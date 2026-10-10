@@ -3419,6 +3419,7 @@ class SafeUnpickler(pickle.Unpickler):
         ("sglang.srt.managers.io_struct", "EmbeddingReqInput"),
         ("sglang.srt.disaggregation.encoder.receiver", "EmbeddingData"),
         ("sglang.srt.managers.schedule_batch", "Modality"),
+        ("sglang.srt.multimodal.modality", "Modality"),
         ("sglang.srt.weight_sync.tensor_bucket", "FlattenedTensorMetadata"),
         ("sglang.srt.weight_sync.tensor_bucket", "FlattenedTensorBucket"),
         (
