@@ -3565,10 +3565,6 @@ class KimiK3ForConditionalGeneration(nn.Module):
                 LOCAL_PREPROCESSED_KEY,
             )
 
-            # Match the configured TP consumer count captured when the
-            # tokenizer creates MmItemMemoryPool. A live attention subgroup
-            # size could leave acknowledgements missing and strand the lease.
-            ipc_consumer_count = max(get_parallel().tp_size, 1)
             device_index = device.index
             if device.type == "cuda" and device_index is None:
                 device_index = torch.cuda.current_device()
@@ -3577,9 +3573,7 @@ class KimiK3ForConditionalGeneration(nn.Module):
             for image_index in image_indices:
                 item = items[image_index]
                 if device.type == "cuda":
-                    item.reconstruct(
-                        device_index, ipc_consumer_count=ipc_consumer_count
-                    )
+                    item.reconstruct(device_index)
                 selected_items.append(item)
 
             locally_preprocessed = [

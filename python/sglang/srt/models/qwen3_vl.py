@@ -1521,7 +1521,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                         (item, proxy, feature_offset, borrowed.shape[0])
                     )
                 elif RETAINED_CUDA_IPC_FEATURE_PROXY_KEY not in model_specific_data:
-                    item.reconstruct(device_index, ipc_consumer_count=consumer_count)
+                    item.reconstruct(device_index)
             features.append(item.feature)
             feature_offset += item.feature.shape[0]
         try:

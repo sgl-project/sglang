@@ -16,7 +16,7 @@ from sglang.srt.managers.io_struct import (
     SessionParams,
     TokenizedGenerateReqInput,
 )
-from sglang.srt.managers.mm_schedule import _acknowledge_deferred_cuda_ipc_cache_hits
+from sglang.srt.managers.mm_schedule import _acknowledge_unused_transport_features
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
@@ -119,12 +119,12 @@ def test_embedding_hit_cannot_recycle_another_ranks_live_proxy(vmm_pool):
     """A rank's cache hit must not retire another rank's proxy before cleanup."""
     items = _publish(vmm_pool)
     with _rank(0):
-        _acknowledge_deferred_cuda_ipc_cache_hits([items[0]])
+        _acknowledge_unused_transport_features([items[0]])
     vmm_pool._recycle_chunks()
     assert vmm_pool.occupied_chunks
 
     with _rank(1):
-        _acknowledge_deferred_cuda_ipc_cache_hits([items[1]])
+        _acknowledge_unused_transport_features([items[1]])
     vmm_pool._recycle_chunks()
     assert not vmm_pool.occupied_chunks
 
@@ -253,10 +253,14 @@ def test_repeated_cancellation_during_publication_does_not_leak(vmm_pool):
 def test_recycler_does_not_hold_allocator_lock_or_free_reused_slice(vmm_pool):
     """A slow ACK poll cannot block cancellation or retire a republished offset."""
     old = _publish(vmm_pool)
+    vmm_pool._stop_recycler = threading.Event()
+    vmm_pool._recycle_interval = 0.001
+    vmm_pool._pool_error = None
     vmm_pool.memory_pool[:8].view(torch.int32).fill_(1)
     stack = torch.stack
 
     def poll(tensors):
+        vmm_pool._stop_recycler.set()
         assert vmm_pool._lock.acquire(blocking=False), (
             "CUDA poll held the allocator lock"
         )
@@ -267,7 +271,8 @@ def test_recycler_does_not_hold_allocator_lock_or_free_reused_slice(vmm_pool):
         return snapshot
 
     with patch.object(torch, "stack", side_effect=poll):
-        vmm_pool._recycle_chunks()
+        vmm_pool._recycle_loop()
+    assert vmm_pool._pool_error is None
     assert vmm_pool.occupied_chunks, "old poll result retired a new allocation"
 
 

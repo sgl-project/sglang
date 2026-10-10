@@ -9,7 +9,7 @@ from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.multimodal.evs import EVSEmbeddingResult
 from sglang.srt.multimodal.transport.cuda_ipc import BORROW_CUDA_IPC_FEATURE_KEY
-from sglang.srt.runtime_context import get_parallel, get_schedule
+from sglang.srt.runtime_context import get_schedule
 from sglang.srt.utils import is_hip, is_npu, is_xpu
 from sglang.srt.utils.async_probe import maybe_assert_sum
 from sglang.utils import logger
@@ -243,24 +243,16 @@ def _move_items_to_device(
             item.feature = item.feature.to(device, non_blocking=True)
 
 
-def _acknowledge_deferred_cuda_ipc_cache_hits(
+def _acknowledge_unused_transport_features(
     items: List[MultimodalDataItem],
 ) -> None:
-    """Release lazy Kimi IPC slices when a cached embedding skips ViT.
+    """Release this rank's lazy features when their embeddings are ready.
 
-    On an encoder-DP miss, exactly one rank copies an image and acknowledges
-    the full TP group.  On a cache hit no rank copies it, so rank zero performs
-    the equivalent single acknowledgement.  This preserves the fixed-pool
-    lifecycle without reintroducing an unnecessary GPU-to-GPU copy.
+    Each rank acknowledges only its own slot. A group acknowledgement could
+    recycle a slice before another rank copies it or releases its local proxy.
     """
-    parallel = get_parallel()
-    if parallel.attn_tp_rank != 0:
-        return
-    # The pool's recycler counts the whole TP group, so the acknowledgement must
-    # match that count even when an attention subgroup is smaller.
-    consumer_count = max(parallel.tp_size, 1)
     for item in items:
-        item.acknowledge_deferred_cuda_ipc_feature(consumer_count)
+        item.acknowledge_deferred_cuda_ipc_feature()
 
 
 def _item_overlap(
@@ -320,6 +312,7 @@ def _get_chunked_embedding_full(
     if embedding_per_req is None:
         _move_items_to_device(embedding_items_per_req, device, data_embedding_func)
         embedding = data_embedding_func(embedding_items_per_req)
+        _acknowledge_unused_transport_features(embedding_items_per_req)
         if isinstance(embedding, list):
             # This path caches the combined per-request embedding, so the
             # per-item form is flattened here.
@@ -331,7 +324,7 @@ def _get_chunked_embedding_full(
         )
         embedding_cache.set(embedding_items_hash, embedding_per_req)
     else:
-        _acknowledge_deferred_cuda_ipc_cache_hits(embedding_items_per_req)
+        _acknowledge_unused_transport_features(embedding_items_per_req)
 
     if isinstance(embedding_per_req, EVSEmbeddingResult):
         item = embedding_items_per_req[0]
@@ -428,6 +421,7 @@ def _batch_encode_per_image_misses(
 
         _move_items_to_device(miss_items, device, data_embedding_func)
         all_miss_embedding = data_embedding_func(miss_items)
+        _acknowledge_unused_transport_features(miss_items)
 
         if isinstance(all_miss_embedding, list):
             # Per-item embeddings: no split needed, and each cache entry owns
@@ -454,6 +448,11 @@ def _batch_encode_per_image_misses(
             # Keep a local ref (no extra GPU memory) so assembly never fails due to LRU eviction.
             hash_to_embedding[cache_key] = emb
 
+    # duplicate images and batch-wide cache hits also own independent leases
+    for req_info in per_image_requests:
+        _acknowledge_unused_transport_features(
+            [item for _, item, _ in req_info.overlapping]
+        )
     return hash_to_embedding
 
 
@@ -492,7 +491,7 @@ def _get_chunked_embedding_by_item(
             cached_token_count = _embedding_token_count(cached_embedding)
             if cached_token_count == expected_token_count:
                 cached_embeddings[idx] = cached_embedding
-                _acknowledge_deferred_cuda_ipc_cache_hits([item])
+                _acknowledge_unused_transport_features([item])
             else:
                 _discard_mismatched_cached_embedding(
                     item.hash, expected_token_count, cached_token_count
@@ -505,6 +504,7 @@ def _get_chunked_embedding_by_item(
         miss_item_list = [item for _, item, _ in miss_items]
         _move_items_to_device(miss_item_list, device, data_embedding_func)
         all_miss_embedding = data_embedding_func(miss_item_list)
+        _acknowledge_unused_transport_features(miss_item_list)
 
         if isinstance(all_miss_embedding, list):
             # Per-item embeddings: no split needed, and each cache entry owns

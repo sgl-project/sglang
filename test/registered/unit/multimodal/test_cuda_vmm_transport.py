@@ -55,13 +55,9 @@ def _produce_vmm_tensor(proxy_queue, consumer_done, result_queue, mode):
         proxy_queue.put((proxy, expected))
         if not consumer_done.wait(timeout=60):
             raise TimeoutError("consumers did not release the CUDA VMM tensor")
-        with pool._lock:
-            pool._recycle_chunks()
-            pool._merge_chunks()
-            if pool.occupied_chunks:
-                raise RuntimeError(
-                    "consumer acknowledgements did not recycle the slice"
-                )
+        pool._recycle_chunks()
+        if pool.occupied_chunks:
+            raise RuntimeError("consumer acknowledgements did not recycle the slice")
     except Exception as exc:  # noqa: BLE001  # pragma: no cover
         result_queue.put(("error", repr(exc)))
         return
@@ -121,6 +117,7 @@ class TestCudaVmmTransport(CustomTestCase):
             ):
                 torch.cuda.set_device(device)
                 with get_parallel().override(
+                    tp_rank=tp_rank,
                     attn_tp_size=2,
                     attn_tp_rank=tp_rank,
                     attn_cp_size=1,
@@ -164,9 +161,7 @@ class TestCudaVmmTransport(CustomTestCase):
                 torch.int32
             ).fill_(1)
             torch.cuda.synchronize(0)
-            with pool._lock:
-                pool._recycle_chunks()
-                pool._merge_chunks()
+            pool._recycle_chunks()
 
             pool.wrap_tensor(torch.ones(100, dtype=torch.uint8, device="cuda:0"))
             live = pool.wrap_tensor(torch.ones(256, dtype=torch.uint8, device="cuda:0"))
@@ -175,8 +170,7 @@ class TestCudaVmmTransport(CustomTestCase):
             ].view(torch.int32)
             self.assertTrue(torch.equal(control, torch.zeros_like(control)))
 
-            with pool._lock:
-                pool._recycle_chunks()
+            pool._recycle_chunks()
             self.assertIn(
                 live.control_offset,
                 [chunk.start for chunk in pool.occupied_chunks],
@@ -237,8 +231,7 @@ class TestCudaVmmTransport(CustomTestCase):
                     for tensor in reconstructed
                 )
             )
-            with pool._lock:
-                pool._recycle_chunks()
+            pool._recycle_chunks()
             self.assertFalse(pool.occupied_chunks)
         finally:
             del reconstructed, proxies, expected, sources
@@ -425,8 +418,7 @@ class TestCudaVmmTransport(CustomTestCase):
             ):
                 proxy.reconstruct_on_target_device(0, consumer_count=1)
             torch.cuda.synchronize(0)
-            with pool._lock:
-                pool._recycle_chunks()
+            pool._recycle_chunks()
             self.assertFalse(pool.occupied_chunks)
 
             with (

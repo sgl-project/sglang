@@ -519,6 +519,7 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         from sglang.srt.utils import cuda_vmm_transport_utils as vmm
 
         pool = object.__new__(vmm.CudaVmmMemoryPool)
+        pool._lock = threading.Lock()
         pool.device_index = 0
         pool.consumer_count = 2
         pool._recycle_stream = object()
@@ -1122,6 +1123,7 @@ class TestVmmConsumerCount(unittest.TestCase):
         proxy = object.__new__(CudaVmmTensorTransportProxy)
         proxy.consumer_count = 4
         with get_parallel().override(
+            tp_rank=3,
             attn_tp_size=2,
             attn_tp_rank=1,
             attn_cp_size=2,
