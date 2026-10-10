@@ -17,8 +17,7 @@ from sglang.srt.debug_utils.comparator.log_sink import log_sink
 from sglang.srt.debug_utils.comparator.utils import Pair
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=15, suite="base-a-test-cpu", nightly=True)
-register_cpu_ci(est_time=8, suite="base-c-test-cpu")
+register_cpu_ci(est_time=15, stage="weekly", runner_config="cpu")
 
 
 class TestComputeAxisAlignerPlan:

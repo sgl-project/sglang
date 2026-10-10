@@ -29,17 +29,20 @@ from typing import List, Optional
 
 import torch
 
+from sglang.srt.runtime_context import derive_parallel_widths, get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.layer_ut_utils import init_single_process_dist
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=30, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
-def _ensure_dist_initialized() -> None:
-    """CCA reads the TP rank / world size inside ``__init__`` to size its
-    head-parallel projections, so the groups must exist before construction."""
+def _ensure_dist_initialized(cls) -> None:
+    """Publish the single-process construction context used by the tests."""
     init_single_process_dist()
+    override = get_context().override_server_args(tp_size=1)
+    override.install()
+    cls.addClassCleanup(override.restore)
 
 
 @dataclass(frozen=True)
@@ -206,6 +209,43 @@ def _make_tiny_config(num_hidden_layers: int = 2):
     )
 
 
+def _build_cca(tp_rank=None, tp_size=None, **kwargs):
+    from sglang.srt.models.zaya import CCA
+
+    parallel = get_parallel()
+    rank = parallel.tp_rank if tp_rank is None else tp_rank
+    size = parallel.tp_size if tp_size is None else tp_size
+    widths = derive_parallel_widths(
+        tp_size=size,
+        attn_cp_size=1,
+        attn_dp_size=1,
+        moe_ep_size=1,
+        moe_dp_size=1,
+        dcp_size=1,
+        dcp_enabled=False,
+    )
+    group = SimpleNamespace(world_size=size, rank_in_group=rank)
+    # Only construction uses the virtual group. Reload and forward run after
+    # this scope closes, so they must use the module's frozen head partition.
+    with parallel.override(
+        **widths,
+        tp_size=size,
+        attn_cp_size=1,
+        moe_dp_size=1,
+        tp_rank=rank,
+        attn_tp_rank=rank,
+        attn_dp_rank=0,
+        attn_cp_rank=0,
+        moe_tp_rank=rank,
+        moe_ep_rank=0,
+        moe_dp_rank=0,
+        tp_group=group,
+        attn_tp_group=group,
+        moe_tp_group=group,
+    ):
+        return CCA(**kwargs)
+
+
 def _make_tiny_cca(
     seed: int = 0,
     tp_rank: Optional[int] = None,
@@ -213,12 +253,10 @@ def _make_tiny_cca(
     layer_id: int = 0,
     config=None,
 ):
-    from sglang.srt.models.zaya import CCA
-
     if config is None:
         config = _make_tiny_config()
     torch.manual_seed(seed)
-    cca = CCA(
+    cca = _build_cca(
         config=config,
         cca_num_k_heads=config.num_query_groups,
         cca_num_q_heads=config.num_attention_heads,
@@ -243,7 +281,7 @@ def _make_tiny_cca(
 class TestZayaCCA(CustomTestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        _ensure_dist_initialized()
+        _ensure_dist_initialized(cls)
 
     def test_single_chunk_matches_reference(self):
         """A single-chunk extend with empty prefix matches the no-state path."""
@@ -540,7 +578,7 @@ class TestZayaCCATensorParallel(CustomTestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        _ensure_dist_initialized()
+        _ensure_dist_initialized(cls)
 
     def _slice_full_state_dict_into_rank(self, ref_cca, tp_cca, tp_rank: int):
         """Copy the reference's full weights into the per-rank CCA, using the
@@ -760,12 +798,10 @@ class TestZayaCCATensorParallel(CustomTestCase):
         both num_q_heads and num_k_heads, since both grouped-mean and
         conv_qk.1 require each rank to hold whole K-head groups.
         """
-        from sglang.srt.models.zaya import CCA
-
         cfg = _make_tiny_config()
         # tiny config has num_query_groups=2; TP=4 cannot divide it cleanly.
         with self.assertRaises(AssertionError):
-            CCA(
+            _build_cca(
                 config=cfg,
                 cca_num_k_heads=cfg.num_query_groups,
                 cca_num_q_heads=cfg.num_attention_heads,

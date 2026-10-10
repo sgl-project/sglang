@@ -19,10 +19,10 @@ from triton_kernels.numerics import InFlexData
 from triton_kernels.swiglu import swiglu_fn
 from triton_kernels.tensor import FP4
 
+from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils import is_cuda
-from sglang.srt.utils.common import is_sm120_supported
 
-if is_sm120_supported():
+if get_platform().is_sm120:
     # use the regular gather/scatter implementation for unsupported devices.
     update_opt_flags_constraints({"is_persistent": False})
 
@@ -153,12 +153,12 @@ def triton_kernel_fused_experts(
 
     # Shape check
     assert hidden_states.ndim == 2, "hidden_states must be 2D"
-    assert (
-        hidden_states.shape[-1] == w1.shape[-2]
-    ), f"hidden_states shape[-1] {hidden_states.shape} must be equal to w1 shape[-2] {w1.shape}"
-    assert (
-        w2.shape[-1] == w1.shape[1]
-    ), f"w2 shape[-1] {w2.shape[-1]} must be equal to w1 shape[1] {w1.shape[1]}"
+    assert hidden_states.shape[-1] == w1.shape[-2], (
+        f"hidden_states shape[-1] {hidden_states.shape} must be equal to w1 shape[-2] {w1.shape}"
+    )
+    assert w2.shape[-1] == w1.shape[1], (
+        f"w2 shape[-1] {w2.shape[-1]} must be equal to w1 shape[1] {w1.shape[1]}"
+    )
 
     # feature check
     assert inplace is False, "Inplace is not supported in new triton MoE kernel"
@@ -309,12 +309,12 @@ def triton_kernel_fused_experts_with_bias(
 
     # Shape check
     assert hidden_states.ndim == 2, "hidden_states must be 2D"
-    assert (
-        hidden_states.shape[-1] == w1.shape[-2]
-    ), f"hidden_states shape[-1] {hidden_states.shape} must be equal to w1 shape[-2] {w1.shape}"
-    assert (
-        w2.shape[-1] == w1.shape[1]
-    ), f"w2 shape[-1] {w2.shape[-1]} must be equal to w1 shape[1] {w1.shape[1]}"
+    assert hidden_states.shape[-1] == w1.shape[-2], (
+        f"hidden_states shape[-1] {hidden_states.shape} must be equal to w1 shape[-2] {w1.shape}"
+    )
+    assert w2.shape[-1] == w1.shape[1], (
+        f"w2 shape[-1] {w2.shape[-1]} must be equal to w1 shape[1] {w1.shape[1]}"
+    )
 
     # feature check
     assert inplace is False, "Inplace is not supported in new triton MoE kernel"

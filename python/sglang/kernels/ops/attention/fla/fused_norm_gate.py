@@ -7,6 +7,7 @@ import torch.nn as nn
 import triton
 import triton.language as tl
 
+from sglang.kernels.jit.utils import get_jit_cuda_arch, is_arch_support_pdl
 from sglang.srt.utils import (
     cdiv,
     cpu_has_amx_support,
@@ -44,7 +45,18 @@ def layer_norm_gated_fwd_kernel(
     HAS_RESIDUAL: tl.constexpr,
     HAS_WEIGHT: tl.constexpr,
     HAS_BIAS: tl.constexpr,
+    USE_GDC: tl.constexpr = False,
+    G_STRIDED: tl.constexpr = False,
+    G_HEADS: tl.constexpr = 1,
+    stride_g_tok=0,
+    stride_g_head=0,
 ):
+    # PDL: x is the producer's output (e.g. the fused KDA verify kernel, which
+    # triggers its dependents right after the o store), so every load sits
+    # behind the wait; the launch/prologue overlaps the producer's tail.
+    if USE_GDC:
+        tl.extra.cuda.gdc_wait()
+
     i_t = tl.program_id(0)
 
     o_d = tl.arange(0, BD)
@@ -90,8 +102,21 @@ def layer_norm_gated_fwd_kernel(
         b_y = b_y + b_b[None, :]
 
     # swish/sigmoid output gate
-    p_g = tl.make_block_ptr(g, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
-    b_g = tl.load(p_g, boundary_check=(0, 1)).to(tl.float32)
+    if G_STRIDED:
+        # strided [tokens, G_HEADS, D] gate: row = token * G_HEADS + head
+        o_r = i_t * BT + tl.arange(0, BT)
+        m_r = o_r < T
+        g_off = (o_r // G_HEADS).to(tl.int64) * stride_g_tok + (
+            o_r % G_HEADS
+        ) * stride_g_head
+        b_g = tl.load(
+            g + g_off[:, None] + o_d[None, :],
+            mask=m_r[:, None] & m_d[None, :],
+            other=0.0,
+        ).to(tl.float32)
+    else:
+        p_g = tl.make_block_ptr(g, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
+        b_g = tl.load(p_g, boundary_check=(0, 1)).to(tl.float32)
     if ACTIVATION == "swish" or ACTIVATION == "silu":
         b_y = b_y * b_g * tl.sigmoid(b_g)
     elif ACTIVATION == "sigmoid":
@@ -100,6 +125,8 @@ def layer_norm_gated_fwd_kernel(
     # Write output
     p_y = tl.make_block_ptr(y, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
     tl.store(p_y, b_y.to(p_y.dtype.element_ty), boundary_check=(0, 1))
+    if USE_GDC:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 @triton.jit
@@ -181,6 +208,7 @@ def layer_norm_gated_fwd(
     out_dtype: torch.dtype = None,
     residual_dtype: torch.dtype = None,
     is_rms_norm: bool = False,
+    g_strided: tuple[int, int, int] | None = None,  # (heads, token stride, head stride)
 ):
     if residual is not None:
         residual_dtype = residual.dtype
@@ -213,7 +241,16 @@ def layer_norm_gated_fwd(
     # heuristics for number of warps
 
     if D <= 512:
+        use_pdl = is_arch_support_pdl()
         BT = 32
+        use_bt8 = 8 <= T <= 256 if is_rms_norm and activation == "sigmoid" else T == 64
+        if use_pdl and use_bt8 and (D, x.dtype) == (128, torch.bfloat16):
+            arch = get_jit_cuda_arch()
+            if (arch.major, arch.minor) == (10, 3):
+                # Small sigmoid-gated RMSNorm batches use eight rows per CTA.
+                # Other norm modes retain their T=64 selection.
+                BT = 8
+        pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if use_pdl else {}
         layer_norm_gated_fwd_kernel[(cdiv(T, BT),)](
             x=x,
             g=g,
@@ -236,8 +273,21 @@ def layer_norm_gated_fwd(
             HAS_WEIGHT=weight is not None,
             HAS_BIAS=bias is not None,
             num_warps=4,
+            **pdl_kwargs,
+            **(
+                dict(
+                    G_STRIDED=True,
+                    G_HEADS=g_strided[0],
+                    stride_g_tok=g_strided[1],
+                    stride_g_head=g_strided[2],
+                )
+                if g_strided is not None
+                else {}
+            ),
         )
     else:
+        if g_strided is not None:
+            g = g.reshape(-1, D)
         layer_norm_gated_fwd_kernel1[(T,)](
             x=x,
             g=g,
@@ -282,7 +332,21 @@ class LayerNormGatedFunction(torch.autograd.Function):
         g_shape_og = g.shape
         # reshape input data into 2D tensor
         x = x.reshape(-1, x.shape[-1])
-        g = g.reshape(-1, g.shape[-1])
+        # A column slice of a fused projection can't be viewed as [rows, D];
+        # pass its strides instead of copying.
+        g_strided = None
+        if (
+            not g.is_contiguous()
+            and g.dim() >= 3
+            and g.shape[-1] == x.shape[-1]
+            and g.shape[-1] <= 512
+            and g.stride(-1) == 1
+            and g.stride(-2) == g.shape[-1]
+            and all(n == 1 for n in g.shape[:-3])
+        ):
+            g_strided = (g.shape[-2], g.stride(-3), g.stride(-2))
+        else:
+            g = g.reshape(-1, g.shape[-1]).contiguous()
         if residual is not None:
             assert residual.shape == x_shape_og
             residual = residual.reshape(-1, residual.shape[-1])
@@ -301,6 +365,7 @@ class LayerNormGatedFunction(torch.autograd.Function):
             residual=residual,
             residual_dtype=residual_dtype,
             is_rms_norm=is_rms_norm,
+            g_strided=g_strided,
         )
         ctx.save_for_backward(residual_out, g, weight, bias, mean, rstd)
         ctx.x_shape_og = x_shape_og
@@ -376,9 +441,9 @@ class FusedRMSNormGated(nn.Module):
         residual_in_fp32: bool = False,
     ) -> torch.Tensor:
         if _use_cpu:
-            assert (
-                self.activation == "silu"
-            ), "CPU rmsnorm_gated currently only supports activation silu"
+            assert self.activation == "silu", (
+                "CPU rmsnorm_gated currently only supports activation silu"
+            )
             return torch.ops.sgl_kernel.fused_rmsnorm_gated_cpu(
                 x, self.weight, g, self.eps
             )

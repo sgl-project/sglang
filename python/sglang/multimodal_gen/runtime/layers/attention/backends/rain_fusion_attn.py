@@ -22,7 +22,6 @@ logger = init_logger(__name__)
 
 
 class RainFusionAttentionBackend(AttentionBackend):
-
     accept_output_buffer: bool = True
 
     @staticmethod
@@ -55,12 +54,6 @@ class RainFusionAttentionMetadata(AttentionMetadata):
 
 
 class RainFusionAttentionMetadataBuilder(AttentionMetadataBuilder):
-    def __init__(self) -> None:
-        pass
-
-    def prepare(self) -> None:
-        pass
-
     def build(
         self,
         current_timestep: int,
@@ -99,7 +92,6 @@ class RainFusionAttentionMetadataBuilder(AttentionMetadataBuilder):
 
 
 class RainFusionAttentionImpl(AttentionImpl):
-
     def __init__(
         self,
         num_heads: int,

@@ -13,7 +13,6 @@ from sglang.multimodal_gen.runtime.layers.kvcache.causal_attention_cache import 
 )
 from sglang.multimodal_gen.runtime.layers.layernorm import (
     LayerNormScaleShift,
-    tensor_parallel_rms_norm,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
@@ -33,42 +32,6 @@ class LongLive2CausalWanTransformerBlock(CausalWanTransformerBlock):
             elementwise_affine=False,
             dtype=torch.float32,
         )
-
-    def _cross_attn_with_cache(
-        self,
-        hidden_states: torch.Tensor,
-        encoder_hidden_states: torch.Tensor,
-        crossattn_cache: CrossAttentionKVCache | None,
-    ) -> torch.Tensor:
-        attn2 = self.attn2
-        q, _ = attn2.to_q(hidden_states)
-        if attn2.tp_rmsnorm:
-            q = tensor_parallel_rms_norm(q, attn2.norm_q)
-        else:
-            q = attn2.norm_q(q)
-        q = q.unflatten(2, (attn2.local_num_heads, attn2.head_dim))
-
-        if crossattn_cache is not None and crossattn_cache.is_init:
-            k = crossattn_cache.k
-            v = crossattn_cache.v
-        else:
-            k, _ = attn2.to_k(encoder_hidden_states)
-            if attn2.tp_rmsnorm:
-                k = tensor_parallel_rms_norm(k, attn2.norm_k)
-            else:
-                k = attn2.norm_k(k)
-            k = k.unflatten(2, (attn2.local_num_heads, attn2.head_dim))
-
-            v, _ = attn2.to_v(encoder_hidden_states)
-            v = v.unflatten(2, (attn2.local_num_heads, attn2.head_dim))
-
-            if crossattn_cache is not None:
-                crossattn_cache.store(k, v)
-
-        hidden_states = attn2.attn(q, k, v)
-        hidden_states = hidden_states.flatten(2)
-        hidden_states, _ = attn2.to_out(hidden_states)
-        return hidden_states
 
     def forward(
         self,
@@ -128,9 +91,10 @@ class LongLive2CausalWanTransformerBlock(CausalWanTransformerBlock):
         norm_hidden_states, hidden_states = self.self_attn_residual_norm(
             hidden_states, attn_output, gate_msa, null_shift, null_scale
         )
-        norm_hidden_states, hidden_states = norm_hidden_states.to(
-            orig_dtype
-        ), hidden_states.to(orig_dtype)
+        norm_hidden_states, hidden_states = (
+            norm_hidden_states.to(orig_dtype),
+            hidden_states.to(orig_dtype),
+        )
 
         attn_output = self._cross_attn_with_cache(
             norm_hidden_states,
@@ -140,9 +104,10 @@ class LongLive2CausalWanTransformerBlock(CausalWanTransformerBlock):
         norm_hidden_states, hidden_states = self.cross_attn_residual_norm(
             hidden_states, attn_output, 1, c_shift_msa, c_scale_msa
         )
-        norm_hidden_states, hidden_states = norm_hidden_states.to(
-            orig_dtype
-        ), hidden_states.to(orig_dtype)
+        norm_hidden_states, hidden_states = (
+            norm_hidden_states.to(orig_dtype),
+            hidden_states.to(orig_dtype),
+        )
 
         ff_output = self.ffn(norm_hidden_states)
         hidden_states = self.mlp_residual(ff_output, c_gate_msa, hidden_states)

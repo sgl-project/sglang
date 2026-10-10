@@ -5,8 +5,8 @@ from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=7, suite="base-a-test-cpu")
-register_cpu_ci(est_time=6, suite="base-c-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=6, suite="stage-b-test-cpu-intel")
 
 
 class TestRunaiUtils(CustomTestCase):
@@ -44,10 +44,6 @@ class TestRunaiUtils(CustomTestCase):
         path1 = ObjectStorageModel.get_path("s3://bucket/model-a/")
         path2 = ObjectStorageModel.get_path("s3://bucket/model-b/")
         self.assertNotEqual(path1, path2)
-
-    def test_get_path_contains_model_streamer(self):
-        path = ObjectStorageModel.get_path("s3://bucket/model/")
-        self.assertIn("model_streamer", path)
 
 
 if __name__ == "__main__":

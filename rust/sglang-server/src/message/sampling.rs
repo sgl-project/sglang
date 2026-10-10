@@ -4,11 +4,8 @@
 //! `TokenizerManager._create_tokenized_object` does).
 
 use std::collections::BTreeMap;
-use std::fmt;
 
-use serde::de::value::{MapAccessDeserializer, SeqAccessDeserializer};
-use serde::de::{MapAccess, SeqAccess, Visitor};
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 
 use super::types::OneOrMany;
 use crate::utils::{error::Error, regex::RegexPattern};
@@ -27,6 +24,34 @@ const MAX_STOP_REGEX_LEN: usize = 256;
 /// Most `stop_regex` patterns accepted per request. Python's `re` cache holds 512
 /// (`re._MAXCACHE`), so past that every pattern recompiles on every decode step.
 const MAX_STOP_REGEX_COUNT: usize = 32;
+const REQUEST_REASONING_END_TOKEN_IDS_KEY: &str = "__sglang_reasoning_end_token_ids";
+const MAX_REQUEST_REASONING_END_TOKEN_IDS: usize = 32;
+
+/// JSON values accepted by Python's `CustomParamValue`: a scalar, a list of
+/// scalars, or a string-keyed object whose values are scalars.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CustomParamValue {
+    Null(()),
+    Bool(bool),
+    Signed(i64),
+    Unsigned(u64),
+    Float(f64),
+    String(String),
+    List(Vec<JsonScalar>),
+    Object(BTreeMap<String, JsonScalar>),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum JsonScalar {
+    Null(()),
+    Bool(bool),
+    Signed(i64),
+    Unsigned(u64),
+    Float(f64),
+    String(String),
+}
 
 /// One module per field default, each exposing the two hooks serde needs under
 /// one name: `default` (key absent) and `deserialize` (key present — including
@@ -72,7 +97,7 @@ fn max_new_tokens_default() -> Option<i64> {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SamplingParams {
-    // --- API parameters (set by callers) ---
+    // Output length and stopping.
     #[serde(default = "max_new_tokens_default")]
     pub max_new_tokens: Option<i64>,
     /// API input alias, copied to `stop_strs` then cleared by `normalize`.
@@ -85,6 +110,8 @@ pub struct SamplingParams {
     /// API input alias, copied to `stop_regex_strs` then cleared by `normalize`.
     #[serde(default)]
     pub stop_regex: Option<OneOrMany<String>>,
+
+    // Sampling distribution and penalties.
     #[serde(
         default = "f64_one::default",
         deserialize_with = "f64_one::deserialize"
@@ -125,11 +152,19 @@ pub struct SamplingParams {
         deserialize_with = "i64_zero::deserialize"
     )]
     pub min_new_tokens: i64,
+
+    // Sequence count and beam search.
     #[serde(
         default = "i64_one::default",
         deserialize_with = "i64_one::deserialize"
     )]
     pub n: i64,
+    /// `beam_width > 1` makes it a beam search request. Mirrored for the
+    /// positional wire layout even though the rust path rejects it below.
+    #[serde(default)]
+    pub beam_width: Option<i64>,
+
+    // Structured-output constraints.
     #[serde(default)]
     pub json_schema: Option<String>,
     #[serde(default)]
@@ -138,6 +173,8 @@ pub struct SamplingParams {
     pub ebnf: Option<String>,
     #[serde(default)]
     pub structural_tag: Option<String>,
+
+    // Output handling.
     #[serde(
         default = "bool_false::default",
         deserialize_with = "bool_false::deserialize"
@@ -160,18 +197,20 @@ pub struct SamplingParams {
     pub no_stop_trim: bool,
     #[serde(default)]
     pub stream_interval: Option<i64>,
+
+    // Logit processing and reproducibility.
     /// Token id (as a string key, matching Python) → bias. Keys are vocab-bounded
     /// by [`verify`](Self::verify).
     #[serde(default)]
     pub logit_bias: Option<BTreeMap<String, f64>>,
     #[serde(default)]
     pub sampling_seed: Option<i64>,
-    /// Opaque JSON object forwarded to a custom logit processor. Python types it
-    /// as `Dict[str, JsonScalar | list | dict]`; it is never inspected here.
+    /// JSON object forwarded to a custom logit processor. Its values match
+    /// Python's `CustomParamValue` exactly.
     #[serde(default)]
-    pub custom_params: Option<serde_json::Value>,
+    pub custom_params: Option<BTreeMap<String, CustomParamValue>>,
 
-    // --- Internal fields (populated by the pipeline below, not API-facing) ---
+    // Normalized internal fields.
     //
     // All `skip_deserializing`: they are outputs of `normalize`, and a client that
     // could set them would be setting the pipeline's own state. `is_normalized` is
@@ -193,47 +232,12 @@ pub struct SamplingParams {
     /// Set by `normalize`; tells the scheduler its own pass can early-return.
     #[serde(skip_deserializing)]
     pub is_normalized: bool,
-}
-
-/// The `/generate` body's `sampling_params`: one object (broadcast to every
-/// prompt) or a list of them (one per prompt), fanned out by `GenerateBody::into_requests`.
-///
-/// Hand-written `Deserialize` rather than `#[serde(untagged)]`: untagged buffers
-/// the input and, on failure, reports only "data did not match any variant" —
-/// losing the field-level message ("unknown field `temperature`, expected one of
-/// …") that makes a typo actionable. Object-vs-list is unambiguous here, so a
-/// single `deserialize_any` dispatch keeps the inner error verbatim.
-#[derive(Debug, Clone, PartialEq)]
-pub enum SamplingParamsInput {
-    /// Boxed: `SamplingParams` is ~440 bytes, so an inline variant would make
-    /// every `GenerateBody` that big regardless of which form arrived.
-    One(Box<SamplingParams>),
-    Many(Vec<SamplingParams>),
-}
-
-impl<'de> Deserialize<'de> for SamplingParamsInput {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct InputVisitor;
-
-        impl<'de> Visitor<'de> for InputVisitor {
-            type Value = SamplingParamsInput;
-
-            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str("a sampling_params object, or a list of them (one per prompt)")
-            }
-
-            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
-                SamplingParams::deserialize(MapAccessDeserializer::new(map))
-                    .map(|p| SamplingParamsInput::One(Box::new(p)))
-            }
-
-            fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Self::Value, A::Error> {
-                Vec::deserialize(SeqAccessDeserializer::new(seq)).map(SamplingParamsInput::Many)
-            }
-        }
-
-        deserializer.deserialize_any(InputVisitor)
-    }
+    /// Set by the OpenAI serving layer for generated full-assistant EBNF
+    /// constraints, which already cover reasoning; the scheduler skips the
+    /// reasoner grammar wrapper for them. Client-settable would let a request
+    /// strip that wrapper from its own grammar, so it is a pipeline output only.
+    #[serde(skip_deserializing)]
+    pub ebnf_full_assistant: bool,
 }
 
 impl Default for SamplingParams {
@@ -256,6 +260,7 @@ impl Default for SamplingParams {
             repetition_penalty: f64_one::default(),
             min_new_tokens: i64_zero::default(),
             n: i64_one::default(),
+            beam_width: None,
             json_schema: None,
             regex: None,
             ebnf: None,
@@ -273,6 +278,7 @@ impl Default for SamplingParams {
             stop_str_max_len: 0,
             stop_regex_max_len: 0,
             is_normalized: false,
+            ebnf_full_assistant: false,
         }
     }
 }
@@ -313,6 +319,16 @@ impl SamplingParams {
         }
         if self.top_k == -1 {
             self.top_k = TOP_K_ALL; // -1 disables top_k → whole vocabulary
+        }
+        for constraint in [
+            &mut self.json_schema,
+            &mut self.regex,
+            &mut self.ebnf,
+            &mut self.structural_tag,
+        ] {
+            if constraint.as_deref() == Some("") {
+                *constraint = None;
+            }
         }
     }
 
@@ -387,6 +403,13 @@ impl SamplingParams {
     /// Python `verify(vocab_size)` — the same ranges, messages and mutual
     /// exclusions, plus the rust-server `n == 1` restriction.
     fn verify(&self, vocab_size: u64) -> Result<(), Error> {
+        if let Some(beam_width) = self.beam_width
+            && beam_width < 1
+        {
+            return Err(bad(format!(
+                "beam_width must be at least 1, got {beam_width}."
+            )));
+        }
         if !self.temperature.is_finite() || self.temperature < 0.0 {
             return Err(bad(format!(
                 "temperature must be a non-negative finite number, got {}",
@@ -461,14 +484,51 @@ impl SamplingParams {
                 }
             }
         }
+        if let Some(value) = self
+            .custom_params
+            .as_ref()
+            .and_then(|params| params.get(REQUEST_REASONING_END_TOKEN_IDS_KEY))
+        {
+            let CustomParamValue::List(token_ids) = value else {
+                return Err(bad(
+                    "request reasoning end token IDs must be a list of integers".into(),
+                ));
+            };
+            if token_ids.is_empty() || token_ids.len() > MAX_REQUEST_REASONING_END_TOKEN_IDS {
+                return Err(bad(format!(
+                    "request reasoning end token IDs must contain 1 to \
+                     {MAX_REQUEST_REASONING_END_TOKEN_IDS} integers"
+                )));
+            }
+            for token_id in token_ids {
+                let in_vocab = match token_id {
+                    JsonScalar::Signed(token_id) => {
+                        *token_id >= 0 && (*token_id as u64) < vocab_size
+                    }
+                    JsonScalar::Unsigned(token_id) => *token_id < vocab_size,
+                    _ => false,
+                };
+                if !in_vocab {
+                    return Err(bad(format!(
+                        "request reasoning end token IDs must be integers in [0, {})",
+                        vocab_size
+                    )));
+                }
+            }
+        }
         // Grammars are mutually exclusive.
-        let grammars = [&self.json_schema, &self.regex, &self.ebnf]
-            .iter()
-            .filter(|g| g.is_some())
-            .count();
+        let grammars = [
+            &self.json_schema,
+            &self.regex,
+            &self.ebnf,
+            &self.structural_tag,
+        ]
+        .iter()
+        .filter(|g| g.is_some())
+        .count();
         if grammars > 1 {
             return Err(bad(
-                "Only one of regex, json_schema, or ebnf can be set".into()
+                "Only one of json_schema, regex, ebnf, or structural_tag can be set".into(),
             ));
         }
         // Not a Python restriction: the rust from_scheduler maps one rid to one response,
@@ -480,6 +540,15 @@ impl SamplingParams {
                 "n must be 1 (parallel sampling is not supported), got {}",
                 self.n
             )));
+        }
+        if let Some(beam_width) = self.beam_width {
+            // Also not a Python restriction: beam search returns its candidates
+            // in `meta_info.beam_results`, which from_scheduler does not carry.
+            if beam_width > 1 {
+                return Err(bad(format!(
+                    "beam_width must be 1 (beam search is not supported), got {beam_width}"
+                )));
+            }
         }
         Ok(())
     }
@@ -617,7 +686,7 @@ mod tests {
         assert_eq!(sp.min_new_tokens, 4096);
     }
 
-    /// The 30 wire slots, in Python's declaration order.
+    /// The 31 wire slots, in Python's declaration order.
     ///
     /// `SamplingParams` is `msgspec.Struct(array_like=True)` on the Python side, so
     /// the header carries an ARRAY and every field is identified by POSITION. Two
@@ -642,6 +711,7 @@ mod tests {
         "repetition_penalty",
         "min_new_tokens",
         "n",
+        "beam_width",
         "json_schema",
         "regex",
         "ebnf",
@@ -659,6 +729,7 @@ mod tests {
         "stop_str_max_len",
         "stop_regex_max_len",
         "is_normalized",
+        "ebnf_full_assistant",
     ];
 
     /// Every field reaches the wire, at the position Python expects.
@@ -682,6 +753,7 @@ mod tests {
             repetition_penalty: 0.19,
             min_new_tokens: 20,
             n: 1,
+            beam_width: Some(21),
             json_schema: Some("22".into()),
             regex: Some("23".into()),
             ebnf: Some("24".into()),
@@ -717,6 +789,7 @@ mod tests {
         assert_eq!(arr[at("frequency_penalty")].as_f64(), Some(0.17));
         assert_eq!(arr[at("presence_penalty")].as_f64(), Some(0.18));
         assert_eq!(arr[at("repetition_penalty")].as_f64(), Some(0.19));
+        assert_eq!(arr[at("beam_width")].as_i64(), Some(21));
         assert_eq!(arr[at("json_schema")].as_str(), Some("22"));
         assert_eq!(arr[at("regex")].as_str(), Some("23"));
         assert_eq!(arr[at("ebnf")].as_str(), Some("24"));
@@ -733,6 +806,7 @@ mod tests {
         // `normalize` outputs occupy the tail.
         assert!(arr[at("stop_strs")].is_array());
         assert_eq!(arr[at("is_normalized")].as_bool(), Some(false));
+        assert_eq!(arr[at("ebnf_full_assistant")].as_bool(), Some(false));
     }
 
     #[test]
@@ -752,6 +826,8 @@ mod tests {
             (r#"{"max_new_tokens": -1}"#, "max_new_tokens"),
             (r#"{"regex": "a", "ebnf": "b"}"#, "Only one of"),
             (r#"{"n": 2}"#, "n must be 1"),
+            (r#"{"beam_width": 2}"#, "beam_width must be 1"),
+            (r#"{"beam_width": 0}"#, "beam_width must be at least 1"),
         ] {
             let err = norm_err(json).to_string();
             assert!(
@@ -876,6 +952,64 @@ mod tests {
         // first pass, which is not in the greedy window.
         once.normalize(false, TEST_VOCAB).unwrap();
         assert_eq!(once.top_k, twice.top_k);
+    }
+
+    #[test]
+    fn empty_grammar_constraints_are_unset() {
+        let sp = norm(r#"{"json_schema":"","regex":"","ebnf":"","structural_tag":""}"#);
+        assert!(sp.json_schema.is_none());
+        assert!(sp.regex.is_none());
+        assert!(sp.ebnf.is_none());
+        assert!(sp.structural_tag.is_none());
+    }
+
+    #[test]
+    fn structural_tag_is_mutually_exclusive_with_other_grammars() {
+        for field in ["json_schema", "regex", "ebnf"] {
+            let json = format!(r#"{{"structural_tag":"tag","{field}":"other"}}"#);
+            assert!(norm_err(&json).to_string().contains("Only one of"));
+        }
+    }
+
+    #[test]
+    fn custom_params_matches_python_shape() {
+        assert!(
+            norm(r#"{"custom_params":{"null":null,"bool":true,"int":1,"float":1.5,"str":"x","list":[1,"x",null],"object":{"x":1}}}"#)
+                .custom_params
+                .is_some()
+        );
+
+        for json in [
+            r#"{"custom_params":[]}"#,
+            r#"{"custom_params":{"nested_list":[[1]]}}"#,
+            r#"{"custom_params":{"nested_object":{"x":{"y":1}}}}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<SamplingParams>(json).is_err(),
+                "{json} must not parse"
+            );
+        }
+    }
+
+    #[test]
+    fn request_reasoning_end_token_ids_are_bounded_integers() {
+        let valid = norm(r#"{"custom_params":{"__sglang_reasoning_end_token_ids":[17,18]}}"#);
+        assert!(valid.custom_params.is_some());
+
+        for body in [
+            r#"{"custom_params":{"__sglang_reasoning_end_token_ids":[]}}"#,
+            r#"{"custom_params":{"__sglang_reasoning_end_token_ids":[-1]}}"#,
+            r#"{"custom_params":{"__sglang_reasoning_end_token_ids":[true]}}"#,
+            r#"{"custom_params":{"__sglang_reasoning_end_token_ids":[32000]}}"#,
+            r#"{"custom_params":{"__sglang_reasoning_end_token_ids":"17"}}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<SamplingParams>(body)
+                    .unwrap()
+                    .normalize(false, 32_000)
+                    .is_err()
+            );
+        }
     }
 
     /// `skip_tokenizer_init` has no tokenizer, so the text-matching stop features

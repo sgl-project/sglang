@@ -193,12 +193,6 @@ class Cosmos3AVAEAudioTokenizer(nn.Module, LayerwiseOffloadableModuleMixin):
     def temporal_compression_factor(self) -> int:
         return self.hop_size
 
-    def get_latent_num_samples(self, num_audio_samples: int) -> int:
-        return int(num_audio_samples) // self.hop_size
-
-    def get_audio_num_samples(self, num_latent_samples: int) -> int:
-        return int(num_latent_samples) * self.hop_size
-
     def _denormalize_latent(self, latent: torch.Tensor) -> torch.Tensor:
         if self.normalization_type == "tanh":
             in_dtype = latent.dtype

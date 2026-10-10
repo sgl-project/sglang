@@ -644,3 +644,103 @@ class SpectrumMixin:
         predicted = forecaster.predict(step_idx)
         self._spectrum_ctx = None
         return predicted.to(dtype=template.dtype, device=template.device)
+
+
+# MiniMax-H3: forecast packed target audio|video only (Comfy / Wan2GP).
+
+H3_SPECTRUM_HISTORY_SIZE = 8
+H3_AUDIO_BLEND_WEIGHT = 0.0
+H3_VIDEO_BLEND_WEIGHT = 0.5
+
+
+def apply_h3_spectrum_param_defaults(params: SpectrumParams) -> SpectrumParams:
+    """Shrink the generic 100-slot GPU buffer default to the H3 CPU window."""
+    if params.history_size == 100:
+        params.history_size = H3_SPECTRUM_HISTORY_SIZE
+    return params
+
+
+def target_audio_video_span(
+    audio_pos: torch.Tensor,
+    infer_out_pos: torch.Tensor,
+) -> tuple[int, int, int]:
+    """Return ``(audio_start, audio_stop, video_stop)`` in packed row indices.
+
+    Target video is ``infer_out_pos``. Target audio is the contiguous
+    ``audio_pos`` run that ends immediately before that video span — the
+    packed t2va / fl2va / ref2va suffix. Earlier reference-audio rows are
+    dropped, matching Wan2GP ``hidden[audio_start:]``.
+    """
+    audio_ids = audio_pos.detach().reshape(-1).to(dtype=torch.long, device="cpu")
+    video_ids = infer_out_pos.detach().reshape(-1).to(dtype=torch.long, device="cpu")
+    if audio_ids.numel() == 0 or video_ids.numel() == 0:
+        raise ValueError(
+            "MiniMax-H3 Spectrum needs non-empty target audio and video rows"
+        )
+    video_start = int(video_ids.min())
+    video_stop = int(video_ids.max()) + 1
+    if int(video_ids.numel()) != video_stop - video_start:
+        raise ValueError(
+            "MiniMax-H3 Spectrum target video rows must be a contiguous packed span"
+        )
+
+    preceding = audio_ids[audio_ids < video_start]
+    if preceding.numel() == 0 or int(preceding.max()) + 1 != video_start:
+        raise ValueError(
+            "MiniMax-H3 Spectrum expects packed target audio rows immediately "
+            f"before target video rows starting at {video_start}"
+        )
+    ordered = preceding.sort().values
+    expected = video_start - 1
+    cursor = int(ordered.numel()) - 1
+    while cursor >= 0 and int(ordered[cursor]) == expected:
+        expected -= 1
+        cursor -= 1
+    audio_start = expected + 1
+    return audio_start, video_start, video_stop
+
+
+def local_target_hidden(
+    hidden: torch.Tensor,
+    audio_start: int,
+    video_stop: int,
+    row_start: int,
+    row_stop: int,
+) -> tuple[torch.Tensor, int, int] | None:
+    """Slice rank-local ``hidden`` to the overlap with packed target media."""
+    start = max(audio_start, row_start)
+    stop = min(video_stop, row_stop)
+    if stop <= start:
+        return None
+    local_start = start - row_start
+    local_stop = stop - row_start
+    return hidden[local_start:local_stop], local_start, local_stop
+
+
+def blend_h3_spectrum_prediction(
+    predicted: torch.Tensor,
+    *,
+    n_audio: int,
+    last_audio: torch.Tensor | None,
+    last_video: torch.Tensor | None,
+    audio_blend: float = H3_AUDIO_BLEND_WEIGHT,
+    video_blend: float = H3_VIDEO_BLEND_WEIGHT,
+) -> torch.Tensor:
+    """Apply Comfy segment blends on a ``[audio | video]`` forecast."""
+    if n_audio < 0 or n_audio > int(predicted.shape[0]):
+        raise ValueError(
+            f"n_audio={n_audio} is outside predicted rows {predicted.shape[0]}"
+        )
+    out = predicted
+    audio = out[:n_audio]
+    video = out[n_audio:]
+    if last_audio is not None and audio.numel():
+        held = last_audio.to(device=audio.device, dtype=audio.dtype)
+        if audio_blend <= 0.0:
+            audio.copy_(held)
+        elif audio_blend < 1.0:
+            audio.copy_(torch.lerp(held, audio, audio_blend))
+    if last_video is not None and video.numel() and video_blend < 1.0:
+        held = last_video.to(device=video.device, dtype=video.dtype)
+        video.copy_(torch.lerp(held, video, video_blend))
+    return out
