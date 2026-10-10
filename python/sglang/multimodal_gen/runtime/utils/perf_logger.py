@@ -462,7 +462,7 @@ class PerformanceLogger:
     def log_request_summary(
         cls,
         metrics: "RequestMetrics",
-        tag: str = "total_inference_time",
+        tag: str = "pipeline_stage_metrics",
     ):
         """logs the stage metrics and total duration for a completed request
         to the performance_log file.
@@ -486,7 +486,7 @@ class PerformanceLogger:
         record = RequestPerfRecord(
             metrics.request_id,
             commit_hash=get_git_commit_hash(),
-            tag="pipeline_stage_metrics",
+            tag=tag,
             stages=formatted_stages,
             steps=metrics.steps,
             total_duration_ms=metrics.total_duration_ms,
