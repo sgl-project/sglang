@@ -412,6 +412,11 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         transport.cancel_for_dispatch.assert_not_called()
 
     def test_async_publication_keeps_event_loop_responsive(self):
+        from sglang.srt.managers.schedule_batch import (
+            Modality,
+            MultimodalDataItem,
+            MultimodalProcessorOutput,
+        )
         from sglang.srt.utils.cuda_vmm_transport_utils import (
             CudaVmmFeatureTransport,
         )
@@ -437,7 +442,11 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
                 release.set()
 
         transport.prepare_for_dispatch = MagicMock(side_effect=block_publication)
-        mm_inputs = SimpleNamespace(mm_items=[object()])
+        mm_inputs = MultimodalProcessorOutput(
+            mm_items=[
+                MultimodalDataItem(modality=Modality.IMAGE, feature=torch.ones(2))
+            ]
+        )
 
         async def run():
             watchdog = threading.Thread(target=unblock_if_event_loop_stalls)
@@ -447,6 +456,8 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
                     transport.prepare_for_dispatch_async([mm_inputs])
                 )
                 while not started.is_set():
+                    if task.done():
+                        await task
                     await asyncio.sleep(0)
                 event_loop_responsive.set()
                 self.assertFalse(task.done())
