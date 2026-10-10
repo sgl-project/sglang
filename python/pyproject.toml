@@ -157,7 +157,7 @@ http2 = [
 ]
 
 fastokens = [
-  "fastokens>=0.1.1,<0.2.0",
+  "fastokens>=0.3.2",
 ]
 
 test = [
@@ -196,6 +196,7 @@ dev = ["sglang[test]"]
 
 all = [
   "sglang[diffusion]",
+  "sglang[fastokens]",
   "sglang[http2]",
   "sglang[tracing]",
 ]
