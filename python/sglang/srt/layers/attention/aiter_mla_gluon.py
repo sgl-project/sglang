@@ -5,8 +5,9 @@ Uses aiter ``mla_gluon`` when import succeeds and Triton Gluon exposes ``cga_lay
 Gluon is unavailable.
 
 Requires aiter ``main`` with ROCm/aiter #4480 (batch>1 ``bh16bn128``) and #4555
-(decode CUDA graph KV splits). SGLang probes import + Triton API only; aiter version
-is not pinned at build time.
+(decode CUDA graph KV splits). Optional ``kv_len_hint`` (ROCm/aiter #6112) is
+forwarded only when that aiter build accepts it. SGLang probes import + Triton
+API only; aiter version is not pinned at build time.
 """
 
 from __future__ import annotations
@@ -25,6 +26,41 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
 
 logger = logging.getLogger(__name__)
+
+_kv_len_hint_support: dict[int, bool] = {}
+_logged_missing_kv_len_hint = False
+
+
+def mla_gluon_kv_len_hint(
+    max_context_len: int, *, local_shard: bool = False, dcp_world_size: int = 1
+) -> int:
+    """Static host scalar for aiter ``mla_gluon(..., kv_len_hint=)``.
+
+    CUDA graph capture freezes ``NUM_KV_SPLITS``, so this is the rank's KV
+    capacity, not the live sequence length. Under DCP each rank holds
+    ``ceil(context / W)`` tokens of the shard.
+    """
+    cap = max(int(max_context_len), 1)
+    if not local_shard:
+        return cap
+    width = max(int(dcp_world_size), 1)
+    return (cap + width - 1) // width
+
+
+def _mla_gluon_accepts_kv_len_hint(fn) -> bool:
+    cached = _kv_len_hint_support.get(id(fn))
+    if cached is not None:
+        return cached
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        accepts = False
+    else:
+        accepts = "kv_len_hint" in params or any(
+            p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+        )
+    _kv_len_hint_support[id(fn)] = accepts
+    return accepts
 
 
 @functools.lru_cache(maxsize=1)
@@ -84,6 +120,7 @@ def mla_gluon_decode(
     qlen: int = 1,
     use_2d_view: bool = False,
     return_lse: bool = False,
+    kv_len_hint: int | None = None,
 ):
     """Run Gluon MLA decode for fused Q [num_tokens, H, 576] and MLA KV pool.
     Returns [num_tokens, H, v_head_dim] (or ``(out, lse)`` when ``return_lse``),
@@ -111,6 +148,17 @@ def mla_gluon_decode(
     extra_kwargs = {}
     if return_lse:
         extra_kwargs["return_lse"] = True
+    if kv_len_hint is not None:
+        if _mla_gluon_accepts_kv_len_hint(mla_gluon):
+            extra_kwargs["kv_len_hint"] = int(kv_len_hint)
+        else:
+            global _logged_missing_kv_len_hint
+            if not _logged_missing_kv_len_hint:
+                logger.info(
+                    "aiter mla_gluon has no kv_len_hint; split budget stays "
+                    "occupancy-only until ROCm/aiter#6112"
+                )
+                _logged_missing_kv_len_hint = True
 
     result = mla_gluon(
         q_nope,
