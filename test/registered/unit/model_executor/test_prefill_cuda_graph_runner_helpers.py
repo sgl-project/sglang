@@ -534,7 +534,9 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
         runner._qwen_bcg_hc_sidechannel = False
         runner._qwen_bcg_mtp_draft = True
         runner._input_embeds_arg_idx = 3
-        runner.buffer_registry = SimpleNamespace(has_slot=lambda _name: True)
+        runner.buffer_registry = SimpleNamespace(
+            has_slot=lambda name: name == "input_embeds"
+        )
         slot = torch.empty((8, 2 * 4))
         runner._fill_input_embeds_slot = Mock(
             side_effect=lambda args, *_: slot[:1].copy_(args[3])
