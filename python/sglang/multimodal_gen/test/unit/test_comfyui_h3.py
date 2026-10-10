@@ -1221,6 +1221,8 @@ def test_integrated_h3_int8_loader_preserves_quantized_weights(
         pin_cpu_memory=False,
         should_start_component_on_cpu=lambda _: True,
         should_use_fsdp_for_component=lambda _: False,
+        minimax_h3_adaln_online=False,
+        minimax_h3_adaln_cache_path=None,
     )
     pipeline = SimpleNamespace(
         pipeline_name="MiniMaxH3Pipeline",

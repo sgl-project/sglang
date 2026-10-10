@@ -864,9 +864,7 @@ class MiniMaxH3ComfyUIStepStage(PipelineStage):
                 self.transformer._resolved_attention_backend,
                 state.attn_metadata is not None,
                 state.build_step_metadata is not None,
-                getattr(state.branch, "static_kwargs", {}).get(
-                    "subblock_sparse_query_block_mask"
-                )
+                state.branch.static_kwargs.get("subblock_sparse_query_block_mask")
                 is not None,
             )
         fk, _branch = build_step_forward_kwargs(
