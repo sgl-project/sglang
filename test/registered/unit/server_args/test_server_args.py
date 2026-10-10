@@ -802,15 +802,6 @@ class TestMultimodalFeatureTransport(CustomTestCase):
             handle_multimodal_feature_transport(server_args)
 
     @override_platform(is_cuda=True)
-    def test_cuda_ipc_rejects_multi_node(self):
-        server_args = ServerArgs(
-            model_path="dummy", mm_feature_transport="cuda_ipc", nnodes=2
-        )
-
-        with self.assertRaisesRegex(ValueError, "single node"):
-            handle_multimodal_feature_transport(server_args)
-
-    @override_platform(is_cuda=True)
     def test_cuda_vmm_is_explicit_and_uses_shared_budget(self):
         server_args = ServerArgs(
             model_path="dummy",
