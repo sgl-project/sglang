@@ -1,0 +1,599 @@
+---
+title: "GLM-5.3-Flash"
+metatags:
+  description: "Deploy GLM-5.3-Flash with SGLang on Ascend A3 and A5 NPUs, including single-node and PD disaggregation modes."
+---
+
+## Introduction
+
+GLM-5.3-Flash is a model in the GLM series. SGLang supports its inference on Ascend NPUs with DeepSeek Sparse
+Attention (DSA), multi-token prediction (MTP), and ModelSlim quantized weights.
+
+This document demonstrates the deployment of GLM-5.3-Flash on Ascend NPUs using SGLang, including single-node
+prefill-decode mixed deployment, prefill-decode disaggregation, feature configuration, and performance tuning.
+The examples use W8A8 weights on Atlas 800I A3 and W8A8_MXFP8 weights on Ascend A5.
+
+## Supported features
+
+| Feature | Example usage |
+| --- | --- |
+| Tensor Parallelism | `--tp-size 16` |
+| Pipeline Parallelism | `--pp-size 4` |
+| Data Parallelism | `--dp-size 16` and `--enable-dp-attention` |
+| DeepEP | `--moe-a2a-backend deepep` and `--deepep-mode auto` |
+| PD Disaggregation | `--disaggregation-mode prefill` and `--disaggregation-transfer-backend ascend` |
+| Quantization | `--quantization modelslim` |
+| Chunked Prefill | `--chunked-prefill-size 8192` |
+| NPU Graph | `--cuda-graph-bs-decode 16` |
+| Speculative Decoding | `--speculative-algorithm NEXTN`<br/>`--speculative-num-steps 3`<br/>`--speculative-eagle-topk 1`<br/>`--speculative-num-draft-tokens 4` |
+| Overlap Schedule | `export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1` |
+| DP LM Head | `--enable-dp-lm-head` |
+
+<Note>
+The values in the **Example usage** column are for illustration only. Adjust them according to your hardware, deployment
+mode, and workload. For parameter details, see
+[Feature descriptions](/docs/hardware-platforms/ascend-npus/ascend_npu_optimization#feature-descriptions); for
+recommended configurations for each deployment scenario, see [Best practices](#best-practices).
+</Note>
+
+For feature compatibility and conflicts, see
+[Feature Compatibility](/docs/hardware-platforms/ascend-npus/ascend_npu_optimization#feature-compatibility).
+
+## Prerequisites
+
+### Environment
+
+Before following this tutorial, complete the environment setup in the documents below:
+
+- [Ascend NPU Quickstart](/docs/hardware-platforms/ascend-npus/ascend_npu_quick_start) — the fastest way to get started.
+  It walks you through launching the official container image, starting the SGLang server, and sending a test request.
+  Recommended if you are new to SGLang on Ascend.
+- [SGLang Installation with NPU Support](/docs/hardware-platforms/ascend-npus/ascend_npu) — the full installation guide.
+  It covers the component version mapping (CANN, TorchNPU, Triton, kernels, etc.), building from source or from a
+  Dockerfile, and recommended system settings (CPU power scheme, NUMA, swap). Use it when you need to install or customize
+  the environment instead of using the official image.
+
+### Model weights
+
+Before downloading model weights, check the model size to reserve enough disk space.
+For PD disaggregation, download the weights to a shared directory accessible to both nodes.
+
+- [GLM-5.3-Flash-w8a8](https://www.modelscope.cn/models/Eco-Tech/GLM-5.3-Flash-w8a8) (W8A8, 332.97GB, for Atlas 800I A3)
+- [GLM-5.3-Flash-w8a8-mxfp8](https://www.modelscope.cn/models/Eco-Tech/GLM-5.3-Flash-w8a8-mxfp8) (W8A8_MXFP8, 338.12GB, for Ascend A5)
+- You can use [msmodelslim](https://gitcode.com/Ascend/msmodelslim) to quantize the model. For quantization guidance, see
+  [Quantization on Ascend NPU](/docs/hardware-platforms/ascend-npus/ascend_npu_quantization).
+
+The checkpoint directory must contain the model configuration, tokenizer files, quantized weights,
+`quant_model_description.json`, and the MTP weights required by NEXTN.
+Set `MODEL_PATH` to this directory inside the container.
+
+<Info>
+A3 single-node deployment uses one full Atlas 800I A3 node: eight cards and 16 dies, with `--tp-size 16`.
+A5 single-node deployment uses eight NPU devices, with `--tp-size 8`.
+Each PD disaggregation configuration uses two nodes of the same platform: one for prefill and one for decode.
+</Info>
+
+For hardware specifications and terminology, see
+[Ascend NPU Reference — Hardware](/docs/hardware-platforms/ascend-npus/ascend_npu_reference#hardware).
+For the PD disaggregation configuration reference, see [Best practices](#best-practices).
+
+## Installation
+
+<Warning>
+Reserve enough disk space for both the container image and model weights before pulling the image.
+</Warning>
+
+Use a SGLang image with the runtime components required by your target platform and deployment mode.
+Replace `IMAGE`, `NAME`, and `MODEL_DIR` below, then start the container.
+For A5 PD disaggregation, choose an image that supports DP attention.
+
+<Tabs>
+  <Tab title="Atlas 800I A3">
+
+```bash Command
+# ============================================================
+# Before running, update the following variables:
+#   IMAGE: SGLang image for Ascend A3
+#   NAME: container name
+#   MODEL_DIR: model weights directory on the host
+# ============================================================
+
+IMAGE="swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-glm5.3-flash"
+NAME=sglang-glm53-flash-a3
+MODEL_DIR=/path/to/model-weights
+
+docker pull "$IMAGE"
+
+docker run -itd --shm-size=16g --name "$NAME" \
+    --privileged=true --net=host \
+    -v /var/queue_schedule:/var/queue_schedule \
+    -v /etc/ascend_install.info:/etc/ascend_install.info \
+    -v /usr/local/sbin:/usr/local/sbin \
+    -v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
+    -v /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
+    -v "${MODEL_DIR}:/models/GLM-5.3-Flash" \
+    --device=/dev/davinci0:/dev/davinci0 \
+    --device=/dev/davinci1:/dev/davinci1 \
+    --device=/dev/davinci2:/dev/davinci2 \
+    --device=/dev/davinci3:/dev/davinci3 \
+    --device=/dev/davinci4:/dev/davinci4 \
+    --device=/dev/davinci5:/dev/davinci5 \
+    --device=/dev/davinci6:/dev/davinci6 \
+    --device=/dev/davinci7:/dev/davinci7 \
+    --device=/dev/davinci8:/dev/davinci8 \
+    --device=/dev/davinci9:/dev/davinci9 \
+    --device=/dev/davinci10:/dev/davinci10 \
+    --device=/dev/davinci11:/dev/davinci11 \
+    --device=/dev/davinci12:/dev/davinci12 \
+    --device=/dev/davinci13:/dev/davinci13 \
+    --device=/dev/davinci14:/dev/davinci14 \
+    --device=/dev/davinci15:/dev/davinci15 \
+    --device=/dev/davinci_manager:/dev/davinci_manager \
+    --device=/dev/hisi_hdc:/dev/hisi_hdc \
+    --entrypoint=bash \
+    "$IMAGE"
+
+docker exec -it "$NAME" bash
+```
+
+  </Tab>
+  <Tab title="Ascend A5">
+
+```bash Command
+# ============================================================
+# Before running, update the following variables:
+#   IMAGE: SGLang image for Ascend A5
+#   NAME: container name
+#   MODEL_DIR: model weights directory on the host
+# ============================================================
+
+IMAGE="<your A5 image>"
+NAME=sglang-glm53-flash-a5
+MODEL_DIR=/path/to/model-weights
+
+docker pull "$IMAGE"
+
+docker run -itd --shm-size=16g --name "$NAME" \
+    --privileged=true --net=host \
+    -v /var/queue_schedule:/var/queue_schedule \
+    -v /etc/ascend_install.info:/etc/ascend_install.info \
+    -v /usr/local/sbin:/usr/local/sbin \
+    -v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
+    -v /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
+    -v "${MODEL_DIR}:/models/GLM-5.3-Flash" \
+    --device=/dev/davinci0:/dev/davinci0 \
+    --device=/dev/davinci1:/dev/davinci1 \
+    --device=/dev/davinci2:/dev/davinci2 \
+    --device=/dev/davinci3:/dev/davinci3 \
+    --device=/dev/davinci4:/dev/davinci4 \
+    --device=/dev/davinci5:/dev/davinci5 \
+    --device=/dev/davinci6:/dev/davinci6 \
+    --device=/dev/davinci7:/dev/davinci7 \
+    --device=/dev/davinci_manager:/dev/davinci_manager \
+    --device=/dev/hisi_hdc:/dev/hisi_hdc \
+    --entrypoint=bash \
+    "$IMAGE"
+
+docker exec -it "$NAME" bash
+```
+
+  </Tab>
+</Tabs>
+
+<Tip>
+- The examples mount the host checkpoint directory at `/models/GLM-5.3-Flash`. Set
+  `MODEL_PATH=/models/GLM-5.3-Flash` in the launch scripts when using this mount.
+- Give each container its own `NAME`. For PD disaggregation, start a container on both nodes.
+- The examples use the SGLang package installed in the image and require no source-code path or `PYTHONPATH` override.
+</Tip>
+
+## Online service deployment
+
+### Single-node deployment
+
+Prefill and decode run in the same instance. Select the script for your platform and run it inside the container.
+
+<Tabs>
+  <Tab title="Atlas 800I A3">
+
+Use the ModelSlim W8A8 checkpoint on one Atlas 800I A3 node, with TP16.
+Replace `MODEL_PATH` with the checkpoint directory inside the container.
+
+```shell
+# ============================================================
+# Before running, update the following variables:
+#   MODEL_PATH: path to the model weights directory
+# ============================================================
+
+MODEL_PATH=/path/to/model-weights
+
+source /usr/local/Ascend/cann-9.1.0/opp/vendors/customize/bin/set_env.bash
+source /usr/local/Ascend/nnal/atb/set_env.sh
+
+export HCCL_BUFFSIZE=1536
+unset ASCEND_LAUNCH_BLOCKING
+
+python3 -m sglang.launch_server \
+    --model-path "$MODEL_PATH" \
+    --quantization modelslim \
+    --attention-backend ascend \
+    --device npu \
+    --tp-size 16 --nnodes 1 \
+    --chunked-prefill-size 4096 \
+    --max-prefill-tokens 8192 \
+    --trust-remote-code \
+    --mem-fraction-static 0.78 \
+    --page-size 128 \
+    --served-model-name GLM-5.3-Flash \
+    --cuda-graph-bs-decode 16 \
+    --max-running-requests 16 \
+    --load-balance-method round_robin \
+    --enable-multimodal \
+    --moe-a2a-backend deepep --deepep-mode auto \
+    --speculative-draft-model-path "$MODEL_PATH" \
+    --speculative-algorithm NEXTN \
+    --speculative-num-steps 3 \
+    --speculative-eagle-topk 1 \
+    --speculative-num-draft-tokens 4 \
+    --watchdog-timeout 9000 \
+    --host 127.0.0.1 --port 8810
+```
+
+  </Tab>
+  <Tab title="Ascend A5">
+
+Use the ModelSlim W8A8_MXFP8 checkpoint on one A5 node, with TP8 and no DP attention.
+Replace `MODEL_PATH` with the checkpoint directory inside the container.
+
+```shell
+# ============================================================
+# Before running, update the following variables:
+#   MODEL_PATH: path to the model weights directory
+# ============================================================
+
+MODEL_PATH=/path/to/model-weights
+
+source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
+source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/custom_transformer/bin/set_env.bash
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/memfabric_hybrid/set_env.sh
+
+export SGLANG_NPU_PROFILING=0
+export ASCEND_LAUNCH_BLOCKING=1
+export HCCL_BUFFSIZE=256
+
+python3 -m sglang.launch_server \
+    --model-path "$MODEL_PATH" \
+    --quantization modelslim \
+    --attention-backend ascend \
+    --device npu \
+    --tp-size 8 --nnodes 1 \
+    --chunked-prefill-size 8192 \
+    --max-prefill-tokens 8192 \
+    --trust-remote-code \
+    --mem-fraction-static 0.83 \
+    --page-size 64 \
+    --served-model-name GLM-5.3-Flash \
+    --load-format auto \
+    --max-running-requests 16 \
+    --pre-warm-nccl \
+    --speculative-draft-model-path "$MODEL_PATH" \
+    --speculative-draft-kv-cache-dtype bf16 \
+    --speculative-algorithm NEXTN \
+    --speculative-num-steps 4 \
+    --speculative-eagle-topk 1 \
+    --speculative-num-draft-tokens 5 \
+    --watchdog-timeout 1200 \
+    --cuda-graph-bs-decode 1 8 64 \
+    --host 127.0.0.1 --port 8810
+```
+
+  </Tab>
+</Tabs>
+
+### Prefill-decode disaggregation deployment
+
+PD disaggregation places prefill and decode on separate nodes. Replace the model path, node IP addresses, and
+network interface names, then run the same script on both nodes. The script selects its role by matching the local
+IP address.
+
+Ensure the worker HTTP ports, prefill bootstrap port, and MemFabric store port are reachable between the nodes.
+
+<Tabs>
+  <Tab title="Atlas 800I A3">
+
+Use W8A8 weights on two Atlas 800I A3 nodes. The prefill instance uses TP4 / PP4 / DP4; the decode instance uses
+TP16 / PP1 / DP16 and NEXTN speculative decoding with three steps and four draft tokens.
+Run the CPU tuning commands with the required host privileges.
+
+```shell
+# ============================================================
+# Before running, update the following variables:
+#   MODEL_PATH: path to the model weights directory
+#   PREFILL_IP: prefill node IP address
+#   DECODE_IP: decode node IP address
+#   HCCL_SOCKET_IFNAME: network interface name for HCCL
+#   GLOO_SOCKET_IFNAME: network interface name for Gloo
+# ============================================================
+
+MODEL_PATH=/path/to/model-weights
+PREFILL_IP="<your prefill ip>"
+DECODE_IP="<your decode ip>"
+
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+export SGLANG_SET_CPU_AFFINITY=1
+
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
+source /usr/local/Ascend/nnal/atb/set_env.sh
+
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export STREAMS_PER_DEVICE=32
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export HCCL_SOCKET_IFNAME="<network-interface>"
+export GLOO_SOCKET_IFNAME="<network-interface>"
+export ASCEND_MF_STORE_URL="tcp://${PREFILL_IP}:24707"
+export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=1200
+export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=1200
+
+unset ASCEND_LAUNCH_BLOCKING
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY
+export no_proxy="127.0.0.1,localhost,${PREFILL_IP},${DECODE_IP},${no_proxy:-}"
+export NO_PROXY="$no_proxy"
+LOCAL_IPS=" $(hostname -I) "
+
+if [[ "$LOCAL_IPS" == *" $PREFILL_IP "* ]]; then
+    export SGLANG_HOST_IP="$PREFILL_IP"
+    export HCCL_BUFFSIZE=1200
+    export DEEPEP_HCCL_BUFFSIZE=1200
+    export DEEPEP_NORMAL_LONG_SEQ_ROUND=128
+    export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=1024
+    export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+    export TASK_QUEUE_ENABLE=2
+    export HCCL_IF_BASE_PORT=61000
+
+    python3 -m sglang.launch_server \
+        --model-path "$MODEL_PATH" \
+        --quantization modelslim \
+        --device npu \
+        --attention-backend ascend \
+        --trust-remote-code \
+        --enable-multimodal \
+        --served-model-name GLM-5.3-Flash \
+        --disaggregation-mode prefill \
+        --disaggregation-bootstrap-port 8998 \
+        --disaggregation-transfer-backend ascend \
+        --dist-init-addr "${PREFILL_IP}:5000" \
+        --tp-size 4 --pp-size 4 --dp-size 4 --nnodes 1 \
+        --enable-dp-attention \
+        --enable-dp-lm-head \
+        --moe-dense-tp 1 \
+        --moe-a2a-backend deepep --deepep-mode normal \
+        --load-balance-method round_robin \
+        --mem-fraction-static 0.78 \
+        --page-size 128 \
+        --max-running-requests 16 \
+        --chunked-prefill-size 4096 \
+        --max-prefill-tokens 8192 \
+        --watchdog-timeout 9000 \
+        --host "$PREFILL_IP" --port 8810
+elif [[ "$LOCAL_IPS" == *" $DECODE_IP "* ]]; then
+    export SGLANG_HOST_IP="$DECODE_IP"
+    export HCCL_BUFFSIZE=512
+    export DEEPEP_HCCL_BUFFSIZE=512
+    export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=16
+    export SGLANG_ENABLE_SPEC_V2=1
+    export SGLANG_SPEC_ENABLE_OVERLAP_REFLOW=1
+    export SGLANG_NPU_USE_MULTI_STREAM=1
+    export TASK_QUEUE_ENABLE=0
+    export HCCL_IF_BASE_PORT=61010
+
+    python3 -m sglang.launch_server \
+        --model-path "$MODEL_PATH" \
+        --quantization modelslim \
+        --device npu \
+        --attention-backend ascend \
+        --trust-remote-code \
+        --enable-multimodal \
+        --served-model-name GLM-5.3-Flash \
+        --disaggregation-mode decode \
+        --disaggregation-transfer-backend ascend \
+        --dist-init-addr "${DECODE_IP}:5000" \
+        --tp-size 16 --pp-size 1 --dp-size 16 --nnodes 1 \
+        --enable-dp-attention \
+        --moe-a2a-backend deepep --deepep-mode low_latency \
+        --load-balance-method round_robin \
+        --mem-fraction-static 0.75 \
+        --page-size 128 \
+        --max-running-requests 32 \
+        --cuda-graph-bs-decode 1 2 \
+        --speculative-draft-model-path "$MODEL_PATH" \
+        --speculative-algorithm NEXTN \
+        --speculative-num-steps 3 \
+        --speculative-eagle-topk 1 \
+        --speculative-num-draft-tokens 4 \
+        --watchdog-timeout 9000 \
+        --host "$DECODE_IP" --port 8811
+else
+    echo "Local IP does not match PREFILL_IP or DECODE_IP: $LOCAL_IPS" >&2
+    exit 1
+fi
+```
+
+  </Tab>
+  <Tab title="Ascend A5">
+
+Use W8A8_MXFP8 weights on two A5 nodes. Both instances use TP8 / PP1 / DP2 and NEXTN speculative decoding
+with four steps and five draft tokens. The nodes must be able to communicate over the `device_urma` transport.
+
+```shell
+# ============================================================
+# Before running, update the following variables:
+#   MODEL_PATH: path to the model weights directory
+#   PREFILL_IP: prefill node IP address
+#   DECODE_IP: decode node IP address
+# ============================================================
+
+MODEL_PATH=/path/to/model-weights
+PREFILL_IP="<your prefill ip>"
+DECODE_IP="<your decode ip>"
+
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
+source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/custom_transformer/bin/set_env.bash
+
+export SGLANG_NPU_PROFILING=0
+export HCCL_BUFFSIZE=256
+export ASCEND_MF_STORE_URL="tcp://${PREFILL_IP}:24670"
+export ASCEND_MF_TRANSFER_PROTOCOL=device_urma
+unset ASCEND_LAUNCH_BLOCKING
+export no_proxy="127.0.0.1,localhost,${PREFILL_IP},${DECODE_IP},${no_proxy:-}"
+export NO_PROXY="$no_proxy"
+LOCAL_IPS=" $(hostname -I) "
+
+if [[ "$LOCAL_IPS" == *" $PREFILL_IP "* ]]; then
+    export SGLANG_HOST_IP="$PREFILL_IP"
+    python3 -m sglang.launch_server \
+        --model-path "$MODEL_PATH" \
+        --quantization modelslim --load-format auto \
+        --device npu --attention-backend ascend --trust-remote-code \
+        --served-model-name GLM-5.3-Flash \
+        --disaggregation-mode prefill \
+        --disaggregation-bootstrap-port 8998 \
+        --disaggregation-transfer-backend ascend \
+        --tp-size 8 --pp-size 1 --dp-size 2 --enable-dp-attention --nnodes 1 \
+        --chunked-prefill-size 16384 --max-prefill-tokens 16384 \
+        --mem-fraction-static 0.83 --page-size 64 --max-running-requests 16 \
+        --speculative-draft-model-path "$MODEL_PATH" \
+        --speculative-draft-kv-cache-dtype bf16 \
+        --speculative-algorithm NEXTN --speculative-num-steps 4 \
+        --speculative-eagle-topk 1 --speculative-num-draft-tokens 5 \
+        --pre-warm-nccl --watchdog-timeout 1200 --cuda-graph-bs-decode 1 8 64 \
+        --host "$PREFILL_IP" --port 8810
+elif [[ "$LOCAL_IPS" == *" $DECODE_IP "* ]]; then
+    export SGLANG_HOST_IP="$DECODE_IP"
+    python3 -m sglang.launch_server \
+        --model-path "$MODEL_PATH" \
+        --quantization modelslim --load-format auto \
+        --device npu --attention-backend ascend --trust-remote-code \
+        --served-model-name GLM-5.3-Flash \
+        --disaggregation-mode decode \
+        --disaggregation-bootstrap-port 8998 \
+        --disaggregation-transfer-backend ascend \
+        --tp-size 8 --pp-size 1 --dp-size 2 --enable-dp-attention --nnodes 1 \
+        --chunked-prefill-size 16384 --max-prefill-tokens 16384 \
+        --mem-fraction-static 0.83 --page-size 64 --max-running-requests 16 \
+        --speculative-draft-model-path "$MODEL_PATH" \
+        --speculative-draft-kv-cache-dtype bf16 \
+        --speculative-algorithm NEXTN --speculative-num-steps 4 \
+        --speculative-eagle-topk 1 --speculative-num-draft-tokens 5 \
+        --pre-warm-nccl --watchdog-timeout 1200 --cuda-graph-bs-decode 1 8 64 \
+        --host "$DECODE_IP" --port 8811
+else
+    echo "Local IP does not match PREFILL_IP or DECODE_IP: $LOCAL_IPS" >&2
+    exit 1
+fi
+```
+
+  </Tab>
+</Tabs>
+
+Launch the router after the prefill and decode services are ready. Use the same node IP addresses as in the worker
+scripts. Client requests go to the router on port 8000; the worker ports are 8810 and 8811, and the prefill bootstrap
+port is 8998.
+
+```shell
+# ============================================================
+# Before running, update the following variables:
+#   PREFILL_IP: prefill node IP address
+#   DECODE_IP: decode node IP address
+#   ROUTER_HOST_IP: router node IP address
+# ============================================================
+
+PREFILL_IP="<your prefill ip>"
+DECODE_IP="<your decode ip>"
+ROUTER_HOST_IP="<your router ip>"
+export no_proxy="127.0.0.1,localhost,${PREFILL_IP},${DECODE_IP},${ROUTER_HOST_IP},${no_proxy:-}"
+export NO_PROXY="$no_proxy"
+
+python3 -m sglang_router.launch_router \
+    --pd-disaggregation \
+    --prefill "http://${PREFILL_IP}:8810" 8998 \
+    --decode "http://${DECODE_IP}:8811" \
+    --host "$ROUTER_HOST_IP" --port 8000 \
+    --policy round_robin \
+    --worker-startup-timeout-secs 3600 \
+    --request-timeout-secs 7200 \
+    --disable-retries
+```
+
+## Functional verification
+
+After the service starts, send a prompt to verify inference. For mixed deployment, run the command inside the
+container with `HOST=127.0.0.1` and `PORT=8810`. For PD disaggregation, use the router IP address and `PORT=8000`.
+
+```shell
+# ============================================================
+# Before running, update the following variables:
+#   HOST: server or router host address
+#   PORT: 8810 for mixed deployment; 8000 for the router
+# ============================================================
+
+HOST=127.0.0.1
+PORT=8810
+
+curl "http://${HOST}:${PORT}/generate" \
+    -H "Content-Type: application/json" \
+    -d '{
+        "text": "What is the capital of France?",
+        "sampling_params": {
+            "max_new_tokens": 64,
+            "temperature": 0
+        }
+    }'
+```
+
+Check for an HTTP 200 response with the generated answer. Once the server prints
+`The server is fired up and ready to roll!`, it is ready to accept requests.
+For Health Check, Generate, Chat Completions, and port usage examples, see
+[Testing the Service](/docs/hardware-platforms/ascend-npus/ascend_npu#testing-the-service).
+
+## Accuracy evaluation
+
+For evaluation methods and datasets, see
+[Accuracy Evaluation on Ascend NPU](/docs/hardware-platforms/ascend-npus/ascend_npu_accuracy_evaluation).
+
+## Performance
+
+For benchmark methods and metric definitions, see
+[Performance Testing on Ascend NPU](/docs/hardware-platforms/ascend-npus/ascend_npu_performance_testing).
+
+The [GLM-5.3-Flash benchmark command](/docs/hardware-platforms/ascend-npus/best_practice/glm5_3_flash#benchmark)
+uses a generated shared-prefix workload with approximately 128K input tokens and 1K output tokens.
+For mixed deployment, use the worker host and port 8810. For PD disaggregation, use the router host and port 8000.
+Set both `--model` and `--tokenizer` to the checkpoint path and use `--served-model-name GLM-5.3-Flash`.
+
+## Best practices
+
+### Best practice configuration reference
+
+See [GLM-5.3-Flash Best Practices](/docs/hardware-platforms/ascend-npus/best_practice/glm5_3_flash)
+for the A3 W8A8 and A5 W8A8_MXFP8 PD disaggregation configurations, router startup, and benchmark command.
+The [Online service deployment](#online-service-deployment) section above also contains complete scripts for
+single-node mixed deployment and PD disaggregation.
+
+For the optimization feature catalog and compatibility details, see
+[Optimization on Ascend NPU](/docs/hardware-platforms/ascend-npus/ascend_npu_optimization).
+
+## Performance tuning
+
+For the feature overview, see [Supported features](#supported-features). For tuning parameters and feature
+compatibility, see [Optimization on Ascend NPU](/docs/hardware-platforms/ascend-npus/ascend_npu_optimization).
+
+## FAQ
+
+For environment, installation, and general parameter issues, see
+[Ascend NPU FAQ](/docs/hardware-platforms/ascend-npus/ascend_npu_faq).
