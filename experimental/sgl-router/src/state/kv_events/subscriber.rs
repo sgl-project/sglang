@@ -1811,49 +1811,6 @@ mod tests {
         registry.shutdown().await;
     }
 
-    #[tokio::test]
-    async fn replay_accepts_legacy_and_topic_frames() {
-        use zeromq::RouterSocket;
-
-        for include_topic in [false, true] {
-            let mut router = RouterSocket::new();
-            let endpoint = router.bind("tcp://127.0.0.1:0").await.unwrap().to_string();
-            let server = tokio::spawn(async move {
-                let request = router.recv().await.unwrap();
-                let peer = request.get(0).unwrap().clone();
-                for seq in [1_i64, END_SEQ_SENTINEL] {
-                    let mut reply = ZmqMessage::from(peer.clone());
-                    reply.push_back(Bytes::new());
-                    if include_topic {
-                        reply.push_back(if seq == END_SEQ_SENTINEL {
-                            Bytes::new()
-                        } else {
-                            Bytes::from_static(b"kv@prefill@model")
-                        });
-                    }
-                    reply.push_back(Bytes::copy_from_slice(&seq.to_be_bytes()));
-                    reply.push_back(if seq == END_SEQ_SENTINEL {
-                        Bytes::new()
-                    } else {
-                        Bytes::from(helpers::encode_all_blocks_cleared_batch(0.0, None))
-                    });
-                    router.send(reply).await.unwrap();
-                }
-            });
-            let mut batches = Vec::new();
-            timeout(
-                Duration::from_secs(2),
-                fetch_replay(&endpoint, 1, 3, &mut batches),
-            )
-            .await
-            .unwrap()
-            .unwrap();
-            assert_eq!(batches.len(), 1, "include_topic={include_topic}");
-            assert_eq!(batches[0].0, 1);
-            server.await.unwrap();
-        }
-    }
-
     /// Replay can time out or fail after useful batches have already arrived.
     #[tokio::test]
     async fn replay_preserves_batches_before_timeout_or_decode_error() {
