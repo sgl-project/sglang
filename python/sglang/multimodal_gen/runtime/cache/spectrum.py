@@ -318,6 +318,7 @@ class SpectrumContext:
     is_cfg_negative: bool
     spectrum_params: SpectrumParams
     debug: bool
+    is_cfg_parallel: bool = False
 
 
 class SpectrumMixin:
@@ -331,16 +332,19 @@ class SpectrumMixin:
     - ``spectrum_record_features()`` — after a real forward, store block outputs.
     - ``spectrum_predict_features()`` — on skipped steps, return forecasted outputs.
 
-    Models with separate CFG branches (Wan, Hunyuan, SD3) list their model prefix
-    in ``_CFG_SUPPORTED_PREFIXES`` so cond/uncond maintain independent counters and
-    forecasters. All other ``CachableDiT`` subclasses share one counter.
+    Models with separate CFG branches (Wan, Hunyuan, SD3, FLUX) list their model
+    prefix in ``_CFG_SUPPORTED_PREFIXES`` so cond/uncond maintain independent
+    counters and forecasters. All other ``CachableDiT`` subclasses share one counter.
     """
 
     # DiT model prefixes that run separate cond/uncond forwards (see TeaCache).
-    _CFG_SUPPORTED_PREFIXES: set[str] = {"wan", "hunyuan", "sd3"}
+    # Per-branch state keeps each schedule in denoising steps, so it is unaffected
+    # by CFG gating dropping the uncond forward, and never mixes cond/uncond
+    # features in one forecaster.
+    _CFG_SUPPORTED_PREFIXES: set[str] = {"wan", "hunyuan", "sd3", "flux"}
 
     def _init_spectrum_state(self) -> None:
-        """Initialize Spectrum state variables. Dual-branch models (Wan, Hunyuan) track separate
+        """Initialize Spectrum state variables. Dual-branch models track separate
         cond/uncond forecasters and counters; others share one.
         """
         # Positive branch (cond) or single-branch state
@@ -370,17 +374,11 @@ class SpectrumMixin:
             self.prefix.lower() in self._CFG_SUPPORTED_PREFIXES
         )
 
-    def reset_spectrum_state(self, spectrum_params: SpectrumParams) -> None:
-        self.spectrum_cnt = 0
-        self.spectrum_num_consecutive_cached_steps = 0
-        self.spectrum_curr_ws = spectrum_params.window_size
-        self.spectrum_forecaster = None
-        self.spectrum_is_cfg_negative = False
-        self.spectrum_real_steps = 0
-        self.spectrum_skipped_steps = 0
-        self.spectrum_shadow_rel_l2_sum = 0.0
-        self.spectrum_shadow_rel_l2_count = 0
-        if self._spectrum_supports_cfg_cache:
+    def _reset_spectrum_branch_state(
+        self, spectrum_params: SpectrumParams, *, is_cfg_negative: bool
+    ) -> None:
+        """Reset the schedule, forecaster, and stats owned by one CFG branch."""
+        if is_cfg_negative and self._spectrum_supports_cfg_cache:
             self.spectrum_cnt_negative = 0
             self.spectrum_num_consecutive_cached_steps_negative = 0
             self.spectrum_curr_ws_negative = spectrum_params.window_size
@@ -389,6 +387,23 @@ class SpectrumMixin:
             self.spectrum_skipped_steps_negative = 0
             self.spectrum_shadow_rel_l2_sum_negative = 0.0
             self.spectrum_shadow_rel_l2_count_negative = 0
+            return
+
+        self.spectrum_cnt = 0
+        self.spectrum_num_consecutive_cached_steps = 0
+        self.spectrum_curr_ws = spectrum_params.window_size
+        self.spectrum_forecaster = None
+        self.spectrum_real_steps = 0
+        self.spectrum_skipped_steps = 0
+        self.spectrum_shadow_rel_l2_sum = 0.0
+        self.spectrum_shadow_rel_l2_count = 0
+
+    def reset_spectrum_state(self, spectrum_params: SpectrumParams) -> None:
+        """Reset all Spectrum branches for callers that need a full reset."""
+        self._reset_spectrum_branch_state(spectrum_params, is_cfg_negative=False)
+        if self._spectrum_supports_cfg_cache:
+            self._reset_spectrum_branch_state(spectrum_params, is_cfg_negative=True)
+        self.spectrum_is_cfg_negative = False
 
     def _get_spectrum_branch_state(self) -> tuple[int, int, float]:
         """Get schedule state for current branch (cond or uncond)."""
@@ -435,6 +450,7 @@ class SpectrumMixin:
         from sglang.multimodal_gen.runtime.managers.forward_context import (
             get_forward_context,
         )
+        from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 
         try:
             forward_context = get_forward_context()
@@ -452,10 +468,12 @@ class SpectrumMixin:
         do_cfg = forward_batch.do_classifier_free_guidance
         is_cfg_negative = forward_batch.is_cfg_negative
         num_inference_steps = forward_batch.num_inference_steps
+        is_cfg_parallel = bool(get_global_server_args().enable_cfg_parallel)
         total_forward_steps = spectrum_params.get_total_forward_steps(
             num_inference_steps,
             do_cfg,
             self._spectrum_supports_cfg_cache,
+            cfg_parallel=is_cfg_parallel,
         )
 
         return SpectrumContext(
@@ -466,6 +484,7 @@ class SpectrumMixin:
             is_cfg_negative=is_cfg_negative,
             spectrum_params=spectrum_params,
             debug=bool(getattr(forward_batch, "debug", False)),
+            is_cfg_parallel=is_cfg_parallel,
         )
 
     def _record_spectrum_step_stat(self, actual_forward: bool) -> None:
@@ -538,21 +557,21 @@ class SpectrumMixin:
             # Spectrum disabled — always run blocks (normal DiT path).
             return True
 
-        # Reset at the very first denoising step of each generation.
-        # Only the positive (or sole) branch triggers the reset so that:
-        # - single-branch models (FLUX, Hunyuan embedded guidance) reset once.
-        # - dual-branch models (Wan with true CFG) reset both counters from the
-        #   positive-branch call and leave the negative-branch call unaffected,
-        #   keeping both branches synchronised (both start at cnt=0 → cnt=1).
-        # Doing the reset here (not inside _get_spectrum_context) guarantees it
-        # fires exactly once per step, preventing the double-reset that would
-        # desync the two branches.
-        if ctx.current_step == 0 and not ctx.is_cfg_negative:
-            if ctx.debug:
+        # Each CFG branch owns its reset, and CFG-parallel ranks each own a model
+        # instance. Serial models with shared CFG state reset only on the
+        # positive call, so the negative call cannot discard the positive history.
+        if ctx.current_step == 0 and (
+            ctx.is_cfg_parallel
+            or not ctx.is_cfg_negative
+            or self._spectrum_supports_cfg_cache
+        ):
+            if ctx.debug and not ctx.is_cfg_negative:
                 logger.info(
                     "[Spectrum] Debug mode enables shadow-error validation; runtime perf is not representative of non-debug runs."
                 )
-            self.reset_spectrum_state(ctx.spectrum_params)
+            self._reset_spectrum_branch_state(
+                ctx.spectrum_params, is_cfg_negative=ctx.is_cfg_negative
+            )
 
         self.spectrum_is_cfg_negative = ctx.is_cfg_negative
         params = ctx.spectrum_params
@@ -580,7 +599,7 @@ class SpectrumMixin:
 
         # End-of-run wrap: after ``total_steps`` forwards on this branch, reset
         # counters so state does not leak if the same module is reused. (A fresh
-        # run also resets via ``reset_spectrum_state`` at denoising timestep 0.)
+        # run also resets this branch at denoising timestep 0.)
         total_steps = ctx.total_forward_steps
         if cnt >= total_steps:
             self._emit_spectrum_summary(ctx)
