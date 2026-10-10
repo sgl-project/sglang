@@ -6,11 +6,23 @@ metatags:
 ---
 
 import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
-import { LTXDeployment } from '/src/snippets/diffusion/ltx-deployment.jsx';
 
 <DiffusionModelTags tags={["video", "text-to-video", "image-to-video", "one/two-stage", "1088p HQ"]} />
 
-## 1. Model Introduction
+import { Deployment } from '/src/snippets/_deployment.jsx';
+import { config } from '/src/snippets/configs/Lightricks/ltx2.jsx';
+
+## 1. Quick start
+
+Follow the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installation) for your GPU platform.
+
+<a id="2-sglang-diffusion-installation" />
+
+<Deployment config={config} />
+
+<a id="1-model-introduction" />
+
+## 2. Model capabilities
 
 [LTX-2](https://huggingface.co/Lightricks/LTX-2) and [LTX-2.3](https://huggingface.co/Lightricks/LTX-2.3) are Lightricks video models for text-to-video and image-conditioned generation. Their defining deployment choice is the pipeline: one-stage minimizes latency, standard two-stage refines quality, and LTX-2.3 adds a 1920×1088 HQ path.
 
@@ -22,16 +34,6 @@ Use `Lightricks/LTX-2` or `Lightricks/LTX-2.3` as `--model-path`. SGLang loads t
 **License notice:** LTX-2 and LTX-2.3 are released under the LTX-2 Community License Agreement, not Apache 2.0. The license includes commercial-use restrictions for some entities. Review the [official Lightricks license](https://huggingface.co/Lightricks/LTX-2.3/blob/main/LICENSE) before production or commercial use; SGLang support does not grant additional model usage rights.
 </Warning>
 
-## 2. SGLang-diffusion Installation
-
-Install SGLang with diffusion dependencies:
-
-```bash
-uv pip install "sglang[diffusion]" --prerelease=allow
-```
-
-For platform-specific setup, see the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installation).
-
 ## 3. Model Deployment
 
 This section provides deployment configurations optimized for different LTX pipelines and hardware targets.
@@ -40,9 +42,7 @@ This section provides deployment configurations optimized for different LTX pipe
 
 The LTX series supports one-stage and two-stage pipelines. LTX-2.3 also supports the HQ two-stage pipeline. The recommended launch configuration depends on whether the target GPU can keep both two-stage DiTs resident.
 
-**Interactive Command Generator**: Use the configuration selector below to generate a deployment command. The default selection targets a single NVIDIA H200 with `resident` two-stage mode. For multi-GPU serving, start from the 2-GPU or 4-GPU presets and only change parallelism if you need more memory headroom.
-
-<LTXDeployment />
+Use the [command builder](#1-quick-start) above.
 
 ### 3.2 Configuration Tips
 

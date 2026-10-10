@@ -40,6 +40,7 @@ def _make_queue(rids, *, tp_world_size=1, cp_world_size=1):
         attn_tp_cpu_group=tp_group,
         attn_cp_cpu_group=cp_group,
         handle_bootstrap_failure=MagicMock(),
+        processed_tokens_counter=0,
     )
     queue.finalize_bootstrap = MagicMock(return_value=True)
     queue.ensure_metadata_buffer = MagicMock(return_value=True)
@@ -73,7 +74,6 @@ class TestPrefillBootstrapRidAlign(CustomTestCase):
             ) as poll,
         ):
             self.assertEqual(queue.pop_bootstrapped(), [])
-            self.assertEqual(queue.pop_bootstrapped(return_failed_reqs=True), ([], []))
             poll.assert_not_called()
 
     def test_empty_queue_rid_align_all_ranks_idle(self):
@@ -231,10 +231,9 @@ class TestPrefillBootstrapRidAlign(CustomTestCase):
                 return_value=[KVPoll.Failed],
             ),
         ):
-            bootstrapped, failed = queue.pop_bootstrapped(return_failed_reqs=True)
+            bootstrapped = queue.pop_bootstrapped()
 
         self.assertEqual(bootstrapped, [])
-        self.assertEqual(failed, [req])
         self.assertEqual(queue.queue, [])
         queue.scheduler.handle_bootstrap_failure.assert_called_once_with(req)
 
@@ -272,7 +271,7 @@ class TestPrefillBootstrapRidAlign(CustomTestCase):
                 return_value=False,
             ),
         ):
-            bootstrapped, failed = queue.pop_bootstrapped(return_failed_reqs=True)
+            bootstrapped = queue.pop_bootstrapped()
 
         # aligned_reqs is sorted by rid: [rid-a, rid-b], so poll[0] is rid-a's
         # (Failed) and poll[1] is rid-b's (WaitingForInput), regardless of the
@@ -281,7 +280,6 @@ class TestPrefillBootstrapRidAlign(CustomTestCase):
         self.assertIs(senders[0], req_a.disagg_kv_sender)
         self.assertIs(senders[1], req_b.disagg_kv_sender)
         self.assertEqual(bootstrapped, [req_b])
-        self.assertEqual(failed, [req_a])
         self.assertEqual(queue.queue, [req_c])
         queue.scheduler.handle_bootstrap_failure.assert_called_once_with(req_a)
 

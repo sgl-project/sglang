@@ -4,7 +4,7 @@ const platformAttention = (s) => sm12Hardware.includes(s.hw) ? "sdpa" : "fa";
 const effectiveAttention = (s) => s.attention === "platform" || (sm12Hardware.includes(s.hw) && s.attention === "fa") ? platformAttention(s) : s.attention;
 
 const config = {
-  modelName: "Qwen-Image 2.1",
+  modelName: "Qwen-Image 2.1 / Turbo",
   supportedHardware: ["h200", "b200", "rtxpro6000", "rtx5090", "rtx4090", "dgx-spark"],
   hardware: [
     { id: "rtxpro6000", label: "RTX PRO 6000", vram: "96GB", vendor: "consumer" },
@@ -19,9 +19,12 @@ const config = {
       id: "weights",
       title: "Checkpoint weights",
       scope: "base",
-      description: "One checkpoint serves generation and editing. Set its Hugging Face repository or local path under Variables.",
+      description: "Both checkpoints serve generation and editing. Turbo uses its preset eight-step sigma grid. Restart the server when changing weights.",
       default: "default",
-      options: [{ id: "default", label: "Qwen-Image 2.1", flags: [] }],
+      options: [
+        { id: "default", label: "Qwen-Image 2.1", description: "Original checkpoint with a configurable step count; defaults to 40 steps." },
+        { id: "turbo", label: "Qwen-Image 2.1 Turbo", description: "Accelerated checkpoint with a fixed eight-step schedule, loaded automatically from model_index.json." },
+      ],
     },
     {
       id: "mode",
@@ -263,8 +266,18 @@ const config = {
       id: "steps",
       title: "Denoising steps",
       scope: "request",
+      showWhen: (s) => s.weights !== "turbo",
       description: "40 is the checkpoint default. Fewer steps trade detail for latency.",
       kind: "number", min: 1, max: 100, unit: "steps", default: 40, options: [],
+    },
+    {
+      id: "schedule",
+      title: "Denoising schedule",
+      scope: "request",
+      showWhen: (s) => s.weights === "turbo",
+      description: "Turbo loads the checkpoint's eight-step sigma grid. A step-count override does not replace this grid.",
+      default: "preset",
+      options: [{ id: "preset", label: "8 steps (checkpoint preset)", recommended: true }],
     },
     {
       id: "outputs",
@@ -284,6 +297,7 @@ const config = {
       limits: { nodes: { min: 1, max: 1 }, gpus_per_node: { min: 1, max: 4 } },
       verifiedRecipes: [
         { id: "h200-1-resident", hw: "h200", nodes: 1, gpus_per_node: 1, placement: "resident", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", attentions: ["fa", "sdpa"], batchSizes: [1, 2, 4], batchAttentions: ["fa"], default: true },
+        { id: "h200-2-tp-turbo", weights: "turbo", hw: "h200", nodes: 1, gpus_per_node: 2, placement: "resident", tp_size: 2, ulysses_degree: 1, ring_degree: 1, encoder: "auto", attentions: ["fa"], verifiedWhen: (s) => s.weights === "turbo" && (!s.batching || s.batching === "off") },
         { id: "b200-1-resident", hw: "b200", nodes: 1, gpus_per_node: 1, placement: "resident", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", attentions: ["fa", "sdpa"], batchSizes: [1, 2, 4], batchAttentions: ["fa"], default: true },
         { id: "b200-2-tp", hw: "b200", nodes: 1, gpus_per_node: 2, placement: "resident", tp_size: 2, ulysses_degree: 1, ring_degree: 1, encoder: "auto", attentions: ["fa"], batchSizes: [1, 2] },
         { id: "b200-2-ulysses", hw: "b200", nodes: 1, gpus_per_node: 2, placement: "resident", tp_size: 1, ulysses_degree: 2, ring_degree: 1, encoder: "auto", attentions: ["fa"], batchSizes: [1, 2] },
@@ -293,7 +307,9 @@ const config = {
         { id: "rtx4090-1-offload", hw: "rtx4090", nodes: 1, gpus_per_node: 1, placement: "offload", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", attentions: ["fa", "sdpa"], batchSizes: [1, 2], batchAttentions: ["fa"], default: true },
         { id: "dgx-spark-1-resident", hw: "dgx-spark", nodes: 1, gpus_per_node: 1, placement: "resident", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", attentions: ["sdpa"], batchSizes: [1], default: true },
       ],
-      autoTopology: (s) => ({ tp_size: 1, ulysses_degree: Number(s.gpus_per_node), ring_degree: 1 }),
+      autoTopology: (s) => s.weights === "turbo" && s.hw === "h200" && Number(s.gpus_per_node) === 2
+        ? { tp_size: 2, ulysses_degree: 1, ring_degree: 1 }
+        : { tp_size: 1, ulysses_degree: Number(s.gpus_per_node), ring_degree: 1 },
       validateTopology: (s, topology) => {
         const errors = [];
         const nodes = Number(s.nodes);
@@ -322,20 +338,27 @@ const config = {
         && entry.placement === s.placement && entry.tp_size === topology.tp_size
         && entry.ulysses_degree === topology.ulysses_degree && entry.ring_degree === topology.ring_degree);
       const serveVerified = !!recipe && !recipe.unverified && errors.length === 0 && s.encoder === "auto"
-        && recipe.attentions.includes(effectiveAttention(s)) && s.precision === "native"
+        && recipe.verifiedWhen(s) && recipe.attentions.includes(effectiveAttention(s)) && s.precision === "native"
         && s.execution === "eager" && s.vae === "full"
         && (!s.batching || s.batching === "off" || ((recipe.batchSizes || [1]).includes(Number(s.batching))
           && (recipe.batchAttentions || recipe.attentions).includes(effectiveAttention(s))));
       // Exact HTTP workloads from the validation matrix, not blanket quality coverage.
-      const requestVerified = serveVerified
-        && ((recipe.batchSizes && (Number(s.outputs) === 1 || (recipe.batchAttentions || recipe.attentions).includes(effectiveAttention(s)))
+      const turboRequestVerified = s.resolution === "1024"
+        && (Number(s.gpus_per_node) === 1
+          ? ((Number(s.outputs) === 1 && (s.mode === "text"
+              || (s.mode === "edit" && (s.background === "scene" || effectiveAttention(s) === "fa"))
+              || (s.mode === "multi" && s.background === "scene" && effectiveAttention(s) === "fa")))
+            || (Number(s.outputs) === 2 && s.mode === "text" && s.background === "scene" && effectiveAttention(s) === "fa"))
+          : Number(s.outputs) === 1 && ["text", "edit"].includes(s.mode) && s.background === "scene");
+      const requestVerified = serveVerified && (s.weights === "turbo" ? turboRequestVerified
+        : ((recipe.batchSizes && (Number(s.outputs) === 1 || (recipe.batchAttentions || recipe.attentions).includes(effectiveAttention(s)))
             && ["text", "edit"].includes(s.mode) && s.resolution === "1024" && Number(s.steps) === 40 && recipe.batchSizes.includes(Number(s.outputs)))
           || (["text", "edit"].includes(s.mode) && s.resolution === "1024" && Number(s.steps) === 40 && Number(s.outputs) === 1
             && (["h200", "rtxpro6000"].includes(s.hw) || s.mode === "text" || s.background === "scene"))
           || (s.hw === "h200" && s.background === "scene" && s.mode === "text" && s.resolution === "512" && Number(s.steps) === 4 && Number(s.outputs) === 2)
-          || (s.hw === "h200" && s.background === "scene" && s.mode === "multi" && s.resolution === "512" && Number(s.steps) === 4 && Number(s.outputs) === 1));
+          || (s.hw === "h200" && s.background === "scene" && s.mode === "multi" && s.resolution === "512" && Number(s.steps) === 4 && Number(s.outputs) === 1)));
       const world = Number(s.nodes) * Number(s.gpus_per_node);
-      const flags = ['--model-path "{{MODEL_PATH}}"'];
+      const flags = [s.weights === "turbo" ? '--model-path "{{TURBO_MODEL_PATH}}"' : '--model-path "{{MODEL_PATH}}"'];
       if (world > 1) flags.push(`--num-gpus ${world}`);
       if (topology.tp_size > 1) flags.push(`--tp-size ${topology.tp_size}`);
       if (world > 1) flags.push(`--ulysses-degree ${topology.ulysses_degree}`);
@@ -370,7 +393,8 @@ const config = {
 
   modelNames: { default: "Qwen-Image-2.1" },
   placeholders: {
-    MODEL_PATH: { target: "command", label: "Checkpoint repository or directory", default: "Qwen/Qwen-Image-2.1" },
+    MODEL_PATH: { target: "command", label: "Base checkpoint repository or directory", default: "Qwen/Qwen-Image-2.1" },
+    TURBO_MODEL_PATH: { target: "command", label: "Turbo checkpoint repository or directory", default: "Qwen/Qwen-Image-2.1-Turbo" },
     FP8_DIT_PATH: { target: "command", label: "Serialized FP8 DiT directory", default: "/models/qwen-image-2.1-fp8/transformer" },
     FP8_ENCODER_PATH: { target: "command", label: "Serialized FP8 encoder directory", default: "/models/qwen-image-2.1-fp8/text_encoder" },
     GGUF_DIT_PATH: { target: "command", label: "GGUF DiT file", default: "/models/qwen-image-2.1-gguf/transformer-Q4_0.gguf" },
@@ -403,7 +427,7 @@ const config = {
     };
     if (Number(s.outputs) !== 1) request.n = Number(s.outputs);
     if (s.resolution !== "1024") request.size = `${s.resolution}x${s.resolution}`;
-    if (Number(s.steps) !== 40) request.num_inference_steps = Number(s.steps);
+    if (s.weights !== "turbo" && Number(s.steps) !== 40) request.num_inference_steps = Number(s.steps);
     if (transparent) request.background = "transparent";
     if (s.mode === "text") {
       return `curl -sS --fail-with-body http://{{CURL_HOST}}:{{CURL_PORT}}/v1/images/generations \\
@@ -421,6 +445,12 @@ ${fields.join(" \\\n")}`;
   showPlaygroundLink: false,
   cells: [],
 };
+
+// Turbo verification is limited to the H200 runs; other base recipes remain unchanged.
+for (const recipe of config.commandBuilder.resource.verifiedRecipes) {
+  recipe.verifiedWhen ??= (s) => s.weights !== "turbo"
+    || (recipe.id === "h200-1-resident" && (!s.batching || s.batching === "off"));
+}
 
 return config;
 })();

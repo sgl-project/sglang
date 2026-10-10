@@ -399,6 +399,85 @@ class TestQuarkPerLayerBlockFp8(CustomTestCase):
         self.assertEqual(matched["weight"]["dtype"], "fp4")
 
 
+class TestDeepseekV4QuarkMapping(CustomTestCase):
+    """amd/DeepSeek-V4-*-MXFP4 layout: MXFP4 experts everywhere, but the MTP
+    block keeps FP8-block shared experts; specs are keyed by checkpoint names."""
+
+    _HF_CONFIG = SimpleNamespace(quantization_config={"quant_method": "quark"})
+
+    _FP8 = TestQuarkPerLayerBlockFp8._BLOCK_FP8_CONFIG
+    _MXFP4 = {
+        "weight": {
+            "dtype": "fp4",
+            "qscheme": "per_group",
+            "group_size": 32,
+            "is_dynamic": False,
+            "scale_format": "e8m0",
+        },
+        "input_tensors": {
+            "dtype": "fp4",
+            "qscheme": "per_group",
+            "group_size": 32,
+            "is_dynamic": True,
+            "scale_format": "e8m0",
+        },
+        "output_tensors": None,
+        "bias": None,
+    }
+
+    def _config_for(self, model_cls) -> QuarkConfig:
+        config = _bare_config()
+        config.quant_config = {
+            "layer_quant_config": {
+                "layers.0.attn.wq_a": deepcopy(self._FP8),
+                "layers.0.attn.wkv": deepcopy(self._FP8),
+                **{
+                    f"mtp.0.ffn.shared_experts.w{i}": deepcopy(self._FP8)
+                    for i in (1, 2, 3)
+                },
+                **{
+                    f"mtp.0.ffn.experts.{e}.w{i}": deepcopy(self._MXFP4)
+                    for e in range(2)
+                    for i in (1, 2, 3)
+                },
+            },
+            "layer_type_quant_config": {},
+            "global_quant_config": deepcopy(self._MXFP4),
+        }
+        config.exclude_layers = []
+        config.kv_cache_group = []
+        config.packed_modules_mapping = {"gate_up_proj": ["gate_proj", "up_proj"]}
+        config.excluded_fp8_config = None
+        config.is_prequantized = True
+        config.dequantization_config = None
+        config._online_quantized_layers = set()
+        config.apply_weight_name_mapper(
+            model_cls.get_hf_to_sglang_mapper(self._HF_CONFIG)
+        )
+        return config
+
+    def test_only_draft_vetoes_fusion_on_fp8_mtp_shared_experts(self):
+        from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
+        from sglang.srt.models.deepseek_v4_nextn import DeepseekV4ForCausalLMNextN
+
+        self.assertTrue(
+            self._config_for(DeepseekV4ForCausalLM).can_fuse_shared_expert()
+        )
+        self.assertFalse(
+            self._config_for(DeepseekV4ForCausalLMNextN).can_fuse_shared_expert()
+        )
+
+    def test_fused_wqkv_a_takes_the_wq_a_block_fp8_spec(self):
+        from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
+
+        config = self._config_for(DeepseekV4ForCausalLM)
+        layer = LinearBase.__new__(LinearBase)
+
+        method = config.get_quant_method(layer, "model.layers.0.self_attn.wqkv_a")
+
+        self.assertIsInstance(method, Fp8LinearMethod)
+
+
 class _Runner:
     """Records the quant_info apply_weights() hands to the runner."""
 
@@ -457,6 +536,76 @@ class TestQuarkMxfp4MoEAiterQuantInfo(CustomTestCase):
         self.assertIs(quant_info.expert_mask, layer.dispatcher.expert_mask_gpu)
         self.assertTrue(quant_info.w13_weight.is_shuffled)
         self.assertTrue(quant_info.w2_weight.is_shuffled)
+
+
+class TestQuarkMxfp4MoEPaddedTpLoading(CustomTestCase):
+    """aiter skips the last intermediate_pad channels of every TP rank, so each
+    rank's real checkpoint channels must load at the head of its padded buffer.
+    Regression: DeepSeek-V4-Pro TP8 (384 -> 512) silently lost 25% of channels."""
+
+    TP, REAL, PADDED, COLS = 8, 384, 512, 3
+
+    def _load_rank(self, rank, loader):
+        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+
+        moe = SimpleNamespace(
+            moe_runner_config=SimpleNamespace(is_gated=True),
+            quant_method=SimpleNamespace(),
+            quant_config=None,
+            use_padded_loading=True,
+            use_presharded_weights=False,
+            moe_tp_rank=rank,
+            moe_tp_size=self.TP,
+        )
+
+        def fused_moe_weight_loader(param, w, name, shard_id, expert_id):
+            load = FusedMoE._load_w2 if shard_id == "w2" else FusedMoE._load_w13
+            load(
+                moe,
+                expert_data=param.data[expert_id],
+                shard_dim=1 if shard_id == "w2" else 0,
+                shard_id=shard_id,
+                loaded_weight=w,
+            )
+
+        load = loader(fused_moe_weight_loader)
+        full = self.TP * self.REAL
+        channel = torch.arange(1, full + 1, dtype=torch.float32)
+        gate, up = channel[:, None].repeat(1, self.COLS), -channel[:, None]
+        down = channel[None, :].repeat(self.COLS, 1)
+        w13 = torch.full((1, 2 * self.PADDED, self.COLS), float("nan"))
+        w2 = torch.full((1, self.COLS, self.PADDED), float("nan"))
+        load(w13, gate, "w13_weight", "w1", 0)
+        load(w13, up.repeat(1, self.COLS), "w13_weight", "w3", 0)
+        load(w2, down, "w2_weight", "w2", 0)
+        return w13[0], w2[0]
+
+    def test_each_rank_holds_its_own_channels_then_zero_padding(self):
+        from sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4_moe import (
+            _rank_chunk_padding_loader,
+        )
+
+        loader = lambda wl: _rank_chunk_padding_loader(wl, tp_size=self.TP)
+        real, padded = self.REAL, self.PADDED
+        for rank in range(self.TP):
+            w13, w2 = self._load_rank(rank, loader)
+            expected = torch.arange(rank * real + 1, (rank + 1) * real + 1).float()
+            with self.subTest(rank=rank):
+                self.assertTrue(torch.equal(w13[:real, 0], expected))
+                self.assertTrue(torch.equal(w13[padded : padded + real, 0], -expected))
+                self.assertTrue(torch.equal(w2[0, :real], expected))
+                self.assertEqual(w13[real:padded].abs().sum().item(), 0)
+                self.assertEqual(w13[padded + real :].abs().sum().item(), 0)
+                self.assertEqual(w2[:, real:].abs().sum().item(), 0)
+
+    def test_unpadded_weights_pass_through_unchanged(self):
+        from sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4_moe import (
+            _pad_tp_chunks,
+        )
+
+        weight = torch.randn(self.TP * self.REAL, self.COLS)
+        out = _pad_tp_chunks(weight, dim=0, tp_size=self.TP, padded=self.REAL)
+        self.assertIs(out, weight)
 
 
 if __name__ == "__main__":
