@@ -6,7 +6,10 @@ import unittest
 
 import torch
 
-from sglang.kernels.ops.speculative.dspark.markov_sample import MarkovSampleStep
+from sglang.kernels.ops.speculative.dspark.markov_sample import (
+    MarkovGreedyFusedBiasStep,
+    MarkovSampleStep,
+)
 from sglang.test.test_utils import CustomTestCase
 
 DEVICE = torch.device("cuda")
@@ -84,6 +87,37 @@ class TestMarkovSampleStep(CustomTestCase):
         for impl in (MarkovSampleStep.triton, MarkovSampleStep.torch):
             greedy_only = _call(impl, has_sampled_rows=False, **kwargs)
             self.assertTrue(torch.equal(greedy_only, mixed))
+
+    def test_fused_bias_matches_separate_gemv(self):
+        # One row: the folded GEMV must pick what the separate GEMV + step picks.
+        g = torch.Generator(device=DEVICE).manual_seed(4)
+        vocab, rank = 20000, 64
+        weight = torch.randn(vocab, rank, generator=g, device=DEVICE)
+        weight = weight.to(torch.bfloat16)
+        for trial in range(20):
+            base = torch.randn(1, vocab + 32, generator=g, device=DEVICE)
+            base = base.to(torch.bfloat16)
+            latent = torch.randn(1, rank, generator=g, device=DEVICE)
+            latent = latent.to(torch.bfloat16)
+            separate = _call(
+                MarkovSampleStep.triton,
+                base=base,
+                bias=torch.nn.functional.linear(latent, weight),
+                temps=torch.zeros(1, device=DEVICE),
+                step_dtype=torch.bfloat16,
+                has_sampled_rows=False,
+            )
+            for impl in (
+                MarkovGreedyFusedBiasStep.triton,
+                MarkovGreedyFusedBiasStep.torch,
+            ):
+                fused = impl(
+                    base_logits=base,
+                    latent=latent,
+                    bias_weight=weight,
+                    step_dtype=torch.bfloat16,
+                )
+                self.assertEqual(fused.item(), separate.item(), f"trial {trial}")
 
     def test_special_values_follow_argmax(self):
         base = torch.zeros(4, 16, device=DEVICE)
