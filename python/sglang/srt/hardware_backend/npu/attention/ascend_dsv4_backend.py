@@ -835,6 +835,70 @@ class CompressorAscendBackendMixin:
             allow_build=False,
         )
 
+        # S229: real-input dump for the slot-layout test (README 226b). Env
+        # SGL_DSV4_SLOTTEST_DUMP=<path.npz>, INDEXER only, triggers on the
+        # decode call covering position 17534. Saves the exact op inputs and the
+        # PRE-op state rows at 1104..1111 / 1184..1191 / 1112..1119, matching
+        # test_compressor_slot_layout._load_real_inputs' npz schema. LIMIT: one
+        # run = one physical layout, so state_1104 is "real" on a MISS run and
+        # state_1184 on a HIT run; run once per harness (miss / hit) if both are
+        # needed. Overwrites the file on each triggering step.
+        _slottest_npz = os.environ.get("SGL_DSV4_SLOTTEST_DUMP")
+        if _slottest_npz and bool(compressor.is_in_indexer):
+            try:
+                import numpy as _npd
+
+                _sp = fm.start_pos.reshape(-1).to(torch.int64).cpu()
+                _su = fm.seqused.reshape(-1).to(torch.int64).cpu()
+                _sp_l = _sp.tolist()
+                _su_l = _su.tolist()
+                if any(
+                    int(_sp_l[_b]) <= 17534 < int(_sp_l[_b]) + int(_su_l[_b])
+                    for _b in range(len(_sp_l))
+                ):
+                    _flatd = (
+                        state_cache.reshape(-1, state_cache.shape[-1])
+                        .detach()
+                        .to(torch.float32)
+                        .cpu()
+                    )
+
+                    def _drows(_a, _b):
+                        return _flatd[_a:_b].numpy()
+
+                    _dd = {
+                        "x": x.detach().to(torch.float32).cpu().numpy(),
+                        "wkv": compressor._fused_wkv_w.detach()
+                        .to(torch.float32)
+                        .cpu()
+                        .numpy(),
+                        "wgate": compressor._fused_wgate_w.detach()
+                        .to(torch.float32)
+                        .cpu()
+                        .numpy(),
+                        "ape": compressor.ape.detach()
+                        .to(torch.float32)
+                        .cpu()
+                        .numpy(),
+                        "norm_weight": compressor._fused_norm_weight_fp32.detach()
+                        .to(torch.float32)
+                        .cpu()
+                        .numpy(),
+                        "rope_sin": sin.detach().to(torch.float32).cpu().numpy(),
+                        "rope_cos": cos.detach().to(torch.float32).cpu().numpy(),
+                        "state_1104": _drows(1104, 1112),
+                        "state_1184": _drows(1184, 1192),
+                        "state_1112": _drows(1112, 1120),
+                    }
+                    _npd.savez(_slottest_npz, **_dd)
+                    print(
+                        f"[SLOTTEST-DUMP] wrote {_slottest_npz} "
+                        f"keys={sorted(_dd)} start={_sp_l} ntok={int(x.shape[0])}",
+                        flush=True,
+                    )
+            except Exception as _exc:
+                print(f"[SLOTTEST-DUMP] skipped: {_exc}", flush=True)
+
         compressor_op = torch.ops.npu.compressor
         cmp_kv = compressor_op(
             x,
