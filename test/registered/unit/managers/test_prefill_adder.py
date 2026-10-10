@@ -211,6 +211,21 @@ class TestPrefillAdder(CustomTestCase):
             self.create_running_batch(), page_size=256, rem_chunk_tokens=chunk_tokens
         )
 
+    def create_chunked_ratio_adder(self, *, chunk_tokens=4096, ratio=0.5):
+        """Adder with chunked_prefill_ratio set on both the context and the adder."""
+        override = get_context().override_server_args(chunked_prefill_ratio=ratio)
+        override.install()
+        self.addCleanup(override.restore)
+        self.mock_tree_cache.supports_mamba.return_value = False
+        self.mock_tree_cache.supports_prefix_sharing.return_value = False
+        self.mock_token_allocator.available_size.return_value = 32768
+        return self.create_adder(
+            self.create_running_batch(),
+            page_size=256,
+            rem_chunk_tokens=chunk_tokens,
+            chunked_prefill_ratio=ratio,
+        )
+
     def test_shortest_prefill_reserves_space_for_complete_waiting_requests(self):
         adder = self.create_shortest_prefill_adder()
         policy = SchedulePolicy(
@@ -286,6 +301,35 @@ class TestPrefillAdder(CustomTestCase):
         req.full_untruncated_fill_ids = list(range(8192))
         self.assertIs(adder.add_chunked_req(req), req)
         self.assertEqual(req.extend_len, 4096)
+
+    def test_chunked_prefill_ratio_limits_chunked_req_budget(self):
+        """With ratio=0.5, add_chunked_req should use half the chunk token budget."""
+        adder = self.create_chunked_ratio_adder(chunk_tokens=4096, ratio=0.5)
+        req = self.create_shared_req("continuation")
+        req.full_untruncated_fill_ids = list(range(8192))
+        self.assertIs(adder.add_chunked_req(req), req)
+        self.assertEqual(req.extend_len, 2048)
+
+    def test_chunked_prefill_ratio_one_preserves_default_behavior(self):
+        """ratio=1.0 should give the full chunk token budget, same as before."""
+        adder = self.create_chunked_ratio_adder(chunk_tokens=4096, ratio=1.0)
+        req = self.create_shared_req("continuation")
+        req.full_untruncated_fill_ids = list(range(8192))
+        self.assertIs(adder.add_chunked_req(req), req)
+        self.assertEqual(req.extend_len, 4096)
+
+    def test_chunked_prefill_ratio_rejects_second_chunked_req(self):
+        """With ratio<1, a second long request is rejected when has_chunked_req=True."""
+        adder = self.create_chunked_ratio_adder(chunk_tokens=512, ratio=0.5)
+        req = self.create_shared_req("second-chunk")
+        req.full_untruncated_fill_ids = list(range(1024))
+        self.assertEqual(
+            adder.add_one_req(req, has_chunked_req=True, truncation_align_size=None),
+            AddReqResult.OTHER,
+        )
+        self.assertEqual(adder.can_run_list, [])
+        self.assertIsNone(adder.new_chunked_req)
+        self.assertIsNone(req.extend_end)
 
     def test_exact_chunk_fill_keeps_mamba_chunks_page_aligned(self):
         # A Mamba checkpoint only lands on a page-aligned chunk end, so an

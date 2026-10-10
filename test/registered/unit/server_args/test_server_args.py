@@ -380,6 +380,20 @@ class TestPrepareServerArgs(CustomTestCase):
         ):
             ServerArgs(model_path="dummy", prefill_decode_interval=-1).resolve_once()
 
+    def test_chunked_prefill_ratio_validation(self):
+        """--chunked-prefill-ratio must be > 0 and <= 1."""
+        args = ServerArgs(model_path="dummy", chunked_prefill_ratio=0.5)
+        args.resolve_once()
+        args.check_server_args()
+        self.assertEqual(resolution_result(args, "chunked_prefill_ratio"), 0.5)
+
+        for bad in (0.0, -0.1, 1.1):
+            with self.subTest(bad=bad):
+                with self.assertRaisesRegex(ValueError, "--chunked-prefill-ratio"):
+                    args = ServerArgs(model_path="dummy", chunked_prefill_ratio=bad)
+                    args.resolve_once()
+                    args.check_server_args()
+
     def test_sampling_mask_max_tokens(self):
         self.assertEqual(ServerArgs(model_path="dummy").sampling_mask_max_tokens, 4096)
         self.assertEqual(

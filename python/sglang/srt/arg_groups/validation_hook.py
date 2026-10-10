@@ -297,6 +297,9 @@ def check_server_args(server_args: Any):
 
     check_load_publish_args(server_args)
 
+    if cfg.chunked_prefill_ratio <= 0 or cfg.chunked_prefill_ratio > 1:
+        raise ValueError("--chunked-prefill-ratio must > 0 and <= 1.")
+
 
 def validate_buckets_rule(arg_name: str, buckets_rule: List[str]):
     if not buckets_rule:
