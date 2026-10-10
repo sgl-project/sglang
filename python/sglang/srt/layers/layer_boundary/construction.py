@@ -315,7 +315,8 @@ def _bind_stage(declaration, norm, incoming, outgoing, *, final_read=None, **opt
     variants = {}
     for variant, edge in incoming.entries.items():
         if (
-            declaration.update.applied_at_exit
+            declaration.kind is StageKind.FFN
+            and not declaration.update.is_plain_add
             and TokenAxis.ATTN_CP
             in edge.produced.layout.sharded - edge.need.layout.sharded
             and not _cp_gathers_over_attn_cp()

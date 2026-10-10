@@ -38,6 +38,9 @@ class MHCState:
     hc_ffn_pre: Callable
     hc_post: Callable
     hc_ffn_post_pre: Optional[Callable] = None
+    # Set on every layer when FFN write-backs are deferred;
+    # all but the last leave theirs to the next layer's attention read.
+    hc_attn_post_pre: Optional[Callable] = None
     # The last layer's write-back also contracts the streams into the hidden
     # states the layer stack hands on.
     is_last_layer: bool = False
@@ -62,33 +65,62 @@ class MHCState:
             hidden_states = out_norm(hidden_states)
         return hidden_states, residual
 
+    def update_and_read_attn_input(
+        self,
+        previous,
+        hidden_states,
+        residual,
+        out_norm: Optional[torch.nn.Module] = None,
+    ):
+        return self._update_and_read(
+            post_pre=self.hc_attn_post_pre,
+            pre=self.hc_attn_pre,
+            writer=previous,
+            hidden_states=hidden_states,
+            residual=residual,
+            out_norm=out_norm,
+        )
+
     def update_and_read_ffn_input(
         self, hidden_states, residual, out_norm: Optional[torch.nn.Module] = None
     ):
+        return self._update_and_read(
+            post_pre=self.hc_ffn_post_pre,
+            pre=self.hc_ffn_pre,
+            writer=self,
+            hidden_states=hidden_states,
+            residual=residual,
+            out_norm=out_norm,
+        )
+
+    def _update_and_read(
+        self, *, post_pre, pre, writer, hidden_states, residual, out_norm
+    ):
         out_norm_weight, out_norm_eps = self._resolve_out_norm(out_norm)
-        if self.hc_ffn_post_pre is not None and hidden_states.shape[0] != 0:
+        if post_pre is not None and hidden_states.shape[0] != 0:
             # Returns None when it declines -- no fused kernel for this platform
             # or shape, or a shape the fusion is slower at -- and the chain runs.
-            fused = self.hc_ffn_post_pre(
+            fused = post_pre(
                 hidden_states=hidden_states,
                 residual=residual,
-                h_res=self.h_res,
-                h_post=self.h_post,
+                h_res=writer.h_res,
+                h_post=writer.h_post,
                 out_norm_weight=out_norm_weight,
                 out_norm_eps=out_norm_eps,
             )
             if fused is not None:
+                writer.clear_coefficients()
                 hidden_states, residual, self.h_res, self.h_post, norm_fused = fused
                 if out_norm is not None and not norm_fused:
                     hidden_states = out_norm(hidden_states)
                 return hidden_states, residual
 
-        hidden_states = self.hc_post(hidden_states, residual, self.h_res, self.h_post)
-        residual = hidden_states
-        hidden_states, self.h_res, self.h_post, norm_fused = self.hc_ffn_pre(
-            hidden_states, out_norm_weight, out_norm_eps
+        residual = writer.apply_post(hidden_states=hidden_states, residual=residual)
+        writer.clear_coefficients()
+        hidden_states, self.h_res, self.h_post, norm_fused = pre(
+            residual, out_norm_weight, out_norm_eps
         )
-        if out_norm is not None and not norm_fused and hidden_states.shape[0] != 0:
+        if out_norm is not None and not norm_fused and residual.shape[0] != 0:
             hidden_states = out_norm(hidden_states)
         return hidden_states, residual
 
@@ -116,13 +148,17 @@ class MHCState:
             attn_readout=_AttnReadout(self),
             attn_update=_AttnUpdate(self),
             ffn_readout=_FfnReadout(self),
-            ffn_update=_FfnUpdate(self),
+            ffn_update=(
+                _DeferredFfnUpdate(self)
+                if self.hc_attn_post_pre is not None and not self.is_last_layer
+                else _FfnUpdate(self)
+            ),
         )
 
 
 class _AttnReadout:
-    """hc_pre and the input norm, from streams that already hold the previous
-    layer's output: an MHC layer takes its input written back."""
+    """hc_pre and the input norm; a previous layer's deferred FFN update, if any,
+    runs first, fused with this hc_pre when hc_attn_post_pre takes the batch."""
 
     is_plain_norm = False
     reads_before_dp_gather = False
@@ -138,8 +174,27 @@ class _AttnReadout:
             raise NotImplementedError(f"an MHC attention input in {quant_format=}")
         return self.state.read_attn_input(residual, out_norm=norm)
 
-    def update_and_read(self, update, hidden_states, residual, norm, **kwargs):
-        raise NotImplementedError("an MHC layer takes its input written back")
+    def update_and_read(
+        self,
+        update,
+        hidden_states,
+        residual,
+        norm,
+        quant_format="",
+        post_residual_addition=None,
+    ):
+        if quant_format:
+            raise NotImplementedError(f"an MHC attention input in {quant_format=}")
+        if post_residual_addition is not None:
+            raise NotImplementedError("an MHC attention input with a residual addition")
+        if not isinstance(update, _DeferredFfnUpdate):
+            raise NotImplementedError(f"an MHC attention input after {update=}")
+        return self.state.update_and_read_attn_input(
+            previous=update.state,
+            hidden_states=hidden_states,
+            residual=residual,
+            out_norm=norm,
+        )
 
 
 class _AttnUpdate:
@@ -188,9 +243,9 @@ class _FfnReadout:
 
 
 class _FfnUpdate:
-    """hc_post with the coefficients the FFN input's read produced, which this
-    layer runs itself; the last layer also contracts the streams into the
-    hidden states the layer stack hands on."""
+    """hc_post with the coefficients the FFN input's read produced, run by this
+    layer at exit; the last layer also contracts the streams into the hidden
+    states the layer stack hands on."""
 
     is_plain_add = False
     applied_at_exit = True
@@ -211,3 +266,10 @@ class _FfnUpdate:
 
     def gather_residual_attn_tp(self, residual):
         return self.state.gather_residual_attn_tp(residual)
+
+
+class _DeferredFfnUpdate(_FfnUpdate):
+    """Applied by the next layer's attention read; never the last layer's update."""
+
+    applied_at_exit = False
+    outlives_layer = True
