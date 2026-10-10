@@ -520,6 +520,10 @@ class QwenImage21Attention(nn.Module):
         the fused norm + RoPE kernel and SDPA both accept that layout. The first
         call compares every slice against the module forwards.
         """
+        # Storage-identity checks and the one-shot verification cannot be traced;
+        # a compiled graph keeps the plain projections instead of breaking here.
+        if torch.compiler.is_compiling():
+            return None
         layers = (self.to_q, self.to_k, self.to_v)
         packed = self.packed_qkv_weight()
         if not (
