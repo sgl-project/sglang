@@ -29,7 +29,7 @@ mod tests {
     fn tool_fixtures_match_sglang() {
         let dir =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tool_parity");
-        for entry in std::fs::read_dir(dir).unwrap() {
+        for entry in std::fs::read_dir(dir).expect("run tests/scripts/fetch_fixtures.sh") {
             let fixture: Value =
                 serde_json::from_str(&std::fs::read_to_string(entry.unwrap().path()).unwrap())
                     .unwrap();

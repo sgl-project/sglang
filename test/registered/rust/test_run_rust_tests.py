@@ -56,8 +56,13 @@ class TestCargoWorkspace(CustomTestCase):
             f"rust workspace manifest not found at {RUST_WORKSPACE}",
         )
 
+        subprocess.run(
+            [RUST_WORKSPACE / "sglang-processor/tests/scripts/fetch_fixtures.sh"],
+            check=True,
+            timeout=120,
+        )
         self._run_cargo(["test", "--workspace"], cwd=RUST_WORKSPACE)
-        # `openai` is off by default; its OpenAI-parity fixtures run offline.
+        # `openai` is off by default; it adds the OpenAI-parity fixtures.
         processor = ["-p", "sglang-processor", "--features", "openai"]
         self._run_cargo(["test", *processor], cwd=RUST_WORKSPACE)
         # Verify that the public crate builds with only its packaged inputs.

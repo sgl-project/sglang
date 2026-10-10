@@ -163,10 +163,16 @@ When a new spec needs more, extend `serving_chat()` in the script (one place):
 
 Pin `revision` to a commit hash and regenerate only on purpose.
 
+`tests/fixtures/` is not in git. `tests/scripts/fetch_fixtures.sh` downloads it
+from the `sgl-project/sglang-processor-parity` dataset at the commit it pins.
+After regenerating, upload with the command in that script and pin the new commit
+in the same PR.
+
 ## Verify
 
 ```sh
 cd rust
+sglang-processor/tests/scripts/fetch_fixtures.sh
 cargo test -p sglang-processor --locked                                       # text, offline
 HF_HUB_CACHE=<hub cache> cargo test -p sglang-processor --test parity --locked  # + token ids
 cargo clippy -p sglang-processor --all-targets --locked -- -D warnings

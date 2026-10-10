@@ -110,8 +110,9 @@ formatters have none, as in Python.
 
 **Parity.** Each `tests/fixtures/parity/<model>.json` holds requests that
 SGLang's Python serving path rendered and tokenized, written by
-`tests/scripts/generate_parity.py`. `tests/parity.rs` checks every fixture. To
-add a model, follow the
+`tests/scripts/generate_parity.py`. `tests/parity.rs` checks every fixture.
+`tests/fixtures/` is not in git: `tests/scripts/fetch_fixtures.sh` downloads it
+from Hugging Face at a pinned revision. To add a model, follow the
 [`processor-model-parity`](../../.claude/skills/processor-model-parity/SKILL.md)
 skill.
 

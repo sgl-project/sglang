@@ -127,8 +127,14 @@ jobs:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      # The parity fixtures live on Hugging Face at a pinned revision.
+      - name: Download parity fixtures
+        run: |
+          pipx install huggingface_hub
+          sglang-processor/tests/scripts/fetch_fixtures.sh
+
       # cargo test builds the library and runs unit, integration, and doc tests.
-      # These tests use local fixtures; no GPU or model downloads are needed.
+      # No GPU or model downloads are needed.
       - name: Test default features
         run: cargo test --locked -p sglang-processor
 
