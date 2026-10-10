@@ -228,3 +228,35 @@ def test_worker_exit_during_load_names_where_the_reason_is(monkeypatch) -> None:
     monkeypatch.setattr(generator.DiffGenerator, "from_pretrained", exit_during_load)
     with pytest.raises(RuntimeError, match="traceback is in the ComfyUI console"):
         SGLDiffusionGenerator().init_generator("h3.safetensors", "MiniMaxH3Pipeline")
+
+
+def test_multi_gpu_single_file_starts_without_cfg_parallel(
+    tmp_path, monkeypatch
+) -> None:
+    """Auto CFG parallel read a model_index.json, so a Flux single file on two GPUs
+    failed ServerArgs validation; ComfyUI already splits cond/uncond requests."""
+    import torch
+    from safetensors.torch import save_file
+
+    from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.core import generator
+    from sglang.multimodal_gen.runtime.server_args import ServerArgs
+
+    path = tmp_path / "flux.safetensors"
+    save_file({"double_blocks.0.img_attn.qkv.weight": torch.zeros(1)}, path)
+    seen = {}
+    monkeypatch.setattr(
+        generator.DiffGenerator,
+        "from_pretrained",
+        lambda **kwargs: seen.update(kwargs) or object(),
+    )
+    SGLDiffusionGenerator().init_generator(str(path), "FluxPipeline", {"num_gpus": 2})
+    assert seen["cfg_parallel_degree"] == 1
+    if torch.cuda.device_count() >= 2:
+        server_args = ServerArgs.from_kwargs(**seen)
+        assert server_args.enable_cfg_parallel is False
+        assert server_args.sp_degree == 2
+    seen.clear()
+    SGLDiffusionGenerator().init_generator(
+        str(path), "FluxPipeline", {"num_gpus": 2, "enable_cfg_parallel": True}
+    )
+    assert "cfg_parallel_degree" not in seen

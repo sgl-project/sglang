@@ -205,6 +205,11 @@ class SGLDiffusionGenerator:
         # policy otherwise sets dit_cpu_offload=True and every sampler step
         # reloads the DiT from CPU.
         kwargs.setdefault("dit_cpu_offload", False)
+        # ComfyUI sends cond and uncond as separate requests, so worker-side CFG
+        # parallel only recomputes; its auto-enable also needs a model_index.json,
+        # which a non-H3 single file lacks, and fails worker startup on >= 2 GPUs.
+        if not kwargs.get("enable_cfg_parallel"):
+            kwargs.setdefault("cfg_parallel_degree", 1)
         kwargs = self._server_args_kwargs(kwargs)
         try:
             self.generator = DiffGenerator.from_pretrained(
