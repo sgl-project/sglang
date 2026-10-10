@@ -214,6 +214,19 @@ class Memory(msgspec.Struct):
             choices=["mooncake", "mori"],
         ),
     ] = "mooncake"
+    unified_cache_external_linker_config: A[
+        Optional[Dict[str, Any]],
+        Arg(
+            help=(
+                "JSON object selecting an out-of-tree UnifiedCacheLinker: "
+                "linker (class name), linker_module_path (Python module), and "
+                "optional linker_extra_config (object). Requires "
+                "--enable-unified-cache-external-linker and takes precedence "
+                "over --unified-cache-external-linker-backend."
+            ),
+            type_parser=json.loads,
+        ),
+    ] = None
     enable_linker_mla_dedup: A[
         bool,
         "Load replicated MLA KV on rank 0 and broadcast each layer with the Mooncake linker.",
