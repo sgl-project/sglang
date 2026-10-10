@@ -47,6 +47,7 @@ _is_cpu = current_platform.is_cpu()
 _is_xpu = current_platform.is_xpu()
 _use_rocm_flydsl = get_bool_env_var("SGLANG_USE_ROCM_FLYDSL")
 _has_attentions = False
+_has_sycl_fused_norm = False
 
 if _is_cuda or _is_xpu:
     from sgl_kernel import fused_add_rmsnorm, rmsnorm
@@ -80,6 +81,23 @@ if USE_AITER:
 
 if _is_xpu:
     from sgl_kernel import fused_inplace_qknorm_rope
+
+    try:
+        from sglang.kernels.ops.diffusion import (
+            can_use_fused_scale_residual_norm_scale_shift_sycl,
+            fused_scale_residual_norm_scale_shift_sycl,
+        )
+
+        _has_sycl_fused_norm = True
+    except ImportError as e:
+        from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+        logger = init_logger(__name__)  # pylint: disable=invalid-name
+        logger.debug(
+            "sgl-kernel-xpu has no fused_scale_residual_norm_scale_shift (%s); "
+            "ScaleResidualLayerNormScaleShift falls back to the triton kernel.",
+            e,
+        )
 
 if not _is_cpu:
     from sglang.kernels.ops.diffusion import norm_infer, rms_norm_fn
@@ -697,6 +715,28 @@ class _ScaleResidualNormScaleShift(CustomOp):
         if self.norm_type == "layer":
             weight = self.norm.weight
             bias = self.norm.bias
+            if (
+                _has_sycl_fused_norm
+                and can_use_fused_scale_residual_norm_scale_shift_sycl(
+                    residual=residual,
+                    x=x,
+                    gate=gate,
+                    shift=shift,
+                    scale=scale,
+                    weight=weight,
+                    bias=bias,
+                )
+            ):
+                return fused_scale_residual_norm_scale_shift_sycl(
+                    residual=residual,
+                    x=x,
+                    gate=gate,
+                    shift=shift,
+                    scale=scale,
+                    weight=weight,
+                    bias=bias,
+                    eps=self.eps,
+                )
             if can_use_fused_scale_residual_norm_scale_shift_triton(
                 residual=residual,
                 x=x,
