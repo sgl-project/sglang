@@ -43,6 +43,7 @@ class TestNPURadixEvictionPolicyConfig(CustomTestCase):
             "--attention-backend",
             "ascend",
             "--disable-cuda-graph",
+            "--enable-metrics",
             "--tp-size",
             "1",
             "--max-total-tokens",
@@ -132,3 +133,4 @@ class TestNPURadixEvictionPolicyConfig(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
