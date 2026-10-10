@@ -1,8 +1,6 @@
 import unittest
 from types import SimpleNamespace
 
-import torch
-
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.arg_groups.speculative_hook import (
     _handle_dspark,
@@ -119,51 +117,6 @@ class TestDsparkDpAttentionMoeA2aGate(CustomTestCase):
         with envs.SGLANG_RAGGED_VERIFY_MODE.override("compact"):
             with self.assertRaisesRegex(ValueError, "static"):
                 _handle_dspark(server_args)
-
-
-class TestDsparkFoldedSamplingDefault(CustomTestCase):
-    def test_auto_folds_sampling_when_buffers_fit(self):
-        from sglang.srt.environ import DsparkFoldedSampling, envs
-        from sglang.srt.models.dspark import VanillaMarkov
-        from sglang.srt.speculative.dspark_components.dspark_draft_sampler import (
-            DRAFT_CAPTURE_MIN_FREE_GB,
-            _resolve_folded_sampling,
-        )
-
-        # FP32 step logits [64, 5, 2**20]: exactly 1.25 GB.
-        model = SimpleNamespace(
-            lm_head=SimpleNamespace(org_vocab_size=1 << 20, weight=torch.empty(1)),
-            markov_head=VanillaMarkov(vocab_size=128, markov_rank=4),
-        )
-        need_gb = 1.25
-        args = dict(
-            model=model,
-            gamma=5,
-            max_bs=64,
-            device="cpu",
-            tp_rank=0,
-            available_memory_gb=DRAFT_CAPTURE_MIN_FREE_GB + need_gb + 0.01,
-        )
-        with envs.SGLANG_DSPARK_FOLDED_SAMPLING.override(
-            DsparkFoldedSampling.AUTO.value
-        ):
-            self.assertTrue(_resolve_folded_sampling(**args))
-            self.assertFalse(
-                _resolve_folded_sampling(
-                    **{
-                        **args,
-                        "available_memory_gb": DRAFT_CAPTURE_MIN_FREE_GB
-                        + need_gb
-                        - 0.01,
-                    }
-                )
-            )
-        with envs.SGLANG_DSPARK_FOLDED_SAMPLING.override(
-            DsparkFoldedSampling.FORCE.value
-        ):
-            self.assertTrue(
-                _resolve_folded_sampling(**{**args, "available_memory_gb": 0.5})
-            )
 
 
 if __name__ == "__main__":

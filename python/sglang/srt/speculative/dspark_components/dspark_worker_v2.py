@@ -41,9 +41,6 @@ from sglang.srt.speculative.draft_worker_common import (
     make_draft_block_spec_info,
     make_draft_sampler_capture_hook,
 )
-from sglang.srt.speculative.dspark_components.dspark_block_accept_estimator import (
-    block_accept_recording_enabled,
-)
 from sglang.srt.speculative.dspark_components.dspark_config import (
     DSV4_DRAFT_ATTENTION_BACKEND,
     draft_is_deepseek_v4,
@@ -54,7 +51,6 @@ from sglang.srt.speculative.dspark_components.dspark_draft import (
     make_next_draft_input,
 )
 from sglang.srt.speculative.dspark_components.dspark_draft_sampler import (
-    DRAFT_CAPTURE_MIN_FREE_GB,
     maybe_build_draft_sampler,
 )
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
@@ -327,9 +323,6 @@ class DSparkWorkerV2(BaseSpecWorker):
             tp_sync=self._tp_sync,
             random_seed=target_worker.random_seed,
             greedy_draft=self._greedy_draft,
-            # Read from the env, not the rank-0 recorder: kept logits change
-            # the draft collectives, which every rank must issue alike.
-            keep_greedy_logits=block_accept_recording_enabled(),
             dp_moe_sync=self._draft_is_moe and get_parallel().attn_dp_enabled,
         )
         self._verify_epilogue = None
@@ -499,7 +492,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             group=self._draft_graph_group,
         )
         if is_cuda_alike() and capture_decode_cuda_graph:
-            if available_mem < DRAFT_CAPTURE_MIN_FREE_GB:
+            if available_mem < 1.0:
                 capture_decode_cuda_graph = False
                 logger.warning(
                     "Disable DSpark draft cuda graph because only %.2f GB GPU "
@@ -515,9 +508,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 # from being the intended precision fallback, skipping the
                 # unused hook avoids paying for two proposal computations.
                 if envs.SGLANG_DSPARK_FOLDED_PROPOSAL.get():
-                    self._draft_sampler = self._maybe_build_draft_sampler(
-                        available_memory_gb=available_mem
-                    )
+                    self._draft_sampler = self._maybe_build_draft_sampler()
                     if self._draft_sampler is not None:
                         self.draft_model_runner.capture_tail_hooks.append(
                             make_draft_sampler_capture_hook(self._draft_sampler)
@@ -527,7 +518,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 capture_decode_cuda_graph=capture_decode_cuda_graph
             )
 
-    def _maybe_build_draft_sampler(self, *, available_memory_gb: float):
+    def _maybe_build_draft_sampler(self):
         return maybe_build_draft_sampler(
             draft_model=self.draft_model,
             gamma=self.gamma,
@@ -537,7 +528,6 @@ class DSparkWorkerV2(BaseSpecWorker):
             noise=self._proposer.noise,
             greedy_draft=self._greedy_draft,
             tp_sync=self._tp_sync,
-            available_memory_gb=available_memory_gb,
             confidence_fn=(
                 self._verify_planner.compute_confidence_tensor
                 if self._verify_planner.carries_confidence

@@ -139,15 +139,14 @@ def draft_markov_block(
     noise: DraftNoise,
     tp_sync: SpecTpSync,
     logits_out: Optional[torch.Tensor] = None,
-    keep_logits: bool = True,
-    has_sampled_rows: Optional[bool] = None,
+    greedy_draft: bool = False,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Draft ``gamma`` tokens per row, each step biased by the token before it;
-    a row at temperature 0 takes the argmax. With ``keep_logits`` the step
-    logits land in ``logits_out`` ([bs, gamma, vocab]), allocated here
-    when not given."""
+    a row at temperature 0 takes the argmax. The step logits land in
+    ``logits_out`` ([bs, gamma, vocab]), allocated here when not given. A
+    greedy draft takes every row's argmax and keeps no step logits."""
     bs, gamma = base_logits.shape[:2]
-    if keep_logits and logits_out is None:
+    if not greedy_draft and logits_out is None:
         logits_out = torch.empty(
             (bs, gamma, markov_head.step_logits_width(base_logits.shape[-1])),
             dtype=markov_head.step_logits_dtype(base_logits.dtype),
@@ -166,8 +165,7 @@ def draft_markov_block(
             noise_key=noise.key,
             noise_offset=noise.offset,
             step=step,
-            logits_out=logits_out[:, step] if keep_logits else None,
-            has_sampled_rows=has_sampled_rows,
+            logits_out=None if greedy_draft else logits_out[:, step],
         )
         prev_tokens = tp_sync.sync(SpecTpSyncSite.DSPARK_DRAFT, prev_tokens)
         draft_tokens.append(prev_tokens)
@@ -194,15 +192,9 @@ def sample_draft_block(
     device: torch.device,
     tp_sync: SpecTpSync,
     greedy_draft: bool,
-    keep_greedy_logits: bool,
 ) -> DraftBlockResult:
     bs = base_logits.shape[0]
     greedy_mask = resolve_greedy_mask(bs=bs, sampling_info=sampling_info, device=device)
-    any_sampling = sampling_info is not None and not sampling_info.is_all_greedy
-    # Greedy accept compares tokens only and a greedy draft is accepted as
-    # one-hot, so a greedy batch keeps its step logits only for a reader such
-    # as the block-accept recorder.
-    keep_logits = (any_sampling or keep_greedy_logits) and not greedy_draft
     temperatures = resolve_draft_temperatures(
         bs=bs, sampling_info=sampling_info, device=device
     )
@@ -211,20 +203,15 @@ def sample_draft_block(
         base_logits=base_logits,
         anchor_tokens=anchor_tokens,
         draft_hidden=draft_hidden,
-        step_temperatures=(
-            torch.zeros_like(temperatures)
-            if greedy_draft
-            else temperatures.masked_fill(greedy_mask, 0.0)
-        ),
+        step_temperatures=temperatures.masked_fill(greedy_mask, 0.0),
         noise=noise,
         tp_sync=tp_sync,
-        keep_logits=keep_logits,
-        has_sampled_rows=any_sampling and not greedy_draft,
+        greedy_draft=greedy_draft,
     )
     return DraftBlockResult(
         draft_tokens=draft_tokens,
         corrected_logits=(
-            expect(_DRAFT_STEP_LOGITS, step_logits) if keep_logits else None
+            None if greedy_draft else expect(_DRAFT_STEP_LOGITS, step_logits)
         ),
         greedy_mask=greedy_mask,
         temperatures=temperatures,
@@ -244,7 +231,6 @@ class DraftBlockProposer:
         tp_sync: SpecTpSync,
         random_seed: int,
         greedy_draft: bool,
-        keep_greedy_logits: bool,
         dp_moe_sync: bool = False,
     ) -> None:
         self.draft_model = draft_model
@@ -256,7 +242,6 @@ class DraftBlockProposer:
         self._draft_block_spec_info = draft_block_spec_info
         self._tp_sync = tp_sync
         self._greedy_draft = greedy_draft
-        self._keep_greedy_logits = keep_greedy_logits
         self._noise = DraftNoise(
             key=draft_noise_key(random_seed),
             offset=torch.zeros(
@@ -301,7 +286,6 @@ class DraftBlockProposer:
             else target_model.get_input_embeddings()
         )
         draft_sampler = self._draft_sampler
-        all_greedy = sampling_info is None or sampling_info.is_all_greedy
         fwd = self._run_forward(
             batch=batch,
             draft_input=draft_input,
@@ -321,31 +305,15 @@ class DraftBlockProposer:
             envs.SGLANG_DSPARK_FOLDED_PROPOSAL.get()
             and draft_sampler is not None
             and fwd.can_run_graph
-            and (all_greedy or self._greedy_draft or draft_sampler.folded_sampling)
         ):
             folded = True
-            # Greedy accept compares tokens only, and a greedy draft is
-            # accepted as one-hot; otherwise sampling accept needs the
-            # markov-corrected logits the graph tail kept.
-            corrected_logits = None
-            if draft_sampler.folded_sampling:
-                greedy_mask = draft_sampler.greedy_mask[:bs]
-                temperatures = draft_sampler.temperatures[:bs]
-                if not all_greedy:
-                    corrected_logits = draft_sampler.step_logits[:bs]
-            else:
-                # Greedy-only tail: no params were staged.
-                greedy_mask = resolve_greedy_mask(
-                    bs=bs, sampling_info=sampling_info, device=device
-                )
-                temperatures = resolve_draft_temperatures(
-                    bs=bs, sampling_info=sampling_info, device=device
-                )
             draft_block = DraftBlockResult(
                 draft_tokens=draft_sampler.out[: bs * self.gamma].view(bs, self.gamma),
-                corrected_logits=corrected_logits,
-                greedy_mask=greedy_mask,
-                temperatures=temperatures,
+                corrected_logits=(
+                    None if self._greedy_draft else draft_sampler.step_logits[:bs]
+                ),
+                greedy_mask=draft_sampler.greedy_mask[:bs],
+                temperatures=draft_sampler.temperatures[:bs],
                 greedy_draft=self._greedy_draft,
             )
             if draft_sampler.confidence_out is not None:
@@ -366,7 +334,6 @@ class DraftBlockProposer:
                 device=device,
                 tp_sync=self._tp_sync,
                 greedy_draft=self._greedy_draft,
-                keep_greedy_logits=self._keep_greedy_logits,
             )
         proposal_block_ids = (
             draft_block_ids
