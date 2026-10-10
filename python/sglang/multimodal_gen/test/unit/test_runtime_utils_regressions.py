@@ -6,9 +6,11 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+import torch
 from PIL import Image
 
 from sglang.multimodal_gen.runtime.utils import common, vision
+from sglang.multimodal_gen.runtime.utils.camera_geometry import get_plucker_embeddings
 from sglang.multimodal_gen.runtime.utils.image_io import save_base64_image_to_path
 
 
@@ -65,3 +67,17 @@ def test_bool_env_var_warning_is_deduplicated_per_variable(monkeypatch):
         common.get_bool_env_var("SGLANG_TEST_FLAG_B")
 
     assert warning.call_count == 2
+
+
+def test_plucker_rays_for_bf16_poses_match_float32():
+    """bf16 cannot represent pixel coordinates above 256, so neighbouring pixels of
+    a wide frame collapsed onto the same ray when poses were bf16."""
+    n_frames, height, width = 1, 4, 640
+    c2ws = torch.eye(4)[None].repeat(n_frames, 1, 1)
+    # Values exactly representable in bf16, so only the pixel grid can differ.
+    Ks = torch.tensor([[512.0, 512.0, 320.0, 2.0]])
+
+    expected = get_plucker_embeddings(c2ws, Ks, height, width)
+    actual = get_plucker_embeddings(c2ws.bfloat16(), Ks.bfloat16(), height, width)
+
+    assert torch.equal(actual.float(), expected)
