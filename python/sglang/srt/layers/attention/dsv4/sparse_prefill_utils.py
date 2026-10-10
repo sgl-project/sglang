@@ -336,6 +336,12 @@ class SparsePrefillChunkCache:
     # Compressed caches keyed by compress ratio: c128 (every block, combined once
     # per chunk) and the top-k ratios (combined per layer).
     compressed: Dict[int, CompressedGather] = field(default_factory=dict)
+    # One compressed dequant serves every consumer layer of a kv_source group:
+    # the source writes the chunk's rows before its own attention and the pool
+    # is stable for the rest of the forward. Key = (workspace ptr, source cache
+    # ptr, gather ids ptr, rows, layout). None after a c0-path workspace write,
+    # which starts at offset 0 and overwrites the compressed region.
+    compressed_dequant_key: Optional[tuple] = None
     swa_indices: Optional[torch.Tensor] = None
     swa_lengths: Optional[torch.Tensor] = None
 

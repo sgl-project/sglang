@@ -1610,6 +1610,14 @@ class Envs:
     SGLANG_OPT_USE_FLASHINFER_MHC = EnvBool(False)
     SGLANG_OPT_FUSE_MHC_POST_PRE = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)
+    # One compressed-cache dequant per kv_source group in sparse prefill,
+    # instead of one per consumer layer. Escape hatch for A/B and debugging.
+    SGLANG_OPT_DSV4_SPARSE_PREFILL_DEQUANT_DEDUP = EnvBool(True)
+    # Per-ratio candidate publishing: the first index-source layer of each
+    # compress-ratio group publishes candidate blocks and later index sources
+    # of that ratio consume them, instead of every non-ratio-1 index source
+    # running a full dense scan. Experimental; unvalidated under prefill CP.
+    SGLANG_OPT_DSV4_PER_RATIO_CANDIDATES = EnvBool(False)
     SGLANG_OPT_DSV4_NONPAGED_INDEXER = EnvBool(True)
     # Per-rank local query rows (after DP-attention sharding when enabled),
     # not request ISL.
