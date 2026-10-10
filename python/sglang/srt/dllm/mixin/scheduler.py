@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, List, Optional, Set, Union
 
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.dllm.mixin.req import DllmReqPhase
+from sglang.srt.managers.io_struct import matches_abort_rid
 from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.mem_cache.common import release_kv_cache
@@ -488,7 +489,7 @@ class DllmManager:
             queue = getattr(self, queue_name)
             kept_queue = []
             for req in queue:
-                if abort_all or req.rid.startswith(rid):
+                if abort_all or matches_abort_rid(req.rid, rid):
                     req_id = id(req)
                     if req_id not in seen:
                         aborted_reqs.append(req)
