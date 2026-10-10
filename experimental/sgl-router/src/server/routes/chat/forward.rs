@@ -80,7 +80,7 @@ pub(super) async fn forward_request(
     let decode_rank = decode
         .as_deref()
         .filter(|_| dp_aware)
-        .and_then(|decode| select_dp_rank(decode, None, &[]));
+        .and_then(|decode| select_dp_rank(decode, None, &[], ctx.config.model.dp_rank_policy));
 
     // Track worker occupancy and the prompt's contribution to active load.
     // A retry keeps the request's stale deadline rather than starting a new one.
@@ -269,7 +269,7 @@ fn prompt_dp_rank(
         (None, Some(provider), Some(tokens)) => provider.rank_depths(&tokens.ids, &worker.url),
         _ => Vec::new(),
     };
-    select_dp_rank(worker, key, &prefix_depths)
+    select_dp_rank(worker, key, &prefix_depths, model.dp_rank_policy)
 }
 
 /// Under `--dp-aware` the router owns the rank: the header pins it for chat, and

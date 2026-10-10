@@ -260,9 +260,10 @@ client sent. The router picks the first of these that applies:
 1. A hash of the sticky routing key or session id, so a conversation keeps
    its rank and router replicas agree.
 2. The rank with the deepest cached prefix in the local KV tree.
-3. The rank with the fewest requests this router has in flight on it.
+3. The rank with the fewest requests this router has in flight on it, or with
+   `--dp-rank-policy round_robin`, the worker's ranks in turn.
 
-In PD mode, decode is ranked by load only. The bootstrap room satisfies
+In PD mode, decode is ranked by step 3 only. The bootstrap room satisfies
 `room % prefill_dp_size == prefill_rank`, which is how a decode engine finds
 the prefill rank.
 
