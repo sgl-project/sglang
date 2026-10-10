@@ -155,6 +155,13 @@ class Spec(msgspec.Struct):
             choices=["auto", "fp8_e5m2", "fp8_e4m3", "bf16", "bfloat16"],
         ),
     ] = None
+    speculative_dcp_size: A[
+        int,
+        "Decode context parallelism size for the draft KV cache. The draft KV cache is "
+        "head-sharded across the TP group like the target's; set to 1 (the default) to "
+        "keep it that way. Sharding the draft KV cache along the sequence (> 1) is not "
+        "supported yet and is rejected.",
+    ] = 1
     speculative_draft_window_size: A[
         Optional[int],
         "Sliding window size for the draft model. Honored by Llama EAGLE-3 (`LlamaForCausalLMEagle3`), DFLASH, and the built-in EAGLE/MTP draft-decode path on the Triton and FlashInfer draft backends; other EAGLE-3 backends (e.g. MLA-based drafters) silently ignore it. For Llama EAGLE-3, the drafter only attends to the most recent N keys (verifier hidden states + its own outputs); the verifier is unaffected. For DFLASH, the draft worker keeps a recent target-token window in its local KV cache (paged backends may retain up to one extra page on the left for alignment). For the built-in EAGLE/MTP draft, each draft-decode step attends to a --speculative-draft-sink-size sink plus the most recent N tokens, leaving the target verify pass unchanged; it is ignored (with a warning) if the draft model has a native sliding window of its own. Default is full attention/context.",

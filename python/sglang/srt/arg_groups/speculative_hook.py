@@ -182,6 +182,12 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
                 cfg.speculative_algorithm,
             )
 
+    if cfg.speculative_dcp_size != 1:
+        raise ValueError(
+            "--speculative-dcp-size must be 1: sharding the draft KV cache along "
+            f"the sequence is not supported yet, got {cfg.speculative_dcp_size}."
+        )
+
     if cfg.speculative_draft_sink_size is not None:
         sink_size = int(cfg.speculative_draft_sink_size)
         if sink_size < 0:
