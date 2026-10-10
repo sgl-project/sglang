@@ -117,6 +117,9 @@ class LongcatFlashConfig(PretrainedConfig):
         self.oe_vocab_size_ratio = oe_vocab_size_ratio
         self.oe_neighbor_num = oe_neighbor_num
         self.oe_split_num = oe_split_num
+        self.ngram_vocab_size_ratio = ngram_vocab_size_ratio
+        self.emb_neighbor_num = emb_neighbor_num
+        self.emb_split_num = emb_split_num
         self.use_ngram_embedding = ngram_vocab_size_ratio is not None
         if self.use_ngram_embedding:
             self.ngram_embedding_m = int(ngram_vocab_size_ratio * vocab_size)
