@@ -83,17 +83,23 @@ def _map_in_window(block, lo, hi):
     return mp
 
 
-def single(path, lo, hi):
+def single(path, lo, hi, verbose=False):
     blocks, lefts, xdiff = parse(path)
-    print(f"{path}: blocks={len(blocks)} L={len(lefts)} XDIFF={len(xdiff)}")
+    agg = collections.defaultdict(list)  # pos -> [(blockIdx, stateLoc)]
     for bi, block in enumerate(blocks):
-        mp = _map_in_window(block, lo, hi)
-        if not mp:
-            continue
-        print(f"\n-- block #{bi} (len={len(block)}) window [{lo},{hi})")
-        for p, vs in mp.items():
-            slots = sorted({v[2] for v in vs})
-            print(f"   pos={p} stateLoc={slots} variants={vs}")
+        for op, b, p, col, sl, blk, row in block:
+            if lo <= p < hi:
+                agg[p].append((bi, sl))
+    print(f"{path}: blocks={len(blocks)} XDIFF={len(xdiff)}  window[{lo},{hi})")
+    if not agg:
+        print("  (no KSTATELOC in window)")
+    for p in sorted(agg):
+        slots = sorted({s for _, s in agg[p]})
+        nb = len({bi for bi, _ in agg[p]})
+        print(f"  pos={p} stateLoc={slots} blocks={nb}")
+        if verbose:
+            for bi, s in agg[p]:
+                print(f"      block#{bi} stateLoc={s}")
     _show_xdiff(xdiff)
 
 
@@ -165,6 +171,7 @@ def main():
     ap.add_argument("--lo", type=int, default=17520)
     ap.add_argument("--hi", type=int, default=17540)
     ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--verbose", action="store_true")
     a = ap.parse_args()
     if a.selftest:
         selftest()
@@ -174,7 +181,7 @@ def main():
     if a.log2:
         diff2(a.log, a.log2, a.lo, a.hi)
     else:
-        single(a.log, a.lo, a.hi)
+        single(a.log, a.lo, a.hi, verbose=a.verbose)
 
 
 if __name__ == "__main__":
