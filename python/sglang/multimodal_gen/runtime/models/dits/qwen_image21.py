@@ -388,6 +388,7 @@ class QwenImage21Attention(nn.Module):
             and not layer.gather_output
             and layer.weight.is_cuda
             and layer.weight.dtype is torch.bfloat16
+            and layer.weight.dim() == 2
             and layer.weight.is_contiguous()
             and layer.weight.shape == self.to_q.weight.shape
             for layer in layers
@@ -412,6 +413,9 @@ class QwenImage21Attention(nn.Module):
         ):
             return None
         q, k, v = self.to_q.weight, self.to_k.weight, self.to_v.weight
+        # Layerwise offload leaves a flat placeholder in place of each weight.
+        if q.dim() != 2:
+            return None
         rows, cols = q.shape
         if not (
             q.is_cuda
