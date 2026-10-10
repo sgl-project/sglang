@@ -1,11 +1,13 @@
 import types
 import unittest
+from dataclasses import replace
 from unittest.mock import patch
 
 import torch
 
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
+    HiCacheStorageExtraInfo,
     PoolName,
     PoolTransfer,
 )
@@ -132,17 +134,18 @@ def _fake_store_class():
 
 
 class FakeHostKVCache:
-    def __init__(self, objects_per_page):
+    def __init__(self, objects_per_page, logical_page_size=1):
         self.objects_per_page = objects_per_page
         self.kv_buffer = torch.empty((1024,), dtype=torch.uint8)
         self.layout = "page_first"
         self.page_size = 1
+        self.logical_page_size = logical_page_size
 
     def get_ksize_per_token(self):
         return 1
 
     def get_page_buffer_meta(self, indices):
-        page_count = len(indices) // self.page_size
+        page_count = len(indices) // self.logical_page_size
         ptrs = []
         sizes = []
         for page_idx in range(page_count):
@@ -152,7 +155,7 @@ class FakeHostKVCache:
         return ptrs, sizes
 
     def get_split_heads_page_buffer_meta(self, indices, split_factor):
-        page_count = len(indices) // self.page_size
+        page_count = len(indices) // self.logical_page_size
         ptrs = []
         sizes = []
         for page_idx in range(page_count):
@@ -244,9 +247,10 @@ def _make_store(
     tp_rank=0,
     tp_size=1,
     tp_lcm_size=None,
+    storage_config=None,
 ):
     fake_store_cls = _fake_store_class()
-    cfg = _make_config(
+    cfg = storage_config or _make_config(
         enable_group_semantics=enable_group_semantics,
         extra_backend_tag=extra_backend_tag,
         model_name=model_name,
@@ -274,6 +278,78 @@ def _make_store(
 
 
 class TestMooncakeGroupSemantics(CustomTestCase):
+    def test_dcp_shard_keys_and_replicas(self):
+        base = replace(
+            _make_config(is_mla_model=True, tp_size=4),
+            dcp_size=2,
+            logical_page_size=128,
+        )
+        keys = []
+        for rank in range(4):
+            cfg = replace(base, tp_rank=rank, dcp_rank=rank % 2)
+            store, fake = _make_store(storage_config=cfg)
+            store.register_mem_pool_host(FakeHostKVCache(1, 128))
+            self.assertEqual(store.batch_set_v1(["page"], torch.arange(128)), [True])
+            keys.append(fake.batch_put_calls[-1]["keys"][0])
+        self.assertEqual(keys[:2], keys[2:])
+        self.assertNotEqual(keys[0], keys[1])
+        self.assertTrue(keys[0].endswith("_page_dcp0_cp0_k"))
+        variants = (
+            base,
+            replace(base, tp_size=2),
+            replace(base, dcp_size=4),
+            replace(base, logical_page_size=256),
+            replace(base, pp_size=2),
+            replace(base, attn_cp_size=2),
+        )
+        prefixes = [
+            _make_store(storage_config=cfg)[0].config_prefix for cfg in variants
+        ]
+        self.assertEqual(len(set(prefixes)), len(variants))
+
+    def test_dcp_logical_batches_groups_and_pp_queries(self):
+        base = replace(
+            _make_config(is_mla_model=True, tp_size=4),
+            dcp_size=2,
+            logical_page_size=128,
+            pp_size=2,
+        )
+        groups = []
+        for shard in (0, 1):
+            for stage in (0, 1):
+                cfg = replace(base, tp_rank=shard, dcp_rank=shard, pp_rank=stage)
+                store, fake = _make_store(storage_config=cfg)
+                store.register_mem_pool_host(FakeHostKVCache(1, 128))
+                pages = ["page_0_hash", "page_1_hash"]
+                self.assertEqual(
+                    store.batch_set_v1(pages, torch.arange(256)), [True, True]
+                )
+                call = fake.batch_put_calls[-1]
+                self.assertEqual(
+                    call["keys"],
+                    [
+                        f"{store.config_prefix}_{page}_dcp{shard}_cp0_{stage}_k"
+                        for page in pages
+                    ],
+                )
+                self.assertEqual(len(call["ptrs"]), 2)
+                groups.append(call["args"][0].group_ids)
+                self.assertEqual(store.batch_exists(pages), 2)
+                fake.existing_keys = {
+                    key.replace(f"_cp0_{stage}_k", f"_cp0_{1 - stage}_k")
+                    for key in call["keys"]
+                }
+                self.assertEqual(store.batch_exists(pages), 0)
+                self.assertEqual(
+                    store.batch_exists(
+                        pages,
+                        HiCacheStorageExtraInfo(extra_info={"pp_rank": 1 - stage}),
+                    ),
+                    2,
+                )
+        self.assertTrue(all(group == groups[0] for group in groups))
+        self.assertEqual(len(set(groups[0])), 2)
+
     def test_group_id_detection_uses_class_attribute_without_instantiating(self):
         fake_store_cls = _fake_store_class()
         with patch.dict(
