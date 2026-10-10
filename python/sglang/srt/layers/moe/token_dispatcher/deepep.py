@@ -560,7 +560,37 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
     ):
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
         topk_ids = topk_ids.to(torch.int64)
-        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8:
+        static_fp8_scale = self.quant_config.get("normal_static_fp8_scale", None)
+        if static_fp8_scale is not None:
+            # Static-FP8 dispatch: per-tensor quantize the activations with the
+            # checkpoint's static scale, then ship the FP8 payload in a BF16
+            # view so DeepEP stays on its plain BF16 all-to-all path. This
+            # halves the traffic versus BF16, and since the scale is a single
+            # static scalar, quantizing on the sender is bit-identical to
+            # quantizing on the receiver -- no per-token scales are needed and
+            # the receive-side requantization is removed entirely.
+            from sglang.kernels.ops.quantization.per_tensor_quant_fp8 import (
+                per_tensor_quant_fp8,
+            )
+
+            assert hidden_states.shape[-1] % 2 == 0, (
+                "static-FP8 dispatch requires an even hidden size to view "
+                "the FP8 payload as BF16"
+            )
+            hidden_states_fp8 = torch.empty(
+                hidden_states.shape,
+                dtype=torch.float8_e4m3fn,
+                device=hidden_states.device,
+            )
+            if hidden_states.shape[0] > 0:
+                per_tensor_quant_fp8(
+                    hidden_states,
+                    hidden_states_fp8,
+                    static_fp8_scale,
+                    True,
+                )
+            hidden_states = hidden_states_fp8.view(torch.bfloat16)
+        elif deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8:
             # TODO hard code 128 block quant,use fp8 communication
             hidden_states = sglang_per_token_group_quant_fp8(
                 hidden_states,
@@ -616,7 +646,16 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         ) = self._dispatch_core(hidden_states, topk_ids, topk_weights, previous_event)
         event.current_stream_wait() if self.async_finish else ()
 
-        if isinstance(hidden_states, tuple):
+        if self.quant_config.get("normal_static_fp8_scale", None) is not None:
+            # Undo the BF16 view from dispatch_a: the received payload is FP8
+            # data quantized with the checkpoint's static scale, so there are
+            # no per-token scales to propagate.
+            assert not isinstance(hidden_states, tuple), (
+                "static-FP8 dispatch must not produce per-token scales"
+            )
+            hidden_states = hidden_states.view(torch.float8_e4m3fn)
+            hidden_states_scale = None
+        elif isinstance(hidden_states, tuple):
             hidden_states, hidden_states_scale = hidden_states
         else:
             hidden_states_scale = None
