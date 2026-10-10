@@ -81,6 +81,10 @@ from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStatePacker,
 )
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
+from sglang.srt.layers.cp.utils import (
+    dsa_prefill_cp_shared_add_rs,
+    dsa_prefill_cp_shared_experts,
+)
 from sglang.srt.layers.dcp.planner import (
     prepare_decode_context_parallel_metadata,
 )
@@ -335,6 +339,7 @@ class DeepseekV2MLP(nn.Module):
         x,
         forward_batch=None,
         gemm_output_zero_allocator: BumpAllocator = None,
+        precomputed_gate_up: Optional[torch.Tensor] = None,
         gateup_pre_quant: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ):
         if self.is_replicated and x.shape[0] == 0:
@@ -365,7 +370,9 @@ class DeepseekV2MLP(nn.Module):
             out, _ = self.down_proj((out_fp4, out_scale))
             return out
 
-        if gateup_pre_quant is not None:
+        if precomputed_gate_up is not None:
+            gate_up = precomputed_gate_up
+        elif gateup_pre_quant is not None:
             # SGLANG_OPT_MOE_QUANT_ONCE: reuse the caller's per-token-group-128
             # fp8 (q, scale) of x for the gate_up GEMM instead of re-quantizing
             # inside the fp8 linear method. q rows may be padded to a multiple
@@ -1172,7 +1179,7 @@ class DeepseekV2MoE(nn.Module):
         # Shared expert on alt stream, issued AFTER the main (routed) branch. See note above.
         # Only the quant-once fp8 pair is shared with it; the routed MXFP8 pre-quant is not.
         with torch.cuda.stream(self.alt_stream):
-            shared_output = self._forward_shared_experts(
+            _, shared_output = self._forward_shared_experts(
                 hidden_states,
                 gemm_output_zero_allocator,
                 pre_quant_input=pre_quant_input,
@@ -1266,11 +1273,13 @@ class DeepseekV2MoE(nn.Module):
                 and not self._fuse_shared_experts_inside_sbo
                 and not skip_shared_experts
             ):
-                shared_output = self._forward_shared_experts(
+                ag_out, shared_output = self._forward_shared_experts(
                     hidden_states,
                     gemm_output_zero_allocator,
                     pre_quant_input=pre_quant_input,
                 )
+                if ag_out is not None:
+                    hidden_states = ag_out
             # router_logits: (num_tokens, n_experts)
             if _is_hip:
                 router_logits, router_logits_partials = _hip_moe.forward_gate(
@@ -1320,7 +1329,7 @@ class DeepseekV2MoE(nn.Module):
                 nonlocal shared_output
                 self.alt_stream.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(self.alt_stream):
-                    shared_output = self._forward_shared_experts(
+                    _, shared_output = self._forward_shared_experts(
                         hidden_states, gemm_output_zero_allocator
                     )
 
@@ -1367,11 +1376,16 @@ class DeepseekV2MoE(nn.Module):
             and not self._fuse_shared_experts_inside_sbo
             and not skip_shared_experts
         ):
-            shared_output = self._forward_shared_experts(
+            _, shared_output = self._forward_shared_experts(
                 hidden_states,
                 gemm_output_zero_allocator,
                 pre_quant_input=pre_quant_input,
             )
+        fused_out = dsa_prefill_cp_shared_add_rs(
+            self, final_hidden_states, shared_output
+        )
+        if fused_out is not None:
+            return fused_out
 
         if return_moe_output:
             return MoEOutput(
@@ -1483,7 +1497,7 @@ class DeepseekV2MoE(nn.Module):
                 if self.alt_stream is not None:
                     self.alt_stream.wait_stream(torch.cuda.current_stream())
                     with torch.cuda.stream(self.alt_stream):
-                        shared_output = self._forward_shared_experts(hidden_states)
+                        _, shared_output = self._forward_shared_experts(hidden_states)
                         shared_output.record_stream(self.alt_stream)
                         shared_event = self.alt_stream.record_event()
                     if is_in_breakable_cuda_graph():
@@ -1494,7 +1508,7 @@ class DeepseekV2MoE(nn.Module):
                         # allocator recycles shared_output across the break.
                         torch.cuda.current_stream().wait_event(shared_event)
                 else:
-                    shared_output = self._forward_shared_experts(hidden_states)
+                    _, shared_output = self._forward_shared_experts(hidden_states)
             topk_kwargs = (
                 {"input_ids": input_ids_global}
                 if getattr(self, "is_hash", False)
@@ -1523,7 +1537,7 @@ class DeepseekV2MoE(nn.Module):
 
             def _deepep_dispatch_hook(dispatcher: BaseDispatcher):
                 nonlocal shared_output
-                shared_output = self._forward_shared_experts(hidden_states)
+                _, shared_output = self._forward_shared_experts(hidden_states)
                 for handle in deepep_dispatch_hook_handle:
                     handle.remove()
 
@@ -1597,7 +1611,7 @@ class DeepseekV2MoE(nn.Module):
                 with deep_gemm_wrapper.configure_deep_gemm_num_sms(
                     dispatcher.meta_overlap_args["compute_num_sms"]
                 ):
-                    shared_output = self._forward_shared_experts(hidden_states)
+                    _, shared_output = self._forward_shared_experts(hidden_states)
 
                 pre_combine_hook_handle.remove()
 
@@ -1704,19 +1718,14 @@ class DeepseekV2MoE(nn.Module):
             if pre_quant_input is None and _is_hip:
                 # SGLANG_HIP_FFN_NORM_MXFP8: the FFN norm launch's fp8 + ue8m0 of these rows
                 pre_quant_input = getattr(hidden_states, "_hip_mxfp8_operand", None)
-            if pre_quant_input is not None:
-                # SGLANG_OPT_MOE_QUANT_ONCE: (q, s) rows may be padded to a
-                # multiple of 4; the padded rows flow through the MLP (all ops
-                # are row-local) and are sliced off here.
-                out = self.shared_experts(
-                    hidden_states, gateup_pre_quant=pre_quant_input
-                )
-                return out[: hidden_states.shape[0]]
-            return self.shared_experts(
-                hidden_states, gemm_output_zero_allocator=gemm_output_zero_allocator
+            return dsa_prefill_cp_shared_experts(
+                self,
+                hidden_states,
+                gemm_output_zero_allocator=gemm_output_zero_allocator,
+                pre_quant_input=pre_quant_input,
             )
         else:
-            return None
+            return None, None
 
     def _moe_quant_once_enabled(self) -> bool:
         """SGLANG_OPT_MOE_QUANT_ONCE: quantize the (dp-gathered) MoE input to
