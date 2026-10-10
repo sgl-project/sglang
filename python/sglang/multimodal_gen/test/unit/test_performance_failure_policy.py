@@ -3,6 +3,7 @@ import subprocess
 import sys
 import textwrap
 import time
+import xml.etree.ElementTree as ET
 
 import pytest
 
@@ -160,9 +161,10 @@ def test_retry_estimate_excludes_successful_cases(tmp_path):
     assert _estimate_failed_test_time(None, 130) == 130
 
 
-@pytest.mark.parametrize(
-    "problem",
-    [
+def test_performance_failure_survives_real_pytest_runner(tmp_path):
+    # Share interpreter startup across scenarios, retaining seven real attempts
+    # and an independent pytest fixture lifecycle for each parametrized case.
+    problems = [
         "regression",
         "missing_baseline",
         "missing_record",
@@ -172,9 +174,7 @@ def test_retry_estimate_excludes_successful_cases(tmp_path):
         "e2e_only_missing_baseline",
         "e2e_only_zero_baseline",
         "e2e_only_nan_baseline",
-    ],
-)
-def test_performance_failure_survives_real_pytest_runner(tmp_path, problem):
+    ]
     # exercise the validator, request loop, pytest output and retry classifier together
     test_file = tmp_path / "test_guard.py"
     test_file.write_text(
@@ -189,8 +189,9 @@ def test_performance_failure_survives_real_pytest_runner(tmp_path, problem):
                 DiffusionSamplingParams, DiffusionServerArgs, DiffusionTestCase, ScenarioConfig,
             )
 
-            @pytest.mark.parametrize("case_id", ["threshold_guard"])
+            @pytest.mark.parametrize("case_id", PROBLEMS)
             def test_guard(case_id, monkeypatch, tmp_path):
+                problem = case_id
                 server = common.DiffusionServerBase()
                 server._perf_results = []
                 case = DiffusionTestCase(
@@ -199,14 +200,14 @@ def test_performance_failure_survives_real_pytest_runner(tmp_path, problem):
                     DiffusionSamplingParams(prompt="test"),
                     run_lora_basic_api_check=True, perf_repeat_requests=2,
                     run_consistency_check=False, run_models_api_check=False,
-                    run_perf_check=not PROBLEM.startswith("e2e_only_") and PROBLEM not in ("missing_record", "missing_e2e", "missing_log"),
+                    run_perf_check=not problem.startswith("e2e_only_") and problem not in ("missing_record", "missing_e2e", "missing_log"),
                 )
                 scenario = ScenarioConfig({}, {}, 1000, 100, 100, expected_load_ms=100)
-                if PROBLEM == "e2e_only_zero_baseline":
+                if problem == "e2e_only_zero_baseline":
                     scenario.expected_e2e_ms = 0
-                if PROBLEM == "e2e_only_nan_baseline":
+                if problem == "e2e_only_nan_baseline":
                     scenario.expected_e2e_ms = float("nan")
-                if PROBLEM in ("missing_baseline", "e2e_only_missing_baseline"):
+                if problem in ("missing_baseline", "e2e_only_missing_baseline"):
                     monkeypatch.delitem(common.BASELINE_CONFIG.scenarios, case_id, raising=False)
                 else:
                     monkeypatch.setitem(common.BASELINE_CONFIG.scenarios, case_id, scenario)
@@ -217,15 +218,15 @@ def test_performance_failure_survives_real_pytest_runner(tmp_path, problem):
                 lora_checks = []
                 def collect(*args, **kwargs):
                     requests.append(1)
-                    if PROBLEM == "missing_record":
+                    if problem == "missing_record":
                         return None, b""
                     return RequestPerfRecord(
                         request_id="guard", commit_hash="test", tag="guard",
                         stages=[], steps=[100],
-                        total_duration_ms=None if PROBLEM == "missing_e2e" else 2000,
+                        total_duration_ms=None if problem == "missing_e2e" else 2000,
                     ), b""
                 context = SimpleNamespace(load_time_ms=100)
-                if PROBLEM == "missing_log":
+                if problem == "missing_log":
                     log_path = tmp_path / "empty-perf.jsonl"
                     log_path.write_text("")
                     context = SimpleNamespace(perf_log_path=log_path, load_time_ms=100)
@@ -247,13 +248,15 @@ def test_performance_failure_survives_real_pytest_runner(tmp_path, problem):
                 try:
                     server._test_diffusion_generation_impl(case, context)
                 finally:
-                    print(f"GUARD_REQUESTS={len(requests)} LORA_CHECKS={len(lora_checks)}")
-                    print(f"RETAINED_METRICS={len(server._perf_results)}")
+                    print(
+                        f"GUARD_CASE={case_id} GUARD_REQUESTS={len(requests)} "
+                        f"LORA_CHECKS={len(lora_checks)} RETAINED_METRICS={len(server._perf_results)}"
+                    )
 
             def test_unrelated_timeout():
                 raise TimeoutError("independent infrastructure failure")
             """
-        ).replace("PROBLEM", repr(problem))
+        ).replace("PROBLEMS", repr(problems))
     )
     report = tmp_path / "junit.xml"
     env = os.environ.copy()
@@ -262,6 +265,8 @@ def test_performance_failure_survives_real_pytest_runner(tmp_path, problem):
         SGLANG_GEN_BASELINE="0",
         SGLANG_GEN_GT="0",
     )
+    # This test verifies retry exhaustion, independently of the outer CI budget.
+    env.pop("SGLANG_DIFFUSION_RETRY_DEADLINE", None)
     command = (
         "from sglang.multimodal_gen.test.runner.pytest_runner import run_pytest; "
         f"result = run_pytest([{str(test_file)!r}], junit_xml_path={str(report)!r}); "
@@ -278,9 +283,25 @@ def test_performance_failure_survives_real_pytest_runner(tmp_path, problem):
     output = result.stdout + result.stderr
     assert result.returncode == 1, output
     assert "[performance]" in output, output
-    assert "GUARD_REQUESTS=1 LORA_CHECKS=0" in output, output
-    retained = 0 if problem in {"missing_record", "missing_e2e", "missing_log"} else 1
-    assert f"RETAINED_METRICS={retained}" in output, output
     assert output.count("Starting pytest attempt") == 7, output
     assert "Max retry exceeded (6)" in output, output
-    assert "'threshold_guard': 'fail'" in output, output
+    cases = {case.attrib["name"]: case for case in ET.parse(report).iter("testcase")}
+    assert set(cases) == {f"test_guard[{p}]" for p in problems} | {
+        "test_unrelated_timeout"
+    }, output
+    for problem in problems:
+        retained = (
+            0 if problem in {"missing_record", "missing_e2e", "missing_log"} else 1
+        )
+        marker = (
+            f"GUARD_CASE={problem} GUARD_REQUESTS=1 LORA_CHECKS=0 "
+            f"RETAINED_METRICS={retained}"
+        )
+        assert output.count(marker) == 7, output
+        assert f"'{problem}': 'fail'" in output, output
+        failure = cases[f"test_guard[{problem}]"].find("failure")
+        assert failure is not None, output
+        assert "[performance]" in failure.attrib["message"], output
+    timeout_failure = cases["test_unrelated_timeout"].find("failure")
+    assert timeout_failure is not None, output
+    assert "independent infrastructure failure" in timeout_failure.attrib["message"]
