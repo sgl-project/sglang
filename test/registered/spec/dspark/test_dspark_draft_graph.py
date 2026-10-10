@@ -8,7 +8,6 @@ from sglang.srt.speculative.dspark_components.dspark_draft import (
     DraftNoise,
     draft_markov_block,
 )
-from sglang.srt.speculative.spec_tp_sync import SpecTpSyncSite
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -32,7 +31,7 @@ class TestDraftMarkovBlockGraph(CustomTestCase):
         noise = DraftNoise(
             key=11, offset=torch.zeros(1, dtype=torch.int64, device=DEVICE)
         )
-        logits_out = torch.empty(BS, GAMMA, VOCAB, dtype=torch.bfloat16, device=DEVICE)
+        logits_out = torch.empty(GAMMA, BS, VOCAB, dtype=torch.bfloat16, device=DEVICE)
         tokens_out = torch.empty(BS, GAMMA, dtype=torch.int64, device=DEVICE)
 
         def block():
@@ -44,7 +43,6 @@ class TestDraftMarkovBlockGraph(CustomTestCase):
                 step_temperatures=temperatures,
                 noise=noise,
                 tp_sync=SimpleNamespace(sync=lambda site, value: value),
-                site=SpecTpSyncSite.DSPARK_GRAPH_SAMPLE,
                 logits_out=logits_out,
             )
             tokens_out.copy_(tokens)
