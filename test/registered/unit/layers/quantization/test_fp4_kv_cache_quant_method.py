@@ -343,6 +343,75 @@ class TestNVFP4KVCacheMethod(CustomTestCase):
         self.assertTrue(torch.all(m.v_scales_gpu == 1.0))
         self.assertEqual(len(m.k_scales_gpu), 4)
 
+    def test_scale_loading_uses_writer_for_shared_cache(self):
+        """A shared reader must not overwrite its cache writer's global scales."""
+        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+            NVFP4KVCacheMethod,
+        )
+
+        for is_sm100 in (False, True):
+            for writer_scale, reader_scale in (
+                (0.25, None),
+                (0.25, 1.0),
+                (0.25, 9.0),
+                (1.0, 9.0),
+            ):
+                for reader_first in (False, True):
+                    with self.subTest(
+                        is_sm100=is_sm100,
+                        writer_scale=writer_scale,
+                        reader_scale=reader_scale,
+                        reader_first=reader_first,
+                    ):
+                        writer = SimpleNamespace(
+                            self_attn=SimpleNamespace(
+                                is_kv_shared_layer=False,
+                                attn=SimpleNamespace(
+                                    layer_id=2,
+                                    k_scale=torch.tensor(writer_scale),
+                                    v_scale=torch.tensor(writer_scale * 2),
+                                ),
+                            )
+                        )
+                        reader = SimpleNamespace(
+                            self_attn=SimpleNamespace(
+                                is_kv_shared_layer=True,
+                                attn=SimpleNamespace(
+                                    layer_id=2,
+                                    k_scale=(
+                                        None
+                                        if reader_scale is None
+                                        else torch.tensor(reader_scale)
+                                    ),
+                                    v_scale=(
+                                        None
+                                        if reader_scale is None
+                                        else torch.tensor(reader_scale)
+                                    ),
+                                ),
+                            )
+                        )
+                        model = SimpleNamespace(
+                            layers=[reader, writer]
+                            if reader_first
+                            else [writer, reader]
+                        )
+                        method = NVFP4KVCacheMethod(
+                            num_layers=3, device="cpu", native_scale_layout=False
+                        )
+                        with patch(
+                            "sglang.srt.layers.quantization.fp4_kv_cache_quant_method.get_platform",
+                            return_value=SimpleNamespace(is_sm100=is_sm100),
+                        ):
+                            method.load_scales_from_model(model)
+                        expected = tuple(
+                            scale * 6 if is_sm100 and scale != 1.0 else scale
+                            for scale in (writer_scale, writer_scale * 2)
+                        )
+                        self.assertEqual(method.get_bmm_scales(2), expected)
+                        self.assertEqual(method.k_scales_gpu[2].item(), expected[0])
+                        self.assertEqual(method.v_scales_gpu[2].item(), expected[1])
+
     def test_sm100_scale_loading_preserves_uncalibrated_fallback(self):
         from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
             NVFP4KVCacheMethod,
