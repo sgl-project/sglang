@@ -100,9 +100,8 @@ class TestDsparkDpAttentionMoeA2aGate(CustomTestCase):
         server_args = _make_dspark_server_args(
             model_path=_BUNDLED_MODEL_PATH, hf_config=_bundled_hf_config()
         )
-        server_args.enable_dp_attention = True
         server_args.enable_dp_lm_head = True
-        server_args.dp_size = 2
+        server_args.attn_dp_size = 2
         server_args.tp_size = 2
         server_args.moe_a2a_backend = moe_a2a_backend
         return server_args
@@ -123,7 +122,7 @@ class TestDsparkDpAttentionMoeA2aGate(CustomTestCase):
 
 
 class TestDsparkFoldedSamplingDefault(CustomTestCase):
-    def test_sharded_greedy_default_and_sampling_override(self):
+    def test_auto_folds_sampling_when_buffers_fit(self):
         from sglang.srt.environ import DsparkFoldedSampling, envs
         from sglang.srt.speculative.dspark_components.dspark_draft_sampler import (
             _resolve_folded_sampling,
@@ -141,17 +140,22 @@ class TestDsparkFoldedSamplingDefault(CustomTestCase):
             tp_rank=0,
             available_memory_gb=16,
         )
-        with envs.SGLANG_DSPARK_FOLDED_SAMPLING.override(
-            DsparkFoldedSampling.AUTO.value
-        ):
-            self.assertFalse(_resolve_folded_sampling(**args))
-            model.markov_head.supports_sharded_greedy = False
-            self.assertTrue(_resolve_folded_sampling(**args))
-        model.markov_head.supports_sharded_greedy = True
+        # AUTO decides on memory alone, also for sharded-greedy (V4.1 TP) heads.
+        for sharded_greedy in (True, False):
+            model.markov_head.supports_sharded_greedy = sharded_greedy
+            with envs.SGLANG_DSPARK_FOLDED_SAMPLING.override(
+                DsparkFoldedSampling.AUTO.value
+            ):
+                self.assertTrue(_resolve_folded_sampling(**args))
+                self.assertFalse(
+                    _resolve_folded_sampling(**{**args, "available_memory_gb": 0.5})
+                )
         with envs.SGLANG_DSPARK_FOLDED_SAMPLING.override(
             DsparkFoldedSampling.FORCE.value
         ):
-            self.assertTrue(_resolve_folded_sampling(**args))
+            self.assertTrue(
+                _resolve_folded_sampling(**{**args, "available_memory_gb": 0.5})
+            )
 
 
 if __name__ == "__main__":

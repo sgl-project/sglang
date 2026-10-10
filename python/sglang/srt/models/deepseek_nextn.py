@@ -28,6 +28,8 @@ from sglang.kernels.ops.layernorm.fused_eh_norm import fused_eh_norm
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
+from sglang.srt.layers.layer_boundary import layer_stack
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -120,19 +122,42 @@ class DeepseekModelNextN(nn.Module):
             layer_name = "layers." + str(config.num_hidden_layers)
 
         self.quant_config = quant_config
-        self.decoder = DeepseekV2DecoderLayer(
-            config,
-            0,
-            quant_config=quant_config,
-            moe_quant_config_override=moe_quant_config_override,
-            is_nextn=True,
-            prefix=add_prefix(layer_name, prefix),
-            alt_stream=self.alt_stream,
-            skip_rope=config.qk_rope_head_dim == 0,
-        )
+        with layer_stack():
+            self.decoder = DeepseekV2DecoderLayer(
+                config,
+                0,
+                quant_config=quant_config,
+                moe_quant_config_override=moe_quant_config_override,
+                is_nextn=True,
+                prefix=add_prefix(layer_name, prefix),
+                alt_stream=self.alt_stream,
+                skip_rope=config.qk_rope_head_dim == 0,
+            )
 
         self.shared_head = nn.Module()
         self.shared_head.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def embed_input_ids(
+        self, input_ids: torch.Tensor, forward_batch: ForwardBatch
+    ) -> torch.Tensor:
+        # MM positions in input_ids hold MM_PAD_SHIFT_VALUE+hash sentinels
+        # (far above vocab_size). Use target-produced mm_input_embeds for
+        # these positions and only call embed_tokens on the appended
+        # next-token to avoid embed OOB.
+        input_embeds = forward_batch.mm_input_embeds
+        if (
+            forward_batch.forward_mode.is_extend()
+            and forward_batch.contains_mm_inputs()
+            and not forward_batch.forward_mode.is_draft_extend_v2()
+        ):
+            assert input_embeds is not None
+            last_indices = (
+                forward_batch.extend_start_loc + forward_batch.extend_seq_lens - 1
+            ).long()
+            input_embeds[last_indices] = self.embed_tokens(input_ids[last_indices])
+        if input_embeds is None:
+            input_embeds = self.embed_tokens(input_ids)
+        return input_embeds
 
     def forward(
         self,
@@ -165,27 +190,7 @@ class DeepseekModelNextN(nn.Module):
             )
 
             if input_embeds is None:
-                # MM positions in input_ids hold MM_PAD_SHIFT_VALUE+hash sentinels
-                # (far above vocab_size). Use target-produced mm_input_embeds for
-                # these positions and only call embed_tokens on the appended
-                # next-token to avoid embed OOB.
-                input_embeds = forward_batch.mm_input_embeds
-                if (
-                    forward_batch.forward_mode.is_extend()
-                    and forward_batch.contains_mm_inputs()
-                    and not forward_batch.forward_mode.is_draft_extend_v2()
-                ):
-                    assert input_embeds is not None
-                    last_indices = (
-                        forward_batch.extend_start_loc
-                        + forward_batch.extend_seq_lens
-                        - 1
-                    ).long()
-                    input_embeds[last_indices] = self.embed_tokens(
-                        input_ids[last_indices]
-                    )
-                if input_embeds is None:
-                    input_embeds = self.embed_tokens(input_ids)
+                input_embeds = self.embed_input_ids(input_ids, forward_batch)
             hidden_states = input_embeds
 
             if hidden_states.shape[0] > 0:
@@ -215,27 +220,21 @@ class DeepseekModelNextN(nn.Module):
                 else:
                     hidden_states = self.eh_proj(eh_input)
 
-            residual = None
+            residual_batch.start(forward_batch)
             index_topk_share = IndexTopKShareState.from_mtp_carry(forward_batch)
             with get_global_expert_distribution_recorder().disable_this_region():
-                hidden_states, residual, topk_indices = self.decoder(
+                (hidden_states, topk_indices) = self.decoder(
                     positions,
                     hidden_states,
                     forward_batch,
-                    residual,
                     zero_allocator,
                     prev_topk_indices=index_topk_share.topk_indices,
                 )
-            hidden_states, residual = (
-                self.decoder.layer_communicator.finish_layer_stack(
-                    hidden_states, residual, forward_batch
-                )
-            )
+            hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
             if not forward_batch.forward_mode.is_idle():
-                if residual is not None:
-                    hidden_states, _ = self.shared_head.norm(hidden_states, residual)
-                else:
-                    hidden_states = self.shared_head.norm(hidden_states)
+                hidden_states = residual_batch.final_norm(
+                    hidden_states, forward_batch, self.shared_head.norm
+                )
 
             index_topk_share.update(topk_indices)
             index_topk_share.publish()
@@ -282,7 +281,6 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
     ) -> None:
         nn.Module.__init__(self)
         self.config = config
-        self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
         # if not set, model load will be broken in DeepseekV3ForCausalLM load_weights()
         self.pp_group = get_parallel().pp_group

@@ -25,10 +25,6 @@ class PoolEntry:
     device_evict_fn: Callable[[int], Any] | None = None
     device_alloc_fn: Callable[[int], Any] | None = None
     device_free_fn: Callable[[Any], Any] | None = None
-    # Bind rows to the anchor's virtual IDs when pools share an ID space.
-    # Return buffer indices, or None if allocation fails. Rollback through
-    # device_free_fn takes the anchor's virtual IDs, not the returned indices.
-    device_indices_from_anchor_fn: Callable[[Any], Any] | None = None
     packed_draft_device_pools: tuple[Any, ...] = ()
 
 
@@ -105,16 +101,18 @@ class HostPoolGroup:
             element_sizes.add(element_size)
         return element_sizes.pop() if len(element_sizes) == 1 else None
 
-    def get_contiguous_buf_infos(self):
+    def get_contiguous_buf_infos(self, pool_names: set[PoolName] | None = None):
         """Return (device_buffers, host_buffers), each (ptrs, sizes, item_sizes)."""
         host_by_device_ptr = {}
         device_infos = ([], [], [])
         for entry in self.entries:
+            if pool_names is not None and entry.name not in pool_names:
+                continue
             host = entry.host_pool
             pools = (entry.device_pool, *entry.packed_draft_device_pools)
             for pool in pools:
                 dense_mha = (
-                    type(pool) is MHATokenToKVPool
+                    isinstance(pool, MHATokenToKVPool)
                     and pool.kv_cache_layout == "nhd"
                     and pool.v_head_dim == pool.head_dim
                 )
@@ -127,9 +125,21 @@ class HostPoolGroup:
                         "Host receive requires dense NHD MHA target and "
                         "draft KV with matching page sizes"
                     )
-                for combined, values in zip(
-                    device_infos, pool.get_contiguous_buf_infos(), strict=True
+                buffers = pool.k_buffer + pool.v_buffer
+                infos = pool.get_contiguous_buf_infos()
+                expected = (
+                    [buffer.data_ptr() for buffer in buffers],
+                    [buffer.nbytes for buffer in buffers],
+                    [buffer[0].nbytes * self.page_size for buffer in buffers],
+                )
+                if infos != expected or any(
+                    not buffer.is_contiguous() for buffer in buffers
                 ):
+                    raise ValueError(
+                        "Host receive requires contiguous per-layer KV buffers "
+                        "without embedded state"
+                    )
+                for combined, values in zip(device_infos, infos, strict=True):
                     combined.extend(values)
 
             # Packed MHA stores target/draft K followed by target/draft V,
@@ -290,6 +300,10 @@ class HostPoolGroup:
     @property
     def size_per_token(self):
         return self.anchor_entry.host_pool.size_per_token
+
+    @property
+    def stores_page_envelope(self) -> bool:
+        return self.anchor_entry.host_pool.stores_page_envelope
 
     def clear(self) -> None:
         for entry in self.entries:

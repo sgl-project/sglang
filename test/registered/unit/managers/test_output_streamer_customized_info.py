@@ -9,7 +9,11 @@ import numpy as np
 import torch
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput, SamplingMaskStatus
+from sglang.srt.layers.logits_processor import (
+    LogitsProcessorOutput,
+    SamplingMaskOutput,
+    SamplingMaskStatus,
+)
 from sglang.srt.managers import io_struct
 from sglang.srt.managers.io_struct import (
     msgpack_decode,
@@ -210,6 +214,7 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
         quiet = _FakeReq("quiet", [10, 11])
         quiet.stream = True
         quiet.sampling_params.stream_interval = 2
+        quiet.send_token_offset = 1
         terminal = _FakeReq("terminal", [20], finished=True)
 
         streamer._stream_output_generation([quiet, terminal], False)
@@ -247,6 +252,7 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
         quiet = _FakeReq("quiet", [10, 11])
         quiet.stream = True
         quiet.sampling_params.stream_interval = 2
+        quiet.send_token_offset = 1
 
         streamer._stream_output_generation([terminal, quiet], False)
 
@@ -388,6 +394,33 @@ class TestOutputStreamerWeightVersions(unittest.TestCase):
         self.assertIsNone(payload.weight_versions)
 
 
+class TestOutputStreamerStreamInterval(unittest.TestCase):
+    def test_sends_once_interval_tokens_are_unsent(self):
+        """With stream_interval=4, the first token goes out at once, then a chunk
+        whenever 4 or more tokens are unsent, however many each step appends."""
+        cases = {
+            # One token per step keeps the cadence of sending at 1, 5, 9, ...
+            "single_token_steps": ([1] * 9, (), [1, 0, 0, 0, 4, 0, 0, 0, 4]),
+            # Speculative steps pass multiples of 4 without landing on them.
+            "multi_token_steps": ([1, 3, 3, 3, 3], (), [1, 0, 6, 0, 6]),
+            # A chunk held for a possible stop string goes out on the next step.
+            "held_for_stop_str": ([1] * 6, (4,), [1, 0, 0, 0, 0, 5]),
+        }
+        for name, (steps, held_steps, expected) in cases.items():
+            with self.subTest(name):
+                req = _FakeReq("r0", [])
+                req.stream = True
+                req.sampling_params.stream_interval = 4
+                sent = []
+                for step, num_tokens in enumerate(steps):
+                    req.check_match_stop_str_prefix = lambda: step in held_steps
+                    req.output_ids.extend(range(num_tokens))
+                    accumulator = _accumulator()
+                    accumulator.accept(req=req)
+                    sent.append(sum(map(len, accumulator.output_ids)))
+                self.assertEqual(sent, expected)
+
+
 _IPC_ROUND_TRIPS = {
     "pickle": lambda payload: pickle.loads(
         pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL)
@@ -494,7 +527,7 @@ class TestOutputStreamerSamplingMasks(unittest.TestCase):
                     support = torch.randn(len(support_reqs), width, generator=generator)
                     output = LogitsProcessorOutput(
                         next_token_logits=None,
-                        sampling_mask_output=SimpleNamespace(
+                        sampling_mask_output=SamplingMaskOutput(
                             token_ids=token_ids,
                             lengths=lengths,
                             selected_logprobs=selected,

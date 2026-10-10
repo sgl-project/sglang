@@ -29,13 +29,15 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.layers.moe import utils as moe_utils
+from sglang.srt.layers.moe.utils import MoeA2ABackend
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
     compute_local_num_token_non_padded,
     compute_local_num_token_non_padded_cpu,
+    enable_num_token_non_padded,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_flags, get_parallel
 from sglang.test.communicator_patch import patch_communicator
 from sglang.test.test_utils import CustomTestCase
 
@@ -54,7 +56,7 @@ def sparse_moe_input(rows):
             "is_moe_input_scattered_across_dp_ranks", return_value=local
         ),
         patch_communicator("is_enable_moe_cp_allgather", return_value=rows == "moe_cp"),
-        patch_communicator("_gathers_over_attention_cp", return_value=False),
+        patch_communicator("_cp_gathers_over_attn_cp", return_value=False),
     ):
         yield
 
@@ -233,6 +235,23 @@ class TestMoeNumTokenNonPaddedTable(CustomTestCase):
                 sparse_moe_input(mode),
             ):
                 self.assertIsNone(_value(_forward_batch(sharded=False, local=None)))
+
+
+class TestEnableNumTokenNonPadded(CustomTestCase):
+    def test_customized_a2a_backend_fills_the_count_at_ep1(self):
+        """At EP 1 without a WORLD-group DP gather, the customized backend
+        enables the count and `none` leaves it disabled."""
+        for backend, expected in (
+            (MoeA2ABackend.NONE, False),
+            (MoeA2ABackend.CUSTOMIZED, True),
+        ):
+            with (
+                self.subTest(backend=backend.value),
+                get_parallel().override(moe_ep_size=1),
+                get_flags().moe.override(a2a_backend=backend),
+                get_flags().dp.override(use_world_group_for_gather=False),
+            ):
+                self.assertIs(enable_num_token_non_padded(), expected)
 
 
 if __name__ == "__main__":

@@ -61,6 +61,9 @@ class KVArgs:
     host_kv_data_ptrs: Optional[List[int]] = None
     host_kv_data_lens: Optional[List[int]] = None
     host_kv_item_lens: Optional[List[int]] = None
+    host_state_data_ptrs: Optional[List[List[int]]] = None
+    host_state_data_lens: Optional[List[List[int]]] = None
+    host_state_item_lens: Optional[List[List[int]]] = None
     aux_data_ptrs: List[int]
     aux_data_lens: List[int]
     aux_item_lens: List[int]
@@ -158,8 +161,6 @@ class BaseKVSender(ABC):
         mgr: BaseKVManager,
         bootstrap_addr: str,
         bootstrap_room: int,
-        dest_tp_ranks: List[int],
-        pp_rank: int,
         req_has_disagg_prefill_dp_rank: bool = False,
     ): ...
 
@@ -181,6 +182,10 @@ class BaseKVSender(ABC):
         Send the kv cache at the given kv indices and the extra cache/state at the given indices to the decoder server.
         """
         ...
+
+    def mark_prefill_complete(self) -> None:
+        """Publish retained final-prefill KV for an enabled allocation policy."""
+        raise NotImplementedError
 
     def pop_decode_prefix_len(self) -> int:
         return 0
@@ -229,6 +234,14 @@ class BaseKVReceiver(ABC):
     def supports_host_destination(self) -> bool:
         """Whether this receiver's peer and layout support host KV destinations."""
         return False
+
+    def is_abort_release_safe(self) -> bool:
+        """Whether all writes to an aborted host destination have drained.
+
+        Host-capable backends must retain this state until ``clear()``. A failed
+        poll or elapsed timeout alone does not prove the buffers can be reused.
+        """
+        raise NotImplementedError
 
     @abstractmethod
     def __init__(

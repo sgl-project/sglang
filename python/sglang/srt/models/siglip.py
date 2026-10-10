@@ -14,7 +14,6 @@ from sglang.srt.layers.conv import Conv2dLayer
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
-from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix
 
 
@@ -71,15 +70,12 @@ class SiglipMLP(nn.Module):
         use_data_parallel: bool = False,
     ):
         super().__init__()
-        tp_size = 1 if use_data_parallel else get_parallel().tp_size
-        tp_rank = 0 if use_data_parallel else get_parallel().tp_rank
         self.fc1 = ColumnParallelLinear(
             config.hidden_size,
             config.intermediate_size,
             quant_config=quant_config,
             prefix=add_prefix("fc1", prefix),
-            tp_size=tp_size,
-            tp_rank=tp_rank,
+            parallel_group="replicated" if use_data_parallel else "tp",
         )
         self.act = act_layer()
         self.fc2 = RowParallelLinear(
@@ -87,8 +83,7 @@ class SiglipMLP(nn.Module):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("fc2", prefix),
-            tp_size=tp_size,
-            tp_rank=tp_rank,
+            parallel_group="replicated" if use_data_parallel else "tp",
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
