@@ -3,7 +3,9 @@ ComfyUI nodes for SGLang Diffusion integration.
 Provides nodes for connecting to SGLang Diffusion server and generating images/videos.
 """
 
+import base64
 import os
+import urllib.parse
 import uuid
 
 import folder_paths
@@ -748,11 +750,46 @@ class SGLDiffusionGenerateH3:
     OUTPUT_NODE = False
 
     @staticmethod
-    def _material_uri(value: str) -> str:
-        """Local paths become file:// URIs; remote URLs are passed through."""
-        if value.startswith(("http://", "https://", "file://")):
+    def _image_material_uri(image: torch.Tensor) -> str:
+        """Embed the image inline as a base64 data URI.
+
+        A `file://` path only works when the SGLD server runs on this same
+        machine; the server's H3 material loader accepts `data:` URIs
+        directly (no upload endpoint needed), so this works locally and
+        remotely alike.
+        """
+        path = get_image_path(image)
+        try:
+            with open(path, "rb") as fh:
+                encoded = base64.b64encode(fh.read()).decode("ascii")
+        finally:
+            os.remove(path)
+        return f"data:image/png;base64,{encoded}"
+
+    @staticmethod
+    def _is_local_server(base_url: str) -> bool:
+        host = urllib.parse.urlparse(base_url).hostname or ""
+        return host in ("localhost", "127.0.0.1", "::1")
+
+    @classmethod
+    def _remote_material_uri(cls, value: str, kind: str, base_url: str) -> str:
+        """Remote URLs pass through. A local path only works when the SGLD
+        server is also on this machine: H3's server-side `/v1/videos`
+        endpoint has no multipart slot for the video/audio conditions this
+        node sends through `extra_fields.conditions`, unlike the image
+        conditions above (which sidestep that by embedding bytes inline).
+        Raise clearly instead of building a `file://` URI that will
+        silently fail against any server that isn't local.
+        """
+        if value.startswith(("http://", "https://")):
             return value
-        return f"file://{os.path.abspath(value)}"
+        if cls._is_local_server(base_url):
+            return f"file://{os.path.abspath(value)}"
+        raise ValueError(
+            f"{kind} must be an http(s) URL when the SGLD server "
+            f"({base_url}) isn't on this machine; got a local path "
+            f"({value!r}), which that server has no way to read or upload."
+        )
 
     def generate(
         self,
@@ -785,7 +822,7 @@ class SGLDiffusionGenerateH3:
             conditions.append(
                 {
                     "type": "image",
-                    "uri": self._material_uri(get_image_path(first_frame)),
+                    "uri": self._image_material_uri(first_frame),
                     "role": "keyframe",
                     "frame_index": 0,
                 }
@@ -794,7 +831,7 @@ class SGLDiffusionGenerateH3:
             conditions.append(
                 {
                     "type": "image",
-                    "uri": self._material_uri(get_image_path(last_frame)),
+                    "uri": self._image_material_uri(last_frame),
                     "role": "keyframe",
                     "frame_index": -1,
                 }
@@ -803,7 +840,7 @@ class SGLDiffusionGenerateH3:
             conditions.append(
                 {
                     "type": "image",
-                    "uri": self._material_uri(get_image_path(reference_image)),
+                    "uri": self._image_material_uri(reference_image),
                     "role": "reference",
                 }
             )
@@ -811,7 +848,9 @@ class SGLDiffusionGenerateH3:
             conditions.append(
                 {
                     "type": "video",
-                    "uri": self._material_uri(reference_video),
+                    "uri": self._remote_material_uri(
+                        reference_video, "reference_video", sgld_client.base_url
+                    ),
                     "role": "reference",
                 }
             )
@@ -819,7 +858,9 @@ class SGLDiffusionGenerateH3:
             conditions.append(
                 {
                     "type": "audio",
-                    "uri": self._material_uri(reference_audio),
+                    "uri": self._remote_material_uri(
+                        reference_audio, "reference_audio", sgld_client.base_url
+                    ),
                     "role": "reference",
                 }
             )

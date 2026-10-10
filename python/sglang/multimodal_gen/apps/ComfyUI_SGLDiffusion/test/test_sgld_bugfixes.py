@@ -542,3 +542,88 @@ def test_generic_video_node_reports_server_resolved_size_not_requested_size():
     assert video.get_dimensions() == (1280, 704)
 
 
+# --- Bug 3: server-mode nodes sent local paths a remote server can't read --
+
+
+def test_generate_video_uploads_local_input_reference_instead_of_sending_path():
+    client = SGLDiffusionServerAPI(base_url="http://127.0.0.1:1234")
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as fh:
+        fh.write(b"fake-png-bytes")
+        local_image = fh.name
+
+    seen = {}
+
+    def fake_post(url, json=None, headers=None, timeout=None, files=None, data=None):
+        seen["files"] = files
+        seen["data"] = data
+        seen["json"] = json
+        return _Response({"id": "job-1"})
+
+    out_path = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False).name
+
+    def fake_get(url, headers=None, timeout=None, **kwargs):
+        return _Response(
+            {"id": "job-1", "status": "completed", "file_path": out_path}
+        )
+
+    with (
+        mock.patch(f"{PKG}.core.server_api.requests.post", side_effect=fake_post),
+        mock.patch(f"{PKG}.core.server_api.requests.get", side_effect=fake_get),
+    ):
+        client.generate_video(prompt="a cat", input_reference=local_image)
+
+    os.remove(local_image)
+    # A local path must be uploaded as file bytes, not sent as a path string
+    # the server (possibly on another machine) has no way to read.
+    assert seen["files"] is not None
+    assert seen["json"] is None
+
+
+def test_generate_video_downloads_result_when_server_path_is_not_local():
+    client = SGLDiffusionServerAPI(base_url="http://127.0.0.1:1234")
+
+    def fake_post(url, **kwargs):
+        return _Response({"id": "job-1"})
+
+    def fake_get(url, headers=None, timeout=None, stream=False, **kwargs):
+        if url.endswith("/content"):
+            return _Response({}, status_code=200)
+        return _Response(
+            {
+                "id": "job-1",
+                "status": "completed",
+                # A path on the *server's* filesystem, not this one.
+                "file_path": "/srv/sglang/outputs/job-1.mp4",
+            }
+        )
+
+    with tempfile.TemporaryDirectory() as out_dir:
+        with (
+            mock.patch(f"{PKG}.core.server_api.requests.post", side_effect=fake_post),
+            mock.patch(f"{PKG}.core.server_api.requests.get", side_effect=fake_get),
+        ):
+            result = client.generate_video(prompt="a cat", output_path=out_dir)
+
+        assert os.path.exists(result["file_path"])
+        assert os.path.dirname(result["file_path"]) == out_dir
+
+
+def test_h3_image_conditions_use_data_uri_not_local_file_path():
+    node = NODES.SGLDiffusionGenerateH3()
+    image = torch.zeros(1, 8, 8, 3)
+    uri = node._image_material_uri(image)
+    assert uri.startswith("data:image/png;base64,")
+
+
+def test_h3_rejects_local_video_reference_against_remote_server():
+    with pytest.raises(ValueError, match="no way to read or upload"):
+        NODES.SGLDiffusionGenerateH3._remote_material_uri(
+            "/data/clip.mp4", "reference_video", "http://remote-host.example:3000/v1"
+        )
+
+
+def test_h3_allows_local_video_reference_against_local_server():
+    uri = NODES.SGLDiffusionGenerateH3._remote_material_uri(
+        "/data/clip.mp4", "reference_video", "http://127.0.0.1:3000/v1"
+    )
+    assert uri == "file:///data/clip.mp4"
