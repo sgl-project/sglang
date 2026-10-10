@@ -1319,3 +1319,47 @@ The offline MXFP4 checkpoint stores weights in an FP8 container and includes dua
 scales (`weight_scale`, `weight_dual_scale`). If exported with smooth quantization,
 `mul_scale` is loaded and applied before activation quantization to keep activations
 aligned with the calibrated weights.
+
+### MXFP8 Flash Attention on Ascend
+
+Enable MXFP8 Flash Attention with `SGLANG_DIFFUSION_ENABLE_MXFP8_ATTENTION=1`
+and `--attention-backend fa`. This opt-in path supports non-causal self-attention
+with online `MXFP8Config` or offline `ModelSlimConfig` quantization.
+
+**Requirements:** Ascend 950, PyTorch 2.10.0, torch_npu >= 2.10.0.post4,
+and CANN >= 9.1.1. The installed stack must provide `npu_dynamic_mx_quant`,
+`npu_fused_infer_attention_score_v2`, and the FP8 E4M3 and E8M0 dtypes.
+
+For an online MXFP8 model:
+
+```bash
+SGLANG_DIFFUSION_ENABLE_MXFP8_ATTENTION=1 sglang generate \
+  --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers \
+  --quantization mxfp8 \
+  --attention-backend fa \
+  --num-gpus 1 \
+  --prompt "A curious raccoon" \
+  --save-output
+```
+
+For an offline ModelSlim checkpoint use its model path:
+
+```bash
+SGLANG_DIFFUSION_ENABLE_MXFP8_ATTENTION=1 sglang generate \
+  --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers-w8a8f8 \
+  --quantization mxfp8 \
+  --attention-backend fa \
+  --num-gpus 1 \
+  --prompt "A curious raccoon" \
+  --save-output
+```
+
+The MXFP8 path currently requires MHA with matching Q/K/V head dimensions of
+64 or 128. Causal and cross-attention use the regular attention path. MXFP8 FA
+does not return softmax LSE; MXFP8 ring attention is not supported. Only ascend_fa
+backend currently supports mxfp8 quantization
+
+Use `SGLANG_DIFFUSION_MXFP8_FA_HEAD_CHUNK_SIZE` to control head splitting optimization
+(default: `4`; `0` disables splitting). See the
+[attention environment variables](/docs/sglang-diffusion/environment_variables)
+for details.
