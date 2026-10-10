@@ -49,6 +49,10 @@ def uncached_a2a_staging():
     finally:
         _UNCACHED_STAGING -= 1
 
+# Accelerators whose device module exposes is_current_stream_capturing() and can
+# run the packed-QKV relayout kernel. "cuda" also covers ROCm, where is_cuda is True.
+_A2A_DEVICE_TYPES = ("cuda", "xpu")
+
 
 def drop_a2a_staging_buffers() -> None:
     """Release the cached all-to-all staging buffers on this rank.
@@ -59,8 +63,9 @@ def drop_a2a_staging_buffers() -> None:
     """
     if not _A2A_STAGING_BUFFERS:
         return
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
+    device_module = torch.get_device_module()
+    if device_module.is_available():
+        device_module.synchronize()
     _A2A_STAGING_BUFFERS.clear()
 
 
@@ -73,23 +78,25 @@ def _a2a_staging_buffer(
     next collective with the same role overwrites it. Keep one grow-only
     backing allocation per (role, dtype, device), then return an exact-shape
     view into that allocation. This removes per-block allocator churn without
-    retaining one CUDA tensor for every request shape seen by the worker.
-    Bypassed under autograd and CUDA graph capture: a buffer first allocated
-    while capturing would live in the graph's private memory pool and must
-    not be shared with eager replays.
+    retaining one device tensor for every request shape seen by the worker.
+    Bypassed under autograd and graph capture: a buffer first allocated while
+    capturing would live in the graph's private memory pool and must not be
+    shared with eager replays.
     """
     if (
         _UNCACHED_STAGING
         or torch.is_grad_enabled()
         or torch.compiler.is_compiling()
-        or device.type != "cuda"
-        or torch.cuda.is_current_stream_capturing()
+        or device.type not in _A2A_DEVICE_TYPES
+        # Query capture through the device module: torch.cuda.is_current_stream_capturing
+        # raises on an XPU-only build rather than returning False.
+        or torch.get_device_module(device).is_current_stream_capturing()
     ):
         return torch.empty(shape, dtype=dtype, device=device)
 
     device_index = device.index
     if device_index is None:
-        device_index = torch.cuda.current_device()
+        device_index = torch.get_device_module(device).current_device()
     key = (role, dtype, device_index)
     required_numel = math.prod(shape)
     buffer = _A2A_STAGING_BUFFERS.get(key)
@@ -400,7 +407,7 @@ def _usp_input_all_to_all_packed_qkv(
     h_local = h_global // world_size
 
     if (
-        q.is_cuda
+        q.device.type in _A2A_DEVICE_TYPES
         and q.dtype in (torch.float16, torch.bfloat16)
         and q.dtype == k.dtype == v.dtype
         and q.stride(-1) == k.stride(-1) == v.stride(-1) == 1
@@ -452,7 +459,7 @@ def _can_use_packed_qkv_a2a_4d(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, world_size: int
 ) -> bool:
     return (
-        q.is_cuda
+        q.device.type in _A2A_DEVICE_TYPES
         and q.ndim == 4
         and q.shape == k.shape == v.shape
         and q.dtype == k.dtype == v.dtype
