@@ -49,10 +49,6 @@ def _reject_model_patches(transformer_options) -> None:
 CONTENT_CONDITIONING = ("control", "ref_latents")
 
 
-# apply_model kwargs that carry image content (ControlNet residuals, reference latents).
-CONTENT_CONDITIONING = ("control", "ref_latents")
-
-
 def _reject_unapplied_conditioning(adapter, kwargs) -> None:
     dropped = [
         name
