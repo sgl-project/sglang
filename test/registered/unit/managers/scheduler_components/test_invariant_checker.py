@@ -35,6 +35,46 @@ from sglang.srt.session.streaming_session import SessionSlot
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
+class TestHiSparseLogicalOccupancy(CustomTestCase):
+    def test_logical_free_count_is_not_capped_by_hot_pool(self):
+        from sglang.srt.mem_cache.allocator.hisparse import (
+            HiSparseTokenToKVPoolAllocator,
+        )
+
+        allocator = MagicMock(spec=HiSparseTokenToKVPoolAllocator)
+        allocator.size = 2048
+        allocator.available_size.return_value = 768
+        allocator.logical_attn_allocator = SimpleNamespace(
+            size=2048, available_size=lambda: 1792
+        )
+        pool = SimpleNamespace(
+            schedulable_token_capacity=lambda size: size,
+            mamba_allocator=SimpleNamespace(available_size=lambda: 7),
+            mamba_pool=SimpleNamespace(size=8),
+        )
+        tree = MagicMock()
+        tree.supports_mamba.return_value = False
+        tree.evictable_size.return_value = 0
+        observer = SchedulerPoolStatsObserver(
+            tree_cache=tree,
+            token_to_kv_pool_allocator=allocator,
+            req_to_token_pool=pool,
+            session_controller=None,
+            hisparse_coordinator=None,
+            is_hybrid_swa=False,
+            is_hybrid_ssm=True,
+            enable_hisparse=True,
+            full_tokens_per_layer=None,
+            swa_tokens_per_layer=None,
+            max_total_num_tokens=1024,
+        )
+        for stats in (observer._get_mamba_token_info(), observer._get_token_info()):
+            self.assertEqual(stats.full_available_size, 1792)
+            self.assertEqual(stats.full_num_used, 256)
+            self.assertEqual(stats.full_token_usage, 0.125)
+        allocator.available_size.assert_not_called()
+
+
 class TestCheckTreeCacheGate(CustomTestCase):
     @contextmanager
     def _without_explicit_sanity_check_setting(self):
