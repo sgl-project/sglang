@@ -434,6 +434,7 @@ class DeepseekSparseAttnBackend(
         super().__init__()
         self.forward_metadata: DSAMetadata
         self.device = model_runner.device
+        self.kv_index_translator = model_runner.kv_index_translator
         assert isinstance(model_runner.page_size, int)
         self.num_splits = (
             1 if get_exec().deterministic.enable_deterministic_inference else 0
