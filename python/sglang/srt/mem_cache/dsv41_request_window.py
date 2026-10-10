@@ -3,7 +3,10 @@ from typing import Optional
 import msgspec
 import torch
 
-from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
+from sglang.kernels.ops.attention.dsv4.request_window import (
+    commit_window_tokens,
+    gather_window_history,
+)
 from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 
 
@@ -65,8 +68,9 @@ def window_layout(
     n = pos.numel()
     if n == 0:
         raise ValueError("request-window layout needs at least one query")
-    req = req.to(torch.int64)
-    pos = pos.to(torch.int64)
+    # The copy kernels read req and pos by address as dense arrays.
+    req = req.to(torch.int64).contiguous()
+    pos = pos.to(torch.int64).contiguous()
     device = pos.device
     groups = n if num_groups is None else int(num_groups)
     offset = torch.arange(n, device=device)
@@ -122,26 +126,6 @@ def window_layout(
     )
 
 
-def copy_packed_tokens(src, dst, src_loc, dst_loc, *, page_size, layout=KVLayout.V4):
-    """Move tokens between paged buffers of ``layout``: a data row and a scale row."""
-    if not src_loc.numel():
-        return
-    src_loc, dst_loc = src_loc.long(), dst_loc.long()
-    for width, base in (
-        (layout.data_bytes, 0),
-        (layout.scale_bytes, page_size * layout.data_bytes),
-    ):
-        cols = torch.arange(width, device=src.device)
-        values = src[
-            src_loc[:, None] // page_size,
-            base + (src_loc[:, None] % page_size) * width + cols,
-        ]
-        dst[
-            dst_loc[:, None] // page_size,
-            base + (dst_loc[:, None] % page_size) * width + cols,
-        ] = values
-
-
 def _capturing() -> bool:
     return torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
 
@@ -177,6 +161,7 @@ class RequestWindow:
             self._ensure_workspace(workspace_rows)
         self.layout = None
         self.prepared = None
+        self.history_checked = False
 
     def _ensure_workspace(self, rows: int) -> None:
         if self.workspace is not None and self.workspace.size >= rows:
@@ -191,12 +176,14 @@ class RequestWindow:
         )
         self.tags[:, loc.flatten()] = -1
         self.prepared = None
+        self.history_checked = False
 
     def activate(self, layout):
         if self.layout is layout:
             return
         self.layout = layout
         self.prepared = None
+        self.history_checked = False
         if self.workspace is None:
             self._ensure_workspace(layout.size)
         elif self.workspace.size < layout.size:
@@ -214,6 +201,7 @@ class RequestWindow:
             buf.zero_()
         self.tags[:, loc] = layout.history_pos
         self.prepared = None
+        self.history_checked = False
 
     def _history_src(self, layout):
         return torch.where(
@@ -231,20 +219,30 @@ class RequestWindow:
             layout = self.layout
             if layout is None:
                 raise RuntimeError("request-window metadata was not activated")
-            src = self._history_src(layout)
-            if not in_capture:
-                valid = layout.history_valid
-                if not torch.equal(
-                    self.tags[layer, src][valid], layout.history_pos[valid]
-                ):
-                    raise RuntimeError(
-                        "SWA history is missing: replay or window ownership is invalid"
-                    )
-            copy_packed_tokens(
+            if in_capture:
+                self.history_checked = False
+            elif not self.history_checked:
+                # A layer's tags change only in its own commit, so checking every
+                # layer at the layout's first gather equals checking each layer
+                # before its own. The assert runs on the GPU without a host sync; a
+                # failure surfaces at the next synchronizing call and leaves the
+                # CUDA context unusable.
+                tags = self.tags[:, self._history_src(layout)]
+                ok = (tags == layout.history_pos) | ~layout.history_valid
+                torch._assert_async(
+                    ok.all(),
+                    "SWA history is missing: replay or window ownership is invalid",
+                )
+                self.history_checked = True
+            gather_window_history(
                 self.state.kv_buffer[layer],
                 self.workspace.kv_buffer[0],
-                src,
-                layout.history_loc,
+                history_req=layout.history_req,
+                history_pos=layout.history_pos,
+                history_valid=layout.history_valid,
+                history_loc=layout.history_loc,
+                capacity=self.capacity,
+                zero_row=self.zero_row,
                 page_size=self.page_size,
                 layout=self.state.kv_layout,
             )
@@ -253,17 +251,16 @@ class RequestWindow:
 
     def commit(self, layer):
         layout = self.layout
-        dst = torch.where(
-            layout.commit_mask,
-            layout.req * self.capacity + layout.pos % self.capacity,
-            self.sink_row,
-        )
-        copy_packed_tokens(
+        commit_window_tokens(
             self.buffer(layer),
             self.state.kv_buffer[layer],
-            layout.write_loc,
-            dst,
+            self.tags[layer],
+            write_loc=layout.write_loc,
+            req=layout.req,
+            pos=layout.pos,
+            commit_mask=layout.commit_mask,
+            capacity=self.capacity,
+            sink_row=self.sink_row,
             page_size=self.page_size,
             layout=self.state.kv_layout,
         )
-        self.tags[layer, dst] = layout.pos
