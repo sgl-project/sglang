@@ -10,7 +10,6 @@
 #include <cstdint>
 #include <cstdlib>
 #include <memory>
-#include <new>
 #include <optional>
 
 namespace sglang {
@@ -59,7 +58,7 @@ inline Tensor from_blob(
   const auto ctx = [&] {
     auto ptr = std::malloc(sizeof(Context) + sizeof(int64_t) * ndim * 2);
     auto ctx = static_cast<Context*>(ptr);
-    new (ctx) Context{std::forward<Fn>(deleter), static_cast<int64_t>(ndim)};
+    std::construct_at(ctx, std::forward<Fn>(deleter), static_cast<int64_t>(ndim));
     stdr::copy_n(shape.data(), ndim, ctx->get_shape());
     if (stride.has_value()) {
       RuntimeCheck(stride->size() == ndim, "Stride ndim mismatch!");

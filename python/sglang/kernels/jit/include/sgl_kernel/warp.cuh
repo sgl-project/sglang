@@ -270,8 +270,7 @@ struct CopyTrait {
 };
 
 struct LoadStorePattern {
-  static constexpr auto MAX_GMEM = LoadStoreBytes::MAX_GMEM;
-  static constexpr auto MAX_SMEM = LoadStoreBytes::MAX_SMEM;
+  using enum LoadStoreBytes::type;
   enum type : int64_t {
     WARP_UNIFORM_GMEM = -MAX_GMEM,
     WARP_UNIFORM_SMEM = -MAX_SMEM,
@@ -306,10 +305,9 @@ SGL_DEVICE auto load_bytes(const void* src) {
 
 template <
     int64_t kBytes,
-    typename T,
     int64_t kMaxVecBytes = LoadStorePattern::MAX_GMEM,
     int64_t kVecBytes = LoadStorePattern::get_vec_bytes<kBytes, kMaxVecBytes>()>
-SGL_DEVICE void store_bytes(void* dst, const T& result) {
+SGL_DEVICE void store_bytes(void* dst, const auto& result) {
   return CopyTrait<kBytes, kVecBytes>::store(dst, result);
 }
 

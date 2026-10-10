@@ -2,7 +2,6 @@
 
 #include <cassert>
 #include <stdexcept>
-#include <tuple>
 #ifndef __CUDACC__
 #include <variant>
 #endif

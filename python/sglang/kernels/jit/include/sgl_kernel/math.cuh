@@ -122,7 +122,7 @@ struct fast_mod_div_u32_t {
  public:
   explicit constexpr fast_mod_div_u32_t(uint32_t d) : m_divisor(d) {
     if (d > 1) {
-      const uint32_t log2_ceil = static_cast<uint32_t>(host::log2_ceil(d));
+      const uint32_t log2_ceil = 32 - std::countl_zero(d - 1);
       const uint32_t p = 31 + log2_ceil;
       m_magic = static_cast<uint32_t>(((uint64_t{1} << p) + d - 1) / d);
       m_shift = p - 32;
@@ -150,8 +150,8 @@ struct fast_mod_div_u32_t {
 
  private:
   uint32_t m_divisor;
-  uint32_t m_magic = 0;
-  uint32_t m_shift = 0;
+  uint32_t m_magic;
+  uint32_t m_shift;
 };
 
 template <typename T>

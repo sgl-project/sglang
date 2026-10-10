@@ -33,7 +33,7 @@
 #include <sgl_kernel/utils.cuh>
 #elif defined(__HIPCC__)
 #include <sgl_kernel/utils.cuh>
-#elif defined(__MUSACC__)
+#elif defined(USE_MUSA)
 #include <sgl_kernel/utils.cuh>
 #endif
 
@@ -91,7 +91,7 @@ template <>
 struct DLDataTypeTrait<bf16_t> {
   inline static constexpr DLDataType value = {.code = DLDataTypeCode::kDLBfloat, .bits = 16, .lanes = 1};
 };
-#elif defined(__MUSACC__)
+#elif defined(USE_MUSA)
 template <>
 struct DLDataTypeTrait<fp16_t> {
   inline static constexpr DLDataType value = {.code = DLDataTypeCode::kDLFloat, .bits = 16, .lanes = 1};
