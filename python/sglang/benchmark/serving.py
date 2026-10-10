@@ -1175,7 +1175,8 @@ def calculate_metrics(
                     retokenized_itls.extend([adjusted_itl] * num_tokens)
             else:
                 itls += outputs[i].itl
-            ttfts.append(outputs[i].ttft)
+            if outputs[i].ttft > 0:
+                ttfts.append(outputs[i].ttft)
 
             e2e_latencies.append(outputs[i].latency)
 
