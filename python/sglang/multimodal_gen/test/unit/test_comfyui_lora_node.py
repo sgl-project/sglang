@@ -2,6 +2,7 @@
 """SGLD LoRA: loader nodes and binding the sampled MODEL's LoRAs to the worker."""
 
 import copy
+import functools
 import sys
 import types
 from contextlib import nullcontext
@@ -21,6 +22,7 @@ from sglang.multimodal_gen.runtime.layers.lora.linear import BaseLayerWithLoRA
 from sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline import LoRAPipeline
 
 
+@functools.cache
 def _load_nodes():
     """Import the real nodes.py with the ComfyUI modules it needs stubbed."""
     folder_paths = types.ModuleType("folder_paths")
@@ -172,3 +174,12 @@ def test_failed_lora_switch_is_not_recorded_as_active() -> None:
         ex.sampler_sample_wrapper(lambda *a: None, _sampler([("B", 0.5)]))
     assert ex._lora_input is None
     ex.generator.unmerge_lora_weights.assert_called_once()
+
+
+def test_chained_lora_targets_that_overlap_are_rejected() -> None:
+    """The worker keeps one group per overlapping target, so 'all' chained with
+    'transformer' would silently drop one LoRA."""
+    loader = _load_nodes().SGLDLoraLoader()
+    (first,) = loader.load_lora(_Model(None), "a.safetensors", 1.0, "a", "all")
+    with pytest.raises(ValueError, match="target 'all'"):
+        loader.load_lora(first, "b.safetensors", 1.0, "b", "transformer")

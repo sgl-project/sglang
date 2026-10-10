@@ -213,6 +213,14 @@ class SGLDLoraLoader:
             lora_input["strength"].append(lora_info[1])
             lora_input["target"].append(lora_info[2])
 
+        targets = set(lora_input["target"])
+        if "all" in targets and len(targets) > 1:
+            # set_lora groups adapters per target string; "all" overlapping a
+            # named target makes the worker keep only one group on that module.
+            raise ValueError(
+                "Chained SGLDLoraLoader nodes mix target 'all' with "
+                f"{sorted(targets - {'all'})}; use the same target on every node"
+            )
         # The shared worker is bound to the selected MODEL at sampling time.
         bi.model_options["sgld_lora_input"] = lora_input
         return (bi,)
