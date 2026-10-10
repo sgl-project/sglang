@@ -30,6 +30,7 @@ TOOL_CALL_PARSER_NAMES = [
     "minicpm5",
     "mistral",
     "muse",
+    "plamo3",
     "poolside_v1",
     "pythonic",
     "qwen",
