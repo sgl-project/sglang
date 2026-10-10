@@ -420,6 +420,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 write_through_threshold=256,
                 device=str(self.device),
                 swa_sliding_window_size=params.sliding_window_size,
+                swa_cache_window_margin=envs.SGLANG_SWA_CACHE_WINDOW_MARGIN.get(),
                 swa_req_ring=is_swa_req_ring(self._allocator),
                 enable_kv_cache_events=params.enable_kv_cache_events,
                 mamba_cache_chunk_size=(

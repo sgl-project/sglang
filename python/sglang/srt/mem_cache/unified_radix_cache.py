@@ -213,6 +213,11 @@ class UnifiedRadixCache(BasePrefixCache):
         self._sliding_window_size = (
             params.sliding_window_size if self.is_swa_enabled else None
         )
+        self._swa_cached_window_size = (
+            self.components[ComponentType.SWA].cached_window_size
+            if self.is_swa_enabled
+            else None
+        )
         # The TreeCore owns the tree member-var state (structure, LRUs, sizes,
         # evictable leaves) and drives the components' tree-level hooks.
         self._tree_core_backend = select_tree_core_backend(params)
@@ -3589,12 +3594,26 @@ class UnifiedRadixCache(BasePrefixCache):
         return swa.sliding_window_size
 
     def swa_retain_floor(self, req) -> int | None:
-        if not self.is_mamba_enabled or self._sliding_window_size is None:
+        if self._sliding_window_size is None:
             return None
-        checkpoint = req.kv.mamba_last_track_seqlen
-        if checkpoint is None:
-            return None
-        return checkpoint - self._sliding_window_size
+        floors = []
+        checkpoint = req.kv.mamba_last_track_seqlen if self.is_mamba_enabled else None
+        if checkpoint is not None:
+            floors.append(checkpoint - self._sliding_window_size)
+        # A mamba hybrid inserts at its checkpoints, so a match lands there and
+        # cannot use a margin behind the prompt end.
+        if (
+            self._swa_cached_window_size > self._sliding_window_size
+            and not self.is_mamba_enabled
+            and not req.skip_radix_cache_insert
+        ):
+            prompt_floor = len(req.origin_input_ids) - self._swa_cached_window_size
+            if req.kv.cache_protected_len < prompt_floor:
+                # The prefill insert stopped at an SWA branch point, so the
+                # prompt's cached window is still request-owned; keep it for
+                # the finish insert.
+                floors.append(prompt_floor)
+        return min(floors, default=None)
 
     def supports_swa(self) -> bool:
         return self.is_swa_enabled

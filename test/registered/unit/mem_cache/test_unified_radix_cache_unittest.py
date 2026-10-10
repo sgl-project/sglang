@@ -11135,6 +11135,165 @@ class TestSWAWindowUnderBigramKey(CustomTestCase):
         cache.sanity_check()
 
 
+class TestSWACacheWindowMargin(CustomTestCase):
+    """A cached prompt must stay reusable by a match that ends up to
+    SGLANG_SWA_CACHE_WINDOW_MARGIN tokens before its end, as a chat template that
+    re-renders the previous assistant turn makes the next turn's match."""
+
+    cfg = CacheConfig(
+        page_size=1,
+        components=(ComponentType.FULL, ComponentType.SWA),
+        sliding_window_size=7,
+        kv_size=256,
+        max_context_len=64,
+    )
+    prompt_len = 24
+    # Generation-prompt tokens the next turn renders differently.
+    template_cut = 3
+
+    def _build(self, margin: int):
+        with envs.SGLANG_SWA_CACHE_WINDOW_MARGIN.override(margin):
+            return build_fixture(self.cfg)
+
+    def _alloc(self, allocator, n):
+        full_indices = allocator.full_attn_allocator.alloc(n)
+        swa_indices = allocator.swa_attn_allocator.alloc(n)
+        allocator.full_to_swa_index_mapping[full_indices] = swa_indices
+        return full_indices
+
+    def _prefilled_req(self, cache, allocator, req_to_token_pool):
+        req = Req(
+            rid=0,
+            origin_input_text="",
+            origin_input_ids=array("q"),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=32),
+        )
+        req_to_token_pool.alloc([req])
+        tokens = list(range(1, self.prompt_len + 1))
+        # Array ids, as the scheduler keeps them: the finish insert builds its
+        # key from origin_input_ids + output_ids.
+        req.origin_input_ids = array("q", tokens)
+        req.output_ids = array("q")
+        req.full_untruncated_fill_ids = array("q", tokens)
+        req.set_extend_range(0, self.prompt_len)
+        req_to_token_pool.write(
+            (req.kv.req_pool_idx, slice(0, self.prompt_len)),
+            self._alloc(allocator, self.prompt_len),
+        )
+        req.kv.kv_committed_len = self.prompt_len
+        req.last_node = cache.root_node_handle()
+        req.kv.cache_protected_len = 0
+        req.lock_receipt = DecLockRefParams()
+        req.extra_key = None
+        return req, tokens
+
+    def _decode(self, cache, allocator, req_to_token_pool, req, num_output: int):
+        """Decode `num_output` tokens, then run the decode-path SWA eviction."""
+        seq_len = self.prompt_len + num_output
+        req.output_ids = array("q", range(500, 500 + num_output))
+        req_to_token_pool.write(
+            (req.kv.req_pool_idx, slice(self.prompt_len, seq_len)),
+            self._alloc(allocator, num_output),
+        )
+        req.kv.kv_committed_len = seq_len
+        cache.evict_sliding_windows(req, seq_len - 1)
+        return seq_len
+
+    def _next_turn_match_len(self, cache, tokens) -> int:
+        next_turn = tokens[: self.prompt_len - self.template_cut] + [1000, 1001]
+        match = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", next_turn)))
+        )
+        return len(match.device_indices)
+
+    def test_next_turn_matches_short_of_the_cached_prompt(self):
+        for margin, expected in ((0, 0), (self.template_cut, 21)):
+            with self.subTest(margin=margin):
+                cache, allocator, req_to_token_pool = self._build(margin)
+                req, tokens = self._prefilled_req(cache, allocator, req_to_token_pool)
+                with envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(
+                    True
+                ):
+                    cache.checkpoint(req, up_to=self.prompt_len)
+                self.assertEqual(req.kv.cache_protected_len, self.prompt_len)
+                # The margin shares the window's leaf; split into the parent, it
+                # would sit outside the window the lock refreshes and go first.
+                self.assertEqual(
+                    len(_node_token_ids(cache, req.last_node)),
+                    self.cfg.sliding_window_size + margin,
+                )
+                cache.dec_lock_ref(req.last_node, req.lock_receipt)
+                self.assertEqual(self._next_turn_match_len(cache, tokens), expected)
+                cache.sanity_check()
+
+    def test_margin_survives_decode_after_a_branch_insert(self):
+        # A prefill insert that stops at an SWA branch point leaves the prompt
+        # request-owned until the request finishes. Decode-time eviction must
+        # keep its cached window for the finish insert.
+        window, margin = self.cfg.sliding_window_size, self.template_cut
+        cache, allocator, req_to_token_pool = self._build(margin)
+        req, tokens = self._prefilled_req(cache, allocator, req_to_token_pool)
+        req.swa_branching_seqlen = 2
+        with envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True):
+            cache.checkpoint(req, up_to=self.prompt_len)
+            self.assertEqual(req.kv.cache_protected_len, 2)
+            seq_len = self._decode(
+                cache, allocator, req_to_token_pool, req, num_output=10
+            )
+            self.assertLessEqual(
+                req.kv.get_evicted_seqlen(ComponentType.SWA),
+                self.prompt_len - window - margin,
+            )
+            finish_req(cache, req, seq_len)
+        self.assertEqual(
+            self._next_turn_match_len(cache, tokens),
+            self.prompt_len - self.template_cut,
+        )
+        cache.sanity_check()
+
+    def test_mamba_hybrid_gets_no_margin_floor(self):
+        # A mamba hybrid inserts at its checkpoints, so a margin behind the prompt
+        # end is never matched; holding it would only pin the reply's SWA.
+        cfg = CacheConfig(
+            page_size=1,
+            components=(ComponentType.FULL, ComponentType.SWA, ComponentType.MAMBA),
+            sliding_window_size=self.cfg.sliding_window_size,
+            kv_size=256,
+            max_context_len=64,
+        )
+        with envs.SGLANG_SWA_CACHE_WINDOW_MARGIN.override(self.template_cut):
+            cache, _, _ = build_fixture(cfg)
+        req = SimpleNamespace(
+            origin_input_ids=array("q", range(self.prompt_len)),
+            skip_radix_cache_insert=False,
+            kv=SimpleNamespace(cache_protected_len=0, mamba_last_track_seqlen=None),
+        )
+        self.assertIsNone(cache.swa_retain_floor(req))
+
+    def test_negative_margin_is_rejected(self):
+        # A margin below zero would free in-window SWA of a running request.
+        with envs.SGLANG_SWA_CACHE_WINDOW_MARGIN.override(-1):
+            with self.assertRaises(ValueError):
+                build_fixture(self.cfg)
+
+    def test_margin_leaves_decode_eviction_of_an_inserted_prompt(self):
+        # The prefill insert already keeps the margin in the tree, so decode
+        # must keep sliding the request's own window past the prompt.
+        window = self.cfg.sliding_window_size
+        cache, allocator, req_to_token_pool = self._build(self.template_cut)
+        req, _ = self._prefilled_req(cache, allocator, req_to_token_pool)
+        with envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True):
+            cache.checkpoint(req, up_to=self.prompt_len)
+            seq_len = self._decode(
+                cache, allocator, req_to_token_pool, req, num_output=20
+            )
+        self.assertEqual(
+            req.kv.get_evicted_seqlen(ComponentType.SWA), seq_len - 1 - window
+        )
+        finish_req(cache, req, seq_len)
+        cache.sanity_check()
+
+
 class TestUnifiedRadixCacheStorageAttachBackfill(CustomTestCase):
     """Enabling a storage backend must hash nodes that predate it.
 

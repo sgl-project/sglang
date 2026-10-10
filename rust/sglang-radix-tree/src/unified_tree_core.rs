@@ -540,6 +540,8 @@ pub struct CacheInitParams {
     pub device: Device,
     /// SWA sliding window size in tokens; None when SWA is disabled.
     pub swa_sliding_window_size: Option<usize>,
+    /// SWA tokens a tree insert keeps live beyond the sliding window.
+    pub swa_cache_window_margin: usize,
     /// Whether SWA lives in a per-request ring rather than cached paged slots.
     pub swa_req_ring: bool,
     /// Whether the cache wired a host SWA pool (HiCache).
@@ -565,6 +567,7 @@ impl Default for CacheInitParams {
             write_through_threshold: 256,
             device: Device::Cpu,
             swa_sliding_window_size: None,
+            swa_cache_window_margin: 0,
             swa_req_ring: false,
             has_swa_host_pool: false,
             enable_kv_cache_events: false,

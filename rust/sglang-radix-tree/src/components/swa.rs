@@ -22,6 +22,9 @@ use crate::unified_tree_core::{
 pub struct SwaComponent {
     /// Sliding window size in tokens.
     sliding_window_size: usize,
+    /// Live SWA tokens a tree insert keeps behind its end: the window plus
+    /// `swa_cache_window_margin`.
+    cached_window_size: usize,
     /// Per-request rings are rebuilt by the request and do not gate tree reuse.
     swa_req_ring: bool,
 }
@@ -45,12 +48,13 @@ impl SwaComponent {
         );
         SwaComponent {
             sliding_window_size,
+            cached_window_size: sliding_window_size + params.swa_cache_window_margin,
             swa_req_ring: params.swa_req_ring,
         }
     }
 
-    /// Cap a fresh in-window SWA leaf at one page-aligned window so locking it pins
-    /// only one window of SWA pool, not the whole (long chunked-prefill) leaf; return
+    /// Cap a fresh in-window SWA leaf at the page-aligned cached window so locking it
+    /// pins only that much SWA pool, not the whole (long chunked-prefill) leaf; return
     /// the split-off parent (older window) or None. The SWA value is stamped later, so
     /// this runs on the tombstone leaf.
     fn maybe_split_leaf_for_swa_lock_<K: ChildKeyType>(
@@ -64,8 +68,10 @@ impl SwaComponent {
         }
 
         let page_size = tree_core.page_size;
-        // Smallest page-aligned size that still covers the sliding window.
-        let tail_size = self.sliding_window_size.div_ceil(page_size) * page_size;
+        // Smallest page-aligned size that still covers the cached window. A margin
+        // split into the parent would sit outside the window the lock refreshes and
+        // be evicted first.
+        let tail_size = self.cached_window_size.div_ceil(page_size) * page_size;
         let leaf_len = leaf.key.atom_len();
         if leaf_len <= tail_size {
             return None;
