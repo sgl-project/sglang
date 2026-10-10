@@ -525,9 +525,12 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def _free_swa_pages(self, free_index: torch.Tensor, start_pos: int):
         ps = self.page_size
         assert start_pos % ps == 0, f"segment start {start_pos} is not page-aligned"
-        full_page_representatives = free_index[::ps]
+        self._free_swa_page_reps(free_index[::ps])
+
+    def _free_swa_page_reps(self, full_page_representatives: torch.Tensor):
+        """Release the SWA pages paired with these full pages, one token each."""
         # torch_npu's transfer_to_npu aliases Tensor.is_cuda to Tensor.is_npu.
-        if not _is_npu and free_index.is_cuda:
+        if not _is_npu and full_page_representatives.is_cuda:
             swa_pages = self._free_swa_pages_cuda(full_page_representatives)
         else:
             swa_pages = self._free_swa_pages_none_cuda(full_page_representatives)
@@ -633,14 +636,70 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
         self.full_attn_allocator.free_segment(free_index, start_pos=start_pos)
 
+    def free_segments(self, segments):
+        if not self._batches_row_segments():
+            return super().free_segments(segments)
+        for free_index, start_pos in self._page_disjoint(segments):
+            self._defer_row_segment(free_index, start_pos, self.row_page_reps_group)
+
+    def free_full_segments(self, segments):
+        if not self._batches_row_segments():
+            return super().free_full_segments(segments)
+        for free_index, start_pos in self._page_disjoint(segments):
+            expect(
+                _SWA_PEER_RELEASED,
+                self.full_to_swa_index_mapping[free_index] == 0,
+                msg="caller wants free_segment",
+            )
+            self._defer_row_segment(
+                free_index, start_pos, self.full_row_page_reps_group
+            )
+
+    def _batches_row_segments(self) -> bool:
+        """Whether a group can defer kv-row segments to one pass at its end.
+
+        Row segments are a request's own slots: nothing in the group re-points
+        their SWA peers, so resolving them late reads the same mapping. Only
+        the plain free_segment paths below are batched."""
+        full = self.full_attn_allocator
+        return (
+            self.free_group is not None
+            and not self._swa_req_ring
+            and type(self).free_segment is SWATokenToKVPoolAllocator.free_segment
+            and type(self).free_full_segment
+            is SWATokenToKVPoolAllocator.free_full_segment
+            and type(full).free_segment is PagedTokenToKVPoolAllocator.free_segment
+            and not full.debug_mode
+        )
+
+    def _defer_row_segment(self, free_index, start_pos: int, group: list) -> None:
+        ps = self.page_size
+        assert start_pos % ps == 0, f"segment start {start_pos} is not page-aligned"
+        group.append(self._copy_for_free_group(free_index[::ps]))
+
+    def _free_deferred_row_segments(self) -> None:
+        swa_and_full, full_only = (
+            self.row_page_reps_group,
+            self.full_row_page_reps_group,
+        )
+        self.row_page_reps_group, self.full_row_page_reps_group = [], []
+        if swa_and_full:
+            self._free_swa_page_reps(torch.cat(swa_and_full))
+        reps = swa_and_full + full_only
+        if reps:
+            self.full_attn_allocator.free_page_ids(torch.cat(reps) // self.page_size)
+
     def free_group_begin(self):
         super().free_group_begin()
         self.swa_free_group = []
         self.swa_page_ids_group = []
+        self.row_page_reps_group = []
+        self.full_row_page_reps_group = []
         # No full-side pile here: the full allocator's own group defers those.
         self.full_attn_allocator.free_group_begin()
 
     def free_group_end(self):
+        self._free_deferred_row_segments()
         super().free_group_end()
         if self.swa_page_ids_group:
             swa_page_ids_group = self.swa_page_ids_group
