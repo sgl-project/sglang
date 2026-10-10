@@ -317,7 +317,7 @@ class MegaMoeTunedForward:
 
     @staticmethod
     def _forward(mega, tensors, workspace=None):
-        if getattr(mega, "supports_output_view", False):
+        if mega.supports_output_view:
             return mega.forward(
                 tensors, workspace=workspace, return_workspace_view=True
             )
