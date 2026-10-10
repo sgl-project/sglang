@@ -228,3 +228,93 @@ def test_worker_exit_during_load_names_where_the_reason_is(monkeypatch) -> None:
     monkeypatch.setattr(generator.DiffGenerator, "from_pretrained", exit_during_load)
     with pytest.raises(RuntimeError, match="traceback is in the ComfyUI console"):
         SGLDiffusionGenerator().init_generator("h3.safetensors", "MiniMaxH3Pipeline")
+
+
+def test_sampler_selects_lora_from_each_patcher_and_clears_previous_adapter():
+    from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.base import (
+        SGLDiffusionExecutor,
+    )
+
+    events = []
+    payload = {"lora_path": "four-step.safetensors", "strength": 1.0}
+    runtime = SimpleNamespace(
+        _lora_input=payload.copy(),
+        generator=SimpleNamespace(unmerge_lora_weights=lambda: events.append("clear")),
+        begin_sampler_run=lambda: events.append("begin"),
+        end_sampler_run=lambda: events.append("end"),
+    )
+
+    def set_lora(**desired):
+        events.append(("load", desired))
+        runtime._lora_input = desired.copy()
+
+    runtime.set_lora = set_lora
+    base = SimpleNamespace(model_patcher=SimpleNamespace(model_options={}))
+    adapted = SimpleNamespace(
+        model_patcher=SimpleNamespace(model_options={"sgld_lora_input": payload})
+    )
+    sample = lambda *args, **kwargs: "sampled"
+    assert (
+        SGLDiffusionExecutor.sampler_sample_wrapper(runtime, sample, base) == "sampled"
+    )
+    assert runtime._lora_input is None
+    assert events == ["clear", "begin", "end"]
+    events.clear()
+    SGLDiffusionExecutor.sampler_sample_wrapper(runtime, sample, adapted)
+    SGLDiffusionExecutor.sampler_sample_wrapper(runtime, sample, adapted)
+    assert events.count(("load", payload)) == 1
+    assert "clear" not in events
+
+
+def test_cached_base_model_resets_request_accelerations_after_spectrum_run():
+    from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.base import (
+        SGLDiffusionExecutor,
+    )
+
+    runtime = SimpleNamespace(
+        _lora_input=None, begin_sampler_run=lambda: None, end_sampler_run=lambda: None
+    )
+    accelerated = SimpleNamespace(
+        model_patcher=SimpleNamespace(
+            model_options={
+                "sgld_request_flags": {
+                    "enable_cache_dit": True,
+                    "cache_dit_params": {"residual_diff_threshold": 0.12},
+                    "request_options": {"enable_spectrum": True},
+                }
+            }
+        )
+    )
+    base = SimpleNamespace(model_patcher=SimpleNamespace(model_options={}))
+    SGLDiffusionExecutor.sampler_sample_wrapper(
+        runtime, lambda *args: None, accelerated
+    )
+    assert runtime.request_options == {"enable_spectrum": True}
+    assert runtime.enable_cache_dit is True
+    SGLDiffusionExecutor.sampler_sample_wrapper(runtime, lambda *args: None, base)
+    assert runtime.request_options == {}
+    assert runtime.enable_cache_dit is None
+    assert runtime.cache_dit_params is None
+
+
+def test_failed_lora_request_does_not_claim_adapter_is_active():
+    import pytest
+    from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.base import (
+        SGLDiffusionExecutor,
+    )
+
+    def reject(**kwargs):
+        raise RuntimeError("Dynamic LoRA supports only one adapter")
+
+    runtime = SimpleNamespace(
+        _lora_input=None, generator=SimpleNamespace(set_lora=reject)
+    )
+    with pytest.raises(RuntimeError, match="one adapter"):
+        SGLDiffusionExecutor.set_lora(
+            runtime,
+            lora_nickname=["a", "b"],
+            lora_path=["a.safetensors", "b.safetensors"],
+            strength=[1, 0.25],
+            target=["all", "all"],
+        )
+    assert runtime._lora_input is None

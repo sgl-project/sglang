@@ -1259,3 +1259,100 @@ def test_h3_pack_rejects_batched_latents() -> None:
             minimax_payload={"audio_scale": 1.0},
             transformer_options={"sample_sigmas": torch.tensor([1.0, 0.0])},
         )
+
+
+def test_comfyui_sparse_stream_layout_preserves_target_and_condition_roles():
+    layout = ComfyUIPackedLayout(
+        3,
+        2,
+        8,
+        12,
+        4,
+        keyframes=[{"resolved_frame_index": 0, "latent": torch.zeros(1, 24, 1, 8, 12)}],
+    )
+    packed = comfyui_layout_to_packed(serialize_comfyui_layout(layout))
+    assert packed["stream_layout"]["target_shape"] == (2, 4, 6)
+    assert packed["stream_layout"]["cond_image_shapes"] == ((1, 4, 6),)
+    assert packed["stream_layout"]["cond_image_roles"] == ("joint_cube",)
+    assert packed["stream_layout"]["cond_event_orders"] == (("imgvid", 0),)
+    assert packed["video_pos"].numel() == 2 * 4 * 6
+    assert not torch.isin(
+        packed["video_pos"], packed["img_pos"][~packed["update_mask"]]
+    ).any()
+
+
+@pytest.mark.parametrize("model_type,nfe", [("fast_h3", 4), ("vdn_h3", 8)])
+def test_distilled_h3_rejects_wrong_grid_and_reference_task(model_type, nfe):
+    from types import SimpleNamespace
+    from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.minimax_h3 import (
+        validate_distilled_h3_step,
+    )
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.time_request import (
+        minimax_h3_time_shift_sigmas,
+    )
+
+    sigmas = torch.tensor(
+        minimax_h3_time_shift_sigmas(num_steps=nfe, shift_scale=12.0)
+    )
+    packed = SimpleNamespace(extra_req={"h3_sample_sigmas": sigmas})
+    validate_distilled_h3_step(packed, model_type)
+    packed.extra_req["h3_sample_sigmas"] = torch.linspace(1, 0, nfe + 1)
+    with pytest.raises(ValueError, match="trained"):
+        validate_distilled_h3_step(packed, model_type)
+    packed.extra_req.update(
+        h3_sample_sigmas=sigmas, h3_payload={"refs": [{"kind": "image"}]}
+    )
+    with pytest.raises(ValueError, match="reference"):
+        validate_distilled_h3_step(packed, model_type)
+
+
+def test_h3_carried_audio_matches_comfyui_without_double_sigma_derivative():
+    adapter = MiniMaxH3Adapter()
+    video = torch.ones(1, 24, 2, 4, 4)
+    audio = torch.ones(1, 32, 2, 3)
+    packed = adapter.pack(
+        [video, audio],
+        torch.tensor([1000.0]),
+        torch.ones(1, 4, 8),
+        minimax_payload={"audio_scale": 4.0},
+    )
+    out = adapter.unpack(
+        [torch.ones_like(video), torch.ones_like(audio)], packed, [video, audio]
+    )
+    # ComfyUI forward: (1 - scale) * input + scale * (-raw velocity).
+    # At sigma_v=sigma_a=1 this is -3 - 4=-7; another derivative gives -28.
+    assert torch.equal(out[1], torch.full_like(audio, -7))
+
+
+def test_h3_masked_velocities_match_comfyui_before_audio_carry_transform():
+    adapter = MiniMaxH3Adapter()
+    video = torch.ones(1, 24, 2, 4, 4)
+    audio = torch.ones(1, 32, 2, 3)
+    packed = adapter.pack(
+        [video, audio],
+        torch.tensor([1000.0]),
+        torch.ones(1, 4, 8),
+        minimax_payload={"audio_scale": 4.0},
+        denoise_mask=torch.full((1, 1, 2, 4, 4), 0.25),
+        audio_denoise_mask=torch.zeros(1, 1, 2, 3),
+    )
+    out = adapter.unpack(
+        [torch.ones_like(video), torch.ones_like(audio)], packed, [video, audio]
+    )
+    assert torch.equal(out[0], torch.full_like(video, -0.25))
+    assert torch.equal(out[1], torch.full_like(audio, -3))
+
+
+def test_comfyui_h3_rejects_bcg_with_offload_before_cuda_capture():
+    from types import SimpleNamespace
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.comfyui_step import (
+        MiniMaxH3ComfyUIStepStage,
+    )
+    import pytest
+
+    batch = SimpleNamespace(sampling_params=SimpleNamespace(quality="lossless"))
+    args = SimpleNamespace(
+        enable_breakable_cuda_graph=True, is_dit_layerwise_offload_selected=True
+    )
+    with pytest.raises(ValueError, match="copy-stream events"):
+        MiniMaxH3ComfyUIStepStage.forward(None, batch, args)
