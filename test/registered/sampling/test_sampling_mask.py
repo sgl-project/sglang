@@ -484,23 +484,6 @@ class TestAscendSamplingMaskCapture(CustomTestCase):
                 self.assertIsNone(output.next_token_sampling_mask_idx[row])
                 self.assertIsNone(output.next_token_sampling_logprobs[row])
 
-    def test_ascend_capture_repairs_sampled_token_outside_exported_support(self):
-        # A one-ulp disagreement between the kernel's internal softmax and the
-        # exported weights must not report the drawn token as outside its own
-        # support, so the drawn column is forced positive.
-        filtered_probs = torch.tensor([[0.5, 0.0, 0.5, 0.0]])
-        sampled = torch.tensor([1], dtype=torch.int32)
-        sampling_info = self._sampling_info(1, top_k=2, top_p=1.0)
-
-        capture = self.sampler._build_ascend_sampling_mask_capture(
-            filtered_probs, sampled, sampling_info
-        )
-        self.assertGreater(float(capture.weights[0, 1]), 0.0)
-
-        output = self._materialize(sampled, capture, sampling_info)
-        self.assertIn(1, output.next_token_sampling_mask_idx[0].tolist())
-        self.assertIsNotNone(output.next_token_sampling_logprobs[0])
-
     @patch.object(sampler_module, "torch_npu", SimpleNamespace(), create=True)
     def test_ascend_export_is_vocab_ordered(self):
         batch_size, vocab_size, top_k = 1, 12, 3

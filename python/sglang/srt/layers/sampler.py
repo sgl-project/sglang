@@ -698,7 +698,7 @@ class Sampler(nn.Module):
         if return_sampling_mask:
             assert filtered_probs is not None
             sampling_mask_capture = self._build_ascend_sampling_mask_capture(
-                filtered_probs, batch_next_token_ids, sampling_info
+                filtered_probs, sampling_info
             )
         logprobs = None
         if return_logprob and not SGLANG_RETURN_ORIGINAL_LOGPROB:
@@ -708,35 +708,20 @@ class Sampler(nn.Module):
     def _build_ascend_sampling_mask_capture(
         self,
         filtered_probs: torch.Tensor,
-        batch_next_token_ids: torch.Tensor,
         sampling_info: SamplingBatchInfo,
     ) -> _SamplingMaskCapture:
         """Build the mask capture from the weights the Ascend kernel exported.
 
-        The export is the only faithful support source: replaying top-k/top-p could
-        disagree with the kernel that drew the token. The drawn column is forced
-        positive so a one-ulp boundary difference cannot exclude the drawn token.
+        Replaying top-k/top-p would risk disagreeing with the kernel that drew the
+        token, so the exported copy is the support source. The drawn column is left
+        exactly as exported, which keeps ``weights > 0`` the same support predicate
+        the other backends use.
         """
         capture_rows = sampling_info.sampling_mask_batch_indices
         assert capture_rows is not None, (
             "Sampling-mask capture requested without any opted-in batch rows."
         )
 
-        sampled_cols = batch_next_token_ids.view(-1, 1).long()
-        sampled_weights = filtered_probs.gather(1, sampled_cols)
-        filtered_probs.scatter_(
-            1,
-            sampled_cols,
-            torch.where(
-                sampled_weights > 0,
-                sampled_weights,
-                # Smallest normal float: keeps the drawn column in the support and
-                # its reported logprob finite instead of failing the request.
-                torch.full_like(
-                    sampled_weights, torch.finfo(filtered_probs.dtype).tiny
-                ),
-            ),
-        )
         return _SamplingMaskCapture(
             weights=_select_sampling_mask_rows(filtered_probs, capture_rows),
             token_ids=None,
