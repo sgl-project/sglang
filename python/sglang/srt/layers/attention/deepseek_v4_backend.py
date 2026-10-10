@@ -33,7 +33,6 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
 )
 from sglang.kernels.ops.attention.dsv4.index_logits import (
     deep_gemm_fp4_paged_mqa_logits,
-    sparse_logits,
 )
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
@@ -46,7 +45,6 @@ from sglang.kernels.ops.attention.dsv4.online_c128_mtp import OnlineC128MTPContr
 from sglang.kernels.ops.attention.dsv4.prefill_candidates import topk_prefill_candidates
 from sglang.kernels.ops.attention.dsv4.topk import (
     topk_transform_ragged_v2,
-    topk_transform_sparse,
 )
 from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
     BuildCausalSwaPageIndices,
@@ -101,6 +99,9 @@ from sglang.srt.layers.attention.dsv4.v41_indexer import (
 from sglang.srt.layers.attention.dsv4.v41_indexer.scoring import (
     get_index_k_cache,
     quantize_index_q,
+)
+from sglang.srt.layers.attention.dsv4.v41_indexer.sparse_table import (
+    select_sparse_table,
 )
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.layers.cp.interleave import (
@@ -3437,16 +3438,7 @@ class DeepseekV4AttnBackend(
         chunks = [(slice(0, rows), None)] if dense else metadata.row_chunks()
         for chunk_idx, (chunk, plan) in enumerate(chunks):
             chunk_lens = lens[chunk]
-            if sparse_consumer:
-                scores = sparse_logits(
-                    q_fp4[chunk].view(-1, 1, heads, 64),
-                    q_sf[chunk].view(-1, 1, heads),
-                    k_cache,
-                    weights[chunk].to(torch.bfloat16),
-                    published.schedule,
-                    published.blocks.shape[1],
-                )
-            elif dense:
+            if dense and not sparse_consumer:
                 scores = _dense_fp4_mqa_logits(
                     (q_fp4[chunk], q_sf[chunk]),
                     k_fp4,
@@ -3455,7 +3447,7 @@ class DeepseekV4AttnBackend(
                     ks[chunk] + chunk_lens,
                     width,
                 )
-            else:
+            elif not sparse_consumer:
                 scores = deep_gemm_fp4_paged_mqa_logits(
                     (
                         q_fp4[chunk].view(-1, 1, heads, 64),
@@ -3505,13 +3497,19 @@ class DeepseekV4AttnBackend(
 
             if sparse_consumer:
                 selected = torch.empty(
-                    (scores.shape[0], topk), dtype=torch.int32, device=scores.device
+                    (q_fp4[chunk].shape[0], topk),
+                    dtype=torch.int32,
+                    device=q_fp4.device,
                 )
-                topk_transform_sparse(
-                    scores,
-                    published.valid_lens[chunk],
-                    published.blocks[chunk],
-                    selected,
+                select_sparse_table(
+                    q_fp4=q_fp4[chunk],
+                    q_sf=q_sf[chunk],
+                    weights=weights[chunk],
+                    k_cache=k_cache,
+                    schedule=published.schedule,
+                    blocks=published.blocks[chunk],
+                    valid_lens=published.valid_lens[chunk],
+                    out_indices=selected,
                 )
             elif two_level and indexer.uses_candidates:
                 selected = torch.empty(

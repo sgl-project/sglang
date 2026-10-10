@@ -482,6 +482,119 @@ class TestCapturedLowRatioIndexer(CustomTestCase):
             backend.req_to_token[requests[:, None], expected.long()].to(torch.int32),
         )
 
+    def test_captured_sparse_consumer_keeps_logical_and_physical_outputs(self):
+        """Interleaved CP rows map logical picks through each request's KV slots,
+        not through another row or the candidate's column offset; empty rows
+        and trailing output padding remain -1 for both compression ratios.
+        """
+        from sglang.srt.layers.attention import deepseek_v4_backend as mod
+        from sglang.srt.layers.attention.dsv4.v41_indexer import sparse_table
+
+        rows, heads, width, topk = 4, 2, 32, 4
+        blocks = torch.tensor([[1, 3], [0, 2], [1, 2], [0, 1]], dtype=torch.int32)
+        valid_lens = torch.tensor([16, 10, 0, 16], dtype=torch.int32)
+        requests = torch.tensor([1, 0, 1, 0])
+        # Distinct scores produce unsorted sparse column offsets [7, 1, 9, 3].
+        scores = torch.zeros((rows, 16), dtype=torch.bfloat16)
+        scores[:, [7, 1, 9, 3]] = torch.tensor([8, 7, 6, 5], dtype=torch.bfloat16)
+
+        def logits(q, sf, cache, weights, schedule, num_blocks):
+            self.assertEqual(q.shape, (rows, 1, heads, 64))
+            self.assertEqual(sf.shape, (rows, 1, heads))
+            self.assertEqual(weights.dtype, torch.bfloat16)
+            return scores
+
+        def select(logits, lengths, block_ids, out_indices):
+            columns = torch.arange(logits.shape[1])
+            masked = logits.masked_fill(
+                columns[None, :] >= lengths[:, None], -torch.inf
+            )
+            indices = masked.topk(out_indices.shape[1], dim=-1).indices
+            values = block_ids.gather(1, indices // 8) * 8 + indices % 8
+            out_indices.copy_(
+                torch.where(masked.gather(1, indices).isfinite(), values, -1)
+            )
+
+        for ratio in (1, 2):
+            with self.subTest(ratio=ratio):
+                out_page = torch.full((rows, topk + 2), -1, dtype=torch.int32)
+                out_raw = torch.full_like(out_page, -1)
+                metadata = SimpleNamespace(
+                    max_compressed_seq_len=width,
+                    compressed_seq_lens=torch.full((rows,), width, dtype=torch.int32),
+                    compressed_page_size=64,
+                    page_table=torch.zeros((rows, 1), dtype=torch.int32),
+                )
+                req_to_token = (torch.arange(2 * width * ratio).view(2, -1) + 128) * 3
+                backend = SimpleNamespace(
+                    req_to_token=req_to_token,
+                    token_to_kv_pool=None,
+                    forward_metadata=SimpleNamespace(
+                        c1_indexer_metadata=metadata,
+                        c2_indexer_metadata=metadata,
+                        prefill_graph_dense_indexer=True,
+                        candidate_metadata=mod._CapturedSparseTable(
+                            blocks, torch.empty(0, dtype=torch.uint8), valid_lens
+                        ),
+                        core_metadata=SimpleNamespace(
+                            sparse_page_indices=lambda r: out_page,
+                            sparse_raw_indices=lambda r: out_raw,
+                        ),
+                        low_ratio_dense_req_indices=torch.tensor([1, 0]),
+                        low_ratio_dense_seq_lens=torch.tensor([32, 32]),
+                        low_ratio_local_req_indices=requests,
+                        low_ratio_dense_k_offsets={},
+                    ),
+                )
+                layer = SimpleNamespace(
+                    compress_ratio=ratio,
+                    layer_id=24,
+                    indexer=SimpleNamespace(
+                        candidate_topk_blocks=2,
+                        candidate_block_size=8,
+                        is_candidate_source=False,
+                        uses_candidates=True,
+                        index_topk=topk,
+                    ),
+                )
+                with (
+                    patch.object(
+                        mod,
+                        "quantize_index_q",
+                        return_value=(
+                            torch.zeros((rows, heads, 64), dtype=torch.int8),
+                            torch.zeros((rows, heads), dtype=torch.int32),
+                        ),
+                    ),
+                    patch.object(mod, "get_index_k_cache", return_value=None),
+                    patch.object(sparse_table, "sparse_logits", side_effect=logits),
+                    patch.object(
+                        sparse_table, "topk_transform_sparse", side_effect=select
+                    ),
+                ):
+                    mod.DeepseekV4AttnBackend._low_ratio_index_topk_captured(
+                        backend,
+                        layer,
+                        torch.zeros((rows, heads, 128)),
+                        torch.ones((rows, heads)),
+                    )
+                expected = torch.tensor(
+                    [[9, 11, 15, 25], [1, 3, 7, 17], [-1, -1, -1, -1], [1, 3, 7, 9]],
+                    dtype=torch.int32,
+                )
+                torch.testing.assert_close(out_raw[:, :topk], expected)
+                physical = (
+                    req_to_token[
+                        requests[:, None], expected.clamp_min(0).long() * ratio
+                    ]
+                    // ratio
+                )
+                torch.testing.assert_close(
+                    out_page[:, :topk], torch.where(expected >= 0, physical, -1).int()
+                )
+                self.assertTrue((out_page[:, topk:] == -1).all())
+                self.assertTrue((out_raw[:, topk:] == -1).all())
+
 
 class TestDSV4FlashInferTopK(CustomTestCase):
     def test_compact_page_transform_respects_fuse_topk(self):

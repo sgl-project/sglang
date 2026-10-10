@@ -291,6 +291,86 @@ def picks(positions: torch.Tensor, row: int) -> set:
 )
 class TestPrefillSparseIndexer(CustomTestCase):
     @torch.inference_mode()
+    def test_shared_sparse_consumer_replays_logical_and_physical_indices(self):
+        """The common consumer matches the original kernel pair with either
+        block-id domain and reads live Q/weights/lengths during graph replay.
+        """
+        from sglang.kernels.ops.attention.dsv4.topk import topk_transform_sparse
+        from sglang.srt.layers.attention.dsv4.v41_indexer.sparse_table import (
+            select_sparse_table,
+        )
+
+        case = make_multi_case([5, 0, 3, 4], 6000, seed=41)
+        table, _ = publish_sparse(case)
+        q, sf, weights = (
+            case.data.q_fp4.clone(),
+            case.data.q_sf.clone(),
+            case.data.weights.clone(),
+        )
+        lengths = table.valid_lens.clone()
+        logical = case.data.empty_selection(TOPK)
+        physical = torch.empty_like(logical)
+
+        def consume():
+            select_sparse_table(
+                q_fp4=q,
+                q_sf=sf,
+                weights=weights,
+                k_cache=case.k_cache,
+                schedule=table.schedule,
+                blocks=table.blocks,
+                valid_lens=lengths,
+                out_indices=logical,
+            )
+            # Decode's already-expanded Q shape and physical block mapping.
+            select_sparse_table(
+                q_fp4=q.unsqueeze(1),
+                q_sf=sf.unsqueeze(1),
+                weights=weights,
+                k_cache=case.k_cache,
+                schedule=table.schedule,
+                blocks=table.phys_blocks,
+                valid_lens=lengths,
+                out_indices=physical,
+            )
+
+        consume()
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            consume()
+
+        for replay in range(2):
+            with self.subTest(replay=replay):
+                if replay:
+                    q.copy_(case.data.q_fp4.roll(1, dims=0))
+                    sf.copy_(case.data.q_sf.roll(1, dims=0))
+                    weights.copy_(case.data.weights.roll(1, dims=-1))
+                    lengths[0] = 0
+                data = msgspec.structs.replace(
+                    case.data, q_fp4=q, q_sf=sf, weights=weights
+                )
+                scores = logits_of(table, data, case.k_cache)
+                expected_raw = torch.empty_like(logical)
+                expected_page = torch.empty_like(physical)
+                topk_transform_sparse(scores, lengths, table.blocks, expected_raw)
+                topk_transform_sparse(scores, lengths, table.phys_blocks, expected_page)
+                graph.replay()
+                torch.testing.assert_close(logical, expected_raw, rtol=0, atol=0)
+                torch.testing.assert_close(physical, expected_page, rtol=0, atol=0)
+                # Logical positions also map through the request's page table.
+                slots = logical.clamp_min(0).long()
+                mapped = case.page_table.gather(1, slots // PAGE) * PAGE + slots % PAGE
+                torch.testing.assert_close(
+                    physical,
+                    torch.where(logical >= 0, mapped, -1).int(),
+                    rtol=0,
+                    atol=0,
+                )
+                if replay:
+                    self.assertTrue((logical[0] == -1).all())
+
+    @torch.inference_mode()
     def test_publish_prefill_is_the_torch_block_selection(self):
         """The published blocks equal `select_candidate_block_ids` block for block
         (ragged lengths, an empty row, block counts above and below 2048), and the
