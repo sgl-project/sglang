@@ -341,6 +341,7 @@ class SplitKDenseGemmKernel:
         epilogue_mode: str = "none",
         epilogue_scale: float = 1.0,
         epilogue_group: int = 1,
+        epilogue_hook=None,
     ) -> None:
         self.acc_dtype = cutlass.Float32
         self.cta_m = tactic.mma_m
@@ -353,6 +354,9 @@ class SplitKDenseGemmKernel:
         self.epilogue_mode = epilogue_mode
         self.epilogue_scale = epilogue_scale
         self.epilogue_group = epilogue_group
+        self.epilogue_hook = epilogue_hook
+        if epilogue_hook is not None and (epilogue_mode != "none" or has_bias):
+            raise ValueError("custom epilogue requires plain GEMM without bias")
 
         if epilogue_mode not in _EPILOGUE_MODES:
             raise ValueError(f"unsupported epilogue_mode={epilogue_mode}")
@@ -411,9 +415,10 @@ class SplitKDenseGemmKernel:
         x: cute.Tensor,
         out: cute.Tensor,
         stream: _cuda.CUstream,
+        epilogue_args=None,
     ):
         # Grid-y packs output-N tile and cluster rank.
-        self.kernel(a, b, c, bias, x, out).launch(
+        self.kernel(a, b, c, bias, x, out, epilogue_args).launch(
             grid=(
                 cute.ceil_div(c.layout.shape[0], self.cta_m),
                 cute.ceil_div(c.layout.shape[1], self.cta_n) * self.split_k,
@@ -435,6 +440,7 @@ class SplitKDenseGemmKernel:
         mBias: cute.Tensor,  # Broadcast bias; dead when has_bias=False
         mX: cute.Tensor,  # Gate activation; dead unless epilogue_mode="gate"
         mOut: cute.Tensor,  # Gate output; dead unless epilogue_mode="gate"
+        epilogue_args=None,
     ):
         """Allocate storage and dispatch the specialized warps."""
         stages = self.num_ab_stage
@@ -541,6 +547,10 @@ class SplitKDenseGemmKernel:
         else:
             gate_tile = mailbox
 
+        hook_scratch = None
+        if cutlass.const_expr(self.epilogue_hook is not None):
+            hook_scratch = self.epilogue_hook.allocate_scratch(ab_dtype)
+
         if warp_idx == 0:
             with cute.arch.elect_one():
                 for i in range(stages):
@@ -627,6 +637,8 @@ class SplitKDenseGemmKernel:
                 mOut,
                 bidx,
                 n_idx,
+                hook_scratch,
+                epilogue_args,
             )
 
     @cute.experimental.jit
@@ -759,6 +771,8 @@ class SplitKDenseGemmKernel:
         mOut: cute.Tensor,
         bidx: cutlass.Int32,
         n_idx: cutlass.Int32,
+        hook_scratch=None,
+        epilogue_args=None,
     ):
         # Wait until MMA publishes the TMEM base pointer.
         cute.arch.mbarrier_arrive(bar_tmem_alloc)
@@ -917,7 +931,19 @@ class SplitKDenseGemmKernel:
             else:
                 rD.store(rAcc.load().to(c_dtype))
                 # Preserve TMEM coordinates; the copy predicates output tails.
-                cute_ext.partition_and_copy(thr_t2r, rD, gD_epi[None, None, 0, 0])
+                if cutlass.const_expr(self.epilogue_hook is not None):
+                    self.epilogue_hook.store(
+                        rD,
+                        thr_t2r,
+                        gD_tile,
+                        epi_tid,
+                        bidx,
+                        n_idx,
+                        hook_scratch,
+                        epilogue_args,
+                    )
+                else:
+                    cute_ext.partition_and_copy(thr_t2r, rD, gD_epi[None, None, 0, 0])
 
         # The reduction mbarrier covers remote stores; no cluster barrier needed.
 

@@ -163,6 +163,11 @@ def reshape_and_cache_flash(
     k_scale_ptr,
     v_scale_ptr,
     block_stride,
+    value_block_stride,
+    cache_token_stride: tl.constexpr,
+    cache_head_stride: tl.constexpr,
+    value_cache_token_stride: tl.constexpr,
+    value_cache_head_stride: tl.constexpr,
     key_stride,
     value_stride,
     num_heads,
@@ -181,6 +186,7 @@ def reshape_and_cache_flash(
 
     Target cache layout:
         cache: [num_blocks, block_size, num_heads, head_size]
+        Token and head strides may describe a view of physical HND storage.
 
     Each Triton program instance handles:
         - one token (program_id(0))
@@ -199,7 +205,12 @@ def reshape_and_cache_flash(
         swa_slot_mapping_ptr: Optional second-stage slot remap for SWA mode.
         k_scale_ptr: Optional key scaling factor pointer.
         v_scale_ptr: Optional value scaling factor pointer.
-        block_stride: Stride between cache blocks.
+        block_stride: Stride between key cache blocks.
+        value_block_stride: Stride between value cache blocks.
+        cache_token_stride: Stride between key cache tokens.
+        cache_head_stride: Stride between key cache heads.
+        value_cache_token_stride: Stride between value cache tokens.
+        value_cache_head_stride: Stride between value cache heads.
         key_stride: Stride between source key tokens.
         value_stride: Stride between source value tokens.
         num_heads: Number of attention heads.
@@ -270,10 +281,20 @@ def reshape_and_cache_flash(
     # target layout
     # [block_idx, block_offset, head, dim]
     # ----------------------------------
-    tgt = block_idx * block_stride + block_offset * num_heads * head_size + offs
-
-    tl.store(key_cache_ptr + tgt, k, mask=mask)
-    tl.store(value_cache_ptr + tgt, v, mask=mask)
+    tgt_k = (
+        block_idx * block_stride
+        + block_offset * cache_token_stride
+        + head_idx[:, None] * cache_head_stride
+        + dim_idx[None, :]
+    )
+    tgt_v = (
+        block_idx * value_block_stride
+        + block_offset * value_cache_token_stride
+        + head_idx[:, None] * value_cache_head_stride
+        + dim_idx[None, :]
+    )
+    tl.store(key_cache_ptr + tgt_k, k, mask=mask)
+    tl.store(value_cache_ptr + tgt_v, v, mask=mask)
 
 
 def launch_reshape_and_cache_flash(
@@ -326,6 +347,11 @@ def launch_reshape_and_cache_flash(
         k_scale if k_scale is not None else key,
         v_scale if v_scale is not None else key,
         key_cache.stride(0),
+        value_cache.stride(0),
+        key_cache.stride(1),
+        key_cache.stride(2),
+        value_cache.stride(1),
+        value_cache.stride(2),
         key.stride(0),
         value.stride(0),
         num_heads,

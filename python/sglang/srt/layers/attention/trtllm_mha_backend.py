@@ -158,6 +158,14 @@ class TRTLLMMHAMetadata:
     encoder_cache_seqlens: torch.Tensor = None
     encoder_page_table: torch.Tensor = None
     encoder_row_map: torch.Tensor = None
+    # Prefix before trailing one-token requests in an extend-shaped batch.
+    mixed_prefill_reqs: int = 0
+    mixed_prefill_tokens: int = 0
+    packed_prefix_indptr: torch.Tensor = None
+    packed_prefix_ids: torch.Tensor = None
+    packed_cu_seqlens: torch.Tensor = None
+    packed_kv_tokens: int = 0
+    packed_max_seq_len: int = 0
 
 
 class TRTLLMHAAttnBackend(FlashInferAttnBackend):
@@ -236,6 +244,25 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         self.data_type = model_runner.kv_cache_dtype
         self.q_data_type = model_runner.dtype
         self.page_size = model_runner.page_size
+        self._packed_prefill_buffers = None
+        self._packed_prefill_stream = None
+        self._packed_prefill_ops = None
+        self._packed_prefill_enabled = (
+            get_platform().is_sm100
+            and torch.cuda.get_device_capability() == (10, 3)
+            and self.data_type == torch.bfloat16
+            and self.q_data_type == torch.bfloat16
+            and self.page_size == 32
+            and config.get_num_attention_heads(get_parallel().attn_tp_size) == 32
+            and config.get_num_kv_heads(
+                get_parallel().attn_tp_size, get_parallel().attn_dcp_size
+            )
+            == 8
+            and config.head_dim == 128
+            and not get_exec().deterministic.enable_deterministic_inference
+            and not get_exec().overlap.enable_two_batch_overlap
+            and not get_exec().overlap.enable_single_batch_overlap
+        )
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.device = model_runner.device
 
@@ -1259,6 +1286,19 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             # (sync-free); for plain prefill these equal the full seq lens.
             metadata.max_seq_len_q = int(max(forward_batch.extend_seq_lens_cpu))
             if (
+                forward_batch.forward_mode.is_extend()
+                and forward_batch.spec_info is None
+            ):
+                # The eager runner normalizes MIXED to EXTEND. A causal
+                # one-token query can use decode even for a new request.
+                lengths = forward_batch.extend_seq_lens_cpu
+                prefix = len(lengths)
+                while prefix and lengths[prefix - 1] == 1:
+                    prefix -= 1
+                if 0 < prefix < len(lengths):
+                    metadata.mixed_prefill_reqs = prefix
+                    metadata.mixed_prefill_tokens = sum(lengths[:prefix])
+            if (
                 forward_batch.extend_prefix_lens_cpu is not None
                 and any(forward_batch.extend_prefix_lens_cpu)
             ) or forward_batch.forward_mode.is_draft_extend_v2():
@@ -1318,7 +1358,73 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 forward_batch, IdSpaceKind.SLIDING_WINDOW
             )
 
+        self._init_packed_prefill_metadata(metadata, forward_batch)
         self.forward_metadata = metadata
+
+    def _init_packed_prefill_metadata(self, metadata, batch):
+        if (
+            not self._packed_prefill_enabled
+            or not batch.forward_mode.is_extend()
+            or batch.spec_info is not None
+            or batch.contains_mm_inputs()
+            or is_cp_active(batch)
+            or self._swa_kv_pool is not None
+            or torch.cuda.is_current_stream_capturing()
+            or batch.extend_prefix_lens_cpu is None
+        ):
+            return
+        stream = torch.cuda.current_stream().cuda_stream
+        if (
+            self._packed_prefill_stream is not None
+            and self._packed_prefill_stream != stream
+        ):
+            return
+        n = metadata.mixed_prefill_reqs or batch.batch_size
+        lengths = batch.extend_seq_lens_cpu[:n]
+        prefixes = batch.extend_prefix_lens_cpu[:n]
+        if not lengths or min(lengths) <= 0 or sum(lengths) < 4096:
+            return
+        totals = [p + q for p, q in zip(prefixes, lengths)]
+        total = sum(totals)
+        if total > 32768 or max(totals) > 16384:
+            return
+        if self._packed_prefill_ops is None:
+            try:
+                from sglang.kernels.ops.attention.dllm_kv_pack import (
+                    pack_prefix_current,
+                )
+                from sglang.kernels.ops.attention.flash_attn.cute.interface import (
+                    flash_attn_varlen_func,
+                )
+            except ImportError:
+                self._packed_prefill_enabled = False
+                return
+            self._packed_prefill_ops = (pack_prefix_current, flash_attn_varlen_func)
+        from sglang.kernels.ops.kvcache.kv_indices import (
+            create_flashinfer_kv_indices_triton,
+        )
+
+        qo = metadata.cu_seqlens_q[: n + 1]
+        ki = metadata.cu_seqlens_k[: n + 1] - qo
+        ids = torch.empty(sum(prefixes), dtype=torch.int32, device=qo.device)
+        if sum(prefixes):
+            rows = torch.arange(n, dtype=torch.int32, device=qo.device)
+            create_flashinfer_kv_indices_triton[(n,)](
+                metadata.page_table,
+                rows,
+                batch.extend_prefix_lens,
+                ki,
+                None,
+                ids,
+                metadata.page_table.stride(0),
+                ENTRY_PAGE_SIZE=self.page_size,
+            )
+        self._packed_prefill_stream = stream
+        metadata.packed_prefix_indptr = ki
+        metadata.packed_prefix_ids = ids
+        metadata.packed_cu_seqlens = torch.empty_like(qo)
+        metadata.packed_kv_tokens = total
+        metadata.packed_max_seq_len = max(totals)
 
     def _reshape_paged_kv_cache(
         self,
@@ -1784,8 +1890,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 cu_seqlens_kv,
                 use_zigzag_page_table=False,
                 out=None,
+                page_table_override=None,
             ):
-                block_tables = page_table
+                block_tables = (
+                    page_table if page_table_override is None else page_table_override
+                )
                 if use_zigzag_page_table:
                     block_tables = self.forward_metadata.zigzag_page_table
                     zigzag_swa_pt = self.forward_metadata.zigzag_swa_page_table
@@ -1793,6 +1902,86 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                         _, is_swa = self._swa_kv_pool.layers_mapping[layer.layer_id]
                         if is_swa:
                             block_tables = zigzag_swa_pt
+                metadata = self.forward_metadata
+                if (
+                    metadata.packed_kv_tokens
+                    and not torch.cuda.is_current_stream_capturing()
+                    and torch.cuda.current_stream().cuda_stream
+                    == self._packed_prefill_stream
+                    and not use_zigzag_page_table
+                    and not cp_active
+                    and layer.attn_type == AttentionType.DECODER
+                    and layer.sliding_window_size in (-1, None)
+                    and attention_sink is None
+                    and kv_cache_block_scales is None
+                    and bmm2_scale == 1.0
+                    and save_kv_cache
+                    and k is not None
+                    and v is not None
+                    and q_chunk.dtype == torch.bfloat16
+                    and k.dtype == torch.bfloat16
+                    and v.dtype == torch.bfloat16
+                    and q_chunk.shape[1:] == (32, 128)
+                    and layer.tp_k_head_num == 8
+                    and layer.tp_v_head_num == 8
+                    and k.stride(-1) == 1
+                    and v.stride(-1) == 1
+                    and all(
+                        x.dtype == torch.bfloat16
+                        and x.stride() == (32768, 4096, 128, 1)
+                        for x in kv_cache
+                    )
+                    and not envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get()
+                ):
+                    pack_prefix_current, flash_attn_varlen_func = (
+                        self._packed_prefill_ops
+                    )
+
+                    total = metadata.packed_kv_tokens
+                    if (
+                        self._packed_prefill_buffers is None
+                        or self._packed_prefill_buffers[0].shape[0] < total
+                    ):
+                        capacity = ((total + 4095) // 4096) * 4096
+                        self._packed_prefill_buffers = tuple(
+                            torch.empty(
+                                (capacity, 8, 128),
+                                dtype=torch.bfloat16,
+                                device=q_chunk.device,
+                            )
+                            for _ in range(2)
+                        )
+                    packed_k, packed_v = (
+                        x[:total] for x in self._packed_prefill_buffers
+                    )
+                    pack_prefix_current(
+                        k.reshape(-1, 8, 128),
+                        v.reshape(-1, 8, 128),
+                        kv_cache[0],
+                        kv_cache[1],
+                        cu_seqlens_q,
+                        metadata.packed_prefix_indptr,
+                        metadata.packed_prefix_ids,
+                        packed_k,
+                        packed_v,
+                        metadata.packed_cu_seqlens,
+                        metadata.packed_max_seq_len,
+                        page_size=self.page_size,
+                    )
+                    result = flash_attn_varlen_func(
+                        q_chunk,
+                        packed_k,
+                        packed_v,
+                        cu_seqlens_q=cu_seqlens_q,
+                        cu_seqlens_k=metadata.packed_cu_seqlens,
+                        max_seqlen_q=max_seqlen_q,
+                        max_seqlen_k=metadata.packed_max_seq_len,
+                        softmax_scale=bmm1_scale,
+                        causal=True,
+                        out=out,
+                        use_clc_scheduler=True,
+                    )
+                    return result[0] if isinstance(result, tuple) else result
                 return flashinfer.prefill.trtllm_batch_context_with_kv_cache(
                     query=q_chunk,
                     kv_cache=kv_cache,
@@ -1829,14 +2018,49 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 out = native_out if uses_native_fp4 else forward_batch._attn_output
                 if out is not None:
                     out = out.view_as(q)
-                o = _trtllm_context_attn(
-                    q,
-                    self.forward_metadata.cu_seqlens_q,
-                    self.forward_metadata.cache_seqlens_int32,
-                    self.forward_metadata.max_seq_len_q,
-                    cu_seqlens_kv=self.forward_metadata.cu_seqlens_k,
-                    out=out,
-                )
+                metadata = self.forward_metadata
+                if (
+                    metadata.mixed_prefill_reqs
+                    and q.dtype == torch.bfloat16
+                    and self.data_type == torch.bfloat16
+                    and not uses_native_fp4
+                    and layer.attn_type == AttentionType.DECODER
+                ):
+                    # Preserve request order and reuse the shared output buffer.
+                    prefix_reqs = metadata.mixed_prefill_reqs
+                    prefix_tokens = metadata.mixed_prefill_tokens
+                    if out is None:
+                        out = torch.empty_like(q)
+                    _trtllm_context_attn(
+                        q[:prefix_tokens],
+                        metadata.cu_seqlens_q[: prefix_reqs + 1],
+                        metadata.cache_seqlens_int32[:prefix_reqs],
+                        metadata.max_seq_len_q,
+                        cu_seqlens_kv=metadata.cu_seqlens_k[: prefix_reqs + 1],
+                        out=out[:prefix_tokens],
+                        page_table_override=page_table[:prefix_reqs],
+                    )
+                    self._run_fixed_q_len_decode(
+                        q[prefix_tokens:],
+                        kv_cache,
+                        page_table[prefix_reqs:],
+                        metadata.cache_seqlens_int32[prefix_reqs:],
+                        bmm1_scale=bmm1_scale,
+                        bmm2_scale=bmm2_scale,
+                        window_left=layer.sliding_window_size,
+                        sinks=attention_sink,
+                        out=out[prefix_tokens:],
+                    )
+                    o = out
+                else:
+                    o = _trtllm_context_attn(
+                        q,
+                        metadata.cu_seqlens_q,
+                        metadata.cache_seqlens_int32,
+                        metadata.max_seq_len_q,
+                        cu_seqlens_kv=metadata.cu_seqlens_k,
+                        out=out,
+                    )
 
         if uses_native_fp4:
             o = self._finalize_nvfp4_output(o, forward_batch)

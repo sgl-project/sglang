@@ -394,6 +394,7 @@ def _flash_attn_fwd(
     qk_sf_vec_size: Optional[int] = None,
     v_sf_vec_size: Optional[int] = None,
     rel_bias_prep_cache: Optional[dict] = None,
+    use_clc_scheduler: Optional[bool] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Forward pass for FlashAttention.
 
@@ -411,7 +412,9 @@ def _flash_attn_fwd(
     """
     fake_mode = is_fake_mode()
     arch = _get_device_arch() if _arch is None else _arch
-    arch_forward_host = get_forward_host(arch)
+    arch_forward_host = (
+        get_forward_host(arch) if use_clc_scheduler is None else None
+    )
     requested_num_splits = num_splits
     if (
         not fake_mode
@@ -735,7 +738,11 @@ def _flash_attn_fwd(
         causal, window_size_left, window_size_right, mask_mod
     )
 
-    requested_use_clc_scheduler = utils._get_use_clc_scheduler_default()
+    requested_use_clc_scheduler = (
+        utils._get_use_clc_scheduler_default()
+        if use_clc_scheduler is None
+        else use_clc_scheduler
+    )
     requested_disable_2cta = utils._get_disable_2cta_default(is_fwd=True)
 
     current_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
@@ -2029,6 +2036,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         rel_bias_prep_cache: Optional[dict] = None,
         return_lse: bool = False,
         out: Optional[torch.Tensor] = None,
+        use_clc_scheduler: Optional[bool] = None,
     ):
         aux_scalars = tuple(aux_scalars) if aux_scalars else None
         shared_kv = k is v
@@ -2077,6 +2085,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             v_sf_vec_size=v_sf_vec_size,
             rel_bias_prep_cache=rel_bias_prep_cache,
             out=out,
+            use_clc_scheduler=use_clc_scheduler,
         )
         if ctx is not None:
             ctx.save_for_backward(
@@ -2195,6 +2204,7 @@ def flash_attn_varlen_func(
     rel_bias_prep_cache: Optional[dict] = None,
     return_lse: bool = False,
     out: Optional[torch.Tensor] = None,
+    use_clc_scheduler: Optional[bool] = None,
 ):
     """
     Tensor arguments:
@@ -2239,7 +2249,11 @@ def flash_attn_varlen_func(
     if out is not None and out.stride(-1) != 1:
         raise ValueError("out must have stride 1 in the last dimension")
     runtime_arch = _get_device_arch()
-    forward_host = None if is_fake_mode() else get_forward_host(runtime_arch)
+    forward_host = (
+        None
+        if is_fake_mode() or use_clc_scheduler is not None
+        else get_forward_host(runtime_arch)
+    )
     if (
         forward_host is not None
         and q is not None
@@ -2330,6 +2344,7 @@ def flash_attn_varlen_func(
         rel_bias_prep_cache,
         return_lse,
         out,
+        use_clc_scheduler,
     )
     needs_autograd = False
     if forward_host is not None or out is not None:

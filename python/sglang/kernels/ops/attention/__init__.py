@@ -407,3 +407,34 @@ for _fn in ("fp4_index_logits_paged", "finish_paged_indexer_topk"):
         )
     )
 del _fn
+
+register_kernel(
+    KernelSpec(
+        op="attention.fused_qk_norm_mrope",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.fused_qknorm_rope:fused_qk_norm_mrope",
+        capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(8, 0))}),
+        format_signature=FormatSignature(
+            supported_dtypes=("bfloat16",),
+            in_place=True,
+            description="Q/K RMSNorm and NeoX MRoPE with optional BF16 paged KV write.",
+        ),
+    )
+)
+
+
+register_kernel(
+    KernelSpec(
+        op="attention.qkv_norm_mrope",
+        backend=KernelBackend.CUTE_DSL,
+        target="sglang.kernels.ops.attention.qkv_norm_mrope:qkv_norm_mrope",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(10, 3), max_sm=(10, 3))}
+        ),
+        format_signature=FormatSignature(
+            supported_dtypes=("bfloat16",),
+            in_place=True,
+            description="M1/M2/M4/M8 QKV projection, Q/K RMSNorm, MRoPE and HND page32 cache write.",
+        ),
+    )
+)

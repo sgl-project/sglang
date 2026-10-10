@@ -453,6 +453,7 @@ class LogitsProcessor(nn.Module):
     ):
         super().__init__()
         self.config = config
+        self._use_bf16_cublaslt_lm_head = False
         self.vocab_size = config.vocab_size
         self.logit_scale = logit_scale
         self.use_attn_tp_group = get_parallel().enable_dp_lm_head
@@ -1014,9 +1015,24 @@ class LogitsProcessor(nn.Module):
                     hidden_states.bfloat16(), lm_head.weight.T.bfloat16()
                 )
             else:
-                logits = torch.matmul(
-                    hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
-                )
+                logits = None
+                if (
+                    self._use_bf16_cublaslt_lm_head
+                    and hidden_states.shape in ((4, 2560), (8, 2560))
+                    and hidden_states.dtype == torch.bfloat16
+                    and not torch.compiler.is_compiling()
+                ):
+                    from sglang.srt.layers.quantization.unquant import (
+                        _try_tuned_bf16_cublaslt,
+                    )
+
+                    logits = _try_tuned_bf16_cublaslt(
+                        hidden_states, lm_head.weight, embedding_bias
+                    )
+                if logits is None:
+                    logits = torch.matmul(
+                        hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
+                    )
         else:
             # GGUF models
             # TODO: use weight_packed_linear for GGUF models
