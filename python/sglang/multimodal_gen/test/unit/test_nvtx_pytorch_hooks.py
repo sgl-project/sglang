@@ -154,6 +154,29 @@ class TestDiffusionNvtxHooks(unittest.TestCase):
         emit ranges; the caller must explicitly enable via set_enabled."""
         self.assertFalse(DiffusionNvtxHooks()._enabled)
 
+    def test_toggling_mid_forward_keeps_push_pop_balanced(self) -> None:
+        """Regression: enabling between a forward's pre- and post-hook popped a
+        range the pre-hook never pushed (closing the parent's), and disabling
+        in between left the pushed range open."""
+        hooks = DiffusionNvtxHooks()
+        dummy = torch.nn.Linear(2, 2)
+        hooks._module_to_name_map[dummy] = "dummy"
+        with (
+            patch.object(nvtx_pytorch_hooks.nvtx, "range_push") as push,
+            patch.object(nvtx_pytorch_hooks.nvtx, "range_pop") as pop,
+        ):
+            hooks.set_enabled(False)
+            hooks._forward_pre_hook(dummy, (torch.zeros(2),), {})
+            hooks.set_enabled(True)
+            hooks._forward_hook(dummy, (), None)
+            pop.assert_not_called()
+
+            hooks._forward_pre_hook(dummy, (torch.zeros(2),), {})
+            hooks.set_enabled(False)
+            hooks._forward_hook(dummy, (), None)
+            push.assert_called_once()
+            pop.assert_called_once_with()
+
     def test_post_hook_fires_on_forward_exception(self) -> None:
         """Regression: ``always_call=True`` on the registered post-hook
         guarantees ``range_pop`` runs even when the wrapped ``forward``
