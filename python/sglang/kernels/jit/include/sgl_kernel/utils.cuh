@@ -154,19 +154,24 @@ using fp32x4_t = float4;
 /*
  * LDG Support
  */
-#if defined(USE_ROCM) || defined(USE_MUSA)
+#ifdef USE_ROCM
+#define SGLANG_LDG(arg) *(arg)
+#elif defined(USE_MUSA)
 #define SGLANG_LDG(arg) *(arg)
 #else
 #define SGLANG_LDG(arg) __ldg(arg)
 #endif
 
 // DLPack device type for the current platform
-#if !defined(USE_ROCM)
+#ifdef USE_ROCM
+inline constexpr auto kDLGPU = kDLROCM;
+inline constexpr auto kDLGPUHost = kDLROCMHost;
+#elif defined(USE_MUSA)
 inline constexpr auto kDLGPU = kDLCUDA;
 inline constexpr auto kDLGPUHost = kDLCUDAHost;
 #else
-inline constexpr auto kDLGPU = kDLROCM;
-inline constexpr auto kDLGPUHost = kDLROCMHost;
+inline constexpr auto kDLGPU = kDLCUDA;
+inline constexpr auto kDLGPUHost = kDLCUDAHost;
 #endif
 
 namespace device {
@@ -231,19 +236,20 @@ using type_identity_t = typename TypeIdentity<T>::type;
  */
 template <uint32_t kNumThreads = kWarpThreads>
 SGL_DEVICE uint32_t get_lane_id() {
-#ifndef USE_ROCM
+#ifdef USE_ROCM
+  static_assert(kNumThreads <= 64 && host::is_pow2(kNumThreads));
+  // AMD has no lane-id register: `__lane_id()` is computed from the exec mask
+  // and the group mask is still needed on top.
+  return threadIdx.x % kNumThreads;
+#elif defined(USE_MUSA)
+  static_assert(kNumThreads <= 32 && host::is_pow2(kNumThreads));
+  return threadIdx.x % kNumThreads;
+#else
   static_assert(kNumThreads <= 32 && host::is_pow2(kNumThreads));
   uint32_t lane_id;
   asm volatile("mov.u32 %0, %%laneid;" : "=r"(lane_id));
   if constexpr (kNumThreads != 32) lane_id %= kNumThreads;
   return lane_id;
-#else
-  static_assert(kNumThreads <= 64 && host::is_pow2(kNumThreads));
-  // AMD has no lane-id register: `__lane_id()` is computed from the exec mask as
-  // a `v_mbcnt_lo`/`v_mbcnt_hi` pair, and the group mask is still needed on top.
-  // Masking `threadIdx.x` -- already live in v0 -- is 2 instructions cheaper and
-  // yields the same value (measured on gfx950, hipcc 7.0).
-  return threadIdx.x % kNumThreads;
 #endif
 }
 
@@ -430,7 +436,10 @@ inline auto prefer_l1_carveout(T&& kernel, int device_id, uint32_t block_threads
     RuntimeDeviceCheck(::cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, kernel, block_threads, dyn_smem_bytes));
     return static_cast<uint32_t>(blocks);
   };
-#if defined(USE_ROCM) || defined(USE_MUSA)
+#ifdef USE_ROCM
+  (void)device_id;
+  return {-1, blocks_per_sm()};
+#elif defined(USE_MUSA)
   (void)device_id;
   return {-1, blocks_per_sm()};
 #else
@@ -536,7 +545,9 @@ struct LaunchKernel {
   }
 
   auto enable_cluster(dim3 cluster_dim) -> LaunchKernel& {
-#if defined(USE_ROCM) || defined(USE_MUSA)
+#ifdef USE_ROCM
+    (void)cluster_dim;
+#elif defined(USE_MUSA)
     (void)cluster_dim;
 #else
     auto& attr = m_attrs[m_config.numAttrs++];
@@ -579,6 +590,8 @@ struct LaunchKernel {
         m_config.stream,
         std::forward<Args>(args)...);
     RuntimeDeviceCheck(m_location);
+#elif defined(USE_MUSA)
+    RuntimeDeviceCheck(::cudaLaunchKernelEx(&m_config, kernel, std::forward<Args>(args)...), m_location);
 #else
     RuntimeDeviceCheck(::cudaLaunchKernelEx(&m_config, kernel, std::forward<Args>(args)...), m_location);
 #endif

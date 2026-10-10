@@ -55,7 +55,6 @@ struct DeviceRef;
 
 template <typename T, typename = void>
 struct DLDataTypeTrait {};
-
 template <typename T>
 struct DLDataTypeTrait<T, std::enable_if_t<std::is_integral_v<T>>> {
   inline static constexpr DLDataType value = {
@@ -69,6 +68,7 @@ struct DLDataTypeTrait<T, std::enable_if_t<std::is_floating_point_v<T>>> {
   inline static constexpr DLDataType value = {
       .code = DLDataTypeCode::kDLFloat, .bits = static_cast<std::uint8_t>(sizeof(T) * 8), .lanes = 1};
 };
+
 #ifdef __CUDACC__
 template <>
 struct DLDataTypeTrait<fp16_t> {
@@ -143,7 +143,14 @@ inline constexpr auto kDeviceStringMap = [] {
       std::pair{DLDeviceType::kDLMAIA, "maia"},
       std::pair{DLDeviceType::kDLTrn, "trn"},
   };
-  constexpr auto max_type = static_cast<std::size_t>(DLDeviceType::kDLTrn);
+  constexpr auto max_type = [](const auto& entries) {
+    std::size_t result = 0;
+    for (const auto& [code, name] : entries) {
+      (void)name;
+      result = std::max(result, static_cast<std::size_t>(code));
+    }
+    return result;
+  }(map);
   auto result = std::array<std::string_view, max_type + 1>{};
   for (const auto& [code, name] : map) {
     result[static_cast<std::size_t>(code)] = name;
