@@ -264,7 +264,13 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 and int(eagle_draft_num_layers) > 0
                 and int(num_layers) > 0
             ):
-                draft_num_layers = int(eagle_draft_num_layers)
+                # Under DCP the target pool is sharded but the draft pool is
+                # replicated across ranks (kv_cache_configurator.loc_space_scale),
+                # so every replica has to be priced. Same multiplier the DFLASH
+                # term below applies.
+                draft_num_layers = (
+                    int(eagle_draft_num_layers) * get_parallel().attn_dcp_size
+                )
                 if is_deepseek_dsa(kvc.model_config.hf_config):
                     target_indexer_size = self._compute_dsa_indexer_cell_size(
                         kvc=kvc,
@@ -288,11 +294,6 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                         num_layers=draft_num_layers,
                         allocate_all_layers=True,
                     )
-                    # The draft pool is replicated and consumes the widened
-                    # allocator-global slot space on NPU DCP.
-                    if _is_npu and dcp_size > 1:
-                        draft_kv_size *= dcp_size
-                        draft_indexer_size *= dcp_size
                     self._cell_size += draft_kv_size + draft_indexer_size
                 else:
                     self._cell_size = int(
@@ -726,6 +727,15 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                     - self._draft_swa_layers_num
                     - self._draft_swa_full_layers_num
                 )
+                # Same DCP replication the default configurator prices: the
+                # target pool is sharded while the draft pool spans the
+                # allocator's widened virtual location space. Scale the derived
+                # per-geometry counts rather than draft_layers, which indexes
+                # real draft layer ids above.
+                dcp_size = get_parallel().attn_dcp_size
+                self._draft_full_layers_num *= dcp_size
+                self._draft_swa_layers_num *= dcp_size
+                self._draft_swa_full_layers_num *= dcp_size
 
         self._draft_cell_size = _dflash_draft_cell_size(kvc)
         self._fused_full_entry = kvc.fused_entry_bytes("full")
