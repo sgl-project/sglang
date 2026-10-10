@@ -187,19 +187,29 @@ jobs:
             echo "Run mode: FILTERED (triggered by ${{ github.event_name }})"
           fi
 
+      - name: Resolve CI labels
+        id: ci-labels
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const { resolveCiLabels } = require(
+              `${process.env.GITHUB_WORKSPACE}/.github/scripts/ci-labels.cjs`
+            );
+            const axes = await resolveCiLabels(github, context);
+            core.info(`CI labels: [${axes.labels.join(', ')}]`);
+            core.setOutput('bypass_fail_fast', String(axes.bypassFailFast));
+
       - name: Set continue-on-error for schedule/full runs
         id: set-continue-on-error
         env:
-          # `bypass-fastfail` PR label: also disable within-suite fast-fail
-          # here. The shared actions/wait-for-jobs already honors the same
-          # label to skip cross-stage waits.
-          BYPASS_FASTFAIL_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'bypass-fastfail') }}
+          BYPASS_FAIL_FAST: ${{ steps.ci-labels.outputs.bypass_fail_fast }}
         run: |
           if [[ "${{ steps.run-mode.outputs.run_all_tests }}" == "true" \
              || "${{ inputs.continue_on_error }}" == "true" \
-             || "$BYPASS_FASTFAIL_LABEL" == "true" ]]; then
+             || "$BYPASS_FAIL_FAST" == "true" ]]; then
             echo "continue_on_error=true" >> $GITHUB_OUTPUT
-            echo "Continue-on-error: ENABLED (run_all_tests=${{ steps.run-mode.outputs.run_all_tests }}, input=${{ inputs.continue_on_error }}, bypass-fastfail=$BYPASS_FASTFAIL_LABEL)"
+            echo "Continue-on-error: ENABLED (run_all_tests=${{ steps.run-mode.outputs.run_all_tests }}, input=${{ inputs.continue_on_error }}, bypass-fail-fast=$BYPASS_FAIL_FAST)"
           else
             echo "continue_on_error=false" >> $GITHUB_OUTPUT
             echo "Continue-on-error: DISABLED"
@@ -608,7 +618,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-1-gpu-small-amd-nondeterministic --timeout-per-file 3600 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
   stage-b-test-1-gpu-small-amd-mi35x:
-    name: ${{ format('stage-b-test-1-gpu-small-amd-mi35x ({0}, {1})', matrix.rocm_version, matrix.runner) }}
+    name: ${{ format('stage-b-test-1-gpu-small-amd-mi35x ({0}, {1}, {2})', matrix.rocm_version, matrix.runner, matrix.part) }}
     needs: [check-changes, wait-for-stage-a-amd]
     if: |
       always() &&
@@ -625,6 +635,7 @@ jobs:
       matrix:
         rocm_version: ${{ fromJson(needs.check-changes.outputs.rocm_versions) }}
         runner: [linux-mi35x-gpu-1]
+        part: [0, 1]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -644,9 +655,9 @@ jobs:
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: 30
+        timeout-minutes: 45
         run: |
-          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-1-gpu-small-amd-mi35x ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-1-gpu-small-amd-mi35x --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
   stage-b-test-1-gpu-large-amd:
     name: ${{ format('stage-b-test-1-gpu-large-amd ({0}, linux-{1}-1gpu-sglang, {2})', matrix.rocm_version, inputs.runner_arch || 'mi300', matrix.part) }}
@@ -855,14 +866,12 @@ jobs:
           echo "=== Post-test System Memory Status ==="
           free -h
 
-      # The mm_gen `unit` suite is portable CPU-style tests that finish in a
-      # few minutes, which does not justify a job of its own: on mi300 the
-      # container pull plus dependency install costs ~2h before any test runs.
-      # Ride along on the shard that is already warm. Runs after the diffusion
-      # tests, and on failure too, so a diffusion regression cannot hide it.
+      # Split unit files across the four existing containers to stay within
+      # the step timeout without repeating image pulls and dependency installs.
+      # Run after failed server tests too, so a regression cannot hide them.
       # Skips the CUDA-only ltx2_vae_channels_last memory-format assertion.
       - name: Run diffusion unit tests
-        if: matrix.part == 0 && (success() || failure())
+        if: success() || failure()
         timeout-minutes: 30
         run: |
           docker exec \
@@ -870,6 +879,8 @@ jobs:
             -w /sglang-checkout/python \
             ci_sglang python3 sglang/multimodal_gen/test/run_suite.py \
               --suite unit \
+              --partition-id ${{ matrix.part }} \
+              --total-partitions 4 \
               -k "not ltx2_vae_channels_last" \
               ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
@@ -979,6 +990,9 @@ jobs:
 
       - name: Run diffusion server tests (2-GPU)
         timeout-minutes: ${{ (inputs.runner_arch || 'mi300') == 'mi300' && 180 || 150 }}
+        env:
+          HF_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN || secrets.HF_TOKEN }}
+          HUGGING_FACE_HUB_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN || secrets.HF_TOKEN }}
         run: |
           # AMD CI: All 2-GPU tests including LoRA
           # Tests: T2V, T2I, I2V, LoRA
@@ -987,6 +1001,8 @@ jobs:
           # - HF_HUB_ENABLE_HF_TRANSFER=1: Use faster hf_transfer for downloads (if available)
           # - HF_HUB_DISABLE_SYMLINKS_WARNING=1: Suppress symlink warnings
           docker exec \
+            -e HF_TOKEN \
+            -e HUGGING_FACE_HUB_TOKEN \
             -e SGLANG_E2E_TOLERANCE=0.3 \
             -e SGLANG_STAGE_TIME_TOLERANCE=0.2 \
             -e SGLANG_NON_DENOISE_STAGE_TIME_TOLERANCE=0.6 \

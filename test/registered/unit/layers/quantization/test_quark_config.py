@@ -1,21 +1,35 @@
-"""Unit tests for QuarkConfig — CPU-only, no model loading."""
+"""Unit tests for QuarkConfig and its MoE scheme — CPU-only, no model loading."""
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
+import sys
+import types
 import unittest
+from copy import deepcopy
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
+from sglang.srt.layers.linear import LinearBase
+from sglang.srt.layers.moe.moe_runner.aiter import AiterQuantType
+from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
 from sglang.srt.layers.quantization.quark.quark import (
     QuarkConfig,
     _build_mixed_precision_layer_quant_config,
     _mixed_precision_layer_map,
     _parse_nvfp4_excludes,
 )
+from sglang.srt.layers.quantization.quark.schemes import (
+    quark_w4a4_mxfp4_moe as quark_moe,
+)
+from sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4_moe import (
+    QuarkW4A4MXFp4MoE,
+)
 from sglang.srt.layers.quantization.quark.utils import check_equal_or_regex_match
+from sglang.srt.models.glm5_next import Glm5NextForConditionalGeneration
 from sglang.test.test_utils import CustomTestCase
 
 _GET_CAP = "sglang.srt.layers.quantization.quark.quark.get_device_capability"
@@ -187,6 +201,74 @@ class TestMixedPrecisionLayerConfig(CustomTestCase):
         self.assertIsNone(_mixed_precision_layer_map({"quant_algo": "NVFP4"}))
 
 
+class TestFusedExpertConfig(CustomTestCase):
+    """Per-expert-only entries must not leave a FusedMoE on the global scheme."""
+
+    _FP8 = {
+        "weight": {
+            "dtype": "fp8_e4m3",
+            "qscheme": "per_block",
+            "block_size": [128, 128],
+        },
+        "input_tensors": {
+            "dtype": "fp8_e4m3",
+            "qscheme": "per_group",
+            "group_size": 128,
+        },
+    }
+    _MXFP4 = {
+        "weight": {"dtype": "fp4", "qscheme": "per_group", "group_size": 32},
+        "input_tensors": {"dtype": "fp4", "qscheme": "per_group", "group_size": 32},
+    }
+    _PREFIX = "model.decoder.mlp.experts"
+
+    def _entries(self, num_experts):
+        return {
+            f"{index}.{projection}": deepcopy(self._FP8)
+            for index in range(num_experts)
+            for projection in ("gate_proj", "up_proj", "down_proj")
+        }
+
+    def _config_with(self, layer_quant_config):
+        quark_config = _bare_config()
+        quark_config.quant_config = {
+            "layer_quant_config": layer_quant_config,
+            "layer_type_quant_config": {},
+            "global_quant_config": self._MXFP4,
+        }
+        quark_config.packed_modules_mapping = {}
+        return quark_config
+
+    def _lookup(self, entries):
+        quark_config = self._config_with(
+            {f"{self._PREFIX}.{s}": cfg for s, cfg in entries.items()}
+        )
+        return quark_config._find_matched_config(self._PREFIX, torch.nn.Module())
+
+    def test_fused_moe_resolves_from_per_expert_entries(self):
+        matched = self._lookup(self._entries(288))
+        self.assertEqual(matched["weight"]["dtype"], "fp8_e4m3")
+
+    def test_incomplete_or_mixed_expert_coverage_raises(self):
+        missing = {s: c for s, c in self._entries(4).items() if not s.startswith("2.")}
+        conflicting = self._entries(4)
+        conflicting["2.up_proj"] = deepcopy(self._MXFP4)
+        partial_projections = self._entries(4)
+        del partial_projections["3.down_proj"]
+        cases = {
+            "missing_expert": (missing, "skip experts"),
+            "conflicting_scheme": (conflicting, "different quantization"),
+            "partial_projections": (partial_projections, "different projections"),
+            "fused_param_name": ({"w13_weight_scale": self._FP8}, "expert index"),
+        }
+        for name, (entries, message) in cases.items():
+            with self.subTest(name), self.assertRaisesRegex(ValueError, message):
+                self._lookup(entries)
+
+    def test_experts_without_per_expert_entries_fall_through_to_global(self):
+        self.assertEqual(self._lookup({})["weight"]["dtype"], "fp4")
+
+
 class TestParseNvfp4Excludes(CustomTestCase):
     """ModelOpt `ignore` lists mix `re:`-prefixed regexes with fnmatch globs."""
 
@@ -205,6 +287,325 @@ class TestParseNvfp4Excludes(CustomTestCase):
         self.assertFalse(
             check_equal_or_regex_match("model.layers.0.mlp.experts", excludes)
         )
+
+
+class TestQuarkPerLayerBlockFp8(CustomTestCase):
+    _BLOCK_FP8_CONFIG = {
+        "weight": {
+            "dtype": "fp8_e4m3",
+            "qscheme": "per_block",
+            "block_size": [128, 128],
+            "is_dynamic": False,
+        },
+        "input_tensors": {
+            "dtype": "fp8_e4m3",
+            "qscheme": "per_group",
+            "group_size": 128,
+            "is_dynamic": True,
+        },
+        "output_tensors": None,
+        "bias": None,
+    }
+
+    def _build_bare_config(self) -> QuarkConfig:
+        config = _bare_config()
+        config.quant_config = {
+            "layer_quant_config": {
+                "model.language_model.layers.0.mlp.down_proj": self._BLOCK_FP8_CONFIG
+            },
+            "layer_type_quant_config": {},
+            "global_quant_config": {
+                "weight": {
+                    "dtype": "fp4",
+                    "qscheme": "per_group",
+                    "group_size": 32,
+                    "is_dynamic": False,
+                    "scale_format": "e8m0",
+                },
+                "input_tensors": {
+                    "dtype": "fp4",
+                    "qscheme": "per_group",
+                    "group_size": 32,
+                    "is_dynamic": True,
+                    "scale_format": "e8m0",
+                },
+            },
+        }
+        config.exclude_layers = []
+        config.kv_cache_group = []
+        config.packed_modules_mapping = {}
+        config.excluded_fp8_config = None
+        config._online_quantized_layers = set()
+        return config
+
+    def test_model_mapper_rewrites_explicit_layer_config(self):
+        config = self._build_bare_config()
+
+        config.apply_weight_name_mapper(
+            Glm5NextForConditionalGeneration.hf_to_sglang_mapper
+        )
+
+        self.assertIn(
+            "model.layers.0.mlp.down_proj",
+            config.quant_config["layer_quant_config"],
+        )
+
+    def test_model_mapper_rewrites_fused_visual_exclusion(self):
+        config = self._build_bare_config()
+        config.exclude_layers = ["model.visual.blocks.0.attn.qkv"]
+
+        config.apply_weight_name_mapper(
+            Glm5NextForConditionalGeneration.hf_to_sglang_mapper
+        )
+
+        self.assertEqual(
+            config.exclude_layers,
+            ["visual.blocks.0.attn.qkv_proj"],
+        )
+        self.assertNotIn(
+            "model.language_model.layers.0.mlp.down_proj",
+            config.quant_config["layer_quant_config"],
+        )
+
+    def test_explicit_block_fp8_linear_uses_fp8_method(self):
+        config = self._build_bare_config()
+        config.apply_weight_name_mapper(
+            Glm5NextForConditionalGeneration.hf_to_sglang_mapper
+        )
+        layer = LinearBase.__new__(LinearBase)
+
+        method = config.get_quant_method(layer, "model.layers.0.mlp.down_proj")
+
+        self.assertIsInstance(method, Fp8LinearMethod)
+        self.assertTrue(method.quant_config.is_checkpoint_fp8_serialized)
+        self.assertEqual(method.quant_config.weight_block_size, [128, 128])
+
+    def test_dynamic_block_fp8_weight_is_not_treated_as_serialized(self):
+        layer_config = deepcopy(self._BLOCK_FP8_CONFIG)
+        layer_config["weight"]["is_dynamic"] = True
+
+        self.assertIsNone(QuarkConfig._get_block_fp8_config(layer_config, {}))
+
+    def test_unmatched_layer_still_uses_global_quark_config(self):
+        config = self._build_bare_config()
+        config.apply_weight_name_mapper(
+            Glm5NextForConditionalGeneration.hf_to_sglang_mapper
+        )
+
+        matched = config._find_matched_config(
+            "model.layers.4.mlp.down_proj", torch.nn.Module()
+        )
+
+        self.assertEqual(matched["weight"]["dtype"], "fp4")
+
+
+class TestDeepseekV4QuarkMapping(CustomTestCase):
+    """amd/DeepSeek-V4-*-MXFP4 layout: MXFP4 experts everywhere, but the MTP
+    block keeps FP8-block shared experts; specs are keyed by checkpoint names."""
+
+    _HF_CONFIG = SimpleNamespace(quantization_config={"quant_method": "quark"})
+
+    _FP8 = TestQuarkPerLayerBlockFp8._BLOCK_FP8_CONFIG
+    _MXFP4 = {
+        "weight": {
+            "dtype": "fp4",
+            "qscheme": "per_group",
+            "group_size": 32,
+            "is_dynamic": False,
+            "scale_format": "e8m0",
+        },
+        "input_tensors": {
+            "dtype": "fp4",
+            "qscheme": "per_group",
+            "group_size": 32,
+            "is_dynamic": True,
+            "scale_format": "e8m0",
+        },
+        "output_tensors": None,
+        "bias": None,
+    }
+
+    def _config_for(self, model_cls) -> QuarkConfig:
+        config = _bare_config()
+        config.quant_config = {
+            "layer_quant_config": {
+                "layers.0.attn.wq_a": deepcopy(self._FP8),
+                "layers.0.attn.wkv": deepcopy(self._FP8),
+                **{
+                    f"mtp.0.ffn.shared_experts.w{i}": deepcopy(self._FP8)
+                    for i in (1, 2, 3)
+                },
+                **{
+                    f"mtp.0.ffn.experts.{e}.w{i}": deepcopy(self._MXFP4)
+                    for e in range(2)
+                    for i in (1, 2, 3)
+                },
+            },
+            "layer_type_quant_config": {},
+            "global_quant_config": deepcopy(self._MXFP4),
+        }
+        config.exclude_layers = []
+        config.kv_cache_group = []
+        config.packed_modules_mapping = {"gate_up_proj": ["gate_proj", "up_proj"]}
+        config.excluded_fp8_config = None
+        config.is_prequantized = True
+        config.dequantization_config = None
+        config._online_quantized_layers = set()
+        config.apply_weight_name_mapper(
+            model_cls.get_hf_to_sglang_mapper(self._HF_CONFIG)
+        )
+        return config
+
+    def test_only_draft_vetoes_fusion_on_fp8_mtp_shared_experts(self):
+        from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
+        from sglang.srt.models.deepseek_v4_nextn import DeepseekV4ForCausalLMNextN
+
+        self.assertTrue(
+            self._config_for(DeepseekV4ForCausalLM).can_fuse_shared_expert()
+        )
+        self.assertFalse(
+            self._config_for(DeepseekV4ForCausalLMNextN).can_fuse_shared_expert()
+        )
+
+    def test_fused_wqkv_a_takes_the_wq_a_block_fp8_spec(self):
+        from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
+
+        config = self._config_for(DeepseekV4ForCausalLM)
+        layer = LinearBase.__new__(LinearBase)
+
+        method = config.get_quant_method(layer, "model.layers.0.self_attn.wqkv_a")
+
+        self.assertIsInstance(method, Fp8LinearMethod)
+
+
+class _Runner:
+    """Records the quant_info apply_weights() hands to the runner."""
+
+    def __init__(self):
+        self.quant_info = None
+
+    def run(self, dispatch_output, quant_info):
+        self.quant_info = quant_info
+        return dispatch_output
+
+
+class TestQuarkMxfp4MoEAiterQuantInfo(CustomTestCase):
+    """apply_weights assembles what the AITER runner consumes.
+
+    The gfx950 e2e builds AiterMoeQuantInfo by hand, so dropping the gate/up
+    layout, the clamp or the padding here would leave it passing while served
+    experts read the gate and up halves swapped.
+    """
+
+    def test_apply_forwards_clamp_separated_layout_and_padding(self):
+        scheme = object.__new__(QuarkW4A4MXFp4MoE)
+        scheme.moe_runner_config = SimpleNamespace(swiglu_limit=10.0)
+        scheme.runner = _Runner()
+
+        layer = SimpleNamespace(
+            w13_weight=torch.zeros((1, 4, 2), dtype=torch.uint8),
+            w2_weight=torch.zeros((1, 2, 2), dtype=torch.uint8),
+            w13_weight_scale=torch.ones((1, 4, 1), dtype=torch.uint8),
+            w2_weight_scale=torch.ones((1, 2, 1), dtype=torch.uint8),
+            hidden_pad=0,
+            intermediate_pad=128,
+            dispatcher=SimpleNamespace(expert_mask_gpu=torch.tensor([True, False])),
+        )
+        layer.w13_weight.is_shuffled = True
+        fake_moe_common = types.ModuleType("aiter.ops.flydsl.moe_common")
+        fake_moe_common.GateMode = SimpleNamespace(
+            SEPARATED=SimpleNamespace(value="separated"),
+            INTERLEAVE=SimpleNamespace(value="interleave"),
+        )
+
+        with (
+            patch.dict(sys.modules, {"aiter.ops.flydsl.moe_common": fake_moe_common}),
+            patch.object(quark_moe, "_is_gfx95", True),
+            patch.object(quark_moe, "_is_gfx1250", False),
+        ):
+            marker = object()
+            result = scheme.apply_weights(layer, marker)
+
+        self.assertIs(result, marker)
+        quant_info = scheme.runner.quant_info
+        self.assertEqual(quant_info.quant_type, AiterQuantType.PER_1X32)
+        self.assertEqual(quant_info.swiglu_limit, 10.0)
+        self.assertEqual(quant_info.hidden_pad, 0)
+        self.assertEqual(quant_info.intermediate_pad, 128)
+        self.assertEqual(quant_info.fused_moe_kwargs, {"gate_mode": "separated"})
+        self.assertIs(quant_info.expert_mask, layer.dispatcher.expert_mask_gpu)
+        self.assertTrue(quant_info.w13_weight.is_shuffled)
+        self.assertTrue(quant_info.w2_weight.is_shuffled)
+
+
+class TestQuarkMxfp4MoEPaddedTpLoading(CustomTestCase):
+    """aiter skips the last intermediate_pad channels of every TP rank, so each
+    rank's real checkpoint channels must load at the head of its padded buffer.
+    Regression: DeepSeek-V4-Pro TP8 (384 -> 512) silently lost 25% of channels."""
+
+    TP, REAL, PADDED, COLS = 8, 384, 512, 3
+
+    def _load_rank(self, rank, loader):
+        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+
+        moe = SimpleNamespace(
+            moe_runner_config=SimpleNamespace(is_gated=True),
+            quant_method=SimpleNamespace(),
+            quant_config=None,
+            use_padded_loading=True,
+            use_presharded_weights=False,
+            moe_tp_rank=rank,
+            moe_tp_size=self.TP,
+        )
+
+        def fused_moe_weight_loader(param, w, name, shard_id, expert_id):
+            load = FusedMoE._load_w2 if shard_id == "w2" else FusedMoE._load_w13
+            load(
+                moe,
+                expert_data=param.data[expert_id],
+                shard_dim=1 if shard_id == "w2" else 0,
+                shard_id=shard_id,
+                loaded_weight=w,
+            )
+
+        load = loader(fused_moe_weight_loader)
+        full = self.TP * self.REAL
+        channel = torch.arange(1, full + 1, dtype=torch.float32)
+        gate, up = channel[:, None].repeat(1, self.COLS), -channel[:, None]
+        down = channel[None, :].repeat(self.COLS, 1)
+        w13 = torch.full((1, 2 * self.PADDED, self.COLS), float("nan"))
+        w2 = torch.full((1, self.COLS, self.PADDED), float("nan"))
+        load(w13, gate, "w13_weight", "w1", 0)
+        load(w13, up.repeat(1, self.COLS), "w13_weight", "w3", 0)
+        load(w2, down, "w2_weight", "w2", 0)
+        return w13[0], w2[0]
+
+    def test_each_rank_holds_its_own_channels_then_zero_padding(self):
+        from sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4_moe import (
+            _rank_chunk_padding_loader,
+        )
+
+        loader = lambda wl: _rank_chunk_padding_loader(wl, tp_size=self.TP)
+        real, padded = self.REAL, self.PADDED
+        for rank in range(self.TP):
+            w13, w2 = self._load_rank(rank, loader)
+            expected = torch.arange(rank * real + 1, (rank + 1) * real + 1).float()
+            with self.subTest(rank=rank):
+                self.assertTrue(torch.equal(w13[:real, 0], expected))
+                self.assertTrue(torch.equal(w13[padded : padded + real, 0], -expected))
+                self.assertTrue(torch.equal(w2[0, :real], expected))
+                self.assertEqual(w13[real:padded].abs().sum().item(), 0)
+                self.assertEqual(w13[padded + real :].abs().sum().item(), 0)
+                self.assertEqual(w2[:, real:].abs().sum().item(), 0)
+
+    def test_unpadded_weights_pass_through_unchanged(self):
+        from sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4_moe import (
+            _pad_tp_chunks,
+        )
+
+        weight = torch.randn(self.TP * self.REAL, self.COLS)
+        out = _pad_tp_chunks(weight, dim=0, tp_size=self.TP, padded=self.REAL)
+        self.assertIs(out, weight)
 
 
 if __name__ == "__main__":

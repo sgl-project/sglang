@@ -29,12 +29,17 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
+from sglang.multimodal_gen.configs.sample.sampling_params import normalize_quality
 from sglang.multimodal_gen.registry import (
     get_model_info,
     get_pipeline_config_classes,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
+from sglang.multimodal_gen.test.test_utils import (
+    SGL_TEST_FILES_CI_DATA_REPO,
+    SGL_TEST_FILES_CI_DATA_REVISION,
+)
 
 
 @dataclass
@@ -49,6 +54,7 @@ class ToleranceConfig:
     load_peak_vram: float = 0.01
     runtime_peak_vram: float = 0.02
     host_anon: float = 0.02
+    load: float | None = None
 
     @classmethod
     def load_profile(cls, all_tolerances: dict, profile_name: str) -> ToleranceConfig:
@@ -102,6 +108,7 @@ class ToleranceConfig:
                 )
             ),
             host_anon=float(tol_data.get("host_anon", 0.02)),
+            load=float(tol_data["load"]) if "load" in tol_data else None,
         )
 
 
@@ -115,6 +122,7 @@ class ScenarioConfig:
     expected_avg_denoise_ms: float
     expected_median_denoise_ms: float
     estimated_full_test_time_s: float | None = None
+    expected_load_ms: float | None = None
     load_peak_vram_mb: float | None = None
     runtime_peak_vram_mb: float | None = None
     # Peak of the warmup calibration probe (the default workload's full shape
@@ -146,6 +154,7 @@ class ScenarioConfig:
             expected_avg_denoise_ms=float(cfg["expected_avg_denoise_ms"]),
             expected_median_denoise_ms=float(cfg["expected_median_denoise_ms"]),
             estimated_full_test_time_s=optional_float("estimated_full_test_time_s"),
+            expected_load_ms=optional_float("expected_load_ms"),
             load_peak_vram_mb=optional_float("load_peak_vram_mb"),
             runtime_peak_vram_mb=optional_float("runtime_peak_vram_mb"),
             warmup_peak_vram_mb=optional_float("warmup_peak_vram_mb"),
@@ -171,6 +180,15 @@ class BaselineConfig:
         """Load baseline configuration from JSON file."""
         with path.open("r", encoding="utf-8") as fh:
             data = json.load(fh)
+
+        # runner pools with the same gpu can have different host-side latency
+        runner_name = os.environ.get("RUNNER_NAME", "")
+        for prefix, overrides in data.get("runner_overrides", {}).items():
+            if runner_name.startswith(prefix):
+                for name, metrics in overrides.items():
+                    data["scenarios"][name].update(metrics)
+                print(f"--- Performance Runner Baseline: {prefix} ---")
+                break
 
         # Get tolerance profile, defaulting to 'pr_test'
         profile_name = "pr_test"
@@ -320,6 +338,7 @@ class DiffusionTestCase:
     run_perf_check: bool = True
     # Validate every repetition against the same baseline and GT.
     perf_repeat_requests: int = 1
+    perf_warmup_requests: int = 0
     run_consistency_check: bool = True
     run_component_accuracy_check: bool = True
     run_models_api_check: bool = True
@@ -333,11 +352,54 @@ class DiffusionTestCase:
     def __post_init__(self) -> None:
         if self.perf_repeat_requests < 1:
             raise ValueError(f"{self.id}: perf_repeat_requests must be positive")
+        if self.perf_warmup_requests < 0:
+            raise ValueError(f"{self.id}: perf_warmup_requests must be non-negative")
         if self.sampling_params is None:
             object.__setattr__(
                 self,
                 "sampling_params",
                 get_default_sampling_params_for_server_args(self.server_args),
+            )
+        if (
+            self.perf_warmup_requests
+            and self.sampling_params.realtime_num_chunks is not None
+        ):
+            raise ValueError(f"{self.id}: request warmup requires non-realtime metrics")
+
+        # A consistency golden records one path, and these were recorded on the
+        # reference one, so the case asks for it by name instead of inheriting
+        # whichever level is the server default. Without this the check would
+        # answer two questions at once -- "did the code regress" and "how far
+        # is the default level from the goldens" -- and spend its whole budget
+        # on the second: the default's own drift already sits at SSIM 0.91
+        # against goldens whose threshold is 0.92. A case that names a level
+        # keeps it; refreshing the goldens onto the default level is what
+        # removes the pin.
+        # Replaces rather than mutates: several cases share one module-level
+        # sampling-params instance.
+        if self.run_consistency_check and "quality" not in self.sampling_params.extras:
+            object.__setattr__(
+                self,
+                "sampling_params",
+                replace(
+                    self.sampling_params,
+                    extras={**self.sampling_params.extras, "quality": "exact"},
+                ),
+            )
+        # Warmup must run the request's level: a request below the server default
+        # unmounts the fusions warmup mounted, so its timed run is the first pass
+        # over an unwarmed path.
+        request_quality = self.sampling_params.extras.get("quality")
+        if request_quality is not None:
+            object.__setattr__(
+                self,
+                "server_args",
+                replace(
+                    self.server_args,
+                    extras=_with_warmup_quality(
+                        self.server_args.extras, normalize_quality(request_quality)
+                    ),
+                ),
             )
 
         has_startup_lora = self.server_args.lora_path is not None
@@ -432,6 +494,28 @@ PI05_ACTION_CI_sampling_params = DiffusionSamplingParams(
 )
 
 
+# DROID policy: three fixed-name 360x640 cameras, 8-dim state and actions,
+# the package recipe (4 steps, CFG on video). Noise comes from the seed.
+FLUX3_ACTION_CI_sampling_params = DiffusionSamplingParams(
+    prompt="put the marker in the cup",
+    extras={
+        "action_horizon": 32,
+        "action_dim": 8,
+        "state_dim": 8,
+        "image_height": 360,
+        "image_width": 640,
+        "camera_order": ("wrist", "left", "right"),
+        "num_inference_steps": 4,
+        "seed": 0,
+        "enable_prefix_cache": False,
+        # Same path is bit-exact across runs and GPUs. Kernel swaps move actions
+        # by up to max 0.064 / mean 0.020 (eager QK-norm+RoPE in every block).
+        "action_max_abs_diff_threshold": 0.2,
+        "action_mean_abs_diff_threshold": 0.05,
+    },
+)
+
+
 def sample_step_indices(
     step_map: dict[int, float], fractions: Sequence[float]
 ) -> list[int]:
@@ -468,6 +552,8 @@ class PerformanceSummary:
     frames_per_second: float | None = None
     total_frames: int | None = None
     avg_frame_time_ms: float | None = None
+    denoising_stages: set[str] = field(default_factory=set)
+    load_time_ms: float | None = None
 
     @staticmethod
     def from_req_perf_record(
@@ -489,10 +575,13 @@ class PerformanceSummary:
 
         # convert from list to dict
         stage_metrics = {}
+        denoising_stages = set()
         for item in record.stages:
             if isinstance(item, dict) and "name" in item:
                 val = item.get("execution_time_ms", 0.0)
                 stage_metrics[item["name"]] = val
+                if item.get("is_denoising", item["name"] == "DenoisingStage"):
+                    denoising_stages.add(item["name"])
 
         load_peak_vram_mb = float(
             record.memory_snapshots.get("load_peak", {}).get("peak_reserved_mb", 0.0)
@@ -528,6 +617,7 @@ class PerformanceSummary:
             step_metrics=step_durations,
             sampled_steps=sampled_steps,
             all_denoise_steps=per_step,
+            denoising_stages=denoising_stages,
             load_peak_vram_mb=load_peak_vram_mb,
             runtime_peak_vram_mb=runtime_peak_vram_mb,
             warmup_peak_vram_mb=warmup_peak_vram_mb,
@@ -799,10 +889,70 @@ TURBOWAN_I2V_sampling_params = DiffusionSamplingParams(
     fps=4,
 )
 
+# Wan-Animate-2 inputs; they ship in the same ci-data-diffusion commit as the GT,
+# so the pinned revision must point at a commit that carries them.
+_WAN_2_2_ANIMATE_2_CI_INPUT_BASE = (
+    "https://raw.githubusercontent.com/"
+    f"{SGL_TEST_FILES_CI_DATA_REPO}/{SGL_TEST_FILES_CI_DATA_REVISION}/"
+    "diffusion-ci/inputs/wan_animate_2"
+)
+WAN_2_2_ANIMATE_2_14B_sampling_params = DiffusionSamplingParams(
+    prompt=(
+        "Character appearance description: a smiling young woman with shoulder-length "
+        "dark hair, a mustard-yellow knit sweater, blue jeans and white sneakers. "
+        "Background description: a plain light-gray studio backdrop."
+    ),
+    image_path=f"{_WAN_2_2_ANIMATE_2_CI_INPUT_BASE}/reference_short.jpg",
+    # The model reads `size` as an area budget and emits the 16-aligned canvas fitted to
+    # the reference aspect; 576x1024 (9:16, like the image) maps onto itself.
+    output_size="576x1024",
+    fps=16,
+    output_format="mp4",
+    # 24 driving frames at 16 fps pad to one 29-frame clip (get_padding_len),
+    # so the request denoises a single clip; output length follows the driving video.
+    extras={
+        "video_url": f"{_WAN_2_2_ANIMATE_2_CI_INPUT_BASE}/driving_video_short.mp4",
+        "clip_len": 37,
+        "num_inference_steps": 8,
+        "seed": 42,
+    },
+)
+
 HUNYUAN3D_SHAPE_sampling_params = DiffusionSamplingParams(
     prompt="",
     image_path="https://raw.githubusercontent.com/sgl-project/sgl-test-files/main/diffusion-ci/consistency_gt/1-gpu/hunyuan3d_2_0/hunyuan3d.png",
 )
+
+
+def _with_warmup_quality(extras: Sequence[str], quality: str) -> list[str]:
+    """Return ``extras`` with ``quality`` in ``--warmup-sampling-params``.
+
+    Merges into an existing JSON object and keeps a quality the case set itself.
+    """
+    option = "--warmup-sampling-params"
+
+    def with_quality(raw: str) -> str:
+        params = json.loads(raw)
+        params.setdefault("quality", quality)
+        return json.dumps(params)
+
+    merged: list[str] = []
+    found = False
+    for item in extras:
+        tokens = shlex.split(item)
+        changed = False
+        for index, token in enumerate(tokens):
+            if token.startswith(f"{option}="):
+                tokens[index] = f"{option}={with_quality(token[len(option) + 1 :])}"
+                changed = True
+            elif token == option and index + 1 < len(tokens):
+                tokens[index + 1] = with_quality(tokens[index + 1])
+                changed = True
+        merged.append(shlex.join(tokens) if changed else item)
+        found = found or changed
+    if not found:
+        merged.append(f"{option} {shlex.quote(json.dumps({'quality': quality}))}")
+    return merged
 
 
 def _get_extra_arg_value(extras: Sequence[str], option_name: str) -> str | None:

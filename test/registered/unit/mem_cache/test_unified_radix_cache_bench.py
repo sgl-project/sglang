@@ -1,7 +1,7 @@
 """Large-scale benchmark + fuzz correctness tests for UnifiedRadixCache.
 
 Usage (standalone):
-    bench: python3 test/registered/unit/mem_cache/test_unified_radix_cache_bench.py --bench --num-seqs 5000 --verify --components mamba legacy-mamba swa legacy-swa
+    bench: python3 test/registered/unit/mem_cache/test_unified_radix_cache_bench.py --bench --num-seqs 5000 --verify --components mamba swa
     CI Test: python -m pytest test/registered/unit/mem_cache/test_unified_radix_cache_bench.py -v -s
 """
 
@@ -28,17 +28,17 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     InsertParams,
     MatchPrefixParams,
+    TreeLock,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.mem_cache.unified_cache.components.base import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.mem_cache_utils import finish_req
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=29, stage="base-b", runner_config="1-gpu-small")
@@ -131,7 +131,6 @@ def create_bench_cache(
     max_context_len,
     components,
     page_size=1,
-    tree_cls=None,
     sliding_window_size=_SWA_WINDOW_SIZE,
 ):
     """Create cache.  Returns (tree, allocator, req_to_token_pool, make_req)."""
@@ -225,21 +224,19 @@ def create_bench_cache(
         )
 
     # --- tree ---
-    if tree_cls is None:
-        tree_cls = UnifiedRadixCache
     backend_override = (
         envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override(_TREE_CORE_TEST_BACKEND)
-        if _TREE_CORE_TEST_BACKEND is not None and tree_cls is UnifiedRadixCache
+        if _TREE_CORE_TEST_BACKEND is not None
         else nullcontext()
     )
     with backend_override:
-        tree = tree_cls(
+        tree = UnifiedRadixCache(
             params=CacheInitParams(
                 req_to_token_pool=req_to_token_pool,
                 token_to_kv_pool_allocator=allocator,
                 page_size=page_size,
                 disable=False,
-                tree_components=components if tree_cls is UnifiedRadixCache else None,
+                tree_components=components,
                 sliding_window_size=sliding_window_size if has_swa else None,
             )
         )
@@ -279,7 +276,7 @@ class _Env:
     avg_tokens: int
 
 
-def _make_env(num_seqs, chunk_len, kv_size, components, tree_cls=None, page_size=1):
+def _make_env(num_seqs, chunk_len, kv_size, components, page_size=1):
     """Create sequences + cache, return shared _Env."""
     if components is None:
         components = _DEFAULT_COMPONENTS
@@ -293,7 +290,6 @@ def _make_env(num_seqs, chunk_len, kv_size, components, tree_cls=None, page_size
             max_context_len=max_seq_len + 10,
             components=components,
             page_size=page_size,
-            tree_cls=tree_cls,
         )
     return _Env(
         tree,
@@ -467,11 +463,10 @@ def bench_insert(
     kv_size=500_000,
     components=None,
     verify=False,
-    tree_cls=None,
     page_size=1,
 ):
     """Insert throughput (alloc + evict-fallback + insert)."""
-    env = _make_env(num_seqs, chunk_len, kv_size, components, tree_cls, page_size)
+    env = _make_env(num_seqs, chunk_len, kv_size, components, page_size)
     warmup = min(20, num_seqs // 10)
 
     return bench_api(
@@ -491,11 +486,10 @@ def bench_match_prefix(
     kv_size=500_000,
     components=None,
     verify=False,
-    tree_cls=None,
     page_size=1,
 ):
     """Prefix matching throughput (hit / partial / miss mix)."""
-    env = _make_env(num_seqs, chunk_len, kv_size, components, tree_cls, page_size)
+    env = _make_env(num_seqs, chunk_len, kv_size, components, page_size)
     _populate(env, num_seqs // 2)
 
     rng = random.Random(123)
@@ -515,7 +509,7 @@ def bench_match_prefix(
         k = RadixKey(array("q", q))
         r1 = env.tree.match_prefix(MatchPrefixParams(key=k))
         r2 = env.tree.match_prefix(MatchPrefixParams(key=k))
-        assert len(r1.device_indices) == len(r2.device_indices), "match not idempotent"
+        assert r1.device_prefix_len == r2.device_prefix_len, "match not idempotent"
 
     warmup = min(20, len(queries) // 10)
     return bench_api(
@@ -535,11 +529,10 @@ def bench_evict(
     kv_size=500_000,
     components=None,
     verify=False,
-    tree_cls=None,
     page_size=1,
 ):
     """Eviction throughput — fill pool then repeatedly evict batches."""
-    env = _make_env(num_seqs, chunk_len, kv_size, components, tree_cls, page_size)
+    env = _make_env(num_seqs, chunk_len, kv_size, components, page_size)
     inserted = _fill_no_evict(env)
 
     evict_batch = max(100, kv_size // 200)
@@ -564,11 +557,10 @@ def bench_lock_unlock(
     kv_size=500_000,
     components=None,
     verify=False,
-    tree_cls=None,
     page_size=1,
 ):
     """Lock/unlock throughput — match nodes then cycle lock/unlock."""
-    env = _make_env(num_seqs, chunk_len, kv_size, components, tree_cls, page_size)
+    env = _make_env(num_seqs, chunk_len, kv_size, components, page_size)
     _populate(env, num_seqs // 2)
 
     nodes = []
@@ -602,27 +594,26 @@ def bench_lock_unlock(
     )
 
 
-def bench_cache_finished(
+def bench_release(
     num_seqs=5000,
     chunk_len=256,
     kv_size=500_000,
     components=None,
     verify=False,
-    tree_cls=None,
     page_size=1,
 ):
-    """cache_finished_req throughput — full request lifecycle.
+    """Request release throughput — full request lifecycle.
 
-    Simulates: match_prefix → inc_lock_ref → alloc → fill req_to_token → cache_finished_req.
+    Simulates: match_prefix → lock → alloc → fill req_to_token → checkpoint + free + unlock.
     """
-    env = _make_env(num_seqs, chunk_len, kv_size, components, tree_cls, page_size)
+    env = _make_env(num_seqs, chunk_len, kv_size, components, page_size)
 
     # Pre-build Req objects with token IDs filled into req_to_token
     req_items: list = []
     for seq in env.seqs:
         key = RadixKey(array("q", seq))
         mr = env.tree.match_prefix(MatchPrefixParams(key=key))
-        matched_len = len(mr.device_indices)
+        matched_len = mr.device_prefix_len
         node = mr.last_device_node
         lr = env.tree.inc_lock_ref(node)
 
@@ -635,35 +626,33 @@ def bench_cache_finished(
                     lr.to_dec_params(),
                 )
                 continue
-            kv_indices = torch.cat([mr.device_indices, v])
+            kv_indices = torch.cat(
+                [env.tree.path_device_indices(mr.last_device_node), v]
+            )
         else:
-            kv_indices = mr.device_indices
+            kv_indices = env.tree.path_device_indices(mr.last_device_node)
 
         req = env.make_req()
         req.origin_input_ids = array("q", seq)
         req.output_ids = array("q")
         req.full_untruncated_fill_ids = array("q", seq)
-        req.set_extend_range(
-            len(req.prefix_indices), len(req.full_untruncated_fill_ids)
-        )
+        req.extend_end = len(req.full_untruncated_fill_ids)
         req.last_node = node
         req.kv.cache_protected_len = matched_len
         req.kv.kv_committed_len = len(seq)
         if hasattr(lr, "to_dec_params"):
-            req.lock_receipt = lr.to_dec_params()
+            req.lock = TreeLock(node, lr.to_dec_params())
         env.rtp.req_to_token[req.kv.req_pool_idx, : len(kv_indices)] = kv_indices
         req_items.append(req)
 
     if not req_items:
-        return BenchResult("cache_finished", 0, 0, 0, [])
+        return BenchResult("release", 0, 0, 0, [])
 
     warmup = min(20, len(req_items) // 10)
     return bench_api(
-        "cache_finished",
+        "release",
         lambda: req_items,
-        lambda req: env.tree.cache_finished_req(
-            req, is_insert=True, owned_kv_len=req.kv.kv_committed_len
-        ),
+        lambda req: finish_req(env.tree, req, req.kv.kv_committed_len),
         len(req_items) - warmup,
         env.avg_tokens,
         warmup,
@@ -680,7 +669,7 @@ ALL_BENCHMARKS = {
     "match": bench_match_prefix,
     "evict": bench_evict,
     "lock": bench_lock_unlock,
-    "cache_finished": bench_cache_finished,
+    "release": bench_release,
 }
 
 
@@ -691,7 +680,6 @@ def run_all_benchmarks(
     components=None,
     verify=False,
     benchmarks=None,
-    tree_cls=None,
     page_size=1,
 ):
     if components is None:
@@ -700,12 +688,12 @@ def run_all_benchmarks(
         benchmarks = list(ALL_BENCHMARKS.keys())
 
     server_args = ServerArgs(model_path="dummy", page_size=page_size)
-    # MambaRadixCache reads mamba_cache_chunk_size, whose property otherwise
+    # The mamba component reads mamba_cache_chunk_size, whose property otherwise
     # loads the HF config for self.model_path — impossible for the dummy model.
     server_args._mamba_cache_chunk_size = max(FLA_CHUNK_SIZE, page_size)
     set_global_server_args_for_scheduler(server_args)
 
-    impl_name = (tree_cls or UnifiedRadixCache).__name__
+    impl_name = UnifiedRadixCache.__name__
     results = []
     for name in benchmarks:
         if name not in ALL_BENCHMARKS:
@@ -718,7 +706,6 @@ def run_all_benchmarks(
                 kv_size=kv_size,
                 components=components,
                 verify=verify,
-                tree_cls=tree_cls,
                 page_size=page_size,
             )
         )
@@ -804,8 +791,8 @@ class _BenchSuite:
     def test_bench_lock_unlock(self):
         self._run(bench_lock_unlock)
 
-    def test_bench_cache_finished(self):
-        self._run(bench_cache_finished)
+    def test_bench_release(self):
+        self._run(bench_release)
 
 
 for _cfg in _CI_BENCH_CONFIGS:
@@ -823,12 +810,10 @@ del _cfg, _name
 # CLI
 # ===================================================================
 _TREE_CONFIGS = {
-    "full": ((ComponentType.FULL,), None),
-    "mamba": ((ComponentType.FULL, ComponentType.MAMBA), None),
-    "swa": ((ComponentType.FULL, ComponentType.SWA), None),
-    "all": ((ComponentType.FULL, ComponentType.SWA, ComponentType.MAMBA), None),
-    "legacy-mamba": ((ComponentType.FULL, ComponentType.MAMBA), MambaRadixCache),
-    "legacy-swa": ((ComponentType.FULL, ComponentType.SWA), SWARadixCache),
+    "full": (ComponentType.FULL,),
+    "mamba": (ComponentType.FULL, ComponentType.MAMBA),
+    "swa": (ComponentType.FULL, ComponentType.SWA),
+    "all": (ComponentType.FULL, ComponentType.SWA, ComponentType.MAMBA),
 }
 
 
@@ -841,7 +826,7 @@ def _run_bench_cli():
         "--components",
         nargs="+",
         choices=list(_TREE_CONFIGS.keys()),
-        default=["mamba", "legacy-mamba"],
+        default=["mamba"],
         help="Component configs to benchmark",
     )
     parser.add_argument("--page-size", type=int, default=1)
@@ -852,12 +837,12 @@ def _run_bench_cli():
         "--benchmarks",
         nargs="+",
         default=["all"],
-        help="insert match evict lock cache_finished all",
+        help="insert match evict lock release all",
     )
     args, _ = parser.parse_known_args()
 
     for comp_name in args.components:
-        components, tree_cls = _TREE_CONFIGS[comp_name]
+        components = _TREE_CONFIGS[comp_name]
         run_all_benchmarks(
             num_seqs=args.num_seqs,
             chunk_len=args.chunk_len,
@@ -865,7 +850,6 @@ def _run_bench_cli():
             components=components,
             verify=args.verify,
             benchmarks=args.benchmarks,
-            tree_cls=tree_cls,
             page_size=args.page_size,
         )
 

@@ -21,6 +21,7 @@ import threading
 import time
 from collections.abc import Callable
 from enum import Enum, auto
+from multiprocessing.connection import Connection, wait
 
 import psutil
 import setproctitle
@@ -49,6 +50,7 @@ from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.req_time_stats import DPControllerReqTimeStats
 from sglang.srt.observability.startup_time import aggregate_scheduler_startup_times
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
+from sglang.srt.plugins import load_plugins
 from sglang.srt.runtime_context import (
     get_device,
     get_disagg,
@@ -102,11 +104,11 @@ class LoadBalanceMethod(Enum):
 
 
 class DPBudget:
-    def __init__(self, dp_size: int):
-        self.dp_size = dp_size
-        self.total_requests = [0] * dp_size
-        self.total_tokens = [0] * dp_size
-        self.last_timestamp = [0.0] * dp_size
+    def __init__(self, num_dp_ranks: int):
+        self.num_dp_ranks = num_dp_ranks
+        self.total_requests = [0] * num_dp_ranks
+        self.total_tokens = [0] * num_dp_ranks
+        self.last_timestamp = [0.0] * num_dp_ranks
 
     def update_budget(self, loads):
         """Update budget from shm snapshots, skipping stale reads."""
@@ -125,7 +127,7 @@ class DPBudget:
         elif method == LoadBalanceMethod.TOTAL_TOKENS:
             # Use total_requests as a tie-breaker when total_tokens are equal
             target_rank = min(
-                range(self.dp_size),
+                range(self.num_dp_ranks),
                 key=lambda i: (self.total_tokens[i], self.total_requests[i]),
             )
         else:
@@ -145,6 +147,9 @@ class DataParallelController:
         server_args: ServerArgs,
         port_args: PortArgs,
         run_scheduler_process_func: Callable,
+        prelaunched_schedulers: (
+            dict[tuple[int, int], tuple[int, Connection]] | None
+        ) = None,
     ) -> None:
         # Parse args
         self.server_args = server_args
@@ -153,9 +158,10 @@ class DataParallelController:
             get_parallel().load_balance_method
         )
         self.run_scheduler_process_func = run_scheduler_process_func
+        self.prelaunched_schedulers = prelaunched_schedulers
 
         # Init inter-process communication
-        self.context = zmq.Context(1 + get_parallel().dp_size)
+        self.context = zmq.Context(1 + get_parallel().num_dp_ranks)
         if get_parallel().node_rank == 0:
             self.recv_from_tokenizer = get_zmq_socket(
                 self.context, zmq.PULL, port_args.scheduler_input_ipc_name, False
@@ -175,8 +181,10 @@ class DataParallelController:
             LoadBalanceMethod.TOTAL_TOKENS,
         )
 
-        self.launch_dp_size: int = get_parallel().dp_size
-        self.max_dp_size: int = get_parallel().max_ep_size or get_parallel().dp_size
+        self.launch_dp_size: int = get_parallel().num_dp_ranks
+        self.max_dp_size: int = (
+            get_parallel().max_ep_size or get_parallel().num_dp_ranks
+        )
         assert self.max_dp_size >= self.launch_dp_size, (
             f"--max-ep-size ({self.max_dp_size}) must be >= "
             f"--dp ({self.launch_dp_size})."
@@ -186,7 +194,7 @@ class DataParallelController:
             self.max_dp_size - self.launch_dp_size
         )
 
-        self.dp_budget = DPBudget(get_parallel().dp_size)
+        self.dp_budget = DPBudget(get_parallel().num_dp_ranks)
         self.load_snapshot_reader = create_load_snapshot_reader(
             port_args,
             caller="DataParallelController",
@@ -198,12 +206,13 @@ class DataParallelController:
 
         # Launch data parallel workers
         self.scheduler_procs = []
+        self.local_kv_event_sources = []
         self.workers: list[zmq.Socket | None] = [None] * self.max_dp_size
         self.status: list[bool] = list(self.dp_active)
         self._active_workers: list[int] = list(range(self.launch_dp_size))
         self._active_count_cache: int = self.launch_dp_size
 
-        if get_parallel().enable_dp_attention:
+        if get_parallel().attn_dp_enabled:
             self.launch_dp_attention_schedulers(server_args, port_args)
             # When local control broadcast is enabled, send control messages to
             # every DP group leader (attn_tp_rank=0) so each leader broadcasts
@@ -374,7 +383,7 @@ class DataParallelController:
         threads = []
         sockets = []
         ready_events = []
-        for dp_rank in range(get_parallel().dp_size):
+        for dp_rank in range(get_parallel().num_dp_ranks):
             tmp_port_args = PortArgs.init_new(server_args)
             tmp_port_args.tokenizer_ipc_name = port_args.tokenizer_ipc_name
             tmp_port_args.detokenizer_ipc_name = port_args.detokenizer_ipc_name
@@ -467,7 +476,7 @@ class DataParallelController:
             )
         else:
             # Other nodes: Receive worker ports from node 0
-            return self._receive_ports_as_client(endpoint, get_parallel().node_rank)
+            return self._receive_ports_as_client(endpoint)
 
     def _broadcast_ports_as_server(
         self, endpoint: str, expected_clients: int, worker_ports: list[int]
@@ -522,9 +531,10 @@ class DataParallelController:
             sock_send(rep_socket, wrap_as_pickle(worker_ports))
             logger.debug(f"Sent worker ports to node {client_rank}")
 
-    def _receive_ports_as_client(self, endpoint: str, node_rank: int) -> list[int]:
+    def _receive_ports_as_client(self, endpoint: str) -> list[int]:
         """Receive worker ports from the server node."""
         logger.debug("Connecting to node 0 to receive worker ports")
+        node_rank = get_parallel().node_rank
 
         req_socket = get_zmq_socket(self.context, zmq.REQ, endpoint, False)
         req_socket.setsockopt(zmq.RCVTIMEO, 600 * 1000)  # 10 minute timeout
@@ -567,9 +577,7 @@ class DataParallelController:
             primary_endpoint = NetworkAddress(
                 primary.host, primary.port + DP_ATTENTION_HANDSHAKE_PORT_DELTA
             ).to_tcp()
-            all_ports = self._receive_ports_as_client(
-                primary_endpoint, get_parallel().node_rank
-            )
+            all_ports = self._receive_ports_as_client(primary_endpoint)
             offset = self._joiner_slot_offset(server_args)
             local_tp_span = self._joiner_local_tp_span(server_args)
             broadcasted_ports = all_ports[offset : offset + local_tp_span]
@@ -578,7 +586,7 @@ class DataParallelController:
             bind_count = (
                 self.max_dp_size
                 if get_exec().moe.elastic_ep_backend is not None
-                else get_parallel().dp_size
+                else get_parallel().num_dp_ranks
             )
             for slot in range(bind_count):
                 worker_port, worker_socket = get_zmq_socket_on_host(
@@ -608,7 +616,7 @@ class DataParallelController:
         dp_rank: int | None,
         worker_ports: list[int] | None = None,
     ):
-        if not get_parallel().enable_dp_attention:
+        if not get_parallel().attn_dp_enabled:
             logger.info(f"Launch DP{dp_rank} starting at GPU #{base_gpu_id}.")
 
         memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -636,19 +644,16 @@ class DataParallelController:
                 tp_size_per_node * (get_parallel().node_rank % nnodes_per_tp_group + 1),
             )
 
-        attn_cp_rank = 0
-        moe_dp_rank = 0
         for pp_rank in pp_rank_range:
             for tp_rank in tp_rank_range:
                 rank_port_args = port_args
 
-                if get_parallel().enable_dp_attention:
+                if get_parallel().attn_dp_enabled:
                     # dp attention has different sharding logic
                     _, _, dp_rank, _ = compute_dp_attention_world_info(
-                        get_parallel().enable_dp_attention,
                         tp_rank,
                         get_parallel().tp_size,
-                        get_parallel().dp_size,
+                        get_parallel().attn_dp_size,
                         get_parallel().attn_cp_size,
                     )
                     # compute zmq ports for this dp rank
@@ -672,29 +677,13 @@ class DataParallelController:
                     rank_port_args.nccl_port = port_args.nccl_port
                     rank_port_args.instance_id = port_args.instance_id
 
-                reader, writer = mp.Pipe(duplex=False)
                 gpu_id = (
                     get_device().base_gpu_id
                     + base_gpu_id
                     + ((pp_rank % pp_size_per_node) * tp_size_per_node)
                     + (tp_rank % tp_size_per_node) * get_device().gpu_id_step
                 )
-                attn_dp_size = (
-                    get_parallel().dp_size if get_parallel().enable_dp_attention else 1
-                )
-
-                # Parallelism hierarchy (outermost to innermost):
-                # - Attention: Global(TP) -> DP -> ATTN_CP -> ATTN_TP (innermost)
-                # - MoE: Global(TP) -> MOE_DP -> EP -> MOE_TP (innermost)
-                attn_tp_size = (
-                    get_parallel().tp_size
-                    // attn_dp_size
-                    // get_parallel().attn_cp_size
-                )
-                attn_cp_rank = (tp_rank // attn_tp_size) % get_parallel().attn_cp_size
-                moe_dp_rank = tp_rank // (
-                    get_parallel().tp_size // get_parallel().moe_dp_size
-                )
+                # Derive the child's EP rank for its display label.
                 moe_ep_rank = (
                     tp_rank
                     % (get_parallel().tp_size // get_parallel().moe_dp_size)
@@ -712,36 +701,49 @@ class DataParallelController:
                 display_dp_rank = dp_rank + offset if dp_rank is not None else None
 
                 with self.env_lock, maybe_reindex_device_id(gpu_id) as gpu_id:
-                    proc = mp.Process(
-                        target=self.run_scheduler_process_func,
-                        args=(
-                            server_args,
-                            rank_port_args,
-                            gpu_id,
-                            tp_rank,
-                            attn_cp_rank,
-                            moe_dp_rank,
-                            moe_ep_rank,
-                            pp_rank,
-                            dp_rank,
-                            writer,
-                            display_tp_rank,
-                            display_dp_rank,
-                            display_moe_ep_rank,
-                        ),
+                    scheduler_args = (
+                        server_args,
+                        rank_port_args,
+                        gpu_id,
+                        tp_rank,
+                        pp_rank,
+                        dp_rank,
                     )
-                    with (
-                        memory_saver_adapter.configure_subprocess(),
-                        numa_utils.configure_subprocess(server_args, gpu_id),
-                    ):
-                        proc.start()
-                self.scheduler_procs.append(proc)
+                    display_ranks = (
+                        display_tp_rank,
+                        display_dp_rank,
+                        display_moe_ep_rank,
+                    )
+                    if self.prelaunched_schedulers is not None:
+                        _, reader = self.prelaunched_schedulers[pp_rank, tp_rank]
+                        reader.send((scheduler_args, display_ranks))
+                    else:
+                        reader, writer = mp.Pipe(duplex=False)
+                        proc = mp.Process(
+                            target=self.run_scheduler_process_func,
+                            args=(*scheduler_args, writer, *display_ranks),
+                        )
+                        with (
+                            memory_saver_adapter.configure_subprocess(),
+                            numa_utils.configure_subprocess(server_args, gpu_id),
+                        ):
+                            proc.start()
+                        self.scheduler_procs.append(proc)
                 scheduler_pipe_readers.append(reader)
 
         # Wait for model to finish loading
         scheduler_info = []
         for i in range(len(scheduler_pipe_readers)):
             scheduler_info.append(scheduler_pipe_readers[i].recv())
+
+        # Pure-DP TP groups launch concurrently. Their ready replies contain
+        # only publishers owned by schedulers on this node.
+        with self.env_lock:
+            self.local_kv_event_sources.extend(
+                source
+                for info in scheduler_info
+                for source in info.get("kv_event_sources", [])
+            )
 
         self.max_total_num_tokens = scheduler_info[0]["max_total_num_tokens"]
         self.max_req_input_len = scheduler_info[0]["max_req_input_len"]
@@ -822,17 +824,29 @@ class DataParallelController:
                 self._request_dispatcher(recv_req)
 
 
+def run_scheduler_process_with_init_pipe(run_scheduler_process_func: Callable, pipe):
+    # Unpickling the callable imports the scheduler before waiting for DP setup.
+    kill_itself_when_parent_died()
+    try:
+        scheduler_args, display_ranks = pipe.recv()
+        run_scheduler_process_func(*scheduler_args, pipe, *display_ranks)
+    finally:
+        pipe.close()
+
+
 def run_data_parallel_controller_process(
     server_args: ServerArgs,
     port_args: PortArgs,
     pipe_writer,
     run_scheduler_process_func: Callable = run_scheduler_process,
+    prelaunched_schedulers: dict[tuple[int, int], tuple[int, Connection]] | None = None,
 ):
     setproctitle.setproctitle("sglang::data_parallel_controller")
     faulthandler.enable()
     kill_itself_when_parent_died()
     parent_process = psutil.Process().parent()
 
+    load_plugins()
     # This process reads the config namespaces before spawning schedulers.
     publish(server_args, role="dp_controller")
     configure_logger(server_args)
@@ -851,23 +865,33 @@ def run_data_parallel_controller_process(
 
     try:
         controller = DataParallelController(
-            server_args, port_args, run_scheduler_process_func
+            server_args, port_args, run_scheduler_process_func, prelaunched_schedulers
         )
-        scheduler_pids = [
-            proc.pid for proc in controller.scheduler_procs if proc is not None
-        ]
-        pipe_writer.send(
-            {
-                "status": "ready",
-                "max_total_num_tokens": controller.max_total_num_tokens,
-                "max_req_input_len": controller.max_req_input_len,
-                "startup_time": controller.startup_time,
-                SCHEDULER_PIDS_ARG: scheduler_pids,
-            }
+        scheduler_pids = (
+            [pid for pid, _ in prelaunched_schedulers.values()]
+            if prelaunched_schedulers is not None
+            else [proc.pid for proc in controller.scheduler_procs if proc is not None]
         )
+        init_info = {
+            "status": "ready",
+            "max_total_num_tokens": controller.max_total_num_tokens,
+            "max_req_input_len": controller.max_req_input_len,
+            "startup_time": controller.startup_time,
+            SCHEDULER_PIDS_ARG: scheduler_pids,
+        }
+        if get_serving().grpc_port is not None and not (
+            get_serving().smg_grpc_mode or get_serving().grpc_mode
+        ):
+            init_info["kv_event_sources"] = sorted(
+                controller.local_kv_event_sources, key=lambda source: source["dp_rank"]
+            )
+        pipe_writer.send(init_info)
         # The primary owns routing for the expanded scheduler set.
         if get_parallel().node_rank == 0 and not get_exec().moe.is_ep_scale_joiner:
             controller.event_loop()
+        if prelaunched_schedulers is not None:
+            # The launcher owns these processes. Their pipes close when they exit.
+            wait([pipe for _, pipe in prelaunched_schedulers.values()])
         for proc in controller.scheduler_procs:
             proc.join()
             logger.error(

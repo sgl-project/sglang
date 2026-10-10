@@ -1,14 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
+import argparse
+import json
+import sys
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import numpy as np
 import pytest
 import torch
+from diffusers import FlowMatchEulerDiscreteScheduler as ReferenceFlowMatchScheduler
 from diffusers.image_processor import VaeImageProcessor
 from PIL import Image
 from transformers import BatchFeature
 
+from sglang.multimodal_gen import registry
 from sglang.multimodal_gen.configs.models.dits.qwenimage21 import (
     QwenImage21ArchConfig,
     QwenImage21DitConfig,
@@ -17,11 +23,16 @@ from sglang.multimodal_gen.configs.models.vaes.qwenimage21 import (
     QwenImage21VAEArchConfig,
     QwenImage21VAEConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image21 import (
     QwenImage21PipelineConfig,
 )
 from sglang.multimodal_gen.configs.sample.qwenimage21 import QwenImage21SamplingParams
 from sglang.multimodal_gen.registry import _get_config_info
+from sglang.multimodal_gen.runtime.cache.conditioning import ConditioningCache
+from sglang.multimodal_gen.runtime.entrypoints.openai.image_api import (
+    _resolve_image_output_format,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ResidencyState,
 )
@@ -30,16 +41,25 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_
 )
 from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
 from sglang.multimodal_gen.runtime.models.dits.qwen_image21 import build_layout
+from sglang.multimodal_gen.runtime.models.encoders.base import (
+    EncoderTensorParallelMixin,
+)
 from sglang.multimodal_gen.runtime.models.encoders.qwen3vl_vision import (
     Qwen3VLVisionRotaryEmbedding,
+)
+from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
+    FlowMatchEulerDiscreteScheduler,
 )
 from sglang.multimodal_gen.runtime.models.vaes.autoencoder_kl_qwenimage21 import (
     AutoencoderKLQwenImage21,
     QwenImage21RMS_norm,
+    QwenImage21Upsample,
     _patchify,
     _unpatchify,
 )
+from sglang.multimodal_gen.runtime.pipelines.qwen_image21 import QwenImage21Pipeline
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import DecodingStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.input_validation import (
     InputValidationStage,
 )
@@ -47,7 +67,119 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.q
     QwenImage21EncodingStage,
     QwenImage21InputValidationStage,
     collapse_image_slots,
+    prepare_qwen21_mu,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.timestep_preparation import (
+    TimestepPreparationStage,
+)
+from sglang.multimodal_gen.runtime.platforms.rocm import RocmPlatform
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
+
+
+@pytest.mark.parametrize("steps", [2, 40])
+@pytest.mark.parametrize("preset", [False, True])
+@pytest.mark.parametrize("explicit_sigmas", [None, [1.0, 0.7, 0.3]])
+@pytest.mark.parametrize("dynamic_shifting", [False, True])
+def test_checkpoint_sigma_grid_reaches_request_scheduler(
+    tmp_path, monkeypatch, steps, preset, explicit_sigmas, dynamic_shifting
+):
+    sample_sigmas = [
+        1.0,
+        0.978453,
+        0.95418,
+        0.926626,
+        0.89508,
+        0.845148,
+        0.704534,
+        0.414568,
+    ]
+    model_index = {
+        "_class_name": "QwenImage21Pipeline",
+        "_diffusers_version": "0.41.0.dev0",
+        "scheduler": ["diffusers", "FlowMatchEulerDiscreteScheduler"],
+    }
+    if preset:
+        model_index["sample_sigmas"] = sample_sigmas
+    (tmp_path / "model_index.json").write_text(json.dumps(model_index))
+    (tmp_path / "scheduler").mkdir()
+    config = QwenImage21PipelineConfig()
+    args = SimpleNamespace(
+        pipeline_config=config,
+        model_subfolder=None,
+        revision=None,
+        enable_cfg_parallel=False,
+    )
+    pipeline = object.__new__(QwenImage21Pipeline)
+    pipeline.model_path = str(tmp_path)
+    pipeline.server_args = args
+    loaded_config = pipeline._load_config()
+    assert "sample_sigmas" not in loaded_config
+    assert config.sample_sigmas == (sample_sigmas if preset else None)
+
+    batch = Req(
+        sampling_params=QwenImage21SamplingParams(
+            prompt="a ceramic teapot",
+            height=1024,
+            width=1024,
+            num_inference_steps=steps,
+        ),
+        sigmas=explicit_sigmas,
+    )
+    QwenImage21InputValidationStage().forward(batch, args)
+    batch.extra["qwen21_mu"] = 0.7
+    scheduler_kwargs = dict(
+        use_dynamic_shifting=dynamic_shifting,
+        shift=1.0,
+        shift_terminal=0.02 if dynamic_shifting else None,
+    )
+    scheduler = FlowMatchEulerDiscreteScheduler(**scheduler_kwargs)
+    monkeypatch.setattr(
+        "sglang.multimodal_gen.runtime.pipelines_core.stages.timestep_preparation.get_local_torch_device",
+        lambda: torch.device("cpu"),
+    )
+    TimestepPreparationStage(scheduler, [prepare_qwen21_mu]).forward(batch, args)
+    expected_sigmas = explicit_sigmas
+    if expected_sigmas is None:
+        expected_sigmas = sample_sigmas if preset else np.linspace(1, 1 / steps, steps)
+    # preserve the native scheduler's existing dynamic-shift rounding; Turbo's
+    # unshifted grid must also match the Diffusers scheduler bit for bit
+    scheduler_cls = (
+        FlowMatchEulerDiscreteScheduler
+        if dynamic_shifting
+        else ReferenceFlowMatchScheduler
+    )
+    reference = scheduler_cls(**scheduler_kwargs)
+    reference.set_timesteps(sigmas=expected_sigmas, mu=0.7, device="cpu")
+    torch.testing.assert_close(batch.timesteps, reference.timesteps, atol=0, rtol=0)
+    torch.testing.assert_close(batch.scheduler.sigmas, reference.sigmas, atol=0, rtol=0)
+    assert batch.num_inference_steps == len(expected_sigmas)
+    assert batch.scheduler.num_inference_steps == len(expected_sigmas)
+    assert isinstance(batch.sigmas, list)
+    # request-local schedules must not mutate the checkpoint's preset
+    batch.sigmas[0] = 0.9
+    assert config.sample_sigmas == (sample_sigmas if preset else None)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("layout", ["contiguous", "channels_last", "transposed"])
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_nearest_upsample_preserves_every_finite_low_precision_value(
+    dtype, layout, device
+):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    values = torch.arange(65536, dtype=torch.int32).to(torch.int16).view(dtype)
+    values = values[torch.isfinite(values)].reshape(1, 2, -1, 128).to(device)
+    if layout == "channels_last":
+        values = values.contiguous(memory_format=torch.channels_last)
+    elif layout == "transposed":
+        values = values.transpose(2, 3)
+    upsample = QwenImage21Upsample(scale_factor=2, mode="nearest-exact")
+    expected = torch.nn.functional.interpolate(
+        values.float(), scale_factor=2, mode="nearest-exact"
+    ).to(dtype)
+    actual = upsample(values)
+    assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
 
 
 @pytest.mark.parametrize("prompt", ["edit", ""])
@@ -92,6 +224,78 @@ def test_prompt_conditioning_uses_training_template_and_pre_norm(prompt, image_c
     for image in images:
         assert image.mode == "RGBA"
         assert image.getpixel((0, 0)) == (12, 34, 56, 0)
+
+
+class ConditioningTestEncoder(EncoderTensorParallelMixin, torch.nn.Module):
+    def __init__(self, device):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.ones((), device=device))
+        self.model = SimpleNamespace(
+            visual=SimpleNamespace(rotary_pos_emb=SimpleNamespace())
+        )
+        self.calls = 0
+
+    def forward(self, input_ids, **kwargs):
+        self.calls += 1
+        hidden = input_ids[..., None].float().expand(-1, -1, 4) * self.weight
+        return SimpleNamespace(hidden_states=tuple(hidden + i for i in range(32)))
+
+
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="CUDA required"
+            ),
+        ),
+    ],
+)
+@torch.no_grad()
+def test_prompt_cache_skips_processor_and_weight_preparation(device):
+    def process(text, **kwargs):
+        image_value = sum(kwargs["images"][0].getpixel((0, 0)))
+        return BatchFeature(
+            data={
+                "input_ids": torch.tensor([[1, len(text[0]), 99, 99, image_value, 0]]),
+                "attention_mask": torch.tensor([[1, 1, 1, 1, 1, 0]]),
+            }
+        )
+
+    processor = Mock(side_effect=process)
+    processor.tokenizer.convert_tokens_to_ids.return_value = 99
+    processor.apply_chat_template.return_value = [[1]]
+    encoder = ConditioningTestEncoder(device).eval()
+    stage = QwenImage21EncodingStage(encoder, processor, None, None)
+    stage.use_declared_component = Mock(return_value=nullcontext(encoder))
+    image = Image.new("RGBA", (2, 2), (12, 34, 56, 128))
+    cache = ConditioningCache(1024)
+    with cache.scope():
+        first, slots = stage.encode_prompt("edit", [image], device)
+        expected = first.clone()
+        first.zero_()
+        slots.zero_()
+        restored, slots = stage.encode_prompt("edit", [image.copy()], device)
+        torch.testing.assert_close(restored, expected, atol=0, rtol=0)
+        assert slots.tolist() == [False, True, False]
+        assert encoder.calls == processor.call_count == 1
+        stage.use_declared_component.assert_called_once()
+        assert cache.stats()["entries"] == 1
+        assert cache.bytes == 3 * 4 * 4 + 3
+        assert cache.bypasses == 0  # no oversized duplicate of all hidden states
+        changed, _ = stage.encode_prompt("another edit", [image], device)
+        assert not torch.equal(changed, expected)
+        image.putpixel((0, 0), (12, 34, 56, 255))
+        changed_alpha, _ = stage.encode_prompt("edit", [image], device)
+        assert not torch.equal(changed_alpha, expected)
+        assert encoder.calls == 3
+        with cache.scope(refresh=True):
+            stage.encode_prompt("edit", [image], device)
+        with cache.scope(enabled=False):
+            stage.encode_prompt("edit", [image], device)
+        assert encoder.calls == processor.call_count == 5
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -155,6 +359,75 @@ def test_condition_slots_expand_to_actual_latent_grid():
     torch.testing.assert_close(collapsed[slots][0], hidden[2])
 
 
+class _RecordingBlock(torch.nn.Module):
+    def __init__(self, layer_id):
+        super().__init__()
+        self._layer_id = layer_id
+        self.seen = None
+
+    def forward(self, hidden_states, *args):
+        caches = [cache[self._layer_id] for cache in args[-1]]
+        self.seen = caches[0]
+        return hidden_states
+
+
+class _UnifiedBlocks(torch.nn.Module):
+    def __init__(self, blocks):
+        super().__init__()
+        self.transformer_blocks = torch.nn.ModuleList(blocks)
+
+    def forward(self, hidden_states, *args):
+        x = hidden_states
+        for block in self.transformer_blocks:
+            x = block(x, *args)
+        return x
+
+
+def _run_blocks(blocks, prefix_caches):
+    x = torch.zeros(1)
+    for block in blocks:
+        x = block(x, prefix_caches)
+    return x
+
+
+def test_cache_dit_wrapper_keeps_per_layer_prefix_kv():
+    inner = [_RecordingBlock(0), _RecordingBlock(1), _RecordingBlock(2)]
+    wrapped = torch.nn.ModuleList([_UnifiedBlocks(inner)])
+    prefix_caches = [[{"layer": 0}, {"layer": 1}, {"layer": 2}]]
+
+    _run_blocks(wrapped, prefix_caches)
+    assert [block.seen for block in inner] == prefix_caches[0]
+
+
+def test_plain_blocks_still_get_per_layer_prefix_kv():
+    blocks = torch.nn.ModuleList([_RecordingBlock(0), _RecordingBlock(1)])
+    prefix_caches = [[{"layer": 0}, {"layer": 1}]]
+
+    _run_blocks(blocks, prefix_caches)
+    assert [block.seen for block in blocks] == prefix_caches[0]
+
+
+class _FirstSlotBlock(torch.nn.Module):
+    """Old loop body: take caches[0] and broadcast it to every layer."""
+
+    def __init__(self):
+        super().__init__()
+        self.seen = None
+
+    def forward(self, hidden_states, *args):
+        self.seen = args[-1][0]
+        return hidden_states
+
+
+def test_first_slot_only_caches_are_shared_across_layers():
+    inner = [_FirstSlotBlock(), _FirstSlotBlock()]
+    unified = _UnifiedBlocks(inner)
+    prefix_caches = [[{"layer": 0}, {"layer": 1}]]
+
+    unified(torch.zeros(1), [cache[0] for cache in prefix_caches])
+    assert [block.seen for block in inner] == [prefix_caches[0][0], prefix_caches[0][0]]
+
+
 def test_adjacent_image_slots_stay_distinct():
     layout = build_layout(
         [False, True, True, False], [(1, 2, 2), (1, 4, 2), (1, 2, 2)], (4, 6, 6), "cpu"
@@ -187,6 +460,74 @@ def test_latent_pack_decode_contract():
     )
 
 
+@pytest.mark.parametrize("gfx1151", [False, True])
+@pytest.mark.parametrize("override", [None, False, True])
+def test_vae_tiling_platform_default_and_python_override(
+    monkeypatch, gfx1151, override
+):
+    module = "sglang.multimodal_gen.configs.pipeline_configs.qwen_image21"
+    monkeypatch.setattr(f"{module}.current_platform.is_gfx1151", lambda: gfx1151)
+    kwargs = {} if override is None else {"vae_tiling": override}
+    config = QwenImage21PipelineConfig(**kwargs)
+    assert config.vae_tiling is (gfx1151 if override is None else override)
+    warning = Mock()
+    monkeypatch.setattr(f"{module}.logger.warning", warning)
+    config.validate_server_args(None)
+    assert warning.call_count == int(gfx1151 and not config.vae_tiling)
+
+
+@pytest.mark.parametrize("gfx1151", [False, True])
+@pytest.mark.parametrize("cli_value", [None, False, True])
+@pytest.mark.parametrize("file_value", [None, False, True])
+def test_vae_tiling_cli_overrides_config_file_and_platform_default(
+    monkeypatch, tmp_path, gfx1151, cli_value, file_value
+):
+    module = "sglang.multimodal_gen.configs.pipeline_configs.qwen_image21"
+    monkeypatch.setattr(f"{module}.current_platform.is_gfx1151", lambda: gfx1151)
+    monkeypatch.setattr(
+        registry,
+        "get_model_info",
+        lambda *args, **kwargs: SimpleNamespace(
+            pipeline_config_cls=QwenImage21PipelineConfig
+        ),
+    )
+    argv = []
+    if file_value is not None:
+        path = tmp_path / "pipeline.json"
+        path.write_text(json.dumps({"vae_tiling": file_value}))
+        argv.extend(["--pipeline-config-path", str(path)])
+    if cli_value is not None:
+        argv.extend(["--vae-tiling", str(cli_value).lower()])
+    monkeypatch.setattr(sys, "argv", ["sglang", *argv])
+    parser = PipelineConfig.add_cli_args(argparse.ArgumentParser())
+    args, unknown = parser.parse_known_args(argv)
+    kwargs = ServerArgs.get_provided_args(args, unknown)
+    kwargs["model_path"] = "Qwen/Qwen-Image-2.1"
+    config = PipelineConfig.from_kwargs(kwargs)
+    expected = gfx1151 if file_value is None else file_value
+    assert config.vae_tiling is (expected if cli_value is None else cli_value)
+
+
+def test_vae_tiling_default_without_visible_rocm_device(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    properties = Mock(side_effect=AssertionError("No device should be queried"))
+    monkeypatch.setattr(torch.cuda, "get_device_properties", properties)
+    module = "sglang.multimodal_gen.configs.pipeline_configs.qwen_image21"
+    monkeypatch.setattr(f"{module}.current_platform", RocmPlatform)
+    RocmPlatform.is_gfx1151.cache_clear()
+    try:
+        assert not QwenImage21PipelineConfig().vae_tiling
+        properties.assert_not_called()
+    finally:
+        RocmPlatform.is_gfx1151.cache_clear()
+
+
+def test_default_image_output_format_preserves_rgba():
+    assert QwenImage21SamplingParams.default_image_output_format() == "png"
+    assert _resolve_image_output_format(None, QwenImage21SamplingParams) == "png"
+    assert _resolve_image_output_format("webp", QwenImage21SamplingParams) == "webp"
+
+
 @pytest.mark.parametrize("outputs", [1, 2])
 def test_dynamic_batching_preserves_output_order_and_seeds(outputs):
     scheduler = object.__new__(Scheduler)
@@ -214,7 +555,9 @@ def test_dynamic_batching_preserves_output_order_and_seeds(outputs):
 
 @pytest.mark.parametrize("channels", [3, 4])
 @pytest.mark.parametrize("tiling", [False, True])
-def test_native_vae_roundtrip_shapes_and_checkpoint_names(channels, tiling):
+def test_native_vae_roundtrip_shapes_and_checkpoint_names(
+    monkeypatch, channels, tiling
+):
     ac = QwenImage21VAEArchConfig(
         base_dim=4,
         decoder_base_dim=4,
@@ -224,6 +567,8 @@ def test_native_vae_roundtrip_shapes_and_checkpoint_names(channels, tiling):
         temperal_downsample=(False, False, False, False),
         in_channels=channels,
         out_channels=channels,
+        latents_mean=(0.0,) * 4,
+        latents_std=(1.0,) * 4,
     )
     model = AutoencoderKLQwenImage21(QwenImage21VAEConfig(arch_config=ac)).eval()
     assert not model.use_tiling
@@ -237,6 +582,30 @@ def test_native_vae_roundtrip_shapes_and_checkpoint_names(channels, tiling):
         assert latent.shape == (1, 4, 1, 2, 4)
         output = model.decode(latent)
         assert output.shape == (1, channels, 1, 32, 64)
+        # Exercise the serving decoder on gfx1151 with an explicit tiling choice.
+        monkeypatch.setattr(
+            "sglang.multimodal_gen.configs.pipeline_configs.qwen_image21.current_platform.is_gfx1151",
+            lambda: True,
+        )
+        args = SimpleNamespace(
+            pipeline_config=QwenImage21PipelineConfig(
+                vae_config=QwenImage21VAEConfig(arch_config=ac), vae_tiling=tiling
+            ),
+            disable_autocast=True,
+            enable_torch_compile=False,
+        )
+        monkeypatch.setattr(
+            "sglang.multimodal_gen.runtime.pipelines_core.stages.base.get_global_server_args",
+            lambda: args,
+        )
+        monkeypatch.setattr(
+            "sglang.multimodal_gen.runtime.pipelines_core.stages.decoding.get_local_torch_device",
+            lambda: torch.device("cpu"),
+        )
+        model.use_tiling = False
+        actual = DecodingStage(model).decode(latent, args, vae_dtype=torch.float32)
+        assert model.use_tiling is tiling
+        torch.testing.assert_close(actual, (output / 2 + 0.5).clamp(0, 1))
     assert model.state_dict()["encoder.conv_in.weight"].ndim == 4
     x = torch.randn(2, 3, 1, 8, 12)
     torch.testing.assert_close(_unpatchify(_patchify(x, 2), 2), x)
@@ -307,6 +676,10 @@ def test_architecture_derived_dimensions():
 
 
 def test_registry_routes_local_checkpoint_and_preserves_legacy():
+    assert (
+        _get_config_info("Qwen/Qwen-Image-2.1-Turbo").pipeline_config_cls
+        is QwenImage21PipelineConfig
+    )
     assert (
         _get_config_info("Qwen/Qwen-Image-2.1").pipeline_config_cls
         is QwenImage21PipelineConfig

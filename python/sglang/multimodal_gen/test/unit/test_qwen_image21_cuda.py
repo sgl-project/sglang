@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Request-scoped prefix KV and graph replay regression tests; no checkpoint needed."""
 
+import json
 from copy import deepcopy
 
 import pytest
@@ -16,6 +17,7 @@ from sglang.multimodal_gen.configs.models.dits.qwenimage21 import (
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image21 import (
     QwenImage21PipelineConfig,
 )
+from sglang.multimodal_gen.configs.sample.qwenimage21 import QwenImage21SamplingParams
 from sglang.multimodal_gen.runtime.breakable_cuda_graph.runner import (
     DiffusionBreakableCudaGraphRunner,
 )
@@ -33,6 +35,11 @@ from sglang.multimodal_gen.runtime.pipelines.qwen_image21 import QwenImage21Pipe
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.qwen_image21 import (
+    QwenImage21DenoisingStage,
+)
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import (
     ServerArgs,
     set_global_server_args,
@@ -41,7 +48,10 @@ from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import
     ensure_distributed_env_defaults,
 )
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+pytestmark = pytest.mark.skipif(
+    not (torch.cuda.is_available() and current_platform.is_cuda()),
+    reason="requires NVIDIA CUDA fusions",
+)
 
 
 @pytest.fixture(scope="module")
@@ -187,11 +197,47 @@ def test_bf16_qk_norm_matches_reference(model):
         torch.testing.assert_close(norm(x), reference(x), atol=0, rtol=0)
 
 
+def _save_lora_and_add_delta(reference, path, adapter_format):
+    """Save a rank-2 LoRA in a published checkpoint layout and add its delta to reference."""
+    scale, metadata = 1.0, None
+    if adapter_format == "diffusers_metadata_alpha":
+        # diffusers keeps alpha only in this JSON blob; alpha 4 over rank 2 doubles B @ A.
+        scale = 2.0
+        packed = {"transformer.r": 2, "transformer.lora_alpha": 4}
+        metadata = {"lora_adapter_metadata": json.dumps(packed)}
+    fused = adapter_format == "comfyui_fused_gate_up"
+    prefix = "diffusion_model." if fused else "transformer."
+    weights = {}
+    for name in ("transformer_blocks.0.attn.to_q", "transformer_blocks.0.img_mlp.out"):
+        layer = reference.get_submodule(name)
+        a = torch.randn(2, layer.weight.shape[1], device="cuda") * 0.2
+        b = torch.randn(layer.weight.shape[0], 2, device="cuda") * 0.2
+        weights[f"{prefix}{name}.lora_A.weight"] = a.cpu()
+        weights[f"{prefix}{name}.lora_B.weight"] = b.cpu()
+        layer.weight.add_(scale * (b @ a))
+    if fused:
+        # ComfyUI's native checkpoint fuses the SwiGLU inputs row-wise as [gate; up].
+        mlp = reference.transformer_blocks[1].img_mlp
+        a = torch.randn(2, mlp.gate_layer.weight.shape[1], device="cuda") * 0.2
+        b = torch.randn(2 * mlp.gate_layer.weight.shape[0], 2, device="cuda") * 0.2
+        weights[f"{prefix}transformer_blocks.1.img_mlp.gate_up.lora_A.weight"] = a.cpu()
+        weights[f"{prefix}transformer_blocks.1.img_mlp.gate_up.lora_B.weight"] = b.cpu()
+        gate, up = b.chunk(2, dim=0)
+        mlp.gate_layer.weight.add_(gate @ a)
+        mlp.proj.weight.add_(up @ a)
+    save_file(weights, str(path), metadata=metadata)
+
+
+@pytest.mark.parametrize(
+    "adapter_format",
+    ["diffusers", "diffusers_metadata_alpha", "comfyui_fused_gate_up"],
+)
 @pytest.mark.parametrize("merge_mode", ["dynamic", "merge"])
 @torch.no_grad()
-def test_diffusers_lora_matches_weight_delta_and_restores_base(
-    model, tmp_path, monkeypatch, merge_mode
+def test_published_lora_layouts_match_weight_delta_and_restore_base(
+    model, tmp_path, monkeypatch, merge_mode, adapter_format
 ):
+    """Fused gate_up rows and metadata-only alpha must reach the layers, not be dropped."""
     # Reuse loaded native components, then exercise the real adapter loader.
     monkeypatch.setattr(ComposedPipelineBase, "__init__", lambda self: None)
     pipeline = object.__new__(QwenImage21Pipeline)
@@ -209,16 +255,8 @@ def test_diffusers_lora_matches_weight_delta_and_restores_base(
         loaded.load_state_dict(model.state_dict())
     pipeline.modules = {"transformer": actual_model}
     pipeline.__init__()
-    weights = {}
-    for name in ("transformer_blocks.0.attn.to_q", "transformer_blocks.0.img_mlp.out"):
-        layer = reference.get_submodule(name)
-        a = torch.randn(2, layer.weight.shape[1], device="cuda") * 0.2
-        b = torch.randn(layer.weight.shape[0], 2, device="cuda") * 0.2
-        weights[f"transformer.{name}.lora_A.weight"] = a.cpu()
-        weights[f"transformer.{name}.lora_B.weight"] = b.cpu()
-        layer.weight.add_(b @ a)
     adapter = tmp_path / "adapter.safetensors"
-    save_file(weights, str(adapter))
+    _save_lora_and_add_delta(reference, adapter, adapter_format)
     kwargs = dict(inputs(5, False), prefix_caches=None)
     with set_forward_context(None, None):
         baseline = actual_model(**kwargs)
@@ -261,14 +299,35 @@ def test_cached_prefix_matches_full_recomputation(model, edit):
 def test_graph_replay_uses_new_request_prefix(model, edit, sample_count):
     first = batched_inputs([inputs(5 + i, edit) for i in range(sample_count)])
     second = batched_inputs([inputs(9 + i, edit) for i in range(sample_count)])
+    for kwargs in (first, second):
+        kwargs["encoder_hidden_states_mask"] = torch.ones(
+            kwargs["encoder_hidden_states"].shape[:2], device="cuda", dtype=torch.bool
+        )
+    stage = object.__new__(QwenImage21DenoisingStage)
     runner = DiffusionBreakableCudaGraphRunner(model, torch.device("cuda"))
     try:
-        with torch.no_grad(), set_forward_context(None, None):
+        with (
+            torch.no_grad(),
+            set_forward_context(
+                None,
+                None,
+                Req(sampling_params=QwenImage21SamplingParams(), is_warmup=True),
+            ),
+        ):
             model(**first)
-            assert runner.capture(**first)
+            stage._bcg_run(runner, first, model)
+        assert len(runner.entries) == 1
+        with (
+            torch.no_grad(),
+            set_forward_context(
+                None,
+                None,
+                Req(sampling_params=QwenImage21SamplingParams()),
+            ),
+        ):
             model(**second)
             expected = model(**second)
-            actual = runner(**second)
+            actual = stage._bcg_run(runner, second, model)
         assert len(runner.entries) == 1
         torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
     finally:
@@ -345,3 +404,183 @@ def test_silu_fusion_mismatch_restores_eager(bf16_model, monkeypatch):
         torch.testing.assert_close(mlp(x), expected, atol=0, rtol=0)
         assert gate.disabled and not gate.verified
         torch.testing.assert_close(mlp(x), expected, atol=0, rtol=0)
+
+
+@pytest.fixture
+def bf16_model_hd128(model):
+    # head_dim 128 is what the CUDA Q/K norm + RoPE + KV packing kernel addresses;
+    # the shared fixture's head_dim 32 never reaches it.
+    config = QwenImage21DitConfig(
+        arch_config=QwenImage21ArchConfig(
+            in_channels=4,
+            out_channels=4,
+            num_layers=2,
+            num_attention_heads=2,
+            attention_head_dim=128,
+            context_in_dim=16,
+            mlp_ratio=2,
+            axes_dims_rope=(16, 56, 56),
+        )
+    )
+    torch.manual_seed(7)
+    result = QwenImage21Transformer2DModel(config, {}).cuda().bfloat16().eval()
+    for name, param in result.named_parameters():
+        torch.nn.init.normal_(param, std=0.02)
+        if name.endswith(("norm_q.weight", "norm_k.weight")):
+            torch.nn.init.normal_(param, mean=1.0, std=0.1)
+    result.post_load_weights()
+    return result
+
+
+def inputs_hd128(seed, edit):
+    torch.manual_seed(seed)
+    slots = [False] * 3 + ([True, False, False] if edit else [])
+    shapes = ([(1, 2, 4)] if edit else []) + [(1, 4, 4)]
+    kwargs = dict(
+        hidden_states=torch.randn(1, 16, 4, device="cuda"),
+        encoder_hidden_states=torch.randn(1, len(slots), 16, device="cuda"),
+        condition_latents=torch.randn(1, 8, 4, device="cuda") if edit else None,
+        layouts=[build_layout(slots, shapes, (16, 56, 56), "cuda")],
+        prefix_caches=[[{} for _ in range(2)]],
+        timestep=torch.tensor([700.0], device="cuda"),
+    )
+    for key in (
+        "hidden_states",
+        "encoder_hidden_states",
+        "condition_latents",
+        "timestep",
+    ):
+        if kwargs[key] is not None:
+            kwargs[key] = kwargs[key].bfloat16()
+    return kwargs
+
+
+@pytest.mark.parametrize("edit", [False, True])
+@torch.no_grad()
+def test_cuda_qk_rope_pack_matches_eager_prefill_and_cached_steps(
+    bf16_model_hd128, edit, monkeypatch
+):
+    # The CUDA Q/K norm + RoPE + KV packing path must reproduce the Triton/eager
+    # chain bit for bit on the prefill step, on cached steps and under BCG replay.
+    actual_model = bf16_model_hd128
+    kwargs = inputs_hd128(11, edit)
+    reference_kwargs = deepcopy(kwargs)
+    expected = []
+    disabled = BitExactFusionGate("reference")
+    disabled.disable()
+    with monkeypatch.context() as reference, set_forward_context(None, None):
+        reference.setattr(model_module, "_QK_ROPE_CUDA_FUSION", disabled)
+        reference.setattr(model_module, "_KV_PACK_CUDA_FUSION", disabled)
+        reference.setattr(model_module, "_KV_PROJECT_INTO_FUSION", disabled)
+        reference.setattr(model_module, "_QKV_PACK_FUSION", disabled)
+        for timestep in (700, 300, 10):
+            reference_kwargs["timestep"].fill_(timestep)
+            expected.append(actual_model(**reference_kwargs))
+
+    qk_gate = BitExactFusionGate("test CUDA Q/K norm + RoPE")
+    kv_gate = BitExactFusionGate("test CUDA KV packing")
+    project_gate = BitExactFusionGate("test K/V projection into buffers")
+    qkv_gate = BitExactFusionGate("test packed Q/K/V projection")
+    monkeypatch.setattr(model_module, "_QK_ROPE_CUDA_FUSION", qk_gate)
+    monkeypatch.setattr(model_module, "_KV_PACK_CUDA_FUSION", kv_gate)
+    monkeypatch.setattr(model_module, "_KV_PROJECT_INTO_FUSION", project_gate)
+    monkeypatch.setattr(model_module, "_QKV_PACK_FUSION", qkv_gate)
+    with set_forward_context(None, None):
+        for timestep, output in zip((700, 300, 10), expected, strict=True):
+            kwargs["timestep"].fill_(timestep)
+            torch.testing.assert_close(actual_model(**kwargs), output, atol=0, rtol=0)
+    # The CUDA kernels are exact by construction and must have engaged.
+    for gate in (qk_gate, kv_gate):
+        assert gate.verified and not gate.disabled, gate.name
+    # The packed and the direct-write projections are GEMM re-plumbings whose
+    # first-sight compare depends on cuBLAS picking the same kernel for both
+    # shapes; where it does not, the gate declines and the next tier takes over
+    # (the outputs above are bit-exact either way). When the packed projection
+    # verified, it supersedes the per-layer direct write, which never attempts.
+    assert qkv_gate.verified or qkv_gate.disabled
+    if qkv_gate.verified:
+        assert not project_gate.verified and not project_gate.disabled
+    else:
+        assert project_gate.verified or project_gate.disabled
+    for actual, reference in zip(
+        kwargs["prefix_caches"][0], reference_kwargs["prefix_caches"][0], strict=True
+    ):
+        for key in ("key", "value"):
+            torch.testing.assert_close(actual[key], reference[key], atol=0, rtol=0)
+            assert (
+                actual[key].untyped_storage().nbytes()
+                == actual[key].numel() * actual[key].element_size()
+            )
+
+    runner = DiffusionBreakableCudaGraphRunner(actual_model, torch.device("cuda"))
+    try:
+        with set_forward_context(None, None):
+            assert runner.capture(**kwargs)
+            kwargs["hidden_states"].add_(0.1)
+            expected = actual_model(**kwargs)
+            torch.testing.assert_close(runner(**kwargs), expected, atol=0, rtol=0)
+    finally:
+        runner.reset()
+
+
+@torch.no_grad()
+def test_cuda_kv_pack_mismatch_restores_reference(bf16_model_hd128, monkeypatch):
+    # A kernel that disagrees with the reference must disable itself and leave
+    # the model output on the Triton/eager chain.
+    kwargs = inputs_hd128(12, False)
+    reference_kwargs = deepcopy(kwargs)
+    disabled = BitExactFusionGate("reference")
+    disabled.disable()
+    with monkeypatch.context() as reference, set_forward_context(None, None):
+        reference.setattr(model_module, "_QK_ROPE_CUDA_FUSION", disabled)
+        reference.setattr(model_module, "_KV_PACK_CUDA_FUSION", disabled)
+        reference.setattr(model_module, "_QKV_PACK_FUSION", disabled)
+        expected = bf16_model_hd128(**reference_kwargs)
+
+    kv_gate = BitExactFusionGate("test mismatched KV packing")
+    monkeypatch.setattr(model_module, "_KV_PACK_CUDA_FUSION", kv_gate)
+    monkeypatch.setattr(model_module, "_QK_ROPE_CUDA_FUSION", disabled)
+
+    def corrupt(q, k_out, v_out, *args):
+        v_out.zero_()
+
+    monkeypatch.setattr(model_module, "qknorm_complex_rope_pack_", corrupt)
+    with set_forward_context(None, None):
+        torch.testing.assert_close(bf16_model_hd128(**kwargs), expected, atol=0, rtol=0)
+    assert kv_gate.disabled and not kv_gate.verified
+
+
+@torch.no_grad()
+def test_packed_qkv_weights_share_storage_and_survive_in_place_updates(
+    bf16_model_hd128,
+):
+    # pack_qkv_weights must keep parameter names/values and alias the packed buffer,
+    # so a merge-mode LoRA delta written into to_q.weight is what the packed GEMM sees.
+    attn = bf16_model_hd128.transformer_blocks[0].attn
+    packed = attn.packed_qkv_weight()
+    assert packed is not None
+    rows = attn.to_q.weight.shape[0]
+    assert torch.equal(packed[:rows], attn.to_q.weight)
+    assert torch.equal(packed[rows : 2 * rows], attn.to_k.weight)
+    assert torch.equal(packed[2 * rows :], attn.to_v.weight)
+    keys = set(bf16_model_hd128.state_dict().keys())
+    assert "transformer_blocks.0.attn.to_q.weight" in keys
+    assert not any("qkv_weight" in key for key in keys)
+    before = packed[:rows].clone()
+    attn.to_q.weight.add_(1.0)
+    assert torch.equal(attn.packed_qkv_weight()[:rows], before + 1.0)
+    attn.to_q.weight.sub_(1.0)
+    # An offload round trip must not pin the shared CUDA storage: nothing on the
+    # module keeps a device tensor once the parameters moved, and the shared
+    # views come back with the weights.
+    attn.to("cpu")
+    assert attn.packed_qkv_weight() is None
+    assert not any(
+        isinstance(value, torch.Tensor) and value.is_cuda
+        for value in vars(attn).values()
+    )
+    attn.to("cuda")
+    packed = attn.packed_qkv_weight()
+    assert packed is not None
+    assert torch.equal(packed[:rows], attn.to_q.weight)
+    assert torch.equal(packed[2 * rows :], attn.to_v.weight)
