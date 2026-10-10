@@ -5,6 +5,7 @@ import torch
 
 from sglang.kernels.ops.attention.fla.fused_gdn_gating import fused_gdn_gating
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
+    CAUSAL_CONV1D_FWD_BLOCK_M,
     causal_conv1d_fn,
     causal_conv1d_update,
 )
@@ -21,11 +22,11 @@ from sglang.srt.layers.attention.linear.utils import (
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.memory_pool import MambaPool
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_exec, get_memory, get_schedule
 from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu, is_xpu
-from sglang.srt.utils.common import rank0_log
+from sglang.srt.utils.common import is_pin_memory_available, rank0_log
 
 _is_hip = is_hip()
 
@@ -581,6 +582,42 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 maybe_build_flashinfer_checkpoint_plan(
                     forward_batch, self.forward_metadata, self.device
                 )
+        self._init_prefill_conv_block_table(forward_batch)
+
+    def _init_prefill_conv_block_table(self, forward_batch: ForwardBatch) -> None:
+        metadata = self.forward_metadata
+        metadata.conv_block_table = None
+        if (
+            not is_cuda()
+            or forward_batch.forward_mode not in (ForwardMode.EXTEND, ForwardMode.MIXED)
+            or self.mis_metadata is not None
+            or forward_batch.tbo_parent_token_range is not None
+        ):
+            return
+        seq_lens = forward_batch.extend_seq_lens_cpu
+        if seq_lens is None or len(seq_lens) != metadata.query_start_loc.numel() - 1:
+            return
+        block_counts = [
+            (length + CAUSAL_CONV1D_FWD_BLOCK_M - 1) // CAUSAL_CONV1D_FWD_BLOCK_M
+            for length in seq_lens
+        ]
+        # Amortize table construction only when most of the rectangular grid
+        # would be empty. Mildly ragged batches see little kernel benefit.
+        if not block_counts or len(block_counts) * max(block_counts) <= 4 * sum(
+            block_counts
+        ):
+            return
+
+        # Build once per forward for all GDN layers. A rectangular launch on a
+        # mixed batch otherwise schedules every decode row for the longest prefill.
+        pairs = [
+            (seq, block)
+            for seq, count in enumerate(block_counts)
+            for block in range(count)
+        ]
+        metadata.conv_block_table = torch.tensor(
+            pairs, dtype=torch.int32, device="cpu", pin_memory=is_pin_memory_available()
+        ).to(self.device, non_blocking=True)
 
     def _init_target_verify_qkv_routing(self, forward_batch: ForwardBatch) -> None:
         # CUDA-graph metadata leaves mode and draft count at their defaults.
@@ -886,6 +923,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
         conv_states: torch.Tensor,
         cache_indices: torch.Tensor,
     ) -> torch.Tensor:
+        block_table = self.forward_metadata.conv_block_table
+        conv_kwargs = {"block_table": block_table} if block_table is not None else {}
         return causal_conv1d_fn(
             mixed_qkv.transpose(0, 1),
             layer.conv_weights,
@@ -896,6 +935,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             cache_indices=cache_indices,
             query_start_loc=self.forward_metadata.query_start_loc,
             seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            **conv_kwargs,
         ).transpose(0, 1)[: mixed_qkv.shape[0]]
 
     @staticmethod
