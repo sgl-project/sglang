@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Callable
+from typing import Callable, Optional
 
 import torch
 
@@ -63,7 +63,7 @@ def fake_apply_fp4_marlin_linear(
     input: torch.Tensor,
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
-    weight_global_scale: torch.Tensor,
+    weight_global_scale: torch.Tensor | None,
     workspace: torch.Tensor,
     size_n: int,
     size_k: int,
@@ -80,7 +80,7 @@ def apply_fp4_marlin_linear(
     input: torch.Tensor,
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
-    weight_global_scale: torch.Tensor,
+    weight_global_scale: torch.Tensor | None,
     workspace: torch.Tensor,
     size_n: int,
     size_k: int,
@@ -88,7 +88,7 @@ def apply_fp4_marlin_linear(
     use_fp32_reduce: bool = USE_FP32_REDUCE_DEFAULT,
 ) -> torch.Tensor:
     if input.dtype not in (torch.float16, torch.bfloat16):
-        raise RuntimeError("NVFP4 Marlin requires FP16 or BF16 activations.")
+        raise RuntimeError("FP4 Marlin requires FP16 or BF16 activations.")
 
     reshaped_x = input.reshape(-1, input.shape[-1])
     out_shape = input.shape[:-1] + (size_n,)
@@ -205,6 +205,83 @@ def prepare_nvfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
     layer.weight_global_scale = torch.nn.Parameter(
         weight_global_scale, requires_grad=False
     )
+
+    if hasattr(layer, "bias") and layer.bias is not None:
+        assert layer.bias.shape == (part_size_n,)
+        bias = torch.nn.functional.pad(layer.bias, (0, padded_size_n - part_size_n))
+        bias = marlin_permute_bias(bias)
+        layer.bias = torch.nn.Parameter(bias, requires_grad=False)
+
+
+def prepare_mxfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
+    group_size = 32
+    if getattr(layer, "quant_config", None) is not None:
+        configured = layer.quant_config.group_size
+        if configured != group_size:
+            raise ValueError(
+                f"MXFP4 Marlin requires group_size={group_size}, got {configured}."
+            )
+
+    part_size_n = layer.output_size_per_partition
+    part_size_k = layer.input_size_per_partition
+    param_dtype = getattr(layer, "params_dtype", getattr(layer, "orig_dtype", None))
+    # The E8M0 scale decoder is only instantiated for bf16; see marlin/dequant.h.
+    if param_dtype != torch.bfloat16:
+        raise RuntimeError("MXFP4 Marlin requires BF16 activation dtype.")
+
+    assert layer.weight.shape == (part_size_n, part_size_k // 2)
+
+    # Marlin accepts either N%64/K%128 or N%128/K%64. Select the smaller
+    # padded shape, matching vLLM's marlin_padded_nk helper.
+    padded_size_n, padded_size_k = min(
+        (
+            ((part_size_n + 63) // 64 * 64, (part_size_k + 127) // 128 * 128),
+            ((part_size_n + 127) // 128 * 128, (part_size_k + 63) // 64 * 64),
+        ),
+        key=lambda nk: (nk[0] * nk[1], nk[0] + nk[1]),
+    )
+
+    if (padded_size_n, padded_size_k) != (part_size_n, part_size_k):
+        pad_rows = padded_size_n - part_size_n
+        pad_cols = (padded_size_k - part_size_k) // 2
+        scale_pad_cols = (padded_size_k - part_size_k) // group_size
+        layer.weight = torch.nn.Parameter(
+            torch.nn.functional.pad(layer.weight, (0, pad_cols, 0, pad_rows)),
+            requires_grad=False,
+        )
+        layer.weight_scale = torch.nn.Parameter(
+            torch.nn.functional.pad(
+                layer.weight_scale, (0, scale_pad_cols, 0, pad_rows)
+            ),
+            requires_grad=False,
+        )
+
+    device = layer.weight.device
+    layer.workspace = marlin_make_workspace(device)
+
+    perm = torch.empty(0, dtype=torch.int, device=device)
+    qweight = layer.weight.view(torch.int32).T.contiguous()
+    marlin_qweight = gptq_marlin_repack(
+        b_q_weight=qweight,
+        perm=perm,
+        size_k=padded_size_k,
+        size_n=padded_size_n,
+        num_bits=4,
+    )
+    layer.weight = torch.nn.Parameter(marlin_qweight, requires_grad=False)
+
+    # Scales are raw E8M0 exponent bytes: reinterpret rather than convert, then
+    # permute and repack in the same order as prepare_moe_mxfp4_layer_for_marlin.
+    weight_scale = _normalize_scale_tensor(layer.weight_scale, param_dtype)
+    weight_scale = weight_scale.T.contiguous()
+    weight_scale = marlin_permute_scales(
+        s=weight_scale,
+        size_k=padded_size_k,
+        size_n=padded_size_n,
+        group_size=group_size,
+    )
+    weight_scale = mxfp4_marlin_process_scales(weight_scale, input_dtype=param_dtype)
+    layer.weight_scale = torch.nn.Parameter(weight_scale, requires_grad=False)
 
     if hasattr(layer, "bias") and layer.bias is not None:
         assert layer.bias.shape == (part_size_n,)
@@ -465,11 +542,16 @@ def prepare_moe_mxfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
             delattr(layer, stale)
 
 
-def prepare_moe_nvfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
-    if layer.quant_config.group_size != 16:
-        raise ValueError(
-            f"NVFP4 Marlin MoE requires group_size=16, got {layer.quant_config.group_size}."
-        )
+def prepare_moe_nvfp4_layer_for_marlin(
+    layer: torch.nn.Module, group_size: Optional[int] = None
+) -> None:
+    # compressed-tensors carries the group size on the per-layer scheme rather
+    # than on layer.quant_config (which the MoE weight loader owns), so callers
+    # outside ModelOpt pass it in.
+    if group_size is None:
+        group_size = layer.quant_config.group_size
+    if group_size != 16:
+        raise ValueError(f"NVFP4 Marlin MoE requires group_size=16, got {group_size}.")
 
     w13 = layer.w13_weight.data
     w2 = layer.w2_weight.data
