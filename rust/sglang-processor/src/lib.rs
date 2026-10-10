@@ -11,12 +11,16 @@ mod model_files;
 pub mod openai;
 #[cfg(feature = "parser")]
 mod parser;
+#[cfg(any(feature = "parser", feature = "openai"))]
+mod py;
 #[cfg(feature = "render")]
 mod render;
 #[cfg(any(feature = "parser", feature = "openai"))]
 mod think;
 #[cfg(feature = "tokenizer")]
 mod tokenizer;
+#[cfg(any(feature = "parser", feature = "openai"))]
+mod tool_call;
 
 pub use error::ProcessorError;
 pub use model_files::{resolve_model_file, resolve_tokenizer_file};
@@ -24,7 +28,7 @@ pub use model_files::{resolve_model_file, resolve_tokenizer_file};
 pub use parser::{
     ChatEvent, ChatFinishReason, ChatResponseProcessor, ChatToolCallDelta, DecodedChatEvent,
     ReasoningStreamSplitter, ToolConstraint, chat_tool_definitions, dynamo_tool_choice,
-    dynamo_tool_parser_name, split_reasoning, tool_constraint,
+    dynamo_tool_parser_name, parse_tool_calls, split_reasoning, tool_call_stream, tool_constraint,
 };
 #[cfg(feature = "render")]
 pub use render::{
