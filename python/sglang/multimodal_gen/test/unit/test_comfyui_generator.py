@@ -33,6 +33,7 @@ def test_ensure_rebuilds_when_another_model_owns_the_worker() -> None:
     stale = object()
     fresh = object()
     loads = []
+    sampler_runs = []
     executor = SimpleNamespace(
         generator=stale,
         _sgld_reload={
@@ -41,6 +42,7 @@ def test_ensure_rebuilds_when_another_model_owns_the_worker() -> None:
             "sgld_options": {},
         },
         _lora_input=None,
+        begin_sampler_run=lambda: sampler_runs.append(True),
     )
 
     def fake_load(**kwargs):
@@ -52,6 +54,7 @@ def test_ensure_rebuilds_when_another_model_owns_the_worker() -> None:
     runtime.ensure_executor(executor)
     assert loads == [executor._sgld_reload]
     assert executor.generator is fresh
+    assert sampler_runs == [True]
 
 
 def test_ensure_is_noop_when_executor_still_owns_live_worker() -> None:
