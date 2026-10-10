@@ -85,6 +85,12 @@ class AttentionBackend(ABC):
     # allow-list enforces.
     kv_index_translator = None
 
+    def get_fused_kv_write_buffers(
+        self, layer: RadixAttention, forward_batch: ForwardBatch
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        """Return token-major K/V buffers and physical slots for a fused writer."""
+        return None
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Eager entry point. Default = ``_out_graph(fb) + _in_graph(fb)``.
 

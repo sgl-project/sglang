@@ -62,6 +62,7 @@ from sglang.srt.layers.moe.utils import is_deepep_class_backend
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -730,6 +731,26 @@ class MiMoV2Attention(nn.Module):
         output, _ = self.o_proj(attn_output)
         return output
 
+    def _forward_rope_store(self, qkv, positions, forward_batch):
+        from sglang.srt.model_executor.forward_context import get_attn_backend
+
+        query = self.rotary_emb.try_bf16_rope_store(
+            qkv,
+            positions,
+            get_attn_backend().get_fused_kv_write_buffers(self.attn, forward_batch),
+            value_scale=1.0 if self.v_scale is None else self.v_scale,
+        )
+        if query is None:
+            return None
+        return self.attn(
+            query,
+            None,
+            None,
+            forward_batch,
+            save_kv_cache=False,
+            sinks=self.attention_sink_bias,
+        )
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -737,6 +758,15 @@ class MiMoV2Attention(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
+        if (
+            forward_batch.forward_mode.is_target_verify()
+            and qkv.shape[0] > 0
+            and isinstance(self.rotary_emb, RotaryEmbedding)
+            and not torch.compiler.is_compiling()
+        ):
+            fused = self._forward_rope_store(qkv, positions, forward_batch)
+            if fused is not None:
+                return self.o_proj(fused)[0]
         q, k, v = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
 
         # [t, h, dr]
