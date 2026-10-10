@@ -381,6 +381,8 @@ class Envs:
     # ===================================================================
     SGLANG_IS_IN_CI = EnvBool(False)
     SGLANG_IS_IN_CI_AMD = EnvBool(False)
+    # Read only by scripts/ci/cuda/ci_install_dependency.sh, which documents it.
+    SGLANG_TEST_CI_PYTHON = EnvStr(None)
     # Set to true by the check-changes CI job when a PR touches no Rust workspace
     # inputs; default false so local and scheduled runs never skip the cargo tests.
     SGLANG_SKIP_RUST_TESTS = EnvBool(False)

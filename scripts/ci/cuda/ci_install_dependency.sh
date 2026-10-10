@@ -68,8 +68,8 @@ configure_environment() {
 
     SYS_PYTHON_VER=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
     # Set to empty to install into the system Python, which must then be >= 3.11.
-    CI_PYTHON_VER="${SGLANG_CI_PYTHON-3.12}"
-    echo "SGLANG_CI_PYTHON=${CI_PYTHON_VER} (system python ${SYS_PYTHON_VER})"
+    CI_PYTHON_VER="${SGLANG_TEST_CI_PYTHON-3.12}"
+    echo "SGLANG_TEST_CI_PYTHON=${CI_PYTHON_VER} (system python ${SYS_PYTHON_VER})"
 
     UV_VENV=""
     UV_VENV_COMPLETE_MARKER=""
