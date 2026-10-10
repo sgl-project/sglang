@@ -15,6 +15,7 @@ from sglang.srt.mem_cache.memory_pool import (
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_bool_env_var
+from sglang.srt.utils.async_probe import maybe_detect_oob
 from sglang.srt.utils.common import is_npu
 
 if TYPE_CHECKING:
@@ -703,6 +704,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 )
             self.index_k_buffer = None
             if self.index_head_dim is not None:
+                # index_size, not self.size: the indexer is replicated.
                 self.index_k_buffer = torch.zeros(
                     (
                         self.num_indexer_layers,
@@ -983,6 +985,15 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         loc: torch.Tensor,
         index_k: torch.Tensor,
     ):
+        # The indexer writes at the raw, untranslated loc.
+        maybe_detect_oob(
+            loc,
+            0,
+            # Widened pages start at 1, so the top is one widened page past index_size.
+            self.index_size + self.index_page_size * self.index_page_padding,
+            "set_index_k_buffer (NPU MLA, raw virtual loc)",
+        )
+
         if index_k.dtype != self.dtype:
             index_k = index_k.to(self.dtype)
 
