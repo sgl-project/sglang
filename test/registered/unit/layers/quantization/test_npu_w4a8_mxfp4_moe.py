@@ -1,9 +1,11 @@
 """CPU regression tests for W4A8 MXFP4 MoE support on Ascend NPU."""
 
 import unittest
+from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.srt.hardware_backend.npu.quantization import moe_methods
 from sglang.srt.hardware_backend.npu.quantization.online_moe_methods import (
     NPUW4A8MXFP4OnlineMoEMethod,
 )
@@ -26,6 +28,65 @@ class TestNPUW4A8MXFP4MoE(CustomTestCase):
         self.assertTrue(
             issubclass(NPUW4A8MXFP4OnlineMoEMethod, UnquantizedFusedMoEMethod)
         )
+
+    def test_online_and_offline_weights_share_gmm_layout(self):
+        packed = (
+            torch.arange(2 * 96 * 64, dtype=torch.int32)
+            .to(torch.uint8)
+            .reshape(2, 96, 64)
+        )
+        scales = (
+            torch.arange(2 * 96 * 4, dtype=torch.int32)
+            .to(torch.uint8)
+            .reshape(2, 96, 4)
+        )
+        method = moe_methods.NPUW4A8MXFP4MoEMethod()
+        for online in (False, True):
+            with self.subTest(online=online):
+                layer = torch.nn.Module()
+                layer.dispatcher = Mock()
+                layer.w13_weight = torch.nn.Parameter(
+                    torch.zeros(2, 96, 128, dtype=torch.bfloat16)
+                    if online
+                    else packed.clone(),
+                    requires_grad=False,
+                )
+                if not online:
+                    layer.w13_weight_scale = torch.nn.Parameter(
+                        scales.clone(), requires_grad=False
+                    )
+                with (
+                    patch.object(
+                        moe_methods,
+                        "_get_float4_e2m1fn_x2_dtype",
+                        return_value=torch.uint8,
+                    ),
+                    patch.object(
+                        moe_methods,
+                        "npu_format_cast",
+                        side_effect=lambda weight, **_: weight,
+                    ),
+                    patch.object(
+                        method,
+                        "_quantize_weight_online",
+                        return_value=(packed.clone(), scales.reshape(2, 96, 2, 2)),
+                    ) as quantize,
+                ):
+                    method.process_weights_after_loading(layer, "w13")
+                self.assertEqual(quantize.call_count, int(online))
+                self.assertTrue(torch.equal(layer.w13_weight, packed.transpose(1, 2)))
+                self.assertTrue(
+                    torch.equal(
+                        layer.w13_weight_scale,
+                        scales.reshape(2, 96, 2, 2).transpose(1, 2),
+                    )
+                )
+                layer.dispatcher.set_quant_config.assert_called_once_with(
+                    {
+                        "normal_dispatcher_output_dtype": "bf16",
+                        "low_latency_dispatcher_output_dtype": "mxfp8",
+                    }
+                )
 
     def test_config_resolves_standard_qwen_moe_projections(self):
         prefix = "model.layers.0.mlp.experts"

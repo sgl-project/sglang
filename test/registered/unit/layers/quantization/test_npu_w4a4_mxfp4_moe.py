@@ -1,6 +1,8 @@
 """CPU regression tests for W4A4 MXFP4 MoE support on Ascend NPU."""
 
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -11,6 +13,7 @@ from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
 from sglang.srt.hardware_backend.npu.quantization.online_moe_methods import (
     NPUW4A4MXFP4OnlineMoEMethod,
 )
+from sglang.srt.layers.moe.moe_runner import ascend as ascend_runner
 from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
 from sglang.srt.layers.quantization.modelslim.schemes import ModelSlimW4A4MXFP4MoE
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
@@ -52,6 +55,25 @@ class TestNPUW4A4MXFP4MoE(CustomTestCase):
 
         self.assertTrue(callable(kernel.apply_fused_gmm1_swiglu))
         self.assertIsInstance(kernel.fused_gmm1, GroupedMatmulSwigluQuant)
+
+    def test_fused_gmm1_respects_dispatch_and_clamp_contract(self):
+        kernel = NPUW4A4MXFP4MoEMethod()
+        for deepep in (False, True):
+            with (
+                self.subTest(deepep=deepep),
+                patch.object(ascend_runner, "get_moe_a2a_backend") as backend,
+            ):
+                backend.return_value.is_deepep.return_value = deepep
+                self.assertEqual(
+                    ascend_runner._uses_fused_gmm1(
+                        kernel, SimpleNamespace(swiglu_limit=None)
+                    ),
+                    not deepep,
+                )
+                with self.assertRaisesRegex(NotImplementedError, "swiglu_limit"):
+                    ascend_runner._uses_fused_gmm1(
+                        kernel, SimpleNamespace(swiglu_limit=7.0)
+                    )
 
     def test_config_resolves_w4a4_mxfp4_moe_scheme(self):
         prefix = "model.layers.0.mlp.experts"
