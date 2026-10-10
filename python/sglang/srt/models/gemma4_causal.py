@@ -33,6 +33,7 @@ from sglang.kernels.ops.moe.gemma4_routing import (
     gemma4_fused_routing,
     gemma_routing_post_topk,
 )
+from sglang.srt.distributed.utils import get_group_rank_size
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.layer_boundary import (
     SumGroup,
@@ -48,6 +49,7 @@ from sglang.srt.layers.linear import (
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
+    _resolve_linear_group,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
@@ -57,7 +59,10 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
-from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+from sglang.srt.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
@@ -1131,6 +1136,7 @@ class Gemma4ForCausalLM(PreTrainedModel):
         self.pp_group = get_parallel().pp_group
         self.config = config
         self.quant_config = quant_config
+        self._shared_vocab_tp_group = _resolve_linear_group("tp")
 
         self.model = Gemma4TextModel(
             config=config, quant_config=quant_config, prefix=add_prefix("model", prefix)
@@ -1425,24 +1431,26 @@ class Gemma4ForCausalLM(PreTrainedModel):
                     logger.log(level, "%s: %s", msg, names)
         return loaded_params
 
-    def _shard_weight(self, weight: torch.Tensor) -> torch.Tensor:
-        """Shard a full embedding/lm_head weight along vocab dim for the current TP rank.
-
-        Gemma4 uses nn.Embedding (unsharded) but the Eagle3 draft model uses
-        VocabParallelEmbedding (sharded). This method extracts the correct
-        shard so the weights can be shared.
-        """
-        tp_size = get_parallel().tp_size
+    def _shard_weight(
+        self, weight: torch.Tensor, *, draft_embedding=None
+    ) -> torch.Tensor:
+        group = self._shared_vocab_tp_group
+        if draft_embedding is not None:
+            group = (
+                draft_embedding.tp_group
+                if isinstance(draft_embedding, VocabParallelEmbedding)
+                else None
+            )
+        tp_rank, tp_size = get_group_rank_size(group)
         if tp_size <= 1:
             return weight
-        tp_rank = get_parallel().tp_rank
         shard_size = (weight.shape[0] + tp_size - 1) // tp_size
         return weight[tp_rank * shard_size : (tp_rank + 1) * shard_size]
 
     def get_embed(self):
         return self._shard_weight(self.model.embed_tokens.weight)
 
-    def get_embed_and_head(self):
+    def get_embed_and_head(self, *, draft_embedding=None):
         if self.pp_group.world_size > 1:
             # Under PP, embed_tokens lives on the first rank and lm_head on
             # the last; neither rank holds both tensors, so we can't return
@@ -1456,9 +1464,14 @@ class Gemma4ForCausalLM(PreTrainedModel):
                 "PP rank and lm_head on the last; use --pp-size 1 if you "
                 "need this API."
             )
-        embed = self._shard_weight(self.model.embed_tokens.weight)
-        head = self._shard_weight(self.lm_head.weight)
+        embed = self._shard_weight(
+            self.model.embed_tokens.weight, draft_embedding=draft_embedding
+        )
+        head = self._shard_weight(self.lm_head.weight, draft_embedding=draft_embedding)
         return embed, head
+
+    def get_embed_and_head_for_draft(self, draft_embedding):
+        return self.get_embed_and_head(draft_embedding=draft_embedding)
 
     def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
         if layer_ids is None:

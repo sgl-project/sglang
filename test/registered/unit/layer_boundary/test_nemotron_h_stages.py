@@ -66,12 +66,14 @@ def stages(pattern, *, dp=1, tp=1, a2a=False):
 
     parallel = SimpleNamespace(
         attn_dp_size=dp,
+        attn_dp_enabled=dp > 1,
         attn_tp_size=tp,
         attn_cp_size=1,
         tp_size=dp * tp,
         moe_dp_size=1,
         moe_dense_tp_size=None,
         enable_attn_tp_input_scattered=False,
+        disable_attn_tp_gather=False,
         enable_prefill_cp=False,
     )
     with (

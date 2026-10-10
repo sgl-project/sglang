@@ -72,6 +72,10 @@ def _tree_core(**params_overrides) -> RustUnifiedTreeCore:
     return RustUnifiedTreeCore(CacheInitParams(**params))
 
 
+def _path_indices(core: RustUnifiedTreeCore, node_id) -> torch.Tensor:
+    return core.collect_full_device_indices(node_id, core.root_node_handle(None))
+
+
 def _key(token_ids: list[int]) -> RadixKey:
     return RadixKey(array("q", token_ids))
 
@@ -128,7 +132,7 @@ def _accumulate_step(result, tracker, device_frees, host_frees):
 def test_match_on_the_empty_tree_returns_no_indices():
     core = _tree_core()
     result = core.match_prefix(MatchPrefixParams(key=_key([1, 2, 3])))
-    assert result.device_indices.numel() == 0
+    assert result.device_prefix_len == 0
 
 
 @pytest.mark.parametrize("instance_backend", [None, "rust"])
@@ -153,7 +157,7 @@ def test_default_backend_constructs_real_rust_cpu_cache(monkeypatch, instance_ba
     assert isinstance(cache.tree_core, RustUnifiedTreeCore)
     cache.insert(InsertParams(key=_key([1, 2, 3]), value=torch.tensor([11, 12, 13])))
     matched = cache.match_prefix(MatchPrefixParams(key=_key([1, 2, 3])))
-    assert matched.device_indices.tolist() == [11, 12, 13]
+    assert cache.path_device_indices(matched.last_device_node).tolist() == [11, 12, 13]
     cache.tree_core.sanity_check([], [])
 
 
@@ -164,7 +168,7 @@ def test_insert_then_match_back_returns_the_exact_indices():
     assert result.cache_actions == []
     matched = core.match_prefix(MatchPrefixParams(key=_key([1, 2, 3])))
     assert result.last_device_node == matched.last_device_node
-    assert matched.device_indices.tolist() == [10, 11, 12]
+    assert _path_indices(core, matched.last_device_node).tolist() == [10, 11, 12]
 
 
 def test_root_node_handle_is_namespace_independent():
@@ -708,7 +712,7 @@ def test_stale_match_finalizer_handles_raise_key_error_without_poisoning_the_cor
     core.reset()
     live_root = core.root_node_handle()
     result = MatchResult(
-        device_indices=torch.empty(0, dtype=torch.int64),
+        device_prefix_len=0,
         last_device_node=live_root,
         last_host_node=live_root,
         best_match_node=live_root,
@@ -945,7 +949,13 @@ def test_extension_insert_frees_the_duplicate_overlap():
     assert isinstance(action, FreeDeviceKV)
     assert torch.cat(action.indices).tolist() == [20, 21, 22]
     matched = core.match_prefix(MatchPrefixParams(key=_key([1, 2, 3, 4, 5])))
-    assert matched.device_indices.tolist() == [10, 11, 12, 13, 14]
+    assert _path_indices(core, matched.last_device_node).tolist() == [
+        10,
+        11,
+        12,
+        13,
+        14,
+    ]
 
 
 def test_lock_and_unlock_move_tokens_between_protected_and_evictable():
@@ -1094,7 +1104,9 @@ def test_binding_stays_usable_after_a_failed_insert():
     )
     assert result.prefix_len == 0
     matched = binding.match_prefix(mem_cache.MatchParamsBinding(array("q", [1, 2, 3])))
-    assert matched.device_indices.tolist() == [10, 11, 12]
+    assert binding.collect_full_device_indices(
+        matched.last_device_node_id, binding.root_node_handle(None)
+    ).tolist() == [10, 11, 12]
 
 
 @pytest.mark.parametrize("prior_hash", ["abcd", "z" * 64])
@@ -1152,13 +1164,13 @@ def test_extra_key_isolates_namespaces():
     salted = core.match_prefix(
         MatchPrefixParams(key=RadixKey(array("q", [1, 2, 3]), extra_key="salt"))
     )
-    assert salted.device_indices.tolist() == [10, 11, 12]
+    assert _path_indices(core, salted.last_device_node).tolist() == [10, 11, 12]
     unsalted = core.match_prefix(MatchPrefixParams(key=_key([1, 2, 3])))
-    assert unsalted.device_indices.numel() == 0
+    assert unsalted.device_prefix_len == 0
     other = core.match_prefix(
         MatchPrefixParams(key=RadixKey(array("q", [1, 2, 3]), extra_key="other"))
     )
-    assert other.device_indices.numel() == 0
+    assert other.device_prefix_len == 0
     assert core.prefetch_anchor_info(salted.best_match_node) == ("salt", None)
     assert core.prefetch_anchor_info(core.root_node_handle()) == (None, None)
 
@@ -1177,20 +1189,23 @@ def test_cache_salt_is_supported_by_all_key_entry_points():
         InsertParams(key=second_key, value=torch.tensor([20, 21], dtype=torch.int64)),
     )
 
-    assert core.match_prefix(
-        MatchPrefixParams(key=first_key)
-    ).device_indices.tolist() == [
+    assert _path_indices(
+        core, core.match_prefix(MatchPrefixParams(key=first_key)).last_device_node
+    ).tolist() == [
         10,
         11,
     ]
-    assert core.match_prefix(
-        MatchPrefixParams(key=second_key)
-    ).device_indices.tolist() == [
+    assert _path_indices(
+        core, core.match_prefix(MatchPrefixParams(key=second_key)).last_device_node
+    ).tolist() == [
         20,
         21,
     ]
     assert (
-        core.match_prefix(MatchPrefixParams(key=_key([1, 2]))).device_indices.numel()
+        _path_indices(
+            core,
+            core.match_prefix(MatchPrefixParams(key=_key([1, 2]))).last_device_node,
+        ).numel()
         == 0
     )
 
@@ -1249,7 +1264,7 @@ def test_page_size_two_drops_the_ragged_tail():
     )
     assert result.prefix_len == 0
     matched = core.match_prefix(MatchPrefixParams(key=_key([1, 2, 3, 4, 5])))
-    assert matched.device_indices.tolist() == [10, 11, 12, 13]
+    assert _path_indices(core, matched.last_device_node).tolist() == [10, 11, 12, 13]
 
 
 def test_insert_value_none_materializes_the_token_ids():
@@ -1257,14 +1272,14 @@ def test_insert_value_none_materializes_the_token_ids():
     result = _pump_insert(core, InsertParams(key=_key([1, 2, 3])))
     assert result.prefix_len == 0
     matched = core.match_prefix(MatchPrefixParams(key=_key([1, 2, 3])))
-    assert matched.device_indices.tolist() == [1, 2, 3]
+    assert _path_indices(core, matched.last_device_node).tolist() == [1, 2, 3]
 
 
 @pytest.mark.parametrize("swa", [False, True])
 def test_empty_match_result_is_root_anchored(swa):
     core = _swa_tree_core() if swa else _tree_core()
     empty = core.empty_match_result
-    assert empty.device_indices.numel() == 0
+    assert empty.device_prefix_len == 0
     assert empty.host_hit_length == 0
     probe = core.match_prefix(MatchPrefixParams(key=_key([9])))
     assert empty.best_match_node == probe.best_match_node
@@ -1312,7 +1327,7 @@ def test_hicache_write_through_and_load_back_round_trip():
     )
     assert actions == []
     result = core.match_prefix(MatchPrefixParams(key=_key([1, 2])))
-    assert result.device_indices.tolist() == [50, 51]
+    assert _path_indices(core, result.last_device_node).tolist() == [50, 51]
     core.finish_load_back(leaf)
     core.sanity_check([], [])
 
@@ -1852,7 +1867,9 @@ def test_empty_cache_salt_uses_the_default_namespace_at_the_binding():
         )
     )
     result = binding.match_prefix(mem_cache.MatchParamsBinding(array("q", [1])))
-    assert result.device_indices.tolist() == [10]
+    assert binding.collect_full_device_indices(
+        result.last_device_node_id, binding.root_node_handle(None)
+    ).tolist() == [10]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -1870,13 +1887,13 @@ def test_cuda_core_resolves_the_current_device():
     )
     assert result.prefix_len == 0
     matched = core.match_prefix(MatchPrefixParams(key=_key([1, 2, 3])))
-    assert matched.device_indices.device == core.device
-    assert matched.device_indices.tolist() == [10, 11, 12]
+    assert _path_indices(core, matched.last_device_node).device == core.device
+    assert _path_indices(core, matched.last_device_node).tolist() == [10, 11, 12]
     # The value=None fallback also lands on the resolved device.
     fallback = _pump_insert(core, InsertParams(key=_key([7, 8])))
     assert fallback.prefix_len == 0
     matched = core.match_prefix(MatchPrefixParams(key=_key([7, 8])))
-    assert matched.device_indices.tolist() == [7, 8]
+    assert _path_indices(core, matched.last_device_node).tolist() == [7, 8]
 
 
 def test_unsupported_component_sets_are_rejected():
@@ -1934,7 +1951,7 @@ def test_write_back_eviction_backs_up_then_drop_subtree_falls_back():
     assert tracker[ComponentType.FULL] == 2
     assert [t.tolist() for t in device_frees[ComponentType.FULL]] == [[10, 11]]
     result = core.match_prefix(MatchPrefixParams(key=_key([1, 2])))
-    assert result.device_indices.numel() == 0
+    assert result.device_prefix_len == 0
     core.sanity_check([], [])
 
 
@@ -2725,7 +2742,7 @@ def test_internal_swa_write_back_preserves_window_until_ack(
             MatchPrefixParams(key=_key(list(range(case.segment))))
         )
         assert matched.best_match_node == parent
-        assert matched.device_indices.numel() == 0
+        assert matched.device_prefix_len == 0
         assert matched.full_kv_hit_length == case.segment
         assert matched.swa_host_hit_length == case.segment
         assert matched.mamba_host_hit_length == int(with_mamba)
@@ -3801,7 +3818,9 @@ def test_swa_match_uses_allocator_layout(backend, ring, hicache, has_swa_host_po
     cache.tree_core.has_swa_host_pool = has_swa_host_pool
     matched = cache.match_prefix(MatchPrefixParams(key=_key(list(range(8)))))
     assert matched.full_kv_hit_length == 8
-    assert matched.device_indices.tolist() == (indices[:8].tolist() if ring else [])
+    assert cache.path_device_indices(matched.last_device_node).tolist() == (
+        indices[:8].tolist() if ring else []
+    )
 
 
 def test_buffer_backup_snapshot_round_trips_and_detects_a_split():
@@ -4196,7 +4215,7 @@ def test_mamba_tree_round_trips_through_the_adapter():
     assert not result.mamba_exist
 
     matched = core.match_prefix(MatchPrefixParams(key=_key([1, 2])))
-    assert matched.device_indices.tolist() == [10, 11]
+    assert _path_indices(core, matched.last_device_node).tolist() == [10, 11]
     assert matched.mamba_host_hit_length == 0
     assert core.mamba_evictable_size() == 1
     assert core.all_mamba_values_flatten().tolist() == [7]
@@ -5001,7 +5020,7 @@ def test_bigram_insert_then_a_longer_match_returns_the_inserted_prefix():
     )
     assert result.prefix_len == 0
     matched = core.match_prefix(MatchPrefixParams(key=_bigram_key([1, 2, 3, 4, 5])))
-    assert matched.device_indices.tolist() == [10, 11, 12]
+    assert _path_indices(core, matched.last_device_node).tolist() == [10, 11, 12]
 
 
 def test_bigram_match_diverges_on_the_pair_not_the_token():
@@ -5015,7 +5034,7 @@ def test_bigram_match_diverges_on_the_pair_not_the_token():
     )
     # (1, 2) matches; (2, 9) diverges from (2, 3) despite the shared token 2.
     matched = core.match_prefix(MatchPrefixParams(key=_bigram_key([1, 2, 9])))
-    assert matched.device_indices.tolist() == [10]
+    assert _path_indices(core, matched.last_device_node).tolist() == [10]
 
 
 def test_bigram_empty_and_single_token_keys_match_nothing():
@@ -5028,9 +5047,9 @@ def test_bigram_empty_and_single_token_keys_match_nothing():
         ),
     )
     empty = core.match_prefix(MatchPrefixParams(key=_bigram_key([])))
-    assert empty.device_indices.numel() == 0
+    assert empty.device_prefix_len == 0
     single = core.match_prefix(MatchPrefixParams(key=_bigram_key([1])))
-    assert single.device_indices.numel() == 0
+    assert single.device_prefix_len == 0
 
 
 def test_bigram_insert_truncates_a_raw_length_value_to_the_bigram_count():
@@ -5044,7 +5063,7 @@ def test_bigram_insert_truncates_a_raw_length_value_to_the_bigram_count():
     )
     assert result.prefix_len == 0
     matched = core.match_prefix(MatchPrefixParams(key=_bigram_key([1, 2, 3])))
-    assert matched.device_indices.tolist() == [10, 11]
+    assert _path_indices(core, matched.last_device_node).tolist() == [10, 11]
 
 
 def test_bigram_insert_value_shorter_than_the_bigram_count_raises():

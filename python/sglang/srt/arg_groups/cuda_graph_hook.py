@@ -203,7 +203,7 @@ def disable_tc_piecewise_cudagraph_if_incompatible(server_args: Any):
             "OOT platform without piecewise support",
             lambda: (
                 current_platform.is_out_of_tree()
-                and not current_platform.support_piecewise_cuda_graph()
+                and not current_platform.capabilities.piecewise_graph
             ),
         ),
         (
@@ -288,9 +288,12 @@ def disable_breakable_cudagraph_if_incompatible(server_args: Any):
     rules = [
         (
             "KDA hybrid linear attention",
-            # GLM-5.3 Flash supports explicit BCG opt-in, but stays off by
-            # default like other KDA models. Explicit backends skip these rules.
-            lambda: uses_kda_attention(model_config_of(server_args).hf_config),
+            # GLM-5.3 Flash is BCG-validated; other KDA models stay off by default.
+            lambda: (
+                uses_kda_attention(model_config_of(server_args).hf_config)
+                and "Glm5NextForConditionalGeneration"
+                not in model_config_of(server_args).hf_config.architectures
+            ),
         ),
         # DSV4 is BCG-compatible but introduces heavy memory pressure: the
         # c4 indexer scratch is pinned in the capture pool and OOMs. Disable.
@@ -407,33 +410,6 @@ def disable_prefill_cuda_graph_for_deepseek_trtllm_mla(server_args: Any):
             cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
         ),
     )
-
-
-def apply_glm5_prefill_cuda_graph_policy(server_args: Any):
-    """Set capture sizes for explicitly enabled GLM breakable prefill graphs."""
-    cfg = resolving_view(server_args)
-    if (
-        cfg.cuda_graph_config.prefill.backend != Backend.BREAKABLE
-        or "Glm5NextForConditionalGeneration"
-        not in model_config_of(server_args).hf_config.architectures
-    ):
-        return
-    locked = server_args._cuda_graph_config_locked
-    if any((Phase.PREFILL, key) in locked for key in ("max_bs", "bs")):
-        return
-    # Capacity defaults have already populated buckets. Replace the unlocked
-    # ceiling and its buckets together.
-    declare_resolution(
-        server_args,
-        "_apply_glm5_prefill_cuda_graph_policy",
-        cuda_graph_config=with_phase(
-            cfg.cuda_graph_config,
-            Phase.PREFILL,
-            max_bs=4096,
-            bs=generate_prefill_cuda_graph_batch_sizes(4096),
-        ),
-    )
-    apply_deepep_adjustments(server_args)
 
 
 def apply_deepep_adjustments(server_args: Any):

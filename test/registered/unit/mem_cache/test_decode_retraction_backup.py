@@ -122,7 +122,7 @@ class TestDecodeRetractionBackup(CustomTestCase):
             hicache_write_policy="write_back",
             disaggregation_mode="decode" if shared_receive else "null",
             disaggregation_decode_host_receive_threshold=(
-                host_receive_threshold if shared_receive else 0.0
+                host_receive_threshold if shared_receive else 1.0
             ),
             disaggregation_decode_enable_radix_cache=radix_cache,
         )
@@ -360,9 +360,10 @@ class TestDecodeRetractionBackup(CustomTestCase):
 
     @patch("torch.distributed.get_world_size", return_value=1)
     def test_host_receive_threshold_controls_device_allocation(self, _world_size):
-        """Transfers at the threshold leave device KV free; zero disables staging."""
+        """Zero always stages, one disables, and intermediate values gate on usage."""
         for threshold, used_tokens, host_staged in (
-            (0.0, 16, False),
+            (0.0, 0, True),
+            (1.0, 16, False),
             (0.5, 15, False),
             (0.5, 16, True),
         ):
@@ -589,7 +590,7 @@ class TestDecodeRetractionBackup(CustomTestCase):
         cached_indices = queue._pre_alloc(cached)
         self._seed_pool(env.target_pool, cached_indices, base=500)
         cached_values = self._snapshot_pool(env.target_pool, cached_indices)
-        cache.checkpoint(cached, up_to=cached.extend_range.end)
+        cache.checkpoint(cached, up_to=cached.extend_end)
         pressure = env.allocator.alloc(self.pool_size // 2 - 4)
 
         req = make_req("receiving", 8)
@@ -614,11 +615,11 @@ class TestDecodeRetractionBackup(CustomTestCase):
         # Prebuilt preparation retains the full-transfer/root state, then
         # restores before normal cache insertion deduplicates the prefix.
         req.init_next_round_input(None)
-        req.set_extend_range(0, 8)
+        req.extend_end = 8
         restore_kv_cache(req, cache, env.req_to_token_pool, env.allocator, "host_pool")
         self.assertEqual(cache.host_pool_group.available_size(), host_free_before)
         free_before_insert = env.allocator.available_size()
-        cache.checkpoint(req, up_to=req.extend_range.end)
+        cache.checkpoint(req, up_to=req.extend_end)
 
         row = env.req_to_token_pool.req_to_token[req.kv.req_pool_idx, :8]
         self.assertTrue(torch.equal(row[:4], cached_indices))

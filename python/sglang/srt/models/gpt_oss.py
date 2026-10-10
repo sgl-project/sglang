@@ -27,6 +27,7 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.srt.distributed.utils import get_group_rank_size
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
@@ -62,6 +63,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     get_tc_piecewise_forward_context,
@@ -382,7 +384,6 @@ class GptOssAttention(nn.Module):
         self.hidden_size = hidden_size
         self.sliding_window_size = sliding_window_size
 
-        attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
 
         self.total_num_heads = num_heads
@@ -413,8 +414,7 @@ class GptOssAttention(nn.Module):
             bias=attention_bias,
             params_dtype=params_dtype,
             quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             prefix=add_prefix("qkv_proj", prefix),
         )
 
@@ -431,8 +431,7 @@ class GptOssAttention(nn.Module):
             hidden_size,
             bias=attention_bias,
             quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             reduce_results=False,
             params_dtype=params_dtype,
             prefix=add_prefix("o_proj", prefix),
@@ -945,11 +944,6 @@ class GptOssForCausalLM(nn.Module):
         loaded_params: set[str] = set()
         mxfp4_block = 32
 
-        moe_tp_rank = get_parallel().moe_tp_rank
-        moe_tp_size = get_parallel().moe_tp_size
-        moe_ep_rank = get_parallel().moe_ep_rank
-        moe_ep_size = get_parallel().moe_ep_size
-
         intermediate_size = self.config.intermediate_size
         original_intermediate_size = getattr(
             self.config, "original_intermediate_size", intermediate_size
@@ -959,29 +953,48 @@ class GptOssForCausalLM(nn.Module):
         )
         intermediate_size_block = intermediate_size // mxfp4_block
 
-        per_rank_intermediate_size_block = math.ceil(
-            intermediate_size_block / moe_tp_size
-        )
-
-        per_rank_intermediate_size = per_rank_intermediate_size_block * mxfp4_block
-
-        # Calculate common slicing bounds for current rank
-        assert self.config.num_local_experts % moe_ep_size == 0
-        moe_num_global_experts = self.config.num_local_experts
-        moe_num_local_experts = self.config.num_local_experts // moe_ep_size
-
-        moe_tp_rank_start = moe_tp_rank * per_rank_intermediate_size
-        moe_tp_rank_end = min(
-            (moe_tp_rank + 1) * per_rank_intermediate_size, original_intermediate_size
-        )
-
-        moe_ep_rank_start = moe_ep_rank * moe_num_local_experts
-        moe_ep_rank_end = (moe_ep_rank + 1) * moe_num_local_experts
-
         weight_device = next(iter(params_dict.values())).device
 
         for name, weight in weights:
             weight = weight.to(weight_device)
+
+            if not any(
+                suffix in name
+                for suffix in (
+                    "gate_up_proj_blocks",
+                    "down_proj_blocks",
+                    "gate_up_proj_scales",
+                    "down_proj_scales",
+                    "gate_up_proj_bias",
+                    "down_proj_bias",
+                )
+            ):
+                continue
+            experts = self.get_submodule(name.rsplit(".", 1)[0])
+            moe_tp_rank = experts.moe_tp_rank
+            moe_tp_size = experts.moe_tp_size
+            moe_ep_rank = experts.moe_ep_rank
+            moe_ep_size = experts.moe_ep_size
+
+            per_rank_intermediate_size_block = math.ceil(
+                intermediate_size_block / moe_tp_size
+            )
+
+            per_rank_intermediate_size = per_rank_intermediate_size_block * mxfp4_block
+
+            # Calculate common slicing bounds for current rank
+            assert self.config.num_local_experts % moe_ep_size == 0
+            moe_num_global_experts = self.config.num_local_experts
+            moe_num_local_experts = self.config.num_local_experts // moe_ep_size
+
+            moe_tp_rank_start = moe_tp_rank * per_rank_intermediate_size
+            moe_tp_rank_end = min(
+                (moe_tp_rank + 1) * per_rank_intermediate_size,
+                original_intermediate_size,
+            )
+
+            moe_ep_rank_start = moe_ep_rank * moe_num_local_experts
+            moe_ep_rank_end = (moe_ep_rank + 1) * moe_num_local_experts
 
             if "gate_up_proj_blocks" in name:
                 # Handle MLP gate and up projection weights
@@ -1243,8 +1256,10 @@ class GptOssForCausalLM(nn.Module):
                     weight_loader = param.weight_loader
                     if "bias" not in name:
                         loaded_weight = loaded_weight.transpose(-2, -1)
-                    if "w2_weight_bias" in name and get_parallel().moe_tp_rank != 0:
-                        loaded_weight = loaded_weight.zero_()
+                    if "w2_weight_bias" in name:
+                        experts = self.get_submodule(name.rsplit(".", 1)[0])
+                        if experts.moe_tp_rank != 0:
+                            loaded_weight = loaded_weight.zero_()
 
                     weight_loader(
                         param,
@@ -1261,8 +1276,11 @@ class GptOssForCausalLM(nn.Module):
                     if name in params_dict.keys():
                         param = params_dict[name]
                         if "sinks" in name:
-                            start = get_parallel().attn_tp_rank * param.numel()
-                            tp_size = get_parallel().tp_size
+                            projection = unwrap_lora_layer(
+                                self.get_submodule(name.rsplit(".", 1)[0]).qkv_proj
+                            )
+                            tp_rank, tp_size = get_group_rank_size(projection.tp_group)
+                            start = tp_rank * param.numel()
                             full_shard_size = param.numel() * tp_size
                             # This handles TP padding: if the checkpoint dim is not divisible by tp_size,
                             # the last TP shard extends beyond `loaded_weight`, pad with zeros before slicing.

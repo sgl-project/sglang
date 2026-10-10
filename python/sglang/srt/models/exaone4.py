@@ -112,9 +112,6 @@ class Exaone4Attention(nn.Module):
         self.hidden_size = hidden_size
         tp_size = get_parallel().tp_size
 
-        attn_tp_rank = get_parallel().attn_tp_rank
-        attn_tp_size = get_parallel().attn_tp_size
-
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size
@@ -144,8 +141,7 @@ class Exaone4Attention(nn.Module):
             bias=bias,
             quant_config=quant_config,
             prefix=add_prefix("qkv_proj", prefix),
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
         )
 
         self.o_proj = RowParallelLinear(
@@ -155,8 +151,7 @@ class Exaone4Attention(nn.Module):
             quant_config=quant_config,
             reduce_results=False,
             prefix=add_prefix("o_proj", prefix),
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
         )
 
         is_neox_style = True

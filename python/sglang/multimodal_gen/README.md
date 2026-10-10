@@ -37,6 +37,9 @@ SGLang Diffusion supports Apple Silicon (M-series) via the MPS backend. Since Tr
 
 Docker is recommended for Linux GPU deployments. Follow the [installation guide](https://docs.sglang.io/docs/sglang-diffusion/installation) to start a container with diffusion dependencies included, or choose pip/uv, source installation, or another platform's setup. Run the examples below inside that environment.
 
+Video output requires a system `ffmpeg` with the `libx264` encoder on `PATH`. For Ubuntu source or pip installations, install it with `sudo apt-get install ffmpeg`; on macOS, use `brew install ffmpeg`.
+
+
 ## Inference
 
 Here's a minimal example to generate a video using the default settings:

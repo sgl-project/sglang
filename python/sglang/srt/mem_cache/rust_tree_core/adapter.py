@@ -267,7 +267,7 @@ def _insert_step_from_binding(step) -> InsertStepResult:
 def _match_result_from_binding(result) -> MatchResult:
     """Build the Python MatchResult for the binding's match result."""
     return MatchResult(
-        device_indices=result.device_indices,
+        device_prefix_len=result.device_prefix_len,
         last_device_node=result.last_device_node_id,
         last_host_node=result.last_host_node_id,
         best_match_node=result.best_match_node_id,

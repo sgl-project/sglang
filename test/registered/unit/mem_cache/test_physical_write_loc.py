@@ -15,7 +15,7 @@
 
 Under the token-major views a virtual id is in range and, by value, the same
 kind of integer as a physical one, so a unified pool cannot tell a skipped
-rebind from a translated loc by looking at it. `rebind_write_loc` marks the
+bind from a translated loc by looking at it. A plan's `bind` marks the
 batch's loc physical, producers carry the mark in `KVWriteLoc`, composites
 forward it, and the unified write doors refuse a loc without it.
 
@@ -31,6 +31,7 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
+from sglang.srt.mem_cache.kv_loc_plan import IdSpace, IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import (
     KVWriteLoc,
     MHATokenToKVPool,
@@ -66,7 +67,11 @@ def _plain_translator():
 def _translating_translator(v2p):
     src = _plain_translator()
     src.is_translating = True
-    src._translate_write_full = lambda t, out=None: v2p[t.to(torch.int64)]
+    src._spaces = {
+        IdSpaceKind.FULL: IdSpace(
+            key=(IdSpaceKind.FULL, "test"), write=lambda t: v2p[t.to(torch.int64)]
+        )
+    }
     return src
 
 
@@ -111,7 +116,7 @@ class TestRebindMarksTheBatch(unittest.TestCase):
     def test_non_translating_pool_marks_physical_without_rebinding(self):
         loc = torch.tensor([3, 5], dtype=torch.int64)
         fb = _batch(loc)
-        _plain_translator().rebind_write_loc(fb)
+        _plain_translator().bind_own_plan(fb)
         self.assertIs(fb.out_cache_loc, loc)  # physical by allocation: untouched
         self.assertTrue(fb.out_cache_loc_is_physical)
 
@@ -119,13 +124,13 @@ class TestRebindMarksTheBatch(unittest.TestCase):
         v2p = torch.tensor([7, 6, 5, 4], dtype=torch.int64)
         loc = torch.tensor([1, 2], dtype=torch.int64)
         fb = _batch(loc)
-        _translating_translator(v2p).rebind_write_loc(fb)
+        _translating_translator(v2p).bind_own_plan(fb)
         self.assertTrue(torch.equal(fb.out_cache_loc, v2p[loc]))
         self.assertTrue(fb.out_cache_loc_is_physical)
 
     def test_no_loc_stays_unmarked(self):
         fb = _batch(None)
-        _translating_translator(torch.arange(4)).rebind_write_loc(fb)
+        _translating_translator(torch.arange(4)).bind_own_plan(fb)
         self.assertFalse(fb.out_cache_loc_is_physical)
 
 

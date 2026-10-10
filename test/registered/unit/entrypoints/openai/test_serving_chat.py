@@ -4399,6 +4399,18 @@ class ServingChatTestCase(CustomTestCase):
                     for choice in chunk.get("choices", []):
                         self.assertIsNone(choice["delta"].get("reasoning_content"))
 
+    def test_empty_reasoning_is_null_for_non_k2_parser(self):
+        """A non-K2 parser that finds no reasoning reports reasoning_content as None, not ''."""
+        self.chat.reasoning_parser = "qwen3"
+        self.template_manager.force_reasoning = False
+        request = self.basic_req.model_copy(update={"separate_reasoning": True})
+        ret = _spec_result(0)
+        ret["text"] = "Hello"
+        response = self.chat._build_chat_response(request, [ret], created=123)
+        message = response.choices[0].message
+        self.assertEqual(message.content, "Hello")
+        self.assertIsNone(message.reasoning_content)
+
     def test_missing_reasoning_history_still_rejected(self):
         self._use_preserved_reasoning_template()
         for reasoning in ({}, {"reasoning_content": None}):

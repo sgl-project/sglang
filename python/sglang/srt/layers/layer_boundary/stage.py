@@ -223,12 +223,12 @@ class StageBoundary:
             Tensor or owed handle for prepare. A producer-written residual and a
             declared partial sum are reconstructed from the incoming contract.
         """
+        previous = self.declaration.previous
         hidden_states, residual = from_pp(
             tensors,
-            residual_in_hidden=(
-                self.declaration.previous is not None
-                and self.declaration.previous.update.applied_at_exit
-            ),
+            # The producer's declaration says whether the stream arrives written.
+            residual_in_hidden=previous is not None
+            and (previous.update.applied_at_exit or previous.writes_at_handoff),
             allow_missing_residual=allow_missing_residual,
         )
         declared_sum = self.entry(forward_batch).declared_sum
@@ -262,12 +262,17 @@ class StageBoundary:
             hidden_states = stream.complete(hidden_states)
         return hidden_states, stream.snapshot(hidden_states)
 
-    def complete_now(self, hidden_states, forward_batch):
-        """Complete an FFN output outside exit() (the operation-scheduled TBO
-        path, which never defers): the sum it owes, then the move onto the
-        rows the layer hands on."""
+    def complete_now(self, hidden_states, forward_batch, *, already_reduced=False):
+        """Complete an FFN output outside exit(), including its residual update.
+
+        already_reduced is for a producer kernel that fused the output sum.
+        Row movement and residual write-back still belong to this boundary.
+        """
         return self.plan.output.complete_now(
-            hidden_states, stream_of(forward_batch), forward_batch
+            hidden_states,
+            stream_of(forward_batch),
+            forward_batch,
+            already_reduced=already_reduced,
         )
 
     def sum_part(self, hidden_states, forward_batch, group: SumGroup):
