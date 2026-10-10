@@ -244,6 +244,10 @@ def apply_dflash_verify_logits_adjustments(
             f"Expected {bs * draft_token_num}, got {next_token_logits.shape[0]}."
         )
 
+    # An extend/decode mask has one row per request and may be stale after batch
+    # filtering. Verify callers apply a separate mask for each tree position.
+    sampling_info.grammar_mask = None
+
     if sampling_info.has_custom_logit_processor:
         apply_custom_logit_processor(
             next_token_logits,
@@ -253,7 +257,6 @@ def apply_dflash_verify_logits_adjustments(
 
     acc_linear_penalties = getattr(sampling_info, "acc_linear_penalties", None)
     penalizer = getattr(sampling_info, "penalizer_orchestrator", None)
-    grammar_mask = getattr(sampling_info, "grammar_mask", None)
     logit_bias = getattr(sampling_info, "logit_bias", None)
 
     logits_3d: Optional[torch.Tensor] = None
@@ -264,12 +267,10 @@ def apply_dflash_verify_logits_adjustments(
             logits_3d = next_token_logits.reshape(bs, draft_token_num, -1)
         return logits_3d
 
-    # Dense fallback only when we need live penalizer application or a vocab mask.
+    # Dense fallback only when we need live penalizer application.
     # In overlap scheduling the common path is `acc_linear_penalties`, which can be
     # broadcast over the verify block without materializing a repeated buffer.
-    if (
-        penalizer is not None and penalizer.is_required and acc_linear_penalties is None
-    ) or grammar_mask is not None:
+    if penalizer is not None and penalizer.is_required and acc_linear_penalties is None:
         linear_penalty = torch.zeros(
             (bs, next_token_logits.shape[1]),
             dtype=torch.float32,
