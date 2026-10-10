@@ -229,6 +229,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 weight_path=self.kt_config.weight_path,
                 chunked_prefill_size=self.kt_config.chunked_prefill_size,
                 method=self.kt_config.method,
+                swiglu_limit=layer.moe_runner_config.swiglu_limit or 0.0,
                 max_deferred_experts_per_token=layer_max_deferred,
             )
 
