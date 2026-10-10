@@ -1138,7 +1138,7 @@ class TestLoadBalanceMethod(unittest.TestCase):
             handle_pd_disaggregation(server_args)
         self.assertIn("without improving prefill performance", "\n".join(logs.output))
 
-    def test_pd_decode_dcp_forces_chunk_cache(self):
+    def test_pd_decode_dcp_disables_radix_cache(self):
         server_args = self._load_balance_args(
             disaggregation_mode="decode",
             disaggregation_transfer_backend="mooncake",
@@ -2051,11 +2051,16 @@ class TestSSLArgs(unittest.TestCase):
 class TestHiCacheArgs(CustomTestCase):
     def test_host_receive_speculative_uses_shared_retraction_pool(self):
         """Speculation must still resolve host receive to the shared host pool."""
-        for algorithm in ("EAGLE", "EAGLE3", "NGRAM"):
-            with self.subTest(algorithm=algorithm):
+        for algorithm, threshold in (
+            ("EAGLE", 0.0),
+            ("EAGLE3", 0.0),
+            ("NGRAM", 0.0),
+            ("EAGLE", 0.8),
+        ):
+            with self.subTest(algorithm=algorithm, threshold=threshold):
                 args = self._make_args(
                     disaggregation_mode="decode",
-                    disaggregation_decode_host_receive_threshold=0.8,
+                    disaggregation_decode_host_receive_threshold=threshold,
                     speculative_algorithm=algorithm,
                 )
                 handle_pd_disaggregation(args)
@@ -2066,6 +2071,15 @@ class TestHiCacheArgs(CustomTestCase):
                 handle_hicache(args)
                 self.assertEqual(
                     resolution_result(args, "hicache_mem_layout"), "layer_first"
+                )
+
+        for overrides in ({}, {"disaggregation_decode_host_receive_threshold": 1.0}):
+            with self.subTest(overrides=overrides):
+                args = self._make_args(disaggregation_mode="decode", **overrides)
+                self.assertEqual(args.disaggregation_decode_host_receive_threshold, 1.0)
+                handle_pd_disaggregation(args)
+                self.assertIsNone(
+                    resolution_result(args, "disaggregation_decode_retraction_backup")
                 )
 
         for threshold in (-0.1, 1.1, float("nan")):

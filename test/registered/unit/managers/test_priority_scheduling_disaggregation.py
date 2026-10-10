@@ -669,6 +669,30 @@ class TestDecodePreallocQueuePriority(CustomTestCase):
             [failed_low.req], failed_low.req.return_logprob
         )
 
+    def test_admission_without_radix_cache_charges_the_alloc_hook(self):
+        """Bug regression: with the decode radix cache disabled, admission
+        charged the raw fill length while ``_pre_alloc`` allocates the
+        page-rounded ``_required_alloc_tokens``. On a paged pool a request
+        could pass admission and then fail allocation; the radix-cache path
+        already charged the rounded amount. Admission must charge what the
+        pool will allocate, so the mocked charge decides whether the request
+        fits."""
+        for charge, fits in ((50, True), (200, False)):
+            with self.subTest(charge=charge):
+                decode_req = self._new_decode_req("req", 1)
+                queue = self._new_queue([decode_req])
+                queue.token_to_kv_pool_allocator.available_size.return_value = 100
+                queue._required_alloc_tokens = MagicMock(return_value=charge)
+
+                preallocated, failed = queue.pop_preallocated()
+
+                queue._required_alloc_tokens.assert_called_once_with(
+                    fill_len=3, prefix_len=0
+                )
+                self.assertEqual(preallocated, [decode_req] if fits else [])
+                self.assertEqual(queue.queue, [] if fits else [decode_req])
+                self.assertEqual(failed, [])
+
 
 class TestDecodePreallocQueueRebootstrapPayload(unittest.TestCase):
     """The decode scheduler builds the rebootstrap ``/generate`` payload; the

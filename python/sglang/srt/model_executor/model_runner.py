@@ -849,6 +849,12 @@ class ModelRunner:
         dllm_config = DllmConfig.from_server_args(self.server_args)
         return dllm_config.block_size if dllm_config is not None else 1
 
+    def decode_graph_gather_requirements(self) -> tuple[bool, bool]:
+        """MLP and attention gathers required by this runner's decode graphs."""
+        return self._decode_cuda_graph_runner_cls().decode_graph_gather_requirements(
+            self
+        )
+
     def max_decode_logits_rows(self) -> int:
         """Rows the shared logits buffer needs."""
         # Resolution can turn speculative_adaptive off, so the effective value
@@ -868,7 +874,11 @@ class ModelRunner:
             num_tokens_per_req = self.decode_num_tokens_per_req(
                 num_draft_tokens=draft_tokens
             )
-            capture_bs, _ = get_batch_sizes_to_capture(self, num_tokens_per_req)
+            capture_bs, _ = get_batch_sizes_to_capture(
+                self,
+                num_tokens_per_req,
+                gathered_buffer_required=any(self.decode_graph_gather_requirements()),
+            )
             max_rows = max(max_rows, max(capture_bs) * num_tokens_per_req)
         return max_rows
 
@@ -900,6 +910,7 @@ class ModelRunner:
             token_to_kv_pool=self.token_to_kv_pool,
             page_size=self.page_size or 1,
             device=self.device,
+            is_draft_worker=self.is_draft_worker,
         )
 
     def max_shared_logits_buffer_rows(self) -> int:
@@ -1755,7 +1766,7 @@ class ModelRunner:
 
         # Try msprob debugger
         if self.msprobe_debugger is not None:
-            rank_id = self.gpu_id if get_parallel().attn_dp_size > 1 else None
+            rank_id = self.gpu_id if get_parallel().dp_size > 1 else None
             self.msprobe_debugger.start(model=self.model, rank_id=rank_id)
 
         # Step span
