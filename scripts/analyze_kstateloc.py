@@ -203,6 +203,36 @@ def tagged(path, lo, hi):
         print("\n(note: some KSTATELOC rows preceded any XDIFF -> layer unknown)")
 
 
+def bycol(path, lo, hi):
+    """Group [KSTATELOC] by tableColumn (the state_block_table entry the kernel
+    looks up). Reveals each table's (pos -> slot) mapping and whether the
+    miss-table vs hit-table differ by a CONSTANT slot offset (benign, e.g. +80)
+    or an inconsistent one (table bug)."""
+    blocks, _, _ = parse(path)
+    per = collections.defaultdict(lambda: collections.defaultdict(set))  # col -> pos -> {slot}
+    for block in blocks:
+        for op, b, p, col, sl, blk, row in block:
+            if lo <= p < hi:
+                per[col][p].add(sl)
+    print(f"{path}: grouped BY tableColumn  window[{lo},{hi})")
+    for col in sorted(per):
+        items = per[col]
+        multi = {p: s for p, s in items.items() if len(s) > 1}
+        print(f"\n-- col={col}  positions={len(items)}" + (f"  multi-slot at {sorted(multi)}" if multi else ""))
+        for p in sorted(items):
+            print(f"   pos={p} slot={sorted(items[p])}")
+    # offset analysis: for each pos, the slot(s) minus the smallest slot
+    print("\n== per-pos slot set (offsets vs min) ==")
+    bypos = collections.defaultdict(set)
+    for col in per:
+        for p, s in per[col].items():
+            bypos[p] |= s
+    for p in sorted(bypos):
+        ss = sorted(bypos[p])
+        base = ss[0]
+        print(f"   pos={p}: slots={ss}  offsets={[s - base for s in ss]}")
+
+
 def _show_xdiff(xdiff, tag=""):
     if not xdiff:
         return
@@ -251,13 +281,16 @@ def main():
     ap.add_argument("--verbose", action="store_true")
     ap.add_argument("--phases", action="store_true")
     ap.add_argument("--tagged", action="store_true")
+    ap.add_argument("--bycol", action="store_true")
     a = ap.parse_args()
     if a.selftest:
         selftest()
         return
     if not a.log:
         ap.error("log path required (or --selftest)")
-    if a.tagged:
+    if a.bycol:
+        bycol(a.log, a.lo, a.hi)
+    elif a.tagged:
         tagged(a.log, a.lo, a.hi)
     elif a.phases:
         phases(a.log, a.lo, a.hi)
