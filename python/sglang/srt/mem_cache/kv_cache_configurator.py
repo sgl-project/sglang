@@ -362,8 +362,8 @@ class KVCacheConfigurator:
         # SWA allocators never widen under DCP.
         if self.is_hybrid_swa:
             return max_total_num_tokens
-        # Target rows widen into attn_dcp_size ids; draft sizes already carry
-        # loc_space_scale.
+        # Target rows widen into attn_dcp_size ids; a draft that spans the
+        # widened space carries that widening in its own size (loc_space_scale).
         return (
             max_total_num_tokens * get_parallel().attn_dcp_size // self.loc_space_scale
         )
@@ -466,12 +466,38 @@ class KVCacheConfigurator:
             unified_memory_pool=pools.unified_memory_pool,
         )
 
+    @property
+    def draft_mla_rows_are_physical(self) -> bool:
+        """Whether the draft's MLA rows are DCP-collapsed like the target's.
+
+        True only for the plain MLA draft pool built by ``_build_mla_kv_pool``:
+        under DCP it writes and reads owner rows at ``loc // dcp_size``
+        (MLATokenToKVPool._scatter_mla_rows, the DCP page table), so it spans
+        and pages the same physical row space as the target. An MHA draft keeps
+        raw widened locs (masked_set_kv_buffer_kernel) and stays logical.
+        """
+        return (
+            self.is_draft_worker
+            and get_parallel().attn_dcp_size > 1
+            and self.use_mla_backend
+            and not self.mambaish_config
+            and not self.is_hybrid_swa
+            and not is_deepseek_dsa(self.model_config.hf_config)
+            and not is_deepseek_v4(self.model_config.hf_config)
+            and not is_float4_e2m1fn_x2(self.kv_cache_dtype)
+            and not current_platform.is_out_of_tree()
+            and get_exec().kernel.attention_backend != "ascend"
+        )
+
     # Note(kpham-sgl):
     # 1. A replicated draft indexes the allocator's virtual locs raw, so its pools
-    #    span and page that space; the sharded target translates and stays per-rank.
+    #    span and page that space; a DCP-collapsed draft and the sharded target
+    #    translate and stay per-rank.
     # 2. A pool must page as its allocator does, or its last page falls short.
     @property
     def loc_space_scale(self) -> int:
+        if self.draft_mla_rows_are_physical:
+            return 1
         dcp_size = get_parallel().attn_dcp_size
         return dcp_size if (self.is_draft_worker and dcp_size > 1) else 1
 
@@ -488,8 +514,9 @@ class KVCacheConfigurator:
             full_max_total_num_tokens = config.full_max_total_num_tokens
             swa_max_total_num_tokens = config.swa_max_total_num_tokens
 
-        # Draft pools are replicated, not DCP-sharded, yet consume the shared
-        # allocator's virtual locs in [0, max_total * dcp_size) untranslated.
+        # A replicated draft pool consumes the shared allocator's virtual locs
+        # in [0, max_total * dcp_size) untranslated; a DCP-collapsed one only
+        # ever addresses the owner rows, so its sizes stay physical.
         loc_scale = self.loc_space_scale
         max_total_num_tokens *= loc_scale
         if full_max_total_num_tokens is not None:
@@ -666,8 +693,21 @@ class KVCacheConfigurator:
                 draft_virtual_id_space = (
                     (draft_virtual_id_space + page - 1) // page * page
                 )
+                if self.draft_mla_rows_are_physical:
+                    # Owner rows carry one widened id each, so the pool keeps a
+                    # dcp_size-th of the space it is addressed in.
+                    dcp_size = get_parallel().attn_dcp_size
+                    widened_page = page * dcp_size
+                    widened = (
+                        (draft_virtual_id_space + widened_page - 1)
+                        // widened_page
+                        * widened_page
+                    )
+                    draft_pool_size = widened // dcp_size
+                else:
+                    draft_pool_size = draft_virtual_id_space
                 size_overrides = {
-                    "max_total_num_tokens": draft_virtual_id_space,
+                    "max_total_num_tokens": draft_pool_size,
                 }
                 if (
                     isinstance(
@@ -733,10 +773,16 @@ class KVCacheConfigurator:
                 )
 
         if draft_virtual_id_space is not None:
-            assert token_to_kv_pool.size >= draft_virtual_id_space, (
+            # The allocator's ids are widened, so compare in that same space.
+            pool_logical_size = (
+                token_to_kv_pool.size
+                * get_parallel().attn_dcp_size
+                // self.loc_space_scale
+            )
+            assert pool_logical_size >= draft_virtual_id_space, (
                 "draft token_to_kv_pool smaller than the shared unified "
                 f"allocator's virtual-id space: pool size="
-                f"{token_to_kv_pool.size} < "
+                f"{pool_logical_size} < "
                 f"virtual_id_space={draft_virtual_id_space}; "
                 "verify-window writes at high virtual ids would go out of "
                 "bounds."
