@@ -139,12 +139,13 @@ class CompressedTensorsConfig(QuantizationConfig):
     @property
     def kv_cache_quant_algo(self) -> Optional[str]:
         """Duck-typed by configure_kv_cache_dtype to resolve --kv-cache-dtype
-        auto: loaded scales need the fp8 pool they calibrate, never bf16."""
+        auto: only an FP8 scheme should select the FP8 pool. NVFP4 still
+        requires an explicit --kv-cache-dtype nvfp4."""
         if (
             self.kv_cache_scheme is not None
             and CompressedTensorsKVCacheMethod.is_supported_scheme(self.kv_cache_scheme)
         ):
-            return "FP8"
+            return "FP8" if self.kv_cache_scheme["num_bits"] == 8 else "NVFP4"
         return None
 
     def get_linear_method(self) -> CompressedTensorsLinearMethod:
@@ -216,7 +217,7 @@ class CompressedTensorsConfig(QuantizationConfig):
                 logger.warning_once(
                     f"Ignoring compressed-tensors kv_cache_scheme "
                     f"{self.kv_cache_scheme}: only static symmetric "
-                    f"per-tensor FP8 scales are supported."
+                    f"per-tensor FP8 or NVFP4 scales are supported."
                 )
                 return None
             return CompressedTensorsKVCacheMethod(self)
@@ -1178,7 +1179,7 @@ class CompressedTensorsConfig(QuantizationConfig):
 
 class CompressedTensorsKVCacheMethod(BaseKVCacheMethod):
     """Load calibrated k_scale / v_scale from a compressed-tensors checkpoint
-    that declares a ``kv_cache_scheme`` (static per-tensor FP8)."""
+    that declares a static per-tensor FP8 or NVFP4 ``kv_cache_scheme``."""
 
     def __init__(self, quant_config: CompressedTensorsConfig):
         assert self.is_supported_scheme(quant_config.kv_cache_scheme)
@@ -1186,11 +1187,11 @@ class CompressedTensorsKVCacheMethod(BaseKVCacheMethod):
 
     @staticmethod
     def is_supported_scheme(kv_cache_scheme: Dict[str, Any]) -> bool:
-        """Static symmetric per-tensor FP8 — all BaseKVCacheMethod can
+        """Static symmetric per-tensor FP8 or NVFP4 — all BaseKVCacheMethod can
         represent. Dynamic schemes serialize no k_scale/v_scale tensors."""
         return (
             kv_cache_scheme.get("type") == "float"
-            and kv_cache_scheme.get("num_bits") == 8
+            and kv_cache_scheme.get("num_bits") in (4, 8)
             and kv_cache_scheme.get("strategy") == "tensor"
             and kv_cache_scheme.get("symmetric", True)
             and not kv_cache_scheme.get("dynamic", False)
