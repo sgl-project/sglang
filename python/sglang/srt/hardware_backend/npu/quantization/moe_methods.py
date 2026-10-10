@@ -279,6 +279,15 @@ class _NPUMoEMethodBase(FusedMoEMethodBase):
 class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
     """ModelSlim W4A8 MoE with packed MXFP4 weights and MXFP8 activations."""
 
+    # Dispatch wire format required by the W4A8 MXFP GMMs: low-latency
+    # dispatch quantizes activations to MXFP8 (E8M0 block scales); normal
+    # dispatch stays BF16 because A5 MXFP8 normal dispatch is intranode-only,
+    # which also preserves multi-node prefill when ``deepep-mode=auto``.
+    DISPATCHER_QUANT_CONFIG = {
+        "normal_dispatcher_output_dtype": "bf16",
+        "low_latency_dispatcher_output_dtype": "mxfp8",
+    }
+
     def __init__(self, dynamic_quant_kwargs=_DEFAULT_DYNAMIC_QUANT):
         super().__init__(quant_config=None)
         self.dynamic_quant_kwargs = dynamic_quant_kwargs
@@ -308,17 +317,8 @@ class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
             weight.data, weight_scale.data
         )
 
-        # A5 DeepEP low-latency dispatch quantizes the valid received rows to
-        # MXFP8 and returns the matching E8M0 block scales.  Keep normal mode
-        # in BF16 because A5 MXFP8 normal dispatch is intranode-only; this also
-        # preserves multi-node prefill when ``deepep-mode=auto``.
         if weight_prefix == "w13" and hasattr(layer, "dispatcher"):
-            layer.dispatcher.set_quant_config(
-                {
-                    "normal_dispatcher_output_dtype": "bf16",
-                    "low_latency_dispatcher_output_dtype": "mxfp8",
-                }
-            )
+            layer.dispatcher.set_quant_config(dict(self.DISPATCHER_QUANT_CONFIG))
 
     def apply(
         self,
