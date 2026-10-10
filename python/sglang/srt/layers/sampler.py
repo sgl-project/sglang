@@ -682,13 +682,21 @@ class Sampler(nn.Module):
     def _sync_token_ids_across_tp(
         self, batch_next_token_ids: torch.Tensor, sampling_info: SamplingBatchInfo
     ):
-        if SYNC_TOKEN_IDS_ACROSS_TP or sampling_info.grammars:
+        if (
+            SYNC_TOKEN_IDS_ACROSS_TP or sampling_info.grammars
+        ) and dist.get_world_size(self.tp_sync_group) > 1:
             # For performance reasons, SGLang does not sync the final token IDs across TP ranks by default.
             # This saves one all-reduce, but the correctness of this approach depends on the determinism of several operators:
             # the last all-reduce, the last lm_head matmul, and all sampling kernels.
             # These kernels are deterministic in most cases, but there are some rare instances where they are not deterministic.
             # In such cases, enable this env variable to prevent hanging due to TP ranks becoming desynchronized.
             # When using xgrammar, this becomes more likely so we also do the sync when grammar is used.
+            #
+            # Skip the (identity) all-reduce when the sync group has a single
+            # rank (e.g. PP-only prefill with tp=1): the call is semantically a
+            # no-op but still lazily initializes the NCCL communicator, which
+            # allocates device memory and can fail under memory pressure,
+            # crashing the scheduler.
 
             torch.distributed.all_reduce(
                 batch_next_token_ids,
