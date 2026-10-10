@@ -1562,6 +1562,77 @@ class TestDeepSeekV3Detector(unittest.TestCase):
         self.assertEqual(params1["city"], "Shanghai")
         self.assertEqual(params2["city"], "Beijing")
 
+    def test_streaming_two_complete_tool_calls_in_one_delta_emit_both(self):
+        """#43523: a coalesced stream increment (backlog or large
+        --stream-interval) holding two complete tool calls must emit both,
+        at distinct tool indices. Previously only the last call was emitted."""
+        c1 = (
+            "<｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather\n"
+            "```json\n"
+            '{"city": "Paris"}\n'
+            "```<｜tool▁call▁end｜>"
+        )
+        c2 = (
+            "\n<｜tool▁call▁begin｜>function<｜tool▁sep｜>get_tourist_attractions\n"
+            "```json\n"
+            '{"city": "Tokyo"}\n'
+            "```<｜tool▁call▁end｜><｜tool▁calls▁end｜>"
+        )
+        text = "<｜tool▁calls▁begin｜>" + c1 + c2
+
+        result = self.detector.parse_streaming_increment(text, self.tools)
+        named = [(c.tool_index, c.name) for c in result.calls if c.name]
+        self.assertEqual(
+            named,
+            [(0, "get_weather"), (1, "get_tourist_attractions")],
+            "both complete calls must be emitted, in order, at distinct indices",
+        )
+        args = [c.parameters for c in result.calls if c.parameters]
+        self.assertEqual(len(args), 2, "both calls must stream their arguments")
+        self.assertEqual(json.loads(args[0])["city"], "Paris")
+        self.assertEqual(json.loads(args[1])["city"], "Tokyo")
+
+    def test_streaming_complete_then_incomplete_tail_emits_both_after_completion(
+        self,
+    ):
+        """#43523 companion: a complete call plus an incomplete next call in the
+        same increment keeps the legacy name-only behavior while the tail is
+        open; once the tail completes, the buffered backlog holds two complete
+        calls and both are emitted with correct indices."""
+        c1 = (
+            "<｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather\n"
+            "```json\n"
+            '{"city": "Paris"}\n'
+            "```<｜tool▁call▁end｜>"
+        )
+        tail = (
+            "\n<｜tool▁call▁begin｜>function<｜tool▁sep｜>get_tourist_attractions\n"
+            "```json\n"
+            '{"city": "Tok'
+        )
+        r1 = self.detector.parse_streaming_increment(
+            "<｜tool▁calls▁begin｜>" + c1 + tail, self.tools
+        )
+        self.assertEqual(
+            [c.name for c in r1.calls if c.name],
+            ["get_weather"],
+            "while the second call is incomplete, only the completed first call name streams",
+        )
+        r2 = self.detector.parse_streaming_increment(
+            'yo"}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>', self.tools
+        )
+        named = [(c.tool_index, c.name) for c in r2.calls if c.name]
+        self.assertEqual(
+            named,
+            [(1, "get_tourist_attractions")],
+            "after the tail completes, the second call must stream at index 1",
+        )
+        args = [c.parameters for c in r2.calls if c.parameters]
+        self.assertEqual(len(args), 2, "both calls' arguments must be streamed")
+        self.assertEqual(json.loads(args[0])["city"], "Paris")
+        self.assertEqual(json.loads(args[1])["city"], "Tokyo")
+
+
 
 class TestDeepSeekV32Detector(unittest.TestCase):
     def setUp(self):
