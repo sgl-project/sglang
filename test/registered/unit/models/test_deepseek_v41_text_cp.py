@@ -26,10 +26,11 @@ RUNNER = "sglang.srt.model_executor.runner.eager_runner"
 
 
 class TestDSV41TextCP(CustomTestCase):
-    def test_cp_multistream_q_starts_before_gathers_and_is_joined(self):
-        """Q must depend on q_lora, not the CP gathers or compressor. The
-        cache writer must still wait for gathered KV, and attention must see
-        completed Q. Emulate stream frontiers to detect missing dependencies.
+    def test_cp_multistream_gathers_submit_before_q_without_serializing(self):
+        """An early Q launch can starve CP collectives of SM resources. Submit
+        gathers first without making Q wait for them to finish. The cache writer
+        must still wait for KV, and attention must see completed Q. Emulate
+        stream frontiers to detect accidental collective/Q dependencies.
         """
         module = "sglang.srt.models.deepseek_v4"
         for captured, compressor, fused, encoder_replay, has_q_out in product(
@@ -88,6 +89,9 @@ class TestDSV41TextCP(CustomTestCase):
             return q, q
 
         def compute_q_b(q, pos, out):
+            self.assertIn("swa_gather", events, "Q submitted before SWA gather")
+            if compressor and not encoder_replay:
+                self.assertIn("main_gather", events, "Q submitted before main gather")
             self.assertIs(pos, positions)
             self.assertIs(out, q_out)
             result = enqueue("q_b", 3 * q.value, q)
@@ -167,12 +171,14 @@ class TestDSV41TextCP(CustomTestCase):
             q_dependencies.isdisjoint({"swa_gather", "main_gather", "sources"})
         )
         self.assertIs(events["swa_gather"][0], parent)
+        self.assertNotIn("q_b", events["swa_gather"][1])
         store_stream, store_dependencies = events["swa_store"]
         self.assertIs(store_stream, workers[0])
         self.assertTrue({"swa_gather", "q_b"}.issubset(store_dependencies))
         if compressor and not encoder_replay:
             self.assertIs(events["main_gather"][0], parent)
             self.assertIn("swa_gather", events["main_gather"][1])
+            self.assertNotIn("q_b", events["main_gather"][1])
             self.assertIn("main_gather", events["sources"][1])
         else:
             self.assertNotIn("main_gather", events)
