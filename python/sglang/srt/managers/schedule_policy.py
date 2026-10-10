@@ -32,7 +32,6 @@ logger = logging.getLogger(__name__)
 
 import os
 import random
-import time
 from collections import Counter
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
@@ -132,8 +131,8 @@ if PREFILL_TILE_BUDGET_MODE not in {"legacy", "compact"}:
 
 # Arbitrary; bounds per-round prefix work on the waiting queue.
 WAITING_QUEUE_PREFIX_MATCH_MAX = 128
-# Arbitrary; bounds the walk cost of touching waiting prefixes.
-WAITING_PREFIX_REFRESH_INTERVAL_S = 0.5
+# Bound the walk cost using scheduling passes, which agree across TP ranks.
+WAITING_PREFIX_REFRESH_INTERVAL = 32
 
 
 def _ceil_div(value: int, divisor: int) -> int:
@@ -202,7 +201,7 @@ class SchedulePolicy:
         self.schedule_low_priority_values_first = schedule_low_priority_values_first
         self.priority_sign = 1 if schedule_low_priority_values_first else -1
         self._shortest_prefill_calls = 0
-        self._last_waiting_prefix_refresh = float("-inf")
+        self._waiting_prefix_refresh_calls = 0
 
         # It is used to find the matching prefix for in-batch prefix caching.
         self.waiting_queue_radix_tree = RadixCache.create_simulated()
@@ -289,10 +288,12 @@ class SchedulePolicy:
             or not self.tree_cache.supports_prefix_sharing()
         ):
             return
-        now = time.monotonic()
-        if now - self._last_waiting_prefix_refresh < WAITING_PREFIX_REFRESH_INTERVAL_S:
+        refresh = (
+            self._waiting_prefix_refresh_calls % WAITING_PREFIX_REFRESH_INTERVAL == 0
+        )
+        self._waiting_prefix_refresh_calls += 1
+        if not refresh:
             return
-        self._last_waiting_prefix_refresh = now
         for r in reversed(waiting_queue[:WAITING_QUEUE_PREFIX_MATCH_MAX]):
             touch_waiting_prefix(r, self.tree_cache)
 
