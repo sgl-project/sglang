@@ -554,14 +554,15 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
                     spec_algorithm=SpeculativeAlgorithm.DFLASH
                 )
                 backend.token_to_kv_pool = SimpleNamespace(request_window=None)
+                # init_forward_metadata's choice with the env below off.
                 backend.forward_metadata = DSV4Metadata(
-                    self._make_core_metadata(0), indexer_metadata=None
+                    self._make_core_metadata(0),
+                    indexer_metadata=None,
+                    sparse_prefill_direct=True,
                 )
                 backend._build_sparse_prefill_chunk_cache = mock.Mock(
                     return_value=cache
                 )
-                # init_forward_metadata's choice with the env below off.
-                backend._sparse_prefill_direct = True
 
                 with (
                     envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.override(True),
