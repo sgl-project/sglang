@@ -86,6 +86,14 @@ page-identity logs; shared cache operations do not invent request ownership.
 
 ## Image and online validation
 
+The HTTP P/D router must also propagate an early Decode rejection and cancel
+the paired Prefill request. After changing `sgl-model-gateway` Rust sources,
+rebuild and install the Router wheel; a Python source overlay does not update
+the loaded `sglang_router_rs` library. Record the wheel hash, loaded native
+library hash and source commit separately from the worker source manifest.
+Verify actual Prefill bootstrap cleanup after cancellation in the online test;
+local HTTP connection closure alone does not prove scheduler cleanup.
+
 Build the complete updated checkout with the existing dependencies. Generate a
 new source-hash manifest for that checkout. On each GPU worker, run:
 
