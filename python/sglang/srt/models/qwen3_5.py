@@ -946,10 +946,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape_og)
-        core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
-
-        output, _ = self.out_proj(core_attn_out)
-        return output
+        return core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
 
     def forward(
         self,
@@ -962,6 +959,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         2. Core attention (custom op)
         3. Output projection
         """
+        output, _ = self.out_proj(self.core(hidden_states, forward_batch))
+        return output
+
+    def core(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch):
+        """Input projection and core attention: ``out_proj``'s input."""
         projected_states_qkvz, projected_states_ba = self._forward_input_proj(
             hidden_states
         )
@@ -1072,17 +1074,14 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 activation=self.norm.activation,
                 quant_heads=nv,
             )
-            return self.out_proj(fp8)[0]
+            return fp8
 
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape_og)
-        core_attn_out = core_attn_out.reshape(
+        return core_attn_out.reshape(
             *core_attn_out.shape[:-2],
             core_attn_out.shape[-2] * core_attn_out.shape[-1],
         )
-
-        output, _ = self.out_proj(core_attn_out)
-        return output
 
 
 class Qwen3_5LinearDecoderLayer(nn.Module):

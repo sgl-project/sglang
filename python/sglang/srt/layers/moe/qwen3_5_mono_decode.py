@@ -14,8 +14,12 @@ two persistent launches:
 
 The decode CUDA graph captures the step per batch size; any other step takes
 the stock layers. Needs the shared expert unfused
-(``--disable-shared-experts-fusion``), an fp32 SSM state (no
+(``--disable-shared-experts-fusion``). K1 also needs an fp32 SSM state (no
 ``--mamba-ssm-dtype bfloat16``) and no ReplaySSM ring.
+
+With speculative decoding, a target-verify step of at most ``MAX_TOKENS``
+rows (batch x draft tokens) runs K2 only: K1 writes no per-draft-token state
+for the rollback, so GDN layers run SGLang's ``linear_attn.core`` there.
 
 The all-reduces run in-kernel over a peer buffer every TP rank maps. Mailbox
 tags carry a device epoch bumped once a step (captured with it), so no buffer
@@ -30,7 +34,7 @@ from sglang.kernels.ops.moe.qwen3_5_mono_flydsl import layout as L
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_context import get_attn_backend
-from sglang.srt.runtime_context import get_memory, get_parallel
+from sglang.srt.runtime_context import get_memory, get_parallel, get_spec
 from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.srt.utils.common import get_device_core_count
 
@@ -115,6 +119,8 @@ class MonoDecode:
         self.ok = why is None
         self._runtime_ok: bool | None = None
         self._logged: set = set()
+        # The target model runs no plain decode steps under speculative decoding.
+        self.k1 = get_spec().speculative_algorithm is None
         if not self.ok:
             logger.info("Qwen3.8 mono decode off: %s", why)
             return
@@ -149,7 +155,9 @@ class MonoDecode:
         )
         self.peers.bytes.zero_()
         logger.info(
-            "Qwen3.8 mono decode on for decode steps of <= %d rows", L.MAX_TOKENS
+            "Qwen3.8 mono decode on for %s steps of <= %d rows",
+            "decode" if self.k1 else "target-verify (K2 only)",
+            L.MAX_TOKENS,
         )
 
     def _runtime_unsupported(self, forward_batch) -> str | None:
@@ -165,7 +173,10 @@ class MonoDecode:
                 return f"w13 shape {tuple(ex.w13_weight.shape)} (EP or padding)"
             if ex.w13_weight.dtype != torch.uint8 or ex.w2_weight.dtype != torch.uint8:
                 return "routed experts not MXFP4"
-            if _is_gdn(layer):
+            if _is_gdn(layer) and not self.k1:
+                w_o = layer.linear_attn.out_proj.weight
+                dense = (w_o,)
+            elif _is_gdn(layer):
                 a = layer.linear_attn
                 dense = (
                     a.in_proj_qkvz.weight,
@@ -208,27 +219,34 @@ class MonoDecode:
         return None
 
     def eligible(self, input_ids, forward_batch, input_embeds, pp_proxy_tensors):
-        """A pure decode step of at most ``MAX_TOKENS`` rows."""
+        """A decode step (K1 on) or a target-verify step (K1 off) of at most
+        ``MAX_TOKENS`` rows."""
         if not self.ok or input_embeds is not None or pp_proxy_tensors is not None:
             return False
         if input_ids is None or not 1 <= input_ids.size(0) <= L.MAX_TOKENS:
             return False
-        if not forward_batch.forward_mode.is_decode():
+        mode = forward_batch.forward_mode
+        if not (mode.is_decode() if self.k1 else mode.is_target_verify()):
             return False
-        if forward_batch.spec_info is not None:
+        if self.k1 and forward_batch.spec_info is not None:
             return self._skip("spec_info set")
         if self.model.layers_to_capture:
             return self._skip("layers_to_capture set")
         lab = getattr(get_attn_backend(), "linear_attn_backend", None)
         if lab is None:
             return self._skip("no linear_attn_backend")
-        idx = lab.forward_metadata.mamba_cache_indices
-        if idx is None or idx.dtype != torch.int32 or idx.numel() < input_ids.size(0):
-            return self._skip(
-                f"mamba_cache_indices {None if idx is None else (idx.dtype, idx.numel())}"
-            )
-        if not idx.is_contiguous():
-            return self._skip("mamba_cache_indices not contiguous")
+        if self.k1:
+            idx = lab.forward_metadata.mamba_cache_indices
+            if (
+                idx is None
+                or idx.dtype != torch.int32
+                or idx.numel() < input_ids.size(0)
+            ):
+                return self._skip(
+                    f"mamba_cache_indices {None if idx is None else (idx.dtype, idx.numel())}"
+                )
+            if not idx.is_contiguous():
+                return self._skip("mamba_cache_indices not contiguous")
         if self._runtime_ok is None:
             why = self._runtime_unsupported(forward_batch)
             if why is not None:
@@ -255,7 +273,7 @@ class MonoDecode:
         h = model.embed_tokens(input_ids)
         residual: torch.Tensor | None = None
         for i, layer in enumerate(model.layers):
-            if _is_gdn(layer):
+            if _is_gdn(layer) and self.k1:
                 core = torch.empty(s, L.CORE, dtype=h.dtype, device=h.device)
                 res_attn = torch.empty_like(h)
                 self._k1(i, layer, pool, idx, h, residual, res_attn, core)
@@ -265,7 +283,11 @@ class MonoDecode:
                     x = layer.input_layernorm(h)
                 else:
                     x, res_attn = layer.input_layernorm(h, residual)
-                core = layer.attention_core(positions, x, forward_batch).contiguous()
+                if _is_gdn(layer):
+                    core = layer.linear_attn.core(x, forward_batch).contiguous()
+                else:
+                    core = layer.attention_core(positions, x, forward_batch)
+                    core = core.contiguous()
             h, residual = self._k2(i, layer, core, res_attn)
         h, _ = model.norm(h, residual)
         return h
