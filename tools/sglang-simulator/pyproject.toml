@@ -15,7 +15,7 @@ dependencies = [
 [project.optional-dependencies]
 aic = [
     "aiconfigurator==0.10.0",
-    # aiconfigurator pins numpy~=1.26.4; pyarrow 26 requires NumPy 2 at import
-    # without declaring it.
+    # pyarrow 26 needs NumPy 2 at import, but aiconfigurator pins numpy 1.26.4;
+    # drop the cap once aiconfigurator allows NumPy 2.
     "pyarrow<26",
 ]

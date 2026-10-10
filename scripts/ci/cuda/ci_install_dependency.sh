@@ -842,8 +842,8 @@ install_extra_deps() {
     fi
 
     if [ "$IS_BLACKWELL" != "1" ]; then
-        # lmms_eval pins numpy==1.26.4, and pyarrow 26 requires NumPy 2 at import
-        # without declaring it, so a fresh resolve breaks `import datasets`.
+        # pyarrow 26 needs NumPy 2 at import, but lmms_eval pins numpy 1.26.4;
+        # drop the cap once lmms_eval allows NumPy 2.
         $PIP_CMD install "lmms_eval==0.5.0" "pyarrow<26" $PIP_INSTALL_SUFFIX
         # lmms_eval 0.5.0 pulls antlr4-python3-runtime==4.7.2, clobbering the
         # 4.9.3 that sgl-eval's latex2sympy2_extended needs (4.7.2 ImportError
