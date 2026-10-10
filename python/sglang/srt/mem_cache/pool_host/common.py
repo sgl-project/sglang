@@ -243,8 +243,25 @@ def alloc_with_host_register(
 ) -> torch.Tensor:
     """
     Allocate tensor and register host memory with cudaHostRegister.
-    CudaHostRegister only applies when pin_memory=True.
+    CudaHostRegister only applies when pin_memory=True. On ROCm with
+    HSA_USERPTR_FOR_PAGED_MEM=0, default-allocator pools come from hipHostMalloc.
     """
+    if _is_hip:
+        from sglang.srt.mem_cache.pool_host.hip_host_allocator import (
+            maybe_alloc_hip_owned_host_tensor,
+        )
+
+        buffer = maybe_alloc_hip_owned_host_tensor(
+            dims=dims,
+            dtype=dtype,
+            device=device,
+            pin_memory=pin_memory,
+            is_default_allocator=type(allocator) is HostTensorAllocator,
+        )
+        if buffer is not None:
+            # Not host-registered, so HostKVCache.destroy() must not unregister it.
+            setattr(buffer, _CUDA_HOST_REGISTERED_RANGES_ATTR, [])
+            return buffer
     buffer = allocator.allocate(dims, dtype=dtype, device=device)
     if pin_memory:
         _cuda_host_register(buffer, registration_granularity_bytes)
