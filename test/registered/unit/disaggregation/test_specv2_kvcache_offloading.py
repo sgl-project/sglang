@@ -10,7 +10,7 @@ Requires: torch, sglang (run in an environment with sglang installed)
 import gc
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 from weakref import WeakKeyDictionary as WeakKeyDict
 
 import torch
@@ -26,6 +26,7 @@ from sglang.srt.managers.scheduler_components.batch_result_processor import (
 )
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.utils import get_hash_str, get_storage_hash_str
 from sglang.srt.runtime_context import get_context
@@ -121,6 +122,56 @@ def _make_manager(pool_size: int, page_size: int = 1):
 class _FinishedEvent:
     def synchronize(self):
         pass
+
+
+class TestDecodeOffloadHostPool(unittest.TestCase):
+    def test_mla_host_pool_preserves_device_row_width(self):
+        kv_cache = object.__new__(MLATokenToKVPool)
+        kv_cache.kv_cache_dim = 416
+        allocator = MagicMock()
+        allocator.get_kvcache.return_value = kv_cache
+        server_args = SimpleNamespace(
+            page_size=64,
+            hicache_ratio=2.0,
+            hicache_size=0,
+            hicache_mem_layout="layer_first",
+            hicache_storage_backend_extra_config=None,
+            hicache_io_backend="kernel",
+            hicache_storage_backend=None,
+            served_model_name="test",
+        )
+
+        with (
+            patch(
+                "sglang.srt.disaggregation.decode_kvcache_offload_manager."
+                "build_kv_host_pool"
+            ) as build_host_pool,
+            patch(
+                "sglang.srt.disaggregation.decode_kvcache_offload_manager."
+                "HiCacheController"
+            ),
+            patch(
+                "sglang.srt.disaggregation.decode_kvcache_offload_manager.get_schedule",
+                return_value=SimpleNamespace(page_size=64),
+            ),
+            patch(
+                "sglang.srt.disaggregation.decode_kvcache_offload_manager.get_memory",
+                return_value=server_args,
+            ),
+            patch(
+                "sglang.srt.disaggregation.decode_kvcache_offload_manager.get_serving",
+                return_value=server_args,
+            ),
+            patch("torch.distributed.get_world_size", return_value=1),
+        ):
+            DecodeKVCacheOffloadManager(
+                req_to_token_pool=MagicMock(),
+                token_to_kv_pool_allocator=allocator,
+                tp_group=MagicMock(),
+                tree_cache=MagicMock(),
+            )
+
+        self.assertEqual(build_host_pool.call_args.kwargs["override_kv_cache_dim"], 416)
 
 
 class TestReleaseFinishedReq(unittest.TestCase):
