@@ -761,9 +761,13 @@ sglang serve \
 ```
 
 `auto` merges an adapter into ordinary resident weights to avoid per-step LoRA
-matmuls, but keeps the dynamic path for FSDP-sharded weights where a full
-gather can increase peak memory. Use `dynamic` when one resident server must
-switch repeatedly between base and LoRA output.
+matmuls. It keeps the dynamic path in two cases. One is FSDP-sharded weights,
+where a full gather can increase peak memory. The other is an adapter whose
+update would mostly round away in a BF16 merge. Distilled adapters such as the
+Larry Turbo LoRA sit below a BF16 ulp of most weights, and a merge drops
+77–97% of their update in typical layers. Use `dynamic` when one resident
+server must switch repeatedly between base and LoRA output, and `merge` to
+force a merge.
 
 Use the filename, scale, and request schedule from the table together. The
 4-evaluation LightX2V recipe is the more aggressive latency/quality tradeoff.
