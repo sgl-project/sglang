@@ -140,7 +140,6 @@ colors, textures, atmosphere, and so on\n - Identify the text clearly visible in
 explanation, and highlight it in the caption with quotation marks\n3. Maintain authenticity and accuracy:\n - Avoid
 generalizations\n - Describe all visible information in the image, while do not add information not explicitly shown in
 the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>assistant\n"""
-        self.default_sample_size = 128
 
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
