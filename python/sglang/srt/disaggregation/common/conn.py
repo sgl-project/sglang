@@ -40,8 +40,10 @@ from sglang.srt.disaggregation.utils import (
     get_dsv41_spec_layout,
 )
 from sglang.srt.environ import envs
+from sglang.srt.observability.kv_transfer_metrics import get_kv_transfer_timeout_counter
 from sglang.srt.runtime_context import (
     get_disagg,
+    get_observability,
     get_parallel,
     get_schedule,
     get_serving,
@@ -305,6 +307,9 @@ class CommonKVManager(BaseKVManager):
         self.is_hybrid_mla_backend = getattr(args, "is_hybrid_mla_backend", False)
         self.disaggregation_mode = disaggregation_mode
         self.server_args = server_args
+        self.kv_transfer_timeouts = get_kv_transfer_timeout_counter(
+            enabled=get_observability().enable_metrics
+        )
         self.enable_deferred_decode_kv_release = (
             envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE.get()
             and self.supports_deferred_decode_kv_release
@@ -1967,6 +1972,12 @@ class CommonKVSender(BaseKVSender):
         elapsed = time.time() - start
         if elapsed < self.kv_mgr.bootstrap_timeout:
             return None
+        if not getattr(self, "_timeout_event_recorded", False):
+            self._timeout_event_recorded = True
+            if (
+                counter := getattr(self.kv_mgr, "kv_transfer_timeouts", None)
+            ) is not None:
+                counter.labels(stage="bootstrap").inc()
         logger.warning_once(
             "Some requests timed out when bootstrapping, "
             "which means prefill instances fail to receive the KV indices from the decode instance of this request. "
@@ -2367,6 +2378,12 @@ class CommonKVReceiver(BaseKVReceiver):
         elapsed = time.time() - self.init_time
         if elapsed < self.kv_mgr.waiting_timeout:
             return None
+        if not getattr(self, "_timeout_event_recorded", False):
+            self._timeout_event_recorded = True
+            if (
+                counter := getattr(self.kv_mgr, "kv_transfer_timeouts", None)
+            ) is not None:
+                counter.labels(stage="transfer").inc()
         logger.warning_once(
             "Some requests fail to receive KV Cache transfer done signal after bootstrapping. "
             "If a greater mean TTFT is acceptable, you can 'export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=600' (10 minutes) to relax the timeout condition. "
