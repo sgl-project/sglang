@@ -1155,21 +1155,19 @@ inline void transfer_kv_page_first_direct_impl(
     }
   };
   DirectCopyWorkspace local_workspace;
-  auto& workspace = [&]() -> DirectCopyWorkspace& {
-    if constexpr (!IsLf2Pf) {
-      constexpr size_t kMaxRetainedCopies = 65536;
-      const bool is_mla = src_ptrs.size() == 1;
-      const size_t layers = is_mla ? dst_ptrs.size() : dst_ptrs.size() / 2;
-      const size_t copies = static_cast<size_t>(num_pages) * layers * (is_mla ? 1 : 2);
-      // Cache capacity, never a previous call's indices or buffer addresses.
-      // Oversized calls use local storage instead of growing the thread's cache.
-      if (copies <= kMaxRetainedCopies && dst_ptrs.size() <= kMaxRetainedCopies) {
-        static thread_local DirectCopyWorkspace cached_workspace;
-        return cached_workspace;
-      }
+  auto* workspace = &local_workspace;
+  if constexpr (!IsLf2Pf) {
+    constexpr size_t kMaxRetainedCopies = 65536;
+    const bool is_mla = src_ptrs.size() == 1;
+    const size_t layers = is_mla ? dst_ptrs.size() : dst_ptrs.size() / 2;
+    const size_t copies = static_cast<size_t>(num_pages) * layers * (is_mla ? 1 : 2);
+    // Retain capacity only; every call rebuilds its addresses and descriptors.
+    // Oversized calls use local storage to keep the thread's cache bounded.
+    if (copies <= kMaxRetainedCopies && dst_ptrs.size() <= kMaxRetainedCopies) {
+      static thread_local DirectCopyWorkspace cached_workspace;
+      workspace = &cached_workspace;
     }
-    return local_workspace;
-  }();
+  }
   struct ClearWorkspace {
     DirectCopyWorkspace& workspace;
     ~ClearWorkspace() {
@@ -1177,12 +1175,12 @@ inline void transfer_kv_page_first_direct_impl(
         workspace.clear();
       }
     }
-  } clear_workspace{workspace};
+  } clear_workspace{*workspace};
 
   size_t num_copies = 0;
-  auto& batch_srcs = workspace.srcs;
-  auto& batch_dsts = workspace.dsts;
-  auto& batch_sizes = workspace.sizes;
+  auto& batch_srcs = workspace->srcs;
+  auto& batch_dsts = workspace->dsts;
+  auto& batch_sizes = workspace->sizes;
   // Preserve D2H's local storage; H2D needs just one stack attribute index.
   std::vector<size_t> attrs_idxs(IsLf2Pf ? 1 : 0, 0);
   size_t first_attr_index = 0;
@@ -1259,8 +1257,8 @@ inline void transfer_kv_page_first_direct_impl(
     batch_dsts.reserve(num_copies);
     batch_sizes.reserve(num_copies);
 
-    auto& host_layer_bases = workspace.host_layer_bases;
-    auto& device_layer_bases = workspace.device_layer_bases;
+    auto& host_layer_bases = workspace->host_layer_bases;
+    auto& device_layer_bases = workspace->device_layer_bases;
     host_layer_bases.reserve(dst_ptrs.size());
     device_layer_bases.reserve(dst_ptrs.size());
     if (num_copies > 0) {
