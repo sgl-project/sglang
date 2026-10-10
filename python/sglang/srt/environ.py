@@ -1324,6 +1324,9 @@ class Envs:
     # residency margin so every cluster can launch beside other streams.
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS = EnvInt(2)
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_FUSE_SHARED_EXPERTS = EnvBool(True)
+    # Opt in to PR #462 locality allocation. Unavailable MLOPart keeps
+    # ordinary weights.
+    SGLANG_OPT_DEEPGEMM_MEGA_MOE_LOCALIZE_WEIGHTS = EnvBool(False)
 
     # ===================================================================
     # Top-k kernels

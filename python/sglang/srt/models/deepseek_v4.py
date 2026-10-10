@@ -4815,6 +4815,7 @@ class DeepseekV4ForCausalLM(nn.Module):
     def precompile_kernels_after_loading(self) -> None:
         from sglang.srt.layers.moe.mega_moe import (
             build_mega_moe_shared_weights,
+            prepare_mega_moe_locality,
             should_fuse_mega_moe_shared_experts,
         )
 
@@ -4828,12 +4829,16 @@ class DeepseekV4ForCausalLM(nn.Module):
             register_fused_all_reduce_comm()
 
         for module in self.modules():
-            if isinstance(
-                module, deepseek_v2.DeepseekV2MoE
-            ) and should_fuse_mega_moe_shared_experts(module):
+            if (
+                isinstance(module, deepseek_v2.DeepseekV2MoE)
+                and should_fuse_mega_moe_shared_experts(module)
+                and not getattr(module.experts, "_mega_moe_weights_localized", False)
+            ):
                 module.mega_shared_l1_weights, module.mega_shared_l2_weights = (
                     build_mega_moe_shared_weights(module.shared_experts)
                 )
+
+        prepare_mega_moe_locality(self)
 
     @staticmethod
     def remap_weight_name_to_dpsk_hf_format(
