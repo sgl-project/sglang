@@ -6,7 +6,15 @@ import threading
 import time
 from dataclasses import replace
 from queue import Queue
-from typing import TYPE_CHECKING, Iterator, NamedTuple, Optional, Sequence, TypeVar
+from typing import (
+    TYPE_CHECKING,
+    Callable,
+    Iterator,
+    NamedTuple,
+    Optional,
+    Sequence,
+    TypeVar,
+)
 
 import torch
 
@@ -653,9 +661,18 @@ class UnifiedRadixCache(BasePrefixCache):
         A component eviction can cascade to its peers; with a shared memory pool,
         those collateral frees can satisfy the original allocation before the
         triggering component's requested count is reached.
+
+        With ``params.alloc_demand`` set, eviction stops as soon as the allocator
+        reports that FULL/SWA demand fits, and the counts only cap each component.
         """
         if self.disable:
             return EvictResult()
+
+        if params.alloc_demand is not None:
+            assert params.mamba_num == 0, "alloc_demand covers FULL/SWA only"
+            fits = self.token_to_kv_pool_allocator.allocation_fits
+            full_tokens, swa_tokens = params.alloc_demand
+            return self._evict(params, stop_when=lambda: fits(full_tokens, swa_tokens))
 
         request_by_type = self._evict_request_by_type(params)
         available_size_targets = {
@@ -747,6 +764,8 @@ class UnifiedRadixCache(BasePrefixCache):
         available_size_targets: Optional[
             dict[ComponentType, tuple[ComponentType, int]]
         ] = None,
+        *,
+        stop_when: Optional[Callable[[], bool]] = None,
     ) -> EvictResult:
         if self.disable:
             return EvictResult()
@@ -758,6 +777,7 @@ class UnifiedRadixCache(BasePrefixCache):
             request_by_type,
             tracker,
             available_size_targets=available_size_targets,
+            stop_when=stop_when,
         )
 
         if (
@@ -879,6 +899,7 @@ class UnifiedRadixCache(BasePrefixCache):
         available_size_targets: Optional[
             dict[ComponentType, tuple[ComponentType, int]]
         ] = None,
+        stop_when: Optional[Callable[[], bool]] = None,
     ) -> None:
         # Buffer mode: eviction always wins over queued backup intents — a
         # destroyed victim's intent is stale-swept and the content rewrites
@@ -888,6 +909,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
         def target_reached(component_type: ComponentType) -> bool:
             nonlocal last_mamba_donor_check, mamba_donor_prepared
+            if stop_when is not None:
+                return stop_when()
             if available_size_targets is None:
                 return False
             target = available_size_targets.get(component_type)
