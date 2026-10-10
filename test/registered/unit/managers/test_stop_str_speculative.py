@@ -7,10 +7,13 @@ a fake tokenizer; pure CPU. Each test guards a distinct branch of
 
 import unittest
 from array import array
+from unittest.mock import patch
 
+from sglang.srt.managers.detokenizer_manager import DetokenizerManager
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -66,7 +69,7 @@ def _make_req(output_ids, stop=None, stop_regex=None, eos_token_ids=frozenset())
     return req
 
 
-class TestStopStrSpeculative(unittest.TestCase):
+class TestStopStrSpeculative(CustomTestCase):
     def test_no_stop_does_not_finish(self):
         req = _make_req([10, 11, 12, 20, 21, 22, 23, 24], stop=["STOP"])
         req.update_finish_state(new_accepted_len=6)
@@ -105,10 +108,15 @@ class TestStopStrSpeculative(unittest.TestCase):
     def test_stop_str_non_spec_single_token(self):
         # new_accepted_len == 1: locate's range is empty -> fallback (non-spec
         # path preserved, no extra decode).
-        req = _make_req([10, 11, STOP_ID], stop=["STOP"])
-        req.update_finish_state(new_accepted_len=1)
+        req = _make_req([10, 11, STOP_ID], stop=["OP", "ST", "STOP"])
+        with patch.object(
+            req.tokenizer, "decode", wraps=req.tokenizer.decode
+        ) as decode:
+            req.update_finish_state()
         self.assertTrue(req.finished())
+        self.assertEqual(req.finished_reason.matched, "OP")
         self.assertEqual(req.finished_len, 3)
+        self.assertEqual(decode.call_count, 1)
 
     def test_stop_str_spanning_two_tokens(self):
         # "XY" completes only once both tokens (70, 71) are decoded -> finished_len
@@ -117,6 +125,61 @@ class TestStopStrSpeculative(unittest.TestCase):
         req.update_finish_state(new_accepted_len=6)
         self.assertTrue(req.finished())
         self.assertEqual(req.finished_len, 4)
+
+    def test_multiple_stop_strs_match_sequential_token_boundary(self):
+        # A later-listed stop can complete before the first-listed stop within
+        # one accepted chunk. Selection must match one-token-at-a-time decoding.
+        cases = [
+            ([], [10, STOP_ID, 70, 71], ["XY", "STOP"], "STOP", 2, "k"),
+            ([10, 70], [71, STOP_ID, 11], ["STOP", "XY"], "XY", 3, "k"),
+            ([], [10, STOP_ID, 70, 71], ["STOPXY", "STOP"], "STOP", 2, "k"),
+        ]
+        manager = DetokenizerManager.__new__(DetokenizerManager)
+        for prefix, chunk, stops, matched, finished_len, text in cases:
+            for stop_order in (stops, stops[::-1]):
+                with self.subTest(prefix=prefix, chunk=chunk, stops=stop_order):
+                    req = _make_req(prefix + chunk, stop=stop_order)
+                    req.update_finish_state(new_accepted_len=len(chunk))
+                    sequential = _make_req(prefix, stop=stop_order)
+                    for token in chunk:
+                        sequential.output_ids.append(token)
+                        sequential.update_finish_state()
+                        if sequential.finished():
+                            break
+
+                    self.assertTrue(req.finished())
+                    self.assertEqual(req.finished_reason.matched, matched)
+                    self.assertEqual(req.finished_len, finished_len)
+                    self.assertEqual(
+                        req.finished_reason.to_json(),
+                        sequential.finished_reason.to_json(),
+                    )
+                    self.assertEqual(req.finished_len, sequential.finished_len)
+                    self.assertEqual(
+                        req.output_ids_through_stop, sequential.output_ids_through_stop
+                    )
+                    self.assertEqual(list(req.output_ids), prefix + chunk)
+                    for no_stop_trim in (False, True):
+                        self.assertEqual(
+                            manager.trim_matched_stop(
+                                req.tokenizer.decode(req.output_ids_through_stop),
+                                req.finished_reason.to_json(),
+                                no_stop_trim,
+                            ),
+                            text + matched if no_stop_trim else text,
+                        )
+
+    def test_stop_strs_completing_in_same_token_keep_list_priority(self):
+        # Both strings appear in the STOP token. Character position must not
+        # override list priority when the first matching token is the same.
+        for stop_order in (["OP", "ST"], ["ST", "OP"]):
+            for chunk in ([STOP_ID], [STOP_ID, 70, 71]):
+                with self.subTest(stops=stop_order, chunk=chunk):
+                    req = _make_req([10] + chunk, stop=stop_order)
+                    req.update_finish_state(new_accepted_len=len(chunk))
+                    self.assertEqual(req.finished_reason.matched, stop_order[0])
+                    self.assertEqual(req.finished_len, 2)
+                    self.assertEqual(list(req.output_ids_through_stop), [10, STOP_ID])
 
     # --- regex matched() branch ---
     def test_stop_regex_midchunk(self):
@@ -145,6 +208,19 @@ class TestStopStrSpeculative(unittest.TestCase):
         req.update_finish_state(new_accepted_len=3)
         self.assertTrue(req.finished())
         self.assertIsNone(req.finished_len)
+
+    def test_decoded_text_fallback_keeps_existing_list_priority(self):
+        for stops, output_ids, matched, finished_len in [
+            (["XY", "STOP"], [10, STOP_ID, 11], "XY", None),
+            (["STOP", "XY"], [10, STOP_ID, 11], "STOP", 2),
+            (["XY", "fallback", "STOP"], [10, STOP_ID, 70, 71], "STOP", 2),
+        ]:
+            with self.subTest(stops=stops):
+                req = _make_req(output_ids, stop=stops)
+                req.decoded_text = "earlier XY fallback text"
+                req.update_finish_state(new_accepted_len=len(output_ids))
+                self.assertEqual(req.finished_reason.matched, matched)
+                self.assertEqual(req.finished_len, finished_len)
 
 
 if __name__ == "__main__":
