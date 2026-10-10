@@ -460,3 +460,26 @@ def test_unreachable_hub_falls_back_to_cached_model_index(monkeypatch, tmp_path)
     assert hf_diffusers_utils._resolve_remote_repo_model_index_path("org/model") == str(
         cached
     )
+
+
+def test_unreachable_hub_is_not_reported_as_single_model_repo(monkeypatch):
+    """With the Hub unreachable and nothing cached, the repo must not be assumed to
+    be a single model (which ends in a misleading "-Diffusers" hint)."""
+
+    def offline(*args, **kwargs):
+        raise LocalEntryNotFoundError("offline")
+
+    downloads = []
+    monkeypatch.setattr(
+        hf_diffusers_utils, "maybe_load_overlay_model_index", lambda *a, **k: None
+    )
+    monkeypatch.setattr(
+        hf_diffusers_utils, "_resolve_remote_repo_model_index_path", offline
+    )
+    monkeypatch.setattr(
+        hf_diffusers_utils, "maybe_download_model", lambda *a, **k: downloads.append(a)
+    )
+
+    with pytest.raises(ValueError, match="Failed to download or parse"):
+        hf_diffusers_utils.maybe_download_model_index("org/model")
+    assert downloads == []

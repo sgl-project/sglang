@@ -844,7 +844,11 @@ def maybe_download_model_index(model_name_or_path: str) -> dict[str, Any]:
             config["_class_name"],
         )
         return config
-    except EntryNotFoundError:
+    except EntryNotFoundError as e:
+        if isinstance(e, LocalEntryNotFoundError):
+            raise ValueError(
+                f"Failed to download or parse model_index.json for {model_name_or_path}: {e}"
+            ) from e
         logger.debug(
             "model_index.json not found for %s. Assuming it is a single model and downloading it.",
             model_name_or_path,
