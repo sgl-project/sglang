@@ -22,6 +22,7 @@ and combine stay pure no-ops; this module owns the layer build + forward.
 
 from __future__ import annotations
 
+import inspect
 import logging
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
@@ -137,10 +138,24 @@ def _forward_megamoe_legacy(mega: Any, tensors: Any) -> torch.Tensor:
     return mega.forward(tensors)
 
 
-def _select_megamoe_forward(mega: Any) -> Callable[[Any, Any], torch.Tensor]:
-    import inspect
+def _megamoe_uses_persistent_topk_reduce(mega: Any) -> bool:
+    return bool(
+        getattr(
+            getattr(mega, "_megakernel_config", None),
+            "topk_reduce_persistent",
+            False,
+        )
+    )
 
-    if "return_workspace_view" in inspect.signature(mega.forward).parameters:
+
+def _select_megamoe_forward(mega: Any) -> Callable[[Any, Any], torch.Tensor]:
+    # Persistent top-k reduce needs the output extent to be the runtime token
+    # count. The workspace view is capacity-sized, so keep it for the static
+    # reducer only.
+    if (
+        not _megamoe_uses_persistent_topk_reduce(mega)
+        and "return_workspace_view" in inspect.signature(mega.forward).parameters
+    ):
         return _forward_megamoe_with_workspace_view
     return _forward_megamoe_legacy
 
@@ -195,6 +210,45 @@ def _scalar_float(value: Any) -> float:
     if isinstance(value, torch.Tensor):
         return float(value.detach().to(torch.float32).max())
     return float(value)
+
+
+def _make_supported_config(config_cls: Any, **kwargs: Any) -> Any:
+    """Instantiate a FlashInfer config while tolerating older wheels.
+
+    The persistent top-k reduce knob is introduced on the FlashInfer side first.
+    Filtering unknown kwargs keeps this adapter importable with older FlashInfer
+    builds while automatically enabling the new scheduler once the config class
+    grows the parameter.
+    """
+    signature = inspect.signature(config_cls)
+    if any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in signature.parameters.values()
+    ):
+        return config_cls(**kwargs)
+
+    supported = {
+        name: value for name, value in kwargs.items() if name in signature.parameters
+    }
+    return config_cls(**supported)
+
+
+def _make_supported_moe_ep_tensors(tensors_cls: Any, **kwargs: Any) -> Any:
+    signature = inspect.signature(tensors_cls)
+    if any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in signature.parameters.values()
+    ):
+        return tensors_cls(**kwargs)
+
+    supported = {
+        name: value for name, value in kwargs.items() if name in signature.parameters
+    }
+    return tensors_cls(**supported)
+
+
+def _topk_reduce_persistent_enabled() -> bool:
+    return bool(envs.SGLANG_FLASHINFER_MEGAMOE_TOPK_REDUCE_PERSISTENT.get())
 
 
 def _local_expert_vector(value: torch.Tensor, num_local_experts: int) -> torch.Tensor:
@@ -319,10 +373,12 @@ def ensure_fp4_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
 
     return _ensure_flashinfer_megamoe_layer(
         layer,
-        megakernel_config=DeepGemmMegaMoeConfig(
+        megakernel_config=_make_supported_config(
+            DeepGemmMegaMoeConfig,
             intermediate_size=layer.intermediate_size_per_partition,
             top_k=layer.top_k,
             activation_clamp=layer.moe_runner_config.swiglu_limit,
+            topk_reduce_persistent=_topk_reduce_persistent_enabled(),
         ),
         w13_scale=layer.w13_weight_scale_inv,
         w2_scale=layer.w2_weight_scale_inv,
@@ -355,12 +411,14 @@ def ensure_nvfp4_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
 
     return _ensure_flashinfer_megamoe_layer(
         layer,
-        megakernel_config=Nvfp4CutedslMegaMoeConfig(
+        megakernel_config=_make_supported_config(
+            Nvfp4CutedslMegaMoeConfig,
             intermediate_size=layer.intermediate_size_per_partition,
             top_k=layer.top_k,
             gate_up_clamp=layer.moe_runner_config.swiglu_limit,
             apply_topk_in_fc1=True,
             in_kernel_fc2_reduce=envs.SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE.get(),
+            topk_reduce_persistent=_topk_reduce_persistent_enabled(),
             combine_dtype=resolve_flashinfer_megamoe_combine_dtype(),
             input_norm_const=input_norm_const,
             fc1_alpha=layer.g1_alphas,
@@ -381,12 +439,14 @@ def ensure_mxfp8_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
 
     return _ensure_flashinfer_megamoe_layer(
         layer,
-        megakernel_config=Mxfp8CutedslMegaMoeConfig(
+        megakernel_config=_make_supported_config(
+            Mxfp8CutedslMegaMoeConfig,
             intermediate_size=layer.intermediate_size_per_partition,
             top_k=layer.top_k,
             kind="mxfp8_e4m3",
             gate_up_clamp=layer.moe_runner_config.swiglu_limit,
             in_kernel_fc2_reduce=envs.SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE.get(),
+            topk_reduce_persistent=_topk_reduce_persistent_enabled(),
         ),
         w13_scale=layer.w13_weight_scale_inv,
         w2_scale=layer.w2_weight_scale_inv,
@@ -567,6 +627,7 @@ def _ensure_shared_workspace(mega: Any) -> None:
         getattr(kc, "kind", None),
         getattr(kc, "in_kernel_fc2_reduce", None),
         getattr(kc, "combine_dtype", None),
+        getattr(kc, "topk_reduce_persistent", None),
         getattr(kc, "token_back_by_dispatch", None),
         getattr(kc, "fast_math", None),
         mc.quantize_input,
@@ -601,12 +662,14 @@ def run_flashinfer_megamoe(
     mega = quant_info.mega
     _ensure_shared_workspace(mega)
 
-    t = MoEEpTensors(
+    t = _make_supported_moe_ep_tensors(
+        MoEEpTensors,
         hidden_states=x.to(torch.bfloat16),
         # FlashInfer's fused staging accepts the int32 router output and widens
         # directly into its final int64 workspace buffer. Keep this path copy-free.
         topk_ids=topk_ids,
         topk_weights=topk_weights.to(torch.float32),
+        num_tokens=x.shape[0],
         fc1_alpha=quant_info.fc1_alpha,
         fc2_alpha=quant_info.fc2_alpha,
         fc1_norm_const=quant_info.fc1_norm_const,
