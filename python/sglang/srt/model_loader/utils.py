@@ -264,7 +264,7 @@ def get_architecture_class_name(model_config: ModelConfig) -> str:
 
 
 def should_deepgemm_weight_requant_ue8m0(
-    weight_block_size, output_dtype=None, weight_shape=None
+    weight_block_size, output_dtype=None, weight_shape=None, *, is_grouped=False
 ):
     """Should we requant fp8 weights into UE8M0 format when loading the model.
 
@@ -281,7 +281,7 @@ def should_deepgemm_weight_requant_ue8m0(
         return False
     # SM120 routes dense block-FP8 GEMMs to CUTLASS/Triton (fp32 scales);
     # only the grouped MoE GEMM consumes DeepGEMM layouts there.
-    if get_device_sm() == 120:
+    if get_device_sm() == 120 and not is_grouped:
         return False
     if output_dtype is not None and output_dtype != torch.bfloat16:
         return False
