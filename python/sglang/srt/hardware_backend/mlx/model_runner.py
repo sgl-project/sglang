@@ -151,6 +151,26 @@ _MLX_QUANTIZATION_PRESETS: dict[str, tuple[int, int]] = {
 _MLX_KV_FLOAT_DTYPES = {mx.float16, mx.bfloat16, mx.float32}
 
 
+def resolve_headless_trunk(model) -> object | None:
+    """Return the logit-head-free trunk callable of ``model``, or None.
+
+    mlx-lm text models expose it as ``Model.model``; VL-family wrappers
+    (e.g. ``qwen3_5``, whose ``Model`` holds a ``language_model``) nest it one
+    level deeper, as ``Model.language_model.model``.  Mirrors the resolution
+    ``_extract_model_components`` already uses, so the two paths cannot drift.
+
+    The trunk is what lets a non-final chunked-prefill chunk update its KV /
+    auxiliary state without materialising vocab-sized logits for positions
+    whose next token is discarded (``_trunk_forward``).  Returning None keeps
+    the safe fallback: the caller runs the full model.
+    """
+    root = getattr(model, "language_model", model)
+    trunk = getattr(root, "model", None)
+    if trunk is None:
+        trunk = getattr(model, "model", None)
+    return trunk if callable(trunk) else None
+
+
 class MlxModelRunner:
     """MLX model runner with radix-cache prefix sharing."""
 
@@ -566,14 +586,15 @@ class MlxModelRunner:
         load_time = time.time() - start_time
         logger.info(f"MLX model loaded in {load_time:.2f}s")
 
-        # mlx-lm models expose the headless trunk as ``Model.model``; without
-        # it, non-final chunked-prefill chunks cannot skip the logit head.
-        trunk = getattr(self.model, "model", None)
-        self._trunk = trunk if callable(trunk) else None
+        # mlx-lm models expose the headless trunk as ``Model.model`` (VL-family
+        # wrappers nest it under ``language_model``); without it, non-final
+        # chunked-prefill chunks cannot skip the logit head.
+        self._trunk = resolve_headless_trunk(self.model)
         if self._trunk is None:
             logger.info(
-                "Model %s exposes no headless trunk (`.model`); non-final "
-                "chunked-prefill chunks will compute full vocab logits.",
+                "Model %s exposes no headless trunk (`.model` / "
+                "`.language_model.model`); non-final chunked-prefill chunks "
+                "will compute full vocab logits.",
                 type(self.model).__name__,
             )
 
