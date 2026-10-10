@@ -91,6 +91,12 @@ def _mtp_quant_config(quant_config):
     return quant_config
 
 
+class _ReducedLMHead(nn.Module):
+    def __init__(self, weight: torch.Tensor):
+        super().__init__()
+        self.weight = weight
+
+
 class Qwen3_5ForCausalLMMTP(nn.Module):
     # The loader reads this off the model class and hands it to the quant
     # config, which needs it to expand fused module names (qkv_proj ->
@@ -176,6 +182,13 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         if head is not None and not self.config.tie_word_embeddings:
             del self.lm_head.weight
             self.lm_head.weight = head
+        elif (
+            head is not None
+            and head.shape[0] != self.model.embed_tokens.weight.shape[0]
+        ):
+            # --speculative-token-map: EAGLE maps draft index i to hot_token_id[i],
+            # so a tied draft must score the reduced rows, not its full embedding.
+            self.lm_head = _ReducedLMHead(head)
         current_platform.empty_cache()
         current_platform.synchronize()
 
