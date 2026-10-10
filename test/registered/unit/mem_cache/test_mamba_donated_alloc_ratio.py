@@ -88,6 +88,7 @@ def _build_peak(pool_size: int, lock_prefixes: bool):
     prefill peak) or left evictable (decode steady state after skip_mamba)."""
     cache = _RatioCache(pool_size)
     component = object.__new__(MambaComponent)
+    component._skipped_checkpoint_count = 0
     component.cache = cache
     # The TreeCore owns the tree member-var state the component reads through.
     component.tree_core = cache
@@ -260,7 +261,7 @@ class TestMambaDonatedAllocRatio(unittest.TestCase):
             cache_len = component.prepare_for_caching_req(
                 req, insert_params, token_ids_len=128, is_finished=False
             )
-        self.assertIn("No free mamba slot to donate", logs.output[0])
+        self.assertIn("Skipping Mamba checkpoint", logs.output[0])
         self.assertEqual(cache_len, 0)
         self.assertIsNone(insert_params.mamba_value)
         self.assertEqual(cache.allocator.free_ids, [])

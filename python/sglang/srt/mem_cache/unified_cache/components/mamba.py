@@ -78,6 +78,7 @@ class MambaComponent(TreeComponent):
                 f"MambaComponent requires page_size=1 when mamba_extra_buffer is disabled, got {params.page_size}"
             )
         super().__init__(cache, params)
+        self._skipped_checkpoint_count = 0
         self.mamba_cache_chunk_size = mamba_cache_chunk_size()
         # params.page_size is the tree page the allocator actually uses, already
         # widened by dcp_size, so it is the one grid a checkpoint depth can land on.
@@ -514,24 +515,21 @@ class MambaComponent(TreeComponent):
             slot = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
         return slot
 
-    # Skipped donations recur at every chunk boundary while the pool stays
-    # pinned, so log the first one and then every 1000th.
-    _skipped_donations = 0
-
-    def _log_skipped_donation(self, req: Req) -> None:
-        self._skipped_donations += 1
-        if self._skipped_donations == 1 or self._skipped_donations % 1000 == 0:
+    def _record_skipped_checkpoint(self, req: Req) -> None:
+        self._skipped_checkpoint_count += 1
+        count = self._skipped_checkpoint_count
+        if count == 1 or count % 1000 == 0:
             ct = self.component_type
             allocator = self.cache.req_to_token_pool.mamba_allocator
             logger.warning(
-                "No free mamba slot to donate the checkpoint of request %s at "
-                "seqlen %s; skipping it (%d skipped so far). Pool: available=%d "
+                "Skipping Mamba checkpoint: no slot available after eviction "
+                "for request %s at seqlen %s (%d skipped so far). Pool: available=%d "
                 "evictable=%d protected=%d. Every slot is held by a running "
                 "request: raise --max-mamba-cache-size or "
                 "--mamba-full-memory-ratio to keep prefix reuse.",
                 req.rid,
                 req.kv.mamba_last_track_seqlen,
-                self._skipped_donations,
+                count,
                 allocator.available_size(),
                 self.tree_core.component_evictable_size_[ct],
                 self.tree_core.component_protected_size_[ct],
@@ -642,7 +640,7 @@ class MambaComponent(TreeComponent):
             if needs_new_slot:
                 new_slot = self._try_alloc_mamba_slot()
                 if new_slot is None:
-                    self._log_skipped_donation(req)
+                    self._record_skipped_checkpoint(req)
                     return 0
             if self.int8_ckpt_pool is not None:
                 if self.cache.enable_mamba_extra_buffer:
