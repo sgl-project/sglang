@@ -22,6 +22,7 @@ class KVCacheBuildResult:
     token_to_kv_pool_allocator: object
     disable_radix_cache: bool
     tree_cache: object
+    storage_contributor: object = None
 
 
 from typing import TYPE_CHECKING
@@ -244,6 +245,96 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
     return backend
 
 
+def _decode_cache_owns_store(
+    *,
+    disable_radix_cache: bool,
+    enable_hierarchical_cache: bool,
+    retraction_backup: str,
+    hicache_storage_backend: Optional[str],
+    external_linker: bool,
+) -> bool:
+    # Must match default_radix_cache_factory and create_unified_radix_cache:
+    # a chunk cache ignores store flags, and HiCache takes precedence over a linker.
+    if disable_radix_cache and retraction_backup != "host_pool":
+        return False
+    if enable_hierarchical_cache or retraction_backup == "host_pool":
+        return hicache_storage_backend is not None
+    return external_linker
+
+
+def _decode_store_contribution_bytes(
+    *, disaggregation_mode: str, cache_owns_store: bool
+) -> int:
+    if disaggregation_mode != "decode" or cache_owns_store:
+        # Other roles, and a decode cache with its own store, mount through it.
+        return 0
+    # Decode keeps no store-backed cache; it lends memory only when sized like prefill.
+    if not envs.MOONCAKE_GLOBAL_SEGMENT_SIZE.is_set():
+        return 0
+    if envs.MOONCAKE_STANDALONE_STORAGE.get():
+        logger.info(
+            "Decode rank mounts no Mooncake segment: MOONCAKE_STANDALONE_STORAGE "
+            "leaves host capacity to the local store service."
+        )
+        return 0
+    if not envs.MOONCAKE_MASTER.is_set():
+        logger.warning(
+            "Ignoring MOONCAKE_GLOBAL_SEGMENT_SIZE on a decode rank: lending "
+            "capacity needs MOONCAKE_MASTER."
+        )
+        return 0
+
+    from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+        _parse_global_segment_size,
+    )
+
+    return max(0, _parse_global_segment_size(envs.MOONCAKE_GLOBAL_SEGMENT_SIZE.get()))
+
+
+def _maybe_create_decode_storage_contributor(
+    *, server_args: ServerArgs, params, cache_owns_store: bool
+) -> object:
+    contribution_bytes = _decode_store_contribution_bytes(
+        disaggregation_mode=get_disagg().disaggregation_mode,
+        cache_owns_store=cache_owns_store,
+    )
+    if contribution_bytes == 0:
+        return None
+
+    from sglang.srt.mem_cache.hicache_storage import HiCacheStorageConfig
+    from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+        MooncakeStore,
+    )
+
+    parallel = get_parallel()
+    storage_config = HiCacheStorageConfig(
+        tp_rank=parallel.attn_tp_rank,
+        tp_size=parallel.attn_tp_size,
+        pp_rank=params.pp_rank,
+        pp_size=params.pp_size,
+        attn_cp_rank=params.attn_cp_rank,
+        attn_cp_size=params.attn_cp_size,
+        is_mla_model=False,
+        enable_storage_metrics=False,
+        is_page_first_layout=False,
+        model_name=server_args.model_path,
+    )
+    # A segment without a cache pool, so no KV is read or written through it.
+    contributor = MooncakeStore(storage_config=storage_config, mem_pool=None)
+    logger.info(
+        "Decode rank lends Mooncake capacity (MOONCAKE_GLOBAL_SEGMENT_SIZE=%d "
+        "bytes): attn_tp_rank=%d/%d, attn_cp_rank=%d/%d, pp_rank=%d/%d",
+        contribution_bytes,
+        parallel.attn_tp_rank,
+        parallel.attn_tp_size,
+        params.attn_cp_rank,
+        params.attn_cp_size,
+        params.pp_rank,
+        params.pp_size,
+    )
+    return contributor
+
+
 def build_kv_cache(
     *,
     server_args: ServerArgs,
@@ -358,6 +449,18 @@ def build_kv_cache(
         mtp_draft_device_pools=mtp_draft_device_pools,
     )
 
+    storage_contributor = _maybe_create_decode_storage_contributor(
+        server_args=server_args,
+        params=params,
+        cache_owns_store=_decode_cache_owns_store(
+            disable_radix_cache=disable_radix_cache,
+            enable_hierarchical_cache=enable_hierarchical_cache,
+            retraction_backup=retraction_backup,
+            hicache_storage_backend=get_memory().hicache_storage_backend,
+            external_linker=get_memory().enable_unified_cache_external_linker,
+        ),
+    )
+
     tree_context = TreeCacheBuildContext(
         server_args=server_args,
         params=params,
@@ -400,6 +503,7 @@ def build_kv_cache(
     init_mm_embedding_cache(embedding_cache_size * 1024 * 1024)
 
     return KVCacheBuildResult(
+        storage_contributor=storage_contributor,
         is_hybrid_swa=is_hybrid_swa,
         is_hybrid_ssm=is_hybrid_ssm,
         sliding_window_size=sliding_window_size,
