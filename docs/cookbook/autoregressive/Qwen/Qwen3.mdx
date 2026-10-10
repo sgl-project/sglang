@@ -53,6 +53,319 @@ import { Qwen3Deployment } from "/src/snippets/autoregressive/qwen3-deployment.j
   - `--speculative-draft-model-path`: The path of the draft model weights. This can be a local folder or a Hugging Face repo ID such as [`lmsys/SGLang-EAGLE3-Qwen3-235B-A22B-Instruct-2507-SpecForge-Meituan`](https://huggingface.co/lmsys/SGLang-EAGLE3-Qwen3-235B-A22B-Instruct-2507-SpecForge-Meituan).
 - **Xeon CPU service configuration:** Please refer to the `Notes` part in the serving engine launching section in [the SGLang CPU server document](../../../docs/hardware-platforms/cpu_server#launch-of-the-serving-engine) to better understand how to configure the arguments, especially for TP (tensor parallel) and NUMA binding settings.
 
+### 3.3 Ascend NPU deployment
+
+Use the selector below for **single-node, PD co-located** deployment: the same
+SGLang service handles prefill and decode. Select **A3** for the measured 8B and
+30B-A3B recipes, or **A2** for 32B recipes and the pending 235B-A22B candidate.
+Then select the model, quantization, and workload.
+
+An A3 physical card contains two 64 GB dies; an A2 card has one 64 GB device.
+Tensor parallelism counts logical devices: TP4 requires four A2 cards or two A3
+cards. The selector shows the card and device requirements for each recipe.
+See the [Ascend hardware reference](/docs/hardware-platforms/ascend-npus/reference/glossary#hardware).
+
+| Model | Quantization | Workload | Hardware / physical cards | Logical devices / TP | Status |
+| --- | --- | --- | --- | --- | --- |
+| Qwen3-8B | W8A8 | Low latency | A3 / 1 | 2 | Measured |
+| Qwen3-8B | W8A8 | High throughput | A3 / 1 allocated | 1 | Performance measured; accuracy includes one rejected request |
+| Qwen3-30B-A3B | W8A8 | Low latency / high throughput | A3 / 1 | 2 | Measured |
+| Qwen3-32B | BF16 | Low latency | A2 / 4 | 4 | Measured |
+| Qwen3-32B | W8A8 | High throughput | A2 / 4 | 4 | Measured |
+| Qwen3-235B-A22B | W8A8 | High throughput | A2 / 8 | 8 | Validation candidate |
+
+The 32B W8A8 recipe follows the command in the
+[A2 best practice](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_32b#qwen3-32b-w8a8-2p-in3k5-out1k5-55ms-a2-series).
+That source labels the scenario as two cards but launches with `--tp-size 4`.
+This selector explicitly requires four A2 devices to match the command.
+
+The measured 32B BF16 recipe uses TP4, up to eight concurrent requests, chunked prefill,
+and decode graph capture for batch sizes 1, 2, 4, and 8. Its low-latency
+performance workload uses client concurrency 1; GSM8K uses client concurrency 8.
+The 235B W8A8 candidate uses the tutorial's recommended TP8 with eight concurrent
+requests. Both start without EAGLE3; the 235B candidate disables graph capture and uses
+pure tensor parallelism. The A2 recipes do not inherit the A3 reference's TP16,
+DP16, fused MoE settings, or latency
+targets. The 32B W8A8 recipe passed startup, temperature-0/1 inference,
+its complete performance workload, and full GPQA evaluation with the corrected
+output budget. The 32B BF16
+recipe passed startup, temperature-0/1 inference, performance, and full GSM8K
+evaluation. The 235B W8A8 candidate still requires runtime validation.
+
+<Info>
+The [235B model tutorial](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/qwen3_235b_a22b#model-weights)
+recommends 16 × 64 GB devices for BF16: two eight-card A2 nodes. That deployment
+needs a separate distributed configuration and validation of communication
+between the nodes. It remains pending and is not offered by this single-node
+selector. Its approximately 470 GB checkpoint also exceeds a 300 GB local volume;
+prepare sufficient shared storage before starting an instance.
+</Info>
+
+<Note>
+The 8B throughput reference uses TP=1, which uses one die of an A3 card. Preserve
+that topology when reproducing its benchmark. Changing the device count, draft
+model, or workload requires a new performance measurement.
+</Note>
+
+#### Prepare the environment and weights
+
+Complete [SGLang installation with NPU support](/docs/hardware-platforms/ascend-npus/getting-started/installation)
+and check `npu-smi info` before launching a recipe. These commands target SGLang
+**main**. Use the dependency combination documented for your CANN version and
+record the exact SGLang commit and runtime versions used for your run. The linked
+Ascend tutorials describe v0.5.16; earlier releases can use different flags.
+
+The A3 measurements and A2 32B validation use the following environments:
+
+| Component | A3, 2026-09-12 | A2 32B, 2026-09-22–23 |
+| :--- | :--- | :--- |
+| SGLang | `main` at `c389dd086340878934bf96bc209534f1fbb8440c` | `main` at `b44e2486824e2fbde9cbcb09adad10bce5593c16` |
+| CANN | `9.0.0` | `9.0.0` |
+| PyTorch / torch-npu | `2.10.0+cpu` / `2.10.0` | `2.10.0+cpu` / `2.10.0` |
+| sgl-kernel-npu | `2026.9.0` | `2026.9.0`, 910B / aarch64 package |
+| triton-ascend | `3.2.1.dev20260530` | `3.2.1.dev20260530` |
+| Transformers | `5.8.1` | `5.12.1` |
+
+This records the tested platform environment. For a new installation, follow the
+linked dependency matrix and record any differences. EAGLE3 sampling at the A3
+measured commit requires `sgl_kernel_npu.sample.chain_speculative_sampling_triton`; the
+platform's older `2026.5.1` kernel failed on nonzero-temperature requests. The
+tested `2026.9.0` kernel provides that function.
+
+The A2 environment has four Ascend 910B3 devices and uses `memfabric-hybrid 1.1.4`
+and `memfabric-zbal 1.1.2`. Install the CANN 9.0.0 / 910B custom-ops,
+ops-transformer, and kernel packages from the [matching official release](https://github.com/sgl-project/sgl-kernel-npu/releases/tag/2026.9.0). The A2
+measurements use the selected recipe without additional host tuning; they do
+not establish a controlled speedup over the published reference.
+
+Download the main checkpoint before starting the service. For recipes that enable
+EAGLE3, also download the matching **EAGLE3 draft**. The following tutorials provide
+weight sources and environment setup; select the **A2 / 910B** environment for A2
+hardware and the **A3** environment for A3 hardware:
+
+- [Qwen3-8B](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/qwen3_8b#model-weights)
+- [Qwen3-30B-A3B](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/qwen3_30b_a3b#model-weights)
+- [Qwen3-32B](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/qwen3_32b#model-weights)
+- [Qwen3-235B-A22B](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/qwen3_235b_a22b#model-weights)
+
+For W8A8, use a ModelSlim checkpoint with its quantization metadata. When EAGLE3
+is enabled, keep the draft unquantized as specified by the recipe. Original Qwen3, Instruct-2507, and
+Thinking-2507 checkpoints require compatible drafts; record both checkpoint
+revisions when testing a pair.
+
+The A2 32B assets are pinned to these **ModelScope** repository revisions. Their
+complete file manifests were checked against the downloaded sizes and SHA256
+digests; these revision identifiers refer to ModelScope, not Hugging Face.
+
+| ModelScope checkpoint | Revision |
+| :--- | :--- |
+| `vllm-ascend/Qwen3-32B-W8A8` | `9ecdf711a9629fbf2385b17b47359c8a604e39ed` |
+| `Zjcxy-SmartAI/Eagle3-Qwen3-32B-zh` | `d7272a49b25d36d75f7ec629503fb704f67268db` |
+| `Qwen/Qwen3-32B` | `d64d397e66908737784bb9172614b88e085b2ad1` |
+
+In the NPU container, load the environment scripts supplied by your installation:
+
+```bash
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+```
+
+The measured A2 environment also loads the custom-operator environments from
+the official kernel bundle. With its CANN 9.0.0 installation layout, these are:
+
+```bash
+source /usr/local/Ascend/cann-9.0.0/opp/vendors/customize/bin/set_env.bash
+source /usr/local/Ascend/cann-9.0.0/opp/vendors/custom_transformer/bin/set_env.bash
+```
+
+Use the corresponding installed paths if your container has a different layout.
+
+Use the selector's environment settings to enter the local main path and, if used, draft path,
+the HCCL and Gloo interfaces, and the service address. Update the paths when
+switching models. These commands run inside an already prepared NPU environment.
+For the reference performance comparison, also apply the host tuning described
+in the linked best practice on a host where you control those settings.
+
+import { Deployment } from "/src/snippets/_deployment.jsx";
+import { config as ascendConfig } from "/src/snippets/configs/Qwen/qwen3-ascend.jsx";
+import { benchmarks as ascendBenchmarks } from "/src/snippets/configs/Qwen/qwen3-ascend-benchmarks.jsx";
+
+<Deployment config={ascendConfig} benchmarks={ascendBenchmarks} />
+
+<Note>
+The benchmark card contains measurements of the selected Cookbook recipe.
+Throughput per NPU device divides total input and output throughput by the number
+of logical devices used by that recipe. Reference TPOT values in the table below
+come from the existing best practices. A measured performance result does not
+imply that accuracy or every other recipe has been verified; check the cell's
+status and measurement notes.
+</Note>
+
+#### Verify the selected recipe
+
+Wait for `The server is fired up and ready to roll!`, then use the selector's
+request example. The `/generate` request should return HTTP 200 and generated
+text containing `Paris`. Check the service logs for errors before continuing.
+
+For accuracy, use the complete evaluation below with the selected checkpoint and
+draft, if enabled. For performance, use the matching workload below. Record successful
+and failed requests, TTFT, TPOT, and throughput.
+See [performance testing](/docs/hardware-platforms/ascend-npus/evaluation/performance_testing)
+for the measurement procedure.
+
+#### Ascend accuracy evaluation
+
+The existing Ascend tests evaluate 8B and 32B W8A8 on **GPQA Diamond (198 questions)** and
+30B-A3B W8A8 on **AIME 2025 (30 questions)**. Both use zero-shot prompts and
+temperature 1.0. Run the full dataset against the running service; a short
+request that returns `Paris` only checks that inference works.
+
+| Model | `EVAL_DATASET` | Maximum output tokens | Client concurrency |
+| :--- | :--- | ---: | ---: |
+| Qwen3-8B W8A8 | `gpqa_diamond` | 38000 | 64 |
+| Qwen3-32B W8A8 | `gpqa_diamond` | 38000 | 64 |
+| Qwen3-30B-A3B W8A8 | `aime25` | 32768 | 16 |
+
+The measured 8B and 32B checkpoints have a 40,960-token context limit. Their longest GPQA
+input uses 2,829 tokens, so a 40,000-token output budget causes that request to
+be rejected before generation. The initial 32B run scored 139/198 (70.20%), with
+197 successful generations and one rejection retained as an incorrect answer.
+The recorded A3 8B run similarly scored 121/198 (61.11%), with 197 successful
+generations and the same rejected question retained in the denominator.
+Use 38,000 output tokens for every question in a separate full run; do not splice
+answers from different runs. The separate A2 32B run with this corrected budget
+scored **132/198 (66.67%)**, with 198 successful generations, no rejected requests,
+and no output-budget stops. Both attempts are retained; the revised budget and
+sampling mean the score difference is not a controlled regression comparison.
+The corresponding A3 8B corrected-budget retest remains pending.
+
+Install the evaluation tool in a separate environment. Set `EVAL_DATASET` and
+`EVAL_MAX_TOKENS` from the table and update `SERVICE_URL` if you changed the selector's host or port.
+The script queries `/v1/models` for the served model name.
+
+```bash
+python -m venv .venv-evalscope
+.venv-evalscope/bin/pip install evalscope==1.11.1
+export SERVICE_URL=http://127.0.0.1:6688
+export EVAL_DATASET=gpqa_diamond
+export EVAL_MAX_TOKENS=38000 # Use 32768 for AIME 2025.
+export NO_PROXY=127.0.0.1,localhost
+.venv-evalscope/bin/python - <<'PY'
+import json
+import os
+from datetime import datetime, timezone
+from urllib.request import urlopen
+
+from evalscope import TaskConfig, run_task
+
+dataset = os.environ["EVAL_DATASET"]
+settings = {
+    "gpqa_diamond": {"limit": 198, "batch": 64},
+    "aime25": {"limit": 30, "batch": 16},
+}[dataset]
+base_url = os.environ["SERVICE_URL"].rstrip("/")
+with urlopen(base_url + "/v1/models", timeout=30) as response:
+    model = json.load(response)["data"][0]["id"]
+run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+run_task(task_cfg=TaskConfig(
+    model=model,
+    api_url=base_url + "/v1/chat/completions",
+    api_key="EMPTY",
+    eval_type="openai_api",
+    datasets=[dataset],
+    dataset_args={dataset: {"few_shot_num": 0}},
+    eval_batch_size=settings["batch"],
+    generation_config={"max_tokens": int(os.environ["EVAL_MAX_TOKENS"]), "temperature": 1.0},
+    limit=settings["limit"],
+    seed=42,
+    timeout=60000,
+    stream=True,
+    work_dir=f"qwen3-ascend-eval/{dataset}-{run_id}",
+))
+PY
+```
+
+The 8B low-latency recipe uses TP2 and different EAGLE3 settings. Evaluate it
+separately before assigning a verified status. Use the following protocol for
+that recipe and the A2 32B BF16 recipe. It uses the upstream
+NPU GSM8K completion protocol at temperature 0, with five examples and a
+512-token output budget. It scores all 1,314 remaining questions after the
+scorer excludes the five examples from the 1,319-row dataset.
+
+```bash
+python -m sglang.test.run_eval \
+  --base-url http://127.0.0.1:6688 \
+  --eval-name gsm8k --api completion \
+  --num-examples 1314 --num-shots 5 \
+  --num-threads 1 --max-tokens 512 --temperature 0 \
+  --repeat 1
+```
+
+For A2 32B BF16, use `--num-threads 8`; the A3 8B low-latency measurement uses 1.
+To use an existing dataset file, add `--gsm8k-data-path /path/to/test.jsonl`.
+The A2 BF16 run scored **1139/1314 (86.68%)** with all requests successful;
+178 responses reached the output budget and remain included in the score.
+GSM8K and GPQA measure different capabilities; report the dataset, prompt format,
+and question count with each score.
+
+Record the report's score and evaluated question count, request failures, model
+and draft revisions, dataset revision, SGLang commit, and dependency versions.
+Keep every attempt's report. Compare against a baseline with the same checkpoint
+pair and evaluation settings; changing a model or generation budget changes the
+comparison. Validate each recipe on its listed device count. See the [accuracy evaluation guide](/docs/hardware-platforms/ascend-npus/evaluation/accuracy_evaluation)
+for other datasets and evaluation methods.
+
+#### Ascend reference workloads
+
+Linked rows use the workloads from the Ascend best practices. The other A2 rows
+define task-specific workloads, without a reference latency target. The 32B BF16
+workload is measured; the 235B workload remains pending. ISL and OSL are input and output token counts
+per request.
+
+| Hardware | Model / quantization | Workload | ISL | OSL | Concurrency | Requests | Reference TPOT |
+| :--- | :--- | :--- | ---: | ---: | ---: | ---: | ---: |
+| A3 | Qwen3-8B / W8A8 | [Low latency](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_8b#qwen3-8b-w8a8-1p-in3k5-out1k5-5ms) | 3500 | 1500 | 1 | 4 | 5 ms |
+| A3 | Qwen3-8B / W8A8 | [High throughput](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_8b#qwen3-8b-w8a8-1p-in3k5-out1k5-37ms) | 3500 | 1500 | 64 | 256 | 37 ms |
+| A3 | Qwen3-30B-A3B / W8A8 | [Low latency](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_30b_a3b#qwen3-30b-a3b-w8a8-1p-in3k5-out1k5-10ms) | 3500 | 1500 | 1 | 1 | 10 ms |
+| A3 | Qwen3-30B-A3B / W8A8 | [High throughput](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_30b_a3b#qwen3-30b-a3b-w8a8-1p-in3k5-out1k5-50ms) | 3500 | 1500 | 160 | 640 | 50 ms |
+| A2 | Qwen3-32B / BF16 | Low latency | 18000 | 4000 | 1 | 4 | No reference target |
+| A2 | Qwen3-32B / W8A8 | [High throughput](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_32b#qwen3-32b-w8a8-2p-in3k5-out1k5-55ms-a2-series) | 3584 | 1536 | 100 | 400 | 55 ms (source) |
+| A2 | Qwen3-235B-A22B / W8A8 | Throughput candidate | 3500 | 1500 | 8 | 32 | Not measured |
+
+The A2 32B reference's card-count inconsistency prevents treating its published
+55 ms as a matched-hardware baseline until the source topology is clarified.
+Record A2 results separately from A3, and compare performance only when the
+hardware, checkpoint pair, runtime, and workload match.
+
+For example, run the 8B low-latency workload on current main as follows. Set
+`MODEL_PATH` to the checkpoint used by the running service. For another row,
+replace the four workload arguments with that row's values.
+
+```bash
+MODEL_PATH=/models/main-checkpoint
+python -m sglang.benchmark.serving \
+  --backend sglang \
+  --host 127.0.0.1 --port 6688 \
+  --model "$MODEL_PATH" \
+  --dataset-name random \
+  --random-input-len 3500 \
+  --random-output-len 1500 \
+  --max-concurrency 1 \
+  --num-prompts 4 \
+  --random-range-ratio 1 \
+  --seed 1 \
+  --flush-cache \
+  --output-details \
+  --output-file qwen3-ascend-results.jsonl
+```
+
+The `random` dataset uses ShareGPT prompts that are repeated or truncated to the
+requested length. It can download the corpus on the first run; pass
+`--dataset-path /path/to/ShareGPT_V3_unfiltered_cleaned_split.json` to use a local
+copy. A different corpus can change EAGLE3 acceptance and latency. Current main
+uses `sglang.benchmark.serving` and does not accept the older reference's
+`--max-attempts` option. Keep every run's output when repeating a measurement.
+
 ## 4. Model Invocation
 
 ### 4.1 Basic Usage
