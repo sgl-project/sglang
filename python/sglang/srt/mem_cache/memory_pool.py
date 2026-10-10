@@ -49,7 +49,11 @@ from sglang.kernels.ops.kvcache.cache_move import (
     set_kv_buffer_prefix_valid_tiled_fp8,
 )
 from sglang.kernels.ops.kvcache.kvcache import can_use_store_cache, store_cache
-from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
+from sglang.kernels.ops.quantization.fp8_kernel import (
+    fp8_dtype,
+    is_fp8_fnuz,
+    saturate_to_fp8_range,
+)
 from sglang.srt.configs.mamba_utils import BaseLinearStateParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
@@ -330,6 +334,7 @@ def _set_kv_buffer_prefix_valid_impl_fp8(
         int(loc_2d.shape[1]),
         ROW_ELEMS=row_dim,
         ELEMS_PER_TILE=elems_per_tile,
+        FP8_MAX=torch.finfo(k_cache.dtype).max,
         K_SCALE_IS_TENSOR=k_scale_is_tensor,
         V_SCALE_IS_TENSOR=v_scale_is_tensor,
         num_warps=num_warps,
@@ -457,7 +462,9 @@ class ReqToTokenPool:
 
     def clear(self):
         self.free_slots = list(range(1, self._alloc_size))
-        self.req_generation.zero_()
+        # req_generation must stay monotonic: readers detect row reuse by
+        # equality with a generation they stored, so zeroing it here can give a
+        # row's next request the same generation as its previous one.
         if self._aux_cache is not None:
             self._aux_cache.clear()
 
@@ -1871,26 +1878,21 @@ class KVWriteLoc:
 
     All location info lives here (in the attention metadata), NOT in the pool:
     - ``loc``: the generic per-token write location (``out_cache_loc``).
-      PHYSICAL on every pool: by allocation on non-unified pools,
-      rebound at ForwardBatch construction (``rebind_write_loc``) on
-      the unified pool.
+      PHYSICAL on every pool: by allocation on non-unified pools, the
+      iteration's plan's write ids on the unified pool (``KVLocPlan.bind``).
     - ``swa_loc``: the SWA-sub-pool location for hybrid SWA pools (``None``
-      otherwise); under the unified pool the translator derives it from the
-      same rebound loc (``sliding_window_write_loc_for``).
-    - ``full_loc``: OPTIONAL full-attention-sub-pool location. Since the
-      construction-time rebind it is the SAME id space as ``loc``, so pools
-      fall back to ``loc`` when it is ``None`` -- only triton's captured path
-      still passes its capture-stable
-      ``ForwardMetadata.out_cache_loc_full_physical`` buffer here (a
-      same-space alias slated for collapse).
+      otherwise): the same plan's write ids in the sliding-window sub-pool
+      (``KVIndexTranslator.write_ids``).
+    - ``full_loc``: OPTIONAL full-attention-sub-pool location, in the same id
+      space as ``loc``; pools fall back to ``loc`` when it is ``None``.
 
     ``swa_loc`` and ``full_loc`` are the parallel pair (each a pre-resolved
     loc into its sub-pool, mirroring ``swa_kv_pool`` / ``full_kv_pool``);
     ``loc`` is the generic fallback. Bundling them lets a backend issue one
     ``set_kv_buffer`` call regardless of pool type.
 
-    ``physical`` marks the locs as physical token ids: the batch's write loc
-    after ``rebind_write_loc``, or ids a backend translated itself. A unified
+    ``physical`` marks the locs as physical token ids: the write ids a plan
+    bound to the batch, or ids produced separately and marked so. A unified
     pool's write door refuses a loc not marked physical; other pools do not
     check.
     """
@@ -1910,9 +1912,9 @@ class KVWriteLoc:
     ) -> KVWriteLoc:
         """The batch's ``out_cache_loc`` as a write loc, carrying the batch's
         physical mark. A ``swa_loc`` or ``full_loc`` passed here travels under
-        the same mark, so it must be derived from that rebound loc (as
-        ``sliding_window_write_loc_for`` does); a loc produced separately
-        states its own mark with ``KVWriteLoc(loc, physical=...)``."""
+        the same mark, so it must come from the same plan (as
+        ``KVIndexTranslator.write_ids`` does); a loc produced separately states
+        its own mark with ``KVWriteLoc(loc, physical=...)``."""
         return cls(
             forward_batch.out_cache_loc,
             swa_loc,
@@ -2095,9 +2097,9 @@ class KVCache(abc.ABC):
         if self.requires_physical_write_loc and not write_loc_is_physical(loc_info):
             raise ValueError(
                 f"{where}: write loc is not marked physical. Hand the pool "
-                "KVWriteLoc.for_batch(forward_batch) after "
-                "KVIndexTranslator.rebind_write_loc, or KVWriteLoc(loc, "
-                "physical=True) for ids translated separately."
+                "KVWriteLoc.for_batch(forward_batch) for a batch bound to a "
+                "plan (KVLocPlan.bind), or KVWriteLoc(loc, physical=True) for "
+                "ids translated separately."
             )
 
     @abc.abstractmethod
@@ -3285,6 +3287,10 @@ class MHATokenToKVPool(KVCache):
                 cache_k.div_(k_scale)
             if v_scale is not None:
                 cache_v.div_(v_scale)
+            if self.dtype == fp8_dtype:
+                # Saturate like the fused kernel above; see saturate_to_fp8_range.
+                cache_k = saturate_to_fp8_range(cache_k, self.dtype)
+                cache_v = saturate_to_fp8_range(cache_v, self.dtype)
             cache_k = cache_k.to(self.dtype)
             cache_v = cache_v.to(self.dtype)
 
@@ -4734,7 +4740,7 @@ class MLATokenToKVPool(KVCache):
 
     # Has the WRITE loc arriving here already had the DCP owner rule resolved?
     # False: this pool takes a WIDENED loc. The unified pool resolves it in
-    # `KVIndexTranslator.rebind_write_loc` and flips this.
+    # the plan's write translation (`translate_write_loc`) and flips this.
     write_loc_is_dcp_resolved = False
 
     @property

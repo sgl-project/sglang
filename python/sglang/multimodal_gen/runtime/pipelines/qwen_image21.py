@@ -22,6 +22,13 @@ class QwenImage21Pipeline(LoRAPipeline, ComposedPipelineBase):
         "scheduler",
     ]
 
+    def _load_config(self):
+        model_index = super()._load_config()
+        sample_sigmas = model_index.pop("sample_sigmas", None)
+        if self.server_args.pipeline_config.sample_sigmas is None:
+            self.server_args.pipeline_config.sample_sigmas = sample_sigmas
+        return model_index
+
     def create_pipeline_stages(self, server_args):
         self.add_stage(QwenImage21InputValidationStage())
         self.add_stage_factory(

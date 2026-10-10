@@ -23,6 +23,7 @@ from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerPoolHost
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import MooncakeStore
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -271,6 +272,39 @@ def test_staged_disjoint_buffers_use_independent_objects_and_query_keys():
     )
 
 
+class TestMixedBufferTransfers(CustomTestCase):
+    def test_staged_and_native_pools_preserve_results_and_roundtrip(self):
+        """A batched native transfer must retain the staged pool's result and bytes."""
+        store, wire, transfers, buffers = staged_case()
+        store.external_buffer_pools = frozenset((PoolName.KV,))
+        indexer = store.registered_pools[PoolName.INDEXER]
+        transfers[1].buffer_pool_name = None
+        transfers[1].host_indices = torch.arange(4)
+        native_buffer = indexer.index_k_with_scale_buffer[:, :2]
+        native_buffer.copy_(
+            torch.arange(native_buffer.numel(), dtype=torch.uint8).reshape(
+                native_buffer.shape
+            )
+        )
+        active_buffers = [buffers[0].buffer, native_buffer]
+        expected = [buffer.clone() for buffer in active_buffers]
+        expected_results = {PoolName.KV: [True, True], PoolName.INDEXER: [True, True]}
+
+        for ordered_transfers in (transfers, list(reversed(transfers))):
+            with self.subTest(order=[t.name for t in ordered_transfers]):
+                self.assertEqual(
+                    store.batch_set_v2(ordered_transfers), expected_results
+                )
+                self.assertEqual(len(wire.objects), 4)
+                for buffer in active_buffers:
+                    buffer.zero_()
+                self.assertEqual(
+                    store.batch_get_v2(ordered_transfers), expected_results
+                )
+                for buffer, value in zip(active_buffers, expected):
+                    self.assertTrue(torch.equal(buffer, value))
+
+
 @pytest.mark.parametrize("fault", ["short_get", "short_response"])
 def test_mooncake_staged_short_get_fails_both_components_closed(fault):
     store, wire, transfers, _ = staged_case()
@@ -481,3 +515,7 @@ def test_staged_set_reports_component_failure_independently():
     assert result == {PoolName.KV: [True, True], PoolName.INDEXER: [False, False]}
     assert complete_page_mask(result, 2) == [False, False]
     assert len(wire.objects) == 2
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__]))
