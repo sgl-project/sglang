@@ -178,6 +178,7 @@ def _make_model_runner(
         eagle_draft_num_layers=None,
         eagle_draft_swa_num_layers=None,
         dflash_draft_num_layers=None,
+        draft_model_config=None,
     )
     # Fused draft KV is off unless a test opts in (a bare MagicMock return
     # would read as a truthy entry size and take the fused pricing branch).
@@ -1068,6 +1069,21 @@ class TestDflashDraftKvBudget(CustomTestCase):
             0,
         )
 
+    def test_draft_kv_heads_follow_draft_tp_placement(self):
+        """The draft pool and its budget shard KV heads as the draft model does: by
+        full TP under context parallelism, by attention TP when the draft owns it."""
+        from sglang.srt.speculative.spec_info import dflash_draft_kv_head_tp_size
+
+        for widths, expected in (
+            (dict(tp_size=4, attn_tp_size=1, attn_cp_size=4, attn_dp_size=1), 4),
+            (dict(tp_size=8, attn_tp_size=2, attn_cp_size=1, attn_dp_size=4), 2),
+        ):
+            with self.subTest(**widths):
+                with get_parallel().override(
+                    **widths, attn_dp_enabled=widths["attn_dp_size"] > 1
+                ):
+                    self.assertEqual(dflash_draft_kv_head_tp_size(), expected)
+
     def test_dcp_replication_scales_draft_budget(self):
         """The replicated draft pool spans every DCP virtual location."""
         draft_kv_per_token = 10_240
@@ -1349,7 +1365,9 @@ class TestSWAPoolFloor(CustomTestCase):
             sliding_window_size=128,
             page_size=256,
             spec_algorithm=spec,
-            spec_aux_config=SimpleNamespace(dflash_draft_num_layers=3),
+            spec_aux_config=SimpleNamespace(
+                dflash_draft_num_layers=3, draft_model_config=None
+            ),
         )
         planner = DSV4PoolConfigurator(kvc)
         self.assertEqual(planner.bytes_per_swa_token, 3 * 584)
@@ -1417,6 +1435,53 @@ class TestSWAPoolFloor(CustomTestCase):
         slots = cfg._get_num_req_slots(mrr)
         target = slots * cfg._swa_ring_size * 640 * cfg.num_layers_total
         self.assertEqual(cfg._fixed_swa_bytes(mrr), int(target * cfg._spec_infl))
+
+    def test_dsv4_dense_draft_reserves_its_own_kv_per_full_token(self):
+        """A dense draft beside a DSV4 target is charged its own KV bytes per full
+        token, not one extra target layer (which under-reserves and OOMs)."""
+        cfg = self._dsv4_configurator_for_budget()
+        cfg.bytes_per_swa_token = 100.0
+        # 4 kv heads * (128 + 128) dims * 5 layers * 2 bytes
+        cfg._dense_draft_cell_size = 10240
+        cfg._reserve_draft_kv()
+        self.assertEqual(cfg.bytes_per_full_token, 576.0 + 10240)
+        self.assertEqual(cfg.bytes_per_swa_token, 100.0)
+        self.assertEqual(cfg._spec_infl, 1.0)
+
+    def test_dsv4_dense_draft_detected_by_draft_architecture(self):
+        from sglang.srt.model_executor.pool_configurator import (
+            _dense_draft_cell_size_on_dsv4,
+        )
+
+        def _kvc(draft_arch):
+            spec = MagicMock()
+            spec.is_dflash_family.return_value = True
+            draft_model_config = (
+                None
+                if draft_arch is None
+                else SimpleNamespace(
+                    hf_config=SimpleNamespace(architectures=[draft_arch])
+                )
+            )
+            return SimpleNamespace(
+                is_draft_worker=False,
+                spec_algorithm=spec,
+                spec_aux_config=SimpleNamespace(
+                    draft_model_config=draft_model_config,
+                    dflash_draft_cell_size_per_token=10240,
+                ),
+            )
+
+        with mock_cpu_env(), get_parallel().override(attn_dcp_size=1):
+            for draft_arch, expected in (
+                ("Qwen3DSparkModel", 10240),
+                ("DeepseekV4ForCausalLMDSpark", 0),
+                (None, 0),
+            ):
+                with self.subTest(draft_arch=draft_arch):
+                    self.assertEqual(
+                        _dense_draft_cell_size_on_dsv4(_kvc(draft_arch)), expected
+                    )
 
     def test_dsv4_fp8_pd_refuses_pp_and_hisparse(self):
         from sglang.srt.model_executor.pool_configurator import (

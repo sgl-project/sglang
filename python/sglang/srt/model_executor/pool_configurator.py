@@ -112,6 +112,15 @@ def _dflash_draft_cell_size(kvc: KVCacheConfigurator) -> int:
     return int(cell_size) * get_parallel().attn_dcp_size
 
 
+def _dense_draft_cell_size_on_dsv4(kvc: KVCacheConfigurator) -> int:
+    """Bytes/token of a DFLASH-family draft that keeps its own MHA pool beside a DSV4
+    target; 0 when the draft is DSV4-shaped and shares the target's layout."""
+    draft_model_config = kvc.spec_aux_config.draft_model_config
+    if draft_model_config is None or is_deepseek_v4(draft_model_config.hf_config):
+        return 0
+    return _dflash_draft_cell_size(kvc)
+
+
 def _get_dsa_cache_layer_ids(kvc: KVCacheConfigurator, num_layers: int) -> list[int]:
     """Global layer ids represented by the local DSA pool's dense layer slots."""
     if kvc.mambaish_config and not kvc.is_draft_worker:
@@ -1022,11 +1031,12 @@ class _DSV4PoolSizes:
 
 
 class DSV4PoolConfigurator(MemoryPoolConfigurator):
-    """DSV4 compressed attention: coeff is bytes_per_full_token, inflated by (T+D)/T
-    for a draft worker; bias is the request-scoped pools that do not scale with it."""
+    """DSV4 compressed attention: coeff is bytes_per_full_token plus the draft worker's
+    share; bias is the request-scoped pools that do not scale with it."""
 
     # object.__new__ stubs (SWA floor tests) skip __init__
     _dspark_draft_on_bf16 = False
+    _dense_draft_cell_size = 0
 
     def __init__(self, kvc: KVCacheConfigurator):
         self.kv_cache_dtype_str = kvc.kv_cache_dtype_str
@@ -1046,10 +1056,13 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         # Resolve the unified-kv gate before any sizing so the two cannot drift.
         self._unified = is_unified_kv_triton()
         self._unified_fp8 = is_unified_kv_fp8()
+        self._dense_draft_cell_size = _dense_draft_cell_size_on_dsv4(kvc)
         # DSpark draft still allocates a bf16 ring; target fp8 * (T+1)/T would
         # under-count that ring (640 vs 1024). MTP keeps the old inflation.
         self._dspark_draft_on_bf16 = bool(
-            self._unified_fp8 and kvc.spec_algorithm.is_dspark()
+            self._unified_fp8
+            and kvc.spec_algorithm.is_dspark()
+            and not self._dense_draft_cell_size
         )
         # Row width across both unified pools: 1024 B bf16, 640 B fp8.
         self._unified_row_bytes = dsv4_unified_row_bytes(
@@ -1193,13 +1206,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.bytes_per_swa_token = self._get_bytes_per_swa_token()
         self.bytes_per_full_token = self._get_bytes_per_full_token()
         if self.is_speculative and not self.encoder_replay:
-            # Reserve the draft worker by inflating per-token bytes by
-            # (target+draft)/target, as scale_kv_cell_size_per_token_for_dflash does.
-            draft_layers = 1
-            target_layers = self.num_layers_total
-            self._spec_infl = (target_layers + draft_layers) / target_layers
-            self.bytes_per_full_token *= self._spec_infl
-            self.bytes_per_swa_token *= self._spec_infl
+            self._reserve_draft_kv()
 
         # Online c128 keeps one in-progress (max, sum, kv) state per index and
         # assumes forward-only; MTP would need rollback across draft and verify.
@@ -1228,6 +1235,20 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 logger.info(
                     "DSV4 compressed attention: online c128 enabled (ring_size=1)"
                 )
+
+    def _reserve_draft_kv(self) -> None:
+        """Charge the draft worker's KV to the per-token coeff; the draft never profiles
+        memory and sizes its pool from the token budget solved here."""
+        if self._dense_draft_cell_size:
+            # A dense draft's MHA pool holds one slot per full token.
+            self.bytes_per_full_token += self._dense_draft_cell_size
+            return
+        # A DSV4-shaped draft costs one more target layer, as
+        # scale_kv_cell_size_per_token_for_dflash does.
+        target_layers = self.num_layers_total
+        self._spec_infl = (target_layers + 1) / target_layers
+        self.bytes_per_full_token *= self._spec_infl
+        self.bytes_per_swa_token *= self._spec_infl
 
     def num_layers(self, ratio: int) -> int:
         """Layers of this stage owning ratio's compressed storage."""
@@ -1585,6 +1606,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             f"DSV4 memory calculation: unified={self._unified}, "
             f"unified_fp8={self._unified_fp8}, "
             f"dspark_draft_bf16={self._dspark_draft_on_bf16}, "
+            f"dense_draft_bytes_per_token={self._dense_draft_cell_size}, "
             f"bytes_per_full_token={self.bytes_per_full_token:.2f}, "
             f"available_bytes={available_bytes / (1 << 30):.2f} GB, "
             f"c128_state_fixed={c128_state_fixed_bytes / (1 << 30):.2f} GB, "

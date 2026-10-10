@@ -99,7 +99,10 @@ from sglang.srt.runtime_context import (
     pre_capture_activation_reserve_mb,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_info import (
+    SpeculativeAlgorithm,
+    dflash_draft_kv_head_tp_size,
+)
 from sglang.srt.utils.common import (
     cpu_has_amx_support,
     get_available_gpu_memory,
@@ -2152,7 +2155,7 @@ class KVCacheConfigurator:
             dtype=self.kv_cache_dtype,
             post_capture_active=self.post_capture_kv_active,
             head_num=self.model_config.get_num_kv_heads(
-                get_parallel().attn_tp_size, get_parallel().attn_dcp_size
+                self._mha_kv_head_tp_size(), get_parallel().attn_dcp_size
             ),
             head_dim=self.model_config.head_dim,
             swa_attention_layer_ids=swa_attention_layer_ids,
@@ -2347,6 +2350,13 @@ class KVCacheConfigurator:
             return MHATokenToKVPoolMXFP8
         return mha_pool_class
 
+    def _mha_kv_head_tp_size(self) -> int:
+        """A dense DFLASH-family draft's attention shards by its own TP placement,
+        wider than attention TP under context parallelism."""
+        if self.is_draft_worker and self.spec_algorithm.is_dflash_family():
+            return dflash_draft_kv_head_tp_size()
+        return get_parallel().attn_tp_size
+
     def _build_mha_kv_pool(
         self, *, max_total_num_tokens: int, mha_pool_class: type, quant_method=None
     ) -> KVCache:
@@ -2368,7 +2378,7 @@ class KVCacheConfigurator:
             page_size=self.pool_page_size,
             dtype=self.kv_cache_dtype,
             head_num=self.model_config.get_num_kv_heads(
-                get_parallel().attn_tp_size, get_parallel().attn_dcp_size
+                self._mha_kv_head_tp_size(), get_parallel().attn_dcp_size
             ),
             head_dim=self.model_config.head_dim,
             v_head_dim=self.model_config.v_head_dim,
