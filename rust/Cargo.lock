@@ -163,9 +163,9 @@ dependencies = [
 
 [[package]]
 name = "async-openai"
-version = "0.41.3"
+version = "0.42.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d72db2750faea2ca5edbf6d0c50277a89dc8f75f5e6ddd695ef30f75e335019b"
+checksum = "63077bf55857e6963effefb5f28134c40cc2ee68bc176cc601bbdeb070017fba"
 dependencies = [
  "bytes",
  "derive_builder",
@@ -945,9 +945,9 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
 name = "dynamo-parsers"
-version = "7.1.1"
+version = "9.2.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7a7f84812e7ce1d3dace1b8d69853cc6c49759cbd07dfbb59452aa928645b031"
+checksum = "0ce378321729ac01507bbebbb66d38a3bf887a694d70d128c72176bcf3515ad6"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -956,6 +956,7 @@ dependencies = [
  "futures",
  "num-traits",
  "openai-harmony",
+ "percent-encoding",
  "regex",
  "rustpython-ruff_python_ast",
  "rustpython-ruff_python_parser",
@@ -968,9 +969,9 @@ dependencies = [
 
 [[package]]
 name = "dynamo-protocols"
-version = "5.4.3"
+version = "7.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1cdacfc1398779cf173d5ff54438d9f14682f76875b6879853a84cc7d646228"
+checksum = "45ca7eba9c7e08c01b523fa8dc3d2287a7dabe53b1f9249827d329a91ad8f925"
 dependencies = [
  "async-openai",
  "derive_builder",
@@ -985,9 +986,9 @@ dependencies = [
 
 [[package]]
 name = "dynamo-renderer"
-version = "5.1.2"
+version = "7.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3ae2eaa139651c535aeaad8856c5546709608931ccd4d24d3a529f6c5233c4b6"
+checksum = "dbca1e2025c60cbecc4c3e919d689d99e552787a7b63821b7a811d257349e820"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1003,9 +1004,9 @@ dependencies = [
 
 [[package]]
 name = "dynamo-tokenizers"
-version = "1.8.1"
+version = "3.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ed232a9d254149a4e2e14f0a7d77f59bd64161964c0ba55267beea3955650faa"
+checksum = "b2bee9c4bcbcb9c498d03199d4ec6738cc0a9f861463074369fc3f7352539e44"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -3753,11 +3754,13 @@ dependencies = [
  "futures",
  "hf-hub",
  "minijinja",
+ "regex",
  "serde",
  "serde_json",
  "sha2",
  "thiserror",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -3820,6 +3823,7 @@ dependencies = [
  "serde_json",
  "sglang-api-types",
  "sglang-mm",
+ "sglang-processor",
  "socket2",
  "thiserror",
  "tokio",

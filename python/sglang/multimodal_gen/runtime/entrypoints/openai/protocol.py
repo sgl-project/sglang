@@ -174,10 +174,6 @@ class VideoListResponse(BaseModel):
     object: str = "list"
 
 
-class VideoRemixRequest(BaseModel):
-    prompt: str
-
-
 class RealtimeVideoGenerationsRequest(VideoGenerationsRequest):
     enhance_prompt: Literal[False] = False
     type: Literal["init"]

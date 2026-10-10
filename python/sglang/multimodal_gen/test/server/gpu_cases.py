@@ -39,6 +39,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     SANA_WM_TI2V_CI_sampling_params,
     T2I_sampling_params,
     T2V_sampling_params,
+    WAN_2_2_ANIMATE_2_14B_sampling_params,
     _make_modelopt_ci_case,
     _with_default_num_gpus,
 )
@@ -63,6 +64,7 @@ from sglang.multimodal_gen.test.test_utils import (
     DEFAULT_WAN_2_1_I2V_14B_720P_MODEL_NAME_FOR_TEST,
     DEFAULT_WAN_2_1_T2V_1_3B_MODEL_NAME_FOR_TEST,
     DEFAULT_WAN_2_1_T2V_14B_MODEL_NAME_FOR_TEST,
+    DEFAULT_WAN_2_2_ANIMATE_2_14B_MODEL_NAME_FOR_TEST,
     DEFAULT_WAN_2_2_I2V_A14B_MODEL_NAME_FOR_TEST,
     DEFAULT_WAN_2_2_T2V_A14B_MODEL_NAME_FOR_TEST,
     DEFAULT_WAN_2_2_TI2V_5B_MODEL_NAME_FOR_TEST,
@@ -459,6 +461,23 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         run_models_api_check=False,
         run_t2v_input_reference_check=False,
     ),
+    # Reference image + driving video -> video. The DiT peaks at 76 GB resident,
+    # so the 80 GB lane streams it layerwise; this also covers the uncond block-9 skip.
+    DiffusionTestCase(
+        "wan2_2_animate_2_14b_ref2v",
+        DiffusionServerArgs(
+            model_path=DEFAULT_WAN_2_2_ANIMATE_2_14B_MODEL_NAME_FOR_TEST,
+            modality="video",
+            dit_layerwise_offload=True,
+            text_encoder_cpu_offload=True,
+            extras=["--layerwise-offload-components", "transformer"],
+        ),
+        WAN_2_2_ANIMATE_2_14B_sampling_params,
+        # The DiT forward takes a per-clip conditioning container and runs forward_ref,
+        # so the raw-component harness contract does not apply.
+        run_perf_check=True,
+        run_component_accuracy_check=False,
+    ),
     # flaky
     # === Helios T2V ===
     # DiffusionTestCase(
@@ -762,7 +781,7 @@ MINIMAX_H3_FOUR_GPU_H100_CASES = [
                     "aspect_ratio": "16:9",
                     "duration_seconds": 5.0,
                 },
-                "num_inference_steps": 9,
+                "num_inference_steps": 8,
                 "seed": 42,
             },
         ),
@@ -803,7 +822,7 @@ MINIMAX_H3_FOUR_GPU_H100_CASES = [
                     "aspect_ratio": "16:9",
                     "duration_seconds": 5.0,
                 },
-                "num_inference_steps": 9,
+                "num_inference_steps": 8,
                 "seed": 42,
             },
         ),
@@ -974,6 +993,32 @@ TWO_GPU_CASES = [
         DiffusionServerArgs(
             model_path=DEFAULT_WAN_2_2_I2V_A14B_MODEL_NAME_FOR_TEST,
         ),
+    ),
+    # GT = the 1-GPU frames renamed. With replicated encoders, serial VAE decode and the
+    # VAE channels_last_3d layout the loader otherwise applies only for num_gpus == 1,
+    # CFG-parallel output is bit-identical to the 1-GPU case, so both share one ground truth.
+    DiffusionTestCase(
+        "wan2_2_animate_2_14b_ref2v_cfg_parallel_2gpu",
+        DiffusionServerArgs(
+            model_path=DEFAULT_WAN_2_2_ANIMATE_2_14B_MODEL_NAME_FOR_TEST,
+            modality="video",
+            cfg_parallel=True,
+            # On 80 GB cards the resident DiT leaves no room for the full-shape warmup probe; stream it layerwise (bit-identical output).
+            dit_layerwise_offload=True,
+            text_encoder_cpu_offload=True,
+            extras=[
+                "--layerwise-offload-components",
+                "transformer",
+                "--encoder-parallel",
+                "replicate",
+                "--vae-config.use-parallel-decode",
+                "false",
+            ],
+            env_vars={"SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D": "1"},
+        ),
+        WAN_2_2_ANIMATE_2_14B_sampling_params,
+        run_perf_check=True,
+        run_component_accuracy_check=False,
     ),
     DiffusionTestCase(
         "wan2_2_t2v_a14b_2gpu",
@@ -1516,6 +1561,7 @@ STANDALONE_FILES = {
         "../single_test_file/test_disagg_server.py",
         "../single_test_file/test_ar_models.py",
         "../single_test_file/test_ipc_a2a_2_gpu.py",
+        "../single_test_file/test_ipc_a2a_multi_gpu.py",
         "../single_test_file/test_encoder_fold_srt_linear_2_gpu.py",
         "../single_test_file/test_encoder_fold_srt_2_gpu.py",
         "../single_test_file/test_diffusion_bcg_tp2_zimage_turbo.py",
@@ -1557,6 +1603,8 @@ STANDALONE_FILE_EST_TIMES = {
         "../single_test_file/test_ar_models.py": 600.0,
         # no model load; the cost is the one-time JIT build of the sync kernels
         "../single_test_file/test_ipc_a2a_2_gpu.py": 240.0,
+        # 2 ranks here (4 ranks skip below four GPUs); ~50 s on H200 with warm JIT
+        "../single_test_file/test_ipc_a2a_multi_gpu.py": 180.0,
         "../single_test_file/test_encoder_fold_srt_linear_2_gpu.py": 120.0,
         "../single_test_file/test_encoder_fold_srt_2_gpu.py": 240.0,
         # ~60 s locally with a warm HF cache (load + one capture + 4 steps);
