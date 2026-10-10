@@ -246,3 +246,35 @@ def test_minimax_h3_module_importable_without_sglang_runtime():
         module.MiniMaxH3Executor(generator=None, model_path="x", model=None, config=None)
 
 
+# --- Bug 1: any .gguf was treated as MiniMax-H3 for architecture detect ----
+
+
+def test_gguf_detect_infers_architecture_from_model_type_hint():
+    model_type = GENERATOR._infer_gguf_model_type("whatever.gguf", "flux")
+    assert model_type == "flux"
+
+
+def test_gguf_detect_infers_architecture_from_filename_when_no_hint():
+    assert GENERATOR._infer_gguf_model_type("qwen_image-Q4.gguf", None) == "qwen_image"
+    assert GENERATOR._infer_gguf_model_type("flux1-dev-Q8.gguf", None) == "flux"
+
+
+def test_gguf_detect_does_not_default_to_h3_for_unknown_architecture():
+    with pytest.raises(ValueError, match="Cannot tell which architecture"):
+        GENERATOR._h3_detect_companion("/models/mystery_model.gguf")
+
+
+def test_gguf_detect_looks_for_matching_companion_not_h3():
+    with tempfile.TemporaryDirectory() as tmp:
+        # Only a flux companion exists; a flux GGUF should accept it, but an
+        # unrelated qwen GGUF in the same folder must not silently grab it.
+        open(os.path.join(tmp, "flux1-dev.safetensors"), "wb").close()
+        gguf_path = os.path.join(tmp, "flux1-schnell-Q4.gguf")
+        found = GENERATOR._h3_detect_companion(gguf_path, model_type_hint="flux")
+        assert found == os.path.join(tmp, "flux1-dev.safetensors")
+
+        qwen_gguf = os.path.join(tmp, "qwen_image-Q4.gguf")
+        with pytest.raises(ValueError, match="qwen_image"):
+            GENERATOR._h3_detect_companion(qwen_gguf)
+
+
