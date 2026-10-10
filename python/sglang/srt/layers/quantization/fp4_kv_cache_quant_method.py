@@ -928,6 +928,22 @@ _TORCH_FP4 = getattr(torch, "float4_e2m1fn_x2", None)
 _BF16 = torch.bfloat16
 _NVFP4_DQ_KV_PREFILL_BACKENDS = frozenset({"flashinfer"})
 _NVFP4_KV_PREFILL_BACKENDS = frozenset({"trtllm_mha"})
+# Native FP4 prefill (fa2 packed-KV + kv_cache_sf) replaces the FP8 dequant
+# workspace on the flashinfer backend: zero workspace temporaries, no
+# per-chunk re-dequant of the whole cached prefix. The FP8 workspace is
+# allocated per *pool row count* and counted into the per-token cell size,
+# so retiring it frees both the fixed buffers and the 1024 B/token budget.
+# Set SGLANG_NVFP4_NATIVE_PREFILL=0 to restore the workspace route.
+_NATIVE_FP4_KV_PREFILL_BACKENDS = (
+    _NVFP4_KV_PREFILL_BACKENDS | _NVFP4_DQ_KV_PREFILL_BACKENDS
+)
+
+
+def _nvfp4_native_prefill_enabled() -> bool:
+    import os
+
+    return os.environ.get("SGLANG_NVFP4_NATIVE_PREFILL", "1") == "1"
+
 _NVFP4_KV_DECODE_BACKENDS = frozenset({"trtllm_mha"})
 _FP4_MX_MHA_BACKENDS = frozenset(
     {"triton", "torch_native", "flex_attention", "trtllm_mha"}
@@ -1001,8 +1017,25 @@ KV_CACHE_ATTENTION_ACCESS_REGISTRY: dict[str, tuple[KVCacheAttentionAccess, ...]
         _plain(_DECODE, _CPU_FP8_BACKENDS),
     ),
     NVFP4KVCacheMethod.name: (
-        _dq_workspace(_PREFILL, _NVFP4_DQ_KV_PREFILL_BACKENDS, _NVFP4_SCALE, _FP8_E4M3),
-        _native_fp4(_PREFILL, _NVFP4_KV_PREFILL_BACKENDS, _NVFP4_SCALE, _TORCH_FP4),
+        *(
+            (
+                _native_fp4(
+                    _PREFILL,
+                    _NATIVE_FP4_KV_PREFILL_BACKENDS,
+                    _NVFP4_SCALE,
+                    _TORCH_FP4,
+                ),
+            )
+            if _nvfp4_native_prefill_enabled()
+            else (
+                _dq_workspace(
+                    _PREFILL, _NVFP4_DQ_KV_PREFILL_BACKENDS, _NVFP4_SCALE, _FP8_E4M3
+                ),
+                _native_fp4(
+                    _PREFILL, _NVFP4_KV_PREFILL_BACKENDS, _NVFP4_SCALE, _TORCH_FP4
+                ),
+            )
+        ),
         _native_fp4(_DECODE, _NVFP4_KV_DECODE_BACKENDS, _NVFP4_SCALE, _TORCH_FP4),
     ),
     FP4MXBlock16KVCacheMethod.name: (
