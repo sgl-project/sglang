@@ -70,18 +70,11 @@ impl LoadBalancingPolicy for PowerOfTwoPolicy {
             .as_ref()
             .and_then(|m| m.get(worker2.url()).copied());
 
-        // If either worker is missing token data (e.g. monitor failure),
-        // we must degrade BOTH to request counts to ensure fairness.
+        // If either worker is missing token data (e.g. monitor failure), or the
+        // token snapshot is tied, compare local request counts for BOTH.
         let (load1, load2) = match (load1_tokens, load2_tokens) {
-            (Some(t1), Some(t2)) => {
-                // Both have token data. Compare Tokens.
-                (t1, t2)
-            }
-            _ => {
-                // If One or both are missing token data.
-                // Fallback to local request counts for BOTH.
-                (worker1.load() as isize, worker2.load() as isize)
-            }
+            (Some(t1), Some(t2)) if t1 != t2 => (t1, t2),
+            _ => (worker1.load() as isize, worker2.load() as isize),
         };
 
         // Select worker with lower load
