@@ -1088,8 +1088,6 @@ class DSV4Metadata:
     # inside the prefill CUDA graph); replay rebuilds the tail metadata iff set.
     prefill_graph_tail: bool = False
 
-    # This step's sparse-prefill choice, from the live batch: read the FP8 cache
-    # directly instead of the bf16 workspace.
     sparse_prefill_direct: bool = False
 
     @property
@@ -1209,7 +1207,6 @@ class _GraphBucket(enum.Enum):
         raise NotImplementedError(f"unsupported {forward_mode=}")
 
 
-# Measured on SM100 (GB300) only; other platforms keep the workspace unless set.
 _SM100_DIRECT_PREFIX_PER_ROW = 5
 _SM100_DIRECT_PREFIX_PER_ROW_GRAPH = 8
 
@@ -1238,8 +1235,7 @@ def _prefill_reads_fp8_direct(
     prefix = forward_batch.extend_prefix_lens_cpu
     if per_row <= 0 or prefix is None:
         return False
-    # The bf16 workspace pays per cached token, the direct kernel per query row;
-    # one choice per forward from the batch totals.
+    # Workspace cost grows with cached tokens, direct-read cost with query rows.
     return sum(prefix) >= per_row * sum(forward_batch.extend_seq_lens_cpu)
 
 
@@ -3342,7 +3338,6 @@ class DeepseekV4AttnBackend(
                 )
             )
         self.prefill_graph_replay_batch = forward_batch
-        # The attention break reads this live; the padded static batch may add rows.
         capture_metadata.sparse_prefill_direct = _prefill_reads_fp8_direct(
             forward_batch, in_prefill_graph=True
         )
