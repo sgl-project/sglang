@@ -1,8 +1,8 @@
 """The dense-FFN gather and take-back under attention DP x CP x TP, rank by rank.
 
 Every rank builds its layer's communicator and runs its prepare_mlp and
-complete_now for real on CPU; the TP-group all-reduce is replaced by the sum of
-the buffers the ranks hand to it.
+finish_complete_output for real on CPU; the TP-group all-reduce is replaced by the
+sum of the buffers the ranks hand to it.
 """
 
 import unittest
@@ -22,7 +22,6 @@ from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
 from sglang.srt.layers.dp_attention import DpPaddingMode
 from sglang.srt.layers.layer_boundary import prepare as comm_ops
 from sglang.srt.layers.layer_boundary.contracts import BatchVariant
-from sglang.srt.layers.layer_boundary.layout import SumGroup
 from sglang.srt.layers.layer_boundary.residual.add_norm import (
     NORM_READOUT,
     PLAIN_RESIDUAL_OPS,
@@ -151,9 +150,8 @@ class TestDpCpGather(CustomTestCase):
         ffn_input=None,
         sparse=False,
     ):
-        """Gather on every rank, check the FFN input and residual, then complete
-        and take back an FFN output of three times the input, of which each rank
-        holds its share, and check each rank's rows.
+        """Gather on every rank, check the FFN input and residual, then take back
+        an FFN output of three times the input and check each rank's rows.
         ``norm_rows`` is what ``norm`` does to complete rows; ``ffn_input``, when
         given, is the step every rank's batch must take."""
         # Binary fractions, so the partial sums add back to the value exactly.
@@ -190,7 +188,7 @@ class TestDpCpGather(CustomTestCase):
                 attn_cp_rank=cp,
                 attn_tp_rank=tp,
                 attn_dp_size=DP_SIZE,
-                attn_dp_enabled=True,
+                enable_dp_attention=True,
                 attn_cp_size=CP_SIZE,
                 attn_tp_size=attn_tp_size,
                 tp_size=tp_size,
@@ -342,25 +340,13 @@ class TestDpCpGather(CustomTestCase):
             hidden_states, residual = gather(rank, lambda x: summed.clone())
             torch.testing.assert_close(hidden_states, expected, rtol=0, atol=0)
             torch.testing.assert_close(residual.residual[:tokens], own, rtol=0, atol=0)
-            tp_size = DP_SIZE * CP_SIZE * attn_tp_size
-            sums = []
-
-            def boundary_sum(value, group, *args, **kwargs):
-                # Every rank holds the same share of the same rows.
-                sums.append(group)
-                return value * tp_size
-
-            with (
-                as_rank(*rank, None) as r,
-                patch_communicator("sum_output", boundary_sum),
-            ):
+            with as_rank(*rank, None) as r:
                 back, _ = postprocess_output(
                     r.communicator.ffn.plan.output,
-                    3 * hidden_states / tp_size,
+                    3 * hidden_states,
                     residual,
                     r.forward_batch,
                 )
-            self.assertEqual(sums, [SumGroup.MOE_OUTPUT if sparse else SumGroup.TP])
             expected_back = torch.zeros(group.held_rows[cp], HIDDEN).double()
             expected_back[:tokens] = 3 * norm_rows(own)
             torch.testing.assert_close(back, expected_back, rtol=0, atol=0)

@@ -43,13 +43,11 @@ def get_normalize_transform(
     return Normalize(mean, std, inplace=inplace)
 
 
-def get_denormalize_transform(
-    norm_type: str = "imagenet", *, inplace: bool = False
-) -> Normalize:
+def get_denormalize_transform(norm_type: str = "imagenet") -> Normalize:
     mean, std = get_norm_constants(norm_type)
     inv_mean = tuple(-m / s for m, s in zip(mean, std))
     inv_std = tuple(1.0 / s for s in std)
-    return Normalize(inv_mean, inv_std, inplace=inplace)
+    return Normalize(inv_mean, inv_std)
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
@@ -71,7 +69,6 @@ class VAEProcessor:
         pixel_norm_type="imagenet",
         transform=None,
         transform_rev=None,
-        transform_rev_inplace=None,
         use_3d_conv=False,
     ):
         self.vae_ratio = vae_ratio
@@ -90,11 +87,6 @@ class VAEProcessor:
             else None
         )
         self.transform_rev = transform_rev or get_denormalize_transform(pixel_norm_type)
-        self.transform_rev_inplace = transform_rev_inplace
-        if transform_rev is None and transform_rev_inplace is None:
-            self.transform_rev_inplace = get_denormalize_transform(
-                pixel_norm_type, inplace=True
-            )
         self.use_3d_conv = use_3d_conv
 
     def _ensure_list(self, data):
@@ -261,23 +253,13 @@ class VAEProcessor:
 
         return tensor.contiguous()
 
-    def revert_tensor(self, tensor, *, runtime_owned=False):
-        """Undo pixel normalization, reusing storage only when ownership is explicit.
-
-        Custom reverse transforms remain out-of-place unless their caller also
-        provides an in-place counterpart.
-        """
+    def revert_tensor(self, tensor):
         B, T = None, None
         if self.use_3d_conv:
             tensor = tensor.unsqueeze(2) if tensor.ndim == 4 else tensor
             B, _, T, _, _ = tensor.shape
             tensor = rearrange(tensor, "b c t h w -> (b t) c h w")
-        transform_rev = (
-            self.transform_rev_inplace
-            if runtime_owned and self.transform_rev_inplace is not None
-            else self.transform_rev
-        )
-        tensor_rev = transform_rev(tensor).clamp_(0, 1)
+        tensor_rev = self.transform_rev(tensor).clamp_(0, 1)
         if B is not None:
             tensor_rev = rearrange(tensor_rev, "(b t) c h w -> b c t h w", b=B, t=T)
         return tensor_rev.contiguous()

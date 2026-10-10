@@ -2,15 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from typing import Any
 
 import torch
-
-from sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_jit import (
-    apply_convrot_int8_shared_input,
-    convrot_int8_shares_input,
-)
 
 
 def modulate(
@@ -26,14 +20,6 @@ def modulate(
     if scale is None:
         return x + shift.unsqueeze(1)  # type: ignore[union-attr]
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
-
-
-def _project_shared_input(
-    x: torch.Tensor, layers: Sequence[torch.nn.Module]
-) -> list[torch.Tensor]:
-    if convrot_int8_shares_input(layers):
-        return apply_convrot_int8_shared_input(x=x, layers=layers)
-    return [layer(x)[0] for layer in layers]
 
 
 def get_qkv_projections(
@@ -67,9 +53,9 @@ def get_qkv_projections(
         if make_contiguous:
             query, key, value = [t.contiguous() for t in (query, key, value)]
     else:
-        query, key, value = _project_shared_input(
-            x=hidden_states, layers=(attn.to_q, attn.to_k, attn.to_v)
-        )
+        query, _ = attn.to_q(hidden_states)
+        key, _ = attn.to_k(hidden_states)
+        value, _ = attn.to_v(hidden_states)
 
     encoder_query = encoder_key = encoder_value = None
     if encoder_hidden_states is not None and attn.added_kv_proj_dim is not None:
@@ -81,9 +67,8 @@ def get_qkv_projections(
                     t.contiguous() for t in (encoder_query, encoder_key, encoder_value)
                 ]
         else:
-            encoder_query, encoder_key, encoder_value = _project_shared_input(
-                x=encoder_hidden_states,
-                layers=(attn.add_q_proj, attn.add_k_proj, attn.add_v_proj),
-            )
+            encoder_query, _ = attn.add_q_proj(encoder_hidden_states)
+            encoder_key, _ = attn.add_k_proj(encoder_hidden_states)
+            encoder_value, _ = attn.add_v_proj(encoder_hidden_states)
 
     return query, key, value, encoder_query, encoder_key, encoder_value

@@ -23,7 +23,6 @@ from transformers import PretrainedConfig
 
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
-from sglang.srt.layers.layer_boundary import layer_stack
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -72,14 +71,13 @@ class Glm4MoeLiteModelNextN(nn.Module):
 
         self.eh_proj = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
 
-        with layer_stack():
-            self.decoder = Glm4MoeLiteDecoderLayer(
-                config,
-                0,
-                quant_config=quant_config,
-                is_nextn=True,
-                prefix=add_prefix("decoder", prefix),
-            )
+        self.decoder = Glm4MoeLiteDecoderLayer(
+            config,
+            0,
+            quant_config=quant_config,
+            is_nextn=True,
+            prefix=add_prefix("decoder", prefix),
+        )
 
         self.shared_head = nn.Module()
         self.shared_head.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -144,6 +142,7 @@ class Glm4MoeLiteForCausalLMNextN(Glm4MoeLiteForCausalLM):
     ) -> None:
         nn.Module.__init__(self)
         self.config = config
+        self.tp_size = get_parallel().tp_size
         if is_npu() and get_spec().speculative_draft_model_quantization is None:
             quant_config = None
         self.quant_config = quant_config

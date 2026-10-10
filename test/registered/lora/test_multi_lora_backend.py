@@ -12,7 +12,6 @@
 # limitations under the License.
 # ==============================================================================
 
-import dataclasses
 import multiprocessing as mp
 import os
 import unittest
@@ -35,11 +34,7 @@ class TestMultiLoRABackend(CustomTestCase):
         run_lora_batch_splitting_equivalence_test(CI_MULTI_LORA_MODELS)
 
     def test_ci_lora_models_multi_batch(self):
-        model_cases = [
-            dataclasses.replace(case, rouge_l_tolerance=0.9)
-            for case in CI_MULTI_LORA_MODELS
-        ]
-        run_lora_multiple_batch_on_model_cases(model_cases)
+        run_lora_multiple_batch_on_model_cases(CI_MULTI_LORA_MODELS)
 
     def test_all_lora_models(self):
         if is_in_ci():

@@ -10,8 +10,9 @@ MIMO_V2_MODEL = "XiaomiMiMo/MiMo-V2.5"
 MIMO_V2_OTHER_ARGS = [
     "--tp",
     "8",
-    "--attn-dp-size",
+    "--dp",
     "2",
+    "--enable-dp-attention",
     "--mm-enable-dp-encoder",
     "--attention-backend",
     "fa3",

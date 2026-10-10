@@ -5,10 +5,10 @@ pub mod admission;
 pub mod buckets;
 pub mod cache_aware;
 pub mod decode;
-pub mod dp_rank;
 pub mod factory;
 pub mod load_based;
 pub mod power_of_two;
+pub mod prefix_provider;
 pub mod random;
 pub mod registry;
 pub mod round_robin;
@@ -21,7 +21,6 @@ use crate::discovery::ModelId;
 use crate::policies::buckets::{BucketRequest, BucketSelector};
 use crate::policies::scoring::{EligibilityFilter, ScoringPolicy};
 use crate::server::metrics::MetricsRegistry;
-pub(crate) use crate::state::kv_events::PrefixLookupResult;
 use crate::state::load_monitor::engine_reported_load::EngineReportedLoadSnapshot;
 use crate::tokenizer::{adapter, TokenizerRegistry};
 use crate::workers::Worker;
@@ -35,6 +34,13 @@ pub struct RequestTokens {
     /// Whether the IDs came from rendered chat messages.
     /// Forwarding also requires the request safety guard.
     pub rendered_from_chat: bool,
+}
+
+/// External indexer answer prepared by the async ingress path for the
+/// synchronous cache-aware policy.
+pub struct ExternalPrefixSignal {
+    pub outcome: sgl_kv_indexer::PrefixOutcome,
+    pub query_blocks: usize,
 }
 
 /// Whether the caller pre-tokenized the prompt (`input_ids` present and not
@@ -166,7 +172,7 @@ pub struct SelectionContext<'a> {
     candidate_range_id: &'a str,
     input_tokens: Option<u64>,
     request_tokens: Option<&'a [u32]>,
-    external_prefix: Option<&'a PrefixLookupResult>,
+    external_prefix: Option<&'a ExternalPrefixSignal>,
     load_snapshot: Option<&'a EngineReportedLoadSnapshot>,
     prefill_cache_bucket: Option<(&'a BucketSelector, BucketRequest)>,
     affinity_lookup_enabled: bool,
@@ -236,7 +242,10 @@ impl<'a> SelectionContext<'a> {
         self
     }
 
-    pub fn with_external_prefix(mut self, external_prefix: Option<&'a PrefixLookupResult>) -> Self {
+    pub fn with_external_prefix(
+        mut self,
+        external_prefix: Option<&'a ExternalPrefixSignal>,
+    ) -> Self {
         self.external_prefix = external_prefix;
         self
     }
@@ -299,7 +308,7 @@ impl<'a> SelectionContext<'a> {
         self.request_tokens
     }
 
-    pub fn external_prefix(&self) -> Option<&PrefixLookupResult> {
+    pub fn external_prefix(&self) -> Option<&ExternalPrefixSignal> {
         self.external_prefix
     }
 
@@ -563,13 +572,6 @@ impl PolicyRegistry {
         self.by_model.get(model).map(|p| p.clone())
     }
 
-    /// Whether any registered policy reads request tokens; startup rejects this under `--no-tokenizer`.
-    pub fn needs_request_tokens(&self) -> bool {
-        self.by_model
-            .iter()
-            .any(|entry| entry.value().needs_request_tokens())
-    }
-
     /// Attaches metrics to each registered policy.
     pub fn attach_metrics(&self, metrics: Arc<MetricsRegistry>) {
         for entry in self.by_model.iter() {
@@ -584,7 +586,7 @@ mod tests {
     use crate::config::{AffinityConfig, SessionAffinityMode};
     use crate::discovery::{WorkerId, WorkerMode, WorkerSpec};
     use crate::policies::admission::{
-        resolve_cache_candidates, resolve_prefill, CandidateRange, DecisionReason,
+        resolve_cache_candidates, resolve_prefill, CandidateRange, DecisionReason, FreshLoadLookup,
     };
     use crate::policies::cache_aware::CacheAwarePolicy;
     use crate::policies::power_of_two::PowerOfTwoChoicesPolicy;
@@ -614,7 +616,7 @@ mod tests {
             url: format!("http://{id}:30000"),
             mode: WorkerMode::Plain,
             model_ids: vec![ModelId("model".into())],
-            ..Default::default()
+            bootstrap_port: None,
         }))
     }
 
@@ -879,12 +881,23 @@ mod tests {
     }
 
     #[test]
+    fn decode_pressure_tie_is_not_broken_by_worker_id() {
+        let a = worker("a");
+        let z = worker("z");
+        assert_eq!(
+            admission::compare_decode_pressure(&a, &z, None),
+            std::cmp::Ordering::Equal,
+            "P2 must preserve random sampling when observable pressure is equal"
+        );
+    }
+
+    #[test]
     fn cache_affinity_uses_longest_routable_prefix_holder() {
         let model = ModelId("model".into());
         let hot = worker("hot");
         let other = worker("other");
         let workers = vec![Arc::clone(&hot), Arc::clone(&other)];
-        let signal = PrefixLookupResult {
+        let signal = ExternalPrefixSignal {
             outcome: sgl_kv_indexer::PrefixOutcome::Matched {
                 matches: vec![
                     sgl_kv_indexer::PrefixMatch {
@@ -906,7 +919,6 @@ mod tests {
                 best_prefix_blocks: 8,
             },
             query_blocks: 8,
-            block_hashes: None,
         };
         let ctx = SelectionContext::new(&model, None)
             .with_request_tokens(Some(&[1, 2, 3, 4, 5, 6, 7, 8]))
@@ -928,7 +940,7 @@ mod tests {
         let hot = worker("hot");
         let warm = worker("warm");
         let workers = vec![Arc::clone(&hot), Arc::clone(&warm)];
-        let signal = PrefixLookupResult {
+        let signal = ExternalPrefixSignal {
             outcome: sgl_kv_indexer::PrefixOutcome::Matched {
                 matches: vec![
                     sgl_kv_indexer::PrefixMatch {
@@ -950,7 +962,6 @@ mod tests {
                 best_prefix_blocks: 8,
             },
             query_blocks: 8,
-            block_hashes: None,
         };
         let ctx = SelectionContext::new(&model, None)
             .with_input_tokens(8_000)
@@ -994,13 +1005,12 @@ mod tests {
                 address: worker.url.clone(),
             })
             .collect();
-        let signal = PrefixLookupResult {
+        let signal = ExternalPrefixSignal {
             outcome: sgl_kv_indexer::PrefixOutcome::Matched {
                 matches,
                 best_prefix_blocks: workers.len() as u32,
             },
             query_blocks: 64,
-            block_hashes: None,
         };
         let ctx = SelectionContext::new(&model, None)
             .with_input_tokens(64_000)
@@ -1051,13 +1061,12 @@ mod tests {
                 address: worker.url.clone(),
             })
             .collect();
-        let signal = PrefixLookupResult {
+        let signal = ExternalPrefixSignal {
             outcome: sgl_kv_indexer::PrefixOutcome::Matched {
                 matches,
                 best_prefix_blocks: 4,
             },
             query_blocks: 4,
-            block_hashes: None,
         };
         let ctx = SelectionContext::new(&model, None)
             .with_input_tokens(4_000)
@@ -1092,7 +1101,7 @@ mod tests {
         let half = worker("half");
         let below_ratio = worker("below-ratio");
         let workers = vec![Arc::clone(&half), Arc::clone(&below_ratio)];
-        let signal = PrefixLookupResult {
+        let signal = ExternalPrefixSignal {
             outcome: sgl_kv_indexer::PrefixOutcome::Matched {
                 matches: vec![
                     sgl_kv_indexer::PrefixMatch {
@@ -1109,7 +1118,6 @@ mod tests {
                 best_prefix_blocks: 4,
             },
             query_blocks: 8,
-            block_hashes: None,
         };
         let ctx = SelectionContext::new(&model, None)
             .with_input_tokens(80)
@@ -1139,7 +1147,7 @@ mod tests {
         let model = ModelId("model".into());
         let weak = worker("weak");
         let workers = vec![Arc::clone(&weak)];
-        let signal = PrefixLookupResult {
+        let signal = ExternalPrefixSignal {
             outcome: sgl_kv_indexer::PrefixOutcome::Matched {
                 matches: vec![sgl_kv_indexer::PrefixMatch {
                     matched_prefix_blocks: 3,
@@ -1149,7 +1157,6 @@ mod tests {
                 best_prefix_blocks: 3,
             },
             query_blocks: 8,
-            block_hashes: None,
         };
         let ctx = SelectionContext::new(&model, None)
             .with_input_tokens(80)
@@ -1171,7 +1178,7 @@ mod tests {
         let model = ModelId("model".into());
         let holder = worker("holder");
         let workers = vec![Arc::clone(&holder)];
-        let signal = PrefixLookupResult {
+        let signal = ExternalPrefixSignal {
             outcome: sgl_kv_indexer::PrefixOutcome::Matched {
                 matches: vec![sgl_kv_indexer::PrefixMatch {
                     matched_prefix_blocks: 2_048,
@@ -1181,7 +1188,6 @@ mod tests {
                 best_prefix_blocks: 2,
             },
             query_blocks: 4_125,
-            block_hashes: None,
         };
         let ctx = SelectionContext::new(&model, None)
             .with_input_tokens(4_125)
@@ -1243,6 +1249,45 @@ mod tests {
                 })
                 .collect::<HashMap<_, _>>(),
         )
+    }
+
+    #[test]
+    fn mixed_freshness_uses_one_captured_local_level_for_the_candidate_set() {
+        let aggregate_idle = worker("aggregate-idle");
+        let aggregate_busy = worker("aggregate-busy");
+        let stale = worker("stale");
+        aggregate_idle
+            .active_requests
+            .store(5, std::sync::atomic::Ordering::Relaxed);
+        aggregate_busy
+            .active_requests
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+        let snapshot = snapshot(&[
+            (
+                &aggregate_idle,
+                TestEngineLoad {
+                    num_waiting_reqs: 0,
+                    ..TestEngineLoad::default()
+                },
+            ),
+            (
+                &aggregate_busy,
+                TestEngineLoad {
+                    num_waiting_reqs: 1_000,
+                    ..TestEngineLoad::default()
+                },
+            ),
+        ]);
+
+        let lookup =
+            FreshLoadLookup::new(Some(&snapshot), [&aggregate_idle, &aggregate_busy, &stale]);
+        assert!(lookup.get(&aggregate_idle.id).is_some());
+        assert!(lookup.get(&stale.id).is_none());
+        assert_eq!(
+            lookup.compare_prefill_pressure(&aggregate_idle, &aggregate_busy),
+            std::cmp::Ordering::Greater,
+            "one stale member makes the complete candidate set compare by the captured local level"
+        );
     }
 
     fn cache_candidate(

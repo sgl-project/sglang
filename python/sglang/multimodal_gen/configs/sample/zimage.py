@@ -8,24 +8,11 @@ from sglang.multimodal_gen.configs.sample.teacache import TeaCacheParams
 
 
 @dataclass
-class ZImageSamplingParams(SamplingParams):
-    num_inference_steps: int = 50
-    num_frames: int = 1
-    negative_prompt: str = ""
-    guidance_scale: float = 5.0
-    cfg_normalization: float | bool = True
-
-    def should_use_classifier_free_guidance(self) -> bool:
-        if self.negative_prompt is None:
-            self.negative_prompt = ""
-        return self.guidance_scale > 0.0
-
-
-@dataclass
-class ZImageTurboSamplingParams(ZImageSamplingParams):
+class ZImageTurboSamplingParams(SamplingParams):
     num_inference_steps: int = 9
 
     num_frames: int = 1
+    negative_prompt: str = None
     # Z-Image officially recommends starting at 1024x1024
     height: int = 1024
     width: int = 1024
@@ -46,3 +33,13 @@ class ZImageTurboSamplingParams(ZImageSamplingParams):
             ],
         )
     )
+
+
+@dataclass
+class ZImageSamplingParams(SamplingParams):
+    num_inference_steps: int = 50
+
+    num_frames: int = 1
+    negative_prompt: str = " "
+    guidance_scale: float = 5.0
+    cfg_normalization: float | bool = True

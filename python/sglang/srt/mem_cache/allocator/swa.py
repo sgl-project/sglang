@@ -7,7 +7,6 @@ from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
-from sglang.srt.platforms import current_platform
 from sglang.srt.utils import is_npu
 from sglang.srt.utils.common import get_num_new_pages
 from sglang.srt.utils.invariants import Bucket, Invariant, IsTrue, expect
@@ -75,10 +74,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 need_sort,
             )
         else:
-            platform_allocator_cls = current_platform.get_paged_allocator_cls()
-            if platform_allocator_cls is not None:
-                PagedTokenToKVPoolAllocatorClass = platform_allocator_cls
-            elif _is_npu:
+            if _is_npu:
                 PagedTokenToKVPoolAllocatorClass = NPUPagedTokenToKVPoolAllocator
             else:
                 PagedTokenToKVPoolAllocatorClass = PagedTokenToKVPoolAllocator
@@ -203,7 +199,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def evict_to_free_tokens(self, tree_cache, num_tokens: int) -> None:
         from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 
-        if tree_cache is None or not tree_cache.supports_prefix_sharing():
+        if tree_cache is None or tree_cache.is_chunk_cache():
             return
         full_shortfall = max(0, num_tokens - self.full_available_size())
         swa_shortfall = max(0, num_tokens - self.swa_available_size())

@@ -51,7 +51,8 @@ class TestDPAttentionDP2TP2DeepseekV3MTP(
             DEFAULT_MODEL_NAME_FOR_TEST_MLA_NEXTN,
             "--tp-size",
             "2",
-            "--attn-dp-size",
+            "--enable-dp-attention",
+            "--dp-size",
             "2",
         ]
         if not is_in_amd_ci():

@@ -17,7 +17,6 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ImagePipelineConfig,
     ModelTaskType,
     TextConditioningOutput,
-    pack_latents_2x2,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
     ModelDeploymentConfig,
@@ -172,6 +171,17 @@ def _unpack_latents(latents, height, width, vae_scale_factor):
     return latents
 
 
+def _pack_latents(latents, batch_size, num_channels_latents, height, width):
+    latents = latents.view(
+        batch_size, num_channels_latents, height // 2, 2, width // 2, 2
+    )
+    latents = latents.permute(0, 2, 4, 1, 3, 5)
+    latents = latents.reshape(
+        batch_size, (height // 2) * (width // 2), num_channels_latents * 4
+    )
+    return latents
+
+
 def _calculate_shift(
     image_seq_len,
     base_seq_len: int = 256,
@@ -283,7 +293,7 @@ class LongCatImagePipelineConfig(ImagePipelineConfig):
     def maybe_pack_latents(self, latents, batch_size, batch):
         num_channels_latents = self.dit_config.arch_config.num_channels_latents
         _, _, h, w = latents.shape
-        return pack_latents_2x2(latents, batch_size, num_channels_latents, h, w)
+        return _pack_latents(latents, batch_size, num_channels_latents, h, w)
 
     def maybe_prepare_latent_ids(self, latents):
         # latents shape after packing: [B, (h//2)*(w//2), C*4]
@@ -507,7 +517,7 @@ class LongCatImageEditPipelineConfig(LongCatImagePipelineConfig):
                 batch_size // latent_condition.shape[0], 1, 1, 1
             )
         _, num_channels_latents, height, width = latent_condition.shape
-        return pack_latents_2x2(
+        return _pack_latents(
             latent_condition, batch_size, num_channels_latents, height, width
         )
 

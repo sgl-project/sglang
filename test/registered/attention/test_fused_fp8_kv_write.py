@@ -251,7 +251,6 @@ class TestAiterFp8KvDispatch(unittest.TestCase):
 
         class _FB:
             out_cache_loc = torch.arange(n, device=dev, dtype=torch.int64)
-            out_cache_loc_is_physical = False
 
         captured = {}
 
@@ -305,7 +304,6 @@ class TestAiterFp8KvDispatch(unittest.TestCase):
 
         class _FB:
             out_cache_loc = torch.arange(n, device=dev, dtype=torch.int64)
-            out_cache_loc_is_physical = False
 
         launch_calls = {"n": 0}
 
@@ -361,7 +359,6 @@ class TestAiterFp8KvDispatch(unittest.TestCase):
 
         class _FB:
             out_cache_loc = torch.arange(n, device=dev, dtype=torch.int64)
-            out_cache_loc_is_physical = False
 
         launch_calls = {"n": 0}
 

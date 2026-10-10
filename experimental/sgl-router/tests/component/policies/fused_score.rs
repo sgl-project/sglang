@@ -32,7 +32,7 @@ fn worker(id: &str) -> Arc<Worker> {
         url: id.into(),
         mode: WorkerMode::Plain,
         model_ids: vec![ModelId("tiny".into())],
-        ..Default::default()
+        bootstrap_port: None,
     }))
 }
 

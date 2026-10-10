@@ -23,8 +23,9 @@ class TestE2ETensorParallel(CustomTestCase):
             extra_server_args=[
                 "--tp",
                 "2",
-                "--attn-dp-size",
+                "--dp",
                 "2",
+                "--enable-dp-attention",
                 "--enable-tp-lm-head-all-to-all",
                 "--cuda-graph-max-bs-decode",
                 "4",

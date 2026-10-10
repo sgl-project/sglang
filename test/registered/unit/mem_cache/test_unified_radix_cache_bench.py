@@ -28,7 +28,6 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     InsertParams,
     MatchPrefixParams,
-    TreeLock,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
@@ -509,7 +508,7 @@ def bench_match_prefix(
         k = RadixKey(array("q", q))
         r1 = env.tree.match_prefix(MatchPrefixParams(key=k))
         r2 = env.tree.match_prefix(MatchPrefixParams(key=k))
-        assert r1.device_prefix_len == r2.device_prefix_len, "match not idempotent"
+        assert len(r1.device_indices) == len(r2.device_indices), "match not idempotent"
 
     warmup = min(20, len(queries) // 10)
     return bench_api(
@@ -604,7 +603,7 @@ def bench_release(
 ):
     """Request release throughput — full request lifecycle.
 
-    Simulates: match_prefix → lock → alloc → fill req_to_token → checkpoint + free + unlock.
+    Simulates: match_prefix → inc_lock_ref → alloc → fill req_to_token → insert_req + free + unpin.
     """
     env = _make_env(num_seqs, chunk_len, kv_size, components, page_size)
 
@@ -613,7 +612,7 @@ def bench_release(
     for seq in env.seqs:
         key = RadixKey(array("q", seq))
         mr = env.tree.match_prefix(MatchPrefixParams(key=key))
-        matched_len = mr.device_prefix_len
+        matched_len = len(mr.device_indices)
         node = mr.last_device_node
         lr = env.tree.inc_lock_ref(node)
 
@@ -626,22 +625,22 @@ def bench_release(
                     lr.to_dec_params(),
                 )
                 continue
-            kv_indices = torch.cat(
-                [env.tree.path_device_indices(mr.last_device_node), v]
-            )
+            kv_indices = torch.cat([mr.device_indices, v])
         else:
-            kv_indices = env.tree.path_device_indices(mr.last_device_node)
+            kv_indices = mr.device_indices
 
         req = env.make_req()
         req.origin_input_ids = array("q", seq)
         req.output_ids = array("q")
         req.full_untruncated_fill_ids = array("q", seq)
-        req.extend_end = len(req.full_untruncated_fill_ids)
+        req.set_extend_range(
+            len(req.prefix_indices), len(req.full_untruncated_fill_ids)
+        )
         req.last_node = node
         req.kv.cache_protected_len = matched_len
         req.kv.kv_committed_len = len(seq)
         if hasattr(lr, "to_dec_params"):
-            req.lock = TreeLock(node, lr.to_dec_params())
+            req.lock_receipt = lr.to_dec_params()
         env.rtp.req_to_token[req.kv.req_pool_idx, : len(kv_indices)] = kv_indices
         req_items.append(req)
 

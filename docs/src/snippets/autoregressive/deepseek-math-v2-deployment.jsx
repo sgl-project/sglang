@@ -51,9 +51,9 @@ export const DeepSeekMathV2Deployment = () => {
     // TP setting
     cmd += ` \\\n  --tp ${tpValue}`;
 
-    // DP Attention: --attn-dp-size matches --tp
+    // DP Attention: --dp matches --tp
     if (values.dpattention === 'enabled') {
-      cmd += ` \\\n  --attn-dp-size ${tpValue}`;
+      cmd += ` \\\n  --dp ${tpValue} \\\n  --enable-dp-attention`;
     }
 
     // EP setting (commonly matches tp for MoE models)

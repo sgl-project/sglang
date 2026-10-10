@@ -193,7 +193,7 @@ class UnifiedCacheLinkerWrapper:
         cache = self.cache
         key, _ = key.maybe_to_bigram_view(cache.tree_core.is_eagle)
         page = cache.page_size
-        device_hit_len = result.device_prefix_len
+        device_hit_len = int(result.device_indices.numel())
         if device_hit_len >= len(key):
             return result
 
@@ -287,11 +287,12 @@ class UnifiedCacheLinkerWrapper:
 
     # ---- init_load_back: remote -> device, then insert ----
 
-    def load_back(self, req: Req) -> tuple[int, NodeId]:
+    def load_back(self, req: Req) -> tuple[torch.Tensor, NodeId]:
         cache = self.cache
+        empty_indices = cache.tree_core.empty_match_result.device_indices
         hit = self.hit_markers.pop(req.rid, None)
         if hit is None:
-            return 0, req.last_node
+            return empty_indices, req.last_node
 
         device_hit_len = hit.device_hit_len
         tail_hashes = hit.tail_hashes
@@ -310,7 +311,7 @@ class UnifiedCacheLinkerWrapper:
                     component_transfers,
                     prefix_len,
                 )
-                return 0, req.last_node
+                return empty_indices, req.last_node
             component_transfers.append((component, transfer))
 
         full_transfer = component_transfers[0][1]
@@ -337,7 +338,7 @@ class UnifiedCacheLinkerWrapper:
 
         # Insert the newly loaded tail into the tree.
         prefix_indices = torch.cat(
-            [cache.prefix_device_indices(req), full_transfer.device_indices]
+            [req.prefix_indices.to(torch.int64), full_transfer.device_indices]
         )
         mamba_transfer = next(
             (
@@ -362,7 +363,7 @@ class UnifiedCacheLinkerWrapper:
                     if req.kv is not None
                     else {}
                 ),
-                inserted_len=len(hit.prefix_key),
+                chunked=True,
                 priority=req.priority or 0,
                 track_adopted_ranges=True,
             )
@@ -390,7 +391,7 @@ class UnifiedCacheLinkerWrapper:
         cache.tree_core.mark_external_cache_stored_path(
             insert_result.last_device_node, req.last_node
         )
-        return len(canonical_tail), insert_result.last_device_node
+        return canonical_tail, insert_result.last_device_node
 
     def _queue_load(
         self, rid: str, node_id: NodeId, transfers: list[PoolTransfer]

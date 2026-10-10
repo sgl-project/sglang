@@ -4,17 +4,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.numerics import round_bf16_to_fp32
-
-# Column tiles per row. One program per whole row padded to a power of two
-# masked off 37.5% of MiniMax-H3's 5376-wide rows; 2048-wide tiles run both
-# kernels ~10% faster on H200 (elementwise, so the bytes are unchanged).
-_MAX_BLOCK_N = 2048
-
-
-def _row_tiles(hidden_size: int) -> tuple[int, int]:
-    block_n = min(_MAX_BLOCK_N, triton.next_power_of_2(hidden_size))
-    return block_n, triton.cdiv(hidden_size, block_n)
+from sglang.kernels.ops.diffusion.common.numerics import round_bf16_to_fp32
 
 
 @triton.jit
@@ -32,7 +22,7 @@ def _indexed_scale_shift_bf16_kernel(
     BLOCK_N: tl.constexpr,
 ):
     row = tl.program_id(0)
-    columns = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+    columns = tl.arange(0, BLOCK_N)
     mask = columns < hidden_size
     index = tl.load(indices_ptr + row * stride_indices)
 
@@ -71,7 +61,7 @@ def _indexed_gate_bf16_kernel(
     BLOCK_N: tl.constexpr,
 ):
     row = tl.program_id(0)
-    columns = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+    columns = tl.arange(0, BLOCK_N)
     mask = columns < hidden_size
     index = tl.load(indices_ptr + row * stride_indices)
 
@@ -102,8 +92,8 @@ def indexed_scale_shift_bf16_(
     rows, hidden_size = x.shape
     if rows == 0:
         return x
-    block_n, tiles = _row_tiles(hidden_size)
-    _indexed_scale_shift_bf16_kernel[(rows, tiles)](
+    block_n = triton.next_power_of_2(hidden_size)
+    _indexed_scale_shift_bf16_kernel[(rows,)](
         x,
         x,
         shift,
@@ -115,7 +105,7 @@ def indexed_scale_shift_bf16_(
         scale.stride(0),
         indices.stride(0),
         BLOCK_N=block_n,
-        num_warps=4,
+        num_warps=8,
     )
     return x
 
@@ -130,8 +120,8 @@ def _indexed_gate_bf16(
     rows, hidden_size = x.shape
     if rows == 0:
         return output
-    block_n, tiles = _row_tiles(hidden_size)
-    _indexed_gate_bf16_kernel[(rows, tiles)](
+    block_n = triton.next_power_of_2(hidden_size)
+    _indexed_gate_bf16_kernel[(rows,)](
         output,
         x,
         gate,
@@ -144,7 +134,7 @@ def _indexed_gate_bf16(
         other.stride(0),
         indices.stride(0),
         BLOCK_N=block_n,
-        num_warps=4,
+        num_warps=8,
     )
     return output
 

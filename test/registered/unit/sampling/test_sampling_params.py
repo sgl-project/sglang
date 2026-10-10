@@ -484,8 +484,7 @@ class TestSamplingParamsMsgspecStruct(CustomTestCase):
         )
         source = rust_path.read_text()
         start = source.index("pub struct SamplingParams {")
-        # The struct's own closing brace: the first one back at column 0.
-        end = source.index("\n}\n", start)
+        end = source.index("\n}\n\n/// The `/generate`", start)
         rust_fields = tuple(
             re.findall(
                 r"^\s*pub ([a-z][a-z0-9_]*):",

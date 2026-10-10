@@ -93,15 +93,16 @@ class TestQwen3MoePPxCP(_Qwen3MoePPCompatMixin, CustomTestCase):
 
 
 class TestQwen3MoePPxDP(_Qwen3MoePPCompatMixin, CustomTestCase):
-    """PP x DP: pp_size=2 x attn_dp_size=2 (tp_size=2)."""
+    """PP x DP: pp_size=2 x dp_size=2 attention (tp_size=2)."""
 
     parallel_args = [
         "--tp-size",
         "2",
         "--pp-size",
         "2",
-        "--attn-dp-size",
+        "--dp-size",
         "2",
+        "--enable-dp-attention",
     ]
 
 

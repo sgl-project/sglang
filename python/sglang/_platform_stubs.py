@@ -162,10 +162,7 @@ class Stream:
     """
 
     def __init__(self, device: Any = None, priority: int = 0) -> None:
-        import torch
-
-        self.device = torch.device(device or "mps")
-        self.priority = priority
+        pass
 
     def synchronize(self) -> None:
         pass
@@ -279,24 +276,13 @@ _cached_props: _MPSDeviceProperties | None = None
 
 
 def get_device_properties(device: Any = 0) -> _MPSDeviceProperties:  # noqa: ARG001
-    """Implement ``torch.mps.get_device_properties``, not other device backends.
-
-    Metal's recommended working-set limit bounds usable GPU memory, even though
-    Apple Silicon shares physical RAM with the CPU.
-    """
+    """Return the properties of the MPS device. Results are cached after first call."""
     global _cached_props
     if _cached_props is None:
-        import torch
-
-        total_memory = int(torch.mps.recommended_max_memory())
-        if total_memory <= 0:
-            raise RuntimeError(
-                "torch.mps.recommended_max_memory() returned a non-positive "
-                "Metal working-set limit"
-            )
+        import psutil
 
         _cached_props = _MPSDeviceProperties(
-            total_memory=total_memory,
+            total_memory=psutil.virtual_memory().total,
         )
     return _cached_props
 

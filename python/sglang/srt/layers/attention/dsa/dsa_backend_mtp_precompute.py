@@ -134,10 +134,8 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
             dsa_cu_seqlens_k = torch.empty(
                 bs + 1, dtype=torch.int32, device=self.device
             )
-            if self.physical_page_size > 1:
-                real_cols = (
-                    max_len + self.physical_page_size - 1
-                ) // self.physical_page_size
+            if self.real_page_size > 1:
+                real_cols = (max_len + self.real_page_size - 1) // self.real_page_size
                 real_page_table = torch.empty(
                     (bs, real_cols), dtype=torch.int32, device=self.device
                 )
@@ -159,7 +157,7 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
                 bs=bs,
                 max_len=max_len,
                 dsa_index_topk=self.dsa_index_topk,
-                physical_page_size=self.physical_page_size,
+                real_page_size=self.real_page_size,
             )
             seqlens_expanded = cache_seqlens
             seqlens_expanded_size = bs
@@ -206,7 +204,7 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
         dsa_cu_seqlens_k = compute_cu_seqlens(dsa_cache_seqlens)
 
         # Transform page table if needed
-        if self.physical_page_size > 1:
+        if self.real_page_size > 1:
             real_page_table = self._transform_table_1_to_real(page_indices)
         else:
             real_page_table = None  # Will use page_indices directly
@@ -266,10 +264,10 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
                 dtype=torch.int32,
                 device=self.device,
             )
-            if self.physical_page_size > 1:
+            if self.real_page_size > 1:
                 real_cols = (
-                    max_seqlen_k + self.physical_page_size - 1
-                ) // self.physical_page_size
+                    max_seqlen_k + self.real_page_size - 1
+                ) // self.real_page_size
                 real_page_table = torch.empty(
                     (seqlens_expanded_size, real_cols),
                     dtype=torch.int32,
@@ -294,7 +292,7 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
                 bs=bs,
                 max_seqlen_k=max_seqlen_k,
                 dsa_index_topk=self.dsa_index_topk,
-                physical_page_size=self.physical_page_size,
+                real_page_size=self.real_page_size,
                 next_n=self.speculative_num_draft_tokens,
             )
 
@@ -357,7 +355,7 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
         dsa_cu_seqlens_k = compute_cu_seqlens(dsa_cache_seqlens)
 
         # Transform page table
-        if self.physical_page_size > 1:
+        if self.real_page_size > 1:
             real_page_table = self._transform_table_1_to_real(page_indices)
         else:
             real_page_table = None

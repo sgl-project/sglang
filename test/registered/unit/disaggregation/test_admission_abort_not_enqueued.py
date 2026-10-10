@@ -22,7 +22,7 @@ them by then -- so it gates on its own `is_retracted` / `is_rebootstrap` flags.
 import unittest
 from array import array
 from http import HTTPStatus
-from types import MethodType, SimpleNamespace
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.disaggregation.decode import DecodePreallocQueue
@@ -95,8 +95,6 @@ def _decode_queue(sched):
         ),
         _resolve_prefill_dp_rank=MagicMock(return_value=0),
     )
-    # Exercise the production initializer reached by the cache-hit fast path.
-    q._init_receiver = MethodType(DecodePreallocQueue._init_receiver, q)
     return q
 
 
@@ -214,10 +212,6 @@ class TestAdmissionAbortNotEnqueued(CustomTestCase):
                         self.assertEqual(q.retracted_queue, [req])
                     else:
                         q._create_receiver_and_enqueue.assert_called_once()
-                        receiver = (
-                            q._create_receiver_and_enqueue.return_value.kv_receiver
-                        )
-                        receiver.init.assert_called_once_with(0)
 
     def test_preempted_reentry_is_not_retired(self):
         """Preemption requeues through a bare `_add_request_to_queue`.
@@ -249,8 +243,6 @@ class TestAdmissionAbortNotEnqueued(CustomTestCase):
                     q = _decode_queue(sched)
                     _admit_decode(q, req)
                     q._create_receiver_and_enqueue.assert_called_once()
-                    receiver = q._create_receiver_and_enqueue.return_value.kv_receiver
-                    receiver.init.assert_called_once_with(0)
                 sched.retire_unadmitted_request.assert_not_called()
 
     def test_valid_request_still_admitted(self):
@@ -266,8 +258,6 @@ class TestAdmissionAbortNotEnqueued(CustomTestCase):
                     q = _decode_queue(sched)
                     _admit_decode(q, req)
                     q._create_receiver_and_enqueue.assert_called_once()
-                    receiver = q._create_receiver_and_enqueue.return_value.kv_receiver
-                    receiver.init.assert_called_once_with(0)
                 sched.retire_unadmitted_request.assert_not_called()
 
     def test_null_mode_is_deliberately_untouched(self):

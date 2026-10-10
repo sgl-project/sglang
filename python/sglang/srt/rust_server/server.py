@@ -120,9 +120,7 @@ class RustServer:
         os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
         # Preserve the DP startup log; ports use node-local offsets.
-        dp_rank = (
-            get_parallel().attn_dp_rank if get_parallel().num_dp_ranks > 1 else None
-        )
+        dp_rank = get_parallel().attn_dp_rank if get_parallel().dp_size > 1 else None
         if get_exec().moe.is_ep_scale_joiner:
             # The joining TP group is entirely local to this node.
             tp_size_per_node = get_parallel().tp_size
@@ -182,9 +180,7 @@ class RustServer:
         # Under DP every rank runs its own server on its own port, so the rank is
         # what tells two otherwise identical startup lines apart.
         dp_note = (
-            ""
-            if dp_rank is None
-            else f" (DP rank {dp_rank}/{get_parallel().num_dp_ranks})"
+            "" if dp_rank is None else f" (DP rank {dp_rank}/{get_parallel().dp_size})"
         )
         logger.info(
             "SGLANG_RUST_SERVER enabled, Rust server listen on %s%s",

@@ -141,14 +141,12 @@ def _apply_cfg_normalization(
 ) -> torch.Tensor:
     cond_f = noise_pred_cond.float()
     pred_f = noise_pred.float()
-    dims = list(range(1, noise_pred.ndim))
-    ori_norm = torch.linalg.vector_norm(cond_f, dim=dims, keepdim=True)
-    new_norm = torch.linalg.vector_norm(pred_f, dim=dims, keepdim=True)
+    ori_norm = torch.linalg.vector_norm(cond_f)
+    new_norm = torch.linalg.vector_norm(pred_f)
     max_norm = ori_norm * cfg_normalization
-    scale = torch.where(
-        new_norm > max_norm, max_norm / new_norm, torch.ones_like(new_norm)
-    )
-    return (noise_pred * scale).to(noise_pred.dtype)
+    if new_norm > max_norm:
+        noise_pred = noise_pred * (max_norm / new_norm)
+    return noise_pred
 
 
 def _rescale_noise_cfg(

@@ -202,20 +202,11 @@ class NGramPool:
                 device=self.context.device, dtype=self.context.dtype
             )
 
-    def set_intermediate_context(
-        self, context: torch.Tensor, indices: Optional[torch.Tensor] = None
-    ):
+    def set_intermediate_context(self, context: torch.Tensor):
         if self.intermediate_context is not None and context.numel() > 0:
-            context = context.to(device=self.context.device, dtype=self.context.dtype)
-            if indices is None:
-                self.intermediate_context[: context.shape[0], : context.shape[1]].copy_(
-                    context
-                )
-            else:
-                self.intermediate_context[
-                    indices.to(device=self.context.device, dtype=torch.long),
-                    : context.shape[1],
-                ] = context
+            self.intermediate_context[: context.shape[0], : context.shape[1]].copy_(
+                context.to(device=self.context.device, dtype=self.context.dtype)
+            )
 
     def clear(self):
         if self.context is not None:

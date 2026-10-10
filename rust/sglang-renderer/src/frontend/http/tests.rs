@@ -29,17 +29,12 @@ mod suite {
         render_only_routes, standalone_routes,
     };
     use crate::openai::test_utils::renderer_config;
-    use crate::{RendererService, TextTokenizer};
-    use sglang_processor::ProcessorError;
+    use crate::{RendererError, RendererService, TextTokenizer};
 
     struct WordTokenizer;
 
     impl TextTokenizer for WordTokenizer {
-        fn encode(
-            &self,
-            text: &str,
-            _add_special_tokens: bool,
-        ) -> Result<Vec<i32>, ProcessorError> {
+        fn encode(&self, text: &str, _add_special_tokens: bool) -> Result<Vec<i32>, RendererError> {
             Ok(text.split_whitespace().map(|_| 7).collect())
         }
     }

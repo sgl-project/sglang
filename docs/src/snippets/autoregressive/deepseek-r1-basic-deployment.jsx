@@ -116,7 +116,7 @@ export const DeepSeekR1BasicDeployment = () => {
       command += isXeon ? ' \\\n  --tp 6' : ' \\\n  --tp 8';
     }
     if (strategyValues.includes('dp')) {
-      command += ' \\\n  --attn-dp-size 8';
+      command += ' \\\n  --dp 8 \\\n  --enable-dp-attention';
     }
     if (strategyValues.includes('ep')) {
       command += ' \\\n  --ep 8';

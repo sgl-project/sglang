@@ -113,7 +113,9 @@ class TestForwardSplitPrefill(CustomTestCase):
             )
             req.full_untruncated_fill_ids = req.origin_input_ids
             req.logprob_start_len = -1
-            req.extend_end = len(req.full_untruncated_fill_ids)
+            req.set_extend_range(
+                len(req.prefix_indices), len(req.full_untruncated_fill_ids)
+            )
             reqs.append(req)
 
         # Create dummy tree_cache for tests (no prefix caching, just allocation)

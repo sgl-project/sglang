@@ -42,13 +42,12 @@ mod tests {
     use serde_json::json;
     use tower::ServiceExt;
 
-    use crate::{RendererConfig, RendererLimits, SamplingDefaults, TextTokenizer};
-    use sglang_processor::ProcessorError;
+    use crate::{RendererConfig, RendererError, RendererLimits, SamplingDefaults, TextTokenizer};
 
     struct PrefixTokenizer;
 
     impl TextTokenizer for PrefixTokenizer {
-        fn encode(&self, text: &str, add_special_tokens: bool) -> Result<Vec<i32>, ProcessorError> {
+        fn encode(&self, text: &str, add_special_tokens: bool) -> Result<Vec<i32>, RendererError> {
             Ok(add_special_tokens
                 .then_some(1)
                 .into_iter()

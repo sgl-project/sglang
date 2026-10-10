@@ -19,7 +19,7 @@ pub async fn get_dp_info(url: &str, api_key: Option<&str>) -> Result<DpInfo, Str
     let info = get_server_info(url, api_key).await?;
 
     let dp_size = info
-        .num_dp_ranks()
+        .dp_size
         .ok_or_else(|| format!("No dp_size in response from {}", url))?;
 
     let model_id = info

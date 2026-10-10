@@ -79,7 +79,13 @@ def direct_register_custom_op(
         # Operator doesn't exist, proceed with registration
         pass
 
-    schema_str = torch.library.infer_schema(op_func, mutates_args=mutates_args)
+    if hasattr(torch.library, "infer_schema"):
+        schema_str = torch.library.infer_schema(op_func, mutates_args=mutates_args)
+    else:
+        # for pytorch 2.4
+        import torch._custom_op.impl
+
+        schema_str = torch._custom_op.impl.infer_schema(op_func, mutates_args)
 
     try:
         my_lib.define(op_name + schema_str)
@@ -100,6 +106,9 @@ def direct_register_custom_op(
         else:
             # Re-raise other RuntimeErrors
             raise error
+    except AttributeError as error:
+        # Always re-raise AttributeError as it indicates missing dependencies
+        raise error
 
 
 class CustomOpWrapper:

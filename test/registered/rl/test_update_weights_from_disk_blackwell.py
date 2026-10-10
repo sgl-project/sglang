@@ -207,8 +207,9 @@ class TestServerUpdateWeightsFromDiskMXFP8(UpdateWeightsFromDiskBase, CustomTest
             "other_args": (
                 "--tp-size",
                 "4",
-                "--attn-dp-size",
+                "--dp-size",
                 "4",
+                "--enable-dp-attention",
                 "--fp8-gemm-backend",
                 "flashinfer_trtllm",
                 "--moe-runner-backend",
@@ -285,8 +286,9 @@ class TestServerUpdateWeightsFromDiskNVFP4W4A16CuteDSL(
             "other_args": (
                 "--tp-size",
                 "4",
-                "--attn-dp-size",
+                "--dp-size",
                 "4",
+                "--enable-dp-attention",
                 "--ep-size",
                 "4",
                 "--fp4-gemm-backend",

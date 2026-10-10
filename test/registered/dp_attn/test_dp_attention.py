@@ -54,7 +54,8 @@ class TestDPAttentionDP2TP2(
                 "4",
                 "--tp",
                 "2",
-                "--attn-dp-size",
+                "--enable-dp-attention",
+                "--dp",
                 "2",
             ],
         )
@@ -71,7 +72,7 @@ class TestDPAttentionGatherv(
 ):
     """Exercise the variable-length all_gatherv + reduce_scatterv DP-MoE path
     (SGLANG_DP_USE_GATHERV=1). The path only activates for the
-    attn_tp_size == 1, tp_size == attn_dp_size layout, which tp2 + attn_dp2 satisfies.
+    attn_tp_size == 1, tp_size == dp_size layout, which tp2 + dp2 satisfies.
     Without this test the gatherv/reduce_scatterv code is never exercised by CI
     (it is gated behind the env var, default off). gsm8k must stay correct since
     the change is a pure communication reorg, not a numerics change."""
@@ -91,7 +92,8 @@ class TestDPAttentionGatherv(
                 "--trust-remote-code",
                 "--tp",
                 "2",
-                "--attn-dp-size",
+                "--enable-dp-attention",
+                "--dp",
                 "2",
                 "--chunked-prefill-size",
                 "256",
@@ -122,7 +124,8 @@ class TestDPAttentionMixedChunk(
                 "--trust-remote-code",
                 "--tp",
                 "2",
-                "--attn-dp-size",
+                "--enable-dp-attention",
+                "--dp",
                 "2",
                 "--enable-mixed-chunk",
                 "--chunked-prefill-size",
@@ -154,7 +157,8 @@ class TestDPRetract(
                 "--trust-remote-code",
                 "--tp",
                 "2",
-                "--attn-dp-size",
+                "--enable-dp-attention",
+                "--dp",
                 "2",
                 "--max-total-tokens",
                 "4500",
@@ -190,7 +194,8 @@ class TestDPAttentionDP2TP2VLM(CustomTestCase):
                 "--trust-remote-code",
                 "--tp",
                 "2",
-                "--attn-dp-size",
+                "--enable-dp-attention",
+                "--dp",
                 "2",
             ],
         )

@@ -179,7 +179,7 @@ export const KimiK27CodeDeployment = () => {
     cmd += ' \\\n  --trust-remote-code';
 
     if (dpattention === 'enabled') {
-      cmd += ` \\\n  --attn-dp-size ${tpValue}`;
+      cmd += ` \\\n  --dp ${tpValue} \\\n  --enable-dp-attention`;
     }
 
     if (reasoning === 'enabled') {

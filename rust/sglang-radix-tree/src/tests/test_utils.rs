@@ -5,16 +5,7 @@ use std::collections::HashMap;
 use tch::Tensor;
 
 use crate::components::ComponentType;
-use crate::node::ChildKeyType;
-use crate::unified_tree_core::{CacheAction, EvictionStepResult, MatchResult, UnifiedTreeCore};
-
-pub(crate) fn matched_device_indices<K: ChildKeyType>(
-    tc: &UnifiedTreeCore<K>,
-    result: &MatchResult,
-) -> Tensor {
-    tc.collect_full_device_indices(result.last_device_node_id, tc.root_node_handle(None))
-        .expect("live match node")
-}
+use crate::unified_tree_core::{CacheAction, EvictionStepResult};
 
 /// Fold an eviction step into a caller's running accumulators (the Controller
 /// consumption contract: deltas add, freed tensors append).

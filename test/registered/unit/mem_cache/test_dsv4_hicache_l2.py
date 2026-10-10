@@ -80,7 +80,7 @@ class TestDSV4DecodeCapacity(CustomTestCase):
             ),
         )
         tree_cache = SimpleNamespace(
-            supports_prefix_sharing=lambda: True,
+            is_chunk_cache=lambda: False,
             evict=MagicMock(side_effect=evict),
         )
 

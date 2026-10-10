@@ -228,7 +228,15 @@ class DFlashAttention(nn.Module):
         attention_bias = bool(getattr(config, "attention_bias", False))
         rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-6))
 
-        self.qkv_proj = self._build_qkv_proj(attention_bias, quant_config, prefix)
+        self.qkv_proj = QKVParallelLinear(
+            hidden_size=hidden_size,
+            head_size=head_dim,
+            total_num_heads=self.total_num_heads,
+            total_num_kv_heads=self.total_num_kv_heads,
+            bias=attention_bias,
+            quant_config=quant_config,
+            prefix=f"{prefix}.qkv_proj" if prefix else "qkv_proj",
+        )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * head_dim,
             hidden_size,
@@ -287,7 +295,7 @@ class DFlashAttention(nn.Module):
             )
             set_weight_attrs(
                 self.attention_sink_bias,
-                {"weight_loader": sharded_weight_loader(0, parallel_group="tp")},
+                {"weight_loader": sharded_weight_loader(0)},
             )
         elif draft_cfg.attention_sink_bias:
             # Per-head sink bias; each TP rank owns its slice of the
@@ -298,7 +306,7 @@ class DFlashAttention(nn.Module):
             )
             set_weight_attrs(
                 self.attention_sink_bias,
-                {"weight_loader": sharded_weight_loader(0, parallel_group="tp")},
+                {"weight_loader": sharded_weight_loader(0)},
             )
         self.attn = RadixAttention(
             num_heads=self.num_heads,
@@ -308,18 +316,6 @@ class DFlashAttention(nn.Module):
             layer_id=layer_id,
             sliding_window_size=self.sliding_window_size,
             attn_type=self.attn_type,
-            quant_config=quant_config,
-        )
-
-    def _build_qkv_proj(self, bias: bool, quant_config, prefix: str) -> nn.Module:
-        return QKVParallelLinear(
-            hidden_size=self.hidden_size,
-            head_size=self.head_dim,
-            total_num_heads=self.total_num_heads,
-            total_num_kv_heads=self.total_num_kv_heads,
-            bias=bias,
-            quant_config=quant_config,
-            prefix=f"{prefix}.qkv_proj" if prefix else "qkv_proj",
         )
 
     def forward_prepare_npu(self, positions, hidden_states):
@@ -477,8 +473,7 @@ def _grouped_conv(hidden_states, delta, base, block_size, num_groups, group_size
         position = position % block_size
     for tap in range(1, taps):
         shifted = F.pad(blocks[:-tap], (0, 0, 0, 0, tap, 0))
-        shifted = torch.where((position >= tap).view(-1, 1, 1), shifted, 0)
-        out = out + coefficients[:, tap] * shifted
+        out = out + coefficients[:, tap] * shifted * (position >= tap).view(-1, 1, 1)
     return out.flatten(-2)
 
 
@@ -627,8 +622,6 @@ class DFlashDraftModel(nn.Module):
 
     decoder_layer_cls = DFlashDecoderLayer
     supports_fused_context_kv = True
-    # Layer prefixes and a quant_config-aware `fc`, for quantized checkpoints.
-    supports_quantization = False
 
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
         super().__init__()
@@ -645,7 +638,6 @@ class DFlashDraftModel(nn.Module):
         self.candidate_selector: Optional[nn.Module] = None
         self.lilicorr: Optional[nn.Module] = None
         self.is_nemotron_35_draft = is_nemotron_35_draft_config(config)
-        self.quantizable = self.supports_quantization or self.is_nemotron_35_draft
         self.embed_tokens: Optional[VocabParallelEmbedding] = None
         if self.is_nemotron_35_draft:
             embed_prefix = f"{prefix}.embed_tokens" if prefix else "embed_tokens"
@@ -676,7 +668,7 @@ class DFlashDraftModel(nn.Module):
                     quant_config=quant_config,
                     prefix=(
                         (f"{prefix}.layers.{i}" if prefix else f"layers.{i}")
-                        if self.quantizable
+                        if self.is_nemotron_35_draft
                         else ""
                     ),
                 )
@@ -700,7 +692,7 @@ class DFlashDraftModel(nn.Module):
         num_context_features = len(target_layer_ids)
 
         self.num_context_features = int(num_context_features)
-        if self.quantizable:
+        if self.is_nemotron_35_draft:
             fc_prefix = f"{prefix}.fc" if prefix else "fc"
             self.fc = ReplicatedLinear(
                 self.num_context_features * hidden_size,
@@ -770,7 +762,9 @@ class DFlashDraftModel(nn.Module):
 
     def project_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
         """Project concatenated target-layer hidden states into draft hidden_size."""
-        expected = int(self.fc.input_size if self.quantizable else self.fc.in_features)
+        expected = int(
+            self.fc.input_size if self.is_nemotron_35_draft else self.fc.in_features
+        )
         if target_hidden.ndim != 2 or int(target_hidden.shape[-1]) != expected:
             raise ValueError(
                 "DFLASH target_hidden feature dim mismatch. "
@@ -781,7 +775,7 @@ class DFlashDraftModel(nn.Module):
                 "the draft checkpoint/config expects."
             )
         projected = self.fc(target_hidden)
-        if self.quantizable:
+        if self.is_nemotron_35_draft:
             projected = projected[0]
         return self.hidden_norm(projected)
 

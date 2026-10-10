@@ -32,10 +32,11 @@ class TestGptOss4GpuMxfp4(BaseTestGptOss):
             other_args=[
                 "--tp",
                 "4",
-                "--attn-dp-size",
+                "--dp",
                 "4",
                 "--ep",
                 "4",
+                "--enable-dp-attention",
                 "--moe-a2a-backend",
                 "none",
                 "--cuda-graph-max-bs-decode",

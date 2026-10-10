@@ -117,29 +117,6 @@ const _: () = {
     }
 };
 
-/// How a subscriber's replay request for a sequence gap ended.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ReplayOutcome {
-    /// Every missing batch was recovered.
-    Repaired,
-    /// History did not cover the gap, or replay failed after recovering part of it.
-    Incomplete,
-    /// Socket/decode error or timeout before any missing batch was recovered.
-    Failed,
-}
-
-impl ReplayOutcome {
-    pub const ALL: [Self; 3] = [Self::Repaired, Self::Incomplete, Self::Failed];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Repaired => "repaired",
-            Self::Incomplete => "incomplete",
-            Self::Failed => "failed",
-        }
-    }
-}
-
 /// One rendered cell of the tally.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TallyRow {
@@ -160,8 +137,6 @@ pub struct EventTally {
     /// Batches the transport lost, inferred from gaps in the publisher's
     /// dense sequence.
     batches_lost: AtomicU64,
-    /// Gap replays, indexed by [`ReplayOutcome`].
-    replays: [AtomicU64; ReplayOutcome::ALL.len()],
     /// Unrecognised `medium` strings already warned about, so an engine that
     /// adds a tier logs once per string rather than once per event.
     warned_unknown_media: Mutex<HashSet<String>>,
@@ -226,14 +201,6 @@ impl EventTally {
 
     pub fn batches_lost(&self) -> u64 {
         self.batches_lost.load(Ordering::Relaxed)
-    }
-
-    pub fn record_replay(&self, outcome: ReplayOutcome) {
-        self.replays[outcome as usize].fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn replays(&self, outcome: ReplayOutcome) -> u64 {
-        self.replays[outcome as usize].load(Ordering::Relaxed)
     }
 
     /// Every cell in (event, medium) order, zeros included.

@@ -26,12 +26,7 @@ def _mhc_post_split_h_kernel(X, R, P, C, Y, H: tl.constexpr, B: tl.constexpr):
 
 
 def mhc_post_split_h(
-    x: torch.Tensor,
-    residual: torch.Tensor,
-    post: torch.Tensor,
-    comb: torch.Tensor,
-    *,
-    block_size: int | None = None,
+    x: torch.Tensor, residual: torch.Tensor, post: torch.Tensor, comb: torch.Tensor
 ) -> torch.Tensor:
     """Same result as the TileLang post kernel for contiguous BF16 HC=4 inputs."""
     assert x.dtype == residual.dtype == torch.bfloat16
@@ -39,7 +34,7 @@ def mhc_post_split_h(
     assert residual.shape == (x.shape[0], 4, x.shape[1])
     assert all(t.is_contiguous() for t in (x, residual, post, comb))
     output = torch.empty_like(residual)
-    block = block_size if block_size is not None else (128 if x.shape[0] <= 8 else 1024)
+    block = 128 if x.shape[0] <= 8 else 1024
     _mhc_post_split_h_kernel[(x.shape[0], triton.cdiv(x.shape[1], block))](
         x,
         residual,

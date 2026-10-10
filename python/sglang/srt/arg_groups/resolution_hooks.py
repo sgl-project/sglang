@@ -13,7 +13,6 @@ from typing import Any, Callable, Dict, FrozenSet, List
 # to every invocation of that name, including repeated steps.
 _OVERRIDABLE_HOOKS: FrozenSet[str] = frozenset(
     {
-        "handle_deprecated_dp_attention",
         "handle_mega_moe",
         "handle_return_hidden_states_mode",
         "handle_media_url_security",
@@ -40,6 +39,7 @@ _OVERRIDABLE_HOOKS: FrozenSet[str] = frozenset(
         "apply_muse_glimmer_prefill_cuda_graph_max_bs_default",
         "handle_dwdp",
         "handle_cuda_graph_config",
+        "apply_glm5_chunked_prefill_default",
         "handle_hpu_backends",
         "handle_cpu_backends",
         "handle_npu_backends",
@@ -56,6 +56,7 @@ _OVERRIDABLE_HOOKS: FrozenSet[str] = frozenset(
         "handle_mamba_backend",
         "handle_int8_mamba_checkpoint",
         "handle_linear_attn_backend",
+        "apply_glm5_prefill_cuda_graph_policy",
         "handle_kv4_compatibility",
         "handle_mxfp8_kv_cache_compatibility",
         "handle_amd_specifics",
@@ -76,7 +77,7 @@ _OVERRIDABLE_HOOKS: FrozenSet[str] = frozenset(
         "validate_experimental_sgl_marlin",
         "handle_speculative_decoding",
         "handle_layernorm_sp",
-        "validate_flashinfer_a2a_token_budget",
+        "validate_cutedsl_a2a_token_budget",
         "validate_mega_moe_token_budget_for_model",
         "handle_load_format",
         "handle_encoder_disaggregation",

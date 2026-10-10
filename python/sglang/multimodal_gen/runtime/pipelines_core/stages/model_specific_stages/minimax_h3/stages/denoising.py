@@ -446,7 +446,8 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
     def default_workload_iterations(
         self, batch: Req, num_inference_steps: int
     ) -> int | None:
-        return num_inference_steps
+        # one denoise per sigma interval: steps - 1
+        return max(1, num_inference_steps - 1)
 
     def __init__(self, transformer, pipeline=None) -> None:
         super().__init__(
@@ -454,7 +455,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             scheduler=None,
             pipeline=pipeline,
         )
-        self._minimax_h3_quality = "exact"
+        self._minimax_h3_quality = "lossless"
         self._minimax_h3_cache_mode: str | None = None
 
     def _owns_compile_warmup_lifecycle(self) -> bool:
@@ -462,7 +463,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
 
     def _cache_dit_requested(self) -> bool:
         return (
-            getattr(self, "_minimax_h3_quality", "exact") == "high"
+            getattr(self, "_minimax_h3_quality", "lossless") == "high"
             or super()._cache_dit_requested()
         )
 
@@ -559,6 +560,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         # would send the next request down the refresh path with nothing
         # mounted.
         self._cache_dit_enabled = False
+        self._cached_num_steps = None
         self._cache_dit_active_key = None
         self._minimax_h3_cache_mode = None
         self._set_cache_dit_input_preservation(False)
@@ -590,7 +592,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
     def _cache_dit_scm_masks(
         self, primary_num_steps: int, secondary_num_steps: int | None = None
     ) -> tuple[str, str, list[int] | None, list[int] | None]:
-        if getattr(self, "_minimax_h3_quality", "exact") == "high":
+        if getattr(self, "_minimax_h3_quality", "lossless") == "high":
             return "none", "dynamic", None, None
         return super()._cache_dit_scm_masks(primary_num_steps, secondary_num_steps)
 
@@ -602,7 +604,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         *,
         secondary: bool = False,
     ) -> CacheDitConfig:
-        if secondary or getattr(self, "_minimax_h3_quality", "exact") != "high":
+        if secondary or getattr(self, "_minimax_h3_quality", "lossless") != "high":
             return super()._build_cache_dit_config(
                 num_inference_steps,
                 steps_computation_mask,
@@ -677,14 +679,13 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
 
         if not (
             current_platform.is_cuda()
-            or current_platform.is_hip()
             or current_platform.is_cpu()
             or current_platform.is_mps()
             or current_platform.is_npu()
             or current_platform.is_xpu()
         ):
             raise RuntimeError(
-                "MiniMax H3 full-loop denoise requires CPU, CUDA, ROCm, MPS, XPU, or Ascend NPU"
+                "MiniMax H3 full-loop denoise requires CPU, CUDA, MPS, XPU, or Ascend NPU"
             )
 
         device = current_platform.get_local_torch_device()
@@ -1075,10 +1076,7 @@ def _maybe_prepare_vsa_h3_step_metadata(
             "VSA-H3 in SGLang serves the trained 64-token (4, 4, 4) tile "
             f"geometry; got vsa_tile_size={tile_size}."
         )
-    default_sparsity = server_args.pipeline_config.vsa_sparsity
-    sparsity = float(
-        config.get("VSA_sparsity", config.get("sparsity", default_sparsity))
-    )
+    sparsity = float(config.get("VSA_sparsity", config.get("sparsity", 0.9)))
     if not 0.0 <= sparsity < 1.0:
         raise ValueError(f"VSA sparsity must be in [0, 1), got {sparsity}")
     mode = str(config.get("vsa_mode", "exempt"))

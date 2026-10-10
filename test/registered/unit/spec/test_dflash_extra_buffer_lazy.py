@@ -139,7 +139,7 @@ class TestDflashVerifyRunsMambaTrackHook(CustomTestCase):
         return calls, batch
 
     def test_hook_runs_before_init_new_on_verify(self):
-        with get_parallel().override(attn_dp_enabled=True):
+        with get_parallel().override(enable_dp_attention=True):
             calls, batch = self._run(ForwardMode.DECODE)
         self.assertEqual(
             calls,
@@ -168,7 +168,7 @@ class TestDflashVerifyRunsMambaTrackHook(CustomTestCase):
                     attn_backend=SimpleNamespace(init_forward_metadata=plan),
                 )
                 with (
-                    get_parallel().override(attn_dp_enabled=True),
+                    get_parallel().override(enable_dp_attention=True),
                     mock.patch.object(dflash_info, "_is_npu", False),
                     mock.patch(
                         "sglang.srt.speculative.spec_utils.prepare_mamba_track_for_verify"

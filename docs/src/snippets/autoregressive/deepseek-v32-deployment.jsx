@@ -219,7 +219,7 @@ export const DeepSeekV32Deployment = () => {
     const epSize = 8;
     cmd += ` \\\n  --tp ${tpSize}`;
     if (strategyArray.includes('dp')) {
-      cmd += ` \\\n  --attn-dp-size ${dpSize}`;
+      cmd += ` \\\n  --dp ${dpSize} \\\n  --enable-dp-attention`;
     }
     if (strategyArray.includes('ep')) {
       cmd += ` \\\n  --ep ${epSize}`;

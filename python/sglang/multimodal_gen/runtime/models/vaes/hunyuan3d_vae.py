@@ -209,6 +209,7 @@ class QKVMultiheadCrossAttention(nn.Module):
     ):
         super().__init__()
         self.heads = heads
+        self.n_data = n_data
         self.q_norm = (
             norm_layer(width // heads, elementwise_affine=True, eps=1e-6)
             if qk_norm
@@ -254,6 +255,7 @@ class MultiheadCrossAttention(nn.Module):
         kv_cache: bool = False,
     ):
         super().__init__()
+        self.n_data = n_data
         self.width = width
         self.heads = heads
         self.data_width = width if data_width is None else data_width
@@ -336,6 +338,7 @@ class QKVMultiheadAttention(nn.Module):
     ):
         super().__init__()
         self.heads = heads
+        self.n_ctx = n_ctx
         self.q_norm = (
             norm_layer(width // heads, elementwise_affine=True, eps=1e-6)
             if qk_norm
@@ -378,6 +381,7 @@ class MultiheadAttention(nn.Module):
         drop_path_rate: float = 0.0,
     ):
         super().__init__()
+        self.n_ctx = n_ctx
         self.width = width
         self.heads = heads
         self.c_qkv = nn.Linear(width, width * 3, bias=qkv_bias)
@@ -446,6 +450,7 @@ class Transformer(nn.Module):
         drop_path_rate: float = 0.0,
     ):
         super().__init__()
+        self.n_ctx = n_ctx
         self.width = width
         self.layers = layers
         self.resblocks = nn.ModuleList(
@@ -507,6 +512,7 @@ class CrossAttentionDecoder(nn.Module):
         if self.enable_ln_post:
             self.ln_post = nn.LayerNorm(width)
         self.output_proj = nn.Linear(width, out_channels)
+        self.label_type = label_type
 
     def set_cross_attention_processor(self, processor):
         self.cross_attn_decoder.attn.attention.attn_processor = processor

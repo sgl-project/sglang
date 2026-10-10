@@ -114,8 +114,9 @@ DEEPSEEK_R1_MODELS = [
         other_args=[
             "--chunked-prefill-size",
             "131072",
-            "--attn-dp-size",
+            "--dp-size",
             "8",
+            "--enable-dp-attention",
             "--mem-fraction-static",
             "0.85",
             "--trust-remote-code",

@@ -114,7 +114,7 @@ sgl-eval run aime25 \\
     // CP sizes auto-gate in the engine to the runtime derivation
     // attn_cp_size = tp/dp (a user-passed --attn-cp-size is overridden).
     // CP is single-machine only (tp_size <= 8). Interleave CP + DP-Attention
-    // currently fails the runtime's attn_dp_size == 1 assert but is allowed here
+    // currently fails the runtime's dp_size == 1 assert but is allowed here
     // with a warning (combined support is planned upstream).
     // Strategy knob: interleave (ex round-robin-split) is the layout verified
     // here and the default; zigzag (ex in-seq-split) is exposed as an
@@ -280,7 +280,8 @@ sgl-eval run aime25 \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--attn-dp-size 8",
+        "--dp 8",
+        "--enable-dp-attention",
         "--moe-a2a-backend deepep",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 1",
@@ -302,7 +303,8 @@ sgl-eval run aime25 \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--attn-dp-size 8",
+        "--dp 8",
+        "--enable-dp-attention",
         "--moe-a2a-backend deepep",
         "--mem-fraction-static 0.85",
         "--max-running-requests 256",
@@ -337,7 +339,8 @@ sgl-eval run aime25 \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--attn-dp-size 8",
+        "--dp 8",
+        "--enable-dp-attention",
         "--moe-a2a-backend deepep",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 1",
@@ -359,7 +362,8 @@ sgl-eval run aime25 \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--attn-dp-size 8",
+        "--dp 8",
+        "--enable-dp-attention",
         "--moe-a2a-backend deepep",
         "--mem-fraction-static 0.85",
         "--max-running-requests 256",
@@ -397,7 +401,8 @@ sgl-eval run aime25 \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--attn-dp-size 4",
+        "--dp 4",
+        "--enable-dp-attention",
         "--moe-a2a-backend deepep",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 1",
@@ -420,7 +425,8 @@ sgl-eval run aime25 \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--attn-dp-size 4",
+        "--dp 4",
+        "--enable-dp-attention",
         "--moe-a2a-backend deepep",
         "--mem-fraction-static 0.85",
         "--host {{HOST_IP}}",
@@ -456,7 +462,8 @@ sgl-eval run aime25 \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--attn-dp-size 8",
+        "--dp 8",
+        "--enable-dp-attention",
         "--moe-a2a-backend deepep",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 1",
@@ -476,7 +483,8 @@ sgl-eval run aime25 \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--attn-dp-size 8",
+        "--dp 8",
+        "--enable-dp-attention",
         "--moe-a2a-backend deepep",
         "--mem-fraction-static 0.85",
         "--max-running-requests 256",
@@ -720,7 +728,8 @@ sgl-eval run aime25 \\
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
         "--quantization modelopt_fp4",
-        "--attn-dp-size 8",
+        "--dp 8",
+        "--enable-dp-attention",
         // Shorter draft (MTP 2-1-3) than low-latency's 5-1-6: at this concurrency the
         // verify overhead of a long draft outweighs the accept-length gain.
         "--speculative-algorithm EAGLE",
@@ -743,7 +752,8 @@ sgl-eval run aime25 \\
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
         "--quantization modelopt_fp4",
-        "--attn-dp-size 8",
+        "--dp 8",
+        "--enable-dp-attention",
         "--chunked-prefill-size 32768",
         "--mem-fraction-static 0.92",
         "--max-running-requests 512",
@@ -779,7 +789,8 @@ sgl-eval run aime25 \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--attn-dp-size 8",
+        "--dp 8",
+        "--enable-dp-attention",
         "--quantization modelopt_fp4",
         // Shorter draft (MTP 2-1-3) than low-latency's 5-1-6: at this concurrency the
         // verify overhead of a long draft outweighs the accept-length gain.
@@ -805,7 +816,8 @@ sgl-eval run aime25 \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--attn-dp-size 8",
+        "--dp 8",
+        "--enable-dp-attention",
         "--quantization modelopt_fp4",
         "--max-running-requests 1024",
         "--chunked-prefill-size 8192",
@@ -843,7 +855,8 @@ sgl-eval run aime25 \\
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
         "--quantization modelopt_fp4",
-        "--attn-dp-size 4",
+        "--dp 4",
+        "--enable-dp-attention",
         // Shorter draft (MTP 2-1-3) than low-latency's 5-1-6: at this concurrency the
         // verify overhead of a long draft outweighs the accept-length gain.
         "--speculative-algorithm EAGLE",
@@ -865,7 +878,8 @@ sgl-eval run aime25 \\
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
         "--quantization modelopt_fp4",
-        "--attn-dp-size 4",
+        "--dp 4",
+        "--enable-dp-attention",
         "--chunked-prefill-size 8192",
         "--mem-fraction-static 0.92",
         "--max-running-requests 512",
@@ -1000,13 +1014,12 @@ sgl-eval run aime25 \\
     // newer image (v0.5.20, see dockerImages["mi355x|mxfp4"]) than the FP8/BF16
     // mi355x cells. Low-Latency uses validated TP8/EP1; High-Throughput uses
     // validated TP4/EP4. Both use five-step MTP from InferenceX PR #2900.
-    // DSA backend: triton (SGLang's ROCm default). Five-step MTP cells select
-    // the top-k v2 indexer kernel, matching InferenceX PR #3724.
+    // DSA backend: triton (SGLang's ROCm default).
     // ====================================================================
     {
       match: { hw: "mi355x", variant: "default", quant: "mxfp4", strategy: "low-latency", nodes: "single" },
       verified: false,
-      env: ["SGLANG_OPT_USE_TOPK_V2=1"],
+      env: [],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -1049,7 +1062,7 @@ sgl-eval run aime25 \\
     {
       match: { hw: "mi355x", variant: "default", quant: "mxfp4", strategy: "high-throughput", nodes: "single" },
       verified: false,
-      env: ["SGLANG_OPT_USE_TOPK_V2=1"],
+      env: [],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",

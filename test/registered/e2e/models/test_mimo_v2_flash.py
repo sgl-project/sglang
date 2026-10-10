@@ -16,8 +16,9 @@ class TestMiMoV2Flash(GSM8KMixin, SpecDecodingMixin, DefaultServerBase):
     other_args = [
         "--tp",
         "4",
-        "--attn-dp-size",
+        "--dp",
         "2",
+        "--enable-dp-attention",
         "--trust-remote-code",
         "--attention-backend",
         "fa4" if is_blackwell() else "fa3",

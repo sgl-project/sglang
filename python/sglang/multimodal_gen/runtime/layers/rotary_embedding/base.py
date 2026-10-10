@@ -85,35 +85,6 @@ class RotaryEmbedding(CustomOp):
         cache = torch.cat((cos, sin), dim=-1)
         return cache
 
-    def _apply_cos_sin(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """rotate Q/K in the caller's layout, preserving broadcast and unrotated tails"""
-        q_rot = query[..., : self.rotary_dim]
-        q_pass = query[..., self.rotary_dim :]
-        k_rot = key[..., : self.rotary_dim]
-        k_pass = key[..., self.rotary_dim :]
-
-        q_rotated = _apply_rotary_emb(
-            q_rot,
-            cos,
-            sin,
-            is_neox_style=self.is_neox_style,
-            interleaved=not self.is_neox_style,
-        )
-        k_rotated = _apply_rotary_emb(
-            k_rot,
-            cos,
-            sin,
-            is_neox_style=self.is_neox_style,
-            interleaved=not self.is_neox_style,
-        )
-        return self._combine_rotated_and_pass(q_rotated, k_rotated, q_pass, k_pass)
-
     def _combine_rotated_and_pass(
         self,
         q_rotated: torch.Tensor,
@@ -245,7 +216,27 @@ class RotaryEmbedding(CustomOp):
             # No [batch*seq, ...] flatten: cos/sin are [seq_len,
             # rotary_dim // 2], shared across the batch, and only
             # broadcast correctly this way for batch_size > 1.
-            return self._apply_cos_sin(query, key, cos, sin)
+            q_rot = query[..., : self.rotary_dim]
+            q_pass = query[..., self.rotary_dim :]
+
+            k_rot = key[..., : self.rotary_dim]
+            k_pass = key[..., self.rotary_dim :]
+
+            q_rotated = _apply_rotary_emb(
+                q_rot,
+                cos,
+                sin,
+                is_neox_style=self.is_neox_style,
+                interleaved=not self.is_neox_style,
+            )
+            k_rotated = _apply_rotary_emb(
+                k_rot,
+                cos,
+                sin,
+                is_neox_style=self.is_neox_style,
+                interleaved=not self.is_neox_style,
+            )
+            return self._combine_rotated_and_pass(q_rotated, k_rotated, q_pass, k_pass)
 
         if cos_sin_cache is not None:
             return self.forward_native(
@@ -393,14 +384,55 @@ class RotaryEmbedding(CustomOp):
                 # num_tokens = batch*seq row-for-row.
                 q_shape = query.shape
                 q_flat = query.reshape(num_tokens, -1, self.head_size)
+                q_rot = q_flat[..., : self.rotary_dim]
+                q_pass = q_flat[..., self.rotary_dim :]
+
                 k_shape = key.shape
                 k_flat = key.reshape(num_tokens, -1, self.head_size)
-                q, k = self._apply_cos_sin(q_flat, k_flat, cos, sin)
+                k_rot = k_flat[..., : self.rotary_dim]
+                k_pass = k_flat[..., self.rotary_dim :]
+
+                q_rotated = _apply_rotary_emb(
+                    q_rot,
+                    cos,
+                    sin,
+                    is_neox_style=self.is_neox_style,
+                    interleaved=not self.is_neox_style,
+                )
+                k_rotated = _apply_rotary_emb(
+                    k_rot,
+                    cos,
+                    sin,
+                    is_neox_style=self.is_neox_style,
+                    interleaved=not self.is_neox_style,
+                )
+                q, k = self._combine_rotated_and_pass(
+                    q_rotated, k_rotated, q_pass, k_pass
+                )
                 return q.reshape(q_shape), k.reshape(k_shape)
 
             # Direct DiT-style call: same batch/seq broadcast reasoning as
             # forward_npu's cos/sin path.
-            return self._apply_cos_sin(query, key, cos, sin)
+            q_rot = query[..., : self.rotary_dim]
+            q_pass = query[..., self.rotary_dim :]
+            k_rot = key[..., : self.rotary_dim]
+            k_pass = key[..., self.rotary_dim :]
+
+            q_rotated = _apply_rotary_emb(
+                q_rot,
+                cos,
+                sin,
+                is_neox_style=self.is_neox_style,
+                interleaved=not self.is_neox_style,
+            )
+            k_rotated = _apply_rotary_emb(
+                k_rot,
+                cos,
+                sin,
+                is_neox_style=self.is_neox_style,
+                interleaved=not self.is_neox_style,
+            )
+            return self._combine_rotated_and_pass(q_rotated, k_rotated, q_pass, k_pass)
 
         if query.dim() != 4 or key.dim() != 4:
             raise ValueError(

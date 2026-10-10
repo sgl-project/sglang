@@ -20,17 +20,15 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.configs.model_config import get_mimo_v2_fused_qkv_expected_tp_size
-from sglang.srt.distributed.utils import get_group_rank_size
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layer_boundary import (
-    append_stages,
     declare_attn,
     declare_ffn,
     is_dense_ffn_fully_dp,
-    layer_stack,
+    make_stages,
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
@@ -40,7 +38,6 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.mimo_v2 import (
@@ -101,24 +98,28 @@ class MiMoV2MTPLayer(nn.Module):
             prefix=add_prefix("self_attn", prefix),
         )
         self.is_layer_sparse = False
+        is_previous_layer_sparse = True
         is_next_layer_sparse = False
 
-        mlp_parallel_group = "replicated" if is_dense_ffn_fully_dp() else "tp"
+        if is_dense_ffn_fully_dp():
+            mlp_tp_rank, mlp_tp_size = 0, 1
+        else:
+            mlp_tp_rank, mlp_tp_size = None, None
         self.mlp = MiMoV2MLP(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
             quant_config=quant_config,
             prefix=add_prefix("mlp", prefix),
-            parallel_group=mlp_parallel_group,
-            reduce_results=False,
+            tp_rank=mlp_tp_rank,
+            tp_size=mlp_tp_size,
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.layernorm_epsilon)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.layernorm_epsilon
         )
 
-        self.attn_boundary, self.ffn_boundary = append_stages(
+        self.attn_boundary, self.ffn_boundary = make_stages(
             (declare_attn(), self.input_layernorm),
             (
                 declare_ffn(
@@ -127,6 +128,12 @@ class MiMoV2MTPLayer(nn.Module):
                 ),
                 self.post_attention_layernorm,
             ),
+            previous=declare_ffn(
+                sparse=is_previous_layer_sparse, next_layer_sparse=self.is_layer_sparse
+            )
+            if layer_id != 0
+            else None,
+            terminal=layer_id == 1 - 1,
         )
 
     def forward(
@@ -147,9 +154,12 @@ class MiMoV2MTPLayer(nn.Module):
 
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
-        with get_global_expert_distribution_recorder().disable_this_region():
+        with (
+            self.ffn_boundary.exit(forward_batch) as ffn_exit,
+            get_global_expert_distribution_recorder().disable_this_region(),
+        ):
             hidden_states = self.mlp(hidden_states)
-        hidden_states = self.ffn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = ffn_exit.finish(hidden_states)
 
         return hidden_states
 
@@ -177,13 +187,12 @@ class MiMoV2ModelNextN(nn.Module):
 
         self.eh_proj = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
 
-        with layer_stack():
-            self.mtp_block = MiMoV2MTPLayer(
-                config,
-                0,
-                quant_config=quant_config,
-                prefix=add_prefix("decoder", prefix),
-            )
+        self.mtp_block = MiMoV2MTPLayer(
+            config,
+            0,
+            quant_config=quant_config,
+            prefix=add_prefix("decoder", prefix),
+        )
         self.final_layernorm = RMSNorm(config.hidden_size, eps=config.layernorm_epsilon)
 
     def forward(
@@ -243,6 +252,7 @@ class MiMoV2MTP(MiMoV2ForCausalLM):
     ) -> None:
         nn.Module.__init__(self)
         self.config = config
+        self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
 
         self.model = MiMoV2ModelNextN(
@@ -310,7 +320,6 @@ class MiMoV2MTP(MiMoV2ForCausalLM):
                         expected_fused_tp_size=get_mimo_v2_fused_qkv_expected_tp_size(
                             self.config
                         ),
-                        qkv_proj=self.get_submodule(name.rsplit(".", 1)[0]),
                     )
                 continue
 
@@ -344,12 +353,7 @@ class MiMoV2MTP(MiMoV2ForCausalLM):
                 if name in params_dict.keys():
                     param = params_dict[name]
                     if "attention_sink_bias" in name:
-                        projection = unwrap_lora_layer(
-                            self.get_submodule(name.rsplit(".", 1)[0]).qkv_proj
-                        )
-                        start = (
-                            get_group_rank_size(projection.tp_group)[0] * param.numel()
-                        )
+                        start = get_parallel().attn_tp_rank * param.numel()
                         param.data.copy_(loaded_weight[start : start + param.numel()])
                     else:
                         weight_loader = getattr(

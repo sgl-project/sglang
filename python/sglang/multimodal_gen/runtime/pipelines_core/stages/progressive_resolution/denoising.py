@@ -303,10 +303,7 @@ class ProgressiveDenoisingStage(DenoisingStage):
         return None if (preset is None or preset == "none") else preset
 
     def _refresh_cache_dit_context(
-        self,
-        n_remaining: int,
-        scm_preset: str | None,
-        ctx: DenoisingContext | None = None,
+        self, n_remaining: int, scm_preset: str | None
     ) -> None:
         """Refresh cache-dit activations and step counter at a stage transition.
 
@@ -618,7 +615,7 @@ class ProgressiveDenoisingStage(DenoisingStage):
                 if self._cache_dit_enabled:
                     n_remaining = n_steps - stage_end
                     self._refresh_cache_dit_context(
-                        n_remaining, self._effective_scm_preset(), ctx
+                        n_remaining, self._effective_scm_preset()
                     )
                     logger.info(
                         "cache-dit context refreshed at stage transition "

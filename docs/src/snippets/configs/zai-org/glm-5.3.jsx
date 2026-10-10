@@ -143,7 +143,7 @@ sgl-eval run aime25 \\
     // CP sizes auto-gate in the engine to the runtime derivation
     // attn_cp_size = tp/dp (a user-passed --attn-cp-size is overridden).
     // CP is single-machine only (tp_size <= 8). Interleave CP + DP-Attention
-    // currently fails the runtime's attn_dp_size == 1 assert but is allowed here
+    // currently fails the runtime's dp_size == 1 assert but is allowed here
     // with a warning (combined support is planned upstream).
     // Strategy knob: interleave (ex round-robin-split) is the default;
     // zigzag (ex in-seq-split) is exposed as an
@@ -317,7 +317,8 @@ sgl-eval run aime25 \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--attn-dp-size 8",
+        "--dp 8",
+        "--enable-dp-attention",
         "--moe-a2a-backend deepep",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 1",
@@ -359,7 +360,8 @@ sgl-eval run aime25 \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--attn-dp-size 8",
+        "--dp 8",
+        "--enable-dp-attention",
         "--moe-a2a-backend deepep",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 1",
@@ -403,7 +405,8 @@ sgl-eval run aime25 \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--attn-dp-size 4",
+        "--dp 4",
+        "--enable-dp-attention",
         "--moe-a2a-backend deepep",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 1",
@@ -445,7 +448,8 @@ sgl-eval run aime25 \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--attn-dp-size 8",
+        "--dp 8",
+        "--enable-dp-attention",
         "--moe-a2a-backend deepep",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 1",
@@ -694,7 +698,8 @@ sgl-eval run aime25 \\
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
         "--quantization modelopt_fp4",
-        "--attn-dp-size 8",
+        "--dp 8",
+        "--enable-dp-attention",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 2",
         "--speculative-eagle-topk 1",
@@ -714,7 +719,8 @@ sgl-eval run aime25 \\
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
         "--quantization modelopt_fp4",
-        "--attn-dp-size 8",
+        "--dp 8",
+        "--enable-dp-attention",
         "--chunked-prefill-size 32768",
         "--mem-fraction-static 0.92",
         "--max-running-requests 512",
@@ -751,7 +757,8 @@ sgl-eval run aime25 \\
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
         "--quantization modelopt_fp4",
-        "--attn-dp-size 8",
+        "--dp 8",
+        "--enable-dp-attention",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 2",
         "--speculative-eagle-topk 1",
@@ -792,7 +799,8 @@ sgl-eval run aime25 \\
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
         "--quantization modelopt_fp4",
-        "--attn-dp-size 4",
+        "--dp 4",
+        "--enable-dp-attention",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 2",
         "--speculative-eagle-topk 1",

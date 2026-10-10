@@ -34,6 +34,50 @@ _DEEPEP_ENV = {
 }
 
 
+class TestDSV4FlashFP4B200MTP(
+    SpecDecodingMixin,
+    BasicDecodeCorrectnessMixin,
+    GSM8KMixin,
+    CustomTestCase,
+):
+    """LowLatency recipe: TP=4, FP4 (mxfp4), EAGLE spec decoding."""
+
+    gsm8k_accuracy_thres = 0.93
+    accept_length_thres = 2.8
+    bs_1_speed_thres = 220
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = try_cached_model(MTP_MODEL)
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=SERVER_LAUNCH_TIMEOUT,
+            other_args=[
+                "--trust-remote-code",
+                "--tp",
+                "4",
+                "--speculative-algorithm",
+                "EAGLE",
+                "--speculative-num-steps",
+                "3",
+                "--speculative-eagle-topk",
+                "1",
+                "--speculative-num-draft-tokens",
+                "4",
+                "--chunked-prefill-size",
+                "4096",
+                "--disable-flashinfer-autotune",
+            ],
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        if hasattr(cls, "process") and cls.process:
+            kill_process_tree(cls.process.pid)
+
+
 class TestDSV4FlashFP4B200DSpark(
     SpecDecodingMixin,
     BasicDecodeCorrectnessMixin,
@@ -89,8 +133,9 @@ class TestDSV4FlashFP4NonSpecB200(
                 "--trust-remote-code",
                 "--tp",
                 "4",
-                "--attn-dp-size",
+                "--dp",
                 "4",
+                "--enable-dp-attention",
                 "--moe-a2a-backend",
                 "deepep",
                 "--deepep-config",
@@ -135,8 +180,9 @@ class TestDSV4FlashFP4BreakableCudaGraphB200(
                 "--trust-remote-code",
                 "--tp",
                 "4",
-                "--attn-dp-size",
+                "--dp",
                 "4",
+                "--enable-dp-attention",
                 "--enable-mixed-chunk",
                 "--cuda-graph-backend-prefill",
                 "breakable",

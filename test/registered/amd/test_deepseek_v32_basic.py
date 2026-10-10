@@ -30,8 +30,9 @@ class TestDeepseekV32DP(CustomTestCase):
             "--trust-remote-code",
             "--tp",
             "8",
-            "--attn-dp-size",
+            "--dp",
             "8",
+            "--enable-dp-attention",
             "--model-loader-extra-config",
             '{"enable_multithread_load": true}',
         ]

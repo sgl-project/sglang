@@ -34,6 +34,8 @@ PROMPT_TEMPLATE = (
     "commentary or evaluations:<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n"
     "<|im_start|>assistant\n"
 )
+IMG_PROMPT_TEMPLATE = "<|vision_start|><|image_pad|><|vision_end|>"
+VIDEO_PROMPT_TEMPLATE = "<|vision_start|><|video_pad|><|vision_end|>"
 
 
 class LingBotVideoTextEncodingStage(TextEncodingStage):

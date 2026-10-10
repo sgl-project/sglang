@@ -47,6 +47,7 @@ class _FakeTokenizerManager(TokenizerControlMixin):
         self.elastic_worker_count = dp_size
         self.server_args = SimpleNamespace(
             dp_size=dp_size,
+            enable_dp_attention=False,
             nnodes=1,
         )
 
@@ -63,7 +64,7 @@ class _FakeHttpTokenizerManager:
         tp_size=1,
         dp_size=1,
         pp_size=1,
-        attn_dp_size=1,
+        enable_dp_attention=False,
     ):
         from sglang.srt.runtime_context import get_context
 
@@ -77,7 +78,7 @@ class _FakeHttpTokenizerManager:
             tp_size=tp_size,
             dp_size=dp_size,
             pp_size=pp_size,
-            attn_dp_size=attn_dp_size,
+            enable_dp_attention=enable_dp_attention,
         )
         self._override.install()
 
@@ -135,7 +136,8 @@ class TestLoadsAcceleratorField(CustomTestCase):
         manager = _FakeHttpTokenizerManager(
             [LoadSnapshot(dp_rank=rank) for rank in range(8)],
             tp_size=8,
-            attn_dp_size=8,
+            dp_size=8,
+            enable_dp_attention=True,
         )
         self.addCleanup(manager.restore)
 

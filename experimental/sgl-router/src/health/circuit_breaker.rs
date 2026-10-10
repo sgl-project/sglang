@@ -23,7 +23,7 @@ pub struct CircuitSnapshot {
     pub state_code: u8,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct CircuitBreakerConfig {
     pub threshold: NonZeroU32,
     pub cool_down: Duration,
@@ -72,10 +72,6 @@ impl CircuitBreaker {
             }),
             config,
         }
-    }
-
-    pub fn config(&self) -> &CircuitBreakerConfig {
-        &self.config
     }
 
     /// Non-mutating predicate: would [`allow`] return `true` if called

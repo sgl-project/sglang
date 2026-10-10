@@ -369,7 +369,6 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         layer_num: int,
         device: str,
         enable_memory_saver: bool,
-        global_page_size: Optional[int] = None,
     ) -> NPUDeepSeekV4IndexerPool:
         # Indexer shares C4 addresses and therefore uses the same native page.
         return NPUDeepSeekV4IndexerPool(
@@ -381,7 +380,6 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             device,
             enable_memory_saver,
             kernel_page_size=page_size,
-            global_page_size=global_page_size,
         )
 
     def get_contiguous_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:

@@ -196,6 +196,12 @@ class AscendFAMetadata:
 
 
 class AscendFAMetadataBuilder(AttentionMetadataBuilder):
+    def __init__(self) -> None:
+        pass
+
+    def prepare(self) -> None:
+        pass
+
     def build(
         self,
         **kwargs: dict[str, Any],

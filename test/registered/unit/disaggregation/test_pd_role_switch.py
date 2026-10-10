@@ -305,10 +305,9 @@ class TestPdRoleSwitchStartupValidation(unittest.TestCase):
         base = dict(
             disaggregation_transfer_backend="mori",
             disaggregation_mode="prefill",
-            disaggregation_decode_host_receive_threshold=1.0,
+            disaggregation_decode_host_receive_threshold=0.0,
             enable_pd_role_switch=True,
-            attn_dp_size=1,
-            ep_join_mode=None,
+            enable_dp_attention=False,
             ep_size=1,
             moe_a2a_backend="none",
             pp_size=1,
@@ -317,8 +316,7 @@ class TestPdRoleSwitchStartupValidation(unittest.TestCase):
             speculative_algorithm=None,
         )
         base.update(kw)
-        # Keep the production defaults for fields read by the shared PD hook.
-        return ServerArgs(model_path="dummy", **base)
+        return SimpleNamespace(**base)
 
     def _run(self, sa):
         from sglang.srt.arg_groups.pd_disaggregation_hook import (
@@ -333,8 +331,8 @@ class TestPdRoleSwitchStartupValidation(unittest.TestCase):
 
     def test_reject_dp_attention(self):
         with self.assertRaises(ValueError) as ctx:
-            self._run(self._sa(attn_dp_size=2))
-        self.assertIn("attention DP", str(ctx.exception))
+            self._run(self._sa(enable_dp_attention=True))
+        self.assertIn("DP attention", str(ctx.exception))
 
     def test_reject_expert_parallelism(self):
         with self.assertRaises(ValueError) as ctx:
@@ -573,7 +571,7 @@ def _radix_scheduler(disable_radix_cache):
 @unittest.skipUnless(_HAS_ROLE_SWITCH, "role_switch not importable in this env")
 class TestReleasePrefixCacheOnRoleSwitch(unittest.TestCase):
     """The flip may run with radix cache ENABLED: teardown resets the tree cache
-    + KV pools when radix is on, and is a no-op on the radix-disabled path."""
+    + KV pools when radix is on, and is a no-op on the historical chunk-cache path."""
 
     def test_noop_when_radix_disabled(self):
         s = _radix_scheduler(disable_radix_cache=True)

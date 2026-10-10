@@ -61,7 +61,6 @@ class TestAdaptiveSpeculativeServer(CustomTestCase):
                 f,
             )
             cls.adaptive_config_path = f.name
-        cls.server_log = tempfile.NamedTemporaryFile("w", suffix=".log", delete=False)
 
         try:
             cls.process = popen_launch_server(
@@ -87,12 +86,9 @@ class TestAdaptiveSpeculativeServer(CustomTestCase):
                     "--mem-fraction-static",
                     "0.7",
                 ],
-                return_stdout_stderr=(cls.server_log, cls.server_log),
             )
         except Exception:
             os.unlink(cls.adaptive_config_path)
-            cls.server_log.close()
-            os.unlink(cls.server_log.name)
             raise
 
     @classmethod
@@ -101,8 +97,6 @@ class TestAdaptiveSpeculativeServer(CustomTestCase):
             kill_process_tree(cls.process.pid)
         if os.path.exists(cls.adaptive_config_path):
             os.unlink(cls.adaptive_config_path)
-        cls.server_log.close()
-        os.unlink(cls.server_log.name)
 
     def _get_internal_state(self) -> dict:
         response = requests.get(self.base_url + "/server_info", timeout=30)
@@ -153,27 +147,25 @@ class TestAdaptiveSpeculativeServer(CustomTestCase):
                 return state
         return state
 
-    def _drive_downshift(self) -> bool:
-        """Send low-acceptance prompts until the server logs a downshift to 1.
-
-        With ema_alpha=1 the steps follow the last verify, so a low-acceptance
-        request can end at either step; the log records every switch.
-        """
-        log_start = os.path.getsize(self.server_log.name)
+    def _drive_downshift(self) -> dict:
+        """Send low-acceptance prompts until steps downshift to 1."""
+        state = self._get_internal_state()
         for _ in range(MAX_DOWNSHIFT_ATTEMPTS):
             self._generate(LOW_ACCEPT_PROMPT)
-            with open(self.server_log.name) as f:
-                f.seek(log_start)
-                if "steps 3 -> 1" in f.read():
-                    return True
-        return False
+            state = self._get_internal_state()
+            if state["speculative_num_steps"] == 1:
+                return state
+        return state
 
     def test_gsm8k_after_adaptive_switches(self):
         """Exercise up/down/up adaptive switches, then verify GSM8K accuracy."""
         state = self._drive_upshift()
         self.assertEqual(state["speculative_num_steps"], 3, f"Never upshifted: {state}")
 
-        self.assertTrue(self._drive_downshift(), "Never downshifted")
+        state = self._drive_downshift()
+        self.assertEqual(
+            state["speculative_num_steps"], 1, f"Never downshifted: {state}"
+        )
 
         self._drive_upshift()
 

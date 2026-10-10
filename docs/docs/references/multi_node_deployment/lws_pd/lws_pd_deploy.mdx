@@ -63,7 +63,8 @@ spec:
           #          - --deepep-config
           #          -  /home/aiges/tuned/tuned_8sms.json
           - --enable-dp-lm-head
-          - --attn-dp-size
+          - --enable-dp-attention
+          - --dp-size
           - "16"
           - --disable-radix-cache
           - --moe-a2a-backend
@@ -209,7 +210,8 @@ spec:
 #          - --deepep-config
 #          -  /home/aiges/tuned/tuned_8sms.json
           - --enable-dp-lm-head
-          - --attn-dp-size
+          - --enable-dp-attention
+          - --dp-size
           - "16"
           - --disable-radix-cache
           - --moe-a2a-backend
@@ -368,8 +370,9 @@ spec:
           - "262144"
           - --page-size
           - "64"
+          - --enable-dp-attention
           - --enable-dp-lm-head
-          - --attn-dp-size
+          - --dp-size
           - "16"
           - --moe-a2a-backend
           - deepep
@@ -500,9 +503,10 @@ spec:
           - "262144"
           - --page-size
           - "64"
+          - --enable-dp-attention
           - --enable-dp-lm-head
             #- --enable-two-batch-overlap
-          - --attn-dp-size
+          - --dp-size
           - "16"
           - --moe-a2a-backend
           - deepep

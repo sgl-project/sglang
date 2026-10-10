@@ -58,13 +58,9 @@ from typing import Any, Dict, List, Optional
 import torch
 import triton
 
-from sglang.kernels.ops.lora.dense.chunked_sgmv_expand import (
-    _chunked_lora_expand_kernel,
-)
-from sglang.kernels.ops.lora.dense.chunked_sgmv_shrink import (
-    _chunked_lora_shrink_kernel,
-)
-from sglang.kernels.ops.lora.dense.lora_tuning_config import (
+from sglang.kernels.ops.gemm.chunked_sgmv_expand import _chunked_lora_expand_kernel
+from sglang.kernels.ops.gemm.chunked_sgmv_shrink import _chunked_lora_shrink_kernel
+from sglang.kernels.ops.gemm.lora_tuning_config import (
     DEFAULT_EXPAND_CONFIG,
     DEFAULT_SHRINK_CONFIG,
     get_lora_config_file_name,
@@ -368,8 +364,7 @@ def save_config(
         "sglang",
         "kernels",
         "ops",
-        "lora",
-        "dense",
+        "gemm",
         "csgmv_configs",
         version_dir,
     )

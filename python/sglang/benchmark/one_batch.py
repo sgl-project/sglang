@@ -115,17 +115,6 @@ from sglang.srt.utils import (
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 
 
-def _init_process_global_configs() -> None:
-    """Process-global config both benchmark modes need before the model loads.
-
-    The Mamba SSU backend is not here: `load_model` installs it for the models
-    that have one.
-    """
-    initialize_moe_config()
-    initialize_fp8_gemm_config()
-    initialize_fp4_gemm_config()
-
-
 def start_profile(
     profile_activities,
     profile_record_shapes=False,
@@ -424,7 +413,7 @@ def prepare_inputs_for_correctness_test(bench_args, tokenizer, custom_prompts):
         )
         req.full_untruncated_fill_ids = req.origin_input_ids
         req.logprob_start_len = -1
-        req.extend_end = len(req.origin_input_ids)
+        req.set_extend_range(len(req.prefix_indices), len(req.origin_input_ids))
         reqs.append(req)
 
     return input_ids, reqs
@@ -438,10 +427,13 @@ def prepare_extend_inputs_for_correctness_test(
         req.full_untruncated_fill_ids.extend(input_ids[i][bench_args.cut_len :])
         if model_runner is not None:
             # Use req.kv.req_pool_idx instead of i to handle slot 0 padding correctly
-            # The cut prefix is already in the request's row from the first extend.
-            req.prefix_len = bench_args.cut_len
+            req.prefix_indices = model_runner.req_to_token_pool.req_to_token[
+                req.kv.req_pool_idx, : bench_args.cut_len
+            ].to(req.prefix_indices.dtype)
             req.logprob_start_len = -1
-        req.extend_end = len(req.full_untruncated_fill_ids)
+        req.set_extend_range(
+            len(req.prefix_indices), len(req.full_untruncated_fill_ids)
+        )
     return reqs
 
 
@@ -468,7 +460,7 @@ def prepare_synthetic_inputs_for_latency_test(
         )
         req.full_untruncated_fill_ids = req.origin_input_ids
         req.logprob_start_len = -1
-        req.extend_end = len(req.origin_input_ids)
+        req.set_extend_range(len(req.prefix_indices), len(req.origin_input_ids))
         reqs.append(req)
 
     return reqs
@@ -481,13 +473,13 @@ class TreeCacheNamespace(SimpleNamespace):
     def supports_mamba(self) -> bool:
         return False
 
-    def supports_prefix_sharing(self) -> bool:
-        return True
+    def is_chunk_cache(self) -> bool:
+        return False
+
+    def is_tree_cache(self) -> bool:
+        return not self.is_chunk_cache()
 
     def evict(self, params: EvictParams):
-        pass
-
-    def maybe_hand_to_session(self, req):
         pass
 
 
@@ -694,7 +686,6 @@ def correctness_test(
             gpu_id=gpu_id,
         ),
     )
-    _init_process_global_configs()
 
     # Configure the logger
     configure_logger(server_args, prefix=f" TP{tp_rank}")
@@ -907,7 +898,9 @@ def latency_test(
             gpu_id=gpu_id,
         ),
     )
-    _init_process_global_configs()
+    initialize_moe_config()
+    initialize_fp8_gemm_config()
+    initialize_fp4_gemm_config()
 
     if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):
         set_gpu_proc_affinity(tp_rank)

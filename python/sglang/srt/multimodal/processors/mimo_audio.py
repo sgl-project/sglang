@@ -17,12 +17,9 @@ from sglang.utils import logger
 
 try:
     from torchcodec.decoders import AudioDecoder
-except (ImportError, OSError, RuntimeError) as e:
-    # TorchCodec may be installed but unable to load its FFmpeg libraries.
+except ImportError:
     logger.warning(
-        "torchcodec is unavailable; video audio-track detection and "
-        "audio decoding via AudioDecoder are disabled: %s",
-        e,
+        "torchcodec is not installed; audio inputs will fail at request time"
     )
     AudioDecoder = None
 

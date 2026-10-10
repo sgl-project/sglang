@@ -198,14 +198,18 @@ class Ernie4DecoderLayer(nn.Module):
                 prefix=add_prefix("mlp", prefix),
             )
         else:
-            mlp_parallel_group = "replicated" if is_dense_ffn_fully_dp() else "tp"
+            if is_dense_ffn_fully_dp():
+                mlp_tp_rank, mlp_tp_size = 0, 1
+            else:
+                mlp_tp_rank, mlp_tp_size = None, None
             self.mlp = Ernie4MLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
-                parallel_group=mlp_parallel_group,
+                tp_rank=mlp_tp_rank,
+                tp_size=mlp_tp_size,
             )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)

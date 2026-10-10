@@ -1,5 +1,4 @@
 import unittest
-from types import SimpleNamespace
 from unittest.mock import patch
 
 from sglang.srt.managers.io_struct import GenerateReqInput
@@ -29,7 +28,6 @@ class TestSamplingMaskValidation(CustomTestCase):
         self.manager.allow_auto_truncate = False
         self.manager.validate_total_tokens = False
         self.manager.is_generation = True
-        self.manager.model_config = SimpleNamespace(joint_head_config=None)
 
     def _validate(
         self,

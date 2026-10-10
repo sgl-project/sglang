@@ -82,7 +82,8 @@ class TestDPAttention(CustomTestCase):
             "--disable-overlap-schedule",
             "--tp",
             "2",
-            "--attn-dp-size",
+            "--enable-dp-attention",
+            "--dp",
             "2",
         ]
         cls.process = popen_launch_server(

@@ -19,6 +19,7 @@ from sglang.srt.models.qwen3_vl import (
     Qwen3VLMoeVisionPatchMerger,
     Qwen3VLVisionPatchEmbed,
 )
+from sglang.srt.runtime_context import get_parallel
 
 
 @dataclass(frozen=True)
@@ -69,6 +70,7 @@ class Qwen3VLVisionBlock(nn.Module):
         prefix: str = "visual",
     ) -> None:
         super().__init__()
+        parallel = get_parallel()
         self.norm1 = nn.LayerNorm(config.hidden_size, eps=1e-6)
         self.norm2 = nn.LayerNorm(config.hidden_size, eps=1e-6)
         self.attn = QwenVLVisionAttention(
@@ -84,7 +86,8 @@ class Qwen3VLVisionBlock(nn.Module):
             hidden_act=config.hidden_act,
             prefix=f"{prefix}.blocks.{layer_idx}.mlp",
             quant_config=quant_config,
-            parallel_group="tp",
+            tp_rank=parallel.tp_rank,
+            tp_size=parallel.tp_size,
         )
 
     def forward(
@@ -207,6 +210,7 @@ class Qwen3VLVisionTransformer(nn.Module):
         prefix: str = "visual",
     ) -> None:
         super().__init__()
+        parallel = get_parallel()
         self.config = config
         self.spatial_merge_size = config.spatial_merge_size
         self.spatial_merge_unit = config.spatial_merge_size**2
@@ -229,7 +233,8 @@ class Qwen3VLVisionTransformer(nn.Module):
             spatial_merge_size=config.spatial_merge_size,
             use_postshuffle_norm=False,
             prefix="visual.merger",
-            parallel_group="tp",
+            tp_rank=parallel.tp_rank,
+            tp_size=parallel.tp_size,
         )
         self.deepstack_visual_indexes = tuple(config.deepstack_visual_indexes)
         self.deepstack_merger_list = nn.ModuleList(
@@ -240,7 +245,8 @@ class Qwen3VLVisionTransformer(nn.Module):
                 spatial_merge_size=config.spatial_merge_size,
                 use_postshuffle_norm=True,
                 prefix=f"visual.deepstack_merger_list.{merger_idx}",
-                parallel_group="tp",
+                tp_rank=parallel.tp_rank,
+                tp_size=parallel.tp_size,
             )
             for merger_idx, _ in enumerate(self.deepstack_visual_indexes)
         )

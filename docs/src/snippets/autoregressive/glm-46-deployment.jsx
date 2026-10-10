@@ -132,7 +132,7 @@ export const GLM46Deployment = () => {
 
     // Strategy-specific parameters
     if (strategyArray.includes('dp')) {
-      cmd += ` \\\n  --attn-dp-size 8`;
+      cmd += ` \\\n  --dp 8 \\\n  --enable-dp-attention`;
       if (hardware === 'b300') {
         cmd += ` \\\n  --cuda-graph-max-bs-decode 256`;
       }

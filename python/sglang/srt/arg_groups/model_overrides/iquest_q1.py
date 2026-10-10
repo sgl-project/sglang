@@ -5,7 +5,6 @@ from sglang.srt.arg_groups.model_override_base import (
     is_attention_backend_not_set,
     resolving_view,
 )
-from sglang.srt.runtime_context import attn_dp_enabled_of
 
 
 @_register_for("IQuestQ1ForCausalLM", "IQuestQ1MTP")
@@ -34,7 +33,7 @@ def _iquest_q1_overrides(server_args: Any, hf_config: Any) -> dict:
         )
     if cfg.enable_multi_layer_eagle:
         raise ValueError("IQuest Q1 MTP drafting does not support multi-layer EAGLE.")
-    if attn_dp_enabled_of(cfg):
+    if cfg.enable_dp_attention:
         raise ValueError("IQuest Q1 does not support DP attention.")
     if cfg.pp_size > 1:
         raise ValueError("IQuest Q1 does not support pipeline parallelism.")

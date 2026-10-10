@@ -13,7 +13,6 @@ from sglang.srt.constants import MIS_DELIMITER_TOKEN_ID
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.runtime_context import get_exec, get_memory, get_schedule, get_serving
-from sglang.srt.utils import ImageData
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +49,6 @@ class TokenizerManagerScoreMixin:
         request: Optional[Any] = None,
         temperature: float = 1.0,
         return_token_logprobs: bool = False,
-        image_data: Optional[List[List[ImageData]]] = None,
     ) -> ScoreResult:
         """
         Score probabilities of specified token IDs after each *full prompt*.
@@ -71,7 +69,6 @@ class TokenizerManagerScoreMixin:
                 request=request,
                 temperature=temperature,
                 return_token_logprobs=return_token_logprobs,
-                image_data=image_data,
             )
 
         # Tokenized prompts
@@ -85,7 +82,6 @@ class TokenizerManagerScoreMixin:
                 request=request,
                 temperature=temperature,
                 return_token_logprobs=return_token_logprobs,
-                image_data=image_data,
             )
 
         raise ValueError("Invalid prompts type for score_prompts.")
@@ -823,7 +819,6 @@ class TokenizerManagerScoreMixin:
         score_extraction_token_id: Optional[int] = None,
         temperature: float = 1.0,
         return_token_logprobs: bool = False,
-        image_data: Optional[List[List[ImageData]]] = None,
     ) -> ScoreResult:
         """
         Score the probability of specified token IDs appearing after the given (query + item) pair.
@@ -931,15 +926,6 @@ class TokenizerManagerScoreMixin:
         use_score_extraction = score_extraction_token_id is not None
         if use_score_extraction:
             self._validate_score_extraction(is_generation, item_first)
-        if image_data is not None and (
-            not is_generation
-            or use_multi_item_scoring
-            or use_score_extraction
-            or has_embeds
-        ):
-            raise ValueError(
-                "image_data requires pointwise generation scoring without embedding overrides"
-            )
 
         input_ids = None
         text_prompts = None
@@ -1080,7 +1066,6 @@ class TokenizerManagerScoreMixin:
             batch_request = GenerateReqInput(
                 text=text_prompts,
                 input_ids=input_ids,
-                image_data=image_data,
                 token_ids_logprob=request_labels,
                 return_logprob=True,
                 # logprob_start_len=0 so input-position logprobs are computed:

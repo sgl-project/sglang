@@ -42,7 +42,7 @@ pub async fn spawn(
                 url,
                 mode: WorkerMode::Plain,
                 model_ids: Vec::new(),
-                ..Default::default()
+                bootstrap_port: None,
             };
             if tx.send(DiscoveryEvent::Added(spec)).await.is_err() {
                 tracing::info!(

@@ -30,6 +30,7 @@ QWEN3_5_9B_OTHER_ARGS = [
     "ascend",
     "--device",
     "npu",
+    "--enable-dp-attention",
     "--chunked-prefill-size",
     4096,
     "--max-prefill-tokens",

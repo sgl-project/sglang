@@ -74,21 +74,28 @@ def _fused_qk_complex_rope_kernel(
 
 
 def can_use_fused_qk_complex_rope(
-    *,
-    dtype: torch.dtype,
-    device: torch.device,
+    q: torch.Tensor,
+    k: torch.Tensor,
     freqs_cis: torch.Tensor,
 ) -> bool:
-    """Select the fused path before projecting the vision Q/K tensors."""
+    """Whether the NVIDIA fused path supports these vision RoPE tensors."""
+
     if not (
-        device.type == "cuda"
+        q.is_cuda
+        and k.is_cuda
         and freqs_cis.is_cuda
-        and device == freqs_cis.device
-        and dtype in (torch.bfloat16, torch.float16)
-        and freqs_cis.dtype == torch.complex64
+        and q.device == k.device == freqs_cis.device
     ):
         return False
-    major, _ = torch.cuda.get_device_capability(device)
+    if q.dtype != k.dtype or q.dtype not in (torch.bfloat16, torch.float16):
+        return False
+    if freqs_cis.dtype != torch.complex64 or q.shape != k.shape or q.ndim < 3:
+        return False
+    if q.shape[-1] % 2 != 0:
+        return False
+    if freqs_cis.shape != q.shape[:-2] + (q.shape[-1] // 2,):
+        return False
+    major, _ = torch.cuda.get_device_capability(q.device)
     return major >= 9
 
 
@@ -105,20 +112,13 @@ def apply_fused_qk_complex_rope(
     not create new Triton specializations.
     """
 
-    if not can_use_fused_qk_complex_rope(
-        dtype=q.dtype, device=q.device, freqs_cis=freqs_cis
-    ):
+    if not can_use_fused_qk_complex_rope(q, k, freqs_cis):
         raise ValueError(
             "Unsupported fused vision RoPE inputs: "
             f"q={q.shape}/{q.dtype}/{q.device}, "
             f"k={k.shape}/{k.dtype}/{k.device}, "
             f"freqs={freqs_cis.shape}/{freqs_cis.dtype}/{freqs_cis.device}"
         )
-
-    assert q.device == k.device and q.dtype == k.dtype
-    assert q.shape == k.shape and q.ndim >= 3
-    assert q.shape[-1] % 2 == 0
-    assert freqs_cis.shape == q.shape[:-2] + (q.shape[-1] // 2,)
 
     original_shape = q.shape
     # Preserve the interleaved QKV token stride when the token dimension is 1.
@@ -211,7 +211,7 @@ def precompile_fused_qk_complex_rope(
     qkv = torch.empty((1, 3, num_heads, head_dim), dtype=dtype, device=device)
     q, k, _ = torch.unbind(qkv, dim=1)
     freqs = torch.ones((1, head_dim // 2), dtype=torch.complex64, device=device)
-    if not can_use_fused_qk_complex_rope(dtype=dtype, device=q.device, freqs_cis=freqs):
+    if not can_use_fused_qk_complex_rope(q, k, freqs):
         return False
     apply_fused_qk_complex_rope(q, k, freqs)
     return True

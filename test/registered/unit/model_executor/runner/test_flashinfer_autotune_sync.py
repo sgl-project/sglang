@@ -31,7 +31,6 @@ from sglang.srt.model_executor.runner.flashinfer_autotune import (
     _autotune_tactic_sync_group,
     _drop_diverged_autotune_cache,
 )
-from sglang.srt.runtime_context import get_parallel
 from sglang.test.test_utils import CustomTestCase, find_available_port
 
 ENV = {"flashinfer_version": "0.6.17", "gpu": "NVIDIA GB300"}
@@ -226,7 +225,11 @@ class TestAutotuneCachePhases(CustomTestCase):
         tuner = AutoTuner.get()
         tuner.clear_cache()
         self.addCleanup(tuner.clear_cache)
-        runner = SimpleNamespace(device="cuda", forward_stream=torch.cuda.Stream())
+        runner = SimpleNamespace(
+            device="cuda",
+            forward_stream=torch.cuda.Stream(),
+            tp_group=SimpleNamespace(world_size=1),
+        )
         with tempfile.TemporaryDirectory() as directory:
             target, draft = (
                 Path(directory) / name for name in ("target.json", "draft.json")
@@ -250,7 +253,6 @@ class TestAutotuneCachePhases(CustomTestCase):
                     autotune, "get_flashinfer_autotune_skip_ops", return_value=set()
                 ),
                 autotune.envs.SGLANG_FLASHINFER_AUTOTUNE_CACHE.override(True),
-                get_parallel().override(tp_group=SimpleNamespace(world_size=1)),
             ):
                 with autotune.flashinfer_autotune_context(runner, run_lm_head=False):
                     self.assertEqual(

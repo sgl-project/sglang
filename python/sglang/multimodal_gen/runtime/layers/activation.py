@@ -41,6 +41,9 @@ class SiluAndMul(CustomOp):
         return: (num_tokens, d) or (batch_size, seq_len, d)
     """
 
+    def __init__(self) -> None:
+        super().__init__()
+
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
         d = x.shape[-1] // 2
         output_shape = x.shape[:-1] + (d,)
@@ -108,6 +111,9 @@ class GeluAndMul(CustomOp):
 
 @CustomOp.register("gelu_new")
 class NewGELU(CustomOp):
+    def __init__(self):
+        super().__init__()
+
     def forward_cuda(self, *args, **kwargs) -> Any:
         return self.forward_native(*args, **kwargs)
 
@@ -123,6 +129,9 @@ class NewGELU(CustomOp):
 @CustomOp.register("quick_gelu")
 class QuickGELU(CustomOp):
     # https://github.com/huggingface/transformers/blob/main/src/transformers/activations.py#L90
+    def __init__(self):
+        super().__init__()
+
     def forward_cuda(self, *args, **kwargs) -> Any:
         return self.forward_native(*args, **kwargs)
 

@@ -23,8 +23,6 @@ from transformers import PretrainedConfig
 
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
-from sglang.srt.layers.layer_boundary import layer_stack
-from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.utils import is_shared_experts_fusion_disabled
@@ -71,13 +69,12 @@ class GlmOcrModelNextN(nn.Module):
 
         self.eh_proj = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
 
-        with layer_stack():
-            self.decoder = Glm4DecoderLayer(
-                config,
-                0,
-                quant_config=quant_config,
-                prefix=add_prefix("decoder", prefix),
-            )
+        self.decoder = Glm4DecoderLayer(
+            config,
+            0,
+            quant_config=quant_config,
+            prefix=add_prefix("decoder", prefix),
+        )
 
         self.shared_head = nn.Module()
         self.shared_head.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -116,13 +113,19 @@ class GlmOcrModelNextN(nn.Module):
                 )
             )
 
-        residual_batch.start(forward_batch)
+        residual = None
         with get_global_expert_distribution_recorder().disable_this_region():
-            hidden_states = self.decoder(positions, hidden_states, forward_batch)
+            hidden_states, residual = self.decoder(
+                positions, hidden_states, forward_batch, residual
+            )
 
-        return residual_batch.final_norm(
-            hidden_states, forward_batch, self.shared_head.norm, skip_empty=True
-        )
+        if not forward_batch.forward_mode.is_idle():
+            if residual is not None:
+                hidden_states, _ = self.shared_head.norm(hidden_states, residual)
+            else:
+                hidden_states = self.shared_head.norm(hidden_states)
+
+        return hidden_states
 
 
 class GlmOcrForConditionalGenerationNextN(GlmOcrForConditionalGeneration):
@@ -134,6 +137,7 @@ class GlmOcrForConditionalGenerationNextN(GlmOcrForConditionalGeneration):
     ) -> None:
         nn.Module.__init__(self)
         self.config = config
+        self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
         _, rope_scaling = get_rope_config(config)
         self.is_mrope_enabled = "mrope_section" in (rope_scaling or {})

@@ -69,7 +69,8 @@ spec:
               - --eplb-algorithm
               - deepseek
               - --enable-dp-lm-head
-              - --attn-dp-size
+              - --enable-dp-attention
+              - --dp-size
               - "8"
               - --moe-a2a-backend
               - deepep
@@ -266,8 +267,9 @@ spec:
                   - "29"
                   - --page-size
                   - "64"
+                  - --enable-dp-attention
                   - --enable-dp-lm-head
-                  - --attn-dp-size
+                  - --dp-size
                   - "8"
                   - --moe-a2a-backend
                   - deepep
@@ -336,8 +338,9 @@ spec:
                 - "29"
                 - --page-size
                 - "64"
+                - --enable-dp-attention
                 - --enable-dp-lm-head
-                - --attn-dp-size
+                - --dp-size
                 - "32"
                 - --moe-a2a-backend
                 - "deepep"

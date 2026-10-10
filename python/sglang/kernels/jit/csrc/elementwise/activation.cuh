@@ -53,7 +53,6 @@ struct ActivationParams {
   // for per-token routing and BLOCK_SIZE_M for sorted/TMA routing.
   const int32_t* __restrict__ expert_ids;
   uint32_t expert_step;
-  float clamp_limit;
 };
 
 template <
@@ -62,8 +61,7 @@ template <
     bool kUsePDL,
     bool kFilterExpert,
     bool kRoundActivation = false,
-    bool kReuseInput = false,
-    bool kClamp = false>
+    bool kReuseInput = false>
 __global__ void act_and_mul_kernel(const __grid_constant__ ActivationParams params) {
   using namespace device;
   constexpr auto kVecSize = kMaxVecBytes / sizeof(T);
@@ -82,17 +80,11 @@ __global__ void act_and_mul_kernel(const __grid_constant__ ActivationParams para
   PDLWaitPrimary<kUsePDL>();
   const auto gate = device::load_as<vec_t>(params.input, input_offset);
   const auto up = device::load_as<vec_t>(params.input, input_offset + num_vecs);
-  const float limit = device::cast<fp32_t>(device::cast<T>(params.clamp_limit));
   vec_t out;
 #pragma unroll
   for (int i = 0; i < kVecSize; ++i) {
-    float gate_f32 = device::cast<fp32_t>(gate[i]);
-    float up_f32 = device::cast<fp32_t>(up[i]);
-    if constexpr (kClamp) {
-      static_assert(kAct == ActivationKind::kSiLU);
-      gate_f32 = gate_f32 > limit ? limit : gate_f32;
-      up_f32 = up_f32 > limit ? limit : (up_f32 < -limit ? -limit : up_f32);
-    }
+    const float gate_f32 = device::cast<fp32_t>(gate[i]);
+    const float up_f32 = device::cast<fp32_t>(up[i]);
     if constexpr (kRoundActivation) {
       const T activated = device::cast<T>(apply_activation_f32<kAct>(gate_f32));
       out[i] = device::cast<T>(device::cast<fp32_t>(activated) * up_f32);
@@ -161,14 +153,13 @@ struct ActivationKernel {
     return nullptr;
   }
 
-  template <bool kRoundActivation = false, bool kReuseInput = false, bool kClamp = false>
+  template <bool kRoundActivation = false, bool kReuseInput = false>
   static void launch(
       const tvm::ffi::TensorView& input,
       const tvm::ffi::TensorView& out,
       const std::string& type,
       const int32_t* expert_ids,
-      uint32_t expert_step,
-      float clamp_limit = 0.0f) {
+      uint32_t expert_step) {
     using namespace host;
 
     auto N = SymbolicSize{"num_tokens"};
@@ -207,14 +198,8 @@ struct ActivationKernel {
         .num_tokens = num_tokens,
         .expert_ids = expert_ids,
         .expert_step = expert_step,
-        .clamp_limit = clamp_limit,
     };
-    if constexpr (kClamp) {
-      RuntimeCheck(type == "silu" && expert_ids == nullptr, "clamping requires unfiltered SiLU");
-      const auto kernel =
-          act_and_mul_kernel<T, ActivationKind::kSiLU, kUsePDL, false, kRoundActivation, kReuseInput, true>;
-      LaunchKernel(num_blocks, kBlockSize, device).enable_pdl(kUsePDL)(kernel, params);
-    } else if (expert_ids != nullptr) {
+    if (expert_ids != nullptr) {
       RuntimeCheck(expert_step > 0, "expert_step must be positive");
       const auto kernel = select_kernel<true, kRoundActivation, kReuseInput>(type);
       LaunchKernel(num_blocks, kBlockSize, device).enable_pdl(kUsePDL)(kernel, params);
@@ -228,13 +213,9 @@ struct ActivationKernel {
     launch(input, out, type, /*expert_ids=*/nullptr, /*expert_step=*/1);
   }
 
-  static void run_activation_with_rounding(
-      const tvm::ffi::TensorView input, const tvm::ffi::TensorView out, std::string type, double clamp_limit) {
-    if (clamp_limit > 0) {
-      launch<true, false, true>(input, out, type, /*expert_ids=*/nullptr, /*expert_step=*/1, clamp_limit);
-    } else {
-      launch<true>(input, out, type, /*expert_ids=*/nullptr, /*expert_step=*/1);
-    }
+  static void
+  run_activation_with_rounding(const tvm::ffi::TensorView input, const tvm::ffi::TensorView out, std::string type) {
+    launch<true>(input, out, type, /*expert_ids=*/nullptr, /*expert_step=*/1);
   }
 
   static void run_activation_with_rounding_input_inplace(

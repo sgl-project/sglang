@@ -145,14 +145,12 @@ def _extract_short_test_summary(full_output: str) -> list[str]:
     for line in full_output.splitlines():
         stripped = line.strip()
         if "short test summary info" in stripped:
-            summary_lines = []
             in_summary = True
             continue
         if not in_summary:
             continue
         if stripped.startswith("="):
-            in_summary = False
-            continue
+            break
         if not stripped or stripped.startswith("!"):
             continue
         summary_lines.append(stripped)

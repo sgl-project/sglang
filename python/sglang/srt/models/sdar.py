@@ -15,9 +15,9 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layer_boundary import (
-    append_stages,
     declare_attn,
     declare_ffn,
+    make_stages,
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
@@ -46,7 +46,7 @@ from sglang.srt.models.utils import (
     enable_fused_set_kv_buffer,
 )
 from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
-from sglang.srt.utils import add_prefix, is_cuda, make_pp_layers
+from sglang.srt.utils import add_prefix, is_cuda, make_layers
 
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
@@ -99,6 +99,8 @@ class SDARAttention(nn.Module):
         self.layer_id = layer_id
         self.hidden_size = config.hidden_size
         self.total_num_heads = config.num_attention_heads
+        self.tp_size = get_parallel().tp_size
+        attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
 
         assert self.total_num_heads % attn_tp_size == 0
@@ -128,7 +130,8 @@ class SDARAttention(nn.Module):
             self.total_num_kv_heads,
             bias=getattr(config, "attention_bias", False),
             quant_config=quant_config,
-            parallel_group="attn_tp",
+            tp_rank=attn_tp_rank,
+            tp_size=attn_tp_size,
             prefix=add_prefix("qkv_proj", prefix),
         )
         self.o_proj = RowParallelLinear(
@@ -137,7 +140,8 @@ class SDARAttention(nn.Module):
             bias=getattr(config, "attention_bias", False),
             quant_config=quant_config,
             reduce_results=reduce_results,
-            parallel_group="attn_tp",
+            tp_rank=attn_tp_rank,
+            tp_size=attn_tp_size,
             prefix=add_prefix("o_proj", prefix),
         )
 
@@ -287,11 +291,11 @@ class SDARBlock(nn.Module):
         self.mlp = SDARMLP(
             config=config,
             quant_config=quant_config,
-            reduce_results=False,
+            reduce_results=True,
             prefix=add_prefix("mlp", prefix),
         )
 
-        self.attn_boundary, self.ffn_boundary = append_stages(
+        self.attn_boundary, self.ffn_boundary = make_stages(
             (declare_attn(), self.input_layernorm),
             (
                 declare_ffn(
@@ -300,6 +304,8 @@ class SDARBlock(nn.Module):
                 ),
                 self.post_attention_layernorm,
             ),
+            previous=declare_ffn() if layer_id != 0 else None,
+            terminal=layer_id == config.num_hidden_layers - 1,
         )
 
     def forward(
@@ -320,8 +326,9 @@ class SDARBlock(nn.Module):
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
 
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = self.ffn_boundary.finish(hidden_states, forward_batch)
+        with self.ffn_boundary.exit(forward_batch) as ffn_exit:
+            hidden_states = self.mlp(hidden_states)
+        hidden_states = ffn_exit.finish(hidden_states)
 
         return hidden_states
 
@@ -351,7 +358,7 @@ class SDARModel(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
-        self.layers, self.start_layer, self.end_layer = make_pp_layers(
+        self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: SDARBlock(
                 layer_id=idx,
@@ -360,6 +367,8 @@ class SDARModel(nn.Module):
                 prefix=prefix,
                 alt_stream=alt_stream,
             ),
+            pp_rank=self.pp_group.rank_in_group,
+            pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
         )
         if self.pp_group.is_last_rank:

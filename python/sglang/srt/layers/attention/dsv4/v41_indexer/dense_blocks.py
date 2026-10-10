@@ -9,20 +9,16 @@ import msgspec
 import torch
 
 from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
-    amax_topk_blocks,
-    candidate_block_mask,
     select_candidate_block_ids,
     topk_among_blocks,
 )
 
 from .scoring import (
     DeepGEMMPrefillData,
-    PagedDecodeScores,
     decode_scores,
     get_deep_gemm_prefill_data,
     prefill_requests,
     score_tiles,
-    select_decode,
     write_decode,
     write_prefill,
 )
@@ -30,6 +26,7 @@ from .types import (
     CandidateMetadata,
     DecodeInputs,
     PrefillInputs,
+    Selection,
     get_tail_row_indices,
 )
 
@@ -43,8 +40,6 @@ class BlockIds(CandidateMetadata, msgspec.Struct):
     blocks: torch.Tensor
     # prefill: query rows of each request in row order, for the late-layer tail
     rows_per_request: Optional[List[int]] = None
-    # Hopper decode materializes this once at the source and reuses it in consumers.
-    decode_mask: Optional[torch.Tensor] = None
 
     def tail(self, rows_per_request: List[int]) -> BlockIds:
         assert self.rows_per_request is not None, "prefill block ids missing"
@@ -72,78 +67,69 @@ class DenseBlocksBackend:
         self.block_size = candidate_block_size
         self.use_deep_gemm_prefill = use_deep_gemm_prefill
 
-    def publish_prefill(self, inputs: PrefillInputs):
+    def publish_prefill(self, inputs: PrefillInputs, out: Selection):
         if self.use_deep_gemm_prefill:
-            return self._deep_gemm_publish_prefill(inputs)
-        return self._torch_publish_prefill(inputs)
+            return self._deep_gemm_publish_prefill(inputs, out)
+        return self._torch_publish_prefill(inputs, out)
 
     def consume_prefill(
         self,
         inputs: PrefillInputs,
         published: Optional[BlockIds],
+        out: Selection,
     ) -> None:
         if self.use_deep_gemm_prefill:
-            self._deep_gemm_consume_prefill(inputs, published)
+            self._deep_gemm_consume_prefill(inputs, published, out)
         else:
-            self._torch_consume_prefill(inputs, published)
+            self._torch_consume_prefill(inputs, published, out)
 
-    def publish_decode(self, inputs: DecodeInputs):
+    def publish_decode(self, inputs: DecodeInputs, out: Selection):
         d = decode_scores(
             inputs=inputs,
+            out=out,
             token_to_kv_pool=self.token_to_kv_pool,
             req_to_token=self.req_to_token,
         )
         if d is None:
             return None
-        if isinstance(d, PagedDecodeScores):
-            assert self.block_size == 8
-            blocks = amax_topk_blocks(
-                d.scores, d.lens, (d.lens + 7) // 8, self.topk_blocks
+        published = BlockIds(
+            blocks=select_candidate_block_ids(
+                d.scores,
+                d.lens[:, None],
+                topk_blocks=self.topk_blocks,
+                block_size=self.block_size,
             )
-            published = BlockIds(
-                blocks=blocks,
-                decode_mask=candidate_block_mask(blocks, d.lmax, self.block_size),
-            )
-        else:
-            published = BlockIds(
-                blocks=select_candidate_block_ids(
-                    d.scores,
-                    d.lens[:, None],
-                    topk_blocks=self.topk_blocks,
-                    block_size=self.block_size,
-                )
-            )
-        select_decode(inputs, d, inputs.indexer.index_topk)
+        )
+        k = min(inputs.indexer.index_topk, d.lmax)
+        idx = d.scores.topk(k, dim=-1, sorted=False).indices
+        write_decode(out, d, idx)
         return published
 
     def consume_decode(
         self,
         inputs: DecodeInputs,
         published: Optional[BlockIds],
+        out: Selection,
     ) -> None:
         d = decode_scores(
             inputs=inputs,
+            out=out,
             token_to_kv_pool=self.token_to_kv_pool,
             req_to_token=self.req_to_token,
-            candidate_mask=published.decode_mask if published is not None else None,
         )
         if d is None:
             return
         assert published is not None and published.blocks.shape[0] == d.bs
-        if isinstance(d, PagedDecodeScores):
-            assert published.decode_mask is not None
-            select_decode(inputs, d, inputs.indexer.index_topk)
-            return
         k = min(inputs.indexer.index_topk, d.lmax)
         idx = topk_among_blocks(
             d.scores, d.lens, published.blocks, k, block_size=self.block_size
         )
-        write_decode(inputs, d, idx.masked_fill(idx < 0, d.lmax))
+        write_decode(out, d, idx.masked_fill(idx < 0, d.lmax))
 
     # ---------- DeepGEMM: flattened-K scores ----------
 
-    def _deep_gemm_publish_prefill(self, inputs: PrefillInputs):
-        inputs.reset_outputs()
+    def _deep_gemm_publish_prefill(self, inputs: PrefillInputs, out: Selection):
+        out.reset()
         data = get_deep_gemm_prefill_data(inputs, self.req_to_token)
         if data is None:
             return None
@@ -156,15 +142,16 @@ class DenseBlocksBackend:
             topk_blocks=self.topk_blocks,
             block_size=self.block_size,
         )
-        data.write_selection(selected, inputs)
+        data.write_selection(selected=selected, out=out)
         return BlockIds(blocks=blocks, rows_per_request=data.rows_per_request)
 
     def _deep_gemm_consume_prefill(
         self,
         inputs: PrefillInputs,
         published: Optional[BlockIds],
+        out: Selection,
     ) -> None:
-        inputs.reset_outputs()
+        out.reset()
         data = get_deep_gemm_prefill_data(inputs, self.req_to_token)
         if data is None:
             return
@@ -178,14 +165,15 @@ class DenseBlocksBackend:
             blocks=published.blocks,
             block_size=self.block_size,
         )
-        data.write_selection(selected, inputs)
+        data.write_selection(selected=selected, out=out)
 
     # ---------- torch: per-request scores ----------
 
-    def _torch_publish_prefill(self, inputs: PrefillInputs):
+    def _torch_publish_prefill(self, inputs: PrefillInputs, out: Selection):
         picked = []  # (query rows, their block ids) per scored chunk
         for request, chunks in prefill_requests(
             inputs=inputs,
+            out=out,
             token_to_kv_pool=self.token_to_kv_pool,
             req_to_token=self.req_to_token,
         ):
@@ -202,7 +190,7 @@ class DenseBlocksBackend:
                     )
                 )
                 idx = chunk.scores.topk(request.k, dim=-1, sorted=False).indices
-                write_prefill(inputs, request, chunk, idx)
+                write_prefill(out, request, chunk, idx)
         width = max((ids.shape[1] for _, ids in picked), default=0)
         blocks = torch.full(
             (inputs.positions.shape[0], width),
@@ -218,10 +206,12 @@ class DenseBlocksBackend:
         self,
         inputs: PrefillInputs,
         published: Optional[BlockIds],
+        out: Selection,
     ) -> None:
         assert published is not None
         for request, chunks in prefill_requests(
             inputs=inputs,
+            out=out,
             token_to_kv_pool=self.token_to_kv_pool,
             req_to_token=self.req_to_token,
         ):
@@ -233,9 +223,7 @@ class DenseBlocksBackend:
                     request.k,
                     block_size=self.block_size,
                 )
-                write_prefill(
-                    inputs, request, chunk, idx.masked_fill(idx < 0, request.lc)
-                )
+                write_prefill(out, request, chunk, idx.masked_fill(idx < 0, request.lc))
 
 
 def _publish_prefill_blocks(

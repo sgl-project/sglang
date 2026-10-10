@@ -115,7 +115,7 @@ class TestMlpSyncPadUnpad(CustomTestCase):
 
     def test_draft_graph_gate_has_an_independent_dp_vote(self):
         sync_info = MLPSyncBatchInfo(
-            num_dp_ranks=1,
+            dp_size=1,
             tp_size=1,
             cp_size=1,
             num_tokens=1,
@@ -306,7 +306,8 @@ class TestDraftScopeMlpSync(CustomTestCase):
     def setUp(self):
         override = get_context().override_server_args(
             tp_size=4,
-            attn_dp_size=4,
+            dp_size=4,
+            enable_dp_attention=True,
             cuda_graph_config=CudaGraphConfig(prefill=PhaseConfig(bs=[])),
         )
         override.install()

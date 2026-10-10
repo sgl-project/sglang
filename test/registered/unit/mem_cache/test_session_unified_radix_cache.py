@@ -75,9 +75,11 @@ def insert(cache, token_ids):
 
 
 def match_len(cache, token_ids) -> int:
-    return cache.match_prefix(
-        MatchPrefixParams(key=RadixKey(array("q", token_ids)))
-    ).device_prefix_len
+    return len(
+        cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", token_ids)))
+        ).device_indices
+    )
 
 
 def register(cache, token_ids, session_id, generation=None):

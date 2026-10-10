@@ -185,9 +185,9 @@ class TestBoundCaptureOwnership(CustomTestCase):
             SumGroup,
             declare_attn,
             declare_ffn,
+            make_stages,
         )
         from sglang.srt.model_executor.forward_batch_info import ForwardMode
-        from sglang.test.boundary_fixtures import build_stages
         from sglang.test.communicator_patch import patch_communicator
 
         parallel = fixture.parallel_of(attn_dp=1, attn_tp=2)
@@ -244,7 +244,7 @@ class TestBoundCaptureOwnership(CustomTestCase):
                 side_effect=fused_kernel,
             ),
         ):
-            attn, ffn = build_stages(
+            attn, ffn = make_stages(
                 (declare_attn(), fixture.Norm()),
                 (declare_ffn(), norm, {"fusions": custom_fusions}),
                 previous=declare_ffn(),

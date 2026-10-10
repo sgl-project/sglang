@@ -79,7 +79,8 @@ class QwenVLVisionAttention(nn.Module):
             bias=True,
             quant_config=quant_config,
             prefix=f"{prefix}.qkv_proj",
-            parallel_group="tp",
+            tp_rank=parallel.tp_rank,
+            tp_size=parallel.tp_size,
         )
         self.proj = RowParallelLinear(
             input_size=config.hidden_size,
@@ -87,7 +88,8 @@ class QwenVLVisionAttention(nn.Module):
             bias=True,
             quant_config=quant_config,
             prefix=f"{prefix}.proj",
-            parallel_group="tp",
+            tp_rank=parallel.tp_rank,
+            tp_size=parallel.tp_size,
         )
 
         backend = get_attn_backend(self.head_dim, torch.get_default_dtype())

@@ -12,7 +12,6 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.managers.schedule_batch import ForwardMode
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.runtime_context import get_schedule
-from sglang.srt.utils.common import async_h2d
 
 if TYPE_CHECKING:
     from sglang.srt.layers.engram import EngramHasher
@@ -123,10 +122,9 @@ class NgramEmbeddingManager:
             all_tokens = []
             column_starts = []
             request_lengths = []
-            for req, start, extend_len in zip(
-                batch.reqs, batch.prefix_lens, batch.extend_lens, strict=True
-            ):
-                end = start + extend_len
+            for req in batch.reqs:
+                start = len(req.prefix_indices)
+                end = start + req.extend_range.length
                 fill_ids = req.origin_input_ids + req.output_ids
                 if start == 0:
                     tokens = fill_ids[start:end]
@@ -197,12 +195,12 @@ class NgramEmbeddingManager:
         if not batch.forward_mode.is_extend_without_speculative():
             return
         rows = []
-        for req, start in zip(batch.reqs, batch.prefix_lens, strict=True):
+        for req in batch.reqs:
+            start = req.extend_range.start
             lo = max(0, start - n1)
             ids = req.full_untruncated_fill_ids[lo:start]
             rows.append([0] * (n1 - len(ids)) + list(ids))
-        # The forward stream waits on the schedule stream, which orders this copy.
-        batch.engram_history = async_h2d(
+        batch.engram_history = torch.tensor(
             rows, dtype=torch.int32, device=self.engram_hasher.history.device
         ).view(len(rows), n1)
 

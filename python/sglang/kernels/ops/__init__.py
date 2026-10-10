@@ -25,7 +25,6 @@ _GROUPS = (
     "grammar",
     "kvcache",
     "layernorm",
-    "lora",
     "mamba",
     "memory",
     "mm",

@@ -19,9 +19,9 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layer_boundary import (
-    append_stages,
     declare_attn,
     declare_ffn,
+    make_stages,
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
@@ -32,6 +32,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.moe import reduce_moe_output
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
@@ -77,7 +78,7 @@ from sglang.srt.utils import (
     is_gfx95_supported,
     is_hip,
     is_npu,
-    make_pp_layers,
+    make_layers,
 )
 from sglang.srt.utils.common import rank0_log
 
@@ -245,6 +246,7 @@ class BailingMoE(nn.Module):
         self.layer_id = layer_id
 
         self.tp_size = get_parallel().tp_size
+        self.tp_rank = get_parallel().tp_rank
 
         self.top_k = config.num_experts_per_tok
         self.norm_expert_prob = getattr(config, "norm_topk_prob", False)
@@ -364,6 +366,7 @@ class BailingMoE(nn.Module):
             if self.num_shared_experts > 0:
                 final_hidden_states = final_hidden_states + shared_output
 
+        final_hidden_states = reduce_moe_output(final_hidden_states)
         return final_hidden_states
 
 
@@ -386,17 +389,17 @@ class BailingGroupRMSNormGate(RMSNormGated):
             dtype=dtype,
             activation="sigmoid",
         )
-        self.tp_size = get_parallel().attn_tp_size
-        self.tp_rank = get_parallel().attn_tp_rank
         self.weight.weight_loader = self.weight_loader
 
+    @staticmethod
     def weight_loader(
-        self,
         param: torch.nn.Parameter,
         loaded_weight: torch.Tensor,
     ) -> None:
-        shard_size = loaded_weight.shape[0] // self.tp_size
-        shard = slice(self.tp_rank * shard_size, (self.tp_rank + 1) * shard_size)
+        tp_size = get_parallel().attn_tp_size
+        tp_rank = get_parallel().attn_tp_rank
+        shard_size = loaded_weight.shape[0] // tp_size
+        shard = slice(tp_rank * shard_size, (tp_rank + 1) * shard_size)
         param.data.copy_(loaded_weight[shard].contiguous())
         return
 
@@ -459,7 +462,8 @@ class BailingMoELinearAttention(nn.Module):
             bias=(config.use_bias or config.use_qkv_bias),
             quant_config=quant_config,
             prefix=f"{prefix}.qkv_proj",
-            parallel_group="attn_tp",
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
         )
 
         if self.use_qk_norm:
@@ -472,7 +476,8 @@ class BailingMoELinearAttention(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.output_gate",
-            parallel_group="attn_tp",
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
         )
         self.dense = RowParallelLinear(
             self.hidden_inner_size,
@@ -480,7 +485,8 @@ class BailingMoELinearAttention(nn.Module):
             bias=config.use_bias,
             quant_config=quant_config,
             prefix=f"{prefix}.out_proj",
-            parallel_group="attn_tp",
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
             reduce_results=False,
         )
         self.attn = RadixAttention(
@@ -666,7 +672,6 @@ class BailingMoEAttention(nn.Module):
             bias=config.use_bias,
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
-            reduce_results=False,
         )
         if hasattr(config, "rotary_dim"):
             self.rotary_dim = config.rotary_dim
@@ -780,6 +785,7 @@ class BailingMoELinearDecoderLayer(nn.Module):
         self.expert_num = config.num_experts
         self.hidden_size = config.hidden_size
         is_moe_layer = self._is_layer_sparse(config, self.layer_id, is_nextn=is_nextn)
+        is_previous_moe_layer = self._is_layer_sparse(config, self.layer_id - 1)
         is_next_layer_moe_layer = self._is_layer_sparse(config, self.layer_id + 1)
         if self.expert_num == 1:
             self.mlp = BailingMLP(
@@ -787,7 +793,6 @@ class BailingMoELinearDecoderLayer(nn.Module):
                 intermediate_size=config.intermediate_size,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
-                reduce_results=False,
             )
         else:
             if is_nextn or self.layer_id >= config.first_k_dense_replace:
@@ -806,7 +811,6 @@ class BailingMoELinearDecoderLayer(nn.Module):
                     intermediate_size=config.intermediate_size,
                     quant_config=quant_config,
                     prefix=add_prefix("mlp", prefix),
-                    reduce_results=False,
                 )
         rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-5))
         self.input_layernorm = RMSNorm(self.hidden_size, eps=rms_norm_eps)
@@ -817,7 +821,7 @@ class BailingMoELinearDecoderLayer(nn.Module):
             if config.attention_type == 1 and self.use_mla
             else None
         )
-        self.attn_boundary, self.ffn_boundary = append_stages(
+        self.attn_boundary, self.ffn_boundary = make_stages(
             (
                 declare_attn(),
                 self.input_layernorm,
@@ -830,6 +834,12 @@ class BailingMoELinearDecoderLayer(nn.Module):
                 ),
                 self.post_attention_layernorm,
             ),
+            previous=declare_ffn(
+                sparse=is_previous_moe_layer, next_layer_sparse=is_moe_layer
+            )
+            if layer_id != 0
+            else None,
+            terminal=layer_id == (1 if is_nextn else config.num_hidden_layers) - 1,
         )
 
     def _is_layer_sparse(
@@ -873,8 +883,9 @@ class BailingMoELinearDecoderLayer(nn.Module):
         # logger.warning(
         #     f"===={self.layer_id=}, 3 shape= {hidden_states.shape}, {residual.shape}"
         # )
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = self.ffn_boundary.finish(hidden_states, forward_batch)
+        with self.ffn_boundary.exit(forward_batch) as ffn_exit:
+            hidden_states = self.mlp(hidden_states)
+        hidden_states = ffn_exit.finish(hidden_states)
         return hidden_states
 
     @staticmethod
@@ -941,9 +952,11 @@ class BailingMoELinearModel(nn.Module):
                 alt_stream=self.alt_stream,
             )
 
-        self.layers, self.start_layer, self.end_layer = make_pp_layers(
+        self.layers, self.start_layer, self.end_layer = make_layers(
             self.num_layers,
             layer_fn,
+            pp_rank=self.pp_group.rank_in_group,
+            pp_size=self.pp_group.world_size,
             prefix=f"{prefix}.layers",
         )
 

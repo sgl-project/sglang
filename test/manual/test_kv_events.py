@@ -48,6 +48,9 @@ class TestKvEvents(CustomTestCase):
                 32,
                 "--cuda-graph-max-bs-decode",
                 2,
+                "--enable-dp-attention",
+                "--dp-size",
+                1,
             ],
         )
 
@@ -198,7 +201,8 @@ class TestKvEvents(CustomTestCase):
                 64,
                 "--cuda-graph-max-bs-decode",
                 4,
-                "--attn-dp-size",
+                "--enable-dp-attention",
+                "--dp-size",
                 2,
                 "--tp-size",
                 2,

@@ -96,6 +96,16 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
     """Abstract class for attention metadata builders."""
 
     @abstractmethod
+    def __init__(self) -> None:
+        """Create the builder, remember some configuration and parameters."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def prepare(self) -> None:
+        """Prepare for one batch."""
+        raise NotImplementedError
+
+    @abstractmethod
     def build(
         self,
         **kwargs: dict[str, Any],

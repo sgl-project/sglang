@@ -36,8 +36,9 @@ class TestMiMoV25ProFP4GraphWithDFlash(GSM8KAscendMixin, CustomTestCase):
         MIMO_V2_5_PRO_FP4_DFLASH_DRAFT_WEIGHTS_PATH,
         "--speculative-num-draft-tokens",
         "8",
-        "--attn-dp-size",
+        "--dp-size",
         "2",
+        "--enable-dp-attention",
         "--enable-dp-lm-head",
     ]
 

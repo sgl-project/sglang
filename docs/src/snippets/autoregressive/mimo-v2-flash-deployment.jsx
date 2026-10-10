@@ -112,7 +112,7 @@ export const MiMoV2FlashDeployment = () => {
 
     // DP settings
     if (!isMI355X && strategyArray.includes('dp')) {
-      cmd += ` \\\n  --attn-dp-size 2`;
+      cmd += ` \\\n  --dp-size 2 \\\n  --enable-dp-attention`;
     }
 
     // Performance Optimizations

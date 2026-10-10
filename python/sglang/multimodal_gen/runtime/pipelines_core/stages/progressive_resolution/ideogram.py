@@ -22,7 +22,6 @@ from diffusers.utils.torch_utils import randn_tensor
 from sglang.multimodal_gen.configs.sample.ideogram import IDEOGRAM4_PRESETS
 from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
     refresh_context_on_dual_transformer,
-    refresh_context_on_transformer,
 )
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.layers.attention import build_varlen_mask_meta
@@ -453,35 +452,14 @@ class Ideogram4ProgressiveDenoisingStage(
     # ------------------------------------------------------------------
 
     def _refresh_cache_dit_context(
-        self,
-        n_remaining: int,
-        scm_preset: str | None,
-        ctx: DenoisingContext | None = None,
+        self, n_remaining: int, scm_preset: str | None
     ) -> None:
-        """Refresh active Cache-DiT transformer contexts after a stage transition."""
+        """Refresh both conditional and unconditional transformers."""
         # Recompute the full SCM config here so custom compute/cache bins stay
         # active after a progressive-resolution stage transition.
-        skip_unconditional = bool(
-            self.unconditional_transformer is None
-            or (
-                ctx is not None and ctx.extra.get("ideogram4_skip_unconditional", False)
-            )
-        )
-
         _, scm_policy, steps_computation_mask, steps_computation_mask_2 = (
-            self._cache_dit_scm_masks(
-                n_remaining, None if skip_unconditional else n_remaining
-            )
+            self._cache_dit_scm_masks(n_remaining, n_remaining)
         )
-        if skip_unconditional:
-            refresh_context_on_transformer(
-                self.transformer,
-                n_remaining,
-                steps_computation_mask=steps_computation_mask,
-                steps_computation_policy=scm_policy,
-            )
-            return
-
         refresh_context_on_dual_transformer(
             self.transformer,
             self.unconditional_transformer,

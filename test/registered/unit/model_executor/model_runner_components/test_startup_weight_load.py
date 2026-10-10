@@ -10,12 +10,7 @@ import torch
 from torch import nn
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import (
-    CustomTestCase,
-    enter_scope,
-    maybe_stub_sgl_kernel,
-    published_topology,
-)
+from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
@@ -65,7 +60,7 @@ def _make_options(**overrides):
         attn_cp_size=1,
         dcp_size=1,
         pp_size=1,
-        num_dp_ranks=1,
+        dp_size=1,
         ep_size=1,
         cpu_offload_gb=0,
         offload_group_size=-1,
@@ -663,8 +658,10 @@ class _RunnerStartupManager:
 
 class TestModelRunnerStartupWeightLoadOwnership(CustomTestCase):
     def setUp(self):
-        # The code under test reads its config and its rank from the context.
-        enter_scope(self, published_topology())
+        # The code under test reads its config from the bags.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
 
     @staticmethod
     def _runner(manager):
@@ -674,6 +671,7 @@ class TestModelRunnerStartupWeightLoadOwnership(CustomTestCase):
             elastic_ep_backend=None,
             is_ep_joiner=False,
         )
+        runner.tp_rank = 0
         return runner
 
     def test_success_releases_ownership_after_the_barrier(self):

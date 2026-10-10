@@ -15,9 +15,9 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layer_boundary import (
-    append_stages,
     declare_attn,
     declare_ffn,
+    make_stages,
 )
 from sglang.srt.layers.layer_boundary.output import OutputTransform
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
@@ -157,7 +157,8 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
             self.total_num_kv_heads,
             bias=False,
             quant_config=quant_config,
-            parallel_group="attn_tp",
+            tp_rank=self.attn_tp_rank,
+            tp_size=self.attn_tp_size,
         )
 
         self.o_proj = RowParallelLinear(
@@ -166,7 +167,8 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
             bias=False,
             quant_config=quant_config,
             reduce_results=False,
-            parallel_group="attn_tp",
+            tp_rank=self.attn_tp_rank,
+            tp_size=self.attn_tp_size,
         )
 
         self.attn = RadixAttention(
@@ -201,6 +203,7 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
 
         # FalconH1 all layers are dense and have no nextn now
         self.is_layer_sparse = False
+        is_previous_layer_sparse = False
         is_next_layer_sparse = False
 
         self.feed_forward = FalconH1MLP(
@@ -211,7 +214,6 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
             mlp_multipliers=config.mlp_multipliers,
             quant_config=quant_config,
             prefix=add_prefix("mlp", prefix),
-            reduce_results=False,
         )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -220,7 +222,7 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
         self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
-        self.attn_boundary, self.ffn_boundary = append_stages(
+        self.attn_boundary, self.ffn_boundary = make_stages(
             (declare_attn(), self.input_layernorm),
             (
                 declare_ffn(
@@ -232,6 +234,12 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
                 ),
                 self.pre_ff_layernorm,
             ),
+            previous=declare_ffn(
+                sparse=is_previous_layer_sparse, next_layer_sparse=self.is_layer_sparse
+            )
+            if layer_id != 0
+            else None,
+            terminal=layer_id == config.num_hidden_layers - 1,
         )
 
         self.alt_stream = alt_stream
@@ -349,7 +357,6 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
                 layer_id=self.layer_id,
                 forward_batch=forward_batch,
                 mup_vector=self.mup_vector,
-                use_triton_causal_conv=forward_batch.forward_mode.is_target_verify(),
             )
             mamba_hidden_states = mamba_hidden_states * self.ssm_out_multiplier
 
@@ -358,8 +365,9 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
         # Fully Connected
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
-        hidden_states = self.feed_forward(hidden_states, forward_batch)
-        return self.ffn_boundary.finish(hidden_states, forward_batch)
+        with self.ffn_boundary.exit(forward_batch) as ffn_exit:
+            hidden_states = self.feed_forward(hidden_states, forward_batch)
+        return ffn_exit.finish(hidden_states)
 
 
 ALL_DECODER_LAYER_TYPES = {

@@ -761,7 +761,8 @@ class _ChecksumTestBase(CustomTestCase):
             self,
             published_topology(
                 tp_size=4,
-                attn_dp_size=2,
+                dp_size=2,
+                enable_dp_attention=True,
                 ranks={"world_rank": 2, "dp_rank": 1},
             ),
         )

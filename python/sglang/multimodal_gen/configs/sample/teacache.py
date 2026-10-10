@@ -62,14 +62,9 @@ class TeaCacheParams(CacheParams):
             return self.coefficients_callback(self)
         return self.coefficients
 
-    def get_skip_step_range(self, num_inference_steps: int) -> tuple[int, int]:
-        """Return the ``[start, end)`` range of denoising steps that may skip.
-
-        Measured in denoising steps rather than forward calls, so the window does
-        not depend on how many CFG branches run locally per step (serial CFG, CFG
-        parallel, or CFG gating that stops running the negative branch).
-        """
-
+    def get_skip_boundaries(
+        self, num_inference_steps: int, do_cfg: bool
+    ) -> tuple[int, int]:
         def _resolve_boundary(value: int | float) -> int:
             if isinstance(value, float):
                 return int(num_inference_steps * value)
@@ -77,7 +72,11 @@ class TeaCacheParams(CacheParams):
                 return num_inference_steps + value
             return value
 
-        return (
-            _resolve_boundary(self.start_skipping),
-            _resolve_boundary(self.end_skipping),
-        )
+        start_skipping = _resolve_boundary(self.start_skipping)
+        end_skipping = _resolve_boundary(self.end_skipping)
+
+        if do_cfg:
+            start_skipping *= 2
+            end_skipping *= 2
+
+        return start_skipping, end_skipping

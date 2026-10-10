@@ -7,11 +7,10 @@ import msgspec
 import torch
 
 from sglang.kernels.ops.speculative.lilicorr import MAX_FUSED_CANDIDATE_TOPK
-from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
 from sglang.srt.environ import envs
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.models.dflash import candidate_topk
-from sglang.srt.runtime_context import get_exec
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.speculative.dflash_utils import _get_dflash_config
 from sglang.srt.speculative.dspark_components.dspark_draft import resolve_greedy_mask
 
@@ -194,7 +193,7 @@ def propose_lilicorr_block(
     )
     candidate_tokens = candidate_tokens.view(bs, slots, int(head.candidate_topk))
 
-    feat = int(head.context_proj.input_size)
+    feat = int(head.context_proj.in_features)
     if anchor is None or int(anchor.shape[0]) != bs:
         # The batch resized since the anchor write; score invalid rather than misaligned.
         anchor_hidden = torch.zeros(
@@ -259,7 +258,7 @@ class LiLiCorrDraftSampler:
 
         # From the head, not from lm_head.weight: a quantized head's weight is packed,
         # so its dtype is not the dtype these buffers carry.
-        anchor_row = head.slot_embedding
+        anchor_row = next(head.parameters())
         device, dtype = anchor_row.device, anchor_row.dtype
         max_rows = self.max_bs * self.slots
 
@@ -268,12 +267,7 @@ class LiLiCorrDraftSampler:
             (self.max_bs, int(anchor_features)), dtype=dtype, device=device
         )
         self.anchor_valid = torch.zeros((self.max_bs,), dtype=torch.bool, device=device)
-        # Candidates carry global ids, so every rank holds the whole table.
-        token_table = head.build_token_table(embed_tokens)
-        if token_table is not None and getattr(embed_tokens, "tp_size", 1) > 1:
-            token_table = tensor_model_parallel_all_gather(token_table, dim=0)
-            assert token_table.shape[0] == embed_tokens.org_vocab_size_padded
-        self.token_table = token_table
+        self.token_table = head.build_token_table(embed_tokens)
 
         self.temperatures = torch.ones(
             (self.max_bs,), dtype=torch.float32, device=device
@@ -392,13 +386,16 @@ def build_lilicorr_draft_sampler(
         )
         return None
 
+    tp_group = get_parallel().tp_group
+    if int(tp_group.world_size) != 1:
+        return eager("tp>1")
     batch_sizes = draft_graph_batch_sizes()
     if not batch_sizes:
         return eager("no draft graph batch sizes to size the static buffers from")
     max_bs = batch_sizes[-1]
 
     reject_added_vocab(lm_head)
-    parameter = head.slot_embedding
+    parameter = next(head.parameters())
     head.materialize_inference_buffers(parameter.device, parameter.dtype)
 
     sampler = LiLiCorrDraftSampler(
@@ -407,7 +404,7 @@ def build_lilicorr_draft_sampler(
         lm_head=lm_head,
         block_size=int(block_size),
         max_bs=int(max_bs),
-        anchor_features=int(draft_model.fc.output_size),
+        anchor_features=int(draft_model.fc.out_features),
         sampling_enabled=sampling_enabled,
     )
     logger.info(

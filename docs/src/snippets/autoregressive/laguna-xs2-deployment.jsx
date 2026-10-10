@@ -127,7 +127,8 @@ export const LagunaXS2Deployment = () => {
 
     if (dpAttention === 'enabled') {
       lines[lines.length - 1] += ' \\';
-      lines.push(`  --attn-dp-size ${tp}`);
+      lines.push(`  --dp ${tp} \\`);
+      lines.push('  --enable-dp-attention');
     }
 
     if (reasoning === 'enabled') {

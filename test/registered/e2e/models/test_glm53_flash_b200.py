@@ -105,9 +105,11 @@ class TestGLM53FlashB200HighThroughput(
     gsm8k_num_shots = 20
     server_args = [
         *COMMON_SERVER_ARGS,
-        "--attn-dp-size",
+        "--enable-dp-attention",
+        "--dp-size",
         "4",
-        "--mm-enable-dp-encoder",
+        "--cuda-graph-backend-prefill",
+        "breakable",
     ]
 
 

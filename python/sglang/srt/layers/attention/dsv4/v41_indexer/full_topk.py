@@ -21,13 +21,14 @@ from .scoring import (
     get_index_k_cache,
     prefill_requests,
     quantize_index_q,
-    select_decode,
+    write_decode,
     write_prefill,
 )
 from .types import (
     CapturedPrefillInputs,
     DecodeInputs,
     PrefillInputs,
+    Selection,
 )
 
 if TYPE_CHECKING:
@@ -48,44 +49,45 @@ class FullTopKIndexer:
         self.use_deep_gemm_prefill = use_deep_gemm_prefill
         self.use_deep_gemm_decode = use_deep_gemm_decode
 
-    def topk_prefill(self, inputs: PrefillInputs) -> None:
+    def topk_prefill(self, inputs: PrefillInputs, out: Selection) -> None:
         if self.use_deep_gemm_prefill:
-            self._deep_gemm_prefill(inputs)
+            self._deep_gemm_prefill(inputs, out)
         else:
-            self._torch_prefill(inputs)
+            self._torch_prefill(inputs, out)
 
-    def topk_prefill_captured(self, inputs: CapturedPrefillInputs) -> None:
-        self._deep_gemm_prefill_captured(inputs)
+    def topk_prefill_captured(self, inputs: CapturedPrefillInputs, out: Selection):
+        self._deep_gemm_prefill_captured(inputs, out)
 
-    def topk_decode(self, inputs: DecodeInputs) -> None:
+    def topk_decode(self, inputs: DecodeInputs, out: Selection) -> None:
         if self.use_deep_gemm_decode:
-            self._deep_gemm_decode(inputs)
+            self._deep_gemm_decode(inputs, out)
         else:
-            self._torch_decode(inputs)
+            self._torch_decode(inputs, out)
 
-    def _deep_gemm_prefill(self, inputs: PrefillInputs) -> None:
-        inputs.reset_outputs()
+    def _deep_gemm_prefill(self, inputs: PrefillInputs, out: Selection) -> None:
+        out.reset()
         data = get_deep_gemm_prefill_data(inputs, self.req_to_token)
         if data is None:
             return
         kv = self.token_to_kv_pool.get_low_ratio_index_k_fp4(
             inputs.layer_id, data.k_slots
         )
-        dense_prefill_topk(data, kv, out=inputs.out_raw_indices[: data.num_rows])
-        data.write_page_indices(inputs)
+        selected = dense_prefill_topk(data, kv, topk=inputs.indexer.index_topk)
+        data.write_selection(selected=selected, out=out)
 
-    def _torch_prefill(self, inputs: PrefillInputs) -> None:
+    def _torch_prefill(self, inputs: PrefillInputs, out: Selection) -> None:
         requests = prefill_requests(
             inputs=inputs,
+            out=out,
             token_to_kv_pool=self.token_to_kv_pool,
             req_to_token=self.req_to_token,
         )
         for request, chunks in requests:
             for chunk in chunks:
                 idx = chunk.scores.topk(request.k, dim=-1, sorted=False).indices
-                write_prefill(inputs, request, chunk, idx)
+                write_prefill(out, request, chunk, idx)
 
-    def _deep_gemm_decode(self, inputs: DecodeInputs) -> None:
+    def _deep_gemm_decode(self, inputs: DecodeInputs, out: Selection) -> None:
         data = get_deep_gemm_decode_data(inputs, self.token_to_kv_pool)
         metadata = inputs.paged_metadata
         if isinstance(metadata.deep_gemm_metadata, list):
@@ -105,7 +107,8 @@ class FullTopKIndexer:
                 topk_transform_paged_from_metadata(
                     logits,
                     metadata,
-                    inputs.out_page_indices,
+                    out.page_indices,
+                    out.raw_indices,
                     rows=rows,
                     topk_metadata=(
                         topk_plans[chunk_idx] if topk_plans is not None else None
@@ -123,20 +126,25 @@ class FullTopKIndexer:
         )
         # TODO(dark): add bf16 topk
         topk_transform_paged_from_metadata(
-            logits, metadata, inputs.out_page_indices, None
+            logits, metadata, out.page_indices, out.raw_indices
         )
 
-    def _torch_decode(self, inputs: DecodeInputs) -> None:
+    def _torch_decode(self, inputs: DecodeInputs, out: Selection) -> None:
         d = decode_scores(
             inputs=inputs,
+            out=out,
             token_to_kv_pool=self.token_to_kv_pool,
             req_to_token=self.req_to_token,
         )
         if d is None:
             return
-        select_decode(inputs, d, inputs.indexer.index_topk)
+        k = min(inputs.indexer.index_topk, d.lmax)
+        idx = d.scores.topk(k, dim=-1, sorted=False).indices
+        write_decode(out, d, idx)
 
-    def _deep_gemm_prefill_captured(self, inputs: CapturedPrefillInputs) -> None:
+    def _deep_gemm_prefill_captured(
+        self, inputs: CapturedPrefillInputs, out: Selection
+    ) -> None:
         indexer = inputs.indexer
         metadata = inputs.paged_metadata
         assert indexer.n_local_heads == indexer.n_heads
@@ -170,7 +178,7 @@ class FullTopKIndexer:
                 logits,
                 lens[rows],
                 page_table[rows],
-                inputs.out_page_indices[rows, :topk],
+                out.page_indices[rows, :topk],
                 page_size,
-                inputs.out_raw_indices[rows, :topk],
+                out.raw_indices[rows, :topk] if out.raw_indices is not None else None,
             )

@@ -81,10 +81,7 @@ def test_insert_then_match_round_trips():
         ),
     )
     matched = core.match_prefix(MatchPrefixParams(key=_key([1, 2, 3])))
-    path = core.collect_full_device_indices(
-        matched.last_device_node, core.root_node_handle(None)
-    )
-    assert path.tolist() == [10, 11, 12]
+    assert matched.device_indices.tolist() == [10, 11, 12]
 
 
 def test_lock_moves_tokens_between_evictable_and_protected():
@@ -111,12 +108,9 @@ def test_namespaces_isolate_the_same_tokens():
         ),
     )
     salted = core.match_prefix(MatchPrefixParams(key=_key([1, 2], extra_key="chat")))
-    path = core.collect_full_device_indices(
-        salted.last_device_node, core.root_node_handle("chat")
-    )
-    assert path.tolist() == [20, 21]
+    assert salted.device_indices.tolist() == [20, 21]
     unsalted = core.match_prefix(MatchPrefixParams(key=_key([1, 2])))
-    assert unsalted.device_prefix_len == 0
+    assert unsalted.device_indices.numel() == 0
 
 
 def test_backfill_hashes_existing_nodes_in_parent_order():

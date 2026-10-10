@@ -26,10 +26,11 @@ def handle_dllm_inference(server_args: Any):
         return
     from sglang.srt.dllm.algorithm import get_algorithm_cls
 
-    run_post_process_pass(server_args, _dllm_attention_backend)
     get_algorithm_cls(cfg.dllm_algorithm).configure_server_args(server_args)
 
-    # DLLM CUDA graphs are disabled on AMD/HIP.
+    # On AMD/HIP, disable cuda graph for DLLM (the attention_backend
+    # resolution moved to the pipeline: arg_groups/overrides.py
+    # _dllm_attention_backend, invoked below at its legacy slot).
     if get_platform().is_hip:
         if (
             cfg.cuda_graph_config.decode.backend != Backend.DISABLED
@@ -53,6 +54,7 @@ def handle_dllm_inference(server_args: Any):
                 ),
             )
 
+    run_post_process_pass(server_args, _dllm_attention_backend)
     run_post_process_pass(server_args, _dllm_overlap_disable)
 
     # The page-size alignment + block-size cap for dllm moved to the

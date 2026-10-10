@@ -91,10 +91,7 @@ class DSparkTargetHiddenProjectionTest(CustomTestCase):
         pool = SimpleNamespace(set_kv_buffer=mock.Mock())
         injector = TargetHiddenKvInjector(
             draft_model=draft_model,
-            draft_model_runner=SimpleNamespace(
-                token_to_kv_pool=pool,
-                kv_index_translator=SimpleNamespace(),
-            ),
+            draft_model_runner=SimpleNamespace(token_to_kv_pool=pool),
             model_runner=SimpleNamespace(device=torch.device("cpu")),
             device=torch.device("cpu"),
             verify_num_draft_tokens=2,

@@ -328,7 +328,7 @@ type TransferArgs = (
 #[derive(FromPyObject)]
 struct InspectionMatchResultInput {
     #[pyo3(attribute)]
-    device_prefix_len: usize,
+    device_indices: PyTensor,
     #[pyo3(attribute)]
     last_device_node: NodeId,
     #[pyo3(attribute)]
@@ -608,7 +608,7 @@ pub struct InsertParamsBinding {
     pub prev_prefix_len: usize,
     pub swa_evicted_seqlen: usize,
     pub swa_branching_seqlen: Option<usize>,
-    pub inserted_len: usize,
+    pub chunked: bool,
     pub priority: i64,
     pub track_adopted_ranges: bool,
 }
@@ -616,7 +616,7 @@ pub struct InsertParamsBinding {
 #[pymethods]
 impl InsertParamsBinding {
     #[new]
-    #[pyo3(signature = (key, value, extra_key = None, cache_salt = None, session_id = None, prev_prefix_len = 0, swa_evicted_seqlen = 0, swa_branching_seqlen = None, inserted_len = 0, priority = 0, mamba_value = None, track_adopted_ranges = false, rotation_base = None))]
+    #[pyo3(signature = (key, value, extra_key = None, cache_salt = None, session_id = None, prev_prefix_len = 0, swa_evicted_seqlen = 0, swa_branching_seqlen = None, chunked = false, priority = 0, mamba_value = None, track_adopted_ranges = false, rotation_base = None))]
     fn new(
         py: Python<'_>,
         key: &Bound<'_, PyAny>,
@@ -627,7 +627,7 @@ impl InsertParamsBinding {
         prev_prefix_len: usize,
         swa_evicted_seqlen: usize,
         swa_branching_seqlen: Option<usize>,
-        inserted_len: usize,
+        chunked: bool,
         priority: i64,
         mamba_value: Option<Py<PyAny>>,
         track_adopted_ranges: bool,
@@ -644,17 +644,17 @@ impl InsertParamsBinding {
             prev_prefix_len,
             swa_evicted_seqlen,
             swa_branching_seqlen,
-            inserted_len,
+            chunked,
             priority,
             track_adopted_ranges,
         })
     }
 }
 
-/// Python-visible match result; actions are Python-held.
+/// Python-visible match result; tensors and actions are Python-held.
 #[pyclass(get_all)]
 pub struct MatchResultBinding {
-    device_prefix_len: usize,
+    device_indices: Py<PyAny>,
     last_device_node_id: NodeId,
     last_host_node_id: NodeId,
     best_match_node_id: NodeId,
@@ -671,7 +671,7 @@ impl MatchResultBinding {
     /// Move a core match result across the boundary.
     fn from_match_result(py: Python<'_>, result: MatchResult) -> PyResult<Self> {
         Ok(MatchResultBinding {
-            device_prefix_len: result.device_prefix_len,
+            device_indices: tensor_to_py(py, result.device_indices)?,
             last_device_node_id: result.last_device_node_id,
             last_host_node_id: result.last_host_node_id,
             best_match_node_id: result.best_match_node_id,
@@ -1187,7 +1187,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
             prev_prefix_len: params.prev_prefix_len,
             swa_evicted_seqlen: params.swa_evicted_seqlen,
             swa_branching_seqlen: params.swa_branching_seqlen,
-            inserted_len: params.inserted_len,
+            chunked: params.chunked,
             priority: params.priority,
             track_adopted_ranges: params.track_adopted_ranges,
         };
@@ -1225,7 +1225,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
             prev_prefix_len: params.prev_prefix_len,
             swa_evicted_seqlen: params.swa_evicted_seqlen,
             swa_branching_seqlen: params.swa_branching_seqlen,
-            inserted_len: params.inserted_len,
+            chunked: params.chunked,
             priority: params.priority,
             track_adopted_ranges: params.track_adopted_ranges,
         };
@@ -2039,10 +2039,6 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         Ok(())
     }
 
-    fn is_write_through_compatible(&self, py: Python<'_>) -> bool {
-        py.allow_threads(|| self.core().is_write_through_compatible())
-    }
-
     /// Set the write-back (vs write-through) policy; decided at HiCache init.
     fn set_is_write_back(&self, py: Python<'_>, is_write_back: bool) {
         py.allow_threads(|| self.core().is_write_back = is_write_back);
@@ -2324,20 +2320,6 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         .map_err(node_access_error)
     }
 
-    fn inspect_get_component_host_lock_ref(
-        &self,
-        py: Python<'_>,
-        node_id: NodeId,
-        component_type: u8,
-    ) -> PyResult<u32> {
-        let component_type = parse_component_type(component_type)?;
-        py.allow_threads(|| {
-            self.core()
-                .inspect_get_component_host_lock_ref(node_id, component_type)
-        })
-        .map_err(node_access_error)
-    }
-
     fn inspect_get_node_hit_count(&self, py: Python<'_>, node_id: NodeId) -> PyResult<i64> {
         py.allow_threads(|| self.core().inspect_get_node_hit_count(node_id))
             .map_err(node_access_error)
@@ -2609,7 +2591,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         let component_type = parse_component_type(component_type)?;
         let key = K::key_from(Cow::Owned(py_array_to_vec_i64(py, key)?)).into_owned();
         let InspectionMatchResultInput {
-            device_prefix_len,
+            device_indices,
             last_device_node: last_device_node_id,
             last_host_node: last_host_node_id,
             best_match_node: best_match_node_id,
@@ -2621,7 +2603,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
             full_kv_hit_length,
         } = result;
         let result = MatchResult {
-            device_prefix_len,
+            device_indices: device_indices.0,
             last_device_node_id,
             last_host_node_id,
             best_match_node_id,
@@ -3333,10 +3315,6 @@ macro_rules! tree_core_binding {
                 catch_native_panic(|| self.inner.dec_host_lock_ref(py, node_id, params))
             }
 
-            fn is_write_through_compatible(&self, py: Python<'_>) -> bool {
-                self.inner.is_write_through_compatible(py)
-            }
-
             /// Set the write-back (vs write-through) policy; decided at HiCache init.
             fn set_is_write_back(&self, py: Python<'_>, is_write_back: bool) -> PyResult<()> {
                 catch_native_panic(|| {
@@ -3560,19 +3538,6 @@ macro_rules! tree_core_binding {
                 catch_native_panic(|| {
                     self.inner
                         .inspect_get_component_device_lock_ref(py, node_id, component_type)
-                })
-            }
-
-            #[cfg(feature = "inspection")]
-            fn inspect_get_component_host_lock_ref(
-                &self,
-                py: Python<'_>,
-                node_id: NodeId,
-                component_type: u8,
-            ) -> PyResult<u32> {
-                catch_native_panic(|| {
-                    self.inner
-                        .inspect_get_component_host_lock_ref(py, node_id, component_type)
                 })
             }
 

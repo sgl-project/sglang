@@ -70,8 +70,9 @@ class TestDeepseekV4ProFp4TboMTP(CustomTestCase):
             "8",
             # DP attention + TBO: non-EP DP TP-MoE two-batch-overlap. DP TBO is
             # selected because moe_a2a_backend stays 'none'; no opt-in env needed.
-            "--attn-dp-size",
+            "--dp",
             "8",
+            "--enable-dp-attention",
             "--enable-prefill-delayer",
             "--enable-two-batch-overlap",
             "--disable-radix-cache",
@@ -100,7 +101,7 @@ class TestDeepseekV4ProFp4TboMTP(CustomTestCase):
             "0.90",
             "--swa-full-tokens-ratio",
             "0.15",
-            # global chunk; DP-attention divides by attn_dp_size=8 -> 8192/rank.
+            # global chunk; DP-attention divides by dp_size=8 -> 8192/rank.
             "--chunked-prefill-size",
             "65536",
             "--disable-shared-experts-fusion",

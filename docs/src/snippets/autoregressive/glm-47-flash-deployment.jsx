@@ -23,6 +23,7 @@ export const GLM47FlashDeployment = () => {
       type: 'checkbox',
       items: [
         { id: 'tp', label: 'TP', subtitle: 'Tensor Parallel', default: true, required: true },
+        { id: 'dp', label: 'DP', subtitle: 'Data Parallel', default: false },
         { id: 'mtp', label: 'MTP', subtitle: 'Multi-token Prediction', default: false }
       ]
     },
@@ -112,6 +113,9 @@ export const GLM47FlashDeployment = () => {
     }
 
     // Strategy-specific parameters
+    if (strategyArray.includes('dp')) {
+      cmd += ` \\\n   --dp 1 \\\n   --enable-dp-attention`;
+    }
     if (strategyArray.includes('mtp')) {
 
       if (hardware === 'b200') {

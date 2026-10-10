@@ -105,14 +105,15 @@ def _patch_cache_dit_similarity():
         tp_sp_group = getattr(self, "_sglang_tp_sp_group", None)
         target_group = tp_sp_group or sp_group or tp_group
 
-        # CFG/DP peers are independent; never fall back to the global group
+        # Averaging over a one-rank group returns the input, so skip the
+        # collective rather than pay for a round trip that cannot change it.
         if target_group is None or dist.get_world_size(target_group) == 1:
             return _original_similarity(
                 self,
                 t1,
                 t2,
                 threshold=threshold,
-                parallelized=False,
+                parallelized=parallelized,
                 prefix=prefix,
             )
 
@@ -435,29 +436,7 @@ def _build_custom_block_adapter(
 ) -> Optional[BlockAdapter]:
     """Build a manual BlockAdapter for a model absent from cache-dit's registry,
     or None if the class is unknown."""
-    # FSDP adds a runtime subclass; retain the native model's adapter contract.
-    model_name = next(
-        (
-            cls.__name__
-            for cls in type(transformer).__mro__
-            if cls.__name__ == "Kandinsky6Transformer3DModel"
-            or cls.__name__ in _CUSTOM_BLOCK_ADAPTER_SPECS
-        ),
-        None,
-    )
-    if model_name == "Kandinsky6Transformer3DModel":
-        # the second stream is evolving audio, not static text conditioning
-        return BlockAdapter(
-            transformer=transformer,
-            blocks=transformer.visual_transformer_blocks,
-            forward_pattern=(
-                ForwardPattern.Pattern_0
-                if transformer.config.is_multimodal
-                else ForwardPattern.Pattern_2
-            ),
-            has_separate_cfg=has_separate_cfg,
-        )
-    spec = _CUSTOM_BLOCK_ADAPTER_SPECS.get(model_name)
+    spec = _CUSTOM_BLOCK_ADAPTER_SPECS.get(transformer.__class__.__name__)
     if spec is None:
         return None
     blocks = getattr(transformer, spec.blocks_attr, None)
@@ -629,9 +608,7 @@ def enable_cache_on_transformer(
         )
 
     parallelism_config = _build_parallelism_config(sp_group, tp_group)
-    if parallelism_config is not None or (
-        dist.is_initialized() and dist.get_world_size() > 1
-    ):
+    if parallelism_config is not None:
         _patch_cache_dit_similarity()
 
     _mark_transformer_parallelized(transformer, parallelism_config, sp_group, tp_group)
@@ -888,23 +865,19 @@ def refresh_context_on_transformer(
     num_inference_steps: int,
     scm_preset: str | None = None,
     verbose: bool = False,
-    steps_computation_mask: Optional[List[int]] = None,
-    steps_computation_policy: str | None = None,
 ) -> None:
     """Refresh cache-dit context for transformer."""
-    if steps_computation_mask is None and scm_preset is not None:
+    steps_computation_mask = None
+    if scm_preset is not None:
         steps_computation_mask = cache_dit.steps_mask(
             mask_policy=scm_preset, total_steps=num_inference_steps
         )
-    policy = (
-        steps_computation_policy if steps_computation_policy is not None else scm_preset
-    )
     cache_dit.refresh_context(
         transformer,
         cache_config=DBCacheConfig().reset(
             num_inference_steps=num_inference_steps,
             steps_computation_mask=steps_computation_mask,
-            steps_computation_policy=policy,
+            steps_computation_policy=scm_preset,
         ),
         verbose=verbose,
     )

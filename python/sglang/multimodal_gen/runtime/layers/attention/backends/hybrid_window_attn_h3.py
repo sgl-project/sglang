@@ -268,6 +268,12 @@ class HybridWindowAttentionH3Metadata(AttentionMetadata):
 
 
 class HybridWindowAttentionH3MetadataBuilder(AttentionMetadataBuilder):
+    def __init__(self) -> None:
+        pass
+
+    def prepare(self) -> None:
+        pass
+
     def build(  # type: ignore[override]
         self,
         *,

@@ -15,11 +15,6 @@ from sglang.kernels.jit.utils import is_arch_support_pdl
 PAD_SLOT_ID = -1
 
 
-# Tokens per program of _causal_conv1d_fwd_kernel; a block_table enumerates
-# (sequence, chunk) pairs in these units.
-CAUSAL_CONV1D_FWD_BLOCK_M = 8
-
-
 @triton.jit()
 def _causal_conv1d_fwd_kernel(  # continuous batching
     # Pointers to matrices
@@ -31,7 +26,6 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     has_initial_states_ptr,
     query_start_loc_ptr,
     o_ptr,  # (dim, seqlen) - actually pointing to x_ptr
-    block_table_ptr,  # (num_blocks, 2) int32 (seq, chunk) rows; USE_BLOCK_TABLE only
     # Matrix dimensions
     dim: tl.constexpr,
     seqlen: tl.int32,  # cu_seqlen
@@ -61,7 +55,6 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     NP2_STATELEN: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    USE_BLOCK_TABLE: tl.constexpr = False,
 ):
     conv_states_ptr = initial_states_ptr
     conv_state_indices_ptr = cache_indices_ptr
@@ -75,17 +68,9 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     # one program handles one chunk in a single sequence
     # rather than mixing sequences - to make updating initial_states across sequences efficiently
 
-    if USE_BLOCK_TABLE:
-        # CUDA-graph safe launch: the grid is a fixed upper bound on the
-        # (sequence, BLOCK_M-chunk) pairs of a token bucket and each program
-        # reads its pair from the table; padded rows carry pad_slot_id.
-        idx_block = tl.program_id(0)
-        idx_seq = tl.load(block_table_ptr + idx_block * 2)
-        chunk_offset = tl.load(block_table_ptr + idx_block * 2 + 1)
-    else:
-        # single-sequence id
-        idx_seq = tl.program_id(0)
-        chunk_offset = tl.program_id(1)
+    # single-sequence id
+    idx_seq = tl.program_id(0)
+    chunk_offset = tl.program_id(1)
 
     # BLOCK_N elements along the feature-dimension (channel)
     idx_feats = tl.program_id(2) * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -417,7 +402,6 @@ def causal_conv1d_fn(
     activation: Optional[str] = "silu",
     pad_slot_id: int = PAD_SLOT_ID,
     validate_data=False,
-    block_table: Optional[torch.Tensor] = None,
     **kwargs,
 ):
     """support varlen + continuous batching when x is 2D tensor
@@ -531,9 +515,6 @@ def causal_conv1d_fn(
         assert is_channel_last, "Need to run in channel-last layout"
 
     def grid(META):
-        if block_table is not None:
-            # (num_blocks, 1, feature blocks): no host-side sequence lengths.
-            return (block_table.shape[0], 1, triton.cdiv(dim, META["BLOCK_N"]))
         max_seq_len = max(seq_lens_cpu)
         return (
             len(seq_lens_cpu),  # batch_size
@@ -551,7 +532,6 @@ def causal_conv1d_fn(
         has_initial_state,
         query_start_loc,
         out,
-        block_table,
         # Matrix dimensions
         dim,
         cu_seqlen,
@@ -580,9 +560,8 @@ def causal_conv1d_fn(
         USE_PAD_SLOT=pad_slot_id is not None,
         NP2_STATELEN=np2_statelen,
         # launch_cooperative_grid=True
-        BLOCK_M=CAUSAL_CONV1D_FWD_BLOCK_M,
+        BLOCK_M=8,
         BLOCK_N=256,
-        USE_BLOCK_TABLE=block_table is not None,
         num_stages=2,
     )
     return out

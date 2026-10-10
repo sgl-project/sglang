@@ -116,8 +116,6 @@ use parking_lot::{Mutex, RwLock};
 use rustc_hash::{FxHashMap, FxHashSet};
 use tracing::{debug, error};
 
-use super::pending::PendingPrefixes;
-
 mod snapshot;
 
 pub(super) use snapshot::ShapeViolation;
@@ -1187,8 +1185,6 @@ pub struct HashTree {
     /// cross-shard scan that chose its target are atomic against the other
     /// writer. Readers never take it.
     writer: Mutex<()>,
-    /// Route-time predictions, kept apart from the event-driven shards.
-    pending: PendingPrefixes,
 }
 
 impl Default for HashTree {
@@ -1206,12 +1202,7 @@ impl HashTree {
         Self {
             shards,
             writer: Mutex::new(()),
-            pending: PendingPrefixes::default(),
         }
-    }
-
-    pub fn pending(&self) -> &PendingPrefixes {
-        &self.pending
     }
 
     /// Resolve an `insert`'s `parent_hash` over the COMPLETE carrier set and
@@ -1474,14 +1465,12 @@ impl HashTree {
     ///
     /// Fans out: a worker can hold chains in many shards. Also the
     /// scale-down path (`KvEventIndex::remove_worker`), which runs off the
-    /// pump task — hence [`Self::writer`]. Pending prefixes are per URL, so
-    /// clearing any rank drops the whole worker's.
+    /// pump task — hence [`Self::writer`].
     pub fn clear_worker(&self, worker: &KvWorkerId) {
         let _writer = self.writer.lock();
         for shard in &self.shards {
             shard.write().clear_worker(worker);
         }
-        self.pending.forget_worker(&worker.url);
     }
 
     /// Find the longest path from the root that matches a prefix of

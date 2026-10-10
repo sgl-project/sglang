@@ -4,11 +4,6 @@ export const DiffusionModelCatalog = ({ category }) => {
   const MODEL_CATALOG = {
   image: [
     {
-      name: "HunyuanImage-3.0",
-      modelIds: ["tencent/HunyuanImage-3.0", "tencent/HunyuanImage-3.0-Instruct"],
-      cookbook: "/cookbook/diffusion/Tencent/HunyuanImage3",
-    },
-    {
       name: "Anima",
       modelIds: ["circlestone-labs/Anima-Base-v1.0-Diffusers"],
       cookbook: "/cookbook/diffusion/CircleStone/Anima",
@@ -41,8 +36,8 @@ export const DiffusionModelCatalog = ({ category }) => {
       cookbook: "/cookbook/diffusion/Qwen-Image/Qwen-Image",
     },
     {
-      name: "Qwen-Image 2.1 / Turbo",
-      modelIds: ["Qwen/Qwen-Image-2.1", "Qwen/Qwen-Image-2.1-Turbo"],
+      name: "Qwen-Image 2.1",
+      modelIds: ["Qwen/Qwen-Image-2.1"],
       cookbook: "/cookbook/diffusion/Qwen-Image/Qwen-Image-2.1",
     },
     {
@@ -140,24 +135,6 @@ export const DiffusionModelCatalog = ({ category }) => {
   ],
   video: [
     {
-      name: "Kandinsky 6",
-      modelIds: [
-        "kandinskylab/Kandinsky-6.0-Pro-5s-Diffusers",
-        "kandinskylab/Kandinsky-6.0-Pro-sft-5s-Diffusers",
-        "kandinskylab/Kandinsky-6.0-Pro-distill-5s-Diffusers",
-      ],
-      cookbook: "/cookbook/diffusion/Kandinsky/Kandinsky6",
-      note: "Pro and Pro-distill have full-checkpoint validation; the older Pro-sft entry remains unverified.",
-    },
-    {
-      name: "Kandinsky 6 VSR",
-      modelIds: [
-        "kandinskylab/Kandinsky-6.0-VSR-distilled2steps-5s-Diffusers",
-      ],
-      cookbook: "/cookbook/diffusion/Kandinsky/Kandinsky6-SR",
-      note: "Use VSR-distilled2steps. The non-distilled VSR output head is incompatible with the current Euler path.",
-    },
-    {
       name: "Wan 2.1",
       modelIds: [
         "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
@@ -177,11 +154,6 @@ export const DiffusionModelCatalog = ({ category }) => {
         "Wan-AI/Wan2.2-I2V-A14B-Diffusers",
       ],
       cookbook: "/cookbook/diffusion/Wan/Wan2.2",
-    },
-    {
-      name: "Wan-Animate-2",
-      modelIds: ["Wan-AI/Wan2.2-Animate-2-14B-Diffusers"],
-      cookbook: "/cookbook/diffusion/Wan/Wan-Animate-2",
     },
     {
       name: "FastWan / TurboWan",
@@ -229,9 +201,9 @@ export const DiffusionModelCatalog = ({ category }) => {
     {
       name: "FastH3",
       modelIds: [
-        "FastVideo/FastVideo-FastH3-8-Step-V2",
+        "FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree",
       ],
-      cookbook: "/cookbook/diffusion/MiniMax/MiniMax-H3#6-fasth3-8-step-distilled",
+      cookbook: "/cookbook/diffusion/MiniMax/MiniMax-H3#6-fasth3-4-step-distilled-preview",
     },
     {
       name: "VDN-H3",
@@ -253,11 +225,6 @@ export const DiffusionModelCatalog = ({ category }) => {
       name: "SANA-Video",
       modelIds: ["Efficient-Large-Model/SANA-Video_2B_480p_diffusers"],
       cookbook: "/cookbook/diffusion/SANA-Video/SANA-Video",
-    },
-    {
-      name: "SANA-Video 2.0",
-      modelIds: ["Efficient-Large-Model/SANA-Video_2.0_5B_720p"],
-      cookbook: "/cookbook/diffusion/SANA-Video/SANA-Video#6-sana-video-20",
     },
     {
       name: "LingBot Video MoE",

@@ -186,20 +186,13 @@ class Flux3ActionPipeline(ComposedPipelineBase):
         )
         self.add_stage(
             Flux3ActionObservationEncodingStage(
-                config,
-                transformer=transformer,
-                vae=self.get_module("vae"),
-                use_cuda_graph=config.cuda_graph_enabled(server_args, "transformer")
-                and config.cuda_graph_enabled(server_args, "vae"),
+                config, transformer=transformer, vae=self.get_module("vae")
             ),
             "flux3_action_observation_encoding",
         )
         self.add_stage(
             Flux3ActionDenoisingStage(
-                config,
-                transformer,
-                scheduler=self.get_module("scheduler"),
-                use_cuda_graph=config.cuda_graph_enabled(server_args, "transformer"),
+                config, transformer, scheduler=self.get_module("scheduler")
             ),
             "flux3_action_denoise",
         )

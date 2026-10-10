@@ -319,7 +319,12 @@ class AscendKDAAttnBackend(KDAAttnBackend):
         Optional[torch.Tensor],
         Optional[torch.Tensor],
     ]:
-        """Activate raw gate and beta projections in FP32 for Ascend prefill."""
+        """Apply the Ascend prefill gate contract.
+
+        The checkpoint was validated with FP32 gate activation before
+        ``chunk_kda``. Keeping this platform override here leaves the shared
+        GPU model/backend paths unchanged.
+        """
         preactivated_g = fused_kda_gate_npu(
             g.flatten(-2),
             layer.A_log,
@@ -327,7 +332,7 @@ class AscendKDAAttnBackend(KDAAttnBackend):
             gate_bias=layer.dt_bias,
             lower_bound=layer.lower_bound,
         )
-        return preactivated_g, beta.float().sigmoid(), None, None
+        return preactivated_g, beta, None, None
 
     def _forward_target_verify(
         self,

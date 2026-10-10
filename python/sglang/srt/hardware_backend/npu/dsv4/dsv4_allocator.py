@@ -295,7 +295,7 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
 
         if available_pages() >= num_pages:
             return True
-        if tree_cache is None or not tree_cache.supports_prefix_sharing():
+        if tree_cache is None or tree_cache.is_chunk_cache():
             return False
 
         while available_pages() < num_pages:

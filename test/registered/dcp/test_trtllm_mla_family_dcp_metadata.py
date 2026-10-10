@@ -55,7 +55,6 @@ def _apply(backend, *, bs: int, seq_lens: torch.Tensor, forward_mode):
         patch.object(backend, "_fill_dcp_block_kv_indices") as fill,
     ):
         backend._apply_cuda_graph_metadata(
-            plan=None,  # DCP builds its own block table
             bs=bs,
             req_pool_indices=torch.arange(bs, dtype=torch.int32, device="cuda"),
             seq_lens=seq_lens,
@@ -109,6 +108,7 @@ class _DCPMetadataTests:
         heads, v_head_dim, n = 4, 512, 3 * NUM_DRAFT_TOKENS
         backend = object.__new__(self.backend_cls)
         backend.data_type = backend.q_data_type = torch.bfloat16
+        backend._decode_kernel_loc = None
 
         def real_path(*args, **kwargs):
             raise _RealVerifyPath
@@ -117,9 +117,7 @@ class _DCPMetadataTests:
         backend._run_decode_kernel = real_path
         layer = SimpleNamespace(tp_q_head_num=heads, v_head_dim=v_head_dim)
         forward_batch = SimpleNamespace(
-            forward_mode=ForwardMode.TARGET_VERIFY,
-            out_cache_loc=None,
-            out_cache_loc_is_physical=False,
+            forward_mode=ForwardMode.TARGET_VERIFY, out_cache_loc=None
         )
         k = torch.zeros((n, 1, v_head_dim), dtype=torch.bfloat16, device="cuda")
         k_rope = torch.zeros((n, 1, 64), dtype=torch.bfloat16, device="cuda")
@@ -294,6 +292,7 @@ class TestDcpBlockTableIdSpace(CustomTestCase):
     PAGE_SIZE = 64
     DCP_SIZE = 4
     DCP_RANK = 2
+    MULTIPLIER = 3
     # Virtual page per request, deliberately not the identity so a missing
     # gather cannot coincide with the right answer.
     VIRTUAL_PAGES = [[5, 2, 9], [7, 0, 4], [1, 8, 6]]
@@ -341,7 +340,7 @@ class TestDcpBlockTableIdSpace(CustomTestCase):
             )
         return block_kv_indices.cpu(), local_seq_lens.cpu(), req_to_token.cpu()
 
-    def _reference(self, req_to_token, local_seq_lens, v2p):
+    def _reference(self, req_to_token, local_seq_lens, v2p, multiplier):
         """What each live entry must be, derived from the id-space definition."""
         rows = []
         for req in range(local_seq_lens.numel()):
@@ -354,7 +353,7 @@ class TestDcpBlockTableIdSpace(CustomTestCase):
                 if v2p is None:
                     row.append(collapsed_page)
                 else:
-                    row.append(max(int(v2p[collapsed_page]), 0))
+                    row.append(max(int(v2p[collapsed_page]) * multiplier, 0))
             rows.append(row)
         return rows
 
@@ -366,9 +365,9 @@ class TestDcpBlockTableIdSpace(CustomTestCase):
             self.assertTrue((table[req, len(row) :] == -1).all())
 
     def test_static_pool_entries_are_the_collapsed_page(self):
-        translator = SimpleNamespace(full_v2p_table=None)
+        translator = SimpleNamespace(full_v2p_table=None, full_page_multiplier=1)
         table, local_lens, req_to_token = self._fill(translator)
-        self._assert_matches(table, self._reference(req_to_token, local_lens, None))
+        self._assert_matches(table, self._reference(req_to_token, local_lens, None, 1))
 
     def test_unified_pool_entries_go_through_the_page_table(self):
         num_pages = 1 + max(max(p) for p in self.VIRTUAL_PAGES)
@@ -378,21 +377,25 @@ class TestDcpBlockTableIdSpace(CustomTestCase):
             dtype=torch.int64,
             device="cuda",
         )
-        translator = SimpleNamespace(full_v2p_table=v2p)
+        translator = SimpleNamespace(
+            full_v2p_table=v2p, full_page_multiplier=self.MULTIPLIER
+        )
         table, local_lens, req_to_token = self._fill(translator)
-        expected = self._reference(req_to_token, local_lens, v2p.cpu())
+        expected = self._reference(req_to_token, local_lens, v2p.cpu(), self.MULTIPLIER)
         self._assert_matches(table, expected)
         # And it is genuinely a translation, not an accident of the fixture.
-        static = self._reference(req_to_token, local_lens, None)
+        static = self._reference(req_to_token, local_lens, None, 1)
         self.assertNotEqual(expected, static)
 
     def test_freed_page_lands_on_the_padding_sink(self):
         # A tombstoned (-1) v2p row must clamp to entry 0, the reserved
-        # padding page, rather than emit -1 as a block id.
+        # padding page, rather than scale -1 into a wild block id.
         num_pages = 1 + max(max(p) for p in self.VIRTUAL_PAGES)
         v2p = torch.arange(num_pages, dtype=torch.int64, device="cuda")
         v2p[self.VIRTUAL_PAGES[0][0]] = -1
-        translator = SimpleNamespace(full_v2p_table=v2p)
+        translator = SimpleNamespace(
+            full_v2p_table=v2p, full_page_multiplier=self.MULTIPLIER
+        )
         table, _, _ = self._fill(translator)
         self.assertEqual(int(table[0, 0]), 0)
 
@@ -493,7 +496,7 @@ class TestFusedFp8WriteGate(CustomTestCase):
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "the fused translate is Triton")
-class TestTranslateTokenIdsCuda(CustomTestCase):
+class TestFusedWriteLocTranslateCuda(CustomTestCase):
     """The fused write-loc translate must agree with its own CPU branch.
 
     The two implementations must not drift: Triton truncates division toward
@@ -503,7 +506,7 @@ class TestTranslateTokenIdsCuda(CustomTestCase):
     """
 
     def test_cuda_matches_the_cpu_branch(self):
-        from sglang.kernels.ops.memory.virtual_slot import translate_token_ids
+        from sglang.kernels.ops.memory.virtual_slot import write_loc_to_kernel_ids
 
         for page_size in (1, 64):
             span = page_size * 4
@@ -523,11 +526,12 @@ class TestTranslateTokenIdsCuda(CustomTestCase):
             for dcp_size, dcp_rank in ((1, 0), (2, 1), (4, 2)):
                 kw = dict(
                     page_size=page_size,
+                    stride=page_size * 3,
                     dcp_size=dcp_size,
                     dcp_rank=dcp_rank,
                 )
-                cpu = translate_token_ids(loc=loc, v2p=v2p, **kw)
-                gpu = translate_token_ids(loc=loc.cuda(), v2p=v2p.cuda(), **kw)
+                cpu = write_loc_to_kernel_ids(loc=loc, v2p=v2p, **kw)
+                gpu = write_loc_to_kernel_ids(loc=loc.cuda(), v2p=v2p.cuda(), **kw)
                 self.assertEqual(
                     cpu.tolist(),
                     gpu.cpu().tolist(),
@@ -538,36 +542,40 @@ class TestTranslateTokenIdsCuda(CustomTestCase):
         """`out_width` past the batch must zero the tail in the same launch.
 
         This is what lets a backend hand in its whole capture-stable buffer:
-        a shorter replay leaves stale physical ids past the batch, and the
+        a shorter replay leaves stale kernel-facing ids past the batch, and the
         captured write kernel consumes the full buffer, so an uncleared tail
         scatters pad rows into live KV pages.
         """
-        from sglang.kernels.ops.memory.virtual_slot import translate_token_ids
+        from sglang.kernels.ops.memory.virtual_slot import write_loc_to_kernel_ids
 
         v2p = torch.tensor([2, 5, 1, 3, 4], dtype=torch.int64, device="cuda")
         loc = torch.tensor([0, 64, 128], dtype=torch.int64, device="cuda")
         width = 8
         # Poison the whole buffer so an unwritten or uncleared cell is visible.
         buf = torch.full((width,), -999, dtype=torch.int64, device="cuda")
-        translate_token_ids(loc=loc, v2p=v2p, page_size=64, out=buf, out_width=width)
-        self.assertEqual(buf[:3].tolist(), [2 * 64, 5 * 64, 1 * 64])
+        write_loc_to_kernel_ids(
+            loc=loc, v2p=v2p, page_size=64, stride=64 * 2, out=buf, out_width=width
+        )
+        self.assertEqual(buf[:3].tolist(), [2 * 128, 5 * 128, 1 * 128])
         self.assertEqual(buf[3:].tolist(), [0] * (width - 3))
 
         # And it must agree with the narrow call on the live prefix.
-        narrow = translate_token_ids(loc=loc, v2p=v2p, page_size=64)
+        narrow = write_loc_to_kernel_ids(loc=loc, v2p=v2p, page_size=64, stride=64 * 2)
         self.assertEqual(narrow.tolist(), buf[:3].tolist())
 
     def test_out_is_written_in_place(self):
         # The captured decode path hands in a capture-stable buffer; rebinding
         # instead of filling it would leave the graph on a stale pointer.
-        from sglang.kernels.ops.memory.virtual_slot import translate_token_ids
+        from sglang.kernels.ops.memory.virtual_slot import write_loc_to_kernel_ids
 
         v2p = torch.tensor([2, 5, -1, 3], dtype=torch.int64, device="cuda")
         loc = torch.tensor([0, 64, 128, 192], dtype=torch.int64, device="cuda")
         dst = torch.full_like(loc, -7)
-        ret = translate_token_ids(loc=loc, v2p=v2p, page_size=64, out=dst)
+        ret = write_loc_to_kernel_ids(
+            loc=loc, v2p=v2p, page_size=64, stride=64 * 2, out=dst
+        )
         self.assertIs(ret, dst)
-        self.assertEqual(dst.tolist(), [2 * 64, 5 * 64, 0, 3 * 64])
+        self.assertEqual(dst.tolist(), [2 * 128, 5 * 128, 0, 3 * 128])
 
 
 class TestDcpDecodeLayout(CustomTestCase):

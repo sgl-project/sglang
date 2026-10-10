@@ -19,6 +19,10 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
 )
 from sglang.srt.configs import KimiLinearConfig
 from sglang.srt.configs.bailing_hybrid import is_bailing_multi_gate_enabled
+from sglang.srt.distributed import (
+    moe_expert_parallel_all_reduce,
+    moe_tensor_model_parallel_all_reduce,
+)
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
@@ -27,16 +31,15 @@ from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layer_boundary import (
-    append_stages,
     declare_attn,
     declare_ffn,
     is_dense_ffn_fully_dp,
+    make_stages,
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
-    LinearParallelGroup,
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
@@ -44,6 +47,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
+    should_skip_post_experts_all_reduce,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
@@ -95,7 +99,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_flashinfer_available,
     log_info_on_rank0,
-    make_pp_layers,
+    make_layers,
 )
 
 _is_fp8_fnuz = is_fp8_fnuz()
@@ -162,6 +166,8 @@ class DsV3MLA(DeepseekV2AttentionMLA):
             alt_stream,
             skip_rope,
         )
+        attn_tp_rank = get_parallel().attn_tp_rank
+        attn_tp_size = get_parallel().attn_tp_size
         self.gated_attention_proj_granularity_type = getattr(
             config, "gated_attention_proj_granularity_type", None
         )
@@ -173,7 +179,8 @@ class DsV3MLA(DeepseekV2AttentionMLA):
                 bias=False,
                 prefix=f"{prefix}.output_gate",
                 quant_config=None,
-                parallel_group="attn_tp",
+                tp_rank=attn_tp_rank,
+                tp_size=attn_tp_size,
             )
         elif self.gated_attention_proj_granularity_type == "element_wise":
             self.g_proj = ColumnParallelLinear(
@@ -181,7 +188,8 @@ class DsV3MLA(DeepseekV2AttentionMLA):
                 self.num_heads * self.v_head_dim,
                 bias=False,
                 prefix=f"{prefix}.output_gate",
-                parallel_group="attn_tp",
+                tp_rank=attn_tp_rank,
+                tp_size=attn_tp_size,
             )
         else:
             self.g_proj = None
@@ -301,13 +309,15 @@ class BailingMLP(nn.Module):
         prefix: str = "",
         swiglu_limit: Optional[float] = None,
         padded_intermediate_size: Optional[int] = None,
-        *,
-        parallel_group: LinearParallelGroup = "tp",
+        tp_rank: Optional[int] = None,
+        tp_size: Optional[int] = None,
     ) -> None:
         super().__init__()
 
         self.config = config
         self.swiglu_limit = swiglu_limit
+        self.tp_size = tp_size if tp_size is not None else get_parallel().tp_size
+        self.tp_rank = tp_rank if tp_rank is not None else get_parallel().tp_rank
 
         self.intermediate_size = intermediate_size
         self.padded_intermediate_size = padded_intermediate_size or intermediate_size
@@ -318,7 +328,8 @@ class BailingMLP(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.gate_up_proj",
-            parallel_group=parallel_group,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
         )
         self.down_proj = RowParallelLinear(
             self.padded_intermediate_size,
@@ -327,15 +338,15 @@ class BailingMLP(nn.Module):
             quant_config=quant_config,
             reduce_results=reduce_results,
             prefix=f"{prefix}.down_proj",
-            parallel_group=parallel_group,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
         )
 
-        group = self.gate_up_proj.tp_group
-        tp_size = group.world_size if group is not None else 1
-
         if self.padded_intermediate_size > self.intermediate_size:
-            self.padded_size_per_partition = self.padded_intermediate_size // tp_size
-            self.effective_size_per_partition = self.intermediate_size // tp_size
+            self.padded_size_per_partition = (
+                self.padded_intermediate_size // self.tp_size
+            )
+            self.effective_size_per_partition = self.intermediate_size // self.tp_size
             self.pad_size_per_partition = (
                 self.padded_size_per_partition - self.effective_size_per_partition
             )
@@ -454,8 +465,10 @@ class BailingMoE(nn.Module):
         self.alt_stream = alt_stream
 
         self.tp_size = get_parallel().tp_size
+        self.tp_rank = get_parallel().tp_rank
         self.moe_ep_size = get_parallel().moe_ep_size
         self.moe_tp_size = get_parallel().moe_tp_size
+        self.moe_tp_rank = get_parallel().moe_tp_rank
 
         self.top_k = config.num_experts_per_tok
         self.norm_expert_prob = getattr(config, "norm_topk_prob", False)
@@ -623,8 +636,10 @@ class BailingMoE(nn.Module):
             # because MoE output is already complete after EP combine.
             # Using tp_size=1 ensures shared output is also complete,
             # so no all-reduce is needed at the MoE level.
+            shared_tp_kwargs = {}
             shared_tp_size = self.tp_size
             if self._enable_a2a_moe:
+                shared_tp_kwargs = dict(tp_rank=0, tp_size=1)
                 shared_tp_size = 1
             padded_intermediate_size = self._compute_padded_intermediate_size(
                 intermediate_size, quant_config, shared_tp_size
@@ -638,7 +653,7 @@ class BailingMoE(nn.Module):
                 prefix=f"{prefix}.shared_experts",
                 swiglu_limit=self.share_expert_swiglu_limit,
                 padded_intermediate_size=padded_intermediate_size,
-                parallel_group="replicated" if self._enable_a2a_moe else "tp",
+                **shared_tp_kwargs,
             )
         else:
             self.shared_experts = None
@@ -739,6 +754,18 @@ class BailingMoE(nn.Module):
 
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
+
+        if self.moe_ep_size > 1 and not should_skip_post_experts_all_reduce(
+            is_tp_path=False,
+        ):
+            final_hidden_states = moe_expert_parallel_all_reduce(final_hidden_states)
+
+        if self.moe_tp_size > 1 and not should_skip_post_experts_all_reduce(
+            is_tp_path=True,
+        ):
+            final_hidden_states = moe_tensor_model_parallel_all_reduce(
+                final_hidden_states
+            )
         return final_hidden_states
 
     def _forward_shared_experts(
@@ -954,7 +981,6 @@ class BailingMoEAttention(nn.Module):
             bias=config.use_bias,
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
-            reduce_results=False,
         )
         if hasattr(config, "rotary_dim"):
             self.rotary_dim = config.rotary_dim
@@ -1078,10 +1104,16 @@ class BailingMoELinearDecoderLayer(nn.Module):
             and (self.layer_id >= config.first_k_dense_replace)
         )
         self.is_layer_sparse = is_moe_layer
+        is_previous_moe_layer = not (self.expert_num == 1) and (
+            self.layer_id - 1 >= config.first_k_dense_replace
+        )
         is_next_layer_sparse = not (self.expert_num == 1) and (
             self.layer_id + 1 >= config.first_k_dense_replace
         )
-        mlp_parallel_group = "replicated" if is_dense_ffn_fully_dp() else "tp"
+        if is_dense_ffn_fully_dp():
+            mlp_tp_rank, mlp_tp_size = 0, 1
+        else:
+            mlp_tp_rank, mlp_tp_size = None, None
 
         if self.expert_num == 1:
             self.mlp = BailingMLP(
@@ -1090,8 +1122,8 @@ class BailingMoELinearDecoderLayer(nn.Module):
                 config=config,
                 quant_config=quant_config,
                 prefix=prefix,
-                parallel_group=mlp_parallel_group,
-                reduce_results=False,
+                tp_rank=mlp_tp_rank,
+                tp_size=mlp_tp_size,
             )
         else:
             if is_nextn or self.layer_id >= config.first_k_dense_replace:
@@ -1110,14 +1142,14 @@ class BailingMoELinearDecoderLayer(nn.Module):
                     config=config,
                     quant_config=quant_config,
                     prefix=prefix,
-                    parallel_group=mlp_parallel_group,
-                    reduce_results=False,
+                    tp_rank=mlp_tp_rank,
+                    tp_size=mlp_tp_size,
                 )
         rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-5))
         self.input_layernorm = RMSNorm(self.hidden_size, eps=rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(self.hidden_size, eps=rms_norm_eps)
 
-        self.attn_boundary, self.ffn_boundary = append_stages(
+        self.attn_boundary, self.ffn_boundary = make_stages(
             (
                 declare_attn(),
                 self.input_layernorm,
@@ -1134,6 +1166,12 @@ class BailingMoELinearDecoderLayer(nn.Module):
                 ),
                 self.post_attention_layernorm,
             ),
+            previous=declare_ffn(
+                sparse=is_previous_moe_layer, next_layer_sparse=is_moe_layer
+            )
+            if layer_id != 0
+            else None,
+            terminal=layer_id == (1 if is_nextn else config.num_hidden_layers) - 1,
         )
 
     @torch.inference_mode()
@@ -1175,16 +1213,17 @@ class BailingMoELinearDecoderLayer(nn.Module):
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
 
-        if not (
-            is_dense_ffn_fully_dp()
-            and (not self.is_layer_sparse)
-            and hidden_states.shape[0] == 0
-        ):
-            hidden_states = self.mlp(
-                hidden_states,
-                forward_batch=forward_batch,
-            )
-        hidden_states = self.ffn_boundary.finish(hidden_states, forward_batch)
+        with self.ffn_boundary.exit(forward_batch) as ffn_exit:
+            if not (
+                is_dense_ffn_fully_dp()
+                and (not self.is_layer_sparse)
+                and hidden_states.shape[0] == 0
+            ):
+                hidden_states = self.mlp(
+                    hidden_states,
+                    forward_batch=forward_batch,
+                )
+        hidden_states = ffn_exit.finish(hidden_states)
 
         return hidden_states
 
@@ -1261,9 +1300,11 @@ class BailingMoELinearModel(nn.Module):
                 alt_stream=self.alt_stream,
             )
 
-        self.layers, self.start_layer, self.end_layer = make_pp_layers(
+        self.layers, self.start_layer, self.end_layer = make_layers(
             self.num_layers,
             layer_fn,
+            pp_rank=self.pp_group.rank_in_group,
+            pp_size=self.pp_group.world_size,
             prefix=f"{prefix}.layers",
         )
 
@@ -1384,6 +1425,7 @@ class BailingMoeV3ForCausalLM(nn.Module):
         self.pp_group = get_parallel().pp_group
         self.config = config
         self.quant_config = quant_config
+        self.tp_size = get_parallel().tp_size
 
         # Determine num_fused_shared_experts
         self.determine_num_fused_shared_experts()

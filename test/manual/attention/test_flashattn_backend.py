@@ -62,6 +62,7 @@ class MockModelRunner:
                 "enable_deterministic_inference": False,
             },
         )
+        self.attn_cp_size = 1
         # Create a large enough req_to_token_pool to fit the test usage.
         self.req_to_token_pool = type(
             "TokenPool",

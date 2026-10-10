@@ -40,8 +40,6 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.layers.layer_boundary import layer_stack
-from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import RowParallelLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -76,18 +74,17 @@ class MistralEagleModel(nn.Module):
             config.hidden_size,
             prefix=add_prefix("embed_tokens", prefix),
         )
-        with layer_stack():
-            self.layers = nn.ModuleList(
-                [
-                    LlamaDecoderLayer(
-                        config=config,
-                        layer_id=i,
-                        prefix=add_prefix(f"layers.{i}", prefix),
-                        quant_config=quant_config,
-                    )
-                    for i in range(config.num_hidden_layers)
-                ]
-            )
+        self.layers = nn.ModuleList(
+            [
+                LlamaDecoderLayer(
+                    config=config,
+                    layer_id=i,
+                    prefix=add_prefix(f"layers.{i}", prefix),
+                    quant_config=quant_config,
+                )
+                for i in range(config.num_hidden_layers)
+            ]
+        )
         self.start_layer = 0
         self.end_layer = config.num_hidden_layers
         self.fc = RowParallelLinear(
@@ -123,11 +120,12 @@ class MistralEagleModel(nn.Module):
             )
         )
 
-        residual_batch.start(forward_batch)
+        residual = None
         for layer in self.layers:
-            hidden_states = layer(positions, hidden_states, forward_batch)
-        hidden_states = residual_batch.fold(hidden_states, forward_batch)
-        return residual_batch.take_output(hidden_states, forward_batch)
+            hidden_states, residual = layer(
+                positions, hidden_states, forward_batch, residual
+            )
+        return hidden_states + residual
 
 
 class MistralForCausalLMEagle(LlamaForCausalLMEagle):

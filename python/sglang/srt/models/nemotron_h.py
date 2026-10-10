@@ -38,7 +38,6 @@ from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
-    LinearParallelGroup,
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
@@ -50,6 +49,7 @@ from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     get_moe_a2a_backend,
+    reduce_moe_output,
 )
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
@@ -79,12 +79,12 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.nemotron_h_utils import make_stage_boundary
 from sglang.srt.models.utils import WeightsMapper
-from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.runtime_context import get_exec, get_forward, get_parallel
 from sglang.srt.utils import (
     add_prefix,
     get_current_device_stream_fast,
     is_cuda,
-    make_pp_layers,
+    make_layers,
 )
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.utils import logger
@@ -106,9 +106,9 @@ class NemotronHMLP(nn.Module):
         quant_config: QuantizationConfig | None = None,
         bias: bool = False,
         reduce_results: bool = True,
+        tp_rank: int | None = None,
+        tp_size: int | None = None,
         prefix: str = "",
-        *,
-        parallel_group: LinearParallelGroup = "tp",
     ) -> None:
         super().__init__()
 
@@ -117,7 +117,8 @@ class NemotronHMLP(nn.Module):
             output_size=intermediate_size,
             bias=bias,
             quant_config=quant_config,
-            parallel_group=parallel_group,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
             prefix=f"{prefix}.up_proj",
         )
         self.down_proj = RowParallelLinear(
@@ -126,7 +127,8 @@ class NemotronHMLP(nn.Module):
             bias=bias,
             quant_config=quant_config,
             reduce_results=reduce_results,
-            parallel_group=parallel_group,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
             prefix=f"{prefix}.down_proj",
         )
         self.act_fn = ReLU2()
@@ -172,6 +174,7 @@ class NemotronHMoE(nn.Module):
     ) -> None:
         super().__init__()
 
+        self.tp_size = get_parallel().tp_size
         self.routed_scaling_factor = config.routed_scaling_factor
         self.device_module = torch.get_device_module()
 
@@ -231,7 +234,7 @@ class NemotronHMoE(nn.Module):
                 quant_config=quant_config,
                 reduce_results=False,
                 **(
-                    dict(parallel_group="replicated")
+                    dict(tp_rank=0, tp_size=1)
                     if get_moe_a2a_backend().is_deepep()
                     or get_moe_a2a_backend().is_flashinfer()
                     or get_moe_a2a_backend().is_flashinfer_megamoe()
@@ -363,6 +366,8 @@ class NemotronHMoE(nn.Module):
         elif shared_output is not None:
             final_hidden_states += shared_output
 
+        final_hidden_states = reduce_moe_output(final_hidden_states)
+
         return final_hidden_states.view(num_tokens, hidden_dim)
 
 
@@ -383,8 +388,9 @@ class NemotronHMLPLikeDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
     ):
         hidden_states = self.boundary.prepare(hidden_states, forward_batch)
-        hidden_states = self.mixer.forward(hidden_states)
-        return self.boundary.finish(hidden_states, forward_batch)
+        with self.boundary.exit(forward_batch) as ffn_exit:
+            hidden_states = self.mixer.forward(hidden_states)
+        return ffn_exit.finish(hidden_states)
 
 
 class NemotronHMLPDecoderLayer(NemotronHMLPLikeDecoderLayer):
@@ -415,7 +421,6 @@ class NemotronHMLPDecoderLayer(NemotronHMLPLikeDecoderLayer):
             quant_config=quant_config,
             bias=config.mlp_bias,
             prefix=f"{prefix}.mixer",
-            reduce_results=False,
         )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
@@ -465,8 +470,11 @@ class NemotronHAttnLikeDecoderLayer(nn.Module):
         if forward_batch.forward_mode.is_idle():
             return hidden_states
 
-        hidden_states = self._forward_mixer(hidden_states, forward_batch)
-        return self.boundary.finish(hidden_states, forward_batch)
+        with self.boundary.exit(forward_batch) as mixer_exit:
+            hidden_states = self._forward_mixer(
+                hidden_states, forward_batch, mixer_exit.skips_reduction
+            )
+        return mixer_exit.finish(hidden_states)
 
 
 class NemotronHMambaDecoderLayer(NemotronHAttnLikeDecoderLayer):
@@ -489,7 +497,7 @@ class NemotronHMambaDecoderLayer(NemotronHAttnLikeDecoderLayer):
             rms_norm_eps=config.layer_norm_epsilon,
             activation=config.mamba_hidden_act,
             quant_config=quant_config,
-            reduce_results=False,
+            reduce_results=True,
             prefix=f"{prefix}.mixer",
         )
 
@@ -518,14 +526,19 @@ class NemotronHMambaDecoderLayer(NemotronHAttnLikeDecoderLayer):
         self,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        skip_reduce: bool,
     ) -> torch.Tensor:
         if is_in_breakable_cuda_graph():
             output = torch.empty_like(hidden_states)
-            breakable_nemotron_mamba2_with_output(hidden_states, output, self.layer_id)
+            breakable_nemotron_mamba2_with_output(
+                hidden_states, output, self.layer_id, skip_reduce
+            )
             return output
         if is_in_tc_piecewise_cuda_graph():
             output = torch.empty_like(hidden_states)
-            nemotron_mamba2_with_output(hidden_states, output, self.layer_id)
+            nemotron_mamba2_with_output(
+                hidden_states, output, self.layer_id, skip_reduce
+            )
             return output
         return self._forward_mamba(hidden_states, forward_batch)
 
@@ -540,6 +553,7 @@ class NemotronHAttention(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
+        tp_rank = get_parallel().attn_tp_rank
         tp_size = get_parallel().attn_tp_size
         self.total_num_heads = config.num_attention_heads
         assert self.total_num_heads % tp_size == 0
@@ -569,7 +583,8 @@ class NemotronHAttention(nn.Module):
             self.total_num_kv_heads,
             bias=False,
             quant_config=quant_config,
-            parallel_group="attn_tp",
+            tp_rank=tp_rank,
+            tp_size=tp_size,
             prefix=f"{prefix}.qkv_proj",
         )
         self.o_proj = RowParallelLinear(
@@ -577,8 +592,8 @@ class NemotronHAttention(nn.Module):
             config.hidden_size,
             bias=False,
             quant_config=quant_config,
-            parallel_group="attn_tp",
-            reduce_results=False,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
             use_dp_attention_reduce=is_dp_attention_enabled(),
             prefix=f"{prefix}.o_proj",
         )
@@ -631,6 +646,7 @@ class NemotronHAttentionDecoderLayer(NemotronHAttnLikeDecoderLayer):
         self,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        skip_reduce: bool,
     ) -> torch.Tensor:
         return self.mixer.forward(
             hidden_states=hidden_states, forward_batch=forward_batch
@@ -686,9 +702,11 @@ class NemotronHModel(nn.Module):
             layer_class = ALL_DECODER_LAYER_TYPES[config.hybrid_override_pattern[idx]]
             return layer_class(config, idx, quant_config=quant_config, prefix=prefix)
 
-        self.layers, self.start_layer, self.end_layer = make_pp_layers(
+        self.layers, self.start_layer, self.end_layer = make_layers(
             len(config.hybrid_override_pattern),
             get_layer,
+            pp_rank=self.pp_group.rank_in_group,
+            pp_size=self.pp_group.world_size,
             prefix=f"{prefix}.layers",
         )
         if self.pp_group.is_last_rank:
@@ -1137,6 +1155,7 @@ def nemotron_mamba2_with_output(
     hidden_states: torch.Tensor,
     output: torch.Tensor,
     layer_id: int,
+    fuse_mlp_allreduce: bool = False,
 ) -> None:
     """Split op for Mamba2 forward in piecewise CUDA graph mode."""
     context = get_tc_piecewise_forward_context()
@@ -1156,7 +1175,12 @@ def nemotron_mamba2_with_output(
     if hidden_states.shape[0] != num_actual_tokens:
         hidden_states = hidden_states[:num_actual_tokens]
 
-    ret = mamba_layer._forward_mamba(hidden_states, forward_batch)
+    # This function is an opaque custom op under torch.compile. The caller's
+    # ForwardFlags scope is Python control-plane state and is no longer active
+    # when the compiled graph invokes this implementation. Carry the scalar
+    # across the graph boundary and republish it for RowParallelLinear.
+    with get_forward().scoped(fuse_mlp_allreduce=fuse_mlp_allreduce):
+        ret = mamba_layer._forward_mamba(hidden_states, forward_batch)
 
     # Copy result back; output may be larger (padded) so only fill actual tokens
     output[:num_actual_tokens].view(ret.shape).copy_(ret)

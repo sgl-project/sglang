@@ -166,7 +166,7 @@ export const GLM51Deployment = () => {
     }
 
     if (values.dpattention === 'enabled') {
-      cmd += ` \\\n  --attn-dp-size ${tpValue}`;
+      cmd += ` \\\n  --dp ${tpValue} \\\n  --enable-dp-attention`;
     }
     if (values.reasoning === 'enabled') cmd += ' \\\n  --reasoning-parser glm45';
     if (values.toolcall  === 'enabled') cmd += ' \\\n  --tool-call-parser glm47';

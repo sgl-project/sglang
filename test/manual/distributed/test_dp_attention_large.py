@@ -42,7 +42,8 @@ class TestDPAttentionDP2TP4(
             other_args=[
                 "--trust-remote-code",
                 "--tp=4",
-                "--attn-dp-size=2",
+                "--enable-dp-attention",
+                "--dp=2",
             ],
         )
 
@@ -88,7 +89,8 @@ class TestDPAttentionDP2TP2DeepseekV3MTP(
             "--speculative-draft-model-path",
             DEFAULT_MODEL_NAME_FOR_TEST_MLA_NEXTN,
             "--tp-size=4",
-            "--attn-dp-size=2",
+            "--enable-dp-attention",
+            "--dp-size=2",
         ]
         if not is_in_amd_ci():
             other_args += ["--mem-frac", "0.7"]
@@ -149,7 +151,8 @@ class TestDPAttentionDP2TP4VLM(CustomTestCase):
                 "--trust-remote-code",
                 "--tp",
                 "4",
-                "--attn-dp-size",
+                "--enable-dp-attention",
+                "--dp",
                 "2",
             ],
         )

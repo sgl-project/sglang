@@ -23,9 +23,6 @@ _UNSUPPORTED_CONFIG_FIELDS = (
     "use_qalora",
 )
 _SAFETENSORS_ALPHA_KEYS = ("lora_alpha", "network_alpha", "alpha")
-# diffusers.loaders.lora_base.LORA_ADAPTER_METADATA_KEY
-_DIFFUSERS_METADATA_KEY = "lora_adapter_metadata"
-_DIFFUSERS_TRANSFORMER_PREFIX = "transformer."
 _NATIVE_LORA_A_SUFFIXES = (
     ".lora_A.weight",
     ".lora_down.weight",
@@ -49,53 +46,13 @@ def _has_unambiguous_global_alpha(file: Any) -> bool:
     return len(ranks) == 1
 
 
-def _diffusers_peft_config(metadata: Mapping[str, str]) -> dict[str, Any]:
-    """The transformer's LoraConfig that diffusers' save_lora_weights embeds."""
-    raw = metadata.get(_DIFFUSERS_METADATA_KEY)
-    if raw is None:
-        return {}
-    try:
-        packed = json.loads(raw)
-    except json.JSONDecodeError as error:
-        raise ValueError(
-            f"safetensors metadata {_DIFFUSERS_METADATA_KEY!r} is not valid JSON"
-        ) from error
-    if not isinstance(packed, dict):
-        raise ValueError(
-            f"safetensors metadata {_DIFFUSERS_METADATA_KEY!r} must be a JSON object"
-        )
-    # Keys are "<component>.<field>"; text-encoder sections do not apply to the DiT.
-    prefix = _DIFFUSERS_TRANSFORMER_PREFIX
-    return {
-        name[len(prefix) :]: value
-        for name, value in packed.items()
-        if name.startswith(prefix)
-    }
-
-
-def _load_safetensors_peft_config(weight_path: str) -> dict[str, Any]:
+def _load_safetensors_lora_alpha(weight_path: str) -> int | None:
     if Path(weight_path).suffix.lower() != ".safetensors":
-        return {}
+        return None
     with safe_open(weight_path, framework="pt", device="cpu") as file:
         metadata = file.metadata() or {}
-        global_alpha_is_unambiguous = _has_unambiguous_global_alpha(file)
-    config = _diffusers_peft_config(metadata)
-    if not global_alpha_is_unambiguous:
-        return config
-    metadata_alpha = _declared_global_alpha(metadata)
-    if metadata_alpha is None:
-        return config
-    config_alpha = get_peft_lora_alpha(config)
-    if config_alpha is not None and config_alpha != metadata_alpha:
-        raise ValueError(
-            f"conflicting safetensors LoRA alpha metadata: {_DIFFUSERS_METADATA_KEY} "
-            f"has {config_alpha}, global alpha is {metadata_alpha}"
-        )
-    config["lora_alpha"] = metadata_alpha
-    return config
-
-
-def _declared_global_alpha(metadata: Mapping[str, str]) -> int | None:
+        if not _has_unambiguous_global_alpha(file):
+            return None
     declared = []
     for key in _SAFETENSORS_ALPHA_KEYS:
         value = metadata.get(key)
@@ -124,8 +81,7 @@ def load_peft_config(weight_path: str) -> dict[str, Any]:
             config = json.load(file)
     if not isinstance(config, dict):
         raise ValueError("PEFT adapter_config.json must contain a JSON object")
-    metadata_config = _load_safetensors_peft_config(weight_path)
-    metadata_alpha = get_peft_lora_alpha(metadata_config)
+    metadata_alpha = _load_safetensors_lora_alpha(weight_path)
     config_alpha = get_peft_lora_alpha(config)
     if (
         metadata_alpha is not None
@@ -136,8 +92,8 @@ def load_peft_config(weight_path: str) -> dict[str, Any]:
             "adapter_config.json lora_alpha conflicts with safetensors metadata: "
             f"{config_alpha} != {metadata_alpha}"
         )
-    for name, value in metadata_config.items():
-        config.setdefault(name, value)
+    if metadata_alpha is not None:
+        config.setdefault("lora_alpha", metadata_alpha)
     return config
 
 

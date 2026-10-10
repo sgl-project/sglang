@@ -150,5 +150,8 @@ class KitchenW4A8Config(QuantizationConfig):
             int(marker.get("convrot_groupsize", 256)),
         )
 
+    def get_scaled_act_names(self) -> list[str]:
+        return []
+
     def quantizes_embedding(self, prefix: str) -> bool:
         return is_comfy_int8_embedding(self.layer_markers.get(prefix))

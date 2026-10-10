@@ -18,7 +18,6 @@ import platform
 import tempfile
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import patch
 
 from sglang.srt.runtime_context import get_parallel
@@ -165,10 +164,7 @@ class TestSchedulerProfilerManagerMPS(unittest.TestCase):
             SchedulerProfilerManager,
         )
 
-        with get_parallel().override(
-            tp_group=SimpleNamespace(cpu_group=None), attn_dp_enabled=False
-        ):
-            mgr = SchedulerProfilerManager(get_forward_ct=lambda: 0)
+        mgr = SchedulerProfilerManager(dp_tp_cpu_group=None, get_forward_ct=lambda: 0)
         mgr._init_profile(output_dir, None, None, None, None, None, False, "test")
         return mgr
 
@@ -221,9 +217,7 @@ class TestSchedulerProfilerManagerMPS(unittest.TestCase):
                     torch.mps.profiler, "metal_capture", return_value=capture_ctx
                 ),
                 mock_patch("torch.distributed.barrier"),
-                get_parallel().override(
-                    tp_rank=0, num_dp_ranks=1, pp_size=1, moe_ep_size=1
-                ),
+                get_parallel().override(tp_rank=0, dp_size=1, pp_size=1, moe_ep_size=1),
             ):
                 result = mgr._start_profile()
                 self.assertTrue(result.success, result.message)

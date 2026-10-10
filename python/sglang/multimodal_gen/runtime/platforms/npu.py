@@ -10,6 +10,7 @@ import torch
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.platforms.interface import (
     AttentionBackendEnum,
+    DeviceCapability,
     Platform,
     PlatformEnum,
 )
@@ -51,6 +52,10 @@ class NPUPlatformBase(Platform):
     @classmethod
     def get_local_torch_device(cls) -> torch.device:
         return torch.device(f"npu:{envs.LOCAL_RANK}")
+
+    @classmethod
+    def get_device_capability(cls, device_id: int = 0) -> DeviceCapability:
+        return None
 
     @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
@@ -109,6 +114,10 @@ class NPUPlatformBase(Platform):
             free_gpu_memory = float(tensor.item())
 
         return free_gpu_memory / (1 << 30)
+
+    @classmethod
+    def log_warnings(cls) -> None:
+        pass
 
     @classmethod
     def get_current_memory_usage(
