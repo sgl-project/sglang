@@ -2327,8 +2327,12 @@ def _block_m_for(m: int) -> int:
 
 
 def _num_stages_for(m: int, k: int) -> int:
-    # GB300 verify batches benefit from a smaller shared-memory footprint.
-    if get_platform().is_blackwell and k == 20480 and 64 <= m <= 384:
+    # Blackwell small/medium batches benefit from a smaller shared-memory
+    # footprint; measured on B200 at K=20480: the partial kernel runs
+    # 14.2 -> 5.0 us at M=7 and the pair 22.2 -> 13.2 us (54.9 -> 20.6 us at
+    # M=64). num_stages only reorders memory issue, so the partials are
+    # bitwise unchanged.
+    if get_platform().is_blackwell and k == 20480 and m <= 384:
         return 1
     return _HC_MIX_NUM_STAGES
 
