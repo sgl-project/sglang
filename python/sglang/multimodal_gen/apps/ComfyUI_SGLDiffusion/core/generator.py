@@ -578,6 +578,11 @@ class SGLDiffusionGenerator:
                     raise ValueError(
                         "Checkpoint quantization is encoded in per-layer metadata; do not also set quantization"
                     )
+                raise ValueError(
+                    "Runtime quantization of a floating-point MiniMax H3 file is not "
+                    "supported in ComfyUI integrated mode yet; load a pre-quantized "
+                    "file (e.g. *_int8_convrot) or leave quantization empty"
+                )
 
         pipeline_class_name = self.pipeline_class_dict[model_type]
         worker_model_path = runtime_model_path or detect_path

@@ -498,3 +498,25 @@ def test_single_file_worker_gets_the_dit_backend_and_h3_model_id(monkeypatch) ->
     )
     assert seen["component_attention_backends"] == {"transformer": "fa"}
     assert "model_id" not in seen
+
+
+def test_float_h3_file_runtime_quantization_is_rejected_before_worker_load(
+    tmp_path,
+) -> None:
+    """The ComfyUI H3 file loader builds no quant config for floating-point
+    weights, so a requested runtime quantization was silently ignored."""
+    import pytest
+    import torch
+    from safetensors.torch import save_file
+
+    path = tmp_path / "h3_bf16.safetensors"
+    save_file({"blocks.0.attn.to_q.weight": torch.zeros(1, dtype=torch.bfloat16)}, path)
+    runtime = SGLDiffusionGenerator()
+    runtime.get_comfyui_model = lambda *a: (SimpleNamespace(), None, "minimax_h3")
+    runtime.init_generator = lambda *a: (_ for _ in ()).throw(
+        AssertionError("worker must not start")
+    )
+    with pytest.raises(ValueError, match="Runtime quantization of a floating-point"):
+        runtime.load_model(
+            model_path=str(path), sgld_options={"quantization": "convrot_int8"}
+        )
