@@ -911,6 +911,17 @@ class SGLDiffusionServerSetLora:
                         "tooltip": "Which transformer(s) to apply the LoRA to",
                     },
                 ),
+                "strength": (
+                    "FLOAT",
+                    {
+                        "default": 1.0,
+                        "min": 0.0,
+                        "max": 10.0,
+                        "step": 0.01,
+                        "tooltip": "LoRA merge strength; the server's own "
+                        "default is 1.0",
+                    },
+                ),
             },
         }
 
@@ -926,6 +937,7 @@ class SGLDiffusionServerSetLora:
         lora_name: str = "",
         lora_nickname: str = "",
         target: str = "all",
+        strength: float = 1.0,
     ):
         """Set LoRA adapter using SGLang Diffusion API."""
         if lora_nickname == "":
@@ -936,6 +948,7 @@ class SGLDiffusionServerSetLora:
             "lora_nickname": lora_nickname,
             "lora_path": lora_name,
             "target": target,
+            "strength": strength,
         }
 
         # Call API

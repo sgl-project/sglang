@@ -475,3 +475,34 @@ def test_get_image_path_accepts_single_image():
     os.remove(path)
 
 
+# --- Bug 11: LoRA strength could not be set in server mode -----------------
+
+
+def test_set_lora_sends_strength_to_server():
+    client = SGLDiffusionServerAPI(base_url="http://127.0.0.1:1234")
+    captured = {}
+
+    def fake_post(url, json=None, headers=None, timeout=None, **kwargs):
+        captured.update(json)
+        return _Response({"status": "ok"})
+
+    with mock.patch(f"{PKG}.core.server_api.requests.post", side_effect=fake_post):
+        client.set_lora(lora_nickname="style", lora_path="style.safetensors", strength=0.7)
+
+    assert captured["strength"] == 0.7
+
+
+def test_set_lora_node_exposes_strength(monkeypatch):
+    client = SGLDiffusionServerAPI(base_url="http://127.0.0.1:1234")
+    node = NODES.SGLDiffusionServerSetLora()
+    captured = {}
+
+    def fake_set_lora(**kwargs):
+        captured.update(kwargs)
+        return {"status": "ok"}
+
+    monkeypatch.setattr(client, "set_lora", fake_set_lora)
+    node.set_lora(sgld_client=client, lora_name="style.safetensors", strength=0.5)
+    assert captured["strength"] == 0.5
+
+
