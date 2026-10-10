@@ -1588,8 +1588,8 @@ class Envs:
     SGLANG_DSV4_DECODER_REPLAY_GRAPH_MAX_ROWS = EnvInt(2048)
     # Eager prefill steps run the full-width layers before the decoder-replay tail
     # from CUDA graphs captured at startup per 256-token bucket up to this many
-    # tokens; 0 keeps them eager.
-    SGLANG_DSV4_FULL_LAYER_GRAPH_MAX_TOKENS = EnvInt(0)
+    # tokens; 0 keeps them eager, -1 = the chunked prefill size, at most 8192.
+    SGLANG_DSV4_FULL_LAYER_GRAPH_MAX_TOKENS = EnvInt(-1)
     # Debug only: the full-layer graphs stop before this layer (0 = the decoder tail).
     SGLANG_DSV4_FULL_LAYER_GRAPH_END = EnvInt(0)
     # Eager replay graphs: skip pad-row zeroing in the attention break and reuse one

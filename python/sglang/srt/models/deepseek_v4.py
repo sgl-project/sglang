@@ -196,6 +196,7 @@ from sglang.srt.runtime_context import (
     get_forward,
     get_parallel,
     get_platform,
+    get_schedule,
 )
 from sglang.srt.utils import (
     LazyValue,
@@ -3867,6 +3868,21 @@ def _scatter_tail_rows(
     return full
 
 
+# Each 256-token bucket took about 0.39 GiB per GPU on GB300 TP4 (32 buckets: 12.6 GiB).
+_FULL_LAYER_GRAPH_DEFAULT_MAX_TOKENS = 8192
+
+
+def _full_layer_graph_max_tokens() -> int:
+    tokens = envs.SGLANG_DSV4_FULL_LAYER_GRAPH_MAX_TOKENS.get()
+    if tokens >= 0:
+        return tokens
+    # Default: cover every chunk-sized eager step, capped to bound capture memory.
+    chunk = get_schedule().chunked_prefill_size
+    if chunk is None or chunk <= 0:
+        return _FULL_LAYER_GRAPH_DEFAULT_MAX_TOKENS
+    return min(chunk, _FULL_LAYER_GRAPH_DEFAULT_MAX_TOKENS)
+
+
 class DeepseekV4Model(nn.Module):
     fall_back_to_pt_during_load = False
 
@@ -4003,7 +4019,7 @@ class DeepseekV4Model(nn.Module):
         self.decoder_replay_graphs: Optional[EagerReplayGraphs] = None
         self.full_layer_graphs: Optional[EagerReplayGraphs] = None
         tail_rows = envs.SGLANG_DSV4_DECODER_REPLAY_GRAPH_MAX_ROWS.get()
-        full_tokens = envs.SGLANG_DSV4_FULL_LAYER_GRAPH_MAX_TOKENS.get()
+        full_tokens = _full_layer_graph_max_tokens()
         if self.late_layer_start is not None and not _is_hip:
             if tail_rows > 0:
                 self.decoder_replay_graphs = EagerReplayGraphs(
