@@ -868,6 +868,122 @@ class CompressorAscendBackendMixin:
             except Exception as _exc:
                 print(f"[C4STP] post skipped: {_exc}", flush=True)
 
+        # S222: [C4DEC] DECISIVE one-line discriminator between the three
+        # microscopic root causes of the block136 last-2 (pos 17534/17535)
+        # HIT!=MISS c4-indexer state divergence. Emitted ONCE per PREFILL call
+        # that actually covers 17534/17535, INDEXER compressor (idx=1) only:
+        #   (beta)  K-split       : kBaseNum (K reduction order) differs by call
+        #           shape (full miss vs suffix hit).
+        #   (alpha) read-misalign : the state rows the kernel ACTUALLY reads at
+        #           the carry positions differ. col = hist + (p - start_pos),
+        #           the SAME formula the kernel's ReadFromCacheState uses; this
+        #           is exactly the [C4STP] rows, but bundled per-call so the
+        #           miss/hit LIST diffs directly.
+        #   (gamma) write/table   : kBaseNum + rdcarry identical, only the
+        #           produced index-K (cmp_kv tail blocks 4382/4383) differs.
+        # Decision rules (see README 222):
+        #   kBaseNum differs                       -> (beta) K-split.
+        #   kBaseNum same, rdcarry rows differ     -> (alpha) read-misalign.
+        #   kBaseNum+rdcarry same, idxK differs    -> (gamma) write path.
+        # Env DSV4_DUMP_C4DEC = layer id or "all"; optional SGLANG_DSV4_AIC_NUM
+        # resolves kBaseNum exactly (else the branch discriminator is emitted).
+        _want_dec = os.environ.get("DSV4_DUMP_C4DEC")
+        _c4dec_on = (
+            bool(_want_dec)
+            and (_want_dec in ("all", "") or _want_dec == str(compressor.layer_id))
+            and bool(compressor.is_in_indexer)
+        )
+        if _c4dec_on:
+            try:
+                import hashlib as _hld
+
+                _hist = coff * ratio
+                _width = int(state_block_table.shape[1])
+                _sp = fm.start_pos.reshape(-1).to(torch.int64).cpu()
+                _su = fm.seqused.reshape(-1).to(torch.int64).cpu()
+                _sp_l = _sp.tolist()
+                _su_l = _su.tolist()
+                if any(
+                    int(_sp_l[_b]) <= 17534 < int(_sp_l[_b]) + int(_su_l[_b])
+                    for _b in range(len(_sp_l))
+                ):
+                    _tbl_cpu = (
+                        state_block_table.detach().to("cpu").to(torch.int64)
+                    )
+                    _flat = (
+                        state_cache.reshape(-1, state_cache.shape[-1])
+                        .detach()
+                        .to("cpu")
+                    )
+                    _rows_n = _flat.shape[0]
+                    # (1) kbase: SplitK shape (mBaseSize=256, dBaseSize=64).
+                    _tok = int(_su.sum())
+                    _m_base = (_tok + 255) // 256
+                    _hd = getattr(compressor, "head_dim", None)
+                    _dbase = (int(_hd) // 64) if _hd else -1
+                    _disc = _dbase * _m_base if _dbase > 0 else -1
+                    _aic = int(os.environ.get("SGLANG_DSV4_AIC_NUM", "0"))
+                    if _aic > 0 and _dbase > 0:
+                        _kb_txt = str(1 if _disc >= _aic else _aic // _dbase)
+                    else:
+                        _kb_txt = "1if>=usedCoreNum_else_split"
+                    _kbase_col = (
+                        f"mBaseNum={_m_base}/kBaseNum={_kb_txt} "
+                        f"raw_tok={_tok} headDim={_hd} dBaseNum={_dbase} "
+                        f"discr={_disc}"
+                    )
+                    # (2) rdcarry: rows the kernel reads for carry 17528..17533.
+                    _rc = []
+                    for _p in range(17528, 17534):
+                        for _b in range(_tbl_cpu.shape[0]):
+                            _idx = _hist + (_p - int(_sp_l[_b]))
+                            if _idx < 0 or _idx >= _width:
+                                continue
+                            _sl = int(_tbl_cpu[_b, _idx])
+                            if _sl < 0 or _sl >= _rows_n:
+                                continue
+                            _row = _flat[_sl].to(torch.float32)
+                            _h = _hld.md5(
+                                _row.numpy().tobytes()
+                            ).hexdigest()[:8]
+                            _rc.append(f"{_p}={_sl}:{_h}")
+                    _rdcarry_col = "[" + ",".join(_rc) + "]"
+                    # (3) idxK: produced index-K for global blocks 4382/4383
+                    #     (== cmp_kv[-2]/[-1] in BOTH miss and suffix hit, both
+                    #     ending at 17536). Read AFTER sync (timing pitfall).
+                    try:
+                        torch.npu.synchronize()
+                    except Exception:
+                        pass
+                    _ik = []
+                    _ck = cmp_kv.detach().to(torch.float32).cpu()
+                    if _ck.shape[0] >= 2:
+                        for _bid, _ri in ((4382, -2), (4383, -1)):
+                            _row = _ck[_ri].reshape(-1)
+                            _h = _hld.md5(
+                                _row.numpy().tobytes()
+                            ).hexdigest()[:8]
+                            _v0 = float(_row[0]) if _row.numel() else 0.0
+                            _sum = float(_row.sum())
+                            _am = (
+                                float(_row.abs().max())
+                                if _row.numel()
+                                else 0.0
+                            )
+                            _ik.append(
+                                f"{_bid}:{_h}:v0={_v0:.4e}:sum={_sum:.4e}:"
+                                f"am={_am:.4e}"
+                            )
+                    _idxk_col = "[" + ",".join(_ik) + "]"
+                    print(
+                        f"[C4DEC] layer={compressor.layer_id} idx=1 "
+                        f"start={_sp_l} kbase={_kbase_col} "
+                        f"rdcarry={_rdcarry_col} idxK={_idxk_col}",
+                        flush=True,
+                    )
+            except Exception as _exc:
+                print(f"[C4DEC] skipped: {_exc}", flush=True)
+
         # prefill output may be padded; trim to loc length
         loc = getattr(fm, f"c{ratio}_loc", None)
         is_prefill = (
