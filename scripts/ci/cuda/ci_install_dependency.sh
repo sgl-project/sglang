@@ -67,7 +67,7 @@ configure_environment() {
     uv --version
 
     SYS_PYTHON_VER=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
-    # Set to empty to install into the system Python whatever its version.
+    # Set to empty to install into the system Python, which must then be >= 3.11.
     CI_PYTHON_VER="${SGLANG_CI_PYTHON-3.12}"
     echo "SGLANG_CI_PYTHON=${CI_PYTHON_VER} (system python ${SYS_PYTHON_VER})"
 
@@ -75,7 +75,12 @@ configure_environment() {
     UV_VENV_COMPLETE_MARKER=""
     if [ "$USE_VENV" = "1" ]; then
         UV_VENV="/tmp/sglang-ci-${GITHUB_RUN_ID:-norun}-${GITHUB_JOB:-nojob}-$$"
-        uv venv "$UV_VENV" --python "python${SYS_PYTHON_VER}" --seed
+        if [ -n "$CI_PYTHON_VER" ]; then
+            uv python install --upgrade "$CI_PYTHON_VER" --python-preference only-managed
+            uv venv "$UV_VENV" --python "$CI_PYTHON_VER" --python-preference only-managed --seed
+        else
+            uv venv "$UV_VENV" --python "python${SYS_PYTHON_VER}" --seed
+        fi
     elif [ -n "$CI_PYTHON_VER" ] && [ "$SYS_PYTHON_VER" != "$CI_PYTHON_VER" ]; then
         # Kept across jobs so installs stay incremental and path-keyed JIT caches hit.
         UV_VENV="/opt/sglang-ci-py${CI_PYTHON_VER}"
