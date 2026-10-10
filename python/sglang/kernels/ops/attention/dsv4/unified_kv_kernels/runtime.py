@@ -282,6 +282,198 @@ def _decode_fp8_tail_splits(T: int, compress_ratio: Optional[int]) -> int:
     return max(1, min(_DECODE_SPLIT_TAIL_VALUE, _cu_count() // T))
 
 
+# ---------------------------------------------------------------------------
+# Split plan from aiter's v4 nm latency model (ROCm/aiter#6126, ATOM#2462)
+# ---------------------------------------------------------------------------
+# t(i) ~= L + W(i) * (C + A * kv_len / i) + [i > 1] * (S + D * num_seqs * i),
+# W(i) = ceil(num_seqs * ceil(H / 64) * i / CU). The gfx950 fit is aiter's
+# (gqa=128, qSeqLen=1, graph replay, uniform KV). Used only when the installed
+# aiter predates get_mla_v4_nm_num_kv_splits.
+_V4_NM_SPLIT_COST = {"gfx950": (12.74, 3.21, 0.0300, 3.38, 0.076)}
+V4_NM_MAX_SPLITS = 16
+# rows the constant split table covers; the asm wraps byte offsets past 32768
+V4_NM_SPLIT_TABLE_ROWS = 32768
+
+
+def _ported_num_kv_splits(
+    num_seqs: int, num_heads: int, kv_len: int, gfx: str, cu_num: int
+) -> Optional[int]:
+    cost = _V4_NM_SPLIT_COST.get(gfx)
+    if cost is None:
+        return None
+    L, C, A, S, D = cost
+    tg_factor = max(1, -(-num_heads // 64))
+    kv_len = max(1, kv_len)
+    best_t, best_s = None, 1
+    for s in range(1, V4_NM_MAX_SPLITS + 1):
+        waves = -(-num_seqs * tg_factor * s // cu_num)
+        t = L + waves * (C + A * kv_len / s)
+        if s > 1:
+            t += S + D * num_seqs * s
+        if best_t is None or t < best_t:
+            best_t, best_s = t, s
+    return best_s
+
+
+@lru_cache(maxsize=None)
+def fp8_decode_num_kv_splits(
+    num_seqs: int, num_heads: int, kv_len: int
+) -> Optional[int]:
+    """aiter's latency-model split count for ``mla_decode_fwd_v4_nm``, or None
+    (no model for this arch: keep the existing pick). Host only, cached: the
+    inputs are fixed per captured graph, so capture and replay agree."""
+    try:
+        from aiter.mla import get_mla_v4_nm_num_kv_splits
+    except ImportError:
+        get_mla_v4_nm_num_kv_splits = None
+    if get_mla_v4_nm_num_kv_splits is not None:
+        return int(get_mla_v4_nm_num_kv_splits(num_seqs, num_heads, kv_len))
+    from aiter.jit.utils.chip_info import get_gfx
+
+    return _ported_num_kv_splits(num_seqs, num_heads, kv_len, get_gfx(), _cu_count())
+
+
+_split_tables: dict = {}
+
+
+def fp8_decode_split_table(device: torch.device) -> Optional[torch.Tensor]:
+    """``[V4_NM_MAX_SPLITS, V4_NM_SPLIT_TABLE_ROWS + 1]`` int32, row ``s - 1``
+    the uniform ``split_indptr`` ``[0, s, 2s, ...]``. Built once per device
+    outside capture and never written again, so every plan is a slice of
+    constant memory (no per-layer arange). None if it would be built under
+    capture: that graph keeps the wrapper's own pick."""
+    device = torch.device(device)
+    key = device.index if device.index is not None else torch.cuda.current_device()
+    table = _split_tables.get(key)
+    if table is None:
+        if torch.cuda.is_current_stream_capturing():
+            return None
+        splits = torch.arange(1, V4_NM_MAX_SPLITS + 1, dtype=torch.int32, device=device)
+        table = splits[:, None] * torch.arange(
+            V4_NM_SPLIT_TABLE_ROWS + 1, dtype=torch.int32, device=device
+        )
+        _split_tables[key] = table
+    return table
+
+
+def fp8_decode_split_plan(
+    n_seq: int, num_heads: int, kv_len_hint: int, device: torch.device
+) -> Optional[Tuple[int, torch.Tensor]]:
+    """(num_kv_splits, split_indptr) from the latency model, or None."""
+    if n_seq > V4_NM_SPLIT_TABLE_ROWS:
+        return None
+    s = fp8_decode_num_kv_splits(n_seq, num_heads, int(kv_len_hint))
+    if s is None:
+        return None
+    table = fp8_decode_split_table(device)
+    if table is None:
+        return None
+    return s, table[s - 1, : n_seq + 1]
+
+
+# ---------------------------------------------------------------------------
+# HCA persistent decode (aiter mla_decode_fwd_v4_nm_ps, ROCm/aiter#6126)
+# ---------------------------------------------------------------------------
+HCA_PS_HEADS = 128
+HCA_PS_MAX_ROWS = 32768
+HCA_PS_PARTITIONS = 128
+_hca_ps_workspaces: dict = {}
+
+
+def _hca_ps_api():
+    try:
+        from aiter.mla import get_mla_v4_nm_ps_workspace, mla_decode_fwd_v4_nm_ps
+    except ImportError:
+        return None
+    return get_mla_v4_nm_ps_workspace, mla_decode_fwd_v4_nm_ps
+
+
+def _dev_key(device) -> int:
+    device = torch.device(device)
+    return device.index if device.index is not None else torch.cuda.current_device()
+
+
+def prepare_fp8_hca_persist(device, num_heads: int) -> bool:
+    """Allocate this device's persistent-decode workspace (~64 MiB) when the
+    switch is on and the kernel can serve this rank. Call outside capture,
+    before warmup; idempotent. One workspace per device is enough because
+    every decode layer runs on the forward's compute stream in order."""
+    from sglang.srt.environ import envs
+    from sglang.srt.utils import is_gfx95_supported
+
+    if not envs.SGLANG_DSV4_FP8_HCA_PERSIST.get() or num_heads != HCA_PS_HEADS:
+        return False
+    if not is_gfx95_supported():
+        return False
+    key = _dev_key(device)
+    if key in _hca_ps_workspaces:
+        return True
+    api = _hca_ps_api()
+    if api is None or torch.cuda.is_current_stream_capturing():
+        return False
+    _hca_ps_workspaces[key] = api[0](
+        torch.device("cuda", key), num_partitions=HCA_PS_PARTITIONS
+    )
+    return True
+
+
+def fp8_hca_persist_wanted(
+    *,
+    T: int,
+    H: int,
+    v_head_dim: int,
+    compress_ratio: Optional[int],
+    max_seqlen_q: int,
+    per_token: bool,
+    device,
+) -> bool:
+    from sglang.srt.environ import envs
+
+    if not (
+        compress_ratio == 128
+        and H == HCA_PS_HEADS
+        and v_head_dim == 512
+        and max_seqlen_q == 1
+        and per_token
+        and envs.SGLANG_DSV4_FP8_HCA_PERSIST.get()
+        and envs.SGLANG_DSV4_FP8_HCA_PERSIST_MIN_ROWS.get() <= T <= HCA_PS_MAX_ROWS
+    ):
+        return False
+    # eager calls may allocate it late; a graph captured without one keeps asm
+    return prepare_fp8_hca_persist(device, H)
+
+
+def decode_fp8_hca_ps(
+    *,
+    q: torch.Tensor,  # [T, 128, 512] fp8 packed
+    q_rope: torch.Tensor,  # [T, 128, 64] bf16
+    unified_kv: torch.Tensor,
+    unified_kv_rope: torch.Tensor,
+    kv_indices: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    attn_sink: torch.Tensor,
+) -> torch.Tensor:
+    """One-launch HCA decode: the kernel plans the split from ``kv_indptr`` on
+    the GPU and merges the partials itself. Rows with an empty KV range are
+    left unwritten (the builders never emit one; see decode_fp8_2buff)."""
+    T = q.shape[0]
+    out = q_rope.new_empty((T, HCA_PS_HEADS, 512))
+    if T == 0:
+        return out
+    _hca_ps_api()[1](
+        q,
+        q_rope,
+        unified_kv,
+        unified_kv_rope,
+        kv_indptr[: T + 1],
+        kv_indices,
+        attn_sink,
+        _hca_ps_workspaces[_dev_key(q.device)],
+        out=out,
+    )
+    return out
+
+
 @lru_cache(maxsize=1)
 def _flydsl_v4_decode():
     """aiter.ops.flydsl when it ships the FlyDSL v4 nm decode, else None."""
@@ -302,9 +494,14 @@ def flydsl_decode_supported(
     num_heads: int, max_seqlen_q: int = 1, grouped: bool = False
 ) -> bool:
     fly = _flydsl_v4_decode()
-    return fly is not None and fly.flydsl_mla_v4_decode_supported(
-        num_heads, max_seqlen_q, grouped
-    )
+    if fly is None:
+        return False
+    if num_heads == 128:
+        from sglang.srt.environ import envs
+
+        if not envs.SGLANG_DSV4_FLYDSL_DECODE_H128.get():
+            return False
+    return fly.flydsl_mla_v4_decode_supported(num_heads, max_seqlen_q, grouped)
 
 
 def _stream_hint(compress_ratio: Optional[int]) -> Optional[str]:
@@ -351,9 +548,16 @@ def decode_fp8_2buff(
     num_kv_splits: Optional[int] = None,
     compress_ratio: Optional[int] = None,
     q_kv_bounds: Optional[torch.Tensor] = None,
+    kv_len_hint: Optional[int] = None,
 ) -> torch.Tensor:
     """Decode over the two-pool fp8 unified_kv, through aiter's FlyDSL v4 nm
     decode (split merge in the same launch) where available, else the asm kernel.
+
+    On the asm kernel, with ``SGLANG_DSV4_FP8_HCA_PERSIST`` the HCA stream
+    (H128, one q row per sequence) takes the persistent kernel, and with
+    ``SGLANG_DSV4_FP8_DECODE_SPLIT_MODEL`` plus ``kv_len_hint`` (the longest
+    KV a row of this stream can see, fixed per server) the split count comes
+    from aiter's latency model with a constant ``split_indptr``.
 
     Q arrives in the same packed form as the pool rows (nope fp8 + duplicated
     e8m0 tile scales) with its rope half beside it in bf16, which is why this
@@ -416,6 +620,32 @@ def decode_fp8_2buff(
         kwargs = dict(hint=_stream_hint(compress_ratio), q_kv_bounds=q_kv_bounds)
     else:
         assert q_kv_bounds is None, "grouped verify streams need FlyDSL"
+        if fp8_hca_persist_wanted(
+            T=T,
+            H=H,
+            v_head_dim=v_head_dim,
+            compress_ratio=compress_ratio,
+            max_seqlen_q=max_seqlen_q,
+            per_token=n_seq == T,
+            device=q.device,
+        ):
+            return decode_fp8_hca_ps(
+                q=q,
+                q_rope=q_rope,
+                unified_kv=unified_kv,
+                unified_kv_rope=unified_kv_rope,
+                kv_indices=kv_indices,
+                kv_indptr=kv_indptr,
+                attn_sink=attn_sink,
+            )
+        split_indptr = None
+        if num_kv_splits is None and kv_len_hint is not None:
+            from sglang.srt.environ import envs
+
+            if envs.SGLANG_DSV4_FP8_DECODE_SPLIT_MODEL.get():
+                plan = fp8_decode_split_plan(n_seq, H, kv_len_hint, q.device)
+                if plan is not None:
+                    num_kv_splits, split_indptr = plan
         # Left None, the wrapper's occupancy heuristic picks it, folds the
         # cross-split merge back into `out`, and leaves the final bf16 there
         # whether or not it split. Pinning it to 1 costs 6.9x at bs=1 kv=2048.
@@ -424,7 +654,10 @@ def decode_fp8_2buff(
         # the per-token path and differ once q rows share a tile.
         if num_kv_splits is None and n_seq > _DECODE_SPLIT_TAIL_MIN_TOKENS:
             num_kv_splits = _decode_fp8_tail_splits(n_seq, compress_ratio)
-        decode_fwd, kwargs = mla_decode_fwd_v4_nm, dict(num_kv_splits=num_kv_splits)
+        decode_fwd, kwargs = (
+            mla_decode_fwd_v4_nm,
+            dict(num_kv_splits=num_kv_splits, split_indptr=split_indptr),
+        )
     decode_fwd(
         q,
         q_rope,

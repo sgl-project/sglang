@@ -15,6 +15,7 @@ file is a test, not part of the aiter package.
 """
 
 import contextlib
+import functools
 import itertools
 import unittest
 from unittest import mock
@@ -23,6 +24,7 @@ import torch
 
 from sglang.kernels.ops.attention.dsv4 import fused_rope_inplace
 from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import runtime
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DSV4_FP8_NOPE_ROW_BYTES
 from sglang.srt.models.deepseek_common.amd import deepseek_v4_wo_a_fp8 as wo_a_fp8
 from sglang.srt.utils import is_gfx95_supported, is_hip
@@ -48,6 +50,26 @@ _needs_gfx950 = unittest.skipUnless(
     torch.cuda.is_available() and is_hip() and is_gfx95_supported(),
     "two-pool fp8 decode runs on the gfx950 asm shader",
 )
+
+
+_SPLIT_MODEL_ONLY = dict(
+    SGLANG_DSV4_FP8_DECODE_SPLIT_MODEL=True, SGLANG_DSV4_FP8_HCA_PERSIST=False
+)
+_PS_ONLY = dict(
+    SGLANG_DSV4_FP8_DECODE_SPLIT_MODEL=False, SGLANG_DSV4_FP8_HCA_PERSIST=True
+)
+
+
+@contextlib.contextmanager
+def _asm_env(**env):
+    """asm decode (FlyDSL off) with the given switches"""
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(
+            mock.patch.object(runtime, "_flydsl_v4_decode", lambda: None)
+        )
+        for name, value in env.items():
+            stack.enter_context(getattr(envs, name).override(value))
+        yield
 
 
 def _pow2_ceil_scale(amax: torch.Tensor) -> torch.Tensor:
@@ -158,7 +180,8 @@ class TestUnifiedFp8Decode(CustomTestCase):
         with (
             mock.patch.object(runtime, "_flydsl_v4_decode", lambda: None)
             if asm
-            else contextlib.nullcontext()
+            # FlyDSL at H128 is opt-in; cover it here
+            else envs.SGLANG_DSV4_FLYDSL_DECODE_H128.override(True)
         ):
             got = runtime.decode_fp8_2buff(
                 q=q_packed,
@@ -371,6 +394,135 @@ class TestUnifiedFp8Decode(CustomTestCase):
         self.assertGreater(len(lengths), 40)
         got, want = self._run(lengths, num_heads=16, asm=True)
         self._assert_close(got, want)
+
+    def test_ported_split_model_matches_aiter(self):
+        """the port is aiter's gfx950 model verbatim; where aiter ships the
+        helper the two agree on every shape, else pin known picks"""
+        port = functools.partial(runtime._ported_num_kv_splits, gfx="gfx950")
+        known = {(24, 1152): 4, (48, 1152): 2, (96, 1152): 1, (192, 1152): 1}
+        for (n, kv), s in known.items():
+            self.assertEqual(port(n, 128, kv, cu_num=256), s, (n, kv))
+        self.assertIsNone(runtime._ported_num_kv_splits(96, 128, 1152, "gfx942", 304))
+        try:
+            from aiter.mla import get_mla_v4_nm_num_kv_splits
+        except ImportError:
+            return
+        if not (torch.cuda.is_available() and is_gfx95_supported()):
+            return
+        cu = runtime._cu_count()
+        for n, h, kv in itertools.product(
+            (1, 7, 24, 48, 96, 128, 192, 384), (16, 128), (128, 1152, 1690, 8320)
+        ):
+            self.assertEqual(
+                port(n, h, kv, cu_num=cu), get_mla_v4_nm_num_kv_splits(n, h, kv)
+            )
+
+    def _run_plan(self, lengths, num_heads, kv_len_hint, compress_ratio, **env):
+        T = len(lengths)
+        rows = max(self.rows, max(lengths) + 1)
+        pool_nope, pool_rope, kv_silver = _make_latent(rows)
+        q_packed, q_rope, q_silver = _make_latent(T, num_heads)
+        indices, indptr = _ragged(lengths, rows)
+        sink = torch.randn(num_heads, device=DEVICE, dtype=torch.float32)
+        kw = dict(
+            q=q_packed,
+            q_rope=q_rope,
+            unified_kv=pool_nope,
+            unified_kv_rope=pool_rope,
+            kv_indices=indices,
+            kv_indptr=indptr,
+            attn_sink=sink,
+            v_head_dim=V_HEAD_DIM,
+            compress_ratio=compress_ratio,
+            kv_len_hint=kv_len_hint,
+        )
+        with _asm_env(**env):
+            got = runtime.decode_fp8_2buff(**kw)
+        want = _reference(q_silver, kv_silver, indices, indptr, sink)
+        return got.float(), want, kw
+
+    @_needs_gfx950
+    def test_cost_model_split_plan_matches_reference(self):
+        """H128 DP-attention rows, CSA/SWA-shaped KV, the split count from the
+        latency model and a slice of the constant split table"""
+        gen = torch.Generator().manual_seed(3)
+        for T, (cr, hint) in itertools.product(
+            (24, 48, 96, 128, 192), ((4, 1152), (0, 128))
+        ):
+            lengths = torch.randint(1, hint + 1, (T,), generator=gen).tolist()
+            with self.subTest(T=T, compress_ratio=cr):
+                plan = runtime.fp8_decode_split_plan(T, 128, hint, DEVICE)
+                self.assertIsNotNone(plan)
+                s, split_indptr = plan
+                self.assertTrue(
+                    torch.equal(
+                        split_indptr.cpu(),
+                        torch.arange(T + 1, dtype=torch.int32) * s,
+                    )
+                )
+                got, want, _ = self._run_plan(
+                    lengths, 128, hint, cr, **_SPLIT_MODEL_ONLY
+                )
+                self._assert_close(got, want)
+
+    @_needs_gfx950
+    def test_constant_split_table_graph_replay(self):
+        """capture with the plan, rewrite the KV ranges, replay: matches eager"""
+        T, hint = 96, 1152
+        lengths = [hint - 7 * i for i in range(T)]
+        _, _, kw = self._run_plan(lengths, 128, hint, 4, **_SPLIT_MODEL_ONLY)
+        self._graph_replay_matches_eager(kw, **_SPLIT_MODEL_ONLY)
+
+    def _graph_replay_matches_eager(self, kw, **env):
+        with _asm_env(**env):
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                runtime.decode_fp8_2buff(**kw)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                captured = runtime.decode_fp8_2buff(**kw)
+            # new, shorter ragged ranges in the same buffers
+            indptr = kw["kv_indptr"]
+            T = indptr.numel() - 1
+            shortest = int((indptr[1:] - indptr[:-1]).min())
+            new_len = torch.randint(1, shortest + 1, (T,), device=DEVICE)
+            indptr[1:] = torch.cumsum(new_len, 0).to(torch.int32)
+            graph.replay()
+            torch.cuda.synchronize()
+            eager = runtime.decode_fp8_2buff(**kw)
+        self._assert_close(captured.float(), eager.float(), atol=1e-2, rtol=1e-2)
+
+    @_needs_gfx950
+    @unittest.skipUnless(runtime._hca_ps_api() is not None, "aiter has no v4 nm ps")
+    def test_hca_persistent_matches_reference(self):
+        """H128 HCA rows on the persistent kernel: uneven KV (AgentX-like
+        dispersion), including cuda-graph pad rows of length 1"""
+        gen = torch.Generator().manual_seed(5)
+        for T in (16, 96, 192):
+            lengths = torch.randint(129, 1700, (T,), generator=gen).tolist()
+            lengths[-3:] = [1, 1, 1]
+            with self.subTest(T=T):
+                got, want, _ = self._run_plan(lengths, 128, 1690, 128, **_PS_ONLY)
+                self.assertIn(runtime._dev_key(DEVICE), runtime._hca_ps_workspaces)
+                self._assert_close(got, want)
+
+    @_needs_gfx950
+    @unittest.skipUnless(runtime._hca_ps_api() is not None, "aiter has no v4 nm ps")
+    def test_hca_persistent_graph_replay_varying_kv(self):
+        lengths = [1690 - 11 * i for i in range(128)]
+        _, _, kw = self._run_plan(lengths, 128, 1690, 128, **_PS_ONLY)
+        self._graph_replay_matches_eager(kw, **_PS_ONLY)
+
+    @_needs_gfx950
+    @unittest.skipUnless(runtime._hca_ps_api() is not None, "aiter has no v4 nm ps")
+    def test_hca_persistent_matches_split_kernel(self):
+        """same inputs, ps vs the asm split kernel"""
+        lengths = [1500, 300, 129, 1690, 1] * 20
+        got_ps, _, kw = self._run_plan(lengths, 128, 1690, 128, **_PS_ONLY)
+        with _asm_env(SGLANG_DSV4_FP8_HCA_PERSIST=False):
+            got_asm = runtime.decode_fp8_2buff(**kw).float()
+        self._assert_close(got_ps, got_asm, atol=1e-2, rtol=1e-2)
 
     @_needs_gfx950
     def test_rejects_pool_that_is_not_a_pair(self):

@@ -1004,6 +1004,8 @@ class DeepseekV4HipRadixBackend(
             if any(getattr(m, "wo_a_fp8", False) for m in model_runner.model.modules())
             else "bf16"
         )
+        self._fp8_split_kv_hint: Dict[int, int] = {}
+        self._init_fp8_asm_decode_plan()
         # Past MAX_FUSED_ROWS the fp4 schedule falls back to AITER's preamble,
         # which frees the scratch its kernels read -- not capture-safe.
         self._fp4_graph_row_limit: Optional[int] = None
@@ -2443,6 +2445,37 @@ class DeepseekV4HipRadixBackend(
         if current_raw is not None:
             self.forward_metadata = current_raw
 
+    def _init_fp8_asm_decode_plan(self) -> None:
+        """fp8 unified_kv asm decode: per-stream KV bound for the split plan
+        and, at init (outside capture, before warmup), the constant split
+        table and the HCA persistent workspace."""
+        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+            is_unified_kv_fp8,
+        )
+
+        if self.is_draft_worker or not is_unified_kv_fp8():
+            return
+        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import runtime
+
+        win = self.token_to_kv_pool.unified_swa_window
+        ctx = min(
+            envs.SGLANG_DSV4_FP8_DECODE_SPLIT_CTX.get() or self.max_context_len,
+            self.max_context_len,
+        )
+        # longest KV one decode row of each stream can see
+        self._fp8_split_kv_hint = {
+            0: win,
+            4: win + self.index_topk,
+            128: win + ctx // 128,
+        }
+        if envs.SGLANG_DSV4_FP8_DECODE_SPLIT_MODEL.get():
+            runtime.fp8_decode_split_table(self.device)
+        if runtime.prepare_fp8_hca_persist(self.device, self._fp8_decode_num_heads):
+            logger.info(
+                "DSV4 fp8 decode: HCA layers on the persistent asm kernel "
+                f"(rows >= {envs.SGLANG_DSV4_FP8_HCA_PERSIST_MIN_ROWS.get()})"
+            )
+
     def _attach_unified_kv_decode_streams(
         self,
         core: DSV4AttnMetadata,
@@ -2792,6 +2825,11 @@ class DeepseekV4HipRadixBackend(
                     qo_indptr=qo_indptr,
                     max_seqlen_q=max_seqlen_q,
                     q_kv_bounds=q_kv_bounds,
+                    kv_len_hint=(
+                        self._fp8_split_kv_hint.get(compress_ratio)
+                        if qo_indptr is None
+                        else None
+                    ),
                 )
             from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.paged_decode import (
                 _kv_splits_for_stream,
