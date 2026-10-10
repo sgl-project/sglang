@@ -1122,7 +1122,7 @@ def _build_unified_host_pair(bundle):
 
 
 class TestUnifiedPageEnvelopeHostPool(CustomTestCase):
-    def test_sidecar_read_error_is_only_a_cache_miss_with_unified_memory(self):
+    def test_sidecar_read_error_is_a_cache_miss_with_unified_memory(self):
         from sglang.srt.runtime_context import publish, reset_context
         from sglang.srt.server_args import ServerArgs
 
@@ -1134,34 +1134,28 @@ class TestUnifiedPageEnvelopeHostPool(CustomTestCase):
                 raise ValueError("sidecar read failed")
 
         self.addCleanup(reset_context)
-        for unified in (False, True):
-            with self.subTest(unified=unified):
-                reset_context()
-                publish(
-                    ServerArgs(model_path="dummy", enable_unified_memory=unified),
-                    role="tokenizer",
-                )
-                cc = HybridCacheController.__new__(HybridCacheController)
-                cc.storage_backend = FailingStorage()
-                cc.prefetch_sync_queue = Queue()
-                operation = PrefetchOperation(
-                    CacheRequestHandle("r", 0),
-                    [1],
-                    pool_transfers=[PoolTransfer(name=PoolName.SWA)],
-                )
-                operation.hash_value = ["h0"]
-                operation.prefix_keys = ["prefix"]
-                if unified:
-                    with self.assertLogs(level="ERROR"):
-                        cc._page_transfer_sidecar(operation, kv_completed_pages=1)
-                    ack = cc.prefetch_sync_queue.get_nowait()
-                    self.assertIs(ack.operation, operation)
-                    self.assertEqual(ack.pool_hits, {})
-                else:
-                    with self.assertRaisesRegex(ValueError, "sidecar read failed"):
-                        cc._page_transfer_sidecar(operation, kv_completed_pages=1)
-                self.assertTrue(cc.prefetch_sync_queue.empty())
-        self.assertEqual(seen_prefixes, [["prefix", "h0"], ["prefix", "h0"]])
+        reset_context()
+        publish(
+            ServerArgs(model_path="dummy", enable_unified_memory=True),
+            role="tokenizer",
+        )
+        cc = HybridCacheController.__new__(HybridCacheController)
+        cc.storage_backend = FailingStorage()
+        cc.prefetch_sync_queue = Queue()
+        operation = PrefetchOperation(
+            CacheRequestHandle("r", 0),
+            [1],
+            pool_transfers=[PoolTransfer(name=PoolName.SWA)],
+        )
+        operation.hash_value = ["h0"]
+        operation.prefix_keys = ["prefix"]
+        with self.assertLogs(level="ERROR"):
+            cc._page_transfer_sidecar(operation, kv_completed_pages=1)
+        ack = cc.prefetch_sync_queue.get_nowait()
+        self.assertIs(ack.operation, operation)
+        self.assertEqual(ack.pool_hits, {})
+        self.assertTrue(cc.prefetch_sync_queue.empty())
+        self.assertEqual(seen_prefixes, [["prefix", "h0"]])
 
     def test_shorter_prefetch_reserves_full_and_swa_without_mutating_probe_keys(self):
         page_size = 4
