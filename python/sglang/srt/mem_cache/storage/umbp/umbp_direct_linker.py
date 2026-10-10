@@ -56,6 +56,10 @@ def _storage_suffix(
     return "_".join(parts)
 
 
+def _buffer_indices(mapped: int | tuple[int, ...]) -> tuple[int, ...]:
+    return (mapped,) if isinstance(mapped, int) else tuple(mapped)
+
+
 def _ordered_layers(entry) -> list[int]:
     component_lengths = {len(component) for component in entry.components}
     if len(component_lengths) != 1:
@@ -63,20 +67,17 @@ def _ordered_layers(entry) -> list[int]:
             f"UMBP pool {entry.name} components have different layer counts."
         )
     pool_layer_count = component_lengths.pop()
-    if pool_layer_count != len(entry.layer_mapping):
-        raise ValueError(
-            f"UMBP pool {entry.name} has {pool_layer_count} buffers per component "
-            f"but {len(entry.layer_mapping)} mapped layers."
-        )
-    by_buffer = {
-        buffer_index: logical_layer
-        for logical_layer, buffer_index in entry.layer_mapping.items()
-    }
-    if sorted(by_buffer) != list(range(pool_layer_count)):
+    pairs = [
+        (buffer_index, logical_layer)
+        for logical_layer, mapped in entry.layer_mapping.items()
+        for buffer_index in _buffer_indices(mapped)
+    ]
+    if sorted(index for index, _ in pairs) != list(range(pool_layer_count)):
         raise ValueError(
             f"UMBP pool {entry.name} layer mapping is not a contiguous bijection."
         )
-    return [by_buffer[index] for index in range(pool_layer_count)]
+    by_buffer = dict(pairs)
+    return list(dict.fromkeys(by_buffer[index] for index in range(pool_layer_count)))
 
 
 class LayerWiseLoadCounter:
@@ -764,17 +765,18 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         entry = self.pools[plan.name]
         items: list[list[tuple[int, int, int, int]]] = []
         for logical_layer in layers:
-            buffer_index = entry.layer_mapping.get(logical_layer)
-            if buffer_index is None:
+            mapped = entry.layer_mapping.get(logical_layer)
+            if mapped is None:
                 continue
-            items.append(
-                [
-                    (*component[buffer_index], offsets[buffer_index])
-                    for component, offsets in zip(
-                        entry.buffer_meta, entry._component_offsets
-                    )
-                ]
-            )
+            for buffer_index in _buffer_indices(mapped):
+                items.append(
+                    [
+                        (*component[buffer_index], offsets[buffer_index])
+                        for component, offsets in zip(
+                            entry.buffer_meta, entry._component_offsets
+                        )
+                    ]
+                )
         return items
 
     def _layer_group_ranges(self, plan: _PoolRangePlan, layers: list[int]):
@@ -811,8 +813,12 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             )
 
         if self.pools[plan.name].packed:
-            # One object per page, its ranges running (layer, component).
-            flat = [item for layer_items in items for item in layer_items]
+            # One object per page; packed draft buffers sit after all target
+            # buffers, so sort ranges by object offset.
+            flat = sorted(
+                (item for layer_items in items for item in layer_items),
+                key=lambda item: item[3],
+            )
             base = np.fromiter((item[0] for item in flat), np.int64, len(flat))
             stride = np.fromiter((item[1] for item in flat), np.int64, len(flat))
             ptrs = (rows[:, None] * stride[None, :] + base[None, :]).tolist()
