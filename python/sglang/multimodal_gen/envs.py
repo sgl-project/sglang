@@ -334,7 +334,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Plan slots in the MiniMax-H3 --minimax-h3-adaln-online GPU slab
     # (9.25 MiB per slot-timestep; 64 x width 4 = 2.31 GiB). A request needs
-    # up to num_inference_steps - 1 slots; the default covers the 50-step
+    # up to num_inference_steps slots; the default covers the 50-step
     # serving schedule, so this is an escape hatch, not a deployment knob.
     "SGLANG_DIFFUSION_MINIMAX_H3_ADALN_GPU_PLANS": _lazy_int(
         "SGLANG_DIFFUSION_MINIMAX_H3_ADALN_GPU_PLANS", 64
