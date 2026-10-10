@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use axum::body::Body;
 use axum::http::Request;
 use serde_json::json;
-use sgl_router::config::{Config, PolicyKind, StickyConfig, StickyFallbackKind};
+use sgl_router::config::{Config, DpRankPolicy, PolicyKind, StickyConfig, StickyFallbackKind};
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
 use sgl_router::policies::factory::build_registry;
 use sgl_router::policies::request_tokens_for;
@@ -165,6 +165,26 @@ async fn pd_room_maps_decode_to_the_prefill_rank() {
         .as_u64()
         .unwrap();
     assert_eq!(room % 4, rank.parse::<u64>().unwrap());
+}
+
+#[tokio::test]
+async fn round_robin_gives_decode_ranks_turns() {
+    let (prefill, decode) = (
+        MockWorker::start(vec![]).await,
+        MockWorker::start(vec![]).await,
+    );
+    let workers = [
+        (&prefill, WorkerMode::Prefill, 4),
+        (&decode, WorkerMode::Decode, 4),
+    ];
+    let mut cfg = sticky_config();
+    cfg.model.dp_rank_policy = DpRankPolicy::RoundRobin;
+    let app = router(cfg, &workers, Default::default());
+    let mut ranks = Vec::new();
+    for _ in 0..8 {
+        ranks.push(send(&app, &decode, &[(KEY, "conv-pd")]).await.unwrap());
+    }
+    assert_eq!(ranks, ["0", "1", "2", "3", "0", "1", "2", "3"]);
 }
 
 #[tokio::test]

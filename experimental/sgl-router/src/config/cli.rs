@@ -14,12 +14,12 @@ use crate::config::{
     default_cb_cool_down, default_host, default_port, default_proxy_request_timeout_secs,
     default_shutdown_drain_secs, default_stale_request_timeout_secs, resolve_mode, AffinityConfig,
     AffinityMode, BalancedBy, CacheAwareConfig, CachePrefixProvider, ChatRoutingKind,
-    CircuitBreakerConfig, Config, DecodePolicyKind, DiscoveryBackend, EligibilityConfig,
-    FilterKind, FusedTerm, InflightLoadConfig, K8sDiscoveryConfig, K8sDiscoveryMode,
-    KvIndexerEndpointConfig, LogFormat, ModelConfig, ObservabilityConfig, PolicyKind, ProxyConfig,
-    ServerConfig, SessionAffinityMode, StaticUrlsDiscoveryConfig, StickyConfig, StickyFallbackKind,
-    TokenizerBackend, TokenizerConfig, DEFAULT_FUSE, DEFAULT_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS,
-    DEFAULT_KV_BOOTSTRAP_TIMEOUT_MS,
+    CircuitBreakerConfig, Config, DecodePolicyKind, DiscoveryBackend, DpRankPolicy,
+    EligibilityConfig, FilterKind, FusedTerm, InflightLoadConfig, K8sDiscoveryConfig,
+    K8sDiscoveryMode, KvIndexerEndpointConfig, LogFormat, ModelConfig, ObservabilityConfig,
+    PolicyKind, ProxyConfig, ServerConfig, SessionAffinityMode, StaticUrlsDiscoveryConfig,
+    StickyConfig, StickyFallbackKind, TokenizerBackend, TokenizerConfig, DEFAULT_FUSE,
+    DEFAULT_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS, DEFAULT_KV_BOOTSTRAP_TIMEOUT_MS,
 };
 use crate::policies_reorg::admission::AdmissionLimits;
 use crate::policies_reorg::factory::AffinitySpec;
@@ -244,6 +244,11 @@ pub struct RoutingArgs {
     /// Also pick the DP rank inside each selected multi-rank worker.
     #[arg(long)]
     pub dp_aware: bool,
+
+    /// How --dp-aware picks a rank that no routing key or cached prefix decides,
+    /// which in PD mode is every decode rank. Defaults to least_in_flight.
+    #[arg(long, value_enum, requires = "dp_aware")]
+    pub dp_rank_policy: Option<DpRankPolicy>,
 
     /// Static bucket configuration JSON; the reorg schema with --chat-routing reorg.
     /// Omit to use the global candidate domain (default buckets with reorg).
@@ -616,6 +621,7 @@ impl Cli {
                 policy: self.routing.policy,
                 decode_policy: self.routing.decode_policy,
                 dp_aware: self.routing.dp_aware,
+                dp_rank_policy: self.routing.dp_rank_policy.unwrap_or_default(),
                 bucket_config,
                 reorg_buckets,
                 reorg_admission,
@@ -2152,6 +2158,21 @@ mod tests {
             DEFAULT_KV_INDEXER_QUERY_TIMEOUT_MS
         );
         assert_eq!(indexer.query_max_inflight, 32);
+    }
+
+    #[test]
+    fn dp_rank_policy_requires_dp_aware() {
+        let urls = ["--worker-urls", "http://x:30000"];
+        let cfg = into_config_owned(with_model(&urls)).unwrap();
+        assert_eq!(cfg.model.dp_rank_policy, DpRankPolicy::LeastInFlight);
+        let rr = ["--dp-rank-policy", "round_robin"];
+        let err = into_config_owned(with_model(&[&urls[..], &rr[..]].concat()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--dp-aware"), "got: {err}");
+        let dp_aware = [&urls[..], &["--dp-aware"][..], &rr[..]].concat();
+        let cfg = into_config_owned(with_model(&dp_aware)).unwrap();
+        assert_eq!(cfg.model.dp_rank_policy, DpRankPolicy::RoundRobin);
     }
 
     #[test]
