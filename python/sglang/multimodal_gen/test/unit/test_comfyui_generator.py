@@ -160,3 +160,71 @@ def test_non_default_weight_dtype_is_rejected_before_worker_load() -> None:
             model_options={"dtype": torch.float8_e4m3fn},
             sgld_options={},
         )
+
+
+@pytest.mark.parametrize(
+    "options,error",
+    [
+        ({"attention_backend": "sage_attn_3"}, "would run torch_sdpa instead"),
+        ({"component_attention_backends": "transformer=sol_attn"}, "not installed"),
+        ({"attention_backend": "not_a_backend"}, "not an SGLang attention backend"),
+        ({"attention_backend": "sage_attn"}, None),
+    ],
+)
+def test_attention_backends_are_checked_before_worker_load(
+    monkeypatch, options, error
+) -> None:
+    """SGLang serves a missing sage_attn / sage_attn_3 kernel as FA / SDPA, so an
+    explicit choice ran another backend; a missing sparse kernel only failed
+    after the full model load."""
+    from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.core import preflight
+    from sglang.multimodal_gen.runtime.platforms.interface import (
+        AttentionBackendEnum as Backend,
+    )
+
+    def resolved(backend):
+        if backend is Backend.SOL_ATTN:
+            raise ImportError("Sol-Attn backend is not installed")
+        return {Backend.SAGE_ATTN_3: Backend.TORCH_SDPA}.get(backend, backend)
+
+    monkeypatch.setattr(preflight, "_resolved_backend", resolved)
+    with pytest.raises(
+        ValueError if error else AssertionError, match=error or "must reject before"
+    ):
+        _runtime_that_must_reject().load_model(
+            model_path="h3.safetensors", sgld_options=options
+        )
+
+
+@pytest.mark.parametrize(
+    "options,error",
+    [
+        ({"num_gpus": 2, "tp_size": 1, "sp_degree": 1}, "must equal"),
+        ({"num_gpus": 2, "tp_size": 2, "sp_degree": 2}, "must equal"),
+        ({"num_gpus": 2, "dp_size": 2}, "dp_size > 1"),
+        ({"num_gpus": 2, "tp_size": 2, "sp_degree": 1}, None),
+        ({"num_gpus": 2, "tp_size": 1, "sp_degree": None}, None),
+    ],
+)
+def test_parallel_layout_is_checked_before_worker_load(options, error) -> None:
+    """num_gpus=2 with tp=sp=1 left rank 1 without a process group, hanging
+    worker startup forever; dp_size=2 sent sampler steps to a replica without
+    the run's cached conditioning."""
+    with pytest.raises(
+        ValueError if error else AssertionError, match=error or "must reject before"
+    ):
+        _runtime_that_must_reject().load_model(
+            model_path="h3.safetensors", sgld_options=options
+        )
+
+
+def test_worker_exit_during_load_names_where_the_reason_is(monkeypatch) -> None:
+    """A worker that raised while loading surfaced as an empty EOFError."""
+    from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.core import generator
+
+    def exit_during_load(**kwargs):
+        raise EOFError
+
+    monkeypatch.setattr(generator.DiffGenerator, "from_pretrained", exit_during_load)
+    with pytest.raises(RuntimeError, match="traceback is in the ComfyUI console"):
+        SGLDiffusionGenerator().init_generator("h3.safetensors", "MiniMaxH3Pipeline")

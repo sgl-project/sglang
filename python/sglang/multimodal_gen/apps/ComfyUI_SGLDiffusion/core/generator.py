@@ -9,6 +9,7 @@ import os
 from ..executors.flux import FluxExecutor
 from ..executors.minimax_h3 import MiniMaxH3Executor
 from ..executors.zimage import ZImageExecutor
+from .preflight import check_sgld_options
 
 logger = logging.getLogger(__name__)
 
@@ -205,11 +206,18 @@ class SGLDiffusionGenerator:
         # reloads the DiT from CPU.
         kwargs.setdefault("dit_cpu_offload", False)
         kwargs = self._server_args_kwargs(kwargs)
-        self.generator = DiffGenerator.from_pretrained(
-            model_path=model_path,
-            pipeline_class_name=pipeline_class_name,
-            **kwargs,
-        )
+        try:
+            self.generator = DiffGenerator.from_pretrained(
+                model_path=model_path,
+                pipeline_class_name=pipeline_class_name,
+                **kwargs,
+            )
+        except EOFError as error:
+            # A worker that raises while loading closes its pipe without a message.
+            raise RuntimeError(
+                "The SGLD worker exited while loading the model; its traceback is in "
+                "the ComfyUI console output above this error"
+            ) from error
         return self.generator
 
     @staticmethod
@@ -408,6 +416,7 @@ class SGLDiffusionGenerator:
                 "SGLDUNETLoader weight_dtype must be 'default': the SGLD worker "
                 "does not use it; select quantization in SGLDOptions instead"
             )
+        check_sgld_options(sgld_options)
         plugin_flags = {}
         if "enable_cache_dit" in sgld_options:
             plugin_flags["enable_cache_dit"] = sgld_options.pop("enable_cache_dit")
