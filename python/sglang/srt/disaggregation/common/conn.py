@@ -1559,8 +1559,16 @@ class CommonKVManager(BaseKVManager):
 
         # Regular MLA PP slicing
         # Decode pp size should be equal to prefill pp size or 1
-        start_layer, end_layer = self._mla_kv_entry_span_with_pp(len(src_kv_ptrs))
+        num_draft = (
+            getattr(self.kv_args, "num_draft_entries", 0) if state_type is None else 0
+        )
+        start_layer, end_layer = self._mla_kv_entry_span_with_pp(
+            len(src_kv_ptrs) - num_draft
+        )
         sliced_dst_kv_ptrs = dst_kv_ptrs[start_layer:end_layer]
+        if num_draft:
+            # Draft entries follow the target's global layer range on both peers.
+            sliced_dst_kv_ptrs += dst_kv_ptrs[-num_draft:]
         return src_kv_ptrs, sliced_dst_kv_ptrs, len(src_kv_ptrs)
 
     def _mla_kv_entry_span_with_pp(self, n_src: int) -> Tuple[int, int]:

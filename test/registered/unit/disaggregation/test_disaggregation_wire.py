@@ -67,6 +67,7 @@ from sglang.srt.sampling.sampling_mask import SamplingMaskRows
 from sglang.srt.speculative.eagle_disaggregation import (
     build_eagle_disagg_draft_input,
 )
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -1187,6 +1188,98 @@ class TestStagingWatermark(unittest.TestCase):
 
         sock.send_multipart.assert_called_once_with(
             [b"WATERMARK", b"3", b"0", b"session-new"]
+        )
+
+
+class TestMooncakeHiSparseSpecIndices(CustomTestCase):
+    def test_draft_buffers_use_logical_device_indices(self):
+        """A local target layer count must not turn remote target KV into draft KV."""
+        for pp_size, stage_start in ((1, 0), (2, 0), (2, 2)):
+            with self.subTest(pp_size=pp_size, stage_start=stage_start):
+                manager = object.__new__(MooncakeKVManager)
+                manager.kv_args = SimpleNamespace(
+                    mla_compression_ratios=None,
+                    prefill_start_layer=stage_start,
+                    prefill_end_layer=stage_start + 2,
+                    kv_data_ptrs=[1000, 2000, 3000],
+                    kv_item_lens=[100, 100, 100],
+                    kv_layer_ids=[],
+                    num_draft_entries=1,
+                )
+                manager.is_mla_backend = True
+                manager.is_hybrid_mla_backend = False
+                manager.enable_custom_mem_pool = False
+                manager.max_transfer_batch_indices = 0
+                manager.pp_size = pp_size
+                manager._transfer_data = Mock(return_value=0)
+                dst_ptrs = (
+                    [10000, 20000, 50000]
+                    if pp_size == 1
+                    else [10000, 20000, 30000, 40000, 50000]
+                )
+                with patch(
+                    "sglang.srt.disaggregation.mooncake.conn.get_memory",
+                    return_value=SimpleNamespace(enable_unified_memory=False),
+                ):
+                    status = manager.send_kvcache(
+                        mooncake_session_id="session",
+                        prefill_kv_indices=np.array([1, 2], dtype=np.int32),
+                        dst_kv_ptrs=dst_ptrs,
+                        dst_kv_indices=np.array([7, 8], dtype=np.int32),
+                        dst_device_kv_indices=np.array([21, 22], dtype=np.int32),
+                        executor=None,
+                    )
+
+                self.assertEqual(status, 0)
+                blocks = manager._transfer_data.call_args.args[1]
+                self.assertEqual(
+                    blocks,
+                    [
+                        (1100, dst_ptrs[stage_start] + 700, 200),
+                        (2100, dst_ptrs[stage_start + 1] + 700, 200),
+                        (3100, dst_ptrs[-1] + 2100, 200),
+                    ],
+                )
+
+
+class TestHiSparseStagedSpecRelay(CustomTestCase):
+    def test_builds_lightweight_eagle_relay_handle(self):
+        future_map = object.__new__(FutureMap)
+        future_map.spec_algo = SpeculativeAlgorithm.EAGLE
+        future_map.dsa_topk_indices_buf = None
+        future_indices = torch.tensor([2, 5], device="cpu")
+
+        spec_input = future_map.make_staged_spec_input(future_indices)
+
+        self.assertIs(spec_input.future_indices, future_indices)
+        self.assertFalse(spec_input.future_dsa_topk_indices_available)
+
+    @patch("sglang.srt.managers.overlap_utils.gather_spec_extras")
+    def test_staged_relay_restores_rejection_sampling_probs(self, gather_spec_extras):
+        future_map = object.__new__(FutureMap)
+        future_map.spec_algo = SpeculativeAlgorithm.EAGLE
+        future_map.device = torch.device("cpu")
+        future_map.need_topk = True
+        future_map.need_hidden_states = False
+        future_map.topk_p_buf = torch.zeros((4, 1), dtype=torch.float32)
+        future_map.topk_index_buf = torch.zeros((4, 1), dtype=torch.int64)
+        future_map.output_tokens_buf = torch.arange(4, dtype=torch.int64)
+        future_map.hidden_states_buf = None
+        future_map.draft_probs_buf = torch.arange(12, dtype=torch.float32).view(4, 3)
+        future_map.dsa_topk_indices_buf = None
+        future_indices = torch.tensor([2, 3], dtype=torch.int64)
+        spec_input = future_map.make_staged_spec_input(future_indices)
+        gather_spec_extras.return_value = (
+            torch.zeros((2, 1)),
+            torch.zeros((2, 1), dtype=torch.int64),
+            torch.tensor([2, 3]),
+            None,
+        )
+
+        future_map._resolve_spec_extras(SimpleNamespace(spec_info=spec_input))
+
+        torch.testing.assert_close(
+            spec_input.draft_probs, future_map.draft_probs_buf[future_indices]
         )
 
 

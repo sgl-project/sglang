@@ -17,6 +17,58 @@ class TestHiSparseSlotTranslation(CustomTestCase):
     def make_pool(self, pool_type):
         return pool_type.__new__(pool_type)
 
+    def test_device_transfer_copies_physical_slots_without_remapping(self):
+        """Accept commit moves target KV, not logical IDs or indexer KV."""
+        pool = self.make_pool(HiSparseDSATokenToKVPool)
+        pool.layer_num = 2
+        pool.bytes_per_token = 4
+        pool.kv_buffer = [
+            torch.arange(12, dtype=torch.float32) + 100 * layer
+            for layer in range(pool.layer_num)
+        ]
+        pool.data_ptrs = torch.tensor(
+            [buf.data_ptr() for buf in pool.kv_buffer], dtype=torch.uint64
+        )
+        pool.data_strides = torch.full_like(pool.data_ptrs, 4)
+        pool.register_mapping(torch.arange(12).flip(0))
+        pool.index_key_cache = [torch.arange(12)]
+        expected = [buf.clone() for buf in pool.kv_buffer]
+        for buf in expected:
+            buf[[1, 3]] = buf[[6, 8]]
+
+        def copy_physical_rows(
+            data_ptrs,
+            strides,
+            dst_indices,
+            src_indices,
+            num_locs,
+            num_locs_upper,
+            config,
+        ):
+            self.assertEqual(num_locs, 2)
+            self.assertEqual(num_locs_upper, 2)
+            torch.testing.assert_close(data_ptrs, pool.data_ptrs)
+            torch.testing.assert_close(strides, pool.data_strides)
+            for buf in pool.kv_buffer:
+                buf[dst_indices] = buf[src_indices]
+
+        with patch.object(
+            hisparse_memory_pool,
+            "copy_all_layer_kv_cache_func",
+            side_effect=copy_physical_rows,
+        ):
+            pool.transfer_values_on_device(
+                dst_indices=torch.tensor([1, 0, 3, 0])[::2],
+                src_indices=torch.tensor([6, 0, 8, 0])[::2],
+            )
+
+        for actual, reference in zip(pool.kv_buffer, expected):
+            torch.testing.assert_close(actual, reference)
+        torch.testing.assert_close(
+            pool.full_to_hisparse_device_index_mapping, torch.arange(12).flip(0)
+        )
+        torch.testing.assert_close(pool.index_key_cache[0], torch.arange(12))
+
     def test_pool_translation_selects_fused_kernel_for_gpu_slot_lists(self):
         pool = self.make_pool(HiSparseDSATokenToKVPool)
         mapping = torch.arange(32, dtype=torch.int64) + 100
