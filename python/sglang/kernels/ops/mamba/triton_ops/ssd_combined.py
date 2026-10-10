@@ -73,6 +73,7 @@ def _mamba_chunk_scan_combined_fwd(
     out=None,
     track_seq_idx=None,
     track_end_locs=None,
+    varlen_end_locs=None,
 ):
     assert is_int_pow_2(chunk_size), "chunk_size must be integer power of 2"
     batch, seqlen, nheads, headdim = x.shape
@@ -195,15 +196,30 @@ def _mamba_chunk_scan_combined_fwd(
         assert batch == 1, (
             "passing cu_seqlens to get the varlen states is only supported if batch dimension is 1"
         )
-        varlen_states = chunk_state_varlen(
-            B.squeeze(0),
-            x.squeeze(0),
-            dt.squeeze(0),
-            dA_cumsum.squeeze(0),
-            cu_seqlens,
-            states.squeeze(0),
-            initial_states=initial_states,
-        )
+        if varlen_end_locs is None:
+            varlen_states = chunk_state_varlen(
+                B.squeeze(0),
+                x.squeeze(0),
+                dt.squeeze(0),
+                dA_cumsum.squeeze(0),
+                cu_seqlens,
+                states.squeeze(0),
+                initial_states=initial_states,
+            )
+        else:
+            # Aligned packing may add inert tokens after each real sequence.
+            # Capture states at the real ends rather than after the padding.
+            varlen_states = _track_states_at(
+                B,
+                x,
+                dt,
+                dA_cumsum,
+                states,
+                cu_seqlens,
+                initial_states,
+                torch.arange(len(cu_seqlens) - 1, device=x.device),
+                varlen_end_locs,
+            ).squeeze(0)
         track_states = None
         if (
             track_seq_idx is not None
@@ -249,6 +265,8 @@ def mamba_chunk_scan_combined(
     return_track_states=False,
     track_seq_idx=None,
     track_end_locs=None,
+    batch_invariant=False,
+    batch_invariant_boundaries=None,
 ):
     """
     Argument:
@@ -267,7 +285,36 @@ def mamba_chunk_scan_combined(
         dt_softplus: Whether to apply softplus to dt
         out: Preallocated output tensor
         state_dtype: The data type of the ssm state
+        batch_invariant: Run each logical sequence on its own chunk grid so its
+            arithmetic does not depend on the preceding sequences' lengths.
+        batch_invariant_boundaries: Optional CPU boundaries from prefill metadata.
     """
+
+    if batch_invariant:
+        assert return_varlen_states and not return_final_states
+        assert not return_intermediate_states
+        assert cu_seqlens is not None and out is not None
+        return _mamba_chunk_scan_combined_batch_invariant(
+            x,
+            dt,
+            A,
+            B,
+            C,
+            chunk_size,
+            D=D,
+            z=z,
+            dt_bias=dt_bias,
+            initial_states=initial_states,
+            cu_seqlens=cu_seqlens,
+            dt_softplus=dt_softplus,
+            dt_limit=dt_limit,
+            out=out,
+            state_dtype=state_dtype,
+            return_track_states=return_track_states,
+            track_seq_idx=track_seq_idx,
+            track_end_locs=track_end_locs,
+            boundaries=batch_invariant_boundaries,
+        )
 
     if not return_varlen_states:
         cu_seqlens = None
@@ -331,3 +378,153 @@ def mamba_chunk_scan_combined(
             if not return_final_states
             else (final_states, varlen_states)
         )
+
+
+def _mamba_chunk_scan_combined_batch_invariant(
+    x,
+    dt,
+    A,
+    B,
+    C,
+    chunk_size,
+    *,
+    D,
+    z,
+    dt_bias,
+    initial_states,
+    cu_seqlens,
+    dt_softplus,
+    dt_limit,
+    out,
+    state_dtype,
+    return_track_states,
+    track_seq_idx,
+    track_end_locs,
+    boundaries,
+):
+    assert x.shape[0] == 1
+    assert cu_seqlens.numel() > 1
+    assert (track_seq_idx is None) == (track_end_locs is None)
+    assert dt_limit[0] == 0.0, "Aligned padding requires zero to be a valid dt"
+
+    # The regular packed scan shares physical chunks across request boundaries.
+    # Align each request to its own chunk grid, then scan the padded batch once.
+    # This preserves each request's arithmetic without serial kernel launches.
+    if boundaries is None:
+        boundaries = cu_seqlens.tolist()
+    assert len(boundaries) == cu_seqlens.numel()
+    assert boundaries[0] == 0 and boundaries[-1] == x.shape[1]
+    lengths = [end - start for start, end in zip(boundaries, boundaries[1:])]
+    assert all(length > 0 for length in lengths)
+    padded_lengths = [
+        triton.cdiv(length, chunk_size) * chunk_size if i < len(lengths) - 1 else length
+        for i, length in enumerate(lengths)
+    ]
+    padded_boundaries = [0]
+    for length in padded_lengths:
+        padded_boundaries.append(padded_boundaries[-1] + length)
+    padded_total = padded_boundaries[-1]
+
+    padded_x = x.new_zeros((1, padded_total, *x.shape[2:]))
+    padded_B = B.new_zeros((1, padded_total, *B.shape[2:]))
+    padded_C = C.new_zeros((1, padded_total, *C.shape[2:]))
+    padded_z = z.new_zeros((1, padded_total, *z.shape[2:])) if z is not None else None
+    padded_dt = dt.new_empty((1, padded_total, *dt.shape[2:]))
+    if dt_softplus:
+        padded_dt.fill_(-float("inf"))
+    elif dt_bias is None:
+        padded_dt.zero_()
+    else:
+        padded_dt.copy_(-dt_bias)
+    padded_out = out.new_empty((1, padded_total, *out.shape[2:]))
+
+    for start, end, padded_start in zip(boundaries, boundaries[1:], padded_boundaries):
+        padded_end = padded_start + end - start
+        padded_x[:, padded_start:padded_end].copy_(x[:, start:end])
+        padded_dt[:, padded_start:padded_end].copy_(dt[:, start:end])
+        padded_B[:, padded_start:padded_end].copy_(B[:, start:end])
+        padded_C[:, padded_start:padded_end].copy_(C[:, start:end])
+        if z is not None:
+            padded_z[:, padded_start:padded_end].copy_(z[:, start:end])
+
+    padded_cu_seqlens = torch.tensor(
+        padded_boundaries, device=x.device, dtype=cu_seqlens.dtype
+    )
+    padded_seq_idx = torch.repeat_interleave(
+        torch.arange(len(lengths), device=x.device, dtype=torch.int32),
+        torch.tensor(padded_lengths, device=x.device, dtype=torch.int32),
+        output_size=padded_total,
+    ).unsqueeze(0)
+    padded_end_locs = torch.tensor(
+        [start + length for start, length in zip(padded_boundaries, lengths)],
+        device=x.device,
+        dtype=cu_seqlens.dtype,
+    )
+    if initial_states is not None:
+        num_chunks = triton.cdiv(padded_total, chunk_size)
+        padded_chunk_indices = torch.arange(
+            num_chunks, device=x.device, dtype=torch.int32
+        )
+        padded_chunk_offsets = torch.zeros_like(padded_chunk_indices)
+    else:
+        padded_chunk_indices = padded_chunk_offsets = None
+
+    if track_end_locs is not None:
+        offsets = torch.tensor(
+            [
+                start - original
+                for start, original in zip(padded_boundaries, boundaries)
+            ],
+            device=x.device,
+            dtype=track_end_locs.dtype,
+        )
+        padded_track_end_locs = track_end_locs + offsets[track_seq_idx]
+    else:
+        padded_track_end_locs = None
+
+    _, _, _, states, _, varlen_states, track_states = _mamba_chunk_scan_combined_fwd(
+        padded_x,
+        padded_dt,
+        A,
+        padded_B,
+        padded_C,
+        chunk_size,
+        D=D,
+        z=padded_z,
+        dt_bias=dt_bias,
+        initial_states=initial_states,
+        seq_idx=padded_seq_idx,
+        chunk_indices=padded_chunk_indices,
+        chunk_offsets=padded_chunk_offsets,
+        cu_seqlens=padded_cu_seqlens,
+        dt_softplus=dt_softplus,
+        dt_limit=dt_limit,
+        out=padded_out,
+        state_dtype=state_dtype,
+        track_seq_idx=track_seq_idx,
+        track_end_locs=padded_track_end_locs,
+        varlen_end_locs=padded_end_locs,
+    )
+
+    for start, end, padded_start in zip(boundaries, boundaries[1:], padded_boundaries):
+        out[:, start:end].copy_(
+            padded_out[:, padded_start : padded_start + end - start]
+        )
+
+    if return_track_states:
+        # The caller indexes h on the original physical grid. Only requests
+        # whose original starts are aligned can contribute a grid state; other
+        # tracked positions use track_states from the recompute path.
+        intermediate_states = states.new_zeros(
+            (1, triton.cdiv(x.shape[1], chunk_size), *states.shape[2:])
+        )
+        for start, length, padded_start in zip(boundaries, lengths, padded_boundaries):
+            if start % chunk_size == 0:
+                first_chunk = start // chunk_size
+                padded_chunk = padded_start // chunk_size
+                count = triton.cdiv(length, chunk_size)
+                intermediate_states[:, first_chunk : first_chunk + count].copy_(
+                    states[:, padded_chunk : padded_chunk + count]
+                )
+        return intermediate_states, varlen_states, track_states
+    return varlen_states
