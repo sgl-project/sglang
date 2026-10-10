@@ -148,6 +148,7 @@ NIGHTLY_SUITES = {
         # shape as the per-commit suites. No `nightly=True`: the stage name
         # carries the cadence; only the legacy suites below still need the flag.
         "nightly-test-1-gpu-large",
+        "nightly-test-1-gpu-large-foundry",
         "nightly-test-2-gpu-large",
         "nightly-test-4-gpu-h100",
         "nightly-test-4-gpu-b200",
