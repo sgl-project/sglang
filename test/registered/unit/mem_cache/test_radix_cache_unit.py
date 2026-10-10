@@ -488,7 +488,7 @@ class TestRadixCache(CustomTestCase):
             allocator.available_size(),
             available_before_free + request_indices.numel(),
         )
-        torch.testing.assert_close(allocator.free_pages[-3:], request_indices)
+        torch.testing.assert_close(allocator.get_all_free_pages()[-3:], request_indices)
         torch.testing.assert_close(
             cache.req_to_token_pool.req_to_token[0], tree_indices
         )
