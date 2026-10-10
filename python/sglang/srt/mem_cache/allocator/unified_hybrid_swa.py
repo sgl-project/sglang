@@ -1171,15 +1171,18 @@ class UnifiedSWATokenToKVPoolAllocator(UnifiedSWAAllocatorBase):
         self, tree_cache, num_tokens: int, *, swa_num_tokens: Optional[int] = None
     ) -> bool | None:
         from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+        from sglang.srt.mem_cache.common import _eviction_target_with_headroom
 
         if tree_cache is None or not tree_cache.supports_prefix_sharing():
             return
         required_swa = num_tokens if swa_num_tokens is None else swa_num_tokens
+        full_evictable_tokens = tree_cache.full_evictable_size()
+        swa_evictable_tokens = tree_cache.swa_evictable_size()
         reclaim_plan = self.reclaim_plan(
             num_tokens,
             required_swa,
-            full_evictable_tokens=tree_cache.full_evictable_size(),
-            swa_evictable_tokens=tree_cache.swa_evictable_size(),
+            full_evictable_tokens=full_evictable_tokens,
+            swa_evictable_tokens=swa_evictable_tokens,
         )
         if reclaim_plan is None:
             return
@@ -1188,6 +1191,12 @@ class UnifiedSWATokenToKVPoolAllocator(UnifiedSWAAllocatorBase):
             # The shared-byte plan returns cumulative eviction quotas.
             # Per-component capacity targets can count the same shared bytes
             # independently and stop before the joint allocation fits.
+            full_reclaim = _eviction_target_with_headroom(
+                full_reclaim, full_evictable_tokens
+            )
+            swa_reclaim = _eviction_target_with_headroom(
+                swa_reclaim, swa_evictable_tokens
+            )
             tree_cache.evict(
                 EvictParams(num_tokens=full_reclaim, swa_num_tokens=swa_reclaim)
             )
