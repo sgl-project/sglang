@@ -7,7 +7,6 @@
 import argparse
 import contextlib
 import dataclasses
-import datetime
 import inspect
 import logging
 import os
@@ -15,15 +14,10 @@ import sys
 import time
 from contextlib import contextmanager
 from enum import Enum
-from functools import lru_cache, partial
+from functools import lru_cache
 from logging import Logger
 from types import MethodType
 from typing import Any, cast
-
-import sglang.multimodal_gen.envs as envs
-
-SGLANG_DIFFUSION_LOGGING_LEVEL = envs.SGLANG_DIFFUSION_LOGGING_LEVEL
-SGLANG_DIFFUSION_LOGGING_PREFIX = envs.SGLANG_DIFFUSION_LOGGING_PREFIX
 
 # color
 CYAN = "\033[1;36m"
@@ -31,45 +25,6 @@ RED = "\033[91m"
 GREEN = "\033[92m"
 YELLOW = "\033[93m"
 RESET = "\033[0;0m"
-
-_FORMAT = (
-    f"{SGLANG_DIFFUSION_LOGGING_PREFIX}%(levelname)s %(asctime)s "
-    "[%(filename)s: %(lineno)d] %(message)s"
-)
-
-# _FORMAT = "[%(asctime)s] %(message)s"
-_DATE_FORMAT = "%m-%d %H:%M:%S"
-
-DEFAULT_LOGGING_CONFIG = {
-    "formatters": {
-        "sgl_diffusion": {
-            "class": "sglang.multimodal_gen.runtime.utils.logging_utils.ColoredFormatter",
-            "datefmt": _DATE_FORMAT,
-            "format": _FORMAT,
-        },
-    },
-    "handlers": {
-        "sgl_diffusion": {
-            "class": "logging.StreamHandler",
-            "formatter": "sgl_diffusion",
-            "level": SGLANG_DIFFUSION_LOGGING_LEVEL,
-            "stream": "ext://sys.stdout",
-        },
-    },
-    "loggers": {
-        "sgl_diffusion": {
-            "handlers": ["sgl_diffusion"],
-            "level": "WARNING",
-            "propagate": False,
-        },
-    },
-    "root": {
-        "handlers": ["sgl_diffusion"],
-        "level": "DEBUG",
-    },
-    "version": 1,
-    "disable_existing_loggers": False,
-}
 
 
 class ColoredFormatter(logging.Formatter):
@@ -422,72 +377,6 @@ def _sanitize_for_logging(obj: Any, key_hint: str | None = None) -> Any:
         return "<unserializable>"
 
 
-def _trace_calls(log_path, root_dir, frame, event, arg=None):
-    if event in ["call", "return"]:
-        # Extract the filename, line number, function name, and the code object
-        filename = frame.f_code.co_filename
-        lineno = frame.f_lineno
-        func_name = frame.f_code.co_name
-        if not filename.startswith(root_dir):
-            # only log the functions in the sgl_diffusion root_dir
-            return
-        # Log every function call or return
-        try:
-            last_frame = frame.f_back
-            if last_frame is not None:
-                last_filename = last_frame.f_code.co_filename
-                last_lineno = last_frame.f_lineno
-                last_func_name = last_frame.f_code.co_name
-            else:
-                # initial frame
-                last_filename = ""
-                last_lineno = 0
-                last_func_name = ""
-            with open(log_path, "a") as f:
-                ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
-                if event == "call":
-                    f.write(
-                        f"{ts} Call to"
-                        f" {func_name} in {filename}:{lineno}"
-                        f" from {last_func_name} in {last_filename}:"
-                        f"{last_lineno}\n"
-                    )
-                else:
-                    f.write(
-                        f"{ts} Return from"
-                        f" {func_name} in {filename}:{lineno}"
-                        f" to {last_func_name} in {last_filename}:"
-                        f"{last_lineno}\n"
-                    )
-        except NameError:
-            # modules are deleted during shutdown
-            pass
-    return partial(_trace_calls, log_path, root_dir)
-
-
-def enable_trace_function_call(log_file_path: str, root_dir: str | None = None):
-    """
-    Enable tracing of every function call in code under `root_dir`.
-    This is useful for debugging hangs or crashes.
-    `log_file_path` is the path to the log file.
-    `root_dir` is the root directory of the code to trace. If None, it is the
-    sgl_diffusion root directory.
-
-    Note that this call is thread-level, any threads calling this function
-    will have the trace enabled. Other threads will not be affected.
-    """
-    logger.warning(
-        "SGLANG_DIFFUSION_TRACE_FUNCTION is enabled. It will record every"
-        " function executed by Python. This will slow down the code. It "
-        "is suggested to be used for debugging hang or crashes only."
-    )
-    logger.info("Trace frame log is saved to %s", log_file_path)
-    if root_dir is None:
-        # by default, this is the sgl_diffusion root directory
-        root_dir = os.path.dirname(os.path.dirname(__file__))
-    sys.settrace(partial(_trace_calls, log_file_path, root_dir))
-
-
 def set_uvicorn_logging_configs(server_args=None):
     from uvicorn.config import LOGGING_CONFIG
 
@@ -585,17 +474,6 @@ def configure_logger(server_args, prefix: str = ""):
 def get_log_level() -> int:
     root = logging.getLogger()
     return root.level
-
-
-def suppress_loggers(loggers_to_suppress: list[str], level: int = logging.WARNING):
-    original_levels = {}
-
-    for logger_name in loggers_to_suppress:
-        logger = logging.getLogger(logger_name)
-        original_levels[logger_name] = logger.level
-        logger.setLevel(level)
-
-    return original_levels
 
 
 def globally_suppress_loggers():

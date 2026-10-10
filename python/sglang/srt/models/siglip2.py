@@ -176,6 +176,8 @@ class Siglip2Attention(nn.Module):
         config: Siglip2VisionConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        qkv_backend: Optional[str] = None,
+        use_data_parallel: bool = False,
     ):
         super().__init__()
         self.config = config
@@ -200,6 +202,8 @@ class Siglip2Attention(nn.Module):
             flatten_batch=True,  # For variable-length sequence support
             quant_config=quant_config,
             prefix=prefix,
+            qkv_backend=qkv_backend,
+            use_data_parallel=use_data_parallel,
         )
 
     def forward(
@@ -234,6 +238,7 @@ class Siglip2MLP(nn.Module):
         config: Siglip2VisionConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        use_data_parallel: bool = False,
     ):
         super().__init__()
         self.config = config
@@ -244,12 +249,14 @@ class Siglip2MLP(nn.Module):
             config.intermediate_size,
             quant_config=quant_config,
             prefix=add_prefix("fc1", prefix),
+            parallel_group="replicated" if use_data_parallel else "tp",
         )
         self.fc2 = RowParallelLinear(
             config.intermediate_size,
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("fc2", prefix),
+            parallel_group="replicated" if use_data_parallel else "tp",
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -267,6 +274,8 @@ class Siglip2EncoderLayer(nn.Module):
         config: Siglip2VisionConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        qkv_backend: Optional[str] = None,
+        use_data_parallel: bool = False,
     ):
         super().__init__()
         self.embed_dim = config.hidden_size
@@ -275,12 +284,15 @@ class Siglip2EncoderLayer(nn.Module):
             config,
             quant_config=quant_config,
             prefix=add_prefix("self_attn", prefix),
+            qkv_backend=qkv_backend,
+            use_data_parallel=use_data_parallel,
         )
         self.layer_norm2 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
         self.mlp = Siglip2MLP(
             config,
             quant_config=quant_config,
             prefix=add_prefix("mlp", prefix),
+            use_data_parallel=use_data_parallel,
         )
 
     def forward(
@@ -324,6 +336,8 @@ class Siglip2Encoder(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         num_hidden_layers_override: Optional[int] = None,
         prefix: str = "",
+        qkv_backend: Optional[str] = None,
+        use_data_parallel: bool = False,
     ):
         super().__init__()
         self.config = config
@@ -339,6 +353,8 @@ class Siglip2Encoder(nn.Module):
                     config=config,
                     quant_config=quant_config,
                     prefix=add_prefix(f"layers.{idx}", prefix),
+                    qkv_backend=qkv_backend,
+                    use_data_parallel=use_data_parallel,
                 )
                 for idx in range(num_hidden_layers)
             ]
@@ -426,6 +442,8 @@ class Siglip2VisionTransformer(nn.Module):
         num_hidden_layers_override: Optional[int] = None,
         require_post_norm: Optional[bool] = None,
         prefix: str = "",
+        qkv_backend: Optional[str] = None,
+        use_data_parallel: bool = False,
     ):
         super().__init__()
         embed_dim = config.hidden_size
@@ -436,6 +454,8 @@ class Siglip2VisionTransformer(nn.Module):
             quant_config=quant_config,
             num_hidden_layers_override=num_hidden_layers_override,
             prefix=add_prefix("encoder", prefix),
+            qkv_backend=qkv_backend,
+            use_data_parallel=use_data_parallel,
         )
         num_hidden_layers = config.num_hidden_layers
         if len(self.encoder.layers) > config.num_hidden_layers:
@@ -513,6 +533,8 @@ class Siglip2Model(nn.Module):
         num_hidden_layers_override: Optional[int] = None,
         require_post_norm: Optional[bool] = None,
         prefix: str = "",
+        qkv_backend: Optional[str] = None,
+        use_data_parallel: bool = False,
     ):
         super().__init__()
 
@@ -522,6 +544,8 @@ class Siglip2Model(nn.Module):
             num_hidden_layers_override=num_hidden_layers_override,
             require_post_norm=require_post_norm,
             prefix=add_prefix("vision_model", prefix),
+            qkv_backend=qkv_backend,
+            use_data_parallel=use_data_parallel,
         )
 
     @property

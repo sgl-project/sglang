@@ -45,12 +45,18 @@ class EvictDeviceNextNodeResult(BaseEvictionResult):
 
     ``node_id`` selects a leaf for the Controller to evict. ``made_progress``
     also covers an internal tombstone that returned no leaf, distinguishing it
-    from true walk exhaustion.
+    from true walk exhaustion. ``mamba_backup_node_id`` and
+    ``swa_backup_node_id`` pause an internal eviction until the Controller
+    finishes its best-effort host backup. ``swa_backup_num_tokens`` includes
+    all unbacked SWA segments in the backup window, not just the victim.
     """
 
     node_id: Optional[NodeId] = None
     made_progress: bool = False
     unbacked_tokens: int = 0
+    mamba_backup_node_id: Optional[NodeId] = None
+    swa_backup_node_id: Optional[NodeId] = None
+    swa_backup_num_tokens: int = 0
 
 
 class EvictDeviceLeafResult(BaseEvictionResult):
@@ -120,7 +126,11 @@ if TYPE_CHECKING:
         MatchResult,
     )
     from sglang.srt.mem_cache.events import KVCacheEventRecorder
-    from sglang.srt.mem_cache.hicache_storage import PoolTransfer, PoolTransferResult
+    from sglang.srt.mem_cache.hicache_storage import (
+        PoolName,
+        PoolTransfer,
+        PoolTransferResult,
+    )
     from sglang.srt.mem_cache.radix_cache import RadixKey
     from sglang.srt.mem_cache.unified_cache.cache_action import (
         BackupKV,
@@ -174,6 +184,14 @@ class UnifiedTreeCoreInterface(ABC):
         its tree node.
 
         TODO(Jialin): Remove after the Unified Radix Cache split.
+        """
+        ...
+
+    @abstractmethod
+    def is_write_through_compatible(self) -> bool:
+        """Whether current host ownership satisfies write-through invariants.
+
+        Read-only; the caller must have drained in-flight cache operations.
         """
         ...
 
@@ -282,6 +300,15 @@ class UnifiedTreeCoreInterface(ABC):
         counts; the result carries the freed slots."""
         ...
 
+    def dec_window_lock_only(
+        self,
+        node_id: NodeId,
+        component_type: ComponentType,
+        params: DecLockRefParams,
+    ) -> DecSwaLockOnlyResult:
+        """Release one window's receipt without releasing peer components."""
+        raise NotImplementedError("This tree core does not support independent windows")
+
     # ==== Device eviction (driven step-wise by the Controller's evict()) ====
 
     @abstractmethod
@@ -308,6 +335,24 @@ class UnifiedTreeCoreInterface(ABC):
     ) -> EvictDeviceLeafResult:
         """Evict a leaf's device value; the result carries a BackupKV when a
         D->H backup must run (write_back) before the node can be demoted."""
+        ...
+
+    @abstractmethod
+    def finish_mamba_state_eviction(self, node_id: NodeId) -> EvictDeviceNextNodeResult:
+        """Resume the pending internal Mamba eviction after its backup attempt.
+
+        The controller must finish any submitted D->H transfer before calling.
+        A failed allocation still permits eviction to make device space.
+        """
+        ...
+
+    @abstractmethod
+    def finish_swa_state_eviction(self, node_id: NodeId) -> EvictDeviceNextNodeResult:
+        """Resume the pending internal SWA eviction after its backup attempt.
+
+        The controller must finish any submitted D->H transfer before calling.
+        A failed allocation still permits eviction to make device space.
+        """
         ...
 
     @abstractmethod
@@ -349,6 +394,10 @@ class UnifiedTreeCoreInterface(ABC):
         """Evictable token count for one component (0 if the component is absent)."""
         ...
 
+    def component_protected_size(self, component_type: ComponentType) -> int:
+        """Protected token count for one component (0 if absent)."""
+        raise NotImplementedError("This tree core does not expose per-component sizes")
+
     @abstractmethod
     def full_evictable_size(self) -> int: ...
 
@@ -388,7 +437,7 @@ class UnifiedTreeCoreInterface(ABC):
 
     @abstractmethod
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
-        """Match a key against the tree; returns device indices + boundary NodeIds."""
+        """Match a key; returns the device prefix length + boundary NodeIds."""
         ...
 
     @abstractmethod
@@ -413,7 +462,7 @@ class UnifiedTreeCoreInterface(ABC):
     @property
     @abstractmethod
     def empty_match_result(self) -> MatchResult:
-        """A shared empty MatchResult (empty device indices + boundary NodeIds)."""
+        """A shared empty MatchResult (zero device prefix + boundary NodeIds)."""
         ...
 
     @abstractmethod
@@ -496,6 +545,20 @@ class UnifiedTreeCoreInterface(ABC):
         """Read a node's device->host backup spec (device value + transfers) now."""
         ...
 
+    def buffer_backup_pool_keys(
+        self, node_id: NodeId, hash_values: list[str]
+    ) -> dict[ComponentType, dict[PoolName, list[str]]]:
+        """Per component, the storage keys per pool a buffer-mode backup of
+        the node writes (``TreeComponent.buffer_backup_keys``); Rust cores name none."""
+        return {}
+
+    def build_backup_kv_action(self, node_id: NodeId) -> BackupKV:
+        """The write-through backup action for a node and its unstored
+        ancestors; only component-requested buffer backups need it."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not expose build_backup_kv_action"
+        )
+
     @abstractmethod
     def build_storage_backup_spec(
         self, node_id: NodeId, pass_prefix_keys: bool
@@ -510,6 +573,9 @@ class UnifiedTreeCoreInterface(ABC):
         node_id: NodeId,
         phase: CacheTransferPhase,
         *,
+        # TODO(Jialin): Remove the legacy `host_indices` argument from the
+        # interface and bindings. Prefetch uses `staging_tokens`;
+        # `PoolTransfer.host_indices` is populated after the storage hit.
         host_indices: Optional[torch.Tensor] = None,
         token_ids: Optional[Sequence[int]] = None,
         prefetch_tokens: int = 0,
@@ -624,6 +690,29 @@ class UnifiedTreeCoreInterface(ABC):
     def finish_write_through(self, node_ids: list[NodeId], ack_id: int) -> None:
         """Clear the write-through-pending mark (when it matches ack_id) and record the
         host store event for each acked node."""
+        ...
+
+    @abstractmethod
+    def swa_tombstone_ranges(
+        self, key: RadixKey, start: int, end: int
+    ) -> list[tuple[int, int]]:
+        """Return maximal missing SWA ranges within the matched [start, end) span."""
+        ...
+
+    @abstractmethod
+    def attach_swa_window(
+        self,
+        key: RadixKey,
+        window_start: int,
+        window_end: int,
+        swa_values: torch.Tensor,
+    ) -> list[CacheAction | ComponentAction]:
+        """Attach a loaded SWA window to tombstoned spans, returning split actions.
+
+        The shared pipeline supplies page-aligned logical token offsets and
+        int64 values on the core's device. The entire span must be matched and
+        tombstoned before publication.
+        """
         ...
 
     @abstractmethod

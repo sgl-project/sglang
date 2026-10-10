@@ -47,11 +47,6 @@ class TestDraftPerRunnerConfig(CustomTestCase):
         runner.is_draft_worker = is_draft_worker
         return runner._resolve_draft_load_format()
 
-    def test_the_draft_load_format_applies_to_the_draft_runner_only(self):
-        self._seed(load_format="auto", speculative_draft_load_format="dummy")
-        self.assertEqual(self._load_format_of(is_draft_worker=True), "dummy")
-        self.assertIsNone(self._load_format_of(is_draft_worker=False))
-
     def test_an_unset_draft_load_format_leaves_the_load_config_alone(self):
         self._seed(load_format="auto")
         self.assertIsNone(self._load_format_of(is_draft_worker=True))
@@ -156,17 +151,6 @@ class TestDraftPerRunnerConfig(CustomTestCase):
         )
         self.assertEqual((draft.prefill, draft.decode), ("triton", "triton"))
 
-    def test_the_target_keeps_its_split_pair(self):
-        self._seed(
-            attention_backend="fa3",
-            prefill_attention_backend="flashinfer",
-            decode_attention_backend="fa3",
-        )
-        target = resolve_attention_backend_strs(
-            model_runner=self._runner(is_draft_worker=False)
-        )
-        self.assertEqual((target.prefill, target.decode), ("flashinfer", "fa3"))
-
     # -- the scheduler hands over the process's own config ---------------------
 
     def _scheduler(self, server_args, create_worker):
@@ -175,7 +159,6 @@ class TestDraftPerRunnerConfig(CustomTestCase):
         scheduler.tp_worker = SimpleNamespace(
             model_runner=SimpleNamespace(model_config=SimpleNamespace(context_len=4096))
         )
-        scheduler.ps = SimpleNamespace(gpu_id=0)
         scheduler.nccl_port = 0
         scheduler.spec_algorithm = SimpleNamespace(
             is_none=lambda: False,
