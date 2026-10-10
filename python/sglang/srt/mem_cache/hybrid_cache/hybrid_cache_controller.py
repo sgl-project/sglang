@@ -29,6 +29,7 @@ from sglang.srt.managers.cache_controller import (
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageExtraInfo,
+    LayerShardStorageSpec,
     PoolHitPolicy,
     PoolName,
     PoolTransfer,
@@ -45,6 +46,7 @@ from sglang.srt.runtime_context import get_memory
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+    from sglang.srt.mem_cache.layer_split.layer_split_config import StagingBufferConfig
 
 from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.srt.utils import broadcast_pyobj
@@ -198,6 +200,10 @@ class PrefetchSubmission:
 
 
 class HybridCacheController(BaseHiCacheController):
+    staging_engine = None
+    _staging_buffer_config = None
+    _layer_split_direct = False
+
     def __init__(
         self,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
@@ -217,7 +223,16 @@ class HybridCacheController(BaseHiCacheController):
         transfer_layer_id_max: Optional[int] = None,
         enable_storage_metrics: bool = False,
         host_memory_mode: str = "cache",
+        staging_buffer_config: Optional[StagingBufferConfig] = None,
+        layer_split_direct: bool = False,
     ):
+        if staging_buffer_config is not None and layer_split_direct:
+            raise ValueError(
+                "LayerSplit direct and staged storage are mutually exclusive"
+            )
+        self.staging_engine = None
+        self._staging_buffer_config = staging_buffer_config
+        self._layer_split_direct = layer_split_direct
         startup_storage_backend = storage_backend
         self.extra_host_mem_release_queues: dict[PoolName, Queue[torch.Tensor]] = {}
         self.pp_prefetch_command_group = None
@@ -264,6 +279,9 @@ class HybridCacheController(BaseHiCacheController):
             )
 
     def _start_storage_threads(self):
+        if self._layer_split_direct:
+            self.backup_skip = self.storage_config.layer_shard.empty
+        self._maybe_init_staging_engine()
         super()._start_storage_threads()
         self._init_extra_host_mem_release_queues()
         if self.pp_prefetch_command_group is not None:
@@ -272,6 +290,47 @@ class HybridCacheController(BaseHiCacheController):
                 target=self.pp_prefetch_command_thread_func, daemon=True
             )
             self.pp_prefetch_command_thread.start()
+
+    def _maybe_init_staging_engine(self):
+        if self._staging_buffer_config is None or self.staging_engine is not None:
+            return
+        from sglang.srt.mem_cache.layer_split.layer_split_engine import (
+            LayerSplitTransferEngine,
+        )
+
+        self.staging_engine = LayerSplitTransferEngine.for_controller(
+            self, self._staging_buffer_config
+        )
+        self.staging_engine.attach()
+        self.backup_skip = False
+
+    def _generate_storage_config(
+        self, model_name=None, storage_backend_extra_config=None
+    ):
+        config = super()._generate_storage_config(
+            model_name, storage_backend_extra_config
+        )
+        if self._staging_buffer_config is not None:
+            from sglang.srt.mem_cache.layer_split.layer_split_engine import (
+                LayerSplitTransferEngine,
+            )
+
+            return LayerSplitTransferEngine.configure_storage(config)
+        if self._layer_split_direct:
+            from sglang.srt.mem_cache.layer_split.layer_split_host_view import (
+                LayerSplitHostView,
+            )
+
+            view = LayerSplitHostView(self.mem_pool_host)
+            device = self.mem_pool_host.entry_map[PoolName.KV].device_pool
+            start, end = device._owned_local_layer_range()
+            return replace(
+                config,
+                layer_shard=LayerShardStorageSpec(
+                    view.shard_rank, view.shard_size, view.layer_count, start, end
+                ),
+            )
+        return config
 
     def _stop_pp_prefetch_thread(self) -> None:
         thread = self.pp_prefetch_command_thread
@@ -301,6 +360,11 @@ class HybridCacheController(BaseHiCacheController):
         storage_backend_extra_config: Optional[dict] = None,
         host_pools: Optional[list[PoolEntry]] = None,
     ):
+        if self._layer_split_direct or self._staging_buffer_config is not None:
+            if storage_backend not in ("mooncake", "flashkv"):
+                raise ValueError("LayerSplit storage requires mooncake or flashkv")
+            if self.host_memory_mode != "cache":
+                raise ValueError("LayerSplit storage requires cache host memory mode")
         if isinstance(
             self.storage_host_pool, UnifiedPageEnvelopeHostPool
         ) and not self.supports_page_envelope_host(storage_backend):
@@ -342,6 +406,11 @@ class HybridCacheController(BaseHiCacheController):
             self.storage_backend.register_mem_host_pool_v2(entry.host_pool, entry.name)
 
     def detach_storage_backend(self):
+        if self.staging_engine is not None:
+            self._stop_storage_threads()
+            self.staging_engine.detach()
+            self.staging_engine = None
+            self.backup_skip = True
         super().detach_storage_backend()
         if self.pp_prefetch_command_group is not None:
             torch.distributed.destroy_process_group(self.pp_prefetch_command_group)
@@ -482,6 +551,9 @@ class HybridCacheController(BaseHiCacheController):
 
     def reset(self):
         self._stop_pp_prefetch_thread()
+        if self.staging_engine is not None:
+            self._stop_storage_threads()
+            self.staging_engine.reset()
         super().reset()
         with self.pp_prefetch_state_lock:
             self.pp_prefetch_states.clear()
@@ -781,6 +853,32 @@ class HybridCacheController(BaseHiCacheController):
         min_tokens: int,
         evict_host: Callable[[int], int],
     ) -> tuple[Optional[torch.Tensor], int]:
+        indices, length = self._allocate_storage_hit(
+            operation,
+            hit_tokens,
+            allow_partial=allow_partial,
+            min_tokens=min_tokens,
+            evict_host=evict_host,
+        )
+        if self.staging_engine is not None:
+            # Query hits are rank-agreed; local L2 allocation can still fail
+            # or shorten under pressure. Agree before building any window plan.
+            agreed = self.staging_engine.align_prefetch_allocation(
+                operation, length if indices is not None else 0
+            )
+            if indices is not None:
+                if agreed < min_tokens:
+                    self.free_prefetch_host_buffers(operation, indices)
+                    indices = None
+                elif agreed < length:
+                    self.mem_pool_host.free(indices[agreed:])
+                    indices = indices[:agreed]
+            length = agreed
+        return indices, length
+
+    def _allocate_storage_hit(
+        self, operation, hit_tokens, *, allow_partial, min_tokens, evict_host
+    ):
         host_indices = self.alloc_prefetch_host_buffers(operation, hit_tokens)
         shared = uses_shared_host_layout(self.mem_pool_host.anchor_entry.host_pool)
         if host_indices is None and not shared:
@@ -1015,6 +1113,8 @@ class HybridCacheController(BaseHiCacheController):
             pool_transfers=extra_pools,
             assume_stored=assume_stored,
         )
+        if self.staging_engine is not None:
+            self.staging_engine.prepare_prefetch(operation)
         self.prefetch_queue.put(operation)
         return operation
 
@@ -1335,7 +1435,7 @@ class HybridCacheController(BaseHiCacheController):
         hash_value: Optional[List[str]] = None,
         prefix_keys: Optional[List[str]] = None,
         extra_pools: Optional[list[PoolTransfer]] = None,
-    ) -> int:
+    ) -> Optional[int]:
         operation = StorageOperation(
             host_indices,
             token_ids,
@@ -1343,6 +1443,8 @@ class HybridCacheController(BaseHiCacheController):
             prefix_keys=prefix_keys,
             pool_transfers=extra_pools,
         )
+        if self.staging_engine is not None:
+            return self.staging_engine.enqueue_backup(operation)
         self.backup_queue.put(operation)
         return operation.id
 
@@ -1465,6 +1567,8 @@ class HybridCacheController(BaseHiCacheController):
             return self._page_transfer_with_stable_layout(operation)
 
     def _page_transfer_with_stable_layout(self, operation: PrefetchOperation) -> None:
+        if self.staging_engine is not None:
+            return self.staging_engine.prefetch(operation)
         # KV pools and KV-derived pools first — determines actual completed page count
         kv_completed_pages = super()._page_transfer(operation)
 
@@ -1552,6 +1656,8 @@ class HybridCacheController(BaseHiCacheController):
             return self._page_backup_with_stable_layout(operation)
 
     def _page_backup_with_stable_layout(self, operation):
+        if self.staging_engine is not None:
+            return self.staging_engine.backup(operation)
         # MLA KV is replicated across TP ranks and should still be written only
         # by TP0. Rank-sharded sidecars still need every TP rank.
         backup_transfers = [

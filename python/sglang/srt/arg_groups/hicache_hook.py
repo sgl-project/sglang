@@ -23,6 +23,7 @@ def handle_hicache(server_args: Any):
     2) Storage <-> layout compatibility (may rewrite layout).
     """
     cfg = resolving_view(server_args)
+    validate_layer_split_storage(cfg)
     if cfg.enable_linker_mla_dedup and (
         not cfg.enable_unified_cache_external_linker
         or cfg.unified_cache_external_linker_backend != "mooncake"
@@ -178,6 +179,9 @@ def resolve_layout_io_compatibility(server_args: Any):
 
 def resolve_storage_layout_compatibility(server_args: Any):
     cfg = resolving_view(server_args)
+    if cfg.enable_dsa_cache_layer_split:
+        # Both direct shard objects and canonical staging use native layer_first.
+        return
     if (
         cfg.hicache_storage_backend not in ("mooncake", "npu_memcache")
         or cfg.hicache_mem_layout != "layer_first"
@@ -201,6 +205,37 @@ def resolve_storage_layout_compatibility(server_args: Any):
         f"Mooncake/Ascend MemCache storage backend does not support layer_first layout, "
         f"switching to {new_layout} layout for {cfg.hicache_io_backend} io backend"
     )
+
+
+def validate_layer_split_storage(cfg):
+    """Validate the existing LayerSplit layout before generic normalization."""
+    staged = cfg.enable_hicache_layer_split_staging
+    if not staged and not (
+        cfg.enable_hierarchical_cache
+        and cfg.enable_dsa_cache_layer_split
+        and cfg.hicache_storage_backend
+    ):
+        return
+    if cfg.hicache_storage_backend not in ("mooncake", "flashkv"):
+        raise ValueError("LayerSplit L3 storage requires mooncake or flashkv")
+    if not cfg.enable_hierarchical_cache or not cfg.enable_dsa_cache_layer_split:
+        raise ValueError("LayerSplit staging requires HiCache and DSA layer split")
+    if cfg.hicache_host_memory_mode != "cache":
+        raise ValueError(
+            "LayerSplit L3 storage currently requires cache host memory mode"
+        )
+    if cfg.hicache_mem_layout != "layer_first":
+        raise ValueError("LayerSplit L3 storage requires layer_first")
+    if cfg.hicache_io_backend not in ("kernel", "direct"):
+        raise ValueError("LayerSplit L3 storage requires kernel or direct host I/O")
+    if cfg.pp_size != 1 or cfg.disaggregation_mode != "prefill":
+        raise ValueError("LayerSplit L3 storage requires a PP=1 PD prefill worker")
+    if cfg.enable_unified_memory or cfg.enable_unified_cache_external_linker:
+        raise ValueError(
+            "LayerSplit L3 storage requires separate persistent host pools"
+        )
+    if cfg.speculative_algorithm or cfg.speculative_draft_model_path:
+        raise ValueError("LayerSplit L3 storage does not support draft layers")
 
 
 def validate_hicache_host_memory_mode(server_args: Any):
