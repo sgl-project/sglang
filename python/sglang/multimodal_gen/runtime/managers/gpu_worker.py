@@ -175,6 +175,27 @@ def _worker_cpu_intra_op_threads(num_gpus: int) -> int | None:
     return max(1, min(16, cpu_count // max(1, num_gpus)))
 
 
+def _bind_worker_to_gpu_numa_node(
+    server_args: ServerArgs, local_rank: int
+) -> int | None:
+    """Bind this worker's CPUs and host memory to its GPU's NUMA node, as srt does.
+
+    Must run before CUDA init and model load so first-touch host memory lands
+    on that node; an unbound worker drifts across sockets and every
+    host-bound op pays remote-memory latency.
+    """
+    from sglang.srt.utils.numa_utils import (
+        get_numa_node_if_available,
+        numa_bind_to_node,
+    )
+
+    numa_node = get_numa_node_if_available(server_args, local_rank)
+    if numa_node is not None:
+        numa_bind_to_node(numa_node)
+        logger.info("GPU %d worker bound to NUMA node %d", local_rank, numa_node)
+    return numa_node
+
+
 OFFLOAD_DISABLE_RECOMMENDATION_ORDER = (
     "vae",
     "image_encoder",
@@ -1756,6 +1777,7 @@ def run_scheduler_process(
     kill_itself_when_parent_died()
     configure_logger(server_args)
     globally_suppress_loggers()
+    _bind_worker_to_gpu_numa_node(server_args, local_rank)
 
     if current_platform.is_cuda():
         set_cuda_arch()
