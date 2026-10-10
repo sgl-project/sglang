@@ -81,6 +81,7 @@ from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStatePacker,
 )
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
+from sglang.srt.layers.cp.utils import cp_gather_full_sequence_states
 from sglang.srt.layers.dcp.planner import (
     prepare_decode_context_parallel_metadata,
 )
@@ -2299,6 +2300,20 @@ class DeepseekV2AttentionMLA(
         else:
             state.hidden_states_after_attn = result
 
+    def rebuild_cp_kv_cache(self, latent_cache, forward_batch, k_nope, k_pe):
+        # CP V2: gather the rank-local latent KV into full sequence order
+        # (the Ascend sparse attention reads the full KV pool).
+        latent_cache[..., : self.kv_lora_rank] = k_nope.squeeze(1)
+        latent_cache[..., self.kv_lora_rank :] = k_pe.squeeze(1)
+        latent_cache_output = cp_gather_full_sequence_states(
+            latent_cache.contiguous(),
+            forward_batch,
+            torch.npu.current_stream(),
+        )
+        k_nope = latent_cache_output[..., : self.kv_lora_rank].unsqueeze(1)
+        k_pe = latent_cache_output[..., self.kv_lora_rank :].unsqueeze(1)
+        return k_nope, k_pe
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -3049,6 +3064,7 @@ class DeepseekV2Model(nn.Module):
                 "topk_indices from the previous stage."
             )
         device = hidden_states.device
+
         zero_allocator = BumpAllocator(
             buffer_size=total_num_layers * 2 * (2 if forward_batch.can_run_tbo else 1),
             dtype=torch.float32,
