@@ -1608,7 +1608,15 @@ class SchedulerBatchResultProcessor:
                 return True, committed_len
         elif result.num_correct_drafts_per_req_cpu is not None:
             cur = req.seqlen - 1
-            prev = cur - result.num_correct_drafts_per_req_cpu[i] - 1
+            num_non_draft = result.num_non_draft_tokens_per_req
+            retained = result.grammar_retained_tokens
+            if retained is not None and retained[i] is not None:
+                # NOTE(kpham-sgl): grammar-truncated run, minus non-draft
+                # tokens ahead of the tracked verify window (UNO's root).
+                num_committed = max(len(retained[i]) - (num_non_draft - 1), 0)
+            else:
+                num_committed = result.num_correct_drafts_per_req_cpu[i] + 1
+            prev = cur - num_committed
             if cur // interval != prev // interval:
                 return True, cur // interval * interval
 
