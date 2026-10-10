@@ -778,9 +778,9 @@ class DataParallelController:
             raise RuntimeError("No active DP workers are available for health checks.")
 
         slot = active[self.health_round_robin_counter % len(active)]
-        self.health_round_robin_counter = (
-            self.health_round_robin_counter + 1
-        ) % len(active)
+        self.health_round_robin_counter = (self.health_round_robin_counter + 1) % len(
+            active
+        )
         logger.debug(f"Choose worker {slot} for health check")
         sock_send(self.workers[slot], req)
 
