@@ -23,6 +23,7 @@ class StoragePrefetchRetries:
     def __init__(self):
         self._pending: dict[str, _StoragePrefetchRetry] = {}
         self._step = 0
+        self._device_covered_ends: dict[str, int] = {}
 
     def poll_miss(self, req_id: str, storage_hit_end: Optional[int] = None) -> None:
         self._pending[req_id] = _StoragePrefetchRetry(False, storage_hit_end)
@@ -30,11 +31,22 @@ class StoragePrefetchRetries:
     def refetch(self, req_id: str, storage_hit_end: Optional[int] = None) -> None:
         self._pending[req_id] = _StoragePrefetchRetry(True, storage_hit_end)
 
+    def device_covered(self, req_id: str, covered_end: int) -> None:
+        """Remember the device span that made an L3 read redundant."""
+        self._device_covered_ends[req_id] = max(
+            self._device_covered_ends.get(req_id, 0), covered_end
+        )
+
+    def pop_device_covered_end(self, req_id: str) -> int:
+        return self._device_covered_ends.pop(req_id, 0)
+
     def cancel(self, req_id: str) -> None:
         self._pending.pop(req_id, None)
+        self._device_covered_ends.pop(req_id, None)
 
     def clear(self) -> None:
         self._pending.clear()
+        self._device_covered_ends.clear()
 
     def pop_ready(
         self, waiting_queue: list[Req], interval: int, max_attempts: int
