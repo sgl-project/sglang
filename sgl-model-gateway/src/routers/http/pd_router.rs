@@ -10,7 +10,7 @@ use axum::{
     },
     response::{IntoResponse, Response},
 };
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
 use memchr::memmem;
 use reqwest::Client;
 use serde::Serialize;
@@ -456,8 +456,6 @@ impl PDRouter {
                             .is_some();
                         if !outcomes_already_recorded {
                             let not_error = status.is_success() || status.is_client_error();
-                            // Prefill is always non-streaming and fully read before
-                            // we get here, so its outcome is final.
                             prefill.record_outcome(not_error);
                             // Decode for a streaming request is still mid-flight at
                             // this point; the `BreakerTrackedStream` wrapped around
@@ -829,23 +827,21 @@ impl PDRouter {
                     return response;
                 }
 
-                // Process prefill response
-                let prefill_body = if context.return_logprob {
+                let mut prefill_drain = None;
+                let prefill_body = if context.is_stream && !context.return_logprob {
+                    prefill_drain = Some(Box::pin(
+                        prefill_result
+                            .expect("Prefill status was checked above")
+                            .bytes(),
+                    ));
+                    None
+                } else {
                     match self
                         .process_prefill_response(
                             prefill_result,
                             prefill.url(),
                             context.return_logprob,
                         )
-                        .await
-                    {
-                        Ok((_, body)) => body,
-                        Err(error_response) => return error_response,
-                    }
-                } else {
-                    // Even if we don't need logprobs, we should check prefill status
-                    match self
-                        .process_prefill_response(prefill_result, prefill.url(), false)
                         .await
                     {
                         Ok((_, body)) => body,
@@ -868,8 +864,21 @@ impl PDRouter {
 
                     let response_headers = header_utils::preserve_response_headers(res.headers());
 
+                    let mut decode_stream = Box::pin(res.bytes_stream());
+                    let stream = futures_util::stream::poll_fn(move |cx| {
+                        if let Some(drain) = prefill_drain.as_mut() {
+                            if let std::task::Poll::Ready(result) = drain.poll_unpin(cx) {
+                                if let Err(error) = result {
+                                    warn!("Error consuming prefill response: {}", error);
+                                }
+                                prefill_drain = None;
+                            }
+                        }
+                        decode_stream.poll_next_unpin(cx)
+                    });
+
                     self.create_streaming_response(
-                        res.bytes_stream(),
+                        stream,
                         status,
                         prefill_logprobs,
                         context.return_logprob,
@@ -1789,6 +1798,115 @@ mod tests {
             .build();
         worker.set_healthy(healthy);
         Box::new(worker)
+    }
+
+    #[tokio::test]
+    async fn streaming_decode_does_not_wait_for_prefill_body() {
+        use axum::{routing::post, Router};
+        use bytes::Bytes;
+        use tokio::{
+            sync::{mpsc, Mutex},
+            time::{timeout, Duration},
+        };
+
+        for ending in ["done", "eof", "disconnect"] {
+            let mut workers: Vec<Arc<dyn Worker>> = Vec::new();
+            let mut senders = Vec::new();
+            let mut servers = Vec::new();
+            for role in [
+                WorkerType::Prefill {
+                    bootstrap_port: None,
+                },
+                WorkerType::Decode,
+            ] {
+                let (tx, rx) = mpsc::unbounded_channel::<Result<Bytes, std::io::Error>>();
+                tx.send(Ok(Bytes::from_static(b": keep-alive\n\n")))
+                    .unwrap();
+                let receiver = Arc::new(Mutex::new(Some(rx)));
+                let app = Router::new().route(
+                    "/v1/responses",
+                    post(move || {
+                        let receiver = receiver.clone();
+                        async move {
+                            Body::from_stream(UnboundedReceiverStream::new(
+                                receiver.lock().await.take().unwrap(),
+                            ))
+                        }
+                    }),
+                );
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let url = format!("http://{}", listener.local_addr().unwrap());
+                servers.push(tokio::spawn(async move {
+                    axum::serve(listener, app).await.unwrap()
+                }));
+                workers.push(Arc::from(create_test_worker(url, role, true)));
+                senders.push(tx);
+            }
+            let context = PDRequestContext {
+                route: "/v1/responses",
+                batch_size: None,
+                is_stream: true,
+                return_logprob: false,
+                request_text: None,
+                model_id: None,
+                headers: None,
+            };
+            let router = create_test_pd_router();
+            let response = timeout(
+                Duration::from_secs(2),
+                router.execute_dual_dispatch_internal(
+                    None,
+                    json!({"input": "hello", "stream": true}),
+                    context,
+                    workers[0].clone(),
+                    workers[1].clone(),
+                    Instant::now(),
+                ),
+            )
+            .await
+            .expect("decode headers must not wait for the prefill body");
+            assert_eq!(response.status(), StatusCode::OK);
+            let mut body = response.into_body().into_data_stream();
+            assert_eq!(
+                timeout(Duration::from_secs(2), body.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap(),
+                Bytes::from_static(b": keep-alive\n\n")
+            );
+            if ending == "done" {
+                senders[1]
+                    .send(Ok(Bytes::from_static(b"data: [DONE]\n\n")))
+                    .unwrap();
+                assert_eq!(
+                    timeout(Duration::from_secs(2), body.next())
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .unwrap(),
+                    Bytes::from_static(b"data: [DONE]\n\n")
+                );
+            }
+            if ending == "eof" {
+                senders.pop();
+            }
+            if ending != "disconnect" {
+                assert!(timeout(Duration::from_secs(2), body.next())
+                    .await
+                    .unwrap()
+                    .is_none());
+            }
+            drop(body);
+            for sender in senders {
+                timeout(Duration::from_secs(2), sender.closed())
+                    .await
+                    .expect("upstream body must close with the client stream");
+            }
+            for server in servers {
+                server.abort();
+            }
+        }
     }
 
     #[test]
