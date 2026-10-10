@@ -11,6 +11,7 @@ from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.utils import should_skip_post_experts_all_reduce
+from sglang.srt.models.deepseek_common.amd import dsv41_mono_decode
 from sglang.srt.models.deepseek_v2 import MoEOutput
 from sglang.srt.models.deepseek_v4_mhc import AttnOutput
 from sglang.srt.runtime_context import (
@@ -600,15 +601,28 @@ def forward_hc_pre_from_prev_fused_boundary(
     x, x_quant = layer._input_norm(
         x, allow_aiter_quant=False, coefficients=attn_coefficients
     )
+    mono = dsv41_mono_decode.ffn_launch(layer, forward_batch, residual.shape[0])
     with layer.self_attn.maybe_use_decode_attn_tp(forward_batch):
-        mhc = attention_mhc_fusion(layer, residual, attn_coefficients, forward_batch)
+        mhc = (
+            None
+            if mono is not None
+            else attention_mhc_fusion(layer, residual, attn_coefficients, forward_batch)
+        )
         x = layer.self_attn(
             x=x,
             positions=positions,
             forward_batch=forward_batch,
             x_quant=x_quant,
-            defer_all_reduce=mhc is not None,
+            defer_all_reduce=mhc is not None or mono is not None,
         )
+    if mono is not None:
+        # the FFN launch reduces wo_b's partials itself; an attention that reduced them fails loud
+        assert isinstance(x, AttnOutput)
+        pre, post, comb = attn_coefficients.tensors()
+        x, residual, post, comb, pre = mono(x.partial, residual, post, comb, pre)
+        if defer_post:
+            return None, pre, (x, residual, post, comb)
+        return layer.hc_post(x, residual, post, comb), pre, None
     if mhc is not None:
         # wo_b honors the deferred reduce under attention_mhc_fusion's gates;
         # fail loud rather than fall back to an unfused reduce.

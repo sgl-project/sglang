@@ -159,6 +159,7 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models import deepseek_v4_mhc as mhc
 from sglang.srt.models.dbrx import ReplicatedLinear
+from sglang.srt.models.deepseek_common.amd import dsv41_mono_decode
 from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
     apply_mhc_post_pre_boundary,
     is_cross_layer_mhc_fusion_enabled,
@@ -5094,6 +5095,14 @@ class DeepseekV4ForCausalLM(nn.Module):
                         )
                     ):
                         continue
+                    if (
+                        envs.SGLANG_ROCM_MONO_DECODE.get()
+                        and not is_nextn
+                        and "mlp.shared_experts" in name
+                    ):
+                        dsv41_mono_decode.stash_shared_expert(
+                            self.model.layers, name, loaded_weight
+                        )
                     if (
                         self.num_fused_shared_experts > 0
                         and "mlp.shared_experts" in name
