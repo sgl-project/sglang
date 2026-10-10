@@ -28,11 +28,11 @@ class TestSchedulerHiCachePrefetch(CustomTestCase):
         tree_cache.hicache_storage_pass_prefix_keys = True
         tree_cache.is_root.side_effect = lambda node: node is root_node
         tree_cache.is_backuped.return_value = False
-        tree_cache.get_last_hash_value.side_effect = (
-            lambda node: "device-hash" if node is device_node else "root-hash"
+        tree_cache.get_last_hash_value.side_effect = lambda node: (
+            "device-hash" if node is device_node else "root-hash"
         )
-        tree_cache.get_prefix_hash_values.side_effect = (
-            lambda node: ["device-prefix-key"] if node is device_node else []
+        tree_cache.get_prefix_hash_values.side_effect = lambda node: (
+            ["device-prefix-key"] if node is device_node else []
         )
 
         scheduler = Scheduler.__new__(Scheduler)
