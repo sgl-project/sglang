@@ -111,6 +111,80 @@ class DeepSeekV3Detector(BaseFormatDetector):
 
         calls: list[ToolCallItem] = []
         try:
+            # A stream backlog (coalesced chunks, or a large --stream-interval)
+            # can deliver several *complete* tool calls in a single increment.
+            # The greedy `partial_match` below would then match from the first
+            # <｜tool▁call▁begin｜> up to the LAST <｜tool▁sep｜>, so every call but
+            # the last one is dropped (see #43523). Parse each complete call
+            # block up front, emit it, and consume it from the buffer.
+            # NOTE: only the multi-call case is handled here; the single-call
+            # "name + args arrive in one delta" gap belongs to #42327/#42328/
+            # #42464 and keeps the original path below.
+            complete_blocks = re.findall(self.func_call_regex, current_text, re.DOTALL)
+            if len(complete_blocks) >= 2:
+                if self.current_tool_id == -1:
+                    self.current_tool_id = 0
+                    self.prev_tool_call_arr = []
+                    self.streamed_args_for_tool = [""]
+
+                # If the name of the first buffered call was already streamed in
+                # an earlier increment, that same call now completes: only its
+                # arguments should be emitted, not a duplicate name item.
+                skip_first_name = self.current_tool_name_sent
+                consumed_end = 0
+                for i, block in enumerate(complete_blocks):
+                    func_detail = re.search(self.func_detail_regex, block, re.DOTALL)
+                    if not func_detail:
+                        continue
+                    func_name = func_detail.group(2).strip()
+                    func_args_raw = func_detail.group(3).strip()
+
+                    while len(self.prev_tool_call_arr) <= self.current_tool_id:
+                        self.prev_tool_call_arr.append({})
+                    while len(self.streamed_args_for_tool) <= self.current_tool_id:
+                        self.streamed_args_for_tool.append("")
+
+                    if not (i == 0 and skip_first_name):
+                        calls.append(
+                            ToolCallItem(
+                                tool_index=self.current_tool_id,
+                                name=func_name,
+                                parameters="",
+                            )
+                        )
+                        self.prev_tool_call_arr[self.current_tool_id] = {
+                            "name": func_name,
+                            "arguments": {},
+                        }
+
+                    if func_args_raw:
+                        calls.append(
+                            ToolCallItem(
+                                tool_index=self.current_tool_id,
+                                name=None,
+                                parameters=func_args_raw,
+                            )
+                        )
+                        try:
+                            parsed_args = json.loads(func_args_raw)
+                            self.prev_tool_call_arr[self.current_tool_id][
+                                "arguments"
+                            ] = parsed_args
+                        except json.JSONDecodeError:
+                            pass
+                        self.streamed_args_for_tool[self.current_tool_id] += (
+                            func_args_raw
+                        )
+
+                    self.current_tool_id += 1
+                    self._last_arguments = ""
+                    consumed_end = current_text.find(block, consumed_end) + len(block)
+
+                # Consume every complete call from the buffer, keep any tail.
+                self._buffer = current_text[consumed_end:]
+                self.current_tool_name_sent = False
+                return StreamingParseResult(normal_text="", calls=calls)
+
             partial_match = re.search(
                 pattern=r"<｜tool▁call▁begin｜>(.*)<｜tool▁sep｜>(.*)\n```json\n(.*)\n```.*",
                 string=current_text,
