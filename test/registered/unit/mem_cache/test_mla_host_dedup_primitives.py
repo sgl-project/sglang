@@ -103,6 +103,50 @@ class TestMLAHostDedupPrimitives(unittest.TestCase):
                 dsa_device_pool, slots, slots, layer_id=0, io_backend="kernel"
             )
 
+    def test_dummy_and_physical_hosts_share_capacity_geometry(self):
+        """Dedup peers must allocate identical IDs despite different host payloads."""
+        for dcp_size in (1, 2):
+            for host_size in (0, 0.000002):
+                with self.subTest(dcp_size=dcp_size, host_size=host_size):
+                    pool = _device_pool_stub(
+                        layer_num=2,
+                        store_dtype=torch.float16,
+                        kv_lora_rank=4,
+                        qk_rope_head_dim=2,
+                        size=8,
+                        host_capacity_tokens=16,
+                        start_layer=7,
+                        end_layer=9,
+                        device="cpu",
+                        kv_buffer=[torch.zeros(10, 1, 6) for _ in range(2)],
+                    )
+                    kwargs = dict(
+                        host_to_device_ratio=2,
+                        host_size=host_size,
+                        page_size=4,
+                        layout="page_first",
+                        pin_memory=False,
+                        dcp_size=dcp_size,
+                    )
+                    host = MLATokenToKVPoolHost(pool, **kwargs)
+                    dummy = MLATokenToKVPoolHost(pool, **kwargs, is_dummy=True)
+                    self.addCleanup(host.destroy)
+                    self.addCleanup(dummy.destroy)
+                    self.assertEqual(
+                        (host.size, host.page_num, host.page_size, host.size_per_token),
+                        (
+                            dummy.size,
+                            dummy.page_num,
+                            dummy.page_size,
+                            dummy.size_per_token,
+                        ),
+                    )
+                    self.assertIsNone(dummy.kv_buffer)
+                    count = host.logical_size // 4 * 4
+                    self.assertEqual(
+                        host.alloc(count).tolist(), dummy.alloc(count).tolist()
+                    )
+
     def test_layer_broadcast_reuses_full_staging_capacity(self):
         broadcaster = MLAHostDedupBroadcaster.__new__(MLAHostDedupBroadcaster)
         broadcaster.is_src = True
