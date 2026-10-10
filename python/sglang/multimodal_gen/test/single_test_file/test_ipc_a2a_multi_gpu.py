@@ -96,8 +96,8 @@ def _worker() -> int:
                     f"pipelined {(s_local, heads, head_dim, groups)} call {call}"
                 )
 
-    # fill: the caller writes each destination block itself (H3's QK-norm does),
-    # own blocks straight into this rank's receive slot
+    # fill: the caller writes each destination's q/k itself (H3's QK-norm does),
+    # own blocks straight into this rank's receive slot; v moves on its own
     def transform(t, scale):
         return (t.float() * scale + 1).to(t.dtype)
 
@@ -116,11 +116,10 @@ def _worker() -> int:
             ]
             q, k, v = (t.narrow(0, rank * s_local, s_local).contiguous() for t in full)
 
-            def fill(head_start, head_count, dst):
+            def fill(head_start, head_count, q_dst, k_dst):
                 h = slice(head_start, head_start + head_count)
-                dst[..., :head_dim].copy_(transform(q[:, h], 2))
-                dst[..., head_dim : 2 * head_dim].copy_(transform(k[:, h], 3))
-                dst[..., 2 * head_dim :].copy_(v[:, h])
+                q_dst.copy_(transform(q[:, h], 2))
+                k_dst.copy_(transform(k[:, h], 3))
 
             ref = sequential(transform(q, 2), transform(k, 3), v)
             got = ulysses_pipelined_attention(q, k, v, _attend, groups, fill=fill)
