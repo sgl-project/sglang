@@ -1280,9 +1280,13 @@ class BufferModePipeline:
         f = self.staged_prefetches.get(req.cache_request_handle)
         if f is None:
             if not (req.host_hit_is_storage and req.host_loaded_length > 0):
-                self._clear_storage_hit(req)
+                self._clip_storage_hit(req)
             return True
         joint_len = req.prefix_len
+        # Preserve the completed L3 span, including peer-covered KV. An aux
+        # fetch can also make resident FULL before that span reusable.
+        req.storage_hit_start = min(f.matched_len, joint_len)
+        req.storage_hit_length = f.matched_len + f.num_tokens - req.storage_hit_start
         if joint_len >= f.matched_len + f.num_tokens:
             # The joint match already covers the staged span; a shorter FULL-only
             # prefix would strand the slots recomputed below cache_protected_len.
@@ -1320,10 +1324,6 @@ class BufferModePipeline:
             return True
         req.host_hit_length = full_tokens
         req.swa_host_hit_length = swa_tokens
-        # The device alone serves only this pass's joint match; the rest of the
-        # span, fetched FULL or resident FULL the aux tail unlocks, is storage's.
-        req.storage_hit_length = f.matched_len + f.num_tokens - joint_len
-        req.storage_hit_start = joint_len
         req.host_hit_is_storage = True
         req.staged_prefetch_plan = StagedPrefetchPlan(
             f.operation_id, key, matched_len, full_tokens, swa_tokens
@@ -1333,13 +1333,12 @@ class BufferModePipeline:
     def _resolve_device_covered(self, req: Req) -> None:
         req.host_hit_length = 0
         req.swa_host_hit_length = 0
-        self._clear_storage_hit(req)
+        self._clip_storage_hit(req)
         self.release_staged_hold(req.cache_request_handle, reason="device_covered")
 
     @staticmethod
-    def _clear_storage_hit(req: Req) -> None:
-        req.storage_hit_length = 0
-        req.storage_hit_start = None
+    def _clip_storage_hit(req: Req) -> None:
+        req.storage_hit_length = req.fulfilled_storage_hit_len(req.prefix_len)
         req.host_hit_is_storage = False
 
     def _refetch_staged(self, f: _StagedPrefetch) -> None:

@@ -3549,6 +3549,9 @@ class UnifiedRadixCacheSuite:
         if prefix_len is None:
             prefix_len = f.matched_len
         req = mock.Mock()
+        req.fulfilled_storage_hit_len.side_effect = lambda length: (
+            Req.fulfilled_storage_hit_len(req, length)
+        )
         req.rid = req_id.rid
         req.cache_request_handle = req_id
         req.extra_key = extra_key
@@ -5713,6 +5716,10 @@ class UnifiedRadixCacheSuite:
             cache_request_handle=req_id,
             prefix_len=live.device_prefix_len,
             last_node=live.last_device_node,
+            host_loaded_length=0,
+        )
+        req.fulfilled_storage_hit_len.side_effect = lambda length: (
+            Req.fulfilled_storage_hit_len(req, length)
         )
         self.assertTrue(cons.buffer_pipeline.prepare_staged_prefetch(req))
         self.assertEqual((req.host_hit_length, req.swa_host_hit_length), (0, 0))
@@ -10743,6 +10750,79 @@ class TestReturnedValuesDrain(_InsertWalkSuite):
         cache.sanity_check()
 
 
+class TestBufferPrefetchAttribution(CustomTestCase):
+    def test_prepare_preserves_completed_span(self):
+        from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
+
+        for (
+            prefix,
+            full_prefix,
+            staged,
+            matched_len,
+            swa_tokens,
+            expected_start,
+            expected,
+        ) in (
+            (512, 512, True, 256, 0, 256, 768),  # Peer-covered head.
+            (1024, 1024, True, 256, 0, 256, 768),  # Peer-covered full span.
+            (512, 512, False, 256, 0, 256, 256),  # Dropped tail, covered head.
+            (128, 128, False, 256, 0, 256, 0),  # No completed L3 in prefix.
+            (0, 1024, True, 1024, 128, 0, 1024),  # SWA unlocks resident FULL.
+            (512, 768, True, 768, 128, 512, 512),  # SWA plus fetched FULL tail.
+            (1024, 1024, True, 768, 0, 768, 256),  # FULL trimmed before IO.
+        ):
+            with self.subTest(prefix=prefix, staged=staged, matched_len=matched_len):
+                req = mock.Mock(spec=Req)
+                req.rid = "req"
+                req.cache_request_handle = CacheRequestHandle("req", 0)
+                req.prefix_len = prefix
+                req.kv = SimpleNamespace(cache_protected_len=prefix)
+                req.storage_hit_start = 256
+                req.storage_hit_length = 768
+                req.host_hit_is_storage = False
+                req.host_loaded_length = 0
+                req.fulfilled_storage_hit_len.side_effect = lambda length: (
+                    Req.fulfilled_storage_hit_len(req, length)
+                )
+                f = SimpleNamespace(
+                    matched_len=matched_len,
+                    num_tokens=1024 - matched_len,
+                    key_tokens=array("q", range(1024)),
+                    extra_key=None,
+                    cache_salt=None,
+                    aux_xfers=(
+                        [
+                            SimpleNamespace(
+                                name=PoolName.SWA, host_indices=range(swa_tokens)
+                            )
+                        ]
+                        if swa_tokens
+                        else []
+                    ),
+                    operation_id=1,
+                )
+                pipeline = BufferModePipeline.__new__(BufferModePipeline)
+                pipeline._cache = mock.Mock()
+                pipeline._cache.tree_core.is_eagle = False
+                pipeline._cache.tree_core.match_full_device_prefix.return_value = (
+                    full_prefix,
+                    1,
+                    None,
+                )
+                pipeline.staged_prefetches = (
+                    {req.cache_request_handle: f} if staged else {}
+                )
+                pipeline.release_staged_hold = mock.Mock()
+                self.assertTrue(pipeline.prepare_staged_prefetch(req))
+                self.assertEqual(req.storage_hit_start, expected_start)
+                self.assertEqual(req.storage_hit_length, expected)
+                if staged and prefix < 1024:
+                    self.assertEqual(req.host_hit_length, 1024 - full_prefix)
+                    self.assertEqual(req.swa_host_hit_length, swa_tokens)
+                if staged and prefix == 1024:
+                    pipeline.release_staged_hold.assert_called_once()
+
+
 class TestPrefetchCommitOrdering(CustomTestCase):
     """The prefetch commit's action ordering (mock-based)."""
 
@@ -10764,6 +10844,7 @@ class TestPrefetchCommitOrdering(CustomTestCase):
         operation.handle = CacheRequestHandle("req", 0)
         operation.request_id = "req"
         operation.completed_tokens = 8
+        operation.storage_start = 16
         cache.ongoing_prefetch = {
             operation.handle: _OngoingPrefetch(
                 7,
@@ -10781,6 +10862,7 @@ class TestPrefetchCommitOrdering(CustomTestCase):
         cache._check_hybrid_prefetch_result.return_value = 8
         cache.cache_controller.prefetch_tokens_occupied = 100
         cache.prefetch_loaded_tokens_by_reqid = {}
+        cache.prefetch_loaded_storage_start_by_reqid = {}
         cache._can_terminate_prefetch.return_value = True
         cache.pp_rank = 0
 
@@ -10812,6 +10894,12 @@ class TestPrefetchCommitOrdering(CustomTestCase):
             order.commit.call_args.kwargs["cache_actions"], insert_result.cache_actions
         )
         self.assertEqual(cache.ongoing_prefetch, {})
+        # Dedup changes ownership, not the source of this request's cache hit.
+        self.assertEqual(cache.prefetch_loaded_tokens_by_reqid[operation.handle], 8)
+        self.assertEqual(
+            cache.prefetch_loaded_storage_start_by_reqid[operation.handle], 16
+        )
+        cache._resolve_storage_prefetch_tokens.assert_not_called()
 
 
 class TestUnifiedRadixPrefetchCorruption(CustomTestCase):
