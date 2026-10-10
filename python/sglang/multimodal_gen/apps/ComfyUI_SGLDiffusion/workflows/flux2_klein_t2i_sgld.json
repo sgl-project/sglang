@@ -1,0 +1,146 @@
+{
+  "1": {
+    "class_type": "SGLDOptions",
+    "inputs": {
+      "model_type": "flux2",
+      "enable_torch_compile": false,
+      "num_gpus": 1,
+      "tp_size": -1,
+      "sp_degree": -1,
+      "ulysses_degree": -1,
+      "ring_degree": -1,
+      "dp_size": 1,
+      "dp_degree": 1,
+      "enable_cfg_parallel": false,
+      "attention_backend": "",
+      "dit_layerwise_offload": false,
+      "enable_cache_dit": false,
+      "quantization": "",
+      "transformer_weights_path": ""
+    }
+  },
+  "2": {
+    "class_type": "SGLDUNETLoader",
+    "inputs": {
+      "unet_name": "flux-2-klein-4b.safetensors",
+      "weight_dtype": "default",
+      "sgld_options": [
+        "1",
+        0
+      ]
+    }
+  },
+  "3": {
+    "class_type": "CLIPLoader",
+    "inputs": {
+      "clip_name": "qwen_3_4b.safetensors",
+      "type": "flux2",
+      "device": "default"
+    }
+  },
+  "4": {
+    "class_type": "VAELoader",
+    "inputs": {
+      "vae_name": "flux2-vae.safetensors"
+    }
+  },
+  "5": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "clip": [
+        "3",
+        0
+      ],
+      "text": "A cinematic photo of a red fox sitting in fresh snow at golden hour, shallow depth of field"
+    }
+  },
+  "8": {
+    "class_type": "KSamplerSelect",
+    "inputs": {
+      "sampler_name": "euler"
+    }
+  },
+  "9": {
+    "class_type": "Flux2Scheduler",
+    "inputs": {
+      "steps": 4,
+      "width": 1024,
+      "height": 1024
+    }
+  },
+  "10": {
+    "class_type": "RandomNoise",
+    "inputs": {
+      "noise_seed": 42
+    }
+  },
+  "7": {
+    "class_type": "EmptyFlux2LatentImage",
+    "inputs": {
+      "width": 1024,
+      "height": 1024,
+      "batch_size": 1
+    }
+  },
+  "11": {
+    "class_type": "BasicGuider",
+    "inputs": {
+      "model": [
+        "2",
+        0
+      ],
+      "conditioning": [
+        "5",
+        0
+      ]
+    }
+  },
+  "12": {
+    "class_type": "SamplerCustomAdvanced",
+    "inputs": {
+      "noise": [
+        "10",
+        0
+      ],
+      "guider": [
+        "11",
+        0
+      ],
+      "sampler": [
+        "8",
+        0
+      ],
+      "sigmas": [
+        "9",
+        0
+      ],
+      "latent_image": [
+        "7",
+        0
+      ]
+    }
+  },
+  "13": {
+    "class_type": "VAEDecode",
+    "inputs": {
+      "samples": [
+        "12",
+        0
+      ],
+      "vae": [
+        "4",
+        0
+      ]
+    }
+  },
+  "14": {
+    "class_type": "SaveImage",
+    "inputs": {
+      "images": [
+        "13",
+        0
+      ],
+      "filename_prefix": "flux2/FLUX2_klein_sgld"
+    }
+  }
+}
