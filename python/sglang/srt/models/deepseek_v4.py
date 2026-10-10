@@ -77,7 +77,6 @@ from sglang.srt.layers.cp.utils import (
 from sglang.srt.layers.deep_gemm_wrapper.configurer import DEEPGEMM_SCALE_UE8M0
 from sglang.srt.layers.dp_attention import (
     _tbo_event,
-    attn_tp_all_gather,
     attn_tp_all_reduce,
     dp_gather_partial,
     dp_gather_replicate,
@@ -3536,9 +3535,24 @@ class DeepseekV4DecoderLayer(nn.Module):
                 hidden_states = hidden_states + _shared_local[:n]
         if _use_tp_attn_a2a_scatter:
             assert _a2a_scatter_chunks is not None
-            gathered = [torch.empty_like(t) for t in _a2a_scatter_chunks]
-            attn_tp_all_gather(gathered, hidden_states.contiguous())
-            hidden_states = torch.cat(gathered)
+            # The list-form all_gather runs torch.distributed and breaks decode graph
+            # capture; gather equal (padded) chunks and drop the padding rows.
+            sizes = [t.shape[0] for t in _a2a_scatter_chunks]
+            m = max(sizes)
+            if m > 0:
+                local = hidden_states.contiguous()
+                if local.shape[0] < m:
+                    local = torch.nn.functional.pad(
+                        local, (0, 0, 0, m - local.shape[0])
+                    )
+                gathered = local.new_empty((m * len(sizes), *local.shape[1:]))
+                get_parallel().attn_tp_group.all_gather_into_tensor(gathered, local)
+                if min(sizes) == m:
+                    hidden_states = gathered
+                else:
+                    hidden_states = torch.cat(
+                        [gathered[i * m : i * m + n] for i, n in enumerate(sizes)]
+                    )
         return hidden_states
 
     # ------------------------------------------------------------------

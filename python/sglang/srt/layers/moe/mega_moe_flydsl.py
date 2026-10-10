@@ -181,7 +181,8 @@ def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool
         return True
     global_num_tokens = get_dp_global_num_tokens()
     if global_num_tokens and not is_dsa_enable_prefill_cp():
-        max_tokens = max(global_num_tokens)
+        # MTPR is per rank; attention TP ranks split each DP group's tokens before the dispatch.
+        max_tokens = -(-max(global_num_tokens) // get_parallel().attn_tp_size)
     else:
         max_tokens = hidden_states.shape[0]
     return max_tokens <= _mtpr()

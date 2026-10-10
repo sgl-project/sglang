@@ -2097,8 +2097,13 @@ class DeepseekV4HipRadixBackend(
             tail_len=SWA_WINDOW,
             device=device,
         )
+        # MLP-sync padding (a2a MoE backends) can add rows after the request's
+        # tokens; the contiguous slice would then keep the padding rows.
         contiguous_start = (
-            extend_lens_cpu[0] - tail_lens_cpu[0] if len(extend_lens_cpu) == 1 else None
+            extend_lens_cpu[0] - tail_lens_cpu[0]
+            if len(extend_lens_cpu) == 1
+            and forward_batch.out_cache_loc.shape[0] == extend_lens_cpu[0]
+            else None
         )
         out_cache_loc = _tail_rows(
             forward_batch.out_cache_loc,
