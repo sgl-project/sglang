@@ -37,6 +37,10 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     # Per-request SWA ring (BaseSWAKVPool.swa_req_ring_size). Class default so
     # subclasses that bypass this __init__ read False.
     _swa_req_ring = False
+    # kv-row segments a free group resolves at its end (page representatives);
+    # empty class defaults for the same reason.
+    row_page_reps_group: tuple | list = ()
+    full_row_page_reps_group: tuple | list = ()
 
     def __init__(
         self,
@@ -685,7 +689,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.row_page_reps_group, self.full_row_page_reps_group = [], []
         if swa_and_full:
             self._free_swa_page_reps(torch.cat(swa_and_full))
-        reps = swa_and_full + full_only
+        reps = [*swa_and_full, *full_only]
         if reps:
             self.full_attn_allocator.free_page_ids(torch.cat(reps) // self.page_size)
 
