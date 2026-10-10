@@ -434,8 +434,7 @@ class NpuMemcacheStore(HiCacheStorage):
     ) -> Tuple[List[str], int]:
         # A logical "page" may map to multiple physical objects in storage.
         # - INDEXER: one key per page
-        # - MAMBA  : one temporal key + N conv keys per page (temporal is dropped
-        #             for conv-only models, mirroring get_page_buffer_meta)
+        # - MAMBA  : one key per MambaPoolHost.get_page_component_names() entry
         # - DRAFT  : one k + one v key per page
         # key_multiplier records how many component keys are generated per page.
         name = transfer.name
@@ -444,14 +443,10 @@ class NpuMemcacheStore(HiCacheStorage):
             suffixes = [f"_{self.mla_suffix}_{PoolName.INDEXER}"]
         elif name == PoolName.MAMBA:
             mamba_pool = getattr(self, "registered_pools", {}).get(PoolName.MAMBA)
-            conv_num = len(getattr(mamba_pool, "conv_buffer", None) or [])
-            base_suffix = f"_{self.mha_suffix}"
-            # Must stay aligned with MambaPoolHost.get_page_buffer_meta(): it
-            # drops the temporal pointer when there is no SSM state, so the
-            # temporal key must be dropped under the same condition.
-            if getattr(mamba_pool, "temporal_state_elem_size", 1) > 0:
-                suffixes = [f"{base_suffix}_temporal"]
-            suffixes += [f"{base_suffix}_conv_{i}" for i in range(conv_num)]
+            suffixes = [
+                f"_{self.mha_suffix}_{component}"
+                for component in mamba_pool.get_page_component_names()
+            ]
         elif name == PoolName.DRAFT:
             # MHA draft KV: one k key + one v key per page, matching the
             # (k_ptr, v_ptr) order of get_page_buffer_meta.

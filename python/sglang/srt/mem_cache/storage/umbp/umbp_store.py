@@ -1361,10 +1361,10 @@ class UMBPStore(HiCacheStorage):
 
         components = getattr(host_pool, "components", None)
         if pool_name == PoolName.MAMBA:
-            conv_num = len(getattr(host_pool, "conv_buffer", None) or [])
-            suffixes = [f"_{mha_suffix}_conv_{i}" for i in range(conv_num)]
-            if getattr(host_pool, "temporal_state_elem_size", 1) > 0:
-                suffixes = [f"_{mha_suffix}_temporal"] + suffixes
+            suffixes = [
+                f"_{mha_suffix}_{component}"
+                for component in host_pool.get_page_component_names()
+            ]
         elif components is not None and len(components) == 1:
             suffixes = [f"_{mla_suffix}_{pool_name}"]
         elif components is not None and len(components) == 2:
