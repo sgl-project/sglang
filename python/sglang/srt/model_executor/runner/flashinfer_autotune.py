@@ -210,9 +210,13 @@ def _autotune_process_group(group: Optional[torch.distributed.ProcessGroup]):
 def _autotune_cache_digest(cache_path: Path, env: dict[str, str]) -> str:
     """Hash of what this rank would load from ``cache_path`` ("" for nothing).
 
-    Includes the environment: ``load_configs`` ignores the whole file when its
-    ``_metadata`` stamp disagrees with the environment reading it, so equal
-    tactics alone do not mean two ranks load the same thing.
+    Only the load decision is hashed, not the tactic entries. ``load_configs``
+    is all-or-nothing: it accepts a file only when its ``_metadata`` matches
+    the current environment, otherwise it skips it whole. Under expert
+    parallelism each rank tunes a disjoint subset of MoE shapes, so the
+    per-rank tactics legitimately differ; digesting the file bytes would drop
+    the caches on every boot even though every rank loads a valid cache for
+    its own shapes.
     """
     if not cache_path.is_file():
         return ""
@@ -222,7 +226,10 @@ def _autotune_cache_digest(cache_path: Path, env: dict[str, str]) -> str:
         return ""
     if not isinstance(configs, dict):
         return ""
-    payload = {"file": configs, "env": env}
+    stamp = configs.get("_metadata")
+    if not isinstance(stamp, dict):
+        stamp = None
+    payload = {"loadable": True, "stamp": stamp, "env": env}
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
 
