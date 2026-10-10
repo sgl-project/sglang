@@ -70,8 +70,16 @@ class DsparkDraftSampler:
         self.temperatures = torch.zeros(
             (self.max_bs,), dtype=torch.float32, device=device
         )
-        # [gamma, max_bs, local vocab] step logits, allocated by the first warmup.
-        self.step_logits: Optional[torch.Tensor] = None
+        # [max_bs, gamma, local vocab] step logits the sampling accept reads.
+        self.step_logits = (
+            torch.empty(
+                (self.max_bs, self.gamma, _local_vocab_width(model)),
+                dtype=_step_logits_dtype(model),
+                device=device,
+            )
+            if folded_sampling
+            else None
+        )
 
     def stage_sampling_params(self, *, bs: int, sampling_info) -> None:
         """Host-side refresh of the static temperatures; must run before the
@@ -102,13 +110,7 @@ class DsparkDraftSampler:
         base_logits = base_logits.view(bs, self.gamma, -1)
         anchor = input_ids.view(bs, self.query_token_num)[:, 0]
 
-        logits_out = None
-        if self.folded_sampling:
-            if self.step_logits is None:
-                self.step_logits = self._new_step_logits(
-                    base_logits, anchor, sample_hidden
-                )
-            logits_out = self.step_logits[:, :bs]
+        logits_out = None if self.step_logits is None else self.step_logits[:bs]
         draft_tokens, _ = draft_markov_block(
             markov_head=self.markov_head,
             base_logits=base_logits,
@@ -133,22 +135,9 @@ class DsparkDraftSampler:
             )
             self.confidence_out[:bs].copy_(confidence)
 
-    def _new_step_logits(self, base_logits, anchor, sample_hidden) -> torch.Tensor:
-        # Replays read this buffer after the graph ends, so it must come from a
-        # warmup run: graph-pool memory is reused once a capture finishes.
-        assert not (
-            torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
-        )
-        bias, _ = self.markov_head.step_bias(
-            anchor.long(),
-            hidden_states=sample_hidden[:, 0],
-            state=self.markov_head.init_state(sample_hidden),
-        )
-        return torch.empty(
-            (self.gamma, self.max_bs, base_logits.shape[-1]),
-            dtype=self.markov_head.step_logits_dtype(base_logits.dtype, bias.dtype),
-            device=base_logits.device,
-        )
+
+def _local_vocab_width(model) -> int:
+    return model.markov_head.local_vocab_width(model.lm_head)
 
 
 def _step_logits_dtype(model) -> torch.dtype:
@@ -163,7 +152,7 @@ def _step_logits_dtype(model) -> torch.dtype:
 def _resolve_folded_sampling(
     *, model, gamma, max_bs, device, tp_rank, available_memory_gb: float
 ) -> bool:
-    """The sampling buffers are baked into the captured draft graph, so AUTO
+    """The step-logits buffer is baked into the captured draft graph, so AUTO
     must decide before capture from a free-memory probe. ``available_memory_gb``
     is the group minimum, so every rank folds identically."""
     mode = envs.SGLANG_DSPARK_FOLDED_SAMPLING.get()
@@ -171,15 +160,13 @@ def _resolve_folded_sampling(
         return False
     if mode == DsparkFoldedSampling.FORCE:
         return True
-    # Upper bound: the whole vocab, though a sharded head keeps only its slice.
-    vocab = int(model.lm_head.org_vocab_size)
     itemsize = _step_logits_dtype(model).itemsize
-    need_gb = max_bs * gamma * vocab * itemsize / (1 << 30)
+    need_gb = max_bs * gamma * _local_vocab_width(model) * itemsize / (1 << 30)
     if available_memory_gb - need_gb >= _CAPTURE_HEADROOM_GB:
         return True
     if tp_rank == 0:
         logger.warning(
-            "DSpark folded sampling disabled: its static buffers need %.2f GB "
+            "DSpark folded sampling disabled: its step-logits buffer needs %.2f GB "
             "but only %.2f GB GPU memory is free; sampling batches will take "
             "the eager proposal path. Set SGLANG_DSPARK_FOLDED_SAMPLING=%d "
             "to force.",

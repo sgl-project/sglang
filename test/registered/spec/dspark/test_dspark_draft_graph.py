@@ -7,6 +7,10 @@ from sglang.srt.models.dspark import VanillaMarkov
 from sglang.srt.speculative.dspark_components.dspark_draft import (
     DraftNoise,
     draft_markov_block,
+    sample_draft_block,
+)
+from sglang.srt.speculative.dspark_components.dspark_draft_sampler import (
+    DsparkDraftSampler,
 )
 from sglang.srt.speculative.spec_tp_sync import SpecTpSyncSite
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -32,7 +36,7 @@ class TestDraftMarkovBlockGraph(CustomTestCase):
         noise = DraftNoise(
             key=11, offset=torch.zeros(1, dtype=torch.int64, device=DEVICE)
         )
-        logits_out = torch.empty(GAMMA, BS, VOCAB, dtype=torch.bfloat16, device=DEVICE)
+        logits_out = torch.empty(BS, GAMMA, VOCAB, dtype=torch.bfloat16, device=DEVICE)
         tokens_out = torch.empty(BS, GAMMA, dtype=torch.int64, device=DEVICE)
 
         def block():
@@ -67,6 +71,67 @@ class TestDraftMarkovBlockGraph(CustomTestCase):
         self.assertEqual(noise.offset.item(), 2)
         self.assertFalse(torch.equal(tokens_out[1::2], eager_tokens[1::2]))
         self.assertTrue(torch.equal(tokens_out[::2], eager_tokens[::2]))
+
+    def test_captured_sampler_matches_eager_block(self):
+        # The graph tail itself: staged temperatures, the static step-logits
+        # buffer and the [:bs] views, against the eager draft of the same batch.
+        torch.manual_seed(1)
+        head = VanillaMarkov(vocab_size=VOCAB, markov_rank=RANK).to(DEVICE)
+        head = head.to(torch.bfloat16)
+        weight = torch.randn(VOCAB, 64, device=DEVICE).to(torch.bfloat16)
+        model = SimpleNamespace(
+            markov_head=head,
+            sample_from_anchor=True,
+            lm_head=SimpleNamespace(org_vocab_size=VOCAB, weight=weight),
+            compute_base_logits=lambda hidden: (hidden @ weight.T, None),
+        )
+        tp_sync = SimpleNamespace(sync=lambda site, value: value)
+        noise = DraftNoise(
+            key=5, offset=torch.zeros(1, dtype=torch.int64, device=DEVICE)
+        )
+        sampler = DsparkDraftSampler(
+            model=model,
+            gamma=GAMMA,
+            max_bs=2 * BS,
+            device=DEVICE,
+            noise=noise,
+            tp_sync=tp_sync,
+            folded_sampling=True,
+        )
+        hidden = torch.randn(BS * GAMMA, 64, device=DEVICE).to(torch.bfloat16)
+        input_ids = torch.randint(0, VOCAB, (BS * GAMMA,), device=DEVICE)
+        sampling_info = SimpleNamespace(
+            is_all_greedy=False,
+            temperatures=(torch.rand(BS, 1, device=DEVICE) + 0.3),
+            top_ks=torch.tensor([1, 40] * (BS // 2), device=DEVICE),
+        )
+        sampler.stage_sampling_params(bs=BS, sampling_info=sampling_info)
+        sampler(hidden, input_ids)  # warm up outside the capture
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            sampler(hidden, input_ids)
+        noise.offset.zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+
+        eager_noise = DraftNoise(
+            key=5, offset=torch.zeros(1, dtype=torch.int64, device=DEVICE)
+        )
+        eager = sample_draft_block(
+            base_logits=model.compute_base_logits(hidden)[0].view(BS, GAMMA, -1),
+            anchor_tokens=input_ids.view(BS, GAMMA)[:, 0],
+            draft_hidden=hidden.view(BS, GAMMA, -1),
+            sampling_info=sampling_info,
+            markov_head=head,
+            noise=eager_noise,
+            device=DEVICE,
+            tp_sync=tp_sync,
+        )
+        self.assertTrue(
+            torch.equal(sampler.out[: BS * GAMMA].view(BS, GAMMA), eager.draft_tokens)
+        )
+        self.assertTrue(torch.equal(sampler.step_logits[:BS], eager.corrected_logits))
+        self.assertEqual(noise.offset.item(), eager_noise.offset.item())
 
 
 if __name__ == "__main__":
