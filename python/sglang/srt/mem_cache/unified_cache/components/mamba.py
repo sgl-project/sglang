@@ -716,6 +716,11 @@ class MambaComponent(TreeComponent):
             self.cache.evict_for_alloc(EvictParams(num_tokens=0, mamba_num=1))
             dst = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
             assert dst is not None, "Cannot alloc mamba for load_back"
+        # The H2D load-back writes only temporal+conv state; an empty ReplaySSM
+        # ring keeps the decode kernel from replaying the previous tenant's ring.
+        pool = self.cache.req_to_token_pool
+        if pool.mamba_pool.replayssm_write_pos is not None:
+            pool.mamba_pool.replayssm_write_pos[pool.translate_mamba_indices(dst)] = 0
         req.kv.mamba_pool_idx = dst[0]
         return PrepareLoadBackResult(allocated_mamba_slot=dst)
 
