@@ -19,6 +19,7 @@ from sglang.srt.layers.sampler import (
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.model_executor.runner_utils.pool import borrow_graph_pool
 from sglang.srt.runtime_context import get_spec
+from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
 from sglang.srt.speculative.spec_utils import sample_simulated_acc_len
 from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu
 
@@ -275,13 +276,29 @@ def apply_dflash_verify_logits_adjustments(
             dtype=torch.float32,
             device=next_token_logits.device,
         )
-        sampling_info.apply_logits_bias(linear_penalty)
+        acc_additive_penalties = getattr(sampling_info, "acc_additive_penalties", None)
+        if acc_additive_penalties is not None:
+            linear_penalty.add_(acc_additive_penalties)
+        if penalizer is not None and penalizer.is_required:
+            penalizer.accumulate_additive_penalties(linear_penalty)
+        if grammar_mask is not None:
+            grammar_mask.apply(linear_penalty)
         get_logits_3d().add_(
             linear_penalty[:, None, :].to(dtype=next_token_logits.dtype)
         )
-        return
-
-    if acc_linear_penalties is not None:
+        scaling_penalties = getattr(sampling_info, "acc_scaling_penalties", None)
+        if (
+            scaling_penalties is None
+            and penalizer is not None
+            and penalizer.is_required
+        ):
+            scaling_penalties = penalizer.accumulate_scaling_penalties()
+        if scaling_penalties is not None:
+            apply_scaling_penalties(
+                get_logits_3d(),
+                scaling_penalties[:, None, :].to(dtype=next_token_logits.dtype),
+            )
+    elif acc_linear_penalties is not None:
         if (
             acc_linear_penalties.device != next_token_logits.device
             or acc_linear_penalties.dtype != next_token_logits.dtype
