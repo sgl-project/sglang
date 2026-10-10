@@ -23,7 +23,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 
 # trtllm_mha kernels are sm100-only; run this kernel-unit test on Blackwell.
-register_cuda_ci(est_time=16, stage="base-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=18, stage="base-b", runner_config="4-gpu-b200")
 
 DEVICE = "cuda"
 PAGE_SIZE = 128
@@ -42,6 +42,7 @@ def make_xqa_backend(monkeypatch):
         trtllm_mha_backend.FlashInferAttnBackend, "__init__", parent_init
     )
     monkeypatch.setattr(TRTLLMHAAttnBackend, "_resolve_swa_kv_pool", lambda *args: None)
+    monkeypatch.setattr(TRTLLMHAAttnBackend, "_resolve_v_tail_pool", lambda *args: None)
     monkeypatch.setattr(trtllm_mha_backend, "DEFAULT_WORKSPACE_SIZE_MB", 1)
     monkeypatch.setattr(
         trtllm_mha_backend, "get_buffer", lambda name, factory: factory()
@@ -256,6 +257,9 @@ def _make_backend_for_hook_test(speculative_num_draft_tokens=None):
     backend.speculative_step_id = 0
     backend.speculative_num_draft_tokens = speculative_num_draft_tokens
     backend.expand_encoder_only_verify = False
+    backend._v_tail_pool = None
+    backend._v_tail_strides = None
+    backend._v_tail_every_forward = False
     backend.decode_cuda_graph_metadata = {}
     backend.target_verify_metadata = {}
     backend.draft_extend_metadata = {}
@@ -462,6 +466,70 @@ def test_metadata_update_records_inside_cuda_graph():
         rtol=0,
         atol=0,
     )
+
+
+class _WeakrefableNamespace(SimpleNamespace):
+    """The eager metadata path keeps a weak reference to the forward batch."""
+
+
+def test_eager_and_graph_metadata_zero_the_tail_of_a_new_last_page():
+    """A decode that starts a page clears that page's stale V rows past seq_len.
+
+    Checked through eager init_forward_metadata and through a replayed graph of
+    init_forward_metadata_in_graph.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+
+    page, heads, dim = 4, 2, 8
+    backend = _make_backend_for_hook_test()
+    backend.device = torch.device(DEVICE)
+    backend.page_size = page
+    backend.max_num_pages = 4
+    # Pool rows 1 and 2 own pages 2-3 and 4-5; row 0 is the padding row.
+    backend.req_to_token = torch.zeros(3, 2 * page, dtype=torch.int32, device=DEVICE)
+    backend.req_to_token[1] = torch.arange(2 * page, 4 * page)
+    backend.req_to_token[2] = torch.arange(4 * page, 6 * page)
+    backend.init_cuda_graph_state(max_bs=2, max_num_tokens=2)
+    v = torch.empty(8, heads, page, dim, dtype=torch.bfloat16, device=DEVICE)
+    backend._v_tail_pool = SimpleNamespace(
+        v_data_ptrs=torch.tensor([v.data_ptr()], dtype=torch.uint64, device=DEVICE),
+        head_num=heads,
+        v_head_dim=dim,
+    )
+    backend._v_tail_strides = v.stride()
+
+    # Each request's 5th token starts its second page: pages 3 and 5, rows 1-3 are stale.
+    fb = _WeakrefableNamespace(
+        batch_size=2,
+        req_pool_indices=torch.tensor([1, 2], dtype=torch.int64, device=DEVICE),
+        seq_lens=torch.tensor([5, 5], dtype=torch.int32, device=DEVICE),
+        forward_mode=ForwardMode.DECODE,
+        spec_info=None,
+        positions=torch.tensor([4, 4], dtype=torch.int64, device=DEVICE),
+        out_cache_loc=torch.tensor(
+            [3 * page, 5 * page], dtype=torch.int64, device=DEVICE
+        ),
+    )
+    expected = torch.full_like(v, float("nan"))
+    expected[3, :, 1:] = 0
+    expected[5, :, 1:] = 0
+
+    v.fill_(float("nan"))
+    backend.init_forward_metadata(fb)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(v, expected, rtol=0, atol=0, equal_nan=True)
+
+    backend.init_forward_metadata_out_graph(fb, in_capture=True)
+    backend.init_forward_metadata_in_graph(fb)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        backend.init_forward_metadata_in_graph(fb)
+    v.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(v, expected, rtol=0, atol=0, equal_nan=True)
 
 
 def test_graph_read_done_event_fences_slot_mutation():

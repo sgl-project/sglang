@@ -27,6 +27,7 @@ from sglang.kernels.ops.kvcache.trtllm_mha_graph_metadata import (
 from sglang.kernels.ops.kvcache.trtllm_mha_page_table import (
     build_trtllm_mha_page_table,
 )
+from sglang.kernels.ops.kvcache.trtllm_mha_v_tail import zero_v_page_tails
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
 from sglang.srt.layers.attention.flashinfer_backend import (
@@ -44,11 +45,16 @@ from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
 from sglang.srt.mem_cache.layout.paged_view import paged_kv_view
-from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, KVWriteLoc
+from sglang.srt.mem_cache.memory_pool import (
+    HybridLinearKVPool,
+    KVWriteLoc,
+    MHATokenToKVPool,
+)
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import (
     get_buffer,
+    get_disagg,
     get_exec,
     get_parallel,
     get_platform,
@@ -330,6 +336,26 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         else:
             self._swa_full_to_swa_mapping = None
 
+        # None when this backend does not zero last-page V tails.
+        self._v_tail_pool: Optional[MHATokenToKVPool] = self._resolve_v_tail_pool(
+            model_runner
+        )
+        self._v_tail_strides: Optional[tuple[int, int, int, int]] = None
+        self._v_tail_every_forward = False
+        if self._v_tail_pool is not None:
+            pool = self._v_tail_pool
+            page_stride, row_stride, head_stride, dim_stride = paged_kv_view(
+                pool.v_buffer[0], self.page_size, pool.head_num, pool.v_head_dim
+            ).stride()
+            self._v_tail_strides = (page_stride, head_stride, row_stride, dim_stride)
+            # A page that another backend, CP rank or PD prefill node started can hold
+            # the previous owner's rows past seq_len, so every forward zeroes the tail.
+            self._v_tail_every_forward = (
+                not prefill_is_trtllm_mha
+                or get_disagg().disaggregation_mode == "decode"
+                or get_cp_strategy() is not None
+            )
+
         # Static page-table width (upper bound). The CUDA-graph path builds the
         # page table on-device sized to this constant, so it never reads a runtime
         # max. See _fill_page_table_device.
@@ -509,6 +535,45 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         allocator = model_runner.token_to_kv_pool_allocator
         kvcache = allocator.get_kvcache()
         return kvcache if isinstance(kvcache, SWAKVPool) else None
+
+    def _resolve_v_tail_pool(
+        self, model_runner: ModelRunner
+    ) -> Optional[MHATokenToKVPool]:
+        # Workaround for flashinfer-ai/flashinfer#6246: a NaN in the V rows past seq_len
+        # on the last page makes the TRT-LLM-gen output NaN; drop once the kernel masks them.
+        pool = model_runner.token_to_kv_pool
+        if (
+            self.is_xqa_impl
+            or not isinstance(pool, MHATokenToKVPool)
+            or pool.store_dtype not in (torch.bfloat16, torch.float16)
+            or self._swa_kv_pool is not None
+            or self.kv_index_translator.is_translating
+            # A frozen-KV MTP draft reads the target's pages read-only.
+            or (
+                model_runner.is_draft_worker
+                and model_runner.spec_algorithm.is_frozen_kv_mtp()
+            )
+        ):
+            return None
+        return pool
+
+    def _zero_v_page_tails(
+        self, metadata: TRTLLMMHAMetadata, forward_batch: ForwardBatch
+    ) -> None:
+        pool = self._v_tail_pool
+        if pool is None or is_cp_active(forward_batch):
+            return
+        zero_v_page_tails(
+            v_ptrs=pool.v_data_ptrs,
+            page_table=metadata.page_table,
+            seq_lens=metadata.cache_seqlens_int32,
+            cu_seqlens_q=metadata.cu_seqlens_q,
+            v_paged_strides=self._v_tail_strides,
+            num_heads=pool.head_num,
+            page_size=self.page_size,
+            head_dim=pool.v_head_dim,
+            every_forward=self._v_tail_every_forward,
+        )
 
     def _alloc_swa_page_table(
         self, max_bs: int, max_num_pages: int
@@ -1178,6 +1243,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             spec_info=forward_batch.spec_info,
             out_cache_loc=forward_batch.out_cache_loc,
         )
+        self._zero_v_page_tails(self.forward_metadata, forward_batch)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize the metadata for a forward pass."""
@@ -1318,6 +1384,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 forward_batch, IdSpaceKind.SLIDING_WINDOW
             )
 
+        self._zero_v_page_tails(metadata, forward_batch)
         self.forward_metadata = metadata
 
     def _reshape_paged_kv_cache(
