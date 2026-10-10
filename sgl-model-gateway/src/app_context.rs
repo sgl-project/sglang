@@ -378,7 +378,7 @@ impl AppContextBuilder {
             n => {
                 let rate_limit_tokens = config
                     .rate_limit_tokens_per_second
-                    .filter(|&t| t > 0)
+                    .filter(|&t| t >= 0)
                     .unwrap_or(n);
                 Some(Arc::new(TokenBucket::new(
                     n as usize,
@@ -528,5 +528,28 @@ impl AppContextBuilder {
 impl Default for AppContextBuilder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod strict_admission_tests {
+    use super::*;
+    #[tokio::test]
+    async fn explicit_zero_refill_holds_all_slots() {
+        let mut config = RouterConfig::default();
+        config.max_concurrent_requests = 64;
+        config.rate_limit_tokens_per_second = Some(0);
+        let bucket = AppContextBuilder::new()
+            .maybe_rate_limiter(&config)
+            .rate_limiter
+            .unwrap();
+        for _ in 0..64 {
+            assert!(bucket.try_acquire(1.0).await.is_ok());
+        }
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert!(bucket.try_acquire(1.0).await.is_err());
+        bucket.return_tokens_sync(1.0);
+        assert!(bucket.try_acquire(1.0).await.is_ok());
+        assert!(bucket.try_acquire(1.0).await.is_err());
     }
 }

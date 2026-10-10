@@ -96,7 +96,7 @@ class RouterArgs:
     queue_size: int = 100
     # Maximum time (in seconds) a request can wait in queue before timing out
     queue_timeout_secs: int = 60
-    # Token bucket refill rate (tokens per second). If not set, defaults to max_concurrent_requests
+    # Token bucket refill rate (tokens per second; 0 holds slots until requests finish). If not set, defaults to max_concurrent_requests
     rate_limit_tokens_per_second: Optional[int] = None
     # CORS allowed origins
     cors_allowed_origins: List[str] = dataclasses.field(default_factory=list)
@@ -559,7 +559,7 @@ class RouterArgs:
             f"--{prefix}queue-size",
             type=int,
             default=RouterArgs.queue_size,
-            help="Queue size for pending requests when max concurrent limit reached (0 = no queue, return 429 immediately)",
+            help="Queue size for pending requests when max concurrent limit reached (0 = no queue; 503 for concurrency-only admission, otherwise 429)",
         )
         rate_limit_group.add_argument(
             f"--{prefix}queue-timeout-secs",
@@ -571,7 +571,7 @@ class RouterArgs:
             f"--{prefix}rate-limit-tokens-per-second",
             type=int,
             default=RouterArgs.rate_limit_tokens_per_second,
-            help="Token bucket refill rate (tokens per second). If not set, defaults to max_concurrent_requests",
+            help="Token bucket refill rate (tokens per second; 0 holds slots until requests finish). If not set, defaults to max_concurrent_requests",
         )
 
         # Retry configuration

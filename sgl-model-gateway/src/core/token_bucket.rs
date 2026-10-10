@@ -30,6 +30,10 @@ struct TokenBucketInner {
 }
 
 impl TokenBucket {
+    pub fn is_concurrency_only(&self) -> bool {
+        self.refill_rate == 0.0
+    }
+
     /// Create a new token bucket
     ///
     /// # Arguments
@@ -106,12 +110,15 @@ impl TokenBucket {
             );
 
             loop {
-                // Wait for notify signal from return_tokens()
-                self.notify.notified().await;
-
+                // Register before rechecking capacity to avoid losing a return
+                // between the initial acquisition attempt and notification wait.
+                let notified = self.notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
                 if self.try_acquire(tokens).await.is_ok() {
                     return Ok(());
                 }
+                notified.await;
             }
         }
 
