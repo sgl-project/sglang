@@ -88,6 +88,8 @@ class DiffusionNvtxHooks:
         # so a forward that bypasses the component-use gate (e.g. an early
         # warmup pass) cannot accidentally pollute the captured timeline.
         self._enabled: bool = False
+        # One entry per in-flight forward: whether its pre-hook pushed a range.
+        self._range_pushed: list[bool] = []
 
     def register_hooks(
         self,
@@ -156,9 +158,8 @@ class DiffusionNvtxHooks:
     def set_enabled(self, enabled: bool) -> None:
         """Toggle whether the registered hooks emit NVTX ranges.
 
-        When disabled, both the pre- and post-hooks early-return, so each
-        forward produces a matched (push, pop) pair of "no-ops" — no range
-        leak and no half-open range across the toggle.
+        The post-hook pops only the ranges its own pre-hook pushed, so
+        toggling mid-forward neither leaks a range nor pops a parent's.
         """
         self._enabled = enabled
 
@@ -170,6 +171,7 @@ class DiffusionNvtxHooks:
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
     ) -> None:
+        self._range_pushed.append(self._enabled)
         if not self._enabled:
             return
         name = self._module_to_name_map.get(module, "unknown")
@@ -183,9 +185,8 @@ class DiffusionNvtxHooks:
         _args: Any,
         _output: Any,
     ) -> None:
-        if not self._enabled:
-            return
-        nvtx.range_pop()
+        if self._range_pushed and self._range_pushed.pop():
+            nvtx.range_pop()
 
 
 def _collect_input_shapes(

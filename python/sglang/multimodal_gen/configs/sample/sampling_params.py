@@ -218,6 +218,33 @@ def align_num_frames_for_num_gpus(
     return new_latent_num_frames
 
 
+# Arbitrary upper bounds; upscaling_scale squares the pixel count.
+_FRAME_INTERPOLATION_SCALE_RANGE = (0.25, 4.0)
+_MAX_UPSCALING_SCALE = 8
+
+
+def _check_postprocess_controls(params: "SamplingParams") -> None:
+    scale = params.frame_interpolation_scale
+    low, high = _FRAME_INTERPOLATION_SCALE_RANGE
+    if (
+        isinstance(scale, bool)
+        or not isinstance(scale, (int, float))
+        or not low <= scale <= high
+    ):
+        raise ValueError(
+            f"frame_interpolation_scale must be in [{low}, {high}], got {scale!r}"
+        )
+    up = params.upscaling_scale
+    if (
+        isinstance(up, bool)
+        or not isinstance(up, int)
+        or not 1 <= up <= _MAX_UPSCALING_SCALE
+    ):
+        raise ValueError(
+            f"upscaling_scale must be an int in [1, {_MAX_UPSCALING_SCALE}], got {up!r}"
+        )
+
+
 @dataclass
 class SamplingParams:
     """
@@ -677,6 +704,9 @@ class SamplingParams:
         # Used by seconds() and video writer; fps <= 0 is always invalid.
         if not isinstance(self.fps, int) or self.fps <= 0:
             raise ValueError(f"fps must be a positive int, got {self.fps!r}")
+
+        # scale bounds follow RIFE's supported range.
+        _check_postprocess_controls(self)
 
         # num_frames is already asserted in __post_init__, but keep a friendly error here too
         # (e.g., when validation is triggered from other code paths).

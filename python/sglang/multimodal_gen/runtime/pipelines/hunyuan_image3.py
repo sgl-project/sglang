@@ -89,7 +89,9 @@ class HunyuanImage3Pipeline(LoRAPipeline, ComposedPipelineBase):
     ) -> dict[str, Any]:
         pipeline_config = server_args.pipeline_config
 
-        model_path = maybe_download_model(self.model_path)
+        model_path = maybe_download_model(
+            self.model_path, revision=server_args.revision
+        )
         self.model_path = model_path
         logger.info("Loading HunyuanImage-3 components from %s", model_path)
 

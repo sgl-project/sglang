@@ -438,3 +438,79 @@ def test_modelscope_selected_partition_cache_hit_requires_a_file(monkeypatch, tm
         )
 
     assert result == str(tmp_path)
+
+
+def test_unreachable_hub_falls_back_to_cached_model_index(monkeypatch, tmp_path):
+    """LocalEntryNotFoundError subclasses EntryNotFoundError, so an offline Hub was
+    treated as "no model_index.json" and the cache fallback never ran."""
+    cached = tmp_path / "model_index.json"
+    cached.write_text("{}")
+
+    def offline(**kwargs):
+        raise LocalEntryNotFoundError("offline")
+
+    monkeypatch.setattr(hf_diffusers_utils, "hf_hub_download", offline)
+    monkeypatch.setattr(
+        "huggingface_hub.try_to_load_from_cache",
+        lambda repo_id, filename: (
+            str(cached) if filename == "model_index.json" else None
+        ),
+    )
+
+    assert hf_diffusers_utils._resolve_remote_repo_model_index_path("org/model") == str(
+        cached
+    )
+
+
+def test_unreachable_hub_is_not_reported_as_single_model_repo(monkeypatch):
+    """With the Hub unreachable and nothing cached, the repo must not be assumed to
+    be a single model (which ends in a misleading "-Diffusers" hint)."""
+
+    def offline(*args, **kwargs):
+        raise LocalEntryNotFoundError("offline")
+
+    downloads = []
+    monkeypatch.setattr(
+        hf_diffusers_utils, "maybe_load_overlay_model_index", lambda *a, **k: None
+    )
+    monkeypatch.setattr(
+        hf_diffusers_utils, "_resolve_remote_repo_model_index_path", offline
+    )
+    monkeypatch.setattr(
+        hf_diffusers_utils, "maybe_download_model", lambda *a, **k: downloads.append(a)
+    )
+
+    with pytest.raises(ValueError, match="Failed to download or parse"):
+        hf_diffusers_utils.maybe_download_model_index("org/model")
+    assert downloads == []
+
+
+def test_component_config_ignores_scheduler_in_parent_directory(tmp_path):
+    """Only the component's own directory name selects scheduler_config.json; a
+    parent such as `scheduler_ablation/` must not redirect every component."""
+    component = tmp_path / "scheduler_ablation" / "unet"
+    component.mkdir(parents=True)
+    (component / "config.json").write_text(json.dumps({"_class_name": "UNet"}))
+
+    config = hf_diffusers_utils.get_diffusers_component_config(str(component))
+
+    assert config["_class_name"] == "UNet"
+
+
+def test_modelopt_config_patch_does_not_write_through_cache_symlink(tmp_path):
+    """In an HF snapshot config.json is a symlink to a blob shared by every
+    revision; the ModelOpt normalization must replace the link, not edit the blob."""
+    blob = tmp_path / "blob"
+    original = json.dumps(
+        {"quantization_config": {"quant_method": "modelopt", "quant_algo": "FP8"}}
+    )
+    blob.write_text(original)
+    component = tmp_path / "snapshot" / "transformer"
+    component.mkdir(parents=True)
+    (component / "config.json").symlink_to(blob)
+
+    hf_diffusers_utils.prepare_diffusers_component_path_for_loading(str(component))
+
+    patched = json.loads((component / "config.json").read_text())
+    assert patched["quantization_config"]["quant_type"] == "FP8"
+    assert blob.read_text() == original

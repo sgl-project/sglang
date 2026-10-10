@@ -21,7 +21,7 @@ def save_base64_image_to_path(
         "Expected format: `data:[<media-type>];base64,<data>`"
     )
 
-    match = re.match(r"data:(.*?)(;base64)?,(.*)", base64_data)
+    match = re.match(r"data:(.*?)(;base64)?,(.*)", base64_data, re.DOTALL)
     if not match:
         raise ValueError(b64_format_hint)
     media_type = match.group(1)

@@ -12,6 +12,7 @@ The FrameInterpolator wrapper and integration code are original work.
 
 import os
 import time
+from collections import OrderedDict
 from typing import Optional
 
 import numpy as np
@@ -20,6 +21,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.postprocess.bounded_cache import (
+    cache_get,
+    cache_put,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -28,7 +33,9 @@ logger = init_logger(__name__)
 _DEFAULT_RIFE_HF_REPO = "elfgum/RIFE-4.22.lite"
 
 # Module-level cache: model_path -> Model instance
-_MODEL_CACHE: dict[str, "Model"] = {}
+_MODEL_CACHE: "OrderedDict[str, Model]" = OrderedDict()
+# Arbitrary; paths are client-chosen, so the cache must be bounded.
+_MAX_CACHED_MODELS = 4
 _MAX_RIFE_BATCH_PAIRS = 16
 
 
@@ -367,15 +374,16 @@ class FrameInterpolator:
         # Resolve: local path pass-through, HF repo ID → download & cache
         model_path = maybe_download_model(model_path)
 
-        if model_path in _MODEL_CACHE:
-            return _MODEL_CACHE[model_path]
+        cached_model = cache_get(_MODEL_CACHE, model_path)
+        if cached_model is not None:
+            return cached_model
 
         device = current_platform.get_local_torch_device()
         model = Model()
         model.load_model(model_path, strip_module_prefix=True)
         model.eval()
         model.flownet = model.flownet.to(device)
-        _MODEL_CACHE[model_path] = model
+        cache_put(_MODEL_CACHE, model_path, model, max_size=_MAX_CACHED_MODELS)
         logger.info("RIFE model loaded on device: %s", device)
         return model
 
