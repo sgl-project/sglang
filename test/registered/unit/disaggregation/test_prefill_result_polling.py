@@ -561,9 +561,14 @@ class TestPrefillResultPolling(CustomTestCase):
                     swa_reprefill_tail_tokens=lambda: 0,
                     match_prefix=match_prefix,
                 )
-                scheduler.policy = SchedulePolicy(
-                    "fcfs", scheduler.tree_cache, False, False, False
-                )
+                with published_topology():
+                    scheduler.policy = SchedulePolicy(
+                        policy="fcfs",
+                        tree_cache=scheduler.tree_cache,
+                        enable_hierarchical_cache=False,
+                        enable_priority_scheduling=False,
+                        schedule_low_priority_values_first=False,
+                    )
                 scheduler.ngram_embedding_manager.prepare_for_forward = Mock(
                     side_effect=lambda batch, chunked_req: batch
                 )

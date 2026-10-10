@@ -3922,6 +3922,7 @@ class Scheduler(
             self.waiting_queue,
             running_batch,
             processed_tokens=self.processed_tokens_counter,
+            forward_ct=self.forward_ct,
         )
 
         if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
