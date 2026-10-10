@@ -22,10 +22,12 @@ import os
 import shutil
 
 import torch
-from safetensors.torch import load_file as safetensors_load_file
 from safetensors.torch import save_file as safetensors_save_file
 
 from sglang.multimodal_gen import envs
+from sglang.multimodal_gen.runtime.loader.readonly_safetensors import (
+    load_safetensors_readonly,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -98,8 +100,9 @@ class LoraMergeCache:
         meta = self._entries.get(name)
         if meta is None:
             return None
-        mapped = safetensors_load_file(os.path.join(self.root, meta["file"]))
-        tensor = mapped.get("weight")
+        tensor = load_safetensors_readonly(os.path.join(self.root, meta["file"])).get(
+            "weight"
+        )
         if (
             tensor is None
             or tuple(tensor.shape) != tuple(shape)
@@ -156,7 +159,7 @@ class LoraMergeCache:
             tmp = f"{path}.tmp.{os.getpid()}"
             safetensors_save_file({"weight": merged.contiguous()}, tmp)
             os.replace(tmp, path)
-            mapped = safetensors_load_file(path)["weight"]
+            mapped = load_safetensors_readonly(path)["weight"]
         except Exception as exc:
             logger.warning(
                 "Could not cache merged weight %s (%s); it stays in "
