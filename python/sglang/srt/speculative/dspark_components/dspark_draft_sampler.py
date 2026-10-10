@@ -22,7 +22,7 @@ DRAFT_CAPTURE_MIN_FREE_GB = 1.0
 class DsparkDraftSampler:
     """The draft proposal folded into the draft cuda graph as its tail: the
     eager path's markov block, run over the graph's hidden states. Without
-    folded sampling every row stays at temperature 0, so the tail drafts
+    folded sampling every row takes the argmax, so the tail drafts
     greedily and keeps no step logits."""
 
     def __init__(
@@ -61,14 +61,15 @@ class DsparkDraftSampler:
         self.folded_sampling = folded_sampling
         self._noise = noise
         self._tp_sync = tp_sync
-        # Per-row draft temperature, 0 for argmax rows; staged before each replay.
-        self.temperatures = torch.zeros(
+        # The requests' temperatures and greedy rows, staged before each replay.
+        self.temperatures = torch.ones(
             (self.max_bs,), dtype=torch.float32, device=device
         )
-        # [max_bs, gamma, local vocab] step logits the sampling accept reads.
+        self.greedy_mask = torch.ones((self.max_bs,), dtype=torch.bool, device=device)
+        # [max_bs, gamma, vocab] step logits the sampling accept reads.
         self.step_logits = (
             torch.empty(
-                (self.max_bs, self.gamma, _local_vocab_width(model)),
+                (self.max_bs, self.gamma, _step_logits_width(model)),
                 dtype=_step_logits_dtype(model),
                 device=device,
             )
@@ -77,18 +78,20 @@ class DsparkDraftSampler:
         )
 
     def stage_sampling_params(self, *, bs: int, sampling_info) -> None:
-        """Host-side refresh of the static temperatures; must run before the
+        """Host-side refresh of the static sampling params; must run before the
         draft graph replay that consumes them."""
         if not self.folded_sampling:
             return
         if sampling_info is None:
-            self.temperatures[:bs].zero_()
+            self.temperatures[:bs].fill_(1.0)
+            self.greedy_mask[:bs].fill_(True)
             return
-        temperatures = (
-            sampling_info.temperatures.view(-1)[:bs].to(torch.float32).clamp_min(1e-5)
+        torch.clamp(
+            sampling_info.temperatures.view(-1)[:bs].to(torch.float32),
+            min=1e-5,
+            out=self.temperatures[:bs],
         )
-        greedy = (sampling_info.top_ks <= 1).view(-1)[:bs]
-        self.temperatures[:bs].copy_(temperatures.masked_fill(greedy, 0.0))
+        torch.le(sampling_info.top_ks.view(-1)[:bs], 1, out=self.greedy_mask[:bs])
 
     def __call__(self, hidden_states, input_ids):
         bs = hidden_states.shape[0] // self.query_token_num
@@ -106,17 +109,23 @@ class DsparkDraftSampler:
         anchor = input_ids.view(bs, self.query_token_num)[:, 0]
 
         logits_out = None if self.step_logits is None else self.step_logits[:bs]
+        step_temperatures = self.temperatures[:bs]
+        if self.folded_sampling:
+            step_temperatures = step_temperatures.masked_fill(
+                self.greedy_mask[:bs], 0.0
+            )
         draft_tokens, _ = draft_markov_block(
             markov_head=self.markov_head,
             base_logits=base_logits,
             anchor_tokens=anchor,
             draft_hidden=sample_hidden,
-            step_temperatures=self.temperatures[:bs],
+            step_temperatures=step_temperatures,
             noise=self._noise,
             tp_sync=self._tp_sync,
             logits_out=logits_out,
             keep_logits=self.folded_sampling,
-            # Without folded sampling every staged temperature stays 0.
+            # Without folded sampling every row takes the argmax and no
+            # temperature is read.
             has_sampled_rows=None if self.folded_sampling else False,
         )
         self.out[: draft_tokens.numel()].copy_(draft_tokens.reshape(-1))
@@ -130,8 +139,9 @@ class DsparkDraftSampler:
             self.confidence_out[:bs].copy_(confidence)
 
 
-def _local_vocab_width(model) -> int:
-    return model.markov_head.local_vocab_width(model.lm_head)
+def _step_logits_width(model) -> int:
+    # Unsharded base logits span the cropped vocab.
+    return model.markov_head.step_logits_width(int(model.lm_head.org_vocab_size))
 
 
 def _step_logits_dtype(model) -> torch.dtype:
@@ -157,7 +167,7 @@ def _resolve_folded_sampling(
     if mode == DsparkFoldedSampling.FORCE:
         return True
     itemsize = _step_logits_dtype(model).itemsize
-    need_gb = max_bs * gamma * _local_vocab_width(model) * itemsize / (1 << 30)
+    need_gb = max_bs * gamma * _step_logits_width(model) * itemsize / (1 << 30)
     if available_memory_gb - need_gb >= DRAFT_CAPTURE_MIN_FREE_GB:
         return True
     if tp_rank == 0:

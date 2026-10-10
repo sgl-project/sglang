@@ -70,6 +70,51 @@ class TestDraftMarkovBlockGraph(CustomTestCase):
         self.assertFalse(torch.equal(tokens_out[1::2], eager_tokens[1::2]))
         self.assertTrue(torch.equal(tokens_out[::2], eager_tokens[::2]))
 
+    def test_one_greedy_row_matches_eager_and_fp32_reference(self):
+        # A one-row greedy block keeping no logits folds the bias GEMV into the
+        # argmax: the graph replays the eager pick, and both pick the argmax of
+        # the FP32 step logits.
+        torch.manual_seed(2)
+        head = VanillaMarkov(vocab_size=VOCAB, markov_rank=RANK).to(DEVICE)
+        head = head.to(torch.bfloat16)
+        base = torch.randn(1, GAMMA, VOCAB, device=DEVICE).to(torch.bfloat16)
+        anchor = torch.randint(0, VOCAB, (1,), device=DEVICE)
+        noise = DraftNoise(
+            key=3, offset=torch.zeros(1, dtype=torch.int64, device=DEVICE)
+        )
+        tokens_out = torch.empty(1, GAMMA, dtype=torch.int64, device=DEVICE)
+
+        def block():
+            tokens, logits = draft_markov_block(
+                markov_head=head,
+                base_logits=base,
+                anchor_tokens=anchor,
+                draft_hidden=None,
+                step_temperatures=torch.zeros(1, device=DEVICE),
+                noise=noise,
+                tp_sync=SimpleNamespace(sync=lambda site, value: value),
+                keep_logits=False,
+                has_sampled_rows=False,
+            )
+            assert logits is None
+            tokens_out.copy_(tokens)
+
+        block()
+        eager_tokens = tokens_out.clone()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            block()
+        tokens_out.zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+        self.assertTrue(torch.equal(tokens_out, eager_tokens))
+
+        prev = anchor
+        for step in range(GAMMA):
+            bias = head.markov_w1(prev).float() @ head.markov_w2.weight.float().T
+            prev = (base[:, step].float() + bias).argmax(-1)
+            self.assertEqual(eager_tokens[0, step].item(), prev.item())
+
     def test_captured_sampler_matches_eager_block(self):
         # The graph tail itself: staged temperatures, the static step-logits
         # buffer and the [:bs] views, against the eager draft of the same batch.
@@ -124,6 +169,7 @@ class TestDraftMarkovBlockGraph(CustomTestCase):
             noise=eager_noise,
             device=DEVICE,
             tp_sync=tp_sync,
+            keep_greedy_logits=False,
         )
         self.assertTrue(
             torch.equal(sampler.out[: BS * GAMMA].view(BS, GAMMA), eager.draft_tokens)
