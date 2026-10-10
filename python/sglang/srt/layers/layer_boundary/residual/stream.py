@@ -189,6 +189,15 @@ class ResidualStream:
         self.check(hidden)
         return self.pending.complete() if self.pending is not None else hidden
 
+    def flush_update(self, hidden):
+        """Complete and apply a pending update that cannot cross a transport."""
+        self.check(hidden)
+        if self.pending is None:
+            return hidden
+        value = self.pending.complete()
+        residual = self.pending.update.update(value, self.residual)
+        return self.write(residual)
+
     def snapshot(self, hidden):
         self.check(hidden)
         pending = self.pending

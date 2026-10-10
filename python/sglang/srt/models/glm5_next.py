@@ -88,6 +88,7 @@ from sglang.srt.model_loader.weight_utils import (
 from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
     apply_mhc_post_pre_boundary,
     is_cross_layer_mhc_fusion_enabled,
+    try_aiter_mhc_pre_quant,
 )
 from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     DeepseekV2WeightLoaderMixin,
@@ -145,6 +146,17 @@ _MHC_POST_MULT_VALUE = 2.0
 # hidden_size=4096 the fusion wins to 16 tokens and reaches parity at 24, with
 # 17-23 unmeasured. Past it the pre-norm GEMM drops mhc_pre's split-K kernel.
 _MHC_FUSED_BOUNDARY_MAX_TOKENS = 16
+_MHC_FUSED_BOUNDARY_LARGE_TOKENS = (4096, 8192, 16384, 131072)
+_MHC_QUANT_BOUNDARY_TOKENS = (
+    1024,
+    2048,
+    4096,
+    8192,
+    16384,
+    32768,
+    65536,
+    131072,
+)
 
 
 @torch.compile
@@ -793,20 +805,27 @@ class Glm5NextDecoderLayer(nn.Module):
             self.hc_ffn_fn = nn.Parameter(
                 torch.empty(mix_hc, hc_dim, dtype=torch.float32)
             )
+            for stage in ("attn", "ffn"):
+                self.register_buffer(f"_hc_{stage}_fn_packed", None, persistent=False)
+                setattr(self, f"_hc_{stage}_fn_packed_source", None)
 
         terminal = layer_id == (1 if is_nextn else config.num_hidden_layers) - 1
         residual = PLAIN_RESIDUAL_OPS
         if self.config.mhc:
+            fuse_mhc_boundaries = is_cross_layer_mhc_fusion_enabled()
             residual = MHCState(
                 hc_mult=config.hc_mult,
                 hc_attn_pre=self.hc_attn_pre,
                 hc_ffn_pre=self.hc_ffn_pre,
                 hc_post=self.hc_post,
-                hc_ffn_post_pre=(
-                    self.hc_ffn_post_pre
-                    if is_cross_layer_mhc_fusion_enabled()
-                    else None
+                hc_ffn_post_pre=(self.hc_ffn_post_pre if fuse_mhc_boundaries else None),
+                hc_attn_post_pre=(
+                    self.hc_attn_post_pre if fuse_mhc_boundaries else None
                 ),
+                hc_attn_pre_quant=(
+                    self.hc_attn_pre_quant if fuse_mhc_boundaries else None
+                ),
+                defer_ffn_update=fuse_mhc_boundaries and not terminal,
                 is_last_layer=terminal,
             ).residual_ops()
         self.attn_boundary, self.ffn_boundary = append_stages(
@@ -874,24 +893,76 @@ class Glm5NextDecoderLayer(nn.Module):
             out_norm_eps,
         )
 
-    def hc_ffn_post_pre(
-        self, hidden_states, residual, h_res, h_post, out_norm_weight, out_norm_eps
+    def _get_hc_fn_packed(self, stage: str):
+        weight = getattr(self, f"hc_{stage}_fn")
+        packed_name = f"_hc_{stage}_fn_packed"
+        source_name = f"_hc_{stage}_fn_packed_source"
+        version = None if weight.is_inference() else weight._version
+        source = getattr(self, source_name)
+        source_is_valid = (
+            source is not None
+            and weight is source[0]
+            and weight.data_ptr() == source[1]
+            and (source[2] is None or version == source[2])
+        )
+        packed = getattr(self, packed_name)
+        if packed is None or not source_is_valid:
+            from aiter.ops.mhc import mhc_shuffle_fn
+
+            packed = mhc_shuffle_fn(weight)
+            setattr(self, packed_name, packed)
+            setattr(
+                self,
+                source_name,
+                (
+                    weight,
+                    weight.data_ptr(),
+                    version,
+                ),
+            )
+        return packed
+
+    def _hc_post_pre(
+        self,
+        stage,
+        hidden_states,
+        residual,
+        h_res,
+        h_post,
+        out_norm_weight,
+        out_norm_eps,
+        is_prefill,
     ):
-        # Fuses hc_post into the pre-norm GEMM; the mhc_pre big-fuse stage
-        # still launches separately, so this is two launches instead of three.
-        assert self.config.mhc, "hc_ffn_post_pre is only valid when config.mhc=True"
+        assert self.config.mhc, "mHC post/pre fusion requires config.mhc=True"
         num_tokens, hidden_size = hidden_states.shape
-        if num_tokens > _MHC_FUSED_BOUNDARY_MAX_TOKENS:
-            return None
         hc_mult = self.config.hc_mult
+        use_large_m_fused = (
+            is_prefill
+            and _use_aiter_gfx95
+            and hidden_size == 4096
+            and hc_mult == 4
+            and num_tokens in _MHC_FUSED_BOUNDARY_LARGE_TOKENS
+        )
+        if num_tokens > _MHC_FUSED_BOUNDARY_MAX_TOKENS and not use_large_m_fused:
+            return None
+        hc_fn = (
+            self._get_hc_fn_packed(stage)
+            if use_large_m_fused
+            else getattr(self, f"hc_{stage}_fn")
+        )
+        return_quant = (
+            stage == "attn"
+            and use_large_m_fused
+            and self._can_use_hc_attn_prequant(num_tokens)
+        )
         fused = apply_mhc_post_pre_boundary(
             layer_input=hidden_states,
             residual=residual.view(num_tokens, hc_mult, hidden_size),
             post=h_post.view(num_tokens, hc_mult),
             comb=h_res.view(num_tokens, hc_mult, hc_mult),
-            hc_fn=self.hc_ffn_fn,
-            hc_scale=self.hc_ffn_scale,
-            hc_base=self.hc_ffn_base,
+            hc_fn=hc_fn,
+            hc_scale=getattr(self, f"hc_{stage}_scale"),
+            hc_base=getattr(self, f"hc_{stage}_base"),
             hc_mult=hc_mult,
             rms_eps=self.config.rms_norm_eps,
             hc_eps=self.config.hc_eps,
@@ -899,19 +970,109 @@ class Glm5NextDecoderLayer(nn.Module):
             sinkhorn_iters=self.config.hc_sinkhorn_iters,
             norm_weight=out_norm_weight,
             norm_eps=out_norm_eps,
-            # Matches DeepSeek-V4's two hc_ffn_fn boundaries; the Triton tier's
-            # parameter is hc_fn_t and this fn has the same [mix_hc, hc_dim] layout.
             fn_transpose=True,
+            force_fused=use_large_m_fused,
+            w_preshuffle_bf16=use_large_m_fused,
+            return_quant=return_quant,
         )
         if fused is None:
             return None
-        next_residual, layer_input, post, comb, norm_fused = fused
-        return (
+        if len(fused) == 6:
+            next_residual, layer_input, post, comb, norm_fused, prequant = fused
+        else:
+            next_residual, layer_input, post, comb, norm_fused = fused
+            prequant = None
+        result = (
             layer_input,
             next_residual.reshape(num_tokens, -1),
             comb.reshape(num_tokens, hc_mult * hc_mult),
             post.reshape(num_tokens, hc_mult),
             norm_fused,
+        )
+        return result if prequant is None else (*result, prequant)
+
+    def _can_use_hc_attn_prequant(self, num_tokens: int) -> bool:
+        consumer = getattr(self.self_attn, "can_consume_mhc_prequant", None)
+        return (
+            self.is_linear_attn
+            and _use_aiter_gfx95
+            and num_tokens in _MHC_QUANT_BOUNDARY_TOKENS
+            and callable(consumer)
+            and consumer(num_tokens)
+        )
+
+    def hc_attn_pre_quant(self, hidden_states, out_norm_weight, out_norm_eps):
+        num_tokens, hc_hidden_size = hidden_states.shape
+        hidden_size = hc_hidden_size // self.config.hc_mult
+        if (
+            hidden_size != 4096
+            or out_norm_weight is None
+            or not self._can_use_hc_attn_prequant(num_tokens)
+        ):
+            return None
+        quantized = try_aiter_mhc_pre_quant(
+            residual=hidden_states.view(num_tokens, self.config.hc_mult, hidden_size),
+            hc_fn=self.hc_attn_fn,
+            hc_scale=self.hc_attn_scale,
+            hc_base=self.hc_attn_base,
+            norm_weight=out_norm_weight,
+            rms_eps=self.config.rms_norm_eps,
+            hc_eps=self.config.hc_eps,
+            hc_post_mult=_MHC_POST_MULT_VALUE,
+            sinkhorn_iters=self.config.hc_sinkhorn_iters,
+            norm_eps=out_norm_eps,
+        )
+        if quantized is None:
+            return None
+        layer_input, post, comb, norm_fused, prequant = quantized
+        return (
+            layer_input,
+            comb.reshape(num_tokens, self.config.hc_mult**2),
+            post.reshape(num_tokens, self.config.hc_mult),
+            norm_fused,
+            prequant,
+        )
+
+    def hc_attn_post_pre(
+        self,
+        hidden_states,
+        residual,
+        h_res,
+        h_post,
+        out_norm_weight,
+        out_norm_eps,
+        is_prefill,
+    ):
+        return self._hc_post_pre(
+            "attn",
+            hidden_states,
+            residual,
+            h_res,
+            h_post,
+            out_norm_weight,
+            out_norm_eps,
+            is_prefill,
+        )
+
+    def hc_ffn_post_pre(
+        self,
+        hidden_states,
+        residual,
+        h_res,
+        h_post,
+        out_norm_weight,
+        out_norm_eps,
+        is_prefill,
+    ):
+        return self._hc_post_pre(
+            "ffn",
+            hidden_states,
+            residual,
+            h_res,
+            h_post,
+            out_norm_weight,
+            out_norm_eps,
+            is_prefill,
         )
 
     def hc_post(self, hidden_states, residual, h_res, h_post):

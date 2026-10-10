@@ -182,6 +182,37 @@ class TestAmdFusedMhcCrossLayerGating(unittest.TestCase):
         # fn_transpose=True must hand the Triton kernel the transposed fn.
         self.assertEqual(mock_triton.call_args.args[4], "transposed_fn")
 
+    @mock.patch.object(
+        deepseek_v4_fused_mhc, "try_aiter_fused_mhc_post_pre", return_value=None
+    )
+    @mock.patch.object(deepseek_v4_fused_mhc, "try_fused_hc_post_pre")
+    def test_packed_aiter_layout_never_falls_through_to_triton(
+        self, mock_triton, mock_aiter
+    ):
+        result = deepseek_v4_fused_mhc.try_mhc_fused_post_pre_boundary(
+            layer_input=mock.Mock(shape=(8192, 4096), dim=2),
+            residual=mock.Mock(dim=3),
+            post=mock.Mock(),
+            comb=mock.Mock(),
+            hc_fn=mock.Mock(),
+            hc_scale=mock.Mock(),
+            hc_base=mock.Mock(),
+            hc_mult=4,
+            rms_eps=1e-6,
+            hc_eps=1e-6,
+            hc_post_mult=2.0,
+            sinkhorn_iters=20,
+            norm_weight=mock.Mock(),
+            norm_eps=1e-6,
+            fn_transpose=True,
+            is_gfx95_supported_flag=True,
+            force_fused=True,
+            w_preshuffle_bf16=True,
+        )
+        self.assertIsNone(result)
+        mock_aiter.assert_called_once()
+        mock_triton.assert_not_called()
+
 
 class TestAmdFusedMhcAttnBoundaryFallback(unittest.TestCase):
     """Regression: the attn-side boundary fallback must close the previous
