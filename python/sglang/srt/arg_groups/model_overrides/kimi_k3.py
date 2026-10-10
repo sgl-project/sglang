@@ -184,6 +184,56 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
     return overrides
 
 
+@_register_for("KimiK3ForConditionalGeneration", "KimiK3LinearForCausalLM")
+def _kimi_k3_mono_decode_checks(server_args: Any, hf_config: Any) -> dict:
+    """Reject a serving config the ROCm mono decode launches can never serve.
+
+    The launches themselves fall back per layer, so this changes nothing about
+    correctness. What it buys is the timing: every condition below is an
+    explicit CLI choice that contradicts an explicit env opt-in, and without
+    this the operator only learns from an info log after the weights have
+    loaded, minutes in.
+
+    Off-platform stays a no-op on purpose: the env may be set globally, and a
+    CUDA host is not a contradiction, just somewhere the feature does not run.
+    """
+    from sglang.srt.environ import envs
+    from sglang.srt.layers.moe.k3_mono_decode import MONO_TP_SIZE
+    from sglang.srt.utils import is_hip
+
+    if envs.SGLANG_K3_MONO_LAYER.get() and not envs.SGLANG_K3_MONO_DECODE.get():
+        raise ValueError(
+            "SGLANG_K3_MONO_LAYER=1 needs SGLANG_K3_MONO_DECODE=1: the layer "
+            "launch is built on the MoE launch's per-layer binding."
+        )
+    if not (envs.SGLANG_K3_MONO_DECODE.get() and is_hip()):
+        return {}
+
+    cfg = resolving_view(server_args)
+    # Mirrors mono_supported() in srt/layers/moe/k3_mono_decode.py, limited to
+    # what a server arg decides.
+    reasons = []
+    if cfg.tp_size != MONO_TP_SIZE:
+        reasons.append(f"--tp-size must be {MONO_TP_SIZE} (got {cfg.tp_size})")
+    if cfg.moe_a2a_backend not in (None, "none"):
+        reasons.append(
+            "--moe-a2a-backend must be none "
+            f"(got {cfg.moe_a2a_backend!r}); the launch holds the experts "
+            "TP-sharded, not expert-parallel"
+        )
+    # --enable-dp-attention is a deprecated alias that resolution turns into
+    # attn_dp_size, so on the pristine config the size is the knob to read.
+    if (cfg.attn_dp_size or 1) > 1 or cfg.enable_dp_attention:
+        reasons.append("--attn-dp-size must be 1 (DP attention is not supported)")
+    if reasons:
+        raise ValueError(
+            "SGLANG_K3_MONO_DECODE=1 cannot serve this configuration: "
+            + "; ".join(reasons)
+            + ". Unset the env to keep the default path."
+        )
+    return {}
+
+
 @_register_for("KimiK3ForConditionalGeneration")
 def _kimi_k3_moe_runner_overrides(server_args: Any, hf_config: Any) -> dict:
     # MoE runner default, independent of the attention-backend gate above.
