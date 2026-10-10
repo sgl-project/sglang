@@ -124,6 +124,10 @@ and VERIFY must match Prefill. Re-establish native/off baselines with the new
 image. Run `native -> passthrough -> force-l2 -> off -> force -> lz4`, then `ans-transfer -> force-ans -> ans-l2 -> force-ans-l2`, then fault
 validation. Use fresh workers for each group, with no resets within a group.
 
+The launcher's exact variable names are `SGLANG_PD_KV_COMPRESSION_FORCE` and
+`SGLANG_PD_KV_COMPRESSION_VERIFY`. `FORCE` and `VERIFY` above are table labels,
+not environment variable names.
+
 ```bash
 python test/manual/kv_transfer/validate_pd_compression.py run \
   --workload workload.json --output results/force-l2 --phase force-l2 \
@@ -158,6 +162,18 @@ writes, restoration failure and in-flight RDMA disconnects. Failed targets must
 not be published. Confirmed drain permits reclamation and a subsequent request;
 uncertain drain retains resources and marks the worker unavailable. Local/GPU
 injection does not replace actual transport-failure testing.
+
+When validating a fault-lifecycle fix, first rerun its targeted online failure
+before starting the normal matrix. For compressed receivers, `failure_exception()`
+reports the error without clearing the room or its drain ACKs. The transfer
+queue clears it only after local restoration and remote writes have drained;
+failed preallocation requests still clear immediately before destinations are
+published. Exercise both ACK-before-error-return and ACK-after-error-return
+through the concrete receiver, inherited failure method and transfer queue.
+After confirmed drain, require a successful next request without restarting.
+If drain remains uncertain, preserve resources and quarantine; restarting that
+worker is test cleanup, not evidence of successful drain. A missing client
+terminal response after quarantine remains a separate online acceptance failure.
 
 ## Admission and resource ownership
 

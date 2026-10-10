@@ -2021,8 +2021,9 @@ class CommonKVReceiver(BaseKVReceiver):
         self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].discard(
             self.bootstrap_room
         )
-        # clear() is reached only after release is safe, or before destinations
-        # were published. Also retire ACK state armed by a preallocation abort.
+        # Compressed receivers leave final cleanup to the owning queue, after
+        # safe release or before publishing destinations. Error reporting must
+        # preserve this state, including ACKs that arrived before deferred release.
         if self.kv_mgr.enable_deferred_decode_kv_release:
             self.kv_mgr.clear_deferred_abort_state(self.bootstrap_room)
 

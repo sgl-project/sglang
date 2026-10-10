@@ -2977,19 +2977,21 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 class MooncakeFailureExceptionMixin:
     """Shared `failure_exception` for the Mooncake sender and receiver.
 
-    Both sides conclude a failed room identically: latch Failed, clear local
-    state, then raise with the recorded reason -- or, when no reason was
-    recorded locally, report it as propagated from another rank. Expects the
+    Latch Failed and raise the recorded reason, or report a failure propagated
+    from another rank. Compressed receivers defer cleanup to their owning queue:
+    reporting an error must not discard the ACKs needed to release destinations.
+    Senders and uncompressed receivers retain immediate cleanup. Expects the
     concrete class to provide ``conclude_state``, ``clear()``,
     ``bootstrap_room`` and ``kv_mgr``.
     """
 
-    def failure_exception(self):
+    def failure_exception(self, *, defer_cleanup: bool = False):
         # A room with no locally recorded reason failed on another rank.
         if self.conclude_state is None:
             self.conclude_state = KVPoll.Failed
 
-        self.clear()
+        if not defer_cleanup:
+            self.clear()
 
         with self.kv_mgr.failure_lock:
             failure_reason = self.kv_mgr.failure_records.pop(self.bootstrap_room, None)
@@ -3151,10 +3153,14 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
         super().__init__(mgr, bootstrap_addr, bootstrap_room)
 
     def failure_exception(self):
-        if self.kv_mgr.compression_mode != "off" and not self.abort_notified:
+        compressed = self.kv_mgr.compression_mode != "off"
+        if compressed and not self.abort_notified:
             self._send_abort_notification()
             self.abort_notified = True
-        return super().failure_exception()
+        # The transfer queue retains this receiver until local restore and remote
+        # writes drain. The preallocation queue also clears failed receivers, but
+        # can do so immediately because it has not published destination pages.
+        return super().failure_exception(defer_cleanup=compressed)
 
     def _register_kv_args(self) -> bool:
         for bootstrap_info in self.bootstrap_infos:
