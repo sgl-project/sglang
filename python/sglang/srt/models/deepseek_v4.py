@@ -4798,11 +4798,6 @@ class DeepseekV4ForCausalLM(nn.Module):
             ):
                 self_attn.indexer.compressor.apply_ape_hotfix()
             layer.refresh_mhc_norm_weight_cache()
-            # Before the memory profiler sizes the KV cache: the fused wo_b
-            # keeps a second, re-laid-out copy of this weight, and building it
-            # on the first fused call would allocate it behind the profiler's
-            # back.
-            prepare_wo_b_weight(self_attn.wo_b)
         layers = self.model.layers
         for i, layer in enumerate(layers):
             if isinstance(layer, DeepseekV4DecoderLayer):
@@ -4830,6 +4825,20 @@ class DeepseekV4ForCausalLM(nn.Module):
                 module.mega_shared_l1_weights, module.mega_shared_l2_weights = (
                     build_mega_moe_shared_weights(module.shared_experts)
                 )
+
+        # The fused wo_b keeps a second, re-laid-out copy of each wo_b weight,
+        # and building it on the first fused call would allocate it after the
+        # memory profiler had already sized the KV cache around its absence.
+        # Here rather than in `post_load_weights`, which runs *before*
+        # `process_weights_after_loading` and so before the mxfp8 layout this
+        # reads even exists.
+        #
+        # Walked as modules, not as `self.model.layers`: the DSPARK draft
+        # wrapper borrows this method and has no `.model`.
+        for module in self.modules():
+            wo_b = getattr(module, "wo_b", None)
+            if wo_b is not None:
+                prepare_wo_b_weight(wo_b)
 
     @staticmethod
     def remap_weight_name_to_dpsk_hf_format(
