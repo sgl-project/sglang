@@ -996,7 +996,7 @@ class Envs:
     # Number of decode steps between periodic mx.clear_cache() calls.
     # Set to 0 to disable cache clearing entirely.
     SGLANG_MLX_CLEAR_CACHE_STEPS = EnvInt(256)
-    # MLX buffer-cache cap in GB.
+    # MLX buffer-cache cap in GB; unset = 10% of the recommended working set (>= 1 GiB).
     SGLANG_MLX_CACHE_LIMIT_GB = EnvFloat(None)
 
     # ===================================================================
