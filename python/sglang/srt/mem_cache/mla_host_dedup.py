@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import List, Optional
 
 import torch
@@ -16,7 +17,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
     MLATokenToKVPoolFP4,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import is_cuda
 
 logger = logging.getLogger(__name__)
@@ -24,6 +25,11 @@ logger = logging.getLogger(__name__)
 
 # These backends tolerate buffer-less host pools on non-source ranks.
 _DEDUP_COMPATIBLE_STORAGE = frozenset({None, "", "file"})
+
+
+def _dedup_group_timeout() -> Optional[timedelta]:
+    seconds = get_server_args().dist_timeout
+    return None if seconds is None else timedelta(seconds=seconds)
 
 
 def storage_supports_host_dedup(storage_backend: Optional[str]) -> bool:
@@ -133,6 +139,7 @@ class MLAHostDedupBroadcaster:
             group_ranks=list(group_ranks),
             backend="nccl",
             metadata_group=get_world_group().cpu_group,
+            timeout=_dedup_group_timeout(),
         )
         broadcaster = cls(device_pool, group, src_global_rank=group_ranks[0])
         broadcaster._warmup_group()
@@ -402,6 +409,7 @@ def _prebuild_prefetch_sync_groups(
                 group_ranks=list(ranks),
                 backend="gloo",
                 metadata_group=get_world_group().cpu_group,
+                timeout=_dedup_group_timeout(),
             )
         )
     return groups

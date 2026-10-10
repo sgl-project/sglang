@@ -1,4 +1,5 @@
 import unittest
+from datetime import timedelta
 from types import SimpleNamespace
 from unittest import mock
 
@@ -142,6 +143,10 @@ class TestMLAHostDedupPrimitives(CustomTestCase):
                 "get_world_group",
                 return_value=SimpleNamespace(cpu_group=cpu_group),
             ),
+            mock.patch(
+                "sglang.srt.mem_cache.mla_host_dedup.get_server_args",
+                return_value=SimpleNamespace(dist_timeout=1200),
+            ),
             mock.patch.object(
                 parallel_state,
                 "create_custom_parallel_group",
@@ -153,8 +158,18 @@ class TestMLAHostDedupPrimitives(CustomTestCase):
         self.assertEqual(
             create.call_args_list,
             [
-                mock.call(group_ranks=[0, 1], backend="gloo", metadata_group=cpu_group),
-                mock.call(group_ranks=[0, 2], backend="gloo", metadata_group=cpu_group),
+                mock.call(
+                    group_ranks=[0, 1],
+                    backend="gloo",
+                    metadata_group=cpu_group,
+                    timeout=timedelta(seconds=1200),
+                ),
+                mock.call(
+                    group_ranks=[0, 2],
+                    backend="gloo",
+                    metadata_group=cpu_group,
+                    timeout=timedelta(seconds=1200),
+                ),
             ],
         )
 
@@ -508,6 +523,10 @@ class TestMLAHostDedupPrimitives(CustomTestCase):
                 "sglang.srt.distributed.parallel_state.get_world_group",
                 return_value=SimpleNamespace(cpu_group=cpu_group),
             ),
+            mock.patch(
+                "sglang.srt.mem_cache.mla_host_dedup.get_server_args",
+                return_value=SimpleNamespace(dist_timeout=1200),
+            ),
             mock.patch.object(torch.distributed, "broadcast") as broadcast,
             mock.patch.object(torch.cuda, "synchronize") as synchronize,
         ):
@@ -516,7 +535,10 @@ class TestMLAHostDedupPrimitives(CustomTestCase):
             )
 
         create_group.assert_called_once_with(
-            group_ranks=[4, 5], backend="nccl", metadata_group=cpu_group
+            group_ranks=[4, 5],
+            backend="nccl",
+            metadata_group=cpu_group,
+            timeout=timedelta(seconds=1200),
         )
         broadcast.assert_called_once()
         self.assertEqual(broadcast.call_args.args[0].numel(), 1)
@@ -540,23 +562,43 @@ class TestMLAHostDedupPrimitives(CustomTestCase):
             mock.patch.object(torch.distributed, "is_initialized", return_value=True),
             mock.patch.object(torch.distributed, "get_world_size", return_value=4),
             mock.patch.object(torch.distributed, "get_rank", return_value=2),
+            mock.patch.object(torch.distributed, "get_backend", return_value="gloo"),
             mock.patch.object(
                 torch.distributed, "all_gather_object", side_effect=gather
             ),
+            mock.patch.object(torch.distributed, "monitored_barrier") as barrier,
             mock.patch.object(
-                torch.distributed, "new_group", side_effect=[first, second]
+                torch.distributed,
+                "new_group",
+                side_effect=[first, second, first, second],
             ) as create,
             mock.patch.object(parallel_state, "_is_npu", False),
         ):
             result = parallel_state.create_custom_parallel_group(
                 [3, 2], "nccl", metadata_group=cpu_group
             )
+            timed_result = parallel_state.create_custom_parallel_group(
+                [3, 2],
+                "nccl",
+                metadata_group=cpu_group,
+                timeout=timedelta(seconds=1200),
+            )
         self.assertIs(result, second)
+        self.assertIs(timed_result, second)
+        barrier.assert_called_once_with(
+            group=cpu_group, timeout=timedelta(seconds=1200), wait_all_ranks=True
+        )
         self.assertEqual(
             create.call_args_list,
             [
                 mock.call(ranks=[0, 1], backend="nccl"),
                 mock.call(ranks=[2, 3], backend="nccl"),
+                mock.call(
+                    ranks=[0, 1], backend="nccl", timeout=timedelta(seconds=1200)
+                ),
+                mock.call(
+                    ranks=[2, 3], backend="nccl", timeout=timedelta(seconds=1200)
+                ),
             ],
         )
 
