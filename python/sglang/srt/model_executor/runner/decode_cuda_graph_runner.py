@@ -113,6 +113,7 @@ from sglang.srt.utils import (
     require_mlp_tp_gather,
 )
 from sglang.srt.utils.device_timer import device_timer_ctx
+from sglang.srt.utils.foundry_adapter import get_foundry_adapter
 from sglang.srt.utils.profile_utils import (
     export_cuda_graph_capture_trace,
     graph_capture_profile_dir,
@@ -1114,6 +1115,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return forward_batch, attn_backend, pp_proxy_tensors
 
     def capture(self) -> None:
+        # Foundry CUDA graph persistence: SAVE archives the graphs captured by
+        # this loop, LOAD restores them in place of capturing (capture_one).
+        with get_foundry_adapter().capture_scope(
+            "decode", model=self.model_runner.model
+        ):
+            self._capture_graphs()
+
+    def _capture_graphs(self) -> None:
         # Warm up + autotune kernels once before capture (run-once across the
         # decode + prefill runners; see BaseRunner.warmup).
         self.warmup()
