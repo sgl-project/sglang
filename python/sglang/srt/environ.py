@@ -881,6 +881,13 @@ class Envs:
     # AMD, ROCm, and AITER
     # ===================================================================
     SGLANG_USE_AITER = EnvBool(False)
+    # ROCm FlyDSL Qwen3.8-27B dense FFN mono stage for decode steps of <= 8 rows
+    # (gfx950, TP1). See srt/layers/qwen3_8_dense_mono.py.
+    SGLANG_QWEN3_8_DENSE_MONO = EnvBool(False)
+    # With it: fold out_proj / o_proj into the launch too.
+    SGLANG_QWEN3_8_DENSE_MONO_OPROJ = EnvBool(True)
+    # With the o_proj fold: GDN layers' input norm .. gated norm as one launch too.
+    SGLANG_QWEN3_8_DENSE_MONO_K1 = EnvBool(True)
     # Fuse MiniMax-M3 main/index QK norm + RoPE with main KV and index-K cache
     # insertion. Requires an AITER build with the fp8_e4m3_unit cache contract.
     # Enabled by default for supported configurations; set to 0 to disable.
