@@ -87,7 +87,7 @@ def _worker() -> int:
     if world == 2:
         cases.append((128, 16, 64, 8))
     for s_local, heads, head_dim, groups in cases:
-        # three calls in a row: the slots alternate and the counters advance
+        # three calls in a row: the slots are reused and the counters advance
         for call in range(3):
             torch.manual_seed(
                 1000 * call + s_local
@@ -247,12 +247,48 @@ def _worker() -> int:
         elif not torch.equal(got, own):
             failures.append(label)
 
-    for call in range(2):  # slots alternate between calls
+    for call in range(2):  # every layout reuses the one pool
         layout_case(2, 48, 16, 16, 0, 0, True, 2, 300 + call)
         layout_case(1, 40, 16, 16, 9, 9, True, 2, 310 + call)
         layout_case(2, 40, 16, 16, 7, 7, False, 2, 320 + call)
         layout_case(1, 40, 16, 16, 0, 11, True, 2, 330 + call)
         layout_case(2, 40, 16, 8, 5, 5, True, 2, 340 + call)
+
+    # one pool per dtype serves every plan above, sized for the largest of them
+    pools = IPC_A2A_MULTI.pools
+    if list(pools) != [torch.bfloat16]:
+        failures.append(f"pipeline pools per dtype: {list(pools)}")
+    else:
+        slots = list(IPC_A2A_MULTI.slots.values())
+        widest = (
+            max(s.in_total for s in slots),
+            max(s.out_total for s in slots),
+            max(s.plan.groups for s in slots),
+        )
+        if pools[torch.bfloat16].sizes != widest:
+            failures.append(f"pool sizes {pools[torch.bfloat16].sizes} != {widest}")
+
+    # one set of slots is enough: a peer cannot write a call's rows or output
+    # blocks before this rank has read the previous call's, however far ahead
+    # it runs. Rank 0 attends slowly; alternating plans share the pool.
+    def slow_attend(q, k, v):
+        if rank == 0:
+            torch.cuda._sleep(20_000_000)
+        return _attend(q, k, v)
+
+    issued = []
+    for call in range(6):  # queued back to back; compared only afterwards
+        s_local, heads, groups = ((96, 16, 2), (40, 32, 4))[call % 2]
+        torch.manual_seed(4000 + call)
+        full = [
+            torch.randn(s_local * world, heads, 64, dtype=torch.bfloat16, device="cuda")
+            for _ in range(3)
+        ]
+        parts = [t.narrow(0, rank * s_local, s_local).contiguous() for t in full]
+        issued.append((parts, ulysses_pipelined_attention(*parts, slow_attend, groups)))
+    for call, (parts, got) in enumerate(issued):
+        if got is None or not torch.equal(sequential(*parts), got):
+            failures.append(f"skewed back-to-back call {call}")
 
     # the plain N-rank exchange behind _usp_all_to_all_single
     for numel in (world * 1024, world * 4096 * 33):

@@ -9,10 +9,11 @@ NCCL's all-to-all is an SM kernel, and next to a full-occupancy attention it
 slows that attention by more than the exchange costs.
 
 Per peer, a sequence counter published after the copy orders the data before
-the flag, and the receiver spins on that peer's entry. Double-buffered slots
-alternate per call; a slot is only rewritten two calls later, after a spin on
-every peer, and each peer publishes that call only after it has consumed the
-slot in stream order.
+the flag, and the receiver spins on that peer's entry. The plain exchange's
+double-buffered slots alternate per call; a slot is only rewritten two calls
+later, after a spin on every peer, and each peer publishes that call only after
+it has consumed the slot in stream order. The pipelined attention needs one set
+of slots (see ``_PipelinePool``).
 """
 
 import dataclasses
@@ -101,16 +102,6 @@ class _PipelinePlan:
 
     def out_block_numel(self) -> int:
         return self.batch * self.out_rows * self.group_heads(0) * self.head_dim
-
-    def send_numel(self) -> int:
-        return (
-            2
-            * self.world
-            * self.groups
-            * self.s_local
-            * self.group_heads(0)
-            * (self.head_dim)
-        )
 
 
 def _auto_pipeline_groups(plan: _PipelinePlan) -> int:
@@ -246,90 +237,104 @@ class _StreamMemOps:
             raise RuntimeError(f"cuMemcpy2DAsync failed with CUresult {rc}")
 
 
-class _PipelineBuffers:
-    """Receive and output slots and flags for one pipelined-attention plan.
+class _PipelinePool:
+    """Receive slots, output blocks and flags that every pipelined call of one
+    dtype shares, grown to the largest call seen rather than kept per shape.
 
-    Receive slots, per call parity, head group and part: one contiguous
-    ``[batch, rows, group_heads, head_dim]`` tensor laid out as attention reads
-    it (see ``_PipelinePlan``). Output slots are source-major: block
-    ``(source, group)`` is that rank's output rows for this rank, one
-    ``[batch, out_rows, group_heads, head_dim]`` block in the output's row
-    order, copied into the merged output as it arrives.
+    One set serves every call, with no slot per call parity. Rank r sends a
+    group's output blocks only after attending over its slot, and peer p
+    returns from a call only after merging all of r's blocks; p writes r's
+    slots for the next call only after that, so after r has read them. And p
+    writes its next block into r's output block only after attending over r's
+    rows of that call, which r sends only after its own previous call
+    returned, so after r merged p's previous block.
     """
 
-    def __init__(self, state, plan: _PipelinePlan, dtype):
-        world, groups = plan.world, plan.groups
+    def __init__(self, state, dtype, in_numel: int, out_numel: int, groups: int):
+        world = state.world
+        self.sizes = (in_numel, out_numel, groups)
+        zeros = lambda n, dt=dtype: torch.zeros(n, dtype=dt, device="cuda")
+        self.inb = state._share(zeros(in_numel), state.group)
+        self.outb = state._share(zeros(out_numel), state.group)
+        # fin[p]: groups peer p has delivered; fout[g, p]: calls whose group g
+        # peer p has delivered. Groups finish on separate streams, so a single
+        # output counter could be lowered by a signal that lands late.
+        self.fin = state._share(zeros(world, dt=torch.int32), state.group)
+        self.fout = state._share(zeros(groups * world, dt=torch.int32), state.group)
+        self.inb_ptr = [t.data_ptr() for t in self.inb]
+        self.outb_ptr = [t.data_ptr() for t in self.outb]
+        self.fin_ptr = [t.data_ptr() for t in self.fin]
+        self.fout_ptr = [t.data_ptr() for t in self.fout]
+        self.calls = 0
+        self.groups_sent = 0
+        # the caller's q/k for each peer block when a fill writes them; v moves
+        # straight from its source
+        self.send = None
+
+    def nbytes(self, esz: int) -> int:
+        return (self.sizes[0] + self.sizes[1]) * esz
+
+
+class _PipelineSlots:
+    """Where one plan's receive slots and output blocks sit in the pool.
+
+    Receive slots, per head group and part: one contiguous ``[batch, rows,
+    group_heads, head_dim]`` tensor laid out as attention reads it (see
+    ``_PipelinePlan``). Output blocks are source-major: block ``(source,
+    group)`` is that rank's output rows for this rank, one ``[batch, out_rows,
+    group_heads, head_dim]`` block in the output's row order, copied into the
+    merged output as it arrives.
+    """
+
+    def __init__(self, plan: _PipelinePlan, dtype):
         self.plan = plan
         self.dtype = dtype
         numel = [plan.slot_numel(part) for part in range(3)]
         self.part_numel = numel
         self.part_offset = (0, numel[0], numel[0] + numel[1])
         self.group_numel = sum(numel)
-        zeros = lambda *shape, dt=dtype: torch.zeros(*shape, dtype=dt, device="cuda")
-        self.inb = state._share(zeros(2 * groups * self.group_numel), state.group)
-        self.outb = state._share(
-            zeros(2, world, groups, plan.out_block_numel()), state.group
-        )
-        # fin[p]: groups peer p has delivered; fout[g, p]: calls whose group g
-        # peer p has delivered. Groups finish on separate streams, so a single
-        # output counter could be lowered by a signal that lands late.
-        self.fin = state._share(zeros(world, dt=torch.int32), state.group)
-        self.fout = state._share(zeros(groups, world, dt=torch.int32), state.group)
-        # the caller's q/k for each peer block when a fill writes them; v moves
-        # straight from its source
-        self.send = None
-        self.calls = 0
+        self.out_numel = plan.out_block_numel()
+        self.in_total = plan.groups * self.group_numel
+        self.out_total = plan.world * plan.groups * self.out_numel
         # raw addresses: the copies are issued per call from plain integers,
         # since a tensor view per copy costs more host time than the copy
         self.esz = torch.empty((), dtype=dtype).element_size()
-        self.inb_ptr = [t.data_ptr() for t in self.inb]
-        self.outb_ptr = [t.data_ptr() for t in self.outb]
-        self.fin_ptr = [t.data_ptr() for t in self.fin]
-        self.fout_ptr = [t.data_ptr() for t in self.fout]
         self.rows = [plan.rows(part) for part in range(3)]
         self.row_bytes = [
             plan.group_heads(part) * plan.head_dim * self.esz for part in range(3)
         ]
-        self.out_numel = plan.out_block_numel()
+        self.send_numel = 2 * plan.s_local * plan.group_heads(0) * plan.head_dim
 
-    def slot_ptr(self, member, parity, group, part, batch_row, row) -> int:
-        elems = (
-            parity * self.plan.groups + group
-        ) * self.group_numel + self.part_offset[part]
+    def slot_ptr(self, pool, member, group, part, batch_row, row) -> int:
+        elems = group * self.group_numel + self.part_offset[part]
         return (
-            self.inb_ptr[member]
+            pool.inb_ptr[member]
             + elems * self.esz
             + (batch_row * self.rows[part] + row) * self.row_bytes[part]
         )
 
-    def out_block_ptr(self, member, parity, source, group) -> int:
-        plan = self.plan
-        block = ((parity * plan.world + source) * plan.groups + group) * self.out_numel
-        return self.outb_ptr[member] + block * self.esz
+    def out_block_ptr(self, pool, member, source, group) -> int:
+        block = (source * self.plan.groups + group) * self.out_numel
+        return pool.outb_ptr[member] + block * self.esz
 
-    def slot(self, member: int, parity: int, group: int, part: int) -> torch.Tensor:
+    def slot(self, pool, member: int, group: int, part: int) -> torch.Tensor:
         """``member``'s receive slot, mapped in this rank's context."""
         plan = self.plan
-        start = (parity * plan.groups + group) * self.group_numel
+        start = group * self.group_numel + self.part_offset[part]
         return (
-            self.inb[member]
-            .narrow(0, start + self.part_offset[part], self.part_numel[part])
+            pool.inb[member]
+            .narrow(0, start, self.part_numel[part])
             .view(plan.batch, plan.rows(part), plan.group_heads(part), plan.head_dim)
         )
 
-    def send_block(self, peer: int, group: int) -> torch.Tensor:
+    def send_block(self, pool, peer: int, group: int) -> torch.Tensor:
         plan = self.plan
-        if self.send is None:
-            self.send = torch.empty(
-                plan.world * plan.groups,
-                2,
-                plan.s_local,
-                plan.group_heads(0),
-                plan.head_dim,
-                dtype=self.dtype,
-                device="cuda",
-            )
-        return self.send[peer * plan.groups + group]
+        need = plan.world * plan.groups * self.send_numel
+        if pool.send is None or pool.send.numel() < need:
+            pool.send = torch.empty(need, dtype=self.dtype, device="cuda")
+        return pool.send.narrow(
+            0, (peer * plan.groups + group) * self.send_numel, self.send_numel
+        ).view(2, plan.s_local, plan.group_heads(0), plan.head_dim)
 
 
 class IpcA2AMultiState:
@@ -362,17 +367,22 @@ class IpcA2AMultiState:
         # call shapes -> the plan they resolve to, None when they cannot
         # pipeline; repeated calls skip straight to the answer
         self.plans = {}
+        # dtype -> the _PipelinePool every pipelined call of that dtype uses
+        self.pools = {}
+        # ("pipeline", plan, dtype) -> its _PipelineSlots
+        self.slots = {}
 
     def reset(self) -> None:
         """Drop mappings that belong to a model-parallel group being replaced."""
         self.__init__()
 
     def drop_staging(self) -> None:
-        if not self.staging:
+        if not self.staging and not self.pools:
             return
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         self.staging.clear()
+        self.pools.clear()
 
     def _share(self, t: torch.Tensor, group) -> list[torch.Tensor]:
         """Every member's `t`, peers' re-opened in the LOCAL device context
@@ -511,7 +521,8 @@ class IpcA2AMultiState:
         caller's attention setup) runs both and keeps the pipeline for them
         only if every rank sees the same bytes, so a backend that does not
         treat a head group as it treats those heads in the full call never
-        changes a result.
+        changes a result. It runs the sequential exchange first, with the
+        pool released, so that call never holds both at once.
         """
         world, r = self.world, self.rank
         squeeze = q.dim() == 3
@@ -551,17 +562,23 @@ class IpcA2AMultiState:
             return None
         if check in self.verified:
             check = None
-        bufs = self.staging.get(key)
-        if bufs is None:
+        slots = self.slots.get(key)
+        if slots is None:
+            slots = self.slots[key] = _PipelineSlots(plan, q.dtype)
+        pool = self.pools.get(q.dtype)
+        sizes = (slots.in_total, slots.out_total, groups)
+        if pool is not None:
+            sizes = tuple(map(max, sizes, pool.sizes))
+        reference = None
+        if pool is None or pool.sizes != sizes or check is not None:
             if torch.cuda.is_current_stream_capturing() or key in self.declined:
                 return None
-            numel = (
-                2 * groups * sum(plan.slot_numel(part) for part in range(3))
-                + 2 * world * groups * plan.out_block_numel()
-                + (plan.send_numel() if fill is not None else 0)
-            )
-            need = numel * q.element_size()
-            if auto and not self._fits_on_every_rank(need):
+            esz = q.element_size()
+            held = 0 if pool is None else pool.nbytes(esz)
+            need = (sizes[0] + sizes[1]) * esz
+            if fill is not None:
+                need += plan.world * groups * slots.send_numel * esz
+            if auto and not self._fits_on_every_rank(need, reclaimable=held):
                 logger.info(
                     "Ulysses pipeline buffers (%.1f GiB) do not fit; using the "
                     "sequential exchange for this shape",
@@ -569,22 +586,28 @@ class IpcA2AMultiState:
                 )
                 self.declined.add(key)
                 return None
-            bufs = _PipelineBuffers(self, plan, q.dtype)
-            self._insert(key, bufs)
+            if pool is not None:
+                # queued copies may still target the old mappings
+                torch.cuda.synchronize()
+                del self.pools[q.dtype]
+                pool = None
+            if check is not None:
+                reference = sequential()
+            pool = self.pools[q.dtype] = _PipelinePool(self, q.dtype, *sizes)
         if self.pipe_in is None:
             self.pipe_in = torch.cuda.Stream()
         while len(self.pipe_group_streams) < groups:
             self.pipe_group_streams.append(torch.cuda.Stream())
         mem, cin = self.memops, self.pipe_in
         main = torch.cuda.current_stream()
-        parity = bufs.calls % 2
-        base = bufs.calls * groups
-        bufs.calls += 1
-        call = bufs.calls
+        base = pool.groups_sent
+        pool.groups_sent += groups
+        pool.calls += 1
+        call = pool.calls
         peers = [(r + step) % world for step in range(1, world)]
         esz = q.element_size()
         head_bytes = head_dim * esz
-        row_bytes = bufs.row_bytes
+        row_bytes = slots.row_bytes
         # first head of block (p, g) of a part
         start = lambda p, g, part: (p * groups + g) * plan.group_heads(part)
         # (address, batch pitch, token pitch) of each part's shard and replicated rows
@@ -602,7 +625,7 @@ class IpcA2AMultiState:
             for b in range(batch):
                 mem.copy2d(
                     stream,
-                    bufs.slot_ptr(p, parity, g, part, b, my_shard_row[part]),
+                    slots.slot_ptr(pool, p, g, part, b, my_shard_row[part]),
                     row_bytes[part],
                     ptr + b * batch_pitch,
                     token_pitch,
@@ -621,7 +644,7 @@ class IpcA2AMultiState:
             for b in range(batch):
                 mem.copy2d(
                     stream,
-                    bufs.slot_ptr(r, parity, g, part, b, row),
+                    slots.slot_ptr(pool, r, g, part, b, row),
                     row_bytes[part],
                     ptr + b * batch_pitch,
                     token_pitch,
@@ -634,13 +657,13 @@ class IpcA2AMultiState:
         if fill is not None:
             # group by group: the peers' blocks first, so their copies start
             # while this rank fills its own block straight into its slot
-            own_rows = lambda part, g: bufs.slot(r, parity, g, part)[
+            own_rows = lambda part, g: slots.slot(pool, r, g, part)[
                 0, my_shard_row[part] : my_shard_row[part] + s_local
             ]
             hg = plan.group_heads(0)
             for g in range(groups):
                 for p in peers:
-                    qk = bufs.send_block(p, g)
+                    qk = slots.send_block(pool, p, g)
                     fill(start(p, g, 0), hg, qk[0], qk[1])
                 sent.append(main.record_event())
                 fill(start(r, g, 0), hg, own_rows(0, g), own_rows(1, g))
@@ -662,20 +685,20 @@ class IpcA2AMultiState:
                     cin.wait_event(sent[g])
                     chunk = s_local * row_bytes[0]
                     for p in peers:
-                        q_slot = bufs.slot_ptr(p, parity, g, 0, 0, my_shard_row[0])
-                        k_slot = bufs.slot_ptr(p, parity, g, 1, 0, my_shard_row[1])
+                        q_slot = slots.slot_ptr(pool, p, g, 0, 0, my_shard_row[0])
+                        k_slot = slots.slot_ptr(pool, p, g, 1, 0, my_shard_row[1])
                         # q then k: two rows of `chunk`, one part apart in the slot
                         mem.copy2d(
                             cin,
                             q_slot,
                             k_slot - q_slot,
-                            bufs.send_block(p, g).data_ptr(),
+                            slots.send_block(pool, p, g).data_ptr(),
                             chunk,
                             chunk,
                             2,
                         )
                 for p in peers:
-                    mem.write(cin, bufs.fin_ptr[p] + 4 * r, base + g + 1)
+                    mem.write(cin, pool.fin_ptr[p] + 4 * r, base + g + 1)
         # Head block b = p * groups + g of the output is group g of rank p's
         # heads. Each group stream writes its blocks as soon as they exist, so
         # the merge overlaps the groups still attending instead of trailing them.
@@ -702,8 +725,8 @@ class IpcA2AMultiState:
             stream.wait_event(own_cin[g])
             with torch.cuda.stream(stream):
                 for p in peers:
-                    mem.wait(stream, bufs.fin_ptr[r] + 4 * p, base + g + 1)
-                views = [bufs.slot(r, parity, g, part) for part in range(3)]
+                    mem.wait(stream, pool.fin_ptr[r] + 4 * p, base + g + 1)
+                views = [slots.slot(pool, r, g, part) for part in range(3)]
                 if squeeze:
                     out = attend(*(t[0] for t in views)).contiguous()[None]
                 else:
@@ -713,7 +736,7 @@ class IpcA2AMultiState:
                 for p in peers:
                     # this peer's rows and the replicated rows every rank needs,
                     # one contiguous run per batch row
-                    block = bufs.out_block_ptr(p, parity, r, g)
+                    block = slots.out_block_ptr(pool, p, r, g)
                     runs = [(shard_out, plan.shard_row(0, p), s_local)]
                     if n_rep:
                         runs.append((rep_out, rep_row, n_rep))
@@ -728,7 +751,7 @@ class IpcA2AMultiState:
                             batch,
                         )
                 for p in peers:
-                    mem.write(stream, bufs.fout_ptr[p] + 4 * (g * world + r), call)
+                    mem.write(stream, pool.fout_ptr[p] + 4 * (g * world + r), call)
                 own_head = merged_ptr + start(r, g, 0) * head_bytes
                 for b in range(batch):
                     runs = [(shard_out, my_shard_row[0], s_local)]
@@ -745,14 +768,14 @@ class IpcA2AMultiState:
                             n,
                         )
                 for p in peers:
-                    mem.wait(stream, bufs.fout_ptr[r] + 4 * (g * world + p), call)
+                    mem.wait(stream, pool.fout_ptr[r] + 4 * (g * world + p), call)
                     # the block and the merged output both have one row pitch
                     # across the batch, so a single copy covers every batch row
                     mem.copy2d(
                         stream,
                         merged_ptr + start(p, g, 0) * head_bytes,
                         merged_row,
-                        bufs.out_block_ptr(r, parity, p, g),
+                        slots.out_block_ptr(pool, r, p, g),
                         out_row,
                         out_row,
                         batch * plan.out_rows,
@@ -766,7 +789,7 @@ class IpcA2AMultiState:
         if squeeze:
             merged = merged[0]
         if check is not None:
-            return self._first_sight(check, merged, sequential)
+            return self._first_sight(check, merged, reference)
         return merged
 
     def _plan(self, q, k, v, replicated, replicated_first, groups, filled):
@@ -804,10 +827,9 @@ class IpcA2AMultiState:
             return None
         return plan
 
-    def _first_sight(self, check, merged, sequential):
+    def _first_sight(self, check, merged, reference):
         """Keep the pipeline for `check` only if it matches the sequential
-        exchange byte for byte on every rank; a group collective."""
-        reference = sequential()
+        exchange's `reference` byte for byte on every rank; a group collective."""
         same = torch.tensor(
             [int(torch.equal(merged, reference))], dtype=torch.int32, device="cuda"
         )
@@ -826,13 +848,16 @@ class IpcA2AMultiState:
         )
         return reference
 
-    def _fits_on_every_rank(self, nbytes: int) -> bool:
+    def _fits_on_every_rank(self, nbytes: int, reclaimable: int = 0) -> bool:
         """Whether every rank can spare twice `nbytes`, counting the allocator's
-        cached blocks; a group collective, so all ranks reach the same answer."""
+        cached blocks and `reclaimable` bytes it is about to free; a group
+        collective, so all ranks reach the same answer."""
         free, _ = torch.cuda.mem_get_info()
         cached = torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
         fits = torch.tensor(
-            [int(free + cached >= 2 * nbytes)], dtype=torch.int32, device="cuda"
+            [int(free + cached + reclaimable >= 2 * nbytes)],
+            dtype=torch.int32,
+            device="cuda",
         )
         dist.all_reduce(fits, op=dist.ReduceOp.MIN, group=self.group)
         return bool(fits.item())

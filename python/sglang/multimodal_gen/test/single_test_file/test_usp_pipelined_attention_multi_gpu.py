@@ -36,9 +36,13 @@ def _worker() -> int:
         tp_size=1, sp_size=world, ulysses_degree=world
     )
 
+    from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a import (
+        IPC_A2A,
+    )
     from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a_multi import (
         IPC_A2A_MULTI,
     )
+    from sglang.multimodal_gen.runtime.layers import usp
     from sglang.multimodal_gen.runtime.layers.attention.layer import (
         PIPELINED_ATTENTION_BACKENDS,
         USPAttention,
@@ -141,6 +145,24 @@ def _worker() -> int:
         q = shard(1, s_local, heads, 40)
         k, v = (shard(1, s_local, kv_heads, 41 + i) for i in range(2))
         both(f"{name} GQA dense", lambda: gqa(q, k, v))
+
+        # the first call of a shape checks the pipeline against a sequential
+        # exchange on per-call buffers: no staging sized for it stays behind
+        usp.drop_a2a_staging_buffers()
+        IPC_A2A.drop_staging()
+        checked = len(IPC_A2A_MULTI.verified)
+        q, k, v = (shard(1, 2 * s_local, heads, 50 + i) for i in range(3))
+        envs.SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS = 2
+        with torch.inference_mode(), set_forward_context(0, None, None):
+            layer(q, k, v)
+        envs.SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS = -1
+        if len(IPC_A2A_MULTI.verified) != checked + 1:
+            failures.append(f"{name}: a new shape was not checked")
+        if usp._A2A_STAGING_BUFFERS or IPC_A2A.staging:
+            failures.append(
+                f"{name}: the first-sight check left sequential staging behind "
+                f"({list(usp._A2A_STAGING_BUFFERS)}, {len(IPC_A2A.staging)} IPC pairs)"
+            )
 
     # a comparison where every arm quietly fell back would pass while testing
     # nothing: the pipeline must have run and verified every layout

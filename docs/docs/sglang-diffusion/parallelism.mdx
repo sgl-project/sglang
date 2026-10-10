@@ -126,10 +126,13 @@ attention, uneven sequence shards (`seq_lens`) and the K/V-gather mode keep the
 sequential exchange. The automatic count is the largest of 7, 5, 4, 3 and 2
 that divides the heads per rank while each group's call still fills four waves
 of 128-row tiles, so short sequences such as a 1024² image keep the sequential
-exchange; so does a shape whose buffers (about 8 × rows per rank × heads ×
-head_dim) do not fit on every rank. The first call of every shape runs both
-exchanges and keeps the pipeline only if they give the same bytes on every
-rank, so results never change. A custom attention module reuses it through
+exchange. Its buffers are one pool per dtype that every shape shares, grown to
+the largest (about 4 × rows per rank × heads × head_dim); a shape that would
+not fit on every rank keeps the sequential exchange. The first call of every
+shape runs both exchanges and keeps the pipeline only if they give the same
+bytes on every rank, so results never change; that check runs the sequential
+exchange on per-call buffers, so no staging for it stays allocated. A custom
+attention module reuses it through
 `ulysses_pipelined_attention(q, k, v, attend, groups, replicated=..., sequential=...)`.
 
 Independently of the transport, the default path already packs the three

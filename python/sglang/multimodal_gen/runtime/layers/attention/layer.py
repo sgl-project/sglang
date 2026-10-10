@@ -68,6 +68,7 @@ from sglang.multimodal_gen.runtime.layers.usp import (
     _usp_output_all_to_all,
     _usp_output_all_to_all_varlen,
     ring_attn,
+    uncached_a2a_staging,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import (
     ForwardContext,
@@ -1604,13 +1605,18 @@ class USPAttention(nn.Module):
             ulysses_pipelined_attention,
         )
 
+        def reference():
+            # once per shape: leave no staging behind that later calls never use
+            with uncached_a2a_staging():
+                return sequential()
+
         out = ulysses_pipelined_attention(
             q,
             k,
             v,
             attend,
             groups,
-            sequential=sequential,
+            sequential=reference,
             signature=(
                 type(self.attn_impl).__name__,
                 self.causal,
