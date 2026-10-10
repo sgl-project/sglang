@@ -24,7 +24,7 @@ from sglang.kernels.ops.attention.dsv4.topk import (
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import async_h2d
 
-from .types import DecodeInputs, PrefillInputs
+from .types import DecodeInputs, PrefillInputs, materialize_prefill_request_rows
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsv4.dsv41_sparse import DeepseekV41Indexer
@@ -288,8 +288,7 @@ def prefill_requests(
     pool = token_to_kv_pool
     ratio = inputs.compress_ratio
     indexer = inputs.indexer
-    req, pos = inputs.req_rows, inputs.positions
-    assert req is not None, "the torch indexer needs the batch's rows"
+    req, pos = materialize_prefill_request_rows(inputs), inputs.positions
     inputs.reset_outputs()
     q = indexer.queries(inputs.q_lora, inputs.freqs_cis[pos])
     weights = indexer.head_weights(inputs.x)
