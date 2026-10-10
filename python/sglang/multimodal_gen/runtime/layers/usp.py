@@ -350,13 +350,24 @@ def _usp_input_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
     x = _usp_all_to_all_single(x, role="usp_input")
     x = x.reshape(world_size, h_local, b, s_local, d)
 
-    # Reorder dims to place 'world_size' adjacent to 's_local' to merge them into 's_global'
+    # Reorder dims to place 'world_size' adjacent to 's_local' to merge them into 's_global'.
+    # Always copy out of the reusable receive buffer. With singleton batch/head
+    # dimensions, contiguous() can return a view; the next Q/K/V exchange would
+    # then overwrite an earlier result that has not yet been consumed.
     if head_dim == 1:
         # Shape transition: [world_size, h_local, b, s_local, d] -> [b, h_local, world_size, s_local, d]
-        x = x.permute(2, 1, 0, 3, 4).contiguous().reshape(b, h_local, s_global, d)
+        x = (
+            x.permute(2, 1, 0, 3, 4)
+            .clone(memory_format=torch.contiguous_format)
+            .reshape(b, h_local, s_global, d)
+        )
     else:  # head_dim == 2
         # Shape transition: [world_size, h_local, b, s_local, d] -> [b, world_size, s_local, h_local, d]
-        x = x.permute(2, 0, 3, 1, 4).contiguous().reshape(b, s_global, h_local, d)
+        x = (
+            x.permute(2, 0, 3, 1, 4)
+            .clone(memory_format=torch.contiguous_format)
+            .reshape(b, s_global, h_local, d)
+        )
 
     return x
 

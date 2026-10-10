@@ -4,6 +4,11 @@ export const DiffusionModelCatalog = ({ category }) => {
   const MODEL_CATALOG = {
   image: [
     {
+      name: "Ovis-Image",
+      modelIds: ["ATH-MaaS/Ovis-Image-7B", "AIDC-AI/Ovis-Image-7B"],
+      cookbook: "/cookbook/diffusion/Ovis/Ovis-Image",
+    },
+    {
       name: "HunyuanImage-3.0",
       modelIds: ["tencent/HunyuanImage-3.0", "tencent/HunyuanImage-3.0-Instruct"],
       cookbook: "/cookbook/diffusion/Tencent/HunyuanImage3",

@@ -818,6 +818,8 @@ class ServerArgs(DisaggServerArgsMixin):
                 self._default_bcg_warmup_resolution()
             return
 
+        if pipeline_config is not None:
+            pipeline_config.validate_breakable_cuda_graph(self)
         logger.warning(
             "[Diffusion BCG] disabled for %s: only Anima Base v1.0, FLUX.1-dev, "
             "FLUX.2-Klein, Ideogram-4, jdopensource/JoyAI-Echo, Lightricks/LTX-2, "

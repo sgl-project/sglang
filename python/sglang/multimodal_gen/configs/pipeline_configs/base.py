@@ -320,6 +320,11 @@ class PipelineConfig:
 
         del server_args
 
+    def validate_breakable_cuda_graph(self, server_args: Any) -> None:
+        """Validate a graph request before unsupported-model defaults disable it."""
+
+        del server_args
+
     def supports_action_endpoint(self) -> bool:
         """Whether this pipeline exposes the generic action generation API."""
 
