@@ -285,6 +285,24 @@ via `--cuda-graph-backend-prefill` or `--cuda-graph-config`.
 | Two-batch overlap (`--enable-two-batch-overlap`) | Not yet supported |
 | Speculative decoding | Not yet implemented |
 
+## Decode Context Parallel (DCP) on Intel XPU [Experimental]
+
+DCP shards the KV cache across the ranks of a TP group by token position. It grows
+the servable context only when `tp_size` exceeds the model's KV heads, which TP would
+otherwise replicate, and decode gets slower, so use it only when the context you need
+does not fit.
+
+```bash
+python -m sglang.launch_server --model-path Qwen/Qwen3.5-4B --device xpu \
+    --attention-backend intel_xpu --tp 2 --dcp-size 2 \
+    --disable-radix-cache --mem-fraction-static 0.60
+```
+
+It needs the `intel_xpu` attention backend and ranks that share their DCP group's
+KV heads: Qwen3.5 models, or models with at most `tp_size / dcp_size` KV heads.
+Unsupported features are refused at startup. If startup fails with
+`UR_RESULT_ERROR_OUT_OF_RESOURCES`, lower `--mem-fraction-static`.
+
 ## Memory Saver (release/resume memory occupation) on Intel XPU [Experimental]
 
 SGLang can temporarily release most of the GPU memory it holds — model weights

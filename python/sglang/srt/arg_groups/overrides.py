@@ -1325,7 +1325,7 @@ def _dcp_comm_backend_default(view: Any) -> dict:
         nnodes=view.nnodes,
     ):
         backend = "fi_a2a"
-    elif platform.is_cuda or platform.is_hip:
+    elif platform.is_cuda or platform.is_hip or platform.is_xpu:
         backend = "a2a"
     else:
         backend = "ag_rs"

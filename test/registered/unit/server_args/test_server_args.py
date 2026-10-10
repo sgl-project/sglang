@@ -4026,7 +4026,7 @@ class TestDcpCommBackendDefault(CustomTestCase):
     def test_no_dcp_is_ag_rs(self):
         self.assertEqual(self._resolved(dcp_size=1), "ag_rs")
 
-    @override_platform(is_npu=True, is_cuda=False, is_hip=False)
+    @override_platform(is_npu=True, is_cuda=False, is_hip=False, is_xpu=False)
     def test_a5_npu_supports_dcp(self):
         self.assertEqual(self._resolved(dcp_size=2), "ag_rs")
 
@@ -4044,12 +4044,19 @@ class TestDcpCommBackendDefault(CustomTestCase):
         ):
             self.assertEqual(self._resolved(dcp_size=4), "a2a")
 
-    @override_platform(is_cuda=False, is_hip=False)
+    @override_platform(is_cuda=False, is_hip=False, is_xpu=False)
     def test_ag_rs_off_cuda(self):
         with patch(
             "sglang.srt.arg_groups.overrides.is_fi_a2a_supported", return_value=False
         ):
             self.assertEqual(self._resolved(dcp_size=4), "ag_rs")
+
+    @override_platform(is_xpu=True, is_cuda=False, is_hip=False)
+    def test_a2a_on_xpu(self):
+        with patch(
+            "sglang.srt.arg_groups.overrides.is_fi_a2a_supported", return_value=False
+        ):
+            self.assertEqual(self._resolved(dcp_size=2), "a2a")
 
     @override_platform(is_cuda=True, is_hip=False)
     def test_explicit_value_wins(self):
