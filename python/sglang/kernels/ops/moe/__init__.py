@@ -315,3 +315,12 @@ register_kernel(
         capabilities=frozenset({CapabilityRequirement.CUDA, CapabilityRequirement.HIP}),
     )
 )
+
+register_kernel(
+    KernelSpec(
+        op="moe.silu_and_mul_block_quant_two_group",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.moe.silu_and_mul_block_quant:silu_and_mul_block_quant_two_group",
+        capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(8, 9))}),
+    )
+)

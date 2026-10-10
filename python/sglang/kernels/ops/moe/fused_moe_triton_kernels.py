@@ -385,6 +385,7 @@ def fused_moe_kernel(
     LORA_PRESERVE_BASE: tl.constexpr,
     ROUTER_TOPK: tl.constexpr,
     FUSE_SWIGLU: tl.constexpr = False,
+    USE_FP8_K160_TAIL: tl.constexpr = False,
     USE_GDC: tl.constexpr = False,
     GDC_EARLY: tl.constexpr = False,
 ):
@@ -541,7 +542,9 @@ def fused_moe_kernel(
     else:
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
-    for k_start in range(0, K, BLOCK_SIZE_K):
+    # Keep the first scale group's accumulation intact; splitting it changes
+    # FP32 rounding before scaling. Only the 32 live tail lanes need a second dot.
+    for k_start in range(0, 128 if USE_FP8_K160_TAIL else K, BLOCK_SIZE_K):
         # Load the next block of A and B, generate a mask by checking the
         # K dimension.
         if a_desc is not None:
@@ -601,6 +604,28 @@ def fused_moe_kernel(
             a_ptrs += BLOCK_SIZE_K * stride_ak
         if b_desc is None:
             b_ptrs += BLOCK_SIZE_K * stride_bk
+
+    if USE_FP8_K160_TAIL:
+        # Dispatch restricts this to unsorted pointer loads, no swap_ab,
+        # BK=128 and BN<=128. The original final dot has 96 zero K lanes;
+        # avoid their tensor-core work without changing either group scale.
+        tail_k = 128 + tl.arange(0, 32)
+        a_tail = tl.load(
+            a_ptr
+            + (offs_token[:, None] // top_k) * stride_am
+            + tail_k[None, :] * stride_ak,
+            mask=token_mask[:, None],
+            other=0.0,
+        )
+        b_tail = tl.load(
+            b_ptr
+            + off_experts * stride_be
+            + tail_k[:, None] * stride_bk
+            + offs_bn[None, :] * stride_bn,
+        )
+        a_tail_scale = tl.load(a_scale_ptrs + stride_ask, mask=token_mask, other=0.0)
+        b_tail_scale = tl.load(b_scale_ptrs + stride_bsk)
+        accumulator += tl.dot(a_tail, b_tail) * (a_tail_scale[:, None] * b_tail_scale)
 
     if swap_ab:
         accumulator = tl.trans(accumulator, (1, 0))
@@ -842,6 +867,28 @@ def invoke_fused_moe_kernel(
     else:
         swap_ab = False
 
+    # A tuned config opts in; unsupported layouts retain the generic kernel.
+    # Copy before consuming the key because config dictionaries are cached.
+    config = dict(config)
+    use_fp8_k160_tail = config.pop("USE_FP8_K160_TAIL", False) and (
+        use_fp8_w8a8
+        and block_shape == [128, 128]
+        and B.shape[2] == 160
+        and config["BLOCK_SIZE_K"] == 128
+        and config["BLOCK_SIZE_N"] <= 128
+        and top_k == 1
+        and compute_type == tl.bfloat16
+        and not (a_use_tma or b_use_tma or c_sorted or swap_ab or fuse_swiglu)
+        and not (
+            fuse_sum_all_reduce
+            or fuse_add_to_output
+            or mask_output
+            or lora_preserve_base
+        )
+        and is_sm90_supported()
+        and not is_batch_invariant_mode_enabled()
+    )
+
     padded_size = 0
     if use_fp8_w8a8:
         assert B_scale is not None
@@ -1054,6 +1101,7 @@ def invoke_fused_moe_kernel(
             FUSE_SUM_ALL_REDUCE=fuse_sum_all_reduce,
             ROUTER_TOPK=router_topk,
             FUSE_SWIGLU=fuse_swiglu,
+            USE_FP8_K160_TAIL=use_fp8_k160_tail,
             **pdl_kwargs,
             **config,
         )
