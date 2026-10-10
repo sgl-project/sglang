@@ -53,16 +53,22 @@ class JointThresholdInDel(DllmAlgorithm):
     def init_step_state(self, forward_batch: ForwardBatch) -> List[Any]:
         batch_size = forward_batch.batch_size
         input_ids = forward_batch.input_ids.view(batch_size, self.block_size)
-        # The prompt is the immutable contiguous prefix before the first mask.
-        # is_orig_mask marks positions associated with masks in the initial
-        # block. DELETE/SPLIT move the marker with the corresponding token.
-        prompt_lens = (input_ids != self.mask_id).cumprod(dim=1).sum(dim=1).tolist()
-        positions = torch.arange(self.block_size, device=input_ids.device)
+        # Explicit metadata distinguishes literal mask IDs in committed tokens
+        # from masks to denoise. Keep the legacy contiguous-prefix fallback for
+        # batches that do not provide it.
+        prompt_mask = forward_batch.dllm_prompt_mask
+        if prompt_mask is None:
+            prompt_lens = (input_ids != self.mask_id).cumprod(dim=1).sum(dim=1)
+            positions = torch.arange(self.block_size, device=input_ids.device)
+            prompt_mask = positions[None, :] < prompt_lens[:, None]
+        prompt_lens = prompt_mask.sum(dim=1).tolist()
+        # DELETE/SPLIT move these markers with the corresponding suffix token.
+        orig_mask = torch.where(prompt_mask, False, input_ids == self.mask_id)
         return [
             {
                 "prompt_len": prompt_lens[i],
-                "prompt_index": positions < prompt_lens[i],
-                "is_orig_mask": input_ids[i] == self.mask_id,
+                "prompt_index": prompt_mask[i],
+                "is_orig_mask": orig_mask[i],
                 "post_edit_steps": 0,
                 "num_update_steps": 0,
                 "finished": False,
@@ -146,7 +152,9 @@ class JointThresholdInDel(DllmAlgorithm):
                 -1,
             )
 
-            mask_index = curr_input_ids == self.mask_id
+            mask_index = torch.where(
+                curr_prompt_index, False, curr_input_ids == self.mask_id
+            )
             is_orig_mask = state["is_orig_mask"]
             original_mask_index = is_orig_mask & mask_index
             original_mask_count, total_mask_count = torch.stack(
