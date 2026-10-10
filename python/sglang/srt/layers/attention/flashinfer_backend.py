@@ -1515,7 +1515,11 @@ class FlashInferAttnBackend(AttentionBackend):
                 self.token_to_kv_pool.get_flashinfer_decode_dequant_workspace_kv_buffer(
                     layer,
                     self.req_to_token_pool.req_to_token,
-                    forward_batch.req_pool_indices,
+                    (
+                        forward_batch.req_pool_indices_cpu
+                        if getattr(forward_batch, "req_pool_indices_cpu", None) is not None
+                        else forward_batch.req_pool_indices
+                    ),
                     (
                         forward_batch.seq_lens_cpu
                         if forward_batch.seq_lens_cpu is not None

@@ -2979,6 +2979,9 @@ class MHATokenToKVPool(KVCache):
         if isinstance(values, list):
             return [int(value) for value in values]
         if isinstance(values, torch.Tensor):
+            if torch.cuda.is_current_stream_capturing():
+                # Avoid non-pinned D2H copy during CUDA graph capture
+                return [0] * values.numel()
             return [int(value) for value in values.cpu().tolist()]
         return [int(value) for value in values]
 
