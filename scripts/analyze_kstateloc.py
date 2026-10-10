@@ -85,21 +85,21 @@ def _map_in_window(block, lo, hi):
 
 def single(path, lo, hi, verbose=False):
     blocks, lefts, xdiff = parse(path)
-    agg = collections.defaultdict(list)  # pos -> [(blockIdx, stateLoc)]
+    agg = collections.defaultdict(list)  # pos -> [(tableColumn, stateLoc)]
     for bi, block in enumerate(blocks):
         for op, b, p, col, sl, blk, row in block:
             if lo <= p < hi:
-                agg[p].append((bi, sl))
+                agg[p].append((col, sl))
     print(f"{path}: blocks={len(blocks)} XDIFF={len(xdiff)}  window[{lo},{hi})")
     if not agg:
         print("  (no KSTATELOC in window)")
+    # tableColumn separates MISS (large col, start_pos~0) from HIT (small col).
     for p in sorted(agg):
-        slots = sorted({s for _, s in agg[p]})
-        nb = len({bi for bi, _ in agg[p]})
-        print(f"  pos={p} stateLoc={slots} blocks={nb}")
+        pairs = sorted(set(agg[p]))
+        cols = sorted({c for c, _ in pairs})
+        print(f"  pos={p}: " + "  ".join(f"(col={c},slot={s})" for c, s in pairs))
         if verbose:
-            for bi, s in agg[p]:
-                print(f"      block#{bi} stateLoc={s}")
+            print(f"      distinct tableColumn={cols}")
     _show_xdiff(xdiff)
 
 
