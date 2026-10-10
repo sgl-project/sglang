@@ -111,6 +111,8 @@ def _engram_hash_kernel(
     L: tl.constexpr,
     H: tl.constexpr,
     BLOCK_T: tl.constexpr,
+    EXTEND_BS: tl.constexpr = 0,
+    SEARCH_STEPS: tl.constexpr = 0,
 ):
     COLS: tl.constexpr = (N - 1) * H
     t = tl.program_id(0) * BLOCK_T + tl.arange(0, BLOCK_T)
@@ -124,7 +126,24 @@ def _engram_hash_kernel(
         r = (t // BLOCK).to(tl.int64)
         off = t - (t // BLOCK) * BLOCK
     else:
-        r = tl.load(row_ptr + t, mask=real, other=0).to(tl.int64)
+        if EXTEND_BS == 1:
+            r = tl.full((BLOCK_T,), 0, tl.int64)
+        elif EXTEND_BS > 1:
+            # Upper bound handles adjacent starts from zero-length requests.
+            # Resolve rows in registers instead of materializing repeat_interleave.
+            lo = tl.full((BLOCK_T,), 0, tl.int32)
+            hi = tl.full((BLOCK_T,), EXTEND_BS, tl.int32)
+            for _ in tl.static_range(SEARCH_STEPS):
+                mid = (lo + hi) // 2
+                start = tl.load(
+                    starts_ptr + mid, mask=real & (mid < EXTEND_BS), other=0
+                )
+                right = (mid < EXTEND_BS) & (start <= t)
+                lo = tl.where(right, mid + 1, lo)
+                hi = tl.where(right, hi, mid)
+            r = tl.maximum(lo - 1, 0).to(tl.int64)
+        else:
+            r = tl.load(row_ptr + t, mask=real, other=0).to(tl.int64)
         off = t - tl.load(starts_ptr + r, mask=real, other=0).to(tl.int32)
     if HIST_VIA_SLOTS:
         hrow = tl.load(slots_ptr + r, mask=real, other=0).to(tl.int64)
@@ -207,6 +226,7 @@ def _launch_hash_kernel(
     out_cache_loc: Optional[torch.Tensor],
     write_tokens: bool,
     block_t: int,
+    extend_bs: int = 0,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     num_tokens = input_ids.shape[0]
     L, N = multipliers.shape
@@ -215,7 +235,7 @@ def _launch_hash_kernel(
     assert primes.shape == (L, N - 1, H) and offsets.shape == (L, (N - 1) * H)
     assert history.dim() == 2 and history.shape[1] == N - 1, history.shape
     if mode == MODE_EXTEND:
-        assert row is not None and starts is not None
+        assert (row is not None or extend_bs > 0) and starts is not None
     if out_cache_loc is not None:
         assert mode == MODE_DECODE and req_slots is not None, "commit is decode-only"
         assert out_cache_loc.shape[0] == num_tokens, out_cache_loc.shape
@@ -260,9 +280,110 @@ def _launch_hash_kernel(
         L=L,
         H=H,
         BLOCK_T=block_t,
+        EXTEND_BS=extend_bs,
+        SEARCH_STEPS=extend_bs.bit_length(),
         num_warps=4,
     )
     return out, tokens
+
+
+@triton.jit
+def _engram_commit_extend_history_kernel(
+    history_ptr,
+    tokens_ptr,
+    slots_ptr,
+    starts_ptr,
+    lens_ptr,
+    out_loc_ptr,
+    NUM_TOKENS: tl.constexpr,
+    N: tl.constexpr,
+    HAS_OUT_LOC: tl.constexpr,
+):
+    r = tl.program_id(0)
+    length = tl.load(lens_ptr + r)
+    start = tl.load(starts_ptr + r)
+    last = tl.minimum(tl.maximum(start + length - 1, 0), NUM_TOKENS - 1)
+    live = length > 0
+    if HAS_OUT_LOC:
+        live = live & (tl.load(out_loc_ptr + last) != 0)
+    slot = tl.load(slots_ptr + r).to(tl.int64)
+    col = tl.arange(0, N)
+    value = tl.load(
+        tokens_ptr + last * N + (N - 2 - col),
+        mask=live & (col < N - 1),
+        other=0,
+    )
+    tl.store(history_ptr + slot * (N - 1) + col, value, mask=live & (col < N - 1))
+
+
+def engram_hash_extend_and_commit(
+    input_ids: torch.Tensor,
+    positions: torch.Tensor,
+    *,
+    history: torch.Tensor,
+    commit_history: torch.Tensor,
+    req_slots: torch.Tensor,
+    starts: torch.Tensor,
+    lengths: torch.Tensor,
+    num_real: int,
+    history_via_slots: bool,
+    out_cache_loc: Optional[torch.Tensor],
+    token_map: torch.Tensor,
+    multipliers: torch.Tensor,
+    primes: torch.Tensor,
+    offsets: torch.Tensor,
+    pad_id: int,
+    image_token_id: Optional[int] = None,
+    mm_pad_shift: int = 0,
+) -> torch.Tensor:
+    """Eager extend: hash without a row-map tensor, then commit in one launch.
+
+    Hashing must finish before history is updated: different token programs may
+    still read a request's old history. Keep these as two ordered kernels.
+    Empty/padded requests leave live history untouched; the spare padding row is
+    intentionally not updated. Request slots must be distinct for live requests.
+    """
+    bs = req_slots.numel()
+    assert 0 <= num_real <= input_ids.numel()
+    assert starts.numel() == lengths.numel() == bs
+    assert history.is_contiguous() and commit_history.is_contiguous()
+    assert all(t.ndim == 1 and t.stride(0) == 1 for t in (req_slots, starts, lengths))
+    out, tokens = _launch_hash_kernel(
+        input_ids,
+        positions,
+        mode=MODE_EXTEND,
+        history=history,
+        token_map=token_map,
+        multipliers=multipliers,
+        primes=primes,
+        offsets=offsets,
+        pad_id=pad_id,
+        num_real=num_real,
+        req_slots=req_slots if history_via_slots else None,
+        block=1,
+        row=None,
+        starts=starts,
+        image_token_id=image_token_id,
+        mm_pad_shift=mm_pad_shift,
+        out_cache_loc=None,
+        write_tokens=True,
+        block_t=32,
+        extend_bs=bs,
+    )
+    if input_ids.numel() and bs:
+        _engram_commit_extend_history_kernel[(bs,)](
+            commit_history,
+            tokens,
+            req_slots,
+            starts,
+            lengths,
+            out_cache_loc if out_cache_loc is not None else req_slots,
+            NUM_TOKENS=input_ids.numel(),
+            N=multipliers.shape[1],
+            HAS_OUT_LOC=out_cache_loc is not None,
+            num_warps=4,
+        )
+    return out
 
 
 def engram_hash_ids(
