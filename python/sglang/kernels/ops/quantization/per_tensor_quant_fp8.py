@@ -75,3 +75,21 @@ def per_tensor_absmax_fp8(
     """
     module = _jit_per_tensor_absmax_fp8_module(input.dtype)
     module.per_tensor_absmax_fp8(input.view(-1), output_s.view(-1))
+
+
+def per_tensor_quant_fp8_native(
+    input: torch.Tensor,
+    output_q: torch.Tensor,
+    output_s: torch.Tensor,
+    is_static: bool = False,
+) -> None:
+    fp8_max = 224.0
+    fp8_min = -fp8_max
+    if not is_static:
+        # Calculate scale on the fly for dynamic
+        scale = input.float().abs().amax().clamp_min(1e-12) / fp8_max
+        output_s.reshape(-1).copy_(scale.reshape(-1))
+    else:
+        scale = output_s.reshape(())
+
+    output_q.copy_((input.float() / scale).clamp(fp8_min, fp8_max).to(output_q.dtype))
