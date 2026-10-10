@@ -314,19 +314,26 @@ class DraftBlockProposer:
             # Greedy accept compares tokens only; sampling accept needs the
             # markov-corrected logits the graph tail kept.
             corrected_logits = None
-            if not all_greedy:
-                corrected_logits = self.draft_model.markov_head.gather_vocab(
-                    draft_sampler.step_logits[:bs]
+            if draft_sampler.folded_sampling:
+                greedy_mask = draft_sampler.greedy_mask[:bs]
+                temperatures = draft_sampler.temperatures[:bs]
+                if not all_greedy:
+                    corrected_logits = self.draft_model.markov_head.gather_vocab(
+                        draft_sampler.step_logits[:bs]
+                    )
+            else:
+                # Greedy-only tail: no params were staged.
+                greedy_mask = resolve_greedy_mask(
+                    bs=bs, sampling_info=sampling_info, device=device
+                )
+                temperatures = resolve_draft_temperatures(
+                    bs=bs, sampling_info=sampling_info, device=device
                 )
             draft_block = DraftBlockResult(
                 draft_tokens=draft_sampler.out[: bs * self.gamma].view(bs, self.gamma),
                 corrected_logits=corrected_logits,
-                greedy_mask=resolve_greedy_mask(
-                    bs=bs, sampling_info=sampling_info, device=device
-                ),
-                temperatures=resolve_draft_temperatures(
-                    bs=bs, sampling_info=sampling_info, device=device
-                ),
+                greedy_mask=greedy_mask,
+                temperatures=temperatures,
             )
             if draft_sampler.confidence_out is not None:
                 folded_confidence = draft_sampler.confidence_out[:bs]
