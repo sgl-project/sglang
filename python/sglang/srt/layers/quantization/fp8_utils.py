@@ -2494,7 +2494,8 @@ def apply_fp8_linear(
                 weight,
                 out_dtype=output_dtype,
                 scale_a=x_scale,
-                scale_b=weight_scale.t(),
+                # Loaders may store channel scales as either (N, 1) or (1, N).
+                scale_b=weight_scale.reshape(1, -1),
                 bias=bias,
             )
             return _process_scaled_mm_output(output, input_2d.shape, output_shape)

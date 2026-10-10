@@ -132,6 +132,7 @@ class TestAiterBpreshuffleDispatch(unittest.TestCase):
         expected = ((qx.float() @ weight.float()) * sx * sw.t() + bias).bfloat16()
 
         def scaled_mm(a, b, *, scale_a, scale_b, out_dtype, bias):
+            self.assertEqual(tuple(scale_b.shape), (1, 64))
             return ((a.float() @ b.float()) * scale_a * scale_b + bias).to(out_dtype)
 
         with (
@@ -155,6 +156,19 @@ class TestAiterBpreshuffleDispatch(unittest.TestCase):
             torch.testing.assert_close(output, expected.reshape(2, 2, 64))
             quant.assert_called_once()
             self.assertTrue(fp8_utils._use_aiter)
+            preshuffled.assert_not_called()
+            # Online FP8 loading stores the same channel scales as (1, N).
+            output = fp8_utils.apply_fp8_linear(
+                torch.ones(2, 2, 128, dtype=torch.bfloat16),
+                weight,
+                sw.t(),
+                bias=bias,
+                cutlass_fp8_supported=False,
+                use_per_token_if_dynamic=True,
+                compressed_tensor_quant=True,
+                pad_output=False,
+            )
+            torch.testing.assert_close(output, expected.reshape(2, 2, 64))
             preshuffled.assert_not_called()
 
 

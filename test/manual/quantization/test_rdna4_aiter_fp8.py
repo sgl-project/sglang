@@ -14,6 +14,7 @@ from sglang.srt.layers.quantization import fp8_utils
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     compressed_tensors_w8a8_fp8 as ct_fp8,
 )
+from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
 from sglang.srt.layers.quantization.quark.schemes.quark_w8a8_fp8 import QuarkW8A8Fp8
 from sglang.srt.utils import is_gfx120x_supported
 
@@ -29,14 +30,17 @@ class TestRdna4AiterFp8(unittest.TestCase):
         self.assertFalse(fp8_utils.use_aiter_bpreshuffle_gemm(8192))
 
         # Include a previously failing shape, unrelated dense-layer dimensions,
-        # and a narrow output partition. Test both serialized FP8 schemes.
-        for scheme_name in ("compressed-tensors", "quark"):
+        # and a narrow output partition. Include serialized and online FP8.
+        for scheme_name in ("compressed-tensors", "quark", "online-fp8"):
             for n, k in ((8192, 2048), (1536, 1024), (32, 512)):
                 dense = torch.randn(n, k, device="cuda", dtype=torch.bfloat16) * 0.02
                 sw = dense.float().abs().amax(dim=1, keepdim=True) / 448.0
                 weight = (dense.float() / sw).to(torch.float8_e4m3fn)
                 layer = torch.nn.Module()
-                layer.weight = torch.nn.Parameter(weight, requires_grad=False)
+                layer.weight = torch.nn.Parameter(
+                    dense if scheme_name == "online-fp8" else weight,
+                    requires_grad=False,
+                )
                 layer.weight_scale = torch.nn.Parameter(sw, requires_grad=False)
                 layer.logical_widths = [n]
                 if scheme_name == "compressed-tensors":
@@ -48,10 +52,16 @@ class TestRdna4AiterFp8(unittest.TestCase):
                         ),
                         is_static_input_scheme=False,
                     )
-                else:
+                elif scheme_name == "quark":
                     scheme = QuarkW8A8Fp8(
                         weight_config={"qscheme": "per_channel"},
                         input_config={"is_dynamic": True, "qscheme": "per_channel"},
+                    )
+                else:
+                    scheme = Fp8LinearMethod(Fp8Config())
+                    scheme.use_aiter_fp8_per_token = True
+                    weight, sw = fp8_utils.per_token_group_quant_fp8(
+                        dense, group_size=k
                     )
                 scheme.process_weights_after_loading(layer)
                 torch.testing.assert_close(
@@ -80,7 +90,10 @@ class TestRdna4AiterFp8(unittest.TestCase):
                             "gemm_a8w8_bpreshuffle",
                             side_effect=AssertionError("unsupported GEMM was selected"),
                         ):
-                            output = scheme.apply_weights(layer, x, bias)
+                            if scheme_name == "online-fp8":
+                                output = scheme.apply(layer, x, bias)
+                            else:
+                                output = scheme.apply_weights(layer, x, bias)
                         self.assertTrue(torch.isfinite(output).all())
                         torch.testing.assert_close(
                             output, reference, rtol=0.02, atol=0.01
