@@ -515,13 +515,19 @@ class AnthropicServing:
                                     "role": "tool",
                                     "tool_call_id": tool_call_id,
                                     "content": tool_content,
+                                    "is_error": bool(block.is_error),
                                 }
                             )
                     else:
+                        # No ``role: "tool"`` slot inside an assistant turn, so
+                        # the failure has to survive as text.
+                        label = (
+                            "Tool result (error)" if block.is_error else "Tool result"
+                        )
                         content_parts.append(
                             {
                                 "type": "text",
-                                "text": f"Tool result: {tool_text}",
+                                "text": f"{label}: {tool_text}",
                             }
                         )
 
