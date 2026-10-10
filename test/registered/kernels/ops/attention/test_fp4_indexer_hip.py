@@ -68,6 +68,10 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer_schedule_hip import (
 from sglang.kernels.ops.attention.dsv4.fp4_rope_fake_quant import (
     rope_tail_fake_quant_fp4,
 )
+from sglang.kernels.ops.attention.dsv4.topk import (
+    plan_topk_v2,
+    topk_transform_paged_v2,
+)
 from sglang.kernels.ops.gemm.router_gemv_hip import rocm_router_gemv_split_k
 from sglang.srt.utils import get_device, is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
@@ -1087,6 +1091,309 @@ def test_rowgroup_table_columns_fix_the_compiled_width() -> None:
 
 def _selected_slots(page_indices: torch.Tensor) -> list[list[int]]:
     return [sorted(v for v in row if v >= 0) for row in page_indices.tolist()]
+
+
+# ---------------------------------------------------------------------------
+# DeepSeek-V4 C4 decode / DSpark target-verify on the row-group kernel
+# (SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP): the backend builds a row-group decode
+# workspace for both modes and the indexer scores verify rows as decode rows.
+# ---------------------------------------------------------------------------
+
+_C4_RATIO = 4
+# DeepSeek-V4-Pro's index_topk
+_C4_TOPK = 1024
+# The server's context length the C4 table width is fixed for; small enough for a test.
+_C4_MAX_CONTEXT = 1 << 18
+
+
+def _c4_step_case(seq_lens: list[int], rows_per_request: int):
+    """One DSv4 C4 indexer step: a decode (one row a request) or a DSpark target-verify
+    (rows_per_request causal rows a request, each with its own query). ``seq_lens`` are
+    the requests' token lengths after the step, so row r of request b sits at token
+    position seq_lens[b] - rows_per_request + r and sees (pos + 1) // 4 compressed keys,
+    as c4_topk_lengths_raw has it. The index-K pages are shuffled and every byte the step
+    must not read is garbage; the page table is the indexer's: one row per query row, as
+    wide as the backend's graph table, zero past the request's pages."""
+    q_rows = rows_per_request
+    batch = len(seq_lens)
+    dev = get_device()
+    keys = [-(-s // _C4_RATIO) for s in seq_lens]
+    pages_per_seq = -(-max(keys) // PAGE_SIZE)
+    padded_len = pages_per_seq * PAGE_SIZE
+    num_pages = batch * pages_per_seq + 5
+    # queries rotate at token positions, keys at compressed ones
+    cos, sin, _ = _rope_tables(max(max(seq_lens), padded_len, 256))
+    payload, scale = _empty_index_k_cache(num_pages)
+    payload.view(torch.uint8).random_(0, 256)
+    scale.random_(100, 140)
+
+    physical = torch.randperm(num_pages, device=dev)[: batch * pages_per_seq]
+    req_pages = physical.to(torch.int32).reshape(batch, pages_per_seq)
+    kv_positions = torch.arange(padded_len, device=dev).repeat(batch)
+    loc = (
+        req_pages.long()[:, :, None] * PAGE_SIZE
+        + torch.arange(PAGE_SIZE, device=dev)[None, None, :]
+    ).reshape(-1)
+    k = torch.randn(batch * padded_len, HEAD_DIM, device=dev, dtype=torch.bfloat16)
+    norm_weight = torch.randn(HEAD_DIM, device=dev, dtype=torch.bfloat16)
+    _write_index_k_cache(k, norm_weight, cos, sin, kv_positions, loc, payload, scale)
+    k_dq = _ref_dequantize_fp4_indexer(*_read_index_k_cache(payload, scale, loc))
+    k_dq = k_dq.reshape(batch, padded_len, HEAD_DIM)
+
+    pos = torch.tensor(
+        [s - q_rows + r for s in seq_lens for r in range(q_rows)], device=dev
+    ).clamp_min(0)
+    row_ends = ((pos + 1) // _C4_RATIO).to(torch.int32)
+    width = rowgroup_table_columns(_C4_MAX_CONTEXT, _C4_RATIO) - 4
+    page_table = torch.zeros(batch, width, dtype=torch.int32, device=dev)
+    page_table[:, :pages_per_seq] = req_pages
+    page_table = page_table.repeat_interleave(q_rows, dim=0).contiguous()
+
+    q = torch.randn(
+        batch * q_rows, NUM_HEADS, HEAD_DIM, device=dev, dtype=torch.bfloat16
+    )
+    q_fp4, q_scale = aiter_q_indexer_fp4(q.contiguous(), cos, sin, pos)
+    q_dq = _ref_dequantize_fp4_indexer(
+        q_fp4.view(torch.uint8),
+        _ref_quantize_fp4_indexer(_ref_q_transform(q, cos, sin, pos))[1],
+    ).reshape(batch, q_rows, NUM_HEADS, HEAD_DIM)
+    weights = torch.randn(batch * q_rows, NUM_HEADS, device=dev, dtype=torch.bfloat16)
+    weight_scale = HEAD_DIM**-0.5 * NUM_HEADS**-0.5
+    per_head = torch.einsum("bqhd,bsd->bqhs", q_dq.float(), k_dq.float()).relu()
+    ref = weight_scale * torch.einsum(
+        "bqhs,bqh->bqs", per_head, weights.float().view(batch, q_rows, NUM_HEADS)
+    )
+    return {
+        "q_fp4": q_fp4,
+        "q_scale": q_scale,
+        "payload": payload,
+        "scale": scale,
+        "weights": weights,
+        "weight_scale": weight_scale,
+        "page_table": page_table,
+        "c4_seq_lens": row_ends,
+        "context": row_ends,
+        "ref_logits_fp4": ref.reshape(batch * q_rows, padded_len),
+        "rows_per_request": q_rows,
+    }
+
+
+def _c4_rowgroup_ws(case, rows_per_request=None, **kwargs):
+    """The workspace the backend builds for a C4 decode / target-verify step: a request's
+    rows one sequence."""
+    kwargs.setdefault("min_grouped_seqs", 1)
+    return prepare_fp4_rowgroup_decode_workspace(
+        case["page_table"],
+        rows_per_request or case["rows_per_request"],
+        table_columns=rowgroup_table_columns(_C4_MAX_CONTEXT, _C4_RATIO),
+        **kwargs,
+    )
+
+
+def _c4_schedule_logits(case):
+    """Today's path: decode on the varctx kernel, target-verify on the prefill kernel."""
+    if case["rows_per_request"] == 1:
+        ws = prepare_fp4_decode_workspace(case["page_table"], case["c4_seq_lens"])
+        return _run_logits(case, is_decode=True, decode_ws=ws)
+    ws = prepare_fp4_prefill_workspace(case["page_table"], case["c4_seq_lens"])
+    return _run_logits(case, is_decode=False, prefill_ws=ws)
+
+
+def _c4_topk(case, logits):
+    """The production paged top-k (v2, index_topk 1024) over each row's own [0, len):
+    (page-table slots, raw positions)."""
+    rows = logits.shape[0]
+    pages = torch.empty(rows, _C4_TOPK, dtype=torch.int32, device=logits.device)
+    raw = torch.empty_like(pages)
+    lens = case["c4_seq_lens"]
+    topk_transform_paged_v2(
+        logits, lens, case["page_table"], pages, PAGE_SIZE, plan_topk_v2(lens), raw
+    )
+    return pages, raw
+
+
+def _assert_same_topk(case, raw_a, raw_b, scores, *, what: str) -> None:
+    """Equal top-k sets, up to keys tied with the k-th score within fp32 noise."""
+    for row, end in enumerate(case["c4_seq_lens"].tolist()):
+        a = {int(v) for v in raw_a[row].tolist() if v >= 0}
+        b = {int(v) for v in raw_b[row].tolist() if v >= 0}
+        assert len(a) == len(b) == min(end, _C4_TOPK), (what, row, len(a), len(b))
+        assert all(v < end for v in a | b), (what, row)
+        diff = a ^ b
+        if not diff:
+            continue
+        row_scores = scores[row, :end]
+        kth = row_scores.topk(min(end, _C4_TOPK)).values[-1]
+        near = (row_scores[list(diff)] - kth).abs() <= 1e-4 * kth.abs().clamp_min(1)
+        assert bool(near.all()), f"{what} row {row}: top-k differs off the tie {diff}"
+
+
+_C4_STEP_CASES = [
+    # decode: one row a request
+    ([9000], 1),
+    ([3000, 17000, 700], 1),
+    # DSpark block 3: 4 rows a request (DP8 c192+, TP c48)
+    ([9000], 4),
+    ([2500, 13000, 6000], 4),
+    ([16000, 2049, 8001, 600, 12345], 4),
+    # DSpark block 6: 7 rows a request (TP c4~c32)
+    ([12000], 7),
+    ([5000, 15000, 2100, 9100, 3, 7777], 7),
+]
+
+
+@pytest.mark.parametrize("seq_lens,rows_per_request", _C4_STEP_CASES)
+def test_c4_rowgroup_matches_schedule_path_and_reference(
+    seq_lens, rows_per_request, monkeypatch
+) -> None:
+    """A C4 decode / target-verify step on the row-group kernel scores what today's
+    kernels score, against the FP4 reference, and the top-k (v2, 1024) picks the same
+    keys; grouped (a request's rows one sequence) and per-row scoring agree bit for bit.
+    The row-group logits are poisoned past each row's bound, which the top-k never reads.
+    """
+    torch.manual_seed(sum(seq_lens) + rows_per_request)
+    case = _c4_step_case(seq_lens, rows_per_request)
+    baseline = _c4_schedule_logits(case).clone()
+
+    import sglang.kernels.ops.attention.dsv4.fp4_indexer_hip as hip_mod
+
+    real_alloc = hip_mod._alloc_logits
+
+    def poisoned(num_tokens, max_seq_len, device, is_decode):
+        return real_alloc(num_tokens, max_seq_len, device, is_decode).fill_(
+            float("inf")
+        )
+
+    monkeypatch.setattr(hip_mod, "_alloc_logits", poisoned)
+    ws = _c4_rowgroup_ws(case)
+    per_row_ws = _c4_rowgroup_ws(case, rows_per_request=1)
+    assert ws.guarded_page_table.shape[1] == rowgroup_table_columns(
+        _C4_MAX_CONTEXT, _C4_RATIO
+    )
+    assert ws.rows_per_seq == rows_per_request
+    assert per_row_ws.rows_per_seq == 1
+    got = _run_logits(case, is_decode=True, decode_ws=ws).clone()
+    per_row = _run_logits(case, is_decode=True, decode_ws=per_row_ws).clone()
+
+    for row, end in enumerate(case["c4_seq_lens"].tolist()):
+        if end == 0:
+            continue
+        assert torch.equal(got[row, :end], per_row[row, :end]), f"row {row}"
+        torch.testing.assert_close(
+            got[row, :end],
+            case["ref_logits_fp4"][row, :end],
+            rtol=2.0e-3,
+            atol=2.0e-3,
+            msg=f"row {row} vs reference",
+        )
+        torch.testing.assert_close(
+            got[row, :end],
+            baseline[row, :end],
+            rtol=1e-5,
+            atol=1e-6,
+            msg=f"row {row} vs schedule path",
+        )
+
+    pages_new, raw_new = _c4_topk(case, got)
+    pages_old, raw_old = _c4_topk(case, baseline)
+    _assert_same_topk(case, raw_new, raw_old, baseline, what="vs schedule path")
+    ref = case["ref_logits_fp4"]
+    _, raw_ref = _c4_topk(case, ref.contiguous())
+    _assert_same_topk(case, raw_new, raw_ref, ref, what="vs reference")
+    # the paged output is the raw pick through the request's page table
+    sel = raw_new.clamp_min(0).long()
+    expect = case["page_table"].long().gather(1, sel // PAGE_SIZE) * PAGE_SIZE + (
+        sel % PAGE_SIZE
+    )
+    expect = torch.where(raw_new >= 0, expect, torch.full_like(expect, -1))
+    assert torch.equal(pages_new.long(), expect)
+
+
+def test_c4_rowgroup_stale_workspace_stays_on_rowgroup() -> None:
+    """A row-group workspace sized for another row count (DP padding, truncated
+    activations) is rebuilt per row on the same table width, not dropped onto the
+    schedule kernels."""
+    torch.manual_seed(21)
+    case = _c4_step_case([6000, 9000, 4000, 7000], 4)
+    stale = _c4_rowgroup_ws(case)
+    rows = case["page_table"].shape[0] - 3
+    sub = {
+        **case,
+        **{
+            key: case[key][:rows]
+            for key in ("q_fp4", "q_scale", "weights", "page_table", "c4_seq_lens")
+        },
+    }
+    with_stale = _run_logits(sub, is_decode=True, decode_ws=stale)
+    fresh = _run_logits(
+        sub, is_decode=True, decode_ws=_c4_rowgroup_ws(sub, rows_per_request=1)
+    )
+    for row, end in enumerate(sub["c4_seq_lens"].tolist()):
+        assert torch.equal(with_stale[row, :end], fresh[row, :end]), f"row {row}"
+
+
+@pytest.mark.parametrize("rows_per_request", [4, 7])
+def test_c4_rowgroup_workspace_and_logits_replay_in_a_graph(
+    rows_per_request: int,
+) -> None:
+    """The backend builds the workspace inside the captured graph: a replay over new
+    lengths and pages scores as an eager step does."""
+    torch.manual_seed(31 + rows_per_request)
+    first = _c4_step_case([8000, 3000, 12000, 5000, 9000], rows_per_request)
+    second = _c4_step_case([2000, 11000, 6100, 9999, 300], rows_per_request)
+    keys = ("q_fp4", "q_scale", "weights", "page_table", "c4_seq_lens")
+    static = {key: torch.empty_like(first[key]) for key in keys}
+    pool_pages = max(first["payload"].shape[0], second["payload"].shape[0])
+    payload, scale = _empty_index_k_cache(pool_pages)
+
+    def load(case):
+        for key in keys:
+            # byte views: the fp4 operands have no copy kernel of their own
+            static[key].view(torch.uint8).copy_(case[key].view(torch.uint8))
+        payload.view(torch.uint8)[: case["payload"].shape[0]].copy_(
+            case["payload"].view(torch.uint8)
+        )
+        scale[: case["scale"].shape[0]].copy_(case["scale"])
+
+    def step():
+        ws = prepare_fp4_rowgroup_decode_workspace(
+            static["page_table"],
+            rows_per_request,
+            table_columns=rowgroup_table_columns(_C4_MAX_CONTEXT, _C4_RATIO),
+            min_grouped_seqs=1,
+        )
+        return aiter_fp4_paged_mqa_logits(
+            q_fp4=static["q_fp4"],
+            q_scale=static["q_scale"],
+            k_payload=payload,
+            k_scale=scale,
+            weights=static["weights"],
+            page_table=static["page_table"],
+            c4_seq_lens=static["c4_seq_lens"],
+            weight_scale=first["weight_scale"],
+            is_decode=True,
+            decode_workspace=ws,
+        )
+
+    load(first)
+    step()  # compile outside the capture
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = step()
+    for case in (second, first):
+        load(case)
+        graph.replay()
+        eager = step()
+        torch.cuda.synchronize()
+        for row, end in enumerate(case["c4_seq_lens"].tolist()):
+            assert torch.equal(out[row, :end], eager[row, :end]), f"row {row}"
+            torch.testing.assert_close(
+                out[row, :end],
+                case["ref_logits_fp4"][row, :end],
+                rtol=2.0e-3,
+                atol=2.0e-3,
+            )
 
 
 @pytest.mark.parametrize(

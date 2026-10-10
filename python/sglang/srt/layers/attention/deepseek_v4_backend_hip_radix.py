@@ -671,7 +671,9 @@ class DSV4Metadata:
     ] = field(default_factory=dict, repr=False)
     # Captured kernels bind these FP4 indexer buffers by address; absent from copy_
     # so addresses stay pinned across replays (the builders refresh contents).
-    fp4_decode_workspace: Optional[FP4DecodeWorkspace] = field(default=None, repr=False)
+    fp4_decode_workspace: Optional[
+        Union[FP4DecodeWorkspace, FP4RowgroupDecodeWorkspace]
+    ] = field(default=None, repr=False)
     fp4_prefill_workspace: Optional[FP4PrefillWorkspace] = field(
         default=None, repr=False
     )
@@ -983,6 +985,36 @@ class DeepseekV4HipRadixBackend(
             )
 
             self._fp4_graph_row_limit = MAX_FUSED_ROWS
+        # DSv4 C4 decode / target-verify indexer on AITER's row-group kernel: no schedule,
+        # its workspace built in the graph, a request's verify rows sharing each key load.
+        # Every launch reads a table of one width (its compiled variant) for the server's life.
+        self._fp4_c4_rowgroup_columns: Optional[int] = None
+        if (
+            self.enable_deepseek_v4_fp4_indexer
+            and self.speculative_num_steps == 0
+            and self.has_c4
+            and envs.SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP.get()
+        ):
+            from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
+                aiter_has_fp4_rowgroup,
+                rowgroup_table_columns,
+            )
+
+            if aiter_has_fp4_rowgroup():
+                self._fp4_c4_rowgroup_columns = rowgroup_table_columns(
+                    max(self.max_context_len, self.MAX_SEQ_LEN_FOR_CAPTURE), 4
+                )
+                logger.info(
+                    "DSv4 C4 indexer: decode / target-verify on the row-group FP4 "
+                    "MQA logits kernel (%d table columns)",
+                    self._fp4_c4_rowgroup_columns,
+                )
+            else:
+                logger.warning(
+                    "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP is set but the installed AITER "
+                    "has no row-group FP4 MQA logits kernel (#6145); keeping the "
+                    "schedule-based C4 indexer."
+                )
         self.speculative_step_id = speculative_step_id
         self.forward_metadata: Union[
             DSV4Metadata,
@@ -1704,8 +1736,21 @@ class DeepseekV4HipRadixBackend(
             )
 
         # Decode's schedule builder is capture-safe (the workspace pins its scratch);
-        # prefill/target-verify's is not, see _refresh_fp4_prefill_workspace.
-        if self._fp4_workspaces_enabled(metadata) and (
+        # prefill/target-verify's is not, see _refresh_fp4_prefill_workspace. The
+        # row-group workspace has no schedule, so target-verify builds it here too.
+        rowgroup_rows = self._fp4_c4_rowgroup_rows(metadata, forward_batch)
+        if rowgroup_rows is not None:
+            from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
+                prepare_fp4_rowgroup_decode_workspace,
+            )
+
+            metadata.fp4_decode_workspace = prepare_fp4_rowgroup_decode_workspace(
+                metadata.indexer_metadata.page_table,
+                rowgroup_rows,
+                table_columns=self._fp4_c4_rowgroup_columns,
+                min_grouped_seqs=1,
+            )
+        elif self._fp4_workspaces_enabled(metadata) and (
             forward_batch.forward_mode.is_decode()
         ):
             from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
@@ -1728,6 +1773,40 @@ class DeepseekV4HipRadixBackend(
             and metadata.indexer_metadata is not None
             and metadata.c4_compress_metadata is not None
         )
+
+    def _fp4_c4_rowgroup_rows(
+        self, metadata, forward_batch: ForwardBatch
+    ) -> Optional[int]:
+        """Rows a request scores as one sequence on the row-group kernel this step: 1 for
+        decode, the draft rows for a target-verify of at least C4_ROWGROUP_MIN_VERIFY_ROWS
+        rows (below it the prefill kernel's schedule spreads a few requests' keys wider).
+        None keeps the schedule kernels, as does a verify whose logits outgrow the prefill
+        budget (the row-group launch is unchunked).
+        """
+        if self._fp4_c4_rowgroup_columns is None or not self._fp4_workspaces_enabled(
+            metadata
+        ):
+            return None
+        mode = forward_batch.forward_mode
+        if mode.is_decode():
+            return 1
+        if not mode.is_target_verify():
+            return None
+        from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
+            C4_ROWGROUP_MIN_VERIFY_ROWS,
+            logits_rows_per_chunk,
+        )
+
+        page_table = metadata.indexer_metadata.page_table
+        rows, num_draft = page_table.shape[0], self.target_verify_num_draft_tokens
+        if (
+            num_draft < 2
+            or rows != num_draft * forward_batch.batch_size
+            or rows < C4_ROWGROUP_MIN_VERIFY_ROWS
+            or rows > logits_rows_per_chunk(page_table)
+        ):
+            return None
+        return num_draft
 
     def _refresh_fp4_prefill_workspace(
         self, forward_batch: ForwardBatch, metadata: Optional[DSV4Metadata] = None
@@ -1762,6 +1841,9 @@ class DeepseekV4HipRadixBackend(
             ForwardMode.MIXED,
             ForwardMode.TARGET_VERIFY,
         ):
+            return
+        if self._fp4_c4_rowgroup_rows(metadata, forward_batch) is not None:
+            # scored on the row-group kernel, its workspace built with the metadata
             return
         if (
             get_parallel().attn_cp_size != 1

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import itertools
 import os
 from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional, Tuple, Union
@@ -48,6 +49,12 @@ _DECODE_CTA_INFO_WIDTH = 4
 # Row-group decode: a request's verify rows share each key load from this many requests up;
 # below it each row scoring as its own sequence is faster (gfx950, H = 32, 8K..64K context).
 _ROWGROUP_MIN_GROUPED_SEQS = 4
+# DeepSeek-V4 C4 indexer (H = 64, 64-slot pages): a target-verify scores on the row-group
+# kernel, a request's rows one sequence, from this many rows up (4-row DSpark: 16 requests,
+# 7-row: 10); below it the prefill kernel's schedule is as fast or faster. MI355X, in a
+# DSpark decode step: 7 rows x 16 requests at 131K 1.36x, 4 x 32 per DP rank at 32K 1.11x,
+# 4 x 8 at 64K 0.88x (bench_dsv4_c4_indexer_rowgroup_hip.py for the kernel alone).
+C4_ROWGROUP_MIN_VERIFY_ROWS = 64
 
 # Budget for the pooled prefill logits block, in MiB. Rows are split to fit it
 # (see `logits_rows_per_chunk`), so this caps the indexer's transient footprint
@@ -282,17 +289,28 @@ def prepare_fp4_decode_workspace(
     )
 
 
+@functools.lru_cache(maxsize=1)
+def aiter_has_fp4_rowgroup() -> bool:
+    """Whether the installed AITER ships the row-group FP4 MQA logits kernel (#6145)."""
+    try:
+        from aiter.ops.flydsl import make_fp4_mqa_plan  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
 def prepare_fp4_rowgroup_decode_workspace(
     page_table: torch.Tensor,
     rows_per_request: int,
     page_table_bucket: int = 4,
     table_columns: Optional[int] = None,
+    min_grouped_seqs: int = _ROWGROUP_MIN_GROUPED_SEQS,
 ) -> FP4RowgroupDecodeWorkspace:
     """The decode workspace of the row-group logits kernel: the padded page table and the
     rows' sequences, no schedule. ``rows_per_request`` consecutive rows belong to one
     request (one page-table row, non-decreasing bounds); they score as one sequence once
-    there are enough requests, else every row is its own. The table has at least
-    ``table_columns`` columns (``rowgroup_table_columns``). Capture-safe."""
+    there are ``min_grouped_seqs`` requests, else every row is its own. The table has at
+    least ``table_columns`` columns (``rowgroup_table_columns``). Capture-safe."""
     guarded, max_seq_len = _guard_page_table(
         page_table, page_table_bucket=page_table_bucket, columns=table_columns
     )
@@ -300,7 +318,7 @@ def prepare_fp4_rowgroup_decode_workspace(
     grouped = (
         rows_per_request > 1
         and rows % rows_per_request == 0
-        and rows // rows_per_request >= _ROWGROUP_MIN_GROUPED_SEQS
+        and rows // rows_per_request >= min_grouped_seqs
     )
     rows_per_seq = rows_per_request if grouped else 1
     query_start_loc = torch.arange(
@@ -549,7 +567,17 @@ def aiter_fp4_paged_mqa_logits(
     # A workspace is bound to one row count. DP padding or truncated activations
     # can leave it stale, in which case fall back to building the schedule here.
     if workspace is not None and workspace.guarded_page_table.shape[0] != num_tokens:
-        workspace = None
+        if is_decode and isinstance(workspace, FP4RowgroupDecodeWorkspace):
+            # Stay on the row-group kernel, capture-safe and on the same compiled table
+            # width, scoring every row as its own sequence.
+            workspace = prepare_fp4_rowgroup_decode_workspace(
+                page_table,
+                1,
+                page_table_bucket=page_table_bucket,
+                table_columns=workspace.guarded_page_table.shape[1],
+            )
+        else:
+            workspace = None
     rowgroup_ws = (
         workspace
         if is_decode and isinstance(workspace, FP4RowgroupDecodeWorkspace)
