@@ -30,7 +30,7 @@ export const config = (() => {
   const config = {
     modelName: "MOVA",
     supportedHardware: ["b200", "h200", "h100", "a100"],
-    hardware: [],
+    hardware: [{ id: "a100", label: "A100", vram: "", vendor: "nvidia" }],
     groupHardware: false,
     matchDims: [],
     overlayDims: [

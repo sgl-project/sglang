@@ -51,7 +51,12 @@ test("every diffusion model uses one shared builder before model capabilities", 
 
 test("migrated recipes retain unverified status, valid scopes and editable ports", () => {
   assert.equal(migrated.length, 22);
+  const shared = readFileSync(join(docs, "src/snippets/_deployment.jsx"), "utf8");
+  const builtInIds = new Set([...shared.matchAll(/\bid: "([^"]+)"/g)].map((match) => match[1]));
   for (const config of migrated) {
+    for (const hw of config.supportedHardware) {
+      assert.ok(builtInIds.has(hw) || config.hardware.some((entry) => entry.id === hw), `${config.modelName}: hidden ${hw}`);
+    }
     for (const dim of config.overlayDims) assert.ok(["base", "serve", "request"].includes(dim.scope));
     for (const recipe of config.commandBuilder.resource.verifiedRecipes) {
       const result = resolve(config, { ...recipe, topology_mode: "manual" });
