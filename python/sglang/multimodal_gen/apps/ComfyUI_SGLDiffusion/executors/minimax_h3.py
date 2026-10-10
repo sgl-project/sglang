@@ -8,22 +8,36 @@ from typing import Any
 
 import torch
 
-from sglang.multimodal_gen.configs.sample.minimax_h3 import MiniMaxH3SamplingParams
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.comfyui_step import (
-    DEFAULT_SIGMA_SHIFT_AUDIO,
-    DEFAULT_SIGMA_SHIFT_VIDEO,
-    serialize_comfyui_layout,
-    time_shift_sigma,
-    time_shift_slope,
-)
-
 from .adapter import ComfyUIModelAdapter, PackedForward
 from .base import SGLDiffusionExecutor
 
-# H3 pins loop/CFG fields with init=False; ComfyUI owns those.
-_H3_PINNED_SAMPLING_FIELDS = frozenset(
-    f.name for f in fields(MiniMaxH3SamplingParams) if not f.init
-)
+# Mirrors base.py's guard: keep this module importable (so nodes.py still
+# loads and ComfyUI can show *why* H3 is unavailable) even when the
+# sglang[diffusion] extras aren't installed. Previously these imports ran
+# unguarded at module scope, which raised ImportError out of
+# `core/generator.py`'s own unconditional executor import and took every
+# node in the plugin down with it, silently (see __init__.py's bare except).
+try:
+    from sglang.multimodal_gen.configs.sample.minimax_h3 import MiniMaxH3SamplingParams
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.comfyui_step import (
+        DEFAULT_SIGMA_SHIFT_AUDIO,
+        DEFAULT_SIGMA_SHIFT_VIDEO,
+        serialize_comfyui_layout,
+        time_shift_sigma,
+        time_shift_slope,
+    )
+except ImportError as exc:
+    _H3_RUNTIME_IMPORT_ERROR: ImportError | None = exc
+    MiniMaxH3SamplingParams = None
+    DEFAULT_SIGMA_SHIFT_AUDIO = DEFAULT_SIGMA_SHIFT_VIDEO = 0.0
+    serialize_comfyui_layout = time_shift_sigma = time_shift_slope = None
+    _H3_PINNED_SAMPLING_FIELDS: frozenset[str] = frozenset()
+else:
+    _H3_RUNTIME_IMPORT_ERROR = None
+    # H3 pins loop/CFG fields with init=False; ComfyUI owns those.
+    _H3_PINNED_SAMPLING_FIELDS = frozenset(
+        f.name for f in fields(MiniMaxH3SamplingParams) if not f.init
+    )
 
 
 def drop_h3_pinned_sampling_fields(kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -213,6 +227,13 @@ class MiniMaxH3Executor(SGLDiffusionExecutor):
     # ComfyUI MiniMaxH3.extra_conds reads this when a denoise_mask is present.
     patch_size = (1, 2, 2)
 
+    def __init__(self, *args, **kwargs):
+        if _H3_RUNTIME_IMPORT_ERROR is not None:
+            raise RuntimeError(
+                "SGLang diffusion runtime failed to import"
+            ) from _H3_RUNTIME_IMPORT_ERROR
+        super().__init__(*args, **kwargs)
+
     def preprocess_text_embeds(self, text_states):
         """ComfyUI extra_conds runs this once per sample.
 
@@ -224,7 +245,4 @@ class MiniMaxH3Executor(SGLDiffusionExecutor):
     def _sampling_params_kwargs(self, packed, timestep) -> dict:
         kwargs = super()._sampling_params_kwargs(packed, timestep)
         drop_h3_pinned_sampling_fields(kwargs)
-        enable_cache_dit = getattr(self, "enable_cache_dit", None)
-        if enable_cache_dit is not None:
-            kwargs["enable_cache_dit"] = bool(enable_cache_dit)
         return kwargs

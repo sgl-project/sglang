@@ -38,18 +38,54 @@ def _looks_like_gguf(path: str) -> bool:
     )
 
 
-def _h3_detect_companion(gguf_ref: str) -> str:
-    """ComfyUI detect needs H3 safetensors keys; GGUF only overrides the DiT."""
+# ComfyUI's detect_unet_config needs a BF16 safetensors' keys; GGUF only
+# overrides the DiT weights. Each architecture needs its own companion file,
+# never MiniMax-H3's regardless of what GGUF is actually being loaded.
+_GGUF_DETECT_COMPANIONS: dict[str, list[str]] = {
+    "minimax_h3": [
+        "minimax_h3_fl2va_bf16.safetensors",
+        "minimax_h3_ref2va_bf16.safetensors",
+    ],
+    "flux": [
+        "flux1-dev.safetensors",
+        "flux1-schnell.safetensors",
+    ],
+    "qwen_image": ["qwen_image_bf16.safetensors"],
+    "qwen_image_edit": ["qwen_image_edit_bf16.safetensors"],
+    "lumina2": ["z_image_turbo_bf16.safetensors"],
+}
+
+_GGUF_NAME_HINTS: dict[str, tuple[str, ...]] = {
+    "minimax_h3": ("minimax_h3", "minimax-h3"),
+    "qwen_image_edit": ("qwen_image_edit", "qwen-image-edit"),
+    "qwen_image": ("qwen_image", "qwen-image"),
+    "flux": ("flux",),
+    "lumina2": ("z_image", "z-image", "lumina", "zimage"),
+}
+
+
+def _infer_gguf_model_type(gguf_ref: str, model_type_hint: str | None) -> str | None:
+    if model_type_hint and model_type_hint in _GGUF_DETECT_COMPANIONS:
+        return model_type_hint
     name = os.path.basename(gguf_ref).lower()
-    prefer = []
-    if "ref2va" in name:
-        prefer.append("minimax_h3_ref2va_bf16.safetensors")
-    prefer.extend(
-        [
-            "minimax_h3_fl2va_bf16.safetensors",
-            "minimax_h3_ref2va_bf16.safetensors",
-        ]
-    )
+    for model_type, needles in _GGUF_NAME_HINTS.items():
+        if any(needle in name for needle in needles):
+            return model_type
+    return None
+
+
+def _h3_detect_companion(gguf_ref: str, model_type_hint: str | None = None) -> str:
+    model_type = _infer_gguf_model_type(gguf_ref, model_type_hint)
+    if model_type is None:
+        raise ValueError(
+            f"Cannot tell which architecture GGUF {gguf_ref!r} is. Set "
+            "model_type on SGLDOptions (not 'auto-detect') so ComfyUI "
+            "architecture detect knows which BF16 safetensors to use."
+        )
+    candidates = list(_GGUF_DETECT_COMPANIONS[model_type])
+    name = os.path.basename(gguf_ref).lower()
+    if model_type == "minimax_h3" and "ref2va" in name:
+        candidates.sort(key=lambda c: "ref2va" not in c)
     folders = (
         [os.path.dirname(os.path.abspath(gguf_ref))]
         if os.path.dirname(gguf_ref)
@@ -65,7 +101,7 @@ def _h3_detect_companion(gguf_ref: str) -> str:
     for folder in folders:
         if not folder:
             continue
-        for candidate in prefer:
+        for candidate in candidates:
             path = os.path.join(folder, candidate)
             if path in seen:
                 continue
@@ -73,10 +109,10 @@ def _h3_detect_companion(gguf_ref: str) -> str:
             if os.path.isfile(path):
                 return path
     raise ValueError(
-        "GGUF transformer needs a MiniMax-H3 BF16 safetensors in "
-        "models/diffusion_models for ComfyUI architecture detect "
-        f"(looked for {prefer}). Keep --model-path / unet_name on the "
-        "BF16 file and pass the GGUF via transformer_weights_path."
+        f"GGUF transformer for {model_type!r} needs a matching BF16 "
+        "safetensors in models/diffusion_models for ComfyUI architecture "
+        f"detect (looked for {candidates}). Keep --model-path / unet_name "
+        "on the BF16 file and pass the GGUF via transformer_weights_path."
     )
 
 
@@ -151,6 +187,7 @@ class SGLDiffusionGenerator:
         self.executor = None
         self.last_options = None
         self._patcher = None
+        self.worker_asleep = False
 
         # Native pipelines, run under comfyui_mode as a DiT-only forward service.
         self.pipeline_class_dict = {}
@@ -274,6 +311,7 @@ class SGLDiffusionGenerator:
     def ensure_executor(self, executor) -> None:
         """Rebuild the worker if this cached executor no longer owns it."""
         if self._owns_live(executor):
+            self.wake_worker()
             return
         reload = getattr(executor, "_sgld_reload", None)
         if not reload:
@@ -289,6 +327,45 @@ class SGLDiffusionGenerator:
         lora = getattr(executor, "_lora_input", None)
         if lora and lora.get("lora_nickname"):
             executor.set_lora(**lora)
+
+    def _memory_occupation_request(self, req_name: str) -> dict:
+        from sglang.multimodal_gen.runtime.entrypoints.post_training import io_struct
+
+        out = self.generator._send_to_scheduler_and_wait_for_response(
+            [getattr(io_struct, req_name)()]
+        )
+        if out.error:
+            raise RuntimeError(out.error)
+        payload = out.output or {}
+        if not payload.get("success", True):
+            raise RuntimeError(payload.get("message", "memory occupation failed"))
+        return payload
+
+    def sleep_worker(self, token=None) -> None:
+        """Move the worker's weights off the GPU (best effort).
+
+        ``token`` is the patcher's ``worker_token`` (the worker's generator);
+        it guards against a patcher for a replaced worker putting the new one
+        to sleep, while ComfyUI clones of the live patcher still match. Failure is logged, not raised: the worker just
+        stays resident, which is the old behaviour.
+        """
+        if token is not None and token is not self.generator:
+            return
+        if self.worker_asleep or self.generator is None or not self._is_live():
+            return
+        try:
+            self._memory_occupation_request("ReleaseMemoryOccupationReqInput")
+        except Exception:
+            logger.warning("Could not release SGLD worker GPU memory", exc_info=True)
+            return
+        self.worker_asleep = True
+
+    def wake_worker(self) -> None:
+        """Bring a sleeping worker's weights back to the GPU."""
+        if not self.worker_asleep:
+            return
+        self._memory_occupation_request("ResumeMemoryOccupationReqInput")
+        self.worker_asleep = False
 
     def kill_generator(self):
         """Force-stop workers this owner started. Do not scan the process table."""
@@ -322,6 +399,7 @@ class SGLDiffusionGenerator:
         self.generator = None
         self.executor = None
         self._patcher = None
+        self.worker_asleep = False
 
     def get_comfyui_model(self, model_path: str, model_options: dict = None):
         """Get ComfyUI model from model path."""
@@ -361,11 +439,19 @@ class SGLDiffusionGenerator:
             if new_sd is not None:  # diffusers mmdit
                 model_config = model_detection.model_config_from_unet(new_sd, "")
                 if model_config is None:
-                    return None
+                    raise ValueError(
+                        f"Could not build a model config for diffusers mmdit "
+                        f"checkpoint {model_path!r} (detected model type "
+                        f"{model_type!r})"
+                    )
             else:  # diffusers unet
                 model_config = model_detection.model_config_from_diffusers_unet(sd)
                 if model_config is None:
-                    return None
+                    raise ValueError(
+                        f"Could not build a model config for diffusers unet "
+                        f"checkpoint {model_path!r} (detected model type "
+                        f"{model_type!r})"
+                    )
 
                 diffusers_keys = unet_to_diffusers(model_config.unet_config)
                 new_sd = {}
@@ -387,7 +473,11 @@ class SGLDiffusionGenerator:
         model_config.custom_operations = model_options.get("custom_operations", None)
         model_config.unet_config["disable_unet_model_creation"] = True
         comfyui_model = model_config.get_model({})
-        return comfyui_model, model_config, model_type
+        # Real byte size from the checkpoint header, not a per-architecture
+        # guess: lets ComfyUI's VRAM accounting work the same for every
+        # model type instead of only the ones with a hardcoded entry.
+        model_size_bytes = parameters * unet_dtype.itemsize
+        return comfyui_model, model_config, model_type, model_size_bytes
 
     def load_model(
         self, model_path: str, model_options: dict = None, sgld_options: dict = None
@@ -414,7 +504,12 @@ class SGLDiffusionGenerator:
             sgld_options.pop("transformer_weights_path", None)
         detect_path = model_path
         if _looks_like_gguf(model_path):
-            detect_path = _h3_detect_companion(sgld_options["transformer_weights_path"])
+            detect_path = _h3_detect_companion(
+                sgld_options["transformer_weights_path"],
+                model_type_hint=(
+                    set_model_type if set_model_type != "auto-detect" else None
+                ),
+            )
         gather_options = {
             "model_path": detect_path,
             "model_options": model_options,
@@ -429,9 +524,20 @@ class SGLDiffusionGenerator:
         self.last_options = gather_options
         self.model_path = detect_path
 
-        comfyui_model, model_config, model_type = self.get_comfyui_model(
-            detect_path, model_options
+        comfyui_model, model_config, model_type, model_size_bytes = (
+            self.get_comfyui_model(detect_path, model_options)
         )
+        if _looks_like_gguf(model_path):
+            # detect_path is the BF16 companion used only so ComfyUI's
+            # architecture detect has keys to read; the weights that
+            # actually land in VRAM are the (much smaller, quantized) GGUF
+            # file, so size them from that file instead of the companion.
+            try:
+                model_size_bytes = os.path.getsize(
+                    sgld_options["transformer_weights_path"]
+                )
+            except OSError:
+                pass
         if model_type is None or model_type not in self.pipeline_class_dict:
             raise ValueError(f"Unsupported model type: {model_type}")
         if set_model_type is not None and set_model_type in self.pipeline_class_dict:
@@ -460,7 +566,13 @@ class SGLDiffusionGenerator:
         offload_device = model_management.unet_offload_device()
 
         self._patcher = SGLDModelPatcher(
-            comfyui_model, load_device, offload_device, model_type=model_type
+            comfyui_model,
+            load_device,
+            offload_device,
+            size=model_size_bytes,
+            model_type=model_type,
+            worker=self,
+            worker_token=self.generator,
         )
         self._patcher.add_wrapper_with_key(
             WrappersMP.SAMPLER_SAMPLE,

@@ -80,7 +80,18 @@ def is_empty_image(image: torch.Tensor, tolerance: float = 1e-6) -> bool:
 def get_image_path(image: torch.Tensor) -> str:
     """
     Save tensor image to ComfyUI temp directory as PNG and return the path.
+
+    Raises if given a batch of more than one image: the node (and the
+    server request it builds) only has a single image slot here, and
+    silently keeping just image[0] would drop the rest of the batch with
+    no indication to the user.
     """
+    if image.dim() == 4 and image.shape[0] > 1:
+        raise ValueError(
+            f"get_image_path received a batch of {image.shape[0]} images but "
+            "this input only accepts one; use a node like 'Image From Batch' "
+            "to select a single image first."
+        )
     temp_dir = folder_paths.get_temp_directory()
 
     # Build file name
@@ -129,6 +140,14 @@ def convert_b64_to_tensor_image(b64_image: str) -> torch.Tensor:
 
 
 class SGLDVideoInput(VideoInput):
+    """Minimal fallback used only when ComfyUI's own file-backed VideoInput
+    isn't importable. It cannot decode frames/audio or re-encode on save, so
+    it fails loudly on those rather than silently returning wrong data (the
+    previous ``get_components`` returned ``[video_path]`` instead of a
+    ``VideoComponents``, and ``save_to`` dropped ``format``/``codec``/
+    ``metadata`` without telling the caller).
+    """
+
     def __init__(self, video_path: str, height: int, width: int):
         super().__init__()
 
@@ -146,20 +165,21 @@ class SGLDVideoInput(VideoInput):
         return self.width, self.height
 
     def get_components(self):
-        """
-        Returns the components of the video input.
-        This is required by the VideoInput abstract base class.
-        """
-        return [self.video_path]
+        raise NotImplementedError(
+            "SGLDVideoInput cannot decode frames/audio (no ComfyUI "
+            "VideoFromFile available in this environment); pass the file "
+            "at video_path to a node that reads files directly instead."
+        )
 
     def save_to(self, path: str, format=None, codec=None, metadata=None):
-        """
-        Abstract method to save the video input to a file.
-        """
+        if format is not None or codec is not None or metadata is not None:
+            raise NotImplementedError(
+                "SGLDVideoInput can only copy the file as-is; format/codec/"
+                "metadata conversion needs ComfyUI's own VideoFromFile, "
+                "which is unavailable in this environment."
+            )
         save_path = path
-        # Copy video file from video_path to save_path
         if os.path.exists(self.video_path):
-            # Ensure destination directory exists
             save_dir = os.path.dirname(save_path)
             if save_dir:
                 os.makedirs(save_dir, exist_ok=True)
@@ -170,7 +190,18 @@ def convert_video_to_comfy_video(
     video_path: str, height: int, width: int
 ) -> VideoInput:
     """
-    Convert video to ComfyUI VIDEO format (VideoInput).
+    Convert a video file on disk to ComfyUI's VIDEO type.
+
+    Prefers ComfyUI's own file-backed ``VideoFromFile``: it probes the real
+    file for dimensions/frames/audio, so it is also immune to the
+    width/height we were told (which can be wrong, e.g. when the server
+    picked a different size than requested to match an image-to-video
+    input). ``height``/``width`` are only used by the ``SGLDVideoInput``
+    fallback below.
     """
-    video_input = SGLDVideoInput(video_path, height, width)
-    return video_input
+    try:
+        from comfy_api.input_impl import VideoFromFile
+
+        return VideoFromFile(video_path)
+    except ImportError:
+        return SGLDVideoInput(video_path, height, width)

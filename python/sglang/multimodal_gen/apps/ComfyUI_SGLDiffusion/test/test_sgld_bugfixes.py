@@ -1,0 +1,907 @@
+"""Regression tests for fourteen ComfyUI_SGLDiffusion bugs found in audit.
+
+Each bug gets a test that fails against the pre-fix code and passes after.
+These stub ComfyUI/ torch-adjacent modules the same way test_h3_request.py
+does, so they run without a ComfyUI install or a GPU.
+"""
+
+import importlib.util
+import os
+import sys
+import tempfile
+import types
+from pathlib import Path
+from unittest import mock
+
+import pytest
+import torch
+
+PLUGIN_DIR = Path(__file__).resolve().parents[1]
+PKG = "sgld_bugfix_under_test"
+
+
+def _install_comfy_stubs() -> None:
+    folder_paths = types.ModuleType("folder_paths")
+    _tmp = tempfile.mkdtemp(prefix="sgld_test_temp_")
+    folder_paths.get_temp_directory = lambda: _tmp
+    folder_paths._diffusion_models_dirs = []
+    folder_paths.folder_names_and_paths = {
+        "diffusion_models": ([], {".safetensors", ".sft"}),
+        "loras": ([], {".safetensors"}),
+    }
+
+    def get_filename_list(name):
+        names = set()
+        for folder in folder_paths.folder_names_and_paths.get(name, ([], set()))[0]:
+            if os.path.isdir(folder):
+                names.update(os.listdir(folder))
+        return sorted(names)
+
+    def get_folder_paths(name):
+        return list(folder_paths.folder_names_and_paths.get(name, ([], set()))[0])
+
+    def get_full_path(name, filename):
+        for folder in get_folder_paths(name):
+            candidate = os.path.join(folder, filename)
+            if os.path.isfile(candidate):
+                return candidate
+        return None
+
+    folder_paths.get_filename_list = get_filename_list
+    folder_paths.get_folder_paths = get_folder_paths
+    folder_paths.get_full_path = get_full_path
+    sys.modules["folder_paths"] = folder_paths
+
+    comfy_api = types.ModuleType("comfy_api")
+    comfy_api_input = types.ModuleType("comfy_api.input")
+
+    class VideoInput:
+        pass
+
+    comfy_api_input.VideoInput = VideoInput
+    comfy_api.input = comfy_api_input
+    sys.modules["comfy_api"] = comfy_api
+    sys.modules["comfy_api.input"] = comfy_api_input
+    # No comfy_api.input_impl: exercises the SGLDVideoInput fallback path.
+    sys.modules.pop("comfy_api.input_impl", None)
+
+    comfy = types.ModuleType("comfy")
+    comfy.model_detection = types.ModuleType("comfy.model_detection")
+    comfy.model_management = types.ModuleType("comfy.model_management")
+
+    comfy_utils = types.ModuleType("comfy.utils")
+    for name in (
+        "calculate_parameters",
+        "load_torch_file",
+        "state_dict_prefix_replace",
+        "unet_to_diffusers",
+    ):
+        setattr(comfy_utils, name, lambda *a, **k: None)
+
+    class InterruptProcessingException(Exception):
+        pass
+
+    _interrupt = {"flag": False}
+
+    def throw_exception_if_processing_interrupted():
+        if _interrupt["flag"]:
+            raise InterruptProcessingException()
+
+    comfy.model_management.InterruptProcessingException = InterruptProcessingException
+    comfy.model_management.throw_exception_if_processing_interrupted = (
+        throw_exception_if_processing_interrupted
+    )
+    comfy.model_management._test_interrupt = _interrupt
+
+    class ProgressBar:
+        instances = []
+
+        def __init__(self, total):
+            self.total = total
+            self.values = []
+            ProgressBar.instances.append(self)
+
+        def update_absolute(self, value, total=None, preview=None):
+            self.values.append(value)
+
+    comfy_utils.ProgressBar = ProgressBar
+    comfy.utils = comfy_utils
+
+    comfy_model_patcher = types.ModuleType("comfy.model_patcher")
+
+    class ModelPatcher:
+        def __init__(self, model, load_device, offload_device, size=0, *a, **k):
+            self.model = model
+            self.load_device = load_device
+            self.offload_device = offload_device
+            self.size = size
+            self.patches = {}
+            self.object_patches = {}
+            self.model_options = {}
+            self.backup = {}
+            self.object_patches_backup = {}
+            self.wrappers = {}
+            self.callbacks = {}
+            self.patches_uuid = None
+            self.weight_inplace_update = False
+
+        def add_wrapper_with_key(self, *a, **k):
+            pass
+
+        # ComfyUI: loaded_size() reads the model's own weight counter (0 for
+        # SGLD, whose weights live in the worker); detach() is what
+        # LoadedModel.model_unload always ends in.
+        def loaded_size(self):
+            return getattr(self.model, "model_loaded_weight_memory", 0)
+
+        def detach(self, unpatch_all=True):
+            return self.model
+
+    comfy_model_patcher.ModelPatcher = ModelPatcher
+    comfy.model_patcher = comfy_model_patcher
+
+    comfy_patcher_extension = types.ModuleType("comfy.patcher_extension")
+
+    class WrappersMP:
+        SAMPLER_SAMPLE = "SAMPLER_SAMPLE"
+
+    comfy_patcher_extension.WrappersMP = WrappersMP
+    comfy.patcher_extension = comfy_patcher_extension
+
+    sys.modules["comfy"] = comfy
+    sys.modules["comfy.model_detection"] = comfy.model_detection
+    sys.modules["comfy.model_management"] = comfy.model_management
+    sys.modules["comfy.utils"] = comfy_utils
+    sys.modules["comfy.model_patcher"] = comfy_model_patcher
+    sys.modules["comfy.patcher_extension"] = comfy_patcher_extension
+    return folder_paths
+
+
+def _load(module_name: str, relative_path: str):
+    spec = importlib.util.spec_from_file_location(
+        module_name, PLUGIN_DIR / relative_path
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_plugin():
+    folder_paths = _install_comfy_stubs()
+
+    package = types.ModuleType(PKG)
+    package.__path__ = [str(PLUGIN_DIR)]
+    sys.modules[PKG] = package
+
+    core = types.ModuleType(f"{PKG}.core")
+    core.__path__ = [str(PLUGIN_DIR / "core")]
+    sys.modules[f"{PKG}.core"] = core
+
+    server_api = _load(f"{PKG}.core.server_api", "core/server_api.py")
+    core.SGLDiffusionServerAPI = server_api.SGLDiffusionServerAPI
+    model_patcher = _load(f"{PKG}.core.model_patcher", "core/model_patcher.py")
+    core.SGLDModelPatcher = model_patcher.SGLDModelPatcher
+    generator = _load(f"{PKG}.core.generator", "core/generator.py")
+    core.SGLDiffusionGenerator = generator.SGLDiffusionGenerator
+
+    _load(f"{PKG}.utils", "utils.py")
+    nodes = _load(f"{PKG}.nodes", "nodes.py")
+    return (
+        server_api,
+        model_patcher,
+        generator,
+        nodes,
+        sys.modules[f"{PKG}.utils"],
+        folder_paths,
+    )
+
+
+SERVER_API, MODEL_PATCHER, GENERATOR, NODES, UTILS, FOLDER_PATHS = _load_plugin()
+SGLDiffusionServerAPI = SERVER_API.SGLDiffusionServerAPI
+SGLDModelPatcher = MODEL_PATCHER.SGLDModelPatcher
+
+
+class _Response:
+    def __init__(self, payload, status_code=200):
+        self._payload = payload
+        self.status_code = status_code
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return self._payload
+
+    def iter_content(self, chunk_size=None):
+        yield b"fake-mp4-bytes"
+
+
+# --- Bug 8: a missing sglang runtime made nodes disappear with no logging --
+
+
+def test_init_logs_when_node_registration_fails(caplog):
+    import logging
+
+    pkg_name = f"{PKG}_init_fail"
+    package = types.ModuleType(pkg_name)
+    package.__path__ = [str(PLUGIN_DIR)]
+    sys.modules[pkg_name] = package
+
+    # Make the inner `from .nodes import ...` fail so __init__.py's except
+    # branch runs.
+    broken_nodes = types.ModuleType(f"{pkg_name}.nodes")
+
+    def _raise(*a, **k):
+        raise ImportError("simulated missing runtime")
+
+    broken_nodes.__getattr__ = _raise
+    sys.modules[f"{pkg_name}.nodes"] = broken_nodes
+    # Force the `from .nodes import NODE_CLASS_MAPPINGS` to raise by not
+    # defining the attributes at all (AttributeError via __getattr__ above
+    # doesn't trigger ImportError machinery, so delete the module and let
+    # the real loader fail via a stub raising at import time instead).
+    del sys.modules[f"{pkg_name}.nodes"]
+
+    init_path = PLUGIN_DIR / "__init__.py"
+    spec = importlib.util.spec_from_file_location(pkg_name, init_path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[pkg_name] = module
+
+    with mock.patch.dict(
+        sys.modules,
+        {f"{pkg_name}.nodes": None},
+    ):
+        with caplog.at_level(logging.ERROR):
+            spec.loader.exec_module(module)
+
+    assert module.NODE_CLASS_MAPPINGS == {}
+    assert any("failed to register nodes" in r.message for r in caplog.records)
+
+
+def test_minimax_h3_module_importable_without_sglang_runtime():
+    """The missing-runtime guard belongs in minimax_h3.py itself (mirroring
+    base.py); previously its unguarded top-level import crashed the whole
+    executors package, and generator.py imports it unconditionally.
+    """
+    pkg_name = f"{PKG}_no_runtime"
+    package = types.ModuleType(pkg_name)
+    package.__path__ = [str(PLUGIN_DIR)]
+    sys.modules[pkg_name] = package
+    executors_pkg = types.ModuleType(f"{pkg_name}.executors")
+    executors_pkg.__path__ = [str(PLUGIN_DIR / "executors")]
+    sys.modules[f"{pkg_name}.executors"] = executors_pkg
+
+    _load(f"{pkg_name}.executors.adapter", "executors/adapter.py")
+    _load(f"{pkg_name}.executors.base", "executors/base.py")
+
+    real_import = __import__
+
+    def fake_import(name, *args, **kwargs):
+        if name.startswith("sglang.multimodal_gen"):
+            raise ImportError("sglang[diffusion] not installed")
+        return real_import(name, *args, **kwargs)
+
+    with mock.patch("builtins.__import__", side_effect=fake_import):
+        module = _load(f"{pkg_name}.executors.minimax_h3", "executors/minimax_h3.py")
+
+    assert module._H3_RUNTIME_IMPORT_ERROR is not None
+    with pytest.raises(RuntimeError, match="failed to import"):
+        module.MiniMaxH3Executor(
+            generator=None, model_path="x", model=None, config=None
+        )
+
+
+# --- Bug 1: any .gguf was treated as MiniMax-H3 for architecture detect ----
+
+
+def test_gguf_detect_infers_architecture_from_model_type_hint():
+    model_type = GENERATOR._infer_gguf_model_type("whatever.gguf", "flux")
+    assert model_type == "flux"
+
+
+def test_gguf_detect_infers_architecture_from_filename_when_no_hint():
+    assert GENERATOR._infer_gguf_model_type("qwen_image-Q4.gguf", None) == "qwen_image"
+    assert GENERATOR._infer_gguf_model_type("flux1-dev-Q8.gguf", None) == "flux"
+
+
+def test_gguf_detect_does_not_default_to_h3_for_unknown_architecture():
+    with pytest.raises(ValueError, match="Cannot tell which architecture"):
+        GENERATOR._h3_detect_companion("/models/mystery_model.gguf")
+
+
+def test_gguf_detect_looks_for_matching_companion_not_h3():
+    with tempfile.TemporaryDirectory() as tmp:
+        # Only a flux companion exists; a flux GGUF should accept it, but an
+        # unrelated qwen GGUF in the same folder must not silently grab it.
+        open(os.path.join(tmp, "flux1-dev.safetensors"), "wb").close()
+        gguf_path = os.path.join(tmp, "flux1-schnell-Q4.gguf")
+        found = GENERATOR._h3_detect_companion(gguf_path, model_type_hint="flux")
+        assert found == os.path.join(tmp, "flux1-dev.safetensors")
+
+        qwen_gguf = os.path.join(tmp, "qwen_image-Q4.gguf")
+        with pytest.raises(ValueError, match="qwen_image"):
+            GENERATOR._h3_detect_companion(qwen_gguf)
+
+
+# --- Bug 2: .gguf was added to ComfyUI's global diffusion_models list ------
+
+
+def test_gguf_support_does_not_leak_into_global_folder_registry():
+    with tempfile.TemporaryDirectory() as tmp:
+        open(os.path.join(tmp, "model.gguf"), "wb").close()
+        FOLDER_PATHS.folder_names_and_paths["diffusion_models"][0].append(tmp)
+        try:
+            names = NODES._list_unet_names_including_gguf()
+            assert "model.gguf" in names
+            # The stock extension set used by every other node (e.g.
+            # ComfyUI's own "Load Diffusion Model") must stay untouched.
+            assert (
+                ".gguf"
+                not in FOLDER_PATHS.folder_names_and_paths["diffusion_models"][1]
+            )
+        finally:
+            FOLDER_PATHS.folder_names_and_paths["diffusion_models"][0].remove(tmp)
+
+
+# --- Bug 4: enable_cache_dit was silently ignored for non-H3 models --------
+
+
+def test_enable_cache_dit_applies_to_every_executor_not_just_h3():
+    from sgld_bugfix_under_test.executors.base import SGLDiffusionExecutor
+
+    class _DummyConfig:
+        unet_config = {"dtype": torch.float32}
+
+    class _DummyAdapter:
+        pass
+
+    class _DummyExecutor(SGLDiffusionExecutor):
+        adapter_cls = _DummyAdapter
+
+        def should_suppress_logs(self, timestep):
+            return False
+
+    class _Packed:
+        guidance_scale = 1.0
+        height = 8
+        width = 8
+
+    executor = _DummyExecutor(
+        generator=None, model_path="x", model=None, config=_DummyConfig()
+    )
+    executor.enable_cache_dit = True
+
+    kwargs = executor._sampling_params_kwargs(_Packed(), timestep=0)
+    assert kwargs["enable_cache_dit"] is True
+
+
+# --- Bug 5: detection failure returned bare None, causing a confusing TypeError
+
+
+def test_get_comfyui_model_raises_clear_error_instead_of_returning_none():
+    gen = GENERATOR.SGLDiffusionGenerator()
+
+    class _FakeConfig:
+        supported_inference_dtypes = [torch.float32]
+
+        def set_inference_dtype(self, *a, **k):
+            pass
+
+    model_detection = sys.modules["comfy.model_detection"]
+    model_management = sys.modules["comfy.model_management"]
+    comfy_utils = sys.modules["comfy.utils"]
+    model_detection.unet_prefix_from_state_dict = lambda sd: ""
+    model_detection.detect_unet_config = lambda sd, key: {"image_model": "flux"}
+    model_detection.model_config_from_unet = lambda sd, key: None
+    model_detection.convert_diffusers_mmdit = lambda sd, key: None
+    model_detection.model_config_from_diffusers_unet = lambda sd: None
+    model_management.get_torch_device = lambda: "cpu"
+    comfy_utils.calculate_parameters = lambda sd: 1
+    comfy_utils.state_dict_prefix_replace = lambda sd, *a, **k: sd
+
+    with mock.patch.object(
+        GENERATOR, "_load_state_dict_for_detection", return_value={"x": 1}
+    ):
+        gen.pipeline_class_dict = {"flux": "FluxPipeline"}
+
+        with pytest.raises(ValueError, match="Could not build a model config"):
+            gen.get_comfyui_model("/tmp/model.safetensors")
+
+
+# --- Bug 12: VRAM accounting was 0 for qwen_image/minimax_h3, hardcoded for others
+
+
+def test_model_size_uses_real_computed_size_for_every_model_type():
+    patcher_h3 = SGLDModelPatcher(
+        model=object(),
+        load_device="cpu",
+        offload_device="cpu",
+        size=13_000_000_000,
+        model_type="minimax_h3",
+    )
+    assert patcher_h3.model_size() == 13_000_000_000
+
+    patcher_qwen = SGLDModelPatcher(
+        model=object(),
+        load_device="cpu",
+        offload_device="cpu",
+        size=20_000_000_000,
+        model_type="qwen_image",
+    )
+    assert patcher_qwen.model_size() == 20_000_000_000
+
+
+def test_gguf_model_size_comes_from_the_gguf_file_not_the_bf16_companion():
+    """Regression for a bug introduced while fixing #12: load_model used to
+    size a GGUF load from the BF16 companion's header (needed only for
+    ComfyUI's architecture detect), wildly overstating VRAM use for the one
+    case GGUF quantization exists to reduce.
+    """
+    gen = GENERATOR.SGLDiffusionGenerator()
+    gen.pipeline_class_dict = {"flux": "FluxPipeline"}
+    gen.executor_class_dict = {"flux": mock.MagicMock()}
+
+    with tempfile.TemporaryDirectory() as tmp:
+        companion = os.path.join(tmp, "flux1-dev.safetensors")
+        with open(companion, "wb") as fh:
+            fh.write(b"\x00" * 10_000_000)  # stand-in for a ~27GB real file
+        gguf_path = os.path.join(tmp, "flux1-schnell-Q4.gguf")
+        with open(gguf_path, "wb") as fh:
+            fh.write(b"\x00" * 4_000_000)  # much smaller, as real GGUF quant is
+
+        fake_config = mock.MagicMock()
+        model_management = sys.modules["comfy.model_management"]
+        model_management.get_torch_device = lambda: "cpu"
+        model_management.unet_offload_device = lambda: "cpu"
+        fake_patcher_module = sys.modules[f"{PKG}.core.model_patcher"]
+        with (
+            mock.patch.object(
+                gen,
+                "get_comfyui_model",
+                return_value=(
+                    mock.MagicMock(),
+                    fake_config,
+                    "flux",
+                    999_999_999_999,  # size computed from the (large) companion
+                ),
+            ),
+            mock.patch.object(gen, "init_generator", return_value=mock.MagicMock()),
+            mock.patch.object(
+                fake_patcher_module,
+                "SGLDModelPatcher",
+                side_effect=lambda model, *a, **k: mock.MagicMock(size=k.get("size")),
+            ),
+        ):
+            patcher = gen.load_model(gguf_path)
+        gguf_size = os.path.getsize(gguf_path)
+
+    assert patcher.size == gguf_size
+    assert patcher.size != 999_999_999_999
+
+
+def test_model_size_falls_back_to_table_only_when_size_unknown():
+    patcher = SGLDModelPatcher(
+        model=object(),
+        load_device="cpu",
+        offload_device="cpu",
+        size=0,
+        model_type="flux",
+    )
+    assert patcher.model_size() == 27 * 1024 * 1024 * 1024
+
+
+# --- Bug 9: hardcoded 300s timeout on image requests -----------------------
+
+
+def test_image_timeout_is_configurable():
+    client = SGLDiffusionServerAPI(base_url="http://127.0.0.1:1234", image_timeout=900)
+    captured = {}
+
+    def fake_post(url, json=None, headers=None, timeout=None, **kwargs):
+        captured["timeout"] = timeout
+        return _Response({"data": [{"b64_json": "x"}]})
+
+    with mock.patch(f"{PKG}.core.server_api.requests.post", side_effect=fake_post):
+        client.generate_image(prompt="a cat")
+
+    assert captured["timeout"] == 900
+
+
+# --- Bug 10: batched image inputs were silently truncated to image[0] ------
+
+
+def test_get_image_path_rejects_batches_instead_of_dropping_them():
+    batch = torch.zeros(3, 8, 8, 3)
+    with pytest.raises(ValueError, match="batch of 3 images"):
+        UTILS.get_image_path(batch)
+
+
+def test_get_image_path_accepts_single_image():
+    single = torch.zeros(1, 8, 8, 3)
+    path = UTILS.get_image_path(single)
+    assert os.path.exists(path)
+    os.remove(path)
+
+
+# --- Bug 11: LoRA strength could not be set in server mode -----------------
+
+
+def test_set_lora_sends_strength_to_server():
+    client = SGLDiffusionServerAPI(base_url="http://127.0.0.1:1234")
+    captured = {}
+
+    def fake_post(url, json=None, headers=None, timeout=None, **kwargs):
+        captured.update(json)
+        return _Response({"status": "ok"})
+
+    with mock.patch(f"{PKG}.core.server_api.requests.post", side_effect=fake_post):
+        client.set_lora(
+            lora_nickname="style", lora_path="style.safetensors", strength=0.7
+        )
+
+    assert captured["strength"] == 0.7
+
+
+def test_set_lora_node_exposes_strength(monkeypatch):
+    client = SGLDiffusionServerAPI(base_url="http://127.0.0.1:1234")
+    node = NODES.SGLDiffusionServerSetLora()
+    captured = {}
+
+    def fake_set_lora(**kwargs):
+        captured.update(kwargs)
+        return {"status": "ok"}
+
+    monkeypatch.setattr(client, "set_lora", fake_set_lora)
+    node.set_lora(sgld_client=client, lora_name="style.safetensors", strength=0.5)
+    assert captured["strength"] == 0.5
+
+
+# --- Bug 6/7: SGLDVideoInput didn't implement VideoInput; dims could be wrong
+
+
+def test_video_input_fallback_fails_loudly_instead_of_returning_wrong_data():
+    video = UTILS.convert_video_to_comfy_video("/tmp/out.mp4", height=720, width=1280)
+    assert isinstance(video, UTILS.SGLDVideoInput)  # no comfy_api.input_impl stubbed
+    with pytest.raises(NotImplementedError):
+        video.get_components()
+
+
+def test_video_input_save_to_refuses_silent_format_drop():
+    video = UTILS.SGLDVideoInput("/tmp/out.mp4", height=720, width=1280)
+    with pytest.raises(NotImplementedError):
+        video.save_to("/tmp/converted.webm", format="webm")
+
+
+def test_generic_video_node_reports_server_resolved_size_not_requested_size():
+    client = SGLDiffusionServerAPI(base_url="http://127.0.0.1:1234")
+    node = NODES.SGLDiffusionGenerateVideo()
+
+    with (
+        mock.patch.object(
+            client,
+            "generate_video",
+            return_value={"file_path": "/tmp/x.mp4", "size": "1280x704"},
+        ),
+    ):
+        video, video_path = node.generate_video(
+            sgld_client=client,
+            positive_prompt="a cat",
+            width=1280,
+            height=720,  # requested 720, server actually resolved to 704
+        )
+    assert video.get_dimensions() == (1280, 704)
+
+
+# --- Bug 3: server-mode nodes sent local paths a remote server can't read --
+
+
+def test_generate_video_uploads_local_input_reference_instead_of_sending_path():
+    client = SGLDiffusionServerAPI(base_url="http://127.0.0.1:1234")
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as fh:
+        fh.write(b"fake-png-bytes")
+        local_image = fh.name
+
+    seen = {}
+
+    def fake_post(url, json=None, headers=None, timeout=None, files=None, data=None):
+        seen["files"] = files
+        seen["data"] = data
+        seen["json"] = json
+        return _Response({"id": "job-1"})
+
+    out_path = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False).name
+
+    def fake_get(url, headers=None, timeout=None, **kwargs):
+        return _Response({"id": "job-1", "status": "completed", "file_path": out_path})
+
+    with (
+        mock.patch(f"{PKG}.core.server_api.requests.post", side_effect=fake_post),
+        mock.patch(f"{PKG}.core.server_api.requests.get", side_effect=fake_get),
+    ):
+        client.generate_video(prompt="a cat", input_reference=local_image)
+
+    os.remove(local_image)
+    # A local path must be uploaded as file bytes, not sent as a path string
+    # the server (possibly on another machine) has no way to read.
+    assert seen["files"] is not None
+    assert seen["json"] is None
+
+
+def test_generate_video_downloads_result_when_server_path_is_not_local():
+    client = SGLDiffusionServerAPI(base_url="http://127.0.0.1:1234")
+
+    def fake_post(url, **kwargs):
+        return _Response({"id": "job-1"})
+
+    def fake_get(url, headers=None, timeout=None, stream=False, **kwargs):
+        if url.endswith("/content"):
+            return _Response({}, status_code=200)
+        return _Response(
+            {
+                "id": "job-1",
+                "status": "completed",
+                # A path on the *server's* filesystem, not this one.
+                "file_path": "/srv/sglang/outputs/job-1.mp4",
+            }
+        )
+
+    with tempfile.TemporaryDirectory() as out_dir:
+        with (
+            mock.patch(f"{PKG}.core.server_api.requests.post", side_effect=fake_post),
+            mock.patch(f"{PKG}.core.server_api.requests.get", side_effect=fake_get),
+        ):
+            result = client.generate_video(prompt="a cat", output_path=out_dir)
+
+        assert os.path.exists(result["file_path"])
+        assert os.path.dirname(result["file_path"]) == out_dir
+
+
+def test_h3_image_conditions_use_data_uri_not_local_file_path():
+    node = NODES.SGLDiffusionGenerateH3()
+    image = torch.zeros(1, 8, 8, 3)
+    uri = node._image_material_uri(image)
+    assert uri.startswith("data:image/png;base64,")
+
+
+def test_h3_rejects_local_video_reference_against_remote_server():
+    with pytest.raises(ValueError, match="no way to read or upload"):
+        NODES.SGLDiffusionGenerateH3._remote_material_uri(
+            "/data/clip.mp4", "reference_video", "http://remote-host.example:3000/v1"
+        )
+
+
+def test_h3_allows_local_video_reference_against_local_server():
+    uri = NODES.SGLDiffusionGenerateH3._remote_material_uri(
+        "/data/clip.mp4", "reference_video", "http://127.0.0.1:3000/v1"
+    )
+    assert uri == "file:///data/clip.mp4"
+
+
+# --- ComfyUI "Unload models" never reached the SGLD worker ------------------
+
+
+class _FakeWorkerOwner:
+    """Stands in for SGLDiffusionGenerator as the patcher's worker handle."""
+
+    def __init__(self, asleep=False):
+        self.worker_asleep = asleep
+        self.calls = []
+
+    def sleep_worker(self, token=None):
+        self.calls.append("sleep")
+        self.worker_asleep = True
+
+    def wake_worker(self):
+        self.calls.append("wake")
+        self.worker_asleep = False
+
+
+def _make_patcher(owner, size=20 * 2**30):
+    return SGLDModelPatcher(
+        torch.nn.Module(),
+        torch.device("cpu"),
+        torch.device("cpu"),
+        size=size,
+        model_type="qwen_image",
+        worker=owner,
+    )
+
+
+def test_detach_puts_the_worker_to_sleep():
+    owner = _FakeWorkerOwner()
+    _make_patcher(owner).detach()
+    assert owner.calls == ["sleep"]
+
+
+def test_loaded_size_counts_worker_vram_only_while_awake():
+    owner = _FakeWorkerOwner()
+    patcher = _make_patcher(owner, size=7)
+    assert patcher.loaded_size() == 7
+    owner.worker_asleep = True
+    assert patcher.loaded_size() == 0
+
+
+def test_cloned_patcher_keeps_the_worker_handle():
+    owner = _FakeWorkerOwner()
+    _make_patcher(owner).clone().detach()
+    assert owner.calls == ["sleep"]
+
+
+def _live_generator(monkeypatch, responses=None):
+    gen = GENERATOR.SGLDiffusionGenerator()
+    sent = []
+
+    class _Gen:
+        def _send_to_scheduler_and_wait_for_response(self, reqs):
+            sent.append(type(reqs[0]).__name__)
+            return types.SimpleNamespace(
+                error=None, output={"success": True, "sleeping": True}
+            )
+
+    gen.generator = _Gen()
+    gen._patcher = object()
+    monkeypatch.setattr(gen, "_is_live", lambda: True)
+
+    io_struct = types.ModuleType(
+        "sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct"
+    )
+    io_struct.ReleaseMemoryOccupationReqInput = type(
+        "ReleaseMemoryOccupationReqInput", (), {}
+    )
+    io_struct.ResumeMemoryOccupationReqInput = type(
+        "ResumeMemoryOccupationReqInput", (), {}
+    )
+    monkeypatch.setitem(sys.modules, io_struct.__name__, io_struct)
+    return gen, sent
+
+
+def test_generator_sleep_and_wake_send_the_scheduler_requests(monkeypatch):
+    gen, sent = _live_generator(monkeypatch)
+    gen.sleep_worker(gen.generator)
+    gen.sleep_worker(gen.generator)  # already asleep: no second request
+    assert sent == ["ReleaseMemoryOccupationReqInput"]
+    assert gen.worker_asleep
+    gen.wake_worker()
+    gen.wake_worker()
+    assert sent[1:] == ["ResumeMemoryOccupationReqInput"]
+    assert not gen.worker_asleep
+
+
+def test_generator_ignores_sleep_from_a_stale_patcher(monkeypatch):
+    gen, sent = _live_generator(monkeypatch)
+    gen.sleep_worker(object())  # token of a worker that was replaced
+    assert sent == []
+    assert not gen.worker_asleep
+
+
+def test_generator_does_not_sleep_a_dead_worker(monkeypatch):
+    gen, sent = _live_generator(monkeypatch)
+    monkeypatch.setattr(gen, "_is_live", lambda: False)
+    gen.sleep_worker(gen.generator)
+    assert sent == []
+
+
+def test_ensure_executor_wakes_a_sleeping_worker(monkeypatch):
+    gen, sent = _live_generator(monkeypatch)
+    executor = types.SimpleNamespace(generator=gen.generator)
+    gen.sleep_worker(gen.generator)
+    gen.ensure_executor(executor)
+    assert sent == [
+        "ReleaseMemoryOccupationReqInput",
+        "ResumeMemoryOccupationReqInput",
+    ]
+
+
+# --- server-mode video jobs: no progress bar, Cancel was ignored ------------
+
+
+def _video_client_with_statuses(statuses):
+    client = SGLDiffusionServerAPI(base_url="http://127.0.0.1:1234")
+    polled = iter(statuses)
+
+    def fake_get(url, **kwargs):
+        return _Response(next(polled))
+
+    def fake_post(url, **kwargs):
+        return _Response({"id": "vid1"})
+
+    return client, fake_get, fake_post
+
+
+def test_generate_video_reports_server_progress():
+    client, fake_get, fake_post = _video_client_with_statuses(
+        [
+            {"status": "queued", "progress": 0},
+            {"status": "in_progress", "progress": 40},
+            {"status": "completed", "progress": 100, "file_path": "/tmp/x.mp4"},
+        ]
+    )
+    seen = []
+    with (
+        mock.patch.object(SERVER_API.requests, "get", fake_get),
+        mock.patch.object(SERVER_API.requests, "post", fake_post),
+        mock.patch.object(SERVER_API.time, "sleep"),
+        mock.patch.object(client, "_localize_video_result", lambda s, *a: s),
+    ):
+        client.generate_video(prompt="a cat", progress_callback=seen.append)
+    assert seen == [0, 40, 100]
+
+
+def test_generate_video_stops_polling_when_interrupted():
+    client, fake_get, fake_post = _video_client_with_statuses(
+        [{"status": "in_progress", "progress": 10}] * 50
+    )
+    checks = {"n": 0}
+
+    class Interrupted(Exception):
+        pass
+
+    def check_interrupt():
+        checks["n"] += 1
+        if checks["n"] > 2:
+            raise Interrupted()
+
+    with (
+        mock.patch.object(SERVER_API.requests, "get", fake_get),
+        mock.patch.object(SERVER_API.requests, "post", fake_post),
+        mock.patch.object(SERVER_API.time, "sleep"),
+    ):
+        with pytest.raises(Interrupted):
+            client.generate_video(prompt="a cat", check_interrupt=check_interrupt)
+    assert checks["n"] == 3  # stopped promptly, did not poll to completion
+
+
+def test_video_node_wires_comfy_progress_bar_and_interrupt():
+    client = SGLDiffusionServerAPI(base_url="http://127.0.0.1:1234")
+    node = NODES.SGLDiffusionGenerateVideo()
+    captured = {}
+
+    def fake_generate_video(**kwargs):
+        captured.update(kwargs)
+        return {"file_path": "/tmp/x.mp4", "size": "1280x720"}
+
+    with mock.patch.object(client, "generate_video", fake_generate_video):
+        node.generate_video(
+            sgld_client=client, positive_prompt="a cat", width=1280, height=720
+        )
+    captured["progress_callback"](55)
+    assert sys.modules["comfy.utils"].ProgressBar.instances[-1].values == [55]
+    sys.modules["comfy.model_management"]._test_interrupt["flag"] = True
+    try:
+        with pytest.raises(
+            sys.modules["comfy.model_management"].InterruptProcessingException
+        ):
+            captured["check_interrupt"]()
+    finally:
+        sys.modules["comfy.model_management"]._test_interrupt["flag"] = False
+
+
+def test_set_lora_wakes_a_sleeping_worker(monkeypatch):
+    gen, sent = _live_generator(monkeypatch)
+    gen.generator.set_lora = lambda **kw: sent.append("set_lora")
+    executor = object.__new__(GENERATOR.FluxExecutor)
+    executor.generator = gen.generator
+    executor._ensure_runtime = gen.ensure_executor
+    gen.sleep_worker(gen.generator)
+    executor.set_lora(lora_nickname="a", lora_path="/x.safetensors")
+    assert sent[-2:] == ["ResumeMemoryOccupationReqInput", "set_lora"]
+
+
+def test_clone_of_live_patcher_still_sleeps_the_real_generator(monkeypatch):
+    gen, sent = _live_generator(monkeypatch)
+    patcher = SGLDModelPatcher(
+        torch.nn.Module(),
+        torch.device("cpu"),
+        torch.device("cpu"),
+        size=1,
+        worker=gen,
+        worker_token=gen.generator,
+    )
+    patcher.clone().detach()
+    assert sent == ["ReleaseMemoryOccupationReqInput"]
+
+
+def test_partially_unload_has_no_side_effects():
+    patcher = _make_patcher(_FakeWorkerOwner())
+    assert patcher.partially_unload(torch.device("cpu"), 123) == 0
