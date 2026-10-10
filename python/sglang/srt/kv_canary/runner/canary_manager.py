@@ -133,10 +133,10 @@ class CanaryManager:
             sweep_interval=config.sweep_interval,
         )
         self._health_checker = KernelRunCounterHealthChecker(
-            config=config,
             device_state=self._device_state,
             active_tags=self._active_tags,
             outer_step_counter_getter=self._get_outer_step_counter,
+            sweep_orchestrator=self._sweep_orchestrator,
             d2h_stream=self._d2h_stream,
         )
         self._stats_logger = PeriodicCanaryStatsLogger(

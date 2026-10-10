@@ -7,9 +7,9 @@ from typing import Optional
 import torch
 
 from sglang.kernels.ops.kv_canary.verify import CanaryLaunchTag
-from sglang.srt.kv_canary.config import CanaryConfig
 from sglang.srt.kv_canary.runner.future_tensor import DelayedDeviceHostHandler
 from sglang.srt.kv_canary.runner.kernel_launcher import passes_v_half_gate
+from sglang.srt.kv_canary.runner.sweep import SweepOrchestrator
 from sglang.srt.kv_canary.state import CanaryDeviceState
 
 logger = logging.getLogger(__name__)
@@ -30,16 +30,16 @@ class KernelRunCounterHealthChecker:
     def __init__(
         self,
         *,
-        config: CanaryConfig,
         device_state: CanaryDeviceState,
         active_tags: tuple[CanaryLaunchTag, ...],
         outer_step_counter_getter: Callable[[], int],
+        sweep_orchestrator: SweepOrchestrator,
         d2h_stream: torch.Stream,
     ) -> None:
-        self._config = config
         self._device_state = device_state
         self._active_tags = active_tags
         self._outer_step_counter_getter = outer_step_counter_getter
+        self._sweep_orchestrator = sweep_orchestrator
         self._handler = DelayedDeviceHostHandler(d2h_stream=d2h_stream)
         self._prev_counters_host: torch.Tensor = torch.zeros_like(
             device_state.kernel_run_counters, device="cpu"
@@ -76,6 +76,6 @@ class KernelRunCounterHealthChecker:
 
     def _expected_active_tags_for_health_check(self) -> tuple[CanaryLaunchTag, ...]:
         tags = self._active_tags
-        if self._config.sweep_interval <= 0:
+        if not self._sweep_orchestrator.is_enabled:
             tags = tuple(tag for tag in tags if tag not in _SWEEP_TAGS)
         return tuple(tag for tag in tags if passes_v_half_gate(tag))
