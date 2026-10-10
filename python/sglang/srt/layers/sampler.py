@@ -450,6 +450,7 @@ class Sampler(nn.Module):
                     sampling_info.sampling_seed,
                     positions,
                     return_filtered_probs=return_sampling_mask,
+                    max_top_k=sampling_info.max_top_k,
                 )
                 if return_sampling_mask:
                     (
@@ -759,6 +760,7 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
     positions: torch.Tensor,
     *,
     return_filtered_probs: bool = False,
+    max_top_k: Optional[int] = None,
 ):
     """
     A top-k, top-p and min-p sampling implementation with native pytorch operations.
@@ -768,11 +770,26 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
     By default, returns only sampled token IDs. With return_filtered_probs=True,
     also returns the actual filtered weights, their token-ID permutation, and
     the selected weights.
+
+    max_top_k, when given, must be >= every value in top_ks.
     """
-    probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
+    # The top-k mask below zeroes every column at rank >= top_k, so the max_top_k
+    # leading columns carry all the mass that survives and sorting only those is
+    # exact. The seeded path keeps the full sort because the order of tied
+    # probabilities may depend on k, which is a batch-wide value, and
+    # deterministic inference must not depend on the batch composition.
+    if (
+        max_top_k is not None
+        and max_top_k < probs.shape[-1]
+        and sampling_seed is None
+        and not return_filtered_probs
+    ):
+        probs_sort, probs_idx = torch.topk(probs, k=max_top_k, dim=-1, sorted=True)
+    else:
+        probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
     probs_sum = torch.cumsum(probs_sort, dim=-1)
     probs_sort[
-        torch.arange(0, probs.shape[-1], device=probs.device).view(1, -1)
+        torch.arange(0, probs_sort.shape[-1], device=probs.device).view(1, -1)
         >= top_ks.view(-1, 1)
     ] = 0.0
     probs_sort[(probs_sum - probs_sort) > top_ps.view(-1, 1)] = 0.0
