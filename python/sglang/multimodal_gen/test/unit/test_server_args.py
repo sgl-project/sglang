@@ -1173,6 +1173,79 @@ class TestDiffusionModelDetection(unittest.TestCase):
             os.mkdir(model_path)
             self.assertTrue(get_is_diffusion_model(model_path))
 
+    def test_detection_does_not_discover_the_pipeline_runtime(self):
+        """Detection must answer without importing the diffusion pipelines.
+
+        Discovery imports every built-in pipeline module, and each one loads the
+        accelerator libraries it bundles. Detection runs in the CLI process
+        before a backend has been chosen, so on Ascend that put a second copy of
+        libcust_opapi.so next to CANN's in the process about to serve an LLM,
+        breaking operator registration. Detection therefore has to work from the
+        path aliases registered at import time.
+        """
+        from sglang.multimodal_gen import registry as diffusion_registry
+
+        with tempfile.TemporaryDirectory() as root:
+            model_path = os.path.join(root, "Z-Image-Turbo")
+            os.mkdir(model_path)
+            with ExitStack() as stack:
+                # Force discovery to be pending and the registry to be empty, so
+                # that triggering it would actually repopulate the registry.
+                stack.enter_context(
+                    patch.object(
+                        diffusion_registry, "_BUILTIN_PIPELINES_DISCOVERED", False
+                    )
+                )
+                stack.enter_context(
+                    patch.dict(diffusion_registry._PIPELINE_REGISTRY, clear=True)
+                )
+
+                self.assertTrue(get_is_diffusion_model(model_path))
+                self.assertEqual(
+                    dict(diffusion_registry._PIPELINE_REGISTRY),
+                    {},
+                    "detection registered pipeline classes, so the diffusion "
+                    "runtime was imported into this process",
+                )
+
+    def test_pipeline_discovery_contributes_no_model_path_aliases(self):
+        """Skipping discovery in detection is only safe while this holds.
+
+        Detection answers from the path aliases present at registry-import time
+        and deliberately never runs pipeline discovery. That is correct exactly
+        as long as discovery contributes no aliases: if a future change moves
+        alias registration behind discovery, detection would start missing
+        registered models and silently route them to the LLM backend, with no
+        other test noticing.
+        """
+        from sglang.multimodal_gen import registry as diffusion_registry
+
+        aliases_before = set(diffusion_registry._MODEL_HF_PATH_TO_NAME)
+        patterns_before = set(
+            diffusion_registry.KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS
+        )
+
+        with ExitStack() as stack:
+            # Force discovery to actually run rather than early-return.
+            stack.enter_context(
+                patch.object(diffusion_registry, "_BUILTIN_PIPELINES_DISCOVERED", False)
+            )
+            stack.enter_context(patch.dict(diffusion_registry._PIPELINE_REGISTRY))
+            diffusion_registry._discover_and_register_pipelines()
+
+        added_aliases = set(diffusion_registry._MODEL_HF_PATH_TO_NAME) - aliases_before
+        self.assertEqual(
+            added_aliases,
+            set(),
+            "pipeline discovery now registers model path aliases, so detection "
+            "can no longer skip it",
+        )
+        self.assertEqual(
+            set(diffusion_registry.KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS)
+            - patterns_before,
+            set(),
+        )
+
 
 class TestMiniMaxH3Routing(unittest.TestCase):
     def test_semantic_variants_map_to_checkpoint_partitions(self):

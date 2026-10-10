@@ -357,7 +357,18 @@ def _normalize_hf_cache_path(path: str) -> str:
 
 
 def has_registered_diffusion_model_path(model_path: str) -> bool:
-    _ensure_registry_initialized()
+    # Answer from the path aliases registered at import time. Detection runs in
+    # the CLI process before a backend has been chosen, and
+    # _ensure_registry_initialized() would discover and import every built-in
+    # runtime pipeline there, dragging their accelerator libraries into a
+    # process that is about to serve an LLM. On Ascend that loads a second copy
+    # of libcust_opapi.so alongside CANN's, which conflicts with the operator
+    # registration of the LLM runtime. An operator that actually serves
+    # diffusion still reaches _ensure_registry_initialized() through
+    # get_pipeline_class()/get_pipeline_config_classes().
+    # Only an explicitly configured external package is loaded here, so
+    # SGLANG_EXTERNAL_MODEL_PACKAGE models stay detectable.
+    load_external_model_package()
     all_model_hf_paths = sorted(_MODEL_HF_PATH_TO_NAME.keys(), key=len, reverse=True)
 
     if is_sensenova_u1_model(model_path):
