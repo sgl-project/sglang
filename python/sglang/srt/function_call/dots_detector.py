@@ -353,3 +353,15 @@ class DotsToolDetector(BaseFormatDetector):
             end=f"}}{self.eot_token}",
             trigger=self.bot_token,
         )
+
+    def finish(self, tools):
+        normal = ""
+        if self._buffer:
+            leftover = self._buffer
+            if leftover.strip() == self.eot_token:
+                # A trailing closing tag is syntax residue, not user text.
+                self._buffer = ""
+            else:
+                normal = leftover
+                self._buffer = ""
+        return StreamingParseResult(normal_text=normal, calls=[])
