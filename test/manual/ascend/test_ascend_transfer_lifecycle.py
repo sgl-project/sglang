@@ -5,9 +5,6 @@ from unittest.mock import Mock
 from sglang.srt.disaggregation.ascend.conn import AscendKVManager
 from sglang.srt.disaggregation.ascend.transfer_engine import AscendTransferEngine
 from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.test.ci.ci_register import register_cpu_ci
-
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class TestAscendTransferLifecycle(unittest.TestCase):
