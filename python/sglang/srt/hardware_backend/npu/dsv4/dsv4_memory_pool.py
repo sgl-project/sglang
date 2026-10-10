@@ -9,7 +9,7 @@ rules as the GPU implementation:
 
 ``NPUCompressStatePool`` adds the contiguous 3-D view and positive dummy
 location required by the Atlas fused compressor operators. A3 uses explicit
-locations; arch35 uses the same ring storage through its request-bank (cycle) ABI.
+locations; Ascend 950 uses the same ring storage through its request-bank (cycle) ABI.
 There is no paged state allocator or ``cache_mode=1`` compatibility storage.
 """
 
@@ -42,7 +42,7 @@ class NPUDeepSeekV4SingleKVPool(DeepSeekV4SingleKVPool):
 
     ``npu_sparse_attn_sharedkv`` reads KV in PA_ND layout
     ``(num_pages, kernel_page_size, num_kv_heads=1, dim)`` with ``dim`` packing
-    K_nope + K_rope as bf16 before arch35; arch35 uses packed FP8 KV rows. C4 uses its
+    K_nope + K_rope as bf16 before Ascend 950; Ascend 950 uses packed FP8 KV rows. C4 uses its
     native page so its physical page id can
     be shared with the corresponding full page. C128 uses its independently
     configured physical page size; Full/SWA use the global page size.
@@ -341,8 +341,8 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         )
         config = self.compressed_pool_configs[ratio]
         ring_size = self.get_ring_size(ratio)
-        # arch35 cache_mode=2 addresses one ring bank per request.  The A3
-        # explicit-location path can share the smaller flat pool, but the arch35
+        # Ascend 950 cache_mode=2 addresses one ring bank per request.  The A3
+        # explicit-location path can share the smaller flat pool, but the Ascend 950
         # cycle ABI needs enough physical banks for every req_pool_idx.
         size = config.state_size
         if is_npu_arch35():
@@ -402,9 +402,9 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
     def get_state_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         """GPU-compatible ``StateType.SWA`` component.
 
-        On pre-arch35 (EXPLICIT cache_mode), SWA KV, C4 attention state and C4
+        On pre-Ascend 950 (EXPLICIT cache_mode), SWA KV, C4 attention state and C4
         indexer state retain separate buffers but share the same SWA page/state
-        index.  On arch35 (CYCLE cache_mode) the compressor addresses the C4 state
+        index.  On Ascend 950 (CYCLE cache_mode) the compressor addresses the C4 state
         ring by ``req_pool_idx`` instead of SWA page, so C4 state is excluded
         here and registered separately via :meth:`get_c4_state_buf_infos`.
         """
@@ -466,7 +466,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
     def get_state_cache(self, layer_id: int, from_indexer: bool) -> torch.Tensor:
         """FP32 ``[block_num, ring_size, 2*coff*D]`` view of this layer's
         kv+score buffer — the fused compressor op
-        (``torch.ops.custom.compressor`` on arch35 and ``torch.ops.npu.compressor``
+        (``torch.ops.custom.compressor`` on Ascend 950 and ``torch.ops.npu.compressor``
         elsewhere)'s ``state_cache`` argument."""
         return self._get_state_pool(layer_id, from_indexer).state_cache_3d
 
@@ -575,14 +575,14 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         cache_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         if cache.shape[-1] != cache_dim:
             raise RuntimeError(
-                f"DSV4 arch35 KV cache expects input last dim {cache_dim}, "
+                f"DSV4 Ascend 950 KV cache expects input last dim {cache_dim}, "
                 f"got shape={tuple(cache.shape)}."
             )
         cache_2d = cache.reshape(-1, cache_dim).to(torch.bfloat16).contiguous()
         slot_mapping = loc.reshape(-1).contiguous()
         if cache_2d.shape[0] != slot_mapping.shape[0]:
             raise RuntimeError(
-                "DSV4 arch35 KV cache write expects one slot per token, got "
+                "DSV4 Ascend 950 KV cache write expects one slot per token, got "
                 f"{cache_2d.shape[0]} rows and {slot_mapping.shape[0]} slots."
             )
         if cache_2d.shape[0] == 0:
@@ -681,7 +681,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         layer_id: int,
         from_indexer: bool,
     ) -> torch.Tensor:
-        # The indexer scale is fp16 on pre-arch35 parts and fp32 on arch35.
+        # The indexer scale is fp16 on pre-Ascend 950 parts and fp32 on Ascend 950.
         assert from_indexer, "only indexer compress pool has dequant scale"
         item = self.layer_mapping[layer_id]
         indexer_pool = self._indexer_pool(item.compress_ratio)

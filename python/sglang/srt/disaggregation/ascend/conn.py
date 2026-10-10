@@ -26,7 +26,7 @@ class AscendStateType(str, enum.Enum):
 
     DSV4_C128 = "dsv4_c128"
     # C4 compress-state rows (attention + indexer) addressed within each
-    # req_pool_idx bank on arch35 (CYCLE cache_mode).  Separate from StateType.SWA
+    # req_pool_idx bank on Ascend 950 (CYCLE cache_mode).  Separate from StateType.SWA
     # because each peer maps logical positions into its own local ring.
     DSV4_C4_STATE = "dsv4_c4_state"
 
@@ -103,7 +103,7 @@ class AscendKVManager(MooncakeKVManager):
                     dst.extend(dst_kv_ptrs[offset + c4_start : offset + c4_end])
                 return src_kv_ptrs, dst, len(src_kv_ptrs)
 
-            # On arch35 (CYCLE cache_mode), StateType.SWA only contains SWA KV
+            # On Ascend 950 (CYCLE cache_mode), StateType.SWA only contains SWA KV
             # buffers (C4 compress state is registered separately as
             # DSV4_C4_STATE).  The common _mla_slice_ptrs_for_pp assumes
             # SWA + C4 state are bundled (swa_L + 2*c4_full), so intercept

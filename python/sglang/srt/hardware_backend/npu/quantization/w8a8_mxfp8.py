@@ -9,7 +9,7 @@ _NPU_ARCH35_MXFP8_BLOCK_SIZE = 32
 def process_npu_arch35_mxfp8_linear_weights(
     layer: Module, weight_block_size: List[int], scale_fmt: Optional[str]
 ) -> None:
-    """Convert a linear layer's weights to the NPU arch35 MXFP8 layout.
+    """Convert a linear layer's weights to the NPU Ascend 950 MXFP8 layout.
 
     UE8M0 checkpoints (scales already powers of two) only need re-layout:
     the 128-group scale can be duplicated to its 1x32 sub-groups exactly.
@@ -50,7 +50,7 @@ def _layout_npu_arch35_e4m3_weights(
 
     Dequantizes the fp8 payload with the expanded block scales to BF16, then
     requantizes to MXFP8 (fp8 payload + 1x32 UE8M0 scale via
-    npu_dynamic_mx_quant) so the native arch35 quantized GEMM
+    npu_dynamic_mx_quant) so the native Ascend 950 quantized GEMM
     (``npu_w8a8_mxfp8_linear``) can run the layer. Chunked over rows to cap
     peak memory; runs once at load time.
     """
@@ -60,7 +60,7 @@ def _layout_npu_arch35_e4m3_weights(
     n_dim, k_dim = weight.shape
     if k_dim % (2 * group_size) != 0:
         raise ValueError(
-            "NPU arch35 MXFP8 linear requires K to be divisible by "
+            "NPU Ascend 950 MXFP8 linear requires K to be divisible by "
             f"{2 * group_size}, got {k_dim}."
         )
     device = f"npu:{torch.npu.current_device()}"
@@ -98,7 +98,7 @@ def _layout_npu_arch35_e4m3_weights(
 
     # Layout mirrors _layout_npu_arch35_ue8m0_weights: weight [in, out] and
     # scale [in//64, out, 2] as strided transpose views — DO NOT call
-    # .contiguous() (the arch35 kernel scans the row-major source K-major).
+    # .contiguous() (the Ascend 950 kernel scans the row-major source K-major).
     layer.weight.data = qw.transpose(0, 1)
     if w_scale.dim() == 2:
         # Older torch_npu builds return [out, in//32]; reshape to 3D.
@@ -119,7 +119,7 @@ def _layout_npu_arch35_ue8m0_weights(
         )
     if k_dim % (2 * group_size) != 0:
         raise ValueError(
-            "NPU arch35 MXFP8 linear requires K to be divisible by "
+            "NPU Ascend 950 MXFP8 linear requires K to be divisible by "
             f"{2 * group_size}, got {k_dim}."
         )
 
@@ -153,7 +153,7 @@ def _layout_npu_arch35_ue8m0_weights(
     scale_u8 = scale_u8.repeat_interleave(block_k // group_size, dim=1)
     scale_u8 = scale_u8[:, : k_dim // group_size]
 
-    # Keep transpose views: the arch35 kernel expects the original row-major
+    # Keep transpose views: the Ascend 950 kernel expects the original row-major
     # storage scanned in K-major logical order.
     layer.weight.data = layer.weight.data.transpose(0, 1)
     layer.weight_scale_inv.data = scale_u8.reshape(
@@ -166,7 +166,7 @@ def _layout_npu_arch35_ue8m0_weights(
 
 
 def batch_npu_arch35_wo_a_weights(layer: Module) -> None:
-    """Reshape DSV4's ``wo_a`` for arch35 batched MXFP8 matmul.
+    """Reshape DSV4's ``wo_a`` for Ascend 950 batched MXFP8 matmul.
 
     ``npu_transpose_quant_batchmatmul`` expects weight
     ``[D, G*R] -> [G, D, R]`` and scale
@@ -180,18 +180,18 @@ def batch_npu_arch35_wo_a_weights(layer: Module) -> None:
 
     if layer.weight.shape != (hidden_dim, output_dim):
         raise ValueError(
-            "Unexpected NPU arch35 wo_a weight layout after FP8 post-processing: "
+            "Unexpected NPU Ascend 950 wo_a weight layout after FP8 post-processing: "
             f"got {tuple(layer.weight.shape)}, expected ({hidden_dim}, {output_dim})."
         )
     if layer.weight_scale_inv.shape != (scale_k64, output_dim, 2):
         raise ValueError(
-            "Unexpected NPU arch35 wo_a scale layout after FP8 post-processing: "
+            "Unexpected NPU Ascend 950 wo_a scale layout after FP8 post-processing: "
             f"got {tuple(layer.weight_scale_inv.shape)}, expected "
             f"({scale_k64}, {output_dim}, 2)."
         )
     if scale_k64 * 64 != hidden_dim:
         raise ValueError(
-            "Unexpected NPU arch35 wo_a scale K dimension: "
+            "Unexpected NPU Ascend 950 wo_a scale K dimension: "
             f"{scale_k64} packed pairs for hidden dim {hidden_dim}."
         )
 

@@ -815,7 +815,7 @@ class MqaAttentionBase(nn.Module):
             if wo_b_reduce_results is None
             else wo_b_reduce_results
         )
-        # NPU arch35 runs wo_a as a batched MXFP8 GEMM instead of deep_gemm's FP8 one,
+        # NPU Ascend 950 runs wo_a as a batched MXFP8 GEMM instead of deep_gemm's FP8 one,
         # but it needs the same quantized weights.
         self.use_npu_arch35_mxfp8_wo_a = use_npu_arch35_mxfp8_wo_a(quant_config)
         quantize_wo_a = fp8 or self.use_npu_arch35_mxfp8_wo_a
@@ -885,7 +885,7 @@ class MqaAttentionBase(nn.Module):
                 "FP8 quant_config must create weight_scale_inv"
             )
         if self.use_npu_arch35_mxfp8_wo_a:
-            # Read by the NPU arch35 MXFP8 weight processor to batch the
+            # Read by the NPU Ascend 950 MXFP8 weight processor to batch the
             # weight/scale per attention group for npu_transpose_quant_batchmatmul.
             self.wo_a._dsv4_npu_arch35_mxfp8_wo_a = True
             self.wo_a._dsv4_num_groups = self.n_local_groups
@@ -2934,7 +2934,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         if _is_npu:
             if not is_npu_arch35():
                 return torch.ops.custom.npu_hc_post(x, residual, post, comb)
-            # The arch35 build of npu_hc_post is batched — it requires a leading
+            # The Ascend 950 build of npu_hc_post is batched — it requires a leading
             # batch axis on every operand.
             return torch.ops.custom.npu_hc_post(
                 x.unsqueeze(0),

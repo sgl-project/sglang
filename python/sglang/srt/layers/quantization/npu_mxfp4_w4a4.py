@@ -12,7 +12,7 @@ L1 scale); activations are dynamically quantised the same way and the matmul run
 via ``npu_dual_level_quant_matmul`` (see :class:`NPUDualLevelMXFP4LinearMethod`).
 Dual-level is the sole online path — it captures per-block dynamic range far more
 accurately than a single-level UE8M0 scale, avoiding the RTN degradation that made
-single-level online decoding loop under greedy sampling. Requires Ascend 950 (arch35).
+single-level online decoding loop under greedy sampling. Requires Ascend 950.
 
 Offline (msmodelslim ``W4A4_MXFP4``) checkpoints are single-level (the checkpoint
 stores UE8M0 scales) and are handled separately by the ``modelslim`` config
@@ -115,7 +115,7 @@ class Mxfp4W4A4Config(QuantizationConfig):
 
                 # Online W4A4 always uses dual-level MXFP4 (finer FP8 L0 scales):
                 # single-level RTN was too lossy and degenerated under greedy
-                # decoding. Requires Ascend 950 (arch35). The single-level kernel is
+                # decoding. Requires Ascend 950. The single-level kernel is
                 # retained only for the offline msmodelslim path.
                 return NPUDualLevelMXFP4LinearMethod(self)
             raise NotImplementedError(

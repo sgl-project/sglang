@@ -36,7 +36,7 @@ def _get_float4_e2m1fn_x2_dtype():
     # torch dtype object torch.float4_e2m1fn_x2 in op-plugin on recent torch_npu
     # builds (it raises, or with None gives "output y must be same shape as input
     # x"), even though torch.float4_e2m1fn_x2 exists. This is fp4-specific: fp8 /
-    # float8_e8m0fnu is accepted from torch either way. Verified on arch35 /
+    # float8_e8m0fnu is accepted from torch either way. Verified on Ascend 950 /
     # torch_npu 2.10.0.post2.dev20260704 (see llm/probe_fp4_w4a8_chain.py: dst=296
     # passes the full quant->format_cast->matmul chain, dst=torch dtype fails).
     #
@@ -323,10 +323,10 @@ def npu_w8a8_mxfp8_linear(
     input_scale: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Block-FP8 linear on Atlas arch35, used as the ``w8a8_block_fp8_linear``
+    """Block-FP8 linear on Ascend 950, used as the ``w8a8_block_fp8_linear``
     backend on NPU (see ``fp8_utils._dispatch_auto_backend``).
 
-    The loading path requantizes block-FP8 weights into the arch35 MXFP8 layout;
+    The loading path requantizes block-FP8 weights into the Ascend 950 MXFP8 layout;
     activations are quantized per call. ``block_size`` is retained for the shared
     block-FP8 backend interface and ``input_scale`` is unused because activation
     scales are always dynamic here.
@@ -423,7 +423,7 @@ class NPUMXFP4W4A8LinearMethod(_NPULinearMethodBase):
         BF16/FP16 activation → npu_dynamic_mx_quant(dst=float8_e4m3fn)  (A8, FP8)
         → npu_quant_matmul(x2_dtype=float4_e2m1fn_x2, group_sizes=[0, 0, block])
 
-    Hardware: arch35 NPU + a recent torch_npu with the FP4 npu_quant_matmul
+    Hardware: Ascend 950 NPU + a recent torch_npu with the FP4 npu_quant_matmul
     (same requirement as the offline W4A8 path — see that class's docstring).
     """
 
@@ -595,7 +595,7 @@ class NPUMXFP4W4A8OfflineLinearMethod(_NPULinearMethodBase):
     scale-layout normalization.
 
     ⚠️ REQUIRES a recent torch_npu build for the FP4 ``npu_quant_matmul``. On the
-    arch35 this device forces ``allow_internal_format=False`` (the NZ cast still produces
+    Ascend 950 this device forces ``allow_internal_format=False`` (the NZ cast still produces
     a ``FRACTAL_NZ_C0_16`` tensor, which is fine). Older torch_npu (e.g.
     ``2.10.0.dev20260320``) had a broken FP4 matmul that rejected the NZ weight in
     *prefill* with ``x2 should be in ... nz format, but it is 2``;
@@ -702,7 +702,7 @@ class NPUSingleLevelMXFP4LinearMethod(_NPULinearMethodBase):
         → npu_quant_matmul(x1_dtype = x2_dtype = float4_e2m1fn_x2,
                            group_sizes=[1, 1, MXFP4_BLOCK_SIZE])
 
-    Triggered by ``--quantization mxfp4`` on NPU. Hardware: arch35 NPU with a recent
+    Triggered by ``--quantization mxfp4`` on NPU. Hardware: Ascend 950 NPU with a recent
     torch_npu exposing ``float4_e2m1fn_x2``.
     """
 
@@ -879,7 +879,7 @@ class NPUDualLevelMXFP4LinearMethod(NPUSingleLevelMXFP4LinearMethod):
         BF16/FP16 activation → npu_dynamic_dual_level_mx_quant  (A4, dual-level)
         → npu_dual_level_quant_matmul(act, weight, act_l0, w_l0, act_l1, w_l1)
 
-    Reference: Diffusion ``NPUMXFP4DiffusionLinearMethod``. Hardware: arch35 NPU
+    Reference: Diffusion ``NPUMXFP4DiffusionLinearMethod``. Hardware: Ascend 950 NPU
     only — the ``DualLevelQuantBatchMatmul`` op is unavailable on A2/A3.
     """
 

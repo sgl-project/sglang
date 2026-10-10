@@ -1,8 +1,8 @@
-"""MXFP4 routed-expert MoE method for Ascend arch35 (Ascend 950).
+"""MXFP4 routed-expert MoE method for Ascend 950.
 
 DeepSeek-V4's FP4 expert checkpoint stores block-32 MXFP4 weights with E8M0
 scales. This module adapts those checkpoint weights to the shared Ascend MoE
-runner and arch35 grouped-matmul kernels.
+runner and Ascend 950 grouped-matmul kernels.
 """
 
 from typing import TYPE_CHECKING
@@ -33,7 +33,7 @@ def _wrap_mxfp4_scale_weight_loader(weight_loader):
 
 
 class NPUW4A8MXFP4FusedMoEMethod(FusedMoEMethodBase):
-    """DeepSeek-V4 routed experts on Ascend arch35: W4A8 MXFP weights.
+    """DeepSeek-V4 routed experts on Ascend 950: W4A8 MXFP weights.
 
     The checkpoint-specific loading remains here while execution is delegated
     to the shared Ascend MoE runner.

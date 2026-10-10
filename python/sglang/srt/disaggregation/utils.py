@@ -1590,7 +1590,7 @@ def setup_state_kv_args(
                 c128_item_lens,
             )
 
-        # On arch35 (CYCLE cache_mode), C4 state uses request-local ring rows rather
+        # On Ascend 950 (CYCLE cache_mode), C4 state uses request-local ring rows rather
         # than SWA pages.  Register it separately so P and D can independently
         # map logical positions when their local ring sizes differ.
         from sglang.srt.hardware_backend.npu.utils import is_npu_arch35

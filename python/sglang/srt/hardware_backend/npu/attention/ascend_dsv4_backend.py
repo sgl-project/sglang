@@ -33,7 +33,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-# arch35 kv-quant KV layout: nope is quantized in groups of 64 and the RoPE half is
+# Ascend 950 kv-quant KV layout: nope is quantized in groups of 64 and the RoPE half is
 # stored unquantized, so the kernels need both dimensions spelled out.
 _NPU_ARCH35_KV_TILE_SIZE = 64
 _NPU_ARCH35_KV_ROPE_HEAD_DIM = 64
@@ -42,8 +42,8 @@ _NPU_ARCH35_KV_ROPE_HEAD_DIM = 64
 def _sparse_attn_ops():
     """(metadata op, attention op) for the DSV4 shared-KV sparse attention.
 
-    arch35 reads a quantized KV cache, which is a different kernel rather than a
-    flag on the pre-arch35 one.
+    Ascend 950 reads a quantized KV cache, which is a different kernel rather than a
+    flag on the pre-Ascend 950 one.
     """
     if is_npu_arch35():
         return (
@@ -57,7 +57,7 @@ def _sparse_attn_ops():
 
 
 def _sparse_attn_kv_quant_kwargs() -> dict:
-    """Extra kwargs the arch35 kv-quant kernels need to interpret the KV layout."""
+    """Extra kwargs the Ascend 950 kv-quant kernels need to interpret the KV layout."""
     if not is_npu_arch35():
         return {}
     return {
@@ -136,15 +136,15 @@ def _build_explicit_state_block_table(
 
 
 def _build_cycle_state_block_table(req_pool_indices: torch.Tensor) -> torch.Tensor:
-    """Build the Atlas arch35 cache_mode=2 request-bank table.
+    """Build the Ascend 950 cache_mode=2 request-bank table.
 
-    arch35 interprets this input as one bank id per request and computes the
+    Ascend 950 interprets this input as one bank id per request and computes the
     in-bank ring offset itself.  It must never receive the A3 explicit
     per-token location table.
     """
     if req_pool_indices.ndim != 1:
         raise ValueError(
-            "Atlas arch35 compressor requires a 1-D request-bank table, got "
+            "Ascend 950 compressor requires a 1-D request-bank table, got "
             f"shape={tuple(req_pool_indices.shape)}"
         )
     return req_pool_indices.to(dtype=torch.int32).contiguous()
@@ -440,7 +440,7 @@ class CompressorAscendBackendMixin:
         state_pool = pool._get_state_pool(compressor.layer_id, compressor.is_in_indexer)
         state_cache = state_pool.state_cache_3d
         if is_npu_arch35():
-            # arch35 cache_mode=2 is CYCLE: one request bank per row.  The
+            # Ascend 950 cache_mode=2 is CYCLE: one request bank per row.  The
             # compressor derives the in-bank offset from start_pos; passing
             # the A3 explicit [B, width] table here would be an ABI violation.
             state_block_table = fm.dsv4_cycle_state_block_table
@@ -470,7 +470,7 @@ class CompressorAscendBackendMixin:
             allow_build=False,
         )
 
-        # TODO: torch.ops.npu.compressor does not support Atlas arch35 yet.
+        # TODO: torch.ops.npu.compressor does not support Ascend 950 yet.
         compressor_op = (
             torch.ops.custom.compressor if is_npu_arch35() else torch.ops.npu.compressor
         )
@@ -543,7 +543,7 @@ class CompressorAscendBackendMixin:
     ) -> None:
         kv_scale: Optional[torch.Tensor] = None
         li_kv_dtype = getattr(compressor, "li_kv_dtype", "bf16")
-        # arch35 quantizes and scatters in one fused kernel, so the dequant scale is
+        # Ascend 950 quantizes and scatters in one fused kernel, so the dequant scale is
         # produced inside indexer_compress_epilog rather than here.
         fused_fp8_indexer_write = li_kv_dtype == "float8" and compressor.is_in_indexer
         if li_kv_dtype == "int8" and compressor.is_in_indexer:
@@ -582,8 +582,8 @@ class CompressorAscendBackendMixin:
 
         # Eager verify keeps no row when no request completed a compression block
         # this step (loc is then all-zero, the skip sentinel), and prefill can hand
-        # us an empty chunk. Nothing to write: the pre-arch35 scatter treated that as a
-        # no-op, while both arch35 fused epilog kernels reject a zero-row input. Unlike
+        # us an empty chunk. Nothing to write: the pre-Ascend 950 scatter treated that as a
+        # no-op, while both Ascend 950 fused epilog kernels reject a zero-row input. Unlike
         # the `loc is None` check below (missing metadata = a bug), an empty write is
         # a legitimate step outcome. Static shape read, so graph capture is unaffected.
         if kv.shape[0] == 0:
@@ -592,7 +592,7 @@ class CompressorAscendBackendMixin:
         if fused_fp8_indexer_write:
             if loc is None:
                 raise RuntimeError(
-                    "DSV4 arch35 fused indexer epilog needs a slot mapping, but "
+                    "DSV4 Ascend 950 fused indexer epilog needs a slot mapping, but "
                     f"loc is None (mode={forward_batch.forward_mode}, "
                     f"ratio={compressor.ratio}). Writing nothing here would "
                     "leave the indexer KV cache stale."
@@ -794,7 +794,7 @@ class C4IndexerAscendBackendMixin:
         return torch.cat(topk_idxs, dim=0).to(dtype=torch.int32)
 
     def _ensure_npu_c4_indexer(self, c4_indexer, device: torch.device) -> None:
-        # arch35's lightning indexer consumes FP8 K + fp32 scales; pre-arch35 stays int8.
+        # Ascend 950's lightning indexer consumes FP8 K + fp32 scales; pre-Ascend 950 stays int8.
         c4_indexer.compressor.li_kv_dtype = "float8" if is_npu_arch35() else "int8"
         if getattr(c4_indexer, "hadamard_matrix", None) is None:
             H = _walsh_hadamard_matrix(c4_indexer.head_dim, torch.float32, device)
@@ -839,7 +839,7 @@ class C4IndexerAscendBackendMixin:
         import torch_npu
 
         if k.dtype == torch.float8_e4m3fn:
-            # arch35: block-quantize Q to FP8 so it matches the FP8 K buffer; scales
+            # Ascend 950: block-quantize Q to FP8 so it matches the FP8 K buffer; scales
             # stay fp32 and the kernel wants one scale per (token, head).
             q_quant, q_scale = torch_npu.npu_dynamic_block_quant(
                 q.view(-1, q.shape[-1]), dst_type=k.dtype

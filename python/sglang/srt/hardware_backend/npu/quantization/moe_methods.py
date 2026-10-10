@@ -35,7 +35,7 @@ def _require_e8m0_dtype():
     """Resolve the e8m0 block-scale dtype, failing loudly if it is unavailable.
 
     The grouped matmuls validate their scale-dtype arguments against torch_npu's
-    own dtype enum (``torch_npu.float8_e8m0fnu``, 293 on arch35) and reject the torch
+    own dtype enum (``torch_npu.float8_e8m0fnu``, 293 on Ascend 950) and reject the torch
     dtype object with "weight_scale_dtype only supports float8_e8m0fnu or None,
     but the actual value is Float8_e8m0fnu" — hence torch_npu first, torch only
     as a fallback. Dense ``npu_quant_matmul`` accepts either, which is why
@@ -60,14 +60,14 @@ def _require_e8m0_dtype():
             _E8M0_DTYPE = _get_float8_e8m0fnu_dtype()
         if _E8M0_DTYPE is None:
             raise RuntimeError(
-                "float8_e8m0fnu dtype not found — MXFP8 MoE requires Ascend arch35 "
+                "float8_e8m0fnu dtype not found — MXFP8 MoE requires Ascend 950 "
                 "with a torch_npu build exposing float8_e8m0fnu (torch_npu >= 2.9)."
             )
     return _E8M0_DTYPE
 
 
 def reshape_w4a8_mxfp_weight_scale_for_npu(scale: torch.Tensor) -> torch.Tensor:
-    """Pack MXFP4 scales from ``[E, N, K/32]`` to the arch35 GMM layout."""
+    """Pack MXFP4 scales from ``[E, N, K/32]`` to the Ascend 950 GMM layout."""
     if scale.dim() != 3:
         return scale
     num_experts, n, k32 = scale.shape
@@ -85,7 +85,7 @@ def prepare_w4a8_mxfp_weight(
     *,
     npu_format=None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Convert W4A8 MXFP weights and scales to the shared arch35 GMM layout."""
+    """Convert W4A8 MXFP weights and scales to the shared Ascend 950 GMM layout."""
     cast_args = {
         "customize_dtype": torch.float8_e4m3fn,
         "input_dtype": _get_float4_e2m1fn_x2_dtype(),
@@ -100,7 +100,7 @@ def prepare_w4a8_mxfp_weight(
 
 
 def _pair_pack_mxfp_act_scale(scale: torch.Tensor) -> torch.Tensor:
-    """Pack MXFP activation scales from ``[M, K/32]`` to arch35 GMM layout."""
+    """Pack MXFP activation scales from ``[M, K/32]`` to Ascend 950 GMM layout."""
     if scale.ndim != 2:
         return scale
     if scale.shape[-1] % 2 != 0:
@@ -120,7 +120,7 @@ def w4a8_mxfp_gmm(
     scale_alg=None,
     dynamic_quant_kwargs: Optional[Dict[str, Any]] = None,
 ) -> torch.Tensor:
-    """Run the shared arch35 FP4-weight × FP8-activation grouped matmul."""
+    """Run the shared Ascend 950 FP4-weight × FP8-activation grouped matmul."""
     group_list = group_list.to(torch.int64)
     if input_scale is None:
         if dynamic_quant_kwargs is None:
@@ -283,7 +283,7 @@ class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
         super().__init__(quant_config=None)
         self.dynamic_quant_kwargs = dynamic_quant_kwargs
         # Fused gmm1 (matmul + swiglu + requant in one aclnn kernel). The v2 op
-        # accepts FP4 weights via weight_scale/weight_dtype — verified on arch35
+        # accepts FP4 weights via weight_scale/weight_dtype — verified on Ascend 950
         # (llm/probe_mxfp4_gmm_swiglu_quant.py: same numerics as the unfused
         # chain modulo the output fp8 requant, which the unfused chain also
         # applies before gmm2).
@@ -308,9 +308,9 @@ class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
             weight.data, weight_scale.data
         )
 
-        # arch35 DeepEP low-latency dispatch quantizes the valid received rows to
+        # Ascend 950 DeepEP low-latency dispatch quantizes the valid received rows to
         # MXFP8 and returns the matching E8M0 block scales.  Keep normal mode
-        # in BF16 because arch35 MXFP8 normal dispatch is intranode-only; this also
+        # in BF16 because Ascend 950 MXFP8 normal dispatch is intranode-only; this also
         # preserves multi-node prefill when ``deepep-mode=auto``.
         if weight_prefix == "w13" and hasattr(layer, "dispatcher"):
             layer.dispatcher.set_quant_config(
@@ -1061,7 +1061,7 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
 #  NPUMXFP8MoEMethod
 # ---------------------------------------------------------------------------
 class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
-    """MXFP8 MoE on arch35 NPU – float8_e4m3fn weights with e8m0 block scales.
+    """MXFP8 MoE on Ascend 950 NPU – float8_e4m3fn weights with e8m0 block scales.
 
     Serves both the online config path (``--quantization mxfp8``, weights
     quantised at load time) and the offline ModelSlim ``W8A8_MXFP8`` scheme
@@ -1138,7 +1138,7 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
         # MoE methods above (they transpose first, but carry no MX scale to keep
         # in sync). Same order as the dense W4A8 path in linear_method_npu.py.
         #
-        # arch35 measurement, Qwen3-30B-A3B shapes, 128 experts (see
+        # Ascend 950 measurement, Qwen3-30B-A3B shapes, 128 experts (see
         # llm/probe_mxfp8_moe_nz.py): +1.4% decode, +3.8% prefill against a 0.2-
         # 0.3% noise floor, bit-identical outputs. Set
         # SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT to fall back to plain ND.

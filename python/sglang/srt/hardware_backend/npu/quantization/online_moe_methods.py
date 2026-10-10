@@ -25,7 +25,7 @@ if TYPE_CHECKING:
 
 
 class NPUMXFP8OnlineMoEMethod(UnquantizedFusedMoEMethod):
-    """Online MXFP8 FusedMoE entry point (``--quantization mxfp8`` on arch35).
+    """Online MXFP8 FusedMoE entry point (``--quantization mxfp8`` on Ascend 950).
 
     Weight creation, weight post-processing and the forward pass are identical
     to the unquantized NPU path — the only difference is which per-gmm kernel
