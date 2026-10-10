@@ -12,6 +12,7 @@ from sglang.srt.managers.cache_controller import CacheOperation, HiCacheControll
 from sglang.srt.mem_cache import l2_transfer as transfer_module
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
+from sglang.srt.mem_cache.device_pool_info import MambaStateBufferInfo
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -742,6 +743,10 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         expected_conv = device_pool.mamba_cache.conv[0][:, device_indices].clone()
 
         host = MambaPoolHost.__new__(MambaPoolHost)
+        host.buffer_info = MambaStateBufferInfo(
+            temporal=device_pool.mamba_cache.temporal,
+            conv=tuple(device_pool.mamba_cache.conv),
+        )
         host.layout = "page_first"
         host.num_mamba_layers = num_layers
         host.device_pool = SimpleNamespace(device="cpu")
@@ -829,6 +834,10 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         expected_conv = device_pool.mamba_cache.conv[0][:, device_indices].clone()
 
         host = MambaPoolHost.__new__(MambaPoolHost)
+        host.buffer_info = MambaStateBufferInfo(
+            temporal=device_pool.mamba_cache.temporal,
+            conv=tuple(device_pool.mamba_cache.conv),
+        )
         host.layout = "page_first_direct"
         host.num_mamba_layers = num_layers
         host.temporal_state_elem_size = 3

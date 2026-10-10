@@ -797,7 +797,7 @@ class TestHybridMambaDeclaredIndexer(CustomTestCase):
             patch.object(pool_host_dsa, "DSAIndexerPoolHost", dummy_indexer_host),
             patch.object(
                 hybrid_pool_assembler,
-                "MambaPoolHost",
+                "build_mamba_host_pool",
                 return_value=SimpleNamespace(layer_num=2, can_use_write_back_jit=False),
             ),
             patch.object(hybrid_pool_assembler, "HybridCacheController", MagicMock()),

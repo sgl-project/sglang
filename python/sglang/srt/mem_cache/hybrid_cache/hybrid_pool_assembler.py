@@ -1128,6 +1128,22 @@ def build_deepseek_v4_hicache_stack(
     return host_pool_group, cache_controller
 
 
+def build_mamba_host_pool(mamba_pool, *, host_size: float, layout: str):
+    (pool_info,) = mamba_pool.get_device_pool_infos()
+    pool_info.buffer_info.validate(layer_ids=pool_info.layer_ids)
+    capacity = mamba_pool.host_capacity_tokens
+    if capacity is None:
+        capacity = mamba_pool.size
+    return MambaPoolHost(
+        pool_info.buffer_info,
+        get_memory().hicache_ratio,
+        host_size,
+        device_capacity=capacity,
+        allocator_type=_get_allocator_type(),
+        layout=layout,
+    )
+
+
 def build_hybrid_mamba_stack(
     *,
     params: CacheInitParams,
@@ -1191,11 +1207,9 @@ def build_hybrid_mamba_stack(
         if get_memory().hicache_mem_layout == "page_first_kv_split"
         else get_memory().hicache_mem_layout
     )
-    mamba_host_pool = MambaPoolHost(
+    mamba_host_pool = build_mamba_host_pool(
         mamba_pool,
-        get_memory().hicache_ratio,
-        mamba_host_size,
-        allocator_type=_get_allocator_type(),
+        host_size=mamba_host_size,
         layout=mamba_layout,
     )
     entries = _build_pool_entries(config=config, root_host_pool=kv_host_pool) + [
@@ -1305,11 +1319,9 @@ def build_hybrid_mamba_swa_stack(
         host_size=swa_host_size,
         pool_label="swa",
     )
-    mamba_host_pool = MambaPoolHost(
+    mamba_host_pool = build_mamba_host_pool(
         mamba_pool,
-        get_memory().hicache_ratio,
-        mamba_host_size,
-        allocator_type=_get_allocator_type(),
+        host_size=mamba_host_size,
         layout=get_memory().hicache_mem_layout,
     )
     entries = [

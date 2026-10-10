@@ -312,7 +312,7 @@ class TestTriPoolAssembly(unittest.TestCase):
                         assembler, "_get_allocator_type", return_value="default"
                     ),
                     patch.object(assembler, "build_kv_host_pool", return_value=host),
-                    patch.object(assembler, "MambaPoolHost", return_value=host),
+                    patch.object(assembler, "build_mamba_host_pool", return_value=host),
                     patch.object(assembler, "HybridCacheController"),
                 ):
                     group, _ = assembler.build_hybrid_mamba_swa_stack(

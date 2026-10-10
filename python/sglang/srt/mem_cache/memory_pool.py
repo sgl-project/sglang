@@ -95,6 +95,7 @@ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.mem_cache.device_pool_info import DevicePoolInfo
 
 
 logger = logging.getLogger(__name__)
@@ -492,6 +493,8 @@ class ReqToTokenPool:
 
 
 class MambaPool:
+    host_capacity_tokens: Optional[int] = None
+
     # Axis of each two-dimensional conv state that represents the sliding window.
     # Upstream states use (dim, K-1); subclasses may preserve another layout.
     conv_window_axis = -1
@@ -1057,6 +1060,31 @@ class MambaPool:
         self.conv_shard_groups = getattr(cache_params.shape, "conv_shard_groups", None)
         self.conv_slice_axis = getattr(cache_params.shape, "conv_slice_axis", 0)
         self._warmup_fused_copy_slot_kernel()
+
+    def get_device_pool_infos(self) -> tuple[DevicePoolInfo, ...]:
+        """Checkpoint buffers for host transfer, excluding speculative work space."""
+        from sglang.srt.mem_cache.device_pool_info import (
+            DevicePoolInfo,
+            MambaStateBufferInfo,
+        )
+        from sglang.srt.mem_cache.hicache_storage import PoolName
+
+        return (
+            DevicePoolInfo(
+                pool_name=PoolName.MAMBA,
+                indices_from_pool=PoolName.MAMBA,
+                layer_ids=tuple(self.mamba_layer_ids),
+                buffer_info=MambaStateBufferInfo(
+                    temporal=self.mamba_cache.temporal,
+                    conv=tuple(self.mamba_cache.conv),
+                    extra_checkpoint_buffers=tuple(
+                        buffer
+                        for sibling in self._slot_siblings
+                        for _, buffer, _, _ in sibling.iter_transfer_state_entries()
+                    ),
+                ),
+            ),
+        )
 
     def get_speculative_mamba2_params_all_layers(self) -> SpeculativeState:
         assert isinstance(self.mamba_cache, self.SpeculativeState)

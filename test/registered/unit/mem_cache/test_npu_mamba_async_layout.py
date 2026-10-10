@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 import torch
 
 import sglang.srt.mem_cache.pool_host.mamba as mamba_pool_host
+from sglang.srt.mem_cache.device_pool_info import MambaStateBufferInfo
 from sglang.srt.mem_cache.pool_host.mamba import (
     MambaPoolHost,
     _npu_hicache_mamba_io_mode,
@@ -173,6 +174,10 @@ class TestNPUMambaAsyncConfig(unittest.TestCase):
             )
         )
 
+        pool.buffer_info = MambaStateBufferInfo(
+            temporal=device_pool.mamba_cache.temporal,
+            conv=tuple(device_pool.mamba_cache.conv),
+        )
         pool.load_to_device_per_layer(
             device_pool=device_pool,
             host_indices=torch.tensor([1]),
