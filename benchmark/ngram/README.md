@@ -15,6 +15,25 @@ This is the Baseten-inspired reconstruction, not an exact reproduction of the
 unpublished settings behind TRT PR #11434. The runner implements the comparison;
 GPU performance and output agreement still need to be measured.
 
+## Build the SGLang environment
+
+From a standalone clone of this branch on the Linux GPU host, outside the TRT
+container:
+
+```bash
+docker build -f docker/Dockerfile --target framework_final \
+  --build-arg BRANCH_TYPE=local --build-arg CUDA_VERSION=13.0.3 \
+  --build-arg SGLANG_BUILD_COMMIT="$(git rev-parse HEAD)" \
+  -t sglang-code-edit:local .
+```
+
+The Dockerfile uses fully qualified `docker.io/nvidia/cuda` base images so
+Podman can resolve them without an unqualified-search registry configuration.
+Podman's warnings about omitted `SGL_VERSION`, `PIP_DEFAULT_INDEX`, and
+`UBUNTU_MIRROR` are harmless for this local-source build. To suppress them, add
+`--build-arg SGL_VERSION= --build-arg PIP_DEFAULT_INDEX= --build-arg UBUNTU_MIRROR=`.
+The full image build and GPU execution still require validation on the host.
+
 ## Run
 
 Use the existing TRT environment to export the exact benchmark input tokens.
