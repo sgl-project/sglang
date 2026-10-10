@@ -10,6 +10,7 @@ use crate::components::TreeComponent;
 use crate::components::{ComponentType, FULL};
 use crate::node::ChildKeyType;
 use crate::node::Node;
+use crate::node::OwnedCopy;
 use crate::node::{NodeId, NodeIdx_, TreeCoreRuntimeError, ValueSlotIdx};
 use crate::unified_lru_list::PriorityKey;
 use crate::unified_tree_core::{
@@ -496,7 +497,7 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
                 {
                     tree_core
                         .arena
-                        .set_host_value(node_id, FULL, host_indices.copy());
+                        .set_host_value(node_id, FULL, host_indices.owned_copy());
                 }
             }
             CacheTransferPhase::LoadBack => {
@@ -511,8 +512,10 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
                             .expect("load-back transfers must reference live nodes");
                         let loaded = tree_core.arena.node_mut(loaded_idx);
                         let n_len = loaded.host_value_len(FULL) as i64;
-                        loaded
-                            .set_device_value(FULL, device_indices.narrow(0, offset, n_len).copy());
+                        loaded.set_device_value(
+                            FULL,
+                            device_indices.narrow(0, offset, n_len).owned_copy(),
+                        );
                         let locked = loaded.device_lock_ref(FULL) > 0;
                         offset += n_len;
                         // Full uses leaf sets, not LRU. A value materialized

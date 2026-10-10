@@ -11,6 +11,7 @@ use crate::components::TreeComponent;
 use crate::components::{ComponentType, FULL, SWA};
 use crate::node::ChildKeyType;
 use crate::node::Node;
+use crate::node::OwnedCopy;
 use crate::node::{NodeId, NodeIdx_, TreeCoreRuntimeError, ValueSlotIdx};
 use crate::unified_tree_core::{
     CacheAction, CacheInitParams, CacheTransferPhase, DecLockRefParams, EvictLayer,
@@ -209,7 +210,7 @@ impl SwaComponent {
     ) {
         let node = tree_core.arena.node_mut(node_id);
         let device_on = node.has_device_value(SWA);
-        node.set_host_value(SWA, host_indices.copy());
+        node.set_host_value(SWA, host_indices.owned_copy());
         let host_lru = tree_core.host_lru_list_mut(SWA);
         if !device_on && !host_lru.in_list(Some(node_id)) {
             host_lru.insert_mru(node_id);
@@ -475,7 +476,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
             }
             result.record_adopted_range(FULL, total_prefix_len, total_prefix_len + prefix_len);
             let old_full = node.take_device_value(FULL);
-            node.set_device_value(FULL, value_slice.copy());
+            node.set_device_value(FULL, value_slice.owned_copy());
             cache_actions.push(CacheAction::FreeDeviceKVFullOnly(vec![old_full]));
             cache_actions.push(CacheAction::SwaRebuild {
                 node_id: node.id,
@@ -508,7 +509,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
             result.record_adopted_range(FULL, swa_evicted_seqlen, total_prefix_len + prefix_len);
             let node = tree_core.arena.node_mut(node_id);
             let _ = node.take_device_value(FULL);
-            node.set_device_value(FULL, new_full.copy());
+            node.set_device_value(FULL, new_full.owned_copy());
             cache_actions.push(CacheAction::FreeDeviceKVFullOnly(vec![old_full]));
             cache_actions.push(CacheAction::SwaRebuild {
                 node_id: node_ext_id,
@@ -1060,7 +1061,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
                 let Some(target_ids) = target_ids else {
                     let node = tree_core.arena.node_mut(node_id);
                     if !node.has_host_value(SWA) {
-                        node.set_host_value(SWA, host_indices.copy());
+                        node.set_host_value(SWA, host_indices.owned_copy());
                     }
                     return;
                 };
@@ -1080,7 +1081,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
                     tree_core.arena.set_host_value(
                         target_idx,
                         SWA,
-                        host_indices.narrow(0, offset, size).copy(),
+                        host_indices.narrow(0, offset, size).owned_copy(),
                     );
                     offset += size;
                 }
@@ -1103,7 +1104,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
                         .resolve(loaded_id)
                         .expect("load-back transfers must reference live nodes");
                     let n_tokens = tree_core.arena.host_value_len(loaded_idx, SWA) as i64;
-                    let swa_chunk = device_indices.narrow(0, offset, n_tokens).copy();
+                    let swa_chunk = device_indices.narrow(0, offset, n_tokens).owned_copy();
                     tree_core.set_component_device_value_(
                         loaded_idx,
                         SWA,

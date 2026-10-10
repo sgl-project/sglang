@@ -17,6 +17,7 @@ use crate::components::{
 use crate::node::Node;
 use crate::node::NodeArena;
 use crate::node::NodeSet;
+use crate::node::OwnedCopy;
 use crate::node::{ChildKeyType, HashDigest, KeyNamespace, KeyNamespaceRef};
 use crate::node::{
     NUM_VALUE_SLOTS, NodeAccessError, NodeId, NodeIdx_, TreeCoreRuntimeError, ValueSlotIdx,
@@ -2195,7 +2196,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             key, parent_id, priority, /* hit_count = */ 0, /* creation_counter = */ None,
             namespace,
         );
-        self.arena.set_device_value(new_node_id, FULL, value.copy());
+        self.arena
+            .set_device_value(new_node_id, FULL, value.owned_copy());
         self.set_tlru_lens_and_raise_history_(new_node_id, parent_id);
         let displaced = self
             .arena
@@ -2225,7 +2227,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         session_id: Option<&str>,
     ) {
         self.arena
-            .set_device_value(node_id, FULL, fresh_value.copy());
+            .set_device_value(node_id, FULL, fresh_value.owned_copy());
         let tokens = fresh_value.size()[0] as usize;
         // A value materialized under lock is protected; the last release
         // moves it to evictable.
@@ -3492,7 +3494,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                     FULL,
                     host_value
                         .narrow(0, matched_start as i64, prefix_len as i64)
-                        .copy(),
+                        .owned_copy(),
                 );
                 if self.arena.node(node_id).hash_value.is_none() {
                     let first_page = matched_start / self.page_size;
@@ -3569,7 +3571,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                     matched_length as i64,
                     (total_len - matched_length) as i64,
                 )
-                .copy(),
+                .owned_copy(),
         );
         let child_map_key = self.arena.node(new_node_id).key.child_key(self.page_size);
         let displaced = self
@@ -4515,7 +4517,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                     (seg_start - window_start) as i64,
                     (seg_end - seg_start) as i64,
                 )
-                .copy();
+                .owned_copy();
             self.set_component_device_value_(target, SWA, values);
         }
         Ok(actions)
