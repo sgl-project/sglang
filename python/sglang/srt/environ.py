@@ -1635,6 +1635,9 @@ class Envs:
     SGLANG_HIP_SHARED_ACT_MXFP8 = EnvBool(_default_hip)
     SGLANG_HIP_WO_A_MXFP8 = EnvBool(_default_hip)
     SGLANG_HIP_FFN_NORM_MXFP8 = EnvBool(_default_hip)
+    # gfx950 DeepSeek-V4.1 decode steps of <= 48 rows: each layer's attention all-reduce, FFN mHC seam,
+    # MoE and MoE all-reduce run as one persistent FlyDSL launch (models/deepseek_common/amd/dsv41_mono).
+    SGLANG_ROCM_MONO_DECODE = EnvBool(False)
 
     # cache, GEMM, and distributed
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)
