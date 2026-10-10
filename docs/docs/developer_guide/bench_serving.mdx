@@ -259,6 +259,28 @@ With `--output-details`, an extended object also includes arrays:
 - `input_lens`, `output_lens`
 - `ttfts`, `itls` (per request: ITL arrays)
 - `generated_texts`, `errors`
+- `client_timings`: one timing object per single-turn request, aligned with the other arrays. Multi-turn entries are `null`.
+
+Each timing uses seconds from the benchmark's monotonic start, after warmup.
+These values are durations within one run, not wall-clock timestamps.
+
+| Field | Meaning |
+| --- | --- |
+| `scheduled_arrival_s` | Planned Mooncake arrival, normalized to the first trace timestamp and scaled by the slowdown factor. Other datasets use `null`. |
+| `ready_s` | The dataset generator yielded the prepared prompt. |
+| `dispatch_s` | The client entered the backend request function after concurrency waiting. This is not a socket-send timestamp. |
+| `backend_start_s` | The backend's existing request timer start, or `null` if unavailable. |
+| `first_token_s` | The backend timer start plus its recorded TTFT, or `null` when no first token was recorded. |
+| `terminal_s` | The backend request function returned, including returned failures. |
+| `success` | The backend's existing success result. Read the corresponding `errors` entry for failure details. |
+
+For Mooncake, `ready_s - scheduled_arrival_s` includes prompt preparation and
+scheduler lateness. `dispatch_s - ready_s` includes task scheduling and client
+concurrency waiting. Backend request durations also include client transport and
+network time. None of these fields isolates the server's queue or device time.
+Failed requests retain terminal observations even when the backend leaves its
+existing latency field at zero. A failure after partial output can also retain
+a first-token observation. Uncaught exceptions still terminate the benchmark.
 
 ### End-to-end examples
 
