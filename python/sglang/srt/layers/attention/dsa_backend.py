@@ -538,6 +538,9 @@ class DeepseekSparseAttnBackend(
             self.aiter_dsa_metadata_kv_dtype = None
             self.aiter_dsa_kv_last_page_lens = None
             self.aiter_dsa_work_metadata = None
+            self.aiter_dsa_identity_scale = torch.ones(
+                (), dtype=torch.float32, device=self.device
+            )
 
             if (
                 self.dsa_prefill_impl == "aiter" or self.dsa_decode_impl == "aiter"
@@ -710,9 +713,8 @@ class DeepseekSparseAttnBackend(
             q_dtype,
             kv_dtype,
             is_sparse=True,
-            fast_mode=False,
-            num_kv_splits=self.aiter_dsa_max_split_per_batch,
-            intra_batch_mode=True,
+            fast_mode=True,
+            intra_batch_mode=False,
         )
 
         return (
@@ -808,10 +810,10 @@ class DeepseekSparseAttnBackend(
             kv_granularity=16,
             max_seqlen_qo=max_seqlen_q,
             uni_seqlen_qo=max_seqlen_q,
-            fast_mode=False,
-            topk=self.dsa_index_topk,
+            fast_mode=True,
+            topk=-1,
             max_split_per_batch=self.aiter_dsa_max_split_per_batch,
-            intra_batch_mode=True,
+            intra_batch_mode=False,
             dtype_q=q_dtype,
             dtype_kv=kv_dtype,
         )
@@ -824,8 +826,6 @@ class DeepseekSparseAttnBackend(
             "reduce_indptr": self.aiter_dsa_reduce_indptr,
             "reduce_final_map": self.aiter_dsa_reduce_final_map,
             "reduce_partial_map": self.aiter_dsa_reduce_partial_map,
-            "intra_batch_mode": True,
-            "num_kv_splits": self.aiter_dsa_max_split_per_batch,
         }
 
     def _pad_trtllm_sparse_page_table(
@@ -3396,11 +3396,14 @@ class DeepseekSparseAttnBackend(
         bs: int,
     ) -> torch.Tensor:
         q = q_all.reshape(-1, layer.tp_q_head_num * layer.head_dim)
+        o_dtype = torch.bfloat16 if q.dtype == fp8_dtype else q.dtype
 
         if layer.head_dim != layer.v_head_dim:
-            o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
+            o = q.new_empty(
+                (q.shape[0], layer.tp_q_head_num * layer.v_head_dim), dtype=o_dtype
+            )
         else:
-            o = torch.empty_like(q)
+            o = torch.empty_like(q, dtype=o_dtype)
 
         if self.need_pad_heads:
             q_kernel = q.view(
@@ -3411,7 +3414,8 @@ class DeepseekSparseAttnBackend(
                     q.shape[0],
                     layer.tp_q_head_num * self.head_repeat_factor,
                     layer.v_head_dim,
-                )
+                ),
+                dtype=o_dtype,
             )
         else:
             q_kernel = q.view(-1, layer.tp_q_head_num, layer.head_dim)
@@ -3421,7 +3425,12 @@ class DeepseekSparseAttnBackend(
         kv_scale = None
         aiter_persistent_kwargs = {}
         if kv_cache.dtype == fp8_dtype:
-            kv_scale = torch.ones((), dtype=torch.float32, device=q_kernel.device)
+            q_scale = self.aiter_dsa_identity_scale
+            kv_scale = (
+                layer.k_scale.reshape(())
+                if isinstance(layer.k_scale, torch.Tensor)
+                else self.aiter_dsa_identity_scale
+            )
 
         kv_indptr = self.kv_indptr
 
@@ -3474,11 +3483,14 @@ class DeepseekSparseAttnBackend(
     ) -> torch.Tensor:
         num_tokens = q_all.shape[0]
         q = q_all.reshape(-1, layer.tp_q_head_num * layer.head_dim)
+        o_dtype = torch.bfloat16 if q.dtype == fp8_dtype else q.dtype
 
         if layer.head_dim != layer.v_head_dim:
-            o = q.new_empty((num_tokens, layer.tp_q_head_num * layer.v_head_dim))
+            o = q.new_empty(
+                (num_tokens, layer.tp_q_head_num * layer.v_head_dim), dtype=o_dtype
+            )
         else:
-            o = torch.empty_like(q)
+            o = torch.empty_like(q, dtype=o_dtype)
 
         if self.need_pad_heads:
             q_kernel = q.view(
@@ -3489,7 +3501,8 @@ class DeepseekSparseAttnBackend(
                     num_tokens,
                     layer.tp_q_head_num * self.head_repeat_factor,
                     layer.v_head_dim,
-                )
+                ),
+                dtype=o_dtype,
             )
         else:
             q_kernel = q.view(-1, layer.tp_q_head_num, layer.head_dim)
@@ -3499,7 +3512,12 @@ class DeepseekSparseAttnBackend(
         kv_scale = None
         aiter_persistent_kwargs = {}
         if kv_cache.dtype == fp8_dtype:
-            kv_scale = torch.ones((), dtype=torch.float32, device=q_kernel.device)
+            q_scale = self.aiter_dsa_identity_scale
+            kv_scale = (
+                layer.k_scale.reshape(())
+                if isinstance(layer.k_scale, torch.Tensor)
+                else self.aiter_dsa_identity_scale
+            )
 
         non_minus1_mask = page_table_1 != -1
         non_minus1_counts = non_minus1_mask.sum(dim=1)
