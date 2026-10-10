@@ -21,6 +21,161 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
+def _reference_attention(
+    *,
+    query,
+    key,
+    value,
+    req_to_token,
+    req_indices,
+    prefix_lens,
+    extend_lens,
+    seq_lens,
+    encoder_lens,
+    causal,
+    window,
+    cross_attention,
+    scale,
+):
+    expected = []
+    start_q = 0
+    for i, extend_len in enumerate(extend_lens):
+        encoder_len = encoder_lens[i]
+        kv_start = 0 if cross_attention else encoder_len
+        kv_end = encoder_len if cross_attention else encoder_len + seq_lens[i]
+        token_ids = req_to_token[req_indices[i], kv_start:kv_end]
+        q = query[start_q : start_q + extend_len].transpose(0, 1)
+        k = key[token_ids].float().transpose(0, 1)
+        v = value[token_ids].float().transpose(0, 1)
+        k = k.repeat_interleave(query.shape[1] // key.shape[1], dim=0)
+        v = v.repeat_interleave(query.shape[1] // key.shape[1], dim=0)
+        logits = q @ k.transpose(-1, -2) * scale
+        if causal:
+            # Enumerate visible positions independently of the backend mask.
+            visible = torch.tensor(
+                [
+                    [
+                        k_pos <= prefix_lens[i] + q_pos
+                        and (window is None or k_pos >= prefix_lens[i] + q_pos - window)
+                        for k_pos in range(len(token_ids))
+                    ]
+                    for q_pos in range(extend_len)
+                ],
+                dtype=torch.bool,
+            ).reshape(extend_len, len(token_ids))
+            logits = logits.masked_fill(~visible, -torch.inf)
+        expected.append((logits.softmax(dim=-1) @ v).transpose(0, 1))
+        start_q += extend_len
+
+    return torch.cat(expected)
+
+
+def _set_cpu_metadata(batch, cpu_metadata):
+    if cpu_metadata:
+        batch.req_pool_indices_cpu = batch.req_pool_indices.clone()
+        batch.seq_lens_cpu = batch.seq_lens.clone()
+        batch.extend_prefix_lens_cpu = batch.extend_prefix_lens.tolist()
+        batch.extend_seq_lens_cpu = batch.extend_seq_lens.tolist()
+        batch.encoder_lens_cpu = (
+            batch.encoder_lens.tolist() if batch.encoder_lens is not None else None
+        )
+        if cpu_metadata == "partial":
+            batch.extend_prefix_lens_cpu = None
+        elif cpu_metadata == "unpadded_encoder":
+            batch.encoder_lens_cpu = batch.encoder_lens[:-1].tolist()
+        elif cpu_metadata == "stale":
+            batch.req_pool_indices_cpu = torch.full_like(batch.req_pool_indices, 1000)
+            batch.seq_lens_cpu = torch.zeros_like(batch.seq_lens)
+            batch.extend_prefix_lens_cpu = [0] * batch.batch_size
+            batch.extend_seq_lens_cpu = [0] * batch.batch_size
+            batch.encoder_lens_cpu = [0] * batch.batch_size
+
+
+def _run_attention(
+    *,
+    query,
+    key,
+    value,
+    req_to_token,
+    batch,
+    causal,
+    window,
+    cross_attention,
+    public_forward,
+    profile_metadata,
+    scale,
+):
+    backend = object.__new__(TorchNativeAttnBackend)
+    output = query.new_empty(query.shape[0], query.shape[1], value.shape[2])
+    with patch.object(
+        torch_native_backend,
+        "scaled_dot_product_attention",
+        wraps=scaled_dot_product_attention,
+    ) as sdpa:
+        if public_forward:
+            backend.req_to_token_pool = SimpleNamespace(req_to_token=req_to_token)
+            backend.token_to_kv_pool = SimpleNamespace(
+                get_key_buffer=lambda _: key, get_value_buffer=lambda _: value
+            )
+            layer = SimpleNamespace(
+                layer_id=0,
+                tp_q_head_num=query.shape[1],
+                tp_k_head_num=key.shape[1],
+                qk_head_dim=query.shape[2],
+                v_head_dim=value.shape[2],
+                scaling=scale,
+                is_cross_attention=cross_attention,
+                attn_type=AttentionType.DECODER
+                if causal
+                else AttentionType.ENCODER_ONLY,
+                sliding_window_size=window,
+            )
+            with (
+                torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU])
+                if profile_metadata
+                else nullcontext()
+            ) as profiler:
+                output = backend.forward_extend(
+                    q=query.flatten(1),
+                    k=None,
+                    v=None,
+                    layer=layer,
+                    forward_batch=batch,
+                    save_kv_cache=False,
+                ).view_as(output)
+        else:
+            backend._run_sdpa_forward_extend(
+                query=query,
+                output=output,
+                k_cache=key,
+                v_cache=value,
+                req_to_token=req_to_token,
+                req_pool_indices=batch.req_pool_indices,
+                seq_lens=batch.seq_lens,
+                extend_prefix_lens=batch.extend_prefix_lens,
+                extend_seq_lens=batch.extend_seq_lens,
+                encoder_lens=batch.encoder_lens,
+                scaling=scale,
+                enable_gqa=query.shape[1] != key.shape[1],
+                causal=causal,
+                is_cross_attn=cross_attention,
+                sliding_window_size=window,
+            )
+
+    scalar_reads = None
+    if profile_metadata:
+        scalar_reads = sum(
+            event.count
+            for event in profiler.key_averages()
+            if event.key == "aten::_local_scalar_dense"
+        )
+    return (
+        output,
+        [call.args[0].shape[-2] for call in sdpa.call_args_list],
+        scalar_reads,
+    )
+
+
 class TestTorchNativeExtend(CustomTestCase):
     def _check_attention(
         self,
@@ -60,42 +215,6 @@ class TestTorchNativeExtend(CustomTestCase):
             req_to_token[req_idx, :length] = slots[start : start + length]
             start += length
 
-        expected = []
-        start_q = 0
-        scale = 0.3
-        for i, extend_len in enumerate(extend_lens):
-            encoder_len = encoder_lens[i]
-            kv_start = 0 if cross_attention else encoder_len
-            kv_end = encoder_len if cross_attention else encoder_len + seq_lens[i]
-            token_ids = req_to_token[req_indices[i], kv_start:kv_end]
-            q = query[start_q : start_q + extend_len].transpose(0, 1)
-            k = key[token_ids].float().transpose(0, 1)
-            v = value[token_ids].float().transpose(0, 1)
-            k = k.repeat_interleave(num_heads // num_kv_heads, dim=0)
-            v = v.repeat_interleave(num_heads // num_kv_heads, dim=0)
-            logits = q @ k.transpose(-1, -2) * scale
-            if causal:
-                # Enumerate visible positions independently of the backend mask.
-                visible = torch.tensor(
-                    [
-                        [
-                            k_pos <= prefix_lens[i] + q_pos
-                            and (
-                                window is None
-                                or k_pos >= prefix_lens[i] + q_pos - window
-                            )
-                            for k_pos in range(len(token_ids))
-                        ]
-                        for q_pos in range(extend_len)
-                    ],
-                    dtype=torch.bool,
-                ).reshape(extend_len, len(token_ids))
-                logits = logits.masked_fill(~visible, -torch.inf)
-            expected.append((logits.softmax(dim=-1) @ v).transpose(0, 1))
-            start_q += extend_len
-
-        backend = object.__new__(TorchNativeAttnBackend)
-        output = torch.empty(sum(extend_lens), num_heads, v_dim)
         batch = ForwardBatch(
             forward_mode=forward_mode,
             batch_size=batch_size,
@@ -109,89 +228,36 @@ class TestTorchNativeExtend(CustomTestCase):
             out_cache_loc=None,
             encoder_out_cache_loc=None,
         )
-        if cpu_metadata:
-            batch.req_pool_indices_cpu = req_indices.clone()
-            batch.seq_lens_cpu = batch.seq_lens.clone()
-            batch.extend_prefix_lens_cpu = list(prefix_lens)
-            batch.extend_seq_lens_cpu = list(extend_lens)
-            batch.encoder_lens_cpu = list(encoder_lens) if has_encoder else None
-            if cpu_metadata == "partial":
-                batch.extend_prefix_lens_cpu = None
-            elif cpu_metadata == "unpadded_encoder":
-                batch.encoder_lens_cpu = list(encoder_lens[:-1])
-            elif cpu_metadata == "stale":
-                batch.req_pool_indices_cpu = torch.full_like(req_indices, 1000)
-                batch.seq_lens_cpu = torch.zeros_like(batch.seq_lens)
-                batch.extend_prefix_lens_cpu = [0] * batch_size
-                batch.extend_seq_lens_cpu = [0] * batch_size
-                batch.encoder_lens_cpu = [0] * batch_size
-        with patch.object(
-            torch_native_backend,
-            "scaled_dot_product_attention",
-            wraps=scaled_dot_product_attention,
-        ) as sdpa:
-            if public_forward:
-                backend.req_to_token_pool = SimpleNamespace(req_to_token=req_to_token)
-                backend.token_to_kv_pool = SimpleNamespace(
-                    get_key_buffer=lambda _: key, get_value_buffer=lambda _: value
-                )
-                layer = SimpleNamespace(
-                    layer_id=0,
-                    tp_q_head_num=num_heads,
-                    tp_k_head_num=num_kv_heads,
-                    qk_head_dim=qk_dim,
-                    v_head_dim=v_dim,
-                    scaling=scale,
-                    is_cross_attention=cross_attention,
-                    attn_type=AttentionType.DECODER,
-                    sliding_window_size=window,
-                )
-                with (
-                    torch.profiler.profile(
-                        activities=[torch.profiler.ProfilerActivity.CPU]
-                    )
-                    if profile_metadata
-                    else nullcontext()
-                ) as profiler:
-                    output = backend.forward_extend(
-                        q=query.flatten(1),
-                        k=None,
-                        v=None,
-                        layer=layer,
-                        forward_batch=batch,
-                        save_kv_cache=False,
-                    ).view_as(output)
-            else:
-                backend._run_sdpa_forward_extend(
-                    query=query,
-                    output=output,
-                    k_cache=key,
-                    v_cache=value,
-                    req_to_token=req_to_token,
-                    req_pool_indices=req_indices,
-                    seq_lens=batch.seq_lens,
-                    extend_prefix_lens=batch.extend_prefix_lens,
-                    extend_seq_lens=batch.extend_seq_lens,
-                    encoder_lens=batch.encoder_lens,
-                    scaling=scale,
-                    enable_gqa=num_heads != num_kv_heads,
-                    causal=causal,
-                    is_cross_attn=cross_attention,
-                    sliding_window_size=window,
-                )
-
-        torch.testing.assert_close(output, torch.cat(expected), atol=1e-6, rtol=1e-5)
-        # Cached prefix queries must not be recomputed and discarded by SDPA.
-        self.assertEqual(
-            [call.args[0].shape[-2] for call in sdpa.call_args_list],
-            list(extend_lens),
+        _set_cpu_metadata(batch, cpu_metadata)
+        options = dict(
+            query=query,
+            key=key,
+            value=value,
+            req_to_token=req_to_token,
+            causal=causal,
+            window=window,
+            cross_attention=cross_attention,
+            scale=0.3,
         )
-        if profile_metadata:
-            return sum(
-                event.count
-                for event in profiler.key_averages()
-                if event.key == "aten::_local_scalar_dense"
-            )
+        expected = _reference_attention(
+            **options,
+            req_indices=req_indices,
+            prefix_lens=prefix_lens,
+            extend_lens=extend_lens,
+            seq_lens=seq_lens,
+            encoder_lens=encoder_lens,
+        )
+        output, query_lengths, scalar_reads = _run_attention(
+            **options,
+            batch=batch,
+            public_forward=public_forward,
+            profile_metadata=profile_metadata,
+        )
+
+        torch.testing.assert_close(output, expected, atol=1e-6, rtol=1e-5)
+        # Cached prefix queries must not be recomputed and discarded by SDPA.
+        self.assertEqual(query_lengths, list(extend_lens))
+        return scalar_reads
 
     def test_cpu_metadata_avoids_scalar_reads(self):
         """Existing host mirrors remove device scalar reads from public extend."""
@@ -265,7 +331,15 @@ class TestTorchNativeExtend(CustomTestCase):
 
     def test_noncausal_prefix(self):
         """Noncausal queries retain access to future keys after removing padding."""
-        self._check_attention(prefix_lens=(0, 4), extend_lens=(3, 2), causal=False)
+        for public_forward in (False, True):
+            with self.subTest(public_forward=public_forward):
+                self._check_attention(
+                    prefix_lens=(0, 4),
+                    extend_lens=(3, 2),
+                    causal=False,
+                    public_forward=public_forward,
+                    cpu_metadata=public_forward,
+                )
 
     def test_encoder_decoder_self_attention(self):
         """Decoder self attention must skip encoder cache slots for each request."""
