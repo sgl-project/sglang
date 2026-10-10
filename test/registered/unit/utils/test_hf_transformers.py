@@ -27,7 +27,11 @@ from sglang.srt.utils.hf_transformers.common import (
     get_rope_config,
     resolve_hf_gguf_reference,
 )
-from sglang.srt.utils.hf_transformers.config import _apply_gemma4_attention_overrides
+from sglang.srt.utils.hf_transformers.config import (
+    _apply_gemma4_attention_overrides,
+    apply_model_override_args,
+    get_config,
+)
 from sglang.srt.utils.hf_transformers.tokenizer import _fix_special_tokens_pattern
 from sglang.srt.utils.hf_transformers_patches import normalize_rope_scaling_compat
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -969,6 +973,114 @@ class TestLayerTypesValidationPatch(CustomTestCase):
         )
 
         self.assertEqual(len(config.mlp_layer_types), 5)
+
+
+# ---------------------------------------------------------------------------
+# apply_model_override_args (issue #27974)
+# ---------------------------------------------------------------------------
+
+
+class TestApplyModelOverrideArgs(unittest.TestCase):
+    YARN = {
+        "rope_type": "yarn",
+        "factor": 4.0,
+        "original_max_position_embeddings": 8192,
+    }
+
+    def _make_composite_config(self, rope_key="rope_parameters"):
+        text_cfg = PretrainedConfig()
+        text_cfg.num_attention_heads = 8
+        rope = {
+            "rope_type": "default",
+            "rope_theta": 1e7,
+            "mrope_section": [11, 11, 10],
+        }
+        setattr(text_cfg, rope_key, rope)
+        cfg = PretrainedConfig()
+        cfg.text_config = text_cfg
+        return cfg, text_cfg
+
+    def test_partial_rope_overrides_reach_loaded_qwen3_5_text_config(self):
+        try:
+            from transformers import Qwen3_5Config
+        except ImportError:
+            self.skipTest("Qwen3_5Config requires transformers v5")
+
+        with tempfile.TemporaryDirectory() as model:
+            Qwen3_5Config().save_pretrained(model)
+            original = get_hf_text_config(get_config(model, trust_remote_code=False))
+            _, checkpoint_rope = get_rope_config(original)
+            expected = {**checkpoint_rope, "rope_theta": 20000.0}
+            for override in (
+                {"rope_parameters": {"rope_theta": 20000.0}},
+                {"text_config": {"rope_parameters": {"rope_theta": 20000.0}}},
+            ):
+                with self.subTest(override=override):
+                    config = get_config(
+                        model, trust_remote_code=False, model_override_args=override
+                    )
+                    theta, params = get_rope_config(get_hf_text_config(config))
+                    self.assertEqual(theta, 20000.0)
+                    self.assertEqual(params, expected)
+
+    def test_flat_update_on_pure_text_config(self):
+        cfg = PretrainedConfig()
+        cfg.num_hidden_layers = 2
+        apply_model_override_args(cfg, {"num_hidden_layers": 4})
+        self.assertEqual(cfg.num_hidden_layers, 4)
+
+    def test_flat_rope_scaling_mirrors_rope_parameters(self):
+        # Qwen3.5 v5 keeps checkpoint keys under rope_parameters while the
+        # documented flat override still uses rope_scaling.
+        cfg, text_cfg = self._make_composite_config("rope_parameters")
+        apply_model_override_args(cfg, {"rope_scaling": dict(self.YARN)})
+        self.assertEqual(text_cfg.rope_parameters["rope_type"], "yarn")
+        self.assertEqual(text_cfg.rope_parameters["factor"], 4.0)
+        self.assertEqual(text_cfg.rope_parameters["rope_theta"], 1e7)
+        self.assertEqual(text_cfg.rope_parameters["mrope_section"], [11, 11, 10])
+
+    def test_flat_rope_parameters_mirrors_and_merges(self):
+        cfg, text_cfg = self._make_composite_config("rope_parameters")
+        apply_model_override_args(cfg, {"rope_parameters": dict(self.YARN)})
+        self.assertEqual(text_cfg.rope_parameters["rope_type"], "yarn")
+        self.assertEqual(text_cfg.rope_parameters["factor"], 4.0)
+        self.assertEqual(text_cfg.rope_parameters["rope_theta"], 1e7)
+        self.assertEqual(text_cfg.rope_parameters["mrope_section"], [11, 11, 10])
+
+    def test_nested_override_recurses_into_sub_config(self):
+        # Nested rope updates retain the existing config object and keys.
+        cfg, text_cfg = self._make_composite_config()
+        apply_model_override_args(
+            cfg, {"text_config": {"rope_parameters": dict(self.YARN)}}
+        )
+        self.assertIsInstance(cfg.text_config, PretrainedConfig)
+        self.assertIs(cfg.text_config, text_cfg)
+        self.assertEqual(text_cfg.num_attention_heads, 8)
+        self.assertEqual(text_cfg.rope_parameters["rope_type"], "yarn")
+        self.assertEqual(text_cfg.rope_parameters["rope_theta"], 1e7)
+
+    def test_nested_non_rope_override(self):
+        cfg, text_cfg = self._make_composite_config()
+        apply_model_override_args(cfg, {"text_config": {"num_attention_heads": 16}})
+        self.assertEqual(text_cfg.num_attention_heads, 16)
+        self.assertEqual(text_cfg.rope_parameters["rope_type"], "default")
+
+    def test_flat_rope_update_prefers_dict_llm_config(self):
+        cfg, lower_priority_text_cfg = self._make_composite_config()
+        cfg.llm_config = {
+            "num_attention_heads": 8,
+            "rope_parameters": {
+                "rope_type": "default",
+                "rope_theta": 1e7,
+            },
+        }
+        apply_model_override_args(cfg, {"rope_parameters": dict(self.YARN)})
+        self.assertIsInstance(cfg.llm_config, PretrainedConfig)
+        self.assertEqual(cfg.llm_config.rope_parameters["rope_type"], "yarn")
+        self.assertEqual(cfg.llm_config.rope_parameters["rope_theta"], 1e7)
+        self.assertEqual(
+            lower_priority_text_cfg.rope_parameters["rope_type"], "default"
+        )
 
 
 if __name__ == "__main__":
