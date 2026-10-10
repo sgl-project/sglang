@@ -39,6 +39,7 @@ class TestIndependentStageConstruction(CustomTestCase):
 
         for variant in BatchVariant:
             plan = stub_plan()
+            plan._unpadded_attn_tp_size = 2
             ordinary = object()
             plan.paths[BatchVariant.ORDINARY] = ordinary
             with (
@@ -61,6 +62,11 @@ class TestIndependentStageConstruction(CustomTestCase):
                     construction,
                     "_batch_shards_over_cp",
                     return_value=variant is BatchVariant.CONTEXT_PARALLEL,
+                ),
+                patch.object(
+                    construction,
+                    "_rows_indivisible_over_attn_tp",
+                    return_value=variant is BatchVariant.UNPADDED,
                 ),
             ):
                 if variant is BatchVariant.ORDINARY:

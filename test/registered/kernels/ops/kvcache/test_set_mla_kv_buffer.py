@@ -5,6 +5,7 @@ import torch
 
 from sglang.kernels.jit.utils import get_ci_test_range
 from sglang.kernels.ops.kvcache.mla_buffer import (
+    set_mla_kv_buffer_naive,
     set_mla_kv_buffer_triton,
     set_mla_kv_buffer_triton_fp8_quant,
     set_mla_kv_scale_buffer_triton,
@@ -308,6 +309,40 @@ def test_set_mla_kv_scale_buffer_triton_reserved_skip_index():
         rtol=0.0,
         atol=0.0,
     )
+
+
+@pytest.mark.parametrize("rope_dim", [TRITON_ROPE_DIM, 0])
+def test_set_mla_kv_buffer_naive_matches_triton(rope_dim):
+    """The torch-native scatter backs supports_triton=False platforms.
+
+    It is never exercised on a Triton-capable device, so only an equivalence
+    check keeps it from drifting: a loc layout change that updates the kernel
+    and not the fallback would otherwise corrupt KV on those platforms alone.
+    """
+    dtype = torch.bfloat16
+    n_loc = 6
+    cache_k_nope = torch.randn((n_loc, 1, TRITON_NOPE_DIM), dtype=dtype, device=DEVICE)
+    cache_k_rope = torch.randn((n_loc, 1, rope_dim), dtype=dtype, device=DEVICE)
+    # Index 0 is the default reserved skip slot. Locs stay distinct: a repeated
+    # loc races in both paths, so the winner is not defined to compare.
+    loc = torch.tensor([0, 7, 3, 9, 5, 11], dtype=torch.int64, device=DEVICE)
+
+    shape = (CACHE_SIZE, 1, TRITON_NOPE_DIM + rope_dim)
+    reference = torch.randn(shape, dtype=dtype, device=DEVICE)
+    from_naive = reference.clone()
+
+    set_mla_kv_buffer_triton(reference, loc, cache_k_nope, cache_k_rope)
+    set_mla_kv_buffer_naive(
+        from_naive,
+        loc,
+        cache_k_nope,
+        cache_k_rope,
+        reserved_skip_index=0,
+        dcp_world_size=1,
+        dcp_rank=0,
+    )
+
+    torch.testing.assert_close(from_naive, reference, rtol=0.0, atol=0.0)
 
 
 @CUDA_TMA_ONLY

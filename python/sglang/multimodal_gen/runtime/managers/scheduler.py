@@ -626,10 +626,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             candidate_req.prompt, str
         ):
             return "prompt_type"
-        if (
-            getattr(base_req, "image_path", None) is not None
-            or getattr(candidate_req, "image_path", None) is not None
-        ):
+        if self._has_unbatchable_image_conditioning(base_req, candidate_req):
             return "image_conditioning"
         if base_req.return_file_paths_only != candidate_req.return_file_paths_only:
             return "return_file_paths_only"
@@ -647,6 +644,15 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
     @staticmethod
     def _has_realtime_session(req: Req) -> bool:
         return bool(req.realtime_session_id) or req.session is not None
+
+    def _has_unbatchable_image_conditioning(
+        self, base_req: Req, candidate_req: Req
+    ) -> bool:
+        """True when either request carries image conditioning that this
+        pipeline cannot keep per-request inside a merged dynamic batch."""
+        if self.server_args.pipeline_config.supports_batching_image_conditioning():
+            return False
+        return base_req.image_path is not None or candidate_req.image_path is not None
 
     def _requires_sequential_multi_output(self, *reqs: Req) -> bool:
         pipeline_config = self.server_args.pipeline_config
@@ -687,10 +693,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         ):
             return False
 
-        if (
-            getattr(base_req, "image_path", None) is not None
-            or getattr(candidate_req, "image_path", None) is not None
-        ):
+        if self._has_unbatchable_image_conditioning(base_req, candidate_req):
             return False
         if base_req.return_file_paths_only != candidate_req.return_file_paths_only:
             return False
@@ -1122,6 +1125,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                     output_batch.audio, start, end, total_items
                 ),
                 audio_sample_rate=output_batch.audio_sample_rate,
+                fps=output_batch.fps,
                 action_pred=self._slice_batched_value(
                     output_batch.action_pred, start, end, total_items
                 ),
@@ -1381,6 +1385,10 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         if self.receiver is not None:
             logger.debug("Driver scheduler of dp replica %d listening", self.dp_replica)
 
+        release_cache_if_idle = getattr(self.worker, "release_cache_if_idle", None)
+        if release_cache_if_idle is not None:
+            self.worker.defer_cache_release = True
+
         while self._running:
             self._reap_finalizes()
 
@@ -1426,6 +1434,12 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             # 2: execute, make sure a reply is always sent
             items = self.get_next_batch_to_run()
             if not items:
+                if (
+                    release_cache_if_idle is not None
+                    and not self.waiting_queue
+                    and not self._inflight_finalizes
+                ):
+                    release_cache_if_idle()
                 if self.waiting_queue and self._dynamic_batching_enabled():
                     oldest_ts = self.waiting_queue[0][2]
                     elapsed_ms = (time.monotonic() - oldest_ts) * 1000.0

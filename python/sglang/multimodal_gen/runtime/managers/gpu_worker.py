@@ -37,6 +37,9 @@ from sglang.multimodal_gen.runtime.distributed import (
 from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a import (
     IPC_A2A,
 )
+from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a_multi import (
+    IPC_A2A_MULTI,
+)
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_cfg_group,
     get_classifier_free_guidance_rank,
@@ -52,6 +55,7 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     materialize_output_sample,
     post_process_sample,
     save_outputs,
+    warm_image_writer,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency import (
     WarmupMemoryRecord,
@@ -101,6 +105,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     configure_logger,
     init_logger,
 )
+from sglang.multimodal_gen.runtime.utils.numerics_policy import apply_numerics_policy
 from sglang.multimodal_gen.runtime.utils.perf_logger import (
     PerformanceLogger,
     capture_memory_snapshot,
@@ -116,6 +121,10 @@ from sglang.srt.environ import third_party_cache_defaults
 from sglang.srt.utils.network import NetworkAddress
 
 logger = init_logger(__name__)
+
+# How long the scheduler must stay idle before the allocator cache goes back
+# to the driver; back-to-back and concurrent requests never wait this long.
+_IDLE_CACHE_RELEASE_S = 1.0
 
 
 def _device_has_allocator_cache() -> bool:
@@ -208,20 +217,26 @@ def fit_auto_residency_probe(
     floor_units = min((record.workload_units() for record in records), default=0)
     fitted, steps = req, 0
     while True:
-        units = (
-            max(1, int(fitted.width or 1))
-            * max(1, int(fitted.height or 1))
-            * max(1, int(fitted.num_frames or 1))
-        )
+        units = _probe_workload_units(fitted)
         estimate = estimate_default_workload_peak_bytes(
             records=records, target_units=units
         )
         if estimate is None or estimate <= budget or units <= floor_units:
             return fitted, estimate, steps
         lighter = lighten_warmup_req(server_args, fitted)
-        if lighter is None:
+        # Sampling params that pin the frame count (Wan-Animate-2 mirrors clip_len
+        # in __post_init__) hand back an equal-size req; treat that as the floor.
+        if lighter is None or _probe_workload_units(lighter) >= units:
             return fitted, estimate, steps
         fitted, steps = lighter, steps + 1
+
+
+def _probe_workload_units(req: Req) -> int:
+    return (
+        max(1, int(req.width or 1))
+        * max(1, int(req.height or 1))
+        * max(1, int(req.num_frames or 1))
+    )
 
 
 class GPUWorker(GPUWorkerPostTrainingMixin):
@@ -282,6 +297,10 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         )
         self._deferred_finalize: Callable[[], None] | None = None
         self._deferred_save_stream = None
+        # Set by a scheduler loop that calls release_cache_if_idle(); others
+        # keep releasing the allocator cache after every request.
+        self.defer_cache_release = False
+        self._cache_release_due: float | None = None
         # per-rank memory measurements of server warmup forwards; consumed by
         # the auto-residency placement decision before the server turns ready
         self._auto_residency_warmup_records: list[WarmupMemoryRecord] = []
@@ -375,6 +394,12 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         if not current_platform.is_mps():
             current_platform.set_device(current_platform.get_device(self.local_rank))
         self._cap_device_memory_for_tests()
+        apply_numerics_policy(
+            allow_cudnn_tf32=self.server_args.allow_cudnn_tf32,
+            allow_bf16_reduced_precision_reduction=(
+                self.server_args.allow_bf16_reduced_precision_reduction
+            ),
+        )
         # num_gpus is the total world size across every node; the co-located,
         # CPU-contending worker count on THIS host is num_gpus // nnodes.
         local_num_gpus = self.server_args.num_gpus // self.server_args.nnodes
@@ -461,6 +486,12 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 ),
             )
 
+        if (
+            self.is_output_rank
+            and self.server_args.pipeline_config.task_type.is_image_gen()
+        ):
+            warm_image_writer()
+
         logger.info(
             f"Worker {self.rank}: Initialized device, model, and distributed environment."
         )
@@ -531,6 +562,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         # request boundary: the IPC watchdog flag is a device read, illegal
         # inside a graph capture and too costly per exchange
         IPC_A2A.check_timeout()
+        IPC_A2A_MULTI.check_timeout()
         if len(batch) > 1:
             if return_req:
                 raise ValueError(
@@ -833,16 +865,20 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         ):
             self.do_mem_analysis(output_batch)
 
-        # Deferred finalize keeps the allocator cache: releasing it while the
-        # next request is mid-forward causes cudaFree/cudaMalloc churn.
         if (
-            not deferred
-            and not current_platform.is_cpu()
+            not current_platform.is_cpu()
             and output_batch.output is None
             and not req.return_raw_frames
         ):
-            with maybe_record_function("EMPTY_CACHE"):
-                torch.get_device_module().empty_cache()
+            if self.defer_cache_release:
+                # Between back-to-back requests a release only makes the next
+                # one grow the pool back, so wait until the scheduler idles.
+                self._cache_release_due = time.monotonic() + _IDLE_CACHE_RELEASE_S
+            elif not deferred:
+                # Deferred finalize keeps the allocator cache: releasing it while
+                # the next request is mid-forward causes cudaFree/cudaMalloc churn.
+                with maybe_record_function("EMPTY_CACHE"):
+                    torch.get_device_module().empty_cache()
 
         if req.perf_dump_path is not None or envs.SGLANG_DIFFUSION_STAGE_LOGGING:
             if not req.is_warmup:
@@ -892,6 +928,18 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                     deferred=True,
                 )
             stream.synchronize()
+
+    def release_cache_if_idle(self) -> None:
+        """Release the allocator cache once no request has finished for a while.
+
+        The scheduler calls this only with nothing queued or in flight.
+        """
+        due = self._cache_release_due
+        if due is None or time.monotonic() < due:
+            return
+        self._cache_release_due = None
+        with maybe_record_function("EMPTY_CACHE"):
+            torch.get_device_module().empty_cache()
 
     def take_deferred_finalize(self) -> Callable[[], None] | None:
         deferred = self._deferred_finalize
@@ -1166,6 +1214,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         from sglang.multimodal_gen.runtime.layers.usp import drop_a2a_staging_buffers
 
         IPC_A2A.drop_staging()
+        IPC_A2A_MULTI.drop_staging()
         drop_a2a_staging_buffers()
         torch.get_device_module().empty_cache()
 
@@ -1404,6 +1453,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             output=result.output,
             audio=getattr(result, "audio", None),
             audio_sample_rate=getattr(result, "audio_sample_rate", None),
+            fps=getattr(result, "fps", None),
             metrics=result.metrics,
             usage=getattr(result, "usage", None),
             trajectory_timesteps=getattr(result, "trajectory_timesteps", None),
@@ -1419,6 +1469,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
     ) -> OutputBatch:
         """Merge per-output batches produced by grouped execution."""
         merged = OutputBatch()
+        merged.fps = output_batches[0].fps
         parts = _ExpandedOutputParts()
 
         for output_batch in output_batches:
@@ -1665,20 +1716,24 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
 
 OOM_MSG = """
 OOM detected. Possible solutions:
-  - If the OOM occurs during loading:
+  - If the OOM occurs during loading, or on the first request with a component on
+    CPU offload (which moves the whole component onto the GPU when it runs):
     1. Check available memory on every selected GPU, not only total capacity.
        In multi-GPU runs, the least-free selected GPU is the bottleneck.
-    2. For single-GPU deployment, use `--performance-mode memory`, component CPU offload,
-       or `--dit-layerwise-offload` for supported Wan/MOVA DiTs.
-    3. For multi-GPU deployment, keep the default `--performance-mode auto` or set
-       `--use-fsdp-inference true` to shard DiT weights with FSDP. FSDP is not a
-       single-GPU substitute for CPU offload.
+    2. For single-GPU deployment, stream weights layer by layer by listing components
+       in `--layerwise-offload-components`, e.g. `dit,text_encoder,image_encoder,vae`.
+       `--dit-layerwise-offload` streams only the DiT, and `--performance-mode memory`
+       streams the DiT only for models that validate it. Component CPU offload helps
+       only when each component fits on its own.
+    3. For multi-GPU deployment, set `--use-fsdp-inference true` to shard DiT weights
+       with FSDP. FSDP is not a single-GPU substitute for offload.
   - If the OOM occurs during runtime:
     1. Reduce resolution, `--num-frames`, or batch size.
     2. Use `--performance-mode memory` for lower memory usage.
     3. Enable SP/Ulysses/Ring for sequence-heavy workloads in multi-GPU setups.
     4. Use FSDP, with CFG parallelism when supported, for validated multi-GPU workloads.
     5. Use a lower-memory attention backend or quantization when available.
+  Tested launch commands per model: https://docs.sglang.io/cookbook
   Or, open an issue on GitHub https://github.com/sgl-project/sglang/issues/new/choose
 """
 
