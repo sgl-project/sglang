@@ -799,14 +799,23 @@ def _xml_arguments_format(
         before = [more[k] if k in required else _optional(more[k]) for k in keys]
         if not follows:
             return _sequence(*before)
-        # A branch per last parameter, after every required one.
-        return _one_of(
-            [
-                _sequence(*before[:index], final[key])
-                for index, key in enumerate(keys)
-                if not set(keys[index + 1 :]) & set(required)
-            ]
-        )
+
+        def last(start: int, stop: int) -> dict[str, Any]:
+            """Parameters of `keys[start:stop]` that end at one of them."""
+            if stop - start == 1:
+                return final[keys[start]]
+            # Halving keeps the tag O(n log n) in size and O(log n) deep.
+            middle = (start + stop) // 2
+            return _one_of(
+                [
+                    last(start, middle),
+                    _sequence(*before[start:middle], last(middle, stop)),
+                ]
+            )
+
+        # The last parameter follows every required one.
+        first = max((i for i, k in enumerate(keys) if k in required), default=0)
+        return _sequence(*before[:first], last(first, len(keys)))
 
     orders = [tuple(values)]
     if sorted_arguments and sorted(values) != list(values):

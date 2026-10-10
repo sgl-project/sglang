@@ -472,6 +472,42 @@ class TestToolCallStructuralTag(CustomTestCase):
                 call = f'<call name="f">{body}</call>'
                 self.assertEqual([_accepts(tag, call) for tag in tags], expected)
 
+    def test_last_parameter_follows_every_required_one(self):
+        template = copy.deepcopy(TEMPLATE)
+        template["fields"]["tool_calls"]["content_args"]["tag_pattern"] = (
+            r'<arg name="(?P<key>[^"]+)">(?P<value>.*?)\n(?:</arg>|(?=<arg name="))'
+        )
+        parameters = {
+            "properties": {key: {"type": "string"} for key in "abcde"},
+            "required": ["b"],
+        }
+        tag = _build(template, tools=[_tool(parameters)])
+
+        def call(keys: str, lookahead: bool) -> str:
+            ends = ["\n" if lookahead else "\n</arg>"] * (len(keys) - 1) + ["\n</arg>"]
+            body = "".join(f'<arg name="{k}">x{e}' for k, e in zip(keys, ends))
+            return f'<call name="f">{body}</call>'
+
+        # Parameters in call order, and whether the call is accepted.
+        cases = [
+            ("b", True),
+            ("ab", True),
+            ("bc", True),
+            ("bd", True),
+            ("be", True),
+            ("abde", True),
+            ("bcde", True),
+            ("", False),
+            ("a", False),
+            ("acd", False),
+            ("bdc", False),
+            ("bcc", False),
+        ]
+        for keys, expected in cases:
+            for lookahead in (False, True):
+                with self.subTest(keys=keys, lookahead=lookahead):
+                    self.assertIs(_accepts(tag, call(keys, lookahead)), expected)
+
     def test_required_argument_without_schema_is_still_required(self):
         """A required entry that is no name leaves the tool to the generic JSON
         schema instead."""
