@@ -117,7 +117,7 @@ renders the model:
   split (it is for DeepSeek-V4). Run each check where Python runs it: a final
   assistant turn's tool calls are discarded, so object checks on their arguments
   belong after the split. Hosts reach the model through `render_prompt` too, so
-  check the renderer's continuation handling (`sglang-renderer` `render()`) as well.
+  check their continuation handling as well.
   (`final_assistant`, `continuation_parts`, `continuation_bos`, `continuation_only`, `final_tool_call_no_arguments`, `continuation_tool_call_null_arguments`)
 - **Model-specific fields and turns**: `task` placement, a system turn mid-conversation,
   inserted empty system turns. (`task_action`, `task_after_developer`, `consecutive_task`, `mid_system`)
