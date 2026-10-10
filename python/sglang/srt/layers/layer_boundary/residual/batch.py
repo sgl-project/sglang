@@ -13,6 +13,7 @@
 # ==============================================================================
 """Residual access for one layer-stack invocation or TBO microbatch."""
 
+from sglang.srt.layers.layer_boundary.output import complete_owed
 from sglang.srt.layers.layer_boundary.residual import access
 from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
@@ -27,21 +28,27 @@ def start(forward_batch):
     forward_batch.residual_stream = ResidualStream()
 
 
-def current(forward_batch):
+def stream_of(forward_batch):
     stream = forward_batch.residual_stream
     if stream is None:
         raise RuntimeError("start the layer stack before entering a stage")
     return stream
 
 
+def written_residual(forward_batch):
+    """The residual the last prepare wrote, for a stage whose compute reads it
+    too (e.g. to write the next stream at its exit). Borrowed: do not modify."""
+    return stream_of(forward_batch).residual
+
+
 def complete_output(hidden_states, forward_batch):
     """Complete the contribution while retaining its pending residual update."""
-    return current(forward_batch).complete(hidden_states)
+    return stream_of(forward_batch).complete(hidden_states)
 
 
 def take_output(hidden_states, forward_batch):
     """Release a terminal output whose residual update has already been written."""
-    stream = current(forward_batch)
+    stream = stream_of(forward_batch)
     stream.check(hidden_states)
     if stream.pending is not None:
         raise RuntimeError("write the residual update before taking the final output")
@@ -49,13 +56,13 @@ def take_output(hidden_states, forward_batch):
     return hidden_states
 
 
-def norm(
+def final_norm(
     hidden_states,
     forward_batch,
     layernorm,
-    capture_output=None,
+    capture=None,
     *,
-    handoff_norm=None,
+    finalize_norm=None,
     skip_empty=False,
     **read_kwargs,
 ):
@@ -65,9 +72,9 @@ def norm(
         hidden_states: Current stream output or opaque owed handle.
         forward_batch: Batch owning the residual stream.
         layernorm: Final norm supporting the model's output/residual pair.
-        capture_output: Optional callback retaining the same updated residual;
+        capture: Optional callback retaining the same updated residual;
             it must copy borrowed storage when retention requires ownership.
-        handoff_norm: Optional adapter with finalize(handoff, residual, gamma)
+        finalize_norm: Optional adapter with finalize(handoff, residual, gamma)
             for a producer-specific finalize handoff; when a handoff arrives it
             cannot be combined with capture. Without it, a handoff is completed
             unfused first. Its gamma is layernorm.gemma_weight, so the final
@@ -79,29 +86,31 @@ def norm(
         Normalized tensor. Add and norm remain together to preserve the kernel's
         accumulation/rounding order; a snapshot is not used as the norm input.
     """
-    hidden_states, residual = current(forward_batch).finish(
-        hidden_states, takes_handoff=handoff_norm is not None
+    hidden_states, residual = stream_of(forward_batch).export(
+        hidden_states, takes_handoff=finalize_norm is not None
     )
     # The terminal consumer now owns the pair. Do not keep layer buffers alive
     # through logits processing or the next forward on this batch.
     forward_batch.residual_stream = None
-    from sglang.srt.layers.layer_boundary.output import HandoffOutput
+    from sglang.srt.layers.layer_boundary.output import DeferredFinalize
 
-    if isinstance(hidden_states, HandoffOutput):
+    if isinstance(hidden_states, DeferredFinalize):
         if residual is None:
             raise RuntimeError("invalid final deferred MoE handoff")
-        if capture_output is not None:
+        if capture is not None:
             raise RuntimeError(
                 "final handoff capture requires an explicit capture adapter"
             )
-        hidden_states, _ = handoff_norm.finalize(
+        hidden_states, _ = finalize_norm.finalize(
             handoff=hidden_states, residual=residual, gamma=layernorm.gemma_weight
         )
         return hidden_states
     if skip_empty and hidden_states.shape[0] == 0:
+        if capture is not None:
+            capture(hidden_states)
         return hidden_states
-    return access.norm_output(
-        hidden_states, residual, layernorm, capture_output, **read_kwargs
+    return access.final_norm_pair(
+        hidden_states, residual, layernorm, capture, **read_kwargs
     )
 
 
@@ -115,29 +124,46 @@ def to_pp(hidden_states, forward_batch, *, preserve_declared=True):
             partial sum unreduced for the receiver's from_pp to complete; pass
             False only when the receiver does not declare that sum.
 
-    Runtime-selected completion work is finished before transport.
+    Runtime-selected completion work is finished before transport. A stream
+    the producer already wrote (MHC writes its streams at the FFN exit) has no
+    separate residual and is sent as hidden_states alone; the receiver's
+    from_pp reconstructs it as written.
     """
-    hidden_states, residual = current(forward_batch).finish(
+    hidden_states, residual = stream_of(forward_batch).export(
         hidden_states, preserve_declared=preserve_declared
     )
     forward_batch.residual_stream = None
-    return PPProxyTensors({"hidden_states": hidden_states, "residual": residual})
+    tensors = {"hidden_states": hidden_states}
+    if residual is not None:
+        tensors["residual"] = residual
+    return PPProxyTensors(tensors)
 
 
 def snapshot(hidden_states, forward_batch):
-    return current(forward_batch).snapshot(hidden_states)
+    return stream_of(forward_batch).snapshot(hidden_states)
 
 
 def add_to_output(hidden_states, forward_batch, extra):
-    output, _ = access.add_to_output(hidden_states, current(forward_batch), extra)
-    return output
+    """Complete the output before adding an extra contribution exactly once.
+    Leave its residual update for the next prepare call."""
+    hidden_states = stream_of(forward_batch).complete(hidden_states)
+    hidden_states.add_(extra)
+    return hidden_states
 
 
 def fold(hidden_states, forward_batch):
-    output, _ = access.fold(hidden_states, current(forward_batch))
-    return output
+    """Finish a plain layer output and fold its residual into a complete value.
+    The following stage receives it with no outstanding residual addition."""
+    stream = stream_of(forward_batch)
+    if stream.pending is not None and not stream.pending.update.is_plain_add:
+        raise NotImplementedError("fold requires a plain residual update")
+    hidden_states, residual = stream.export(hidden_states)
+    hidden_states = complete_owed(hidden_states)
+    if residual is not None:
+        hidden_states = hidden_states + residual
+    return stream.write(hidden_states)
 
 
-def written(hidden_states, forward_batch):
+def set_written(hidden_states, forward_batch):
     forward_batch.residual_stream = ResidualStream(hidden_states)
     return hidden_states

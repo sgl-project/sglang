@@ -45,12 +45,16 @@ from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
-    is_in_full_prefill_graph,
 )
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
     is_in_breakable_cuda_graph,
 )
+from sglang.srt.model_executor.runner_utils.forward_batch import get_forward_batch
+from sglang.srt.model_executor.runner_utils.prefill_graph import (
+    is_in_full_prefill_graph,
+)
+from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -160,8 +164,8 @@ class HPCOpsAttnBackend(AttentionBackend):
         self.use_fp8 = model_runner.kv_cache_dtype == torch.float8_e4m3fn
         if self.use_fp8:
             heads = (
-                model_runner.model_config.num_attention_heads // model_runner.tp_size,
-                model_runner.model_config.get_num_kv_heads(model_runner.tp_size),
+                model_runner.model_config.num_attention_heads // get_parallel().tp_size,
+                model_runner.model_config.get_num_kv_heads(get_parallel().tp_size),
             )
             if heads not in FP8_ROPE_SUPPORTED_HEAD_CONFIGS:
                 raise ValueError(
@@ -174,8 +178,8 @@ class HPCOpsAttnBackend(AttentionBackend):
 
         config = model_runner.model_config
         head_dim = config.head_dim
-        num_q_heads = config.num_attention_heads // model_runner.tp_size
-        num_kv_heads = config.get_num_kv_heads(model_runner.tp_size)
+        num_q_heads = config.num_attention_heads // get_parallel().tp_size
+        num_kv_heads = config.get_num_kv_heads(get_parallel().tp_size)
         gqa_group_size = num_q_heads // num_kv_heads
         if head_dim != _SUPPORTED_HEAD_DIM or gqa_group_size not in (
             _SUPPORTED_GQA_GROUP_SIZES
@@ -419,7 +423,6 @@ class HPCOpsAttnBackend(AttentionBackend):
                 cos_sin_cache,
                 out_q,
                 layer,
-                forward_batch,
                 qk_norm_policy,
                 q_norm_weight=q_norm_weight,
                 k_norm_weight=k_norm_weight,
@@ -655,7 +658,6 @@ class HPCOpsAttnBackend(AttentionBackend):
         cos_sin_cache: torch.Tensor,
         out_q: torch.Tensor,
         layer,
-        forward_batch: ForwardBatch,
         qk_norm_policy: int,
         *,
         q_norm_weight: Optional[torch.Tensor] = None,
@@ -669,6 +671,7 @@ class HPCOpsAttnBackend(AttentionBackend):
         alive. ``out_q`` is preallocated by the captured segment and mutated in
         place, which is what stitches the surrounding graph segments together.
         """
+        forward_batch = get_forward_batch()
         real_num_tokens = forward_batch.global_num_token_non_padded_cpu
 
         get_attn_backend()._run_fp8_rope_store_kv(

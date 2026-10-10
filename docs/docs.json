@@ -18,6 +18,10 @@
       "destination": "/cookbook/intro"
     },
     {
+      "source": "/cookbook/autoregressive/Perplexity/pplx-decider-v1-27b",
+      "destination": "/cookbook/autoregressive/Perplexity/PPLX-Decider-v1-27B"
+    },
+    {
       "source": "/whl",
       "destination": "https://sgl-project.github.io/whl/",
       "permanent": false
@@ -887,9 +891,9 @@
             "icon": "play",
             "pages": [
               "index",
-              "docs/get-started/install",
               "docs/get-started/quickstart",
-              "docs/basic_usage/send_request"
+              "docs/get-started/install",
+              "docs/get-started/examples"
             ]
           }
         ]
@@ -902,6 +906,7 @@
             "icon": "book-open",
             "pages": [
               "docs/basic_usage/overview",
+              "docs/basic_usage/send_request",
               {
                 "group": "OpenAI-Compatible APIs",
                 "pages": [
@@ -935,6 +940,7 @@
               "docs/advanced_features/structured_outputs_for_reasoning_models",
               "docs/advanced_features/tool_parser",
               "docs/advanced_features/separate_reasoning",
+              "docs/advanced_features/thinking_budget",
               "docs/advanced_features/quantization",
               "docs/advanced_features/quantized_kv_cache",
               "docs/advanced_features/reasoning_aware_compression",
@@ -1329,6 +1335,7 @@
                     "group": "Google",
                     "pages": [
                       "cookbook/autoregressive/Google/EmbeddingGemma",
+                      "cookbook/autoregressive/Google/EmbeddingGemma2",
                       "cookbook/autoregressive/Google/Gemma4",
                       "cookbook/autoregressive/Google/DiffusionGemma"
                     ]
@@ -1471,6 +1478,19 @@
                       "cookbook/autoregressive/Poolside/Laguna-M.1",
                       "cookbook/autoregressive/Poolside/Laguna-XS.2"
                     ]
+                  },
+                  {
+                    "group": "Perplexity",
+                    "pages": [
+                      "cookbook/autoregressive/Perplexity/PPLX-Decider-v1.1-27B",
+                      "cookbook/autoregressive/Perplexity/PPLX-Decider-v1-27B"
+                    ]
+                  },
+                  {
+                    "group": "Cloudflare",
+                    "pages": [
+                      "cookbook/autoregressive/Cloudflare/clef"
+                    ]
                   }
                 ]
               },
@@ -1500,7 +1520,8 @@
                     "group": "Wan",
                     "pages": [
                       "cookbook/diffusion/Wan/Wan2.1",
-                      "cookbook/diffusion/Wan/Wan2.2"
+                      "cookbook/diffusion/Wan/Wan2.2",
+                      "cookbook/diffusion/Wan/Wan-Animate-2"
                     ]
                   },
                   {
@@ -1593,6 +1614,14 @@
                     "tag": "NEW",
                     "pages": [
                       "cookbook/diffusion/MiniMax/MiniMax-H3"
+                    ]
+                  },
+                  {
+                    "group": "Kandinsky",
+                    "tag": "NEW",
+                    "pages": [
+                      "cookbook/diffusion/Kandinsky/Kandinsky6",
+                      "cookbook/diffusion/Kandinsky/Kandinsky6-SR"
                     ]
                   },
                   {

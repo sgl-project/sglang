@@ -85,7 +85,10 @@ def resolve_decode_backend(
             debug_eager=get_exec().graph.debug_cuda_graph,
         )
 
-    if backend_name != Backend.FULL:
+    # Callers decide whether to construct a graph runner. Explicit construction
+    # with a disabled config (e.g. the draft-runner test harness) historically
+    # uses the full backend; retiring TCPCG must preserve that behavior.
+    if backend_name not in (Backend.FULL, Backend.DISABLED):
         raise ValueError(f"Unsupported decode graph backend: {backend_name}")
 
     full_backend_cls = None

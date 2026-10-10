@@ -19,7 +19,7 @@ an explicit address); off by default so an upgrade never reserves a port a
 co-hosted neighbor's KV publisher binds. The port comes from
 `resolve_load_pub_range` (the same function `/server_info` advertises with,
 so the two cannot drift). With `auto`, a worker's ZMQ footprint is
-`2 * dp_size` ports after its KV base (`2 * dp_size + 1` with the
+`2 * num_dp_ranks` ports after its KV base (`2 * num_dp_ranks + 1` with the
 conventional adjacent replay), so co-hosted workers must space their KV
 bases that far apart or move the range with an explicit address.
 """
@@ -164,7 +164,7 @@ class SchedulerLoadPublisher:
         resolved, reason = resolve_load_pub_range(
             kv_endpoint=cfg.endpoint,
             replay_endpoint=cfg.replay_endpoint,
-            dp_size=get_parallel().dp_size,
+            dp_size=get_parallel().num_dp_ranks,
             load_publish_endpoint=load_publish_endpoint,
         )
         if resolved is None:

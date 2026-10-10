@@ -28,6 +28,7 @@ from sglang.srt.arg_groups.choices import (
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     CudaGraphConfig,
+    parse_cuda_graph_backend_arg,
     parse_cuda_graph_config_arg,
 )
 from sglang.srt.utils.common import human_readable_int
@@ -92,7 +93,7 @@ class ExecFeatures(msgspec.Struct):
     enable_encoder_swa_bounded_replay: A[
         bool,
         "DeepSeek-V4.1 encoder SWA bounded replay: cache Main KV and Indexer keys only, "
-        "rebuild request-owned SWA windows on prefix hits. Experimental; CUDA only.",
+        "rebuild request-owned SWA windows on prefix hits. Experimental; CUDA and gfx950.",
     ] = False
     enable_decoder_swa_bounded_replay: A[
         bool,
@@ -217,11 +218,13 @@ class ExecKernel(msgspec.Struct):
                 "flashmla_kv",
                 "flashmla_auto",
                 "flashinfer_sparse_mla",
+                "triton_sparse_mla",
                 "fa3",
                 "tilelang",
                 "triton",
                 "aiter",
                 "trtllm",
+                "intel_xpu",
             ],
             resolvable=True,
         ),
@@ -237,6 +240,16 @@ class ExecKernel(msgspec.Struct):
             choices=["auto", "flashmla_sparse", "flashmla_sparse_q8"],
         ),
     ] = "auto"
+    dsa_triton_union: A[
+        int,
+        Arg(
+            help="Union group size for --dsa-prefill-backend triton_sparse_mla: "
+            "0 disables, 2 or 4 make G adjacent query tokens share one gathered "
+            "index set (mathematically exact; an ownership mask restores each "
+            "token's own softmax support).",
+            choices=[0, 2, 4],
+        ),
+    ] = 0
     dsa_decode_backend: A[
         Optional[str],
         Arg(
@@ -252,6 +265,7 @@ class ExecKernel(msgspec.Struct):
                 "triton",
                 "aiter",
                 "trtllm",
+                "intel_xpu",
             ],
             resolvable=True,
         ),
@@ -326,6 +340,19 @@ class ExecKernel(msgspec.Struct):
         bool,
         "Enable the experimental FP4 C4 indexer path for DeepSeek V4. Default keeps the existing indexer implementation.",
     ] = False
+    enable_dsa_fused_indexer: A[
+        Optional[bool],
+        Arg(
+            help="Use the four-kernel fused DSA indexer decode path in place of "
+            "the 12-launch aiter/torch chain. By default this is enabled "
+            "wherever it is supported -- gfx950 (MI355X) with aiter preshuffle "
+            "and an fp8 e4m3fn index cache -- and the runtime declines with a "
+            "logged reason wherever any of that is missing. Pass "
+            "--no-enable-dsa-fused-indexer to force the standard path.",
+            action=argparse.BooleanOptionalAction,
+            resolvable=True,
+        ),
+    ] = None
 
 
 class ExecMamba(msgspec.Struct):
@@ -488,6 +515,7 @@ class ExecGraph(msgspec.Struct):
         Arg(
             help="Backend for the decode phase. Folds into cuda_graph_config[decode].backend.",
             choices=Backend.ALL,
+            type_parser=parse_cuda_graph_backend_arg,
         ),
     ] = None
     cuda_graph_backend_prefill: A[
@@ -495,6 +523,7 @@ class ExecGraph(msgspec.Struct):
         Arg(
             help="Backend for the prefill phase. Folds into cuda_graph_config[prefill].backend.",
             choices=Backend.ALL,
+            type_parser=parse_cuda_graph_backend_arg,
         ),
     ] = None
     cuda_graph_max_bs_decode: A[

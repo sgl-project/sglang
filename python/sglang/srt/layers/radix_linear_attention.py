@@ -22,11 +22,14 @@ from torch import nn
 
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
-    is_in_full_prefill_graph,
 )
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
     is_in_breakable_cuda_graph,
+)
+from sglang.srt.model_executor.runner_utils.forward_batch import get_forward_batch
+from sglang.srt.model_executor.runner_utils.prefill_graph import (
+    is_in_full_prefill_graph,
 )
 
 if TYPE_CHECKING:
@@ -97,7 +100,12 @@ class RadixLinearAttention(nn.Module):
                 dtype=mixed_qkv.dtype,
                 device=mixed_qkv.device,
             )
-            self._eager_linear_attention(mixed_qkv, a, b, output, forward_batch)
+            if is_in_breakable_cuda_graph() and _linear_extend_in_graph():
+                _linear_attention_with_output_impl(
+                    mixed_qkv, a, b, output, self, forward_batch
+                )
+            else:
+                self._eager_linear_attention(mixed_qkv, a, b, output)
             return output
 
         # Target verify rebuilds query_start_loc from the physical padded input,
@@ -136,11 +144,12 @@ class RadixLinearAttention(nn.Module):
             b=b,
         )
 
-    def _capture_stub_linear_attention(self, mixed_qkv, a, b, output, forward_batch):
+    def _capture_stub_linear_attention(self, mixed_qkv, a, b, output):
         output.zero_()
 
     @eager_on_graph(capture_stub=_capture_stub_linear_attention)
-    def _eager_linear_attention(self, mixed_qkv, a, b, output, forward_batch):
+    def _eager_linear_attention(self, mixed_qkv, a, b, output):
+        forward_batch = get_forward_batch()
         _linear_attention_with_output_impl(mixed_qkv, a, b, output, self, forward_batch)
 
 
@@ -186,3 +195,17 @@ def _linear_attention_with_output_impl(
     # Physical padding participates in following residual, router, expert/MoE,
     # and collective operations. Keep those inputs finite and deterministic.
     output[:, real_num_tokens:].zero_()
+
+
+def _linear_extend_in_graph() -> bool:
+    """Whether the backend runs this breakable prefill capture's linear extend
+    on static tables inside the graph (no eager break at the layer)."""
+    from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+        HybridLinearAttnBackend,
+    )
+
+    backend = get_attn_backend()
+    return (
+        isinstance(backend, HybridLinearAttnBackend)
+        and backend.linear_extend_in_graph()
+    )

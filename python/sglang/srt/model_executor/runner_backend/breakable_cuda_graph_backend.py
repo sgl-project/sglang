@@ -45,6 +45,7 @@ from sglang.srt.model_executor.runner_utils.pool import (
     graph_pool_capture_scope,
     graph_pool_replay_scope,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
@@ -75,7 +76,7 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         self._capture_inputs: Dict[Any, Any] = {}
         self._pool = None
         self._device_module = cuda_graph_runner.device_module
-        self._tp_group = cuda_graph_runner.model_runner.tp_group
+        self._tp_group = get_parallel().tp_group
         self._capture_stream: Optional[torch.cuda.Stream] = None
         self._debug_eager = debug_eager
         self._shared_output_buffer: Optional[Any] = None
@@ -264,7 +265,7 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         **kwargs,
     ) -> Any:
         with graph_pool_replay_scope():
-            self._graphs[shape_key].replay(static_forward_batch)
+            self._graphs[shape_key].replay()
         return self._outputs[shape_key]
 
     def cleanup(self) -> None:

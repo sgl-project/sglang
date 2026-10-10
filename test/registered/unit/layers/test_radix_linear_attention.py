@@ -108,6 +108,11 @@ class TestRadixLinearAttentionPadding(CustomTestCase):
                         "get_attn_backend",
                         return_value=_FakeAttentionBackend(),
                     ),
+                    patch.object(
+                        radix_linear_attention,
+                        "_linear_extend_in_graph",
+                        return_value=False,
+                    ),
                     patch.object(layer, "_eager_linear_attention") as eager,
                 ):
                     layer.forward(
@@ -116,6 +121,34 @@ class TestRadixLinearAttentionPadding(CustomTestCase):
                     self.assertEqual(
                         eager.called, extend and (full or (breakable and not verify))
                     )
+
+    def test_linear_extend_in_graph_does_not_create_an_eager_break(self):
+        layer = radix_linear_attention.RadixLinearAttention(0, 1, 1, 2, 4, 4, 4)
+        batch = SimpleNamespace(
+            forward_mode=SimpleNamespace(
+                is_extend=lambda: True,
+                is_extend_without_speculative=lambda: True,
+            ),
+            global_num_token_non_padded_cpu=3,
+            out_cache_loc=torch.arange(3),
+        )
+        with (
+            patch.object(
+                radix_linear_attention, "is_in_breakable_cuda_graph", return_value=True
+            ),
+            patch.object(
+                radix_linear_attention, "_linear_extend_in_graph", return_value=True
+            ),
+            patch.object(
+                radix_linear_attention,
+                "get_attn_backend",
+                return_value=_FakeAttentionBackend(),
+            ),
+            patch.object(layer, "_eager_linear_attention") as eager,
+        ):
+            out = layer(batch, torch.zeros(3, 8), torch.zeros(3, 2), torch.zeros(3, 2))
+        eager.assert_not_called()
+        torch.testing.assert_close(out, torch.full((1, 3, 2, 4), 5.0))
 
     def test_eager_padded_input_is_sliced_and_output_shape_is_restored(self):
         layer = radix_linear_attention.RadixLinearAttention(

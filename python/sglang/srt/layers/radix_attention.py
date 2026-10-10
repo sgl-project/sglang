@@ -22,18 +22,23 @@ import torch
 from torch import nn
 
 from sglang.srt.layers.attention.graph_utils import (
+    _attention_on_real_rows,
     _zero_padded_tokens,
     allocate_attention_outputs,
     attention_input_scope,
+    padded_extend_real_tokens,
 )
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
-    get_forward_context,
-    is_in_full_prefill_graph,
 )
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
     is_in_breakable_cuda_graph,
+)
+from sglang.srt.model_executor.runner_utils.forward_batch import get_forward_batch
+from sglang.srt.model_executor.runner_utils.prefill_graph import (
+    get_prefill_raw_num_tokens,
+    is_in_full_prefill_graph,
 )
 
 if TYPE_CHECKING:
@@ -142,7 +147,6 @@ class RadixAttention(nn.Module):
                 k,
                 v,
                 output,
-                forward_batch,
                 save_kv_cache,
                 key_value_num_tokens,
                 idx_output,
@@ -153,6 +157,19 @@ class RadixAttention(nn.Module):
             if kwargs.get("return_lse") or forward_batch.mha_return_lse:
                 return output.view(-1, self.tp_q_head_num, self.v_head_dim), lse
             return output
+        real_num_tokens = padded_extend_real_tokens(q, forward_batch)
+        if real_num_tokens is not None:
+            return _attention_on_real_rows(
+                self,
+                real_num_tokens,
+                q,
+                k,
+                v,
+                forward_batch,
+                save_kv_cache,
+                key_value_num_tokens=key_value_num_tokens,
+                **kwargs,
+            )
         return get_attn_backend().forward(
             q, k, v, self, forward_batch, save_kv_cache, **kwargs
         )
@@ -164,13 +181,13 @@ class RadixAttention(nn.Module):
         k,
         v,
         output,
-        forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
         key_value_num_tokens: Optional[int] = None,
         idx_output=None,
         **kwargs,
     ):
         """Run real tokens, retaining padded outputs for the next graph segment."""
+        forward_batch = get_forward_batch()
         rows = output.shape[0]
         n = forward_batch.global_num_token_non_padded_cpu
         kv_n = n if key_value_num_tokens is None else key_value_num_tokens
@@ -203,7 +220,7 @@ class RadixAttention(nn.Module):
                 result, lse, *_ = result
             if result.data_ptr() != output.data_ptr():
                 output[:n].view(result.shape).copy_(result)
-            raw = get_forward_context().raw_num_tokens
+            raw = get_prefill_raw_num_tokens()
             _zero_padded_tokens(output, raw)
             if idx_output is not None:
                 _zero_padded_tokens(idx_output, raw)

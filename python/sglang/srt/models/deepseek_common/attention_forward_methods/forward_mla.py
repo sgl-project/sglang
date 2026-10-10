@@ -15,6 +15,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.dsa.utils import is_graph_dsa_split_op_surface
 from sglang.srt.layers.attention.dsa_backend import prepare_kv_for_attention
+from sglang.srt.layers.attention.graph_utils import padded_extend_real_tokens
 from sglang.srt.layers.dcp import (
     all_gather_kv_cache_for_mla_extend,
     all_gather_q_for_mla_decode,
@@ -36,7 +37,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
     get_token_to_kv_pool,
-    is_in_full_prefill_graph,
 )
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
@@ -62,6 +62,10 @@ logger = logging.getLogger(__name__)
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 _ENABLE_DSA_Q8KV8_BORN_FP8_Q = envs.SGLANG_ENABLE_DSA_Q8KV8_BORN_FP8_Q.get()
 _ENABLE_DSA_Q8KV8_QPREP_OVERLAP = envs.SGLANG_ENABLE_DSA_Q8KV8_QPREP_OVERLAP.get()
+
+from sglang.srt.model_executor.runner_utils.prefill_graph import (
+    is_in_full_prefill_graph,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
@@ -600,7 +604,10 @@ class DeepseekMLAForwardMixin:
                 absorbed_bmm_concat_cast_q_fp8(
                     q_fp8, q_nope, self.w_kc, q_pe, self.num_local_heads
                 )
-            born_q_backend.q8kv8_stash_born_q(num_tokens, self.attn_mqa.layer_id)
+            born_q_backend.q8kv8_stash_born_q(
+                padded_extend_real_tokens(q_nope, forward_batch) or num_tokens,
+                self.attn_mqa.layer_id,
+            )
             q_nope_out = born_q_backend.q8kv8_born_q_sentinel(
                 num_tokens, self.num_local_heads, self.kv_lora_rank, q_nope.device
             )
@@ -694,7 +701,6 @@ class DeepseekMLAForwardMixin:
                     k_nope,
                     fusion_plan.attn_output_buf,
                     save_kv_cache,
-                    forward_batch,
                     q_pe,
                     k_pe,
                     cos_sin_cache=extra_args.get("cos_sin_cache"),
@@ -940,7 +946,6 @@ class DeepseekMLAForwardMixin:
         k_nope: torch.Tensor,
         attn_output_buf: torch.Tensor,
         save_kv_cache: bool,
-        forward_batch: ForwardBatch,
         q_pe: torch.Tensor,
         k_pe: torch.Tensor,
         cos_sin_cache: Optional[torch.Tensor] = None,
@@ -955,7 +960,6 @@ class DeepseekMLAForwardMixin:
             k_nope,
             k_nope,
             attn_output_buf,
-            forward_batch,
             save_kv_cache,
             q_rope=q_pe,
             k_rope=k_pe,

@@ -1,12 +1,13 @@
 """BCG prefill must not change decode or verification fusion eligibility."""
 
+import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 import torch
 
-from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.runner_utils.prefill_graph import prefill_graph_scope
 from sglang.srt.models.inkling_common.kernels import comm
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -36,7 +37,7 @@ def test_fusion_gate_preserves_non_prefill_behavior(scope, mode, scattered):
         else comm.fullwidth_ar_sconv_fusable
     )
     with (
-        forward_context(ForwardContext(attn_backend=None, full_graph=scope == "full")),
+        prefill_graph_scope(full_graph=scope == "full"),
         patch.object(comm, "is_cuda", return_value=True),
         patch.object(
             comm, "is_in_breakable_cuda_graph", return_value=scope == "breakable"
@@ -64,3 +65,7 @@ def test_fusion_gate_preserves_non_prefill_behavior(scope, mode, scattered):
             scope == "breakable" and mode == "extend"
         )
         assert gate(group, batch, 4096, 128, torch.bfloat16) == expected
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

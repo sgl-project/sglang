@@ -4,20 +4,19 @@
 // real weights.
 //
 // Every DSpark cell caps --cuda-graph-max-bs-decode: the derived batch list does
-// not fit while capturing the DSpark decode graphs, on any NVIDIA platform. The
-// MI350X cell already carried the equivalent --cuda-graph-max-bs. H200 is the
+// not fit while capturing the DSpark decode graphs, on any platform. H200 is the
 // tightest board at 140 GiB and needs the cap on both cells plus a lower memory
-// fraction; the three other High-Throughput cells start without either.
+// fraction; the B200 / B300 / GB300 High-Throughput cells start without either.
 //
 // DP-Attention, DeepEP and MegaMoE are absent by design: they have never been
-// enabled on this model. EP is set equal to TP on every shape here.
+// enabled on this model. EP is set equal to TP on every shape except MI355X.
 
 export const config = {
   modelName: "DeepSeek-V4.1",
 
   latencyPercentile: "P50",
 
-  supportedHardware: ["h200", "b200", "b300", "gb300", "mi350x"],
+  supportedHardware: ["h200", "b200", "b300", "gb300", "mi355x"],
 
   // Hardware is the implicit first match dim; Strategy is the only other one.
   // Declaring matchDims replaces variants / quantizations / nodesOptions
@@ -50,12 +49,13 @@ export const config = {
 -d '{ "model": "{{MODEL_NAME}}", "messages": [{"role":"user","content":"Hello"}] }'`,
 
   dockerImages: {
-    // DeepSeek-V4.1 support has not shipped in a release yet.
+    // DeepSeek-V4.1 support has not shipped in a CUDA release yet; the ROCm
+    // images carry it from v0.5.21.
     h200:  "lmsysorg/sglang:dev-dsv41",
     b200:  "lmsysorg/sglang:dev-dsv41",
     b300:  "lmsysorg/sglang:dev-dsv41",
     gb300: "lmsysorg/sglang:dev-dsv41",
-    mi350x: "lmsysorg/sglang:dev-dsv41-mi35x",
+    mi355x: "lmsysorg/sglang-rocm:v0.5.21-rocm720-mi35x-20261006",
   },
 
   github: {
@@ -66,14 +66,14 @@ export const config = {
 
     attention: {
       knobs: [
-        { id: "tp", label: "TP", values: [null, 4, 8] },
+        { id: "tp", label: "TP", values: [null, 2, 4, 8] },
       ],
     },
 
     // No backend chooser: `flashinfer_mxfp4` is selected automatically and is the
     // only MoE runner this model has run on. EP tracks TP.
     moe: {
-      ep: { label: "EP", values: [null, 4, 8] },
+      ep: { label: "EP", values: [null, 1, 4, 8] },
     },
 
     // Both parsers default to None; without them the DSML tool-call block and the
@@ -122,11 +122,10 @@ export const config = {
       },
     },
 
-    // GPU → CPU KV offload (L2 only; no storage tier). Hidden on MI350X: both
-    // ROCm cells run `--disable-radix-cache`, which the server rejects alongside
-    // `--enable-hierarchical-cache`.
+    // GPU → CPU KV offload (L2 only; no storage tier). Hidden on MI355X: not
+    // validated on ROCm for this model yet.
     hicache: {
-      excludesHw: ["mi350x"],
+      excludesHw: ["mi355x"],
       writePolicies: [
         { id: "auto",                    label: "Auto" },
         { id: "write_through",           label: "Write-through" },
@@ -343,35 +342,39 @@ export const config = {
       ],
     },
 
-    // ---------- MI350X: 4x MI350X (gfx950), TP4 + EP4. Speculative decoding is
-    // rejected on ROCm, so there is one recipe. ----------
+    // ---------- MI355X: 2x MI355X (gfx950), TP2 + EP1.
     {
-      // DSpark runs on MI350X but is off by default; this cell turns it on.
-      match: { hw: "mi350x", strategy: "low-latency" },
+      match: { hw: "mi355x", strategy: "low-latency" },
       nnodes: 1,
       verified: true,
       env: [
-        // Load-bearing: without it the fp4 experts land in the Triton
-        // fused-experts runner and assert on the hidden size.
-        "SGLANG_USE_AITER=1",
-        "SGLANG_MOE_PADDING=1",
-        // Required for run-to-run repeatable output: forces the FlyDSL MoE
-        // down-projection onto a per-slot reduce instead of atomics.
-        "AITER_FLYDSL_FORCE_REDUCE=1",
-        "ROCM_QUICK_REDUCE_QUANTIZATION=NONE",
+        // Required until ROCm/aiter#5802 is in the aiter pin: below 256 tokens aiter
+        // routes these fp4 experts to a bf16-activation MoE path the pin cannot run.
+        "AITER_BF16_FP8_MOE_BOUND=0",
+        "SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1",
+        "SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT=per_rank",
+        "SGLANG_USE_ROCM700A=0",
+        "TORCH_BLAS_PREFER_HIPBLASLT=1",
       ],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
-        "--tp 4",
-        "--ep-size 4",
-        "--disable-radix-cache",
-        "--mem-fraction-static 0.8",
+        "--tp 2",
+        "--ep-size 1",
+        "--mem-fraction-static 0.85",
         "--speculative-algorithm DSPARK",
         "--speculative-dspark-block-size 5",
+        // Fuses the shared expert into the routed MoE launch, which is worth more
+        // at TP2 than TP4: the same fused GEMM covers twice the experts per rank.
+        "--enforce-shared-experts-fusion",
+        // The one backend worth naming on gfx950: aiter's fp8 GEMM beats what the
+        // automatic selection resolves to for this model's 32-wide ue8m0 blocks.
+        "--fp8-gemm-backend aiter",
+        // Decode CUDA graphs: the derived batch list does not fit here; a cap of 64
+        // fits and keeps 64-request decode batches on the graph.
         "--cuda-graph-max-bs-decode 64",
-        "--cuda-graph-backend-prefill breakable",
-        "--cuda-graph-max-bs-prefill 4096",
+        "--enable-decoder-swa-bounded-replay",
+        "--cuda-graph-backend-prefill disabled",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
         "--host {{HOST_IP}}",
@@ -379,29 +382,32 @@ export const config = {
       ],
     },
     {
-      // The attention backend and mem-fraction-static are the resolved
-      // defaults on HIP, so this cell leaves both alone.
-      match: { hw: "mi350x", strategy: "high-throughput" },
+      match: { hw: "mi355x", strategy: "high-throughput" },
       nnodes: 1,
       verified: true,
       env: [
-        // Load-bearing: without it the fp4 experts land in the Triton
-        // fused-experts runner and assert on the hidden size.
-        "SGLANG_USE_AITER=1",
-        "SGLANG_MOE_PADDING=1",
-        // Required for run-to-run repeatable output: forces the FlyDSL MoE
-        // down-projection onto a per-slot reduce instead of atomics.
-        "AITER_FLYDSL_FORCE_REDUCE=1",
-        "ROCM_QUICK_REDUCE_QUANTIZATION=NONE",
+        "AITER_BF16_FP8_MOE_BOUND=0",
+        "SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1",
+        "SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT=per_rank",
+        "SGLANG_USE_ROCM700A=0",
+        "TORCH_BLAS_PREFER_HIPBLASLT=1",
       ],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
-        "--tp 4",
-        "--ep-size 4",
-        "--disable-radix-cache",
-        "--cuda-graph-backend-prefill breakable",
-        "--cuda-graph-max-bs-prefill 4096",
+        "--tp 2",
+        "--ep-size 1",
+        "--mem-fraction-static 0.85",
+        // DSpark with graphs up to the running-request cap: 47% more throughput
+        // than plain decode at 256 concurrent requests.
+        "--speculative-algorithm DSPARK",
+        "--speculative-dspark-block-size 5",
+        "--enforce-shared-experts-fusion",
+        "--fp8-gemm-backend aiter",
+        "--cuda-graph-max-bs-decode 128",
+        "--max-running-requests 128",
+        "--enable-decoder-swa-bounded-replay",
+        "--cuda-graph-backend-prefill disabled",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
         "--host {{HOST_IP}}",

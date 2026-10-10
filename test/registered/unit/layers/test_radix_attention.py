@@ -1,5 +1,7 @@
 """CPU contracts shared by the full and breakable prefill attention paths."""
 
+import sys
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -8,14 +10,28 @@ import torch
 
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.runner_utils.forward_batch import set_forward_batch
+from sglang.srt.model_executor.runner_utils.prefill_graph import prefill_graph_scope
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
+@contextmanager
+def attention_scope(batch, backend, *, full_graph=False, raw_num_tokens=None):
+    with (
+        forward_context(ForwardContext(backend)),
+        set_forward_batch(batch),
+        prefill_graph_scope(full_graph=full_graph, raw_num_tokens=raw_num_tokens),
+    ):
+        yield
+
+
 def make_batch(tokens=2, rows=4, return_lse=False):
     return SimpleNamespace(
-        forward_mode=SimpleNamespace(is_extend=lambda: True),
+        forward_mode=SimpleNamespace(
+            is_extend=lambda: True, is_target_verify=lambda: False
+        ),
         global_num_token_non_padded_cpu=tokens,
         out_cache_loc=torch.arange(rows),
         positions=torch.arange(rows),
@@ -47,12 +63,11 @@ def test_dense_outputs_padding_and_lse(breakable, return_lse, tokens):
 
     q = torch.zeros(4, 2, 3)
     with (
-        forward_context(
-            ForwardContext(
-                SimpleNamespace(forward=attention),
-                full_graph=not breakable,
-                raw_num_tokens=tokens,
-            )
+        attention_scope(
+            batch,
+            SimpleNamespace(forward=attention),
+            full_graph=not breakable,
+            raw_num_tokens=tokens,
         ),
         patch(
             "sglang.srt.layers.radix_attention.is_in_breakable_cuda_graph",
@@ -90,10 +105,8 @@ def test_extra_kwargs_and_exception_restore():
         assert kwargs["q_descale"].shape[0] == 2
         raise RuntimeError("backend failed")
 
-    with forward_context(
-        ForwardContext(
-            SimpleNamespace(forward=attention), full_graph=True, raw_num_tokens=2
-        )
+    with attention_scope(
+        batch, SimpleNamespace(forward=attention), full_graph=True, raw_num_tokens=2
     ):
         with pytest.raises(RuntimeError, match="backend failed"):
             layer(
@@ -129,10 +142,11 @@ def test_sparse_full_graph_two_outputs(tokens, has_index_value):
             torch.ones_like(q),
         )
 
-    with forward_context(
-        ForwardContext(
-            SimpleNamespace(forward=attention), full_graph=True, raw_num_tokens=tokens
-        )
+    with attention_scope(
+        batch,
+        SimpleNamespace(forward=attention),
+        full_graph=True,
+        raw_num_tokens=tokens,
     ):
         index_output, output = layer(q, q, q, batch, idx_q=idx, idx_k=idx)
     assert output.shape == (4, 6) and index_output.shape == (4, 2)
@@ -151,7 +165,7 @@ def test_direct_backend_dispatch(sparse):
     result = object()
     backend = SimpleNamespace(forward=lambda *args, **kwargs: result)
     with (
-        forward_context(ForwardContext(backend)),
+        attention_scope(batch, backend),
         patch(
             "sglang.srt.layers.radix_attention.is_in_breakable_cuda_graph",
             return_value=sparse,
@@ -169,7 +183,7 @@ def test_output_dtype_follows_values():
     backend = SimpleNamespace(
         forward=lambda q, k, v, *args, **kwargs: torch.ones_like(v)
     )
-    with forward_context(ForwardContext(backend, full_graph=True, raw_num_tokens=2)):
+    with attention_scope(batch, backend, full_graph=True, raw_num_tokens=2):
         assert layer(q, q, v, batch).dtype == torch.bfloat16
 
 
@@ -200,7 +214,7 @@ def test_attention_replay_uses_live_batch_and_static_output_buffers(return_lse):
     )
     backend = SimpleNamespace(forward=attention)
     with (
-        forward_context(ForwardContext(backend, raw_num_tokens=2)),
+        attention_scope(captured_batch, backend, raw_num_tokens=2),
         patch(
             "sglang.srt.layers.radix_attention.is_in_breakable_cuda_graph",
             return_value=True,
@@ -213,10 +227,32 @@ def test_attention_replay_uses_live_batch_and_static_output_buffers(return_lse):
             bcg._current_capture_var.reset(token)
     output, lse = result if return_lse else (result, None)
     pointer = output.data_ptr()
-    with forward_context(ForwardContext(backend, raw_num_tokens=1)):
-        graph._break_fns[0](live_batch)
+    with attention_scope(live_batch, backend, raw_num_tokens=1):
+        graph._break_fns[0]()
     assert seen == [captured_batch, live_batch]
     assert output.data_ptr() == pointer
     assert torch.all(output[:1] == 2) and torch.count_nonzero(output[1:]) == 0
     if return_lse:
         assert torch.all(lse[:1] == 2) and torch.count_nonzero(lse[1:]) == 0
+
+
+def test_prefill_graph_policy_restores_after_exception():
+    from sglang.srt.model_executor.runner_utils.prefill_graph import (
+        get_prefill_raw_num_tokens,
+        is_in_full_prefill_graph,
+    )
+
+    with prefill_graph_scope(full_graph=True, raw_num_tokens=3):
+        with pytest.raises(RuntimeError):
+            with prefill_graph_scope(full_graph=False, raw_num_tokens=1):
+                assert not is_in_full_prefill_graph()
+                assert get_prefill_raw_num_tokens() == 1
+                raise RuntimeError("forward failed")
+        assert is_in_full_prefill_graph()
+        assert get_prefill_raw_num_tokens() == 3
+    assert not is_in_full_prefill_graph()
+    assert get_prefill_raw_num_tokens() is None
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
