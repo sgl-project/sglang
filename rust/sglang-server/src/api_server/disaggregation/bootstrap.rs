@@ -216,7 +216,9 @@ async fn route_put(State(state): State<Arc<Registry>>, Json(body): Json<Route>) 
                 rank_port: body.rank_port,
             },
         );
-        topo.registered_count += 1;
+        // A retried registration replaces the same rank. Counting PUTs would
+        // advertise readiness while another rank is still missing.
+        topo.registered_count = topo.prefill_ranks.len() as i64;
         topo
     });
 
@@ -582,6 +584,10 @@ mod tests {
         // dp_size resolved to system_dp_size=2 → one registration isn't ready.
         let (status, _) = request(addr, "GET", SENTINEL, None);
         assert_eq!(status, 503);
+
+        // A rank retry cannot stand in for the missing second rank.
+        assert_eq!(request(addr, "PUT", "/route", Some(&rank0)).0, 200);
+        assert_eq!(request(addr, "GET", SENTINEL, None).0, 503);
 
         let rank1 = put_route(serde_json::json!({
             "system_dp_size": 2, "system_dp_rank": 1, "rank_ip": "10.0.0.2",
