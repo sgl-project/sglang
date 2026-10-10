@@ -7,7 +7,7 @@ from sglang.srt.managers.schedule_policy import CacheAwarePolicy, SchedulePolicy
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, enter_scope, published_topology
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -25,6 +25,9 @@ def _make_req(rid, origin_input_text, origin_input_ids, sampling_params=None, **
 
 
 class TestSchedulePolicyHRRN(CustomTestCase):
+    def setUp(self):
+        enter_scope(test_case=self, scope=published_topology())
+
     def test_calc_priority_hrrn(self):
         """HRRN sorts by response ratio (waited_tokens / uncached_tokens).
 
@@ -127,6 +130,7 @@ class TestSchedulePolicyHRRN(CustomTestCase):
 
 class TestShortestPrefillFirst(CustomTestCase):
     def setUp(self):
+        enter_scope(test_case=self, scope=published_topology())
         self.policy = SchedulePolicy(
             policy="shortest-prefill-first",
             tree_cache=RadixCache.create_simulated(),

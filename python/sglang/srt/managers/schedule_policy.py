@@ -202,6 +202,13 @@ class SchedulePolicy:
         self.schedule_low_priority_values_first = schedule_low_priority_values_first
         self.priority_sign = 1 if schedule_low_priority_values_first else -1
         self._shortest_prefill_calls = 0
+        self._waiting_prefix_refresh_enabled = (
+            envs.SGLANG_ENABLE_WAITING_PREFIX_REFRESH.get()
+            # Other eviction strategies ignore recency.
+            and get_memory().radix_eviction_policy.lower() == "lru"
+            and not tree_cache.supports_fast_match_prefix()
+            and tree_cache.supports_prefix_sharing()
+        )
         self._last_waiting_prefix_refresh_forward_ct: Optional[int] = None
 
         # It is used to find the matching prefix for in-batch prefix caching.
@@ -283,17 +290,14 @@ class SchedulePolicy:
     def _touch_waiting_prefixes(
         self, policy: Policy, waiting_queue: List[Req], forward_ct: Optional[int]
     ) -> None:
-        # Head last, so LRU evicts in reverse admission order; cache-aware policies
-        # already touch while matching, and other eviction strategies ignore recency.
         if (
             forward_ct is None
+            or not self._waiting_prefix_refresh_enabled
+            # Cache-aware policies already touch while matching.
             or isinstance(policy, CacheAwarePolicy)
             or not waiting_queue
-            or not envs.SGLANG_ENABLE_WAITING_PREFIX_REFRESH.get()
+            # A PD role switch can flip the mode at runtime.
             or get_disagg().disaggregation_mode == "decode"
-            or get_memory().radix_eviction_policy.lower() != "lru"
-            or self.tree_cache.supports_fast_match_prefix()
-            or not self.tree_cache.supports_prefix_sharing()
         ):
             return
         last = self._last_waiting_prefix_refresh_forward_ct
@@ -303,6 +307,7 @@ class SchedulePolicy:
         ):
             return
         self._last_waiting_prefix_refresh_forward_ct = forward_ct
+        # Head last, so LRU evicts in reverse admission order.
         for r in reversed(waiting_queue[:WAITING_QUEUE_PREFIX_MATCH_MAX]):
             touch_waiting_prefix(r, self.tree_cache)
 
