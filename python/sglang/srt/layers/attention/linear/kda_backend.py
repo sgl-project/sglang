@@ -1862,3 +1862,39 @@ class KDAAttnBackend(MambaAttnBackendBase):
         if apply_onorm:
             layer._k3_onorm_consumed = True
         return out
+
+    def kimi_k3_mono_state(
+        self, layer: RadixLinearAttention, forward_batch: ForwardBatch
+    ) -> Optional[dict]:
+        """The speculative state of one KDA layer, for the K3 mono K1 launch.
+
+        K1 replaces this layer's seam, in-projection, conv and recurrence in
+        one launch, so it needs what the verify path owns. The model side has
+        no route to these tensors, so expose them here -- the same derivation
+        ``_forward_target_verify`` opens with, and nothing more. Everything
+        about K1 itself stays in srt/layers/moe/k3_mono_decode.py.
+
+        None when this batch has no speculative state to hand over.
+        """
+        params = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+        inter_ssm = getattr(params, "intermediate_ssm", None)
+        windows = getattr(params, "intermediate_conv_window", None)
+        spec_info = getattr(forward_batch, "spec_info", None)
+        if inter_ssm is None or not windows or spec_info is None:
+            return None
+        num_reqs = forward_batch.req_pool_indices.shape[0]
+        slots = self.forward_metadata.mamba_cache_indices[:num_reqs]
+        return {
+            "committed_conv": params.conv[0],
+            "committed_ssm": params.temporal,
+            "inter_ssm": inter_ssm,
+            "inter_window": windows[0],
+            "slots": slots,
+            "rows": select_verify_intermediate_state_indices(
+                self.verify_intermediate_state_indices,
+                forward_batch.req_pool_indices,
+                slots >= 0,
+                self.req_to_token_pool.size,
+            ),
+            "num_draft": spec_info.draft_token_num,
+        }

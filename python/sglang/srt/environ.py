@@ -1845,6 +1845,26 @@ class Envs:
     SGLANG_K3_FUSED_FRONT = EnvBool(True)
     # Use the ROCm radix-4 router for covered K3 top-k workloads.
     SGLANG_K3_RADIX4_TOPK = EnvBool(False)
+    # ROCm FlyDSL mono decode for K3: one persistent launch runs the whole MoE
+    # -- router, latent down, shared gate_up, MXFP4 experts, shared down,
+    # latent up and both TP all-reduces, the reduces in-kernel over a HIP-IPC
+    # peer buffer. The router and the latent down are TP sharded here, so the
+    # two widest decode weights are read 8x less. gfx950 + TP8 + decode steps
+    # of at most 8 rows; everything else keeps the existing path. See
+    # srt/layers/moe/k3_mono_decode.py.
+    SGLANG_K3_MONO_DECODE = EnvBool(False)
+    # Widen that launch to a whole layer: o_proj and its all-reduce, the MLP
+    # attention-residual seam and the MoE in one launch instead of three.
+    # Needs SGLANG_K3_MONO_DECODE; a layer it cannot serve keeps the MoE-only
+    # launch.
+    SGLANG_K3_MONO_LAYER = EnvBool(False)
+    # Widen it once more to the KDA half of the layer (the kernel's "K1"):
+    # the attention-residual seam, input_layernorm, the in-projection, the
+    # conv and the recurrence join K2's launch. Needs SGLANG_K3_MONO_LAYER.
+    # Not yet usable: MonoK1.forward still reads index tensors on the host,
+    # which a CUDA graph capture rejects. Kept off until that is fixed so the
+    # layer launch above stays usable on its own.
+    SGLANG_K3_MONO_K1 = EnvBool(False)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MIN_HITS = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MAX_SEQLEN = EnvInt(6144)
