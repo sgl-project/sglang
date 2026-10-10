@@ -74,28 +74,52 @@ pub fn error_body(status: u16, message: &str) -> Vec<u8> {
 /// Re-wrap any chat-path error body into the Anthropic envelope.
 pub fn wrap_error_body(body: &[u8], status: u16) -> Vec<u8> {
     let v: Option<Value> = serde_json::from_slice(body).ok();
-    if let Some(v) = &v {
-        if v.get("type").and_then(Value::as_str) == Some("error")
-            && v.get("error").is_some_and(Value::is_object)
-        {
-            return body.to_vec();
-        }
-    }
-    let message = v
+    let message = match &v {
+        Some(v) => v
+            .pointer("/error/message")
+            .or_else(|| v.get("message"))
+            .or_else(|| v.get("detail"))
+            .or_else(|| v.get("error"))
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        None => Some(String::from_utf8_lossy(body).into_owned()),
+    };
+    let upstream_type = v
         .as_ref()
-        .and_then(|v| {
-            v.pointer("/error/message")
-                .or_else(|| v.get("message"))
-                .or_else(|| v.get("detail"))
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        })
-        .or_else(|| {
-            let text = String::from_utf8_lossy(body).trim().to_owned();
-            (!text.is_empty()).then_some(text)
-        })
-        .unwrap_or_else(|| format!("upstream returned HTTP {status}"));
-    error_body(status, &message)
+        .filter(|v| v.get("type").and_then(Value::as_str) == Some("error"))
+        .and_then(|v| v.pointer("/error/type"))
+        .and_then(Value::as_str)
+        .filter(|_| status < 500);
+    serde_json::to_vec(&json!({
+        "type": "error",
+        "error": {
+            "type": upstream_type.unwrap_or(error_type(status)),
+            "message": scrub_message(message.as_deref().unwrap_or(""), status),
+        },
+    }))
+    .expect("serialize error")
+}
+
+/// 5xx text can carry stack frames, paths or prompt fragments, so it never
+/// reaches the client; 4xx keeps the validation message.
+pub(crate) fn scrub_message(message: &str, status: u16) -> String {
+    const MAX_CHARS: usize = 500;
+    if status >= 500 {
+        return "Internal server error".into();
+    }
+    let kept: Vec<&str> = message
+        .lines()
+        .filter(|l| !l.starts_with("Traceback") && !l.contains("File \"/"))
+        .collect();
+    let cleaned = kept.join("\n");
+    let cleaned = cleaned.trim();
+    if cleaned.is_empty() {
+        return "Request failed".into();
+    }
+    match cleaned.char_indices().nth(MAX_CHARS) {
+        Some((at, _)) => format!("{}\u{2026}", &cleaned[..at]),
+        None => cleaned.to_owned(),
+    }
 }
 
 pub(crate) fn new_id(prefix: &str) -> String {
@@ -169,5 +193,32 @@ mod tests {
         let v: Value = serde_json::from_slice(&wrap_error_body(b"", 503)).unwrap();
         assert_eq!(v["error"]["type"], "overloaded_error");
         assert!(!v["error"]["message"].as_str().unwrap().is_empty());
+    }
+
+    #[test]
+    fn error_messages_are_scrubbed() {
+        let v: Value = serde_json::from_slice(&wrap_error_body(
+            br#"{"object":"error","message":"CUDA OOM at /opt/sglang/x.py","code":500}"#,
+            500,
+        ))
+        .unwrap();
+        assert_eq!(
+            v,
+            json!({"type": "error", "error": {"type": "api_error",
+                   "message": "Internal server error"}})
+        );
+        let v: Value = serde_json::from_slice(&wrap_error_body(
+            br#"{"type":"error","error":{"type":"api_error","message":"secret"}}"#,
+            502,
+        ))
+        .unwrap();
+        assert_eq!(v["error"]["message"], "Internal server error");
+
+        let traced = "bad input\nTraceback (most recent call last):\n  File \"/a.py\", line 1";
+        assert_eq!(scrub_message(traced, 400), "bad input");
+        let long = scrub_message(&"x".repeat(600), 400);
+        assert_eq!(long.chars().count(), 501);
+        assert!(long.ends_with('\u{2026}'));
+        assert_eq!(scrub_message("", 400), "Request failed");
     }
 }

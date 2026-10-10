@@ -426,7 +426,11 @@ embeddings, a PD fleet answers 400 and `--dp-aware` pins no rank.
 routed exactly like `/v1/chat/completions`, and converts the reply (or stream)
 back to the Messages format. Consecutive turns of the same role are merged, as
 the Messages API does, and a final assistant turn is sent as a prefill
-(`continue_final_message`). Every error uses the Anthropic error envelope.
+(`continue_final_message`). Besides the Messages fields, only
+`chat_template_kwargs` and `continue_final_message` reach the chat request.
+Every error uses the Anthropic error envelope; 5xx messages are replaced with a
+generic one, and a failed stream still closes its open block and ends with
+`message_stop`.
 
 `/v1/messages/count_tokens` is answered by the router from the model's chat
 template, without calling an engine. Image tokens are not counted, and a model

@@ -1,8 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Messages request → chat request. `Value`-based so unconsumed fields
-//! (sglang extensions) pass through.
+//! Messages request → chat request.
 
 use serde_json::{json, Map, Value};
 
@@ -19,29 +18,14 @@ pub struct Converted {
     pub stream: bool,
 }
 
-/// Fields not forwarded as-is.
-const CONSUMED: &[&str] = &[
-    "model",
-    "messages",
-    "system",
-    "max_tokens",
-    "stop_sequences",
-    "stream",
-    "thinking",
-    "output_config",
-    "output_format",
-    "tools",
-    "tool_choice",
-    "metadata",
-    "betas",
-    "container",
-    "mcp_servers",
-    "service_tier",
-    "context_management",
-    "inference_geo",
-    // Chat fields that would break the conversion.
-    "stream_options",
-    "n",
+/// Forwarded as-is. Anything else could override the conversion, as
+/// `max_completion_tokens` would take precedence over `max_tokens`.
+const FORWARDED: &[&str] = &[
+    "temperature",
+    "top_p",
+    "top_k",
+    "chat_template_kwargs",
+    "continue_final_message",
 ];
 
 /// `count_only`: `count_tokens` shape, no `max_tokens` required.
@@ -89,7 +73,7 @@ pub fn to_chat(req: Value, count_only: bool) -> Result<Converted, String> {
 
     let mut chat = Map::new();
     for (k, v) in &req {
-        if !CONSUMED.contains(&k.as_str()) {
+        if FORWARDED.contains(&k.as_str()) {
             chat.insert(k.clone(), v.clone());
         }
     }
@@ -128,16 +112,7 @@ pub fn to_chat(req: Value, count_only: bool) -> Result<Converted, String> {
     }
 
     if let Some(thinking) = req.get("thinking").filter(|v| !v.is_null()) {
-        let enabled = match thinking.get("type").and_then(Value::as_str) {
-            Some("enabled") | Some("adaptive") => true,
-            Some("disabled") => false,
-            other => {
-                return Err(format!(
-                    "thinking.type: expected enabled, disabled or adaptive, got {}",
-                    other.unwrap_or("<missing>")
-                ))
-            }
-        };
+        let enabled = thinking_enabled(thinking)?;
         // Templates read different keys; explicit client values win.
         let ctk = chat
             .entry("chat_template_kwargs")
@@ -153,14 +128,18 @@ pub fn to_chat(req: Value, count_only: bool) -> Result<Converted, String> {
         .and_then(|c| c.get("effort"))
         .filter(|v| !v.is_null())
     {
-        // Every tier is also an engine `reasoning_effort` tier.
+        // The engine's own Messages adapter folds `xhigh` into `max`.
         match effort.as_str() {
-            Some(e @ ("low" | "medium" | "high" | "xhigh" | "max")) => {
+            Some("xhigh") => {
+                chat.insert("reasoning_effort".into(), "max".into());
+            }
+            Some(e @ ("minimal" | "low" | "medium" | "high" | "max")) => {
                 chat.insert("reasoning_effort".into(), e.into());
             }
             _ => {
                 return Err(format!(
-                    "output_config.effort: expected low, medium, high, xhigh or max, got {effort}"
+                    "output_config.effort: expected minimal, low, medium, high, xhigh or max, \
+                     got {effort}"
                 ))
             }
         }
@@ -177,18 +156,17 @@ pub fn to_chat(req: Value, count_only: bool) -> Result<Converted, String> {
         Some(t) => convert_tools(t)?,
         None => Vec::new(),
     };
-    let has_tools = !tools.is_empty();
-    if has_tools {
-        chat.insert("tools".into(), Value::Array(tools));
-    }
     if let Some(tc) = req.get("tool_choice").filter(|v| !v.is_null()) {
-        let (choice, parallel) = convert_tool_choice(tc, has_tools)?;
+        let (choice, parallel) = convert_tool_choice(tc, &tools)?;
         if let Some(c) = choice {
             chat.insert("tool_choice".into(), c);
         }
         if parallel == Some(false) {
             chat.insert("parallel_tool_calls".into(), Value::Bool(false));
         }
+    }
+    if !tools.is_empty() {
+        chat.insert("tools".into(), Value::Array(tools));
     }
 
     Ok(Converted {
@@ -201,16 +179,57 @@ pub fn to_chat(req: Value, count_only: bool) -> Result<Converted, String> {
     })
 }
 
+fn thinking_enabled(thinking: &Value) -> Result<bool, String> {
+    let field = |k: &str| thinking.get(k).filter(|v| !v.is_null());
+    let budget = field("budget_tokens");
+    let display = field("display");
+    if let Some(d) = display {
+        if !matches!(d.as_str(), Some("summarized" | "omitted")) {
+            return Err(format!(
+                "thinking.display: expected summarized or omitted, got {d}"
+            ));
+        }
+    }
+    let forbidden = |k: &str, typ: &str| -> Result<bool, String> {
+        Err(format!(
+            "thinking.{k} is not allowed when thinking.type is '{typ}'"
+        ))
+    };
+    match thinking.get("type").and_then(Value::as_str) {
+        Some("enabled") => match budget.map(Value::as_i64) {
+            None => {
+                Err("thinking.budget_tokens is required when thinking.type is 'enabled'".into())
+            }
+            Some(Some(n)) if n >= 1024 => Ok(true),
+            Some(Some(n)) => Err(format!("thinking.budget_tokens must be >= 1024 (got {n})")),
+            Some(None) => Err("thinking.budget_tokens: must be an integer".into()),
+        },
+        Some("adaptive") if budget.is_some() => forbidden("budget_tokens", "adaptive"),
+        Some("adaptive") => Ok(true),
+        Some("disabled") if budget.is_some() => forbidden("budget_tokens", "disabled"),
+        Some("disabled") if display.is_some() => forbidden("display", "disabled"),
+        Some("disabled") => Ok(false),
+        other => Err(format!(
+            "thinking.type: expected enabled, disabled or adaptive, got {}",
+            other.unwrap_or("<missing>")
+        )),
+    }
+}
+
 fn system_text(system: Option<&Value>) -> Result<Option<String>, String> {
-    match system {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::String(s)) => Ok(Some(s.clone())),
+    let text = match system {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::String(s)) => s.clone(),
         Some(Value::Array(blocks)) => {
             let mut parts = Vec::new();
             for b in blocks {
                 match b.get("type").and_then(Value::as_str) {
                     Some("text") => {
-                        parts.push(b.get("text").and_then(Value::as_str).unwrap_or(""));
+                        if let Some(t) = b.get("text").and_then(Value::as_str) {
+                            if !t.is_empty() {
+                                parts.push(t);
+                            }
+                        }
                     }
                     other => {
                         return Err(format!(
@@ -220,10 +239,11 @@ fn system_text(system: Option<&Value>) -> Result<Option<String>, String> {
                     }
                 }
             }
-            Ok(Some(parts.join("\n")))
+            parts.join("\n")
         }
-        Some(_) => Err("system: must be a string or an array of text blocks".into()),
-    }
+        Some(_) => return Err("system: must be a string or an array of text blocks".into()),
+    };
+    Ok((!text.trim().is_empty()).then_some(text))
 }
 
 /// One turn after consecutive same-role turns are merged, as the Messages
@@ -289,34 +309,15 @@ fn convert_user(blocks: &[Value], i: usize, messages: &mut Vec<Value>) -> Result
                 let id = block
                     .get("tool_use_id")
                     .and_then(Value::as_str)
+                    .or_else(|| block.get("id").and_then(Value::as_str))
                     .ok_or_else(|| {
                         format!("messages.{i}.content.{j}.tool_use_id: field required")
                     })?;
-                let tool_content = match block.get("content") {
-                    None | Some(Value::Null) => Value::String(String::new()),
-                    Some(Value::String(s)) => Value::String(s.clone()),
-                    Some(Value::Array(inner)) => {
-                        let mut out = Vec::new();
-                        for (k, b) in inner.iter().enumerate() {
-                            if let Some(p) =
-                                convert_block(b, &format!("{i}.content.{j}.content.{k}"))?
-                            {
-                                out.push(p);
-                            }
-                        }
-                        collapse(out)
-                    }
-                    Some(other) => Value::String(other.to_string()),
-                };
-                let tool_content = match (block.get("is_error"), tool_content) {
-                    (Some(Value::Bool(true)), Value::String(s)) => format!("Error: {s}").into(),
-                    (Some(Value::Bool(true)), Value::Array(mut parts)) => {
-                        parts.insert(0, json!({"type": "text", "text": "Error:"}));
-                        Value::Array(parts)
-                    }
-                    (_, c) => c,
-                };
-                messages.push(json!({"role": "tool", "tool_call_id": id, "content": tool_content}));
+                for content in
+                    tool_result_contents(block.get("content"), &format!("{i}.content.{j}.content"))?
+                {
+                    messages.push(json!({"role": "tool", "tool_call_id": id, "content": content}));
+                }
             }
             _ => {
                 if let Some(p) = convert_block(block, &format!("{i}.content.{j}"))? {
@@ -327,6 +328,43 @@ fn convert_user(blocks: &[Value], i: usize, messages: &mut Vec<Value>) -> Result
     }
     flush(&mut parts, messages);
     Ok(())
+}
+
+/// One tool message per run of `tool_reference` parts and per run of other
+/// parts: chat templates expand references only at the start of a tool message.
+fn tool_result_contents(content: Option<&Value>, at: &str) -> Result<Vec<Value>, String> {
+    let blocks = match content {
+        None | Some(Value::Null) => return Ok(vec![Value::String(String::new())]),
+        Some(Value::String(s)) => return Ok(vec![Value::String(s.clone())]),
+        Some(Value::Array(blocks)) => blocks,
+        Some(other) => return Ok(vec![Value::String(other.to_string())]),
+    };
+    let mut groups: Vec<Vec<Value>> = Vec::new();
+    for (k, b) in blocks.iter().enumerate() {
+        let part = if b.get("type").and_then(Value::as_str) == Some("tool_reference") {
+            let name = b
+                .get("tool_name")
+                .and_then(Value::as_str)
+                .or_else(|| b.get("name").and_then(Value::as_str))
+                .ok_or_else(|| format!("messages.{at}.{k}.tool_name: field required"))?;
+            // The engine's chat templates match on `name`.
+            json!({"type": "tool_reference", "name": name})
+        } else {
+            match convert_block(b, &format!("{at}.{k}"))? {
+                Some(p) => p,
+                None => continue,
+            }
+        };
+        let is_reference = part["type"] == "tool_reference";
+        match groups.last_mut() {
+            Some(g) if (g[0]["type"] == "tool_reference") == is_reference => g.push(part),
+            _ => groups.push(vec![part]),
+        }
+    }
+    if groups.is_empty() {
+        return Ok(vec![Value::String(String::new())]);
+    }
+    Ok(groups.into_iter().map(collapse).collect())
 }
 
 fn convert_assistant(blocks: &[Value], i: usize, messages: &mut Vec<Value>) -> Result<(), String> {
@@ -343,7 +381,11 @@ fn convert_assistant(blocks: &[Value], i: usize, messages: &mut Vec<Value>) -> R
                     }
                 }
             }
-            "redacted_thinking" => {}
+            "redacted_thinking" => {
+                return Err(format!(
+                    "messages.{i}.content.{j}: redacted_thinking history is not supported"
+                ))
+            }
             "tool_use" => {
                 let id = block
                     .get("id")
@@ -518,20 +560,29 @@ fn convert_tools(tools: &Value) -> Result<Vec<Value>, String> {
             .get("name")
             .and_then(Value::as_str)
             .ok_or_else(|| format!("tools.{i}.name: field required"))?;
-        let schema = tool
-            .get("input_schema")
-            .filter(|v| !v.is_null())
-            .ok_or_else(|| format!("tools.{i}.input_schema: field required"))?;
+        let mut schema = match tool.get("input_schema") {
+            Some(Value::Object(o)) => o.clone(),
+            None | Some(Value::Null) => {
+                return Err(format!("tools.{i}.input_schema: field required"))
+            }
+            Some(_) => return Err(format!("tools.{i}.input_schema: must be an object")),
+        };
+        schema.entry("type").or_insert_with(|| "object".into());
         let mut function = Map::new();
         function.insert("name".into(), name.into());
         if let Some(d) = tool.get("description").filter(|v| !v.is_null()) {
             function.insert("description".into(), d.clone());
         }
-        function.insert("parameters".into(), schema.clone());
+        function.insert("parameters".into(), Value::Object(schema));
         if let Some(s) = tool.get("strict").filter(|v| !v.is_null()) {
             function.insert("strict".into(), s.clone());
         }
-        out.push(json!({"type": "function", "function": function}));
+        let mut converted = json!({"type": "function", "function": function});
+        // Deferred tools stay listed; the template renders them once referenced.
+        if let Some(d) = tool.get("defer_loading").filter(|v| !v.is_null()) {
+            converted["defer_loading"] = d.clone();
+        }
+        out.push(converted);
     }
     Ok(out)
 }
@@ -539,8 +590,9 @@ fn convert_tools(tools: &Value) -> Result<Vec<Value>, String> {
 /// Returns (`tool_choice`, `parallel_tool_calls` override).
 fn convert_tool_choice(
     tc: &Value,
-    has_tools: bool,
+    tools: &[Value],
 ) -> Result<(Option<Value>, Option<bool>), String> {
+    let has_tools = !tools.is_empty();
     let typ = tc
         .get("type")
         .and_then(Value::as_str)
@@ -563,6 +615,14 @@ fn convert_tool_choice(
                 .get("name")
                 .and_then(Value::as_str)
                 .ok_or_else(|| "tool_choice.name: field required".to_string())?;
+            if !tools
+                .iter()
+                .any(|t| t.pointer("/function/name").and_then(Value::as_str) == Some(name))
+            {
+                return Err(format!(
+                    "tool_choice references tool `{name}`, which is not a custom tool in `tools`"
+                ));
+            }
             Some(json!({"type": "function", "function": {"name": name}}))
         }
         other => {
@@ -665,6 +725,7 @@ mod tests {
                       {"type": "web_search_20250305", "name": "web_search"}],
             "tool_choice": {"type": "any", "disable_parallel_tool_use": true},
             "metadata": {"user_id": "u"},
+            "max_completion_tokens": 100000,
             "foo_bar": 1,
         }));
         assert_eq!(
@@ -678,7 +739,7 @@ mod tests {
             c["chat_template_kwargs"],
             json!({"thinking": true, "enable_thinking": true})
         );
-        assert_eq!(c["reasoning_effort"], "xhigh");
+        assert_eq!(c["reasoning_effort"], "max");
         assert_eq!(
             c["response_format"],
             json!({"type": "json_schema",
@@ -691,8 +752,10 @@ mod tests {
         );
         assert_eq!(c["tool_choice"], "required");
         assert_eq!(c["parallel_tool_calls"], false);
-        assert_eq!(c["foo_bar"], 1);
+        assert_eq!(c["max_tokens"], 64);
         for gone in [
+            "max_completion_tokens",
+            "foo_bar",
             "metadata",
             "thinking",
             "output_config",
@@ -704,10 +767,10 @@ mod tests {
     }
 
     #[test]
-    fn response_format_passthrough_for_json_object() {
+    fn non_schema_formats_pass_through() {
         let c = chat(
             json!({"model": "m", "max_tokens": 8, "messages": [{"role": "user", "content": "x"}],
-                            "response_format": {"type": "json_object"}}),
+                   "output_config": {"format": {"type": "json_object"}}}),
         );
         assert_eq!(c["response_format"], json!({"type": "json_object"}));
     }
@@ -812,15 +875,88 @@ mod tests {
     }
 
     #[test]
-    fn tool_result_error_with_blocks_keeps_the_flag() {
+    fn tool_results() {
         let c = chat(req(json!([{"role": "user", "content": [{
-            "type": "tool_result", "tool_use_id": "t", "is_error": true,
+            "type": "tool_result", "id": "t", "is_error": true,
             "content": [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]}]}])));
         assert_eq!(
-            c["messages"][0]["content"][0],
-            json!({"type": "text", "text": "Error:"})
+            c["messages"][0],
+            json!({"role": "tool", "tool_call_id": "t", "content": [
+                {"type": "text", "text": "a"}, {"type": "text", "text": "b"}]})
         );
-        assert_eq!(c["messages"][0]["content"].as_array().unwrap().len(), 3);
+
+        let c = chat(req(json!([{"role": "user", "content": [{
+            "type": "tool_result", "tool_use_id": "t", "content": [
+                {"type": "text", "text": "found"},
+                {"type": "tool_reference", "tool_name": "f"},
+                {"type": "tool_reference", "tool_name": "g"},
+                {"type": "text", "text": "done"}]}]}])));
+        let contents: Vec<&Value> = c["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| {
+                assert_eq!(m["tool_call_id"], "t");
+                &m["content"]
+            })
+            .collect();
+        assert_eq!(
+            contents,
+            [
+                &json!("found"),
+                &json!([{"type": "tool_reference", "name": "f"},
+                        {"type": "tool_reference", "name": "g"}]),
+                &json!("done"),
+            ]
+        );
+    }
+
+    #[test]
+    fn tool_definitions() {
+        let c = chat(json!({"model": "m", "max_tokens": 8,
+            "messages": [{"role": "user", "content": "x"}],
+            "tools": [{"name": "f", "input_schema": {"properties": {}}, "defer_loading": true}],
+            "tool_choice": {"type": "tool", "name": "f"}}));
+        assert_eq!(
+            c["tools"][0],
+            json!({"type": "function", "defer_loading": true, "function": {
+                "name": "f", "parameters": {"type": "object", "properties": {}}}})
+        );
+        assert_eq!(c["tool_choice"]["function"]["name"], "f");
+    }
+
+    #[test]
+    fn thinking_shapes() {
+        let with = |thinking: Value| {
+            let mut r = req(json!([{"role": "user", "content": "q"}]));
+            r["thinking"] = thinking;
+            to_chat(r, false).map(|c| c.chat["chat_template_kwargs"]["enable_thinking"].clone())
+        };
+        assert_eq!(
+            with(json!({"type": "adaptive", "display": "omitted"})),
+            Ok(json!(true))
+        );
+        assert_eq!(with(json!({"type": "disabled"})), Ok(json!(false)));
+        for (thinking, needle) in [
+            (json!({"type": "enabled"}), "required"),
+            (json!({"type": "enabled", "budget_tokens": 1023}), ">= 1024"),
+            (
+                json!({"type": "disabled", "budget_tokens": 2048}),
+                "not allowed",
+            ),
+            (
+                json!({"type": "disabled", "display": "summarized"}),
+                "not allowed",
+            ),
+            (
+                json!({"type": "adaptive", "budget_tokens": 2048}),
+                "not allowed",
+            ),
+            (json!({"type": "adaptive", "display": "full"}), "display"),
+        ] {
+            let err = with(thinking.clone()).unwrap_err();
+            assert!(err.contains(needle), "{thinking}: {err}");
+        }
     }
 
     #[test]
@@ -840,9 +976,13 @@ mod tests {
                 "image_url",
             ),
             (
-                json!([{"role": "user", "content": [
-                    {"type": "tool_result", "id": "t", "content": "r"}]}]),
+                json!([{"role": "user", "content": [{"type": "tool_result", "content": "r"}]}]),
                 "tool_use_id",
+            ),
+            (
+                json!([{"role": "user", "content": "q"}, {"role": "assistant", "content": [
+                    {"type": "redacted_thinking", "data": "opaque"}]}]),
+                "redacted_thinking",
             ),
         ] {
             let err = to_chat(req(messages.clone()), false).unwrap_err();

@@ -87,6 +87,26 @@ fn assert_anthropic_error(body: &[u8], want_type: &str) {
     assert!(!v["error"]["message"].as_str().unwrap().is_empty(), "{v}");
 }
 
+fn sse_events(body: &[u8]) -> Vec<(String, Value)> {
+    std::str::from_utf8(body)
+        .unwrap()
+        .split("\n\n")
+        .filter(|b| !b.is_empty())
+        .map(|b| {
+            let mut l = b.lines();
+            let ev = l
+                .next()
+                .unwrap()
+                .strip_prefix("event: ")
+                .unwrap()
+                .to_owned();
+            let data =
+                serde_json::from_str(l.next().unwrap().strip_prefix("data: ").unwrap()).unwrap();
+            (ev, data)
+        })
+        .collect()
+}
+
 #[tokio::test]
 async fn buffered_message() {
     let mock = MockWorker::start(vec![]).await;
@@ -138,23 +158,8 @@ async fn streaming_event_sequence() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert!(ct.starts_with("text/event-stream"), "{ct}");
+    let events = sse_events(&body);
     let text = String::from_utf8(body).unwrap();
-    let events: Vec<(String, Value)> = text
-        .split("\n\n")
-        .filter(|b| !b.is_empty())
-        .map(|b| {
-            let mut l = b.lines();
-            let ev = l
-                .next()
-                .unwrap()
-                .strip_prefix("event: ")
-                .unwrap()
-                .to_owned();
-            let data =
-                serde_json::from_str(l.next().unwrap().strip_prefix("data: ").unwrap()).unwrap();
-            (ev, data)
-        })
-        .collect();
     let names: Vec<&str> = events.iter().map(|(e, _)| e.as_str()).collect();
     assert_eq!(
         names,
@@ -181,6 +186,39 @@ async fn streaming_event_sequence() {
         sent["stream_options"],
         json!({"include_usage": true, "continuous_usage_stats": true})
     );
+}
+
+#[tokio::test]
+async fn a_malformed_chunk_ends_the_stream_well_formed() {
+    let mock = MockWorker::start(vec![
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"O\"},\"finish_reason\":null}],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":1}}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"con\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n",
+    ])
+    .await;
+    let (status, _, body) = post(
+        build_ctx(mock.url.clone()),
+        "/v1/messages",
+        json!({"model": MODEL, "max_tokens": 512, "stream": true,
+               "messages": [{"role": "user", "content": "reply OK"}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let events = sse_events(&body);
+    let names: Vec<&str> = events.iter().map(|(e, _)| e.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "message_start",
+            "content_block_start",
+            "content_block_delta",
+            "content_block_stop",
+            "error",
+            "message_stop",
+        ]
+    );
+    assert_eq!(events[4].1["error"]["type"], "api_error");
 }
 
 #[tokio::test]
