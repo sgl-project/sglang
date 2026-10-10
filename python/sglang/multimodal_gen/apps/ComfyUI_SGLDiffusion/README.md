@@ -24,6 +24,7 @@ The plugin supports two modes of operation: **Server Mode** (via HTTP API) and *
 - **Z-Image**: High-speed image generation models (e.g., `Z-Image-Turbo`)
 - **FLUX**: State-of-the-art text-to-image models (e.g., `FLUX.1-dev`)
 - **Qwen-Image**: Multi-modal image generation models (e.g., `Qwen-Image`,`Qwen-Image-2512`). *Note: Image editing support is currently experimental and may have some issues.*
+- **Qwen-Image-2.1**: Integrated mode (`model_type=qwen_image21`, auto-detected) for Comfy-Org's single-file `qwen_image_2.1_bf16.safetensors` or INT8 ConvRot `qwen_image_2.1_int8_convrot.safetensors`. Text-to-image and reference-image edit (`TextEncodeQwenImage21` with images) work with the official templates after swapping `UNETLoader` for `SGLDUNETLoader`. The worker caches the text / reference prefix K/V on the GPU for each sampler run when it fits (otherwise it recomputes it); the `Qwen Image 2.1 Cache` node's options are ignored. Multi-GPU: `sp_degree` or `tp_size` in `SGLDOptions`; `enable_cfg_parallel` is rejected because ComfyUI runs CFG itself. DiT patches (Fun-Control, attention hooks) are not supported. LoRA: replace `LoraLoaderModelOnly` with `SGLDiffusion LoRA Loader` (merged on bf16, dynamic on INT8). Tested with `Viggle/Qwen-Image-2.1-viggle-turbo` (`...-v0.3-6step-lora-r128.safetensors`): 6 steps, euler, `BasicGuider` (no CFG) and `ManualSigmas` `1.0, 0.967754, 0.933358, 0.857192, 0.666756, 0.400096, 0` at 1024x1024.
 - **MiniMax-H3**: Joint video-and-audio DiT (`model_type=minimax_h3`). Integrated mode: T2V / I2VA / FL2VA use an `fl2va` checkpoint; R2V needs `ref2va`. CLIP and VAE stay in ComfyUI. Server mode uses `SGLDiffusion Generate MiniMax-H3`.
 
 ### Mode 1: Server Mode (HTTP API)
@@ -85,6 +86,7 @@ Reference workflow files are provided in the `workflows/` directory:
 - **`z-image_sgld.json`**: High-speed image generation using Z-Image.
 - **`sgld_text2img.json`**: Server-mode text-to-image generation with LoRA support.
 - **`sgld_image2video.json`**: Server-mode image-to-video generation.
+- **`qwen_image21_t2i_sgld.json`** / **`qwen_image21_edit_sgld.json`**: Qwen-Image-2.1 text-to-image and reference edit (official templates without the prompt-enhancer branch).
 - **`minimax_h3_t2v_sgld.json`**: MiniMax-H3 T2V / I2VA / FL2VA (`fl2va` DiT).
 - **`minimax_h3_r2v_sgld.json`**: MiniMax-H3 reference-to-video (`ref2va` DiT).
 - **`minimax_h3_t2v_sgld_upscaler.json`**: H3 two-pass latent upscale (low-res then 3D ×2 refine).
