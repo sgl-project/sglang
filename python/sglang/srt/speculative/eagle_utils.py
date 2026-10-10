@@ -19,7 +19,10 @@ from sglang.srt.mem_cache.allocation_sizing import (
     get_alloc_reserve_per_decode,
     page_aligned_decode_alloc_lens,
 )
-from sglang.srt.runtime_context import get_spec
+from sglang.srt.runtime_context import get_exec, get_spec
+from sglang.srt.speculative.spec_sampling_mask import (
+    verify_sampling_mask_output,
+)
 from sglang.srt.utils import (
     is_cpu,
     is_cuda,
@@ -806,6 +809,8 @@ def eagle_sample(
 
     # Sample tokens
     target_predict = None
+    mask_req_rows = sampling_info.sampling_mask_batch_indices
+    mask_probs = None
     use_rejection_sampling = get_spec().speculative_use_rejection_sampling
     if _verify_uses_greedy(
         is_all_greedy=sampling_info.is_all_greedy,
@@ -944,6 +949,8 @@ def eagle_sample(
             )
             maybe_detect_nan(target_probs, "v2 verify: target_probs after top_p_renorm")
         target_probs = target_probs.reshape(bs, verify_input.draft_token_num, -1)
+        if mask_req_rows is not None:
+            mask_probs = target_probs.index_select(0, mask_req_rows).flatten(0, 1)
         draft_probs = (
             verify_input.draft_probs
             if use_rejection_sampling
@@ -1005,6 +1012,23 @@ def eagle_sample(
             tp_group.broadcast(predict, src=0)
             tp_group.broadcast(accept_index, src=0)
             tp_group.broadcast(num_correct_drafts, src=0)
+
+    if mask_req_rows is not None:
+        tp_group = get_parallel().tp_group.device_group
+        cp_group = None
+        if is_dp_attention_enabled():
+            tp_group = get_parallel().attn_tp_group.device_group
+            cp_group = get_parallel().attn_cp_group.device_group
+        logits_output.sampling_mask_output = verify_sampling_mask_output(
+            mask_req_rows=mask_req_rows,
+            mask_probs=mask_probs,
+            predict=predict,
+            accept_index=accept_index,
+            draft_token_num=verify_input.draft_token_num,
+            max_tokens=get_exec().features.sampling_mask_max_tokens,
+            support_capture_indices=sampling_info.sampling_support_logprobs_capture_indices,
+            sync_groups=(tp_group, cp_group),
+        )
 
     if SIMULATE_ACC_LEN > 0:
         # Do simulation. The helper builds (and returns) a replacement
