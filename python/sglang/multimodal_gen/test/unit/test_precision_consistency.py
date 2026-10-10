@@ -224,6 +224,22 @@ class TestDiffusionPrecisionConsistency(unittest.TestCase):
             self.assertIs(casted, module)
             self.assertEqual(module.weight.dtype, torch.float32)
 
+    def test_temporary_module_dtype_restores_each_tensor_dtype(self):
+        """A bf16 module with fp32 norm weights and an fp32 buffer must come back
+        with every tensor in its own dtype, not uniformly in the first parameter's."""
+        module = torch.nn.Sequential(torch.nn.Linear(2, 2), torch.nn.LayerNorm(2))
+        module.to(torch.bfloat16)
+        module[1].float()
+        module.register_buffer("scale", torch.ones(2, dtype=torch.float32))
+
+        with temporary_module_dtype(module, torch.float16):
+            self.assertEqual(module[0].weight.dtype, torch.float16)
+            self.assertEqual(module[1].weight.dtype, torch.float16)
+
+        self.assertEqual(module[0].weight.dtype, torch.bfloat16)
+        self.assertEqual(module[1].weight.dtype, torch.float32)
+        self.assertEqual(module.scale.dtype, torch.float32)
+
 
 if __name__ == "__main__":
     unittest.main()
