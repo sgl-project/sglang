@@ -52,7 +52,7 @@ class SGLDiffusionExecutor(torch.nn.Module):
 
     def set_lora(self, lora_nickname=None, lora_path=None, strength=None, target=None):
         """Set LoRA adapter using SGLang Diffusion API."""
-        self._lora_input = {
+        desired = {
             "lora_nickname": lora_nickname,
             "lora_path": lora_path,
             "strength": strength,
@@ -66,6 +66,8 @@ class SGLDiffusionExecutor(torch.nn.Module):
                 target=target,
             )
 
+        self._lora_input = desired
+
     def begin_sampler_run(self) -> None:
         """One ComfyUI ``sampler.sample()`` invocation is one cache lifetime."""
         self._run_id += 1
@@ -75,6 +77,16 @@ class SGLDiffusionExecutor(torch.nn.Module):
         """Run cache is evicted on the next bind of a newer id for this executor."""
 
     def sampler_sample_wrapper(self, executor, *args, **kwargs):
+        if self._ensure_runtime is not None:
+            self._ensure_runtime(self)
+        model_wrap = args[0] if args else kwargs["model_wrap"]
+        desired = model_wrap.model_patcher.model_options.get("sgld_lora_input")
+        if desired != self._lora_input:
+            if self._lora_input is not None:
+                self.generator.unmerge_lora_weights()
+                self._lora_input = None
+            if desired is not None:
+                self.set_lora(**desired)
         self.begin_sampler_run()
         try:
             return executor(*args, **kwargs)

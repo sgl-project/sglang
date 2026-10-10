@@ -213,10 +213,8 @@ class SGLDLoraLoader:
             lora_input["strength"].append(lora_info[1])
             lora_input["target"].append(lora_info[2])
 
-        # call the SGLang Diffusion API
-        model.model.diffusion_model.set_lora(**lora_input)
-        # Return the clone so a chained LoRA node sees this LoRA in its patches;
-        # set_lora replaces the active set, so a dropped patch is a dropped LoRA.
+        # The shared worker is bound to the selected MODEL at sampling time.
+        bi.model_options["sgld_lora_input"] = lora_input
         return (bi,)
 
 
