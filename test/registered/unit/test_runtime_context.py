@@ -1127,6 +1127,26 @@ class TestMoeFlagsGroup(_IsolatedServerArgs):
         self.assertFalse(get_flags().moe.disable_fp4_allgather)
         self.assertFalse(get_flags().moe.speculative_context)
 
+    def test_flashinfer_megamoe_speculative_defaults(self):
+        self._init(
+            moe_a2a_backend="flashinfer_megamoe",
+            moe_runner_backend="flashinfer_megamoe",
+        )
+        moe = get_flags().moe
+        self.assertEqual(moe.speculative_runner_backend.value, "flashinfer_trtllm")
+        self.assertTrue(moe.speculative_a2a_backend.is_none())
+
+    def test_flashinfer_megamoe_speculative_explicit_wins(self):
+        self._init(
+            moe_a2a_backend="flashinfer_megamoe",
+            moe_runner_backend="flashinfer_megamoe",
+            speculative_moe_runner_backend="triton",
+            speculative_moe_a2a_backend="deepep",
+        )
+        moe = get_flags().moe
+        self.assertEqual(moe.speculative_runner_backend.value, "triton")
+        self.assertTrue(moe.speculative_a2a_backend.is_deepep())
+
     def test_swap_restores_on_exception(self):
         from sglang.srt.layers.moe.utils import (
             get_moe_runner_backend,

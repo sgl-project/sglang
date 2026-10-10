@@ -440,6 +440,27 @@ def get_deepep_v2_fp8_scale_format() -> DeepEPv2Fp8ScaleFormat:
     )
 
 
+# Only flashinfer_megamoe is special-cased: its global-expert-id dispatch
+# assumes quantized layers, which draft (MTP/NextN) layers typically are not.
+# DeepGEMM megamoe (a2a "megamoe") falls back per-layer when its weights
+# are not prepared, so drafts can inherit it. A quantized draft that wants
+# flashinfer_megamoe must set the --speculative-moe-* flags explicitly.
+def _default_speculative_a2a_backend(
+    target_a2a_backend: MoeA2ABackend,
+) -> MoeA2ABackend:
+    if target_a2a_backend.is_flashinfer_megamoe():
+        return MoeA2ABackend.NONE
+    return target_a2a_backend
+
+
+def _default_speculative_moe_runner_backend(
+    target_runner_backend: MoeRunnerBackendLike,
+) -> MoeRunnerBackendLike:
+    if target_runner_backend.is_flashinfer_megamoe():
+        return MoeRunnerBackend.FLASHINFER_TRTLLM
+    return target_runner_backend
+
+
 def initialize_moe_config():
     """Seed the MoE runtime flags from the published configuration.
 
@@ -457,12 +478,12 @@ def initialize_moe_config():
     moe.speculative_runner_backend = (
         resolve_moe_runner_backend(spec.speculative_moe_runner_backend)
         if spec.speculative_moe_runner_backend is not None
-        else moe.runner_backend
+        else _default_speculative_moe_runner_backend(moe.runner_backend)
     )
     moe.speculative_a2a_backend = (
         MoeA2ABackend(spec.speculative_moe_a2a_backend)
         if spec.speculative_moe_a2a_backend is not None
-        else moe.a2a_backend
+        else _default_speculative_a2a_backend(moe.a2a_backend)
     )
     moe.deepep_mode = DeepEPMode(exec_moe.deepep_mode)
     moe.deepep_config = exec_moe.deepep_config or ""

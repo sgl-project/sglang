@@ -1562,9 +1562,22 @@ def _pipeline_parallel_overlap_disable(view: Any) -> dict:
 def _speculative_moe_runner_default(view: Any) -> dict:
     """Default the speculative (draft) MoE runner backend to the resolved
     target-model backend. Invoked at the head of the speculative-decoding
-    hook, after the MoE kernel chain has resolved."""
+    hook, after the MoE kernel chain has resolved.
+
+    flashinfer_megamoe routes by global expert id inside the mega kernel and
+    only supports the quantized MoE layers it prepared weights for. Draft
+    (MTP/NextN) layers are typically unquantized and run through a regular
+    runner, so inheriting it would mismatch the draft's runner and corrupt
+    expert-id dispatch. Default the draft to flashinfer_trtllm instead; users
+    with a quantized draft can set --speculative-moe-runner-backend explicitly.
+    (DeepGEMM megamoe is selected via the a2a backend and falls back per-layer
+    when its weights are not prepared, so it needs no override.)
+    """
     if view.speculative_moe_runner_backend is None:
-        return {"speculative_moe_runner_backend": view.moe_runner_backend}
+        default = view.moe_runner_backend
+        if default == "flashinfer_megamoe":
+            default = "flashinfer_trtllm"
+        return {"speculative_moe_runner_backend": default}
     return {}
 
 
