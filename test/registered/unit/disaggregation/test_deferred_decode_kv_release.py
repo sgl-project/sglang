@@ -598,6 +598,41 @@ class TestAbortArmsTrackerBeforeSend(CustomTestCase):
         self.assertEqual(armed_at_send, [False])
         self.assertNotIn(500, mgr._deferred_abort_ack_tracker)
 
+    def _waiting_prealloc_receiver(self):
+        mgr = self._make_decode_manager()
+        mgr.waiting_timeout = 5.0
+        mgr.record_failure = lambda room, reason: None
+        mgr.update_status = lambda room, status: None
+        recv, armed_at_send = self._abort_receiver(mgr, init_time=None)
+        recv.prealloc_start_time = None
+        recv.conclude_state = None
+        recv._connection_pool_entries = {}
+        mgr.connection_pool, mgr.connection_lock = {}, threading.Lock()
+        return mgr, recv, armed_at_send
+
+    @patch("sglang.srt.disaggregation.common.conn.time.time", return_value=100.0)
+    def test_prealloc_abort_after_waiting_poll_does_not_arm(self, _clock):
+        # The preallocation deadline starts on the first WaitingForInput poll
+        # but must not mark metadata as published; the prealloc queue only
+        # calls clear(), which never drops a deferred-release tracker entry.
+        mgr, recv, armed_at_send = self._waiting_prealloc_receiver()
+        self.assertIsNone(recv._check_waiting_timeout())
+        recv.abort()
+        self.assertNotIn(500, mgr._deferred_abort_ack_tracker)
+        self.assertEqual(armed_at_send, [False])
+        self.assertIsNone(recv.init_time)
+
+    @patch("sglang.srt.disaggregation.common.conn.time.time")
+    def test_prealloc_timeout_does_not_arm(self, clock):
+        mgr, recv, armed_at_send = self._waiting_prealloc_receiver()
+        clock.return_value = 100.0
+        self.assertIsNone(recv._check_waiting_timeout())
+        clock.return_value = 105.0
+        self.assertEqual(recv._check_waiting_timeout(), KVPoll.Failed)
+        self.assertNotIn(500, mgr._deferred_abort_ack_tracker)
+        self.assertEqual(armed_at_send, [False])
+        self.assertIsNone(recv.init_time)
+
     def test_opted_out_backend_does_not_arm(self):
         # Backends without a drain ack send the ABORT but must not arm:
         # nothing would ever clean the tracker up.

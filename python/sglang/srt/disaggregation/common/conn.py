@@ -2044,6 +2044,7 @@ class CommonKVReceiver(BaseKVReceiver):
         self.require_staging: bool = False
         self.init_time: Optional[float] = None
         self._prefill_wait_start: Optional[float] = None
+        self.prealloc_start_time: Optional[float] = None
         self.abort_notified: bool = False
         self._abort_generation: Optional[int] = None
         self._connection_pool_entries: Dict[str, List[Dict]] = {}
@@ -2362,9 +2363,16 @@ class CommonKVReceiver(BaseKVReceiver):
         raise NotImplementedError
 
     def _check_waiting_timeout(self) -> Optional[KVPoll]:
-        if self.init_time is None:
-            return None
-        elapsed = time.time() - self.init_time
+        if self.init_time is not None:
+            start_time = self.init_time
+        else:
+            # Time the preallocation wait from the first WaitingForInput poll.
+            # init_time stays None until send_metadata publishes destinations,
+            # because abort notification uses it to arm deferred release.
+            if self.prealloc_start_time is None:
+                self.prealloc_start_time = time.time()
+            start_time = self.prealloc_start_time
+        elapsed = time.time() - start_time
         if elapsed < self.kv_mgr.waiting_timeout:
             return None
         logger.warning_once(
