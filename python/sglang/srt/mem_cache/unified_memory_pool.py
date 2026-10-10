@@ -456,6 +456,7 @@ class UnifiedKVPool:
         # 0 (up to page_size * entry_bytes), not one slot entry -- reserve the
         # max of both.
         reserved_floor = _reserved_floor_bytes(self.sub_pool_specs, page_size)
+        self._reserved_floor = reserved_floor
 
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             if post_capture_active:
@@ -566,6 +567,9 @@ class UnifiedKVPool:
             # Debug: bf16-NaN-fill so NaN-unsafe reads of never-written bytes
             # fail deterministically.
             raw.view(torch.int16).fill_(0x7FC1)
+            # Not the slot-0 sink: kernels read it for padding and for freed window
+            # pages, and in serving it holds zeros.
+            raw[: self._reserved_floor].zero_()
             logger.warning(
                 "[unified-memory-pool] POISONED: backed pool bytes filled with "
                 "bf16-NaN patterns (SGLANG_DEBUG_POISON_POOL)"
@@ -839,6 +843,18 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
                 self._num_pages,
                 self._page_bytes,
             )
+
+    def zero_physical_pages(self, phys_pages: torch.Tensor) -> None:
+        """Zero whole page envelopes (PHYSICAL page ids) on allocator
+        hand-out."""
+        # Same byte-0 envelope view as move_kv_cache.
+        assert self._unified_buffer.anchor_bytes(self._sub_pool_name) == 0
+        zero_pages(
+            self._unified_buffer._raw,
+            phys_pages,
+            self._num_pages,
+            self._page_bytes,
+        )
 
     def get_contiguous_buf_infos(self):
         """Register the raw buffer as physical page envelopes for PD transfer.
