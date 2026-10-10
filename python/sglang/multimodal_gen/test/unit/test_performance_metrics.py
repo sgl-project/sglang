@@ -784,3 +784,11 @@ def test_timing_tolerance_override_leaves_memory_guards_alone():
     with patch.object(current_platform, "is_hip", return_value=False):
         with pytest.raises(AssertionError, match="Runtime Peak VRAM"):
             validator.validate_peak_vram(regression, 10_000.0, 10_000.0)
+
+
+def test_request_metrics_compare_by_identity():
+    """RequestMetrics declares no dataclass fields, so the generated __eq__ made
+    every pair of instances equal."""
+    assert perf_logger_module.RequestMetrics("a") != perf_logger_module.RequestMetrics(
+        "b"
+    )
