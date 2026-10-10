@@ -2750,7 +2750,6 @@ class Scheduler(
     def _maybe_namespace_elastic_radix_cache(self, req: Req) -> None:
         if (
             get_exec().moe.elastic_ep_backend is None
-            or self.disable_radix_cache
             or not self.tree_cache.supports_prefix_sharing()
         ):
             return

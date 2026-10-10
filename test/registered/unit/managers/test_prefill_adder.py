@@ -121,6 +121,7 @@ class TestPrefillAdder(CustomTestCase):
 
     def create_mock_req(self, rid, priority, max_new_tokens, output_len=0, wait_time=0):
         req = MagicMock(spec=Req)
+        req.kv = SimpleNamespace(req_pool_idx=None)
         req.rid = str(rid)
         req.cache_request_handle = CacheRequestHandle(req.rid, 0)
         req.priority = priority
@@ -1234,7 +1235,7 @@ class TestPrefillAdder(CustomTestCase):
             req.needs_host_load_back.return_value = True
             req.last_node = MagicMock()
             req.best_match_node = MagicMock()
-            req.kv = SimpleNamespace(cache_protected_len=0)
+            req.kv.cache_protected_len = 0
 
             req.sampling_params = SimpleNamespace(max_new_tokens=8, ignore_eos=False)
 
@@ -1461,7 +1462,7 @@ class TestPrefillAdder(CustomTestCase):
         req.host_hit_length = host_hit
         req.needs_host_load_back.return_value = True
         req.best_match_node = req.last_node
-        req.kv = SimpleNamespace(cache_protected_len=prefix_len)
+        req.kv.cache_protected_len = prefix_len
         return req
 
     def test_successful_load_back_commits_the_selected_shape_once(self):
