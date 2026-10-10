@@ -118,13 +118,14 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         )
 
     def _get_tiled_mma(self):
+        atom_layout_n = 2 if max(self.tile_hdim, self.tile_hdimv) > 256 else 1
         tiled_mma_qk = sm90_utils_basic.make_trivial_tiled_mma(
             self.dtype,
             self.dtype,
             warpgroup.OperandMajorMode.K,
             warpgroup.OperandMajorMode.K,
             Float32,
-            atom_layout_mnk=(self.tile_m // 64, 1, 1),
+            atom_layout_mnk=(self.tile_m // 64, atom_layout_n, 1),
             tiler_mn=(64, self.tile_n),
         )
         tiled_mma_pv = sm90_utils_basic.make_trivial_tiled_mma(
@@ -135,10 +136,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             Float32,
             atom_layout_mnk=(
                 self.tile_m // 64,
+                atom_layout_n,
                 1,
-                1,
-            ),  # Might need (1, 2, 1) for hdim 512
-            tiler_mn=(64, self.tile_hdimv),
+            ),
+            tiler_mn=(64, min(256, self.tile_hdimv)),
             a_source=(
                 warpgroup.OperandSource.RMEM
                 if self.mma_pv_is_rs
@@ -1857,10 +1858,23 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
 
         if const_expr(not self.mma_pv_is_rs):
             tPrP = smem_copy_params.smem_thr_copy_P.retile(tOrP_cur)
+            if const_expr(max(self.tile_hdim, self.tile_hdimv) > 256):
+                # Both warp groups consume the same P tile for hdim 512.
+                # Wait for every reader before overwriting shared memory.
+                cute.arch.barrier(
+                    barrier_id=int(NamedBarrierFwd.PEmpty),
+                    number_of_threads=self.num_mma_threads,
+                )
             cute.copy(smem_copy_params.smem_thr_copy_P, tPrP, smem_copy_params.tPsP)
             # Fence and barrier to make smem store visible to WGMMA
             cute.arch.fence_view_async_shared()
-            cute.arch.sync_warp()
+            if const_expr(max(self.tile_hdim, self.tile_hdimv) > 256):
+                cute.arch.barrier(
+                    barrier_id=int(NamedBarrierFwd.PFull),
+                    number_of_threads=self.num_mma_threads,
+                )
+            else:
+                cute.arch.sync_warp()
 
         # For RescaleOBeforeGemm: initialize acc_O
         if const_expr(self.rescale_O_before_gemm):
@@ -1962,12 +1976,25 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         utils.cvt_f16(tOrP_acc, tOrP_cur)
         if const_expr(not self.mma_pv_is_rs):
             tPrP = smem_copy_params.smem_thr_copy_P.retile(tOrP_cur)
+            if const_expr(max(self.tile_hdim, self.tile_hdimv) > 256):
+                # Both warp groups consume the same P tile for hdim 512.
+                # Wait for every reader before overwriting shared memory.
+                cute.arch.barrier(
+                    barrier_id=int(NamedBarrierFwd.PEmpty),
+                    number_of_threads=self.num_mma_threads,
+                )
             cute.copy(smem_copy_params.smem_thr_copy_P, tPrP, smem_copy_params.tPsP)
         softmax.rescale_O(acc_O, row_scale)
         if const_expr(not self.mma_pv_is_rs):
             # Fence and barrier to make sure smem store is visible to WGMMA
             cute.arch.fence_view_async_shared()
-            cute.arch.sync_warp()  # Only need syncwarp since each warp is using its own P values for MmaPV
+            if const_expr(max(self.tile_hdim, self.tile_hdimv) > 256):
+                cute.arch.barrier(
+                    barrier_id=int(NamedBarrierFwd.PFull),
+                    number_of_threads=self.num_mma_threads,
+                )
+            else:
+                cute.arch.sync_warp()
         pipeline_v.consumer_wait(
             smem_pipe_read, pipeline_v.consumer_try_wait(smem_pipe_read)
         )
@@ -2056,6 +2083,13 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         utils.cvt_f16(tOrP_acc, tOrP_cur)
         if const_expr(not self.mma_pv_is_rs):
             tPrP = smem_copy_params.smem_thr_copy_P.retile(tOrP_cur)
+            if const_expr(max(self.tile_hdim, self.tile_hdimv) > 256):
+                # Both warp groups consume the same P tile for hdim 512.
+                # Wait for every reader before overwriting shared memory.
+                cute.arch.barrier(
+                    barrier_id=int(NamedBarrierFwd.PEmpty),
+                    number_of_threads=self.num_mma_threads,
+                )
             cute.copy(smem_copy_params.smem_thr_copy_P, tPrP, smem_copy_params.tPsP)
         if const_expr(not self.rescale_O_before_gemm):
             softmax.rescale_O(acc_O, row_scale)
@@ -2064,7 +2098,13 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         if const_expr(not self.mma_pv_is_rs):
             # Fence and barrier to make sure smem store is visible to WGMMA
             cute.arch.fence_view_async_shared()
-            cute.arch.sync_warp()  # Only need syncwarp since each warp is using its own P values for MmaPV
+            if const_expr(max(self.tile_hdim, self.tile_hdimv) > 256):
+                cute.arch.barrier(
+                    barrier_id=int(NamedBarrierFwd.PFull),
+                    number_of_threads=self.num_mma_threads,
+                )
+            else:
+                cute.arch.sync_warp()
         return smem_pipe_read
 
     @cute.jit

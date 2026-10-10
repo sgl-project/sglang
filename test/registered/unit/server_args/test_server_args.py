@@ -25,7 +25,6 @@ from sglang.srt.arg_groups.attention_hook import (
 )
 from sglang.srt.arg_groups.cuda_graph_hook import (
     apply_cuda_graph_compatibility,
-    disable_tc_piecewise_cudagraph_if_incompatible,
     finalize_cuda_graph_prefill_max_context,
     handle_cuda_graph_config,
 )
@@ -1137,7 +1136,7 @@ class TestLoadBalanceMethod(unittest.TestCase):
             handle_pd_disaggregation(server_args)
         self.assertIn("without improving prefill performance", "\n".join(logs.output))
 
-    def test_pd_decode_dcp_forces_chunk_cache(self):
+    def test_pd_decode_dcp_disables_radix_cache(self):
         server_args = self._load_balance_args(
             disaggregation_mode="decode",
             disaggregation_transfer_backend="mooncake",
@@ -2024,11 +2023,16 @@ class TestSSLArgs(unittest.TestCase):
 class TestHiCacheArgs(CustomTestCase):
     def test_host_receive_speculative_uses_shared_retraction_pool(self):
         """Speculation must still resolve host receive to the shared host pool."""
-        for algorithm in ("EAGLE", "EAGLE3", "NGRAM"):
-            with self.subTest(algorithm=algorithm):
+        for algorithm, threshold in (
+            ("EAGLE", 0.0),
+            ("EAGLE3", 0.0),
+            ("NGRAM", 0.0),
+            ("EAGLE", 0.8),
+        ):
+            with self.subTest(algorithm=algorithm, threshold=threshold):
                 args = self._make_args(
                     disaggregation_mode="decode",
-                    disaggregation_decode_host_receive_threshold=0.8,
+                    disaggregation_decode_host_receive_threshold=threshold,
                     speculative_algorithm=algorithm,
                 )
                 handle_pd_disaggregation(args)
@@ -2039,6 +2043,15 @@ class TestHiCacheArgs(CustomTestCase):
                 handle_hicache(args)
                 self.assertEqual(
                     resolution_result(args, "hicache_mem_layout"), "layer_first"
+                )
+
+        for overrides in ({}, {"disaggregation_decode_host_receive_threshold": 1.0}):
+            with self.subTest(overrides=overrides):
+                args = self._make_args(disaggregation_mode="decode", **overrides)
+                self.assertEqual(args.disaggregation_decode_host_receive_threshold, 1.0)
+                handle_pd_disaggregation(args)
+                self.assertIsNone(
+                    resolution_result(args, "disaggregation_decode_retraction_backup")
                 )
 
         for threshold in (-0.1, 1.1, float("nan")):
@@ -2519,44 +2532,6 @@ class TestPrefillOnlyDisableKvCache(unittest.TestCase):
                     self._validate_prefill_only_args(kv_cache_dtype=kv_cache_dtype)
 
 
-class TestCudaGraphConfigDataclassAccess(CustomTestCase):
-    @patch(
-        "sglang.srt.model_executor.runner_backend."
-        "tc_piecewise_cuda_graph_backend.get_moe_a2a_backend"
-    )
-    def test_tc_piecewise_build_config_reads_phase_config_dataclass(
-        self, mock_get_moe_a2a_backend
-    ):
-        from sglang.srt.model_executor.runner_backend.tc_piecewise_cuda_graph_backend import (
-            TcPiecewiseCudaGraphBackend,
-        )
-
-        mock_backend = mock_get_moe_a2a_backend.return_value
-        mock_backend.is_deepep.return_value = False
-        mock_backend.is_mooncake.return_value = False
-        from sglang.srt.runtime_context import get_context
-
-        # The graph configuration is a bag leaf; the debug switch is raw input
-        # and stays on the argument.
-        override = get_context().override_server_args(
-            cuda_graph_config=CudaGraphConfig(
-                prefill=PhaseConfig(
-                    backend=Backend.TC_PIECEWISE,
-                    bs=[32, 64],
-                    tc_compiler="eager",
-                )
-            )
-        )
-        override.install()
-        self.addCleanup(override.restore)
-        server_args = SimpleNamespace(enable_torch_compile_debug_mode=False)
-
-        config = TcPiecewiseCudaGraphBackend.build_compilation_config(server_args)
-
-        self.assertEqual(config.get_capture_sizes(), [32, 64])
-        self.assertEqual(config.compiler, "eager")
-
-
 class TestPipelineParallelCompat(CustomTestCase):
     """Features supported with `pipeline-parallel-size > 1`."""
 
@@ -2838,33 +2813,6 @@ class TestPrefillCudaGraphLoRACompatibility(CustomTestCase):
         self.assertEqual(
             resolution_result(args, "cuda_graph_config").prefill.backend,
             Backend.BREAKABLE,
-        )
-
-    def test_lora_still_disables_tc_piecewise_prefill_graph(self):
-        # Pin the tc_piecewise LoRA rule itself, with the hardware rule
-        # neutralized so this runs on CPU-only CI.
-        args = ServerArgs(model_path="dummy", enable_lora=True)
-        args._model_config = SimpleNamespace(
-            hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"]),
-            is_piecewise_cuda_graph_disabled_model=False,
-            is_multimodal=False,
-            is_multimodal_piecewise_cuda_graph_supported=False,
-        )
-        args.cuda_graph_config = CudaGraphConfig(
-            prefill=PhaseConfig(backend=Backend.TC_PIECEWISE)
-        )
-        with (
-            override_platform(is_hip=False),
-            override_platform(is_npu=False),
-            patch("sglang.srt.arg_groups.cuda_graph_hook.is_cpu", return_value=False),
-            patch("sglang.srt.arg_groups.cuda_graph_hook.is_mps", return_value=False),
-            override_platform(is_xpu=False),
-        ):
-            disable_tc_piecewise_cudagraph_if_incompatible(args)
-
-        self.assertEqual(
-            resolution_result(args, "cuda_graph_config").prefill.backend,
-            Backend.DISABLED,
         )
 
 

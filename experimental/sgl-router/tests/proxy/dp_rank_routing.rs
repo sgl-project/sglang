@@ -63,6 +63,7 @@ fn router(
         let profile = EngineProfile {
             protocol: WireProtocol::default(),
             dp_ranks,
+            openai: None,
         };
         registry.add_with_cb(spec, None, profile).unwrap();
     }
@@ -228,6 +229,10 @@ async fn pd_fan_out_leaves_the_prefill_rank_to_the_engine() {
     for (path, mut body) in [
         ("/v1/chat/completions", chat),
         ("/generate", json!({"text": ["a", "b"]})),
+        (
+            "/v1/completions",
+            json!({"model": MODEL, "prompt": ["a", "b"]}),
+        ),
     ] {
         // A caller's rank is replaced too.
         body["routed_dp_rank"] = 3.into();
