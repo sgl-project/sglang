@@ -27,6 +27,11 @@ from sglang.srt.function_call.muse_glimmer_format import (
     has_atem_markers,
     partial_marker_len,
 )
+from sglang.srt.function_call.utils import (
+    get_schema_properties,
+    infer_type_from_json_schema,
+    schema_allows_null,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +51,14 @@ def _is_tool_channel(recipient: Optional[str]) -> bool:
     return recipient is not None and recipient not in _NON_TOOL_RECIPIENTS
 
 
-def _decode_value(raw: str):
+def _decode_value(raw: str, schema: Optional[dict] = None):
+    """Decode one parameter value. A parameter declared as a string keeps its
+    exact text; "null" decodes to None only when the schema accepts null."""
+    ptype = infer_type_from_json_schema(schema) if schema is not None else None
+    if ptype in {"string", "str", "text"} or (schema is not None and ptype is None):
+        if raw.strip().lower() == "null" and schema_allows_null(schema):
+            return None
+        return raw
     try:
         return json.loads(raw)
     except (json.JSONDecodeError, ValueError):
@@ -125,6 +137,7 @@ class MuseGlimmerDetector(BaseFormatDetector):
                     calls,
                     normal_parts,
                     final=True,
+                    tools=tools,
                 )
             else:
                 # Truncated header: no body ever arrived, keep it as text.
@@ -189,7 +202,7 @@ class MuseGlimmerDetector(BaseFormatDetector):
                 if not chunk:
                     break
                 consumed = self._consume_body(
-                    chunk, registered, calls, normal_parts, final=False
+                    chunk, registered, calls, normal_parts, final=False, tools=tools
                 )
                 if consumed == 0:
                     break
@@ -202,6 +215,7 @@ class MuseGlimmerDetector(BaseFormatDetector):
                 calls,
                 normal_parts,
                 final=True,
+                tools=tools,
             )
             self._buffer = self._buffer[end_at + end_len :]
             self._in_body = False
@@ -217,6 +231,7 @@ class MuseGlimmerDetector(BaseFormatDetector):
         calls: List[ToolCallItem],
         normal_parts: List[str],
         final: bool,
+        tools: List[Tool],
     ) -> int:
         if not _is_tool_channel(self._recipient):
             normal_parts.append(chunk)
@@ -236,8 +251,21 @@ class MuseGlimmerDetector(BaseFormatDetector):
             if close_at == -1:
                 return pos if not final else len(chunk)
             body = chunk[pos:close_at]
+            tool = next(
+                (
+                    t
+                    for t in tools or []
+                    if t.function
+                    and t.function.name
+                    == _normalize_name(self._open_invoke, registered)
+                ),
+                None,
+            )
+            properties = get_schema_properties(tool.function.parameters) if tool else {}
             args = {
-                pm.group("key"): _decode_value(pm.group("value"))
+                pm.group("key"): _decode_value(
+                    pm.group("value"), properties.get(pm.group("key"))
+                )
                 for pm in _PARAM_RE.finditer(body)
             }
             item = self._emit_call(self._open_invoke, args, registered)
