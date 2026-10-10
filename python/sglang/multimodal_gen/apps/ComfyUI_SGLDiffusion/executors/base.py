@@ -76,7 +76,9 @@ class SGLDiffusionExecutor(torch.nn.Module):
         super(SGLDiffusionExecutor, self).__init__()
         self.generator = generator
         self.model_path = model_path
-        self.model = model
+        # Not a submodule: the BaseModel holds this executor as diffusion_model,
+        # and registering it back makes state_dict() / .to() recurse forever.
+        object.__setattr__(self, "model", model)
         self.dtype = config.unet_config["dtype"]
         self.config = config
         self.loras = []
@@ -89,6 +91,13 @@ class SGLDiffusionExecutor(torch.nn.Module):
         self.session_id = uuid.uuid4().hex
         self._run_id = 0
         self._sent_conds: set[tuple] = set()
+
+    def state_dict(self, *args, **kwargs):
+        raise RuntimeError(
+            "The SGLD worker owns this diffusion model's weights, so ComfyUI weight "
+            "nodes (LoraLoader, ModelSave, model merging) cannot use it; load LoRAs "
+            "with SGLDLoraLoader"
+        )
 
     @staticmethod
     def should_suppress_logs(timestep):

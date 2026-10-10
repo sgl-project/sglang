@@ -14,7 +14,10 @@ from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.adapter import (
 from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.base import (
     SGLDiffusionExecutor,
 )
-from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.flux import FluxAdapter
+from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.flux import (
+    FluxAdapter,
+    FluxExecutor,
+)
 from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.zimage import (
     ZImageAdapter,
 )
@@ -142,3 +145,14 @@ def test_conditioning_the_worker_cannot_apply_is_rejected(kwargs) -> None:
     with pytest.raises(ValueError, match=next(iter(kwargs))):
         _flux_step(ex, **kwargs)
     assert ex.sent == []
+
+
+def test_comfyui_weight_access_gets_a_clear_error() -> None:
+    """ComfyUI's BaseModel holds the executor as diffusion_model; LoraLoader's key
+    map calls state_dict() on it, which must not recurse through the executor."""
+    base = torch.nn.Module()
+    config = SimpleNamespace(unet_config={"dtype": torch.bfloat16})
+    base.diffusion_model = FluxExecutor(None, "flux.safetensors", base, config)
+    base.to("cpu")
+    with pytest.raises(RuntimeError, match="SGLDLoraLoader"):
+        base.state_dict()
