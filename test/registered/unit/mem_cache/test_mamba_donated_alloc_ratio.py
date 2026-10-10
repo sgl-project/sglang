@@ -132,6 +132,41 @@ class TestMambaRatioEnvGate(unittest.TestCase):
             ):
                 return KVCacheConfigurator._calculate_mamba_ratio(fake)
 
+    def test_lazy_in_place_tracking_does_not_donate_the_old_checkpoint(self):
+        from sglang.srt.managers.schedule_batch import ScheduleBatch
+        from sglang.srt.mem_cache.base_prefix_cache import InsertParams
+
+        for speculative in (False, True):
+            with self.subTest(speculative=speculative):
+                component, cache, _ = _build_peak(2 * N, lock_prefixes=True)
+                component._alloc_mamba_slot = lambda *_: self.fail(
+                    "Cannot donate an in-flight checkpoint"
+                )
+                cache.enable_mamba_extra_buffer = True
+                req = SimpleNamespace(
+                    kv=SimpleNamespace(
+                        mamba_ping_pong_track_buffer=torch.tensor([0, -1]),
+                        mamba_next_track_idx=0,
+                        mamba_last_track_seqlen=192,
+                        kv_committed_len=255,
+                    ),
+                )
+                batch = SimpleNamespace(
+                    reqs=[req],
+                    req_to_token_pool=cache.req_to_token_pool,
+                    seq_lens_cpu=torch.tensor([256]),
+                )
+                if speculative:
+                    ScheduleBatch.mamba_lazy_spec_prepare(batch, 128, 8)
+                else:
+                    ScheduleBatch.mamba_lazy_prealloc_at_boundary(batch, 128)
+                params = InsertParams()
+                self.assertEqual(
+                    component.prepare_for_caching_req(req, params, 255, False), 0
+                )
+                self.assertIsNone(params.mamba_value)
+                self.assertEqual(cache.alloc_evict_params, [])
+
     def test_flag_off_restores_original_ratios(self):
         def r(**kwargs):
             return self._ratio(skip=False, **kwargs)
