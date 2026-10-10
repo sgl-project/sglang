@@ -31,6 +31,7 @@ import math
 import os
 import sys
 from contextlib import contextmanager
+from enum import Enum, auto
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import msgspec
@@ -69,16 +70,14 @@ def _parallel_fields() -> frozenset:
     return frozenset(_parallel_config_leaves() | derived)
 
 
-def derive_attention_widths(
-    *, tp_size: int, attn_cp_size: int, dp_size: int, enable_dp_attention: bool
-) -> tuple:
-    """Return (attn_dp_size, attn_tp_size) from the configured widths."""
-    attn_dp_size = dp_size if enable_dp_attention else 1
-    return attn_dp_size, tp_size // attn_dp_size // attn_cp_size
+def derive_attn_tp_size(*, tp_size: int, attn_cp_size: int, attn_dp_size: int) -> int:
+    """Return the attention-TP width: what is left of the TP group after the
+    attention-DP and attention-CP dimensions."""
+    return tp_size // attn_dp_size // attn_cp_size
 
 
 def derive_attention_ranks(
-    *, tp_rank: int, attn_tp_size: int, attn_cp_size: int, enable_dp_attention: bool
+    *, tp_rank: int, attn_tp_size: int, attn_cp_size: int
 ) -> tuple:
     """Return (attn_tp_rank, attn_dp_rank) for a process at ``tp_rank``.
 
@@ -86,11 +85,11 @@ def derive_attention_ranks(
 
         tp_rank = (attn_dp_rank * attn_cp_size + attn_cp_rank) * attn_tp_size
                   + attn_tp_rank
+
+    Without attention DP the TP group is one attention-DP group, so
+    ``attn_dp_rank`` is zero.
     """
-    attn_tp_rank = tp_rank % attn_tp_size
-    if not enable_dp_attention:
-        return attn_tp_rank, 0
-    return attn_tp_rank, tp_rank // (attn_tp_size * attn_cp_size)
+    return tp_rank % attn_tp_size, tp_rank // (attn_tp_size * attn_cp_size)
 
 
 def spawn_world_rank(server_args, *, tp_rank: int, pp_rank: int) -> int:
@@ -148,13 +147,9 @@ def derive_parallel_widths(
     """Derive attention and MoE widths and DCP settings from configuration."""
     return {
         "attn_dp_size": attn_dp_size,
-        # `attn_dp_size` already accounts for disabled DP attention.
-        "attn_tp_size": derive_attention_widths(
-            tp_size=tp_size,
-            attn_cp_size=attn_cp_size,
-            dp_size=attn_dp_size,
-            enable_dp_attention=True,
-        )[1],
+        "attn_tp_size": derive_attn_tp_size(
+            tp_size=tp_size, attn_cp_size=attn_cp_size, attn_dp_size=attn_dp_size
+        ),
         "moe_ep_size": moe_ep_size,
         "moe_tp_size": tp_size // moe_ep_size // moe_dp_size,
         "dcp_enabled": dcp_enabled,
@@ -164,16 +159,10 @@ def derive_parallel_widths(
 
 def parallel_widths_of(cfg: Any) -> dict:
     """Return derived parallel settings from resolved configuration."""
-    attn_dp_size, _ = derive_attention_widths(
-        tp_size=cfg.tp_size,
-        attn_cp_size=cfg.attn_cp_size,
-        dp_size=cfg.dp_size,
-        enable_dp_attention=cfg.enable_dp_attention,
-    )
     return derive_parallel_widths(
         tp_size=cfg.tp_size,
         attn_cp_size=cfg.attn_cp_size,
-        attn_dp_size=attn_dp_size,
+        attn_dp_size=cfg.attn_dp_size,
         moe_ep_size=cfg.ep_size,
         moe_dp_size=cfg.moe_dp_size,
         dcp_size=cfg.dcp_size,
@@ -199,9 +188,23 @@ def attn_tp_size_of(cfg: Any):
     return parallel_widths_of(cfg)["attn_tp_size"]
 
 
-def attn_dp_size_of(cfg: Any):
-    """`attn_dp_size`, computed at publish. See `parallel_widths_of`."""
-    return parallel_widths_of(cfg)["attn_dp_size"]
+def attn_dp_enabled_of(cfg: Any) -> bool:
+    """`attn_dp_enabled`, computed at publish.
+
+    A scale joiner's own group can be one rank wide, but it joins an
+    attention-DP deployment and runs its DP-attention paths.
+    """
+    from sglang.srt.arg_groups.model_override_base import ep_scale_joiner_of
+
+    return cfg.attn_dp_size > 1 or ep_scale_joiner_of(cfg)
+
+
+def num_dp_ranks_of(cfg: Any) -> int:
+    """`num_dp_ranks`, computed at publish: replicas times attention-DP groups.
+
+    DP attention does not run inside replicas, so one of the two is one.
+    """
+    return cfg.dp_size * cfg.attn_dp_size
 
 
 def attn_dcp_size_of(cfg: Any):
@@ -471,6 +474,18 @@ def _install_parallel_properties() -> None:
 _install_parallel_properties()
 
 
+def linear_attn_parallel_group() -> str:
+    """The group linear attention partitions its heads over: the attention-TP
+    group, or the TP group under CP-TP group sharing, where the attention-TP
+    group is one rank wide."""
+    return "tp" if get_parallel().enable_cp_tp_group_sharing else "attn_tp"
+
+
+def linear_attn_tp_size() -> int:
+    """The width of ``linear_attn_parallel_group()``."""
+    return getattr(get_parallel(), f"{linear_attn_parallel_group()}_size")
+
+
 class _FlagGroupBase(msgspec.Struct):
     """Shared flag-group behavior: typo-safe writes + transactional ``override()``.
 
@@ -577,6 +592,9 @@ class DpFlags(_FlagGroupBase):
     # gather/scatter helpers, whose captured geometry needs one shared bucket.
     capturing_prefill_graph: bool = False
     prefill_graph_has_dp_gather: bool = False
+    # This process's slot in the target's DP sync while a draft scope narrows
+    # attention; dp_gather_width() also reads it as the in-scope marker.
+    scoped_gather_slot: Optional[int] = None
     # DP gathered-buffer allocation metadata (model hidden size / dtype /
     # device), set by initialize_dp_attention alongside the flags above.
     buffer_hidden_size: Any = None
@@ -636,6 +654,13 @@ class Resources(_FlagGroupBase):
     trace_level: Any = None
 
 
+class LoRABatchLayout(Enum):
+    """Token layout used by LoRA kernels in the current model section."""
+
+    DP_LOCAL = auto()
+    TP_GLOBAL = auto()
+
+
 class ForwardFlags:
     """Scoped per-forward flags.
 
@@ -657,19 +682,24 @@ class ForwardFlags:
         "is_extend_in_batch": False,
         # Per-layer MLP collective control (set by decoder via scoped()
         # around the MLP / MoE / hybrid mixer call).
-        # fuse_mlp_allreduce: next residual+LN absorbs the post-MLP all-reduce.
         # mlp_reduce_scatter: postprocess will reduce-scatter (skip MLP AR).
         # flashinfer_trtllm_bypass: deepseek dual-stream graph topk bypass.
         # defer_moe_finalize: next layer's fused collective absorbs the finalize.
-        "fuse_mlp_allreduce": False,
         "mlp_reduce_scatter": False,
         "flashinfer_trtllm_bypass": False,
         "defer_moe_finalize": False,
+        # Attention runs on a DP-local token batch. The MLP runs after the DP
+        # gather and therefore uses the TP-global token batch.
+        "lora_batch_layout": LoRABatchLayout.DP_LOCAL,
         # LayerNorm sequence parallelism region; see layers/layernorm_sp.py.
         "sp_active": False,
+        # This forward's MoE runs on attention-TP-local token slices (the
+        # ForwardBatch.attn_tp_sequence_sharded decision, stamped by the model
+        # that slices); read by the benchmark routing override.
+        "attn_tp_sequence_sharded": False,
     }
 
-    # Read/written inside compiled graphs (vocab embedding, communicator,
+    # Read/written inside compiled graphs (vocab embedding, layer boundaries,
     # EP dispatch, DP gather/scatter, MLP/MoE skip-AR): plain-slot backed.
     # Before moving a flag out of this set, prove no read/write site sits
     # under torch.compile.
@@ -678,11 +708,12 @@ class ForwardFlags:
             "attn_input_scattered",
             "attn_inputs",
             "is_extend_in_batch",
-            "fuse_mlp_allreduce",
             "mlp_reduce_scatter",
             "flashinfer_trtllm_bypass",
             "defer_moe_finalize",
+            "lora_batch_layout",
             "sp_active",
+            "attn_tp_sequence_sharded",
         }
     )
 
@@ -1545,7 +1576,6 @@ def _attention_ranks(parallel, tp_rank: int) -> dict:
         tp_rank=tp_rank,
         attn_tp_size=parallel.attn_tp_size,
         attn_cp_size=parallel.attn_cp_size,
-        enable_dp_attention=parallel.enable_dp_attention,
     )
     return {"attn_tp_rank": attn_tp_rank, "attn_dp_rank": attn_dp_rank}
 
@@ -1759,9 +1789,11 @@ _PLATFORM_PROBES: Dict[str, str] = {
     "is_npu": "is_npu",
     "is_xpu": "is_xpu",
     "is_musa": "is_musa",
+    "is_mps": "is_mps",
     "is_sm90": "is_sm90_supported",
     "is_sm100": "is_sm100_supported",
     "is_sm100_or_sm110": "is_sm100_or_sm110_supported",
+    "is_sm110": "is_sm110_supported",
     "is_sm120": "is_sm120_supported",
     "is_blackwell": "is_blackwell_supported",
     "is_hopper_with_cuda_12_3": "is_hopper_with_cuda_12_3",
@@ -1978,13 +2010,12 @@ def exports_expert_balancedness_to_prometheus() -> bool:
 
 
 def cutedsl_moe_max_num_tokens() -> int:
-    """The CuteDSL A2A per-rank token budget.
+    """Largest token count one forward routes through a CuteDSL MoE layer on one
+    DP rank; sizes the standard-allgather wrapper, MegaMoE, and AR fusion buffers.
 
     Every input is a published leaf (``spec``, ``schedule``, ``exec.graph``), so
-    this derives from the bags and follows a post-publish override;
-    ``overrides.cutedsl_moe_max_num_tokens`` is the pre-publish equivalent the
-    resolution pipeline uses. Max over the prefill bound, the piecewise-prefill
-    capture, and the decode/verify bound.
+    this follows a post-publish override. Max over the prefill bound, the
+    piecewise-prefill capture, and the decode/verify bound.
     """
     from sglang.srt.model_executor.cuda_graph_config import Backend
 
@@ -2045,6 +2076,12 @@ def describe_kv_events_publisher(server_args: Any) -> Optional[dict]:
                                               # socket; present iff
                                               # load_endpoint_port_base
                                               # is present
+            "replay_endpoint_port_base": 5558,
+                                              # ROUTER replay port; rank r
+                                              # = base + r, same host rule
+                                              # as the SUB endpoints;
+                                              # present only when
+                                              # replay_endpoint is tcp
         }
 
     Returns None (i.e. "no publisher to describe") when any of:
@@ -2104,7 +2141,8 @@ def describe_kv_events_publisher(server_args: Any) -> Optional[dict]:
         "endpoint_port_base": port,
         "topic": cfg.topic,
         "block_size": kv_event_block_size_of(resolved),
-        "dp_size": resolved.dp_size,
+        # The wire key predates attention DP; it counts DP ranks.
+        "dp_size": num_dp_ranks_of(resolved),
     }
     # Load range, from the same resolver SchedulerLoadPublisher binds
     # with (so the two can't drift). The decline reason is logged once at
@@ -2112,10 +2150,13 @@ def describe_kv_events_publisher(server_args: Any) -> Optional[dict]:
     resolved_range, _reason = resolve_load_pub_range(
         kv_endpoint=cfg.endpoint,
         replay_endpoint=cfg.replay_endpoint,
-        dp_size=resolved.dp_size,
+        dp_size=num_dp_ranks_of(resolved),
         load_publish_endpoint=resolved.load_publish_endpoint,
     )
     if resolved_range is not None:
         descriptor["load_endpoint_port_base"] = resolved_range[1]
         descriptor["load_topic"] = LOAD_TOPIC
+    resolved_replay = parse_advertisable_tcp(cfg.replay_endpoint)
+    if resolved_replay is not None:
+        descriptor["replay_endpoint_port_base"] = resolved_replay[1]
     return descriptor

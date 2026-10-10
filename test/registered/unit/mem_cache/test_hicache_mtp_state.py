@@ -172,4 +172,5 @@ def test_ascend_packed_state_roundtrip_uses_per_layer_destinations(monkeypatch):
 
 
 if __name__ == "__main__":
-    raise SystemExit(pytest.main([__file__, "-v", "-x", *sys.argv[1:]]))
+    args = [arg for arg in sys.argv[1:] if arg != "-f"]
+    raise SystemExit(pytest.main([__file__, "-v", "-x", *args]))

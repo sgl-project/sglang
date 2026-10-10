@@ -313,4 +313,5 @@ def test_hicache_restores_all_mtp_kv_and_conv_state(
 
 
 if __name__ == "__main__":
-    raise SystemExit(pytest.main([__file__, "-v", "-x", *sys.argv[1:]]))
+    args = [arg for arg in sys.argv[1:] if arg != "-f"]
+    raise SystemExit(pytest.main([__file__, "-v", "-x", *args]))

@@ -180,8 +180,15 @@ class BaseSpecWorker(ABC):
 
     @property
     def primary_draft_kv_pool(self) -> Optional[object]:
+        from sglang.srt.mem_cache.unified_draft_pool import fused_draft_host_allocator
+
         draft_runners = self._draft_model_runners()
-        return draft_runners[0].token_to_kv_pool if draft_runners else None
+        if not draft_runners:
+            return None
+        pool = draft_runners[0].token_to_kv_pool
+        if fused_draft_host_allocator(pool) is not None:
+            return None
+        return pool
 
     @property
     def target_worker(self) -> TpModelWorker:

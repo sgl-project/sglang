@@ -17,7 +17,11 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
-from sglang.srt.mem_cache.hicache_storage import PoolTransfer, PoolTransferResult
+from sglang.srt.mem_cache.hicache_storage import (
+    PoolName,
+    PoolTransfer,
+    PoolTransferResult,
+)
 from sglang.srt.mem_cache.unified_cache.component_type import (  # noqa: F401
     BASE_COMPONENT_TYPE,
     ComponentType,
@@ -25,7 +29,11 @@ from sglang.srt.mem_cache.unified_cache.component_type import (  # noqa: F401
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.mem_cache.buffer_mode.storage_existence_cache import (
+        PoolBeliefPolicy,
+    )
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+    from sglang.srt.mem_cache.pool_host.group import HostPoolGroup, PoolEntry
     from sglang.srt.mem_cache.unified_cache.cache_action import (
         CacheAction,
         ComponentAction,
@@ -41,7 +49,18 @@ if TYPE_CHECKING:
 _NUM_COMPONENT_TYPES = len(ComponentType)
 
 _LAST_ACCESS_TIME_COUNTER_FLOAT = float64(1.0)
-_COMPONENT_UUID_COUNTER = 1
+_COMPONENT_UUID_RANGE_SIZE = 100_000_000_000_000
+_COMPONENT_UUID_RANGE_INDEX = {
+    ComponentType.SWA: 0,
+    ComponentType.FULL: 1,
+    ComponentType.MAMBA: 2,
+    ComponentType.C128: 3,
+    ComponentType.AUXILIARY_SWA: 4,
+}
+_COMPONENT_UUID_COUNTERS = {
+    component_type: (range_index + 1) * _COMPONENT_UUID_RANGE_SIZE
+    for component_type, range_index in _COMPONENT_UUID_RANGE_INDEX.items()
+}
 
 
 @dataclasses.dataclass
@@ -61,6 +80,15 @@ class EvictLayer(IntFlag):
     DEVICE = 1
     HOST = 2
     ALL = DEVICE | HOST
+
+
+@dataclasses.dataclass(frozen=True)
+class InternalStateBackup:
+    """Pause eviction for a host backup before freeing internal device state."""
+
+    node_id: NodeId
+    # Host capacity required by the backup, in this component's pool units.
+    num_tokens: int
 
 
 @dataclasses.dataclass(frozen=True)
@@ -112,10 +140,9 @@ def get_and_increase_time_counter() -> float64:
     return ret
 
 
-def next_component_uuid() -> int:
-    global _COMPONENT_UUID_COUNTER
-    _COMPONENT_UUID_COUNTER += 1
-    return _COMPONENT_UUID_COUNTER
+def next_component_uuid(component_type: ComponentType) -> int:
+    _COMPONENT_UUID_COUNTERS[component_type] += 1
+    return _COMPONENT_UUID_COUNTERS[component_type]
 
 
 class TreeComponent(ABC):
@@ -318,6 +345,17 @@ class TreeComponent(ABC):
     def value_len(self, node: UnifiedTreeNode) -> int:
         value = node.component_data[self.component_type].value
         return len(value) if value is not None else 0
+
+    def reclaimable_tokens(self, node: UnifiedTreeNode) -> int:
+        """Pool tokens the allocator gets back when this node's device value
+        is evicted. The evictable/protected ledgers count these (prefill
+        admission adds the evictable ledger to the allocator's free space, and
+        the eviction walk counts them toward its request), so they must be in
+        the allocator's units: the value length by default, less for a
+        component whose values are not backed one-to-one by pool rows. A
+        component whose per-node figure changes in place reports the delta
+        through ``UnifiedTreeCore.adjust_component_ledger``."""
+        return self.value_len(node)
 
     def has_host_value_only(self, node: UnifiedTreeNode) -> bool:
         """Whether this component's data is evicted from device but host-backed."""
@@ -522,11 +560,12 @@ class TreeComponent(ABC):
         tracker: dict[ComponentType, int],
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
-    ) -> Optional[NodeId]:
-        """Advance one eviction step and return a device leaf, if selected.
+    ) -> NodeId | InternalStateBackup | None:
+        """Return a device leaf, an internal backup request, or no selection.
 
         Implementations must return after one allocator-relevant internal
         mutation so the caller can drain pending frees before continuing.
+        Backup requests leave device state intact until the core resumes eviction.
         """
         assert self.is_evict_device_ongoing, (
             f"{self.component_type} device eviction not started"
@@ -552,8 +591,8 @@ class TreeComponent(ABC):
         tracker: dict[ComponentType, int],
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
-    ) -> Optional[NodeId]:
-        """Advance the walk by at most one allocator-relevant mutation."""
+    ) -> NodeId | InternalStateBackup | None:
+        """Select a leaf, request backup, or perform at most one internal mutation."""
         ...
 
     @abstractmethod
@@ -579,7 +618,7 @@ class TreeComponent(ABC):
           node itself (mamba state is per-leaf, not per-path).
 
         When ``lock_host`` is True, the lock applies to host-side state:
-        - Full: single-node host lock.
+        - Full: a one-node UUID-bounded segment that expands across splits.
         - SWA: host window-lock with a dedicated host UUID boundary.
         - Mamba: single-node host lock with host LRU detach."""
         ...
@@ -600,7 +639,8 @@ class TreeComponent(ABC):
         - Mamba: single-node unlock — only decrements lock_ref on the
           node itself.
 
-        When ``lock_host`` is True, the inverse host-side semantics apply."""
+        When ``lock_host`` is True, Full and SWA replay their host boundary
+        UUIDs while Mamba retains its single-node semantics."""
         ...
 
     def prepare_for_caching_req(
@@ -615,7 +655,8 @@ class TreeComponent(ABC):
         Return None for no truncation opinion (use full length);
         return int >= 0 for effective cache length.
         - Full: no-op, returns None.
-        - SWA: sets insert_params.swa_evicted_seqlen on finished; returns None.
+        - SWA: copies its eviction cursor into insert_params for finished and
+          unfinished requests; may return a branching boundary.
         - Mamba: prepares mamba_value (finished from ping-pong buffer,
           unfinished fork from req); returns mamba_last_track_seqlen."""
         return None
@@ -675,6 +716,40 @@ class TreeComponent(ABC):
 
     def alloc_prefetch_staging(self, num_tokens: int) -> Optional[torch.Tensor]:
         """Allocate prefetch staging sized by prepare_prefetch, once the hit is known."""
+        return None
+
+    # ---- Buffer-mode backup hooks (hicache_host_memory_mode=buffer_only) ----
+    # Buffer mode writes a node pool by pool: keys per pool come from
+    # ``buffer_backup_keys`` or the BACKUP_HOST transfers, beliefs heal through
+    # ``buffer_belief_policy``; the pipeline pins the node from D2H launch to
+    # ack, so a component dropping rows asks ``buffer_backup_pending`` first.
+
+    def buffer_mode_host_pool_entries(
+        self, host_pool_group: HostPoolGroup
+    ) -> list[PoolEntry]:
+        """Extra host pool entries this component stages through (an entry
+        may alias the anchor's host pool)."""
+        return []
+
+    def buffer_backup_keys(
+        self, node: UnifiedTreeNode, hash_values: list[str]
+    ) -> dict[PoolName, list[str]]:
+        """Per-pool storage keys a backup of ``node`` writes for this component
+        (empty list: withhold the pool; empty dict: derive them from its
+        BACKUP_HOST transfers). A component naming any pool names all of them."""
+        return {}
+
+    def buffer_backup_parent_covered(
+        self, parent_node_id: NodeId, node_id: NodeId
+    ) -> bool:
+        """Whether this component covers the parent of ``node_id`` without
+        the parent's KV pages in storage (no prefix hole for a reader)."""
+        return False
+
+    def buffer_belief_policy(self, pool: PoolName) -> Optional[PoolBeliefPolicy]:
+        """The policy healing ``pool``'s existence beliefs, for a pool this
+        component owns; None picks the built-in one for the transfer's hit
+        policy."""
         return None
 
     def build_hicache_transfers(
