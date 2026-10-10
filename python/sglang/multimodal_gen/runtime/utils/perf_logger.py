@@ -51,7 +51,7 @@ class MemorySnapshot:
         }
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(eq=False)
 class RequestMetrics:
     """Performance metrics for a single request, including timings and memory snapshots."""
 
