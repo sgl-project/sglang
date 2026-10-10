@@ -96,7 +96,8 @@ def test_broken_pool_is_replaced_once_for_concurrent_failures():
 def test_replacement_pool_runs_after_real_worker_exit(monkeypatch):
     monkeypatch.setenv("SGLANG_CPU_WORKERS", "1")
     processor = object.__new__(LlavaImageProcessor)
-    processor.mm_feature_transport = "cpu"
+    processor.cpu_process_start_method = "fork"
+    processor.cpu_worker_num = 0
     processor._cpu_executor_lock = threading.Lock()
     failed_executor = processor._create_cpu_executor()
     processor.cpu_executor = failed_executor
