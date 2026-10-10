@@ -632,7 +632,9 @@ def handle_missing_default_values(server_args: Any):
 
     # In speculative scenario:
     # - If `speculative_draft_model_quantization` is specified, the draft model uses this quantization method.
-    # - Otherwise, the draft model defaults to the same quantization as the target model.
+    # - Otherwise, inherit the target quantization except for nvfp4_online:
+    #   keep MTP/draft weights in their checkpoint precision by default.
+    #   Leaving the draft method unset preserves checkpoint quantization detection.
     if cfg._speculative_draft_quantization_explicitly_set is None:
         declare_resolution(
             server_args,
@@ -640,7 +642,10 @@ def handle_missing_default_values(server_args: Any):
             _speculative_draft_quantization_explicitly_set=cfg.speculative_draft_model_quantization
             is not None,
         )
-    if cfg.speculative_draft_model_quantization is None:
+    if (
+        cfg.speculative_draft_model_quantization is None
+        and cfg.quantization != "nvfp4_online"
+    ):
         declare_resolution(
             server_args,
             "_handle_missing_default_values",
