@@ -145,6 +145,16 @@ class TestHostKVCache(CustomTestCase):
         self.assertIn("Double-alloc", msg)
         self.assertIn(f"[{int(leak[0])}]", msg)
 
+    def test_alloc_prefers_contiguous_run(self):
+        everything = self.host_pool.alloc(self.host_pool.size)
+        self.host_pool.free(everything[:2])
+        self.host_pool.free(everything[6:10])
+        # merged free list is [0, 1, 6, 7, 8, 9], first-fit would hand out the
+        # split [0, 1, 6, 7]
+        indices = self.host_pool.alloc(4)
+        self.assertEqual(indices.tolist(), everything[6:10].tolist())
+        self.assertEqual(self.host_pool.free_slots.tolist(), everything[:2].tolist())
+
     def test_double_free(self):
         indices = self.host_pool.alloc(4)
         self.assertEqual(len(indices), 4)

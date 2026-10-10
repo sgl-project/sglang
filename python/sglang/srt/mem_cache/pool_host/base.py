@@ -13,6 +13,7 @@ import torch
 
 from sglang.srt.mem_cache.host_memory import available_host_memory_bytes
 from sglang.srt.mem_cache.memory_pool import KVCache
+from sglang.srt.mem_cache.pool_host.coalesce_reload import take_contiguous_run
 from sglang.srt.mem_cache.pool_host.common import (
     _cuda_host_unregister,
     get_allocator_from_storage,
@@ -511,9 +512,11 @@ class HostKVCache(abc.ABC):
             return
 
         if len(self.free_slots) == 0 and len(self.release_slots) == 1:
-            self.free_slots = self.release_slots[0]
+            merged = self.release_slots[0]
         else:
-            self.free_slots = torch.cat([self.free_slots, *self.release_slots])
+            merged = torch.cat([self.free_slots, *self.release_slots])
+        # keep free_slots sorted so alloc() can find a contiguous run in one scan
+        self.free_slots = torch.sort(merged).values
 
         self.release_slots = []
         self.num_release_slots = 0
@@ -539,12 +542,15 @@ class HostKVCache(abc.ABC):
         if need_size > len(self.free_slots):
             self._merge_release_slots()
 
-        select_index = self.free_slots[:need_size]
-        self.free_slots = self.free_slots[need_size:]
+        head = self.free_slots[:need_size]
+        select_index, self.free_slots = take_contiguous_run(self.free_slots, need_size)
 
-        assert not self.slot_used[select_index].any(), (
+        # take_contiguous_run can skip the head of free_slots, so check the head
+        # too, otherwise an in-use slot leaked there would never be caught
+        checked = torch.cat([head, select_index])
+        assert not self.slot_used[checked].any(), (
             f"Double-alloc detected: slots already allocated: "
-            f"{select_index[self.slot_used[select_index]].tolist()}."
+            f"{checked[self.slot_used[checked]].unique().tolist()}."
         )
         self.slot_used[select_index] = True
 
