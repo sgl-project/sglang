@@ -239,7 +239,7 @@ fn create_external_kv_indexer_client(config: &Config) -> Result<Option<Arc<dyn P
 
 fn prefix_index_config(indexer: &KvIndexerEndpointConfig) -> PrefixIndexConfig {
     PrefixIndexConfig {
-        endpoint: indexer.url.clone(),
+        endpoints: indexer.urls.clone(),
         query_deadline: Duration::from_millis(indexer.query_timeout_ms),
         max_inflight: indexer.query_max_inflight,
     }
@@ -557,11 +557,21 @@ mod tests {
     #[test]
     fn prefix_index_config_preserves_router_limits() {
         let config = prefix_index_config(&KvIndexerEndpointConfig {
-            url: "http://127.0.0.1:50051".to_string(),
+            urls: vec![
+                "http://127.0.0.1:50051".to_string(),
+                "http://127.0.0.1:50052".to_string(),
+            ],
             query_timeout_ms: 25,
             query_max_inflight: 17,
         });
-        assert_eq!(config.endpoint, "http://127.0.0.1:50051");
+        // Order is the client's failover preference, so it must survive intact.
+        assert_eq!(
+            config.endpoints,
+            vec![
+                "http://127.0.0.1:50051".to_string(),
+                "http://127.0.0.1:50052".to_string()
+            ]
+        );
         assert_eq!(config.query_deadline, Duration::from_millis(25));
         assert_eq!(config.max_inflight, 17);
     }
