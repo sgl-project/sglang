@@ -5,12 +5,12 @@ import torch
 from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
     is_unified_kv_triton,
 )
-from sglang.kernels.ops.speculative.cache_locs import assign_extend_cache_locs_func
 from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
     BuildCommitInjectLayout,
     build_unified_commit_inject_layout,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.mem_cache.kv_loc_plan import Cols, KVLocPlan
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 
 
@@ -31,6 +31,11 @@ class TargetHiddenKvInjector:
         self.device = device
         self.verify_num_draft_tokens = verify_num_draft_tokens
         self._block_pos_offsets = block_pos_offsets
+
+    def ids_for(self, plan: KVLocPlan, *, cols: Optional[Cols] = None) -> torch.Tensor:
+        """The plan's write ids as the draft pool indexes them: the target's
+        physical ids for a fused draft, the virtual ids for a private one."""
+        return plan.write_ids(self.draft_model_runner.kv_index_translator, cols=cols)
 
     def inject_target_hidden(
         self,
@@ -70,6 +75,7 @@ class TargetHiddenKvInjector:
                 device=device, dtype=torch.int64, non_blocking=True
             )
 
+        # `cache_loc` arrives in the draft pool's id space (`ids_for`).
         pool = self.draft_model_runner.token_to_kv_pool
         if hasattr(pool, "set_swa_key_buffer_radix_fused_norm_rope"):
             if target_hidden_is_projected:
@@ -120,6 +126,24 @@ class TargetHiddenKvInjector:
                 commit_lens=commit_lens,
                 state_slot=state_slot,
                 final_pos=final_pos,
+            )
+        elif (
+            cache_loc.is_cuda
+            and cache_loc.is_contiguous()
+            and commit_lens is not None
+            and cache_loc_2d is not None
+            and commit_lens.is_contiguous()
+            and cache_loc.numel() == cache_loc_2d.numel()
+        ):
+            from sglang.kernels.ops.speculative.dspark.commit_swa import (
+                committed_swa_locations,
+            )
+
+            swa_loc = committed_swa_locations(
+                cache_loc,
+                pool.full_to_swa_index_mapping,
+                commit_lens,
+                cache_loc_2d.shape[1],
             )
         else:
             swa_loc = pool.translate_loc_from_full_to_swa(cache_loc).to(torch.int32)
@@ -186,6 +210,7 @@ class TargetHiddenKvInjector:
         hidden_strided: torch.Tensor,
         commit_lens: torch.Tensor,
         bs: int,
+        kv_loc_plan: KVLocPlan,
     ) -> None:
         stride = self.verify_num_draft_tokens
         prefix_lens = batch.seq_lens
@@ -224,15 +249,7 @@ class TargetHiddenKvInjector:
             return
 
         positions_2d = prefix_lens.unsqueeze(1) + self._block_pos_offsets
-        verify_cache_loc = assign_extend_cache_locs_func(
-            req_pool_indices=batch.req_pool_indices,
-            req_to_token=self.model_runner.req_to_token_pool.req_to_token,
-            start_offset=prefix_lens,
-            end_offset=prefix_lens + stride,
-            batch_size=bs,
-            draft_token_num=stride,
-            device=self.device,
-        )
+        verify_cache_loc = self.ids_for(kv_loc_plan)
         verify_cache_loc_2d = verify_cache_loc.view(bs, stride)
         self.inject_target_hidden(
             target_hidden=hidden.reshape(-1, hidden.shape[-1]),

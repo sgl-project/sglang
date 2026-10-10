@@ -34,37 +34,30 @@ If you only need to use the distributed environment without model parallelism,
 import contextlib
 import datetime
 import os
-import weakref
-from collections import namedtuple
-from collections.abc import Callable
 from contextlib import contextmanager
-from multiprocessing import shared_memory
-from typing import Any, List, Optional
-from unittest.mock import patch
+from typing import List, Optional
 
 import torch
 import torch.distributed
 from torch.distributed import ProcessGroup
 
 import sglang.multimodal_gen.envs as envs
-from sglang.multimodal_gen.runtime.distributed.utils import StatelessProcessGroup
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
-from ..utils.distributed import RankGenerator
 from .group_coordinator import (
     GroupCoordinator,
-    PipelineGroupCoordinator,
     SequenceParallelGroupCoordinator,
     get_local_torch_device,
     new_device_group,
 )
+from .utils import RankGenerator
 
 logger = init_logger(__name__)
 
 _WORLD: GroupCoordinator | None = None
 _TP: GroupCoordinator | None = None
 _SP: SequenceParallelGroupCoordinator | None = None
-_PP: PipelineGroupCoordinator | None = None
+_PP: GroupCoordinator | None = None
 _CFG: GroupCoordinator | None = None
 _DP: GroupCoordinator | None = None
 # all ranks serving one pipeline replica (every dim except dp); with
@@ -73,59 +66,13 @@ _REPLICA: GroupCoordinator | None = None
 # Corresponding TP lanes across the replicated encoder copies in one pipeline
 # replica. None means the encoder has only one TP copy, so batch DP cannot run.
 _ENCODER_DP: GroupCoordinator | None = None
+_SRT_MOE_EP = None
 _VAE_DECODE: GroupCoordinator | None = None
 _DIT: ProcessGroup | None = None
 _VAE: ProcessGroup | None = None
 _VAE_DECODE_PARALLEL_AXES = "tp-sp-pp-cfg"
 _REPLICA_PARALLEL_AXES = "tp-sp-pp-cfg"
 _ENCODER_DP_PARALLEL_AXES = "sp-pp-cfg"
-
-TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
-
-
-def _split_tensor_dict(
-    tensor_dict: dict[str, torch.Tensor | Any],
-) -> tuple[list[tuple[str, Any]], list[torch.Tensor]]:
-    """Split the tensor dictionary into two parts:
-    1. A list of (key, value) pairs. If the value is a tensor, it is replaced
-         by its metadata.
-    2. A list of tensors.
-    """
-    metadata_list: list[tuple[str, Any]] = []
-    tensor_list: list[torch.Tensor] = []
-    for key, value in tensor_dict.items():
-        if isinstance(value, torch.Tensor):
-            # Note: we cannot use `value.device` here,
-            # because it contains not only the device type but also the device
-            # index (e.g. "cuda:0"). We only need the device type.
-            # receiving side will set the device index.
-            device = value.device.type
-            metadata_list.append(
-                (key, TensorMetadata(device, value.dtype, value.size()))
-            )
-            tensor_list.append(value)
-        else:
-            metadata_list.append((key, value))
-    return metadata_list, tensor_list
-
-
-_groups: dict[str, Callable[[], Optional["GroupCoordinator"]]] = {}
-
-
-def _register_group(group: "GroupCoordinator") -> None:
-    _groups[group.unique_name] = weakref.ref(group)
-
-
-def all_reduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
-    assert group_name in _groups, f"Group {group_name} is not found."
-    group = _groups[group_name]()
-    if group is None:
-        raise ValueError(f"Group {group_name} is destroyed.")
-    return group._all_reduce_out_place(tensor)
-
-
-def all_reduce_fake(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
-    return torch.empty_like(tensor)
 
 
 def get_world_group() -> GroupCoordinator:
@@ -151,9 +98,12 @@ def init_world_group(
 
 def _sync_srt_world_group() -> None:
     import sglang.srt.distributed.parallel_state as srt_parallel_state
+    from sglang.srt.runtime_context import get_parallel
 
     if srt_parallel_state._WORLD is None:
         srt_parallel_state._WORLD = _WORLD
+    if srt_parallel_state._WORLD is _WORLD:
+        get_parallel().override_permanently(world_group=_WORLD)
 
 
 def _clear_srt_world_group() -> None:
@@ -163,22 +113,96 @@ def _clear_srt_world_group() -> None:
         srt_parallel_state._WORLD = None
 
 
-def _sync_srt_tp_group() -> None:
+def _init_srt_moe_ep_group():
+    """SRT's MOE EP group for FusedMoE layers.
+
+    multimodal_gen has no expert parallelism: every rank keeps all experts
+    and TP shards the weights inside each expert (``_MOE_TP = _TP``). The EP
+    group must therefore be single-rank (``moe_ep_size=1``); aliasing
+    ``_MOE_EP`` to ``_TP`` would partition experts across ranks and break
+    FusedMoE dispatch.
+    """
     import sglang.srt.distributed.parallel_state as srt_parallel_state
+
+    world_size = torch.distributed.get_world_size()
+    return srt_parallel_state.init_model_parallel_group(
+        group_ranks=[[r] for r in range(world_size)],
+        local_rank=get_world_group().local_rank,
+        backend=torch.distributed.get_backend(get_world_group().device_group),
+        use_pynccl=False,
+        use_custom_allreduce=False,
+        group_name="moe_ep",
+    )
+
+
+def _sync_srt_tp_group() -> None:
+    """Expose this package's TP group, widths, and ranks to shared SRT layers.
+
+    Use the group's actual width: sequence parallelism can make it wider than
+    the TP size in the dummy SRT configuration. Other parallel dimensions are
+    one. Overrides also work before SRT configuration is published.
+    """
+    global _SRT_MOE_EP
+    import sglang.srt.distributed.parallel_state as srt_parallel_state
+    from sglang.srt.runtime_context import derive_parallel_widths, get_parallel
 
     if srt_parallel_state._TP is None:
         srt_parallel_state._TP = _TP
     if srt_parallel_state._ATTN_TP is None:
         srt_parallel_state._ATTN_TP = _TP
+    if srt_parallel_state._TP is _TP and srt_parallel_state._MOE_TP is None:
+        srt_parallel_state._MOE_TP = _TP
+    if (
+        _TP is not None
+        and srt_parallel_state._TP is _TP
+        and srt_parallel_state._MOE_TP is _TP
+        and srt_parallel_state._MOE_EP is None
+    ):
+        _SRT_MOE_EP = _init_srt_moe_ep_group()
+        srt_parallel_state._MOE_EP = _SRT_MOE_EP
+    if srt_parallel_state._ATTN_TP is _TP:
+        get_parallel().override_permanently(
+            tp_group=_TP,
+            attn_tp_group=_TP,
+            tp_size=_TP.world_size,
+            tp_rank=_TP.rank_in_group,
+            attn_tp_rank=_TP.rank_in_group,
+            moe_tp_rank=_TP.rank_in_group,
+            attn_cp_rank=0,
+            pp_rank=0,
+            moe_ep_rank=0,
+            **derive_parallel_widths(
+                tp_size=_TP.world_size,
+                attn_cp_size=1,
+                attn_dp_size=1,
+                moe_ep_size=1,
+                moe_dp_size=1,
+                dcp_size=1,
+                dcp_enabled=False,
+            ),
+        )
 
 
 def _clear_srt_tp_group() -> None:
+    global _SRT_MOE_EP
     import sglang.srt.distributed.parallel_state as srt_parallel_state
+    from sglang.srt.runtime_context import get_parallel
 
     if srt_parallel_state._ATTN_TP is _TP:
         srt_parallel_state._ATTN_TP = None
+        get_parallel().clear_stamp()
+        if srt_parallel_state._WORLD is not None:
+            # Restore the still-active WORLD handle after clearing TP overrides.
+            get_parallel().override_permanently(world_group=srt_parallel_state._WORLD)
     if srt_parallel_state._TP is _TP:
         srt_parallel_state._TP = None
+    if srt_parallel_state._MOE_TP is _TP:
+        srt_parallel_state._MOE_TP = None
+    if _SRT_MOE_EP is not None:
+        _SRT_MOE_EP.destroy()
+        if srt_parallel_state._MOE_EP is _SRT_MOE_EP:
+            srt_parallel_state._MOE_EP = None
+        _SRT_MOE_EP = None
 
 
 def init_parallel_group_coordinator(
@@ -199,14 +223,7 @@ def init_parallel_group_coordinator(
         "replica",
         "encoder_data",
     ], f"parallel_mode {parallel_mode} is not supported"
-    if parallel_mode == "pipeline":
-        return PipelineGroupCoordinator(
-            group_ranks=group_ranks,
-            local_rank=local_rank,
-            torch_distributed_backend=backend,
-            group_name="pp_group",
-        )
-    elif parallel_mode == "sequence":
+    if parallel_mode == "sequence":
         return SequenceParallelGroupCoordinator(
             group_ranks=group_ranks,
             local_rank=local_rank,
@@ -216,6 +233,7 @@ def init_parallel_group_coordinator(
         )
     else:
         group_name = {
+            "pipeline": "pp_group",
             "tensor": "tp_group",
             "vae_decode": "vae_decode_group",
             "replica": "replica_group",
@@ -284,17 +302,10 @@ def init_distributed_environment(
             "distributed environment"
         )
 
-        # For MPS, MUSA, and XPU, don't pass device_id as it doesn't support device indices
         extra_args = (
-            {}
-            if (
-                current_platform.is_mps()
-                or current_platform.is_musa()
-                or current_platform.is_npu()
-                or current_platform.is_cpu()
-                or current_platform.is_xpu()
-            )
-            else dict(device_id=device_id)
+            dict(device_id=device_id)
+            if current_platform.supports_distributed_device_id()
+            else {}
         )
 
         if timeout is not None:
@@ -704,11 +715,17 @@ def use_tensor_parallel_group(tp_group: GroupCoordinator):
 
     The scope replaces the module globals that ``get_tp_group()`` and srt's
     ``get_tp_group()`` / ``get_attention_tp_group()`` read, and — like srt's
-    ``patch_tensor_parallel_group`` — the three members the runtime context
-    answers with, so that a size read from the published bag cannot disagree
-    with a rank read from the swapped group.
+    ``patch_tensor_parallel_group`` — the members the runtime context answers
+    with, so that a size read from the published bag cannot disagree with a rank
+    read from the swapped group.
+
+    The parallel quotients are part of that set: the published config describes
+    the launch (`tp=1` for a sequence-parallel run), not the group folded in
+    here. Left out, an encoder built in this scope keeps its heads whole on
+    `attn_tp_size == 1` while the `QKVParallelLinear` beside it shards on
+    `tp_size == 2`, and the weight loader narrows past the end of the tensor.
     """
-    from sglang.srt.runtime_context import get_parallel
+    from sglang.srt.runtime_context import derive_parallel_widths, get_parallel
 
     old_tp_group = get_tp_group()
     import sglang.srt.distributed.parallel_state as srt_parallel_state
@@ -724,6 +741,20 @@ def use_tensor_parallel_group(tp_group: GroupCoordinator):
             tp_size=tp_group.world_size,
             tp_rank=tp_group.rank_in_group,
             tp_group=tp_group,
+            attn_tp_group=tp_group,
+            attn_tp_rank=tp_group.rank_in_group,
+            moe_tp_rank=tp_group.rank_in_group,
+            # Only tensor parallelism folds here, so every other dimension is
+            # one and the quotients come out of the shared derivation.
+            **derive_parallel_widths(
+                tp_size=tp_group.world_size,
+                attn_cp_size=1,
+                attn_dp_size=1,
+                moe_ep_size=1,
+                moe_dp_size=1,
+                dcp_size=1,
+                dcp_enabled=False,
+            ),
         ):
             yield
     finally:
@@ -763,96 +794,6 @@ def cleanup_dist_env_and_memory(shutdown_ray: bool = False):
         ray.shutdown()
 
 
-def is_the_same_node_as(
-    pg: ProcessGroup | StatelessProcessGroup, source_rank: int = 0
-) -> list[int]:
-    """
-    This is a collective operation that returns if each rank is in the same node
-    as the source rank. It tests if processes are attached to the same
-    memory system (shared access to shared memory).
-    """
-    if isinstance(pg, ProcessGroup):
-        assert torch.distributed.get_backend(pg) != torch.distributed.Backend.NCCL, (
-            "in_the_same_node_as should be tested with a non-NCCL group."
-        )
-        # local rank inside the group
-        rank = torch.distributed.get_rank(group=pg)
-        world_size = torch.distributed.get_world_size(group=pg)
-
-        # global ranks of the processes in the group
-        ranks = torch.distributed.get_process_group_ranks(pg)
-    else:
-        rank = pg.rank
-        world_size = pg.world_size
-        ranks = list(range(world_size))
-
-    # local tensor in each process to store the result
-    is_in_the_same_node = torch.tensor([0] * world_size, dtype=torch.int32)
-
-    magic_message = b"magic_message"
-    shm = None
-
-    try:
-        with contextlib.suppress(OSError):
-            if rank == source_rank:
-                # create a shared memory segment
-                shm = shared_memory.SharedMemory(create=True, size=128)
-                shm.buf[: len(magic_message)] = magic_message
-                if isinstance(pg, ProcessGroup):
-                    torch.distributed.broadcast_object_list(
-                        [shm.name], src=ranks[source_rank], group=pg
-                    )
-                else:
-                    pg.broadcast_obj(shm.name, src=source_rank)
-                is_in_the_same_node[rank] = 1
-            else:
-                # try to open the shared memory segment
-                if isinstance(pg, ProcessGroup):
-                    recv = [None]
-                    torch.distributed.broadcast_object_list(
-                        recv, src=ranks[source_rank], group=pg
-                    )
-                    name = recv[0]
-                else:
-                    name = pg.broadcast_obj(None, src=source_rank)
-                # fix to https://stackoverflow.com/q/62748654/9191338
-                # Python incorrectly tracks shared memory even if it is not
-                # created by the process. The following patch is a workaround.
-                with patch(
-                    "multiprocessing.resource_tracker.register",
-                    lambda *args, **kwargs: None,
-                ):
-                    shm = shared_memory.SharedMemory(name=name)
-                if shm.buf[: len(magic_message)] == magic_message:
-                    is_in_the_same_node[rank] = 1
-    except Exception as e:
-        logger.error("Error ignored in is_in_the_same_node: %s", e)
-    finally:
-        if shm:
-            shm.close()
-
-    if isinstance(pg, ProcessGroup):
-        torch.distributed.barrier(group=pg)
-    else:
-        pg.barrier()
-
-    # clean up the shared memory segment
-    with contextlib.suppress(OSError):
-        if rank == source_rank and shm:
-            shm.unlink()
-
-    if isinstance(pg, ProcessGroup):
-        torch.distributed.all_reduce(is_in_the_same_node, group=pg)
-        aggregated_data = is_in_the_same_node
-    else:
-        aggregated_data = torch.zeros_like(is_in_the_same_node)
-        for i in range(world_size):
-            rank_data = pg.broadcast_obj(is_in_the_same_node, src=i)
-            aggregated_data += rank_data
-
-    return [x == 1 for x in aggregated_data.tolist()]
-
-
 def get_tensor_model_parallel_world_size() -> int:
     """Return world size for the tensor model parallel group."""
     return get_tp_world_size()
@@ -866,11 +807,6 @@ def get_tensor_model_parallel_rank() -> int:
 def get_sequence_parallel_world_size() -> int:
     """Return world size for the sequence parallel group."""
     return get_sp_world_size()
-
-
-def get_sequence_parallel_rank() -> int:
-    """Return my rank for the sequence parallel group."""
-    return get_sp_parallel_rank()
 
 
 def get_ulysses_parallel_world_size() -> int:
@@ -904,32 +840,6 @@ def get_ring_ctx() -> tuple[int, int]:
     return get_ring_parallel_world_size(), get_ring_parallel_rank()
 
 
-# PP
-def get_pp_group() -> PipelineGroupCoordinator:
-    assert _PP is not None, "pipeline model parallel group is not initialized"
-    return _PP
-
-
-def get_pipeline_parallel_world_size() -> int:
-    """Return world size for the pipeline model parallel group."""
-    return get_pp_group().world_size
-
-
-def get_pipeline_parallel_rank() -> int:
-    """Return my rank for the pipeline model parallel group."""
-    return get_pp_group().rank_in_group
-
-
-def is_pipeline_first_stage() -> bool:
-    """Return True if in the first pipeline model parallel stage, False otherwise."""
-    return get_pipeline_parallel_rank() == 0
-
-
-def is_pipeline_last_stage() -> bool:
-    """Return True if in the last pipeline model parallel stage, False otherwise."""
-    return get_pipeline_parallel_rank() == (get_pipeline_parallel_world_size() - 1)
-
-
 # CFG
 def get_cfg_group() -> GroupCoordinator:
     assert _CFG is not None, (
@@ -951,47 +861,6 @@ def get_classifier_free_guidance_rank() -> int:
 def get_data_parallel_world_size() -> int:
     """Return world size for the data parallel group."""
     return get_dp_world_size()
-
-
-def get_data_parallel_rank() -> int:
-    """Return my rank for the data parallel group."""
-    return get_dp_rank()
-
-
-def is_dp_last_group() -> bool:
-    """Return True if in the last data parallel group, False otherwise."""
-    return (
-        get_sequence_parallel_rank() == (get_sequence_parallel_world_size() - 1)
-        and get_classifier_free_guidance_rank()
-        == (get_classifier_free_guidance_world_size() - 1)
-        and get_pipeline_parallel_rank() == (get_pipeline_parallel_world_size() - 1)
-    )
-
-
-def get_dit_world_size() -> int:
-    """Return world size for the DiT model (excluding VAE)."""
-    return (
-        get_data_parallel_world_size()
-        * get_classifier_free_guidance_world_size()
-        * get_sequence_parallel_world_size()
-        * get_pipeline_parallel_world_size()
-        * get_tensor_model_parallel_world_size()
-    )
-
-
-def get_vae_parallel_group() -> ProcessGroup:
-    assert _VAE is not None, "VAE parallel group is not initialized"
-    return _VAE
-
-
-def get_vae_parallel_world_size() -> int:
-    """Return world size for the VAE parallel group."""
-    return torch.distributed.get_world_size(group=get_vae_parallel_group())
-
-
-def get_vae_parallel_rank() -> int:
-    """Return my rank for the VAE parallel group."""
-    return torch.distributed.get_rank(group=get_vae_parallel_group())
 
 
 def get_decode_parallel_group_coordinator() -> GroupCoordinator:
@@ -1041,9 +910,11 @@ def destroy_model_parallel() -> None:
     # The IPC transport keeps CUDA mappings associated with the current
     # Ulysses group. Drop them before tearing down the process groups.
     from .device_communicators.ipc_a2a import IPC_A2A
+    from .device_communicators.ipc_a2a_multi import IPC_A2A_MULTI
     from .parallel_groups import PROCESS_GROUP
 
     IPC_A2A.reset()
+    IPC_A2A_MULTI.reset()
 
     destroyed_groups = []
     for group in (

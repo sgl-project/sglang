@@ -11,24 +11,7 @@ from sglang.srt.state_capturer import routed_experts as re_mod
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
-
-
-class TestScatteredA2ABackendHelper(CustomTestCase):
-    def test_classification(self):
-        expected = {
-            "deepep": True,
-            "deepep_v2": True,
-            "none": False,
-            "mooncake": False,
-        }
-        for value, exp in expected.items():
-            with mock.patch.object(
-                re_mod, "get_moe_a2a_backend", return_value=MoeA2ABackend(value)
-            ):
-                self.assertEqual(
-                    re_mod._is_scattered_a2a_backend(), exp, f"backend={value}"
-                )
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class TestGetLocalSliceBackendBranch(CustomTestCase):

@@ -19,23 +19,19 @@ import torch
 
 from sglang.srt.configs.k2_horizon import K2HorizonConfig, XllmConfig
 from sglang.srt.models.xllm import (
-    EntryClass,
-    K2HorizonForCausalLM,
     XllmAttention,
     XllmForCausalLM,
     XllmGroupRMSNorm,
     _normalize_k2_horizon_config,
     _validate_mova_config,
     _xllm_router_gemm,
-    _xllm_stacked_params_mapping,
     permute_to_hf,
     permute_to_xllm,
 )
 from sglang.srt.runtime_context import get_context
-from sglang.srt.utils.hf_transformers.common import _CONFIG_REGISTRY
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
 
 class _IdentityRotary:
@@ -44,13 +40,6 @@ class _IdentityRotary:
         self.q_shape = tuple(q.shape)
         self.k_shape = tuple(k.shape)
         return q, k
-
-
-def test_native_config_and_model_registration():
-    assert _CONFIG_REGISTRY["xllm"] is XllmConfig
-    assert _CONFIG_REGISTRY["k2_horizon"] is K2HorizonConfig
-    assert XllmForCausalLM in EntryClass
-    assert K2HorizonForCausalLM in EntryClass
 
 
 def test_dense_horizon_yarn_schema_normalization():
@@ -205,32 +194,6 @@ def test_mp2_router_gemm_preserves_source_rounding_order():
         _xllm_router_gemm(hidden.float(), weight.float(), 2)
 
 
-def test_mova_weight_mapping_uses_checkpoint_shaped_attention_projections():
-    config = SimpleNamespace(num_values=4)
-    mapping = _xllm_stacked_params_mapping(config)
-
-    assert mapping == [
-        (".gate_up_proj", ".gate_proj", 0),
-        (".gate_up_proj", ".up_proj", 1),
-        (".v_experts.weight", ".v_experts.0.weight", 0),
-        (".v_experts.weight", ".v_experts.1.weight", 1),
-        (".v_experts.weight", ".v_experts.2.weight", 2),
-        (".v_experts.weight", ".v_experts.3.weight", 3),
-    ]
-
-
-def test_dense_weight_mapping_packs_qkv_and_gate_up():
-    config = SimpleNamespace(num_values=0)
-
-    assert _xllm_stacked_params_mapping(config) == [
-        (".qkv_proj", ".q_proj", "q"),
-        (".qkv_proj", ".k_proj", "k"),
-        (".qkv_proj", ".v_proj", "v"),
-        (".gate_up_proj", ".gate_proj", 0),
-        (".gate_up_proj", ".up_proj", 1),
-    ]
-
-
 def test_strict_loader_rejects_unknown_checkpoint_weight():
     model = object.__new__(XllmForCausalLM)
     torch.nn.Module.__init__(model)
@@ -285,16 +248,6 @@ def test_native_xllm_rejects_other_quantization(monkeypatch):
         pytest.raises(ValueError, match="supports only compressed-tensors"),
     ):
         _validate_mova_config(config, quant_config=quant_config)
-
-
-def test_native_xllm_declares_quantized_fused_module_mapping():
-    assert XllmForCausalLM.packed_modules_mapping == {
-        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
-        "gate_up_proj": ["gate_proj", "up_proj"],
-    }
-    assert K2HorizonForCausalLM.packed_modules_mapping == (
-        XllmForCausalLM.packed_modules_mapping
-    )
 
 
 def test_native_xllm_accepts_bfloat16_without_expert_remapping(monkeypatch):

@@ -223,7 +223,7 @@ sglang serve \
   --model-path ./zai-org/GLM-Image/vision_language_encoder/ \
   --tokenizer-path ./zai-org/GLM-Image/processor/ \
   --enable-multimodal \
-  --cuda-graph-max-bs 28 \
+  --cuda-graph-max-bs-decode 28 \
   --device npu \
   --attention-backend ascend \
   --disable-fast-image-processor \
@@ -424,24 +424,25 @@ If not specified, parallelism is auto-derived from `--num-gpus`.
 
 ## Python API
 
-For programmatic single-machine deployment, `launch_pool_disagg_server()` is available:
+For programmatic single-machine deployment, `launch_pool_disagg_server()` is available. It spawns its workers, and each child re-executes this script's module scope before initializing its platform, so keep the diffusion imports inside the guard:
 
 ```python
-from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.runtime.launch_server import launch_pool_disagg_server
+if __name__ == "__main__":
+    from sglang.multimodal_gen.runtime.launch_server import launch_pool_disagg_server
+    from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
-server_args = ServerArgs.from_kwargs(
-    model_path="Wan-AI/Wan2.1-T2V-14B-Diffusers",
-    denoiser_sp=4, denoiser_ulysses=2, denoiser_ring=2,
-    disagg_ib_device="mlx5_0",
-)
+    server_args = ServerArgs.from_kwargs(
+        model_path="Wan-AI/Wan2.1-T2V-14B-Diffusers",
+        denoiser_sp=4, denoiser_ulysses=2, denoiser_ring=2,
+        disagg_ib_device="mlx5_0",
+    )
 
-launch_pool_disagg_server(
-    server_args,
-    encoder_gpus=[[0]],
-    denoiser_gpus=[[1, 2, 3, 4], [5, 6, 7, 8]],
-    decoder_gpus=[[0]],
-)
+    launch_pool_disagg_server(
+        server_args,
+        encoder_gpus=[[0]],
+        denoiser_gpus=[[1, 2, 3, 4], [5, 6, 7, 8]],
+        decoder_gpus=[[0]],
+    )
 ```
 
 ## Architecture

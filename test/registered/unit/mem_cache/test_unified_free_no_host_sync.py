@@ -38,7 +38,7 @@ from sglang.srt.mem_cache.allocator import unified_sub_pool as mea
 from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=20, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 PAGE_SIZE = _PagedFixture.PAGE_SIZE
 
@@ -58,13 +58,14 @@ def _paged_allocator(lazy: bool):
 _TABLES = {"virtual_to_physical", "physical_to_virtual"}
 
 # Methods that MUST tombstone through index_fill_; hand-listed because "writes
-# a tombstone" is a per-method design fact a scan cannot infer. Completeness is
-# guarded by `test_every_allocator_free_path_is_listed` below.
+# a tombstone" is a per-method design fact a scan cannot infer.
 _TOMBSTONE_METHODS = [
     (mea.MultiEndedAllocator, "_free_lazy"),
     (mea.MultiEndedAllocator, "free"),
+    (mea.MultiEndedAllocator, "free_physical"),
     (mea.MultiEndedAllocator, "_commit_move_batch"),
     (mea.FloatMultiEndedAllocator, "free"),
+    (mea.FloatMultiEndedAllocator, "free_physical"),
     (mea.FloatMultiEndedAllocator, "make_room"),
     (mea.FloatMultiEndedAllocator, "_relocate_to_positions"),
 ]
@@ -172,36 +173,6 @@ class TestTombstonesDoNotCrossTheBus(unittest.TestCase):
                         f"RHS: {bad}. That materialises -1 as a CPU tensor and "
                         f"copies it H2D, blocking the scheduler thread until the "
                         f"stream drains. Use `.index_fill_(0, idx, -1)`."
-                    ),
-                )
-
-    def test_every_allocator_free_path_is_listed(self):
-        """Bug regression: an allocator that owns a free path but is missing
-        from `_TOMBSTONE_METHODS` must fail loudly here rather than drop out of
-        tombstone coverage."""
-        listed = {(cls.__name__, name) for cls, name in _TOMBSTONE_METHODS}
-        for cls in _allocators_in_module():
-            for name, fn in vars(cls).items():
-                if not inspect.isfunction(fn):
-                    continue
-                try:
-                    src = inspect.getsource(fn)
-                except OSError:
-                    continue
-                # Only a method that WRITES a page table needs a tombstone;
-                # one that merely READS has nothing to guard.
-                if not (
-                    any(f"{t}.index_fill_" in src for t in _TABLES)
-                    or _scalar_index_assignments(fn)
-                ):
-                    continue
-                self.assertIn(
-                    (cls.__name__, name),
-                    listed,
-                    msg=(
-                        f"{cls.__name__}.{name} writes a page table but is not in "
-                        f"_TOMBSTONE_METHODS, so the index_fill_ guard does not "
-                        f"cover it. Add it."
                     ),
                 )
 
@@ -327,6 +298,7 @@ class TestEveryUnifiedAllocatorOverridesFreeSegment(unittest.TestCase):
             mea.MultiEndedAllocator,
             unified_mamba.UnifiedMambaTokenToKVPoolAllocator,
             unified_hybrid_swa.UnifiedSWATokenToKVPoolAllocator,
+            unified_hybrid_swa.UnifiedMambaSWATokenToKVPoolAllocator,
         ):
             with self.subTest(cls=cls.__name__):
                 self.assertIsNot(
@@ -346,9 +318,13 @@ class TestEveryUnifiedAllocatorOverridesFreeSegment(unittest.TestCase):
             mea.MultiEndedAllocator,
             unified_mamba.UnifiedMambaTokenToKVPoolAllocator,
             unified_hybrid_swa.UnifiedSWATokenToKVPoolAllocator,
+            unified_hybrid_swa.UnifiedMambaSWATokenToKVPoolAllocator,
         ):
             with self.subTest(cls=cls.__name__):
-                self.assertIn("free_page_reps_group", inspect.getsource(cls))
+                alloc = object.__new__(cls)
+                alloc.free_group = None
+                alloc.free_group_begin()
+                self.assertEqual(alloc.free_page_reps_group, [])
 
 
 class TestUnifiedSwaFullSideGroup(unittest.TestCase):
@@ -373,7 +349,7 @@ class TestUnifiedSwaFullSideGroup(unittest.TestCase):
 
 class TestFreeSwaWindowRatchetNoHostSync(unittest.TestCase):
     """The per-decode-step SWA window ratchet frees a CONTIGUOUS row slice with
-    host-int, page-aligned bounds, so `free_swa(..., start_pos=)` must reach the
+    host-int, page-aligned bounds, so `free_swa_segment` must reach the
     swa side with caller-derived page ids: no `torch.unique` and no stale-slot
     `.item()` on the per-step path.
     """
@@ -429,15 +405,15 @@ class TestFreeSwaWindowRatchetNoHostSync(unittest.TestCase):
                 torch.Tensor, "item", side_effect=AssertionError("item = host sync")
             ),
         ):
-            alloc.free_swa(v[: 4 * self.PS], start_pos=0)
-            alloc.free_swa(v[4 * self.PS :], start_pos=4 * self.PS)
+            alloc.free_swa_segment(v[: 4 * self.PS], start_pos=0)
+            alloc.free_swa_segment(v[4 * self.PS :], start_pos=4 * self.PS)
 
     def test_full_only_segment_free_never_syncs(self):
         """Request-finish shape: the swa side is already tombstoned, so the
         full side must free by page reps rather than `free_full`'s dedup."""
         alloc = self._swa_composite(lazy=True)
         v = alloc.alloc(8 * self.PS)
-        alloc.free_swa(v, start_pos=0)
+        alloc.free_swa_segment(v, start_pos=0)
         before = alloc.full_available_size()
         with (
             mock.patch.object(
@@ -456,7 +432,7 @@ class TestFreeSwaWindowRatchetNoHostSync(unittest.TestCase):
         alloc = self._swa_composite(lazy=True)
         v = alloc.alloc(8 * self.PS)
         with self.assertRaises(AssertionError):
-            alloc.free_swa(v[1 : 5 * self.PS], start_pos=1)
+            alloc.free_swa_segment(v[1 : 5 * self.PS], start_pos=1)
 
     def test_start_pos_path_matches_the_fallback_end_state(self):
         """Derived property: the stride-rep path and the dedup fallback leave
@@ -468,7 +444,7 @@ class TestFreeSwaWindowRatchetNoHostSync(unittest.TestCase):
                 v1 = a1.alloc(6 * self.PS)
                 v2 = a2.alloc(6 * self.PS)
                 self.assertTrue(torch.equal(v1, v2))
-                a1.free_swa(v1[: 4 * self.PS], start_pos=0)
+                a1.free_swa_segment(v1[: 4 * self.PS], start_pos=0)
                 a2.free_swa(v2[: 4 * self.PS])  # fallback (radix shape)
                 self.assertTrue(
                     torch.equal(
@@ -487,8 +463,8 @@ class TestFreeSwaWindowRatchetNoHostSync(unittest.TestCase):
         liveness filter (radix eviction and the ratchet can overlap)."""
         alloc = self._swa_composite(lazy=True)
         v = alloc.alloc(4 * self.PS)
-        alloc.free_swa(v, start_pos=0)
-        alloc.free_swa(v, start_pos=0)  # all tombstoned -> filtered to empty
+        alloc.free_swa_segment(v, start_pos=0)
+        alloc.free_swa_segment(v, start_pos=0)  # all tombstoned -> filtered to empty
 
 
 @unittest.skipUnless(

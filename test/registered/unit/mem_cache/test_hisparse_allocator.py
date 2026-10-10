@@ -1,7 +1,7 @@
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import torch
@@ -10,14 +10,142 @@ from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
 )
-from sglang.srt.runtime_context import get_context
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.runtime_context import get_context, publish, reset_context
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+
+class TestHiSparseDecodeRemap(CustomTestCase):
+    def test_page_size_one_reclaims_temporary_device_slot(self):
+        """Decode remapping must reclaim its temporary slot without freeing the live slot."""
+        from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+        from sglang.srt.mem_cache.allocator.hisparse import (
+            HiSparseTokenToKVPoolAllocator,
+        )
+        from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
+
+        pool = MiniMaxSparseKVPool(
+            size=8,
+            page_size=1,
+            dtype=torch.float32,
+            head_num=1,
+            head_dim=8,
+            idx_head_dim=16,
+            dense_layer_ids=[0],
+            sparse_layer_ids=[1],
+            disable_value_sparse_layer_ids=[1],
+            device="cpu",
+            start_layer=0,
+            end_layer=2,
+            enable_hisparse=True,
+        )
+        allocator = HiSparseTokenToKVPoolAllocator(
+            size=pool.size,
+            page_size=1,
+            dtype=pool.dtype,
+            device="cpu",
+            kvcache=pool,
+            need_sort=False,
+        )
+        coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
+        coordinator.is_dsv4_hisparse = False
+        coordinator.mem_pool_device = pool.main_pool
+        coordinator.token_to_kv_pool_allocator = allocator
+        coordinator.device_buffer_size = 2
+        coordinator.req_to_device_buffer = allocator.hisparse_attn_allocator.alloc(
+            3
+        ).reshape(1, 3)
+        coordinator.req_device_buffer_size = torch.tensor([3])
+        coordinator.req_device_buffer_token_locs = torch.zeros(
+            (1, 1, 3), dtype=torch.int32
+        )
+        coordinator._skip_first_backup = [True]
+        out_loc = allocator.alloc(1)
+        with patch("sglang.srt.managers.hisparse_coordinator._is_hip", False):
+            for _ in range(2):
+                coordinator._skip_first_backup[0] = True
+                coordinator.map_last_loc_to_buffer(
+                    seq_lens=torch.tensor([3]),
+                    out_cache_loc=out_loc,
+                    req_pool_indices=torch.tensor([0]),
+                    seq_lens_cpu=torch.tensor([3]),
+                    req_pool_indices_cpu=torch.tensor([0]),
+                )
+                self.assertEqual(
+                    allocator.hisparse_attn_allocator.available_size(), pool.size - 3
+                )
+                torch.testing.assert_close(
+                    allocator.full_to_hisparse_device_index_mapping[out_loc],
+                    coordinator.req_to_device_buffer[:, 2],
+                )
 
 
 class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
+    def setUp(self):
+        # The code under test reads its config from the bags.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+
+    def test_free_returns_c4_slots(self):
+        """Freeing a request's logical row must return the C4 HiSparse slots its
+        compressed tokens were mapped to."""
+        from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+            DeepSeekV4TokenToKVPool,
+        )
+
+        page_size, full_size = 256, 4 * 256
+        override = get_context().override_server_args(page_size=page_size)
+        override.install()
+        self.addCleanup(override.restore)
+        pool = DeepSeekV4TokenToKVPool(
+            max_num_reqs=4,
+            swa_size=full_size,
+            c4_size=full_size // 4,
+            c128_size=2 * full_size // 128,  # sizes the C4 logical index space
+            c4_state_pool_size=16,
+            c128_state_pool_size=0,
+            page_size=page_size,
+            swa_page_size=page_size,
+            dtype=torch.float8_e4m3fn,
+            c4_state_dtype=torch.float32,
+            c128_state_dtype=torch.float32,
+            qk_nope_head_dim=448,
+            qk_rope_head_dim=64,
+            indexer_head_dim=128,
+            layer_num=2,
+            device="cpu",
+            enable_memory_saver=False,
+            compression_ratios=[0, 4],
+            full_size=full_size,
+            enable_hisparse=True,
+        )
+        logical = PagedTokenToKVPoolAllocator(
+            full_size, page_size, pool.dtype, "cpu", pool, need_sort=False
+        )
+        allocator = DeepSeekV4HiSparseTokenToKVPoolAllocator(logical)
+        c4_free = allocator.hisparse_attn_allocator.available_size()
+
+        # What alloc_extend leaves behind for a one-page request.
+        locs = logical.alloc(page_size)
+        compressed = allocator.hisparse_kvcache.translate_loc_from_full_to_compressed(
+            locs
+        )
+        slots = allocator.hisparse_attn_allocator.alloc(len(compressed))
+        allocator.full_to_hisparse_device_index_mapping[compressed] = slots
+
+        allocator.free(locs)
+
+        self.assertEqual(allocator.hisparse_attn_allocator.available_size(), c4_free)
+        self.assertFalse(
+            allocator.full_to_hisparse_device_index_mapping[compressed].any()
+        )
+
     def test_forwards_swa_tail_allocation_to_logical_allocator(self):
         allocator = object.__new__(DeepSeekV4HiSparseTokenToKVPoolAllocator)
         logical_allocator = MagicMock(spec=["alloc_extend_swa_tail"])
@@ -52,6 +180,25 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         self.assertIs(kwargs["last_loc"], last_loc)
         self.assertEqual(kwargs["extend_num_tokens"], 512)
         self.assertEqual(kwargs["swa_tail_len"], 128)
+
+    def test_forwards_prealloc_reclaim_to_logical_allocator(self):
+        """PD decode preallocation must not crash on the HiSparse composite."""
+        allocator = object.__new__(DeepSeekV4HiSparseTokenToKVPoolAllocator)
+        logical_allocator = MagicMock(spec=["reclaim_for_prealloc"])
+        allocator.logical_attn_allocator = logical_allocator
+        logical_allocator.reclaim_for_prealloc.return_value = None
+
+        tree_cache = object()
+        self.assertIsNone(allocator.reclaim_for_prealloc(tree_cache, 512, 256))
+        logical_allocator.reclaim_for_prealloc.assert_called_once_with(
+            tree_cache, 512, 256
+        )
+
+        logical_allocator.reclaim_for_prealloc.return_value = "SWA eviction short"
+        self.assertEqual(
+            allocator.reclaim_for_prealloc(tree_cache, 512, 256),
+            "SWA eviction short",
+        )
 
     def test_hisparse_budget_uses_full_logical_capacity_for_swa_tail(self):
         from sglang.srt.disaggregation.decode import DecodePreallocQueue
@@ -95,11 +242,6 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
             kv=ReqKvInfo(),
         )
 
-        def set_extend_range(start, end):
-            req.extend_range = SimpleNamespace(start=start, end=end, length=end - start)
-
-        req.set_extend_range = set_extend_range
-
         class ReqToTokenPool:
             def __init__(self):
                 self.writes = []
@@ -134,6 +276,7 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         queue.tree_cache = SimpleNamespace(
             evictable_size=MagicMock(return_value=0),
             protected_size=MagicMock(return_value=0),
+            maybe_hand_to_session=lambda req: None,
         )
         queue.scheduler = SimpleNamespace(
             enable_hisparse=True,
@@ -151,10 +294,12 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         _, kwargs = allocator.alloc_extend_swa_tail.call_args
         self.assertEqual(kwargs["extend_num_tokens"], fill_len)
         self.assertEqual(kwargs["swa_tail_len"], swa_tail_len)
-        self.assertEqual(req.kv.swa_evicted_seqlen, fill_len - swa_tail_len)
+        self.assertEqual(
+            req.kv.get_evicted_seqlen(ComponentType.SWA), fill_len - swa_tail_len
+        )
         self.assertEqual(req.kv.kv_allocated_len, fill_len)
         self.assertEqual(req.kv.kv_committed_len, fill_len)
-        self.assertEqual(req.extend_range.length, fill_len)
+        self.assertEqual(req.extend_end, fill_len)
         self.assertEqual(len(req_to_token_pool.writes), 1)
         coordinator.host_token_len.assert_called_once_with(fill_len)
         regular_host_alloc.assert_called_once_with(
@@ -180,6 +325,7 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         manager.is_mla_backend = True
         manager.is_hybrid_mla_backend = False
         manager.enable_custom_mem_pool = False
+        manager.max_transfer_batch_indices = 0
         manager._transfer_data = MagicMock(return_value=0)
 
         with ThreadPoolExecutor(max_workers=1) as executor:

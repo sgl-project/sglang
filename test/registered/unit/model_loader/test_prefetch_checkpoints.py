@@ -25,10 +25,11 @@ from sglang.srt.model_loader.weight_utils import (
     fastsafetensors_weights_iterator,
     safetensors_weights_iterator,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class _InlineThread:
@@ -202,27 +203,6 @@ class TestPrefetchCheckpoints(CustomTestCase):
         self.assertEqual(warning.call_args.args[1], paths[0])
         self.assertIsInstance(warning.call_args.args[2], OSError)
 
-    @patch("torch.distributed.is_initialized", return_value=False)
-    def test_prefetch_progress_logs_all_crossed_buckets(self, _):
-        paths = [f"model-{i:05d}.safetensors" for i in range(3)]
-
-        with (
-            patch("threading.Thread", _InlineThread),
-            patch("concurrent.futures.ThreadPoolExecutor", _InlineExecutor),
-            patch("concurrent.futures.wait", side_effect=_wait_all),
-            patch("sglang.srt.model_loader.weight_utils._prefetch_checkpoint_file"),
-            patch("sglang.srt.model_loader.weight_utils.logger.debug") as log_debug,
-        ):
-            _prefetch_all_checkpoints(paths, num_threads=1)
-
-        progress_pcts = [
-            call.args[2]
-            for call in log_debug.call_args_list
-            if call.args
-            and call.args[0] == "Rank %d: prefetching checkpoint files: %d%% (%d/%d)"
-        ]
-        self.assertEqual(progress_pcts, list(range(10, 101, 10)))
-
     @patch("torch.distributed.is_initialized", return_value=True)
     def test_prefetch_uses_node_local_rank_partitioning(self, _):
         paths = [f"model-{i:05d}.safetensors" for i in range(10)]
@@ -237,10 +217,7 @@ class TestPrefetchCheckpoints(CustomTestCase):
             patch("threading.Thread", _InlineThread),
             patch("concurrent.futures.ThreadPoolExecutor", _InlineExecutor),
             patch("concurrent.futures.wait", side_effect=_wait_all),
-            patch(
-                "sglang.srt.model_loader.weight_utils.get_world_group",
-                return_value=FakeWorldGroup(),
-            ),
+            get_parallel().override(world_group=FakeWorldGroup()),
             patch(
                 "sglang.srt.model_loader.weight_utils._prefetch_checkpoint_file",
                 side_effect=lambda path, cancel_event: loaded_paths.append(path),

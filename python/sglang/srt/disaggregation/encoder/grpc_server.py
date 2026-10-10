@@ -251,8 +251,8 @@ async def serve_grpc_encoder(server_args: ServerArgs):
     ipc_path_prefix = random_uuid()
     port_args = PortArgs.init_new(server_args)
 
-    if server_args.dist_init_addr:
-        na = NetworkAddress.parse(server_args.dist_init_addr)
+    if get_parallel().dist_init_addr:
+        na = NetworkAddress.parse(get_parallel().dist_init_addr)
         dist_init_method = na.to_tcp()
     else:
         dist_init_method = NetworkAddress(

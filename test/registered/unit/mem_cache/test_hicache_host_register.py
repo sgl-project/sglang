@@ -27,7 +27,7 @@ from sglang.srt.mem_cache.pool_host.mha import (
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class _FakeBuffer:
@@ -80,6 +80,7 @@ class TestHiCacheHostRegister(unittest.TestCase):
                     SimpleNamespace(index_k_with_scale_buffer=[draft_buffer])
                 ]
                 host.layout = layout
+                host._live_target_layers = [0, 1, 2]
                 host.layer_num = 4
                 host.indexer_page_num = 3
                 host.indexer_page_stride_size = 512
@@ -196,7 +197,7 @@ class TestHiCacheHostRegister(unittest.TestCase):
                         "host_memory_budget_bytes",
                         return_value=1024**3,
                     ),
-                    mock.patch.dict(ALLOC_MEMORY_FUNCS, {torch.device("cpu"): alloc}),
+                    mock.patch.dict(ALLOC_MEMORY_FUNCS, {"cpu": alloc}),
                 ):
                     DeepSeekV4PagedHostPool(
                         pool_name="test",
@@ -229,7 +230,7 @@ class TestHiCacheHostRegister(unittest.TestCase):
                         "host_memory_budget_bytes",
                         return_value=1024**3,
                     ),
-                    mock.patch.dict(ALLOC_MEMORY_FUNCS, {torch.device("cpu"): alloc}),
+                    mock.patch.dict(ALLOC_MEMORY_FUNCS, {"cpu": alloc}),
                 ):
                     DeepSeekV4StateHostPool(
                         pool_name="test",

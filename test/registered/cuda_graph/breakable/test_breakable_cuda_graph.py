@@ -4,7 +4,7 @@ Two test classes:
 - TestBreakableCUDAGraphBasic / TestCopyOutput / TestBreakGraphHelper:
   unit tests for the core capture / replay mechanism (simple tensor ops).
 - TestBreakableCudaGraph: integration test — spin up Qwen3-8B with
-  --enable-breakable-cuda-graph and check mgsm_en accuracy.
+  --cuda-graph-backend-prefill=breakable and check mgsm_en accuracy.
 """
 
 import unittest
@@ -24,7 +24,7 @@ from sglang.test.test_utils import (
 )
 
 # CI Registration — large suite to fit the integration test's server startup.
-register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=90, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=200, suite="stage-c-test-large-8-gpu-amd-mi35x")
 
 
@@ -46,6 +46,30 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
         cls.BreakableCUDAGraphCapture = BreakableCUDAGraphCapture
         cls.eager_on_graph = staticmethod(eager_on_graph)
         cls.device = torch.device("cuda:0")
+
+    def test_qsa_indexer_uses_live_lengths(self):
+        from sglang.srt.models import qwen4_exp
+
+        context = SimpleNamespace(forward_batch=SimpleNamespace(rows=8))
+        layer = SimpleNamespace(_qsa_prefill_topk_bridge=None)
+        layer._compute_qsa_topk_indices_eager = (
+            lambda hidden_states, forward_batch, **kw: hidden_states[
+                : forward_batch.rows
+            ]
+        )
+        x = torch.zeros((8, 2), dtype=torch.int32, device=self.device)
+        inputs = dict(layer=layer, positions=None)
+        graph = self.BreakableCUDAGraph()
+        with patch.object(
+            qwen4_exp, "get_tc_piecewise_forward_context", return_value=context
+        ):
+            with self.BreakableCUDAGraphCapture(graph, stream=torch.cuda.Stream()):
+                result = qwen4_exp._breakable_qsa_indexer(hidden_states=x + 1, **inputs)
+            for n in (3, 8):
+                context.forward_batch = SimpleNamespace(rows=n)
+                x.fill_(2)
+                graph.replay()
+                self.assertEqual(result.tolist(), [[3, 3]] * n + [[0, 0]] * (8 - n))
 
     def test_no_break_capture_replay(self):
         """Capture and replay without any graph breaks should work like normal CUDA graph."""
@@ -364,7 +388,7 @@ class TestBreakGraphHelper(CustomTestCase):
 
 
 class TestBreakableCudaGraph(CustomTestCase):
-    """Integration: Qwen3-8B with --enable-breakable-cuda-graph on mgsm_en."""
+    """Integration: Qwen3-8B with --cuda-graph-backend-prefill=breakable on mgsm_en."""
 
     @classmethod
     def setUpClass(cls):
