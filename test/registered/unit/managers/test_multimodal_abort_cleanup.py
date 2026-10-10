@@ -116,25 +116,48 @@ def test_queued_abort_recycles_unconsumed_vmm_slices(vmm_pool):
         assert not vmm_pool.occupied_chunks
 
 
-def test_embedding_hit_cannot_recycle_another_ranks_live_proxy(vmm_pool):
+@pytest.mark.parametrize("path", ["full", "per_image", "batch"])
+def test_embedding_hit_cannot_recycle_another_ranks_live_proxy(vmm_pool, path):
     """A rank's cache hit must not retire another rank's proxy before cleanup."""
     items = _publish(vmm_pool)
     cache = MultiModalStaticCache(1 << 20)
     cached = torch.ones(1, 2)
     cache.set(cache.combine_hashes([123]), EmbeddingResult(embedding=cached))
+    cache.set(123, EmbeddingResult(embedding=cached))
+
+    def encode(_):
+        pytest.fail("cache hit unexpectedly ran the encoder")
+
     for rank, item in enumerate(items):
         item.hash = 123
         item.offsets = [(0, 0)]
         with _rank(rank), patch.object(mm_schedule, "embedding_cache", cache):
-            embedding, _ = mm_schedule._get_chunked_embedding_full(
-                lambda _: pytest.fail("cache hit unexpectedly ran the encoder"),
-                [item],
-                [(0, 0)],
-                0,
-                1,
-                torch.tensor([1]),
-                torch.device("cpu"),
-            )
+            if path == "full":
+                embedding, _ = mm_schedule._get_chunked_embedding_full(
+                    encode,
+                    [item],
+                    [(0, 0)],
+                    0,
+                    1,
+                    torch.tensor([1]),
+                    torch.device("cpu"),
+                )
+            elif path == "per_image":
+                [embedding] = mm_schedule._get_chunked_embedding_by_item(
+                    encode,
+                    [item],
+                    0,
+                    1,
+                    torch.device("cpu"),
+                )
+            else:
+                request = mm_schedule.PerImageRequestInfo(0, [item], [(0, 0)], 0, 1)
+                embeddings = mm_schedule._batch_encode_per_image_misses(
+                    encode,
+                    [request],
+                    torch.device("cpu"),
+                )
+                embedding = embeddings[(123, 1)]
         assert torch.equal(embedding, cached)
         assert not item.feature._consumer_acknowledged, (
             "cache eviction may need this input again"

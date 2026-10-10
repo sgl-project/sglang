@@ -157,6 +157,8 @@ class TestCudaVmmTransport(CustomTestCase):
         pool = CudaVmmMemoryPool(4 << 20, 60, 0, 2, allow_posix_fallback=True)
         try:
             old = pool.wrap_tensor(torch.ones(1024, dtype=torch.uint8, device="cuda:0"))
+            # VMM must bypass the CUDA IPC zero-copy borrow protocol.
+            self.assertIsNone(old.borrow_on_target_device(0))
             pool.memory_pool[old.control_offset : old.control_offset + 8].view(
                 torch.int32
             ).fill_(1)
