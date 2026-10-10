@@ -286,21 +286,23 @@ jobs:
       device_type_for_deps: 'a3'
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
 
-  nightly-acc-4-npu-a5:
-    name: nightly-acc-4-npu-a5
-    if: ${{ !cancelled() }}
-    needs: [set-image-config]
-    uses: ./.github/workflows/_npu-single-node-test-stage.yml
-    with:
-      runner: linux-amd64-a5-4
-      test_type: 'accuracy'
-      test_suite: nightly-acc-4-npu-a5
-      is_nightly_pipeline_job: true
-      skip_pr_test_health_check: 'true'
-      image: ${{ needs.set-image-config.outputs.image_a5 }}
-      install_sglang_deps: false
-      device_type_for_deps: 'a5'
-      run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
+# TEMP: A5 (Ascend 950) machine is powered off for maintenance.
+# TEMP: Revert this commit (or uncomment this job block) once the A5 machines are back online.
+#   nightly-acc-4-npu-a5:
+#     name: nightly-acc-4-npu-a5
+#     if: ${{ !cancelled() }}
+#     needs: [set-image-config]
+#     uses: ./.github/workflows/_npu-single-node-test-stage.yml
+#     with:
+#       runner: linux-amd64-a5-4
+#       test_type: 'accuracy'
+#       test_suite: nightly-acc-4-npu-a5
+#       is_nightly_pipeline_job: true
+#       skip_pr_test_health_check: 'true'
+#       image: ${{ needs.set-image-config.outputs.image_a5 }}
+#       install_sglang_deps: false
+#       device_type_for_deps: 'a5'
+#       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
   nightly-poc-multi-node-tests:
     name: multi-node-poc
     if: ${{ !cancelled() }}
@@ -394,7 +396,7 @@ jobs:
       - nightly-perf-16-npu-a3
       - nightly-acc-2-npu-a3
       - nightly-acc-16-npu-a3
-      - nightly-acc-4-npu-a5
+#       - nightly-acc-4-npu-a5 # TEMP: disabled with job above (A5 power maintenance)
       - nightly-poc-multi-node-tests
       - nightly-poc-multi-node-mix-tests
     runs-on: ubuntu-latest
@@ -416,8 +418,9 @@ jobs:
             "${{ needs.nightly-perf-4-npu-a3.result }}" \
             "${{ needs.nightly-perf-16-npu-a3.result }}" \
             "${{ needs.nightly-acc-2-npu-a3.result }}" \
-            "${{ needs.nightly-acc-16-npu-a3.result }}" \
-            "${{ needs.nightly-acc-4-npu-a5.result }}"; do
+            "${{ needs.nightly-acc-16-npu-a3.result }}"; do
+            # TEMP: A5 power maintenance - line below disabled; when restoring, move '; do' back onto the a5 line
+            # "${{ needs.nightly-acc-4-npu-a5.result }}"; do
             if [ "${r}" != "success" ] && [ "${r}" != "skipped" ]; then
               single_result="failure"
             fi
@@ -447,8 +450,9 @@ jobs:
             "nightly-perf-4-npu-a3:${{ needs.nightly-perf-4-npu-a3.result }}" \
             "nightly-perf-16-npu-a3:${{ needs.nightly-perf-16-npu-a3.result }}" \
             "nightly-acc-2-npu-a3:${{ needs.nightly-acc-2-npu-a3.result }}" \
-            "nightly-acc-16-npu-a3:${{ needs.nightly-acc-16-npu-a3.result }}" \
-            "nightly-acc-4-npu-a5:${{ needs.nightly-acc-4-npu-a5.result }}"; do
+            "nightly-acc-16-npu-a3:${{ needs.nightly-acc-16-npu-a3.result }}"; do
+            # TEMP: A5 power maintenance - line below disabled; when restoring, move '; do' back onto the a5 line
+            # "nightly-acc-4-npu-a5:${{ needs.nightly-acc-4-npu-a5.result }}"; do
             suite="${entry%%:*}"
             r="${entry##*:}"
             echo "| ${suite} | $(group_icon ${r}) ${r} |" >> $GITHUB_STEP_SUMMARY
