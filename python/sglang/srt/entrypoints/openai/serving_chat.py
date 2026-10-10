@@ -1045,6 +1045,9 @@ class OpenAIServingChat(OpenAIServingBase):
         if request.return_sampling_mask and not request.return_meta_info:
             return "return_sampling_mask requires return_meta_info=true."
 
+        if request.return_flat_raw_output_top_logprobs and not request.return_meta_info:
+            return "return_flat_raw_output_top_logprobs requires return_meta_info=true."
+
         media_error = self._validate_media_content(request)
         if media_error:
             return media_error
@@ -1296,6 +1299,12 @@ class OpenAIServingChat(OpenAIServingBase):
             sampling_logprobs_mode=request.sampling_logprobs_mode,
             stream=request.stream,
             return_text_in_logprobs=True,
+            return_flat_raw_output_top_logprobs=request.return_flat_raw_output_top_logprobs,
+            # GenerateReqInput rejects b64 without a flat flag; chat has only the output one
+            return_flat_raw_top_logprobs_b64=(
+                request.return_flat_raw_output_top_logprobs
+                and request.return_flat_raw_top_logprobs_b64
+            ),
             modalities=processed_messages.modalities,
             lora_path=lora_path,
             bootstrap_host=request.bootstrap_host,
