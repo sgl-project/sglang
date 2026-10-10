@@ -27,6 +27,7 @@ def _jit_module(
     out_dtype: torch.dtype,
     group_size: int,
     scale_ue8m0: bool,
+    packed_scale: bool,
     row_major: bool,
     aligned: bool,
     fuse_silu_and_mul: bool,
@@ -41,6 +42,7 @@ def _jit_module(
         out_dtype,
         group_size,
         scale_ue8m0,
+        packed_scale,
         row_major,
         aligned,
         fuse_silu_and_mul,
@@ -76,8 +78,6 @@ def _infer_scale_layout(
         aligned = num_groups % 4 == 0
         return row_major, aligned
     if output_s.dtype == torch.float32:
-        if scale_ue8m0:
-            raise ValueError("scale_ue8m0=True requires an int32-packed output_s")
         return row_major, True
     raise ValueError(f"Unsupported output_s dtype {output_s.dtype}")
 
@@ -103,6 +103,7 @@ def _per_token_group_quant_custom_op(
         output_q.dtype,
         int(group_size),
         bool(scale_ue8m0),
+        output_s.dtype == torch.int32,
         row_major,
         aligned,
         bool(fuse_silu_and_mul),
@@ -190,7 +191,10 @@ def per_token_group_quant(
       float32 transposed  -> col-major fp32 scales (TMA-aligned view)
       int32 transposed    -> col-major UE8M0 bytes packed 4-per-int32
       int32 contiguous    -> row-major UE8M0 bytes packed 4-per-int32
-    The packed layouts require ``scale_ue8m0=True``.
+    ``scale_ue8m0=True`` rounds scale values up to powers of two. A supplied
+    float32 ``output_s`` stores those values unpacked; int32 buffers pack the
+    exponent bytes and require ``scale_ue8m0=True``. Automatic allocation with
+    ``scale_ue8m0=True`` continues to select packed int32 storage.
 
     ``expected_m`` (masked only) is an optional expected-tokens-per-expert hint.
 
