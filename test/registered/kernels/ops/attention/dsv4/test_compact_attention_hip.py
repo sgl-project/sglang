@@ -5,14 +5,22 @@ import unittest
 
 import torch
 
-from sglang.kernels.ops.attention.dsv4.compact_attention_hip import (
-    compact_attention_hip,
-)
 from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_amd_ci(est_time=20, stage="stage-b", runner_config="1-gpu-small-amd-mi35x")
+
+_RUNNABLE = is_hip() and is_gfx95_supported()
+if _RUNNABLE:
+    try:
+        from sglang.kernels.ops.attention.dsv4.compact_attention_hip import (
+            compact_attention_hip,
+        )
+    except ImportError:
+        # compact_attention_hip imports aiter's gfx950 pa_decode_sparse gluon kernel
+        # at module scope, which images with an older aiter do not ship.
+        _RUNNABLE = False
 
 PAGE, PAGES = 64, 8
 E2M1 = [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6]
@@ -52,7 +60,7 @@ def _dequant(cache: torch.Tensor) -> torch.Tensor:
     return v.to(torch.bfloat16).float().view(-1, 512).cuda()
 
 
-@unittest.skipUnless(is_hip() and is_gfx95_supported(), "gfx950 gluon MFMA kernel")
+@unittest.skipUnless(_RUNNABLE, "gfx950 gluon MFMA kernel from aiter")
 class TestCompactAttentionHip(CustomTestCase):
     def test_matches_torch_over_both_caches_splits_and_empty_rows(self):
         """Both packed layouts, a second cache, -1 slots and a row with no keys (sink only)."""
