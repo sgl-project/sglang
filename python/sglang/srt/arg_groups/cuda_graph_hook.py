@@ -594,6 +594,14 @@ def generate_prefill_cuda_graph_batch_sizes(max_bs: int):
 
     capture_sizes = [s for s in capture_sizes if s <= max_bs]
 
+    # The flag reads as an exact ceiling ("Maximum batch size captured for
+    # the prefill cuda graph"), and the decode path already appends max_bs
+    # when it falls between grid points. Do the same here so an off-grid
+    # ceiling does not silently shrink the largest captured prefill bucket
+    # (which post-capture KV sizing then treats as the real ceiling).
+    if max_bs not in capture_sizes:
+        capture_sizes.append(max_bs)
+
     return capture_sizes
 
 
