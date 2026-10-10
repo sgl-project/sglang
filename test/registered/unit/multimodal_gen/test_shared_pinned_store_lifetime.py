@@ -111,6 +111,22 @@ def _join_one(key: str, pool: str, accept: bool, report: str, gate: str) -> None
     _wait_for_gate(gate)
 
 
+def _serve_pools(pools: list[str], report: str, gate: str) -> None:
+    """Serve several pools at once, the way one worker serves several components."""
+    for pool in pools:
+        store.join_pool(pool)
+        for index in range(3):
+            key = f"{pool}:{index}"
+            held = store.begin(key, SEGMENT_BYTES, lambda buf: True, pool=pool)
+            if held is not None and held.created:
+                name, marker = store._names(key)
+                with open(marker, "w") as handle:
+                    handle.write(name)
+    with open(report, "w") as handle:
+        handle.write("serving")
+    _wait_for_gate(gate)
+
+
 def _start(tmp_path, target, *args):
     token = uuid.uuid4().hex[:8]
     report = tmp_path / f"{token}.report"
@@ -265,6 +281,38 @@ class TestSharedPinnedStoreLifetime:
             for proc, gate, _ in children:
                 if proc.is_alive():
                     _release(proc, gate)
+            _clear(pool)
+
+    def test_a_sigterm_releases_the_generation(self, tmp_path):
+        """The exit that actually happens in a deployment: a signal, not a return.
+
+        A unit stops with SIGTERM to every process in its cgroup, so the worker
+        never reaches `atexit` or a finalizer. The last participant still has to
+        release the generation from the handler, or the whole component stays in
+        /dev/shm until some later start.
+        """
+        pool = _pool_name()
+        keys = _keys(pool)
+        names = [store._names(key)[0] for key in keys]
+        owner = follower = None
+        try:
+            owner = _start(tmp_path, _serve, pool, keys)
+            follower = _start(tmp_path, _serve, pool, keys)
+            _release(*owner[:2])
+            owner = None
+            assert _present(names), "a clean return released the pool too early"
+
+            follower[0].terminate()
+            follower[0].join(timeout=DEADLINE_S)
+            follower = None
+            assert not any(os.path.exists(_segment_path(n)) for n in names), (
+                "the last participant was signalled but did not release the generation"
+            )
+        finally:
+            if owner is not None:
+                _release(*owner[:2])
+            if follower is not None:
+                _release(*follower[:2])
             _clear(pool)
 
     @pytest.mark.parametrize("accept", [True, False])

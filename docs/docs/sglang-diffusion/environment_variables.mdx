@@ -109,6 +109,11 @@ description: "Configure SGLang diffusion behavior with environment variables."
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Max activation rows per <code>convrot_int8</code> fused GEMM on the <code>comfy_kitchen</code> backend. Set <code>0</code> to disable row splitting.</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DIFFUSION_SHARE_PINNED_STORES</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>false</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Share the layerwise offload pinned host store between co-resident servers on one host: the first server creates and registers it, the rest attach to the same pages. Default off.</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_KITCHEN_INT8_MIN_SPLIT_N</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>8192</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Minimum output features before <code>convrot_int8</code> (<code>comfy_kitchen</code> backend) splits large-M GEMMs. Narrow outputs stay as a single call.</td>

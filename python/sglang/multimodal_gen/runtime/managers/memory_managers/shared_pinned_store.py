@@ -41,8 +41,10 @@ to hold for that to be stable, and each of them was learned the hard way:
    A named segment also outlives its readers, so the participant that leaves
    last runs the same check on its way out and unlinks the generation there,
    rather than leaving the whole component to a next start that may never come.
-   A process that is killed reaches no exit hook and leaves the generation
-   behind; the next creator reclaims it.
+   Leaving is either a signal -- a unit stops with SIGTERM to every process in
+   it, so the release runs from a handler -- or a return, which a
+   multiprocessing child makes through `os._exit` and a finalizer. SIGKILL
+   reaches neither, and the next creator reclaims instead.
 
    create    the creator allocates each segment, fills it, registers it, then
              publishes its marker.
@@ -61,6 +63,7 @@ import fcntl
 import hashlib
 import logging
 import os
+import signal
 import time
 from multiprocessing import resource_tracker, shared_memory, util
 
@@ -86,6 +89,10 @@ _ROLE: dict[str, bool | None] = {}
 _FILLED: dict[str, int] = {}
 _STATS: dict[str, dict[str, int]] = {}
 _LEAVING: set[str] = set()
+_TERM_HOOKED = False
+_RELEASING = False
+_TERM_SIGNALS = {signal.SIGTERM, signal.SIGINT}
+_PREV_SIGNAL: dict[int, object] = {}
 
 
 class SharedStore:
@@ -208,15 +215,55 @@ def join_pool(pool: str) -> bool | None:
                 os.close(fd)
 
 
-def _note_leave(pool: str) -> None:
-    """Have `leave_pool` run when this process exits normally.
+def _release_and_die(signum: int, _frame) -> None:
+    """Release every pool this process holds, then die the way the signal meant.
 
-    `atexit` is not enough: a process serving here is a multiprocessing child,
-    and `BaseProcess._bootstrap` leaves through `os._exit`, which skips every
-    `atexit` hook. `util.Finalize` is what that exit path does run. A process
-    killed by a signal runs neither, which is why the next creator still has to
-    be able to reclaim.
+    Needed because the exit that actually happens is a signal: a systemd unit
+    stops with `KillMode=control-group`, so SIGTERM goes to every process in it
+    -- this worker included -- and the default action kills it before any exit
+    hook runs. Whichever handler was installed before is restored and re-raised,
+    so a process that already owns this signal keeps owning it.
     """
+    # A unit stop delivers more than one SIGTERM and a Python handler is re-entered
+    # between bytecodes, sometimes before the block below takes effect (a pending
+    # call is already queued). The inner call ends by re-raising the signal, which
+    # would kill the process in the middle of the release the outer call is still
+    # running, so it must not run at all -- blocking alone is not enough.
+    global _RELEASING
+    if _RELEASING:
+        return
+    _RELEASING = True
+    signal.pthread_sigmask(signal.SIG_BLOCK, _TERM_SIGNALS)
+    for pool in list(_LOCKS):
+        try:
+            leave_pool(pool)
+        except Exception:  # a process on its way out must not raise
+            logger.warning("shared pinned store %s: release on signal failed", pool)
+    signal.signal(signum, _PREV_SIGNAL.get(signum, signal.SIG_DFL))
+    os.kill(os.getpid(), signum)
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, _TERM_SIGNALS)
+
+
+def _note_leave(pool: str) -> None:
+    """Arrange for `leave_pool` to run when this process goes away.
+
+    Neither of the two exits here is a normal one. A signal: the unit is stopped
+    with SIGTERM to every process in it, so nothing Python-level runs and a
+    handler is the only way to release the generation in time. A clean return: a
+    multiprocessing child leaves through `os._exit`, which skips every `atexit`
+    hook, and `util.Finalize` is what that path does run. SIGKILL reaches
+    neither, and the next creator reclaims instead.
+    """
+    global _TERM_HOOKED
+    if not _TERM_HOOKED:
+        _TERM_HOOKED = True
+        for signum in sorted(_TERM_SIGNALS):
+            try:
+                _PREV_SIGNAL[signum] = signal.getsignal(signum)
+                signal.signal(signum, _release_and_die)
+            except (ValueError, OSError):
+                # Not the main thread; the finalizer below still covers a return.
+                _PREV_SIGNAL.pop(signum, None)
     if pool in _LEAVING:
         return
     _LEAVING.add(pool)
