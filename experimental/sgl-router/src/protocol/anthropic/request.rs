@@ -813,6 +813,14 @@ mod tests {
                 "requires",
             ),
             (
+                json!({"model": "m", "max_tokens": 8,
+                    "tools": [{"name": "f", "input_schema": {}},
+                              {"type": "web_search_20250305", "name": "web_search"}],
+                    "tool_choice": {"type": "tool", "name": "web_search"},
+                    "messages": [{"role": "user", "content": "x"}]}),
+                "`web_search`",
+            ),
+            (
                 json!({"model": "m", "max_tokens": 8, "messages": [{"role": "user", "content": [
                     {"type": "document", "source": {}}]}]}),
                 "document",
@@ -992,5 +1000,14 @@ mod tests {
         let mut r = req(json!([{"role": "user", "content": "q"}]));
         r["stop_sequences"] = json!("END");
         assert_eq!(chat(r)["stop"], json!(["END"]));
+        let mut r = req(json!([{"role": "user", "content": "q"}]));
+        r["output_config"] = json!({"effort": "minimal"});
+        assert_eq!(chat(r)["reasoning_effort"], "minimal");
+        let mut r = req(json!([{"role": "user", "content": "q"}]));
+        r["system"] = json!(" \n ");
+        assert_eq!(
+            chat(r)["messages"],
+            json!([{"role": "user", "content": "q"}])
+        );
     }
 }
