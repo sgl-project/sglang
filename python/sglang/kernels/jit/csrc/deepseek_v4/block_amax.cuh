@@ -16,23 +16,26 @@ namespace sglang {
 
 /// Level-one keys of the two-level indexer: the max of each kBlockTokens-score
 /// block, the row's newest block forced to +inf. Contract: BlockAmaxKernel.
+template <typename T>
 struct BlockAmaxConfig {
-  using DType = float;
+  using DType = T;
   static constexpr uint32_t kBlockTokens = 8;  // scores per key
   static constexpr uint32_t kBlockSize = 512;
   static constexpr uint32_t kNumItems = 2;  // keys per thread
   static constexpr uint32_t kOccupancy = 4;
   static constexpr uint32_t kKeysPerCTA = kBlockSize * kNumItems;
-  // One block is 32 B: a single load on Blackwell, two 16 B loads before it.
-  static constexpr uint32_t kVecSize = device::kMaxVecBytes / sizeof(DType);
+  // One block is 32 B for FP32 or 16 B for BF16; cap the vector at one block.
+  static constexpr uint32_t kVecSize =
+      device::kMaxVecBytes / sizeof(DType) < kBlockTokens ? device::kMaxVecBytes / sizeof(DType) : kBlockTokens;
   static constexpr uint32_t kVecsPerBlock = kBlockTokens / kVecSize;
   static_assert(kVecsPerBlock * kVecSize == kBlockTokens);
   using vec_t = device::AlignedVector<DType, kVecSize>;
 };
 
+template <typename T>
 struct BlockAmaxParams {
-  const BlockAmaxConfig::DType* __restrict__ scores;
-  BlockAmaxConfig::DType* __restrict__ amax_scores;
+  const T* __restrict__ scores;
+  float* __restrict__ amax_scores;
   const int32_t* __restrict__ seq_len;
   int64_t stride_scores;       // in elements
   int64_t stride_amax_scores;  // in elements
@@ -41,12 +44,11 @@ struct BlockAmaxParams {
 
 /// grid = (rows, ceil(max_keys / kKeysPerCTA)); a CTA owns kKeysPerCTA consecutive
 /// keys of one row, a thread kNumItems keys kBlockSize apart (coalesced loads).
-template <bool kUsePDL>
-__global__ __launch_bounds__(BlockAmaxConfig::kBlockSize, BlockAmaxConfig::kOccupancy)  //
-    void amax8_varlen_kernel(const __grid_constant__ BlockAmaxParams params) {
+template <bool kUsePDL, typename T>
+__global__ __launch_bounds__(BlockAmaxConfig<T>::kBlockSize, BlockAmaxConfig<T>::kOccupancy)  //
+    void amax8_varlen_kernel(const __grid_constant__ BlockAmaxParams<T> params) {
   using namespace device;
-  using C = BlockAmaxConfig;
-  using T = typename C::DType;
+  using C = BlockAmaxConfig<T>;
   using vec_t = typename C::vec_t;
   const auto bx = blockIdx.x;
   const auto by = blockIdx.y;
@@ -81,25 +83,25 @@ __global__ __launch_bounds__(BlockAmaxConfig::kBlockSize, BlockAmaxConfig::kOccu
   for (uint32_t i = 0; i < C::kNumItems; ++i) {
     const auto idx = first_key + tx + i * C::kBlockSize;
     if (idx < num_keys) {
-      T key = vec[i][0][0];
+      float key = static_cast<float>(vec[i][0][0]);
 #pragma unroll
       for (uint32_t v = 0; v < C::kVecsPerBlock; ++v) {
 #pragma unroll
         for (uint32_t j = 0; j < C::kVecSize; ++j) {
-          key = fmaxf(key, vec[i][v][j]);  // a NaN score is ignored, torch.amax would propagate it
+          key = fmaxf(key, static_cast<float>(vec[i][v][j]));  // a NaN score is ignored, torch.amax would propagate it
         }
       }
-      out[idx] = idx + 1 == num_keys ? std::numeric_limits<T>::infinity() : key;
+      out[idx] = idx + 1 == num_keys ? std::numeric_limits<float>::infinity() : key;
     }
   }
 }
 
 /// Host entry: `amax_scores[b, i] = max(scores[b, 8 i : 8 i + 8])` for
 /// `i < ceil(seq_len[b] / 8)`, the last of them +inf; rows with at most `topk`
-/// blocks untouched. `scores` rows must stay 32 B aligned (stride % 8 == 0).
+/// blocks untouched. `scores` rows must stay block aligned (stride % 8 == 0).
 /// The grid covers `amax_scores`' width, so the caller sizes it for the longest
 /// row: `seq_len[b] <= 8 * amax_scores.shape[1]` for every row (not checked).
-template <bool kPDL>
+template <bool kPDL, typename T>
 struct BlockAmaxKernel {
   static void amax8_varlen(
       const tvm::ffi::TensorView scores,
@@ -107,7 +109,7 @@ struct BlockAmaxKernel {
       const tvm::ffi::TensorView amax_scores,
       const uint32_t topk) {
     using namespace host;
-    using C = BlockAmaxConfig;
+    using C = BlockAmaxConfig<T>;
     auto B = SymbolicSize{"batch_size"};
     auto L = SymbolicSize{"max_seq_len"};
     auto S = SymbolicSize{"stride_scores"};
@@ -126,18 +128,18 @@ struct BlockAmaxKernel {
         .verify(seq_lens);
     TensorMatcher({B, K})  // amax_scores
         .with_strides({O, 1})
-        .with_dtype<typename C::DType>()
+        .with_dtype<float>()
         .with_device(device_)
         .verify(amax_scores);
-    RuntimeCheck(S.unwrap() % C::kBlockTokens == 0, "stride_scores must keep every block 32 B aligned");
+    RuntimeCheck(S.unwrap() % C::kBlockTokens == 0, "stride_scores must keep every block aligned");
     RuntimeCheck(
         reinterpret_cast<uintptr_t>(scores.data_ptr()) % (C::kBlockTokens * sizeof(typename C::DType)) == 0,
-        "scores must be 32 B aligned");
+        "scores must be block aligned");
     RuntimeCheck(K.unwrap() > 0, "amax_scores must hold at least one key per row");
     const auto max_keys = K.unwrap();  // ceil(longest row / 8), sized by the caller
-    const auto params = BlockAmaxParams{
+    const auto params = BlockAmaxParams<T>{
         .scores = static_cast<const typename C::DType*>(scores.data_ptr()),
-        .amax_scores = static_cast<typename C::DType*>(amax_scores.data_ptr()),
+        .amax_scores = static_cast<float*>(amax_scores.data_ptr()),
         .seq_len = static_cast<const int32_t*>(seq_lens.data_ptr()),
         .stride_scores = S.unwrap(),
         .stride_amax_scores = O.unwrap(),
@@ -148,7 +150,7 @@ struct BlockAmaxKernel {
         static_cast<uint32_t>(div_ceil(max_keys, static_cast<int64_t>(C::kKeysPerCTA))));
     LaunchKernel(grid, C::kBlockSize, device_.unwrap())
         .config({.use_pdl = kPDL})
-        .launch(amax8_varlen_kernel<kPDL>, params);
+        .launch(amax8_varlen_kernel<kPDL, T>, params);
   }
 };
 

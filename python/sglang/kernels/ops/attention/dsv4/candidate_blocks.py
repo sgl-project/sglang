@@ -80,8 +80,8 @@ def candidate_row_lens(
 
 
 @cache_once
-def _jit_block_amax_module():
-    args = make_cpp_args(is_arch_support_pdl())
+def _jit_block_amax_module(dtype: torch.dtype):
+    args = make_cpp_args(is_arch_support_pdl(), dtype)
     return load_jit(
         make_name("block_amax"),
         *args,
@@ -105,15 +105,15 @@ def amax8_varlen(
     selected anyway); ``topk=0`` never skips. ``out`` is allocated as
     ``[rows, ceil(max_seqlen / 8)]`` when not given, ``max_seqlen`` defaulting to
     the width of ``scores``; every ``seq_lens[b]`` must fit in ``8 * out.shape[1]``.
-    fp32 only for now; ``scores`` rows must be 32-byte aligned (stride a multiple
-    of 8). Returns ``out``.
+    FP32 or BF16 ``scores``, FP32 keys; ``scores`` rows must be block aligned
+    (stride a multiple of 8). Returns ``out``.
     """
     if out is None:
         num_tokens, max_len = scores.shape
         if max_seqlen == 0:
             max_seqlen = max_len
-        out = scores.new_empty(num_tokens, (max_seqlen + 7) // 8)
-    _jit_block_amax_module().amax8_varlen(scores, seq_lens, out, topk)
+        out = scores.new_empty(num_tokens, (max_seqlen + 7) // 8, dtype=torch.float32)
+    _jit_block_amax_module(scores.dtype).amax8_varlen(scores, seq_lens, out, topk)
     return out
 
 
@@ -136,7 +136,9 @@ def amax_topk_blocks(
     plan = plan_topk_v2(nblocks)
     # block maxima, the newest block +inf; the top-k reads each row up to nblocks
     # only, so nothing past a row's keys is initialised (v2 needs stride % 4 == 0)
-    keys = logits.new_empty(rows, -(-max_seq_len // (4 * block)) * 4)
+    keys = logits.new_empty(
+        rows, -(-max_seq_len // (4 * block)) * 4, dtype=torch.float32
+    )
     amax8_varlen(logits, seq_lens, out=keys)
     blocks = torch.empty(rows, topk_blocks, dtype=torch.int32, device=logits.device)
     topk_transform_paged_v2(keys, nblocks, None, blocks, 1, plan)
