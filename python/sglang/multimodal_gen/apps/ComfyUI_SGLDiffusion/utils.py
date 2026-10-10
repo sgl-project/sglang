@@ -80,7 +80,18 @@ def is_empty_image(image: torch.Tensor, tolerance: float = 1e-6) -> bool:
 def get_image_path(image: torch.Tensor) -> str:
     """
     Save tensor image to ComfyUI temp directory as PNG and return the path.
+
+    Raises if given a batch of more than one image: the node (and the
+    server request it builds) only has a single image slot here, and
+    silently keeping just image[0] would drop the rest of the batch with
+    no indication to the user.
     """
+    if image.dim() == 4 and image.shape[0] > 1:
+        raise ValueError(
+            f"get_image_path received a batch of {image.shape[0]} images but "
+            "this input only accepts one; use a node like 'Image From Batch' "
+            "to select a single image first."
+        )
     temp_dir = folder_paths.get_temp_directory()
 
     # Build file name
