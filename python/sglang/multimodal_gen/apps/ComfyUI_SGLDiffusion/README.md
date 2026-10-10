@@ -24,6 +24,7 @@ The plugin supports two modes of operation: **Server Mode** (via HTTP API) and *
 - **Z-Image**: High-speed image generation models (e.g., `Z-Image-Turbo`)
 - **FLUX**: State-of-the-art text-to-image models (e.g., `FLUX.1-dev`)
 - **Qwen-Image**: Multi-modal image generation models (e.g., `Qwen-Image`,`Qwen-Image-2512`). *Note: Image editing support is currently experimental and may have some issues.*
+- **Hunyuan3D (image-to-3D)**: Server mode only. `SGLDiffusion Generate Mesh` sends an image to `/v1/meshes` and returns the GLB or OBJ as ComfyUI's 3D file type (plus its path), so it plugs into `Preview 3D`. Whether the mesh is textured depends on how the server was launched (the Hunyuan3D `paint_enable` setting); it is not a per-request option.
 - **MiniMax-H3**: Joint video-and-audio DiT (`model_type=minimax_h3`). Integrated mode: T2V / I2VA / FL2VA use an `fl2va` checkpoint; R2V needs `ref2va`. CLIP and VAE stay in ComfyUI. Server mode uses `SGLDiffusion Generate MiniMax-H3`.
 
 ### Mode 1: Server Mode (HTTP API)
@@ -85,6 +86,7 @@ Reference workflow files are provided in the `workflows/` directory:
 - **`z-image_sgld.json`**: High-speed image generation using Z-Image.
 - **`sgld_text2img.json`**: Server-mode text-to-image generation with LoRA support.
 - **`sgld_image2video.json`**: Server-mode image-to-video generation.
+- **`sgld_image_to_3d.json`**: Server-mode image-to-3D (Hunyuan3D): `SGLDiffusion Generate Mesh` returns a GLB or OBJ for ComfyUI's `Preview 3D`.
 - **`minimax_h3_t2v_sgld.json`**: MiniMax-H3 T2V / I2VA / FL2VA (`fl2va` DiT).
 - **`minimax_h3_r2v_sgld.json`**: MiniMax-H3 reference-to-video (`ref2va` DiT).
 - **`minimax_h3_t2v_sgld_upscaler.json`**: H3 two-pass latent upscale (low-res then 3D ×2 refine).
