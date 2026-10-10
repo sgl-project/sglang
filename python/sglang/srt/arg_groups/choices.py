@@ -125,6 +125,7 @@ DISAGG_TRANSFER_BACKEND_CHOICES = [
     "fake",
     "mori",
     "mooncake_tcp",
+    "uniflow",
 ]
 
 GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
