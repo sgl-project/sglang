@@ -229,6 +229,21 @@ def choose_output_image_ext(
     return "jpg"
 
 
+_MODEL_PATH_FIELDS = ("upscaling_model_path", "frame_interpolation_model_path")
+
+
+def _reject_remote_model_paths(kwargs: dict[str, Any]) -> None:
+    """Client-supplied model paths must not make the server fetch arbitrary URLs."""
+    for name in _MODEL_PATH_FIELDS:
+        value = kwargs.get(name)
+        if isinstance(value, str) and "://" in value:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{name} must be a local path or a HuggingFace repo id, "
+                "not a URL",
+            )
+
+
 def build_sampling_params(request_id: str, **kwargs) -> SamplingParams:
     """Build SamplingParams from request parameters.
 
@@ -253,6 +268,7 @@ def build_sampling_params(request_id: str, **kwargs) -> SamplingParams:
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    _reject_remote_model_paths(kwargs)
     has_explicit_compression = kwargs.get("output_compression") is not None
 
     # parse "WxH" size string if provided

@@ -288,3 +288,60 @@ def test_image_download_within_limit_is_saved(monkeypatch, tmp_path):
         utils._save_url_image_to_path("https://x.test/a.png", str(target))
     )
     assert Path(saved).read_bytes() == b"x" * 512
+
+
+@pytest.mark.parametrize(
+    "field", ["upscaling_model_path", "frame_interpolation_model_path"]
+)
+@pytest.mark.parametrize(
+    "value", ["http://169.254.169.254/latest/x.pth", "https://internal.svc/w.pth"]
+)
+def test_remote_url_model_paths_are_rejected_over_http(monkeypatch, field, value):
+    """A client-supplied URL must not make the server fetch it (SSRF)."""
+    monkeypatch.setattr(
+        utils, "get_global_server_args", lambda: SimpleNamespace(model_path="m")
+    )
+    with pytest.raises(HTTPException) as exc_info:
+        utils.build_sampling_params("request", **{field: value})
+    assert exc_info.value.status_code == 400
+    assert field in exc_info.value.detail
+
+
+def test_unsupported_response_format_is_rejected_before_generation(monkeypatch):
+    """An unsupported response_format must fail fast, not after generation."""
+    args = SimpleNamespace(
+        input_save_path=None, output_path="out", pipeline_class_name=None
+    )
+    monkeypatch.setattr(image_api, "get_global_server_args", lambda: args)
+    monkeypatch.setattr(
+        image_api, "resolve_sampling_params_cls", lambda args: SamplingParams
+    )
+    monkeypatch.setattr(
+        image_api,
+        "build_sampling_params",
+        lambda *a, **k: (_ for _ in ()).throw(HTTPException(599, "generation reached")),
+    )
+    app = FastAPI()
+    app.include_router(image_api.router)
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/images/generations", json={"prompt": "p", "response_format": "bmp"}
+        )
+    assert response.status_code == 400, response.text
+    assert "not supported" in response.json()["detail"]
+
+
+def test_cloud_upload_failure_is_not_reported_as_a_client_error(monkeypatch):
+    """With cloud storage enabled but the upload failed, the server is at fault."""
+    monkeypatch.setattr(image_api.cloud_storage, "enabled", True)
+    with pytest.raises(HTTPException) as exc_info:
+        image_api._build_image_response_kwargs(
+            ["a.png"],
+            "url",
+            "p",
+            "req",
+            SimpleNamespace(),
+            cloud_urls=[None],
+            is_persistent=False,
+        )
+    assert exc_info.value.status_code == 502
