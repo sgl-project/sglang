@@ -796,7 +796,7 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
             isinstance(processor.image_processor, BaseImageProcessor)
             and not self.disable_fast_image_processor
         ):
-            processor_device = self._fast_image_processor_device(processor)
+            processor_device = self._resolve_mm_preprocessing_device(processor)
             if processor_device is not None:
                 image_kwargs["device"] = processor_device
 
