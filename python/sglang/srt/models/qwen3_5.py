@@ -34,7 +34,10 @@ from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
 from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
 
 # Configs
-from sglang.srt.configs.model_config import load_decision_config
+from sglang.srt.configs.model_config import (
+    load_decision_config,
+    load_joint_head_config,
+)
 from sglang.srt.configs.qwen3_5 import (
     Qwen3_5Config,
     Qwen3_5MoeConfig,
@@ -54,6 +57,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.flashinfer_comm_fusion import uses_cutedsl_ar_fusion
+from sglang.srt.layers.joint_schema_head import JointSchemaHead, JointSchemaPooler
 from sglang.srt.layers.layer_boundary import (
     append_stages,
     declare_attn,
@@ -129,6 +133,7 @@ from sglang.srt.runtime_context import (
     get_model,
     get_parallel,
     get_stream,
+    linear_attn_parallel_group,
 )
 
 # Utils
@@ -335,8 +340,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        self.attn_tp_rank = get_parallel().attn_tp_rank
-        self.attn_tp_size = get_parallel().attn_tp_size
+        parallel_group = linear_attn_parallel_group()
+        self.attn_tp_rank, self.attn_tp_size = resolve_linear_parallel_group(
+            parallel_group
+        )
         self.hidden_size = config.hidden_size
         self.num_v_heads = (
             config.linear_num_value_heads
@@ -367,7 +374,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             output_size=self.conv_dim,
             bias=False,
             quant_config=None,
-            parallel_group="attn_tp",
+            parallel_group=parallel_group,
             prefix=add_prefix("conv1d", prefix),
         )
         self.conv1d.weight.data = self.conv1d.weight.data.unsqueeze(1)
@@ -379,7 +386,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             value_dim=self.value_dim,
             quant_config=quant_config,
             prefix=add_prefix("in_proj_qkvz", prefix),
-            parallel_group="attn_tp",
+            parallel_group=parallel_group,
         )
 
         self.in_proj_ba = self.create_ba_proj(
@@ -387,7 +394,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             num_v_heads=self.num_v_heads,
             quant_config=quant_config,
             prefix=add_prefix("in_proj_ba", prefix),
-            parallel_group="attn_tp",
+            parallel_group=parallel_group,
         )
 
         # Override weight loaders for packed checkpoint format.
@@ -446,11 +453,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         set_weight_attrs(
             self.A_log,
-            {"weight_loader": sharded_weight_loader(0, parallel_group="attn_tp")},
+            {"weight_loader": sharded_weight_loader(0, parallel_group=parallel_group)},
         )
         set_weight_attrs(
             self.dt_bias,
-            {"weight_loader": sharded_weight_loader(0, parallel_group="attn_tp")},
+            {"weight_loader": sharded_weight_loader(0, parallel_group=parallel_group)},
         )
 
         conv_weights = self.conv1d.weight.view(
@@ -491,7 +498,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             input_is_parallel=True,
             reduce_results=False,
             quant_config=quant_config,
-            parallel_group="attn_tp",
+            parallel_group=parallel_group,
             prefix=add_prefix("out_proj", prefix),
         )
 
@@ -2327,6 +2334,16 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
             self.visual.deepstack_visual_indexes if self.visual is not None else []
         )
 
+        if config.architectures == ["Qwen3_5ForConditionalGeneration"]:
+            model = get_model()
+            joint_head_config = load_joint_head_config(model.model_path, model.revision)
+            if joint_head_config is not None:
+                # A Clef checkpoint, whose joint schema head scores every option
+                # of every question from the final hidden states and LM head rows.
+                self.pooler = JointSchemaPooler(
+                    JointSchemaHead(**joint_head_config), lambda: self.lm_head.weight
+                )
+
     def get_hidden_dim(self, module_name: str, layer_idx: int):
         return self.model.get_hidden_dim(module_name, layer_idx)
 
@@ -2467,7 +2484,22 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         if bare_backbone and self.pp_group.is_last_rank:
             self._load_decision_readout()
             loaded_params.add("lm_head.weight")
+        if isinstance(self.pooler, JointSchemaPooler):
+            self._load_joint_head()
+            loaded_params.update(
+                f"pooler.head.{name}" for name, _ in self.pooler.head.named_parameters()
+            )
         return loaded_params
+
+    def _load_joint_head(self) -> None:
+        """Load joint_head.safetensors, which the checkpoint index leaves out."""
+        model = get_model()
+        state_dict = load_file(
+            cached_file(
+                model.model_path, "joint_head.safetensors", revision=model.revision
+            )
+        )
+        self.pooler.head.load_state_dict(state_dict, strict=True)
 
     def _load_decision_readout(self) -> None:
         """Place the checkpoint's decision readout in the LM head rows of its codes."""

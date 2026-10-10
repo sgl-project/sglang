@@ -6,11 +6,36 @@ metatags:
 ---
 
 import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
-import { LTX25Deployment } from '/src/snippets/diffusion/ltx25-deployment.jsx';
 
 <DiffusionModelTags tags={["video", "audio", "text-to-video", "image-to-video", "two-stage", "auto-duration"]} />
 
-## 1. Model Introduction
+import { Deployment } from '/src/snippets/_deployment.jsx';
+import { config } from '/src/snippets/configs/Lightricks/ltx25.jsx';
+
+## 1. Quick start
+
+Follow the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installation) for your GPU platform.
+
+<Accordion title="Installation and prerequisites">
+
+<a id="2-sglang-diffusion-installation" />
+
+Follow the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installation). Docker is recommended for Linux GPU deployments; run the commands below inside the container or your installed Python environment.
+
+NATTEN is an optional extra, worth installing only if you plan to use the
+[diffusion decoder](#4-6-diffusion-decoder) — see that section for why.
+
+</Accordion>
+
+<Deployment config={config} />
+
+To use diffusion decoding, load **Diffusion decoder weights** in Server, then
+select **Diffusion** in Request. Duration and decoder selection are request-time
+choices; loading the optional decoder requires a server restart.
+
+<a id="1-model-introduction" />
+
+## 2. Model capabilities
 
 [LTX-2.5](https://huggingface.co/Lightricks/LTX-2.5) is an open world model from
 Lightricks, built for local execution and fine-tuning. Its established use is
@@ -31,7 +56,9 @@ before production or commercial use; SGLang support does not grant additional
 model usage rights.
 </Warning>
 
-### 1.1 New in LTX-2.5
+<a id="1-1-new-in-ltx-2-5" />
+
+### 2.1 New in LTX-2.5
 
 Two capabilities have no equivalent in LTX-2 / LTX-2.3:
 
@@ -49,7 +76,9 @@ Two capabilities have no equivalent in LTX-2 / LTX-2.3:
 
 Both are optional and off by default.
 
-### 1.2 Components
+<a id="1-2-components" />
+
+### 2.2 Components
 
 | Path | Component | Used by |
 | --- | --- | --- |
@@ -64,13 +93,6 @@ Both are optional and off by default.
 Encoding always uses `vae/`, and both decoders consume the same latents, so the
 decoder choice does not change anything upstream of it.
 
-## 2. SGLang-diffusion Installation
-
-Follow the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installation). Docker is recommended for Linux GPU deployments; run the commands below inside the container or your installed Python environment.
-
-NATTEN is an optional extra, worth installing only if you plan to use the
-[diffusion decoder](#4-6-diffusion-decoder) — see that section for why.
-
 ## 3. Model Deployment
 
 ### 3.1 Basic Configuration
@@ -83,13 +105,7 @@ sglang serve \
 
 On a single high-VRAM GPU no extra flags are needed.
 
-**Interactive Command Generator**: pick a target and the features you want; the
-command updates below. Server-side choices (pipeline class, weights variant,
-parallelism) go on `sglang serve`, while per-request choices (auto-duration,
-diffusion decoder, resolution) are listed separately, since they belong on the
-`sglang generate` call or the request body.
-
-<LTX25Deployment />
+Use the [command builder](#1-quick-start) above.
 
 ### 3.2 Configuration Tips
 
@@ -192,8 +208,6 @@ right one from the checkpoint, so nothing needs to be passed.
 
 ### 4.3 Auto-duration
 
-<span style={{fontSize: "0.7em", verticalAlign: "middle", padding: "2px 8px", borderRadius: "9999px", background: "#16a34a", color: "#fff"}}>NEW</span>
-
 LTX-2.5 ships a duration head — a small module that reads the encoded caption
 and regresses the natural length of the shot it describes. Use it when the
 prompt implies a duration ("a quick glance" vs "a slow pan across the valley")
@@ -272,8 +286,6 @@ Note that `from_pretrained` only fetches what `model_index.json` lists, so a
 partial snapshot download will not include `transformer_full/` (another 38 GB).
 
 ### 4.6 Diffusion decoder
-
-<span style={{fontSize: "0.7em", verticalAlign: "middle", padding: "2px 8px", borderRadius: "9999px", background: "#16a34a", color: "#fff"}}>NEW</span>
 
 LTX-2.5 adds a diffusion-based video decoder as an alternative to the
 convolutional VAE decoder. Rather than deconvolving the latent it denoises

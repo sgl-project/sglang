@@ -855,17 +855,6 @@ install_extra_deps() {
     mark_step_done "${FUNCNAME[0]}"
 }
 
-install_test_tools() {
-    # Download kernels from kernels community
-    kernels download python || true
-    kernels lock python || true
-    [ -e "${HOME}/.cache/sglang" ] && [ ! -d "${HOME}/.cache/sglang" ] && rm -f "${HOME}/.cache/sglang"
-    mkdir -p "${HOME}/.cache/sglang/"
-    mv python/kernels.lock "${HOME}/.cache/sglang/" || true
-
-    mark_step_done "${FUNCNAME[0]}"
-}
-
 prepare_runner() {
     bash "${SCRIPT_DIR}/prepare_runner.sh"
 
@@ -985,7 +974,6 @@ main() {
     download_flashinfer_cache
     stabilize_flashinfer_jit_paths
     install_extra_deps
-    install_test_tools
     install_nccl
     prepare_runner
     setup_ld_library_path

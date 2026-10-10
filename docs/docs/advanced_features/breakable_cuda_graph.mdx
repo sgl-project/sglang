@@ -35,7 +35,7 @@ For production use, you can mark specific functions as "non-graphable" using the
 ```python
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import eager_on_graph
 
-@eager_on_graph(enable=True)
+@eager_on_graph
 def my_dynamic_op(x):
     # This op is incompatible with CUDA graph capture
     return some_dynamic_operation(x)

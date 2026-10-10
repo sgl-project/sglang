@@ -321,7 +321,7 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
             patch(
                 "sglang.srt.managers.scheduler_components.metrics_reporter.get_disagg",
                 return_value=SimpleNamespace(
-                    disaggregation_decode_host_receive_threshold=0
+                    disaggregation_decode_host_receive_threshold=1
                 ),
             ),
             patch(
@@ -419,7 +419,7 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
             patch(
                 "sglang.srt.managers.scheduler_components.metrics_reporter.get_disagg",
                 return_value=SimpleNamespace(
-                    disaggregation_decode_host_receive_threshold=0,
+                    disaggregation_decode_host_receive_threshold=1,
                     language_only=False,
                 ),
             ),

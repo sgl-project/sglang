@@ -66,6 +66,7 @@ from fastapi.routing import APIRoute
 
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.embedding_model_spec import resolved_embedding_plan
+from sglang.srt.configs.model_config import load_joint_head_config
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.entrypoints.anthropic.protocol import (
@@ -190,6 +191,7 @@ from sglang.srt.utils.auth import AuthLevel, app_has_admin_force_endpoints, auth
 from sglang.srt.utils.json_response import (
     SGLangORJSONResponse,
     dumps_json,
+    model_json_response,
     orjson_response,
 )
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
@@ -916,6 +918,13 @@ async def generate_request(obj: GenerateReqInput, request: Request):
     contract_error = generate_contract_error(await request.json())
     if contract_error is not None:
         return ORJSONResponse(status_code=400, content={"error": contract_error})
+    return await serve_generate_request(obj, request)
+
+
+async def serve_generate_request(obj: GenerateReqInput, request: Request):
+    """Serve an admitted generate request: `generate_request` after its
+    contract check. A route that admits requests with its own parser calls
+    this directly, so the body is not decoded and checked a second time."""
     if envs.SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES.get():
         apply_header_overrides(obj, request.headers)
     if obj.stream:
@@ -966,6 +975,7 @@ async def generate_request(obj: GenerateReqInput, request: Request):
 async def encode_request(obj: EmbeddingReqInput, request: Request):
     """Handle an embedding request."""
     try:
+        _refuse_decision_layout(obj)
         ret = await _global_state.tokenizer_manager.generate_request(
             obj, request
         ).__anext__()
@@ -978,12 +988,19 @@ async def encode_request(obj: EmbeddingReqInput, request: Request):
 async def classify_request(obj: EmbeddingReqInput, request: Request):
     """Handle a reward model request. Now the arguments and return values are the same as embedding models."""
     try:
+        _refuse_decision_layout(obj)
         ret = await _global_state.tokenizer_manager.generate_request(
             obj, request
         ).__anext__()
         return ret
     except ValueError as e:
         return _create_error_response(e)
+
+
+def _refuse_decision_layout(obj: EmbeddingReqInput) -> None:
+    # Only /v1/systemone builds a decision layout, from the prompt it compiles.
+    if obj.decision_layout is not None:
+        raise ValueError("decision_layout is set only by /v1/systemone")
 
 
 @app.api_route("/flush_cache", methods=["GET", "POST"])
@@ -1773,8 +1790,10 @@ async def continue_generation(
 @app.post("/v1/completions", dependencies=[Depends(validate_json_request)])
 async def openai_v1_completions(request: CompletionRequest, raw_request: Request):
     """OpenAI-compatible text completion endpoint."""
-    return await raw_request.app.state.openai_serving_completion.handle_request(
-        request, raw_request
+    return model_json_response(
+        await raw_request.app.state.openai_serving_completion.handle_request(
+            request, raw_request
+        )
     )
 
 
@@ -1783,8 +1802,10 @@ async def openai_v1_chat_completions(
     request: ChatCompletionRequest, raw_request: Request
 ):
     """OpenAI-compatible chat completion endpoint."""
-    return await raw_request.app.state.openai_serving_chat.handle_request(
-        request, raw_request
+    return model_json_response(
+        await raw_request.app.state.openai_serving_chat.handle_request(
+            request, raw_request
+        )
     )
 
 
@@ -2107,8 +2128,10 @@ async def sagemaker_chat_completions(
     request: ChatCompletionRequest, raw_request: Request
 ):
     """OpenAI-compatible chat completion endpoint."""
-    return await raw_request.app.state.openai_serving_chat.handle_request(
-        request, raw_request
+    return model_json_response(
+        await raw_request.app.state.openai_serving_chat.handle_request(
+            request, raw_request
+        )
     )
 
 
@@ -2263,10 +2286,6 @@ def _execute_server_warmup(server_args: ServerArgs):
     url = server_args.url()
     if get_serving().api_key:
         headers["Authorization"] = f"Bearer {get_serving().api_key}"
-    if envs.SGLANG_RUST_SERVER.get():
-        # The Rust listener binds before this request so /model_info is
-        # available, but health stays 503 until this marked request succeeds.
-        headers["x-sglang-startup-warmup"] = "1"
 
     ssl_verify = ssl_verify_of(server_args)
 
@@ -2328,16 +2347,7 @@ def _execute_server_warmup(server_args: ServerArgs):
         and get_disagg().disaggregation_mode == "null"
         and model_info["is_generation"]
     ):
-        served_model_name = ""
-        if not envs.SGLANG_RUST_SERVER.get():
-            served_model_name = _global_state.tokenizer_manager.served_model_name
-        else:
-            # _global_state.tokenizer_manager is not initialized in the rust server,
-            # so we need to get the model name from the model_info
-            served_model_name = model_info.get(
-                "model_path", get_serving().served_model_name
-            )
-            served_model_name = served_model_name or get_model().model_path
+        served_model_name = _global_state.tokenizer_manager.served_model_name
         # TODO: ChatCompletionRequest does not have bootstrap info required by disaggregation mode, disable image-warmup for now
         # Only use chat completions format for generation models, not embedding models
         json_data = {
@@ -2380,6 +2390,22 @@ def _execute_server_warmup(server_args: ServerArgs):
         ).tolist()
         json_data["sampling_params"]["max_new_tokens"] = 0
 
+    if (
+        not model_info["is_generation"]
+        and model_info.get("architectures") == ["Qwen3_5ForConditionalGeneration"]
+        and load_joint_head_config(get_model().model_path, get_model().revision)
+        is not None
+    ):
+        # A Clef checkpoint answers /v1/systemone decisions only.
+        request_name = "/v1/systemone"
+        json_data = {
+            "model": "warmup",
+            "state": "The capital city of France is Paris.",
+            "questions": {
+                "warmup": {"type": "noul", "instructions": "Is the state true?"}
+            },
+        }
+
     # Send a warmup request
     warmup_timeout = envs.SGLANG_WARMUP_TIMEOUT.get()
     try:
@@ -2392,9 +2418,7 @@ def _execute_server_warmup(server_args: ServerArgs):
                 verify=ssl_verify,
             )
             assert res.status_code == 200, f"{res.text}"
-            # Skip server_status update for Rust server
-            if not envs.SGLANG_RUST_SERVER.get():
-                _global_state.tokenizer_manager.server_status = ServerStatus.Up
+            _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
         else:
             logger.info(f"Start of pd disaggregation warmup ...")
@@ -2419,14 +2443,9 @@ def _execute_server_warmup(server_args: ServerArgs):
                     get_disagg().disaggregation_mode,
                     failed_status_codes,
                 )
-            # In rust-server mode there is no TokenizerManager (readiness is
-            # the Rust server's own /health), so skip the status update.
-            if not envs.SGLANG_RUST_SERVER.get():
-                _global_state.tokenizer_manager.server_status = (
-                    ServerStatus.Up
-                    if not failed_status_codes
-                    else ServerStatus.UnHealthy
-                )
+            _global_state.tokenizer_manager.server_status = (
+                ServerStatus.Up if not failed_status_codes else ServerStatus.UnHealthy
+            )
 
     except Exception:
         last_traceback = get_exception_traceback()
@@ -2921,13 +2940,8 @@ def launch_server(
     if envs.SGLANG_RUST_SERVER.get():
         # The Rust server serves api-server, tokenizer, and detokenizer, so the
         # main process has no Python HTTP server / tokenizer manager to run.
-        # Run a warmup /generate before advertising readiness: the Rust /health
-        # and /get_model_info endpoints are static (200 as soon as the server
-        # binds, before any forward pass), so without this the first real request
-        # pays the cold-start cost (observed as a >60s first generation).
-        if not get_serving().skip_server_warmup:
-            _execute_server_warmup(server_args)
-        logger.info("The server is fired up and ready to roll!")
+        # Each Rust listener runs its own startup warmup and keeps /health at
+        # 503 until it succeeds, so the main process does not warm up here.
         if launch_callback is not None:
             launch_callback()
         scheduler_init_result.block_until_scheduler_exits()

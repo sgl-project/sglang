@@ -81,6 +81,7 @@ from sglang.srt.mem_cache.memory_pool import (
     get_minimax_sparse_index_dtype,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.platforms import current_platform
 from sglang.srt.platforms.interface import KVPoolKind, reject_out_of_tree_path
 from sglang.srt.runtime_context import (
@@ -2579,7 +2580,24 @@ class KVCacheConfigurator:
         )
 
         slack_gb = pre_model_load_memory * (1 - get_schedule().mem_fraction_static)
-        if self.mambaish_config is not None and self.post_capture_kv_active:
+        # Every prefill batch fits a captured bucket when batches are capped at the
+        # request slots; the exemption also needs an explicit Mamba size: a larger
+        # rest_memory would otherwise auto-size a bigger physical Mamba pool below.
+        prefill_max_requests = get_schedule().prefill_max_requests
+        request_slots = get_exec().graph.cuda_graph_config.prefill.full_prefill_max_req
+        capped_full_prefill_role = (
+            get_disagg().disaggregation_mode == "prefill"
+            and get_exec().graph.cuda_graph_config.prefill.backend == Backend.FULL
+            and get_schedule().max_mamba_cache_size is not None
+            and prefill_max_requests is not None
+            and request_slots is not None
+            and prefill_max_requests <= request_slots
+        )
+        if (
+            self.mambaish_config is not None
+            and self.post_capture_kv_active
+            and not capped_full_prefill_role
+        ):
             # Mamba state is a fixed pre-capture allocation, so it can't ride the ~0 post-capture slack.
             slack_gb = max(
                 slack_gb,
