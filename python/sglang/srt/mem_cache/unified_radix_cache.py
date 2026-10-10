@@ -1036,7 +1036,17 @@ class UnifiedRadixCache(BasePrefixCache):
             return DecLockRefResult()
         return self.tree_core.dec_host_lock_ref(node_id, params)
 
+    def prefix_device_indices(self, req: Req) -> torch.Tensor:
+        if self.linker is not None:
+            indices = self.linker.prefix_device_indices(req)
+            if indices is not None:
+                return indices
+        return super().prefix_device_indices(req)
+
     def maybe_hand_to_session(self, req: Req) -> None:
+        # Allocation has written the staged prefix into the request's row.
+        if self.linker is not None:
+            self.linker.claim_request_row(req)
         self.session.take(req)
 
     def claim_kv_row(self, req: Req) -> bool:

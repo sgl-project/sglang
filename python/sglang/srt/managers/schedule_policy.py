@@ -1439,7 +1439,9 @@ class PrefillAdder:
                     if isinstance(admission, AddReqResult):
                         return admission
                 req.prefix_len += req.host_loaded_length
-                req.kv.cache_protected_len = req.prefix_len
+                # PP linker slots remain request-owned until post-prefill insert.
+                if req.external_cache_hit_length is None:
+                    req.kv.cache_protected_len = req.prefix_len
 
             # Sharded pools cannot load host KV; reserve scratch after all other gates.
             if not self._kv_shard_reserve_scratch(

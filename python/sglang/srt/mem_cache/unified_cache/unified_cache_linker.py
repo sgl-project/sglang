@@ -141,6 +141,13 @@ class _PendingOffload(NamedTuple):
     publish_node_ids: list[NodeId]
 
 
+class _PendingPPPrefix(NamedTuple):
+    req: Req
+    component_transfers: list[tuple[TreeComponent, PoolTransfer]]
+    device_hit_len: int
+    prefix_len: int
+
+
 class UnifiedCacheLinkerWrapper:
     """Drives an external KV store on behalf of one :class:`UnifiedRadixCache`."""
 
@@ -172,8 +179,12 @@ class UnifiedCacheLinkerWrapper:
         )
         # rid -> what match found, consumed by the next init_load_back.
         self.hit_markers: dict[str, ExternalCacheHitMarker] = {}
-        # Loads in flight, each pinning its inserted endpoint until DMA completes.
+        # Loads pin their tree prefix until DMA completes. In PP, newly loaded
+        # slots remain request-owned until the normal post-prefill insert.
         self.pending_loads: dict[str, tuple[NodeId, DecLockRefParams]] = {}
+        # PP tails not yet written into a request row by the extend allocator.
+        self.pending_pp_prefixes: dict[str, _PendingPPPrefix] = {}
+        self.cancelled_pp_prefixes: set[str] = set()
         # Offloads in flight, each holding a lock on its node until it lands.
         self.pending_offloads: list[_PendingOffload] = []
 
@@ -187,6 +198,21 @@ class UnifiedCacheLinkerWrapper:
     def has_hit(self, rid: str) -> bool:
         return rid in self.hit_markers
 
+    def prefix_device_indices(self, req: Req) -> torch.Tensor | None:
+        pending = self.pending_pp_prefixes.get(req.rid)
+        if pending is None:
+            return None
+        path = self.cache.path_device_indices(req.last_node)
+        assert len(path) >= pending.device_hit_len
+        full = pending.component_transfers[0][1]
+        indices = torch.cat([path[: pending.device_hit_len], full.device_indices])
+        assert len(indices) >= req.prefix_len
+        return indices[: req.prefix_len]
+
+    def claim_request_row(self, req: Req) -> None:
+        # Called only after allocation has written all prefix slots into the row.
+        self.pending_pp_prefixes.pop(req.rid, None)
+
     # ---- match: probe the remote store and report host_hit_length ----
 
     def match(self, key: RadixKey, req: Req, result: MatchResult) -> MatchResult:
@@ -194,6 +220,17 @@ class UnifiedCacheLinkerWrapper:
         key, _ = key.maybe_to_bigram_view(cache.tree_core.is_eagle)
         page = cache.page_size
         device_hit_len = result.device_prefix_len
+        self.hit_markers.pop(req.rid, None)
+
+        known_hit_len = req.external_cache_hit_length if cache.pp_size > 1 else None
+        if known_hit_len is not None:
+            # PP0's absolute boundary also survives later local L1 rematches.
+            key = key[:known_hit_len]
+        elif cache.pp_size > 1:
+            req.external_cache_hit_length = 0
+            if cache.pp_rank != 0:
+                return result
+
         if device_hit_len >= len(key):
             return result
 
@@ -212,11 +249,16 @@ class UnifiedCacheLinkerWrapper:
         by_pool = {transfer.name: transfer for transfer in lookup_transfers}
 
         # Tail-relative: page 0 of `tail_hashes` is the first uncached page.
-        hit_pages = self._sync_restorable_prefix(
-            self.cache_linker.lookup(req.rid, lookup_transfers),
-            num_pages=len(tail_hashes),
-            device_hit_pages=0,
-        )
+        if known_hit_len is None:
+            hit_pages = self._sync_restorable_prefix(
+                self.cache_linker.lookup(req.rid, lookup_transfers),
+                num_pages=len(tail_hashes),
+                device_hit_pages=0,
+            )
+            if cache.pp_size > 1 and hit_pages:
+                req.external_cache_hit_length = device_hit_len + hit_pages * page
+        else:
+            hit_pages = len(tail_hashes)
         if hit_pages == 0:
             return result
         hit_tokens = hit_pages * page
@@ -315,7 +357,11 @@ class UnifiedCacheLinkerWrapper:
 
         full_transfer = component_transfers[0][1]
         assert full_transfer.name == PoolName.KV
-        self._update_load(
+        previous_kv = req.kv
+        previous_evicted_seqlens = (
+            req.kv.component_evicted_seqlens.copy() if req.kv is not None else None
+        )
+        prepared_transfers = self._update_load(
             ExternalLinkerLoadPhase.PREPARE,
             req,
             component_transfers,
@@ -334,6 +380,38 @@ class UnifiedCacheLinkerWrapper:
                 ComponentType.SWA,
                 max(req.kv.get_evicted_seqlen(ComponentType.SWA), prefix_len),
             )
+
+        if cache.pp_size > 1:
+            # Load into request-owned slots. The existing PP result ring delays
+            # normal insert/dedup until every stage has completed this prefill.
+            try:
+                self._queue_load(req.rid, req.last_node, prepared_transfers)
+            except BaseException:
+                self._update_load(
+                    ExternalLinkerLoadPhase.ABORT,
+                    req,
+                    component_transfers,
+                    prefix_len,
+                )
+                req.kv = previous_kv
+                if req.kv is not None:
+                    req.kv.component_evicted_seqlens = previous_evicted_seqlens
+                raise
+            if req.kv is not None and req.kv.holds_kv:
+                # A later chunk already has a row; the extend allocator reads
+                # its prefix from there instead of the tree path.
+                cache.req_to_token_pool.write(
+                    (req.kv.req_pool_idx, slice(device_hit_len, prefix_len)),
+                    full_transfer.device_indices,
+                )
+                req.kv.kv_allocated_len = max(req.kv.kv_allocated_len, prefix_len)
+                req.kv.kv_committed_len = max(req.kv.kv_committed_len, prefix_len)
+            else:
+                assert req.rid not in self.pending_pp_prefixes
+                self.pending_pp_prefixes[req.rid] = _PendingPPPrefix(
+                    req, component_transfers, device_hit_len, prefix_len
+                )
+            return len(full_transfer.device_indices), req.last_node
 
         # Insert the newly loaded tail into the tree.
         prefix_indices = torch.cat(
@@ -557,6 +635,8 @@ class UnifiedCacheLinkerWrapper:
             for rid in self.cache_linker.pop_completed_load():
                 node_id, lock_params = self.pending_loads.pop(rid)
                 self.cache.dec_lock_ref(node_id, lock_params)
+                if rid in self.cancelled_pp_prefixes:
+                    self._release_pp_prefix(rid)
 
     def take_completed_offloads(self, finish_count: int) -> list[bool]:
         assert finish_count <= len(self.pending_offloads)
@@ -579,7 +659,23 @@ class UnifiedCacheLinkerWrapper:
     def reset(self) -> None:
         self.cache_linker.reset()
         self.hit_markers.clear()
+        self._release_pp_prefixes()
         self._release_pending_locks()
+
+    def _release_pp_prefix(self, rid: str) -> None:
+        pending = self.pending_pp_prefixes.pop(rid, None)
+        self.cancelled_pp_prefixes.discard(rid)
+        if pending is not None:
+            self._update_load(
+                ExternalLinkerLoadPhase.ABORT,
+                pending.req,
+                pending.component_transfers,
+                pending.prefix_len,
+            )
+
+    def _release_pp_prefixes(self) -> None:
+        for rid in list(self.pending_pp_prefixes):
+            self._release_pp_prefix(rid)
 
     def _release_pending_locks(self) -> None:
         for node_id, lock_params in self.pending_loads.values():
@@ -599,7 +695,15 @@ class UnifiedCacheLinkerWrapper:
         if self.cache_linker.cancel_queued_load(rid):
             node_id, lock_params = self.pending_loads.pop(rid)
             self.cache.dec_lock_ref(node_id, lock_params)
+            self._release_pp_prefix(rid)
+        elif rid in self.pending_pp_prefixes:
+            if rid in self.pending_loads:
+                # DMA may still refer to these slots. Retire them after completion.
+                self.cancelled_pp_prefixes.add(rid)
+            else:
+                self._release_pp_prefix(rid)
 
     def close(self) -> None:
         self.cache_linker.close()
+        self._release_pp_prefixes()
         self._release_pending_locks()
