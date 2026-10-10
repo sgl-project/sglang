@@ -246,10 +246,11 @@ def _environment_fingerprint() -> str:
     compilers = []
     for path in (toolchain.device_compiler_path(), toolchain.host_compiler_path()):
         try:
-            compilers.append(subprocess.check_output([path, "--version"], text=True))
+            version = subprocess.check_output([path, "--version"], text=True)
+            compilers.append((path, version))
         except (OSError, subprocess.SubprocessError) as error:
             logger.warning("Cannot fingerprint compiler %s: %s", path, error)
-            compilers.append("unknown")
+            compilers.append((path, _file_digest(pathlib.Path(path)) or "missing"))
 
     versions: List[Tuple[str, str]] = []
     for name in _VERSIONED_PACKAGES:
