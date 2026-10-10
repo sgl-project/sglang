@@ -212,12 +212,9 @@ def match_kv_cache(
     if token_ids is None:
         token_ids = req.origin_input_ids + req.output_ids
 
+    key = _req_radix_key(tree_cache, req, token_ids, max_prefix_len)
     match_result = tree_cache.match_prefix(
-        MatchPrefixParams(
-            key=_req_radix_key(tree_cache, req, token_ids, max_prefix_len),
-            cow_mamba=cow_mamba,
-            req=req,
-        )
+        MatchPrefixParams(key=key, cow_mamba=cow_mamba, req=req)
     )
     if envs.SGLANG_RADIX_FORCE_MISS.get():
         match_result = zero_match_result(
@@ -242,6 +239,8 @@ def match_kv_cache(
     max_len = req._compute_max_prefix_len(len(token_ids))
     req.num_matched_prefix_tokens = min(req.prefix_len + req.host_hit_length, max_len)
     req.swa_branching_seqlen = match_result.swa_branching_seqlen
+    req.swa_recompute_hit_length = match_result.swa_recompute_hit_length
+    req.swa_recompute_key = key if req.swa_recompute_hit_length else None
     # A probe match keeps what it did not report; a new round resets both.
     if match_result.mamba_branching_seqlen is not None:
         req.mamba_branching_seqlen = match_result.mamba_branching_seqlen

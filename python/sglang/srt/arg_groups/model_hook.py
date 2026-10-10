@@ -469,11 +469,13 @@ def handle_model_specific_adjustments(server_args: Any):
     ]:
         from sglang.srt.arg_groups.deepseek_v4_hook import (
             validate_deepseek_v4_cp,
+            validate_deepseek_v4_swa_recompute,
             validate_deepseek_v41_features,
         )
 
         # Before the CP validation: V4.1 rejects CP outright, the actionable message.
         validate_deepseek_v41_features(server_args)
+        validate_deepseek_v4_swa_recompute(server_args)
         validate_deepseek_v4_cp(server_args)
 
         if get_platform().is_sm120:

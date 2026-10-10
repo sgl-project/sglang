@@ -1162,3 +1162,26 @@ sglang serve ...
 ```
 
 Two further limits are worth knowing before you size a run. The pool is a per-node process, so a worker that spans nodes would shard its keyspace by node. And under PD disaggregation the §3.7 pairs run the linker on the prefill role only, so the decode worker offloads nothing; in aggregated serving the single worker offloads its own KV.
+
+### 3.9 SWA Recompute (Experimental)
+
+DeepSeek-V4 keeps two kinds of KV for a cached prefix: the full KV and a smaller sliding-window (SWA) KV sized by `--swa-full-tokens-ratio`. Under memory pressure the SWA KV of an idle prefix is evicted first. A later request that reuses that prefix then has to prefill it again, even though its full KV is still cached.
+
+`--enable-swa-recompute` rebuilds the SWA KV instead. The server replays only the last tokens of the prefix (5,632 tokens for V4-Flash at the default page size of 256) and reads everything older from the cached full KV. Prefixes shorter than about twice that length are prefilled again as before.
+
+```bash Command
+sglang serve \
+  --trust-remote-code \
+  --model-path deepseek-ai/DeepSeek-V4-Flash-0731 \
+  --tp 4 \
+  --moe-runner-backend flashinfer_mxfp4 \
+  --speculative-algorithm DSPARK \
+  --mem-fraction-static 0.90 \
+  --chunked-prefill-size 8192 \
+  --swa-full-tokens-ratio 0.1 \
+  --enable-swa-recompute \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+The flag works with TP and with DSpark. It does not yet work with DP attention, PD disaggregation, the TRT-LLM attention backend, UMBP or DeepSeek-V4.1, and the server refuses to start when it is combined with one of them.

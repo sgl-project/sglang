@@ -133,6 +133,7 @@ class TestPrefillAdder(CustomTestCase):
         req.retracted_stain = False
         req.host_hit_length = 0
         req.swa_host_hit_length = 0
+        req.swa_recompute_hit_length = 0
         req.storage_hit_length = 0
         req.storage_hit_start = None
         req.host_hit_is_storage = False
@@ -194,6 +195,7 @@ class TestPrefillAdder(CustomTestCase):
         req = self.create_mock_req(rid, priority=0, max_new_tokens=max_new_tokens)
         req.sampling_params.ignore_eos = False
         req.swa_host_hit_length = 0
+        req.swa_recompute_hit_length = 0
         req.last_node = MagicMock()
         req.full_untruncated_fill_ids = list(range(12))
         return req
@@ -1134,6 +1136,7 @@ class TestPrefillAdder(CustomTestCase):
         req.full_untruncated_fill_ids = list(range(PREFIX + EXTEND))
         req.host_hit_length = 0
         req.swa_host_hit_length = 0
+        req.swa_recompute_hit_length = 0
         req.last_node = MagicMock()
         req.sampling_params = SimpleNamespace(max_new_tokens=40, ignore_eos=False)
 

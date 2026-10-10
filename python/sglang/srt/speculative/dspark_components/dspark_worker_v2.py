@@ -664,6 +664,36 @@ class DSparkWorkerV2(BaseSpecWorker):
         if on_publish is not None:
             on_publish(batch_output.new_seq_lens)
 
+        self._inject_prefill_target_hidden(
+            batch,
+            logits_output,
+            batch_output.kv_loc_plan,
+            next_token_ids.device,
+            target_hidden_is_projected,
+        )
+        batch_output.kv_loc_plan = None
+        for replay in batch_output.swa_recompute_outputs or ():
+            self._inject_prefill_target_hidden(
+                replay.batch,
+                replay.logits_output,
+                replay.kv_loc_plan,
+                next_token_ids.device,
+                target_hidden_is_projected,
+            )
+        batch_output.next_draft_input = make_next_draft_input(
+            bonus_tokens=next_token_ids,
+            new_seq_lens=new_seq_lens,
+        )
+        return batch_output
+
+    def _inject_prefill_target_hidden(
+        self,
+        batch: ScheduleBatch,
+        logits_output,
+        kv_loc_plan,
+        device,
+        target_hidden_is_projected: bool,
+    ) -> None:
         if logits_output.hidden_states is None:
             raise RuntimeError(
                 "DSpark requires target aux hidden capture for prefill, but got None. "
@@ -678,7 +708,6 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         # Must inject before prefill returns: the scheduler may update radix
         # afterward, invalidating out_cache_loc.
-        device = next_token_ids.device
         pin_memory = is_pin_memory_available(device)
         ctx_lens = torch.tensor(
             batch.extend_lens, dtype=torch.int32, pin_memory=pin_memory
@@ -711,8 +740,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 output_size=num_tokens,
             )
         # The draft KV goes to the slots the target prefill just wrote.
-        cache_loc = self._kv_injector.ids_for(batch_output.kv_loc_plan)
-        batch_output.kv_loc_plan = None
+        cache_loc = self._kv_injector.ids_for(kv_loc_plan)
         token_indices = logits_output.hidden_states_token_indices
         if token_indices is not None:
             cache_loc = cache_loc[token_indices]
@@ -731,12 +759,6 @@ class DSparkWorkerV2(BaseSpecWorker):
         # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
         logits_output.hidden_states = None
         logits_output.hidden_states_token_indices = None
-
-        batch_output.next_draft_input = make_next_draft_input(
-            bonus_tokens=next_token_ids,
-            new_seq_lens=new_seq_lens,
-        )
-        return batch_output
 
     def _idle_verify_ragged_layout(self, batch: ScheduleBatch):
         if batch.global_num_tokens is None or not self._verify_planner.is_compact_mode:

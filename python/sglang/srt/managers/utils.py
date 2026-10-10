@@ -62,6 +62,9 @@ class GenerationBatchResult:
     accept_length_per_req_cpu: Optional[List[int]] = None
     dllm_algo_state: Optional[List[Any]] = None
     can_run_cuda_graph: bool = False
+    # Replays that rebuilt cached SWA rows before this forward; a draft worker
+    # that keeps per-token state rebuilds its own rows from them.
+    swa_recompute_outputs: Optional[List[Any]] = None
 
     # PP skip output comm: True when output send/recv was skipped and
     # next_token_ids are placeholder zeros. Used by process_batch_result_prefill
