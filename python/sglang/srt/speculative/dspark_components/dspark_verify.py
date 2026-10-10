@@ -140,6 +140,7 @@ class TargetVerifyExecutor:
         self._simulate_acc_len = float(simulate_acc_len)
         self._block_verification = block_verification
         self._simulated_correct_drafts_buf: Optional[torch.Tensor] = None
+        self._step_simulated_correct_len = 0
 
     def accept_and_finalize(
         self,
@@ -160,8 +161,8 @@ class TargetVerifyExecutor:
 
         Folded path: the accept/finalize/out-token kernels already ran inside
         the target-verify cuda graph (DsparkVerifyEpilogue); read its buffers.
-        Eager path: run them here, including the SGLANG_SIMULATE_ACC_LEN
-        override.
+        Eager path: run them here. Both apply the SGLANG_SIMULATE_ACC_LEN
+        override drawn by begin_simulated_step.
         """
         if folded_accept:
             return self.verify_epilogue.read_accept(bs)
@@ -226,6 +227,20 @@ class TargetVerifyExecutor:
             out_tokens=out_tokens,
         )
 
+    def begin_simulated_step(self) -> None:
+        """Draw this step's SGLANG_SIMULATE_ACC_LEN correct length, before the
+        target verify, so the folded accept in the graph applies it too."""
+        if self._simulate_acc_len <= 0:
+            return
+        simulated_acc_len = sample_simulated_acc_len(
+            self._simulate_acc_len, SIMULATE_ACC_METHOD, self.gamma + 1
+        )
+        self._step_simulated_correct_len = simulated_acc_len - 1
+        if self.verify_epilogue is not None:
+            self.verify_epilogue.stage_simulated_correct_len(
+                self._step_simulated_correct_len
+            )
+
     def _simulated_correct_len(
         self, *, bs: int, dtype: torch.dtype, device: torch.device
     ) -> torch.Tensor:
@@ -238,11 +253,7 @@ class TargetVerifyExecutor:
         ):
             buf = torch.empty((max(bs, 512),), dtype=dtype, device=device)
             self._simulated_correct_drafts_buf = buf
-
-        simulated_acc_len = sample_simulated_acc_len(
-            self._simulate_acc_len, SIMULATE_ACC_METHOD, self.gamma + 1
-        )
-        return buf[:bs].fill_(simulated_acc_len - 1)
+        return buf[:bs].fill_(self._step_simulated_correct_len)
 
     def run_idle_participation(
         self,
@@ -569,6 +580,7 @@ class DsparkVerifyEpilogue:
         tp_sync: SpecTpSync,
         commit_ctx: Optional[CommitInjectCtx] = None,
         fused_argmax: bool = False,
+        simulate: bool = False,
     ) -> None:
         self.max_bs = int(max_bs)
         self.stride = int(verify_num_draft_tokens)
@@ -598,6 +610,12 @@ class DsparkVerifyEpilogue:
         )
         self.out_tokens_buf = torch.zeros(
             (self.max_bs, self.stride), dtype=torch.int64, device=device
+        )
+        # SGLANG_SIMULATE_ACC_LEN: the step's correct length, staged per replay.
+        self.simulated_correct_len_buf = (
+            torch.zeros((self.max_bs,), dtype=torch.int64, device=device)
+            if simulate
+            else None
         )
         self.strided_logits: Optional[torch.Tensor] = None
         self.strided_hidden: Optional[torch.Tensor] = None
@@ -637,6 +655,9 @@ class DsparkVerifyEpilogue:
             if bs < self.max_bs:
                 self.verify_lens_buf[bs:].zero_()
         self.inject_gate_buf.fill_(1 if armed else 0)
+
+    def stage_simulated_correct_len(self, correct_len: int) -> None:
+        self.simulated_correct_len_buf.fill_(correct_len)
 
     def begin_static_step(self, bs: int, armed: bool) -> None:
         state = (bs, armed)
@@ -781,6 +802,9 @@ class DsparkVerifyEpilogue:
             cutoff_verify_lens=cutoff_verify_lens,
             fused_argmax=self._fused_argmax,
         )
+        if self.simulated_correct_len_buf is not None:
+            # The accept runs as served; only its length is replaced.
+            correct_len = self.simulated_correct_len_buf[:bs].to(correct_len.dtype)
         self._tp_sync.sync(SpecTpSyncSite.DSPARK_ACCEPT_GRAPH, correct_len)
         self._tp_sync.sync(SpecTpSyncSite.DSPARK_ACCEPT_GRAPH, bonus)
         self._tp_sync.sync(SpecTpSyncSite.DSPARK_ACCEPT_GRAPH, cap_trim_lens)
