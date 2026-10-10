@@ -709,7 +709,18 @@ class Ernie4_5_VLMoeForConditionalGeneration(nn.Module):
                     f"(3, seq_len) positions, but got {positions.size()}"
                 )
 
-        self._set_visual_token_mask(input_ids, forward_batch)
+        # Only prefill/extend batches carrying image tokens need the vision/text
+        # expert-routing mask; decode tokens are always text (all-False mask == None,
+        # the text-experts path). Computing it every decode step allocates small XPU
+        # tensors (.to/cat/isin) that the level_zero backend never reclaims -> USM
+        # exhaustion (error 40) after tens of docs.
+        if (
+            not forward_batch.forward_mode.is_decode()
+            and forward_batch.contains_image_inputs()
+        ):
+            self._set_visual_token_mask(input_ids, forward_batch)
+        else:
+            self.visual_token_mask = None
 
         assert input_ids.numel() == positions.shape[-1], (
             f"input_ids {input_ids.shape} and position_ids {positions.shape} should have the same length"
