@@ -1,8 +1,11 @@
 // Custom all-reduce kernels over the decoupled Communicator storage plane.
 //
-// Three algorithms are provided behind one entry point:
+// Four algorithms are provided behind one entry point:
 //   - 1shot_push: lamport-style push of local data to every peer's push
 //     workspace, then a local polling reduce (best at small sizes).
+//   - 2shot_push: the same lamport push, but each chunk goes only to its
+//     owner rank, which reduces it and pushes the sum to every other rank.
+//     Same traffic as 2shot_pull, with no barriers and no remote loads.
 //   - 1shot_pull: every rank reduces all peers' data (from the symmetric pull
 //     workspaces, a CUDA-graph pointer table, or a multicast address).
 //   - 2shot_pull: reduce-scatter fused with all-gather; each rank reduces its
@@ -208,6 +211,115 @@ ALL_REDUCE_KERNEL void all_reduce_1shot_push_kernel(const __grid_constant__ AllR
   epoch.flip();
 }
 
+/// Chunk c of the flat tensor is owned by rank c. A slot (dst, src) holds two
+/// `chunk_vecs` halves: [0, chunk) takes src's partial of chunk dst, and
+/// [chunk, 2 * chunk) takes src's reduced chunk src. The (r, r) slot is unused:
+/// the owner reads its own partial straight from the input.
+template <typename T, uint32_t kWorldSize, bool kUsePDL>
+ALL_REDUCE_KERNEL void all_reduce_2shot_push_kernel(const __grid_constant__ AllReducePushParams<kWorldSize> params) {
+  using namespace device;
+  constexpr uint32_t kVecSize = 16 / (sizeof(T) * 2);
+  constexpr uint32_t kFan = kWorldSize - 1;
+  using vec_t = AlignedVector<packed_t<T>, kVecSize>;
+  using Lamport = distributed::LamportTrait<T, kVecSize * 2, /*kAtom=*/4>;
+  const auto r = params.rank;
+  const auto num_vecs = params.num_vecs;
+  const auto chunk_vecs = (num_vecs + kWorldSize - 1) / kWorldSize;
+  const auto chunk_len = [&](uint32_t c) { return min(chunk_vecs, num_vecs - min(num_vecs, c * chunk_vecs)); };
+  const auto num_threads = blockDim.x * gridDim.x;
+  const auto num_warps = num_threads / kWarpThreads;
+  const auto warp_in_block = threadIdx.x / kWarpThreads;
+  const auto lane_id = threadIdx.x % kWarpThreads;
+  const auto global_warp_id = blockIdx.x + gridDim.x * warp_in_block;
+  const auto global_tid = global_warp_id * kWarpThreads + lane_id;
+  PDLWaitPrimary<kUsePDL>();
+  const auto epoch = distributed::PushEpoch<kWorldSize>{params.ws};
+
+  // Each warp serves one peer, starting at r + 1 so every peer's ingress is
+  // busy from the first wave and the slot pointer stays warp-uniform.
+  auto peer = r + 1 + global_warp_id % kFan;
+  if (peer >= kWorldSize) peer -= kWorldSize;
+  const auto group_warps = num_warps / kFan + (global_warp_id % kFan < num_warps % kFan ? 1 : 0);
+  const auto group_tid = (global_warp_id / kFan) * kWarpThreads + lane_id;
+  const auto group_stride = group_warps * kWarpThreads;
+  const auto peer_len = chunk_len(peer);
+
+  // reduce-scatter: my partial of the peer's chunk to its owner
+  {
+    const auto push_ptr = epoch.slot_ptr(/*dst=*/peer, /*src=*/r);
+    for (auto j = group_tid; j < peer_len; j += group_stride) {
+      vec_t vec;
+      vec.load(params.input, peer * chunk_vecs + j);
+      Lamport::clear_pos_zero(vec.data());
+      ptx::st_relaxed_16B(vec, push_ptr, j);
+    }
+  }
+
+  vec_t pos_zero_vec;
+  Lamport::fill_pos_zero(pos_zero_vec.data());
+
+  void* poll_ptrs[kWorldSize];
+#pragma unroll
+  for (uint32_t i = 0; i < kWorldSize; ++i) {
+    poll_ptrs[i] = epoch.slot_ptr(/*dst=*/r, /*src=*/i);
+  }
+
+  // reduce my chunk, keep it and fan it out
+  const auto my_len = chunk_len(r);
+  for (auto j = global_tid; j < my_len; j += num_threads) {
+    const auto vid = r * chunk_vecs + j;
+    vec_t vec[kWorldSize];
+#pragma unroll
+    for (uint32_t i = 0; i < kWorldSize; ++i) {
+      if (i == r) {
+        vec[i].load(params.input, vid);
+        Lamport::clear_pos_zero(vec[i].data());
+      }
+    }
+    do {
+      bool has_zero = false;
+#pragma unroll
+      for (uint32_t i = 0; i < kWorldSize; ++i) {
+        if (i != r) ptx::ld_relaxed_16B(vec[i], poll_ptrs[i], j);
+      }
+#pragma unroll
+      for (uint32_t i = 0; i < kWorldSize; ++i) {
+        if (i != r) has_zero |= Lamport::has_pos_zero(vec[i].data());
+      }
+      if (!has_zero) break;
+    } while (true);
+    auto out_vec = reduce_vec(vec);
+    // remap before the local store too, so every rank holds identical bits
+    Lamport::clear_pos_zero(out_vec.data());
+#pragma unroll
+    for (uint32_t i = 0; i < kWorldSize; ++i) {
+      if (i != r) ptx::st_relaxed_16B(out_vec, epoch.slot_ptr(/*dst=*/i, /*src=*/r), chunk_vecs + j);
+    }
+    out_vec.store(params.output, vid);
+#pragma unroll
+    for (uint32_t i = 0; i < kWorldSize; ++i) {
+      if (i != r) ptx::st_global_16B(pos_zero_vec, poll_ptrs[i], j);
+    }
+  }
+
+  // all-gather: drain the peer's reduced chunk
+  {
+    const auto poll_ptr = epoch.slot_ptr(/*dst=*/r, /*src=*/peer);
+    for (auto j = group_tid; j < peer_len; j += group_stride) {
+      vec_t vec;
+      do {
+        ptx::ld_relaxed_16B(vec, poll_ptr, chunk_vecs + j);
+      } while (Lamport::has_pos_zero(vec.data()));
+      vec.store(params.output, peer * chunk_vecs + j);
+      ptx::st_global_16B(pos_zero_vec, poll_ptr, chunk_vecs + j);
+    }
+  }
+
+  PDLTriggerSecondary<kUsePDL>();
+  __syncthreads();
+  epoch.flip();
+}
+
 template <typename Impl, typename T, uint32_t kWorldSize, bool kUsePDL>
 ALL_REDUCE_KERNEL void all_reduce_1shot_pull_kernel(const __grid_constant__ AllReducePullParams<kWorldSize> params) {
   using namespace device;
@@ -314,7 +426,7 @@ struct AllReduceKernel {
       const bool use_multicast) {
     using namespace host;
     const auto& comm = *comm_ref.get();
-    CHECK_HOST(algo == "1shot_pull" || algo == "2shot_pull" || algo == "1shot_push") << algo;
+    CHECK_HOST(algo == "1shot_pull" || algo == "2shot_pull" || algo == "1shot_push" || algo == "2shot_push") << algo;
     CHECK_HOST(comm.get_world_size() == kWorldSize) << comm.get_world_size();
     CHECK_HOST(in.IsContiguous() && is_type<T>(in.dtype()) && in.device().device_type == kDLCUDA);
     const auto num_elems_int64 = in.numel();
@@ -326,21 +438,29 @@ struct AllReduceKernel {
     const auto stream = LaunchKernel::resolve_device(in.device());
     const auto use_graph = graph_params_opt.has_value();
 
-    if (algo == "1shot_push") {
+    if (algo == "1shot_push" || algo == "2shot_push") {
       CHECK_HOST(!use_graph && !use_multicast);
       const auto& push = comm.get_push_obj();
+      const auto two_shot = algo == "2shot_push";
+      const auto chunk_vecs = div_ceil(num_vecs, kWorldSize);
       Tensor out = ffi::empty_like(in);
       const auto params = PushParams{
           .input = in.data_ptr(),
           .output = out.data_ptr(),
           .num_vecs = num_vecs,
           .rank = push.rank,
-          .ws = push.get_workspace<kWorldSize>(nbytes),
+          .ws = push.get_workspace<kWorldSize>(two_shot ? int64_t{2} * chunk_vecs * 16 : nbytes),
       };
       using Impl = LoadStoreImpl<vec_t, kWorldSize, /*kUseGraph=*/false>;
-      const auto kernel = all_reduce_1shot_push_kernel<Impl, T, kWorldSize, kUsePDL>;
+      const auto kernel = two_shot ? all_reduce_2shot_push_kernel<T, kWorldSize, kUsePDL>
+                                   : all_reduce_1shot_push_kernel<Impl, T, kWorldSize, kUsePDL>;
       // the grid is bound to the counter array and must stay constant
-      LaunchKernel(push.num_blocks, choose_block_size(num_vecs), stream)  //
+      auto block_size = choose_block_size(num_vecs);
+      if (two_shot) {
+        // Every peer needs a warp, including when callers use a small grid.
+        block_size = std::max(block_size, 32u * div_ceil(kWorldSize - 1, push.num_blocks));
+      }
+      LaunchKernel(push.num_blocks, block_size, stream)  //
           .enable_pdl(kUsePDL)(kernel, params);
       return out;
     }

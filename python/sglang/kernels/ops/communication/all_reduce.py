@@ -20,11 +20,12 @@ from sglang.kernels.kernel_api_logging import debug_kernel_api
 
 class AllReduceAlgo(enum.Enum):
     ONE_SHOT_PUSH = enum.auto()
+    TWO_SHOT_PUSH = enum.auto()
     ONE_SHOT_PULL = enum.auto()
     TWO_SHOT_PULL = enum.auto()
 
     def is_push(self) -> bool:
-        return self == AllReduceAlgo.ONE_SHOT_PUSH
+        return self in (AllReduceAlgo.ONE_SHOT_PUSH, AllReduceAlgo.TWO_SHOT_PUSH)
 
     @property
     def algo_name(self) -> str:
@@ -33,6 +34,7 @@ class AllReduceAlgo(enum.Enum):
 
 _ALGO_NAMES = {
     AllReduceAlgo.ONE_SHOT_PUSH: "1shot_push",
+    AllReduceAlgo.TWO_SHOT_PUSH: "2shot_push",
     AllReduceAlgo.ONE_SHOT_PULL: "1shot_pull",
     AllReduceAlgo.TWO_SHOT_PULL: "2shot_pull",
 }
