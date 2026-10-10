@@ -627,6 +627,19 @@ class TokenizerControlMixin:
 
         return success, message
 
+    def _validate_dynamic_lora_supported(self: TokenizerManager) -> None:
+        # Each tokenizer worker keeps its own LoRA registry; dynamic updates
+        # are not synchronized across workers (issue #31084).
+        if get_serving().tokenizer_worker_num > 1:
+            raise ValueError(
+                "Dynamic LoRA updates are not supported with "
+                "--tokenizer-worker-num > 1: each tokenizer worker keeps its "
+                "own LoRA registry and dynamic updates are not synchronized "
+                "across workers (https://github.com/sgl-project/sglang/issues/31084). "
+                "Launch with --tokenizer-worker-num 1, or preload adapters at "
+                "startup via --lora-paths."
+            )
+
     async def _unload_lora_adapter_locked(
         self: TokenizerManager,
         obj: UnloadLoRAAdapterReqInput,
@@ -665,8 +678,10 @@ class TokenizerControlMixin:
                     "LoRA is not enabled. Please set `--enable-lora` to enable LoRA."
                 )
 
-            assert get_parallel().dp_size == 1, (
-                "data-parallel replicas are not supported for dynamic lora loading"
+            self._validate_dynamic_lora_supported()
+
+            assert get_parallel().dp_size == 1 or get_parallel().enable_dp_attention, (
+                "dp_size must be 1 or dp attention must be enabled for dynamic lora loading"
             )
             logger.info(
                 "Start load Lora adapter. Lora name=%s, path=%s",
@@ -751,8 +766,10 @@ class TokenizerControlMixin:
                     "LoRA is not enabled. Please set `--enable-lora` to enable LoRA."
                 )
 
-            assert get_parallel().dp_size == 1, (
-                "data-parallel replicas are not supported for dynamic lora loading"
+            self._validate_dynamic_lora_supported()
+
+            assert get_parallel().dp_size == 1 or get_parallel().enable_dp_attention, (
+                "dp_size must be 1 or dp attention must be enabled for dynamic lora loading"
             )
             logger.info(
                 "Start load Lora adapter from tensors. Lora name=%s",
@@ -841,8 +858,10 @@ class TokenizerControlMixin:
                 "lora_name must be provided to unload LoRA adapter"
             )
 
-            assert get_parallel().dp_size == 1, (
-                "data-parallel replicas are not supported for dynamic lora loading"
+            self._validate_dynamic_lora_supported()
+
+            assert get_parallel().dp_size == 1 or get_parallel().enable_dp_attention, (
+                "dp_size must be 1 or dp attention must be enabled for dynamic lora loading"
             )
             logger.info(
                 "Start unload Lora adapter. Lora name=%s",
