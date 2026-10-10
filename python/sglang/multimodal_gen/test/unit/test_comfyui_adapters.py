@@ -56,3 +56,18 @@ def test_flux_pack_and_unpack_roundtrip() -> None:
 
     default = adapter.pack(x, timestep, context, y=y)
     assert default.guidance_scale == 3.5
+
+
+def test_flux_pack_and_unpack_roundtrip_odd_latent_size() -> None:
+    """Regression: a width/height not divisible by patch_size=2 (e.g. a
+    1032px-wide ComfyUI latent, 1032 // 8 = 129) raised a view() RuntimeError
+    in _pack_latents before it was padded like QwenImageAdapter."""
+    adapter = FluxAdapter()
+    x = torch.arange(1 * 16 * 8 * 9, dtype=torch.float32).reshape(1, 16, 8, 9)
+    timestep = torch.tensor([0.5])
+    context = torch.ones(1, 8, 4096)
+    y = torch.ones(1, 768)
+    packed = adapter.pack(x, timestep, context, y=y, guidance=torch.tensor([1.0]))
+    out = adapter.unpack(packed.latents, packed, x)
+    assert out.shape == x.shape
+    assert torch.equal(out, x)
