@@ -771,11 +771,12 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
     """
     probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
     probs_sum = torch.cumsum(probs_sort, dim=-1)
-    probs_sort[
+    probs_sort.masked_fill_(
         torch.arange(0, probs.shape[-1], device=probs.device).view(1, -1)
-        >= top_ks.view(-1, 1)
-    ] = 0.0
-    probs_sort[(probs_sum - probs_sort) > top_ps.view(-1, 1)] = 0.0
+        >= top_ks.view(-1, 1),
+        0.0,
+    )
+    probs_sort.masked_fill_((probs_sum - probs_sort) > top_ps.view(-1, 1), 0.0)
 
     if need_min_p_sampling:
         # TODO: probs_sort should be re-normalized for the use of multinomial_with_seed
@@ -783,7 +784,7 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
             "With sampling seed, multinomial_with_seed will provide wrong results"
         )
         min_p_thresholds = probs_sort[:, 0] * min_ps
-        probs_sort[probs_sort < min_p_thresholds.view(-1, 1)] = 0.0
+        probs_sort.masked_fill_(probs_sort < min_p_thresholds.view(-1, 1), 0.0)
 
     if sampling_seed is None:
         sampled_index = torch.multinomial(probs_sort, num_samples=1)
