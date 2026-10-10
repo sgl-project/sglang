@@ -755,6 +755,7 @@ class DeepseekMLARocmForwardMixin:
             or (
                 (not fuse_rope_for_trtllm_mla)
                 and (not self._skip_rope_for_dsa_tilelang_fused())
+                and (not self._skip_rope_for_dsa_aiter_fused_prep())
                 and (not self._skip_rope_for_aiter_fused_mla())
                 and (
                     not _use_aiter
@@ -830,7 +831,10 @@ class DeepseekMLARocmForwardMixin:
         save_kv_cache = True
 
         if self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
-            if self._skip_rope_for_dsa_tilelang_fused() and self.rotary_emb is not None:
+            if (
+                self._skip_rope_for_dsa_tilelang_fused()
+                or self._skip_rope_for_dsa_aiter_fused_prep()
+            ) and self.rotary_emb is not None:
                 if q_nope_unabsorbed is not None:
                     # prepare left the absorb to us: one kernel for the BMM,
                     # the RoPE and the KV write instead of two launches that
@@ -1109,6 +1113,13 @@ class DeepseekMLARocmForwardMixin:
                 get_exec().kernel.dsa_decode_backend in ("tilelang", "triton")
                 or get_exec().kernel.dsa_prefill_backend in ("tilelang", "triton")
             )
+        )
+
+    def _skip_rope_for_dsa_aiter_fused_prep(self: DeepseekV2AttentionMLA) -> bool:
+        return (
+            _use_aiter_gfx95
+            and self.current_attention_backend in ("dsa", "nsa")
+            and get_exec().kernel.dsa_decode_backend == "aiter"
         )
 
     def _skip_rope_for_aiter_fused_mla(self: DeepseekV2AttentionMLA) -> bool:

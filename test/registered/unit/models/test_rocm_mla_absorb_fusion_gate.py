@@ -90,6 +90,24 @@ class TestFusedAbsorbGate(CustomTestCase):
             with self.subTest(term=name):
                 self.assertFalse(_CAN_FUSE(_attn(**{name: broken})))
 
+    def test_aiter_uses_rope_cache_fusion_without_absorb_fusion(self):
+        backend = SimpleNamespace(
+            current_attention_backend="dsa",
+        )
+        backend._skip_rope_for_dsa_aiter_fused_prep = forward_mla_rocm.DeepseekMLARocmForwardMixin._skip_rope_for_dsa_aiter_fused_prep.__get__(
+            backend
+        )
+        saved = forward_mla_rocm.get_exec
+        forward_mla_rocm.get_exec = lambda: SimpleNamespace(
+            kernel=SimpleNamespace(dsa_decode_backend="aiter")
+        )
+        self.addCleanup(setattr, forward_mla_rocm, "get_exec", saved)
+
+        self.assertTrue(backend._skip_rope_for_dsa_aiter_fused_prep())
+        self.assertFalse(
+            _CAN_FUSE(_attn(_skip_rope_for_dsa_tilelang_fused=lambda: False))
+        )
+
 
 class TestAbsorbBmmConfig(CustomTestCase):
     def setUp(self):
