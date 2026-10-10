@@ -29,7 +29,7 @@ class TestRustServerExtension(CustomTestCase):
                 self.server.start_mm_workers(sentinel.spec, 8)
 
         scheduler = SimpleNamespace(
-            model_config=SimpleNamespace(is_multimodal=True),
+            model_config=SimpleNamespace(is_generation=True, is_multimodal=True),
         )
         with (
             patch.object(
