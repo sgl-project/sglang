@@ -194,7 +194,7 @@ def emit_transposed_bpreshuffle_scale(m: int, *, on_bpreshuffle_gfx95: bool) -> 
     zero-copy path is only taken on gfx95 bpreshuffle and only for M(tokens) >= 2:
     at M == 1 the ``[1, G]`` and ``[G, 1]`` byte orders coincide, so the transposed
     emit buys nothing and the materialize path is used. Centralizes the gate shared
-    by the MoE-down and MLA o_proj producer sites.
+    by the gfx95 bpreshuffle producer sites.
     """
     return on_bpreshuffle_gfx95 and m >= 2
 
@@ -232,6 +232,10 @@ if _use_aiter:
     )
 
     aiter_per1x128_quant = get_hip_quant(aiter.QuantType.per_1x128)
+    from sglang.kernels.ops.gemm.smallm_fp8_gfx950 import (
+        smallm_fp8_gemm,
+        smallm_fp8_gemm_supported,
+    )
 
 
 if _is_cuda:
@@ -489,6 +493,12 @@ if get_platform().is_blackwell and is_flashinfer_available():
     from flashinfer import mxfp8_quantize as _raw_flashinfer_mxfp8_quantize
     from flashinfer.gemm import gemm_fp8_nt_groupwise as _raw_gemm_fp8_nt_groupwise
 
+    from sglang.srt.layers.quantization.mxfp8_dispatch_cache import (
+        maybe_cache_mxfp8_dispatch,
+    )
+
+    _flashinfer_mm_mxfp8_impl = maybe_cache_mxfp8_dispatch(_raw_flashinfer_mm_mxfp8)
+
     @lru_cache(maxsize=1)
     def _get_flashinfer_groupwise_backend() -> str:
         if get_fp8_gemm_runner_backend().is_flashinfer_cutlass():
@@ -583,7 +593,7 @@ if get_platform().is_blackwell and is_flashinfer_available():
         use_8x4_sf_layout: bool = False,
         backend: str = "auto",
     ) -> torch.Tensor:
-        return _raw_flashinfer_mm_mxfp8(
+        return _flashinfer_mm_mxfp8_impl(
             q_input,
             weight_t,
             x_scale_u8,
@@ -868,13 +878,18 @@ def _deepgemm_w8a8_mxfp8_linear_with_fallback(
         sglang_per_token_group_quant_fp8,
     )
 
-    assert input_scale is None
-    output_dtype = input.dtype
+    pre_quantized = input_scale is not None
+    output_dtype = torch.bfloat16 if pre_quantized else input.dtype
 
     shape_supported = weight.shape[0] % 64 == 0 and weight.shape[1] % 128 == 0
     dtype_supported = output_dtype == torch.bfloat16
 
     if not (shape_supported and dtype_supported):
+        if pre_quantized:
+            raise ValueError(
+                "Pre-quantized DeepGEMM input requires N % 64 == 0 and K % 128 == 0; "
+                "its packed scales cannot be used by the FlashInfer fallback."
+            )
         if weight_scale_swizzled is None:
             raise RuntimeError(
                 f"DeepGEMM cannot serve this MXFP8 GEMM ({shape_supported=}, "
@@ -892,13 +907,32 @@ def _deepgemm_w8a8_mxfp8_linear_with_fallback(
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]
 
-    q_input, x_scale = sglang_per_token_group_quant_fp8(
-        input_2d,
-        32,
-        column_major_scales=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-        scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-        scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-    )
+    if pre_quantized:
+        m, k = input_2d.shape
+        if not (
+            deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+            and input.ndim == 2
+            and input.is_contiguous()
+            and input.dtype == torch.float8_e4m3fn
+            and input_scale.dtype == torch.int32
+            and input_scale.device == input.device
+            and input_scale.shape == (m, k // 128)
+            and input_scale.stride() == (1, ceil_align(m, 4))
+            and k == weight.shape[1]
+        ):
+            raise ValueError(
+                "Expected 2D contiguous FP8 input with packed, MN-major, "
+                "TMA-aligned UE8M0 scales for DeepGEMM MXFP8."
+            )
+        q_input, x_scale = input_2d, input_scale
+    else:
+        q_input, x_scale = sglang_per_token_group_quant_fp8(
+            input_2d,
+            32,
+            column_major_scales=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+            scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+            scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+        )
 
     # weight_scale format is set per-backend by _process_mxfp8_linear_weight_scale
     # (int32 packed TMA-aligned on Blackwell, float32 on Hopper); NOT uint8 — Triton form is routed to the fallback above.
@@ -2216,9 +2250,9 @@ def apply_fp8_linear(
     output_shape = [*input.shape[:-1], weight.shape[1]]
 
     # A pre-quantized fp8 activation (e.g. from a fused RMSNorm+quant kernel)
-    # carries no original dtype: skip re-quant, reuse the supplied per-tensor
-    # input_scale, and emit ``pre_quant_output_dtype`` (the model's activation
-    # dtype, propagated by the producer) or bf16 if it was not provided.
+    # carries no original dtype: skip re-quant, reuse its supplied per-tensor
+    # or per-token input scale, and emit ``pre_quant_output_dtype`` (the model's
+    # activation dtype, propagated by the producer) or bf16 if omitted.
     input_prequantized = input_2d.dtype in (
         torch.float8_e4m3fn,
         torch.float8_e4m3fnuz,
@@ -2246,9 +2280,16 @@ def apply_fp8_linear(
     )
 
     if input_prequantized:
-        assert input_scale is not None and input_scale.numel() == 1
+        assert input_scale is not None and input_scale.numel() in (
+            1,
+            input_2d.shape[0],
+        )
         qinput = input_2d
-        if channelwise_cutlass and not native_scalar_a_scale:
+        if (
+            input_scale.numel() == 1
+            and channelwise_cutlass
+            and not native_scalar_a_scale
+        ):
             # Unsupported CUTLASS epilogues require one A scale per row.
             x_scale = input_scale.repeat(input_2d.shape[0]).view(-1, 1)
         else:
@@ -2390,7 +2431,12 @@ def apply_fp8_linear(
             # x_scale -> input scale tensor, shape = (m, 1)
             # w_scale -> weight scale tensor, shape = (n ,1)
             # dtype -> output dtype
-            output = gemm_a8w8_bpreshuffle(
+            gemm = (
+                smallm_fp8_gemm
+                if smallm_fp8_gemm_supported(qinput, weight.T, x_scale, output_dtype)
+                else gemm_a8w8_bpreshuffle
+            )
+            output = gemm(
                 XQ=qinput,
                 WQ=weight.T,
                 x_scale=x_scale,
