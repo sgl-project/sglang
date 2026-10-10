@@ -497,12 +497,23 @@ def test_decode_cta_count_stays_within_available_chunks(
     assert cta_count <= max(1024, num_queries * 4)
 
 
-@pytest.mark.parametrize("num_queries", [1, 1536])
-def test_decode_schedule_matches_aiter_varctx_schedule(num_queries: int) -> None:
+@pytest.mark.parametrize("num_queries", [1, 200])
+def test_decode_schedule_matches_aiter_varctx_schedule(
+    num_queries: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """The in-tree decode schedule writes AITER compute_varctx_schedule's cta_info rows and
-    split factor, including zero-length rows and prefix sums carried across row blocks."""
+    split factor, including zero-length rows and prefix sums carried across row blocks.
+
+    The row block is shrunk so 200 rows span four blocks. Crossing the production block
+    (1024) needs over a thousand rows, and AITER's reference kernel holds a [256, rows]
+    tile; at 2048 it spent ~9 minutes compiling on the ROCm 10 image."""
     from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4 import (
         compute_varctx_schedule,
+    )
+
+    monkeypatch.setattr(
+        "sglang.kernels.ops.attention.dsv4.fp4_indexer_schedule_hip._DECODE_ROW_BLOCK",
+        64,
     )
 
     torch.manual_seed(num_queries)
