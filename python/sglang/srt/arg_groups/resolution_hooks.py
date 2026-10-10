@@ -19,6 +19,7 @@ _OVERRIDABLE_HOOKS: FrozenSet[str] = frozenset(
         "handle_media_url_security",
         "handle_hicache_ratio_default",
         "handle_offload_compatibility",
+        "validate_schedule_policy",
         "validate_prefill_decode_interval",
         "default_unset_prefill_decode_interval",
         "validate_response_store",

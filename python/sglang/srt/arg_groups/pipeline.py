@@ -81,8 +81,10 @@ def run_resolution_pipeline(server_args: Any) -> None:
         validate_prefill_decode_interval,
         validate_response_store,
         validate_sampling_mask_max_tokens,
+        validate_schedule_policy,
     )
 
+    run_hook(validate_schedule_policy, server_args)
     run_hook(validate_prefill_decode_interval, server_args)
     run_hook(validate_response_store, server_args)
     run_hook(validate_sampling_mask_max_tokens, server_args)
