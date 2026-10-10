@@ -2,8 +2,8 @@ import logging
 import os
 import time
 import uuid
-from dataclasses import dataclass
-from typing import Any, List, Optional
+from dataclasses import dataclass, replace
+from typing import Any, Iterator, List, Optional
 
 import torch
 
@@ -580,6 +580,39 @@ class HiCacheNixl(HiCacheStorage):
         key_strs = self._get_component_keys(keys, transfer.name)
         return host_pool, key_strs, host_buffers, page_offsets, 1
 
+    def _iter_bounded_pool_transfers(
+        self, transfer: PoolTransfer
+    ) -> Iterator[PoolTransfer]:
+        """Split bounce-backed hybrid I/O to the registered buffer capacity.
+
+        Zero-copy pools can describe the complete transfer directly. Bounce-backed
+        pools reuse a fixed ``STORAGE_BATCH_SIZE`` staging area, so each yielded
+        descriptor must fit that area. ``host_indices`` contains ``page_size``
+        entries per logical storage key and is sliced on the same page boundary.
+
+        Leave malformed transfers intact so ``_prepare_pool_transfer`` rejects the
+        complete operation before any partial I/O is issued.
+        """
+        ctx = self._hybrid_pool_ctx.get(transfer.name)
+        keys = transfer.keys or []
+        if ctx is None or ctx.is_zero_copy or len(keys) <= STORAGE_BATCH_SIZE:
+            yield transfer
+            return
+
+        host_indices = transfer.host_indices
+        page_size = getattr(ctx.host_pool, "page_size", 1) or 1
+        if host_indices is None or host_indices.numel() != len(keys) * page_size:
+            yield transfer
+            return
+
+        for start in range(0, len(keys), STORAGE_BATCH_SIZE):
+            end = min(start + STORAGE_BATCH_SIZE, len(keys))
+            yield replace(
+                transfer,
+                keys=keys[start:end],
+                host_indices=host_indices[start * page_size : end * page_size],
+            )
+
     def _alloc_registered(
         self,
         page_numel: int,
@@ -943,6 +976,43 @@ class HiCacheNixl(HiCacheStorage):
             for i in range(0, len(results), key_multiplier)
         ]
 
+    def _normalize_pool_transfer_results(
+        self,
+        raw_results: List[bool],
+        expected_components: int,
+        expected_pages: int,
+        key_multiplier: int,
+        pool_name: PoolName,
+    ) -> List[bool]:
+        """Validate component results and return a contiguous page prefix."""
+        if len(raw_results) != expected_components:
+            logger.error(
+                "HiCacheNixl: hybrid pool %s result length mismatch: "
+                "expected %s components, got %s",
+                pool_name,
+                expected_components,
+                len(raw_results),
+            )
+            return [False] * expected_pages
+
+        page_results = [
+            bool(result) for result in self._page_results(raw_results, key_multiplier)
+        ]
+        if len(page_results) != expected_pages:
+            logger.error(
+                "HiCacheNixl: hybrid pool %s page result length mismatch: "
+                "expected %s pages, got %s",
+                pool_name,
+                expected_pages,
+                len(page_results),
+            )
+            return [False] * expected_pages
+
+        if False in page_results:
+            first_failure = page_results.index(False)
+            page_results[first_failure:] = [False] * (expected_pages - first_failure)
+        return page_results
+
     def batch_get_v2(
         self,
         transfers: List[PoolTransfer],
@@ -950,35 +1020,51 @@ class HiCacheNixl(HiCacheStorage):
     ) -> dict[str, List[bool]]:
         results: dict[str, List[bool]] = {}
         for transfer in transfers:
-            host_pool, key_strs, host_buffers, page_offsets, key_multiplier = (
-                self._prepare_pool_transfer(transfer, for_write=False)
-            )
-            if host_pool is None or not key_strs:
-                results[transfer.name] = [False] * len(transfer.keys or [])
-                continue
+            pool_results: List[bool] = []
+            total_pages = len(transfer.keys or [])
+            for bounded in self._iter_bounded_pool_transfers(transfer):
+                host_pool, key_strs, host_buffers, page_offsets, key_multiplier = (
+                    self._prepare_pool_transfer(bounded, for_write=False)
+                )
+                batch_pages = len(bounded.keys or [])
+                if host_pool is None or not key_strs:
+                    pool_results.extend([False] * batch_pages)
+                    break
 
-            start_time = time.perf_counter()
-            transfer_results = self._batch_xfer(
-                key_strs, key_strs, host_buffers, "READ"
-            )
-            elapsed_ms = (time.perf_counter() - start_time) * 1000
-            self._log_xfer_stats(
-                f"batch_get_v2[{transfer.name}]",
-                len(transfer.keys or []),
-                transfer.host_indices,
-                [size for _, size in host_buffers],
-                elapsed_ms,
-            )
-            ctx = self._hybrid_pool_ctx[transfer.name]
-            page_results = self._page_results(transfer_results, key_multiplier)
-            if not ctx.is_zero_copy:
-                for ok, page_offset, data_page in zip(
-                    page_results, page_offsets, ctx.bounce_get
-                ):
-                    if not ok:
-                        break
-                    host_pool.set_from_flat_data_page(page_offset, data_page)
-            results[transfer.name] = page_results
+                start_time = time.perf_counter()
+                transfer_results = self._batch_xfer(
+                    key_strs, key_strs, host_buffers, "READ"
+                )
+                elapsed_ms = (time.perf_counter() - start_time) * 1000
+                self._log_xfer_stats(
+                    f"batch_get_v2[{transfer.name}]",
+                    batch_pages,
+                    bounded.host_indices,
+                    [size for _, size in host_buffers],
+                    elapsed_ms,
+                )
+                ctx = self._hybrid_pool_ctx[transfer.name]
+                page_results = self._normalize_pool_transfer_results(
+                    transfer_results,
+                    len(key_strs),
+                    batch_pages,
+                    key_multiplier,
+                    transfer.name,
+                )
+                if not ctx.is_zero_copy:
+                    for ok, page_offset, data_page in zip(
+                        page_results, page_offsets, ctx.bounce_get
+                    ):
+                        if not ok:
+                            break
+                        host_pool.set_from_flat_data_page(page_offset, data_page)
+                pool_results.extend(page_results)
+                if len(page_results) != batch_pages or not all(page_results):
+                    break
+
+            if len(pool_results) < total_pages:
+                pool_results.extend([False] * (total_pages - len(pool_results)))
+            results[transfer.name] = pool_results
         return results
 
     def batch_set_v2(
@@ -988,26 +1074,41 @@ class HiCacheNixl(HiCacheStorage):
     ) -> dict[str, List[bool]]:
         results: dict[str, List[bool]] = {}
         for transfer in transfers:
-            _, key_strs, host_buffers, _, key_multiplier = self._prepare_pool_transfer(
-                transfer, for_write=True
-            )
-            if not key_strs:
-                results[transfer.name] = [False] * len(transfer.keys or [])
-                continue
+            pool_results: List[bool] = []
+            total_pages = len(transfer.keys or [])
+            for bounded in self._iter_bounded_pool_transfers(transfer):
+                _, key_strs, host_buffers, _, key_multiplier = (
+                    self._prepare_pool_transfer(bounded, for_write=True)
+                )
+                batch_pages = len(bounded.keys or [])
+                if not key_strs:
+                    pool_results.extend([False] * batch_pages)
+                    break
 
-            start_time = time.perf_counter()
-            transfer_results = self._batch_xfer(
-                key_strs, key_strs, host_buffers, "WRITE"
-            )
-            elapsed_ms = (time.perf_counter() - start_time) * 1000
-            self._log_xfer_stats(
-                f"batch_set_v2[{transfer.name}]",
-                len(transfer.keys or []),
-                transfer.host_indices,
-                [size for _, size in host_buffers],
-                elapsed_ms,
-            )
-            results[transfer.name] = self._page_results(
-                transfer_results, key_multiplier
-            )
+                start_time = time.perf_counter()
+                transfer_results = self._batch_xfer(
+                    key_strs, key_strs, host_buffers, "WRITE"
+                )
+                elapsed_ms = (time.perf_counter() - start_time) * 1000
+                self._log_xfer_stats(
+                    f"batch_set_v2[{transfer.name}]",
+                    batch_pages,
+                    bounded.host_indices,
+                    [size for _, size in host_buffers],
+                    elapsed_ms,
+                )
+                page_results = self._normalize_pool_transfer_results(
+                    transfer_results,
+                    len(key_strs),
+                    batch_pages,
+                    key_multiplier,
+                    transfer.name,
+                )
+                pool_results.extend(page_results)
+                if len(page_results) != batch_pages or not all(page_results):
+                    break
+
+            if len(pool_results) < total_pages:
+                pool_results.extend([False] * (total_pages - len(pool_results)))
+            results[transfer.name] = pool_results
         return results
