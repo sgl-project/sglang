@@ -42,6 +42,7 @@ from sglang.multimodal_gen.test.test_utils import (
 )
 from sglang.srt.environ import envs
 
+
 @dataclass
 class ToleranceConfig:
     """Tolerance ratios for performance validation."""
