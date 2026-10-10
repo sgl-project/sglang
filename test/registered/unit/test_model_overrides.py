@@ -1764,6 +1764,30 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             (self._publish(sa), self._leaf("attention_backend"))[1], "flashinfer"
         )
 
+    def test_dllm_refuses_unsupported_features_at_launch(self):
+        """These features crash a dLLM server on its first request, so the
+        launch must fail instead and name the flag."""
+        cases = [
+            ("--speculative-algorithm", {"speculative_algorithm": "NGRAM"}),
+            (
+                "--enable-deterministic-inference",
+                {"enable_deterministic_inference": True},
+            ),
+            ("--enable-two-batch-overlap", {"enable_two_batch_overlap": True}),
+        ]
+        for flag, server_kwargs in cases:
+            with self.subTest(flag=flag):
+                with self.assertRaisesRegex(
+                    ValueError, f"{flag} is not supported with diffusion LLM"
+                ):
+                    self._construct(
+                        "SDARForCausalLM",
+                        "llama",
+                        dllm_algorithm="LowConfidence",
+                        disable_radix_cache=True,
+                        **server_kwargs,
+                    )
+
     def test_attention_backend_leaf_materializes_end_state(self):
         # The default-fill pass declares the platform-selected backend; the
         # leaf must equal the last declared value while the server_args field

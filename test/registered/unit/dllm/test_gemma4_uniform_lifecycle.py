@@ -367,6 +367,15 @@ class TestGemma4RequestValidation(unittest.TestCase):
         return SchedulerDllmMixin.validate_dllm_request(scheduler, req)
 
     def test_logprob_rejection_never_enters_the_generation_queue(self):
+        """No dLLM algorithm fills logprobs, so a logprob request must get a 400
+        before any queue instead of a reply with empty logprobs."""
+        from sglang.srt.dllm.algorithm import algo_name_to_cls
+
+        for algorithm in algo_name_to_cls:
+            with self.subTest(algorithm=algorithm):
+                self._assert_logprob_request_rejected(algorithm)
+
+    def _assert_logprob_request_rejected(self, algorithm):
         from sglang.srt.disaggregation.utils import DisaggregationMode
         from sglang.srt.managers.io_struct import AbortReq
         from sglang.srt.managers.scheduler import Scheduler
@@ -379,6 +388,7 @@ class TestGemma4RequestValidation(unittest.TestCase):
         scheduler.metrics_reporter = SimpleNamespace(enable_metrics=False)
         scheduler.tokenizer = None
         scheduler.dllm_config = _Scheduler(fdfo=False).dllm_config
+        scheduler.dllm_config.algorithm = algorithm
         scheduler._maybe_namespace_elastic_radix_cache = Mock()
         scheduler._add_request_to_queue = Mock()
         scheduler.init_req_max_new_tokens = Mock()
