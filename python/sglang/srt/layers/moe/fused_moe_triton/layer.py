@@ -102,14 +102,18 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _deferred_finalize_info_logged = False
 
 
+def _nvfp4_backend_is_marlin(quant_method) -> bool:
+    """Marlin, or the LoRA MoE runner on its Marlin NVFP4 vendor."""
+    backend = getattr(quant_method, "_moe_runner_backend", get_moe_runner_backend())
+    return backend.is_marlin() or backend.is_lora_marlin()
+
+
 def _fuses_routed_scaling_factor_in_topk(quant_method) -> bool:
     return (
         getattr(quant_method, "fuse_routed_scaling_factor_in_topk", False)
         or (
             isinstance(quant_method, ModelOptNvFp4FusedMoEMethod)
-            and not getattr(
-                quant_method, "_moe_runner_backend", get_moe_runner_backend()
-            ).is_marlin()
+            and not _nvfp4_backend_is_marlin(quant_method)
         )
         or (
             isinstance(quant_method, Fp8MoEMethod)
@@ -419,7 +423,11 @@ class FusedMoE(torch.nn.Module):
             get_moe_runner_backend().is_flashinfer_trtllm()
             or get_moe_runner_backend().is_flashinfer_trtllm_routed()
         )
-        self.use_deep_gemm = get_moe_runner_backend().is_deep_gemm()
+        # LoRA providers use DeepGEMM's resident weight layout and preparation.
+        self.use_deep_gemm = (
+            get_moe_runner_backend().is_deep_gemm()
+            or get_moe_runner_backend().is_lora()
+        )
 
         # flashinfer_trtllm kernel requires intermediate_size to be a multiple of 128
         # Pad the intermediate_size_per_partition if necessary

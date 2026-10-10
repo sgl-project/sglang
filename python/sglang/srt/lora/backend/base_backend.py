@@ -79,6 +79,9 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
             "prepare_global_lora_batch() to support DP attention."
         )
 
+    def reset_routing_cache(self) -> None:
+        """Clear cached routes without changing batch metadata or storage."""
+
     def validate_lora_targets(
         self,
         base_model: torch.nn.Module,
@@ -208,7 +211,7 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         """
         pass
 
-    def init_cuda_graph_batch_info(
+    def init_decode_cuda_graph_batch_info(
         self,
         max_bs_in_cuda_graph: int,
         num_tokens_per_req: int,

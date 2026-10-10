@@ -146,7 +146,7 @@ class LoRAManager:
             lora_paths=lora_paths,
         )
 
-    def init_cuda_graph_batch_info(
+    def init_decode_cuda_graph_batch_info(
         self, max_bs_in_cuda_graph: int, num_tokens_per_req: int
     ):
         """Phase 2 of LoRA CUDA graph init: dense LoRA batch metadata.
@@ -155,7 +155,7 @@ class LoRAManager:
         Phase 1 (MoE buffers) is handled earlier via init_cuda_graph_moe_buffers().
         """
         self.max_bs_in_cuda_graph = max_bs_in_cuda_graph
-        self.lora_backend.init_cuda_graph_batch_info(
+        self.lora_backend.init_decode_cuda_graph_batch_info(
             max_bs_in_cuda_graph=max_bs_in_cuda_graph,
             num_tokens_per_req=num_tokens_per_req,
         )
@@ -252,7 +252,7 @@ class LoRAManager:
         """Phase 1 of LoRA CUDA graph init: MoE intermediate buffers.
 
         Called before init_memory_pool() so memory profiling accounts for them.
-        Phase 2 (dense batch metadata) is handled later via init_cuda_graph_batch_info().
+        Phase 2 (dense batch metadata) is handled later via init_decode_cuda_graph_batch_info().
         """
         self.lora_backend.init_cuda_graph_moe_buffers(
             max_bs=max_bs,
@@ -478,6 +478,9 @@ class LoRAManager:
         take the base path instead of reading the previous batch's stale
         metadata."""
         self.lora_backend.reset_batch_state()
+
+    def reset_routing_cache(self) -> None:
+        self.lora_backend.reset_routing_cache()
 
     def prepare_lora_batch(self, forward_batch: ForwardBatch):
         # Some internal-only backends (currently UNO) use explicit token-row
@@ -1165,7 +1168,7 @@ def init_lora_cuda_graph_moe_buffers(
     lora_backend) since they execute sequentially during forward.
 
     Phase 2 (dense LoRA batch metadata) is handled later in
-    CudaGraphRunner.__init__() via lora_manager.init_cuda_graph_batch_info(),
+    CudaGraphRunner.__init__() via lora_manager.init_decode_cuda_graph_batch_info(),
     because it needs capture-time parameters (max_bs, num_tokens_per_req)
     that are only available at that stage.
     """
