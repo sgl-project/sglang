@@ -720,6 +720,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
     ) -> torch.Tensor:
         return self._binding.collect_full_device_indices(from_node_id, until_node_id)
 
+    def full_device_path_len(self, from_node_id: NodeId, until_node_id: NodeId) -> int:
+        return self._binding.full_device_path_len(from_node_id, until_node_id)
+
     def begin_insert(self, params: InsertParams) -> InsertStepResult:
         key = params.key
         key_buffer = _radix_key_buffer(key)

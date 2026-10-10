@@ -1056,6 +1056,17 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         prefix_chunks.reverse()
         return torch.cat(prefix_chunks)
 
+    def full_device_path_len(self, from_node_id: NodeId, until_node_id: NodeId) -> int:
+        until_node = self.node_by_id(until_node_id)
+        length = 0
+        node = self.node_by_id(from_node_id)
+        while node is not until_node:
+            value = node.component_data[BASE_COMPONENT_TYPE].value
+            assert value is not None
+            length += len(value)
+            node = node.parent
+        return length
+
     def _touch_node(self, node: UnifiedTreeNode):
         node.last_access_time = get_and_increase_time_counter()
         if node != self.root_node:

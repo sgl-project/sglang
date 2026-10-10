@@ -1491,6 +1491,25 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         Ok(Tensor::cat(&prefix_chunks, 0))
     }
 
+    /// Length of what `collect_full_device_indices` would return, without
+    /// concatenating the values.
+    pub fn full_device_path_len(
+        &self,
+        from_node_id: NodeId,
+        until_node_id: NodeId,
+    ) -> Result<usize, NodeAccessError> {
+        let from_node_id = self.arena.resolve(from_node_id)?;
+        let until_node_id = self.arena.resolve(until_node_id)?;
+        let mut len = 0;
+        let mut node_id = from_node_id;
+        while node_id != until_node_id {
+            let node = self.arena.node(node_id);
+            len += node.device_value_len(FULL);
+            node_id = node.parent();
+        }
+        Ok(len)
+    }
+
     /// Refresh a node's access tick and component LRU positions.
     pub fn touch_node_(&mut self, node_id: NodeIdx_) {
         let tick = self.arena.get_and_bump_access_counter();
