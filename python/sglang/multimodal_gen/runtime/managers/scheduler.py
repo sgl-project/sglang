@@ -665,7 +665,10 @@ class Scheduler(
         pipeline cannot keep per-request inside a merged dynamic batch."""
         if self.server_args.pipeline_config.supports_batching_image_conditioning():
             return False
-        return base_req.image_path is not None or candidate_req.image_path is not None
+        return (
+            getattr(base_req, "image_path", None) is not None
+            or getattr(candidate_req, "image_path", None) is not None
+        )
 
     def _requires_sequential_multi_output(self, *reqs: Req) -> bool:
         pipeline_config = self.server_args.pipeline_config

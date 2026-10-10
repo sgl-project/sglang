@@ -236,3 +236,30 @@ def test_unsupported_stateful_or_multioutput_requests_use_ordinary_path(field, v
     req = Request("a")
     setattr(req, field, value)
     assert scheduler._is_pi05_segment_request(req) is False
+
+
+def test_real_action_requests_can_reach_dynamic_batch_admission(monkeypatch):
+    from sglang.multimodal_gen.configs.pipeline_configs.pi05 import Pi05PipelineConfig
+    from sglang.multimodal_gen.configs.sample.pi05 import Pi05SamplingParams
+    from sglang.multimodal_gen.runtime.managers.scheduler import (
+        Scheduler as ProductionScheduler,
+    )
+    from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+
+    monkeypatch.setattr(module, "Req", Req)
+    scheduler = ProductionScheduler.__new__(ProductionScheduler)
+    config = Pi05PipelineConfig()
+    scheduler.server_args = SimpleNamespace(pipeline_config=config)
+    a = Req(sampling_params=Pi05SamplingParams(prompt="a", num_inference_steps=3))
+    b = Req(sampling_params=Pi05SamplingParams(prompt="b", num_inference_steps=5))
+    a.extra["vla"] = {}
+    b.extra["vla"] = {}
+    assert scheduler._can_dynamic_batch(a, a)
+    assert not scheduler._can_dynamic_batch(a, b)
+    config.enable_segmented_actions = True
+    for req in (a, b):
+        req._dynamic_batch_sig = None
+    assert scheduler._can_dynamic_batch(a, b)
+    assert scheduler._has_unbatchable_image_conditioning(a, b) is False
+    a.image_path = "image.png"
+    assert scheduler._has_unbatchable_image_conditioning(a, b) is True
