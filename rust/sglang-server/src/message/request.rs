@@ -263,24 +263,11 @@ pub fn into_requests(req: api_v1::GenerateRequest) -> Result<(Vec<GenerateReques
     let top_logprobs_nums = fan_out(top_logprobs_num, n, "top_logprobs_num")?;
     let return_hidden = fan_out(return_hidden_states, n, "return_hidden_states")?;
 
-    // PD fields fan out like Python `_normalize_bootstrap_params`: scalars
-    // broadcast — except a scalar `bootstrap_room`, which becomes `room + i`
-    // (each item needs a distinct room; rooms are the P↔D pairing key).
-    // `fan_out` yields `Option<Option<T>>` for these nullable elements
-    // (outer: absent, inner: an explicit `null` element) — flatten, both
-    // mean "not set" downstream.
-    let bootstrap_hosts = flatten_column(fan_out(bootstrap_host, n, "bootstrap_host")?);
-    let bootstrap_ports = flatten_column(fan_out(bootstrap_port, n, "bootstrap_port")?);
-    let bootstrap_rooms = match bootstrap_room {
-        // `wrapping_add`, not `checked_`: rooms are drawn from `[0, 2^63)`,
-        // so a batch can only overflow by starting within `n` of `i64::MAX`
-        // — and distinct-but-wrapped still pairs P↔D, where saturating
-        // would collide every item onto one room.
-        Some(OneOrMany::One(Some(room))) => {
-            (0..n).map(|i| Some(room.wrapping_add(i as i64))).collect()
-        }
-        other => flatten_column(fan_out(other, n, "bootstrap_room")?),
-    };
+    let BootstrapColumns {
+        bootstrap_hosts,
+        bootstrap_ports,
+        bootstrap_rooms,
+    } = normalize_bootstrap_columns(bootstrap_host, bootstrap_port, bootstrap_room, n)?;
     let bootstrap_pair_keys = flatten_column(fan_out(bootstrap_pair_key, n, "bootstrap_pair_key")?);
     let decode_tp_sizes = flatten_column(fan_out(decode_tp_size, n, "decode_tp_size")?);
     // `mm_hashes` has no batch form: honoring it only here would give the two
@@ -625,7 +612,7 @@ fn flatten_column<T>(column: Vec<Option<Option<T>>>) -> Vec<Option<T>> {
 }
 
 /// Reject a broadcast whose clones would exceed [`MAX_BROADCAST_CLONE_BYTES`].
-pub(super) fn check_broadcast_budget(per_clone: usize, n: usize, name: &str) -> Result<(), Error> {
+pub(crate) fn check_broadcast_budget(per_clone: usize, n: usize, name: &str) -> Result<(), Error> {
     // `n == 1` is not a broadcast — there is one value and one prompt, so nothing
     // is duplicated. Charging it here rejected ordinary single requests with a
     // message about a batch they never sent.
@@ -664,6 +651,39 @@ fn fan_out<T: OneOrManyItem + Clone + HeapBytes>(
             Ok(v.into_iter().map(Some).collect())
         }
     }
+}
+
+/// Bootstrap metadata columns with matching lengths.
+pub(crate) struct BootstrapColumns {
+    pub(crate) bootstrap_hosts: Vec<Option<String>>,
+    pub(crate) bootstrap_ports: Vec<Option<i64>>,
+    pub(crate) bootstrap_rooms: Vec<Option<i64>>,
+}
+
+/// Normalize native and OpenAI bootstrap fields after wire decoding.
+/// Missing values and null elements stay unset; lists must match the prompt count.
+/// Scalars broadcast, except rooms advance once per prompt.
+pub(crate) fn normalize_bootstrap_columns(
+    hosts: Option<OneOrMany<Option<String>>>,
+    ports: Option<OneOrMany<Option<i64>>>,
+    rooms: Option<OneOrMany<Option<i64>>>,
+    prompt_count: usize,
+) -> Result<BootstrapColumns, Error> {
+    let bootstrap_hosts = flatten_column(fan_out(hosts, prompt_count, "bootstrap_host")?);
+    let bootstrap_ports = flatten_column(fan_out(ports, prompt_count, "bootstrap_port")?);
+    let bootstrap_rooms = match rooms {
+        // Wrapping preserves distinct pairing keys at the i64 boundary;
+        // saturating would make multiple requests share a room.
+        Some(OneOrMany::One(Some(room))) => (0..prompt_count)
+            .map(|i| Some(room.wrapping_add(i as i64)))
+            .collect(),
+        other => flatten_column(fan_out(other, prompt_count, "bootstrap_room")?),
+    };
+    Ok(BootstrapColumns {
+        bootstrap_hosts,
+        bootstrap_ports,
+        bootstrap_rooms,
+    })
 }
 
 #[cfg(test)]
