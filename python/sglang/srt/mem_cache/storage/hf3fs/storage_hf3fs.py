@@ -21,6 +21,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
     PoolTransferResult,
+    mla_tp_shard_tag,
 )
 from sglang.srt.mem_cache.pool_host import HostKVCache
 from sglang.srt.mem_cache.storage.hf3fs.hf3fs_client import Hf3fsClient
@@ -201,8 +202,11 @@ class HiCacheHF3FS(HiCacheStorage):
         is_page_first_layout: bool = False,
         use_mock_client: bool = False,
         enable_storage_metrics: bool = False,
+        tp_size: int = 1,
     ):
         self.rank = rank
+        self.tp_rank = rank
+        self.tp_size = tp_size
         self.file_path = file_path
         self.file_size = file_size
         self.numjobs = numjobs
@@ -374,6 +378,7 @@ class HiCacheHF3FS(HiCacheStorage):
             is_page_first_layout=is_page_first_layout,
             use_mock_client=use_mock_client,
             enable_storage_metrics=storage_config.enable_storage_metrics,
+            tp_size=storage_config.tp_size,
         )
 
     def _batch_get(
@@ -694,7 +699,9 @@ class HiCacheHF3FS(HiCacheStorage):
                 final_pages = 0
                 break
 
-            component_keys = [f"{key}_{pool_name}" for key in keys[:kv_pages]]
+            component_keys = [
+                self._pool_component_key(key, pool_name) for key in keys[:kv_pages]
+            ]
             exists_results = self.metadata_client.exists(
                 self.rank, component_keys, namespace=ctx.namespace
             )
@@ -730,7 +737,7 @@ class HiCacheHF3FS(HiCacheStorage):
         page_size = getattr(host_pool, "page_size", 1) or 1
         page_num = len(keys)
 
-        component_keys = [f"{key}_{pool_name}" for key in keys]
+        component_keys = [self._pool_component_key(key, pool_name) for key in keys]
         page_indices = self.metadata_client.get_page_indices(
             self.rank, component_keys, namespace=ctx.namespace
         )
@@ -779,6 +786,10 @@ class HiCacheHF3FS(HiCacheStorage):
 
         return results
 
+    def _pool_component_key(self, key: str, pool_name: PoolName) -> str:
+        tag = mla_tp_shard_tag(self.is_mla_model, self.tp_rank, self.tp_size, pool_name)
+        return f"{key}_{pool_name}_{tag}" if tag else f"{key}_{pool_name}"
+
     def _pool_batch_set(self, transfer: PoolTransfer) -> List[bool]:
         pool_name = transfer.name
         ctx = self._pool_storage_ctx[pool_name]
@@ -788,7 +799,7 @@ class HiCacheHF3FS(HiCacheStorage):
         page_size = getattr(host_pool, "page_size", 1) or 1
         page_num = len(keys)
 
-        component_keys = [f"{key}_{pool_name}" for key in keys]
+        component_keys = [self._pool_component_key(key, pool_name) for key in keys]
         key_with_prefix = [(k, "") for k in component_keys]
         indices = self.metadata_client.reserve_and_allocate_page_indices(
             self.rank, key_with_prefix, namespace=ctx.namespace

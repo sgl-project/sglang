@@ -88,6 +88,13 @@ class PoolName(str, Enum):
         return self.value
 
 
+def mla_tp_shard_tag(is_mla_model: bool, tp_rank: int, tp_size: int, pool_name) -> str:
+    """Key tag for MLA Mamba state, which every TP rank backs up (see should_backup)."""
+    if is_mla_model and pool_name == PoolName.MAMBA:
+        return f"tp{tp_rank}_{tp_size}"
+    return ""
+
+
 class PoolHitPolicy(str, Enum):
     """Hit policy for batch_exists_v2 per-pool prefix matching.
 
@@ -399,7 +406,8 @@ class HiCacheFile(HiCacheStorage):
         enable_pp = pp_size > 1
         self._is_mla_model = is_mla_model
         self._tp_rank = tp_rank
-        self._mamba_tp_suffix = f".mamba.tp{tp_rank}_{tp_size}"
+        mamba_tag = mla_tp_shard_tag(True, tp_rank, tp_size, PoolName.MAMBA)
+        self._mamba_tp_suffix = f".mamba.{mamba_tag}"
         self.config_suffix = f"_{model_name}"
         if not is_mla_model:
             self.config_suffix += f"_{tp_rank}_{tp_size}"

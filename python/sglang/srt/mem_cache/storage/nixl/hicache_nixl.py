@@ -17,6 +17,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
     PoolTransferResult,
+    mla_tp_shard_tag,
 )
 from sglang.srt.mem_cache.pool_host import HostKVCache
 from sglang.srt.mem_cache.storage.mmap import alloc_mmap
@@ -185,12 +186,21 @@ class HiCacheNixl(HiCacheStorage):
     def _get_suffixed_key(self, key: str) -> str:
         return key + self.config_suffix
 
+    def _get_pool_key_base(self, key: str, pool_name: PoolName) -> str:
+        tag = mla_tp_shard_tag(
+            self.is_mla_model,
+            self.storage_config.tp_rank,
+            self.storage_config.tp_size,
+            pool_name,
+        )
+        return self._get_suffixed_key(key) + (f"_{tag}" if tag else "")
+
     def _get_component_key(
         self, key: str, component_name: Optional[PoolName] = None
     ) -> str:
         if component_name in (None, PoolName.KV):
             return self._get_suffixed_key(key)
-        return f"{self._get_suffixed_key(key)}_{component_name}"
+        return f"{self._get_pool_key_base(key, component_name)}_{component_name}"
 
     def _get_component_keys(
         self, keys: List[str], pool_name: Optional[PoolName] = None
@@ -213,7 +223,7 @@ class HiCacheNixl(HiCacheStorage):
             suffixes = [f"_{pool_name}_{i}" for i in range(key_multiplier)]
 
         return [
-            f"{self._get_suffixed_key(key)}{suffix}"
+            f"{self._get_pool_key_base(key, pool_name)}{suffix}"
             for key in keys
             for suffix in suffixes
         ]
