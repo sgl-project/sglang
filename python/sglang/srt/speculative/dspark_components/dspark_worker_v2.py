@@ -1,4 +1,5 @@
 import logging
+import os
 from typing import TYPE_CHECKING, Callable, Optional, Protocol, runtime_checkable
 
 import torch
@@ -25,6 +26,7 @@ from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
     get_parallel,
+    get_platform,
     get_schedule,
     get_spec,
     mamba_track_grid,
@@ -188,19 +190,37 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         # Inside the draft scope the context answers the draft's narrowed rank.
         self._target_tp_rank = get_parallel().tp_rank
-        with draft_pp_context(), self._draft_context():
-            bundle = build_draft_tp_worker(
-                server_args=server_args,
-                gpu_id=gpu_id,
-                nccl_port=nccl_port,
-                target_model_config=target_worker.model_runner.model_config,
-                algo_label="DSPARK",
-                attention_backend_override=(
-                    DSV4_DRAFT_ATTENTION_BACKEND if self._draft_is_moe else None
-                ),
-                draft_worker_cls=draft_worker_cls,
-                random_seed=target_worker.random_seed,
-            )
+        # The target backend is already constructed, so this env only reaches
+        # the draft. DSpark's mask is causal (custom_mask is None); aiter's
+        # non-MLA verify uses unified_attention only when this is set, which
+        # is the kernel ATOM runs instead of triton _verify_mla_prefix_stage1.
+        draft_attn = get_spec().speculative_draft_attention_backend
+        enable_draft_unified = (
+            get_platform().is_hip and not self._draft_is_moe and draft_attn == "aiter"
+        )
+        prev_unified = os.environ.get("SGLANG_USE_AITER_UNIFIED_ATTN")
+        if enable_draft_unified:
+            os.environ["SGLANG_USE_AITER_UNIFIED_ATTN"] = "1"
+        try:
+            with draft_pp_context(), self._draft_context():
+                bundle = build_draft_tp_worker(
+                    server_args=server_args,
+                    gpu_id=gpu_id,
+                    nccl_port=nccl_port,
+                    target_model_config=target_worker.model_runner.model_config,
+                    algo_label="DSPARK",
+                    attention_backend_override=(
+                        DSV4_DRAFT_ATTENTION_BACKEND if self._draft_is_moe else None
+                    ),
+                    draft_worker_cls=draft_worker_cls,
+                    random_seed=target_worker.random_seed,
+                )
+        finally:
+            if enable_draft_unified:
+                if prev_unified is None:
+                    os.environ.pop("SGLANG_USE_AITER_UNIFIED_ATTN", None)
+                else:
+                    os.environ["SGLANG_USE_AITER_UNIFIED_ATTN"] = prev_unified
         self._draft_worker = bundle.draft_worker
         self.draft_model_runner = bundle.draft_model_runner
         self.draft_model = bundle.draft_model
