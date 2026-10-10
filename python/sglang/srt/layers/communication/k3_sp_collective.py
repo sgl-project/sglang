@@ -9,8 +9,6 @@ the checked-in GB200/GB300 tuning envelope.
 from __future__ import annotations
 
 import logging
-from contextlib import contextmanager
-from contextvars import ContextVar
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -47,9 +45,6 @@ class _State:
 _STATE: Optional[_State] = None
 _INITIALIZED = False
 _O_PROJ_RESULT_BUFFERS: dict[int, torch.Tensor] = {}
-_O_PROJ_OUTPUT_ROWS: ContextVar[Optional[int]] = ContextVar(
-    "k3_sp_o_proj_output_rows", default=None
-)
 
 
 def _init_state() -> Optional[_State]:
@@ -192,21 +187,6 @@ def get_o_proj_output_buffer(
     return _symm_buffer(state, _O_PROJ, num_tokens, hidden_size, dtype)
 
 
-@contextmanager
-def o_proj_output_rows(num_rows: int):
-    """Tell o_proj to target a padded full-batch symmetric output."""
-    token = _O_PROJ_OUTPUT_ROWS.set(num_rows)
-    try:
-        yield
-    finally:
-        _O_PROJ_OUTPUT_ROWS.reset(token)
-
-
-def get_o_proj_output_rows(default: int) -> int:
-    num_rows = _O_PROJ_OUTPUT_ROWS.get()
-    return default if num_rows is None else num_rows
-
-
 def register_o_proj_output(result: torch.Tensor, output: torch.Tensor) -> None:
     """Associate a model-visible o_proj result/view with its symmetric backing."""
     if (
@@ -219,18 +199,6 @@ def register_o_proj_output(result: torch.Tensor, output: torch.Tensor) -> None:
             "K3 o_proj result does not match its persistent symmetric output"
         )
     _O_PROJ_RESULT_BUFFERS[result.data_ptr()] = output
-
-
-def finish_padded_o_proj_output(
-    result: torch.Tensor, num_padded: int
-) -> Optional[torch.Tensor]:
-    """Zero the padding tail and return the full persistent symmetric buffer."""
-    output = _O_PROJ_RESULT_BUFFERS.get(result.data_ptr())
-    if output is None or output.shape[0] != num_padded:
-        return None
-    output[result.shape[0] :].zero_()
-    _O_PROJ_RESULT_BUFFERS[output.data_ptr()] = output
-    return output
 
 
 def _resolve_symmetric_o_proj_input(tensor: torch.Tensor) -> tuple[torch.Tensor, int]:

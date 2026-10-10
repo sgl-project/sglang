@@ -446,8 +446,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
     def default_workload_iterations(
         self, batch: Req, num_inference_steps: int
     ) -> int | None:
-        # one denoise per sigma interval: steps - 1
-        return max(1, num_inference_steps - 1)
+        return num_inference_steps
 
     def __init__(self, transformer, pipeline=None) -> None:
         super().__init__(
@@ -560,7 +559,6 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         # would send the next request down the refresh path with nothing
         # mounted.
         self._cache_dit_enabled = False
-        self._cached_num_steps = None
         self._cache_dit_active_key = None
         self._minimax_h3_cache_mode = None
         self._set_cache_dit_input_preservation(False)
