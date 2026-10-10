@@ -761,22 +761,26 @@ class Lfm2Detector(BaseFormatDetector):
         """
         One-time parsing: Detects and parses tool calls in the provided text.
         """
-        idx = text.find(self.bot_token)
-        normal_text = text[:idx].strip() if idx != -1 else text
-
         if self.bot_token not in text:
-            return StreamingParseResult(normal_text=normal_text, calls=[])
+            return StreamingParseResult(normal_text=text, calls=[])
 
         # Find all <|tool_call_start|>...<|tool_call_end|> blocks
         pattern = rf"{re.escape(self.bot_token)}(.*?){re.escape(self.eot_token)}"
-        match_result_list = re.findall(pattern, text, re.DOTALL)
 
         calls = []
-        for match_result in match_result_list:
-            parsed_calls = self._parse_tool_calls_content(match_result, tools)
+        text_parts = []
+        cursor = 0
+        for match in re.finditer(pattern, text, re.DOTALL):
+            text_parts.append(text[cursor : match.start()])
+            parsed_calls = self._parse_tool_calls_content(match.group(1), tools)
             calls.extend(parsed_calls)
+            cursor = match.end()
 
-        return StreamingParseResult(normal_text=normal_text, calls=calls)
+        # Keep prose before an unfinished final block, not its partial call payload.
+        text_parts.append(text[cursor:].split(self.bot_token, 1)[0])
+        return StreamingParseResult(
+            normal_text="".join(text_parts).strip(), calls=calls
+        )
 
     def _strip_special_tokens(self, text: str) -> str:
         """Remove special tokens from text."""

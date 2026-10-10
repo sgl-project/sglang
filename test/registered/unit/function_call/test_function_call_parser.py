@@ -39,6 +39,7 @@ from sglang.srt.function_call.pythonic_detector import PythonicDetector
 from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
 from sglang.srt.function_call.utils import get_schema_properties
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 register_cpu_ci(est_time=70, suite="stage-b-test-cpu-intel")
@@ -4134,7 +4135,7 @@ class TestJsonArrayParser(unittest.TestCase):
         self.assertEqual(total_calls, 3, "Should have parsed exactly 3 tool calls")
 
 
-class TestLfm2Detector(unittest.TestCase):
+class TestLfm2Detector(CustomTestCase):
     """Tests for LFM2 (Liquid Foundation Model 2) function call detector."""
 
     def setUp(self):
@@ -4341,7 +4342,7 @@ class TestLfm2Detector(unittest.TestCase):
 
     def test_detect_and_parse_no_tool_call(self):
         """Test parsing text with no tool calls."""
-        text = "This is just regular text without any tool calls."
+        text = " \nThis is regular text: 1 < 2.\t "
         result = self.detector.detect_and_parse(text, self.tools)
 
         self.assertEqual(result.normal_text, text)
@@ -4370,6 +4371,65 @@ class TestLfm2Detector(unittest.TestCase):
         self.assertEqual(len(result.calls), 2)
         self.assertEqual(result.calls[0].name, "get_weather")
         self.assertEqual(result.calls[1].name, "search")
+
+    def test_detect_and_parse_preserves_text_between_and_after_blocks(self):
+        """Complete tool blocks must not swallow subsequent ordinary text."""
+        expected_calls = [
+            ("get_weather", {"city": "Paris"}),
+            ("search", {"query": "hotels"}),
+        ]
+        formats = {
+            "pythonic": ['[get_weather(city="Paris")]', '[search(query="hotels")]'],
+            "json": [
+                json.dumps([{"name": name, "arguments": arguments}])
+                for name, arguments in expected_calls
+            ],
+        }
+        for format_name, bodies in formats.items():
+            blocks = [f"<|tool_call_start|>{body}<|tool_call_end|>" for body in bodies]
+            cases = [
+                (blocks[0] + " After.", "After.", expected_calls[:1]),
+                (
+                    "  Before.\n"
+                    + blocks[0]
+                    + "\nBetween 1 < 2.\n"
+                    + blocks[1]
+                    + "\nAfter.\t",
+                    "Before.\n\nBetween 1 < 2.\n\nAfter.",
+                    expected_calls,
+                ),
+                ("".join(blocks), "", expected_calls),
+            ]
+            for text, expected_text, expected in cases:
+                with self.subTest(format=format_name, text=text):
+                    result = self.detector.detect_and_parse(text, self.tools)
+                    self.assertEqual(result.normal_text, expected_text)
+                    self.assertEqual(
+                        [
+                            (call.name, json.loads(call.parameters))
+                            for call in result.calls
+                        ],
+                        expected,
+                    )
+
+    def test_detect_and_parse_keeps_text_before_a_truncated_final_block(self):
+        """Retain intervening prose without exposing an unfinished tool call."""
+        for partial_call in (
+            "<|tool_call_start|>",
+            '<|tool_call_start|>[search(query="unfinished',
+            '<|tool_call_start|>[search(query="hotels")]<|tool_call_end',
+        ):
+            with self.subTest(partial_call=partial_call):
+                result = self.detector.detect_and_parse(
+                    'Before. <|tool_call_start|>[get_weather(city="Paris")]'
+                    "<|tool_call_end|> Safe text. " + partial_call,
+                    self.tools,
+                )
+                self.assertEqual(result.normal_text, "Before.  Safe text.")
+                self.assertEqual(
+                    [(call.name, json.loads(call.parameters)) for call in result.calls],
+                    [("get_weather", {"city": "Paris"})],
+                )
 
     # ==================== Streaming tests ====================
     # The LFM2 detector buffers until it sees complete <|tool_call_start|>...<|tool_call_end|>
