@@ -78,6 +78,9 @@ if TYPE_CHECKING:
 # Default workspace size in MB for TRTLLM MHA
 # Can be configured via SGLANG_FLASHINFER_WORKSPACE_SIZE environment variable
 DEFAULT_WORKSPACE_SIZE_MB = 512
+# flashinfer XQA decode reserves workspace[:8MB] as semaphores that must start
+# at zero; fmha_v2 prefill leaves its scheduling counters non-zero there.
+_XQA_SEMAPHORE_BYTES = 8 << 20
 
 # Reuse this workspace buffer across all TRTLLM MHA wrappers
 
@@ -158,6 +161,8 @@ class TRTLLMMHAMetadata:
     encoder_cache_seqlens: torch.Tensor = None
     encoder_page_table: torch.Tensor = None
     encoder_row_map: torch.Tensor = None
+    # Per-forward memoization of pre-expanded [B, 2, M] fmha_v2 block tables
+    fmha_v2_block_tables: Optional[dict] = None
 
 
 class TRTLLMHAAttnBackend(FlashInferAttnBackend):
@@ -301,6 +306,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 device=model_runner.device,
             ),
         )
+        # Workaround for flashinfer-ai/flashinfer#6151; drop once fixed upstream.
+        self._fmha_v2_workspace_buffer = self.workspace_buffer[_XQA_SEMAPHORE_BYTES:]
 
         # CUDA graph state
         self.decode_cuda_graph_metadata = {}
@@ -410,6 +417,44 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             self._xqa_spec_dec_mask = (
                 mask.unsqueeze(0).expand(max_bs, -1, -1).contiguous().to(self.device)
             )
+
+    def _fmha_v2_paged_inputs(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        page_table: torch.Tensor,
+    ):
+        """Build (qkv, block_tables) for trtllm_fmha_v2_prefill.
+
+        The kernel addresses K and V blocks from k_cache's base pointer via
+        int32 block offsets. When K and V are contiguous and V sits at a
+        block-aligned offset from K (the fused pool halves), pass them with
+        pre-expanded [B, 2, M] offsets, avoiding an expensive copy of KV caches.
+        """
+        block_bytes = k_cache.stride(0) * k_cache.element_size()
+        delta, rem = divmod(v_cache.data_ptr() - k_cache.data_ptr(), block_bytes)
+        if (
+            rem != 0
+            or not 0 < delta < torch.iinfo(torch.int32).max // 2
+            or not (k_cache.is_contiguous() and v_cache.is_contiguous())
+        ):
+            logger.warning_once(
+                "fmha_v2 prefill: K/V caches are not contiguous block-aligned halves "
+                "of one allocation, so every prefill copies the per-layer KV pool (slow)."
+            )
+            return (q, torch.stack([k_cache, v_cache], dim=1)), page_table
+
+        tables = self.forward_metadata.fmha_v2_block_tables
+        if tables is None:
+            tables = self.forward_metadata.fmha_v2_block_tables = {}
+        key = (page_table.data_ptr(), tuple(page_table.shape), delta)
+        expanded = tables.get(key)
+        if expanded is None:
+            expanded = tables[key] = torch.stack(
+                [page_table, page_table + delta], dim=1
+            )
+        return (q, (k_cache, v_cache)), expanded
 
     def _check_decode_kv_access(self) -> None:
         supported_kinds = {
@@ -1635,16 +1680,25 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             kv_cache, kv_cache_block_scales = self._get_nvfp4_decode_kv_cache(layer)
             k_cache, v_cache = kv_cache
         else:
-            # Native pool format is NHD:
-            # [num_pages, page_size, num_kv_heads, head_dim].
             k_cache_raw, v_cache_raw = self.token_to_kv_pool.get_kv_buffer(
                 layer.layer_id
             )
+            # Same test as paged_kv_view: SGLANG_USE_HND_KVCACHE pools are
+            # [pages, heads, page, dim]; NHD pools are per-slot rows.
+            kv_pool_is_hnd = k_cache_raw.dim() == 4
             if not self.use_fmha_v2 or uses_decode_kernel:
                 # Decode and SM100 batch_context kernels require HND layout.
                 k_cache, v_cache = self._reshape_paged_kv_cache(
                     k_cache_raw, v_cache_raw, layer, layer.head_dim
                 )
+            elif kv_pool_is_hnd:
+                # fmha_v2 reads HND pool buffers as-is; they are already contiguous.
+                hnd_shape = (layer.tp_k_head_num, self.page_size, layer.head_dim)
+                assert k_cache_raw.shape[1:] == v_cache_raw.shape[1:] == hnd_shape, (
+                    f"expected HND buffers [pages, *{hnd_shape}], got "
+                    f"{tuple(k_cache_raw.shape)} / {tuple(v_cache_raw.shape)}"
+                )
+                k_cache, v_cache = k_cache_raw, v_cache_raw
             else:
                 k_cache = paged_kv_view(
                     k_cache_raw, self.page_size, layer.tp_k_head_num, layer.head_dim
@@ -1746,12 +1800,14 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         elif self.use_fmha_v2 and not cp_active:
             # CP must go through cp_strategy.run_attention (per-shard
             # masking); the plain-causal fmha_v2 call below would be wrong.
-            paged_kv = torch.stack([k_cache, v_cache], dim=1)
+            qkv, fmha_v2_block_tables = self._fmha_v2_paged_inputs(
+                q=q, k_cache=k_cache, v_cache=v_cache, page_table=page_table
+            )
             out = forward_batch._attn_output
             o = flashinfer.prefill.trtllm_fmha_v2_prefill(
-                (q, paged_kv),
-                input_layout="Q_PAGED_KV_NHD",
-                workspace_buffer=self.workspace_buffer,
+                qkv,
+                input_layout="Q_PAGED_KV_HND" if kv_pool_is_hnd else "Q_PAGED_KV_NHD",
+                workspace_buffer=self._fmha_v2_workspace_buffer,
                 seq_lens=self.forward_metadata.cache_seqlens_int32,
                 max_q_len=self.forward_metadata.max_seq_len_q,
                 max_kv_len=self.max_context_len,
@@ -1760,7 +1816,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 batch_size=forward_batch.batch_size,
                 cum_seq_lens_q=self.forward_metadata.cu_seqlens_q,
                 cum_seq_lens_kv=self.forward_metadata.cu_seqlens_k,
-                block_tables=page_table,
+                block_tables=fmha_v2_block_tables,
                 out=None if out is None else out.view_as(q),
                 out_dtype=self.q_data_type,
                 mask_mode=(
