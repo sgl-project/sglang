@@ -1629,8 +1629,7 @@ def run_dsv4_compress_attention_case(
     """SWA + compressed-cache path (compress ratios 1, 2, 4, 128) through
     `DeepseekV4AttnBackend.forward` against a pure-PyTorch reference that reads the
     same cache bytes and metadata indices. `sparse_prefill` pins
-    `SGLANG_OPT_FLASHMLA_SPARSE_PREFILL` with the long-prefix direct read off;
-    the C4 seeding dispatches on the same flag.
+    `SGLANG_OPT_FLASHMLA_SPARSE_PREFILL`; the C4 seeding dispatches on the same flag.
     """
     assert case.compress_ratio in (1, 2, 4, 128), (
         f"DSV4 compact runner requires compress_ratio in (1, 2, 4, 128); "
