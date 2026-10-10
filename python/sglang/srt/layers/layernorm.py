@@ -147,6 +147,13 @@ if _is_hip:
     except ImportError:
         _has_rocm_triton_gemma_rms_norm = False
 
+
+def gemma_rms_norm_uses_rocm_triton() -> bool:
+    """Whether GemmaRMSNorm runs the ROCm Triton kernels (``minimax_m3_rmsnorm``),
+    the reference of kernels that reproduce its reduction order."""
+    return _use_aiter and _has_rocm_triton_gemma_rms_norm
+
+
 if _is_cuda:
     # HF-semantics RMSNorm kernel (JIT-compiled).  Used when `cast_x_before_out_mul=True`
     # (the transformers backend path) to produce outputs that are numerically identical
@@ -1172,7 +1179,7 @@ class GemmaRMSNorm(BaseFusedOp):
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        if _use_aiter and _has_rocm_triton_gemma_rms_norm:
+        if gemma_rms_norm_uses_rocm_triton():
             if residual is not None:
                 if post_residual_addition is not None:
                     residual = residual + post_residual_addition

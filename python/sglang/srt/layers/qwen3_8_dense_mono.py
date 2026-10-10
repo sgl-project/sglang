@@ -62,7 +62,7 @@ def _unsupported(model) -> str | None:
     from sglang.kernels.ops.moe.k3_mono_flydsl.common.plan import BLOCKS
     from sglang.kernels.ops.moe.qwen3_5_mono_flydsl import dense_ffn as D
     from sglang.srt.distributed.parallel_state import get_tp_group
-    from sglang.srt.layers import layernorm
+    from sglang.srt.layers.layernorm import gemma_rms_norm_uses_rocm_triton
     from sglang.srt.models.qwen2_moe import Qwen2MoeMLP
 
     c = model.config
@@ -70,7 +70,7 @@ def _unsupported(model) -> str | None:
         return "needs TP1"
     # The kernels follow the ROCm Triton Gemma norm's reduction; without aiter
     # GemmaRMSNorm takes torch ops.
-    if not (layernorm._use_aiter and layernorm._has_rocm_triton_gemma_rms_norm):
+    if not gemma_rms_norm_uses_rocm_triton():
         return "GemmaRMSNorm not on the ROCm Triton kernel (needs SGLANG_USE_AITER=1)"
     if model.pp_group.world_size != 1:
         return "pipeline parallel"
@@ -103,6 +103,8 @@ def _mxfp4_unsupported(proj, n: int, k: int) -> str | None:
         proj.scheme, QuarkW4A4MXFP4
     ):
         return "not Quark MXFP4"
+    if getattr(proj, "dequantized_bf16", False):
+        return "MXFP4 weights dequantized to bf16 (AITER_FORCE_A8W4)"
     w, ws = proj.weight, proj.weight_scale
     # The kernels shuffle their own copy; a weight some other path already
     # preshuffled would be shuffled twice.
