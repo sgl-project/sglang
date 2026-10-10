@@ -936,7 +936,8 @@ def extend_attention_fwd(
     identity_kv_indices: bool = False,
 ):
     """
-    q_extend, k_extend, v_extend, o_extend: contiguous tensors
+    q_extend, o_extend: contiguous tensors; k_extend, v_extend: strided is fine
+    (token and head strides, unit head_dim stride)
 
     k_buffer, v_buffer: (prefix + extend) tensors in mem_manager
 
