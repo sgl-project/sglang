@@ -487,7 +487,8 @@ class MeshRender:
     def get_texture(self) -> np.ndarray:
         """Get current texture as numpy array."""
         if self.tex is None:
-            return np.ones((*self.texture_size, 3), dtype=np.float32)
+            width, height = self.texture_size
+            return np.ones((height, width, 3), dtype=np.float32)
         return self.tex.cpu().numpy()
 
     def _get_pos_from_mvp(
@@ -828,8 +829,9 @@ class MeshRender:
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Fast texture baking by weighted averaging."""
         channel = textures[0].shape[-1]
-        texture_merge = torch.zeros(self.texture_size + (channel,)).to(self.device)
-        trust_map_merge = torch.zeros(self.texture_size + (1,)).to(self.device)
+        width, height = self.texture_size
+        texture_merge = torch.zeros(height, width, channel).to(self.device)
+        trust_map_merge = torch.zeros(height, width, 1).to(self.device)
 
         for texture, cos_map in zip(textures, cos_maps):
             view_sum = (cos_map > 0).sum()
