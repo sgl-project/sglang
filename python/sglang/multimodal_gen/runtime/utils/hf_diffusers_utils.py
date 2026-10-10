@@ -512,7 +512,7 @@ def get_diffusers_component_config(
 
     config_names = ["generation_config.json"]
     # By default, we load config.json, but scheduler_config.json for scheduler
-    if "scheduler" in component_path:
+    if "scheduler" in os.path.basename(os.path.normpath(component_path)):
         config_names.append("scheduler_config.json")
     else:
         config_names.append("config.json")
