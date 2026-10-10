@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
 import gc
 import multiprocessing as mp
 import os
@@ -13,8 +15,14 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalProcessorOutput,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.cuda_vmm_transport_utils import (
+    CudaVmmFeatureTransport,
     CudaVmmMemoryPool,
     CudaVmmPackedTensorTransportProxy,
     _imported_pool_cache_clear,
@@ -152,6 +160,53 @@ class TestCudaVmmTransport(CustomTestCase):
 
     def test_auto_prefers_fabric_tensor_round_trip_and_recycling(self):
         self._run_round_trip(mode="auto")
+
+    def test_publication_waits_for_source_stream(self):
+        torch.cuda.set_device(0)
+        for mode in ("single", "packed", "async", "async_fallback"):
+            with self.subTest(mode=mode):
+                pool = CudaVmmMemoryPool(4 << 20, 60, 0, 1, allow_posix_fallback=True)
+                transport = object.__new__(CudaVmmFeatureTransport)
+                transport.pool = pool
+                try:
+                    # Make a wrong-stream copy observably read the previous value.
+                    size = 8 << 20 if mode == "async_fallback" else 1024
+                    source = torch.zeros(size, dtype=torch.uint8, device="cuda")
+                    torch.cuda.synchronize()
+                    stream = torch.cuda.Stream()
+                    with concurrent.futures.ThreadPoolExecutor(1) as executor:
+                        transport._publisher_executor = executor
+                        with torch.cuda.stream(stream):
+                            torch.cuda._sleep(200_000_000)
+                            source.fill_(73)
+                            if mode == "single":
+                                proxy = pool.wrap_tensor(source)
+                            elif mode == "packed":
+                                proxy = pool.wrap_tensors([source, source])[0]
+                            else:
+                                item = MultimodalDataItem(
+                                    modality=Modality.IMAGE, feature=source
+                                )
+                                asyncio.run(
+                                    transport.prepare_for_dispatch_async(
+                                        [MultimodalProcessorOutput(mm_items=[item])]
+                                    )
+                                )
+                                proxy = item.feature
+                    result = (
+                        proxy
+                        if isinstance(proxy, torch.Tensor)
+                        else proxy.reconstruct_on_target_device(0)
+                    )
+                    self.assertTrue(
+                        torch.equal(
+                            result.cpu(), torch.full((size,), 73, dtype=torch.uint8)
+                        )
+                    )
+                finally:
+                    torch.cuda.synchronize()
+                    _imported_pool_cache_clear()
+                    pool.shutdown()
 
     def test_reused_chunk_clears_acknowledgements(self):
         pool = CudaVmmMemoryPool(4 << 20, 60, 0, 2, allow_posix_fallback=True)

@@ -401,6 +401,10 @@ class CudaVmmMemoryPool:
         producer_stream = None
         copy_synchronized = False
         try:
+            if tensor.is_cuda:
+                self._publish_stream.wait_stream(
+                    torch.cuda.current_stream(tensor.device)
+                )
             with (
                 torch.cuda.device(self.device_index),
                 torch.cuda.stream(self._publish_stream),
@@ -476,6 +480,8 @@ class CudaVmmMemoryPool:
         producer_stream = None
         copy_synchronized = False
         try:
+            for device in {tensor.device for tensor in tensors if tensor.is_cuda}:
+                self._publish_stream.wait_stream(torch.cuda.current_stream(device))
             with (
                 torch.cuda.device(self.device_index),
                 torch.cuda.stream(self._publish_stream),
@@ -1036,8 +1042,22 @@ class CudaVmmFeatureTransport:
         if self._publisher_executor is None:
             raise RuntimeError("CUDA VMM feature transport is shutting down")
 
+        # CUDA current streams are thread-local; carry readiness into the publisher.
+        ready_events = []
+        devices = {
+            tensor.device
+            for mm_inputs in mm_inputs_batch
+            if mm_inputs is not None
+            for item in mm_inputs.mm_items
+            for tensor in (item.feature, item.precomputed_embeddings)
+            if isinstance(tensor, torch.Tensor) and tensor.is_cuda
+        }
+        for device in devices:
+            event = torch.cuda.Event()
+            event.record(torch.cuda.current_stream(device))
+            ready_events.append((device, event))
         future = self._publisher_executor.submit(
-            self.prepare_for_dispatch, mm_inputs_batch
+            self._prepare_after_source_events, mm_inputs_batch, ready_events
         )
         try:
             return await asyncio.shield(asyncio.wrap_future(future))
@@ -1045,6 +1065,16 @@ class CudaVmmFeatureTransport:
             # cleanup must survive a second task cancellation or loop shutdown
             future.add_done_callback(self._cancel_completed_publish)
             raise
+
+    def _prepare_after_source_events(
+        self,
+        mm_inputs_batch: Iterable[MultimodalProcessorOutput | None],
+        ready_events: list[tuple[torch.device, torch.cuda.Event]],
+    ) -> list[MultimodalDataItem]:
+        for device, event in ready_events:
+            # Both VMM copies and a pool-full CPU fallback must see ready input.
+            torch.cuda.current_stream(device).wait_event(event)
+        return self.prepare_for_dispatch(mm_inputs_batch)
 
     def _cancel_completed_publish(self, future: concurrent.futures.Future) -> None:
         if future.cancelled() or future.exception() is not None:
