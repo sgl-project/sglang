@@ -311,7 +311,7 @@ class _SendingExecutor(_Executor):
         super().__init__(adapter)
         self.seen = []
 
-    def _execute_packed(self, packed, x, timestep, *, cond_uuid=None):
+    def _execute_packed(self, packed, x, timestep):
         req = self.send(packed)
         self.seen.append(req.image_latent)
         return x
@@ -321,7 +321,14 @@ def test_batched_rows_with_same_text_keep_their_own_reference() -> None:
     ex = _SendingExecutor(_RefAdapter())
     context = torch.ones(1, 3, 8).expand(2, 3, 8)
     refs = torch.stack([torch.zeros(4, 8), torch.ones(4, 8)])
-    ex(torch.zeros(2, 4, 8), torch.tensor([0.5, 0.5]), context, ref_latents=[refs])
+    # Both rows share the cond chunk's uuid, as in a real ComfyUI call.
+    ex(
+        torch.zeros(2, 4, 8),
+        torch.tensor([0.5, 0.5]),
+        context,
+        ref_latents=[refs],
+        transformer_options={"uuids": ["cond-0"], "cond_or_uncond": [0]},
+    )
     assert len(ex.seen) == 2
     assert torch.equal(ex.seen[0], refs[0:1])
     assert torch.equal(ex.seen[1], refs[1:2])
@@ -383,13 +390,16 @@ def test_cond_key_memoized_per_uuid_within_run() -> None:
     # must reuse the memoized key without rehashing the (changed) tensor.
     ex = _Executor(MiniMaxH3Adapter())
     text = torch.ones(3, 4)
-    first = ex._cond_key(_h3_packed(text, {}), cond_uuid=("u1",))
+    packed = _h3_packed(text, {})
+    packed.unpack_ctx["comfyui_cond_uuid"] = ("u1",)
+    first = ex._cond_key(packed)
     mutated = _h3_packed(torch.zeros(3, 4), {})
-    second = ex._cond_key(mutated, cond_uuid=("u1",))
+    mutated.unpack_ctx["comfyui_cond_uuid"] = ("u1",)
+    second = ex._cond_key(mutated)
     assert first == second
 
     ex.begin_sampler_run()
-    third = ex._cond_key(mutated, cond_uuid=("u1",))
+    third = ex._cond_key(mutated)
     assert third != first
 
 

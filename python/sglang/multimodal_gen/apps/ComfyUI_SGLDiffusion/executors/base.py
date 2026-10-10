@@ -169,7 +169,7 @@ class SGLDiffusionExecutor(torch.nn.Module):
     def comfyui_session_id(self) -> str:
         return f"{self.session_id}:{self._run_id}"
 
-    def _cond_key(self, packed, cond_uuid=None) -> str | None:
+    def _cond_key(self, packed) -> str | None:
         embeds = packed.prompt_embeds
         if not embeds:
             return None
@@ -180,6 +180,7 @@ class SGLDiffusionExecutor(torch.nn.Module):
         # uuid from ComfyUI we only need to hash it once per run rather than
         # once per step; the memo key still folds in shape/dtype so a stale
         # entry can never be returned for tensors that don't actually match.
+        cond_uuid = packed.unpack_ctx.get("comfyui_cond_uuid")
         memo_key = None
         if cond_uuid is not None:
             shape_key = tuple(
@@ -210,8 +211,8 @@ class SGLDiffusionExecutor(torch.nn.Module):
             self._cond_key_cache[memo_key] = key
         return key
 
-    def _mark_and_maybe_drop(self, packed, cond_uuid=None) -> None:
-        key = self._cond_key(packed, cond_uuid)
+    def _mark_and_maybe_drop(self, packed) -> None:
+        key = self._cond_key(packed)
         if key is not None:
             packed.extra_req["comfyui_cond_key"] = key
             if key in self._sent_conds:
@@ -231,7 +232,7 @@ class SGLDiffusionExecutor(torch.nn.Module):
             "suppress_logs": self.should_suppress_logs(timestep),
         }
 
-    def _execute_packed(self, packed, x, timestep, *, cond_uuid=None):
+    def _execute_packed(self, packed, x, timestep):
         if _RUNTIME_IMPORT_ERROR is not None:
             raise RuntimeError(
                 "SGLang diffusion runtime failed to import"
@@ -239,7 +240,7 @@ class SGLDiffusionExecutor(torch.nn.Module):
         ensure = getattr(self, "_ensure_runtime", None)
         if ensure is not None:
             ensure(self)
-        self._mark_and_maybe_drop(packed, cond_uuid)
+        self._mark_and_maybe_drop(packed)
         sampling_params = SamplingParams.from_user_sampling_params_args(
             self.model_path,
             server_args=self.generator.server_args,
@@ -276,6 +277,7 @@ class SGLDiffusionExecutor(torch.nn.Module):
                     _slice_batch_row(x, i, batch),
                     _slice_batch_row(timestep, i, batch),
                     _slice_batch_row(context, i, batch),
+                    _cond_row=i,
                     **{
                         key: (
                             _slice_transformer_options(value, i, batch)
@@ -289,9 +291,15 @@ class SGLDiffusionExecutor(torch.nn.Module):
             ]
         )
 
-    def _forward_one(self, x, timestep, context, **kwargs):
+    def _forward_one(self, x, timestep, context, _cond_row=None, **kwargs):
         packed = self.adapter.pack(x, timestep, context, **kwargs)
         cond_uuid = _cond_uuid_from_transformer_options(
             kwargs.get("transformer_options")
         )
-        return self._execute_packed(packed, x, timestep, cond_uuid=cond_uuid)
+        # Rows of one cond chunk share its uuid but can carry different
+        # per-row conditioning (e.g. reference latents), so key on the row too.
+        # unpack_ctx is executor-local, keeping _execute_packed's signature.
+        packed.unpack_ctx["comfyui_cond_uuid"] = (
+            None if cond_uuid is None else (cond_uuid, _cond_row)
+        )
+        return self._execute_packed(packed, x, timestep)
