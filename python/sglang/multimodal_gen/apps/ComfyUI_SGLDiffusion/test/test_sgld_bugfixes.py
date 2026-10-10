@@ -77,6 +77,34 @@ def _install_comfy_stubs() -> None:
         "unet_to_diffusers",
     ):
         setattr(comfy_utils, name, lambda *a, **k: None)
+
+    class InterruptProcessingException(Exception):
+        pass
+
+    _interrupt = {"flag": False}
+
+    def throw_exception_if_processing_interrupted():
+        if _interrupt["flag"]:
+            raise InterruptProcessingException()
+
+    comfy.model_management.InterruptProcessingException = InterruptProcessingException
+    comfy.model_management.throw_exception_if_processing_interrupted = (
+        throw_exception_if_processing_interrupted
+    )
+    comfy.model_management._test_interrupt = _interrupt
+
+    class ProgressBar:
+        instances = []
+
+        def __init__(self, total):
+            self.total = total
+            self.values = []
+            ProgressBar.instances.append(self)
+
+        def update_absolute(self, value, total=None, preview=None):
+            self.values.append(value)
+
+    comfy_utils.ProgressBar = ProgressBar
     comfy.utils = comfy_utils
 
     comfy_model_patcher = types.ModuleType("comfy.model_patcher")
@@ -99,6 +127,15 @@ def _install_comfy_stubs() -> None:
 
         def add_wrapper_with_key(self, *a, **k):
             pass
+
+        # ComfyUI: loaded_size() reads the model's own weight counter (0 for
+        # SGLD, whose weights live in the worker); detach() is what
+        # LoadedModel.model_unload always ends in.
+        def loaded_size(self):
+            return getattr(self.model, "model_loaded_weight_memory", 0)
+
+        def detach(self, unpatch_all=True):
+            return self.model
 
     comfy_model_patcher.ModelPatcher = ModelPatcher
     comfy.model_patcher = comfy_model_patcher
@@ -639,3 +676,148 @@ def test_h3_allows_local_video_reference_against_local_server():
         "/data/clip.mp4", "reference_video", "http://127.0.0.1:3000/v1"
     )
     assert uri == "file:///data/clip.mp4"
+
+
+# --- ComfyUI "Unload models" never reached the SGLD worker ------------------
+
+
+class _FakeWorkerOwner:
+    """Stands in for SGLDiffusionGenerator as the patcher's worker handle."""
+
+    def __init__(self, asleep=False):
+        self.worker_asleep = asleep
+        self.calls = []
+
+    def sleep_worker(self, token=None):
+        self.calls.append("sleep")
+        self.worker_asleep = True
+
+    def wake_worker(self):
+        self.calls.append("wake")
+        self.worker_asleep = False
+
+
+def _make_patcher(owner, size=20 * 2**30):
+    return SGLDModelPatcher(
+        torch.nn.Module(),
+        torch.device("cpu"),
+        torch.device("cpu"),
+        size=size,
+        model_type="qwen_image",
+        worker=owner,
+    )
+
+
+def test_detach_puts_the_worker_to_sleep():
+    owner = _FakeWorkerOwner()
+    _make_patcher(owner).detach()
+    assert owner.calls == ["sleep"]
+
+
+def test_loaded_size_counts_worker_vram_only_while_awake():
+    owner = _FakeWorkerOwner()
+    patcher = _make_patcher(owner, size=7)
+    assert patcher.loaded_size() == 7
+    owner.worker_asleep = True
+    assert patcher.loaded_size() == 0
+
+
+def test_cloned_patcher_keeps_the_worker_handle():
+    owner = _FakeWorkerOwner()
+    _make_patcher(owner).clone().detach()
+    assert owner.calls == ["sleep"]
+
+
+def _live_generator(monkeypatch, responses=None):
+    gen = GENERATOR.SGLDiffusionGenerator()
+    sent = []
+
+    class _Gen:
+        def _send_to_scheduler_and_wait_for_response(self, reqs):
+            sent.append(type(reqs[0]).__name__)
+            return types.SimpleNamespace(
+                error=None, output={"success": True, "sleeping": True}
+            )
+
+    gen.generator = _Gen()
+    gen._patcher = object()
+    monkeypatch.setattr(gen, "_is_live", lambda: True)
+
+    io_struct = types.ModuleType(
+        "sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct"
+    )
+    io_struct.ReleaseMemoryOccupationReqInput = type(
+        "ReleaseMemoryOccupationReqInput", (), {}
+    )
+    io_struct.ResumeMemoryOccupationReqInput = type(
+        "ResumeMemoryOccupationReqInput", (), {}
+    )
+    monkeypatch.setitem(sys.modules, io_struct.__name__, io_struct)
+    return gen, sent
+
+
+def test_generator_sleep_and_wake_send_the_scheduler_requests(monkeypatch):
+    gen, sent = _live_generator(monkeypatch)
+    gen.sleep_worker(gen.generator)
+    gen.sleep_worker(gen.generator)  # already asleep: no second request
+    assert sent == ["ReleaseMemoryOccupationReqInput"]
+    assert gen.worker_asleep
+    gen.wake_worker()
+    gen.wake_worker()
+    assert sent[1:] == ["ResumeMemoryOccupationReqInput"]
+    assert not gen.worker_asleep
+
+
+def test_generator_ignores_sleep_from_a_stale_patcher(monkeypatch):
+    gen, sent = _live_generator(monkeypatch)
+    gen.sleep_worker(object())  # token of a worker that was replaced
+    assert sent == []
+    assert not gen.worker_asleep
+
+
+def test_generator_does_not_sleep_a_dead_worker(monkeypatch):
+    gen, sent = _live_generator(monkeypatch)
+    monkeypatch.setattr(gen, "_is_live", lambda: False)
+    gen.sleep_worker(gen.generator)
+    assert sent == []
+
+
+def test_ensure_executor_wakes_a_sleeping_worker(monkeypatch):
+    gen, sent = _live_generator(monkeypatch)
+    executor = types.SimpleNamespace(generator=gen.generator)
+    gen.sleep_worker(gen.generator)
+    gen.ensure_executor(executor)
+    assert sent == [
+        "ReleaseMemoryOccupationReqInput",
+        "ResumeMemoryOccupationReqInput",
+    ]
+
+
+def test_set_lora_wakes_a_sleeping_worker(monkeypatch):
+    gen, sent = _live_generator(monkeypatch)
+    gen.generator.set_lora = lambda **kw: sent.append("set_lora")
+    executor = object.__new__(GENERATOR.FluxExecutor)
+    executor.generator = gen.generator
+    executor._ensure_runtime = gen.ensure_executor
+    gen.sleep_worker(gen.generator)
+    executor.set_lora(lora_nickname="a", lora_path="/x.safetensors")
+    assert sent[-2:] == ["ResumeMemoryOccupationReqInput", "set_lora"]
+
+
+def test_clone_of_live_patcher_still_sleeps_the_real_generator(monkeypatch):
+    gen, sent = _live_generator(monkeypatch)
+    patcher = SGLDModelPatcher(
+        torch.nn.Module(),
+        torch.device("cpu"),
+        torch.device("cpu"),
+        size=1,
+        worker=gen,
+        worker_token=gen.generator,
+    )
+    patcher.clone().detach()
+    assert sent == ["ReleaseMemoryOccupationReqInput"]
+
+
+def test_partially_unload_has_no_side_effects():
+    patcher = _make_patcher(_FakeWorkerOwner())
+    assert patcher.partially_unload(torch.device("cpu"), 123) == 0

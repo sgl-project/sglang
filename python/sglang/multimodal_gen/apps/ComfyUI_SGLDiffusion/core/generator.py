@@ -187,6 +187,7 @@ class SGLDiffusionGenerator:
         self.executor = None
         self.last_options = None
         self._patcher = None
+        self.worker_asleep = False
 
         # Native pipelines, run under comfyui_mode as a DiT-only forward service.
         self.pipeline_class_dict = {}
@@ -310,6 +311,7 @@ class SGLDiffusionGenerator:
     def ensure_executor(self, executor) -> None:
         """Rebuild the worker if this cached executor no longer owns it."""
         if self._owns_live(executor):
+            self.wake_worker()
             return
         reload = getattr(executor, "_sgld_reload", None)
         if not reload:
@@ -325,6 +327,45 @@ class SGLDiffusionGenerator:
         lora = getattr(executor, "_lora_input", None)
         if lora and lora.get("lora_nickname"):
             executor.set_lora(**lora)
+
+    def _memory_occupation_request(self, req_name: str) -> dict:
+        from sglang.multimodal_gen.runtime.entrypoints.post_training import io_struct
+
+        out = self.generator._send_to_scheduler_and_wait_for_response(
+            [getattr(io_struct, req_name)()]
+        )
+        if out.error:
+            raise RuntimeError(out.error)
+        payload = out.output or {}
+        if not payload.get("success", True):
+            raise RuntimeError(payload.get("message", "memory occupation failed"))
+        return payload
+
+    def sleep_worker(self, token=None) -> None:
+        """Move the worker's weights off the GPU (best effort).
+
+        ``token`` is the patcher's ``worker_token`` (the worker's generator);
+        it guards against a patcher for a replaced worker putting the new one
+        to sleep, while ComfyUI clones of the live patcher still match. Failure is logged, not raised: the worker just
+        stays resident, which is the old behaviour.
+        """
+        if token is not None and token is not self.generator:
+            return
+        if self.worker_asleep or self.generator is None or not self._is_live():
+            return
+        try:
+            self._memory_occupation_request("ReleaseMemoryOccupationReqInput")
+        except Exception:
+            logger.warning("Could not release SGLD worker GPU memory", exc_info=True)
+            return
+        self.worker_asleep = True
+
+    def wake_worker(self) -> None:
+        """Bring a sleeping worker's weights back to the GPU."""
+        if not self.worker_asleep:
+            return
+        self._memory_occupation_request("ResumeMemoryOccupationReqInput")
+        self.worker_asleep = False
 
     def kill_generator(self):
         """Force-stop workers this owner started. Do not scan the process table."""
@@ -358,6 +399,7 @@ class SGLDiffusionGenerator:
         self.generator = None
         self.executor = None
         self._patcher = None
+        self.worker_asleep = False
 
     def get_comfyui_model(self, model_path: str, model_options: dict = None):
         """Get ComfyUI model from model path."""
@@ -529,6 +571,8 @@ class SGLDiffusionGenerator:
             offload_device,
             size=model_size_bytes,
             model_type=model_type,
+            worker=self,
+            worker_token=self.generator,
         )
         self._patcher.add_wrapper_with_key(
             WrappersMP.SAMPLER_SAMPLE,

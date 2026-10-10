@@ -60,6 +60,10 @@ class SGLDiffusionExecutor(torch.nn.Module):
             "target": target,
         }
         if lora_nickname and len(lora_nickname) > 0:
+            # The worker may be asleep after a ComfyUI unload.
+            ensure = getattr(self, "_ensure_runtime", None)
+            if ensure is not None:
+                ensure(self)
             self.generator.set_lora(
                 lora_nickname=lora_nickname,
                 lora_path=lora_path,
