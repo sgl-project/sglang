@@ -1024,6 +1024,12 @@ class Envs:
     SGLANG_NPU_FORWARD_NATIVE_GEMMA_RMS_NORM = EnvBool(False)
     # Delay all-gather after qlora for better performance for Deepseek v3.2
     SGLANG_USE_AG_AFTER_QLORA = EnvBool(False)
+    # DSA prefill: each attention-TP rank scores only its shard of the indexer
+    # queries, and the top-k is all-gathered.
+    SGLANG_NPU_ENABLE_DSA_INDEXER_QUERY_SHARDING = EnvBool(True)
+    # DSA prefill: each attention-TP rank computes every head for its slice of
+    # the tokens. Consumes no ranks. Off under DCP, which all-gathers the query.
+    SGLANG_NPU_ENABLE_DSA_TOKEN_SHARD = EnvBool(True)
     # Enable int4x2 weights loading
     SGLANG_NPU_W4A4_NEW_PACKING = EnvBool(False)
     # Use the graph-safe Triton-Ascend kernel for masked speculative KV commits.

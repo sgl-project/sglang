@@ -72,6 +72,7 @@ from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.amx_utils import PackWeightMethod
 from sglang.srt.layers.attention.dsa.dsa_indexer import Indexer
 from sglang.srt.layers.attention.dsa.dsa_indexer_kpool import IndexerKPool
+from sglang.srt.layers.attention.dsa.dsa_token_shard import dsa_token_shard_enabled
 from sglang.srt.layers.attention.dsa.utils import (
     maybe_prefetch_next_full_attention_kv,
 )
@@ -2159,6 +2160,22 @@ class DeepseekV2AttentionMLA(
         if get_parallel().dcp_enabled:
             self.attn_mqa_for_dcp_decode = RadixAttention(
                 self.num_local_heads * get_parallel().attn_dcp_size,
+                self.kv_lora_rank + self.qk_rope_head_dim,
+                self.scaling,
+                num_kv_heads=1,
+                layer_id=layer_id,
+                v_head_dim=self.kv_lora_rank,
+                quant_config=quant_config,
+                prefix=add_prefix("attn_mqa", prefix),
+            )
+
+        # DSA token-shard: every head for this rank's slice of the tokens; the
+        # weights stay head-sharded. ``use_dsa``, not ``indexer is not None``: a
+        # skip-topk layer owns no Indexer but still attends, so it needs this.
+        self.attn_mqa_for_dsa_token_shard = None
+        if self.use_dsa and dsa_token_shard_enabled():
+            self.attn_mqa_for_dsa_token_shard = RadixAttention(
+                self.num_heads,
                 self.kv_lora_rank + self.qk_rope_head_dim,
                 self.scaling,
                 num_kv_heads=1,
