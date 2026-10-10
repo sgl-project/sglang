@@ -1,0 +1,164 @@
+{
+  "1": {
+    "class_type": "SGLDUNETLoader",
+    "inputs": {
+      "unet_name": "qwen_image_2.1_bf16.safetensors",
+      "weight_dtype": "default",
+      "sgld_options": [
+        "20",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "SGLDiffusion UNET Loader"
+    }
+  },
+  "2": {
+    "class_type": "QwenImage21Cache",
+    "inputs": {
+      "model": [
+        "1",
+        0
+      ],
+      "device": "auto",
+      "dtype": "default"
+    },
+    "_meta": {
+      "title": "Qwen Image 2.1 Cache"
+    }
+  },
+  "3": {
+    "class_type": "CLIPLoader",
+    "inputs": {
+      "clip_name": "qwen3vl_8b_int8_convrot.safetensors",
+      "type": "qwen_image",
+      "device": "default"
+    },
+    "_meta": {
+      "title": "Load CLIP"
+    }
+  },
+  "4": {
+    "class_type": "VAELoader",
+    "inputs": {
+      "vae_name": "qwen_image_2.1_vae_bf16.safetensors"
+    },
+    "_meta": {
+      "title": "Load VAE"
+    }
+  },
+  "5": {
+    "class_type": "TextEncodeQwenImage21",
+    "inputs": {
+      "clip": [
+        "3",
+        0
+      ],
+      "prompt": "Turn the scene into a watercolor painting and make the background warm orange.",
+      "negative_prompt": "",
+      "resolution": 1024,
+      "vae": [
+        "4",
+        0
+      ],
+      "images.image_1": [
+        "31",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "Text Encode Qwen Image 2.1"
+    }
+  },
+  "7": {
+    "class_type": "KSampler",
+    "inputs": {
+      "model": [
+        "2",
+        0
+      ],
+      "seed": 447606998181262,
+      "steps": 25,
+      "cfg": 1.0,
+      "sampler_name": "euler",
+      "scheduler": "simple",
+      "positive": [
+        "5",
+        0
+      ],
+      "negative": [
+        "5",
+        1
+      ],
+      "latent_image": [
+        "5",
+        2
+      ],
+      "denoise": 1.0
+    },
+    "_meta": {
+      "title": "KSampler"
+    }
+  },
+  "8": {
+    "class_type": "VAEDecode",
+    "inputs": {
+      "samples": [
+        "7",
+        0
+      ],
+      "vae": [
+        "4",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "VAE Decode"
+    }
+  },
+  "9": {
+    "class_type": "SaveImage",
+    "inputs": {
+      "images": [
+        "8",
+        0
+      ],
+      "filename_prefix": "Qwen_image_2.1_edit_sgld"
+    },
+    "_meta": {
+      "title": "Save Image"
+    }
+  },
+  "20": {
+    "class_type": "SGLDOptions",
+    "inputs": {
+      "model_type": "qwen_image21",
+      "enable_torch_compile": false,
+      "num_gpus": 1,
+      "tp_size": -1,
+      "sp_degree": -1,
+      "ulysses_degree": -1,
+      "ring_degree": -1,
+      "dp_size": 1,
+      "dp_degree": 1,
+      "enable_cfg_parallel": false,
+      "attention_backend": "",
+      "dit_layerwise_offload": false,
+      "enable_cache_dit": false,
+      "quantization": "",
+      "transformer_weights_path": ""
+    },
+    "_meta": {
+      "title": "SGLDiffusion Options"
+    }
+  },
+  "31": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": "example.png"
+    },
+    "_meta": {
+      "title": "Load Image"
+    }
+  }
+}

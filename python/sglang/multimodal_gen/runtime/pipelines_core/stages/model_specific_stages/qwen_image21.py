@@ -7,6 +7,7 @@ from PIL import Image
 from sglang.multimodal_gen.runtime.cache.conditioning import cached_encoder_call
 from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
+    get_sp_group,
     get_tp_group,
     model_parallel_is_initialized,
 )
@@ -15,6 +16,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager im
     ComponentUse,
 )
 from sglang.multimodal_gen.runtime.models.dits.qwen_image21 import build_layout
+from sglang.multimodal_gen.runtime.pipelines_core.comfyui_mode import (
+    get_or_create_run_state,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
     calculate_linear_shift,
 )
@@ -293,4 +297,95 @@ class QwenImage21DenoisingStage(DenoisingStage):
             target_dtype,
             guidance,
             **kwargs,
+        )
+
+
+# ComfyUI integrated mode. Must match COND_EXTRA_KEY in the plugin's
+# executors/qwen_image21.py.
+COMFYUI_COND_EXTRA_KEY = "qwen21_cond"
+
+
+def insert_image_placeholders(context, image_slots, num_refs):
+    """Context with a zero token at each ComfyUI image slot, and the native flags."""
+    text_len = context.shape[1]
+    slots = [min(int(s), text_len) for s in image_slots][:num_refs]
+    slots += [text_len] * (num_refs - len(slots))
+    if slots != sorted(slots):
+        raise ValueError(f"Qwen-Image 2.1 image_slots must be ascending, got {slots}")
+    placeholder = context.new_zeros(context.shape[0], 1, context.shape[2])
+    pieces, flags, start = [], [], 0
+    for slot in slots:
+        pieces += [context[:, start:slot], placeholder]
+        flags += [False] * (slot - start) + [True]
+        start = slot
+    pieces.append(context[:, start:])
+    flags += [False] * (text_len - start)
+    return torch.cat(pieces, dim=1), flags
+
+
+def _cache_fits(need_bytes, device) -> bool:
+    free = torch.cuda.mem_get_info(device)[0] if device.type == "cuda" else 0
+    free = torch.tensor([free], dtype=torch.int64)
+    # Ranks running one call must agree: under TP an uncached prefix runs
+    # extra all-reduces, so a split decision would hang.
+    if model_parallel_is_initialized():
+        for group in (get_tp_group(), get_sp_group()):
+            if group.world_size > 1:
+                torch.distributed.all_reduce(
+                    free, op=torch.distributed.ReduceOp.MIN, group=group.cpu_group
+                )
+    return int(free) > 2 * need_bytes
+
+
+class QwenImage21ComfyUIConditionStage(PipelineStage):
+    """Turn one ComfyUI ``apply_model`` call into native denoising inputs.
+
+    ComfyUI's text encoder drops the vision tokens and reports ``image_slots``:
+    the text positions of the reference latents. A placeholder token at each
+    slot gives the native ``build_layout`` input; the DiT overwrites those rows
+    with ``img_in(condition_latents)``. Conditioning and its prefix K/V cache
+    are built once per cond for the sampler run.
+    """
+
+    def forward(self, batch, server_args):
+        bsz, _, height, width = batch.latents.shape
+        batch.latents = batch.latents.flatten(2).transpose(1, 2).contiguous()
+        # ComfyUI repeats one sigma per batch row; the loop runs one step per entry.
+        batch.timesteps = batch.timesteps[:1]
+        conds = get_or_create_run_state(batch, dict)
+        key = (batch.extra.get("comfyui_cond_key"), bsz, height, width)
+        if key not in conds:
+            conds[key] = self._new_cond(batch, server_args, bsz, height, width)
+        batch.prompt_embeds, batch.extra["qwen21_positive"] = conds[key]
+        return batch
+
+    def _new_cond(self, batch, server_args, bsz, height, width):
+        arch = server_args.pipeline_config.dit_config.arch_config
+        payload = batch.extra.get(COMFYUI_COND_EXTRA_KEY) or {}
+        device, dtype = batch.latents.device, torch.bfloat16
+        context = batch.prompt_embeds[0].to(device=device, dtype=dtype)
+        refs = [
+            r.to(device=device, dtype=dtype) for r in payload.get("ref_latents", [])
+        ]
+        context, flags = insert_image_placeholders(
+            context.expand(bsz, -1, -1), payload.get("image_slots", []), len(refs)
+        )
+        shapes = [(1, r.shape[-2], r.shape[-1]) for r in refs] + [(1, height, width)]
+        layout = build_layout(flags, shapes, arch.axes_dims_rope, device)
+        condition_latents = None
+        if refs:
+            condition_latents = torch.cat(
+                [r.expand(bsz, -1, -1, -1).flatten(2).transpose(1, 2) for r in refs],
+                dim=1,
+            )
+        # K and V of every layer for every batch row, bf16.
+        need = 2 * arch.num_layers * bsz * layout["prefix_rope"].shape[0]
+        need *= arch.hidden_size * 2
+        caches = None
+        if _cache_fits(need, device):
+            caches = [[{} for _ in range(arch.num_layers)] for _ in range(bsz)]
+        return [context], dict(
+            layouts=[layout] * bsz,
+            condition_latents=condition_latents,
+            prefix_caches=caches,
         )
