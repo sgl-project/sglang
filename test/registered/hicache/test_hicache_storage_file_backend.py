@@ -10,6 +10,7 @@ import random
 import tempfile
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from typing import Dict
 from urllib.parse import urlparse
@@ -29,8 +30,8 @@ from sglang.test.test_utils import (
 )
 from sglang.utils import wait_for_http_ready
 
-register_cuda_ci(est_time=191, stage="base-b", runner_config="2-gpu-large")
-register_amd_ci(est_time=526, suite="stage-b-test-2-gpu-large-amd")
+register_cuda_ci(est_time=600, stage="base-b", runner_config="2-gpu-large")
+register_amd_ci(est_time=600, suite="stage-b-test-2-gpu-large-amd")
 
 
 class HiCacheStorageBaseMixin:
@@ -236,6 +237,69 @@ class TestHiCacheStoragePageFirstDirectIO(HiCacheStorageBaseMixin, CustomTestCas
             "--tp-size": 2,
         }
         return server_args, {}
+
+
+class TestHiCacheStorageRandomDelay(HiCacheStorageBaseMixin, CustomTestCase):
+    """Random storage delays must change only latency, never hit semantics;
+    the rank consensus checker (enabled by the mixin) fails the server if the
+    skewed storage IO timing causes cross-rank divergence."""
+
+    @classmethod
+    def _get_additional_server_args_and_env(cls):
+        server_args = {"--tp-size": 2}
+        env_vars = {
+            "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.temp_dir,
+            "SGLANG_TEST_HICACHE_BACKEND_RANDOM_DELAY": "0.1",
+        }
+        return server_args, env_vars
+
+    def test_delayed_storage_hits_concurrent_requests(self):
+        base_prompt = self.gen_prompt(768)
+        self.send_request(base_prompt, max_tokens=8)
+        self.trigger_offloading_and_flush()
+
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            responses = list(
+                executor.map(
+                    lambda _: self.send_request(base_prompt, max_tokens=8), range(4)
+                )
+            )
+
+        for response in responses:
+            self.assertEqual(response["meta_info"]["completion_tokens"], 8)
+            self.assertGreater(
+                self.get_cached_tokens(response),
+                700,
+                "Delayed storage IO must not turn a stored prefix into a miss",
+            )
+
+
+class TestHiCacheStorageRandomFailure(HiCacheStorageBaseMixin, CustomTestCase):
+    """Random backend failures must degrade to plain cache misses: every
+    request still completes, and the server stays healthy; the rank
+    consensus checker (enabled by the mixin) fails the server if per-rank
+    failure draws cause cross-rank divergence."""
+
+    @classmethod
+    def _get_additional_server_args_and_env(cls):
+        server_args = {"--tp-size": 2}
+        env_vars = {
+            "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.temp_dir,
+            "SGLANG_TEST_HICACHE_BACKEND_RANDOM_FAILURE": "0.05",
+        }
+        return server_args, env_vars
+
+    def test_random_failures_degrade_to_cache_misses(self):
+        base_prompt = self.gen_prompt(768)
+        for _ in range(10):
+            self.send_request(base_prompt, max_tokens=8)
+            self.trigger_offloading_and_flush()
+
+            response = self.send_request(base_prompt, max_tokens=8)
+            self.assertEqual(response["meta_info"]["completion_tokens"], 8)
+
+        health = requests.get(self.base_url + "/health", timeout=10)
+        self.assertEqual(health.status_code, 200)
 
 
 def run_eval_accuracy_test(test_instance, accuracy_threshold: float = 0.03):
