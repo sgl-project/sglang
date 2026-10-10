@@ -907,6 +907,32 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             set_forward_context,
         )
 
+        # H3 resolves transformer component overrides lazily, so its actual
+        # model backend may differ from the stage's default metadata backend.
+        backend_enum = getattr(model, "_resolved_attention_backend", None)
+        if not isinstance(backend_enum, AttentionBackendEnum):
+            backend = getattr(self, "attn_backend", None)
+            backend_enum = backend.get_enum() if backend is not None else None
+        if backend_enum == AttentionBackendEnum.EQBSA_ATTN:
+            from sglang.multimodal_gen.runtime.layers.attention.backends.eqbsa_attn import (
+                EQBSAAttentionMetadataBuilder,
+            )
+
+            packed_params = call_kwargs["packed_seq_params"]
+            video_spans = packed_params.get("video_spans")
+            if video_spans is None:
+                raise ValueError(
+                    "MiniMax H3 EQBSA attention requires video_spans from its "
+                    "packed-sequence builder."
+                )
+            sparse_config = self.server_args.attention_backend_config or {}
+            attn_metadata = EQBSAAttentionMetadataBuilder().build(
+                current_timestep=step_index,
+                skip_first_steps=sparse_config.get("skip_first_steps", 10),
+                sparsity=sparse_config.get("sparsity", 0.2),
+                precision=sparse_config.get("precision", "bf16"),
+                video_spans=video_spans,
+            )
         with set_forward_context(
             current_timestep=step_index,
             attn_metadata=(
@@ -1120,7 +1146,7 @@ def _build_packed_layout(
     emb: Mapping[str, Any],
     *,
     include_video_pos: bool = False,
-) -> dict[str, torch.Tensor]:
+) -> dict[str, Any]:
     """Build the per-task packed layout for the positive branch."""
 
     from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.packed_sequence import (

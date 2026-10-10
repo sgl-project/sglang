@@ -128,6 +128,30 @@ class NPUPlatformBase(Platform):
             logger.info("Using Ascend Flash Attention backend.")
             return "sglang.multimodal_gen.runtime.layers.attention.backends.ascend_fa.AscendFABackend"
 
+        elif selected_backend == AttentionBackendEnum.FIA_ATTN:
+            try:
+                from sglang.multimodal_gen.runtime.layers.attention.backends.fia_attn import (  # noqa: F401
+                    FIAAttentionBackend,
+                )
+
+                logger.info(
+                    "Using MindIE-SD FIA Attention backend (FP8 HIGH_PRECISION)"
+                )
+                return "sglang.multimodal_gen.runtime.layers.attention.backends.fia_attn.FIAAttentionBackend"
+            except ImportError as e:
+                logger.error(f"Failed to import FIA Attention backend: {e}")
+                raise ImportError(
+                    "FIA Attention backend requires MindIE-SD with quant_attention support."
+                ) from e
+
+        elif selected_backend == AttentionBackendEnum.EQBSA_ATTN:
+            from sglang.multimodal_gen.runtime.layers.attention.backends.eqbsa_attn import (  # noqa: F401
+                EQBSAAttentionBackend,
+            )
+
+            logger.info("Using MindIE-SD EQBSA Attention backend (rf_v3)")
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.eqbsa_attn.EQBSAAttentionBackend"
+
         elif selected_backend == AttentionBackendEnum.LASER_ATTN:
             try:
                 from sglang.multimodal_gen.runtime.layers.attention.backends.laser_attn import (  # noqa: F401
