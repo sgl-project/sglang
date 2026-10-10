@@ -14,13 +14,17 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import datetime
+import errno
+import fcntl
 import functools
 import hashlib
 import json
 import logging
+import shutil
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Optional
+from typing import IO, TYPE_CHECKING, Callable, Optional
 
 import torch
 
@@ -134,14 +138,17 @@ def should_run_flashinfer_autotune(
     return True
 
 
-def flashinfer_autotune_cache_path(model_runner: ModelRunner) -> Path:
-    import flashinfer
+def flashinfer_autotune_store_root(model_runner: ModelRunner) -> Path:
+    """This rank's FlashInfer managed autotune store root.
 
+    FlashInfer namespaces the store below the root by its environment identity
+    (library versions, GPU) and keys each entry by op, runner and shape bucket
+    plus whatever extras the runner adds, so the root separates deployments.
+    It is resolved once per process, from the runner that attaches first.
+    Per rank: a store shared across ranks would let one rank read a winner
+    another published mid-tuning, so ranks of one TP group could split on a hit.
+    """
     mr = model_runner
-    major, minor = torch.cuda.get_device_capability(mr.device)
-    arch = f"sm{major}{minor}"
-    flashinfer_version = getattr(flashinfer, "__version__", "unknown")
-
     model_key_parts = [
         str(get_model().model_path),
         str(mr.dtype),
@@ -156,22 +163,17 @@ def flashinfer_autotune_cache_path(model_runner: ModelRunner) -> Path:
     # A different skip policy must not reuse previously tuned tactics.
     skip_ops = get_flashinfer_autotune_skip_ops(mr)
     model_key_parts.append("skip_ops=" + ",".join(sorted(skip_ops)))
-    if mr.is_draft_worker:
-        model_key_parts.append(f"draft_quant={mr.model_config.quantization}")
     model_key = "|".join(model_key_parts)
     cache_key = hashlib.sha256(model_key.encode()).hexdigest()[:16]
-    cache_dir = (
-        Path(envs.SGLANG_CACHE_DIR.get())
-        / "flashinfer"
-        / "autotune"
-        / flashinfer_version
-        / arch
-        / cache_key
-    )
-    cache_dir.mkdir(parents=True, exist_ok=True)
+    base = Path(envs.SGLANG_CACHE_DIR.get()) / "flashinfer" / "autotune" / "managed"
+    if not envs.SGLANG_FLASHINFER_AUTOTUNE_CACHE.get():
+        # Reuse disabled: tune from scratch into a fresh store, kept for inspection.
+        base = base / "runs" / datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    parallel = get_parallel()
     return (
-        cache_dir
-        / f"rank_tp{get_parallel().tp_rank}_pp{get_parallel().pp_rank}_dp{get_parallel().dp_rank or 0}.json"
+        base
+        / cache_key
+        / f"rank_tp{parallel.tp_rank}_pp{parallel.pp_rank}_dp{parallel.dp_rank or 0}"
     )
 
 
@@ -207,70 +209,199 @@ def _autotune_process_group(group: Optional[torch.distributed.ProcessGroup]):
         set_autotune_process_group(previous)
 
 
-def _autotune_cache_digest(cache_path: Path, env: dict[str, str]) -> str:
-    """Hash of what this rank would load from ``cache_path`` ("" for nothing).
+@dataclasses.dataclass(frozen=True)
+class _AutotuneStore:
+    """The store this process tunes into; ``root`` None means in memory only."""
 
-    Includes the environment: ``load_configs`` ignores the whole file when its
-    ``_metadata`` stamp disagrees with the environment reading it, so equal
-    tactics alone do not mean two ranks load the same thing.
+    root: Optional[Path]
+    # Held open for the process lifetime; the OS releases the lock on exit.
+    lock: Optional[IO[bytes]] = None
+
+
+_attached_store: Optional[_AutotuneStore] = None
+
+
+def _lock_autotune_store(root: Path) -> Optional[IO[bytes]]:
+    """Hold ``root`` exclusively, or return None (with the reason logged).
+
+    FlashInfer snapshots the store when it attaches but reads a key published
+    after that from disk on first lookup, so a second server publishing into
+    the same root while this one tunes could split a TP group's ranks on a hit.
+    Only TP groups take it; a single rank has no group to split.
     """
-    if not cache_path.is_file():
-        return ""
     try:
-        configs = json.loads(cache_path.read_text())
-    except (OSError, ValueError):
-        return ""
-    if not isinstance(configs, dict):
-        return ""
-    payload = {"file": configs, "env": env}
-    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+        root.mkdir(parents=True, exist_ok=True)
+        lock = open(root / ".lock", "ab")
+    except OSError as e:
+        logger.warning(
+            "FlashInfer autotune: cannot create the store lock under %s (%s).", root, e
+        )
+        return None
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as e:
+        lock.close()
+        if e.errno in (errno.EWOULDBLOCK, errno.EAGAIN):
+            reason = "another process holds it"
+        else:
+            reason = f"flock is not supported here: {e}"
+        logger.warning("FlashInfer autotune: cannot lock store %s (%s).", root, reason)
+        return None
+    return lock
 
 
-def _drop_diverged_autotune_cache(
-    cache_path: Path, group: torch.distributed.ProcessGroup, env: dict[str, str]
-) -> None:
-    """Enter tuning with the same cache on every rank, or with none at all.
+def _autotune_store_digest(root: Path) -> str:
+    """Hash of every entry under ``root``, across all environment namespaces.
 
-    A cache hit skips a profile, so caches that disagree desync the reduction.
+    Covers every namespace rather than recomputing FlashInfer's environment
+    hash: a rank in a different environment reads a different namespace, and
+    stale namespaces only cost a spurious wipe. An unreadable entry counts by
+    name, so a peer without it disagrees rather than being silently matched.
     """
-    digests: list[str] = [""] * torch.distributed.get_world_size(group)
-    torch.distributed.all_gather_object(
-        digests, _autotune_cache_digest(cache_path, env), group=group
-    )
-    if len(set(digests)) == 1:
-        return
+    digest = hashlib.sha256()
+    for entry in sorted(root.glob("**/entries/*.json")):
+        digest.update(str(entry.relative_to(root)).encode() + b"\0")
+        try:
+            digest.update(hashlib.sha256(entry.read_bytes()).digest())
+        except OSError as e:
+            logger.warning("FlashInfer autotune: cannot read %s (%s).", entry, e)
+            digest.update(b"unreadable")
+    return digest.hexdigest()
+
+
+def _wipe_autotune_store(root: Path) -> bool:
+    """Delete every entry under ``root`` except the lock; return whether it worked."""
+    try:
+        children = list(root.iterdir())
+    except OSError as e:
+        logger.warning("FlashInfer autotune: cannot list %s (%s).", root, e)
+        return False
+    for child in children:
+        if child.name == ".lock":
+            continue
+        try:
+            if child.is_dir() and not child.is_symlink():
+                shutil.rmtree(child)
+            else:
+                child.unlink(missing_ok=True)
+        except OSError as e:
+            logger.warning("FlashInfer autotune: cannot remove %s (%s).", child, e)
+    left = list(root.glob("**/entries/*.json"))
+    if left:
+        logger.warning(
+            "FlashInfer autotune: %d entries survived wiping %s.", len(left), root
+        )
+    return not left
+
+
+def _agree_on_autotune_store(
+    root: Path,
+    locked: bool,
+    group: Optional[torch.distributed.ProcessGroup],
+    env: dict[str, str],
+) -> bool:
+    """Enter tuning with the same store on every rank, or with none at all.
+
+    A store hit skips a profile, so stores that disagree desync the reduction:
+    diverged stores are wiped on every rank. The environment is compared too:
+    it picks the namespace a rank reads, so equal stores alone do not mean two
+    ranks hit the same entries. A rank that could not lock, read
+    or wipe its store cannot vouch for its contents, so then no rank uses one.
+    Every branch is decided on gathered values, so all ranks take the same one.
+    Returns whether this rank tunes into its on-disk store.
+    """
+    if group is None:
+        return locked
+    digest = ""
+    if locked:
+        try:
+            digest = hashlib.sha256(
+                json.dumps(env, sort_keys=True).encode()
+                + _autotune_store_digest(root).encode()
+            ).hexdigest()
+        except OSError as e:
+            logger.warning("FlashInfer autotune: cannot scan %s (%s).", root, e)
+            locked = False
+    world_size = torch.distributed.get_world_size(group)
+    gathered: list = [None] * world_size
+    torch.distributed.all_gather_object(gathered, (locked, digest), group=group)
+    if not all(rank_locked for rank_locked, _ in gathered):
+        log_info_on_rank0(
+            logger,
+            "FlashInfer autotune: a rank could not lock its autotune store (see "
+            "that rank's warning); tuning in memory only on every rank.",
+        )
+        return False
+    if len({rank_digest for _, rank_digest in gathered}) == 1:
+        return True
     log_info_on_rank0(
         logger,
-        "FlashInfer autotune: per-rank caches disagree, discarding them and "
+        "FlashInfer autotune: per-rank stores disagree, discarding them and "
         "tuning from scratch so all ranks agree on the tactics.",
     )
-    cache_path.unlink(missing_ok=True)
+    wiped: list = [None] * world_size
+    torch.distributed.all_gather_object(wiped, _wipe_autotune_store(root), group=group)
+    if not all(wiped):
+        log_info_on_rank0(
+            logger,
+            "FlashInfer autotune: a rank could not empty its autotune store (see "
+            "that rank's warning); tuning in memory only on every rank.",
+        )
+        return False
+    return True
+
+
+def attach_flashinfer_autotune_store(model_runner: ModelRunner) -> _AutotuneStore:
+    """Attach this rank's managed autotune store, once per process.
+
+    ``autotune_v2`` attaches its store for the whole process (last attach wins),
+    and serving then reads tuned winners from that store's partition, not ones
+    tuned in memory under another store or before the attach. So every tuning
+    pass in the process -- target, extend, draft, and the PCIe-IPC all-reduce
+    -- must tune into one store attached before the first of them runs. The
+    gate runs before the attach: attaching loads the store into memory, after
+    which a wipe would no longer reach what the rank serves.
+    """
+    global _attached_store
+    if _attached_store is not None:
+        return _attached_store
+    from flashinfer import autotune_v2
+    from flashinfer.autotuner import _collect_metadata
+
+    root = flashinfer_autotune_store_root(model_runner)
+    sync_group = _autotune_tactic_sync_group(get_parallel().tp_group)
+    if sync_group is None:
+        # No group to split, and FlashInfer publishes each entry atomically, so
+        # servers that resolve the same root share the store without a lock.
+        lock, use_store = None, True
+    else:
+        lock = _lock_autotune_store(root)
+        # The environment autotune_v2 namespaces the store by.
+        env = _collect_metadata()
+        use_store = _agree_on_autotune_store(root, lock is not None, sync_group, env)
+    if use_store:
+        # Attach and load only; tuning happens in flashinfer_autotune_context.
+        with autotune_v2(mode="replay", cache_root=root):
+            pass
+        _attached_store = _AutotuneStore(root, lock)
+    else:
+        if lock is not None:
+            lock.close()
+        _attached_store = _AutotuneStore(None)
+    return _attached_store
 
 
 @contextlib.contextmanager
 def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool):
-    # The gate below decides on the same inputs load_configs does.
-    from flashinfer.autotuner import AutoTuner, _collect_metadata, autotune
+    from flashinfer import autotune_v2
 
     mr = model_runner
-    cache_path = flashinfer_autotune_cache_path(mr)
+    store = attach_flashinfer_autotune_store(mr)
     sync_group = _autotune_tactic_sync_group(get_parallel().tp_group)
-    reuse_cache = envs.SGLANG_FLASHINFER_AUTOTUNE_CACHE.get()
-    if reuse_cache:
-        autotune_cache = cache_path
-        if sync_group is not None:
-            _drop_diverged_autotune_cache(cache_path, sync_group, _collect_metadata())
-        logger.info("Running FlashInfer autotune with cache: %s", autotune_cache)
+    if store.root is None:
+        logger.info("Running FlashInfer autotune in memory only (no cache)")
     else:
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        runs_dir = cache_path.parent / "runs"
-        runs_dir.mkdir(parents=True, exist_ok=True)
-        autotune_cache = runs_dir / f"{cache_path.stem}.{timestamp}{cache_path.suffix}"
-        logger.info(
-            "Running FlashInfer autotune (cache reuse DISABLED via "
-            "SGLANG_FLASHINFER_AUTOTUNE_CACHE=0); writing fresh result to: %s",
-            autotune_cache,
-        )
+        logger.info("Running FlashInfer autotune with cache: %s", store.root)
 
     # Run warmup on the non-default stream to avoid NCCL 2.29+ cudaMemcpyBatchAsync
     # calls on default stream (unsupported by CUDA) when --enable-symm-mem is used.
@@ -278,24 +409,17 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
     with torch.get_device_module(mr.device).stream(mr.forward_stream):
         from sglang.srt.layers.logits_processor import autotune_dummy_run_mode
 
-        skip_ops = get_flashinfer_autotune_skip_ops(mr)
-        # autotune(cache=...) clears all file-loaded tactics on entry, which would drop
-        # the target's tactics when the draft worker loads; load and save them by hand.
-        tuner = AutoTuner.get()
-        if reuse_cache and autotune_cache.is_file():
-            tuner.load_configs(str(autotune_cache))
         with (
             _autotune_process_group(sync_group),
-            autotune(
-                True,
-                cache=None if reuse_cache else str(autotune_cache),
-                skip_ops=skip_ops,
+            autotune_v2(
+                mode="tune",
+                persistent_cache=store.root is not None,
+                cache_root=store.root,
+                skip_ops=get_flashinfer_autotune_skip_ops(mr),
             ),
             autotune_dummy_run_mode(run_lm_head=run_lm_head),
         ):
             yield
-        if reuse_cache:
-            tuner.save_configs(str(autotune_cache))
     torch.cuda.current_stream().wait_stream(mr.forward_stream)
     logger.info("FlashInfer autotune completed.")
 
@@ -362,8 +486,8 @@ def maybe_flashinfer_autotune_extend(
     prefill_autotune = getattr(mr.model, "autotune_prefill_kernels", None)
     wants_prefill_autotune = getattr(mr.model, "wants_prefill_autotune", None)
     if wants_prefill_autotune is not None and not wants_prefill_autotune():
-        # Entering the autotune context loads / saves the tactic cache and syncs
-        # ranks, so a model that has nothing to tune must decline before it.
+        # A model that declines has nothing to tune at the prefill ceiling, so
+        # it skips the autotune context and its timing-reduction setup entirely.
         prefill_autotune = None
     if prefill_autotune is not None and mr.is_generation and not mr.is_draft_worker:
         with flashinfer_autotune_context(mr, run_lm_head=False):
