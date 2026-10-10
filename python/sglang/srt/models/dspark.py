@@ -148,8 +148,8 @@ class BaseDSparkMarkovHead(nn.Module, ABC):
         return {}
 
     def gather_vocab(self, local_logits: torch.Tensor) -> torch.Tensor:
-        """[gamma, bs, local vocab] step logits -> [bs, gamma, vocab]."""
-        return local_logits.transpose(0, 1)
+        """[bs, gamma, local vocab] step logits -> [bs, gamma, vocab]."""
+        return local_logits
 
     @property
     def supports_sharded_greedy(self) -> bool:

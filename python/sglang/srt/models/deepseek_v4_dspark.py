@@ -530,11 +530,12 @@ class DSparkV4MarkovHead(BaseDSparkMarkovHead):
 
     def gather_vocab(self, local_logits: torch.Tensor) -> torch.Tensor:
         if self._tp_shard is None:
-            return local_logits.transpose(0, 1)
+            return local_logits
         # One gather per step keeps each call within the NVLink pull capacity,
         # which is sized for one step's rows.
         steps = [
-            self._vocab_gather(step)[:, : self.vocab_size] for step in local_logits
+            self._vocab_gather(local_logits[:, step].contiguous())[:, : self.vocab_size]
+            for step in range(local_logits.shape[1])
         ]
         return torch.stack(steps, dim=1)
 
