@@ -3,16 +3,22 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+from sglang.srt.arg_groups.model_override_base import (
+    attention_backends_of,
+    context_parallel_attn_dp_size,
+)
 from sglang.srt.arg_groups.overrides import (
     _deepseek_v4_kv_cache_dtype,
     declare_resolution,
     model_config_of,
+    resolved_view,
     resolving_view,
     run_post_process_pass,
 )
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils.common import is_npu
+from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
+from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
+from sglang.srt.utils.common import is_gfx95_supported, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -119,14 +125,43 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
 
     if cfg.cp_strategy == "zigzag" and not is_npu():
         raise ValueError(
-            "DeepSeekV4 zigzag CP requires the NPU backend; the CUDA backend "
-            "reindexes with interleave order."
+            "DeepSeekV4 zigzag CP requires the NPU backend; CUDA/HIP backends "
+            "reindex with interleave order."
         )
+    if get_platform().is_hip:
+        prefill_backend, decode_backend = attention_backends_of(
+            resolved_view(server_args)
+        )
+        if (prefill_backend, decode_backend) != ("dsv4", "dsv4"):
+            raise ValueError(
+                "DeepSeekV4 prefill CP on HIP requires the dsv4 attention "
+                f"backend for both phases, got prefill={prefill_backend!r}, "
+                f"decode={decode_backend!r}."
+            )
+        unsupported = (
+            ("multiple nodes", cfg.nnodes > 1),
+            (
+                "DeepSeek-V4.1",
+                model_config_of(server_args).hf_config.model_type == "deepseek_v41",
+            ),
+            (
+                "--enable-decoder-swa-bounded-replay",
+                cfg.enable_decoder_swa_bounded_replay,
+            ),
+            ("--enable-two-batch-overlap", cfg.enable_two_batch_overlap),
+        )
+        for feature, enabled in unsupported:
+            if enabled:
+                raise ValueError(
+                    f"DeepSeekV4 prefill CP on HIP does not support {feature} yet."
+                )
 
+    attn_dp_size = context_parallel_attn_dp_size(cfg, "DeepSeek-V4 context parallelism")
     declare_resolution(
         server_args,
         "validate_deepseek_v4_cp",
-        enable_dp_attention=True,
+        attn_dp_size=attn_dp_size,
+        dp_size=1,
     )
     declare_resolution(
         server_args,
@@ -136,10 +171,10 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
     declare_resolution(
         server_args,
         "validate_deepseek_v4_cp",
-        attn_cp_size=cfg.tp_size // cfg.dp_size,
+        attn_cp_size=cfg.tp_size // attn_dp_size,
     )
     if not is_npu():
-        assert cfg.dp_size == 1, (
+        assert attn_dp_size == 1, (
             "For round-robin split mode, dp attention is not supported."
         )
         assert cfg.tp_size <= 8, (
@@ -161,7 +196,7 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
     logger.warning(
         f"Enable Context Parallel for DeepSeekV4, "
         f"strategy={cfg.cp_strategy}, "
-        f"dp_size={cfg.dp_size}, moe_dense_tp_size={cfg.moe_dense_tp_size}, "
+        f"attn_dp_size={attn_dp_size}, moe_dense_tp_size={cfg.moe_dense_tp_size}, "
         f"attn_cp_size={cfg.attn_cp_size}, ep_size={cfg.ep_size}, tp_size={cfg.tp_size}"
     )
 
@@ -181,16 +216,27 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
         return
     if hf_config.vision_n_layers > 0 and cfg.enable_prefill_cp:
         _validate_deepseek_v41_vision_prefill_cp(server_args)
+    if (
+        cfg.dsv4_attn_backend == "trtllm"
+        and cfg.cuda_graph_config.prefill.backend != Backend.DISABLED
+    ):
+        raise ValueError(
+            "DeepSeek-V4.1 TRT-LLM requires --cuda-graph-backend-prefill disabled"
+        )
     if cfg.enable_encoder_swa_bounded_replay:
-        from sglang.srt.model_executor.cuda_graph_config import Backend
-
         incompatible = (
-            ("non-CUDA hardware", not get_platform().is_cuda),
+            (
+                "hardware other than CUDA or gfx950",
+                not (
+                    get_platform().is_cuda
+                    or (get_platform().is_hip and is_gfx95_supported())
+                ),
+            ),
             (
                 "prefill CUDA graphs",
                 cfg.cuda_graph_config.prefill.backend != Backend.DISABLED,
             ),
-            ("DP attention", cfg.enable_dp_attention),
+            ("DP attention", attn_dp_enabled_of(cfg)),
             # Prefill CP declares attn_cp_size and DP attention only later.
             ("context parallelism", cfg.attn_cp_size > 1 or cfg.enable_prefill_cp),
             ("external cache linker", cfg.enable_unified_cache_external_linker),
@@ -223,8 +269,14 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
         ),
         ("HiSparse", cfg.enable_hisparse),
         ("the unified KV layout", is_unified_kv_triton()),
-        # The trtllm-gen path has no uniform-FP8 pool for V4.1's ratio-1/2 layers.
-        ("the trtllm DSv4 attention backend", cfg.dsv4_attn_backend == "trtllm"),
+        (
+            "TRT-LLM with SWA bounded replay",
+            cfg.dsv4_attn_backend == "trtllm"
+            and (
+                cfg.enable_encoder_swa_bounded_replay
+                or cfg.enable_decoder_swa_bounded_replay
+            ),
+        ),
         ("two-batch overlap", cfg.enable_two_batch_overlap),
         ("pipeline parallelism", cfg.pp_size > 1),
     )
@@ -244,18 +296,15 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
         if (
             read_ragged_verify_mode() is not RaggedVerifyMode.STATIC
             or cfg.disaggregation_transfer_backend != "mooncake"
-            or cfg.dp_size != 1
-            or cfg.enable_dp_attention
+            or cfg.enable_prefill_cp
             or cfg.attn_cp_size != 1
             or cfg.dcp_size != 1
         ):
             raise ValueError(
                 "DeepSeek-V4.1 DSpark PD requires static verify, Mooncake, "
-                "DP=1 and CP=1. Both servers must enable DSpark with the same "
-                "block size and TP size."
+                "and CP=1 on both servers. DP attention is supported when "
+                "both servers use the same block size and target/draft KV layout."
             )
-
-    from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 
     prefill_graph = cfg.cuda_graph_config.prefill
     if prefill_graph.backend != Backend.DISABLED and prefill_graph.max_seq_len is None:
@@ -274,8 +323,6 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
         )
 
     if cfg.enable_decoder_swa_bounded_replay:
-        from sglang.srt.model_executor.cuda_graph_config import Backend
-
         # Late layers see a per-request tail slice, not the captured prefill shape.
         incompatible = (
             (
@@ -283,7 +330,7 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 cfg.cuda_graph_config.prefill.backend != Backend.DISABLED,
             ),
             # input_ids_global is a DP-wide gather, so the tail slice cannot apply.
-            ("DP attention", cfg.enable_dp_attention),
+            ("DP attention", attn_dp_enabled_of(cfg)),
         )
         for feature, enabled in incompatible:
             if enabled:

@@ -184,7 +184,6 @@ for _mod, _fn in [
     ("dsa.cp_split", "dsa_cp_interleave_q_seqs_kernel"),
     ("dsv4.fp4_indexer", "quantize_fp4_indexer_tensor"),
     ("dsv4.fp4_indexer", "store_fp4_index_k_cache"),
-    ("dsv4.rms_normalize_hip", "rms_normalize_triton"),
 ]:
     register_kernel(
         KernelSpec(
@@ -287,3 +286,124 @@ for _mod, _fn, _backend, _device in [
         )
     )
 del _mod, _fn, _backend, _device
+
+
+# Public entry points inventoried by logical operator group (RFC #29630).
+register_kernel(
+    KernelSpec(
+        op="attention.get_block_table",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.minicpm_sala.get_block_table:get_block_table",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="attention.fast_kpool_topk_transform_fused",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.dsa.kpool_topk_transform:fast_kpool_topk_transform_fused",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="attention.fast_topk",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.fast_topk:fast_topk",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="attention.deep_select_topk",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.deep_select:topk",
+        # Exactly SM90, SM100 and SM103, the architectures DeepSelect is tuned for.
+        capabilities=frozenset(
+            CapabilityRequirement.cuda(min_sm=sm, max_sm=sm)
+            for sm in ((9, 0), (10, 0), (10, 3))
+        ),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="attention.fused_k_indexer_norm_rope",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.dsa.indexer_k:fused_k_indexer_norm_rope",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="attention.fused_k_indexer_norm_rope_store",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.dsa.indexer_k:fused_k_indexer_norm_rope_store",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="attention.fused_rope_wo_a_bf16",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.dsv4.wo_a:fused_rope_wo_a_bf16",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 9))}
+        ),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="attention.fp4_index_logits_decode",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.attention.dsv4.fp4_indexer:fp4_index_logits_decode",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+    )
+)
+
+register_kernel(
+    KernelSpec(
+        op="attention.pack_prefix_current",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.attention.dllm_kv_pack:pack_prefix_current",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+        description="Pack CSR prefix and current K/V into caller-provided dense buffers.",
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="attention.flash_attn_gqa_512",
+        backend=KernelBackend.CUTE_DSL,
+        target="sglang.kernels.ops.attention.flash_attention_v4:flash_attn_gqa_512",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(11, 9))}
+        ),
+        format_signature=FormatSignature(
+            supported_dtypes=("float16", "bfloat16"),
+            description="SM100/SM110 D512 GQA with separate K/V and optional page tables.",
+        ),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="attention.gemma_qkv_norm_rope",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.attention.gemma_qkv_norm_rope:gemma_qkv_norm_rope",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+        format_signature=FormatSignature(
+            supported_dtypes=("float16", "bfloat16"),
+            in_place=True,
+            description="Strided QKV normalization and partial NeoX RoPE.",
+        ),
+    )
+)
+
+for _fn in ("fp4_index_logits_paged", "finish_paged_indexer_topk"):
+    register_kernel(
+        KernelSpec(
+            op=f"attention.{_fn}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.attention.dsv4.fp4_indexer:{_fn}",
+            capabilities=frozenset({CapabilityRequirement.CUDA}),
+        )
+    )
+del _fn

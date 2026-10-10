@@ -331,7 +331,24 @@ def _migrate_deprecated_dp_rank(values: dict) -> dict:
     return values
 
 
-class CompletionRequest(BaseModel):
+class PDRoutingFields(BaseModel):
+    """PD and DP routing fields a router may inject into a request."""
+
+    # For PD disaggregation
+    bootstrap_host: Optional[Union[List[str], str]] = None
+    bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
+    bootstrap_room: Optional[Union[List[int], int]] = None
+
+    # For DP routing -- external router assigns a specific DP worker
+    routed_dp_rank: Optional[int] = None
+    # For PD disagg -- hint telling decode which prefill DP worker has the KV cache
+    disagg_prefill_dp_rank: Optional[int] = None
+
+    def pd_routing_kwargs(self) -> Dict[str, Any]:
+        return {name: getattr(self, name) for name in PDRoutingFields.model_fields}
+
+
+class CompletionRequest(PDRoutingFields):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/completions/create
     model: str = Field(
@@ -384,15 +401,6 @@ class CompletionRequest(BaseModel):
 
     images_config: Optional[Dict] = None
 
-    # For PD disaggregation
-    bootstrap_host: Optional[Union[List[str], str]] = None
-    bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
-    bootstrap_room: Optional[Union[List[int], int]] = None
-
-    # For DP routing — external router assigns a specific DP worker
-    routed_dp_rank: Optional[int] = None
-    # For PD disagg — hint telling decode which prefill DP worker has the KV cache
-    disagg_prefill_dp_rank: Optional[int] = None
     # Deprecated: use routed_dp_rank instead
     data_parallel_rank: Optional[int] = None
 
@@ -847,7 +855,7 @@ def _has_message_level_tools(messages: Any) -> bool:
     )
 
 
-class ChatCompletionRequest(BaseModel):
+class ChatCompletionRequest(PDRoutingFields):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/chat/create
     messages: List[ChatCompletionMessageParam]
@@ -965,15 +973,6 @@ class ChatCompletionRequest(BaseModel):
     # Priority for the request
     priority: Optional[int] = None
 
-    # For PD disaggregation
-    bootstrap_host: Optional[Union[List[str], str]] = None
-    bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
-    bootstrap_room: Optional[Union[List[int], int]] = None
-
-    # For DP routing — external router assigns a specific DP worker
-    routed_dp_rank: Optional[int] = None
-    # For PD disagg — hint telling decode which prefill DP worker has the KV cache
-    disagg_prefill_dp_rank: Optional[int] = None
     # Deprecated: use routed_dp_rank instead
     data_parallel_rank: Optional[int] = None
 
@@ -1408,10 +1407,11 @@ class ScoringRequest(BaseModel):
     item_first: bool = False
     return_pooled_hidden_states: bool = False
 
-    # Setwise readout (SequenceClassification-only): when set, the head is pooled
-    # AT every occurrence of this token in each `query + item` sequence instead of
-    # the last token, and `scores` is returned nested (one `[Nᵢ x num_labels]`
-    # matrix per item). --enable-mis fuses items; otherwise each is scored alone.
+    # Setwise readout: when set, the readout is taken AT every occurrence of this
+    # token in each `query + item` sequence instead of the last token, and `scores`
+    # is returned nested (one `[Nᵢ x num_labels]` matrix per item). SeqCls pools the
+    # head there; CausalLM reads label-token logprobs there. Both support batched
+    # and --enable-mis.
     score_extraction_token: Optional[str] = None
 
     model: str = DEFAULT_MODEL_NAME
@@ -1472,6 +1472,21 @@ DecisionText = Union[str, Dict[str, Any], List[Any]]
 RequiredDecisionText = Annotated[DecisionText, AfterValidator(_nonblank_decision_text)]
 
 
+def _to_image_url(
+    image: Union[ChatCompletionMessageContentImageURL, str],
+) -> ChatCompletionMessageContentImageURL:
+    if isinstance(image, str):
+        return ChatCompletionMessageContentImageURL(url=image)
+    return image
+
+
+# An image arrives as the chat image URL object or as its url alone, such as a
+# data URI or base64 bytes. A url alone is converted to the object as it validates.
+DecisionImage = Annotated[
+    Union[ChatCompletionMessageContentImageURL, str], AfterValidator(_to_image_url)
+]
+
+
 class DecisionOption(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -1527,6 +1542,7 @@ class DecisionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     input: RequiredDecisionText
+    images: List[DecisionImage] = Field(default_factory=list)
     questions: List[DecisionQuestion] = Field(min_length=1)
     # Scales option probabilities only, not label_mass.
     temperature: float = Field(default=1.0, gt=0, allow_inf_nan=False)
@@ -1774,7 +1790,7 @@ ResponseInputOutputItem: TypeAlias = Union[
 ]
 
 
-class ResponsesRequest(BaseModel):
+class ResponsesRequest(PDRoutingFields):
     """Request body for v1/responses endpoint."""
 
     # Core OpenAI API fields (ordered by official documentation)
@@ -1830,15 +1846,6 @@ class ResponsesRequest(BaseModel):
         default=None, description="Cache salt for request caching"
     )
 
-    # For PD disaggregation
-    bootstrap_host: Optional[Union[List[str], str]] = None
-    bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
-    bootstrap_room: Optional[Union[List[int], int]] = None
-
-    # For DP routing — external router assigns a specific DP worker
-    routed_dp_rank: Optional[int] = None
-    # For PD disagg — hint telling decode which prefill DP worker has the KV cache
-    disagg_prefill_dp_rank: Optional[int] = None
     # Deprecated: use routed_dp_rank instead
     data_parallel_rank: Optional[int] = None
 
@@ -1983,23 +1990,32 @@ class ResponsesRequest(BaseModel):
 
     def to_sampling_params(
         self,
-        default_max_tokens: int,
+        default_max_tokens: Optional[int] = None,
         default_params: Optional[Dict] = None,
         stop: Optional[Union[str, List[str]]] = None,
         tool_call_constraint: Optional[ToolCallConstraint] = None,
     ) -> Dict[str, Any]:
-        """Convert to sampling parameters for generation."""
+        """Convert to sampling parameters for generation.
+
+        ``default_max_tokens`` may be ``None``: when neither it nor
+        ``max_output_tokens`` is set, ``max_new_tokens`` is left ``None`` so the
+        scheduler clamps the budget against the real (post-expansion) input
+        length, matching the Chat Completions path. See issue #29287.
+        """
         if default_params is None:
             default_params = {}
 
         # Use max_output_tokens if available, otherwise use max_tokens for backwards compatibility
         if self.max_output_tokens is not None:
-            max_tokens = min(self.max_output_tokens, default_max_tokens)
+            max_tokens = self.max_output_tokens
+            if default_max_tokens is not None:
+                max_tokens = min(max_tokens, default_max_tokens)
         else:
             max_tokens = default_max_tokens
 
         # Headroom for BOS/EOS the engine appends on top of prompt+budget.
-        max_tokens -= 2
+        if max_tokens is not None:
+            max_tokens -= 2
 
         temperature = self.temperature
         if temperature is None:

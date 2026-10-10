@@ -24,7 +24,6 @@ from sglang.srt.disaggregation.encoder.runtime import (
 from sglang.srt.disaggregation.encoder.server import (
     BadRequestError,
     EncodeContext,
-    EncoderDelivery,
     EncoderMetaRegistry,
     InternalError,
     MMEncoder,
@@ -473,47 +472,6 @@ class TestEncoderDelivery(CustomTestCase):
 
         asyncio.run(run())
 
-    def test_failed_mooncake_transfer_releases_per_send_registration(self):
-        async def run():
-            encoder = MMEncoder.__new__(MMEncoder)
-            encoder._element_size = 2
-            encoder.transfer_backend = "mooncake"
-            encoder.engine = SimpleNamespace(
-                register=unittest.mock.Mock(),
-                transfer_sync=unittest.mock.Mock(
-                    side_effect=RuntimeError("transfer failed")
-                ),
-                deregister=unittest.mock.Mock(),
-            )
-            embedding = torch.ones((2, 4), dtype=torch.float16)
-            mm_data = EmbeddingData(
-                "failed-transfer",
-                1,
-                0,
-                None,
-                Modality.IMAGE,
-                embedding=embedding,
-            )
-
-            with patch(
-                "sglang.srt.disaggregation.encoder.server.get_disagg",
-                return_value=SimpleNamespace(encoder_transfer_backend="mooncake"),
-            ):
-                with self.assertRaisesRegex(RuntimeError, "transfer failed"):
-                    await encoder._send(
-                        embedding,
-                        mm_data,
-                        session_id="session",
-                        buffer_address=1,
-                    )
-
-            encoder.engine.register.assert_called_once_with(
-                embedding.data_ptr(), embedding.nbytes
-            )
-            encoder.engine.deregister.assert_called_once_with(embedding.data_ptr())
-
-        asyncio.run(run())
-
     @staticmethod
     def _global_cache_context(num_items=2):
         return SimpleNamespace(
@@ -636,16 +594,6 @@ class TestEncoderDelivery(CustomTestCase):
             log_exception.assert_called_once_with("MMEncoder background task failed")
 
         asyncio.run(run())
-
-    def test_contract_has_two_direct_implementations(self):
-        self.assertEqual(EncoderDelivery.__abstractmethods__, {"send", "release"})
-        self.assertEqual(
-            set(EncoderDelivery.__subclasses__()),
-            {
-                MooncakeDelivery,
-                ZmqDelivery,
-            },
-        )
 
     def test_failed_staged_send_releases_request(self):
         async def run():

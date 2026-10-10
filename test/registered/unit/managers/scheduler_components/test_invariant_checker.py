@@ -14,12 +14,14 @@ import torch
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
+from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.managers.scheduler_components import invariant_checker
 from sglang.srt.managers.scheduler_components.invariant_checker import (
     SchedulerInvariantChecker,
 )
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     SchedulerPoolStatsObserver,
+    kv_private_swa_tokens,
 )
 from sglang.srt.mem_cache.allocator.page_interleave import PageInterleavePoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixParams
@@ -28,6 +30,7 @@ from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.srt.session.streaming_session import SessionSlot
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -39,13 +42,14 @@ class TestCheckTreeCacheGate(CustomTestCase):
             envs.SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK.clear()
             yield
 
-    def _make_checker(self):
+    def _make_checker(self, prefix_sharing=True, hybrid_swa=True, hybrid_ssm=False):
         tree_cache = MagicMock()
-        tree_cache.is_tree_cache.return_value = True
-        tree_cache.supports_swa.return_value = True
+        tree_cache.supports_prefix_sharing.return_value = prefix_sharing
+        tree_cache.supports_swa.return_value = hybrid_swa
+        tree_cache.supports_mamba.return_value = hybrid_ssm
         return SchedulerInvariantChecker(
-            is_hybrid_swa=True,
-            is_hybrid_ssm=False,
+            is_hybrid_swa=hybrid_swa,
+            is_hybrid_ssm=hybrid_ssm,
             disaggregation_mode=DisaggregationMode.NULL,
             page_size=1,
             full_tokens_per_layer=None,
@@ -99,6 +103,32 @@ class TestCheckTreeCacheGate(CustomTestCase):
                 checker._check_tree_cache()
 
             checker.tree_cache.sanity_check.assert_called_once()
+
+    def test_skipped_without_prefix_sharing(self):
+        with envs.SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK.override(True):
+            checker = self._make_checker(
+                prefix_sharing=False, hybrid_swa=False, hybrid_ssm=True
+            )
+
+            checker._check_tree_cache()
+
+            checker.tree_cache.sanity_check.assert_not_called()
+
+
+class TestPrivateSwaTokens(CustomTestCase):
+    def test_floor_shielded_prefix_stays_private(self):
+        # A prefill-aware SWA request with radix off: the window cursor jumps to
+        # the floor (278) without freeing it, then frees [278, 300).
+        kv = ReqKvInfo(
+            req_pool_idx=0,
+            kv_allocated_len=280,
+            swa_evict_floor=278,
+            component_evicted_seqlens={ComponentType.SWA: 278},
+        )
+        self.assertEqual(kv_private_swa_tokens(kv, page_size=1), 280)
+        kv.kv_allocated_len = 450
+        kv.set_evicted_seqlen(ComponentType.SWA, 300)
+        self.assertEqual(kv_private_swa_tokens(kv, page_size=1), 428)
 
 
 class TestShardedFullPoolInvariant(CustomTestCase):
@@ -156,8 +186,6 @@ class TestShardedFullPoolInvariant(CustomTestCase):
             full_tokens_per_layer=None,
             swa_tokens_per_layer=None,
             max_total_num_tokens=self.allocator.size,
-            get_last_batch=lambda: self.last_batch,
-            get_running_batch=lambda: self.running_batch,
         )
         return SchedulerInvariantChecker(
             is_hybrid_swa=False,
@@ -285,6 +313,25 @@ class TestShardedFullPoolInvariant(CustomTestCase):
                 leak, msg = checker._check_full_pool(stats, uncached=uncached)
                 self.assertFalse(leak, msg)
                 self.assertNotIn("slack_allowed", msg)
+                with envs.SGLANG_CHECK_KV_PAGE_INVARIANTS.override(False):
+                    checker.self_check_during_busy()
+
+    def test_session_record_is_counted_once_by_its_owner(self):
+        checker = self._make_checker()
+        req = self._active_partial_page(checker)
+        # The session owns the row: session-held whether the turn is in a batch
+        # or parked between prefill chunks, never also uncached.
+        self.cache.session.slots["s"] = SessionSlot(kv=req.kv)
+        for parked in (False, True):
+            with self.subTest(parked=parked):
+                self.chunked_req = req
+                if parked:
+                    self.last_batch = SimpleNamespace(reqs=[], is_empty=lambda: True)
+                    self.running_batch = self.last_batch
+                self.assertEqual(checker._get_total_uncached_sizes(), (0, 0))
+                self.assertEqual(
+                    checker.pool_stats_observer.session_held_tokens(), self.PAGE_SIZE
+                )
                 with envs.SGLANG_CHECK_KV_PAGE_INVARIANTS.override(False):
                     checker.self_check_during_busy()
 

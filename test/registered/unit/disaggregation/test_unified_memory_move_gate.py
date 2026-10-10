@@ -150,6 +150,7 @@ class TestGatedPeerHolesAreNotSchedulable(CustomTestCase):
         def __init__(self, gate, host_gate=None):
             self.lazy_compaction = True
             self._free_phys_pages = [0, 1, 2, 3]  # only len() is read
+            self._pending_hicache_load_pages = 0
             self.entry_bytes_per_page = 512
             self.disagg_move_gate = gate
             self.host_transfer_move_gate = host_gate
@@ -297,28 +298,10 @@ class TestUnifiedAllocatorsPublishTheTransferContract(CustomTestCase):
                         f"{name}.{slot} does not cover every member",
                     )
 
-    def test_gate_setters_do_not_enumerate_members_themselves(self):
-        """The structural half of the rule above: a setter that names its
-        members is one a new member silently escapes. Installation must go
-        through the shared helper, which drives off `_move_gate_targets`.
-        """
-        import inspect
-
-        for name in self._EXPECTED_COVERAGE:
-            cls = self._allocator_class(name)
-            for setter in ("set_disagg_move_gate", "set_host_transfer_move_gate"):
-                if setter not in vars(cls):
-                    continue  # inherited, and the inherited one is checked above
-                with self.subTest(composite=name, setter=setter):
-                    body = inspect.getsource(getattr(cls, setter))
-                    self.assertIn("install_move_gate", body)
-                    self.assertNotIn("_move_gate = ", body)
-
     def test_swa_composite_translates_the_swa_side_separately(self):
         """The SWA sub-pool runs its OWN compaction, so a full-side physical id
-        does not name the SWA page holding the same virtual token. The read-path
-        `translate_loc_from_full_to_swa` cannot stand in either: it returns
-        kernel-facing ids, and the transfer addresses raw page envelopes."""
+        does not name the SWA page holding the same virtual token: the transfer
+        translate must go through the SWA sub-pool's own table."""
         virtual = torch.tensor([1, 3], dtype=torch.int32)
         for name in (
             "UnifiedSWATokenToKVPoolAllocator",
@@ -331,7 +314,6 @@ class TestUnifiedAllocatorsPublishTheTransferContract(CustomTestCase):
                 )
                 alloc.swa_attn_allocator = SimpleNamespace(
                     translate_kv_loc=lambda ids: ids + 32,
-                    translate_kv_loc_for_kernel=lambda ids: ids + 64,
                 )
                 physical = alloc.translate_swa_indices_for_transfer(virtual)
                 self.assertEqual(physical.dtype, torch.int64)

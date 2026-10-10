@@ -21,6 +21,12 @@ from openai.types.responses import (
     ResponseOutputText,
     ResponseReasoningItem,
 )
+from openai.types.responses.response_content_part_added_event import (
+    PartReasoningText as ResponseReasoningTextAddedPart,
+)
+from openai.types.responses.response_content_part_done_event import (
+    PartReasoningText as ResponseReasoningTextDonePart,
+)
 from openai.types.responses.response_custom_tool_call import ResponseCustomToolCall
 from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
 from openai.types.responses.response_output_text import Logprob, LogprobTopLogprob
@@ -449,27 +455,15 @@ class OpenAIServingResponses(OpenAIServingChat):
                     assert len(tool_list) == 0
                     tool_sessions = {}
                 for i, engine_prompt in enumerate(engine_prompts):
-                    # Calculate default max tokens from context length minus prompt length
-                    if isinstance(engine_prompt, list):
-                        prompt_length = len(engine_prompt)
-                    elif isinstance(engine_prompt, str):
-                        prompt_length = len(tokenizer.encode(engine_prompt))
-                    else:
-                        prompt_length = 0
-
-                    context_len = (
-                        self.tokenizer_manager.model_config.context_len
-                        if hasattr(self.tokenizer_manager.model_config, "context_len")
-                        else 4096
-                    )
-                    # Account for reserved tokens (e.g., EAGLE speculative decoding slots)
-                    # that the tokenizer_manager adds during validation
-                    num_reserved_tokens = self.tokenizer_manager.num_reserved_tokens
-                    default_max_tokens = max(
-                        context_len - prompt_length - num_reserved_tokens, 512
-                    )  # Ensure minimum 512 tokens
+                    # Leave the default budget unset so the scheduler clamps
+                    # max_new_tokens against the real (post-expansion) input
+                    # length, mirroring the Chat Completions path. Pre-computing
+                    # it here under-counted multimodal prompts (image tokens are
+                    # only expanded engine-side), so default_max_tokens was
+                    # overestimated and triggered spurious context-length 400s.
+                    # See issue #29287.
                     sampling_params = request.to_sampling_params(
-                        default_max_tokens,
+                        None,
                         self.default_sampling_params,
                         stop=(
                             processed_messages.stop
@@ -1081,6 +1075,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 chat_tools,
                 self.tool_call_parser,
                 tokenizer=self.tokenizer_manager.tokenizer,
+                tool_choice=tool_choice,
             )
             detector_owns_format = self._tool_parser_owns_format(parser)
             should_try_native = not is_required or detector_owns_format
@@ -1166,10 +1161,7 @@ class OpenAIServingResponses(OpenAIServingChat):
 
     @staticmethod
     def _tool_parser_owns_format(parser: FunctionCallParser) -> bool:
-        return (
-            parser.detector.supports_structural_tag()
-            or parser.detector.parses_required_natively()
-        )
+        return parser.owns_tool_format()
 
     @staticmethod
     def _chat_tool_choice(tool_choice: Any) -> Any:
@@ -1461,6 +1453,10 @@ class OpenAIServingResponses(OpenAIServingChat):
         # (message + function_call(s)); collapse them into one chat message
         # so chat templates render a single assistant block per turn.
         messages = self._merge_consecutive_assistant_messages(messages)
+
+        # Preserve the history prefix when a later instruction is appended.
+        if self.supports_inline_system:
+            return messages
 
         # Most chat templates expect a single leading ``system`` message;
         # coalesce any ``instructions`` + interleaved ``developer`` entries.
@@ -2011,6 +2007,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                     chat_tools,
                     self.tool_call_parser,
                     tokenizer=self.tokenizer_manager.tokenizer,
+                    tool_choice=tool_choice,
                 )
                 detector_owns_format = self._tool_parser_owns_format(probe)
             if is_required and not detector_owns_format:
@@ -2020,6 +2017,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                     chat_tools,
                     self.tool_call_parser,
                     tokenizer=self.tokenizer_manager.tokenizer,
+                    tool_choice=tool_choice,
                 )
         reasoning_parser_obj: Optional[ReasoningParser] = None
         if self.reasoning_parser:
@@ -2123,6 +2121,20 @@ class OpenAIServingResponses(OpenAIServingChat):
                             output_index=reasoning_state["output_index"],
                             content_index=0,
                             text=text,
+                        )
+                    )
+                )
+                events.append(
+                    _send_event(
+                        openai_responses_types.ResponseContentPartDoneEvent(
+                            type="response.content_part.done",
+                            item_id=reasoning_state["item_id"],
+                            sequence_number=-1,
+                            output_index=reasoning_state["output_index"],
+                            content_index=0,
+                            part=ResponseReasoningTextDonePart(
+                                type="reasoning_text", text=text
+                            ),
                         )
                     )
                 )
@@ -2359,6 +2371,19 @@ class OpenAIServingResponses(OpenAIServingChat):
                                     summary_index=0,
                                     part=ResponseReasoningSummaryAddedPart(
                                         type="summary_text", text=""
+                                    ),
+                                    sequence_number=-1,
+                                )
+                            )
+                        else:
+                            yield _send_event(
+                                openai_responses_types.ResponseContentPartAddedEvent(
+                                    type="response.content_part.added",
+                                    item_id=item_id,
+                                    output_index=reasoning_state["output_index"],
+                                    content_index=0,
+                                    part=ResponseReasoningTextAddedPart(
+                                        type="reasoning_text", text=""
                                     ),
                                     sequence_number=-1,
                                 )

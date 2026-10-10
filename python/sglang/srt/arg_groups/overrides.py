@@ -62,8 +62,10 @@ logger = logging.getLogger(__name__)
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.runtime_context import (
+    attn_dp_enabled_of,
     get_context,
     get_platform,
+    num_dp_ranks_of,
 )
 from sglang.srt.utils.common import (
     get_quantization_config,
@@ -374,7 +376,7 @@ _MAMBA_RADIX_CACHE_ARCHS = frozenset(
 )
 
 # Architectures that support the extra_buffer mamba radix cache strategy.
-# The single source of truth; `supports_mamba_cache_extra_buffer` reads it.
+# Registry specs opt in through `support_mamba_cache_extra_buffer` instead.
 _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
     {
         "KimiLinearForCausalLM",
@@ -409,12 +411,17 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
 )
 
 
-def supports_mamba_cache_extra_buffer(view: Any, model_arch: str) -> bool:
-    """Whether ``model_arch`` supports the extra_buffer strategy on the
-    configured linear-attention backend (pure read)."""
+def supports_mamba_cache_extra_buffer(view: Any, hf_config: Any) -> bool:
+    """Whether the model of ``hf_config`` supports the extra_buffer strategy on
+    the configured linear-attention backend (pure read)."""
+    from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec
+
     if get_platform().is_xpu:
         return False
-    if model_arch in _MAMBA_EXTRA_BUFFER_ARCHS:
+    spec = get_linear_attn_spec(hf_config)
+    if hf_config.architectures[0] in _MAMBA_EXTRA_BUFFER_ARCHS or (
+        spec is not None and spec.support_mamba_cache_extra_buffer
+    ):
         return view.linear_attn_backend == "triton"
     return False
 
@@ -422,9 +429,7 @@ def supports_mamba_cache_extra_buffer(view: Any, model_arch: str) -> bool:
 @register_post_process
 def _mamba_radix_cache_resolution(view: Any) -> dict:
     """Resolve hybrid-Mamba cache settings using the current page size and overlap policy."""
-    from sglang.srt.configs.linear_attn_model_registry import (
-        get_linear_attn_spec_by_arch,
-    )
+    from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec
 
     hf_config = model_config_of(view).hf_config
     model_arch = hf_config.architectures[0]
@@ -435,7 +440,9 @@ def _mamba_radix_cache_resolution(view: Any) -> dict:
             layer_type == "mamba"
             for layer_type in getattr(hf_config, "layer_types", [])
         )
-    spec = get_linear_attn_spec_by_arch(model_arch)
+    # Specs registered by config predicate (archs=[]) are only reachable
+    # through the HF config, not the architecture name.
+    spec = get_linear_attn_spec(hf_config)
     if not ((spec is not None and spec.uses_mamba_radix_cache) or in_branch):
         return {}
 
@@ -447,7 +454,7 @@ def _mamba_radix_cache_resolution(view: Any) -> dict:
         wants_overlap = not view.disable_overlap_schedule
         wants_paging = view.page_size is not None and view.page_size > 1
         if (wants_overlap or wants_paging) and supports_mamba_cache_extra_buffer(
-            view, model_arch
+            view, hf_config
         ):
             declared["mamba_radix_cache_strategy"] = "extra_buffer"
         else:
@@ -579,11 +586,6 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
             declared["dsa_prefill_backend"] = "intel_xpu"
         if view.dsa_decode_backend is None:
             declared["dsa_decode_backend"] = "intel_xpu"
-        # sgl-kernel topk ops (the default) are CUDA-only; fall back to the
-        # torch-native topk implementation on XPU, unless the user already
-        # picked a different backend explicitly (e.g. "flashinfer").
-        if view.dsa_topk_backend == "sgl-kernel":
-            declared["dsa_topk_backend"] = "torch"
         logger.warning(
             "Set DSA backends for XPU: prefill=%s, decode=%s, topk=%s.",
             declared.get("dsa_prefill_backend", view.dsa_prefill_backend),
@@ -926,7 +928,7 @@ def _flashinfer_allreduce_fusion_auto_enable(view: Any) -> dict:
         and not prefer_custom_dsv41
         and (get_platform().is_sm90 or get_platform().is_sm100)
         and view.tp_size > 1
-        and not view.enable_dp_attention
+        and not attn_dp_enabled_of(view)
         and (view.nnodes == 1 or get_platform().is_sm100)
         and view.moe_a2a_backend == "none"
     ):
@@ -1224,6 +1226,11 @@ def _fa4_page_constraint(view: Any) -> dict:
         # page_size==1, so skip the 128 auto-force for it and keep the default.
         and (view.speculative_eagle_topk or 0) <= 1
     ):
+        if (
+            "DiffusionGemmaForBlockDiffusion"
+            in model_config_of(view).hf_config.architectures
+        ):
+            return {"page_size": 1}
         logger.warning(
             f"FA4 backend only supports page size 128 for non-MLA model architectures, changing page_size from {view.page_size} to 128."
         )
@@ -1299,8 +1306,8 @@ def _page_size_default(view: Any) -> dict:
 
 @register_post_process
 def _data_parallelism_defaults(view: Any) -> dict:
-    if view.dp_size == 1 and view.ep_join_mode != "scale":
-        return {"enable_dp_attention": False, "enable_dp_lm_head": False}
+    if num_dp_ranks_of(view) == 1 and view.ep_join_mode != "scale":
+        return {"enable_dp_lm_head": False}
     return {}
 
 
@@ -1344,9 +1351,8 @@ def _tp_lm_head_all_to_all_default(view: Any) -> dict:
 
     enable = (
         view.disaggregation_mode == "decode"
-        and view.enable_dp_attention
-        and view.dp_size > 1
-        and view.tp_size == view.dp_size
+        and view.attn_dp_size > 1
+        and view.tp_size == view.attn_dp_size
         and view.attn_cp_size == 1
         and not view.enable_dp_lm_head
     )
@@ -1357,20 +1363,21 @@ def _tp_lm_head_all_to_all_default(view: Any) -> dict:
 def _dp_lm_head_validation(view: Any) -> dict:
     """Require DP attention for DP LM head and TP LM-head all-to-all."""
     if view.enable_dp_lm_head:
-        assert view.enable_dp_attention, (
-            "Please enable dp attention when setting enable_dp_lm_head. "
+        assert attn_dp_enabled_of(view), (
+            "--enable-dp-lm-head requires attention DP (--attn-dp-size)."
         )
     if view.enable_tp_lm_head_all_to_all:
-        assert view.enable_dp_attention, (
-            "Please enable dp attention when setting enable_tp_lm_head_all_to_all."
+        assert attn_dp_enabled_of(view), (
+            "--enable-tp-lm-head-all-to-all requires attention DP (--attn-dp-size)."
         )
         assert not view.enable_dp_lm_head, (
             "--enable-tp-lm-head-all-to-all uses a TP-sharded LM head and is "
             "incompatible with --enable-dp-lm-head."
         )
-        assert view.tp_size == view.dp_size, (
+        assert view.tp_size == view.attn_dp_size, (
             "--enable-tp-lm-head-all-to-all currently requires tp_size == "
-            f"dp_size, got tp_size={view.tp_size}, dp_size={view.dp_size}."
+            f"attn_dp_size, got tp_size={view.tp_size}, "
+            f"attn_dp_size={view.attn_dp_size}."
         )
         assert view.attn_cp_size == 1, (
             "--enable-tp-lm-head-all-to-all currently requires "
@@ -1412,8 +1419,12 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
 
         is_gfx95_mxfp8 = get_platform().is_hip and is_gfx95_supported()
         allowed = list(MXFP8_MOE_RUNNER_BACKEND_CHOICES)
-        if is_gfx95_mxfp8:
+        # Every other entry is CUDA-only. Honor an explicit triton request on ROCm
+        # instead of sending it back to flashinfer_trtllm, whose MoE apply path
+        # imports flashinfer.
+        if is_gfx95_mxfp8 or (get_platform().is_hip and moe_runner_backend == "triton"):
             allowed.append("triton")
+        if is_gfx95_mxfp8:
             # the aiter MXFP8 MoE quant info is built only when aiter is enabled
             if envs.SGLANG_USE_AITER.get():
                 allowed.append("aiter")
@@ -1435,11 +1446,11 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
     if (
         moe_runner_backend == "auto"
         and view.quantization == "modelopt_fp4"
-        and get_platform().is_sm120
+        and (get_platform().is_sm120 or get_platform().is_sm110)
     ):
         moe_runner_backend = "flashinfer_cutlass"
         logger.info(
-            "Use flashinfer_cutlass as MoE runner backend on SM120 for "
+            "Use flashinfer_cutlass as MoE runner backend on SM110/SM120 for "
             "modelopt_fp4 (trtllm-gen MoE kernels are SM100-only)"
         )
     if moe_runner_backend != view.moe_runner_backend:
@@ -1575,6 +1586,12 @@ def _dllm_attention_backend(view: Any) -> dict:
     from sglang.srt.dllm.algorithm import get_algorithm_cls
 
     algorithm_cls = get_algorithm_cls(view.dllm_algorithm)
+    if view.attention_backend in algorithm_cls.supported_attention_backends and all(
+        getattr(view, field, None)
+        in (None, *algorithm_cls.supported_attention_backends)
+        for field in ("prefill_attention_backend", "decode_attention_backend")
+    ):
+        return {}
     if backend := algorithm_cls.required_attention_backend:
         fields = (
             "attention_backend",
@@ -1688,11 +1705,14 @@ def post_capture_kv_sizing_planned(server_args: Any) -> bool:
     False for any config the runtime won't post-capture-size, else it gets an
     under-reserved fraction."""
     cfg = resolving_view(server_args)
+    # Logical-page sharding always runs prefill eagerly. This predicate runs
+    # before the sharding hook disables prefill capture, so gate on the feature
+    # itself to retain eager activation headroom in the memory heuristic.
+    if cfg.enable_kv_cache_sharding:
+        return False
+
     mla_enabled = use_mla_backend(server_args)
     if not envs.SGLANG_ENABLE_POST_CAPTURE_KV_SIZING.get():
-        return False
-    # Unified arenas are fully backed before capture and cannot resize afterward.
-    if cfg.enable_unified_memory:
         return False
     if cfg.device != "cuda":
         return False
@@ -1714,6 +1734,19 @@ def post_capture_kv_sizing_planned(server_args: Any) -> bool:
     ):
         return False
 
+    # Only the hybrid-SWA byte pool has a matching post-capture resize path.
+    model_config = model_config_of(server_args)
+    if cfg.enable_unified_memory:
+        from sglang.srt.configs.hybrid_arch import mambaish_config
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        if not model_config.is_hybrid_swa or mambaish_config(model_config) is not None:
+            return False
+        # The solver budgets these independent draft pools again after capture.
+        spec = SpeculativeAlgorithm.from_string(cfg.speculative_algorithm)
+        if spec.is_eagle() or spec.is_standalone() or spec.is_dflash_family():
+            return False
+
     if (
         cfg.disaggregation_mode != "prefill"
         and cfg.cuda_graph_config.decode.backend == Backend.DISABLED
@@ -1734,33 +1767,11 @@ def post_capture_kv_sizing_planned(server_args: Any) -> bool:
 
     from sglang.srt.configs.model_config import is_deepseek_v4, is_minimax_sparse
 
-    hf_config = model_config_of(server_args).hf_config
+    hf_config = model_config.hf_config
     if is_deepseek_v4(hf_config) or is_minimax_sparse(hf_config):
         return False
 
     return True
-
-
-def cutedsl_moe_max_num_tokens(server_args: Any) -> int:
-    """Largest number of tokens a single forward routes through a CuteDSL
-    MoE layer on one (DP) rank. Single source of truth for both the
-    standard-allgather wrapper buffers and the FlashInfer A2A dispatcher
-    budget. Max over the prefill (max_prefill_tokens), piecewise-prefill
-    capture, and decode/verify bounds; num_tokens_per_req is
-    speculative_num_draft_tokens under speculative decoding, else 1.
-    """
-    cfg = resolving_view(server_args)
-    if cfg.speculative_algorithm:
-        num_tokens_per_req = cfg.speculative_num_draft_tokens or 1
-    else:
-        num_tokens_per_req = 1
-    prefill_tokens = cfg.max_prefill_tokens
-    cg_config = cfg.cuda_graph_config
-    if cg_config is not None and cg_config.prefill.backend == Backend.TC_PIECEWISE:
-        prefill_tokens = max(prefill_tokens, cg_config.prefill.max_bs or 0)
-    decode_max_bs = (cg_config.decode.max_bs if cg_config is not None else 0) or 0
-    decode_tokens = decode_max_bs * num_tokens_per_req
-    return max(prefill_tokens, decode_tokens)
 
 
 def max_prefill_buffer_tokens(server_args: Any) -> int:
@@ -1782,6 +1793,17 @@ def max_prefill_buffer_tokens(server_args: Any) -> int:
     if isinstance(server_args, (ResolvedView, ResolvingConfig)):
         record = record_of(server_args)
     return prefill_buffer_ceiling_of(record, tokens)
+
+
+def flashinfer_a2a_max_dispatch_tokens_per_rank(prefill_buffer_tokens: int) -> int:
+    """Per-rank token capacity of the FlashInfer A2A workspace; the allocation
+    and the startup budget check must both read it from here."""
+    configured = envs.SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
+    if configured is not None:
+        return configured
+    # max_running_requests is unresolved at model construction; 4096 covers the
+    # per-DP-worker cap resolve_max_num_reqs applies, and _dummy_run.
+    return max(prefill_buffer_tokens, 4096)
 
 
 def mamba_cache_chunk_size(server_args: Any) -> int:

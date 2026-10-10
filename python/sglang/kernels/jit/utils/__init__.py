@@ -7,6 +7,7 @@ from sglang.kernels.jit.utils.arch import (
     override_jit_cuda_arch,
 )
 from sglang.kernels.jit.utils.common import (
+    aligned_new_empty,
     cache_once,
     empty_sentinel,
     get_ci_test_range,
@@ -23,6 +24,7 @@ from sglang.kernels.jit.utils.compile import (
 )
 
 __all__ = [
+    "aligned_new_empty",
     "empty_sentinel",
     "should_run_full_tests",
     "get_ci_test_range",
