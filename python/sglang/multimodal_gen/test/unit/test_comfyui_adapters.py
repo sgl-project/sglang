@@ -98,7 +98,13 @@ def test_flux_pack_rejects_kontext_reference_latents() -> None:
     timestep = torch.tensor([0.5])
     context = torch.ones(1, 8, 4096)
     with pytest.raises(ValueError, match="Kontext"):
-        adapter.pack(x, timestep, context, y=torch.ones(1, 768), ref_latents=[torch.ones(1, 16, 8, 8)])
+        adapter.pack(
+            x,
+            timestep,
+            context,
+            y=torch.ones(1, 768),
+            ref_latents=[torch.ones(1, 16, 8, 8)],
+        )
 
 
 def test_flux_pack_rejects_controlnet_control() -> None:

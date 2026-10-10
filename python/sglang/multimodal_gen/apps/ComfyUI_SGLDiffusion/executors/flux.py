@@ -5,7 +5,6 @@ import torch
 from .adapter import ComfyUIModelAdapter, PackedForward
 from .base import SGLDiffusionExecutor
 
-
 # Width of Flux.1's CLIP-L pooled vector (vec_in_dim / pooled_projection_dim).
 _FLUX_POOLED_DIM = 768
 
