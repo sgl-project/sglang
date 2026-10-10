@@ -8,7 +8,7 @@ from typing import Any, Callable, NamedTuple, Optional
 import torch
 
 from sglang.srt.mem_cache.pool_host.base import shared_host_layout_domains
-from sglang.srt.utils import get_device_module
+from sglang.srt.utils import get_device_module, is_cuda
 
 logger = logging.getLogger(__name__)
 device_module = get_device_module()
@@ -53,8 +53,17 @@ class L2TransferEngine:
 
     def __init__(self, io_backend: str):
         self.io_backend = io_backend
+        self.batch_direct = False
         self.device_to_host_stream = device_module.Stream()
         self.host_to_device_stream = device_module.Stream()
+
+    def enable_batch_direct(self) -> None:
+        from sglang.srt.mem_cache.pool_host.direct import load_block_dma_module
+
+        assert self.io_backend == "direct" and is_cuda()
+        # Compile during cache initialization, never on the first restore.
+        load_block_dma_module()
+        self.batch_direct = True
 
     @staticmethod
     def _resolve_device_indices(transfer: L2Transfer) -> torch.Tensor:
@@ -153,29 +162,49 @@ class L2TransferEngine:
             transfers, self.host_to_device_stream, "host_to_device", start_event
         ) as (transfers, completion):
             primary = transfers[0] if transfers else None
-            for layer_id in range(transfer_layer_id_max):
+            layer_groups = [
+                range(layer, layer + 1) for layer in range(transfer_layer_id_max)
+            ]
+            for layers in layer_groups:
                 for transfer in transfers:
-                    local_layer_id = (
-                        transfer.layer_mapper(layer_id)
-                        if transfer.layer_mapper is not None
-                        else layer_id
-                    )
-                    if local_layer_id is None or (
-                        transfer is not primary
-                        and transfer.layer_mapper is None
-                        and layer_id >= transfer.host_pool.layer_num
-                    ):
+                    local_layers = []
+                    for layer_id in layers:
+                        local = (
+                            transfer.layer_mapper(layer_id)
+                            if transfer.layer_mapper is not None
+                            else layer_id
+                        )
+                        if local is None or (
+                            transfer is not primary
+                            and transfer.layer_mapper is None
+                            and layer_id >= transfer.host_pool.layer_num
+                        ):
+                            continue
+                        local_layers.append(local)
+                    if not local_layers:
                         continue
-                    transfer.host_pool.load_to_device_per_layer_physical(
-                        transfer.device_pool,
-                        transfer.host_indices,
-                        transfer.device_indices,
-                        local_layer_id,
-                        self.io_backend,
-                        is_draft=transfer.is_draft,
-                    )
+                    if self.batch_direct:
+                        transfer.host_pool.load_to_device_layer_block(
+                            transfer.device_pool,
+                            transfer.host_indices,
+                            transfer.device_indices,
+                            local_layers,
+                            self.io_backend,
+                            is_draft=transfer.is_draft,
+                        )
+                    else:
+                        for layer in local_layers:
+                            transfer.host_pool.load_to_device_per_layer_physical(
+                                transfer.device_pool,
+                                transfer.host_indices,
+                                transfer.device_indices,
+                                layer,
+                                self.io_backend,
+                                is_draft=transfer.is_draft,
+                            )
                 if on_layer_done is not None:
-                    on_layer_done(layer_id)
+                    for layer_id in layers:
+                        on_layer_done(layer_id)
         return completion
 
     @staticmethod
