@@ -328,7 +328,7 @@ type TransferArgs = (
 #[derive(FromPyObject)]
 struct InspectionMatchResultInput {
     #[pyo3(attribute)]
-    device_indices: PyTensor,
+    device_prefix_len: usize,
     #[pyo3(attribute)]
     last_device_node: NodeId,
     #[pyo3(attribute)]
@@ -651,10 +651,10 @@ impl InsertParamsBinding {
     }
 }
 
-/// Python-visible match result; tensors and actions are Python-held.
+/// Python-visible match result; actions are Python-held.
 #[pyclass(get_all)]
 pub struct MatchResultBinding {
-    device_indices: Py<PyAny>,
+    device_prefix_len: usize,
     last_device_node_id: NodeId,
     last_host_node_id: NodeId,
     best_match_node_id: NodeId,
@@ -671,7 +671,7 @@ impl MatchResultBinding {
     /// Move a core match result across the boundary.
     fn from_match_result(py: Python<'_>, result: MatchResult) -> PyResult<Self> {
         Ok(MatchResultBinding {
-            device_indices: tensor_to_py(py, result.device_indices)?,
+            device_prefix_len: result.device_prefix_len,
             last_device_node_id: result.last_device_node_id,
             last_host_node_id: result.last_host_node_id,
             best_match_node_id: result.best_match_node_id,
@@ -2039,6 +2039,10 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         Ok(())
     }
 
+    fn is_write_through_compatible(&self, py: Python<'_>) -> bool {
+        py.allow_threads(|| self.core().is_write_through_compatible())
+    }
+
     /// Set the write-back (vs write-through) policy; decided at HiCache init.
     fn set_is_write_back(&self, py: Python<'_>, is_write_back: bool) {
         py.allow_threads(|| self.core().is_write_back = is_write_back);
@@ -2320,6 +2324,20 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         .map_err(node_access_error)
     }
 
+    fn inspect_get_component_host_lock_ref(
+        &self,
+        py: Python<'_>,
+        node_id: NodeId,
+        component_type: u8,
+    ) -> PyResult<u32> {
+        let component_type = parse_component_type(component_type)?;
+        py.allow_threads(|| {
+            self.core()
+                .inspect_get_component_host_lock_ref(node_id, component_type)
+        })
+        .map_err(node_access_error)
+    }
+
     fn inspect_get_node_hit_count(&self, py: Python<'_>, node_id: NodeId) -> PyResult<i64> {
         py.allow_threads(|| self.core().inspect_get_node_hit_count(node_id))
             .map_err(node_access_error)
@@ -2591,7 +2609,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         let component_type = parse_component_type(component_type)?;
         let key = K::key_from(Cow::Owned(py_array_to_vec_i64(py, key)?)).into_owned();
         let InspectionMatchResultInput {
-            device_indices,
+            device_prefix_len,
             last_device_node: last_device_node_id,
             last_host_node: last_host_node_id,
             best_match_node: best_match_node_id,
@@ -2603,7 +2621,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
             full_kv_hit_length,
         } = result;
         let result = MatchResult {
-            device_indices: device_indices.0,
+            device_prefix_len,
             last_device_node_id,
             last_host_node_id,
             best_match_node_id,
@@ -3315,6 +3333,10 @@ macro_rules! tree_core_binding {
                 catch_native_panic(|| self.inner.dec_host_lock_ref(py, node_id, params))
             }
 
+            fn is_write_through_compatible(&self, py: Python<'_>) -> bool {
+                self.inner.is_write_through_compatible(py)
+            }
+
             /// Set the write-back (vs write-through) policy; decided at HiCache init.
             fn set_is_write_back(&self, py: Python<'_>, is_write_back: bool) -> PyResult<()> {
                 catch_native_panic(|| {
@@ -3538,6 +3560,19 @@ macro_rules! tree_core_binding {
                 catch_native_panic(|| {
                     self.inner
                         .inspect_get_component_device_lock_ref(py, node_id, component_type)
+                })
+            }
+
+            #[cfg(feature = "inspection")]
+            fn inspect_get_component_host_lock_ref(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+                component_type: u8,
+            ) -> PyResult<u32> {
+                catch_native_panic(|| {
+                    self.inner
+                        .inspect_get_component_host_lock_ref(py, node_id, component_type)
                 })
             }
 

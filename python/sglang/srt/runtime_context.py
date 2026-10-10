@@ -474,6 +474,18 @@ def _install_parallel_properties() -> None:
 _install_parallel_properties()
 
 
+def linear_attn_parallel_group() -> str:
+    """The group linear attention partitions its heads over: the attention-TP
+    group, or the TP group under CP-TP group sharing, where the attention-TP
+    group is one rank wide."""
+    return "tp" if get_parallel().enable_cp_tp_group_sharing else "attn_tp"
+
+
+def linear_attn_tp_size() -> int:
+    """The width of ``linear_attn_parallel_group()``."""
+    return getattr(get_parallel(), f"{linear_attn_parallel_group()}_size")
+
+
 class _FlagGroupBase(msgspec.Struct):
     """Shared flag-group behavior: typo-safe writes + transactional ``override()``.
 
@@ -681,6 +693,10 @@ class ForwardFlags:
         "lora_batch_layout": LoRABatchLayout.DP_LOCAL,
         # LayerNorm sequence parallelism region; see layers/layernorm_sp.py.
         "sp_active": False,
+        # This forward's MoE runs on attention-TP-local token slices (the
+        # ForwardBatch.attn_tp_sequence_sharded decision, stamped by the model
+        # that slices); read by the benchmark routing override.
+        "attn_tp_sequence_sharded": False,
     }
 
     # Read/written inside compiled graphs (vocab embedding, layer boundaries,
@@ -697,6 +713,7 @@ class ForwardFlags:
             "defer_moe_finalize",
             "lora_batch_layout",
             "sp_active",
+            "attn_tp_sequence_sharded",
         }
     )
 
@@ -1772,9 +1789,11 @@ _PLATFORM_PROBES: Dict[str, str] = {
     "is_npu": "is_npu",
     "is_xpu": "is_xpu",
     "is_musa": "is_musa",
+    "is_mps": "is_mps",
     "is_sm90": "is_sm90_supported",
     "is_sm100": "is_sm100_supported",
     "is_sm100_or_sm110": "is_sm100_or_sm110_supported",
+    "is_sm110": "is_sm110_supported",
     "is_sm120": "is_sm120_supported",
     "is_blackwell": "is_blackwell_supported",
     "is_hopper_with_cuda_12_3": "is_hopper_with_cuda_12_3",
@@ -1991,13 +2010,12 @@ def exports_expert_balancedness_to_prometheus() -> bool:
 
 
 def cutedsl_moe_max_num_tokens() -> int:
-    """The CuteDSL A2A per-rank token budget.
+    """Largest token count one forward routes through a CuteDSL MoE layer on one
+    DP rank; sizes the standard-allgather wrapper, MegaMoE, and AR fusion buffers.
 
     Every input is a published leaf (``spec``, ``schedule``, ``exec.graph``), so
-    this derives from the bags and follows a post-publish override;
-    ``overrides.cutedsl_moe_max_num_tokens`` is the pre-publish equivalent the
-    resolution pipeline uses. Max over the prefill bound, the piecewise-prefill
-    capture, and the decode/verify bound.
+    this follows a post-publish override. Max over the prefill bound, the
+    piecewise-prefill capture, and the decode/verify bound.
     """
     from sglang.srt.model_executor.cuda_graph_config import Backend
 
@@ -2058,6 +2076,12 @@ def describe_kv_events_publisher(server_args: Any) -> Optional[dict]:
                                               # socket; present iff
                                               # load_endpoint_port_base
                                               # is present
+            "replay_endpoint_port_base": 5558,
+                                              # ROUTER replay port; rank r
+                                              # = base + r, same host rule
+                                              # as the SUB endpoints;
+                                              # present only when
+                                              # replay_endpoint is tcp
         }
 
     Returns None (i.e. "no publisher to describe") when any of:
@@ -2132,4 +2156,7 @@ def describe_kv_events_publisher(server_args: Any) -> Optional[dict]:
     if resolved_range is not None:
         descriptor["load_endpoint_port_base"] = resolved_range[1]
         descriptor["load_topic"] = LOAD_TOPIC
+    resolved_replay = parse_advertisable_tcp(cfg.replay_endpoint)
+    if resolved_replay is not None:
+        descriptor["replay_endpoint_port_base"] = resolved_replay[1]
     return descriptor

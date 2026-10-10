@@ -21,9 +21,15 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import prometheus_client
 
+from sglang.srt.disaggregation.decode import DecodeTransferQueue
+from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.managers.scheduler_components.metrics_reporter import (
+    SchedulerMetricsReporter,
+)
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_EXPERT_DISPATCH,
     STAT_LOGGER_ROLE_RADIX_CACHE,
@@ -32,6 +38,7 @@ from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_TOKENIZER,
     RadixCacheMetricsCollector,
     SchedulerMetricsCollector,
+    SchedulerStats,
     StorageMetricsCollector,
     TokenizerMetricsCollector,
     radix_cache_metric_labels,
@@ -222,6 +229,211 @@ class TestHiCacheMetrics(unittest.TestCase):
         self.assertEqual(
             collector.storage_prefetch_deferred_tokens_total.increments,
             [({**labels, "reason": "device_capacity"}, 7)],
+        )
+
+
+class TestDeferredKVReleaseMetrics(CustomTestCase):
+    def setUp(self):
+        self.labels = {
+            "model_name": "test",
+            "engine_type": "decode",
+            "tp_rank": 0,
+            "pp_rank": 0,
+            "moe_ep_rank": 0,
+        }
+        self.collector = SchedulerMetricsCollector.__new__(SchedulerMetricsCollector)
+        self.collector.labels = self.labels
+        self.collector.decode_deferred_kv_release_seconds = _RecordingMetric(
+            name="sglang:decode_deferred_kv_release_seconds",
+            labelnames=self.labels.keys(),
+        )
+        self.collector.decode_deferred_kv_release_total = _RecordingMetric(
+            name="sglang:decode_deferred_kv_release_total",
+            labelnames=list(self.labels.keys()) + ["outcome"],
+        )
+        self.collector.num_decode_deferred_kv_release_reqs = _RecordingMetric(
+            name="sglang:num_decode_deferred_kv_release_reqs",
+            labelnames=self.labels.keys(),
+        )
+
+    def test_records_duration_and_bounded_outcome(self):
+        self.collector.observe_decode_deferred_kv_release(
+            duration_seconds=0.25,
+            outcome="drained",
+        )
+
+        self.assertEqual(
+            self.collector.decode_deferred_kv_release_seconds.observations,
+            [(self.labels, 0.25)],
+        )
+        self.assertEqual(
+            self.collector.decode_deferred_kv_release_total.increments,
+            [({**self.labels, "outcome": "drained"}, 1)],
+        )
+        with self.assertRaisesRegex(ValueError, "Invalid deferred KV release outcome"):
+            self.collector.observe_decode_deferred_kv_release(
+                duration_seconds=0.5,
+                outcome="room-123",
+            )
+
+    def test_logs_current_deferred_release_count(self):
+        queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
+        queue.queue = []
+        queue._deferred_releases = [object(), object(), object()]
+        reporter = SchedulerMetricsReporter.__new__(SchedulerMetricsReporter)
+        reporter.scheduler = SimpleNamespace(
+            disaggregation_mode=DisaggregationMode.DECODE,
+            disagg_decode_transfer_queue=queue,
+            disagg_decode_prealloc_queue=SimpleNamespace(queue=[]),
+            running_batch=SimpleNamespace(reqs=[]),
+            waiting_queue=[],
+            grammar_manager=[],
+            enable_priority_scheduling=False,
+            pool_stats_observer=SimpleNamespace(
+                get_pool_stats=lambda: SimpleNamespace(
+                    update_scheduler_stats=lambda stats: None,
+                ),
+                streaming_session_count=lambda: 0,
+                session_held_tokens=lambda: 0,
+            ),
+        )
+        reporter.stats = SchedulerStats()
+        reporter.current_scheduler_metrics_enabled = True
+        collector = MagicMock()
+        collector.last_log_time = 0
+        collector.num_decode_deferred_kv_release_reqs = (
+            self.collector.num_decode_deferred_kv_release_reqs
+        )
+        collector.labels = self.labels
+        collector.log_stats.side_effect = lambda stats: (
+            SchedulerMetricsCollector.log_stats(collector, stats)
+        )
+        collector._log_gauge.side_effect = lambda gauge, data: (
+            SchedulerMetricsCollector._log_gauge(collector, gauge, data)
+        )
+        reporter.metrics_collector = collector
+
+        with (
+            patch(
+                "sglang.srt.managers.scheduler_components.metrics_reporter.ENABLE_METRICS_DEVICE_TIMER",
+                False,
+            ),
+            patch(
+                "sglang.srt.managers.scheduler_components.metrics_reporter.get_disagg",
+                return_value=SimpleNamespace(
+                    disaggregation_decode_host_receive_threshold=1
+                ),
+            ),
+            patch(
+                "sglang.srt.managers.scheduler_components.metrics_reporter.time.perf_counter",
+                side_effect=[31.0, 31.0, 62.0, 62.0],
+            ),
+        ):
+            reporter._maybe_log_idle_metrics()
+            self.assertEqual(reporter.stats.num_decode_deferred_kv_release_reqs, 3)
+            queue._deferred_releases.clear()
+            reporter._maybe_log_idle_metrics()
+            self.assertEqual(reporter.stats.num_decode_deferred_kv_release_reqs, 0)
+
+        self.assertEqual(
+            self.collector.num_decode_deferred_kv_release_reqs.sets,
+            [(self.labels, 3), (self.labels, 0)],
+        )
+
+    def test_decode_report_logs_current_deferred_release_count(self):
+        # Regression: report_decode_stats reads the queue in its message section
+        # before the metrics block runs, so a reset inside the metrics block
+        # would zero the gauge on every busy-path report.
+        queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
+        queue.queue = []
+        queue._deferred_releases = [object(), object()]
+        batch = SimpleNamespace(
+            reqs=[],
+            seq_lens_cpu=None,
+            forward_iter=1,
+            dp_cooperation_info=None,
+        )
+        reporter = SchedulerMetricsReporter.__new__(SchedulerMetricsReporter)
+        reporter.scheduler = SimpleNamespace(
+            disaggregation_mode=DisaggregationMode.DECODE,
+            disagg_decode_transfer_queue=queue,
+            disagg_decode_prealloc_queue=SimpleNamespace(
+                queue=[], retracted_queue=[], num_tokens_pre_allocated=0
+            ),
+            running_batch=batch,
+            waiting_queue=[],
+            grammar_manager=[],
+            enable_priority_scheduling=False,
+            max_total_num_tokens=1,
+            spec_algorithm=SimpleNamespace(is_none=lambda: True),
+            pool_stats_observer=SimpleNamespace(
+                get_pool_stats=lambda: SimpleNamespace(
+                    get_decode_usage_msg_parts=lambda: [],
+                    update_scheduler_stats=lambda stats: None,
+                ),
+                streaming_session_count=lambda: 0,
+                session_held_tokens=lambda: 0,
+            ),
+            kv_events_publisher=SimpleNamespace(
+                emit_kv_metrics=lambda: None, publish_kv_events=lambda: None
+            ),
+        )
+        reporter.stats = SchedulerStats()
+        reporter.current_scheduler_metrics_enabled = True
+        reporter.is_stats_logging_rank = False
+        reporter.enable_mfu_metrics = False
+        reporter.scheduler_status_logger = None
+        reporter.forward_ct_decode = 0
+        reporter.decode_log_interval = 1
+        reporter.last_decode_stats_tic = 0.0
+        reporter.num_generated_tokens = 0
+        reporter.num_retracted_reqs = 0
+        reporter.num_paused_reqs = 0
+        reporter.fwd_occupancy = 0.0
+        reporter._graph_backend_label = "cuda graph"
+        reporter._calculate_utilization = lambda: None
+        reporter._update_lora_metrics = lambda: None
+        reporter._log_hicache_stats = lambda: None
+        collector = MagicMock()
+        collector.num_decode_deferred_kv_release_reqs = (
+            self.collector.num_decode_deferred_kv_release_reqs
+        )
+        collector.labels = self.labels
+        collector.log_stats.side_effect = lambda stats: (
+            SchedulerMetricsCollector.log_stats(collector, stats)
+        )
+        collector._log_gauge.side_effect = lambda gauge, data: (
+            SchedulerMetricsCollector._log_gauge(collector, gauge, data)
+        )
+        reporter.metrics_collector = collector
+
+        with (
+            patch(
+                "sglang.srt.managers.scheduler_components.metrics_reporter.ENABLE_METRICS_DEVICE_TIMER",
+                False,
+            ),
+            patch(
+                "sglang.srt.managers.scheduler_components.metrics_reporter.RECORD_STEP_TIME",
+                False,
+            ),
+            patch(
+                "sglang.srt.managers.scheduler_components.metrics_reporter.get_disagg",
+                return_value=SimpleNamespace(
+                    disaggregation_decode_host_receive_threshold=1,
+                    language_only=False,
+                ),
+            ),
+            patch(
+                "sglang.srt.managers.scheduler_components.metrics_reporter.time.perf_counter",
+                return_value=10.0,
+            ),
+        ):
+            reporter.report_decode_stats(can_run_cuda_graph=False, running_batch=batch)
+
+        self.assertEqual(reporter.stats.num_decode_deferred_kv_release_reqs, 2)
+        self.assertEqual(
+            self.collector.num_decode_deferred_kv_release_reqs.sets,
+            [(self.labels, 2)],
         )
 
 

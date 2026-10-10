@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import sys
 from array import array
-from typing import TYPE_CHECKING, Optional, Sequence
+from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import torch
 
@@ -267,7 +267,7 @@ def _insert_step_from_binding(step) -> InsertStepResult:
 def _match_result_from_binding(result) -> MatchResult:
     """Build the Python MatchResult for the binding's match result."""
     return MatchResult(
-        device_indices=result.device_indices,
+        device_prefix_len=result.device_prefix_len,
         last_device_node=result.last_device_node_id,
         last_host_node=result.last_host_node_id,
         best_match_node=result.best_match_node_id,
@@ -371,6 +371,19 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             )
 
         self._page_size = params.page_size
+        self._swa_backup_index_mapper: Optional[
+            Callable[[torch.Tensor], torch.Tensor]
+        ] = None
+        allocator = params.token_to_kv_pool_allocator
+        if allocator is not None and ComponentType.SWA in self.tree_components:
+            from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
+                UnifiedSWAAllocatorBase,
+            )
+
+            if isinstance(allocator, UnifiedSWAAllocatorBase):
+                self._swa_backup_index_mapper = (
+                    allocator.translate_swa_indices_for_transfer
+                )
         self.is_eagle = (
             params.is_eagle and ComponentType.MAMBA not in self.tree_components
         )
@@ -868,11 +881,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
     def _refresh_swa_backup_indices(self, transfers: Sequence[PoolTransfer]) -> None:
         if not transfers:
             return
-        from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
-            UnifiedSWAAllocatorBase,
-        )
-
-        if not isinstance(self._allocator, UnifiedSWAAllocatorBase):
+        if self._swa_backup_index_mapper is None:
             return
         for transfer in transfers:
             if transfer.name != PoolName.SWA or not transfer.nodes_to_load:
@@ -883,7 +892,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 self.get_component_device_value(node_id, ComponentType.FULL)
                 for node_id in transfer.nodes_to_load
             ]
-            transfer.device_indices = self._allocator.translate_loc_from_full_to_swa(
+            transfer.device_indices = self._swa_backup_index_mapper(
                 torch.cat(full_values)
             ).to(torch.int64)
 
@@ -944,33 +953,15 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         )
         kv_xfer = _transfer_from_binding(kv_xfer)
         comp_xfers = _comp_xfers_from_binding(comp_xfers)
-        swa_xfers = comp_xfers.get(ComponentType.SWA, ())
-        if swa_xfers:
-            full_node_ids = kv_xfer.nodes_to_load or []
-            full_load_slices = {}
-            offset = 0
-            for full_node_id, count in zip(
-                full_node_ids, self._binding.get_node_key_lengths(full_node_ids)
-            ):
-                full_load_slices[full_node_id] = slice(offset, offset + count)
-                offset += count
-            for transfer in swa_xfers:
-                # SWA may have holes between resident nodes, or reload while
-                # FULL stays resident. Preserve the SWA transfer's node order.
-                transfer.anchor_index_parts = [
-                    (
-                        full_load_slices[nid]
-                        if nid in full_load_slices
-                        else self.get_component_device_value(nid, ComponentType.FULL)
-                    )
-                    for nid in transfer.nodes_to_load or ()
-                ]
         return kv_xfer, comp_xfers
 
     def prefetch_anchor_info(
         self, node_id: NodeId
     ) -> tuple[Optional[str], Optional[str]]:
         return self._binding.prefetch_anchor_info(node_id)
+
+    def is_write_through_compatible(self) -> bool:
+        return self._binding.is_write_through_compatible()
 
     def is_backuped(self, node_id: NodeId) -> bool:
         return self._binding.node_backuped(node_id)

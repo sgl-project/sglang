@@ -296,8 +296,7 @@ class GigaChat35AttentionMLA(deepseek_v2.DeepseekV2AttentionMLA):
                 bias=False,
                 quant_config=quant_config,
                 prefix=add_prefix("attn_gate", prefix),
-                tp_rank=get_parallel().attn_tp_rank,
-                tp_size=get_parallel().attn_tp_size,
+                parallel_group="attn_tp",
             )
             self.o_proj.register_forward_pre_hook(self._o_proj_gate_hook)
 
@@ -365,6 +364,7 @@ class GigaChat35DecoderLayer(deepseek_v2.DeepseekV2DecoderLayer):
             is_nextn=is_nextn,
             prefix=prefix,
             alt_stream=alt_stream,
+            build_stages=False,
         )
 
         attn_layer_id = config.num_hidden_layers if is_nextn else layer_id

@@ -71,6 +71,8 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler = Scheduler.__new__(Scheduler)
         scheduler._engine_paused = False
         scheduler.enable_overlap = False
+        scheduler.enable_skip_finishing_decode = False
+        scheduler.enable_overlap_mlx = False
         scheduler.last_batch = None
         scheduler.cur_batch_for_debug = None
         scheduler.chunked_req = None
@@ -522,9 +524,12 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         )
         scheduler.result_queue = deque([(MagicMock(), MagicMock())])
         event_log: List[str] = []
-        scheduler.process_batch_result = MagicMock(
-            side_effect=lambda *args, **kwargs: event_log.append("drain")
-        )
+
+        def process_result(batch, result):
+            self.assertFalse(scheduler.result_queue)
+            event_log.append("drain")
+
+        scheduler.process_batch_result = MagicMock(side_effect=process_result)
         scheduler._add_request_to_queue = MagicMock(
             side_effect=lambda req: event_log.append(
                 "requeue-released" if req.is_retracted else "requeue-unreleased"
@@ -565,19 +570,27 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         self.assertIs(scheduler.chunked_req, chunked_req)
 
     def test_retract_drains_overlap_queue(self):
-        """retract with overlap enabled should drain the result_queue."""
-        scheduler = self._new_scheduler()
-        scheduler.enable_overlap = True
-        mock_batch = MagicMock()
-        mock_batch.forward_mode.is_extend.return_value = False
-        scheduler.last_batch = mock_batch
-        scheduler.result_queue = deque([(MagicMock(), MagicMock())])
-        scheduler.process_batch_result = MagicMock()
+        """Single-result retract must preserve the existing chunk-preparation state."""
+        for mode in (
+            DisaggregationMode.NULL,
+            DisaggregationMode.PREFILL,
+            DisaggregationMode.DECODE,
+        ):
+            with self.subTest(mode=mode):
+                scheduler = self._new_scheduler()
+                scheduler.enable_overlap = True
+                scheduler.disaggregation_mode = mode
+                batch = ScheduleBatch(reqs=[], forward_mode=ForwardMode.EXTEND)
+                result = SimpleNamespace(delay_sample_func=None)
+                scheduler.last_batch = batch
+                scheduler.result_queue = deque([(batch, result)])
+                scheduler.process_batch_result = MagicMock()
 
-        scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
+                scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
 
-        scheduler.process_batch_result.assert_called_once()
-        self.assertEqual(len(scheduler.result_queue), 0)
+                scheduler.process_batch_result.assert_called_once_with(batch, result)
+                self.assertFalse(scheduler.result_queue)
+                self.assertFalse(batch.prefill_chunk_processed)
 
     def test_pd_decode_retract_requeues_for_rebootstrap(self):
         """PD decode retract should rebootstrap instead of resuming stale CPU KV."""

@@ -1785,16 +1785,12 @@ class MoriKVSender(CommonKVSender):
         mgr: MoriKVManager,
         bootstrap_addr: str,
         bootstrap_room: int,
-        dest_tp_ranks: List[int],
-        pp_rank: int,
         req_has_disagg_prefill_dp_rank: bool = False,
     ):
         super().__init__(
             mgr,
             bootstrap_addr,
             bootstrap_room,
-            dest_tp_ranks,
-            pp_rank,
             req_has_disagg_prefill_dp_rank,
         )
         self.conclude_state: Optional[KVPoll] = None
@@ -1848,6 +1844,12 @@ class MoriKVSender(CommonKVSender):
             )
 
     def poll(self) -> KVPoll:
+        return self._poll_with_status(self.kv_mgr.check_status)
+
+    def poll_pp_consensus(self) -> KVPoll:
+        return self._poll_with_status(self.kv_mgr.check_status_pp_consensus)
+
+    def _poll_with_status(self, check_status) -> KVPoll:
         if self.conclude_state is not None:
             return self.conclude_state
 
@@ -1855,7 +1857,7 @@ class MoriKVSender(CommonKVSender):
             self.conclude_state = KVPoll.Failed
             return self.conclude_state
 
-        status = self.kv_mgr.check_status(self.bootstrap_room)
+        status = check_status(self.bootstrap_room)
         if status == KVPoll.Bootstrapping:
             timeout_result = self._check_bootstrap_timeout()
             if timeout_result is not None:

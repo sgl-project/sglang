@@ -72,6 +72,9 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# Arbitrary; bounds how often an unreachable peer's dlists are rebuilt.
+_PEER_RELOAD_MIN_INTERVAL_S = 1.0
+
 GUARD = "NixlMsgGuard".encode("ascii")
 KV_MEM_KINDS = {"VRAM", "DRAM"}
 
@@ -527,6 +530,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         # peer_name -> (handle, num_slots, head_group_idx)
         self.prep_handles_segment_src: Dict[Tuple[int, int, str], Any] = {}
         self._num_slots_src: int = 0
+        self._peer_reload_lock = threading.Lock()
+        self._peer_reload_times: Dict[str, float] = {}
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             if self.kv_args.kv_item_lens:
@@ -1225,6 +1230,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             room = kv_chunk.room
             handles: List[Any] = []
             settle_timed_out = False
+            room_transfer_infos = None
             try:
                 if room not in self.request_status:
                     logger.debug(
@@ -1575,6 +1581,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     # drain ACK can follow; discard the target and fall back to
                     # the timeout.
                     self.poison_deferred_ack_room(room)
+                # Settle first; NIXL 1.3.0 undoes a reload when an old handle fails.
+                # room_transfer_infos survives the sender's clear() of this room.
+                self._reload_invalidated_peers(room_transfer_infos or {})
 
     def register_buffer_to_engine(self):
         self.kv_descs = []
@@ -1648,6 +1657,45 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         self.agent.add_remote_agent(decode_kv_args.agent_metadata)
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self._prepare_payload_xfer(decode_kv_args)
+
+    def _reload_invalidated_peers(self, room_transfer_infos: Dict[str, Any]) -> None:
+        # NIXL drops a peer's metadata after a remote-disconnect error and never
+        # restores it; reload it from the registration we already hold.
+        for agent_name in list(room_transfer_infos):
+            peer_info = self.decode_kv_args_table.get(agent_name)
+            if peer_info is None:
+                continue
+            try:
+                if self.agent.check_remote_metadata(agent_name):
+                    continue
+                with self._peer_reload_lock:
+                    if self.agent.check_remote_metadata(agent_name):
+                        continue
+                    now = time.monotonic()
+                    last = self._peer_reload_times.get(agent_name)
+                    if last is not None and now - last < _PEER_RELOAD_MIN_INTERVAL_S:
+                        continue
+                    self._peer_reload_times[agent_name] = now
+                    logger.warning(
+                        "NIXL invalidated remote agent %s; reloading its metadata",
+                        agent_name,
+                    )
+                    # No other thread holds these dlists: every room with this
+                    # peer has the same peer set, so all shard to this worker.
+                    self.prep_handles.pop(agent_name, None)
+                    self.prep_handles_slice_dst.pop(agent_name, None)
+                    peer_info.kv_xfer_segments = None
+                    self.agent.add_remote_agent(peer_info.agent_metadata)
+                    try:
+                        self._prepare_payload_xfer(peer_info)
+                    except Exception:
+                        # Leave the peer invalid so a later failure retries.
+                        self.agent.remove_remote_agent(agent_name)
+                        raise
+            except Exception:
+                logger.exception(
+                    "Failed to reload NIXL metadata for remote agent %s", agent_name
+                )
 
     def _send_kvcache_generic(
         self,
@@ -3133,16 +3181,12 @@ class NixlKVSender(CommonKVSender):
         mgr: NixlKVManager,
         bootstrap_addr: str,
         bootstrap_room: int,
-        dest_tp_ranks: List[int],
-        pp_rank: int,
         req_has_disagg_prefill_dp_rank: bool = False,
     ):
         super().__init__(
             mgr,
             bootstrap_addr,
             bootstrap_room,
-            dest_tp_ranks,
-            pp_rank,
             req_has_disagg_prefill_dp_rank,
         )
         self.init_time = time.time()
@@ -3188,9 +3232,15 @@ class NixlKVSender(CommonKVSender):
             self.has_sent = True
 
     def poll(self) -> KVPoll:
+        return self._poll_with_status(self.kv_mgr.check_status)
+
+    def poll_pp_consensus(self) -> KVPoll:
+        return self._poll_with_status(self.kv_mgr.check_status_pp_consensus)
+
+    def _poll_with_status(self, check_status) -> KVPoll:
         if self._send_failed:
             return KVPoll.Failed  # type: ignore
-        status = self.kv_mgr.check_status(self.bootstrap_room)
+        status = check_status(self.bootstrap_room)
         if status == KVPoll.Bootstrapping:
             timeout_result = self._check_bootstrap_timeout()
             if timeout_result is not None:

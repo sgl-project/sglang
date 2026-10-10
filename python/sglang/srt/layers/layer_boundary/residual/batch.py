@@ -106,6 +106,8 @@ def final_norm(
         )
         return hidden_states
     if skip_empty and hidden_states.shape[0] == 0:
+        if capture is not None:
+            capture(hidden_states)
         return hidden_states
     return access.final_norm_pair(
         hidden_states, residual, layernorm, capture, **read_kwargs

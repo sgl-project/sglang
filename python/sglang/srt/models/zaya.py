@@ -53,17 +53,19 @@ from torch import nn
 
 from sglang.srt.configs.zaya import ZayaConfig
 from sglang.srt.layers.layer_boundary import (
+    append_stages,
     declare_attn,
     declare_ffn,
-    make_stages,
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layer_boundary.residual.add_norm import PLAIN_ADD
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
+    LinearParallelGroup,
     ReplicatedLinear,
     RowParallelLinear,
+    resolve_linear_parallel_group,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
@@ -432,8 +434,7 @@ class CCA(nn.Module):
         layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        tp_rank: Optional[int] = None,
-        tp_size: Optional[int] = None,
+        parallel_group: LinearParallelGroup = "tp",
     ) -> None:
         super().__init__()
         self.config = config
@@ -446,12 +447,7 @@ class CCA(nn.Module):
         self.padding1 = self.cca_time1 - 1
         self.total_padding = self.padding0 + self.padding1
 
-        if tp_rank is None:
-            tp_rank = get_parallel().tp_rank
-        if tp_size is None:
-            tp_size = get_parallel().tp_size
-        self.tp_rank = int(tp_rank)
-        self.tp_size = int(tp_size)
+        self.tp_rank, self.tp_size = resolve_linear_parallel_group(parallel_group)
 
         # Full (global) head counts retained for weight loading and shape asserts.
         self.num_q_heads_full = int(cca_num_q_heads)
@@ -506,8 +502,7 @@ class CCA(nn.Module):
                 gather_output=False,
                 quant_config=quant_config,
                 prefix=add_prefix("linear_q", prefix),
-                tp_rank=self.tp_rank,
-                tp_size=self.tp_size,
+                parallel_group=parallel_group,
             )
             self.linear_k = ColumnParallelLinear(
                 self.hidden_size,
@@ -516,8 +511,7 @@ class CCA(nn.Module):
                 gather_output=False,
                 quant_config=quant_config,
                 prefix=add_prefix("linear_k", prefix),
-                tp_rank=self.tp_rank,
-                tp_size=self.tp_size,
+                parallel_group=parallel_group,
             )
         else:
             self.linear_q = ReplicatedLinear(
@@ -1320,12 +1314,8 @@ class ZayaDecoderATTLayer(nn.Module):
             self.res_scale = ResidualScaling(config, layer_id)
         else:
             self.res_scale = None
-        (self.attn_boundary,) = make_stages(
+        (self.attn_boundary,) = append_stages(
             (declare_attn(read=_ResidualMergeRead(self.res_scale)), self.input_norm),
-            previous=declare_ffn(sparse=True, next_layer_sparse=True)
-            if layer_id != 0
-            else None,
-            terminal=layer_id == config.num_hidden_layers - 1,
         )
         self.entry_boundary = self.attn_boundary
 
@@ -1375,7 +1365,7 @@ class ZayaDecoderMLPLayer(nn.Module):
             self.res_scale = ResidualScaling(config, layer_id)
         else:
             self.res_scale = None
-        (self.ffn_boundary,) = make_stages(
+        (self.ffn_boundary,) = append_stages(
             (
                 declare_ffn(
                     sparse=True,
@@ -1384,8 +1374,6 @@ class ZayaDecoderMLPLayer(nn.Module):
                 ),
                 self.input_norm,
             ),
-            previous=declare_attn(),
-            terminal=layer_id == config.num_hidden_layers - 1,
         )
         self.entry_boundary = self.ffn_boundary
 

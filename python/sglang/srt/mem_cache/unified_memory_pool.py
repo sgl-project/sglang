@@ -37,17 +37,24 @@ from sglang.kernels.ops.kvcache.copy_pages import copy_pages
 from sglang.kernels.ops.kvcache.zero_pages import zero_pages
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.kv_vmm_backing import KvVmmBufferOwner
+from sglang.srt.mem_cache.layout.fused_draft import (
+    DenseDraftRegion,
+    FusedDraftPlacement,
+)
 from sglang.srt.mem_cache.layout.token_major import (
     ROW_ALIGN_BYTES,
     DenseEntryLayout,
     DensePart,
     align_entry_bytes,
+    align_part_offset,
     build_dense_views,
     build_mamba_entry_views,
 )
 from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
     HybridReqToTokenPool,
+    KvBufferDesc,
     KVWriteLoc,
     MambaPool,
     MHATokenToKVPool,
@@ -111,6 +118,8 @@ class SubPoolSpec(ABC):
     name: str
     layer_num: int
     grow_direction: str  # "up" | "down" | "float"
+    # Fused draft region riding in this sub-pool's entries; None = unfused.
+    draft_region: Optional[DenseDraftRegion] = None
 
     def __post_init__(self):
         assert self.grow_direction in self._allowed_grow_directions, (
@@ -132,7 +141,16 @@ class SubPoolSpec(ABC):
 
 @dataclass(frozen=True, kw_only=True)
 class MHASubPoolSpec(SubPoolSpec):
-    """Per-slot layout of one MHA-shaped sub-pool. `v_head_dim` defaults to `head_dim`."""
+    """Per-slot layout of one MHA-shaped sub-pool. `v_head_dim` defaults to `head_dim`.
+
+    With `draft_region` set, the draft model's K and V rows are two more
+    parts of every slot's entry, after the host parts:
+
+        [ K_0 | V_0 | ... | K_{Lh-1} | V_{Lh-1} | dK_0 | dV_0 | ... | pad ]
+
+    The slot stride stays the one entry, so host and draft views are indexed
+    by the same physical token id; only their offsets differ.
+    """
 
     head_num: int
     head_dim: int
@@ -157,6 +175,8 @@ class MHASubPoolSpec(SubPoolSpec):
         assert self.v_head_dim > 0, (
             f"v_head_dim must be positive; got {self.v_head_dim}"
         )
+        if self.draft_region is not None:
+            self.draft_region.validate()
 
     def k_row_bytes(self) -> int:
         return self.head_num * self.head_dim * self.store_dtype.itemsize
@@ -164,9 +184,20 @@ class MHASubPoolSpec(SubPoolSpec):
     def v_row_bytes(self) -> int:
         return self.head_num * self.v_head_dim * self.store_dtype.itemsize
 
+    def host_entry_bytes(self) -> int:
+        """Host (target-only) bytes for one slot, before any draft parts."""
+        return self.layer_num * (self.k_row_bytes() + self.v_row_bytes())
+
+    def draft_offset_in_entry(self) -> int:
+        """Byte offset of the fused draft parts inside one slot's entry."""
+        assert self.draft_region is not None
+        return align_part_offset(self.host_entry_bytes())
+
     def entry_bytes(self) -> int:
+        if self.draft_region is None:
+            return align_entry_bytes(self.host_entry_bytes())
         return align_entry_bytes(
-            self.layer_num * (self.k_row_bytes() + self.v_row_bytes())
+            self.draft_offset_in_entry() + self.draft_region.entry_bytes()
         )
 
     def page_bytes(self, page_size: int) -> int:
@@ -177,27 +208,27 @@ class MHASubPoolSpec(SubPoolSpec):
         is ``page_size`` such entries back to back."""
         _check_row_alignment(self.name, K=self.k_row_bytes(), V=self.v_row_bytes())
         layer_stride = self.k_row_bytes() + self.v_row_bytes()
-        return DenseEntryLayout(
-            entry_bytes=self.entry_bytes(),
-            parts=(
-                DensePart(
-                    name="k",
-                    offset_bytes=0,
-                    layer_stride_bytes=layer_stride,
-                    layer_num=self.layer_num,
-                    row_shape=(self.head_num, self.head_dim),
-                    dtype=self.store_dtype,
-                ),
-                DensePart(
-                    name="v",
-                    offset_bytes=self.k_row_bytes(),
-                    layer_stride_bytes=layer_stride,
-                    layer_num=self.layer_num,
-                    row_shape=(self.head_num, self.v_head_dim),
-                    dtype=self.store_dtype,
-                ),
+        parts = (
+            DensePart(
+                name="k",
+                offset_bytes=0,
+                layer_stride_bytes=layer_stride,
+                layer_num=self.layer_num,
+                row_shape=(self.head_num, self.head_dim),
+                dtype=self.store_dtype,
+            ),
+            DensePart(
+                name="v",
+                offset_bytes=self.k_row_bytes(),
+                layer_stride_bytes=layer_stride,
+                layer_num=self.layer_num,
+                row_shape=(self.head_num, self.v_head_dim),
+                dtype=self.store_dtype,
             ),
         )
+        if self.draft_region is not None:
+            parts += self.draft_region.parts(self.draft_offset_in_entry())
+        return DenseEntryLayout(entry_bytes=self.entry_bytes(), parts=parts)
 
     def get_dtype(self) -> torch.dtype:
         return self.store_dtype
@@ -210,7 +241,8 @@ class MLASubPoolSpec(SubPoolSpec):
     One latent row (``kv_lora_rank + qk_rope_head_dim``) per token per layer; V
     is a prefix slice of the same row, so there is no separate V region. Not a
     subclass of ``MHASubPoolSpec`` — the K+V byte math and the ``v_head_dim > 0``
-    invariant there do not apply.
+    invariant there do not apply. With `draft_region` set, the draft's K and V
+    parts follow the latent rows inside every slot's entry, as on an MHA host.
     """
 
     kv_lora_rank: int
@@ -225,6 +257,8 @@ class MLASubPoolSpec(SubPoolSpec):
         assert self.qk_rope_head_dim > 0, (
             f"qk_rope_head_dim must be positive; got {self.qk_rope_head_dim}"
         )
+        if self.draft_region is not None:
+            self.draft_region.validate()
 
     @property
     def kv_cache_dim(self) -> int:
@@ -233,24 +267,37 @@ class MLASubPoolSpec(SubPoolSpec):
     def row_bytes(self) -> int:
         return self.kv_cache_dim * self.store_dtype.itemsize
 
+    def host_entry_bytes(self) -> int:
+        """Host (target-only) bytes for one slot, before any draft parts."""
+        return self.layer_num * self.row_bytes()
+
+    def draft_offset_in_entry(self) -> int:
+        """Byte offset of the fused draft parts inside one slot's entry."""
+        assert self.draft_region is not None
+        return align_part_offset(self.host_entry_bytes())
+
     def entry_bytes(self) -> int:
-        return align_entry_bytes(self.layer_num * self.row_bytes())
+        if self.draft_region is None:
+            return align_entry_bytes(self.host_entry_bytes())
+        return align_entry_bytes(
+            self.draft_offset_in_entry() + self.draft_region.entry_bytes()
+        )
 
     def layout(self) -> DenseEntryLayout:
         _check_row_alignment(self.name, latent=self.row_bytes())
-        return DenseEntryLayout(
-            entry_bytes=self.entry_bytes(),
-            parts=(
-                DensePart(
-                    name="kv",
-                    offset_bytes=0,
-                    layer_stride_bytes=self.row_bytes(),
-                    layer_num=self.layer_num,
-                    row_shape=(1, self.kv_cache_dim),
-                    dtype=self.store_dtype,
-                ),
+        parts = (
+            DensePart(
+                name="kv",
+                offset_bytes=0,
+                layer_stride_bytes=self.row_bytes(),
+                layer_num=self.layer_num,
+                row_shape=(1, self.kv_cache_dim),
+                dtype=self.store_dtype,
             ),
         )
+        if self.draft_region is not None:
+            parts += self.draft_region.parts(self.draft_offset_in_entry())
+        return DenseEntryLayout(entry_bytes=self.entry_bytes(), parts=parts)
 
     def get_dtype(self) -> torch.dtype:
         return self.store_dtype
@@ -269,6 +316,9 @@ class MambaSubPoolSpec(SubPoolSpec):
     def __post_init__(self):
         super().__post_init__()
         assert len(self.conv_state_shapes) > 0, "conv_state_shapes must be non-empty"
+        assert self.draft_region is None, (
+            "mamba state pages carry no fused draft region yet"
+        )
 
     def conv_row_bytes(self, idx: int) -> int:
         return _prod(self.conv_state_shapes[idx]) * self.conv_dtype.itemsize
@@ -346,6 +396,9 @@ class UnifiedKVPool:
         device: str,
         enable_memory_saver: bool,
         page_size: int = 1,
+        post_capture_active: bool = False,
+        bs1_floor_terms: Optional[List[Tuple[str, int]]] = None,
+        fused_draft: Optional[FusedDraftPlacement] = None,
     ):
         assert page_size >= 1, f"page_size must be >= 1; got {page_size}"
         assert len(sub_pool_specs) >= 2, (
@@ -379,22 +432,68 @@ class UnifiedKVPool:
         self._specs_by_name: Dict[str, SubPoolSpec] = {
             s.name: s for s in sub_pool_specs
         }
+        self.post_capture_active = post_capture_active
+        self._post_capture_owner: Optional[KvVmmBufferOwner] = None
+        self._bs1_floor_terms = bs1_floor_terms or []
+        self.fused_draft = fused_draft
+        for spec in sub_pool_specs:
+            expected = (
+                fused_draft.region
+                if fused_draft is not None and spec.name == "full"
+                else None
+            )
+            assert spec.draft_region is expected, (
+                f"sub-pool {spec.name!r}: draft_region {spec.draft_region} does "
+                f"not match the fused draft placement's {expected}"
+            )
 
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
         )
+        # Slot-0 dummy writes for both pools land in the reserved low-byte sink;
+        # each pool's first allocatable slot is chosen so real data starts past it.
+        # A page-aware sub-pool allocates whole pages, so the sink is all of page
+        # 0 (up to page_size * entry_bytes), not one slot entry -- reserve the
+        # max of both.
+        reserved_floor = _reserved_floor_bytes(self.sub_pool_specs, page_size)
+
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
-            self._raw = torch.empty(total_bytes, dtype=torch.uint8, device=device)
-        if envs.SGLANG_DEBUG_POISON_POOL.get():
-            # Debug: bf16-NaN-fill so NaN-unsafe reads of never-written bytes
-            # fail deterministically.
-            self._raw.view(torch.int16).fill_(0x7FC1)
-            logger.warning(
-                "[unified-memory-pool] POISONED: pool filled with bf16-NaN "
-                "patterns (SGLANG_DEBUG_POISON_POOL)"
-            )
-        else:
-            self._raw.zero_()  # unset slots must read as zeros (matches non-shared)
+            if post_capture_active:
+                dev = torch.device(device)
+                if dev.type != "cuda":
+                    raise ValueError(
+                        "UnifiedKVPool post-capture backing requires a CUDA device"
+                    )
+                device_id = (
+                    dev.index if dev.index is not None else torch.cuda.current_device()
+                )
+                self._post_capture_owner = KvVmmBufferOwner(
+                    device=device,
+                    device_id=device_id,
+                    store_dtype=torch.uint8,
+                    page_size=1,
+                    reserved_num_tokens=total_bytes,
+                    buffer_descs=[
+                        KvBufferDesc(
+                            "unified_raw",
+                            (total_bytes,),
+                            row_bytes=1,
+                            tokens_per_row=1,
+                        )
+                    ],
+                )
+                self._raw = self._post_capture_owner.tensors[0]
+                # Capture routes every dummy KV write to slot 0, whose page
+                # envelope is the whole reserved sink: back it before any graph
+                # is captured.
+                self._post_capture_owner.ensure_prefix(reserved_floor)
+                accessible_raw = self._raw[:reserved_floor]
+                self._accessible_bytes = reserved_floor
+            else:
+                self._raw = torch.empty(total_bytes, dtype=torch.uint8, device=device)
+                accessible_raw = self._raw
+                self._accessible_bytes = total_bytes
+        self._initialize_raw(accessible_raw)
 
         self._max_slots: Dict[str, int] = {}
         self._anchor_bytes: Dict[str, int] = {}
@@ -404,13 +503,6 @@ class UnifiedKVPool:
         self._mha_views: Dict[str, Tuple[List[torch.Tensor], List[torch.Tensor]]] = {}
         self._mla_views: Dict[str, List[torch.Tensor]] = {}
         self._mamba_views: Dict[str, Tuple[List[torch.Tensor], torch.Tensor]] = {}
-
-        # Slot-0 dummy writes for both pools land in the reserved low-byte sink;
-        # each pool's first allocatable slot is chosen so real data starts past it.
-        # A page-aware sub-pool allocates whole pages, so the sink is all of page
-        # 0 (up to page_size * entry_bytes), not one slot entry -- reserve the
-        # max of both.
-        reserved_floor = _reserved_floor_bytes(self.sub_pool_specs, page_size)
 
         for spec in self.sub_pool_specs:
             entry_bytes = spec.entry_bytes()
@@ -448,8 +540,9 @@ class UnifiedKVPool:
                 raise TypeError(f"unsupported SubPoolSpec type: {type(spec)}")
 
         logger.info(
-            "[unified-memory-pool] UnifiedKVPool allocated: total_bytes=%.2f GB (=%d B), "
+            "[unified-memory-pool] UnifiedKVPool %s: total_bytes=%.2f GB (=%d B), "
             "%d sub-pool(s)",
+            "reserved VA upper bound" if post_capture_active else "allocated",
             total_bytes / GB,
             total_bytes,
             len(self.sub_pool_specs),
@@ -467,6 +560,67 @@ class UnifiedKVPool:
                 self._min_slot_index[s.name],
                 self._min_slot_index[s.name],
             )
+
+    def _initialize_raw(self, raw: torch.Tensor) -> None:
+        if envs.SGLANG_DEBUG_POISON_POOL.get():
+            # Debug: bf16-NaN-fill so NaN-unsafe reads of never-written bytes
+            # fail deterministically.
+            raw.view(torch.int16).fill_(0x7FC1)
+            logger.warning(
+                "[unified-memory-pool] POISONED: backed pool bytes filled with "
+                "bf16-NaN patterns (SGLANG_DEBUG_POISON_POOL)"
+            )
+        else:
+            raw.zero_()  # unset slots must read as zeros (matches non-shared)
+
+    def _max_slots_for_total_bytes(self, total_bytes: int) -> Dict[str, int]:
+        max_slots_by_name = {}
+        for spec in self.sub_pool_specs:
+            max_slots = total_bytes // spec.entry_bytes()
+            min_page_index = (
+                self._min_slot_index[spec.name] + self._page_size - 1
+            ) // self._page_size
+            if max_slots // self._page_size <= min_page_index:
+                raise ValueError(
+                    f"unified pool size {total_bytes} leaves no allocatable page "
+                    f"for sub-pool {spec.name!r} after its reserved slot-0 sink"
+                )
+            max_slots_by_name[spec.name] = max_slots
+        return max_slots_by_name
+
+    @property
+    def post_capture_backed_bytes(self) -> int:
+        if self._post_capture_owner is None:
+            return 0
+        return self._post_capture_owner.backed_bytes
+
+    @property
+    def active_allocation_bytes(self) -> int:
+        """Bytes that are safe to access/register in the shared raw tensor."""
+        return self._accessible_bytes
+
+    def finalize_backing(self, config) -> None:
+        """Back the final shared byte budget without changing any tensor address."""
+        if self._post_capture_owner is None:
+            raise RuntimeError("UnifiedKVPool post-capture backing is not active")
+        final_total_bytes = config.unified_memory_pool_bytes
+        if final_total_bytes is None:
+            raise ValueError(
+                "UnifiedKVPool post-capture sizing requires "
+                "config.unified_memory_pool_bytes"
+            )
+        final_total_bytes = int(final_total_bytes)
+        _check_bs1_feasibility_floor(
+            total_bytes=final_total_bytes,
+            floor_terms=self._bs1_floor_terms,
+            factory="UnifiedKVPool.finalize_backing",
+        )
+        final_max_slots = self._max_slots_for_total_bytes(final_total_bytes)
+        self._post_capture_owner.ensure_prefix(final_total_bytes)
+        self._initialize_raw(self._raw[:final_total_bytes])
+        self.total_bytes = final_total_bytes
+        self._accessible_bytes = final_total_bytes
+        self._max_slots = final_max_slots
 
     # -- introspection --
 
@@ -491,6 +645,17 @@ class UnifiedKVPool:
         s = self._specs_by_name[name]
         assert isinstance(s, MambaSubPoolSpec), (
             f"sub-pool {name!r} is {type(s).__name__}, expected MambaSubPoolSpec"
+        )
+        return s
+
+    def require_draft_host_spec(self, name: str) -> SubPoolSpec:
+        """The sub-pool spec whose entries carry a fused draft region.
+
+        Kind-agnostic: any spec that resolves a `draft_region` also lays the
+        draft parts out in its `layout()`."""
+        s = self._specs_by_name[name]
+        assert s.draft_region is not None, (
+            f"sub-pool {name!r} carries no fused draft region"
         )
         return s
 
@@ -533,6 +698,27 @@ class UnifiedKVPool:
                 anchor_bytes=anchor_bytes,
             )
             for name in ("k", "v")
+        )
+        return k_views, v_views
+
+    def build_dense_draft_views(
+        self, sub_pool_name: str
+    ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+        """Per-layer K/V views of the DRAFT parts fused into ``sub_pool_name``'s
+        entries: same pages, same slot ids, same v2p table as the host."""
+        spec = self.require_draft_host_spec(sub_pool_name)
+        layout = spec.layout()
+        page_size = self._page_size
+        num_slots = self.max_slots(sub_pool_name) // page_size * page_size
+        k_views, v_views = (
+            build_dense_views(
+                self._raw,
+                layout=layout,
+                part_name=name,
+                num_slots=num_slots,
+                anchor_bytes=self._anchor_bytes[sub_pool_name],
+            )
+            for name in ("draft_k", "draft_v")
         )
         return k_views, v_views
 
@@ -617,6 +803,9 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
             kv_cache_layout="page_major",
         )
 
+    def _kv_tokens_per_row(self) -> int:
+        return 1
+
     def _create_buffers(self):
         self.k_buffer = self._k_views
         self.v_buffer = self._v_views
@@ -660,7 +849,11 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
         """
         assert self._unified_buffer.anchor_bytes(self._sub_pool_name) == 0
         raw = self._unified_buffer._raw
-        return [raw.data_ptr()], [raw.numel()], [self._page_bytes]
+        return (
+            [raw.data_ptr()],
+            [self._unified_buffer.active_allocation_bytes],
+            [self._page_bytes],
+        )
 
     def get_page_envelope_buffer(self) -> torch.Tensor:
         """Return this sub-pool's page-strided view of the shared allocation."""
@@ -736,8 +929,9 @@ class UnifiedMLATokenToKVPool(MLATokenToKVPool):
         # Lifetime owned by UnifiedKVPool; do not delete the views.
         pass
 
-    # `rebind_write_loc` already collapsed the widened id and sent the rows this
-    # rank does not own to the padding sink.
+    # The plan's write translation (`translate_write_loc`) already collapsed
+    # the widened id and sent the rows this rank does not own to the padding
+    # sink.
     write_loc_is_dcp_resolved = True
 
     def get_kv_size_bytes(self):
@@ -1050,6 +1244,7 @@ class UnifiedHybridReqToTokenPool(HybridReqToTokenPool):
         cache_params,
         mamba_layer_ids: List[int],
         enable_mamba_extra_buffer: bool,
+        enable_mamba_extra_buffer_lazy: bool,
         speculative_num_draft_tokens: Optional[int] = None,
         enable_overlap_schedule: bool = True,
         start_layer: Optional[int] = None,
@@ -1073,6 +1268,7 @@ class UnifiedHybridReqToTokenPool(HybridReqToTokenPool):
             cache_params=cache_params,
             mamba_layer_ids=mamba_layer_ids,
             enable_mamba_extra_buffer=enable_mamba_extra_buffer,
+            enable_mamba_extra_buffer_lazy=enable_mamba_extra_buffer_lazy,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
             enable_overlap_schedule=enable_overlap_schedule,
             start_layer=start_layer,
@@ -1259,6 +1455,7 @@ def init_unified_mamba_pools(
     use_mla_backend: bool,
     kv_lora_rank: Optional[int] = None,
     qk_rope_head_dim: Optional[int] = None,
+    fused_draft: Optional[FusedDraftPlacement] = None,
     mamba_layer_ids: List[int],
     full_attention_layer_ids: List[int],
     mamba2_cache_params,
@@ -1269,6 +1466,7 @@ def init_unified_mamba_pools(
     max_num_reqs: int,
     enable_memory_saver: bool,
     enable_mamba_extra_buffer: bool,
+    enable_mamba_extra_buffer_lazy: bool,
     speculative_num_draft_tokens: Optional[int],
     disable_overlap_schedule: bool,
     need_sort: bool,
@@ -1294,8 +1492,8 @@ def init_unified_mamba_pools(
             f"qk_rope_head_dim; got {kv_lora_rank} / {qk_rope_head_dim}"
         )
         assert not is_draft_worker, (
-            "init_unified_mamba_pools: draft workers (speculative decoding) are "
-            "not supported with the MLA unified pool"
+            "init_unified_mamba_pools: a draft worker binds views over the "
+            "target's buffer instead of building one of its own"
         )
         full_spec = MLASubPoolSpec(
             name="full",
@@ -1304,6 +1502,7 @@ def init_unified_mamba_pools(
             qk_rope_head_dim=qk_rope_head_dim,
             store_dtype=store_dtype,
             grow_direction="down",
+            draft_region=None if fused_draft is None else fused_draft.region,
         )
     else:
         full_spec = MHASubPoolSpec(
@@ -1314,6 +1513,7 @@ def init_unified_mamba_pools(
             store_dtype=store_dtype,
             kv_cache_dtype=kv_cache_dtype,
             grow_direction="down",
+            draft_region=None if fused_draft is None else fused_draft.region,
         )
     cp = mamba2_cache_params
     mamba_spec = MambaSubPoolSpec(
@@ -1356,6 +1556,7 @@ def init_unified_mamba_pools(
         device=device,
         enable_memory_saver=enable_memory_saver,
         page_size=page_size,
+        fused_draft=fused_draft,
     )
     req_to_token_pool = UnifiedHybridReqToTokenPool(
         unified_buffer=shared_pool,
@@ -1368,6 +1569,7 @@ def init_unified_mamba_pools(
         cache_params=mamba2_cache_params,
         mamba_layer_ids=mamba_layer_ids,
         enable_mamba_extra_buffer=enable_mamba_extra_buffer,
+        enable_mamba_extra_buffer_lazy=enable_mamba_extra_buffer_lazy,
         speculative_num_draft_tokens=speculative_num_draft_tokens,
         enable_overlap_schedule=not disable_overlap_schedule,
         start_layer=start_layer,
@@ -1617,6 +1819,17 @@ class UnifiedSWAKVPool(SWAKVPool):
     def get_kv_size_bytes(self):
         return 0, 0  # UnifiedKVPool logs the total; per-side would double-count
 
+    @property
+    def post_capture_active(self) -> bool:
+        return self.unified_buffer.post_capture_active
+
+    @property
+    def post_capture_backed_bytes(self) -> int:
+        return self.unified_buffer.post_capture_backed_bytes
+
+    def finalize_backing(self, config) -> None:
+        self.unified_buffer.finalize_backing(config)
+
     def get_contiguous_buf_infos(self):
         return self.full_kv_pool.get_contiguous_buf_infos()
 
@@ -1777,13 +1990,21 @@ def init_unified_swa_pools(
     swa_max_total_num_tokens: Optional[int] = None,
     total_bytes: Optional[int] = None,
     enable_memory_saver: bool,
+    post_capture_active: bool = False,
     need_sort: bool,
     forward_stream: Optional[torch.cuda.Stream] = None,
     lazy_compaction: bool = False,
     model_context_len: Optional[int] = None,
     sliding_window_size: Optional[int] = None,
+    fused_draft: Optional[FusedDraftPlacement] = None,
 ) -> UnifiedSWAPoolBundle:
-    """Build the SWA-hybrid unified-memory-pool stack."""
+    """Build the SWA-hybrid unified-memory-pool stack.
+
+    With ``fused_draft``, every entry of the "full" sub-pool carries the
+    draft model's K/V parts after the host parts, and each draft runner
+    binds a `UnifiedDraftKVPool` over its own lanes instead of allocating a
+    pool of its own.
+    """
     from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
         UnifiedSWATokenToKVPoolAllocator,
     )
@@ -1809,6 +2030,7 @@ def init_unified_swa_pools(
         store_dtype=store_dtype,
         kv_cache_dtype=kv_cache_dtype,
         grow_direction="down",
+        draft_region=None if fused_draft is None else fused_draft.region,
     )
     swa_spec = MHASubPoolSpec(
         name="swa",
@@ -1834,6 +2056,7 @@ def init_unified_swa_pools(
             "full_max_total_num_tokens": full_max_total_num_tokens,
             "swa_max_total_num_tokens": swa_max_total_num_tokens,
         }
+    bs1_floor_terms = []
     if model_context_len is not None:
         # bs=1 floor: ONE sliding window of swa KV (+ a page of slack for the
         # page-granular walk) + the slot-0 sink. The full side is not charged
@@ -1844,12 +2067,13 @@ def init_unified_swa_pools(
             if sliding_window_size is not None
             else model_context_len
         )
+        bs1_floor_terms = [
+            ("swa_window_kv", swa_bs1_tokens * swa_spec.entry_bytes()),
+            ("sink", _reserved_floor_bytes([full_spec, swa_spec], page_size)),
+        ]
         _check_bs1_feasibility_floor(
             total_bytes=total_bytes,
-            floor_terms=[
-                ("swa_window_kv", swa_bs1_tokens * swa_spec.entry_bytes()),
-                ("sink", _reserved_floor_bytes([full_spec, swa_spec], page_size)),
-            ],
+            floor_terms=bs1_floor_terms,
             factory="init_unified_swa_pools",
         )
     if total_bytes <= 0:
@@ -1860,6 +2084,9 @@ def init_unified_swa_pools(
         device=device,
         enable_memory_saver=enable_memory_saver,
         page_size=page_size,
+        post_capture_active=post_capture_active,
+        bs1_floor_terms=bs1_floor_terms,
+        fused_draft=fused_draft,
     )
     token_to_kv_pool = UnifiedSWAKVPool(
         unified_buffer=shared_pool,
@@ -1948,6 +2175,7 @@ def init_unified_mamba_swa_pools(
     max_num_reqs: int,
     enable_memory_saver: bool,
     enable_mamba_extra_buffer: bool,
+    enable_mamba_extra_buffer_lazy: bool,
     disable_overlap_schedule: bool,
     need_sort: bool,
     speculative_num_draft_tokens: Optional[int] = None,
@@ -1956,6 +2184,7 @@ def init_unified_mamba_swa_pools(
     unified_total_bytes: Optional[int] = None,
     sliding_window_size: Optional[int] = None,
     decode_pre_alloc_size: int = 0,
+    fused_draft: Optional[FusedDraftPlacement] = None,
 ) -> UnifiedPoolBundle:
     """Build the TRI-pool unified-memory-pool stack for models with full KV +
     SWA KV + mamba/conv state (Inkling-class: `mambaish_config` AND
@@ -1971,7 +2200,8 @@ def init_unified_mamba_swa_pools(
 
     Sizing inputs are the same token counts the 2-pool factories take (ratio-
     fed until the byte configurator lands); the buffer budget is their byte
-    sum and the runtime split floats.
+    sum and the runtime split floats. With ``fused_draft``, every entry of the
+    "full" sub-pool carries the draft's parts, as in the 2-pool factories.
     """
     from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
         UnifiedMambaSWATokenToKVPoolAllocator,
@@ -1998,6 +2228,7 @@ def init_unified_mamba_swa_pools(
         store_dtype=store_dtype,
         kv_cache_dtype=kv_cache_dtype,
         grow_direction="down",
+        draft_region=None if fused_draft is None else fused_draft.region,
     )
     swa_spec = MHASubPoolSpec(
         name="swa",
@@ -2059,6 +2290,7 @@ def init_unified_mamba_swa_pools(
         device=device,
         enable_memory_saver=enable_memory_saver,
         page_size=page_size,
+        fused_draft=fused_draft,
     )
     token_to_kv_pool = UnifiedSWAKVPool(
         unified_buffer=shared_pool,
@@ -2080,6 +2312,7 @@ def init_unified_mamba_swa_pools(
         cache_params=mamba2_cache_params,
         mamba_layer_ids=mamba_layer_ids,
         enable_mamba_extra_buffer=enable_mamba_extra_buffer,
+        enable_mamba_extra_buffer_lazy=enable_mamba_extra_buffer_lazy,
         speculative_num_draft_tokens=speculative_num_draft_tokens,
         enable_overlap_schedule=not disable_overlap_schedule,
         start_layer=start_layer,

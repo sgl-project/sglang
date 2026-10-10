@@ -34,17 +34,17 @@ from sglang.srt.layers.layer_boundary.contracts import (
     InputContract,
     OutputContract,
     ProducerReduction,
+    ReadoutFusion,
     StageContract,
     StageKind,
     StagePath,
 )
 from sglang.srt.layers.layer_boundary.exit import ExitDecision, FfnExit, MixerExit
 from sglang.srt.layers.layer_boundary.factories import (
+    append_stages,
     declare_attn,
     declare_ffn,
-    make_attn_stage,
-    make_ffn_stage,
-    make_stages,
+    layer_stack,
 )
 from sglang.srt.layers.layer_boundary.layout import (
     Layout,
@@ -72,6 +72,12 @@ from sglang.srt.layers.layer_boundary.residual.add_norm import (
     PLAIN_ADD,
     PLAIN_RESIDUAL_OPS,
 )
+from sglang.srt.layers.layer_boundary.residual.gated import (
+    GatedResidualState,
+)
+from sglang.srt.layers.layer_boundary.residual.ihc import (
+    IHCState,
+)
 from sglang.srt.layers.layer_boundary.residual.mhc import (
     MHCState,
 )
@@ -79,9 +85,8 @@ from sglang.srt.layers.layer_boundary.residual.mhc import (
 __all__ = [
     "declare_attn",
     "declare_ffn",
-    "make_attn_stage",
-    "make_ffn_stage",
-    "make_stages",
+    "append_stages",
+    "layer_stack",
     "PLAIN_ADD",
     "AttentionInputs",
     "StagePath",
@@ -92,7 +97,10 @@ __all__ = [
     "ExitDecision",
     "FfnExit",
     "FfnInputFusion",
+    "ReadoutFusion",
     "DeferredFinalize",
+    "GatedResidualState",
+    "IHCState",
     "LayerResidualOps",
     "Layout",
     "MHCState",

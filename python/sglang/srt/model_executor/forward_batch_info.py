@@ -43,7 +43,6 @@ from sglang.srt.environ import envs
 from sglang.srt.kv_canary.req_to_expected_token_ids_manager import (
     compute_req_all_ids_info,
 )
-from sglang.srt.layers.dcp.layout import localize_dcp_indices
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     dp_slot_in,
@@ -77,6 +76,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.managers.schedule_batch import MultimodalInputs, ScheduleBatch
+    from sglang.srt.mem_cache.kv_loc_plan import Cols, KVLocPlan
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
@@ -190,21 +190,6 @@ def _elastic_should_preserve_local_token_counts(
 
     uneven_token_count = len(set(global_num_tokens)) > 1
     return uneven_token_count
-
-
-def _localize_npu_dcp_out_cache_loc(
-    out_cache_loc: torch.Tensor,
-    *,
-    interleave_size: int,
-) -> torch.Tensor:
-    """Map allocator-global NPU DCP slots to this target rank."""
-    parallel = get_parallel()
-    return localize_dcp_indices(
-        out_cache_loc,
-        parallel.dcp_size,
-        parallel.dcp_rank,
-        interleave_size,
-    )
 
 
 class ForwardMode(IntEnum):
@@ -532,14 +517,23 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # The original sequence length without being chunked. Qwen-1M related.
     orig_seq_lens: Optional[torch.Tensor] = None
 
-    # The write loc before `rebind_write_loc` replaced it with physical
-    # ids; a backend re-derives from it into its capture-stable buffer.
+    # This iteration's KV ids, translated once per sub-pool (`KVLocPlan`).
+    # Every forward of the iteration holds the same plan; `out_cache_loc` is
+    # its write window in the full-attention ids this runner's pool indexes,
+    # and a backend that writes another sub-pool asks the plan for its ids
+    # (`KVIndexTranslator.write_ids`).
+    kv_loc_plan: Optional[KVLocPlan] = None
+    # The part of the plan's window this forward writes (None: all of it).
+    kv_loc_cols: Optional[Cols] = None
+    # The same write ids in the virtual space when `out_cache_loc` holds
+    # translated ones (None on a pool that indexes virtual ids), for the
+    # scheduler's bookkeeping: lazy compaction's in-flight write set, TBO's
+    # split, state capture.
     out_cache_loc_virtual: Optional[torch.Tensor] = None
     # DSV4-NPU only: per-pool slot bundle from DSV4NPUTokenToKVPoolAllocator,
     # consumed by the Ascend backend for PA_ND block tables. None elsewhere.
     out_cache_loc_dsv4: Optional[DSV4OutCacheLoc] = None
-    # Whether `out_cache_loc` holds physical ids: set by
-    # KVIndexTranslator.rebind_write_loc; capture-time batches declare it.
+    # Whether `out_cache_loc` holds physical ids: set by `KVLocPlan.bind`.
     out_cache_loc_is_physical: bool = False
     # The indices to track mamba state with
     mamba_track_indices: Optional[torch.Tensor] = None  # shape: [b], int64
@@ -556,6 +550,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For input embeddings
     input_embeds: Optional[torch.Tensor] = None
+    dllm_input_preparation_state: Optional[torch.Tensor] = None
     # For token embedding overrides (sparse replacement at specific positions)
     replace_embeds: Optional[torch.Tensor] = None
     replace_positions: Optional[torch.Tensor] = None
@@ -619,6 +614,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Setwise pooling readout positions (CPU tensors, one per request)
     token_indices_to_pool: Optional[List[torch.Tensor]] = None
 
+    # Joint schema head decision layouts (one per request, None if absent)
+    decision_layouts: Optional[List[Optional[List[int]]]] = None
+
     # === Borrowed from ScheduleBatch: compound (carry their own device tensors) ===
     # Sampling info
     sampling_info: SamplingBatchInfo = None
@@ -677,8 +675,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     #                                      the eager forward and the cuda-graph
     #                                      registry localize from on each forward /
     #                                      replay. Present only when
-    #                                      enable_num_token_non_padded()
-    #                                      (moe_ep_size > 1).
+    #                                      enable_num_token_non_padded().
     #     global_num_token_non_padded_cpu  host int. Host-side attention/backend
     #                                      slices read it directly; the prefill
     #                                      graph registry derives its per-rank GPU
@@ -936,9 +933,16 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         return_hidden_states_before_norm: bool,
         extend_position_info=None,
         spec_mrope_positions: Optional[torch.Tensor] = None,
+        kv_loc_plan: Optional[KVLocPlan] = None,
+        write_cols: Optional[Cols] = None,
     ):
         # init_new must not mutate the input ScheduleBatch; per-forward
         # overrides go through explicit keyword arguments.
+        #
+        # `kv_loc_plan`: the iteration's plan when this forward is one of
+        # several over the same slots (a speculative iteration), `write_cols`
+        # the columns of its window this forward writes. Without one, this
+        # forward is its own iteration and builds the plan itself.
 
         # capture_hidden_mode=None means no override: capture the server's
         # configured maximum so lower-mode requests can share one graph.
@@ -1050,15 +1054,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             spec_info=batch.spec_info,
         )
 
-        # ScheduleBatch and req_to_token keep allocator-global slot identities.
-        # Preserve that view before exposing rank-local NPU DCP write slots.
+        # ScheduleBatch and req_to_token keep allocator-global slot identities,
+        # and so does the plan's window. An NPU DCP target writes rank-local
+        # slots, which its translator maps the window to at `bind` below; keep
+        # the global view for the consumers that read it.
         if _is_npu and get_parallel().dcp_enabled and not model_runner.is_draft_worker:
             ret.origin_out_cache_loc = ret.out_cache_loc
-            if ret.out_cache_loc is not None:
-                ret.out_cache_loc = _localize_npu_dcp_out_cache_loc(
-                    ret.out_cache_loc,
-                    interleave_size=model_runner.page_size,
-                )
         ret._maybe_init_non_generation_fields(batch)
 
         device = model_runner.device
@@ -1072,7 +1073,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             device,
         )
 
-        model_runner.kv_index_translator.rebind_write_loc(ret)
+        translator = model_runner.kv_index_translator
+        if kv_loc_plan is None:
+            kv_loc_plan = translator.own_plan(ret)
+        kv_loc_plan.bind(ret, translator, cols=write_cols)
 
         if envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get():
             hashed = _hash_rids_to_tensor(
@@ -1262,6 +1266,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     for r in batch.reqs
                 ]
 
+            if any(r.decision_layout is not None for r in batch.reqs):
+                self.decision_layouts = [r.decision_layout for r in batch.reqs]
+
         token_type_ids = [
             r.token_type_ids for r in batch.reqs if r.token_type_ids is not None
         ]
@@ -1302,6 +1309,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         input is a gathered buffer whose real rows are not a prefix of it."""
         from sglang.srt.layers.layer_boundary import batch_gathers_over_moe_cp
         from sglang.srt.layers.moe.utils import is_moe_input_scattered_across_dp_ranks
+
+        if (
+            is_moe_input_scattered_across_dp_ranks()
+            and self.attn_cp_metadata is not None
+            and self.forward_mode.is_context_parallel_extend()
+        ):
+            from sglang.srt.layers.cp.base import get_cp_strategy
+
+            strategy = get_cp_strategy()
+            if strategy is not None:
+                return strategy.moe_num_token_non_padded(self)
 
         if self.num_token_non_padded is None:
             return None
@@ -2089,8 +2107,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
 
 def enable_num_token_non_padded():
-    # Elastic joiners also need graph padding masked after joining WORLD.
-    return get_parallel().moe_ep_size > 1 or world_dp_gather_enabled()
+    from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+
+    # Elastic joiners also need graph padding masked after joining WORLD; a
+    # customized A2A backend consumes the count whatever the EP size.
+    return (
+        get_parallel().moe_ep_size > 1
+        or world_dp_gather_enabled()
+        or get_moe_a2a_backend().is_customized()
+    )
 
 
 def build_inner_fb_view(
@@ -2131,6 +2156,8 @@ def build_inner_fb_view(
         out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
         # A caller may hand in another view that does not carry this field.
         out_cache_loc_virtual=getattr(forward_batch, "out_cache_loc_virtual", None),
+        kv_loc_plan=getattr(forward_batch, "kv_loc_plan", None),
+        kv_loc_cols=getattr(forward_batch, "kv_loc_cols", None),
         origin_out_cache_loc=getattr(forward_batch, "origin_out_cache_loc", None),
         out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
         spec_info=forward_batch.spec_info,
