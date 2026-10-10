@@ -918,6 +918,39 @@ class DeepseekSparseAttnBackend(
             f"Unsupported {self.dsa_topk_backend = } for SGLANG_DSA_FUSE_TOPK."
         )
 
+    def prepare_mtp_seed_indices(
+        self, topk_indices: torch.Tensor, forward_mode: ForwardMode
+    ) -> torch.Tensor:
+        """Export a seed in the representation consumed by the next draft decode."""
+        if (
+            not self.use_fused_topk
+            or self.get_topk_transform_method(forward_mode)
+            != TopkTransformMethod.RAGGED
+        ):
+            # PAGED output is already physical; unfused/PD seeds stay request-local.
+            return topk_indices
+
+        # Prefill addresses concatenated logical KV, but fused draft decode
+        # consumes allocator-local physical slots. Leave prefill's input intact.
+        metadata = self.forward_metadata
+        page_table = metadata.page_table_1_flattened
+        if page_table is None:
+            # Without a cached prefix attention does not need a flattened table.
+            # Build it in the producer indexer's request order for seed export.
+            page_table = torch.cat(
+                [
+                    metadata.page_table_1[i, :length]
+                    for i, length in enumerate(metadata.indexer_seq_lens_cpu.tolist())
+                ]
+            )
+        padding = topk_indices == -1
+        # index_select rejects invalid indices. Replace only the padding sentinel
+        # for the gather, then restore it; never clamp a bad positive index.
+        physical_indices = page_table.index_select(
+            0, topk_indices.masked_fill(padding, 0).reshape(-1).long()
+        ).view_as(topk_indices)
+        return physical_indices.masked_fill(padding, -1)
+
     def get_device_int32_arange(self, length: int) -> torch.Tensor:
         if length > len(self._arange_buf):
             next_pow_of_2 = 1 << (length - 1).bit_length()
