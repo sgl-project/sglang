@@ -236,8 +236,13 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             # Only the CUDA backend folds the replay into the extend; a separate
             # replay forward would run its MLP sync on the hitting DP ranks alone.
             (
-                "DP attention on ROCm",
-                attn_dp_enabled_of(cfg) and get_platform().is_hip,
+                "DP attention other than CUDA with attention TP 1 and MoE backend none",
+                attn_dp_enabled_of(cfg)
+                and (
+                    not get_platform().is_cuda
+                    or cfg.tp_size != cfg.attn_dp_size
+                    or cfg.moe_a2a_backend != "none"
+                ),
             ),
             ("context parallelism", cfg.attn_cp_size > 1),
             ("external cache linker", cfg.enable_unified_cache_external_linker),
@@ -330,8 +335,16 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 "the prefill CUDA graph",
                 cfg.cuda_graph_config.prefill.backend != Backend.DISABLED,
             ),
-            # input_ids_global is a DP-wide gather, so the tail slice cannot apply.
-            ("DP attention", attn_dp_enabled_of(cfg)),
+            # The late layers resize only an unpadded, gathered MoE input.
+            (
+                "DP attention other than CUDA with attention TP 1 and MoE backend none",
+                attn_dp_enabled_of(cfg)
+                and (
+                    not get_platform().is_cuda
+                    or cfg.tp_size != cfg.attn_dp_size
+                    or cfg.moe_a2a_backend != "none"
+                ),
+            ),
         )
         for feature, enabled in incompatible:
             if enabled:

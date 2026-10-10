@@ -5,6 +5,11 @@ import msgspec
 import torch
 
 
+# DeepSeek-V4.1's sliding window (deepseek_v4_backend.SWA_WINDOW); the scheduler
+# counts replay and tail rows without importing the attention backend.
+_SWA_WINDOW = 128
+
+
 class FoldedExtend(msgspec.Struct, frozen=True):
     """An extend batch whose prefix hits start at their replay start."""
 
@@ -103,10 +108,22 @@ def encoder_swa_fold_rows(batch) -> int:
     return sum(end - start for _, start, end in _replay_spans(batch))
 
 
+def decoder_swa_trim_rows(batch, *, folds_encoder: bool) -> int:
+    """Rows the decoder SWA tail drops from this scheduled extend: all but the
+    last SWA window of each request's (folded) extend."""
+    if not batch.forward_mode.is_extend_without_speculative():
+        return 0
+    lens = list(batch.extend_lens)
+    if folds_encoder and batch.encoder_swa_reset is not None:
+        for i, start, end in _replay_spans(batch):
+            lens[i] += end - start
+    return sum(n - min(_SWA_WINDOW, n) for n in lens)
+
+
 def _replay_spans(batch):
     # (batch row, replay start, cached-prefix end) of each hit whose window resets.
     return [
-        (i, max(0, end - 128), end)
+        (i, max(0, end - _SWA_WINDOW), end)
         for i, (reset, end) in enumerate(
             zip(batch.encoder_swa_reset, batch.prefix_lens)
         )

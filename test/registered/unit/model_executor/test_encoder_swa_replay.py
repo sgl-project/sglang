@@ -13,6 +13,7 @@ from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
 from sglang.srt.distributed import parallel_state
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.layers import dp_attention
+from sglang.srt.layers.dp_attention import DpPaddingMode
 from sglang.srt.layers.attention.deepseek_v4_backend import (
     SWA_WINDOW,
     DeepseekV4AttnBackend,
@@ -26,10 +27,12 @@ from sglang.srt.model_executor.encoder_swa_replay import (
     _check_folded_counts,
     _fold_batch,
     _replay_spans,
+    decoder_swa_trim_rows,
     drop_folded_rows,
     encoder_swa_fold_rows,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.models import deepseek_v4
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -417,8 +420,10 @@ class TestFoldUnderDpAttention(CustomTestCase):
             )
             self.assertEqual(encoder_swa_fold_rows(batch), 0, (reset, mode))
 
-    def _gather(self, batch, *, folds):
-        """The real scheduler gather on DP rank RANK; the peers report PEERS."""
+    def _gather(self, batch, *, folds, decoder=False, peer_trims=None):
+        """The real scheduler gather on DP rank RANK; the peers report PEERS
+        tokens and peer_trims decoder tail trims."""
+        peer_trims = peer_trims or {}
 
         def fake_all_gather_single(output, local, group, **_):
             rows = []
@@ -426,8 +431,14 @@ class TestFoldUnderDpAttention(CustomTestCase):
                 row = local.clone()
                 if r != self.RANK:
                     row[0] = row[1] = self.PEERS[r]
+                    row[11] = peer_trims.get(r, 0)  # decoder_trim_rows
                 rows.append(row)
             output.copy_(torch.stack(rows).flatten())
+
+        exec_cfg = SimpleNamespace(
+            features=SimpleNamespace(enable_decoder_swa_bounded_replay=decoder),
+            overlap=SimpleNamespace(enable_two_batch_overlap=False),
+        )
 
         tbo = MagicMock()
         tbo.prepare_all_gather.return_value = (False, ForwardMode.EXTEND.value)
@@ -451,6 +462,7 @@ class TestFoldUnderDpAttention(CustomTestCase):
             ),
             patch.object(dp_attn, "get_parallel", return_value=parallel),
             patch.object(dp_attn, "check_cuda_graph_backend", return_value=False),
+            patch.object(dp_attn, "get_exec", return_value=exec_cfg),
             patch.object(
                 dp_attn, "all_gather_single", side_effect=fake_all_gather_single
             ),
@@ -522,6 +534,178 @@ class TestFoldUnderDpAttention(CustomTestCase):
                         **{**vars(fx.folded.batch), "global_num_tokens": stale}
                     )
                 )
+
+
+class TestDecoderTailUnderDpAttention(CustomTestCase):
+    """Decoder SWA replay drops all but each request's last SWA_WINDOW rows before
+    the late layers. Under attention DP the late layers' MoE gather spans every
+    rank, so the scheduler gathers each rank's trimmed rows and every rank, trimming
+    or not, resizes its gather at the same layer."""
+
+    def test_trim_rows_match_the_backend_tail(self):
+        fx = _Fixture()
+        folded_lens = fx.folded.batch.extend_lens  # [40, 158, 84]
+        _, tail_lens, _ = late_layer_tail_layout(
+            extend_lens_cpu=folded_lens,
+            seq_lens_cpu=fx.folded_seq_lens(),
+            tail_len=SWA_WINDOW,
+            device="cpu",
+        )
+        trim = decoder_swa_trim_rows(fx.batch, folds_encoder=True)
+        self.assertEqual(trim, fx.folded.num_rows - sum(tail_lens))
+        self.assertEqual(trim, 30)
+        # Without the fold the 30-token extend of the hit stays under one window.
+        self.assertEqual(decoder_swa_trim_rows(fx.batch, folds_encoder=False), 0)
+
+    def test_decoder_only_trim_matches_backend_tail(self):
+        # A cold extend and two prefix-hit extends, without encoder replay.
+        lens, prefixes = [4096, 282, 40], [0, 512, 64]
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            extend_lens=lens,
+            prefix_lens=prefixes,
+            encoder_swa_reset=None,
+        )
+        _, tail_lens, _ = late_layer_tail_layout(
+            extend_lens_cpu=lens,
+            seq_lens_cpu=torch.tensor([p + n for p, n in zip(prefixes, lens)]),
+            tail_len=SWA_WINDOW,
+            device="cpu",
+        )
+        self.assertEqual(
+            decoder_swa_trim_rows(batch, folds_encoder=False),
+            sum(lens) - sum(tail_lens),
+        )
+        self.assertEqual(tail_lens, [128, 128, 40])
+
+    def test_no_trim_outside_plain_extends(self):
+        fx = _Fixture()
+        for mode in (ForwardMode.DECODE, ForwardMode.IDLE, ForwardMode.TARGET_VERIFY):
+            batch = SimpleNamespace(**{**vars(fx.batch), "forward_mode": mode})
+            self.assertEqual(decoder_swa_trim_rows(batch, folds_encoder=True), 0, mode)
+
+    def test_dp_gather_carries_every_ranks_trim(self):
+        dp = TestFoldUnderDpAttention()
+        _, batch = dp._scheduled_batch()
+        out = dp._gather(batch, folds=True, decoder=True, peer_trims={0: 3968, 3: 2})
+        self.assertEqual(out.global_num_tokens, [4096, 282, 0, 130])
+        self.assertEqual(out.global_decoder_trim_rows, [3968, 30, 0, 2])
+
+    def test_no_resize_when_no_rank_trims(self):
+        dp = TestFoldUnderDpAttention()
+        _, batch = dp._scheduled_batch()
+        batch.encoder_swa_reset = [False] * len(REQS)  # no fold: extends of 40/30/20
+        out = dp._gather(batch, folds=True, decoder=True)
+        self.assertIsNone(out.global_decoder_trim_rows)
+        # One trimming peer is enough for every rank to resize.
+        out = dp._gather(batch, folds=True, decoder=True, peer_trims={0: 3968})
+        self.assertEqual(out.global_decoder_trim_rows, [3968, 0, 0, 0])
+
+    def _forward_batch(self, rows, trims, rank):
+        return SimpleNamespace(
+            dp_padding_mode=DpPaddingMode.SUM_LEN,
+            global_num_tokens_cpu=list(rows),
+            global_num_tokens_padded_cpu=list(rows),
+            global_num_tokens_gpu=torch.tensor(rows),
+            global_dp_buffer_len=sum(rows),
+            global_decoder_trim_rows_cpu=trims,
+            dp_local_start_pos=torch.tensor(sum(rows[:rank])),
+            dp_local_num_tokens=torch.tensor(rows[rank]),
+        )
+
+    def test_late_layers_resize_and_restore_the_dp_gather(self):
+        """Ranks 0 and 1 trim; rank 2 is idle and rank 3 decodes 130 rows. All four
+        publish the same late sizes, and the exit restores the full ones."""
+        rows, trims = [4096, 282, 0, 130], [3968, 30, 0, 0]
+        for rank in range(4):
+            fb = self._forward_batch(rows, trims, rank)
+            published = []
+            with patch.object(
+                deepseek_v4,
+                "set_dp_buffer_len_from_batch",
+                side_effect=lambda b: published.append(
+                    (list(b.global_num_tokens_padded_cpu), b.global_dp_buffer_len)
+                ),
+            ):
+                saved = deepseek_v4._enter_dp_late_layers(fb)
+                self.assertEqual(fb.global_num_tokens_cpu, [128, 252, 0, 130])
+                self.assertEqual(fb.global_num_tokens_gpu.tolist(), [128, 252, 0, 130])
+                self.assertIsNone(
+                    fb.dp_local_start_pos
+                )  # recomputed from the late sizes
+                deepseek_v4._exit_dp_late_layers(fb, saved)
+            self.assertEqual(published, [([128, 252, 0, 130], 510), (rows, 4508)])
+            self.assertEqual(fb.global_num_tokens_cpu, rows)
+            self.assertEqual(fb.global_num_tokens_gpu.tolist(), rows)
+            self.assertEqual(fb.dp_local_num_tokens.item(), rows[rank])
+
+    def test_trimming_rank_late_rows_equal_its_tail(self):
+        # Rank 1 runs the fixture's folded extend; its late slot is its tail rows.
+        fx = _Fixture()
+        _, tail_lens, _ = late_layer_tail_layout(
+            extend_lens_cpu=fx.folded.batch.extend_lens,
+            seq_lens_cpu=fx.folded_seq_lens(),
+            tail_len=SWA_WINDOW,
+            device="cpu",
+        )
+        trim = decoder_swa_trim_rows(fx.batch, folds_encoder=True)
+        fb = self._forward_batch([0, fx.folded.num_rows], [0, trim], 1)
+        with patch.object(deepseek_v4, "set_dp_buffer_len_from_batch"):
+            deepseek_v4._enter_dp_late_layers(fb)
+        self.assertEqual(fb.global_num_tokens_cpu[1], sum(tail_lens))
+
+
+class TestDpReplayLaunchPolicy(CustomTestCase):
+    def _validate(self, encoder, decoder, *, cuda=True, tp=4, dp=4, a2a="none"):
+        from sglang.srt.arg_groups import deepseek_v4_hook
+        from sglang.srt.runtime_context import override_platform
+
+        cfg = SimpleNamespace(
+            enable_encoder_swa_bounded_replay=encoder,
+            enable_decoder_swa_bounded_replay=decoder,
+            tp_size=tp,
+            attn_dp_size=dp,
+            attn_cp_size=1,
+            moe_a2a_backend=a2a,
+            dsv4_attn_backend="dsv4",
+            cuda_graph_config=CudaGraphConfig(prefill=PhaseConfig(backend="disabled")),
+            max_running_requests=64,
+            chunked_prefill_size=32768,
+            enable_unified_cache_external_linker=False,
+            enable_unified_memory=False,
+            disaggregation_mode="null",
+            enable_mixed_chunk=False,
+            enable_lora=False,
+            enable_session_radix_cache=False,
+            speculative_algorithm=None,
+            enable_hisparse=False,
+            enable_two_batch_overlap=False,
+            pp_size=1,
+        )
+        model = SimpleNamespace(hf_config=SimpleNamespace(model_type="deepseek_v41"))
+        with (
+            override_platform(is_cuda=cuda, is_hip=not cuda),
+            patch.object(deepseek_v4_hook, "resolving_view", return_value=cfg),
+            patch.object(deepseek_v4_hook, "model_config_of", return_value=model),
+            patch.object(deepseek_v4_hook, "is_gfx95_supported", return_value=True),
+            patch(
+                "sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate.is_unified_kv_triton",
+                return_value=False,
+            ),
+        ):
+            deepseek_v4_hook.validate_deepseek_v41_features(object())
+
+    def test_cuda_flags_together_or_separately(self):
+        for encoder, decoder in ((True, False), (False, True), (True, True)):
+            with self.subTest(encoder=encoder, decoder=decoder):
+                self._validate(encoder, decoder)
+
+    def test_unvalidated_dp_layouts_stay_rejected(self):
+        for encoder, decoder in ((True, False), (False, True), (True, True)):
+            for layout in (dict(cuda=False), dict(tp=8), dict(a2a="deepep")):
+                with self.subTest(encoder=encoder, decoder=decoder, layout=layout):
+                    with self.assertRaisesRegex(ValueError, "DP attention"):
+                        self._validate(encoder, decoder, **layout)
 
 
 if __name__ == "__main__":
