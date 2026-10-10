@@ -180,10 +180,11 @@ def test_quantized_base_uses_dynamic_lora_in_auto_mode():
     assert not pipeline._should_merge_lora_for_layers(
         "transformer", {"linear": layer}, "auto"
     )
-    with pytest.raises(ValueError, match="use merge mode 'dynamic'"):
-        pipeline._should_merge_lora_for_layers(
-            "transformer", {"linear": layer}, "merge"
-        )
+    # Explicit merge folds the delta into FP8 storage by requantizing it.
+    assert layer.can_requant_merge
+    assert pipeline._should_merge_lora_for_layers(
+        "transformer", {"linear": layer}, "merge"
+    )
 
 
 def test_dynamic_lora_reactivates_cached_layers_without_weight_update_context():
@@ -402,3 +403,82 @@ def test_cached_merge_restores_untouched_base_view():
     layer.merge_lora_weights(strength=0.5)
     layer.unmerge_lora_weights()
     torch.testing.assert_close(base.weight, original, rtol=0, atol=0)
+
+
+def test_stochastic_fp8_rounding_is_unbiased_and_exact_on_grid():
+    from sglang.multimodal_gen.runtime.layers.lora.linear import (
+        stochastic_round_to_fp8,
+    )
+
+    generator = torch.Generator().manual_seed(0)
+    on_grid = torch.tensor([0.0, 1.0, -1.125, 448.0, -0.001953125])
+    torch.testing.assert_close(
+        stochastic_round_to_fp8(on_grid, generator).float(), on_grid
+    )
+    # A LoRA-sized nudge (far below half an FP8 step) survives in expectation;
+    # round-to-nearest would drop it entirely.
+    nudged = torch.full((200_000,), 1.01)
+    rounded = stochastic_round_to_fp8(nudged, generator).float()
+    assert nudged.to(torch.float8_e4m3fn).float().mean().item() == 1.0
+    assert abs(rounded.mean().item() - 1.01) < 1e-3
+    assert (
+        abs(stochastic_round_to_fp8(-nudged, generator).float().mean().item() + 1.01)
+        < 1e-3
+    )
+    saturated = stochastic_round_to_fp8(torch.tensor([500.0, -500.0]), generator)
+    torch.testing.assert_close(saturated.float(), torch.tensor([448.0, -448.0]))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="FP8 linear needs CUDA")
+def test_fp8_requant_merge_keeps_lora_delta_and_restores_base():
+    torch.manual_seed(0)
+    with patch(
+        "sglang.multimodal_gen.runtime.layers.quantization.fp8."
+        "get_tensor_model_parallel_world_size",
+        return_value=1,
+    ):
+        base_layer = ReplicatedLinear(
+            512,
+            256,
+            bias=False,
+            quant_config=Fp8Config(
+                is_checkpoint_fp8_serialized=True, activation_scheme="static"
+            ),
+        ).cuda()
+    dense = torch.randn(256, 512, device="cuda") * 0.02
+    scale = dense.abs().amax() / 448.0
+    base_layer.weight.data.copy_((dense / scale).to(torch.float8_e4m3fn))
+    base_layer.weight_scale.data.fill_(scale)
+    base_layer.input_scale.data.fill_(0.05)
+    base_layer.quant_method.process_weights_after_loading(base_layer)
+
+    def dequantized():
+        return base_layer.weight.t().float() * base_layer.weight_scale.float().reshape(
+            -1, 1
+        )
+
+    original_bytes = base_layer.weight.detach().clone()
+    original_scale = base_layer.weight_scale.detach().clone()
+    base = dequantized()
+    layer = wrap_with_lora_layer(base_layer, lora_rank=8, lora_alpha=8)
+    assert not layer.can_merge_base_weight and layer.can_requant_merge
+    A = torch.randn(8, 512, device="cuda") * 0.05
+    B = torch.randn(256, 8, device="cuda") * 0.002
+    delta = 0.5 * (B @ A)
+    layer.set_lora_weights(A, B, strength=0.5, clear_existing=True, merge_weights=True)
+    assert layer.merged
+    merged = dequantized()
+    first_bytes = base_layer.weight.detach().clone()
+    # The delta is below half an FP8 step for most weights; unbiased rounding
+    # must still carry it (regression slope ~1, not ~0 as with round-to-nearest).
+    slope = ((merged - base) * delta).sum() / (delta * delta).sum()
+    assert 0.9 < slope.item() < 1.1
+    layer.unmerge_lora_weights()
+    assert torch.equal(
+        base_layer.weight.view(torch.uint8), original_bytes.view(torch.uint8)
+    )
+    torch.testing.assert_close(base_layer.weight_scale, original_scale, rtol=0, atol=0)
+    layer.set_lora_weights(A, B, strength=0.5, clear_existing=True, merge_weights=True)
+    assert torch.equal(
+        base_layer.weight.view(torch.uint8), first_bytes.view(torch.uint8)
+    )

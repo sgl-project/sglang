@@ -7,6 +7,7 @@ import logging
 import os
 
 from ..executors.flux import FluxExecutor
+from ..executors.ltx_av import LTXAVExecutor
 from ..executors.minimax_h3 import MiniMaxH3Executor
 from ..executors.zimage import ZImageExecutor
 
@@ -115,7 +116,7 @@ else:
 
 def _load_executor_classes():
     """Qwen adapters import ComfyUI. Keep them optional so CI can load the rest."""
-    classes = [FluxExecutor, ZImageExecutor, MiniMaxH3Executor]
+    classes = [FluxExecutor, ZImageExecutor, MiniMaxH3Executor, LTXAVExecutor]
     try:
         from ..executors.qwen_image import QwenImageEditExecutor, QwenImageExecutor
     except ModuleNotFoundError as exc:
@@ -204,6 +205,10 @@ class SGLDiffusionGenerator:
         # policy otherwise sets dit_cpu_offload=True and every sampler step
         # reloads the DiT from CPU.
         kwargs.setdefault("dit_cpu_offload", False)
+        # ComfyUI owns CFG. Without this, num_gpus > 1 lets ServerArgs auto-enable
+        # CFG parallel, whose default-CFG lookup needs a model_index.json.
+        if not kwargs.get("enable_cfg_parallel"):
+            kwargs.setdefault("cfg_parallel_degree", 1)
         kwargs = self._server_args_kwargs(kwargs)
         self.generator = DiffGenerator.from_pretrained(
             model_path=model_path,
@@ -438,11 +443,12 @@ class SGLDiffusionGenerator:
             model_type = set_model_type
 
         pipeline_class_name = self.pipeline_class_dict[model_type]
+        executor_class = self.executor_class_dict[model_type]
+        executor_class.validate_sgld_options(sgld_options)
         self.generator = self.init_generator(
             detect_path, pipeline_class_name, sgld_options
         )
 
-        executor_class = self.executor_class_dict[model_type]
         self.executor = executor_class(
             self.generator, detect_path, comfyui_model, model_config
         )

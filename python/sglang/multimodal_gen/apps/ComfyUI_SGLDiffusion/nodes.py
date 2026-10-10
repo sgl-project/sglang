@@ -3,6 +3,7 @@ ComfyUI nodes for SGLang Diffusion integration.
 Provides nodes for connecting to SGLang Diffusion server and generating images/videos.
 """
 
+import json
 import os
 import uuid
 
@@ -42,6 +43,7 @@ class SGLDOptions:
                         "flux",
                         "lumina2",
                         "minimax_h3",
+                        "ltxav",
                     ],
                     {"default": "auto-detect"},
                 ),
@@ -97,6 +99,14 @@ class SGLDOptions:
                         "multiline": False,
                     },
                 ),
+                "extra_server_args": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "multiline": False,
+                        "tooltip": 'JSON object of extra SGLang ServerArgs, e.g. {"master_port": 30105}',
+                    },
+                ),
             },
         }
 
@@ -122,6 +132,7 @@ class SGLDOptions:
         enable_cache_dit: bool = False,
         quantization: str = "",
         transformer_weights_path: str = "",
+        extra_server_args: str = "",
     ):
         """
         Build a dictionary of SGLang Diffusion runtime options.
@@ -159,6 +170,13 @@ class SGLDOptions:
             # Same selector as `sglang serve --transformer-weights-path`:
             # local .gguf, owner/repo/path/file.gguf, or owner/repo:QUANT.
             options["transformer_weights_path"] = transformer_weights_path
+
+        extra_server_args = (extra_server_args or "").strip()
+        if extra_server_args:
+            extra = json.loads(extra_server_args)
+            if not isinstance(extra, dict):
+                raise ValueError("extra_server_args must be a JSON object")
+            options.update(extra)
 
         # Strip None to keep payload clean
         options = {k: v for k, v in options.items() if v is not None}

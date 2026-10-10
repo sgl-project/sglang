@@ -24,6 +24,8 @@ class SGLDiffusionExecutor(torch.nn.Module):
     """Shared ComfyUI DiT-forward executor. Per-model logic lives on the adapter."""
 
     adapter_cls = None
+    # LoRA merge mode for set_lora; None keeps the server default.
+    lora_merge_mode: str | None = None
 
     def __init__(self, generator, model_path, model, config):
         super(SGLDiffusionExecutor, self).__init__()
@@ -43,11 +45,16 @@ class SGLDiffusionExecutor(torch.nn.Module):
         self._run_id = 0
         self._sent_conds: set[tuple] = set()
 
+    @classmethod
+    def validate_sgld_options(cls, sgld_options: dict | None) -> None:
+        """Reject SGLDOptions this model cannot honour, before the worker starts."""
+
     @staticmethod
     def should_suppress_logs(timestep):
         """Determine if logs should be suppressed based on timestep value."""
         if torch.is_tensor(timestep):
-            return bool((timestep < 1.0).item())
+            # ComfyUI batches cond/uncond rows, so the timestep can be [B].
+            return bool((timestep.reshape(-1)[0] < 1.0).item())
         return bool(timestep < 1.0)
 
     def set_lora(self, lora_nickname=None, lora_path=None, strength=None, target=None):
@@ -64,6 +71,7 @@ class SGLDiffusionExecutor(torch.nn.Module):
                 lora_path=lora_path,
                 strength=strength,
                 target=target,
+                merge_mode=self.lora_merge_mode,
             )
 
     def begin_sampler_run(self) -> None:

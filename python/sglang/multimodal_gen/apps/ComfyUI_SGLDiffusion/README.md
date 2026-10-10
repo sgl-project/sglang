@@ -24,6 +24,7 @@ The plugin supports two modes of operation: **Server Mode** (via HTTP API) and *
 - **Z-Image**: High-speed image generation models (e.g., `Z-Image-Turbo`)
 - **FLUX**: State-of-the-art text-to-image models (e.g., `FLUX.1-dev`)
 - **Qwen-Image**: Multi-modal image generation models (e.g., `Qwen-Image`,`Qwen-Image-2512`). *Note: Image editing support is currently experimental and may have some issues.*
+- **LTX-2.5 / LTX-2.3**: Lightricks audio-video DiTs (ComfyUI `ltxav`). Integrated mode loads the ComfyUI single-file DiT (LTX-2.5 INT8 ConvRot / BF16, or the LTX-2.3 all-in-one FP8 checkpoint). The DiT and its text connectors run on the worker with SGLang's native LTX numerics; Gemma, the VAEs, the latent upsampler and the samplers / guiders stay in ComfyUI. Text-to-video and image-to-video (`LTXVImgToVideoInplace`) are supported; keyframe guides (`LTXVAddGuide`) and reference-audio conditioning raise an error.
 - **MiniMax-H3**: Joint video-and-audio DiT (`model_type=minimax_h3`). Integrated mode: T2V / I2VA / FL2VA use an `fl2va` checkpoint; R2V needs `ref2va`. CLIP and VAE stay in ComfyUI. Server mode uses `SGLDiffusion Generate MiniMax-H3`.
 
 ### Mode 1: Server Mode (HTTP API)
@@ -43,7 +44,7 @@ runs one forward per sampler step (pass-through scheduler, no text encode /
 decode on the worker).
 
 1. **Load Model**: Use the `SGLDiffusion UNET Loader` node to load your diffusion model.
-2. **Configure Options**: Use the `SGLDiffusion Options` node to set runtime parameters like `num_gpus`, `tp_size`, `model_type`, or `enable_torch_compile`.
+2. **Configure Options**: Use the `SGLDiffusion Options` node to set runtime parameters like `num_gpus`, `tp_size`, `model_type`, or `enable_torch_compile`. `extra_server_args` takes a JSON object of any other SGLang `ServerArgs` (e.g. `{"master_port": 30105, "scheduler_port": 5655}` to run a second worker beside another one).
 3. **Sample**: Connect the loaded model to standard ComfyUI samplers. Each step is packed by a model adapter and sent to the SGLang scheduler.
 4. **LoRA Support**: Use the `SGLDiffusion LoRA Loader` for native LoRA integration.
 
@@ -88,6 +89,8 @@ Reference workflow files are provided in the `workflows/` directory:
 - **`minimax_h3_t2v_sgld.json`**: MiniMax-H3 T2V / I2VA / FL2VA (`fl2va` DiT).
 - **`minimax_h3_r2v_sgld.json`**: MiniMax-H3 reference-to-video (`ref2va` DiT).
 - **`minimax_h3_t2v_sgld_upscaler.json`**: H3 two-pass latent upscale (low-res then 3D ×2 refine).
+- **`ltx2_5_t2v_sgld.json`**: the official LTX-2.5 two-stage text-to-video template with `SGLDUNETLoader`.
+- **`ltx2_3_dev_lora_t2v_sgld.json`**: the official LTX-2.3 template (dev FP8 checkpoint + distilled LoRA 0.5). `SGLDLoraLoader` replaces `LoraLoaderModelOnly`; the worker merges the LoRA into the FP8 weights once, so sampling runs at base-model speed. On a 32 GB GPU the options stream 20% of the DiT layers (`dit_layerwise_offload` + `extra_server_args`).
 
 For other workflows supporting the models, you can easily use SGLang by replacing the official `UNET Loader` node with the `SGLDUNETLoader` node. Similarly, for LoRA support, replace the official LoRA loader with the `SGLDiffusion LoRA Loader`.
 

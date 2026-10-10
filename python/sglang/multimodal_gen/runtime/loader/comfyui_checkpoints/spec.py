@@ -70,6 +70,11 @@ class ComfyUICheckpointSpec:
     # mapping is applied repeatedly until it reaches a fixed point and the
     # config rules would rewrite names this spec already resolved.
     inherit_config_mapping: bool = True
+    # Serialized ComfyUI quantization: per-layer markers keyed by SGLang module
+    # prefix ({} for an unquantized file). MiniMax-H3 reads its own when unset.
+    quant_markers: Callable[[list[str]], dict[str, dict[str, Any]]] | None = None
+    # Drops checkpoint keys that are not DiT weights (e.g. all-in-one files).
+    checkpoint_key_filter: Callable[[str], bool] | None = None
 
 
 _SPEC_REGISTRY: dict[str, ComfyUICheckpointSpec] = {}
@@ -89,6 +94,7 @@ def _discover_checkpoint_specs() -> None:
     _SPECS_DISCOVERED = True
     from sglang.multimodal_gen.runtime.loader.comfyui_checkpoints import (  # noqa: F401
         flux,
+        ltx_2,
         minimax_h3,
         qwen_image,
         zimage,
@@ -248,17 +254,22 @@ def load_comfyui_transformer(
             )
 
         quant_config = None
-        checkpoint_key_filter = None
+        checkpoint_key_filter = spec.checkpoint_key_filter
         weight_load_plan = None
         # GGUF already sets AdaLN curve from tensor meta. Pruned BF16
         # safetensors keep the same adaln_t_table; without this the DiT is
         # built as the unpruned MLP and load fails on that extra parameter.
-        if spec.dit_cls_name == "MiniMaxH3DiTModel":
-            adaln_curve_shape, layer_markers = inspect_minimax_h3_safetensors(
-                [model_path]
-            )
+        if spec.dit_cls_name == "MiniMaxH3DiTModel" or spec.quant_markers:
+            if spec.quant_markers:
+                # Format support is checked by the quantization resolver below.
+                adaln_curve_shape = None
+                layer_markers = spec.quant_markers([model_path])
+            else:
+                adaln_curve_shape, layer_markers = inspect_minimax_h3_safetensors(
+                    [model_path]
+                )
             if layer_markers:
-                if any(
+                if not spec.quant_markers and any(
                     marker.get("format") != "int8_tensorwise"
                     for marker in layer_markers.values()
                 ):
@@ -277,7 +288,12 @@ def load_comfyui_transformer(
                         "Comfy quantized checkpoints do not support FSDP inference; use TP and/or sequence parallelism instead"
                     )
                 quant_config = resolve_minimax_h3_checkpoint_quantization(layer_markers)
-                checkpoint_key_filter = comfy_quant_key_filter
+                spec_filter = spec.checkpoint_key_filter
+                checkpoint_key_filter = (
+                    comfy_quant_key_filter
+                    if spec_filter is None
+                    else lambda key: comfy_quant_key_filter(key) and spec_filter(key)
+                )
                 checkpoint_device = (
                     torch.device("cpu")
                     if server_args.should_start_component_on_cpu("transformer")
