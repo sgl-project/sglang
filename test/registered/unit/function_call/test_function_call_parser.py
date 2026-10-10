@@ -2905,14 +2905,33 @@ class TestGptOssDetector(unittest.TestCase):
 
 class TestGlm4ArgumentFallback(CustomTestCase):
     def test_comma_expressions_remain_strings(self):
-        """Comma expressions must not become arrays in tool arguments."""
+        """Comma expressions must not become arrays without an array schema."""
         for raw in ("1,000", '"a","b"', "1,", "(1, 2)"):
-            for arg_type in (None, "number", "array"):
+            for arg_type in (None, "number"):
                 with self.subTest(raw=raw, arg_type=arg_type):
                     self.assertEqual(parse_arguments(raw, arg_type), (raw, True))
 
+    def test_array_comma_expressions_remain_arrays(self):
+        """Array schemas preserve comma-separated values as JSON arrays."""
+        for raw, expected in (
+            ("1, 2", [1, 2]),
+            ('"a","b"', ["a", "b"]),
+            ("1,", [1]),
+            ("(1, 2)", [1, 2]),
+        ):
+            with self.subTest(raw=raw):
+                self.assertEqual(parse_arguments(raw, "array"), (expected, True))
+
     def test_tool_call_preserves_comma_value(self):
-        """An unparsable numeric argument retains its original text."""
+        """Tool calls preserve comma values according to their argument schema."""
+        for arg_type, raw, expected in (
+            ("number", "1,000", "1,000"),
+            ("array", "1, 2", [1, 2]),
+        ):
+            with self.subTest(arg_type=arg_type):
+                self._assert_tool_call_comma_value(arg_type, raw, expected)
+
+    def _assert_tool_call_comma_value(self, arg_type, raw, expected):
         tools = [
             Tool(
                 type="function",
@@ -2920,19 +2939,19 @@ class TestGlm4ArgumentFallback(CustomTestCase):
                     name="book",
                     parameters={
                         "type": "object",
-                        "properties": {"n": {"type": "number"}},
+                        "properties": {"n": {"type": arg_type}},
                     },
                 ),
             )
         ]
         text = (
             "<tool_call>book\n<arg_key>n</arg_key>\n"
-            "<arg_value>1,000</arg_value>\n</tool_call>"
+            f"<arg_value>{raw}</arg_value>\n</tool_call>"
         )
         calls = Glm4MoeDetector().detect_and_parse(text, tools).calls
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0].name, "book")
-        self.assertEqual(json.loads(calls[0].parameters), {"n": "1,000"})
+        self.assertEqual(json.loads(calls[0].parameters), {"n": expected})
 
 
 class TestGlm4MoeDetector(unittest.TestCase):
