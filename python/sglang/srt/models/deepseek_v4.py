@@ -1588,7 +1588,7 @@ class MQALayer(MqaAttentionBase):
         q_out: Optional[torch.Tensor] = None,
         x_quant=None,
     ) -> torch.Tensor:
-        """Overlap CP SWA/cache sources with the Q projection after allgather."""
+        """Overlap Q with CP gathers, then prepare cache/indexer sources."""
         assert self.alt_streams is not None
         assert len(self.alt_streams) >= 3
         current_stream = torch.cuda.current_stream()
@@ -1600,8 +1600,14 @@ class MQALayer(MqaAttentionBase):
             qkv_a, _ = self.wqkv_a(x_linear)
         q_lora, q_for_wqb = self._compute_q_a(x_linear, qkv_a=qkv_a)
 
+        # Q needs only the local q_lora. Start it before the gathers, rather
+        # than alongside the compressor GEMM, on the existing SWA writer stream.
+        stream_kv.wait_stream(current_stream)
+        with torch.cuda.stream(stream_kv):
+            q = self._compute_q_b(q_for_wqb, positions, q_out)
+
         # Collectives must launch in identical parent-stream order on every CP
-        # rank. Neither worker may start consuming until both gathers finish.
+        # rank. Workers that read gathered inputs wait for both gathers below.
         swa_k = self._materialize_cp_swa_k(x_linear, forward_batch, qkv_a=qkv_a)
         x_global = None
         if self.compressor is not None and not forward_batch.encoder_swa_replay:
@@ -1650,7 +1656,6 @@ class MQALayer(MqaAttentionBase):
                     projected_q
                 )
 
-        q = self._compute_q_b(q_for_wqb, positions, q_out)
         current_stream.wait_stream(stream_compressor)
         current_stream.wait_stream(stream_indexer)
         if capture_indexer:
@@ -1661,8 +1666,8 @@ class MQALayer(MqaAttentionBase):
                 prepared_q=prepared_q,
                 prepared_dense_k=prepared_dense_k,
             )
-        # Indexer logits need index-K, not SWA KV. Join the SWA writer only at
-        # the attention boundary so it can overlap logits and top-k as well.
+        # Indexer logits need index-K, not attention Q or SWA KV. Join the Q/SWA
+        # stream at the attention boundary so it can overlap logits/top-k too.
         current_stream.wait_stream(stream_kv)
         del qkv_a
         return q
