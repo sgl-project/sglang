@@ -12,6 +12,7 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     HiSparseC4DevicePool,
 )
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 from sglang.srt.platforms import current_platform
 from sglang.srt.utils.common import get_num_new_pages
 
@@ -26,11 +27,19 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         page_size: int,
         dtype: torch.dtype,
         device: torch.device,
-        kvcache: HiSparseDSATokenToKVPool | MiniMaxSparseKVPool,
+        kvcache: HiSparseDSATokenToKVPool | MiniMaxSparseKVPool | HybridLinearKVPool,
         need_sort: bool,
         host_to_device_ratio: int = 2,
     ):
         self._kvcache = kvcache
+        # Keep the wrapper for Mamba state access; map only DSA token locations.
+        self.hisparse_kvcache = (
+            kvcache.full_kv_pool if isinstance(kvcache, HybridLinearKVPool) else kvcache
+        )
+        if isinstance(kvcache, HybridLinearKVPool) and not isinstance(
+            self.hisparse_kvcache, HiSparseDSATokenToKVPool
+        ):
+            raise TypeError("Hybrid HiSparse requires a HiSparse DSA backing pool")
         self._size_full = size * host_to_device_ratio
         self._size_hisparse = size
         self.compress_ratio = 1
@@ -73,7 +82,7 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.release_pages = None
         self.free_group = None
         self.clear()
-        self._kvcache.register_mapping(
+        self.hisparse_kvcache.register_mapping(
             weakref.proxy(self.full_to_hisparse_device_index_mapping)
         )
 
@@ -175,7 +184,7 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return last_locs
 
     def get_last_loc_hisparse_device(self, last_locs: torch.Tensor):
-        return self._kvcache._translate_loc_to_hisparse_device(last_locs)
+        return self.hisparse_kvcache._translate_loc_to_hisparse_device(last_locs)
 
     def alloc_extend(
         self,
@@ -237,7 +246,9 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
 
     def free_hisparse(self, free_indices: torch.Tensor):
-        hisparse_indices = self._kvcache._translate_loc_to_hisparse_device(free_indices)
+        hisparse_indices = self.hisparse_kvcache._translate_loc_to_hisparse_device(
+            free_indices
+        )
         hisparse_indices = hisparse_indices[hisparse_indices > 0]
         self.free_hisparse_indices(hisparse_indices)
         self.full_to_hisparse_device_index_mapping[free_indices] = 0

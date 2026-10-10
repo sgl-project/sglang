@@ -1,6 +1,6 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -13,6 +13,69 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestHiSparsePoolConfigurator(CustomTestCase):
+    def test_hybrid_dsa_pool_uses_dense_layer_ids(self):
+        from sglang.srt.mem_cache import kv_cache_configurator as module
+
+        kvc = SimpleNamespace()
+        kvc.layer_info = SimpleNamespace(
+            start_layer=4, end_layer=12, num_effective_layers=8
+        )
+        kvc.model_config = SimpleNamespace(
+            kv_lora_rank=512, qk_rope_head_dim=0, hf_config=SimpleNamespace()
+        )
+        kvc.pool_page_size = 64
+        kvc.kv_cache_dtype = torch.bfloat16
+        kvc.device = "cpu"
+        kvc.is_draft_worker = False
+        with (
+            patch.object(
+                module, "get_memory", return_value=SimpleNamespace(enable_hisparse=True)
+            ),
+            patch.object(
+                module,
+                "get_exec",
+                return_value=SimpleNamespace(
+                    features=SimpleNamespace(enable_memory_saver=False)
+                ),
+            ),
+            patch.object(module, "reject_out_of_tree_path"),
+            patch(
+                "sglang.srt.layers.cp.utils.get_glm_dsa_cp_layer_shard_info",
+                return_value=(None, None),
+            ),
+            patch(
+                "sglang.srt.mem_cache.sparsity.parse_hisparse_config",
+                return_value=SimpleNamespace(host_to_device_ratio=2),
+            ),
+            patch.object(module, "_should_elide_dsa_index_k", return_value=True),
+            patch.object(
+                module,
+                "dsa_layer_skips_topk",
+                side_effect=lambda config, layer: layer == 11,
+            ) as skips,
+            patch.object(module, "calculate_mla_kv_cache_dim", return_value=512),
+            patch.object(module, "get_dsa_index_head_dim", return_value=128),
+            patch.object(module, "get_dsa_index_kpool", return_value=4),
+            patch.object(module, "get_dsa_index_kpool_compress", return_value=False),
+            patch.object(module, "max_speculative_num_draft_tokens", return_value=None),
+            patch.object(module, "HiSparseDSATokenToKVPool") as pool,
+        ):
+            result = module.KVCacheConfigurator._build_dsa_kv_pool(
+                kvc,
+                max_total_num_tokens=1024,
+                max_running_requests=8,
+                dsa_pool_class=object,
+                full_attention_layer_ids=[7, 11],
+            )
+        self.assertIs(result, pool.return_value)
+        kwargs = pool.call_args.kwargs
+        self.assertEqual(
+            (kwargs["start_layer"], kwargs["end_layer"], kwargs["layer_num"]), (0, 2, 2)
+        )
+        self.assertEqual(kwargs["skip_topk_layers"], [False, True])
+        self.assertEqual([call.args[1] for call in skips.call_args_list], [7, 11])
+        self.assertEqual(kwargs["host_to_device_ratio"], 2)
+
     def _compute_cell_size(
         self,
         kv_cache_dtype: torch.dtype,

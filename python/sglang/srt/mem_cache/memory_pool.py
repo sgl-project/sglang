@@ -4136,7 +4136,7 @@ class HybridLinearKVPool(KVCache):
         start_layer: Optional[int] = None,
         full_kv_pool_class: Optional[type] = None,
         quant_method=None,
-        # When provided (shared-KV-pool path), use this pool for the
+        # When provided (shared-KV-pool or HiSparse path), use this pool for the
         # full-attention layers instead of constructing one internally.
         full_kv_pool: Optional[KVCache] = None,
         post_capture_active: bool = False,
@@ -4158,8 +4158,7 @@ class HybridLinearKVPool(KVCache):
         self.use_mla = use_mla
         self.use_dsa = use_dsa
         if full_kv_pool is not None:
-            # Shared-KV-pool path: the caller built a UnifiedMHATokenToKVPool
-            # aliasing the shared byte buffer.
+            # Reuse the supplied backing pool without allocating another KV pool.
             self.full_kv_pool = full_kv_pool
         elif not use_mla:
             TokenToKVPoolClass = (
@@ -4307,6 +4306,10 @@ class HybridLinearKVPool(KVCache):
             data_ptrs, _, _ = self.get_contiguous_buf_infos()
             return layer_ids * (len(data_ptrs) // len(layer_ids))
         return layer_ids if self.use_mla else layer_ids * 2
+
+    def translate_loc_to_hisparse_device(self, indices: torch.Tensor):
+        # Mamba state slots are request-indexed and do not use this mapping.
+        return self.full_kv_pool.translate_loc_to_hisparse_device(indices)
 
     def get_state_buf_infos(self):
         mamba_data_ptrs, mamba_data_lens, mamba_item_lens = (
