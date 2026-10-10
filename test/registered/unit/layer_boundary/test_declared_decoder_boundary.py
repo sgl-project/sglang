@@ -730,7 +730,7 @@ class TestTheAttentionOutputDecidesItsSum(CustomTestCase):
             TokenAxis.ATTN_CP: 1,
             TokenAxis.ATTN_TP: 2,
         }
-        steps, _ = comm_boundary._select_entry_step(
+        steps, *_ = comm_boundary._select_entry_step(
             produced,
             residual=comm.Layout.sharded_over(TokenAxis.ATTN_DP, axis_sizes=sizes),
             residual_to=comm.Layout.sharded_over(TokenAxis.ATTN_DP, axis_sizes=sizes),
@@ -813,7 +813,7 @@ class TestFusedKernelsTakeOnlyTheStepsTheyComplete(CustomTestCase):
             TokenAxis.ATTN_TP: 2,
         }
         attention = comm.Layout.sharded_over(TokenAxis.ATTN_DP, axis_sizes=sizes)
-        steps, _ = comm_boundary._select_entry_step(
+        steps, *_ = comm_boundary._select_entry_step(
             comm.OutputContract(attention, group=SumGroup.ATTN_TP, always_partial=True),
             residual=comm.Layout.sharded_over(TokenAxis.ATTN_DP, axis_sizes=sizes),
             residual_to=comm.Layout.sharded_over(TokenAxis.ATTN_DP, axis_sizes=sizes),
@@ -901,7 +901,7 @@ class TestInputScatteredAttention(CustomTestCase):
             (False, comm_ops._reduce_update_read),
         ):
             with self.subTest(residual_joins_sum=joins):
-                steps, _ = comm_boundary._select_entry_step(
+                steps, *_ = comm_boundary._select_entry_step(
                     owed,
                     residual=local,
                     residual_to=attention,
@@ -920,7 +920,7 @@ class TestInputScatteredAttention(CustomTestCase):
         sizes = self.SIZES
         attention = comm.Layout.sharded_over(axis_sizes=sizes)
         local = comm.Layout(frozenset({TokenAxis.ATTN_TP}))
-        step, _ = comm_boundary._select_entry_step(
+        step, *_ = comm_boundary._select_entry_step(
             comm.OutputContract(attention),
             residual=attention,
             residual_to=local,

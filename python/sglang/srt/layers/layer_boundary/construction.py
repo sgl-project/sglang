@@ -247,6 +247,7 @@ class StagePlan:
                 output=edges.outgoing.produced,
                 output_move=out.output_move,
                 output_move_completes_sum=out.output_move_completes_sum,
+                output_gathers_attn_tp=out.gathers_attn_tp,
                 returns_over_dp=out.returns_over_dp,
                 writes_at_handoff=writes_at_handoff,
             )

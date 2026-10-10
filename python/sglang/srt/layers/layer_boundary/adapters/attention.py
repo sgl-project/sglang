@@ -55,7 +55,6 @@ class AttentionInputs:
         self.hidden_states_local = hidden_states
         self.forward_batch = forward_batch
         self.qkv_latent_func = qkv_latent_func
-        self.hidden_states_ = None
         self.qkv_latent_ = None
         # When True, hidden_states_local is already attn_tp-gathered upstream
         # (e.g. by the input-scattered attention input step for DSA). fetch_* must NOT gather again.
@@ -71,14 +70,6 @@ class AttentionInputs:
         if get_attn_tp_context().input_scattered and not self.is_pre_gathered:
             self.qkv_latent_ = tp_gather(self.qkv_latent_, self.forward_batch)
         return self.qkv_latent_
-
-    def fetch_hidden_states(self):
-        if self.hidden_states_ is not None:
-            return self.hidden_states_
-        self.hidden_states_ = self.hidden_states_local
-        if get_attn_tp_context().input_scattered and not self.is_pre_gathered:
-            self.hidden_states_ = tp_gather(self.hidden_states_, self.forward_batch)
-        return self.hidden_states_
 
 
 class AttnTpContext:
@@ -130,11 +121,6 @@ class AttnTpContext:
         attn_inputs = get_forward().attn_inputs
         assert attn_inputs is not None
         return attn_inputs.fetch_qkv_latent()
-
-    def fetch_hidden_states(self):
-        attn_inputs = get_forward().attn_inputs
-        assert attn_inputs is not None
-        return attn_inputs.fetch_hidden_states()
 
     def clear_attn_inputs(self) -> None:
         get_forward().set("attn_inputs", None)

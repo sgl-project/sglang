@@ -17,7 +17,6 @@ from sglang.srt.layers.layer_boundary import stage as stages
 from sglang.srt.layers.layer_boundary.contracts import BatchVariant
 from sglang.srt.layers.layer_boundary.fusions.cutedsl import CuteDSLFusion
 from sglang.srt.layers.layer_boundary.layout import SumGroup
-from sglang.srt.layers.layer_boundary.prepare import _dispatch_by_update
 from sglang.srt.layers.layer_boundary.residual import batch
 from sglang.srt.layers.layer_boundary.residual.add_norm import REPLACE_AT_EXIT
 from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
@@ -133,17 +132,6 @@ class TestBoundaryIntegrations(unittest.TestCase):
                 ):
                     decision = ffn.exit(fb)
                 self.assertEqual(decision.defer_moe_finalize, accepted)
-
-    def test_absent_residual_uses_non_partial_update_path(self):
-        plain = Mock(side_effect=AssertionError("cannot add a missing residual"))
-        generic = Mock(return_value=("input", None))
-        self.assertEqual(
-            _dispatch_by_update(
-                None, None, None, None, paths={True: plain, False: generic}
-            ),
-            ("input", None),
-        )
-        plain.assert_not_called()
 
     def test_lora_or_shared_tp1_defers_only_when_fusion_is_eligible(self):
         group = object()

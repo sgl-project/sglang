@@ -31,7 +31,7 @@ from sglang.srt.layers.layer_boundary.contracts import (
     StagePath,
 )
 from sglang.srt.layers.layer_boundary.layout import SumGroup
-from sglang.srt.layers.layer_boundary.ops import attn_tp_gather_input, sum_output
+from sglang.srt.layers.layer_boundary.ops import sum_output
 from sglang.srt.layers.layer_boundary.residual.access import buffer, from_pp
 from sglang.srt.layers.layer_boundary.residual.add_norm import (
     PLAIN_ADD,
@@ -395,11 +395,10 @@ class StageBoundary:
                     forward_batch=forward_batch,
                 )
             )
-            # Input gathers allocate fresh DP buffers (see attn_tp_gather_input).
             # Without a gather this is the mutable residual, so retention copies.
             capture_gathered.capture(
                 gathered_last_layer_output,
-                owned=move is attn_tp_gather_input
+                owned=entry.input_retainable
                 or (
                     move is None
                     and entry.capture_preserves_residual is not None

@@ -263,21 +263,6 @@ def _attn_input_scattered(
     return hidden_states
 
 
-def _dispatch_by_update(
-    hidden_states, residual, forward_batch, norm, *, paths, update=PLAIN_ADD, **call
-):
-    if residual is None:
-        # A missing residual cannot join a partial sum. The non-plain path
-        # performs init_residual/read without that optimization.
-        prepare = paths[False]
-    else:
-        try:
-            prepare = paths[update.is_plain_add]
-        except KeyError:
-            raise RuntimeError("producer update has no bound input path") from None
-    return prepare(hidden_states, residual, forward_batch, norm, update=update, **call)
-
-
 def _run_entry(
     hidden_states: Union[torch.Tensor, UnreducedOutput, DeferredFinalize],
     residual: Optional[torch.Tensor],
