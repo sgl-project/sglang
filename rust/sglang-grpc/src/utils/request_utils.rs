@@ -329,6 +329,15 @@ pub(crate) fn build_generate_dict(
     let mut d = HashMap::new();
     d.insert("rid".into(), serde_json::json!(rid));
     d.insert("input_ids".into(), serde_json::json!(req.input_ids));
+    for (name, sources) in [
+        ("image_data", &req.image_data),
+        ("video_data", &req.video_data),
+        ("audio_data", &req.audio_data),
+    ] {
+        if !sources.is_empty() {
+            d.insert(name.into(), serde_json::json!(sources));
+        }
+    }
     d.insert(
         "sampling_params".into(),
         sampling_params_to_map(&req.sampling_params)?,
@@ -644,6 +653,65 @@ mod tests {
             assert!(!mapped.contains_key("priority"));
             assert!(!mapped.contains_key("require_reasoning"));
             assert!(!mapped.contains_key("max_thinking_tokens"));
+        }
+    }
+
+    #[test]
+    fn tokenized_multimodal_request_preserves_generation_params() {
+        let request = proto::GenerateRequest {
+            input_ids: vec![2, 10, 20],
+            image_data: vec![
+                "https://example.com/image.png".to_string(),
+                "data:image/png;base64,aW1hZ2U=".to_string(),
+            ],
+            video_data: vec!["https://example.com/clip.mp4".to_string()],
+            audio_data: vec!["data:audio/wav;base64,UklGRg==".to_string()],
+            sampling_params: Some(proto::SamplingParams {
+                temperature: Some(0.5),
+                max_new_tokens: Some(64),
+                ..Default::default()
+            }),
+            disaggregated_params: Some(proto::DisaggregatedParams {
+                bootstrap_host: "10.0.0.1".to_string(),
+                bootstrap_port: 8998,
+                bootstrap_room: i64::MAX,
+            }),
+            ..Default::default()
+        };
+
+        let mapped = build_generate_dict("request", &request).unwrap();
+
+        assert_eq!(mapped["input_ids"], serde_json::json!([2, 10, 20]));
+        assert_eq!(
+            mapped["image_data"],
+            serde_json::json!([
+                "https://example.com/image.png",
+                "data:image/png;base64,aW1hZ2U="
+            ])
+        );
+        assert_eq!(
+            mapped["video_data"],
+            serde_json::json!(["https://example.com/clip.mp4"])
+        );
+        assert_eq!(
+            mapped["audio_data"],
+            serde_json::json!(["data:audio/wav;base64,UklGRg=="])
+        );
+        assert_eq!(
+            mapped["sampling_params"],
+            serde_json::json!({"temperature": 0.5, "max_new_tokens": 64})
+        );
+        assert_eq!(mapped["bootstrap_host"], serde_json::json!("10.0.0.1"));
+        assert_eq!(mapped["bootstrap_port"], serde_json::json!(8998));
+        assert_eq!(mapped["bootstrap_room"], serde_json::json!(i64::MAX));
+    }
+
+    #[test]
+    fn tokenized_request_omits_empty_media_data() {
+        let mapped = build_generate_dict("request", &proto::GenerateRequest::default()).unwrap();
+
+        for key in ["image_data", "video_data", "audio_data"] {
+            assert!(!mapped.contains_key(key));
         }
     }
 

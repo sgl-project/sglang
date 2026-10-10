@@ -169,6 +169,12 @@ pub struct GenerateRequest {
     pub max_thinking_tokens: ::core::option::Option<u32>,
     #[prost(message, optional, tag = "17")]
     pub kv_hints: ::core::option::Option<KvHintsEnvelope>,
+    #[prost(string, repeated, tag = "18")]
+    pub image_data: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(string, repeated, tag = "19")]
+    pub video_data: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(string, repeated, tag = "20")]
+    pub audio_data: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 /// Versioned KV-hint envelope forwarded from a trusted orchestrator.
 #[derive(Clone, PartialEq, ::prost::Message)]
