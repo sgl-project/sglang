@@ -1,4 +1,4 @@
-"""Regression tests for a dozen ComfyUI_SGLDiffusion bugs found in audit.
+"""Regression tests for fourteen ComfyUI_SGLDiffusion bugs found in audit.
 
 Each bug gets a test that fails against the pre-fix code and passes after.
 These stub ComfyUI/ torch-adjacent modules the same way test_h3_request.py
