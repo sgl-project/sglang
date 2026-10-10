@@ -1094,8 +1094,16 @@ class DeepseekSparseAttnBackend(
                 )
                 kpool_inputs.full_seqlens_expanded = seqlens_expanded
 
-            if can_dsa_prefill_cp_interleave(forward_batch):
-                strategy = get_cp_strategy()
+            # Gate on a live V2 strategy, not only the launch flags: legacy V1 CP
+            # runtimes (non-interleave CP on PPU keeps the strategy dormant, see
+            # init_cp_strategy) run prefill CP with the batch already CP-sharded
+            # upstream -- this rewrite must stay off there.
+            strategy = (
+                get_cp_strategy()
+                if can_dsa_prefill_cp_interleave(forward_batch)
+                else None
+            )
+            if strategy is not None:
                 seqlens_expanded = strategy.shard_local_tokens(seqlens_expanded)
                 extend_seq_lens_cpu, extend_seq_lens, bs_idx_cpu, bs_idx = (
                     strategy.shard_per_request(extend_seq_lens_cpu, extend_seq_lens)

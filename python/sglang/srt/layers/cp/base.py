@@ -253,12 +253,6 @@ def init_cp_strategy(
     """
     global _STRATEGY
 
-    if is_ppu():
-        # PPU has no CP v2 implementation; its prefill CP runs on the legacy
-        # shared V1 path, which requires the V2 strategy to stay dormant.
-        _STRATEGY = None
-        return
-
     if not enable_prefill_cp:
         _STRATEGY = None
         return
@@ -268,6 +262,14 @@ def init_cp_strategy(
         return
 
     kind = ContextParallelStrategyKind.from_string(cp_strategy)
+    if is_ppu() and kind != ContextParallelStrategyKind.INTERLEAVE:
+        # PPU only runs the interleave (DSA) V2 strategy; zigzag drives
+        # FlashAttention-style backends that PPU does not provide, so
+        # non-interleave prefill CP stays on the legacy shared V1 path with
+        # a dormant strategy there.
+        _STRATEGY = None
+        return
+
     if kind == ContextParallelStrategyKind.ZIGZAG:
         from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
 

@@ -2428,9 +2428,12 @@ class DeepseekV4AttnBackend(
             else list(extend_seq_lens_cpu)
         )
         max_seq_len = max(seq_lens_cpu_list)
-        if can_dsa_prefill_cp_round_robin_split(forward_batch):
-            # Legacy V1 prefill CP round-robin path (PPU keeps the V2 interleave
-            # strategy dormant, see init_cp_strategy). Restrict the chunk cache
+        if can_dsa_prefill_cp_round_robin_split(forward_batch) and not is_cp_active(
+            forward_batch
+        ):
+            # Legacy V1 prefill CP round-robin path, used only when no live V2
+            # strategy owns this batch (PPU binds the interleave V2 strategy,
+            # see init_cp_strategy). Restrict the chunk cache
             # to this CP rank's locally-owned requests and size total_swa with
             # the carry-propagated round-robin offsets so it stays sync-free.
             (
