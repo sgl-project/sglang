@@ -104,12 +104,19 @@ class TestBlockVerificationArgs(unittest.TestCase):
             ({"speculative_eagle_topk": 2}, "requires --speculative-eagle-topk=1"),
             ({"speculative_accept_threshold_single": 0.5}, "incompatible"),
             ({"speculative_accept_threshold_acc": 0.5}, "incompatible"),
-            ({"enable_deterministic_inference": True}, "incompatible"),
         ]
         for overrides, message in cases:
             with self.subTest(overrides=overrides):
                 with self.assertRaisesRegex(ValueError, message):
                     handle_speculative_decoding(self._args(**overrides))
+
+    def test_deterministic_inference_supported_on_cuda(self):
+        # Block verification reuses rejection sampling's seeded draft and verify draws,
+        # so deterministic inference must stay allowed on CUDA.
+        args = self._args(enable_deterministic_inference=True)
+        handle_speculative_decoding(args)
+        self.assertTrue(resolution_result(args, "speculative_use_block_verification"))
+        self.assertTrue(resolution_result(args, "speculative_use_rejection_sampling"))
 
 
 if __name__ == "__main__":
