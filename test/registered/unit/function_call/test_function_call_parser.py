@@ -5209,6 +5209,112 @@ function call<|role_sep|>
         self.assertEqual(params["action"], "create")
         self.assertEqual(params["id"], "prefs")
 
+    @staticmethod
+    def _collect_gigachat3(chunks, tools):
+        """Feed deltas and merge streamed calls the way a client would."""
+        detector = GigaChat3Detector()
+        store: dict = {}
+        order = []
+        text = ""
+        for chunk in chunks:
+            result = detector.parse_streaming_increment(chunk, tools)
+            text += result.normal_text or ""
+            for call in result.calls:
+                if call.tool_index not in store:
+                    store[call.tool_index] = [call.name, ""]
+                    order.append(call.tool_index)
+                if call.name:
+                    store[call.tool_index][0] = call.name
+                store[call.tool_index][1] += call.parameters or ""
+        end = detector.finish(tools)
+        text += end.normal_text or ""
+        for call in end.calls:
+            if call.tool_index not in store:
+                store[call.tool_index] = [call.name, ""]
+                order.append(call.tool_index)
+            if call.name:
+                store[call.tool_index][0] = call.name
+            store[call.tool_index][1] += call.parameters or ""
+        return text, [(i, store[i][0], store[i][1]) for i in order]
+
+    def test_streaming_never_emits_protocol_markers_as_content(self):
+        """Marker tokens must not reach the user as assistant text.
+
+        The marker can straddle a delta boundary. Emitting each delta verbatim
+        printed the framing itself -- "<|message_sep|>function call<|role_sep|>"
+        -- while the non-streaming path returns no text at all for these inputs.
+        """
+        outputs = [
+            "<|message_sep|>\n\nfunction call<|role_sep|>\n"
+            '{"name": "manage_user_memory", "arguments": {"action": "create", "id": "preferences"}}',
+            '<|function_call|>{"name": "manage_user_memory", "arguments": {"action": "create", "id": "preferences"}}',
+            "<|message_sep|>\n\nfunction call<|role_sep|>\n"
+            '{"name": "manage_user_memory", "arguments": {}}',
+        ]
+        for text in outputs:
+            expected_text = (
+                GigaChat3Detector().detect_and_parse(text, self.tools).normal_text
+            )
+            for chunk_size in (1, 5, 13, 16, len(text)):
+                chunks = [
+                    text[i : i + chunk_size] for i in range(0, len(text), chunk_size)
+                ]
+                streamed_text, _ = self._collect_gigachat3(chunks, self.tools)
+                self.assertEqual(
+                    streamed_text,
+                    expected_text,
+                    f"chunk_size={chunk_size} text={text[:40]!r}",
+                )
+                for marker in (
+                    "<|message_sep|>",
+                    "<|function_call|>",
+                    "function call<|role_sep|>",
+                ):
+                    self.assertNotIn(marker, streamed_text, f"chunk_size={chunk_size}")
+
+    def test_streaming_arguments_survive_a_split_end_token(self):
+        """The end token can arrive split; the emitted arguments must stay valid.
+
+        Stripping "</s>" only when the whole token is present let an uncleaned
+        snapshot through, and no later delta can repair a string the client has
+        already concatenated, so the arguments arrived as invalid JSON
+        ("{...}}</s").
+        """
+        text = (
+            "I'll remember that."
+            "<|message_sep|>\n\nfunction call<|role_sep|>\n"
+            '{"name": "manage_user_memory", "arguments": {"action": "create", "id": "test"}}</s>'
+        )
+        non_stream = GigaChat3Detector().detect_and_parse(text, self.tools)
+        expected_calls = [
+            (c.tool_index, c.name, c.parameters) for c in non_stream.calls
+        ]
+        for chunk_size in (1, 5, 13, 16, 24, 32, 48, len(text)):
+            chunks = [text[i : i + chunk_size] for i in range(0, len(text), chunk_size)]
+            streamed_text, streamed = self._collect_gigachat3(chunks, self.tools)
+            self.assertEqual(streamed, expected_calls, f"chunk_size={chunk_size}")
+            self.assertEqual(
+                streamed_text, non_stream.normal_text, f"chunk_size={chunk_size}"
+            )
+            # the accumulated arguments must be parseable JSON, exactly like the
+            # non-streaming path
+            for _, _, parameters in streamed:
+                json.loads(parameters)
+
+    def test_finish_releases_arguments_of_a_call_completed_in_one_delta(self):
+        """A call completing inside one delta must not arrive with empty args."""
+        text = (
+            '<|function_call|>{"name": "manage_user_memory", '
+            '"arguments": {"action": "create", "id": "preferences"}}'
+        )
+        streamed_text, streamed = self._collect_gigachat3([text], self.tools)
+        non_stream = GigaChat3Detector().detect_and_parse(text, self.tools)
+
+        self.assertEqual(
+            streamed, [(c.tool_index, c.name, c.parameters) for c in non_stream.calls]
+        )
+        self.assertEqual(streamed_text, non_stream.normal_text)
+
 
 class TestGetStructureConstraint(unittest.TestCase):
     """Tests for FunctionCallParser.get_structure_constraint() logic.
