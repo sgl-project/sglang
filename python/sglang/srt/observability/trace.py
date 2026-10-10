@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 import os
 import random
@@ -73,6 +74,29 @@ except ImportError:
 
 def extract_trace_headers(headers: Mapping[str, str]) -> Optional[Dict]:
     return {h: headers[h] for h in TRACE_HEADERS if h in headers}
+
+
+def fastapi_telemetry_disabled() -> Dict[str, Any]:
+    """FastAPI() keyword arguments that turn off FastAPI's built-in OpenTelemetry.
+
+    FastAPI 0.142 records request spans, metrics and logs through the global
+    OpenTelemetry providers by default. SGLang installs a global tracer provider
+    for its own request tracing, so those spans would be exported whatever the
+    trace level is, and FastAPI's environment auto-configuration would attach a
+    second OTLP exporter to it. Returns no arguments on older FastAPI versions.
+    """
+    from fastapi import FastAPI
+
+    if "telemetry" not in inspect.signature(FastAPI.__init__).parameters:
+        return {}
+    return {
+        "telemetry": {
+            "tracing": False,
+            "metrics": False,
+            "logs": False,
+            "auto_configure": False,
+        }
+    }
 
 
 def get_global_trace_level() -> int:

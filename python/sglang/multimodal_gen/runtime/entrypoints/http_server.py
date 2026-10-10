@@ -46,6 +46,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     globally_suppress_loggers,
     init_logger,
 )
+from sglang.srt.observability.trace import fastapi_telemetry_disabled
 from sglang.srt.utils.common import (
     add_prometheus_middleware,
     add_prometheus_track_response_middleware,
@@ -430,7 +431,7 @@ def create_app(server_args: ServerArgs):
     Create and configure the FastAPI application instance.
     """
     globally_suppress_loggers()
-    app = FastAPI(lifespan=lifespan)
+    app = FastAPI(lifespan=lifespan, **fastapi_telemetry_disabled())
     if server_args.enable_metrics:
         configure_metrics()
         add_prometheus_middleware(app)
