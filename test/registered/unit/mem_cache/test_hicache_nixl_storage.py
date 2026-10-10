@@ -11,6 +11,8 @@ import subprocess
 import tempfile
 import time
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
@@ -564,6 +566,64 @@ class TestNixlUnified(CustomTestCase):
         ]
 
         self.assertEqual(self.hicache.batch_exists(["key1", "key2"]), 1)
+
+    def test_dsa_indexer_bounce_round_trip_preserves_every_byte(self):
+        """Index pages must survive copy fallback when the main KV dtype is bf16."""
+        from sglang.srt.mem_cache.pool_host.dsa import (
+            DSAIndexerPoolHost,
+            make_dsa_indexer_pool_decl,
+        )
+
+        pool = SimpleNamespace(
+            layer_num=2,
+            device="cpu",
+            layer_shard_enabled=False,
+            store_dtype=torch.bfloat16,
+            start_layer=0,
+            end_layer=2,
+            index_head_dim=128,
+            quant_block_size=128,
+            page_size=64,
+            index_page_size=64,
+            skip_topk_layers=[False, False],
+            index_k_with_scale_buffer=[
+                torch.empty((4, 64 * 132), dtype=torch.uint8) for _ in range(2)
+            ],
+        )
+        anchor = SimpleNamespace(
+            page_size=64, layout="page_first", size=256, page_num=4
+        )
+        host = DSAIndexerPoolHost(
+            make_dsa_indexer_pool_decl(pool), anchor, pin_memory=False
+        )
+        self.addCleanup(host.destroy)
+        with mock.patch.object(
+            self.hicache, "_hybrid_pool_supports_zero_copy", return_value=False
+        ):
+            self.hicache.register_mem_host_pool_v2(host, PoolName.INDEXER)
+        self.addCleanup(self.hicache.close)
+        ctx = self.hicache._hybrid_pool_ctx[PoolName.INDEXER]
+        self.assertFalse(ctx.is_zero_copy)
+        expected = (
+            torch.arange(host.get_dummy_flat_data_page().numel())
+            .remainder(251)
+            .to(torch.uint8)
+        )
+        host.set_from_flat_data_page(64, expected)
+        transfer = PoolTransfer(
+            name=PoolName.INDEXER,
+            keys=["dsa-index-bytes"],
+            host_indices=torch.arange(64, 128),
+        )
+        self.assertEqual(
+            self.hicache.batch_set_v2([transfer]), {PoolName.INDEXER: [True]}
+        )
+        host.set_from_flat_data_page(64, torch.zeros_like(expected))
+        ctx.bounce_get.zero_()
+        self.assertEqual(
+            self.hicache.batch_get_v2([transfer]), {PoolName.INDEXER: [True]}
+        )
+        self.assertTrue(torch.equal(host.get_data_page(64), expected))
 
     def test_register_mem_host_pool_v2_uses_zero_copy_when_supported(self):
         pool = MockHybridPool(expose_zero_copy=True)
