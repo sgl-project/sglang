@@ -4,12 +4,51 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-
+from sglang.srt.mem_cache.kv_cache_configurator import (
+    _qsa_cache_sharding_graph_reservation_gb,
+)
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+
+def test_qsa_cache_sharding_budget_covers_graph_and_ple_prefill_output():
+    reserve_gb = _qsa_cache_sharding_graph_reservation_gb(
+        sharding_size=4,
+        is_qsa=True,
+        cuda_graph_enabled=True,
+        prefill_tokens=8192,
+        hidden_size=2560,
+        hyper_connection_count=4,
+        activation_element_size=2,
+    )
+
+    graph_private_gb = 4 * 0.5
+    ple_tensor_gb = 8192 * 2560 * 4 * 2 / (1 << 30)
+    assert reserve_gb == pytest.approx(graph_private_gb + 3 * ple_tensor_gb)
+
+
+@pytest.mark.parametrize(
+    ("sharding_size", "is_qsa", "cuda_graph_enabled"),
+    [(1, True, True), (4, False, True), (4, True, False)],
+)
+def test_qsa_cache_sharding_budget_preserves_unsharded_or_eager_behavior(
+    sharding_size, is_qsa, cuda_graph_enabled
+):
+    assert (
+        _qsa_cache_sharding_graph_reservation_gb(
+            sharding_size=sharding_size,
+            is_qsa=is_qsa,
+            cuda_graph_enabled=cuda_graph_enabled,
+            prefill_tokens=8192,
+            hidden_size=2560,
+            hyper_connection_count=4,
+            activation_element_size=2,
+        )
+        == 0.0
+    )
 
 
 def test_qsa_allocations_follow_parent_mooncake_scope(monkeypatch):

@@ -98,6 +98,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
     get_spec,
+    max_prefill_buffer_tokens,
     max_speculative_num_draft_tokens,
     pre_capture_activation_reserve_mb,
 )
@@ -116,13 +117,32 @@ logger = logging.getLogger(__name__)
 
 
 def _qsa_cache_sharding_graph_reservation_gb(
-    *, sharding_size: int, is_qsa: bool, cuda_graph_enabled: bool
+    *,
+    sharding_size: int,
+    is_qsa: bool,
+    cuda_graph_enabled: bool,
+    prefill_tokens: int,
+    hidden_size: int,
+    hyper_connection_count: int,
+    activation_element_size: int,
 ) -> float:
     if sharding_size <= 1 or not is_qsa or not cuda_graph_enabled:
         return 0.0
     # NCCL graph-private pools are created per QSA cache shard during decode
-    # capture and are not visible when the KV pool is initially sized.
-    return sharding_size * 0.5
+    # capture and are not visible when the KV pool is initially sized. Qwen4
+    # PLE holds the indexed short-conv result while SiLU materializes its output,
+    # then the enclosing residual add materializes another result. Thus three
+    # [prefill_tokens, hc_count * hidden_size] tensors can overlap after those
+    # pools exist; keep them out of the KV budget too.
+    graph_private_gb = sharding_size * 0.5
+    ple_selection_gb = (
+        prefill_tokens
+        * hidden_size
+        * hyper_connection_count
+        * activation_element_size
+        / (1 << 30)
+    )
+    return graph_private_gb + 3 * ple_selection_gb
 
 
 def _should_elide_dsa_index_k(*, is_draft_worker: bool) -> bool:
@@ -2638,14 +2658,20 @@ class KVCacheConfigurator:
         slack_gb = pre_model_load_memory * (1 - get_schedule().mem_fraction_static)
         from sglang.srt.layers.attention.qsa.config import parse_qsa_profile
 
+        qsa_profile = parse_qsa_profile(self.model_config.hf_config)
+        text_config = self.model_config.hf_text_config
         qsa_sharding_graph_reservation_gb = (
             _qsa_cache_sharding_graph_reservation_gb(
                 sharding_size=int(get_parallel().qsa_cache_sharding_size),
-                is_qsa=parse_qsa_profile(self.model_config.hf_config) is not None,
+                is_qsa=qsa_profile is not None,
                 cuda_graph_enabled=(
                     get_exec().graph.cuda_graph_config.decode.backend
                     != Backend.DISABLED
                 ),
+                prefill_tokens=max_prefill_buffer_tokens(),
+                hidden_size=int(getattr(text_config, "hidden_size", 0)),
+                hyper_connection_count=int(getattr(text_config, "hc_count", 1)),
+                activation_element_size=self.model_dtype.itemsize,
             )
         )
         if qsa_sharding_graph_reservation_gb:
