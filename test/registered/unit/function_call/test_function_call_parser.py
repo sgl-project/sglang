@@ -39,6 +39,7 @@ from sglang.srt.function_call.pythonic_detector import PythonicDetector
 from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
 from sglang.srt.function_call.utils import get_schema_properties
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 register_cpu_ci(est_time=70, suite="stage-b-test-cpu-intel")
@@ -2286,7 +2287,7 @@ class TestDeepSeekV4Detector(unittest.TestCase):
         self.assertEqual(json.loads(tool_calls_by_index[0]["parameters"]), {})
 
 
-class TestQwen3CoderDetector(unittest.TestCase):
+class TestQwen3CoderDetector(CustomTestCase):
     """Test suite for Qwen3CoderDetector."""
 
     def setUp(self):
@@ -2436,6 +2437,65 @@ class TestQwen3CoderDetector(unittest.TestCase):
         self.assertEqual(params2["dry_run"], True)
 
     # ==================== Streaming Tests ====================
+
+    def test_streaming_tool_end_closes_missing_function_end(self):
+        for body, expected in (
+            ("<parameter=days>\n0\n</parameter>\n", {"days": 0}),
+            ("<parameter=days>\n0\n", {"days": 0}),
+            ("", {}),
+        ):
+            text = "<tool_call>\n<function=get_current_weather>\n" + body
+            text += "</tool_call>"
+            for chunk_size in (1, 7, len(text)):
+                with self.subTest(body=body, chunk_size=chunk_size):
+                    detector = Qwen3CoderDetector()
+                    calls = []
+                    normal_text = ""
+                    for offset in range(0, len(text), chunk_size):
+                        result = detector.parse_streaming_increment(
+                            text[offset : offset + chunk_size], self.tools
+                        )
+                        calls.extend(result.calls)
+                        normal_text += result.normal_text
+                    self.assertEqual(normal_text, "")
+                    self.assertEqual(
+                        [call.name for call in calls if call.name],
+                        ["get_current_weather"],
+                    )
+                    self.assertEqual({call.tool_index for call in calls}, {0})
+                    arguments = "".join(call.parameters for call in calls)
+                    self.assertEqual(json.loads(arguments), expected)
+                    oneshot = Qwen3CoderDetector().detect_and_parse(text, self.tools)
+                    self.assertEqual(json.loads(oneshot.calls[0].parameters), expected)
+
+    def test_streaming_missing_function_end_preserves_following_call_and_text(self):
+        text = (
+            "<tool_call><function=get_current_weather>"
+            "<parameter=days>0</tool_call>"
+            "<tool_call><function=sql_interpreter>"
+            "<parameter=query>SELECT 1</parameter></function></tool_call>done"
+        )
+        for chunk_size in (1, len(text)):
+            with self.subTest(chunk_size=chunk_size):
+                detector = Qwen3CoderDetector()
+                arguments = ["", ""]
+                names = []
+                normal_text = ""
+                for offset in range(0, len(text), chunk_size):
+                    result = detector.parse_streaming_increment(
+                        text[offset : offset + chunk_size], self.tools
+                    )
+                    normal_text += result.normal_text
+                    for call in result.calls:
+                        if call.name:
+                            names.append(call.name)
+                        arguments[call.tool_index] += call.parameters
+                self.assertEqual(names, ["get_current_weather", "sql_interpreter"])
+                self.assertEqual(
+                    [json.loads(value) for value in arguments],
+                    [{"days": 0}, {"query": "SELECT 1"}],
+                )
+                self.assertEqual(normal_text, "done")
 
     def test_streaming_single_tool_call(self):
         """
