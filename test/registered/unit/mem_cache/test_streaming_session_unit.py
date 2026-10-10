@@ -3,7 +3,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, FINISH_LENGTH, ReqKvInfo
+from sglang.srt.managers.schedule_batch import (
+    FINISH_ABORT,
+    FINISH_LENGTH,
+    Req,
+    ReqKvInfo,
+)
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
@@ -82,6 +87,8 @@ class _FakeInnerCache:
 
 
 class _FakeReq:
+    release_mm_inputs_on_abort = Req.release_mm_inputs_on_abort
+
     def __init__(
         self, session_id: str, req_pool_idx: int, committed: int, allocated: int
     ):
@@ -108,6 +115,8 @@ class _FakeReq:
         self.to_finish = None
         self.finished_reason = None
         self.finished_len = None
+        self.multimodal_inputs = None
+        self._session_mm_items = []
 
     def detach_kv(self):
         kv, self.kv = self.kv, ReqKvInfo()

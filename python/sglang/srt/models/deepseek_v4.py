@@ -4579,7 +4579,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         spans = []
         device, dtype = self.image_start.device, self.image_start.dtype
         for item in items:
-            item.reconstruct(device.index, ipc_consumer_count=self.tp_size)
+            item.reconstruct(device.index)
             h, w = int(item.n_vit_h), int(item.n_vit_w)
             pixels = torch.as_tensor(item.feature, device=device)
             plan = item.model_specific_data.get(GPU_PLAN_KEY)
