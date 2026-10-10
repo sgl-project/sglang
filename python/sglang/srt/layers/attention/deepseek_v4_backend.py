@@ -1698,29 +1698,7 @@ class DeepseekV4AttnBackend(
             get_local_dp_buffer_len(),
         )
         tail = tail_metadata.late_layer_tail
-        # The layers before the switch published top-k into the full metadata's
-        # buffers; carry the tail rows into the tail metadata's (padding stays -1).
-        full_core = saved[0].core_attn_metadata
         tail_core = tail_metadata.core_attn_metadata
-        for ratio in tail_core.low_ratios:
-            for full_buf, tail_buf in (
-                (
-                    full_core.sparse_page_indices(ratio),
-                    tail_core.sparse_page_indices(ratio),
-                ),
-                (
-                    full_core.sparse_topk_lengths(ratio),
-                    tail_core.sparse_topk_lengths(ratio),
-                ),
-                (
-                    full_core.sparse_raw_indices(ratio),
-                    tail_core.sparse_raw_indices(ratio),
-                ),
-            ):
-                if full_buf is None or tail_buf is None:
-                    continue
-                rows = tail.real_rows(full_buf)
-                tail_buf[: rows.shape[0]].copy_(rows)
         self.forward_metadata = tail_metadata
         if self.token_to_kv_pool.request_window is not None:
             self.token_to_kv_pool.request_window.activate(
@@ -2742,6 +2720,10 @@ class DeepseekV4AttnBackend(
             return
         if forward_batch.encoder_swa_replay:
             run_compressor = False
+        meta = self.forward_metadata
+        if isinstance(meta, DSV4Metadata) and meta.late_layer_tail is not None:
+            # The source layer wrote every row's compressed KV before the switch.
+            run_compressor = False
         if dsa_use_prefill_cp(forward_batch) and forward_batch.forward_mode.is_extend():
             self._forward_low_ratio_sources_cp(
                 layer=layer,
@@ -2753,7 +2735,6 @@ class DeepseekV4AttnBackend(
                 run_indexer=run_indexer,
             )
             return
-        meta = self.forward_metadata
         hoisted_req = getattr(meta, "low_ratio_req_indices", None)
         hoisted_pos = getattr(meta, "low_ratio_pos_i64", None)
         if (
@@ -3314,15 +3295,6 @@ class DeepseekV4AttnBackend(
         if published is None:
             return
         self.forward_metadata.candidate_metadata = published
-        tail_metadata = self.tail_forward_metadata
-        if tail_metadata is None or tail_metadata is self.forward_metadata:
-            return
-        tail = tail_metadata.late_layer_tail
-        tail_metadata.candidate_metadata = published.tail(
-            tail.local_lens_cpu
-            if tail.cp_metadata is not None
-            else tail.extend_seq_lens_cpu
-        )
 
     def get_swa_out_cache_loc(self, forward_batch: ForwardBatch) -> torch.Tensor:
         """Idle always re-translates at store time: its metadata may be stale, and
