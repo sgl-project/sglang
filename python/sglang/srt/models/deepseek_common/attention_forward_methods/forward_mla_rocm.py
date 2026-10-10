@@ -134,6 +134,7 @@ if _use_aiter:
     )
 
 if _use_aiter_gfx95:
+    from aiter.ops.triton.batched_gemm_a16wfp4 import batched_gemm_a16wfp4
     from aiter.ops.triton.fused_fp8_quant import (
         fused_flatten_fp8_group_quant,
         fused_rms_fp8_group_quant,
@@ -183,6 +184,111 @@ def _absorb_bmm_config(heads: int, m: int, n: int) -> Optional[dict]:
     }
 
 
+def _get_mxfp4_bmm_config(m: int, n: int, k: int):
+    from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_a16wfp4 import (
+        _get_config,
+    )
+
+    return _get_config(m, n, k)
+
+
+def _get_single_split_mxfp4_bmm_config(x: torch.Tensor, weight: torch.Tensor) -> dict:
+    config, _ = _get_mxfp4_bmm_config(x.shape[1], weight.shape[1], x.shape[2])
+    config = config.copy()
+    config["NUM_KSPLIT"] = 1
+    return config
+
+
+def _get_glm_mxfp4_k_bmm_config(x: torch.Tensor, weight: torch.Tensor) -> dict:
+    config = _get_single_split_mxfp4_bmm_config(x, weight)
+    # GLM's K-up has K=192. Larger blocks over-read its six E8M0 scale groups.
+    config["BLOCK_SIZE_K"] = 64
+    return config
+
+
+def _get_glm_mxfp4_v_bmm_config(x: torch.Tensor, weight: torch.Tensor) -> dict:
+    config = _get_single_split_mxfp4_bmm_config(x, weight)
+    # Keep AITER's small-M decode buckets; use the profiled prefill tiles.
+    if x.shape[1] > 256:
+        config["BLOCK_SIZE_M"] = 128
+        config["BLOCK_SIZE_K"] = 128
+    return config
+
+
+def _run_tuned_mxfp4_bmm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output: torch.Tensor,
+    config: dict,
+    *,
+    transpose_bm: bool,
+) -> torch.Tensor:
+    return batched_gemm_a16wfp4(
+        x,
+        weight,
+        weight_scale,
+        y=output,
+        config=config,
+        transpose_bm=transpose_bm,
+        prequant=True,
+        y_scale=None,
+        dtype=torch.bfloat16,
+    )
+
+
+def _run_mxfp4_k_bmm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    if x.shape[2] == 192 and weight.shape[1] == 512:
+        _run_tuned_mxfp4_bmm(
+            x,
+            weight,
+            weight_scale,
+            output,
+            _get_glm_mxfp4_k_bmm_config(x, weight),
+            transpose_bm=False,
+        )
+        return
+
+    batched_gemm_afp4wfp4_pre_quant(
+        x,
+        weight,
+        weight_scale,
+        torch.bfloat16,
+        output,
+    )
+
+
+def _run_mxfp4_v_bmm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    if x.shape[2] == 512 and weight.shape[1] == 256:
+        return _run_tuned_mxfp4_bmm(
+            x,
+            weight,
+            weight_scale,
+            output,
+            _get_glm_mxfp4_v_bmm_config(x, weight),
+            transpose_bm=True,
+        )
+
+    batched_gemm_afp4wfp4_pre_quant(
+        x,
+        weight,
+        weight_scale,
+        torch.bfloat16,
+        output.transpose(0, 1),
+    )
+    return output
+
+
 def _absorb_weight_bf16(w: torch.Tensor, w_scale) -> torch.Tensor:
     """Dequantize an absorbed MLA weight, skipping the pass when it is a no-op."""
     if (
@@ -211,11 +317,10 @@ def rocm_absorb_q_bmm(
             device=x.device,
             dtype=torch.bfloat16,
         )
-        batched_gemm_afp4wfp4_pre_quant(
+        _run_mxfp4_k_bmm(
             x,
             attn.w_kc.transpose(-2, -1),
             attn.w_scale_k.transpose(-2, -1),
-            torch.bfloat16,
             q_nope_out,
         )
     else:
@@ -266,14 +371,13 @@ def rocm_absorb_v_bmm(
             device=x.device,
             dtype=torch.bfloat16,
         )
-        attn_bmm_output = _bmm_buf.transpose(0, 1)
-        batched_gemm_afp4wfp4_pre_quant(
+        _bmm_buf = _run_mxfp4_v_bmm(
             x,
             attn.w_vc.transpose(-2, -1),
             attn.w_scale_v.transpose(-2, -1),
-            torch.bfloat16,
-            attn_bmm_output,
+            _bmm_buf,
         )
+        attn_bmm_output = _bmm_buf
     else:
         _bmm_buf = None
         if _use_aiter_gfx95 and attn.w_kc.dtype == torch.float8_e4m3fn:
