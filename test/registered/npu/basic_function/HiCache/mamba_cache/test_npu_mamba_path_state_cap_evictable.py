@@ -96,7 +96,7 @@ def _wait_metrics_ready(base_url, timeout=120):
             if resp.status_code == 200:
                 return
         except requests.RequestException:
-            pass	
+            pass
         time.sleep(2)
     raise AssertionError(
         f"/metrics kept returning non-200 (port {base_url}). Please check: "
@@ -265,7 +265,9 @@ class TestNPUMambaPathStateCapEvictable(CustomTestCase):
             # for the metrics to stabilize.
             evictable = _wait_metric_stable(BASE_URL, METRIC)
             available = _wait_metric_stable(BASE_URL, "sglang:mamba_available_tokens")
-            _dump_mamba_metrics(BASE_URL, cap)  # print per-rank raw values for diagnosis
+            _dump_mamba_metrics(
+                BASE_URL, cap
+            )  # print per-rank raw values for diagnosis
             return {"evictable": evictable, "available": available, "results": results}
         finally:
             terminate_and_kill_process_tree(process, terminate_timeout=60)
