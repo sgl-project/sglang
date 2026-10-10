@@ -6,17 +6,21 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 import math
 import types
 import unittest
+from dataclasses import replace
 from functools import partial
 from unittest.mock import patch
 
+import msgspec
 import prometheus_client
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler_components.metrics_reporter import (
     PrefillStats,
     SchedulerMetricsReporter,
     _CacheHitRateWindow,
 )
+from sglang.srt.observability.forward_pass_metrics import ForwardPassMetrics
 from sglang.srt.observability.metrics_collector import (
     DPBalanceStats,
     SchedulerMetricsCollector,
@@ -155,6 +159,7 @@ class TestForwardPassMetrics(unittest.TestCase):
             reqs=[],
             decoding_reqs=[],
             prefix_lens=[],
+            extend_lens=[],
             prefill_stats=None,
             seq_lens_cpu=[],
             fpm_start_time=100.0,
@@ -164,7 +169,11 @@ class TestForwardPassMetrics(unittest.TestCase):
 
     def test_emit_mixed_batch_separates_prefill_and_decode(self):
         self.scheduler._fpm_dp_rank = 3
-        self.scheduler.waiting_queue = [_FakeReq(6), _FakeReq(4, output_len=2)]
+        self.scheduler.waiting_queue = [
+            _FakeReq(6),
+            _FakeReq(10),
+            _FakeReq(4, output_len=2),
+        ]
 
         prefill_a = _FakeReq(10)
         prefill_b = _FakeReq(14)
@@ -174,6 +183,7 @@ class TestForwardPassMetrics(unittest.TestCase):
             reqs=[prefill_a, prefill_b, decode_req],
             decoding_reqs=[decode_req],
             prefix_lens=[2, 3, decode_req.seqlen - 1],
+            extend_lens=[4, 8, 1],
             prefill_stats=PrefillStats(
                 log_input_tokens=12,
                 log_hit_tokens=5,
@@ -198,12 +208,84 @@ class TestForwardPassMetrics(unittest.TestCase):
         self.assertEqual(metrics.scheduled_requests.num_prefill_requests, 2)
         self.assertEqual(metrics.scheduled_requests.sum_prefill_tokens, 12)
         self.assertEqual(metrics.scheduled_requests.sum_prefill_kv_tokens, 5)
+        # Only prefill centers 4 and 7 contribute; the decode row is excluded.
+        self.assertEqual(metrics.scheduled_requests.var_prefill_length, 2.25)
         self.assertEqual(metrics.scheduled_requests.num_decode_requests, 1)
         self.assertEqual(
             metrics.scheduled_requests.sum_decode_kv_tokens, decode_req.seqlen
         )
-        self.assertEqual(metrics.queued_requests.num_prefill_requests, 1)
+        self.assertEqual(metrics.queued_requests.num_prefill_requests, 2)
+        self.assertEqual(metrics.queued_requests.var_prefill_length, 4.0)
         self.assertEqual(metrics.queued_requests.num_decode_requests, 1)
+        self.assertEqual(
+            msgspec.msgpack.decode(
+                msgspec.msgpack.encode(metrics), type=ForwardPassMetrics
+            ),
+            metrics,
+        )
+
+    def test_prefill_variance_matches_vllm_iteration_contract(self):
+        cases = [
+            # name, full prompts, prefixes, scheduled chunks, expected variance
+            ("vllm_reference", [1000, 5], [4, 2], [1, 3], 0.25),
+            ("odd_even_chunks", [1000, 5], [4, 2], [1, 2], 0.5625),
+            ("different_full_prompts", [8, 100], [4, 2], [1, 3], 0.25),
+            ("same_geometry", [10, 100], [2, 2], [4, 4], 0.0),
+            ("uncached_full_prefill", [8, 12], [0, 0], [8, 12], 1.0),
+            ("single_request", [1000], [40], [3], 0.0),
+            ("empty", [], [], [], 0.0),
+        ]
+        for name, prompts, prefixes, chunks, expected in cases:
+            with self.subTest(name=name):
+                batch = self._make_batch(
+                    forward_mode=_FakeForwardMode(is_extend=True),
+                    reqs=[_FakeReq(prompt) for prompt in prompts],
+                    prefix_lens=prefixes,
+                    extend_lens=chunks,
+                )
+                metrics = self.reporter._build_scheduled_request_metrics(batch)
+                self.assertEqual(metrics.var_prefill_length, expected)
+
+    def test_prefill_variance_uses_copied_chunk_geometry(self):
+        batch = ScheduleBatch(
+            reqs=[_FakeReq(100), _FakeReq(100)],
+            forward_mode=_FakeForwardMode(is_extend=True),
+            prefix_lens=[0, 40],
+            extend_lens=[20, 20],
+            prefill_stats=PrefillStats(
+                log_input_tokens=40,
+                log_hit_tokens=40,
+                new_token_ratio=1.0,
+                num_running_reqs=types.SimpleNamespace(),
+                num_new_seqs=0,
+            ),
+        )
+        snapshot = batch.copy()
+        self.assertIs(snapshot.reqs[0], batch.reqs[0])
+        # Result processing and the next chunk can advance shared requests.
+        for req, prefix in zip(batch.reqs, [60, 80]):
+            req.prefix_indices = list(range(prefix))
+        batch.prefix_lens = [20, 60]
+        batch.extend_lens = [40, 20]
+        batch.prefill_stats = replace(
+            batch.prefill_stats, log_input_tokens=60, log_hit_tokens=80
+        )
+
+        for current, expected in ((snapshot, 400.0), (batch, 225.0)):
+            with self.subTest(prefixes=current.prefix_lens):
+                metrics = self.reporter._build_scheduled_request_metrics(current)
+                self.assertEqual(metrics.var_prefill_length, expected)
+                # Continuing chunks contribute even with no new sequences.
+                self.assertEqual(metrics.num_prefill_requests, 0)
+
+    def test_decode_only_keeps_decode_variance(self):
+        batch = self._make_batch(
+            reqs=[_FakeReq(8, output_len=3), _FakeReq(12, output_len=3)],
+            seq_lens_cpu=[11, 15],
+        )
+        metrics = self.reporter._build_scheduled_request_metrics(batch)
+        self.assertEqual(metrics.var_prefill_length, 0.0)
+        self.assertEqual(metrics.var_decode_kv_tokens, 4.0)
 
     def test_emit_uses_device_timer_gpu_time(self):
         self.scheduler._fpm_uses_device_timer = True
