@@ -49,6 +49,16 @@ test("every diffusion model uses one shared builder before model capabilities", 
   assert.ok(!walk(join(docs, "src/snippets/diffusion")).some((path) => path.endsWith("-deployment.jsx")));
 });
 
+test("server builder has a footer link to the CLI reference", () => {
+  const shared = readFileSync(join(docs, "src/snippets/_deployment.jsx"), "utf8");
+  assert.match(shared, /builderScope === "serve" && \(\s*<p className="sgd-builder-docs-tip">/);
+  const tip = shared.indexOf('className="sgd-builder-docs-tip"');
+  assert.ok(tip > shared.indexOf('className="sgd-builder-output-rail"'));
+  const href = shared.slice(tip).match(/href="([^"]+)"/)[1];
+  assert.equal(href, "/docs/sglang-diffusion/api/cli");
+  assert.match(readFileSync(join(docs, `${href}.mdx`), "utf8"), /title: CLI reference/);
+});
+
 test("migrated recipes retain unverified status, valid scopes and editable ports", () => {
   assert.equal(migrated.length, 22);
   const shared = readFileSync(join(docs, "src/snippets/_deployment.jsx"), "utf8");
