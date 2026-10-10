@@ -12,6 +12,7 @@ from sglang.srt.configs.model_config import (
     is_deepseek_dsa,
 )
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.allocation_sizing import get_req_to_token_extra_context_len
 from sglang.srt.runtime_context import (
     attention_backends,
     get_disagg,
@@ -19,7 +20,7 @@ from sglang.srt.runtime_context import (
     process_model_config,
     uses_mla_backend,
 )
-from sglang.srt.utils.common import is_npu
+from sglang.srt.utils.common import ceil_align, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -188,7 +189,7 @@ def get_sparsity_driven_kv_offload_fixed_memory_size(
     element_size: int,
     max_running_requests_per_worker: int,
 ) -> Optional[int]:
-    """Return the fixed device-KV allocation made by the sparse KV manager.
+    """Return the fixed device KV and PD staging allocation of the sparse manager.
 
     In addition to the token-scaled index pool, ``SparseKVCacheManager`` keeps
     a full-MLA-KV cache for every request and layer. With LRU its capacity is
@@ -196,6 +197,10 @@ def get_sparsity_driven_kv_offload_fixed_memory_size(
     the model's ``index_topk``. The request-to-token
     pool includes a padding row and, on PD decode, preallocated transfer rows.
     The manager allocates a device cache for all of them.
+
+    PD decode also needs one full-context K/V staging slot per layer. Reserve
+    its page-aligned request-pool capacity before sizing the index pool, even
+    though staging is allocated later during transfer-buffer registration.
     """
     mode = resolve_sparse_kv_offload_mode(
         model_config=model_config,
@@ -223,10 +228,11 @@ def get_sparsity_driven_kv_offload_fixed_memory_size(
     request_capacity = max_running_requests_per_worker + 1
     if mode.uses_pd_decode_staging:
         request_capacity += get_disagg().disaggregation_decode_extra_slots
-    return (
-        request_capacity
-        * device_cache_capacity
-        * kv_head_dim
-        * num_layers
-        * element_size
-    )
+    device_kv_tokens = request_capacity * device_cache_capacity
+    if mode.uses_pd_decode_staging:
+        max_context_len = (
+            model_config.context_len + get_req_to_token_extra_context_len()
+        )
+        # The single staging slot is shared across requests.
+        device_kv_tokens += ceil_align(max_context_len, get_schedule().page_size)
+    return device_kv_tokens * kv_head_dim * num_layers * element_size

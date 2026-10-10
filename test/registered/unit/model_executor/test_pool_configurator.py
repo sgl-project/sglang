@@ -8,6 +8,8 @@ from unittest.mock import MagicMock, patch
 
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.runtime_context import (
+    get_disagg,
+    get_exec,
     get_memory,
     get_parallel,
     get_schedule,
@@ -313,6 +315,53 @@ class TestDefaultConfigurator(CustomTestCase):
                 expected_tokens = ((available - fixed_memory) // cell_size) // page_size
                 self.assertEqual(
                     config.max_total_num_tokens, expected_tokens * page_size
+                )
+
+    def test_sparse_pd_staging_is_reserved_before_index_pool(self):
+        """128K PD staging must not consume HBM already assigned to index KV."""
+        mr = _make_model_runner(
+            self,
+            num_layers=78,
+            use_mla_backend=True,
+            max_running_requests=6,
+            page_size=128,
+            disaggregation_mode="decode",
+        )
+        _configure_dsa_model(mr)
+        mr.model_config.context_len = 131072
+        # Reported allocation: 131072 context + 4 headroom, aligned to 128.
+        staging_bytes = 131200 * (512 + 64) * 2 * 78
+        device_kv_bytes = 7 * 4096 * (512 + 64) * 2 * 78
+        index_bytes = 1024 * 128 * 2 * 78
+        with (
+            mock_cpu_env(),
+            get_exec().kernel.override(attention_backend="ascend"),
+            get_disagg().override(disaggregation_transfer_backend="ascend"),
+            patch.dict(
+                os.environ,
+                {
+                    "SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD": "1",
+                    "SGLANG_NPU_SPARSE_KV_ENABLE_LRU": "1",
+                    "SGLANG_NPU_SPARSE_KV_DEVICE_CACHE_FACTOR": "2",
+                },
+            ),
+            patch(
+                "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config.is_npu",
+                return_value=True,
+            ),
+        ):
+            from sglang.srt.model_executor.pool_configurator import (
+                DefaultPoolConfigurator,
+            )
+
+            configurator = DefaultPoolConfigurator(mr)
+            result = configurator.calculate_pool_sizes(
+                device_kv_bytes + staging_bytes + index_bytes, 128
+            )
+            self.assertEqual(result.max_total_num_tokens, 1024)
+            with self.assertRaisesRegex(RuntimeError, "Not enough memory"):
+                configurator.calculate_pool_sizes(
+                    device_kv_bytes + staging_bytes - 1, 128
                 )
 
     @patch(

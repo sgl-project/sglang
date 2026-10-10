@@ -12,6 +12,7 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     get_sparsity_driven_kv_offload_sparse_context_len,
     resolve_sparse_kv_offload_mode,
 )
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -30,6 +31,7 @@ def _make_glm51_model_config():
         index_head_dim=128,
         kv_lora_rank=512,
         qk_rope_head_dim=64,
+        context_len=4092,
     )
 
 
@@ -77,6 +79,9 @@ class TestSparsityDrivenKVOffloadConfig(CustomTestCase):
                     )
 
     def setUp(self):
+        override = get_context().override_server_args(page_size=128)
+        override.install()
+        self.addCleanup(override.restore)
         self.model_config = _make_glm51_model_config()
         self.disagg = SimpleNamespace(
             disaggregation_mode="null",
@@ -101,7 +106,7 @@ class TestSparsityDrivenKVOffloadConfig(CustomTestCase):
             ),
             patch(
                 "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config.get_schedule",
-                return_value=SimpleNamespace(max_running_requests=8),
+                return_value=SimpleNamespace(max_running_requests=8, page_size=128),
             ),
             patch(
                 "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config.get_disagg",
@@ -152,7 +157,12 @@ class TestSparsityDrivenKVOffloadConfig(CustomTestCase):
                     expected = (
                         None
                         if role == "prefill"
-                        else (8 + 1) * factor * 2048 * (512 + 64) * 2 * 2
+                        else (
+                            (8 + 1) * factor * 2048 + (4096 if role == "decode" else 0)
+                        )
+                        * (512 + 64)
+                        * 2
+                        * 2
                     )
                     self.assertEqual(self.fixed_memory_size(), expected)
 
@@ -169,7 +179,9 @@ class TestSparsityDrivenKVOffloadConfig(CustomTestCase):
     def test_decode_budget_includes_preallocated_transfer_rows(self):
         self.disagg.disaggregation_mode = "decode"
         self.disagg.disaggregation_decode_extra_slots = 4
-        self.assertEqual(self.fixed_memory_size(), (8 + 4 + 1) * 1536 * 576 * 2 * 2)
+        self.assertEqual(
+            self.fixed_memory_size(), ((8 + 4 + 1) * 1536 + 4096) * 576 * 2 * 2
+        )
 
     def test_dynamic_topk_with_lru_disabled(self):
         with patch.dict(

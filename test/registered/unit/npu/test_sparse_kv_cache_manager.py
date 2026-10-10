@@ -19,6 +19,7 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload import config
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool, ReqToTokenPool
+from sglang.srt.runtime_context import get_context
 from sglang.srt.utils import common
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -99,14 +100,22 @@ class TestSparseKVCacheManager(CustomTestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
 
-    def make_manager(self, topk=1536, enable_lru=False, factor=2, pool_device="cpu"):
-        pool = ReqToTokenPool(2, 4096, pool_device, False)
+    def make_manager(
+        self,
+        topk=1536,
+        enable_lru=False,
+        factor=2,
+        pool_device="cpu",
+        max_context_len=4096,
+        dtype=torch.float32,
+    ):
+        pool = ReqToTokenPool(2, max_context_len, pool_device, False)
         kv = MLATokenToKVPool.__new__(MLATokenToKVPool)
         kv.start_layer = 0
         kv.layer_num = 2
         kv.kv_lora_rank = 2
         kv.qk_rope_head_dim = 2
-        kv.store_dtype = torch.float32
+        kv.store_dtype = dtype
         kv.page_size = 128
         allocator = SimpleNamespace(get_kvcache=lambda: kv)
         with (
@@ -283,6 +292,76 @@ class TestSparseKVCacheManager(CustomTestCase):
                     self.assertEqual(manager.device_kv_buffer[0].shape[0], 3)
                     self.assertEqual(manager._decode_query_seq_lengths[:16].numel(), 16)
                     self.assertEqual(manager._zero_sparse_index[:16].shape[0], 16)
+
+    def test_pd_fixed_budget_matches_allocated_kv_and_staging(self):
+        """Late PD staging allocation must fit the bytes reserved during sizing."""
+        self.kernels.fused_timestamp_lru_metadata_update_with_probation = Mock()
+        self.kernels.parallel_lru_metadata_write = Mock()
+        for context_len, request_context_len, page_size, enable_lru, dtype, draft in (
+            (252, 256, 128, False, torch.float32, None),
+            (253, 257, 128, True, torch.bfloat16, None),
+            (252, 256, 1, False, torch.bfloat16, None),
+            # Speculative reserve is 2 * 4 + (128 - 1) = 135 extra tokens.
+            (252, 387, 128, True, torch.float32, 4),
+        ):
+            topk = 2048 if enable_lru else 3
+            hf_config = SimpleNamespace(
+                architectures=["GlmMoeDsaForCausalLM"], index_topk=topk
+            )
+            hf_config.get_text_config = lambda: hf_config
+            model_config = SimpleNamespace(
+                hf_config=hf_config,
+                context_len=context_len,
+                kv_lora_rank=2,
+                qk_rope_head_dim=2,
+            )
+            with (
+                self.subTest(context_len=context_len, page_size=page_size, draft=draft),
+                get_context().override_server_args(
+                    attention_backend="ascend",
+                    disaggregation_mode="decode",
+                    disaggregation_transfer_backend="ascend",
+                    disaggregation_decode_extra_slots=0,
+                    max_running_requests=2,
+                    page_size=page_size,
+                    speculative_algorithm="EAGLE" if draft else None,
+                    speculative_num_draft_tokens=draft,
+                    speculative_num_steps=3 if draft else None,
+                    speculative_eagle_topk=1 if draft else None,
+                ),
+                patch.object(config, "is_npu", return_value=True),
+                patch.dict(
+                    os.environ,
+                    {
+                        "SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD": "1",
+                        "SGLANG_NPU_SPARSE_KV_ENABLE_LRU": str(int(enable_lru)),
+                        "SGLANG_NPU_SPARSE_KV_DEVICE_CACHE_FACTOR": "2",
+                    },
+                ),
+            ):
+                manager, _ = self.make_manager(
+                    topk=topk,
+                    enable_lru=enable_lru,
+                    max_context_len=request_context_len,
+                    dtype=dtype,
+                )
+                manager.ensure_pd_decode_staging_buffers(page_size=page_size)
+                allocated_bytes = sum(
+                    buf.nbytes
+                    for buf in (
+                        manager.device_kv_buffer
+                        + manager.pd_decode_k_staging
+                        + manager.pd_decode_v_staging
+                    )
+                )
+                budget = config.get_sparsity_driven_kv_offload_fixed_memory_size(
+                    model_config=model_config,
+                    use_mla_backend=True,
+                    num_layers=manager.layer_num,
+                    element_size=torch.tensor([], dtype=dtype).element_size(),
+                    max_running_requests_per_worker=2,
+                )
+                self.assertEqual(budget, allocated_bytes)
 
     def test_pd_registration_preserves_native_and_staging_buffer_layouts(self):
         for mode in (
