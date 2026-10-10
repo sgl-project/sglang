@@ -89,6 +89,7 @@ class SWAComponent(TreeComponent):
         super().__init__(cache, params)
         self._session_leaf_covered_len: dict[str, dict[UnifiedTreeNode, int]] = {}
         self.sliding_window_size = params.sliding_window_size
+        self.swa_retain_window = params.swa_retain_window
         self.full_window_pages = (
             self.sliding_window_size + params.page_size - 1
         ) // params.page_size
@@ -992,7 +993,7 @@ class SWAComponent(TreeComponent):
         free_swa_out_of_window_slots(
             req,
             pre_len,
-            sliding_window_size=self.sliding_window_size,
+            sliding_window_size=self.swa_retain_window,
             page_size=self.cache.page_size,
             req_to_token_pool=self.cache.req_to_token_pool,
             token_to_kv_pool_allocator=self.cache.token_to_kv_pool_allocator,

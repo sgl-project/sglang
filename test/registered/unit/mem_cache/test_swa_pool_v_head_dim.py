@@ -34,7 +34,7 @@ _FULL_V_HEAD_DIM = 8
 _SWA_V_HEAD_DIM = 8  # MATCHING: this is what routes Inkling into the branch
 
 
-def _swa_pool():
+def _swa_pool(*, swa_attention_layer_ids=(0, 2), full_attention_layer_ids=(1, 3)):
     """Inkling-class layer split: full and SWA layers interleaved, layer 0 NOT a
     full-attention layer, which is why the backend asks the pool at all."""
     return SWAKVPool(
@@ -44,8 +44,8 @@ def _swa_pool():
         dtype=torch.float16,
         head_num=2,
         head_dim=_FULL_V_HEAD_DIM,
-        swa_attention_layer_ids=[0, 2],
-        full_attention_layer_ids=[1, 3],
+        swa_attention_layer_ids=list(swa_attention_layer_ids),
+        full_attention_layer_ids=list(full_attention_layer_ids),
         device=_DEV,
         enable_memory_saver=False,
     )
@@ -55,6 +55,14 @@ class TestSWAPoolVHeadDim(unittest.TestCase):
     def test_static_pool_reports_the_full_side_value_head_dim(self):
         pool = _swa_pool()
         self.assertEqual(pool.get_v_head_dim(), _FULL_V_HEAD_DIM)
+
+    def test_window_only_pool_answers_from_the_swa_side(self):
+        """BUG REGRESSION. A sliding-window MTP depth is a window-only block,
+        so its pool has an EMPTY full side; asking that side for a value
+        buffer killed the draft backend's construction before a token was
+        served."""
+        pool = _swa_pool(swa_attention_layer_ids=(0,), full_attention_layer_ids=())
+        self.assertEqual(pool.get_v_head_dim(), _SWA_V_HEAD_DIM)
 
 
 if __name__ == "__main__":

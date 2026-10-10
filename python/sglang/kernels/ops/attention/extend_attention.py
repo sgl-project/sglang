@@ -559,7 +559,9 @@ def _fwd_kernel(
                 mask=(mask_m[:, None] & mask_n[None, :]),
                 other=0,
             )
-            final_mask &= custom_mask
+            # The mask buffer is int8; narrow it to i1, since a score_mod hands
+            # final_mask to tl.load, which rejects an i8 mask.
+            final_mask &= custom_mask != 0
         if SLIDING_WINDOW_SIZE > 0:
             # Add mask where q_id <= kv_id + sliding_window_size
             # q_id = prefix_len + cur_m, kv_id = cur_n
@@ -740,7 +742,8 @@ def _fwd_kernel(
                 mask=(mask_m[:, None] & mask_n[None, :]),
                 other=0,
             )
-            custom_mask &= mask_m[:, None] & mask_n[None, :]
+            # int8 -> i1 before the &=; see the prefix loop above.
+            custom_mask = (custom_mask != 0) & mask_m[:, None] & mask_n[None, :]
             final_mask &= custom_mask
         elif IS_CAUSAL:
             mask_causual = (cur_block_m * BLOCK_M + offs_m[:, None]) >= (
@@ -1340,7 +1343,8 @@ def _fwd_kernel_unified(
                 mask=(mask_m[:, None] & mask_n[None, :]),
                 other=0,
             )
-            final_mask &= custom_mask
+            # int8 -> i1 before the &=; see `_fwd_kernel`'s prefix loop.
+            final_mask &= custom_mask != 0
 
         # Apply causal mask for extend part
         if IS_CAUSAL and not USE_CUSTOM_MASK:

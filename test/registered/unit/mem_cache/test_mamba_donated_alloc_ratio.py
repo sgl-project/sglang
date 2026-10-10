@@ -268,16 +268,12 @@ class TestPPMambaPoolSizing(unittest.TestCase):
     BUDGET_GB = 8.0
 
     @classmethod
-    def _pool_size(cls, pp_rank, pp_size):
-        from sglang.srt import runtime_context as rc
+    def _cache_params(cls):
         from sglang.srt.configs.mamba_utils import (
             Mamba2CacheParams,
             Mamba2StateDType,
             Mamba2StateShape,
         )
-        from sglang.srt.distributed.utils import get_pp_indices
-        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
-        from sglang.srt.runtime_context import get_schedule
 
         shape = Mamba2StateShape(
             conv=[(4096, 3)],
@@ -291,15 +287,33 @@ class TestPPMambaPoolSizing(unittest.TestCase):
             conv_kernel=0,
             num_k_heads_per_tp=8,
         )
-        params = Mamba2CacheParams(
+        return Mamba2CacheParams(
             shape=shape,
             dtype=Mamba2StateDType(conv=torch.bfloat16, temporal=torch.float32),
             layers=list(cls.MAMBA_LAYERS),
         )
+
+    @classmethod
+    def _mamba_budget_bytes(cls):
+        """The byte budget the solve hands the state pool: the mamba share of
+        the rest-memory, at the fixture's mamba_full_memory_ratio of 0.5."""
+        return cls.BUDGET_GB * (0.5 / 1.5) * (1 << 30)
+
+    @classmethod
+    def _pool_size(cls, pp_rank, pp_size, fused_state_entry=None):
+        from sglang.srt import runtime_context as rc
+        from sglang.srt.distributed.utils import get_pp_indices
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+        from sglang.srt.runtime_context import get_schedule
+
+        params = cls._cache_params()
         start, end = get_pp_indices(cls.TOTAL_LAYERS, pp_rank, pp_size)
         fake = SimpleNamespace(
             mambaish_config=SimpleNamespace(mamba2_cache_params=params),
             extra_mamba_cache_bytes_per_req=0,
+            fused_entry_bytes=lambda name: (
+                fused_state_entry if name == "mamba" else None
+            ),
             server_args=SimpleNamespace(),
             spec_algorithm=SimpleNamespace(is_none=lambda: True),
             layer_info=SimpleNamespace(start_layer=start, end_layer=end),
@@ -319,6 +333,27 @@ class TestPPMambaPoolSizing(unittest.TestCase):
         ):
             KVCacheConfigurator._handle_max_mamba_cache(fake, cls.BUDGET_GB)
             return get_schedule().max_mamba_cache_size
+
+    def test_a_fused_state_entry_is_priced_per_slot(self):
+        """With a draft state block fused into every state slot, the unified
+        factory carves out K x the FUSED entry; the solve must size K from
+        that entry, or the buffer over-commits by K x (fused - host) bytes.
+
+        The fused entry is the host's block plus the draft's, so it is always
+        WIDER than the per-request cost the unfused solve prices -- hence
+        fewer slots, never more. Deriving it from `mamba_cache_per_req` keeps
+        that ordering true; a hard-coded constant silently inverted it.
+        """
+        host_per_req = self._cache_params().mamba_cache_per_req
+        fused_entry = host_per_req + host_per_req // 4  # host + a draft block
+        budget_bytes = self._mamba_budget_bytes()
+
+        unfused = self._pool_size(0, 1)
+        fused = self._pool_size(0, 1, fused_state_entry=fused_entry)
+
+        self.assertEqual(unfused, int((budget_bytes - host_per_req) // host_per_req))
+        self.assertEqual(fused, int((budget_bytes - fused_entry) // fused_entry))
+        self.assertLess(fused, unfused)
 
     def test_stage_is_not_charged_for_the_whole_model(self):
         solo = self._pool_size(0, 1)
@@ -349,6 +384,7 @@ class TestExtraMambaCacheSizing(unittest.TestCase):
                 )
             ),
             extra_mamba_cache_bytes_per_req=extra_bytes,
+            fused_entry_bytes=lambda name: None,
             spec_algorithm=SimpleNamespace(is_none=lambda: draft_tokens is None),
             attn_dp_size=dp_size,
             pp_size=pp_size,

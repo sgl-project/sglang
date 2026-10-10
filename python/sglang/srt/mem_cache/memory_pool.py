@@ -1942,6 +1942,8 @@ class KVWriteLoc:
         # swa_loc / full_loc are resolved once at metadata-init from the full
         # (padded) out_cache_loc; piecewise/DP-padded paths later narrow loc per
         # layer, so slice these pre-resolved locs to match (same per-token order).
+        # A multi-step draft step's slice is NOT a prefix of the all-steps loc;
+        # its backend derives per-step locs and never relies on this.
         if self.swa_loc is not None and self.swa_loc.shape[0] != self.loc.shape[0]:
             self.swa_loc = self.swa_loc[: self.loc.shape[0]]
         if self.full_loc is not None and self.full_loc.shape[0] != self.loc.shape[0]:

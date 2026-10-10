@@ -998,6 +998,12 @@ class ModelConfig:
             and self.hf_config.architectures[0] == "InklingForConditionalGeneration"
         ):
             self.hf_config.architectures[0] = "InklingForConditionalGenerationMTP"
+            if self.hf_text_config.mtp_local_layer_ids:
+                # A local MTP depth keeps the trunk's window unless it declares
+                # its own: the draft backend builds its window rail only if set.
+                self.sliding_window_size = (
+                    self.hf_text_config.mtp_local_extent or self.sliding_window_size
+                )
         if (
             is_draft_model
             and self.hf_config.architectures[0] == "GigaChat35ForCausalLM"

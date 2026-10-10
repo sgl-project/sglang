@@ -35,6 +35,12 @@ from sglang.srt.mem_cache.allocator.unified_sub_pool import (
     MultiEndedAllocator,
 )
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+from sglang.srt.mem_cache.layout.fused_draft import (
+    DenseDraftRegion,
+    DraftStateGeometry,
+    DraftStateRegion,
+    FusedDraftPlacement,
+)
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_memory_pool import (
     UnifiedKVPool,
@@ -494,7 +500,7 @@ class TestTriPagedFreeGroup(unittest.TestCase):
 
         allocator.free_group_begin()
         allocator.free_full_segment(full_indices, start_pos=0)
-        self.assertTrue(allocator.full_free_group)
+        self.assertTrue(allocator.full_page_reps_group)
 
         donor = allocator.mamba_full_cache_donor()
         self.assertIsNotNone(donor)
@@ -502,6 +508,7 @@ class TestTriPagedFreeGroup(unittest.TestCase):
 
         self.assertEqual(allocator.free_group, [])
         self.assertEqual(allocator.free_page_reps_group, [])
+        self.assertEqual(allocator.full_page_reps_group, [])
         self.assertEqual(allocator.full_free_group, [])
         self.assertLess(
             allocator.full_attn_allocator.allocated_count(), allocated_before
@@ -1047,7 +1054,11 @@ class TestTriFactorySizing(unittest.TestCase):
                         kw = self._factory_kwargs()
                         model = SimpleNamespace(
                             get_num_kv_heads=lambda tp, dcp: 2,
+                            get_swa_num_kv_heads=lambda tp: 2,
                             head_dim=4,
+                            v_head_dim=4,
+                            swa_head_dim=4,
+                            swa_v_head_dim=4,
                             context_len=16,
                             full_attention_layer_ids=[0],
                             swa_attention_layer_ids=[1],
@@ -1075,6 +1086,11 @@ class TestTriFactorySizing(unittest.TestCase):
                             forward_stream=None,
                             # Spec off: no draft region to fuse.
                             _fused_draft_for_mamba_factory=lambda: None,
+                            _unified_swa_head_geometry=lambda: (
+                                cfg.KVCacheConfigurator._unified_swa_head_geometry(
+                                    configurator
+                                )
+                            ),
                         )
                         # Run the production configurator AND factory. Reverting
                         # either top-level flag forwarding must break cleanup.
@@ -1207,6 +1223,61 @@ class TestTriFactorySizing(unittest.TestCase):
             + 4 * pool.spec("mamba").entry_bytes()
         )
         self.assertEqual(pool.total_bytes, want)
+
+    def test_full_side_carries_the_fused_draft_region(self):
+        """The boot solve prices the fused entry whenever a placement resolves,
+        so a factory that dropped the kwarg would allocate UNFUSED under that
+        price and under-budget the private draft pool."""
+        region = DenseDraftRegion(
+            lane_num=1, head_num=2, head_dim=4, store_dtype=torch.float16
+        )
+        placement = FusedDraftPlacement.from_counts(
+            counts={"full": [1]}, regions={"full": region}
+        )
+        bundle = init_unified_mamba_swa_pools(
+            **self._factory_kwargs(fused_draft=placement)
+        )
+        pool = bundle.unified_memory_pool
+        self.assertIs(pool.fused_draft, placement)
+        self.assertIs(pool.spec("full").draft_region, region)
+        self.assertIs(pool.require_draft_host_spec("full"), pool.spec("full"))
+        for other in ("swa", "mamba"):
+            self.assertIsNone(pool.spec(other).draft_region, other)
+
+    def _state_placement(self):
+        region = DraftStateRegion(
+            lane_num=2,
+            state=DraftStateGeometry(
+                conv_state_shapes=((3, 8),),
+                conv_dtype=torch.bfloat16,
+                temporal_state_shape=(0, 0, 0),
+                temporal_dtype=torch.float32,
+            ),
+        )
+        return FusedDraftPlacement.from_counts(
+            counts={"mamba": [1, 1]}, regions={"mamba": region}
+        )
+
+    def test_fused_draft_state_clone_shares_the_request_slot_space(self):
+        """A draft runner's req pool over the fused state block keeps the
+        target's request->slot mappings and slot allocator (the draft's slot
+        ids ARE the target's), and views only its own block."""
+        bundle = init_unified_mamba_swa_pools(
+            **self._factory_kwargs(fused_draft=self._state_placement())
+        )
+        target = bundle.req_to_token_pool
+        clone = target.clone_for_fused_draft(layer_lanes={1: 1})
+        self.assertIs(
+            clone.req_index_to_mamba_index_mapping,
+            target.req_index_to_mamba_index_mapping,
+        )
+        self.assertIs(clone.mamba_allocator, target.mamba_allocator)
+        self.assertIs(clone.req_to_token, target.req_to_token)
+        self.assertEqual(clone.mamba_map, {1: 0})
+        conv = clone.mamba2_layer_cache(1).conv[0]
+        self.assertEqual(tuple(conv.shape), (target.mamba_pool.size + 1, 3, 8))
+        draft_conv, _ = bundle.unified_memory_pool.build_draft_state_views("mamba")
+        self.assertEqual(conv.data_ptr(), draft_conv[0][1].data_ptr())
 
     def test_bs1_floor_fails_loud_before_construction(self):
         """A budget far below one worst-case request must raise BEFORE any

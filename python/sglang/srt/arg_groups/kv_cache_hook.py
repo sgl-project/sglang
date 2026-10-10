@@ -491,7 +491,7 @@ _SPEC_VERIFY_AUDITED_BACKENDS = frozenset(
 # The MHA backends that read through the KV-index translator on every path a
 # draft forward takes. A fused draft region holds dense K/V rows, so a fused
 # draft runs only on these.
-TRANSLATED_MHA_RAILS = frozenset({"triton", "flashinfer", "fa3"})
+TRANSLATED_MHA_RAILS = frozenset({"triton", "flashinfer", "fa3", "trtllm_mha"})
 
 
 def _assert_spec_verify_backends(
@@ -607,7 +607,7 @@ def handle_unified_memory_pool(server_args: Any) -> None:
         assert _mc.is_hybrid_swa or mambaish_config(_mc) is not None, (
             "--enable-unified-memory + EAGLE/EAGLE3 requires a unified "
             "target (hybrid-SWA or a mamba hybrid): the draft's KV lives "
-            "fused inside the full-attention page envelope."
+            "fused inside the target's sub-pool entries."
         )
         # The target verifies on its own pages: the MLA family on an MLA host.
         eagle_allowed = (
@@ -707,18 +707,6 @@ def handle_unified_memory_pool(server_args: Any) -> None:
                 sorted(full_cg_backends),
                 sorted(backends),
             )
-    # trtllm_mha refills its graph page table before replay from
-    # `cache_seqlens_int32`, which only the in-graph metadata kernel writes, so
-    # it uses the previous replay's lengths. Refuse until it uses the batch's.
-    _, decode_backend = attention_backends_of(resolved_view(server_args))
-    if decode_backend == "trtllm_mha":
-        assert _cg_cfg is None or _cg_cfg.decode.backend == Backend.DISABLED, (
-            "--enable-unified-memory does not yet support decode cuda graphs "
-            "with the trtllm_mha attention backend: its replay refills the page "
-            "table from the previous replay's sequence lengths. Pass "
-            "--disable-cuda-graph, or pick another decode attention backend "
-            "(fa3 / fa4 / flashinfer / triton)."
-        )
 
 
 def _validate_unified_memory_dcp(server_args: Any) -> None:
@@ -766,6 +754,12 @@ def _validate_unified_memory_dcp(server_args: Any) -> None:
     )
 
 
+# Unified-memory backends that carry v_head_dim through to the kernel, so a
+# V row narrower than K (MiMoV2: 192 / 128) reads correctly. FlashInfer's
+# paged_kv_t compiles ONE head_dim for both; trtllm_mha refuses unequal dims.
+ASYMMETRIC_KV_BACKENDS = frozenset({"triton", "fa3", "fa4"})
+
+
 def handle_page_major_kv_layout(server_args: Any):
     # --enable-unified-memory implies --enable-page-major-kv-layout, so the
     # unified pool goes through this one gate (declared before the guard).
@@ -786,23 +780,7 @@ def handle_page_major_kv_layout(server_args: Any):
         "reimplementation. Run with --enable-unified-memory, or drop "
         "--enable-page-major-kv-layout."
     )
-    from sglang.srt.mem_cache.unified_memory_pool import (
-        unified_memory_supported_for_model,
-    )
-
     model_config = model_config_of(server_args)
-    assert unified_memory_supported_for_model(
-        model_config, use_mla_backend=use_mla_backend(server_args)
-    ), (
-        "--enable-unified-memory does not yet admit asymmetric K/V rows "
-        "(head_dim != v_head_dim); this model has "
-        f"head_dim={model_config.head_dim}, "
-        f"v_head_dim={model_config.v_head_dim}, "
-        f"swa_head_dim={model_config.swa_head_dim}, "
-        f"swa_v_head_dim={model_config.swa_v_head_dim}. The token-major "
-        "views can hold them, but the backends' write and read paths are "
-        "not audited for it; run this model without --enable-unified-memory."
-    )
     # Allow-list. Every backend below reads through the translator, so what
     # gates one is only whether its kernels address the per-layer views by
     # their strides (the slot stride is the whole entry, not one row):
@@ -810,6 +788,8 @@ def handle_page_major_kv_layout(server_args: Any):
     #     snap).
     #   * MHA/SWA models: fa3 / fa4 / flashinfer / trtllm_mha alongside
     #     Triton. fa4 is the fa3 class.
+    #   * MHA/SWA models with asymmetric K/V rows: only the backends that
+    #     carry v_head_dim through to the kernel (ASYMMETRIC_KV_BACKENDS).
     # Names are the RESOLVED ids from attention_backends_of.
     if use_mla_backend(server_args):
         allowed_full = {
@@ -821,6 +801,8 @@ def handle_page_major_kv_layout(server_args: Any):
             "tokenspeed_mla",
             "flashmla",
         }
+    elif model_config.has_asymmetric_kv:
+        allowed_full = set(ASYMMETRIC_KV_BACKENDS)
     else:
         allowed_full = {
             "triton",
@@ -835,7 +817,12 @@ def handle_page_major_kv_layout(server_args: Any):
         "--enable-page-major-kv-layout: the resolved attention backends "
         f"{sorted(backends)} are not in the allowed set "
         f"{sorted(allowed_full)} for this configuration (unified memory "
-        "allows the stride-aware per-layer-view families). Pass a "
+        "allows the stride-aware per-layer-view families; asymmetric K/V "
+        f"rows -- this model has head_dim={model_config.head_dim}, "
+        f"v_head_dim={model_config.v_head_dim}, "
+        f"swa_head_dim={model_config.swa_head_dim}, "
+        f"swa_v_head_dim={model_config.swa_v_head_dim} -- narrow it to the "
+        "backends that carry v_head_dim through to the kernel). Pass a "
         "compatible --attention-backend."
     )
     # The Mamba/KDA state is stored in envelope-strided views; only
