@@ -1,5 +1,6 @@
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
@@ -41,11 +42,40 @@ class TestSpecCPUOverlapConstraint(CustomTestCase):
         self.assertTrue(resolution_result(args, "disable_overlap_schedule"))
 
     def test_cpu_eagle3_forces_disable_overlap_schedule(self):
-        args = _make_spec_args(device="cpu", algorithm="EAGLE3")
+        args = _make_spec_args(
+            device="cpu",
+            algorithm="EAGLE3",
+            speculative_draft_model_path="eagle3-draft",
+        )
+
+        with patch(
+            "sglang.srt.arg_groups.speculative_hook._resolve_speculative_algorithm_alias",
+            return_value="EAGLE3",
+        ):
+            handle_speculative_decoding(args)
+
+        self.assertTrue(resolution_result(args, "disable_overlap_schedule"))
+
+    def test_eagle3_requires_draft_for_non_bundled_target(self):
+        args = _make_spec_args(device="cuda", algorithm="EAGLE3")
+
+        with self.assertRaisesRegex(ValueError, "--speculative-draft-model-path"):
+            handle_speculative_decoding(args)
+
+    def test_eagle3_bundled_target_uses_target_as_draft(self):
+        args = _make_spec_args(device="cuda", algorithm="EAGLE3")
+        args.get_model_config = lambda: SimpleNamespace(
+            hf_config=SimpleNamespace(
+                architectures=["DeepseekV3ForCausalLM"],
+                get_text_config=lambda: SimpleNamespace(),
+            )
+        )
 
         handle_speculative_decoding(args)
 
-        self.assertTrue(resolution_result(args, "disable_overlap_schedule"))
+        self.assertEqual(
+            resolution_result(args, "speculative_draft_model_path"), args.model_path
+        )
 
     def test_cpu_explicit_disable_overlap_is_preserved(self):
         args = _make_spec_args(device="cpu", disable_overlap_schedule=True)
