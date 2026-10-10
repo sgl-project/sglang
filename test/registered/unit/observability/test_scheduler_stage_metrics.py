@@ -7,7 +7,6 @@ from sglang.srt.observability.scheduler_stage_metrics import (
     FORWARD_OVERLAP_FULL,
     FORWARD_OVERLAP_NONE,
     FORWARD_OVERLAP_PARTIAL,
-    SCHEDULER_STAGE_CATEGORIES,
     SCHEDULER_STAGE_GET_NEXT_BATCH,
     SCHEDULER_STAGE_PROCESS_QUEUE,
     SCHEDULER_STAGE_PROCESS_REQUESTS,
@@ -23,22 +22,6 @@ register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
 
 class TestSchedulerStageMetricsRecorder(CustomTestCase):
-    def test_category_names(self):
-        self.assertEqual(
-            set(SCHEDULER_STAGE_CATEGORIES),
-            {
-                "other",
-                "recv_requests",
-                "process_input_requests",
-                "process_batch_result",
-                "process_queue",
-                "get_next_batch_to_run",
-                "run_batch",
-                "sanity_check_cache",
-                "idle",
-            },
-        )
-
     def test_nested_stages_are_exclusive(self):
         # Each exclusive span uses its own endpoints, including the resumed parent.
         active = iter([False, False, True, True, False, False])

@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! OpenAI completions served through the engine's `/generate`; exact parity with
-//! SGLang is checked by `rust/sglang-processor/tests/openai_parity.rs`.
+//! OpenAI chat and completions served through the engine's `/generate`; exact
+//! parity with SGLang is checked by `rust/sglang-processor/tests/openai_parity.rs`.
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -18,9 +18,13 @@ use crate::common::mock_worker::MockWorker;
 use crate::common::streaming::{collect_body, parse_sse_data};
 
 async fn complete(app: &Router, body: Value) -> (StatusCode, Vec<u8>) {
+    post(app, "/v1/completions", body).await
+}
+
+async fn post(app: &Router, uri: &str, body: Value) -> (StatusCode, Vec<u8>) {
     let request = Request::builder()
         .method("POST")
-        .uri("/v1/completions")
+        .uri(uri)
         .header("content-type", "application/json")
         .body(Body::from(body.to_string()))
         .unwrap();
@@ -95,6 +99,26 @@ async fn an_aborted_choice_ends_the_stream_at_once() {
     assert_eq!(events[1..], ["[DONE]"]);
 }
 
+/// The engine's `[DONE]` finishes the request, so its stream is read to the
+/// end rather than dropped, which would abort the finished request.
+#[tokio::test]
+async fn a_finished_stream_sends_no_abort() {
+    let frames = vec![
+        "data: {\"text\":\"ok\",\"meta_info\":{\"id\":\"r\",\"finish_reason\":{\"type\":\"stop\"}}}\n\n",
+        "data: [DONE]\n\n",
+        "", // the engine closes its body a moment after `[DONE]`
+    ];
+    let engine = MockWorker::start_slow_stream(frames, Duration::from_millis(50)).await;
+    let app = openai_router(&[(&engine, WorkerMode::Plain)]);
+
+    let request = json!({"model": MODEL, "prompt": "hi", "stream": true});
+    let (status, body) = complete(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(parse_sse_data(&body).last().unwrap(), "[DONE]");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(engine.abort_log.lock().unwrap().is_empty());
+}
+
 #[tokio::test]
 async fn completions_go_to_the_engine_route_when_unsupported() {
     let engine = MockWorker::start(vec![]).await;
@@ -105,6 +129,26 @@ async fn completions_go_to_the_engine_route_when_unsupported() {
     let mut sent = engine.captured_json().await;
     sent.as_object_mut().unwrap().remove("rid"); // for abort-on-disconnect, as chat
     assert_eq!(sent, request);
+}
+
+#[tokio::test]
+async fn chat_goes_through_generate_with_rendered_ids() {
+    let engine = MockWorker::start(vec![]).await;
+    let app = openai_router(&[(&engine, WorkerMode::Plain)]);
+
+    let messages = json!([{"role": "user", "content": "hi"}]);
+    // No `max_tokens`: the fixture has no `config.json` to check it against.
+    let request = json!({"model": MODEL, "messages": messages});
+    let (status, body) = post(&app, "/v1/chat/completions", request).await;
+    assert_eq!(status, StatusCode::OK);
+    let sent = engine.captured_json().await;
+    assert!(sent["input_ids"]
+        .as_array()
+        .is_some_and(|ids| !ids.is_empty()));
+    assert_eq!(sent["require_reasoning"], false);
+    let response: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(response["object"], "chat.completion");
+    assert_eq!(response["choices"][0]["message"]["content"], "ok");
 }
 
 #[tokio::test]
