@@ -866,3 +866,6 @@ def __dir__() -> list[str]:
 
 
 __all__ = sorted(_EXPORTS)
+
+# Cake (FlashInfer) backends: metadata-only registrations + explicit entry points.
+from sglang.kernels.ops.diffusion import cake as _cake  # noqa: E402, F401
