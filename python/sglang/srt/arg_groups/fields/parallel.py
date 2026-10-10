@@ -161,6 +161,17 @@ class Parallel(msgspec.Struct):
             choices=("zigzag", "interleave"),
         ),
     ] = None
+    enable_cp_tp_group_sharing: A[
+        bool,
+        Arg(
+            help="(Derived) CP-TP group sharing: prefill CP for hybrid "
+            "linear-attention models where the CP group is the TP group; the "
+            "residual stream, attention and indexer are CP-sharded while MoE "
+            "and linear attention keep TP. Resolved from the model architecture.",
+            no_cli=True,
+            resolvable=True,
+        ),
+    ] = False
     # Split DSA GPU KV/indexer cache layers across CP ranks.
     enable_dsa_cache_layer_split: A[
         bool,
@@ -169,6 +180,14 @@ class Parallel(msgspec.Struct):
     enable_cp_decode_attn_tp: A[
         bool,
         "Enable attention tensor-parallel weight slicing during decode under context parallel (cp_size>1). Slices the replicated attention linears to the local CP partition, eliminating redundant decode GEMMs.",
+    ] = False
+    enable_kv_cache_sharding: A[
+        bool,
+        "Shard at-rest KV cache storage at page granularity across the group "
+        "that currently replicates it (attention-CP ranks for GQA models "
+        "under prefill CP; attention-TP ranks for MLA models), multiplying "
+        "the group's unique KV capacity. Prefill workers of PD "
+        "disaggregation only.",
     ] = False
     # Deprecated spelling of `attn_dp_size`: `--dp-size N --enable-dp-attention`
     # resolves to `attn_dp_size = N`, `dp_size = 1`. TODO: remove after 2026-12-31.
