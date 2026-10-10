@@ -534,6 +534,20 @@ class MultimemAllGatherer:
             tp_group = get_tp_group()
             if tp_group.world_size <= 1:
                 return None
+            # Check before rendezvous: on platforms without CUDA multicast
+            # (e.g. WSL2), rendezvous itself can crash the process (SIGFPE)
+            # before the multicast_ptr check below is reached.
+            from torch._C._autograd import DeviceType
+            from torch._C._distributed_c10d import _SymmetricMemory
+
+            if not _SymmetricMemory.has_multicast_support(
+                DeviceType.CUDA, torch.cuda.current_device()
+            ):
+                logger.warning(
+                    "multimem all-gather disabled (CUDA multicast not supported "
+                    "on this device)"
+                )
+                return None
             state = create_state(
                 group=tp_group.device_group,
                 rank_in_group=tp_group.rank_in_group,
