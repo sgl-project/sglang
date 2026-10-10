@@ -1878,8 +1878,11 @@ fn acquire_lock_overshooting_the_window_stops_at_the_crossing_node() {
         IncLockRefResult::default(),
         /* lock_host = */ false,
     );
-    // The 2-atom nodes overshoot the 3-atom window at b (2 -> 4): the walk
-    // stops there, stamps b, and leaves a untouched.
+    // The 2-atom nodes overshoot the 3-atom window at b (2 -> 4). The walk
+    // stops there and stamps b; the window-only split (SGLANG_SWA_LOCK_WINDOW_ONLY)
+    // first splits b into a 1-atom prefix and its 1-atom in-window tail, so
+    // the crossing node pins only the tail the window still needs and a
+    // stays untouched (mirrors Python _maybe_split_for_window_lock in #41580).
     assert_eq!(tc.arena.device_lock_ref(c, SWA), 1);
     assert_eq!(tc.arena.device_lock_ref(b, SWA), 1);
     assert_eq!(tc.arena.device_lock_ref(a, SWA), 0);
@@ -1889,8 +1892,8 @@ fn acquire_lock_overshooting_the_window_stops_at_the_crossing_node() {
     );
     assert_eq!(node_swa_uuid(&tc, b), Some(100_000_000_000_001));
     assert_eq!(node_swa_uuid(&tc, a), None);
-    assert_eq!(tc.swa_evictable_size(), 2);
-    assert_eq!(tc.swa_protected_size(), 4);
+    assert_eq!(tc.swa_evictable_size(), 3);
+    assert_eq!(tc.swa_protected_size(), 3);
 }
 
 #[test]
@@ -6433,4 +6436,146 @@ fn insert_reports_whether_it_reached_the_branch_boundary() {
             "swa_branching_seqlen={branching_seqlen:?}"
         );
     }
+}
+
+#[test]
+fn swa_lock_walk_splits_a_long_live_ancestor_to_one_window() {
+    // #41579: a match that ends just short of the window leaves a short
+    // endpoint, so the lock walk reaches a long live-SWA ancestor (e.g. a
+    // finished request's untrimmed last chunk) and would pin all of it.
+    // The window-only split caps the pinned amount at one page-aligned window.
+    // Page size 1: 32-token live ancestor + 7-token endpoint + 8-token window
+    // pins 8 tokens (the endpoint plus a 1-token ancestor tail) instead of 39.
+    let mut tc = swa_core(8, 1);
+    let ancestor = tc
+        .arena
+        .alloc_child(tc.arena.root(), (1..=32).collect(), 0, None)
+        .unwrap();
+    let endpoint = tc
+        .arena
+        .alloc_child(ancestor, (33..=39).collect(), 0, None)
+        .unwrap();
+    store_swa_device(&mut tc, ancestor);
+    store_swa_device(&mut tc, endpoint);
+
+    let result = tc
+        .inc_lock_ref(tc.arena.node(endpoint).id, ComponentSet::EMPTY)
+        .expect("live test node");
+    // The ancestor is split at its tail: the original id is now 1 token long.
+    assert_eq!(tc.arena.node(ancestor).key.atom_len(), 1);
+    assert_eq!(tc.arena.device_lock_ref(endpoint, SWA), 1);
+    assert_eq!(tc.arena.device_lock_ref(ancestor, SWA), 1);
+    assert_eq!(tc.swa_protected_size(), 8);
+    assert!(result.component_lock_uuids[&(SWA.idx() as u8)].is_some());
+
+    // The split is topology only: the release round-trips through the same
+    // segment and everything unlocks.
+    tc.dec_lock_ref(tc.arena.node(endpoint).id, &result.to_dec_params(), false)
+        .expect("live test node");
+    assert_eq!(tc.arena.device_lock_ref(endpoint, SWA), 0);
+    assert_eq!(tc.arena.device_lock_ref(ancestor, SWA), 0);
+    assert_eq!(tc.swa_protected_size(), 0);
+}
+
+/// `SGLANG_SWA_LOCK_WINDOW_ONLY` parses like Python `EnvBool.parse`:
+/// `true/1/yes/y` / `false/0/no/n` (case-insensitive), everything else
+/// invalid. `no`/`n` must switch the split off; `off` is not a Python
+/// literal, so it keeps the default instead of disabling it. Unique var name
+/// per case: tests in this binary run concurrently and share the process
+/// environment, and the real flag must stay unset for the tests above.
+#[test]
+fn swa_lock_window_only_matches_python_env_bool() {
+    for (raw, want) in [
+        ("true", true),
+        ("1", true),
+        ("YES", true),
+        ("y", true),
+        ("false", false),
+        ("0", false),
+        ("No", false),
+        ("n", false),
+    ] {
+        let name = format!("SGLANG_TEST_ENV_BOOL_SWA_{raw}");
+        unsafe { std::env::set_var(&name, raw) };
+        assert_eq!(env_bool(&name, true), want, "value {raw:?}");
+        assert_eq!(env_bool(&name, false), want, "value {raw:?}");
+    }
+    // Unparsable stays on the default, like `EnvField.get` (warn-and-default).
+    for (i, raw) in ["off", "2", "", "yes."].into_iter().enumerate() {
+        let name = format!("SGLANG_TEST_ENV_BOOL_SWA_INVALID_{i}");
+        unsafe { std::env::set_var(&name, raw) };
+        assert!(env_bool(&name, true), "value {raw:?} keeps default true");
+        assert!(!env_bool(&name, false), "value {raw:?} keeps default false");
+    }
+    // Unset is the default, i.e. the split is on unless explicitly turned off.
+    assert!(env_bool("SGLANG_TEST_ENV_BOOL_SWA_UNSET", true));
+    assert!(!env_bool("SGLANG_TEST_ENV_BOOL_SWA_UNSET", false));
+}
+
+/// A buffer-mode HiCache backup pins its node with `inc_lock_ref`, and that pin
+/// is itself a lock walk: without this guard the walk splits the very node the
+/// write is about to read, the node keeps its id as the shorter in-window tail,
+/// and the written keys stop matching the chain. The pipeline marks the node
+/// for the enqueue -> storage-ack window instead, mirroring the
+/// `buffer_backup_pending` term Python added to `_maybe_split_for_window_lock`.
+#[test]
+fn swa_lock_walk_leaves_a_buffer_backup_pending_node_whole() {
+    // Page size 1: 32-token live ancestor + 7-token endpoint + 8-token window.
+    let mut tc = swa_core(8, 1);
+    let ancestor = tc
+        .arena
+        .alloc_child(tc.arena.root(), (1..=32).collect(), 0, None)
+        .unwrap();
+    let endpoint = tc
+        .arena
+        .alloc_child(ancestor, (33..=39).collect(), 0, None)
+        .unwrap();
+    store_swa_device(&mut tc, ancestor);
+    store_swa_device(&mut tc, endpoint);
+    let ancestor_id = tc.arena.node(ancestor).id;
+
+    // Pending: the walk pins the node whole, which is what the write reads.
+    tc.set_buffer_backup_pending(ancestor_id, true);
+    let pending_pin = tc
+        .inc_lock_ref(tc.arena.node(endpoint).id, ComponentSet::EMPTY)
+        .expect("live test node");
+    assert_eq!(tc.arena.node(ancestor).key.atom_len(), 32);
+    assert_eq!(tc.swa_protected_size(), 39);
+    tc.dec_lock_ref(
+        tc.arena.node(endpoint).id,
+        &pending_pin.to_dec_params(),
+        false,
+    )
+    .expect("live test node");
+
+    // Acked: the same walk splits again. The guard tracks the flag, not the
+    // node, so the control arm really is the pre-guard behaviour.
+    tc.set_buffer_backup_pending(ancestor_id, false);
+    tc.inc_lock_ref(tc.arena.node(endpoint).id, ComponentSet::EMPTY)
+        .expect("live test node");
+    assert_eq!(tc.arena.node(ancestor).key.atom_len(), 1);
+    assert_eq!(tc.swa_protected_size(), 8);
+}
+
+/// The pipeline clears the mark from its stale sweep too, where the node it
+/// names may already be freed: an id no slot maps to must be ignored, not
+/// panic, and must not resurrect the flag on a recycled slot.
+#[test]
+fn set_buffer_backup_pending_ignores_a_freed_id() {
+    let mut tc = swa_core(8, 1);
+    let node = tc
+        .arena
+        .alloc_child(tc.arena.root(), (1..=3).collect(), 0, None)
+        .unwrap();
+    let stale_id = tc.arena.node(node).id;
+    tc.arena.free_leaf(node).unwrap();
+
+    tc.set_buffer_backup_pending(stale_id, true);
+
+    let fresh = tc
+        .arena
+        .alloc_child(tc.arena.root(), (4..=6).collect(), 0, None)
+        .unwrap();
+    assert!(!tc.arena.node(fresh).buffer_backup_pending);
+    assert_ne!(tc.arena.node(fresh).id, stale_id, "ids are never reused");
 }

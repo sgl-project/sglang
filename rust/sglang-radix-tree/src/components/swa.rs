@@ -18,6 +18,23 @@ use crate::unified_tree_core::{
     PoolHitPolicy, PoolName, PoolTransfer, PoolTransferResult, UnifiedTreeCore,
 };
 
+/// Boolean env var with Python `EnvBool` semantics: `true/1/yes/y` → true,
+/// `false/0/no/n` → false (case-insensitive); anything else is invalid and
+/// keeps `default`, mirroring `EnvField.get`'s warn-and-default. The literal
+/// sets are the ones `sglang-server`'s `utils::environ::env_bool` mirrors;
+/// this crate is excluded from the root workspace and cannot depend on it, so
+/// the parse is kept in sync by hand and pinned by a unit test.
+fn env_bool(name: &str, default: bool) -> bool {
+    let Ok(raw) = std::env::var(name) else {
+        return default;
+    };
+    match raw.to_lowercase().as_str() {
+        "true" | "1" | "yes" | "y" => true,
+        "false" | "0" | "no" | "n" => false,
+        _ => default,
+    }
+}
+
 /// SWA component driver; owns the SWA device/host value slots.
 pub struct SwaComponent {
     /// Sliding window size in tokens.
@@ -83,6 +100,59 @@ impl SwaComponent {
             "fresh SWA leaf cannot be write-through-pending"
         );
         Some(new_parent)
+    }
+
+    /// Cap the part of a live, unlocked SWA node that a lock walk pins at what
+    /// the trailing window still needs (device tier). Mirrors Python
+    /// `_maybe_split_for_window_lock`: the node keeps its id and becomes the
+    /// in-window tail, so a lock receipt anchored on it stays valid. A node
+    /// with a buffer-mode backup pending is left whole, as in Python: that
+    /// write reads all of it, and the backup's own pin is the walk itself.
+    fn maybe_split_for_window_lock_<K: ChildKeyType>(
+        &self,
+        tree_core: &mut UnifiedTreeCore<K>,
+        node_id: NodeIdx_,
+        uncovered: usize,
+    ) {
+        let (is_root, already_locked, has_device_value, write_pending, node_len) = {
+            let node = tree_core.arena.node(node_id);
+            (
+                node.is_root(),
+                node.device_lock_ref(SWA) > 0,
+                node.has_device_value(SWA),
+                // A write-through backup or a buffer-mode backup reads the node
+                // as it is now, and in buffer mode the walk that would split the
+                // node is the backup's own D2H pin.
+                node.write_through_pending_id.is_some() || node.buffer_backup_pending,
+                node.key.atom_len(),
+            )
+        };
+        if is_root || already_locked || !has_device_value || write_pending {
+            return;
+        }
+        let page_size = tree_core.page_size;
+        // Smallest page-aligned size that still covers the remaining window.
+        let tail_size = uncovered.div_ceil(page_size) * page_size;
+        if node_len <= tail_size {
+            return;
+        }
+        let split_at = node_len - tail_size;
+        if page_size > 1
+            && (!split_at.is_multiple_of(page_size) || !node_len.is_multiple_of(page_size))
+        {
+            return;
+        }
+        let (_, action) = tree_core.split_node_(node_id, split_at);
+        assert!(
+            action.is_none(),
+            "a node without write-through cannot return an action"
+        );
+    }
+
+    /// The window-only lock split is on by default, matching Python
+    /// `SGLANG_SWA_LOCK_WINDOW_ONLY` (an EnvBool defaulting to True).
+    fn swa_lock_window_only() -> bool {
+        env_bool("SGLANG_SWA_LOCK_WINDOW_ONLY", true)
     }
 
     // Tier-selected SWA slot reads for the lock walks; `host` picks the host slot.
@@ -1162,6 +1232,9 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
         let sliding_window_size = self.sliding_window_size;
         let mut covered = 0;
         let mut swa_uuid = None;
+        // Read once per walk, like Python (`window_only = not lock_host and
+        // envs.SGLANG_SWA_LOCK_WINDOW_ONLY.get()`, above its loop).
+        let window_only = !lock_host && Self::swa_lock_window_only();
 
         let mut cur = node_id;
         loop {
@@ -1169,6 +1242,14 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
             if node.is_root() || covered >= sliding_window_size {
                 break;
             }
+            // Cap what the walk pins of a long live SWA ancestor at the
+            // trailing window (device tier). Split before locking: the guard
+            // requires the node to be unlocked. `cur` keeps its id as the
+            // in-window tail, so the walk continues into the split-off parent.
+            if window_only {
+                self.maybe_split_for_window_lock_(tree_core, cur, sliding_window_size - covered);
+            }
+            let node = tree_core.arena.node_mut(cur);
             let parent = node.parent();
             let key_len = node.key.atom_len();
             let has_value = Self::has_value(node, lock_host);

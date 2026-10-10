@@ -1786,6 +1786,12 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
             .map_err(node_access_error)
     }
 
+    /// Mark or clear the buffer-mode backup-pending flag the SWA window lock
+    /// consults before splitting the node a lock walk would pin.
+    fn set_buffer_backup_pending(&self, py: Python<'_>, node_id: NodeId, pending: bool) {
+        py.allow_threads(|| self.core().set_buffer_backup_pending(node_id, pending))
+    }
+
     /// Whether the node is a (default or named) root.
     fn is_root(&self, py: Python<'_>, node_id: NodeId) -> PyResult<bool> {
         py.allow_threads(|| self.core().is_root(node_id))
@@ -3151,6 +3157,21 @@ macro_rules! tree_core_binding {
             /// Whether the node's Full KV is present on host.
             fn node_backuped(&self, py: Python<'_>, node_id: NodeId) -> PyResult<bool> {
                 catch_native_panic(|| self.inner.node_backuped(py, node_id))
+            }
+
+            /// Mark or clear the buffer-mode backup-pending flag the SWA
+            /// window lock consults before splitting the node a lock walk
+            /// would pin.
+            fn set_buffer_backup_pending(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+                pending: bool,
+            ) -> PyResult<()> {
+                catch_native_panic(|| {
+                    self.inner.set_buffer_backup_pending(py, node_id, pending);
+                    Ok(())
+                })
             }
 
             /// Whether the node is a (default or named) root.

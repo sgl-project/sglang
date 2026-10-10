@@ -2278,6 +2278,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def set_host_memory_buffer_only(self) -> None:
         self.is_host_memory_buffer_only = True
 
+    def set_buffer_backup_pending(self, node_id: NodeId, pending: bool) -> None:
+        """No-op: `SwaComponent` reads the pending set from the cache itself."""
+
     def insert_host(
         self,
         node_id: NodeId,
