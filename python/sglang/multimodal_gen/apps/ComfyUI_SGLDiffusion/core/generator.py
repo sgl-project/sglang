@@ -397,11 +397,19 @@ class SGLDiffusionGenerator:
             if new_sd is not None:  # diffusers mmdit
                 model_config = model_detection.model_config_from_unet(new_sd, "")
                 if model_config is None:
-                    return None
+                    raise ValueError(
+                        f"Could not build a model config for diffusers mmdit "
+                        f"checkpoint {model_path!r} (detected model type "
+                        f"{model_type!r})"
+                    )
             else:  # diffusers unet
                 model_config = model_detection.model_config_from_diffusers_unet(sd)
                 if model_config is None:
-                    return None
+                    raise ValueError(
+                        f"Could not build a model config for diffusers unet "
+                        f"checkpoint {model_path!r} (detected model type "
+                        f"{model_type!r})"
+                    )
 
                 diffusers_keys = unet_to_diffusers(model_config.unet_config)
                 new_sd = {}

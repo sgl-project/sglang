@@ -327,3 +327,36 @@ def test_enable_cache_dit_applies_to_every_executor_not_just_h3():
     assert kwargs["enable_cache_dit"] is True
 
 
+# --- Bug 5: detection failure returned bare None, causing a confusing TypeError
+
+
+def test_get_comfyui_model_raises_clear_error_instead_of_returning_none():
+    gen = GENERATOR.SGLDiffusionGenerator()
+
+    class _FakeConfig:
+        supported_inference_dtypes = [torch.float32]
+
+        def set_inference_dtype(self, *a, **k):
+            pass
+
+    model_detection = sys.modules["comfy.model_detection"]
+    model_management = sys.modules["comfy.model_management"]
+    comfy_utils = sys.modules["comfy.utils"]
+    model_detection.unet_prefix_from_state_dict = lambda sd: ""
+    model_detection.detect_unet_config = lambda sd, key: {"image_model": "flux"}
+    model_detection.model_config_from_unet = lambda sd, key: None
+    model_detection.convert_diffusers_mmdit = lambda sd, key: None
+    model_detection.model_config_from_diffusers_unet = lambda sd: None
+    model_management.get_torch_device = lambda: "cpu"
+    comfy_utils.calculate_parameters = lambda sd: 1
+    comfy_utils.state_dict_prefix_replace = lambda sd, *a, **k: sd
+
+    with mock.patch.object(
+        GENERATOR, "_load_state_dict_for_detection", return_value={"x": 1}
+    ):
+        gen.pipeline_class_dict = {"flux": "FluxPipeline"}
+
+        with pytest.raises(ValueError, match="Could not build a model config"):
+            gen.get_comfyui_model("/tmp/model.safetensors")
+
+
