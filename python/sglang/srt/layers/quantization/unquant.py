@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from enum import Enum
 from typing import TYPE_CHECKING, Callable, List, Optional
 
@@ -105,6 +106,22 @@ def _prefer_triton_a16w16(x: torch.Tensor, weight: torch.Tensor) -> bool:
         and x.is_contiguous()
         and weight.is_contiguous()
     )
+
+
+def _aiter_clamped_swiglu_limit(config: MoeRunnerConfig) -> float:
+    # SiTU uses linear_beta for clamp; swiglu_limit must stay 0 (see mxfp4).
+    if config.activation == "situ":
+        return 0.0
+    return float(config.gemm1_clamp_limit or config.swiglu_limit or 0.0)
+
+
+def _aiter_runner_moe_config(config: MoeRunnerConfig) -> MoeRunnerConfig:
+    # MiniMax-M3 declares activation="silu" with gemm1_clamp_limit; route
+    # clamped-SwiGLU through the AITER runner (mirrors quark_w4a4_mxfp4_moe).
+    limit = _aiter_clamped_swiglu_limit(config)
+    if limit > 0 and config.activation != "situ":
+        return replace(config, activation="swiglu")
+    return config
 
 
 class Bf16GemmBackend(Enum):
@@ -1050,7 +1067,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             reason = self._aiter_ck_moe_unsupported_reason(layer)
             if reason is None:
                 self._aiter_runner = MoeRunner(
-                    MoeRunnerBackend.AITER, moe_runner_config
+                    MoeRunnerBackend.AITER,
+                    _aiter_runner_moe_config(moe_runner_config),
                 )
             elif get_moe_runner_backend().is_aiter():
                 raise ValueError(
@@ -1159,14 +1177,13 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             if self._aiter_runner is not None:
                 from sglang.srt.layers.moe.moe_runner.aiter import (
                     AiterMoeQuantInfo,
-                    aiter_swiglu_oai_limit,
                 )
 
                 quant_info = AiterMoeQuantInfo(
                     w13_weight=layer.w13_weight,
                     w2_weight=layer.w2_weight,
                     expert_mask=layer.dispatcher.expert_mask_gpu,
-                    swiglu_limit=aiter_swiglu_oai_limit(self.moe_runner_config) or 0.0,
+                    swiglu_limit=_aiter_clamped_swiglu_limit(self.moe_runner_config),
                 )
                 return self._aiter_runner.run(dispatch_output, quant_info)
 
