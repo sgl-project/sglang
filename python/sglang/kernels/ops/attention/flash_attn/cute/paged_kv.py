@@ -93,7 +93,8 @@ class PagedKVManager(ParamsBase):
             atom_async_copy, thr_layout, val_layout
         )
         gmem_thr_copy_KV = gmem_tiled_copy_KV.get_slice(thread_idx)
-        page_entry_per_thread = n_block_size // num_threads
+        # Cover short tiles and the remaining rows of a partial final thread group.
+        page_entry_per_thread = (n_block_size + num_threads - 1) // num_threads
 
         if const_expr(mSFK_paged is not None or mSFV_paged is not None):
             atom_async_copy_sf = cute.make_copy_atom(
@@ -299,6 +300,7 @@ class PagedKVManager(ParamsBase):
             if n_block >= 0
             else 0
         )
+        rows_per_pass = self.num_threads // self.gmem_threads_per_row
         for m in cutlass.range_constexpr(cute.size(tXsX, mode=[1])):
             row_valid = tXc0X[0, m, 0][0] < seqlenk_row_limit
             should_load = cute.make_fragment_like(tXsX[(0, None), m, 0], cute.Boolean)
@@ -319,7 +321,14 @@ class PagedKVManager(ParamsBase):
             mX_paged_cur_copy = cute.tiled_divide(
                 mX_paged_cur, (self.async_copy_elems,)
             )
-            self._copy_row_async(tXsX, tXcX, mX_paged_cur_copy, m, should_load)
+            if const_expr(tXc0X[0, m, 0][0] + rows_per_pass <= self.n_block_size):
+                self._copy_row_async(tXsX, tXcX, mX_paged_cur_copy, m, should_load)
+            else:
+                # Rows past a partial final pass alias another column block or
+                # stage. Predicated-off cp.async still zero-fills its destination,
+                # so out-of-tile threads must not issue a copy.
+                if tXcX[0, m, 0][0] < self.n_block_size:
+                    self._copy_row_async(tXsX, tXcX, mX_paged_cur_copy, m, should_load)
 
     @cute.jit
     def load_sf_KV(self, n_block: Int32, sSFX: cute.Tensor, K_or_V: str):

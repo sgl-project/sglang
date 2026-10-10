@@ -319,6 +319,21 @@ curl -sS -X POST "http://localhost:30010/v1/videos" \
       }'
 ```
 
+<Note>
+`size` is the literal output resolution for most pipelines. Wan-Animate-2
+treats it as a pixel-area budget instead: the output keeps the reference image's
+aspect ratio and uses the largest frame with at most `width × height` pixels whose
+sides are multiples of 16, so `size=640x800` with a 9:16 reference image yields a
+528×944 video. Request a budget with the reference image's aspect ratio to get a
+specific size. Wan-Animate-2 also ignores `seconds` and `num_frames`: the output
+has as many frames as the (resampled) reference video, generated in chunks of
+`clip_len` frames; see the
+[Wan-Animate-2 cookbook](/cookbook/diffusion/Wan/Wan-Animate-2#1-2-defaults).
+Wan-Animate-2 keeps the reference video's audio track on the output; the
+model-specific `enable_audio` field (form field or `extra_body`, default `true`)
+set to `false` gives a silent output.
+</Note>
+
 #### MP4 encoding
 
 `x264_preset` picks the libx264 preset for the returned MP4: `ultrafast`,

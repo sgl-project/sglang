@@ -48,14 +48,9 @@ Choose your GPU, then Clef or Clef Flash. The wizard updates the model in the la
 
 import { Deployment } from "/src/snippets/_deployment.jsx"
 import { config } from "/src/snippets/configs/Cloudflare/clef.jsx"
+import { benchmarks } from "/src/snippets/configs/Cloudflare/clef-benchmarks.jsx"
 
-<Deployment config={config} />
-
-<Note>
-  We tested both models on one B300 and one H200 inside `lmsysorg/sglang:dev-clef`, built from [SGLang bd2d73daa5af](https://github.com/sgl-project/sglang/commit/bd2d73daa5afda6bcad8d479a834f2e70bbe9569), with PyTorch 2.14.1+cu130 and Transformers 5.19.0. Each configuration passed the wizard’s cURL request, the Python example below, and four requests covering short and long text, each with and without an image. Both long requests used all 16,384 prompt tokens and preserved every question.
-
-  B200 passed the same four text/image cases with [SGLang e122069670a7](https://github.com/sgl-project/sglang/commit/e122069670a74611be5a566c5a14f7b7422a1154), PyTorch 2.14.1, and Transformers 5.17.0. These checks covered serving behavior; throughput and accuracy were not measured.
-</Note>
+<Deployment config={config} benchmarks={benchmarks} />
 
 ## 1. Model introduction
 
@@ -158,3 +153,14 @@ Usage: {'input_tokens': 334, 'output_tokens': 0}
 ```
 
 </Accordion>
+
+## 4. GSM8K accuracy
+
+[Decision Index 0.2.1](https://github.com/apolinario/decision-index/blob/9eb2dbe2a358004c8782c66e40a83ac07b953fec/docs/suite.md) evaluates all 1,319 GSM8K test problems with both four-choice and ten-choice questions, for 2,638 requests per configuration. The table reports accuracy across both formats through `/v1/systemone`.
+
+| Model | [Reported](https://huggingface.co/Cloudflare/clef#results) | H200 | B200 | B300 |
+|---|---:|---:|---:|---:|
+| Clef | 80.8% | 80.71% | 80.59% | 80.59% |
+| Clef Flash | 67.3% | 67.32% | 67.36% | 67.36% |
+
+All runs use BF16 and TP=1 on one GPU.
