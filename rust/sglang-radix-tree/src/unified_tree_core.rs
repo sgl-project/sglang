@@ -1827,7 +1827,6 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 );
             }
         } else {
-            let value_slice = state.value.narrow(0, cursor as i64, prefix_len as i64);
             let mut consumed_from = prefix_len;
             // Let each component claim ownership of overlapping KV slots.
             for i in 0..self.components.len() {
@@ -1837,7 +1836,6 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                     node_id,
                     prefix_len,
                     cursor,
-                    value_slice.shallow_clone(),
                     &params,
                     state
                         .result
@@ -1850,6 +1848,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
 
             let dup_start = state.prev_prefix_len.saturating_sub(cursor);
             if dup_start < consumed_from {
+                // Sliced only here: most walk steps neither free nor recover.
+                let value_slice = state.value.narrow(0, cursor as i64, prefix_len as i64);
                 // The duplicate slice may straddle this request's own eviction
                 // floor; below it only the full side is still ours to release.
                 let dup_len = consumed_from - dup_start;

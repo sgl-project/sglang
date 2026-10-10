@@ -435,7 +435,6 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
         node_id: NodeIdx_,
         prefix_len: usize,
         total_prefix_len: usize,
-        value_slice: Tensor,
         params: &InsertParams<'_, K>,
         result: &mut InsertResult,
         cache_actions: &mut Vec<CacheAction>,
@@ -451,6 +450,9 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
         }
 
         let swa_evicted_seqlen = params.swa_evicted_seqlen;
+        let value_slice = params
+            .value
+            .narrow(0, total_prefix_len as i64, prefix_len as i64);
         // A locked tombstone is legal (segment locks count every node); the
         // full-value swap below is safe because full lock_ref >= swa
         // lock_ref, so a locked-SWA node always takes the Recover branch.
