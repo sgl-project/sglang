@@ -105,16 +105,24 @@ def _add_lora_delta_in_gemm(
 
     Lossless tier: the reference path rounds the delta after the GEMM, after
     each scale and after the add, moving the full ``[tokens, out]`` delta
-    through memory for each; here it is never materialized and rounds once.
+    through memory for each; here it is never materialized. The scale goes on
+    the rank-wide intermediate as a tensor op, not as the GEMM's ``alpha``: a
+    compiled forward reads the request scale as a symbolic float, which a
+    kwarg would freeze at its first value.
     """
     out_2d = out.view(-1, out.shape[-1])
     x_2d = x.reshape(-1, x.shape[-1])
     if lora_A.dim() == 2:
-        groups = [(out_2d, x_2d @ lora_A.t(), lora_B)]
+        hidden = x_2d @ lora_A.t()
+    else:
+        hidden = x_2d @ lora_A.reshape(-1, lora_A.shape[-1]).t()
+    if scale != 1.0:
+        hidden = hidden * scale
+    if lora_A.dim() == 2:
+        groups = [(out_2d, hidden, lora_B)]
     else:
         # stacked [groups, rank, in] / [groups, out, rank], one GEMM per group
         rank, width = lora_A.shape[1], lora_B.shape[1]
-        hidden = x_2d @ lora_A.reshape(-1, lora_A.shape[-1]).t()
         groups = [
             (
                 out_2d[:, g * width : (g + 1) * width],
@@ -123,11 +131,11 @@ def _add_lora_delta_in_gemm(
             )
             for g in range(lora_B.shape[0])
         ]
-    for target, hidden, b in groups:
-        if target.dtype == hidden.dtype:
-            target.addmm_(hidden, b.t(), alpha=scale)
+    for target, rows, b in groups:
+        if target.dtype == rows.dtype:
+            target.addmm_(rows, b.t())
         else:
-            target.add_(hidden @ b.t(), alpha=scale)
+            target.add_(rows @ b.t())
     return out
 
 
