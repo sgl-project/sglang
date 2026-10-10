@@ -99,9 +99,12 @@ class TestMoeSortingSmall(CustomTestCase):
 
     def test_sort_matches_aiter(self):
         # compact at E=513; distributed at MiniMax-M3's E=129 / top-4 + shared
-        cases = [(513, 11, m) for m in (1, 2, 4, 5)] + [
-            (129, 5, m) for m in (13, 25, 51)
-        ]
+        # sorted kernel above 32 pairs at DeepSeek-V4.1's E=385 / top-6 + shared
+        cases = (
+            [(513, 11, m) for m in (1, 2, 4, 5)]
+            + [(129, 5, m) for m in (13, 25, 51)]
+            + [(385, 7, m) for m in (4, 5, 10, 36)]
+        )
         for bs in (32, 64):
             for E, topk, m in cases:
                 ids, w = self._routing(m, m, E, topk)
@@ -114,12 +117,22 @@ class TestMoeSortingSmall(CustomTestCase):
 
     def test_fused_mxfp8_quant_matches_aiter(self):
         bs = 32
-        # compact at E=513; distributed at MiniMax-M3's E=129 / top-4 + shared
-        for E, topk, m in ((513, 11, 1), (513, 11, 5), (129, 5, 16), (129, 5, 51)):
+        # compact at E=513; distributed at MiniMax-M3's E=129 / top-4 + shared;
+        # hidden 5120 (DeepSeek-V4.1) quantizes in 1024-column chunks
+        for E, topk, dim, m in (
+            (513, 11, 4096, 1),
+            (513, 11, 4096, 5),
+            (129, 5, 4096, 16),
+            (129, 5, 4096, 51),
+            (385, 7, 5120, 9),
+            (385, 7, 5120, 10),
+            (385, 7, 5120, 36),
+            (129, 5, 5120, 16),
+        ):
             ids, w = self._routing(m, m, E, topk)
-            x = torch.randn(m, self.DIM, dtype=torch.bfloat16, device=self.dev)
+            x = torch.randn(m, dim, dtype=torch.bfloat16, device=self.dev)
             sid, sw, _, nv, _ = self._sort(self.orig_sort, ids, w, bs, E)
-            ref_q, _ = self.orig_quant(
+            ref_q, ref_s = self.orig_quant(
                 x,
                 sorted_ids=sid,
                 num_valid_ids=nv,
@@ -135,11 +148,29 @@ class TestMoeSortingSmall(CustomTestCase):
                 torch.equal(ref_q.view(torch.uint8), emitted[0].view(torch.uint8)),
                 f"E={E} m={m}",
             )
+            # e8m0 byte of every (real sorted row, 32-group) at aiter's swizzled address
+            rows = torch.nonzero(sid[: int(nv[0])] != ((topk << 24) | m))
+            pad, g = (dim // 32 + 7) // 8 * 8, torch.arange(dim // 32, device=self.dev)
+            addr = (rows // 32) * pad * 32 + rows % 16 * 4 + rows % 32 // 16
+            addr = (addr + g // 8 * 256 + g % 4 * 64 + g % 8 // 4 * 2).flatten()
+            self.assertTrue(
+                torch.equal(
+                    ref_s.view(torch.uint8).flatten()[addr],
+                    emitted[1].view(torch.uint8).flatten()[addr],
+                ),
+                f"E={E} m={m} scales",
+            )
 
     def test_falls_back_to_aiter_past_compact_at_513_experts(self):
         m = 6
         ids, _ = self._routing(m, m)
         self.assertFalse(self.S._small_sort_supported(ids, 32, None, None, self.E))
+
+    def test_sorted_path_past_compact_at_385_experts(self):
+        ids, _ = self._routing(36, 36, 385, 7)
+        self.assertTrue(self.S._small_sort_supported(ids, 32, None, None, 385))
+        ids, _ = self._routing(37, 37, 385, 7)
+        self.assertFalse(self.S._small_sort_supported(ids, 32, None, None, 385))
 
 
 @unittest.skipUnless(torch.cuda.is_available() and torch.version.hip, "ROCm only")
