@@ -899,6 +899,36 @@ class CompressorAscendBackendMixin:
             except Exception as _exc:
                 print(f"[SLOTTEST-DUMP] skipped: {_exc}", flush=True)
 
+        # S232: decisive op-INPUT probe. Env SGL_DSV4_XDIFF=<any>, INDEXER only,
+        # on the call covering position 17534. Prints x (the compressor input
+        # hidden) aggregates so a MISS run vs a HIT run can be diffed: if x
+        # differs, the root is UPSTREAM (attention / index-K), not the op.
+        _xd_on = os.environ.get("SGL_DSV4_XDIFF")
+        if _xd_on and bool(compressor.is_in_indexer):
+            try:
+                import hashlib as _hlx
+
+                _xsp = fm.start_pos.reshape(-1).to(torch.int64).cpu()
+                _xsu = fm.seqused.reshape(-1).to(torch.int64).cpu()
+                _xsp_l = _xsp.tolist()
+                _xsu_l = _xsu.tolist()
+                if any(
+                    int(_xsp_l[_b]) <= 17534 < int(_xsp_l[_b]) + int(_xsu_l[_b])
+                    for _b in range(len(_xsp_l))
+                ):
+                    _xa = x.detach().to(torch.float32).cpu().numpy()
+                    print(
+                        f"[XDIFF] layer={compressor.layer_id} idx=1 "
+                        f"start={_xsp_l} ntok={int(x.shape[0])} "
+                        f"xshape={tuple(x.shape)} "
+                        f"xsum={float(_xa.sum()):.6e} "
+                        f"xabsmax={float(abs(_xa).max()):.6e} "
+                        f"xmd5={_hlx.md5(_xa.tobytes()).hexdigest()[:16]}",
+                        flush=True,
+                    )
+            except Exception as _exc:
+                print(f"[XDIFF] skipped: {_exc}", flush=True)
+
         compressor_op = torch.ops.npu.compressor
         cmp_kv = compressor_op(
             x,
