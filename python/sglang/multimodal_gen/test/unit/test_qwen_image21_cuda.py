@@ -455,11 +455,16 @@ def inputs_hd128(seed, edit):
     return kwargs
 
 
+@pytest.mark.parametrize("cuda_kernels", [False, True])
 @pytest.mark.parametrize("edit", [False, True])
 @torch.no_grad()
 def test_cuda_qk_rope_pack_matches_eager_prefill_and_cached_steps(
-    bf16_model_hd128, edit, monkeypatch
+    bf16_model_hd128, edit, cuda_kernels, monkeypatch
 ):
+    if not cuda_kernels:
+        monkeypatch.setattr(
+            model_module, "can_use_qknorm_complex_rope_cuda", lambda *args: False
+        )
     # The CUDA Q/K norm + RoPE + KV packing path must reproduce the Triton/eager
     # chain bit for bit on the prefill step, on cached steps and under BCG replay.
     actual_model = bf16_model_hd128
@@ -489,9 +494,12 @@ def test_cuda_qk_rope_pack_matches_eager_prefill_and_cached_steps(
         for timestep, output in zip((700, 300, 10), expected, strict=True):
             kwargs["timestep"].fill_(timestep)
             torch.testing.assert_close(actual_model(**kwargs), output, atol=0, rtol=0)
-    # The CUDA kernels are exact by construction and must have engaged.
+    # Unsupported CUDA kernels must leave the exact fallback and cache intact.
     for gate in (qk_gate, kv_gate):
-        assert gate.verified and not gate.disabled, gate.name
+        if cuda_kernels:
+            assert gate.verified and not gate.disabled, gate.name
+        else:
+            assert not gate.verified and not gate.disabled, gate.name
     # The packed and the direct-write projections are GEMM re-plumbings whose
     # first-sight compare depends on cuBLAS picking the same kernel for both
     # shapes; where it does not, the gate declines and the next tier takes over
