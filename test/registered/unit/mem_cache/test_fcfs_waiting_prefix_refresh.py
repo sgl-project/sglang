@@ -1,6 +1,7 @@
 import time
 import unittest
 from array import array
+from unittest import mock
 
 import torch
 
@@ -82,7 +83,9 @@ class TestFcfsWaitingPrefixRefresh(CustomTestCase):
             ServerArgs(model_path="dummy", radix_eviction_policy=eviction_policy),
             role="test",
         )
-        SchedulePolicy("fcfs", cache, False, False, False).calc_priority(queue)
+        SchedulePolicy("fcfs", cache, False, False, False).calc_priority(
+            queue, forward_ct=0
+        )
         cache.evict(EvictParams(num_tokens=len(OLDER_PREFIX)))
         return [
             cache.match_prefix(
@@ -97,6 +100,32 @@ class TestFcfsWaitingPrefixRefresh(CustomTestCase):
     def test_mru_keeps_plain_order(self):
         # MRU evicts the most recent first, so a refresh would invert its intent.
         self.assertEqual(self._run_and_evict_one_prefix("mru"), [4, 0])
+
+    def test_refresh_decisions_ignore_wall_clock_spacing(self):
+        """TP/PP ranks fed the same calls must refresh on the same calls,
+        however far apart in time each rank makes them."""
+        publish(
+            ServerArgs(model_path="dummy", radix_eviction_policy="lru"), role="test"
+        )
+        queue = [Req(1, "", array("q", OLDER_PREFIX), SamplingParams())]
+
+        def refreshes(gap_s):
+            policy = SchedulePolicy(
+                "fcfs", RadixCache.create_simulated(), False, False, False
+            )
+            touched = []
+            for forward_ct in range(3):
+                if forward_ct:
+                    time.sleep(gap_s)
+                with mock.patch(
+                    "sglang.srt.managers.schedule_policy.touch_waiting_prefix"
+                ) as touch:
+                    policy.calc_priority(queue, forward_ct=forward_ct)
+                touched.append(touch.called)
+            return touched
+
+        self.assertEqual(refreshes(gap_s=0), [True, False, False])
+        self.assertEqual(refreshes(gap_s=0.6), [True, False, False])
 
 
 if __name__ == "__main__":

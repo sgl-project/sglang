@@ -32,7 +32,6 @@ logger = logging.getLogger(__name__)
 
 import os
 import random
-import time
 from collections import Counter
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
@@ -133,7 +132,8 @@ if PREFILL_TILE_BUDGET_MODE not in {"legacy", "compact"}:
 # Arbitrary; bounds per-round prefix work on the waiting queue.
 WAITING_QUEUE_PREFIX_MATCH_MAX = 128
 # Arbitrary; bounds the walk cost of touching waiting prefixes.
-WAITING_PREFIX_REFRESH_INTERVAL_S = 0.5
+# Counted in forward passes, not wall time: TP/PP ranks must refresh in lockstep.
+WAITING_PREFIX_REFRESH_INTERVAL_FORWARDS = 32
 
 
 def _ceil_div(value: int, divisor: int) -> int:
@@ -202,7 +202,7 @@ class SchedulePolicy:
         self.schedule_low_priority_values_first = schedule_low_priority_values_first
         self.priority_sign = 1 if schedule_low_priority_values_first else -1
         self._shortest_prefill_calls = 0
-        self._last_waiting_prefix_refresh = float("-inf")
+        self._last_waiting_prefix_refresh_forward_ct: Optional[int] = None
 
         # It is used to find the matching prefix for in-batch prefix caching.
         self.waiting_queue_radix_tree = RadixCache.create_simulated()
@@ -212,6 +212,8 @@ class SchedulePolicy:
         waiting_queue: List[Req],
         running_batch: Optional[ScheduleBatch] = None,
         processed_tokens: int = 0,
+        # None skips the waiting-prefix refresh.
+        forward_ct: Optional[int] = None,
     ) -> None:
         policy = self._determine_active_policy(waiting_queue)
 
@@ -274,13 +276,16 @@ class SchedulePolicy:
             else:
                 raise ValueError(f"Unknown CacheAgnostic Policy: {policy=}")
 
-        self._touch_waiting_prefixes(policy, waiting_queue)
+        self._touch_waiting_prefixes(policy, waiting_queue, forward_ct)
 
-    def _touch_waiting_prefixes(self, policy: Policy, waiting_queue: List[Req]) -> None:
+    def _touch_waiting_prefixes(
+        self, policy: Policy, waiting_queue: List[Req], forward_ct: Optional[int]
+    ) -> None:
         # Head last, so LRU evicts in reverse admission order; cache-aware policies
         # already touch while matching, and other eviction strategies ignore recency.
         if (
-            isinstance(policy, CacheAwarePolicy)
+            forward_ct is None
+            or isinstance(policy, CacheAwarePolicy)
             or not waiting_queue
             or not envs.SGLANG_ENABLE_WAITING_PREFIX_REFRESH.get()
             or get_disagg().disaggregation_mode == "decode"
@@ -289,10 +294,13 @@ class SchedulePolicy:
             or not self.tree_cache.supports_prefix_sharing()
         ):
             return
-        now = time.monotonic()
-        if now - self._last_waiting_prefix_refresh < WAITING_PREFIX_REFRESH_INTERVAL_S:
+        last = self._last_waiting_prefix_refresh_forward_ct
+        if (
+            last is not None
+            and forward_ct - last < WAITING_PREFIX_REFRESH_INTERVAL_FORWARDS
+        ):
             return
-        self._last_waiting_prefix_refresh = now
+        self._last_waiting_prefix_refresh_forward_ct = forward_ct
         for r in reversed(waiting_queue[:WAITING_QUEUE_PREFIX_MATCH_MAX]):
             touch_waiting_prefix(r, self.tree_cache)
 

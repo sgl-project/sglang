@@ -45,7 +45,7 @@ class SchedulerDllmMixin:
             return None
 
         running_bs = len(running_batch.reqs)
-        self.policy.calc_priority(self.waiting_queue)
+        self.policy.calc_priority(self.waiting_queue, forward_ct=self.forward_ct)
 
         # Create prefill adder with resource constraints
         adder = self._create_dllm_prefill_adder(running_bs, running_batch=running_batch)
