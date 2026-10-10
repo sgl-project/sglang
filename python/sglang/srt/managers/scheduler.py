@@ -69,6 +69,7 @@ except ImportError:
     initialize_mamba_selective_state_update_backend = None
 from sglang.srt.beam_search.coordinator import BeamCoordinator
 from sglang.srt.configs.model_config import (
+    AttentionArch,
     ModelConfig,
     ModelImpl,
     is_deepseek_v4,
@@ -1670,10 +1671,14 @@ class Scheduler(
         self.truncation_align_size = None
         if not get_exec().deterministic.enable_deterministic_inference:
             return
-        # Only flashinfer needs chunks on its q-tile grid; triton tiles keys at
+        # Only the MHA flashinfer backend runs the fixed-split fa2 prefill; its
+        # MLA wrapper has no deterministic mode, and triton tiles keys at
         # absolute positions (align_window_kv_to_tiles).
         prefill_backend, _ = attention_backends()
-        if prefill_backend == "flashinfer":
+        if (
+            prefill_backend == "flashinfer"
+            and self.model_config.attention_arch != AttentionArch.MLA
+        ):
             from sglang.srt.layers.attention.flashinfer_backend import (
                 PREFILL_Q_TILE_TOKENS,
             )
