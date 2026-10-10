@@ -87,6 +87,9 @@ from sglang.srt.layers.attention.dsv4.v41_indexer import (
     make_candidate_indexer,
     make_full_topk_indexer,
 )
+from sglang.srt.layers.attention.dsv4.v41_indexer.scoring import (
+    prefill_score_budget_bytes,
+)
 from sglang.srt.layers.attention.verify_mask import (
     VerifyMask,
     maybe_create_verify_mask,
@@ -970,6 +973,9 @@ class DSV4Metadata:
     # What the candidate-source layer published for the index-source layers after
     # it, in the implementation's own type; never copied from the host.
     candidate_metadata: Optional[CandidateMetadata] = None
+    # The eager low-ratio prefill indexer's score-tile budget, read by its first
+    # layer in this forward and shared by the rest.
+    low_ratio_score_budget_bytes: Optional[int] = None
 
     # Built at the runner's prefill WAR boundary when the fast path is on,
     # otherwise lazily by ``_forward_prefill_sparse``.
@@ -994,6 +1000,7 @@ class DSV4Metadata:
         )
         self.sparse_prefill_cache = None
         self.prefill_shared_reads_snapshotted = False
+        self.low_ratio_score_budget_bytes = None
 
     def refresh_for_breakable_cuda_graph_replay_(self, static_metadata: DSV4Metadata):
         self.core_attn_metadata.refresh_for_breakable_cuda_graph_replay_(
@@ -1026,6 +1033,7 @@ class DSV4Metadata:
             )
         self.sparse_prefill_cache = None
         self.prefill_shared_reads_snapshotted = False
+        self.low_ratio_score_budget_bytes = None
 
 
 @dataclass
@@ -1721,6 +1729,10 @@ class DeepseekV4AttnBackend(
                     continue
                 rows = tail.real_rows(full_buf)
                 tail_buf[: rows.shape[0]].copy_(rows)
+        if tail_metadata.low_ratio_score_budget_bytes is None:
+            tail_metadata.low_ratio_score_budget_bytes = saved[
+                0
+            ].low_ratio_score_budget_bytes
         self.forward_metadata = tail_metadata
         if self.token_to_kv_pool.request_window is not None:
             self.token_to_kv_pool.request_window.activate(
@@ -3275,6 +3287,18 @@ class DeepseekV4AttnBackend(
         else:
             rows_per_request = _as_int_list(forward_batch.extend_seq_lens_cpu)
             rows_per_request_device = forward_batch.extend_seq_lens
+        seq_lens_cpu = _as_int_list(forward_batch.seq_lens_cpu)
+        meta = self.forward_metadata
+        if (
+            meta.low_ratio_score_budget_bytes is None
+            and self.full_topk_indexer.use_deep_gemm_prefill
+        ):
+            # Ratio 1 bounds both low-ratio score widths.
+            meta.low_ratio_score_budget_bytes = prefill_score_budget_bytes(
+                num_rows=x.shape[0],
+                max_seq_len=max(seq_lens_cpu or (), default=0),
+                device=x.device,
+            )
         return PrefillInputs(
             indexer=layer.indexer,
             layer_id=layer.layer_id,
@@ -3286,7 +3310,7 @@ class DeepseekV4AttnBackend(
             req_rows=req,
             req_pool_indices=forward_batch.req_pool_indices,
             kv_page_table=core.page_table,
-            seq_lens_cpu=_as_int_list(forward_batch.seq_lens_cpu),
+            seq_lens_cpu=seq_lens_cpu,
             rows_per_request=rows_per_request,
             rows_per_request_device=rows_per_request_device,
             out_raw_indices=core.sparse_raw_indices(layer.compress_ratio),
@@ -3295,6 +3319,7 @@ class DeepseekV4AttnBackend(
                 if self._low_ratio_prefill_reads_page_indices(forward_batch)
                 else None
             ),
+            score_budget_bytes=meta.low_ratio_score_budget_bytes,
         )
 
     def _low_ratio_prefill_reads_page_indices(self, forward_batch: ForwardBatch):
