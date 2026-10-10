@@ -362,6 +362,17 @@ html.dark table tbody tr:nth-child(even) td,
 .sgd-builder-controls, .sgd-builder-output-rail { min-width: 0; }
 .sgd-builder-controls { container: builder-controls / inline-size; padding: 4px 16px 20px; }
 
+.sgd-builder-docs-tip {
+  display: block;
+  margin: 0;
+  padding: 12px 16px;
+  border-top: 1px solid var(--sgdb-line);
+  color: var(--sgdb-muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.sgd-builder-docs-tip a { color: var(--sgdb-serve); text-decoration: underline; text-underline-offset: 3px; }
+
 .sgd-builder-scope-panel { display: grid; gap: 0; }
 .sgd-builder-recipe {
   display: flex;
