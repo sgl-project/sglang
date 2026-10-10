@@ -147,6 +147,8 @@ class Sampler(nn.Module):
         top_logprobs_nums: List[int],
         token_ids_logprobs: List[List[int]],
         positions: torch.Tensor,
+        *,
+        logprob_logits: Optional[torch.Tensor] = None,
     ):
         """Run a sampler & compute logprobs and update logits_output accordingly.
 
@@ -161,6 +163,7 @@ class Sampler(nn.Module):
                 sequence in the batch. This is used in speculative decoding.
             positions: The positions of the tokens in the sequence. Used for deterministic sampling
                 to get the unique seed for each position.
+            logprob_logits: Optional pre-watermark logits for returned log probabilities.
         """
         logits = logits_output.next_token_logits
         maybe_detect_nan(logits, "sampler: next_token_logits")
@@ -177,6 +180,18 @@ class Sampler(nn.Module):
         _trace_e2e_sampler("preprocess_enter")
         logits = self._preprocess_logits(logits, sampling_info)
         _trace_e2e_sampler("preprocess_returned")
+        target_logprobs = None
+        if logprob_logits is not None:
+            logprob_logits = self._preprocess_logits(logprob_logits, sampling_info)
+            if sampling_info.is_all_greedy or SGLANG_RETURN_ORIGINAL_LOGPROB:
+                target_logprobs = torch.nn.functional.log_softmax(
+                    logprob_logits, dim=-1
+                )
+            else:
+                target_logprobs = torch.nn.functional.log_softmax(
+                    logprob_logits / sampling_info.temperatures, dim=-1
+                )
+            target_logprobs.clamp_(min=torch.finfo(target_logprobs.dtype).min)
         sampling_mask_batch_indices = sampling_info.sampling_mask_batch_indices
         return_sampling_mask = sampling_mask_batch_indices is not None
         sampling_support_logprobs_capture_indices = (
@@ -208,7 +223,11 @@ class Sampler(nn.Module):
             )
 
             # If requested, cache original logprobs before temperature scaling.
-            if return_logprob and SGLANG_RETURN_ORIGINAL_LOGPROB:
+            if (
+                return_logprob
+                and SGLANG_RETURN_ORIGINAL_LOGPROB
+                and target_logprobs is None
+            ):
                 original_logprobs = torch.log_softmax(logits, dim=-1)
 
             # In RL on-policy mode, we use log_softmax to compute logprobs to match the trainer.
@@ -259,6 +278,7 @@ class Sampler(nn.Module):
                     and self.enable_deterministic
                     and logprobs_via_logsoftmax_kernel is None
                     and not SGLANG_RETURN_ORIGINAL_LOGPROB
+                    and target_logprobs is None
                 ):
                     logprobs_via_logsoftmax_kernel = torch.nn.functional.log_softmax(
                         logits, dim=-1
@@ -278,7 +298,11 @@ class Sampler(nn.Module):
                     positions,
                     simple_sampling_case,
                 )
-                if return_logprob and not SGLANG_RETURN_ORIGINAL_LOGPROB:
+                if (
+                    return_logprob
+                    and not SGLANG_RETURN_ORIGINAL_LOGPROB
+                    and target_logprobs is None
+                ):
                     logprobs = (
                         logprobs_via_logsoftmax_kernel
                         if logprobs_via_logsoftmax_kernel is not None
@@ -287,7 +311,9 @@ class Sampler(nn.Module):
                 del probs
 
         if return_logprob:
-            if SGLANG_RETURN_ORIGINAL_LOGPROB:
+            if target_logprobs is not None:
+                logprobs = target_logprobs
+            elif SGLANG_RETURN_ORIGINAL_LOGPROB:
                 logprobs = original_logprobs
             logprob_result = self.output_logprob_processor.compute_logprobs(
                 logprobs,

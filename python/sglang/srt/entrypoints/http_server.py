@@ -175,6 +175,7 @@ from sglang.srt.observability.trace import (
 )
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.parser.template_manager import TemplateManager
+from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     add_prometheus_middleware,
@@ -861,13 +862,15 @@ async def server_info():
     server_args = _global_state.tokenizer_manager.server_args
 
     return msgspec_to_builtins(
-        {
-            **build_server_info(server_args, _global_state.scheduler_info),
-            "startup_time": _global_state.tokenizer_manager.startup_time,
-            "internal_states": internal_states,
-            "version": __version__,
-            "frontend": "python",
-        }
+        redact_watermark_secrets(
+            {
+                **build_server_info(server_args, _global_state.scheduler_info),
+                "startup_time": _global_state.tokenizer_manager.startup_time,
+                "internal_states": internal_states,
+                "version": __version__,
+                "frontend": "python",
+            }
+        )
     )
 
 

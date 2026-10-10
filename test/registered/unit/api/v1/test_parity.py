@@ -89,6 +89,7 @@ PYTHON_ONLY_REQUEST_FIELDS = frozenset(
         "use_audio_in_video",
         "video_config",
         "video_max_dynamic_patch",
+        "watermark",
     }
 )
 
