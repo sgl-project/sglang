@@ -71,7 +71,7 @@ def test_npu_vit_graph_keys_include_attention_boundaries():
     second_layout = torch.tensor([0, 2, 8], dtype=torch.int32)
 
     # patch.dict dropped the module from sys.modules, so patch it by object.
-    with patch.object(module, "set_graph_pool_id"):
+    with patch.object(target=module, attribute="set_graph_pool_id"):
         runner.run(
             x,
             first_layout,

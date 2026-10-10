@@ -94,7 +94,7 @@ def _video_request(**overrides) -> SimpleNamespace:
     return SimpleNamespace(**fields)
 
 
-@unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+@unittest.skipUnless(condition=torch.cuda.is_available(), reason="needs CUDA")
 class TestStreamedEncode(CustomTestCase):
     @torch.no_grad()
     def test_streamed_mp4_matches_the_one_shot_save(self):

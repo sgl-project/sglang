@@ -104,7 +104,7 @@ class TestDecodeHandsOutFinishedFrames(CustomTestCase):
             )
 
 
-@unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+@unittest.skipUnless(condition=torch.cuda.is_available(), reason="needs CUDA")
 class TestStreamedEncode(CustomTestCase):
     @staticmethod
     def _video(height: int, width: int) -> torch.Tensor:
