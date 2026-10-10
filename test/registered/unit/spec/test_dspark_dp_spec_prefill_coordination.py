@@ -112,6 +112,11 @@ class TestDSparkDPSpecPrefillCoordination(CustomTestCase):
                 worker.enable_dp_spec_prefill_coordination = enabled
                 worker.verify_num_draft_tokens = 7
                 worker._proposer = SimpleNamespace(query_token_num=6)
+                worker.device = torch.device("cpu")
+                target_runner = SimpleNamespace(
+                    shared_read_done_event="target-verify-read-done"
+                )
+                worker._target_worker = SimpleNamespace(model_runner=target_runner)
                 worker._verify_planner = MagicMock()
                 worker._observers = MagicMock()
                 worker._forward_prefill = MagicMock(return_value="prefill")
@@ -129,6 +134,9 @@ class TestDSparkDPSpecPrefillCoordination(CustomTestCase):
                     ),
                 )
                 self.assertEqual(worker.forward_batch_generation(batch), expected)
+                self.assertIsInstance(
+                    target_runner.shared_read_done_event, torch.cpu.Event
+                )
                 if expected == "coordinate":
                     plan = worker._forward_dp_spec_prefill_coordination.call_args.args[
                         1

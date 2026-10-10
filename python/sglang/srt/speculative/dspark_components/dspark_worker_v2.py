@@ -586,21 +586,28 @@ class DSparkWorkerV2(BaseSpecWorker):
                 on_publish(batch_output.new_seq_lens)
             return batch_output
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
+            plan = None
             if batch.is_extend_in_batch and self.enable_dp_spec_prefill_coordination:
                 plan = DPSpecPrefillCoordinationPlan(
                     *batch.dp_spec_prefill_coordination_metadata,
                     draft_width=self._proposer.query_token_num,
                     verify_width=self.verify_num_draft_tokens,
                 )
-                if plan.heterogeneous:
-                    return self._forward_dp_spec_prefill_coordination(
-                        batch, plan, on_publish, grammar_barrier, pp_proxy_tensors
-                    )
-            self._verify_planner.note_non_decode_step()
-            self._observers.note_prefill_step()
-            return self._forward_prefill(batch, on_publish, pp_proxy_tensors)
+            if plan is not None and plan.heterogeneous:
+                result = self._forward_dp_spec_prefill_coordination(
+                    batch, plan, on_publish, grammar_barrier, pp_proxy_tensors
+                )
+            else:
+                self._verify_planner.note_non_decode_step()
+                self._observers.note_prefill_step()
+                result = self._forward_prefill(batch, on_publish, pp_proxy_tensors)
+        else:
+            result = self._forward_decode(batch, on_publish, grammar_barrier)
 
-        return self._forward_decode(batch, on_publish, grammar_barrier)
+        read_done = torch.get_device_module(self.device).Event()
+        read_done.record()
+        self.last_shared_read_runner.shared_read_done_event = read_done
+        return result
 
     def _forward_dp_spec_prefill_coordination(
         self, batch, plan, on_publish, grammar_barrier, pp_proxy_tensors
