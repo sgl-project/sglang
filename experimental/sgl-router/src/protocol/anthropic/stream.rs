@@ -6,8 +6,8 @@
 
 use serde_json::{json, Value};
 
-use super::{error_type, new_id, stop_reason, usage_from_chat, EchoContext};
-use crate::protocol::sse::{data_payload, write_event, LineBuffer, SseTransducer};
+use super::{error_type, new_id, scrub_message, stop_reason, usage_from_chat, EchoContext};
+use crate::protocol::sse::{data_payload, write_event, Data, LineBuffer, SseTransducer};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
@@ -53,8 +53,14 @@ impl MessagesStream {
         if self.terminal {
             return;
         }
-        let Some(chunk) = data_payload(line) else {
-            return;
+        let chunk = match data_payload(line) {
+            None => return,
+            Some(Data::Done) => return self.finalize(out),
+            Some(Data::Invalid) => {
+                tracing::warn!("messages: upstream stream chunk is not valid JSON");
+                return self.emit_error("api_error", "Stream processing error", out);
+            }
+            Some(Data::Json(chunk)) => chunk,
         };
         if let Some(err) = chunk.get("error").filter(|e| !e.is_null()) {
             let message = err
@@ -64,7 +70,7 @@ impl MessagesStream {
                 .unwrap_or("upstream error");
             let status = err.get("code").and_then(Value::as_u64);
             let status = status.and_then(|c| u16::try_from(c).ok()).unwrap_or(500);
-            self.emit_error(error_type(status), message, out);
+            self.emit_error(error_type(status), &scrub_message(message, status), out);
             return;
         }
         if let Some(u) = chunk.get("usage").filter(|u| u.is_object()) {
@@ -150,21 +156,26 @@ impl MessagesStream {
             .pointer("/function/name")
             .and_then(Value::as_str)
             .is_some_and(|n| !n.is_empty());
-        if named || !matches!(self.open, Some((Kind::Tool, _))) {
+        if named {
             self.close_block(out);
             self.flush_held(out);
             self.open_block(Kind::Tool, Some(call), out);
         }
-        if let Some(args) = call
+        let Some(args) = call
             .pointer("/function/arguments")
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
-        {
-            self.delta(
-                json!({"type": "input_json_delta", "partial_json": args}),
-                out,
-            );
+        else {
+            return;
+        };
+        if !matches!(self.open, Some((Kind::Tool, _))) {
+            tracing::warn!("messages: dropping tool call arguments with no open tool_use block");
+            return;
         }
+        self.delta(
+            json!({"type": "input_json_delta", "partial_json": args}),
+            out,
+        );
     }
 
     /// Emits held text after a tool call; whitespace alone is dropped.
@@ -182,7 +193,7 @@ impl MessagesStream {
         let index = self.next_index;
         self.next_index += 1;
         let block = match kind {
-            Kind::Thinking => json!({"type": "thinking", "thinking": "", "signature": ""}),
+            Kind::Thinking => json!({"type": "thinking", "thinking": ""}),
             Kind::Text => json!({"type": "text", "text": ""}),
             Kind::Tool => json!({
                 "type": "tool_use",
@@ -222,12 +233,51 @@ impl MessagesStream {
         }
     }
 
+    /// Strict SDK parsers reject a stream that leaves a block open, even on error.
     fn emit_error(&mut self, typ: &str, message: &str, out: &mut Vec<u8>) {
+        self.ensure_started(out);
+        self.close_block(out);
+        self.held.clear();
         write_event(
             out,
             "error",
             &json!({"type": "error", "error": {"type": typ, "message": message}}),
         );
+        write_event(out, "message_stop", &json!({"type": "message_stop"}));
+        self.terminal = true;
+    }
+
+    fn finalize(&mut self, out: &mut Vec<u8>) {
+        if self.terminal {
+            return;
+        }
+        if self.finish_reason.is_none() {
+            return self.emit_error(
+                "api_error",
+                "upstream stream ended before the message completed",
+                out,
+            );
+        }
+        self.ensure_started(out);
+        self.close_block(out);
+        self.flush_held(out);
+        self.close_block(out);
+        let (reason, sequence) = stop_reason(
+            self.finish_reason.as_deref(),
+            self.matched_stop.as_ref(),
+            &self.echo,
+        );
+        let usage = usage_from_chat(self.usage.as_ref());
+        write_event(
+            out,
+            "message_delta",
+            &json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": reason, "stop_sequence": sequence},
+                "usage": {"output_tokens": usage["output_tokens"]},
+            }),
+        );
+        write_event(out, "message_stop", &json!({"type": "message_stop"}));
         self.terminal = true;
     }
 }
@@ -249,37 +299,7 @@ impl SseTransducer for MessagesStream {
         let mut out = Vec::new();
         let mut lines = std::mem::take(&mut self.lines);
         lines.flush(|line| self.handle_line(line, &mut out));
-        if self.terminal {
-            return out;
-        }
-        if self.finish_reason.is_none() {
-            self.emit_error(
-                "api_error",
-                "upstream stream ended before the message completed",
-                &mut out,
-            );
-            return out;
-        }
-        self.ensure_started(&mut out);
-        self.close_block(&mut out);
-        self.flush_held(&mut out);
-        self.close_block(&mut out);
-        let (reason, sequence) = stop_reason(
-            self.finish_reason.as_deref(),
-            self.matched_stop.as_ref(),
-            &self.echo,
-        );
-        write_event(
-            &mut out,
-            "message_delta",
-            &json!({
-                "type": "message_delta",
-                "delta": {"stop_reason": reason, "stop_sequence": sequence},
-                "usage": usage_from_chat(self.usage.as_ref()),
-            }),
-        );
-        write_event(&mut out, "message_stop", &json!({"type": "message_stop"}));
-        self.terminal = true;
+        self.finalize(&mut out);
         out
     }
 
@@ -380,7 +400,10 @@ mod tests {
         assert_eq!(start["usage"]["input_tokens"], 4);
         assert_eq!(start["usage"]["cache_read_input_tokens"], 6);
         assert_eq!(start["usage"]["output_tokens"], 0);
-        assert_eq!(evs[1].1["content_block"]["type"], "thinking");
+        assert_eq!(
+            evs[1].1["content_block"],
+            json!({"type": "thinking", "thinking": ""})
+        );
         assert_eq!(
             evs[2].1["delta"],
             json!({"type": "thinking_delta", "thinking": "hm"})
@@ -447,28 +470,76 @@ mod tests {
         );
     }
 
+    fn names(evs: &[(String, Value)]) -> Vec<&str> {
+        evs.iter().map(|(e, _)| e.as_str()).collect()
+    }
+
+    /// Every failure leaves a well-formed stream: started, blocks closed, stopped.
     #[test]
-    fn inband_error_and_cut_stream() {
+    fn errors_close_the_stream() {
+        let errored_after_text = [
+            "message_start",
+            "content_block_start",
+            "content_block_delta",
+            "content_block_stop",
+            "error",
+            "message_stop",
+        ];
         let mut s = MessagesStream::new(echo());
         let mut raw = s.feed(chunk(json!({"content": "a"}), None, true).as_bytes());
-        raw.extend(s.feed(b"data: {\"error\": {\"message\": \"boom\"}}\n\n"));
+        raw.extend(s.feed(b"data: {\"error\": {\"message\": \"boom /opt/x.py\"}}\n\n"));
         assert!(s.is_terminal());
         raw.extend(s.finish());
-        let (last, data) = events(&raw).pop().unwrap();
-        assert_eq!(last, "error");
+        let evs = events(&raw);
+        assert_eq!(names(&evs), errored_after_text);
         assert_eq!(
-            data["error"],
-            json!({"type": "api_error", "message": "boom"})
+            evs[4].1["error"],
+            json!({"type": "api_error", "message": "Internal server error"})
         );
 
-        // An upstream status maps to its Anthropic error type.
+        // A 4xx keeps its message and maps to its Anthropic error type.
         let mut s = MessagesStream::new(echo());
-        let raw = s.feed(b"data: {\"error\": {\"message\": \"too long\", \"code\": 400}}\n\n");
-        let (_, data) = events(&raw).pop().unwrap();
-        assert_eq!(data["error"]["type"], "invalid_request_error");
+        let evs =
+            events(&s.feed(b"data: {\"error\": {\"message\": \"too long\", \"code\": 400}}\n\n"));
+        assert_eq!(names(&evs), ["message_start", "error", "message_stop"]);
+        assert_eq!(
+            evs[1].1["error"],
+            json!({"type": "invalid_request_error", "message": "too long"})
+        );
+
+        let mut s = MessagesStream::new(echo());
+        let raw = s.feed(b"data: {\"error\": \"queue full\"}\n\n");
+        assert_eq!(events(&raw)[1].1["error"]["type"], "api_error");
+
+        let evs = run(&[
+            chunk(json!({"content": "a"}), None, true),
+            "data: {\"choices\": [{\"delta\": {\"content\n\n".into(),
+            chunk(json!({"content": "lost"}), Some("stop"), true),
+        ]);
+        assert_eq!(names(&evs), errored_after_text);
+        assert_eq!(evs[4].1["error"]["message"], "Stream processing error");
 
         let evs = run(&[chunk(json!({"content": "cut"}), None, true)]);
-        assert_eq!(evs.last().unwrap().0, "error");
+        assert_eq!(names(&evs), errored_after_text);
+
+        let mut s = MessagesStream::new(echo());
+        let mut raw = s.feed(chunk(call(Some("f"), "{"), None, true).as_bytes());
+        raw.extend(s.fail("upstream stream interrupted"));
+        assert_eq!(names(&events(&raw)), errored_after_text);
+    }
+
+    #[test]
+    fn done_completes_the_message_without_waiting_for_eof() {
+        let mut s = MessagesStream::new(echo());
+        let mut raw = s.feed(chunk(json!({"content": "OK"}), Some("stop"), true).as_bytes());
+        raw.extend(s.feed(b"data: [DONE]\n\n"));
+        assert!(s.is_terminal());
+        assert!(s.finish().is_empty());
+        let evs = events(&raw);
+        assert_eq!(evs.last().unwrap().0, "message_stop");
+        let md = &evs.iter().find(|(e, _)| e == "message_delta").unwrap().1;
+        assert_eq!(md["delta"]["stop_reason"], "end_turn");
+        assert_eq!(md["usage"], json!({"output_tokens": 1}));
     }
 
     #[test]
@@ -482,7 +553,7 @@ mod tests {
         ]);
         assert_eq!(evs[0].0, "message_start");
         let md = &evs.iter().find(|(e, _)| e == "message_delta").unwrap().1;
-        assert_eq!(md["usage"]["input_tokens"], 4);
+        assert_eq!(md["usage"], json!({"output_tokens": 1}));
     }
 
     /// The partial JSON each `tool_use` block received, in block order.
@@ -557,10 +628,12 @@ mod tests {
     }
 
     #[test]
-    fn a_string_error_keeps_its_message() {
-        let mut s = MessagesStream::new(echo());
-        let raw = s.feed(b"data: {\"error\": \"queue full\"}\n\n");
-        let (_, data) = events(&raw).pop().unwrap();
-        assert_eq!(data["error"]["message"], "queue full");
+    fn arguments_without_an_open_call_are_dropped() {
+        let evs = run(&[
+            chunk(json!({"content": "a"}), None, true),
+            chunk(call(None, r#"{"x":1}"#), Some("tool_calls"), true),
+        ]);
+        assert!(tool_inputs(&evs).is_empty());
+        assert_eq!(text_deltas(&evs), ["a"]);
     }
 }
