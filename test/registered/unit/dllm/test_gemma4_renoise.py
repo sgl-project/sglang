@@ -15,6 +15,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -98,7 +99,7 @@ class _FakeRunner:
         )
 
 
-class TestGemma4Renoise(unittest.TestCase):
+class TestGemma4Renoise(CustomTestCase):
     def _initialize(self, algorithm, batch, vocab_size=4, hidden_size=3):
         weight = torch.arange(vocab_size * hidden_size, dtype=torch.float32).view(
             vocab_size, hidden_size
@@ -435,10 +436,15 @@ class TestGemma4Renoise(unittest.TestCase):
         batch = _batch(["request"], 3, encoder=True)
 
         output = algorithm.run(runner, batch)
-        self.assertEqual(output, (marker, [], None, None, True))
+        self.assertIs(output.logits_output, marker)
+        self.assertEqual(output.block_tokens.numel(), 0)
+        self.assertTrue(output.can_run_cuda_graph)
 
         empty = _batch(["request"], 3, encoder=True, empty=True)
-        self.assertEqual(algorithm.run(runner, empty), (None, [], None, None, False))
+        empty_output = algorithm.run(runner, empty)
+        self.assertIsNone(empty_output.logits_output)
+        self.assertEqual(empty_output.block_tokens.numel(), 0)
+        self.assertFalse(empty_output.can_run_cuda_graph)
 
     def test_fdfo_mixes_fresh_and_carried_state(self):
         algorithm = Gemma4Renoise(
@@ -456,7 +462,7 @@ class TestGemma4Renoise(unittest.TestCase):
         runner = _FakeRunner()
         first_batch = _batch(["carried"], 2)
         first_output = algorithm.run(runner, first_batch)
-        self.assertEqual(first_output[2], [0])
+        self.assertEqual(first_output.block_done.tolist(), [False])
         carried = first_output[3][0]
         self.assertEqual(carried["step"], 2)
         carried_canvas = carried["current"].clone()
@@ -478,7 +484,7 @@ class TestGemma4Renoise(unittest.TestCase):
         observed_signal = record["self_conditioning"].view(2, 2, 3)
         torch.testing.assert_close(observed_signal[0], carried_signal)
         torch.testing.assert_close(observed_signal[1], torch.zeros_like(carried_signal))
-        self.assertEqual(mixed_output[2], [0, 0])
+        self.assertEqual(mixed_output.block_done.tolist(), [False, False])
         self.assertEqual([state["step"] for state in mixed_output[3]], [1, 2])
 
 

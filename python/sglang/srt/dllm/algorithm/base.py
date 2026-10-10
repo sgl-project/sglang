@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, List, NamedTuple, Optional, Tuple, Union
 
 import torch
 
@@ -17,13 +17,15 @@ if TYPE_CHECKING:
 
 _is_npu = is_npu()
 
-DllmRunOutput = Tuple[
-    Union[LogitsProcessorOutput, torch.Tensor],
-    List,
-    Optional[List[int]],
-    Optional[List[Any]],
-    bool,
-]
+
+class DllmRunOutput(NamedTuple):
+    logits_output: Union[LogitsProcessorOutput, torch.Tensor]
+    block_tokens: torch.Tensor  # [batch_size, block_size]
+    block_done: Optional[
+        torch.Tensor
+    ]  # [batch_size] bool; FDFO only, true means block KV is ready to commit.
+    algo_states: Optional[List[Any]]
+    can_run_cuda_graph: bool
 
 
 class DllmAlgorithm:
@@ -107,14 +109,15 @@ class DllmAlgorithm:
     ) -> DllmRunOutput:
         batch_size = forward_batch.batch_size
         start_list = self._block_start_list(forward_batch)
+        block_tokens = forward_batch.input_ids.view(batch_size, self.block_size)
         states = self.init_step_state(forward_batch)
         self.prepare_inputs(model_runner, forward_batch, states)
 
         out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
-        # No mask to denoise: return empty so process_batch_result_dllm skips the
-        # stream branch (matches the pre-refactor behavior).
         if all(start == self.block_size for start in start_list):
-            return out.logits_output, [], None, None, out.can_run_graph
+            return DllmRunOutput(
+                out.logits_output, block_tokens.clone(), None, None, out.can_run_graph
+            )
 
         # The first forward has planned the fixed canvas's attention metadata.
         if _is_npu or (self.reuse_forward_metadata and out.can_run_graph):
@@ -126,11 +129,9 @@ class DllmAlgorithm:
             self.prepare_inputs(model_runner, forward_batch, states)
             out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
 
-        next_token_ids = forward_batch.input_ids.view(batch_size, self.block_size)
-        next_token_ids_list = [
-            next_token_ids[i, start_list[i] :] for i in range(batch_size)
-        ]
-        return out.logits_output, next_token_ids_list, None, None, out.can_run_graph
+        return DllmRunOutput(
+            out.logits_output, block_tokens.clone(), None, None, out.can_run_graph
+        )
 
     def _run_fdfo(
         self,
@@ -155,17 +156,12 @@ class DllmAlgorithm:
         self.prepare_inputs(model_runner, forward_batch, states)
         out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
         done = self.step(forward_batch, out.logits_output.full_logits, states)
+        done = torch.as_tensor(
+            done, dtype=torch.bool, device=forward_batch.input_ids.device
+        )
+        # Clone so a later in-place step cannot race the async D2H of this result.
+        block_tokens = forward_batch.input_ids.view(batch_size, self.block_size).clone()
 
-        accept_length_per_req_cpu = [self.block_size if d else 0 for d in done]
-        next_token_ids_list = forward_batch.input_ids.view(
-            batch_size, self.block_size
-        ).tolist()
-        states_out = [None if done[i] else states[i] for i in range(batch_size)]
-
-        return (
-            out.logits_output,
-            next_token_ids_list,
-            accept_length_per_req_cpu,
-            states_out,
-            out.can_run_graph,
+        return DllmRunOutput(
+            out.logits_output, block_tokens, done, states, out.can_run_graph
         )

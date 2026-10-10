@@ -2,7 +2,7 @@
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 import torch
 
@@ -555,14 +555,56 @@ class TestJointThresholdInDelTermination(CustomTestCase):
         self.assertEqual(batch.input_ids.view(2, 3)[1].tolist(), [3, 6, 4])
 
 
+class TestJointThresholdInDelSync(CustomTestCase):
+    def test_sync_prompt_only_block_runs_one_forward(self):
+        algorithm = JointThresholdInDel(make_config(block_size=3))
+        batch = make_batch([[3, 4, 5]])
+        forward_inputs = []
+
+        def forward(forward_batch, pp_proxy_tensors=None):
+            forward_inputs.append(forward_batch.input_ids.tolist())
+            return make_model_output(make_logits([[3], [4], [5]]))
+
+        result = algorithm.run(SimpleNamespace(forward=forward), batch)
+
+        self.assertEqual(result.block_tokens.tolist(), [[3, 4, 5]])
+        self.assertIsNone(result.block_done)
+        self.assertIsNone(result.algo_states)
+        self.assertEqual(forward_inputs, [[3, 4, 5]])
+
+    def test_sync_cleanup_persists_final_tokens_before_returning(self):
+        algorithm = JointThresholdInDel(
+            make_config(block_size=3, max_post_edit_steps=0)
+        )
+        batch = make_batch([[3, MASK, 4]])
+        forward_inputs = []
+        logits = iter(
+            [
+                make_logits([[3], [SPLIT, 6], [DELETE, 7]]),
+                make_logits([[3], [6], [7]]),
+            ]
+        )
+
+        def forward(forward_batch, pp_proxy_tensors=None):
+            forward_inputs.append(forward_batch.input_ids.tolist())
+            return make_model_output(next(logits))
+
+        result = algorithm.run(SimpleNamespace(forward=forward), batch)
+
+        self.assertEqual(result.block_tokens.tolist(), [[3, 6, 7]])
+        self.assertIsNone(result.block_done)
+        self.assertIsNone(result.algo_states)
+        self.assertEqual(forward_inputs, [[3, MASK, 4], [3, 6, 7]])
+
+
 class TestJointThresholdInDelFdfo(CustomTestCase):
     def test_fdfo_budget_zero_cleans_up_while_resolving_last_original_mask(self):
         algorithm = JointThresholdInDel(
             make_config(block_size=3, max_post_edit_steps=0, fdfo=True)
         )
-        model_runner = Mock()
-        model_runner.forward.side_effect = [
-            make_model_output(
+        forward_inputs = []
+        logits = iter(
+            [
                 make_logits(
                     [
                         [3],
@@ -572,76 +614,78 @@ class TestJointThresholdInDelFdfo(CustomTestCase):
                         [SPLIT, 6],
                         [DELETE, 7],
                     ]
-                )
-            ),
-            make_model_output(make_logits([[3], [6], [7]])),
-        ]
-
-        batch = make_batch([[3, 4, 5], [3, MASK, 4]])
-        _, next_token_ids, accept_lengths, algo_states, _ = algorithm.run(
-            model_runner, batch
+                ),
+                make_logits([[3], [6], [7]]),
+            ]
         )
 
-        self.assertEqual(accept_lengths, [3, 0])
-        self.assertIsNone(algo_states[0])
-        self.assertEqual(next_token_ids[1], [3, 6, 7])
-        surviving_state = algo_states[1]
+        def forward(forward_batch, pp_proxy_tensors=None):
+            forward_inputs.append(forward_batch.input_ids.tolist())
+            return make_model_output(next(logits))
+
+        model_runner = SimpleNamespace(forward=forward)
+        batch = make_batch([[3, 4, 5], [3, MASK, 4]])
+        result = algorithm.run(model_runner, batch)
+
+        self.assertEqual(result.block_done.tolist(), [True, False])
+        self.assertTrue(result.algo_states[0]["finished"])
+        self.assertEqual(result.block_tokens.tolist(), [[3, 4, 5], [3, 6, 7]])
+        surviving_state = result.algo_states[1]
         self.assertEqual(surviving_state["num_update_steps"], 1)
         self.assertEqual(surviving_state["post_edit_steps"], 0)
         self.assertTrue(surviving_state["finished"])
 
-        batch = make_batch([next_token_ids[1]])
-        _, next_token_ids, accept_lengths, algo_states, _ = algorithm.run(
-            model_runner, batch, [surviving_state]
-        )
+        batch = make_batch([result.block_tokens[1].tolist()])
+        result = algorithm.run(model_runner, batch, [surviving_state])
 
-        self.assertEqual(accept_lengths, [3])
-        self.assertEqual(next_token_ids, [[3, 6, 7]])
-        self.assertEqual(algo_states, [None])
-        self.assertEqual(model_runner.forward.call_count, 2)
+        self.assertEqual(result.block_done.tolist(), [True])
+        self.assertEqual(result.block_tokens.tolist(), [[3, 6, 7]])
+        self.assertIs(result.algo_states[0], surviving_state)
+        self.assertEqual(forward_inputs, [[3, 4, 5, 3, MASK, 4], [3, 6, 7]])
 
     def test_fdfo_budget_one_uses_first_post_edit_round_for_cleanup(self):
         algorithm = JointThresholdInDel(
             make_config(block_size=3, max_post_edit_steps=1, fdfo=True)
         )
-        model_runner = Mock()
-        model_runner.forward.side_effect = [
-            make_model_output(make_logits([[3], [6], [4]])),
-            make_model_output(make_logits([[3], [DELETE, 7], [SPLIT, 8]])),
-            make_model_output(make_logits([[3], [7], [8]])),
-        ]
-
-        batch = make_batch([[3, MASK, 4]])
-        _, next_token_ids, accept_lengths, algo_states, _ = algorithm.run(
-            model_runner, batch
+        forward_inputs = []
+        logits = iter(
+            [
+                make_logits([[3], [6], [4]]),
+                make_logits([[3], [DELETE, 7], [SPLIT, 8]]),
+                make_logits([[3], [7], [8]]),
+            ]
         )
 
-        self.assertEqual(accept_lengths, [0])
-        self.assertEqual(next_token_ids, [[3, 6, 4]])
-        state = algo_states[0]
+        def forward(forward_batch, pp_proxy_tensors=None):
+            forward_inputs.append(forward_batch.input_ids.tolist())
+            return make_model_output(next(logits))
+
+        model_runner = SimpleNamespace(forward=forward)
+        batch = make_batch([[3, MASK, 4]])
+        result = algorithm.run(model_runner, batch)
+
+        self.assertEqual(result.block_done.tolist(), [False])
+        self.assertEqual(result.block_tokens.tolist(), [[3, 6, 4]])
+        state = result.algo_states[0]
         self.assertEqual(state["post_edit_steps"], 0)
         self.assertFalse(state["finished"])
 
-        batch = make_batch(next_token_ids)
-        _, next_token_ids, accept_lengths, algo_states, _ = algorithm.run(
-            model_runner, batch, algo_states
-        )
+        batch = make_batch(result.block_tokens.tolist())
+        result = algorithm.run(model_runner, batch, result.algo_states)
 
-        self.assertEqual(accept_lengths, [0])
-        self.assertEqual(next_token_ids, [[3, 7, 8]])
-        self.assertIs(algo_states[0], state)
+        self.assertEqual(result.block_done.tolist(), [False])
+        self.assertEqual(result.block_tokens.tolist(), [[3, 7, 8]])
+        self.assertIs(result.algo_states[0], state)
         self.assertEqual(state["post_edit_steps"], 1)
         self.assertTrue(state["finished"])
 
-        batch = make_batch(next_token_ids)
-        _, next_token_ids, accept_lengths, algo_states, _ = algorithm.run(
-            model_runner, batch, algo_states
-        )
+        batch = make_batch(result.block_tokens.tolist())
+        result = algorithm.run(model_runner, batch, result.algo_states)
 
-        self.assertEqual(accept_lengths, [3])
-        self.assertEqual(next_token_ids, [[3, 7, 8]])
-        self.assertEqual(algo_states, [None])
-        self.assertEqual(model_runner.forward.call_count, 3)
+        self.assertEqual(result.block_done.tolist(), [True])
+        self.assertEqual(result.block_tokens.tolist(), [[3, 7, 8]])
+        self.assertIs(result.algo_states[0], state)
+        self.assertEqual(forward_inputs, [[3, MASK, 4], [3, 6, 4], [3, 7, 8]])
 
 
 class TestJointThresholdInDelAntiLoop(CustomTestCase):

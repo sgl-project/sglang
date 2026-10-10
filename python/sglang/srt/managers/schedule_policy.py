@@ -1027,8 +1027,27 @@ class PrefillAdder:
         if _rem_tokens <= 0:
             return AddReqResult.NO_TOKEN
 
-        # Truncate input length to available tokens and update request metadata
-        cand_extend_input_len = len(req.full_untruncated_fill_ids) - req.prefix_len
+        reuse_block = (
+            not self.dllm_config.requires_separate_context_encoding
+            and req.kv.holds_kv
+            and not req.dllm_block_done
+        )
+        if (
+            not self.dllm_config.requires_separate_context_encoding
+            and req.dllm_block_done
+        ):
+            cand_extend_input_len = (
+                len(req.origin_input_ids)
+                + len(req.output_ids)
+                + self.dllm_config.block_size
+                - req.prefix_len
+            )
+        else:
+            cand_extend_input_len = (
+                req.extend_end - req.prefix_len
+                if reuse_block
+                else len(req.full_untruncated_fill_ids) - req.prefix_len
+            )
         if (
             self.dllm_config.requires_separate_context_encoding
             and req.is_dllm_prefill()
@@ -1038,7 +1057,8 @@ class PrefillAdder:
                 req.dllm_block_offset - req.prefix_len,
             )
         if (
-            req.dllm_incomplete_ids
+            reuse_block
+            or req.dllm_incomplete_ids
             or (
                 self.dllm_config.requires_separate_context_encoding
                 and not req.is_dllm_prefill()
