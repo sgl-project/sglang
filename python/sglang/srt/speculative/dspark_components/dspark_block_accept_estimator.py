@@ -816,22 +816,16 @@ class BlockAcceptEstimateRecorder:
         warn_once(self._warned_skip_reasons, reason=reason)
 
 
-def block_accept_recording_enabled() -> bool:
-    """Whether rank 0 records block accept estimates; the same on every rank."""
-    return (
-        bool(envs.SGLANG_DSPARK_BLOCK_ACCEPT_ESTIMATE_PATH.get())
-        or envs.SGLANG_DSPARK_BLOCK_ACCEPT_ONLINE_INTERVAL.get() > 0
-    )
-
-
 def create_block_accept_estimate_recorder(
     *, gamma: int, device: Union[str, torch.device], tp_rank: int
 ) -> Optional[BlockAcceptEstimateRecorder]:
-    if tp_rank != 0 or not block_accept_recording_enabled():
+    if tp_rank != 0:
         return None
 
     path = envs.SGLANG_DSPARK_BLOCK_ACCEPT_ESTIMATE_PATH.get()
     online_log_interval = envs.SGLANG_DSPARK_BLOCK_ACCEPT_ONLINE_INTERVAL.get()
+    if not path and online_log_interval <= 0:
+        return None
 
     return BlockAcceptEstimateRecorder(
         path=path,
