@@ -86,7 +86,6 @@ def _staged_fixture(full_match=2):
         entry_map={
             PoolName.SWA: SimpleNamespace(
                 host_pool=SimpleNamespace(free=Mock()),
-                device_indices_from_anchor_fn=None,
             )
         },
     )
