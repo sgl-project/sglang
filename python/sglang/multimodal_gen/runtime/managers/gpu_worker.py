@@ -37,6 +37,9 @@ from sglang.multimodal_gen.runtime.distributed import (
 from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a import (
     IPC_A2A,
 )
+from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a_multi import (
+    IPC_A2A_MULTI,
+)
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_cfg_group,
     get_classifier_free_guidance_rank,
@@ -559,6 +562,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         # request boundary: the IPC watchdog flag is a device read, illegal
         # inside a graph capture and too costly per exchange
         IPC_A2A.check_timeout()
+        IPC_A2A_MULTI.check_timeout()
         if len(batch) > 1:
             if return_req:
                 raise ValueError(
@@ -1210,6 +1214,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         from sglang.multimodal_gen.runtime.layers.usp import drop_a2a_staging_buffers
 
         IPC_A2A.drop_staging()
+        IPC_A2A_MULTI.drop_staging()
         drop_a2a_staging_buffers()
         torch.get_device_module().empty_cache()
 

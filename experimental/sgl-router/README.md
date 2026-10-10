@@ -171,9 +171,20 @@ sgl-router --model-id qwen3 --worker-urls http://localhost:30001 \
 
 Reorg supports `power_of_two` (its default), `cache_aware`, and `session_aware`.
 Discovery supplies the plain or PD workers; decode uses power-of-two. Cache
-settings, external indexers, session headers/timeouts, and `--filter overloaded`
-with `--max-in-flight` retain their existing flags. `--max-kv-usage 0.95` rejects
-an engine whose KV tokens have reached 95% of its capacity.
+settings, external indexers and session headers/timeouts retain their existing
+flags. Admission flags set the default per-engine caps; an engine at a cap is
+skipped, and affinity falls back to the others:
+
+| Flag | Rejects an engine at |
+|---|---|
+| `--max-in-flight N` | `N` requests this router has in flight to it (no `--filter overloaded` needed) |
+| `--max-waiting-requests N` | `N` engine-reported waiting requests |
+| `--max-pending-prefill-tokens N` | `N` engine-reported waiting uncached tokens |
+| `--max-running-usage F` | share `F` of its reported running-request capacity |
+| `--max-kv-usage F` | share `F` of its reported KV capacity |
+
+Engine-reported caps lag by one load report, so a burst can pass them; the
+router-local `--max-in-flight` counts dispatches as they happen.
 Unsupported legacy options fail at startup.
 
 `--bucket-config buckets.json` replaces the default plain and P/D buckets. Each
@@ -399,16 +410,15 @@ text, as does any model whose template fails to load or render.
 
 Some chats additionally forward the rendered tokens to the engine as
 `input_ids`, retaining the original messages, so the engine skips
-re-tokenizing. How many depends on the model's renderer. DeepSeek-V4's native
-encoder is fixture-verified against SGLang's request normalization, so it
-forwards every chat except multimodal ones and those with caller-provided
-`input_ids`. Renderers without that verification (HF Jinja templates, Kimi-K3)
+re-tokenizing. How many depends on the model's renderer. DeepSeek-V4's and
+V4.1's native encoders are fixture-verified against SGLang's request
+normalization, so they forward every chat except multimodal ones and those with
+caller-provided `input_ids`. Renderers without that verification (HF Jinja templates, Kimi-K3)
 forward only plain text chat requests (string `content`, no tools, no template
 kwargs or reasoning controls or historical `reasoning_content`, no assistant
 continuation, no consecutive users or non-leading system turns) and warn
 `UNVERIFIED` at startup; every other request shape is rendered for routing
-only. DeepSeek-V4.1 forwards nothing — its renderer is not verified against
-current SGLang — while routing tokenization keeps working.
+only.
 
 Use matching model files on the router and workers, and set
 the same `--default-chat-template-kwargs`, `SGLANG_DEFAULT_THINKING`,
@@ -498,13 +508,17 @@ own route as sent: workers that disagree on those args or never
 reported them, `--completion-template`, `return_hidden_states` and other
 `sglext` outputs, `echo` or `logprobs` without a router tokenizer, and bodies
 SGLang would reject. Chat also needs a renderer verified against SGLang (the
-`AllText` scope, DeepSeek-V4 today), router `--default-chat-template-kwargs`
+`AllText` scope, DeepSeek-V4 and V4.1 today), router `--default-chat-template-kwargs`
 equal to the workers', a reasoning parser the processor reproduces
-(`deepseek-v4`) or none, and no tools or media yet.
+(`deepseek-v4`, `deepseek-v41`) or none, and no media yet. Tools are served with `tool_choice`
+`auto` or `none`, non-strict, with standard JSON-schema types, and a tool
+parser the processor reproduces (`deepseekv4`, `deepseekv41`); `required`, named and strict
+tools take a constraint from the engine's xgrammar, so they go to the engine.
 The router reads the model's `config.json` and `generation_config.json` beside
 `--tokenizer-path` (or from the HF repo), as the engine reads them, so a local
-path should point into the model's directory. `sgl_router_openai_route_total`
-counts each outcome.
+path should point into the model's directory. Engine env vars that change the
+layer (`SGLANG_TOOL_STRICT_LEVEL`, `SGLANG_FORWARD_UNKNOWN_TOOLS`) are taken as
+unset. `sgl_router_openai_route_total` counts each outcome.
 
 ## Embeddings
 
@@ -533,9 +547,9 @@ forwarded as sent, since the engine renders and tokenizes each query-document
 pair. Routing is on load, with each pair's size estimated from its text. As for
 embeddings, a PD fleet answers 400 and `--dp-aware` pins no rank.
 
-## DeepSeek V4
+## DeepSeek V4 and V4.1
 
-Native V4 rendering comes from `rust/sglang-processor`, shared with SGLang's Rust
+Native V4 and V4.1 rendering comes from `rust/sglang-processor`, shared with SGLang's Rust
 server, and follows SGLang's serving path (`serving_chat.py`), not Dynamo's
 OpenAI defaults: all declared tools are rendered with SGLang's schema
 defaults, reasoning effort comes from `reasoning` / `reasoning_effort`, and the
@@ -544,12 +558,9 @@ official/preview effort profile is detected from the checkpoint's
 `config.json`, as in SGLang. Reference prompts live in `tests/fixtures/deepseek/`
 and are regenerated by `tests/scripts/generate_deepseek_parity.py`.
 
-V4.1 Flash uses Dynamo's separate V4.1 encoder with SGLang's numeric reasoning
-budgets, tool payloads, and `<｜System｜>` markers — for routing tokenization
-only, since V4.1 never forwards `input_ids`. Developer messages and media are
-left to the worker (the pinned encoder renders them differently), and a
-non-default `SGLANG_DSV41_REASONING_EFFORT` still matters for cache-aware
-routing-hash parity.
+V4.1 Flash uses Dynamo's V4.1 encoder with SGLang's numeric reasoning budgets
+and tool payloads. Developer messages and media are left to the worker, since
+the encoder renders them differently.
 
 ## Kimi-K3
 

@@ -88,6 +88,17 @@ def _usp_all_to_all_single(x: torch.Tensor, role: str | None = None) -> torch.Te
     assert ulysses_pg is not None, "Ulysses process group is not initialized."
     x_shape = x.shape
     x = x.flatten().contiguous()
+    if x.is_cuda:
+        from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a_multi import (
+            IPC_A2A_MULTI,
+            ipc_a2a_multi_ready,
+        )
+
+        if ipc_a2a_multi_ready(ulysses_pg):
+            world_size = torch.distributed.get_world_size(group=ulysses_pg)
+            received = IPC_A2A_MULTI.exchange(x.view(world_size, -1))
+            if received is not None:
+                return received.view(x_shape)
     if role is None:
         output = torch.empty_like(x)
     else:
