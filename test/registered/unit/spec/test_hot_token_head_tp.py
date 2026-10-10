@@ -5,7 +5,10 @@ import unittest
 
 import torch
 
-from sglang.srt.speculative.eagle_worker_v2 import slice_hot_token_head
+from sglang.srt.speculative.eagle_worker_v2 import (
+    check_hot_token_head_indexable,
+    slice_hot_token_head,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
@@ -73,6 +76,11 @@ class TestSliceHotTokenHead(unittest.TestCase):
         hot = torch.arange(0, 60)
         with self.assertRaises(ValueError):
             slice_hot_token_head(hot, _fake_lm_head(2, 0, 50, 70))
+
+    def test_block_quantized_head_rejected(self):
+        check_hot_token_head_indexable(torch.zeros(4, 8, dtype=torch.bfloat16))
+        with self.assertRaises(ValueError):
+            check_hot_token_head_indexable(torch.zeros(4, 4, dtype=torch.uint8))
 
 
 if __name__ == "__main__":

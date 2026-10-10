@@ -345,6 +345,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         else:
             if self.hot_token_id is not None and head is not None:
+                check_hot_token_head_indexable(head)
                 head = head.clone()
                 local_rows, self.hot_token_id = slice_hot_token_head(
                     self.hot_token_id.to(head.device), target_lm_head
@@ -1229,6 +1230,21 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             next_draft_input.dsa_topk_indices = dsa_seed_topk_indices
         next_draft_input.cuda_graph_compatible = not (
             self.seed_dsa_topk_from_draft_extend and dsa_seed_topk_indices is None
+        )
+
+
+def check_hot_token_head_indexable(head: torch.Tensor) -> None:
+    """Reject lm_heads whose rows cannot be selected by plain indexing.
+
+    A block-quantized lm_head (e.g. a ModelOpt NVFP4 linear: packed uint8
+    weight plus per-block scales) stores no per-token float rows, so
+    ``head.data[rows]`` would silently bind packed bytes as the draft head.
+    """
+    if not head.is_floating_point():
+        raise ValueError(
+            "--speculative-token-map needs a floating-point lm_head to select "
+            f"rows from, but the shared lm_head weight is {head.dtype} "
+            "(block-quantized). Drop --speculative-token-map for this checkpoint."
         )
 
 
