@@ -91,9 +91,9 @@ def _worker() -> int:
         if not torch.equal(nccl_out, ipc_out):
             failures.append(f"output a2a {(b, s_local, h_global, d)}")
 
-    # AllToAll4D is a second entry point (stacked-qkv UlyssesAttention: zimage's
-    # secondary attention, wan-VSA, hunyuanvideo) and routes through the same
-    # exchange, so it needs its own parity check.
+    # AllToAll4D is a second entry point (stacked-qkv UlyssesAttention, used by
+    # wan-VSA) and routes through the same exchange, so it needs its own parity
+    # check.
     from sglang.multimodal_gen.runtime.distributed.communication_op import (
         sequence_model_parallel_all_to_all_4D as all_to_all_4D,
     )
@@ -101,6 +101,7 @@ def _worker() -> int:
     # count exchanges, not staging keys: the key is (n_local, n_peer, dtype),
     # so these shapes reuse the buffers the earlier arms already allocated
     calls_before_a2a4d = IPC_A2A.calls
+    flag_before_a2a4d = IPC_A2A.flag
     for b, s_local, h_global, d in shapes:
         torch.manual_seed(4321)
         for scatter_dim in (1, 2):
@@ -133,8 +134,11 @@ def _worker() -> int:
                 )
 
     # A parity check that never reached the IPC branch would pass while proving
-    # nothing, so require that exchanges actually happened.
-    if IPC_A2A.calls == calls_before_a2a4d:
+    # nothing, so require that exchanges actually happened. A re-init restarts
+    # the count, so rule it out first.
+    if IPC_A2A.flag is not flag_before_a2a4d:
+        failures.append("AllToAll4D re-initialized the IPC transport USP set up")
+    elif IPC_A2A.calls == calls_before_a2a4d:
         failures.append(
             f"AllToAll4D never took the IPC path (exchange count stayed at "
             f"{calls_before_a2a4d})"

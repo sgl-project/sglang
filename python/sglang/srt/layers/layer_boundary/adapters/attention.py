@@ -26,6 +26,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layer_boundary.layout import (
+    batches_are_unpadded,
     is_dense_ffn_fully_dp,
 )
 from sglang.srt.layers.moe import get_moe_a2a_backend
@@ -158,10 +159,21 @@ def get_attn_tp_context():
     return ATTN_TP_CONTEXT
 
 
-def attn_tp_gather(tensor: torch.Tensor) -> torch.Tensor:
-    gathered = get_local_dp_buffer(
-        get_parallel().attn_tp_group, hidden_size=tensor.shape[-1]
-    )
+def attn_tp_gather(tensor: torch.Tensor, *, owned: bool = False) -> torch.Tensor:
+    """Gather this rank's attention-TP slice of the rows into all of them: in
+    the local DP buffer, or in a buffer of its own for an output that
+    outlives the next use of that buffer (``owned``)."""
+    parallel = get_parallel()
+    if owned or batches_are_unpadded():
+        # MLP sync, which sizes the local DP buffer for a batch, does not run
+        # for an unpadded one.
+        gathered = tensor.new_empty(
+            (tensor.shape[0] * parallel.attn_tp_size, tensor.shape[-1])
+        )
+    else:
+        gathered = get_local_dp_buffer(
+            parallel.attn_tp_group, hidden_size=tensor.shape[-1]
+        )
     attn_tp_all_gather_into_tensor(gathered, tensor)
     return gathered
 

@@ -51,6 +51,7 @@ from sglang.srt.models.glm4v import (
     Glm4vVisionMLP,
     Glm4vVisionModel,
     Glm4vVisionPatchEmbed,
+    glm4v_vision_reduces_over_attn_tp,
 )
 from sglang.srt.runtime_context import get_mm, get_parallel
 from sglang.srt.utils import add_prefix
@@ -98,6 +99,9 @@ class GlmOcrVisionBlock(nn.Module):
             prefix=add_prefix("attn", prefix),
             num_dummy_heads=num_dummy_heads,
             use_data_parallel=use_data_parallel,
+            use_dp_attention_reduce=glm4v_vision_reduces_over_attn_tp(
+                use_data_parallel
+            ),
         )
         self.mlp = GlmOcrVisionMLP(
             dim,

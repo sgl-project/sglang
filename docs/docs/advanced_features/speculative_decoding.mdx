@@ -413,6 +413,14 @@ For stochastic EAGLE, EAGLE3, or NEXTN decoding on NVIDIA CUDA or AMD ROCm, add
 with `--speculative-eagle-topk 1`. The draft model must produce a full target-vocabulary
 proposal distribution, as required by the existing rejection sampler.
 
+The same flag applies to the DFlash family (`DFLASH` and `DSPARK`) on CUDA or ROCm
+when the draft samples its proposals: DSpark drafts, DFlash checkpoints with a
+candidate selector, and [LiLiCorr](#lilicorr-reranked-dflash-drafts) drafts with
+`SGLANG_ENABLE_LILICORR_SAMPLING=1`. These paths already publish their proposal
+distribution, so `--speculative-use-rejection-sampling` is not needed. A DFlash draft
+that proposes greedy tokens is a point mass, where block and token-wise verification
+accept the same prefixes; the server warns that the flag has no effect.
+
 [Block verification](https://arxiv.org/abs/2403.10444) checks every draft prefix and
 keeps the longest accepted prefix, including when an earlier prefix was rejected.
 It uses a corresponding correction distribution to preserve target sampling.

@@ -29,8 +29,8 @@ on:
         value: ${{ jobs.run.outputs.multimodal_gen }}
       renderer:
         value: ${{ jobs.run.outputs.renderer }}
-      rust_workspace:
-        value: ${{ jobs.run.outputs.rust_workspace }}
+      server_args_docs:
+        value: ${{ jobs.run.outputs.server_args_docs }}
       partitions:
         value: ${{ jobs.run.outputs.partitions }}
       partition_model_sha:
@@ -53,7 +53,7 @@ jobs:
       jit_kernel: ${{ steps.filter.outputs.jit_kernel || steps.run-mode.outputs.run_all_tests }}
       multimodal_gen: ${{ steps.filter.outputs.multimodal_gen || steps.run-mode.outputs.run_all_tests }}
       renderer: ${{ steps.filter.outputs.renderer || steps.run-mode.outputs.run_all_tests }}
-      rust_workspace: ${{ steps.filter.outputs.rust_workspace || steps.run-mode.outputs.run_all_tests }}
+      server_args_docs: ${{ steps.filter.outputs.server_args_docs || steps.run-mode.outputs.run_all_tests }}
       partitions: ${{ steps.partitions.outputs.partitions }}
       partition_model_sha: ${{ steps.partition-model-sha.outputs.sha }}
       runs_on_map: ${{ steps.runner-map.outputs.runs_on_map }}
@@ -94,17 +94,40 @@ jobs:
               - "python/pyproject.toml"
               - "python/setup.py"
               - "python/sglang/!(multimodal_gen|kernels)/**/!(*.md)"
-              - "python/sglang/kernels/!(*.md)"
-              - "python/sglang/kernels/!(aot)/**/!(*.md)"
+              # Diffusion-only kernels and tests are left to multimodal_gen and
+              # jit_kernel; ops/diffusion/common stays since srt imports it via kda_kernels.
+              - "python/sglang/kernels/{,ops/,jit/,jit/csrc/}!(*.md)"
+              - "python/sglang/kernels/!(aot|ops|jit)/**/!(*.md)"
+              - "python/sglang/kernels/jit/!(csrc)/**/!(*.md)"
+              - "python/sglang/kernels/{ops,jit/csrc}/!(diffusion)/**/!(*.md)"
+              - "python/sglang/kernels/ops/diffusion/common/**/!(*.md)"
               - "scripts/ci/cuda/*"
               - "scripts/ci/utils/*"
-              - "test/**/!(*.md)"
-              - "rust/*"
-              - "rust/!(sglang-renderer|sglang-processor)/**"
+              - "test/{,registered/,registered/kernels/}!(*.md)"
+              - "test/!(registered)/**/!(*.md)"
+              - "test/registered/!(kernels|unit|e2e)/**/!(*.md)"
+              - "test/registered/kernels/!(ops|benchmark)/**/!(*.md)"
+              - "test/registered/{kernels/ops,kernels/benchmark,unit,e2e}/!(*.md)"
+              - "test/registered/{kernels/ops,kernels/benchmark,unit,e2e}/!(diffusion)/**/!(*.md)"
+              # rust/Cargo.lock is shared by the whole workspace, so renderer-only
+              # dependency edits rewrite it too; it gates the renderer filter
+              # instead. A dependency change for a shipped crate also edits its
+              # Cargo.toml, which still matches here. `/**/*` (not `/**`) keeps
+              # the per-crate glob from matching rust/Cargo.lock itself.
+              - "rust/!(Cargo.lock)"
+              - "rust/!(sglang-renderer|sglang-processor)/**/*"
               - "proto/**"
             renderer:
               - "rust/sglang-renderer/**"
               - "rust/sglang-processor/**"
+              - "rust/Cargo.lock"
+            server_args_docs:
+              # test_server_args_docs_coverage.py diffs this doc and its allowlist
+              # against the CLI, so a docs only edit can break that test. Kept out
+              # of main_package which also gates every GPU stage. Only the CPU
+              # stage reads this.
+              - "docs/docs/advanced_features/server_arguments.mdx"
+              - "docs/docs/advanced_features/server_arguments_undocumented.txt"
             simulator:
               - ".github/workflows/pr-test-extra.yml"
               - ".github/workflows/_pr-test-simulator-cpu.yml"
@@ -118,9 +141,11 @@ jobs:
               - "python/sglang/srt/model_executor/runner_backend_utils/breakable_cuda_graph/**"
               - "python/sglang/srt/observability/**"
               - "python/sglang/kernels/ops/diffusion/**"
+              - "python/sglang/kernels/jit/csrc/diffusion/**"
               - "test/registered/kernels/ops/diffusion/**"
               - "test/registered/kernels/benchmark/diffusion/**"
               - "test/registered/unit/diffusion/**"
+              - "test/registered/e2e/diffusion/**"
               - "python/sglang/cli/**"
             jit_kernel:
               - ".github/workflows/pr-test.yml"
@@ -135,13 +160,6 @@ jobs:
               # Intentionally excludes ".github/workflows/pr-test-sgl-kernel.yml" —
               # see API-side detector below for rationale.
               - "python/sglang/kernels/aot/**/!(*.md|THIRDPARTYNOTICES.txt|LICENSE)"
-            rust_workspace:
-              # Gates the cargo test in test/registered/rust/; exported to the
-              # CPU stage as its negation, SGLANG_SKIP_RUST_TESTS.
-              - "rust/**"
-              - "proto/**"
-              - "test/registered/rust/**"
-              - ".github/workflows/_pr-test-*.yml"
 
       - name: Resolve CI labels
         id: ci-labels
@@ -258,7 +276,7 @@ jobs:
             echo "| sgl_kernel        | ${{ steps.filter.outputs.sgl_kernel }} |"
             echo "| jit_kernel        | ${{ steps.filter.outputs.jit_kernel || steps.run-mode.outputs.run_all_tests }} |"
             echo "| multimodal_gen    | ${{ steps.filter.outputs.multimodal_gen || steps.run-mode.outputs.run_all_tests }} |"
-            echo "| rust_workspace    | ${{ steps.filter.outputs.rust_workspace || steps.run-mode.outputs.run_all_tests }} |"
+            echo "| server_args_docs  | ${{ steps.filter.outputs.server_args_docs || steps.run-mode.outputs.run_all_tests }} |"
             echo "| b200_runner       | ${{ steps.set-runner.outputs.b200_runner }} |"
             echo "| enable_retry      | ${{ steps.set-retry.outputs.enable_retry }} |"
             echo "| continue_on_error | ${{ steps.set-continue-on-error.outputs.continue_on_error }} |"

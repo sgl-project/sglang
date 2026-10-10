@@ -62,12 +62,6 @@ class CubeSparseAttentionMetadata(AttentionMetadata):
 
 
 class CubeSparseAttentionMetadataBuilder(AttentionMetadataBuilder):
-    def __init__(self):
-        pass
-
-    def prepare(self):
-        pass
-
     def build(  # type: ignore[override]
         self,
         *,

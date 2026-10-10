@@ -19,6 +19,7 @@ from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
+    LinearParallelGroup,
     MergedColumnParallelLinear,
     QKVParallelLinear,
     ReplicatedLinear,
@@ -67,6 +68,8 @@ class Step3p5MLP(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         reduce_results: bool = True,
+        *,
+        parallel_group: LinearParallelGroup = "tp",
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -76,6 +79,7 @@ class Step3p5MLP(nn.Module):
             [intermediate_size] * 2,
             bias=False,
             quant_config=quant_config,
+            parallel_group=parallel_group,
             prefix=add_prefix("gate_up_proj", prefix),
         )
         self.down_proj = RowParallelLinear(
@@ -83,6 +87,7 @@ class Step3p5MLP(nn.Module):
             hidden_size,
             bias=False,
             quant_config=quant_config,
+            parallel_group=parallel_group,
             prefix=add_prefix("down_proj", prefix),
             reduce_results=reduce_results,
         )
@@ -287,7 +292,6 @@ class Step3p5Attention(nn.Module):
         super().__init__()
         self.hidden_size = hidden_size
         self.total_num_heads = num_heads
-        attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
 
         assert self.total_num_heads % attn_tp_size == 0
@@ -318,8 +322,7 @@ class Step3p5Attention(nn.Module):
             self.total_num_kv_heads,
             bias=False,
             quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             prefix=add_prefix("qkv_proj", prefix),
         )
         self.o_proj = RowParallelLinear(
@@ -327,8 +330,7 @@ class Step3p5Attention(nn.Module):
             hidden_size,
             bias=False,
             quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             reduce_results=False,
             prefix=add_prefix("o_proj", prefix),
         )
@@ -339,8 +341,7 @@ class Step3p5Attention(nn.Module):
                 hidden_size,
                 self.total_num_heads,
                 bias=False,
-                tp_rank=attn_tp_rank,
-                tp_size=attn_tp_size,
+                parallel_group="attn_tp",
                 prefix=add_prefix("g_proj", prefix),
             )
 
@@ -490,7 +491,7 @@ class Step3p5DecoderLayer(nn.Module):
                 prefix=add_prefix("share_expert", prefix),
                 reduce_results=False,
                 **(
-                    dict(tp_rank=0, tp_size=1)
+                    dict(parallel_group="replicated")
                     if get_moe_a2a_backend().is_deepep()
                     or get_moe_a2a_backend().is_mooncake()
                     or get_moe_a2a_backend().is_nixl()

@@ -127,9 +127,7 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
                 post_warmup_hook()
 
         graph = BreakableCUDAGraph(self.deduped_cuda_graph)
-        captured_fn = (
-            eager_on_graph(True)(forward_fn) if self._debug_eager else forward_fn
-        )
+        captured_fn = eager_on_graph(forward_fn) if self._debug_eager else forward_fn
         size = shape_key.size
         if self._shared_output_buffer is None:
             capacity_rows = self._cuda_graph_runner.cuda_graph_output_capacity_rows(

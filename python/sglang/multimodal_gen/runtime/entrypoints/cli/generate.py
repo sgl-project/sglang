@@ -215,16 +215,6 @@ class GenerateSubcommand(CLISubcommand):
     def __init__(self) -> None:
         self.name = "generate"
         super().__init__()
-        self.init_arg_names = self._get_init_arg_names()
-        self.generation_arg_names = self._get_generation_arg_names()
-
-    def _get_init_arg_names(self) -> list[str]:
-        """Get names of arguments for DiffGenerator initialization"""
-        return ["num_gpus", "tp_size", "sp_size", "model_path"]
-
-    def _get_generation_arg_names(self) -> list[str]:
-        """Get names of arguments for generate_video method"""
-        return [field.name for field in dataclasses.fields(SamplingParams)]
 
     def cmd(
         self, args: argparse.Namespace, unknown_args: list[str] | None = None

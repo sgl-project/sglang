@@ -344,6 +344,20 @@ for _fn in ("softcap_out", "softcap_inplace_logits"):
 del _fn
 
 
+register_kernel(
+    KernelSpec(
+        op="activation.softcap_to_float32_logits",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.activation.softcap:softcap_to_float32_logits",
+        capabilities=_CUDA,
+        format_signature=FormatSignature(
+            supported_dtypes=("float16", "bfloat16", "float32"),
+            description="Softcap logits into a caller-provided FP32 output.",
+        ),
+    )
+)
+
+
 # Kernels introduced with Kimi-K3, inventoried by logical operator group.
 register_kernel(
     KernelSpec(

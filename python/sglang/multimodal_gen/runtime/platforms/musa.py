@@ -85,15 +85,6 @@ class MusaPlatformBase(Platform):
         raise NotImplementedError
 
     @classmethod
-    def get_device_name(cls, device_id: int = 0) -> str:
-        raise NotImplementedError
-
-    @classmethod
-    @lru_cache(maxsize=1)
-    def get_device_total_memory(cls, device_id: int = 0) -> int:
-        raise NotImplementedError
-
-    @classmethod
     def is_async_output_supported(cls, enforce_eager: bool | None) -> bool:
         if enforce_eager:
             logger.warning(

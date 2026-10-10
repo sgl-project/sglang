@@ -398,7 +398,11 @@ class DiffGenerator:
                         save_outputs(
                             output_batch.output,
                             requests[0].data_type,
-                            requests[0].fps,
+                            (
+                                output_batch.fps
+                                if output_batch.fps is not None
+                                else requests[0].fps
+                            ),
                             requests[0].save_output,
                             lambda idx: output_requests[idx].output_file_path(),
                             audio=output_batch.audio,

@@ -313,7 +313,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         req = SimpleNamespace(
             rid="r",
             cache_request_handle=handle,
-            prefix_indices=_indices(0, 0),
+            prefix_len=0,
             kv=SimpleNamespace(cache_protected_len=0),
         )
         self.assertTrue(pipeline.prepare_staged_prefetch(req))
@@ -329,7 +329,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         req = SimpleNamespace(
             rid="r",
             cache_request_handle=handle,
-            prefix_indices=_indices(0, 0),
+            prefix_len=0,
             kv=SimpleNamespace(cache_protected_len=0),
         )
         self.assertTrue(pipeline.prepare_staged_prefetch(req))

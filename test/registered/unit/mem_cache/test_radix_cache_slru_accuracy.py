@@ -117,7 +117,7 @@ class TestSLRUAccuracy(unittest.TestCase):
         )
 
         # Check if the tensor is empty, which indicates the key was not found (evicted)
-        is_frequent_key_present = frequent_match_result.device_indices.numel() > 0
+        is_frequent_key_present = frequent_match_result.device_prefix_len > 0
         self.assertTrue(
             is_frequent_key_present,
             "Frequently accessed key should still be in cache after evictions",
@@ -126,7 +126,7 @@ class TestSLRUAccuracy(unittest.TestCase):
         # Verify the first low-frequency key has been evicted
         # The device_indices tensor should be empty when the key is not found
         is_first_low_freq_key_present = (
-            first_low_freq_match_result.device_indices.numel() > 0
+            first_low_freq_match_result.device_prefix_len > 0
         )
         self.assertFalse(
             is_first_low_freq_key_present,

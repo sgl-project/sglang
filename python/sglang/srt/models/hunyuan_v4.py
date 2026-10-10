@@ -357,14 +357,12 @@ class HYV4Attention(DeepseekV2AttentionMLA):
             alt_stream=alt_stream,
             is_nextn=is_nextn,
         )
-        parallel = get_parallel()
         self.linear_gate = ColumnParallelLinear(
             config.hidden_size,
             config.num_attention_heads * config.v_head_dim,
             bias=False,
             quant_config=quant_config,
-            tp_rank=parallel.attn_tp_rank,
-            tp_size=parallel.attn_tp_size,
+            parallel_group="attn_tp",
             prefix=f"{prefix}.linear_gate",
         )
         self.local_gate_width = self.num_local_heads * config.v_head_dim

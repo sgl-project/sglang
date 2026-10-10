@@ -1,5 +1,5 @@
 import logging
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING, NamedTuple, Optional, Tuple
 
 import torch
 import triton
@@ -10,7 +10,9 @@ if TYPE_CHECKING:
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe import get_moe_a2a_backend
-from sglang.srt.layers.moe.mhc_post_fusion import MhcPostFusion, use_mhc_post_fusion
+from sglang.srt.layers.moe.utils import should_skip_post_experts_all_reduce
+from sglang.srt.models.deepseek_v2 import MoEOutput
+from sglang.srt.models.deepseek_v4_mhc import AttnOutput
 from sglang.srt.runtime_context import (
     get_exec,
     get_forward,
@@ -37,6 +39,19 @@ if _is_gfx95_supported:
     from sglang.srt.models.deepseek_common.amd.deepseek_v4_gfx95_dense import (
         post_attention_norm,
     )
+
+
+class MhcPostOperands(NamedTuple):
+    """What the fused all-reduce + hc_post kernel reads besides the sublayer rows.
+
+    The caller hands this to `apply_attention_mhc` / `apply_moe_mhc` directly; the
+    sublayer only has to be told to leave its reduce alone.
+    """
+
+    residual: torch.Tensor
+    post: torch.Tensor
+    comb: torch.Tensor
+
 
 # the fused all-reduce + hc_post kernel: DeepSeek-V4.1's hidden size, up to this many rows
 MHC_HIDDEN_SIZE = 5120
@@ -422,7 +437,7 @@ def apply_mhc_post_pre_boundary(
     if not _is_fused_mhc_post_pre_enabled():
         return None
 
-    from sglang.srt.models.deepseek_v4 import _get_mhc_ops
+    from sglang.srt.models.deepseek_v4 import get_mhc_ops
 
     post_in = post.unsqueeze(-1) if post.ndim == 2 else post
     (
@@ -430,7 +445,7 @@ def apply_mhc_post_pre_boundary(
         post_out,
         comb_out,
         layer_input_out,
-    ) = _get_mhc_ops().mhc_fused_post_pre(
+    ) = get_mhc_ops().mhc_fused_post_pre(
         layer_input,
         residual,
         post_in,
@@ -508,14 +523,12 @@ def _can_fuse_mhc(layer, residual: torch.Tensor, forward_batch) -> bool:
 
 def _make_mhc_fusion(
     residual: torch.Tensor, coefficients: "HcCoefficients", comm
-) -> Optional[MhcPostFusion]:
+) -> Optional[MhcPostOperands]:
     # comm is the group's aiter CustomAllreduce, or None when custom all-reduce is off
     if comm is None or comm.disabled or not comm.enable_register_for_capturing:
         return None
     coefficients.materialize()
-    return MhcPostFusion(
-        residual, coefficients.post, coefficients.comb, None, pre=coefficients.pre
-    )
+    return MhcPostOperands(residual, coefficients.post, coefficients.comb)
 
 
 def attention_mhc_fusion(layer, residual, coefficients, forward_batch):
@@ -536,18 +549,26 @@ def moe_mhc_fusion(layer, residual, coefficients, forward_batch):
         and layer.mlp.tp_size == 4
         and not layer.mlp._shared_expert_tp1
         and get_moe_a2a_backend().is_none()
+        # A reduce some later step already owns, or one the combine performed, is
+        # not ours to fuse into the post.
+        and not should_skip_post_experts_all_reduce(is_tp_path=True)
     ):
         return None
     return _make_mhc_fusion(residual, coefficients, get_parallel().tp_group.ca_comm)
 
 
-def apply_attention_mhc(x: torch.Tensor, state: MhcPostFusion) -> None:
-    # a lazily recorded state still needs its stats before the fused kernel reads them
-    state.materialize_stats()
-    if state.stats_stream is not None:
-        torch.cuda.current_stream().wait_stream(state.stats_stream)
-    state.output = all_reduce_mhc_post(
+def apply_attention_mhc(x: torch.Tensor, state: MhcPostOperands) -> torch.Tensor:
+    """Attention's all-reduce fused with hc_post; returns the rebuilt streams."""
+    return all_reduce_mhc_post(
         x, state.residual, state.post, state.comb, get_parallel().attn_tp_group.ca_comm
+    )
+
+
+def apply_moe_mhc(x: torch.Tensor, state: MhcPostOperands) -> torch.Tensor:
+    """The same for the MoE's post-experts reduce, on rows it merged but left
+    unreduced."""
+    return all_reduce_mhc_post(
+        x, state.residual, state.post, state.comb, get_parallel().tp_group.ca_comm
     )
 
 
@@ -581,19 +602,25 @@ def forward_hc_pre_from_prev_fused_boundary(
     )
     with layer.self_attn.maybe_use_decode_attn_tp(forward_batch):
         mhc = attention_mhc_fusion(layer, residual, attn_coefficients, forward_batch)
-        with use_mhc_post_fusion(mhc):
-            x = layer.self_attn(
-                x=x, positions=positions, forward_batch=forward_batch, x_quant=x_quant
-            )
+        x = layer.self_attn(
+            x=x,
+            positions=positions,
+            forward_batch=forward_batch,
+            x_quant=x_quant,
+            defer_all_reduce=mhc is not None,
+        )
     if mhc is not None:
-        residual = mhc.output
+        # wo_b honors the deferred reduce under attention_mhc_fusion's gates;
+        # fail loud rather than fall back to an unfused reduce.
+        assert isinstance(x, AttnOutput)
+        residual = apply_attention_mhc(x.partial, mhc)
         x = None
     residual, x, ffn_coefficients = hc_boundary(
         layer,
         x,
         residual,
-        attn_coefficients.post if mhc is None else None,
-        attn_coefficients.comb if mhc is None else None,
+        attn_coefficients.post if x is not None else None,
+        attn_coefficients.comb if x is not None else None,
         attn_coefficients.pre,
         layer.hc_ffn_fn,
         layer.hc_ffn_scale,
@@ -601,15 +628,22 @@ def forward_hc_pre_from_prev_fused_boundary(
     )
     x = _gfx95_dense_post_attention_norm(layer, x, ffn_coefficients)
     mhc = moe_mhc_fusion(layer, residual, ffn_coefficients, forward_batch)
-    with use_mhc_post_fusion(mhc):
-        x = layer._run_moe_ffn_dp_sync(
-            x, forward_batch, input_ids=input_ids, input_ids_global=input_ids_global
-        )
+    x = layer._run_moe_ffn_dp_sync(
+        x,
+        forward_batch,
+        input_ids=input_ids,
+        input_ids_global=input_ids_global,
+        return_moe_output=mhc is not None,
+    )
     ffn_pre, ffn_post, ffn_comb = ffn_coefficients.tensors()
-    if mhc is not None and mhc.output is not None:
+    if mhc is not None:
+        # The MoE TP path honors the deferred output under moe_mhc_fusion's gates;
+        # fail loud rather than fall back to an unfused reduce. The fused post
+        # carries the reduce, so take the merged rows without one.
+        assert isinstance(x, MoEOutput)
         # Reduction already applied post. The next boundary consumes this
         # materialized residual, including when it would normally defer post.
-        return mhc.output, ffn_pre, None
+        return apply_moe_mhc(x.get_merged(), mhc), ffn_pre, None
     if defer_post:
         return None, ffn_pre, (x, residual, ffn_post, ffn_comb)
     return layer.hc_post(x, residual, ffn_post, ffn_comb), ffn_pre, None

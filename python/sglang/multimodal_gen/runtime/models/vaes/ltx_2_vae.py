@@ -122,9 +122,7 @@ class LTX2VideoCausalConv3d(nn.Module):
 
     def _weight_is_channels_last_3d(self) -> bool:
         w = self.conv.weight
-        return hasattr(torch, "channels_last_3d") and _is_channels_last_3d_stride(
-            tuple(w.size()), tuple(w.stride())
-        )
+        return _is_channels_last_3d_stride(tuple(w.size()), tuple(w.stride()))
 
     def _causal_temporal_pad_channels_last(
         self,
@@ -1769,16 +1767,9 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
         # intermediate tiles together, the memory requirement can be lowered.
         self.use_tiling = False
 
-        # When decoding temporally long video latents, the memory requirement is very high. By decoding latent frames
-        # at a fixed frame batch size (based on `self.num_latent_frames_batch_sizes`), the memory requirement can be lowered.
+        # Temporal tiling bounds memory when encoding or decoding long videos.
         self.use_framewise_encoding = False
         self.use_framewise_decoding = False
-
-        # This can be configured based on the amount of GPU memory available.
-        # `16` for sample frames and `2` for latent frames are sensible defaults for consumer GPUs.
-        # Setting it to higher values results in higher memory usage.
-        self.num_sample_frames_batch_size = 16
-        self.num_latent_frames_batch_size = 2
 
         # The minimal tile height and width for spatial tiling to be used
         self.tile_sample_min_height = 512
@@ -1991,36 +1982,6 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
 
         return DecoderOutput(sample=decoded)
 
-    def blend_v(
-        self, a: torch.Tensor, b: torch.Tensor, blend_extent: int
-    ) -> torch.Tensor:
-        blend_extent = min(a.shape[3], b.shape[3], blend_extent)
-        for y in range(blend_extent):
-            b[:, :, :, y, :] = a[:, :, :, -blend_extent + y, :] * (
-                1 - y / blend_extent
-            ) + b[:, :, :, y, :] * (y / blend_extent)
-        return b
-
-    def blend_h(
-        self, a: torch.Tensor, b: torch.Tensor, blend_extent: int
-    ) -> torch.Tensor:
-        blend_extent = min(a.shape[4], b.shape[4], blend_extent)
-        for x in range(blend_extent):
-            b[:, :, :, :, x] = a[:, :, :, :, -blend_extent + x] * (
-                1 - x / blend_extent
-            ) + b[:, :, :, :, x] * (x / blend_extent)
-        return b
-
-    def blend_t(
-        self, a: torch.Tensor, b: torch.Tensor, blend_extent: int
-    ) -> torch.Tensor:
-        blend_extent = min(a.shape[-3], b.shape[-3], blend_extent)
-        for x in range(blend_extent):
-            b[:, :, x, :, :] = a[:, :, -blend_extent + x, :, :] * (
-                1 - x / blend_extent
-            ) + b[:, :, x, :, :] * (x / blend_extent)
-        return b
-
     def tiled_encode(
         self, x: torch.Tensor, causal: Optional[bool] = None
     ) -> torch.Tensor:
@@ -2073,22 +2034,13 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
                 row.append(time)
             rows.append(row)
 
-        result_rows = []
-        for i, row in enumerate(rows):
-            result_row = []
-            for j, tile in enumerate(row):
-                # blend the above tile and the left tile
-                # to the current tile and add the current tile to the result row
-                if i > 0:
-                    tile = self.blend_v(rows[i - 1][j], tile, blend_height)
-                if j > 0:
-                    tile = self.blend_h(row[j - 1], tile, blend_width)
-                result_row.append(
-                    tile[:, :, :, :tile_latent_stride_height, :tile_latent_stride_width]
-                )
-            result_rows.append(torch.cat(result_row, dim=4))
-
-        enc = torch.cat(result_rows, dim=3)[:, :, :, :latent_height, :latent_width]
+        enc = self._merge_spatial_tiles(
+            rows,
+            blend_height,
+            blend_width,
+            tile_latent_stride_height,
+            tile_latent_stride_width,
+        )[:, :, :, :latent_height, :latent_width]
         return enc
 
     def tiled_decode(
@@ -2153,28 +2105,13 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
                 row.append(time)
             rows.append(row)
 
-        result_rows = []
-        for i, row in enumerate(rows):
-            result_row = []
-            for j, tile in enumerate(row):
-                # blend the above tile and the left tile
-                # to the current tile and add the current tile to the result row
-                if i > 0:
-                    tile = self.blend_v(rows[i - 1][j], tile, blend_height)
-                if j > 0:
-                    tile = self.blend_h(row[j - 1], tile, blend_width)
-                result_row.append(
-                    tile[
-                        :,
-                        :,
-                        :,
-                        : self.tile_sample_stride_height,
-                        : self.tile_sample_stride_width,
-                    ]
-                )
-            result_rows.append(torch.cat(result_row, dim=4))
-
-        dec = torch.cat(result_rows, dim=3)[:, :, :, :sample_height, :sample_width]
+        dec = self._merge_spatial_tiles(
+            rows,
+            blend_height,
+            blend_width,
+            self.tile_sample_stride_height,
+            self.tile_sample_stride_width,
+        )[:, :, :, :sample_height, :sample_width]
 
         if not return_dict:
             return (dec,)

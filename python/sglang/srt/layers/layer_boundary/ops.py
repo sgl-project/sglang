@@ -91,10 +91,27 @@ def tp_slice(hidden_states, residual):
     return hidden_states, residual
 
 
+class GatheredInput:
+    """A stage input its read already gathered over attention TP, which the
+    entry's gather then passes on as it is."""
+
+    __slots__ = ("value",)
+
+    def __init__(self, value: torch.Tensor):
+        self.value = value
+
+
 def attn_tp_gather_input(
     hidden_states: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
     forward_batch: ForwardBatch,
+    gather: Optional[Callable] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    """Gather a stage input from this rank's attention-TP slice of the rows,
+    trying the stage's ``gather`` first for a single tensor (see
+    attn_tp_gather_with); an input its read already gathered (GatheredInput)
+    passes through."""
+    if isinstance(hidden_states, GatheredInput):
+        return hidden_states.value
     parallel = get_parallel()
     if isinstance(hidden_states, tuple):
         gathered_hidden_states = []
@@ -118,7 +135,7 @@ def attn_tp_gather_input(
             gathered_hidden_states.append(output)
         return tuple(gathered_hidden_states)
 
-    return attn_tp_gather(hidden_states)
+    return attn_tp_gather_with(hidden_states, gather)
 
 
 def attn_tp_reduce_scatter(
@@ -328,10 +345,22 @@ def update_attn_tp_gather_output(
     residual: torch.Tensor,
     forward_batch: ForwardBatch,
     update: ResidualUpdate = PLAIN_ADD,
+    gather: Optional[Callable] = None,
     **kwargs,
 ):
+    """Write the output into the residual on this rank's slice, then gather it
+    over attention TP (see attn_tp_gather_with)."""
     hidden_states = update.update(hidden_states, residual)
-    return attn_tp_gather(hidden_states), None
+    return attn_tp_gather_with(hidden_states, gather), None
+
+
+def attn_tp_gather_with(
+    hidden_states: torch.Tensor, gather: Optional[Callable]
+) -> torch.Tensor:
+    """Gather this rank's attention-TP slice of the rows into all of them: in
+    the stage's own ``gather`` when it takes the batch, else the boundary's."""
+    gathered = gather(hidden_states) if gather is not None else None
+    return attn_tp_gather(hidden_states) if gathered is None else gathered
 
 
 def residual_slice_output(

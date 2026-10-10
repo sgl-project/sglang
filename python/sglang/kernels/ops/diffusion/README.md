@@ -37,11 +37,11 @@ norm/        RMSNorm / LayerNorm / GroupNorm and their fused epilogues
 modulate/    adaLN modulate, gating, timestep conditioning
 rope/        rotary embeddings and the QK-norm chains fused into them
 activation/  SiLU / GLU / GELU fusions
-quantization/ MXFP8 producers whose scales land in the GEMM's swizzled layout
+quantization/ FP8 rowwise producers fused into the GEMM input path
 attention/   sparse linear attention, gated delta-net
 routing/     diffusion-model MoE routing and expert selection
 layout/      pure data movement: USP/Ulysses relayout, varlen pack, causal pad
-common/      numerics primitives, platform predicates, non-Triton fallbacks
+common/      platform predicates, non-Triton fallbacks (numerics: kernels/numerics.py)
 sites/       request-scoped mount policy — NOT kernels (see below)
 ext/         JIT C++/CUDA extensions (Hunyuan3D raster/inpaint) — NOT kernels
 ../../kda_kernels/  agent-generated implementations and their JIT CUDA sources
@@ -60,11 +60,12 @@ themselves against the live eager chain on first sight via
 `sites/bitexact_gate.py` and fall back permanently on mismatch — the
 dispatch they replicate can change under them.
 
-**Not bit-exact → quality-gated.** Mounted onto marked `nn.Module` sites only
-for `quality="extra-high"` and `quality="high"` requests, at batch boundaries,
-all-or-nothing per transformer (`sites/quality_gate.py`). `extra-high` adds
-only these request-gated DiT/VAE fusions; `high` is cumulative and may also
-enable model-owned approximate paths such as Cache-DiT or a lower-precision
+**Not bit-exact → quality-gated.** Mounted onto marked `nn.Module` sites at
+batch boundaries, all-or-nothing per transformer (`sites/quality_gate.py`),
+from the lowest tier that may run each one: `lossless` for a fusion that keeps
+the reference math and every operand's precision and only moves the rounding,
+`high` for one that quantizes or lowers a precision. `high` is cumulative and
+may also enable model-owned approximate paths such as Cache-DiT or a lower-precision
 decode. A plain fp32 single-pass norm fusion looks harmless and is not: on
 ERNIE-Image it moved the 50-step trajectory to PSNR 18.83 dB, which is what
 motivated the bit-exact rewrite.
@@ -151,6 +152,10 @@ Several norms look interchangeable and are not. Start here.
 | Entry point | Backend | Contract | Applies to |
 |---|---|---|---|
 | `residual_gate_add` | JIT CUDA (contiguous), Triton (transposed) | bit-exact `residual + update * gate` | contiguous tensors, or a transposed-dense `[B, tokens, hidden]` residual/output with contiguous update and row-broadcast gate (SANA-Video) |
+| `residual_gate_fp32` | Triton | separate FP32 multiply/add, then cast to input dtype | contiguous `[B,S,D]`, strided `[B or 1,1,D]` gate; Kandinsky6 |
+
+These contracts differ: `residual_gate_fp32` does not round the product to
+BF16/FP16, and disables FMA to preserve the eager FP32 rounding boundary.
 
 The transposed-dense path tiles along the physical stride-1 token dimension
 for coalesced residual reads and output writes. The contiguous layouts use
@@ -186,6 +191,8 @@ tensor copy at each residual site.
 | `vdn_delta_factors` | JIT CUDA | `(alpha * inv(I + A), B @ inv(I + A))` in one launch; same fp32 accuracy class as the cholesky + solve_triangular chain (cond-dominated); head_dim 128 |
 
 ### MXFP8 producers (online `mxfp8`, cuBLASLt block-scaled GEMM on SM100)
+
+Defined in `sglang.kernels.ops.quantization.mxfp8_swizzled_triton` and re-exported here.
 
 | Entry point | Backend | Contract |
 |---|---|---|
@@ -244,7 +251,11 @@ inspecting model modules is its whole job.
    wrapper when the fallback policy is shared.
 4. State the numerical contract in the module docstring, including which
    shapes it was verified on.
-5. If it is not bit-exact, gate it through `sites/`. It must mount for both
-   `extra-high` and `high`, never for the default `lossless` path.
+5. If it is not bit-exact, gate it through `sites/` and declare its tier in
+   `_QUALITY_FUSION_HANDLERS`: `lossless` when it keeps the reference math and
+   every operand's precision, `high` when it does not. Never `exact`, which
+   is reserved for paths that reproduce the reference's rounding. A
+   `lossless` claim has to pass
+   `multimodal_gen/test/quality_tier_admission.py`.
 6. Test it in the domain suite (`test/registered/kernels/ops/diffusion/`), and
    the model wiring in `test_model_fast_paths.py`.

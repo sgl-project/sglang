@@ -17,7 +17,11 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
-from sglang.srt.mem_cache.hicache_storage import PoolTransfer, PoolTransferResult
+from sglang.srt.mem_cache.hicache_storage import (
+    PoolName,
+    PoolTransfer,
+    PoolTransferResult,
+)
 from sglang.srt.mem_cache.unified_cache.component_type import (  # noqa: F401
     BASE_COMPONENT_TYPE,
     ComponentType,
@@ -25,7 +29,11 @@ from sglang.srt.mem_cache.unified_cache.component_type import (  # noqa: F401
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.mem_cache.buffer_mode.storage_existence_cache import (
+        PoolBeliefPolicy,
+    )
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+    from sglang.srt.mem_cache.pool_host.group import HostPoolGroup, PoolEntry
     from sglang.srt.mem_cache.unified_cache.cache_action import (
         CacheAction,
         ComponentAction,
@@ -337,6 +345,17 @@ class TreeComponent(ABC):
     def value_len(self, node: UnifiedTreeNode) -> int:
         value = node.component_data[self.component_type].value
         return len(value) if value is not None else 0
+
+    def reclaimable_tokens(self, node: UnifiedTreeNode) -> int:
+        """Pool tokens the allocator gets back when this node's device value
+        is evicted. The evictable/protected ledgers count these (prefill
+        admission adds the evictable ledger to the allocator's free space, and
+        the eviction walk counts them toward its request), so they must be in
+        the allocator's units: the value length by default, less for a
+        component whose values are not backed one-to-one by pool rows. A
+        component whose per-node figure changes in place reports the delta
+        through ``UnifiedTreeCore.adjust_component_ledger``."""
+        return self.value_len(node)
 
     def has_host_value_only(self, node: UnifiedTreeNode) -> bool:
         """Whether this component's data is evicted from device but host-backed."""
@@ -697,6 +716,40 @@ class TreeComponent(ABC):
 
     def alloc_prefetch_staging(self, num_tokens: int) -> Optional[torch.Tensor]:
         """Allocate prefetch staging sized by prepare_prefetch, once the hit is known."""
+        return None
+
+    # ---- Buffer-mode backup hooks (hicache_host_memory_mode=buffer_only) ----
+    # Buffer mode writes a node pool by pool: keys per pool come from
+    # ``buffer_backup_keys`` or the BACKUP_HOST transfers, beliefs heal through
+    # ``buffer_belief_policy``; the pipeline pins the node from D2H launch to
+    # ack, so a component dropping rows asks ``buffer_backup_pending`` first.
+
+    def buffer_mode_host_pool_entries(
+        self, host_pool_group: HostPoolGroup
+    ) -> list[PoolEntry]:
+        """Extra host pool entries this component stages through (an entry
+        may alias the anchor's host pool)."""
+        return []
+
+    def buffer_backup_keys(
+        self, node: UnifiedTreeNode, hash_values: list[str]
+    ) -> dict[PoolName, list[str]]:
+        """Per-pool storage keys a backup of ``node`` writes for this component
+        (empty list: withhold the pool; empty dict: derive them from its
+        BACKUP_HOST transfers). A component naming any pool names all of them."""
+        return {}
+
+    def buffer_backup_parent_covered(
+        self, parent_node_id: NodeId, node_id: NodeId
+    ) -> bool:
+        """Whether this component covers the parent of ``node_id`` without
+        the parent's KV pages in storage (no prefix hole for a reader)."""
+        return False
+
+    def buffer_belief_policy(self, pool: PoolName) -> Optional[PoolBeliefPolicy]:
+        """The policy healing ``pool``'s existence beliefs, for a pool this
+        component owns; None picks the built-in one for the transfer's hit
+        policy."""
         return None
 
     def build_hicache_transfers(

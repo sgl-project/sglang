@@ -249,7 +249,7 @@ async fn streaming_chunks_pass_through() {
     assert_eq!(res.status(), StatusCode::OK);
     assert_eq!(
         res.headers().get("content-type").unwrap().to_str().unwrap(),
-        "text/event-stream"
+        "text/event-stream; charset=utf-8"
     );
 
     let bytes = res.into_body().collect().await.unwrap().to_bytes();

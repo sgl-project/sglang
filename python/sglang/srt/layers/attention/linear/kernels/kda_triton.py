@@ -251,4 +251,6 @@ class TritonKDAKernel(LinearAttnKernelBase):
             output_intermediate_states=return_intermediate_states,
             track_state=kwargs.get("track_state"),
             track_chunk_idx=kwargs.get("track_chunk_idx"),
+            chunk_indices=kwargs.get("chunk_indices"),
+            chunk_offsets=kwargs.get("chunk_offsets"),
         )

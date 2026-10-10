@@ -44,7 +44,7 @@ def _fused_dsa_target_verify_metadata_kernel(
     num_splits,
     dsa_index_topk: tl.constexpr,
     index_kpool: tl.constexpr,
-    real_page_size: tl.constexpr,
+    physical_page_size: tl.constexpr,
     next_n: tl.constexpr,
     HAS_REAL_PAGE_TABLE: tl.constexpr,
     HAS_PAGED_MQA_CTX_LENS: tl.constexpr,
@@ -146,13 +146,13 @@ def _fused_dsa_target_verify_metadata_kernel(
             )
 
         if HAS_REAL_PAGE_TABLE:
-            real_mask = mask & ((offs_n % real_page_size) == 0)
-            real_cols = offs_n // real_page_size
+            real_mask = mask & ((offs_n % physical_page_size) == 0)
+            real_cols = offs_n // physical_page_size
             tl.store(
                 real_page_table
                 + out_row_i64 * real_page_table_stride_0
                 + real_cols * real_page_table_stride_1,
-                vals // real_page_size,
+                vals // physical_page_size,
                 mask=real_mask,
             )
 
@@ -171,7 +171,7 @@ def _prep_fused_dsa_target_verify_metadata_launch(
     bs: int,
     max_seqlen_k: int,
     dsa_index_topk: int,
-    real_page_size: int,
+    physical_page_size: int,
     next_n: int,
     paged_mqa_ctx_lens_2d: torch.Tensor = None,
     index_kpool: int = 1,
@@ -189,7 +189,7 @@ def _prep_fused_dsa_target_verify_metadata_launch(
     assert next_n > 0
     assert index_kpool > 0
 
-    has_real_page_table = real_page_size > 1
+    has_real_page_table = physical_page_size > 1
     if has_real_page_table:
         assert real_page_table is not None
         assert real_page_table.is_cuda
@@ -251,7 +251,7 @@ def _prep_fused_dsa_target_verify_metadata_launch(
         num_splits,
         dsa_index_topk,
         index_kpool,
-        real_page_size,
+        physical_page_size,
         next_n,
         has_real_page_table,
         has_paged_mqa_ctx_lens,
@@ -279,7 +279,7 @@ def fused_dsa_target_verify_metadata(
     bs: int,
     max_seqlen_k: int,
     dsa_index_topk: int,
-    real_page_size: int,
+    physical_page_size: int,
     next_n: int,
     paged_mqa_ctx_lens_2d: torch.Tensor = None,
     index_kpool: int = 1,
@@ -305,7 +305,7 @@ def fused_dsa_target_verify_metadata(
         bs,
         max_seqlen_k,
         dsa_index_topk,
-        real_page_size,
+        physical_page_size,
         next_n,
         paged_mqa_ctx_lens_2d,
         index_kpool,

@@ -169,7 +169,6 @@ class GroupCoordinator:
     rank_in_group: int  # rank inside the group
     cpu_group: ProcessGroup  # group for CPU communication
     device_group: ProcessGroup  # group for device communication
-    use_device_communicator: bool  # whether to use device communicator
     device_communicator: DeviceCommunicatorBase  # all_to_all_4D communicator
 
     def __init__(
@@ -207,7 +206,6 @@ class GroupCoordinator:
         # TODO: fix it for other platforms
         self.device = get_local_torch_device()
 
-        self.use_device_communicator = use_device_communicator
         self.device_communicator: DeviceCommunicatorBase = None  # type: ignore
         if use_device_communicator and self.world_size > 1:
             communicator_cls = _resolve_all_to_all_communicator_cls()
@@ -227,10 +225,6 @@ class GroupCoordinator:
         ):
             # srt owns topology, dtype, contiguity, and size dispatch for custom ar
             self._init_srt_custom_allreduce()
-
-        # TODO(will): check if this is needed
-        # self.use_custom_op_call = current_platform.is_cuda_alike()
-        self.use_custom_op_call = False
 
     def _init_srt_custom_allreduce(self) -> None:
         custom_allreduce_kwargs = {

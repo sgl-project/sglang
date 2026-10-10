@@ -341,7 +341,6 @@ class MLP2(nn.Module):
         self.quant_config = quant_config
         use_tensor_parallel = use_tensor_parallel and not use_data_parallel
         tp_size = get_parallel().attn_tp_size if use_tensor_parallel else 1
-        tp_rank = get_parallel().attn_tp_rank if use_tensor_parallel else 0
         if isinstance(self.quant_config, ModelSlimConfig):
             self.fc0 = ReplicatedLinear(
                 dims[0],
@@ -373,16 +372,14 @@ class MLP2(nn.Module):
                 dims[1],
                 bias=bias,
                 prefix=add_prefix("fc0", prefix),
-                tp_rank=tp_rank,
-                tp_size=tp_size,
+                parallel_group="attn_tp",
             )
             self.fc1 = RowParallelLinear(
                 dims[1],
                 dims[2],
                 bias=bias,
                 prefix=add_prefix("fc1", prefix),
-                tp_rank=tp_rank,
-                tp_size=tp_size,
+                parallel_group="attn_tp",
             )
         else:
             self.fc0 = nn.Linear(dims[0], dims[1], bias=bias)

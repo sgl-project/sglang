@@ -404,3 +404,61 @@ async fn retries_stop_at_the_request_deadline() {
     assert_eq!(workers.iter().filter(|worker| hit(worker)).count(), 2);
     assert_eq!(retries(&ctx), 1);
 }
+
+/// A failed /generate attempt must not consume the OpenAI response converter.
+#[tokio::test]
+async fn retried_completions_keep_the_openai_response_format() {
+    use crate::common::streaming::{collect_body, parse_sse_data};
+    use sgl_router::workers::{EngineProfile, WireProtocol};
+
+    for streaming in [false, true] {
+        let ok = MockWorker::start(vec![
+            "data: {\"text\":\"ok\",\"meta_info\":{\"id\":\"r\",\"finish_reason\":{\"type\":\"stop\"}}}\n\n",
+            "data: [DONE]\n\n",
+        ]).await;
+        let unavailable =
+            MockWorker::start_returning_error(StatusCode::SERVICE_UNAVAILABLE, rejected()).await;
+        let ctx = router_ctx(&[], 2, false);
+        for (id, worker) in [("ok", &ok), ("unavailable", &unavailable)] {
+            ctx.registry
+                .add_with_cb(
+                    spec(id, &worker.url, WorkerMode::Plain),
+                    None,
+                    EngineProfile {
+                        openai: Some(Arc::default()),
+                        ..WireProtocol::default().into()
+                    },
+                )
+                .unwrap();
+        }
+        let app = build_router(ctx.clone());
+        // Round robin visits both workers within two requests, regardless of registry order.
+        for _ in 0..2 {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post("/v1/completions")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            json!({"model":"tiny", "prompt":"hi", "stream":streaming}).to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = collect_body(response.into_body()).await;
+            let response: Value = if streaming {
+                let events = parse_sse_data(&body);
+                assert_eq!(events.last().unwrap(), "[DONE]");
+                serde_json::from_str(&events[0]).unwrap()
+            } else {
+                serde_json::from_slice(&body).unwrap()
+            };
+            assert_eq!(response["object"], "text_completion");
+            assert_eq!(response["choices"][0]["text"], "ok");
+        }
+        assert!(hit(&unavailable));
+        assert!(retries(&ctx) > 0);
+    }
+}

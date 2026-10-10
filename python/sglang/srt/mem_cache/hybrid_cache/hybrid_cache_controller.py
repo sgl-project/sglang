@@ -51,6 +51,10 @@ from sglang.srt.utils import broadcast_pyobj
 
 logger = logging.getLogger(__name__)
 
+# Pool boundaries are nonnegative; an omitted rank must dominate MIN so
+# a peer cannot establish presence of that rank's storage shard.
+_NO_POOL_VERDICT = -1
+
 
 @dataclass(frozen=True)
 class PPPrefetchPoolSpec:
@@ -165,6 +169,10 @@ class PrefetchOperation(StorageOperation):
             pool_transfers=pool_transfers,
         )
         self.pool_transfers_done = not bool(pool_transfers)
+        # The hit query's verdict per pool, as the chain prefix length (in
+        # pages) up to which the pool is present; rank-reduced with the
+        # folded hit count. Empty until the query ran on this rank.
+        self.query_pool_hit_pages: dict[PoolName, int] = {}
         self.buffer_host_occupied_units: Optional[int] = None
         # The Python transfer worker leaves the unfinished tail to the ACK drain;
         # a controller that releases it itself must set this False.
@@ -1348,9 +1356,11 @@ class HybridCacheController(BaseHiCacheController):
 
         if operation.assume_stored:
             # A prior hit on a suffix of this span proved it stored, and writes
-            # are prefix-covered, so re-querying only adds a round trip.
+            # are prefix-covered, so re-querying only adds a round trip. Nothing
+            # is verified now, so no pool gets a verdict to learn from.
             kv_hit_pages = len(hash_value)
             operation.pool_storage_result.update_kv_hit_pages(kv_hit_pages)
+            operation.query_pool_hit_pages = {}
             return hash_value, kv_hit_pages * self.page_size
 
         extra_info = HiCacheStorageExtraInfo(
@@ -1369,11 +1379,44 @@ class HybridCacheController(BaseHiCacheController):
 
         kv_hit_pages = hit_result.kv_hit_pages
         operation.pool_storage_result.update_kv_hit_pages(kv_hit_pages)
+        # Each pool's own boundary (the KV pool's where the backend reports
+        # it, else the folded cut); the beliefs heal pool by pool. A pool the
+        # backend did not report carries no verdict.
+        pool_hits = hit_result.extra_pool_hit_pages
+        operation.query_pool_hit_pages = {
+            PoolName.KV: pool_hits.get(PoolName.KV, kv_hit_pages)
+        }
+        for transfer in operation.pool_transfers or ():
+            if transfer.name in pool_hits:
+                operation.query_pool_hit_pages[transfer.name] = pool_hits[transfer.name]
 
         return (
             hash_value[:kv_hit_pages],
             kv_hit_pages * self.page_size,
         )
+
+    def _sync_prefetch_hit_query(self, operation, storage_hit_count: int) -> int:
+        """One MIN collective for the folded hit count and every pool's own
+        boundary, so per-pool beliefs stay rank-identical. A pool omitted
+        by any rank heals from the folded cut without learning presence."""
+        pools = list(PoolName)
+        local = operation.query_pool_hit_pages
+        packed = torch.tensor(
+            [storage_hit_count] + [local.get(pool, _NO_POOL_VERDICT) for pool in pools],
+            dtype=torch.int,
+        )
+        self._all_reduce(
+            packed,
+            torch.distributed.ReduceOp.MIN,
+            self.prefetch_hits_sync_groups,
+        )
+        reduced = packed.tolist()
+        operation.query_pool_hit_pages = {
+            pool: pages
+            for pool, pages in zip(pools, reduced[1:], strict=True)
+            if pages != _NO_POOL_VERDICT
+        }
+        return int(reduced[0])
 
     def _move_pool_indices(
         self, host_pool, host_indices, device_indices, *, write_back_jit: bool
@@ -1676,7 +1719,6 @@ class HybridCacheController(BaseHiCacheController):
             return None
         newly_allocated: list[tuple[PoolTransfer, Callable, torch.Tensor]] = []
         derived_transfers: list[PoolTransfer] = []
-        anchor_transfers = []
 
         def rollback_allocated() -> None:
             for prev_pool, prev_free_fn, prev_indices in reversed(newly_allocated):
@@ -1691,11 +1733,6 @@ class HybridCacheController(BaseHiCacheController):
             if entry is None:
                 continue
             if pool.device_indices is not None or pool.host_indices is None:
-                continue
-            if entry.device_indices_from_anchor_fn is not None:
-                # Allocate independent pools first: their allocation/eviction
-                # can compact SWA before its physical IDs are captured.
-                anchor_transfers.append((pool, entry))
                 continue
             # device_alloc_fn / device_free_fn override entry.device_pool's
             # methods for pools whose device_pool is a raw KV pool (layout)
@@ -1714,28 +1751,6 @@ class HybridCacheController(BaseHiCacheController):
                 return None
             pool.device_indices = indices
             newly_allocated.append((pool, free_fn, indices))
-
-        for pool, entry in anchor_transfers:
-            if kv_device_indices is None or not pool.anchor_index_parts:
-                rollback_allocated()
-                return None
-            anchor_indices = torch.cat(
-                [
-                    kv_device_indices[part] if isinstance(part, slice) else part
-                    for part in pool.anchor_index_parts
-                ]
-            )
-            assert len(anchor_indices) == len(pool.host_indices)
-            bind = entry.device_indices_from_anchor_fn
-            indices = bind(anchor_indices)
-            if indices is None and entry.device_evict_fn:
-                entry.device_evict_fn(len(anchor_indices))
-                indices = bind(anchor_indices)
-            if indices is None:
-                rollback_allocated()
-                return None
-            pool.device_indices = indices
-            newly_allocated.append((pool, entry.device_free_fn, anchor_indices))
 
         # Assign indices to deferred pools from their source.
         for pool in derived_transfers:

@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -76,8 +76,8 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config i
     NunchakuConfig,
     is_nunchaku_available,
 )
-from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
-    NDRotaryEmbedding,
+from sglang.multimodal_gen.runtime.layers.rotary_embedding.mrope import (
+    FluxPosEmbed,
 )
 from sglang.multimodal_gen.runtime.layers.visual_embedding import (
     CombinedTimestepGuidanceTextProjEmbeddings,
@@ -91,7 +91,6 @@ from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.models.dits.common import get_qkv_projections
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
-    current_platform,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -175,7 +174,7 @@ def _flux_norm_modulate(
     Priority: (1) the bit-exact single-kernel LN+modulate -- lossless, so it
     needs no quality gate and also supersedes the request-gated affine
     fold wherever it verifies; (2) when the site is mounted
-    (``quality="extra-high"`` or ``"high"``) and the bit-exact kernel is
+    (``quality="lossless"`` or ``"high"``) and the bit-exact kernel is
     unavailable, the modulate folded into the LN affine (one aten kernel; not
     bit-exact);
     (3) affine-free LayerNorm + the bit-exact fused modulate.
@@ -409,7 +408,7 @@ class FluxGELU(nn.Module):
             prefix=f"{prefix}.proj" if prefix else "proj",
         )
         self.gelu = nn.GELU(approximate="tanh")
-        # extra-high/high fusion site: up-proj GEMM + tanh-GELU in the cublasLt
+        # lossless/high fusion site: up-proj GEMM + tanh-GELU in the cublasLt
         # epilogue. Off by default; mounted per batch by the denoising stage.
         mark_fused_gelu_site(self, "proj")
 
@@ -429,7 +428,7 @@ class FluxFusedGELUProj(nn.Module):
     ``approximate="tanh"`` that keeps the ``net.0.proj`` parameter path. The
     default path is the bit-exact reference (plain Linear + tanh-GELU); the
     cublasLt GELU epilogue is mounted per batch by the denoising stage for
-    requests with ``quality="extra-high"`` or ``quality="high"`` only.
+    requests with ``quality="lossless"`` or ``quality="high"`` only.
     """
 
     def __init__(self, proj: nn.Linear):
@@ -524,7 +523,6 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
         )
         self.local_heads = divide(self.heads, self.tp_size)
         self.added_kv_proj_dim = added_kv_proj_dim
-        self.added_proj_bias = added_proj_bias
 
         self.use_fused_qkv = isinstance(quant_config, NunchakuConfig)
         self.use_fused_added_qkv = isinstance(quant_config, NunchakuConfig)
@@ -877,7 +875,7 @@ class FluxSingleTransformerBlock(nn.Module):
                 prefix=f"{prefix}.proj_mlp" if prefix else "proj_mlp",
             )
             self.act_mlp = nn.GELU(approximate="tanh")
-            # extra-high/high fusion site: proj_mlp GEMM + tanh-GELU in the
+            # lossless/high fusion site: proj_mlp GEMM + tanh-GELU in the
             # cublasLt epilogue (mounted per batch by the denoising stage).
             mark_fused_gelu_site(self, "proj_mlp")
             proj_out_cls = (
@@ -1044,7 +1042,7 @@ class FluxTransformerBlock(nn.Module):
 
         self.norm2 = LayerNorm(dim, eps=1e-6, elementwise_affine=False)
         self.norm2_context = LayerNorm(dim, eps=1e-6, elementwise_affine=False)
-        # extra-high/high site: norm2/norm2_context modulate folds into the
+        # lossless/high site: norm2/norm2_context modulate folds into the
         # LN affine when mounted.
         mark_fused_ln_modulate_site(self)
 
@@ -1099,7 +1097,7 @@ class FluxTransformerBlock(nn.Module):
                 activation_fn="gelu-approximate",
             )
             # Re-home each FF's tanh-GELU up-projection onto a marked
-            # extra-high/high fusion site (bit-exact reference by default).
+            # lossless/high fusion site (bit-exact reference by default).
             self.ff.net[0] = FluxFusedGELUProj(self.ff.net[0].proj)
             self.ff_context.net[0] = FluxFusedGELUProj(self.ff_context.net[0].proj)
 
@@ -1189,30 +1187,6 @@ class FluxTransformerBlock(nn.Module):
             encoder_hidden_states = encoder_hidden_states.clip(-65504, 65504)
 
         return encoder_hidden_states, hidden_states
-
-
-class FluxPosEmbed(nn.Module):
-    # modified from https://github.com/black-forest-labs/flux/blob/c00d7c60b085fce8058b9df845e036090873f2ce/src/flux/modules/layers.py#L11
-    def __init__(self, theta: int, axes_dim: List[int]):
-        super().__init__()
-        self.rope = NDRotaryEmbedding(
-            rope_dim_list=axes_dim,
-            rope_theta=theta,
-            use_real=False,
-            repeat_interleave_real=False,
-            dtype=(
-                torch.float64
-                if current_platform.is_float64_supported()
-                else torch.float32
-            ),
-        )
-
-    def forward(self, ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        pos = ids.float()
-        # TODO: potential error: flux use n_axes = ids.shape[-1]
-        # see: https://github.com/huggingface/diffusers/blob/17c0e79dbdf53fb6705e9c09cc1a854b84c39249/src/diffusers/models/transformers/transformer_flux.py#L509
-        freqs_cos, freqs_sin = self.rope.forward_uncached(pos=pos)
-        return freqs_cos.contiguous().float(), freqs_sin.contiguous().float()
 
 
 class FluxTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):

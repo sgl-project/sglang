@@ -5,9 +5,8 @@ import json
 import math
 import os
 from collections.abc import Callable
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import dataclass, field, fields
 from enum import Enum
-from operator import attrgetter
 from typing import Any, ClassVar
 
 import numpy as np
@@ -54,6 +53,16 @@ class STA_Mode(str, Enum):
     STA_TUNING = "STA_tuning"
     STA_TUNING_CFG = "STA_tuning_cfg"
     NONE = None
+
+
+def pack_latents_2x2(latents, batch_size, num_channels_latents, height, width):
+    latents = latents.view(
+        batch_size, num_channels_latents, height // 2, 2, width // 2, 2
+    )
+    latents = latents.permute(0, 2, 4, 1, 3, 5)
+    return latents.reshape(
+        batch_size, (height // 2) * (width // 2), num_channels_latents * 4
+    )
 
 
 def postprocess_text(output: BaseEncoderOutput, _text_inputs) -> torch.tensor:
@@ -468,6 +477,10 @@ class PipelineConfig:
 
     def supports_native_grouped_requests(self):
         """Return whether dynamic batches should run as grouped Req lists."""
+        return False
+
+    def supports_batching_image_conditioning(self):
+        """Return whether image-conditioned requests may join dynamic batches."""
         return False
 
     def supports_sequential_dit_inference(self):
@@ -1197,35 +1210,6 @@ class PipelineConfig:
             raise ValueError(
                 f"Length of text postprocess functions ({len(self.postprocess_text_funcs)}) must be equal to length of text preprocessing functions ({len(self.preprocess_text_funcs)})"
             )
-
-    def dump_to_json(self, file_path: str):
-        output_dict = {f.name: attrgetter(f.name)(self) for f in fields(self)}
-        del_keys = []
-        for key, value in output_dict.items():
-            if isinstance(value, ModelConfig):
-                model_dict = asdict(value)
-                # Model Arch Config should be hidden away from the users
-                model_dict.pop("arch_config")
-                output_dict[key] = model_dict
-            elif isinstance(value, tuple) and all(
-                isinstance(v, ModelConfig) for v in value
-            ):
-                model_dicts = []
-                for v in value:
-                    model_dict = asdict(v)
-                    # Model Arch Config should be hidden away from the users
-                    model_dict.pop("arch_config")
-                    model_dicts.append(model_dict)
-                output_dict[key] = model_dicts
-            elif isinstance(value, tuple) and all(callable(f) for f in value):
-                # Skip dumping functions
-                del_keys.append(key)
-
-        for key in del_keys:
-            output_dict.pop(key, None)
-
-        with open(file_path, "w") as f:
-            json.dump(output_dict, f, indent=2)
 
     def load_from_json(self, file_path: str):
         with open(file_path) as f:

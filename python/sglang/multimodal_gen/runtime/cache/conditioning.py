@@ -90,6 +90,29 @@ def prefer_conditioning_cache():
         _prefer_cache.reset(token)
 
 
+# Image-to-video VAE inputs are one image followed by all-zero frames, so most
+# blocks of large CUDA inputs are zero. Hashing the nonzero-block bitmap and only
+# those blocks still identifies every byte, without copying the zeros to host.
+_SPARSE_HASH_BLOCK_BYTES = 64 * 1024
+_SPARSE_HASH_MIN_BYTES = 16 * 1024 * 1024
+
+
+def _tensor_digest(tensor):
+    data = tensor.reshape(-1).view(torch.uint8)
+    if not data.is_cuda or data.numel() < _SPARSE_HASH_MIN_BYTES:
+        return hashlib.sha256(data.cpu().numpy()).digest()
+    num_blocks = data.numel() // _SPARSE_HASH_BLOCK_BYTES
+    split = num_blocks * _SPARSE_HASH_BLOCK_BYTES
+    blocks = data[:split].view(num_blocks, _SPARSE_HASH_BLOCK_BYTES)
+    nonzero = blocks.amax(dim=1).ne(0).cpu().numpy()
+    digest = hashlib.sha256(nonzero.tobytes())
+    edges = np.flatnonzero(np.diff(np.concatenate(([0], nonzero.view(np.int8), [0]))))
+    for start, end in zip(edges[::2], edges[1::2]):
+        digest.update(blocks[start:end].cpu().numpy())
+    digest.update(data[split:].cpu().numpy())
+    return digest.digest()
+
+
 def _fingerprint(value):
     if isinstance(value, torch.Tensor):
         if (
@@ -98,15 +121,13 @@ def _fingerprint(value):
             or value.requires_grad
         ):
             raise Uncacheable("only dense inference tensors can be cached")
-        tensor = value.detach().cpu().contiguous()
-        data = tensor.reshape(-1).view(torch.uint8).numpy()
         return (
             "tensor",
             str(value.dtype),
             str(value.device),
             tuple(value.shape),
             tuple(value.stride()),
-            hashlib.sha256(data).digest(),
+            _tensor_digest(value.detach().contiguous()),
         )
     if isinstance(value, Image.Image):
         return (

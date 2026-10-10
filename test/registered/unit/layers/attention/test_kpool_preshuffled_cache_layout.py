@@ -24,7 +24,7 @@ class TestKpoolPreshuffledCacheLayout(CustomTestCase):
         """A layout mismatch between the two writers never raises; it silently
         returns the wrong top-k."""
         torch.manual_seed(0)
-        pool = SimpleNamespace(page_size=4 * PAGE_SIZE, slots_per_page=PAGE_SIZE)
+        pool = SimpleNamespace(page_size=4 * PAGE_SIZE, index_page_size=PAGE_SIZE)
         num_pages, seq_len = 2, PAGE_SIZE + 5
         buf = torch.zeros(
             num_pages,

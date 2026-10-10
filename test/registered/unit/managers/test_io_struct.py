@@ -1352,6 +1352,39 @@ class TestEmbeddingReqInputGetItem(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "must match batch size"):
             req.normalize_batch_and_arguments()
 
+    def test_media_only_flat_list_is_one_request(self):
+        """Without text, a flat media list is one request with all items, as in HF."""
+        req = EmbeddingReqInput(image_data=["a.jpg", "b.jpg"])
+        req.normalize_batch_and_arguments()
+        self.assertTrue(req.is_single)
+        self.assertEqual(req.image_data, ["a.jpg", "b.jpg"])
+
+    def test_media_only_nested_list_is_a_batch(self):
+        """A list of per-request media lists is the explicit batch form."""
+        req = EmbeddingReqInput(image_data=[["a.jpg"], ["b.jpg", "c.jpg"]])
+        req.normalize_batch_and_arguments()
+        self.assertFalse(req.is_single)
+        self.assertEqual(
+            [req[0].image_data, req[1].image_data], [["a.jpg"], ["b.jpg", "c.jpg"]]
+        )
+
+    def test_media_list_pairs_with_text_batch(self):
+        """A media list pairs by position; a scalar item broadcasts to every request."""
+        req = EmbeddingReqInput(
+            text=["t0", "t1"], image_data=["a.jpg", None], audio_data="s.wav"
+        )
+        req.normalize_batch_and_arguments()
+        self.assertEqual(
+            [(req[i].image_data, req[i].audio_data) for i in range(2)],
+            [("a.jpg", "s.wav"), (None, "s.wav")],
+        )
+
+    def test_media_list_length_must_match_batch(self):
+        """A short media list must not be re-attached to the remaining requests."""
+        req = EmbeddingReqInput(text=["t0", "t1", "t2"], image_data=["a.jpg"])
+        with self.assertRaisesRegex(ValueError, "image_data has 1 entries"):
+            req.normalize_batch_and_arguments()
+
 
 if __name__ == "__main__":
     unittest.main()

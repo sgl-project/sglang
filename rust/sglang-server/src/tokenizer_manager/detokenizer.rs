@@ -42,9 +42,10 @@ const SKIP_SPECIAL_TOKENS: bool = true;
 
 /// Per-request incremental decoder. `step` feeds the new token ids for one chunk
 /// and returns the newly decoded text delta (empty if the ids only produced a
-/// partial/incomplete multi-byte sequence that needs more tokens).
+/// partial/incomplete multi-byte sequence that needs more tokens). `finish` marks
+/// the request's last chunk, which also flushes any text held back.
 pub trait StreamDecoder: Send {
-    fn step(&mut self, token_ids: &[i64]) -> Result<String, Error>;
+    fn step(&mut self, token_ids: &[i64], finish: bool) -> Result<String, Error>;
 }
 
 /// Real decoder wrapping a dynamo-tokenizers `DecodeStream`.
@@ -53,7 +54,7 @@ struct DynamoDecoder {
 }
 
 impl StreamDecoder for DynamoDecoder {
-    fn step(&mut self, token_ids: &[i64]) -> Result<String, Error> {
+    fn step(&mut self, token_ids: &[i64], finish: bool) -> Result<String, Error> {
         let mut out = String::new();
         for &id in token_ids {
             if let Some(chunk) = self
@@ -63,6 +64,14 @@ impl StreamDecoder for DynamoDecoder {
             {
                 out.push_str(&chunk);
             }
+        }
+        if finish
+            && let Some(chunk) = self
+                .stream
+                .finish()
+                .map_err(|e| Error::Detokenize(e.to_string()))?
+        {
+            out.push_str(&chunk);
         }
         Ok(out)
     }
@@ -184,7 +193,7 @@ impl Runnable for DetokenizerWorker {
 
         // Plain `recv`: exits when the `DetokMsg` channel closes (every `Senders`
         // clone gone). On shutdown that happens once to-scheduler/from-scheduler
-        // exit — frontend calls own only their abort sender, not detok channels.
+        // exit — core calls own only their abort sender, not detok channels.
         while let Ok(msg) = self.rx.recv() {
             match msg {
                 DetokMsg::Register {
@@ -322,7 +331,7 @@ fn handle_chunk(
     // `skip_tokenizer_init` mode. Nothing cumulative is kept here — the api-server's
     // drain loop reassembles it where needed.
     let mut delta_text = match &mut st.decoder {
-        Some(decoder) => match decoder.step(&ev.token_ids) {
+        Some(decoder) => match decoder.step(&ev.token_ids, finished) {
             Ok(delta) => delta,
             Err(e) => {
                 // Abort too: this is terminal for the request, and without it the
@@ -395,7 +404,7 @@ fn handle_chunk(
             }
             let _ = st.fsm.apply(Event::Disconnect);
             // Abort ONLY when the sink is full. `Closed` means the handler future is
-            // already gone, so its `FrontendCall` has queued the abort; do not emit
+            // already gone, so its `CoreCall` has queued the abort; do not emit
             // the same lifecycle event a second time. A full sink still has a live
             // handler, so the detokenizer must initiate cleanup itself.
             if matches!(e, SinkError::Full) {

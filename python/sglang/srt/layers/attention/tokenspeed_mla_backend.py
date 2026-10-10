@@ -404,7 +404,7 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         if save_kv_cache:
             self.token_to_kv_pool.set_mla_kv_buffer(
                 layer,
-                self._kv_write_loc(forward_batch),
+                KVWriteLoc.for_batch(forward_batch),
                 k,
                 k_rope,
             )

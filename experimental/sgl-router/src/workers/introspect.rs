@@ -29,6 +29,7 @@ use std::time::Duration;
 
 use reqwest::header::{HeaderValue, AUTHORIZATION};
 use serde::Deserialize;
+use sglang_processor::openai::OpenAiSettings;
 use tracing::warn;
 use url::Url;
 
@@ -69,6 +70,8 @@ pub struct ServerInfo {
     /// DP ranks behind the endpoint, mirroring the engine's `num_dp_ranks_of`;
     /// an absent field counts as 1.
     pub dp_ranks: u32,
+    /// The engine's OpenAI-layer server args; `None` when `/server_info` did not report them.
+    pub openai: Option<OpenAiSettings>,
 }
 
 /// PD classification derived from a worker's `/server_info` response.
@@ -132,12 +135,26 @@ impl WorkerIntrospector {
         let server_info_url = format!("{base}/server_info");
         let model_info_url = format!("{base}/model_info");
         let (parsed, model_info) = tokio::join!(
-            Self::fetch_with_retry::<ServerInfoBody>(&self.client, &server_info_url, worker_url),
+            Self::fetch_with_retry::<serde_json::Value>(&self.client, &server_info_url, worker_url),
             Self::fetch_with_retry::<ModelInfoBody>(&self.client, &model_info_url, worker_url),
         );
         // A worker that answers one endpoint and not the other still gets
         // registered with whatever did answer.
-        let parsed = parsed.unwrap_or_default();
+        // Parsed apart, so an engine that reports them oddly loses only OpenAI lowering.
+        let openai = parsed
+            .as_ref()
+            .filter(|info| info.get("incremental_streaming_output").is_some())
+            .and_then(|info| OpenAiSettings::deserialize(info).ok());
+        let parsed: ServerInfoBody = parsed
+            .and_then(|info| {
+                serde_json::from_value(info)
+                    .map_err(|e| {
+                        warn!(worker_url = %worker_url, error = %e,
+                        "introspect: /server_info fields did not parse; treating it as absent")
+                    })
+                    .ok()
+            })
+            .unwrap_or_default();
 
         // `/model_info` is the effective identity; `/server_info` is the launch
         // record, kept as the fallback for workers that predate the field
@@ -179,6 +196,7 @@ impl WorkerIntrospector {
                 .dp_size
                 .unwrap_or(1)
                 .saturating_mul(parsed.attn_dp_size.unwrap_or(1)),
+            openai,
         }
     }
 

@@ -560,8 +560,8 @@ def test_pi05_siglip_reuses_srt_model_with_layerwise_groups():
     assert vision_model.embeddings.position_embedding.tp_size == 1
     assert layer.self_attn.tp_size == 1
     assert layer.self_attn.qkv_backend.flatten_batch is False
-    assert layer.mlp.fc1.tp_size == 1
-    assert layer.mlp.fc2.tp_size == 1
+    assert layer.mlp.fc1.output_size_per_partition == config.intermediate_size
+    assert layer.mlp.fc2.input_size_per_partition == config.intermediate_size
     assert isinstance(layer.mlp.act, nn.GELU)
     assert layer.mlp.act.approximate == "tanh"
     assert model.device == vision_model.embeddings.patch_embedding.weight.device

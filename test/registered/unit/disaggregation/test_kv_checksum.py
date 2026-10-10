@@ -132,6 +132,12 @@ class TestKvChecksumComputer(unittest.TestCase):
         kv[0][5, 0] += 1
         self.assertNotEqual(v1, computer.compute(idx))
 
+    def test_state_only_matches_reference(self):
+        state = _make_kv(num_layers=1, num_pages=4, page_elems=16)
+        idx = torch.tensor([1, 3], dtype=torch.int64, device=self.device)
+        value = _make_computer([], 0, state, [32, 32]).compute(idx, idx)
+        self.assertEqual(value, _ref_strided_adler32(state, [idx, idx], [32, 32]))
+
     def test_kv_plus_state_matches_reference(self):
         kv = _make_kv(num_layers=2, num_pages=8, page_elems=32)
         state = [

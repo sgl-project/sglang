@@ -131,6 +131,10 @@ class DynamicChunkSizer:
         return predicted_size
 
     def _profile_prefill_latency(self) -> Tuple[List[int], List[float]]:
+        from sglang.srt.model_executor.runner_utils.buffers import (
+            allocate_pp_proxy_tensors,
+        )
+
         seq_lens: List[int] = []
         latencies: List[float] = []
         model_runner = self.model_runner
@@ -170,9 +174,7 @@ class DynamicChunkSizer:
             # request so release_kv_cache can release it symmetrically.
             req.init_next_round_input(self.tree_cache)
             req.lock = self.tree_cache.lock(req.last_node)
-            req.set_extend_range(
-                len(req.prefix_indices), len(req.full_untruncated_fill_ids)
-            )
+            req.extend_end = len(req.full_untruncated_fill_ids)
 
             # Prepare batch
             batch = ScheduleBatch.init_new(
@@ -185,7 +187,7 @@ class DynamicChunkSizer:
                 self.spec_algorithm,
             )
 
-            current_seq_len = req.extend_range.end
+            current_seq_len = req.extend_end
 
             if is_dp_attention_enabled():
                 # Profiling runs one request on this rank; other DP ranks report 0.
@@ -195,28 +197,18 @@ class DynamicChunkSizer:
                 batch.global_num_tokens = global_num_tokens
                 batch.global_num_tokens_for_logprob = global_num_tokens
 
-            hs = (
-                getattr(model_config, "hc_hidden_size", None)
-                or model_config.hidden_size
-            )
-            proxy_tensors = {
-                "hidden_states": torch.zeros(
-                    (current_seq_len, hs),
+            # Keyed and shaped like the runner's PP buffers.
+            with torch.device(self.device):
+                proxy_tensors = allocate_pp_proxy_tensors(
+                    max_num_tokens=current_seq_len,
+                    max_hidden_tokens=current_seq_len,
+                    hidden_size=model_config.hidden_size,
                     dtype=model_config.dtype,
-                    device=self.device,
-                ),
-                "residual": torch.zeros(
-                    (current_seq_len, model_config.hidden_size),
-                    dtype=model_config.dtype,
-                    device=self.device,
-                ),
-            }
-            pp_proxy_topk_size = model_runner.get_pp_proxy_topk_size()
-            if pp_proxy_topk_size is not None:
-                proxy_tensors["topk_indices"] = torch.zeros(
-                    (current_seq_len, pp_proxy_topk_size),
-                    dtype=torch.int32,
-                    device=self.device,
+                    hc_hidden_size=getattr(model_config, "hc_hidden_size", None),
+                    pp_proxy_topk_size=model_runner.get_pp_proxy_topk_size(),
+                    pp_proxy_residual_num_blocks=(
+                        model_runner.get_pp_proxy_residual_num_blocks()
+                    ),
                 )
 
             pp_proxy = PPProxyTensors(proxy_tensors)

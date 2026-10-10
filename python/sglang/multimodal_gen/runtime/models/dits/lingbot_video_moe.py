@@ -114,7 +114,7 @@ def _lingbot_gated_residual(
 
     Uses the request-gated per-token ``residual_gate_add`` fast path when the
     block's quality-gated site is enabled; otherwise the reference FP32
-    multiply form (bit-exact for ``quality="lossless"``).
+    multiply form (bit-exact for ``quality="exact"``).
     """
     fused = try_lingbot_video_gated_residual(block, residual, update, gate)
     if fused is not None:

@@ -109,8 +109,11 @@ class TestReduceMoeOutput(CustomTestCase):
                 self.assertEqual(self.all_reduces()[0], 0)
                 self.assertTrue(post_experts_output_is_complete(is_tp_path=True))
 
-    def test_fp4_allgather_only_completes_the_tp_sum(self):
+    def test_fp4_allgather_also_completes_the_ep_sum(self):
+        # Its combine reduce-scatters over _TP, which spans the EP group.
         with moe_config(fp4_allgather=True):
+            self.assertTrue(post_experts_output_is_complete(is_tp_path=False))
+        with moe_config():
             self.assertFalse(post_experts_output_is_complete(is_tp_path=False))
 
 

@@ -110,7 +110,8 @@ pub struct Proxy {
     /// on a cleartext URL.
     h2c_client: Client,
     /// Wall-clock timeout for a non-streaming upstream request, and for a
-    /// streaming one's response headers. A stream's body is not bounded by it
+    /// streaming one's response headers, which SGLang's chat endpoint sends with
+    /// the first token. A stream's body is not bounded by it
     /// (long generations are valid), only by the idle and stale-request limits.
     pub request_timeout: Duration,
     /// Maximum silence between streamed upstream chunks; `None` waits forever.
@@ -357,8 +358,10 @@ impl Proxy {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("application/json")
             .to_string();
+        // SGLang's `text/event-stream; charset=utf-8`: clients that decode by the
+        // header would otherwise read the UTF-8 events as Latin-1.
         let content_type = if status.is_success() {
-            "text/event-stream".to_string()
+            "text/event-stream; charset=utf-8".to_string()
         } else {
             upstream_ct
         };

@@ -27,6 +27,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
+from sglang.srt.layers.linear import _resolve_linear_group
 from sglang.srt.layers.parameter import BasevLLMParameter
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
@@ -248,6 +249,11 @@ class VocabParallelEmbedding(torch.nn.Module):
 
         self.enable_tp = enable_tp
         self.use_attn_tp_group = use_attn_tp_group
+        self.tp_group = (
+            _resolve_linear_group("attn_tp" if use_attn_tp_group else "tp")
+            if enable_tp
+            else None
+        )
         if self.enable_tp:
             if use_attn_tp_group:
                 tp_rank = get_parallel().attn_tp_rank

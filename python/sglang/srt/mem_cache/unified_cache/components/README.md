@@ -99,7 +99,7 @@ Find the longest cached prefix for a token sequence.
 |--------|--------|
 | **Purpose** | Walk the radix tree to find the longest prefix where **all** component validators pass |
 | **Inputs** | `params.key: RadixKey` — token IDs + optional extra key for namespace isolation |
-| **Output** | `MatchResult(device_indices, last_device_node, last_host_node, best_match_node, host_hit_length, mamba_branching_seqlen, ...)` |
+| **Output** | `MatchResult(device_prefix_len, last_device_node, last_host_node, best_match_node, host_hit_length, mamba_branching_seqlen, ...)` |
 | **Mutation** | Updates `last_access_time` on matched path; promotes matched nodes to MRU in all component LRU lists; may trigger `_split_node` if match ends mid-node |
 | **Complexity** | **O(K + D·C)** |
 
@@ -237,10 +237,10 @@ Insert a request's KV into the tree: at every checkpoint while it runs, and once
 
 | Aspect | Detail |
 |--------|--------|
-| **Purpose** | Publish the request's KV `[cache_protected_len, up_to)` so other requests can match it; nodes past `req.kv.cache_inserted_len` count one hit (a request counts each node once). `checkpoint_kv_cache` calls it with `req.extend_range.end` while the request runs; `release_kv_cache` calls it with the request-owned length when it finishes (`req.finished()`), then frees `[cache_protected_len, up_to)` and everything past it and unlocks `req.lock`; with `checkpoint=False` it skips the insert and calls `on_release(req, checkpointed=False)` for component cleanup |
+| **Purpose** | Publish the request's KV `[cache_protected_len, up_to)` so other requests can match it; nodes past `req.kv.cache_inserted_len` count one hit (a request counts each node once). `checkpoint_kv_cache` calls it with `req.extend_end` while the request runs; `release_kv_cache` calls it with the request-owned length when it finishes (`req.finished()`), then frees `[cache_protected_len, up_to)` and everything past it and unlocks `req.lock`; with `checkpoint=False` it skips the insert and calls `on_release(req, checkpointed=False)` for component cleanup |
 | **Inputs** | `req` — the request; `up_to` — row position the insert may read up to |
 | **Output** | `None` |
-| **Mutation** | Component hooks → `insert` → re-match → writes the tree's indices back into the row → moves `req.lock` to the node the insert ended on → updates `req.prefix_indices`, `req.kv.cache_protected_len`, `req.kv.cache_inserted_len`, `req.last_node` → component cleanup. A finished request's component state (Mamba) is handed to the tree instead of forked, and what it still held is freed. Frees no KV slot: `release_kv_cache` does that afterwards. |
+| **Mutation** | Component hooks → `insert` → re-match → writes the tree's indices back into the row → moves `req.lock` to the node the insert ended on → updates `req.kv.cache_protected_len`, `req.kv.cache_inserted_len`, `req.last_node` (`checkpoint_kv_cache` then advances `req.prefix_len`) → component cleanup. A finished request's component state (Mamba) is handed to the tree instead of forked, and what it still held is freed. Frees no KV slot: `release_kv_cache` does that afterwards. |
 | **Complexity** | **O(K + D·C)** — insert O(K + D·C) + re-match O(K + D·C) + lock transfer O(D). Simplifies to **O(K)**. |
 
 **Algorithm detail:**

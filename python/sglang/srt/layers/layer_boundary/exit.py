@@ -100,10 +100,14 @@ class ExitPolicy:
         hidden_states: torch.Tensor,
         stream: ResidualStream,
         forward_batch: ForwardBatch,
+        *,
+        already_reduced: bool = False,
     ):
         """Complete the output of the operation-scheduled producer path, which
         never defers: the sum it owes, then its move and write-back."""
         steps = self.plan.path_for(forward_batch)
+        if already_reduced and steps.output_move_completes_sum:
+            raise ValueError("already-reduced output cannot use a reduce-scatter move")
         hidden_states, residual = self._complete_now(
             hidden_states,
             stream.residual,
@@ -111,7 +115,8 @@ class ExitPolicy:
             dp_step=None,
             steps=steps,
             output_move=steps.output_move,
-            owes_sum=steps.output.group is not None
+            owes_sum=not already_reduced
+            and steps.output.group is not None
             and not steps.output_move_completes_sum,
         )
         return self._record_output(
@@ -194,8 +199,10 @@ class ExitPolicy:
             self.plan.fusions is not None
             and self.plan.fusions.can_defer_finalize(self.plan, forward_batch)
         )
-        if not steps.output.may_defer_to_next and not (
-            self.plan.terminal and defer_moe_finalize
+        # An FFN that writes its output at a pipeline handoff completes it here.
+        if steps.writes_at_handoff or (
+            not steps.output.may_defer_to_next
+            and not (self.plan.terminal and defer_moe_finalize)
         ):
             return ExitDecision(
                 defer_moe_finalize=False,
@@ -279,7 +286,7 @@ class ExitPolicy:
                 forward_batch=forward_batch,
             )
         update = steps.output.update
-        if residual is not None and update.applied_at_exit:
+        if residual is not None and (update.applied_at_exit or steps.writes_at_handoff):
             hidden_states = update.update(hidden_states, residual)
             residual = None
         return hidden_states, residual

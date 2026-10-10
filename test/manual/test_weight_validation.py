@@ -104,6 +104,26 @@ class TestWeightValidation(unittest.TestCase):
             self.assertIsNone(error_msg)
             self.assertEqual(corrupted_files, [])
 
+    def test_validate_sharded_model_suffixed_shard_prefix(self):
+        """Shards named `model.safetensors-0000N-of-0000M.safetensors` (Qwen3.5)
+        pair with `model.safetensors.index.json`."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            names = [f"model.safetensors-0000{i}-of-00002.safetensors" for i in [1, 2]]
+            header = b'{"__metadata__":{}}'
+            for name in names:
+                with open(os.path.join(tmpdir, name), "wb") as f:
+                    f.write(struct.pack("<Q", len(header)))
+                    f.write(header)
+            with open(os.path.join(tmpdir, "model.safetensors.index.json"), "w") as f:
+                json.dump({"weight_map": {"a": names[0], "b": names[1]}}, f)
+
+            is_valid, error_msg, corrupted_files = _validate_sharded_model(
+                tmpdir, [os.path.join(tmpdir, name) for name in names]
+            )
+
+            self.assertTrue(is_valid, error_msg)
+            self.assertEqual(corrupted_files, [])
+
     def test_validate_sharded_model_corrupted_shard(self):
         """
         Test that corrupted shards are detected and returned in corrupted_files.

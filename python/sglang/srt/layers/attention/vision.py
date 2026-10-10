@@ -1196,8 +1196,7 @@ class VisionAttention(nn.Module):
                 total_num_kv_heads=num_dummy_heads + num_kv_heads,
                 bias=qkv_bias,
                 quant_config=quant_config,
-                tp_rank=self.tp_rank,
-                tp_size=self.tp_size,
+                parallel_group="replicated" if use_data_parallel else "attn_tp",
                 prefix=add_prefix("qkv_proj", prefix),
             )
         else:
@@ -1206,8 +1205,7 @@ class VisionAttention(nn.Module):
                 output_size=3 * self.dummy_dim,
                 bias=qkv_bias,
                 quant_config=quant_config,
-                tp_rank=self.tp_rank,
-                tp_size=self.tp_size,
+                parallel_group="replicated" if use_data_parallel else "attn_tp",
                 prefix=add_prefix("qkv_proj", prefix),
             )
         # TODO: this layer shards over attention TP but reduces over the full TP
@@ -1226,8 +1224,7 @@ class VisionAttention(nn.Module):
             output_size=embed_dim,
             bias=proj_bias,
             quant_config=quant_config,
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
+            parallel_group="replicated" if use_data_parallel else "attn_tp",
             prefix=add_prefix("proj", prefix),
             use_dp_attention_reduce=use_dp_attention_reduce,
         )

@@ -13,6 +13,7 @@ Covers warmup and cfg-parallel guard paths introduced alongside this file:
 All tests are CPU-only; no model loading, no distributed init.
 """
 
+import json
 import unittest
 from collections import deque
 from types import SimpleNamespace
@@ -32,7 +33,10 @@ from sglang.multimodal_gen.configs.pipeline_configs.sana_wm import SanaWMPipelin
 from sglang.multimodal_gen.configs.sample.longlive2 import LongLive2SamplingParams
 from sglang.multimodal_gen.configs.sample.ltx_2_5 import LTX25SamplingParams
 from sglang.multimodal_gen.configs.sample.minimax_h3 import MiniMaxH3SamplingParams
-from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.sample.sampling_params import (
+    SamplingParams,
+    normalize_quality,
+)
 from sglang.multimodal_gen.configs.sample.sana_wm import SanaWMSamplingParams
 from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
     SetLoraReq,
@@ -65,7 +69,10 @@ from sglang.multimodal_gen.runtime.warmup_request_builder import (
     supports_synthetic_warmup,
 )
 from sglang.multimodal_gen.test.server.gpu_cases import ONE_GPU_CASES, TWO_GPU_CASES
-from sglang.multimodal_gen.test.server.testcase_configs import _get_extra_arg_value
+from sglang.multimodal_gen.test.server.testcase_configs import (
+    _get_extra_arg_value,
+    _with_warmup_quality,
+)
 
 
 def _make_bare_scheduler(enable_cfg_parallel: bool) -> Scheduler:
@@ -706,6 +713,41 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         self.assertEqual(len(reqs), 1)
         self.assertEqual((reqs[0].width, reqs[0].height), (384, 640))
         self.assertEqual(reqs[0].num_frames, case.sampling_params.num_frames)
+
+    def test_ci_warmup_runs_the_request_quality(self):
+        """A request below the server default level unmounts the fusions warmup
+        mounted, so its timed run takes an unwarmed path; warmup must match."""
+        for case in ONE_GPU_CASES + TWO_GPU_CASES:
+            request_quality = case.sampling_params.extras.get("quality")
+            if request_quality is None:
+                continue
+            warmup = _get_extra_arg_value(
+                case.server_args.extras, "--warmup-sampling-params"
+            )
+            self.assertIsNotNone(warmup, case.id)
+            self.assertEqual(
+                json.loads(warmup)["quality"],
+                normalize_quality(request_quality),
+                case.id,
+            )
+
+    def test_warmup_quality_merges_into_existing_warmup_params(self):
+        merged = _with_warmup_quality(
+            ["--load-x", """--warmup-sampling-params '{"num_frames": 9}'"""],
+            "exact",
+        )
+        self.assertEqual(
+            json.loads(_get_extra_arg_value(merged, "--warmup-sampling-params")),
+            {"num_frames": 9, "quality": "exact"},
+        )
+        self.assertEqual(merged[0], "--load-x")
+        kept = _with_warmup_quality(
+            ["""--warmup-sampling-params='{"quality": "lossless"}'"""], "exact"
+        )
+        self.assertEqual(
+            json.loads(_get_extra_arg_value(kept, "--warmup-sampling-params")),
+            {"quality": "lossless"},
+        )
 
     def test_ltx25_ci_warmup_matches_formal_decoder_and_shape(self):
         case = next(

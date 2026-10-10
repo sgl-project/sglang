@@ -72,6 +72,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_cuda,
     is_gfx95_supported,
+    is_gfx1250_supported,
     is_hip,
     is_npu,
     is_xpu,
@@ -122,6 +123,7 @@ else:
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_fp8_fnuz = is_fp8_fnuz()
 _is_gfx95_supported = is_gfx95_supported()
+_is_gfx1250_supported = is_gfx1250_supported()
 # Whether the aiter preshuffle paged-MQA path (page_size=64 + Preshuffle=True +
 # KVBlockSize=64) can be used. Falls back to the legacy page_size=1 / KVBlockSize=1
 # path when the gluon kernel is unavailable (Triton<3.5 and no AOT bundle).
@@ -1897,7 +1899,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             topk_result = _broadcast_indexer_topk_from_rank0(topk_result)
             return maybe_capture_indexer_topk(layer_id, topk_result)
 
-        if _is_hip:
+        if _is_hip and not _is_gfx1250_supported:
             from sglang.kernels.ops.attention.dsa.tilelang_kernel import act_quant
         elif not _is_npu:
             from sglang.kernels.ops.attention.dsa.triton_kernel import act_quant

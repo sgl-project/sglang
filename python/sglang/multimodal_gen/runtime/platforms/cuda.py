@@ -9,6 +9,7 @@ pynvml. However, it should not initialize cuda context.
 import os
 from collections.abc import Callable
 from functools import lru_cache, wraps
+from pkgutil import resolve_name
 from typing import Any, TypeVar
 
 import psutil
@@ -590,15 +591,6 @@ class CudaPlatformBase(Platform):
         raise NotImplementedError
 
     @classmethod
-    def get_device_name(cls, device_id: int = 0) -> str:
-        raise NotImplementedError
-
-    @classmethod
-    @lru_cache(maxsize=1)
-    def get_device_total_memory(cls, device_id: int = 0) -> int:
-        raise NotImplementedError
-
-    @classmethod
     def is_async_output_supported(cls, enforce_eager: bool | None) -> bool:
         if enforce_eager:
             logger.warning(
@@ -825,6 +817,14 @@ class CudaPlatformBase(Platform):
 
             resolved_backend = resolver.resolve(cls)
             if isinstance(resolved_backend, str):
+                if selected_backend == AttentionBackendEnum.SAGE_ATTN:
+                    backend_cls = resolve_name(resolved_backend)
+                    if head_size not in backend_cls.get_supported_head_sizes():
+                        # leave fallback policy to the component-aware selector
+                        raise ValueError(
+                            f"SageAttention 2 does not support head size {head_size}; "
+                            "supported head sizes are 1 through 128"
+                        )
                 return resolved_backend
             target_backend = resolved_backend
 
@@ -838,17 +838,20 @@ class CudaPlatformBase(Platform):
 
     @classmethod
     def optimize_vae(cls, vae: torch.nn.Module) -> torch.nn.Module:
-        """Install the quality-gated FLUX.2 / AutoencoderKL / Wan / Qwen-Image
-        VAE decoder fast paths.
+        """Install the quality-gated FLUX.2 / AutoencoderKL / Wan / Qwen-Image /
+        MiniMax-H3 VAE decoder fast paths.
 
-        Requests with quality="extra-high" or "high" run the fast paths; the
-        "lossless" default runs the original module path bit-for-bit. See
+        Requests with quality="lossless" or "high" run the fast paths; the
+        "exact" default runs the original module path bit-for-bit. See
         flux2_vae_cuda_opt and wan_vae_cuda_opt for details.
         """
         try:
             from sglang.multimodal_gen.runtime.models.vaes.flux2_vae_cuda_opt import (
                 maybe_optimize_autoencoder_kl,
                 maybe_optimize_flux2_vae,
+            )
+            from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_vae_cuda_opt import (
+                maybe_optimize_minimax_h3_vae,
             )
             from sglang.multimodal_gen.runtime.models.vaes.wan_vae_cuda_opt import (
                 maybe_optimize_qwen_image_vae,
@@ -859,6 +862,7 @@ class CudaPlatformBase(Platform):
             vae = maybe_optimize_autoencoder_kl(vae)
             vae = maybe_optimize_wan_vae(vae)
             vae = maybe_optimize_qwen_image_vae(vae)
+            vae = maybe_optimize_minimax_h3_vae(vae)
         except Exception:
             logger.warning(
                 "Failed to apply CUDA VAE optimizations; using the unmodified VAE.",

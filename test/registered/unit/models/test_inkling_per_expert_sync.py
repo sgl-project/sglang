@@ -20,7 +20,7 @@ import unittest
 import torch
 
 import sglang.srt.models.inkling as inkling_mod
-from sglang.srt.runtime_context import reset_context
+from sglang.srt.runtime_context import get_parallel, reset_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import publish_build_topology
 
@@ -38,6 +38,10 @@ class _FakeModel:
             inference_moe_w13_interleaved=interleaved,
         )
         self._moe = moe if moe is not None else types.SimpleNamespace()
+        self._moe.moe_ep_size = get_parallel().moe_ep_size
+        self._moe.moe_ep_rank = get_parallel().moe_ep_rank
+        self._moe.moe_tp_size = get_parallel().moe_tp_size
+        self._moe.moe_tp_rank = get_parallel().moe_tp_rank
 
     def get_submodule(self, path):
         return self._moe

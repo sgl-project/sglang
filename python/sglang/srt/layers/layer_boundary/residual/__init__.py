@@ -70,6 +70,17 @@ class ResidualReadout(Protocol):
         is_plain_norm: Read is normalization/optional quantization without changing
             the residual, allowing compatible fused add+norm implementations.
         reads_before_dp_gather: Preserve this read on source rows before a DP gather.
+        reads_after_attn_tp_gather: Optional. The read needs every row of the
+            attention's, so it runs after any gather over attention TP: a
+            producer that would leave its output on this rank's attention-TP
+            slice returns it to the attention's rows instead.
+        completing_fusions: Optional. ReadoutFusion kernels that complete the
+            sum the input owes with the residual add ahead of this read, tried
+            before the boundary's own all-reduce or reduce-scatter.
+        gathering_reads: Optional. Callables ``(hidden_states, residual,
+            norm)`` that read the input on this rank's attention-TP slice and
+            gather it over attention TP, returning ``(input, residual)``, or
+            None when they do not take the batch.
 
     init_residual initializes the stack residual. read consumes an
     already-written residual; update_and_read first applies the actual

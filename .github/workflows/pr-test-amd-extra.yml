@@ -21,11 +21,9 @@ name: PR Test Extra (AMD)
 # (it now exercises the ROCm canary kernels end-to-end).
 
 on:
+  # No `labeled` trigger, as in pr-test-extra.yml: a label event would cancel
+  # the run in progress. Adding the labels after a push takes a rerun.
   pull_request:
-    # `labeled` lets the workflow re-fire when `run-ci-extra` (or `run-ci`)
-    # is added after the latest push. See call-gate.if for the matching guard
-    # that prevents unrelated label additions from dispatching a full run.
-    types: [opened, synchronize, reopened, labeled]
   workflow_dispatch:
     inputs:
       runner_arch:
@@ -119,16 +117,7 @@ jobs:
   # requires both `run-ci` and `run-ci-extra`. A failure here cascades to
   # every test job via `needs`, so a PR without the labels ends in one red
   # ~30s gate job plus a row of skipped jobs instead of consuming AMD runners.
-  #
-  # The job-level `if` only filters the `labeled` event type so that adding an
-  # unrelated label doesn't dispatch a full run; the actual label-presence
-  # gate is enforced at runtime inside pr-gate.yml.
   call-gate:
-    if: |
-      github.event_name != 'pull_request' ||
-      github.event.action != 'labeled' ||
-      github.event.label.name == 'run-ci' ||
-      github.event.label.name == 'run-ci-extra'
     uses: ./.github/workflows/pr-gate.yml
     with:
       require-run-ci: true
@@ -243,14 +232,7 @@ jobs:
         extra-a-test-1-gpu-large-amd,
         extra-a-test-2-gpu-large-amd,
       ]
-    # Same `labeled` guard as call-gate: an unrelated label would otherwise finish
-    # green with nothing executed, over the real run's result.
-    if: |
-      always() &&
-      (github.event_name != 'pull_request' ||
-       github.event.action != 'labeled' ||
-       github.event.label.name == 'run-ci' ||
-       github.event.label.name == 'run-ci-extra')
+    if: always()
     runs-on: ubuntu-latest
     steps:
       - name: Check all dependent job statuses

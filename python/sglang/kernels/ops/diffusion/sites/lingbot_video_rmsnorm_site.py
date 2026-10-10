@@ -7,7 +7,7 @@ the reference formula still promotes their multiplication through the FP32
 hidden states. For ``quality="high"``, existing diffusion Triton RMSNorm
 kernels replace that chain. Wide rows with FP32 weights use the one-row
 ``norm_infer`` kernel; the remaining sites use the tiled one-pass kernel. Their
-reduction order is not bit-exact, so the default ``quality="lossless"`` path
+reduction order is not bit-exact, so the default ``quality="exact"`` path
 remains unchanged.
 """
 

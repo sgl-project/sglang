@@ -232,6 +232,21 @@ This section provides deployment configurations optimized for different hardware
 
 - **Xeon CPU service configuration**: Please refer to the `Notes` part in the serving engine launching section in [the SGLang CPU server document](../../../docs/hardware-platforms/cpu_server#launch-of-the-serving-engine) to better understand how to configure the arguments, especially for TP (tensor parallel) and NUMA binding settings.
 
+<a id="agentic-long-context-deployment" />
+
+### 3.3 Agentic Long-Context Deployment
+
+Agentic workloads, such as coding agents and other multi-turn, tool-using assistants, send long prompts whose prefixes grow and repeat from turn to turn. Serving them well depends on reusing the KV cache across turns, offloading it beyond GPU memory, and keeping each session on the workers that already hold its prefix. This section gives complete launch commands for such deployments of Qwen3.5-397B-A17B, each benchmarked in [SemiAnalysis InferenceX](https://inferencex.semianalysis.com/) and linked to the run that measured it. Pick a hardware platform, checkpoint, deployment shape, concurrency, KV cache offloading mechanism and router to get every process of the deployment as a raw command, one tab per process in launch order.
+
+- **Router.** Each configuration was submitted behind one front door: Dynamo (`dynamo.frontend` with `dynamo.sglang` workers) or SGLang (`sglang.launch_server`, behind `sglang_router` when there are several workers or DP-attention ranks).
+- **KV offload.** Choose among these KV cache offloading mechanisms: none (GPU KV only), HiCache (host DRAM), or a Mooncake store attached through the external linker. The Mooncake option needs an image whose SGLang build includes `--enable-unified-cache-external-linker`.
+- **Container image.** Run the commands inside the image listed for each configuration. Several are SGLang nightly images, so flag names follow that image.
+
+import { AgentX } from "/src/snippets/_agentx.jsx";
+import { agentx } from "/src/snippets/agentx/Qwen/qwen3.5.jsx";
+
+<AgentX data={agentx} />
+
 ## 4. Model Invocation
 
 **NVIDIA:**
@@ -1021,44 +1036,6 @@ P95 ITL (ms):                            72.10
 P99 ITL (ms):                            149.57
 Max ITL (ms):                            1220.68
 ==================================================
-```
-
-#### 5.2.3 Agentic Long-Context with HiCache DRAM Offload (H200 FP8, MTP)
-
-For agentic workloads, here is how to enable HiCache and MTP.
-
-Container image (pinned for reproducibility):
-`lmsysorg/sglang:nightly-dev-cu13-20260815-a5ba081f`.
-
-Server Launch Command:
-```bash Command
-python3 -m sglang.launch_server \
-  --model-path Qwen/Qwen3.5-397B-A17B-FP8 \
-  --served-model-name Qwen/Qwen3.5-397B-A17B-FP8 \
-  --trust-remote-code \
-  --tensor-parallel-size 8 \
-  --data-parallel-size 1 \
-  --expert-parallel-size 1 \
-  --quantization fp8 \
-  --kv-cache-dtype fp8_e4m3 \
-  --mamba-ssm-dtype bfloat16 \
-  --attention-backend flashinfer \
-  --enable-flashinfer-allreduce-fusion \
-  --mem-fraction-static 0.8 \
-  --stream-interval 50 \
-  --scheduler-recv-interval 10 \
-  --tokenizer-worker-num 6 \
-  --enable-metrics \
-  --speculative-algorithm EAGLE \
-  --speculative-num-steps 3 \
-  --speculative-eagle-topk 1 \
-  --speculative-num-draft-tokens 4 \
-  --page-size 64 \
-  --enable-hierarchical-cache \
-  --hicache-size 77 \
-  --hicache-io-backend kernel \
-  --hicache-mem-layout page_first \
-  --hicache-write-policy write_through_selective
 ```
 
 ### 5.3 Vision Speed Benchmark

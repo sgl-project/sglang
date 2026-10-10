@@ -19,7 +19,8 @@ use sgl_router::proxy::Proxy;
 use sgl_router::server::app::build_router;
 use sgl_router::server::app_context::AppContext;
 use sgl_router::tokenizer::TokenizerRegistry;
-use sgl_router::workers::WorkerRegistry;
+use sgl_router::workers::{EngineProfile, WireProtocol, WorkerRegistry};
+use sglang_processor::openai::OpenAiSettings;
 use std::sync::Arc;
 use std::time::Duration;
 use tower::ServiceExt;
@@ -51,16 +52,30 @@ fn config(flags: &[&str]) -> Config {
 }
 
 fn build_ctx(url: String, flags: &[&str]) -> Arc<AppContext> {
+    build_ctx_with(url, flags, None)
+}
+
+/// [`build_ctx`] whose worker reported `openai` settings, so OpenAI requests are lowered.
+fn build_ctx_with(
+    url: String,
+    flags: &[&str],
+    openai: Option<Arc<OpenAiSettings>>,
+) -> Arc<AppContext> {
     let cfg = config(flags);
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
     let registry = Arc::new(WorkerRegistry::default());
-    let _ = registry.add(WorkerSpec {
+    let spec = WorkerSpec {
         id: WorkerId(url.clone()),
         url,
         mode: WorkerMode::Plain,
         model_ids: vec![ModelId(MODEL.into())],
         ..Default::default()
-    });
+    };
+    let profile = EngineProfile {
+        openai,
+        ..WireProtocol::default().into()
+    };
+    let _ = registry.add_with_cb(spec, None, profile);
     let policies = Arc::new(build_registry_with_defaults(&cfg).unwrap());
     let proxy = Arc::new(Proxy::new(Duration::from_secs(5)).unwrap());
     Arc::new(AppContext::new(cfg, tokenizers, proxy, registry, policies))
@@ -115,6 +130,32 @@ async fn configured_values_reach_the_engine_when_the_request_omits_them() {
     assert_eq!(body.get("frequency_penalty"), Some(&json!(0)));
     assert_eq!(body.get("presence_penalty"), Some(&json!(0)));
     assert_eq!(body.get("n"), Some(&json!(1)));
+}
+
+/// Configured values apply to the OpenAI request before it is lowered to
+/// `/generate`, where every sampling key is already filled in.
+#[tokio::test]
+async fn configured_values_reach_a_lowered_completion() {
+    let mock = MockWorker::start(vec![]).await;
+    let flags = ["--override-sampling-params", OVERRIDES];
+    let ctx = build_ctx_with(mock.url.clone(), &flags, Some(Arc::default()));
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({"model": MODEL, "prompt": "hi"}).to_string(),
+        ))
+        .unwrap();
+    assert_eq!(
+        build_router(ctx).oneshot(req).await.unwrap().status(),
+        StatusCode::OK
+    );
+
+    let params = &captured(&mock).expect("worker received a request")["sampling_params"];
+    assert_eq!(params["temperature"], json!(1.0));
+    assert_eq!(params["top_p"], json!(0.95));
+    assert_eq!(params["top_k"], json!(1000));
 }
 
 /// Under the default `reject` mode a conflicting request is a 400 that never

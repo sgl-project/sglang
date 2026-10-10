@@ -12,6 +12,7 @@ from sglang.srt.layers.layer_boundary import StageKind
 from sglang.srt.layers.layer_boundary import prepare as comm_ops
 from sglang.srt.layers.layer_boundary.contracts import BatchVariant
 from sglang.srt.layers.layer_boundary.ops import keep_output
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.models.bailing_moe import BailingMoEModel
@@ -208,6 +209,22 @@ class TestAuxCaptureDeferredAllreduce(CustomTestCase):
         self.assertIs(hidden, owed)
         self.assertIsNone(captured)
         reduce.assert_not_called()
+
+    def test_an_empty_final_norm_still_captures(self):
+        # A rank without rows takes the same number of captures as the others.
+        stream = ResidualStream(torch.empty(0, 4))
+        hidden = stream.record(torch.empty(0, 4), comm.PLAIN_ADD)
+        batch = SimpleNamespace(residual_stream=stream)
+        captured = AuxHiddenStateList()
+        hidden = residual_batch.final_norm(
+            hidden,
+            batch,
+            SumNorm(),
+            capture=captured.capture,
+            skip_empty=True,
+        )
+        self.assertEqual(tuple(hidden.shape), (0, 4))
+        self.assertEqual([tuple(c.shape) for c in captured], [(0, 4)])
 
     def test_snapshot_without_a_residual_does_not_alias_the_main_output(self):
         hidden = torch.ones(2, 4)

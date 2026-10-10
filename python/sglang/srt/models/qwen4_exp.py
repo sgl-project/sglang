@@ -1,7 +1,8 @@
 """Inference-only Qwen4-Exp (text + VL) on the Qwen3.5 backbone."""
 
 import math
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass
 from typing import Any, Iterable, Optional, Set, Tuple, Union
 
 import msgspec
@@ -34,10 +35,10 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.hyperconnection import (
     GatedResidual,
+    GroupedGemmaRMSNorm,
     HyperConnectionConfig,
 )
 from sglang.srt.layers.layer_boundary import (
-    ExitRows,
     GatedResidualState,
     append_stages,
     declare_attn,
@@ -48,6 +49,7 @@ from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptMixedPrecisionConfig,
@@ -1423,24 +1425,31 @@ class _MixStreams:
     """The layer stack's terminal read: the gated mix down to one stream. The
     stack ends on the mix, with no final norm after it."""
 
-    def __init__(self, hyper_connection_mixer):
+    def __init__(self, hyper_connection_mixer, normalized_input=None):
         self.hyper_connection_mixer = hyper_connection_mixer
+        self.normalized_input = normalized_input
 
     def __call__(self, hidden_states):
-        return self.hyper_connection_mixer.mix(hidden_states)[0]
+        return self.hyper_connection_mixer.mix(
+            hidden_states, normalized_input=self.normalized_input
+        )[0]
+
+
+@dataclass
+class _HCNorms:
+    """Prepared norms for one layer invocation; never carried across PLE or PP."""
+
+    attn_input: Optional[torch.Tensor]
+    next_norm: Optional[GroupedGemmaRMSNorm]
+    ffn_input: Optional[torch.Tensor] = None
+    output: Optional[torch.Tensor] = None
 
 
 def _has_ple(layer_id, config) -> bool:
     return (layer_id + 1) in config.ple_layer_ids
 
 
-def _ffn_exit_rows(layer_id, config):
-    """A PLE layer's read adds an embedding computed for every row, so the FFN
-    before it hands its output on as full attention rows."""
-    return ExitRows.ATTENTION if _has_ple(layer_id + 1, config) else None
-
-
-def _build_qwen4_exp_stages(residual, *, sparse, layer_id, config):
+def _build_qwen4_exp_stages(residual, *, sparse):
     """The attention and FFN stage boundaries of one gated hyper-connection layer.
 
     Each read normalizes the streams itself, so neither stage binds a norm, and
@@ -1458,7 +1467,6 @@ def _build_qwen4_exp_stages(residual, *, sparse, layer_id, config):
                 next_layer_sparse=sparse,
                 read=residual.ffn_readout,
                 update=residual.ffn_update,
-                exit_rows=_ffn_exit_rows(layer_id, config),
             ),
             None,
         ),
@@ -1478,6 +1486,7 @@ class Qwen4ExpLayerExtensionMixin:
         self.ple = None
         self._ple_forward_batch = None
         self._ple_batch = None
+        self._hc_norms = None
 
         # The gated reads normalize the streams themselves, so these layers
         # have neither of the norms their base class builds.
@@ -1523,14 +1532,40 @@ class Qwen4ExpLayerExtensionMixin:
             GatedResidualState(
                 expand=self._widen_streams,
                 attn_mix=self._attn_mix,
-                ffn_mix=self.mlp_hyper_connection.mix,
-                attn_combine=self.attn_hyper_connection.combine,
-                ffn_combine=self.mlp_hyper_connection.combine,
+                ffn_mix=self._ffn_mix,
+                attn_combine=self._attn_combine,
+                ffn_combine=self._ffn_combine,
+                # The PLE embedding is computed for every row.
+                attn_reads_every_row=self.ple is not None,
             ).residual_ops(),
             sparse=isinstance(self.mlp, Qwen2MoeSparseMoeBlock),
-            layer_id=layer_id,
-            config=config,
         )
+
+        from sglang.srt.layers.moe.qwen4_decode import prepare_qwen4_decode_comm
+
+        self._decode_moe_comm = (
+            prepare_qwen4_decode_comm(self.mlp)
+            if isinstance(self.mlp, Qwen2MoeSparseMoeBlock)
+            else None
+        )
+
+    @contextmanager
+    def hc_norms(self, normalized_input, next_norm):
+        norms = _HCNorms(normalized_input, next_norm)
+        # A prepared norm can only follow its residual without row movement.
+        self._hc_norms = (
+            norms
+            if get_parallel().attn_dp_size == 1
+            and get_parallel().attn_cp_size == 1
+            and get_parallel().moe_ep_size == 1
+            and not get_attn_tp_context().input_scattered
+            and get_moe_a2a_backend().is_none()
+            else None
+        )
+        try:
+            yield norms
+        finally:
+            self._hc_norms = None
 
     def _widen_streams(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Open the layer stack's input into one stream per hyper connection.
@@ -1546,7 +1581,42 @@ class Qwen4ExpLayerExtensionMixin:
         own contribution to the streams and joins them before the read."""
         if self.ple is not None:
             residual = self._add_ple_embedding(residual)
-        return self.attn_hyper_connection.mix(residual)
+        normalized_input = (
+            self._hc_norms.attn_input
+            if self._hc_norms is not None and self.ple is None
+            else None
+        )
+        return self.attn_hyper_connection.mix(
+            residual, normalized_input=normalized_input
+        )
+
+    def _attn_combine(self, hidden_states, residuals):
+        if self._hc_norms is None:
+            return self.attn_hyper_connection.combine(hidden_states, residuals)
+        hidden_states, self._hc_norms.ffn_input = (
+            self.attn_hyper_connection.combine_and_normalize(
+                hidden_states, residuals, self.mlp_hyper_connection.hc_norm
+            )
+        )
+        return hidden_states
+
+    def _ffn_mix(self, residual):
+        normalized_input = (
+            self._hc_norms.ffn_input if self._hc_norms is not None else None
+        )
+        return self.mlp_hyper_connection.mix(
+            residual, normalized_input=normalized_input
+        )
+
+    def _ffn_combine(self, hidden_states, residuals):
+        if self._hc_norms is None:
+            return self.mlp_hyper_connection.combine(hidden_states, residuals)
+        hidden_states, self._hc_norms.output = (
+            self.mlp_hyper_connection.combine_and_normalize(
+                hidden_states, residuals, self._hc_norms.next_norm
+            )
+        )
+        return hidden_states
 
     def _add_ple_embedding(self, residual: torch.Tensor) -> torch.Tensor:
         forward_batch, ple_batch = self._ple_forward_batch, self._ple_batch
@@ -1581,6 +1651,21 @@ class Qwen4ExpLayerExtensionMixin:
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ) -> torch.Tensor:
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
+        if (
+            self._decode_moe_comm is not None
+            and hidden_states.shape[0] == 1
+            and hidden_states.dtype == torch.bfloat16
+            and not get_attn_tp_context().input_scattered
+            and not torch.compiler.is_compiling()
+        ):
+            from sglang.srt.layers.moe.qwen4_decode import qwen4_decode_moe
+
+            hidden_states = qwen4_decode_moe(
+                hidden_states, self.mlp, self._decode_moe_comm
+            )
+            return self.ffn_boundary.complete_now(
+                hidden_states, forward_batch, already_reduced=True
+            )
         with self.ffn_boundary.exit(forward_batch) as ffn_exit:
             if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
                 hidden_states = self.mlp(
@@ -1863,8 +1948,6 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             if self.pp_group.is_last_rank
             else PPMissingLayer()
         )
-        # The stack's terminal read mixes the streams down; there is no final norm.
-        self._mix_streams = _MixStreams(self.hyper_connection_mixer)
 
     def forward(
         self,
@@ -1911,6 +1994,7 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                 ngram_eos_token_id=self.ple_ngram_eos_token_id,
             )
         aux_hidden_states = AuxHiddenStateList()
+        normalized_input = None
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
             if i + 1 < self.end_layer:
@@ -1922,7 +2006,17 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                         next_ple.start_prefetch(
                             batch=ple_batch, forward_batch=forward_batch
                         )
-            with get_global_expert_distribution_recorder().with_current_layer(i):
+            next_norm = None
+            if i + 1 < self.end_layer:
+                next_layer = self.layers[i + 1]
+                if next_layer.ple is None:
+                    next_norm = next_layer.attn_hyper_connection.hc_norm
+            elif self.pp_group.is_last_rank:
+                next_norm = self.hyper_connection_mixer.hc_norm
+            with (
+                get_global_expert_distribution_recorder().with_current_layer(i),
+                layer.hc_norms(normalized_input, next_norm) as norms,
+            ):
                 hidden_states = layer(
                     positions=positions,
                     hidden_states=hidden_states,
@@ -1934,6 +2028,8 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                         else None
                     ),
                 )
+
+            normalized_input = norms.output
 
         if breakable_ple:
             _breakable_commit_ple_batch(batch=ple_batch)
@@ -1950,7 +2046,9 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
 
         hc_hidden_states = hidden_states
         hidden_states = residual_batch.final_norm(
-            hidden_states, forward_batch, self._mix_streams
+            hidden_states,
+            forward_batch,
+            _MixStreams(self.hyper_connection_mixer, normalized_input),
         )
         if not forward_batch.forward_mode.is_idle():
             return hidden_states, hc_hidden_states

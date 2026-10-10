@@ -718,7 +718,6 @@ def _build_inkling_shared_experts(
     if n_shared_experts <= 0:
         return None
     # The shared dense MLP is reconstructed by the full-TP all-reduce in forward.
-    parallel = get_parallel()
     if shared_expert_sink:
         shared_prefix = add_prefix("shared_experts", prefix)
         shared_sink_serves_fp4 = InklingBatchDenseMLP._resolve_fp4_strategy(
@@ -746,8 +745,7 @@ def _build_inkling_shared_experts(
             prefix=shared_prefix,
             quant_config=quant_config,
             inference_moe_w13_interleaved=inference_moe_w13_interleaved,
-            tp_rank=parallel.tp_rank,
-            tp_size=parallel.tp_size,
+            parallel_group="tp",
             tp_group=get_parallel().tp_group,
         )
         return InklingBatchDenseMLP(
@@ -765,8 +763,7 @@ def _build_inkling_shared_experts(
         layer_id=layer_id,
         prefix=add_prefix("shared_experts", prefix),
         quant_config=quant_config,
-        tp_rank=parallel.tp_rank,
-        tp_size=parallel.tp_size,
+        parallel_group="tp",
         tp_group=get_parallel().tp_group,
     )
 

@@ -393,7 +393,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
         value_chunks: &[Tensor],
         best_value_len: usize,
     ) -> MatchResult {
-        let swa_boundary_len = result.device_indices.size()[0] as usize + result.host_hit_length;
+        let swa_boundary_len = result.device_prefix_len + result.host_hit_length;
 
         // Branch at the last page-aligned Full-KV position past the SWA boundary.
         let page_aligned_full_hit_len =
@@ -801,19 +801,6 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
                     state.evict_device_pending_num_tokens = needed;
                     break 'step None;
                 }
-            }
-            if tree_core.is_write_back
-                && tree_core.swa_write_back_eviction_barrier_enabled
-                && tree_core.component_state(SWA).evict_device_last_backup != Some(x)
-                && !tree_core.arena.node(x).backuped()
-            {
-                // A later Full backup cannot recover SWA data after this
-                // internal node is tombstoned. Pause on the same cursor so
-                // the Controller can preserve the dirty path first.
-                tree_core.component_state_mut(SWA).evict_device_backup_node = Some(x);
-                tree_core.component_state_mut(SWA).evict_device_last_backup = Some(x);
-                cursor = Some(x);
-                break 'step None;
             }
             // Internal nodes are tombstoned inline (no IO).
             tree_core.evict_component_and_detach_lru_(

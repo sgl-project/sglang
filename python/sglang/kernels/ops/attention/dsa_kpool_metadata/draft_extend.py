@@ -45,7 +45,7 @@ def _fused_dsa_draft_extend_metadata_kernel(
     num_splits,
     dsa_index_topk: tl.constexpr,
     index_kpool: tl.constexpr,
-    real_page_size: tl.constexpr,
+    physical_page_size: tl.constexpr,
     HAS_REAL_PAGE_TABLE: tl.constexpr,
     HAS_PAGE_TABLE_1: tl.constexpr,
     STATIC_EXTEND_LEN: tl.constexpr,
@@ -183,13 +183,13 @@ def _fused_dsa_draft_extend_metadata_kernel(
             )
 
         if HAS_REAL_PAGE_TABLE:
-            real_mask = mask & ((offs_n[None, :] % real_page_size) == 0)
-            real_cols = offs_n // real_page_size
+            real_mask = mask & ((offs_n[None, :] % physical_page_size) == 0)
+            real_cols = offs_n // physical_page_size
             tl.store(
                 real_page_table
                 + out_rows_i64[:, None] * real_page_table_stride_0
                 + real_cols[None, :] * real_page_table_stride_1,
-                (vals // real_page_size)[None, :],
+                (vals // physical_page_size)[None, :],
                 mask=real_mask,
             )
 
@@ -210,7 +210,7 @@ def fused_dsa_draft_extend_metadata(
     total_len: int,
     max_seqlen_k: int,
     dsa_index_topk: int,
-    real_page_size: int,
+    physical_page_size: int,
     max_extend_len: int,
     max_total_len: int,
     static_extend_len: bool = False,
@@ -245,7 +245,7 @@ def fused_dsa_draft_extend_metadata(
     assert total_len <= bs * max_extend_len
     assert index_kpool > 0
 
-    has_real_page_table = real_page_size > 1
+    has_real_page_table = physical_page_size > 1
     if has_real_page_table:
         assert real_page_table is not None
         assert real_page_table.is_cuda
@@ -297,7 +297,7 @@ def fused_dsa_draft_extend_metadata(
         num_splits,
         dsa_index_topk,
         index_kpool,
-        real_page_size,
+        physical_page_size,
         has_real_page_table,
         has_page_table_1,
         static_extend_len,

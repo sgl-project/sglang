@@ -2,7 +2,7 @@
 
 The fused FC1 + SwiGLU + FC2-input quantization path changes the rounding
 order by quantizing before the reference BF16 intermediate is materialized.
-Keep it disabled for the lossless default and mount it only for
+Keep it disabled below the approximate tier and mount it only for
 ``quality="high"`` requests at denoising batch boundaries.
 """
 

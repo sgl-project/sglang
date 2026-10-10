@@ -136,12 +136,11 @@ export const config = {
           label: "L1 + L2",
           subtitle: "Host memory",
           flags: (s) => s.hw === "mi355x"
-            ? ["--enable-hierarchical-cache", "--hicache-ratio 0.50",
-              "--hicache-write-policy write_through", "--hicache-io-backend direct",
-              "--hicache-mem-layout page_first_direct"]
+            ? ["--enable-hierarchical-cache", "--hicache-size 180",
+              "--hicache-write-policy write_through"]
             : ["--enable-hierarchical-cache", "--hicache-size 32"],
           hints: (s) => s.hw === "mi355x"
-            ? ["Host cache matches the measured 0.50-ratio, write-through MI355X recipe; check available RAM."]
+            ? ["About 750 GB of host memory per node; the measured MI355X agentic recipe."]
             : ["32 GB host tier; the default ratio can demand more host RAM than the node has free."],
         },
         {
@@ -394,9 +393,9 @@ sgl-eval run gsm8k \\
   },
 
   cells: [
-    // Four MI355X VFs, TP4/EP4. The fixed-source AgentX comparison also used
-    // HiCache L2 and CPU multimodal transport. These cookbook commands are
-    // supported starting points, not post-merge measurements of every overlay.
+    // Four MI355X VFs, TP4/EP4. The MXFP4 Low Latency chunk and memory fraction
+    // come from AgentX with the 180 GB/rank HiCache L2 tier; the other cells
+    // are supported starting points, not measurements of every overlay.
     {
       match: { hw: "mi355x", strategy: "low-latency", quant: "fp8" },
       nnodes: 1,
@@ -445,9 +444,9 @@ sgl-eval run gsm8k \\
         "--quantization quark",
         "--tp-size 4", "--ep-size 4",
         "--page-size 64",
-        "--mem-fraction-static 0.82", "--max-running-requests 96",
+        "--mem-fraction-static 0.85", "--max-running-requests 96",
         "--cuda-graph-max-bs-decode 96", "--min-free-slots-delay 1",
-        "--chunked-prefill-size 8192", "--max-prefill-tokens 8192",
+        "--chunked-prefill-size 65536", "--max-prefill-tokens 65536",
         "--prefill-decode-interval 0",
         "--dsa-prefill-backend tilelang", "--dsa-decode-backend tilelang",
         "--linear-attn-verify-backend triton", "--kv-cache-dtype fp8_e4m3",

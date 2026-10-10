@@ -43,7 +43,7 @@ class TestSchedulePolicyWaitingQueueMatching(unittest.TestCase):
 class TestSchedulerLoadInquirer(unittest.TestCase):
     def make_inquirer(self, waiting_queue_prefix_matched):
         waiting_req = SimpleNamespace(seqlen=100, num_matched_prefix_tokens=20)
-        chunked_req = SimpleNamespace(seqlen=50, prefix_indices=range(10))
+        chunked_req = SimpleNamespace(seqlen=50, prefix_len=10)
         return SimpleNamespace(
             disaggregation_mode=DisaggregationMode.NULL,
             get_waiting_queue=lambda: [waiting_req],

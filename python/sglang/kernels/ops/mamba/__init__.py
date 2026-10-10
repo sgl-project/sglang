@@ -149,3 +149,15 @@ register_kernel(
         capabilities=frozenset({CapabilityRequirement.CUDA}),
     )
 )
+
+register_kernel(
+    KernelSpec(
+        op="mamba.fill_track_conv_indices",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.mamba.sconv_tracking:fill_track_conv_indices",
+        capabilities=_CUDA,
+        format_signature=FormatSignature(
+            in_place=True, description="short-convolution checkpoint-window indices"
+        ),
+    )
+)

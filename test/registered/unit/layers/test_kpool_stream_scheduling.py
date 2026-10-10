@@ -691,7 +691,7 @@ class TestKPoolPerRequestChunking(CustomTestCase):
         )
         with _chunking_patches(
             rows_per_chunk=rows_per_chunk,
-            kv_pool=SimpleNamespace(page_size=256, slots_per_page=64),
+            kv_pool=SimpleNamespace(page_size=256, index_page_size=64),
         ):
             result = IndexerKPool._get_topk_ragged_kpool(
                 backend,

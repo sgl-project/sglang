@@ -3,14 +3,11 @@ SGLang Diffusion Server API client.
 Provides a low-level interface for interacting with SGLang Diffusion HTTP server.
 """
 
-import base64
-import io
 import os
 import time
 from typing import Any, Dict, Optional
 
 import requests
-from PIL import Image
 
 
 class SGLDiffusionServerAPI:
@@ -99,8 +96,8 @@ class SGLDiffusionServerAPI:
             seed: Random seed for reproducible generation
             enable_teacache: Enable TEA cache acceleration
             response_format: Response format ("b64_json" or "url")
-            quality: Request optimization tier ("auto", "lossless",
-                "extra-high", "high") - only for generation
+            quality: Request optimization tier ("auto", "exact",
+                "lossless", "high") - only for generation
             style: Image style ("vivid" or "natural") - only for generation
             background: Background type ("auto", "transparent", "opaque")
             output_format: Output format ("png", "jpeg", "webp")
@@ -416,38 +413,6 @@ class SGLDiffusionServerAPI:
             ".webp": "image/webp",
         }
         return content_types.get(ext, "image/png")
-
-    def decode_image_from_response(
-        self, response_data: Dict[str, Any], index: int = 0
-    ) -> Image.Image:
-        """
-        Decode base64 image from API response.
-
-        Args:
-            response_data: API response dictionary
-            index: Index of the image in the response (default: 0)
-
-        Returns:
-            PIL Image object
-        """
-        if "data" not in response_data or not response_data["data"]:
-            raise ValueError("No image data in response")
-
-        if index >= len(response_data["data"]):
-            raise IndexError(f"Image index {index} out of range")
-
-        image_data = response_data["data"][index]
-        if "b64_json" not in image_data or not image_data["b64_json"]:
-            raise ValueError("No base64 image data found")
-
-        image_bytes = base64.b64decode(image_data["b64_json"])
-        image = Image.open(io.BytesIO(image_bytes))
-
-        # Convert to RGB if needed
-        if image.mode != "RGB":
-            image = image.convert("RGB")
-
-        return image
 
     def set_lora(
         self,

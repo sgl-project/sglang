@@ -159,7 +159,7 @@ class C128SidecarComponent(TreeComponent):
         # endpoint, so constrain that candidate to the nearest C128 boundary.
         group_tokens = 128 * self.allocator.c128_attn_allocator.page_size
         branching_seqlen = branching_seqlen // group_tokens * group_tokens
-        current_boundary = len(result.device_indices) + result.host_hit_length
+        current_boundary = result.device_prefix_len + result.host_hit_length
         return result._replace(
             swa_branching_seqlen=(
                 branching_seqlen if branching_seqlen > current_boundary else None

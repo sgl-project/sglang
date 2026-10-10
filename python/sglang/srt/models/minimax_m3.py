@@ -23,6 +23,11 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.kernels.ops.quantization.mxfp8_swizzled_triton import (
+    can_use_silu_mul_mxfp8,
+    swiglu_oai_mxfp8,
+    swiglu_oai_mxfp8_deepgemm,
+)
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_stages
 from sglang.srt.configs.model_config import (
     get_minimax_sparse_disable_value_layer_ids,
@@ -48,9 +53,11 @@ from sglang.srt.layers.layer_boundary import (
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
 from sglang.srt.layers.linear import (
+    LinearParallelGroup,
     MergedColumnParallelLinear,
     QKVParallelLinear,
     ReplicatedLinear,
+    ReplicatedParallelGroup,
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -62,6 +69,11 @@ from sglang.srt.layers.moe.utils import (
     is_shared_experts_fusion_disabled,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.mxfp8_input import (
+    Mxfp8SwizzledInput,
+    accepts_mxfp8_deepgemm_input,
+    accepts_mxfp8_swizzled_input,
+)
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer
@@ -85,9 +97,10 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
+from sglang.srt.models.deepseek_common.utils import tiny_router_gemm_max_tokens
 from sglang.srt.models.minimax_m2 import MiniMaxM2RMSNormTP
 from sglang.srt.models.utils import WeightsMapper
-from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
+from sglang.srt.runtime_context import get_exec, get_forward, get_parallel, get_stream
 from sglang.srt.utils import (
     add_prefix,
     get_device_sm,
@@ -113,6 +126,12 @@ if _is_gfx95_supported:
     )
 else:
     router_gemv = router_gemv_supported = None
+
+# Import-time CUDA kernels would block processor imports on CPU CI.
+if _is_cuda:
+    from sglang.kernels.ops.gemm.tiny_gemm import tiny_gemm_bf16
+else:
+    tiny_gemm_bf16 = None
 
 _FP8_KV_DTYPES = (
     torch.float8_e4m3fn,
@@ -171,6 +190,7 @@ class MultiHeadRMSNorm(nn.Module):
     ) -> None:
         super().__init__()
         self.tp_world = get_parallel().attn_tp_size
+        self.tp_rank = get_parallel().attn_tp_rank
         self.num_heads = num_heads
         self.num_heads_per_tp = num_heads // self.tp_world
         self.head_dim = head_dim
@@ -181,16 +201,13 @@ class MultiHeadRMSNorm(nn.Module):
         self.apply_layernorm_1p = apply_layernorm_1p
         self.variance_epsilon = eps
 
-    @staticmethod
     def weight_loader(
+        self,
         param: nn.Parameter,
         loaded_weight: torch.Tensor,
     ) -> None:
-        tp_world = get_parallel().attn_tp_size
-        tp_rank = get_parallel().attn_tp_rank
-
-        shard_size = loaded_weight.shape[0] // tp_world
-        shard = slice(tp_rank * shard_size, (tp_rank + 1) * shard_size)
+        shard_size = loaded_weight.shape[0] // self.tp_world
+        shard = slice(self.tp_rank * shard_size, (self.tp_rank + 1) * shard_size)
         param.data.copy_(loaded_weight[shard].reshape_as(param))
 
     def forward(
@@ -273,12 +290,13 @@ class MiniMaxM3MLP(nn.Module):
         prefix: str = "",
         reduce_results: bool = True,
         intermediate_size: int = None,
-        tp_rank: Optional[int] = None,
-        tp_size: Optional[int] = None,
+        *,
+        parallel_group: LinearParallelGroup = "tp",
     ) -> None:
         super().__init__()
         hidden_size = config.hidden_size
         hidden_act = config.hidden_act
+        self.fuse_swiglu_oai_mxfp8 = hidden_act == "swigluoai"
 
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
@@ -286,8 +304,7 @@ class MiniMaxM3MLP(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("gate_up_proj", prefix),
-            tp_rank=tp_rank,
-            tp_size=tp_size,
+            parallel_group=parallel_group,
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
@@ -296,15 +313,16 @@ class MiniMaxM3MLP(nn.Module):
             quant_config=quant_config,
             reduce_results=reduce_results,
             prefix=add_prefix("down_proj", prefix),
-            tp_rank=tp_rank,
-            tp_size=tp_size,
+            parallel_group=parallel_group,
         )
         if hidden_act == "silu":
             self.act_fn = SiluAndMul()
         elif hidden_act == "swigluoai":
+            self.swiglu_alpha = float(config.swiglu_alpha)
+            self.swiglu_limit = float(config.swiglu_limit)
             if _is_npu:
                 self.act_fn = lambda x: self._swigluoai_fused(
-                    x, config.swiglu_alpha, config.swiglu_limit
+                    x, self.swiglu_alpha, self.swiglu_limit
                 )
             else:
                 from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
@@ -312,12 +330,30 @@ class MiniMaxM3MLP(nn.Module):
                 )
 
                 self.act_fn = lambda x: swiglu_no_interleaved_with_alpha_and_limit(
-                    x, config.swiglu_alpha, config.swiglu_limit
+                    x, self.swiglu_alpha, self.swiglu_limit
                 )
         else:
             raise ValueError(
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
+
+    def _swiglu_oai_mxfp8(self, gate_up: torch.Tensor):
+        if not (
+            self.fuse_swiglu_oai_mxfp8
+            and gate_up.shape[0] > 0
+            and not get_forward().sp_active
+            and can_use_silu_mul_mxfp8(gate_up)
+        ):
+            return None
+        if accepts_mxfp8_swizzled_input(self.down_proj):
+            return Mxfp8SwizzledInput(
+                *swiglu_oai_mxfp8(gate_up, self.swiglu_alpha, self.swiglu_limit)
+            )
+        if accepts_mxfp8_deepgemm_input(self.down_proj):
+            return swiglu_oai_mxfp8_deepgemm(
+                gate_up, self.swiglu_alpha, self.swiglu_limit
+            )
+        return None
 
     def forward(
         self,
@@ -325,7 +361,9 @@ class MiniMaxM3MLP(nn.Module):
         forward_batch: Optional[ForwardBatch] = None,
     ):
         gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
+        x = self._swiglu_oai_mxfp8(gate_up)
+        if x is None:
+            x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
 
@@ -406,7 +444,7 @@ class MiniMaxM3MoE(nn.Module):
                 prefix=add_prefix("shared_experts", prefix),
                 reduce_results=False,
                 intermediate_size=intermediate_size,
-                **(dict(tp_rank=0, tp_size=1) if shared_experts_tp1 else {}),
+                parallel_group="replicated" if shared_experts_tp1 else "tp",
             )
         else:
             self.shared_experts = None
@@ -419,6 +457,11 @@ class MiniMaxM3MoE(nn.Module):
             params_dtype=torch.bfloat16 if self.bf16_router_gemm else torch.float32,
             quant_config=None,
             prefix=add_prefix("gate", prefix),
+        )
+        self.tiny_router_gemm_max_tokens = tiny_router_gemm_max_tokens(
+            num_experts=config.num_local_experts,
+            hidden_size=config.hidden_size,
+            weight_dtype=self.gate.weight.dtype,
         )
 
         self.layer_id = layer_id
@@ -522,6 +565,18 @@ class MiniMaxM3MoE(nn.Module):
             if _is_npu:
                 # NPU lacks aten::mm.dtype; bf16 mm then cast keeps topk semantics.
                 return torch.mm(hidden_states, self.gate.weight.t()).float()
+            if (
+                not get_exec().deterministic.enable_deterministic_inference
+                and hidden_states.shape[0] <= self.tiny_router_gemm_max_tokens
+            ):
+                # N is num_local_experts, so cuBLAS splits K and runs the
+                # projection as two launches; the tiny GEMM does it in one.
+                return tiny_gemm_bf16(
+                    hidden_states,
+                    self.gate.weight,
+                    out_dtype=torch.float32,
+                    max_m=self.tiny_router_gemm_max_tokens,
+                )
             return torch.mm(
                 hidden_states, self.gate.weight.t(), out_dtype=torch.float32
             )
@@ -602,6 +657,9 @@ class MiniMaxM3Attention(nn.Module):
             self.idx_replica_size = attn_tp_size // self.idx_head_tp_size
             self.idx_head_rank = attn_tp_rank // self.idx_replica_size
             self.num_idx_heads = self.total_idx_heads // self.idx_head_tp_size
+            index_parallel_group = ReplicatedParallelGroup(
+                "attn_tp", self.idx_replica_size
+            )
 
         self.qkv_proj = QKVParallelLinear(
             self.hidden_size,
@@ -610,8 +668,7 @@ class MiniMaxM3Attention(nn.Module):
             self.total_num_kv_heads,
             bias=False,
             quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             prefix=add_prefix("qkv_proj", prefix),
         )
 
@@ -621,8 +678,7 @@ class MiniMaxM3Attention(nn.Module):
             bias=False,
             reduce_results=False,
             quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             prefix=add_prefix("o_proj", prefix),
         )
 
@@ -643,8 +699,7 @@ class MiniMaxM3Attention(nn.Module):
                 bias=False,
                 quant_config=quant_config,
                 v_head_size=(0 if self.disable_index_value else self.idx_head_dim),
-                tp_rank=self.idx_head_rank,
-                tp_size=self.idx_head_tp_size,
+                parallel_group=index_parallel_group,
                 prefix=add_prefix("index_qkv_proj", prefix),
             )
 
@@ -659,8 +714,7 @@ class MiniMaxM3Attention(nn.Module):
                     reduce_results=False,
                     quant_config=quant_config,
                     prefix=add_prefix("index_o_proj", prefix),
-                    tp_rank=self.idx_head_rank,
-                    tp_size=self.idx_head_tp_size,
+                    parallel_group=index_parallel_group,
                 )
             self.index_rotary_emb = self.rotary_emb
 
@@ -1482,17 +1536,13 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 prefix=add_prefix("mlp", prefix),
             )
         else:
-            if is_dense_ffn_fully_dp():
-                mlp_tp_rank, mlp_tp_size = 0, 1
-            else:
-                mlp_tp_rank, mlp_tp_size = None, None
+            mlp_parallel_group = "replicated" if is_dense_ffn_fully_dp() else "tp"
             self.mlp = MiniMaxM3MLP(
                 config=config,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
                 intermediate_size=config.dense_intermediate_size,
-                tp_rank=mlp_tp_rank,
-                tp_size=mlp_tp_size,
+                parallel_group=mlp_parallel_group,
                 reduce_results=False,
             )
 

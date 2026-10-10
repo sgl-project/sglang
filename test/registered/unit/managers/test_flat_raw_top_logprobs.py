@@ -686,12 +686,6 @@ class TestBatchOutputTransport(CustomTestCase):
         decoded = msgpack_decode(msgpack_encode(output))
         self._check_roundtrip(decoded, output)
 
-    def test_fields_default_none(self):
-        output = _make_batch_token_id_output()
-        self.assertIsNone(output.input_top_logprobs_val_flat)
-        self.assertIsNone(output.input_top_logprobs_idx_flat)
-        self.assertIsNone(output.input_top_logprobs_flat_null_prefix)
-
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

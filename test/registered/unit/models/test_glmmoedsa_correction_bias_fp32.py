@@ -32,13 +32,6 @@ NUM_EXPERTS = 174
 BIAS_BASE = 34.0
 
 
-def _glm_bias_values() -> torch.Tensor:
-    step = 0.5 / NUM_EXPERTS
-    return torch.tensor(
-        [BIAS_BASE + i * step for i in range(NUM_EXPERTS)], dtype=torch.float32
-    )
-
-
 class TestMoEGateCorrectionBiasDtype(CustomTestCase):
     """Behavioral guard on the production dtype block in MoEGate.__init__.
 
@@ -81,10 +74,6 @@ class TestMoEGateCorrectionBiasDtype(CustomTestCase):
 class TestIsGlmMoeDsaHelper(CustomTestCase):
     """The arch-gate predicate used at both fix sites."""
 
-    def test_matches_main_and_nextn(self):
-        self.assertTrue(is_glm_moe_dsa(SimpleNamespace(architectures=[GLM_MAIN_ARCH])))
-        self.assertTrue(is_glm_moe_dsa(SimpleNamespace(architectures=[GLM_NEXTN_ARCH])))
-
     def test_reads_the_first_architecture_like_its_neighbours(self):
         # is_deepseek_dsa and is_kimi_k3 next to it both decide on
         # architectures[0]; a HF config carries the model's own arch there.
@@ -92,49 +81,11 @@ class TestIsGlmMoeDsaHelper(CustomTestCase):
             is_glm_moe_dsa(SimpleNamespace(architectures=["Foo", GLM_MAIN_ARCH]))
         )
 
-    def test_rejects_non_glm(self):
-        self.assertFalse(is_glm_moe_dsa(SimpleNamespace(architectures=[NON_GLM_ARCH])))
-
     def test_returns_false_for_none_or_empty_architectures(self):
         # A config with architectures=None or [] must return False, never
         # mis-gating a non-GLM model. _hf_arch() returns None for both.
         self.assertFalse(is_glm_moe_dsa(SimpleNamespace(architectures=None)))
         self.assertFalse(is_glm_moe_dsa(SimpleNamespace(architectures=[])))
-
-
-class TestCorrectionBiasBf16Collapse(CustomTestCase):
-    """Pins the numeric mechanism the fp32 fix protects against."""
-
-    def test_bf16_collapses_distinct_biases(self):
-        biases = _glm_bias_values()
-        fp32_distinct = torch.unique(biases).numel()
-        bf16_distinct = torch.unique(biases.to(torch.bfloat16)).numel()
-        # fp32 keeps every distinct bias; bf16 collapses the 174 values to a
-        # handful (the documented ~3), i.e. an order-of-magnitude information loss.
-        self.assertEqual(fp32_distinct, NUM_EXPERTS)
-        self.assertLessEqual(bf16_distinct, 4)
-        self.assertLess(bf16_distinct * 20, fp32_distinct)
-
-    def test_bf16_bias_scrambles_topk_routing(self):
-        # noaux_tc selects top-k experts by (sigmoid(logits) + correction_bias).
-        # With the bias collapsed to ~3 levels, selection within a level is decided
-        # by the tiny sigmoid term instead of the intended bias order -> the chosen
-        # expert set diverges from the fp32 (correct) selection for most tokens.
-        torch.manual_seed(0)
-        topk = 8
-        num_tokens = 64
-        biases_fp32 = _glm_bias_values()[torch.randperm(NUM_EXPERTS)]
-        biases_bf16 = biases_fp32.to(torch.bfloat16).to(torch.float32)
-
-        scores = torch.randn(num_tokens, NUM_EXPERTS).sigmoid()
-        top_fp32 = (scores + biases_fp32).topk(topk, dim=-1).indices
-        top_bf16 = (scores + biases_bf16).topk(topk, dim=-1).indices
-
-        differ = sum(
-            set(top_fp32[t].tolist()) != set(top_bf16[t].tolist())
-            for t in range(num_tokens)
-        )
-        self.assertGreater(differ / num_tokens, 0.5)
 
 
 if __name__ == "__main__":

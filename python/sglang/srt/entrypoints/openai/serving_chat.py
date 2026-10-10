@@ -46,6 +46,9 @@ from sglang.srt.entrypoints.openai import (
     encoding_dsv32,
     encoding_dsv41,
 )
+from sglang.srt.entrypoints.openai.parallel_prompt_encode import (
+    parallel_prompt_encode,
+)
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageContentTextPart,
     ChatCompletionMessageContentVideoPart,
@@ -1836,8 +1839,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 return_dict=False,
                 **template_kwargs,
             )
-            prompt_ids = self.tokenizer_manager.tokenizer.encode(
-                rendered_prompt, **encode_kwargs
+            prompt_ids = parallel_prompt_encode(
+                self.tokenizer_manager.tokenizer, rendered_prompt, encode_kwargs
             )
         decoded_prompt = (
             self.tokenizer_manager.tokenizer.decode(prompt_ids)
@@ -2087,6 +2090,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 # First chunk with role
                 if is_firsts.get(index, True):
                     is_firsts[index] = False
+                    # K2 templates require preserved thinking, including empty reasoning.
                     yield build_sse_content(
                         chunk_id=content["meta_info"]["id"],
                         created=int(time.time()),
@@ -2094,6 +2098,12 @@ class OpenAIServingChat(OpenAIServingBase):
                         index=index,
                         role="assistant",
                         content="",
+                        reasoning_content=(
+                            ""
+                            if self.reasoning_parser == "k2_horizon"
+                            and request.separate_reasoning
+                            else None
+                        ),
                     )
                     stream_started = True
 
@@ -2446,7 +2456,12 @@ class OpenAIServingChat(OpenAIServingBase):
                     role="assistant",
                     content=text if text else "",
                     tool_calls=tool_calls,
-                    reasoning_content=reasoning_text if reasoning_text else None,
+                    # Only K2 templates replay empty reasoning; other parsers report None.
+                    reasoning_content=(
+                        reasoning_text
+                        if reasoning_text or self.reasoning_parser == "k2_horizon"
+                        else None
+                    ),
                 ),
                 logprobs=choice_logprobs,
                 finish_reason=finish_reason["type"] if finish_reason else None,

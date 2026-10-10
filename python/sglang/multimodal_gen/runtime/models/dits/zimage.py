@@ -1380,10 +1380,6 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         return self._pin_for_active_capture(result)
 
     @staticmethod
-    def _has_padding(valid_lens: list[int], target_len: int) -> bool:
-        return any(int(length) < target_len for length in valid_lens)
-
-    @staticmethod
     def _as_image_list(hidden_states) -> list[torch.Tensor]:
         """Normalize 4D/5D image latents into per-sample tensors."""
         if torch.is_tensor(hidden_states):

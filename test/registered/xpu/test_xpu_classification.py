@@ -14,7 +14,8 @@ from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.runners import HFRunner, SRTRunner
 from sglang.test.test_utils import CustomTestCase, empty_gpu_cache
 
-register_xpu_ci(est_time=120, suite="nightly-xpu-1-gpu", nightly=True)
+register_xpu_ci(est_time=120, suite="nightly-xpu-kernel-main-1-gpu", nightly=True)
+register_xpu_ci(est_time=120, suite="nightly-xpu-kernel-wheel-1-gpu", nightly=True)
 
 MODEL_PATH = "jason9693/Qwen2.5-1.5B-apeach"
 TP_SIZE = 1

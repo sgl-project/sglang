@@ -24,7 +24,10 @@ from sglang.srt.layers.dcp import (
 )
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
-from sglang.srt.layers.radix_attention import unified_attention_with_output
+from sglang.srt.layers.radix_attention import (
+    padded_extend_real_tokens,
+    unified_attention_with_output,
+)
 from sglang.srt.lora.deepseek_mla_correction import (
     apply_q_correction as apply_kv_b_lora_q_correction,
 )
@@ -611,7 +614,12 @@ class DeepseekMLAForwardMixin:
                 absorbed_bmm_concat_cast_q_fp8(
                     q_fp8, q_nope, self.w_kc, q_pe, self.num_local_heads
                 )
-            born_q_backend.q8kv8_stash_born_q(num_tokens, self.attn_mqa.layer_id)
+            # The attention call consumes the batch's real rows, a prefix of
+            # the rows written here.
+            born_q_backend.q8kv8_stash_born_q(
+                padded_extend_real_tokens(q_nope, forward_batch) or num_tokens,
+                self.attn_mqa.layer_id,
+            )
             q_nope_out = born_q_backend.q8kv8_born_q_sentinel(
                 num_tokens, self.num_local_heads, self.kv_lora_rank, q_nope.device
             )

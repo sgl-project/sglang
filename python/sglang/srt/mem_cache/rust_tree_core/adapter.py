@@ -267,7 +267,7 @@ def _insert_step_from_binding(step) -> InsertStepResult:
 def _match_result_from_binding(result) -> MatchResult:
     """Build the Python MatchResult for the binding's match result."""
     return MatchResult(
-        device_indices=result.device_indices,
+        device_prefix_len=result.device_prefix_len,
         last_device_node=result.last_device_node_id,
         last_host_node=result.last_host_node_id,
         best_match_node=result.best_match_node_id,
@@ -568,11 +568,6 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         result = EvictDeviceNextNodeResult(
             node_id=binding_result.node_id,
             made_progress=binding_result.made_progress,
-            backup_kv=(
-                _cache_action_from_tagged(binding_result.backup_kv)
-                if binding_result.backup_kv is not None
-                else None
-            ),
             unbacked_tokens=binding_result.unbacked_tokens,
             mamba_backup_node_id=binding_result.mamba_backup_node_id,
             swa_backup_node_id=binding_result.swa_backup_node_id,
@@ -788,9 +783,6 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
     def set_hicache_enabled(self) -> None:
         self._binding.set_hicache_enabled()
 
-    def enable_swa_write_back_eviction_barrier(self) -> None:
-        self._binding.enable_swa_write_back_eviction_barrier()
-
     def set_host_memory_buffer_only(self) -> None:
         self._binding.set_host_memory_buffer_only()
 
@@ -961,27 +953,6 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         )
         kv_xfer = _transfer_from_binding(kv_xfer)
         comp_xfers = _comp_xfers_from_binding(comp_xfers)
-        swa_xfers = comp_xfers.get(ComponentType.SWA, ())
-        if swa_xfers:
-            full_node_ids = kv_xfer.nodes_to_load or []
-            full_load_slices = {}
-            offset = 0
-            for full_node_id, count in zip(
-                full_node_ids, self._binding.get_node_key_lengths(full_node_ids)
-            ):
-                full_load_slices[full_node_id] = slice(offset, offset + count)
-                offset += count
-            for transfer in swa_xfers:
-                # SWA may have holes between resident nodes, or reload while
-                # FULL stays resident. Preserve the SWA transfer's node order.
-                transfer.anchor_index_parts = [
-                    (
-                        full_load_slices[nid]
-                        if nid in full_load_slices
-                        else self.get_component_device_value(nid, ComponentType.FULL)
-                    )
-                    for nid in transfer.nodes_to_load or ()
-                ]
         return kv_xfer, comp_xfers
 
     def prefetch_anchor_info(

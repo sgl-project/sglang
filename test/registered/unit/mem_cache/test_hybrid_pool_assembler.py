@@ -29,6 +29,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     _require_single_row_dsv4_swa_pages,
     _split_hicache_size,
     _SwaStrategy,
+    _uses_unified_page_envelope_host,
     build_full_draft_pools,
     build_host_pool_group,
     build_hybrid_swa_group,
@@ -270,7 +271,7 @@ class TestDraftSidecarPoolDispatch(CustomTestCase):
         draft_kv_pool.size = 800
         draft_kv_pool.index_head_dim = 128
         draft_kv_pool.page_size = 64
-        draft_kv_pool.slots_per_page = 64
+        draft_kv_pool.index_page_size = 64
         draft_kv_pool.skip_topk_layers = [False]
         draft_kv_pool.index_key_cache = SimpleNamespace(buffer=[object()])
         draft_host_pool = SimpleNamespace(layer_num=1)
@@ -337,7 +338,7 @@ def _dsa_pool_stub(*, layer_num: int, size: int = 4096, shard: tuple | None = No
     pool.kv_cache_dim = 576
     pool.index_head_dim = 128
     pool.page_size = 64
-    pool.slots_per_page = 64
+    pool.index_page_size = 64
     pool.skip_topk_layers = [False] * layer_num
     pool.index_key_cache = SimpleNamespace(buffer=[object()] * layer_num)
     pool.layer_shard_enabled = shard is not None
@@ -1243,6 +1244,41 @@ class TestUnifiedPageEnvelopeHostPool(CustomTestCase):
 
         full_pool.free(full_indices[page_size:])
         self.assertIsNotNone(swa_pool.alloc(page_size))
+
+
+class TestUnifiedPageEnvelopeSelection(CustomTestCase):
+    """Only no backend and Mori store the complete shared page, so only they
+    keep the page-envelope host arena."""
+
+    def test_only_no_backend_and_mori_select_the_envelope(self):
+        from sglang.srt.runtime_context import publish, reset_context
+        from sglang.srt.server_args import ServerArgs
+
+        pool = _build_unified_swa_pool().token_to_kv_pool
+        self.addCleanup(reset_context)
+        for backend, expected in (
+            (None, True),
+            ("mori", True),
+            ("mooncake", False),
+            ("dynamic", False),
+        ):
+            with self.subTest(backend=backend):
+                reset_context()
+                publish(
+                    ServerArgs(
+                        model_path="dummy",
+                        enable_unified_memory=True,
+                        hicache_storage_backend=backend,
+                        hicache_mem_layout="layer_first",
+                    ),
+                    role="tokenizer",
+                )
+                self.assertEqual(
+                    _uses_unified_page_envelope_host(
+                        pool.full_kv_pool, pool.swa_kv_pool, use_mla=False
+                    ),
+                    expected,
+                )
 
 
 if __name__ == "__main__":

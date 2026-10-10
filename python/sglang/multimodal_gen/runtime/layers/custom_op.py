@@ -129,14 +129,6 @@ class CustomOp(nn.Module):
         # since we are not using Inductor, we always return True
         return True
 
-    @staticmethod
-    def default_on() -> bool:
-        """
-        On by default if level < CompilationLevel.PIECEWISE
-        Specifying 'all' or 'none' in custom_op takes precedence.
-        """
-        raise NotImplementedError
-
     # Dictionary of all custom ops (classes, indexed by registered name).
     # To check if an op with a name is enabled, call .enabled() on the class.
     # Examples:

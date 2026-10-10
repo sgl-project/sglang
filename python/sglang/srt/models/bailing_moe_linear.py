@@ -386,17 +386,17 @@ class BailingGroupRMSNormGate(RMSNormGated):
             dtype=dtype,
             activation="sigmoid",
         )
+        self.tp_size = get_parallel().attn_tp_size
+        self.tp_rank = get_parallel().attn_tp_rank
         self.weight.weight_loader = self.weight_loader
 
-    @staticmethod
     def weight_loader(
+        self,
         param: torch.nn.Parameter,
         loaded_weight: torch.Tensor,
     ) -> None:
-        tp_size = get_parallel().attn_tp_size
-        tp_rank = get_parallel().attn_tp_rank
-        shard_size = loaded_weight.shape[0] // tp_size
-        shard = slice(tp_rank * shard_size, (tp_rank + 1) * shard_size)
+        shard_size = loaded_weight.shape[0] // self.tp_size
+        shard = slice(self.tp_rank * shard_size, (self.tp_rank + 1) * shard_size)
         param.data.copy_(loaded_weight[shard].contiguous())
         return
 
@@ -459,8 +459,7 @@ class BailingMoELinearAttention(nn.Module):
             bias=(config.use_bias or config.use_qkv_bias),
             quant_config=quant_config,
             prefix=f"{prefix}.qkv_proj",
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
+            parallel_group="attn_tp",
         )
 
         if self.use_qk_norm:
@@ -473,8 +472,7 @@ class BailingMoELinearAttention(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.output_gate",
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
+            parallel_group="attn_tp",
         )
         self.dense = RowParallelLinear(
             self.hidden_inner_size,
@@ -482,8 +480,7 @@ class BailingMoELinearAttention(nn.Module):
             bias=config.use_bias,
             quant_config=quant_config,
             prefix=f"{prefix}.out_proj",
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
+            parallel_group="attn_tp",
             reduce_results=False,
         )
         self.attn = RadixAttention(

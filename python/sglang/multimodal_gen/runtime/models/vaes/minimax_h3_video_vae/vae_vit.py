@@ -426,6 +426,7 @@ class ViT3DDecoder(ViTBase):
             rotary_pos_emb = prepare_rotary_pos_emb(
                 self.pos_embed(img_ids[:1]),
                 dtype=rotary_dtype,
+                batch=B,
             )
             if B > 1:
                 rotary_pos_emb = _expand_rotary_batch(rotary_pos_emb, B)

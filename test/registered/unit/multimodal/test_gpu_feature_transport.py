@@ -987,6 +987,7 @@ class TestSchedulerMmTransportBoundary(CustomTestCase):
             return_pooled_hidden_states=False,
             multi_item_delimiter_indices=None,
             token_indices_to_pool=None,
+            decision_layout=None,
             mm_inputs=object(),
         )
 

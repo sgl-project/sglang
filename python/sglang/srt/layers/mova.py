@@ -14,7 +14,7 @@
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -22,6 +22,9 @@ from torch import nn
 
 from sglang.srt.utils import set_weight_attrs
 from sglang.srt.utils.custom_op import register_custom_op
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.linear import LinearParallelGroup
 
 _ROUTED_LINEAR_CHUNK_SIZE = 64 * 1024
 
@@ -245,10 +248,12 @@ class RoutedValueExperts(nn.Module):
         input_size: int,
         output_size: int,
         *,
-        tp_rank: int,
-        tp_size: int,
+        parallel_group: LinearParallelGroup = "attn_tp",
     ) -> None:
+        from sglang.srt.layers.linear import resolve_linear_parallel_group
+
         super().__init__()
+        tp_rank, tp_size = resolve_linear_parallel_group(parallel_group)
         if output_size % tp_size:
             raise ValueError(
                 f"MoVA value width {output_size} is not divisible by TP={tp_size}"

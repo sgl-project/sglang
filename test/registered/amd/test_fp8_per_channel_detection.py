@@ -1,21 +1,24 @@
-"""Unit tests for _is_block_scale_fp8 per-channel vs block-scale fp8 detection.
+"""CPU unit tests for AMD fp8 weight-scale handling (no GPU required).
 
-Tests the helper that distinguishes block-scale fp8 (weight_scale [N, K/128],
-compatible with fused gfx95 group-quant kernels) from per-channel fp8
-(weight_scale [N, 1], must use the plain bf16 path).
+Two independent regression surfaces, guarded cheaply without a nightly run:
 
-These tests run on CPU and require no GPU, guarding the regression surface
-cheaply without waiting for a full nightly accuracy run.
+- ``_is_block_scale_fp8``: distinguishes block-scale fp8 (weight_scale [N, K/128],
+  compatible with fused gfx95 group-quant kernels) from per-channel fp8
+  (weight_scale [N, 1], must use the plain bf16 path).
+- ``Fp8LinearMethod.process_weights_after_loading`` on the e4m3fnuz aiter
+  per-token path: a static activation input_scale must be doubled alongside
+  weight_scale (see TestFnuzAiterPerTokenInputScale).
 """
 
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
 from sglang.test.ci.ci_register import register_amd_ci
 
-register_amd_ci(est_time=10, suite="stage-a-test-1-gpu-small-amd")
+register_amd_ci(est_time=15, suite="stage-a-test-1-gpu-small-amd")
 
 
 def _make_proj(weight_dtype, weight_scale_shape=None):
@@ -69,6 +72,81 @@ class TestIsBlockScaleFp8(unittest.TestCase):
         """No weight attribute — should return False gracefully."""
         proj = SimpleNamespace()
         self.assertFalse(self.fn(proj))
+
+
+def _process_with_fnuz_aiter_per_token(activation_scheme, input_scale_value):
+    """Drive the fnuz + aiter-per-token weight-processing path and return the
+    resulting ``layer.input_scale`` (the value apply_fp8_linear would consume)."""
+    from sglang.srt.layers.quantization import fp8
+
+    method = fp8.Fp8LinearMethod.__new__(fp8.Fp8LinearMethod)
+    method.block_quant = False
+    method.use_mxfp8 = False
+    method.cutlass_fp8_supported = False
+    method.use_marlin = False
+    method.is_checkpoint_fp8_serialized = True
+    method.use_aiter_fp8_per_token = True
+    method.use_per_token_if_dynamic = False
+    method.quant_config = SimpleNamespace(
+        activation_scheme=activation_scheme, weight_block_size=None
+    )
+
+    n, k = 32, 64
+    layer = torch.nn.Module()
+    layer.weight = torch.nn.Parameter(
+        torch.randn(n, k).to(torch.float8_e4m3fn), requires_grad=False
+    )
+    layer.weight_scale = torch.nn.Parameter(
+        torch.tensor([0.5], dtype=torch.float32), requires_grad=False
+    )
+    if input_scale_value is None:
+        layer.input_scale = None
+    else:
+        layer.input_scale = torch.nn.Parameter(
+            torch.tensor([input_scale_value], dtype=torch.float32), requires_grad=False
+        )
+    layer.logical_widths = [n]
+
+    # Force the fnuz + aiter per-token branch deterministically regardless of the
+    # runner's arch/env, and neutralize the real aiter weight shuffle.
+    with (
+        mock.patch.object(fp8, "_is_fp8_fnuz", True),
+        mock.patch.object(fp8, "_use_aiter", True),
+        mock.patch.object(fp8, "_is_cpu", False),
+        mock.patch.object(fp8, "use_aiter_bpreshuffle_gemm", return_value=False),
+    ):
+        method.process_weights_after_loading(layer)
+
+    return layer
+
+
+class TestFnuzAiterPerTokenInputScale(unittest.TestCase):
+    """Regression: the aiter per-token path forces dynamic per-token activation
+    quant (use_per_token_if_dynamic), which is incompatible with a static
+    per-tensor input_scale. Fp8LinearMethod.process_weights_after_loading must
+    drop a static input_scale here so apply_fp8_linear (and the fused
+    RMSNorm+quant path) quantize activations per token; keeping it would run
+    static per-tensor quant and, on fnuz, against an un-doubled (2x-overrange)
+    scale -> wrong GEMM results. weight_scale is still fnuz-doubled.
+    """
+
+    def test_static_input_scale_is_dropped(self):
+        """A static input_scale must be dropped (None) on the per-token path."""
+        layer = _process_with_fnuz_aiter_per_token(
+            activation_scheme="static", input_scale_value=0.5
+        )
+        # Dropped so activations go through dynamic per-token quant. Pre-fix it
+        # was kept (0.5, un-doubled); an earlier fix kept it doubled (1.0).
+        self.assertIsNone(layer.input_scale)
+        # weights still need the fnuz reinterpretation (0.5 -> 1.0).
+        self.assertAlmostEqual(layer.weight_scale.flatten()[0].item(), 1.0, places=6)
+
+    def test_dynamic_input_scale_stays_none(self):
+        """Dynamic activation (input_scale is None) must not crash or be set."""
+        layer = _process_with_fnuz_aiter_per_token(
+            activation_scheme="dynamic", input_scale_value=None
+        )
+        self.assertIsNone(layer.input_scale)
 
 
 if __name__ == "__main__":

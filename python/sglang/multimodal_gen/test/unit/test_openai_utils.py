@@ -2,18 +2,55 @@
 
 import asyncio
 import io
+import json
 from types import SimpleNamespace
 
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
+from sglang.multimodal_gen.configs.sample.minimax_h3 import MiniMaxH3SamplingParams
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.entrypoints.openai import utils as openai_utils
+from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
+    ImageGenerationsRequest,
+    VideoGenerationsRequest,
+)
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     _parse_size_or_raise,
     _save_upload_to_path,
     _validate_positive_int,
     build_sampling_params,
+    request_field_value,
+    request_model_kwargs,
 )
+
+
+def test_request_fields_preserve_falsy_values_and_extra_precedence():
+    for cls in (ImageGenerationsRequest, VideoGenerationsRequest):
+        for container in ("extra_body", "extra_json", "extra_args", "extra_params"):
+            for direct in (0, None):
+                request = cls(
+                    prompt="test",
+                    seed=direct,
+                    enable_cache_dit=False,
+                    **{container: json.dumps({"seed": 42, "enable_cache_dit": True})},
+                )
+                before = request.model_dump()
+                assert request_field_value(request, "seed") == (
+                    42 if direct is None else 0
+                )
+                assert request_field_value(request, "enable_cache_dit") is False
+                assert request.model_dump() == before
+
+
+def test_video_model_kwargs_exclude_transport_only_aliases():
+    request = VideoGenerationsRequest(
+        prompt="test", extra_body={"task": "t2va", "audio_guidance_scale": 2.0}
+    )
+    assert request_model_kwargs(request, MiniMaxH3SamplingParams, "video") == {
+        "task": "t2va"
+    }
+    assert request.model_extra["extra_body"]["audio_guidance_scale"] == 2.0
+    assert request_model_kwargs(request, MiniMaxH3SamplingParams, "image") == {}
 
 
 def test_save_upload_to_path_accepts_starlette_upload_file(tmp_path):
