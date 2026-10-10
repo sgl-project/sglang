@@ -38,6 +38,9 @@ class ComfyUIModelAdapter:
 
     model_types: tuple[str, ...] = ()
     pipeline_class_name: str = ""
+    # Conditioning apply_model kwargs this adapter forwards to the worker;
+    # the executor rejects the other content kwargs instead of dropping them.
+    applied_conditioning: tuple[str, ...] = ()
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)

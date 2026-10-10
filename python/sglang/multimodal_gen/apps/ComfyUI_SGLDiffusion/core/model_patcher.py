@@ -45,6 +45,7 @@ class SGLDModelPatcher(ModelPatcher):
 
         n.object_patches = self.object_patches.copy()
         n.model_options = copy.deepcopy(self.model_options)
+        n.parent = self
         n.backup = self.backup
         n.object_patches_backup = self.object_patches_backup
         n.lora_cache = copy.copy(self.lora_cache)

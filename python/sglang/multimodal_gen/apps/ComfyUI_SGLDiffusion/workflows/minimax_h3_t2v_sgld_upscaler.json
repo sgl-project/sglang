@@ -148,12 +148,14 @@
     "class_type": "MinimaxH3LatentUpscaler3D",
     "inputs": {
       "latent": ["201", 0],
-      "model_name": "minimax_h3_latent_upscaler_3d_fp16.safetensors",
+      "model_name": "minimax_h3_latent_upscaler_3d_conv_v1_fp16.safetensors",
       "mode": "scale by multiplier",
       "mode.scale": 2.0,
       "align": 32,
       "device": "cuda",
-      "precision": "fp16"
+      "precision": "fp16",
+      "enable_temporal_chunking": true,
+      "force_unload": true
     }
   },
   "203": {

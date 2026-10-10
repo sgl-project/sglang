@@ -3,12 +3,19 @@ Generator for SGLang Diffusion ComfyUI integration.
 """
 
 import atexit
+import contextlib
 import logging
 import os
+import sys
 
 from ..executors.flux import FluxExecutor
-from ..executors.minimax_h3 import MiniMaxH3Executor
+from ..executors.minimax_h3 import FastH3Executor, MiniMaxH3Executor, VDNH3Executor
 from ..executors.zimage import ZImageExecutor
+from .preflight import (
+    check_sgld_options,
+    fold_h3_attention_requests,
+    transformer_backend,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +35,53 @@ class _HeaderTensor:
         return n
 
     nelement = numel
+
+
+@contextlib.contextmanager
+def _spawn_without_launcher_main():
+    """Keep spawned diffusion workers from re-executing ComfyUI's main.py.
+
+    spawn re-runs ``__main__`` in every child. ComfyUI's main.py initializes
+    CUDA and DynamicVRAM at module scope, and with ``ComfyUI/comfy`` first on
+    sys.path (custom-node init) its ``import utils`` resolves to comfy/utils.py
+    and the worker dies before reporting ready. The workers import nothing
+    from ComfyUI, so hide the launcher while they start.
+    """
+    main_dict = vars(sys.modules["__main__"])
+    saved = {
+        key: main_dict[key] for key in ("__file__", "__spec__") if key in main_dict
+    }
+    main_dict.pop("__file__", None)
+    main_dict["__spec__"] = None
+    try:
+        yield
+    finally:
+        main_dict.pop("__spec__", None)
+        main_dict.update(saved)
+
+
+def _has_vsa_gate(path: str) -> bool:
+    from safetensors import safe_open
+
+    with safe_open(path, framework="pt") as f:
+        return any(".to_gate_compress." in key for key in f.keys())
+
+
+_H3_MODEL_TYPES = ("minimax_h3", "fast_h3", "vdn_h3")
+
+
+def _single_file_server_args(kwargs: dict, pipeline_class_name: str) -> None:
+    """ServerArgs for a ComfyUI single file, whose worker loads only the DiT."""
+    backend = transformer_backend(kwargs)
+    if backend:
+        # Single-file loads skip SGLang's per-component attention scoping, and
+        # the DiT is the only component, so its backend is the global one.
+        kwargs["attention_backend"] = backend
+        kwargs.pop("component_attention_backends", None)
+    if pipeline_class_name == "MiniMaxH3Pipeline":
+        # Arbitrary local file names otherwise miss model-id keyed defaults
+        # such as breakable CUDA graph support.
+        kwargs.setdefault("model_id", "MiniMaxAI/MiniMax-H3")
 
 
 def _looks_like_gguf(path: str) -> bool:
@@ -115,7 +169,13 @@ else:
 
 def _load_executor_classes():
     """Qwen adapters import ComfyUI. Keep them optional so CI can load the rest."""
-    classes = [FluxExecutor, ZImageExecutor, MiniMaxH3Executor]
+    classes = [
+        FluxExecutor,
+        ZImageExecutor,
+        MiniMaxH3Executor,
+        FastH3Executor,
+        VDNH3Executor,
+    ]
     try:
         from ..executors.qwen_image import QwenImageEditExecutor, QwenImageExecutor
     except ModuleNotFoundError as exc:
@@ -204,12 +264,29 @@ class SGLDiffusionGenerator:
         # policy otherwise sets dit_cpu_offload=True and every sampler step
         # reloads the DiT from CPU.
         kwargs.setdefault("dit_cpu_offload", False)
+        # Each sampler step is its own request carrying ComfyUI tensors; a
+        # synthetic or request-based warmup has no such inputs to run with.
+        kwargs["warmup_mode"] = "off"
+        if os.path.isfile(model_path):
+            _single_file_server_args(kwargs, pipeline_class_name)
+        elif pipeline_class_name == "VDNH3Pipeline":
+            # Local VDN copies are often renamed, so the registry's path and
+            # _class_name detectors can miss; the short HF id always matches.
+            kwargs.setdefault("model_id", "vdn-minimax-h3")
         kwargs = self._server_args_kwargs(kwargs)
-        self.generator = DiffGenerator.from_pretrained(
-            model_path=model_path,
-            pipeline_class_name=pipeline_class_name,
-            **kwargs,
-        )
+        try:
+            with _spawn_without_launcher_main():
+                self.generator = DiffGenerator.from_pretrained(
+                    model_path=model_path,
+                    pipeline_class_name=pipeline_class_name,
+                    **kwargs,
+                )
+        except EOFError as error:
+            # A worker that raises while loading closes its pipe without a message.
+            raise RuntimeError(
+                "The SGLD worker exited while loading the model; its traceback is in "
+                "the ComfyUI console output above this error"
+            ) from error
         return self.generator
 
     @staticmethod
@@ -401,10 +478,36 @@ class SGLDiffusionGenerator:
         }
         sgld_options = dict(raw_sgld_options)
         model_options = dict(reload_kwargs["model_options"])
+        if model_options.get("dtype") is not None:
+            # Only the ComfyUI architecture companion would get this dtype; the
+            # worker loads its own weights, so the choice would be silently lost.
+            raise ValueError(
+                "SGLDUNETLoader weight_dtype must be 'default': the SGLD worker "
+                "does not use it; select quantization in SGLDOptions instead"
+            )
+        check_sgld_options(sgld_options)
         plugin_flags = {}
         if "enable_cache_dit" in sgld_options:
             plugin_flags["enable_cache_dit"] = sgld_options.pop("enable_cache_dit")
+        if "cache_dit_params" in sgld_options:
+            plugin_flags["cache_dit_params"] = sgld_options.pop("cache_dit_params")
+        plugin_flags["request_options"] = sgld_options.pop("request_options", {})
         set_model_type = sgld_options.pop("model_type", None)
+        runtime_model_path = sgld_options.pop("runtime_model_path", None)
+        if runtime_model_path:
+            runtime_model_path = os.path.abspath(os.path.expanduser(runtime_model_path))
+            if not os.path.isdir(runtime_model_path):
+                raise ValueError(
+                    "runtime_model_path must be a local materialized native model directory"
+                )
+            if set_model_type not in ("fast_h3", "vdn_h3"):
+                raise ValueError(
+                    "runtime_model_path requires fast_h3 or vdn_h3 model_type"
+                )
+        elif set_model_type in ("fast_h3", "vdn_h3"):
+            raise ValueError(
+                "Distilled H3 needs its native checkpoint in runtime_model_path; a base H3 file is only the ComfyUI architecture companion"
+            )
         override = (sgld_options.get("transformer_weights_path") or "").strip()
         if override:
             sgld_options["transformer_weights_path"] = override
@@ -420,10 +523,20 @@ class SGLDiffusionGenerator:
             "model_options": model_options,
             "sgld_options": sgld_options,
             "set_model_type": set_model_type,
+            "runtime_model_path": runtime_model_path,
         }
+        if set_model_type in _H3_MODEL_TYPES or (
+            isinstance(self.executor, MiniMaxH3Executor)
+            and self.model_path == detect_path
+        ):
+            fold_h3_attention_requests(sgld_options, plugin_flags["request_options"])
         if self._can_reuse(gather_options):
             self.executor.enable_cache_dit = plugin_flags.get("enable_cache_dit")
-            return self._patcher
+            self.executor.cache_dit_params = plugin_flags.get("cache_dit_params")
+            self.executor.request_options = plugin_flags.get("request_options", {})
+            patcher = self._patcher.clone()
+            patcher.model_options["sgld_request_flags"] = dict(plugin_flags)
+            return patcher
 
         self.close_generator()
         self.last_options = gather_options
@@ -437,16 +550,57 @@ class SGLDiffusionGenerator:
         if set_model_type is not None and set_model_type in self.pipeline_class_dict:
             model_type = set_model_type
 
+        if model_type in _H3_MODEL_TYPES:
+            # gather_options holds this dict, so a reuse check sees the folded backend.
+            fold_h3_attention_requests(sgld_options, plugin_flags["request_options"])
+        if model_type == "fast_h3":
+            from ..executors.minimax_h3 import load_fasth3_release
+
+            load_fasth3_release(runtime_model_path)
+        if model_type == "minimax_h3" and not runtime_model_path:
+            if detect_path.endswith(".safetensors") and _has_vsa_gate(detect_path):
+                raise ValueError(
+                    "This is a FastH3 checkpoint (VSA gate weights), which the "
+                    "base MiniMax H3 model cannot load; set model_type fast_h3 "
+                    "with runtime_model_path pointing at the native FastH3 model"
+                )
+            if sgld_options.get("minimax_h3_adaln_online") or sgld_options.get(
+                "minimax_h3_adaln_cache_path"
+            ):
+                raise ValueError(
+                    "ComfyUI H3 checkpoint loading does not support native AdaLN online/sidecar caches; use standard AdaLN projections or a supported native-layout runtime"
+                )
+            if sgld_options.get("quantization") and detect_path.endswith(
+                ".safetensors"
+            ):
+                from sglang.multimodal_gen.runtime.loader.minimax_h3_weights import (
+                    inspect_minimax_h3_safetensors,
+                )
+
+                _, markers = inspect_minimax_h3_safetensors([detect_path])
+                if markers:
+                    raise ValueError(
+                        "Checkpoint quantization is encoded in per-layer metadata; do not also set quantization"
+                    )
+                raise ValueError(
+                    "Runtime quantization of a floating-point MiniMax H3 file is not "
+                    "supported in ComfyUI integrated mode yet; load a pre-quantized "
+                    "file (e.g. *_int8_convrot) or leave quantization empty"
+                )
+
         pipeline_class_name = self.pipeline_class_dict[model_type]
+        worker_model_path = runtime_model_path or detect_path
         self.generator = self.init_generator(
-            detect_path, pipeline_class_name, sgld_options
+            worker_model_path, pipeline_class_name, sgld_options
         )
 
         executor_class = self.executor_class_dict[model_type]
         self.executor = executor_class(
-            self.generator, detect_path, comfyui_model, model_config
+            self.generator, worker_model_path, comfyui_model, model_config
         )
         self.executor.enable_cache_dit = plugin_flags.get("enable_cache_dit")
+        self.executor.cache_dit_params = plugin_flags.get("cache_dit_params")
+        self.executor.request_options = plugin_flags.get("request_options", {})
         self.executor._sgld_reload = reload_kwargs
         self.executor._ensure_runtime = self.ensure_executor
         comfyui_model.diffusion_model = self.executor
@@ -462,6 +616,7 @@ class SGLDiffusionGenerator:
         self._patcher = SGLDModelPatcher(
             comfyui_model, load_device, offload_device, model_type=model_type
         )
+        self._patcher.model_options["sgld_request_flags"] = dict(plugin_flags)
         self._patcher.add_wrapper_with_key(
             WrappersMP.SAMPLER_SAMPLE,
             "sgld_session",

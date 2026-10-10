@@ -3,6 +3,7 @@ ComfyUI nodes for SGLang Diffusion integration.
 Provides nodes for connecting to SGLang Diffusion server and generating images/videos.
 """
 
+import json
 import os
 import uuid
 
@@ -28,6 +29,23 @@ from .utils import (
 )
 
 
+class SGLDH3DistilledSigmas:
+    """The checkpoint's trained rectified-flow grid, independent of scheduler presets."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"model_type": (["fast_h3", "vdn_h3"],)}}
+
+    RETURN_TYPES = ("SIGMAS",)
+    FUNCTION = "build"
+    CATEGORY = "SGLDiffusion"
+
+    def build(self, model_type):
+        from .executors.minimax_h3 import distilled_h3_sigmas
+
+        return (torch.tensor(distilled_h3_sigmas(model_type)),)
+
+
 class SGLDOptions:
     @classmethod
     def INPUT_TYPES(cls):
@@ -42,6 +60,8 @@ class SGLDOptions:
                         "flux",
                         "lumina2",
                         "minimax_h3",
+                        "fast_h3",
+                        "vdn_h3",
                     ],
                     {"default": "auto-detect"},
                 ),
@@ -90,6 +110,29 @@ class SGLDOptions:
                     "STRING",
                     {"default": ""},
                 ),
+                "runtime_model_path": ("STRING", {"default": ""}),
+                "performance_mode": (["auto", "memory", "speed"], {"default": "auto"}),
+                "compile_mode": (["auto", "off", "on"], {"default": "auto"}),
+                "regional_compile": ("BOOLEAN", {"default": False}),
+                "enable_attention_backend_autotune": ("BOOLEAN", {"default": False}),
+                "dit_offload_prefetch_size": (
+                    "FLOAT",
+                    {"default": 0.0, "min": 0.0, "step": 1.0},
+                ),
+                "dit_layerwise_resident_layers": (
+                    "FLOAT",
+                    {"default": 0.0, "min": 0.0, "step": 1.0},
+                ),
+                "attention_backend_config_json": (
+                    "STRING",
+                    {"default": "", "multiline": True},
+                ),
+                "cache_dit_params_json": ("STRING", {"default": "", "multiline": True}),
+                "request_options_json": ("STRING", {"default": "", "multiline": True}),
+                "advanced_server_args_json": (
+                    "STRING",
+                    {"default": "", "multiline": True},
+                ),
                 "transformer_weights_path": (
                     "STRING",
                     {
@@ -122,6 +165,17 @@ class SGLDOptions:
         enable_cache_dit: bool = False,
         quantization: str = "",
         transformer_weights_path: str = "",
+        runtime_model_path: str = "",
+        performance_mode: str = "auto",
+        compile_mode: str = "auto",
+        regional_compile: bool = False,
+        enable_attention_backend_autotune: bool = False,
+        dit_offload_prefetch_size: float = 0.0,
+        dit_layerwise_resident_layers: float = 0.0,
+        attention_backend_config_json: str = "",
+        cache_dit_params_json: str = "",
+        request_options_json: str = "",
+        advanced_server_args_json: str = "",
     ):
         """
         Build a dictionary of SGLang Diffusion runtime options.
@@ -159,6 +213,90 @@ class SGLDOptions:
             # Same selector as `sglang serve --transformer-weights-path`:
             # local .gguf, owner/repo/path/file.gguf, or owner/repo:QUANT.
             options["transformer_weights_path"] = transformer_weights_path
+
+        # Omitted checkboxes preserve native auto policies; compile_mode=off
+        # provides an explicit opt-out without conflating false with "auto".
+        if not enable_torch_compile:
+            options.pop("enable_torch_compile", None)
+        if not enable_cfg_parallel:
+            options.pop("enable_cfg_parallel", None)
+        if not dit_layerwise_offload:
+            options.pop("dit_layerwise_offload", None)
+        if compile_mode != "auto":
+            options["enable_torch_compile"] = compile_mode == "on"
+        if runtime_model_path.strip():
+            options["runtime_model_path"] = runtime_model_path.strip()
+        options["performance_mode"] = performance_mode
+        if regional_compile:
+            options["regional_compile"] = True
+        if enable_attention_backend_autotune:
+            options["enable_attention_backend_autotune"] = True
+        if dit_offload_prefetch_size:
+            options["dit_offload_prefetch_size"] = dit_offload_prefetch_size
+        if dit_layerwise_resident_layers:
+            options["dit_layerwise_resident_layers"] = dit_layerwise_resident_layers
+
+        def object_json(raw, label):
+            if not raw or not raw.strip():
+                return None
+            try:
+                value = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"{label}: invalid JSON: {exc}") from exc
+            if not isinstance(value, dict):
+                raise ValueError(f"{label} must be a JSON object")
+            return value
+
+        backend_config = object_json(
+            attention_backend_config_json, "attention_backend_config_json"
+        )
+        if backend_config is not None:
+            options["attention_backend_config"] = backend_config
+        cache_params = object_json(cache_dit_params_json, "cache_dit_params_json")
+        if cache_params is not None:
+            from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
+                resolve_cache_dit_request_overrides,
+            )
+
+            options["cache_dit_params"] = resolve_cache_dit_request_overrides(
+                cache_params
+            )
+        request_options = object_json(request_options_json, "request_options_json")
+        if request_options is not None:
+            allowed = {
+                "quality",
+                "enable_spectrum",
+                "spectrum_params",
+                "attention_backend_override",
+                "skip_softmax_params",
+            }
+            if set(request_options) - allowed:
+                raise ValueError(
+                    f"Unsupported ComfyUI request options: {sorted(set(request_options) - allowed)}"
+                )
+            if "spectrum_params" in request_options:
+                from sglang.multimodal_gen.configs.sample.spectrum import SpectrumParams
+
+                SpectrumParams(**request_options["spectrum_params"])
+            options["request_options"] = request_options
+        advanced = object_json(advanced_server_args_json, "advanced_server_args_json")
+        if advanced is not None:
+            import dataclasses
+
+            from sglang.multimodal_gen.runtime.server_args import ServerArgs
+
+            valid = {
+                f.name
+                for f in dataclasses.fields(ServerArgs)
+                if not f.name.startswith("_")
+            }
+            protected = {"model_path", "comfyui_mode", "pipeline_class_name"}
+            invalid = set(advanced) - valid
+            if invalid or set(advanced) & protected:
+                raise ValueError(
+                    f"Invalid or reserved advanced ServerArgs: {sorted(invalid | (set(advanced) & protected))}"
+                )
+            options.update(advanced)
 
         # Strip None to keep payload clean
         options = {k: v for k, v in options.items() if v is not None}
@@ -213,9 +351,17 @@ class SGLDLoraLoader:
             lora_input["strength"].append(lora_info[1])
             lora_input["target"].append(lora_info[2])
 
-        # call the SGLang Diffusion API
-        model.model.diffusion_model.set_lora(**lora_input)
-        return (model,)
+        targets = set(lora_input["target"])
+        if "all" in targets and len(targets) > 1:
+            # set_lora groups adapters per target string; "all" overlapping a
+            # named target makes the worker keep only one group on that module.
+            raise ValueError(
+                "Chained SGLDLoraLoader nodes mix target 'all' with "
+                f"{sorted(targets - {'all'})}; use the same target on every node"
+            )
+        # The shared worker is bound to the selected MODEL at sampling time.
+        bi.model_options["sgld_lora_input"] = lora_input
+        return (bi,)
 
 
 class SGLDUNETLoader:
@@ -964,6 +1110,7 @@ class SGLDiffusionServerUnsetLora:
 
 # Register nodes
 NODE_CLASS_MAPPINGS = {
+    "SGLDH3DistilledSigmas": SGLDH3DistilledSigmas,
     "SGLDiffusionServerModel": SGLDiffusionServerModel,
     "SGLDiffusionGenerateImage": SGLDiffusionGenerateImage,
     "SGLDiffusionGenerateVideo": SGLDiffusionGenerateVideo,
