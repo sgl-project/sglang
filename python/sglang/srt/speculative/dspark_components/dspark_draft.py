@@ -191,10 +191,14 @@ def sample_draft_block(
     noise: DraftNoise,
     device: torch.device,
     tp_sync: SpecTpSync,
+    keep_greedy_logits: bool,
 ) -> DraftBlockResult:
     bs = base_logits.shape[0]
     greedy_mask = resolve_greedy_mask(bs=bs, sampling_info=sampling_info, device=device)
     any_sampling = sampling_info is not None and not sampling_info.is_all_greedy
+    # Greedy accept compares tokens only, so a greedy batch keeps its step
+    # logits only for a reader such as the block-accept recorder.
+    keep_logits = any_sampling or keep_greedy_logits
     temperatures = resolve_draft_temperatures(
         bs=bs, sampling_info=sampling_info, device=device
     )
@@ -211,11 +215,14 @@ def sample_draft_block(
             if any_sampling
             else SpecTpSyncSite.DSPARK_DRAFT_GREEDY
         ),
+        keep_logits=keep_logits,
         has_sampled_rows=any_sampling,
     )
     return DraftBlockResult(
         draft_tokens=draft_tokens,
-        corrected_logits=expect(_DRAFT_STEP_LOGITS, step_logits),
+        corrected_logits=(
+            expect(_DRAFT_STEP_LOGITS, step_logits) if keep_logits else None
+        ),
         greedy_mask=greedy_mask,
         temperatures=temperatures,
     )
@@ -232,6 +239,7 @@ class DraftBlockProposer:
         draft_block_spec_info,
         tp_sync: SpecTpSync,
         random_seed: int,
+        keep_greedy_logits: bool,
         dp_moe_sync: bool = False,
     ) -> None:
         self.draft_model = draft_model
@@ -242,6 +250,7 @@ class DraftBlockProposer:
         self._mask_token_id = mask_token_id
         self._draft_block_spec_info = draft_block_spec_info
         self._tp_sync = tp_sync
+        self._keep_greedy_logits = keep_greedy_logits
         self._noise = DraftNoise(
             key=draft_noise_key(random_seed),
             offset=torch.zeros(
@@ -348,6 +357,7 @@ class DraftBlockProposer:
                 noise=self._noise,
                 device=device,
                 tp_sync=self._tp_sync,
+                keep_greedy_logits=self._keep_greedy_logits,
             )
         proposal_block_ids = (
             draft_block_ids
