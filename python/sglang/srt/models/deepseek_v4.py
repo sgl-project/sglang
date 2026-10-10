@@ -76,6 +76,7 @@ from sglang.srt.layers.cp.utils import (
 )
 from sglang.srt.layers.deep_gemm_wrapper.configurer import DEEPGEMM_SCALE_UE8M0
 from sglang.srt.layers.dp_attention import (
+    DpPaddingMode,
     _tbo_event,
     attn_tp_all_gather,
     attn_tp_all_reduce,
@@ -94,6 +95,7 @@ from sglang.srt.layers.dp_attention import (
     is_allocation_symmetric,
     is_dp_attention_enabled,
     is_dp_gatherv_active,
+    set_dp_buffer_len_from_batch,
 )
 from sglang.srt.layers.engram import Engram, EngramHasher, EngramLayout
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
@@ -3457,6 +3459,11 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             if _do_shared_local and local_hidden_states.shape[0] > 0:
                 _shared_local = self.mlp._forward_shared_experts(local_hidden_states)
+            # The gather ships the whole padded chunk and the MoE runs on it, but
+            # graph replay never refreshes pad rows, so they hold stale pool
+            # memory (bf16-max scale) that overflows the MoE and the combine.
+            if _is_hip:
+                _mask_dp_pad_rows(local_hidden_states, forward_batch)
             # self_attn has already reduced across attention TP, so these hidden
             # states are replicated and must not be summed by a partial gather.
             dp_gather_replicate(hidden_states, local_hidden_states, forward_batch)
@@ -3796,6 +3803,79 @@ class DeepseekV4DecoderLayer(nn.Module):
         state.hidden_states_mlp_output = hidden
 
 
+def _mask_dp_pad_rows(local_hidden_states, forward_batch) -> None:
+    n_real = forward_batch.num_token_non_padded
+    num_rows = local_hidden_states.shape[0]
+    if n_real is None or num_rows == 0:
+        return
+    pad = torch.arange(num_rows, device=local_hidden_states.device) >= n_real
+    local_hidden_states.masked_fill_(
+        pad.view(-1, *([1] * (local_hidden_states.dim() - 1))), 0
+    )
+
+
+def _late_layer_dp_counts(
+    forward_batch: ForwardBatch, local_late_rows: int
+) -> Optional[List[int]]:
+    # Bounded replay shrinks an extending rank's late layers to its tail, but the
+    # TP-MoE gather / combine there spans every DP rank, so each rank needs all
+    # ranks' late-layer row counts. Eager forwards only: every rank takes this
+    # branch together, and graph replays never reach the late-layer switch.
+    early = forward_batch.global_num_tokens_padded_cpu
+    if early is None:
+        early = forward_batch.global_num_tokens_cpu
+    if early is None or torch.cuda.is_current_stream_capturing():
+        return None
+    device = forward_batch.global_num_tokens_gpu.device
+    local = torch.tensor([local_late_rows], dtype=torch.int64, device=device)
+    counts = torch.empty(len(early), dtype=torch.int64, device=device)
+    get_parallel().tp_group.all_gather_into_tensor(counts, local)
+    counts = counts.tolist()
+    return None if counts == list(early) else counts
+
+
+def _enter_late_layer_dp(forward_batch: ForwardBatch, counts: List[int]) -> tuple:
+    fb = forward_batch
+    saved = (
+        fb.global_num_tokens_cpu,
+        fb.global_num_tokens_gpu,
+        fb.global_num_tokens_padded_cpu,
+        fb.global_num_tokens_for_logprob_cpu,
+        fb.global_dp_buffer_len,
+        fb.dp_padding_mode,
+        fb.dp_local_start_pos,
+        fb.dp_local_num_tokens,
+    )
+    fb.global_num_tokens_cpu = counts
+    fb.global_num_tokens_gpu = torch.tensor(
+        counts, dtype=torch.int64, device=fb.global_num_tokens_gpu.device
+    )
+    fb.global_num_tokens_padded_cpu = counts
+    # The MoE gatherv reads its sizes from the logprob counts when present.
+    fb.global_num_tokens_for_logprob_cpu = counts
+    fb.global_dp_buffer_len = sum(counts)
+    # Tail rows are real rows only, so the late layers gather variable lengths.
+    fb.dp_padding_mode = DpPaddingMode.SUM_LEN
+    fb.dp_local_start_pos = fb.dp_local_num_tokens = None
+    set_dp_buffer_len_from_batch(fb)
+    return saved
+
+
+def _exit_late_layer_dp(forward_batch: ForwardBatch, saved: tuple) -> None:
+    fb = forward_batch
+    (
+        fb.global_num_tokens_cpu,
+        fb.global_num_tokens_gpu,
+        fb.global_num_tokens_padded_cpu,
+        fb.global_num_tokens_for_logprob_cpu,
+        fb.global_dp_buffer_len,
+        fb.dp_padding_mode,
+        fb.dp_local_start_pos,
+        fb.dp_local_num_tokens,
+    ) = saved
+    set_dp_buffer_len_from_batch(fb)
+
+
 def _scatter_tail_rows(
     tail: LateLayerTail, rows: torch.Tensor, num_tokens: int
 ) -> torch.Tensor:
@@ -4046,6 +4126,22 @@ class DeepseekV4Model(nn.Module):
             self._check_late_layer_tail_readers(forward_batch)
             attn_backend = get_attn_backend()
             tail = attn_backend.tail_forward_metadata.late_layer_tail
+        late_dp_counts = None
+        saved_dp = None
+        if (
+            _is_hip
+            and self.late_layer_start is not None
+            and get_parallel().attn_dp_size > 1
+            and get_moe_a2a_backend().is_none()
+        ):
+            late_dp_counts = _late_layer_dp_counts(
+                forward_batch,
+                (
+                    tail.token_indices.shape[0]
+                    if tail is not None
+                    else hidden_states.shape[0]
+                ),
+            )
         saved_full = None
         # A pending post never meets a residual reader: the HIP boundary's defer_post
         # gate excludes Engram/DSpark-capture layers and the model end.
@@ -4064,6 +4160,11 @@ class DeepseekV4Model(nn.Module):
                 positions = tail.positions
                 if hash_ids is not None:
                     hash_ids = tail.rows(hash_ids)
+            # late_dp_counts is only not None on hip
+            if late_dp_counts is not None and i == self.late_layer_start:
+                saved_dp = _enter_late_layer_dp(forward_batch, late_dp_counts)
+                # Gathered over the full extend; no late layer is hash-routed.
+                input_ids_global = None
             engram = self.layers[i].engram
             if engram is not None:
                 before_engram = state.residual
@@ -4119,6 +4220,9 @@ class DeepseekV4Model(nn.Module):
                     seam_open=tail is None,
                 )
         state = state.materialized(self.layers[self.end_layer - 1].hc_cfg)
+        # saved_dp is only not None on hip
+        if saved_dp is not None:
+            _exit_late_layer_dp(forward_batch, saved_dp)
         if saved_full is not None:
             attn_backend.exit_late_layer_tail(saved_full, forward_batch)
             return state.residual, state.pre, tail

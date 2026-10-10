@@ -70,6 +70,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
     PPProxyTensors,
+    _dp_tp_moe_masks_pad_rows,
     compute_local_num_token_non_padded,
     enable_num_token_non_padded,
     get_required_capture_hidden_mode,
@@ -1358,6 +1359,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     post_warmup_hook=post_warmup_hook,
                 )
 
+    def _set_dp_real_num_tokens(self, raw_num_token: int) -> None:
+        # An idle DP rank replays a fabricated batch whose count may not reach
+        # the slot, leaving the previous replay's value; the model masks DP pad
+        # rows by this count, so write the real one on every replay.
+        buf = self.buffers.num_token_non_padded
+        if buf is not None and _dp_tp_moe_masks_pad_rows():
+            buf.fill_(raw_num_token)
+
     def _validate_capture_hidden_mode(self, forward_batch: ForwardBatch) -> None:
         if self.capture_hidden_mode < forward_batch.capture_hidden_mode:
             raise RuntimeError(
@@ -1410,6 +1419,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     f"{ragged_layout.graph_num_tokens}"
                 )
                 self._stage_ragged_verify_layout(ragged_layout, graph_size_key)
+            self._set_dp_real_num_tokens(self.raw_num_token)
             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
             self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
             if (
@@ -1501,6 +1511,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             buffers.input_embeds[:raw_num_token].copy_(forward_batch.input_embeds)
         # Padded tokens aren't read, so skip zeroing. Ragged input_ids arrive
         # from the planner already padded to the tier, invalid slots zeroed.
+        self._set_dp_real_num_tokens(raw_num_token)
         if self.enable_two_batch_overlap:
             self.tbo_plugin.replay_prepare(
                 forward_mode=self.capture_forward_mode,
