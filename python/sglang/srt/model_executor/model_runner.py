@@ -1432,7 +1432,8 @@ class ModelRunner:
         """Request-token capacity in logical tokens, not per-rank DCP rows."""
         return self.req_to_token_pool.schedulable_token_capacity(
             self.kv_cache_configurator.logical_token_capacity(
-                max_total_num_tokens=self.max_total_num_tokens
+                max_total_num_tokens=self.max_total_num_tokens,
+                allocator=self.token_to_kv_pool_allocator,
             )
         )
 

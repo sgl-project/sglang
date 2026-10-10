@@ -2390,7 +2390,7 @@ class Scheduler(
             full_tokens_per_layer=self.full_tokens_per_layer,
             swa_tokens_per_layer=self.swa_tokens_per_layer,
             # Match the allocator and radix counters' logical units.
-            max_total_num_tokens=self.max_total_num_tokens * self.kv_shard_widening,
+            max_total_num_tokens=self.max_total_num_tokens,
         )
 
     def init_invariant_checker(self) -> None:
@@ -2401,7 +2401,7 @@ class Scheduler(
             page_size=self.page_size,
             full_tokens_per_layer=self.full_tokens_per_layer,
             swa_tokens_per_layer=self.swa_tokens_per_layer,
-            max_total_num_tokens=self.max_total_num_tokens * self.kv_shard_widening,
+            max_total_num_tokens=self.max_total_num_tokens,
             tree_cache=self.tree_cache,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             req_to_token_pool=self.req_to_token_pool,
@@ -2453,8 +2453,8 @@ class Scheduler(
         self.load_inquirer = SchedulerLoadInquirer(
             disaggregation_mode=self.disaggregation_mode,
             server_args=self.server_args,
-            # The worker reports logical DCP capacity; add KV shard widening.
-            max_total_num_tokens=self.max_total_num_tokens * self.kv_shard_widening,
+            # The worker already reports logical DCP / page-interleave capacity.
+            max_total_num_tokens=self.max_total_num_tokens,
             max_running_requests=self.max_running_requests,
             pool_stats_observer=self.pool_stats_observer,
             tp_worker=self.tp_worker,
@@ -2577,9 +2577,8 @@ class Scheduler(
         )
         # PrefillAdder reserves one page per shard; the allocator reserves one.
         # Subtract the other N - 1 pages to keep queue admission schedulable.
-        token_capacity = (
-            self.max_total_num_tokens * self.kv_shard_widening
-            - self.page_size * (self.kv_shard_widening - 1)
+        token_capacity = self.max_total_num_tokens - self.page_size * (
+            self.kv_shard_widening - 1
         )
         max_new_tokens = self.token_to_kv_pool_allocator.max_new_tokens_for_memory(
             input_len,

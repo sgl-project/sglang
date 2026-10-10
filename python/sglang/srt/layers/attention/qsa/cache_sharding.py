@@ -83,12 +83,15 @@ def validate_qsa_cache_sharding(
     is_qsa: bool,
     tp_size: int,
     sharding_size: int,
+    num_attention_heads: int,
+    num_key_value_heads: int,
     pp_size: int,
     attn_cp_size: int,
     enable_prefill_cp: bool,
     ep_size: int,
     moe_dp_size: int,
     disaggregation_mode: str,
+    dcp_size: int = 1,
 ) -> None:
     """Reject combinations without complete QSA cache-sharding semantics."""
 
@@ -100,6 +103,22 @@ def validate_qsa_cache_sharding(
         raise ValueError("QSA cache sharding requires a QSA model")
     if sharding_size < 1 or tp_size % sharding_size:
         raise ValueError("QSA cache sharding requires its size to divide tp_size")
+    if (
+        min(num_attention_heads, num_key_value_heads) < 1
+        or num_attention_heads % tp_size
+        or num_attention_heads % num_key_value_heads
+        or tp_size % num_key_value_heads
+        or (tp_size // num_key_value_heads) % sharding_size
+    ):
+        raise ValueError(
+            "QSA cache sharding must divide the KV-head replica group size: "
+            f"attention_tp_size={tp_size}, num_attention_heads={num_attention_heads}, "
+            f"num_key_value_heads={num_key_value_heads}, sharding_size={sharding_size}"
+        )
+    if dcp_size != 1:
+        raise ValueError(
+            "QSA cache sharding does not support decode context parallelism"
+        )
     if pp_size != 1:
         raise ValueError("QSA cache sharding does not support pipeline parallelism")
     if attn_cp_size != 1:

@@ -21,7 +21,7 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
       1. context: input_len + max_new_tokens < max_req_len
       2. admission budget (PrefillAdder):
          ceil_page(input_len) + max_new_tokens + page_size * shard_widening
-         < max_total_num_tokens * shard_widening
+         < max_total_num_tokens
       3. env limit: <= SGLANG_MAX_NEW_TOKENS_LIMIT when set and positive
       4. never above the requested value
       5. min_new_tokens <= max_new_tokens afterwards
@@ -100,7 +100,7 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
             context_ok = input_len + candidate < scheduler.max_req_len
             budget_ok = (
                 paged_input_len + candidate + page_size * shard_widening
-                < scheduler.max_total_num_tokens * shard_widening
+                < scheduler.max_total_num_tokens
             )
             limit_ok = not limit_active or candidate <= limit
             requested_ok = requested is None or candidate <= requested
@@ -169,7 +169,7 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
             self.assertEqual(self._init_and_check(scheduler, req), 11)
 
     def test_sharded_budget_reserves_one_page_per_shard(self):
-        max_total_num_tokens, page_size, input_len, shard_widening = 8, 4, 8, 3
+        max_total_num_tokens, page_size, input_len, shard_widening = 24, 4, 8, 3
         scheduler = self._new_scheduler(
             max_req_len=128,
             max_total_num_tokens=max_total_num_tokens,
@@ -180,15 +180,14 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
 
         max_new_tokens = self._init_and_check(scheduler, req)
 
-        widened_capacity = max_total_num_tokens * shard_widening
         per_req_overhead = page_size * shard_widening
         self.assertEqual(
             max_new_tokens,
-            widened_capacity - input_len - per_req_overhead - 1,
+            max_total_num_tokens - input_len - per_req_overhead - 1,
         )
         self.assertLess(
             input_len + max_new_tokens + per_req_overhead,
-            widened_capacity,
+            max_total_num_tokens,
         )
 
     def test_min_new_tokens_clamped_to_limit(self):

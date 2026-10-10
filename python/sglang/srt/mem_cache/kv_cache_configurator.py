@@ -459,10 +459,7 @@ class KVCacheConfigurator:
         )
 
         return KVCacheConfigResult(
-            max_total_num_tokens=self.logical_token_capacity(
-                max_total_num_tokens=sizes.max_total_num_tokens,
-                allocator=alloc,
-            ),
+            max_total_num_tokens=sizes.max_total_num_tokens,
             max_running_requests=sizes.max_running_requests,
             full_max_total_num_tokens=sizes.full_max_total_num_tokens,
             swa_max_total_num_tokens=swa_max_total_num_tokens,
@@ -2660,19 +2657,16 @@ class KVCacheConfigurator:
 
         qsa_profile = parse_qsa_profile(self.model_config.hf_config)
         text_config = self.model_config.hf_text_config
-        qsa_sharding_graph_reservation_gb = (
-            _qsa_cache_sharding_graph_reservation_gb(
-                sharding_size=int(get_parallel().qsa_cache_sharding_size),
-                is_qsa=qsa_profile is not None,
-                cuda_graph_enabled=(
-                    get_exec().graph.cuda_graph_config.decode.backend
-                    != Backend.DISABLED
-                ),
-                prefill_tokens=max_prefill_buffer_tokens(),
-                hidden_size=int(getattr(text_config, "hidden_size", 0)),
-                hyper_connection_count=int(getattr(text_config, "hc_count", 1)),
-                activation_element_size=self.model_dtype.itemsize,
-            )
+        qsa_sharding_graph_reservation_gb = _qsa_cache_sharding_graph_reservation_gb(
+            sharding_size=int(get_parallel().qsa_cache_sharding_size),
+            is_qsa=qsa_profile is not None,
+            cuda_graph_enabled=(
+                get_exec().graph.cuda_graph_config.decode.backend != Backend.DISABLED
+            ),
+            prefill_tokens=max_prefill_buffer_tokens(),
+            hidden_size=int(getattr(text_config, "hidden_size", 0)),
+            hyper_connection_count=int(getattr(text_config, "hc_count", 1)),
+            activation_element_size=self.model_dtype.itemsize,
         )
         if qsa_sharding_graph_reservation_gb:
             slack_gb += qsa_sharding_graph_reservation_gb

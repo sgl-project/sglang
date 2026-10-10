@@ -279,14 +279,21 @@ def handle_decode_context_parallelism(server_args: Any):
     validate_qsa_cache_sharding(
         device=cfg.device,
         is_qsa=is_qwen_qsa(hf_config),
-        tp_size=cfg.tp_size,
+        tp_size=derive_attn_tp_size(
+            tp_size=cfg.tp_size,
+            attn_cp_size=resolved_view(server_args).attn_cp_size,
+            attn_dp_size=cfg.attn_dp_size,
+        ),
         sharding_size=cfg.qsa_cache_sharding_size,
+        num_attention_heads=model_config.num_attention_heads,
+        num_key_value_heads=model_config.num_key_value_heads,
         pp_size=cfg.pp_size,
         attn_cp_size=cfg.attn_cp_size,
         enable_prefill_cp=cfg.enable_prefill_cp,
         ep_size=cfg.ep_size,
         moe_dp_size=cfg.moe_dp_size,
         disaggregation_mode=cfg.disaggregation_mode,
+        dcp_size=cfg.dcp_size,
     )
 
 

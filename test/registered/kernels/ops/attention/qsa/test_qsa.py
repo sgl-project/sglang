@@ -4,13 +4,12 @@ from types import MethodType, ModuleType, SimpleNamespace
 
 import pytest
 import torch
+
 from sglang.kernels.ops.attention import qwen38_qsa_sm121_varlen
 from sglang.srt.configs.qwen4_exp import Qwen4ExpConfig
 from sglang.srt.layers.attention import qwen_sparse_attn_backend as qsa_backend_module
 from sglang.srt.layers.attention.qsa import cache_sharding as cache_sharding_module
-from sglang.srt.layers.attention.qsa import (
-    distributed_topk as distributed_topk_module,
-)
+from sglang.srt.layers.attention.qsa import distributed_topk as distributed_topk_module
 from sglang.srt.layers.attention.qsa import (
     owner_sparse_attn as owner_sparse_attn_module,
 )
@@ -62,6 +61,108 @@ COMPRESS_RATIO = 4
 TOKEN_TOPK = 2048
 BLOCK_TOPK = TOKEN_TOPK // COMPRESS_RATIO
 FINAL_TOPK = TOKEN_TOPK + COMPRESS_RATIO - 1
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("is_graph", [False, True])
+@pytest.mark.parametrize("expanded", [False, True])
+def test_owner_fallback_expands_blocks_and_pending_tail(
+    monkeypatch, device, is_graph, expanded
+):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    backend = QwenSparseAttnBackend.__new__(QwenSparseAttnBackend)
+    backend.compress_ratio = COMPRESS_RATIO
+    backend.qsa_profile = SimpleNamespace(block_topk=BLOCK_TOPK, budget=TOKEN_TOPK)
+    backend._qsa_cache_sharding_buffers = None
+    positions = torch.arange(11, 15, device=device)
+    lengths = positions + 1
+    slots = torch.arange(63, -1, -1, device=device).repeat(4, 1)
+    backend.req_to_token = slots.flip(0)
+    metadata = SimpleNamespace(
+        token_to_batch_idx=torch.arange(4, device=device),
+        sequence_lengths=lengths,
+        is_cuda_graph=is_graph,
+        row_req_pool_indices=torch.arange(3, -1, -1, device=device),
+        token_slot_table=slots,
+        indexer_metadata=SimpleNamespace(
+            decode_logical_positions=positions,
+            get_seqlens_int32=lambda: lengths.to(torch.int32),
+        ),
+    )
+    backend.forward_metadata = metadata
+    k = torch.zeros(64, 1, 8, device=device)
+    v = torch.arange(64, device=device, dtype=torch.float32)[:, None, None].expand(
+        64, 1, 8
+    )
+    backend.token_to_kv_pool = SimpleNamespace(
+        qsa_raw_kv_sharding=object(),
+        qsa_owner_group=object(),
+        get_key_buffer=lambda _: k,
+        get_value_buffer=lambda _: v,
+        set_kv_buffer=lambda *args: None,
+    )
+    backend._select_attention_kv_heads = lambda k, v, layer: (k, v)
+    backend._fused_kv_pool_eligible = True
+    monkeypatch.setattr(
+        qsa_backend_module, "_resolve_trtllm_sparse_decode", lambda: None
+    )
+    expected_slots = torch.full((4, FINAL_TOPK), -1, device=device, dtype=torch.int32)
+    for row in range(4):
+        expected_slots[row, :4] = slots[row, 8:12]
+        expected_slots[row, 4 : 4 + row] = slots[row, 12 : 12 + row]
+
+    def owner(q, k, v, actual_slots, runtime, **kwargs):
+        torch.testing.assert_close(actual_slots, expected_slots)
+        return qsa_sparse_attention(q, k, v, actual_slots), None
+
+    monkeypatch.setattr(qsa_backend_module, "owner_sparse_attention", owner)
+    blocks = torch.full((4, BLOCK_TOPK), -1, device=device, dtype=torch.int32)
+    blocks[:, 0] = 2
+    indices = (
+        expand_qsa_block_indices(blocks, positions, lengths, COMPRESS_RATIO, TOKEN_TOPK)
+        if expanded
+        else blocks
+    )
+    q = torch.zeros(4, 1, 8, device=device)
+    layer = SimpleNamespace(layer_id=0, scaling=1.0, tp_q_head_num=1, head_dim=8)
+    batch = SimpleNamespace(forward_mode=ForwardMode.DECODE, out_cache_loc=None)
+    actual = backend.forward_decode(q, k[:4], v[:4], layer, batch, topk_indices=indices)
+    expected = qsa_sparse_attention(q, k, v, expected_slots).reshape(4, -1)
+    torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize(
+    ("tp_size", "kv_heads", "sharding_size", "valid"),
+    [
+        (4, 2, 4, False),
+        (4, 2, 2, True),
+        (8, 2, 4, True),
+        (8, 2, 8, False),
+        (8, 4, 2, True),
+        (8, 4, 4, False),
+    ],
+)
+def test_qsa_sharding_stays_inside_kv_replicas(tp_size, kv_heads, sharding_size, valid):
+    kwargs = dict(
+        device="cuda",
+        is_qsa=True,
+        tp_size=tp_size,
+        sharding_size=sharding_size,
+        pp_size=1,
+        attn_cp_size=1,
+        enable_prefill_cp=False,
+        ep_size=tp_size,
+        moe_dp_size=1,
+        disaggregation_mode="null",
+        num_attention_heads=24,
+        num_key_value_heads=kv_heads,
+    )
+    if valid:
+        validate_qsa_cache_sharding(**kwargs)
+    else:
+        with pytest.raises(ValueError, match="KV-head replica"):
+            validate_qsa_cache_sharding(**kwargs)
 
 
 def _pack_global_topk_candidates(scores, *, world_size, page_size, topk):
@@ -150,9 +251,7 @@ def test_distributed_topk_matches_test_oracle_for_ties_and_ragged_shards():
         ]
     )
     actual_scores, actual_indices = merge_qsa_topk_candidates(
-        _pack_global_topk_candidates(
-            scores, world_size=3, page_size=2, topk=5
-        ),
+        _pack_global_topk_candidates(scores, world_size=3, page_size=2, topk=5),
         topk=5,
     )
     expected_indices = torch.tensor(
@@ -252,6 +351,7 @@ def test_qsa_cache_sharding_cli_keeps_state_cp_alias(option):
         ({"attn_cp_size": 2}, "attention context"),
         ({"enable_prefill_cp": True}, "prefill"),
         ({"disaggregation_mode": "decode"}, "PD disaggregation"),
+        ({"dcp_size": 2}, "decode context"),
     ],
 )
 def test_qsa_cache_sharding_rejects_unsupported_combinations(overrides, message):
@@ -260,6 +360,8 @@ def test_qsa_cache_sharding_rejects_unsupported_combinations(overrides, message)
         "is_qsa": True,
         "tp_size": 4,
         "sharding_size": 2,
+        "num_attention_heads": 24,
+        "num_key_value_heads": 2,
         "pp_size": 1,
         "attn_cp_size": 1,
         "enable_prefill_cp": False,
@@ -279,6 +381,8 @@ def test_qsa_cache_sharding_accepts_supported_degrees(sharding_size):
         is_qsa=True,
         tp_size=8,
         sharding_size=sharding_size,
+        num_attention_heads=24,
+        num_key_value_heads=2,
         pp_size=1,
         attn_cp_size=1,
         enable_prefill_cp=False,
@@ -813,8 +917,8 @@ def test_qsa_indexer_ignores_dp_attention_token_padding():
                     rope_rows=rope.numel(),
                 )
             ),
-            select_prefill_tokens=lambda q, keys, starts, ends, logical, lengths, **kwargs: q.squeeze(
-                1
+            select_prefill_tokens=lambda q, keys, starts, ends, logical, lengths, **kwargs: (
+                q.squeeze(1)
             ),
         )
         indexer._forward_impl = MethodType(QSAIndexer._forward_impl, indexer)
@@ -1112,9 +1216,7 @@ def test_qsa_speculative_pseudo_extend_is_rejected():
 
 
 class _FakeQSAPool:
-    cache_sharding_runtime = resolve_qsa_cache_sharding_runtime(
-        SimpleNamespace()
-    )
+    cache_sharding_runtime = resolve_qsa_cache_sharding_runtime(SimpleNamespace())
     qsa_index_kv_heads = 1
     qsa_index_head_dim = 128
     qsa_compressed_page_size = 64
@@ -1375,9 +1477,7 @@ def test_qsa_prefill_logical_positions_are_gathered_per_microchunk(monkeypatch):
     ends = torch.full((rows,), keys, dtype=torch.int32)
     positions = torch.full((rows,), keys * 4 - 1, dtype=torch.long)
     sequence_lengths = torch.full((rows,), keys * 4, dtype=torch.int32)
-    logical_by_sequence = torch.stack(
-        (torch.arange(keys), torch.arange(keys) + 100)
-    )
+    logical_by_sequence = torch.stack((torch.arange(keys), torch.arange(keys) + 100))
     sequence_ids = torch.arange(rows).remainder(2)
     seen = []
 
@@ -1635,9 +1735,7 @@ def test_qsa_graph_metadata_kernels_match_legacy_host_path(max_pages):
                 graph_write_locs=torch.zeros(
                     num_rows, dtype=torch.int32, device=device
                 ),
-                write_owner_mask=torch.zeros(
-                    num_rows, dtype=torch.bool, device=device
-                ),
+                write_owner_mask=torch.zeros(num_rows, dtype=torch.bool, device=device),
                 graph_compressed_page_table=torch.zeros(
                     (num_rows, max_pages), dtype=torch.int32, device=device
                 ),
@@ -1811,9 +1909,7 @@ def test_qsa_graph_layout_covers_speculative_rows_and_padded_tail(seq_offset):
             req_pool_indices=torch.zeros(num_rows, dtype=torch.int32, device=device),
             is_cuda_graph=True,
             graph_write_locs=torch.zeros(num_rows, dtype=torch.int32, device=device),
-            write_owner_mask=torch.zeros(
-                num_rows, dtype=torch.bool, device=device
-            ),
+            write_owner_mask=torch.zeros(num_rows, dtype=torch.bool, device=device),
             graph_compressed_page_table=torch.zeros(
                 (num_rows, max_pages), dtype=torch.int32, device=device
             ),
@@ -1954,15 +2050,15 @@ def test_qsa_draft_metadata_multi_step_graph(bs, padding):
         indexer = SimpleNamespace(
             graph_compressed_lengths=torch.empty(bs, dtype=torch.int32, device="cuda"),
             graph_write_locs=torch.empty(bs, dtype=torch.int32, device="cuda"),
-                write_owner_mask=torch.empty(bs, dtype=torch.bool, device="cuda"),
+            write_owner_mask=torch.empty(bs, dtype=torch.bool, device="cuda"),
             graph_compressed_page_table=torch.empty(
                 (bs, pages), dtype=torch.int32, device="cuda"
             ),
-                decode_block_positions=torch.empty(
-                    (bs, pages * (full_page // ratio)),
-                    dtype=torch.int32,
-                    device="cuda",
-                ),
+            decode_block_positions=torch.empty(
+                (bs, pages * (full_page // ratio)),
+                dtype=torch.int32,
+                device="cuda",
+            ),
             decode_logical_positions=torch.empty(bs, dtype=torch.int32, device="cuda"),
             pending_ring_slots=torch.empty(bs, dtype=torch.int64, device="cuda"),
             graph_ring_group_locs=torch.empty(

@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.mem_cache.allocator.page_interleave import PageInterleavePoolAllocator
 from sglang.srt.mem_cache.allocator.unified_mamba import (
@@ -115,13 +116,95 @@ class TestDcpLogicalCapacity(CustomTestCase):
         runner.max_total_num_tokens = 64
         allocator = PageInterleavePoolAllocator.__new__(PageInterleavePoolAllocator)
         allocator.shard_size = 3
+        allocator.size = 64 * 3
         runner.token_to_kv_pool_allocator = allocator
 
         info = TpModelWorker.get_worker_info(worker)
 
-        self.assertEqual(info[0], 64)
+        self.assertEqual(info[0], 64 * 3)
         self.assertEqual(info[4], 64 * 3 - 1)
         self.assertEqual(info[5], 64 * 3 - 6)
+
+    def test_configurator_to_worker_converts_capacity_once(self):
+        for dcp_size, shard_size in ((1, 1), (4, 1), (1, 4)):
+            with self.subTest(dcp_size=dcp_size, shard_size=shard_size):
+                worker = self.make_worker(dcp_size)
+                runner = worker.model_runner
+                cfg = runner.kv_cache_configurator
+                allocator = None
+                if shard_size > 1:
+                    allocator = PageInterleavePoolAllocator(
+                        size=64,
+                        physical_page_size=4,
+                        shard_size=shard_size,
+                        dtype=torch.int64,
+                        device="cpu",
+                        kvcache=None,
+                        need_sort=False,
+                    )
+                sizes = NS(
+                    max_total_num_tokens=64,
+                    max_running_requests=8,
+                    full_max_total_num_tokens=None,
+                    swa_max_total_num_tokens=None,
+                )
+                pools = NS(
+                    token_to_kv_pool_allocator=allocator,
+                    token_to_kv_pool=runner.token_to_kv_pool,
+                    req_to_token_pool=runner.req_to_token_pool,
+                    unified_memory_pool=None,
+                )
+                cfg.kv_cache_dtype = torch.float32
+                cfg.device, cfg.gpu_id = "cpu", 0
+                cfg.spec_algorithm = NS(is_none=lambda: True)
+                cfg.req_to_token_pool = runner.req_to_token_pool
+                cfg.token_to_kv_pool_allocator = allocator
+                with (
+                    patch.object(
+                        KVCacheConfigurator,
+                        "_resolve_memory_pool_config",
+                        return_value=sizes,
+                    ),
+                    patch.object(
+                        KVCacheConfigurator, "_derive_pool_sizes", return_value=sizes
+                    ),
+                    patch.object(
+                        KVCacheConfigurator, "_init_pools", return_value=pools
+                    ),
+                    patch(
+                        "sglang.srt.mem_cache.kv_cache_configurator.get_available_gpu_memory",
+                        return_value=0,
+                    ),
+                ):
+                    result = cfg.configure(pre_model_load_memory=0)
+                self.assertEqual(result.max_total_num_tokens, 64)
+                runner.max_total_num_tokens = result.max_total_num_tokens
+                runner.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
+                logical = 64 * dcp_size * shard_size
+                self.assertEqual(runner.logical_max_total_num_tokens, logical)
+                info = TpModelWorker.get_worker_info(worker)
+                self.assertEqual(info[0], logical)
+                self.assertEqual(info[4], logical - 1)
+
+    def test_scheduler_consumers_receive_logical_capacity(self):
+        class SchedulerState(NS):
+            def __getattr__(self, name):
+                return None
+
+        state = SchedulerState(max_total_num_tokens=256, kv_shard_widening=4)
+        for method, consumer in (
+            (Scheduler.init_pool_stats_observer, "SchedulerPoolStatsObserver"),
+            (Scheduler.init_invariant_checker, "SchedulerInvariantChecker"),
+            (Scheduler.init_load_inquirer, "SchedulerLoadInquirer"),
+        ):
+            with (
+                self.subTest(consumer=consumer),
+                patch("sglang.srt.managers.scheduler." + consumer) as constructor,
+            ):
+                method(state)
+                self.assertEqual(
+                    constructor.call_args.kwargs["max_total_num_tokens"], 256
+                )
 
     def test_logical_capacity(self):
         for dcp_size in (1, 2, 8):

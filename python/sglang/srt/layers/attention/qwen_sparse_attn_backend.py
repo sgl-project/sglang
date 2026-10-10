@@ -14,6 +14,7 @@ from functools import lru_cache
 import msgspec
 import torch
 import torch.nn.functional as F
+
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.qsa.cache_sharding import (
     assert_qsa_cache_sharding_runtime_match,
@@ -361,6 +362,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 "must be supplied together"
             )
         metadata = self._resolve_metadata(forward_batch)
+        topk_indices = self._expand_block_indices(topk_indices, metadata)
         global_token_slots = self._logical_to_physical(topk_indices, metadata)
         pool = self.token_to_kv_pool
         k_cache, v_cache = self._select_attention_kv_heads(
@@ -969,7 +971,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             )
 
     @property
-    def verify_mask(self) -> Optional[VerifyMask]:
+    def verify_mask(self) -> VerifyMask | None:
         return self._verify_mask
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int) -> None:
@@ -1003,9 +1005,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 max_rows=max_num_tokens,
                 topk=max(1, self.qsa_profile.block_topk),
                 owner_topk=(
-                    self.qsa_profile.budget
-                    + self.qsa_profile.compress_ratio
-                    - 1
+                    self.qsa_profile.budget + self.qsa_profile.compress_ratio - 1
                 ),
                 num_heads=gathered_query_heads,
                 head_dim=int(config.head_dim),
@@ -1536,18 +1536,16 @@ class QwenSparseAttnBackend(AttentionBackend):
             safe = logical_indices.clamp(
                 min=0, max=self.req_to_token.shape[1] - 1
             ).long()
-            reqs = metadata.row_req_pool_indices.long().index_select(
-                0, sequence_ids
-            )
+            reqs = metadata.row_req_pool_indices.long().index_select(0, sequence_ids)
             slots = self.req_to_token[reqs[:, None], safe]
         else:
             safe = logical_indices.clamp(
                 min=0, max=metadata.token_slot_table.shape[1] - 1
             ).long()
             slots = metadata.token_slot_table[sequence_ids[:, None], safe]
-        physical_slots = torch.where(
-            valid, slots, torch.full_like(slots, -1)
-        ).to(torch.int32)
+        physical_slots = torch.where(valid, slots, torch.full_like(slots, -1)).to(
+            torch.int32
+        )
         return physical_slots
 
     @staticmethod
@@ -2103,9 +2101,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         v_buffer = pool.get_value_buffer(layer.layer_id)
         metadata = self._resolve_metadata(forward_batch)
         topk_indices = self._expand_block_indices(topk_indices, metadata)
-        k_buffer, v_buffer = self._select_attention_kv_heads(
-            k_buffer, v_buffer, layer
-        )
+        k_buffer, v_buffer = self._select_attention_kv_heads(k_buffer, v_buffer, layer)
         if not q.is_cuda:
             slots = self._logical_to_physical(topk_indices, metadata)
             output = qsa_sparse_attention(q, k_buffer, v_buffer, slots, layer.scaling)
