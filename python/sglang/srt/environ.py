@@ -1995,7 +1995,8 @@ _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
         note="DSpark draft sampling always uses Gumbel-max."
     ),
     "SGLANG_DSPARK_OPT_FUSED_GREEDY_MARKOV": _DeprecatedEnv(
-        note="Greedy DSpark draft rows always use the markov sample step kernel."
+        note="A one-row greedy DSpark step on a vanilla markov head fuses the bias "
+        "GEMV by default."
     ),
     "SGLANG_QWEN35_NATIVE_FINAL_NORM": _DeprecatedEnv(),
     "SGLANG_ENABLE_HICACHE_BUFFER_ANCHOR_LOCK": _DeprecatedEnv(
