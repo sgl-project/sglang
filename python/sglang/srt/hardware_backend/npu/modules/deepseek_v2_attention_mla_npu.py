@@ -9,6 +9,9 @@ import sglang.srt.layers.dcp.layout as dcp_layout
 import sglang.srt.model_executor.forward_context as forward_context
 import sglang.srt.runtime_context as runtime_context
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.npu.attention.dcp import (
+    merge_mla_dcp_output_npu,
+)
 from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     NPUFusedMLAPreprocess,
     is_fia_nz,
@@ -19,9 +22,10 @@ from sglang.srt.layers.attention.dsa.dsa_npu_indexer import scattered_to_tp_attn
 from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
 )
+from sglang.srt.layers.dcp.comm import all_gather_q_for_mla_decode
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
-from sglang.srt.runtime_context import get_disagg
+from sglang.srt.runtime_context import get_disagg, get_parallel
 from sglang.srt.state_capturer.indexer_topk import maybe_capture_indexer_topk
 
 if TYPE_CHECKING:
@@ -172,7 +176,22 @@ def forward_mla_prepare_npu(
     zero_allocator: "BumpAllocator",
     input_on_attn_tp_slices: bool,
 ):
-    if is_mla_preprocess_enabled():
+    parallel = get_parallel()
+    if parallel.dcp_enabled and forward_batch.forward_mode.is_draft_extend_v2():
+        raise NotImplementedError(
+            "Kimi-K3 NPU DCP does not support draft-extend-v2 attention; "
+            "DSPARK uses the supported static target-verify path."
+        )
+    if parallel.dcp_enabled and forward_batch.forward_mode.is_mixed():
+        raise NotImplementedError(
+            "Kimi-K3 NPU DCP does not support mixed-chunk attention yet. "
+            "Use separate eager prefill/extend and decode batches."
+        )
+
+    # The fused MLA preprocess writes cache rows using the global virtual loc.
+    # Keep DCP on the explicit path until that operator accepts owner-filtered
+    # physical locations.
+    if is_mla_preprocess_enabled() and not parallel.dcp_enabled:
         if not hasattr(m, "mla_preprocess"):
             m.mla_preprocess = NPUFusedMLAPreprocess(
                 m.fused_qkv_a_proj_with_mqa,
@@ -281,6 +300,17 @@ def forward_mla_prepare_npu(
                 layer_id=m.layer_id,
             )
 
+    dcp_decode_phase = parallel.dcp_enabled and (
+        forward_batch.forward_mode.is_decode()
+        or forward_batch.forward_mode.is_target_verify()
+    )
+    if dcp_decode_phase:
+        q_nope_out, q_pe = all_gather_q_for_mla_decode(q_nope_out, q_pe)
+        # FIA requires contiguous query inputs, while the common helper returns
+        # transposed views so CUDA backends can choose their preferred layout.
+        q_nope_out = q_nope_out.contiguous()
+        q_pe = q_pe.contiguous()
+
     return (
         q_pe,
         k_pe,
@@ -308,15 +338,37 @@ def forward_mla_core_npu(
     # a trailing arg. None everywhere else.
     gate: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    attn_output = m.attn_mqa(
-        q_nope_out,
-        k_nope,
-        k_nope,
-        forward_batch,
-        q_rope=q_pe,
-        k_rope=k_pe,
-        **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
+    parallel = get_parallel()
+    dcp_decode_phase = parallel.dcp_enabled and (
+        forward_batch.forward_mode.is_decode()
+        or forward_batch.forward_mode.is_target_verify()
     )
+    if dcp_decode_phase:
+        attn_output, attn_lse = m.attn_mqa_for_dcp_decode(
+            q_nope_out,
+            k_nope,
+            k_nope,
+            forward_batch,
+            q_rope=q_pe,
+            k_rope=k_pe,
+            return_softmax_lse=True,
+        )
+        attn_output = attn_output.view(
+            -1,
+            m.num_local_heads * parallel.attn_dcp_size,
+            m.kv_lora_rank,
+        )
+        attn_output = merge_mla_dcp_output_npu(attn_output, attn_lse)
+    else:
+        attn_output = m.attn_mqa(
+            q_nope_out,
+            k_nope,
+            k_nope,
+            forward_batch,
+            q_rope=q_pe,
+            k_rope=k_pe,
+            **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
+        )
 
     attn_output = attn_output.view(-1, m.num_local_heads, m.kv_lora_rank)
 
