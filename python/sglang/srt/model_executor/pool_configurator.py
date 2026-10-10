@@ -1262,7 +1262,14 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             # Nothing is kept for reuse, so the request cap alone bounds the pool.
             return 0
         max_running_requests = self.requested_max_running_requests_per_worker
-        return 4 * max_running_requests if max_running_requests is not None else 0
+        if max_running_requests is None:
+            return 0
+        tails = 4 * max_running_requests
+        if self.encoder_replay and self.paged_draft_layers:
+            # A replay tail pays for draft layers only; spend the non-replay
+            # default's bytes on proportionally more tails.
+            tails *= max(1, self.num_layers_total // self.paged_draft_layers)
+        return tails
 
     def _resolve_swa_cap_tokens(self) -> Optional[int]:
         """SWA slots to reserve in cap mode, None to keep ratio sizing. Cap mode

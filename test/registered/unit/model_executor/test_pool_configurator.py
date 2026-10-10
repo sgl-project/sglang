@@ -1419,6 +1419,22 @@ class TestSWAPoolFloor(CustomTestCase):
         # 4096 tails cost < 3 GiB of draft SWA; at 40 layers it was ~36 GiB.
         self.assertLess(fixed[4096][1], 3 << 30)
 
+    def test_dsv4_replay_prefix_tails_scale_with_draft_layers(self):
+        from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
+
+        _publish_config(self, max_running_requests=64)
+        cfg = object.__new__(DSV4PoolConfigurator)
+        cfg.requested_max_running_requests_per_worker = 64
+        cfg.num_layers_total = 43
+        cfg.encoder_replay = False
+        cfg.paged_draft_layers = 0
+        self.assertEqual(cfg._resolve_swa_prefix_tails(), 256)
+        cfg.encoder_replay = True
+        cfg.paged_draft_layers = 3
+        self.assertEqual(cfg._resolve_swa_prefix_tails(), 256 * 14)
+        _publish_config(self, swa_prefix_tails=1024)
+        self.assertEqual(cfg._resolve_swa_prefix_tails(), 1024)
+
     def test_dsv4_trtllm_kv_bytes(self):
         from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
 
