@@ -8,6 +8,7 @@ import triton.language as tl
 
 from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
 from sglang.kernels.kda_kernels import _cuda_source
+from sglang.kernels.ops.diffusion.common.platform import is_hip
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -230,8 +231,12 @@ def _is_transposed_dense_residual(
 def can_use_residual_gate_add_cuda(
     residual: torch.Tensor, update: torch.Tensor, gate: torch.Tensor
 ) -> bool:
+    # The Triton fast path emits CUDA PTX cvt.rn.*.f32 with constraint "=h".
+    # On ROCm that constraint is a fatal LLVM register-allocation error, so
+    # the caller never reaches its eager fallback. tensor.is_cuda is true on
+    # HIP; the platform predicate is what rejects this path.
     return (
-        torch.version.hip is None
+        not is_hip()
         and residual.dtype in _SUPPORTED_DTYPES
         and residual.dtype == update.dtype
         and residual.dtype == gate.dtype
