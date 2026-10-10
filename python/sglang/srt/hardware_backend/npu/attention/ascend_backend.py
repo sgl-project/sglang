@@ -35,6 +35,7 @@ from sglang.srt.layers.dcp.layout import (
 )
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_kv_cache
+from sglang.srt.mem_cache.kv_cache_dtype import QUANT_MODE_MXFP8
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -116,6 +117,14 @@ class ForwardMetadata:
     dcp_spec_seq_lens_cpu_int: Optional[torch.Tensor] = None
     dcp_spec_seq_lens: Optional[torch.Tensor] = None
     dcp_spec_block_tables: Optional[torch.Tensor] = None
+
+    # Pre-planned quant_lightning_indexer (v2) inputs, computed once per
+    # forward batch in init_forward_metadata and shared by all DSA indexer
+    # layers of this batch (None when the quant indexer is not active or the
+    # backend did not pre-plan, e.g. cuda-graph capture).
+    quant_indexer_cu_seqlens_q: Optional[torch.Tensor] = None
+    quant_indexer_seqused_k: Optional[torch.Tensor] = None
+    quant_indexer_metadata: Optional[torch.Tensor] = None
 
     # swa attention mask for graph mode decode
     swa_mask: Optional[torch.Tensor] = None
@@ -355,6 +364,36 @@ class AscendAttnBackend(AttentionBackend):
                 in model_runner.model_config.hf_config.architectures
             ):
                 self.use_native_sdpa = True
+        # DSA quantized indexer (quant_lightning_indexer v2) constants, used
+        # to pre-plan the per-batch metadata in init_forward_metadata.
+        self.quant_indexer_enabled = (
+            self.use_mla
+            and getattr(model_runner.token_to_kv_pool, "index_k_scale_buffer", None)
+            is not None
+        )
+        if self.quant_indexer_enabled:
+            from sglang.srt.configs.model_config import (
+                get_dsa_index_head_dim,
+                get_dsa_index_n_heads,
+                get_dsa_index_topk,
+            )
+
+            hf_config = model_runner.model_config.hf_config
+            self.quant_indexer_n_heads = get_dsa_index_n_heads(hf_config)
+            self.quant_indexer_topk = get_dsa_index_topk(hf_config)
+            self.quant_indexer_head_dim = get_dsa_index_head_dim(hf_config)
+            # quant_lightning_indexer (v2) quant_mode of the indexer cache
+            # (1 = token-wise FP8 + FP32 scale, 3 = block-32 MXFP8 + E8M0,
+            # 5 = block-32 MXFP4 + E8M0), picked at pool-build time from
+            # --indexer-kv-cache-dtype.
+            self.quant_indexer_quant_mode = getattr(
+                model_runner.token_to_kv_pool, "indexer_quant_mode", QUANT_MODE_MXFP8
+            )
+        else:
+            self.quant_indexer_n_heads = None
+            self.quant_indexer_topk = None
+            self.quant_indexer_head_dim = None
+            self.quant_indexer_quant_mode = QUANT_MODE_MXFP8
         self.native_attn = AscendTorchNativeAttnBackend()
         self.graph_metadata = {}
         self.max_context_len = model_runner.model_config.context_len
@@ -529,6 +568,49 @@ class AscendAttnBackend(AttentionBackend):
             origin_out_cache_loc=getattr(forward_batch, "origin_out_cache_loc", None),
         )
 
+    def _plan_quant_indexer_metadata(self, forward_batch: ForwardBatch) -> None:
+        # Pre-plan the quant_lightning_indexer (v2) task list once per
+        # forward batch; every DSA indexer layer of this step reads it from
+        # forward_metadata instead of calling the metadata op per layer.
+        # CP prefill takes the legacy op path in the indexer and never calls
+        # quant_lightning_indexer, so it is skipped here.
+        if not self.quant_indexer_enabled:
+            return
+        if (
+            forward_batch.forward_mode.is_extend()
+            and forward_batch.attn_cp_metadata is not None
+        ):
+            return
+        base_q = self.forward_metadata.actual_seq_lengths_q
+        if base_q is None:  # plain extend: cumsum of per-seq q lengths
+            base_q = forward_batch.extend_seq_lens.int().cumsum(0)
+        # NPU cumsum upcasts int32 -> int64; the op requires int32
+        # cu_seqlens_q.
+        base_q = base_q.to(torch.int32)
+        fm = self.forward_metadata
+        fm.quant_indexer_cu_seqlens_q = torch.cat([base_q.new_zeros(1), base_q])
+        fm.quant_indexer_seqused_k = fm.seq_lens_cpu_int.to(
+            self.device, dtype=torch.int32
+        )
+        fm.quant_indexer_metadata = (
+            torch.ops.cann_ops_transformer.quant_lightning_indexer_metadata(
+                self.quant_indexer_n_heads,
+                1,
+                self.quant_indexer_head_dim,
+                self.quant_indexer_topk,
+                self.quant_indexer_quant_mode,
+                cu_seqlens_q=fm.quant_indexer_cu_seqlens_q,
+                seqused_k=fm.quant_indexer_seqused_k,
+                batch_size=int(fm.quant_indexer_seqused_k.numel()),
+                max_seqlen_q=-1,
+                max_seqlen_k=-1,
+                layout_q="TND",
+                layout_k="PA_BBND",
+                mask_mode=3,
+                cmp_ratio=1,
+            )
+        )
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
         self.forward_metadata = ForwardMetadata()
@@ -677,6 +759,8 @@ class AscendAttnBackend(AttentionBackend):
                         device=self.device, dtype=torch.int32
                     )
                 )
+
+        self._plan_quant_indexer_metadata(forward_batch)
 
         if (
             self.use_mla
