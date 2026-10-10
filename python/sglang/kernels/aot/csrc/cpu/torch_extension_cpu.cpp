@@ -326,6 +326,14 @@ at::Tensor convert_scale_packed(at::Tensor& scale);
 
 // quant
 std::tuple<at::Tensor, at::Tensor> per_token_quant_int8_cpu(at::Tensor& A);
+std::tuple<at::Tensor, at::Tensor>
+per_token_group_quant_fp8_cpu(const at::Tensor& input, int64_t group_size, double eps);
+std::tuple<at::Tensor, at::Tensor> scaled_fp8_quant_cpu(
+    const at::Tensor& input,
+    const std::optional<at::Tensor>& scale,
+    int64_t num_token_padding,
+    bool use_per_token_if_dynamic);
+std::tuple<at::Tensor, at::Tensor> mxfp8_group_quantize_cpu(const at::Tensor& input);
 
 // igemm
 at::Tensor int8_scaled_mm_cpu(
@@ -836,6 +844,14 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   // quant
   m.def("per_token_quant_int8_cpu(Tensor A) -> (Tensor, Tensor)");
   m.impl("per_token_quant_int8_cpu", torch::kCPU, &per_token_quant_int8_cpu);
+  m.def("per_token_group_quant_fp8_cpu(Tensor input, int group_size, float eps) -> (Tensor, Tensor)");
+  m.impl("per_token_group_quant_fp8_cpu", torch::kCPU, &per_token_group_quant_fp8_cpu);
+  m.def(
+      "scaled_fp8_quant_cpu(Tensor input, Tensor? scale, int num_token_padding, bool use_per_token_if_dynamic) -> "
+      "(Tensor, Tensor)");
+  m.impl("scaled_fp8_quant_cpu", torch::kCPU, &scaled_fp8_quant_cpu);
+  m.def("mxfp8_group_quantize_cpu(Tensor input) -> (Tensor, Tensor)");
+  m.impl("mxfp8_group_quantize_cpu", torch::kCPU, &mxfp8_group_quantize_cpu);
 
   // igemm
   m.def(
