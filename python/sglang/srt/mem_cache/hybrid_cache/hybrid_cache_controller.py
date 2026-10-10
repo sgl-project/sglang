@@ -20,7 +20,6 @@ from sglang.srt.managers.cache_controller import (
     HiCacheController as BaseHiCacheController,
 )
 from sglang.srt.managers.cache_controller import (
-    LayerDoneCounter,
     PrefetchAck,
 )
 from sglang.srt.managers.cache_controller import (
@@ -217,6 +216,7 @@ class HybridCacheController(BaseHiCacheController):
         transfer_layer_id_max: Optional[int] = None,
         enable_storage_metrics: bool = False,
         host_memory_mode: str = "cache",
+        load_block_layers: int = 1,
     ):
         startup_storage_backend = storage_backend
         self.extra_host_mem_release_queues: dict[PoolName, Queue[torch.Tensor]] = {}
@@ -243,15 +243,9 @@ class HybridCacheController(BaseHiCacheController):
             storage_backend_extra_config=storage_backend_extra_config,
             enable_storage_metrics=enable_storage_metrics,
             host_memory_mode=host_memory_mode,
+            load_block_layers=load_block_layers,
+            transfer_layer_id_max=transfer_layer_id_max,
         )
-        # Hybrid transfer IDs span every component pool, including holes for
-        # uncached layers that the anchor pool alone cannot describe.
-        if (
-            transfer_layer_id_max is not None
-            and transfer_layer_id_max != self.transfer_layer_id_max
-        ):
-            self.transfer_layer_id_max = transfer_layer_id_max
-            self.layer_done_counter = LayerDoneCounter(self.transfer_layer_id_max)
 
         self.storage_host_pool = mem_pool_host.anchor_entry.host_pool
         if startup_storage_backend is not None:

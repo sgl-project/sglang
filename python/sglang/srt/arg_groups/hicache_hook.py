@@ -52,6 +52,9 @@ def handle_hicache(server_args: Any):
     ):
         return
 
+    if cfg.hicache_load_block_layers < 1:
+        raise ValueError("--hicache-load-block-layers must be a positive integer")
+
     validate_hicache_host_memory_mode(server_args)
 
     if cfg.disaggregation_decode_host_receive_threshold < 1:

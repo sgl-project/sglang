@@ -38,7 +38,8 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
-from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
+from sglang.srt.model_executor.cuda_graph_config import Backend, Phase
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -51,7 +52,9 @@ from sglang.srt.model_executor.graph_memory_usage import (
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.runtime_context import (
     get_device,
+    get_disagg,
     get_exec,
+    get_memory,
     get_model,
     get_parallel,
     get_schedule,
@@ -279,6 +282,8 @@ class BaseTpWorker(ABC):
 class TpModelWorker(BaseTpWorker):
     """A tensor parallel model worker."""
 
+    _hicache_graph_architectures: tuple[str, ...] = ("InklingForConditionalGeneration",)
+
     def __init__(
         self,
         server_args: ServerArgs,
@@ -425,6 +430,40 @@ class TpModelWorker(BaseTpWorker):
 
     def init_cuda_graphs(self, capture_decode_cuda_graph: bool = True):
         """Capture cuda graphs for all model runners."""
+        runner = self.model_runner
+        if (
+            runner.device == "cuda"
+            and get_memory().enable_hierarchical_cache
+            and not get_memory().enable_unified_memory
+            and self.model_config.hf_config.architectures[0]
+            in self._hicache_graph_architectures
+            and runner.is_generation
+            and any(
+                get_exec().graph.cuda_graph_config[phase].backend != Backend.DISABLED
+                for phase in Phase.ALL
+            )
+            and runner.spec_algorithm.is_none()
+            and not runner.mtp_draft_device_pools
+            and not get_disagg().enable_pdmux
+            and get_disagg().disaggregation_mode == "null"
+            and not get_disagg().enable_pd_role_switch
+            and not runner.is_draft_worker
+            and (
+                not isinstance(runner.req_to_token_pool, HybridReqToTokenPool)
+                or not runner.req_to_token_pool.mamba_pool._slot_siblings
+            )
+        ):
+            from sglang.srt.managers.cache_controller import LayerDoneCounter
+
+            # Create events before graph capture; the controller later reuses this counter.
+            counter = LayerDoneCounter(
+                runner.layer_info.num_effective_layers,
+                block_layers=get_memory().hicache_load_block_layers,
+            )
+            counter.init_graph_events()
+            runner.token_to_kv_pool.register_layer_transfer_counter(counter)
+            if isinstance(runner.req_to_token_pool, HybridReqToTokenPool):
+                runner.req_to_token_pool.register_layer_transfer_counter(counter)
         self.model_runner.init_cuda_graphs(
             capture_decode_cuda_graph=capture_decode_cuda_graph
         )

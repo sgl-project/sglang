@@ -129,6 +129,10 @@ class Memory(msgspec.Struct):
             choices=["direct", "kernel", "kernel_ascend"],
         ),
     ] = "kernel"
+    hicache_load_block_layers: A[
+        int,
+        "Number of model layers per HiCache restore block. Must be positive; 1 preserves layerwise loading. Each pipeline stage ends with a partial block if needed.",
+    ] = 1
     hicache_mem_layout: A[
         str,
         Arg(

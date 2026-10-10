@@ -157,18 +157,21 @@ class L2TransferEngine:
         transfer_layer_id_max: int,
         start_event=None,
         on_layer_done=None,
+        layer_block_ends: Optional[tuple[int, ...]] = None,
     ) -> TransferCompletion:
+        block_ends = (
+            layer_block_ends
+            if layer_block_ends is not None
+            else tuple(range(1, transfer_layer_id_max + 1))
+        )
         with self._submission(
             transfers, self.host_to_device_stream, "host_to_device", start_event
         ) as (transfers, completion):
             primary = transfers[0] if transfers else None
-            layer_groups = [
-                range(layer, layer + 1) for layer in range(transfer_layer_id_max)
-            ]
-            for layers in layer_groups:
+            for first, end in zip((0, *block_ends), block_ends):
                 for transfer in transfers:
                     local_layers = []
-                    for layer_id in layers:
+                    for layer_id in range(first, end):
                         local = (
                             transfer.layer_mapper(layer_id)
                             if transfer.layer_mapper is not None
@@ -203,8 +206,8 @@ class L2TransferEngine:
                                 is_draft=transfer.is_draft,
                             )
                 if on_layer_done is not None:
-                    for layer_id in layers:
-                        on_layer_done(layer_id)
+                    # Includes all auxiliary pools, including a partial last block.
+                    on_layer_done(end - 1)
         return completion
 
     @staticmethod

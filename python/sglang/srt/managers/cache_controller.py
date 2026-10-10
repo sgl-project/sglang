@@ -41,8 +41,14 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
+from sglang.srt.mem_cache.layer_schedule import resolve_layer_block_ends
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.mem_cache.utils import get_storage_hash_str
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    Phase,
+    check_cuda_graph_backend,
+)
 from sglang.srt.runtime_context import get_memory, get_parallel
 from sglang.srt.utils import get_device_module
 
@@ -63,31 +69,70 @@ def storage_model_name(
 
 
 class LayerLoadingEvent:
-    def __init__(self, num_layers: int):
+    def __init__(
+        self,
+        num_layers: int,
+        block_ends: tuple[int, ...],
+    ):
         self._num_layers = num_layers
-        self.load_events = [device_module.Event() for _ in range(num_layers)]
+        self.block_ends = block_ends
+        self.layer_to_block = tuple(
+            block
+            for block, (first, end) in enumerate(zip((0, *block_ends), block_ends))
+            for _ in range(first, end)
+        )
+        num_blocks = len(block_ends)
+        self.load_events = [device_module.Event() for _ in range(num_blocks)]
+        # The controller replaces this with the transfer's own completion event.
+        self.finish_event = self.load_events[-1]
         self.start_event = device_module.Event()  # start event on controller stream
 
     def complete(self, layer_index: int):
         assert 0 <= layer_index < self._num_layers
-        self.load_events[layer_index].record()
+        block = self.layer_to_block[layer_index]
+        if layer_index + 1 != self.block_ends[block]:
+            return
+        self.load_events[block].record()
 
     def wait(self, layer_index: int):
-        device_module.current_stream().wait_event(self.load_events[layer_index])
-
-    @property
-    def finish_event(self):
-        return self.load_events[-1]
+        assert 0 <= layer_index < self._num_layers
+        block = self.layer_to_block[layer_index]
+        device_module.current_stream().wait_event(self.load_events[block])
 
 
 class LayerDoneCounter:
-    def __init__(self, num_layers: int):
+    def __init__(
+        self,
+        num_layers: int,
+        block_layers: int = 1,
+    ):
         self.num_layers = num_layers
+        self.block_layers = block_layers
+        self.block_ends = resolve_layer_block_ends(block_layers, num_layers)
         # extra producer and consumer counters for overlap mode
         self.num_counters = 3
-        self.events = [LayerLoadingEvent(num_layers) for _ in range(self.num_counters)]
+        self.events = [
+            LayerLoadingEvent(num_layers, block_ends=self.block_ends)
+            for _ in range(self.num_counters)
+        ]
         self.producer_index = -1
         self.consumer_index = -1
+        self.layer_to_block = self.events[0].layer_to_block
+        self.graph_enabled = False
+
+    def init_graph_events(self) -> None:
+        # Pool reads must follow forward-stream order. Create external events before
+        # capture so graph waits observe records submitted before each replay.
+        assert not self.graph_enabled
+        load_events = [torch.cuda.Event(external=True) for _ in self.block_ends]
+        # Complete events for resident-only replays, even before the first restore.
+        for event in load_events:
+            event.record()
+        # Eager and captured waits use the same handles. The ring retains only
+        # per-restore start/finish events so later loads cannot delay old ACKs.
+        for producer in self.events:
+            producer.load_events = load_events
+        self.graph_enabled = True
 
     def update_producer(self):
         self.producer_index = (self.producer_index + 1) % self.num_counters
@@ -100,9 +145,20 @@ class LayerDoneCounter:
         self.consumer_index = index
 
     def wait_until(self, threshold: int):
-        if self.consumer_index < 0:
-            return
-        self.events[self.consumer_index].wait(threshold)
+        assert 0 <= threshold < self.num_layers
+        block = self.layer_to_block[threshold]
+        if self.graph_enabled and torch.cuda.is_current_stream_capturing():
+            # Waiting at the first layer covers later captured layers in the block.
+            # Eager state copies can access layers out of order.
+            if threshold % self.block_layers != 0:
+                return
+            event = self.events[0].load_events[block]
+        else:
+            if self.consumer_index < 0:
+                return
+            event = self.events[self.consumer_index].load_events[block]
+
+        device_module.current_stream().wait_event(event)
 
     def reset(self):
         self.producer_index = -1
@@ -311,6 +367,8 @@ class HiCacheController:
         storage_backend_extra_config: Optional[dict] = None,
         enable_storage_metrics: bool = False,
         host_memory_mode: str = "cache",
+        load_block_layers: int = 1,
+        transfer_layer_id_max: Optional[int] = None,
     ):
         self.tp_group = tp_group
         self.host_memory_mode = host_memory_mode
@@ -321,6 +379,7 @@ class HiCacheController:
         self.prefetch_completion_sync_groups: List[torch.distributed.ProcessGroup] = []
         self.mem_pool_device_allocator = token_to_kv_pool_allocator
         mem_pool_device = token_to_kv_pool_allocator.get_kvcache()
+        self.layer_done_counter = mem_pool_device.layer_transfer_counter
         from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 
         if isinstance(mem_pool_device, HybridLinearKVPool):
@@ -355,8 +414,22 @@ class HiCacheController:
         self.host_mem_release_queue: Optional[Queue[torch.Tensor]] = None
 
         self.device = self.mem_pool_device.device
-        self.transfer_layer_id_max = self.mem_pool_device.layer_num
-        self.layer_done_counter = LayerDoneCounter(self.transfer_layer_id_max)
+        # The full-KV sub-pool may omit logical layers that only hold recurrent state.
+        self.transfer_layer_id_max = (
+            self.mem_pool_device.layer_num
+            if transfer_layer_id_max is None
+            else transfer_layer_id_max
+        )
+        if self.layer_done_counter is None:
+            self.layer_done_counter = LayerDoneCounter(
+                self.transfer_layer_id_max, block_layers=load_block_layers
+            )
+        else:
+            # Keep the counter whose event handles were embedded during graph capture.
+            assert (
+                self.layer_done_counter.num_layers == self.transfer_layer_id_max
+                and self.layer_done_counter.block_layers == load_block_layers
+            ), "HiCache graph/transfer block boundaries differ"
         self.mem_pool_device.register_layer_transfer_counter(self.layer_done_counter)
 
         if write_policy not in [
@@ -372,7 +445,7 @@ class HiCacheController:
         self.ack_load_queue: List[HiCacheAck] = []
         # Set by the scheduler to the forward stream; gates load-back H2D
         # behind in-flight forwards (see start_loading).
-        self.load_fence_stream = None
+        self.load_fence_stream: Optional[torch.cuda.Stream] = None
         self.ack_write_queue: List[HiCacheAck] = []
 
         self.l2_transfer_engine = L2TransferEngine(io_backend)
@@ -988,12 +1061,20 @@ class HiCacheController:
             self._l2_load_transfers(host_indices, device_indices, pool_transfers),
             start_event=producer_event.start_event,
             on_layer_done=producer_event.complete,
+            layer_block_ends=self.layer_done_counter.block_ends,
             transfer_layer_id_max=self.transfer_layer_id_max,
         )
+        producer_event.finish_event = completion.finish_event
 
         self.mem_pool_device_allocator.set_hicache_transfer_done_event(
             (id(self), "load"), completion.finish_event
         )
+        if not self.layer_done_counter.graph_enabled and not check_cuda_graph_backend(
+            Phase.PREFILL, Backend.DISABLED
+        ):
+            # Graphs without block waits need a full-restore fence; eager readers wait in
+            # their backend/pool. Submit the prior-forward dependency first to avoid cycles.
+            producer_event.wait(self.transfer_layer_id_max - 1)
 
         self.ack_load_queue.append(
             HiCacheAck(
