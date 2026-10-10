@@ -218,3 +218,32 @@ def test_sibling_hf_cache_repo_does_not_match_overlay(monkeypatch, tmp_path):
         "Lightricks/LTX-2.3",
         spec,
     )
+
+
+def test_direct_overlay_repo_downloads_full_metadata_not_just_manifest(tmp_path):
+    """Resolving an overlay repo by Hub id fetched only `_overlay/overlay_manifest.json`,
+    so the returned snapshot lacked model_index.json and the configs."""
+    snapshot = tmp_path / "snapshot"
+
+    def hf_hub_download_fn(repo_id, filename):
+        path = snapshot / filename
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"source_model_id": "org/source"}))
+        return str(path)
+
+    def snapshot_download_fn(repo_id, allow_patterns, **kwargs):
+        (snapshot / "model_index.json").write_text(
+            json.dumps({"_class_name": "SomePipeline", "_diffusers_version": "0.35.0"})
+        )
+        return str(snapshot)
+
+    _, overlay_dir, manifest = model_overlay.resolve_direct_overlay_repo(
+        "someone/overlay",
+        hf_hub_download_fn=hf_hub_download_fn,
+        snapshot_download_fn=snapshot_download_fn,
+    )
+
+    assert manifest["source_model_id"] == "org/source"
+    assert model_overlay.load_model_index_from_dir(overlay_dir)["_class_name"] == (
+        "SomePipeline"
+    )

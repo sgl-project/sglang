@@ -383,6 +383,7 @@ def resolve_direct_overlay_repo(
     model_name_or_path: str,
     *,
     hf_hub_download_fn: Callable[..., str],
+    snapshot_download_fn: Callable[..., str] | None = None,
 ) -> tuple[dict[str, Any], str, dict[str, Any]] | None:
     if os.path.exists(model_name_or_path):
         manifest = load_overlay_manifest_if_present(model_name_or_path)
@@ -415,6 +416,17 @@ def resolve_direct_overlay_repo(
         return None
     except Exception:
         return None
+
+    if snapshot_download_fn is not None:
+        # The manifest download alone leaves the rest of the overlay repo
+        # (model_index.json, configs) out of the snapshot.
+        overlay_dir = str(
+            snapshot_download_fn(
+                repo_id=model_name_or_path,
+                allow_patterns=MODEL_OVERLAY_METADATA_PATTERNS,
+                max_workers=4,
+            )
+        )
 
     manifest = load_overlay_manifest_if_present(overlay_dir)
     if manifest is None:
@@ -702,7 +714,9 @@ def maybe_load_overlay_model_index(
         return load_model_index_from_dir(overlay_dir)
 
     direct_overlay = resolve_direct_overlay_repo(
-        model_name_or_path, hf_hub_download_fn=hf_hub_download_fn
+        model_name_or_path,
+        hf_hub_download_fn=hf_hub_download_fn,
+        snapshot_download_fn=snapshot_download_fn,
     )
     if direct_overlay is None:
         return None
@@ -780,7 +794,9 @@ def maybe_resolve_overlay_model_path(
         )
 
     direct_overlay = resolve_direct_overlay_repo(
-        model_name_or_path, hf_hub_download_fn=hf_hub_download_fn
+        model_name_or_path,
+        hf_hub_download_fn=hf_hub_download_fn,
+        snapshot_download_fn=snapshot_download_fn,
     )
     if direct_overlay is None:
         return None
