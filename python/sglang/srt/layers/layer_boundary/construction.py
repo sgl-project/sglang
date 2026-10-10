@@ -17,12 +17,15 @@ from dataclasses import dataclass
 from functools import cached_property
 from typing import Callable, Optional
 
+import msgspec
+
 from sglang.srt.layers.layer_boundary.adapters.attention import get_attn_tp_context
 from sglang.srt.layers.layer_boundary.boundary import (
     ExitMove,
     _cp_moves,
     bind_entry,
     bind_exit,
+    input_rows,
 )
 from sglang.srt.layers.layer_boundary.contracts import (
     BatchVariant,
@@ -127,6 +130,8 @@ class StagePlan:
         fusions=None,
         attn_tp_gather=None,
         exit_gather=None,
+        next_input_rows=None,
+        capture_preserves_residual=None,
     ):
         self.norm = norm
         self.edges = dict(variants)
@@ -146,7 +151,7 @@ class StagePlan:
         self._publish_lora_layout = get_parallel().attn_dp_enabled and bool(
             get_lora().enable_lora
         )
-        self._next_input_rows = None
+        self._next_input_rows = next_input_rows
         carried = (
             attn_input_fusions(self, next(iter(self.edges.values())).incoming.need.read)
             if kind is StageKind.ATTENTION
@@ -172,6 +177,11 @@ class StagePlan:
                     attn_input_adapter=edges.attn_input_adapter,
                     attn_tp_gather=attn_tp_gather,
                 )
+                keeps = (capture_preserves_residual or {}).get(variant)
+                if keeps is not None:
+                    entry = msgspec.structs.replace(
+                        entry, capture_preserves_residual=keeps
+                    )
             out = (
                 ExitMove()
                 if finishes_directly
@@ -251,7 +261,16 @@ def _bound_for(bound, variant):
         ) from None
 
 
-def _bind_stage(declaration, norm, incoming, outgoing, *, final_read=None, **options):
+def _bind_stage(
+    declaration,
+    norm,
+    incoming,
+    outgoing,
+    *,
+    final_read=None,
+    capture_preserves_residual=None,
+    **options,
+):
     if incoming.consumer != declaration or outgoing.producer != declaration:
         raise ValueError("connections do not match the stage declaration")
     if incoming.entries.keys() != outgoing.exits.keys():
@@ -307,15 +326,14 @@ def _bind_stage(declaration, norm, incoming, outgoing, *, final_read=None, **opt
         ),
         finishes_directly=declaration.kind is StageKind.ATTENTION
         and declaration.reduction is ProducerReduction.ALWAYS_PARTIAL,
-        **options,
-    )
-    if declaration.kind is StageKind.ATTENTION and outgoing.consumer is not None:
         # Layout eligibility comes from the connected consumer, not a mutable
         # link to its execution plan. Kernel binding remains consumer-owned.
-        from sglang.srt.layers.layer_boundary.boundary import input_rows
-
-        plan._next_input_rows = {
-            v: input_rows(edge) for v, edge in outgoing.entries.items()
-        }
-
+        next_input_rows=(
+            {v: input_rows(edge) for v, edge in outgoing.entries.items()}
+            if declaration.kind is StageKind.ATTENTION and outgoing.consumer is not None
+            else None
+        ),
+        capture_preserves_residual=capture_preserves_residual,
+        **options,
+    )
     return StageBoundary(plan, declaration=declaration)
