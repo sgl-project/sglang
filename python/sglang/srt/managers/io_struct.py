@@ -247,7 +247,10 @@ class GenerateReqInput:
     # Return prompt top logprobs as flat arrays plus shape metadata instead of
     # the nested per-position [logprob, token_id, text] lists.
     return_flat_raw_top_logprobs: bool = False
-    # Base64-encode the flat arrays. Requires return_flat_raw_top_logprobs.
+    # Return output top logprobs the same way, on the finished response only,
+    # which also skips detokenizing every candidate. Not supported with stream.
+    return_flat_raw_output_top_logprobs: bool = False
+    # Base64-encode the flat arrays. Requires one of the two flags above.
     return_flat_raw_top_logprobs_b64: bool = False
     # Whether to stream output.
     stream: bool = False
@@ -460,12 +463,18 @@ class GenerateReqInput:
                 "scoring: delimiter-sparse top logprob rows have no contiguous "
                 "position mapping."
             )
-        if (
-            self.return_flat_raw_top_logprobs_b64
-            and not self.return_flat_raw_top_logprobs
+        if self.return_flat_raw_output_top_logprobs and self.stream:
+            raise ValueError(
+                "return_flat_raw_output_top_logprobs is only set on the finished "
+                "response and does not support stream=True."
+            )
+        if self.return_flat_raw_top_logprobs_b64 and not (
+            self.return_flat_raw_top_logprobs
+            or self.return_flat_raw_output_top_logprobs
         ):
             raise ValueError(
-                "return_flat_raw_top_logprobs_b64 requires return_flat_raw_top_logprobs."
+                "return_flat_raw_top_logprobs_b64 requires return_flat_raw_top_logprobs "
+                "or return_flat_raw_output_top_logprobs."
             )
 
     def _determine_batch_size(self):
@@ -969,6 +978,7 @@ class GenerateReqInput:
             sampling_logprobs_mode=self.sampling_logprobs_mode[i],
             return_text_in_logprobs=self.return_text_in_logprobs,
             return_flat_raw_top_logprobs=self.return_flat_raw_top_logprobs,
+            return_flat_raw_output_top_logprobs=self.return_flat_raw_output_top_logprobs,
             return_flat_raw_top_logprobs_b64=self.return_flat_raw_top_logprobs_b64,
             stream=self.stream,
             log_metrics=self.log_metrics,
@@ -1494,6 +1504,30 @@ CachedTokensDetails = Dict[str, Union[int, str]]
 FinishReasonDict = Dict[str, Optional[Union[str, int, List[int]]]]
 
 
+def flat_top_logprobs_layout(
+    top_logprobs_val: List[Optional[List[float]]], top_logprobs_num: int
+) -> Tuple[int, int]:
+    """(null_prefix, k) of nested per-position top logprob rows in the flat format.
+
+    Raises ValueError when the rows are not representable by (shape,
+    null_prefix): interior nulls or ragged k, e.g. multi-item scoring.
+    """
+    num_rows = len(top_logprobs_val)
+    null_prefix = 0
+    while null_prefix < num_rows and not top_logprobs_val[null_prefix]:
+        null_prefix += 1
+    val_rows = top_logprobs_val[null_prefix:]
+    k = len(val_rows[0]) if val_rows else top_logprobs_num
+    for offset, row in enumerate(val_rows):
+        if row is None or len(row) != k:
+            raise ValueError(
+                "return_flat_raw_top_logprobs requires rectangular top logprob "
+                f"rows with nulls only in the leading prefix; row {null_prefix + offset} "
+                f"has {None if row is None else len(row)} entries (expected {k})."
+            )
+    return null_prefix, k
+
+
 def build_flat_input_top_logprobs_arrays(
     input_top_logprobs_val: List[Optional[List[float]]],
     input_top_logprobs_idx: List[Optional[List[int]]],
@@ -1504,24 +1538,12 @@ def build_flat_input_top_logprobs_arrays(
 
     Returns (float32 values [rows, k], int32 token ids [rows, k],
     null_prefix). The leading null rows are counted into null_prefix and
-    excluded from the arrays. Raises ValueError when the rows are not
-    representable by (shape, null_prefix): interior nulls or ragged k,
-    e.g. multi-item scoring.
+    excluded from the arrays; see `flat_top_logprobs_layout` for the rows
+    that raise ValueError.
     """
-    num_rows = len(input_top_logprobs_val)
-    null_prefix = 0
-    while null_prefix < num_rows and not input_top_logprobs_val[null_prefix]:
-        null_prefix += 1
+    null_prefix, k = flat_top_logprobs_layout(input_top_logprobs_val, top_logprobs_num)
     val_rows = input_top_logprobs_val[null_prefix:]
     idx_rows = input_top_logprobs_idx[null_prefix:]
-    k = len(val_rows[0]) if val_rows else top_logprobs_num
-    for offset, row in enumerate(val_rows):
-        if row is None or len(row) != k:
-            raise ValueError(
-                "return_flat_raw_top_logprobs requires rectangular top logprob "
-                f"rows with nulls only in the leading prefix; row {null_prefix + offset} "
-                f"has {None if row is None else len(row)} entries (expected {k})."
-            )
     val_arr = np.asarray(val_rows, dtype=np.float32).reshape(len(val_rows), k)
     idx_arr = np.asarray(idx_rows, dtype=np.int32).reshape(len(idx_rows), k)
     return val_arr, idx_arr, null_prefix
