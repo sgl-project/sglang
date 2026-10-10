@@ -70,15 +70,8 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
     output_audio_channels: int | None = 2
     output_av_drift_tolerance_s: float | None = 0.25
 
-    def accepts_audio_input(self) -> bool:
-        return True
-
     def supports_disaggregation(self) -> bool:
         return False
-
-    @property
-    def requires_audio_output(self) -> bool:
-        return True
 
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
         return ModelDeploymentConfig(
@@ -162,6 +155,7 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
             "is_dit_layerwise_offload_selected": (
                 server_args.is_dit_layerwise_offload_selected
             ),
+            "lora_path": server_args.lora_path,
             "model_variant": model_variant,
             "num_gpus": server_args.num_gpus,
             "performance_mode": server_args.performance_mode,
@@ -172,6 +166,7 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
             "ring_degree": server_args.ring_degree,
             "sp_degree": server_args.sp_degree,
             "tp_size": server_args.tp_size,
+            "transformer_weights_path": server_args.transformer_weights_path,
             "ulysses_degree": server_args.ulysses_degree,
             "use_fsdp_inference": server_args.use_fsdp_inference,
         }
@@ -185,6 +180,7 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
             "enable_breakable_cuda_graph": False,
             "enable_torch_compile": False,
             "is_dit_layerwise_offload_selected": False,
+            "lora_path": None,
             "model_variant": "fl2va",
             "num_gpus": 4,
             "performance_mode": "speed",
@@ -195,6 +191,7 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
             "ring_degree": 1,
             "sp_degree": 4,
             "tp_size": 1,
+            "transformer_weights_path": None,
             "ulysses_degree": 4,
             "use_fsdp_inference": False,
         }

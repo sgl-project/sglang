@@ -101,10 +101,16 @@ def _load_state_dict_for_detection(model_path: str):
 
 try:
     from sglang.multimodal_gen import DiffGenerator
-except ImportError:
+except ImportError as exc:
+    # Keep the nodes importable so ComfyUI shows this; fail clearly on first use.
+    _RUNTIME_IMPORT_ERROR: ImportError | None = exc
     logger.error(
-        "Error: sglang.multimodal_gen is not installed. Please install it using 'pip install sglang[diffusion]'"
+        "Failed to import the SGLang diffusion runtime: %r. Install the diffusion "
+        "extras with 'pip install sglang[diffusion]'.",
+        exc,
     )
+else:
+    _RUNTIME_IMPORT_ERROR = None
 
 
 def _load_executor_classes():
@@ -185,6 +191,10 @@ class SGLDiffusionGenerator:
         """Initialize the diffusion generator."""
         if self.generator is not None:
             return self.generator
+        if _RUNTIME_IMPORT_ERROR is not None:
+            raise RuntimeError(
+                "SGLang diffusion runtime failed to import"
+            ) from _RUNTIME_IMPORT_ERROR
         if kwargs is None:
             kwargs = {}
         # Set comfyui_mode for ComfyUI integration
