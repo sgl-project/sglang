@@ -300,7 +300,7 @@ class Model:
             else:
                 return {k: v for k, v in param.items() if "module." not in k}
 
-        state = torch.load(flownet_path, map_location="cpu", weights_only=False)
+        state = torch.load(flownet_path, map_location="cpu", weights_only=True)
         self.flownet.load_state_dict(convert(state), strict=False)
         logger.info("Loaded RIFE weights from %s", flownet_path)
 
