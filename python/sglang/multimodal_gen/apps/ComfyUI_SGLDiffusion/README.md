@@ -141,3 +141,11 @@ Per sampler step:
 4. The worker pipeline is the native model class with modules trimmed to `transformer` + pass-through scheduler. A single-file checkpoint goes through `comfyui_checkpoints`. After the first step, conditioning stays in a worker session; later steps send latents and the timestep.
 
 Adding a model means a checkpoint spec plus a `ComfyUIModelAdapter`. There is no extra ComfyUI pipeline class.
+
+## Per-run cache options
+
+`SGLDiffusion Cache Options` takes a MODEL and returns a clone carrying a per-run Cache-DiT toggle (plus optional DBCache knobs; `-1` keeps the server default). It is sent as a per-request sampling field, so changing it between runs does not restart the worker.
+
+- Supported today: MiniMax-H3 only. Other models run one independent step per request, so Cache-DiT raises a `ValueError` for them. Setting it to `off` or `default` is always accepted.
+- TeaCache is not exposed: no ComfyUI model can use it (H3 rejects `enable_teacache`; the single-step flow resets TeaCache state every request).
+- The `enable_cache_dit` loader option in `SGLDiffusion Options` still works as the default. A per-run `on`/`off` wins over it; `default` falls back to it.
