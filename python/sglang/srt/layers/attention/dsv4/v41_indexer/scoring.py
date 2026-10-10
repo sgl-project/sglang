@@ -12,6 +12,7 @@ import torch
 
 from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
     finish_paged_indexer_topk,
+    fp4_index_logits_candidates,
     fp4_index_logits_decode,
     fp4_index_logits_paged,
 )
@@ -20,6 +21,7 @@ from sglang.kernels.ops.attention.dsv4.index_logits import flat_index_logits_til
 from sglang.kernels.ops.attention.dsv4.topk import (
     plan_topk_v2,
     topk_transform_paged_v2,
+    topk_transform_ragged_v2,
 )
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import async_h2d
@@ -267,7 +269,8 @@ class ChunkScores(msgspec.Struct, frozen=True):
     rows: slice  # into the request's rows
     tok: torch.Tensor
     lens: torch.Tensor
-    scores: torch.Tensor  # [rows, lc] bf16, -inf past each row's length
+    scores: torch.Tensor  # [rows, lc], or compact candidate scores
+    candidate_blocks: Optional[torch.Tensor] = None
 
 
 class DecodeScores(msgspec.Struct, frozen=True):
@@ -283,6 +286,8 @@ def prefill_requests(
     inputs: PrefillInputs,
     token_to_kv_pool: DeepSeekV4TokenToKVPool,
     req_to_token: torch.Tensor,
+    candidate_blocks: Optional[torch.Tensor] = None,
+    block_size: int = 8,
 ) -> Iterator[tuple[RequestScores, Iterator[ChunkScores]]]:
     """Requests with nothing visible yet are skipped."""
     pool = token_to_kv_pool
@@ -296,6 +301,15 @@ def prefill_requests(
     # A compressed position is visible once the query has passed its last token.
     compress_lens = (pos + 1) // ratio
     topk = indexer.index_topk
+    # Unsupported shapes keep the independent Torch scoring/selection path.
+    if candidate_blocks is not None and not (
+        q.is_cuda
+        and torch.version.cuda is not None
+        and q.shape[1:] == (32, 128)
+        and q.dtype == weights.dtype == torch.bfloat16
+        and block_size == 8
+    ):
+        candidate_blocks = None
     for r in torch.unique_consecutive(req).tolist():
         tok = (req == r).nonzero().squeeze(1)
         lens = compress_lens[tok]
@@ -312,7 +326,12 @@ def prefill_requests(
         yield (
             request,
             _score_chunks(
-                indexer=indexer, q=q, weights=weights, index_k=index_k, request=request
+                indexer=indexer,
+                q=q,
+                weights=weights,
+                index_k=index_k,
+                request=request,
+                candidate_blocks=candidate_blocks,
             ),
         )
 
@@ -324,16 +343,36 @@ def _score_chunks(
     weights: torch.Tensor,
     index_k: torch.Tensor,
     request: RequestScores,
+    candidate_blocks: Optional[torch.Tensor] = None,
 ) -> Iterator[ChunkScores]:
     lc, j = request.lc, request.columns
     # Chunk rows so the [rows, heads, lc] bf16 scores stay under the budget.
     rows_per_chunk = max(1, _TORCH_SCORE_BUDGET_BYTES // (q.shape[1] * lc * 2))
+    if candidate_blocks is not None and index_k.dtype == torch.bfloat16:
+        from sglang.kernels.ops.attention.dsv4.candidate_bf16_mqa import (
+            candidate_bf16_mqa_logits,
+        )
+
+        # No [rows, heads, lc] or per-query K tensor on this path. Bound the
+        # FP32 output and the logical-index/top-k temporaries instead.
+        width = candidate_blocks.shape[1] * 8
+        rows_per_chunk = max(1, _TORCH_SCORE_BUDGET_BYTES // max(1, width * 32))
+    else:
+        candidate_blocks = None
     for start in range(0, request.tok.numel(), rows_per_chunk):
         rows = slice(start, start + rows_per_chunk)
         tok_c, lens_c = request.tok[rows], request.lens[rows]
-        s = indexer.scores(q[tok_c], index_k, weights[tok_c])
-        s = s.masked_fill(j[None, :] >= lens_c[:, None], -torch.inf)
-        yield ChunkScores(rows=rows, tok=tok_c, lens=lens_c, scores=s)
+        blocks = None if candidate_blocks is None else candidate_blocks[tok_c]
+        if blocks is None:
+            s = indexer.scores(q[tok_c], index_k, weights[tok_c])
+            s = s.masked_fill(j[None, :] >= lens_c[:, None], -torch.inf)
+        else:
+            s = candidate_bf16_mqa_logits(
+                q[tok_c], index_k, weights[tok_c], blocks, lens_c
+            )
+        yield ChunkScores(
+            rows=rows, tok=tok_c, lens=lens_c, scores=s, candidate_blocks=blocks
+        )
 
 
 def write_prefill(
@@ -353,11 +392,13 @@ def write_prefill(
 
 
 class PagedDecodeScores(msgspec.Struct, frozen=True):
-    """Paged decode scores with graph-stable capacity ``lmax``.
+    """Paged decode scores with graph-stable logical capacity ``lmax``.
 
     Only positions below each device-side ``lens`` are initialized. Top-k
     consumers must respect those lengths. With ``has_candidate_mask``, masked
     positions have -inf scores and must be discarded during selection writeback.
+    Compact candidates instead initialize every score column; score_lens is
+    their scan width, while lens remains the causal bound in logical K space.
     """
 
     bs: int
@@ -369,6 +410,9 @@ class PagedDecodeScores(msgspec.Struct, frozen=True):
     ratio: int
     plan: torch.Tensor
     has_candidate_mask: bool
+    # Compact columns need their own scan lengths; lens stays in logical K space.
+    candidate_blocks: Optional[torch.Tensor] = None
+    score_lens: Optional[torch.Tensor] = None
 
 
 def decode_scores(
@@ -377,6 +421,7 @@ def decode_scores(
     token_to_kv_pool: DeepSeekV4TokenToKVPool,
     req_to_token: torch.Tensor,
     candidate_mask: Optional[torch.Tensor] = None,
+    candidate_blocks: Optional[torch.Tensor] = None,
 ) -> Optional[DecodeScores | PagedDecodeScores]:
     """None when there is no row, or nothing visible yet."""
     pool = token_to_kv_pool
@@ -404,20 +449,39 @@ def decode_scores(
     table = pool.get_index_k_with_scale_buffer(inputs.layer_id)
     if paged:
         lens = lens.to(torch.int32)
-        # Prepare the device-side plan before scoring, away from its top-k consumer.
-        plan = plan_topk_v2(lens)
-        scores = fp4_index_logits_paged(
-            q,
-            weights,
-            req,
-            req_to_token,
-            lens,
-            table,
-            table.shape[1] // 68,
-            lmax,
-            ratio,
-            candidate_mask,
-        )
+        if candidate_blocks is not None:
+            assert candidate_mask is None
+            # Valid candidates may be interspersed with padding/causal holes.
+            score_lens = torch.full_like(lens, candidate_blocks.shape[1] * 8)
+            plan = plan_topk_v2(score_lens)
+            scores = fp4_index_logits_candidates(
+                q,
+                weights,
+                req,
+                req_to_token,
+                lens,
+                table,
+                table.shape[1] // 68,
+                lmax,
+                ratio,
+                candidate_blocks,
+            )
+        else:
+            score_lens = None
+            # Prepare the plan before scoring, away from its top-k consumer.
+            plan = plan_topk_v2(lens)
+            scores = fp4_index_logits_paged(
+                q,
+                weights,
+                req,
+                req_to_token,
+                lens,
+                table,
+                table.shape[1] // 68,
+                lmax,
+                ratio,
+                candidate_mask,
+            )
         return PagedDecodeScores(
             bs=bs,
             lmax=lmax,
@@ -428,7 +492,10 @@ def decode_scores(
             ratio=ratio,
             plan=plan,
             has_candidate_mask=candidate_mask is not None,
+            candidate_blocks=candidate_blocks,
+            score_lens=score_lens,
         )
+    assert candidate_blocks is None, "compact paged scoring requires SM90"
     inputs.reset_outputs()
     j = torch.arange(lmax, device=pos.device)
     valid = j[None, :] < lens[:, None]
@@ -445,8 +512,13 @@ def select_decode(
 ) -> None:
     k = min(topk, d.lmax)
     if isinstance(d, PagedDecodeScores):
+        k = min(k, d.scores.shape[1])
+        if not k:
+            inputs.reset_outputs()
+            return
         idx = torch.empty((d.bs, k), dtype=torch.int32, device=d.scores.device)
-        topk_transform_paged_v2(d.scores, d.lens, None, idx, 1, d.plan)
+        scan_lens = d.lens if d.score_lens is None else d.score_lens
+        topk_transform_paged_v2(d.scores, scan_lens, None, idx, 1, d.plan)
         finish_paged_indexer_topk(
             idx,
             d.scores,
@@ -457,6 +529,7 @@ def select_decode(
             None,
             d.ratio,
             d.has_candidate_mask,
+            candidate_blocks=d.candidate_blocks,
         )
     else:
         write_decode(inputs, d, d.scores.topk(k, dim=-1, sorted=False).indices)
@@ -469,3 +542,39 @@ def write_decode(inputs: DecodeInputs, d: DecodeScores, idx: torch.Tensor) -> No
     inputs.out_page_indices[: d.bs, :k] = torch.where(
         reach, d.slots.gather(1, idx.clamp_max(d.lmax - 1)), -1
     ).to(torch.int32)
+
+
+def select_compact_prefill(
+    inputs: PrefillInputs,
+    request: RequestScores,
+    chunk: ChunkScores,
+    req_to_token: torch.Tensor,
+) -> None:
+    rows, width = chunk.scores.shape
+    k = min(request.k, width)
+    if not rows or not k:
+        return  # prefill_requests has reset the output to -1.
+    indices = torch.empty((rows, k), dtype=torch.int32, device=chunk.scores.device)
+    # Scan the entire compact row: padding/causal holes can precede valid blocks.
+    scan_lens = torch.full(
+        (rows,), width, dtype=torch.int32, device=chunk.scores.device
+    )
+    topk_transform_ragged_v2(
+        chunk.scores,
+        scan_lens,
+        out_offsets=torch.zeros_like(scan_lens),
+        out_indices=indices,
+    )
+    finish_paged_indexer_topk(
+        indices,
+        chunk.scores,
+        chunk.lens,
+        inputs.req_rows[chunk.tok] if inputs.out_page_indices is not None else None,
+        req_to_token,
+        inputs.out_page_indices,
+        inputs.out_raw_indices,
+        inputs.compress_ratio,
+        True,
+        candidate_blocks=chunk.candidate_blocks,
+        output_rows=chunk.tok,
+    )

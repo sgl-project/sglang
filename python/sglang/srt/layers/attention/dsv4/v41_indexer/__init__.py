@@ -105,6 +105,10 @@ def make_candidate_indexer(
         candidate_topk_blocks=candidate_topk_blocks,
         candidate_block_size=candidate_block_size,
         use_deep_gemm_prefill=use_deep_gemm_prefill,
+        use_triton_candidates=(
+            torch.version.cuda is not None
+            and torch.cuda.get_device_capability()[0] == 9
+        ),
     )
     # Without candidate blocks no layer is a candidate source or consumer.
     if not is_sm100_or_newer() or candidate_topk_blocks <= 0:

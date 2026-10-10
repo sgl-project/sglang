@@ -24,6 +24,12 @@ def _finish_paged_indexer_topk_kernel(
     ReqTable,
     Pages,
     Raw,
+    Blocks,
+    OutputRows,
+    HAS_OUTPUT_ROWS: tl.constexpr,
+    WRITE_PAGES: tl.constexpr,
+    BLOCK_STRIDE: tl.constexpr,
+    HAS_CANDIDATES: tl.constexpr,
     BATCH: tl.constexpr,
     K: tl.constexpr,
     WIDTH: tl.constexpr,
@@ -45,23 +51,32 @@ def _finish_paged_indexer_topk_kernel(
         valid = (row < BATCH) & (col < K) & (idx >= 0) & (idx < WIDTH)
         score = tl.load(Scores + row * SCORE_STRIDE + idx, valid, -float("inf"))
         idx = tl.where(valid & (score > -float("inf")), idx, WIDTH)
+    if HAS_CANDIDATES:
+        valid = (row < BATCH) & (col < K) & (idx >= 0) & (idx < WIDTH)
+        block = tl.load(Blocks + row * BLOCK_STRIDE + idx // 8, valid, -1)
+        # Sort logical positions, not the unordered candidate-table columns.
+        idx = tl.where(valid & (block >= 0), block * 8 + idx % 8, 0x7FFFFFFF)
     idx = tl.sort(tl.where(idx >= 0, idx, WIDTH), descending=False)
     length = tl.load(Lengths + row, row < BATCH, 0)
-    req = tl.load(Requests + row, row < BATCH, 0)
+    output_row = tl.load(OutputRows + row) if HAS_OUTPUT_ROWS else row
     valid = (row < BATCH) & (col < K) & (idx < length)
-    slot = tl.load(
-        ReqTable + req.to(tl.int64) * TABLE_STRIDE + idx.to(tl.int64) * RATIO,
-        valid,
-        0,
-    )
-    tl.store(
-        Pages + row * PAGE_STRIDE + col,
-        tl.where(valid, slot.to(tl.int64) // RATIO, -1),
-        col < OUT_WIDTH,
-    )
+    if WRITE_PAGES:
+        req = tl.load(Requests + row, row < BATCH, 0)
+        slot = tl.load(
+            ReqTable + req.to(tl.int64) * TABLE_STRIDE + idx.to(tl.int64) * RATIO,
+            valid,
+            0,
+        )
+        tl.store(
+            Pages + output_row * PAGE_STRIDE + col,
+            tl.where(valid, slot.to(tl.int64) // RATIO, -1),
+            col < OUT_WIDTH,
+        )
     if WRITE_RAW:
         tl.store(
-            Raw + row * RAW_STRIDE + col, tl.where(valid, idx, -1), col < OUT_WIDTH
+            Raw + output_row * RAW_STRIDE + col,
+            tl.where(valid, idx, -1),
+            col < OUT_WIDTH,
         )
 
 
@@ -69,21 +84,38 @@ def finish_paged_indexer_topk(
     indices: torch.Tensor,
     scores: torch.Tensor,
     lengths: torch.Tensor,
-    req: torch.Tensor,
-    req_table: torch.Tensor,
-    page_indices: torch.Tensor,
+    req: torch.Tensor | None,
+    req_table: torch.Tensor | None,
+    page_indices: torch.Tensor | None,
     raw_indices: torch.Tensor | None,
     ratio: int,
     mask_scores: bool,
+    *,
+    candidate_blocks: torch.Tensor | None = None,
+    output_rows: torch.Tensor | None = None,
 ) -> None:
     """Sort selected positions and map them to compressed KV slots.
 
     Candidate consumers discard selected masked scores, including top-k underfill.
-    The entire output (including padded rows/columns) is written, with -1 padding.
+    With output_rows, write only those rows (unique, in-range destination indices).
+    Otherwise write every output row, including padded decode rows. Unselected
+    columns are -1. Raw-only prefill does not read the request table.
     """
-    if not page_indices.shape[0]:
+    if candidate_blocks is not None:
+        assert candidate_blocks.shape == (lengths.numel(), scores.shape[1] // 8)
+        assert candidate_blocks.stride(1) == 1
+    out = page_indices if page_indices is not None else raw_indices
+    assert out is not None
+    if page_indices is not None:
+        assert req is not None and req_table is not None
+        if raw_indices is not None:
+            assert raw_indices.shape == page_indices.shape
+    if output_rows is not None:
+        assert output_rows.shape == (lengths.numel(),) and output_rows.is_contiguous()
+    rows = out.shape[0] if output_rows is None else output_rows.numel()
+    if not rows or not out.shape[1]:
         return
-    _finish_paged_indexer_topk_kernel[(page_indices.shape[0],)](
+    _finish_paged_indexer_topk_kernel[(rows,)](
         indices,
         scores,
         lengths,
@@ -91,19 +123,25 @@ def finish_paged_indexer_topk(
         req_table,
         page_indices,
         raw_indices,
+        candidate_blocks,
+        output_rows,
+        output_rows is not None,
+        page_indices is not None,
+        candidate_blocks.stride(0) if candidate_blocks is not None else 0,
+        candidate_blocks is not None,
         lengths.numel(),
         indices.shape[1],
         scores.shape[1],
-        page_indices.shape[1],
+        out.shape[1],
         indices.stride(0),
         scores.stride(0),
-        req_table.stride(0),
-        page_indices.stride(0),
+        req_table.stride(0) if req_table is not None else 0,
+        page_indices.stride(0) if page_indices is not None else 0,
         raw_indices.stride(0) if raw_indices is not None else 0,
         ratio,
-        mask_scores,
+        mask_scores or candidate_blocks is not None,
         raw_indices is not None,
-        triton.next_power_of_2(max(page_indices.shape[1], indices.shape[1])),
+        triton.next_power_of_2(max(out.shape[1], indices.shape[1])),
         num_warps=4,
     )
 
@@ -944,3 +982,121 @@ def fp4_index_logits_paged(
         num_warps=4,
     )
     return out[:, :max_len]
+
+
+@triton.jit
+def _fp4_index_logits_candidates_kernel(
+    Q,
+    W,
+    Requests,
+    ReqTable,
+    Lengths,
+    Cache,
+    Blocks,
+    Out,
+    WIDTH: tl.constexpr,
+    MAX_LEN: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    CACHE_STRIDE: tl.constexpr,
+    TABLE_STRIDE: tl.constexpr,
+    BLOCK_STRIDE: tl.constexpr,
+    QB: tl.constexpr,
+    QH: tl.constexpr,
+    WB: tl.constexpr,
+    H: tl.constexpr,
+    RATIO: tl.constexpr,
+    TILE: tl.constexpr,
+):
+    row = tl.program_id(0)
+    req = tl.load(Requests + row).to(tl.int64)
+    visible = tl.minimum(tl.load(Lengths + row), MAX_LEN)
+    for tile in range(tl.program_id(1), tl.cdiv(WIDTH, TILE), tl.num_programs(1)):
+        compact = tile * TILE + tl.arange(0, TILE)
+        block = tl.load(
+            Blocks + row * BLOCK_STRIDE + compact // 8, mask=compact < WIDTH, other=-1
+        ).to(tl.int64)
+        logical = block * 8 + compact % 8
+        valid = (compact < WIDTH) & (block >= 0) & (logical < visible)
+        slot = (
+            tl.load(
+                ReqTable + req * TABLE_STRIDE + logical * RATIO, mask=valid, other=0
+            ).to(tl.int64)
+            // RATIO
+        )
+        score = _fp4_index_logits_tile(
+            Q,
+            W,
+            Cache,
+            row,
+            slot,
+            valid,
+            PAGE_SIZE,
+            CACHE_STRIDE,
+            QB,
+            QH,
+            WB,
+            H,
+            64,
+        )
+        tl.store(Out + row * WIDTH + compact, score, mask=compact < WIDTH)
+
+
+def fp4_index_logits_candidates(
+    q: torch.Tensor,
+    weights: torch.Tensor,
+    req: torch.Tensor,
+    req_table: torch.Tensor,
+    lens: torch.Tensor,
+    table: torch.Tensor,
+    page_size: int,
+    max_len: int,
+    ratio: int,
+    blocks: torch.Tensor,
+) -> torch.Tensor:
+    """Paged FP4 scores in candidate order, [rows, blocks_per_row * 8].
+
+    Read the request table directly, as in the dense paged scorer. Padding and
+    causal-invisible candidates produce -inf; no full-width mask or slot map.
+    """
+    assert q.dtype == torch.bfloat16 and q.shape[-1] == INDEX_HEAD_DIM
+    assert table.dtype == torch.uint8 and table.ndim == 2
+    assert ratio in (1, 2) and max_len <= req_table.shape[1] // ratio
+    assert req_table.stride(1) == 1
+    batch, heads, _ = q.shape
+    assert blocks.ndim == 2 and blocks.shape[0] == batch
+    assert blocks.dtype in (torch.int32, torch.int64)
+    assert req.shape == lens.shape == (batch,)
+    assert weights.shape == (batch, heads)
+    q = q.contiguous()
+    weights = weights.to(torch.bfloat16).contiguous()
+    req, lens, blocks = req.contiguous(), lens.contiguous(), blocks.contiguous()
+    width = blocks.shape[1] * 8
+    out = torch.empty((batch, width), device=q.device, dtype=torch.float32)
+    if not batch or not width:
+        return out
+    num_sms = torch.cuda.get_device_properties(q.device).multi_processor_count
+    workers = min(triton.cdiv(width, 64), triton.cdiv(num_sms * 4, batch))
+    _fp4_index_logits_candidates_kernel[(batch, workers)](
+        q,
+        weights,
+        req,
+        req_table,
+        lens,
+        table,
+        blocks,
+        out,
+        width,
+        max_len,
+        page_size,
+        table.stride(0),
+        req_table.stride(0),
+        blocks.stride(0),
+        q.stride(0),
+        q.stride(1),
+        weights.stride(0),
+        heads,
+        ratio,
+        64,
+        num_warps=4,
+    )
+    return out
