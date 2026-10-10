@@ -1,7 +1,8 @@
 """Pure-language V4.1 CP input, padding and DSpark state regressions."""
 
 import unittest
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
+from itertools import product
 from types import SimpleNamespace as NS
 from unittest.mock import Mock, patch
 
@@ -25,6 +26,159 @@ RUNNER = "sglang.srt.model_executor.runner.eager_runner"
 
 
 class TestDSV41TextCP(CustomTestCase):
+    def test_cp_multistream_q_starts_before_gathers_and_is_joined(self):
+        """Q must depend on q_lora, not the CP gathers or compressor. The
+        cache writer must still wait for gathered KV, and attention must see
+        completed Q. Emulate stream frontiers to detect missing dependencies.
+        """
+        module = "sglang.srt.models.deepseek_v4"
+        for captured, compressor, fused, encoder_replay, has_q_out in product(
+            (False, True), repeat=5
+        ):
+            with self.subTest(
+                captured=captured,
+                compressor=compressor,
+                fused=fused,
+                encoder_replay=encoder_replay,
+                has_q_out=has_q_out,
+            ):
+                self._check_early_cp_q(
+                    module, captured, compressor, fused, encoder_replay, has_q_out
+                )
+
+    def _check_early_cp_q(
+        self, module, captured, compressor, fused, encoder_replay, has_q_out
+    ):
+        class Stream:
+            def __init__(self):
+                self.ready = set()
+
+            def wait_stream(self, source):
+                self.ready.update(source.ready)
+
+        parent = Stream()
+        workers = [Stream() for _ in range(3)]
+        active = [parent]
+        events = {}
+
+        @contextmanager
+        def use_stream(stream):
+            previous, active[0] = active[0], stream
+            try:
+                yield
+            finally:
+                active[0] = previous
+
+        def enqueue(name, value, *inputs):
+            ready = active[0].ready
+            for operand in inputs:
+                self.assertIn(operand.name, ready, f"{name} reads unfinished input")
+            events[name] = (active[0], ready.copy())
+            ready.add(name)
+            return NS(name=name, value=value)
+
+        x = NS(name="input", value=2)
+        x.contiguous = lambda: x
+        parent.ready.add(x.name)
+        positions = 0
+        q_out = NS(value=-1) if has_q_out else None
+
+        def compute_q_a(hidden, qkv_a=None):
+            q = enqueue("q_a", 2 * hidden.value, qkv_a or hidden)
+            return q, q
+
+        def compute_q_b(q, pos, out):
+            self.assertIs(pos, positions)
+            self.assertIs(out, q_out)
+            result = enqueue("q_b", 3 * q.value, q)
+            if out is None:
+                return result
+            out.name, out.value = result.name, result.value
+            return out
+
+        def sources(**kwargs):
+            inputs = [kwargs["precomputed_x_global"] or x]
+            if kwargs["q_lora"] is not None:
+                inputs.append(kwargs["q_lora"])
+            return enqueue("sources", 5, *inputs)
+
+        def gather_index_k(layer):
+            # With no compressor this layer borrows an already-written cache.
+            inputs = (NS(name="sources"),) if compressor else ()
+            return enqueue("index_k", 7, *inputs)
+
+        def topk(layer, q, w, *, prepared_q, prepared_dense_k):
+            enqueue("topk", 0, prepared_q, prepared_dense_k, w)
+
+        layer = NS(
+            alt_streams=workers,
+            fuse_wqa_wkv=fused,
+            wqkv_a=lambda hidden: (enqueue("qkv_a", hidden.value, hidden), None),
+            compressor=object() if compressor else None,
+            indexer=NS(
+                queries=lambda q, freqs: enqueue("index_q", q.value, q),
+                head_weights=lambda hidden: enqueue("index_w", hidden.value, hidden),
+            ),
+            freqs_cis=(0,),
+            _compute_q_a=compute_q_a,
+            _compute_q_b=compute_q_b,
+            _materialize_cp_swa_k=lambda hidden, *args, **kw: enqueue(
+                "swa_gather", hidden.value, hidden
+            ),
+            _store_cp_swa_k=lambda kv, *args: enqueue("swa_store", kv.value, kv),
+        )
+        backend = NS(
+            low_ratio_prefill_graph=True,
+            forward_low_ratio_sources=sources,
+            _low_ratio_gather_k_prefill_graph=gather_index_k,
+            _low_ratio_quantize_q_prefill_graph=lambda q: enqueue(
+                "index_quant", q.value, q
+            ),
+            _low_ratio_index_topk_captured=topk,
+        )
+        with (
+            patch(module + ".torch.cuda.current_stream", side_effect=lambda: active[0]),
+            patch(module + ".torch.cuda.stream", side_effect=use_stream),
+            patch(
+                module + ".cp_materialize_global_token_order",
+                side_effect=lambda hidden, *args: enqueue(
+                    "main_gather", hidden.value, hidden
+                ),
+            ),
+            patch(module + ".is_in_breakable_cuda_graph", return_value=captured),
+        ):
+            result = MQALayer._forward_prepare_low_ratio_cp_multi_stream(
+                layer,
+                x,
+                positions,
+                NS(encoder_swa_replay=encoder_replay),
+                backend,
+                q_out,
+            )
+
+        self.assertEqual(result.value, 12)
+        if has_q_out:
+            self.assertIs(result, q_out)
+        self.assertIn(result.name, parent.ready, "attention reads unfinished Q")
+        q_stream, q_dependencies = events["q_b"]
+        self.assertIs(q_stream, workers[0])
+        self.assertIn("q_a", q_dependencies)
+        self.assertTrue(
+            q_dependencies.isdisjoint({"swa_gather", "main_gather", "sources"})
+        )
+        self.assertIs(events["swa_gather"][0], parent)
+        store_stream, store_dependencies = events["swa_store"]
+        self.assertIs(store_stream, workers[0])
+        self.assertTrue({"swa_gather", "q_b"}.issubset(store_dependencies))
+        if compressor and not encoder_replay:
+            self.assertIs(events["main_gather"][0], parent)
+            self.assertIn("swa_gather", events["main_gather"][1])
+            self.assertIn("main_gather", events["sources"][1])
+        else:
+            self.assertNotIn("main_gather", events)
+        if captured:
+            self.assertNotIn("swa_store", events["topk"][1])
+
     def test_cp_multistream_joins_swa_after_indexer_before_attention(self):
         # SWA KV is not an input of logits/top-k, but must be complete before
         # attention starts. A moved/removed join silently changes that boundary.
