@@ -29,6 +29,8 @@ mp.set_start_method("spawn", force=True)
 
 from sglang.benchmark.deepseek_utils import get_weight_shapes
 from sglang.kernels.ops.gemm.fp8_kernel import (
+    _select_w8a8_block_fp8_generic_kernel,
+    _supports_w8a8_block_fp8_k_groups,
     _w8a8_block_fp8_matmul,
     _w8a8_block_fp8_matmul_unrolledx4,
 )
@@ -38,6 +40,7 @@ from sglang.srt.utils import (
     get_device_core_count,
     get_device_count,
     get_device_name,
+    is_cuda,
     is_hip,
 )
 
@@ -92,8 +95,6 @@ def w8a8_block_matmul(
     C_shape = A.shape[:-1] + (N,)
     C = A.new_empty(C_shape, dtype=output_dtype)
 
-    needs_masking = bool(K % config["BLOCK_SIZE_K"] != 0)
-
     def grid(META):
         return (
             triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
@@ -113,8 +114,10 @@ def w8a8_block_matmul(
             if (_is_hip == True and num_workgroups <= get_device_core_count())
             else _w8a8_block_fp8_matmul
         )
+        if kernel is _w8a8_block_fp8_matmul:
+            kernel = _select_w8a8_block_fp8_generic_kernel(block_k, config, As, Bs)
         # set masking flag required by kernel arguments
-        extra_kernel_args["needs_masking"] = needs_masking
+        extra_kernel_args["needs_masking"] = bool(K % config["BLOCK_SIZE_K"] != 0)
     else:
         kernel = _w8a8_block_int8_matmul
 
@@ -169,14 +172,14 @@ def get_rocm_configs_compute_bound():
     return configs
 
 
-def get_configs_compute_bound():
+def get_configs_compute_bound(block_k_values=None):
     configs = []
     if _is_hip:
         configs = get_rocm_configs_compute_bound()
     else:
         for num_stages in [2, 3, 4, 5]:
             for block_m in [16, 32, 64, 128, 256]:
-                for block_k in [64, 128]:
+                for block_k in block_k_values or [64, 128]:
                     for block_n in [32, 64, 128, 256]:
                         for num_warps in [4, 8]:
                             for group_size in [1, 16, 32, 64]:
@@ -331,6 +334,22 @@ def save_configs(
             lock.release()
 
 
+def get_tuning_configs(block_k, input_type):
+    # Keep a one-group candidate when exploring unrolled CUDA FP8 tiles.
+    cuda_fp8 = is_cuda() and input_type == "fp8"
+    block_k_values = [32, 64, 128] if cuda_fp8 and block_k == 32 else None
+    configs = get_configs_compute_bound(block_k_values)
+    return [
+        config
+        for config in configs
+        if block_k % config["BLOCK_SIZE_K"] == 0
+        or (
+            cuda_fp8
+            and _supports_w8a8_block_fp8_k_groups(block_k, config["BLOCK_SIZE_K"])
+        )
+    ]
+
+
 def tune_on_gpu(args_dict):
     """Run tuning on a specific GPU."""
     gpu_id = args_dict["gpu_id"]
@@ -348,10 +367,7 @@ def tune_on_gpu(args_dict):
     save_path = args.save_path
     input_type = args.input_type
 
-    search_space = get_configs_compute_bound()
-    search_space = [
-        config for config in search_space if block_k % config["BLOCK_SIZE_K"] == 0
-    ]
+    search_space = get_tuning_configs(block_k, input_type)
 
     start = time.perf_counter()
     for shape in tqdm(weight_shapes, desc=f"GPU {gpu_id} - Shapes"):
