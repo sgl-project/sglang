@@ -147,7 +147,8 @@ def qsa_index_k_compress_store(
     cos_sin_cache: torch.Tensor,
     axis_map: torch.Tensor,
     weight: torch.Tensor,
-    write_locs: torch.Tensor,
+    owner_mask: torch.Tensor,
+    local_write_locs: torch.Tensor,
     compressed_k_buffer: torch.Tensor,
     compress_ratio: int,
     rotary_dim: int,
@@ -167,7 +168,9 @@ def qsa_index_k_compress_store(
     cos_sin_cache    : CUDA fp32 [capacity, rotary_dim] RoPE cache
     axis_map         : CUDA int32 [rotary_dim // 2] position-axis per pair index
     weight           : [head_dim] gemma norm weight (kernel applies 1 + w)
-    write_locs       : CUDA int32 [groups] compressed-cache slots to write
+    owner_mask       : CUDA int32 [groups], zero skips all reads and writes
+    local_write_locs : CUDA int32 [groups] rank-local compressed-cache slots;
+                       ignored where owner_mask is zero
     compressed_k_buffer : CUDA [compressed_slots, head_dim] (written), ring dtype
                        or fp8 e4m3
     compress_ratio   : raw keys per compressed key
@@ -186,7 +189,8 @@ def qsa_index_k_compress_store(
         cos_sin_cache,
         axis_map,
         weight,
-        write_locs,
+        owner_mask,
+        local_write_locs,
         compressed_k_buffer,
         compress_ratio,
         rotary_dim,

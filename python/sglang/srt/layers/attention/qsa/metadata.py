@@ -10,8 +10,11 @@ from typing import Optional, Tuple
 
 import msgspec
 import torch
-
 from sglang.srt.layers.attention.qsa.kernel import qsa_fast_topk
+from sglang.srt.mem_cache.qsa_kv_pool import (
+    QSACompressedBlockSharding,
+    assert_qsa_indices_in_bounds,
+)
 
 
 def build_qsa_row_ranges(
@@ -41,6 +44,39 @@ def build_qsa_row_ranges(
     max_blocks = compressed_lengths.index_select(0, query_sequence_ids)
     row_ends = row_starts + torch.minimum(visible_blocks, max_blocks)
     return row_starts, row_ends, compressed_cu_seqlens
+
+
+def count_visible_local_blocks(
+    logical_block_positions: torch.Tensor,
+    local_lengths: torch.Tensor,
+    sequence_ids: torch.Tensor,
+    visible_blocks: torch.Tensor,
+) -> torch.Tensor:
+    """Count visible owner-local blocks without a rows-by-prefix workspace."""
+
+    if logical_block_positions.ndim != 2:
+        raise ValueError("logical_block_positions must be rank 2")
+    if local_lengths.ndim != 1:
+        raise ValueError("local_lengths must be rank 1")
+    if logical_block_positions.shape[0] != local_lengths.numel():
+        raise ValueError("logical block rows must match local lengths")
+    if sequence_ids.shape != visible_blocks.shape:
+        raise ValueError("sequence_ids and visible_blocks must have matching shapes")
+
+    counts = torch.empty_like(visible_blocks, dtype=torch.int32)
+    for sequence_id, local_length in enumerate(local_lengths.tolist()):
+        row_mask = sequence_ids == sequence_id
+        if not bool(row_mask.any().item()):
+            continue
+        sorted_positions = logical_block_positions[
+            sequence_id, : int(local_length)
+        ].contiguous()
+        counts[row_mask] = torch.searchsorted(
+            sorted_positions,
+            visible_blocks[row_mask].to(sorted_positions.dtype),
+            right=False,
+        ).to(torch.int32)
+    return counts
 
 
 class QSAIndexerMetadata(msgspec.Struct, frozen=True):
@@ -75,6 +111,8 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
     # The first member's token row in this forward's packed tensors is extend only,
     # where group-aligned chunks keep every member in-chunk; None on paged forwards.
     write_locs: Optional[torch.Tensor] = None
+    write_owner_mask: Optional[torch.Tensor] = None
+    local_write_locs: Optional[torch.Tensor] = None
     compress_group_positions: Optional[torch.Tensor] = None
     compress_sequence_ids: Optional[torch.Tensor] = None
     compress_member_rows: Optional[torch.Tensor] = None
@@ -83,8 +121,12 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
     graph_compressed_page_table: Optional[torch.Tensor] = None
     graph_compressed_lengths: Optional[torch.Tensor] = None
     graph_prefix_lengths: Optional[torch.Tensor] = None
+    prefill_page_table: Optional[torch.Tensor] = None
+    prefill_lengths: Optional[torch.Tensor] = None
+    prefill_block_positions: Optional[torch.Tensor] = None
     decode_page_table: Optional[torch.Tensor] = None
     decode_lengths: Optional[torch.Tensor] = None
+    decode_block_positions: Optional[torch.Tensor] = None
     decode_logical_positions: Optional[torch.Tensor] = None
     pending_ring_slots: Optional[torch.Tensor] = None
     compress_group_ring_locs: Optional[torch.Tensor] = None
@@ -139,24 +181,36 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
         pool = self.token_to_kv_pool
         ratio = self.compress_ratio
         compressed_buffer = pool.get_qsa_compressed_k_buffer(layer_id)
-        parts = []
         sequence_lengths = self.sequence_lengths.to(torch.int32)
-        sequence_lengths_list = self.prefill_sequence_lengths_cpu
-        if sequence_lengths_list is None:
-            sequence_lengths_list = sequence_lengths.tolist()
-        for sequence_id in range(len(sequence_lengths_list)):
-            complete_blocks = int(sequence_lengths_list[sequence_id]) // ratio
-            if complete_blocks == 0:
-                continue
-            # compressed slot = first raw slot // ratio; the allocator is page-aligned,
-            # so each group is contiguous in one page (see QSATokenToKVPool).
-            compressed_locs = (
-                self.token_slot_table[
-                    sequence_id, : complete_blocks * ratio : ratio
-                ].long()
-                // ratio
+        parts: list[torch.Tensor] = []
+        if self.prefill_page_table is not None:
+            if self.prefill_lengths is None or self.prefill_block_positions is None:
+                raise RuntimeError("QSA local prefill page metadata is incomplete")
+            page_size = pool.qsa_compressed_page_size
+            cache = compressed_buffer.reshape(
+                -1, page_size, pool.qsa_index_kv_heads, pool.qsa_index_head_dim
             )
-            parts.append(compressed_buffer.index_select(0, compressed_locs))
+            for sequence_id, local_length in enumerate(self.prefill_lengths.tolist()):
+                if local_length == 0:
+                    continue
+                pages_needed = -(int(local_length) // -page_size)
+                pages = self.prefill_page_table[sequence_id, :pages_needed].long()
+                parts.append(cache.index_select(0, pages).flatten(0, 1)[:local_length])
+        else:
+            sequence_lengths_list = self.prefill_sequence_lengths_cpu
+            if sequence_lengths_list is None:
+                sequence_lengths_list = sequence_lengths.tolist()
+            for sequence_id in range(len(sequence_lengths_list)):
+                complete_blocks = int(sequence_lengths_list[sequence_id]) // ratio
+                if complete_blocks == 0:
+                    continue
+                compressed_locs = (
+                    self.token_slot_table[
+                        sequence_id, : complete_blocks * ratio : ratio
+                    ].long()
+                    // ratio
+                )
+                parts.append(compressed_buffer.index_select(0, compressed_locs))
         compressed_keys = (
             torch.cat(parts, dim=0)
             if parts
@@ -173,12 +227,31 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
                 f"positions={positions.numel()}, mapping={num_valid_tokens}"
             )
         positions = positions[:num_valid_tokens]
-        row_starts, row_ends, _ = build_qsa_row_ranges(
-            sequence_lengths,
-            positions.to(sequence_lengths.device),
-            query_sequence_ids.to(sequence_lengths.device),
-            self.compress_ratio,
-        )
+        if self.prefill_lengths is None:
+            row_starts, row_ends, _ = build_qsa_row_ranges(
+                sequence_lengths,
+                positions.to(sequence_lengths.device),
+                query_sequence_ids.to(sequence_lengths.device),
+                self.compress_ratio,
+            )
+        else:
+            cumulative = torch.nn.functional.pad(
+                self.prefill_lengths.to(torch.int32).cumsum(0), (1, 0)
+            ).to(torch.int32)
+            sequence_ids = query_sequence_ids.long()
+            row_starts = cumulative.index_select(0, sequence_ids)
+            visible_blocks = torch.div(
+                positions.to(sequence_lengths.device, dtype=torch.int64) + 1,
+                ratio,
+                rounding_mode="floor",
+            )
+            visible_local = count_visible_local_blocks(
+                self.prefill_block_positions,
+                self.prefill_lengths,
+                sequence_ids,
+                visible_blocks,
+            )
+            row_ends = row_starts + visible_local
         return compressed_keys, row_starts, row_ends, sequence_lengths
 
     def get_decode_mqa_inputs(
@@ -318,6 +391,119 @@ def compressed_decode_view(
     return compressed_page_table, compressed_lengths
 
 
+def localize_compressed_page_table(
+    *,
+    global_page_table: torch.Tensor,
+    compressed_lengths: torch.Tensor,
+    sharding: QSACompressedBlockSharding,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Localize owned physical pages and preserve each logit's logical position.
+
+    Page-table rows may contain non-monotonic physical page ids. Ownership and
+    cache addressing follow those physical ids, while ``logical_positions``
+    records the original sequence-local compressed-block position represented
+    by each compacted logit.
+    """
+
+    if global_page_table.ndim != 2:
+        raise ValueError(
+            "global_page_table must be rank 2, got "
+            f"shape={tuple(global_page_table.shape)}"
+        )
+    if compressed_lengths.ndim != 1:
+        raise ValueError(
+            "compressed_lengths must be rank 1, got "
+            f"shape={tuple(compressed_lengths.shape)}"
+        )
+    if global_page_table.shape[0] != compressed_lengths.numel():
+        raise ValueError(
+            "page-table rows must match compressed lengths: "
+            f"rows={global_page_table.shape[0]}, "
+            f"lengths={compressed_lengths.numel()}"
+        )
+    if global_page_table.device != compressed_lengths.device:
+        raise ValueError("global_page_table and compressed_lengths must share a device")
+    if torch.any(compressed_lengths < 0):
+        raise ValueError("compressed_lengths must be non-negative")
+
+    page_size = sharding.compressed_page_size
+    row_capacity = global_page_table.shape[1] * page_size
+    if torch.any(compressed_lengths > row_capacity):
+        raise ValueError(
+            f"compressed length exceeds page-table capacity: capacity={row_capacity}"
+        )
+
+    logical_page_starts = (
+        torch.arange(
+            global_page_table.shape[1],
+            dtype=torch.int64,
+            device=global_page_table.device,
+        )
+        * page_size
+    )
+    visible_pages = logical_page_starts.unsqueeze(
+        0
+    ) < compressed_lengths.long().unsqueeze(1)
+    visible_physical_pages = global_page_table[visible_pages]
+    if not global_page_table.is_cuda and torch.any(
+        (visible_physical_pages < 0) | (visible_physical_pages >= sharding.global_pages)
+    ):
+        raise ValueError("visible compressed physical page is out of range")
+    assert_qsa_indices_in_bounds(
+        global_page_table,
+        sharding.global_pages,
+        valid_mask=visible_pages,
+        label="compressed KV page table",
+    )
+
+    local_page_ids = sharding.global_to_local_pages(global_page_table)
+    owned_pages = visible_pages & (local_page_ids >= 0)
+    assert_qsa_indices_in_bounds(
+        local_page_ids,
+        sharding.local_pages,
+        valid_mask=owned_pages,
+        label="compressed KV local page table",
+    )
+    local_page_counts = owned_pages.sum(dim=1, dtype=torch.int32)
+    output_pages = (
+        int(local_page_counts.max().item()) if local_page_counts.numel() else 0
+    )
+    local_page_table = torch.full(
+        (global_page_table.shape[0], output_pages),
+        -1,
+        dtype=global_page_table.dtype,
+        device=global_page_table.device,
+    )
+    local_lengths = torch.zeros_like(compressed_lengths, dtype=torch.int32)
+    logical_positions = torch.full(
+        (global_page_table.shape[0], output_pages * page_size),
+        -1,
+        dtype=torch.int64,
+        device=global_page_table.device,
+    )
+    for row in range(global_page_table.shape[0]):
+        owned_columns = torch.nonzero(owned_pages[row], as_tuple=False).flatten()
+        row_position = 0
+        for output_page, column in enumerate(owned_columns):
+            local_page_table[row, output_page] = local_page_ids[row, column]
+            logical_start = int(column.item()) * page_size
+            visible_blocks = min(
+                page_size,
+                int(compressed_lengths[row].item()) - logical_start,
+            )
+            logical_positions[row, row_position : row_position + visible_blocks] = (
+                torch.arange(
+                    logical_start,
+                    logical_start + visible_blocks,
+                    dtype=torch.int64,
+                    device=global_page_table.device,
+                )
+            )
+            row_position += visible_blocks
+        local_lengths[row] = row_position
+    return local_page_table, local_lengths, logical_positions
+
+
 __all__ = [
     "QSAIndexerMetadata",
     "build_qsa_row_ranges",
@@ -325,4 +511,6 @@ __all__ = [
     "build_group_ring_slots",
     "build_rope_position_matrix",
     "compressed_decode_view",
+    "count_visible_local_blocks",
+    "localize_compressed_page_table",
 ]

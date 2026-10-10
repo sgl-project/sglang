@@ -277,11 +277,14 @@ struct QsaIndexKCompressParams {
   const float* cos_sin_cache;           // [positions_capacity, rotary_dim]
   const int32_t* axis_map;              // [rotary_dim / 2]
   const void* weight;                   // [kHeadDim]
-  const int32_t* write_locs;            // [groups]
+  const int32_t* owner_mask;            // [groups]
+  const int32_t* local_write_locs;      // [groups]
   void* compressed_k_buffer;            // [compressed_slots, kHeadDim]
   int32_t compress_ratio;
   int32_t rotary_dim;
   int32_t num_groups;
+  int32_t state_slots;
+  int32_t compressed_slots;
   float eps;
 };
 
@@ -306,7 +309,24 @@ __launch_bounds__(128) void qsa_index_k_compress_kernel(const QsaIndexKCompressP
 
   device::PDLWaitPrimary<kUsePDL>();
 
+  // Shape-derived eager launches retain padded and non-owner groups. Skip
+  // those before touching source state; their locations need not be valid.
+  if (params.owner_mask[group] == 0) {
+    device::PDLTriggerSecondary<kUsePDL>();
+    return;
+  }
   const int32_t* locs = params.group_locs + group * params.compress_ratio;
+  const int32_t write_loc = params.local_write_locs[group];
+  if (write_loc < 0 || write_loc >= params.compressed_slots) {
+    device::PDLTriggerSecondary<kUsePDL>();
+    return;
+  }
+  for (int32_t r = 0; r < params.compress_ratio; ++r) {
+    if (locs[r] < 0 || locs[r] >= params.state_slots) {
+      device::PDLTriggerSecondary<kUsePDL>();
+      return;
+    }
+  }
   const int32_t loc0 = locs[0];
 
   // fp32 mean over the group, rounded to the storage dtype exactly like
@@ -362,7 +382,7 @@ __launch_bounds__(128) void qsa_index_k_compress_kernel(const QsaIndexKCompressP
   }
 
   TOut* out_row =
-      static_cast<TOut*>(params.compressed_k_buffer) + static_cast<int64_t>(params.write_locs[group]) * kHeadDim;
+      static_cast<TOut*>(params.compressed_k_buffer) + static_cast<int64_t>(write_loc) * kHeadDim;
   qsa_mrope_apply<T, TOut, kHeadDim, kIsNeox>(
       smem_rows[warp], out_row, params.cos_sin_cache, params.axis_map, pos, params.rotary_dim);
 
@@ -453,7 +473,8 @@ void qsa_index_k_compress(
     tvm::ffi::TensorView cos_sin_cache,
     tvm::ffi::TensorView axis_map,
     tvm::ffi::TensorView weight,
-    tvm::ffi::TensorView write_locs,
+    tvm::ffi::TensorView owner_mask,
+    tvm::ffi::TensorView local_write_locs,
     tvm::ffi::TensorView compressed_k_buffer,
     int64_t compress_ratio,
     int64_t rotary_dim,
@@ -472,7 +493,8 @@ void qsa_index_k_compress(
   TensorMatcher({cache_rows, rotary_dim}).with_dtype<fp32_t>().with_device(device).verify(cos_sin_cache);
   TensorMatcher({rotary_dim / 2}).with_dtype<int32_t>().with_device(device).verify(axis_map);
   TensorMatcher({D}).with_dtype<T>().with_device(device).verify(weight);
-  TensorMatcher({groups}).with_dtype<int32_t>().with_device(device).verify(write_locs);
+  TensorMatcher({groups}).with_dtype<int32_t>().with_device(device).verify(owner_mask);
+  TensorMatcher({groups}).with_dtype<int32_t>().with_device(device).verify(local_write_locs);
   auto compressed_slots = SymbolicSize{"compressed_slots"};
   TensorMatcher({compressed_slots, D}).with_dtype<TOut>().with_device(device).verify(compressed_k_buffer);
 
@@ -490,11 +512,14 @@ void qsa_index_k_compress(
       .cos_sin_cache = static_cast<const float*>(cos_sin_cache.data_ptr()),
       .axis_map = static_cast<const int32_t*>(axis_map.data_ptr()),
       .weight = weight.data_ptr(),
-      .write_locs = static_cast<const int32_t*>(write_locs.data_ptr()),
+      .owner_mask = static_cast<const int32_t*>(owner_mask.data_ptr()),
+      .local_write_locs = static_cast<const int32_t*>(local_write_locs.data_ptr()),
       .compressed_k_buffer = compressed_k_buffer.data_ptr(),
       .compress_ratio = static_cast<int32_t>(compress_ratio),
       .rotary_dim = static_cast<int32_t>(rotary_dim),
       .num_groups = static_cast<int32_t>(num_groups),
+      .state_slots = static_cast<int32_t>(slots.unwrap()),
+      .compressed_slots = static_cast<int32_t>(compressed_slots.unwrap()),
       .eps = eps,
   };
   LaunchKernel(static_cast<uint32_t>(div_ceil(num_groups, 4)), 128, device.unwrap())

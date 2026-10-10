@@ -47,15 +47,18 @@ from array import array
 from contextlib import contextmanager
 from types import SimpleNamespace
 
+import pytest
 import torch
 import torch.multiprocessing as mp
 from parameterized import parameterized_class
-
 from sglang.srt.distributed import (
     init_distributed_environment,
     initialize_model_parallel,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.qsa.metadata import (
+    localize_compressed_page_table,
+)
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache import page_interleave
 from sglang.srt.mem_cache.allocator.page_interleave import (
@@ -82,6 +85,12 @@ from sglang.srt.mem_cache.page_interleave_pool import (
     PageInterleaveKVPoolMixin,
     PageInterleaveMHATokenToKVPool,
     PageInterleaveMLATokenToKVPool,
+)
+from sglang.srt.mem_cache.qsa_kv_pool import (
+    QSACompressedBlockSharding,
+    QSARawKVSharding,
+    QSATokenToKVPool,
+    qsa_global_compressed_capacity,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
@@ -497,10 +506,89 @@ class TestClassedAllocator(CustomTestCase):
         alloc = _make_allocator()
         with self.assertRaises(NotImplementedError):
             alloc.alloc(GS)
-        with self.assertRaises(NotImplementedError):
-            alloc.alloc_decode(
-                torch.tensor([PS + 1]), torch.tensor([PS + 1]), torch.tensor([PS - 1])
+
+    def test_decode_reuses_current_page_and_draws_next_owner_class(self):
+        alloc = _make_allocator(pages_per_rank=4)
+        chain = _alloc_extend(alloc, 0, 2 * PS, rotation_base=2)
+        before = alloc.class_free_page_counts()
+        seq_lens = torch.tensor([PS, 2 * PS + 1], dtype=torch.int64)
+        last_loc = torch.tensor([chain[PS - 2], chain[-1]], dtype=torch.int64)
+
+        out = alloc.alloc_decode(
+            seq_lens, seq_lens, last_loc, rotation_bases=[2, 2]
+        )
+
+        self.assertEqual(int(out[0]), int(last_loc[0]) + 1)
+        self.assertEqual(int(out[1] // PS % N), 0)
+        self.assertEqual(int(out[1] % PS), 0)
+        after = alloc.class_free_page_counts()
+        self.assertEqual(
+            [a - b for a, b in zip(after, before)],
+            [-1, 0, 0, 0],
+        )
+
+    def test_decode_preserves_int32_location_dtype_when_drawing_page(self):
+        alloc = _make_allocator(pages_per_rank=4)
+        chain = _alloc_extend(alloc, 0, PS, rotation_base=0)
+        seq_lens = torch.tensor([PS + 1], dtype=torch.int32)
+        last_loc = torch.tensor([chain[-1]], dtype=torch.int32)
+
+        out = alloc.alloc_decode(
+            seq_lens, seq_lens, last_loc, rotation_bases=[0]
+        )
+
+        self.assertEqual(out.dtype, torch.int32)
+        self.assertEqual(int(out[0] // PS % N), 1)
+        self.assertEqual(int(out[0] % PS), 0)
+
+    def test_decode_allocation_is_atomic_when_next_owner_class_is_empty(self):
+        alloc = _make_allocator(pages_per_rank=1)
+        _alloc_extend(alloc, 0, PS, rotation_base=0)
+        counts_before = alloc.class_free_page_counts()
+        seq_lens = torch.tensor([PS + 1, PS], dtype=torch.int64)
+        last_loc = torch.tensor([(N + 4) * PS - 1, 2 * PS - 2], dtype=torch.int64)
+
+        out = alloc.alloc_decode(
+            seq_lens, seq_lens, last_loc, rotation_bases=[3, 0]
+        )
+
+        self.assertIsNone(out)
+        self.assertEqual(alloc.class_free_page_counts(), counts_before)
+
+    def test_decode_helper_forwards_request_rotation_bases(self):
+        from sglang.srt.mem_cache import allocation
+
+        alloc = _make_allocator()
+        alloc.alloc_decode = unittest.mock.MagicMock(
+            return_value=torch.tensor([PS, 2 * PS])
+        )
+        tree_cache = SimpleNamespace(token_to_kv_pool_allocator=alloc)
+        batch = SimpleNamespace(
+            reqs=[
+                SimpleNamespace(kv_rotation_base=1),
+                SimpleNamespace(kv_rotation_base=3),
+            ]
+        )
+        seq_lens = torch.tensor([PS + 1, 2 * PS + 1], dtype=torch.int64)
+        last_loc = torch.tensor([PS - 1, 2 * PS - 1], dtype=torch.int64)
+
+        with unittest.mock.patch.object(
+            allocation, "evict_from_tree_cache", return_value=None
+        ):
+            allocation.alloc_paged_token_slots_decode(
+                tree_cache,
+                seq_lens,
+                seq_lens,
+                last_loc,
+                batch=batch,
             )
+
+        alloc.alloc_decode.assert_called_once_with(
+            seq_lens,
+            seq_lens,
+            last_loc,
+            rotation_bases=[1, 3],
+        )
 
     def test_batch_alloc_per_request_rotation(self):
         """bs > 1: each request draws its own cyclic run; out_cache_loc is
@@ -1682,6 +1770,175 @@ class TestPageInterleaveGatherMultiGpu(CustomTestCase):
 
     def test_mha_shard_over_attention_cp(self):
         mp.spawn(_run_mha, args=(_GATHER_WORLD, 29812), nprocs=_GATHER_WORLD, join=True)
+
+
+def test_qsa_compressed_page_ownership_mapping():
+    shard = QSACompressedBlockSharding(
+        global_blocks=20,
+        compressed_page_size=4,
+        world_size=3,
+        rank=1,
+    )
+    global_blocks = torch.tensor([4, 7, 16, 19])
+    torch.testing.assert_close(
+        shard.global_to_local_blocks(global_blocks), torch.tensor([0, 3, 4, 7])
+    )
+    torch.testing.assert_close(
+        shard.global_to_local_blocks(torch.tensor([0, 8, 12])),
+        torch.tensor([-1, -1, -1]),
+    )
+
+
+def test_qsa_shards_reuse_page_interleave_placement():
+    raw = QSARawKVSharding(local_capacity=8, page_size=4, world_size=2, rank=1)
+    compressed = QSACompressedBlockSharding(
+        global_blocks=20,
+        compressed_page_size=4,
+        world_size=3,
+        rank=1,
+    )
+    assert isinstance(raw.placement, PageInterleavePlacement)
+    assert raw.placement.spec.page_size == 1
+    assert isinstance(compressed.placement, PageInterleavePlacement)
+    assert compressed.placement.spec.page_size == 4
+
+
+def test_qsa_capacity_uses_page_interleave_allocator_width():
+    allocator = object.__new__(PageInterleavePoolAllocator)
+    allocator.shard_size = 4
+    assert (
+        qsa_global_compressed_capacity(13, compress_ratio=4, allocator=allocator) == 13
+    )
+
+
+def test_kv_cache_configurator_selects_page_interleave_allocator_for_sharded_qsa(
+    monkeypatch,
+):
+    from sglang.srt.mem_cache import kv_cache_configurator as module
+    from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+
+    pool = object.__new__(QSATokenToKVPool)
+    pool.cache_sharding_runtime = SimpleNamespace(enabled=True, size=4)
+    subject = object.__new__(KVCacheConfigurator)
+    subject.kv_cache_dtype = torch.bfloat16
+    subject.device = "cpu"
+    subject.is_hybrid_swa = False
+    subject.is_draft_worker = False
+    sizes = SimpleNamespace(
+        max_total_num_tokens=32,
+        full_max_total_num_tokens=None,
+        swa_max_total_num_tokens=None,
+    )
+    monkeypatch.setattr(module.current_platform, "is_out_of_tree", lambda: False)
+    monkeypatch.setattr(
+        module, "get_schedule", lambda: SimpleNamespace(page_size=4)
+    )
+    monkeypatch.setattr(
+        module,
+        "get_disagg",
+        lambda: SimpleNamespace(disaggregation_mode="null"),
+    )
+    monkeypatch.setattr(
+        module, "get_memory", lambda: SimpleNamespace(enable_hisparse=False)
+    )
+    monkeypatch.setattr(
+        module,
+        "get_parallel",
+        lambda: SimpleNamespace(dcp_enabled=False, attn_dcp_size=1),
+    )
+    allocator = subject._build_token_to_kv_pool_allocator(
+        sizes=sizes,
+        token_to_kv_pool=pool,
+        is_dsv4_model=False,
+        req_to_token_pool=SimpleNamespace(),
+        token_to_kv_pool_allocator=None,
+    )
+    assert isinstance(allocator, PageInterleavePoolAllocator)
+    assert allocator.size == 32 * 4
+    assert allocator.page_size == 4
+    assert allocator.shard_size == 4
+    assert (
+        subject.logical_token_capacity(
+            max_total_num_tokens=32,
+            allocator=allocator,
+        )
+        == 32 * 4
+    )
+
+
+@pytest.mark.parametrize(
+    ("page_table", "length", "pages", "local_length", "positions"),
+    [
+        (
+            [[5, 1, 5]],
+            12,
+            [[2, 0, 2]],
+            12,
+            [[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]],
+        ),
+        (
+            [[0, 1, 2]],
+            10,
+            [[0, 1]],
+            6,
+            [[0, 1, 2, 3, 8, 9, -1, -1]],
+        ),
+    ],
+)
+def test_qsa_page_localization_preserves_reuse_and_ragged_tail(
+    page_table, length, pages, local_length, positions
+):
+    shard = QSACompressedBlockSharding(
+        global_blocks=24 if page_table[0][0] == 5 else 12,
+        compressed_page_size=4,
+        world_size=2,
+        rank=1 if page_table[0][0] == 5 else 0,
+    )
+    actual_pages, actual_length, actual_positions = localize_compressed_page_table(
+        global_page_table=torch.tensor(page_table, dtype=torch.int32),
+        compressed_lengths=torch.tensor([length], dtype=torch.int32),
+        sharding=shard,
+    )
+    torch.testing.assert_close(actual_pages, torch.tensor(pages, dtype=torch.int32))
+    torch.testing.assert_close(
+        actual_length, torch.tensor([local_length], dtype=torch.int32)
+    )
+    torch.testing.assert_close(
+        actual_positions, torch.tensor(positions, dtype=torch.int64)
+    )
+
+
+def test_qsa_raw_slots_preserve_page_offsets_and_reuse():
+    shard = QSARawKVSharding(local_capacity=8, page_size=4, world_size=2, rank=1)
+    owner, local = shard.local_write_targets(torch.tensor([0, 1, 3, 14, 15, -1]))
+    torch.testing.assert_close(
+        owner, torch.tensor([False, True, True, False, True, False])
+    )
+    torch.testing.assert_close(local, torch.tensor([0, 0, 1, 0, 7, 0]))
+
+
+@pytest.mark.parametrize("kind", ["compressed", "raw"])
+def test_qsa_sharding_rejects_out_of_bounds_writes(kind):
+    if kind == "compressed":
+        shard = QSACompressedBlockSharding(
+            global_blocks=20,
+            compressed_page_size=4,
+            world_size=3,
+            rank=1,
+        )
+        with pytest.raises(IndexError, match="compressed KV write locations"):
+            shard.local_write_targets(
+                torch.tensor([20]), valid_mask=torch.tensor([True])
+            )
+    else:
+        shard = QSARawKVSharding(
+            local_capacity=8,
+            page_size=4,
+            world_size=2,
+            rank=1,
+        )
+        with pytest.raises(IndexError, match="raw KV write locations"):
+            shard.local_write_targets(torch.tensor([16]))
 
 
 if __name__ == "__main__":

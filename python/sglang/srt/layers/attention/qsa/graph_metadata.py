@@ -74,7 +74,9 @@ def _qsa_graph_row_metadata_kernel(
     # Graph output buffers.
     compressed_lens_ptr,
     write_locs_ptr,
+    write_owner_ptr,
     page_table_ptr,
+    block_positions_ptr,
     logical_positions_ptr,
     state_slots_ptr,
     ring_locs_ptr,
@@ -84,6 +86,9 @@ def _qsa_graph_row_metadata_kernel(
     max_pages,
     RATIO: tl.constexpr,
     FULL_PAGE: tl.constexpr,  # full-KV tokens per page
+    COMPRESSED_PAGE: tl.constexpr,
+    WORLD_SIZE: tl.constexpr,
+    RANK: tl.constexpr,
     PAGE_BLOCK: tl.constexpr,
     seq_lens_ptr,
     req_pool_ptr,
@@ -114,18 +119,22 @@ def _qsa_graph_row_metadata_kernel(
         seq_len = tl.load(row_seq_lens_ptr + row).to(tl.int32)
         req = tl.load(row_req_pool_ptr + row).to(tl.int64)
     token_row = req * req_to_token_row_stride
+    compressed = seq_len // RATIO
     if tl.program_id(1) == 0:
         current = tl.maximum(seq_len - 1, 0)
         last_loc = tl.load(req_to_token_ptr + token_row + current).to(tl.int32)
 
-        compressed = seq_len // RATIO
-        tl.store(compressed_lens_ptr + row, compressed)
-
-        # The page-aligned allocator keeps each compression group inside one page,
-        # so last_loc // RATIO is the group's compressed slot; slot 0 is the padding slot.
+        # The page-aligned allocator keeps each compression group inside one page.
         boundary = (seq_len > 0) & (seq_len % RATIO == 0)
-        write_loc = tl.where(boundary, last_loc // RATIO, 0)
-        tl.store(write_locs_ptr + row, write_loc)
+        global_write = last_loc // RATIO
+        global_write_page = global_write // COMPRESSED_PAGE
+        write_owner = boundary & (global_write_page % WORLD_SIZE == RANK)
+        local_write = (
+            global_write_page // WORLD_SIZE * COMPRESSED_PAGE
+            + global_write % COMPRESSED_PAGE
+        )
+        tl.store(write_locs_ptr + row, tl.where(write_owner, local_write, 0))
+        tl.store(write_owner_ptr + row, write_owner)
 
         tl.store(logical_positions_ptr + row, current)
         tl.store(state_slots_ptr + row, req * RATIO + (current % RATIO).to(tl.int64))
@@ -139,12 +148,63 @@ def _qsa_graph_row_metadata_kernel(
     # page-aligned req_to_token row; the scoring kernels turn them into
     # compressed slots as page_id * (FULL_PAGE // RATIO) + block_in_page.
     table_row = page_table_ptr + row.to(tl.int64) * max_pages
+    positions_row = (
+        block_positions_ptr
+        + row.to(tl.int64) * max_pages * COMPRESSED_PAGE
+    )
     offs = tl.arange(0, PAGE_BLOCK)
     row_width_pages = req_to_token_row_stride // FULL_PAGE
-    idx = tl.program_id(1) * PAGE_BLOCK + offs
-    valid = idx < tl.minimum(max_pages, row_width_pages)
-    loc = tl.load(req_to_token_ptr + token_row + idx * FULL_PAGE, mask=valid, other=0)
-    tl.store(table_row + idx, tl.maximum(loc // FULL_PAGE, 0), mask=valid)
+    visible_pages = tl.cdiv(compressed, COMPRESSED_PAGE)
+    local_page_count = 0
+    local_block_count = 0
+    for p0 in range(0, max_pages, PAGE_BLOCK):
+        idx = p0 + offs
+        valid = idx < tl.minimum(
+            visible_pages, tl.minimum(max_pages, row_width_pages)
+        )
+        loc = tl.load(
+            req_to_token_ptr + token_row + idx * FULL_PAGE, mask=valid, other=0
+        )
+        global_page = tl.maximum(loc // FULL_PAGE, 0)
+        owner = valid & (global_page % WORLD_SIZE == RANK)
+        owner_i = owner.to(tl.int32)
+        local_indices = (
+            local_page_count + tl.cumsum(owner_i, axis=0) - 1
+        )
+        tl.store(
+            table_row + local_indices,
+            global_page // WORLD_SIZE,
+            mask=owner,
+        )
+        blocks = tl.maximum(
+            0,
+            tl.minimum(
+                COMPRESSED_PAGE,
+                compressed - idx * COMPRESSED_PAGE,
+            ),
+        )
+        for k in tl.static_range(COMPRESSED_PAGE):
+            block_valid = owner & (k < blocks)
+            tl.store(
+                positions_row + local_indices * COMPRESSED_PAGE + k,
+                tl.where(block_valid, idx * COMPRESSED_PAGE + k, -1),
+                mask=owner,
+            )
+        local_page_count += tl.sum(owner_i, axis=0)
+        local_block_count += tl.sum(tl.where(owner, blocks, 0), axis=0)
+    # Graph buffers persist across replays. Clear the unused tail so shrinking
+    # sequences and padded rows cannot retain stale page ids or block positions.
+    for p0 in range(0, max_pages, PAGE_BLOCK):
+        idx = p0 + offs
+        clear_page = (idx >= local_page_count) & (idx < max_pages)
+        tl.store(table_row + idx, 0, mask=clear_page)
+        for k in tl.static_range(COMPRESSED_PAGE):
+            tl.store(
+                positions_row + idx * COMPRESSED_PAGE + k,
+                -1,
+                mask=clear_page,
+            )
+    tl.store(compressed_lens_ptr + row, local_block_count)
 
 
 def supports_graph_metadata_kernels(pool, device) -> bool:
@@ -176,6 +236,7 @@ def launch_graph_metadata(
     row_seq_lens = metadata.sequence_lengths
     row_req_pool = metadata.row_req_pool_indices
     row_prefix_lens = indexer.graph_prefix_lengths
+    compressed_sharding = getattr(pool, "qsa_compressed_sharding", None)
 
     if mode == 2:
         _qsa_graph_layout_kernel[(bs + 1,)](
@@ -194,12 +255,14 @@ def launch_graph_metadata(
             num_padding,
             num_warps=1,
         )
-    _qsa_graph_row_metadata_kernel[(num_rows, triton.cdiv(max_pages, 128))](
+    _qsa_graph_row_metadata_kernel[(num_rows, 1)](
         row_seq_lens,
         row_req_pool,
         indexer.graph_compressed_lengths,
         indexer.graph_write_locs,
+        indexer.write_owner_mask,
         indexer.graph_compressed_page_table,
+        indexer.decode_block_positions,
         indexer.decode_logical_positions,
         indexer.pending_ring_slots,
         indexer.graph_ring_group_locs,
@@ -208,6 +271,17 @@ def launch_graph_metadata(
         max_pages,
         RATIO=indexer.compress_ratio,
         FULL_PAGE=pool.qsa_compressed_page_size * indexer.compress_ratio,
+        COMPRESSED_PAGE=pool.qsa_compressed_page_size,
+        WORLD_SIZE=(
+            compressed_sharding.world_size
+            if compressed_sharding is not None
+            else 1
+        ),
+        RANK=(
+            compressed_sharding.rank
+            if compressed_sharding is not None
+            else 0
+        ),
         PAGE_BLOCK=128,
         seq_lens_ptr=seq_lens,
         req_pool_ptr=req_pool_indices,
@@ -233,6 +307,9 @@ def _qsa_draft_graph_metadata_kernel(
     MAX_PAGES: tl.constexpr,
     RATIO: tl.constexpr,
     FULL_PAGE: tl.constexpr,
+    COMPRESSED_PAGE: tl.constexpr,
+    WORLD_SIZE: tl.constexpr,
+    RANK: tl.constexpr,
 ):
     for step in tl.static_range(len(buffers)):
         if tl.program_id(2) == step:
@@ -246,15 +323,20 @@ def _qsa_draft_graph_metadata_kernel(
                 buf[5],
                 buf[6],
                 buf[7],
+                buf[8],
+                buf[9],
                 req_to_token,
                 row_stride,
                 MAX_PAGES,
                 RATIO,
                 FULL_PAGE,
+                COMPRESSED_PAGE,
+                WORLD_SIZE,
+                RANK,
                 128,
                 seq_lens,
                 req_pool,
-                buf[8],
+                buf[10],
                 bs,
                 num_padding,
                 extend_len=0,
@@ -264,13 +346,16 @@ def _qsa_draft_graph_metadata_kernel(
 
 
 def prepare_draft_graph_metadata(metadata, req_to_token, pool):
+    compressed_sharding = getattr(pool, "qsa_compressed_sharding", None)
     buffers = tuple(
         (
             m.sequence_lengths,
             m.row_req_pool_indices,
             m.indexer_metadata.graph_compressed_lengths,
             m.indexer_metadata.graph_write_locs,
+            m.indexer_metadata.write_owner_mask,
             m.indexer_metadata.graph_compressed_page_table,
+            m.indexer_metadata.decode_block_positions,
             m.indexer_metadata.decode_logical_positions,
             m.indexer_metadata.pending_ring_slots,
             m.indexer_metadata.graph_ring_group_locs,
@@ -285,14 +370,35 @@ def prepare_draft_graph_metadata(metadata, req_to_token, pool):
         metadata[0].indexer_metadata.graph_compressed_page_table.shape[1],
         pool.qsa_compress_ratio,
         pool.qsa_compressed_page_size * pool.qsa_compress_ratio,
+        pool.qsa_compressed_page_size,
+        (
+            compressed_sharding.world_size
+            if compressed_sharding is not None
+            else 1
+        ),
+        (
+            compressed_sharding.rank
+            if compressed_sharding is not None
+            else 0
+        ),
     )
 
 
 def launch_draft_graph_metadata(args, seq_lens, req_pool_indices, bs, num_padding):
-    buffers, req_to_token, row_stride, max_pages, ratio, full_page = args
+    (
+        buffers,
+        req_to_token,
+        row_stride,
+        max_pages,
+        ratio,
+        full_page,
+        compressed_page,
+        world_size,
+        rank,
+    ) = args
     if bs == 0:
         return
-    _qsa_draft_graph_metadata_kernel[(bs, triton.cdiv(max_pages, 128), len(buffers))](
+    _qsa_draft_graph_metadata_kernel[(bs, 1, len(buffers))](
         buffers,
         seq_lens,
         req_pool_indices,
@@ -303,5 +409,8 @@ def launch_draft_graph_metadata(args, seq_lens, req_pool_indices, bs, num_paddin
         max_pages,
         ratio,
         full_page,
+        compressed_page,
+        world_size,
+        rank,
         num_warps=1,
     )

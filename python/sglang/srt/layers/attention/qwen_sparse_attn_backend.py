@@ -10,13 +10,15 @@ import logging
 import math
 from copy import copy
 from functools import lru_cache
-from typing import Dict, Optional, Tuple
 
 import msgspec
 import torch
 import torch.nn.functional as F
-
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.qsa.cache_sharding import (
+    assert_qsa_cache_sharding_runtime_match,
+    get_qsa_cache_sharding_runtime,
+)
 from sglang.srt.layers.attention.qsa.config import (
     is_qwen_qsa,
     parse_qsa_profile,
@@ -32,6 +34,11 @@ from sglang.srt.layers.attention.qsa.metadata import (
     build_pending_ring_slots,
     build_rope_position_matrix,
     compressed_decode_view,
+    localize_compressed_page_table,
+)
+from sglang.srt.layers.attention.qsa.owner_sparse_attn import (
+    owner_sparse_attention,
+    select_kv_heads_for_query_shard,
 )
 from sglang.srt.layers.attention.qsa.sparse_attn import (
     qwen_sparse_fa2_cu_seqlens_triton,
@@ -54,7 +61,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     is_in_breakable_cuda_graph,
 )
-from sglang.srt.runtime_context import get_spec
+from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.utils import is_hip
 
 logger = logging.getLogger(__name__)
@@ -136,11 +143,11 @@ class QwenSparseAttnMetadata(msgspec.Struct, frozen=True):
     token_to_batch_idx: torch.Tensor
     token_slot_table: torch.Tensor
     indexer_metadata: QSAIndexerMetadata
-    row_req_pool_indices: Optional[torch.Tensor] = None
+    row_req_pool_indices: torch.Tensor | None = None
     is_cuda_graph: bool = False
-    fa2_valid_counts: Optional[torch.Tensor] = None
-    fa2_cu_seqlens_k: Optional[torch.Tensor] = None
-    fa2_cu_seqlens_q: Optional[torch.Tensor] = None
+    fa2_valid_counts: torch.Tensor | None = None
+    fa2_cu_seqlens_k: torch.Tensor | None = None
+    fa2_cu_seqlens_q: torch.Tensor | None = None
 
 
 class QSAMTPSharedSparseIndices:
@@ -209,7 +216,18 @@ class QwenSparseAttnBackend(AttentionBackend):
     # the graphed decode path never reads it, so opting out is safe.
     needs_cpu_seq_lens: bool = False
 
-    def __init__(self, runner=None) -> None:
+    def __init__(
+        self,
+        runner=None,
+        *,
+        owner_sparse_attn_group=None,
+        owner_sparse_attn_runtime=None,
+    ) -> None:
+        if owner_sparse_attn_group is not None or owner_sparse_attn_runtime is not None:
+            raise ValueError(
+                "the QSA cache-sharding owner attention hot path is "
+                "temporarily disabled"
+            )
         self.runner = runner
         self.token_to_kv_pool = getattr(runner, "token_to_kv_pool", None)
         self._fused_kv_pool_eligible = self._supports_fused_kv_pool(
@@ -220,6 +238,24 @@ class QwenSparseAttnBackend(AttentionBackend):
         config = getattr(model_config, "hf_text_config", None)
         if config is None:
             config = getattr(model_config, "hf_config", None)
+        cache_sharding_runtime = get_qsa_cache_sharding_runtime()
+        if self.token_to_kv_pool is None:
+            pool_runtime = cache_sharding_runtime
+        else:
+            pool_runtime = getattr(
+                self.token_to_kv_pool, "cache_sharding_runtime", None
+            )
+            if pool_runtime is None:
+                raise ValueError(
+                    "backend QSA cache-sharding runtime mismatch: QSA pool did "
+                    "not publish its construction contract"
+                )
+        assert_qsa_cache_sharding_runtime_match(
+            cache_sharding_runtime,
+            pool_runtime,
+            component="backend",
+        )
+        self.cache_sharding_runtime = cache_sharding_runtime
         self.qsa_profile = parse_qsa_profile(config)
         self.max_context_len = int(getattr(model_config, "context_len", 0))
         self.compress_ratio = (
@@ -230,14 +266,14 @@ class QwenSparseAttnBackend(AttentionBackend):
         req_pool = getattr(runner, "req_to_token_pool", None)
         self.req_to_token = getattr(req_pool, "req_to_token", None)
         self.req_to_token_pool = req_pool
-        self.forward_metadata: Optional[QwenSparseAttnMetadata] = None
-        self._cuda_graph_metadata: Dict[
-            Tuple[ForwardMode, int], QwenSparseAttnMetadata
+        self.forward_metadata: QwenSparseAttnMetadata | None = None
+        self._cuda_graph_metadata: dict[
+            tuple[ForwardMode, int], QwenSparseAttnMetadata
         ] = {}
         self._cuda_graph_max_tokens = 0
-        self._fa2_scratch: Dict[
-            Tuple[int, int, torch.dtype, torch.device],
-            Tuple[torch.Tensor, torch.Tensor],
+        self._fa2_scratch: dict[
+            tuple[int, int, torch.dtype, torch.device],
+            tuple[torch.Tensor, torch.Tensor],
         ] = {}
         self._graph_seq_lens = None
         self._graph_token_to_batch = None
@@ -245,8 +281,10 @@ class QwenSparseAttnBackend(AttentionBackend):
         self._graph_fa2_valid_counts = None
         self._graph_fa2_cu_seqlens_k = None
         self._graph_write_locs = None
+        self._graph_write_owner_mask = None
         self._graph_compressed_page_table = None
         self._graph_compressed_lengths = None
+        self._graph_block_positions = None
         self._graph_prefix_lengths = None
         self._graph_dummy_token_slot_table = None
         self._graph_dummy_out_cache_loc = None
@@ -258,12 +296,94 @@ class QwenSparseAttnBackend(AttentionBackend):
         self._graph_extend_lens = None
         self._graph_extend_lens_pin = None
         self._verify_mask = None
+        self._qsa_cache_sharding_buffers = None
+        raw_sharding = getattr(self.token_to_kv_pool, "qsa_raw_kv_sharding", None)
+        self.owner_sparse_attn_group = getattr(
+            self.token_to_kv_pool, "qsa_owner_group", None
+        )
+        self.owner_sparse_attn_runtime = getattr(raw_sharding, "runtime", None)
 
     @staticmethod
     def _is_speculative_paged_mode(forward_mode) -> bool:
         if forward_mode is None:
             return False
         return forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2()
+
+    @staticmethod
+    def _select_attention_kv_heads(
+        k: torch.Tensor, v: torch.Tensor, layer
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        parallel = get_parallel()
+        total_query_heads = layer.tp_q_head_num * parallel.attn_tp_size
+        total_kv_heads = getattr(
+            getattr(layer, "config", None),
+            "num_key_value_heads",
+            k.shape[1],
+        )
+        return select_kv_heads_for_query_shard(
+            k,
+            v,
+            total_query_heads=total_query_heads,
+            total_kv_heads=total_kv_heads,
+            tp_size=parallel.attn_tp_size,
+            tp_rank=parallel.attn_tp_rank,
+        )
+
+    def _owner_sparse_attn_components(self):
+        """Resolve owner communication after the KV pool has finished setup."""
+
+        pool = self.token_to_kv_pool
+        raw_sharding = getattr(pool, "qsa_raw_kv_sharding", None)
+        pool_group = getattr(pool, "qsa_owner_group", None)
+        pool_runtime = raw_sharding
+        if pool_group is not None or pool_runtime is not None:
+            if pool_group is None or pool_runtime is None:
+                raise ValueError(
+                    "QSA owner group and raw-KV runtime must be initialized together"
+                )
+            self.owner_sparse_attn_group = pool_group
+            self.owner_sparse_attn_runtime = pool_runtime
+        return self.owner_sparse_attn_group, self.owner_sparse_attn_runtime
+
+    def _dispatch_owner_sparse_attention(
+        self,
+        q: torch.Tensor,
+        layer,
+        forward_batch,
+        topk_indices: torch.Tensor,
+    ) -> torch.Tensor | None:
+        group, runtime = self._owner_sparse_attn_components()
+        if group is None and runtime is None:
+            return None
+        if group is None or runtime is None:
+            raise ValueError(
+                "owner_sparse_attn_group and owner_sparse_attn_runtime "
+                "must be supplied together"
+            )
+        metadata = self._resolve_metadata(forward_batch)
+        global_token_slots = self._logical_to_physical(topk_indices, metadata)
+        pool = self.token_to_kv_pool
+        k_cache, v_cache = self._select_attention_kv_heads(
+            pool.get_key_buffer(layer.layer_id),
+            pool.get_value_buffer(layer.layer_id),
+            layer,
+        )
+        static_buffers = self._qsa_cache_sharding_buffers
+        if static_buffers is not None and q.shape[0] > static_buffers.max_rows:
+            static_buffers = None
+        if static_buffers is not None:
+            static_buffers = static_buffers.for_layer(layer.layer_id)
+        output, _ = owner_sparse_attention(
+            q,
+            k_cache,
+            v_cache,
+            global_token_slots,
+            runtime,
+            group=group,
+            softmax_scale=layer.scaling,
+            static_buffers=static_buffers,
+        )
+        return output.to(q.dtype)
 
     def _require_chain_speculation(self, forward_mode, spec_info) -> None:
         if forward_mode is None or not forward_mode.is_target_verify():
@@ -375,7 +495,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         forward_mode,
         spec_info,
         num_padding: int = 0,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         base_lengths = cls._as_cpu_int_tensor(seq_lens_cpu, bs)
         if forward_mode.is_target_verify():
             extend_len = int(spec_info.draft_token_num)
@@ -499,7 +619,8 @@ class QwenSparseAttnBackend(AttentionBackend):
         prefix_lens=None,
     ):
         """Compact per-row block ranges into ``capacity`` write entries,
-        a shape-derived bound (no sync); padding writes the inert reserved slot 0."""
+        a shape-derived bound (no sync); ``valid`` distinguishes real groups
+        from padding instead of relying on the reserved slot value."""
         device = token_slot_table.device
         # The table width is a host-side bound;
         # assert on device so a short table fails loudly without a sync.
@@ -530,7 +651,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 row_token_starts[rows] + blocks * compress_ratio - prefix_lens[rows],
                 torch.zeros_like(blocks),
             )
-        return write_locs, group_end_positions, rows, member_rows
+        return write_locs, group_end_positions, rows, member_rows, valid
 
     def _qsa_build_write_plan(
         self,
@@ -671,18 +792,32 @@ class QwenSparseAttnBackend(AttentionBackend):
                     )
         decode_page_table = None
         decode_lengths = None
+        decode_block_positions = None
         decode_logical_positions = None
         pending_ring_slots = None
         compress_group_ring_locs = None
         extend_rope_matrix = None
-        write_locs, group_positions, group_sequence_ids, group_member_rows = (
-            self._qsa_build_write_plan(
-                forward_batch=forward_batch,
-                speculative_paged=speculative_paged,
-                token_slot_table=token_slot_table,
-                sequence_lengths=sequence_lengths,
-            )
+        (
+            write_locs,
+            group_positions,
+            group_sequence_ids,
+            group_member_rows,
+            write_valid_mask,
+        ) = self._qsa_build_write_plan(
+            forward_batch=forward_batch,
+            speculative_paged=speculative_paged,
+            token_slot_table=token_slot_table,
+            sequence_lengths=sequence_lengths,
         )
+        pool = self.token_to_kv_pool
+        sharding = getattr(pool, "qsa_compressed_sharding", None)
+        if sharding is None:
+            write_owner_mask = write_valid_mask
+            local_write_locs = torch.where(write_valid_mask, write_locs.long(), 0)
+        else:
+            write_owner_mask, local_write_locs = sharding.local_write_targets(
+                write_locs.long(), valid_mask=write_valid_mask
+            )
         decode_like = speculative_paged or forward_batch.forward_mode.is_decode()
         if decode_like:
             decode_logical_positions = (
@@ -698,15 +833,41 @@ class QwenSparseAttnBackend(AttentionBackend):
             ring_logical_positions = extend_positions.flatten()[
                 : token_to_batch_idx.numel()
             ]
+        prefill_page_table = None
+        prefill_lengths = None
+        prefill_block_positions = None
         if not self.should_reuse_mtp_sparse_indices(forward_batch):
-            if decode_like:
-                pool = self.token_to_kv_pool
-                decode_page_table, decode_lengths = compressed_decode_view(
-                    compressed_page_size=pool.qsa_compressed_page_size,
-                    compress_ratio=pool.qsa_compress_ratio,
-                    sequence_lengths=sequence_lengths,
-                    token_slot_table=token_slot_table,
+            global_page_table, global_lengths = compressed_decode_view(
+                compressed_page_size=pool.qsa_compressed_page_size,
+                compress_ratio=pool.qsa_compress_ratio,
+                sequence_lengths=sequence_lengths,
+                token_slot_table=token_slot_table,
+            )
+            if sharding is not None:
+                (
+                    local_page_table,
+                    local_lengths,
+                    local_block_positions,
+                ) = localize_compressed_page_table(
+                    global_page_table=global_page_table,
+                    compressed_lengths=global_lengths,
+                    sharding=sharding,
                 )
+                if decode_like:
+                    (
+                        decode_page_table,
+                        decode_lengths,
+                        decode_block_positions,
+                    ) = (local_page_table, local_lengths, local_block_positions)
+                else:
+                    (
+                        prefill_page_table,
+                        prefill_lengths,
+                        prefill_block_positions,
+                    ) = (local_page_table, local_lengths, local_block_positions)
+            elif decode_like:
+                decode_page_table = global_page_table
+                decode_lengths = global_lengths
             pending_ring_slots = build_pending_ring_slots(
                 token_to_batch_idx=token_to_batch_idx,
                 req_pool_indices=row_req_pool_indices,
@@ -742,11 +903,17 @@ class QwenSparseAttnBackend(AttentionBackend):
             block_topk=self.token_to_kv_pool.qsa_block_topk,
             req_pool_indices=row_req_pool_indices,
             write_locs=write_locs,
+            write_owner_mask=write_owner_mask,
+            local_write_locs=local_write_locs,
             compress_group_positions=group_positions,
             compress_sequence_ids=group_sequence_ids,
             compress_member_rows=group_member_rows,
+            prefill_page_table=prefill_page_table,
+            prefill_lengths=prefill_lengths,
+            prefill_block_positions=prefill_block_positions,
             decode_page_table=decode_page_table,
             decode_lengths=decode_lengths,
+            decode_block_positions=decode_block_positions,
             decode_logical_positions=decode_logical_positions,
             pending_ring_slots=pending_ring_slots,
             compress_group_ring_locs=compress_group_ring_locs,
@@ -820,6 +987,39 @@ class QwenSparseAttnBackend(AttentionBackend):
             is_read=False,
         )
         self._cuda_graph_max_tokens = max_num_tokens
+        if self.owner_sparse_attn_group is not None:
+            from sglang.srt.layers.attention.qsa.cache_sharding import (
+                QSACacheShardingStaticBuffers,
+            )
+
+            config = self.runner.model_config.hf_text_config
+            parallel = get_parallel()
+            gathered_query_heads = (
+                int(config.num_attention_heads)
+                // int(parallel.attn_tp_size)
+                * int(self.owner_sparse_attn_group.world_size)
+            )
+            self._qsa_cache_sharding_buffers = QSACacheShardingStaticBuffers(
+                max_rows=max_num_tokens,
+                topk=max(1, self.qsa_profile.block_topk),
+                owner_topk=(
+                    self.qsa_profile.budget
+                    + self.qsa_profile.compress_ratio
+                    - 1
+                ),
+                num_heads=gathered_query_heads,
+                head_dim=int(config.head_dim),
+                world_size=int(self.owner_sparse_attn_group.world_size),
+                device=self.device,
+                dtype=self.runner.dtype,
+                layer_ids=tuple(
+                    self.token_to_kv_pool.full_attention_layer_id_mapping.keys()
+                ),
+                candidate_group=self.owner_sparse_attn_group,
+            )
+            self.token_to_kv_pool.qsa_cache_sharding_buffers = (
+                self._qsa_cache_sharding_buffers
+            )
         max_blocks = math.ceil(self.max_context_len / self.compress_ratio)
         max_pages = max(
             1,
@@ -843,11 +1043,23 @@ class QwenSparseAttnBackend(AttentionBackend):
         self._graph_write_locs = torch.zeros(
             max_num_tokens, dtype=torch.int32, device=self.device
         )
+        self._graph_write_owner_mask = torch.zeros(
+            max_num_tokens, dtype=torch.bool, device=self.device
+        )
         self._graph_compressed_page_table = torch.zeros(
             (max_num_tokens, max_pages), dtype=torch.int32, device=self.device
         )
         self._graph_compressed_lengths = torch.zeros(
             max_num_tokens, dtype=torch.int32, device=self.device
+        )
+        self._graph_block_positions = torch.full(
+            (
+                max_num_tokens,
+                max_pages * self.token_to_kv_pool.qsa_compressed_page_size,
+            ),
+            -1,
+            dtype=torch.int32,
+            device=self.device,
         )
         self._graph_prefix_lengths = torch.zeros(
             max_num_tokens, dtype=torch.int32, device=self.device
@@ -947,10 +1159,12 @@ class QwenSparseAttnBackend(AttentionBackend):
             req_pool_indices=self._graph_row_req_pool_indices[:metadata_rows],
             is_cuda_graph=True,
             graph_write_locs=self._graph_write_locs[:metadata_rows],
+            write_owner_mask=self._graph_write_owner_mask[:metadata_rows],
             graph_compressed_page_table=self._graph_compressed_page_table[
                 :metadata_rows
             ],
             graph_compressed_lengths=self._graph_compressed_lengths[:metadata_rows],
+            decode_block_positions=self._graph_block_positions[:metadata_rows],
             graph_prefix_lengths=self._graph_prefix_lengths[:metadata_rows],
             decode_logical_positions=self._graph_logical_positions[:metadata_rows],
             pending_ring_slots=self._graph_state_slots[:metadata_rows],
@@ -1304,9 +1518,8 @@ class QwenSparseAttnBackend(AttentionBackend):
         assert self.forward_metadata is not None
         return self.forward_metadata
 
-    @staticmethod
     def _logical_to_physical(
-        logical_indices: torch.Tensor, metadata: QwenSparseAttnMetadata
+        self, logical_indices: torch.Tensor, metadata: QwenSparseAttnMetadata
     ) -> torch.Tensor:
         sequence_ids = metadata.token_to_batch_idx.long()
         if sequence_ids.numel() != logical_indices.shape[0]:
@@ -1315,11 +1528,27 @@ class QwenSparseAttnBackend(AttentionBackend):
             0, sequence_ids
         )
         valid = (logical_indices >= 0) & (logical_indices < row_lengths.unsqueeze(1))
-        safe = logical_indices.clamp(
-            min=0, max=metadata.token_slot_table.shape[1] - 1
-        ).long()
-        slots = metadata.token_slot_table[sequence_ids[:, None], safe]
-        return torch.where(valid, slots, torch.full_like(slots, -1)).to(torch.int32)
+        if metadata.is_cuda_graph:
+            if self.req_to_token is None or metadata.row_req_pool_indices is None:
+                raise RuntimeError(
+                    "QSA graph replay requires live req_to_token row metadata"
+                )
+            safe = logical_indices.clamp(
+                min=0, max=self.req_to_token.shape[1] - 1
+            ).long()
+            reqs = metadata.row_req_pool_indices.long().index_select(
+                0, sequence_ids
+            )
+            slots = self.req_to_token[reqs[:, None], safe]
+        else:
+            safe = logical_indices.clamp(
+                min=0, max=metadata.token_slot_table.shape[1] - 1
+            ).long()
+            slots = metadata.token_slot_table[sequence_ids[:, None], safe]
+        physical_slots = torch.where(
+            valid, slots, torch.full_like(slots, -1)
+        ).to(torch.int32)
+        return physical_slots
 
     @staticmethod
     def _supports_fused_kv_pool(pool):
@@ -1437,7 +1666,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         layer,
         forward_batch,
         save_kv_cache: bool = True,
-        topk_indices: Optional[torch.Tensor] = None,
+        topk_indices: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         if topk_indices is None:
@@ -1472,6 +1701,11 @@ class QwenSparseAttnBackend(AttentionBackend):
             output = self._forward_paged_attention(
                 q, layer, forward_batch, topk_indices
             )
+            return self._pad_extend_output(output, num_output_rows)
+        output = self._dispatch_owner_sparse_attention(
+            q, layer, forward_batch, topk_indices
+        )
+        if output is not None:
             return self._pad_extend_output(output, num_output_rows)
         if not q.is_cuda:
             metadata = self._resolve_metadata(forward_batch)
@@ -1664,7 +1898,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         head_dim: int,
         dtype: torch.dtype,
         device: torch.device,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         key = (num_kv_heads, head_dim, dtype, device)
         buffers = self._fa2_scratch.get(key)
         if buffers is None or buffers[0].shape[0] < capacity:
@@ -1832,7 +2066,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         layer,
         forward_batch,
         save_kv_cache: bool = True,
-        topk_indices: Optional[torch.Tensor] = None,
+        topk_indices: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         if topk_indices is None:
@@ -1847,7 +2081,10 @@ class QwenSparseAttnBackend(AttentionBackend):
                 layer, forward_batch.out_cache_loc, k, v
             )
         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
-        return self._forward_paged_attention(q, layer, forward_batch, topk_indices)
+        output = self._forward_paged_attention(
+            q, layer, forward_batch, topk_indices
+        ).reshape(q.shape[0], -1)
+        return output
 
     def _forward_paged_attention(
         self,
@@ -1856,11 +2093,19 @@ class QwenSparseAttnBackend(AttentionBackend):
         forward_batch,
         topk_indices: torch.Tensor,
     ) -> torch.Tensor:
+        output = self._dispatch_owner_sparse_attention(
+            q, layer, forward_batch, topk_indices
+        )
+        if output is not None:
+            return output.reshape(q.shape[0], -1)
         pool = self.token_to_kv_pool
         k_buffer = pool.get_key_buffer(layer.layer_id)
         v_buffer = pool.get_value_buffer(layer.layer_id)
         metadata = self._resolve_metadata(forward_batch)
         topk_indices = self._expand_block_indices(topk_indices, metadata)
+        k_buffer, v_buffer = self._select_attention_kv_heads(
+            k_buffer, v_buffer, layer
+        )
         if not q.is_cuda:
             slots = self._logical_to_physical(topk_indices, metadata)
             output = qsa_sparse_attention(q, k_buffer, v_buffer, slots, layer.scaling)
@@ -2168,8 +2413,8 @@ class QwenSparseMultiStepDraftBackend:
 
 
 __all__ = [
-    "is_qwen_qsa",
-    "QwenSparseAttnMetadata",
     "QwenSparseAttnBackend",
+    "QwenSparseAttnMetadata",
     "QwenSparseMultiStepDraftBackend",
+    "is_qwen_qsa",
 ]

@@ -546,6 +546,8 @@ def _dcp_lse_combine_kernel(
     out_stride_B,
     out_stride_H,
     out_stride_D,
+    out_lse_stride_B,
+    out_lse_stride_H,
     N: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     IS_BASE_E: tl.constexpr,
@@ -578,7 +580,8 @@ def _dcp_lse_combine_kernel(
         )
         lse_max = tl.where(lse_i > lse_max, lse_i, lse_max)
 
-    lse_max = tl.where(lse_max == -float("inf"), 0.0, lse_max)
+    has_any = lse_max != -float("inf")
+    lse_max = tl.where(has_any, lse_max, 0.0)
 
     # Pass 2: accumulate weighted outputs
     weight_sum = tl.zeros([], dtype=tl.float32)
@@ -594,6 +597,7 @@ def _dcp_lse_combine_kernel(
             w = tl.exp(centered)
         else:
             w = tl.exp2(centered)
+        w = tl.where(lse_i == -float("inf"), 0.0, w)
         weight_sum += w
 
         o_offsets = (
@@ -605,7 +609,7 @@ def _dcp_lse_combine_kernel(
         partial_out = tl.load(recv_output_ptr + o_offsets).to(tl.float32)
         acc += partial_out * w
 
-    acc = acc / weight_sum
+    acc = tl.where(has_any, acc / tl.maximum(weight_sum, 1.0), 0.0)
 
     out_offsets = (
         batch_idx * out_stride_B + head_idx * out_stride_H + d_offsets * out_stride_D
@@ -614,10 +618,14 @@ def _dcp_lse_combine_kernel(
 
     if RETURN_LSE:
         if IS_BASE_E:
-            global_lse = tl.log(weight_sum) + lse_max
+            global_lse = tl.where(
+                has_any, tl.log(weight_sum) + lse_max, -float("inf")
+            )
         else:
-            global_lse = tl.log2(weight_sum) + lse_max
-        out_lse_offset = batch_idx * recv_lse_stride_B + head_idx * recv_lse_stride_H
+            global_lse = tl.where(
+                has_any, tl.log2(weight_sum) + lse_max, -float("inf")
+            )
+        out_lse_offset = batch_idx * out_lse_stride_B + head_idx * out_lse_stride_H
         tl.store(out_lse_ptr + out_lse_offset, global_lse)
 
 
@@ -665,6 +673,8 @@ def dcp_lse_combine_triton(
         out.stride(0),
         out.stride(1),
         out.stride(2),
+        out_lse.stride(0) if return_lse else 0,
+        out_lse.stride(1) if return_lse else 0,
         N=N,
         HEAD_DIM=D,
         IS_BASE_E=is_lse_base_on_e,
