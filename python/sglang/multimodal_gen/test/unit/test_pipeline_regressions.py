@@ -1,5 +1,7 @@
 """Regression tests for pipeline and model-helper bugs (CPU only)."""
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 import torch
@@ -7,6 +9,9 @@ from PIL import Image
 
 from sglang.multimodal_gen.runtime.pipelines.diffusers_pipeline import (
     DiffusersExecutionStage,
+)
+from sglang.multimodal_gen.runtime.pipelines.sana_video import (
+    SanaVideoTextEncodingStage,
 )
 from sglang.multimodal_gen.runtime.utils.camera_geometry import get_plucker_embeddings
 from sglang.multimodal_gen.runtime.utils.mesh3d_utils import (
@@ -64,3 +69,21 @@ def test_diffusers_output_layout_is_channels_first(data, expected_shape):
     output = stage._postprocess_output(stage._convert_to_tensor(data))
 
     assert tuple(output.shape) == expected_shape
+
+
+def test_sana_video_negative_prompt_uses_requested_sequence_length():
+    """The negative prompt was always encoded at 300 tokens, so a custom
+    max_sequence_length gave positive and negative embeddings different lengths."""
+    stage = SanaVideoTextEncodingStage.__new__(SanaVideoTextEncodingStage)
+    captured = {}
+    stage.encode_text = lambda *args, **kwargs: captured.update(kwargs)
+
+    stage._encode_negative_text(
+        SimpleNamespace(negative_prompt="Blurry", max_sequence_length=128), None, [0]
+    )
+    assert captured["max_length"] == 128
+
+    stage._encode_negative_text(
+        SimpleNamespace(negative_prompt="Blurry", max_sequence_length=None), None, [0]
+    )
+    assert captured["max_length"] == 300
