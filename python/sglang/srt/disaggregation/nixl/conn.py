@@ -85,6 +85,24 @@ NIXL_ERR_SETTLE_TIMEOUT_S = 5.0
 NIXL_ERR_SETTLE_POLL_S = 0.001
 
 
+def _resolve_ucx_device_list(ib_device: str, gpu_id: int) -> Optional[str]:
+    from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
+        get_ib_devices_for_gpu,
+    )
+
+    devices = get_ib_devices_for_gpu(ib_device, gpu_id)
+    if devices is None:
+        return None
+    names = [name.strip() for name in devices.split(",")]
+    if any(not name or ":" in name for name in names):
+        raise ValueError(
+            "NIXL UCX --disaggregation-ib-device requires HCA names without "
+            "port suffixes (e.g. mlx5_0); NIXL appends port 1."
+        )
+    # NIXL's UCX device_list parser splits on the literal delimiter ", ".
+    return ", ".join(names)
+
+
 def _normalize_kv_mem_kinds(kinds: Optional[List[str]], expected_len: int) -> List[str]:
     if kinds is None:
         return ["VRAM"] * expected_len
@@ -482,6 +500,31 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 "SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS must be a JSON object "
                 "with string keys and string values"
             )
+        if backend == "UCX" and self.kv_args.ib_device:
+            device_list = _resolve_ucx_device_list(
+                self.kv_args.ib_device, self.kv_args.gpu_id
+            )
+            if device_list is not None:
+                existing = backend_params.get("device_list")
+                if (
+                    existing is not None
+                    and ", ".join(name.strip() for name in existing.split(","))
+                    != device_list
+                ):
+                    raise ValueError(
+                        "Conflicting NIXL UCX device_list in "
+                        "SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS and "
+                        "--disaggregation-ib-device. Configure only one "
+                        "device selection or make them agree."
+                    )
+                backend_params["device_list"] = device_list
+                logger.info(
+                    "NIXL UCX device binding: gpu_id=%s, engine_rank=%s, "
+                    "device_list=%s",
+                    self.kv_args.gpu_id,
+                    self.kv_args.engine_rank,
+                    device_list,
+                )
         # self.transfer_worker and self._start_bootstrap_thread runs concurrently
         # so we cannot use sync_mode=None which is thread-unsafe.
         agent_config = nixl_agent_config(
