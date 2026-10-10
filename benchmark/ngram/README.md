@@ -39,6 +39,10 @@ Dockerfile to preserve the other shared defaults too. Do not pass an empty
 Podman's warnings about omitted `SGL_VERSION`, `PIP_DEFAULT_INDEX`, and
 `UBUNTU_MIRROR` are harmless for this local-source build. To suppress them, add
 `--build-arg SGL_VERSION= --build-arg PIP_DEFAULT_INDEX= --build-arg UBUNTU_MIRROR=`.
+The gateway build raises its soft open-file limit only to the inherited hard
+limit. Older checkouts use `ulimit -n 65536`, which aborts on restricted build
+containers when that hard limit cannot be raised. Replace it with
+`ulimit -S -n "$(ulimit -H -n)"` to respect the container's existing ceiling.
 The full image build and GPU execution still require validation on the host.
 
 ## Run

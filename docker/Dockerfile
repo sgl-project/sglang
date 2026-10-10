@@ -412,13 +412,15 @@ WORKDIR /build
 # Copy ONLY the gateway source (not the full repo)
 COPY sgl-model-gateway /build/sgl-model-gateway
 
-# Install Rust, build gateway binary and Python bindings, then clean up Rust toolchain
+# Install Rust, build gateway binary and Python bindings, then clean up Rust toolchain.
+# Raise only the soft open-file limit, within the build container's hard limit.
 RUN --mount=type=cache,target=/root/.cache/pip \
     curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.rustup.rs | sh -s -- -y \
     && export PATH="/root/.cargo/bin:${PATH}" \
     && python3 -m pip install maturin \
     && cd /build/sgl-model-gateway/bindings/python \
-    && ulimit -n 65536 && maturin build --release --features vendored-openssl --out /build/gateway_wheels \
+    && ulimit -S -n "$(ulimit -H -n)" \
+    && maturin build --release --features vendored-openssl --out /build/gateway_wheels \
     && cd /build/sgl-model-gateway \
     && cargo build --release --bin sgl-model-gateway --features vendored-openssl \
     && cp target/release/sgl-model-gateway /build/sgl-model-gateway-bin \
