@@ -30,10 +30,8 @@ try:
 except ImportError:
     import sre_parse  # Python < 3.11
 
-# JSON-safe value types for custom_params.  Must survive msgpack IPC
-# without PickleWrapper.  After deserialization on the scheduler side,
-# Req.__init__ injects "__req__" (a Req object) into the dict in-process;
-# that augmented dict is never re-serialized.
+# JSON-safe value types for custom_params. Must survive msgpack IPC
+# without PickleWrapper.
 _JsonScalar = Union[None, bool, int, float, str]
 CustomParamValue = Union[
     _JsonScalar,

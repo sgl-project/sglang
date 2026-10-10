@@ -1266,6 +1266,11 @@ class EmbeddingReqInput:
     # Batch-level: List[List[int]] (one per request). After __getitem__: List[int].
     token_indices_to_pool: Optional[Union[List[List[int]], List[int]]] = None
 
+    # Question and option spans that a Clef checkpoint's joint schema head
+    # scores, as packed by layers.joint_schema_head.pack_decision_layout.
+    # Batch-level: List[List[int]] (one per request). After __getitem__: List[int].
+    decision_layout: Optional[Union[List[List[int]], List[int]]] = None
+
     def regenerate_rid(self):
         """Generate a new request ID and return it."""
         if isinstance(self.rid, list):
@@ -1482,6 +1487,11 @@ class EmbeddingReqInput:
                     if self.token_indices_to_pool is not None
                     else None
                 ),
+                decision_layout=(
+                    self.decision_layout[i]
+                    if self.decision_layout is not None
+                    else None
+                ),
             )
         cache[i] = sub
         return sub
@@ -1513,6 +1523,8 @@ class TokenizedEmbeddingReqInput(BaseReq, kw_only=True):
     multi_item_delimiter_indices: Optional[List[int]] = None
     # Token positions for setwise pooling readout
     token_indices_to_pool: Optional[List[int]] = None
+    # Question and option spans for a joint schema head
+    decision_layout: Optional[List[int]] = None
     # For observability
     # Pickled Optional[Union[APIServerReqTimeStats, DPControllerReqTimeStats]]
     time_stats: Optional[PickleWrapper] = None

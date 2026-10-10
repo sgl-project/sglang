@@ -1590,13 +1590,15 @@ def make_layers(
     prefix: str = "",
     return_tuple: bool = False,
     offloader_kwargs: Optional[Dict[str, Any]] = None,
+    final_read: Optional[Any] = None,
 ) -> Tuple[torch.nn.Module, int, int]:
     """Make a list of layers with the given layer function.
 
     The local layers are built inside one layer stack, so layers that declare
     stage boundaries connect in order without naming their neighbours. Across
     a pipeline stage boundary the stack learns the neighbouring stage from the
-    layer itself, built again on the meta device.
+    layer itself, built again on the meta device. ``final_read`` is the
+    stack's terminal read when it is not a plain final norm (see layer_stack).
     """
     # circular imports
     from sglang.srt.distributed import get_pp_indices
@@ -1623,6 +1625,7 @@ def make_layers(
     with layer_stack(
         previous_layers=[neighbour(idx) for idx in reversed(range(start_layer))],
         next_layers=[neighbour(idx) for idx in range(end_layer, num_hidden_layers)],
+        final_read=final_read,
     ):
         modules = torch.nn.ModuleList(
             [PPMissingLayer(return_tuple=return_tuple) for _ in range(start_layer)]
@@ -1649,6 +1652,7 @@ def make_pp_layers(
     prefix: str = "",
     return_tuple: bool = False,
     offloader_kwargs: Optional[Dict[str, Any]] = None,
+    final_read: Optional[Any] = None,
 ) -> Tuple[torch.nn.Module, int, int]:
     """Make this pipeline stage's layers, and return them with the stage's range.
 
@@ -1663,6 +1667,7 @@ def make_pp_layers(
         prefix=prefix,
         return_tuple=return_tuple,
         offloader_kwargs=offloader_kwargs,
+        final_read=final_read,
     )
 
 
@@ -4224,11 +4229,15 @@ def require_mlp_sync():
     return get_parallel().attn_dp_enabled or require_gathered_buffer()
 
 
-def get_cuda_graph_batch_size_alignment() -> int:
+def get_cuda_graph_batch_size_alignment(
+    *, gathered_buffer_required: Optional[bool] = None
+) -> int:
+    if gathered_buffer_required is None:
+        gathered_buffer_required = require_gathered_buffer()
     alignment = 1
     if get_exec().overlap.enable_two_batch_overlap:
         alignment *= 2
-    if require_gathered_buffer():
+    if gathered_buffer_required:
         alignment *= get_parallel().attn_tp_size
     # TODO: unverified on NVIDIA; drop the gate once validated on CUDA.
     if not is_hip() and alignment % get_parallel().attn_cp_size != 0:
