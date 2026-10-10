@@ -53,7 +53,9 @@ def _make_executor(generator) -> FluxExecutor:
     return executor
 
 
-def _pack_and_fill(executor: FluxExecutor, context: torch.Tensor, y: torch.Tensor) -> Req:
+def _pack_and_fill(
+    executor: FluxExecutor, context: torch.Tensor, y: torch.Tensor
+) -> Req:
     # Same latents/conditioning ComfyUI would pass on consecutive denoise
     # steps of one sampler run: the cond key must match step to step so
     # _mark_and_maybe_drop can recognize "already sent".
@@ -92,7 +94,9 @@ def test_rebuild_resends_conditioning_the_new_worker_lacks():
         owner.ensure_executor(executor)
 
     req1 = _pack_and_fill(executor, context, y)
-    stage = ComfyUILatentPreparationStage(scheduler=mock.Mock(), transformer=mock.Mock())
+    stage = ComfyUILatentPreparationStage(
+        scheduler=mock.Mock(), transformer=mock.Mock()
+    )
     result1 = stage.verify_input(req1, server_args=mock.Mock())
     assert result1.is_valid(), result1.get_failure_summary()
     assert len(req1.prompt_embeds) == 2
@@ -103,8 +107,13 @@ def test_rebuild_resends_conditioning_the_new_worker_lacks():
     new_generator = mock.Mock()
     comfyui_mode._SESSIONS.clear()
     comfyui_mode._RUNS.clear()
-    with mock.patch.object(owner, "_owns_live", return_value=False), mock.patch.object(
-        owner, "load_model", side_effect=lambda **_: setattr(owner, "generator", new_generator)
+    with (
+        mock.patch.object(owner, "_owns_live", return_value=False),
+        mock.patch.object(
+            owner,
+            "load_model",
+            side_effect=lambda **_: setattr(owner, "generator", new_generator),
+        ),
     ):
         owner.ensure_executor(executor)
     assert executor.generator is new_generator

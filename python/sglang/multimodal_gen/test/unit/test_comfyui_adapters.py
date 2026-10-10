@@ -94,9 +94,7 @@ def test_qwen_image_edit_pack_keeps_all_ref_latents() -> None:
     ref_b = torch.ones(1, 16, 1, 32, 96)
     ref_c = torch.ones(1, 16, 1, 48, 48)
 
-    packed = adapter.pack(
-        x, timestep, context, ref_latents=[ref_a, ref_b, ref_c]
-    )
+    packed = adapter.pack(x, timestep, context, ref_latents=[ref_a, ref_b, ref_c])
 
     sizes = packed.extra_req["vae_image_sizes"]
     assert sizes == [(64, 64), (96, 32), (48, 48)]

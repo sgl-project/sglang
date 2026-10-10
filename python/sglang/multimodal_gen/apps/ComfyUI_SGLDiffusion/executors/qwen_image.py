@@ -1,8 +1,7 @@
 """Qwen-Image adapters for the ComfyUI DiT-forward contract."""
 
-import torch
-
 import comfy.ldm.common_dit
+import torch
 
 from .adapter import ComfyUIModelAdapter, PackedForward
 from .base import SGLDiffusionExecutor
