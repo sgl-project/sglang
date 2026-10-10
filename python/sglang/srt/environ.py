@@ -1583,8 +1583,9 @@ class Envs:
     SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE = EnvBool(False)
     # Decoder SWA bounded replay: eager prefill steps run the trimmed late layers
     # from CUDA graphs captured per tail-row bucket (multiples of 128) up to this
-    # many rows; 0 keeps them eager.
-    SGLANG_DSV4_DECODER_REPLAY_GRAPH_MAX_ROWS = EnvInt(0)
+    # many rows; 0 keeps them eager. 2048 rows (16 buckets) took 0.11 GiB per GPU
+    # on GB300 TP4.
+    SGLANG_DSV4_DECODER_REPLAY_GRAPH_MAX_ROWS = EnvInt(2048)
     # Debug only: replay decoder replay graphs one segment at a time with a sync,
     # naming the segment or break that faults.
     SGLANG_DSV4_DECODER_REPLAY_GRAPH_DEBUG = EnvBool(False)
