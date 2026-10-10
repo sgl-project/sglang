@@ -1909,24 +1909,35 @@ def requant_block_scale_ue8m0_for_deepgemm(
     use_deepgemm_runner: bool,
     output_dtype: Optional[torch.dtype] = None,
     weight_shape=None,
+    *,
+    grouped_moe: bool = False,
 ) -> bool:
     """Requantize block-FP8 weight scales to UE8M0 in place for DeepGEMM.
 
     No-op (returns False) unless the caller selected the DeepGEMM runner, the
-    block size is 128x128 (the only layout the requant kernel supports), the
-    scales are not already UE8M0, and DeepGEMM can run the layer (bf16 output,
-    aligned shape). Returns True when it requantizes.
+    block size is 128x128 (or a refined MoE block, see below), the scales are not
+    already UE8M0, and DeepGEMM can run the layer (bf16 output, aligned shape).
+    Returns True when it requantizes.
     """
     from sglang.srt.model_loader.utils import should_deepgemm_weight_requant_ue8m0
 
+    # Fp8MoEMethod refines the dimension a TP shard splits to a block dividing
+    # 128 (32 along K, DeepGEMM's other UE8M0 granularity); dense layers keep 128x128.
+    supported = weight_block_size == [128, 128] or (
+        grouped_moe
+        and weight_block_size is not None
+        and 128 % weight_block_size[0] == 0
+        and weight_block_size[1] in (32, 128)
+    )
     if (
         not use_deepgemm_runner
-        or weight_block_size != [128, 128]
+        or not supported
         or getattr(weight_scale, "format_ue8m0", False)
         or not should_deepgemm_weight_requant_ue8m0(
             weight_block_size=weight_block_size,
             output_dtype=output_dtype,
             weight_shape=weight_shape,
+            grouped_moe=grouped_moe,
         )
     ):
         return False
@@ -1941,8 +1952,6 @@ def requant_weight_ue8m0(
     weight_scale_inv: torch.Tensor,
     weight_block_size: List[int],
 ):
-    assert weight_block_size == [128, 128]
-
     # 3D+ weights stack multiple experts (e.g. MoE); requant each group separately.
     # 2D weights are a single matrix and fall through to the direct path below.
     if weight.dim() > 2:
@@ -1964,7 +1973,9 @@ def requant_weight_ue8m0(
         weight_block_size=weight_block_size,
     )
 
-    out_s = transform_scale_ue8m0(out_s, mn=out_w.shape[-2])
+    out_s = transform_scale_ue8m0(
+        out_s, mn=out_w.shape[-2], block_mn=weight_block_size[0]
+    )
 
     return out_w, out_s
 
@@ -2005,7 +2016,7 @@ def _requant_weight_ue8m0_grouped(
     out_w = out_w.view(*group_dims, n, k)
     out_s = out_s.view(*group_dims, *out_s.shape[-2:])
 
-    out_s = transform_scale_ue8m0(out_s, mn=n)
+    out_s = transform_scale_ue8m0(out_s, mn=n, block_mn=weight_block_size[0])
 
     return out_w, out_s
 
@@ -2014,7 +2025,8 @@ def quant_weight_ue8m0(
     weight_dequant: torch.Tensor,
     weight_block_size: List[int],
 ):
-    assert weight_block_size == [128, 128]
+    # Rows go to per-row UE8M0 scales; K granularity is 32 or 128 for DeepGEMM.
+    assert 128 % weight_block_size[0] == 0 and weight_block_size[1] in (32, 128)
     assert weight_dequant.dtype == torch.bfloat16, (
         f"{weight_dequant.dtype=} {weight_dequant.shape=}"
     )
@@ -2022,7 +2034,9 @@ def quant_weight_ue8m0(
     *batch_dims, n, k = weight_dequant.shape
 
     weight_dequant_flat = weight_dequant.view((-1, k))
-    out_w_flat, out_s_flat = per_block_cast_to_fp8(weight_dequant_flat)
+    out_w_flat, out_s_flat = per_block_cast_to_fp8(
+        weight_dequant_flat, block_size=weight_block_size
+    )
 
     out_w = out_w_flat.view((*batch_dims, n, k))
     out_s = out_s_flat.view(
@@ -2037,7 +2051,7 @@ def quant_weight_ue8m0(
 
 
 # NOTE copy and modified from DeepGEMM
-def transform_scale_ue8m0(sf, mn, use_torch_impl: bool = False):
+def transform_scale_ue8m0(sf, mn, use_torch_impl: bool = False, *, block_mn: int = 128):
     import deep_gemm.utils.layout
 
     get_mn_major_tma_aligned_packed_ue8m0_tensor = (
@@ -2046,7 +2060,7 @@ def transform_scale_ue8m0(sf, mn, use_torch_impl: bool = False):
         else deep_gemm.utils.layout.get_mn_major_tma_aligned_packed_ue8m0_tensor
     )
 
-    sf = sf.index_select(-2, torch.arange(mn, device=sf.device) // 128)
+    sf = sf.index_select(-2, torch.arange(mn, device=sf.device) // block_mn)
     sf = get_mn_major_tma_aligned_packed_ue8m0_tensor(sf)
 
     # In sgl-deep-gemm, the C++ deepgemm path returns through DLPack which collapses the stride
@@ -2146,14 +2160,19 @@ def _inverse_transform_scale_ue8m0_impl(sf_packed):
 
 
 # COPIED FROM DeepGEMM
-def per_block_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+def per_block_cast_to_fp8(
+    x: torch.Tensor, block_size: Tuple[int, int] = (128, 128)
+) -> Tuple[torch.Tensor, torch.Tensor]:
     assert x.dim() == 2
     m, n = x.shape
+    block_m, block_n = block_size
     x_padded = torch.zeros(
-        (ceil_align(m, 128), ceil_align(n, 128)), dtype=x.dtype, device=x.device
+        (ceil_align(m, block_m), ceil_align(n, block_n)),
+        dtype=x.dtype,
+        device=x.device,
     )
     x_padded[:m, :n] = x
-    x_view = x_padded.view(-1, 128, x_padded.size(1) // 128, 128)
+    x_view = x_padded.view(-1, block_m, x_padded.size(1) // block_n, block_n)
     x_amax = x_view.abs().float().amax(dim=(1, 3), keepdim=True).clamp(1e-4)
     sf = ceil_to_ue8m0(x_amax / 448.0)
     x_scaled = (x_view * (1.0 / sf)).to(torch.float8_e4m3fn)

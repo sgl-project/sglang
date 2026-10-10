@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 import torch
@@ -108,6 +109,7 @@ from sglang.srt.utils import (
     is_xpu,
     log_info_on_rank0,
     mxfp8_block_convert_required,
+    print_info_once,
     print_warning_once,
     set_weight_attrs,
     use_intel_amx_backend,
@@ -1368,6 +1370,65 @@ class Fp8LinearMethod(LinearMethodBase):
         )
 
 
+def _tp_refined_moe_block_sizes(
+    *,
+    weight_block_size: List[int],
+    intermediate_size_per_partition: int,
+    moe_tp_size: int,
+    hidden_size: int,
+    runner_backend: MoeRunnerBackend,
+) -> Optional[tuple[List[int], List[int]]]:
+    """Finer w13 and w2 scale blocks for block-FP8 MoE whose TP shard splits blocks.
+
+    TP splits w13 along N and w2 along K, so only those dimensions are refined.
+    Each checkpoint scale covers whole blocks of the finer grid, so repeating it
+    onto that grid is lossless and every rank loads exactly its shard. None when
+    the shard is block-aligned or the runner only takes the checkpoint's block.
+    """
+    block_n, block_k = weight_block_size
+    shard = intermediate_size_per_partition
+    if shard % block_n == 0 and (moe_tp_size == 1 or shard % block_k == 0):
+        return None
+    intermediate_size = shard * moe_tp_size
+    if any(
+        size % block
+        for size in (intermediate_size, hidden_size)
+        for block in (block_n, block_k)
+    ):
+        return None
+    w13_block_n = math.gcd(block_n, shard)
+    w2_block_k = math.gcd(block_k, shard)
+    if runner_backend.is_triton():
+        # Block sizes are runtime arguments; FP8 MMA needs K >= 32.
+        if w2_block_k < 32:
+            return None
+    else:
+        from sglang.srt.layers import deep_gemm_wrapper
+
+        if not (
+            runner_backend.is_deep_gemm() and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+        ):
+            return None
+        # Per-row UE8M0 scales take a K granularity of 32 or 128 only.
+        if w2_block_k != block_k:
+            if w2_block_k % 32:
+                return None
+            w2_block_k = 32
+    return [w13_block_n, block_k], [block_n, w2_block_k]
+
+
+def _refined_block_scale_loader(weight_loader, *, repeats: tuple[int, int]):
+    """Repeat checkpoint block scales onto the finer grid before TP sharding."""
+
+    def load(param, loaded_weight, *args, **kwargs):
+        loaded_weight = loaded_weight.repeat_interleave(
+            repeats[0], dim=-2
+        ).repeat_interleave(repeats[1], dim=-1)
+        return weight_loader(param, loaded_weight, *args, **kwargs)
+
+    return load
+
+
 class Fp8MoEMethod(FusedMoEMethodBase):
     """MoE method for FP8.
     Supports loading FP8 checkpoints with static weight scale and
@@ -1389,6 +1450,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         )
         self.convert_mxfp8_to_block = self.use_mxfp8 and _mxfp8_to_block_fp8_required
         self.weight_block_size = self.quant_config.weight_block_size
+        # w2's scale block when create_weights refines it apart from
+        # weight_block_size (then w13's) for a TP shard that splits checkpoint
+        # blocks; see _tp_refined_moe_block_sizes. None means weight_block_size.
+        self.w2_weight_block_size: Optional[List[int]] = None
         self.is_fp4_expert = self.quant_config.is_fp4_experts
         self.dequant_fp4_to_fp8 = self.quant_config.dequant_fp4_to_fp8
         self.with_bias = False
@@ -1445,6 +1510,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         with_bias: bool = False,
         fp4_scale_dtype: Optional[torch.dtype] = None,
+        weight_block_size: Optional[List[int]] = None,
+        w2_weight_block_size: Optional[List[int]] = None,
         **extra_weight_attrs,
     ):
         """
@@ -1465,11 +1532,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             is_packed=False,
         )
 
+        # The grids w13's and w2's block scales are stored on, finer than the
+        # checkpoint's along the dimension a TP shard splits mid-block.
+        if weight_block_size is None:
+            weight_block_size = quant_config.weight_block_size
+        if w2_weight_block_size is None:
+            w2_weight_block_size = weight_block_size
         if block_quant:
-            block_n, block_k = (
-                quant_config.weight_block_size[0],
-                quant_config.weight_block_size[1],
-            )
+            block_n, block_k = weight_block_size[0], w2_weight_block_size[1]
 
             padding_size = get_moe_padding_size(_use_aiter)
             if not (_use_aiter and padding_size == block_n == block_k):
@@ -1610,12 +1680,17 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         elif block_quant:
             scale_dtype = torch.uint8 if use_mxfp8 else torch.float32
             scale_init = torch.zeros if scale_dtype == torch.uint8 else torch.ones
+            w13_block_n, w13_block_k = weight_block_size
+            w2_block_n, w2_block_k = w2_weight_block_size
             w13_weight_scale = torch.nn.Parameter(
                 scale_init(
                     num_experts,
                     w13_num_shards
-                    * ((intermediate_size_per_partition + block_n - 1) // block_n),
-                    (hidden_size + block_k - 1) // block_k,
+                    * (
+                        (intermediate_size_per_partition + w13_block_n - 1)
+                        // w13_block_n
+                    ),
+                    (hidden_size + w13_block_k - 1) // w13_block_k,
                     dtype=scale_dtype,
                 ),
                 requires_grad=False,
@@ -1623,8 +1698,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             w2_weight_scale = torch.nn.Parameter(
                 scale_init(
                     num_experts,
-                    (hidden_size + block_n - 1) // block_n,
-                    (intermediate_size_per_partition + block_k - 1) // block_k,
+                    (hidden_size + w2_block_n - 1) // w2_block_n,
+                    (intermediate_size_per_partition + w2_block_k - 1) // w2_block_k,
                     dtype=scale_dtype,
                 ),
                 requires_grad=False,
@@ -1679,8 +1754,24 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         # If loading an fp16 checkpoint, do not (we will quantize in
         #   process_weights_after_loading()
         if quant_config.is_checkpoint_fp8_serialized:
-            set_weight_attrs(w13_weight_scale, extra_weight_attrs)
-            set_weight_attrs(w2_weight_scale, extra_weight_attrs)
+            for weight_scale, scale_block_size in (
+                (w13_weight_scale, weight_block_size),
+                (w2_weight_scale, w2_weight_block_size),
+            ):
+                scale_attrs = extra_weight_attrs
+                if block_quant and scale_block_size != quant_config.weight_block_size:
+                    checkpoint_n, checkpoint_k = quant_config.weight_block_size
+                    scale_attrs = {
+                        **extra_weight_attrs,
+                        "weight_loader": _refined_block_scale_loader(
+                            extra_weight_attrs["weight_loader"],
+                            repeats=(
+                                checkpoint_n // scale_block_size[0],
+                                checkpoint_k // scale_block_size[1],
+                            ),
+                        ),
+                    }
+                set_weight_attrs(weight_scale, scale_attrs)
 
             if _is_hip and _use_hip_int4:
                 extra_weight_attrs.update(
@@ -1723,6 +1814,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         with_bias: bool = False,
         **extra_weight_attrs,
     ):
+        self.weight_block_size, self.w2_weight_block_size = self._tp_weight_block_sizes(
+            layer=layer,
+            hidden_size=hidden_size,
+            intermediate_size_per_partition=intermediate_size_per_partition,
+        )
         Fp8MoEMethod.create_fp8_moe_weight_(
             layer=layer,
             num_experts=num_experts,
@@ -1735,6 +1831,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             is_fp4_expert=self.is_fp4_expert,
             params_dtype=params_dtype,
             with_bias=with_bias,
+            weight_block_size=self.weight_block_size,
+            w2_weight_block_size=self.w2_weight_block_size,
             **extra_weight_attrs,
         )
 
@@ -1744,6 +1842,38 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             and get_moe_runner_backend().is_cutlass()
         ):
             self._ensure_cutlass_buffers_initialized(layer)
+
+    def _tp_weight_block_sizes(
+        self,
+        *,
+        layer: Module,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+    ) -> tuple[Optional[List[int]], Optional[List[int]]]:
+        unrefined = self.weight_block_size, None
+        if not (
+            self.block_quant
+            and not self.use_mxfp8
+            and not self.is_fp4_expert
+            and self.quant_config.is_checkpoint_fp8_serialized
+            and not layer.use_presharded_weights
+        ):
+            return unrefined
+        refined = _tp_refined_moe_block_sizes(
+            weight_block_size=self.weight_block_size,
+            intermediate_size_per_partition=intermediate_size_per_partition,
+            moe_tp_size=layer.moe_tp_size,
+            hidden_size=hidden_size,
+            runner_backend=self._resolve_moe_runner_backend(),
+        )
+        if refined is None:
+            return unrefined
+        print_info_once(
+            f"Block-FP8 MoE scales refined from {self.weight_block_size} to "
+            f"{refined[0]} (w13) and {refined[1]} (w2) blocks for a TP shard "
+            f"of {intermediate_size_per_partition}."
+        )
+        return refined
 
     def _dequantize_aiter_fp4_experts(self, layer: Module) -> None:
         """Convert packed FP4 expert weights to block-FP8 in place."""
@@ -2159,10 +2289,17 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 return
 
             if not self.is_fp4_expert:
-                weight_block_size = self.quant_config.weight_block_size
-                for weight, weight_scale in (
-                    (layer.w13_weight, layer.w13_weight_scale_inv),
-                    (layer.w2_weight, layer.w2_weight_scale_inv),
+                for weight, weight_scale, weight_block_size in (
+                    (
+                        layer.w13_weight,
+                        layer.w13_weight_scale_inv,
+                        self.weight_block_size,
+                    ),
+                    (
+                        layer.w2_weight,
+                        layer.w2_weight_scale_inv,
+                        self.w2_weight_block_size or self.weight_block_size,
+                    ),
                 ):
                     requant_block_scale_ue8m0_for_deepgemm(
                         weight,
@@ -2171,6 +2308,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                         use_deepgemm_runner=will_use_deepgemm,
                         output_dtype=torch.bfloat16,
                         weight_shape=weight.shape[-2:],
+                        grouped_moe=True,
                     )
 
     def _convert_mxfp8_moe_to_block_fp8(self, layer: Module) -> None:
@@ -2814,25 +2952,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
             torch.cuda.empty_cache()
 
-    def create_moe_runner(
-        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
-    ):
-        self._owns_moe_runner = False
-        self.moe_runner_config = moe_runner_config
-
-        # MXFP4 experts on NPU run through the ASCEND runner, which
-        # quantizes activations internally.
-        if _is_npu and self.is_fp4_expert:
-            from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
-                NPUW4A8MXFP4MoEMethod,
-            )
-
-            layer.w13_kernel = NPUW4A8MXFP4MoEMethod()
-            layer.w2_kernel = NPUW4A8MXFP4MoEMethod()
-            moe_runner_config.layer = layer
-            self.runner = MoeRunner(MoeRunnerBackend.ASCEND, moe_runner_config)
-            return
-
+    def _resolve_moe_runner_backend(self) -> MoeRunnerBackend:
         moe_runner_backend = get_moe_runner_backend()
 
         if moe_runner_backend.is_auto():
@@ -2853,11 +2973,38 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         ):
             # Neither runner has an fp8 MoE path; they get pinned globally for
             # NVFP4 experts on sm120, so run this layer's fp8 experts on triton.
+            moe_runner_backend = MoeRunnerBackend.TRITON
+        return moe_runner_backend
+
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+    ):
+        self._owns_moe_runner = False
+        self.moe_runner_config = moe_runner_config
+
+        # MXFP4 experts on NPU run through the ASCEND runner, which
+        # quantizes activations internally.
+        if _is_npu and self.is_fp4_expert:
+            from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
+                NPUW4A8MXFP4MoEMethod,
+            )
+
+            layer.w13_kernel = NPUW4A8MXFP4MoEMethod()
+            layer.w2_kernel = NPUW4A8MXFP4MoEMethod()
+            moe_runner_config.layer = layer
+            self.runner = MoeRunner(MoeRunnerBackend.ASCEND, moe_runner_config)
+            return
+
+        configured_backend = get_moe_runner_backend()
+        moe_runner_backend = self._resolve_moe_runner_backend()
+        if (
+            configured_backend.is_flashinfer_cutlass()
+            or configured_backend.is_flashinfer_cutedsl()
+        ):
             logger.info(
                 "Fp8MoEMethod has no %s path; using triton for its fp8 experts.",
-                moe_runner_backend.name,
+                configured_backend.name,
             )
-            moe_runner_backend = MoeRunnerBackend.TRITON
 
         if (
             moe_runner_backend.is_deep_gemm()
@@ -2894,6 +3041,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             a13_scale=layer.w13_input_scale,
             a2_scale=layer.w2_input_scale,
             block_shape=self.weight_block_size,
+            w2_block_shape=self.w2_weight_block_size,
         )
 
     def _process_npu_fp4_expert_weights(self, layer: torch.nn.Module) -> None:
@@ -3142,6 +3290,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w13_scale=w13_scale,
                 w2_scale=w2_scale,
                 block_shape=block_shape,
+                w2_block_shape=self.w2_weight_block_size,
                 is_fp4_experts=self.is_fp4_expert,
                 use_mxfp8=self.use_mxfp8,
             )
