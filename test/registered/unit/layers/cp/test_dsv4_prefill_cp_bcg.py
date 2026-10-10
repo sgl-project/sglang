@@ -273,7 +273,9 @@ class TestDSV4PrefillCPBCG(unittest.TestCase):
                     global_positions = batch.positions.clone()
                     with (
                         get_parallel().override(
-                            attn_cp_rank=rank, attn_cp_size=cp_size
+                            attn_cp_rank=rank,
+                            attn_cp_size=cp_size,
+                            enable_cp_tp_group_sharing=False,
                         ),
                         patch(
                             "sglang.srt.layers.cp.padding.get_cp_padding_align_size",
