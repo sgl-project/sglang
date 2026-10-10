@@ -135,3 +135,39 @@ def test_generator_reports_real_runtime_import_error(caplog) -> None:
     with pytest.raises(RuntimeError, match="failed to import") as err:
         module.SGLDiffusionGenerator().init_generator("flux", "FluxPipeline", {})
     assert isinstance(err.value.__cause__, ImportError)
+
+
+def test_worker_start_pins_cfg_parallel_off(monkeypatch) -> None:
+    """ComfyUI owns CFG, so the worker must not auto-enable CFG parallel."""
+    from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.core import generator
+
+    seen = {}
+
+    def from_pretrained(**kwargs):
+        seen.clear()
+        seen.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(
+        generator, "DiffGenerator", SimpleNamespace(from_pretrained=from_pretrained)
+    )
+    runtime = SGLDiffusionGenerator()
+    runtime.init_generator("m.safetensors", "P", {"num_gpus": 2})
+    assert seen["cfg_parallel_degree"] == 1
+    runtime.generator = None
+    runtime.init_generator(
+        "m.safetensors", "P", {"num_gpus": 2, "enable_cfg_parallel": True}
+    )
+    assert "cfg_parallel_degree" not in seen
+
+
+def test_should_suppress_logs_accepts_batched_timestep() -> None:
+    """ComfyUI batches cond/uncond rows into one call with a [B] timestep."""
+    import torch
+
+    from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.base import (
+        SGLDiffusionExecutor,
+    )
+
+    assert SGLDiffusionExecutor.should_suppress_logs(torch.tensor([0.5, 0.5]))
+    assert not SGLDiffusionExecutor.should_suppress_logs(torch.tensor([2.0, 2.0]))
