@@ -546,13 +546,6 @@ class UnifiedRadixCache(BasePrefixCache):
             self.cache_controller is not None
             and self.cache_controller.write_policy == "write_back"
         )
-        # Preserve the SWA host window before device eviction makes it unrecoverable.
-        if (
-            get_memory().enable_unified_memory
-            and self.host_memory_mode == "cache"
-            and self.tree_core.has_swa_host_pool
-        ):
-            self.tree_core.enable_swa_write_back_eviction_barrier()
         # Pre-seed the logical dropped-tokens series.
         if self.metrics_collector is not None and self.cache_controller is not None:
             reasons = ["host_pressure"]
@@ -819,74 +812,45 @@ class UnifiedRadixCache(BasePrefixCache):
     def _evict_device_next_node(
         self, component_type: ComponentType, tracker: dict[ComponentType, int]
     ) -> tuple[Optional[NodeId], bool]:
-        """Advance the walk, completing pending host-backup barriers."""
-        while True:
-            result = self.tree_core.evict_device_next_node(component_type, tracker)
-            if result.mamba_backup_node_id is not None:
-                assert component_type == ComponentType.MAMBA and result.node_id is None
-                assert (
-                    not result.device_frees
-                    and not result.host_frees
-                    and not result.tracker
-                )
-                # Reserve a host state slot and wait for the backup acknowledgment
-                # before freeing device state. If allocation fails, eviction still
-                # proceeds to make room on the device.
-                node_id = result.mamba_backup_node_id
-                mamba_host_pool = self.host_pool_group.get_pool(PoolName.MAMBA)
-                if mamba_host_pool is not None and mamba_host_pool.available_size() < 1:
-                    self.evict_host(1, ComponentType.MAMBA)
-                self.backup_node_for_write_back(node_id)
-                result = self.tree_core.finish_mamba_state_eviction(node_id)
-            elif result.swa_backup_node_id is not None:
-                assert component_type == ComponentType.SWA and result.node_id is None
-                assert (
-                    not result.device_frees
-                    and not result.host_frees
-                    and not result.tracker
-                )
-                # The backup can cover several unbacked SWA segments. Reserve host
-                # space for the whole window before copying it, then resume eviction
-                # even if host allocation fails.
-                node_id = result.swa_backup_node_id
-                needed = result.swa_backup_num_tokens
-                swa_host_pool = self.host_pool_group.get_pool(PoolName.SWA)
-                if (
-                    swa_host_pool is not None
-                    and swa_host_pool.available_size() < needed
-                ):
-                    self.evict_host(needed, ComponentType.SWA)
-                self.backup_node_for_write_back(node_id)
-                result = self.tree_core.finish_swa_state_eviction(node_id)
-            self._free_values(result.device_frees, result.host_frees)
-            if self._tracks_write_through_unbacked_evictions():
-                self._record_dropped_tokens(
-                    result.unbacked_tokens,
-                    reason="write_through_unbacked_eviction",
-                )
-            self._accumulate_tracker(tracker, result.tracker)
-            if result.backup_kv is None:
-                return result.node_id, result.made_progress
-
-            assert result.node_id is None
-            assert self.buffer_pipeline is None, (
-                "SWA write-back eviction barriers are cache-mode only"
+        """Advance the eviction walk one node, consuming its step result."""
+        result = self.tree_core.evict_device_next_node(component_type, tracker)
+        if result.mamba_backup_node_id is not None:
+            assert component_type == ComponentType.MAMBA and result.node_id is None
+            assert (
+                not result.device_frees and not result.host_frees and not result.tracker
             )
-            written = self._execute_and_commit_kv_backup(
-                result.backup_kv, write_back=True
+            # Reserve a host state slot and wait for the backup acknowledgment
+            # before freeing device state. If allocation fails, eviction still
+            # proceeds to make room on the device.
+            node_id = result.mamba_backup_node_id
+            mamba_host_pool = self.host_pool_group.get_pool(PoolName.MAMBA)
+            if mamba_host_pool is not None and mamba_host_pool.available_size() < 1:
+                self.evict_host(1, ComponentType.MAMBA)
+            self.backup_node_for_write_back(node_id)
+            result = self.tree_core.finish_mamba_state_eviction(node_id)
+        elif result.swa_backup_node_id is not None:
+            assert component_type == ComponentType.SWA and result.node_id is None
+            assert (
+                not result.device_frees and not result.host_frees and not result.tracker
             )
-            if written <= 0:
-                node_id = result.backup_kv.node_ids[0]
-                logger.warning(
-                    "write_back: auxiliary backup failed under host pressure "
-                    "(component=%s, node=%d); dropping only the component",
-                    component_type.name,
-                    node_id,
-                )
-                # Match the Python SWA demotion: preserve FULL and descendants;
-                # the resumed native walk tombstones this component after one try.
-                continue
-            self.writing_check(write_back=True)
+            # The backup can cover several unbacked SWA segments. Reserve host
+            # space for the whole window before copying it, then resume eviction
+            # even if host allocation fails.
+            node_id = result.swa_backup_node_id
+            needed = result.swa_backup_num_tokens
+            swa_host_pool = self.host_pool_group.get_pool(PoolName.SWA)
+            if swa_host_pool is not None and swa_host_pool.available_size() < needed:
+                self.evict_host(needed, ComponentType.SWA)
+            self.backup_node_for_write_back(node_id)
+            result = self.tree_core.finish_swa_state_eviction(node_id)
+        self._free_values(result.device_frees, result.host_frees)
+        if self._tracks_write_through_unbacked_evictions():
+            self._record_dropped_tokens(
+                result.unbacked_tokens,
+                reason="write_through_unbacked_eviction",
+            )
+        self._accumulate_tracker(tracker, result.tracker)
+        return result.node_id, result.made_progress
 
     def _evict_device_leaf(
         self, node_id: NodeId, tracker: dict[ComponentType, int]

@@ -2371,6 +2371,13 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
           </div>
         </div>
 
+        {builderScope === "serve" && (
+          <p className="sgd-builder-docs-tip">
+            <strong>Tip:</strong> For more server options, see the{" "}
+            <a href="/docs/sglang-diffusion/api/cli">CLI reference</a>.
+          </p>
+        )}
+
         {modal === "env" && (
           <div style={s.modalBackdrop} onClick={() => setModal(null)}>
             <div style={s.modalBox} onClick={(event) => event.stopPropagation()}>
