@@ -178,6 +178,10 @@ IMATRIX_QUANT_TYPES = {
 DEQUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES | IMATRIX_QUANT_TYPES
 MMVQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES | IMATRIX_QUANT_TYPES
 MMQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES
+# MMVQ time grows linearly with the number of input rows, while MMQ has a fixed
+# cost that very large matrices (e.g. lm_head) amortize: above this many output
+# rows, MMQ is already faster from 2 input rows.
+MMVQ_SINGLE_ROW_ABOVE = 32768
 
 
 def dequantize_gguf_weight(
@@ -194,6 +198,8 @@ def fused_mul_mat_gguf(
 ) -> torch.Tensor:
     if qweight_type in IMATRIX_QUANT_TYPES:
         mmvq_safe = 8 if qweight.shape[0] > 5120 else 16
+    elif qweight.shape[0] > MMVQ_SINGLE_ROW_ABOVE:
+        mmvq_safe = 1
     else:
         mmvq_safe = 2 if qweight.shape[0] > 5120 else 6
     # HACK: when doing chunked prefill we don't generate output tokens
