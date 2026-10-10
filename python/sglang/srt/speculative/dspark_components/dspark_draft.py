@@ -142,8 +142,8 @@ def draft_markov_block(
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Draft ``gamma`` tokens per row, each step biased by the token before it;
     a row at temperature 0 takes the argmax. With ``keep_logits`` the step
-    logits land in ``logits_out`` ([bs, gamma, local vocab]), allocated here
-    when not given."""
+    logits land in ``logits_out`` ([gamma, bs, local vocab], so each step's rows
+    are contiguous), allocated here when not given."""
     bs, gamma = base_logits.shape[:2]
     state = markov_head.init_state(draft_hidden)
     prev_tokens = anchor_tokens.long()
@@ -156,7 +156,7 @@ def draft_markov_block(
         step_base = base_logits[:, step]
         if keep_logits and logits_out is None:
             logits_out = torch.empty(
-                (bs, gamma, step_base.shape[-1]),
+                (gamma, bs, step_base.shape[-1]),
                 dtype=markov_head.step_logits_dtype(step_base.dtype, bias.dtype),
                 device=step_base.device,
             )
@@ -167,7 +167,7 @@ def draft_markov_block(
             noise_key=noise.key,
             noise_offset=noise.offset,
             step=step,
-            logits_out=logits_out[:, step] if keep_logits else None,
+            logits_out=logits_out[step] if keep_logits else None,
             has_sampled_rows=has_sampled_rows,
         )
         prev_tokens = tp_sync.sync(SpecTpSyncSite.DSPARK_DRAFT, prev_tokens)
@@ -314,7 +314,7 @@ class DraftBlockProposer:
             corrected_logits = None
             if not all_greedy:
                 corrected_logits = self.draft_model.markov_head.gather_vocab(
-                    draft_sampler.step_logits[:bs]
+                    draft_sampler.step_logits[:, :bs]
                 )
             draft_block = DraftBlockResult(
                 draft_tokens=draft_sampler.out[: bs * self.gamma].view(bs, self.gamma),
