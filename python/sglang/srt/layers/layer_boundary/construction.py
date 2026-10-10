@@ -213,7 +213,11 @@ class StagePlan:
             if kind is StageKind.ATTENTION
             else ()
         )
-        fused = ffn_input_fusions(self) if kind is StageKind.FFN else ()
+        fused = (
+            ffn_input_fusions(self, next(iter(self.edges.values())).incoming.need.read)
+            if kind is StageKind.FFN
+            else ()
+        )
         self.paths = {}
         for variant, edges in self.edges.items():
             if is_branch:
