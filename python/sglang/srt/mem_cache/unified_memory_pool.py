@@ -1617,6 +1617,7 @@ def init_unified_mamba_pools(
         need_sort=need_sort,
         forward_stream=forward_stream,
         lazy_compaction=lazy_compaction,
+        logical_token_capacity=max_total_num_tokens,
     )
     # Size host storage from the configured token cap, not the dynamic buffer view.
     full_pool = token_to_kv_pool.full_kv_pool

@@ -624,6 +624,7 @@ class PrefillAdder:
         self.memory_budget = token_to_kv_pool_allocator.create_prefill_budget(
             tree_cache, num_mixed_decode_tokens=num_mixed_decode_tokens
         )
+        self.logical_total_offset = num_mixed_decode_tokens
 
         self.req_states = None
         self.can_run_list = []
@@ -640,9 +641,16 @@ class PrefillAdder:
 
         if running_batch is not None:
             # Estimate the offset in the remaining token space
-            self.memory_budget.total_offset += sum(
+            running_offset = sum(
                 [
                     self._get_running_request_total_token_offset(r)
+                    for r in running_batch.reqs
+                ]
+            )
+            self.memory_budget.total_offset += running_offset
+            self.logical_total_offset += sum(
+                [
+                    self._get_running_request_logical_token_offset(r)
                     for r in running_batch.reqs
                 ]
             )
@@ -759,13 +767,46 @@ class PrefillAdder:
             * self.new_token_ratio
         )
 
+    def _get_running_request_logical_token_offset(self, req: Req) -> int:
+        ratio = (
+            1.0
+            if getattr(req.sampling_params, "ignore_eos", False)
+            else self.new_token_ratio
+        )
+        return (
+            min(
+                (req.sampling_params.max_new_tokens - len(req.output_ids)),
+                CLIP_MAX_NEW_TOKENS,
+            )
+            * ratio
+        )
+
     @property
     def rem_total_tokens(self):
-        return self.memory_budget.remaining_total
+        logical_remaining = self._logical_remaining_total()
+        if logical_remaining is None:
+            return self.memory_budget.remaining_total
+        return min(self.memory_budget.remaining_total, logical_remaining)
 
     @property
     def cur_rem_tokens(self):
         return self.memory_budget.remaining_current
+
+    def _logical_remaining_total(self) -> Optional[int]:
+        logical_available = getattr(
+            self.token_to_kv_pool_allocator, "logical_available_size", None
+        )
+        if logical_available is None:
+            return None
+        available = logical_available()
+        if available is None:
+            return None
+        evictable = (
+            self.tree_cache.full_evictable_size()
+            if self.tree_cache.supports_mamba()
+            else 0
+        )
+        return available + evictable - self.logical_total_offset
 
     def _swa_new_tokens(self, req: Req) -> int:
         """Tokens a request may still decode, for SWA headroom sizing. Mirrors
@@ -783,9 +824,10 @@ class PrefillAdder:
         *,
         extend_input_len: int,
         total_tokens: int,
+        mamba_gap_reserve: int,
         swa_host_hit_length: int,
     ) -> tuple[bool, Optional[int]]:
-        return self.memory_budget.check_prefill(
+        can_admit, chunk_limit = self.memory_budget.check_prefill(
             extend_input_len=extend_input_len,
             total_tokens=total_tokens,
             max_new_tokens=self._swa_new_tokens(req),
@@ -793,6 +835,13 @@ class PrefillAdder:
             swa_host_hit_length=swa_host_hit_length,
             chunk_limit=self.rem_chunk_tokens,
         )
+        logical_remaining = self._logical_remaining_total()
+        if logical_remaining is not None and (
+            total_tokens - mamba_gap_reserve >= logical_remaining
+        ):
+            can_admit = False
+            chunk_limit = None
+        return can_admit, chunk_limit
 
     def _mamba_gap_budget_for_req(self, req: Req) -> int:
         """Shared-gap reservation (full-token-equivalents) for a request's new
@@ -814,6 +863,9 @@ class PrefillAdder:
 
     def budget_state(self):
         no_token = not self.memory_budget.has_capacity()
+        logical_remaining = self._logical_remaining_total()
+        if logical_remaining is not None:
+            no_token = no_token or logical_remaining <= 0
         # Gate new mamba slots separately: rem_total_tokens' full_evictable can't
         # cover a mamba slot, which needs mamba-recoverable bytes (see __init__).
         if not no_token and self.rem_mamba_slots is not None:
@@ -869,6 +921,11 @@ class PrefillAdder:
             ),
             chunk_limit=self.rem_chunk_tokens,
             is_chunked_continuation=is_chunked_continuation,
+        )
+        # The logical max-total-tokens budget counts only FULL KV tokens. Mamba
+        # state bytes remain charged to the physical shared-memory budget above.
+        self.logical_total_offset += (
+            extend_input_len + max_new_tokens + self.per_req_token_overhead
         )
         # The new mamba slot also consumes one mamba-recoverable slot (gated
         # separately so full_evictable can't cover it — see __init__).
@@ -1313,8 +1370,8 @@ class PrefillAdder:
         )
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - req.prefix_len
         total_tokens = cand_extend_input_len + max_new + self.per_req_token_overhead
-        # Shared Mamba pool: fold the new mamba state's shared-gap cost into
-        # `total_tokens` so both `rem_total_tokens` gates reflect the joint budget.
+        # Shared Mamba pool: fold the new mamba state's shared-gap cost into the
+        # physical budget. The separate logical token gate excludes this value.
         # Read before `init_load_back` binds `req.mamba_pool_idx` — after that
         # this returns 0, so the debit sites below reuse the value.
         mamba_gap_reserve = self._mamba_gap_budget_for_req(req)
@@ -1326,6 +1383,7 @@ class PrefillAdder:
             admission = self._select_prefill_admission(
                 req,
                 total_tokens=total_tokens,
+                mamba_gap_reserve=mamba_gap_reserve,
                 host_hit_length=req.host_hit_length,
                 swa_host_hit_length=req.swa_host_hit_length,
                 truncation_align_size=truncation_align_size,
@@ -1431,6 +1489,7 @@ class PrefillAdder:
                     admission = self._select_prefill_admission(
                         req,
                         total_tokens=total_tokens,
+                        mamba_gap_reserve=mamba_gap_reserve,
                         host_hit_length=0,
                         swa_host_hit_length=0,
                         truncation_align_size=truncation_align_size,
@@ -1457,6 +1516,7 @@ class PrefillAdder:
         req: Req,
         *,
         total_tokens: int,
+        mamba_gap_reserve: int,
         host_hit_length: int,
         swa_host_hit_length: int,
         truncation_align_size: Optional[int],
@@ -1474,6 +1534,7 @@ class PrefillAdder:
             req,
             extend_input_len=extend_len,
             total_tokens=total_tokens,
+            mamba_gap_reserve=mamba_gap_reserve,
             swa_host_hit_length=swa_host_hit_length,
         )
         if not can_admit:
@@ -1614,8 +1675,12 @@ class PrefillAdder:
         release_counter = 0
         for i, running_req in enumerate(self.running_batch.reqs):
             if running_req in preemptible_reqs:
-                self.memory_budget.total_offset -= (
-                    self._get_running_request_total_token_offset(running_req)
+                running_offset = self._get_running_request_total_token_offset(
+                    running_req
+                )
+                self.memory_budget.total_offset -= running_offset
+                self.logical_total_offset -= (
+                    self._get_running_request_logical_token_offset(running_req)
                 )
                 release_counter += 1
                 self.running_batch.release_req(

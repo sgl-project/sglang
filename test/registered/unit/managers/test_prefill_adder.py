@@ -96,6 +96,8 @@ class TestPrefillAdder(CustomTestCase):
         allocator.available_size.return_value = available_size
         allocator.size_swa = size_swa
         allocator.swa_req_ring = False
+        allocator.logical_token_capacity = None
+        allocator.logical_available_size = None
         allocator.create_prefill_budget.side_effect = lambda tree_cache, **kwargs: (
             PrefillBudget(allocator, tree_cache, **kwargs)
         )
@@ -761,6 +763,68 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(len(adder2.can_run_list), 2)
         self.assertEqual(adder2.rem_chunk_tokens, 0)  # 3 - 3 = 0
         self.assertEqual(result3, AddReqResult.OTHER)
+
+    def test_logical_token_budget_excludes_mamba_state_bytes(self):
+        self.mock_tree_cache.supports_mamba.return_value = True
+        self.mock_token_allocator.available_size.return_value = 100_000
+        self.mock_token_allocator.logical_token_capacity = 16_384
+        self.mock_token_allocator.logical_available_size = MagicMock(
+            return_value=16_384
+        )
+        adder = self.create_adder(self.create_running_batch())
+
+        req = self.create_mock_req("mamba", priority=0, max_new_tokens=1_500)
+        mamba_state_cost = 7_000
+        per_request_logical_tokens = 10 + 1_500 + adder.per_req_token_overhead
+        per_request_physical_tokens = per_request_logical_tokens + mamba_state_cost
+
+        can_admit, _ = adder._check_prefill_budget(
+            req,
+            extend_input_len=10,
+            total_tokens=per_request_physical_tokens,
+            mamba_gap_reserve=mamba_state_cost,
+            swa_host_hit_length=0,
+        )
+        self.assertTrue(can_admit)
+
+        for _ in range(10):
+            adder._update_prefill_budget(
+                prefix_len=0,
+                extend_input_len=10,
+                max_new_tokens=1_500,
+                retracted_stain=False,
+                mamba_gap_reserve=mamba_state_cost,
+            )
+
+        self.assertEqual(adder.logical_total_offset, 10 * per_request_logical_tokens)
+        self.assertEqual(
+            adder.memory_budget.total_offset, 10 * per_request_physical_tokens
+        )
+        self.assertEqual(adder.rem_total_tokens, 16_384 - 10 * 1_511)
+
+        can_admit, _ = adder._check_prefill_budget(
+            req,
+            extend_input_len=10,
+            total_tokens=per_request_physical_tokens,
+            mamba_gap_reserve=mamba_state_cost,
+            swa_host_hit_length=0,
+        )
+        self.assertFalse(can_admit)
+
+    def test_logical_token_budget_fully_reserves_ignore_eos_decode(self):
+        self.mock_tree_cache.supports_mamba.return_value = True
+        self.mock_token_allocator.available_size.return_value = 100_000
+        self.mock_token_allocator.logical_token_capacity = 16_384
+        self.mock_token_allocator.logical_available_size = MagicMock(
+            return_value=16_384
+        )
+        req = self.create_mock_req("ignore-eos", priority=0, max_new_tokens=1_500)
+        req.sampling_params.ignore_eos = True
+
+        adder = self.create_adder(self.create_running_batch([req]), new_token_ratio=0.1)
+
+        self.assertEqual(adder.memory_budget.total_offset, 150)
+        self.assertEqual(adder.logical_total_offset, 1_500)
 
     @patch(
         "sglang.srt.managers.schedule_policy.page_interleave_shard_size",
