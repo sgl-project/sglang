@@ -116,6 +116,51 @@ def _can_use_operand(
     )
 
 
+import struct
+
+from sglang.kernels.ops.diffusion.norm import fast_launch as _fast_launch
+
+_RMSNORM_SCALE_LAUNCH = _fast_launch.CachedLaunch()
+_RMSNORM_TANH_LAUNCH = _fast_launch.CachedLaunch()
+
+
+def _f32_bits(value: float) -> int:
+    """An fp32 kernel argument as the 4 bytes the driver will read."""
+    return struct.unpack("<I", struct.pack("<f", float(value)))[0]
+
+
+def _scale_signature(x, weight, scale, eps):
+    """What a recorded rmsnorm_scale launch stays valid for.
+
+    Strides belong in the key because the kernel indexes rows with them, and
+    dtype because the compiled kernel is specialized on it. Buffer addresses do
+    not: those are rebound per call, which is the whole point.
+    """
+    return (
+        x.shape,
+        x.stride(),
+        x.dtype,
+        weight.shape,
+        scale.shape,
+        scale.stride(),
+        eps,
+    )
+
+
+def _tanh_signature(x, gate, residual, weight, eps):
+    """What a recorded gated-residual launch stays valid for."""
+    return (
+        x.shape,
+        x.stride(),
+        x.dtype,
+        gate.shape,
+        gate.stride(),
+        residual.stride(),
+        weight.shape,
+        eps,
+    )
+
+
 def rmsnorm_scale(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -123,6 +168,25 @@ def rmsnorm_scale(
     eps: float,
 ) -> torch.Tensor | None:
     """Apply BF16-native ``RMSNorm(x) * scale`` or return ``None``."""
+    # Operand validation, stride derivation and the power-of-two block below
+    # are decided by the signature, never by the values. At this kernel's size
+    # that bookkeeping costs more than the launch it guards, so a signature
+    # seen before goes straight to rebinding pointers and replaying.
+    if _fast_launch.available():
+        cached = _RMSNORM_SCALE_LAUNCH.lookup(_scale_signature(x, weight, scale, eps))
+        if cached is not None:
+            out = torch.empty_like(x, memory_format=torch.contiguous_format)
+            _RMSNORM_SCALE_LAUNCH.replay(
+                cached,
+                [
+                    out.data_ptr(),
+                    x.data_ptr(),
+                    weight.data_ptr(),
+                    scale.data_ptr(),
+                ],
+            )
+            return out
+
     if not _can_use_operand(x, weight, scale):
         return None
 
@@ -138,19 +202,29 @@ def rmsnorm_scale(
         return None
 
     out = torch.empty_like(x, memory_format=torch.contiguous_format)
+    out_flat = out.reshape(-1, dim)
+    rows_per_scale = x_rows // scale_rows
     with torch.get_device_module().device(x.device):
-        _rmsnorm_scale_kernel[(x_rows,)](
-            out.reshape(-1, dim),
+        compiled = _rmsnorm_scale_kernel[(x_rows,)](
+            out_flat,
             x,
             weight,
             scale,
             x_row_stride,
             scale_row_stride,
-            x_rows // scale_rows,
+            rows_per_scale,
             dim,
             eps,
             block_dim=triton.next_power_of_2(dim),
             num_warps=8,
+        )
+    if _fast_launch.available() and compiled is not None:
+        _RMSNORM_SCALE_LAUNCH.record(
+            _scale_signature(x, weight, scale, eps),
+            compiled,
+            (x_rows, 1, 1),
+            [out_flat.data_ptr(), x.data_ptr(), weight.data_ptr(), scale.data_ptr()],
+            [x_row_stride, scale_row_stride, rows_per_scale, dim, _f32_bits(eps)],
         )
     return out
 
@@ -163,6 +237,25 @@ def rmsnorm_tanh_residual(
     eps: float,
 ) -> torch.Tensor | None:
     """Apply BF16-native gated RMSNorm residual fusion or return ``None``."""
+    # Same reasoning as rmsnorm_scale: the checks below are signature-decided.
+    if _fast_launch.available():
+        cached = _RMSNORM_TANH_LAUNCH.lookup(
+            _tanh_signature(x, gate, residual, weight, eps)
+        )
+        if cached is not None:
+            out = torch.empty_like(x, memory_format=torch.contiguous_format)
+            _RMSNORM_TANH_LAUNCH.replay(
+                cached,
+                [
+                    out.data_ptr(),
+                    x.data_ptr(),
+                    gate.data_ptr(),
+                    residual.data_ptr(),
+                    weight.data_ptr(),
+                ],
+            )
+            return out
+
     if not _can_use_operand(x, weight, gate):
         return None
     if (
@@ -186,9 +279,11 @@ def rmsnorm_tanh_residual(
         return None
 
     out = torch.empty_like(x, memory_format=torch.contiguous_format)
+    out_flat = out.reshape(-1, dim)
+    rows_per_gate = x_rows // gate_rows
     with torch.get_device_module().device(x.device):
-        _rmsnorm_tanh_residual_kernel[(x_rows,)](
-            out.reshape(-1, dim),
+        compiled = _rmsnorm_tanh_residual_kernel[(x_rows,)](
+            out_flat,
             x,
             gate,
             residual,
@@ -196,11 +291,32 @@ def rmsnorm_tanh_residual(
             x_row_stride,
             gate_row_stride,
             residual_row_stride,
-            x_rows // gate_rows,
+            rows_per_gate,
             dim,
             eps,
             block_dim=triton.next_power_of_2(dim),
             num_warps=8,
+        )
+    if _fast_launch.available() and compiled is not None:
+        _RMSNORM_TANH_LAUNCH.record(
+            _tanh_signature(x, gate, residual, weight, eps),
+            compiled,
+            (x_rows, 1, 1),
+            [
+                out_flat.data_ptr(),
+                x.data_ptr(),
+                gate.data_ptr(),
+                residual.data_ptr(),
+                weight.data_ptr(),
+            ],
+            [
+                x_row_stride,
+                gate_row_stride,
+                residual_row_stride,
+                rows_per_gate,
+                dim,
+                _f32_bits(eps),
+            ],
         )
     return out
 
