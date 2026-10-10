@@ -1,5 +1,6 @@
 import functools
 import json
+import time
 import unittest
 import warnings
 
@@ -1514,6 +1515,24 @@ class TestDeepSeekV3Detector(unittest.TestCase):
             ),
         ]
         self.detector = DeepSeekV3Detector()
+
+    def test_unclosed_tool_call_tags_parse_in_linear_time(self):
+        """Repeated call/separator tokens without the closing ones must not stall
+        the parser (it runs on the event loop); a complete call still parses."""
+        begin, sep = "<｜tool▁call▁begin｜>", "<｜tool▁sep｜>"
+        complete = (
+            "<｜tool▁calls▁begin｜>" + begin + "function" + sep + "get_weather\n"
+            '```json\n{"city": "Paris"}\n```<｜tool▁call▁end｜>'
+        )
+
+        start = time.perf_counter()
+        result = self.detector.detect_and_parse(complete + begin * 10000, self.tools)
+        DeepSeekV3Detector().parse_streaming_increment(begin + sep * 14000, self.tools)
+        elapsed = time.perf_counter() - start
+
+        self.assertLess(elapsed, 1.0)
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(json.loads(result.calls[0].parameters), {"city": "Paris"})
 
     def test_parse_streaming_multiple_tool_calls_with_multi_token_chunk(self):
         """Test parsing multiple tool calls when streaming chunks contains multi-tokens (e.g. DeepSeekV3 enable MTP)"""
