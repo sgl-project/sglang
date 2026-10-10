@@ -78,7 +78,7 @@ class TestAscendSpeculativeDraftAttentionAndMoeRunner(CustomTestCase):
             "--chunked-prefill-size",
             32768,
             "--tp-size",
-            8,
+            16,
             "--speculative-algorithm",
             "EAGLE3",
             "--speculative-draft-model-path",
