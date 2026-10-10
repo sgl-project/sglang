@@ -1,22 +1,35 @@
 ARG CUDA_VERSION=13.0.3
-FROM docker.io/nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu24.04 AS base
-
-ARG TARGETARCH
+# Keep shared defaults global so every stage can consume them with ARG,
+# including builders that do not inherit ARG values from a parent stage.
 ARG BUILD_TYPE=all
 ARG BRANCH_TYPE=remote
 ARG SGL_KERNEL_VERSION=0.4.6.post1
-ARG SGL_VERSION
-ARG SGL_DEEP_GEMM_VERSION=0.1.7
 ARG USE_LATEST_SGLANG=0
-ARG GDRCOPY_VERSION=2.5.1
 ARG SGL_NCCL_VERSION=2.30.7
-ARG PIP_DEFAULT_INDEX
-ARG UBUNTU_MIRROR
 ARG GITHUB_ARTIFACTORY=github.com
 ARG INSTALL_FLASHINFER_JIT_CACHE=0
 ARG FLASHINFER_VERSION=0.6.18
 ARG MOONCAKE_VERSION=0.3.13
 ARG MSCCLPP_VERSION=sglang-v0.9.1
+
+FROM docker.io/nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu24.04 AS base
+
+ARG TARGETARCH
+ARG BUILD_TYPE
+ARG BRANCH_TYPE
+ARG SGL_KERNEL_VERSION
+ARG SGL_VERSION
+ARG SGL_DEEP_GEMM_VERSION=0.1.7
+ARG USE_LATEST_SGLANG
+ARG GDRCOPY_VERSION=2.5.1
+ARG SGL_NCCL_VERSION
+ARG PIP_DEFAULT_INDEX
+ARG UBUNTU_MIRROR
+ARG GITHUB_ARTIFACTORY
+ARG INSTALL_FLASHINFER_JIT_CACHE
+ARG FLASHINFER_VERSION
+ARG MOONCAKE_VERSION
+ARG MSCCLPP_VERSION
 
 ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
@@ -183,7 +196,8 @@ RUN curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.ru
 
 # Install sgl-kernel (from pre-built wheel)
 RUN --mount=type=cache,target=/root/.cache/pip \
-    python3 -m pip install --upgrade pip setuptools wheel html5lib six \
+    : "${SGL_KERNEL_VERSION:?SGL_KERNEL_VERSION must not be empty}" \
+    && python3 -m pip install --upgrade pip setuptools wheel html5lib six \
     && case "$CUDA_VERSION" in \
         12.6.3) CUINDEX=126 ;; \
         12.9.2) CUINDEX=129 ;; \
@@ -198,7 +212,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     ; \
     elif [ "$CUDA_VERSION" = "13.0.3" ]; then \
         # --no-deps prevents pip from pulling torch from default PyPI
-        python3 -m pip install sglang-kernel==${SGL_KERNEL_VERSION} --force-reinstall --no-deps \
+        python3 -m pip install "sglang-kernel==${SGL_KERNEL_VERSION}" --force-reinstall --no-deps \
     ; \
     else \
         echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 \

@@ -29,6 +29,13 @@ docker build -f docker/Dockerfile --target framework_final \
 
 The Dockerfile uses fully qualified `docker.io/nvidia/cuda` base images so
 Podman can resolve them without an unqualified-search registry configuration.
+Shared build-argument defaults are declared before the first `FROM` and consumed
+in each stage, so Podman does not need to inherit defaults from a parent stage.
+If an older checkout fails with `Invalid requirement: 'sglang-kernel=='`, the
+kernel version reached the install stage empty. For this revision, adding
+`--build-arg SGL_KERNEL_VERSION=0.4.6.post1` fixes that argument; use the updated
+Dockerfile to preserve the other shared defaults too. Do not pass an empty
+`SGL_KERNEL_VERSION` override. The kernel pin matches `python/pyproject.toml`.
 Podman's warnings about omitted `SGL_VERSION`, `PIP_DEFAULT_INDEX`, and
 `UBUNTU_MIRROR` are harmless for this local-source build. To suppress them, add
 `--build-arg SGL_VERSION= --build-arg PIP_DEFAULT_INDEX= --build-arg UBUNTU_MIRROR=`.
