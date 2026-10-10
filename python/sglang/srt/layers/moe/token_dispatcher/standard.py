@@ -223,7 +223,21 @@ class StandardDispatcher(BaseDispatcher):
                 )
             elif not self.use_aiter_moe_runner:
                 if TopKOutputChecker.format_is_standard(topk_output):
-                    topk_ids_local = self.local_expert_mapping[topk_output.topk_ids]
+                    # Clamp before the gather so a -1 sentinel never indexes
+                    # past the mapping table, and restore it afterwards:
+                    # advanced indexing would otherwise wrap -1 to the table's
+                    # last entry and re-label every masked-out padded row as
+                    # the last local expert. The masked-count kernels would
+                    # otherwise manufacture top_k * num_padded_rows fake
+                    # assignments on that expert (observed 4032 vs the 768
+                    # per-expert slab capacity on CUDA-graph padded
+                    # spec-verify batches), and the scatter / varlen
+                    # activation kernels storing past the slab corrupt memory.
+                    topk_ids_local = torch.where(
+                        topk_output.topk_ids < 0,
+                        torch.full_like(topk_output.topk_ids, -1),
+                        self.local_expert_mapping[topk_output.topk_ids.clamp_min(0)],
+                    )
                     # Drop dp-attention MAX_LEN pad rows from the dispatch:
                     # pad rows carry stale hidden through the router and
                     # their expert outputs are discarded downstream — pure
