@@ -58,9 +58,11 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 logger = init_logger(__name__)
 
 # merge_mode "auto" keeps an adapter unmerged when merging it into the base
-# weights would round away more than this share of its update (by norm):
-# distilled LoRAs such as MiniMax-H3 Turbo sit below a BF16 ulp of the weights
-AUTO_MERGE_MAX_ROUNDING_LOSS = 0.1
+# weights would round away more than this share of its update (by norm).
+# Distilled LoRAs sit below a BF16 ulp of the weights (MiniMax-H3 Turbo loses
+# 75%), while style LoRAs keep most of theirs (Wan Arcane-Jinx loses 14%) and
+# would pay the dynamic path's cost for little
+AUTO_MERGE_MAX_ROUNDING_LOSS = 0.3
 
 
 def merge_rounding_loss(lora_layers: dict) -> float | None:

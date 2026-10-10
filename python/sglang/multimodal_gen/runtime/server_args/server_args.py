@@ -3095,7 +3095,7 @@ class ServerArgs(DisaggServerArgsMixin):
             help=(
                 "How LoRA is applied: auto merges into regular weights, but uses "
                 "dynamic LoRA for FSDP-sharded weights (to avoid a full gather) and "
-                "for adapters a merge would mostly round away (more than 10% of "
+                "for adapters a merge would mostly round away (more than 30% of "
                 "the update, e.g. distilled LoRAs); merge always merges into base "
                 "weights; dynamic always applies LoRA at forward time."
             ),
