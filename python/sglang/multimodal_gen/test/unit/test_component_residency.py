@@ -211,6 +211,43 @@ def test_snapshot_offload_sleep_uses_existing_host_storage():
     assert module.weight.data_ptr() == host_pointer
 
 
+def test_component_offload_warmup_preload_honors_margin_on_state(monkeypatch):
+    """A zero margin fits a preload that the default 1 GiB margin rejects."""
+    module = torch.nn.Linear(8, 8, bias=False)
+    required_bytes = sum(tensor.nbytes for tensor in module.parameters())
+    free_bytes = required_bytes + 1
+    monkeypatch.setattr(residency_strategies, "_device_free_bytes", lambda: free_bytes)
+    monkeypatch.setattr(
+        residency_strategies,
+        "_module_ready_on_local_device",
+        lambda *args, **kwargs: False,
+    )
+    monkeypatch.setattr(residency_strategies, "_empty_device_cache", Mock())
+    strategy = ComponentOffloadStrategy()
+    strategy.prepare_for_use = Mock()
+    strategy.wait_for_use = Mock()
+    strategy.finish_use = Mock()
+    use = ComponentUse(
+        stage_name="DenoisingStage",
+        component_name="transformer",
+        preferred_ready_after_request=True,
+    )
+    zero_state = ResidencyState(batch_is_warmup=True, warmup_preload_margin_bytes=0)
+
+    strategy.finish_request(module, use, zero_state, preferred=True)
+
+    strategy.prepare_for_use.assert_called_once_with(module, use, zero_state)
+    strategy.wait_for_use.assert_called_once_with(module, use, zero_state)
+    strategy.finish_use.assert_not_called()
+
+    strategy.prepare_for_use.reset_mock()
+    strategy.wait_for_use.reset_mock()
+    default_state = ResidencyState(batch_is_warmup=True)
+    strategy.finish_request(module, use, default_state, preferred=True)
+    strategy.prepare_for_use.assert_not_called()
+    strategy.finish_use.assert_called_once_with(module, use, default_state)
+
+
 @pytest.mark.parametrize(
     "strategy_cls", [ComponentOffloadStrategy, SnapshotOffloadStrategy]
 )
@@ -477,6 +514,192 @@ def test_request_tail_uses_dynamic_component_instance():
     strategy.finish_request.assert_called_once_with(
         module, use, manager.state, preferred=False
     )
+
+
+def _preferred_at_request_end(
+    modules, uses, *, spec, is_warmup, explicit=None
+) -> dict[str, bool]:
+    stage = _Stage(*uses)
+    pipeline = SimpleNamespace(
+        modules=modules,
+        _stage_name_mapping={"stage": stage},
+        component_residency_strategies={},
+    )
+    explicit = explicit or {}
+    server_args = SimpleNamespace(
+        enable_layerwise_nvtx_marker=False,
+        explicit_residency_mode=lambda name: explicit.get(name),
+        warmup_preload_components=spec,
+        pipeline_config=SimpleNamespace(supports_auto_residency=False),
+    )
+    server_args.allows_warmup_preload = lambda name: ServerArgs.allows_warmup_preload(
+        server_args, name
+    )
+    manager = ComponentResidencyManager(pipeline, server_args)
+    strategy = Mock()
+    manager.strategy_for = Mock(return_value=strategy)
+    manager.begin_request([stage], SimpleNamespace(is_warmup=is_warmup), server_args)
+    for use in uses:
+        manager.ensure_ready(use, module=modules[use.component_name])
+    strategy.finish_request.reset_mock()
+    manager.finish_request()
+    preferred: dict[str, bool] = {}
+    for call in strategy.finish_request.call_args_list:
+        preferred[call.args[1].component_name] = call.kwargs["preferred"]
+    return preferred
+
+
+def test_warmup_preload_auto_keeps_hinted_text_encoder():
+    module = torch.nn.Linear(2, 2)
+    use = ComponentUse("encode", "text_encoder", preferred_ready_after_request=True)
+    preferred = _preferred_at_request_end(
+        {"text_encoder": module}, (use,), spec="auto", is_warmup=True
+    )
+    assert preferred == {"text_encoder": True}
+
+
+def test_warmup_preload_none_skips_hinted_text_encoder():
+    module = torch.nn.Linear(2, 2)
+    use = ComponentUse("encode", "text_encoder", preferred_ready_after_request=True)
+    preferred = _preferred_at_request_end(
+        {"text_encoder": module}, (use,), spec="none", is_warmup=True
+    )
+    assert preferred == {"text_encoder": False}
+
+
+def test_warmup_preload_dit_keeps_two_tower_transformer_only():
+    modules = {
+        name: torch.nn.Linear(2, 2)
+        for name in ("text_encoder", "transformer", "transformer_2")
+    }
+    uses = (
+        ComponentUse("encode", "text_encoder", preferred_ready_after_request=True),
+        ComponentUse("denoise", "transformer", preferred_ready_after_request=True),
+    )
+    preferred = _preferred_at_request_end(modules, uses, spec="dit", is_warmup=True)
+    assert preferred["transformer"] is True
+    assert preferred["text_encoder"] is False
+
+
+def test_warmup_preload_group_matches_suffix_exact_key_does_not():
+    names = ("text_encoder", "text_encoder_2", "transformer", "transformer_2")
+    modules = {name: torch.nn.Linear(2, 2) for name in names}
+    uses = tuple(
+        ComponentUse(name, name, preferred_ready_after_request=True) for name in names
+    )
+    grouped = _preferred_at_request_end(
+        modules, uses, spec="text_encoder,dit", is_warmup=True
+    )
+    assert grouped == {name: True for name in names}
+
+    exact = _preferred_at_request_end(modules, uses, spec="transformer", is_warmup=True)
+    assert exact["transformer"] is True
+    assert exact["transformer_2"] is False
+    assert exact["text_encoder"] is False
+    assert exact["text_encoder_2"] is False
+
+
+def test_explicit_residency_wins_over_warmup_preload_list():
+    names = ("text_encoder", "transformer", "transformer_2", "vae")
+    modules = {name: torch.nn.Linear(2, 2) for name in names}
+    uses = tuple(
+        ComponentUse(name, name, preferred_ready_after_request=True)
+        for name in ("text_encoder", "transformer", "vae")
+    )
+    preferred = _preferred_at_request_end(
+        modules,
+        uses,
+        spec="text_encoder,dit",
+        is_warmup=True,
+        explicit={"text_encoder": "resident"},
+    )
+    # Listed, but an explicit residency mode still wins.
+    assert preferred["text_encoder"] is False
+    # The filter still preloads a listed two-tower DiT with no explicit mode.
+    assert preferred["transformer"] is True
+    # Hinted, but not in the list, so the filter drops it.
+    assert preferred["vae"] is False
+
+
+def test_warmup_preload_none_leaves_keep_ready_component_untouched():
+    modules = {name: torch.nn.Linear(2, 2) for name in ("text_encoder", "vae")}
+    uses = (
+        ComponentUse("encode", "text_encoder", preferred_ready_after_request=True),
+        ComponentUse(
+            "decode",
+            "vae",
+            preferred_ready_after_request=True,
+            keep_ready_after_warmup=True,
+        ),
+    )
+    preferred = _preferred_at_request_end(modules, uses, spec="none", is_warmup=True)
+    # none still skips the ordinary preferred preload.
+    assert preferred == {"text_encoder": False}
+
+
+def test_warmup_preload_none_does_not_clear_preferred_on_a_real_request():
+    module = torch.nn.Linear(2, 2)
+    use = ComponentUse("encode", "text_encoder", preferred_ready_after_request=True)
+    preferred = _preferred_at_request_end(
+        {"text_encoder": module}, (use,), spec="none", is_warmup=False
+    )
+    assert preferred == {"text_encoder": True}
+
+
+def test_missing_preload_policy_keeps_auto_on_warmup():
+    module = torch.nn.Linear(2, 2)
+    use = ComponentUse("encode", "text_encoder", preferred_ready_after_request=True)
+    stage = _Stage(use)
+    pipeline = SimpleNamespace(
+        modules={"text_encoder": module},
+        _stage_name_mapping={"encode": stage},
+        component_residency_strategies={},
+    )
+    server_args = _server_args()
+    manager = ComponentResidencyManager(pipeline, server_args)
+    strategy = Mock()
+    manager.strategy_for = Mock(return_value=strategy)
+    manager.begin_request([stage], SimpleNamespace(is_warmup=True), server_args)
+    manager.ensure_ready(use, module=module)
+    strategy.finish_request.reset_mock()
+    manager.finish_request()
+    strategy.finish_request.assert_called_once_with(
+        module, use, manager.state, preferred=True
+    )
+
+
+def test_unmatched_warmup_preload_selector_warns_once(monkeypatch):
+    warning = Mock()
+    monkeypatch.setattr(
+        "sglang.multimodal_gen.runtime.managers.memory_managers."
+        "component_manager.logger.warning",
+        warning,
+    )
+    module = torch.nn.Linear(2, 2)
+    use = ComponentUse("encode", "text_encoder", preferred_ready_after_request=True)
+    stage = _Stage(use)
+    pipeline = SimpleNamespace(
+        modules={"text_encoder": module},
+        _stage_name_mapping={"encode": stage},
+        component_residency_strategies={},
+    )
+    server_args = SimpleNamespace(
+        enable_layerwise_nvtx_marker=False,
+        explicit_residency_mode=lambda _name: None,
+        warmup_preload_components="transfrmer,text_encoder",
+        pipeline_config=SimpleNamespace(supports_auto_residency=False),
+    )
+    server_args.allows_warmup_preload = lambda name: ServerArgs.allows_warmup_preload(
+        server_args, name
+    )
+    manager = ComponentResidencyManager(pipeline, server_args)
+    manager.strategy_for = Mock(return_value=Mock())
+    for _ in range(2):
+        manager.begin_request([stage], SimpleNamespace(is_warmup=True), server_args)
+        manager.ensure_ready(use, module=module)
+        manager.finish_request()
+    warning.assert_called_once()
+    assert warning.call_args.args[1] == "transfrmer"
 
 
 def test_strategy_cache_replaces_stale_component_instance():
