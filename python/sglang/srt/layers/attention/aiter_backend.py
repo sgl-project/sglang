@@ -20,7 +20,7 @@ from sglang.kernels.ops.attention.utils import (
     create_flashinfer_kv_indices_triton,
     create_flashmla_kv_indices_triton,
     get_num_kv_index_blocks_flashmla,
-    kv_indices_num_token_blocks,
+    spec_kv_index_token_blocks,
 )
 from sglang.kernels.ops.kvcache.aiter_unified_attention import (
     scatter_ragged_to_page_table_kernel,
@@ -155,13 +155,6 @@ _MLA_REDUCE_V1_HEADS = {
 # fake non-ps, intra_batch_mode needs to be True for non-ps-mode
 fast_mode = False
 intra_batch_mode = True if _use_mla_ps_kernel else False
-
-
-# Token-block parallel KV-index building is enabled only where it pays:
-# the speculative-decoding paths (target_verify / draft_extend / draft
-# decode) of long-context servers. Everything else keeps the historical
-# one-program-per-request launch.
-_KV_INDEX_BLOCKS_MIN_CONTEXT = 32768
 
 
 class WrapperDispatch(Enum):
@@ -1966,9 +1959,12 @@ class AiterAttnBackend(AttentionBackend):
         return output, final_lse
 
     def _kv_index_blocks(self, bs: int) -> int:
-        if self.max_context_len < _KV_INDEX_BLOCKS_MIN_CONTEXT:
-            return 1
-        return kv_indices_num_token_blocks(self.req_to_token.shape[1], bs)
+        return spec_kv_index_token_blocks(
+            self.req_to_token.shape[1],
+            kv_lens_sum=None,
+            batch_size=bs,
+            context_len=self.max_context_len,
+        )
 
     def init_forward_metadata_out_graph(
         self,
@@ -5125,12 +5121,12 @@ class AiterMultiStepDraftBackend:
         bs = self.topk * num_seqs
         seq_lens_sum = forward_batch.seq_lens_sum
 
-        num_token_blocks = (
-            kv_indices_num_token_blocks(
-                self.pool_len, self.speculative_num_steps * num_seqs * self.topk
-            )
-            if self.max_context_len >= _KV_INDEX_BLOCKS_MIN_CONTEXT
-            else 1
+        num_token_blocks = spec_kv_index_token_blocks(
+            self.pool_len,
+            kv_lens_sum=None,
+            batch_size=num_seqs,
+            base_programs=self.speculative_num_steps * num_seqs * self.topk,
+            context_len=self.max_context_len,
         )
         src = self.kv_index_translator.read_source(
             forward_batch.kv_loc_plan,

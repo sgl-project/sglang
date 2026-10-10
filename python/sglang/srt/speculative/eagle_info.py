@@ -4,6 +4,7 @@ from typing import Callable, List, Optional
 
 import torch
 
+from sglang.kernels.ops.attention.utils import spec_kv_index_token_blocks
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
 from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind, KVLocPlan
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
@@ -118,6 +119,13 @@ class EagleVerifyInput(SpecInput):
 
         total_tokens = paged_kernel_lens_sum + self.draft_token_num * batch_size
         kv_indices = torch.empty(total_tokens, dtype=torch.int32, device=device)
+        # Tiled over token blocks, sized from the mean live KV length while the
+        # sum is still a host int.
+        num_token_blocks = spec_kv_index_token_blocks(
+            table_width=translator.req_to_token.size(1),
+            kv_lens_sum=paged_kernel_lens_sum,
+            batch_size=batch_size,
+        )
         translator.pack_read_stream(
             plan,
             req_pool_indices=req_pool_indices,
@@ -125,6 +133,7 @@ class EagleVerifyInput(SpecInput):
             indptr=cum_kv_seq_len,
             out=kv_indices,
             kind=kind,
+            num_token_blocks=num_token_blocks,
         )
         mask_numel = (
             paged_kernel_lens_sum * self.draft_token_num
@@ -425,6 +434,13 @@ class EagleDraftExtendInput(SpecInput):
         cum_kv_seq_len = torch.zeros((bs + 1,), dtype=torch.int32, device=device)
         cum_kv_seq_len[1:] = torch.cumsum(paged_kernel_lens, dim=0)
 
+        # Sized while the length sum is still a host int (None -> table width).
+        num_token_blocks = spec_kv_index_token_blocks(
+            table_width=translator.req_to_token.size(1),
+            kv_lens_sum=paged_kernel_lens_sum,
+            batch_size=bs,
+        )
+
         if paged_kernel_lens_sum is None:
             paged_kernel_lens_sum = cum_kv_seq_len[-1]
 
@@ -439,5 +455,6 @@ class EagleDraftExtendInput(SpecInput):
             indptr=cum_kv_seq_len,
             out=kv_indices,
             kind=kind,
+            num_token_blocks=num_token_blocks,
         )
         return kv_indices, cum_kv_seq_len, qo_indptr, None

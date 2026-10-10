@@ -51,6 +51,9 @@ from sglang.kernels.ops.kvcache.kv_indices import (
 from sglang.kernels.ops.kvcache.kv_indices import (
     kv_indices_num_token_blocks as kv_indices_num_token_blocks,
 )
+from sglang.kernels.ops.kvcache.kv_indices import (
+    spec_kv_index_token_blocks as spec_kv_index_token_blocks,
+)
 from sglang.kernels.ops.kvcache.rope_cache import (
     fused_qk_rope_reshape_and_cache as fused_qk_rope_reshape_and_cache,
 )
