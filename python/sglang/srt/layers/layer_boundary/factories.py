@@ -11,6 +11,7 @@ from typing import Callable, Mapping, Optional
 
 import msgspec
 
+from sglang.srt.environ import envs
 from sglang.srt.layers import layernorm_sp
 from sglang.srt.layers.layer_boundary.adapters.overlap import (
     resolve_exit_rows,
@@ -20,10 +21,6 @@ from sglang.srt.layers.layer_boundary.boundary import _cp_moves
 from sglang.srt.layers.layer_boundary.construction import (
     BatchVariant,
     _bind_stage,
-    _input_scattered_possible,
-    _reject_unsupported_cp_moe,
-    _unpadded_possible,
-    _use_ag_after_qlora,
 )
 from sglang.srt.layers.layer_boundary.contracts import (
     EdgeContract,
@@ -40,6 +37,8 @@ from sglang.srt.layers.layer_boundary.layout import (
     TokenAxis,
     _cp_gathers_over_attn_cp,
     _prefill_cp_shards_tokens,
+    batches_are_unpadded,
+    input_scattered_configured,
     is_dense_ffn_fully_dp,
     moe_gathers_over_moe_cp,
     token_axis_sizes,
@@ -58,12 +57,49 @@ from sglang.srt.layers.layer_boundary.stage import StageBoundary
 from sglang.srt.layers.moe import is_moe_input_scattered_across_dp_ranks
 from sglang.srt.runtime_context import get_exec, get_parallel
 
+_use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
+
+
+def _reject_unsupported_cp_moe(moe_on_local_rows: bool, cp_shards: bool) -> None:
+    """A MoE layer under attention CP whose tokens the steps cannot bring
+    to it: under a prefill CP, one dispatched per DP shard under attention DP
+    and GQA CP, and one on the TP group whose data-parallel groups are the CP
+    ranks under DSA or MLA CP; and under attention DP, one on the TP group
+    whose data-parallel groups are the CP ranks."""
+    parallel = get_parallel()
+    gqa = not _cp_gathers_over_attn_cp()
+    if moe_on_local_rows:
+        if cp_shards and gqa and parallel.attn_dp_size > 1:
+            raise NotImplementedError(
+                "a MoE dispatched per DP shard under attention DP and GQA prefill CP"
+            )
+    elif parallel.moe_dp_size == parallel.attn_cp_size:
+        if cp_shards and not gqa:
+            raise NotImplementedError(
+                "a MoE on the TP group with moe_dp_size == attn_cp_size under "
+                "DSA or MLA prefill CP"
+            )
+        if parallel.attn_dp_size > 1:
+            raise NotImplementedError(
+                "a MoE on the TP group with moe_dp_size == attn_cp_size under "
+                "attention DP and attention CP"
+            )
+
+
+def _unpadded_possible() -> bool:
+    """Whether a batch whose rows do not divide over attention TP may reach an
+    FFN that would run on this rank's attention-TP slice, so that FFN needs a
+    variant that stays on the attention's rows."""
+    return batches_are_unpadded() and (
+        is_moe_input_scattered_across_dp_ranks() or is_dense_ffn_fully_dp()
+    )
+
 
 def _active_variants():
     yield BatchVariant.ORDINARY
     if _prefill_cp_shards_tokens():
         yield BatchVariant.CONTEXT_PARALLEL
-    if _input_scattered_possible():
+    if input_scattered_configured():
         yield BatchVariant.INPUT_SCATTERED
     if layernorm_sp.layernorm_sp_enabled():
         yield BatchVariant.SEQUENCE_PARALLEL
@@ -120,8 +156,6 @@ def _resolve_ffn(
     cp_shards = _prefill_cp_shards_tokens()
     axes, attention, local, full = _row_layouts(variant)
     on_rank_rows = _ffn_on_rank_rows(sparse, dense_tp_size)
-    if parallel.attn_cp_size > 1 and sparse:
-        _reject_unsupported_cp_moe(on_rank_rows, cp_shards)
     if variant is BatchVariant.UNPADDED and on_rank_rows:
         # Rows that do not divide over attention TP stay whole: the FFN runs on
         # the attention's rows (an a2a MoE dispatches them from every
@@ -463,19 +497,32 @@ def declare_ffn(
     )
 
 
-def _resolve_stage(stage, variant, following=None):
-    axes, attention, local, full = _row_layouts(variant)
+def _reject_unsupported(stage):
+    """Reject a stage whose declared capabilities this parallel configuration
+    cannot bind, naming the combination. The rejections that depend on the
+    rows of one edge are made where that edge binds (``_bind_stage``)."""
+    parallel = get_parallel()
     if stage.update.applied_at_exit:
         if stage.sparse and moe_gathers_over_moe_cp():
             raise NotImplementedError(
                 "an update applied at the stage's exit with a MoE gathered over "
                 "the MoE-CP group"
             )
-        if get_parallel().attn_cp_size > 1 and _input_scattered_possible():
+        if parallel.attn_cp_size > 1 and input_scattered_configured():
             raise NotImplementedError(
                 "an update applied at the stage's exit with input-scattered "
                 "attention under attention CP"
             )
+    if stage.kind is StageKind.FFN and stage.sparse and parallel.attn_cp_size > 1:
+        _reject_unsupported_cp_moe(
+            _ffn_on_rank_rows(stage.sparse, stage.dense_tp_size),
+            _prefill_cp_shards_tokens(),
+        )
+
+
+def _resolve_stage(stage, variant, following=None):
+    axes, attention, local, full = _row_layouts(variant)
+    _reject_unsupported(stage)
     if stage.kind is StageKind.FFN:
         declaration, residual, returned = _resolve_ffn(
             variant,

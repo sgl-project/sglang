@@ -17,7 +17,6 @@ from dataclasses import dataclass
 from functools import cached_property
 from typing import Callable, Optional
 
-from sglang.srt.environ import envs
 from sglang.srt.layers.layer_boundary.adapters.attention import get_attn_tp_context
 from sglang.srt.layers.layer_boundary.boundary import (
     ExitMove,
@@ -43,19 +42,12 @@ from sglang.srt.layers.layer_boundary.layout import (
     TokenAxis,
     _batch_shards_over_cp,
     _cp_gathers_over_attn_cp,
-    _prefill_cp_shards_tokens,
-    batches_are_unpadded,
-    is_dense_ffn_fully_dp,
 )
 from sglang.srt.layers.layer_boundary.prepare import (
     _attn_input_default,
     _attn_input_scattered,
 )
 from sglang.srt.layers.layer_boundary.stage import StageBoundary
-from sglang.srt.layers.moe import (
-    get_moe_a2a_backend,
-    is_moe_input_scattered_across_dp_ranks,
-)
 from sglang.srt.runtime_context import (
     get_forward,
     get_lora,
@@ -64,63 +56,10 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
-_use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
-
-
-def _reject_unsupported_cp_moe(moe_on_local_rows: bool, cp_shards: bool) -> None:
-    """A MoE layer under attention CP whose tokens the steps cannot bring
-    to it: under a prefill CP, one dispatched per DP shard under attention DP
-    and GQA CP, and one on the TP group whose data-parallel groups are the CP
-    ranks under DSA or MLA CP; and under attention DP, one on the TP group
-    whose data-parallel groups are the CP ranks."""
-    parallel = get_parallel()
-    gqa = not _cp_gathers_over_attn_cp()
-    if moe_on_local_rows:
-        if cp_shards and gqa and parallel.attn_dp_size > 1:
-            raise NotImplementedError(
-                "a MoE dispatched per DP shard under attention DP and GQA prefill CP"
-            )
-    elif parallel.moe_dp_size == parallel.attn_cp_size:
-        if cp_shards and not gqa:
-            raise NotImplementedError(
-                "a MoE on the TP group with moe_dp_size == attn_cp_size under "
-                "DSA or MLA prefill CP"
-            )
-        if parallel.attn_dp_size > 1:
-            raise NotImplementedError(
-                "a MoE on the TP group with moe_dp_size == attn_cp_size under "
-                "attention DP and attention CP"
-            )
-
-
-def _unpadded_possible() -> bool:
-    """Whether a batch whose rows do not divide over attention TP may reach an
-    FFN that would run on this rank's attention-TP slice, so that FFN needs a
-    variant that stays on the attention's rows."""
-    return batches_are_unpadded() and (
-        is_moe_input_scattered_across_dp_ranks() or is_dense_ffn_fully_dp()
-    )
-
 
 def _rows_indivisible_over_attn_tp(forward_batch, attn_tp_size: int) -> bool:
     """Whether this batch arrived with rows that do not divide over attention TP."""
     return forward_batch.input_ids.shape[0] % attn_tp_size != 0
-
-
-def _input_scattered_possible() -> bool:
-    """Whether a batch may run this layer with input-scattered attention:
-    configured, on TP without attention DP, a prefill CP, an a2a backend or
-    a dense MLP on every rank. The rest of what ``AttnTpContext.init_context`` requires is only
-    known once the model is built."""
-    parallel = get_parallel()
-    return (
-        parallel.enable_attn_tp_input_scattered
-        and parallel.tp_size > 1
-        and parallel.attn_dp_size == 1
-        and not _prefill_cp_shards_tokens()
-        and get_moe_a2a_backend().is_none()
-        and not is_dense_ffn_fully_dp()
-    )
 
 
 @dataclass(frozen=True)
@@ -276,19 +215,12 @@ class StagePlan:
         return BatchVariant.ORDINARY
 
     def path_for(self, forward_batch):
-        variant = self.variant_for(forward_batch)
-        try:
-            return self.paths[variant]
-        except KeyError:
-            raise NotImplementedError(
-                f"no stage boundary path for the active {variant.name} batch"
-            ) from None
+        return _bound_for(self.paths, self.variant_for(forward_batch))
 
     def fused_input_rows(self, forward_batch):
         if self._next_input_rows is not None:
-            return self._next_input_rows[self.variant_for(forward_batch)]
-        entry = self.path_for(forward_batch)
-        return entry.entry.input_rows
+            return _bound_for(self._next_input_rows, self.variant_for(forward_batch))
+        return self.path_for(forward_batch).entry.input_rows
 
     def produced(self, forward_batch):
         return self.path_for(forward_batch).output
@@ -306,6 +238,17 @@ class StagePlan:
             edges.incoming.residual_to,
             edges.outgoing.need.layout,
         )
+
+
+def _bound_for(bound, variant):
+    """What a stage bound for a batch's variant: the variant a batch selects
+    must be one the stage bound, whichever table is looked up."""
+    try:
+        return bound[variant]
+    except KeyError:
+        raise NotImplementedError(
+            f"no stage boundary path for the active {variant.name} batch"
+        ) from None
 
 
 def _bind_stage(declaration, norm, incoming, outgoing, *, final_read=None, **options):
