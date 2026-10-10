@@ -176,6 +176,56 @@ class VanillaMarkov(BaseDSparkMarkovHead):
         del hidden_states
         return self.project_bias(self.get_prev_embeddings(prev_tokens)), state
 
+    def draft_step(
+        self,
+        prev_tokens: torch.Tensor,
+        base_logits: torch.Tensor,
+        *,
+        hidden_states: Optional[torch.Tensor],
+        state: Optional[torch.Tensor],
+        temperatures: torch.Tensor,
+        noise_key: int,
+        noise_offset: torch.Tensor,
+        step: int,
+        logits_out: Optional[torch.Tensor] = None,
+        has_sampled_rows: Optional[bool] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        # One greedy row with no logits to keep: one kernel does the bias GEMV,
+        # the add and the argmax without writing the bias.
+        if (
+            has_sampled_rows is False
+            and logits_out is None
+            and len(prev_tokens) == 1
+            and self._bias_is_w2_gemv()
+        ):
+            tokens = MarkovGreedyStep.execute(
+                base_logits=base_logits,
+                prev_embeds=self.get_prev_embeddings(prev_tokens),
+                w2_weight=self.markov_w2.weight,
+            )
+            return tokens, state
+        return super().draft_step(
+            prev_tokens,
+            base_logits,
+            hidden_states=hidden_states,
+            state=state,
+            temperatures=temperatures,
+            noise_key=noise_key,
+            noise_offset=noise_offset,
+            step=step,
+            logits_out=logits_out,
+            has_sampled_rows=has_sampled_rows,
+        )
+
+    def _bias_is_w2_gemv(self) -> bool:
+        # The fused kernel recomputes this class's bias from the raw w2 weight;
+        # a subclass that changes the bias keeps the op.
+        cls = type(self)
+        return (
+            cls.step_bias is VanillaMarkov.step_bias
+            and cls.project_bias is VanillaMarkov.project_bias
+        )
+
 
 class Nemotron35VanillaMarkov(VanillaMarkov):
     """Checkpoint-quantized Markov head used only by Nemotron 3.5 DSpark."""
