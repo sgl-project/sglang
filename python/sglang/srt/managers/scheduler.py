@@ -3438,12 +3438,16 @@ class Scheduler(
 
         if (timeout_s := envs.SGLANG_REQ_RUNNING_TIMEOUT.get()) > 0:
             deadline = time.perf_counter() - timeout_s
-            inflight_batches = self._collect_inflight_batches()
+            req_groups = [
+                batch.reqs
+                for batch in self._collect_inflight_batches()
+                if batch is not None
+            ]
+            if self.dllm_config is not None:
+                req_groups.append(self.dllm_manager.waiting_queue)
             seen_rids = set()
-            for batch in inflight_batches:
-                if batch is None:
-                    continue
-                for req in batch.reqs:
+            for reqs in req_groups:
+                for req in reqs:
                     # Polling must not re-emit an abort awaiting result processing.
                     if (
                         req.rid in seen_rids

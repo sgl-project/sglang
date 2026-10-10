@@ -68,6 +68,7 @@ def _scheduler(waiting_queue, running_reqs=(), last_batch_reqs=()):
     s.enable_continuous_input_polling = False
     s.result_queue = deque()
     s.waiting_queue = waiting_queue
+    s.dllm_config = None
     s.enable_hierarchical_cache = False
     s.enable_hicache_storage = False
     s.enable_unified_cache_external_linker = False
@@ -138,6 +139,26 @@ class TestWaitingTimeout(CustomTestCase):
 class TestRunningTimeout(CustomTestCase):
     def setUp(self):
         enter_scope(self, published_topology())
+
+    def test_dllm_running_timeout_for_manager_held_reqs(self):
+        """Started requests must remain timeout-eligible between denoising rounds."""
+        now = time.perf_counter()
+        stale = _req("stale", forward_entry=now - 10)
+        fresh = _req("fresh", forward_entry=now)
+        unstarted = _req("unstarted", forward_entry=0.0)
+        reqs = [stale, fresh, unstarted]
+        s = _scheduler([])
+        s.dllm_config = SimpleNamespace()
+        s.dllm_manager = SimpleNamespace(waiting_queue=list(reqs))
+
+        with envs.SGLANG_REQ_RUNNING_TIMEOUT.override(1.0):
+            aborts = s._poll_timeout_aborts()
+            self.assertEqual([a.rid for a in aborts], ["stale"])
+            self.assertEqual(s.dllm_manager.waiting_queue, reqs)
+            s.running_batch = _batch([stale])
+            self.assertEqual([a.rid for a in s._poll_timeout_aborts()], ["stale"])
+
+        self.assertEqual(s.dllm_manager.waiting_queue, reqs)
 
     def test_emits_only_stale_unfinished_reqs_without_marking(self):
         now = time.perf_counter()
