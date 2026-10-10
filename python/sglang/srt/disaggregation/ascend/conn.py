@@ -280,7 +280,11 @@ class AscendKVManager(MooncakeKVManager):
         dst_device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
         dst_kv_item_len: Optional[int] = None,
         dst_attn_tp_size: Optional[int] = None,
+        dst_kv_item_lens: Optional[List[int]] = None,
+        dst_tp_rank: Optional[int] = None,
     ):
+        # Ascend copies draft pages whole, so the per-entry destination layout
+        # the Mooncake worker passes for hybrid draft slicing is unused here.
         if dst_device_kv_indices is not None:
             raise NotImplementedError(
                 "Ascend PD transfer does not support HiSparse "
