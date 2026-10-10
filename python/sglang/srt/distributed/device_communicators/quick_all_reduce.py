@@ -4,7 +4,7 @@ import logging
 import os
 from enum import Enum
 from functools import cache
-from typing import Union
+from typing import Any, Optional, Union
 
 import torch
 import torch.distributed as dist
@@ -88,7 +88,8 @@ class QuickAllReduce:
         self.disabled = True
         if not qr_rocm_arch_available():
             logger.debug(
-                "Custom quick allreduce is only supported on ROCm MI300 series."
+                "Custom quick allreduce is only supported on ROCm "
+                "MI30X/MI35X/MI45X series."
             )
             return
 
@@ -264,3 +265,89 @@ class QuickAllReduce:
 
     def __del__(self):
         self.close()
+
+
+class _QuickAllReduceAdapter:
+    """Expose the SGLang QuickReduce interface for bundled and AITER backends."""
+
+    def __init__(self, communicator: Any) -> None:
+        self._communicator = communicator
+
+    @property
+    def disabled(self) -> bool:
+        # AITER does not guarantee this attribute across releases. If it is
+        # absent, the presence of its eligibility method is the enable signal.
+        return bool(getattr(self._communicator, "disabled", False))
+
+    def should_quick_allreduce(self, inp: torch.Tensor) -> bool:
+        eligibility = getattr(self._communicator, "should_quick_allreduce", None)
+        if eligibility is None:
+            return False
+        return bool(eligibility(inp))
+
+    def quick_all_reduce(
+        self, inp: torch.Tensor, *, out: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        reduce = self._communicator.quick_all_reduce
+        if out is None:
+            return reduce(inp)
+        return reduce(inp, out=out)
+
+    def close(self) -> None:
+        close = getattr(self._communicator, "close", None)
+        if close is not None:
+            close()
+
+
+def _configure_aiter_quickreduce_env() -> None:
+    """Translate legacy SGLang QuickReduce settings for AITER.
+
+    Explicit AITER settings always win. This keeps existing launch scripts
+    working while allowing users to migrate one variable at a time.
+    """
+    aliases = {
+        "ROCM_QUICK_REDUCE_QUANTIZATION": "AITER_QUICK_REDUCE_QUANTIZATION",
+        "ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16": ("AITER_QUICK_REDUCE_CAST_BF16_TO_FP16"),
+        "ROCM_QUICK_REDUCE_MAX_SIZE_BYTES_MB": ("AITER_QUICK_REDUCE_MAX_SIZE_BYTES_MB"),
+    }
+    for legacy_name, aiter_name in aliases.items():
+        if aiter_name in os.environ or legacy_name not in os.environ:
+            continue
+        value = os.environ[legacy_name]
+        if legacy_name == "ROCM_QUICK_REDUCE_QUANTIZATION" and value == "INT8":
+            value = "FP8"
+        os.environ[aiter_name] = value
+
+
+def create_quick_allreduce(
+    group: ProcessGroup, device: Union[int, str, torch.device]
+) -> Optional[_QuickAllReduceAdapter]:
+    """Create the configured QuickReduce communicator.
+
+    AITER is opt-in through ``SGLANG_USE_AITER``. If its Python implementation
+    is not installed, retain the bundled communicator as a compatibility
+    fallback. Constructor failures intentionally propagate: distributed
+    initialization may already have exchanged resources, so silently creating
+    a second communicator is unsafe.
+    """
+    if not qr_rocm_arch_available():
+        return None
+
+    if os.environ.get("SGLANG_USE_AITER", "0").lower() in ("1", "true"):
+        _configure_aiter_quickreduce_env()
+        try:
+            from aiter.dist.device_communicators.quick_all_reduce import (
+                QuickAllReduce as AiterQuickAllReduce,
+            )
+        except (ImportError, AttributeError) as exc:
+            logger.info(
+                "AITER QuickAllReduce unavailable; using bundled QuickAllReduce: %s",
+                exc,
+            )
+        else:
+            logger.info("Using AITER QuickAllReduce")
+            return _QuickAllReduceAdapter(
+                AiterQuickAllReduce(group=group, device=device)
+            )
+
+    return _QuickAllReduceAdapter(QuickAllReduce(group=group, device=device))

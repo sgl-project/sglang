@@ -463,8 +463,7 @@ class GroupCoordinator:
         self.debug_check_symmetric_mempool = debug_check_symmetric_mempool
         if is_hip():
             from sglang.srt.distributed.device_communicators.quick_all_reduce import (
-                QuickAllReduce,
-                qr_rocm_arch_available,
+                create_quick_allreduce,
             )
 
         self.pynccl_comm: Optional[PyNcclCommunicator] = None
@@ -484,7 +483,7 @@ class GroupCoordinator:
             )
 
         self.ca_comm: Optional[Any] = None
-        self.qr_comm: Optional[QuickAllReduce] = None
+        self.qr_comm: Optional[Any] = None
 
         self.pcie_ipc_comm: Optional[Any] = None
         from sglang.srt.distributed.device_communicators.pcie_ipc_ar import (
@@ -526,14 +525,12 @@ class GroupCoordinator:
 
             if is_hip():
                 try:
-                    # Initialize a custom quick all-reduce implementation for AMD
-                    # when rocm >= gfx942. Quick reduce is designed as a
-                    # complement to custom allreduce.
+                    # Prefer AITER QuickReduce when globally enabled and
+                    # available; otherwise retain the bundled implementation.
                     # Based on quickreduce (https://github.com/mk1-project/quickreduce).
-                    if qr_rocm_arch_available():
-                        self.qr_comm = QuickAllReduce(
-                            group=self.cpu_group, device=self.device
-                        )
+                    self.qr_comm = create_quick_allreduce(
+                        group=self.cpu_group, device=self.device
+                    )
                 except Exception as e:
                     logger.warning(f"Failed to initialize QuickAllReduce: {e}")
         elif self.world_size > 1 and is_hip():
@@ -769,10 +766,17 @@ class GroupCoordinator:
             and not self.ca_comm.disabled
             and self.ca_comm.should_custom_ar(input_)
         )
+        should_use_quick_allreduce = (
+            is_hip()
+            and self.qr_comm is not None
+            and not self.qr_comm.disabled
+            and self.qr_comm.should_quick_allreduce(input_)
+        )
         if (
             self.pynccl_comm is not None
             and self.is_symmetric_memory_enabled()
             and not should_use_pymscclpp_allreduce
+            and not should_use_quick_allreduce
             and not should_use_custom_allreduce
         ):
             self.debug_check_symmetric_mempool(self, {"input": input_}, "all_reduce")
@@ -786,6 +790,7 @@ class GroupCoordinator:
         outplace_all_reduce_method = self._resolve_outplace_all_reduce_method(
             input_=input_,
             should_use_pymscclpp_allreduce=should_use_pymscclpp_allreduce,
+            should_use_quick_allreduce=should_use_quick_allreduce,
         )
         if outplace_all_reduce_method is not None:
             return outplace_all_reduce(
@@ -953,12 +958,23 @@ class GroupCoordinator:
         self,
         input_: torch.Tensor,
         should_use_pymscclpp_allreduce: Optional[bool] = None,
+        should_use_quick_allreduce: Optional[bool] = None,
     ) -> Optional[str]:
+        is_rocm = is_hip()
         if should_use_pymscclpp_allreduce is None:
             should_use_pymscclpp_allreduce = (
                 self.pymscclpp_comm is not None
                 and self.pymscclpp_comm.should_mscclpp_allreduce(input_)
             )
+        if should_use_quick_allreduce is None:
+            should_use_quick_allreduce = (
+                is_rocm
+                and self.qr_comm is not None
+                and not self.qr_comm.disabled
+                and self.qr_comm.should_quick_allreduce(input_)
+            )
+        if is_rocm and should_use_quick_allreduce:
+            return "qr"
         if (
             self.ca_comm is not None
             and not self.ca_comm.disabled
@@ -976,12 +992,6 @@ class GroupCoordinator:
             and self.pcie_ipc_comm.should_pcie_ipc_ar(input_)
         ):
             return "pcie_ipc"
-        if (
-            self.qr_comm is not None
-            and not self.qr_comm.disabled
-            and self.qr_comm.should_quick_allreduce(input_)
-        ):
-            return "qr"
         if self.pymscclpp_comm is not None and should_use_pymscclpp_allreduce:
             return "pymscclpp"
         if (
@@ -2098,6 +2108,9 @@ class GroupCoordinator:
         if self.pcie_ipc_comm is not None:
             self.pcie_ipc_comm.destroy()
             self.pcie_ipc_comm = None
+        if self.qr_comm is not None:
+            self.qr_comm.close()
+            self.qr_comm = None
         if self.device_group is not None:
             torch.distributed.destroy_process_group(self.device_group)
             self.device_group = None
