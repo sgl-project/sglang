@@ -520,3 +520,40 @@ def test_float_h3_file_runtime_quantization_is_rejected_before_worker_load(
         runtime.load_model(
             model_path=str(path), sgld_options={"quantization": "convrot_int8"}
         )
+
+
+def test_renamed_vdn_dir_resolves_through_the_plugin_model_id(
+    tmp_path, monkeypatch
+) -> None:
+    """A local VDN copy whose path lacks "minimax" matched no registry detector."""
+    import json
+
+    from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.core import generator
+    from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3_vdn import (
+        VDNH3PipelineConfig,
+    )
+    from sglang.multimodal_gen.registry import _get_config_info
+
+    model_dir = tmp_path / "VDN-H3-8nfe"
+    (model_dir / "transformer").mkdir(parents=True)
+    (model_dir / "model_index.json").write_text(
+        json.dumps(
+            {
+                "_class_name": "VDNH3Pipeline",
+                "_diffusers_version": "0.36.0",
+                "transformer": ["diffusers", "MiniMaxH3DiTModel"],
+                "_minimax_h3": {"schema_version": 1, "partition": "fl2va"},
+            }
+        )
+    )
+    seen = {}
+    monkeypatch.setattr(
+        generator.DiffGenerator,
+        "from_pretrained",
+        lambda **kwargs: seen.update(kwargs) or object(),
+    )
+    SGLDiffusionGenerator().init_generator(str(model_dir), "VDNH3Pipeline", {})
+    _get_config_info.cache_clear()
+    assert _get_config_info(str(model_dir)) is None
+    info = _get_config_info(str(model_dir), model_id=seen["model_id"])
+    assert info.pipeline_config_cls is VDNH3PipelineConfig

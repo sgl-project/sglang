@@ -269,6 +269,10 @@ class SGLDiffusionGenerator:
         kwargs["warmup_mode"] = "off"
         if os.path.isfile(model_path):
             _single_file_server_args(kwargs, pipeline_class_name)
+        elif pipeline_class_name == "VDNH3Pipeline":
+            # Local VDN copies are often renamed, so the registry's path and
+            # _class_name detectors can miss; the short HF id always matches.
+            kwargs.setdefault("model_id", "vdn-minimax-h3")
         kwargs = self._server_args_kwargs(kwargs)
         try:
             with _spawn_without_launcher_main():
