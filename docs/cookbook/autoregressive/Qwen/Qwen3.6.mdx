@@ -88,11 +88,9 @@ docker pull lmsysorg/sglang:latest
 
 For the full Docker setup and other installation methods, please refer to the [official SGLang installation guide](../../../docs/get-started/install).
 
-For SGLang CPU installation, please refer to the [CPU version installation guide](../../../docs/hardware-platforms/cpu_server#installation).
-
 ## 3. Model Deployment
 
-This section provides deployment configurations optimized for different hardware platforms and use cases.
+This section provides deployment configurations optimized for different hardware platforms including NVIDIA GPUs, Intel Arc Pro B-Series GPUs(codename: BMG (Battlemage)), and Intel Xeon CPUs.
 
 ### 3.1 Basic Configuration
 
@@ -119,8 +117,9 @@ This section provides deployment configurations optimized for different hardware
     - **27B BF16**: ~54GB for weights. TP=1 fits on all supported hardware.
     - **27B FP8**: ~27GB for weights. TP=1 fits on all supported hardware.
     - **27B NVFP4**: ~22GB for weights. TP=1 fits on B200/B300.
+    - **Intel Arc Pro B-Series GPUs (BMG, 24GB per GPU)**: BF16 only. Both 35B-A3B and 27B use TP=4.
 
-All Qwen3.6 variants (MoE 35B-A3B and Dense 27B) fit on a single supported GPU. NVFP4 is available on B200/B300:
+All Qwen3.6 variants (MoE 35B-A3B and Dense 27B) fit on a single supported NVIDIA GPU. NVFP4 is available on B200/B300:
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <thead>
