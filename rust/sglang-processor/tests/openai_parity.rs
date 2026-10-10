@@ -133,10 +133,10 @@ fn check_case(
                 None => recorded(),
             };
             lower_chat(&body, &headers, settings, chat_model, render, tokenizer)
-                .map(|(body, responder)| (body, Responder::Chat(responder)))
+                .map(|(body, responder)| (body, Responder::Chat(Box::new(responder))))
         }
         _ => lower_completion(&body, &headers, settings, tokenizer)
-            .map(|(body, responder)| (body, Responder::Completion(responder))),
+            .map(|(body, responder)| (body, Responder::Completion(Box::new(responder)))),
     };
     let (generate, mut responder) = match (lowered, case["unsupported"].as_bool()) {
         (Err(reason), None) if checkpoint.is_none() && reason.0 == "no_tokenizer" => {
@@ -230,13 +230,16 @@ fn event_json(event: &str) -> Value {
     serde_json::from_str(data).unwrap_or_else(|_| json!(data))
 }
 
-/// `created` is the wall clock at response time.
+/// `created` is the wall clock at response time, and tool call ids are random.
 fn without_created(value: Value) -> Value {
     match value {
         Value::Object(map) => Value::Object(
             map.into_iter()
                 .map(|(k, v)| match k.as_str() {
                     "created" => (k, json!(0)),
+                    "id" if v.as_str().is_some_and(|id| id.starts_with("call_")) => {
+                        (k, json!("call_"))
+                    }
                     _ => (k, without_created(v)),
                 })
                 .collect(),

@@ -123,24 +123,29 @@ split_reasoning(reasoning_parser, &options, text, token_ids) -> (reasoning, norm
 ReasoningStreamSplitter::new(reasoning_parser, options).split(text, token_ids)
 tool_constraint(tool_parser, &dynamo_tool_choice(&tool_choice), &tools, parallel_tool_calls)
     -> Result<Option<ToolConstraint>, ProcessorError>
+tool_call_stream(tool_parser, tool_choice, tools, uses_tool_call_structural_tag, Stream<chunk>) -> Stream<chunk>
+parse_tool_calls(tool_parser, text, tools).await -> Result<(calls, normal), String>
 dynamo_tool_parser_name(sglang_name) -> &str
 ```
 
 `mod.rs` holds the events and the stream processor, `reasoning.rs` the
 reasoning split, and `tools.rs` tool schemas, constraints and call deltas.
-`src/think/models/` lists the parser names SGLang ports from Python because
-Dynamo's parsers split them differently; `src/think/` is the port of SGLang's
-`BaseReasoningFormatDetector` they configure, free of Dynamo so `openai` needs
-no `parser` feature. `tests/reasoning_parity.rs` checks them against SGLang's
-`ReasoningParser`. To port another model, add `think/models/<model>.rs` and its
-names in `think/models/mod.rs`.
+`src/think/models/` and `src/tool_call/models/` list the parser names SGLang
+ports from Python because Dynamo's parsers split them differently; `src/think/`
+is the port of SGLang's `BaseReasoningFormatDetector` they configure and
+`src/tool_call/` of its `BaseFormatDetector`, both free of Dynamo so `openai`
+needs no `parser` feature. `tests/reasoning_parity.rs` and the test in
+`tool_call/models/mod.rs` check them against SGLang's `ReasoningParser` and
+`FunctionCallParser`. To port another model, add `think/models/<model>.rs` or
+`tool_call/models/<model>.rs` and its names in that `models/mod.rs`.
 
 Pass-through for parsing:
 - Other reasoning parsers go through
   `ReasoningParserType::get_reasoning_parser_from_name` and
   `parse_reasoning_streaming_incremental`.
-- Tool calls go through `apply_tool_calling_jail`. Decoded output is wrapped as
-  OpenAI stream chunks only to feed the jail, then unwrapped into `ChatEvent`.
+- Other tool parsers go through `apply_tool_calling_jail`. Decoded output is
+  wrapped as OpenAI stream chunks only to feed the parser, then unwrapped into
+  `ChatEvent`.
 
 SGLang additions:
 - **Parser names** from SGLang are mapped onto Dynamo's before construction,

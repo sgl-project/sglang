@@ -253,7 +253,7 @@ class DecodeReqToTokenPool:
 
     def clear(self):
         self.free_slots = list(range(1, self._alloc_size))
-        self.req_generation.zero_()
+        # req_generation must stay monotonic; see ReqToTokenPool.clear().
 
     def register_on_alloc_rows(self, hook: Callable[[List[int]], None]) -> None:
         assert self._on_alloc_rows is None
@@ -656,7 +656,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             total_kv_layers=self.scheduler.model_config.num_hidden_layers,
             req_to_token_pool=getattr(self, "req_to_token_pool", None),
         )
-        if get_disagg().disaggregation_decode_host_receive_threshold > 0:
+        if get_disagg().disaggregation_decode_host_receive_threshold < 1:
             pool = self.token_to_kv_pool
             group = self.tree_cache.host_pool_group
             if kv_args.state_types or any(
@@ -692,7 +692,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.is_mla_backend,
         )
         if (
-            get_disagg().disaggregation_decode_host_receive_threshold > 0
+            get_disagg().disaggregation_decode_host_receive_threshold < 1
             and not kv_manager.supports_host_destination
         ):
             raise ValueError(
@@ -1371,7 +1371,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 continue
 
             if (
-                get_disagg().disaggregation_decode_host_receive_threshold > 0
+                get_disagg().disaggregation_decode_host_receive_threshold < 1
                 and not decode_req.is_rebootstrap
                 and not _is_fake_transfer(decode_req.req)
                 and decode_req.kv_receiver.supports_host_destination
@@ -2372,7 +2372,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self.metadata_buffers = metadata_buffers
         self.scheduler = scheduler
         self.enable_host_receive = (
-            get_disagg().disaggregation_decode_host_receive_threshold > 0
+            get_disagg().disaggregation_decode_host_receive_threshold < 1
         )
         self.tree_cache = tree_cache
         self.spec_algorithm = scheduler.spec_algorithm
@@ -3187,7 +3187,7 @@ class SchedulerDisaggregationDecodeMixin:
             # A finished request can still have one redundant forward in flight.
             # Drain it before a prebuilt request seeds a potentially reused row.
             self.schedule_stream.wait_stream(self.forward_stream)
-        if get_disagg().disaggregation_decode_host_receive_threshold > 0:
+        if get_disagg().disaggregation_decode_host_receive_threshold < 1:
             for req in new_batch.reqs:
                 if req.kv.retraction_backup is not None:
                     restore_kv_cache(
@@ -3225,7 +3225,7 @@ class SchedulerDisaggregationDecodeMixin:
         self.polling_count = (self.polling_count + 1) % self.polling_interval
 
         if self.polling_count % self.polling_interval == 0:
-            if get_disagg().disaggregation_decode_host_receive_threshold == 0:
+            if get_disagg().disaggregation_decode_host_receive_threshold == 1:
                 req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated()
                 self.disagg_decode_transfer_queue.extend(req_conns)
             transferred_reqs = (
@@ -3236,7 +3236,7 @@ class SchedulerDisaggregationDecodeMixin:
                     # Direct-to-host: KV data already in host pool, skip staging
                     self.hisparse_coordinator.admit_request_direct(req)
             self.waiting_queue.extend(transferred_reqs)
-            if get_disagg().disaggregation_decode_host_receive_threshold > 0:
+            if get_disagg().disaggregation_decode_host_receive_threshold < 1:
                 # Give completed host transfers device space before new arrivals.
                 req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated()
                 self.disagg_decode_transfer_queue.extend(req_conns)
