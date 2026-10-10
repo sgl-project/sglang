@@ -309,9 +309,7 @@ class SGLDiffusionServerModel:
     FUNCTION = "load_server"
     CATEGORY = "SGLDiffusion"
 
-    def load_server(
-        self, base_url: str, api_key: str, image_timeout: int = 300
-    ):
+    def load_server(self, base_url: str, api_key: str, image_timeout: int = 300):
         """Initialize OpenAI client for SGLang Diffusion server."""
         client = SGLDiffusionServerAPI(
             base_url=base_url, api_key=api_key, image_timeout=image_timeout

@@ -318,11 +318,7 @@ class SGLDiffusionServerAPI:
                         )
                     }
                     data = {
-                        key: (
-                            value
-                            if isinstance(value, (str, bytes))
-                            else str(value)
-                        )
+                        key: (value if isinstance(value, (str, bytes)) else str(value))
                         for key, value in fields.items()
                     }
                     response = requests.post(

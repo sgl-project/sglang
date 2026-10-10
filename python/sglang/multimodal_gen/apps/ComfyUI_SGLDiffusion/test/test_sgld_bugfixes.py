@@ -150,7 +150,14 @@ def _load_plugin():
 
     _load(f"{PKG}.utils", "utils.py")
     nodes = _load(f"{PKG}.nodes", "nodes.py")
-    return server_api, model_patcher, generator, nodes, sys.modules[f"{PKG}.utils"], folder_paths
+    return (
+        server_api,
+        model_patcher,
+        generator,
+        nodes,
+        sys.modules[f"{PKG}.utils"],
+        folder_paths,
+    )
 
 
 SERVER_API, MODEL_PATCHER, GENERATOR, NODES, UTILS, FOLDER_PATHS = _load_plugin()
@@ -243,7 +250,9 @@ def test_minimax_h3_module_importable_without_sglang_runtime():
 
     assert module._H3_RUNTIME_IMPORT_ERROR is not None
     with pytest.raises(RuntimeError, match="failed to import"):
-        module.MiniMaxH3Executor(generator=None, model_path="x", model=None, config=None)
+        module.MiniMaxH3Executor(
+            generator=None, model_path="x", model=None, config=None
+        )
 
 
 # --- Bug 1: any .gguf was treated as MiniMax-H3 for architecture detect ----
@@ -290,9 +299,10 @@ def test_gguf_support_does_not_leak_into_global_folder_registry():
             assert "model.gguf" in names
             # The stock extension set used by every other node (e.g.
             # ComfyUI's own "Load Diffusion Model") must stay untouched.
-            assert ".gguf" not in FOLDER_PATHS.folder_names_and_paths[
-                "diffusion_models"
-            ][1]
+            assert (
+                ".gguf"
+                not in FOLDER_PATHS.folder_names_and_paths["diffusion_models"][1]
+            )
         finally:
             FOLDER_PATHS.folder_names_and_paths["diffusion_models"][0].remove(tmp)
 
@@ -320,7 +330,9 @@ def test_enable_cache_dit_applies_to_every_executor_not_just_h3():
         height = 8
         width = 8
 
-    executor = _DummyExecutor(generator=None, model_path="x", model=None, config=_DummyConfig())
+    executor = _DummyExecutor(
+        generator=None, model_path="x", model=None, config=_DummyConfig()
+    )
     executor.enable_cache_dit = True
 
     kwargs = executor._sampling_params_kwargs(_Packed(), timestep=0)
@@ -487,7 +499,9 @@ def test_set_lora_sends_strength_to_server():
         return _Response({"status": "ok"})
 
     with mock.patch(f"{PKG}.core.server_api.requests.post", side_effect=fake_post):
-        client.set_lora(lora_nickname="style", lora_path="style.safetensors", strength=0.7)
+        client.set_lora(
+            lora_nickname="style", lora_path="style.safetensors", strength=0.7
+        )
 
     assert captured["strength"] == 0.7
 
@@ -562,9 +576,7 @@ def test_generate_video_uploads_local_input_reference_instead_of_sending_path():
     out_path = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False).name
 
     def fake_get(url, headers=None, timeout=None, **kwargs):
-        return _Response(
-            {"id": "job-1", "status": "completed", "file_path": out_path}
-        )
+        return _Response({"id": "job-1", "status": "completed", "file_path": out_path})
 
     with (
         mock.patch(f"{PKG}.core.server_api.requests.post", side_effect=fake_post),
