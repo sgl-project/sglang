@@ -1559,7 +1559,20 @@ class KVCacheConfigurator:
             start_layer=self.layer_info.start_layer,
             enable_linear_replayssm=get_exec().mamba.enable_linear_replayssm,
             linear_replayssm_cache_len=get_exec().mamba.linear_replayssm_cache_len,
-            mamba_envelope_layout=get_memory().enable_page_major_kv_layout,
+            mamba_envelope_layout=(
+                get_memory().enable_page_major_kv_layout
+                or (
+                    self.device == "cuda"
+                    and not self.is_draft_worker
+                    and self.model_config.hf_config.architectures[0]
+                    == "InklingForConditionalGeneration"
+                    and get_disagg().disaggregation_mode == "null"
+                    and not get_disagg().enable_pd_role_switch
+                    and get_memory().enable_hierarchical_cache
+                    and get_memory().hicache_io_backend == "direct"
+                    and get_memory().hicache_mem_layout == "page_first_direct"
+                )
+            ),
             # ReplaySSM spec-verify is for linear-attn models (GDN fold or KDA
             # fold); activate the pool machinery only for those, so any other
             # mamba-ish model (Mamba2/Nemotron, lightning, ...) run with the
