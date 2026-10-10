@@ -13,8 +13,15 @@ from PIL import Image
 
 from sglang.srt.multimodal.modality import Modality, MultimodalInputFormat
 from sglang.srt.multimodal.processors.executor import MultimodalProcessorExecutor
+from sglang.srt.multimodal.processors.processor_config import MultimodalProcessorConfig
+from sglang.srt.multimodal.token_space.process_strategy import (
+    close_loaded_media,
+    list_media_items,
+)
 from sglang.srt.utils import (
     CLIENT_MEDIA_EXCEPTIONS,
+    ImageData,
+    VideoData,
     configure_media_url_security,
     load_audio,
     load_image,
@@ -22,6 +29,20 @@ from sglang.srt.utils import (
     logger,
     smart_to_rgb,
 )
+
+
+def get_media_source_configs(mm_data):
+    """Return per-source preprocessing options in the original media order."""
+    source_configs = []
+    for source in mm_data or []:
+        if isinstance(source, (ImageData, VideoData)):
+            options = source.preprocess_kwargs
+        elif isinstance(source, dict):
+            options = source.get("preprocess_kwargs")
+        else:
+            options = None
+        source_configs.append(options or {})
+    return source_configs
 
 
 @dataclasses.dataclass
@@ -179,6 +200,7 @@ class MultimodalProcessorMixin:
     # `process_and_combine_mm_data` -- resolves that clone instead of
     # `self._processor`, so isolation does not depend on the subclass.
     supports_mm_processor_concurrency = True
+    use_token_space_processor = False
 
     def _initialize_processor(
         self, hf_config, _processor, *, processor_config, **kwargs
@@ -188,10 +210,14 @@ class MultimodalProcessorMixin:
         self.cpu_process_start_method = processor_config.cpu_process_start_method
         self.cpu_worker_num = processor_config.cpu_worker_num
 
-        configure_media_url_security(
-            processor_config.allowed_media_domains,
-            processor_config.media_url_max_file_size_mb,
-        )
+        allowed_media_domains = processor_config.allowed_media_domains
+        media_url_max_file_size_mb = processor_config.media_url_max_file_size_mb
+        if allowed_media_domains is not None or media_url_max_file_size_mb is not None:
+            configure_media_url_security(
+                allowed_media_domains,
+                max_file_size_mb=media_url_max_file_size_mb,
+                preserve_allowed_domains=allowed_media_domains is None,
+            )
 
         self.image_processor_backend = processor_config.image_processor_backend
         if processor_config.disable_fast_image_processor:
@@ -326,6 +352,75 @@ class MultimodalProcessorMixin:
         if processor is None:
             return self._processor, self._tokenizer
         return processor, _tokenizer_of(processor)
+
+    async def _run_mm_processor(self, function, **kwargs):
+        if self.mm_processor_executor is None:
+            return function(**kwargs)
+        return await self.mm_processor_executor.run(function, **kwargs)
+
+    async def process_media_async(
+        self,
+        *,
+        images=None,
+        videos=None,
+        audios=None,
+        image_source_configs=None,
+        video_source_configs=None,
+        audio_source_configs=None,
+        video_metadata=None,
+        image_device=None,
+        video_device=None,
+        **kwargs,
+    ):
+        """Process loaded media one task per item.
+
+        Tasks run in parallel on clone workers if configured, else sequentially on the calling thread.
+        """
+        strategy = self.token_space_process_strategy
+        media_options = strategy.resolve_media_options(
+            self._processor,
+            image_device=image_device,
+            video_device=video_device,
+            **kwargs,
+        )
+        media_items = list_media_items(
+            images=images,
+            videos=videos,
+            audios=audios,
+            image_source_configs=image_source_configs,
+            video_source_configs=video_source_configs,
+            audio_source_configs=audio_source_configs,
+            video_metadata=video_metadata,
+        )
+        # Wait for every task before closing decoders, even if one item fails.
+        item_features = await asyncio.gather(
+            *(
+                self._run_mm_processor(
+                    self._process_media_item,
+                    modality=modality,
+                    item=item,
+                    source_config=source_config,
+                    options={**media_options[modality], **item_kwargs},
+                )
+                for modality, item, source_config, item_kwargs in media_items
+            ),
+            return_exceptions=True,
+        )
+        close_loaded_media(media_items)
+        failures = [f for f in item_features if isinstance(f, BaseException)]
+        if failures:
+            for failure in failures[1:]:
+                logger.warning("Another media item also failed", exc_info=failure)
+            raise failures[0]
+        return strategy.merge_media(media_items, item_features)
+
+    def _process_media_item(
+        self, *, modality, item, source_config, options, processor=None
+    ):
+        processor, _ = self._resolve_processor(processor)
+        return self.token_space_process_strategy.process_item(
+            modality, item, processor, source_config, **options
+        )
 
     @classmethod
     def _load_single_item(
@@ -617,3 +712,27 @@ class MultimodalProcessorMixin:
             len(audios),
         )
         return images, videos, audios
+
+
+class TokenSpaceMMProcessor(MultimodalProcessorMixin):
+    """Load media and run a token-space process strategy without serving dependencies."""
+
+    use_token_space_processor = True
+
+    def __init__(
+        self,
+        hf_config,
+        processor,
+        token_space_process_strategy_class,
+        *,
+        processor_config=None,
+        **kwargs,
+    ):
+        if processor_config is None:
+            processor_config = MultimodalProcessorConfig()
+        self.token_space_process_strategy = token_space_process_strategy_class(
+            hf_config, processor, mm_process_config=processor_config.mm_process_config
+        )
+        self._initialize_processor(
+            hf_config, processor, processor_config=processor_config, **kwargs
+        )

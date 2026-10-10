@@ -298,6 +298,11 @@ def handle_encoder_disaggregation(server_args: Any):
         )
     if cfg.encoder_only and cfg.language_only:
         raise ValueError("Cannot set --encoder-only and --language-only together")
+    if cfg.enable_token_space_processor and (cfg.encoder_only or cfg.language_only):
+        raise ValueError(
+            "--enable-token-space-processor does not support encoder "
+            "disaggregation (--encoder-only / --language-only) yet"
+        )
     if cfg.encoder_only and not cfg.disaggregation_mode == "null":
         raise ValueError(
             "Cannot set --encoder-only and --disaggregation-mode prefill/decode together"

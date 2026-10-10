@@ -28,6 +28,7 @@ import torch
 from PIL import Image
 
 from sglang.srt.managers.schedule_batch import Modality
+from sglang.srt.multimodal.media_processor import TokenSpaceMMProcessor
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.srt.utils import common
 from sglang.srt.utils.nvjpeg_decoder import _NvJpegDecoderPool
@@ -127,6 +128,19 @@ class TestLoadSingleItemImageDecode(CustomTestCase):
         ):
             with self.assertRaisesRegex(RuntimeError, "unexpected loader bug"):
                 _StubProcessor._load_single_item(b"image", Modality.IMAGE)
+
+    def test_shared_and_serving_choose_same_jpeg_decoder(self):
+        jpeg = _jpeg_bytes()
+        decoded = torch.zeros((3, 8, 8), dtype=torch.uint8)
+        with (
+            patch.object(common, "is_cuda", return_value=True),
+            patch("torchvision.io.decode_jpeg", return_value=decoded) as decode,
+        ):
+            for processor in (BaseMultimodalProcessor, TokenSpaceMMProcessor):
+                self.assertIs(
+                    processor._load_single_item(jpeg, Modality.IMAGE), decoded
+                )
+        self.assertEqual(decode.call_count, 2)
 
     def test_high_fidelity_gpu_jpeg_decoder_is_selected(self):
         data = _jpeg_bytes()

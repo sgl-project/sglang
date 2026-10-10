@@ -1,4 +1,4 @@
-from typing import Any
+from typing import Any, Optional
 
 import msgspec
 
@@ -16,5 +16,7 @@ class MultimodalProcessorConfig(msgspec.Struct, frozen=True, kw_only=True):
     # Serving always passes this (fork, or spawn for cuda_vmm); the default serves
     # trainer hosts, where CUDA is usually initialized and fork is unsafe.
     cpu_process_start_method: str = "spawn"
-    allowed_media_domains: list[str] = []
-    media_url_max_file_size_mb: int = 64
+    # Unset domains inherit the process allowlist; an explicit [] clears it.
+    allowed_media_domains: Optional[list[str]] = None
+    # Unset size inherits the process-wide download limit.
+    media_url_max_file_size_mb: Optional[int] = None

@@ -4,14 +4,22 @@ Regression: the device decision read the published global ServerArgs, so every
 processor answered with one process-wide device. The encode-server DP workers
 each drive their own GPU, which no process-global value can express — the
 device has to come from what the worker was handed.
+Token-space media dispatch keeps the video device and override priority.
 """
 
+import asyncio
 import unittest
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
+
+from transformers import BaseImageProcessor
+from transformers.processing_utils import ProcessorMixin
 
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
+from sglang.srt.multimodal.token_space.process_strategy import (
+    TokenSpaceProcessStrategy,
+)
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -114,6 +122,97 @@ class TestFastImageProcessorDevice(CustomTestCase):
                     ),
                     expected,
                 )
+
+    def test_media_dispatch_keeps_video_device_and_override_priority(self):
+        def capture_options(item, processor, source_config, **kwargs):
+            return {f"{item}_options": kwargs}
+
+        # CPU-only capture at the component boundary catches a missing video device.
+        cases = (
+            (None, False, None, None, "cuda:3"),
+            (["image"], False, None, None, "cuda:3"),
+            (None, False, "cpu", None, "cpu"),
+            (None, False, "cuda:5", "cpu", "cpu"),
+            (["image"], False, "cuda:5", "cpu", "cpu"),
+            (None, True, None, None, None),
+        )
+        for images, use_pil, requested_device, model_device, expected_device in cases:
+            with self.subTest(
+                images=images,
+                use_pil=use_pil,
+                requested_device=requested_device,
+                model_device=model_device,
+            ):
+                processor = _make(base_gpu_id=3)
+                processor._processor = object.__new__(ProcessorMixin)
+                processor._processor.image_processor = object.__new__(
+                    BaseImageProcessor
+                )
+                processor._tokenizer = SimpleNamespace(init_kwargs={})
+                processor._processor.tokenizer = processor._tokenizer
+                processor.token_space_process_strategy = TokenSpaceProcessStrategy(
+                    None, processor._processor
+                )
+                processor.mm_processor_executor = None
+                processor.disable_fast_image_processor = use_pil
+                processor.video_preprocessing_device = model_device
+                processor._load_media_lists = AsyncMock(
+                    return_value=(images or [], ["video"], [])
+                )
+                videos_kwargs = (
+                    {} if requested_device is None else {"device": requested_device}
+                )
+                platforms = SimpleNamespace(
+                    current_platform=SimpleNamespace(
+                        is_cuda_alike=lambda: True, device_type="cuda"
+                    )
+                )
+                with (
+                    patch.multiple(
+                        BASE,
+                        platforms=platforms,
+                        _is_cpu=False,
+                        _is_xpu=False,
+                        _is_npu=False,
+                    ),
+                    patch.object(
+                        processor.token_space_process_strategy,
+                        "get_mm_token_expansion_spec",
+                        return_value=[],
+                    ),
+                    patch.object(
+                        processor,
+                        "sglang_post_process",
+                        side_effect=lambda input_ids, features: features,
+                    ),
+                    patch.object(
+                        processor,
+                        "_temporary_fast_processor_cuda_pool",
+                        return_value=nullcontext(),
+                    ),
+                    patch.object(processor, "_move_processor_output_to_cpu"),
+                    patch.object(
+                        processor.token_space_process_strategy,
+                        "process_image",
+                        new=capture_options,
+                    ),
+                    patch.object(
+                        processor.token_space_process_strategy,
+                        "process_video",
+                        new=capture_options,
+                    ),
+                ):
+                    output = asyncio.run(
+                        processor.process_token_space_mm_data_async(
+                            input_ids=[],
+                            image_data=images,
+                            video_data=["video"],
+                            videos_kwargs=videos_kwargs,
+                        )
+                    )
+                self.assertEqual(output["video_options"].get("device"), expected_device)
+                if images:
+                    self.assertEqual(output["image_options"]["device"], expected_device)
 
 
 class TestFastImageProcessorMemoryPool(CustomTestCase):

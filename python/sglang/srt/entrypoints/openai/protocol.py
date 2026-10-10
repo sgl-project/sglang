@@ -963,6 +963,8 @@ class ChatCompletionRequest(PDRoutingFields):
     # tokenization entirely.  Messages are still used to derive stop tokens
     # and tool_call_constraint.
     input_ids: Optional[List[int]] = None
+    # Start multimodal token expansion here in supplied input_ids; preserve the prefix.
+    mm_token_expansion_start_len: Optional[int] = None
 
     # For request id
     rid: Optional[Union[List[str], str]] = None
@@ -1008,6 +1010,14 @@ class ChatCompletionRequest(PDRoutingFields):
         if isinstance(value, bool):
             raise ValueError("reasoning_effort must not be a boolean")
         return value
+
+    @model_validator(mode="after")
+    def validate_mm_token_expansion_start_len(self):
+        if self.mm_token_expansion_start_len is not None and not self.input_ids:
+            raise ValueError(
+                "input_ids must be non-empty when mm_token_expansion_start_len is set."
+            )
+        return self
 
     @model_validator(mode="before")
     @classmethod

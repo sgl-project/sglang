@@ -375,6 +375,7 @@ POSITIONAL_FIELD_ORDER = (
     "enable_prefix_mm_cache",
     "mm_enable_dp_encoder",
     "mm_process_config",
+    "enable_token_space_processor",
     "mm_processor_worker_num",
     "mm_io_worker_num",
     "allowed_media_domains",
