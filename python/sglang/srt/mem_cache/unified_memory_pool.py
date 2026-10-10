@@ -342,11 +342,6 @@ class MambaSubPoolSpec(SubPoolSpec):
 # ---------------------------------------------------------------------------
 
 
-def unified_memory_supported_for_model(model_config, *, use_mla_backend: bool) -> bool:
-    """Whether this model's KV geometry can back the unified memory pool."""
-    return use_mla_backend or not model_config.has_asymmetric_kv
-
-
 def _assert_physical_id_bound(*, sub_pool_name: str, n_rows: int) -> None:
     """Physical ids must fit the int32 read-index buffers."""
     assert n_rows < 2**31, (
@@ -456,6 +451,7 @@ class UnifiedKVPool:
         # 0 (up to page_size * entry_bytes), not one slot entry -- reserve the
         # max of both.
         reserved_floor = _reserved_floor_bytes(self.sub_pool_specs, page_size)
+        self._reserved_floor = reserved_floor
 
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             if post_capture_active:
@@ -566,6 +562,9 @@ class UnifiedKVPool:
             # Debug: bf16-NaN-fill so NaN-unsafe reads of never-written bytes
             # fail deterministically.
             raw.view(torch.int16).fill_(0x7FC1)
+            # Not the slot-0 sink: kernels read it for padding and for freed window
+            # pages, and in serving it holds zeros.
+            raw[: self._reserved_floor].zero_()
             logger.warning(
                 "[unified-memory-pool] POISONED: backed pool bytes filled with "
                 "bf16-NaN patterns (SGLANG_DEBUG_POISON_POOL)"
@@ -839,6 +838,18 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
                 self._num_pages,
                 self._page_bytes,
             )
+
+    def zero_physical_pages(self, phys_pages: torch.Tensor) -> None:
+        """Zero whole page envelopes (PHYSICAL page ids) on allocator
+        hand-out."""
+        # Same byte-0 envelope view as move_kv_cache.
+        assert self._unified_buffer.anchor_bytes(self._sub_pool_name) == 0
+        zero_pages(
+            self._unified_buffer._raw,
+            phys_pages,
+            self._num_pages,
+            self._page_bytes,
+        )
 
     def get_contiguous_buf_infos(self):
         """Register the raw buffer as physical page envelopes for PD transfer.
@@ -1453,6 +1464,7 @@ def init_unified_mamba_pools(
     end_layer: int,
     is_draft_worker: bool,
     use_mla_backend: bool,
+    v_head_dim: Optional[int] = None,
     kv_lora_rank: Optional[int] = None,
     qk_rope_head_dim: Optional[int] = None,
     fused_draft: Optional[FusedDraftPlacement] = None,
@@ -1510,6 +1522,7 @@ def init_unified_mamba_pools(
             layer_num=len(full_attention_layer_ids),
             head_num=head_num,
             head_dim=head_dim,
+            v_head_dim=v_head_dim,
             store_dtype=store_dtype,
             kv_cache_dtype=kv_cache_dtype,
             grow_direction="down",

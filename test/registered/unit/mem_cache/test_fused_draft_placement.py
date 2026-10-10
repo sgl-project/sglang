@@ -21,8 +21,9 @@ Pinned:
     (one shared region would let the runners clobber each other's KV);
   - a per-depth head serves one depth per runner and needs one runner per
     depth;
-  - a draft with SWA or recurrent-state layers of its own, or asymmetric K/V
-    rows, declines;
+  - a draft with SWA or recurrent-state layers of its own declines, and so do
+    asymmetric K/V rows unless every resolved backend, the draft's included,
+    carries v_head_dim through to the kernel;
   - so does a draft whose attention backend is off the translated MHA rails
     (it would read the fused rows with virtual ids), a draft under
     --dcp-size > 1 (each rank's rows hold only its share of the tokens), an
@@ -39,6 +40,8 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.arg_groups.kv_cache_hook import ASYMMETRIC_KV_BACKENDS
+from sglang.srt.mem_cache import kv_cache_configurator as kcc
 from sglang.srt.mem_cache.layout.fused_draft import (
     DenseDraftRegion,
     DraftKVGeometry,
@@ -72,11 +75,12 @@ def _profile(
     )
 
 
-def _place(profile, num_runners=1):
+def _place(profile, num_runners=1, asymmetric_rows_ok=False):
     return place_fused_draft(
         profile=profile,
         num_runners=num_runners,
         store_dtype=_DTYPE,
+        asymmetric_rows_ok=asymmetric_rows_ok,
     )
 
 
@@ -112,6 +116,23 @@ class TestPlaceFusedDraft(CustomTestCase):
             self.assertIsNone(decision.placement)
             self.assertIsNotNone(decision.declined)
 
+    def test_asymmetric_rows_fuse_with_their_v_width_when_backends_allow(self):
+        placement = _place(
+            _profile(head_dim=64, v_head_dim=32), asymmetric_rows_ok=True
+        ).placement
+        self.assertIsNotNone(placement)
+        self.assertEqual(placement.region.resolved_v_head_dim(), 32)
+        self.assertEqual(placement.region.entry_bytes(), 4 * (64 + 32) * 2)
+        # Symmetric rows never consult the rule.
+        self.assertIsNotNone(_place(_profile(), asymmetric_rows_ok=False).placement)
+
+    def test_a_misaligned_v_row_declines_even_when_backends_allow(self):
+        # K rows are 4 x 64 x 2 B = 512 B; V rows 4 x 5 x 2 B = 40 B are not a
+        # 16-B-aligned entry part.
+        decision = _place(_profile(head_dim=64, v_head_dim=5), asymmetric_rows_ok=True)
+        self.assertIsNone(decision.placement)
+        self.assertIn("40 B", decision.declined)
+
     def test_region_carries_the_profile_geometry(self):
         placement = _place(_profile()).placement
         self.assertEqual(
@@ -119,6 +140,78 @@ class TestPlaceFusedDraft(CustomTestCase):
             DenseDraftRegion(
                 lane_num=1, head_num=4, head_dim=64, v_head_dim=64, store_dtype=_DTYPE
             ),
+        )
+
+
+class TestAsymmetricBackendRule(CustomTestCase):
+    """The rule reads the TARGET's resolved backends and the draft's explicit
+    one (unset inherits the target's); one shared-head_dim backend anywhere
+    disqualifies asymmetric rows."""
+
+    def _carries(self, *, backends, draft_backend=None):
+        cfg = kcc.KVCacheConfigurator.__new__(kcc.KVCacheConfigurator)
+        with (
+            patch.object(kcc, "attention_backends", return_value=tuple(backends)),
+            patch.object(
+                kcc,
+                "get_spec",
+                return_value=SimpleNamespace(
+                    speculative_draft_attention_backend=draft_backend
+                ),
+            ),
+        ):
+            return cfg._draft_backends_carry_v_head_dim()
+
+    def test_every_split_stride_backend_qualifies(self):
+        for backend in sorted(ASYMMETRIC_KV_BACKENDS):
+            self.assertTrue(self._carries(backends=(backend,)), backend)
+
+    def test_a_shared_head_dim_backend_anywhere_disqualifies(self):
+        self.assertNotIn("flashinfer", ASYMMETRIC_KV_BACKENDS)
+        self.assertFalse(self._carries(backends=("flashinfer",)))
+        self.assertFalse(
+            self._carries(backends=("triton",), draft_backend="flashinfer")
+        )
+
+
+class TestUnifiedSWAHeadGeometry(CustomTestCase):
+    """BUG REGRESSION. The hybrid-SWA factories hard-coded a symmetric shape
+    on GPU hosts, so an asymmetric model (MiMo-V2-Flash, 192/128) allocated
+    192-wide V rows in both sub-pools while the boot solve priced 128."""
+
+    def _configurator(self):
+        cfg = kcc.KVCacheConfigurator.__new__(kcc.KVCacheConfigurator)
+        cfg.is_hybrid_swa = True
+        cfg.is_hybrid_swa_compress = False
+        cfg.use_mla_backend = False
+        cfg.kv_cache_dtype = _DTYPE
+        cfg.layer_info = SimpleNamespace(full_attention_layer_ids=[0, 3])
+        cfg.model_config = SimpleNamespace(
+            get_num_kv_heads=lambda tp, dcp: 4,
+            head_dim=192,
+            v_head_dim=128,
+            get_swa_num_kv_heads=lambda tp: 8,
+            swa_head_dim=192,
+            swa_v_head_dim=128,
+        )
+        return cfg
+
+    def test_both_sub_pools_take_the_model_config_geometry(self):
+        with get_parallel().override(attn_tp_size=1, attn_dcp_size=1):
+            g = self._configurator()._unified_swa_head_geometry()
+        self.assertEqual((g.head_num, g.head_dim, g.v_head_dim), (4, 192, 128))
+        self.assertEqual(
+            (g.swa_head_num, g.swa_head_dim, g.swa_v_head_dim), (8, 192, 128)
+        )
+
+    def test_the_fused_price_reads_the_same_geometry(self):
+        region = DenseDraftRegion(
+            lane_num=1, head_num=4, head_dim=64, store_dtype=_DTYPE
+        )
+        with get_parallel().override(attn_tp_size=1, attn_dcp_size=1):
+            spec = self._configurator()._full_host_spec(region)
+        self.assertEqual(
+            (spec.layer_num, spec.head_dim, spec.v_head_dim), (2, 192, 128)
         )
 
 
@@ -224,13 +317,13 @@ class TestFusedDraftDecision(CustomTestCase):
 
     def test_a_draft_off_the_translated_rails_keeps_the_private_pool(self):
         """A fused draft reads its rows through the KV-index translator, which
-        only triton, flashinfer and fa3 carry on every draft path. The draft's
-        backend is the published one, a model hook's declaration included;
-        otherwise it is what the draft runner inherits from the target."""
-        # Kimi-Linear + DSPARK on SM100, where a model hook declares trtllm_mha.
-        declined = self._decide(algorithm="DSPARK", draft_backend="trtllm_mha")
+        only triton, flashinfer, fa3 and trtllm_mha carry on every draft path.
+        The draft's backend is the published one, a model hook's declaration
+        included; otherwise it is what the draft runner inherits from the
+        target."""
+        declined = self._decide(algorithm="DSPARK", draft_backend="fa4")
         self.assertIsNone(declined.placement)
-        self.assertIn("trtllm_mha", declined.declined)
+        self.assertIn("fa4", declined.declined)
         # A DFLASH-family draft runs the target's prefill backend, or the
         # platform default when that is not a draft backend.
         for target_backends, fuses in (
@@ -242,6 +335,17 @@ class TestFusedDraftDecision(CustomTestCase):
             self.assertEqual(decision.placement is not None, fuses, target_backends)
         # An EAGLE draft with no backend of its own runs the target's pair.
         self.assertIsNone(self._decide(target_backends=("fa3", "flashmla")).placement)
+
+    def test_a_trtllm_mha_draft_fuses(self):
+        """trtllm_mha refills its graph page table to what each replay reads
+        and widens its eager table by the draft block, so its draft fuses."""
+        # Kimi-Linear + DSPARK on SM100, where a model hook declares trtllm_mha.
+        for algorithm in ("EAGLE", "DFLASH", "DSPARK"):
+            decision = self._decide(algorithm=algorithm, draft_backend="trtllm_mha")
+            self.assertIsNotNone(decision.placement, algorithm)
+        # A draft with no backend of its own inherits the target's trtllm_mha.
+        decision = self._decide(target_backends=("trtllm_mha", "trtllm_mha"))
+        self.assertIsNotNone(decision.placement)
 
     def test_dcp_keeps_the_private_pool(self):
         """Under --dcp-size > 1 each rank's host rows hold only its share of

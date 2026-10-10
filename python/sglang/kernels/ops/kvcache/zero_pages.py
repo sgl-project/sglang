@@ -1,8 +1,8 @@
 """Zero whole page envelopes of the unified pool by physical page id.
 
-The pool is viewed as int64 words (the MLA page envelope is always
-8-byte-aligned: entry bytes per layer = kv_cache_dim * itemsize, a multiple
-of 8), one wide element per lane; grid = (num_pages, page word blocks).
+The pool is viewed as int64 words (MHA and MLA page envelopes are
+8-byte-aligned), one wide element per lane; grid = (num_pages, page word
+blocks).
 """
 
 from __future__ import annotations
@@ -41,6 +41,9 @@ def zero_pages(
     if m == 0:
         return
     assert raw.dtype == torch.uint8, f"expected uint8 pool, got {raw.dtype}"
+    if not raw.is_cuda:
+        raw[: num_pages * page_bytes].view(num_pages, page_bytes)[pages] = 0
+        return
     assert page_bytes % 8 == 0, f"page_bytes {page_bytes} not int64-aligned"
     page_words = page_bytes // 8
     words = raw[: num_pages * page_bytes].view(torch.int64)
