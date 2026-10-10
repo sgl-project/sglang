@@ -90,8 +90,8 @@ impl IncLockRefResult {
 /// Receipt required by `dec_lock_ref`.
 #[derive(Default)]
 pub struct DecLockRefParams {
-    /// The node the matching acquire locked; None only for receipts that did
-    /// not come from this core (a mispaired anchor is a protocol violation).
+    /// The node the matching acquire locked; a missing or mispaired anchor is
+    /// a protocol violation.
     pub node_id: Option<NodeId>,
     /// Components the matching acquire left untaken.
     pub skipped_lock_components: ComponentSet,
@@ -974,16 +974,15 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         Ok(())
     }
 
-    /// A receipt releases only the node its acquire returned; a mispaired
-    /// node would silently release (or steal) another holder's segment.
+    /// A receipt releases only the node its acquire returned; a mispaired or
+    /// unanchored one would silently release (or steal) another holder's segment.
     fn assert_receipt_anchor_(&self, node_idx: NodeIdx_, params: &DecLockRefParams) {
-        if let Some(anchor) = params.node_id {
-            let node_handle = self.arena.node(node_idx).id;
-            assert!(
-                anchor == node_handle,
-                "lock receipt anchored on node {anchor} released on node {node_handle}"
-            );
-        }
+        let node_handle = self.arena.node(node_idx).id;
+        assert!(
+            params.node_id == Some(node_handle),
+            "lock receipt anchored on node {:?} released on node {node_handle}",
+            params.node_id
+        );
     }
 
     /// Release each component this receipt acquired. Auxiliaries go first so
