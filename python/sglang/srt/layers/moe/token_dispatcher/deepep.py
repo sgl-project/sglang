@@ -458,12 +458,14 @@ class _DeepEPDispatcherImplBase:
                 "use_fp8": False,
                 "use_mxfp4": False,
                 "use_mxfp8": False,
+                "use_int8": False,
                 "use_nvfp4": False,
             },
             DispatcherOutputDtype.FP8: {
                 "use_fp8": True,
                 "use_mxfp4": False,
                 "use_mxfp8": False,
+                "use_int8": False,
                 "use_nvfp4": False,
             },
             # Needed for Ascend A2/A3 NPU case,
@@ -480,6 +482,7 @@ class _DeepEPDispatcherImplBase:
             DispatcherOutputDtype.UINT8: {
                 "use_fp8": False,
                 "use_int8": False,
+                "use_mxfp8": False,
                 "use_nvfp4": False,
                 "use_mxfp4": True,
             },
@@ -494,12 +497,14 @@ class _DeepEPDispatcherImplBase:
                 "use_fp8": False,
                 "use_mxfp4": True,
                 "use_mxfp8": False,
+                "use_int8": False,
                 "use_nvfp4": False,
             },
             DispatcherOutputDtype.MXFP8: {
                 "use_fp8": False,
                 "use_mxfp4": False,
                 "use_mxfp8": True,
+                "use_int8": False,
                 "use_nvfp4": False,
             },
         }
