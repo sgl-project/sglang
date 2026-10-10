@@ -770,6 +770,7 @@ class DeepseekV2MoE(nn.Module):
             if is_deepseek_v4:
                 topk_kwargs.update(
                     use_grouped_topk=False,
+                    router_stream_overlap=routed_quant_stream is not None,
                     scoring_func=config.scoring_func,
                     sqrtsoftplus_log1p=(
                         getattr(config, "model_type", None) == "deepseek_v41"
