@@ -10,6 +10,7 @@ from typing import cast
 from unittest.mock import patch
 
 import torch
+from safetensors.torch import save_file
 
 import sglang.srt.model_loader.loader as loader_mod
 import sglang.srt.model_loader.utils as model_loader_utils
@@ -17,6 +18,10 @@ import sglang.srt.model_loader.weight_utils as weight_utils
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.distributed import (
+    destroy_distributed_environment,
+    init_distributed_environment,
+)
 from sglang.srt.models.deepseek_common import deepseek_weight_loader
 from sglang.srt.models.deepseek_v4 import (
     _dequant_fp8_wo_a,
@@ -27,7 +32,7 @@ from sglang.srt.utils import runai_utils
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=110, suite="base-a-test-cpu")
 
 
 class _FakeModel:
@@ -35,7 +40,215 @@ class _FakeModel:
         return self
 
 
+def _distributed_selection_worker(rank, rendezvous, directory, scenario):
+    # Two WORLD ranks without a TP group: RunAI's distribution is not TP-scoped.
+    init_distributed_environment(
+        world_size=2,
+        rank=rank,
+        local_rank=rank,
+        distributed_init_method="file://" + rendezvous,
+        backend="gloo",
+        timeout=30,
+    )
+    try:
+        root = "s3://bucket/checkpoint"
+        if scenario == "different_roots":
+            root += f"/rank-{rank}"
+        files = [root + "/" + name + ".safetensors" for name in ("main", "draft")]
+        cache = os.path.join(directory, str(rank))
+        os.makedirs(cache)
+        if scenario != "missing_index" or rank == 0:
+            names = ("main", "draft")
+            if scenario == "different_maps" and rank == 1:
+                names = ("draft", "main")
+            with open(os.path.join(cache, "model.safetensors.index.json"), "w") as f:
+                json.dump(
+                    {
+                        "weight_map": {
+                            name + ".weight": path.rsplit("/", 1)[1]
+                            for name, path in zip(names, files)
+                        }
+                    },
+                    f,
+                )
+        source = loader_mod.RunaiModelStreamerLoader.Source(
+            model_or_path=root,
+            revision=None,
+            is_unused_weight=(
+                None
+                if scenario == "no_hook" and rank == 1
+                else lambda name: not name.startswith("draft.")
+            ),
+        )
+        loader = loader_mod.RunaiModelStreamerLoader(
+            LoadConfig(
+                load_format=LoadFormat.RUNAI_STREAMER,
+                model_loader_extra_config={"distributed": True},
+            )
+        )
+        loader.target_device_str = "cpu"
+
+        def reader(paths, *_args):
+            # Replace remote tensor I/O only; preparation, optional selection
+            # and real Gloo collectives run unchanged.
+            yield from ((path, torch.ones(1)) for path in paths)
+
+        with (
+            patch.object(loader_mod, "get_server_args", return_value=None),
+            patch.object(runai_utils, "list_safetensors", return_value=files),
+            patch.object(
+                runai_utils.ObjectStorageModel, "get_path", return_value=cache
+            ),
+            patch.object(weight_utils, "runai_safetensors_weights_iterator", reader),
+        ):
+            received = [name for name, _ in loader._get_weights_iterator(source)]
+        expected = files[1:] if scenario == "healthy" else files
+        assert received == expected, (rank, scenario, received, expected)
+    finally:
+        destroy_distributed_environment()
+
+
 class TestRunaiModelStreamerLoader(CustomTestCase):
+    def test_distributed_selection_agrees_before_streaming(self):
+        for scenario in (
+            "healthy",
+            "missing_index",
+            "different_maps",
+            "no_hook",
+            "different_roots",
+        ):
+            with (
+                self.subTest(scenario=scenario),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                torch.multiprocessing.spawn(
+                    _distributed_selection_worker,
+                    args=(os.path.join(directory, "rendezvous"), directory, scenario),
+                    nprocs=2,
+                    join=True,
+                )
+
+    def test_local_selection_precedes_streaming(self):
+        with tempfile.TemporaryDirectory() as directory:
+            files = [
+                os.path.join(directory, name + ".safetensors")
+                for name in ("main", "draft", "mixed")
+            ]
+            for path, tensors in zip(
+                files,
+                (
+                    {"main.weight": torch.ones(1)},
+                    {"draft.weight": torch.ones(1)},
+                    {"main.bias": torch.ones(1), "draft.bias": torch.ones(1)},
+                ),
+            ):
+                save_file(tensors, path)
+            config = SimpleNamespace(
+                model_path=directory,
+                revision=None,
+                hf_config=SimpleNamespace(architectures=["Unknown"]),
+            )
+            for kind in ("draft", "unadapted", "prefix", "remapped"):
+                with self.subTest(kind=kind):
+                    loader = loader_mod.RunaiModelStreamerLoader(
+                        LoadConfig(
+                            load_format=LoadFormat.RUNAI_STREAMER,
+                            draft_model_idx=0 if kind == "remapped" else None,
+                        )
+                    )
+                    loader.target_device_str = "cpu"
+                    model = _FakeModel()
+                    if kind != "unadapted":
+                        model.is_unused_checkpoint_weight = lambda name: (
+                            not name.startswith("draft.")
+                        )
+                    source = loader.Source.init_new(config, model)
+                    if kind == "prefix":
+                        source.prefix = "nested."
+                    with (
+                        patch.object(loader_mod, "get_server_args", return_value=None),
+                        patch.object(
+                            runai_utils, "list_safetensors", return_value=files
+                        ),
+                        patch.object(
+                            weight_utils,
+                            "runai_safetensors_weights_iterator",
+                            return_value=iter(()),
+                        ) as streamer,
+                    ):
+                        list(loader._get_weights_iterator(source))
+                    self.assertEqual(
+                        streamer.call_args.args[0],
+                        files[1:] if kind == "draft" else files,
+                    )
+
+    def test_remote_selection_uses_weights_index_and_keeps_extra_mtp(self):
+        for scheme in ("s3", "gs", "az"):
+            with (
+                self.subTest(scheme=scheme),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                root = f"{scheme}://bucket/checkpoint"
+                files = [
+                    root + "/" + name
+                    for name in (
+                        "main/part.safetensors",
+                        "draft/part.safetensors",
+                        "mixed.safetensors",
+                        "mtp.safetensors",
+                    )
+                ]
+                with open(
+                    os.path.join(directory, "model.safetensors.index.json"), "w"
+                ) as index:
+                    json.dump(
+                        {
+                            "weight_map": {
+                                "main.weight": "main/part.safetensors",
+                                "draft.weight": "draft/part.safetensors",
+                                "main.bias": "mixed.safetensors",
+                                "draft.bias": "mixed.safetensors",
+                            }
+                        },
+                        index,
+                    )
+                config = SimpleNamespace(
+                    model_path="unrelated-config-directory",
+                    model_weights=root,
+                    revision=None,
+                    hf_config=SimpleNamespace(
+                        architectures=["Glm4MoeForCausalLMNextN"],
+                        num_nextn_predict_layers=1,
+                    ),
+                )
+                model = _FakeModel()
+                model.is_unused_checkpoint_weight = lambda name: (
+                    not name.startswith("draft.")
+                )
+                loader = loader_mod.RunaiModelStreamerLoader(
+                    LoadConfig(load_format=LoadFormat.RUNAI_STREAMER)
+                )
+                loader.target_device_str = "cpu"
+                with (
+                    patch.object(loader_mod, "get_server_args", return_value=None),
+                    patch.object(
+                        runai_utils.ObjectStorageModel,
+                        "get_path",
+                        return_value=directory,
+                    ) as cache,
+                    patch.object(runai_utils, "list_safetensors", return_value=files),
+                    patch.object(
+                        weight_utils,
+                        "runai_safetensors_weights_iterator",
+                        return_value=iter(()),
+                    ) as streamer,
+                ):
+                    list(loader._get_all_weights(config, model))
+                self.assertEqual(streamer.call_args.args[0], files[1:])
+                self.assertTrue(
+                    all(call.args[0] == root for call in cache.call_args_list)
+                )
+
     def test_remote_checkpoint_index(self):
         for scheme in ("s3", "gs", "az"):
             for relative_cache in (False, True):

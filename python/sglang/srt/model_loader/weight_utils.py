@@ -13,6 +13,7 @@ import itertools
 import json
 import logging
 import os
+import posixpath
 import re
 import struct
 import tempfile
@@ -747,6 +748,51 @@ def download_safetensors_index_file_from_hf(
             logger.debug("No %s found in remote.", index_file)
         except huggingface_hub.utils.LocalEntryNotFoundError:
             logger.debug("No %s found in local cache.", index_file)
+
+
+def filter_safetensors_files_by_weight_name(
+    hf_weights_files: List[str],
+    is_unused_weight: Callable[[str], bool],
+) -> List[str]:
+    """Keep shards containing a weight the model may load, using headers only."""
+    kept = []
+    for path in hf_weights_files:
+        with safetensors.safe_open(path, framework="pt") as weights:
+            if any(not is_unused_weight(name) for name in weights.keys()):
+                kept.append(path)
+    # Preserve the model's existing missing-weight validation on empty selection.
+    return kept or hf_weights_files
+
+
+def filter_safetensors_files_by_weight_map(
+    files: List[str],
+    model_root: str,
+    weight_map: Dict[str, str],
+    is_unused_weight: Callable[[str], bool],
+) -> List[str]:
+    """Select remote shards without opening their tensor data."""
+    if not isinstance(weight_map, dict) or not weight_map:
+        return files
+    if any(
+        not isinstance(name, str)
+        or not isinstance(shard, str)
+        or not shard
+        or posixpath.isabs(shard)
+        or posixpath.normpath(shard) != shard
+        or shard in (".", "..")
+        or shard.startswith("../")
+        for name, shard in weight_map.items()
+    ):
+        return files
+    root = model_root.rstrip("/") + "/"
+    indexed = {root + shard for shard in weight_map.values()}
+    needed = {
+        root + shard for name, shard in weight_map.items() if not is_unused_weight(name)
+    }
+    # Extra files, such as separately packaged draft weights, are not described
+    # by this index. Their absence from the map is not evidence they are unused.
+    kept = [path for path in files if path not in indexed or path in needed]
+    return kept or files
 
 
 # For models like Mistral-7B-v0.3, there are both sharded

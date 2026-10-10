@@ -75,6 +75,7 @@ from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     DeepseekV2WeightLoaderMixin,
+    is_unused_nextn_checkpoint_weight,
 )
 from sglang.srt.models.deepseek_common.utils import _is_cuda, _use_aiter
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
@@ -820,6 +821,9 @@ class Glm4MoeLiteForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         self.capture_aux_hidden_states = True
         self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
+    def is_unused_checkpoint_weight(self, name: str) -> bool:
+        return is_unused_nextn_checkpoint_weight(name, self.config, is_nextn=False)
+
     def load_weights(
         self,
         weights: Iterable[Tuple[str, torch.Tensor]],
@@ -902,25 +906,10 @@ class Glm4MoeLiteForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         for name, loaded_weight in weights:
             weight_names.append(name)
 
-            if not is_nextn:
-                if hasattr(self.config, "num_nextn_predict_layers"):
-                    num_nextn_layers = self.config.num_nextn_predict_layers
-                    if num_nextn_layers > 0 and name.startswith("model.layers"):
-                        name_list = name.split(".")
-                        if (
-                            len(name_list) >= 3
-                            and int(name_list[2]) >= self.config.num_hidden_layers
-                        ):
-                            continue
-            else:
-                if nextn_layer_prefix and not name.startswith(nextn_layer_prefix):
-                    continue
-
+            if is_unused_nextn_checkpoint_weight(name, self.config, is_nextn):
+                continue
+            if is_nextn:
                 if nextn_layer_prefix is not None:  # mtp
-                    # Use shared head and embed weights from target model
-                    if "shared_head.head" in name or "embed_tokens" in name:
-                        continue
-
                     is_decoder = True
                     # For nextn specific weights
                     for weight_name in nextn_spec_weight_names:

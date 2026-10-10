@@ -7,6 +7,10 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import safetensors.torch
+import torch
+
+from sglang.srt.model_loader import weight_utils
 from sglang.srt.model_loader.weight_utils import (
     filter_duplicate_safetensors_files,
     maybe_add_mtp_safetensors,
@@ -30,6 +34,86 @@ def _touch(folder, name):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     open(path, "w").close()
     return path
+
+
+class TestFilterSafetensorsFilesByWeightName(CustomTestCase):
+    def test_remote_ambiguous_or_empty_map_keeps_files(self):
+        files = [
+            "s3://bucket/model/main.safetensors",
+            "s3://bucket/model/draft.safetensors",
+        ]
+        for weight_map in (
+            None,
+            {},
+            [],
+            {"draft.weight": None},
+            {"main.weight": "main.safetensors", "draft.weight": "../draft.safetensors"},
+            {"main.weight": "main.safetensors", "draft.weight": "/draft.safetensors"},
+            {"main.weight": "main.safetensors", "draft.weight": "./draft.safetensors"},
+        ):
+            with self.subTest(weight_map=weight_map):
+                self.assertEqual(
+                    weight_utils.filter_safetensors_files_by_weight_map(
+                        files,
+                        "s3://bucket/model",
+                        weight_map,
+                        lambda name: not name.startswith("draft."),
+                    ),
+                    files,
+                )
+
+    def test_keeps_mixed_shards_and_preserves_order_and_values(self):
+        with tempfile.TemporaryDirectory() as folder:
+            files = []
+            contents = [
+                {"main.weight": torch.tensor([1.0])},
+                {"draft.weight": torch.tensor([2.0])},
+                {
+                    "main.bias": torch.tensor([3.0]),
+                    "draft.bias": torch.tensor([4.0]),
+                },
+            ]
+            for i, tensors in enumerate(contents):
+                path = os.path.join(folder, f"part-{i}.safetensors")
+                safetensors.torch.save_file(tensors, path)
+                files.append(path)
+
+            for role, expected_files in (
+                ("main", [files[0], files[2]]),
+                ("draft", [files[1], files[2]]),
+            ):
+                with self.subTest(role=role):
+                    selected = weight_utils.filter_safetensors_files_by_weight_name(
+                        files, lambda name: not name.startswith(role + ".")
+                    )
+                    self.assertEqual(selected, expected_files)
+                    loaded = {
+                        name: tensor
+                        for path in selected
+                        for name, tensor in safetensors.torch.load_file(path).items()
+                        if name.startswith(role + ".")
+                    }
+                    expected = {
+                        name: tensor
+                        for tensors in contents
+                        for name, tensor in tensors.items()
+                        if name.startswith(role + ".")
+                    }
+                    self.assertEqual(loaded.keys(), expected.keys())
+                    for name in loaded:
+                        torch.testing.assert_close(loaded[name], expected[name])
+
+    def test_empty_selection_keeps_files_for_model_validation(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "model.safetensors")
+            safetensors.torch.save_file({"weight": torch.ones(1)}, path)
+            files = [path]
+            self.assertEqual(
+                weight_utils.filter_safetensors_files_by_weight_name(
+                    files, lambda _: True
+                ),
+                files,
+            )
 
 
 class TestFilterDuplicateSafetensorsFiles(CustomTestCase):
