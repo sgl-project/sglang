@@ -155,7 +155,7 @@ class TestCompressedTensorsKVCacheMethod(CustomTestCase):
         return configure_kv_cache_dtype(**kwargs)
 
     def test_nvfp4_calibration_requires_matched_cache_dtype(self):
-        for dtype in ("auto", "bf16", "fp8_e4m3"):
+        for dtype in ("auto", "bf16", "fp8_e4m3", "fp4_mx_block16"):
             with self.subTest(dtype=dtype), self.assertRaisesRegex(
                 ValueError, "Checkpoint NVFP4 KV calibration requires"
             ):
@@ -165,12 +165,15 @@ class TestCompressedTensorsKVCacheMethod(CustomTestCase):
         )
 
     def test_nvfp4_calibration_checks_effective_draft_dtype(self):
-        with self.assertRaisesRegex(ValueError, "NVFP4 KV calibration requires"):
-            self._resolve_dtype(
-                "nvfp4",
-                is_draft_worker=True,
-                speculative_draft_kv_cache_dtype="bf16",
-            )
+        for draft_dtype in ("bf16", "fp4_mx_block16"):
+            with self.subTest(draft_dtype=draft_dtype), self.assertRaisesRegex(
+                ValueError, "NVFP4 KV calibration requires"
+            ):
+                self._resolve_dtype(
+                    "nvfp4",
+                    is_draft_worker=True,
+                    speculative_draft_kv_cache_dtype=draft_dtype,
+                )
         self.assertEqual(
             self._resolve_dtype(
                 "bf16",

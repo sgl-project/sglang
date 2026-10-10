@@ -101,7 +101,10 @@ def configure_kv_cache_dtype(
     if (
         isinstance(kv_cache_quant_algo, str)
         and kv_cache_quant_algo.upper() == "NVFP4"
-        and kv_cache_dtype != getattr(torch, "float4_e2m1fn_x2", None)
+        and (
+            server_args_kv_cache_dtype != "nvfp4"
+            or kv_cache_dtype != getattr(torch, "float4_e2m1fn_x2", None)
+        )
     ):
         raise ValueError(
             "Checkpoint NVFP4 KV calibration requires --kv-cache-dtype nvfp4 "
