@@ -1,3 +1,4 @@
+import asyncio
 import itertools
 import pickle
 import time
@@ -20,12 +21,15 @@ from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
     UnmergeLoraWeightsReq,
 )
 from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
+    DestroyWeightsUpdateGroupReqInput,
     GetWeightsChecksumReqInput,
+    InitWeightsUpdateGroupReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromTensorCheckerReqInput,
     UpdateWeightFromTensorReqInput,
+    UpdateWeightsFromDistributedReqInput,
 )
 from sglang.multimodal_gen.runtime.ipc_array import (
     is_local_endpoint,
@@ -43,6 +47,14 @@ from sglang.multimodal_gen.runtime.utils.request_logger import (
 )
 
 logger = init_logger(__name__)
+
+# All replicas join one process group for these ops, so they must reach every
+# replica at once; a sequential fan-out would deadlock.
+_COLLECTIVE_REQ_TYPES = (
+    InitWeightsUpdateGroupReqInput,
+    UpdateWeightsFromDistributedReqInput,
+    DestroyWeightsUpdateGroupReqInput,
+)
 
 # Control ops mutate replica state (weights, LoRA, memory, shutdown), so with
 # DP they must reach every replica rather than one.
@@ -270,7 +282,12 @@ class AsyncSchedulerClient:
             )
 
         endpoints = self.server_args.scheduler_endpoints
-        if isinstance(batch, _CONTROL_REQ_TYPES):
+        if isinstance(batch, _COLLECTIVE_REQ_TYPES):
+            results = await asyncio.gather(
+                *(self._forward_one(ep, batch, timeout_ms) for ep in endpoints)
+            )
+            output_batch = _merge_fanout_results(results)
+        elif isinstance(batch, _CONTROL_REQ_TYPES):
             # replica state (weights, LoRA, memory) must change everywhere
             results = [
                 await self._forward_one(ep, batch, timeout_ms) for ep in endpoints
