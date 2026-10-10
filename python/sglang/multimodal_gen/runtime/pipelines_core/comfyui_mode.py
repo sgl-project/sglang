@@ -124,8 +124,8 @@ def _evict_other_runs(session_id: str) -> None:
 def bind_comfyui_session(req):
     """Restore cached conditioning, then refresh the cache from whatever is set.
 
-    Conditioning is stored per ``comfyui_cond_key`` so CFG pos/neg do not
-    overwrite each other. Packed extras are restored only when
+    Conditioning and packed extras are stored per ``comfyui_cond_key`` so CFG
+    pos/neg do not overwrite each other. Extras are restored only when
     ``comfyui_cache_fp`` matches; a mismatch must not revive a stale layout.
     """
     sid = session_id_from_req(req)
@@ -137,6 +137,7 @@ def bind_comfyui_session(req):
     cond_key = extra.get("comfyui_cond_key") or "_"
     cached = _SESSIONS.get(sid) or {}
     cond_snap = (cached.get("_conds") or {}).get(cond_key) or {}
+    extra_snap = (cached.get("_extra") or {}).get(cond_key) or {}
     current_fp = extra.get("comfyui_cache_fp")
     cached_fp = cached.get("_fp")
     extra_ok = current_fp is None or cached_fp is None or current_fp == cached_fp
@@ -145,7 +146,7 @@ def bind_comfyui_session(req):
         if _is_empty(getattr(req, name, None)):
             setattr(req, name, value)
     if extra_ok:
-        for key, value in (cached.get("_extra") or {}).items():
+        for key, value in extra_snap.items():
             if _is_empty(extra.get(key)):
                 extra[key] = value
     req.extra = extra
@@ -164,14 +165,17 @@ def bind_comfyui_session(req):
     conds = dict(cached.get("_conds") or {})
     if new_cond:
         conds[cond_key] = new_cond
-    snapshot: dict[str, Any] = {"_conds": conds}
+    extras = dict(cached.get("_extra") or {}) if extra_ok else {}
     if extra_snapshot:
-        snapshot["_extra"] = extra_snapshot
+        extras[cond_key] = extra_snapshot
+    snapshot: dict[str, Any] = {"_conds": conds}
+    if extras:
+        snapshot["_extra"] = extras
     if current_fp is not None:
         snapshot["_fp"] = current_fp
     elif extra_ok and cached_fp is not None:
         snapshot["_fp"] = cached_fp
-    if conds or extra_snapshot:
+    if conds or extras:
         _SESSIONS[sid] = snapshot
     return req
 

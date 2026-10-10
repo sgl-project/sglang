@@ -2,6 +2,7 @@
 Base executor class for SGLang Diffusion ComfyUI integration.
 """
 
+import hashlib
 import uuid
 
 import torch
@@ -18,6 +19,88 @@ except ImportError as exc:
     )
 else:
     _RUNTIME_IMPORT_ERROR = None
+
+
+def _hash_value(digest, value) -> None:
+    """Hash ``value`` into ``digest``, framing each item so values cannot merge."""
+    if torch.is_tensor(value):
+        tensor = value.detach().contiguous().cpu()
+        digest.update(f"T{tensor.dtype}{tuple(tensor.shape)}".encode())
+        digest.update(tensor.reshape(-1).view(torch.uint8).numpy().tobytes())
+    elif isinstance(value, dict):
+        digest.update(f"D{len(value)}".encode())
+        for key, item in value.items():
+            _hash_value(digest, key)
+            _hash_value(digest, item)
+    elif isinstance(value, (list, tuple)):
+        digest.update(f"L{len(value)}".encode())
+        for item in value:
+            _hash_value(digest, item)
+    else:
+        text = repr(value).encode()
+        digest.update(f"V{len(text)}:".encode())
+        digest.update(text)
+
+
+# transformer_options entries with one item per cond chunk; the rest is shared
+# apart from "sigmas", which holds one item per row of a single chunk.
+_PER_CHUNK_TRANSFORMER_OPTIONS = ("cond_or_uncond", "uuids")
+
+
+def _slice_batch_row(value, index: int, batch: int):
+    """Row ``index`` of a batched ComfyUI argument.
+
+    ComfyUI concatenates every cond-derived kwarg to the full batch, so a
+    leading dim of ``batch`` is per-row and 1 is shared; any other size is
+    ambiguous and rejected rather than guessed.
+    """
+    if torch.is_tensor(value):
+        if value.ndim == 0 or value.shape[0] == 1:
+            return value
+        if value.shape[0] == batch:
+            return value[index : index + 1]
+        raise ValueError(
+            f"cannot split a batch of {batch} on a tensor of shape {tuple(value.shape)}"
+        )
+    if type(value) in (list, tuple):
+        return type(value)(_slice_batch_row(item, index, batch) for item in value)
+    if type(value) is dict:
+        return {
+            key: _slice_batch_row(item, index, batch) for key, item in value.items()
+        }
+    return value
+
+
+def _cond_uuid_from_transformer_options(options):
+    """ComfyUI's per-cond uuid for this call, stable across steps in one run."""
+    if not isinstance(options, dict):
+        return None
+    uuids = options.get("uuids")
+    if type(uuids) in (list, tuple) and uuids:
+        return tuple(uuids)
+    return None
+
+
+def _slice_transformer_options(options, index: int, batch: int):
+    """Shared options pass through; only the per-chunk entries are sliced."""
+    if not isinstance(options, dict):
+        return options
+    sliced = dict(options)
+    for key in _PER_CHUNK_TRANSFORMER_OPTIONS:
+        value = options.get(key)
+        if type(value) in (list, tuple) and value and batch % len(value) == 0:
+            # Each chunk holds batch // len rows.
+            sliced[key] = type(value)([value[index // (batch // len(value))]])
+    # ComfyUI sets sigmas to the timestep before repeating it per chunk.
+    sigmas = options.get("sigmas")
+    if torch.is_tensor(sigmas) and sigmas.ndim > 0 and sigmas.shape[0] > 1:
+        if batch % sigmas.shape[0] != 0:
+            raise ValueError(
+                f"cannot split a batch of {batch} on sigmas of shape {tuple(sigmas.shape)}"
+            )
+        row = index % sigmas.shape[0]
+        sliced["sigmas"] = sigmas[row : row + 1]
+    return sliced
 
 
 class SGLDiffusionExecutor(torch.nn.Module):
@@ -41,7 +124,8 @@ class SGLDiffusionExecutor(torch.nn.Module):
         self.adapter = self.adapter_cls()
         self.session_id = uuid.uuid4().hex
         self._run_id = 0
-        self._sent_conds: set[tuple] = set()
+        self._sent_conds: set[str] = set()
+        self._cond_key_cache: dict[tuple, str] = {}
 
     @staticmethod
     def should_suppress_logs(timestep):
@@ -70,6 +154,7 @@ class SGLDiffusionExecutor(torch.nn.Module):
         """One ComfyUI ``sampler.sample()`` invocation is one cache lifetime."""
         self._run_id += 1
         self._sent_conds = set()
+        self._cond_key_cache = {}
 
     def end_sampler_run(self) -> None:
         """Run cache is evicted on the next bind of a newer id for this executor."""
@@ -84,24 +169,52 @@ class SGLDiffusionExecutor(torch.nn.Module):
     def comfyui_session_id(self) -> str:
         return f"{self.session_id}:{self._run_id}"
 
-    def _cond_key(self, packed) -> tuple | None:
+    def _cond_key(self, packed) -> str | None:
         embeds = packed.prompt_embeds
         if not embeds:
             return None
         tensor = embeds[0]
         if not torch.is_tensor(tensor) or tensor.numel() == 0:
             return None
-        flat = tensor.reshape(-1)
-        return (
-            tuple(int(dim) for dim in tensor.shape),
-            float(flat[0].item()),
-            float(flat[-1].item()),
+        # A cond's content is fixed for the life of one sampler run, so with a
+        # uuid from ComfyUI we only need to hash it once per run rather than
+        # once per step; the memo key still folds in shape/dtype so a stale
+        # entry can never be returned for tensors that don't actually match.
+        cond_uuid = packed.unpack_ctx.get("comfyui_cond_uuid")
+        memo_key = None
+        if cond_uuid is not None:
+            shape_key = tuple(
+                (t.dtype, tuple(t.shape)) if torch.is_tensor(t) else None
+                for t in embeds
+            )
+            memo_key = (cond_uuid, shape_key)
+            cached = self._cond_key_cache.get(memo_key)
+            if cached is not None:
+                return cached
+        # Hash everything drop_cached_fields removes: a hit means the worker
+        # restores all of it, so a partial key would revive another cond.
+        digest = hashlib.blake2b(digest_size=16)
+        _hash_value(
+            digest,
+            (
+                embeds,
+                packed.pooled_embeds,
+                packed.prompt_seq_lens,
+                {
+                    key: packed.extra_req.get(key)
+                    for key in self.adapter.cached_extra_keys
+                },
+            ),
         )
+        key = digest.hexdigest()
+        if memo_key is not None:
+            self._cond_key_cache[memo_key] = key
+        return key
 
     def _mark_and_maybe_drop(self, packed) -> None:
         key = self._cond_key(packed)
         if key is not None:
-            packed.extra_req["comfyui_cond_key"] = repr(key)
+            packed.extra_req["comfyui_cond_key"] = key
             if key in self._sent_conds:
                 self.adapter.drop_cached_fields(packed)
             else:
@@ -152,5 +265,41 @@ class SGLDiffusionExecutor(torch.nn.Module):
         return self.adapter.unpack(output_batch.noise_pred, packed, x)
 
     def forward(self, x, timestep, context, **kwargs):
+        batch = int(x.shape[0]) if torch.is_tensor(x) else 1
+        if batch == 1:
+            return self._forward_one(x, timestep, context, **kwargs)
+        # ComfyUI batches CFG cond/uncond (and batch_size > 1) into one call,
+        # but the worker's comfyui path is per-sample: req.timesteps is its
+        # schedule and seq lens are per request. Send one request per row.
+        return torch.cat(
+            [
+                self._forward_one(
+                    _slice_batch_row(x, i, batch),
+                    _slice_batch_row(timestep, i, batch),
+                    _slice_batch_row(context, i, batch),
+                    _cond_row=i,
+                    **{
+                        key: (
+                            _slice_transformer_options(value, i, batch)
+                            if key == "transformer_options"
+                            else _slice_batch_row(value, i, batch)
+                        )
+                        for key, value in kwargs.items()
+                    },
+                )
+                for i in range(batch)
+            ]
+        )
+
+    def _forward_one(self, x, timestep, context, _cond_row=None, **kwargs):
         packed = self.adapter.pack(x, timestep, context, **kwargs)
+        cond_uuid = _cond_uuid_from_transformer_options(
+            kwargs.get("transformer_options")
+        )
+        # Rows of one cond chunk share its uuid but can carry different
+        # per-row conditioning (e.g. reference latents), so key on the row too.
+        # unpack_ctx is executor-local, keeping _execute_packed's signature.
+        packed.unpack_ctx["comfyui_cond_uuid"] = (
+            None if cond_uuid is None else (cond_uuid, _cond_row)
+        )
         return self._execute_packed(packed, x, timestep)
