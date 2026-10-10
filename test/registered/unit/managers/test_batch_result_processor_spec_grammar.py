@@ -5,7 +5,10 @@ token, so the over-drafted suffix is never committed to KV nor emitted.
 """
 
 import unittest
+from array import array
+from dataclasses import replace
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import torch
 
@@ -15,6 +18,8 @@ from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
 from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import (
     REQUEST_REASONING_END_TOKEN_IDS_KEY,
     SamplingParams,
@@ -249,6 +254,104 @@ class TestReasoningTokenAccounting(CustomTestCase):
 
         self.assertEqual(req.reasoning_tokens, 0)
         self.assertFalse(req._is_reasoning_over)
+
+
+class TestFinishedMambaSpecCheckpoint(CustomTestCase):
+    def test_truncated_live_state_is_not_cached_but_kv_is_released(self):
+        """Finishing inside a verified run must not cache its later live state."""
+        cases = (
+            # kind, grammar retained, max output, stop token, non-draft count, cache
+            ("grammar", 1, 256, None, 1, False),
+            ("offloaded", 1, 256, None, 1, False),
+            ("grammar_abort", 0, 256, None, 1, False),
+            ("eos", None, 256, 4, 1, False),
+            ("length", None, 2, None, 1, False),
+            ("stop", None, 256, 4, 1, False),
+            ("aligned", None, 3, None, 1, True),
+            ("grammar_aligned", 3, 256, None, 1, True),
+            ("two_non_draft", 2, 256, None, 2, False),
+        )
+        for kind, retained, limit, stop, non_draft, expected in cases:
+            with (
+                self.subTest(kind=kind),
+                get_context().override_server_args(
+                    speculative_algorithm="EAGLE",
+                    mamba_radix_cache_strategy="no_buffer",
+                    disable_overlap_schedule=True,
+                    disaggregation_decode_enable_offload_kvcache=kind == "offloaded",
+                ),
+            ):
+                processor = _make_processor()
+                req = _make_req(retained or 3)
+                req.origin_input_ids = array("q", req.origin_input_ids)
+                if retained is None:
+                    req.grammar = None
+                elif retained == 0:
+                    req.grammar.accept_token = MagicMock(
+                        side_effect=ValueError("invalid")
+                    )
+                req.sampling_params.max_new_tokens = limit
+                if kind == "eos":
+                    req.eos_token_ids = {stop}
+                else:
+                    req.sampling_params.stop_token_ids = {stop} if stop else set()
+                req.output_ids.append(3)  # Prefill's bonus has not entered state yet.
+                req.kv.kv_committed_len = 3
+                req.kv.kv_allocated_len = 6
+                req.kv.req_pool_idx = 0
+                result = _make_result(3, [3], [4, 5, 6])
+                result.num_non_draft_tokens_per_req = non_draft
+                batch = _FakeBatch([req])
+                batch.mamba_track_mask_cpu = None
+                tokens = processor._resolve_spec_v2_tokens(result, batch)[0]
+                req.output_ids.extend(tokens)
+                req.update_finish_state(len(tokens))
+                self.assertTrue(req.finished())
+
+                # Model allocation is the boundary stub; token settlement and
+                # release_kv_cache both run their production implementations.
+                cached_lengths = []
+                freed_ranges = []
+                tree = MagicMock()
+                tree.supports_mamba.return_value = True
+                tree.claim_kv_row.return_value = False
+                tree.token_to_kv_pool_allocator.page_size = 1
+                tree.checkpoint.side_effect = lambda req, *, up_to: (
+                    cached_lengths.append(up_to)
+                )
+                tree.free_kv_row.side_effect = lambda kv, ranges: freed_ranges.extend(
+                    ranges
+                )
+                processor = replace(
+                    processor,
+                    tree_cache=tree,
+                    decode_offload_manager=SimpleNamespace(
+                        offload_kv_cache=lambda req: True
+                    ),
+                )
+                processor._handle_finish_state_updated_req(req, batch, result, 0, None)
+                if kind == "offloaded":
+                    self.assertFalse(req.kv.is_kv_released)
+                    release_kv_cache(req, tree, checkpoint=True)
+
+                self.assertEqual(cached_lengths, [6] if expected else [])
+                self.assertEqual(req.skip_radix_cache_insert, not expected)
+                self.assertTrue(req.kv.is_kv_released)
+                self.assertEqual(sum(hi - lo for lo, hi in freed_ranges), 6)
+
+    def test_dedicated_checkpoints_are_not_rejected_for_live_state_overshoot(self):
+        processor = _make_processor()
+        processor = replace(
+            processor, tree_cache=SimpleNamespace(supports_mamba=lambda: True)
+        )
+        req = _make_req(1)
+        result = _make_result(3, [3], [4, 5, 6])
+        result.num_correct_drafts_per_req_cpu = [2]
+        result.grammar_retained_tokens = [[4]]
+        for slots in (1, 2):
+            with self.subTest(slots=slots):
+                req.kv.mamba_ping_pong_track_buffer = torch.arange(slots)
+                self.assertTrue(processor._mamba_can_cache_finished_req(req, result, 0))
 
 
 if __name__ == "__main__":
