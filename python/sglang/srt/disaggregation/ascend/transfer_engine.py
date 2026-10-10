@@ -84,13 +84,19 @@ class AscendTransferEngine(MooncakeTransferEngine):
             raise RuntimeError("Ascend Transfer Engine initialization failed.")
 
     def batch_register(self, ptrs: List[int], lengths: List[int]):
-        try:
-            ret_value = self.engine.batch_register_memory(ptrs, lengths)
-        except Exception:
-            # Mark register as failed
-            ret_value = -1
+        ret_value = self.engine.batch_register_memory(ptrs, lengths)
         if ret_value != 0:
-            logger.debug(f"Ascend memory registration for ptr {ptrs} failed.")
+            raise RuntimeError(
+                f"Ascend memory registration failed with ret_value={ret_value}"
+            )
+        return ret_value
+
+    def close(self) -> None:
+        """Release the role-bound MemFabric session without freeing KV tensors."""
+        if self.engine is None:
+            return
+        self.engine.destroy()
+        self.engine = None
 
     @staticmethod
     def _get_transfer_protocol() -> str:

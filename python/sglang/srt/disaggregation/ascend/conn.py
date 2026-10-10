@@ -93,6 +93,15 @@ def _build_page_interleaved_dcp_plan(
 
 
 class AscendKVManager(MooncakeKVManager):
+    def _teardown_transfer_engine(self) -> None:
+        # MemFabric belongs to this manager and is bound to its PD role.
+        # Destroy releases all registered (possibly merged) memory regions
+        # and the old session before the replacement manager initializes.
+        self.engine.close()
+        if hasattr(self, "connection_pool"):
+            with self.connection_lock:
+                self.connection_pool.clear()
+
     def __init__(
         self,
         args,
