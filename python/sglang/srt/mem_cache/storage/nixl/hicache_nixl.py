@@ -106,11 +106,12 @@ class HiCacheNixl(HiCacheStorage):
         self.backup_skip = self.is_mla_model and storage_config.tp_rank != 0
 
         model_name = "-".join(model_name.split("/")) if model_name else ""
+        self.tp_config_suffix = f"_{model_name}_{tp_rank}_{tp_size}"
 
         if self.is_mla_model:
             self.config_suffix = f"_{model_name}"
         else:
-            self.config_suffix = f"_{model_name}_{tp_rank}_{tp_size}"
+            self.config_suffix = self.tp_config_suffix
 
         sync_mode = getattr(
             nixlBind, "NIXL_THREAD_SYNC_RW", nixlBind.NIXL_THREAD_SYNC_STRICT
@@ -182,7 +183,10 @@ class HiCacheNixl(HiCacheStorage):
         if self._l3_cleaner is not None:
             self._l3_cleaner.start()
 
-    def _get_suffixed_key(self, key: str) -> str:
+    def _get_suffixed_key(self, key: str, pool_name: Optional[PoolName] = None) -> str:
+        # Mamba state is TP-sharded even when the model's MLA KV is replicated.
+        if pool_name == PoolName.MAMBA:
+            return key + self.tp_config_suffix
         return key + self.config_suffix
 
     def _get_component_key(
@@ -190,7 +194,7 @@ class HiCacheNixl(HiCacheStorage):
     ) -> str:
         if component_name in (None, PoolName.KV):
             return self._get_suffixed_key(key)
-        return f"{self._get_suffixed_key(key)}_{component_name}"
+        return f"{self._get_suffixed_key(key, component_name)}_{component_name}"
 
     def _get_component_keys(
         self, keys: List[str], pool_name: Optional[PoolName] = None
@@ -213,7 +217,7 @@ class HiCacheNixl(HiCacheStorage):
             suffixes = [f"_{pool_name}_{i}" for i in range(key_multiplier)]
 
         return [
-            f"{self._get_suffixed_key(key)}{suffix}"
+            f"{self._get_suffixed_key(key, pool_name)}{suffix}"
             for key in keys
             for suffix in suffixes
         ]
