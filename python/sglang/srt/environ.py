@@ -335,6 +335,11 @@ class Envs:
     SGLANG_EXTERNAL_MODEL_PACKAGE = EnvStr("")
     SGLANG_EXTERNAL_MM_MODEL_ARCH = EnvStr("")
     SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE = EnvStr("")
+    # Opt-in CUDA path for `--dllm-algorithm LowConfidence --tp-size <N>`.
+    # Unsupported devices, modes, and LM heads fall back to full TP logits.
+    SGLANG_DLLM_TP_LOCAL_VOCAB = EnvBool(False)
+    # Pack state into one FP32 gather; IDs above 2^24 use typed gathers.
+    SGLANG_DLLM_TP_LOCAL_VOCAB_PACKED_GATHER = EnvBool(True)
 
     # ===================================================================
     # HTTP server and health
@@ -481,6 +486,7 @@ class Envs:
     SGLANG_TRACE_LOGITS_E2E_SYNC = EnvBool(False)
     SGLANG_TRACE_SAMPLER_E2E = EnvBool(False)
     SGLANG_TRACE_QWEN_MOE_DEEPEP_E2E = EnvBool(False)
+    SGLANG_CONSUMER_STATE_TRACE_JSONL = EnvStr("")
     SGLANG_DEEPEP_V2_TRACE_CONTIG = EnvBool(False)
     SGLANG_DEEPEP_V2_TRACE_MASKED = EnvBool(False)
 

@@ -18,6 +18,8 @@ from unittest.mock import call, patch
 
 import torch
 
+from sglang.srt.dllm.algorithm.gemma4_renoise import Gemma4Renoise
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.models import gemma4_diffusion, gemma4_mm
 from sglang.srt.models.gemma4_diffusion import DiffusionGemmaForBlockDiffusion
@@ -57,6 +59,17 @@ class _LogitsProcessorStub(torch.nn.Module):
         return self.output
 
 
+class _DllmModelRunnerStub:
+    def __init__(self, logits_output):
+        self.logits_output = logits_output
+
+    def forward(self, forward_batch, pp_proxy_tensors):
+        return SimpleNamespace(
+            logits_output=self.logits_output,
+            can_run_graph=True,
+        )
+
+
 def _diffusion_model_stub():
     model = DiffusionGemmaForBlockDiffusion.__new__(DiffusionGemmaForBlockDiffusion)
     torch.nn.Module.__init__(model)
@@ -74,6 +87,63 @@ def _dispatch_batch(*, encoder):
         dllm_input_preparation_state=None,
         contains_image_inputs=lambda: True,
     )
+
+
+class TestGemma4RenoiseLogitsOutput(unittest.TestCase):
+    def _run_loop(self, *, fdfo):
+        algorithm = Gemma4Renoise.__new__(Gemma4Renoise)
+        algorithm.block_size = 2
+        algorithm.mask_id = 99
+        algorithm.fdfo = fdfo
+        algorithm.vocab_size = 3
+        algorithm.max_denoising_steps = 1
+        algorithm.prepare_inputs = lambda model_runner, forward_batch, states: None
+
+        state = {
+            "finished": True,
+            "current": torch.tensor([1, 2]),
+        }
+        algorithm.init_step_state = lambda forward_batch: [state]
+
+        logits_output = LogitsProcessorOutput(
+            next_token_logits=None,
+            full_logits=torch.zeros(2, 3),
+        )
+        model_runner = _DllmModelRunnerStub(logits_output)
+        forward_batch = SimpleNamespace(
+            batch_size=1,
+            input_ids=torch.tensor([99, 99]),
+        )
+
+        if fdfo:
+            result = algorithm._run_fdfo(
+                model_runner,
+                forward_batch,
+                algo_states=[state],
+            )
+        else:
+            result = algorithm._run_sync(model_runner, forward_batch)
+
+        self.assertIs(result[0], logits_output)
+        self.assertEqual(forward_batch.input_ids.tolist(), [1, 2])
+
+    def test_result_object_is_supported_by_sync_and_fdfo_loops(self):
+        for fdfo in (False, True):
+            with self.subTest(fdfo=fdfo):
+                self._run_loop(fdfo=fdfo)
+
+    def test_compact_state_is_rejected(self):
+        algorithm = Gemma4Renoise.__new__(Gemma4Renoise)
+        algorithm.block_size = 2
+        algorithm.vocab_size = 3
+        forward_batch = SimpleNamespace(batch_size=1)
+
+        with self.assertRaisesRegex(ValueError, "requires dense full logits"):
+            algorithm.step(
+                forward_batch,
+                LogitsProcessorOutput(next_token_logits=None),
+                [{"finished": True}],
+            )
 
 
 class TestGemma4DiffusionImageMasks(unittest.TestCase):

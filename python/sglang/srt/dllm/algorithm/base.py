@@ -75,11 +75,12 @@ class DllmAlgorithm:
     def step(
         self,
         forward_batch: ForwardBatch,
-        full_logits: torch.Tensor,
+        logits_output: LogitsProcessorOutput,
         states: List[Any],
     ) -> List[bool]:
         """Advance one denoise step in place and report which blocks may emit.
 
+        ``logits_output`` may carry either dense logits or compact consumer state.
         Algorithms that retain generated-block KV must not report completion
         until a forward has persisted their final tokens. Algorithms with a
         separate context pass may emit immediately because that block KV is
@@ -120,7 +121,7 @@ class DllmAlgorithm:
         if _is_npu or (self.reuse_forward_metadata and out.can_run_graph):
             forward_batch.mark_forward_metadata_ready(replan_equivalent=not _is_npu)
         for _ in range(self.max_steps(self.block_size)):
-            done = self.step(forward_batch, out.logits_output.full_logits, states)
+            done = self.step(forward_batch, out.logits_output, states)
             if all(done):
                 break
             self.prepare_inputs(model_runner, forward_batch, states)
@@ -154,7 +155,7 @@ class DllmAlgorithm:
 
         self.prepare_inputs(model_runner, forward_batch, states)
         out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
-        done = self.step(forward_batch, out.logits_output.full_logits, states)
+        done = self.step(forward_batch, out.logits_output, states)
 
         accept_length_per_req_cpu = [self.block_size if d else 0 for d in done]
         next_token_ids_list = forward_batch.input_ids.view(

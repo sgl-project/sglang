@@ -138,6 +138,21 @@ SGLang supports various environment variables that can be used to configure its 
   </thead>
   <tbody>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DLLM_TP_LOCAL_VOCAB</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable compact TP vocabulary-state gathers for CUDA <code>LowConfidence</code> launches. Unsupported configurations retain the full-logits path. See <a href="../supported-models/diffusion_language_models#tp-local-vocabulary-state">Diffusion language models</a> for the launch command and limitations.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DLLM_TP_LOCAL_VOCAB_PACKED_GATHER</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Pack the compact state into one FP32 collective. Set to <code>0</code> for typed collectives; IDs above <code>2^24</code> use them automatically.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_CONSUMER_STATE_TRACE_JSONL</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Write dLLM vocabulary-state tensor and TP collective metadata to this JSONL file. Empty disables tracing.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Not set</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_ENABLE_TORCH_INFERENCE_MODE`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Control whether to use torch.inference_mode</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`false`</td>
