@@ -11,7 +11,11 @@ import sys
 from ..executors.flux import FluxExecutor
 from ..executors.minimax_h3 import FastH3Executor, MiniMaxH3Executor, VDNH3Executor
 from ..executors.zimage import ZImageExecutor
-from .preflight import check_h3_request_options, check_sgld_options
+from .preflight import (
+    check_sgld_options,
+    fold_h3_attention_requests,
+    transformer_backend,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +65,23 @@ def _has_vsa_gate(path: str) -> bool:
 
     with safe_open(path, framework="pt") as f:
         return any(".to_gate_compress." in key for key in f.keys())
+
+
+_H3_MODEL_TYPES = ("minimax_h3", "fast_h3", "vdn_h3")
+
+
+def _single_file_server_args(kwargs: dict, pipeline_class_name: str) -> None:
+    """ServerArgs for a ComfyUI single file, whose worker loads only the DiT."""
+    backend = transformer_backend(kwargs)
+    if backend:
+        # Single-file loads skip SGLang's per-component attention scoping, and
+        # the DiT is the only component, so its backend is the global one.
+        kwargs["attention_backend"] = backend
+        kwargs.pop("component_attention_backends", None)
+    if pipeline_class_name == "MiniMaxH3Pipeline":
+        # Arbitrary local file names otherwise miss model-id keyed defaults
+        # such as breakable CUDA graph support.
+        kwargs.setdefault("model_id", "MiniMaxAI/MiniMax-H3")
 
 
 def _looks_like_gguf(path: str) -> bool:
@@ -243,6 +264,11 @@ class SGLDiffusionGenerator:
         # policy otherwise sets dit_cpu_offload=True and every sampler step
         # reloads the DiT from CPU.
         kwargs.setdefault("dit_cpu_offload", False)
+        # Each sampler step is its own request carrying ComfyUI tensors; a
+        # synthetic or request-based warmup has no such inputs to run with.
+        kwargs["warmup_mode"] = "off"
+        if os.path.isfile(model_path):
+            _single_file_server_args(kwargs, pipeline_class_name)
         kwargs = self._server_args_kwargs(kwargs)
         try:
             with _spawn_without_launcher_main():
@@ -495,9 +521,12 @@ class SGLDiffusionGenerator:
             "set_model_type": set_model_type,
             "runtime_model_path": runtime_model_path,
         }
+        if set_model_type in _H3_MODEL_TYPES or (
+            isinstance(self.executor, MiniMaxH3Executor)
+            and self.model_path == detect_path
+        ):
+            fold_h3_attention_requests(sgld_options, plugin_flags["request_options"])
         if self._can_reuse(gather_options):
-            if isinstance(self.executor, MiniMaxH3Executor):
-                check_h3_request_options(plugin_flags["request_options"], sgld_options)
             self.executor.enable_cache_dit = plugin_flags.get("enable_cache_dit")
             self.executor.cache_dit_params = plugin_flags.get("cache_dit_params")
             self.executor.request_options = plugin_flags.get("request_options", {})
@@ -517,8 +546,9 @@ class SGLDiffusionGenerator:
         if set_model_type is not None and set_model_type in self.pipeline_class_dict:
             model_type = set_model_type
 
-        if model_type in ("minimax_h3", "fast_h3", "vdn_h3"):
-            check_h3_request_options(plugin_flags["request_options"], sgld_options)
+        if model_type in _H3_MODEL_TYPES:
+            # gather_options holds this dict, so a reuse check sees the folded backend.
+            fold_h3_attention_requests(sgld_options, plugin_flags["request_options"])
         if model_type == "fast_h3":
             from ..executors.minimax_h3 import load_fasth3_release
 

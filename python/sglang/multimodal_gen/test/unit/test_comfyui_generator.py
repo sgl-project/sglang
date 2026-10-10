@@ -404,33 +404,97 @@ def test_fasth3_runtime_dir_is_checked_before_worker_load(tmp_path) -> None:
             runtime.load_model(model_path="h3.safetensors", sgld_options=options)
 
 
-def test_h3_per_request_attention_options_are_checked_before_worker_load(
+def test_h3_per_request_attention_choice_becomes_the_worker_backend(
     monkeypatch,
 ) -> None:
-    """H3 has no per-request switchable attention, so an override only failed
-    at the first sampling step; skip_softmax_params needs the FA backend."""
+    """The H3 DiT cannot switch attention per request, so an override used to
+    fail at the first sampling step; it now selects the worker's DiT backend,
+    restarting the worker only when that backend changes."""
     import pytest
 
     from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.core import preflight
+    from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.minimax_h3 import (
+        MiniMaxH3Executor,
+    )
 
     monkeypatch.setattr(preflight, "_resolved_backend", lambda backend: backend)
+    started = []
+
+    class Started(Exception):
+        pass
+
+    def start(model_path, pipeline_class_name, sgld_options):
+        started.append(dict(sgld_options))
+        raise Started
+
     runtime = SGLDiffusionGenerator()
     runtime.get_comfyui_model = lambda *a: (SimpleNamespace(), None, "minimax_h3")
-    runtime.init_generator = lambda *a: (_ for _ in ()).throw(
-        AssertionError("worker must not start")
+    runtime.init_generator = start
+    load = lambda options: runtime.load_model(
+        model_path="h3.ckpt", sgld_options=options
     )
     skip = {"skip_softmax_params": {"threshold_scale_factor": 1.0}}
-    for options, message in (
-        ({"request_options": {"attention_backend_override": "fa"}}, "per request"),
-        (
-            {"attention_backend": "torch_sdpa", "request_options": skip},
-            "attention_backend=fa",
-        ),
-    ):
-        with pytest.raises(ValueError, match=message):
-            runtime.load_model(model_path="h3.ckpt", sgld_options=options)
-    with pytest.raises(AssertionError, match="worker must not start"):
-        runtime.load_model(
-            model_path="h3.ckpt",
-            sgld_options={"attention_backend": "fa", "request_options": skip},
-        )
+
+    with pytest.raises(Started):
+        load({"request_options": {"attention_backend_override": "sage_attn"}})
+    assert started[-1]["attention_backend"] == "sage_attn"
+    with pytest.raises(Started):
+        load({"request_options": dict(skip)})
+    assert started[-1]["attention_backend"] == "fa"
+    with pytest.raises(ValueError, match="runs on FlashAttention"):
+        load({"attention_backend": "sage_attn", "request_options": dict(skip)})
+
+    # A running H3 worker is reused for the same backend and restarted otherwise.
+    runtime.executor = MiniMaxH3Executor.__new__(MiniMaxH3Executor)
+    runtime.generator, runtime._patcher = (
+        object(),
+        SimpleNamespace(clone=lambda: patched),
+    )
+    patched = SimpleNamespace(model_options={})
+    runtime._is_live = lambda: True
+    runtime.close_generator = lambda: None
+    runtime.model_path = "h3.ckpt"
+    runtime.last_options = {
+        "model_path": "h3.ckpt",
+        "model_options": {},
+        "sgld_options": {"attention_backend": "fa"},
+        "set_model_type": None,
+        "runtime_model_path": None,
+    }
+    assert load({"request_options": {"attention_backend_override": "fa"}}) is patched
+    with pytest.raises(Started):
+        load({"request_options": {"attention_backend_override": "torch_sdpa"}})
+    assert started[-1]["attention_backend"] == "torch_sdpa"
+
+
+def test_single_file_worker_gets_the_dit_backend_and_h3_model_id(monkeypatch) -> None:
+    """Single-file loads skip SGLang's per-component attention scoping and
+    match no model-id keyed defaults; integrated workers cannot warm up."""
+    from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.core import generator
+
+    seen = {}
+    monkeypatch.setattr(
+        generator.DiffGenerator,
+        "from_pretrained",
+        lambda **kwargs: seen.update(kwargs) or object(),
+    )
+    monkeypatch.setattr(
+        generator.os.path, "isfile", lambda path: path.endswith(".safetensors")
+    )
+    SGLDiffusionGenerator().init_generator(
+        "h3.safetensors",
+        "MiniMaxH3Pipeline",
+        {"component_attention_backends": {"transformer": "video_sparse_attn_h3"}},
+    )
+    assert seen["attention_backend"] == "video_sparse_attn_h3"
+    assert "component_attention_backends" not in seen
+    assert seen["model_id"] == "MiniMaxAI/MiniMax-H3"
+    assert seen["warmup_mode"] == "off"
+    seen.clear()
+    SGLDiffusionGenerator().init_generator(
+        "/models/fasth3",
+        "FastH3Pipeline",
+        {"component_attention_backends": {"transformer": "fa"}},
+    )
+    assert seen["component_attention_backends"] == {"transformer": "fa"}
+    assert "model_id" not in seen
