@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
 from sglang.kernels.kernel_api_logging import wrap_method_with_debug_kernel_once
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.distributed import (
     divide,
     get_tp_group,
@@ -42,6 +43,11 @@ from sglang.multimodal_gen.runtime.utils.weight_attrs import set_weight_attrs
 logger = init_logger(__name__)
 
 IS_AMP_SUPPORTED = current_platform.is_amp_supported()
+_USE_AITER_TGEMM = current_platform.is_rocm() and envs.SGLANG_USE_ROCM_AITER_TGEMM
+if _USE_AITER_TGEMM:
+    from aiter.tuned_gemm import tgemm
+# aiter gemm_a16w16 kernels index operands with int32 offsets and fault beyond this.
+_AITER_TGEMM_MAX_NUMEL = 2**31
 WEIGHT_LOADER_V2_SUPPORTED = [
     "CompressedTensorsLinearMethod",
     "AWQMarlinLinearMethod",
@@ -164,6 +170,16 @@ def apply_unquantized_linear(
             weight.to(torch.float32),
             None if bias is None else bias.to(torch.float32),
         ).to(x.dtype)
+
+    if (
+        _USE_AITER_TGEMM
+        and x.dtype in (torch.bfloat16, torch.float16)
+        and weight.dtype == x.dtype
+        and (bias is None or bias.dtype == x.dtype)
+        and x.numel() < _AITER_TGEMM_MAX_NUMEL
+        and x.numel() // x.shape[-1] * weight.shape[0] < _AITER_TGEMM_MAX_NUMEL
+    ):
+        return tgemm.mm(x, weight, bias)
 
     return (
         F.linear(x, weight, bias)
