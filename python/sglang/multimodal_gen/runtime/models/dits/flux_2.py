@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import os
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -77,8 +77,8 @@ from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
     apply_nvfp4_gemm_prequantized,
     apply_nvfp4_gemm_swiglu_quant,
 )
-from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
-    NDRotaryEmbedding,
+from sglang.multimodal_gen.runtime.layers.rotary_embedding.mrope import (
+    FluxPosEmbed as Flux2PosEmbed,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
@@ -573,7 +573,6 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
         self.dropout = dropout
 
         self.added_kv_proj_dim = added_kv_proj_dim
-        self.added_proj_bias = added_proj_bias
 
         # Packed NVFP4 checkpoints already serialize QKV together. ModelOpt
         # FP8 exports separate Diffusers tensors, but the loader can merge
@@ -1449,33 +1448,6 @@ class Flux2Modulation(nn.Module):
         return tuple(
             mod_params[3 * i : 3 * (i + 1)] for i in range(self.mod_param_sets)
         )
-
-
-class Flux2PosEmbed(nn.Module):
-    def __init__(self, theta: int, axes_dim: List[int]):
-        super().__init__()
-        self.rope = NDRotaryEmbedding(
-            rope_dim_list=axes_dim,
-            rope_theta=theta,
-            use_real=False,
-            repeat_interleave_real=False,
-            dtype=(
-                torch.float64
-                if (
-                    current_platform.is_float64_supported()
-                    if hasattr(current_platform, "is_float64_supported")
-                    else True
-                )
-                else torch.float32
-            ),
-        )
-
-    def forward(self, ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        pos = ids.float()
-        # TODO: potential error: flux use n_axes = ids.shape[-1]
-        # see: https://github.com/huggingface/diffusers/blob/17c0e79dbdf53fb6705e9c09cc1a854b84c39249/src/diffusers/models/transformers/transformer_flux.py#L509
-        freqs_cos, freqs_sin = self.rope.forward_uncached(pos=pos)
-        return freqs_cos.contiguous().float(), freqs_sin.contiguous().float()
 
 
 class Flux2Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):

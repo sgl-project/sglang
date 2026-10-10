@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 mod forward;
+mod openai;
 mod preparation;
 mod reorg;
 
@@ -25,7 +26,8 @@ use axum::http::{HeaderMap, HeaderName, Response};
 use bytes::Bytes;
 use forward::{forward_request, RequestDurationGuard, SelectedWorkers};
 use preparation::{
-    parse_embedding_request, parse_routing_fields, PreparedRequest, CLASSIFY_PATH, EMBEDDINGS_PATH,
+    parse_embedding_request, parse_routing_fields, PreparedRequest, CHAT_PATH, CLASSIFY_PATH,
+    COMPLETIONS_PATH, EMBEDDINGS_PATH,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -44,6 +46,24 @@ pub async fn chat_completions(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response<Body>, ApiError> {
+    openai_route(&ctx, CHAT_PATH, headers, body).await
+}
+
+/// OpenAI completions; see [`PreparedRequest::openai`].
+pub async fn completions(
+    State(ctx): State<Arc<AppContext>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response<Body>, ApiError> {
+    openai_route(&ctx, COMPLETIONS_PATH, headers, body).await
+}
+
+async fn openai_route(
+    ctx: &AppContext,
+    path: &'static str,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response<Body>, ApiError> {
     let start = Instant::now();
     let mut fields = parse_routing_fields(&body)?;
     let model = ModelId(
@@ -52,15 +72,10 @@ pub async fn chat_completions(
             .take()
             .ok_or_else(|| ApiError::BadRequest("missing `model` field".into()))?,
     );
-    let routing = ModelRouting::lookup(&ctx, &model)?;
-    let request = PreparedRequest::chat(
-        &ctx,
-        model,
-        fields,
-        body,
-        routing.needs_request_tokens(&ctx),
-    )?;
-    routing.dispatch(&ctx, request, headers, start).await
+    let routing = ModelRouting::lookup(ctx, &model)?;
+    let tokens = routing.needs_request_tokens(ctx);
+    let request = PreparedRequest::openai(ctx, path, model, fields, &headers, body, tokens)?;
+    routing.dispatch(ctx, request, headers, start).await
 }
 
 /// SGLang's native `/generate`: same request and response schema as the engine.
