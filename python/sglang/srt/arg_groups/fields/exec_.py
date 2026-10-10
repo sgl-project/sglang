@@ -893,6 +893,23 @@ class ExecMoe(msgspec.Struct):
     ] = False
 
     # -------------------------------------------------------------------------
+    # Paged experts
+    # -------------------------------------------------------------------------
+    enable_paged_experts: A[
+        bool,
+        "Keep only --paged-experts-num-resident routed experts per MoE layer on the GPU and page "
+        "the rest from pinned host memory on demand. Unquantized, block-FP8 or GPTQ experts, "
+        "single GPU. Decode CUDA graphs (full backend) are captured up to K // top_k requests; "
+        "prefill graphs must be breakable or disabled.",
+    ] = False
+    paged_experts_num_resident: A[
+        Optional[int],
+        "Number of routed experts per MoE layer kept resident on the GPU with --enable-paged-experts. "
+        "Unset: the most that fit --mem-fraction-static next to the other weights and a KV "
+        "reserve for --max-running-requests at full context.",
+    ] = None
+
+    # -------------------------------------------------------------------------
     # Ktransformers/AMX expert parallelism
     # -------------------------------------------------------------------------
     kt_weight_path: A[

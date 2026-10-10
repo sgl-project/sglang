@@ -231,6 +231,7 @@ def outplace_fused_experts(
     gate_up_interleaved: bool = True,
     a1_q: Optional[torch.Tensor] = None,
     fuse_swiglu_interleaved: bool = False,
+    no_combine_keep_router_weight: bool = False,
 ) -> torch.Tensor:
     return fused_experts_impl(
         hidden_states,
@@ -265,6 +266,7 @@ def outplace_fused_experts(
         gate_up_interleaved=gate_up_interleaved,
         a1_q=a1_q,
         fuse_swiglu_interleaved=fuse_swiglu_interleaved,
+        no_combine_keep_router_weight=no_combine_keep_router_weight,
     )
 
 
@@ -364,6 +366,7 @@ def fused_experts(
             gate_up_interleaved=moe_runner_config.gate_up_interleaved,
             a1_q=a1_q,
             fuse_swiglu_interleaved=fuse_swiglu_interleaved,
+            no_combine_keep_router_weight=moe_runner_config.no_combine_keep_router_weight,
         )
 
 
@@ -525,6 +528,7 @@ def _fused_moe_kernel_sequence(
     gate_up_interleaved: bool = True,
     a1_q: Optional[torch.Tensor] = None,
     fuse_swiglu_interleaved: bool = False,
+    no_combine_keep_router_weight: bool = False,
 ) -> torch.Tensor:
     """Run the MoE kernel/activation/kernel/combine sequence in a single shot.
 
@@ -866,7 +870,8 @@ def _fused_moe_kernel_sequence(
         sorted_token_ids,
         expert_ids,
         num_tokens_post_padded,
-        not apply_router_weight_on_input and not no_combine,
+        not apply_router_weight_on_input
+        and (not no_combine or no_combine_keep_router_weight),
         1,
         down_config or config,
         compute_type=compute_type,
@@ -889,6 +894,30 @@ def _fused_moe_kernel_sequence(
         )
 
     del intermediate_cache2
+
+    return moe_combine_topk(
+        intermediate_cache3=intermediate_cache3,
+        out_hidden_states=out_hidden_states,
+        routed_scaling_factor=routed_scaling_factor,
+        no_combine=no_combine,
+        use_fused_moe_sum_all_reduce=use_fused_moe_sum_all_reduce,
+        out_slice=out_slice,
+        _use_intermediate=_use_intermediate,
+    )
+
+
+def moe_combine_topk(
+    intermediate_cache3: torch.Tensor,
+    out_hidden_states: torch.Tensor,
+    routed_scaling_factor: Optional[float],
+    no_combine: bool = False,
+    use_fused_moe_sum_all_reduce: bool = False,
+    out_slice: Optional[torch.Tensor] = None,
+    _use_intermediate: bool = True,
+) -> torch.Tensor:
+    """Sum the routed-weighted ``[num_tokens, topk, hidden]`` expert outputs into
+    ``out_hidden_states`` (the tail of ``_fused_moe_kernel_sequence``)."""
+    num_tokens, topk = intermediate_cache3.shape[:2]
 
     if routed_scaling_factor is None:
         routed_scaling_factor = 1.0
@@ -1012,6 +1041,7 @@ def fused_experts_impl(
     gate_up_interleaved: bool = True,
     a1_q: Optional[torch.Tensor] = None,
     fuse_swiglu_interleaved: bool = False,
+    no_combine_keep_router_weight: bool = False,
 ):
     padded_size = padding_size
     if not (use_fp8_w8a8 or use_int8_w8a8) or block_shape is not None or _use_aiter:
@@ -1092,6 +1122,7 @@ def fused_experts_impl(
         gate_up_interleaved=gate_up_interleaved,
         a1_q=a1_q,
         fuse_swiglu_interleaved=fuse_swiglu_interleaved,
+        no_combine_keep_router_weight=no_combine_keep_router_weight,
     )
 
 

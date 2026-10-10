@@ -472,6 +472,9 @@ class FusedMoE(torch.nn.Module):
         )
 
         self.quant_method = quant_method
+        # The method whose weight layout the loader follows when quant_method wraps another
+        # one (None: quant_method itself).
+        self.weight_load_method = None
         server_args = get_server_args()
         kt_config = create_kt_config_from_server_args(server_args, layer_id)
         if kt_config is not None:
@@ -490,6 +493,12 @@ class FusedMoE(torch.nn.Module):
                     self.use_triton_kernels,
                     self.use_flashinfer_trtllm_moe,
                     self.use_deep_gemm,
+                )
+            if get_exec().moe.enable_paged_experts:
+                from sglang.srt.layers.moe.paged_experts import make_for_layer
+
+                self.quant_method = make_for_layer(
+                    layer=self, base_method=self.quant_method
                 )
         _validate_hpc_ops_quant_method(self.quant_method)
         _validate_deepep_v2_quant_method(self.quant_method)
@@ -756,7 +765,11 @@ class FusedMoE(torch.nn.Module):
         # w1, gate_proj: Load into first logical weight of w13.
         # w3, up_proj: Load into second logical weight of w13.
         # trtllm cutlass kernel assumes differently
-        switch_w13 = getattr(self.quant_method, "load_up_proj_weight_first", False)
+        switch_w13 = getattr(
+            self.weight_load_method or self.quant_method,
+            "load_up_proj_weight_first",
+            False,
+        )
         if (
             (switch_w13 and shard_id == "w1") or (not switch_w13 and shard_id == "w3")
         ) and self.moe_runner_config.is_gated:
@@ -1179,7 +1192,7 @@ class FusedMoE(torch.nn.Module):
         # compressed-tensors checkpoints with packed weights are stored flipped
         # TODO (mgoin): check self.quant_method.quant_config.quant_format
         # against known CompressionFormat enum values that have this quality
-        method = self.quant_method
+        method = self.weight_load_method or self.quant_method
         if self.scheme is not None:
             method = self.scheme
         if method.__class__.__name__ == "KTEPWrapperMethod":
@@ -1414,7 +1427,7 @@ class FusedMoE(torch.nn.Module):
     ) -> None:
         # Mirror _weight_loader_impl: the trtllm bf16 prep reshapes expert weights
         # into block layout; hot weight updates must restore canonical shapes first.
-        method = self.quant_method
+        method = self.weight_load_method or self.quant_method
         if isinstance(method, KTEPWrapperMethod):
             method = method.gpu_method
         if isinstance(method, UnquantizedFusedMoEMethod):
@@ -1443,7 +1456,7 @@ class FusedMoE(torch.nn.Module):
         # compressed-tensors checkpoints with packed weights are stored flipped
         # TODO: check self.quant_method.quant_config.quant_format
         # against known CompressionFormat enum values that have this quality
-        method = self.quant_method
+        method = self.weight_load_method or self.quant_method
         if self.scheme is not None:
             method = self.scheme
         if isinstance(method, Fp8MoEMethod) and (
