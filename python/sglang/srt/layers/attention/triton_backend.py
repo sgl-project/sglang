@@ -238,19 +238,8 @@ class TritonAttnBackend(AttentionBackend):
             self.use_mla,
             self.use_verify_splitkv,
         )
-        # TODO: this logic should be fixed in non-hip platform
-        self.is_hip_dspark_draft = (
-            _is_hip
-            and model_runner.is_draft_worker
-            and model_runner.spec_algorithm.is_dspark()
-        )
-        if self.is_hip_dspark_draft:
-            # Drafts never join the dcp group so we ignore it
-            self.dcp_size = 1
-            self.dcp_rank = 0
-        else:
-            self.dcp_size = get_parallel().attn_dcp_size
-            self.dcp_rank = get_parallel().attn_dcp_rank
+        self.dcp_size = model_runner.kv_dcp.size
+        self.dcp_rank = model_runner.kv_dcp.rank
         self.num_head = (
             model_runner.model_config.get_max_num_attention_heads()
             // get_parallel().attn_tp_size

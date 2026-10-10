@@ -39,6 +39,23 @@ def is_post_capture_kv_active(
     )
 
 
+class KvDcp(msgspec.Struct, frozen=True, kw_only=True):
+    """The DCP width and rank one runner's KV cache is sequence-sharded with."""
+
+    size: int
+    rank: int
+
+
+def resolve_kv_dcp(*, is_draft_worker: bool) -> KvDcp:
+    """Target rows follow the attention DCP group; draft rows follow
+    `--speculative-dcp-size`. It belongs to the runner, not the process:
+    target and draft coexist with different widths."""
+    parallel = get_parallel()
+    if is_draft_worker:
+        return KvDcp(size=parallel.draft_dcp_size, rank=parallel.draft_dcp_rank)
+    return KvDcp(size=parallel.attn_dcp_size, rank=parallel.attn_dcp_rank)
+
+
 class PostCaptureKVResize(msgspec.Struct, frozen=True, kw_only=True):
     max_total_num_tokens: int
     full_max_total_num_tokens: Optional[int]

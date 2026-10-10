@@ -129,6 +129,7 @@ from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
 from sglang.srt.model_executor.model_runner_components.kv_pool_runtime import (
     compute_post_capture_kv_resize,
     is_post_capture_kv_active,
+    resolve_kv_dcp,
 )
 from sglang.srt.model_executor.model_runner_components.layer_setup import (
     AttentionAndMoeLayers,
@@ -357,6 +358,7 @@ class ModelRunner:
             draft_attention_backend=draft_attention_backend,
             is_draft_worker=is_draft_worker,
         )
+        self.kv_dcp = resolve_kv_dcp(is_draft_worker=is_draft_worker)
         # This runner's own load format, resolved before anything keys off it:
         # the remote-instance transfer engine is initialized at the top of
         # initialize(), long before the weights are loaded.
