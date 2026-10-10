@@ -1389,9 +1389,20 @@ class OpenAIServingResponses(OpenAIServingChat):
                 and merged
                 and isinstance(merged[-1], dict)
                 and merged[-1].get("role") == "assistant"
-                and merged[-1].get("phase") == msg.get("phase")
+                # ``phase`` only exists on message items; reasoning and
+                # function_call items carry none, so a missing phase must not
+                # split [reasoning, commentary message, function_call] apart.
+                and (
+                    merged[-1].get("phase") is None
+                    or msg.get("phase") is None
+                    or merged[-1].get("phase") == msg.get("phase")
+                )
             ):
                 prev = merged[-1] = dict(merged[-1])
+                # Adopt the phase once one item in the run knows it, so a
+                # following final_answer still stays separate (#38690).
+                if prev.get("phase") is None and msg.get("phase") is not None:
+                    prev["phase"] = msg["phase"]
                 # Lift mixed str/list content to list parts so non-text parts
                 # (e.g. image_url) survive when the two sides differ in shape.
                 new_content = msg.get("content")
