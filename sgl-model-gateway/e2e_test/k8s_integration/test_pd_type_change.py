@@ -8,8 +8,16 @@ with the same IP but a new UID. The gateway must:
 2. Register the new decode worker
 3. End up with the correct worker_type=decode, not the old prefill
 
-This covers the UID-based eviction path in handle_pod_event (same name,
-different UID) and the reconciliation diff (stale uid-A, missing uid-B).
+Scope, so this suite is not read as covering more than it does:
+`test_delete_prefill_recreate_as_decode` waits for the worker count to reach
+zero before recreating the pod, which manufactures a window where the old
+identity is absent. It therefore does NOT cover the overlap case — an old and a
+new pod of the same name being tracked at the same time — which is what the
+UID-keyed reconcile diff exists for. That case is covered by the unit tests in
+`src/service_discovery.rs`
+(`test_reconcile_removes_pod_replaced_under_the_same_name` and
+`test_reconcile_hands_over_a_shared_url_without_deregistering_it`), where a
+same-name replacement can be presented to the reconcile directly.
 
 Run with:
     cd e2e_test/k8s_integration
@@ -234,7 +242,10 @@ class TestPDRolloutTypeChange:
                 "--grace-period=0",
             )
 
-            # Step 3: Wait for the gateway to remove the stale prefill worker
+            # Step 3: Wait for the gateway to remove the stale prefill worker.
+            # NOTE: this wait is what keeps the test off the overlap path — see
+            # the module docstring. Do not read a pass here as evidence that a
+            # same-name replacement evicts its predecessor.
             _poll_until(
                 lambda: _get_worker_count(pd_gateway) == 0,
                 "prefill worker removed",

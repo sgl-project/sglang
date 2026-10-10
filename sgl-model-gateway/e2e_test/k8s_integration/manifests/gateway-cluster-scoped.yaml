@@ -32,6 +32,8 @@ spec:
             - "--selector"
             - "app=fake-worker"
             - "cross-ns-test=true"
+            - "--service-discovery-resync-secs"
+            - "10"
             - "--service-discovery-port"
             - "8000"
             - "--port"

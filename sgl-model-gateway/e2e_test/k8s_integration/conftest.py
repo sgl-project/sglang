@@ -29,9 +29,12 @@ MANIFESTS_DIR = Path(__file__).parent / "manifests"
 FAKE_WORKER_SCRIPT = Path(__file__).parent / "fake_worker.py"
 KUBECTL_CONTEXT = "kind-smg-test"
 
-# Reconciliation interval matches ServiceDiscoveryConfig.check_interval in
-# sgl-model-gateway/src/service_discovery.rs (currently 60s).
-RECONCILIATION_INTERVAL_SECS = 60
+# Worker convergence is driven by the gateway's periodic full-LIST reconcile,
+# not by ServiceDiscoveryConfig.check_interval (which now only paces router-node
+# discovery). The gateway manifests pin the reconcile explicitly with
+# --service-discovery-resync-secs, so keep this in sync with them rather than
+# with the Rust default.
+RECONCILIATION_INTERVAL_SECS = 10
 RECONCILIATION_WAIT_SECS = RECONCILIATION_INTERVAL_SECS + 30
 
 # Errors safe to retry while polling: connection-level failures only.
