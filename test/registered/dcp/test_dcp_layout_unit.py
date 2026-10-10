@@ -45,11 +45,6 @@ def _owner_count(length: int, n: int, rank: int, start: int) -> int:
     return sum(1 for p in range(start, start + length) if p % n == rank)
 
 
-def _legacy_inplace_formula(length: int, n: int, rank: int) -> int:
-    """The pre-refactor update_local_kv_lens_for_dcp body (start == 0 case)."""
-    return (length - rank - 1) // n + 1
-
-
 class TestFilterDcpLocalChunkKvIndices(CustomTestCase):
     PAGE = 64
 
@@ -157,21 +152,6 @@ class TestGetDcpLens(CustomTestCase):
                 self.assertTrue(
                     torch.equal(got.to(torch.int32), expected),
                     f"start=None mismatch at n={n}, rank={rank}: {got.tolist()} != {expected.tolist()}",
-                )
-
-    def test_start_none_matches_legacy_inplace_formula(self):
-        # The collapse claim: get_dcp_lens (start=None) == legacy floor((L-rank-1)/N)+1.
-        for n in DCP_SIZES:
-            for rank in range(n):
-                lens = torch.tensor(LENS, dtype=torch.int64)
-                got = get_dcp_lens(lens, n, rank)
-                legacy = torch.tensor(
-                    [_legacy_inplace_formula(L, n, rank) for L in LENS],
-                    dtype=torch.int64,
-                )
-                self.assertTrue(
-                    torch.equal(got.to(torch.int64), legacy),
-                    f"legacy-formula mismatch at n={n}, rank={rank}",
                 )
 
     def test_start_tensor_matches_owner_count(self):

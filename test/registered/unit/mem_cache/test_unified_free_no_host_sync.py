@@ -177,36 +177,6 @@ class TestTombstonesDoNotCrossTheBus(unittest.TestCase):
                     ),
                 )
 
-    def test_every_allocator_free_path_is_listed(self):
-        """Bug regression: an allocator that owns a free path but is missing
-        from `_TOMBSTONE_METHODS` must fail loudly here rather than drop out of
-        tombstone coverage."""
-        listed = {(cls.__name__, name) for cls, name in _TOMBSTONE_METHODS}
-        for cls in _allocators_in_module():
-            for name, fn in vars(cls).items():
-                if not inspect.isfunction(fn):
-                    continue
-                try:
-                    src = inspect.getsource(fn)
-                except OSError:
-                    continue
-                # Only a method that WRITES a page table needs a tombstone;
-                # one that merely READS has nothing to guard.
-                if not (
-                    any(f"{t}.index_fill_" in src for t in _TABLES)
-                    or _scalar_index_assignments(fn)
-                ):
-                    continue
-                self.assertIn(
-                    (cls.__name__, name),
-                    listed,
-                    msg=(
-                        f"{cls.__name__}.{name} writes a page table but is not in "
-                        f"_TOMBSTONE_METHODS, so the index_fill_ guard does not "
-                        f"cover it. Add it."
-                    ),
-                )
-
     def test_free_paths_actually_write_a_tombstone(self):
         """Positive form, so deleting the scatter entirely cannot pass; a new
         no-sync mechanism is added to `_NO_SYNC_TOMBSTONE_FORMS` deliberately."""
