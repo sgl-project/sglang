@@ -215,7 +215,9 @@ class SGLDLoraLoader:
 
         # call the SGLang Diffusion API
         model.model.diffusion_model.set_lora(**lora_input)
-        return (model,)
+        # Return the clone so a chained LoRA node sees this LoRA in its patches;
+        # set_lora replaces the active set, so a dropped patch is a dropped LoRA.
+        return (bi,)
 
 
 class SGLDUNETLoader:
