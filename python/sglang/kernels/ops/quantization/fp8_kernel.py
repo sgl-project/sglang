@@ -714,8 +714,8 @@ def sglang_per_token_group_quant_fp8_row_padded(
     if m > 0:
         _run_per_token_group_quant_8bit_kernel(
             x,
-            x_q[:m],
-            x_s[:m],
+            x_q[:m] if _is_musa else x_q,
+            x_s[:m] if _is_musa else x_s,
             group_size,
             eps,
             fp8_min,
@@ -724,9 +724,8 @@ def sglang_per_token_group_quant_fp8_row_padded(
             fuse_silu_and_mul=False,
             masked_m=None,
         )
-    if m_pad != m:
-        # Tail rows feed the cutlass GEMM's padded region; zero them so the padded
-        # GEMM stays bit-exact with the legacy pad_tensor path (torch.empty is garbage).
+    if _is_musa and m_pad != m:
+        # CUDA fills the tail in the quant kernel; MUSA still needs explicit fills.
         x_q[m:].zero_()
         x_s[m:].zero_()
     return x_q, x_s
