@@ -3246,6 +3246,9 @@ class Scheduler(
 
     def _prefetch_after_device_hit_loss(self, req: Req) -> bool:
         """Re-query an L3 range newly exposed by queue-time device eviction."""
+        retries = self.tree_cache.storage_prefetch_retries
+        if retries is not None:
+            retries.update_device_coverage(req)
         previous_match_len = req.storage_prefetch_last_match_len
         buffer_pipeline = self.tree_cache.buffer_pipeline
         if not previous_match_len or (

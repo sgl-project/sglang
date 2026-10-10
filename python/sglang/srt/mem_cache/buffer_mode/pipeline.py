@@ -1250,7 +1250,12 @@ class BufferModePipeline:
             cache_salt=span_key.cache_salt,
         )
         match = self._cache.match_prefix(MatchPrefixParams(key=key))
-        return match.device_prefix_len >= len(key)
+        covered = match.device_prefix_len >= len(key)
+        if covered:
+            self._cache.storage_prefetch_retries.record_device_coverage(
+                request.rid, len(key)
+            )
+        return covered
 
     def set_prefix_ctx(
         self,
@@ -1331,6 +1336,11 @@ class BufferModePipeline:
         return True
 
     def _resolve_device_covered(self, req: Req) -> None:
+        # The request may wait again after releasing staging; detect eviction
+        # of this joint device match on its next admission pass.
+        req.storage_prefetch_last_match_len = max(
+            req.storage_prefetch_last_match_len or 0, req.prefix_len
+        )
         req.host_hit_length = 0
         req.swa_host_hit_length = 0
         self._clear_storage_hit(req)
