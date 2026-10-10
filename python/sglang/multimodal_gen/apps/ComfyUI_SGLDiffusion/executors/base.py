@@ -49,6 +49,24 @@ def _reject_model_patches(transformer_options) -> None:
 CONTENT_CONDITIONING = ("control", "ref_latents")
 
 
+# apply_model kwargs that carry image content (ControlNet residuals, reference latents).
+CONTENT_CONDITIONING = ("control", "ref_latents")
+
+
+def _reject_unapplied_conditioning(adapter, kwargs) -> None:
+    dropped = [
+        name
+        for name in CONTENT_CONDITIONING
+        if name not in adapter.applied_conditioning and kwargs.get(name)
+    ]
+    if dropped:
+        raise ValueError(
+            f"SGLD integrated mode does not apply {', '.join(dropped)} for this model "
+            "(ControlNet / reference-latent nodes); remove those nodes or use the "
+            "native ComfyUI loader"
+        )
+
+
 class SGLDiffusionExecutor(torch.nn.Module):
     """Shared ComfyUI DiT-forward executor. Per-model logic lives on the adapter."""
 
@@ -196,5 +214,6 @@ class SGLDiffusionExecutor(torch.nn.Module):
 
     def forward(self, x, timestep, context, **kwargs):
         _reject_model_patches(kwargs.get("transformer_options"))
+        _reject_unapplied_conditioning(self.adapter, kwargs)
         packed = self.adapter.pack(x, timestep, context, **kwargs)
         return self._execute_packed(packed, x, timestep)

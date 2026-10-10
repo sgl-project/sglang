@@ -126,3 +126,19 @@ def test_comfy_model_patches_are_rejected_not_dropped(options) -> None:
         _flux_step(ex, transformer_options=options)
     _flux_step(ex, transformer_options={"patches": {}, "patches_replace": {"dit": {}}})
     assert len(ex.sent) == 1
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"control": {"output": [torch.ones(1)]}},
+        {"ref_latents": [torch.ones(1, 16, 8, 8)]},
+    ],
+)
+def test_conditioning_the_worker_cannot_apply_is_rejected(kwargs) -> None:
+    """ControlNet residuals and reference latents reach apply_model as kwargs; an
+    adapter that does not forward them must fail instead of ignoring them."""
+    ex = _RecordingExecutor(FluxAdapter())
+    with pytest.raises(ValueError, match=next(iter(kwargs))):
+        _flux_step(ex, **kwargs)
+    assert ex.sent == []
