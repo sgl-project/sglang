@@ -6,6 +6,7 @@ token, so the over-drafted suffix is never committed to KV nor emitted.
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -71,17 +72,17 @@ def _make_processor() -> SchedulerBatchResultProcessor:
         enable_overlap=False,
         enable_overlap_mlx=False,
         model_config=SimpleNamespace(think_end_ids=None),
-        token_to_kv_pool_allocator=None,
+        token_to_kv_pool_allocator=Mock(),
         tree_cache=None,
         hisparse_coordinator=None,
         req_to_token_pool=None,
         decode_offload_manager=None,
         metrics_collector=None,
-        metrics_reporter=SimpleNamespace(),
+        metrics_reporter=Mock(num_generated_tokens=0, forward_ct_decode=0),
         draft_worker=None,
         model_worker=SimpleNamespace(on_verify_complete_cpu=lambda *a, **k: None),
         logprob_result_processor=None,
-        output_streamer=SimpleNamespace(),
+        output_streamer=Mock(),
         beam_coordinator=SimpleNamespace(),
         abort_request=lambda *a, **k: None,
     )
@@ -178,6 +179,66 @@ class TestSpecV2GrammarTruncation(CustomTestCase):
 
 
 class TestReasoningTokenAccounting(CustomTestCase):
+    def _decode(self, processor, req, tokens):
+        # Exercise the real speculative result normalization, finish handling,
+        # and reasoning matcher; only cache release/metrics/transport are stubbed.
+        batch = _FakeBatch([req])
+        batch.return_logprob = False
+        batch.batch_size = lambda: 1
+        result = _make_result(len(tokens), [len(tokens)], tokens)
+        with (
+            patch.object(
+                SchedulerBatchResultProcessor, "_handle_finish_state_updated_req"
+            ),
+            patch(
+                "sglang.srt.managers.scheduler_components."
+                "batch_result_processor.get_observability",
+                return_value=SimpleNamespace(enable_metrics=False),
+            ),
+        ):
+            processor.process_batch_result_decode(batch, result)
+
+    def test_speculative_suffix_past_finish_is_not_reasoning(self):
+        """An accepted suffix beyond the output cap/EOS must not affect usage.
+
+        The old decode path counted the full verify run before applying its
+        stop boundary, reporting more reasoning tokens than completion tokens
+        and consuming a reasoning terminator that was never emitted.
+        """
+        for stop_at_eos in (False, True):
+            with self.subTest(stop_at_eos=stop_at_eos):
+                req = _make_req(terminate_after=99)
+                req.grammar = None
+                req.require_reasoning = True
+                req.sampling_params.max_new_tokens = 8 if stop_at_eos else 4
+                req.eos_token_ids = {2} if stop_at_eos else set()
+                processor = _make_processor()
+                processor.model_config.think_end_ids = [7, 8]
+
+                self._decode(processor, req, [10, 11])
+                self.assertFalse(req.finished())
+                self._decode(processor, req, [12, 2, 7, 8])
+
+                self.assertEqual(list(req.output_ids_through_stop), [10, 11, 12, 2])
+                self.assertEqual(req.reasoning_tokens, 4)
+                self.assertFalse(req._is_reasoning_over)
+                self.assertEqual(req._think_end_match_len, 0)
+
+    def test_reasoning_end_before_finish_keeps_answer_out_of_reasoning(self):
+        req = _make_req(terminate_after=99)
+        req.grammar = None
+        req.require_reasoning = True
+        req.sampling_params.max_new_tokens = 4
+        processor = _make_processor()
+        processor.model_config.think_end_ids = [7, 8]
+
+        self._decode(processor, req, [10, 7])
+        self._decode(processor, req, [8, 11, 12, 13])
+
+        self.assertEqual(list(req.output_ids_through_stop), [10, 7, 8, 11])
+        self.assertEqual(req.reasoning_tokens, 3)
+        self.assertTrue(req._is_reasoning_over)
+
     def test_multi_token_end_can_span_decode_steps(self):
         req = _make_req(terminate_after=99)
         req.require_reasoning = True

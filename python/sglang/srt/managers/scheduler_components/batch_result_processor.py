@@ -1017,12 +1017,22 @@ class SchedulerBatchResultProcessor:
             else:
                 req.output_ids.extend(next_token_id)
                 new_accept_len = len(next_token_id)
-                self._maybe_update_reasoning_tokens(req, next_token_id)
             req.update_finish_state(new_accept_len)
 
             if sampling_mask_finish_reason is not None:
                 self._handle_sampling_mask_abort(req)
                 continue
+
+            # A speculative block can cross EOS or the output budget. Count
+            # only its retained prefix, after the finish boundary is known;
+            # even the reasoning-end marker may lie in the discarded suffix.
+            reasoning_token_ids = next_token_id
+            if req.finished_len is not None:
+                output_start = len(req.output_ids) - new_accept_len
+                reasoning_token_ids = next_token_id[
+                    : max(0, req.finished_len - output_start)
+                ]
+            self._maybe_update_reasoning_tokens(req, reasoning_token_ids)
 
             self._handle_finish_state_updated_req(req, batch, result, i, logits_output)
 
