@@ -14,6 +14,7 @@ import msgspec.structs
 
 import sglang.srt.server_args as server_args_module
 from sglang.srt.arg_groups import (
+    memory_hook,
     parallel_hook,
     pd_disaggregation_hook,
     serving_hook,
@@ -75,6 +76,7 @@ from sglang.srt.arg_groups.validation_hook import (
     check_pipeline_parallel_compat,
     check_two_batch_overlap,
 )
+from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.entrypoints.sidecar import (
     SGLANG_GRPC_ENDPOINT_ENV,
     Sidecar,
@@ -2736,6 +2738,96 @@ class TestPipelineParallelPrefillCudaGraphPolicy(CustomTestCase):
                     handle_gpu_memory_settings(args)
                 prefill = resolution_result(args, "cuda_graph_config").prefill
                 self.assertEqual((prefill.max_bs, prefill.bs[-1]), (expected, expected))
+
+
+class TestDerivedMemFractionFloor(CustomTestCase):
+    """The activation/graph reserve is a worst-case estimate; on small devices
+    it can exceed the whole GPU and the derived fraction goes negative
+    (https://github.com/sgl-project/sglang/issues/43160)."""
+
+    def _resolved_fraction(self, gpu_mem_mb=24576, **overrides):
+        args = ServerArgs(
+            model_path="dummy",
+            cuda_graph_config=CudaGraphConfig(
+                decode=PhaseConfig(backend=Backend.DISABLED, max_bs=1, bs=[1]),
+                prefill=PhaseConfig(backend=Backend.DISABLED, max_bs=1, bs=[1]),
+            ),
+            **overrides,
+        )
+        args._cuda_graph_config_locked = {
+            (Phase.DECODE, "backend"),
+            (Phase.PREFILL, "backend"),
+            (Phase.DECODE, "max_bs"),
+            (Phase.PREFILL, "max_bs"),
+            (Phase.DECODE, "bs"),
+            (Phase.PREFILL, "bs"),
+        }
+        args._model_config = SimpleNamespace(
+            is_multimodal=False,
+            attention_arch=AttentionArch.MHA,
+            hf_config=SimpleNamespace(vision_config=None),
+        )
+        with (
+            patch(
+                "sglang.srt.arg_groups.memory_hook.get_device_memory_capacity",
+                return_value=gpu_mem_mb,
+            ),
+            patch(
+                "sglang.srt.arg_groups.memory_hook.use_mla_backend",
+                return_value=False,
+            ),
+        ):
+            handle_gpu_memory_settings(args)
+        return resolution_result(args, "mem_fraction_static")
+
+    def test_disabled_chunked_prefill_no_longer_derives_negative_fraction(self):
+        # -1 scales the reserve with max_prefill_tokens (16384 * 1.5 MiB),
+        # which alone exceeds a 24 GiB device.
+        with self.assertLogs(memory_hook.logger, level="WARNING"):
+            fraction = self._resolved_fraction(chunked_prefill_size=-1)
+        self.assertGreaterEqual(fraction, 0.5)
+
+    def test_oversized_chunk_clamps_to_floor(self):
+        with self.assertLogs(memory_hook.logger, level="WARNING"):
+            fraction = self._resolved_fraction(
+                gpu_mem_mb=16384, chunked_prefill_size=32768
+            )
+        self.assertGreaterEqual(fraction, 0.5)
+
+    def test_healthy_derived_fraction_is_untouched(self):
+        fraction = self._resolved_fraction()
+        self.assertGreater(fraction, 0.5)
+
+    def test_explicit_mem_fraction_static_wins_over_floor(self):
+        # An explicit value must not be rewritten by the clamp.
+        args = ServerArgs(
+            model_path="dummy",
+            chunked_prefill_size=-1,
+            mem_fraction_static=0.9,
+            cuda_graph_config=CudaGraphConfig(
+                decode=PhaseConfig(backend=Backend.DISABLED, max_bs=1, bs=[1]),
+                prefill=PhaseConfig(backend=Backend.DISABLED, max_bs=1, bs=[1]),
+            ),
+        )
+        args._cuda_graph_config_locked = {
+            (Phase.DECODE, "backend"),
+            (Phase.PREFILL, "backend"),
+            (Phase.DECODE, "max_bs"),
+            (Phase.PREFILL, "max_bs"),
+            (Phase.DECODE, "bs"),
+            (Phase.PREFILL, "bs"),
+        }
+        with patch(
+            "sglang.srt.arg_groups.memory_hook.get_device_memory_capacity",
+            return_value=24576,
+        ):
+            handle_gpu_memory_settings(args)
+        self.assertEqual(resolution_result(args, "mem_fraction_static"), 0.9)
+
+    def test_explicit_out_of_range_mem_fraction_is_rejected(self):
+        args = ServerArgs(model_path="dummy", mem_fraction_static=-0.05)
+        with self.assertRaises(ValueError):
+            handle_other_validations(args)
 
 
 class TestCudaGraphDisaggregationRoles(CustomTestCase):
