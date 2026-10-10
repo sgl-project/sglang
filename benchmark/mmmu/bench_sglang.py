@@ -69,11 +69,52 @@ async def async_request_profile(api_url: str) -> RequestFuncOutput:
     return output
 
 
-def _get_prefix_suffix(prompt: str) -> Tuple[str, str]:
-    """Split the prompt into prefix and suffix."""
-    prefix = prompt.split("<")[0]
-    suffix = prompt.split(">", 1)[1]
-    return prefix, suffix
+_IMAGE_TAG_RE = re.compile(r"<image\s+(\d+)>")
+
+
+def _path_to_image_url(path: str) -> str:
+    if path and not path.startswith(("http://", "https://", "data:")):
+        p = Path(path)
+        mime = mimetypes.guess_type(str(p))[0] or "image/png"
+        with open(p, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode()
+        return f"data:{mime};base64,{b64}"
+    return path
+
+
+def _build_multimodal_content(prompt: str, image_paths: List[str]) -> list:
+    """Interleave text and images by replacing each ``<image N>`` placeholder
+    in the prompt with ``image_paths[N-1]``."""
+    parts = []
+    last = 0
+    used = 0
+    for m in _IMAGE_TAG_RE.finditer(prompt):
+        text_chunk = prompt[last : m.start()]
+        if text_chunk:
+            parts.append({"type": "text", "text": text_chunk})
+        idx = int(m.group(1)) - 1
+        if 0 <= idx < len(image_paths):
+            url = _path_to_image_url(image_paths[idx])
+            parts.append({"type": "image_url", "image_url": {"url": url}})
+            used += 1
+        else:
+            # Placeholder with no matching image — keep the literal token
+            # rather than silently dropping it from the question.
+            parts.append({"type": "text", "text": m.group(0)})
+        last = m.end()
+    tail = prompt[last:]
+    if tail:
+        parts.append({"type": "text", "text": tail})
+    # No `<image N>` placeholders in the prompt: anchor the image at the front.
+    if used == 0 and image_paths:
+        parts.insert(
+            0,
+            {
+                "type": "image_url",
+                "image_url": {"url": _path_to_image_url(image_paths[0])},
+            },
+        )
+    return parts
 
 
 async def process_sample(
@@ -86,31 +127,13 @@ async def process_sample(
 ) -> Tuple[dict, str]:
     """Send a single sample to the LLM and return (sample, response)."""
     prompt = sample["final_input_prompt"]
-    prefix, suffix = _get_prefix_suffix(prompt)
-    image = sample["image"]
-    assert image is not None
-    image_path = sample["image_path"]
-    if image_path and not image_path.startswith(("http://", "https://", "data:")):
-        p = Path(image_path)
-        mime = mimetypes.guess_type(str(p))[0] or "image/png"
-        with open(p, "rb") as f:
-            b64 = base64.b64encode(f.read()).decode()
-        image_url = f"data:{mime};base64,{b64}"
-    else:
-        image_url = image_path
+    image_paths = sample.get("image_paths") or [sample["image_path"]]
+    assert image_paths and image_paths[0] is not None
+    content = _build_multimodal_content(prompt, image_paths)
     extra_body = {"lora_path": lora_path} if lora_path else None
     payload = {
         "model": model,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prefix},
-                    {"type": "image_url", "image_url": {"url": image_url}},
-                    {"type": "text", "text": suffix},
-                ],
-            }
-        ],
+        "messages": [{"role": "user", "content": content}],
         "extra_body": extra_body,
         **sampling_params,
     }
