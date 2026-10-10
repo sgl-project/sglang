@@ -561,6 +561,7 @@ class DSparkV4MarkovHead(BaseDSparkMarkovHead):
                 step_dtype=torch.float32,
                 vocab_start=shard.org_vocab_start,
                 gather=self._vocab_gather.gather_stacked,
+                has_sampled_rows=False,
             )
             tokens.append(prev)
         return torch.stack(tokens, dim=1)
