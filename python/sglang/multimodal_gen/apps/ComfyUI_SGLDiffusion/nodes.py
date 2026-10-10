@@ -12,14 +12,24 @@ import torch
 from .core import SGLDiffusionGenerator, SGLDiffusionServerAPI
 
 
-def _enable_gguf_in_diffusion_models() -> None:
-    """Let SGLDUNETLoader list ``.gguf`` DiTs. Quantization lives in the file."""
-    entry = folder_paths.folder_names_and_paths.get("diffusion_models")
-    if entry is not None and len(entry) >= 2 and isinstance(entry[1], set):
-        entry[1].add(".gguf")
+def _list_unet_names_including_gguf() -> list[str]:
+    """SGLDUNETLoader's own file list, with ``.gguf`` DiTs included.
+
+    Previously this mutated ``folder_paths.folder_names_and_paths`` globally,
+    which also made ComfyUI's stock "Load Diffusion Model" node offer GGUF
+    files it cannot load. Scan for ``.gguf`` locally instead so only this
+    node's dropdown is affected.
+    """
+    names = set(folder_paths.get_filename_list("diffusion_models"))
+    for folder in folder_paths.get_folder_paths("diffusion_models"):
+        if not os.path.isdir(folder):
+            continue
+        for entry in os.listdir(folder):
+            if entry.lower().endswith(".gguf"):
+                names.add(entry)
+    return sorted(names)
 
 
-_enable_gguf_in_diffusion_models()
 from .utils import (
     convert_b64_to_tensor_image,
     convert_video_to_comfy_video,
@@ -226,7 +236,7 @@ class SGLDUNETLoader:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "unet_name": (folder_paths.get_filename_list("diffusion_models"),),
+                "unet_name": (_list_unet_names_including_gguf(),),
                 "weight_dtype": (["default", "fp8_e4m3fn", "fp8_e5m2"],),
             },
             "optional": {
