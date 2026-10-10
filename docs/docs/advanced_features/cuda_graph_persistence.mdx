@@ -1,0 +1,61 @@
+---
+title: "CUDA Graph Persistence"
+metatags:
+    description: "Save the captured CUDA graphs once and restore them on later starts with Foundry (--cuda-graph-persistence)."
+---
+
+## Overview
+
+CUDA graph capture (kernel warmup, attention-metadata setup and one capture per batch size) is a large part of a server's cold start. With `--cuda-graph-persistence`, [Foundry](https://github.com/foundry-org/foundry) saves the captured graphs, together with the memory layout they reference, on a first start (`save`) and rebuilds them from that archive on later starts (`load`) instead of capturing.
+
+Foundry runs a CUDA driver hook in the scheduler processes that places every device allocation at the same address on `save` and `load`.
+
+## Installation
+
+Foundry is an optional dependency, published on PyPI as `foundry-core` (import name `foundry`):
+
+```bash
+pip install "sglang[foundry]"
+```
+
+The PyPI wheel is built against the torch SGLang pins. For another torch / CUDA pair, add the pair's package index (`whl/<cuda>/torch<A.B>/`, see the [Foundry README](https://github.com/foundry-org/foundry#installation)):
+
+```bash
+pip install "sglang[foundry]" --extra-index-url https://foundry-org.github.io/foundry/whl/cu130/torch2.13/
+```
+
+## Usage
+
+```bash
+# First start: capture as usual and write the archive (./foundry_archive by default).
+sglang serve --model-path Qwen/Qwen3-1.7B --cuda-graph-persistence save
+
+# Later starts: restore the graphs from the archive.
+sglang serve --model-path Qwen/Qwen3-1.7B --cuda-graph-persistence load
+```
+
+**Engines with `--cuda-graph-persistence` run with `TORCHDYNAMO_DISABLE=1`.** Foundry pins it for the scheduler processes and rejects a contrary value: with TorchDynamo on, `save` fails at the first `@torch.compile` helper inside the capture window on torch 2.14 and later. The validated models show no difference in output or TPOT.
+
+`--cuda-graph-persistence-config` names an optional Foundry TOML (`workspace_root` for the archive directory, `base_addr` / `region_size` for the address region, `scratch_space_size`); its `mode` key is ignored, the flag's mode wins:
+
+```toml
+workspace_root = "/data/foundry_archive/qwen3-1.7b"
+region_size = "256GB"
+```
+
+`save` and `load` must use the same model, flags, parallel layout and GPU type; remove the archive before a `save` of another configuration.
+
+The launcher and every scheduler log one activation line, and `load` logs the restore per runner:
+
+```text
+[Foundry] cuda graph persistence active: pid=<pid> mode=load config=<toml or None>
+[Foundry] Loaded <N> SGLang graphs in <s>s
+```
+
+Run engines with and without `--cuda-graph-persistence` in separate processes.
+
+## What it changes
+
+- Decode graphs use the `full` backend; prefill graphs are `full` or `disabled` (default `disabled`). Other backends are rejected.
+- Flags and environment variables that select state a restored graph cannot replay (custom all-reduce IPC buffers, NCCL symmetric memory / NVLS / buffer registration, MSCCL++, two-batch overlap, the memory saver, graph-pool borrow / precarve, the metadata glue graph) are pinned; each pin prints a `[Foundry] pin:` line, and an explicit contrary value stops the launch with the reason.
+- Speculative decoding, LoRA, PD multiplexing, elastic-EP graph recapture and post-capture KV sizing are not supported.
