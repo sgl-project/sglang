@@ -767,11 +767,15 @@ class FusedMoE(torch.nn.Module):
         if self.use_padded_loading:
             if _is_cpu and is_bias:
                 shard_dim = 1
+            weight_start = shard_size * self.moe_tp_rank
+            # Pre-sharded CPU weights are rank-local; do not apply the TP offset again.
+            if _is_cpu and self.use_presharded_weights:
+                weight_start = 0
             expert_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                 expert_data,
                 loaded_weight,
                 start,
-                shard_size * self.moe_tp_rank,
+                weight_start,
                 shard_dim,
                 shard_size,
                 not self.use_presharded_weights,
@@ -856,11 +860,15 @@ class FusedMoE(torch.nn.Module):
         if self.use_padded_loading:
             if _is_cpu and is_bias:
                 shard_dim = 1
+            weight_start = shard_size * self.moe_tp_rank
+            # Pre-sharded CPU weights are rank-local; do not apply the TP offset again.
+            if _is_cpu and self.use_presharded_weights:
+                weight_start = 0
             expert_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                 expert_data,
                 loaded_weight,
                 0,  # param_data_start
-                shard_size * self.moe_tp_rank,
+                weight_start,
                 shard_dim,
                 shard_size,
                 not self.use_presharded_weights,

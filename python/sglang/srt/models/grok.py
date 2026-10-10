@@ -59,11 +59,51 @@ from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_parallel, get_stream
-from sglang.srt.utils import add_prefix, is_npu
+from sglang.srt.utils import add_prefix, cpu_has_amx_support, is_cpu, is_npu
 
 _is_npu = is_npu()
+_is_cpu = is_cpu()
+_is_cpu_amx_available = cpu_has_amx_support()
 
 logger = logging.getLogger(__name__)
+
+
+def dual_residual_rmsnorm_naive(x, residual, weight1, weight2, eps):
+    hidden_size = (x.shape[-1],)
+    mid = residual + F.rms_norm(x.float(), hidden_size, weight1.float(), eps).to(
+        residual.dtype
+    )
+    output = F.rms_norm(mid.float(), hidden_size, weight2.float(), eps).to(x.dtype)
+    return output, mid
+
+
+def fused_rmsnorm_cpu(x, weight, eps):
+    if _is_cpu_amx_available:
+        return torch.ops.sgl_kernel.rmsnorm_cpu(x, weight, eps)
+    return F.rms_norm(x.float(), (x.shape[-1],), weight.float(), eps).to(x.dtype)
+
+
+def moe_router_shim_naive(
+    softcap, hidden_states, gating_output, topk, renormalize, **kwargs
+):
+    assert not renormalize
+    logits = F.linear(hidden_states.float(), gating_output.float())
+    logits = softcap * torch.tanh(logits / softcap)
+    probabilities = torch.softmax(logits, dim=-1)
+    weights, indices = torch.topk(probabilities, topk, dim=-1)
+    return weights, indices.to(torch.int32)
+
+
+def grok_gelu_and_mul_naive(x):
+    gate, up = x.chunk(2, dim=-1)
+    return up * F.gelu(gate.float(), approximate="none").to(gate.dtype), None
+
+
+if _is_cpu:
+    fused_rmsnorm = fused_rmsnorm_cpu
+    fused_dual_residual_rmsnorm = dual_residual_rmsnorm_naive
+    fused_moe_router_shim = moe_router_shim_naive
+    gelu_and_mul_triton = grok_gelu_and_mul_naive
 
 
 class Grok1MLP(nn.Module):
@@ -939,13 +979,23 @@ old_prepare_weights = getattr(DefaultModelLoader, "_prepare_weights")
 
 
 def _prepare_presharded_weights(
-    self, model_name_or_path: str, revision: Optional[str], fall_back_to_pt: bool
+    self,
+    model_name_or_path: str,
+    revision: Optional[str],
+    fall_back_to_pt: bool,
+    allow_patterns_overrides: Optional[list[str]] = None,
 ) -> Tuple[str, list[str], bool]:
     import glob
     import os
 
     if get_parallel().tp_size == 1:
-        return old_prepare_weights(self, model_name_or_path, revision, fall_back_to_pt)
+        return old_prepare_weights(
+            self,
+            model_name_or_path,
+            revision,
+            fall_back_to_pt,
+            allow_patterns_overrides,
+        )
 
     if not os.path.isdir(model_name_or_path):
         from sglang.srt.model_loader.weight_utils import download_weights_from_hf
@@ -974,7 +1024,13 @@ def _prepare_presharded_weights(
         hf_weights_files += glob.glob(os.path.join(hf_folder, pattern))
 
     if not hf_weights_files:
-        return old_prepare_weights(self, model_name_or_path, revision, fall_back_to_pt)
+        return old_prepare_weights(
+            self,
+            model_name_or_path,
+            revision,
+            fall_back_to_pt,
+            allow_patterns_overrides,
+        )
 
     if hf_weights_files[0].endswith("safetensors"):
         use_safetensors = True
