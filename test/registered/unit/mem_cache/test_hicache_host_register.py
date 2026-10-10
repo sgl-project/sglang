@@ -10,12 +10,11 @@ from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4PagedHostPool,
     DeepSeekV4StateHostPool,
 )
-from sglang.srt.mem_cache.pool_host import mha as mha_pool_host
-from sglang.srt.mem_cache.pool_host import mla as mla_pool_host
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     _cuda_host_register,
     _cuda_host_unregister,
+    alloc_with_pin_memory,
 )
 from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerPoolHost
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
@@ -115,7 +114,7 @@ class TestHiCacheHostRegister(unittest.TestCase):
         pool.allocator = object()
         alloc = mock.Mock(return_value=object())
 
-        with mock.patch.dict(mla_pool_host.ALLOC_MEMORY_FUNCS, {"cuda": alloc}):
+        with mock.patch.dict(ALLOC_MEMORY_FUNCS, {"cuda": alloc}):
             pool.init_kv_buffer()
 
         self.assertEqual(
@@ -138,7 +137,7 @@ class TestHiCacheHostRegister(unittest.TestCase):
         pool.allocator = object()
         alloc = mock.Mock(return_value=object())
 
-        with mock.patch.dict(mha_pool_host.ALLOC_MEMORY_FUNCS, {"cuda": alloc}):
+        with mock.patch.dict(ALLOC_MEMORY_FUNCS, {"cuda": alloc}):
             pool.init_kv_buffer()
 
         self.assertEqual(
@@ -407,6 +406,26 @@ class TestHiCacheHostRegister(unittest.TestCase):
         )
         for ptr, _, _ in cudart.registrations:
             self.assertEqual((ptr - base) % page_copy_bytes, 0)
+
+    def test_null_pinned_allocation_raises(self):
+        """A null pinned buffer must fail at allocation, not at first transfer."""
+        gib = 1024**3
+
+        def alloc(buffer):
+            with mock.patch.object(torch, "empty", return_value=buffer):
+                return alloc_with_pin_memory(
+                    (buffer.numel(),),
+                    dtype=torch.uint8,
+                    device="cpu",
+                    pin_memory=True,
+                    allocator=None,
+                )
+
+        with self.assertRaisesRegex(RuntimeError, r"2\.0 GiB .* null pointer"):
+            alloc(_FakeBuffer(0, 2 * gib))
+        # An empty tensor has data_ptr() == 0 on every backend and is not a failure.
+        empty = _FakeBuffer(0, 0)
+        self.assertIs(alloc(empty), empty)
 
 
 if __name__ == "__main__":
