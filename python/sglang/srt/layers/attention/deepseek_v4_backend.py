@@ -980,6 +980,10 @@ class DSV4Metadata:
     # Set only on the metadata built for the late layers under bounded SWA replay.
     late_layer_tail: Optional[LateLayerTail] = None
 
+    # This step's sparse-prefill choice, from the live batch: read the FP8 cache
+    # directly instead of the bf16 workspace.
+    sparse_prefill_direct: bool = False
+
     @property
     def core_metadata(self) -> DSV4AttnMetadata:
         return self.core_attn_metadata
@@ -1087,16 +1091,32 @@ class _GraphBucket(enum.Enum):
         raise NotImplementedError(f"unsupported {forward_mode=}")
 
 
-def _prefill_reads_fp8_direct(
-    forward_batch: ForwardBatch, *, in_prefill_graph: bool
-) -> bool:
-    if not envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get():
-        return True
+# Measured on SM100 (GB300) only; other platforms keep the workspace unless set.
+_SM100_DIRECT_PREFIX_PER_ROW = 5
+_SM100_DIRECT_PREFIX_PER_ROW_GRAPH = 8
+
+
+def _direct_prefix_per_row(*, in_prefill_graph: bool) -> int:
     per_row = (
         envs.SGLANG_DSV4_SPARSE_PREFILL_DIRECT_PREFIX_PER_ROW_GRAPH
         if in_prefill_graph
         else envs.SGLANG_DSV4_SPARSE_PREFILL_DIRECT_PREFIX_PER_ROW
     ).get()
+    if per_row is not None:
+        return per_row
+    if not get_platform().is_sm100:
+        return 0
+    if in_prefill_graph:
+        return _SM100_DIRECT_PREFIX_PER_ROW_GRAPH
+    return _SM100_DIRECT_PREFIX_PER_ROW
+
+
+def _prefill_reads_fp8_direct(
+    forward_batch: ForwardBatch, *, in_prefill_graph: bool
+) -> bool:
+    if not envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get():
+        return True
+    per_row = _direct_prefix_per_row(in_prefill_graph=in_prefill_graph)
     prefix = forward_batch.extend_prefix_lens_cpu
     if per_row <= 0 or prefix is None:
         return False
@@ -1235,8 +1255,6 @@ class DeepseekV4AttnBackend(
         ] = None
         self.online_c128_mtp = OnlineC128MTPController(self)
         self.sparse_prefill_workspace = SparsePrefillWorkspace(self.device)
-        # Set per step from the live batch: sparse prefill reads the fp8 cache directly.
-        self._sparse_prefill_direct = False
         spec_alg = model_runner.spec_algorithm
         self.needs_cpu_seq_lens = not spec_alg.is_dspark() and (
             not _is_cuda or self.online_c128_mtp.enabled()
@@ -2371,9 +2389,6 @@ class DeepseekV4AttnBackend(
             return
 
         self.encoder_replay = forward_batch.encoder_swa_replay
-        self._sparse_prefill_direct = _prefill_reads_fp8_direct(
-            forward_batch, in_prefill_graph=False
-        )
         self.forward_metadata = self._build_forward_metadata(forward_batch)
         self.init_forward_metadata_in_graph(forward_batch)
         self.tail_forward_metadata = (
@@ -2382,6 +2397,10 @@ class DeepseekV4AttnBackend(
             and forward_batch.forward_mode.is_extend_without_speculative()
             else None
         )
+        if self.tail_forward_metadata is not None:
+            self.tail_forward_metadata.sparse_prefill_direct = (
+                self.forward_metadata.sparse_prefill_direct
+            )
 
         if self.token_to_kv_pool.request_window is not None:
             self.token_to_kv_pool.request_window.activate(
@@ -2415,7 +2434,7 @@ class DeepseekV4AttnBackend(
             and metadata.late_layer_tail is None
             and (
                 num_qo_tokens > _LARGE_INDEXER_QUERY_THRESHOLD
-                or not self._sparse_prefill_direct
+                or not metadata.sparse_prefill_direct
             )
         )
         if use_sparse_prefill:
@@ -2596,6 +2615,9 @@ class DeepseekV4AttnBackend(
                 use_prefill_cuda_graph=use_prefill_cuda_graph,
                 forward_batch=forward_batch,
             )
+            metadata.sparse_prefill_direct = _prefill_reads_fp8_direct(
+                forward_batch, in_prefill_graph=use_prefill_cuda_graph
+            )
         else:
             raise NotImplementedError(f"unsupported mode {forward_batch.forward_mode=}")
 
@@ -2605,9 +2627,6 @@ class DeepseekV4AttnBackend(
         self, forward_batch: ForwardBatch
     ):
         max_seq_len = forward_batch.max_seq_len_override or self.MAX_SEQ_LEN_FOR_CAPTURE
-        self._sparse_prefill_direct = _prefill_reads_fp8_direct(
-            forward_batch, in_prefill_graph=True
-        )
         self.forward_metadata = self._build_forward_metadata(
             forward_batch,
             max_seq_len_override=max_seq_len,
@@ -2662,9 +2681,6 @@ class DeepseekV4AttnBackend(
         max_seq_len = (
             metadata_batch.max_seq_len_override or self.MAX_SEQ_LEN_FOR_CAPTURE
         )
-        self._sparse_prefill_direct = _prefill_reads_fp8_direct(
-            forward_batch, in_prefill_graph=True
-        )
         static_metadata = self._build_forward_metadata(
             metadata_batch,
             max_seq_len_override=max_seq_len,
@@ -2672,6 +2688,10 @@ class DeepseekV4AttnBackend(
         )
         assert isinstance(capture_metadata, DSV4Metadata)
         capture_metadata.refresh_for_breakable_cuda_graph_replay_(static_metadata)
+        # The attention break reads this live; the padded static batch may add rows.
+        capture_metadata.sparse_prefill_direct = _prefill_reads_fp8_direct(
+            forward_batch, in_prefill_graph=True
+        )
         self.forward_metadata = capture_metadata
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int) -> None:
@@ -3328,6 +3348,10 @@ class DeepseekV4AttnBackend(
         )
 
     def _low_ratio_prefill_reads_page_indices(self, forward_batch: ForwardBatch):
+        from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
+            is_in_breakable_cuda_graph,
+        )
+
         # The negation of the sparse-prefill gate in forward(), which reads only
         # raw_indices; the query-count clause is dropped, so this errs to True.
         return (
@@ -3338,9 +3362,12 @@ class DeepseekV4AttnBackend(
             or self.forward_metadata.late_layer_tail is not None
             or self.token_to_kv_pool.request_window is not None
             or not envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
-            # Captured indexers keep this choice, so any step may still read direct.
-            or envs.SGLANG_DSV4_SPARSE_PREFILL_DIRECT_PREFIX_PER_ROW.get() > 0
-            or envs.SGLANG_DSV4_SPARSE_PREFILL_DIRECT_PREFIX_PER_ROW_GRAPH.get() > 0
+            or self.forward_metadata.sparse_prefill_direct
+            # A captured indexer keeps this choice, so any replay may still read direct.
+            or (
+                is_in_breakable_cuda_graph()
+                and _direct_prefix_per_row(in_prefill_graph=True) > 0
+            )
         )
 
     def _publish_candidate_metadata(self, published: Optional[CandidateMetadata]):
@@ -3529,7 +3556,7 @@ class DeepseekV4AttnBackend(
                 )
                 and (
                     q.shape[0] > _LARGE_INDEXER_QUERY_THRESHOLD
-                    or not self._sparse_prefill_direct
+                    or not self.forward_metadata.sparse_prefill_direct
                 )
             ):
                 if use_dsv4_q8kv8_sparse_prefill(self.dsv4_prefill_backend):
