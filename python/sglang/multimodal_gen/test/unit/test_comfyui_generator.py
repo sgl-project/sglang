@@ -344,3 +344,23 @@ def test_spawned_workers_do_not_reexecute_launcher_main() -> None:
                 main_dict.pop(key, None)
             else:
                 main_dict[key] = value
+
+
+def test_fasth3_single_file_as_base_h3_is_rejected_before_worker_load(
+    tmp_path,
+) -> None:
+    """A FastH3 single file loaded as minimax_h3 used to start the worker and
+    die on a raw state-dict mapping error for to_gate_compress."""
+    import pytest
+    import torch
+    from safetensors.torch import save_file
+
+    path = tmp_path / "fasth3.safetensors"
+    save_file({"blocks.0.attn.to_gate_compress.weight": torch.zeros(1)}, path)
+    runtime = SGLDiffusionGenerator()
+    runtime.get_comfyui_model = lambda *a: (SimpleNamespace(), None, "minimax_h3")
+    runtime.init_generator = lambda *a: (_ for _ in ()).throw(
+        AssertionError("worker must not start")
+    )
+    with pytest.raises(ValueError, match="model_type fast_h3"):
+        runtime.load_model(model_path=str(path), sgld_options={})

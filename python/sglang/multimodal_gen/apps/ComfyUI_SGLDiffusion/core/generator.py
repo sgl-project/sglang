@@ -54,6 +54,13 @@ def _spawn_without_launcher_main():
         main_dict.update(saved)
 
 
+def _has_vsa_gate(path: str) -> bool:
+    from safetensors import safe_open
+
+    with safe_open(path, framework="pt") as f:
+        return any(".to_gate_compress." in key for key in f.keys())
+
+
 def _looks_like_gguf(path: str) -> bool:
     if not path:
         return False
@@ -507,6 +514,12 @@ class SGLDiffusionGenerator:
             model_type = set_model_type
 
         if model_type == "minimax_h3" and not runtime_model_path:
+            if detect_path.endswith(".safetensors") and _has_vsa_gate(detect_path):
+                raise ValueError(
+                    "This is a FastH3 checkpoint (VSA gate weights), which the "
+                    "base MiniMax H3 model cannot load; set model_type fast_h3 "
+                    "with runtime_model_path pointing at the native FastH3 model"
+                )
             if sgld_options.get("minimax_h3_adaln_online") or sgld_options.get(
                 "minimax_h3_adaln_cache_path"
             ):
