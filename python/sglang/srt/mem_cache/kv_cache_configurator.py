@@ -33,6 +33,7 @@ from sglang.srt.configs.model_config import (
 from sglang.srt.distributed.utils import get_pp_indices
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+    KV_CACHE_QUANT_REGISTRY,
     get_kv_cache_quant_method,
     resolve_kv_cache_quant,
 )
@@ -364,6 +365,7 @@ class KVCacheConfigurator:
             page_size=self.page_size,
         )
         quant_method.configure_attention_backends_from_server_args(self.server_args)
+        quant_method.configure_model(self.model_config)
         quant_method.load_scales_from_model(self.model)
         return quant_method
 
@@ -2663,7 +2665,8 @@ class KVCacheConfigurator:
         return base + additional_ratio
 
     def _apply_token_constraints(self, token_capacity: int) -> int:
-        """Apply external constraints to token capacity: user cap, PP sync.
+        """Apply external constraints to token capacity: user cap, KV recipe
+        addressing limit, PP sync.
 
         Page alignment is handled by the configurator, not here.
         If constraints change the value, the configurator re-runs and re-aligns.
@@ -2679,6 +2682,17 @@ class KVCacheConfigurator:
                 )
             token_capacity = min(token_capacity, user_limit)
 
+        recipe_limit = self._kv_quant_max_pool_tokens()
+        if recipe_limit is not None and token_capacity > recipe_limit:
+            logger.info(
+                "Capping the KV pool at %d tokens, the most the %s kernels can "
+                "address (profiled %d).",
+                recipe_limit,
+                self.kv_cache_dtype_str,
+                token_capacity,
+            )
+            token_capacity = recipe_limit
+
         # Sync across PP ranks (each may have different layer counts)
         if get_parallel().pp_size > 1:
             tensor = torch.tensor(token_capacity, dtype=torch.int64)
@@ -2690,6 +2704,20 @@ class KVCacheConfigurator:
             token_capacity = tensor.item()
 
         return token_capacity
+
+    def _kv_quant_max_pool_tokens(self) -> Optional[int]:
+        if not is_float4_e2m1fn_x2(self.kv_cache_dtype):
+            return None
+        quant_name = resolve_kv_cache_quant(self.kv_cache_dtype_str)
+        if quant_name is None:
+            return None
+        return KV_CACHE_QUANT_REGISTRY[quant_name].max_pool_tokens(
+            self.model_config.get_num_kv_heads(
+                get_parallel().attn_tp_size, get_parallel().attn_dcp_size
+            ),
+            self.model_config.head_dim,
+            self.pool_page_size,
+        )
 
     def resolve_max_num_reqs(self, token_capacity: int) -> int:
         """Compute max concurrent requests (per dp worker) from the finalized

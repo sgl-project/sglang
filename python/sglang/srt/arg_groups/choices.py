@@ -91,6 +91,7 @@ ATTENTION_BACKEND_CHOICES = [
     # AMD specific
     "aiter",
     "wave",
+    "ultraquant",  # requires --kv-cache-dtype ultraquant_4bit
     # Other platforms
     "intel_amx",
     "ascend",

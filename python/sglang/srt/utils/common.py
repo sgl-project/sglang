@@ -239,9 +239,9 @@ def is_mps() -> bool:
 
 
 def is_float4_e2m1fn_x2(dtype) -> bool:
-    """Check if dtype is float4_e2m1fn_x2 and CUDA is available."""
+    """Check if dtype is float4_e2m1fn_x2 and CUDA or ROCm is available."""
     target_dtype = getattr(torch, "float4_e2m1fn_x2", None)
-    return is_cuda() and dtype == target_dtype
+    return (is_cuda() or is_hip()) and dtype == target_dtype
 
 
 def get_cuda_version():

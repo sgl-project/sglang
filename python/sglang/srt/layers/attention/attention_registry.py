@@ -205,6 +205,13 @@ def create_triton_backend(runner):
     return TritonAttnBackend(runner)
 
 
+@register_attention_backend("ultraquant")
+def create_ultraquant_backend(runner):
+    from sglang.srt.layers.attention.ultraquant_backend import UltraQuantAttnBackend
+
+    return UltraQuantAttnBackend(runner)
+
+
 @register_attention_backend("torch_native")
 def create_torch_native_backend(runner):
     from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
