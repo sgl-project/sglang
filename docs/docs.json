@@ -1559,13 +1559,6 @@
                     ]
                   },
                   {
-                    "group": "InclusionAI",
-                    "tag": "NEW",
-                    "pages": [
-                      "cookbook/diffusion/InclusionAI/LLaDA-Image"
-                    ]
-                  },
-                  {
                     "group": "CircleStone",
                     "pages": [
                       "cookbook/diffusion/CircleStone/Anima"
@@ -1587,6 +1580,12 @@
                     "group": "Ming-Image",
                     "pages": [
                       "cookbook/diffusion/inclusionAI/Ming-Image"
+                    ]
+                  },
+                  {
+                    "group": "LLaDA-Image",
+                    "pages": [
+                      "cookbook/diffusion/inclusionAI/LLaDA-Image"
                     ]
                   },
                   {
