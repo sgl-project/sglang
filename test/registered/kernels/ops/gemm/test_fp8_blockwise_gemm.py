@@ -86,5 +86,67 @@ def test_accuracy(M, N, K, out_dtype):
     _test_accuracy_once(M, N, K, out_dtype, "cuda")
 
 
+@pytest.mark.skipif(not is_sm120_supported(), reason="requires SM120")
+@pytest.mark.parametrize("M", [4, 8, 12, 16, 32, 36, 60, 64, 68])
+@pytest.mark.parametrize(
+    "N,K",
+    [
+        (34816, 5120),
+        (5120, 17408),
+        (16384, 5120),
+        (5120, 6144),
+        (14336, 5120),
+        (5120, 16512),  # An odd number of K blocks: unequal split-K partitions.
+        (5120, 4224),
+        (5120, 4352),
+        (5120, 4480),  # Unequal warp split-K partitions.
+    ],
+)
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
+def test_qwen_decode(M, N, K, out_dtype):
+    """Exercise the small-M dispatch and its boundary with model-size weights."""
+    torch.manual_seed(42)
+    a = torch.randn(M, K, device="cuda").to(torch.float8_e4m3fn)
+    b = torch.randn(N, K, device="cuda").to(torch.float8_e4m3fn).T
+    sa = torch.rand(K // 128, M, device="cuda").T * 0.1
+    sb = torch.rand(N // 128, K // 128, device="cuda").T * 0.1
+    expected = baseline_scaled_mm(a, b, sa, sb, out_dtype)
+    actual = fp8_blockwise_scaled_mm(a, b, sa, sb, out_dtype)
+    torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.005)
+
+
+@pytest.mark.skipif(not is_sm120_supported(), reason="requires SM120")
+@pytest.mark.parametrize(
+    "M,N,K",
+    [
+        (4, 34816, 5120),
+        (4, 5120, 4224),
+        (12, 5120, 6144),
+        (36, 5120, 17408),
+        (60, 5120, 16512),
+        (60, 14336, 5120),
+    ],
+)
+def test_qwen_decode_cuda_graph(M, N, K):
+    """Replays must consume current activations, weights, and block scales."""
+    torch.manual_seed(42)
+    a = torch.randn(M, K, device="cuda").to(torch.float8_e4m3fn)
+    b = torch.randn(N, K, device="cuda").to(torch.float8_e4m3fn).T
+    sa = torch.rand(K // 128, M, device="cuda").T * 0.1
+    sb = torch.rand(N // 128, K // 128, device="cuda").T * 0.1
+    fp8_blockwise_scaled_mm(a, b, sa, sb, torch.bfloat16)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = fp8_blockwise_scaled_mm(a, b, sa, sb, torch.bfloat16)
+    for _ in range(3):
+        a.copy_(torch.randn(M, K, device="cuda").to(torch.float8_e4m3fn))
+        b.copy_(torch.randn(N, K, device="cuda").to(torch.float8_e4m3fn).T)
+        sa.uniform_(0, 0.1)
+        sb.uniform_(0, 0.1)
+        graph.replay()
+        expected = baseline_scaled_mm(a, b, sa, sb, torch.bfloat16)
+        torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.005)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
