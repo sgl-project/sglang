@@ -870,3 +870,15 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
 
 def is_swa_req_ring(allocator) -> bool:
     return isinstance(allocator, SWATokenToKVPoolAllocator) and allocator.swa_req_ring
+
+
+def swa_kept_out_of_tree(allocator) -> bool:
+    """Whether radix-tree nodes do not own the SWA state: a per-request SWA ring,
+    or the DeepSeek-V4.1 encoder-replay request window, which replay rebuilds on a
+    prefix hit. SWA bookkeeping must not gate prefix matching for either."""
+    if not isinstance(allocator, SWATokenToKVPoolAllocator):
+        return False
+    if allocator.swa_req_ring:
+        return True
+    kvcache = getattr(allocator, "_kvcache", None)
+    return getattr(kvcache, "request_window", None) is not None
