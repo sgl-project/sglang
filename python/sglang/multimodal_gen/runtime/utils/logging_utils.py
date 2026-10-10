@@ -217,8 +217,6 @@ def init_logger(name: str) -> _SGLDiffusionLogger:
 
     logger = logging.getLogger(name)
 
-    server_log_level = logger.getEffectiveLevel()
-
     # Patch instance methods
     setattr(logger, "info_once", MethodType(_print_info_once, logger))
     setattr(logger, "warning_once", MethodType(_print_warning_once, logger))
@@ -237,7 +235,7 @@ def init_logger(name: str) -> _SGLDiffusionLogger:
             **kwargs: Any,
         ) -> None:
             _log_process_aware(
-                server_log_level,
+                self.getEffectiveLevel(),
                 level,
                 self,
                 msg,
