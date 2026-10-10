@@ -231,6 +231,10 @@ class TestDiffusionBCGPadding(unittest.TestCase):
                 torch.zeros(4096, 128, dtype=torch.float32),
                 torch.ones(seq_len, 128, dtype=torch.float32),
             ),
+            "freqs_complex": (
+                torch.zeros(4096, 64, dtype=torch.complex64),
+                torch.ones(seq_len, 64, dtype=torch.complex64),
+            ),
             "img_shapes": [[(1, 64, 64)]],
         }
 
@@ -251,8 +255,14 @@ class TestDiffusionBCGPadding(unittest.TestCase):
         self.assertTrue(longer["encoder_hidden_states_mask"][0, :47].all())
         self.assertFalse(longer["encoder_hidden_states_mask"][0, 47:].any())
         self.assertEqual(short["freqs_cis"][1].shape, (256, 128))
-        self.assertEqual(short["txt_seq_lens"], [256])
-        self.assertEqual(longer["txt_seq_lens"], [256])
+        # the complex RoPE cache must follow the bucket too, or every prompt
+        # length misses the captured graph
+        self.assertEqual(short["freqs_complex"][1].shape, (256, 64))
+        self.assertFalse(short["freqs_complex"][1][19:].any())
+        # a bucketed length would tell a missed graph's eager forward to attend
+        # the pad rows; the mask alone marks the valid text
+        self.assertIsNone(short["txt_seq_lens"])
+        self.assertIsNone(longer["txt_seq_lens"])
         self.assertEqual(_signature_kwargs(short), _signature_kwargs(longer))
 
     def test_qwen_prompt_content_changes_do_not_change_signature(self):
@@ -331,8 +341,8 @@ class TestDiffusionBCGPadding(unittest.TestCase):
         )
 
         self.assertEqual(first["encoder_hidden_states"][0].shape[1], 64)
-        self.assertEqual(first["txt_seq_lens"], [64])
-        self.assertEqual(second["txt_seq_lens"], [64])
+        self.assertIsNone(first["txt_seq_lens"])
+        self.assertIsNone(second["txt_seq_lens"])
         self.assertTrue(first["encoder_hidden_states_mask"][0, :19].all())
         self.assertFalse(first["encoder_hidden_states_mask"][0, 19:].any())
         self.assertTrue(second["encoder_hidden_states_mask"][0, :47].all())

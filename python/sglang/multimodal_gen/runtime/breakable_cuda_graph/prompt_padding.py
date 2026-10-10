@@ -138,20 +138,6 @@ def pad_nested_dim(
     return obj
 
 
-def bucket_txt_seq_lens(txt_seq_lens: Any, bucket: int) -> Any:
-    if txt_seq_lens is None:
-        return txt_seq_lens
-    if torch.is_tensor(txt_seq_lens):
-        return torch.full_like(txt_seq_lens, bucket)
-    if isinstance(txt_seq_lens, list):
-        return [bucket_txt_seq_lens(seq_len, bucket) for seq_len in txt_seq_lens]
-    if isinstance(txt_seq_lens, tuple):
-        return tuple(bucket_txt_seq_lens(seq_len, bucket) for seq_len in txt_seq_lens)
-    if isinstance(txt_seq_lens, int):
-        return bucket
-    return txt_seq_lens
-
-
 def prompt_seq_and_dim(call_kwargs: dict) -> tuple[int, int] | None:
     """Return ``(text_seq_len, seq_dim)`` inferred from the prompt embeddings or
     a prompt mask, or ``None`` when no text conditioning is present."""
