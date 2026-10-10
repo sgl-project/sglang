@@ -20,6 +20,8 @@ from sglang.srt.function_call.utils import safe_literal_eval
 
 logger = logging.getLogger(__name__)
 
+_JSON_OPENERS = {"array": "[", "object": "{"}
+
 
 @lru_cache(maxsize=1)
 def _glm47_native_structural_tag_available() -> bool:
@@ -406,12 +408,9 @@ class Glm47MoeDetector(BaseFormatDetector):
         return get_argument_type(func_name, key, tools) or "auto"
 
     def _format_value_complete(self, value: str, value_type: str) -> str:
-        """Format a value that completed in one chunk; number/integer/auto never
-        reach here (they are parsed at value close instead)."""
-        if value_type == "string":
-            return json.dumps(value, ensure_ascii=False)
-        # object/array/boolean values arrive as JSON already
-        return value
+        """Format a string value that never started streaming; every other
+        type that never started is parsed at value close instead."""
+        return json.dumps(value, ensure_ascii=False)
 
     def _process_xml_to_json_streaming(
         self, raw_increment: str, func_name: str, tools: List[Tool]
@@ -468,7 +467,9 @@ class Glm47MoeDetector(BaseFormatDetector):
                     self._current_value += final_value
 
                     value_type = self._cached_value_type or "string"
-                    if value_type in ("auto", "number", "integer"):
+                    if value_type in ("auto", "number", "integer") or (
+                        value_type != "string" and not self._value_started
+                    ):
                         parsed = self._parse_argument_pairs(
                             [(self._current_key, self._current_value)], func_name, tools
                         )[self._current_key]
@@ -518,13 +519,19 @@ class Glm47MoeDetector(BaseFormatDetector):
                                 self._current_value += content
                                 self._xml_tag_buffer = ""
                         else:
-                            # object/array/boolean values stream through verbatim
+                            # Object/array values that open as JSON stream through
+                            # verbatim; anything else ("1, 2", "True") is held and
+                            # parsed at value close, as non-streaming does.
                             if content:
-                                if not self._value_started:
-                                    self._value_started = True
-                                json_output += content
                                 self._current_value += content
                                 self._xml_tag_buffer = ""
+                                if self._value_started:
+                                    json_output += content
+                                elif self._current_value.lstrip()[
+                                    :1
+                                ] == _JSON_OPENERS.get(value_type):
+                                    self._value_started = True
+                                    json_output += self._current_value
 
         return json_output
 
