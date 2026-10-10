@@ -6,6 +6,8 @@ from unittest.mock import patch
 
 import pytest
 import torch
+import triton
+import triton.language as tl
 
 from sglang.kernels.ops.attention.deepseek_v4_rope import (
     apply_rotary_emb_triton,
@@ -17,6 +19,8 @@ from sglang.kernels.ops.attention.dsv4 import (
     fused_q_indexer_rope_hadamard_fp4_quant,
 )
 from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+    _e2m1_decode,
+    _e8m0_decode,
     finish_paged_indexer_topk,
     fp4_index_logits_decode,
     fp4_index_logits_paged,
@@ -396,6 +400,28 @@ def _reference_logits(q, weights, slots, lens, table):
     )
     logits = products.double().sum(dim=1).to(torch.bfloat16).float()
     return logits.masked_fill(position[None, :] >= lens[:, None], -torch.inf)
+
+
+@triton.jit
+def _decode_all_codes_kernel(e2m1_ptr, e8m0_ptr):
+    code = tl.arange(0, 256).to(tl.uint8)
+    tl.store(e2m1_ptr + tl.arange(0, 16), _e2m1_decode(tl.arange(0, 16).to(tl.uint8)))
+    tl.store(e8m0_ptr + tl.arange(0, 256), _e8m0_decode(code))
+
+
+def test_fp4_scorer_decodes_every_code_exactly():
+    e2m1 = torch.empty(16, device=get_device(), dtype=torch.float32)
+    e8m0 = torch.empty(256, device=get_device(), dtype=torch.float32)
+    _decode_all_codes_kernel[(1,)](e2m1, e8m0)
+    levels = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
+    # Value equality: the sign of zero (E2M1 code 8) does not reach the scores.
+    # E8M0 code 0 is never stored and decodes to 0; code 255 overflows to inf.
+    expected_e2m1 = torch.tensor(levels + [-v for v in levels], dtype=torch.float32)
+    expected_e8m0 = torch.tensor(
+        [0.0] + [2.0 ** (e - 127) for e in range(1, 256)], dtype=torch.float32
+    )
+    assert torch.equal(e2m1.cpu(), expected_e2m1)
+    assert torch.equal(e8m0.cpu(), expected_e8m0)
 
 
 @pytest.mark.parametrize("heads", [32, 64])
