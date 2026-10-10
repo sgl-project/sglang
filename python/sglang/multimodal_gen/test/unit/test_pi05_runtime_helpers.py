@@ -560,8 +560,8 @@ def test_pi05_siglip_reuses_srt_model_with_layerwise_groups():
     assert vision_model.embeddings.position_embedding.tp_size == 1
     assert layer.self_attn.tp_size == 1
     assert layer.self_attn.qkv_backend.flatten_batch is False
-    assert layer.mlp.fc1.tp_size == 1
-    assert layer.mlp.fc2.tp_size == 1
+    assert layer.mlp.fc1.output_size_per_partition == config.intermediate_size
+    assert layer.mlp.fc2.input_size_per_partition == config.intermediate_size
     assert isinstance(layer.mlp.act, nn.GELU)
     assert layer.mlp.act.approximate == "tanh"
     assert model.device == vision_model.embeddings.patch_embedding.weight.device
@@ -688,10 +688,10 @@ def test_sample_actions_only_hoists_denoise_layout_for_eager():
     model.denoise_step = lambda _ctx, x_t, _t, **_kwargs: torch.zeros_like(x_t)
     layout_calls = []
     model.core_model = SimpleNamespace(
-        prepare_denoise_layout=lambda *args, **kwargs: layout_calls.append(
-            (args, kwargs)
+        prepare_denoise_layout=lambda *args, **kwargs: (
+            layout_calls.append((args, kwargs))
+            or (None, torch.zeros(1, 2, dtype=torch.long))
         )
-        or (None, torch.zeros(1, 2, dtype=torch.long))
     )
     observation = SimpleNamespace(batch_size=1)
     prefix_context = _prefix_context(1.0, "prompt")

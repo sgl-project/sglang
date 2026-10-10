@@ -14,12 +14,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sglang.kernels.ops.activation.activation import relu2
 from sglang.kernels.ops.diffusion import (
     can_use_fused_inplace_qknorm_rope,
     fused_qknorm_rope_pack_kv,
 )
 from sglang.multimodal_gen.configs.models.dits.cosmos3video import Cosmos3VideoConfig
 from sglang.multimodal_gen.configs.models.fsdp import is_module_list_entry_in
+from sglang.multimodal_gen.runtime.cache.conditioning import cached_conditioning
 from sglang.multimodal_gen.runtime.distributed import (
     get_sp_group,
     get_sp_world_size,
@@ -42,6 +44,13 @@ from sglang.multimodal_gen.runtime.layers.linear import (
 )
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
+)
+from sglang.multimodal_gen.runtime.layers.quantization.modelopt_fp8_step_precision import (
+    MODELOPT_FP8_QUANT_CONFIGS,
+    StepMixedPrecisionController,
+    install_step_mixed_precision,
+    read_checkpoint_step_policy,
+    resolve_step_policy,
 )
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     Qwen3VLTextRotaryEmbedding,
@@ -74,12 +83,17 @@ def _can_enable_t1_fused_qk_norm_rope(
     tp_size: int,
     sp_size: int,
     is_compiled: bool,
+    hidden_size: int = 0,
 ) -> bool:
     if is_compiled:
         return False
     if is_blackwell:
         return True
-    return is_hopper and hidden_act != "relu2" and tp_size == 1 and sp_size == 1
+    if not is_hopper or sp_size != 1:
+        return False
+    if tp_size == 1:
+        return hidden_act != "relu2" or hidden_size == 2048
+    return tp_size == 2 and hidden_act == "silu" and hidden_size == 5120
 
 
 # -----------------------------------------------------------------------------
@@ -361,7 +375,6 @@ class DomainAwareLinear(nn.Module):
         super().__init__()
         self.input_size = input_size
         self.output_size = output_size
-        self.num_domains = num_domains
         self.fc = nn.Embedding(num_domains, output_size * input_size)
         self.bias = nn.Embedding(num_domains, output_size)
         nn.init.xavier_uniform_(
@@ -533,8 +546,18 @@ class Cosmos3DenseMLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         up, _ = self.up_proj(x)
-        up = F.relu(up)
-        out, _ = self.down_proj(up * up)
+        if (
+            up.is_cuda
+            and up.dtype == torch.bfloat16
+            and up.is_contiguous()
+            and not torch.is_grad_enabled()
+            and not torch.compiler.is_compiling()
+        ):
+            up = relu2(up, fast_math=False)
+        else:
+            up = F.relu(up)
+            up = up * up
+        out, _ = self.down_proj(up)
         return out
 
 
@@ -557,6 +580,27 @@ def _build_mlp(
 # -----------------------------------------------------------------------------
 # Cosmos3 UND Causal Attention
 # -----------------------------------------------------------------------------
+
+
+def _initialize_attention_projections(module, prefix, quant_config):
+    module.q_size = module.num_attention_heads * module.head_dim
+    module.kv_size = module.num_key_value_heads * module.head_dim
+    module.to_qkv = MergedColumnParallelLinear(
+        module.hidden_size,
+        [module.q_size, module.kv_size, module.kv_size],
+        bias=False,
+        gather_output=False,
+        quant_config=quant_config,
+        prefix=add_prefix("to_qkv", prefix),
+    )
+    module.to_out = RowParallelLinear(
+        module.q_size,
+        module.hidden_size,
+        bias=False,
+        input_is_parallel=True,
+        quant_config=quant_config,
+        prefix=add_prefix("to_out", prefix),
+    )
 
 
 class Cosmos3CausalAttention(nn.Module):
@@ -594,24 +638,7 @@ class Cosmos3CausalAttention(nn.Module):
         self.local_num_attention_heads = num_attention_heads // self.tp_size
         self.local_num_key_value_heads = num_key_value_heads // self.tp_size
 
-        self.q_size = num_attention_heads * head_dim
-        self.kv_size = num_key_value_heads * head_dim
-        self.to_qkv = MergedColumnParallelLinear(
-            hidden_size,
-            [self.q_size, self.kv_size, self.kv_size],
-            bias=False,
-            gather_output=False,
-            quant_config=quant_config,
-            prefix=add_prefix("to_qkv", prefix),
-        )
-        self.to_out = RowParallelLinear(
-            num_attention_heads * head_dim,
-            hidden_size,
-            bias=False,
-            input_is_parallel=True,
-            quant_config=quant_config,
-            prefix=add_prefix("to_out", prefix),
-        )
+        _initialize_attention_projections(self, prefix, quant_config)
 
         # Per-head QK norm (optional; some backbones omit it on text).
         if qk_norm:
@@ -730,24 +757,7 @@ class Cosmos3CrossAttention(nn.Module):
         self.local_num_attention_heads = num_attention_heads // self.tp_size
         self.local_num_key_value_heads = num_key_value_heads // self.tp_size
 
-        self.q_size = num_attention_heads * head_dim
-        self.kv_size = num_key_value_heads * head_dim
-        self.to_qkv = MergedColumnParallelLinear(
-            hidden_size,
-            [self.q_size, self.kv_size, self.kv_size],
-            bias=False,
-            gather_output=False,
-            quant_config=quant_config,
-            prefix=add_prefix("to_qkv", prefix),
-        )
-        self.to_out = RowParallelLinear(
-            num_attention_heads * head_dim,
-            hidden_size,
-            bias=False,
-            input_is_parallel=True,
-            quant_config=quant_config,
-            prefix=add_prefix("to_out", prefix),
-        )
+        _initialize_attention_projections(self, prefix, quant_config)
 
         self.norm_q = RMSNorm(head_dim, eps=1e-6)
         self.norm_k = RMSNorm(head_dim, eps=1e-6)
@@ -1076,6 +1086,7 @@ class Cosmos3LanguageModel(nn.Module):
             ]
         )
 
+    @cached_conditioning
     def forward(
         self,
         text_ids: torch.Tensor,
@@ -1280,6 +1291,12 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
         # prompts, avoiding recomputation on every denoising step
         self.cached_kv: dict[str, list[tuple[torch.Tensor, torch.Tensor]]] = {}
         self.cached_gen_rope_inputs: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+
+        # Installed in post_load_weights when step mixed precision is enabled.
+        self.step_precision_controller: StepMixedPrecisionController | None = None
+        self.modelopt_fp8_checkpoint = isinstance(
+            quant_config, MODELOPT_FP8_QUANT_CONFIGS
+        )
 
         self.__post_init__()
 
@@ -1697,13 +1714,14 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
         self._ensure_cache_dicts()
 
         # The T=1 fused path is faster on Blackwell. It also benefits the
-        # single-GPU Hopper Nano (SwiGLU) workload, while the Hopper
-        # Cosmos3-Super (dense MLP) multi-GPU workload remains on the split
-        # path because that shape regresses with the fusion.
+        # single-GPU Hopper Nano (SwiGLU) and Edge (2048-wide dense) workloads,
+        # as well as TP2 Super-Text2Image (SwiGLU). The older dense-MLP Super
+        # workload remains on the split path because that shape regresses.
         enable_t1_fused_qk_norm_rope = T == 1 and _can_enable_t1_fused_qk_norm_rope(
             is_blackwell=current_platform.is_blackwell(),
             is_hopper=current_platform.is_hopper(),
             hidden_act=self.hidden_act,
+            hidden_size=self.hidden_size,
             tp_size=get_tp_world_size(),
             sp_size=get_sp_world_size(),
             is_compiled=self._gen_layers_torch_compiled,
@@ -2002,6 +2020,77 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
         for module in self.modules():
             if isinstance(module, RMSNorm):
                 module.to(target_dtype)
+
+        self._maybe_install_step_mixed_precision()
+
+    def _maybe_install_step_mixed_precision(self) -> None:
+        """Wrap ModelOpt FP8 linears for per-denoising-step W8A16 dispatch.
+
+        The checkpoint owns the behavior: mixed precision runs only when the
+        checkpoint carries a diffusion_step_policy
+        (quantization_config.runtime in config.json). Explicitly-set env vars
+        act as a manual override, and
+        SGLANG_DIFFUSION_ENABLE_COSMOS3_STEP_MIXED_PRECISION=0 disables. Runs
+        at the end of post_load_weights so the base quant method has already
+        transposed weights and collapsed scales.
+        """
+        checkpoint_quant_config = self.hf_config.get("quantization_config")
+        if not self.modelopt_fp8_checkpoint:
+            # A checkpoint that carries a step policy the runtime cannot honor
+            # must fail closed rather than silently run without it.
+            if read_checkpoint_step_policy(checkpoint_quant_config) is not None:
+                raise ValueError(
+                    "Checkpoint carries a diffusion_step_policy but was not "
+                    "loaded as a ModelOpt FP8 checkpoint; step mixed precision "
+                    "supports only ModelOpt FP8 in sglang."
+                )
+            return
+        policy, source = resolve_step_policy(checkpoint_quant_config)
+        if policy is None:
+            logger.info(
+                "Step mixed precision off (%s); running W8A8 on every denoising step.",
+                source,
+            )
+            return
+        controller = StepMixedPrecisionController(
+            first_steps=policy.first_steps,
+            last_steps=policy.last_steps,
+            reasoner_a16=policy.reasoner_a16,
+        )
+        reasoner_wrapped, generation_wrapped = install_step_mixed_precision(
+            reasoner_modules=[self.language_model.layers],
+            generation_modules=[self.gen_layers],
+            controller=controller,
+        )
+        if reasoner_wrapped + generation_wrapped == 0:
+            logger.warning(
+                "ModelOpt FP8 quant config detected but no ModelOpt FP8 "
+                "linears were found; running without step mixed precision."
+            )
+            return
+        self.step_precision_controller = controller
+        logger.info(
+            "Step mixed precision enabled (policy source: %s): %d generation "
+            "FP8 linears run W8A16 on the first %d and last %d denoising "
+            "steps; %d reasoner FP8 linears run %s.",
+            source,
+            generation_wrapped,
+            controller.first_steps,
+            controller.last_steps,
+            reasoner_wrapped,
+            "W8A16" if controller.reasoner_a16 else "W8A8",
+        )
+
+    def set_denoising_step(self, step_index: int, num_steps: int) -> None:
+        """Select this step's precision before any transformer call for it."""
+        if self.step_precision_controller is not None:
+            self.step_precision_controller.set_step(
+                step_index=step_index, num_steps=num_steps
+            )
+
+    def reset_denoising_step(self) -> None:
+        if self.step_precision_controller is not None:
+            self.step_precision_controller.reset()
 
 
 EntryClass = Cosmos3OmniTransformer

@@ -40,10 +40,10 @@ class TestSchedulerHiCachePrefetch(CustomTestCase):
         scheduler.tree_cache = tree_cache
 
         req = SimpleNamespace(
-            rid="request-id",
+            cache_request_handle=object(),
             last_host_node=root_node,
             last_node=device_node,
-            prefix_indices=[0, 1],
+            prefix_len=2,
             host_hit_length=0,
             full_untruncated_fill_ids=[10, 11, 12, 13, 14, 15],
             extra_key=None,

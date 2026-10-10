@@ -88,11 +88,14 @@ class TestXpuMoeLdPadding(CustomTestCase):
                 )
             return layer.w13_weight, layer.w2_weight
 
-        with unittest.mock.patch(
-            "sglang.srt.layers.quantization.unquant.is_xpu", return_value=True
-        ), unittest.mock.patch(
-            "sglang.srt.layers.quantization.unquant.get_moe_runner_backend",
-            return_value=MoeRunnerBackend.AUTO,
+        with (
+            unittest.mock.patch(
+                "sglang.srt.layers.quantization.unquant.is_xpu", return_value=True
+            ),
+            unittest.mock.patch(
+                "sglang.srt.layers.quantization.unquant.get_moe_runner_backend",
+                return_value=MoeRunnerBackend.AUTO,
+            ),
         ):
             # Backend on but building for CPU -> must stay contiguous.
             w13_cpu, w2_cpu = build("cpu")
@@ -107,11 +110,14 @@ class TestXpuMoeLdPadding(CustomTestCase):
                 self.assertTrue(w13_triton.is_contiguous())
 
         # Backend forced to Triton -> never padded, even on XPU.
-        with unittest.mock.patch(
-            "sglang.srt.layers.quantization.unquant.is_xpu", return_value=True
-        ), unittest.mock.patch(
-            "sglang.srt.layers.quantization.unquant.get_moe_runner_backend",
-            return_value=MoeRunnerBackend.TRITON,
+        with (
+            unittest.mock.patch(
+                "sglang.srt.layers.quantization.unquant.is_xpu", return_value=True
+            ),
+            unittest.mock.patch(
+                "sglang.srt.layers.quantization.unquant.get_moe_runner_backend",
+                return_value=MoeRunnerBackend.TRITON,
+            ),
         ):
             device = "xpu" if torch.xpu.is_available() else "cpu"
             w13, w2 = build(device)

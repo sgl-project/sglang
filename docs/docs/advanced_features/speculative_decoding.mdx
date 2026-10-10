@@ -1,9 +1,9 @@
 ---
 title: "Speculative Decoding"
 metatags:
-    description: "SGLang speculative decoding: EAGLE-2/EAGLE-3, MTP, DFLASH, draft model configuration, and overlap-scheduler guidance."
+    description: "SGLang speculative decoding: EAGLE-2/EAGLE-3, MTP, UNO, DFLASH, draft model configuration, and overlap-scheduler guidance."
 ---
-SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3, MTP, DFLASH, classic draft-model decoding, and an NGRAM-based variant. Our implementation aims to maximize speed and efficiency and is considered to be among the fastest in open-source LLM engines.
+SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3, MTP, UNO, DFLASH, classic draft-model decoding, and an NGRAM-based variant. Our implementation aims to maximize speed and efficiency and is considered to be among the fastest in open-source LLM engines.
 
 ## Summary
 
@@ -14,7 +14,9 @@ SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3,
   - [EAGLE-2 Decoding with torch.compile](#eagle-2-decoding-with-torch-compile)
   - [EAGLE-2 Decoding via Frequency-Ranked Speculative Sampling](#eagle-2-decoding-via-frequency-ranked-speculative-sampling)
   - [EAGLE-3 Decoding](#eagle-3-decoding)
+- [Block verification](#block-verification)
 - [Multi Token Prediction](#multi-token-prediction)
+- [UNO decoding](#uno-decoding)
 - [DFlash Decoding](#dflash-decoding)
 - [Standalone Speculative Decoding (Small Draft Model)](#standalone-speculative-decoding-small-draft-model)
 - [Speculative Decoding V2 (Overlap Scheduler)](#speculative-decoding-v2-overlap-scheduler)
@@ -30,6 +32,7 @@ SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3,
 - **Workload acceptance changes over time**: Use [**Adaptive speculative decoding**](./adaptive_speculative_decoding) on top of **EAGLE** with `--speculative-eagle-topk 1`.
 - **Lower `lm_head` overhead for EAGLE-2**: Enable **FR-Spec** with `--speculative-token-map`.
 - **Model is MTP-enabled**: Use **MTP via speculative decoding** (often with small `speculative_num_steps/topk/num_draft_tokens`, see the example section).
+- **You have a UNO adapter for the target model**: Use **UNO** with `--speculative-algorithm UNO` and `--uno-lora-path ...`.
 - **You have a DFlash draft checkpoint**: Use **DFLASH** with `--speculative-algorithm DFLASH` and `--speculative-draft-model-path ...`.
 - **You have a smaller draft LLM**: Use **STANDALONE** (`--speculative-algorithm STANDALONE`).
 - **No extra model available**: Use **NGRAM** (`--speculative-algorithm NGRAM`, CUDA-only).
@@ -86,26 +89,33 @@ SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3,
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>See <strong>Multi Token Prediction</strong> section</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Uses speculative workflow; draft path may be auto-handled for some models</td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>UNO</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Target model with a trained UNO LoRA (linear chain or tree)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>No</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>--speculative-algorithm UNO</code> + <code>--uno-lora-path ...</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>CUDA and FA3; currently requires TP=PP=1</td>
+    </tr>
 <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>DFLASH</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>DFlash draft model (linear block verification)</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Yes</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>--speculative-algorithm DFLASH</code> + <code>--speculative-draft-model-path ...</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>No <code>--enable-dp-attention</code>; <code>pp_size == 1</code>; disables overlap scheduler &amp; mixed chunked prefill</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>No DP attention (<code>--attn-dp-size</code> &gt; 1); <code>pp_size == 1</code>; disables overlap scheduler &amp; mixed chunked prefill</td>
     </tr>
 <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>STANDALONE</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Smaller draft LLM (token-level)</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Yes</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>--speculative-algorithm STANDALONE</code> + <code>--speculative-draft-model-path ...</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Does <strong>not</strong> support <code>--enable-dp-attention</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Does <strong>not</strong> support DP attention (<code>--attn-dp-size</code> &gt; 1)</td>
     </tr>
 <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>NGRAM</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Ngram cache from previous tokens</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>No</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>--speculative-algorithm NGRAM</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>CUDA-only; no <code>--enable-dp-attention</code>; disables overlap scheduler &amp; mixed chunked prefill</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>CUDA-only; no DP attention (<code>--attn-dp-size</code> &gt; 1); disables overlap scheduler &amp; mixed chunked prefill</td>
     </tr>
 </tbody>
 </table>
@@ -396,6 +406,31 @@ print(response.choices[0].message.content)
 
 ---
 
+## Block verification
+
+For stochastic EAGLE, EAGLE3, or NEXTN decoding on NVIDIA CUDA or AMD ROCm, add
+`--speculative-use-block-verification`
+with `--speculative-eagle-topk 1`. The draft model must produce a full target-vocabulary
+proposal distribution, as required by the existing rejection sampler.
+
+The same flag applies to the DFlash family (`DFLASH` and `DSPARK`) on CUDA or ROCm
+when the draft samples its proposals: DSpark drafts, DFlash checkpoints with a
+candidate selector, and [LiLiCorr](#lilicorr-reranked-dflash-drafts) drafts with
+`SGLANG_ENABLE_LILICORR_SAMPLING=1`. These paths already publish their proposal
+distribution, so `--speculative-use-rejection-sampling` is not needed. A DFlash draft
+that proposes greedy tokens is a point mass, where block and token-wise verification
+accept the same prefixes; the server warns that the flag has no effect.
+
+[Block verification](https://arxiv.org/abs/2403.10444) checks every draft prefix and
+keeps the longest accepted prefix, including when an earlier prefix was rejected.
+It uses a corresponding correction distribution to preserve target sampling.
+Use `--speculative-use-rejection-sampling` alone for token-wise verification, which
+stops at the first rejected token.
+Greedy requests keep their existing verification behavior.
+
+Block verification adds vocabulary reductions during verification. Benchmark your
+model and workload to measure the effect on latency and throughput.
+
 ## Multi Token Prediction
 
 We support [MTP (Multi-Token Prediction)](https://arxiv.org/pdf/2404.19737) in SGLang by using speculative decoding. We use `XiaomiMiMo/MiMo-7B-RL` as an example here (for DeepSeek MTP usage, refer to [DeepSeek-V3.2 cookbook §4.2.3](/cookbook/autoregressive/DeepSeek/DeepSeek-V3_2#4-2-3-multi-token-prediction-eagle-speculative-decoding)).
@@ -431,6 +466,88 @@ data = {
 response = requests.post(url, json=data)
 print(response.json())
 ```
+
+---
+
+## UNO decoding
+
+UNO reuses the target transformer for both passes of each speculative decode cycle instead of loading a separate draft model. During the draft forward, the first row of each request uses the base weights and the remaining `B - 1` rows use a trained UNO LoRA. Target verification is entirely base-only.
+
+UNO provides two sampling modes:
+
+- **Linear** constructs and verifies one chain of draft tokens, similar to DFlash's proposal layout.
+- **Tree** expands multiple candidates at each draft depth and uses SGLang's EAGLE tree-verification path.
+
+For UNO modes, the three numbers are `B/K/V`: draft-forward width, candidates kept per expansion, and verification width. Thus, `Linear 8/1/8` uses an 8-token draft width, one candidate per expansion, and an 8-token verification width. UNO's `K` controls proposal-tree breadth and is unrelated to the request sampling parameter `top_k`. The command-line mapping depends on the mode:
+
+- In linear mode, `B` and `V` are both `--speculative-num-draft-tokens`; set `--speculative-num-steps 1` and `--speculative-eagle-topk 1`.
+- In tree mode, `B` is `--speculative-num-steps + 1`, `K` is `--speculative-eagle-topk`, and `V` is `--speculative-num-draft-tokens`.
+
+Use an adapter trained for the exact target-model checkpoint. The current integration has been validated with `Qwen/Qwen3-8B`; unsupported LoRA target layers are rejected at startup. Set the adapter's local path or Hugging Face repository before starting the server:
+
+### Linear 8/1/8
+
+```bash Command
+export UNO_LORA_PATH="s-sahoo/uno-qwen3-8B"
+
+sglang serve \
+    --model-path Qwen/Qwen3-8B \
+    --speculative-algorithm UNO \
+    --uno-lora-path "$UNO_LORA_PATH" \
+    --speculative-num-steps 1 \
+    --speculative-eagle-topk 1 \
+    --speculative-num-draft-tokens 8 \
+    --attention-backend fa3 \
+    --tp 1 \
+    --host 0.0.0.0 \
+    --port 30000
+```
+
+### Tree 8/32/8
+
+The following command selects tree mode because `K` is greater than one:
+
+```bash Command
+export UNO_LORA_PATH="s-sahoo/uno-qwen3-8B"
+
+sglang serve \
+    --model-path Qwen/Qwen3-8B \
+    --speculative-algorithm UNO \
+    --uno-lora-path "$UNO_LORA_PATH" \
+    --speculative-num-steps 7 \
+    --speculative-eagle-topk 32 \
+    --speculative-num-draft-tokens 8 \
+    --attention-backend fa3 \
+    --tp 1 \
+    --host 0.0.0.0 \
+    --port 30000
+```
+
+Send requests through the standard OpenAI-compatible API:
+
+```python Example
+import openai
+
+client = openai.Client(base_url="http://127.0.0.1:30000/v1", api_key="None")
+
+response = client.chat.completions.create(
+    model="Qwen/Qwen3-8B",
+    messages=[{"role": "user", "content": "Explain speculative decoding."}],
+    max_tokens=128,
+)
+
+print(response.choices[0].message.content)
+```
+
+### Key requirements and limitations
+
+- UNO requires CUDA with FA3 for prefill and decode, tensor and pipeline parallel sizes of 1, and no DP attention or context parallelism.
+- `--uno-lora-path` loads UNO's fixed internal adapter and cannot be combined with request-selectable Multi-LoRA serving.
+- UNO manages its own stochastic verification; do not set `--speculative-use-rejection-sampling`.
+- Grammar decoding, returned logprobs or hidden states, sampling penalties, `min_p`, logit bias, custom logit processors, strict thinking, and deterministic inference are not yet supported.
+- In tree mode, both speculative acceptance thresholds must remain at 1.0, `V` must be at least `B` and at most 128, and `V * K` must not exceed 2048. SGLang validates the remaining tree-capacity and EAGLE parent-representation constraints at startup.
+- Mixed chunked prefill is disabled for UNO.
+- Ordinary overlap scheduling is supported. Tree mode does not yet support PDMux or the separate `--enable-two-batch-overlap` feature.
 
 ---
 
@@ -470,7 +587,7 @@ Relevant parameters:
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>None</code></td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--speculative-dflash-draft-window-size</code></td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--speculative-draft-window-size</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Draft KV sliding-window size. Must be <code>&gt;= speculative-num-draft-tokens</code> when set.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>None</code></td>
     </tr>
@@ -502,6 +619,40 @@ response = client.chat.completions.create(
 
 print(response.choices[0].message.content)
 ```
+
+### LiLiCorr: reranked DFlash drafts
+
+A DFlash drafter is trained on per-position marginals rather than on the joint block distribution, so its drafted tokens are individually plausible yet jointly incoherent. **LiLiCorr** ([arXiv:2608.20530](https://arxiv.org/abs/2608.20530)) keeps the top-`k` candidates per block position, scores the whole lattice jointly with a small two-layer transformer, and commits a path through it greedily instead of taking the per-slot argmax. Verify is unchanged, so outputs remain distributionally identical to the target model's and only acceptance length moves.
+
+LiLiCorr is **not a separate `--speculative-algorithm`**: it is a property of the draft checkpoint, the same way the DFlash candidate selector is. Serve it with `--speculative-algorithm DFLASH` and a checkpoint whose config declares `architectures: ["LiLiCorrDraftModel"]` and carries the `lilicorr_*` geometry fields inside `dflash_config`. The head is then built, loaded and folded into the draft CUDA graph automatically.
+
+No LiLiCorr drafter is published yet, so the draft path below is a placeholder.
+
+```bash Command
+python3 -m sglang.launch_server \
+    --model Qwen/Qwen3-8B \
+    --attention-backend fa3 \
+    --speculative-algorithm DFLASH \
+    --speculative-draft-model-path <your-lilicorr-draft-model>
+```
+
+**Use a backend that opts out of the host `seq_lens` mirror.** `AttentionBackend.needs_cpu_seq_lens` defaults to `True`; `fa3`, `triton`, `trtllm_mha`, `trtllm_mla`, `flashmla` and `dsa` set it `False`, while `FlashInferAttnBackend` inherits the default. Under a backend that does not opt out the worker publishes `seq_lens_cpu` every step, which is a device-to-host sync per block. The flag is OR-ed over the target and draft runners, so both have to opt out. This is a property of DFlash decoding rather than of LiLiCorr, but it dominates the throughput of a 16-slot block. Backends also differ in attention numerics, so acceptance measured on different backends does not belong in one table.
+
+A checkpoint carrying head weights but declaring `architectures: ["DFlashDraftModel"]` loads as plain DFlash and ignores the head, which reads as a small acceptance loss rather than an error. The reverse, declaring `LiLiCorrDraftModel` without complete head weights, is refused at load.
+
+#### Sampling the committed path
+
+Above temperature 0 the target samples, but a deterministic draft is paid `p(argmax)` per slot because verify is handed a point mass. `SGLANG_ENABLE_LILICORR_SAMPLING=1` draws each slot from `softmax(scores / T)` over that slot's candidates at the request's own temperature and publishes the proposal it drew from, so rejection sampling is paid the overlap of the two distributions instead. Verify stays exact. Greedy requests sharing the batch take the argmax and report a one-hot proposal.
+
+Off by default; with it unset the captured body is `select` itself, so temperature-0 output is unchanged bit for bit. On Qwen3-8B it is worth about 6% acceptance and 6% end-to-end at temperature 1, at under 1% of the per-block wall.
+
+**Only enable it on the folded path.** The eager fallback that serves the steps the draft CUDA graph cannot is correct but costs a large fraction of throughput, and because acceptance is identical either way that regression shows up only in tokens/s. `build_lilicorr_draft_sampler` warns with a reason when it declines to fold, and the worker warns once if a decode step lands on the eager head.
+
+#### Drafters with grouped convolutions
+
+LiLiCorr composes with the grouped dynamic convolutions that wrap each DFlash sublayer, and serving one needs no extra flag: the convolution belongs to the DFlash backbone, so `LiLiCorrDraftModel` inherits the builder and picks it up from `conv_kernel_size` and `conv_group_size` in `dflash_config`.
+
+Both keys default to `0`, so a checkpoint whose config lost them builds no convolution modules and the backbone loader then drops every convolution tensor it cannot resolve. That is correct for rotary caches and the worst case here, because the draft would serve as its convolution-free parent at a lower but entirely believable acceptance length. The loader therefore refuses any checkpoint whose convolution tensors and built modules disagree, in either direction.
 
 ---
 
@@ -553,7 +704,7 @@ Relevant parameters:
   </tbody>
 </table>
 
-> **Note:** Standalone speculative decoding currently **does not support** `--enable-dp-attention`.
+> **Note:** Standalone speculative decoding currently **does not support** DP attention (`--attn-dp-size` > 1).
 
 ```bash Command
 python3 -m sglang.launch_server \
@@ -690,7 +841,7 @@ Enable it with:
 
 Notes:
 - Ngram speculative decoding **only supports CUDA**.
-- It currently **does not support** `--enable-dp-attention`.
+- It currently **does not support** DP attention (`--attn-dp-size` > 1).
 - It disables the overlap scheduler and mixed chunked prefill.
 - If `--speculative-ngram-max-bfs-breadth > 1` (thus `speculative_eagle_topk > 1`) and `page_size > 1`, use `--attention-backend flashinfer`; otherwise the server will error.
 - Optional: set `SGLANG_NGRAM_FORCE_GREEDY_VERIFY=True` to force greedy verification.
@@ -753,13 +904,19 @@ Below is a comprehensive list of all speculative decoding parameters available i
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--speculative-algorithm</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>str</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>None</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Algorithm to use: <code>DFLASH</code>, <code>EAGLE</code>, <code>EAGLE3</code>, <code>STANDALONE</code>, <code>NGRAM</code>, <code>NEXTN</code> (alias of <code>EAGLE</code>)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Algorithm to use: <code>UNO</code>, <code>DFLASH</code>, <code>EAGLE</code>, <code>EAGLE3</code>, <code>STANDALONE</code>, <code>NGRAM</code>, <code>NEXTN</code> (alias of <code>EAGLE</code>)</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--speculative-draft-model-path</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>str</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>None</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Path to the draft model weights</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--uno-lora-path</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>str</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>None</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>UNO-only path or Hugging Face repository for the draft LoRA checkpoint</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--speculative-draft-model-revision</code></td>
@@ -777,19 +934,19 @@ Below is a comprehensive list of all speculative decoding parameters available i
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--speculative-num-steps</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>int</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>None</code> (auto-chosen when omitted)</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Autoregressive drafting depth</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Autoregressive drafting depth. Some algorithms auto-tune it; tree UNO requires it and uses <code>B = speculative_num_steps + 1</code>.</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--speculative-eagle-topk</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>int</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>None</code> (auto-chosen when omitted)</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Branching factor per drafting step</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Branching factor per drafting step. Some algorithms auto-tune it; UNO resolves an omitted value to <code>1</code>, and values greater than one select UNO tree mode.</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--speculative-num-draft-tokens</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>int</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>None</code> (auto-chosen when omitted)</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Maximum number of draft tokens for verification</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Maximum number of draft tokens for verification. Some algorithms auto-tune it; UNO requires it and uses it as linear width or tree verification width <code>V</code>.</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--speculative-dflash-block-size</code></td>
@@ -798,7 +955,7 @@ Below is a comprehensive list of all speculative decoding parameters available i
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>DFlash-only alias of <code>--speculative-num-draft-tokens</code></td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--speculative-dflash-draft-window-size</code></td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--speculative-draft-window-size</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>int</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>None</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>DFlash-only draft KV sliding-window size</td>

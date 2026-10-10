@@ -1,5 +1,8 @@
 import concurrent.futures
+import json
+import os
 import sys
+import tempfile
 import threading
 import unittest
 from types import SimpleNamespace
@@ -20,10 +23,11 @@ from sglang.srt.models.deepseek_v4 import (
     _dequant_fp8_wo_a_streaming,
 )
 from sglang.srt.models.deepseek_v4_dspark import DeepseekV4ForCausalLMDSpark
+from sglang.srt.utils import runai_utils
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=6, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class _FakeModel:
@@ -32,6 +36,80 @@ class _FakeModel:
 
 
 class TestRunaiModelStreamerLoader(CustomTestCase):
+    def test_remote_checkpoint_index(self):
+        for scheme in ("s3", "gs", "az"):
+            for relative_cache in (False, True):
+                with (
+                    self.subTest(scheme=scheme, relative_cache=relative_cache),
+                    tempfile.TemporaryDirectory() as cache_dir,
+                ):
+                    model_path = f"{scheme}://bucket/model"
+                    shard = "model-00001-of-00001.safetensors"
+                    files = [
+                        f"{model_path}/{shard}",
+                        f"{model_path}/mtp.safetensors",
+                        f"{model_path}/unused.safetensors",
+                    ]
+                    cache_root = (
+                        os.path.relpath(cache_dir) if relative_cache else cache_dir
+                    )
+                    with (
+                        patch.object(
+                            runai_utils.envs.SGLANG_CACHE_DIR,
+                            "get",
+                            return_value=cache_root,
+                        ),
+                        patch.object(loader_mod, "get_server_args", return_value=None),
+                        patch.object(
+                            runai_utils, "list_safetensors", return_value=files
+                        ) as list_safetensors,
+                        patch.object(
+                            weight_utils,
+                            "runai_safetensors_weights_iterator",
+                            return_value=iter(()),
+                        ) as streamer,
+                    ):
+                        metadata = runai_utils.ObjectStorageModel.get_path(model_path)
+                        os.makedirs(metadata, exist_ok=True)
+                        loader = loader_mod.RunaiModelStreamerLoader(
+                            LoadConfig(load_format=LoadFormat.RUNAI_STREAMER)
+                        )
+                        self.assertEqual(
+                            loader._prepare_weights(model_path, revision=None),
+                            (model_path, files),
+                        )
+                        list_safetensors.assert_called_with(path=model_path)
+
+                        with open(
+                            os.path.join(metadata, "model.safetensors.index.json"), "w"
+                        ) as f:
+                            json.dump({"weight_map": {"weight": shard}}, f)
+                        self.assertEqual(
+                            loader._prepare_weights(model_path, revision=None),
+                            (model_path, [files[0]]),
+                        )
+
+                        loader.target_device_str = "cpu"
+                        source = loader_mod.RunaiModelStreamerLoader.Source(
+                            model_or_path=model_path,
+                            revision=None,
+                            model_config=cast(
+                                ModelConfig,
+                                SimpleNamespace(
+                                    hf_config=SimpleNamespace(
+                                        architectures=["Glm4MoeForCausalLMNextN"],
+                                        num_nextn_predict_layers=1,
+                                    )
+                                ),
+                            ),
+                        )
+                        list(loader._get_weights_iterator(source))
+                        streamer.assert_called_once_with(files[:2], True, "cpu")
+
+                        list_safetensors.return_value = [files[-1]]
+                        with self.assertRaisesRegex(RuntimeError, shard):
+                            loader._prepare_weights(model_path, revision=None)
+
     def test_passes_quant_config_to_model_init(self):
         quant_config = object()
         fake_model = _FakeModel()

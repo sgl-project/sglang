@@ -1,7 +1,7 @@
 //! Runtime configuration: the rust-server boot knobs
 //! ([`RustServerServerArgs`]), the scheduler's typed `server_args` handoff
 //! ([`ServerArgs`] / [`ModelConfig`]), the [`RuntimeConfig`] pairing them for
-//! `runtime::start`, and the native MM pipeline handoff ([`MmSpec`]).
+//! `runtime::start`, and the Rust MM pipeline handoff ([`MmSpec`]).
 //!
 //! [`ServerArgs`] / [`ModelConfig`] / [`DefaultSamplingParams`] /
 //! [`DisaggregationMode`] / [`MmSpec`] / [`MmFamily`] / [`MmResample`] are
@@ -15,6 +15,7 @@
 //! [`PreferredSamplingParams`] — are the only Python-facing code in this file;
 //! the rest is pure Rust.
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -26,10 +27,12 @@ use serde::Serialize;
 #[derive(Clone, Debug)]
 pub struct RustServerServerArgs {
     pub http_addr: SocketAddr,
+    /// The gRPC transport's listen address; `None` keeps it disabled.
+    pub grpc_addr: Option<SocketAddr>,
     pub http_api_worker_num: usize,
     pub to_scheduler_cap: usize,
     pub from_scheduler_cap: usize,
-    pub channel_cap: usize,
+    pub stage_channel_cap: usize,
     /// CPU core ids the pools pin to (e.g. this rank's NUMA-local cores minus
     /// the scheduler's reserved launch cores). `None` → run unpinned.
     pub cores: Option<Vec<usize>>,
@@ -39,10 +42,11 @@ impl Default for RustServerServerArgs {
     fn default() -> Self {
         Self {
             http_addr: "127.0.0.1:30000".parse().unwrap(),
+            grpc_addr: None,
             http_api_worker_num: 2,
             to_scheduler_cap: 8192,
             from_scheduler_cap: 8192,
-            channel_cap: 8192,
+            stage_channel_cap: 8192,
             cores: None,
         }
     }
@@ -97,6 +101,9 @@ pub struct ServerArgs {
     /// HTTP bind address (see [`Self::bind`]).
     pub host: String,
     pub port: u16,
+    /// Optional gRPC base port. The same per-rank offset as HTTP is applied at
+    /// the Python→Rust startup boundary; `None` keeps gRPC disabled.
+    pub grpc_port: Option<u16>,
     /// Log levels driving the access log — uvicorn runs at
     /// `log_level_http or log_level` (see [`Self::http_access_log_enabled`]).
     pub log_level: String,
@@ -118,6 +125,9 @@ pub struct ServerArgs {
     /// Token-ids-in / token-ids-out mode: no tokenizer load, raw `output_ids`
     /// frames.
     pub skip_tokenizer_init: bool,
+    /// Start accepting health checks immediately instead of waiting for the
+    /// main process's startup warmup request to finish.
+    pub skip_server_warmup: bool,
     /// Streamed `/generate` frames carry per-step deltas instead of cumulative
     /// text. Matches the Python `TokenizerManager`.
     pub incremental_streaming_output: bool,
@@ -126,9 +136,11 @@ pub struct ServerArgs {
     pub disaggregation_mode: DisaggregationMode,
     /// The resolved Python `ModelConfig`, attached at handoff time.
     pub model_config: ModelConfig,
-    /// Default sampling params advertised by `/get_model_info`, verbatim from
-    /// `server_args.preferred_sampling_params` (a JSON object or null).
+    /// Launch-time sampling defaults merged beneath per-request values and
+    /// advertised by `/get_model_info`.
     pub preferred_sampling_params: Option<PreferredSamplingParams>,
+    /// Per-modality media-count limits from `--limit-mm-data-per-request`.
+    pub limit_mm_data_per_request: BTreeMap<String, usize>,
     /// Over-long inputs are truncated to fit the context instead of 400ing, and
     /// `max_new_tokens` is clamped rather than rejected (Python
     /// `TokenizerManager._validate_one_request`).
@@ -159,6 +171,7 @@ impl ServerArgs {
         weight_version,
         host,
         port,
+        grpc_port,
         log_level,
         log_level_http,
         chat_template,
@@ -168,10 +181,12 @@ impl ServerArgs {
         tokenizer_worker_num,
         detokenizer_worker_num,
         skip_tokenizer_init,
+        skip_server_warmup,
         incremental_streaming_output,
         disaggregation_mode,
         model_config,
         preferred_sampling_params,
+        limit_mm_data_per_request,
         allow_auto_truncate,
         enable_return_hidden_states,
         num_reserved_tokens,
@@ -189,6 +204,7 @@ impl ServerArgs {
         weight_version: Option<String>,
         host: String,
         port: u16,
+        grpc_port: Option<u16>,
         log_level: String,
         log_level_http: Option<String>,
         chat_template: Option<String>,
@@ -198,10 +214,12 @@ impl ServerArgs {
         tokenizer_worker_num: usize,
         detokenizer_worker_num: usize,
         skip_tokenizer_init: bool,
+        skip_server_warmup: bool,
         incremental_streaming_output: bool,
         disaggregation_mode: DisaggregationMode,
         model_config: ModelConfig,
         preferred_sampling_params: Option<PreferredSamplingParams>,
+        limit_mm_data_per_request: BTreeMap<String, usize>,
         allow_auto_truncate: bool,
         enable_return_hidden_states: bool,
         num_reserved_tokens: u64,
@@ -217,6 +235,7 @@ impl ServerArgs {
             weight_version,
             host,
             port,
+            grpc_port,
             log_level,
             log_level_http,
             chat_template,
@@ -226,10 +245,12 @@ impl ServerArgs {
             tokenizer_worker_num,
             detokenizer_worker_num,
             skip_tokenizer_init,
+            skip_server_warmup,
             incremental_streaming_output,
             disaggregation_mode,
             model_config,
             preferred_sampling_params,
+            limit_mm_data_per_request,
             allow_auto_truncate,
             enable_return_hidden_states,
             num_reserved_tokens,
@@ -253,6 +274,7 @@ impl Default for ServerArgs {
             weight_version: None,
             host: "127.0.0.1".into(),
             port: 30000,
+            grpc_port: None,
             log_level: "info".into(),
             log_level_http: None,
             chat_template: None,
@@ -262,10 +284,12 @@ impl Default for ServerArgs {
             tokenizer_worker_num: 1,
             detokenizer_worker_num: 1,
             skip_tokenizer_init: false,
+            skip_server_warmup: false,
             incremental_streaming_output: false,
             disaggregation_mode: DisaggregationMode::Null,
             model_config: ModelConfig::default(),
             preferred_sampling_params: None,
+            limit_mm_data_per_request: BTreeMap::new(),
             allow_auto_truncate: false,
             enable_return_hidden_states: false,
             num_reserved_tokens: 0,
@@ -303,9 +327,12 @@ impl<'py> pyo3::FromPyObject<'_, 'py> for PreferredSamplingParams {
     from_py_object,
     module = "sglang.srt.rust_extensions._server"
 )]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+// Lowercase to match the values Python reports for the same field.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum DisaggregationMode {
     /// Unified prefill + decode.
+    #[default]
     Null,
     Prefill,
     Decode,
@@ -315,6 +342,8 @@ pub enum DisaggregationMode {
 #[pyo3::pyclass(frozen, from_py_object, module = "sglang.srt.rust_extensions._server")]
 #[derive(Clone, Debug)]
 pub struct ModelConfig {
+    /// Authoritative HF model type, used to select a native chat formatter.
+    pub model_type: Option<String>,
     /// Resolved context length (`max_model_len` in `/v1/models`); the ceiling
     /// for input + `max_new_tokens`.
     pub context_len: u64,
@@ -337,18 +366,20 @@ pub struct ModelConfig {
 #[pyo3::pymethods]
 impl ModelConfig {
     #[new]
-    #[pyo3(signature = (*, context_len, vocab_size, is_multimodal, default_sampling_params))]
+    #[pyo3(signature = (*, context_len, vocab_size, is_multimodal, default_sampling_params, model_type))]
     fn py_new(
         context_len: u64,
         vocab_size: u64,
         is_multimodal: bool,
         default_sampling_params: DefaultSamplingParams,
+        model_type: Option<String>,
     ) -> Self {
         Self {
             context_len,
             vocab_size,
             is_multimodal,
             default_sampling_params,
+            model_type,
         }
     }
 }
@@ -358,6 +389,7 @@ impl Default for ModelConfig {
     fn default() -> Self {
         Self {
             context_len: 2048,
+            model_type: None,
             vocab_size: 1000,
             is_multimodal: false,
             default_sampling_params: DefaultSamplingParams::default(),
@@ -404,15 +436,15 @@ impl DefaultSamplingParams {
     }
 }
 
-/// The native MM pipeline handoff, built by `RustServer._build_mm_spec` from
-/// the resolved `NativeMmSpec` and passed to `Server.start_mm_workers`. Same
+/// The Rust MM pipeline handoff, built by `RustServer._build_mm_spec` from
+/// the resolved `RustMmSpec` and passed to `Server.start_mm_workers`. Same
 /// contract as [`ServerArgs`]: every field is a required, typed constructor
 /// keyword, so a drifted Python caller fails at boot.
 #[pyo3::pyclass(frozen, from_py_object, module = "sglang.srt.rust_extensions._server")]
 #[derive(Clone, Debug)]
 pub struct MmSpec {
     /// Park feature buffers in POSIX shm rather than inline. Set by the Python
-    /// launcher (`NativeMmHost._use_feature_shm`) exactly when the scheduler
+    /// launcher (`RustMmProcessor._use_feature_shm`) exactly when the scheduler
     /// broadcasts across TP ranks and will unwrap `ShmPointerMMData`.
     pub feature_shm: bool,
     /// The family pipeline and its resolved processor parameters.
@@ -442,7 +474,7 @@ impl MmSpec {
     fn py_new(
         family: MmFamily,
         feature_shm: bool,
-        image_token_id: i32,
+        image_token_id: i64,
         patch_size: usize,
         merge_size: usize,
         temporal_patch_size: usize,
@@ -475,7 +507,7 @@ impl MmSpec {
 
 /// Which `sglang_mm` family pipeline serves the model — one variant per
 /// [`sglang_mm::registry::PipelineSpec`] arm. Exposed to Python as an enum
-/// (`MmFamily.QwenVl`); `NativeMmFamily.name` maps onto it at handoff.
+/// (`MmFamily.QwenVl`); `RustMmFamily.name` maps onto it at handoff.
 #[pyo3::pyclass(
     eq,
     frozen,
@@ -487,9 +519,9 @@ pub enum MmFamily {
     QwenVl,
 }
 
-/// The HF image processor the native resize must reproduce bit-exactly (see
+/// The HF image processor the Rust resize must reproduce bit-exactly (see
 /// [`sglang_mm::qwen_vl::Resampler`]). Exposed to Python as an enum
-/// (`MmResample.AtenU8` / `.Pil`); `NativeMmFamily.image_processors` maps each
+/// (`MmResample.AtenU8` / `.Pil`); `RustMmFamily.image_processors` maps each
 /// processor class onto it.
 #[pyo3::pyclass(
     eq,
@@ -527,6 +559,25 @@ impl ServerArgs {
     pub fn validate(&self) -> Result<(), String> {
         if self.served_model_name.is_empty() {
             return Err("empty 'served_model_name' in server_args".into());
+        }
+        if let Some(grpc_port) = self.grpc_port {
+            if grpc_port == 0 {
+                return Err("'grpc_port' must be between 1 and 65535".into());
+            }
+            if grpc_port == self.port {
+                return Err(format!(
+                    "'grpc_port' ({grpc_port}) must differ from 'port' ({})",
+                    self.port
+                ));
+            }
+        }
+        if let Some(preferred) = &self.preferred_sampling_params {
+            // The wire schema is the contract: a preferred value the decoder
+            // rejects would 400 every request, so reject it at boot instead.
+            serde_json::from_value::<sglang_api_types::api::v1::SamplingParams>(
+                preferred.0.clone(),
+            )
+            .map_err(|e| format!("invalid preferred_sampling_params: {e}"))?;
         }
         Ok(())
     }
@@ -597,6 +648,14 @@ mod tests {
     }
 
     #[test]
+    fn disaggregation_mode_wire_values_match_python() {
+        let json = |m| serde_json::to_string(&m).unwrap();
+        assert_eq!(json(DisaggregationMode::Null), "\"null\"");
+        assert_eq!(json(DisaggregationMode::Prefill), "\"prefill\"");
+        assert_eq!(json(DisaggregationMode::Decode), "\"decode\"");
+    }
+
+    #[test]
     fn pd_role_derivations() {
         let prefill = ServerArgs {
             disaggregation_mode: DisaggregationMode::Prefill,
@@ -621,6 +680,36 @@ mod tests {
             ..Default::default()
         };
         assert!(sa.validate().is_ok());
+    }
+
+    #[test]
+    fn grpc_is_disabled_by_default_and_rejects_invalid_ports() {
+        assert!(ServerArgs::default().grpc_port.is_none());
+        assert!(RustServerServerArgs::default().grpc_addr.is_none());
+
+        let base = ServerArgs {
+            served_model_name: "m".into(),
+            ..Default::default()
+        };
+        assert!(base.validate().is_ok());
+        assert!(
+            ServerArgs {
+                grpc_port: Some(0),
+                ..base.clone()
+            }
+            .validate()
+            .unwrap_err()
+            .contains("between 1 and 65535")
+        );
+        assert!(
+            ServerArgs {
+                grpc_port: Some(base.port),
+                ..base
+            }
+            .validate()
+            .unwrap_err()
+            .contains("must differ")
+        );
     }
 
     /// `--log-level-http` overrides `--log-level` for the access log; unset or

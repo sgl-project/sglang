@@ -1,3 +1,4 @@
+import inspect
 import os
 from dataclasses import fields
 
@@ -18,16 +19,21 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.image_api import (
     _build_image_response_kwargs,
     _fallback_image_urls,
     _get_response_resize,
-    _image_request_model_kwargs,
     _raise_if_image_variant_not_found,
     _runtime_sampling_quality,
     _select_image_variant_cloud_url,
     _select_image_variant_path,
+    edits,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     ImageGenerationsRequest,
 )
+from sglang.multimodal_gen.runtime.entrypoints.openai.utils import request_model_kwargs
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
+
+
+def test_image_edits_declares_perf_dump_path_form_field():
+    assert "perf_dump_path" in inspect.signature(edits).parameters
 
 
 def test_url_response_returns_one_item_per_output_path():
@@ -58,6 +64,7 @@ def test_runtime_sampling_quality_preserves_the_openai_default():
     assert _runtime_sampling_quality(None) is None
     assert _runtime_sampling_quality("auto") is None
     assert _runtime_sampling_quality("lossless") == "lossless"
+    assert _runtime_sampling_quality("lossless") == "lossless"
     assert _runtime_sampling_quality("high") == "high"
 
 
@@ -77,10 +84,10 @@ def test_longcat_image_fields_remain_model_specific():
         assert field_name in longcat_fields
         assert getattr(request, field_name) == value
 
-    assert _image_request_model_kwargs(request, LongCatImageSamplingParams) == (
+    assert request_model_kwargs(request, LongCatImageSamplingParams, "image") == (
         field_values
     )
-    assert _image_request_model_kwargs(request, SamplingParams) == {}
+    assert request_model_kwargs(request, SamplingParams, "image") == {}
 
 
 def test_longcat_image_fields_accept_nested_extra_body():
@@ -94,7 +101,7 @@ def test_longcat_image_fields_accept_nested_extra_body():
         },
     )
 
-    assert _image_request_model_kwargs(request, LongCatImageSamplingParams) == {
+    assert request_model_kwargs(request, LongCatImageSamplingParams, "image") == {
         "enable_prompt_rewrite": True,
         "enable_cfg_renorm": False,
         "cfg_renorm_min": 0.5,
@@ -120,10 +127,10 @@ def test_other_image_extensions_remain_model_specific():
         assert field_name not in ImageGenerationsRequest.model_fields
         assert field_name not in base_fields
         assert field_name in model_fields
-        assert _image_request_model_kwargs(request, sampling_params_cls) == {
+        assert request_model_kwargs(request, sampling_params_cls, "image") == {
             field_name: value
         }
-        assert _image_request_model_kwargs(request, SamplingParams) == {}
+        assert request_model_kwargs(request, SamplingParams, "image") == {}
 
 
 def test_cosmos_image_guardrails_alias_is_preserved():
@@ -132,7 +139,7 @@ def test_cosmos_image_guardrails_alias_is_preserved():
         extra_body={"guardrails": False},
     )
 
-    assert _image_request_model_kwargs(request, Cosmos3SamplingParams) == {
+    assert request_model_kwargs(request, Cosmos3SamplingParams, "image") == {
         "use_guardrails": False
     }
 

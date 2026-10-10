@@ -14,6 +14,7 @@ from sglang.srt.distributed.communication_op import tensor_model_parallel_all_ga
 from sglang.srt.environ import envs
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dflash import DFlashDraftModel
 from sglang.srt.speculative.dflash_utils import can_dflash_slice_qkv_weight
@@ -84,7 +85,6 @@ def run_markov_block(
 
 
 class VanillaMarkov(nn.Module):
-
     markov_head_type = "vanilla"
 
     def __init__(self, *, vocab_size: int, markov_rank: int) -> None:
@@ -219,7 +219,6 @@ class Nemotron35VanillaMarkov(VanillaMarkov):
 
 
 class GatedMarkovHead(VanillaMarkov):
-
     markov_head_type = "gated"
 
     def __init__(self, *, vocab_size: int, markov_rank: int, hidden_size: int) -> None:
@@ -260,7 +259,6 @@ class GatedMarkovHead(VanillaMarkov):
 
 
 class RNNHead(VanillaMarkov):
-
     markov_head_type = "rnn"
 
     def __init__(self, *, vocab_size: int, markov_rank: int, hidden_size: int) -> None:
@@ -413,7 +411,6 @@ def build_nemotron_35_markov_head(config, quant_config, prefix: str) -> nn.Modul
 
 
 class DSparkConfidenceHead(nn.Module):
-
     def __init__(
         self,
         *,
@@ -483,6 +480,7 @@ _DSPARK_SKIPPED_WEIGHT_PREFIXES = ("lm_head.", "rotary_emb.")
 
 
 class DSparkDraftMixin:
+    supports_pre_gather_target_hidden_projection = True
 
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
@@ -641,8 +639,6 @@ class DSparkDraftMixin:
         rotary = attn0.rotary_emb
         if type(rotary).__name__ != "RotaryEmbedding":
             return None
-        if not getattr(rotary, "is_neox_style", False):
-            return None
         if getattr(rotary, "rotary_dim", None) != head_dim:
             return None
         eps = attn0.k_norm.variance_epsilon
@@ -661,6 +657,8 @@ class DSparkDraftMixin:
             if attn.rotary_emb is not rotary and not torch.equal(
                 attn.rotary_emb.cos_sin_cache, rotary.cos_sin_cache
             ):
+                return None
+            if attn.rotary_emb.is_neox_style != rotary.is_neox_style:
                 return None
             if attn.k_norm.variance_epsilon != eps:
                 return None
@@ -737,8 +735,13 @@ class DSparkDraftMixin:
         cache_loc: torch.Tensor,
         cache_loc_2d: Optional[torch.Tensor] = None,
         commit_lens: Optional[torch.Tensor] = None,
+        target_hidden_is_projected: bool = False,
     ) -> None:
-        ctx_hidden = self.project_target_hidden(target_hidden)
+        ctx_hidden = (
+            target_hidden
+            if target_hidden_is_projected
+            else self.project_target_hidden(target_hidden)
+        )
 
         bundle = self._fused_kv_write_bundle(pool)
         if bundle is not None:
@@ -769,6 +772,7 @@ class DSparkDraftMixin:
                 eps,
                 commit_lens=write_commit_lens,
                 locs_row_width=locs_row_width,
+                is_neox_style=self.layers[0].self_attn.rotary_emb.is_neox_style,
             )
             return
 
@@ -799,9 +803,11 @@ class DSparkDraftMixin:
                     attn.attn.v_scale,
                 )
             else:
+                # `cache_loc` comes from `TargetHiddenKvInjector.ids_for`,
+                # already in the ids the draft pool indexes.
                 pool.set_kv_buffer(
                     attn.attn,
-                    cache_loc,
+                    KVWriteLoc(cache_loc, physical=True),
                     k,
                     v,
                     attn.attn.k_scale,
@@ -851,7 +857,6 @@ class DSparkDraftMixin:
 
 
 class DSparkDraftModel(DSparkDraftMixin, DFlashDraftModel):
-
     def prune_to_ctx_kv_injection(self) -> None:
         self.markov_head = None
         self.confidence_head = None

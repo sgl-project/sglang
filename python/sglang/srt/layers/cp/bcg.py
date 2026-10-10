@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any, Dict, Optional
 import torch
 
 from sglang.srt.arg_groups.overrides import (
+    attention_backends_of,
     resolved_view,
     resolving_view,
 )
@@ -30,7 +31,6 @@ from sglang.srt.layers.cp.padding import get_cp_padding_align_size
 from sglang.srt.layers.cp.utils import (
     cp_gather_after_forward,
     cp_split_before_forward,
-    enable_cp_v2,
     prepare_cp_forward,
 )
 from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
@@ -46,22 +46,22 @@ if TYPE_CHECKING:
 
 def supports_prefill_cp_bcg(server_args: ServerArgs) -> bool:
     """Return whether the selected prefill-CP configuration supports BCG."""
-    from sglang.srt.arg_groups.overrides import attention_backends_of
 
     cfg = resolving_view(server_args)
     resolved = resolved_view(server_args)
     prefill_attention_backend, _ = attention_backends_of(resolved_view(server_args))
     return (
         cfg.enable_prefill_cp
+        and cfg.pp_size == 1
         and resolved.attn_cp_size == cfg.tp_size
         and cfg.cp_strategy == "zigzag"
         and prefill_attention_backend == "trtllm_mha"
     )
 
 
-def enable_cp_v2_bcg_capture(server_args: ServerArgs) -> bool:
-    """Return whether CP-v2 breakable prefill capture is enabled."""
-    return enable_cp_v2() and supports_prefill_cp_bcg(server_args)
+def enable_cp_bcg_capture(server_args: ServerArgs) -> bool:
+    """Return whether CP breakable prefill capture is enabled."""
+    return supports_prefill_cp_bcg(server_args)
 
 
 def filter_prefill_cp_bcg_capture_num_tokens(

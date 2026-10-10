@@ -146,7 +146,7 @@ class StagingBuffer:
         self.data_ptr = self.buffer.data_ptr()
 
         logger.info(
-            f"StagingBuffer allocated: {size_bytes / (1024*1024):.1f} MB "
+            f"StagingBuffer allocated: {size_bytes / (1024 * 1024):.1f} MB "
             f"on {device}, method={alloc_method}, ptr=0x{self.data_ptr:x}"
         )
 
@@ -207,7 +207,7 @@ class StagingAllocator:
 
         logger.info(
             f"StagingAllocator (ring+overcommit): "
-            f"{total_size_bytes / (1024*1024):.1f} MB "
+            f"{total_size_bytes / (1024 * 1024):.1f} MB "
             f"on {device}, ptr=0x{self.base_ptr:x}"
         )
 
@@ -243,8 +243,12 @@ class StagingAllocator:
                 self.alloc_order.pop(0)
 
             if not self.allocations:
+                # An empty ring makes the entire prior round reusable. Start a
+                # fresh round at offset zero so the watermark cannot stay stale.
+                self.round += 1
+                self.head = 0
                 self.watermark_round = self.round
-                self.watermark_tail = self.head
+                self.watermark_tail = 0
             elif self.alloc_order:
                 off, _, rnd = self.allocations[self.alloc_order[0]]
                 self.watermark_round = rnd

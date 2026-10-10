@@ -26,6 +26,7 @@ class DiTArchConfig(ArchConfig):
 
     # Reverse mapping for saving checkpoints: custom -> hf
     reverse_param_names_mapping: dict = field(default_factory=dict)
+    quant_ignore_remap: dict = field(default_factory=dict)
     hidden_size: int = 0
     num_attention_heads: int = 0
     num_channels_latents: int = 0
@@ -44,6 +45,10 @@ class DiTConfig(ModelConfig):
     prefix: str = ""
     quant_config: QuantizationConfig | None = None
     torch_compile_mode: str = "max-autotune-no-cudagraphs"
+
+    # torch._inductor.config overrides for this model, applied before compiling,
+    # e.g. {"multi_kernel_hints": [64, 4096]}.
+    torch_compile_inductor_config: dict[str, Any] = field(default_factory=dict)
 
     @staticmethod
     def add_cli_args(parser: Any, prefix: str = "dit-config") -> Any:

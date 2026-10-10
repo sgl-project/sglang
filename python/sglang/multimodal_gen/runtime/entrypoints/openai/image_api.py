@@ -5,7 +5,7 @@ import base64
 import contextlib
 import os
 import time
-from typing import Any, List, Optional
+from typing import List, Optional
 
 from fastapi import (
     APIRouter,
@@ -25,6 +25,10 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
     SamplingParams,
     generate_request_id,
 )
+from sglang.multimodal_gen.configs.task_type import DataType
+from sglang.multimodal_gen.runtime.entrypoints.openai.prompt_enhancement import (
+    maybe_enhance_prompt,
+)
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     ImageGenerationsRequest,
     ImageResponse,
@@ -36,11 +40,13 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     add_common_data_to_response,
     build_sampling_params,
     choose_output_image_ext,
-    get_sampling_request_extra_fields,
     merge_image_input_list,
     process_generation_batch,
     request_extra_value,
+    request_field_value,
+    request_model_kwargs,
     resolve_sampling_params_cls,
+    sanitize_upload_filename,
     save_image_to_path,
     temp_dir_if_disabled,
 )
@@ -53,34 +59,17 @@ from sglang.srt.observability.trace import extract_trace_headers
 router = APIRouter(prefix="/v1/images", tags=["images"])
 
 
-def _get_extra_field(request, field_name):
-    return request_extra_value(request, field_name)
-
-
-def _get_request_field_or_extra(request, field_name):
-    value = getattr(request, field_name, None)
-    if value is not None:
-        return value
-    return _get_extra_field(request, field_name)
-
-
-def _image_request_model_kwargs(
-    request: ImageGenerationsRequest,
-    sampling_params_cls: type[SamplingParams],
-) -> dict[str, Any]:
-    """Extract fields owned and declared by the active model contract."""
-
-    kwargs = {}
-    for field_name in get_sampling_request_extra_fields(sampling_params_cls, "image"):
-        value = _get_extra_field(request, field_name)
-        if value is not None:
-            kwargs[field_name] = value
-    return kwargs
-
-
 def _runtime_sampling_quality(quality: str | None) -> str | None:
     """Keep OpenAI's automatic default out of SGLang's sampling contract."""
     return None if quality in (None, "auto") else quality
+
+
+def _resolve_image_output_format(
+    output_format: str | None, sampling_params_cls: type[SamplingParams]
+) -> str | None:
+    if output_format is not None:
+        return output_format
+    return sampling_params_cls.default_image_output_format()
 
 
 def _read_b64_for_paths(paths: list[str]) -> list[str]:
@@ -267,18 +256,21 @@ async def generations(
     request_id = generate_request_id()
     server_args = get_global_server_args()
     sampling_params_cls = resolve_sampling_params_cls(server_args)
-    model_kwargs = _image_request_model_kwargs(request, sampling_params_cls)
-    output_format = (
-        request.output_format
-        if request.output_format is not None
-        else sampling_params_cls.default_image_output_format()
+    model_kwargs = request_model_kwargs(request, sampling_params_cls, "image")
+    output_format = _resolve_image_output_format(
+        request.output_format, sampling_params_cls
     )
     ext = choose_output_image_ext(output_format, request.background)
+    prompt = await maybe_enhance_prompt(
+        raw_request, request.prompt, enabled=request.enhance_prompt, task="image"
+    )
 
     with temp_dir_if_disabled(server_args.output_path) as output_dir:
         sampling = build_sampling_params(
             request_id,
-            prompt=request.prompt,
+            prompt=prompt,
+            task_type=request.task_type,
+            request_data_type=DataType.IMAGE,
             size=request.size,
             width=request.width,
             height=request.height,
@@ -292,23 +284,16 @@ async def generations(
             guidance_scale=request.guidance_scale,
             true_cfg_scale=request.true_cfg_scale,
             negative_prompt=request.negative_prompt,
-            max_sequence_length=(
-                request.max_sequence_length
-                if request.max_sequence_length is not None
-                else _get_extra_field(request, "max_sequence_length")
-            ),
-            flow_shift=(
-                request.flow_shift
-                if request.flow_shift is not None
-                else _get_extra_field(request, "flow_shift")
-            ),
+            max_sequence_length=request_field_value(request, "max_sequence_length"),
+            flow_shift=request_field_value(request, "flow_shift"),
             enable_teacache=request.enable_teacache,
-            enable_cache_dit=_get_extra_field(request, "enable_cache_dit"),
-            cache_dit_params=_get_extra_field(request, "cache_dit_params"),
-            cfg_gate_step=_get_extra_field(request, "cfg_gate_step"),
-            attention_backend_override=_get_extra_field(
+            enable_cache_dit=request_extra_value(request, "enable_cache_dit"),
+            cache_dit_params=request_extra_value(request, "cache_dit_params"),
+            cfg_gate_step=request_extra_value(request, "cfg_gate_step"),
+            attention_backend_override=request_extra_value(
                 request, "attention_backend_override"
             ),
+            skip_softmax_params=request_extra_value(request, "skip_softmax_params"),
             quality=_runtime_sampling_quality(request.quality),
             output_compression=request.output_compression,
             output_quality=request.output_quality,
@@ -317,11 +302,9 @@ async def generations(
             upscaling_model_path=request.upscaling_model_path,
             upscaling_scale=request.upscaling_scale,
             perf_dump_path=request.perf_dump_path,
-            progressive_mode=_get_request_field_or_extra(request, "progressive_mode"),
-            progressive_levels=_get_request_field_or_extra(
-                request, "progressive_levels"
-            ),
-            progressive_delta=_get_request_field_or_extra(request, "progressive_delta"),
+            progressive_mode=request_field_value(request, "progressive_mode"),
+            progressive_levels=request_field_value(request, "progressive_levels"),
+            progressive_delta=request_field_value(request, "progressive_delta"),
             **model_kwargs,
         )
         trace_headers = extract_trace_headers(raw_request.headers)
@@ -382,7 +365,7 @@ async def generations(
         response_kwargs = _build_image_response_kwargs(
             save_file_path_list,
             resp_format,
-            request.prompt,
+            prompt,
             request_id,
             result,
             b64_list=b64_list,
@@ -403,8 +386,10 @@ async def edits(
     url: Optional[List[str]] = Form(None),
     url_array: Optional[List[str]] = Form(None, alias="url[]"),
     prompt: str = Form(...),
+    enhance_prompt: bool = Form(False),
     mask: Optional[UploadFile] = File(None),
     model: Optional[str] = Form(None),
+    task_type: Optional[str] = Form(None),
     n: Optional[int] = Form(1),
     response_format: Optional[str] = Form(None),
     size: Optional[str] = Form(None),
@@ -424,10 +409,13 @@ async def edits(
     enable_upscaling: Optional[bool] = Form(False),
     upscaling_model_path: Optional[str] = Form(None),
     upscaling_scale: Optional[int] = Form(4),
+    perf_dump_path: Optional[str] = Form(None),
     num_frames: int = Form(1),
 ):
     request_id = generate_request_id()
     server_args = get_global_server_args()
+    sampling_params_cls = resolve_sampling_params_cls(server_args)
+    output_format = _resolve_image_output_format(output_format, sampling_params_cls)
     # Resolve images from either `image` or `image[]` (OpenAI SDK sends `image[]` when list is provided)
     images = image or image_array
     urls = url or url_array
@@ -449,10 +437,12 @@ async def edits(
         try:
             for idx, img in enumerate(image_list):
                 filename = img.filename if hasattr(img, "filename") else f"image_{idx}"
+                safe_name = sanitize_upload_filename(filename, f"image_{idx}")
                 input_path = await save_image_to_path(
                     img,
-                    os.path.join(uploads_dir, f"{request_id}_{idx}_{filename}"),
+                    os.path.join(uploads_dir, f"{request_id}_{idx}_{safe_name}"),
                     prefer_remote_source=server_args.input_save_path is None,
+                    uploads_root=uploads_dir,
                 )
                 input_paths.append(input_path)
         except Exception as e:
@@ -462,9 +452,18 @@ async def edits(
             )
 
         ext = choose_output_image_ext(output_format, background)
+        prompt = await maybe_enhance_prompt(
+            raw_request,
+            prompt,
+            enabled=enhance_prompt,
+            task="image_edit",
+            image_paths=input_paths,
+        )
         sampling = build_sampling_params(
             request_id,
             prompt=prompt,
+            task_type=task_type,
+            request_data_type=DataType.IMAGE,
             size=size,
             num_outputs_per_prompt=max(1, min(int(n or 1), 10)),
             output_file_name=f"{request_id}.{ext}",
@@ -484,6 +483,7 @@ async def edits(
             enable_upscaling=enable_upscaling,
             upscaling_model_path=upscaling_model_path,
             upscaling_scale=upscaling_scale,
+            perf_dump_path=perf_dump_path,
         )
         trace_headers = extract_trace_headers(raw_request.headers)
         batch = prepare_request(
