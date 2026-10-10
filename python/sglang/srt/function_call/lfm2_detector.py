@@ -21,7 +21,6 @@ import ast
 import json
 import keyword as _python_keyword
 import logging
-import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from sglang.srt.entrypoints.openai.protocol import Tool
@@ -767,9 +766,7 @@ class Lfm2Detector(BaseFormatDetector):
         if self.bot_token not in text:
             return StreamingParseResult(normal_text=normal_text, calls=[])
 
-        # Find all <|tool_call_start|>...<|tool_call_end|> blocks
-        pattern = rf"{re.escape(self.bot_token)}(.*?){re.escape(self.eot_token)}"
-        match_result_list = re.findall(pattern, text, re.DOTALL)
+        match_result_list = list(self._iter_tool_call_bodies(text))
 
         calls = []
         for match_result in match_result_list:
@@ -777,6 +774,17 @@ class Lfm2Detector(BaseFormatDetector):
             calls.extend(parsed_calls)
 
         return StreamingParseResult(normal_text=normal_text, calls=calls)
+
+    def _iter_tool_call_bodies(self, text: str):
+        # Linear scan on purpose: a `bot(.*?)eot` findall rescans to the end
+        # from every opening tag when the end tag never arrives.
+        start = text.find(self.bot_token)
+        while start != -1:
+            end = text.find(self.eot_token, start + len(self.bot_token))
+            if end == -1:
+                return
+            yield text[start + len(self.bot_token) : end]
+            start = text.find(self.bot_token, end + len(self.eot_token))
 
     def _strip_special_tokens(self, text: str) -> str:
         """Remove special tokens from text."""
