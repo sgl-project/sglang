@@ -392,14 +392,15 @@ class HiCacheNixl(HiCacheStorage):
             # so each slot matches what the v1 path would otherwise allocate.
             sample = mem_pool_host.get_dummy_flat_data_page()
             page_numel = sample.numel()
+            page_dtype = sample.dtype
             self._bounce_page_bytes = page_numel * sample.element_size()
             del sample
             pin_memory = bool(getattr(mem_pool_host, "pin_memory", False))
             self._bounce_set = self._alloc_registered(
-                page_numel, mem_pool_host.dtype, pin_memory, "bounce_set"
+                page_numel, page_dtype, pin_memory, "bounce_set"
             )
             self._bounce_get = self._alloc_registered(
-                page_numel, mem_pool_host.dtype, pin_memory, "bounce_get"
+                page_numel, page_dtype, pin_memory, "bounce_get"
             )
 
         logger.info(
@@ -426,15 +427,17 @@ class HiCacheNixl(HiCacheStorage):
         else:
             sample = host_pool.get_dummy_flat_data_page()
             page_numel = sample.numel()
+            # Serialized index and Mamba pages can differ from the pool dtype.
+            page_dtype = sample.dtype
             page_bytes = page_numel * sample.element_size()
             del sample
 
             pin_memory = bool(getattr(host_pool, "pin_memory", False))
             bounce_set = self._alloc_registered(
-                page_numel, host_pool.dtype, pin_memory, f"{host_pool_name}_bounce_set"
+                page_numel, page_dtype, pin_memory, f"{host_pool_name}_bounce_set"
             )
             bounce_get = self._alloc_registered(
-                page_numel, host_pool.dtype, pin_memory, f"{host_pool_name}_bounce_get"
+                page_numel, page_dtype, pin_memory, f"{host_pool_name}_bounce_get"
             )
             self._hybrid_pool_ctx[host_pool_name] = _HybridPoolContext(
                 host_pool=host_pool,
