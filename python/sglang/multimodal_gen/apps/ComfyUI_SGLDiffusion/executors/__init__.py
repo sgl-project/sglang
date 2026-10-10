@@ -7,6 +7,7 @@ from .adapter import ComfyUIModelAdapter, PackedForward, get_adapter_class
 from .base import SGLDiffusionExecutor
 from .flux import FluxAdapter, FluxExecutor
 from .minimax_h3 import MiniMaxH3Adapter, MiniMaxH3Executor
+from .qwen_image21 import QwenImage21Adapter, QwenImage21Executor
 from .zimage import ZImageAdapter, ZImageExecutor
 
 # Qwen adapters import ComfyUI (`comfy.ldm.common_dit`). Keep that optional so
@@ -20,6 +21,8 @@ __all__ = [
     "FluxExecutor",
     "MiniMaxH3Adapter",
     "MiniMaxH3Executor",
+    "QwenImage21Adapter",
+    "QwenImage21Executor",
     "ZImageAdapter",
     "ZImageExecutor",
     "QwenImageExecutor",

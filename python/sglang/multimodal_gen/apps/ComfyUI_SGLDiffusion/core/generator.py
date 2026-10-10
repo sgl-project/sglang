@@ -8,6 +8,7 @@ import os
 
 from ..executors.flux import FluxExecutor
 from ..executors.minimax_h3 import MiniMaxH3Executor
+from ..executors.qwen_image21 import QwenImage21Executor
 from ..executors.zimage import ZImageExecutor
 
 logger = logging.getLogger(__name__)
@@ -115,7 +116,7 @@ else:
 
 def _load_executor_classes():
     """Qwen adapters import ComfyUI. Keep them optional so CI can load the rest."""
-    classes = [FluxExecutor, ZImageExecutor, MiniMaxH3Executor]
+    classes = [FluxExecutor, ZImageExecutor, MiniMaxH3Executor, QwenImage21Executor]
     try:
         from ..executors.qwen_image import QwenImageEditExecutor, QwenImageExecutor
     except ModuleNotFoundError as exc:
