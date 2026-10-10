@@ -167,7 +167,9 @@ from sglang.multimodal_gen.runtime.utils.precision import (
 from sglang.multimodal_gen.runtime.utils.precision import (
     autocast_enabled as precision_autocast_enabled,
 )
-from sglang.multimodal_gen.runtime.utils.precision import resolve_precision
+from sglang.multimodal_gen.runtime.utils.precision import (
+    resolve_precision,
+)
 from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
 from sglang.multimodal_gen.runtime.utils.torch_compile import (
     CompiledModuleRegistry,
