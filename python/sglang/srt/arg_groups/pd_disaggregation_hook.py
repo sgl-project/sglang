@@ -250,7 +250,7 @@ def _validate_prefill_complete(server_args: ServerArgs) -> None:
 def _alias_bootstrap_port_to_api_port(server_args: ServerArgs) -> None:
     """Rust-server prefill serves the KV bootstrap registry on the api listener
     itself, so the resolved bootstrap port must BE the api port — every internal
-    consumer (KVManager registration, PrefillBootstrapQueue) reads the resolved
+    consumer (e.g. KVManager registration) reads the resolved
     field and agrees automatically. Decode is untouched: there the field names
     the PREFILL side's bootstrap port and must stay as the operator set it.
     """

@@ -170,7 +170,6 @@ class PrefillBootstrapQueue:
         req_to_metadata_buffer_idx_allocator: ReqToMetadataIdxAllocator,
         metadata_buffers: MetadataBuffers,
         gpu_id: int,
-        bootstrap_port: int,
         max_total_num_tokens: int,
         scheduler: Scheduler,
         scheduler_stage_metrics: SchedulerStageMetricsRecorder,
@@ -186,7 +185,6 @@ class PrefillBootstrapQueue:
         self.pp_rank = parallel.pp_rank
         self.pp_size = parallel.pp_size
         self.gpu_id = gpu_id
-        self.bootstrap_port = bootstrap_port
         self.queue: List[Req] = []
         self.scheduler = scheduler
         self.scheduler_stage_metrics = scheduler_stage_metrics
@@ -385,7 +383,9 @@ class PrefillBootstrapQueue:
 
         req.disagg_kv_sender = kv_sender_class(
             mgr=self.kv_manager,
-            bootstrap_addr=f"{req.bootstrap_host}:{self.bootstrap_port}",
+            # Register the DP rank where decode looks it up. With the Rust
+            # server, each DP listener has its own registry on its own port.
+            bootstrap_addr=f"{req.bootstrap_host}:{req.bootstrap_port}",
             bootstrap_room=req.bootstrap_room,
             req_has_disagg_prefill_dp_rank=req.disagg_prefill_dp_rank is not None,
         )

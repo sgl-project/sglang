@@ -17,7 +17,7 @@ from sglang.srt.arg_groups.overrides import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
-from sglang.srt.runtime_context import get_platform
+from sglang.srt.runtime_context import get_platform, num_dp_ranks_of
 from sglang.srt.utils.common import (
     configure_media_url_security,
     get_device,
@@ -197,17 +197,34 @@ def handle_load_balance_method(server_args: Any):
     if cfg.disaggregation_mode not in ("null", "prefill", "decode"):
         raise ValueError(f"Invalid disaggregation_mode={cfg.disaggregation_mode!r}")
 
+    # The Rust server gives each DP rank its own listener and the router picks
+    # one, so the bootstrap room cannot choose the rank. Prefill must register
+    # each request's rank for decode to look up instead.
+    rust_multi_rank_prefill = (
+        envs.SGLANG_RUST_SERVER.get()
+        and cfg.disaggregation_mode == "prefill"
+        and num_dp_ranks_of(cfg) > 1
+    )
+    if rust_multi_rank_prefill and cfg.load_balance_method == "follow_bootstrap_room":
+        raise ValueError(
+            "--load-balance-method follow_bootstrap_room does not work with "
+            "SGLANG_RUST_SERVER on a PD prefill with multiple DP ranks: each "
+            "rank has its own listener, so the router picks the rank, not the "
+            "bootstrap room. Use auto (resolves to round_robin) instead."
+        )
+
     if cfg.load_balance_method == "auto":
         # Default behavior:
         # - non-PD: round_robin
-        # - PD prefill: follow_bootstrap_room
+        # - PD prefill: follow_bootstrap_room (round_robin for a multi-rank
+        #   Rust server)
         # - PD decode: round_robin
         declare_resolution(
             server_args,
             "_handle_load_balance_method",
             load_balance_method=(
                 "follow_bootstrap_room"
-                if cfg.disaggregation_mode == "prefill"
+                if cfg.disaggregation_mode == "prefill" and not rust_multi_rank_prefill
                 else "round_robin"
             ),
         )
