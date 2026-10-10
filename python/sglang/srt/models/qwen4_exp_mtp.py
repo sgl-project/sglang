@@ -25,6 +25,15 @@ logger = logging.getLogger(__name__)
 
 
 class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
+    def load_weights(self, weights, is_mtp=False):
+        from sglang.srt.layers.hyperconnection import GatedResidual
+
+        loaded = super().load_weights(weights, is_mtp=is_mtp)
+        for module in self.modules():
+            if isinstance(module, GatedResidual):
+                module.prepare_sum_state_weights()
+        return loaded
+
     def __init__(
         self,
         config: PretrainedConfig,

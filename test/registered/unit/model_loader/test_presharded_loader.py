@@ -17,8 +17,77 @@ import torch
 from sglang.srt.model_loader.loader import PreshardedModelLoader
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+
+class TestPreshardedHCPreparation(CustomTestCase):
+    def test_cache_hit_prepares_hc_after_all_weights_without_reprocessing_model(self):
+        loader = object.__new__(PreshardedModelLoader)
+        loader.load_config = mock.Mock()
+        loader._verify_on_load = False
+        model = torch.nn.Module()
+        model.hc = torch.nn.Module()
+        model.hc.down = torch.nn.Parameter(torch.zeros(2, 4), requires_grad=False)
+        model.hc.inject = torch.nn.Parameter(torch.zeros(1, 4), requires_grad=False)
+        checkpoint = {
+            "hc.down": torch.arange(8, dtype=torch.float32).view(2, 4),
+            "hc.inject": torch.full((1, 4), 7.0),
+        }
+        events = []
+
+        def prepare(*, force):
+            self.assertTrue(force)
+            for name, weight in model.named_parameters():
+                torch.testing.assert_close(weight, checkpoint[name], rtol=0, atol=0)
+            events.append("hc")
+
+        model.hc.prepare_sum_state_weights = mock.Mock(side_effect=prepare)
+        model.hc.quant_method = mock.Mock()
+        model.hc.quant_method.process_weights_after_loading.side_effect = (
+            lambda module: events.append("quant")
+        )
+        model.post_load_weights = mock.Mock()
+        reads = [
+            {"filename": f"{name}.safetensors", "name": name, "stored_key": name}
+            for name in checkpoint
+        ]
+        plan = {"version": loader.PLAN_VERSION, "rank_to_reads": {"0": reads}}
+        with (
+            mock.patch.object(loader, "_collect_shard_config", return_value={}),
+            mock.patch.object(loader, "_presharded_dir", return_value="/presharded"),
+            mock.patch.object(loader, "_presharded_ready", return_value=True),
+            mock.patch.object(loader, "_shard_config_matches", return_value=True),
+            mock.patch.object(loader, "_world_rank_and_size", return_value=(0, 1)),
+            mock.patch.object(
+                loader,
+                "_read_presharded_file",
+                side_effect=lambda path, keys: {k: checkpoint[k] for k in keys},
+            ),
+            mock.patch.object(
+                loader,
+                "_rebind_parameter_aliases",
+                side_effect=lambda module: events.append("aliases"),
+            ),
+            mock.patch(
+                "sglang.srt.model_loader.loader._get_quantization_config",
+                return_value=None,
+            ),
+            mock.patch(
+                "sglang.srt.model_loader.loader._initialize_model", return_value=model
+            ),
+            mock.patch("builtins.open", mock.mock_open(read_data=json.dumps(plan))),
+        ):
+            result = loader.load_model(
+                model_config=SimpleNamespace(dtype=torch.float32),
+                device_config=SimpleNamespace(device="cpu"),
+            )
+        self.assertIs(result, model)
+        self.assertFalse(model.training)
+        self.assertEqual(events, ["quant", "aliases", "hc"])
+        model.hc.prepare_sum_state_weights.assert_called_once_with(force=True)
+        model.post_load_weights.assert_not_called()
 
 
 class TestPreshardedHashTensor(unittest.TestCase):

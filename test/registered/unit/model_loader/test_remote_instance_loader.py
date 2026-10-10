@@ -1,11 +1,15 @@
-"""Unit tests for RemoteInstanceModelLoader construction - no server, no weights."""
+"""Remote loader construction and synthetic host-storage registration tests."""
 
 import unittest
+from unittest.mock import Mock, patch
+
+import torch
 
 import sglang.srt.model_loader.loader as loader_mod
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
+    register_memory_region_v2,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -71,6 +75,33 @@ class TestRemoteInstanceModelLoaderExtraConfig(CustomTestCase):
             with self.subTest(backend=backend):
                 loader = loader_mod.RemoteInstanceModelLoader(_load_config(backend))
                 self.assertFalse(loader.load_config.model_loader_extra_config)
+
+
+class TestHostCheckpointRegistration(CustomTestCase):
+    def test_cpu_storage_aliases_offsets_and_empty(self):
+        backing = torch.arange(32, dtype=torch.float32)
+        model = torch.nn.Module()
+        model.register_parameter("left", torch.nn.Parameter(backing[4:12]))
+        model.register_parameter("right", torch.nn.Parameter(backing[12:24]))
+        model.register_parameter("empty", torch.nn.Parameter(torch.empty(0)))
+        engine = Mock()
+        engine.register_memory.return_value = 0
+        with patch("torch.cuda.memory.memory_snapshot", return_value=[]):
+            published = register_memory_region_v2(model, engine)
+        engine.register_memory.assert_called_once_with(
+            backing.data_ptr(), backing.nbytes
+        )
+        self.assertEqual(published["left"], (model.left.data_ptr(), 8, 4))
+        self.assertEqual(published["right"], (model.right.data_ptr(), 12, 4))
+        self.assertEqual(published["empty"][1], 0)
+
+    def test_registration_failure_is_not_published(self):
+        model = torch.nn.Linear(8, 4, bias=False, device="cpu")
+        engine = Mock()
+        engine.register_memory.return_value = -7
+        with patch("torch.cuda.memory.memory_snapshot", return_value=[]):
+            with self.assertRaisesRegex(RuntimeError, "register memory failed.*-7"):
+                register_memory_region_v2(model, engine)
 
 
 if __name__ == "__main__":
