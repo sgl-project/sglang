@@ -157,5 +157,65 @@ class TestStartupPlan(CustomTestCase):
         self.assertFalse(full._capture_open or tail._capture_open)
 
 
+class TestIndexerStepRowsCache(CustomTestCase):
+    """Lean breaks share the DeepGEMM prefill indexer's row plumbing across the index
+    layers of one step; a new step (new page table) or other rows must never reuse it."""
+
+    def setUp(self):
+        from sglang.srt.layers.attention.dsv4.v41_indexer import scoring
+
+        self.scoring = scoring
+        scoring._step_rows_cache.clear()
+        self.addCleanup(scoring._step_rows_cache.clear)
+        self.req_to_token = torch.arange(4 * 64).reshape(4, 64)
+        self.positions = torch.arange(40)
+
+    def _inputs(self, page_table, positions):
+        return SimpleNamespace(
+            compress_ratio=2,
+            positions=positions,
+            seq_lens_cpu=[24, 16],
+            req_pool_indices=self.req_pool,
+            kv_page_table=page_table,
+            rows_per_request_device=torch.tensor([24, 16]),
+        )
+
+    def test_reused_within_a_step_only(self):
+        self.req_pool = torch.tensor([1, 3])
+        step1 = torch.zeros(40, 8, dtype=torch.int32)
+        first = self.scoring._step_rows(
+            self._inputs(step1, self.positions), self.req_to_token
+        )
+        # Another index layer of the same step passes a fresh view of the same rows.
+        again = self.scoring._step_rows(
+            self._inputs(step1, self.positions[:40]), self.req_to_token
+        )
+        self.assertIs(again, first)
+        torch.testing.assert_close(
+            first["k_slots"][:12], self.req_to_token[1, 0:24:2] // 2
+        )
+        step2 = torch.zeros(40, 8, dtype=torch.int32)
+        self.assertIsNot(
+            self.scoring._step_rows(
+                self._inputs(step2, self.positions), self.req_to_token
+            ),
+            first,
+        )
+
+    def test_not_cached_when_lean_breaks_off(self):
+        from sglang.srt.environ import envs
+
+        self.req_pool = torch.tensor([1, 3])
+        page_table = torch.zeros(40, 8, dtype=torch.int32)
+        with envs.SGLANG_DSV4_EAGER_GRAPH_LEAN_BREAKS.override(False):
+            first = self.scoring._step_rows(
+                self._inputs(page_table, self.positions), self.req_to_token
+            )
+            again = self.scoring._step_rows(
+                self._inputs(page_table, self.positions), self.req_to_token
+            )
+        self.assertIsNot(again, first)
+
+
 if __name__ == "__main__":
     unittest.main()
