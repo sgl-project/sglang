@@ -2,6 +2,10 @@
 """Process-wide SGLD worker ownership for ComfyUI loaders."""
 
 from types import SimpleNamespace
+from unittest.mock import Mock
+
+import pytest
+import torch
 
 from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.core.generator import (
     SGLDiffusionGenerator,
@@ -135,3 +139,24 @@ def test_generator_reports_real_runtime_import_error(caplog) -> None:
     with pytest.raises(RuntimeError, match="failed to import") as err:
         module.SGLDiffusionGenerator().init_generator("flux", "FluxPipeline", {})
     assert isinstance(err.value.__cause__, ImportError)
+
+
+def _runtime_that_must_reject() -> SGLDiffusionGenerator:
+    """A loader whose model build fails loudly, so a check that should reject
+    first is caught if it lets the options through."""
+    runtime = SGLDiffusionGenerator()
+    runtime.get_comfyui_model = Mock(
+        side_effect=AssertionError("must reject before building the model")
+    )
+    return runtime
+
+
+def test_non_default_weight_dtype_is_rejected_before_worker_load() -> None:
+    """weight_dtype only reached the ComfyUI architecture companion, so fp8
+    produced output bit-identical to the default load."""
+    with pytest.raises(ValueError, match="weight_dtype must be 'default'"):
+        _runtime_that_must_reject().load_model(
+            model_path="h3.safetensors",
+            model_options={"dtype": torch.float8_e4m3fn},
+            sgld_options={},
+        )

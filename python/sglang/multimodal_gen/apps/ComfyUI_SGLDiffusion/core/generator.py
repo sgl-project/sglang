@@ -401,6 +401,13 @@ class SGLDiffusionGenerator:
         }
         sgld_options = dict(raw_sgld_options)
         model_options = dict(reload_kwargs["model_options"])
+        if model_options.get("dtype") is not None:
+            # Only the ComfyUI architecture companion would get this dtype; the
+            # worker loads its own weights, so the choice would be silently lost.
+            raise ValueError(
+                "SGLDUNETLoader weight_dtype must be 'default': the SGLD worker "
+                "does not use it; select quantization in SGLDOptions instead"
+            )
         plugin_flags = {}
         if "enable_cache_dit" in sgld_options:
             plugin_flags["enable_cache_dit"] = sgld_options.pop("enable_cache_dit")
