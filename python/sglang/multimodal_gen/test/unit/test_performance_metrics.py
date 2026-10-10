@@ -792,3 +792,18 @@ def test_request_metrics_compare_by_identity():
     assert perf_logger_module.RequestMetrics("a") != perf_logger_module.RequestMetrics(
         "b"
     )
+
+
+def test_log_request_summary_records_requested_tag(monkeypatch, tmp_path):
+    """The `tag` argument was ignored and every record was written with a fixed tag."""
+    monkeypatch.setattr(perf_logger_module, "get_git_commit_hash", lambda: "test")
+    monkeypatch.setattr(perf_logger_module, "get_is_main_process", lambda: True)
+    monkeypatch.setattr(
+        perf_logger_module, "get_diffusion_perf_log_dir", lambda: str(tmp_path)
+    )
+
+    perf_logger_module.PerformanceLogger.log_request_summary(
+        perf_logger_module.RequestMetrics("r1"), tag="custom_tag"
+    )
+
+    assert "custom_tag" in (tmp_path / "performance.log").read_text()
