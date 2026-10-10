@@ -98,6 +98,7 @@ def stub_plan():
     plan._unpadded_attn_tp_size = None
     plan.paths = {}
     plan.enters_stack = False
+    plan.finishes_directly = False
     return plan
 
 

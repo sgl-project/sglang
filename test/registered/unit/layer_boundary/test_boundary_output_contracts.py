@@ -14,7 +14,11 @@ from sglang.srt.layers.layer_boundary import (
 )
 from sglang.srt.layers.layer_boundary import exit as exits
 from sglang.srt.layers.layer_boundary import stage as stages
-from sglang.srt.layers.layer_boundary.contracts import BatchVariant
+from sglang.srt.layers.layer_boundary.contracts import (
+    BatchVariant,
+    ExitFacts,
+    StageKind,
+)
 from sglang.srt.layers.layer_boundary.fusions.cutedsl import CuteDSLFusion
 from sglang.srt.layers.layer_boundary.layout import SumGroup
 from sglang.srt.layers.layer_boundary.residual import batch
@@ -35,15 +39,21 @@ class TestBoundaryIntegrations(unittest.TestCase):
         produced = fixture.comm.OutputContract(
             rows, group=SumGroup.ATTN_TP, may_defer_to_next=True, update=PLAIN_ADD
         )
-        plan = SimpleNamespace(path_for=lambda _: SimpleNamespace(output=produced))
+        path = SimpleNamespace(output=produced)
+        plan = SimpleNamespace(finishes_directly=False, path_for=lambda _: path)
         boundary = exits.ExitPolicy(plan)
-        boundary._sum_deferral_allowed = lambda _: True
         summed = Mock(side_effect=lambda value, *args, **kwargs: value * 2)
         with (
             fixture.planning(parallel),
             patch.object(exits, "is_dp_attention_enabled", return_value=True),
             patch.object(exits, "sum_output", summed),
         ):
+            # Under attention DP a mixer completes its sum even where it could
+            # otherwise carry it to the next attention.
+            with patch.object(exits, "_sum_deferral_allowed", return_value=True):
+                path.exit = exits.exit_facts(
+                    StageKind.ATTENTION, plan, BatchVariant.ORDINARY, path
+                )
             stream = ResidualStream(torch.zeros(3, 4))
             result = exits.MixerExit(boundary, None, stream=stream)
             value = torch.ones(3, 4)
@@ -157,9 +167,6 @@ class TestBoundaryIntegrations(unittest.TestCase):
                     ),
                     patch.object(exits, "_ffn_has_tokens", return_value=True),
                     patch.object(
-                        exits, "post_experts_sum_is_one_all_reduce", return_value=False
-                    ),
-                    patch.object(
                         exits,
                         "get_lora",
                         return_value=SimpleNamespace(enable_lora=lora),
@@ -189,8 +196,11 @@ class TestBoundaryIntegrations(unittest.TestCase):
                     ),
                     patch.object(exits, "aiter_ar_fusion_applies", return_value=False),
                 ):
+                    facts = ExitFacts(
+                        single_sum=False, fused_consumer_sum=exits._fused_consumer_sum()
+                    )
                     self.assertEqual(
-                        exits._batch_allows_deferred_sum(fb),
+                        exits._batch_allows_deferred_sum(fb, facts),
                         enabled and (lora or shared),
                     )
 

@@ -250,7 +250,7 @@ class TestResidualStream(CustomTestCase):
         events = []
         outputs = AuxHiddenStateList()
 
-        def prepare(hidden, stream, batch, **kwargs):
+        def prepare(hidden, stream, batch, steps, **kwargs):
             events.append("add_norm")
             self.assertIsNone(stream.pending.owed)
             # A fused read returns both the norm output and its updated residual.
@@ -263,13 +263,15 @@ class TestResidualStream(CustomTestCase):
             outputs.capture(value, owned=owned)
 
         boundary.norm = None
-        stub_stage(boundary, StageKind.ATTENTION)._prepare_input = Mock(
-            side_effect=prepare
-        )
-        stub_stage(boundary, StageKind.ATTENTION).entry = lambda batch: SimpleNamespace(
+        stub_stage(boundary, StageKind.ATTENTION)._prepare = Mock(side_effect=prepare)
+        entry = SimpleNamespace(
             capture_move=None,
             capture_move_allocates=False,
             capture_preserves_residual=None,
+        )
+        stub_stage(boundary, StageKind.ATTENTION)._select = lambda hidden, batch: (
+            hidden,
+            SimpleNamespace(entry=entry),
         )
         output, stream = prepare_attention(
             stub_stage(boundary, StageKind.ATTENTION),
@@ -280,7 +282,7 @@ class TestResidualStream(CustomTestCase):
         )
         self.assertEqual(events, ["add_norm", "capture"])
         self.group.all_reduce.assert_called_once()
-        stub_stage(boundary, StageKind.ATTENTION)._prepare_input.assert_called_once()
+        stub_stage(boundary, StageKind.ATTENTION)._prepare.assert_called_once()
         torch.testing.assert_close(output, torch.full((2, 4), 15.0))
         torch.testing.assert_close(outputs[0], torch.full((2, 4), 5.0))
         stream.residual.zero_()
@@ -291,7 +293,7 @@ class TestResidualStream(CustomTestCase):
         extra = torch.full_like(self.partial, 7.0)
         outputs = AuxHiddenStateList()
 
-        def prepare(hidden, stream, batch, **kwargs):
+        def prepare(hidden, stream, batch, steps, **kwargs):
             self.assertEqual(len(outputs), 1)
             self.assertIs(kwargs["post_residual_addition"], extra)
             updated = hidden + stream.residual + extra
@@ -299,13 +301,15 @@ class TestResidualStream(CustomTestCase):
             return updated * 3, stream
 
         boundary.norm = None
-        stub_stage(boundary, StageKind.ATTENTION)._prepare_input = Mock(
-            side_effect=prepare
-        )
-        stub_stage(boundary, StageKind.ATTENTION).entry = lambda batch: SimpleNamespace(
+        stub_stage(boundary, StageKind.ATTENTION)._prepare = Mock(side_effect=prepare)
+        entry = SimpleNamespace(
             capture_move=None,
             capture_move_allocates=False,
             capture_preserves_residual=None,
+        )
+        stub_stage(boundary, StageKind.ATTENTION)._select = lambda hidden, batch: (
+            hidden,
+            SimpleNamespace(entry=entry),
         )
         output, _ = prepare_attention(
             stub_stage(boundary, StageKind.ATTENTION),

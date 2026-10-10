@@ -262,6 +262,48 @@ class EntryPath(msgspec.Struct, frozen=True):
     capture_preserves_residual: Optional[Callable] = None
 
 
+class ExitFacts(msgspec.Struct, frozen=True):
+    """What an FFN's or a mixer's exit decides from fixed facts, for one batch
+    variant: the parallel configuration, the declarations and the bound path.
+    What depends on the batch (its padding, whether the attention-DP
+    reduce-scatter is usable, whether it has tokens, a fused consumer's
+    accept) stays with the exit's decision for that batch.
+
+    They are read once, when the stage binds, under the scope it is built
+    in: a speculative draft's own MoE backends and boundary reduction while
+    it builds. A worker builds and runs its draft under the same MoE backend
+    scopes, so they hold for every forward. Whether the attention-DP
+    reduce-scatter is usable can change with elastic EP, so it is not one of
+    them.
+
+    Fields:
+        may_defer_sum: Whether an FFN may leave its sum to the next input as
+            far as fixed facts go: TP > 1, not the stack's end, one group the
+            next input can complete it over, no MoE-CP all-gather or
+            input-scattered batch, no EAGLE draft under attention DP, and under
+            attention DP only when the next input also scatters the output back.
+        defers_mixer_sum: Whether a mixer carries its sum to the next attention.
+        sum_in_reduce_scatter: Whether, without an attention-DP reduce-scatter,
+            a reduce-scatter completes the FFN's sum: its exit's own move, or
+            the next input's on an input-scattered batch.
+        sum_left_to_next_input: The sum an input-scattered batch's next input
+            completes, as the stream records it.
+        reduce_scatterv: Whether the attention-DP return is the reduce-scatterv.
+        single_sum: Whether the post-expert sum is one all-reduce, which a
+            deferred sum's consumer completes.
+        fused_consumer_sum: Whether a LoRA or TP1 shared-expert output, which
+            is not one all-reduce, may still be left to a fused consumer.
+    """
+
+    may_defer_sum: bool = False
+    defers_mixer_sum: bool = False
+    sum_in_reduce_scatter: bool = False
+    sum_left_to_next_input: Optional[SumGroup] = None
+    reduce_scatterv: bool = False
+    single_sum: bool = False
+    fused_consumer_sum: bool = False
+
+
 class StagePath(msgspec.Struct, frozen=True):
     """Precomputed entry and exit work for one stage and batch variant.
 
@@ -276,6 +318,7 @@ class StagePath(msgspec.Struct, frozen=True):
         returns_over_dp: Whether output uses batch-dependent attention-DP transport.
         writes_at_handoff: Whether the exit completes the output and writes it
             into the residual, for an FFN that hands off to another pipeline rank.
+        exit: What the exit decides from fixed facts (see ExitFacts).
     """
 
     entry: EntryPath
@@ -287,6 +330,7 @@ class StagePath(msgspec.Struct, frozen=True):
 
     returns_over_dp: bool = False
     writes_at_handoff: bool = False
+    exit: ExitFacts = ExitFacts()
 
 
 class StageKind(Enum):

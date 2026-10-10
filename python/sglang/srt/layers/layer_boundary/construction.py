@@ -36,7 +36,7 @@ from sglang.srt.layers.layer_boundary.contracts import (
     StageKind,
     StagePath,
 )
-from sglang.srt.layers.layer_boundary.exit import ExitPolicy
+from sglang.srt.layers.layer_boundary.exit import ExitPolicy, exit_facts
 from sglang.srt.layers.layer_boundary.fusions.allreduce import (
     attn_input_fusions,
     ffn_input_fusions,
@@ -191,7 +191,7 @@ class StagePlan:
                     attn_tp_gather=exit_gather,
                 )
             )
-            self.paths[variant] = StagePath(
+            path = StagePath(
                 entry=entry,
                 output=edges.outgoing.produced,
                 output_move=out.output_move,
@@ -199,6 +199,9 @@ class StagePlan:
                 output_gathers_attn_tp=out.gathers_attn_tp,
                 returns_over_dp=out.returns_over_dp,
                 writes_at_handoff=writes_at_handoff,
+            )
+            self.paths[variant] = msgspec.structs.replace(
+                path, exit=exit_facts(kind, self, variant, path)
             )
 
     @property

@@ -125,9 +125,13 @@ class TestBoundaryOutputPolicy(unittest.TestCase):
                 policy=policy, varlen=varlen, max_len=max_len, can_rs=can_rs
             ):
                 parallel = fixture.parallel_of(attn_dp=2, attn_tp=1)
-                layer = fixture.build(
-                    fixture.layer_case(2, 3), parallel, boundary_reduction=policy
-                )
+                # Whether the DP return is the reduce-scatterv is the configuration's.
+                with patch_communicator(
+                    "should_use_dp_reduce_scatterv", lambda: varlen
+                ):
+                    layer = fixture.build(
+                        fixture.layer_case(2, 3), parallel, boundary_reduction=policy
+                    )
                 calls = []
 
                 def move(step, batch, value):
@@ -147,7 +151,6 @@ class TestBoundaryOutputPolicy(unittest.TestCase):
                 )
                 with (
                     fixture.planning(parallel),
-                    patch_communicator("should_use_dp_reduce_scatterv", lambda: varlen),
                     patch_communicator("can_use_dp_reduce_scatter", lambda: can_rs),
                     patch_communicator("to_dp_local", move),
                     patch_communicator("sum_output", summed),
