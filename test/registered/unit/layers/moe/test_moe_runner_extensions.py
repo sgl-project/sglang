@@ -328,9 +328,10 @@ def test_trtllm_quant_method_defines_runner_after_create_moe_runner() -> None:
     method = Mxfp4FlashinferTrtllmMoEMethod.__new__(Mxfp4FlashinferTrtllmMoEMethod)
     assert not hasattr(method, "runner")
 
-    method.create_moe_runner(
-        SimpleNamespace(num_local_experts=2), MoeRunnerConfig(swiglu_limit=None)
-    )
+    # The clamp limit is registered on the layer as a buffer.
+    layer = torch.nn.Module()
+    layer.num_local_experts = 2
+    method.create_moe_runner(layer, MoeRunnerConfig(swiglu_limit=None))
 
     assert method.runner is None
 

@@ -20,6 +20,7 @@ from sglang.srt.layers.moe.topk import (
     TopKConfig,
     _mask_topk_ids_padded_region,
     _zero_topk_weights_padded_region,
+    capture_routed_experts_if_allowed,
     remap_topk_for_per_rank_shared_slots,
     resolve_routing_inputs,
 )
@@ -77,6 +78,14 @@ class HashTopK(nn.Module):
                 "HashTopK + apply_routed_scaling_factor_on_output is not supported "
                 "with fused shared experts; pass --disable-shared-experts-fusion."
             )
+        # Draft models opt out by flipping allow_routed_experts_capture.
+        self.topk_config = TopKConfig(
+            top_k=self.topk,
+            shared_experts=self.shared_experts,
+            routed_scaling_factor=routed_scaling_factor,
+            apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+            allow_routed_experts_capture=not self.is_draft,
+        )
 
     def routing_inputs(self):
         return resolve_routing_inputs(layer_id=self.layer_id, is_draft=self.is_draft)
@@ -264,6 +273,13 @@ class HashTopK(nn.Module):
         if self.apply_routed_scaling_factor_on_output:
             topk_weights = topk_weights * self.routed_scaling_factor
 
+        capture_routed_experts_if_allowed(
+            self.topk_config,
+            self.layer_id,
+            topk_ids,
+            num_token_non_padded,
+        )
+
         num_shared_topk_slots = self.num_shared_topk_slots
         routed_ids = (
             topk_ids[:, :-num_shared_topk_slots] if num_shared_topk_slots else topk_ids
@@ -296,12 +312,7 @@ class HashTopK(nn.Module):
                 topk_weights[:, :-num_shared_topk_slots],
                 num_shared_topk_slots,
                 num_physical_routed_experts,
-                TopKConfig(
-                    top_k=self.topk,
-                    shared_experts=self.shared_experts,
-                    routed_scaling_factor=self.routed_scaling_factor,
-                    apply_routed_scaling_factor_on_output=self.apply_routed_scaling_factor_on_output,
-                ),
+                self.topk_config,
             )
         elif num_shared_topk_slots:
             topk_ids = torch.cat(

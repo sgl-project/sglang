@@ -1928,7 +1928,7 @@ def _mask_topk_ids_padded_region(
         mask_topk_ids(topk_ids, num_token_non_padded)
     elif _is_npu:
         return
-    elif _can_fuse_padded_region(topk_ids):
+    elif not topk_ids.is_cpu and _can_fuse_padded_region(topk_ids):
         _fill_padded_rows(topk_ids, num_token_non_padded, fill_value)
     else:
         indices = torch.arange(0, topk_ids.shape[0], device=topk_ids.device)
