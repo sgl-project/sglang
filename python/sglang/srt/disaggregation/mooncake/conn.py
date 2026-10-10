@@ -731,7 +731,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     "encoding": encoding,
                     "raw_bytes": raw_bytes,
                     "wire_bytes": wire.numel(),
-                    "descriptor_bytes": len(desc.to_bytes()),
                     "prepare_ms": compression_ms,
                     "host_send_bytes": getattr(runtime.local, "host_send_bytes", 0),
                     "objects": len(pages),
@@ -2659,6 +2658,19 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     room_to_be_aborted = int(waiting_req_bytes[1].decode("ascii"))
                     decode_ip = waiting_req_bytes[2].decode("ascii")
                     decode_port = int(waiting_req_bytes[3].decode("ascii"))
+                    nonce = (
+                        waiting_req_bytes[4].decode("ascii")
+                        if len(waiting_req_bytes) > 4
+                        else ""
+                    )
+                    if self.compression_mode != "off":
+                        if not nonce:
+                            continue
+                        infos = self.transfer_infos.get(room_to_be_aborted, {}).values()
+                        if infos and not any(
+                            info.compression_nonce == nonce for info in infos
+                        ):
+                            continue
                     room_active = (
                         room_to_be_aborted in self.request_status
                         and self.check_status(room_to_be_aborted) != KVPoll.Success
@@ -2674,7 +2686,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         if room_active:
                             self.update_status(room_to_be_aborted, KVPoll.Failed)
                             self.register_deferred_ack_target(
-                                room_to_be_aborted, decode_ip, decode_port
+                                room_to_be_aborted, decode_ip, decode_port, nonce
                             )
                             # Try once: the room may already be quiescent and
                             # never revisited by the worker.
@@ -2683,13 +2695,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 f"Received abort notification for room {room_to_be_aborted}, "
                                 f"marked as Failed; ACK deferred until transfer drains"
                             )
-                        elif self._staging_outstanding.get(room_to_be_aborted, 0) == 0:
-                            # Concluded/unknown AND quiescent: ack now. A cleared
-                            # room is not automatically quiescent -- clear() can
-                            # drop a room whose chunk is still transferring.
-                            self._send_abort_ack(
-                                decode_ip, decode_port, room_to_be_aborted
+                        else:
+                            # Concluded/unknown rooms may still own writes. Keep
+                            # an ACK target until both queued reads and writes drain.
+                            self.register_deferred_ack_target(
+                                room_to_be_aborted, decode_ip, decode_port, nonce
                             )
+                            self._maybe_ack_drained_abort(room_to_be_aborted)
                         continue
                     # No need to abort the room if it has already succeeded
                     if room_active:
@@ -2836,11 +2848,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 if msg[0] == b"ABORT_ACK":
                     ack_aborted_room = int(msg[1].decode("ascii"))
                     logger.debug(f"Received ABORT_ACK for room {ack_aborted_room}")
-                    # Deferred release: the 3-frame ack carries the prefill rank
-                    # and means its transfer drained; aggregate for is_abort_release_safe.
+                    # Compression adds the request nonce to the rank-bearing drain ACK.
+                    # Old/missing nonces cannot release a compressed room.
                     if self.enable_deferred_decode_kv_release and len(msg) >= 3:
                         self.note_abort_ack(
-                            ack_aborted_room, int(msg[2].decode("ascii"))
+                            ack_aborted_room,
+                            int(msg[2].decode("ascii")),
+                            msg[3].decode("ascii") if len(msg) > 3 else "",
                         )
                     continue
 

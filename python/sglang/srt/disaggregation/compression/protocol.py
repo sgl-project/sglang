@@ -17,6 +17,10 @@ REGISTRATION_VERSION = 2
 MODES = ("off", "passthrough", "lz4", "ans")
 
 
+class CompressionCompatibilityError(ValueError):
+    """Terminal peer configuration error, not a transient bootstrap failure."""
+
+
 CHUNK_READY = b"COMPRESSED_CHUNK_READY_V2"
 
 
@@ -50,13 +54,13 @@ def capability(mode: str, force=None, verify=None) -> str:
     representation = "native-ans-65536-u1" if mode == "ans" else "native-lz4-65536"
     return (
         f"pd-kv-v{PROTOCOL_VERSION}/{mode}/nvcomp-{NVCOMP_VERSION}"
-        f"/{representation}/registration-v{REGISTRATION_VERSION}/verify-{int(verify)}{suffix}"
+        f"/{representation}/registration-v{REGISTRATION_VERSION}/verify-{int(verify)}{suffix}/drain-v1"
     )
 
 
 def check_peer(local: str, remote: str) -> None:
     if local != remote:
-        raise ValueError(
+        raise CompressionCompatibilityError(
             f"P/D KV compression mismatch: local={local!r}, peer={remote!r}"
         )
 

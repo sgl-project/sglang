@@ -244,6 +244,9 @@ class CompressedDecodeStagingHandler(DecodeStagingHandler):
                 return
             if session_id != receiver.session_id:
                 return
+            if self.runtime.transport_failed or self.runtime.shared.is_quarantined():
+                self._fail(req, RuntimeError("KV compression worker is quarantined"))
+                return
             try:
                 desc = ChunkDescriptor.from_bytes(payload)
                 if desc.nonce != receiver.compression_nonce:
@@ -478,6 +481,33 @@ class CompressedDecodeStagingHandler(DecodeStagingHandler):
                 except Exception as exc:
                     self._fail(decode_req, exc)
         super().advance_scatter(decode_req)
+
+    def abort_room_drained(self, room):
+        """Stop new restores and poll local completion without blocking scheduler."""
+        with self._restore_lock:
+            req = self._room_to_decode_req.get(room)
+            if req is not None:
+                req._staging_failed = True
+            if room in self._quarantined:
+                raise BufferDrainError("Restore buffers quarantined; restart worker")
+            tasks = [
+                future
+                for (task_room, _), (future, _) in self._restore_tasks.items()
+                if task_room == room
+            ]
+            if any(not future.done() for future in tasks):
+                return False
+            for future in tasks:
+                if future.cancelled():
+                    continue
+                try:
+                    future.result()
+                except BufferDrainError:
+                    self._quarantined.setdefault(room, req)
+                    raise
+                except Exception:
+                    pass  # A failed task whose CUDA accesses drained is releasable.
+            return req is None or all(event.query() for event, _ in req._chunk_events)
 
     def unregister_decode_req(self, room):
         with self._restore_lock:

@@ -14,7 +14,7 @@ With compression disabled, the original transfer path is used.
 ## Supported configuration
 
 The initial scope is Qwen3-8B, BF16, FlashInfer, 1P1D, TP/PP/DP/CP/DCP=1,
-page size 1 and prefill chunk size 1024. The reference settings use 512 MiB
+page size 1 and prefill chunk size 1024. The reference settings use 640 MiB
 compression workspace, 8 GB Prefill L2 and no Decode L2. Compressed L2 requires
 write-through and the Python UnifiedRadixCache. Overlap scheduling, CUDA graphs,
 HiSparse, speculative decoding, LoRA, sessions, external cache linkers and L3
@@ -259,3 +259,24 @@ waits, workspace and L2 occupancy. Cold encoding and cached-object reuse are
 separate experiments. Keep VERIFY settings matched. Show finalized commands
 and monitoring queries before a measured run; no performance result is implied
 by the algorithm probe or correctness validator.
+
+### Fault lifecycle revision (2026-10-10)
+
+Compression capability negotiation now includes `drain-v1`. Update both P/D
+workers together; older compression peers are rejected before transfer. The KV
+payload and registration layouts remain v2. Abort notifications and drain ACKs
+carry the receiver nonce, and ACKs are accepted only from expected prefill ranks.
+Local restore completion and remote drain are both required before release.
+
+Unconfirmed drain makes the worker unavailable and retains its resources. Pending
+requests receive an error; background drain polling continues. Quarantine remains
+sticky even if a late ACK permits safe cleanup. Restart the isolated workers after
+diagnosis. Capability mismatches return a request error and mark this experimental
+worker unavailable instead of escaping the scheduler loop. Reconfigure and restart
+a mismatched pair; this draft does not dynamically recover incompatible peers.
+
+Keep `SGLANG_KV_COMPRESSION_WORKSPACE_MB=640` for the validated Qwen3-8B
+1024-token configuration. This revision does not remove the 512 MiB capacity guard
+or change ANS batching/performance. Re-run GPU preflight, targeted abort/ACK and
+VERIFY mismatch faults, then the ten-group normal matrix on the new image. CPU
+method tests do not establish GPU/RDMA safety or Router retry behavior.
