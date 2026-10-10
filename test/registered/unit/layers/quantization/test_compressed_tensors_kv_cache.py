@@ -156,18 +156,20 @@ class TestCompressedTensorsKVCacheMethod(CustomTestCase):
 
     def test_nvfp4_calibration_requires_matched_cache_dtype(self):
         for dtype in ("auto", "bf16", "fp8_e4m3", "fp4_mx_block16"):
-            with self.subTest(dtype=dtype), self.assertRaisesRegex(
-                ValueError, "Checkpoint NVFP4 KV calibration requires"
+            with (
+                self.subTest(dtype=dtype),
+                self.assertRaisesRegex(
+                    ValueError, "Checkpoint NVFP4 KV calibration requires"
+                ),
             ):
                 self._resolve_dtype(dtype)
-        self.assertEqual(
-            self._resolve_dtype("nvfp4")[1], torch.float4_e2m1fn_x2
-        )
+        self.assertEqual(self._resolve_dtype("nvfp4")[1], torch.float4_e2m1fn_x2)
 
     def test_nvfp4_calibration_checks_effective_draft_dtype(self):
         for draft_dtype in ("bf16", "fp4_mx_block16"):
-            with self.subTest(draft_dtype=draft_dtype), self.assertRaisesRegex(
-                ValueError, "NVFP4 KV calibration requires"
+            with (
+                self.subTest(draft_dtype=draft_dtype),
+                self.assertRaisesRegex(ValueError, "NVFP4 KV calibration requires"),
             ):
                 self._resolve_dtype(
                     "nvfp4",
@@ -195,7 +197,8 @@ class TestCompressedTensorsKVCacheMethod(CustomTestCase):
     def test_other_cache_calibration_keeps_existing_resolution(self):
         self.assertEqual(
             self._resolve_dtype(
-                "auto", model=SimpleNamespace(quant_config=_config(_FP8_TENSOR_KV_SCHEME))
+                "auto",
+                model=SimpleNamespace(quant_config=_config(_FP8_TENSOR_KV_SCHEME)),
             )[1],
             torch.float8_e4m3fn,
         )
