@@ -667,6 +667,7 @@ def _make_decode_req(room, idx, mgr, n_prefill_ranks=1):
         # One entry per prefill rank the decode notified of the abort; its length
         # is the required drain-ack count (see DecodeTransferQueue._defer_release).
         bootstrap_infos=[{"rank": r} for r in range(n_prefill_ranks)],
+        is_abort_release_safe=lambda: mgr.is_abort_release_safe(room, n_prefill_ranks),
         clear=lambda: None,
     )
     return SimpleNamespace(

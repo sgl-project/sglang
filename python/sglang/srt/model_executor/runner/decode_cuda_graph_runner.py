@@ -245,10 +245,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.enable_torch_compile = get_flags().capture.enable_torch_compile
         self.disable_padding = get_exec().graph.disable_cuda_graph_padding
         self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
-        self.require_mlp_tp_gather = (
-            require_mlp_tp_gather() and not self._forward_is_dp_local(model_runner)
+        self.require_mlp_tp_gather, self.require_attn_tp_gather = (
+            self.decode_graph_gather_requirements(model_runner)
         )
-        self.require_attn_tp_gather = require_attn_tp_gather()
         # Composite predicates derive from the instance values so the dp-local
         # draft exemption above stays consistent (require_gathered_buffer ==
         # mlp_tp_gather or attn_tp_gather; require_mlp_sync adds dp attention).
@@ -330,7 +329,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         # --- bucket sizes ---------------------------------------------
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(
-            model_runner, self.captured_req_width
+            model_runner,
+            self.captured_req_width,
+            gathered_buffer_required=self.require_gathered_buffer,
         )
         if self.dllm_uses_input_embeds:
             max_requests = min(
@@ -629,6 +630,17 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             return "lora"
         return "nolora"
 
+    @classmethod
+    def decode_graph_gather_requirements(cls, model_runner) -> tuple[bool, bool]:
+        """(mlp_tp_gather, attn_tp_gather) needed by this runner's decode graphs.
+
+        Startup sizing (logits rows, reduction workspaces) asks the runner class
+        so it aligns capture buckets exactly as the runner itself will."""
+        return (
+            require_mlp_tp_gather() and not cls._forward_is_dp_local(model_runner),
+            require_attn_tp_gather(),
+        )
+
     @staticmethod
     def _forward_is_dp_local(model_runner) -> bool:
         """The DSpark dense draft runs attn-TP-local (draft_tp_context): each
@@ -655,6 +667,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             return None
         if envs.SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE.get():
             return None
+        layout = self._captured_ragged_layouts.get(num_tokens)
+        if layout is not None:
+            return layout
         from sglang.srt.speculative.ragged_verify import (
             RaggedVerifyLayout,
             build_capture_verify_lens,
@@ -1107,7 +1122,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if self.enable_torch_compile and not (get_flags().capture.enable_torch_compile):
             self.enable_torch_compile = False
             _, self.compile_bs = get_batch_sizes_to_capture(
-                self.model_runner, self.captured_req_width
+                self.model_runner,
+                self.captured_req_width,
+                gathered_buffer_required=self.require_gathered_buffer,
             )
         profile_context = empty_context()
         # Holds the active torch profiler during capture so the backend can
