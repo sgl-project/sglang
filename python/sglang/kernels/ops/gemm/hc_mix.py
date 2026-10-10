@@ -13,6 +13,10 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.utils import is_npu
+
+_is_npu = is_npu()
+
 _FUSED_MIX_MAX_ROWS = 16
 
 
@@ -166,7 +170,8 @@ def fused_hc_mix_supported(
     if _deterministic_inference():
         return False
     return (
-        hyper_input_normed.is_cuda
+        not _is_npu
+        and hyper_input_normed.is_cuda
         and hyper_input_normed.dtype in (torch.bfloat16, torch.float16)
         and w_down.dtype == hyper_input_normed.dtype
         and w_up.dtype == hyper_input_normed.dtype
