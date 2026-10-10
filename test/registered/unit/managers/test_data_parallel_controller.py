@@ -11,6 +11,7 @@ is exercised as the real method, no mock. The refresh-throttle tests inject
 `load_snapshot_reader` and `_last_refresh_time` on top of those.
 """
 
+import queue
 import threading
 import time
 import unittest
@@ -65,6 +66,104 @@ def _req(routed_dp_rank=None, bootstrap_room=None, input_ids=None):
         bootstrap_room=bootstrap_room,
         input_ids=input_ids or [],
     )
+
+
+class TestDPStartup(CustomTestCase):
+    def test_worker_reports_failure_without_signaling_success(self):
+        from sglang.srt.managers import data_parallel_controller as module
+
+        controller = DataParallelController.__new__(DataParallelController)
+        error = EOFError("scheduler readiness pipe closed")
+        controller.launch_tensor_parallel_group = MagicMock(side_effect=error)
+        results = queue.SimpleQueue()
+        with patch.object(module.time, "sleep") as sleep:
+            controller.launch_tensor_parallel_group_thread(None, None, 0, 1, results)
+        self.assertEqual(results.get_nowait(), (1, error))
+        self.assertTrue(results.empty())
+        sleep.assert_not_called()
+
+    def _launch(self, failing_rank):
+        from sglang.srt.managers import data_parallel_controller as module
+
+        controller = DataParallelController.__new__(DataParallelController)
+        error = EOFError("scheduler readiness pipe closed")
+        release_first = threading.Event()
+        release_workers = threading.Event()
+        finished = threading.Event()
+        original_thread = threading.Thread
+        workers, errors = [], []
+
+        class EndWorker(BaseException):
+            pass
+
+        def launch(server_args, port_args, base_gpu_id, rank):
+            if rank == failing_rank:
+                raise error
+            if failing_rank is not None:
+                release_first.wait()
+
+        def sleep(_):
+            release_workers.wait()
+            raise EndWorker()
+
+        def worker_thread(*, target, args):
+            def run():
+                try:
+                    target(*args)
+                except EndWorker:
+                    pass
+
+            worker = original_thread(target=run, daemon=True)
+            workers.append(worker)
+            return worker
+
+        def call():
+            try:
+                controller.launch_dp_schedulers(MagicMock(), MagicMock())
+            except Exception as exc:
+                errors.append(exc)
+            finally:
+                finished.set()
+
+        controller.launch_tensor_parallel_group = launch
+        parallel = SimpleNamespace(num_dp_ranks=2, tp_size=1, pp_size=1, node_rank=1)
+        caller = original_thread(target=call, daemon=True)
+        with (
+            patch.object(module, "get_parallel", return_value=parallel),
+            patch.object(
+                module, "get_device", return_value=SimpleNamespace(gpu_id_step=1)
+            ),
+            patch.object(module.PortArgs, "init_new", return_value=MagicMock()),
+            patch.object(module, "bind_port", return_value=MagicMock()),
+            patch.object(module.threading, "Thread", side_effect=worker_thread),
+            patch.object(module.time, "sleep", side_effect=sleep),
+        ):
+            caller.start()
+            try:
+                # Rank 0 has not completed: rank 1's error must still propagate.
+                self.assertTrue(finished.wait(2), "DP startup did not finish")
+                if failing_rank is None:
+                    self.assertTrue(all(worker.is_alive() for worker in workers))
+            finally:
+                release_first.set()
+                release_workers.set()
+                caller.join(2)
+                for worker in workers:
+                    worker.join(2)
+        self.assertFalse(caller.is_alive())
+        self.assertTrue(all(not worker.is_alive() for worker in workers))
+        return errors, error
+
+    def test_later_rank_failure_does_not_wait_for_earlier_rank(self):
+        errors, cause = self._launch(failing_rank=1)
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], RuntimeError)
+        self.assertIn("DP1", str(errors[0]))
+        self.assertIs(errors[0].__cause__, cause)
+
+    def test_all_groups_ready(self):
+        errors, _ = self._launch(failing_rank=None)
+        self.assertEqual(errors, [])
 
 
 class TestLocalKvEventSources(CustomTestCase):
