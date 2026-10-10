@@ -1588,11 +1588,11 @@ class MQALayer(MqaAttentionBase):
         q_out: Optional[torch.Tensor] = None,
         x_quant=None,
     ) -> torch.Tensor:
-        """Submit CP gathers before Q, then prepare cache/indexer sources."""
+        """Prepare indexer queries on the parent alongside CP source workers."""
         assert self.alt_streams is not None
-        assert len(self.alt_streams) >= 3
+        assert len(self.alt_streams) >= 2
         current_stream = torch.cuda.current_stream()
-        stream_kv, stream_compressor, stream_indexer = self.alt_streams[:3]
+        stream_kv, stream_compressor = self.alt_streams[:2]
         x_linear = x_quant if x_quant is not None else x
 
         qkv_a: Optional[torch.Tensor] = None
@@ -1613,9 +1613,9 @@ class MQALayer(MqaAttentionBase):
                 x.contiguous(), forward_batch, current_stream
             )
 
-        # Submit the long-running gathers before the SM-heavy Q GEMM. Q still
-        # waits only for q_lora and runs on the existing SWA writer stream, not
-        # the collective stream.
+        # Register gathers before Q during capture; replay can schedule these
+        # independent branches in either order. Q waits only for q_lora and
+        # runs on the SWA writer stream, not the collective stream.
         with torch.cuda.stream(stream_kv):
             q = self._compute_q_b(q_for_wqb, positions, q_out)
 
@@ -1626,7 +1626,6 @@ class MQALayer(MqaAttentionBase):
 
         stream_kv.wait_stream(current_stream)
         stream_compressor.wait_stream(current_stream)
-        stream_indexer.wait_stream(current_stream)
         with torch.cuda.stream(stream_kv):
             self._store_cp_swa_k(swa_k, forward_batch, attn_backend)
         prepared_dense_k = None
@@ -1648,20 +1647,16 @@ class MQALayer(MqaAttentionBase):
                 # its live dense prefixes on the same stream after that write.
                 prepared_dense_k = attn_backend._low_ratio_gather_k_prefill_graph(self)
         projected_q = projected_w = prepared_q = None
-        with torch.cuda.stream(stream_indexer):
-            if capture_indexer:
-                # Capture the full CP-local bucket; the paged metadata masks
-                # padding when the indexer runs after the worker join.
-                # These projections are graph-owned intermediates, so consume
-                # them directly after the join without persistent staging copies.
-                projected_q = self.indexer.queries(q_lora, self.freqs_cis[positions])
-                projected_w = self.indexer.head_weights(x)
-                prepared_q = attn_backend._low_ratio_quantize_q_prefill_graph(
-                    projected_q
-                )
+        if capture_indexer:
+            # Q/W and Q quantization need only local inputs, not compressed K or
+            # SWA KV. Keep them on the parent before joining the compressor so
+            # they overlap both workers without a separate indexer fork/join.
+            # The full CP-local bucket is graph-owned; metadata masks padding.
+            projected_q = self.indexer.queries(q_lora, self.freqs_cis[positions])
+            projected_w = self.indexer.head_weights(x)
+            prepared_q = attn_backend._low_ratio_quantize_q_prefill_graph(projected_q)
 
         current_stream.wait_stream(stream_compressor)
-        current_stream.wait_stream(stream_indexer)
         if capture_indexer:
             attn_backend._low_ratio_index_topk_captured(
                 self,

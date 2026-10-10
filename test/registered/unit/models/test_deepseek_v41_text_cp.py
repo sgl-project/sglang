@@ -27,10 +27,10 @@ RUNNER = "sglang.srt.model_executor.runner.eager_runner"
 
 class TestDSV41TextCP(CustomTestCase):
     def test_cp_multistream_gathers_submit_before_q_without_serializing(self):
-        """An early Q launch can starve CP collectives of SM resources. Submit
-        gathers first without making Q wait for them to finish. The cache writer
-        must still wait for KV, and attention must see completed Q. Emulate
-        stream frontiers to detect accidental collective/Q dependencies.
+        """Gathers and Q must stay independent, while indexer query preparation
+        must not wait for compressed K. Emulate stream frontiers to detect a
+        premature compressor/SWA join, an unfinished top-k input or missing Q.
+        Submission order alone does not guarantee GPU execution order.
         """
         module = "sglang.srt.models.deepseek_v4"
         for captured, compressor, fused, encoder_replay, has_q_out in product(
@@ -112,7 +112,13 @@ class TestDSV41TextCP(CustomTestCase):
             return enqueue("index_k", 7, *inputs)
 
         def topk(layer, q, w, *, prepared_q, prepared_dense_k):
-            enqueue("topk", 0, prepared_q, prepared_dense_k, w)
+            backend.topk_result = enqueue(
+                "topk",
+                prepared_q.value + prepared_dense_k.value + w.value,
+                prepared_q,
+                prepared_dense_k,
+                w,
+            )
 
         layer = NS(
             alt_streams=workers,
@@ -183,7 +189,20 @@ class TestDSV41TextCP(CustomTestCase):
         else:
             self.assertNotIn("main_gather", events)
         if captured:
+            for name in ("index_q", "index_w", "index_quant"):
+                stream, dependencies = events[name]
+                self.assertIs(stream, parent)
+                self.assertTrue(
+                    dependencies.isdisjoint({"q_b", "swa_store", "sources", "index_k"}),
+                    "Indexer query preparation waits for unrelated worker inputs",
+                )
+            self.assertEqual(backend.topk_result.value, 13)
             self.assertNotIn("swa_store", events["topk"][1])
+            if compressor:
+                self.assertIs(events["sources"][0], workers[1])
+        self.assertFalse(
+            workers[2].ready, "Unused indexer worker acquired dependencies"
+        )
 
     def test_cp_multistream_joins_swa_after_indexer_before_attention(self):
         # SWA KV is not an input of logits/top-k, but must be complete before
@@ -232,7 +251,7 @@ class TestDSV41TextCP(CustomTestCase):
                 layer, x, positions, NS(encoder_swa_replay=False), backend
             )
         self.assertIs(result, x)
-        self.assertEqual(order, [1, 2, "topk", 0])
+        self.assertEqual(order, [1, "topk", 0])
 
     def test_interleave_roundtrip_mixed_lengths_prefix_and_padding(self):
         for size in (2, 4):
