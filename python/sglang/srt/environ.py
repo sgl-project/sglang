@@ -372,6 +372,8 @@ class Envs:
     # Log top-level PickleWrapper frames unwrapped on msgpack IPC decode.
     SGLANG_LOG_PICKLE_IPC_OBJECTS = EnvBool(False)
     SGLANG_USE_MESSAGE_QUEUE_BROADCASTER = EnvBool(True)
+    # Group one detokenizer output message by TokenizerWorker destination.
+    SGLANG_ENABLE_BATCHED_DETOKENIZER_OUTPUTS = EnvBool(False)
     SGLANG_TCP_STORE_PORT = EnvInt(29600)
     # Base port hint for ephemeral sockets (ZMQ, SHM broadcaster, etc.).
     # When set, get_open_port() and shm_broadcast search upwards from this

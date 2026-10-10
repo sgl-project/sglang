@@ -38,6 +38,7 @@ import zmq
 import zmq.asyncio
 
 from sglang.srt.disaggregation.utils import TransferBackend
+from sglang.srt.environ import envs
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.io_struct import (
     BaseBatchReq,
@@ -502,9 +503,58 @@ class MultiHttpWorkerDetokenizerMixin:
         if hasattr(self, "socket_mapping"):
             self.socket_mapping.clear_all_sockets()
 
+    @staticmethod
+    def _group_output_by_http_worker(output, ipc_names):
+        if (
+            not isinstance(output, BaseBatchReq)
+            or ipc_names is None
+            or output.rids is None
+            or len(ipc_names) != len(output.rids)
+            or any(ipc_name is None for ipc_name in ipc_names)
+        ):
+            return None
+
+        indices_by_ipc: Dict[str, List[int]] = {}
+        for index, ipc_name in enumerate(ipc_names):
+            indices_by_ipc.setdefault(ipc_name, []).append(index)
+
+        try:
+            grouped = [
+                (
+                    ipc_name,
+                    _handle_output_by_indices(output, indices),
+                    indices,
+                )
+                for ipc_name, indices in indices_by_ipc.items()
+            ]
+        except _CannotSplitBatch:
+            return None
+
+        for _, grouped_output, indices in grouped:
+            grouped_output.http_worker_ipcs = [ipc_names[index] for index in indices]
+        return grouped
+
+    def _send_batch_output(self, output, ipc_names, enable_batching):
+        grouped = (
+            self._group_output_by_http_worker(output, ipc_names)
+            if enable_batching
+            else None
+        )
+        if grouped is not None:
+            for ipc_name, grouped_output, _ in grouped:
+                self.socket_mapping.send_output(
+                    ipc_name, grouped_output, is_tokenizer=True
+                )
+            return
+
+        for index, ipc_name in enumerate(ipc_names):
+            single_output = _handle_output_by_index(output, index)
+            self.socket_mapping.send_output(ipc_name, single_output, is_tokenizer=True)
+
     def multi_http_worker_event_loop(self: DetokenizerManager):
         """The event loop that handles requests, for multi multi-http-worker mode"""
         self.socket_mapping = SocketMapping()
+        enable_batching = envs.SGLANG_ENABLE_BATCHED_DETOKENIZER_OUTPUTS.get()
         # Watchdog wiring mirrors DetokenizerManager.event_loop: the watchdog is
         # paused while waiting for input and fed once per processed message.
         while True:
@@ -516,11 +566,9 @@ class MultiHttpWorkerDetokenizerMixin:
                 # In multi-detokenizer mode the upstream MultiDetokenizerRouter may
                 # forward either batched or single requests, so handle both shapes.
                 if isinstance(recv_obj, BaseBatchReq):
-                    for i, ipc_name in enumerate(recv_obj.http_worker_ipcs):
-                        new_output = _handle_output_by_index(output, i)
-                        self.socket_mapping.send_output(
-                            ipc_name, new_output, is_tokenizer=True
-                        )
+                    self._send_batch_output(
+                        output, recv_obj.http_worker_ipcs, enable_batching
+                    )
                 elif isinstance(recv_obj, BaseReq):
                     self.socket_mapping.send_output(
                         recv_obj.http_worker_ipc, output, is_tokenizer=True
