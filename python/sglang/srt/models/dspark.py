@@ -117,8 +117,8 @@ class BaseDSparkMarkovHead(nn.Module, ABC):
     ) -> torch.Tensor:
         """One token per row from the step logits ``base_logits + bias``,
         rounded to ``step_logits_dtype``: the argmax at temperature 0, a
-        Gumbel-max sample otherwise. ``logits_out`` receives this rank's step
-        logits ([bs, local vocab])."""
+        Gumbel-max sample otherwise. ``logits_out`` receives the step logits,
+        ``step_logits_width`` wide."""
         return MarkovSampleStep.execute(
             base_logits=base_logits,
             bias=bias,
@@ -135,13 +135,9 @@ class BaseDSparkMarkovHead(nn.Module, ABC):
     def _vocab_shard_args(self) -> dict:
         return {}
 
-    def local_vocab_width(self, lm_head: nn.Module) -> int:
-        """Width of the base logits this rank sees: the cropped vocab."""
-        return int(lm_head.org_vocab_size)
-
-    def gather_vocab(self, local_logits: torch.Tensor) -> torch.Tensor:
-        """[bs, gamma, local vocab] step logits -> [bs, gamma, vocab]."""
-        return local_logits
+    def step_logits_width(self, base_width: int) -> int:
+        """The width of the step logits over base logits ``base_width`` wide."""
+        return base_width
 
 
 class VanillaMarkov(BaseDSparkMarkovHead):
@@ -166,10 +162,15 @@ class VanillaMarkov(BaseDSparkMarkovHead):
         # The bias comes out in the embedding's dtype.
         return torch.promote_types(base_dtype, self.markov_w1.weight.dtype)
 
-    def fused_bias_weight(self) -> Optional[torch.Tensor]:
-        """The weight a one-row greedy step may fold into its argmax, or None
-        when the bias is not a plain GEMV of the previous token's embedding."""
-        return self.markov_w2.weight
+    def step_bias(
+        self,
+        prev_tokens: torch.Tensor,
+        *,
+        hidden_states: Optional[torch.Tensor],
+        state: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        del hidden_states
+        return self.project_bias(self.get_prev_embeddings(prev_tokens)), state
 
     def draft_step(
         self,
@@ -185,19 +186,18 @@ class VanillaMarkov(BaseDSparkMarkovHead):
         logits_out: Optional[torch.Tensor] = None,
         has_sampled_rows: Optional[bool] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        weight = self.fused_bias_weight()
-        # One greedy row with no logits to keep: the GEMV and the argmax both
-        # stream the weight once, so one kernel does both.
+        # One greedy row with no logits to keep: one kernel does the bias GEMV,
+        # the add and the argmax without writing the bias.
         if (
-            weight is not None
-            and has_sampled_rows is False
+            has_sampled_rows is False
             and logits_out is None
             and len(prev_tokens) == 1
+            and self._bias_is_w2_gemv()
         ):
             tokens = MarkovGreedyStep.execute(
                 base_logits=base_logits,
                 prev_embeds=self.get_prev_embeddings(prev_tokens),
-                w2_weight=weight,
+                w2_weight=self.markov_w2.weight,
             )
             return tokens, state
         return super().draft_step(
@@ -213,15 +213,14 @@ class VanillaMarkov(BaseDSparkMarkovHead):
             has_sampled_rows=has_sampled_rows,
         )
 
-    def step_bias(
-        self,
-        prev_tokens: torch.Tensor,
-        *,
-        hidden_states: Optional[torch.Tensor],
-        state: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        del hidden_states
-        return self.project_bias(self.get_prev_embeddings(prev_tokens)), state
+    def _bias_is_w2_gemv(self) -> bool:
+        # The fused kernel recomputes this class's bias from the raw w2 weight;
+        # a subclass that changes the bias keeps the op.
+        cls = type(self)
+        return (
+            cls.step_bias is VanillaMarkov.step_bias
+            and cls.project_bias is VanillaMarkov.project_bias
+        )
 
 
 class Nemotron35VanillaMarkov(VanillaMarkov):
@@ -256,10 +255,6 @@ class Nemotron35VanillaMarkov(VanillaMarkov):
         bias, _ = self.markov_w2(latent_states)
         return bias
 
-    def fused_bias_weight(self) -> Optional[torch.Tensor]:
-        # A quantized weight needs its scale; the fused kernel reads it raw.
-        return None
-
 
 class GatedMarkovHead(VanillaMarkov):
     def __init__(self, *, vocab_size: int, markov_rank: int, hidden_size: int) -> None:
@@ -276,10 +271,6 @@ class GatedMarkovHead(VanillaMarkov):
         prev_embeddings = self.get_prev_embeddings(token_ids)
         gate_inputs = torch.cat([hidden_states, prev_embeddings], dim=-1)
         return torch.sigmoid(self.gate_proj(gate_inputs))
-
-    def fused_bias_weight(self) -> Optional[torch.Tensor]:
-        # The bias depends on the hidden state, not only on the previous token.
-        return None
 
     def step_bias(
         self,
@@ -327,10 +318,6 @@ class RNNHead(VanillaMarkov):
             device=hidden_states.device,
             dtype=hidden_states.dtype,
         )
-
-    def fused_bias_weight(self) -> Optional[torch.Tensor]:
-        # The bias depends on the hidden state, not only on the previous token.
-        return None
 
     def step_bias(
         self,

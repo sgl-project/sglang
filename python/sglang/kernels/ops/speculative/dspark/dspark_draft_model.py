@@ -19,11 +19,11 @@ class MarkovGreedyStep:
     Computes ``argmax_v(base_logits[:, v] + dot(w2_weight[v, :], prev_embeds))``
     in a single pass over the (vocab x rank) weight: no full-vocab bias or
     step-logits materialization, no separate GEMV / add / two-pass argmax
-    launches. Numerics: the dot and the add accumulate in fp32, while the eager
-    path rounds the GEMV output and the add to bf16 before argmax — near-tie
-    winners can differ on rare steps. Drafts are proposals only (target verify
-    guards output correctness), so the impact is bounded to accept-rate noise
-    on exact ties.
+    launches. Numerics: the dot and the add accumulate in fp32, while
+    MarkovSampleStep rounds the bias and the sum to the step dtype; near-tie
+    winners can differ, so a one-row block can draft differently from the same
+    row in a larger batch. Drafts are proposals only (target verify guards the
+    output), so the impact is bounded to accept-rate noise on near ties.
     """
 
     @classmethod

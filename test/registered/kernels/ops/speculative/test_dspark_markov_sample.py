@@ -227,6 +227,57 @@ class TestMarkovSampleStep(CustomTestCase):
         for rank in range(3):
             self.assertTrue(torch.equal(run(rank, lambda _: stacked), full))
 
+    def test_kept_sharded_logits_match_full_vocab(self):
+        # Kept logits are gathered whole and every rank picks from them: the
+        # same tokens and the same logits as the full vocab, both backends.
+        g = torch.Generator(device=DEVICE).manual_seed(2)
+        rows, shard = 32, 5000
+        vocab = 2 * shard - 7
+        base = torch.randn(rows, 3 * shard, generator=g, device=DEVICE)
+        bias = torch.randn(rows, vocab, generator=g, device=DEVICE)
+        temps = torch.rand(rows, generator=g, device=DEVICE)
+        temps[:8] = 0.0
+        full_logits = torch.empty(rows, vocab, device=DEVICE)
+        full = _call(
+            MarkovSampleStep.triton,
+            base=base[:, :vocab].contiguous(),
+            bias=bias,
+            temps=temps,
+            step_dtype=torch.float32,
+            logits_out=full_logits,
+        )
+        for impl in (MarkovSampleStep.triton, MarkovSampleStep.torch):
+            locals_ = {}
+
+            def run(rank, gather_logits):
+                start = rank * shard
+                logits_out = torch.empty(rows, vocab, device=DEVICE)
+                tokens = _call(
+                    impl,
+                    base=base[:, start : start + shard].contiguous(),
+                    bias=bias[:, start : start + shard].contiguous(),
+                    temps=temps,
+                    step_dtype=torch.float32,
+                    vocab_start=start,
+                    gather=lambda _: self.fail("candidates gathered"),
+                    gather_logits=gather_logits,
+                    logits_out=logits_out,
+                )
+                return tokens, logits_out
+
+            for rank in range(3):
+                run(
+                    rank,
+                    lambda local, rank=rank: locals_.setdefault(
+                        rank, local.clone()
+                    ).repeat(1, 3),
+                )
+            stacked = torch.cat([locals_[rank] for rank in range(3)], dim=1)
+            for rank in range(3):
+                tokens, logits_out = run(rank, lambda _: stacked)
+                self.assertTrue(torch.equal(tokens, full))
+                self.assertTrue(torch.equal(logits_out, full_logits))
+
 
 if __name__ == "__main__":
     unittest.main()

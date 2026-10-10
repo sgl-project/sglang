@@ -41,6 +41,9 @@ from sglang.srt.speculative.draft_worker_common import (
     make_draft_block_spec_info,
     make_draft_sampler_capture_hook,
 )
+from sglang.srt.speculative.dspark_components.dspark_block_accept_estimator import (
+    block_accept_recording_enabled,
+)
 from sglang.srt.speculative.dspark_components.dspark_config import (
     DSV4_DRAFT_ATTENTION_BACKEND,
     draft_is_deepseek_v4,
@@ -324,6 +327,9 @@ class DSparkWorkerV2(BaseSpecWorker):
             tp_sync=self._tp_sync,
             random_seed=target_worker.random_seed,
             greedy_draft=self._greedy_draft,
+            # Read from the env, not the rank-0 recorder: kept logits change
+            # the draft collectives, which every rank must issue alike.
+            keep_greedy_logits=block_accept_recording_enabled(),
             dp_moe_sync=self._draft_is_moe and get_parallel().attn_dp_enabled,
         )
         self._verify_epilogue = None

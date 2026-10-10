@@ -2,9 +2,12 @@
 per row, the argmax at temperature 0 and a Gumbel-max sample otherwise.
 
 The vocab may be TP-sharded: each rank reduces its shard to one (value,
-global-index-bits) pair per block, and only those pairs are all-gathered.
+global-index-bits) pair per block, and only those pairs are all-gathered. When
+the step logits are kept, they are gathered whole instead and every rank picks
+from the full vocab, so a step takes one collective either way.
 """
 
+import functools
 from typing import Callable, Optional
 
 import torch
@@ -50,7 +53,9 @@ def _markov_sample_partial_kernel(
     STEP,
     BLOCK: tl.constexpr,
     ROUND: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
     STORE: tl.constexpr,
+    SELECT: tl.constexpr,
     SAMPLE: tl.constexpr,
     PHILOX_ROUNDS: tl.constexpr,
 ):
@@ -58,11 +63,50 @@ def _markov_sample_partial_kernel(
     i = part * BLOCK + tl.arange(0, BLOCK)
     valid = i < WIDTH
     in_shard = i < PADDED
-    bias = tl.load(B + row * BS + i, valid, 0).to(tl.float32)
-    base = tl.load(X + row * XS + i, in_shard, 0).to(tl.float32)
-    value = _round_to_step_dtype(base + bias, ROUND)
+    value = tl.load(X + row * XS + i, in_shard, 0).to(tl.float32)
+    if HAS_BIAS:
+        value += tl.load(B + row * BS + i, valid, 0).to(tl.float32)
+    value = _round_to_step_dtype(value, ROUND)
     if STORE:
         tl.store(L + row * LS + i, value.to(L.dtype.element_ty), in_shard)
+    if SELECT:
+        _select_block(
+            value,
+            T,
+            OFFSET,
+            P,
+            row,
+            part,
+            i,
+            valid,
+            PARTS,
+            KEY,
+            STEP,
+            VOCAB_START,
+            BLOCK,
+            SAMPLE,
+            PHILOX_ROUNDS,
+        )
+
+
+@triton.jit
+def _select_block(
+    value,
+    T,
+    OFFSET,
+    P,
+    row,
+    part,
+    i,
+    valid,
+    PARTS,
+    KEY,
+    STEP,
+    VOCAB_START,
+    BLOCK: tl.constexpr,
+    SAMPLE: tl.constexpr,
+    PHILOX_ROUNDS: tl.constexpr,
+):
     key = value
     # Without SAMPLE every row is at temperature 0: no per-row temperature read
     # on the critical path and no noise code.
@@ -149,15 +193,70 @@ def _philox(key: int, c0, c1, c2, c3) -> tuple[torch.Tensor, ...]:
     return c0, c1, c2, c3
 
 
+def _launch_partial(
+    base_logits,
+    bias,
+    *,
+    width,
+    store,
+    temperatures,
+    key,
+    offset,
+    step,
+    step_dtype,
+    has_sampled_rows,
+    vocab_start=0,
+    select=True,
+):
+    # Returns the [rows, parts * 2] (value, index bits) candidates of each block.
+    rows, padded = base_logits.shape
+    parts = triton.cdiv(padded, _BLOCK)
+    assert parts > 0
+    partial = torch.empty(
+        (rows, parts, 2), device=base_logits.device, dtype=torch.float32
+    )
+    _markov_sample_partial_kernel[(rows, parts)](
+        base_logits if bias is None else bias,
+        base_logits,
+        temperatures,
+        offset,
+        base_logits if store is None else store,
+        partial,
+        0 if bias is None else bias.stride(0),
+        base_logits.stride(0),
+        0 if store is None else store.stride(0),
+        width,
+        padded,
+        vocab_start,
+        parts,
+        key,
+        step,
+        _BLOCK,
+        _ROUND_CODE[step_dtype],
+        bias is not None,
+        store is not None,
+        select,
+        has_sampled_rows is not False,
+        _PHILOX_ROUNDS,
+        num_warps=4,
+    )
+    # The padded shard width fixes the transport shape on all ranks; WIDTH
+    # masks real entries, including a completely empty final shard.
+    return partial.view(rows, parts * 2)
+
+
 class MarkovSampleStep:
     """``base_logits`` is the rank's padded vocab shard, ``bias`` its first
     ``width`` columns (the rest is padding and never wins). The step logits are
     their sum rounded to ``step_dtype``, the dtype the head's own add produces.
-    A temperature of 0 takes the argmax. ``logits_out``, when given, receives
-    the step logits of the whole padded shard. ``gather`` stacks every rank's
+    A temperature of 0 takes the argmax. ``gather`` stacks every rank's
     ``[rows, k]`` candidates as ``[world * rows, k]``; None for an unsharded
-    vocab. ``has_sampled_rows=False`` promises every temperature is 0 and skips
-    the noise; None decides per row on the device. Returns global token ids."""
+    vocab. ``logits_out``, when given, receives the step logits: of the whole
+    padded base unsharded, else of the first ``logits_out.shape[1]`` columns
+    of ``gather_logits``, which lays every rank's ``[rows, padded]`` shard side
+    by side; the rank then picks from those. ``has_sampled_rows=False`` takes
+    the argmax of every row and reads neither the temperatures nor the offset;
+    None decides per row on the device. Returns global token ids."""
 
     @classmethod
     def execute(cls, **kwargs) -> torch.Tensor:
@@ -167,7 +266,15 @@ class MarkovSampleStep:
 
     @staticmethod
     def _check(
-        base_logits, bias, temperatures, offset, step_dtype, vocab_start, logits_out
+        base_logits,
+        bias,
+        temperatures,
+        offset,
+        step_dtype,
+        vocab_start,
+        gather,
+        gather_logits,
+        logits_out,
     ):
         assert base_logits.ndim == bias.ndim == 2
         assert bias.shape[0] == base_logits.shape[0]
@@ -180,8 +287,12 @@ class MarkovSampleStep:
         # Philox words go to tokens in quads of global ids.
         assert vocab_start % 4 == 0, vocab_start
         if logits_out is not None:
-            assert logits_out.shape == base_logits.shape
             assert logits_out.dtype == step_dtype and logits_out.stride(1) == 1
+            if gather is None:
+                assert logits_out.shape == base_logits.shape
+            else:
+                assert gather_logits is not None
+                assert logits_out.shape[0] == base_logits.shape[0]
 
     @classmethod
     def triton(
@@ -196,46 +307,48 @@ class MarkovSampleStep:
         step_dtype: torch.dtype,
         vocab_start: int = 0,
         gather: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+        gather_logits: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
         logits_out: Optional[torch.Tensor] = None,
         has_sampled_rows: Optional[bool] = None,
     ) -> torch.Tensor:
         cls._check(
-            base_logits, bias, temperatures, offset, step_dtype, vocab_start, logits_out
-        )
-        rows, width = bias.shape
-        padded = base_logits.shape[1]
-        parts = triton.cdiv(padded, _BLOCK)
-        assert parts > 0
-        partial = torch.empty(
-            (rows, parts, 2), device=base_logits.device, dtype=torch.float32
-        )
-        _markov_sample_partial_kernel[(rows, parts)](
-            bias,
             base_logits,
+            bias,
             temperatures,
             offset,
-            base_logits if logits_out is None else logits_out,
-            partial,
-            bias.stride(0),
-            base_logits.stride(0),
-            0 if logits_out is None else logits_out.stride(0),
-            width,
-            padded,
+            step_dtype,
             vocab_start,
-            parts,
-            key,
-            step,
-            _BLOCK,
-            _ROUND_CODE[step_dtype],
-            logits_out is not None,
-            has_sampled_rows is not False,
-            _PHILOX_ROUNDS,
-            num_warps=4,
+            gather,
+            gather_logits,
+            logits_out,
         )
-        # The padded shard width fixes the transport shape on all ranks;
-        # WIDTH masks real entries, including a completely empty final shard.
-        partial = partial.view(rows, parts * 2)
-        gathered = partial if gather is None else gather(partial)
+        rows, width = bias.shape
+        launch = functools.partial(
+            _launch_partial,
+            temperatures=temperatures,
+            key=key,
+            offset=offset,
+            step=step,
+            step_dtype=step_dtype,
+            has_sampled_rows=has_sampled_rows,
+        )
+        if gather is not None and logits_out is not None:
+            local = torch.empty(
+                base_logits.shape, device=base_logits.device, dtype=step_dtype
+            )
+            launch(base_logits, bias, width=width, store=local, select=False)
+            full = gather_logits(local)[:, : logits_out.shape[1]]
+            gathered = launch(full, None, width=full.shape[1], store=logits_out)
+        else:
+            partial = launch(
+                base_logits,
+                bias,
+                width=width,
+                store=logits_out,
+                vocab_start=vocab_start,
+            )
+            gathered = partial if gather is None else gather(partial)
+        parts = gathered.shape[1] // 2
         world = gathered.shape[0] // rows
         result = torch.empty(rows, device=base_logits.device, dtype=torch.int64)
         _markov_sample_finish_kernel[(rows,)](
@@ -262,20 +375,42 @@ class MarkovSampleStep:
         step_dtype: torch.dtype,
         vocab_start: int = 0,
         gather: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+        gather_logits: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
         logits_out: Optional[torch.Tensor] = None,
         has_sampled_rows: Optional[bool] = None,
     ) -> torch.Tensor:
         # None draws the noise for every row: reading the temperatures on the
         # host would break a graph capture.
         cls._check(
-            base_logits, bias, temperatures, offset, step_dtype, vocab_start, logits_out
+            base_logits,
+            bias,
+            temperatures,
+            offset,
+            step_dtype,
+            vocab_start,
+            gather,
+            gather_logits,
+            logits_out,
         )
         rows, width = bias.shape
-        padded = base_logits.shape[1]
-        device = base_logits.device
         value = base_logits.to(torch.float32, copy=True)
         value[:, :width] += bias.float()
         value = value.to(step_dtype).float()
+        if gather is not None and logits_out is not None:
+            full = gather_logits(value.to(step_dtype))[:, : logits_out.shape[1]]
+            return cls.torch(
+                base_logits=full,
+                bias=torch.zeros_like(full),
+                temperatures=temperatures,
+                key=key,
+                offset=offset,
+                step=step,
+                step_dtype=step_dtype,
+                logits_out=logits_out,
+                has_sampled_rows=has_sampled_rows,
+            )
+        padded = base_logits.shape[1]
+        device = base_logits.device
         if logits_out is not None:
             logits_out.copy_(value)
 

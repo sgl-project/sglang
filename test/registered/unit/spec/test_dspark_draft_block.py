@@ -31,6 +31,7 @@ def _draft(head, sampling_info, offset):
         device="cpu",
         tp_sync=SimpleNamespace(sync=lambda site, tokens: tokens),
         greedy_draft=False,
+        keep_greedy_logits=False,
     )
     return block, base, hidden, anchor
 
