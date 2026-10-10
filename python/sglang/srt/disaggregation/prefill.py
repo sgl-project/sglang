@@ -60,7 +60,7 @@ from sglang.srt.disaggregation.utils import (
     is_mla_backend,
     is_unadmitted_reject,
     poll_and_all_reduce_attn_cp_tp_group,
-    poll_and_all_reduce_pp,
+    poll_and_all_reduce_prefill_pp,
     prepare_abort,
     setup_state_kv_args,
 )
@@ -194,6 +194,7 @@ class PrefillBootstrapQueue:
             self.scheduler.tp_worker.model_runner.effective_logical_max_total_num_tokens
         )
         self.transfer_backend = transfer_backend
+        self.pp_poll_sync_work_list: List = []
         if envs.SGLANG_DISAGG_STAGING_BUFFER.get():
             if self.is_mla_backend:
                 raise RuntimeError(
@@ -458,47 +459,25 @@ class PrefillBootstrapQueue:
         req.sampling_params.max_new_tokens = 1
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
-    def pop_bootstrapped(
-        self,
-        return_failed_reqs: bool = False,
-        pp_good_rids: Optional[List[str]] = None,
-        pp_bad_rids: Optional[List[str]] = None,
-    ) -> List[Req] | tuple[List[Req], List[Req]]:
-        """
-        pop the reqs which has finished bootstrapping
-
-        return_failed_reqs: For PP, on rank 0, also return the failed reqs to notify the next rank
-        pp_good_rids: RIDs that PP consensus determined as WaitingForInput.
-        pp_bad_rids: RIDs that PP consensus determined as Failed.
-        """
+    def pop_bootstrapped(self) -> List[Req]:
+        """Pop the reqs which have finished bootstrapping."""
 
         bootstrapped_reqs = []
-        failed_reqs = []
         indices_to_remove = set()
 
         if len(self.queue) == 0:
-            if return_failed_reqs is False:
-                return []
-            else:
-                return [], []
+            return []
 
         if self.pp_size > 1:
-            polls = poll_and_all_reduce_pp(
-                (req.rid for req in self.queue),
-                KVPoll.WaitingForInput,
-                pp_good_rids,
-                pp_bad_rids,
+            polls = poll_and_all_reduce_prefill_pp(
+                [req.disagg_kv_sender for req in self.queue],
+                self.scheduler.attn_cp_cpu_group,
+                self.scheduler.attn_tp_cpu_group,
+                self.scheduler.pp_group,
+                self.pp_rank,
+                self.pp_size,
+                self.pp_poll_sync_work_list,
             )
-            uncovered = [i for i, poll in enumerate(polls) if poll is None]
-            if uncovered:
-                local_polls = poll_and_all_reduce_attn_cp_tp_group(
-                    [self.queue[i].disagg_kv_sender for i in uncovered],
-                    self.scheduler.attn_cp_cpu_group,
-                    self.scheduler.attn_tp_cpu_group,
-                )
-                for i, local_poll in zip(uncovered, local_polls):
-                    if local_poll == KVPoll.Failed:
-                        polls[i] = KVPoll.Failed
         else:
             polls = poll_and_all_reduce_attn_cp_tp_group(
                 [req.disagg_kv_sender for req in self.queue],
@@ -507,13 +486,9 @@ class PrefillBootstrapQueue:
             )
 
         for i, (req, poll) in enumerate(zip(self.queue, polls)):
-            if poll is None:
-                continue
-
             if poll == KVPoll.Failed:
                 self.scheduler.handle_bootstrap_failure(req)
                 indices_to_remove.add(i)
-                failed_reqs.append(req)
             elif poll == KVPoll.Bootstrapping:
                 if (
                     (
@@ -558,10 +533,7 @@ class PrefillBootstrapQueue:
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
         ]
 
-        if return_failed_reqs is False:
-            return bootstrapped_reqs
-        else:
-            return bootstrapped_reqs, failed_reqs
+        return bootstrapped_reqs
 
     def release_memory_occupation(self):
         self.queue.clear()
@@ -593,6 +565,7 @@ class SchedulerDisaggregationPrefillMixin:
         cache = self.tree_cache
         if req.pending_bootstrap and _uses_write_through_cache(cache):
             cache.advance_unpublished_req(req)
+            req.prefix_len = req.extend_end
             return
 
         checkpoint_kv_cache(req, cache)
@@ -1059,12 +1032,12 @@ class SchedulerDisaggregationPrefillMixin:
                 req.inflight_middle_chunks -= 1
 
                 # Still chunking iff its next chunk was launched: either it is
-                # still self.chunked_req, or its final chunk (extend_range
+                # still self.chunked_req, or its final chunk (extend_end
                 # reaching the end of the input) is in flight. A yielded req
                 # is neither, so do its deferred release here.
                 still_chunking = self.chunked_req is req or (
-                    req.extend_range is not None
-                    and req.extend_range.end >= len(req.origin_input_ids)
+                    req.extend_end is not None
+                    and req.extend_end >= len(req.origin_input_ids)
                 )
                 # Abort is terminal. Do not requeue an aborted optimistic
                 # request merely because bootstrap is still pending.
@@ -1375,9 +1348,9 @@ class SchedulerDisaggregationPrefillMixin:
         last_batch: Optional[ScheduleBatch],
         running_batch: ScheduleBatch,
     ) -> None:
-        chunked_req_to_exclude = set()
+        reqs_to_exclude = set()
         if (req := self.chunked_req) is not None:
-            chunked_req_to_exclude.add(req)
+            reqs_to_exclude.add(req)
             self.checkpoint_disagg_prefill(req)
 
             if not self.check_bootstrap(req):
@@ -1398,7 +1371,7 @@ class SchedulerDisaggregationPrefillMixin:
             elif self.enable_overlap:
                 # Delay KV transfer to process_batch_result_disagg_prefill when overlap is enabled to ensure results are resolved
                 req.tmp_end_idx = min(
-                    req.extend_range.end,
+                    req.extend_end,
                     len(req.origin_input_ids),
                 )
             else:
@@ -1411,10 +1384,10 @@ class SchedulerDisaggregationPrefillMixin:
             if last_batch.chunked_req:
                 # In the context pipeline parallelism, after the last chunk, the current microbatch still track outdated chunked_req.
                 # We need to discard it.
-                chunked_req_to_exclude.add(last_batch.chunked_req)
+                reqs_to_exclude.add(last_batch.chunked_req)
 
             last_bs = last_batch.batch_size()
-            last_batch.filter_batch(chunked_req_to_exclude=list(chunked_req_to_exclude))
+            last_batch.filter_batch(reqs_to_exclude=list(reqs_to_exclude))
             if last_batch.batch_size() < last_bs:
                 running_batch.batch_is_full = False
 
@@ -1426,9 +1399,7 @@ class SchedulerDisaggregationPrefillMixin:
         # must stay stable across the request's batches: snapshot the at-rest
         # prefix on the first batch. Non-staging reads the live prefix.
         if self.enable_staging and req.early_send_prefix_end is None:
-            req.early_send_prefix_end = max(
-                0, len(req.prefix_indices) - req.host_hit_length
-            )
+            req.early_send_prefix_end = max(0, req.prefix_len - req.host_hit_length)
 
         if req.pending_bootstrap:
             return
@@ -1437,7 +1408,7 @@ class SchedulerDisaggregationPrefillMixin:
         cached_end = (
             req.early_send_prefix_end
             if self.enable_staging
-            else len(req.prefix_indices) - req.host_hit_length
+            else req.prefix_len - req.host_hit_length
         )
         if cached_end <= req.start_send_idx:
             return
@@ -1469,7 +1440,7 @@ class SchedulerDisaggregationPrefillMixin:
                 value = 0
             else:
                 if end_idx is None:
-                    end_idx = min(req.extend_range.end, len(req.origin_input_ids))
+                    end_idx = min(req.extend_end, len(req.origin_input_ids))
                 page_indices_gpu = page_indices_for_request(self, req, end_idx)
                 state_indices = state_indices_for_request(self, req, end_idx)
                 value = computer.compute(page_indices_gpu, state_indices)
@@ -1489,9 +1460,7 @@ class SchedulerDisaggregationPrefillMixin:
         start_idx = req.start_send_idx
         transfer_input_len = len(req.origin_input_ids)
         end_idx = (
-            end_idx
-            if end_idx is not None
-            else min(req.extend_range.end, transfer_input_len)
+            end_idx if end_idx is not None else min(req.extend_end, transfer_input_len)
         )
 
         if not last_chunk:
@@ -1524,7 +1493,7 @@ class SchedulerDisaggregationPrefillMixin:
             # range actually materialized on prefill. C128 state is request
             # scoped, so its transfer index must use the logical input length
             # that decode used to register the destination row.
-            seq_len = min(req.extend_range.end, transfer_input_len)
+            seq_len = min(req.extend_end, transfer_input_len)
             c128_seq_len = transfer_input_len
 
             def _mamba_payload():

@@ -446,7 +446,7 @@ class DeepseekSparseAttnBackend(
         )
         self.dsa_index_topk = get_dsa_index_topk(hf_config)
         self.dsa_index_kpool = get_dsa_index_kpool(hf_config)
-        self.real_page_size = model_runner.page_size // self.dsa_index_kpool
+        self.physical_page_size = model_runner.page_size // self.dsa_index_kpool
         self._init_kpool_metadata_fusion()
         self.max_context_len = model_runner.model_config.context_len
         self._memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -947,7 +947,7 @@ class DeepseekSparseAttnBackend(
         return self.req_to_token.shape[1]
 
     def _transform_table_1_to_real(self, page_table: torch.Tensor) -> torch.Tensor:
-        page_size = self.real_page_size
+        page_size = self.physical_page_size
         if page_size == 1:
             return page_table
         max_seqlen_k = page_table.shape[1]
@@ -1030,11 +1030,11 @@ class DeepseekSparseAttnBackend(
         use_kpool = self.dsa_index_kpool > 1
         if use_kpool:
             assert (
-                self.real_page_size == 64
-                and self.real_page_size % self.dsa_index_kpool == 0
+                self.physical_page_size == 64
+                and self.physical_page_size % self.dsa_index_kpool == 0
             ), (
                 f"kpool path requires page_size == 64 and page_size % pool_size == 0; "
-                f"got page_size={self.real_page_size}, pool_size={self.dsa_index_kpool}."
+                f"got page_size={self.physical_page_size}, pool_size={self.dsa_index_kpool}."
             )
         kpool_inputs = _KPoolForwardInputs()
 
@@ -1248,7 +1248,7 @@ class DeepseekSparseAttnBackend(
             )
 
         metadata = DSAMetadata(
-            page_size=self.real_page_size,
+            page_size=self.physical_page_size,
             cache_seqlens_int32=cache_seqlens_int32,
             max_seq_len_q=max_seqlen_q,
             max_seq_len_k=max_seqlen_k,
@@ -1391,7 +1391,7 @@ class DeepseekSparseAttnBackend(
         self.dsa_drop_wide_page_table = (
             is_cuda()
             and not _is_hip
-            and self.real_page_size > 1
+            and self.physical_page_size > 1
             and self.hisparse_coordinator is None
             and not self.speculative_num_draft_tokens
             # kpool's PAGED fused-topk mapping still reads page_table_1.
@@ -1444,7 +1444,8 @@ class DeepseekSparseAttnBackend(
             "real_page_table": (
                 torch.zeros(
                     max_num_tokens,
-                    (max_ctx_len + self.real_page_size - 1) // self.real_page_size,
+                    (max_ctx_len + self.physical_page_size - 1)
+                    // self.physical_page_size,
                     dtype=torch.int32,
                     device=self.device,
                 )
@@ -1636,7 +1637,7 @@ class DeepseekSparseAttnBackend(
             )
 
         metadata = DSAMetadata(
-            page_size=self.real_page_size,
+            page_size=self.physical_page_size,
             cache_seqlens_int32=cache_seqlens_int32,
             max_seq_len_q=max_seqlen_q,
             max_seq_len_k=max_seqlen_k,
@@ -1720,7 +1721,7 @@ class DeepseekSparseAttnBackend(
                     bs=bs,
                     max_len=max_len,
                     dsa_index_topk=self.dsa_index_topk,
-                    real_page_size=self.real_page_size,
+                    physical_page_size=self.physical_page_size,
                 )
                 cache_seqlens = metadata.cache_seqlens_int32
                 dsa_cache_seqlens = metadata.dsa_cache_seqlens_int32
@@ -1775,7 +1776,7 @@ class DeepseekSparseAttnBackend(
                     bs=bs,
                     max_seqlen_k=max_seqlen_k,
                     dsa_index_topk=self.dsa_index_topk,
-                    real_page_size=self.real_page_size,
+                    physical_page_size=self.physical_page_size,
                     next_n=self.speculative_num_draft_tokens,
                     paged_mqa_ctx_lens_2d=paged_mqa_ctx_lens_2d,
                 )
@@ -1863,7 +1864,7 @@ class DeepseekSparseAttnBackend(
                     total_len=total_extend_len,
                     max_seqlen_k=max_seqlen_k,
                     dsa_index_topk=self.dsa_index_topk,
-                    real_page_size=self.real_page_size,
+                    physical_page_size=self.physical_page_size,
                     max_extend_len=self.speculative_num_draft_tokens,
                     max_total_len=bs * self.speculative_num_draft_tokens,
                     static_extend_len=True,
@@ -1943,8 +1944,8 @@ class DeepseekSparseAttnBackend(
             )
         # NOTE(dark): (dsa-) cu_seqlens_q is always arange, no need to copy
 
-        assert self.real_page_size == metadata.page_size
-        if self.real_page_size > 1:
+        assert self.physical_page_size == metadata.page_size
+        if self.physical_page_size > 1:
             if not used_fused_metadata_generation:
                 real_table = self._transform_table_1_to_real(page_indices)
                 new_rows = real_table.shape[0]
@@ -2590,6 +2591,28 @@ class DeepseekSparseAttnBackend(
         logit_cap: float,
         page_size: int,
     ) -> torch.Tensor:
+        # Sparse DSA represents each query token as a one-token FA3 sequence.
+        # MoE synchronization can pad length metadata, while the prefill graph
+        # attention bridge narrows Q and the page table to real query tokens.
+        # Remove only trailing metadata padding to match that narrowed layout.
+        if max_seqlen_q == 1 and q_nope.ndim == 3:
+            num_queries = q_nope.shape[0]
+            if cache_seqlens.shape[0] > num_queries:
+                if (
+                    page_table.shape[0] != num_queries
+                    or cu_seqlens_q.shape[0] != cache_seqlens.shape[0] + 1
+                    or cu_seqlens_k.shape[0] != cache_seqlens.shape[0] + 1
+                ):
+                    raise ValueError(
+                        "Inconsistent padded DSA FA3 metadata: "
+                        f"q={tuple(q_nope.shape)}, page_table={tuple(page_table.shape)}, "
+                        f"cache_seqlens={tuple(cache_seqlens.shape)}, "
+                        f"cu_q={tuple(cu_seqlens_q.shape)}, "
+                        f"cu_k={tuple(cu_seqlens_k.shape)}"
+                    )
+                cache_seqlens = cache_seqlens[:num_queries]
+                cu_seqlens_q = cu_seqlens_q[: num_queries + 1]
+                cu_seqlens_k = cu_seqlens_k[: num_queries + 1]
         k_rope_cache = kv_cache[:, :, v_head_dim:]
         c_kv_cache = kv_cache[:, :, :v_head_dim]
         qk_rope_dim = k_rope_cache.shape[-1]
@@ -3061,7 +3084,7 @@ class DeepseekSparseAttnBackend(
             indices=page_table_1,
             seq_lens=seq_lens,
             workspace_buffer=self.workspace_buffer,
-            page_size=self.real_page_size,
+            page_size=self.physical_page_size,
             kv_cache_dim=self.kv_cache_dim,
             qk_nope_head_dim=self.qk_nope_head_dim,
             kv_lora_rank=self.kv_lora_rank,
@@ -3098,8 +3121,8 @@ class DeepseekSparseAttnBackend(
         else:
             q_input = q_all
 
-        kv_cache = kv_cache.view(-1, self.real_page_size, 1, self.kv_cache_dim)
-        assert self.real_page_size == 64, "only page size 64 is supported"
+        kv_cache = kv_cache.view(-1, self.physical_page_size, 1, self.kv_cache_dim)
+        assert self.physical_page_size == 64, "only page size 64 is supported"
 
         if not self.dsa_kv_cache_store_fp8:
             # inefficiently quantize the whole cache
@@ -3340,7 +3363,7 @@ class DeepseekSparseAttnBackend(
 
         D_ckv = kv_cache.shape[-1]
         # kv_cache: (N_tokens, 1, D_ckv) from MLATokenToKVPool → (N_pages, page_size, D_ckv)
-        kv_paged = kv_cache.view(-1, self.real_page_size, D_ckv)
+        kv_paged = kv_cache.view(-1, self.physical_page_size, D_ckv)
 
         block_table = metadata.real_page_table  # (B, max_pages), page-indexed int32
         seq_lens_k = metadata.cache_seqlens_int32  # (B,) total KV lengths
@@ -3616,7 +3639,9 @@ class DeepseekSparseAttnBackend(
             self.token_to_kv_pool.set_mla_kv_buffer(layer, cache_loc, k, k_rope)
 
         k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
-        kv_cache = k_cache.view(-1, self.real_page_size, self.kv_cache_dim).unsqueeze(1)
+        kv_cache = k_cache.view(
+            -1, self.physical_page_size, self.kv_cache_dim
+        ).unsqueeze(1)
 
         if merge_query:
             q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
@@ -3686,7 +3711,7 @@ class DeepseekSparseAttnBackend(
         multi_ctas_kv_counter_buffer = self._multi_ctas_kv_counter_for(batch_size)
 
         q = q_all.view(batch_size, 1, num_heads, head_dim)
-        kv = kv_cache.view(-1, 1, self.real_page_size, self.kv_cache_dim)
+        kv = kv_cache.view(-1, 1, self.physical_page_size, self.kv_cache_dim)
         block_tables = page_table_1.unsqueeze(1)
         seq_lens = metadata.cache_seqlens_int32 if seq_lens is None else seq_lens
 

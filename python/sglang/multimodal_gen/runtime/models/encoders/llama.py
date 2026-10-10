@@ -51,10 +51,12 @@ from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
-    default_weight_loader,
-    maybe_remap_kv_scale_name,
+    load_llm_encoder_weights,
 )
-from sglang.multimodal_gen.runtime.models.encoders.base import TextEncoder
+from sglang.multimodal_gen.runtime.models.encoders.base import (
+    TextEncoder,
+    get_attention_head_partition,
+)
 
 
 class LlamaMLP(nn.Module):
@@ -116,18 +118,10 @@ class LlamaAttention(nn.Module):
         self.hidden_size = hidden_size
         tp_size = get_tp_world_size()
         self.total_num_heads = num_heads
-        assert self.total_num_heads % tp_size == 0
-        self.num_heads = self.total_num_heads // tp_size
         self.total_num_kv_heads = num_kv_heads
-        if self.total_num_kv_heads >= tp_size:
-            # Number of KV heads is greater than TP size, so we partition
-            # the KV heads across multiple tensor parallel GPUs.
-            assert self.total_num_kv_heads % tp_size == 0
-        else:
-            # Number of KV heads is less than TP size, so we replicate
-            # the KV heads across multiple tensor parallel GPUs.
-            assert tp_size % self.total_num_kv_heads == 0
-        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
+        self.num_heads, self.num_kv_heads = get_attention_head_partition(
+            num_heads, num_kv_heads, tp_size
+        )
         # MistralConfig has an optional head_dim introduced by Mistral-Nemo
         self.head_dim = getattr(
             config, "head_dim", self.hidden_size // self.total_num_heads
@@ -390,66 +384,11 @@ class LlamaModel(TextEncoder):
         return output
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-
-        params_dict = dict(self.named_parameters())
-        loaded_params: set[str] = set()
-        for name, loaded_weight in weights:
-            if "rotary_emb.inv_freq" in name:
-                continue
-            if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
-                # Models trained using ColossalAI may include these tensors in
-                # the checkpoint. Skip them.
-                continue
-            # if (self.quant_config is not None and
-            #     (scale_name := self.quant_config.get_cache_scale(name))):
-            #     # Loading kv cache quantization scales
-            #     param = params_dict[scale_name]
-            #     weight_loader = getattr(param, "weight_loader",
-            #                             default_weight_loader)
-            #     loaded_weight = (loaded_weight if loaded_weight.dim() == 0 else
-            #                      loaded_weight[0])
-            #     weight_loader(param, loaded_weight)
-            #     loaded_params.add(scale_name)
-            #     continue
-            if "scale" in name:
-                # Remapping the name of FP8 kv-scale.
-                kv_scale_name: str | None = maybe_remap_kv_scale_name(name, params_dict)
-                if kv_scale_name is None:
-                    continue
-                else:
-                    name = kv_scale_name
-            for (
-                param_name,
-                weight_name,
-                shard_id,
-            ) in self.config.arch_config.stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-
-                if name not in params_dict:
-                    continue
-
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-
-                if name not in params_dict:
-                    continue
-
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-            loaded_params.add(name)
-        return loaded_params
+        return load_llm_encoder_weights(
+            weights,
+            dict(self.named_parameters()),
+            self.config.arch_config.stacked_params_mapping,
+        )
 
 
 EntryClass = LlamaModel
