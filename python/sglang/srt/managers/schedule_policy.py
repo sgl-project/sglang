@@ -1439,7 +1439,8 @@ class PrefillAdder:
                     if isinstance(admission, AddReqResult):
                         return admission
                 req.prefix_len += req.host_loaded_length
-                req.kv.cache_protected_len = req.prefix_len
+                if self.tree_cache.load_back_is_cache_owned():
+                    req.kv.cache_protected_len = req.prefix_len
 
             # Sharded pools cannot load host KV; reserve scratch after all other gates.
             if not self._kv_shard_reserve_scratch(
