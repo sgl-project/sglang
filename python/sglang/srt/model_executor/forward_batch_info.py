@@ -578,6 +578,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     lora_ids: Optional[List[str]] = None
     # For dumper: request IDs for cross-step sequence tracking
     rids: Optional[List[str]] = None
+    # Per-request cached-prefix token count (Req.num_matched_prefix_tokens), the
+    # same source the scheduler's ``#cached-token:N`` log sums. Host mirror only;
+    # consumed by the DSV4-NPU compressor to gate HIT-only fixes (is_prefix_suffix).
+    num_matched_prefix_tokens_cpu: Optional[List[int]] = None
 
     # === Per-forward overrides passed explicitly to init_new ===
     capture_hidden_mode: CaptureHiddenMode = None
@@ -960,6 +964,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             encoder_lens_cpu=batch.encoder_lens_cpu,
             lora_ids=[req.lora_id for req in batch.reqs],
             rids=[req.rid for req in batch.reqs],
+            num_matched_prefix_tokens_cpu=[
+                getattr(req, "num_matched_prefix_tokens", 0) for req in batch.reqs
+            ],
             # Compound (carry their own device tensors)
             sampling_info=batch.sampling_info,
             spec_info=batch.spec_info,

@@ -227,12 +227,59 @@ class CompressorAscendBackendMixin:
             for seq_len, extend_len in zip(seq_lens, extend_lens)
         ]
 
+    def _build_is_prefix_suffix(self, forward_batch: ForwardBatch) -> torch.Tensor:
+        """Per-batch int32 flag [bs]: 1 iff the request's prefix was restored from
+        the radix cache (a HIT), else 0 (a MISS / no cached prefix).
+
+        This is the request-level gate the kernel cannot derive itself: at the
+        decode step the miss and hit calls have identical shape/x/carry, so only
+        a request-level flag can tell them apart. Prefill reads the extend prefix
+        lens; decode reads the request's cached-token count (the same source the
+        scheduler's ``#cached-token:N`` log sums). Defaults to all-zeros when the
+        source is unavailable, which keeps the gate off and the MISS code path
+        byte-for-byte intact.
+        """
+        bs = forward_batch.batch_size
+        device = forward_batch.seq_lens.device
+        zeros = torch.zeros(bs, dtype=torch.int32, device=device)
+
+        if forward_batch.forward_mode.is_decode():
+            cached = getattr(forward_batch, "num_matched_prefix_tokens_cpu", None)
+            if cached is None:
+                return zeros
+            return torch.tensor(
+                [
+                    1 if i < len(cached) and int(cached[i]) > 0 else 0
+                    for i in range(bs)
+                ],
+                dtype=torch.int32,
+                device=device,
+            )
+
+        # prefill: a non-empty extend prefix means the prefix was restored from
+        # the radix cache for this extend.
+        prefix = getattr(forward_batch, "extend_prefix_lens", None)
+        if prefix is not None and prefix.numel() > 0:
+            return (prefix.reshape(-1)[:bs] > 0).to(torch.int32)
+        prefix_cpu = self._extend_prefix_lens_cpu(forward_batch)
+        if prefix_cpu is not None:
+            return torch.tensor(
+                [
+                    1 if i < len(prefix_cpu) and int(prefix_cpu[i]) > 0 else 0
+                    for i in range(bs)
+                ],
+                dtype=torch.int32,
+                device=device,
+            )
+        return zeros
+
     def _build_npu_compress_metadata(self, forward_batch: ForwardBatch) -> None:
         fm = self.forward_metadata
         is_decode = forward_batch.forward_mode.is_decode()
         is_verify = forward_batch.forward_mode.is_target_verify()
         fm.dsv4_explicit_state_block_tables = {}
         fm.dsv4_max_input_capacity = 1 if is_decode else None
+        fm.is_prefix_suffix = self._build_is_prefix_suffix(forward_batch)
         _verify_compress = is_verify and bool(self._dsv4_compress_ratios)
         _seq_lens = forward_batch.seq_lens.to(torch.int32)
         if _verify_compress:
@@ -951,6 +998,10 @@ class CompressorAscendBackendMixin:
             except Exception as _exc:
                 print(f"[C4POS] skipped: {_exc}", flush=True)
 
+        is_prefix_suffix = getattr(fm, "is_prefix_suffix", None)
+        if is_prefix_suffix is None:
+            is_prefix_suffix = self._build_is_prefix_suffix(forward_batch)
+
         compressor_op = torch.ops.npu.compressor
         cmp_kv = compressor_op(
             x,
@@ -967,6 +1018,7 @@ class CompressorAscendBackendMixin:
             cu_seqlens=fm.actual_seq_lengths_q_pa,
             seqused=fm.seqused,
             start_pos=fm.start_pos,
+            is_prefix_suffix=is_prefix_suffix,
             coff=coff,
             norm_eps=compressor.norm.variance_epsilon,
             rotary_mode=2,
@@ -1865,6 +1917,7 @@ class DeepseekV4AscendAttnBackend(
         "c128_state_loc",
         "start_pos",
         "seqused",
+        "is_prefix_suffix",
     )
 
     def __init__(
@@ -2286,6 +2339,7 @@ class DeepseekV4AscendAttnBackend(
         )
         metadata.start_pos = torch.zeros(bs, dtype=torch.int32, device=device)
         metadata.seqused = torch.zeros(bs, dtype=torch.int32, device=device)
+        metadata.is_prefix_suffix = torch.zeros(bs, dtype=torch.int32, device=device)
 
         metadata.kernel_metadata = {
             "c1a_metadata": self.graph_metadata["kernel_metadata_c1a"],
@@ -2575,6 +2629,11 @@ class DeepseekV4AscendAttnBackend(
             )
         fm.start_pos.copy_(positions_last.to(torch.int32))
         fm.seqused.copy_(valid.to(torch.int32))
+        # is_prefix_suffix gate: refresh in place so the captured buffer address
+        # stays stable; the helper falls back to all-zeros (gate off => MISS path)
+        # when the graph-replay forward_batch does not carry the cached-token
+        # source.
+        fm.is_prefix_suffix.copy_(self._build_is_prefix_suffix(ctx.forward_batch))
 
     def _refresh_graph_target_verify_compress_1d_direct(self, ctx) -> None:
         fm = ctx.fm
