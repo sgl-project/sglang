@@ -174,7 +174,7 @@ class StageBoundary:
         completed or carried on. An FFN whose boundary has fusions (which may
         take a MoE finalize handoff) finishes through exit() instead."""
         if self.kind is StageKind.ATTENTION and self.plan.finishes_directly:
-            produced = self.plan.produced(forward_batch)
+            produced = self.plan.path_for(forward_batch).output
             return stream_of(forward_batch).record(
                 hidden_states,
                 produced.update,
@@ -237,9 +237,6 @@ class StageBoundary:
             hidden_states, residual, PLAIN_ADD
         )
         return hidden_states
-
-    def snapshot(self, hidden_states, forward_batch):
-        return stream_of(forward_batch).snapshot(hidden_states)
 
     def capture_output(self, hidden_states, forward_batch, *, skip_empty=False):
         """Capture an output while preserving the caller's reduction timing.

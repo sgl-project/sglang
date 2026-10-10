@@ -27,7 +27,9 @@ from sglang.srt.layers.layer_boundary.residual.add_norm import NORM_READOUT, PLA
 
 
 class ProducerReduction(Enum):
-    """Who completes the sum a stage's output owes; compute never does.
+    """Who completes the sum a stage's output owes: exactly one completer for
+    each output, the boundary. Compute completes it only where an FFN fuses
+    it with a reduction its computation needs (``output_complete``).
 
     ALWAYS_PARTIAL is attention-only: finish() hands the partial sum to the
     next stage's input as its declared sum. EXIT_SCOPED, for an FFN or a

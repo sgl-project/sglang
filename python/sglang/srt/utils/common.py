@@ -1591,18 +1591,27 @@ def make_layers(
     return_tuple: bool = False,
     offloader_kwargs: Optional[Dict[str, Any]] = None,
     final_read: Optional[Any] = None,
+    stage_facts: Optional[Callable[[int], Sequence[Any]]] = None,
 ) -> Tuple[torch.nn.Module, int, int]:
     """Make a list of layers with the given layer function.
 
     The local layers are built inside one layer stack, so layers that declare
     stage boundaries connect in order without naming their neighbours. Across
-    a pipeline stage boundary the stack learns the neighbouring stage from the
-    layer itself, built again on the meta device. ``final_read`` is the
-    stack's terminal read when it is not a plain final norm (see layer_stack).
+    a pipeline stage boundary the stack learns the neighbouring stage from
+    ``stage_facts``: the model's shared declaration function, which returns
+    the stages the layer at a global index declares without building it (an
+    empty sequence when it declares none), and which the layer itself uses
+    for its own declarations. A model on the transitional list may omit it;
+    the stack then builds the layer again on the meta device to read them.
+    ``final_read`` is the stack's terminal read when it is not a plain final
+    norm (see layer_stack).
     """
     # circular imports
     from sglang.srt.distributed import get_pp_indices
-    from sglang.srt.layers.layer_boundary.factories import layer_stack
+    from sglang.srt.layers.layer_boundary.factories import (
+        check_declared_stages,
+        layer_stack,
+    )
     from sglang.srt.layers.utils import PPMissingLayer
     from sglang.srt.utils.offloader import get_offloader
 
@@ -1618,22 +1627,29 @@ def make_layers(
     )
 
     def neighbour(idx):
+        if stage_facts is not None:
+            return functools.partial(_declared_stages, stage_facts, idx)
         return functools.partial(
             _build_neighbour_layer, layer_fn, idx, add_prefix(idx, prefix)
         )
+
+    def build(stack, idx):
+        appended = len(stack.appends)
+        layer = layer_fn(idx=idx, prefix=add_prefix(idx, prefix))
+        if stage_facts is not None and (pp_size or 1) > 1:
+            # Another rank binds this layer's stages from stage_facts alone.
+            check_declared_stages(stack, appended, stage_facts(idx), f"layer {idx}")
+        return layer
 
     with layer_stack(
         previous_layers=[neighbour(idx) for idx in reversed(range(start_layer))],
         next_layers=[neighbour(idx) for idx in range(end_layer, num_hidden_layers)],
         final_read=final_read,
-    ):
+    ) as stack:
         modules = torch.nn.ModuleList(
             [PPMissingLayer(return_tuple=return_tuple) for _ in range(start_layer)]
             + get_offloader().wrap_modules(
-                (
-                    layer_fn(idx=idx, prefix=add_prefix(idx, prefix))
-                    for idx in range(start_layer, end_layer)
-                ),
+                (build(stack, idx) for idx in range(start_layer, end_layer)),
                 **(offloader_kwargs or {}),
             )
             + [
@@ -1653,10 +1669,12 @@ def make_pp_layers(
     return_tuple: bool = False,
     offloader_kwargs: Optional[Dict[str, Any]] = None,
     final_read: Optional[Any] = None,
+    stage_facts: Optional[Callable[[int], Sequence[Any]]] = None,
 ) -> Tuple[torch.nn.Module, int, int]:
     """Make this pipeline stage's layers, and return them with the stage's range.
 
     Layers outside ``[start_layer, end_layer)`` are ``PPMissingLayer`` stand-ins.
+    ``stage_facts`` is the model's shared declaration function (see make_layers).
     """
     parallel = get_parallel()
     return make_layers(
@@ -1668,7 +1686,66 @@ def make_pp_layers(
         return_tuple=return_tuple,
         offloader_kwargs=offloader_kwargs,
         final_read=final_read,
+        stage_facts=stage_facts,
     )
+
+
+# The models whose layers a pipeline rank still builds on the meta device to
+# read the stages they declare, until each gives make_layers its shared
+# declaration function (stage_facts). Any other model must give one to run
+# under pipeline parallelism.
+_NEIGHBOUR_BUILD_MODULES = frozenset(
+    (
+        "sglang.srt.models.apertus",
+        "sglang.srt.models.arcee",
+        "sglang.srt.models.bailing_moe",
+        "sglang.srt.models.bailing_moe_linear",
+        "sglang.srt.models.bailing_moe_v3",
+        "sglang.srt.models.deepseek_v2",
+        "sglang.srt.models.dots3_common.modeling",
+        "sglang.srt.models.ernie45_moe_vl",
+        "sglang.srt.models.exaone4",
+        "sglang.srt.models.exaone_moe",
+        "sglang.srt.models.gemma4_causal",
+        "sglang.srt.models.gigachat35",
+        "sglang.srt.models.glm4",
+        "sglang.srt.models.glm4_moe",
+        "sglang.srt.models.glm4_moe_lite",
+        "sglang.srt.models.glm5_next",
+        "sglang.srt.models.gpt_oss",
+        "sglang.srt.models.granitemoehybrid",
+        "sglang.srt.models.kimi_k3",
+        "sglang.srt.models.kimi_linear",
+        "sglang.srt.models.laguna",
+        "sglang.srt.models.llada2",
+        "sglang.srt.models.llama",
+        "sglang.srt.models.mimo_v2",
+        "sglang.srt.models.minimax_m2",
+        "sglang.srt.models.minimax_m3",
+        "sglang.srt.models.ministral3",
+        "sglang.srt.models.mixtral",
+        "sglang.srt.models.nanbeige",
+        "sglang.srt.models.nemotron_nas",
+        "sglang.srt.models.qwen2",
+        "sglang.srt.models.qwen2_moe",
+        "sglang.srt.models.qwen3_5",
+        "sglang.srt.models.sarvam_moe",
+        "sglang.srt.models.sdar",
+        "sglang.srt.models.sdar_moe",
+        "sglang.srt.models.spark2_5",
+        "sglang.srt.models.step3p5",
+        "sglang.srt.models.xllm",
+        "sglang.srt.models.zaya",
+    )
+)
+
+
+def _declared_stages(stage_facts, idx: int):
+    """The stages the layer at ``idx`` declares, from the model's shared
+    declaration function, standing in for building it."""
+    from sglang.srt.layers.layer_boundary.factories import DeclaredStages
+
+    return DeclaredStages(tuple(stage_facts(idx)))
 
 
 def _build_neighbour_layer(layer_fn: LayerFn, idx: int, prefix: str) -> None:
@@ -1677,6 +1754,13 @@ def _build_neighbour_layer(layer_fn: LayerFn, idx: int, prefix: str) -> None:
     adds to the shared cache are meta, so they are dropped again."""
     from sglang.srt.layers.rotary_embedding.factory import _ROPE_DICT
 
+    module = getattr(getattr(layer_fn, "func", layer_fn), "__module__", None)
+    if module not in _NEIGHBOUR_BUILD_MODULES:
+        raise ValueError(
+            f"{module} declares stage boundaries under pipeline parallelism "
+            "without a shared declaration function: give make_layers its "
+            "stage_facts, the stages a layer declares without building it"
+        )
     cached = set(_ROPE_DICT)
     try:
         with building_neighbour_layer():

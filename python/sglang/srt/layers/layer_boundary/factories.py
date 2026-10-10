@@ -5,9 +5,9 @@ from __future__ import annotations
 import contextlib
 import os
 import sys
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, is_dataclass, replace
 from types import MappingProxyType
-from typing import Callable, Mapping, NamedTuple, Optional
+from typing import Callable, Mapping, NamedTuple, Optional, Tuple
 
 from sglang.srt.environ import envs
 from sglang.srt.layers import layernorm_sp
@@ -29,6 +29,7 @@ from sglang.srt.layers.layer_boundary.contracts import (
     StageContract,
     StageKind,
 )
+from sglang.srt.layers.layer_boundary.facts import facts_of
 from sglang.srt.layers.layer_boundary.layout import (
     Layout,
     SumGroup,
@@ -301,11 +302,14 @@ class StageDeclaration:
             contiguous slice of the rows, it returns them all, in rank order,
             or None to leave the gather to the boundary. Called on every batch,
             so it must be CUDA-graph safe. Across a pipeline boundary the
-            producer's rank takes it from the neighbouring layer it builds on
-            the meta device, so it may use only the communication state of the
-            rank it runs on, not the declaring layer's weights or buffers.
-        previous: Declaration whose output this stage consumes, as the stack
-            records it; across pipeline ranks it is built locally.
+            producer's rank takes it from the neighbouring stage's declaration
+            (the model's shared declaration function, or, for a model on the
+            transitional list, the layer built again on the meta device), so it
+            may use only the communication state of the rank it runs on, not
+            the declaring layer's weights or buffers.
+        previous: The stage whose output this stage consumes, as the stack
+            records it: only the facts binding reads of it (see facts_of),
+            on this rank or another.
         prepared_from: Declaration whose already-read input a branch reuses.
             Mutually exclusive with previous; avoids a second update/read.
 
@@ -738,6 +742,19 @@ def _connect_line(line, origins, *, before=None, after=None, arrivals=None):
     if arrivals is None:
         arrivals = {v: _stack_arrival(v) for v in variants}
         if before is not None:
+            if (
+                before.output_transform is not None
+                and before.kind is StageKind.ATTENTION
+                and before.reduction is ProducerReduction.ALWAYS_PARTIAL
+            ):
+                # Its transform runs at the next stage's input, which would be
+                # on this rank, without the module that declares it.
+                error = NotImplementedError(
+                    "a pipeline rank that ends on an attention transforming the "
+                    "output whose sum it leaves"
+                )
+                _note_origin(error, origins[0])
+                raise error
             flow = resolve(0, before, arrivals, line[0])
             arrivals = {v: _arrival(before, flow[v], v) for v in variants}
     flows = []
@@ -830,11 +847,14 @@ def layer_stack(*, previous_layers=(), next_layers=(), final_read=None):
     stage ends the model's layer stack unless a later layer declares a stage.
 
     Args:
-        previous_layers: Callables that build, nearest first, the layers before
-            this stack that another pipeline rank holds. Called only if this
-            stack appended stages, after its own layers are built, until one of
-            them declares a stage: its last stage is the producer of this
-            stack's first. What they build is discarded.
+        previous_layers: For the layers before this stack that another
+            pipeline rank holds, nearest first, callables that return the
+            stages the layer declares as DeclaredStages (from the model's
+            shared declaration function), or else build the layer so that it
+            appends them. Called only if this stack appended stages, after its
+            own layers are built, until one of them declares a stage: its last
+            stage is the producer of this stack's first. Only what binding
+            reads of that stage is kept (see facts_of).
         next_layers: Likewise for the layers after this stack, whose first
             declared stage is the consumer of this stack's last.
         final_read: The model's final read of the stack's output (a
@@ -861,21 +881,94 @@ def layer_stack(*, previous_layers=(), next_layers=(), final_read=None):
         _stack = outer
 
 
-def _neighbour_stage(build_layers, *, last):
+class DeclaredStages(NamedTuple):
+    """The stages a neighbouring layer declares, from the model's shared
+    declaration function, which stand in for building the layer."""
+
+    stages: Tuple[StageDeclaration, ...]
+
+
+def check_declared_stages(stack, appended: int, expected, where: str) -> None:
+    """Check that what a layer appended to ``stack`` since it held
+    ``appended`` appends is what its shared declaration function says it
+    declares, as far as binding reads it: another pipeline rank binds this
+    layer's stages from that function alone."""
+    declared = [
+        facts_of(declaration)
+        for append in stack.appends[appended:]
+        if append.prepared_from is None
+        for declaration in append.declarations
+    ]
+    expected = [facts_of(declaration) for declaration in expected]
+    if declared != expected:
+        raise ValueError(
+            f"{where} declares stages its shared declaration function does "
+            f"not: {_first_difference(declared, expected)}"
+        )
+
+
+def _first_difference(declared, expected) -> str:
+    """Where the stages a layer declares first differ from those its shared
+    declaration function gives, field by field."""
+    if len(declared) != len(expected):
+        return (
+            f"it declares {[stage.kind.name for stage in declared]}, the "
+            f"function {[stage.kind.name for stage in expected]}"
+        )
+    index, (stage, given) = next(
+        (index, pair)
+        for index, pair in enumerate(zip(declared, expected))
+        if pair[0] != pair[1]
+    )
+    return f"stage {index} ({stage.kind.name}): " + "; ".join(
+        f"{name} is {value!r}, the function says {given_value!r}"
+        for name, value, given_value in _differing_fields(stage, given)
+    )
+
+
+def _differing_fields(value, given, prefix=""):
+    """(dotted name, value, given value) for each leaf field that differs,
+    descending into declarations and the facts they hold."""
+    if is_dataclass(value):
+        names = [field.name for field in fields(value)]
+    else:
+        names = getattr(type(value), "__struct_fields__", None)
+    if names is None or type(value) is not type(given):
+        return [(prefix.rstrip("."), value, given)]
+    return [
+        difference
+        for name in names
+        if getattr(value, name) != getattr(given, name)
+        for difference in _differing_fields(
+            getattr(value, name), getattr(given, name), f"{prefix}{name}."
+        )
+    ]
+
+
+def _neighbour_stage(layers, *, last):
     """The stage a neighbouring layer declares next to this stack: the last
     one of the nearest layer before it, or the first of the nearest after.
     Branches are side paths, so they never stand next to the stack."""
     global _stack
-    for build_layer in build_layers:
+    for layer in layers:
         outer = _stack
         _stack = _LayerStack()
         try:
-            build_layer()
-            appends = [a for a in _stack.appends if a.prepared_from is None]
+            result = layer()
+            declared = (
+                result.stages
+                if isinstance(result, DeclaredStages)
+                else [
+                    declaration
+                    for append in _stack.appends
+                    if append.prepared_from is None
+                    for declaration in append.declarations
+                ]
+            )
         finally:
             _stack = outer
-        if appends:
-            return appends[-1].declarations[-1] if last else appends[0].declarations[0]
+        if declared:
+            return facts_of(declared[-1] if last else declared[0])
     return None
 
 
@@ -938,15 +1031,6 @@ def _return_before_trailing_attention(line):
             return
 
 
-def _detached(declaration):
-    """The declaration as the stage after it records it: without its own
-    history, so a bound stage holds its producer's facts and not the chain of
-    declarations before it."""
-    if declaration is None:
-        return None
-    return replace(declaration, previous=None, prepared_from=None)
-
-
 def _bind_stack(appends, *, previous, following, final_read=None):
     """Bind every appended stage and fill in the boundaries each append
     returned.
@@ -973,13 +1057,13 @@ def _bind_stack(appends, *, previous, following, final_read=None):
     bound = {id(append): [None] * len(append.bindings) for append in appends}
     # A returned declaration's stage as bound, for the branches that start from it.
     sources = {}
-    producer = _detached(_handed_off(previous))
+    producer = facts_of(_handed_off(previous))
     chained = []
     for append, index in stages:
         chained.append(
             replace(append.declarations[index], previous=producer, prepared_from=None)
         )
-        producer = _detached(chained[-1])
+        producer = facts_of(chained[-1])
     connections = _connect_line(
         chained,
         [append.origin for append, _ in stages],
@@ -1010,8 +1094,8 @@ def _bind_stack(appends, *, previous, following, final_read=None):
             chained.append(
                 replace(
                     declaration,
-                    previous=chained[-1] if chained else None,
-                    prepared_from=None if chained else source_declaration,
+                    previous=facts_of(chained[-1]) if chained else None,
+                    prepared_from=None if chained else facts_of(source_declaration),
                 )
             )
         try:

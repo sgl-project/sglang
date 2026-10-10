@@ -22,6 +22,8 @@ from sglang.srt.layers.layer_boundary import (
     layer_stack,
 )
 from sglang.srt.layers.layer_boundary.contracts import BatchVariant
+from sglang.srt.layers.layer_boundary.facts import facts_of
+from sglang.srt.layers.layer_boundary.output import OutputTransform
 from sglang.srt.layers.layer_boundary.residual import batch
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.boundary_fixtures import build_stages
@@ -189,9 +191,12 @@ class TestIndependentStageConstruction(CustomTestCase):
                     )
                 # The branch leaves the stage it reads from as it was.
                 self.assertEqual(source.plan.edges, alone.plan.edges)
-                self.assertEqual(first.declaration.prepared_from, source.declaration)
-                self.assertIs(attn.declaration.previous, first.declaration)
-                self.assertIs(last.declaration.previous, attn.declaration)
+                # Each records the stage before it by what binding reads of it.
+                self.assertEqual(
+                    first.declaration.prepared_from, facts_of(source.declaration)
+                )
+                self.assertEqual(attn.declaration.previous, facts_of(first.declaration))
+                self.assertEqual(last.declaration.previous, facts_of(attn.declaration))
                 for v, edge in first.plan.edges.items():
                     source_input = source.plan.edges[v].incoming
                     self.assertEqual(
@@ -448,6 +453,33 @@ class TestPipelineCuts(CustomTestCase):
                 f"receiver's {index}",
             )
         return True
+
+    def test_a_rank_after_an_attention_that_transforms_its_output_is_rejected(self):
+        # The attention leaves its sum, and its transform runs at the next
+        # stage's input: on the receiving rank, which does not hold it.
+        transformed = partial(declare_attn, output_transform=OutputTransform(abs))
+        for (name, (parallel, a2a)), kind in itertools.product(
+            CUT_CONFIGS.items(), CUT_STAGES
+        ):
+            with (
+                self.subTest(config=name, receiver=kind),
+                fixture.planning(parallel, a2a=a2a),
+            ):
+                # Without the transform, the same rank binds.
+                self.assertIsNone(bind_rank((kind,), before=("attention",))[1])
+                with (
+                    self.assertRaisesRegex(
+                        NotImplementedError,
+                        "a pipeline rank that ends on an attention transforming "
+                        "the output whose sum it leaves",
+                    ),
+                    layer_stack(
+                        previous_layers=[
+                            lambda: append_stages((transformed(), fixture.Norm()))
+                        ]
+                    ),
+                ):
+                    append_stages(*cut_stages((kind,)))
 
     def assert_rows_follow(self, stages, rank):
         """Within one rank's stages, each side of a boundary takes the
