@@ -30,12 +30,8 @@ from sglang.srt.utils.cuda_ipc_transport_utils import (
     get_mm_feature_pool_size_per_worker,
 )
 from sglang.srt.utils.cuda_vmm_utils import (
-    _FD_SEND_TIMEOUT_S,
     VmmReservation,
     _get_cuda_driver,
-    _recv_fd,
-    _send_fd,
-    align_up,
     allocation_handle_type_name,
     check_drv,
     get_allocation_granularity,
@@ -44,6 +40,12 @@ from sglang.srt.utils.cuda_vmm_utils import (
     make_device_allocation_prop,
     release_mappings,
     tensor_from_pointer,
+)
+from sglang.srt.utils.vmm_common import (
+    FD_SEND_TIMEOUT_S,
+    align_up,
+    recv_fd,
+    send_fd,
 )
 
 logger = logging.getLogger(__name__)
@@ -90,7 +92,7 @@ class _PosixFdBroker:
 
             try:
                 with conn:
-                    _send_fd(conn, self.fd, src_rank=0, base_idx=0)
+                    send_fd(conn, self.fd, src_rank=0, base_idx=0)
             except Exception as error:
                 self._error = error
                 logger.exception("CUDA VMM POSIX FD broker failed")
@@ -110,9 +112,9 @@ class _PosixFdBroker:
 
 def _receive_posix_fd(socket_path: str) -> int:
     with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as sock:
-        sock.settimeout(_FD_SEND_TIMEOUT_S)
+        sock.settimeout(FD_SEND_TIMEOUT_S)
         sock.connect(socket_path)
-        packet = _recv_fd(sock)
+        packet = recv_fd(sock)
     if packet is None:
         raise RuntimeError("CUDA VMM POSIX FD broker returned no file descriptor")
     _src_rank, _base_idx, fd = packet

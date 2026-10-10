@@ -1,11 +1,8 @@
-import array
 import ctypes
 import logging
 import os
-import socket
 import struct
 import tempfile
-import threading
 import time
 from functools import cache
 from typing import Any, List, Optional
@@ -15,11 +12,12 @@ import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 from sglang.srt.utils import log_info_on_rank0
+from sglang.srt.utils.vmm_common import (
+    all_ranks_ok,
+    exchange_posix_fds,
+)
 
 logger = logging.getLogger(__name__)
-
-_FD_HEADER_BYTES = 24
-_FD_SEND_TIMEOUT_S = 120.0
 
 try:
     from cuda.bindings import driver as _drv
@@ -327,16 +325,6 @@ def get_device_granularity(device_id: int) -> int:
     return get_allocation_granularity(make_device_allocation_prop(device_id))
 
 
-def align_up(value: int, alignment: int) -> int:
-    """Round ``value`` up to a positive byte ``alignment``."""
-    return (int(value) + alignment - 1) // alignment * alignment
-
-
-def align_down(value: int, alignment: int) -> int:
-    """Round ``value`` down to a positive byte ``alignment``."""
-    return int(value) // alignment * alignment
-
-
 # Bump allocator over caller-provided extents: malloc first-fits an extent and
 # hands back base+cursor, bounded by each extent's RESERVED size (not any
 # committed watermark) so upper-bound tensors can be allocated before physical
@@ -642,6 +630,26 @@ class VmmReservation:
 
         self._mappings.append((address, size, None))
 
+    def unmap_existing(self, offset: int, size: int) -> None:
+        """Undo one ``map_existing``, leaving its handle alive and unmapped.
+
+        Only a backend without aliased mappings needs to rebind, but the shared
+        ``PagePool.unmap_binding`` calls this on whichever reservation it holds.
+        """
+        if self._closed:
+            raise RuntimeError("VmmReservation.unmap_existing after close")
+        offset, size = int(offset), int(size)
+        record = (self.base + offset, size, None)
+        if record not in self._mappings:
+            raise ValueError(
+                f"[{offset}, {offset + size}) is not an aliased mapping of this "
+                f"reservation"
+            )
+        self._mappings.remove(record)
+        check_drv(
+            _get_cuda_driver().cuMemUnmap(record[0], size), "cuMemUnmap(existing)"
+        )
+
     def close(self, *, release_handles: bool = True) -> None:
         """Unmap allocations, optionally release retained handles, and free VA."""
         if self._closed:
@@ -665,13 +673,6 @@ class VmmReservation:
             logger.warning("cuMemAddressFree(local) -> %s", err)
 
 
-def all_ranks_ok(group: ProcessGroup, ok: bool) -> bool:
-    """True iff ``ok`` holds on every rank in ``group`` (BAND all-reduce)."""
-    flag = torch.tensor([1 if ok else 0], dtype=torch.int32, device="cpu")
-    dist.all_reduce(flag, op=dist.ReduceOp.BAND, group=group)
-    return flag.item() == 1
-
-
 def release_mappings(mappings) -> None:
     """Unmap + address-free each ``(va, span_size, [(rel, size), ...])`` mapping.
 
@@ -683,42 +684,6 @@ def release_mappings(mappings) -> None:
         for rel, size in mapped_chunks:
             check_drv(drv.cuMemUnmap(int(va) + int(rel), int(size)), "cuMemUnmap")
         check_drv(drv.cuMemAddressFree(int(va), int(span_size)), "cuMemAddressFree")
-
-
-def _send_fd(sock, fd: int, src_rank: int, base_idx: int) -> None:
-    fds = array.array("i", [int(fd)])
-    header = struct.pack("<QQQ", int(src_rank), int(base_idx), 1)
-    sent = sock.sendmsg(
-        [header],
-        [(socket.SOL_SOCKET, socket.SCM_RIGHTS, fds.tobytes())],
-    )
-    if sent != len(header):
-        raise RuntimeError(f"sendmsg sent {sent} bytes, expected {len(header)}")
-
-
-def _recv_fd(sock):
-    fd_item_size = array.array("i").itemsize
-    data, ancdata, _, _ = sock.recvmsg(
-        _FD_HEADER_BYTES, socket.CMSG_SPACE(fd_item_size)
-    )
-    if not data:
-        return None
-    if len(data) != _FD_HEADER_BYTES:
-        raise RuntimeError(
-            f"received truncated fd header: {len(data)} < {_FD_HEADER_BYTES}"
-        )
-    src_rank, base_idx, fd_count = struct.unpack("<QQQ", data)
-    fds = array.array("i")
-    for level, cmsg_type, cmsg_data in ancdata:
-        if level == socket.SOL_SOCKET and cmsg_type == socket.SCM_RIGHTS:
-            fds.frombytes(cmsg_data[: len(cmsg_data) - (len(cmsg_data) % fd_item_size)])
-    if fd_count != 1 or len(fds) != 1:
-        for fd in fds:
-            os.close(fd)
-        raise RuntimeError(
-            f"expected one fd, got header={fd_count}, ancillary={len(fds)}"
-        )
-    return int(src_rank), int(base_idx), int(fds[0])
 
 
 def export_shareable_handles(retained_handles, group: ProcessGroup, rank: int):
@@ -787,97 +752,6 @@ def export_shareable_handles(retained_handles, group: ProcessGroup, rank: int):
         raise RuntimeError(message) from posix_error
 
     return [], posix_fds, False
-
-
-def exchange_posix_fds(
-    group: ProcessGroup,
-    rank: int,
-    world_size: int,
-    local_fds: List[int],
-    peer_base_counts: List[int],
-):
-    """Exchange POSIX file descriptors across ranks via SCM_RIGHTS over a UNIX
-    socket. Returns ``{(src_rank, base_idx): fd}`` for every peer. The caller
-    owns the received fds and must close them.
-    """
-    sock_kind = socket.SOCK_SEQPACKET
-    sock_dir = tempfile.mkdtemp(prefix="sgl_ar_fd_")
-    sock_path = os.path.join(sock_dir, f"rank_{rank}.sock")
-    server = socket.socket(socket.AF_UNIX, sock_kind)
-    server.settimeout(_FD_SEND_TIMEOUT_S)
-    received_fds = {}
-    errors = []
-
-    def recv_loop():
-        try:
-            for _ in range(world_size - 1):
-                conn, _ = server.accept()
-                with conn:
-                    conn.settimeout(_FD_SEND_TIMEOUT_S)
-                    while True:
-                        packet = _recv_fd(conn)
-                        if packet is None:
-                            break
-                        src_rank, base_idx, fd = packet
-                        key = (src_rank, base_idx)
-                        if key in received_fds:
-                            os.close(fd)
-                            raise RuntimeError(f"duplicate fd for {key}")
-                        received_fds[key] = fd
-        except BaseException as e:
-            errors.append(e)
-
-    try:
-        server.bind(sock_path)
-        server.listen(world_size)
-        paths = [None] * world_size
-        dist.all_gather_object(paths, sock_path, group=group)
-
-        thread = threading.Thread(target=recv_loop, daemon=True)
-        thread.start()
-        try:
-            for peer_rank, peer_path in enumerate(paths):
-                if peer_rank == rank:
-                    continue
-                with socket.socket(socket.AF_UNIX, sock_kind) as sock:
-                    sock.settimeout(_FD_SEND_TIMEOUT_S)
-                    sock.connect(peer_path)
-                    for base_idx, fd in enumerate(local_fds):
-                        _send_fd(sock, fd, rank, base_idx)
-        finally:
-            thread.join(_FD_SEND_TIMEOUT_S)
-
-        if thread.is_alive():
-            raise RuntimeError("timed out waiting for POSIX fd exchange")
-        if errors:
-            raise RuntimeError("POSIX fd exchange receive failed") from errors[0]
-
-        expected = {
-            (src_rank, base_idx)
-            for src_rank, count in enumerate(peer_base_counts)
-            if src_rank != rank
-            for base_idx in range(count)
-        }
-        missing = expected.difference(received_fds)
-        extra = set(received_fds).difference(expected)
-        if missing or extra:
-            for fd in received_fds.values():
-                os.close(fd)
-            raise RuntimeError(
-                "POSIX fd exchange mismatch: "
-                f"missing={sorted(missing)[:8]}, extra={sorted(extra)[:8]}"
-            )
-        return received_fds
-    finally:
-        server.close()
-        try:
-            os.unlink(sock_path)
-        except FileNotFoundError:
-            pass
-        try:
-            os.rmdir(sock_dir)
-        except OSError:
-            pass
 
 
 def import_peer_handle(fabric_handle, fd, *, use_fabric: bool, peer_rank: int):
