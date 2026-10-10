@@ -386,6 +386,13 @@ class ExecMamba(msgspec.Struct):
             choices=["triton", "flashinfer"],
         ),
     ] = "triton"
+    mamba_prefill_backend: A[
+        str,
+        Arg(
+            help="Mamba2 prefill backend. FlashInfer SSD requires SM100, BF16 activations, head dimension 64 and state dimension 128; decode/verify still use --mamba-backend.",
+            choices=["triton", "flashinfer"],
+        ),
+    ] = "triton"
     mamba_ssm_dtype: A[
         Optional[str],
         Arg(
@@ -491,6 +498,12 @@ class ExecMamba(msgspec.Struct):
     enable_linear_replayssm_spec: A[
         bool,
         "Enable the ReplaySSM spec-verify: fold-every-commit -- a per-slot raw-input window replaces the recurrent verify's per-draft full-state snapshots. GDN or KDA hybrid linear-attn models, linear-chain (--speculative-eagle-topk in {None, 1}) only.",
+    ] = False
+    enable_mamba2_spec_replay: A[
+        bool,
+        "Replay accepted Nemotron Mamba2 speculative states from compact inputs "
+        "instead of per-candidate SSM snapshots. Requires SM100, FlashInfer 0.7.0.post1, "
+        "FP16 state, BF16 activations, EAGLE/NEXTN, topk=1, and 4 verify positions.",
     ] = False
 
 

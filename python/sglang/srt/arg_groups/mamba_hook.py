@@ -7,6 +7,7 @@ import logging
 from typing import Any
 
 from sglang.srt.arg_groups.overrides import (
+    model_config_of,
     resolving_view,
     supports_mamba_cache_extra_buffer,
 )
@@ -18,6 +19,35 @@ logger = logging.getLogger(__name__)
 
 def handle_mamba_backend(server_args: Any):
     cfg = resolving_view(server_args)
+    if cfg.mamba_prefill_backend == "flashinfer":
+        if not get_platform().is_sm100:
+            raise ValueError("FlashInfer Mamba2 SSD prefill currently requires SM100.")
+        if cfg.enable_unified_memory or cfg.enable_page_major_kv_layout:
+            raise ValueError(
+                "FlashInfer Mamba2 SSD prefill requires contiguous static state pools."
+            )
+        logger.info(
+            "Mamba2 prefill uses FlashInfer SSD; decode/verify backend is unchanged"
+        )
+    if cfg.enable_mamba2_spec_replay:
+        from sglang.srt.configs.mamba2_spec_replay import validate_mamba2_spec_replay
+        from sglang.srt.speculative.ragged_verify import (
+            RaggedVerifyMode,
+            read_ragged_verify_mode,
+        )
+
+        model = model_config_of(server_args)
+        if not get_platform().is_sm100:
+            raise ValueError("--enable-mamba2-spec-replay currently requires SM100.")
+        validate_mamba2_spec_replay(
+            cfg,
+            getattr(model.hf_text_config, "model_type", None),
+            is_cuda=get_platform().is_cuda,
+        )
+        if read_ragged_verify_mode() is not RaggedVerifyMode.STATIC:
+            raise ValueError(
+                "--enable-mamba2-spec-replay requires static-width verify."
+            )
     if cfg.mamba_cache_philox_rounds < 0:
         raise ValueError("--mamba-cache-philox-rounds must be non-negative.")
 
@@ -113,7 +143,6 @@ def _platform_supports_mamba_cache_extra_buffer() -> bool:
 
 
 def validate_mamba_extra_buffer(view, hf_config: Any, *, mamba_cache_chunk_size_of):
-
     assert supports_mamba_cache_extra_buffer(view, hf_config), (
         f"extra_buffer is not supported for {hf_config.architectures[0]}; use no_buffer."
     )

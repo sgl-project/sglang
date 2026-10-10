@@ -1116,6 +1116,51 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
             self.mamba_chunk_size,
             forward_batch,
         )
+        if (
+            get_exec().mamba.mamba_prefill_backend == "flashinfer"
+            and self.forward_metadata.num_prefills > 0
+        ):
+            from sglang.kernels.ops.mamba.flashinfer_ssd import (
+                prepare_ssd_prefill_metadata,
+            )
+
+            lengths = forward_batch.extend_seq_lens_cpu
+            if lengths is None:
+                lengths = forward_batch.extend_seq_lens.tolist()
+            endpoints = None
+            slots = None
+            if metadata.has_mamba_track_mask:
+                # Use exactly the Triton tracking policy, including final-state
+                # rows and sequence-relative chunk boundaries. Slot IDs stay
+                # on device after virtual-to-physical translation.
+                if self._has_cpu_prefill_track_metadata(forward_batch):
+                    mask = forward_batch.mamba_prefill_track_mask_cpu
+                    track_lens = forward_batch.mamba_track_seqlens_cpu
+                    prefix_lens = forward_batch.extend_prefix_lens_cpu
+                else:
+                    mask = forward_batch.mamba_track_mask.tolist()
+                    track_lens = forward_batch.mamba_track_seqlens.tolist()
+                    prefix_lens = forward_batch.extend_prefix_lens.tolist()
+                endpoints = []
+                for active, track, prefix, length in zip(
+                    mask, track_lens, prefix_lens, lengths
+                ):
+                    relative = track - prefix
+                    endpoints.append(
+                        (
+                            length
+                            if relative % self.mamba_chunk_size == 0
+                            else relative
+                            // self.mamba_chunk_size
+                            * self.mamba_chunk_size
+                        )
+                        if active
+                        else -1
+                    )
+                slots = forward_batch.mamba_track_indices[: len(lengths)]
+            self.forward_metadata.ssd_prefill = prepare_ssd_prefill_metadata(
+                lengths, forward_batch.input_ids.device, endpoints, slots
+            )
 
     def forward(
         self,
@@ -1589,6 +1634,22 @@ class HybridLinearAttnBackend(AttentionBackend):
             )
             return
 
+        mamba2_replay = getattr(mamba_pool, "enable_mamba2_spec_replay", False)
+        if mamba2_replay:
+            from sglang.kernels.ops.mamba.mamba2_spec_replay import commit_mamba2_replay
+
+            assert mamba_caches.intermediate_ssm is None
+            # Verify and acceptance/commit are enqueued on the worker's forward
+            # stream (run_eagle_verify). The next verify cannot overwrite these
+            # slot-keyed records before this commit, even with plan overlap.
+            commit_mamba2_replay(
+                mamba_caches,
+                state_indices_tensor,
+                last_correct_step_indices,
+                mamba_track_indices,
+                mamba_steps_to_track,
+            )
+
         scatter_mamba_states_after_mtp_verify(
             mamba_caches,
             state_indices_tensor,
@@ -1596,6 +1657,7 @@ class HybridLinearAttnBackend(AttentionBackend):
             mamba_track_indices,
             mamba_steps_to_track,
             src_indices_raw=src_indices_raw,
+            skip_ssm=mamba2_replay,
         )
 
         self._update_ple_state_after_mtp_verify(

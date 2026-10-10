@@ -92,7 +92,6 @@ def mamba_v2_sharded_weight_loader(
     """
 
     def loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
-
         # - track boundary of (sharded) param, and loaded_weight, respectively
         boundary, loaded_boundary = 0, 0
 
@@ -612,36 +611,72 @@ class MambaMixer2(torch.nn.Module):
                     0,
                 )
 
-            # NOTE: final output is an in-place update of out tensor
-            intermediate_states, varlen_state, track_states = mamba_chunk_scan_combined(
-                hidden_states_p.view(
-                    1, num_prefill_tokens, local_num_heads, self.head_dim
-                ),
-                dt_p.unsqueeze(0),
-                self.A,
-                B_p.view(1, num_prefill_tokens, local_num_groups, -1),
-                C_p.view(1, num_prefill_tokens, local_num_groups, -1),
-                chunk_size=mixed_metadata.chunk_size,
-                D=self.D,
-                z=None,
-                dt_bias=self.dt_bias,
-                seq_idx=mixed_metadata.seq_idx,
-                chunk_indices=mixed_metadata.chunk_indices,
-                chunk_offsets=mixed_metadata.chunk_offsets,
-                cu_seqlens=query_start_loc_p,
-                initial_states=initial_states,
-                return_varlen_states=True,
-                return_final_states=False,
-                return_track_states=True,
-                track_seq_idx=metadata.track_ssm_seq_idx,
-                track_end_locs=metadata.track_ssm_end_locs,
-                dt_softplus=True,
-                dt_limit=(0.0, float("inf")),
-                out=preallocated_ssm_out_p.view(
-                    1, num_prefill_tokens, -1, self.head_dim
-                ),
-                state_dtype=ssm_state.dtype,
-            )
+            if metadata.ssd_prefill is not None:
+                from sglang.kernels.ops.mamba.flashinfer_ssd import (
+                    flashinfer_ssd_prefill,
+                )
+
+                if initial_states is None:
+                    initial_states = ssm_state.new_zeros(
+                        (num_prefills, *ssm_state.shape[1:])
+                    )
+                # SSD writes the selected tracking endpoint directly. Returning
+                # no intermediate_states prevents the backend's Triton snapshot
+                # copy from overwriting that checkpoint with a different state.
+                varlen_state = flashinfer_ssd_prefill(
+                    hidden_states_p.view(
+                        1, num_prefill_tokens, local_num_heads, self.head_dim
+                    ),
+                    dt_p.unsqueeze(0),
+                    self.A,
+                    B_p.view(1, num_prefill_tokens, local_num_groups, -1),
+                    C_p.view(1, num_prefill_tokens, local_num_groups, -1),
+                    D=self.D,
+                    dt_bias=self.dt_bias,
+                    initial_states=initial_states,
+                    metadata=metadata.ssd_prefill,
+                    out=preallocated_ssm_out_p.view(
+                        1, num_prefill_tokens, -1, self.head_dim
+                    ),
+                    checkpoint_states=(
+                        ssm_state
+                        if metadata.ssd_prefill.checkpoint_token_indices is not None
+                        else None
+                    ),
+                )
+            else:
+                # NOTE: final output is an in-place update of out tensor
+                intermediate_states, varlen_state, track_states = (
+                    mamba_chunk_scan_combined(
+                        hidden_states_p.view(
+                            1, num_prefill_tokens, local_num_heads, self.head_dim
+                        ),
+                        dt_p.unsqueeze(0),
+                        self.A,
+                        B_p.view(1, num_prefill_tokens, local_num_groups, -1),
+                        C_p.view(1, num_prefill_tokens, local_num_groups, -1),
+                        chunk_size=mixed_metadata.chunk_size,
+                        D=self.D,
+                        z=None,
+                        dt_bias=self.dt_bias,
+                        seq_idx=mixed_metadata.seq_idx,
+                        chunk_indices=mixed_metadata.chunk_indices,
+                        chunk_offsets=mixed_metadata.chunk_offsets,
+                        cu_seqlens=query_start_loc_p,
+                        initial_states=initial_states,
+                        return_varlen_states=True,
+                        return_final_states=False,
+                        return_track_states=True,
+                        track_seq_idx=metadata.track_ssm_seq_idx,
+                        track_end_locs=metadata.track_ssm_end_locs,
+                        dt_softplus=True,
+                        dt_limit=(0.0, float("inf")),
+                        out=preallocated_ssm_out_p.view(
+                            1, num_prefill_tokens, -1, self.head_dim
+                        ),
+                        state_dtype=ssm_state.dtype,
+                    )
+                )
 
             # update ssm states
             # - varlen state is a (num_prefills, nheads, headdim, dstate) tensor
@@ -718,7 +753,16 @@ class MambaMixer2(torch.nn.Module):
             hidden_states_d = hidden_states_d.view(-1, local_num_heads, self.head_dim)
 
             if is_target_verify:
-                selective_state_update(
+                verify_fn = selective_state_update
+                verify_kwargs = {}
+                if getattr(layer_cache, "mamba2_replay_x", None) is not None:
+                    from sglang.kernels.ops.mamba.mamba2_spec_replay import (
+                        verify_mamba2_replay,
+                    )
+
+                    verify_fn = verify_mamba2_replay
+                    verify_kwargs["layer_cache"] = layer_cache
+                verify_fn(
                     ssm_state,
                     hidden_states_d.view(
                         num_decodes,
@@ -751,6 +795,7 @@ class MambaMixer2(torch.nn.Module):
                     cache_steps=draft_token_num,
                     retrieve_parent_token=metadata.retrieve_parent_token,
                     intermediate_state_indices=self.intermediate_state_indices,
+                    **verify_kwargs,
                 )
             else:
                 selective_state_update(

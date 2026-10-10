@@ -18,6 +18,39 @@ if TYPE_CHECKING:
 
 _CUDA = frozenset({CapabilityRequirement.CUDA})
 
+register_kernel(
+    KernelSpec(
+        op="mamba.flashinfer_ssd_prefill",
+        backend=KernelBackend.FLASHINFER,
+        target="sglang.kernels.ops.mamba.flashinfer_ssd:flashinfer_ssd_prefill",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 3))}
+        ),
+        description="Packed BF16 Mamba2 SSD with FP16/BF16 endpoint checkpoints.",
+    )
+)
+
+register_kernel(
+    KernelSpec(
+        op="mamba.verify_mamba2_replay",
+        backend=KernelBackend.FLASHINFER,
+        target="sglang.kernels.ops.mamba.mamba2_spec_replay:verify_mamba2_replay",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 0))}
+        ),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="mamba.materialize_flashinfer_mamba2",
+        backend=KernelBackend.FLASHINFER,
+        target="sglang.kernels.ops.mamba.flashinfer_replay_materialize:materialize_flashinfer_mamba2",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 0))}
+        ),
+    )
+)
+
 # JIT is the only backend: the AOT kernel it replaced was built for CUDA alone,
 # never by the ROCm / MUSA / Metal extensions. Non-CUDA resolves nothing here --
 # the Triton fallback is picked by the serving wrapper's `_HAS_CONV1D_KERNEL`
