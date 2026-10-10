@@ -457,7 +457,9 @@ class ReqToTokenPool:
 
     def clear(self):
         self.free_slots = list(range(1, self._alloc_size))
-        self.req_generation.zero_()
+        # req_generation must stay monotonic: readers detect row reuse by
+        # equality with a generation they stored, so zeroing it here can give a
+        # row's next request the same generation as its previous one.
         if self._aux_cache is not None:
             self._aux_cache.clear()
 
