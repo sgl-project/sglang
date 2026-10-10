@@ -13,6 +13,7 @@ from PIL import Image
 from sglang.multimodal_gen.runtime.pipelines.diffusers_pipeline import (
     DiffusersExecutionStage,
 )
+from sglang.multimodal_gen.runtime.pipelines.ernie_image import ErnieImagePipeline
 from sglang.multimodal_gen.runtime.pipelines.sana_video import (
     SanaVideoTextEncodingStage,
 )
@@ -147,3 +148,23 @@ def test_sana_video_negative_prompt_uses_requested_sequence_length():
         SimpleNamespace(negative_prompt="Blurry", max_sequence_length=None), None, [0]
     )
     assert captured["max_length"] == 300
+
+
+@pytest.mark.parametrize(
+    "pe_entry, expected",
+    [([None, None], False), (["transformers", "Mistral3Model"], True), (None, False)],
+)
+def test_ernie_absent_pe_component_is_not_detected(monkeypatch, pe_entry, expected):
+    """model_index.json records an absent component as [null, null]; that was
+    treated as a real prompt-enhancement model and loading then failed."""
+    model_index = {} if pe_entry is None else {"pe": pe_entry}
+    monkeypatch.setattr(
+        "sglang.multimodal_gen.runtime.pipelines.ernie_image.maybe_download_model_index",
+        lambda path: model_index,
+    )
+    pipeline = ErnieImagePipeline.__new__(ErnieImagePipeline)
+
+    assert (
+        pipeline._has_pe_in_model_index(SimpleNamespace(model_path="org/ernie"))
+        is expected
+    )
