@@ -1,12 +1,15 @@
 import os
 import socket
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
+from sglang.srt.server_args import PortArgs
 from sglang.srt.utils.network import (
     _get_addrinfos_for_bind,
     bind_port,
     get_free_port,
+    get_free_rendezvous_port,
     get_open_port,
     is_port_available,
     try_bind_socket,
@@ -119,6 +122,63 @@ class TestSocketUtilities(CustomTestCase):
         self.assertGreater(port, 0)
         self.assertLessEqual(port, 65535)
 
+    def test_get_free_rendezvous_port_avoids_linux_ephemeral_range(self):
+        """Rendezvous ports should avoid Linux ephemeral client ports."""
+        checked_ports = []
+
+        def mock_is_port_available(port):
+            checked_ports.append(port)
+            return port == 9999
+
+        with (
+            patch(
+                "sglang.srt.utils.network._read_linux_ephemeral_port_range",
+                return_value=(10000, 61000),
+            ),
+            patch("sglang.srt.utils.network.random.randrange", return_value=8975),
+            patch(
+                "sglang.srt.utils.network.is_port_available",
+                side_effect=mock_is_port_available,
+            ),
+        ):
+            self.assertEqual(get_free_rendezvous_port(), 9999)
+        self.assertTrue(all(port < 10000 or port > 61000 for port in checked_ports))
+
+    def test_get_free_rendezvous_port_uses_random_start(self):
+        """Avoid pinning every process to the same non-ephemeral candidate."""
+        with (
+            patch(
+                "sglang.srt.utils.network._read_linux_ephemeral_port_range",
+                return_value=(10000, 61000),
+            ),
+            patch("sglang.srt.utils.network.random.randrange", return_value=2),
+            patch("sglang.srt.utils.network.is_port_available", return_value=True),
+        ):
+            self.assertEqual(get_free_rendezvous_port(), 1026)
+
+    def test_get_free_rendezvous_port_excludes_reserved_ports(self):
+        """Do not reuse ports already planned for other listeners."""
+        with (
+            patch(
+                "sglang.srt.utils.network._read_linux_ephemeral_port_range",
+                return_value=(10000, 61000),
+            ),
+            patch("sglang.srt.utils.network.random.randrange", return_value=0),
+            patch("sglang.srt.utils.network.is_port_available", return_value=True),
+        ):
+            self.assertEqual(get_free_rendezvous_port(exclude_ports={1024}), 1025)
+
+    def test_get_free_rendezvous_port_falls_back_without_candidate(self):
+        """Use OS-assigned ports when no non-ephemeral TCP port is available."""
+        with (
+            patch(
+                "sglang.srt.utils.network._read_linux_ephemeral_port_range",
+                return_value=(1024, 65535),
+            ),
+            patch("sglang.srt.utils.network.get_free_port", return_value=49152),
+        ):
+            self.assertEqual(get_free_rendezvous_port(), 49152)
+
     def test_bind_port(self):
         """bind_port should return a listening socket."""
         port = get_free_port()
@@ -152,6 +212,43 @@ class TestSocketUtilities(CustomTestCase):
                 self.assertGreater(port, occupied_port)
         finally:
             sock.close()
+
+
+class TestPortArgsRendezvousPortExclusions(CustomTestCase):
+    def test_rendezvous_exclusions_cover_later_bound_listener_ports(self):
+        server_args = SimpleNamespace(
+            port=32000,
+            dp_size=3,
+            engine_info_bootstrap_port=6789,
+            grpc_port=32010,
+            gated_launch_port=32011,
+            smg_grpc_mode=True,
+            grpc_mode=False,
+            smg_http_sidecar_port=32012,
+            disaggregation_bootstrap_port=8998,
+            encoder_bootstrap_port=8997,
+            remote_instance_weight_loader_seed_instance_service_port=32013,
+            remote_instance_weight_loader_send_weights_group_ports=[32014, 32015],
+        )
+
+        exclusions = set(PortArgs._rendezvous_port_exclusions(server_args))
+
+        self.assertTrue(
+            {
+                6789,
+                8997,
+                8998,
+                32000,
+                32001,
+                32002,
+                32010,
+                32011,
+                32012,
+                32013,
+                32014,
+                32015,
+            }.issubset(exclusions)
+        )
 
 
 class TestReservePort(CustomTestCase):
