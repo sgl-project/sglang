@@ -5,6 +5,7 @@ import torch
 from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyLayout,
     build_ragged_target_verify_geometry,
+    ragged_verify_dense_scatter_indices,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -20,6 +21,25 @@ _GRID = [8, 16, 24, 32, 64]
 
 
 class TestRaggedTargetVerifyGeometry(CustomTestCase):
+    def test_dense_scatter_indices_preserve_variable_row_boundaries(self):
+        query_start_loc = torch.tensor([0, 3, 4, 8], dtype=torch.int32)
+        indices = ragged_verify_dense_scatter_indices(
+            query_start_loc=query_start_loc,
+            seq_len=8,
+            draft_token_num=4,
+        )
+        self.assertEqual(indices.tolist(), [0, 1, 2, 4, 8, 9, 10, 11])
+
+    def test_dense_scatter_indices_map_uncovered_tail_to_ghost(self):
+        # The capped layout covers six tokens; two graph-tail tokens remain.
+        query_start_loc = torch.tensor([0, 2, 3, 6], dtype=torch.int32)
+        indices = ragged_verify_dense_scatter_indices(
+            query_start_loc=query_start_loc,
+            seq_len=8,
+            draft_token_num=4,
+        )
+        self.assertEqual(indices.tolist(), [0, 1, 4, 8, 9, 10, 12, 12])
+
     def test_mixed_verify_lens_geometry(self):
         layout = RaggedVerifyLayout.from_verify_lens(
             verify_lens_cpu=[8, 1, 3], device=_DEVICE, grid=_GRID
