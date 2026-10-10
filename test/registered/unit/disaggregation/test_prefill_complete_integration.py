@@ -28,7 +28,7 @@ from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, enter_scope
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
@@ -590,14 +590,15 @@ class TestAllocationIntegration(CustomTestCase):
         scheduler.attn_cp_cpu_group = scheduler.attn_tp_cpu_group = object()
         scheduler.output_streamer = Mock()
         scheduler.send_kv_chunk = Mock()
-        self.enterContext(
+        enter_scope(
+            self,
             patch(
                 "sglang.srt.disaggregation.prefill.poll_and_all_reduce_attn_cp_tp_group",
                 side_effect=lambda senders, *groups: [s.poll() for s in senders],
-            )
+            ),
         )
-        self.enterContext(
-            patch("sglang.srt.disaggregation.prefill.checkpoint_kv_cache")
+        enter_scope(
+            self, patch("sglang.srt.disaggregation.prefill.checkpoint_kv_cache")
         )
         return scheduler
 
