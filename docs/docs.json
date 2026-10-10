@@ -975,7 +975,9 @@
               "docs/advanced_features/llm-d",
               "docs/advanced_features/deterministic_inference",
               "docs/advanced_features/observability",
+              "docs/advanced_features/forward_hooks",
               "docs/advanced_features/model_loading",
+              "docs/advanced_features/rfork",
               "docs/advanced_features/object_storage",
               "docs/advanced_features/checkpoint_engine",
               "docs/advanced_features/sglang_for_rl"
@@ -1033,7 +1035,9 @@
                   "docs/developer_guide/development_guide_using_docker",
                   "docs/developer_guide/development_jit_kernel_guide",
                   "docs/developer_guide/quantization_contribution_guide",
-                  "docs/developer_guide/layer_boundary"
+                  "docs/developer_guide/layer_boundary",
+                  "docs/developer_guide/release_process",
+                  "docs/developer_guide/setup_github_runner"
                 ]
               },
               {
@@ -1054,6 +1058,7 @@
               "docs/references/overview",
               "docs/references/faq",
               "docs/references/environment_variables",
+              "docs/references/torch_compile_cache",
               "docs/references/production_metrics",
               "docs/references/production_request_trace",
               {
@@ -1668,6 +1673,19 @@
                     "tag": "NEW",
                     "pages": [
                       "cookbook/vla/FLUX/FLUX-3-Action"
+                    ]
+                  }
+                ]
+              },
+              {
+                "group": "Omni Models",
+                "pages": [
+                  "cookbook/omni/intro",
+                  {
+                    "group": "FishAudio",
+                    "tag": "NEW",
+                    "pages": [
+                      "cookbook/omni/FishAudio/S2-Pro"
                     ]
                   }
                 ]
