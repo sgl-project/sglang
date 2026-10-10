@@ -110,7 +110,6 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
-from sglang.srt.utils.video_decoder import _BACKEND, VideoDecoderWrapper
 
 if TYPE_CHECKING:
     pass
@@ -1915,6 +1914,8 @@ def load_audio(
             mono=mono,
         )
 
+    from sglang.srt.utils.video_decoder import _BACKEND
+
     if _BACKEND == "torchcodec":
         from torchcodec.decoders import AudioDecoder
 
@@ -2222,6 +2223,8 @@ def load_video(video_file: Union[str, bytes, VideoData], use_gpu: bool = True):
     if source is None:
         raise ValueError(f"Unsupported video input type: {type(video_file)}")
 
+    from sglang.srt.utils.video_decoder import VideoDecoderWrapper
+
     device = "cuda" if use_gpu else "cpu"
     try:
         return VideoDecoderWrapper(source, device=device)
@@ -2261,6 +2264,8 @@ def encode_video(video_path, frame_count_limit=None):
         gap = len(l) / n
         idxs = [int(i * gap + gap / 2) for i in range(n)]
         return [l[i] for i in idxs]
+
+    from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 
     decoder = VideoDecoderWrapper(video_path)
     avg_fps = decoder.avg_fps
