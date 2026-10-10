@@ -1,6 +1,5 @@
 """Verify --enable-int8-mamba-checkpoint doubles cacheable prefix capacity on NPU."""
 
-import os
 import random
 import time
 import unittest
@@ -33,18 +32,15 @@ NPU_ENV = {
     "SGLANG_DEEPEP_BF16_DISPATCH": "1",
     "ENABLE_ASCEND_MOE_NZ": "1",
 }
-# Optional: specify the starting NPU card when reusing the script locally across
-# multiple machines (not set in CI, delegated to the scheduler).
-BASE_GPU_ID = os.environ.get("BASE_GPU_ID")
 
 # Prefixes must cross the mamba chunk granularity (~512), otherwise they cannot
 # be cached and reuse stays 0 (note from PR 28185).
-PREFIX_TOKENS = 1024
+PREFIX_TOKENS = 768
 SUFFIX_TOKENS = 16
 # Number of active bf16 pool slots; the int8 checkpoint pool defaults to 2x this.
-MAX_MAMBA_CACHE_SIZE = 256
+MAX_MAMBA_CACHE_SIZE = 128
 # Distinct prefix counts to sweep; the reuse collapse point should fall in this
-# range (off ~256, on ~512).
+# range (off ~128, on ~256).
 K_SCAN = [64, 128, 256, 512]
 PARALLEL = 8
 # reuse below this threshold is considered "collapsed" (cache overflowed at K).
@@ -131,8 +127,6 @@ def _measure_config(int8_enabled, plan):
         "--mamba-ssm-dtype",
         "bfloat16",
     ]
-    if BASE_GPU_ID is not None:
-        other_args += ["--base-gpu-id", BASE_GPU_ID]
     if int8_enabled:
         other_args.append("--enable-int8-mamba-checkpoint")
 
