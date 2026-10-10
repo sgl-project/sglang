@@ -1162,3 +1162,84 @@ sglang serve ...
 ```
 
 Two further limits are worth knowing before you size a run. The pool is a per-node process, so a worker that spans nodes would shard its keyspace by node. And under PD disaggregation the §3.7 pairs run the linker on the prefill role only, so the decode worker offloads nothing; in aggregated serving the single worker offloads its own KV.
+
+### 3.9 Attention-FFN disaggregation on GB300
+
+This example serves the original **DeepSeek-V4-Pro MXFP4** checkpoint with
+Direct MegaMoE and EAGLE/MTP.
+
+N attention instances (A) share one FFN instance (F), with four GB300 GPUs per host:
+
+| Role | Hosts | GPUs | Parallelism |
+| --- | --- | --- | --- |
+| Attention | N | 4 per instance | TP4 / attention DP4 |
+| Shared FFN | 2 | 8 total | TP8 / EP8 across both hosts |
+
+Follow the [AFD setup guide](/docs/advanced_features/afd_disaggregation) on every
+host. This configuration requires:
+
+- All A and F GPUs in one MNNVL domain, with IMEX configured for cross-host GPU
+  memory access.
+- An `sgl-deep-gemm` build with `deep_gemm.mega.m2n` support and the
+  `runai-model-streamer` loader.
+
+Set `FFN_HOST` to F's first host address in both commands below.
+
+#### Attention instances
+
+Run the same command on each A host, using the same checkpoint and F address:
+
+```bash
+FFN_HOST=10.0.0.10
+
+python -m sglang.launch_server \
+  --model-path deepseek-ai/DeepSeek-V4-Pro \
+  --host 0.0.0.0 \
+  --tp 4 --attn-dp-size 4 \
+  --afd-role attn --afd-backend direct_megamoe \
+  --afd-ffn-addr "$FFN_HOST:30000" \
+  --chunked-prefill-size 8192 \
+  --max-running-requests 512 --cuda-graph-max-bs-decode 128 \
+  --mem-fraction-static 0.84 \
+  --enable-dp-lm-head \
+  --afd-decode-num-microbatches 2 \
+  --speculative-algorithm EAGLE \
+  --speculative-num-steps 2 --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 3 \
+  --speculative-moe-runner-backend flashinfer_mxfp4
+```
+
+#### FFN instance
+
+Run on both F hosts with `NODE_RANK=0` and `1`, respectively. Set
+`NUM_ATTN_INSTANCES` to the number of A hosts;
+`2` below is an example.
+
+```bash
+FFN_HOST=10.0.0.10
+NUM_ATTN_INSTANCES=2
+NODE_RANK=0
+
+python -m sglang.launch_server \
+  --model-path deepseek-ai/DeepSeek-V4-Pro \
+  --host 0.0.0.0 \
+  --tp 8 --ep-size 8 \
+  --nnodes 2 --node-rank "$NODE_RANK" \
+  --dist-init-addr "$FFN_HOST:20000" \
+  --afd-role ffn --afd-backend direct_megamoe \
+  --afd-attn-instances "$NUM_ATTN_INSTANCES" \
+  --moe-runner-backend deep_gemm \
+  --mem-fraction-static 0.84
+```
+
+Start all A and F instances. After initialization and graph capture complete,
+send generation requests to the A instances on port `30000`.
+
+#### Configuration notes
+
+- `--max-running-requests 512` applies to each A instance. With DP4, the decode
+  graph limit is `128` per rank. Keep all A configurations identical.
+- F derives its graph and dispatch capacities from the A handshakes; leave
+  F's graph limits and `SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK` unset.
+- `--afd-decode-num-microbatches 2` enables decode overlap. Restart the A/F group after changing topology, capacity,
+  or microbatch settings.

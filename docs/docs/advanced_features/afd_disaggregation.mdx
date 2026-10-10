@@ -1,0 +1,208 @@
+---
+title: "Attention-FFN disaggregation"
+description: "Run attention and routed MoE experts on separate GPU groups with AFD."
+---
+
+Attention-FFN disaggregation (AFD) separates routed MoE expert computation from
+the rest of the model. The attention instance (A) owns request scheduling,
+attention, KV cache, routing, and shared experts. The FFN instance (F) owns routed
+expert weights and executes the expert work sent by A at each MoE layer. Send
+generation requests to A; F does not serve generation requests.
+
+Multiple A instances can share one F instance. You can choose their GPU counts
+independently, subject to the parallelism requirements below.
+
+For a multi-host deployment with shared experts, EAGLE/MTP, and decode microbatch
+overlap, see the [DeepSeek-V4-Pro Direct MegaMoE recipe on GB300](/cookbook/autoregressive/DeepSeek/DeepSeek-V4#3-9-attention-ffn-disaggregation-on-gb300).
+
+## Prerequisites
+
+- Linux with NVIDIA GPUs and a working CUDA 13
+  [SGLang installation](/docs/get-started/install).
+- The same SGLang revision containing AFD support and the same model checkpoint
+  on A and F. Use matching optional component builds on all workers when
+  selecting an optional backend.
+- Network connectivity between all participating workers. On multiple hosts, use
+  an F address reachable from every A worker. The handshake uses F's API port
+  plus 300, and workers also establish NCCL and control connections.
+
+## Supported models and precisions
+
+AFD integrates Qwen3 MoE, DeepSeek V3/V3.2/V4, and the GLM-5 MoE DSA family. These
+architectures also support AFD decode microbatch overlap.
+
+Quantization support depends on the AFD backend and F's MoE runner. The table
+describes **routed-expert weight formats**; attention, shared experts, and KV
+cache can use different formats.
+
+| Backend | Routed-expert weights | Model activation dtype |
+| --- | --- | --- |
+| `nccl` / `nvshmem` | BF16, FP8, MXFP4, or ModelOpt NVFP4, where supported by the model and native F MoE runner | Must match between A and F |
+| `direct_deepep` | FP8 or MXFP4 with the DeepGEMM core; ModelOpt NVFP4 with `flashinfer_cutedsl` | BF16 |
+| `direct_megamoe` | 128×128 block FP8, MXFP4, or ModelOpt NVFP4 with prepared MegaMoE weights | BF16 |
+
+The Direct backends require BF16 model activations but do not support BF16
+routed-expert weights. Direct MegaMoE additionally requires SM100 or SM103 GPUs.
+MXFP4 includes the routed-expert format used by DeepSeek V4; it does not imply
+that every layer runs in FP4. FP8 support is limited to the layouts accepted by
+the selected runner, and does not imply MXFP8 support.
+
+These are implementation capabilities. Accuracy and performance qualification
+applies to specific model, checkpoint, backend, and hardware configurations.
+
+## Select a backend
+
+`nccl` is the default backend. To select another backend, set the same
+`--afd-backend` on A and F.
+
+| Backend | Decode path | Additional AFD component |
+| --- | --- | --- |
+| `nccl` | Staged transfers between A and F | None |
+| `nvshmem` | Transfers through a shared symmetric arena | `afd-nvshmem` |
+| `direct_deepep` | Direct token dispatch from A ranks to F expert owners | `sglang-afd-deepep-v2` |
+| `direct_megamoe` | Fused M2N dispatch, expert compute, and combine | An `sgl-deep-gemm` build exposing `deep_gemm.mega.m2n` |
+
+All backends use staged NCCL transfers for prefill. For staged backends,
+`--moe-a2a-backend` selects F's internal expert layout; set it consistently on A
+and F. The default is `none`. To use DeepEP within F, select `deepep` on both
+sides and configure F's expert parallelism.
+
+Direct backends configure this internal layout automatically. They require pure
+expert parallelism on F (`--ep-size` equal to `--tp`, with `--moe-dp-size 1`) and
+either `deep_gemm` or `flashinfer_cutedsl` as its MoE runner, depending on the
+model's quantization. Direct MegaMoE requires trivial expert placement and no
+redundant experts.
+
+### Install optional components
+
+Install only the component needed for your selected backend. Use wheels built
+for your Python version, CPU architecture, Torch, and CUDA environment. These
+AFD component builds are separate from the standard SGLang installation; a stock
+DeepGEMM wheel does not provide the M2N API.
+
+{/* TODO: Add public source and release links once component publishing is finalized. */}
+
+Replace the local paths below with the corresponding wheel paths:
+
+```bash
+# For --afd-backend nvshmem:
+python -m pip install --no-deps /path/to/afd_nvshmem-*.whl
+
+# For --afd-backend direct_deepep:
+python -m pip install --no-deps /path/to/sglang_afd_deepep_v2-*.whl
+
+# For --afd-backend direct_megamoe:
+python -m pip install --no-deps /path/to/sgl_deep_gemm-*.whl
+```
+
+Use an AFD-tagged DeepGEMM version to distinguish this build from the stock
+release. The isolated `sglang_afd_deepep_v2` module and the private NVSHMEM runtime
+allow their AFD paths to coexist with F's standard DeepEP prefill path.
+
+## Reference deployment
+
+The following single-host baseline deploys Qwen3-30B-A3B-FP8 on four NVIDIA GB300
+GPUs. It uses the default staged NCCL backend and standard SGLang
+dependencies. Each GPU group must have enough memory for its model weights;
+A also needs capacity for KV cache and concurrent requests.
+
+| Instance | GPUs | Parallelism | Endpoint |
+| --- | --- | --- | --- |
+| Attention | 0, 1 | TP2 with attention DP2 | `127.0.0.1:30000` (default) |
+| FFN | 2, 3 | TP2 | `127.0.0.1:31000` |
+
+The commands specify only the model, topology, roles, and F endpoint. Memory
+allocation, context length, request capacity, kernel selection, and CUDA graph
+configuration use SGLang defaults. The A:F allocation is a deployment baseline;
+size and tune it against the workload before using it as a production configuration.
+
+### Attention instance
+
+Start A on its assigned GPUs and connect it to F's API address. With `--tp 2`,
+AFD requires `--attn-dp-size 2` so that each attention group has TP size one.
+
+```bash
+MODEL_PATH=/path/to/Qwen3-30B-A3B-FP8
+
+CUDA_VISIBLE_DEVICES=0,1 python -m sglang.launch_server \
+  --model-path "$MODEL_PATH" \
+  --tp 2 --attn-dp-size 2 \
+  --afd-role attn \
+  --afd-ffn-addr 127.0.0.1:31000
+```
+
+### FFN instance
+
+Start F on its assigned GPUs. The nondefault port separates F from A on the
+same host.
+
+```bash
+MODEL_PATH=/path/to/Qwen3-30B-A3B-FP8
+
+CUDA_VISIBLE_DEVICES=2,3 python -m sglang.launch_server \
+  --model-path "$MODEL_PATH" \
+  --tp 2 \
+  --afd-role ffn \
+  --port 31000
+```
+
+### Service readiness
+
+Start both A and F. Once model initialization, the AFD handshake, and CUDA graph
+capture complete, validate the generation path through A's endpoint:
+
+```bash
+curl http://127.0.0.1:30000/generate \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"The capital of France is","sampling_params":{"temperature":0,"max_new_tokens":32}}'
+```
+
+F's HTTP readiness alone does not establish that the AFD group is ready to serve.
+For a multi-host deployment, use an F address reachable by all A workers. If an
+individual A or F instance spans hosts, configure `--nnodes`, `--node-rank`, and
+`--dist-init-addr` for that instance separately; `--afd-ffn-addr` still identifies
+F's API endpoint.
+
+## Parallelism and batching
+
+- **A parallelism:** when `--tp` is greater than one, set `--attn-dp-size` to the
+  same value. Each attention group has tensor parallel size one. Leave A's
+  expert-parallel and MoE DP sizes at their defaults of one.
+- **F parallelism:** configure tensor and expert parallelism on F. Do not enable
+  attention DP or model DP on F.
+- **Shared F:** set `--afd-attn-instances` on F to the number of A instances that
+  will connect. Every instance must complete its handshake before serving
+  starts. Staged backends batch compatible ready steps across A instances;
+  direct backends use a joint world across all participating ranks. The A
+  instances must have matching GPU counts, token and graph buckets, and
+  microbatch configurations.
+- **Decode overlap:** set `--afd-decode-num-microbatches 2` or `3` on A to overlap
+  microbatches. The default is `1`. All A instances sharing F must use the same
+  microbatch count. Values greater than one require attention DP greater than
+  one and do not support LoRA.
+
+Keep capacity settings at their defaults unless the workload requires an
+override. Configure request admission and decode graph sizes on A; AFD derives
+F's graph capacities and applicable DeepEP dispatch limits from the handshakes.
+Do not copy A's request or graph limits to F. Configure speculative decoding
+only on A.
+
+For multiple A instances, start all declared instances before waiting for the
+group to become ready. Membership and capacity plans are established at startup;
+restart the A/F group together after changing its topology or capacity settings.
+
+## Current restrictions
+
+- Pipeline parallelism, attention context parallelism, prefill context
+  parallelism, EPLB, waterfill, PD multiplexing, and native two-batch or
+  single-batch overlap are not supported. AFD has its own decode overlap path.
+- AFD disables shared-expert fusion and prefill CUDA graphs. Direct backends
+  select full decode graphs when graphs are enabled and do not support
+  `--enable-torch-compile`.
+- EAGLE and DSPARK integration uses draft-local computation on A. Configure
+  speculative decoding only on A, with `--speculative-eagle-topk 1`, fixed draft
+  token counts, and full decode graphs. Adaptive speculation, multilayer EAGLE,
+  decoupled speculation, and skipping DP MLP synchronization are not supported.
+- An A instance can use PD's `decode` role; F must use
+  `--disaggregation-mode null`. This is separate from the single-host example
+  above; see [PD disaggregation](/docs/advanced_features/pd_disaggregation).
