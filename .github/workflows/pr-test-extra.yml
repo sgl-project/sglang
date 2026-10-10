@@ -56,7 +56,8 @@ on:
 
 concurrency:
   # Keys on the PR number: two forks can share a head_ref and would cancel each other.
-  group: pr-test-extra-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref_name || 'default' }}-${{ inputs.git_ref || 'all' }}
+  # Isolate unrelated label events so they do not cancel active CI runs.
+  group: pr-test-extra-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref_name || 'default' }}-${{ inputs.git_ref || 'all' }}-${{ (github.event.action == 'labeled' && github.event.label.name != 'run-ci' && github.event.label.name != 'run-ci-extra') && github.run_id || 'main' }}
   cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
 
 env:
