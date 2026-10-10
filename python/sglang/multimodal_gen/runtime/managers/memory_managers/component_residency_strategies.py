@@ -269,17 +269,14 @@ class ComponentOffloadStrategy(ComponentResidencyStrategy):
                 return
             required_bytes = _cpu_module_nbytes(module, dtype=use.target_dtype)
             free_bytes = _device_free_bytes()
-            if free_bytes is not None and required_bytes > (
-                free_bytes - _WARMUP_PRELOAD_MARGIN_BYTES
-            ):
+            margin_bytes = state.warmup_preload_margin_bytes
+            if free_bytes is not None and required_bytes > (free_bytes - margin_bytes):
                 # reclaim unused allocator blocks only when driver-free memory is short
                 _empty_device_cache()
                 free_bytes = _device_free_bytes()
             preload_failed = False
             try:
-                if free_bytes is None or required_bytes <= (
-                    free_bytes - _WARMUP_PRELOAD_MARGIN_BYTES
-                ):
+                if free_bytes is None or required_bytes <= (free_bytes - margin_bytes):
                     self.prepare_for_use(module, use, state)
                     self.wait_for_use(module, use, state)
                     return

@@ -1146,6 +1146,106 @@ class TestWarmupModeNormalization(unittest.TestCase):
             self._resolve(warmup_mode="bogus")
 
 
+class TestWarmupPreload(unittest.TestCase):
+    """Warmup preload selectors and the device headroom are configurable."""
+
+    def _resolve(self, *, components="auto", margin_gib=1.0):
+        from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+
+        sa = ServerArgs.__new__(ServerArgs)
+        sa.warmup_mode = "off"
+        sa.warmup_resolutions = None
+        sa.warmup_num_frames = None
+        sa.enable_torch_compile = False
+        sa.enable_breakable_cuda_graph = False
+        sa.disagg_role = RoleType.MONOLITHIC
+        sa.warmup_preload_components = components
+        sa.warmup_preload_margin_gib = margin_gib
+        sa._adjust_warmup()
+        return sa
+
+    def test_defaults_keep_today_behavior(self):
+        from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_strategies import (
+            _WARMUP_PRELOAD_MARGIN_BYTES,
+        )
+
+        sa = self._resolve()
+        self.assertEqual(sa.warmup_preload_components, "auto")
+        self.assertEqual(sa.warmup_preload_margin_gib, 1.0)
+        self.assertEqual(sa.warmup_preload_margin_bytes, _WARMUP_PRELOAD_MARGIN_BYTES)
+        self.assertEqual(sa.warmup_preload_margin_bytes, round(1.0 * 1024**3))
+        self.assertTrue(sa.allows_warmup_preload("text_encoder"))
+        self.assertTrue(sa.allows_warmup_preload("transformer"))
+
+    def test_none_skips_every_component(self):
+        sa = self._resolve(components="none")
+        self.assertEqual(sa.warmup_preload_components, "none")
+        self.assertFalse(sa.allows_warmup_preload("text_encoder"))
+        self.assertFalse(sa.allows_warmup_preload("transformer"))
+
+    def test_name_list_normalizes_and_matches_groups(self):
+        sa = self._resolve(components="Text-Encoder, DiT")
+        self.assertEqual(sa.warmup_preload_components, "text_encoder,dit")
+        self.assertTrue(sa.allows_warmup_preload("text_encoder"))
+        self.assertTrue(sa.allows_warmup_preload("text_encoder_2"))
+        self.assertTrue(sa.allows_warmup_preload("transformer"))
+        self.assertTrue(sa.allows_warmup_preload("transformer_2"))
+        self.assertTrue(sa.allows_warmup_preload("video_dit"))
+        self.assertFalse(sa.allows_warmup_preload("vae"))
+
+        exact = self._resolve(components="transformer")
+        self.assertTrue(exact.allows_warmup_preload("transformer"))
+        self.assertFalse(exact.allows_warmup_preload("transformer_2"))
+        self.assertFalse(exact.allows_warmup_preload("text_encoder"))
+
+    def test_auto_or_none_cannot_mix_with_names(self):
+        with self.assertRaisesRegex(ValueError, "cannot mix"):
+            self._resolve(components="auto,dit")
+        with self.assertRaisesRegex(ValueError, "cannot mix"):
+            self._resolve(components="none,text_encoder")
+
+    def test_empty_list_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "comma-separated"):
+            self._resolve(components=" , ")
+
+    def test_negative_and_non_finite_margin_are_rejected(self):
+        for margin in (-0.1, float("nan"), float("inf"), float("-inf")):
+            with self.subTest(margin=margin):
+                with self.assertRaisesRegex(ValueError, "non-negative finite"):
+                    self._resolve(margin_gib=margin)
+
+    def test_zero_margin_is_allowed(self):
+        sa = self._resolve(margin_gib=0)
+        self.assertEqual(sa.warmup_preload_margin_gib, 0.0)
+        self.assertEqual(sa.warmup_preload_margin_bytes, 0)
+
+    def test_cli_accepts_the_flags(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        parsed, unknown = parser.parse_known_args(
+            [
+                "--model-path",
+                "/unused",
+                "--warmup-preload-components",
+                "text_encoder,dit",
+                "--warmup-preload-margin-gib",
+                "2.5",
+            ]
+        )
+        self.assertEqual(unknown, [])
+        self.assertEqual(parsed.warmup_preload_components, "text_encoder,dit")
+        self.assertEqual(parsed.warmup_preload_margin_gib, 2.5)
+
+    def test_missing_fields_mean_auto_and_one_gib(self):
+        from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_strategies import (
+            _WARMUP_PRELOAD_MARGIN_BYTES,
+        )
+
+        sa = ServerArgs.__new__(ServerArgs)
+        self.assertTrue(sa.allows_warmup_preload("transformer"))
+        self.assertEqual(sa.warmup_preload_margin_bytes, _WARMUP_PRELOAD_MARGIN_BYTES)
+
+
 class TestWarmupImageIsModelValid(unittest.TestCase):
     """The server-warmup placeholder image must be large enough for real pipelines."""
 
