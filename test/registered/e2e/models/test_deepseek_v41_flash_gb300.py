@@ -1,4 +1,4 @@
-"""DeepSeek-V4.1-Flash accuracy with DSPARK on four B200 GPUs.
+"""DeepSeek-V4.1-Flash accuracy with DSPARK on four GB300 GPUs.
 
 Run GSM8K and MMLU in TP4+EP4 and DP-attention4 + EP4 configurations.
 The DP+EP recipe is intentionally exercised rather than skipped: startup or
@@ -19,7 +19,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=1800, stage="extra-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=1800, stage="base-c", runner_config="4-gpu-gb300")
 
 MODEL = "deepseek-ai/DeepSeek-V4.1-Flash"
 
