@@ -57,6 +57,13 @@ class HostPoolBuilder(Protocol):
         packed_draft_device_pools: tuple[Any, ...],
     ) -> Any: ...
 
+    def kv_budget_bytes(
+        self, *, decl: HostPoolDecl, packed_draft_device_pools: tuple[Any, ...]
+    ) -> Optional[int]:
+        """Device bytes this pool takes out of the KV host budget under a fixed
+        hicache size. None: it is allocated on top of the KV host pool."""
+        ...
+
 
 class HostPoolDecl(msgspec.Struct, frozen=True, kw_only=True):
     """One host pool a device pool asks HiCache to keep. Pool-intrinsic: no layer binding."""
