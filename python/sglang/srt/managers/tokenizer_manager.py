@@ -3721,9 +3721,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 for i in range(len(obj.rid))
             ]
 
-        for rid, sub_obj, bootstrap_room in items:
+        # Check for duplicates before inserting anything: raising midway
+        # through the insert loop would leak the states created for the
+        # earlier items (they are never dispatched nor removed).
+        for rid, _, _ in items:
             if rid in self.rid_to_state:
                 raise ValueError(f"Duplicate request ID detected: {rid}")
+
+        for rid, sub_obj, bootstrap_room in items:
             time_stats = APIServerReqTimeStats(disagg_mode=self.disaggregation_mode)
             state = ReqState([], False, asyncio.Event(), sub_obj, time_stats)
             self.rid_to_state[rid] = state
