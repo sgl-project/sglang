@@ -353,4 +353,4 @@ def test_publish_consume_ragged_cp_rows(cached_mask, block):
 if __name__ == "__main__":
     import sys
 
-    sys.exit(pytest.main([__file__, *sys.argv[1:]]))
+    sys.exit(pytest.main([__file__]))
