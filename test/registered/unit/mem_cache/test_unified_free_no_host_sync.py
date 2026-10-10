@@ -58,8 +58,7 @@ def _paged_allocator(lazy: bool):
 _TABLES = {"virtual_to_physical", "physical_to_virtual"}
 
 # Methods that MUST tombstone through index_fill_; hand-listed because "writes
-# a tombstone" is a per-method design fact a scan cannot infer. Completeness is
-# guarded by `test_every_allocator_free_path_is_listed` below.
+# a tombstone" is a per-method design fact a scan cannot infer.
 _TOMBSTONE_METHODS = [
     (mea.MultiEndedAllocator, "_free_lazy"),
     (mea.MultiEndedAllocator, "free"),
