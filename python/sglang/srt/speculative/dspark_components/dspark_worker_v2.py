@@ -51,6 +51,7 @@ from sglang.srt.speculative.dspark_components.dspark_draft import (
     make_next_draft_input,
 )
 from sglang.srt.speculative.dspark_components.dspark_draft_sampler import (
+    DRAFT_CAPTURE_MIN_FREE_GB,
     maybe_build_draft_sampler,
 )
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
@@ -490,7 +491,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             group=self._draft_graph_group,
         )
         if is_cuda_alike() and capture_decode_cuda_graph:
-            if available_mem < 1.0:
+            if available_mem < DRAFT_CAPTURE_MIN_FREE_GB:
                 capture_decode_cuda_graph = False
                 logger.warning(
                     "Disable DSpark draft cuda graph because only %.2f GB GPU "

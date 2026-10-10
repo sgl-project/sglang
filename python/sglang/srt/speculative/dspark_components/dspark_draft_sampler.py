@@ -15,8 +15,8 @@ from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 
 logger = logging.getLogger(__name__)
 
-# Same free-memory floor init_cuda_graphs requires before draft capture.
-_CAPTURE_HEADROOM_GB = 1.0
+# Free GPU memory the draft graph capture needs left over, in GB.
+DRAFT_CAPTURE_MIN_FREE_GB = 1.0
 
 
 class DsparkDraftSampler:
@@ -164,7 +164,7 @@ def _resolve_folded_sampling(
         return True
     itemsize = _step_logits_dtype(model).itemsize
     need_gb = max_bs * gamma * _local_vocab_width(model) * itemsize / (1 << 30)
-    if available_memory_gb - need_gb >= _CAPTURE_HEADROOM_GB:
+    if available_memory_gb - need_gb >= DRAFT_CAPTURE_MIN_FREE_GB:
         return True
     if tp_rank == 0:
         logger.warning(
