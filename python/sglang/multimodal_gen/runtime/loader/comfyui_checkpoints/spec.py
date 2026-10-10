@@ -94,6 +94,7 @@ def _discover_checkpoint_specs() -> None:
     _SPECS_DISCOVERED = True
     from sglang.multimodal_gen.runtime.loader.comfyui_checkpoints import (  # noqa: F401
         flux,
+        ltx_2,
         minimax_h3,
         qwen_image,
         zimage,
