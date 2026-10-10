@@ -1233,6 +1233,7 @@
                   {
                     "group": "IFM",
                     "pages": [
+                      "cookbook/autoregressive/IFM/Jais-3",
                       "cookbook/autoregressive/IFM/K2-Horizon"
                     ]
                   },

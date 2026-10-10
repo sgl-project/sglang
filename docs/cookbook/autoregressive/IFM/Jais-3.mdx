@@ -1,0 +1,237 @@
+---
+title: Jais 3
+description: "Deploy the IFM Jais 3 family with SGLang — BF16 recipes for six dense and Mixture-of-Experts checkpoints on NVIDIA H100 GPUs."
+tag: NEW
+---
+
+## Deployment
+
+<a id="install" />
+
+<Accordion title="Install SGLang">
+
+Jais 3 is supported from SGLang 0.5.20:
+
+```bash Command
+pip install --upgrade pip
+pip install "sglang>=0.5.20"
+```
+
+For other install methods, see [Install](/docs/get-started/install).
+
+</Accordion>
+
+Choose a model size to generate its H100 launch command. Five checkpoints run on a single node; 375B-A23B needs two. The recipes serve each repository's `main` branch.
+
+import { Deployment } from "/src/snippets/_deployment.jsx";
+import { config }     from "/src/snippets/configs/IFM/jais-3.jsx";
+import { benchmarks } from "/src/snippets/configs/IFM/jais-3-benchmarks.jsx";
+
+<Deployment config={config} benchmarks={benchmarks} />
+
+Each accuracy value in the benchmark cards is the arithmetic mean of two full evaluation runs. Speed values come from a single run.
+
+## Playground
+
+The base recipes enable the `k2_horizon` reasoning parser. Use the Playground to configure the `k2_horizon` tool-call parser, TP and MoE expert-parallel overrides, NGRAM speculative decoding, PD disaggregation, and HiCache. A separate validation pass functionally exercised the tool-call parser on all six checkpoints; every other Playground override remains unverified.
+
+import { Playground } from "/src/snippets/_playground.jsx";
+
+<Playground config={config} />
+
+## 1. Model introduction
+
+**Jais 3** is an IFM model family spanning six checkpoints from **0.9B** to **375B** parameters. The family includes dense models, Mixture-of-Experts models, and the MoVA-36B-A4B checkpoint's routed Mixture-of-Value-Attention path. This page provides native SGLang serving recipes for the family.
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "22%"}} />
+    <col style={{width: "25%"}} />
+    <col style={{width: "23%"}} />
+    <col style={{width: "30%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Checkpoint</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Architecture</th>
+      <th style={{textAlign: "right", padding: "10px 12px", fontWeight: 700}}>Context length</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>H100 recipe</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px"}}><strong><a href="https://huggingface.co/IFM/Jais-3-0.9B">0.9B</a></strong></td>
+      <td style={{padding: "9px 12px", background: "rgba(255,255,255,0.02)"}}>Dense</td>
+      <td style={{padding: "9px 12px", textAlign: "right"}}>131,072</td>
+      <td style={{padding: "9px 12px", background: "rgba(255,255,255,0.02)"}}>BF16 · TP1</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px"}}><strong><a href="https://huggingface.co/IFM/Jais-3-3.7B">3.7B</a></strong></td>
+      <td style={{padding: "9px 12px", background: "rgba(255,255,255,0.02)"}}>Dense</td>
+      <td style={{padding: "9px 12px", textAlign: "right"}}>524,288</td>
+      <td style={{padding: "9px 12px", background: "rgba(255,255,255,0.02)"}}>BF16 · TP1</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px"}}><strong><a href="https://huggingface.co/IFM/Jais-3-7B">7B</a></strong></td>
+      <td style={{padding: "9px 12px", background: "rgba(255,255,255,0.02)"}}>Dense</td>
+      <td style={{padding: "9px 12px", textAlign: "right"}}>524,288</td>
+      <td style={{padding: "9px 12px", background: "rgba(255,255,255,0.02)"}}>BF16 · TP1</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px"}}><strong><a href="https://huggingface.co/IFM/Jais-3-32B">32B</a></strong></td>
+      <td style={{padding: "9px 12px", background: "rgba(255,255,255,0.02)"}}>Dense</td>
+      <td style={{padding: "9px 12px", textAlign: "right"}}>524,288</td>
+      <td style={{padding: "9px 12px", background: "rgba(255,255,255,0.02)"}}>BF16 · TP2</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px"}}><strong><a href="https://huggingface.co/IFM/Jais-3-MoVA-36B-A4B">MoVA-36B-A4B</a></strong></td>
+      <td style={{padding: "9px 12px", background: "rgba(255,255,255,0.02)"}}>MoE + MoVA</td>
+      <td style={{padding: "9px 12px", textAlign: "right"}}>524,288</td>
+      <td style={{padding: "9px 12px", background: "rgba(255,255,255,0.02)"}}>BF16 · TP2 · EP2</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px"}}><strong><a href="https://huggingface.co/IFM/Jais-3-375B-A23B">375B-A23B</a></strong></td>
+      <td style={{padding: "9px 12px", background: "rgba(255,255,255,0.02)"}}>MoE</td>
+      <td style={{padding: "9px 12px", textAlign: "right"}}>524,288</td>
+      <td style={{padding: "9px 12px", background: "rgba(255,255,255,0.02)"}}>BF16 · TP16 · EP16 · 2 nodes</td>
+    </tr>
+  </tbody>
+</table>
+
+**Resources:** [Jais 3 collection](https://huggingface.co/collections/IFM/jais-3) · [Jais 3 375B-A23B model card](https://huggingface.co/IFM/Jais-3-375B-A23B).
+
+## 2. Configuration tips
+
+- **Hardware and precision:** The current matrix covers NVIDIA H100 GPUs and BF16 checkpoints only.
+- **Parallelism:** Use TP1 for 0.9B, 3.7B, and 7B; TP2 for 32B; TP2 with expert parallelism (`--ep 2`) for MoVA-36B-A4B; and TP16 with `--ep 16` across two eight-GPU nodes for 375B-A23B. Every other recipe stays within one node.
+- **Attention:** The verified base recipes select FlashAttention-3 with `--attention-backend fa3`.
+- **Parsers:** The base recipes enable reasoning with `--reasoning-parser k2_horizon`. Enable `--tool-call-parser k2_horizon` from the **Parsers** card in the [Playground](#playground) when you need tool calling.
+- **MoVA-36B-A4B router provenance:** The MoVA-36B-A4B checkpoint's source xLLM router used two GEMM partitions. `--json-model-override-args '{"xllm_source_router_gemm_partitions":2}'` preserves its BF16 partial-GEMM rounding and FP32 reduction order; SGLang does not infer this source topology from runtime TP.
+- **375B-A23B memory:** The BF16 weights take about 760 GB. One node of eight H100 80 GB GPUs holds 640 GB, so the checkpoint does not fit on a single node; the recipe uses two nodes (16 GPUs, 1,280 GB). Run the generated command on both nodes, with node rank 0 on the head node and 1 on the other.
+- **375B-A23B loading:** The 375B-A23B recipe disables multithreaded weight loading with `--model-loader-extra-config '{"enable_multithread_load":false}'`.
+- **Playground features:** TP and EP settings other than the base recipes', NGRAM, PD disaggregation, and HiCache are optional, unverified command overrides. The tool-call parser was functionally exercised separately.
+- **Deliberate omissions:** Context parallelism is unsupported or unvalidated for xLLM. DP-attention and alternate MoE backend selectors are not exposed until they are validated.
+- **Validation:** All six recipes completed two full GSM8K evaluation runs on H100; see [Benchmark results](#3-benchmark-results).
+
+## 3. Benchmark results
+
+Speed was measured with native `sglang.benchmark.serving` using fixed random token IDs: 8,192 input tokens, 1,024 output tokens, 64 warmup requests, a cache flush, and seed `20260901`. The latency run uses 32 prompts at concurrency 1. The throughput run uses 256 prompts at concurrency 64 for the single-GPU checkpoints, 32 for the two-GPU checkpoints, and 8 for the two-node 375B-A23B. Each speed value comes from a single run, with the load generator on a separate client node; TTFT and TPOT are medians. Throughput per GPU is `(total input tokens + total output tokens) / duration / TP`. Checkpoints and workloads not yet measured show a dash in the benchmark cards.
+
+GSM8K used the full 1,319-example test split with `sgl-eval`, 32 client threads, a 32,768-token output limit, temperature 0, top-p 0.95, seed 0, and high reasoning effort. Each server ran on H100 from the repository's `main` branch, with no pinned revision. The evaluation is zero-shot: each question is sent as a single user message with the `math` prompt, which asks for the final answer inside `\boxed{}`, and no worked examples. Scoring is rule-based accuracy with no LLM judge: `sgl-eval` extracts the last `\boxed{}` from the final answer and checks it against the reference by symbolic equivalence, so `\$57{,}500` matches `57500`. A response with no boxed answer counts as incorrect, so these scores can be lower than LLM-as-a-judge results on the same outputs.
+
+Each checkpoint was evaluated twice, and the table shows both runs and their mean. The 0.9B and 3.7B runs were issued one after the other; from 7B onward both were issued together with `--n-repeats 2` against one running server. All requests completed without errors. Responses that reached the output limit stay in the score and count as incorrect; the Truncated column gives the share of such responses in run 1 and run 2.
+
+| Checkpoint | Run 1 | Run 2 | Mean | Truncated |
+| --- | ---: | ---: | ---: | ---: |
+| 0.9B | 83.62% | 83.78% | 83.70% | 0.68% / 0.61% |
+| 3.7B | 96.36% | 96.13% | 96.25% | 0.00% / 0.15% |
+| 7B | 95.91% | 95.83% | 95.87% | 0.00% / 0.08% |
+| 32B | 96.51% | 96.74% | 96.63% | 0.00% / 0.00% |
+| MoVA-36B-A4B | 95.98% | 96.44% | 96.21% | 0.00% / 0.00% |
+| 375B-A23B | 96.44% | 96.21% | 96.32% | 0.00% / 0.00% |
+
+## 4. Advanced usage
+
+### 4.1 Reasoning
+
+The base recipes include `--reasoning-parser k2_horizon`. The parser returns thinking in `reasoning_content` and the final answer in `content`.
+
+The example output below was captured with the MoVA-36B-A4B checkpoint and both parser flags enabled.
+
+<Accordion title="Reasoning example (Python)">
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
+response = client.chat.completions.create(
+    model="IFM/Jais-3-MoVA-36B-A4B",
+    messages=[{"role": "user", "content": "Hello"}],
+)
+
+message = response.choices[0].message
+reasoning = getattr(message, "reasoning_content", None)
+if reasoning is None:
+    reasoning = (message.model_extra or {}).get("reasoning_content")
+print("Reasoning:", reasoning)
+print("Answer:", message.content)
+```
+
+</Accordion>
+
+<Accordion title="Example Output">
+
+```text Output
+Reasoning: The user says "Hello". As a helpful AI, we should greet them back, maybe ask how we can assist. 
+
+We need to respond with a friendly greeting. Probably something like "Hello! How can I help you today?" 
+
+That's straightforward.
+
+We should consider any policies for greeting. No issues.
+
+Let's proceed.
+Answer: Hello! How can I help you today?
+```
+
+</Accordion>
+
+### 4.2 Tool calling
+
+Enable **Tool Call Parser** in the **Parsers** card of the [Playground](#playground) to add `--tool-call-parser k2_horizon`. The parser exposes K2 tool output as OpenAI-compatible `message.tool_calls`.
+
+The example output below was captured with the MoVA-36B-A4B checkpoint and both parser flags enabled.
+
+<Accordion title="Tool-calling example (Python)">
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Return weather for a city.",
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+            },
+        },
+    }
+]
+
+response = client.chat.completions.create(
+    model="IFM/Jais-3-MoVA-36B-A4B",
+    messages=[{"role": "user", "content": "Call get_weather for Paris."}],
+    tools=tools,
+    tool_choice={"type": "function", "function": {"name": "get_weather"}},
+    max_tokens=1024,
+)
+
+message = response.choices[0].message
+reasoning = getattr(message, "reasoning_content", None)
+if reasoning is None:
+    reasoning = (message.model_extra or {}).get("reasoning_content")
+print("Reasoning:", reasoning)
+print("Content:", message.content or "")
+for tool_call in message.tool_calls or []:
+    print(f"Tool call: {tool_call.function.name}({tool_call.function.arguments})")
+```
+
+</Accordion>
+
+<Accordion title="Example Output">
+
+```text Output
+Reasoning: The user wants the weather for Paris, using the get_weather function. We'll call the function.
+Content: [{"name":"get_weather", "parameters": {"city": "Paris"}}]
+```
+
+</Accordion>
+
+### 4.3 HiCache
+
+For large checkpoints or repeated long-context prefixes, enable **HiCache** in the [Playground](#playground), then choose a storage backend and write policy. Treat the generated override as unverified until it is exercised on your storage stack.
