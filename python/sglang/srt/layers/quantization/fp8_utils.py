@@ -1909,6 +1909,8 @@ def requant_block_scale_ue8m0_for_deepgemm(
     use_deepgemm_runner: bool,
     output_dtype: Optional[torch.dtype] = None,
     weight_shape=None,
+    *,
+    grouped_moe: bool = False,
 ) -> bool:
     """Requantize block-FP8 weight scales to UE8M0 in place for DeepGEMM.
 
@@ -1927,6 +1929,7 @@ def requant_block_scale_ue8m0_for_deepgemm(
             weight_block_size=weight_block_size,
             output_dtype=output_dtype,
             weight_shape=weight_shape,
+            grouped_moe=grouped_moe,
         )
     ):
         return False
