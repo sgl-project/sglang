@@ -516,13 +516,7 @@ class HunyuanDetector(BaseFormatDetector):
             )
             safe_value = partial_value[:-hold] if hold else partial_value
             k_json = json.dumps(partial_key, ensure_ascii=False)
-            escaped = (
-                safe_value.replace("\\", "\\\\")
-                .replace('"', '\\"')
-                .replace("\n", "\\n")
-                .replace("\r", "\\r")
-                .replace("\t", "\\t")
-            )
+            escaped = json.dumps(safe_value, ensure_ascii=False)[1:-1]
             # No closing `"` here — it's appended when the value closes.
             snapshot_parts.append(f'{k_json}: "{escaped}')
 
