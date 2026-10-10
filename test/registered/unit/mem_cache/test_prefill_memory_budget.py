@@ -8,7 +8,7 @@ from unittest.mock import MagicMock
 import torch
 
 from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.managers.schedule_policy import PrefillAdder
+from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
@@ -17,15 +17,18 @@ from sglang.srt.mem_cache.allocator.swa import (
     PureSWATokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
 )
+from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
     UnifiedMambaSWATokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.common import evict_from_tree_cache
 from sglang.srt.mem_cache.prefill_budget import SWAPrefillBudget
+from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase, published_topology
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -224,6 +227,55 @@ class TestSharedPrefillAdmission(unittest.TestCase):
                     req, has_chunked_req=False, truncation_align_size=None
                 )
                 self.assertEqual(adder.can_run_list, [req])
+
+
+class TestRunningDecodeReservation(CustomTestCase):
+    def test_cached_admission_reserves_fixed_length_decode(self):
+        # 900 tokens remain free. A new 600-token prompt with 100 output tokens
+        # fits only if the running request can stop before its remaining 300.
+        for ignore_eos, decoded, should_admit in (
+            (True, 100, False),
+            (True, 350, True),
+            (False, 100, True),
+        ):
+            with (
+                self.subTest(ignore_eos=ignore_eos, decoded=decoded),
+                published_topology(),
+            ):
+                allocator = TokenToKVPoolAllocator(
+                    2048, torch.bfloat16, "cpu", None, False
+                )
+                allocator.alloc(1148)
+                cache = RadixCache.create_simulated(mock_allocator=allocator)
+                running = Req(
+                    "running",
+                    None,
+                    array("q", [1]),
+                    SamplingParams(max_new_tokens=400, ignore_eos=ignore_eos),
+                )
+                running.output_ids.extend([1] * decoded)
+                waiting = Req(
+                    "waiting",
+                    None,
+                    array("q", [2] * 600),
+                    SamplingParams(max_new_tokens=100, ignore_eos=True),
+                )
+                waiting.init_next_round_input(cache)
+                adder = PrefillAdder(
+                    page_size=1,
+                    tree_cache=cache,
+                    token_to_kv_pool_allocator=allocator,
+                    running_batch=SimpleNamespace(reqs=[running]),
+                    new_token_ratio=0.1,
+                    rem_input_tokens=8192,
+                    rem_chunk_tokens=8192,
+                )
+                result = adder.add_one_req(
+                    waiting, has_chunked_req=False, truncation_align_size=None
+                )
+                self.assertEqual(bool(adder.can_run_list), should_admit)
+                if not should_admit:
+                    self.assertEqual(result, AddReqResult.NO_TOKEN)
 
 
 class TestFixedPrefillMemoryBudget(unittest.TestCase):
