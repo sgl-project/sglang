@@ -482,9 +482,17 @@ def prepare_diffusers_component_path_for_loading(component_path: str) -> str:
 
         config["quantization_config"] = normalized_quant_config
         try:
-            with open(config_path, "w", encoding="utf-8") as f:
-                json.dump(config, f, indent=2, sort_keys=True)
-                f.write("\n")
+            # Replace the path instead of writing through it: in an HF snapshot
+            # it is a symlink to a blob shared by every revision.
+            tmp_path = f"{config_path}.{os.getpid()}.tmp"
+            try:
+                with open(tmp_path, "w", encoding="utf-8") as f:
+                    json.dump(config, f, indent=2, sort_keys=True)
+                    f.write("\n")
+                os.replace(tmp_path, config_path)
+            finally:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
         except OSError as exc:
             logger.warning(
                 "Could not persist normalized ModelOpt config at %s (%s); "
