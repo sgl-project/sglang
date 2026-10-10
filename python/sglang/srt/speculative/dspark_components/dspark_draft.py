@@ -141,7 +141,7 @@ def draft_markov_block(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Draft ``gamma`` tokens per row, each step biased by the token before it;
     a row at temperature 0 takes the argmax. Returns the tokens and the step
-    logits, [bs, gamma, local vocab]."""
+    logits, [gamma, bs, local vocab] so that each step's rows are contiguous."""
     bs, gamma = base_logits.shape[:2]
     state = markov_head.init_state(draft_hidden)
     prev_tokens = anchor_tokens.long()
@@ -155,7 +155,7 @@ def draft_markov_block(
         step_base = base_logits[:, step]
         if logits_out is None:
             logits_out = torch.empty(
-                (bs, gamma, step_base.shape[-1]),
+                (gamma, bs, step_base.shape[-1]),
                 dtype=markov_head.step_logits_dtype(step_base.dtype, bias.dtype),
                 device=step_base.device,
             )
@@ -166,7 +166,7 @@ def draft_markov_block(
             noise_key=noise.key,
             noise_offset=noise.offset,
             step=step,
-            logits_out=logits_out[:, step],
+            logits_out=logits_out[step],
             has_sampled_rows=has_sampled_rows,
         )
         prev_tokens = tp_sync.sync(site, prev_tokens)
