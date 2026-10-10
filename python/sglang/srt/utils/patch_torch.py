@@ -17,6 +17,7 @@ import torch
 from torch.multiprocessing import reductions
 
 from sglang.srt.utils.common import is_musa, is_npu, torch_release
+from sglang.srt.utils.xpu_tensor_shm import monkey_patch_xpu_tensor_reductions
 
 _is_npu = is_npu()
 _is_musa = is_musa()
@@ -42,21 +43,19 @@ def monkey_patch_torch_reductions():
     """Monkey patching before Torch https://github.com/pytorch/pytorch/pull/149248 is fixed"""
 
     if not _is_npu:
-        if hasattr(reductions, "_reduce_tensor_original"):
-            return
-        reductions._reduce_tensor_original = reductions.reduce_tensor
-        reductions._rebuild_cuda_tensor_original = reductions.rebuild_cuda_tensor
+        if not hasattr(reductions, "_reduce_tensor_original"):
+            reductions._reduce_tensor_original = reductions.reduce_tensor
+            reductions._rebuild_cuda_tensor_original = reductions.rebuild_cuda_tensor
 
-        reductions.reduce_tensor = _reduce_tensor_modified
-        reductions.rebuild_cuda_tensor = _rebuild_cuda_tensor_modified
-        reductions.init_reductions()
-    else:
-        # FIXME: This is a temp patch for npu as HDK does not support device uuid for now
-        if hasattr(npu_reductions, "_rebuild_npu_tensor_original"):
-            return
-
+            reductions.reduce_tensor = _reduce_tensor_modified
+            reductions.rebuild_cuda_tensor = _rebuild_cuda_tensor_modified
+            reductions.init_reductions()
+    # FIXME: This is a temp patch for npu as HDK does not support device uuid for now
+    elif not hasattr(npu_reductions, "_rebuild_npu_tensor_original"):
         npu_reductions._rebuild_npu_tensor_original = npu_reductions.rebuild_npu_tensor
         npu_reductions.rebuild_npu_tensor = _rebuild_npu_tensor_modified
+
+    monkey_patch_xpu_tensor_reductions()
 
 
 # The signature has not been changed for years, and we will not need this when the next version is released,
@@ -71,6 +70,11 @@ def register_sgl_tp_rank(rank: int):
 
 def _reduce_tensor_modified(*args, **kwargs):
     output_fn, output_args = reductions._reduce_tensor_original(*args, **kwargs)
+    if output_fn is not reductions.rebuild_cuda_tensor:
+        # Only the CUDA-IPC payload carries a device at that index: a CPU tensor
+        # reduces to 3 arguments, and a meta tensor to 7, where index 6 is
+        # requires_grad.
+        return output_fn, output_args
     output_args = _modify_tuple(
         output_args, _REDUCE_TENSOR_ARG_DEVICE_INDEX, _device_to_uuid
     )
