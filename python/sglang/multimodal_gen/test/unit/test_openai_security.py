@@ -177,3 +177,114 @@ def test_multipart_upload_is_sanitized_before_generation(
         )
     assert response.status_code == 418, response.text
     assert not (tmp_path / "evil.png").exists()
+
+
+def test_invalid_output_quality_is_a_400_not_a_500(monkeypatch):
+    """A bad output_quality must surface as HTTP 400, not an unhandled ValueError."""
+    monkeypatch.setattr(
+        utils, "get_global_server_args", lambda: SimpleNamespace(model_path="m")
+    )
+    monkeypatch.setattr(
+        SamplingParams,
+        "from_user_sampling_params_args",
+        classmethod(
+            lambda cls, **kw: SimpleNamespace(
+                data_type=utils.DataType.IMAGE, output_compression=None
+            )
+        ),
+    )
+    with pytest.raises(HTTPException) as exc_info:
+        utils.build_sampling_params("request", output_quality="bogus")
+    assert exc_info.value.status_code == 400
+    assert "output_quality" in exc_info.value.detail
+
+
+@pytest.mark.parametrize(
+    "endpoint,kwargs",
+    [
+        ("/v1/images/generations", {"json": {"prompt": "p", "response_format": "url"}}),
+        (
+            "/v1/images/edits",
+            {
+                "data": {"prompt": "p", "response_format": "url"},
+                "files": {"image": ("a.png", b"image", "image/png")},
+            },
+        ),
+    ],
+)
+def test_url_response_without_destination_is_rejected_before_generation(
+    monkeypatch, tmp_path, endpoint, kwargs
+):
+    """response_format='url' with no cloud storage and no output_path must fail
+    fast instead of running the whole generation first."""
+    args = SimpleNamespace(
+        input_save_path=None, output_path=None, pipeline_class_name=None
+    )
+    monkeypatch.setattr(image_api, "get_global_server_args", lambda: args)
+    monkeypatch.setattr(
+        image_api, "resolve_sampling_params_cls", lambda args: SamplingParams
+    )
+    monkeypatch.setattr(image_api.cloud_storage, "enabled", False)
+
+    def generation_reached(*args, **kwargs):
+        raise HTTPException(status_code=599, detail="generation reached")
+
+    monkeypatch.setattr(image_api, "build_sampling_params", generation_reached)
+    app = FastAPI()
+    app.include_router(image_api.router)
+    with TestClient(app) as client:
+        response = client.post(endpoint, **kwargs)
+    assert response.status_code == 400, response.text
+    assert "cloud storage" in response.json()["detail"]
+
+
+def _patch_download(monkeypatch, handler):
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        utils.httpx,
+        "AsyncClient",
+        lambda **kw: real_client(transport=httpx.MockTransport(handler), **kw),
+    )
+
+
+def _chunked_png(request):
+    async def body():
+        for _ in range(8):
+            yield b"x" * 512
+
+    return httpx.Response(200, content=body(), headers={"content-type": "image/png"})
+
+
+@pytest.mark.parametrize(
+    "handler",
+    [
+        lambda request: httpx.Response(
+            200, content=b"x" * 4096, headers={"content-type": "image/png"}
+        ),
+        _chunked_png,
+    ],
+    ids=["content-length", "chunked-no-length"],
+)
+def test_image_download_over_size_limit_is_rejected(monkeypatch, tmp_path, handler):
+    """An oversized remote image must be aborted, not buffered and written."""
+    monkeypatch.setattr(utils, "_MAX_IMAGE_DOWNLOAD_BYTES", 1024)
+    _patch_download(monkeypatch, handler)
+    target = tmp_path / "in" / "img.png"
+    with pytest.raises(Exception, match="exceeds"):
+        asyncio.run(utils._save_url_image_to_path("https://x.test/a.png", str(target)))
+    assert not target.exists()
+
+
+def test_image_download_within_limit_is_saved(monkeypatch, tmp_path):
+    monkeypatch.setattr(utils, "_MAX_IMAGE_DOWNLOAD_BYTES", 1024)
+    _patch_download(
+        monkeypatch,
+        lambda request: httpx.Response(
+            200, content=b"x" * 512, headers={"content-type": "image/png"}
+        ),
+    )
+    target = tmp_path / "in" / "img.png"
+    saved = asyncio.run(
+        utils._save_url_image_to_path("https://x.test/a.png", str(target))
+    )
+    assert Path(saved).read_bytes() == b"x" * 512

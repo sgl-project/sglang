@@ -99,6 +99,15 @@ def _fallback_image_urls(
     ]
 
 
+def _raise_if_url_response_undeliverable(resp_format: str, is_persistent: bool) -> None:
+    """Reject response_format='url' before generating when no URL can be produced."""
+    if resp_format == "url" and not is_persistent and not cloud_storage.is_enabled():
+        raise HTTPException(
+            status_code=400,
+            detail="response_format='url' requires cloud storage to be configured.",
+        )
+
+
 def _select_image_variant_path(item: dict, variant: str | None) -> str | None:
     file_paths = item.get("file_paths")
     if file_paths:
@@ -260,6 +269,15 @@ async def generations(
     output_format = _resolve_image_output_format(
         request.output_format, sampling_params_cls
     )
+    response_format = request.response_format
+    if "response_format" not in request.model_fields_set:
+        response_format = (
+            sampling_params_cls.default_image_response_format() or response_format
+        )
+    resp_format = (response_format or "b64_json").lower()
+    _raise_if_url_response_undeliverable(
+        resp_format, server_args.output_path is not None
+    )
     ext = choose_output_image_ext(output_format, request.background)
     prompt = await maybe_enhance_prompt(
         raw_request, request.prompt, enabled=request.enhance_prompt, task="image"
@@ -322,12 +340,6 @@ async def generations(
         )
         save_file_path = save_file_path_list[0]
         response_resize = _get_response_resize(sampling, save_file_path)
-        response_format = request.response_format
-        if "response_format" not in request.model_fields_set:
-            response_format = (
-                sampling_params_cls.default_image_response_format() or response_format
-            )
-        resp_format = (response_format or "b64_json").lower()
 
         # read b64 before cloud upload may delete the local file
         b64_list = (
@@ -416,6 +428,10 @@ async def edits(
     server_args = get_global_server_args()
     sampling_params_cls = resolve_sampling_params_cls(server_args)
     output_format = _resolve_image_output_format(output_format, sampling_params_cls)
+    resp_format = (response_format or "b64_json").lower()
+    _raise_if_url_response_undeliverable(
+        resp_format, server_args.output_path is not None
+    )
     # Resolve images from either `image` or `image[]` (OpenAI SDK sends `image[]` when list is provided)
     images = image or image_array
     urls = url or url_array
@@ -496,7 +512,6 @@ async def edits(
         )
         save_file_path = save_file_path_list[0]
         response_resize = _get_response_resize(sampling, save_file_path)
-        resp_format = (response_format or "b64_json").lower()
 
         # read b64 before cloud upload may delete the local file
         b64_list = (
