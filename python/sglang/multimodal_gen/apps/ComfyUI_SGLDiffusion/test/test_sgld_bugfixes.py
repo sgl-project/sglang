@@ -459,3 +459,19 @@ def test_image_timeout_is_configurable():
     assert captured["timeout"] == 900
 
 
+# --- Bug 10: batched image inputs were silently truncated to image[0] ------
+
+
+def test_get_image_path_rejects_batches_instead_of_dropping_them():
+    batch = torch.zeros(3, 8, 8, 3)
+    with pytest.raises(ValueError, match="batch of 3 images"):
+        UTILS.get_image_path(batch)
+
+
+def test_get_image_path_accepts_single_image():
+    single = torch.zeros(1, 8, 8, 3)
+    path = UTILS.get_image_path(single)
+    assert os.path.exists(path)
+    os.remove(path)
+
+
