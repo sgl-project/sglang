@@ -530,7 +530,7 @@ std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
     at::Tensor& cos_sin_cache,
     bool is_neox);
 std::tuple<at::Tensor, at::Tensor>
-apply_rotary_pos_emb_cpu(at::Tensor& query, at::Tensor& key, at::Tensor& cos, at::Tensor& sin);
+apply_rotary_pos_emb_cpu(at::Tensor& query, at::Tensor& key, at::Tensor& cos, at::Tensor& sin, int64_t unsqueeze_dim);
 
 // multidimensional rope
 void apply_multidimensional_rope_cpu(at::Tensor& query, at::Tensor& key, at::Tensor& cos, at::Tensor& sin);
@@ -959,7 +959,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "rotary_embedding_cpu(Tensor positions, Tensor query, Tensor key, int head_size, Tensor cos_sin_cache, "
       "bool is_neox) -> (Tensor, Tensor)");
   m.impl("rotary_embedding_cpu", torch::kCPU, &rotary_embedding_cpu);
-  m.def("apply_rotary_pos_emb_cpu(Tensor query, Tensor key, Tensor cos, Tensor sin) -> (Tensor, Tensor)");
+  m.def(
+      "apply_rotary_pos_emb_cpu(Tensor query, Tensor key, Tensor cos, Tensor sin, int unsqueeze_dim=1) -> (Tensor, "
+      "Tensor)");
   m.impl("apply_rotary_pos_emb_cpu", torch::kCPU, &apply_rotary_pos_emb_cpu);
 
   // multidimensional rope
