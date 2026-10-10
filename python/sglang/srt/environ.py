@@ -1865,6 +1865,13 @@ class Envs:
     # which a CUDA graph capture rejects. Kept off until that is fixed so the
     # layer launch above stays usable on its own.
     SGLANG_K3_MONO_K1 = EnvBool(False)
+    # ROCm FlyDSL mono decode for Qwen3.8 (Qwen3_5MoeForCausalLM): each decoder
+    # layer of a decode step of at most 8 rows runs as two persistent launches,
+    # the GDN front (norm, in-projection, conv, recurrence, gated norm) and the
+    # layer back (out/o_proj, both TP all-reduces, norm, router, MXFP4 experts,
+    # shared expert). gfx950 + TP8; needs --disable-shared-experts-fusion and
+    # an fp32 SSM state. See srt/layers/moe/qwen3_5_mono_decode.py.
+    SGLANG_QWEN3_5_MONO_DECODE = EnvBool(False)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MIN_HITS = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MAX_SEQLEN = EnvInt(6144)
