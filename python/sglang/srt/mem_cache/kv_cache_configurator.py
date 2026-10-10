@@ -1968,6 +1968,20 @@ class KVCacheConfigurator:
             dsa_cp_layer_shard_rank,
             dsa_cp_layer_shard_size,
         ) = get_glm_dsa_cp_layer_shard_info(self)
+        if is_float4_e2m1fn_x2(self.kv_cache_dtype):
+            if self.kv_cache_dtype_str != "nvfp4":
+                raise ValueError("DSA packed FP4 cache requires --kv-cache-dtype nvfp4")
+            if (
+                get_memory().enable_hisparse
+                or get_memory().enable_hierarchical_cache
+                or get_disagg().disaggregation_mode != "null"
+                or get_parallel().dcp_enabled
+                or dsa_cp_layer_shard_rank is not None
+            ):
+                raise ValueError(
+                    "GLM DSA NVFP4 currently requires a local DSATokenToKVPool "
+                    "without HiSparse, HiCache, disaggregation, DCP, or cache-layer splitting."
+                )
         pool_kwargs = {}
         if get_memory().enable_hisparse:
             reject_out_of_tree_path(
@@ -2024,7 +2038,50 @@ class KVCacheConfigurator:
             max_running_requests=max_running_requests,
             **pool_kwargs,
         )
+        if token_to_kv_pool.dsa_kv_cache_store_nvfp4:
+            self._load_dsa_nvfp4_global_scales(token_to_kv_pool)
         return token_to_kv_pool
+
+    def _load_dsa_nvfp4_global_scales(self, pool: DSATokenToKVPool) -> None:
+        """Initialize stable per-layer dequant scales before any rows are written."""
+        from sglang.srt.model_loader.utils import resolve_language_model
+
+        language_model = (
+            self.model
+            if hasattr(self.model, "layers")
+            else resolve_language_model(self.model)
+        )
+        layers = getattr(language_model, "layers", None)
+        if layers is None:
+            decoder = getattr(language_model, "decoder", None)
+            layers = [] if decoder is None else [decoder]
+        loaded = 0
+        for model_layer in layers:
+            attention = None
+            if hasattr(model_layer, "self_attn"):
+                self_attn = model_layer.self_attn
+                attention = getattr(self_attn, "attn", None)
+                if attention is None:
+                    attention = getattr(self_attn, "attn_mqa", None)
+            elif hasattr(model_layer, "attn"):
+                attention = model_layer.attn
+            if attention is None or not hasattr(attention, "layer_id"):
+                continue
+            layer_id = attention.layer_id
+            if not pool.start_layer <= layer_id < pool.start_layer + pool.layer_num:
+                continue
+            scale = getattr(attention, "k_scale_float", None)
+            if scale is None:
+                scale = getattr(attention, "k_scale", None)
+            if scale is not None:
+                pool.set_mla_kv_global_scale(layer_id, scale)
+                loaded += 1
+        logger.info(
+            "DSA NVFP4 global scales: initialized %d/%d local layers from "
+            "attention scale parameters; missing parameters use 1.0.",
+            loaded,
+            pool.layer_num,
+        )
 
     def _build_hybrid_mla_swa_kv_pool(
         self,
@@ -2989,6 +3046,13 @@ def calculate_mla_kv_cache_dim(
     # For non-DSA models, MLA kv cache dim is simply kv_lora_rank + qk_rope_head_dim
     if not is_dsa_model:
         return kv_cache_dim
+
+    if is_float4_e2m1fn_x2(kv_cache_dtype):
+        if (kv_lora_rank, qk_rope_head_dim) != (512, 64):
+            raise ValueError("DSA NVFP4 requires latent dimension 512 and RoPE 64")
+        # Already a physical byte width: no additional division by two or
+        # separate scale allocation is needed for this mixed-format row.
+        return 256 + 32 + 128
 
     # TRTLLM uses the raw MLA KV layout. In disaggregated serving only the
     # backend for the local role determines the local pool layout; the

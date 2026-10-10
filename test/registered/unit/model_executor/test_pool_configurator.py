@@ -320,6 +320,86 @@ class TestDefaultConfigurator(CustomTestCase):
             fused = create_memory_pool_configurator(mr)
         self.assertEqual(fused._cell_size, 77777)
 
+    @patch("sglang.srt.utils.common.is_cuda", return_value=True)
+    def test_dsa_nvfp4_cell_size_counts_mixed_row_once(self, _mock_is_cuda):
+        import torch
+
+        if not hasattr(torch, "float4_e2m1fn_x2"):
+            self.skipTest("Requires torch FP4 dtype")
+        num_layers = 2
+        runner = _make_model_runner(self, num_layers=num_layers, use_mla_backend=True)
+        _configure_dsa_model(runner)
+        runner.kv_cache_dtype = torch.float4_e2m1fn_x2
+        with mock_cpu_env(kv_size=1):
+            from sglang.srt.model_executor.pool_configurator import (
+                DefaultPoolConfigurator,
+            )
+
+            configurator = DefaultPoolConfigurator(runner)
+        # The 416-byte row includes FP4 payload, block16 scales and BF16 RoPE;
+        # the unchanged indexer contributes 128 FP8 values + one FP32 scale.
+        self.assertEqual(configurator._cell_size, (416 + 132) * num_layers)
+
+    @patch("sglang.srt.utils.common.is_cuda", return_value=True)
+    def test_dsa_nvfp4_pool_keeps_byte_layout_and_persistent_layer_scales(
+        self, _mock_is_cuda
+    ):
+        import torch
+
+        from sglang.srt.layers.attention.dsa.nvfp4_k_cache import (
+            quantize_nvfp4_k_cache_into_reference,
+        )
+        from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+
+        if not hasattr(torch, "float4_e2m1fn_x2"):
+            self.skipTest("Requires torch FP4 dtype")
+        pool = MLATokenToKVPool(
+            size=64,
+            page_size=64,
+            dtype=torch.float4_e2m1fn_x2,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            layer_num=2,
+            device="cpu",
+            enable_memory_saver=False,
+            start_layer=2,
+            end_layer=4,
+            use_dsa=True,
+            override_kv_cache_dim=416,
+        )
+        pool.set_mla_kv_global_scale(2, 0.003)
+        self.assertEqual(pool.get_key_buffer(2).dtype, torch.uint8)
+        self.assertEqual(tuple(pool.get_key_buffer(2).shape), (128, 1, 416))
+        self.assertEqual(pool.get_kv_size_bytes(), 128 * 416 * 2 + 2 * 4)
+        self.assertEqual(
+            pool.get_value_buffer(2).data_ptr(), pool.get_key_buffer(2).data_ptr()
+        )
+        torch.manual_seed(42)
+        k = torch.randn(2, 1, 576, dtype=torch.bfloat16)
+        loc = torch.tensor([5, 66], dtype=torch.int64)
+        reference = torch.zeros_like(pool.get_key_buffer(2))
+        quantize_nvfp4_k_cache_into_reference(
+            k[..., :512],
+            k[..., 512:],
+            reference,
+            loc,
+            pool.get_mla_kv_global_scale(2),
+        )
+        layer = SimpleNamespace(layer_id=2)
+        with get_parallel().override(attn_dcp_size=1):
+            pool.set_mla_kv_buffer(layer, loc, k[..., :512], k[..., 512:])
+        torch.testing.assert_close(pool.get_key_buffer(2), reference, rtol=0, atol=0)
+
+        # The combined-row entry point must use the same mixed codec too.
+        pool.set_kv_buffer(layer, loc, k, k)
+        torch.testing.assert_close(pool.get_key_buffer(2), reference, rtol=0, atol=0)
+        scale_pointer = pool.mla_kv_global_scale.data_ptr()
+        pool._create_buffers()
+        self.assertEqual(pool.mla_kv_global_scale.data_ptr(), scale_pointer)
+        self.assertAlmostEqual(pool.get_mla_kv_global_scale(2).item(), 0.003)
+        with self.assertRaises(ValueError):
+            pool.set_mla_kv_global_scale(2, 0.0)
+
 
 class TestHybridSWAConfigurator(CustomTestCase):
     """Hybrid SWA: full/swa split, ratio, memory invariant."""
