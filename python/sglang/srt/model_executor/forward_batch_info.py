@@ -2112,7 +2112,11 @@ def enable_num_token_non_padded():
 
     # Elastic joiners also need graph padding masked after joining WORLD; a
     # customized A2A backend consumes the count whatever the EP size.
-    if get_parallel().moe_ep_size > 1 or world_dp_gather_enabled() or get_moe_a2a_backend().is_customized():
+    if (
+        get_parallel().moe_ep_size > 1
+        or world_dp_gather_enabled()
+        or get_moe_a2a_backend().is_customized()
+    ):
         return True
     # DP attention + TP MoE gathers each rank's whole padded chunk into the MoE,
     # so the model needs the real count to zero the pad rows (see
