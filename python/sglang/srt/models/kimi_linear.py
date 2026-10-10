@@ -8,6 +8,9 @@ from typing import Optional
 import torch
 from torch import nn
 
+from sglang.kernels.ops.attention.fla.fused_kda_output_quant import (
+    fused_kda_output_quant,
+)
 from sglang.kernels.ops.attention.fla.fused_norm_gate import FusedRMSNormGated
 from sglang.srt.configs.kimi_linear import KimiLinearConfig
 from sglang.srt.distributed import (
@@ -36,6 +39,11 @@ from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
+from sglang.srt.layers.quantization.fp8_utils import (
+    can_use_fused_kda_output_quant,
+    fp8_block_gemv_with_side,
+)
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -459,17 +467,48 @@ class KimiDeltaAttention(nn.Module):
             g_proj_states,
         )
 
+    def _fused_qkvbfg_with_beta(self, hidden_states: torch.Tensor):
+        proj = self.fused_qkvbfg_proj
+        method = proj.quant_method
+        if not (
+            hidden_states.ndim == 2
+            and isinstance(method, Fp8LinearMethod)
+            and method.block_quant
+            and not method.use_marlin
+            and not method.use_mxfp8
+            and not method.block_fp8_as_mxfp8
+        ):
+            return None
+        return fp8_block_gemv_with_side(
+            hidden_states,
+            proj.weight,
+            proj.weight_scale_inv,
+            method.weight_block_size,
+            self.b_proj.weight,
+            act_scale_ue8m0=isinstance(method.quant_config, Fp8Config)
+            and method.quant_config.scale_fmt == "ue8m0",
+        )
+
     def forward_qkvbfg_fused(self, hidden_states: torch.Tensor):
         if self.no_kda_lora:
             # Full-rank f/g: everything comes out of one GEMM, no batched
             # second-stage matmul.
-            fused_states, _ = self.fused_qkvbfg_proj(hidden_states)
+            fused = (
+                self._fused_qkvbfg_with_beta(hidden_states)
+                if not self.fuse_no_lora_beta
+                else None
+            )
+            if fused is None:
+                fused_states, _ = self.fused_qkvbfg_proj(hidden_states)
+            else:
+                fused_states, beta = fused
             split_states = torch.split(fused_states, self.split_sizes, dim=-1)
             if self.fuse_no_lora_beta:
                 qkv, beta, forget_gate, g_proj_states = split_states
             else:
                 qkv, forget_gate, g_proj_states = split_states
-                beta = self.b_proj(hidden_states)[0]
+                if fused is None:
+                    beta = self.b_proj(hidden_states)[0]
             return (
                 qkv,
                 beta,
@@ -533,8 +572,46 @@ class KimiDeltaAttention(nn.Module):
         norm_gate = g_proj_states.unflatten(
             -1, (-1, self.head_dim)
         )  # ... (h d) -> ... h d
-        core_attn_out = self.o_norm(core_attn_out, norm_gate)
-        core_attn_out = core_attn_out.squeeze(0).flatten(-2)  # 1 n h d -> n (h d)
+        use_fused_output_quant = False
+        num_tokens = hidden_states.shape[0]
+        if (
+            forward_batch.forward_mode.is_target_verify()
+            and self.head_dim == 128
+            and self.head_v_dim == 128
+            and core_attn_out.ndim == 4
+            and core_attn_out.dtype == torch.bfloat16
+            and core_attn_out.is_cuda
+            and core_attn_out.shape
+            == (1, num_tokens, self.local_num_heads, self.head_v_dim)
+            and core_attn_out.stride(-1) == 1
+            and norm_gate.dtype == torch.bfloat16
+            and norm_gate.device == core_attn_out.device
+            and norm_gate.shape == (num_tokens, self.local_num_heads, self.head_v_dim)
+            and norm_gate.stride(-1) == 1
+            and self.o_norm.activation == "sigmoid"
+            and self.o_norm.bias is None
+            and self.o_norm.weight.dtype == torch.bfloat16
+            and self.o_norm.weight.device == core_attn_out.device
+            and self.o_norm.weight.shape == (self.head_v_dim,)
+            and self.o_norm.weight.stride(0) == 1
+        ):
+            use_fused_output_quant = can_use_fused_kda_output_quant(
+                self.o_proj,
+                m=num_tokens,
+                k=self.local_num_heads * self.head_v_dim,
+                input_dtype=core_attn_out.dtype,
+            )
+
+        if use_fused_output_quant:
+            core_attn_out = fused_kda_output_quant(
+                core_attn_out,
+                norm_gate,
+                self.o_norm.weight,
+                self.o_norm.eps,
+            )
+        else:
+            core_attn_out = self.o_norm(core_attn_out, norm_gate)
+            core_attn_out = core_attn_out.squeeze(0).flatten(-2)  # 1 n h d -> n (h d)
 
         return self.o_proj(core_attn_out)[0]
 
