@@ -1044,7 +1044,8 @@ class TestDflashDraftKvBudget(CustomTestCase):
         )
 
     def test_dcp_replication_scales_draft_budget(self):
-        """The replicated draft pool spans every DCP virtual location."""
+        """The draft pool spans the virtual locations of the DCP ranks it is
+        replicated across: attn_dcp_size // draft_dcp_size of them."""
         draft_kv_per_token = 10_240
         mr = _make_model_runner(self)
         mr.spec_algorithm.is_dflash_family.return_value = True
@@ -1055,13 +1056,15 @@ class TestDflashDraftKvBudget(CustomTestCase):
         )
 
         target_kv_per_token = 4 * (64 + 64) * 32 * KV_SIZE
-        for dcp_size in (1, 8):
-            with self.subTest(dcp_size=dcp_size):
-                # TP=8 makes both topologies valid. The mock deliberately keeps
+        for dcp_size, draft_dcp_size in ((1, 1), (8, 1), (8, 2)):
+            with self.subTest(dcp_size=dcp_size, draft_dcp_size=draft_dcp_size):
+                # TP=8 makes every topology valid. The mock deliberately keeps
                 # target geometry fixed so this assertion isolates the draft term.
                 with (
                     mock_cpu_env(tp_size=8),
-                    get_parallel().override(attn_dcp_size=dcp_size),
+                    get_parallel().override(
+                        attn_dcp_size=dcp_size, draft_dcp_size=draft_dcp_size
+                    ),
                 ):
                     from sglang.srt.model_executor.pool_configurator import (
                         create_memory_pool_configurator,
@@ -1071,7 +1074,8 @@ class TestDflashDraftKvBudget(CustomTestCase):
 
                 self.assertEqual(
                     cfg._cell_size,
-                    target_kv_per_token + draft_kv_per_token * dcp_size,
+                    target_kv_per_token
+                    + draft_kv_per_token * (dcp_size // draft_dcp_size),
                 )
 
     def test_hybrid_swa_budget_shrinks_by_draft_pool(self):

@@ -85,20 +85,26 @@ def _mla_decode_kv_splits_cap(
     return max(base_max_kv_splits, min(sm_cap, ctx_cap))
 
 
-def _should_use_verify_shared_kv(model_config, topk, use_mla, use_verify_splitkv):
+def _should_use_verify_shared_kv(
+    model_config,
+    topk,
+    use_mla,
+    use_verify_splitkv,
+    *,
+    kv_dcp_size: Optional[int] = None,
+):
     if not is_gfx95_supported() or topk != 1:
         return False
     if use_mla:
         return is_kimi_k3(model_config.hf_config)
     if is_dspark_draft(model_config.hf_config):
         return use_verify_splitkv
+    if kv_dcp_size is None:
+        kv_dcp_size = get_parallel().attn_dcp_size
     return (
         use_verify_splitkv
         and is_qwen3_5(model_config.hf_config)
-        and model_config.get_num_kv_heads(
-            get_parallel().attn_tp_size, get_parallel().attn_dcp_size
-        )
-        == 1
+        and model_config.get_num_kv_heads(get_parallel().attn_tp_size, kv_dcp_size) == 1
     )
 
 
@@ -237,6 +243,7 @@ class TritonAttnBackend(AttentionBackend):
             self.topk,
             self.use_mla,
             self.use_verify_splitkv,
+            kv_dcp_size=model_runner.kv_dcp.size,
         )
         self.dcp_size = model_runner.kv_dcp.size
         self.dcp_rank = model_runner.kv_dcp.rank
@@ -245,7 +252,7 @@ class TritonAttnBackend(AttentionBackend):
             // get_parallel().attn_tp_size
         ) * self.dcp_size
         self.num_kv_head = model_runner.model_config.get_num_kv_heads(
-            get_parallel().attn_tp_size, get_parallel().attn_dcp_size
+            get_parallel().attn_tp_size, model_runner.kv_dcp.size
         )
         mla_config = model_runner.model_config
         self.use_dense_fp8_chunked_prefill = (

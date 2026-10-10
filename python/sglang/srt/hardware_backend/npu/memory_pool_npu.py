@@ -5,6 +5,7 @@ import torch
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.layers.dcp.layout import localize_dcp_indices
+from sglang.srt.mem_cache.allocation_sizing import get_draft_loc_space_scale
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKOnlyPool,
     MHATokenToKVPool,
@@ -659,7 +660,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         self.dcp_size = parallel.attn_dcp_size
         self.dcp_rank = parallel.attn_dcp_rank
         global_page_padding = self.dcp_size if self.dcp_size > 1 else 1
-        kv_page_padding = global_page_padding if is_draft_worker else 1
+        # Draft rows span the allocator-global ids of the DCP ranks the draft
+        # pool is replicated across.
+        kv_page_padding = get_draft_loc_space_scale() if is_draft_worker else 1
         index_page_padding = global_page_padding if index_head_dim is not None else 1
         if kv_page_padding < 1 or index_page_padding < 1:
             raise ValueError("NPU MLA page padding must be positive")
@@ -835,35 +838,43 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         )
 
     def _get_disagg_buffer_entries(self):
-        """Return (buffer, uses_global_slots) entries in PD transfer order."""
+        """Return (buffer, uses_global_slots, slots_per_row) entries in PD
+        transfer order; slots_per_row is the page padding that entry spans."""
         self._raise_if_native_kv_cache_disabled()
         global_kv = self.is_draft_worker
-        entries = [(buffer, global_kv) for buffer in self.k_buffer]
+        entries = [
+            (buffer, global_kv, self.kv_page_padding) for buffer in self.k_buffer
+        ]
         if not getattr(self, "dsa_kv_cache_store_fp8", False):
-            entries += [(buffer, global_kv) for buffer in self.v_buffer]
+            entries += [
+                (buffer, global_kv, self.kv_page_padding) for buffer in self.v_buffer
+            ]
         if self.index_head_dim is not None:
-            entries += [(buffer, True) for buffer in self.index_k_buffer]
+            entries += [
+                (buffer, True, self.index_page_padding)
+                for buffer in self.index_k_buffer
+            ]
             if self.index_k_scale_buffer is not None:
-                entries += [(buffer, True) for buffer in self.index_k_scale_buffer]
+                entries += [
+                    (buffer, True, self.index_page_padding)
+                    for buffer in self.index_k_scale_buffer
+                ]
         return entries
 
     # for disagg
     def get_contiguous_buf_infos(self):
         entries = self._get_disagg_buffer_entries()
         return (
-            [buffer.data_ptr() for buffer, _ in entries],
-            [buffer.nbytes for buffer, _ in entries],
-            [
-                buffer[0].nbytes * (self.dcp_size if uses_global_slots else 1)
-                for buffer, uses_global_slots in entries
-            ],
+            [buffer.data_ptr() for buffer, _, _ in entries],
+            [buffer.nbytes for buffer, _, _ in entries],
+            [buffer[0].nbytes * slots_per_row for buffer, _, slots_per_row in entries],
         )
 
     def get_dcp_remote_decode_layout(self) -> list[bool]:
         """Whether each PD entry uses allocator-global slots on decode."""
         return [
             uses_global_slots
-            for _, uses_global_slots in self._get_disagg_buffer_entries()
+            for _, uses_global_slots, _ in self._get_disagg_buffer_entries()
         ]
 
     def get_kv_layer_ids(self):
