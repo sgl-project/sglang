@@ -3,11 +3,12 @@
 import base64
 import io
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 from PIL import Image
 
-from sglang.multimodal_gen.runtime.utils import vision
+from sglang.multimodal_gen.runtime.utils import common, vision
 from sglang.multimodal_gen.runtime.utils.image_io import save_base64_image_to_path
 
 
@@ -49,3 +50,18 @@ def test_line_wrapped_base64_image_is_saved_in_full(tmp_path):
 
     with open(path, "rb") as f:
         assert f.read() == raw
+
+
+def test_bool_env_var_warning_is_deduplicated_per_variable(monkeypatch):
+    """The warning was keyed by the bad value, so a second variable holding the
+    same bad value was never reported."""
+    monkeypatch.setattr(common, "_warned_bool_env_var_keys", set())
+    monkeypatch.setenv("SGLANG_TEST_FLAG_A", "maybe")
+    monkeypatch.setenv("SGLANG_TEST_FLAG_B", "maybe")
+
+    with patch.object(common.logger, "warning") as warning:
+        common.get_bool_env_var("SGLANG_TEST_FLAG_A")
+        common.get_bool_env_var("SGLANG_TEST_FLAG_A")
+        common.get_bool_env_var("SGLANG_TEST_FLAG_B")
+
+    assert warning.call_count == 2
