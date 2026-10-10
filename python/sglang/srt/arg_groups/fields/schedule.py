@@ -173,6 +173,14 @@ class Schedule(msgspec.Struct):
             ),
         ),
     ] = None
+    swa_max_states_per_path: A[
+        int,
+        "Maximum number of sliding-window (SWA) windows retained per root-to-tail "
+        "radix path (-1 means unlimited). After each insert the shallowest eligible "
+        "interior windows beyond the cap are removed while their full KV remains, so "
+        "fewer windows are also written to an external cache. Tail, fork, and locked "
+        "nodes are preserved. Must be -1 or a positive integer.",
+    ] = -1
     disable_hybrid_swa_memory: A[
         bool, Arg(help="Disable the hybrid SWA memory pool.", resolvable=True)
     ] = False

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import defaultdict
 from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import torch
@@ -23,6 +24,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransferResult,
 )
 from sglang.srt.mem_cache.unified_cache.cache_action import (
+    EvictExcessPathStates,
     FreeComponentDeviceSlot,
     FreeComponentHostSlot,
     FreeDeviceKVFullOnly,
@@ -43,6 +45,7 @@ from sglang.srt.mem_cache.unified_cache.components.base import (
     TreeComponent,
     next_component_uuid,
 )
+from sglang.srt.runtime_context import get_schedule
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -94,6 +97,8 @@ class SWAComponent(TreeComponent):
         ) // params.page_size
         # HiCache state: set to host SWA pool when HiCache enabled
         self._swa_kv_pool_host = None
+        # Shares the Mamba per-path cap: both are checkpoint-only state.
+        self.swa_max_states_per_path = get_schedule().swa_max_states_per_path
 
     component_type = ComponentType.SWA
     _independent = False
@@ -563,6 +568,23 @@ class SWAComponent(TreeComponent):
             result=result,
             cap_leaf=True,
             cache_actions=cache_actions,
+        )
+        if self.swa_max_states_per_path > 0:
+            # Queued after the SWARebuild actions that stamp this insert's windows.
+            cache_actions.append(
+                EvictExcessPathStates(
+                    tail_node_id=node.id, component_type=self.component_type
+                )
+            )
+
+    def _evict_excess_path_states(
+        self,
+        tail: UnifiedTreeNode,
+        device_frees: dict[ComponentType, list[torch.Tensor]],
+        host_frees: dict[ComponentType, list[torch.Tensor]],
+    ) -> None:
+        self._evict_path_states_beyond_cap(
+            tail, self.swa_max_states_per_path, device_frees, host_frees
         )
 
     def _maybe_split_leaf_for_swa_lock(
@@ -1519,6 +1541,18 @@ class SWAComponent(TreeComponent):
 
     def apply_component_action(self, action: ComponentAction) -> None:
         alloc = self.cache.token_to_kv_pool_allocator
+        if isinstance(action, EvictExcessPathStates):
+            device_frees: dict[ComponentType, list[torch.Tensor]] = defaultdict(list)
+            host_frees: dict[ComponentType, list[torch.Tensor]] = defaultdict(list)
+            try:
+                self._evict_excess_path_states(
+                    self.tree_core.node_by_id(action.tail_node_id),
+                    device_frees,
+                    host_frees,
+                )
+            finally:
+                self.cache._free_values(device_frees, host_frees)
+            return
         if isinstance(action, FreeComponentDeviceSlot):
             for indices in action.indices:
                 # Component values are page-aligned copies of a kv row.

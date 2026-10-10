@@ -13,7 +13,7 @@ from unittest import mock
 import torch
 from test_unified_radix_cache_unittest import CacheConfig, UnifiedRadixCacheSuite
 
-from sglang.srt.mem_cache.unified_cache.cache_action import MambaEvictExcessPathStates
+from sglang.srt.mem_cache.unified_cache.cache_action import EvictExcessPathStates
 from sglang.srt.mem_cache.unified_cache.components.base import (
     ComponentType,
 )
@@ -321,7 +321,11 @@ class TestMambaPathCapWriteThroughOrdering(CustomTestCase):
             cache.tree_core, "_cascade_evict", side_effect=RuntimeError("boom")
         ):
             with self.assertRaises(RuntimeError):
-                mamba_comp.apply_component_action(MambaEvictExcessPathStates(leaf.id))
+                mamba_comp.apply_component_action(
+                    EvictExcessPathStates(
+                        tail_node_id=leaf.id, component_type=ComponentType.MAMBA
+                    )
+                )
 
         self.assertIsNone(ancestor.component_data[ComponentType.MAMBA].value)
         self.assertEqual(
