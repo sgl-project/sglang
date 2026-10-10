@@ -70,7 +70,7 @@ class DsparkDraftSampler:
         self.temperatures = torch.zeros(
             (self.max_bs,), dtype=torch.float32, device=device
         )
-        # [max_bs, gamma, local vocab] step logits, allocated by the first warmup.
+        # [gamma, max_bs, local vocab] step logits, allocated by the first warmup.
         self.step_logits: Optional[torch.Tensor] = None
 
     def stage_sampling_params(self, *, bs: int, sampling_info) -> None:
@@ -108,7 +108,7 @@ class DsparkDraftSampler:
                 self.step_logits = self._new_step_logits(
                     base_logits, anchor, sample_hidden
                 )
-            logits_out = self.step_logits[:bs]
+            logits_out = self.step_logits[:, :bs]
         draft_tokens, _ = draft_markov_block(
             markov_head=self.markov_head,
             base_logits=base_logits,
@@ -120,6 +120,8 @@ class DsparkDraftSampler:
             site=self._site,
             logits_out=logits_out,
             keep_logits=self.folded_sampling,
+            # Without folded sampling every staged temperature stays 0.
+            has_sampled_rows=None if self.folded_sampling else False,
         )
         self.out[: draft_tokens.numel()].copy_(draft_tokens.reshape(-1))
         if self.confidence_out is not None:
@@ -143,7 +145,7 @@ class DsparkDraftSampler:
             state=self.markov_head.init_state(sample_hidden),
         )
         return torch.empty(
-            (self.max_bs, self.gamma, base_logits.shape[-1]),
+            (self.gamma, self.max_bs, base_logits.shape[-1]),
             dtype=self.markov_head.step_logits_dtype(base_logits.dtype, bias.dtype),
             device=base_logits.device,
         )

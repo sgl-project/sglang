@@ -86,7 +86,7 @@ class BaseDSparkMarkovHead(nn.Module, ABC):
         """One token per row from the step logits ``base_logits + bias``,
         rounded to ``step_logits_dtype``: the argmax at temperature 0, a
         Gumbel-max sample otherwise. ``logits_out`` receives this rank's step
-        logits, in the layout ``gather_vocab`` takes."""
+        logits ([bs, local vocab])."""
         return MarkovSampleStep.execute(
             base_logits=base_logits,
             bias=bias,
@@ -104,7 +104,8 @@ class BaseDSparkMarkovHead(nn.Module, ABC):
         return {}
 
     def gather_vocab(self, local_logits: torch.Tensor) -> torch.Tensor:
-        return local_logits
+        """[gamma, bs, local vocab] step logits -> [bs, gamma, vocab]."""
+        return local_logits.transpose(0, 1)
 
 
 class VanillaMarkov(BaseDSparkMarkovHead):

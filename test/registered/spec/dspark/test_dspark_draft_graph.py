@@ -32,7 +32,7 @@ class TestDraftMarkovBlockGraph(CustomTestCase):
         noise = DraftNoise(
             key=11, offset=torch.zeros(1, dtype=torch.int64, device=DEVICE)
         )
-        logits_out = torch.empty(BS, GAMMA, VOCAB, dtype=torch.bfloat16, device=DEVICE)
+        logits_out = torch.empty(GAMMA, BS, VOCAB, dtype=torch.bfloat16, device=DEVICE)
         tokens_out = torch.empty(BS, GAMMA, dtype=torch.int64, device=DEVICE)
 
         def block():

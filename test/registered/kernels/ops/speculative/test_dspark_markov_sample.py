@@ -74,6 +74,17 @@ class TestMarkovSampleStep(CustomTestCase):
             self.assertGreaterEqual(agree, 0.95)
             self.assertTrue(((t_tok >= 100) & (t_tok < 100 + width)).all())
 
+    def test_greedy_only_variant_matches_mixed_kernel(self):
+        g = torch.Generator(device=DEVICE).manual_seed(3)
+        base = torch.randn(16, 9000, generator=g, device=DEVICE).to(torch.bfloat16)
+        bias = torch.randn(16, 8990, generator=g, device=DEVICE).to(torch.bfloat16)
+        temps = torch.zeros(16, device=DEVICE)
+        kwargs = dict(base=base, bias=bias, temps=temps, step_dtype=torch.bfloat16)
+        mixed = _call(MarkovSampleStep.triton, **kwargs)
+        for impl in (MarkovSampleStep.triton, MarkovSampleStep.torch):
+            greedy_only = _call(impl, has_sampled_rows=False, **kwargs)
+            self.assertTrue(torch.equal(greedy_only, mixed))
+
     def test_special_values_follow_argmax(self):
         base = torch.zeros(4, 16, device=DEVICE)
         base[0, 3] = float("nan")
