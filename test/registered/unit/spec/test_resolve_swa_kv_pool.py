@@ -3,6 +3,7 @@
 import unittest
 from unittest.mock import MagicMock
 
+from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
 from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
@@ -17,6 +18,7 @@ register_amd_ci(est_time=8, suite="stage-b-test-1-gpu-large-amd")
 _RESOLVERS = (
     ("trtllm_mha", TRTLLMHAAttnBackend._resolve_swa_kv_pool, SWAKVPool),
     ("flashinfer", FlashInferAttnBackend._resolve_swa_kv_pool, BaseSWAKVPool),
+    ("flashattention", FlashAttentionBackend._resolve_swa_kv_pool, SWAKVPool),
 )
 
 
