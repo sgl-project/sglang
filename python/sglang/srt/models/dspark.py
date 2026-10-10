@@ -8,10 +8,10 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from sglang.kernels.ops.speculative.dspark.markov_sample import (
-    MarkovGreedyFusedBiasStep,
-    MarkovSampleStep,
+from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
+    MarkovGreedyStep,
 )
+from sglang.kernels.ops.speculative.dspark.markov_sample import MarkovSampleStep
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
 from sglang.srt.environ import envs
 from sglang.srt.layers.linear import ReplicatedLinear
@@ -186,15 +186,18 @@ class VanillaMarkov(BaseDSparkMarkovHead):
         has_sampled_rows: Optional[bool] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         weight = self.fused_bias_weight()
-        # One greedy row: the GEMV and the argmax both stream the weight once,
-        # so one kernel does both.
-        if weight is not None and has_sampled_rows is False and len(prev_tokens) == 1:
-            tokens = MarkovGreedyFusedBiasStep.execute(
+        # One greedy row with no logits to keep: the GEMV and the argmax both
+        # stream the weight once, so one kernel does both.
+        if (
+            weight is not None
+            and has_sampled_rows is False
+            and logits_out is None
+            and len(prev_tokens) == 1
+        ):
+            tokens = MarkovGreedyStep.execute(
                 base_logits=base_logits,
-                latent=self.get_prev_embeddings(prev_tokens),
-                bias_weight=weight,
-                step_dtype=self.step_logits_dtype(base_logits.dtype),
-                logits_out=logits_out,
+                prev_embeds=self.get_prev_embeddings(prev_tokens),
+                w2_weight=weight,
             )
             return tokens, state
         return super().draft_step(
