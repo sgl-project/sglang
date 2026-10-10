@@ -161,6 +161,8 @@ class SGLDiffusionExecutor(torch.nn.Module):
             torch.Generator("cuda") for _ in range(req.num_outputs_per_prompt)
         ]
         output_batch = self.generator._send_to_scheduler_and_wait_for_response([req])
+        if output_batch.error:
+            raise RuntimeError(f"SGLang Diffusion worker failed: {output_batch.error}")
         return self.adapter.unpack(output_batch.noise_pred, packed, x)
 
     def forward(self, x, timestep, context, **kwargs):

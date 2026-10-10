@@ -1,16 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
 """Pack / unpack contract for ComfyUI model adapters."""
 
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import pytest
 import torch
 
 from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.adapter import (
     get_adapter_class,
     registered_model_types,
 )
+from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.base import (
+    SGLDiffusionExecutor,
+)
 from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.flux import FluxAdapter
 from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.zimage import (
     ZImageAdapter,
 )
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 
 
 def test_registered_comfyui_model_types() -> None:
@@ -56,3 +64,30 @@ def test_flux_pack_and_unpack_roundtrip() -> None:
 
     default = adapter.pack(x, timestep, context, y=y)
     assert default.guidance_scale == 3.5
+
+
+def test_worker_error_is_raised_not_unpacked() -> None:
+    """Unpacking a failed reply replaced the worker's message with a misleading
+    adapter TypeError about noise_pred being None."""
+    ex = SGLDiffusionExecutor.__new__(SGLDiffusionExecutor)
+    torch.nn.Module.__init__(ex)
+    ex.adapter, ex.model_path = FluxAdapter(), "/test-model"
+    ex.session_id, ex._run_id, ex._sent_conds = "error-test", 0, set()
+    ex.generator = SimpleNamespace(
+        server_args=SimpleNamespace(attention_backend_config={}, enable_trace=False),
+        _send_to_scheduler_and_wait_for_response=lambda reqs: SimpleNamespace(
+            noise_pred=None, error="index_copy_(): shape mismatch"
+        ),
+    )
+    x, t = torch.randn(1, 16, 8, 8), torch.full((1,), 0.5)
+    packed = ex.adapter.pack(x, t, torch.randn(1, 7, 32), y=torch.randn(1, 768))
+    with (
+        patch.object(
+            SamplingParams,
+            "from_user_sampling_params_args",
+            side_effect=lambda model_path, server_args, **kw: SamplingParams(**kw),
+        ),
+        patch.object(torch, "Generator", side_effect=lambda device: object()),
+        pytest.raises(RuntimeError, match="worker failed: index_copy_"),
+    ):
+        ex._execute_packed(packed, x, t)
