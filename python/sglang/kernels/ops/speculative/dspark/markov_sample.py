@@ -156,8 +156,9 @@ class MarkovSampleStep:
     A temperature of 0 takes the argmax. ``logits_out``, when given, receives
     the step logits of the whole padded shard. ``gather`` stacks every rank's
     ``[rows, k]`` candidates as ``[world * rows, k]``; None for an unsharded
-    vocab. ``has_sampled_rows=False`` promises every temperature is 0 and skips
-    the noise; None decides per row on the device. Returns global token ids."""
+    vocab. ``has_sampled_rows=False`` takes the argmax of every row and reads
+    neither the temperatures nor the offset; None decides per row on the
+    device. Returns global token ids."""
 
     @classmethod
     def execute(cls, **kwargs) -> torch.Tensor:
