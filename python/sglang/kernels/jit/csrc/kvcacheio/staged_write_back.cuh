@@ -35,9 +35,19 @@ using CudaMemcpyBatchAsyncFn = cudaError_t (*)(
 #endif
 
 inline auto get_cuda_memcpy_batch_async() -> CudaMemcpyBatchAsyncFn {
-  static CudaMemcpyBatchAsyncFn cuda_memcpy_batch_async = []() {
-    void* symbol = dlsym(RTLD_DEFAULT, "cudaMemcpyBatchAsync");
-    return reinterpret_cast<CudaMemcpyBatchAsyncFn>(symbol);
+  // Resolve from the CUDA runtime this module links against: its ABI matches the
+  // CUDA_VERSION-selected signature, while RTLD_DEFAULT can return a runtime of
+  // another major version loaded globally by torch (CUDA 13 dropped failIdx).
+  static CudaMemcpyBatchAsyncFn cuda_memcpy_batch_async = []() -> CudaMemcpyBatchAsyncFn {
+    Dl_info runtime_info{};
+    if (dladdr(reinterpret_cast<void*>(&cudaRuntimeGetVersion), &runtime_info) == 0) {
+      return nullptr;
+    }
+    void* runtime = dlopen(runtime_info.dli_fname, RTLD_LAZY | RTLD_NOLOAD);
+    if (runtime == nullptr) {
+      return nullptr;
+    }
+    return reinterpret_cast<CudaMemcpyBatchAsyncFn>(dlsym(runtime, "cudaMemcpyBatchAsync"));
   }();
   return cuda_memcpy_batch_async;
 }
