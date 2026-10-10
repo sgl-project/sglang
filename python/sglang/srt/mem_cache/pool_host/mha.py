@@ -413,6 +413,7 @@ class MHATokenToKVPoolHost(HostKVCache):
                     page_size=self.page_size,
                 )
             elif self.layout == "page_first_direct":
+                self._require_packed_device_rows("transfer_kv_per_layer_direct_pf_lf")
                 transfer_kv_per_layer_direct_pf_lf(
                     src_ptrs=[self.k_buffer, self.v_buffer],
                     dst_ptrs=[
@@ -589,6 +590,7 @@ class MHATokenToKVPoolHost(HostKVCache):
                     page_size=self.page_size,
                 )
             elif self.layout == "page_first_direct":
+                self._require_packed_device_rows("transfer_kv_all_layer_direct_lf_pf")
                 transfer_kv_all_layer_direct_lf_pf(
                     src_ptrs=device_kv_buffers,
                     dst_ptrs=[self.k_buffer, self.v_buffer],

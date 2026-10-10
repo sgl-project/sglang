@@ -57,6 +57,35 @@ class TestHostKVCache(CustomTestCase):
             allocator_type="default",
         )
 
+    def test_direct_page_first_direct_rejects_strided_rows(self):
+        device = self.device_pool
+        device.k_buffer = [
+            torch.empty((buf.shape[0] * 2, *buf.shape[1:]), dtype=buf.dtype)[::2]
+            for buf in device.k_buffer
+        ]
+        device.v_buffer = [
+            torch.empty((buf.shape[0] * 2, *buf.shape[1:]), dtype=buf.dtype)[::2]
+            for buf in device.v_buffer
+        ]
+        device._init_data_ptrs_and_strides()
+        host = MHATokenToKVPoolHost(
+            device_pool=device,
+            host_to_device_ratio=2.0,
+            host_size=0,
+            page_size=self.page_size,
+            layout="page_first_direct",
+            pin_memory=False,
+            device="cpu",
+            allocator_type="default",
+        )
+        self.addCleanup(host.destroy)
+        src = torch.tensor([0, 1])
+        host_slots = host.alloc(len(src))
+        with self.assertRaisesRegex(NotImplementedError, "direct_lf_pf"):
+            host.backup_from_device_all_layer(device, host_slots, src, "direct")
+        with self.assertRaisesRegex(NotImplementedError, "direct_pf_lf"):
+            host.load_to_device_per_layer(device, host_slots, src, 0, "direct")
+
     def test_index_k_host_pool_joins_a_host_pool_group(self):
         """Grouping a main KV pool with a K-only index pool raised AttributeError."""
         index_pool = MHATokenToKOnlyPool(
