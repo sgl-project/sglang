@@ -102,6 +102,10 @@ class PoolStats:
             usage = max(usage, self.swa_token_usage)
         if self.is_hybrid_ssm:
             usage = max(usage, self.mamba_usage)
+        if self.is_hisparse:
+            usage = max(
+                usage, self.hisparse_device_token_usage, self.hisparse_host_token_usage
+            )
         assert usage is not None and usage >= 0, f"{usage=} is not valid"
         return usage
 
