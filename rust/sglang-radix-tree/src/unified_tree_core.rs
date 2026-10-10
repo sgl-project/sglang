@@ -516,6 +516,10 @@ pub struct ComponentState {
     pub(crate) evict_device_pending_num_tokens: usize,
     /// Token budget for the current eviction walk.
     pub(crate) evict_device_request_cnt: usize,
+    /// Whether the SWA walk still passes over branch tails.
+    pub(crate) evict_device_spares_tails: bool,
+    /// Whether the SWA walk passed over a branch tail it may have to reclaim.
+    pub(crate) evict_device_spared_tail: bool,
 }
 
 /// Tree-construction parameters: the tree-consumed slice of the cache's init params.
@@ -746,6 +750,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         );
         state.is_evict_device_ongoing = true;
         state.evict_device_request_cnt = request_cnt;
+        state.evict_device_spares_tails = true;
+        state.evict_device_spared_tail = false;
         state.evict_device_cursor = None;
         state.evict_device_pending_node = None;
         state.evict_device_pending_num_tokens = 0;
