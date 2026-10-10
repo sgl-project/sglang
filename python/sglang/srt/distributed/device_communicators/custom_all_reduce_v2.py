@@ -81,21 +81,26 @@ def _ceil_align(nbytes: int, align: int) -> int:
 
 
 def _allocate_symmetric_memory(nbytes: int, device: torch.device, group: ProcessGroup):
-    from torch._C._distributed_c10d import _SymmetricMemory
+    import torch.distributed._symmetric_memory as torch_symm_mem
 
     if torch.__version__ < "2.11.0":
-        import torch.distributed._symmetric_memory as torch_symm_mem
+        from torch._C._distributed_c10d import _SymmetricMemory
 
         torch_symm_mem.enable_symm_mem_for_group(group.group_name)
-    tensor = _SymmetricMemory.empty_strided_p2p(
-        (nbytes,),
-        [1],
-        torch.uint8,
-        device,
-        group.group_name,
-    )
-    symm_mem = _SymmetricMemory.rendezvous(tensor)
-    return tensor, symm_mem
+        tensor = _SymmetricMemory.empty_strided_p2p(
+            (nbytes,),
+            [1],
+            torch.uint8,
+            device,
+            group.group_name,
+        )
+        return tensor, _SymmetricMemory.rendezvous(tensor)
+    # Allocate without a group name and rendezvous on the group: the form every
+    # torch symmetric-memory backend accepts. The NVSHMEM backend (selected by
+    # --enable-flashinfer-agmm-true-sp) rejects a group-named allocation, and
+    # the CUDA backend registers a group-named allocation at rendezvous anyway.
+    tensor = torch_symm_mem.empty(nbytes, dtype=torch.uint8, device=device)
+    return tensor, torch_symm_mem.rendezvous(tensor, group=group)
 
 
 class AllReduceConfig(NamedTuple):
