@@ -1999,7 +1999,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         tokens_padded = (tokens + rank_size - 1) // rank_size * rank_size
         self._pad_inputs_to_size(model_runner, tokens_padded, self.batch_size)
 
-    def post_forward_mlp_sync_batch(self, logits_output: LogitsProcessorOutput):
+    def post_forward_mlp_sync_batch(
+        self, logits_output: Optional[LogitsProcessorOutput]
+    ):
         if self._original_forward_mode is not None:
             self.forward_mode = self._original_forward_mode
         if self._original_batch_size is not None:
@@ -2018,6 +2020,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 self.req_pool_indices_cpu = self.req_pool_indices_cpu[:bs]
             if self.seq_lens_cpu is not None:
                 self.seq_lens_cpu = self.seq_lens_cpu[:bs]
+
+        # Intermediate PDMux layer segments have no logits, but still need the
+        # structural padding above undone before this batch is resumed.
+        if logits_output is None:
+            return
 
         if self.spec_info is not None:
             if self.forward_mode.is_decode():  # draft

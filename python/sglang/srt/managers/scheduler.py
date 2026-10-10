@@ -3870,6 +3870,20 @@ class Scheduler(
 
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
+    def check_hicache_events_if_enabled(self) -> bool:
+        """Drain HiCache transfer acks, host locks, and prefetch progress.
+
+        Batch formation is the normal caller, so every scheduling loop must
+        either form a batch or call this itself. The gate is load-bearing:
+        the base `tree_cache` leaves `check_hicache_events` unimplemented.
+        Returns whether the pump may have enqueued DEVICE work (KV frees,
+        mapping writes) that the caller must publish to other streams --
+        ack retirement alone is host-only bookkeeping and returns False.
+        """
+        if self.enable_hierarchical_cache or get_memory().enable_flexkv:
+            return bool(self.tree_cache.check_hicache_events())
+        return False
+
     def _get_new_batch_prefill_raw(
         self,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
@@ -4539,10 +4553,22 @@ class Scheduler(
                         batch.spec_info.dsa_topk_indices is not None
                     )
                     batch.spec_info.future_indices = future_indices
-            elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
-                resolve_forward_inputs(batch, self.future_map)
-                batch_result = self.tp_worker.forward_batch_split_prefill(batch)
-                self._relay_forward_payload(batch, batch.req_pool_indices, batch_result)
+            elif self.enable_pdmux and batch is self.split_prefill_batch:
+                if batch.split_index == 0:
+                    resolve_forward_inputs(batch, self.future_map)
+                split_worker = getattr(self, "model_worker", None) or self.tp_worker
+                batch_result = split_worker.forward_batch_split_prefill(batch)
+                if batch_result.next_draft_input is not None:
+                    batch.spec_info = batch_result.next_draft_input
+                    if batch_result.new_seq_lens is not None:
+                        batch.seq_lens = batch_result.new_seq_lens
+                        if batch.seq_lens_cpu is not None:
+                            batch.seq_lens_cpu = batch_result.new_seq_lens.to("cpu")
+                            batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+                elif batch_result.has_sampled_token_ids:
+                    self._relay_forward_payload(
+                        batch, batch.req_pool_indices, batch_result
+                    )
                 batch.input_ids = None
                 self._copy_auxiliary_output_to_cpu(batch, batch_result)
             elif not batch.spec_algorithm.is_none():
