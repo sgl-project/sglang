@@ -227,6 +227,94 @@ def _make_batch_str_output(rid: str, finished_reason=None) -> BatchStrOutput:
     return BatchStrOutput(**kwargs)
 
 
+class TestIncrementalStreamingAbort(CustomTestCase):
+    def setUp(self):
+        self.tm = _make_tokenizer_manager(self)
+        self.tm.incremental_streaming_output = True
+        self.state = _make_req_state("incremental_abort")
+        self.state.obj.stream = True
+        self.tm.rid_to_state[self.state.obj.rid] = self.state
+
+    def _stream_chunk(self, text, output_ids):
+        batch = _make_batch_str_output(self.state.obj.rid, _NOT_FINISHED)
+        batch.output_strs = [text]
+        batch.output_ids = [output_ids]
+        batch.completion_tokens = [len(self.state.output_ids) + len(output_ids)]
+        asyncio.run(self.tm._handle_batch_output(batch))
+
+    def _abort(self):
+        self.tm._handle_abort_req(_make_abort_req(self.state.obj.rid))
+        out = self.state.out_list[-1]
+        self.assertTrue(self.state.finished)
+        self.assertTrue(self.state.event.is_set())
+        self.assertNotIn(self.state.obj.rid, self.tm.rid_to_state)
+        self.assertEqual(out["meta_info"]["finish_reason"]["type"], "abort")
+        self.assertEqual(
+            out["meta_info"]["completion_tokens"], len(self.state.output_ids)
+        )
+        return out
+
+    def test_abort_does_not_repeat_streamed_output(self):
+        self._stream_chunk("hello ", [10])
+        self._stream_chunk("world", [11, 12])
+        out = self._abort()
+        self.assertEqual(out["text"], "")
+        self.assertEqual(out["output_ids"], [])
+        coalesced = self.tm._coalesce_streaming_chunks(
+            self.state.out_list, self.state.obj.rid
+        )
+        self.assertEqual(coalesced["text"], "hello world")
+        self.assertEqual(coalesced["output_ids"], [10, 11, 12])
+
+    def test_abort_returns_all_pending_output(self):
+        self._stream_chunk("hello ", [10])
+        # Output accumulated after the last emitted chunk is still a delta.
+        self.state.append_text("world!")
+        self.state.output_ids.extend([11, 12])
+        out = self._abort()
+        self.assertEqual(out["text"], "world!")
+        self.assertEqual(out["output_ids"], [11, 12])
+
+    def test_abort_before_first_chunk_returns_all_output(self):
+        self.state.append_text("hello world")
+        self.state.output_ids.extend([10, 11, 12])
+        out = self._abort()
+        self.assertEqual(out["text"], "hello world")
+        self.assertEqual(out["output_ids"], [10, 11, 12])
+
+    def test_abort_without_output(self):
+        out = self._abort()
+        self.assertEqual(out["text"], "")
+        self.assertEqual(out["output_ids"], [])
+
+    def test_text_offset_handles_empty_and_unicode_chunks(self):
+        self._stream_chunk("", [10])
+        self._stream_chunk("hello 🌍", [11])
+        # Materializing accumulated text must not reset the streamed offset.
+        self.assertEqual(self.state.get_text(), "hello 🌍")
+        self.state.append_text("!")
+        self.state.output_ids.append(12)
+        out = self._abort()
+        self.assertEqual(out["text"], "!")
+        self.assertEqual(out["output_ids"], [12])
+
+    def test_non_incremental_abort_returns_full_output(self):
+        self.tm.incremental_streaming_output = False
+        self._stream_chunk("hello ", [10])
+        self._stream_chunk("world", [11, 12])
+        out = self._abort()
+        self.assertEqual(out["text"], "hello world")
+        self.assertEqual(out["output_ids"], [10, 11, 12])
+
+    def test_non_streaming_abort_returns_full_output(self):
+        self.state.obj.stream = False
+        self._stream_chunk("hello ", [10])
+        self._stream_chunk("world", [11, 12])
+        out = self._abort()
+        self.assertEqual(out["text"], "hello world")
+        self.assertEqual(out["output_ids"], [10, 11, 12])
+
+
 class TestEngineResponseWait(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.tm = _make_tokenizer_manager(self)

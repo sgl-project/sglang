@@ -257,6 +257,7 @@ class ReqState:
 
     # For streaming output
     last_output_offset: int = 0
+    last_streamed_text_len: int = 0
 
     # Accumulate text lazily so incremental streaming can emit the incoming
     # delta directly without rebuilding the full output prefix.
@@ -2572,6 +2573,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                             state.customized_info_accumulated.keys(),
                         )
                         state.last_output_offset = len(state.output_ids)
+                        state.last_streamed_text_len += len(delta_text)
                         out_dict = {
                             "text": delta_text,
                             "output_ids": output_token_ids,
@@ -3518,11 +3520,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
 
         output_ids = state.output_ids
+        text = state.get_text()
         meta_info["completion_tokens"] = len(output_ids)
         if is_stream and self.incremental_streaming_output:
-            output_ids = [output_ids[-1]] if len(output_ids) > 0 else []
+            text = text[state.last_streamed_text_len :]
+            output_ids = output_ids[state.last_output_offset :]
         out = {
-            "text": state.get_text(),
+            "text": text,
             "output_ids": output_ids,
             "meta_info": meta_info,
         }
