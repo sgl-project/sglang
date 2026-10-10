@@ -30,7 +30,6 @@ from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Set, Tuple, 
 
 from sglang.srt.runtime_context import (
     SpawnRanks,
-    attention_backends,
     get_context,
     get_device,
     get_disagg,
@@ -69,7 +68,6 @@ except ImportError:
     initialize_mamba_selective_state_update_backend = None
 from sglang.srt.beam_search.coordinator import BeamCoordinator
 from sglang.srt.configs.model_config import (
-    AttentionArch,
     ModelConfig,
     ModelImpl,
     is_deepseek_v4,
@@ -668,8 +666,8 @@ class Scheduler(
         # Init Ngram Embedding
         self.maybe_init_ngram_embedding()
 
-        # Init prefill chunk alignment when deterministic inference is enabled with various attention backends
-        self.init_deterministic_prefill_chunk_align()
+        # Init prefill chunk alignment for attention backends that need it (deterministic flashinfer)
+        self.init_prefill_chunk_align()
         self.init_dsa_kpool_truncation_align()
         self.check_truncation_align_fits_chunk()
 
@@ -1666,24 +1664,11 @@ class Scheduler(
         )
         self.use_ngram_embedding = self.tp_worker.model_config.use_ngram_embedding
 
-    def init_deterministic_prefill_chunk_align(self):
-        """Align prefill chunks to the flashinfer q-tile grid under deterministic inference."""
-        self.truncation_align_size = None
-        if not get_exec().deterministic.enable_deterministic_inference:
-            return
-        # Only the MHA flashinfer backend runs the fixed-split fa2 prefill; its
-        # MLA wrapper has no deterministic mode, and triton tiles keys at
-        # absolute positions (align_window_kv_to_tiles).
-        prefill_backend, _ = attention_backends()
-        if (
-            prefill_backend == "flashinfer"
-            and self.model_config.attention_arch != AttentionArch.MLA
-        ):
-            from sglang.srt.layers.attention.flashinfer_backend import (
-                PREFILL_Q_TILE_TOKENS,
-            )
-
-            self.truncation_align_size = PREFILL_Q_TILE_TOKENS
+    def init_prefill_chunk_align(self):
+        """Take the prefill chunk grid the attention backend asks for."""
+        self.truncation_align_size = (
+            self.tp_worker.model_runner.attn_backend.prefill_chunk_align
+        )
 
     def init_dsa_kpool_truncation_align(self):
         """Kpool compress-write asserts chunked extends start on pool boundaries.
