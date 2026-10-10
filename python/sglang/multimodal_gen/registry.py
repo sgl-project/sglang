@@ -191,6 +191,7 @@ KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS: Dict[str, str] = {
     "fal/ideogram-v4-fast": "Ideogram4FastPipeline",
     "fal/ideogram-v4-instant": "Ideogram4InstantPipeline",
     "comfy-org/ideogram-4": "Ideogram4Nvfp4Pipeline",
+    "hidream-ai/hidream-o1-image": "HiDreamO1ImagePipeline",
 }
 
 
