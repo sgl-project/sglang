@@ -33,7 +33,7 @@ from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
 )
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
-from sglang.srt.runtime_context import get_context
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -42,13 +42,14 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 def _static_pool_translator():
     """A static pool's translator: its plans hand every batch its own ids."""
-    return KVIndexTranslator(
-        req_to_token=torch.zeros((1, 8), dtype=torch.int32),
-        token_to_kv_pool_allocator=None,
-        token_to_kv_pool=object(),
-        page_size=1,
-        device="cpu",
-    )
+    with get_parallel().override(dcp_enabled=False):
+        return KVIndexTranslator(
+            req_to_token=torch.zeros((1, 8), dtype=torch.int32),
+            token_to_kv_pool_allocator=None,
+            token_to_kv_pool=object(),
+            page_size=1,
+            device="cpu",
+        )
 
 
 class _FakeAttentionBackend:
@@ -217,6 +218,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         runner.max_context_size = None
         runner._capture_req_slots = 1
         runner.max_bs = 4
+        runner.backend = object()
         runner._prefill_static_buffers = None
         runner.buffer_registry = registry
         runner.require_mlp_tp_gather = False
