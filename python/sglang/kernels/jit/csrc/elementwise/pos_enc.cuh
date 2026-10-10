@@ -8,6 +8,7 @@
 
 #include <tvm/ffi/container/tensor.h>
 
+#include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
@@ -306,6 +307,138 @@ struct RotaryEmbeddingKernel {
           grid,
           block,
           stream);
+    }
+  }
+};
+
+template <typename Index>
+__global__ void bf16_rope_scale_store_kernel(
+    const nv_bfloat16* qkv,
+    nv_bfloat16* query,
+    nv_bfloat16* key_cache,
+    nv_bfloat16* value_cache,
+    const nv_bfloat16* cos_sin,
+    const int64_t* positions,
+    const Index* locations,
+    int64_t input_stride,
+    int64_t query_stride,
+    int64_t key_stride,
+    int64_t value_stride,
+    int query_heads,
+    int kv_heads,
+    int head_dim,
+    int value_dim,
+    int rotary_dim,
+    float value_scale) {
+  const int token = blockIdx.x;
+  const int query_size = query_heads * head_dim;
+  const int key_size = kv_heads * head_dim;
+  const int value_size = kv_heads * value_dim;
+  const int64_t slot = locations[token];
+  const auto* input = qkv + int64_t(token) * input_stride;
+  auto* q = query + int64_t(token) * query_stride;
+  // Slot 0 is reserved for CUDA graph padding.
+  auto* k = slot > 0 ? key_cache + slot * key_stride : nullptr;
+  auto* v = slot > 0 ? value_cache + slot * value_stride : nullptr;
+  for (int i = threadIdx.x; i < query_size; i += blockDim.x)
+    q[i] = input[i];
+  if (slot > 0) {
+    for (int i = threadIdx.x; i < key_size; i += blockDim.x)
+      k[i] = input[query_size + i];
+    for (int i = threadIdx.x; i < value_size; i += blockDim.x) {
+      auto x = input[query_size + key_size + i];
+      v[i] = value_scale == 1.f ? x : __float2bfloat16_rn(static_cast<float>(x) * value_scale);
+    }
+  }
+  __syncthreads();
+  // Preserve the standalone RoPE's BF16 multiply/subtract/add sequence.
+  apply_rotary_embedding<nv_bfloat16, true>(
+      q, k, cos_sin + positions[token] * rotary_dim, head_dim, query_heads, kv_heads, rotary_dim, 0, 0, 0, head_dim);
+}
+
+struct BF16RopeScaleStoreKernel {
+  static void
+  run(tvm::ffi::TensorView qkv,
+      tvm::ffi::TensorView query,
+      tvm::ffi::TensorView key_cache,
+      tvm::ffi::TensorView value_cache,
+      tvm::ffi::TensorView cos_sin,
+      tvm::ffi::TensorView positions,
+      tvm::ffi::TensorView locations,
+      double value_scale) {
+    using namespace host;
+    auto tokens = SymbolicSize{"tokens"};
+    auto input_width = SymbolicSize{"input_width"};
+    auto query_width = SymbolicSize{"query_width"};
+    auto capacity = SymbolicSize{"capacity"};
+    auto kv_heads = SymbolicSize{"kv_heads"};
+    auto head_dim = SymbolicSize{"head_dim"};
+    auto value_dim = SymbolicSize{"value_dim"};
+    auto rotary_dim = SymbolicSize{"rotary_dim"};
+    auto input_stride = SymbolicSize{"input_stride"};
+    auto query_stride = SymbolicSize{"query_stride"};
+    auto key_stride = SymbolicSize{"key_stride"};
+    auto value_stride = SymbolicSize{"value_stride"};
+    auto device = SymbolicDevice{};
+    auto index_type = SymbolicDType{};
+    device.set_options<kDLCUDA>();
+    TensorMatcher({tokens, input_width})
+        .with_strides({input_stride, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(qkv);
+    TensorMatcher({tokens, query_width})
+        .with_strides({query_stride, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(query);
+    TensorMatcher({capacity, kv_heads, head_dim})
+        .with_strides({key_stride, head_dim, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(key_cache);
+    TensorMatcher({capacity, kv_heads, value_dim})
+        .with_strides({value_stride, value_dim, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(value_cache);
+    TensorMatcher({-1, rotary_dim}).with_dtype<bf16_t>().with_device(device).verify(cos_sin);
+    TensorMatcher({tokens}).with_dtype<int64_t>().with_device(device).verify(positions);
+    TensorMatcher({tokens}).with_dtype<int32_t, int64_t>(index_type).with_device(device).verify(locations);
+    RuntimeCheck(query_width.unwrap() % head_dim.unwrap() == 0, "Query width must contain whole heads");
+    RuntimeCheck(
+        input_width.unwrap() == query_width.unwrap() + kv_heads.unwrap() * (head_dim.unwrap() + value_dim.unwrap()),
+        "Invalid fused QKV width");
+    RuntimeCheck(
+        rotary_dim.unwrap() > 0 && rotary_dim.unwrap() % 2 == 0 && rotary_dim.unwrap() <= head_dim.unwrap(),
+        "Invalid rotary dimension");
+    const int query_heads = query_width.unwrap() / head_dim.unwrap();
+    const int threads = std::min(query_heads * static_cast<int>(rotary_dim.unwrap()) / 2, 512);
+    auto launch = [&]<typename Index>() {
+      LaunchKernel(tokens.unwrap(), threads, device.unwrap())(
+          bf16_rope_scale_store_kernel<Index>,
+          static_cast<const nv_bfloat16*>(qkv.data_ptr()),
+          static_cast<nv_bfloat16*>(query.data_ptr()),
+          static_cast<nv_bfloat16*>(key_cache.data_ptr()),
+          static_cast<nv_bfloat16*>(value_cache.data_ptr()),
+          static_cast<const nv_bfloat16*>(cos_sin.data_ptr()),
+          static_cast<const int64_t*>(positions.data_ptr()),
+          static_cast<const Index*>(locations.data_ptr()),
+          input_stride.unwrap(),
+          query_stride.unwrap(),
+          key_stride.unwrap(),
+          value_stride.unwrap(),
+          query_heads,
+          static_cast<int>(kv_heads.unwrap()),
+          static_cast<int>(head_dim.unwrap()),
+          static_cast<int>(value_dim.unwrap()),
+          static_cast<int>(rotary_dim.unwrap()),
+          static_cast<float>(value_scale));
+    };
+    if (index_type.is_type<int64_t>()) {
+      launch.template operator()<int64_t>();
+    } else {
+      launch.template operator()<int32_t>();
     }
   }
 };

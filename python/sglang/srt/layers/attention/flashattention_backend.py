@@ -1387,6 +1387,41 @@ class FlashAttentionBackend(AttentionBackend):
             k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
         return q, q_rope, k_rope, k_descale, v_descale
 
+    def get_fused_kv_write_buffers(self, layer, forward_batch):
+        if (
+            self.kv_cache_dtype != torch.bfloat16
+            or self.use_mla
+            or layer.is_cross_attention
+            or self.kv_index_translator.is_translating
+            or self._kv_shard_pool is not None
+            or self.fa_skip_kv_cache
+            or layer.tp_k_head_num != layer.tp_v_head_num
+            or is_cp_active(forward_batch)
+            or forward_batch.dcp_kv_mask is not None
+        ):
+            return None
+        write_loc = KVWriteLoc.for_layer(
+            forward_batch,
+            layer,
+            swa_loc=self.forward_metadata.swa_out_cache_loc,
+        )
+        locations = (
+            write_loc.swa_loc
+            if self.use_sliding_window_kv_pool and layer.sliding_window_size >= 0
+            else write_loc.loc
+        )
+        if locations is None:
+            return None
+        buffers = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        shapes = (
+            (layer.tp_k_head_num, layer.head_dim),
+            (layer.tp_v_head_num, layer.v_head_dim),
+        )
+        for buffer, shape in zip(buffers, shapes):
+            if buffer.shape[1:] != shape or buffer.stride()[-2:] != (shape[-1], 1):
+                return None
+        return (*buffers, locations)
+
     def forward_extend(
         self,
         q: torch.Tensor,
