@@ -2654,6 +2654,96 @@ class TestPipelineParallelCompat(CustomTestCase):
             check_pipeline_parallel_compat(self._cfg(min_free_slots_delay=4))
 
 
+class TestPPSpecGate(CustomTestCase):
+    """Validate the experimental aggregate PP speculative decoding gate."""
+
+    def _server_args(self, **overrides):
+        from sglang.test.mock_model.utils import MOCK_MODEL_PATH
+
+        args = dict(
+            model_path=MOCK_MODEL_PATH,
+            pp_size=2,
+            disable_overlap_schedule=True,
+            speculative_algorithm="EAGLE",
+            speculative_draft_model_path=MOCK_MODEL_PATH,
+            speculative_num_steps=2,
+            speculative_eagle_topk=1,
+            speculative_num_draft_tokens=3,
+        )
+        args.update(overrides)
+        server_args = ServerArgs(**args)
+        # check_server_args reads resolution-filled fields (served_model_name,
+        # chunked_prefill_size); the bare constructor leaves them None.
+        server_args.resolve_once()
+        return server_args
+
+    def test_gate_off_keeps_the_ban(self):
+        os.environ.pop("SGLANG_ENABLE_PP_SPEC", None)
+        with self.assertRaises(AssertionError):
+            self._server_args().check_server_args()
+
+    def test_gate_on_rejects_unsupported_combinations(self):
+        os.environ["SGLANG_ENABLE_PP_SPEC"] = "1"
+        try:
+            self._server_args().check_server_args()
+            # DP attention partitions the batch per DP rank, so the stages
+            # would no longer rebuild the same verify tree.
+            with self.assertRaises(AssertionError):
+                self._server_args(tp_size=2, attn_dp_size=2).check_server_args()
+            # Adaptive spec changes num_draft_tokens at runtime, which the
+            # relay slices results with.
+            with self.assertRaises(AssertionError):
+                self._server_args(
+                    speculative_adaptive=True, speculative_num_steps=3
+                ).check_server_args()
+            # The relay carries an EAGLE-shaped tree; other algorithms would
+            # be mis-rebuilt on the non-last stages.
+            with self.assertRaises(AssertionError):
+                self._server_args(
+                    speculative_algorithm="NGRAM", speculative_draft_model_path=None
+                ).check_server_args()
+            # PD prefill needs the RelayPayload draft fields the gated flow
+            # does not carry.
+            with self.assertRaises(AssertionError):
+                self._server_args(disaggregation_mode="prefill").check_server_args()
+        finally:
+            os.environ.pop("SGLANG_ENABLE_PP_SPEC", None)
+
+    def test_gate_on_disables_mixed_chunk(self):
+        os.environ["SGLANG_ENABLE_PP_SPEC"] = "1"
+        try:
+            with self.assertLogs(
+                "sglang.srt.arg_groups.speculative_hook", level="WARNING"
+            ) as logs:
+                server_args = self._server_args(enable_mixed_chunk=True)
+
+            self.assertFalse(resolution_result(server_args, "enable_mixed_chunk"))
+            self.assertIn(
+                "pipeline-parallel speculative decoding does not support it",
+                "\n".join(logs.output),
+            )
+            server_args.check_server_args()
+        finally:
+            os.environ.pop("SGLANG_ENABLE_PP_SPEC", None)
+
+    def test_single_stage_spec_keeps_mixed_chunk(self):
+        os.environ["SGLANG_ENABLE_PP_SPEC"] = "1"
+        try:
+            server_args = self._server_args(pp_size=1, enable_mixed_chunk=True)
+            self.assertTrue(resolution_result(server_args, "enable_mixed_chunk"))
+            server_args.check_server_args()
+        finally:
+            os.environ.pop("SGLANG_ENABLE_PP_SPEC", None)
+
+    def test_pd_prefill_keeps_mixed_chunk(self):
+        os.environ.pop("SGLANG_ENABLE_PP_SPEC", None)
+        server_args = self._server_args(
+            disaggregation_mode="prefill", enable_mixed_chunk=True
+        )
+        self.assertTrue(resolution_result(server_args, "enable_mixed_chunk"))
+        server_args.check_server_args()
+
+
 class TestCudaGraphPrefillMaxContextResolution(CustomTestCase):
     @staticmethod
     def _make_args(max_context_size, model_context_len=4096, page_size=64):
