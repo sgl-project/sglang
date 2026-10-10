@@ -311,11 +311,8 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
         ):
             # The chunk size is already per DP rank. Prepare one prefill profile
             # independently of the optional full-model EXTEND autotune pass.
-            schedule = get_schedule()
             prefill_num_tokens = (
-                schedule.chunked_prefill_size
-                if schedule.chunked_prefill_size and schedule.chunked_prefill_size > 0
-                else schedule.max_prefill_tokens
+                max_prefill_buffer_tokens() or get_schedule().max_prefill_tokens
             )
             mega_context = megamoe_autotune_context(
                 decode_num_tokens=max(

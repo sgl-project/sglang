@@ -158,6 +158,8 @@ def _profile_fixture(monkeypatch, world_size=1, num_tokens=3):
     calls = []
 
     class Mega:
+        supports_output_view = False
+
         def forward(self, inputs, **kwargs):
             calls.append((inputs, kwargs.get("workspace")))
             return inputs.hidden_states
@@ -376,6 +378,8 @@ def test_adapter_keeps_router_ids_int32(monkeypatch):
     output = torch.randn_like(hidden_states)
 
     class Mega:
+        supports_output_view = False
+
         def forward(self, tensors):
             self.tensors = tensors
             return output
@@ -525,6 +529,8 @@ def test_nvfp4_keeps_weight_scale_storage_and_activation_contract(
         )
 
     class Mega:
+        supports_output_view = False
+
         def __init__(self, **kwargs):
             self.__dict__.update(kwargs)
 

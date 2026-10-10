@@ -133,9 +133,8 @@ class TestMegaMoEAutotuneStartup(CustomTestCase):
                         ),
                         get_eager_max_batch_size=lambda bs: bs,
                         max_speculative_num_draft_tokens=lambda: width,
-                        get_schedule=lambda: SimpleNamespace(
-                            chunked_prefill_size=chunk_size, max_prefill_tokens=16384
-                        ),
+                        max_prefill_buffer_tokens=lambda: max(chunk_size, 0),
+                        get_schedule=lambda: SimpleNamespace(max_prefill_tokens=16384),
                     ),
                     patch.object(
                         autotune.torch.cuda,
