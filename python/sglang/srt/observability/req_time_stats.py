@@ -531,6 +531,32 @@ class APIServerReqTimeStats(ReqTimeStatsBase):
             meta_info["decode_throughput"] = decode_throughput
         return meta_info
 
+    def compute_request_metrics(
+        self, scheduler_time_stats=None, completion_tokens: int = 0
+    ) -> Dict[str, float]:
+        """Derive opt-in per-request timing metrics.
+
+        Returns a plain dict keyed by the field names of
+        ``openai.protocol.RequestMetrics``; durations are in milliseconds.
+        Metrics that cannot be derived are omitted.
+        """
+        metrics: Dict[str, float] = {}
+        if scheduler_time_stats is not None:
+            metrics["queue_time_ms"] = scheduler_time_stats.get_queueing_time() * 1000.0
+        if self.created_time > 0.0 and self.first_token_time > self.created_time:
+            metrics["time_to_first_token_ms"] = self.get_first_token_latency() * 1000.0
+        if self.first_token_time > 0.0 and self.finished_time >= self.first_token_time:
+            metrics["generation_time_ms"] = self.get_decode_latency() * 1000.0
+        if self.created_time > 0.0 and self.finished_time > 0.0:
+            metrics["end_to_end_latency_ms"] = self.get_e2e_latency() * 1000.0
+        tpot = self.get_time_per_output_token(completion_tokens)
+        if tpot is not None:
+            metrics["mean_itl_ms"] = tpot * 1000.0
+        decode_throughput = self.get_decode_throughput(completion_tokens)
+        if decode_throughput is not None:
+            metrics["tokens_per_second"] = decode_throughput
+        return metrics
+
     def convert_to_gen_ai_span_attrs(self):
         span_attrs = {}
         if self.first_token_time and self.created_time:

@@ -264,6 +264,9 @@ class GenerateReqInput:
     # 0 = full sequence.
     routed_experts_start_len: int = 0
     return_indexer_topk: bool = False
+    # Opt-in per-request timing metrics (returned via the OpenAI-compatible
+    # sglext extension). Computed independently of --enable-metrics.
+    return_request_metrics: bool = False
 
     # The modalities of the image data [image, multi-images, video]
     modalities: Optional[List[str]] = None
