@@ -20,6 +20,35 @@ else:
     _RUNTIME_IMPORT_ERROR = None
 
 
+def _reject_model_patches(transformer_options) -> None:
+    # The DiT runs in the SGLD worker, so ComfyUI block/attention patches would
+    # be dropped silently (e.g. MiniMax H3 Fun ControlNet, ModelAttentionBackend).
+    opts = transformer_options or {}
+    found = [
+        f"patches_replace.{name}"
+        for name, blocks in (opts.get("patches_replace") or {}).items()
+        if blocks
+    ]
+    found += [
+        f"patches.{name}"
+        for name, items in (opts.get("patches") or {}).items()
+        if items
+    ]
+    if opts.get("optimized_attention_override") is not None:
+        found.append("optimized_attention_override")
+    if found:
+        raise ValueError(
+            "SGLD integrated mode runs the diffusion model in its worker and cannot "
+            f"apply ComfyUI model patches ({', '.join(sorted(found))}); remove the "
+            "patch nodes (ControlNet, attention backend, block patches) or use the "
+            "native ComfyUI loader"
+        )
+
+
+# apply_model kwargs that carry image content (ControlNet residuals, reference latents).
+CONTENT_CONDITIONING = ("control", "ref_latents")
+
+
 class SGLDiffusionExecutor(torch.nn.Module):
     """Shared ComfyUI DiT-forward executor. Per-model logic lives on the adapter."""
 
@@ -166,5 +195,6 @@ class SGLDiffusionExecutor(torch.nn.Module):
         return self.adapter.unpack(output_batch.noise_pred, packed, x)
 
     def forward(self, x, timestep, context, **kwargs):
+        _reject_model_patches(kwargs.get("transformer_options"))
         packed = self.adapter.pack(x, timestep, context, **kwargs)
         return self._execute_packed(packed, x, timestep)

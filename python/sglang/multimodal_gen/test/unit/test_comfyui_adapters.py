@@ -91,3 +91,38 @@ def test_worker_error_is_raised_not_unpacked() -> None:
         pytest.raises(RuntimeError, match="worker failed: index_copy_"),
     ):
         ex._execute_packed(packed, x, t)
+
+
+class _RecordingExecutor(SGLDiffusionExecutor):
+    """The real forward(); records what would be sent to the worker."""
+
+    def __init__(self, adapter):
+        torch.nn.Module.__init__(self)
+        self.adapter, self.sent = adapter, []
+
+    def _execute_packed(self, packed, x, timestep):
+        self.sent.append(packed)
+        return x
+
+
+def _flux_step(ex, **kwargs):
+    x, t = torch.randn(1, 16, 8, 8), torch.full((1,), 0.5)
+    ex(x, t, torch.randn(1, 7, 32), y=torch.randn(1, 768), **kwargs)
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"patches_replace": {"dit": {("double_block", 3): object()}}},
+        {"patches": {"attn1_patch": [object()]}},
+        {"optimized_attention_override": object()},
+    ],
+)
+def test_comfy_model_patches_are_rejected_not_dropped(options) -> None:
+    """ComfyUI model patches (H3 Fun ControlNet block replace, attention backend
+    override) never reach the worker; ignoring them gave bit-identical output."""
+    ex = _RecordingExecutor(FluxAdapter())
+    with pytest.raises(ValueError, match="cannot apply ComfyUI model patches"):
+        _flux_step(ex, transformer_options=options)
+    _flux_step(ex, transformer_options={"patches": {}, "patches_replace": {"dit": {}}})
+    assert len(ex.sent) == 1
