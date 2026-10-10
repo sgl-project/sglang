@@ -331,10 +331,12 @@ def low_ratio_index_topk_hip_extend(
     q_lora,
     pos,
     forward_batch: ForwardBatch,
+    rows_per_request: Optional[List[int]] = None,
 ) -> None:
     """Ragged prefill: the FlyDSL prefill kernel scores every token's visible compressed positions,
     candidate masks are published or applied per request, one paged top-k selects every row.
-    Identity requests are written without scores; an all-identity batch skips the kernel."""
+    Identity requests are written without scores; an all-identity batch skips the kernel.
+    rows_per_request (prefill CP): this rank's rows of each request, request-major."""
     pool = backend.token_to_kv_pool
     metadata = backend.forward_metadata
     core = metadata.core_metadata
@@ -347,8 +349,10 @@ def low_ratio_index_topk_hip_extend(
         raw_indices.fill_(-1)
 
     seq_lens_cpu = _as_int_list(forward_batch.seq_lens_cpu)
-    # bounded replay counts cover only each request's tail
-    if metadata.late_layer_tail is not None:
+    if rows_per_request is not None:
+        extend_lens_cpu = list(rows_per_request)
+    elif metadata.late_layer_tail is not None:
+        # bounded replay counts cover only each request's tail
         extend_lens_cpu = metadata.late_layer_tail.extend_seq_lens_cpu
     else:
         extend_lens_cpu = _as_int_list(forward_batch.extend_seq_lens_cpu)
