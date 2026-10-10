@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import logging
 import math
@@ -128,6 +129,35 @@ logger = logging.getLogger(__name__)
 
 _MEDIA_CONTENT_PART_TYPES = frozenset({"image_url", "video_url", "audio_url"})
 _CHAT_TEMPLATE_CACHE_MAX_SIZE = 128
+_VALID_TOOL_SCHEMAS_MAX_SIZE = 4096
+# Digests of tool parameter schemas that passed check_schema.
+_VALID_TOOL_SCHEMAS: OrderedDict[bytes, None] = OrderedDict()
+
+
+def _check_tool_schema_once(parameters: Any) -> None:
+    """Run check_schema, and skip it for a schema that already passed.
+
+    An agent sends the same tools on every request. check_schema is pure Python
+    and runs on the event loop of the API server. A schema that fails is not
+    remembered, so it is checked and reported every time.
+    """
+    try:
+        payload = orjson.dumps(parameters, option=orjson.OPT_SORT_KEYS)
+        if b"null" in payload:
+            # orjson writes NaN and Infinity as null. A schema with one of them
+            # must not share a digest with the schema that has a real null.
+            json.dumps(parameters, allow_nan=False)
+    except (TypeError, ValueError):
+        Draft202012Validator.check_schema(parameters)
+        return
+    digest = hashlib.blake2b(payload, digest_size=16).digest()
+    if digest in _VALID_TOOL_SCHEMAS:
+        _VALID_TOOL_SCHEMAS.move_to_end(digest)
+        return
+    Draft202012Validator.check_schema(parameters)
+    _VALID_TOOL_SCHEMAS[digest] = None
+    if len(_VALID_TOOL_SCHEMAS) > _VALID_TOOL_SCHEMAS_MAX_SIZE:
+        _VALID_TOOL_SCHEMAS.popitem(last=False)
 
 
 def normalize_tool_content(role: str, content):
@@ -1088,7 +1118,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 # guards against hand-crafted cyclic schemas so the request gets
                 # a 400 instead of crashing into a 500.
                 normalize_json_schema_types(tool.function.parameters)
-                Draft202012Validator.check_schema(tool.function.parameters)
+                _check_tool_schema_once(tool.function.parameters)
             except SchemaError as e:
                 return f"Tool {i} function has invalid 'parameters' schema: {str(e)}"
             except RecursionError:
