@@ -1741,6 +1741,15 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         )
         self.assertEqual(_deterministic_sampling_backend(view), {})
 
+    def test_dllm_rejects_deterministic_inference(self):
+        with self.assertRaisesRegex(ValueError, "deterministic-inference"):
+            self._construct(
+                "SDARForCausalLM",
+                "llama",
+                dllm_algorithm="LowConfidence",
+                enable_deterministic_inference=True,
+            )
+
     def test_dllm_forces_flashinfer_with_cuda_graph(self):
         # CUDA path: cuda graph enabled by default -> dllm forces flashinfer.
         # A real dllm arch: the page pass now runs regardless of the radix
