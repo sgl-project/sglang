@@ -671,8 +671,8 @@ async fn fill_gap(
 /// only `from..to`. The publisher replies in sequence order, so stop once the
 /// gap's end is reached without waiting for newer batches or their END_SEQ.
 /// Wire contract: `ZmqEventPublisher._service_replay` in SGLang's
-/// `disaggregation/kv_events.py`; replies are `[b"", seq, payload]` up to an
-/// `END_SEQ` frame.
+/// `disaggregation/kv_events.py`; replies carry `[b"", topic, seq, payload]`
+/// up to `END_SEQ`. Legacy publishers omit the topic.
 async fn fetch_replay(
     endpoint: &str,
     from: i64,
@@ -686,11 +686,14 @@ async fn fetch_replay(
     dealer.send(request).await?;
     loop {
         let reply = dealer.recv().await?;
-        let (3, Some(delim), Some(seq), Some(payload)) =
-            (reply.len(), reply.get(0), reply.get(1), reply.get(2))
-        else {
-            return Err(anyhow!("replay reply has {} frames", reply.len()));
+        let seq_index = match reply.len() {
+            3 => 1, // Legacy: [delimiter, sequence, payload]
+            4 => 2, // Current: [delimiter, topic, sequence, payload]
+            len => return Err(anyhow!("replay reply has {len} frames")),
         };
+        let delim = reply.get(0).context("replay delimiter frame")?;
+        let seq = reply.get(seq_index).context("replay seq frame")?;
+        let payload = reply.get(seq_index + 1).context("replay payload frame")?;
         if !delim.is_empty() {
             return Err(anyhow!("replay reply lacks the empty delimiter frame"));
         }
