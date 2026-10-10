@@ -876,7 +876,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 (ElasticScaleUpdateReq, self.forward_elastic_scale_update),
             ]
         )
-        if self.fault_tolerance is not None:
+        if get_parallel().enable_fault_tolerance and self.fault_tolerance is not None:
             self._result_dispatcher += self.fault_tolerance.init_request_dispatcher()
         self.init_communicators()
 
@@ -913,7 +913,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 raise ValueError(
                     f"routed_dp_rank={obj.routed_dp_rank} out of range [0, {num_dp_ranks})"
                 )
-        if self.fault_tolerance is not None:
+        if get_parallel().enable_fault_tolerance and self.fault_tolerance is not None:
             routed_dp_rank = (
                 obj.routed_dp_rank if isinstance(obj, GenerateReqInput) else None
             )
@@ -2254,12 +2254,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self.is_pause_cond.notify_all()
 
     def fault_tolerance_status(self):
-        if self.fault_tolerance is None:
+        if not get_parallel().enable_fault_tolerance or self.fault_tolerance is None:
             return 503, {"message": "fault_tolerance_disabled"}
         return self.fault_tolerance.status()
 
     def fault_tolerance_apply(self, obj: FaultToleranceApplyRequest):
-        if self.fault_tolerance is None:
+        if not get_parallel().enable_fault_tolerance or self.fault_tolerance is None:
             return 503, {"message": "fault_tolerance_disabled"}
         return self.fault_tolerance.submit(obj)
 
@@ -2417,7 +2417,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             loop.create_task(print_exception_wrapper(self.handle_loop))
         )
         self.event_loop = loop
-        if self.fault_tolerance is not None:
+        if get_parallel().enable_fault_tolerance and self.fault_tolerance is not None:
             self.fault_tolerance.bind_event_loop(loop)
 
         # We only add signal handler when the tokenizer manager is in the main thread
@@ -3577,7 +3577,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         state.event.set()
 
     def update_active_ranks(self, ranks: ActiveRanksOutput):
-        if self.fault_tolerance is not None:
+        if get_parallel().enable_fault_tolerance and self.fault_tolerance is not None:
             ranks = self.fault_tolerance.observe_active_ranks(ranks)
             if ranks is None:
                 return
@@ -3638,7 +3638,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         return responses[0]
 
     def update_process_active_ranks(self, ranks: ProcessActiveRanksOutput):
-        if self.fault_tolerance is not None:
+        if get_parallel().enable_fault_tolerance and self.fault_tolerance is not None:
             active_ranks = self.fault_tolerance.observe_process_active_ranks(ranks)
             if active_ranks is not None:
                 self._dispatch_to_scheduler(active_ranks)

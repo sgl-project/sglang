@@ -256,17 +256,18 @@ class MLPSyncBatchInfo:
         tp0_info_cpu = global_info_tensor.cpu()[:, 0, :]
         self.tp0_info_cpu = tp0_info_cpu
         self.global_num_tokens = tp0_info_cpu[:, 0].tolist()
+        from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
+
+        state = ElasticEPStateManager.instance()
         if (
-            get_parallel().enable_fault_tolerance
+            state is not None
+            and get_parallel().enable_fault_tolerance
             and get_parallel().fault_tolerance_on_error_strategy == "pause"
         ):
-            from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
-
-            state = ElasticEPStateManager.instance()
             # PG can observe an idle failure without any EP forward running.
             # Compare with the last installed topology so removed ranks do not
             # trigger another pause after a successful scale-down.
-            if state is not None and bool(
+            if bool(
                 (
                     state.last_active_ranks.to(tp_active_ranks.device).bool()
                     & ~tp_active_ranks.bool()
