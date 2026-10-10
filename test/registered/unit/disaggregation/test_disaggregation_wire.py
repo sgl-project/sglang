@@ -184,6 +184,7 @@ class TestDisaggregationWire(unittest.TestCase):
                         manager.decode_kv_args_table[req.mooncake_session_id] = (
                             SimpleNamespace(
                                 requires_dcp_relayout=False,
+                                kv_layout_error=None,
                                 dst_state_data_ptrs=[[0x2000], [0x4000]],
                                 dst_state_item_lens=[
                                     [

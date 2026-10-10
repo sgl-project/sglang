@@ -159,6 +159,12 @@ class KVArgsRegisterInfo:
     requires_dcp_relayout: bool = False
     dcp_token_item_lens: Optional[List[int]] = None
     dst_kv_item_lens: List[int] = dataclasses.field(default_factory=list)
+    # None when the decode build predates the KV layout handshake.
+    dst_kv_buf_groups: Optional[int] = None
+    dst_kv_cache_dtype: Optional[str] = None
+    # Set by the prefill manager on registration; transfers to this decode
+    # rank fail with this reason instead of writing into a mismatched layout.
+    kv_layout_error: Optional[str] = None
     staging_base_ptr: int = 0
     staging_total_size: int = 0
     staging: Optional[StagingRegisterInfo] = None
@@ -210,6 +216,12 @@ class KVArgsRegisterInfo:
                 list(struct.unpack(f"{len(msg[19]) // 8}Q", msg[19]))
                 if len(msg) > 19 and msg[19]
                 else []
+            ),
+            dst_kv_buf_groups=(
+                int(msg[20].decode("ascii")) if len(msg) > 20 and msg[20] else None
+            ),
+            dst_kv_cache_dtype=(
+                msg[21].decode("ascii") if len(msg) > 21 and msg[21] else None
             ),
             # Note: always put the staging field at the final
             staging=StagingRegisterInfo.from_zmq_fields(msg, 14, slot_ids_index=18),
@@ -1191,6 +1203,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 if ret != 0:
                     return ret
             return 0
+
+    def check_decode_kv_layout(self, info: KVArgsRegisterInfo) -> Optional[str]:
+        """Return why a registering decode rank's KV layout is incompatible, if it is."""
+        return None
 
     def _validate_envelope_kv_layout(
         self,
@@ -2407,6 +2423,14 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         target_rank_registration_info: KVArgsRegisterInfo = (
                             self.decode_kv_args_table[req.mooncake_session_id]
                         )
+                        if target_rank_registration_info.kv_layout_error is not None:
+                            self.conclude_failure(
+                                bootstrap_room=kv_chunk.room,
+                                failure_reason=(
+                                    target_rank_registration_info.kv_layout_error
+                                ),
+                            )
+                            break
                         is_dcp_transfer = (
                             target_rank_registration_info.requires_dcp_relayout
                         )
@@ -2788,6 +2812,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         self._init_dcp_pack_buffers_once(
                             decode_kv_args.dst_dcp_size, include_draft=True
                         )
+                    decode_kv_args.kv_layout_error = self.check_decode_kv_layout(
+                        decode_kv_args
+                    )
                     layout_mismatch = self._publish_peer_registration(
                         mooncake_session_id, decode_kv_args
                     )
@@ -3175,6 +3202,12 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
             else:
                 packed_staging_base_ptr = b""
                 staging_total_size_str = b""
+            # 0 = the pool does not group its KV buffers; an empty frame would
+            # read as a peer that predates the KV layout handshake.
+            dst_kv_buf_groups = str(
+                getattr(self.kv_mgr.kv_args, "kv_buf_groups", None) or 0
+            ).encode("ascii")
+            dst_kv_cache_dtype = (self.kv_mgr.kv_cache_dtype_str or "").encode("ascii")
             staging_slots = getattr(self.kv_mgr, "kv_buffer_tensors", None) or {}
             packed_staging_slot_layer_ids = b"".join(
                 struct.pack("Q", layer_id)
@@ -3209,6 +3242,8 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
                                 f"{len(self.kv_mgr.kv_args.kv_item_lens)}Q",
                                 *self.kv_mgr.kv_args.kv_item_lens,
                             ),
+                            dst_kv_buf_groups,
+                            dst_kv_cache_dtype,
                         ]
                     )
             except zmq.ZMQError:
