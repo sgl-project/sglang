@@ -103,9 +103,13 @@ class BaseDSparkMarkovHead(nn.Module, ABC):
     def _vocab_shard_args(self) -> dict:
         return {}
 
+    def local_vocab_width(self, lm_head: nn.Module) -> int:
+        """Width of the base logits this rank sees: the cropped vocab."""
+        return int(lm_head.org_vocab_size)
+
     def gather_vocab(self, local_logits: torch.Tensor) -> torch.Tensor:
-        """[gamma, bs, local vocab] step logits -> [bs, gamma, vocab]."""
-        return local_logits.transpose(0, 1)
+        """[bs, gamma, local vocab] step logits -> [bs, gamma, vocab]."""
+        return local_logits
 
 
 class VanillaMarkov(BaseDSparkMarkovHead):
