@@ -25,6 +25,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     dispatch_w8a8_block_fp8_linear,
     normalize_e4m3fn_to_e4m3fnuz,
     requant_block_scale_ue8m0_for_deepgemm,
+    use_aiter_bpreshuffle_gemm,
     validate_fp8_block_shape,
 )
 from sglang.srt.layers.quantization.utils import requantize_with_max_scale
@@ -177,7 +178,7 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
             else:
                 weight_scale = layer.weight_scale.data
 
-            if _use_aiter:
+            if use_aiter_bpreshuffle_gemm(weight.shape[0]):
                 # keep the weight as (N, K)
                 layer.weight = Parameter(
                     shuffle_weight(weight, (16, 16)), requires_grad=False
@@ -258,7 +259,11 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
                 bias=bias,
             )
 
-        if _use_aiter and self.strategy == QuantizationStrategy.CHANNEL:
+        # The scale count is N for both shuffled (N, K) and plain (K, N)
+        # weights, so this agrees with the load-time layout decision.
+        if self.strategy == QuantizationStrategy.CHANNEL and use_aiter_bpreshuffle_gemm(
+            layer.weight_scale.numel()
+        ):
             return apply_fp8_ptpc_linear(
                 input=x,
                 weight=layer.weight,

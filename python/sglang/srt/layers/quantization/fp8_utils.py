@@ -45,6 +45,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_flashinfer_available,
     is_gfx95_supported,
+    is_gfx120x_supported,
     is_gfx942_supported,
     is_gfx1250_supported,
     is_hip,
@@ -65,6 +66,7 @@ _is_cuda = is_cuda()
 _is_xpu = is_xpu()
 _is_fp8_fnuz = is_fp8_fnuz()
 _is_gfx95_supported = is_gfx95_supported()
+_is_gfx120x_supported = is_gfx120x_supported()
 _is_gfx1250_supported = is_gfx1250_supported()
 _is_musa = is_musa()
 
@@ -2226,12 +2228,15 @@ def _apply_fallback_scaled_mm(
 
 
 def use_aiter_bpreshuffle_gemm(output_size: int) -> bool:
+    # The CK per-token/channel bpreshuffle GEMM does not support gfx1200/1201.
+    # Gate both the load-time shuffle and runtime GEMM, while retaining AITER
+    # quantization and activation kernels on these devices.
     # aiter's CK gemm_a8w8_bpreshuffle instances are GemmSpecialization::Default
     # (pre-shuffled weights are never N-padded) with NPerBlock=64, so any N that
     # is not a multiple of 64 raises "This GEMM is not supported!". Measured on
     # gfx950 for M=16384/N=32/K=4096, torch._scaled_mm rowwise runs that shape in
     # 14us against 90us for the cktile instance that does accept it.
-    return _use_aiter and output_size % 64 == 0
+    return _use_aiter and not _is_gfx120x_supported and output_size % 64 == 0
 
 
 def apply_fp8_linear_bmm_flashinfer(
