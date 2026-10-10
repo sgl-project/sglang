@@ -5,6 +5,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.managers.mm_owner_embedding import ImageSpanRequest, MmOwnerSession
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.multimodal.evs import EVSEmbeddingResult
@@ -457,6 +458,36 @@ def _batch_encode_per_image_misses(
     return hash_to_embedding
 
 
+def _collect_image_span_requests(
+    per_image_requests: List[PerImageRequestInfo],
+) -> List[ImageSpanRequest]:
+    spans: Dict[Tuple[Optional[int], int], ImageSpanRequest] = {}
+    for req_info in per_image_requests:
+        chunk_start = req_info.extend_prefix_len
+        chunk_end = chunk_start + req_info.extend_seq_len  # exclusive
+        req_info.overlapping = [
+            (idx, item, token_count)
+            for idx, item in enumerate(req_info.items)
+            if (token_count := _item_overlap(item, chunk_start, chunk_end)) is not None
+        ]
+        for _idx, item, token_count in req_info.overlapping:
+            span = spans.setdefault(
+                (item.hash, token_count),
+                ImageSpanRequest(hash=item.hash, span_len=token_count, item=item),
+            )
+            if span.item is not item:
+                span.duplicates.append(item)
+    return list(spans.values())
+
+
+def _owner_span_encoder(data_embedding_func: DataEmbeddingFunc, device: torch.device):
+    def encode(items: List[MultimodalDataItem]):
+        _move_items_to_device(items, device, data_embedding_func)
+        return data_embedding_func(items)
+
+    return encode
+
+
 def _get_chunked_embedding_by_item(
     data_embedding_func: DataEmbeddingFunc,
     embedding_items_per_req: List[MultimodalDataItem],
@@ -567,6 +598,7 @@ def _get_chunked_prefill_embedding(
     extend_length: List[int],
     items_offset_list: List[List[Tuple[int, int]]],
     input_ids: torch.Tensor,
+    mm_owner: Optional[MmOwnerSession] = None,
 ) -> tuple[torch.Tensor | None, torch.Tensor]:
     """
     Chunked prefill embedding: encode items across all requests and extract
@@ -630,7 +662,15 @@ def _get_chunked_prefill_embedding(
 
     # Phase 1: batch encode all per-image cache misses in ONE ViT call
     hash_to_embedding: Dict[Tuple[Optional[int], int], torch.Tensor] = {}
-    if per_image_requests:
+    if per_image_requests and mm_owner is not None:
+        # The owner protocol must see every overlapping span before any local
+        # cache filtering: a rank-local hit can never skip a group collective.
+        hash_to_embedding = mm_owner.resolve(
+            _collect_image_span_requests(per_image_requests),
+            cache=embedding_cache,
+            encode=_owner_span_encoder(data_embedding_func, device),
+        )
+    elif per_image_requests:
         hash_to_embedding = _batch_encode_per_image_misses(
             data_embedding_func, per_image_requests, device
         )
@@ -734,6 +774,7 @@ def get_embedding_and_mask(
     prefix_length: List[int],
     extend_length: List[int],
     items_offset_list: List[List[Tuple[int, int]]],
+    mm_owner: Optional[MmOwnerSession] = None,
 ) -> Tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor]:
     """
     Generate multimodal embeddings and create a mask for identifying their positions in the input sequence.
@@ -774,6 +815,7 @@ def get_embedding_and_mask(
             extend_length,
             items_offset_list,
             input_ids,
+            mm_owner=mm_owner,
         )
         if embedding is None:
             return None, None, input_ids
