@@ -51,6 +51,7 @@ def _markov_sample_partial_kernel(
     BLOCK: tl.constexpr,
     ROUND: tl.constexpr,
     STORE: tl.constexpr,
+    SAMPLE: tl.constexpr,
     PHILOX_ROUNDS: tl.constexpr,
 ):
     row, part = tl.program_id(0), tl.program_id(1)
@@ -63,7 +64,12 @@ def _markov_sample_partial_kernel(
     if STORE:
         tl.store(L + row * LS + i, value.to(L.dtype.element_ty), in_shard)
     key = value
-    temperature = tl.load(T + row)
+    # Without SAMPLE every row is at temperature 0: no per-row temperature read
+    # on the critical path and no noise code.
+    if SAMPLE:
+        temperature = tl.load(T + row)
+    else:
+        temperature = 0.0
     if temperature != 0.0:
         # One Philox call yields four words; word k goes to token 4 * q + k.
         quad = (part * BLOCK + VOCAB_START) // 4 + tl.arange(0, BLOCK // 4)
@@ -150,7 +156,8 @@ class MarkovSampleStep:
     A temperature of 0 takes the argmax. ``logits_out``, when given, receives
     the step logits of the whole padded shard. ``gather`` stacks every rank's
     ``[rows, k]`` candidates as ``[world * rows, k]``; None for an unsharded
-    vocab. Returns global token ids."""
+    vocab. ``has_sampled_rows=False`` promises every temperature is 0 and skips
+    the noise; None decides per row on the device. Returns global token ids."""
 
     @classmethod
     def execute(cls, **kwargs) -> torch.Tensor:
@@ -192,8 +199,6 @@ class MarkovSampleStep:
         logits_out: Optional[torch.Tensor] = None,
         has_sampled_rows: Optional[bool] = None,
     ) -> torch.Tensor:
-        # Each row branches on its own temperature here; the hint is for torch.
-        del has_sampled_rows
         cls._check(
             base_logits, bias, temperatures, offset, step_dtype, vocab_start, logits_out
         )
@@ -223,6 +228,7 @@ class MarkovSampleStep:
             _BLOCK,
             _ROUND_CODE[step_dtype],
             logits_out is not None,
+            has_sampled_rows is not False,
             _PHILOX_ROUNDS,
             num_warps=4,
         )
@@ -259,8 +265,8 @@ class MarkovSampleStep:
         logits_out: Optional[torch.Tensor] = None,
         has_sampled_rows: Optional[bool] = None,
     ) -> torch.Tensor:
-        """``has_sampled_rows=False`` skips the noise; None draws it for every
-        row without reading the temperatures on the host, so it can be captured."""
+        # None draws the noise for every row: reading the temperatures on the
+        # host would break a graph capture.
         cls._check(
             base_logits, bias, temperatures, offset, step_dtype, vocab_start, logits_out
         )
