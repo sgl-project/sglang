@@ -72,7 +72,7 @@ class _RecordingExecutor(SGLDiffusionExecutor):
         self.adapter = adapter
         self.sent = []
 
-    def _execute_packed(self, packed, x, timestep):
+    def _execute_packed(self, packed, x, timestep, *, cond_uuid=None):
         self.sent.append((packed, timestep))
         # Fake noise_pred that identifies the row by its T5 context.
         noise = torch.full_like(packed.latents, float(packed.prompt_embeds[-1].mean()))

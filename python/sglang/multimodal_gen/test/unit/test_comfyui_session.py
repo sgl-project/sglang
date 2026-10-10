@@ -213,6 +213,7 @@ class _Executor(SGLDiffusionExecutor):
         self.session_id = uuid.uuid4().hex
         self._run_id = 0
         self._sent_conds = set()
+        self._cond_key_cache = {}
         self.begin_sampler_run()
         self.sid = self.comfyui_session_id()
 
@@ -310,7 +311,7 @@ class _SendingExecutor(_Executor):
         super().__init__(adapter)
         self.seen = []
 
-    def _execute_packed(self, packed, x, timestep):
+    def _execute_packed(self, packed, x, timestep, *, cond_uuid=None):
         req = self.send(packed)
         self.seen.append(req.image_latent)
         return x
@@ -375,6 +376,21 @@ def test_cond_key_hashes_large_tensors_inside_lists() -> None:
     key_a = ex._cond_key(_h3_packed(text, {"cond_video_latents": [latent_a]}))
     key_b = ex._cond_key(_h3_packed(text, {"cond_video_latents": [latent_b]}))
     assert key_a != key_b
+
+
+def test_cond_key_memoized_per_uuid_within_run() -> None:
+    # A cond's content can't change within one sampler run, so a repeat uuid
+    # must reuse the memoized key without rehashing the (changed) tensor.
+    ex = _Executor(MiniMaxH3Adapter())
+    text = torch.ones(3, 4)
+    first = ex._cond_key(_h3_packed(text, {}), cond_uuid=("u1",))
+    mutated = _h3_packed(torch.zeros(3, 4), {})
+    second = ex._cond_key(mutated, cond_uuid=("u1",))
+    assert first == second
+
+    ex.begin_sampler_run()
+    third = ex._cond_key(mutated, cond_uuid=("u1",))
+    assert third != first
 
 
 def test_extras_cached_per_cond_key() -> None:
