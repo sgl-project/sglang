@@ -65,6 +65,14 @@ if TYPE_CHECKING:
     # back to NCCL when unavailable. Set 0 to force NCCL. Keep this in step with
     # the resolver below -- that is the value the runtime reads.
     SGLANG_DIFFUSION_IPC_A2A: bool = True
+    # copy-engine all-to-all for Ulysses groups of any size on one host; off by
+    # default while it is validated. Falls back to NCCL when unavailable.
+    SGLANG_DIFFUSION_IPC_A2A_MULTI: bool = False
+    # head groups for pipelining MiniMax-H3's Ulysses exchange against dense
+    # attention over the copy-engine transport: -1 picks a count that divides
+    # the heads per rank and steps aside when its buffers do not fit, 0 or 1
+    # keeps the sequential exchange, N >= 2 forces N groups
+    SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS: int = -1
     # a deadlock backstop, not a per-step budget: a rank can legitimately stall
     # for seconds (layerwise offload, wan2.2 expert-tower swaps), and expiry now
     # retires the transport on every rank and fails the request
@@ -97,6 +105,14 @@ if TYPE_CHECKING:
     SGLANG_CACHE_DIT_SECONDARY_MC: int = 3
     SGLANG_CACHE_DIT_SECONDARY_TAYLORSEER: bool = False
     SGLANG_CACHE_DIT_SECONDARY_TS_ORDER: int = 1
+    # HunyuanImage-3: batch all condition images of a request group into one
+    # VAE/ViT encode call (halve-on-OOM backoff). Opt-in, off by default.
+    SGLANG_HI3_COND_ENCODE_BATCHING: bool = False
+    # HunyuanImage-3: apply the post-decode output geometry (native crop/pad
+    # and exact-size resample) to hit the requested aspect ratio. On by
+    # default; set 0 to skip the plan and return the full decoded native
+    # bucket untouched.
+    SGLANG_HI3_OUTPUT_CROP: bool = True
     SGLANG_CACHE_DIT_SECONDARY_DMD: bool = False
     SGLANG_CACHE_DIT_SECONDARY_DMD_HISTORY: int = 6
     SGLANG_CACHE_DIT_SECONDARY_DMD_RANK: int = 0
@@ -326,7 +342,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Plan slots in the MiniMax-H3 --minimax-h3-adaln-online GPU slab
     # (9.25 MiB per slot-timestep; 64 x width 4 = 2.31 GiB). A request needs
-    # up to num_inference_steps - 1 slots; the default covers the 50-step
+    # up to num_inference_steps slots; the default covers the 50-step
     # serving schedule, so this is an escape hatch, not a deployment knob.
     "SGLANG_DIFFUSION_MINIMAX_H3_ADALN_GPU_PLANS": _lazy_int(
         "SGLANG_DIFFUSION_MINIMAX_H3_ADALN_GPU_PLANS", 64
@@ -405,6 +421,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable cache-dit acceleration for DiT inference
     # CUDA-IPC transport for 2-rank Ulysses all-to-all (NVLink same-node)
     "SGLANG_DIFFUSION_IPC_A2A": _lazy_bool("SGLANG_DIFFUSION_IPC_A2A", "true"),
+    "SGLANG_DIFFUSION_IPC_A2A_MULTI": _lazy_bool(
+        "SGLANG_DIFFUSION_IPC_A2A_MULTI", "false"
+    ),
+    "SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS": _lazy_int(
+        "SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS", -1
+    ),
     "SGLANG_DIFFUSION_IPC_A2A_TIMEOUT_MS": _lazy_float(
         "SGLANG_DIFFUSION_IPC_A2A_TIMEOUT_MS", 10000.0
     ),
@@ -447,6 +469,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_CACHE_DIT_SCM_CACHE_BINS": _lazy_str("SGLANG_CACHE_DIT_SCM_CACHE_BINS"),
     # SCM policy: dynamic or static
     "SGLANG_CACHE_DIT_SCM_POLICY": _lazy_str("SGLANG_CACHE_DIT_SCM_POLICY", "dynamic"),
+    # HunyuanImage-3: batch all condition images of a request group into one
+    # VAE/ViT encode call (halve-on-OOM backoff on OOM). Opt-in, off by
+    # default; the AR backbone resident on the same device makes full-batch
+    # encoding tight on memory, so it must be explicitly enabled.
+    "SGLANG_HI3_COND_ENCODE_BATCHING": _lazy_bool("SGLANG_HI3_COND_ENCODE_BATCHING"),
+    # HunyuanImage-3: post-decode output geometry (native crop/pad plus
+    # exact-size resample). On by default; 0 returns the raw native bucket.
+    "SGLANG_HI3_OUTPUT_CROP": _lazy_bool("SGLANG_HI3_OUTPUT_CROP", "true"),
     # model loading
     "SGLANG_USE_RUNAI_MODEL_STREAMER": _lazy_bool(
         "SGLANG_USE_RUNAI_MODEL_STREAMER", "true"
