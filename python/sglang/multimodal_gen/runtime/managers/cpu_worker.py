@@ -5,7 +5,6 @@ import os
 
 import torch
 
-from sglang.multimodal_gen.runtime.distributed import get_tp_rank
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     init_logger,
@@ -72,7 +71,3 @@ class CPUWorker(GPUWorker):
 
         # Bind OpenMP threads to CPU cores
         torch.ops.sgl_kernel.init_cpu_threads_env(self.local_omp_cpuid)
-
-        # Set local size to hint SGLang to use shared memory based AllReduce
-        os.environ["LOCAL_SIZE"] = str(self.server_args.tp_size)
-        torch.ops.sgl_kernel.initialize(self.server_args.tp_size, get_tp_rank())

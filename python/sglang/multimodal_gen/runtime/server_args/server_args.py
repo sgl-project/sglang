@@ -1488,10 +1488,9 @@ class ServerArgs(DisaggServerArgsMixin):
         if self.tp_size is None:
             self.tp_size = 1
 
-        if current_platform.is_cpu():
-            if self.sp_degree is None:
-                self.sp_degree = 1
-            self.num_gpus = self.tp_size * self.sp_degree
+        if current_platform.is_cpu() and self.tp_size > 1:
+            # CPU platform reuse num_gpus to represent num cpu numa nodes as devices
+            self.num_gpus = self.tp_size
 
         if self.hsdp_shard_dim is None:
             self.hsdp_shard_dim = self.num_gpus
@@ -1553,14 +1552,18 @@ class ServerArgs(DisaggServerArgsMixin):
 
         # adjust sp_degree: allocate all remaining GPUs after TP and DP
         if self.sp_degree is None:
-            num_gpus_per_group = self.dp_size * self.tp_size
-            if self.enable_cfg_parallel:
-                num_gpus_per_group *= self.cfg_parallel_degree
-            if self.num_gpus % num_gpus_per_group == 0:
-                self.sp_degree = self.num_gpus // num_gpus_per_group
+            if current_platform.is_cpu():
+                # CPU supports Ulysses / KV-Gather SP.
+                self.sp_degree = self.ulysses_degree or self.kv_gather_degree or 1
             else:
-                # Will be validated later
-                self.sp_degree = 1
+                num_gpus_per_group = self.dp_size * self.tp_size
+                if self.enable_cfg_parallel:
+                    num_gpus_per_group *= self.cfg_parallel_degree
+                if self.num_gpus % num_gpus_per_group == 0:
+                    self.sp_degree = self.num_gpus // num_gpus_per_group
+                else:
+                    # Will be validated later
+                    self.sp_degree = 1
 
         if (
             self.ulysses_degree is None
@@ -1611,6 +1614,9 @@ class ServerArgs(DisaggServerArgsMixin):
             # gather gets a first-class dimension (needed only once it
             # composes with Ulysses).
             self.ulysses_degree = self.kv_gather_degree
+        if current_platform.is_cpu():
+            # On CPU, the number of GPUs is determined by the TP and SP degrees.
+            self.num_gpus = self.tp_size * self.sp_degree
 
     def _model_default_uses_cfg(self) -> bool:
         """
