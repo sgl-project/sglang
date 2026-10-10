@@ -16,6 +16,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     CompletionResponseStreamChoice,
     CompletionStreamResponse,
     ErrorResponse,
+    RequestMetrics,
     SglExt,
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
@@ -140,6 +141,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             custom_labels=custom_labels,
             custom_logit_processor=request.custom_logit_processor,
             images_config=getattr(request, "images_config", None),
+            return_request_metrics=request.return_request_metrics,
         )
 
         return adapted_request, request
@@ -451,12 +453,19 @@ class OpenAIServingCompletion(OpenAIServingBase):
                         spec_details if request.n > 1 else spec_details[0]
                     )
 
+            sglext_request_metrics = None
+            if request.return_request_metrics:
+                metrics_dict = content["meta_info"].get("request_metrics")
+                if metrics_dict:
+                    sglext_request_metrics = RequestMetrics(**metrics_dict)
+
             if any(
                 obj is not None
                 for obj in [
                     sglext_routed,
                     sglext_cached_tokens_details,
                     sglext_spec_tokens_details,
+                    sglext_request_metrics,
                 ]
             ):
                 sglext_chunk = CompletionStreamResponse(
@@ -469,6 +478,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                         routed_experts=sglext_routed,
                         cached_tokens_details=sglext_cached_tokens_details,
                         spec_tokens_details=sglext_spec_tokens_details,
+                        request_metrics=sglext_request_metrics,
                     ),
                 )
                 yield f"data: {sglext_chunk.model_dump_json()}\n\n"
@@ -561,12 +571,23 @@ class OpenAIServingCompletion(OpenAIServingBase):
             if request.n > 1
             else (spec_details[0] if spec_details else None)
         )
+        request_metrics = None
+        if request.return_request_metrics:
+            metrics_dict = first_ret["meta_info"].get("request_metrics")
+            if metrics_dict:
+                request_metrics = RequestMetrics(**metrics_dict)
         response_sglext = None
-        if routed_experts or cached_tokens_details or spec_tokens_details:
+        if (
+            routed_experts
+            or cached_tokens_details
+            or spec_tokens_details
+            or request_metrics is not None
+        ):
             response_sglext = SglExt(
                 routed_experts=routed_experts,
                 cached_tokens_details=cached_tokens_details,
                 spec_tokens_details=spec_tokens_details,
+                request_metrics=request_metrics,
             )
 
         for idx, ret_item in enumerate(ret):

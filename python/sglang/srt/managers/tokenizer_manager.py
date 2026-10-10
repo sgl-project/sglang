@@ -2682,6 +2682,24 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
                 meta_info["e2e_latency"] = state.time_stats.get_e2e_latency()
 
+                # Opt-in per-request metrics, independent of --enable-metrics.
+                if getattr(state.obj, "return_request_metrics", False):
+                    scheduler_time_stats = (
+                        recv_obj.time_stats[i]
+                        if recv_obj.time_stats is not None
+                        else None
+                    )
+                    completion_tokens = (
+                        recv_obj.completion_tokens[i]
+                        if not isinstance(recv_obj, BatchEmbeddingOutput)
+                        else 0
+                    )
+                    request_metrics = state.time_stats.compute_request_metrics(
+                        scheduler_time_stats, completion_tokens
+                    )
+                    if request_metrics:
+                        meta_info["request_metrics"] = request_metrics
+
                 if get_spec().speculative_algorithm:
                     self._calculate_spec_decoding_metrics(meta_info, recv_obj, i)
                 if self.enable_metrics:

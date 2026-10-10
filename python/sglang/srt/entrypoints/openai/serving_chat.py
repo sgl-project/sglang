@@ -67,6 +67,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     FunctionResponse,
     MessageProcessingResult,
     PromptTokensDetails,
+    RequestMetrics,
     ResponseParserProtocol,
     SglExt,
     Tool,
@@ -1326,6 +1327,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 or request.return_token_ids
                 or self._should_return_input_ids(request)
             ),
+            return_request_metrics=request.return_request_metrics,
         )
         if (
             raw_request is not None
@@ -2206,12 +2208,19 @@ class OpenAIServingChat(OpenAIServingBase):
                     list(output_ids.get(i, [])) for i in range(request.n)
                 ]
 
+            sglext_request_metrics = None
+            if request.return_request_metrics:
+                metrics_dict = content["meta_info"].get("request_metrics")
+                if metrics_dict:
+                    sglext_request_metrics = RequestMetrics(**metrics_dict)
+
             sglext_full = SglExt(
                 routed_experts=sglext_routed,
                 cached_tokens_details=sglext_cached_tokens_details,
                 spec_tokens_details=sglext_spec_tokens_details,
                 input_ids=sglext_input_ids,
                 output_ids=sglext_output_ids,
+                request_metrics=sglext_request_metrics,
             )
             sglext_non_ids, sglext_ids = sglext_full.split_ids()
 
@@ -2363,6 +2372,11 @@ class OpenAIServingChat(OpenAIServingBase):
         output_ids = None
         if self._should_return_output_ids(request):
             output_ids = [list(ret_item["output_ids"]) for ret_item in ret]
+        request_metrics = None
+        if request.return_request_metrics:
+            metrics_dict = first_ret["meta_info"].get("request_metrics")
+            if metrics_dict:
+                request_metrics = RequestMetrics(**metrics_dict)
         response_sglext = None
         if (
             routed_experts
@@ -2370,6 +2384,7 @@ class OpenAIServingChat(OpenAIServingBase):
             or spec_tokens_details
             or input_ids is not None
             or output_ids is not None
+            or request_metrics is not None
         ):
             response_sglext = SglExt(
                 routed_experts=routed_experts,
@@ -2377,6 +2392,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 spec_tokens_details=spec_tokens_details,
                 input_ids=input_ids,
                 output_ids=output_ids,
+                request_metrics=request_metrics,
             )
 
         for idx, ret_item in enumerate(ret):
