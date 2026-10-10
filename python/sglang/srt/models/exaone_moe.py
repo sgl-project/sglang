@@ -69,6 +69,12 @@ logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 
 
+def get_attention_sliding_window_size(config: PretrainedConfig) -> int:
+    # HF counts the query token inside the window; SGLang counts only the
+    # earlier tokens (see exaone4.py, gemma3_causal.py).
+    return config.sliding_window - 1
+
+
 class ExaoneMoEMLP(nn.Module):
     def __init__(
         self,
@@ -389,7 +395,9 @@ class ExaoneMoEAttention(nn.Module):
             layer_id=layer_id,
             prefix=add_prefix("attn", prefix),
             sliding_window_size=(
-                config.sliding_window if self.sliding_window else None
+                get_attention_sliding_window_size(config)
+                if self.sliding_window
+                else None
             ),
         )
         self.layer_id = layer_id
@@ -734,6 +742,9 @@ class ExaoneMoEForCausalLM(nn.Module):
     @property
     def end_layer(self):
         return self.model.end_layer
+
+    def get_attention_sliding_window_size(self) -> int:
+        return get_attention_sliding_window_size(self.config)
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
