@@ -736,8 +736,8 @@ class MiniMaxH3ComfyUIStepStage(PipelineStage):
         server_args: ServerArgs,
     ) -> MiniMaxH3ComfyUIRunState:
         from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.denoising import (
-            _precompute_refined_prompt_embeds,
             _build_cube_attn_metadata,
+            _precompute_refined_prompt_embeds,
         )
 
         signature = (

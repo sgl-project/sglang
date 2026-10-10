@@ -270,7 +270,7 @@ def validate_distilled_h3_step(packed, model_type):
         or not torch.allclose(actual.reshape(-1), expected, atol=1e-6, rtol=0)
     ):
         raise ValueError(
-            f"{model_type} requires its trained {n-1}-NFE video shift 12 grid; use SGLDH3DistilledSigmas"
+            f"{model_type} requires its trained {n - 1}-NFE video shift 12 grid; use SGLDH3DistilledSigmas"
         )
     payload = packed.extra_req.get("h3_payload") or {}
     if payload.get("refs") or (model_type == "fast_h3" and payload.get("keyframes")):
