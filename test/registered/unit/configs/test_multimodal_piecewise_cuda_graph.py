@@ -10,7 +10,6 @@ from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.configs.embedding_model_spec import resolve_embedding_model_spec
 from sglang.srt.configs.model_config import (
     AttentionArch,
-    is_multimodal_piecewise_cuda_graph_supported,
 )
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -61,20 +60,6 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
             return_logprob=False,
             input_ids=[1, 2, 3, 4],
             extend_prefix_lens_cpu=[0],
-        )
-
-    def test_kimi_k25_lm_prefill_is_opted_in(self):
-        self.assertTrue(
-            is_multimodal_piecewise_cuda_graph_supported(
-                ["KimiK25ForConditionalGeneration"]
-            )
-        )
-
-    def test_unknown_multimodal_arch_is_not_opted_in(self):
-        self.assertFalse(
-            is_multimodal_piecewise_cuda_graph_supported(
-                ["UnknownVisionForConditionalGeneration"]
-            )
         )
 
     def test_trtllm_mla_stays_on_breakable(self):

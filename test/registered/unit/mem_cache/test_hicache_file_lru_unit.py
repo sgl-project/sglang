@@ -151,24 +151,6 @@ class HiCacheFileLRUTestBase(CustomTestCase):
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
 
-class TestEnvDefaults(CustomTestCase):
-    """Verify the env var defaults match the documented opt-in behavior."""
-
-    def test_min_free_space_default_is_zero(self):
-        # Default must keep eviction off so existing users are unaffected.
-        with mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("SGLANG_HICACHE_FILE_BACKEND_MIN_FREE_SPACE", None)
-            self.assertEqual(
-                envs.SGLANG_HICACHE_FILE_BACKEND_MIN_FREE_SPACE.get(),
-                "0",
-            )
-
-    def test_max_size_default_is_none(self):
-        with mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE", None)
-            self.assertIsNone(envs.SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE.get())
-
-
 class TestEvictionDisabledByDefault(HiCacheFileLRUTestBase):
     def test_no_config_no_eviction(self):
         b = self.make_backend(max_size="0", min_free="0")

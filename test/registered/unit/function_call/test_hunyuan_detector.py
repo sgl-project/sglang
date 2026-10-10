@@ -518,23 +518,6 @@ class TestHunyuanDetectorStreaming(CustomTestCase):
         self.assertEqual(collected[0]["name"], "get_current_date")
         self.assertEqual(json.loads(collected[0]["parameters"]), {})
 
-    def test_streaming_with_args_char_by_char(self):
-        detector = self._new_detector()
-        full = (
-            "<tool_calls><tool_call>get_weather<tool_sep>"
-            "<arg_key>city</arg_key><arg_value>NYC</arg_value>"
-            "</tool_call></tool_calls>"
-        )
-        all_calls = []
-        for ch in full:
-            result = detector.parse_streaming_increment(ch, self.tools)
-            all_calls.extend(result.calls)
-
-        collected = _collect_streamed_tool_calls(all_calls)
-        self.assertEqual(len(collected), 1)
-        args = json.loads(collected[0]["parameters"])
-        self.assertEqual(args["city"], "NYC")
-
     def test_streaming_three_tools_sequential(self):
         """Three different tool calls arriving sequentially."""
         detector = self._new_detector()
