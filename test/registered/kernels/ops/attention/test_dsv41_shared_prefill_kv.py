@@ -1,4 +1,5 @@
 """Shared compressed-KV workspace validity across layers and forwards."""
+
 import sys
 from types import SimpleNamespace as NS
 from unittest.mock import patch
@@ -8,9 +9,9 @@ import torch
 
 from sglang.srt.layers.attention import deepseek_v4_backend as backend
 from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
+    WORKSPACE_DIM,
     CompressedGather,
     SparsePrefillWorkspace,
-    WORKSPACE_DIM,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -58,7 +59,9 @@ def test_shared_compressed_dequant_lifetime():
     def make_cache(n):
         gathers = {
             ratio: CompressedGather(
-                flat_token_ids=torch.arange(n // ratio, device=device, dtype=torch.int32),
+                flat_token_ids=torch.arange(
+                    n // ratio, device=device, dtype=torch.int32
+                ),
                 compressed_base=torch.zeros(1, device=device, dtype=torch.int32),
                 swa_base=torch.zeros(1, device=device, dtype=torch.int32),
             )
