@@ -48,7 +48,25 @@ constexpr uint32_t kMaxTopK = impl::TopKConfig::kMaxTopK;
 constexpr uint32_t kReg2MaxSeqLen = Register2::kMaxSeqLen;  // 8192
 constexpr uint32_t kReg4MaxSeqLen = Register4::kMaxSeqLen;  // 16384
 
+#ifdef USE_ROCM
+// HIP reads the second __launch_bounds__ argument as waves per SIMD, CUDA as
+// blocks per SM, so kOccupancy asks ROCm for 2 waves/SIMD -- below the 4 a
+// 1024-thread block already forces. Do NOT translate kOccupancy into this:
+// "kOccupancy blocks per CU" is 8 waves/SIMD, which caps the allocator at
+// 512/8 = 64 VGPRs and spills, and a second resident block is unreachable with
+// a grid of batch_size. wave64 is a literal because __AMDGCN_WAVEFRONT_SIZE__
+// is gone in ROCm 7 and warpSize is not constexpr.
+inline constexpr uint32_t kSimdsPerCu = 4;
+inline constexpr uint32_t kWavefrontSize = 64;  // CDNA
+inline constexpr uint32_t kWavesPerBlock = kBlockSize / kWavefrontSize;
+inline constexpr uint32_t kMinWavesPerSimd = kWavesPerBlock / kSimdsPerCu;
+static_assert(kMinWavesPerSimd > 0, "kBlockSize must cover at least one wave per SIMD");
+#define TOPK_KERNEL __global__ __launch_bounds__(kBlockSize, kMinWavesPerSimd)
+#else
+// topk_small_batch_cluster_kernel shadows kOccupancy with its own template
+// parameter and CLUSTER_TOPK_KERNEL relies on that, so leave the CUDA spelling.
 #define TOPK_KERNEL __global__ __launch_bounds__(kBlockSize, kOccupancy)
+#endif
 
 /// Metadata tensor rows (each 8 B / 2 int32). Row 0 is the global plan result;
 /// rows 1..N are the (batch_id, seq_len) of items routed to the cluster pool.
@@ -643,8 +661,9 @@ struct SplitWorkspace {
   uint32_t floor;  ///< same value the host dispatched on
 };
 
-/// 12 histogram bits, the width TopKStreaming uses: a 10-bit threshold bin holds
-/// more unequal scores than kMaxNumTie can stage, and drops the rest in silence.
+/// 12 histogram bits, the width TopKStreaming uses: a 10-bit threshold bin overflows
+/// kMaxNumTie far more often, and each overflowing row costs the epilogue a
+/// refine_ties rescan of the whole row in one block.
 struct TopKSplit : impl::TopKRadixBase<12> {
   using Base = impl::TopKRadixBase<12>;
   static_assert(kHistSize % kBlockSize == 0, "the histogram is transferred kHistItems bins per thread");
@@ -722,8 +741,9 @@ struct TopKSplit : impl::TopKRadixBase<12> {
     // The full row's histogram and the full row's seq_len, so every rank picks
     // the same bin and the appends below agree on what "above" means.
     find_threshold(problem.topk, problem.seq_len, smem, [&](uint32_t threshold_bin) {
-      smem->v_hi = impl::coarse_bin_lower_bound<kHistBits>(threshold_bin + 1);
-      smem->v_lo = impl::coarse_bin_lower_bound<kHistBits>(threshold_bin + 0);
+      const auto [v_lo, v_hi] = impl::coarse_bin_bounds<kHistBits>(threshold_bin);
+      smem->v_hi = v_hi;
+      smem->v_lo = v_lo;
     });
 
     const auto topk = problem.topk;
@@ -750,7 +770,8 @@ struct TopKSplit : impl::TopKRadixBase<12> {
     const auto n_eq = min(smem->count_eq, kMaxNumTie);
     if (tx == 0) {
       smem->base_gt = atomicAdd(&ctr->count_gt, n_gt);
-      smem->base_eq = atomicAdd(&ctr->count_eq, n_eq);
+      // Uncapped: finish_ties needs the row's exact bin size to detect overflow and refine.
+      smem->base_eq = atomicAdd(&ctr->count_eq, smem->count_eq);
     }
     __syncthreads();
     const auto base_gt = smem->base_gt;
@@ -787,15 +808,27 @@ struct TopKSplit : impl::TopKRadixBase<12> {
   }
 
   /// Fill the slots the threshold bin has to break ties for, staging the ties
-  /// into LDS first since handle_tie's ranking pass is all-to-all.
+  /// into LDS first since handle_tie's ranking pass is all-to-all. `problem`
+  /// must be the whole row: an overflowing bin is re-derived by rescanning it.
   SGL_DEVICE static void finish_ties(const TopKProblem& problem, const impl::TieValue* ties, Smem* smem) {
     const auto tx = threadIdx.x;
-    const auto above_count = smem->total_gt;
-    const auto tie_count = min(smem->total_eq, kMaxNumTie);
+    uint32_t above_count, tie_count;
+    if (smem->total_eq > kMaxNumTie) [[unlikely]] {
+      // The global list holds an arrival-order subset. refine_ties emits after
+      // the slots every rank already took, so seed its counter with their total.
+      if (tx == 0) smem->count_gt = smem->total_gt;
+      __syncthreads();
+      refine_ties(problem, smem, smem->v_lo, smem->v_hi, smem->total_eq);
+      above_count = smem->count_gt;
+      tie_count = min(smem->count_eq, kMaxNumTie);
+    } else {
+      above_count = smem->total_gt;
+      tie_count = smem->total_eq;
+      for (uint32_t t = tx; t < tie_count; t += kBlockSize)
+        smem->tie_values[t] = ties[t];
+      __syncthreads();
+    }
     const auto remain_topk = above_count < problem.topk ? problem.topk - above_count : 0;
-    for (uint32_t t = tx; t < tie_count; t += kBlockSize)
-      smem->tie_values[t] = ties[t];
-    __syncthreads();
     handle_tie(smem->tie_values, problem, above_count, tie_count, remain_topk, &smem->tie_handle);
   }
 };
