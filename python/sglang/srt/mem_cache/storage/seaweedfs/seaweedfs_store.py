@@ -32,6 +32,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
     PoolTransferResult,
+    mla_tp_shard_tag,
 )
 
 logger = logging.getLogger(__name__)
@@ -111,6 +112,7 @@ class SeaweedFSStore(HiCacheStorage):
         self.config = SeaweedFSConfig.from_extra_config(storage_config.extra_config)
         scope = [self.config.prefix.strip("/")] if self.config.prefix else []
         self.key_prefix = "/".join(scope + key_scope(storage_config))
+        self._storage_config = storage_config
         self._s3 = _make_s3_client(self.config)
         self._executor = ThreadPoolExecutor(max_workers=self.config.max_workers)
         self._ensure_bucket()
@@ -301,7 +303,11 @@ class SeaweedFSStore(HiCacheStorage):
 
     def _component_key(self, key: str, pool_name) -> str:
         name = getattr(pool_name, "value", pool_name)
-        return key if name == PoolName.KV.value else f"{key}.{name}"
+        if name == PoolName.KV.value:
+            return key
+        cfg = self._storage_config
+        tag = mla_tp_shard_tag(cfg.is_mla_model, cfg.tp_rank, cfg.tp_size, name)
+        return f"{key}.{name}.{tag}" if tag else f"{key}.{name}"
 
     def batch_exists_v2(
         self,

@@ -291,8 +291,8 @@ class TestSeaweedFSStore(CustomTestCase):
     # the backend only touches it through the host-pool page API, so what this
     # proves is the per-pool object naming, routing and hit policies.
 
-    def _v2_store(self, layout="page_first"):
-        store = self._store()
+    def _v2_store(self, layout="page_first", **store_kwargs):
+        store = self._store(**store_kwargs)
         kv, side = _host_pool(layout), _host_pool(layout)
         store.register_mem_host_pool_v2(kv, PoolName.KV)
         store.register_mem_host_pool_v2(side, PoolName.MAMBA)
@@ -324,6 +324,28 @@ class TestSeaweedFSStore(CustomTestCase):
                     self.assertEqual(loaded[p], [True] * NUM_PAGES)
                     for i in range(NUM_PAGES):
                         self.assertTrue(torch.equal(_page(pool, i), expected[p][i]))
+
+    def test_v2_mla_mamba_state_stays_per_rank(self):
+        # Every MLA TP rank backs up its own Mamba shard; replicated KV is shared.
+        ranks = [self._v2_store(tp_rank=r, tp_size=2, is_mla=True) for r in (0, 1)]
+        keys = ranks[0][3]
+        for store, _, _, _, transfers in ranks:
+            transfers[1].keys = keys
+            self.assertEqual(
+                store.batch_set_v2(transfers[1:])[PoolName.MAMBA], [True] * NUM_PAGES
+            )
+        for store, _, side, _, transfers in ranks:
+            expected = [_page(side, i) for i in range(NUM_PAGES)]
+            side.kv_buffer.zero_()
+            self.assertEqual(
+                store.batch_get_v2(transfers[1:])[PoolName.MAMBA], [True] * NUM_PAGES
+            )
+            for i in range(NUM_PAGES):
+                self.assertTrue(torch.equal(_page(side, i), expected[i]))
+        self.assertEqual(
+            ranks[0][0]._component_key("k", PoolName.KV),
+            ranks[1][0]._component_key("k", PoolName.KV),
+        )
 
     def test_v2_kv_pages_are_the_v1_objects(self):
         # KV pages keep their v1 object names, so v1 and v2 share one cache;

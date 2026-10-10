@@ -88,6 +88,13 @@ class PoolName(str, Enum):
         return self.value
 
 
+def mla_tp_shard_tag(is_mla_model: bool, tp_rank: int, tp_size: int, pool_name) -> str:
+    """Key tag for MLA Mamba state, which every TP rank backs up (see should_backup)."""
+    if is_mla_model and pool_name == PoolName.MAMBA:
+        return f"tp{tp_rank}_{tp_size}"
+    return ""
+
+
 class PoolHitPolicy(str, Enum):
     """Hit policy for batch_exists_v2 per-pool prefix matching.
 
@@ -397,6 +404,10 @@ class HiCacheFile(HiCacheStorage):
         attn_cp_size = storage_config.attn_cp_size
         model_name = "-".join(model_name.split("/")) if model_name else ""
         enable_pp = pp_size > 1
+        self._is_mla_model = is_mla_model
+        self._tp_rank = tp_rank
+        mamba_tag = mla_tp_shard_tag(True, tp_rank, tp_size, PoolName.MAMBA)
+        self._mamba_tp_suffix = f".mamba.{mamba_tag}"
         self.config_suffix = f"_{model_name}"
         if not is_mla_model:
             self.config_suffix += f"_{tp_rank}_{tp_size}"
@@ -446,6 +457,7 @@ class HiCacheFile(HiCacheStorage):
             self.config_suffix,
             tp_rank=tp_rank,
             is_mla_model=is_mla_model,
+            owns_key=self._owns_file_key if is_mla_model else None,
             extra_config=storage_config.extra_config,
             on_evict=(
                 self.metadata_cache.remove if self.metadata_cache is not None else None
@@ -453,7 +465,18 @@ class HiCacheFile(HiCacheStorage):
         )
 
     def _get_suffixed_key(self, key: str) -> str:
+        # MLA KV/indexer pages are replicated; Mamba state is TP-sharded.
+        if self._is_mla_model and key.endswith(".mamba"):
+            key = key[: -len(".mamba")] + self._mamba_tp_suffix
         return key + self.config_suffix
+
+    def _owns_file_key(self, suffixed_key: str) -> bool:
+        key = suffixed_key[: -len(self.config_suffix)]
+        if ".mamba.tp" in key:
+            return key.endswith(self._mamba_tp_suffix)
+        if key.endswith(".mamba"):
+            return False  # Legacy state has no rank identity.
+        return self._tp_rank == 0  # Rank 0 owns replicated pages.
 
     def _get_component_key(self, key: str, component_name: Optional[str] = None) -> str:
         if component_name is None or component_name in ("__default__", PoolName.KV):

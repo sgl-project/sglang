@@ -4,6 +4,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=16, stage="base-b", runner_config="1-gpu-small")
 
+import dataclasses
 import os
 import shutil
 import socket
@@ -686,6 +687,35 @@ class TestNixlUnified(CustomTestCase):
         self.assertEqual(get_results[PoolName.SWA], [True])
         self.assertTrue(torch.equal(mamba_pool.get_data_page(0), expected_mamba))
         self.assertTrue(torch.equal(swa_pool.get_data_page(0), expected_swa))
+
+    def test_mla_mamba_state_stays_per_rank(self):
+        # Every MLA TP rank backs up its own Mamba shard under the same page key.
+        ranks = []
+        for tp_rank in (0, 1):
+            config = dataclasses.replace(
+                self.storage_config, tp_rank=tp_rank, is_mla_model=True
+            )
+            store = HiCacheNixl(storage_config=config, file_path=self.test_dir)
+            pool = MockHybridPool(expose_zero_copy=False)
+            store.register_mem_host_pool_v2(pool, PoolName.MAMBA)
+            pool.temporal_buffer[0].fill_(10 + tp_rank)
+            pool.conv_buffer[0][0].fill_(20 + tp_rank)
+            ranks.append((store, pool, pool.get_data_page(0).clone()))
+
+        transfer = lambda: [
+            PoolTransfer(
+                name=PoolName.MAMBA,
+                keys=["shared_key"],
+                host_indices=torch.tensor([0], dtype=torch.int64),
+            )
+        ]
+        for store, _, _ in ranks:
+            self.assertEqual(store.batch_set_v2(transfer())[PoolName.MAMBA], [True])
+        for store, pool, expected in ranks:
+            pool.temporal_buffer.zero_()
+            pool.conv_buffer[0].zero_()
+            self.assertEqual(store.batch_get_v2(transfer())[PoolName.MAMBA], [True])
+            self.assertTrue(torch.equal(pool.get_data_page(0), expected))
 
 
 @unittest.skipUnless(hasattr(os, "O_DIRECT"), "O_DIRECT not available on this platform")
