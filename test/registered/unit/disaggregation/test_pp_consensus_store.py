@@ -1,8 +1,12 @@
 """Unit tests for srt/disaggregation/pp_consensus_store."""
 
+import pickle
 import time
 import unittest
 from collections.abc import Callable
+
+import msgspec
+import zmq
 
 from sglang.srt.disaggregation.pp_consensus_store import PPConsensusStore
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -186,6 +190,54 @@ class TestPPConsensusStore(CustomTestCase):
             store1.collect("key")
         store0.close()
         store1.close()
+
+    def test_int_room_key_round_trip(self):
+        group = _MockPPGroup()
+        store0 = PPConsensusStore(2, 0, group)
+        store1 = PPConsensusStore(2, 1, group)
+        room = 1234567890123
+        store1[room] = 2
+        self._wait_until(lambda: store0.collect(room) == [None, 2])
+        store1.pop(room)
+        self._wait_until(lambda: store0.collect(room) == [None, None])
+        store0.close()
+        store1.close()
+
+    def test_unencodable_value_raises_in_caller(self):
+        group = _MockPPGroup()
+        store0 = PPConsensusStore(2, 0, group)
+        store1 = PPConsensusStore(2, 1, group)
+        with self.assertRaises(TypeError):
+            store1["key"] = object()
+        self.assertFalse("key" in store1)
+        store0.close()
+        store1.close()
+
+    def test_malformed_messages_are_dropped(self):
+        """Garbage on the PP0 socket must be dropped; it must never exit the process."""
+        group = _MockPPGroup()
+        store0 = PPConsensusStore(2, 0, group)
+        ctx = zmq.Context()
+        peer = ctx.socket(zmq.PUSH)
+        peer.connect(store0._socket.getsockopt_string(zmq.LAST_ENDPOINT))
+        for raw in (
+            b"",
+            b"\xc1",  # invalid msgpack
+            pickle.dumps((1, 1, "key", 99)),
+            msgspec.msgpack.encode({"kind": 1}),
+            msgspec.msgpack.encode([1, 0, "key", 99]),  # rank 0 never sends
+            msgspec.msgpack.encode([1, 7, "key", 99]),  # rank out of range
+            msgspec.msgpack.encode([9, 1, "key", 99]),  # unknown op
+            msgspec.msgpack.encode([1, 1, ["key"], 99]),  # bad key type
+            msgspec.msgpack.encode([1, 1, "key", "bad"]),  # bad value type
+        ):
+            peer.send(raw)
+        # Same connection, so this lands only after every message above was handled.
+        peer.send(msgspec.msgpack.encode([1, 1, "key", 11]))
+        self._wait_until(lambda: store0.collect("key") == [None, 11])
+        peer.close(linger=0)
+        ctx.term()
+        store0.close()
 
 
 if __name__ == "__main__":
