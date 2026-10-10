@@ -2,7 +2,6 @@
 
 import json
 import logging
-import re
 from typing import List
 
 from sglang.srt.entrypoints.openai.protocol import Tool
@@ -56,6 +55,17 @@ class InternlmDetector(BaseFormatDetector):
         has_call = self.bot_token in text
         return has_call
 
+    def _iter_tool_call_bodies(self, text: str):
+        # Linear scan on purpose: a `bot\s*(.*?)eot` findall rescans to the end
+        # from every opening tag (and whitespace split) when eot never arrives.
+        start = text.find(self.bot_token)
+        while start != -1:
+            end = text.find(self.eot_token, start + len(self.bot_token))
+            if end == -1:
+                return
+            yield text[start + len(self.bot_token) : end]
+            start = text.find(self.bot_token, end + len(self.eot_token))
+
     def get_arguments(self, obj):
         """Extract arguments from object, supporting both 'parameters' and 'arguments' keys."""
         if "parameters" in obj:
@@ -83,12 +93,7 @@ class InternlmDetector(BaseFormatDetector):
             logger.warning("[InternLM Tool Call] No tool call markers found in text")
             return StreamingParseResult(normal_text=normal_text, calls=[])
 
-        # Use regex to find all tool call blocks
-        # Pattern matches: {self.bot_token}{...}{self.eot_token}
-        tool_call_pattern = (
-            rf"{re.escape(self.bot_token)}\s*(.*?){re.escape(self.eot_token)}"
-        )
-        matches = re.findall(tool_call_pattern, text, re.DOTALL)
+        matches = list(self._iter_tool_call_bodies(text))
 
         if not matches:
             logger.warning("[InternLM Tool Call] No complete tool call blocks found")
