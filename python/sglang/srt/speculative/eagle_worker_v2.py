@@ -345,9 +345,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         else:
             if self.hot_token_id is not None and head is not None:
+                check_hot_token_head_indexable(head)
                 head = head.clone()
-                self.hot_token_id = self.hot_token_id.to(head.device)
-                head.data = head.data[self.hot_token_id]
+                local_rows, self.hot_token_id = slice_hot_token_head(
+                    self.hot_token_id.to(head.device), target_lm_head
+                )
+                head.data = head.data[local_rows]
 
             # Share the embedding and lm_head
             self.draft_runner.model.set_embed_and_head(embed, head)
@@ -1228,6 +1231,77 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         next_draft_input.cuda_graph_compatible = not (
             self.seed_dsa_topk_from_draft_extend and dsa_seed_topk_indices is None
         )
+
+
+def check_hot_token_head_indexable(head: torch.Tensor) -> None:
+    """Reject lm_heads whose rows cannot be selected by plain indexing.
+
+    A block-quantized lm_head (e.g. a ModelOpt NVFP4 linear: packed uint8
+    weight plus per-block scales) stores no per-token float rows, so
+    ``head.data[rows]`` would silently bind packed bytes as the draft head.
+    """
+    if not head.is_floating_point():
+        raise ValueError(
+            "--speculative-token-map needs a floating-point lm_head to select "
+            f"rows from, but the shared lm_head weight is {head.dtype} "
+            "(block-quantized). Drop --speculative-token-map for this checkpoint."
+        )
+
+
+def slice_hot_token_head(hot_token_id: torch.Tensor, target_lm_head):
+    """Map a reduced (hot) draft vocab onto this rank's lm_head rows.
+
+    ``hot_token_id`` holds global vocab ids. Under vocab-parallel TP the shared
+    lm_head only holds rows ``[rank * part, (rank + 1) * part)``, so indexing it
+    with global ids reads out of bounds (or the wrong rows on rank >= 1).
+
+    Each rank keeps the hot ids that fall in its own shard, as local row
+    indices. The draft logits are all-gathered along the vocab dim, so every
+    rank must contribute the same width: shorter blocks are padded with ids
+    from the same shard that are not in the hot set (distinct, real tokens, so
+    top-k never sees duplicates). Returns ``(local_rows, gathered_ids)`` where
+    ``gathered_ids[j]`` is the global id of column ``j`` of the gathered
+    logits, i.e. the new ``hot_token_id``.
+    """
+    hot = hot_token_id.to(torch.int64)
+    tp_size = getattr(target_lm_head, "tp_size", 1) if target_lm_head else 1
+    shard = getattr(target_lm_head, "shard_indices", None)
+    part = getattr(target_lm_head, "num_embeddings_per_partition", None)
+    if tp_size <= 1 or shard is None or part is None:
+        return hot, hot
+
+    org_vocab_size = target_lm_head.org_vocab_size
+    rank = shard.org_vocab_start_index // part
+    blocks = []
+    for r in range(tp_size):
+        lo, hi = r * part, min((r + 1) * part, org_vocab_size)
+        blocks.append((lo, hi, hot[(hot >= lo) & (hot < hi)]))
+    width = max(ids.numel() for _, _, ids in blocks)
+    padded = []
+    for lo, hi, ids in blocks:
+        if ids.numel() < width:
+            if hi - lo < width:
+                raise ValueError(
+                    f"--speculative-token-map: vocab shard [{lo}, {hi}) is smaller "
+                    f"than the per-rank draft width {width}"
+                )
+            cold = torch.ones(hi - lo, dtype=torch.bool, device=hot.device)
+            cold[ids - lo] = False
+            fill = torch.nonzero(cold).flatten()[: width - ids.numel()] + lo
+            ids = torch.cat([ids, fill])
+        padded.append(ids)
+    gathered_ids = torch.cat(padded)
+    local_rows = padded[rank] - rank * part
+    logger.info(
+        "Hot-token draft head under TP=%d: rank %d keeps %d of %d hot ids "
+        "(%d columns per rank)",
+        tp_size,
+        rank,
+        blocks[rank][2].numel(),
+        hot.numel(),
+        width,
+    )
+    return local_rows, gathered_ids
 
 
 class EAGLEWorkerV2(BaseSpecWorker):
