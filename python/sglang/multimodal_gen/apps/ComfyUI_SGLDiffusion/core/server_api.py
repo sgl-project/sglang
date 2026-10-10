@@ -265,48 +265,83 @@ class SGLDiffusionServerAPI:
             else:
                 size = "720x1280"
 
-        # Prepare request payload
-        payload: Dict[str, Any] = {
+        # Prepare request fields shared by the JSON and multipart paths.
+        # `output_path` is deliberately never sent: it used to be the
+        # ComfyUI node's own temp directory, which only exists on this
+        # machine and breaks as soon as the server runs elsewhere. Letting
+        # the server pick its own output location and fetching the result
+        # (see below) works for both the local and remote case.
+        fields: Dict[str, Any] = {
             "prompt": prompt,
             "size": size,
         }
-
-        # Add optional parameters
         if seconds is not None:
-            payload["seconds"] = seconds
+            fields["seconds"] = seconds
         if fps is not None:
-            payload["fps"] = fps
+            fields["fps"] = fps
         if num_frames is not None:
-            payload["num_frames"] = num_frames
+            fields["num_frames"] = num_frames
         if negative_prompt:
-            payload["negative_prompt"] = negative_prompt
+            fields["negative_prompt"] = negative_prompt
         if guidance_scale is not None:
-            payload["guidance_scale"] = guidance_scale
+            fields["guidance_scale"] = guidance_scale
         if num_inference_steps is not None:
-            payload["num_inference_steps"] = num_inference_steps
+            fields["num_inference_steps"] = num_inference_steps
         if seed is not None and seed >= 0:
-            payload["seed"] = seed
+            fields["seed"] = seed
         if enable_teacache:
-            payload["enable_teacache"] = True
+            fields["enable_teacache"] = True
         if generator_device:
-            payload["generator_device"] = generator_device
-        if input_reference:
-            payload["input_reference"] = input_reference
-        if output_path:
-            payload["output_path"] = output_path
+            fields["generator_device"] = generator_device
         # merged last so a model-specific field wins over a generic default of
         # the same name (H3 sizes its output from `target`, not `size`)
         if extra_fields:
-            payload.update(extra_fields)
+            fields.update(extra_fields)
+
+        local_reference = (
+            input_reference
+            and not input_reference.startswith(("http://", "https://"))
+            and os.path.exists(input_reference)
+        )
 
         try:
-            # Create video generation job
-            response = requests.post(
-                f"{self.base_url}/videos",
-                json=payload,
-                headers=self.headers,
-                timeout=30,
-            )
+            if local_reference:
+                # Upload the file instead of sending a path: a server on
+                # another machine cannot read this machine's filesystem
+                # (the images endpoint already does this for image_path).
+                with open(input_reference, "rb") as fh:
+                    files = {
+                        "input_reference": (
+                            os.path.basename(input_reference),
+                            fh,
+                            self._get_content_type(input_reference),
+                        )
+                    }
+                    data = {
+                        key: (
+                            value
+                            if isinstance(value, (str, bytes))
+                            else str(value)
+                        )
+                        for key, value in fields.items()
+                    }
+                    response = requests.post(
+                        f"{self.base_url}/videos",
+                        files=files,
+                        data=data,
+                        headers={"Authorization": f"Bearer {self.api_key}"},
+                        timeout=30,
+                    )
+            else:
+                payload = dict(fields)
+                if input_reference:
+                    payload["input_reference"] = input_reference
+                response = requests.post(
+                    f"{self.base_url}/videos",
+                    json=payload,
+                    headers=self.headers,
+                    timeout=30,
+                )
             response.raise_for_status()
             video_job = response.json()
             video_id = video_job.get("id")
@@ -332,7 +367,9 @@ class SGLDiffusionServerAPI:
                     consecutive_errors = 0
 
                     if status.get("status") == "completed":
-                        return status
+                        return self._localize_video_result(
+                            status, video_id, output_path
+                        )
                     elif status.get("status") == "failed":
                         error = status.get("error", {})
                         error_msg = (
@@ -364,6 +401,37 @@ class SGLDiffusionServerAPI:
             )
         except requests.exceptions.RequestException as e:
             raise RuntimeError(f"Failed to generate video: {str(e)}")
+
+    def _localize_video_result(
+        self, status: Dict[str, Any], video_id: str, output_path: Optional[str]
+    ) -> Dict[str, Any]:
+        """Make sure ``file_path`` in a completed job points at a local file.
+
+        The server's own ``file_path`` is only readable when the server runs
+        on this machine. When it isn't (no such local file), download the
+        result through ``GET /videos/{id}/content`` instead of trusting a
+        path that belongs to a different filesystem.
+        """
+        file_path = status.get("file_path")
+        if file_path and os.path.exists(file_path):
+            return status
+        target_dir = output_path or os.getcwd()
+        os.makedirs(target_dir, exist_ok=True)
+        ext = os.path.splitext(file_path or "")[1] or ".mp4"
+        local_path = os.path.join(target_dir, f"{video_id}{ext}")
+        response = requests.get(
+            f"{self.base_url}/videos/{video_id}/content",
+            headers=self.headers,
+            timeout=300,
+            stream=True,
+        )
+        response.raise_for_status()
+        with open(local_path, "wb") as fh:
+            for chunk in response.iter_content(chunk_size=1024 * 1024):
+                fh.write(chunk)
+        status = dict(status)
+        status["file_path"] = local_path
+        return status
 
     def _build_image_common_params(
         self,
