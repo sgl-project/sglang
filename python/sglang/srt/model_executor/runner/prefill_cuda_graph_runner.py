@@ -1964,6 +1964,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # The n-gram hasher runs outside the graph and reads this at replay.
         static_forward_batch.ngram_embedding_info = forward_batch.ngram_embedding_info
         static_forward_batch.engram_history = forward_batch.engram_history
+        static_forward_batch.encoder_swa_replay = forward_batch.encoder_swa_replay
         static_forward_batch = self.model_runner.prepare_dummy_forward_batch(
             static_forward_batch
         )
@@ -2195,6 +2196,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 if output.hidden_states is not None
                 else None
             ),
+            hidden_states_token_indices=output.hidden_states_token_indices,
             input_token_logprobs=output.input_token_logprobs,
             input_top_logprobs_val=output.input_top_logprobs_val,
             input_top_logprobs_idx=output.input_top_logprobs_idx,
