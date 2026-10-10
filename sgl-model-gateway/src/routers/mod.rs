@@ -31,6 +31,7 @@ pub mod mesh;
 pub mod openai;
 pub mod parse;
 pub mod persistence_utils;
+pub mod responses;
 pub mod router_manager;
 pub mod streaming_utils;
 pub mod tokenize;
@@ -124,6 +125,18 @@ pub trait RouterTrait: Send + Sync + Debug {
             "Responses endpoint not implemented",
         )
             .into_response()
+    }
+
+    async fn route_responses_raw(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &responses::ResponsesRequestBody,
+        model_id: Option<&str>,
+    ) -> Response {
+        match body.parse_typed() {
+            Ok(request) => self.route_responses(headers, &request, model_id).await,
+            Err(response) => *response,
+        }
     }
 
     /// Retrieve a stored/background response by id

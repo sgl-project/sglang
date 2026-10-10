@@ -423,11 +423,6 @@ impl PDRouter {
                             Ok(v) => v,
                             Err(e) => return Self::handle_serialization_error(e),
                         };
-                        // ResponsesRequest serializes an absent stream as null, which SRT rejects.
-                        if context.route == "/v1/responses" {
-                            json_request["stream"] = Value::Bool(context.is_stream);
-                        }
-
                         json_request = match Self::inject_bootstrap_into_value(
                             json_request,
                             prefill.as_ref(),
@@ -945,6 +940,50 @@ impl PDRouter {
                 response
             }
         }
+    }
+
+    async fn route_responses_body<T: GenerationRequest + Serialize + Clone>(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &T,
+        background: bool,
+        model_id: Option<&str>,
+    ) -> Response {
+        let is_stream = body.is_stream();
+
+        // Reject detached requests even when workers lack response-store
+        // admission checks: the PD router cannot complete their retrieval /
+        // cancel lifecycle. Attached requests still undergo serving-side
+        // capability validation, including rejection of background streams
+        // when response storage is unavailable.
+        if background && !is_stream {
+            warn!("PD mode does not support detached background responses; returning bad request");
+            return error::bad_request(
+                "pd_unsupported_background_responses",
+                "PD mode does not support background responses without streaming",
+            );
+        }
+
+        let request_text = if self.policies_need_request_text() {
+            let text = body.extract_text_for_routing();
+            (!text.is_empty()).then_some(text)
+        } else {
+            None
+        };
+
+        let context = PDRequestContext {
+            route: "/v1/responses",
+            batch_size: None,
+            is_stream,
+            // The PD logprob merging expects /generate-style meta_info,
+            // which the Responses API schema does not carry.
+            return_logprob: false,
+            request_text,
+            model_id,
+            headers: headers.cloned(),
+        };
+
+        self.execute_dual_dispatch(headers, body, context).await
     }
 
     fn policies_need_request_text(&self) -> bool {
@@ -1666,42 +1705,20 @@ impl RouterTrait for PDRouter {
         body: &ResponsesRequest,
         model_id: Option<&str>,
     ) -> Response {
-        let is_stream = body.is_stream();
+        let mut body = body.clone();
+        body.stream = Some(body.is_stream());
+        self.route_responses_body(headers, &body, body.background.unwrap_or(false), model_id)
+            .await
+    }
 
-        // Reject detached requests even when workers lack response-store
-        // admission checks: the PD router cannot complete their retrieval /
-        // cancel lifecycle. Attached requests still undergo serving-side
-        // capability validation, including rejection of background streams
-        // when response storage is unavailable.
-        if body.background.unwrap_or(false) && !is_stream {
-            warn!("PD mode does not support detached background responses; returning bad request");
-            return error::bad_request(
-                "pd_unsupported_background_responses",
-                "PD mode does not support background responses without streaming",
-            );
-        }
-
-        let request_text = if self.policies_need_request_text() {
-            let text = body.extract_text_for_routing();
-            (!text.is_empty()).then_some(text)
-        } else {
-            None
-        };
-
-        let context = PDRequestContext {
-            route: "/v1/responses",
-            // The Responses API carries one logical response per request.
-            batch_size: None,
-            is_stream,
-            // The PD logprob merging expects /generate-style meta_info,
-            // which the Responses API schema does not carry.
-            return_logprob: false,
-            request_text,
-            model_id,
-            headers: headers.cloned(),
-        };
-
-        self.execute_dual_dispatch(headers, body, context).await
+    async fn route_responses_raw(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &crate::routers::responses::ResponsesRequestBody,
+        model_id: Option<&str>,
+    ) -> Response {
+        self.route_responses_body(headers, body, body.background(), model_id)
+            .await
     }
 
     async fn route_rerank(
