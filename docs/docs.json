@@ -18,6 +18,10 @@
       "destination": "/cookbook/intro"
     },
     {
+      "source": "/cookbook/autoregressive/Perplexity/pplx-decider-v1-27b",
+      "destination": "/cookbook/autoregressive/Perplexity/PPLX-Decider-v1-27B"
+    },
+    {
       "source": "/whl",
       "destination": "https://sgl-project.github.io/whl/",
       "permanent": false
@@ -891,9 +895,9 @@
             "icon": "play",
             "pages": [
               "index",
-              "docs/get-started/install",
               "docs/get-started/quickstart",
-              "docs/basic_usage/send_request"
+              "docs/get-started/install",
+              "docs/get-started/examples"
             ]
           }
         ]
@@ -906,6 +910,7 @@
             "icon": "book-open",
             "pages": [
               "docs/basic_usage/overview",
+              "docs/basic_usage/send_request",
               {
                 "group": "OpenAI-Compatible APIs",
                 "pages": [
@@ -939,6 +944,7 @@
               "docs/advanced_features/structured_outputs_for_reasoning_models",
               "docs/advanced_features/tool_parser",
               "docs/advanced_features/separate_reasoning",
+              "docs/advanced_features/thinking_budget",
               "docs/advanced_features/quantization",
               "docs/advanced_features/quantized_kv_cache",
               "docs/advanced_features/reasoning_aware_compression",
@@ -1026,7 +1032,8 @@
                 "pages": [
                   "docs/developer_guide/development_guide_using_docker",
                   "docs/developer_guide/development_jit_kernel_guide",
-                  "docs/developer_guide/quantization_contribution_guide"
+                  "docs/developer_guide/quantization_contribution_guide",
+                  "docs/developer_guide/layer_boundary"
                 ]
               },
               {
@@ -1218,6 +1225,12 @@
                 "pages": [
                   "cookbook/autoregressive/intro",
                   {
+                    "group": "IQuestLab",
+                    "pages": [
+                      "cookbook/autoregressive/IQuestLab/IQuest-Q1"
+                    ]
+                  },
+                  {
                     "group": "IFM",
                     "pages": [
                       "cookbook/autoregressive/IFM/K2-Horizon"
@@ -1239,6 +1252,13 @@
                     "pages": [
                       "cookbook/autoregressive/ThinkingMachines/Inkling",
                       "cookbook/autoregressive/ThinkingMachines/Inkling-Small"
+                    ]
+                  },
+                  {
+                    "group": "GigaChat",
+                    "pages": [
+                      "cookbook/autoregressive/GigaChat/GigaChat3.5",
+                      "cookbook/autoregressive/GigaChat/GigaChat3.5-Reasoning"
                     ]
                   },
                   {
@@ -1320,6 +1340,7 @@
                     "group": "Google",
                     "pages": [
                       "cookbook/autoregressive/Google/EmbeddingGemma",
+                      "cookbook/autoregressive/Google/EmbeddingGemma2",
                       "cookbook/autoregressive/Google/Gemma4",
                       "cookbook/autoregressive/Google/DiffusionGemma"
                     ]
@@ -1462,6 +1483,19 @@
                       "cookbook/autoregressive/Poolside/Laguna-M.1",
                       "cookbook/autoregressive/Poolside/Laguna-XS.2"
                     ]
+                  },
+                  {
+                    "group": "Perplexity",
+                    "pages": [
+                      "cookbook/autoregressive/Perplexity/PPLX-Decider-v1.1-27B",
+                      "cookbook/autoregressive/Perplexity/PPLX-Decider-v1-27B"
+                    ]
+                  },
+                  {
+                    "group": "Cloudflare",
+                    "pages": [
+                      "cookbook/autoregressive/Cloudflare/clef"
+                    ]
                   }
                 ]
               },
@@ -1489,9 +1523,11 @@
                   },
                   {
                     "group": "Wan",
+                    "tag": "NEW",
                     "pages": [
                       "cookbook/diffusion/Wan/Wan2.1",
-                      "cookbook/diffusion/Wan/Wan2.2"
+                      "cookbook/diffusion/Wan/Wan2.2",
+                      "cookbook/diffusion/Wan/Wan-Animate-2"
                     ]
                   },
                   {
@@ -1502,7 +1538,6 @@
                   },
                   {
                     "group": "LTX",
-                    "tag": "NEW",
                     "pages": [
                       "cookbook/diffusion/LTX/LTX2 & LTX2.3",
                       "cookbook/diffusion/LTX/LTX2.5"
@@ -1530,14 +1565,12 @@
                   },
                   {
                     "group": "SenseNova",
-                    "tag": "NEW",
                     "pages": [
                       "cookbook/diffusion/SenseNova/SenseNova-U1.5-8B-MoT"
                     ]
                   },
                   {
                     "group": "LongCat-Image",
-                    "tag": "NEW",
                     "pages": [
                       "cookbook/diffusion/LongCat/LongCat-Image"
                     ]
@@ -1574,21 +1607,26 @@
                   },
                   {
                     "group": "SANA Video",
-                    "tag": "NEW",
                     "pages": [
                       "cookbook/diffusion/SANA-Video/SANA-Video"
                     ]
                   },
                   {
                     "group": "MiniMax",
-                    "tag": "NEW",
                     "pages": [
                       "cookbook/diffusion/MiniMax/MiniMax-H3"
                     ]
                   },
                   {
-                    "group": "LingBot Video",
+                    "group": "Kandinsky",
                     "tag": "NEW",
+                    "pages": [
+                      "cookbook/diffusion/Kandinsky/Kandinsky6",
+                      "cookbook/diffusion/Kandinsky/Kandinsky6-SR"
+                    ]
+                  },
+                  {
+                    "group": "LingBot Video",
                     "pages": [
                       "cookbook/diffusion/LingBot-Video/LingBot-Video-MoE"
                     ]
@@ -1617,6 +1655,13 @@
                     "tag": "NEW",
                     "pages": [
                       "cookbook/vla/OpenPI/Pi0.5"
+                    ]
+                  },
+                  {
+                    "group": "FLUX",
+                    "tag": "NEW",
+                    "pages": [
+                      "cookbook/vla/FLUX/FLUX-3-Action"
                     ]
                   }
                 ]
