@@ -1,4 +1,4 @@
-//! Tokenizer loading and encoding over Dynamo tokenizers.
+//! Tokenizer loading, encoding and decoding over Dynamo tokenizers.
 
 use crate::ProcessorError as Error;
 use crate::model_files::resolve_tokenizer_file;
@@ -18,6 +18,13 @@ pub trait TextTokenizer: Send + Sync {
             .map(|segment| segment.text)
             .collect::<String>();
         self.encode(&text, add_special_tokens)
+    }
+
+    /// Decode token IDs back to text. Encode-only backends keep the default.
+    fn decode(&self, _token_ids: &[u32], _skip_special_tokens: bool) -> Result<String, Error> {
+        Err(Error::Internal(
+            "the configured tokenizer does not support decoding".into(),
+        ))
     }
 }
 
@@ -100,5 +107,13 @@ impl TextTokenizer for DynamoTokenizer {
         .encode_segments(segments)
         .map_err(|error| Error::Tokenize(error.to_string()))?;
         Ok(encoding.token_ids().iter().map(|&id| id as i32).collect())
+    }
+
+    fn decode(&self, token_ids: &[u32], skip_special_tokens: bool) -> Result<String, Error> {
+        // `add_special_tokens` only affects encoding, so either handle decodes.
+        self.without_specials
+            .decode(token_ids, skip_special_tokens)
+            .map(String::from)
+            .map_err(|error| Error::InvalidRequest(format!("Error decoding tokens: {error}")))
     }
 }
