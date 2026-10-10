@@ -30,6 +30,23 @@ def test_single_backend_resolves_without_backend():
     )
 
 
+@pytest.mark.parametrize(
+    "platform, eligible",
+    [
+        (_CPU, False),
+        (_HIP, False),
+        (PlatformInfo(device_type="cuda", cuda_arch_major=8, cuda_arch_minor=0), False),
+        (PlatformInfo(device_type="cuda", cuda_arch_major=8, cuda_arch_minor=9), True),
+        (_SM90, True),
+        (PlatformInfo(device_type="cuda", cuda_arch_major=12, cuda_arch_minor=0), True),
+    ],
+)
+def test_fp8_store_registry_requires_native_e4m3(platform, eligible):
+    # Triton's CUDA compiler admits native E4M3 only from SM89 onward.
+    spec = K.select_kernel("kvcache.store_cache_fp8")
+    assert K.capabilities_satisfied(spec.capabilities, platform) is eligible
+
+
 def test_fp8_scaled_mm_requires_explicit_registry_backend(monkeypatch):
     monkeypatch.setattr(sel, "_platform", lambda: _SM90)
     with pytest.raises(ValueError, match="multiple backends"):
