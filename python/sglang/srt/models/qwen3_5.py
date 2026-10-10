@@ -161,8 +161,8 @@ _is_cpu = is_cpu()
 _is_gfx95 = is_gfx95_supported()
 _is_hip = is_hip()
 _QWEN3_5_MOE_TEXT_MODEL_TYPES = ("qwen3_5_moe_text", "qwen4_exp_text")
-# qwen4_exp shares these classes, but the ROCm packed path is Qwen3.5-only.
-_QWEN3_5_ROCM_PACKED_MODEL_TYPES = ("qwen3_5_text", "qwen3_5_moe_text")
+# qwen4_exp shares these classes but packs at load; the capture hook packs only these.
+_QWEN3_5_PACKED_MODEL_TYPES = ("qwen3_5_text", "qwen3_5_moe_text")
 _is_xpu = is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 if _use_aiter:
@@ -676,10 +676,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         """
         if not (_is_cuda or _use_aiter) or self._fused_in_proj_weight is not None:
             return
-        if (
-            _use_aiter
-            and self.config.model_type not in _QWEN3_5_ROCM_PACKED_MODEL_TYPES
-        ):
+        if _use_aiter and self.config.model_type not in _QWEN3_5_PACKED_MODEL_TYPES:
             return
         if get_lora().enable_lora or get_lora().lora_paths:
             # LoRA wraps the individual Linear modules; the fused GEMM would
@@ -698,6 +695,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             and qkvz.bias is None
             and ba.bias is None
         ):
+            return
+        if not _use_aiter and (qkvz.weight.shape[0] + ba.weight.shape[0]) % 8:
+            # cuBLAS picks slower kernels for BF16 output rows that are not 16-byte
+            # aligned; such a packed GEMM (e.g. Qwen3.5-0.8B, 2B, 27B at TP 8) is
+            # slower than the two separate ones.
             return
         fused = torch.cat([qkvz.weight.data, ba.weight.data], dim=0).contiguous()
         self._fused_in_proj_qkvz_width = qkvz.weight.shape[0]
@@ -1813,7 +1815,9 @@ class Qwen3_5ForCausalLM(nn.Module):
         return self.embed_tokens
 
     def prepare_before_cuda_graph_capture(self, model_runner) -> None:
-        if _use_aiter and self.config.model_type in _QWEN3_5_ROCM_PACKED_MODEL_TYPES:
+        if (_is_cuda or _use_aiter) and (
+            self.config.model_type in _QWEN3_5_PACKED_MODEL_TYPES
+        ):
             packed = 0
             for module in self.modules():
                 if isinstance(module, Qwen3_5GatedDeltaNet):
@@ -2346,6 +2350,9 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
     def get_hidden_dim(self, module_name: str, layer_idx: int):
         return self.model.get_hidden_dim(module_name, layer_idx)
+
+    def prepare_before_cuda_graph_capture(self, model_runner) -> None:
+        self.model.prepare_before_cuda_graph_capture(model_runner)
 
     def should_apply_lora(self, module_name: str) -> bool:
         return module_name.startswith("model.layers.")
