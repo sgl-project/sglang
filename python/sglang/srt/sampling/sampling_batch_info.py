@@ -70,6 +70,9 @@ class SamplingBatchInfo:
 
     # Masking tensors for grammar-guided structured outputs
     vocab_size: int
+    # Largest bounded top-k from host request metadata. TOP_K_ALL is excluded so
+    # mixed batches do not force a full-vocabulary device selection.
+    max_top_k: int = 0
     grammars: Optional[List[Optional[BaseGrammarObject]]] = None
     rids_int: Optional[torch.Tensor] = None
     bootstrap_room_ids_int: Optional[torch.Tensor] = None
@@ -189,6 +192,14 @@ class SamplingBatchInfo:
             and any(r.custom_logit_processor for r in reqs)  # check the flag first.
         )  # then check the requests.
         return_sampling_masks = [r.return_sampling_mask for r in reqs]
+        max_top_k = max(
+            (
+                r.sampling_params.top_k
+                for r in reqs
+                if r.sampling_params.top_k != TOP_K_ALL
+            ),
+            default=0,
+        )
         return_sampling_support_logprobs = [
             r.return_sampling_mask and r.sampling_logprobs_mode == "support"
             for r in reqs
@@ -264,6 +275,7 @@ class SamplingBatchInfo:
                 1 <= r.sampling_params.top_k <= 1024 for r in reqs
             ),
             vocab_size=vocab_size,
+            max_top_k=max_top_k,
             penalizer_orchestrator=penalizer_orchestrator,
             has_custom_logit_processor=has_custom_logit_processor,
             custom_params=custom_params,
@@ -571,6 +583,7 @@ class SamplingBatchInfo:
         self.need_top_p_sampling |= other.need_top_p_sampling
         self.need_top_k_sampling |= other.need_top_k_sampling
         self.need_min_p_sampling |= other.need_min_p_sampling
+        self.max_top_k = max(self.max_top_k, other.max_top_k)
         self.npu_top_k_top_p_eligible &= other.npu_top_k_top_p_eligible
 
         self.adjusted_merge_batch(other)

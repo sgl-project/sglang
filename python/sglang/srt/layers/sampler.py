@@ -8,6 +8,7 @@ from torch import nn
 
 from sglang.kernels.ops.sampling import softmax as sampler_softmax
 from sglang.kernels.ops.sampling.murmur_hash import murmur_hash32
+from sglang.kernels.ops.sampling.renorm import top_p_renorm_probs_torch
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
@@ -958,12 +959,7 @@ def top_p_normalize_probs_torch(
     probs: torch.Tensor,
     top_ps: torch.Tensor,
 ):
-    # See also top_k_top_p_min_p_sampling_from_probs_torch
-    probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
-    probs_sum = torch.cumsum(probs_sort, dim=-1)
-    probs_sort[(probs_sum - probs_sort) > top_ps.view(-1, 1)] = 0.0
-    probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
-    return torch.zeros_like(probs_sort).scatter_(-1, probs_idx, probs_sort)
+    return top_p_renorm_probs_torch(probs, top_ps)
 
 
 def apply_custom_logit_processor(

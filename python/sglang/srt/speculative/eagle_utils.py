@@ -9,9 +9,16 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 import torch
 
 from sglang.kernels.ops.sampling import softmax as sampling_softmax
+from sglang.kernels.ops.sampling import (
+    top_k_renorm_probs,
+    top_p_renorm_probs,
+)
 from sglang.kernels.ops.speculative.spec_tree import (
     sgl_build_tree_kernel_efficient_triton,
     verify_tree_greedy_kernel_triton,
+)
+from sglang.kernels.ops.speculative.tree_sampling import (
+    tree_speculative_sampling_target_only_triton,
 )
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_build_dsv4_verify_bundle,
@@ -345,6 +352,36 @@ def sgl_build_tree_kernel_triton(
         ),
         selected_index_stride=selected_index.stride(0),
     )
+
+
+def _get_spec_sampling_verify_fn(
+    use_rejection_sampling: bool,
+    use_block_verification: bool = False,
+):
+    if use_rejection_sampling:
+        from sglang.kernels.ops.speculative.reject_sampling import (
+            chain_speculative_sampling_triton,
+        )
+
+        if use_block_verification:
+            return partial(chain_speculative_sampling_triton, block_verification=True)
+        return chain_speculative_sampling_triton
+    if _is_hip:
+        return tree_speculative_sampling_target_only_triton
+    if _is_cuda:
+        from sglang.kernels.ops.speculative.sampling import (
+            tree_speculative_sampling_target_only,
+        )
+
+        return tree_speculative_sampling_target_only
+    if _is_npu:
+        from sgl_kernel_npu.sample import tree_speculative_sampling_target_only
+
+        return tree_speculative_sampling_target_only
+
+    from sgl_kernel import tree_speculative_sampling_target_only
+
+    return tree_speculative_sampling_target_only
 
 
 def verify_tree_greedy_triton(
@@ -709,12 +746,10 @@ def _verify_uses_greedy(
 ) -> bool:
     """Whether EAGLE verify must commit argmax instead of taking the sampling path.
 
-    HIP has no CUDA/MUSA sampling-verify kernels, so it used to be listed here
-    unconditionally. Rejection sampling routes it through the pure-Triton chain
-    sampler instead, so only a HIP run without that still has to go greedy. Every
-    other platform reduces to the original predicate.
+    HIP uses the portable target-only or rejection-sampling Triton verifier, so
+    non-greedy requests stay on the sampling path.
     """
-    return is_all_greedy or is_cpu or is_xpu or (is_hip and not use_rejection_sampling)
+    return is_all_greedy or is_cpu or is_xpu
 
 
 def _can_use_sparse_uno_tree_target_sampling(
@@ -884,47 +919,10 @@ def eagle_sample(
             tp_group.broadcast(accept_index, src=0)
             tp_group.broadcast(num_correct_drafts, src=0)
     else:
-        if _is_npu:
-            from sgl_kernel_npu.sample import (
-                chain_speculative_sampling_triton,
-                top_k_renorm_prob,
-                top_p_renorm_prob,
-                tree_speculative_sampling_target_only,
-            )
-        else:
-            from sglang.kernels.ops.speculative.reject_sampling import (
-                chain_speculative_sampling_triton,
-            )
-
-        # if/else, not a ternary: the CUDA-only name still has to resolve in the
-        # branch not taken, and HIP only reaches here with rejection sampling on.
-        if use_rejection_sampling:
-            sampling_fn = chain_speculative_sampling_triton
-            if get_spec().speculative_use_block_verification:
-                sampling_fn = partial(sampling_fn, block_verification=True)
-        else:
-            if _is_cuda:
-                from sglang.kernels.ops.speculative.sampling import (
-                    tree_speculative_sampling_target_only,
-                )
-            elif not _is_npu:
-                from sgl_kernel import tree_speculative_sampling_target_only
-
-            sampling_fn = tree_speculative_sampling_target_only
-
-        if _is_hip:
-            # Same names, same contract: dflash_utils.py aliases these too.
-            from sglang.kernels.ops.sampling.renorm_triton import (
-                top_k_renorm_probs_triton as top_k_renorm_prob,
-            )
-            from sglang.kernels.ops.sampling.renorm_triton import (
-                top_p_renorm_probs_triton as top_p_renorm_prob,
-            )
-        elif _is_cuda:
-            from flashinfer.sampling import top_k_renorm_probs as top_k_renorm_prob
-            from flashinfer.sampling import top_p_renorm_probs as top_p_renorm_prob
-        elif not _is_npu:
-            from sgl_kernel import top_k_renorm_prob, top_p_renorm_prob
+        sampling_fn = _get_spec_sampling_verify_fn(
+            use_rejection_sampling,
+            get_spec().speculative_use_block_verification,
+        )
 
         expanded_temperature = torch.repeat_interleave(
             sampling_info.temperatures, verify_input.draft_token_num, dim=0
@@ -935,15 +933,16 @@ def eagle_sample(
         )  # (bs * num_draft_tokens, vocab_size)
         maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
         if sampling_info.need_top_k_sampling:
-            target_probs = top_k_renorm_prob(
+            target_probs = top_k_renorm_probs(
                 target_probs,
                 torch.repeat_interleave(
                     sampling_info.top_ks, verify_input.draft_token_num, dim=0
                 ),
+                max_top_k=sampling_info.max_top_k,
             )  # (bs * num_draft_tokens, vocab_size)
             maybe_detect_nan(target_probs, "v2 verify: target_probs after top_k_renorm")
         if sampling_info.need_top_p_sampling:
-            target_probs = top_p_renorm_prob(
+            target_probs = top_p_renorm_probs(
                 target_probs,
                 torch.repeat_interleave(
                     sampling_info.top_ps, verify_input.draft_token_num, dim=0
