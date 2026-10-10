@@ -68,10 +68,11 @@ if TYPE_CHECKING:
     # copy-engine all-to-all for Ulysses groups of any size on one host; off by
     # default while it is validated. Falls back to NCCL when unavailable.
     SGLANG_DIFFUSION_IPC_A2A_MULTI: bool = False
-    # head groups for pipelining MiniMax-H3's Ulysses exchange against dense
-    # attention over the copy-engine transport: -1 picks a count that divides
-    # the heads per rank and steps aside when its buffers do not fit, 0 or 1
-    # keeps the sequential exchange, N >= 2 forces N groups
+    # head groups for pipelining the Ulysses exchange against dense attention
+    # over the copy-engine transport (MiniMax-H3, and USPAttention's plain path):
+    # -1 picks the most groups that divide the heads per rank while each group's
+    # call still fills the GPU, and steps aside when the buffers do not fit; 0 or
+    # 1 keeps the sequential exchange; N >= 2 forces N groups
     SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS: int = -1
     # a deadlock backstop, not a per-step budget: a rank can legitimately stall
     # for seconds (layerwise offload, wan2.2 expert-tower swaps), and expiry now

@@ -1,5 +1,6 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
+import contextlib
 import logging
 import math
 from typing import TYPE_CHECKING
@@ -28,6 +29,25 @@ logger = logging.getLogger(__name__)
 
 
 _A2A_STAGING_BUFFERS: dict[tuple[str, torch.dtype, int], torch.Tensor] = {}
+# depth of open uncached_a2a_staging() blocks
+_UNCACHED_STAGING = 0
+
+
+@contextlib.contextmanager
+def uncached_a2a_staging():
+    """Run the Ulysses exchanges inside the block over NCCL on per-call buffers.
+
+    For a one-off exchange the steady state never repeats (the pipelined
+    attention's first-sight reference): the staging cache and the IPC
+    transports' staging pairs would otherwise stay allocated at its size. An
+    all-to-all is a permutation, so the transport never changes its bytes.
+    """
+    global _UNCACHED_STAGING
+    _UNCACHED_STAGING += 1
+    try:
+        yield
+    finally:
+        _UNCACHED_STAGING -= 1
 
 
 def drop_a2a_staging_buffers() -> None:
@@ -59,7 +79,8 @@ def _a2a_staging_buffer(
     not be shared with eager replays.
     """
     if (
-        torch.is_grad_enabled()
+        _UNCACHED_STAGING
+        or torch.is_grad_enabled()
         or torch.compiler.is_compiling()
         or device.type != "cuda"
         or torch.cuda.is_current_stream_capturing()
@@ -88,7 +109,7 @@ def _usp_all_to_all_single(x: torch.Tensor, role: str | None = None) -> torch.Te
     assert ulysses_pg is not None, "Ulysses process group is not initialized."
     x_shape = x.shape
     x = x.flatten().contiguous()
-    if x.is_cuda:
+    if x.is_cuda and not _UNCACHED_STAGING:
         from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a_multi import (
             IPC_A2A_MULTI,
             ipc_a2a_multi_ready,
@@ -148,6 +169,8 @@ def _ipc_ready_group():
         ipc_a2a_ready,
     )
 
+    if _UNCACHED_STAGING:
+        return None
     group = get_sp_group().ulysses_group
     return group if ipc_a2a_ready(group) else None
 
