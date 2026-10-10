@@ -96,6 +96,7 @@ class NPUMoEInitRouting_v2(BaseInitRouting):
         topk_ids: torch.Tensor,
         num_experts: int,
         top_k: int,
+        active_expert_range: Optional[Tuple[int, int]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         num_tokens = hidden_states.shape[0]
         hidden_states, expanded_row_idx, expert_tokens, pertoken_scale = (
@@ -106,7 +107,11 @@ class NPUMoEInitRouting_v2(BaseInitRouting):
                 expert_num=num_experts,
                 expert_tokens_num_type=1,
                 expert_tokens_num_flag=True,
-                active_expert_range=[0, num_experts],
+                active_expert_range=(
+                    list(active_expert_range)
+                    if active_expert_range is not None
+                    else [0, num_experts]
+                ),
                 quant_mode=self.quant_mode,
             )
         )

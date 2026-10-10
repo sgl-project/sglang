@@ -72,9 +72,9 @@ def should_run_flashinfer_autotune(
             get_spec().speculative_moe_runner_backend
             or get_exec().moe.moe_runner_backend
         )
-        a2a_backend_str = (
-            get_spec().speculative_moe_a2a_backend or get_exec().moe.moe_a2a_backend
-        )
+        a2a_backend_str = get_spec().speculative_moe_a2a_backend
+        if a2a_backend_str in (None, "none"):
+            a2a_backend_str = get_exec().moe.moe_a2a_backend
     else:
         backend_str = get_exec().moe.moe_runner_backend
         a2a_backend_str = get_exec().moe.moe_a2a_backend
