@@ -1713,13 +1713,19 @@ class QwenSparseAttnBackend(AttentionBackend):
             batch, pages_per_row, page, device
         )
         capacity_rows = self._cuda_graph_max_tokens if metadata.is_cuda_graph else batch
-        # Gather into the query dtype: an FP8 pool is dequantized on the way in, so the
-        # paged kernel always runs the bf16 q + bf16 KV path.
+        # TRTLLM-gen has a BF16-query + FP8-E4M3-KV path. Preserve an FP8 pool
+        # in the packed scratch instead of expanding it to BF16 while gathering.
+        # BF16 pools and the FA2/FA4 fallback keep their existing dtype behavior.
+        packed_dtype = (
+            k_buffer.dtype
+            if k_buffer.dtype == torch.float8_e4m3fn
+            else q.dtype
+        )
         packed_k, packed_v = self._get_fa2_scratch(
             max(capacity_rows, batch) * stride,
             k_buffer.shape[1],
             k_buffer.shape[2],
-            q.dtype,
+            packed_dtype,
             k_buffer.device,
         )
         if new_kv is not None:

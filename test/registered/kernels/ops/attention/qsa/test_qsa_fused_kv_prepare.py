@@ -18,7 +18,11 @@ register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-l
 @pytest.mark.parametrize("width", [1, 4])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("padding", [False, True])
-def test_fused_kv_prepare(requests, width, dtype, padding):
+@pytest.mark.parametrize("packed_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_fused_kv_prepare(requests, width, dtype, padding, packed_dtype):
+    if dtype == torch.bfloat16 and packed_dtype == torch.float8_e4m3fn:
+        pytest.skip("FP8 packed scratch is used only with an FP8 KV pool")
+
     torch.manual_seed(23)
     rows, heads, dim, length, topk, stride = requests * width, 2, 256, 4096, 2051, 2112
     mapping = (torch.randperm(requests * length, device="cuda") + 1).view(
@@ -47,7 +51,7 @@ def test_fused_kv_prepare(requests, width, dtype, padding):
     kc = torch.randn(requests * length + 1, heads, dim, device="cuda").to(dtype)
     vc = torch.randn_like(kc.float()).to(dtype)
     counts = torch.empty(rows, device="cuda", dtype=torch.int32)
-    ok = torch.empty(rows * stride, heads, dim, device="cuda", dtype=torch.bfloat16)
+    ok = torch.empty(rows * stride, heads, dim, device="cuda", dtype=packed_dtype)
     ov = torch.empty_like(ok)
     cu = torch.arange(rows + 1, device="cuda", dtype=torch.int32) * stride
     store_cache(
