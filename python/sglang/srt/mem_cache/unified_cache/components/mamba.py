@@ -11,6 +11,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     IncLockRefResult,
     InsertParams,
     InsertResult,
+    MambaCowAllocError,
     MatchPrefixParams,
     MatchResult,
 )
@@ -213,7 +214,8 @@ class MambaComponent(TreeComponent):
                 self.cache.dec_lock_ref(
                     result.best_match_node, lock_result.to_dec_params()
                 )
-                assert dst_index is not None, "Can not alloc mamba cache"
+                if dst_index is None:
+                    raise MambaCowAllocError("Can not alloc mamba cache")
             req.kv.mamba_pool_idx = dst_index[0]
         req.kv.mamba_cow_src_index = src_index
         req.kv.mamba_needs_clear = False
