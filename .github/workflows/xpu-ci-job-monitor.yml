@@ -127,9 +127,9 @@ jobs:
         id: parse
         run: |
           # Parse pr-test-xpu.yml and extract job names (exclude utility jobs)
-          # Excluded: check-changes, pr-gate, wait-for-stage-a, finish
+          # Excluded: check-changes, pr-gate, finish
           pr_jobs=$(yq -r '.jobs | keys | .[]' .github/workflows/pr-test-xpu.yml | \
-            grep -v -E '^(check-changes|pr-gate|wait-for-stage-a|finish)$' | \
+            grep -v -E '^(check-changes|pr-gate|finish)$' | \
             jq -R -s -c 'split("\n") | map(select(length > 0))')
           echo "pr_jobs=$pr_jobs" >> $GITHUB_OUTPUT
           echo "PR jobs: $pr_jobs"
@@ -446,7 +446,7 @@ jobs:
         if: steps.source-run.outputs.run_id != ''
         uses: actions/download-artifact@v4
         with:
-          pattern: nightly-xpu-*-metrics
+          pattern: nightly-xpu-kernel-main-*-metrics
           path: metrics/
           run-id: ${{ steps.source-run.outputs.run_id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -465,13 +465,13 @@ jobs:
           import os
 
           SUITES = [
-              ("1x", "nightly-xpu-1-gpu-metrics"),
-              ("2x", "nightly-xpu-2-gpu-metrics"),
-              ("4x", "nightly-xpu-4-gpu-metrics"),
+              ("1x", "nightly-xpu-kernel-main-1-gpu-metrics"),
+              ("2x", "nightly-xpu-kernel-main-2-gpu-metrics"),
+              ("4x", "nightly-xpu-kernel-main-4-gpu-metrics"),
               # 8x is here for future readiness. Until nightly-test-intel.yml
               # adds an 8-GPU suite + upload step, its artifact directory is
               # missing and the section renders "No metrics recorded".
-              ("8x", "nightly-xpu-8-gpu-metrics"),
+              ("8x", "nightly-xpu-kernel-main-8-gpu-metrics"),
           ]
 
           def load(subdir: str):

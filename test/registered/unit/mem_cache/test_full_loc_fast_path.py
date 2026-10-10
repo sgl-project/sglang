@@ -30,10 +30,10 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
-def _loc_info(virtual_loc, swa_phys=None, full_phys=None):
+def _loc_info(virtual_loc, swa_phys=None, full_phys=None, physical=False):
     from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 
-    return KVWriteLoc(virtual_loc, swa_phys, full_phys)
+    return KVWriteLoc(virtual_loc, swa_phys, full_phys, physical=physical)
 
 
 class _RecordingPool:
@@ -41,9 +41,17 @@ class _RecordingPool:
 
     def __init__(self):
         self.calls = []
+        self.physical = []
 
-    def set_kv_buffer(self, layer, loc, cache_k, cache_v, *args, **kwargs):
+    def set_kv_buffer(self, layer, loc_info, cache_k, cache_v, *args, **kwargs):
+        from sglang.srt.mem_cache.memory_pool import (
+            unwrap_write_loc,
+            write_loc_is_physical,
+        )
+
+        loc, _, _ = unwrap_write_loc(loc_info)
         self.calls.append((loc, kwargs))
+        self.physical.append(write_loc_is_physical(loc_info))
 
 
 class TestUnifiedSWARouting(unittest.TestCase):
@@ -88,7 +96,7 @@ class TestUnifiedSWARouting(unittest.TestCase):
     def test_full_layer_falls_back_to_generic_loc(self):
         """Bug regression: a 2-arg `KVWriteLoc(loc, swa)` with no explicit
         `full_loc` must fall back to the rebound `loc` -- which IS the full-side
-        kernel-facing id -- instead of failing the full-layer door."""
+        physical id -- instead of failing the full-layer door."""
         pool = self._make_bare_pool()
         rebound_loc = torch.tensor([10, 11, 12], dtype=torch.int64)
         swa_phys = torch.tensor([1, 2, 0], dtype=torch.int64)
@@ -152,7 +160,7 @@ class TestUnifiedSWATombstoneClamp(unittest.TestCase):
     buffer base.
     """
 
-    def _make_bare_pool(self, page_size, v2p, multiplier=1):
+    def _make_bare_pool(self, page_size, v2p):
         from sglang.srt.mem_cache.allocator.unified_sub_pool import MultiEndedAllocator
         from sglang.srt.mem_cache.unified_memory_pool import UnifiedSWAKVPool
 
@@ -164,23 +172,21 @@ class TestUnifiedSWATombstoneClamp(unittest.TestCase):
         swa_allocator.page_size = page_size
         swa_allocator.pool_page_size = page_size
         swa_allocator.virtual_to_physical = v2p
-        swa_allocator.kernel_page_multiplier = multiplier
         pool = object.__new__(UnifiedSWAKVPool)
         pool._swa_allocator = swa_allocator
         return pool
 
     def test_tombstoned_id_lands_on_sink(self):
-        for ps, mult in ((1, 1), (4, 1), (4, 6)):
+        for ps in (1, 4):
             v2p = torch.tensor([0, -1, 2], dtype=torch.int64)
-            pool = self._make_bare_pool(ps, v2p, multiplier=mult)
+            pool = self._make_bare_pool(ps, v2p)
             # Virtual ids covering the tombstoned page (index 1) and a live one.
             kv_indices = torch.tensor([0, ps, 2 * ps], dtype=torch.int64)
             out = pool.translate_loc_from_full_to_swa(kv_indices)
             self.assertEqual(out.dtype, torch.int64)
             self.assertTrue(
                 bool((out >= 0).all().item()),
-                f"tombstoned swa id stayed negative at page_size={ps}, "
-                f"multiplier={mult}: {out}",
+                f"tombstoned swa id stayed negative at page_size={ps}: {out}",
             )
             self.assertEqual(int(out[1].item()), 0)
 
@@ -230,6 +236,23 @@ class TestHybridLinearFullLocRouting(unittest.TestCase):
                         self.assertIs(forwarded, loc)
                     self.assertNotIn("already_physical", kwargs)
 
+    def test_forwards_the_physical_mark(self):
+        # The sub-pool decides on the mark, so the composite must pass it
+        # through unchanged either way.
+        for physical in (True, False):
+            pool = self._make_bare_pool(use_mla=False)
+            pool.set_kv_buffer(
+                types.SimpleNamespace(layer_id=0),
+                _loc_info(
+                    torch.tensor([1, 2]),
+                    full_phys=torch.tensor([5, 6]),
+                    physical=physical,
+                ),
+                torch.zeros(2, 4, 8),
+                torch.zeros(2, 4, 8),
+            )
+            self.assertEqual(pool.full_kv_pool.physical, [physical])
+
 
 class _RecordingMLAPool(_RecordingPool):
     """Also records the model-level MLA write entry point."""
@@ -244,7 +267,7 @@ class _RecordingMLAPool(_RecordingPool):
 
 class TestHybridLinearMLARouting(unittest.TestCase):
     """MLA-side door contract of `HybridLinearKVPool`: `set_mla_kv_buffer`
-    forwards `loc` untouched -- writes are kernel-facing since the ForwardBatch
+    forwards `loc` untouched -- writes are physical since the ForwardBatch
     rebind."""
 
     def _make_bare_pool(self):
@@ -257,9 +280,9 @@ class TestHybridLinearMLARouting(unittest.TestCase):
         return pool
 
     def test_set_mla_kv_buffer_door_never_translates(self):
-        """The translate happens exactly once, at ForwardBatch construction
-        (`rebind_write_loc`); a door that translated again would
-        double-translate every unified MLA write."""
+        """The translate happens exactly once, in the iteration's plan
+        (`KVLocPlan`); a door that translated again would double-translate
+        every unified MLA write."""
         pool = self._make_bare_pool()
         loc = torch.tensor([107, 108, 109], dtype=torch.int64)
         layer = types.SimpleNamespace(layer_id=0)
@@ -297,7 +320,6 @@ class TestMlaWriteDoorsUnderDcp(unittest.TestCase):
         pool = object.__new__(MLATokenToKVPool)
         pool.size = 64
         pool.page_size = 1
-        pool.kernel_page_blocks = 1
         pool.start_layer = 0
         pool.dtype = torch.float16
         pool.store_dtype = torch.float16

@@ -21,13 +21,6 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
 from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
     ModelDeploymentConfig,
 )
-from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
-    AttentionRequirements,
-)
-from sglang.multimodal_gen.runtime.layers.attention.selector import (
-    get_attn_backend,
-    get_global_forced_attn_backend,
-)
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
     LAYERWISE_OFFLOAD,
 )
@@ -64,6 +57,8 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
     vae_precision: str = "fp32"
     vae_decode_precision: str = "fp16"
     audio_vae_precision: str = "fp32"
+    # Default VSA-H3 sparsity; --attention-backend-config VSA_sparsity overrides.
+    vsa_sparsity: float = 0.9
     text_encoder_configs: tuple[MiniMaxH3Qwen3VLConfig, ...] = field(
         default_factory=lambda: (MiniMaxH3Qwen3VLConfig(),)
     )
@@ -75,15 +70,8 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
     output_audio_channels: int | None = 2
     output_av_drift_tolerance_s: float | None = 0.25
 
-    def accepts_audio_input(self) -> bool:
-        return True
-
     def supports_disaggregation(self) -> bool:
         return False
-
-    @property
-    def requires_audio_output(self) -> bool:
-        return True
 
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
         return ModelDeploymentConfig(
@@ -108,6 +96,10 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
         self, server_args
     ) -> AttentionBackendEnum | None:
         """Resolve the H3 DiT backend using the selector's precedence."""
+        from sglang.multimodal_gen.runtime.layers.attention.selector import (
+            get_global_forced_attn_backend,
+        )
+
         selected_backend = get_global_forced_attn_backend()
         if selected_backend is None:
             selected_backend, _ = server_args.resolve_component_attention_backend(
@@ -163,6 +155,7 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
             "is_dit_layerwise_offload_selected": (
                 server_args.is_dit_layerwise_offload_selected
             ),
+            "lora_path": server_args.lora_path,
             "model_variant": model_variant,
             "num_gpus": server_args.num_gpus,
             "performance_mode": server_args.performance_mode,
@@ -173,6 +166,7 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
             "ring_degree": server_args.ring_degree,
             "sp_degree": server_args.sp_degree,
             "tp_size": server_args.tp_size,
+            "transformer_weights_path": server_args.transformer_weights_path,
             "ulysses_degree": server_args.ulysses_degree,
             "use_fsdp_inference": server_args.use_fsdp_inference,
         }
@@ -186,6 +180,7 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
             "enable_breakable_cuda_graph": False,
             "enable_torch_compile": False,
             "is_dit_layerwise_offload_selected": False,
+            "lora_path": None,
             "model_variant": "fl2va",
             "num_gpus": 4,
             "performance_mode": "speed",
@@ -196,6 +191,7 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
             "ring_degree": 1,
             "sp_degree": 4,
             "tp_size": 1,
+            "transformer_weights_path": None,
             "ulysses_degree": 4,
             "use_fsdp_inference": False,
         }
@@ -260,6 +256,39 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
             )
         if selected_backend is None:
             return
+        if selected_backend is AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN:
+            attention_config = server_args.attention_backend_config or {}
+            compute_mode = str(attention_config.get("compute_mode", "bf16"))
+            if compute_mode not in ("bf16", "sage_fp8"):
+                raise ValueError(
+                    "SubBlock compute_mode must be 'bf16' or 'sage_fp8', got "
+                    f"{compute_mode!r}."
+                )
+            if compute_mode == "sage_fp8":
+                capability = current_platform.get_device_capability()
+                if capability is None or capability.to_int() not in (90, 120):
+                    found = (
+                        capability.as_version_str()
+                        if capability is not None
+                        else "unknown"
+                    )
+                    raise ValueError(
+                        "MiniMax-H3 SubBlock compute_mode='sage_fp8' currently "
+                        "requires SM90 or SM120 (compute capability 9.0 or 12.0); "
+                        f"found {found}."
+                    )
+                if capability.to_int() == 90:
+                    from sglang.kernels.ops.attention.subblock_sage_fp8_sm90 import (
+                        _load_sparge_attention_sm90_ops,
+                    )
+
+                    _load_sparge_attention_sm90_ops()
+                else:
+                    from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse_attn import (
+                        _load_sm120_sage_ops,
+                    )
+
+                    _load_sm120_sage_ops()
         if selected_backend is AttentionBackendEnum.VIDEO_SPARSE_ATTN_H3:
             if server_args.ring_degree > 1:
                 raise ValueError(
@@ -275,6 +304,13 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
                     "validated under torch.compile or the breakable CUDA "
                     "graph; disable them or use --attention-backend fa."
                 )
+        from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
+            AttentionRequirements,
+        )
+        from sglang.multimodal_gen.runtime.layers.attention.selector import (
+            get_attn_backend,
+        )
+
         get_attn_backend(
             self.dit_config.arch_config.attention_head_dim,
             torch.bfloat16,
@@ -296,16 +332,20 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
 
 @dataclass
 class FastH3PipelineConfig(MiniMaxH3PipelineConfig):
-    """FastH3: 4-step VSA-distilled MiniMax-H3, t2va only."""
+    """FastH3 8-Step V2: VSA-distilled MiniMax-H3, t2va only."""
+
+    # The checkpoint's trained sparsity (fastvideo_inference.json).
+    vsa_sparsity: float = 0.8
 
     def __post_init__(self) -> None:
         self.dit_config.arch_config.has_gate_compress = True
+        self.vae_config.stack_tiling = True
 
     def validate_quality_deployment(self, server_args) -> None:
         raise ValueError(
             'quality="high" is audited only for the base MiniMax-H3 50-step '
-            "4xH200 deployment; the FastH3 4-step distilled checkpoint has no "
-            'audited high-quality deployment. Use quality="lossless".'
+            "4xH200 deployment; FastH3 has no audited high-quality deployment. "
+            'Use quality="exact", or the default "lossless".'
         )
 
     def validate_server_args(self, server_args) -> None:
@@ -319,3 +359,38 @@ class FastH3PipelineConfig(MiniMaxH3PipelineConfig):
 
 
 __all__ = ["FastH3PipelineConfig", "MiniMaxH3PipelineConfig"]
+
+
+def register():
+    from sglang.multimodal_gen.configs.sample.minimax_h3 import (
+        FastH3SamplingParams,
+        MiniMaxH3SamplingParams,
+    )
+    from sglang.multimodal_gen.registry import register_configs
+
+    register_configs(
+        sampling_param_cls=MiniMaxH3SamplingParams,
+        pipeline_config_cls=MiniMaxH3PipelineConfig,
+        hf_model_paths=[
+            "MiniMaxAI/MiniMax-H3",
+            "MiniMax/MiniMax-H3",
+        ],
+        model_detectors=[
+            lambda model_id: (
+                "minimaxh3" in model_id.lower().replace("-", "").replace("_", "")
+                and "vdn" not in model_id.lower()
+            )
+        ],
+    )
+    register_configs(
+        sampling_param_cls=FastH3SamplingParams,
+        pipeline_config_cls=FastH3PipelineConfig,
+        hf_model_paths=[
+            "FastVideo/FastVideo-FastH3-8-Step-V2",
+        ],
+        model_detectors=[
+            lambda model_id: (
+                "fasth3" in model_id.lower().replace("-", "").replace("_", "")
+            )
+        ],
+    )

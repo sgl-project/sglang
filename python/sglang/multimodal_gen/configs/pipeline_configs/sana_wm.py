@@ -11,7 +11,10 @@ from sglang.multimodal_gen.configs.models.dits.sana_wm import SanaWMConfig
 from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
 from sglang.multimodal_gen.configs.models.encoders.base import EncoderConfig
 from sglang.multimodal_gen.configs.models.encoders.gemma2 import Gemma2Config
-from sglang.multimodal_gen.configs.models.vaes.ltx_video import LTXVideoVAEConfig
+from sglang.multimodal_gen.configs.models.vaes.ltx_video import (
+    LTXVideoVAEConfig,
+    get_ltx_video_decode_scale_and_shift,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ModelTaskType,
     PipelineConfig,
@@ -286,42 +289,9 @@ class SanaWMPipelineConfig(PipelineConfig):
         return latents
 
     def get_decode_scale_and_shift(self, device, dtype, vae):
-        """Invert the LTX-2 latent normalization used before denoising.
-
-        SANA-WM uses the LTX-2 VAE. Upstream encodes as
-        ``(z - latents_mean) * scaling_factor / latents_std`` and decodes by
-        applying the inverse transform.
-        """
-        latents_mean = getattr(vae, "latents_mean", None)
-        latents_std = getattr(vae, "latents_std", None)
-
-        scaling_factor = (
-            getattr(getattr(vae, "config", None), "scaling_factor", None)
-            or getattr(vae, "scaling_factor", None)
-            or getattr(self.vae_config.arch_config, "scaling_factor", None)
-            or 1.0
+        return get_ltx_video_decode_scale_and_shift(
+            device, dtype, vae, self.vae_config.arch_config
         )
-        if isinstance(scaling_factor, (int, float)) and float(scaling_factor) == 0.0:
-            scaling_factor = 1.0
-
-        if isinstance(latents_mean, torch.Tensor) and isinstance(
-            latents_std, torch.Tensor
-        ):
-            latents_mean = latents_mean.to(device=device, dtype=dtype).view(
-                1, -1, 1, 1, 1
-            )
-            latents_std = latents_std.to(device=device, dtype=dtype).view(
-                1, -1, 1, 1, 1
-            )
-            sf = torch.tensor(float(scaling_factor), device=device, dtype=dtype).view(
-                1, 1, 1, 1, 1
-            )
-            return sf / latents_std, latents_mean
-
-        sf = torch.tensor(float(scaling_factor), device=device, dtype=dtype).view(
-            1, 1, 1, 1, 1
-        )
-        return sf, None
 
 
 class SanaWMRealtimeConfig(SanaWMPipelineConfig):
@@ -339,3 +309,20 @@ class SanaWMRealtimeConfig(SanaWMPipelineConfig):
             keep_resident_components=("dit",),
             auto_enable_cfg_parallel=False,
         )
+
+
+def register():
+    from sglang.multimodal_gen.configs.sample.sana_wm import SanaWMSamplingParams
+    from sglang.multimodal_gen.registry import register_configs
+
+    register_configs(
+        sampling_param_cls=SanaWMSamplingParams,
+        pipeline_config_cls=SanaWMPipelineConfig,
+        hf_model_paths=[
+            "Efficient-Large-Model/SANA-WM_bidirectional",
+            "Efficient-Large-Model/SANA-WM_streaming",
+        ],
+        model_detectors=[
+            lambda hf_id: "sana-wm" in hf_id.lower() or "sana_wm" in hf_id.lower(),
+        ],
+    )

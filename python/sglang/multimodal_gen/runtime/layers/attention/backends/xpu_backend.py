@@ -26,6 +26,10 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
 
 
 class XPUAttentionBackend(AttentionBackend):
+    @classmethod
+    def supports_ring_rotation(cls) -> bool:
+        return True
+
     accept_output_buffer: bool = True
 
     @staticmethod
@@ -115,7 +119,36 @@ class XPUAttentionImpl(AttentionImpl):
         if return_softmax_lse:
             out_tensor, softmax_lse = out[:2]
             result = out_tensor.reshape(bsz, seqlen_q, nheads_q, d)
+            # The kernel returns lse as (H, B * S); ring attention needs [B, H, S].
+            softmax_lse = softmax_lse.view(nheads_q, bsz, seqlen_q).permute(1, 0, 2)
             return result, softmax_lse
 
         result = out.reshape(bsz, seqlen_q, nheads_q, d)
         return result
+
+    def forward_varlen(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+        cu_seqlens_host: tuple[int, ...] | None = None,
+    ) -> torch.Tensor:
+        del cu_seqlens_host
+        q_ = query.contiguous()
+        k_ = key.contiguous()
+        v_ = value.contiguous()
+        output = flash_attn_func(
+            q=q_,
+            k=k_,
+            v=v_,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=max_seqlen,
+            softmax_scale=self.softmax_scale,
+            causal=self.causal,
+        )
+        return output[0] if isinstance(output, tuple) else output

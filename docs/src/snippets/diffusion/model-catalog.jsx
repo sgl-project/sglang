@@ -4,6 +4,21 @@ export const DiffusionModelCatalog = ({ category }) => {
   const MODEL_CATALOG = {
   image: [
     {
+      name: "HunyuanImage-3.0",
+      modelIds: ["tencent/HunyuanImage-3.0", "tencent/HunyuanImage-3.0-Instruct"],
+      cookbook: "/cookbook/diffusion/Tencent/HunyuanImage3",
+    },
+    {
+      name: "Anima",
+      modelIds: ["circlestone-labs/Anima-Base-v1.0-Diffusers"],
+      cookbook: "/cookbook/diffusion/CircleStone/Anima",
+    },
+    {
+      name: "Ming-Image",
+      modelIds: ["inclusionAI/Ming-Image-0.1-Design", "inclusionAI/Ming-Image-0.1-Design-Layer"],
+      cookbook: "/cookbook/diffusion/inclusionAI/Ming-Image",
+    },
+    {
       name: "FLUX",
       modelIds: [
         "black-forest-labs/FLUX.1-dev",
@@ -24,6 +39,11 @@ export const DiffusionModelCatalog = ({ category }) => {
         "Qwen/Qwen-Image-2512",
       ],
       cookbook: "/cookbook/diffusion/Qwen-Image/Qwen-Image",
+    },
+    {
+      name: "Qwen-Image 2.1 / Turbo",
+      modelIds: ["Qwen/Qwen-Image-2.1", "Qwen/Qwen-Image-2.1-Turbo"],
+      cookbook: "/cookbook/diffusion/Qwen-Image/Qwen-Image-2.1",
     },
     {
       name: "Qwen-Image Edit / Layered",
@@ -104,6 +124,11 @@ export const DiffusionModelCatalog = ({ category }) => {
       modelIds: ["jdopensource/JoyAI-Image-Edit-Diffusers"],
     },
     {
+      name: "SenseNova-U1.5",
+      modelIds: ["sensenova/SenseNova-U1.5-8B-MoT"],
+      cookbook: "/cookbook/diffusion/SenseNova/SenseNova-U1.5-8B-MoT",
+    },
+    {
       name: "GLM-Image",
       modelIds: ["zai-org/GLM-Image"],
       note: "Resolved by the GLM-Image family detector.",
@@ -114,6 +139,24 @@ export const DiffusionModelCatalog = ({ category }) => {
     },
   ],
   video: [
+    {
+      name: "Kandinsky 6",
+      modelIds: [
+        "kandinskylab/Kandinsky-6.0-Pro-5s-Diffusers",
+        "kandinskylab/Kandinsky-6.0-Pro-sft-5s-Diffusers",
+        "kandinskylab/Kandinsky-6.0-Pro-distill-5s-Diffusers",
+      ],
+      cookbook: "/cookbook/diffusion/Kandinsky/Kandinsky6",
+      note: "Pro and Pro-distill have full-checkpoint validation; the older Pro-sft entry remains unverified.",
+    },
+    {
+      name: "Kandinsky 6 VSR",
+      modelIds: [
+        "kandinskylab/Kandinsky-6.0-VSR-distilled2steps-5s-Diffusers",
+      ],
+      cookbook: "/cookbook/diffusion/Kandinsky/Kandinsky6-SR",
+      note: "Use VSR-distilled2steps. The non-distilled VSR output head is incompatible with the current Euler path.",
+    },
     {
       name: "Wan 2.1",
       modelIds: [
@@ -134,6 +177,11 @@ export const DiffusionModelCatalog = ({ category }) => {
         "Wan-AI/Wan2.2-I2V-A14B-Diffusers",
       ],
       cookbook: "/cookbook/diffusion/Wan/Wan2.2",
+    },
+    {
+      name: "Wan-Animate-2",
+      modelIds: ["Wan-AI/Wan2.2-Animate-2-14B-Diffusers"],
+      cookbook: "/cookbook/diffusion/Wan/Wan-Animate-2",
     },
     {
       name: "FastWan / TurboWan",
@@ -181,9 +229,14 @@ export const DiffusionModelCatalog = ({ category }) => {
     {
       name: "FastH3",
       modelIds: [
-        "FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree",
+        "FastVideo/FastVideo-FastH3-8-Step-V2",
       ],
-      cookbook: "/cookbook/diffusion/MiniMax/MiniMax-H3#6-fasth3-4-step-distilled-preview",
+      cookbook: "/cookbook/diffusion/MiniMax/MiniMax-H3#6-fasth3-8-step-distilled",
+    },
+    {
+      name: "VDN-H3",
+      modelIds: ["OpenVDN/vdn-minimax-h3"],
+      cookbook: "/cookbook/diffusion/MiniMax/MiniMax-H3#7-vdn-h3-hybrid-attention-8-step-distill",
     },
     {
       name: "MOVA",
@@ -200,6 +253,11 @@ export const DiffusionModelCatalog = ({ category }) => {
       name: "SANA-Video",
       modelIds: ["Efficient-Large-Model/SANA-Video_2B_480p_diffusers"],
       cookbook: "/cookbook/diffusion/SANA-Video/SANA-Video",
+    },
+    {
+      name: "SANA-Video 2.0",
+      modelIds: ["Efficient-Large-Model/SANA-Video_2.0_5B_720p"],
+      cookbook: "/cookbook/diffusion/SANA-Video/SANA-Video#6-sana-video-20",
     },
     {
       name: "LingBot Video MoE",
@@ -228,6 +286,11 @@ export const DiffusionModelCatalog = ({ category }) => {
         "nvidia/Cosmos3-Edge",
       ],
       cookbook: "/cookbook/diffusion/Cosmos/Cosmos3",
+    },
+    {
+      name: "FLUX 3 Action",
+      modelIds: ["black-forest-labs/flux-3-action-droid"],
+      cookbook: "/cookbook/vla/FLUX/FLUX-3-Action",
     },
     {
       name: "LingBotWorld",

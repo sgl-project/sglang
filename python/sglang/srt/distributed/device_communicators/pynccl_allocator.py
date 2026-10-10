@@ -427,7 +427,7 @@ def prealloc_symmetric_memory_pool(
     ):
         return
 
-    from sglang.srt.distributed import get_tp_group
+    from sglang.srt.distributed.parallel_state import get_tp_group
 
     # Memory allocation is tied to a cuda stream, use the forward stream
     with torch.get_device_module(device).stream(forward_stream):

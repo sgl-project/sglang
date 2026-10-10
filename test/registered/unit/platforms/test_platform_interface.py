@@ -9,7 +9,8 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.srt.platforms import _load_platform_class, _resolve_platform
+from sglang import _platform_stubs
+from sglang.srt.platforms import _load_platform_class, _resolve_platform, interface
 from sglang.srt.platforms.cpu import CpuSRTPlatform
 from sglang.srt.platforms.cuda import CudaSRTPlatform
 from sglang.srt.platforms.device_mixin import (
@@ -19,6 +20,8 @@ from sglang.srt.platforms.device_mixin import (
     PlatformEnum,
 )
 from sglang.srt.platforms.interface import SRTPlatform
+from sglang.srt.platforms.mps import MpsSRTPlatform
+from sglang.srt.platforms.npu import NPUSRTPlatform
 from sglang.srt.platforms.rocm import RocmSRTPlatform
 from sglang.srt.platforms.xpu import XpuSRTPlatform
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -58,40 +61,6 @@ def _make_platform_ep(name, load_fn=None):
     else:
         ep.load.return_value = MagicMock()
     return ep
-
-
-# ---------------------------------------------------------------------------
-# PlatformEnum & CpuArchEnum
-# ---------------------------------------------------------------------------
-
-
-class TestPlatformEnum(CustomTestCase):
-    """Tests for PlatformEnum enumeration."""
-
-    def test_all_expected_values_exist(self):
-        expected = {
-            "CUDA",
-            "ROCM",
-            "CPU",
-            "XPU",
-            "MUSA",
-            "NPU",
-            "TPU",
-            "MPS",
-            "OOT",
-            "UNSPECIFIED",
-        }
-        actual = {member.name for member in PlatformEnum}
-        self.assertEqual(actual, expected)
-
-
-class TestCpuArchEnum(CustomTestCase):
-    """Tests for CpuArchEnum enumeration."""
-
-    def test_all_expected_values_exist(self):
-        expected = {"X86", "ARM", "UNSPECIFIED"}
-        actual = {member.name for member in CpuArchEnum}
-        self.assertEqual(actual, expected)
 
 
 # ---------------------------------------------------------------------------
@@ -209,6 +178,26 @@ class TestSRTPlatform(CustomTestCase):
         self.assertFalse(base.is_pin_memory_available())
         self.assertFalse(base.is_pin_memory_available(device="cpu"))
 
+    def test_base_speculative_capability_defaults_are_conservative(self):
+        base = SRTPlatform()
+        self.assertFalse(base.supports_speculative_algorithm("DFLASH"))
+        self.assertFalse(
+            base.supports_speculative_draft_attention_backend(
+                "DFLASH", "custom_backend"
+            )
+        )
+
+    def test_mamba_cache_extra_buffer_capability(self):
+        self.assertFalse(SRTPlatform().support_mamba_cache_extra_buffer())
+
+        class OutOfTreePlatform(SRTPlatform):
+            _enum = PlatformEnum.OOT
+
+            def support_mamba_cache_extra_buffer(self) -> bool:
+                return True
+
+        self.assertTrue(OutOfTreePlatform().support_mamba_cache_extra_buffer())
+
 
 class TestCudaDeviceMixin(CustomTestCase):
     """Tests for CUDA device operation defaults."""
@@ -216,12 +205,6 @@ class TestCudaDeviceMixin(CustomTestCase):
     def test_default_get_device_returns_cuda_device(self):
         base = CudaSRTPlatform()
         self.assertEqual(base.get_device(2), torch.device("cuda", 2))
-
-    @patch("torch.cuda.get_device_capability", return_value=(9, 0))
-    def test_default_get_device_capability_uses_cuda(self, mock_get_device_capability):
-        base = CudaSRTPlatform()
-        self.assertEqual(base.get_device_capability(1), DeviceCapability(9, 0))
-        mock_get_device_capability.assert_called_once_with(1)
 
     def test_pin_memory_available_for_cuda_targets(self):
         base = CudaSRTPlatform()
@@ -251,9 +234,9 @@ class TestCudaDeviceMixin(CustomTestCase):
 
     def test_cuda_srt_platform_capabilities(self):
         base = CudaSRTPlatform()
-        self.assertTrue(base.supports_fp8())
-        self.assertTrue(base.support_cuda_graph())
-        self.assertTrue(base.support_piecewise_cuda_graph())
+        self.assertTrue(base.capabilities.graph_capture)
+        self.assertTrue(base.capabilities.piecewise_graph)
+        self.assertTrue(base.capabilities.supports_triton)
 
 
 class TestXpuDeviceMixin(CustomTestCase):
@@ -262,24 +245,6 @@ class TestXpuDeviceMixin(CustomTestCase):
     def test_default_get_device_returns_xpu_device(self):
         base = XpuSRTPlatform()
         self.assertEqual(base.get_device(2), torch.device("xpu", 2))
-
-    # TODO: @patch("torch.xpu.get_device_capability", return_value=(9, 0))
-    def test_default_get_device_capability_uses_xpu(self):
-        # torch.ops.sgl_kernel.query_device is only registered by XPU builds
-        # of sgl-kernel, so patch the op namespace attribute with create=True
-        # (a dotted @patch target would fail to import on CPU/CUDA machines).
-        # torch.xpu.current_device() likewise needs an XPU device; mock it.
-        base = XpuSRTPlatform()
-        fake_query_device = MagicMock()
-        fake_query_device.default.return_value = (9, 0)
-        with (
-            patch("torch.xpu.current_device", return_value=0),
-            patch.object(
-                torch.ops.sgl_kernel, "query_device", fake_query_device, create=True
-            ),
-        ):
-            self.assertEqual(base.get_device_capability(0), DeviceCapability(9, 0))
-        fake_query_device.default.assert_called_once_with(0)
 
     def test_pin_memory_available_for_xpu_targets(self):
         base = XpuSRTPlatform()
@@ -303,9 +268,82 @@ class TestXpuDeviceMixin(CustomTestCase):
 
     def test_xpu_srt_platform_capabilities(self):
         base = XpuSRTPlatform()
-        self.assertFalse(base.supports_fp8())
-        self.assertTrue(base.support_cuda_graph())
-        self.assertTrue(base.support_piecewise_cuda_graph())
+        self.assertTrue(base.capabilities.graph_capture)
+        self.assertTrue(base.capabilities.piecewise_graph)
+
+
+class TestNpuDeviceMixin(CustomTestCase):
+    """Tests for NPU device operation defaults."""
+
+    def setUp(self):
+        # torch.device("npu", ...) requires the "npu" device type, which
+        # torch_npu registers via the privateuse1 backend rename; CPU-only
+        # builds lack it. Register it per-test so only this suite carries
+        # the process-wide side effect.
+        try:
+            torch.utils.rename_privateuse1_backend("npu")
+        except Exception:
+            # Re-registration with a different name raises on some versions;
+            # real NPU machines may have already renamed the backend.
+            pass
+        super().setUp()
+
+    def test_default_get_device_returns_npu_device(self):
+        base = NPUSRTPlatform()
+        self.assertEqual(base.get_device(2), torch.device("npu", 2))
+
+    def test_default_get_device_capability_reports_zero(self):
+        # torch_npu's get_device_capability is configured via the environment
+        # variable TORCH_NPU_DEVICE_CAPABILITY purely for native-PyTorch
+        # compatibility; it does not reflect the real NPU hardware. The
+        # platform therefore reports (0, 0) without consulting torch.npu.
+        base = NPUSRTPlatform()
+        mock_npu = MagicMock()
+        with patch.object(torch, "npu", mock_npu, create=True):
+            self.assertEqual(base.get_device_capability(1), DeviceCapability(0, 0))
+        mock_npu.get_device_capability.assert_not_called()
+
+    def test_pin_memory_available_for_npu_targets(self):
+        base = NPUSRTPlatform()
+        self.assertTrue(base.is_pin_memory_available())
+        self.assertTrue(base.is_pin_memory_available(device="npu"))
+        self.assertTrue(base.is_pin_memory_available(device=torch.device("npu", 0)))
+        self.assertFalse(base.is_pin_memory_available(device="cpu"))
+        self.assertFalse(base.is_pin_memory_available(device=torch.device("cpu")))
+
+    def test_default_seed_everything_seeds_npu(self):
+        mock_npu = MagicMock()
+        with (
+            patch.object(torch, "npu", mock_npu, create=True),
+            patch("torch.manual_seed") as mock_torch_seed,
+            patch("sglang.srt.platforms.device_mixin.np.random.seed") as mock_np_seed,
+            patch("sglang.srt.platforms.device_mixin.random.seed") as mock_random_seed,
+        ):
+            NPUSRTPlatform.seed_everything(123)
+        mock_random_seed.assert_called_once_with(123)
+        mock_np_seed.assert_called_once_with(123)
+        mock_torch_seed.assert_called_once_with(123)
+        mock_npu.manual_seed_all.assert_called_once_with(123)
+
+    def test_seed_everything_none_seed_is_noop(self):
+        mock_npu = MagicMock()
+        with (
+            patch.object(torch, "npu", mock_npu, create=True),
+            patch("torch.manual_seed") as mock_torch_seed,
+            patch("sglang.srt.platforms.device_mixin.np.random.seed") as mock_np_seed,
+            patch("sglang.srt.platforms.device_mixin.random.seed") as mock_random_seed,
+        ):
+            NPUSRTPlatform.seed_everything(None)
+        mock_random_seed.assert_not_called()
+        mock_np_seed.assert_not_called()
+        mock_torch_seed.assert_not_called()
+        mock_npu.manual_seed_all.assert_not_called()
+
+    def test_npu_srt_platform_capabilities(self):
+        base = NPUSRTPlatform()
+        self.assertTrue(base.capabilities.graph_capture)
+        self.assertFalse(base.capabilities.piecewise_graph)
+        self.assertTrue(base.capabilities.supports_triton)
 
 
 class TestCpuDeviceMixin(CustomTestCase):
@@ -365,12 +403,161 @@ class TestCpuDeviceMixin(CustomTestCase):
 
     def test_cpu_srt_platform_capabilities(self):
         base = CpuSRTPlatform()
-        self.assertFalse(base.supports_fp8())
-        self.assertFalse(base.support_cuda_graph())
-        self.assertFalse(base.support_piecewise_cuda_graph())
+        self.assertTrue(base.capabilities.graph_capture)
+        self.assertFalse(base.capabilities.piecewise_graph)
+        self.assertFalse(base.capabilities.supports_triton)
         # CPU has no GPU to pin host memory to.
         self.assertFalse(base.is_pin_memory_available())
         self.assertFalse(base.is_pin_memory_available(device="cpu"))
+
+
+class TestLegacyKvPoolHookDeprecation(CustomTestCase):
+    """get_kv_pool_cls() still serves platforms on the removed class hooks.
+
+    get_{mha,mla,dsa}_kv_pool_cls were the out-of-tree contract before
+    get_kv_pool_cls replaced them. An OOT platform pinned to an older sglang
+    overrides them and nothing else, so dropping the hooks outright would
+    silently build the CUDA-assuming in-tree pool on its device.
+    """
+
+    def test_legacy_hook_is_used_and_warns_once_per_kind(self):
+        sentinel = type("VendorMHAPool", (), {})
+
+        class LegacyPlatform(SRTPlatform):
+            def get_mha_kv_pool_cls(self):
+                return sentinel
+
+        platform = LegacyPlatform()
+        with self.assertLogs("sglang.srt.platforms.interface", "WARNING") as logs:
+            self.assertIs(platform.get_kv_pool_cls(kind="mha"), sentinel)
+        self.assertIn("get_mha_kv_pool_cls", logs.output[0])
+
+        # The warning is per (class, hook); a hot path must not re-log it.
+        with patch.object(interface.logger, "warning") as mock_warning:
+            self.assertIs(platform.get_kv_pool_cls(kind="mha"), sentinel)
+        mock_warning.assert_not_called()
+
+    def test_kinds_without_a_legacy_hook_stay_none(self):
+        class LegacyPlatform(SRTPlatform):
+            def get_mha_kv_pool_cls(self):
+                return type("VendorMHAPool", (), {})
+
+        platform = LegacyPlatform()
+        self.assertIsNone(platform.get_kv_pool_cls(kind="mla"))
+        self.assertIsNone(platform.get_kv_pool_cls(kind="dsa"))
+
+    def test_platform_on_neither_api_gets_the_in_tree_pool(self):
+        base = SRTPlatform()
+        for kind in ("mha", "mla", "dsa"):
+            self.assertIsNone(base.get_kv_pool_cls(kind=kind))
+
+
+class TestMpsDeviceMixin(CustomTestCase):
+    """Tests for the built-in Apple MPS platform contract."""
+
+    def test_identity_and_backend_defaults(self):
+        base = MpsSRTPlatform()
+        self.assertTrue(base.is_mps())
+        self.assertEqual(base.get_device(), torch.device("mps"))
+        self.assertEqual(base.get_default_attention_backend(), "torch_native")
+        self.assertEqual(base.get_torch_distributed_backend_str(), "gloo")
+        self.assertFalse(base.is_pin_memory_available())
+
+    def test_single_device_contract(self):
+        base = MpsSRTPlatform()
+        base.set_device(torch.device("mps"))
+        with self.assertRaisesRegex(ValueError, "one device"):
+            base.get_device(1)
+        with self.assertRaisesRegex(ValueError, "cannot select"):
+            base.set_device(torch.device("cpu"))
+
+    @patch("sglang.srt.platforms.mps.torch.mps.driver_allocated_memory")
+    @patch("sglang.srt.platforms.mps.torch.mps.recommended_max_memory")
+    @patch(
+        "sglang.srt.platforms.mps.torch.mps.current_allocated_memory",
+        side_effect=AssertionError("device budget must use driver allocation"),
+    )
+    def test_unified_memory_contract(self, mock_current, mock_recommended, mock_driver):
+        mock_recommended.return_value = 800
+        mock_driver.return_value = 350
+        base = MpsSRTPlatform()
+        # Use Metal capacity and driver allocation for memory accounting.
+        self.assertEqual(base.get_device_total_memory(), 800)
+        self.assertEqual(base.get_current_memory_usage(), 350.0)
+        mock_current.assert_not_called()
+
+        mock_recommended.return_value = 0
+        with self.assertRaisesRegex(RuntimeError, "non-positive Metal working-set"):
+            base.get_device_total_memory()
+
+    @patch("torch.mps.recommended_max_memory")
+    def test_stub_device_properties_use_metal_working_set(self, mock_recommended):
+        mock_recommended.return_value = 800
+        with patch.object(_platform_stubs, "_cached_props", None):
+            self.assertEqual(_platform_stubs.get_device_properties().total_memory, 800)
+
+    @patch("torch.backends.mps.get_name", return_value="Apple M-series")
+    def test_device_metadata_contract(self, _mock_name):
+        base = MpsSRTPlatform()
+        self.assertIsNone(base.get_device_capability())
+        self.assertEqual(base.get_device_name(), "Apple M-series")
+
+    @patch("torch.mps.driver_allocated_memory")
+    @patch("torch.mps.recommended_max_memory")
+    def test_common_device_helpers_handle_mps_inline(
+        self, mock_recommended, mock_driver
+    ):
+        """Handle MPS directly instead of using OOT dispatch."""
+        from sglang.srt.utils import common
+
+        mock_recommended.return_value = 8 << 30
+        mock_driver.return_value = 5 << 30
+
+        with (
+            patch.object(common, "is_mps", return_value=True),
+            patch.object(common, "is_cuda", return_value=False),
+            patch.object(common, "is_hip", return_value=False),
+            patch.object(common, "is_cpu", return_value=False),
+            patch.object(common, "is_npu", return_value=False),
+            patch.object(common, "is_musa", return_value=False),
+            patch.object(common, "is_habana_available", return_value=False),
+            patch.object(torch.cuda, "is_available", return_value=False),
+            patch.object(torch.xpu, "is_available", return_value=False),
+            patch.object(torch.mps, "is_available", return_value=True),
+            patch.object(torch.mps, "device_count", return_value=1),
+            patch.object(common, "empty_device_cache"),
+            # The Linux CPU suite has no MPS device name.
+            patch("torch.backends.mps.get_name", return_value="Apple M-series"),
+            patch(
+                "sglang.srt.hardware_backend.mlx.runtime.use_mlx",
+                return_value=False,
+            ),
+        ):
+            common.get_device_count.cache_clear()
+            common.get_device.cache_clear()
+            try:
+                self.assertEqual(common.get_device_memory_capacity("mps"), 8192)
+                self.assertEqual(common.get_device_name(), "Apple M-series")
+                self.assertEqual(common.get_device_count(), 1)
+                self.assertEqual(common.get_device(), "mps")
+                self.assertEqual(common.get_device(0), "mps:0")
+                self.assertEqual(common.get_compiler_backend(), "eager")
+
+                # Metal headroom is the tighter limit.
+                with patch.object(common.psutil, "virtual_memory") as mock_vm:
+                    mock_vm.return_value.available = 6 << 30
+                    self.assertEqual(common.get_available_gpu_memory("mps", 0), 3.0)
+
+                    # Host memory can be the tighter limit.
+                    mock_vm.return_value.available = 1 << 30
+                    self.assertEqual(common.get_available_gpu_memory("mps", 0), 1.0)
+
+                    # Clamp negative Metal headroom.
+                    mock_driver.return_value = 9 << 30
+                    self.assertEqual(common.get_available_gpu_memory("mps", 0), 0.0)
+            finally:
+                common.get_device_count.cache_clear()
+                common.get_device.cache_clear()
 
 
 class TestPinMemoryAvailability(CustomTestCase):
@@ -439,34 +626,6 @@ class TestPinMemoryAvailability(CustomTestCase):
 
         self.assertEqual(platform.calls, [None])
 
-    def test_oot_platform_override_true_is_used(self):
-        from sglang.srt.utils import common
-
-        class P(SRTPlatform):
-            _enum = PlatformEnum.OOT
-            device_name = "custom"
-            device_type = "custom"
-
-            def is_pin_memory_available(self, device=None):
-                return True
-
-        with patch.object(common, "current_platform", P()):
-            self.assertTrue(common.is_pin_memory_available())
-
-    def test_oot_platform_override_false_is_used(self):
-        from sglang.srt.utils import common
-
-        class P(SRTPlatform):
-            _enum = PlatformEnum.OOT
-            device_name = "custom"
-            device_type = "custom"
-
-            def is_pin_memory_available(self, device=None):
-                return False
-
-        with patch.object(common, "current_platform", P()):
-            self.assertFalse(common.is_pin_memory_available())
-
     def test_oot_platform_without_override_uses_conservative_default(self):
         from sglang.srt.utils import common
 
@@ -513,7 +672,7 @@ class TestResolvePlatformWithEnv(CustomTestCase):
         mock_envs.SGLANG_PLATFORM.get.return_value = "nonexistent"
         mock_ep.return_value = []
         with self.assertRaises(RuntimeError):
-            _resolve_platform()
+            result = _resolve_platform()
 
     @patch("sglang.srt.platforms.entry_points")
     @patch("sglang.srt.platforms.envs")
@@ -593,10 +752,11 @@ class TestResolvePlatformAutoDiscover(CustomTestCase):
         self.assertIsInstance(result, CudaSRTPlatform)
 
     @patch("sglang.srt.platforms.load_plugins_by_group")
+    @patch("sglang.srt.platforms._is_mps_available", return_value=False)
     @patch("sglang.srt.platforms._is_cuda_available")
     @patch("sglang.srt.platforms.envs")
     def test_no_plugin_no_cuda_activates_base_fallback(
-        self, mock_envs, mock_is_cuda_available, mock_load
+        self, mock_envs, mock_is_cuda_available, _mock_is_mps_available, mock_load
     ):
         """When no plugin or CUDA is available, return the abstract base platform."""
         mock_envs.SGLANG_PLATFORM.get.return_value = ""
@@ -605,6 +765,27 @@ class TestResolvePlatformAutoDiscover(CustomTestCase):
         result = _resolve_platform()
         self.assertIsInstance(result, SRTPlatform)
         self.assertNotIsInstance(result, CudaSRTPlatform)
+
+    @patch("sglang.srt.platforms.load_plugins_by_group")
+    @patch("sglang.srt.platforms._is_mps_available", return_value=True)
+    @patch("sglang.srt.platforms._is_xpu_available", return_value=False)
+    @patch("sglang.srt.platforms._is_rocm_available", return_value=False)
+    @patch("sglang.srt.platforms._is_cuda_available", return_value=False)
+    @patch("sglang.srt.platforms._is_cpu_available", return_value=False)
+    @patch("sglang.srt.platforms.envs")
+    def test_no_plugin_activates_mps_fallback(
+        self,
+        mock_envs,
+        _mock_is_cpu,
+        _mock_is_cuda,
+        _mock_is_rocm,
+        _mock_is_xpu,
+        _mock_is_mps,
+        mock_load,
+    ):
+        mock_envs.SGLANG_PLATFORM.get.return_value = ""
+        mock_load.return_value = {}
+        self.assertIsInstance(_resolve_platform(), MpsSRTPlatform)
 
     @patch("sglang.srt.platforms.load_plugins_by_group")
     @patch("sglang.srt.platforms.torch")

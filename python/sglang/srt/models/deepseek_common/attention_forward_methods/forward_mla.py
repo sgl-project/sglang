@@ -16,17 +16,18 @@ from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.dsa.utils import is_graph_dsa_split_op_surface
 from sglang.srt.layers.attention.dsa_backend import prepare_kv_for_attention
-from sglang.srt.layers.communicator import get_attn_tp_context
-from sglang.srt.layers.cp.utils import enable_cp_v2
 from sglang.srt.layers.dcp import (
     all_gather_kv_cache_for_mla_extend,
     all_gather_q_for_mla_decode,
     cp_lse_ag_out_rs_mla,
     dcp_a2a_lse_reduce,
 )
+from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
-from sglang.srt.layers.radix_attention import unified_attention_with_output
-from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
+from sglang.srt.layers.radix_attention import (
+    padded_extend_real_tokens,
+    unified_attention_with_output,
+)
 from sglang.srt.lora.deepseek_mla_correction import (
     apply_q_correction as apply_kv_b_lora_q_correction,
 )
@@ -101,7 +102,7 @@ def is_dcp_mla_decode_phase(forward_batch: ForwardBatch) -> bool:
 
 
 def is_mla_dcp_lse_base_on_e(attention_backend: Optional[str]) -> bool:
-    return attention_backend in {"flashmla", "cutedsl_mla"}
+    return attention_backend in {"flashmla", "cutedsl_mla", "aiter"}
 
 
 if _is_cuda:
@@ -613,7 +614,12 @@ class DeepseekMLAForwardMixin:
                 absorbed_bmm_concat_cast_q_fp8(
                     q_fp8, q_nope, self.w_kc, q_pe, self.num_local_heads
                 )
-            born_q_backend.q8kv8_stash_born_q(num_tokens, self.attn_mqa.layer_id)
+            # The attention call consumes the batch's real rows, a prefix of
+            # the rows written here.
+            born_q_backend.q8kv8_stash_born_q(
+                padded_extend_real_tokens(q_nope, forward_batch) or num_tokens,
+                self.attn_mqa.layer_id,
+            )
             q_nope_out = born_q_backend.q8kv8_born_q_sentinel(
                 num_tokens, self.num_local_heads, self.kv_lora_rank, q_nope.device
             )
@@ -625,11 +631,6 @@ class DeepseekMLAForwardMixin:
             k_pe,
             defer_materialization=fuse_rope_for_trtllm_mla,
         )
-
-        if not enable_cp_v2() and mla_use_prefill_cp(forward_batch):
-            k_nope, k_pe = self.rebuild_cp_kv_cache(
-                latent_cache, forward_batch, k_nope, k_pe
-            )
 
         # all_gather q_pe, q_nope_out,take tp8 as an example， q_pe [B, H, ROPE_DIM], q_nope_out [B, H, NOPE_DIM] gathered to [B, H * dcp_world_size, ROPE_DIM] [B, H * dcp_world_size, NOPE_DIM] for decode batch, and all gather k_pe, k_nope for extend batch.
         if get_parallel().dcp_enabled:

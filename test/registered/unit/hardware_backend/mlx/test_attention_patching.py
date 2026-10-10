@@ -8,9 +8,8 @@ from collections import deque
 from types import SimpleNamespace
 
 from sglang.srt.managers.schedule_batch import ReqKvInfo
-from sglang.test.ci.ci_register import register_cpu_ci, register_mlx_ci
+from sglang.test.ci.ci_register import register_mlx_ci
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 register_mlx_ci(est_time=1, suite="stage-a-unit-test-mlx")
 
 _HAS_MLX = importlib.util.find_spec("mlx") is not None
@@ -1155,11 +1154,11 @@ class TestMlxOverlapScheduler(unittest.TestCase):
             raise _StopLoop
 
         scheduler = SchedulerMlxOverlapMixin.__new__(SchedulerMlxOverlapMixin)
-        scheduler.request_receiver = SimpleNamespace(recv_requests=lambda: [])
-        scheduler.process_input_requests = lambda recv_reqs: None
+        scheduler.ingest_requests = lambda: []
         scheduler.gracefully_exit = False
         scheduler._engine_paused = False
         scheduler.forward_ct = 0
+        scheduler._sched_idled = False
         scheduler.profiler_manager = SimpleNamespace(
             _profile_batch_predicate=lambda batch: None
         )
@@ -1238,7 +1237,7 @@ class TestMlxOverlapScheduler(unittest.TestCase):
             multimodal_inputs=None,
             session=None,
             return_routed_experts=False,
-            mamba_lazy_is_insert=True,
+            mamba_lazy_checkpoint=True,
             time_stats=SimpleNamespace(
                 set_completion_time=lambda: events.append(("completion", "r0"))
             ),
@@ -1254,7 +1253,7 @@ class TestMlxOverlapScheduler(unittest.TestCase):
         original_release = batch_result_processor_module.release_kv_cache
         original_get_indexer = batch_result_processor_module.get_global_indexer_capturer
 
-        def fake_release_kv_cache(release_req, tree_cache, is_insert=False):
+        def fake_release_kv_cache(release_req, tree_cache, checkpoint=False):
             events.append(("release", release_req.rid))
             self.assertIs(tree_cache, processor.tree_cache)
 

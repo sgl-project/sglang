@@ -27,7 +27,7 @@ register_amd_ci(est_time=165, stage="extra-a", runner_config="2-gpu-large-amd")
 # full graph silently bypasses the only path that exercises that invariant
 # end-to-end.
 #
-# --disable-piecewise-cuda-graph is REQUIRED by canary: install_canary
+# --cuda-graph-backend-prefill=disabled is REQUIRED by canary: install_canary
 # (api.py) asserts it, and the SingleForwardManager design depends on it.
 # mock_model_server_args() already passes it; do not remove it.
 _NUM_PROMPTS = 32
