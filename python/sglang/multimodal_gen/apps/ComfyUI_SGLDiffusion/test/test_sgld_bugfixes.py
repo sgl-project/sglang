@@ -278,3 +278,22 @@ def test_gguf_detect_looks_for_matching_companion_not_h3():
             GENERATOR._h3_detect_companion(qwen_gguf)
 
 
+# --- Bug 2: .gguf was added to ComfyUI's global diffusion_models list ------
+
+
+def test_gguf_support_does_not_leak_into_global_folder_registry():
+    with tempfile.TemporaryDirectory() as tmp:
+        open(os.path.join(tmp, "model.gguf"), "wb").close()
+        FOLDER_PATHS.folder_names_and_paths["diffusion_models"][0].append(tmp)
+        try:
+            names = NODES._list_unet_names_including_gguf()
+            assert "model.gguf" in names
+            # The stock extension set used by every other node (e.g.
+            # ComfyUI's own "Load Diffusion Model") must stay untouched.
+            assert ".gguf" not in FOLDER_PATHS.folder_names_and_paths[
+                "diffusion_models"
+            ][1]
+        finally:
+            FOLDER_PATHS.folder_names_and_paths["diffusion_models"][0].remove(tmp)
+
+
