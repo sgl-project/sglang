@@ -8,7 +8,11 @@ import torch
 from diffusers.models.embeddings import Timesteps
 from torch import nn
 
-from sglang.kernels.ops.diffusion import BitExactFusionGate, tensors_equal
+from sglang.kernels.ops.diffusion import (
+    BitExactFusionGate,
+    modulate_scale_shift,
+    tensors_equal,
+)
 from sglang.multimodal_gen.configs.models.dits.anima import AnimaDiTConfig
 from sglang.multimodal_gen.configs.models.fsdp import is_module_list_entry_in
 from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
@@ -164,7 +168,23 @@ class AnimaAdaLayerNorm(nn.Module):
         modulation = self.linear_2(modulation)[0]
         modulation = modulation + temb[..., : modulation.shape[-1]]
         values = modulation.unsqueeze(1).chunk(3 if self.gated else 2, dim=-1)
-        out = self.norm(x) * (1 + values[1]) + values[0]
+        norm_x = self.norm(x)
+        if (
+            norm_x.is_cuda
+            and norm_x.dtype in (torch.float16, torch.bfloat16)
+            and not torch.compiler.is_compiling()
+        ):
+            # Batched chunk views are strided; only copy the small [B, D]
+            # modulation rows, never the [B, S, D] activation.
+            out = modulate_scale_shift(
+                norm_x,
+                values[1].squeeze(1).contiguous(),
+                values[0].squeeze(1).contiguous(),
+            )
+        else:
+            # Keep the original graph for torch.compile: the CUDA dispatch
+            # checks pointer alignment, which cannot be traced in a full graph.
+            out = norm_x * (1 + values[1]) + values[0]
         return (out, values[2]) if self.gated else out
 
 

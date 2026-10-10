@@ -100,11 +100,11 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 - `--warmup-mode {off|request|server}`: control startup warmup for `sglang serve`; `off` skips warmup, `request` primes the request path, and `server` runs a full synthetic server warmup before serving traffic
 - `--enable-torch-compile {true|false}`: compile native diffusion hot paths. When no warmup mode is configured, this also enables server warmup so first real requests do not pay compile latency.
 - `--offload-during-compile {true|false}`: when compile warmup is active, temporarily layerwise-offload DiT weights and move resident non-DiT components off-device so `max-autotune` fits on tighter-memory GPUs; the configured serving residency is restored before real traffic. Skipped under existing layerwise offload, Cache-DiT, or FSDP.
-- `--enable-breakable-cuda-graph {true|false}`: capture supported DiT forwards as breakable CUDA graph segments to reduce launch overhead. Requires `--warmup-resolutions` for every served resolution because each resolution is captured separately. An `extra-high` or `high` request is rejected when it would mount request-scoped DiT fusions that were not present during lossless graph capture; VAE-only request-gated paths remain compatible.
+- `--enable-breakable-cuda-graph {true|false}`: capture supported DiT forwards as breakable CUDA graph segments to reduce launch overhead. Requires `--warmup-resolutions` for every served resolution because each resolution is captured separately. An `lossless` or `high` request is rejected when it would mount request-scoped DiT fusions that were not present during lossless graph capture; VAE-only request-gated paths remain compatible.
 - `--bcg-text-buckets {N...}`: prompt-length padding buckets for breakable CUDA graph capture/replay reuse.
 - `--attention-backend {BACKEND}`: attention backend for native SGLang and diffusers pipelines
 - `--enable-attention-backend-autotune {true|false}`: for SGLang-native pipelines, benchmark compatible attention backends on each layer's first sufficiently large input and keep a backend only when it is both numerically compatible and measurably faster. Disabled by default and currently validated on SM90 and SM12x. Explicit `--attention-backend`, component overrides, and model-required backends are never replaced.
-- `--component-attention-backends {MAP}`: per-component attention backend overrides, for example `text_encoder=torch_sdpa,transformer=fa`
+- `--component-attention-backends {MAP}`: per-component attention backend overrides, for example `text_encoder=torch_sdpa,transformer=fa`. A key may carry a `.self` or `.cross` role suffix to override one kind of attention only, for example `transformer.cross=fa`
 - `--attention-backend-config {CONFIG}`: attention backend configuration
 - `--srt-encoder-url {HTTPADDRESS}`: address of SGLang srt server with AR model for GLM-Image like models. See [Models with AR Stage](/docs/sglang-diffusion/models_with_ar).
 - `--srt-encoder-timeout {SECONDS}`: Timeout in seconds for HTTP requests to the SGLang encoder server
@@ -123,7 +123,7 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 - `--image-path {PATH} [{PATH} ...]`: input image(s) for image-to-video or image-to-image generation
 - `--num-inference-steps {STEPS}` and `--seed {SEED}`
 - `--num-outputs-per-prompt {N}` / `--num-outputs {N}`: generate multiple outputs for each prompt. A scalar seed expands as `seed + output_index`.
-- `--quality {lossless,extra-high,high}`: cumulative request-level optimization tier. `lossless` (default) keeps the selected deployment's reference path and all unconditional bit-exact replacements. `extra-high` adds only request-gated DiT/VAE kernel fusions; the tier does not itself enable sparse, caching, or other approximate paths. `high` includes the complete `extra-high` set and may also enable model-owned approximate optimizations. Separately configured quantization, attention, or caching options still apply. Support and validation constraints are model-specific.
+- `--quality {exact,lossless,high}`: cumulative request-level optimization tier. `lossless` (default) runs every fast path that keeps the reference math and the precision of every operand, moving only where the rounding happens; it does not enable quantization, sparsity, caching, or another approximate path. `exact` restricts it to the fast paths that reproduce the reference's rounding exactly, so output is bit-identical in the same environment -- ask for it when a run has to be reproducible. `high` includes the complete `lossless` set and may also enable model-owned approximate optimizations. `extra-high` is accepted as the former name of `lossless`. Separately configured quantization, attention, or caching options still apply. Support and validation constraints are model-specific.
 - `skip_softmax_params` (online request only): explicitly enables lossy BLASST/Skip-Softmax attention for compatible FA self-attention layers. See [Attention Backends](../attention_backends#request-scoped-skip-softmax).
 - `--height {HEIGHT}`, `--width {WIDTH}`, `--num-frames {N}`, `--fps {FPS}`
 - `--output-path {PATH}`, `--output-file-name {NAME}`, `--save-output`, `--return-frames`
@@ -506,6 +506,21 @@ sglang generate \
   --component-attention-backends.text_encoder torch_sdpa \
   --component-attention-backends.transformer fa
 ```
+
+A component key may end in `.self` or `.cross` to override one kind of attention
+only. This helps when a backend's per-call overhead pays off for self-attention
+but not for the lighter cross-attention:
+
+```bash Command
+sglang generate \
+  --model-path <MODEL_PATH_OR_ID> \
+  --component-attention-backends.transformer.self sage_attn \
+  --component-attention-backends.transformer.cross fa
+```
+
+A role override outranks the component-wide backend for layers of that role and
+is equally strict: it fails the load if it never reaches a layer of that role.
+See [Attention Backends](/docs/sglang-diffusion/attention_backends#per-role-overrides).
 
 ## Diffusers Backend
 

@@ -4,8 +4,9 @@ Slim, KV-aware, OpenAI-compatible router for SGLang workers.
 
 Serves a single model and routes across its workers. Exposes
 `/v1/tokenize`, `/v1/detokenize`, `/v1/models`, [`/v1/embeddings`](#embeddings),
-[`/v1/classify`](#classify), [`/v1/rerank`](#rerank), `/v1/chat/completions` and
-SGLang's native [`/generate`](#native-generate) (buffered and SSE), plus
+[`/v1/classify`](#classify), [`/v1/rerank`](#rerank),
+[`/v1/chat/completions` and `/v1/completions`](#openai-over-generate) and SGLang's native
+[`/generate`](#native-generate) (buffered and SSE), plus
 `/healthz` / `/readyz` and `/metrics`. Worker pools come from either a static URL
 list or Kubernetes EndpointSlice discovery. Both edges speak cleartext HTTP/2
 where the peer does — see [HTTP/2](#http2).
@@ -483,6 +484,32 @@ a single prompt that has none, and `--override-sampling-params` defaults. Under
 batch or `n > 1` request leaves the prefill rank to the engine, which gives item
 `i` the bootstrap room `room + i`.
 
+## OpenAI over /generate
+
+`/v1/completions` and `/v1/chat/completions` behave as the engine's own routes,
+but the router runs SGLang's OpenAI layer itself (`sglang-processor`'s `openai` module): it lowers
+the request to the `GenerateReqInput` SGLang would build, sends it to
+`/generate` like a native request, and builds the OpenAI response, buffered or
+SSE, from the engine's output. The engine's `/server_info` supplies the server
+args that layer reads (`--enable-cache-report`,
+`--stream-response-default-include-usage`, `--incremental-streaming-output`, the
+custom-labels header). Requests it cannot reproduce exactly go to the engine's
+own route as sent: workers that disagree on those args or never
+reported them, `--completion-template`, `return_hidden_states` and other
+`sglext` outputs, `echo` or `logprobs` without a router tokenizer, and bodies
+SGLang would reject. Chat also needs a renderer verified against SGLang (the
+`AllText` scope, DeepSeek-V4 today), router `--default-chat-template-kwargs`
+equal to the workers', a reasoning parser the processor reproduces
+(`deepseek-v4`) or none, and no media yet. Tools are served with `tool_choice`
+`auto` or `none`, non-strict, with standard JSON-schema types, and a tool
+parser the processor reproduces (`deepseekv4`); `required`, named and strict
+tools take a constraint from the engine's xgrammar, so they go to the engine.
+The router reads the model's `config.json` and `generation_config.json` beside
+`--tokenizer-path` (or from the HF repo), as the engine reads them, so a local
+path should point into the model's directory. Engine env vars that change the
+layer (`SGLANG_TOOL_STRICT_LEVEL`, `SGLANG_FORWARD_UNKNOWN_TOOLS`) are taken as
+unset. `sgl_router_openai_route_total` counts each outcome.
+
 ## Embeddings
 
 `/v1/embeddings` has the engine's interface: the same OpenAI `EmbeddingRequest`
@@ -512,8 +539,9 @@ embeddings, a PD fleet answers 400 and `--dp-aware` pins no rank.
 
 ## DeepSeek V4
 
-Native V4 rendering follows SGLang's serving path (`serving_chat.py`), not
-Dynamo's OpenAI defaults: all declared tools are rendered with SGLang's schema
+Native V4 rendering comes from `rust/sglang-processor`, shared with SGLang's Rust
+server, and follows SGLang's serving path (`serving_chat.py`), not Dynamo's
+OpenAI defaults: all declared tools are rendered with SGLang's schema
 defaults, reasoning effort comes from `reasoning` / `reasoning_effort`, and the
 official/preview effort profile is detected from the checkpoint's
 `encoding/encoding_dsv4.py` or overridden by `dsv4_reasoning_effort_profile` in
