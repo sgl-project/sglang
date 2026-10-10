@@ -85,13 +85,22 @@ class RequestLogger:
         self.metadata = self._compute_metadata()
         self.targets = self._setup_targets()
 
+    def _skips_request_logging(self, obj: Any) -> bool:
+        """Whether this request must not be logged at all.
+
+        ``no_logs`` opts a single request out of logging (e.g. for ZDR
+        clients). ``getattr`` keeps request types that do not carry the
+        field (``EmbeddingReqInput``) logging as before.
+        """
+        return not self.log_requests or bool(getattr(obj, "no_logs", False))
+
     def log_received_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         tokenizer: Any = None,
         request: Optional[fastapi.Request] = None,
     ) -> None:
-        if not self.log_requests:
+        if self._skips_request_logging(obj):
             return
 
         max_length, skip_names, _ = self.metadata
@@ -162,7 +171,7 @@ class RequestLogger:
         out: Any,
         request: Optional[fastapi.Request] = None,
     ) -> None:
-        if not self.log_requests:
+        if self._skips_request_logging(obj):
             return
 
         e2e_latency_ms = out["meta_info"].get("e2e_latency", 0) * 1000
