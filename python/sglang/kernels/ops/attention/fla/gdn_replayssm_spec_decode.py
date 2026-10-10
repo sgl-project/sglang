@@ -812,6 +812,8 @@ def gdn_replayssm_compact_commit_kernel(
     base = tl.load(cache_base + replay_idx).to(tl.int32)
     o_t = tl.arange(0, MAX_CACHE_LEN)
     phys = (base + o_t) & (MAX_CACHE_LEN - 1)
+    # Zero decay cannot suppress NaN/Inf left in unused ring slots.
+    history_mask = o_t < n_history
     o_k = tl.arange(0, K)
     o_v = i_v * BV + tl.arange(0, BV)
     mask_v = o_v < V
@@ -828,21 +830,25 @@ def gdn_replayssm_compact_commit_kernel(
         k_cache
         + replay_idx * stride_k_slot
         + (i_h * MAX_CACHE_LEN + phys[:, None]) * K
-        + o_k[None, :]
+        + o_k[None, :],
+        mask=history_mask[:, None],
+        other=0.0,
     )
     if HAS_RESIDUAL:
         key_residual = tl.load(
             k_residual_cache
             + replay_idx * stride_k_residual_slot
             + (i_h * MAX_CACHE_LEN + phys[:, None]) * K
-            + o_k[None, :]
+            + o_k[None, :],
+            mask=history_mask[:, None],
+            other=0.0,
         )
     updates = tl.load(
         d_cache
         + replay_idx * stride_d_slot
         + (i_hv * MAX_CACHE_LEN + phys[:, None]) * V
         + o_v[None, :],
-        mask=mask_v[None, :],
+        mask=history_mask[:, None] & mask_v[None, :],
         other=0.0,
     ).to(tl.float32)
     if HAS_RESIDUAL:
@@ -851,19 +857,19 @@ def gdn_replayssm_compact_commit_kernel(
             + replay_idx * stride_d_residual_slot
             + (i_hv * MAX_CACHE_LEN + phys[:, None]) * V
             + o_v[None, :],
-            mask=mask_v[None, :],
+            mask=history_mask[:, None] & mask_v[None, :],
             other=0.0,
         ).to(tl.float32)
     gates = tl.load(
-        g_cache + replay_idx * stride_g_slot + i_hv * MAX_CACHE_LEN + phys
+        g_cache + replay_idx * stride_g_slot + i_hv * MAX_CACHE_LEN + phys,
+        mask=history_mask,
+        other=0.0,
     ).to(tl.float32)
 
     if fold_active:
-        active_mask = o_t < n_history
-        active_g = tl.where(active_mask, gates, 0.0)
-        active_prefix = tl.cumsum(active_g, axis=0)
-        active_total = tl.sum(active_g, axis=0)
-        active_decay = tl.where(active_mask, tl.exp(active_total - active_prefix), 0.0)
+        active_prefix = tl.cumsum(gates, axis=0)
+        active_total = tl.sum(gates, axis=0)
+        active_decay = tl.where(history_mask, tl.exp(active_total - active_prefix), 0.0)
         active_updates = updates * active_decay[:, None]
         active_hi = active_updates.to(k_cache.dtype.element_ty)
         active_lo = (active_updates - active_hi.to(tl.float32)).to(
@@ -887,16 +893,19 @@ def gdn_replayssm_compact_commit_kernel(
             track_prefix = tl.cumsum(track_g, axis=0)
             track_total = tl.sum(track_g, axis=0)
             track_decay = tl.where(track_mask, tl.exp(track_total - track_prefix), 0.0)
-            track_updates = updates * track_decay[:, None]
+            track_keys = tl.where(track_mask[:, None], keys, 0.0)
+            track_updates = tl.where(track_mask[:, None], updates, 0.0)
+            track_updates *= track_decay[:, None]
             track_hi = track_updates.to(k_cache.dtype.element_ty)
             track_lo = (track_updates - track_hi.to(tl.float32)).to(
                 k_cache.dtype.element_ty
             )
-            track_delta = tl.dot(tl.trans(keys), track_hi)
-            track_delta += tl.dot(tl.trans(keys), track_lo)
+            track_delta = tl.dot(tl.trans(track_keys), track_hi)
+            track_delta += tl.dot(tl.trans(track_keys), track_lo)
             if HAS_RESIDUAL:
-                track_delta += tl.dot(tl.trans(key_residual), track_hi)
-                track_delta += tl.dot(tl.trans(key_residual), track_lo)
+                track_key_residual = tl.where(track_mask[:, None], key_residual, 0.0)
+                track_delta += tl.dot(tl.trans(track_key_residual), track_hi)
+                track_delta += tl.dot(tl.trans(track_key_residual), track_lo)
             tl.store(
                 h0
                 + track_idx * stride_state_slot
