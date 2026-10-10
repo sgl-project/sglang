@@ -164,6 +164,23 @@ def count_pool_hits(results: dict[str, List[bool]]) -> dict[str, int]:
     }
 
 
+# Sidecars whose bytes differ per attention-TP rank even when the primary KV
+# pool is replicated. `HybridCacheController.should_backup` has every rank back
+# these up (Kimi-K3 Mamba/KDA state is TP-sharded under a replicated MLA pool),
+# so without a rank in the key the ranks overwrite each other's shard.
+RANK_SHARDED_POOLS = (PoolName.MAMBA,)
+
+
+def rank_shard_key_scope(
+    storage_config: HiCacheStorageConfig, component_name: Optional[str]
+) -> str:
+    """The key scope a rank-sharded sidecar needs when the model's own key has
+    no rank in it. Empty for a non-MLA model, whose keys are already per-rank."""
+    if not storage_config.is_mla_model or component_name not in RANK_SHARDED_POOLS:
+        return ""
+    return f"_{storage_config.tp_rank}_{storage_config.tp_size}"
+
+
 class HiCacheStorage(ABC):
     """
     HiCacheStorage is a class that provides a generic key-value interface for storing and retrieving KV cache.
@@ -385,6 +402,7 @@ class HiCacheFile(HiCacheStorage):
             or file_path
         )
 
+        self.storage_config = storage_config
         tp_rank, tp_size, pp_rank, pp_size, model_name, is_mla_model = (
             storage_config.tp_rank,
             storage_config.tp_size,
@@ -458,7 +476,10 @@ class HiCacheFile(HiCacheStorage):
     def _get_component_key(self, key: str, component_name: Optional[str] = None) -> str:
         if component_name is None or component_name in ("__default__", PoolName.KV):
             return self._get_suffixed_key(key)
-        return self._get_suffixed_key(f"{key}.{component_name}")
+        # The scope goes before config_suffix: both file scans select this
+        # rank's files with `stem.endswith(config_suffix)`.
+        scope = rank_shard_key_scope(self.storage_config, component_name)
+        return self._get_suffixed_key(f"{key}.{component_name}{scope}")
 
     def _scan_existing_files_to_metadata_cache(self) -> None:
         try:
