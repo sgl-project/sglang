@@ -10,6 +10,7 @@ from typing import (
     Tuple,
 )
 
+from sglang.srt.mem_cache.allocator.hisparse import HiSparseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.utils.common import ceil_align
@@ -98,6 +99,10 @@ class PoolStats:
             usage = max(usage, self.swa_token_usage)
         if self.is_hybrid_ssm:
             usage = max(usage, self.mamba_usage)
+        if self.is_hisparse:
+            usage = max(
+                usage, self.hisparse_device_token_usage, self.hisparse_host_token_usage
+            )
         assert usage is not None and usage >= 0, f"{usage=} is not valid"
         return usage
 
@@ -233,10 +238,15 @@ class SchedulerPoolStatsObserver:
         return pool_stats
 
     def _get_token_info(self) -> PoolStats:
-        available_size = self.token_to_kv_pool_allocator.available_size()
+        allocator = self.token_to_kv_pool_allocator
+        capacity = self.max_total_num_tokens
+        if isinstance(allocator, HiSparseTokenToKVPoolAllocator):
+            allocator = allocator.logical_attn_allocator
+            capacity = allocator.size
+        available_size = allocator.available_size()
         evictable_size = self.tree_cache.evictable_size()
-        num_used = self.max_total_num_tokens - (available_size + evictable_size)
-        token_usage = num_used / self.max_total_num_tokens
+        num_used = capacity - (available_size + evictable_size)
+        token_usage = num_used / capacity
         return PoolStats(
             full_num_used=num_used,
             full_token_usage=token_usage,
@@ -262,7 +272,11 @@ class SchedulerPoolStatsObserver:
             self.tree_cache.supports_mamba()
             and self.tree_cache.supports_prefix_sharing()
         )
-        full_available_size = self.token_to_kv_pool_allocator.available_size()
+        allocator = self.token_to_kv_pool_allocator
+        if isinstance(allocator, HiSparseTokenToKVPoolAllocator):
+            # Admission also checks the hot pool; occupancy counts logical KV.
+            allocator = allocator.logical_attn_allocator
+        full_available_size = allocator.available_size()
         full_evictable_size = (
             self.tree_cache.full_evictable_size() if is_mamba_radix_cache else 0
         )
@@ -282,7 +296,7 @@ class SchedulerPoolStatsObserver:
             else 0
         )
         full_capacity = self.req_to_token_pool.schedulable_token_capacity(
-            self.token_to_kv_pool_allocator.size
+            allocator.size
         )
         full_num_used = full_capacity - (full_available_size + full_evictable_size)
         mamba_num_used = self.req_to_token_pool.mamba_pool.size - (
