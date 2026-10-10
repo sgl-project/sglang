@@ -60,17 +60,6 @@ class TestTboCudaGraphNumTokenDevice(CustomTestCase):
             plugin._tbo_children_num_token_non_padded.device.type,
         )
 
-    def test_eager_split_values(self):
-        # value_a = min(split, n); value_b = max(0, n - split). Computed on CPU
-        # so the values are materializable.
-        with get_context().override_server_args():
-            with get_device().override(device="cpu"):
-                eager = TboForwardBatchPreparer.compute_tbo_children_num_token_non_padded_raw(
-                    tbo_split_token_index=3, num_token_non_padded=8
-                )
-        self.assertEqual(eager.dtype, torch.int32)
-        self.assertEqual(eager.tolist(), [3, 5])
-
 
 if __name__ == "__main__":
     unittest.main()

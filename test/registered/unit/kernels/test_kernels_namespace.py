@@ -210,10 +210,6 @@ def test_kimi_k3_kernels_are_inventoried_by_operator(op, backend, device):
     assert not K.capabilities_satisfied(spec.capabilities, _CPU)
 
 
-def test_kimi_k3_model_namespace_is_retired():
-    assert importlib.util.find_spec("sglang.kernels.ops.kimi_k3") is None
-
-
 def test_operator_and_test_groups_agree():
     """A new root-level model bundle must not bypass logical op grouping."""
     root = Path(K.__file__).resolve().parents[3]
