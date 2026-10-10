@@ -1196,6 +1196,11 @@ class FluxTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     Reference: https://blackforestlabs.ai/announcing-black-forest-labs/
     """
 
+    _compile_conditions = [
+        lambda name, module: isinstance(
+            module, (FluxTransformerBlock, FluxSingleTransformerBlock)
+        )
+    ]
     param_names_mapping = FluxConfig().arch_config.param_names_mapping
 
     @classmethod

@@ -5,6 +5,11 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch.nn as nn
 
+from sglang.multimodal_gen.runtime.models.dits.flux import (
+    FluxSingleTransformerBlock,
+    FluxTransformer2DModel,
+    FluxTransformerBlock,
+)
 from sglang.multimodal_gen.runtime.models.dits.ltx_2 import (
     LTX2VideoTransformer3DModel,
 )
@@ -193,6 +198,18 @@ def test_ltx2_compile_conditions_match_only_direct_blocks():
     assert not any(
         condition("transformer_blocks", object()) for condition in conditions
     )
+
+
+def test_flux_compile_conditions_match_both_block_types():
+    def matches(module) -> bool:
+        return any(
+            condition("transformer_blocks.0", module)
+            for condition in FluxTransformer2DModel._compile_conditions
+        )
+
+    assert matches(FluxTransformerBlock.__new__(FluxTransformerBlock))
+    assert matches(FluxSingleTransformerBlock.__new__(FluxSingleTransformerBlock))
+    assert not matches(nn.Linear(2, 2))
 
 
 def test_compile_matching_submodules_matches_only_declared_regions():
