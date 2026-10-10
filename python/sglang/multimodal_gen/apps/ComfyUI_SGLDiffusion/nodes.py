@@ -8,6 +8,8 @@ import os
 import urllib.parse
 import uuid
 
+import comfy.model_management
+import comfy.utils
 import folder_paths
 import torch
 
@@ -45,6 +47,15 @@ class SGLDH3DistilledSigmas:
         from .executors.minimax_h3 import distilled_h3_sigmas
 
         return (torch.tensor(distilled_h3_sigmas(model_type)),)
+
+
+def _comfy_job_hooks() -> dict:
+    """Wire a server-mode job into ComfyUI's progress bar and Cancel button."""
+    pbar = comfy.utils.ProgressBar(100)
+    return {
+        "progress_callback": pbar.update_absolute,
+        "check_interrupt": comfy.model_management.throw_exception_if_processing_interrupted,
+    }
 
 
 class SGLDOptions:
@@ -682,7 +693,9 @@ class SGLDiffusionGenerateVideo:
 
         # Call API
         try:
-            response = sgld_client.generate_video(**request_params)
+            response = sgld_client.generate_video(
+                **request_params, **_comfy_job_hooks()
+            )
             video_path = response.get("file_path", "")
             # The server may have resolved a different size than requested
             # (e.g. to match an image-to-video input's aspect ratio).
@@ -690,6 +703,8 @@ class SGLDiffusionGenerateVideo:
             if resolved_size:
                 width, height = (int(v) for v in resolved_size.split("x"))
             video = convert_video_to_comfy_video(video_path, height, width)
+        except comfy.model_management.InterruptProcessingException:
+            raise
         except Exception as e:
             raise RuntimeError(f"Failed to generate video: {str(e)}")
 
@@ -934,7 +949,11 @@ class SGLDiffusionGenerateH3:
             request_params["seed"] = seed
 
         try:
-            response = sgld_client.generate_video(**request_params)
+            response = sgld_client.generate_video(
+                **request_params, **_comfy_job_hooks()
+            )
+        except comfy.model_management.InterruptProcessingException:
+            raise
         except Exception as e:
             raise RuntimeError(f"Failed to generate MiniMax-H3 video: {str(e)}")
 

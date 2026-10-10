@@ -77,6 +77,34 @@ def _install_comfy_stubs() -> None:
         "unet_to_diffusers",
     ):
         setattr(comfy_utils, name, lambda *a, **k: None)
+
+    class InterruptProcessingException(Exception):
+        pass
+
+    _interrupt = {"flag": False}
+
+    def throw_exception_if_processing_interrupted():
+        if _interrupt["flag"]:
+            raise InterruptProcessingException()
+
+    comfy.model_management.InterruptProcessingException = InterruptProcessingException
+    comfy.model_management.throw_exception_if_processing_interrupted = (
+        throw_exception_if_processing_interrupted
+    )
+    comfy.model_management._test_interrupt = _interrupt
+
+    class ProgressBar:
+        instances = []
+
+        def __init__(self, total):
+            self.total = total
+            self.values = []
+            ProgressBar.instances.append(self)
+
+        def update_absolute(self, value, total=None, preview=None):
+            self.values.append(value)
+
+    comfy_utils.ProgressBar = ProgressBar
     comfy.utils = comfy_utils
 
     comfy_model_patcher = types.ModuleType("comfy.model_patcher")
@@ -99,6 +127,15 @@ def _install_comfy_stubs() -> None:
 
         def add_wrapper_with_key(self, *a, **k):
             pass
+
+        # ComfyUI: loaded_size() reads the model's own weight counter (0 for
+        # SGLD, whose weights live in the worker); detach() is what
+        # LoadedModel.model_unload always ends in.
+        def loaded_size(self):
+            return getattr(self.model, "model_loaded_weight_memory", 0)
+
+        def detach(self, unpatch_all=True):
+            return self.model
 
     comfy_model_patcher.ModelPatcher = ModelPatcher
     comfy.model_patcher = comfy_model_patcher
@@ -150,7 +187,14 @@ def _load_plugin():
 
     _load(f"{PKG}.utils", "utils.py")
     nodes = _load(f"{PKG}.nodes", "nodes.py")
-    return server_api, model_patcher, generator, nodes, sys.modules[f"{PKG}.utils"], folder_paths
+    return (
+        server_api,
+        model_patcher,
+        generator,
+        nodes,
+        sys.modules[f"{PKG}.utils"],
+        folder_paths,
+    )
 
 
 SERVER_API, MODEL_PATCHER, GENERATOR, NODES, UTILS, FOLDER_PATHS = _load_plugin()
@@ -218,7 +262,9 @@ def test_set_lora_sends_strength_to_server():
         return _Response({"status": "ok"})
 
     with mock.patch(f"{PKG}.core.server_api.requests.post", side_effect=fake_post):
-        client.set_lora(lora_nickname="style", lora_path="style.safetensors", strength=0.7)
+        client.set_lora(
+            lora_nickname="style", lora_path="style.safetensors", strength=0.7
+        )
 
     assert captured["strength"] == 0.7
 
@@ -293,9 +339,7 @@ def test_generate_video_uploads_local_input_reference_instead_of_sending_path():
     out_path = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False).name
 
     def fake_get(url, headers=None, timeout=None, **kwargs):
-        return _Response(
-            {"id": "job-1", "status": "completed", "file_path": out_path}
-        )
+        return _Response({"id": "job-1", "status": "completed", "file_path": out_path})
 
     with (
         mock.patch(f"{PKG}.core.server_api.requests.post", side_effect=fake_post),
@@ -358,3 +402,87 @@ def test_h3_allows_local_video_reference_against_local_server():
         "/data/clip.mp4", "reference_video", "http://127.0.0.1:3000/v1"
     )
     assert uri == "file:///data/clip.mp4"
+
+
+# --- server-mode video jobs: no progress bar, Cancel was ignored ------------
+
+
+def _video_client_with_statuses(statuses):
+    client = SGLDiffusionServerAPI(base_url="http://127.0.0.1:1234")
+    polled = iter(statuses)
+
+    def fake_get(url, **kwargs):
+        return _Response(next(polled))
+
+    def fake_post(url, **kwargs):
+        return _Response({"id": "vid1"})
+
+    return client, fake_get, fake_post
+
+
+def test_generate_video_reports_server_progress():
+    client, fake_get, fake_post = _video_client_with_statuses(
+        [
+            {"status": "queued", "progress": 0},
+            {"status": "in_progress", "progress": 40},
+            {"status": "completed", "progress": 100, "file_path": "/tmp/x.mp4"},
+        ]
+    )
+    seen = []
+    with (
+        mock.patch.object(SERVER_API.requests, "get", fake_get),
+        mock.patch.object(SERVER_API.requests, "post", fake_post),
+        mock.patch.object(SERVER_API.time, "sleep"),
+        mock.patch.object(client, "_localize_video_result", lambda s, *a: s),
+    ):
+        client.generate_video(prompt="a cat", progress_callback=seen.append)
+    assert seen == [0, 40, 100]
+
+
+def test_generate_video_stops_polling_when_interrupted():
+    client, fake_get, fake_post = _video_client_with_statuses(
+        [{"status": "in_progress", "progress": 10}] * 50
+    )
+    checks = {"n": 0}
+
+    class Interrupted(Exception):
+        pass
+
+    def check_interrupt():
+        checks["n"] += 1
+        if checks["n"] > 2:
+            raise Interrupted()
+
+    with (
+        mock.patch.object(SERVER_API.requests, "get", fake_get),
+        mock.patch.object(SERVER_API.requests, "post", fake_post),
+        mock.patch.object(SERVER_API.time, "sleep"),
+    ):
+        with pytest.raises(Interrupted):
+            client.generate_video(prompt="a cat", check_interrupt=check_interrupt)
+    assert checks["n"] == 3  # stopped promptly, did not poll to completion
+
+
+def test_video_node_wires_comfy_progress_bar_and_interrupt():
+    client = SGLDiffusionServerAPI(base_url="http://127.0.0.1:1234")
+    node = NODES.SGLDiffusionGenerateVideo()
+    captured = {}
+
+    def fake_generate_video(**kwargs):
+        captured.update(kwargs)
+        return {"file_path": "/tmp/x.mp4", "size": "1280x720"}
+
+    with mock.patch.object(client, "generate_video", fake_generate_video):
+        node.generate_video(
+            sgld_client=client, positive_prompt="a cat", width=1280, height=720
+        )
+    captured["progress_callback"](55)
+    assert sys.modules["comfy.utils"].ProgressBar.instances[-1].values == [55]
+    sys.modules["comfy.model_management"]._test_interrupt["flag"] = True
+    try:
+        with pytest.raises(
+            sys.modules["comfy.model_management"].InterruptProcessingException
+        ):
+            captured["check_interrupt"]()
+    finally:
+        sys.modules["comfy.model_management"]._test_interrupt["flag"] = False
