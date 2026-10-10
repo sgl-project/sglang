@@ -4,7 +4,8 @@ from unittest.mock import patch
 
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policy import CacheAwarePolicy, SchedulePolicy
-from sglang.srt.mem_cache.radix_cache import RadixCache
+from sglang.srt.mem_cache.base_prefix_cache import InsertParams
+from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -225,6 +226,44 @@ class TestShortestPrefillFirst(CustomTestCase):
                 256,
             )
         )
+
+
+class TestAdmissionMatchedPrefixTokens(CustomTestCase):
+    """init_next_round_input records the admission re-match length.
+
+    Cache-agnostic policies (fcfs, lof, random, routing-key) skip the
+    sort-time match in calc_priority, so before this fix their reqs kept
+    num_matched_prefix_tokens at 0 while still reusing cached prefixes --
+    load snapshots (uncached waiting tokens) and cache-hit reporting then
+    read zero reuse.
+    """
+
+    def _cache_with_shared_prefix(self):
+        tree_cache = RadixCache.create_simulated()
+        tree_cache.insert(
+            InsertParams(key=RadixKey(token_ids=array("q", list(range(64)))))
+        )
+        return tree_cache
+
+    def test_warm_req_records_match_length(self):
+        warm = _make_req("warm", "y", list(range(64)) + [7, 8, 9])
+        warm.init_next_round_input(self._cache_with_shared_prefix())
+        self.assertEqual(warm.num_matched_prefix_tokens, 64)
+
+    def test_cold_req_stays_zero(self):
+        cold = _make_req("cold", "x" * 80, [100 + i for i in range(80)])
+        cold.init_next_round_input(RadixCache.create_simulated())
+        self.assertEqual(cold.num_matched_prefix_tokens, 0)
+
+    def test_records_after_retraction_reset(self):
+        # Retraction resets num_matched_prefix_tokens to 0; the next
+        # admission re-match must re-record the real reuse.
+        warm = _make_req("warm", "y", list(range(64)) + [7, 8, 9])
+        warm.init_next_round_input(self._cache_with_shared_prefix())
+        self.assertEqual(warm.num_matched_prefix_tokens, 64)
+        warm.num_matched_prefix_tokens = 0  # simulate the retraction reset
+        warm.init_next_round_input(self._cache_with_shared_prefix())
+        self.assertEqual(warm.num_matched_prefix_tokens, 64)
 
 
 if __name__ == "__main__":
