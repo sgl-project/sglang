@@ -40,9 +40,11 @@ SGL_TEST_FILES_CI_DATA_REPO = "sgl-project/ci-data-diffusion"
 SGL_TEST_FILES_CI_DATA_REVISION = "75992dbf1d6eaeacbc1c2cd6beb48f77dd7ae4f7"
 
 # The NPU pin is kept as a separate branch so ascend GT can be bumped independently
-# when it's regenerated on its own cadence.
+# when it's regenerated on its own cadence. aeeb38b9 re-generated the MiniMax-H3
+# frames after #38671 made num_inference_steps=50 run 50 denoising updates
+# (previously 49), which shifted the sampled trajectory off the old GT.
 if current_platform.is_npu():
-    SGL_TEST_FILES_CI_DATA_REVISION = "609c4cef31864d75dbd11fe3c26b8ae09469204d"
+    SGL_TEST_FILES_CI_DATA_REVISION = "aeeb38b9a586d3ebde8135e12887372d573c18b0"
 
 SGL_TEST_FILES_CONSISTENCY_GT_ROOT = (
     "https://raw.githubusercontent.com/"
