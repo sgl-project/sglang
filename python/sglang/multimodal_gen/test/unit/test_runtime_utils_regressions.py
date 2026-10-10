@@ -1,5 +1,6 @@
 """Regression tests for small runtime/utils and pipeline helper bugs (CPU only)."""
 
+import base64
 import io
 from types import SimpleNamespace
 
@@ -7,6 +8,7 @@ import pytest
 from PIL import Image
 
 from sglang.multimodal_gen.runtime.utils import vision
+from sglang.multimodal_gen.runtime.utils.image_io import save_base64_image_to_path
 
 
 def _gif_bytes() -> bytes:
@@ -32,3 +34,18 @@ def test_load_video_removes_downloaded_temp_file(monkeypatch, tmp_path, payload)
         pass
 
     assert list(tmp_path.iterdir()) == []
+
+
+def test_line_wrapped_base64_image_is_saved_in_full(tmp_path):
+    """A MIME-style base64 payload with newlines was silently cut at the first
+    line, and the truncated bytes were written to disk without an error."""
+    raw = bytes(range(256)) * 2
+    wrapped = base64.encodebytes(raw).decode()
+    assert "\n" in wrapped.strip()
+
+    path = save_base64_image_to_path(
+        f"data:image/png;base64,{wrapped}", str(tmp_path / "upload")
+    )
+
+    with open(path, "rb") as f:
+        assert f.read() == raw
