@@ -972,7 +972,8 @@ def test_pp_load_queue_failure_releases_full_and_swa_slots(pp_cache, raises):
     assert not cache.linker.pending_loads
     assert not cache.linker.pending_pp_prefixes
     assert not req.kv.holds_kv
-    assert not cache.tree_core.root_node.children
+    match = cache.match_prefix(MatchPrefixParams(key=RadixKey(req.origin_input_ids)))
+    assert match.device_prefix_len == 0
 
 
 @pytest.mark.parametrize(
