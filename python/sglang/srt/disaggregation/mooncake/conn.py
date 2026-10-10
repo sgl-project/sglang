@@ -278,6 +278,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             # Peers already cleared at registration; skip the per-transfer check.
             self.state_strides_validated: Set[str] = set()
             self.session_lock = threading.Lock()
+            self._transfer_completion_condition = threading.Condition()
             self.start_prefill_thread()
             # Determine the number of threads to use for kv sender
             cpu_count = os.cpu_count()
@@ -348,6 +349,31 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             if self.enable_staging:
                 self._init_staging_allocator()
             self.start_decode_thread()
+
+    def update_status(self, bootstrap_room: int, status: KVPoll):
+        super().update_status(bootstrap_room, status)
+        condition = getattr(self, "_transfer_completion_condition", None)
+        if condition is not None and status in (KVPoll.Success, KVPoll.Failed):
+            with condition:
+                condition.notify_all()
+
+    def wait_for_transfer_rooms(
+        self, bootstrap_rooms: Set[int], timeout_s: float
+    ) -> bool:
+        """Wait briefly for final rooms so the scheduler can poll before forward."""
+        if not bootstrap_rooms or timeout_s <= 0:
+            return False
+
+        def all_terminal() -> bool:
+            return all(
+                self.request_status.get(room) in (None, KVPoll.Success, KVPoll.Failed)
+                for room in bootstrap_rooms
+            )
+
+        with self._transfer_completion_condition:
+            return self._transfer_completion_condition.wait_for(
+                all_terminal, timeout=timeout_s
+            )
 
     def init_engine(self):
         self.engine = get_mooncake_transfer_engine()
