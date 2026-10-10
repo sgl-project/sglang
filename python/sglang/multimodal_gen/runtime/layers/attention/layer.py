@@ -816,10 +816,17 @@ class USPAttention(nn.Module):
         skip_sequence_parallel: bool = False,
         enable_packed_qkv_input_a2a: bool = False,
         is_cross_attention: bool = False,
+        global_num_heads: int | None = None,
         **extra_impl_args,
     ) -> None:
         """
         Args:
+            global_num_heads:
+              query heads of the layer before TP sharding. Lets the torch
+              SDPA backend keep heads sharded by TP or Ulysses on the same
+              flash kernel as the unsharded layer for "exact" quality
+              requests. Defaults to ``num_heads``, which covers Ulysses
+              sharding only.
             skip_sequence_parallel:
               when KV is replicated across all SP ranks (e.g. cross-attention to
               text/image encoder outputs), the full USP pipeline is redundant:
@@ -868,6 +875,7 @@ class USPAttention(nn.Module):
             num_kv_heads=num_kv_heads,
             prefix=f"{prefix}.impl",
             is_cross_attention=is_cross_attention,
+            global_num_heads=global_num_heads or num_heads,
             **extra_impl_args,
         )
         self.attn_impl = impl_cls(**self._attn_impl_ctor_kwargs)

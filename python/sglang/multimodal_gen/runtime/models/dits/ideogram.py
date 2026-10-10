@@ -323,6 +323,7 @@ class Ideogram4Attention(nn.Module):
         self.norm_k = Ideogram4RMSNorm(self.head_dim, eps=eps)
         self.attn = USPAttention(
             num_heads=self.local_num_heads,
+            global_num_heads=num_heads,
             head_size=self.head_dim,
             dropout_rate=0,
             softmax_scale=None,

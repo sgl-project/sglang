@@ -375,6 +375,7 @@ class MMDoubleStreamBlock(nn.Module):
         )
         self.attn = USPAttention(
             num_heads=self.local_heads_num,
+            global_num_heads=self.heads_num,
             head_size=self.head_dim,
             causal=False,
             supported_attention_backends=supported_attention_backends,

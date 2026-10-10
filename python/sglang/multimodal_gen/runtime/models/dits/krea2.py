@@ -321,6 +321,7 @@ class Attention(nn.Module):
         # Native GQA flash via the platform backend; parameterless.
         self.attn = USPAttention(
             num_heads=self.local_heads,
+            global_num_heads=self.heads,
             head_size=self.headdim,
             num_kv_heads=self.local_kvheads,
             dropout_rate=0,

@@ -228,6 +228,7 @@ class AnimaAttention(nn.Module):
         self.attn = USPAttention(
             self.heads,
             self.head_dim,
+            global_num_heads=config.num_attention_heads,
             is_cross_attention=cross_attention,
             skip_sequence_parallel=cross_attention,
             prefix=prefix,

@@ -264,6 +264,7 @@ class LingBotVideoAttention(nn.Module):
         )
         self.attn = USPAttention(
             num_heads=self.local_num_heads,
+            global_num_heads=num_heads,
             head_size=self.head_dim,
             dropout_rate=0,
             softmax_scale=None,

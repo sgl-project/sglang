@@ -359,6 +359,7 @@ class MMDoubleStreamBlock(nn.Module):
 
         self.attn = USPAttention(
             num_heads=self.local_num_attention_heads,
+            global_num_heads=num_attention_heads,
             head_size=head_dim,
             causal=False,
             supported_attention_backends=supported_attention_backends,
@@ -557,6 +558,7 @@ class MMSingleStreamBlock(nn.Module):
 
         self.attn = USPAttention(
             num_heads=self.local_num_attention_heads,
+            global_num_heads=num_attention_heads,
             head_size=head_dim,
             causal=False,
             supported_attention_backends=supported_attention_backends,

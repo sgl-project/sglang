@@ -365,7 +365,10 @@ class QwenImage21Attention(nn.Module):
             self.heads, self.head_dim, supported_attention_backends=backends
         )
         self.target_attn = USPAttention(
-            self.heads, self.head_dim, supported_attention_backends=backends
+            self.heads,
+            self.head_dim,
+            supported_attention_backends=backends,
+            global_num_heads=ac.num_attention_heads,
         )
 
     def pack_qkv_weights(self):

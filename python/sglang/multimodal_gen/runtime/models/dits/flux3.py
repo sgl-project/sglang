@@ -502,6 +502,7 @@ class Flux3Block(nn.Module):
         self.pre_norm = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.attn = USPAttention(
             num_heads=self.local_heads,
+            global_num_heads=num_heads,
             head_size=self.head_dim,
             causal=False,
             supported_attention_backends=supported_attention_backends,

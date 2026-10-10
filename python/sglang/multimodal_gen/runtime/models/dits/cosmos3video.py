@@ -764,6 +764,7 @@ class Cosmos3CrossAttention(nn.Module):
 
         self.attn = USPAttention(
             num_heads=self.local_num_attention_heads,
+            global_num_heads=num_attention_heads,
             head_size=head_dim,
             num_kv_heads=self.local_num_key_value_heads,
             causal=False,
