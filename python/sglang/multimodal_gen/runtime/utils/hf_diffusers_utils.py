@@ -621,6 +621,10 @@ def maybe_download_lora(
             guessed = _best_guess_weight_name(
                 model_name_or_path, file_extension=".safetensors"
             )
+        if guessed is None:
+            raise FileNotFoundError(
+                f"No .safetensors LoRA weights found in {local_path}"
+            )
         return os.path.join(local_path, guessed)
 
     resolved_weight = resolve_weight(model_name_or_path, weight_name=weight_name)
