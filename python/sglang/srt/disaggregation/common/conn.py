@@ -198,6 +198,8 @@ class CommonKVManager(BaseKVManager):
         self.attn_cp_rank = parallel.attn_cp_rank
         self.dcp_size = parallel.attn_dcp_size
         self.dcp_rank = parallel.attn_dcp_rank
+        self.draft_dcp_size = parallel.draft_dcp_size
+        self.draft_dcp_rank = parallel.draft_dcp_rank
         self.attn_dp_size = parallel.attn_dp_size
         self.attn_dp_rank = parallel.attn_dp_rank
         self.system_dp_size = get_parallel().dp_size
@@ -352,7 +354,10 @@ class CommonKVManager(BaseKVManager):
         )
 
     def prepare_dcp_token_item_lens(
-        self, dst_page_item_lens: List[Optional[int]], dst_dcp_size: int
+        self,
+        dst_page_item_lens: List[Optional[int]],
+        dst_dcp_size: int,
+        dst_draft_dcp_size: int = 1,
     ) -> List[int]:
         page_size = self.kv_args.page_size
         num_draft = self.kv_args.num_draft_entries
@@ -369,8 +374,12 @@ class CommonKVManager(BaseKVManager):
         for i, dst_item_len in enumerate(dst_page_item_lens):
             if dst_item_len is None:
                 continue
+            # Draft rows page the virtual ids of the DCP ranks the draft pool
+            # is replicated across; target rows page per rank.
             dst_page_scale = page_size * (
-                dst_dcp_size if i >= num_entries - num_draft else 1
+                dst_dcp_size // dst_draft_dcp_size
+                if i >= num_entries - num_draft
+                else 1
             )
             if dst_item_len // dst_page_scale != src_token_lens[i]:
                 raise RuntimeError(

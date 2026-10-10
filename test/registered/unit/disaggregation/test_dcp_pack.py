@@ -156,6 +156,26 @@ class TestPackedDcpGrouping(CustomTestCase):
         self.assertEqual(draft_dst, [[0, 1, 2, 3, 4, 5, 6, 7]])
 
 
+class TestDraftShardedPlan(CustomTestCase):
+    def test_draft_shards_the_virtual_page_at_its_own_width(self):
+        """A draft at draft_dcp_size 2 under DCP 4 takes every other token into a
+        page half the virtual page, while the target keeps its 4-way stride."""
+        plan = _plan(
+            src=[0, 1, 2, 3],
+            dst=[0],
+            page_size=2,
+            dcp_size=4,
+            dcp_rank=0,
+            num_kv_tokens=8,
+            draft_dcp_size=2,
+            draft_dcp_rank=1,
+        )
+        np.testing.assert_array_equal(plan.target_src_token_indices, [0, 4])
+        np.testing.assert_array_equal(plan.target_dst_token_indices, [0, 1])
+        np.testing.assert_array_equal(plan.draft_src_token_indices, [1, 3, 5, 7])
+        np.testing.assert_array_equal(plan.draft_dst_token_indices, [0, 1, 2, 3])
+
+
 def _dcp_kv_manager_stub(*, page_size, kv_item_lens, num_draft_entries):
     return SimpleNamespace(
         kv_args=SimpleNamespace(
@@ -177,6 +197,17 @@ class TestPrepareDcpTokenItemLens(CustomTestCase):
             mgr, [64 * 32, 64 * 32, 4 * 64 * 16], dst_dcp_size=4
         )
         self.assertEqual(token_lens, [32, 32, 16])
+
+    def test_draft_tail_scales_by_the_ranks_it_is_replicated_across(self):
+        mgr = _dcp_kv_manager_stub(
+            page_size=64,
+            kv_item_lens=[64 * 32, 64 * 16],
+            num_draft_entries=1,
+        )
+        token_lens = CommonKVManager.prepare_dcp_token_item_lens(
+            mgr, [64 * 32, 2 * 64 * 16], dst_dcp_size=4, dst_draft_dcp_size=2
+        )
+        self.assertEqual(token_lens, [32, 16])
 
     def test_rejects_unscaled_draft_item_len(self):
         mgr = _dcp_kv_manager_stub(

@@ -160,10 +160,17 @@ class AscendKVManager(MooncakeKVManager):
         return layout
 
     def prepare_dcp_token_item_lens(
-        self, dst_page_item_lens: List[Optional[int]], dst_dcp_size: int
+        self,
+        dst_page_item_lens: List[Optional[int]],
+        dst_dcp_size: int,
+        dst_draft_dcp_size: int = 1,
     ) -> List[int]:
         if not self._is_npu_dsa_layout():
-            return super().prepare_dcp_token_item_lens(dst_page_item_lens, dst_dcp_size)
+            return super().prepare_dcp_token_item_lens(
+                dst_page_item_lens,
+                dst_dcp_size,
+                dst_draft_dcp_size=dst_draft_dcp_size,
+            )
         self._get_dcp_remote_decode_layout()
         page_size = self.kv_args.page_size
         token_item_lens = []
@@ -423,6 +430,8 @@ class AscendKVManager(MooncakeKVManager):
         dst_kv_item_lens: Optional[List[int]] = None,
         dst_tp_rank: int = 0,
         dst_attn_tp_size: Optional[int] = None,
+        dst_draft_dcp_size: int = 1,
+        dst_draft_dcp_rank: int = 0,
     ) -> int:
         if not self._is_npu_dsa_layout():
             return super().send_kvcache_dcp(
@@ -442,6 +451,8 @@ class AscendKVManager(MooncakeKVManager):
                 dst_kv_item_lens=dst_kv_item_lens,
                 dst_tp_rank=dst_tp_rank,
                 dst_attn_tp_size=dst_attn_tp_size,
+                dst_draft_dcp_size=dst_draft_dcp_size,
+                dst_draft_dcp_rank=dst_draft_dcp_rank,
             )
 
         src_kv_ptrs = self.kv_args.kv_data_ptrs
@@ -483,8 +494,16 @@ class AscendKVManager(MooncakeKVManager):
                     f"Ascend PD DCP source geometry differs at entry {entry}"
                 )
             if dst_kv_item_lens:
+                # A draft entry spans the ranks the draft pool is replicated
+                # across; a target entry on global slots spans every rank.
+                is_draft_entry = entry >= num_entries - self.kv_args.num_draft_entries
+                dst_slot_scale = (
+                    dst_dcp_size // dst_draft_dcp_size
+                    if is_draft_entry
+                    else dst_dcp_size
+                )
                 expected_dst_bytes = page_bytes * (
-                    dst_dcp_size if uses_global_slots else 1
+                    dst_slot_scale if uses_global_slots else 1
                 )
                 if dst_kv_item_lens[entry] != expected_dst_bytes:
                     raise RuntimeError(

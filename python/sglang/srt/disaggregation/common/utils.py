@@ -159,6 +159,8 @@ def build_dcp_token_transfer_plan(
     src_page_offset: int = 0,
     decode_prefix_len: int = 0,
     num_kv_tokens: Optional[int] = None,
+    draft_dcp_size: int = 1,
+    draft_dcp_rank: int = 0,
 ) -> DCPTokenTransferPlan:
     src_pages = np.asarray(src_page_indices, dtype=np.int64)
     dst_pages = np.asarray(dst_page_indices, dtype=np.int64)
@@ -182,8 +184,6 @@ def build_dcp_token_transfer_plan(
             + dst_local % dst_page_size,
         )
 
-    draft_offsets = np.arange(num_kv_tokens, dtype=np.int64)
-    draft_local = src_page_offset * physical_page_size + draft_offsets
     chunk_start = decode_prefix_len + src_page_offset * physical_page_size
     target_offsets = np.arange(
         (dcp_rank - chunk_start) % dcp_size,
@@ -192,6 +192,18 @@ def build_dcp_token_transfer_plan(
         dtype=np.int64,
     )
     target_local = (src_page_offset * physical_page_size + target_offsets) // dcp_size
+    # The draft shards the virtual page at its own width: every token when it
+    # is replicated (draft_dcp_size == 1), else the same stride as the target.
+    draft_page_size = virtual_page_size // draft_dcp_size
+    draft_offsets = np.arange(
+        (draft_dcp_rank - chunk_start) % draft_dcp_size,
+        num_kv_tokens,
+        draft_dcp_size,
+        dtype=np.int64,
+    )
+    draft_local = (
+        src_page_offset * physical_page_size + draft_offsets
+    ) // draft_dcp_size
     target_src, target_dst = rows(target_offsets, physical_page_size, target_local)
-    draft_src, draft_dst = rows(draft_offsets, virtual_page_size, draft_local)
+    draft_src, draft_dst = rows(draft_offsets, draft_page_size, draft_local)
     return DCPTokenTransferPlan(target_src, target_dst, draft_src, draft_dst)
