@@ -186,14 +186,14 @@ _is_amx_available = cpu_has_amx_support()
 _is_xpu = is_xpu()
 
 # Head-group ratios (num_v_heads // num_k_heads) served by the fused
-# split/reshape/cat Triton kernel. On AMD/aiter the ratio-8 layout is also
-# covered by the fused kernel, which removes the two `.contiguous()` copies
-# plus the `torch.cat` of the unfused fallback. On CUDA the ratio-3 dense 27B
-# layout is handled by the Triton kernel's per-head walk (the CPU fused op
-# still requires a power-of-two group). Other backends keep the original
-# tuple so their control flow is unchanged.
+# split/reshape/cat Triton kernel, which removes the two `.contiguous()`
+# copies plus the `torch.cat` of the unfused fallback. On CUDA and AMD/aiter
+# the ratio-3 dense 27B layout is handled by the Triton kernel's per-head walk
+# (the CPU fused op still requires a power-of-two group). On AMD/aiter the
+# ratio-8 layout is also covered by the fused kernel. Other backends keep the
+# original tuple so their control flow is unchanged.
 _GDN_FUSED_QKVZBA_RATIOS = (
-    (1, 2, 4, 8) if _use_aiter else (1, 2, 3, 4) if _is_cuda else (1, 2, 4)
+    (1, 2, 3, 4, 8) if _use_aiter else (1, 2, 3, 4) if _is_cuda else (1, 2, 4)
 )
 
 cached_get_processor = lru_cache(get_processor)
