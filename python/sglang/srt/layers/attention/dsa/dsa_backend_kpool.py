@@ -43,12 +43,16 @@ class DeepseekSparseAttnBackendKPoolMixin:
             topk_indices is None
             or self.dsa_index_kpool <= 1
             or dsa_impl in ("fa3", "tilelang", "trtllm")
+            or (
+                dsa_impl in ("triton", "aiter_sparse_mla")
+                and getattr(self, "_triton_kpool_tail_supported", False)
+            )
         ):
             return
         raise NotImplementedError(
             "index_kpool > 1 appends tail tokens to topk_indices and is "
-            f"currently only supported by the FA3/TileLang/TRTLLM DSA {phase} "
-            "backend."
+            "currently only supported by the FA3/TileLang/TRTLLM backends and "
+            f"the validated GLM-5.3 Triton/AITER sparse-MLA DSA {phase} backends."
         )
 
     def _resolve_kpool_tail_backend(
