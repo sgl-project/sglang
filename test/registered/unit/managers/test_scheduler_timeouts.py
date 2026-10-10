@@ -40,6 +40,7 @@ class _FakeReq:
         self.cache_request_handle = CacheRequestHandle(rid, 0)
         self.to_finish = None
         self.beam_group = None
+        self.multimodal_inputs = None
         self._finished = is_finished
         self.output_ids = []
         self.weight_version_events = []

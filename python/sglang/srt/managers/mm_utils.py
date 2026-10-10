@@ -654,6 +654,46 @@ def _embed_mm_inputs_with_split(
     return input_embeds, other_info
 
 
+def _is_releasable_feature(feature) -> bool:
+    if isinstance(feature, torch.Tensor):
+        return True
+    return (
+        isinstance(feature, (list, tuple))
+        and bool(feature)
+        and all(isinstance(tensor, torch.Tensor) for tensor in feature)
+    )
+
+
+def should_release_mm_features(server_args) -> bool:
+    """Requires radix caching (retract re-prefill reads the retained prompt
+    KV) and pp_size==1 (only the first PP stage releases)."""
+    if not envs.SGLANG_ENABLE_MM_RELEASE_AT_CONSUMPTION.get():
+        return False
+    if getattr(server_args, "pp_size", 1) != 1:
+        return False
+    return not getattr(server_args, "disable_radix_cache", False)
+
+
+def release_consumed_mm_features(
+    mm_inputs_list: List[MultimodalInputs],
+    extend_prefix_lens: List[int],
+    extend_seq_lens: List[int],
+) -> None:
+    """Release image features fully covered by this extend chunk."""
+    for mm_inputs, prefix_len, seq_len in zip(
+        mm_inputs_list, extend_prefix_lens, extend_seq_lens, strict=True
+    ):
+        chunk_end = prefix_len + seq_len
+        for item in mm_inputs.mm_items:
+            if (
+                item.is_image()
+                and _is_releasable_feature(item.feature)
+                and item.offsets
+                and all(end < chunk_end for _, end in item.offsets)
+            ):
+                item.release_feature(consumed=True)
+
+
 def prepare_mm_inputs(
     input_ids: torch.Tensor,
     forward_batch: ForwardBatch,
@@ -783,6 +823,11 @@ def prepare_mm_inputs(
                     if mm_schedule.host_offload_event is None:
                         mm_schedule.host_offload_event = torch.cuda.Event()
                     mm_schedule.host_offload_event.record(stream)
+            # After the offload loop, which pins any CUDA feature to this stream.
+            if mm_inputs_list and should_release_mm_features(server_args):
+                release_consumed_mm_features(
+                    mm_inputs_list, extend_prefix_lens, extend_seq_lens
+                )
             forward_batch.mm_inputs = None
             forward_batch.mm_input_embeds = (
                 input_embeds.clone()
