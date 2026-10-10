@@ -881,6 +881,153 @@ def _fp4_index_logits_paged_kernel(
         tl.store(out_ptr + b * out_stride + offs_l, logit, mask=offs_l < L)
 
 
+@triton.jit
+def _neg_inf_visible_kernel(out_ptr, lens_ptr, L, out_stride, BLOCK: tl.constexpr):
+    b = tl.program_id(0)
+    n_vis = tl.minimum(tl.load(lens_ptr + b), L)
+    for start in range(tl.program_id(1) * BLOCK, n_vis, tl.num_programs(1) * BLOCK):
+        offs = start + tl.arange(0, BLOCK)
+        tl.store(out_ptr + b * out_stride + offs, float("-inf"), mask=offs < n_vis)
+
+
+@triton.jit
+def _fp4_index_logits_candidates_kernel(
+    q_ptr,
+    w_ptr,
+    req_ptr,
+    req_table_ptr,
+    lens_ptr,
+    table_ptr,
+    blocks_ptr,
+    out_ptr,
+    L,
+    num_blocks,
+    page_size,
+    row_stride,
+    req_stride,
+    blocks_stride,
+    out_stride,
+    stride_qb,
+    stride_qh,
+    stride_wb,
+    H: tl.constexpr,
+    HALF_D: tl.constexpr,
+    RATIO: tl.constexpr,
+):
+    BLOCK_SIZE: tl.constexpr = 8
+    BLOCKS_PER_TILE: tl.constexpr = 8
+    b = tl.program_id(0)
+    n_vis = tl.minimum(tl.load(lens_ptr + b), L)
+    req = tl.load(req_ptr + b).to(tl.int64)
+    TILE: tl.constexpr = BLOCKS_PER_TILE * BLOCK_SIZE
+    offs = tl.arange(0, TILE)
+    which = offs // BLOCK_SIZE
+    within = offs % BLOCK_SIZE
+    for c in range(
+        tl.program_id(1) * BLOCKS_PER_TILE,
+        num_blocks,
+        tl.num_programs(1) * BLOCKS_PER_TILE,
+    ):
+        blk = tl.load(
+            blocks_ptr + b * blocks_stride + c + which,
+            mask=c + which < num_blocks,
+            other=-1,
+        )
+        pos = blk * BLOCK_SIZE + within
+        valid = (blk >= 0) & (pos < n_vis)
+        if tl.max(valid.to(tl.int32), axis=0) > 0:
+            pos = tl.where(valid, pos, 0)
+            slot = (
+                tl.load(
+                    req_table_ptr + req * req_stride + pos * RATIO, mask=valid, other=0
+                ).to(tl.int64)
+                // RATIO
+            )
+            logit = _fp4_index_logits_tile(
+                q_ptr,
+                w_ptr,
+                table_ptr,
+                b,
+                slot,
+                valid,
+                page_size,
+                row_stride,
+                stride_qb,
+                stride_qh,
+                stride_wb,
+                H,
+                HALF_D,
+            )
+            tl.store(out_ptr + b * out_stride + pos, logit, mask=valid)
+
+
+def fp4_index_logits_candidates(
+    q: torch.Tensor,
+    weights: torch.Tensor,
+    req: torch.Tensor,
+    req_table: torch.Tensor,
+    lens: torch.Tensor,
+    table: torch.Tensor,
+    page_size: int,
+    max_len: int,
+    ratio: int,
+    blocks: torch.Tensor,
+) -> torch.Tensor:
+    """Score 8-position candidate ``blocks`` ([batch, n] IDs, -1 padded).
+
+    Returns [batch, max_len] FP32 scores, -inf outside the candidates within the
+    visible range. Positions beyond the visible range are uninitialized.
+    """
+    assert q.dtype == torch.bfloat16 and q.shape[-1] == INDEX_HEAD_DIM
+    assert table.dtype == torch.uint8 and table.ndim == 2
+    assert ratio in (1, 2) and max_len <= req_table.shape[1] // ratio
+    assert req_table.stride(1) == 1 and blocks.dim() == 2
+    batch, heads, _ = q.shape
+    q = q.contiguous()
+    weights = weights.to(torch.bfloat16).contiguous()
+    req = req.contiguous()
+    lens = lens.contiguous()
+    blocks = blocks.contiguous()
+    out = torch.empty(
+        (batch, triton.cdiv(max_len, 8) * 8), device=q.device, dtype=torch.float32
+    )
+    if not batch or not max_len:
+        return out[:, :max_len]
+    num_sms = torch.cuda.get_device_properties(q.device).multi_processor_count
+    fill_workers = min(triton.cdiv(max_len, 4096), triton.cdiv(num_sms * 2, batch))
+    _neg_inf_visible_kernel[(batch, fill_workers)](
+        out, lens, max_len, out.stride(0), BLOCK=4096, num_warps=4
+    )
+    workers = max(
+        1, min(triton.cdiv(blocks.shape[1], 8), triton.cdiv(num_sms * 4, batch))
+    )
+    _fp4_index_logits_candidates_kernel[(batch, workers)](
+        q,
+        weights,
+        req,
+        req_table,
+        lens,
+        table,
+        blocks,
+        out,
+        max_len,
+        blocks.shape[1],
+        page_size,
+        table.stride(0),
+        req_table.stride(0),
+        blocks.stride(0),
+        out.stride(0),
+        q.stride(0),
+        q.stride(1),
+        weights.stride(0),
+        H=heads,
+        HALF_D=INDEX_HEAD_DIM // 2,
+        RATIO=ratio,
+        num_warps=4,
+    )
+    return out[:, :max_len]
+
+
 def fp4_index_logits_paged(
     q: torch.Tensor,
     weights: torch.Tensor,
