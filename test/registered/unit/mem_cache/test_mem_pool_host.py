@@ -564,6 +564,12 @@ class TestDSAIndexerPoolDecl(CustomTestCase):
         # packed draft depth 0 arrives as device layer_num + 0 and lands after the live layers
         self.assertEqual(mirror._draft_host_layer(stub.layer_num), 2)
 
+    def test_forwards_dtype_from_anchor(self):
+        # cache_controller reads mem_pool_host.dtype; the facade must forward it
+        # from the flagged anchor, not the positional first entry (swa is first).
+        group = self._group(swa=2, kv=4)
+        self.assertIs(group.dtype, group.anchor_entry.host_pool.dtype)
+
 
 if __name__ == "__main__":
     unittest.main()
