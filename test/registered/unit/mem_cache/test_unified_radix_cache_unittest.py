@@ -55,6 +55,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
     PoolTransferResult,
+    SidecarPoolSpec,
 )
 from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
@@ -63,6 +64,7 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
 )
 from sglang.srt.mem_cache.pool_host import PoolEntry
+from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
@@ -4621,6 +4623,91 @@ class UnifiedRadixCacheSuite:
         cache.request_buffer_backup(leaf)
         self.assertNotIn(leaf, pipeline.inflight_backup_node_ids)
         cache.sanity_check()
+
+    def test_buffer_only_split_pool_sidecar_storage_roundtrip(self):
+        """A sidecar of a pool staged in several transfers copies and
+        persists every transfer's pages, not only the first one's."""
+        self._skip_unsupported_hicache_test()
+        storage_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+        # Component buffer-mode hooks are Python-core only.
+        cache, allocator, req_pool = build_fixture(
+            self.cfg,
+            component_registry_override={ComponentType.FULL: _ExtraPoolFullComponent},
+            tree_core_backend="python",
+        )
+        self._init_buffer_hicache(cache, storage_dir)
+        controller = cache.cache_controller
+        source = controller.mem_pool_host.entry_map[_ExtraPoolFullComponent.EXTRA_POOL]
+        sidecar_host = MHATokenToKVPoolHost(
+            source.device_pool,
+            host_to_device_ratio=source.host_pool.size / source.device_pool.size,
+            host_size=0,
+            page_size=self.cfg.page_size,
+            layout=source.host_pool.layout,
+        )
+        controller.register_host_pool_entry(
+            PoolEntry(
+                name=PoolName.DRAFT_SWA,
+                host_pool=sidecar_host,
+                device_pool=source.device_pool,
+                layer_mapper=source.layer_mapper,
+            )
+        )
+        cache.sidecar_pool_specs.append(
+            SidecarPoolSpec(PoolName.DRAFT_SWA, _ExtraPoolFullComponent.EXTRA_POOL)
+        )
+        sidecar_host.kv_buffer.fill_(-1000)
+        tokens = self._make_seq(1, 8)
+        self._insert(cache, allocator, req_pool, tokens)
+        leaf = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", tokens)))
+        ).last_device_node
+        # SWA may split the leaf at the window boundary; check a node whose
+        # pool is staged in two transfers.
+        node = next(
+            n
+            for n in self._path_chain(cache, leaf)
+            if len(cache.tree_core.get_hash_values(n)) >= 2
+        )
+        transfers = cache.tree_core.build_hicache_transfers(
+            ComponentType.FULL, node, CacheTransferPhase.BACKUP_HOST
+        )
+        self.assertEqual(len(transfers), 2)
+        for segment, transfer in enumerate(transfers):
+            for layer in range(source.device_pool.layer_num):
+                source.device_pool.k_buffer[layer][transfer.device_indices] = (
+                    segment + 7
+                )
+                source.device_pool.v_buffer[layer][transfer.device_indices] = (
+                    segment + 17
+                )
+        torch.cuda.synchronize()
+        self._buffer_backup_and_wait(cache, leaf)
+
+        keys = list(cache.tree_core.get_hash_values(node))
+        indices = source.host_pool.alloc(len(keys) * self.cfg.page_size)
+        self.assertIsNotNone(indices)
+        try:
+            source.host_pool.kv_buffer.zero_()
+            sidecar_host.kv_buffer.zero_()
+            reads = [
+                PoolTransfer(name=name, keys=keys, host_indices=indices)
+                for name in (_ExtraPoolFullComponent.EXTRA_POOL, PoolName.DRAFT_SWA)
+            ]
+            results = controller.storage_backend.batch_get_v2(reads)
+            self.assertTrue(all(results[_ExtraPoolFullComponent.EXTRA_POOL]))
+            self.assertTrue(all(results[PoolName.DRAFT_SWA]))
+            for index in indices[:: self.cfg.page_size].tolist():
+                self.assertTrue(
+                    torch.equal(
+                        source.host_pool.get_data_page(index),
+                        sidecar_host.get_data_page(index),
+                    ),
+                    "Every persisted sidecar page must contain its source's GPU data",
+                )
+        finally:
+            source.host_pool.free(indices)
 
     def test_buffer_only_read_path_roundtrip(self):
         """Read path end to end: prefetch -> staged (host bounce only,
