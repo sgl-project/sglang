@@ -1780,6 +1780,8 @@ def run_scheduler_process(
         pipe_writer.send(
             {
                 "status": "ready",
+                "dp_replica": scheduler.dp_replica,
+                "actual_scheduler_port": scheduler.actual_scheduler_port,
             }
         )
         scheduler.event_loop()

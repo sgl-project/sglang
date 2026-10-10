@@ -1545,6 +1545,9 @@ class ServerArgs(DisaggServerArgsMixin):
                     )
                 seen_ports[port] = name
                 self._require_port(port, name)
+            self.scheduler_ports = [
+                self.scheduler_port + replica for replica in range(self.dp_size or 1)
+            ]
         else:
             settled_ports: set[int] = set()
             if needs_http:
