@@ -46,6 +46,51 @@ logger = logging.getLogger(__name__)
 
 _MOE_SORTING_DISPATCH_POLICY = envs.SGLANG_AITER_MOE_SORTING_DISPATCH_POLICY.get()
 
+# aiter's block-fp8 split-K stage1 (ck_moe_stage1) accumulates the splits into
+# a torch.empty fp32 buffer, which CK zeroes only when every split owns at
+# least two K tiles (KBatch = K // (splitk * 256) > 1). For tiny M, aiter's
+# default heuristic can still choose a split with KBatch == 1; e.g. M=1 for
+# Qwen3.5/3.6-FP8 at TP1, M<=4 at TP4. The stage1 output is then garbage.
+# aiter #3997 guarded this by running such calls unsplit and #4394 dropped the
+# guard. Lowering the split to the largest count that keeps two K tiles per
+# split is also correct, and faster than running unsplit.
+# TODO(ntgiang71096): remove once the minimum supported aiter carries the
+# guard again (ROCm/aiter#4032).
+_AITER_SPLITK_K_PER_BLOCK = 256
+
+
+def _aiter_safe_splitk(k: int, splitk: int) -> int:
+    """Largest split <= splitk whose splits each own >= 2 K tiles; 0 runs unsplit."""
+    for split in range(splitk, 1, -1):
+        tiles, rem = divmod(k, split * _AITER_SPLITK_K_PER_BLOCK)
+        if rem == 0 and tiles >= 2:
+            return split
+    return 0
+
+
+@functools.cache
+def apply_aiter_splitk_kbatch_guard() -> None:
+    """Keep aiter's block-fp8 split-K stage1 at >= 2 K tiles per split."""
+    try:
+        import aiter.fused_moe as fm
+        from aiter import QuantType
+    except ImportError:
+        return
+    orig_stage1 = fm.ck_moe_stage1
+
+    @functools.wraps(orig_stage1)
+    def ck_moe_stage1_guarded(*args, **kwargs):
+        splitk = kwargs.get("splitk", 1)
+        if splitk > 1 and kwargs.get("quant_type") == QuantType.per_1x128:
+            hidden_states = args[0] if args else kwargs["hidden_states"]
+            k = hidden_states.shape[-1]
+            if k // (splitk * _AITER_SPLITK_K_PER_BLOCK) < 2:
+                kwargs["splitk"] = _aiter_safe_splitk(k, splitk)
+        return orig_stage1(*args, **kwargs)
+
+    fm.ck_moe_stage1 = ck_moe_stage1_guarded
+    logger.info("aiter split-K KBatch guard applied")
+
 
 class AiterQuantType(str, Enum):
     NONE = "No"
@@ -255,6 +300,7 @@ class AiterRunnerCore(MoeRunnerCore):
         )
 
         apply_aiter_small_moe_sort_patch()
+        apply_aiter_splitk_kbatch_guard()
 
     def run(
         self,
