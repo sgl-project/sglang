@@ -21,6 +21,7 @@ import shutil
 import tempfile
 import time
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 import torch
@@ -149,6 +150,88 @@ class HiCacheFileLRUTestBase(CustomTestCase):
         for cm in self._env_overrides:
             cm.__exit__(None, None, None)
         shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+
+class TestStorageTopology(HiCacheFileLRUTestBase):
+    def make_storage_config(self, rank, tp_size, cp_size, dp_size=1, mla=True):
+        from sglang.srt.managers.cache_controller import HiCacheController
+        from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+        from sglang.srt.runtime_context import (
+            derive_attention_ranks,
+            derive_attn_tp_size,
+        )
+
+        attn_tp_size = derive_attn_tp_size(
+            tp_size=tp_size, attn_cp_size=cp_size, attn_dp_size=dp_size
+        )
+        attn_tp_rank, attn_dp_rank = derive_attention_ranks(
+            tp_rank=rank, attn_tp_size=attn_tp_size, attn_cp_size=cp_size
+        )
+        cp_rank = (rank // attn_tp_size) % cp_size
+        parallel = SimpleNamespace(
+            tp_rank=rank,
+            tp_size=tp_size,
+            attn_tp_rank=attn_tp_rank,
+            attn_tp_size=attn_tp_size,
+            attn_dp_rank=attn_dp_rank,
+            attn_cp_size=cp_size,
+            pp_rank=0,
+            pp_size=1,
+        )
+        controller = SimpleNamespace(
+            mem_pool_device=object.__new__(MLATokenToKVPool) if mla else object(),
+            mem_pool_host=SimpleNamespace(layout="page_first"),
+            storage_host_pool=SimpleNamespace(storage_format_tag=None),
+            get_attn_cp_rank_and_size=lambda: (cp_rank, cp_size),
+            enable_storage_metrics=False,
+        )
+        with (
+            mock.patch(
+                "sglang.srt.managers.cache_controller.get_parallel",
+                return_value=parallel,
+            ),
+            mock.patch(
+                "sglang.srt.managers.cache_controller.is_dp_attention_enabled",
+                return_value=dp_size > 1,
+            ),
+        ):
+            return HiCacheController._generate_storage_config(
+                controller, "testmodel", {"max_size": "64", "eviction_ratio": 1.0}
+            )
+
+    def test_cp_without_dp_has_one_mla_file_owner_per_cp_shard(self):
+        backends = []
+        for rank in range(8):
+            cfg = self.make_storage_config(rank, tp_size=8, cp_size=4)
+            backend = HiCacheFile(cfg, file_path=self.tmpdir)
+            # Each CP shard has two attention-TP replicas: only its leader writes.
+            self.assertEqual(
+                backend.set(
+                    "page" if rank % 2 == 0 else f"replica-{rank}", _t(64, rank)
+                ),
+                rank % 2 == 0,
+            )
+            if rank % 2 == 0:
+                backends.append((rank, backend))
+        self.assertEqual(len(backends), 4)
+        self.assertEqual(len({b.config_suffix for _, b in backends}), 4)
+        for rank, backend in backends:
+            self.assertTrue(torch.equal(backend.get("page", _t(64)), _t(64, rank)))
+
+    def test_non_mla_keeps_existing_storage_coordinates(self):
+        cfg = self.make_storage_config(3, tp_size=8, cp_size=4, mla=False)
+        self.assertEqual((cfg.tp_rank, cfg.tp_size), (3, 8))
+        self.assertEqual((cfg.attn_cp_rank, cfg.attn_cp_size), (1, 4))
+
+    def test_existing_non_cp_and_dp_topologies_keep_their_ranks(self):
+        for rank, tp, cp, dp, expected in (
+            (3, 4, 1, 1, (3, 4, 0)),
+            (5, 8, 2, 2, (1, 2, 1)),
+            (3, 4, 1, 2, (1, 2, 1)),
+        ):
+            with self.subTest(rank=rank, cp=cp, dp=dp):
+                cfg = self.make_storage_config(rank, tp, cp, dp)
+                self.assertEqual((cfg.tp_rank, cfg.tp_size, cfg.dp_rank), expected)
 
 
 class TestEnvDefaults(CustomTestCase):

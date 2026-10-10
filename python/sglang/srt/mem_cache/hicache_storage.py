@@ -40,6 +40,8 @@ class HiCacheStorageConfig:
     # with dp-attention, tp_rank is attention-group-local; dp_rank disambiguates
     dp_rank: int = 0
     extra_config: Optional[dict] = None
+    # Replicated KV has one writer per attention-TP group, including under CP.
+    attn_tp_rank: Optional[int] = None
 
 
 @dataclass
@@ -447,7 +449,11 @@ class HiCacheFile(HiCacheStorage):
         self._evictor = LRUFileEvictor(
             self.file_path,
             self.config_suffix,
-            tp_rank=tp_rank,
+            tp_rank=(
+                storage_config.attn_tp_rank
+                if is_mla_model and storage_config.attn_tp_rank is not None
+                else tp_rank
+            ),
             is_mla_model=is_mla_model,
             extra_config=storage_config.extra_config,
             on_evict=(
