@@ -146,6 +146,82 @@ def conv_window_dedup_enabled(
     )
 
 
+def check_linear_lossless_verify(
+    *,
+    speculative_eagle_topk: Optional[int],
+    is_kda: bool,
+    enable_linear_replayssm_spec: bool,
+) -> None:
+    """Reject configurations the lossless GDN tuple verify cannot serve.
+
+    The replay applies the accepted steps of one linear draft chain with the
+    GDN scalar gate. Server-arg validation already enforces this; the pool
+    re-checks so a direct construction cannot silently fall back.
+    """
+    if speculative_eagle_topk != 1:
+        raise ValueError(
+            "enable_linear_lossless_verify requires a linear draft chain "
+            f"(speculative_eagle_topk == 1), got {speculative_eagle_topk!r}."
+        )
+    if is_kda:
+        raise ValueError(
+            "enable_linear_lossless_verify supports GDN layers only (KDA has a "
+            "per-channel gate and its own verify kernels)."
+        )
+    if enable_linear_replayssm_spec:
+        raise ValueError(
+            "enable_linear_lossless_verify and enable_linear_replayssm_spec are "
+            "mutually exclusive."
+        )
+
+
+def spec_intermediate_bytes_per_req(
+    cache_params,
+    speculative_num_draft_tokens: int,
+    *,
+    speculative_eagle_topk: Optional[int] = None,
+    enable_linear_lossless_verify: bool = False,
+) -> int:
+    """Bytes of per-request target-verify scratch that MambaPool really allocates.
+
+    The stock KV budget charges `mamba_cache_per_req * draft_tokens`, i.e. one
+    full (conv + [HV, V, K] SSM) snapshot per draft token. Two layouts here are
+    far smaller than that, so the budget over-reserves and the freed memory just
+    sits idle instead of becoming KV cache:
+
+      * SSM: the lossless tuple checkpoint keeps (u, k, g) per step --
+        HV*(V + K + 1) instead of HV*V*K, ~64x smaller at V=K=128.
+      * conv: the deduplicated sliding window keeps (D + Kconv - 2) shared
+        columns instead of D separate (Kconv - 1)-wide windows.
+
+    Mirrors MambaPool.__init__ exactly; keep the two in sync. Not used under
+    --enable-linear-replayssm-spec (that path has its own ring accounting).
+    """
+    d = int(speculative_num_draft_tokens)
+    shape = cache_params.shape
+    num_layers = len(cache_params.layers)
+    is_kda = cache_params.is_kda
+
+    conv_itemsize = cache_params.dtype.conv.itemsize
+    if not shape.disable_conv_window_dedup and conv_window_dedup_enabled(
+        _is_npu, _is_cpu, speculative_eagle_topk, is_kda
+    ):
+        # One shared [dim, D + Kconv - 2] buffer per (layer, slot); step t is an
+        # overlapping as_strided view at columns [t, t + Kconv - 1).
+        conv_numel = sum(dim * (d + width - 1) for dim, width in shape.conv)
+    else:
+        conv_numel = sum(dim * width * d for dim, width in shape.conv)
+
+    hv, v_dim, k_dim = shape.temporal
+    if enable_linear_lossless_verify:
+        # fp32 (u, k, g) tuples regardless of the state dtype.
+        ssm_bytes = hv * (v_dim + k_dim + 1) * d * torch.float32.itemsize
+    else:
+        ssm_bytes = hv * v_dim * k_dim * d * cache_params.dtype.temporal.itemsize
+
+    return (conv_numel * conv_itemsize + ssm_bytes) * num_layers
+
+
 def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
     if isinstance(t, list):
         return sum(get_tensor_size_bytes(x) for x in t)
@@ -560,6 +636,15 @@ class MambaPool:
         # full-state snapshots are never produced or consumed.
         intermediate_ssm: Optional[torch.Tensor]
         intermediate_conv_window: List[torch.Tensor]
+        # Lossless GDN tuple ring (--enable-linear-lossless-verify); None
+        # otherwise. fp32 whatever the state dtype, so the replay sees exactly
+        # the values the verify kernel computed.
+        #   intermediate_ssm_u: [num_layers, spec_slots, D, HV, V]
+        #   intermediate_ssm_k: [num_layers, spec_slots, D, HV, K]
+        #   intermediate_ssm_g: [num_layers, spec_slots, D, HV]
+        intermediate_ssm_u: Optional[torch.Tensor] = None
+        intermediate_ssm_k: Optional[torch.Tensor] = None
+        intermediate_ssm_g: Optional[torch.Tensor] = None
 
     def _detect_conv_window_axis(
         self, conv_state_shape: List[Tuple[int, int]], win_len: int
@@ -644,6 +729,7 @@ class MambaPool:
         linear_replayssm_cache_len: int = 16,
         envelope_layout: bool = False,
         enable_linear_replayssm_spec: bool = False,
+        enable_linear_lossless_verify: bool = False,
     ):
         conv_state_shape = cache_params.shape.conv
         temporal_state_shape = cache_params.shape.temporal
@@ -871,7 +957,42 @@ class MambaPool:
                 # KDA verify kernel takes intermediate_states_buffer=None (skips the
                 # per-step write, CACHE_INTERMEDIATE_STATES=False) and the commit
                 # replays the ring into the checkpoint instead. This is the memory win.
-                if enable_linear_replayssm_spec:
+                # Lossless GDN tuple verify (--enable-linear-lossless-verify):
+                # keep each draft step's (u, k, g) tuple instead of a full
+                # [HV, V, K] snapshot -- ~K x smaller -- and replay the accepted
+                # state at commit. The replay is a linear chain, so this requires
+                # speculative_eagle_topk == 1 (checked here and in server args).
+                lossless_verify = enable_linear_lossless_verify
+                if lossless_verify:
+                    check_linear_lossless_verify(
+                        speculative_eagle_topk=speculative_eagle_topk,
+                        is_kda=cache_params.is_kda,
+                        enable_linear_replayssm_spec=enable_linear_replayssm_spec,
+                    )
+                intermediate_ssm_u_cache = None
+                intermediate_ssm_k_cache = None
+                intermediate_ssm_g_cache = None
+                if lossless_verify:
+                    intermediate_ssm_state_cache = None
+                    num_heads, value_dim, key_dim = temporal_state_shape
+                    tuple_shape = (
+                        num_mamba_layers,
+                        spec_state_size + 1,
+                        speculative_num_draft_tokens,
+                        num_heads,
+                    )
+                    intermediate_ssm_u_cache = torch.zeros(
+                        size=(*tuple_shape, value_dim),
+                        dtype=torch.float32,
+                        device=device,
+                    )
+                    intermediate_ssm_k_cache = torch.zeros(
+                        size=(*tuple_shape, key_dim), dtype=torch.float32, device=device
+                    )
+                    intermediate_ssm_g_cache = torch.zeros(
+                        size=tuple_shape, dtype=torch.float32, device=device
+                    )
+                elif enable_linear_replayssm_spec:
                     intermediate_ssm_state_cache = None
                 else:
                     intermediate_ssm_state_cache = torch.zeros(
@@ -962,6 +1083,9 @@ class MambaPool:
                     temporal=temporal_state,
                     intermediate_ssm=intermediate_ssm_state_cache,
                     intermediate_conv_window=intermediate_conv_window_cache,
+                    intermediate_ssm_u=intermediate_ssm_u_cache,
+                    intermediate_ssm_k=intermediate_ssm_k_cache,
+                    intermediate_ssm_g=intermediate_ssm_g_cache,
                     replayssm_d=replayssm_d,
                     replayssm_k=replayssm_k,
                     replayssm_g=replayssm_g,
@@ -984,6 +1108,13 @@ class MambaPool:
                     # over-reports its logical, un-deduplicated size).
                     f"intermediate_conv_window_cache size: {get_tensor_size_bytes(self._intermediate_conv_window_phys) / GB:.2f}GB "
                 )
+                if lossless_verify:
+                    logger.info(
+                        "Lossless GDN tuple cache is on: (u, k, g) ring "
+                        f"{get_tensor_size_bytes([intermediate_ssm_u_cache, intermediate_ssm_k_cache, intermediate_ssm_g_cache]) / GB:.3f}GB "
+                        f"for {spec_state_size + 1} spec slots x "
+                        f"{speculative_num_draft_tokens} draft tokens."
+                    )
             else:
                 self.mamba_cache = self.State(
                     conv=conv_state,
@@ -1233,6 +1364,9 @@ class MambaPool:
         {
             "intermediate_ssm",
             "intermediate_conv_window",
+            "intermediate_ssm_u",
+            "intermediate_ssm_k",
+            "intermediate_ssm_g",
             "replayssm_d",
             "replayssm_k",
             "replayssm_g",
@@ -1363,6 +1497,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         linear_replayssm_cache_len: int = 16,
         mamba_envelope_layout: bool = False,
         enable_linear_replayssm_spec: bool = False,
+        enable_linear_lossless_verify: bool = False,
         short_conv_layer_ids: Optional[List[int]] = None,
         short_conv_state_shape: Optional[Tuple[int, int]] = None,
         ngram_context_len: int = 0,
@@ -1402,6 +1537,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             linear_replayssm_cache_len=linear_replayssm_cache_len,
             mamba_envelope_layout=mamba_envelope_layout,
             enable_linear_replayssm_spec=enable_linear_replayssm_spec,
+            enable_linear_lossless_verify=enable_linear_lossless_verify,
             short_conv_layer_ids=short_conv_layer_ids,
             short_conv_state_shape=short_conv_state_shape,
             ngram_context_len=ngram_context_len,
@@ -1422,6 +1558,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         linear_replayssm_cache_len: int = 16,
         mamba_envelope_layout: bool = False,
         enable_linear_replayssm_spec: bool = False,
+        enable_linear_lossless_verify: bool = False,
         short_conv_layer_ids: Optional[List[int]] = None,
         short_conv_state_shape: Optional[Tuple[int, int]] = None,
         ngram_context_len: int = 0,
@@ -1440,6 +1577,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             linear_replayssm_cache_len=linear_replayssm_cache_len,
             envelope_layout=mamba_envelope_layout,
             enable_linear_replayssm_spec=enable_linear_replayssm_spec,
+            enable_linear_lossless_verify=enable_linear_lossless_verify,
         )
         self.mamba_allocator = MambaSlotAllocator(
             size=mamba_size,

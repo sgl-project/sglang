@@ -546,6 +546,30 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
         )
         self._use_strided_target_verify_qkv = False
+        # Checked once at the first lossless verify (see
+        # _assert_lossless_verify_kernel).
+        self._lossless_kernel_checked = False
+
+    def _assert_lossless_verify_kernel(self):
+        """Only the Triton verify kernel writes the (u, k, g) tuple ring.
+
+        The FlashInfer verify kernel -- picked by GDNKernelDispatcher when
+        --linear-attn-decode-backend flashinfer is set and it supports MTP
+        verify -- takes ``**kwargs`` and would silently DROP the three tuple
+        buffers: the ring stays zero, the replay commits a wrong state, and
+        nothing fails. Fail here instead.
+
+        Runs exactly once: this sits in forward_extend, i.e. once per GDN layer
+        per verify step, so the isinstance must not stay on the hot path.
+        """
+        kernel = self.kernel_dispatcher.verify_kernel
+        if not isinstance(kernel, TritonGDNKernel):
+            raise RuntimeError(
+                "--enable-linear-lossless-verify requires the Triton GDN verify "
+                f"kernel, but the dispatcher selected {type(kernel).__name__}. "
+                "Pass --linear-attn-verify-backend triton."
+            )
+        self._lossless_kernel_checked = True
 
     def init_forward_metadata_out_graph(
         self,
@@ -955,6 +979,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 cache_indices[: query_start_loc.shape[0] - 1] >= 0,
                 self.req_to_token_pool.size,
             )
+            # Lossless verify writes (u, k, g) tuples instead of the full
+            # [HV, V, K] state cache (None unless --enable-linear-lossless-verify).
+            u_tuple_cache = mamba_cache_params.intermediate_ssm_u
+            k_tuple_cache = mamba_cache_params.intermediate_ssm_k
+            g_tuple_cache = mamba_cache_params.intermediate_ssm_g
             mamba_pool = self.req_to_token_pool.mamba_pool
             use_replayssm_fold = (
                 mamba_cache_params.replayssm_rawv is not None
@@ -1094,12 +1123,26 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     draft_token_num=forward_batch.spec_info.draft_token_num,
                 )
             else:
-                # The recurrent fallback needs the per-draft snapshots, which
-                # the pool gates OFF under --enable-linear-replayssm-spec (the
-                # same flag that makes `use_replayssm_spec` true above), so
-                # this branch is unreachable with a None buffer by
-                # construction -- keep it loud rather than silently frozen.
-                assert intermediate_state_cache is not None, (
+                # Under --enable-linear-lossless-verify the pool swaps the
+                # per-draft full-state snapshots for the (u, k, g) tuple ring,
+                # so the full-state buffer is None and the tuples are written.
+                _lossless = u_tuple_cache is not None
+                if _lossless:
+                    if not self._lossless_kernel_checked:
+                        self._assert_lossless_verify_kernel()
+                    # Runtime half of the topk == 1 gate: the replay follows
+                    # one linear chain and cannot honour tree parents.
+                    assert retrieve_parent_token is None, (
+                        "--enable-linear-lossless-verify got an EAGLE tree verify "
+                        "batch; it supports --speculative-eagle-topk 1 only."
+                    )
+                # The recurrent fallback needs the per-draft snapshots (or the
+                # lossless tuples), which the pool gates OFF under
+                # --enable-linear-replayssm-spec (the same flag that makes
+                # `use_replayssm_spec` true above), so this branch is
+                # unreachable with a None buffer by construction -- keep it
+                # loud rather than silently frozen.
+                assert _lossless or intermediate_state_cache is not None, (
                     "recurrent target_verify fallback requires intermediate_ssm, "
                     "which is not allocated under --enable-linear-replayssm-spec"
                 )
@@ -1119,6 +1162,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     cache_steps=forward_batch.spec_info.draft_token_num,
                     retrieve_parent_token=retrieve_parent_token,
                     stable_rows=pp_spec_stable_rows_enabled(),
+                    u_states_buffer=u_tuple_cache,
+                    k_states_buffer=k_tuple_cache,
+                    g_states_buffer=g_tuple_cache,
                 )
         else:
             g, beta = self._prefill_gates(layer, a, b)

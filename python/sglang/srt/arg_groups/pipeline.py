@@ -295,6 +295,11 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     run_hook(handle_layernorm_sp, server_args)
 
+    # After the speculative hook so speculative_eagle_topk is final.
+    from sglang.srt.arg_groups.attention_hook import validate_linear_lossless_verify
+
+    run_hook(validate_linear_lossless_verify, server_args)
+
     # Validate the FlashInfer A2A token budget now that draft-token counts are final.
     run_hook(validate_flashinfer_a2a_token_budget, server_args)
 
