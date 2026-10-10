@@ -225,12 +225,14 @@ class Sampler(nn.Module):
 
             if self.use_ascend_backend:
                 # Ascend backend: sample from logits directly.
-                batch_next_token_ids, logprobs = self._forward_ascend_backend(
-                    logits,
-                    sampling_info,
-                    simple_sampling_case,
-                    return_logprob,
-                    positions,
+                batch_next_token_ids, logprobs, sampling_mask_capture = (
+                    self._forward_ascend_backend(
+                        logits,
+                        sampling_info,
+                        simple_sampling_case,
+                        return_logprob,
+                        positions,
+                    )
                 )
             elif (
                 self.use_log_softmax_logprob
@@ -622,11 +624,19 @@ class Sampler(nn.Module):
         sampling_info: SamplingBatchInfo,
         simple_sampling_case: bool,
         positions: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Sample from temperature-scaled logits without softmax.
 
         Used for the Ascend NPU backend which handles softmax internally.
+
+        When the batch requested sampling masks, also returns the post-filter
+        weights the token was drawn from, in vocabulary order and for the full
+        batch. The Ascend backend needs this export because its fused kernels
+        otherwise keep the truncated distribution internal, leaving nothing to
+        build a sampling mask from.
         """
+        return_sampling_mask = sampling_info.sampling_mask_batch_indices is not None
+        filtered_probs = None
         if simple_sampling_case:
             probs = torch.softmax(logits, dim=-1)
             if sampling_info.sampling_seed is not None:
@@ -636,12 +646,15 @@ class Sampler(nn.Module):
                 ).view(-1)
             else:
                 batch_next_token_ids = torch.multinomial(probs, num_samples=1).view(-1)
-            return batch_next_token_ids.to(torch.int32)
+            if return_sampling_mask:
+                # Nothing is truncated here, so the whole softmax is the support
+                # the token was drawn from.
+                filtered_probs = probs
         else:
             assert self.use_ascend_backend, (
                 "Only ascend backend supports sampling from logits"
             )
-            batch_next_token_ids = top_k_top_p_min_p_sampling_from_logits_ascend(
+            ascend_result = top_k_top_p_min_p_sampling_from_logits_ascend(
                 logits,
                 sampling_info.top_ks,
                 sampling_info.top_ps,
@@ -650,8 +663,13 @@ class Sampler(nn.Module):
                 sampling_info.sampling_seed,
                 positions,
                 npu_top_k_top_p_eligible=sampling_info.npu_top_k_top_p_eligible,
+                return_filtered_probs=return_sampling_mask,
             )
-            return batch_next_token_ids.to(torch.int32)
+            if return_sampling_mask:
+                batch_next_token_ids, filtered_probs = ascend_result
+            else:
+                batch_next_token_ids = ascend_result
+        return batch_next_token_ids.to(torch.int32), filtered_probs
 
     def _forward_ascend_backend(
         self,
@@ -660,24 +678,57 @@ class Sampler(nn.Module):
         simple_sampling_case: bool,
         return_logprob: bool,
         positions: torch.Tensor,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[_SamplingMaskCapture]]:
         """Handle the full Ascend backend sampling path.
 
         Ascend backend has fused kernels that handle softmax internally,
         so we sample directly from temperature-scaled logits.
 
         Returns:
-            A tuple of (batch_next_token_ids, logprobs). logprobs is None
-            when return_logprob is False or SGLANG_RETURN_ORIGINAL_LOGPROB is set.
+            A tuple of (batch_next_token_ids, logprobs, sampling_mask_capture).
+            logprobs is None when return_logprob is False or
+            SGLANG_RETURN_ORIGINAL_LOGPROB is set. sampling_mask_capture is None
+            unless the batch requested sampling masks.
         """
+        return_sampling_mask = sampling_info.sampling_mask_batch_indices is not None
         logits.div_(sampling_info.temperatures)
-        batch_next_token_ids = self._sample_from_logits(
+        batch_next_token_ids, filtered_probs = self._sample_from_logits(
             logits, sampling_info, simple_sampling_case, positions
         )
+        sampling_mask_capture = None
+        if return_sampling_mask:
+            assert filtered_probs is not None
+            sampling_mask_capture = self._build_ascend_sampling_mask_capture(
+                filtered_probs, sampling_info
+            )
         logprobs = None
         if return_logprob and not SGLANG_RETURN_ORIGINAL_LOGPROB:
             logprobs = torch.log_softmax(logits, dim=-1)
-        return batch_next_token_ids, logprobs
+        return batch_next_token_ids, logprobs, sampling_mask_capture
+
+    def _build_ascend_sampling_mask_capture(
+        self,
+        filtered_probs: torch.Tensor,
+        sampling_info: SamplingBatchInfo,
+    ) -> _SamplingMaskCapture:
+        """Build the mask capture from the weights the Ascend kernel exported.
+
+        Replaying top-k/top-p would risk disagreeing with the kernel that drew the
+        token, so the exported copy is the support source. The drawn column is left
+        exactly as exported, which keeps ``weights > 0`` the same support predicate
+        the other backends use.
+        """
+        capture_rows = sampling_info.sampling_mask_batch_indices
+        assert capture_rows is not None, (
+            "Sampling-mask capture requested without any opted-in batch rows."
+        )
+
+        return _SamplingMaskCapture(
+            weights=_select_sampling_mask_rows(filtered_probs, capture_rows),
+            token_ids=None,
+            selected_weight=None,
+            batch_rows=capture_rows,
+        )
 
     def _sync_token_ids_across_tp(
         self, batch_next_token_ids: torch.Tensor, sampling_info: SamplingBatchInfo
@@ -818,11 +869,21 @@ def top_k_top_p_min_p_sampling_from_logits_ascend(
     sampling_seed: Optional[torch.Tensor],
     positions: torch.Tensor,
     npu_top_k_top_p_eligible: bool = False,
+    *,
+    return_filtered_probs: bool = False,
 ):
     """A top-k, top-p and min-p sampling implementation for ascend npu with torch_npu interface.
 
     Takes temperature-scaled logits as input (softmax is applied internally).
+
+    By default, returns only the sampled token IDs. With return_filtered_probs,
+    also returns the post-filter weights in **vocabulary order** (full batch,
+    shape [batch, vocab]): exactly the distribution the returned token was drawn
+    from, with truncated entries set to an exact 0. Callers use it to report the
+    sampling support, so the filters must keep writing exact zeros for it to
+    describe the sampler's action space.
     """
+    filtered_probs = None
     # torch_npu.npu_top_k_top_p requires top_k value range in [1, 1024]
     if hasattr(torch_npu, "npu_top_k_top_p") and npu_top_k_top_p_eligible:
         logits_top_k_top_p = torch_npu.npu_top_k_top_p(logits, top_ps, top_ks)
@@ -833,13 +894,23 @@ def top_k_top_p_min_p_sampling_from_logits_ascend(
             min_p_mask = probs_top_k_top_p < min_p_thresholds.view(-1, 1)
             probs_top_k_top_p.masked_fill_(min_p_mask, 0.0)
 
+        if return_filtered_probs:
+            # The fused op preserves token order and the filters above only write
+            # exact zeros, so this is already vocab-ordered support. Reference it
+            # before the seeded draw below makes a float64 copy: neither
+            # multinomial nor that conversion mutates this tensor.
+            filtered_probs = probs_top_k_top_p
+
         if sampling_seed is None:
             batch_next_token_ids = torch.multinomial(probs_top_k_top_p, num_samples=1)
         else:
             logprobs_top_k_top_p = probs_top_k_top_p.to(
                 torch.float64
             )  # Using float64 for numerical stability
-            del probs_top_k_top_p
+            if not return_filtered_probs:
+                # Drop the float32 weights before allocating their float64 copy;
+                # filtered_probs keeps them alive when the export asked for them.
+                del probs_top_k_top_p
             logprobs_top_k_top_p.log_()
             batch_next_token_ids = multinomial_with_seed(
                 logprobs_top_k_top_p, sampling_seed, positions
@@ -865,19 +936,35 @@ def top_k_top_p_min_p_sampling_from_logits_ascend(
             min_p_mask = probs_sort < min_p_thresholds.view(-1, 1)
             probs_sort.masked_fill_(min_p_mask, 0.0)
 
+        if return_filtered_probs:
+            # probs_sort is in descending order; scatter it back to token-id order
+            # once, in float32, before sampling consumes it. Exporting here instead
+            # of after the draw below also avoids the float64 log/exp round trip,
+            # which would perturb the support by an ulp. probs_idx is still int64,
+            # which scatter_ requires.
+            filtered_probs = torch.zeros_like(probs_sort).scatter_(
+                1, probs_idx, probs_sort
+            )
+
         if sampling_seed is None:
             sampled_index = torch.multinomial(probs_sort, num_samples=1)
         else:
             logprobs = probs_sort.to(
                 torch.float64
             )  # Using float64 for numerical stability
-            del probs_sort
+            if not return_filtered_probs:
+                # Drop the float32 weights before allocating their float64 copy;
+                # filtered_probs keeps them alive when the export asked for them.
+                del probs_sort
             logprobs.log_()
             sampled_index = multinomial_with_seed(logprobs, sampling_seed, positions)
         probs_idx = probs_idx.to(torch.int32)
         batch_next_token_ids = torch.gather(probs_idx, dim=1, index=sampled_index)
 
-    return batch_next_token_ids.view(-1)
+    batch_next_token_ids = batch_next_token_ids.view(-1)
+    if return_filtered_probs:
+        return batch_next_token_ids, filtered_probs
+    return batch_next_token_ids
 
 
 @torch.compile(dynamic=True, disable=is_npu())
