@@ -51,6 +51,7 @@ from sglang.srt.layers.dp_attention import (
     set_is_extend_in_batch,
     world_dp_gather_enabled,
 )
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
     ForwardBatchDeepSeekMHAMixin,
 )
@@ -59,6 +60,7 @@ from sglang.srt.runtime_context import (
     get_flags,
     get_lora,
     get_parallel,
+    get_platform,
     mamba_cache_chunk_size,
 )
 from sglang.srt.speculative.spec_info import SpecInputType
@@ -681,6 +683,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Has to be None when cuda graph is captured.
     global_num_tokens_for_logprob_cpu: Optional[List[int]] = None
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor] = None
+    # Per DP rank, the rows the decoder SWA tail drops before the late layers;
+    # None when no rank trims (see DeepseekV4Model's late-layer DP switch).
+    global_decoder_trim_rows_cpu: Optional[List[int]] = None
 
     # Real (non-padding) token count, held at two scopes whose meaning never
     # changes once set:
@@ -1172,6 +1177,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         ret.init_mlp_sync_metadata(
             batch, device, is_draft_worker=model_runner.is_draft_worker
         )
+        if not model_runner.is_draft_worker:
+            ret.global_decoder_trim_rows_cpu = batch.global_decoder_trim_rows
 
         if ret.forward_mode.is_idle():
             ret.positions = torch.empty((0,), dtype=torch.int64, device=device)
@@ -1961,13 +1968,29 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         ):
             local_late_rows = model_runner.attn_backend.late_layer_num_tokens(self)
             if local_late_rows is not None:
-                late_rows = torch.empty(sync_group_size, dtype=torch.int64)
-                all_gather_single(
-                    late_rows,
-                    torch.tensor([local_late_rows], dtype=torch.int64),
-                    group=get_parallel().tp_group.cpu_group,
-                )
-                self.global_late_layer_num_tokens_cpu = late_rows.tolist()
+                trims = self.global_decoder_trim_rows_cpu
+                if (
+                    trims is not None
+                    and get_platform().is_cuda
+                    and get_parallel().attn_tp_size == 1
+                    and get_exec().graph.cuda_graph_config.prefill.backend
+                    == Backend.DISABLED
+                    and not self.dp_padding_mode.is_max_len()
+                ):
+                    counts = [
+                        n - t for n, t in zip(global_num_tokens, trims, strict=True)
+                    ]
+                    assert min(counts) >= 0, (global_num_tokens, trims)
+                    assert counts[dp_slot_in(counts)] == local_late_rows
+                    self.global_late_layer_num_tokens_cpu = counts
+                else:
+                    late_rows = torch.empty(sync_group_size, dtype=torch.int64)
+                    all_gather_single(
+                        late_rows,
+                        torch.tensor([local_late_rows], dtype=torch.int64),
+                        group=get_parallel().tp_group.cpu_group,
+                    )
+                    self.global_late_layer_num_tokens_cpu = late_rows.tolist()
 
         TboForwardBatchPreparer.prepare(
             batch=self, is_draft_worker=model_runner.is_draft_worker
