@@ -1734,6 +1734,9 @@ class Envs:
     SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
+    # Opt-in: chunked-prefill indexer passes per-request page-table rows to the
+    # sgl-kernel top-k transform instead of a per-token copy. Bit-exact.
+    SGLANG_DSA_DEDUPE_CHUNK_GATHER = EnvBool(False)
     SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)
     # HIP analog of CUDA SGLANG_DISABLE_DSA_INDEXER_FUSION (default on).
     # Set 1 for the legacy split writer. Omits Hadamard; pre-quant logits match.
@@ -1760,6 +1763,14 @@ class Envs:
     # predicate.  Coarse per-layer join keeps the single-slot born-q buffer
     # WAR-safe.
     SGLANG_ENABLE_DSA_Q8KV8_QPREP_OVERLAP = EnvBool(False)
+    # Opt-in: split the extend rows of the ragged DSA indexer (logits + top-k)
+    # across the attention-TP group and all-gather the top-k indices, instead
+    # of every rank computing all rows. Only when rows >= MIN_ROWS.
+    SGLANG_DSA_INDEXER_TP_SPLIT = EnvBool(False)
+    SGLANG_DSA_INDEXER_TP_SPLIT_MIN_ROWS = EnvInt(1024)
+    # Opt-in (needs SGLANG_DSA_INDEXER_TP_SPLIT): also split when the indexer
+    # runs as the eager break op of a breakable prefill CUDA graph replay.
+    SGLANG_ENABLE_DSA_TP_SPLIT_IN_GRAPH = EnvBool(False)
     # Opt-in: fuse the Q8KV8 non-prefix KV prep — cast-concat k/k_rope
     # directly into the persistent fp8 kv buffer and zero the pad band in one
     # Triton kernel (replaces bf16 _cat + copy_ cast + zero_ tail).
