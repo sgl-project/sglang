@@ -885,6 +885,14 @@ class CompressorAscendBackendMixin:
         #   kBaseNum differs                       -> (beta) K-split.
         #   kBaseNum same, rdcarry rows differ     -> (alpha) read-misalign.
         #   kBaseNum+rdcarry same, idxK differs    -> (gamma) write path.
+        #   all three IDENTICAL                    -> INCONCLUSIVE, NOT "no bug":
+        #     rdcarry is recomputed with the SAME formula the kernel uses, so it
+        #     can never reveal a KERNEL-internal page-boundary column error; if
+        #     all three match, (alpha) at the KERNEL level is NOT excluded and a
+        #     kernel-side stateLoc print in ReadState/ReadFromCacheState is then
+        #     required. kBaseNum also needs the REAL usedCoreNum (set
+        #     SGLANG_DSV4_AIC_NUM) and the right headDim; both are emitted raw so
+        #     the verdict can be checked.
         # Env DSV4_DUMP_C4DEC = layer id or "all"; optional SGLANG_DSV4_AIC_NUM
         # resolves kBaseNum exactly (else the branch discriminator is emitted).
         _want_dec = os.environ.get("DSV4_DUMP_C4DEC")
@@ -916,21 +924,34 @@ class CompressorAscendBackendMixin:
                         .to("cpu")
                     )
                     _rows_n = _flat.shape[0]
-                    # (1) kbase: SplitK shape (mBaseSize=256, dBaseSize=64).
+                    # (1) kbase: SplitK trigger is
+                    #     dBasicBlockNum * mBaseNum < usedCoreNum
+                    # (mBaseSize=256, dBaseSize=64; dBasicBlockNum = headDim /
+                    # dBaseSize). Emit BOTH head-dim sources so a wrong headDim
+                    # (128 indexer-frame vs 512 attention-frame) cannot silently
+                    # flip the verdict, plus the raw usedCoreNum.
                     _tok = int(_su.sum())
                     _m_base = (_tok + 255) // 256
-                    _hd = getattr(compressor, "head_dim", None)
-                    _dbase = (int(_hd) // 64) if _hd else -1
-                    _disc = _dbase * _m_base if _dbase > 0 else -1
+                    _srd = int(state_cache.shape[-1])
+                    _hd_attr = getattr(compressor, "head_dim", None)
+                    _hd_state = (
+                        _srd // (2 * coff) if _srd % (2 * coff) == 0 else -1
+                    )
+                    _hd = int(_hd_attr) if _hd_attr else _hd_state
+                    # dBasicBlockNum = headDim / dBaseSize(64)
+                    _dbb = (_hd // 64) if _hd and _hd > 0 else -1
+                    _thresh = _dbb * _m_base if _dbb > 0 else -1
                     _aic = int(os.environ.get("SGLANG_DSV4_AIC_NUM", "0"))
-                    if _aic > 0 and _dbase > 0:
-                        _kb_txt = str(1 if _disc >= _aic else _aic // _dbase)
+                    if _aic > 0 and _dbb > 0:
+                        _kb_txt = str(1 if _thresh >= _aic else _aic // _dbb)
                     else:
-                        _kb_txt = "1if>=usedCoreNum_else_split"
+                        _kb_txt = "1if_thresh>=usedCoreNum_else_split"
                     _kbase_col = (
-                        f"mBaseNum={_m_base}/kBaseNum={_kb_txt} "
-                        f"raw_tok={_tok} headDim={_hd} dBaseNum={_dbase} "
-                        f"discr={_disc}"
+                        f"mBaseNum={_m_base}/kBaseNum={_kb_txt} raw_tok={_tok} "
+                        f"headDim={_hd}(attr={_hd_attr},state={_hd_state}) "
+                        f"dBasicBlockNum={_dbb} state_row_dim={_srd} "
+                        f"thresh={_thresh} "
+                        f"usedCoreNum={_aic if _aic > 0 else 'unset'}"
                     )
                     # (2) rdcarry: rows the kernel reads for carry 17528..17533.
                     _rc = []
@@ -948,15 +969,27 @@ class CompressorAscendBackendMixin:
                             ).hexdigest()[:8]
                             _rc.append(f"{_p}={_sl}:{_h}")
                     _rdcarry_col = "[" + ",".join(_rc) + "]"
-                    # (3) idxK: produced index-K for global blocks 4382/4383
-                    #     (== cmp_kv[-2]/[-1] in BOTH miss and suffix hit, both
-                    #     ending at 17536). Read AFTER sync (timing pitfall).
+                    # (3) idxK: produced index-K for global blocks 4382/4383.
+                    #     The op output MAY be padded, and the caller trims it
+                    #     with  cmp_kv = cmp_kv[: loc.numel()]  a few lines
+                    #     below. Read the SAME trimmed view here, else [-1]
+                    #     could be a padding row and (gamma) is void. n_raw /
+                    #     n_keep are emitted so a wrong trim is visible.
                     try:
                         torch.npu.synchronize()
                     except Exception:
                         pass
-                    _ik = []
-                    _ck = cmp_kv.detach().to(torch.float32).cpu()
+                    _loc = getattr(fm, f"c{ratio}_loc", None)
+                    _n_raw = int(cmp_kv.shape[0])
+                    _n_keep = (
+                        int(_loc.numel())
+                        if _loc is not None and int(_loc.numel()) < _n_raw
+                        else _n_raw
+                    )
+                    _ik = [f"n_raw={_n_raw},n_keep={_n_keep}"]
+                    _ck = (
+                        cmp_kv[: _n_keep].detach().to(torch.float32).cpu()
+                    )
                     if _ck.shape[0] >= 2:
                         for _bid, _ri in ((4382, -2), (4383, -1)):
                             _row = _ck[_ri].reshape(-1)
