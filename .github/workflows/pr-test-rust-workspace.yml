@@ -3,23 +3,19 @@ name: PR Test (Rust workspace)
 # Native Rust unit tests for the rust/ workspace and the standalone
 # sglang-radix-tree crate. These used to run from the Python CPU suite through
 # test/registered/rust/ wrappers; they run here instead, on their own runner
-# and rust cache, only when Rust or proto inputs change.
+# and rust cache, only when files under rust/ change.
 
 on:
   push:
     branches: [ main ]
     paths:
       - "rust/**"
-      - "proto/**"
-      - "python/sglang/srt/rust_extensions/**"
       - ".github/workflows/pr-test-rust-workspace.yml"
   pull_request:
     branches: [ main ]
     types: [opened, synchronize, reopened, labeled]
     paths:
       - "rust/**"
-      - "proto/**"
-      - "python/sglang/srt/rust_extensions/**"
       - ".github/workflows/pr-test-rust-workspace.yml"
   workflow_dispatch:
 

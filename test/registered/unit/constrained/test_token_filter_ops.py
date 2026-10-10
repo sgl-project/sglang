@@ -16,11 +16,6 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(2.0, "base-a-test-cpu")
 
-# Conditionally import Triton path
-_has_cuda = torch.cuda.is_available()
-if _has_cuda:
-    pass
-
 
 def _get_allowed_tokens(vocab_mask, batch_idx, max_token_id):
     """Extract allowed token IDs from a bitmask row."""
