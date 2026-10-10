@@ -4419,8 +4419,8 @@ class HybridLinearKVPool(KVCache):
         loc_info,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
-        k_scale: float = 1.0,
-        v_scale: float = 1.0,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
         dcp_kv_mask: Optional[torch.Tensor] = None,
     ):
         # Write-location info lives in the metadata (`KVWriteLoc`). `full_loc` is the

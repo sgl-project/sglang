@@ -1861,8 +1861,8 @@ class UnifiedSWAKVPool(SWAKVPool):
         loc_info,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
-        k_scale: float = 1.0,
-        v_scale: float = 1.0,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
     ):
         """Route to the right sub-pool. Both `swa_loc` and `full_loc` are PHYSICAL
         (pre-translated once per forward by the attention backend); never translates here.
