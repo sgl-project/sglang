@@ -1054,7 +1054,8 @@ def generate_glm_grammar(
         f'{root_name} ::= assistant_turn ( "{special_tokens.assistant_token}" assistant_turn )*'
         if allow_multiple_assistant_turns
         else f"{root_name} ::= assistant_turn",
-        "assistant_turn ::= thinking_block text_block tool_call_blocks",
+        "assistant_turn ::= thinking_block generation",
+        "generation ::= text_block tool_call_blocks",
     ]
 
     thinking_exclusions = [
@@ -1154,3 +1155,16 @@ def generate_glm_grammar(
         deduped_lines.append(line)
 
     return "\n".join(deduped_lines)
+
+
+@lru_cache(maxsize=1)
+def glm47_thinking_grammar_prefix() -> str:
+    grammar = generate_glm_grammar(
+        enable_thinking=True,
+        functions=None,
+        special_tokens=GlmSpecialTokenConfig(),
+        chat_template_version="glm47",
+        accommodate_chat_template=True,
+        allow_multiple_assistant_turns=False,
+    )
+    return grammar.split("\ntext_without_special_tokens ::=", 1)[0] + "\n"
