@@ -163,6 +163,9 @@ all of it, and the `sgl_router_kv_bootstrap_*` series in
 
 Use `--chat-routing reorg` to select the new bucket engine. The existing `--policy`
 and cache/session flags configure its policies; a bucket file is optional.
+See [POLICY_DESIGN.md](POLICY_DESIGN.md) for how buckets, engine groups and
+policies (selection, affinity modes, admission) fit together, with a full
+configuration reference.
 
 ```bash
 sgl-router --model-id qwen3 --worker-urls http://localhost:30001 \
@@ -189,7 +192,7 @@ Unsupported legacy options fail at startup.
 
 `--bucket-config buckets.json` replaces the default plain and P/D buckets. Each
 bucket is plain or P/D, and each group may set its own engines, policy,
-admission and affinity; see [POLICY_DESIGN.md](POLICY_DESIGN.md#7-configuration-and-compatibility):
+admission and affinity; see [POLICY_DESIGN.md](POLICY_DESIGN.md#13-configuration):
 
 ```json
 {"buckets": [{
