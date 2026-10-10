@@ -537,6 +537,13 @@ class MambaComponent(TreeComponent):
     def _alloc_int8_ckpt_slot(self) -> torch.Tensor:
         slot = self.int8_ckpt_pool.alloc(1)
         if slot is None:
+            if _MAMBA_CKPT_PROBE:
+                _CKPT_PROBE_STATS["int8_evict"] += 1
+                _ckpt_probe(
+                    "int8_evict",
+                    f"n={_CKPT_PROBE_STATS['int8_evict']}",
+                    f"int8_free={self.int8_ckpt_pool.available_size()}",
+                )
             self.cache.evict(EvictParams(num_tokens=0, mamba_num=1))
             slot = self.int8_ckpt_pool.alloc(1)
             assert slot is not None, "Can not alloc int8 mamba checkpoint slot"
@@ -715,6 +722,16 @@ class MambaComponent(TreeComponent):
                     and insert_params is not None
                     and insert_params.mamba_value is not None
                 )
+                if _MAMBA_CKPT_PROBE:
+                    _CKPT_PROBE_STATS["finished_ins"] += 1
+                    _ckpt_probe(
+                        "finished_ins",
+                        "exist="
+                        + str(insert_result.mamba_exist if insert_result else None),
+                        f"unused={insert_value_unused}",
+                        f"commit_tot={_CKPT_PROBE_STATS['commit_total']}",
+                        f"int8_free={self.int8_ckpt_pool.available_size()}",
+                    )
                 if insert_value_unused:
                     self._free_mamba_value(insert_params.mamba_value)
                 pool.free_mamba_cache(req)
