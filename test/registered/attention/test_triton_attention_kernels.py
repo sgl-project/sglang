@@ -1,3 +1,4 @@
+import itertools
 import random
 import unittest
 
@@ -11,6 +12,7 @@ from sglang.kernels.ops.attention.decode_attention import (
 )
 from sglang.kernels.ops.attention.extend_attention import (
     _compact_extend_q_tiles_per_head,
+    align_window_kv_to_tiles,
     build_unified_kv_indices,
     extend_attention_fwd,
     extend_attention_fwd_unified,
@@ -1129,6 +1131,86 @@ class TestTritonAttention(CustomTestCase):
             # Check that prefix and extend are concatenated correctly
             unified_seq = unified_kv_indices[start_idx:end_idx]
             self.assertEqual(len(unified_seq), prefix_len + extend_len)
+
+    def _unified_sliding_window_rows(self, q, k, v, prefix_lens, seq_len, window):
+        """Run the unified kernel over the last seq_len - prefix chunk of each
+        request, whose KV sits at slots [i * seq_len, (i + 1) * seq_len)."""
+        device = q.device
+        bs = len(prefix_lens)
+        i32 = lambda x: torch.tensor(x, dtype=torch.int32, device=device)
+        win = [min(p, window) for p in prefix_lens]
+        ext = [seq_len - p for p in prefix_lens]
+        window_kv_indptr = i32([0] + list(itertools.accumulate(win)))
+        window_kv_indices = torch.cat(
+            [
+                torch.arange(i * seq_len + p - w, i * seq_len + p)
+                for i, (p, w) in enumerate(zip(prefix_lens, win))
+            ]
+        ).to(device)
+        aligned_indptr, aligned_indices = align_window_kv_to_tiles(
+            window_kv_indptr, window_kv_indices, i32(prefix_lens) - i32(win), bs
+        )
+        aligned_lens = aligned_indptr[1:] - aligned_indptr[:-1]
+        extend_lens = i32(ext)
+        extend_start = i32([0] + list(itertools.accumulate(ext))[:-1])
+        extend_kv_indices = torch.cat(
+            [
+                torch.arange(i * seq_len + p, (i + 1) * seq_len)
+                for i, p in enumerate(prefix_lens)
+            ]
+        ).to(device)
+        kv_indptr, kv_indices, kv_prefix_lens = build_unified_kv_indices(
+            aligned_indptr,
+            aligned_indices,
+            extend_start,
+            extend_lens,
+            extend_kv_indices,
+            bs,
+        )
+        q_rows = torch.cat(
+            [q[i * seq_len + p : (i + 1) * seq_len] for i, p in enumerate(prefix_lens)]
+        )
+        o = torch.empty_like(q_rows)
+        extend_attention_fwd_unified(
+            q_rows,
+            o,
+            k,
+            v,
+            1.0,
+            1.0,
+            i32([0] + list(itertools.accumulate(ext))),
+            kv_indptr,
+            kv_indices,
+            kv_prefix_lens.to(torch.int32),
+            max(ext),
+            sm_scale=q.shape[-1] ** -0.5,
+            sliding_window_size=window,
+            window_start_pos=(i32(prefix_lens) - aligned_lens).to(torch.int32),
+        )
+        return o
+
+    def test_unified_sliding_window_chunked_matches_unchunked(self):
+        """A chunked prefill whose window starts off a tile boundary gives the
+        unchunked prefill's output bit for bit once the window list is aligned."""
+        torch.manual_seed(0)
+        device = get_device()
+        seq_len, window = 3000, 128
+        prefix_lens = [2192, 2205, 2900]  # window starts 2064, 2077, 2772
+        bs = len(prefix_lens)
+        q = torch.randn(bs * seq_len, 8, 64, dtype=torch.bfloat16, device=device)
+        k = torch.randn(bs * seq_len, 8, 64, dtype=torch.bfloat16, device=device)
+        v = torch.randn_like(k)
+        full = self._unified_sliding_window_rows(q, k, v, [0] * bs, seq_len, window)
+        chunked = self._unified_sliding_window_rows(
+            q, k, v, prefix_lens, seq_len, window
+        )
+        expected = torch.cat(
+            [
+                full[i * seq_len + p : (i + 1) * seq_len]
+                for i, p in enumerate(prefix_lens)
+            ]
+        )
+        self.assertTrue(torch.equal(chunked, expected))
 
 
 if __name__ == "__main__":

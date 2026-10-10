@@ -1673,8 +1673,9 @@ class Scheduler(
             return
 
         # Flashinfer splits the prefill KV into fixed tiles, so chunk boundaries
-        # must fall on tile boundaries. Triton's deterministic extend kernel reads
-        # prefix and extend KV through one index list, so any boundary is fine.
+        # must fall on tile boundaries. Triton's deterministic extend kernel tiles
+        # keys at absolute positions (see align_window_kv_to_tiles), so any
+        # boundary is fine.
         backend_sizes = {
             "flashinfer": ("SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE", 4096),
         }
