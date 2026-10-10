@@ -190,6 +190,22 @@ tensor copy at each residual site.
 | `vdn_temporal_conv_act`, `vdn_silu_l2norm`, `vdn_linear_epilogue` | Triton | one rounding at the store, within one bf16 ulp of the eager chain; the model's own inference kernels, mounted unconditionally by the VDN-H3 branch |
 | `vdn_delta_factors` | JIT CUDA | `(alpha * inv(I + A), B @ inv(I + A))` in one launch; same fp32 accuracy class as the cholesky + solve_triangular chain (cond-dominated); head_dim 128 |
 
+### Rowwise E4M3 producers (SM89+)
+
+| Entry point | Backend | Contract |
+|---|---|---|
+| `fp8_rowwise` | Triton | Dynamic per-row FP32 scales, E4M3 payload and zero-row padding; matches the eager quantizer |
+| `fused_packed_swiglu_fp8_rowwise` | Triton | Packed/row-strided BF16 `[B,T,2*K]` to padded 2D E4M3 + FP32 row scales; preserves both BF16 rounds of `F.silu(gate) * up`; mounted in FLUX3 FP8r MLP output projections |
+
+The SwiGLU producer avoids materializing a BF16 activation. Its measured SM89
+`K=9216` path uses nine 1024-element tiles, native BF16 rounding, and paired
+FP32-to-E4M3 conversions, retaining one row reduction and zero-row padding.
+Other widths/devices retain the full-row implementation. Finite inputs,
+`K <= 16384`, and flattenable B/T row strides are required. Padding rows have
+zero payload and scale `1e-12`. The local CUDA-graph benchmark is
+`test/manual/kernels/diffusion/bench_swiglu_fp8_rowwise.py`; it compares the
+existing two kernels and the fusion, both alone and with the same FP8 GEMM.
+
 ### MXFP8 producers (online `mxfp8`, cuBLASLt block-scaled GEMM on SM100)
 
 Defined in `sglang.kernels.ops.quantization.mxfp8_swizzled_triton` and re-exported here.
