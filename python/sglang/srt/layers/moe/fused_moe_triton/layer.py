@@ -14,6 +14,7 @@ from sglang.srt.batch_overlap.single_batch_overlap import DownGemmOverlapArgs
 from sglang.srt.batch_overlap.two_batch_overlap import MaybeTboDeepEPDispatcher
 from sglang.srt.configs.moe_model_registry import model_requires_fp32_silu_mul
 from sglang.srt.distributed import (
+    get_tp_group,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -39,6 +40,9 @@ from sglang.srt.layers.moe.token_dispatcher.ascend_tp import (
 from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
 from sglang.srt.layers.moe.token_dispatcher.deepep_v2 import DeepEPv2Dispatcher
 from sglang.srt.layers.moe.token_dispatcher.flashinfer import FlashinferDispatcher
+from sglang.srt.layers.moe.token_dispatcher.mscclpp import (
+    MSCCLPPDispatcher,
+)
 from sglang.srt.layers.moe.token_dispatcher.standard import (
     StandardDispatcher,
 )
@@ -53,6 +57,8 @@ from sglang.srt.layers.moe.utils import (
     DispatcherOutputDtype,
     RoutingMethodType,
     get_deepep_v2_dispatcher_output_dtype,
+    get_mscclpp_ep_layout,
+    get_mscclpp_mode,
     has_per_rank_fused_shared_slots,
     uses_per_rank_fused_shared_slots,
 )
@@ -225,6 +231,17 @@ def create_moe_dispatcher(
             num_experts=moe_runner_config.num_experts,
             num_local_experts=moe_runner_config.num_local_experts,
             hidden_size=moe_runner_config.hidden_size,
+        )
+    elif a2a_backend.is_mscclpp():
+        return MSCCLPPDispatcher(
+            group=get_tp_group().cpu_group,
+            router_topk=moe_runner_config.top_k,
+            num_experts=moe_runner_config.num_experts,
+            num_local_experts=moe_runner_config.num_local_experts,
+            hidden_size=moe_runner_config.hidden_size,
+            params_dtype=moe_runner_config.params_dtype,
+            mode=get_mscclpp_mode(),
+            output_layout=get_mscclpp_ep_layout(),
         )
     else:
         raise NotImplementedError(f"Unsupported a2a backend: {a2a_backend}")
