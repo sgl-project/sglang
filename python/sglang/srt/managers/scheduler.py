@@ -667,6 +667,7 @@ class Scheduler(
         # Init Ngram Embedding
         self.maybe_init_ngram_embedding()
 
+        # Init prefill chunk alignment when deterministic inference is enabled with various attention backends
         self.init_deterministic_prefill_chunk_align()
         self.init_dsa_kpool_truncation_align()
         self.check_truncation_align_fits_chunk()
@@ -1669,6 +1670,8 @@ class Scheduler(
         self.truncation_align_size = None
         if not get_exec().deterministic.enable_deterministic_inference:
             return
+        # Only flashinfer needs chunks on its q-tile grid; triton tiles keys at
+        # absolute positions (align_window_kv_to_tiles).
         prefill_backend, _ = attention_backends()
         if prefill_backend == "flashinfer":
             from sglang.srt.layers.attention.flashinfer_backend import (
