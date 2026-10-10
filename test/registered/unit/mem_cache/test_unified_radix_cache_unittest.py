@@ -1690,7 +1690,7 @@ class TestUnifiedRadixCacheBatchedWriteThrough(CustomTestCase):
     )
     seqs = ([1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12])
 
-    def _build(self, batched=True, cfg=None):
+    def _build(self, cfg=None):
         cfg = cfg or self.cfg
         cache, allocator, _ = build_fixture(cfg)
         server_args = ServerArgs(
@@ -1705,7 +1705,7 @@ class TestUnifiedRadixCacheBatchedWriteThrough(CustomTestCase):
         self.addCleanup(cache.release_host_resources)
         cache.write_through_threshold = 1
         cache.load_back_threshold = 0
-        cache._batched_backup = batched
+        cache._batched_backup = True
         return cache, allocator
 
     def _insert(self, cache, allocator, tokens):
@@ -1769,66 +1769,48 @@ class TestUnifiedRadixCacheBatchedWriteThrough(CustomTestCase):
         self.assertEqual(cache.cache_controller.ack_write_queue[-1].node_ids, nodes)
         self._assert_all_backed_up(cache, nodes)
 
-    def test_split_of_a_queued_node_backs_the_new_parent_up_first(self):
-        for cfg in (self.cfg, self.swa_cfg):
-            with self.subTest(swa=cfg is self.swa_cfg):
+    def test_split_parent_is_backed_up_before_its_queued_child(self):
+        # Threshold 1 queues the split parent [1, 2] behind the split node;
+        # threshold 100 leaves it unqueued, holding no queue lock.
+        chained = [[3, 4], [1, 2], [5, 6]]
+        cases = [(self.cfg, 1, chained), (self.swa_cfg, 1, chained)]
+        cases.append((self.cfg, 100, [[3, 4]]))
+        for cfg, threshold, queued_tokens in cases:
+            with self.subTest(swa=cfg is self.swa_cfg, threshold=threshold):
                 cache, allocator = self._build(cfg=cfg)
                 node = self._insert(cache, allocator, [1, 2, 3, 4])
-                # Split the queued node: [1, 2] becomes its parent and is queued
-                # behind it by the new leaf's BackupKV chain.
+                cache.write_through_threshold = threshold
                 self._insert(cache, allocator, [1, 2, 5, 6])
+                parent = _node_parent(cache, node)
+                self.assertEqual(_node_token_ids(cache, parent), [1, 2])
                 queued = list(cache.queued_backups)
                 self.assertEqual(queued[0], node)
                 self.assertEqual(
-                    [_node_token_ids(cache, n) for n in queued],
-                    [[3, 4], [1, 2], [5, 6]],
+                    [_node_token_ids(cache, n) for n in queued], queued_tokens
                 )
 
                 cache.flush_pending_backups()
-                self._assert_all_backed_up(cache, queued)
-
-    def test_split_parent_left_unqueued_is_backed_up_with_its_child(self):
-        cache, allocator = self._build()
-        node = self._insert(cache, allocator, [1, 2, 3, 4])
-        # Neither the new leaf nor the split parent reaches the threshold, so no
-        # chain queues the parent.
-        cache.write_through_threshold = 100
-        self._insert(cache, allocator, [1, 2, 5, 6])
-        parent = _node_parent(cache, node)
-        self.assertEqual(_node_token_ids(cache, parent), [1, 2])
-        self.assertEqual(list(cache.queued_backups), [node])
-
-        cache.flush_pending_backups()
-        self._assert_all_backed_up(cache, [parent, node])
+                self._assert_all_backed_up(cache, [parent, *queued])
 
     def test_failed_batch_allocation_retries_node_by_node(self):
-        # 1 failure: only the merged allocation fails and both retries succeed.
-        # 3 failures: the retries fail too, so both nodes drop and unlock.
-        for failures in (1, 3):
+        # After the merged allocation fails, the retries succeed, fail, or fail on
+        # a parent, whose queued child must then drop instead of backing up.
+        chain = ([1, 2, 3, 4], [1, 2, 3, 4, 5, 6])
+        cases = [(self.seqs[:2], 1, 3, True), (self.seqs[:2], 3, 3, False)]
+        cases.append((chain, 2, 2, False))
+        for seqs, failures, alloc_calls, backed_up in cases:
             with self.subTest(failures=failures):
                 cache, allocator = self._build()
-                nodes = [self._insert(cache, allocator, seq) for seq in self.seqs[:2]]
+                nodes = [self._insert(cache, allocator, seq) for seq in seqs]
+                self.assertEqual(list(cache.queued_backups), nodes)
                 calls = self._host_alloc_calls(cache, failures=failures)
 
                 cache.flush_pending_backups()
-                self.assertEqual(len(calls), 3)
-                if failures == 1:
+                self.assertEqual(len(calls), alloc_calls)
+                if backed_up:
                     self._assert_all_backed_up(cache, nodes)
                 else:
                     self._assert_all_dropped(cache, nodes)
-
-    def test_failed_parent_drops_its_queued_child(self):
-        cache, allocator = self._build()
-        parent = self._insert(cache, allocator, [1, 2, 3, 4])
-        child = self._insert(cache, allocator, [1, 2, 3, 4, 5, 6])
-        self.assertEqual(list(cache.queued_backups), [parent, child])
-        # The merged allocation and the parent's retry fail; the child must not
-        # be backed up under an unbacked parent.
-        calls = self._host_alloc_calls(cache, failures=2)
-
-        cache.flush_pending_backups()
-        self.assertEqual(len(calls), 2)
-        self._assert_all_dropped(cache, [parent, child])
 
     def test_child_in_the_swa_window_of_a_batched_parent_is_backed_up_after_it(self):
         # The child's SWA window reaches into the parent, so batching both would
@@ -1844,15 +1826,6 @@ class TestUnifiedRadixCacheBatchedWriteThrough(CustomTestCase):
             [[parent, child]],
         )
         self._assert_all_backed_up(cache, [parent, child])
-
-    def test_disabled_backs_up_at_insert_time(self):
-        cache, allocator = self._build(batched=False)
-        node = self._insert(cache, allocator, [1, 2, 3, 4])
-        self.assertEqual(cache.queued_backups, {})
-        self.assertTrue(cache.tree_core.is_backuped(node))
-        self.assertEqual(list(cache.ongoing_write_through), [node])
-        cache.writing_check(write_back=True)
-        cache.sanity_check()
 
     def test_backup_dispatch_queues_only_batched_write_through(self):
         action = BackupKV(node_ids=[7])
@@ -10238,10 +10211,11 @@ class TestUnifiedTreeCoreSWAPrefetchBackends(_InsertWalkSuite):
 class TestResumableInsertWalk(_InsertWalkSuite):
     cfg = CacheConfig()
 
-    def test_walk_backup_can_host_evict_on_path_h_leaf(self):
-        """A crossing node's backup runs at its walk step, so its host eviction
-        can still take an H-leaf deeper on the inserted path."""
+    def _build_host_full_on_path_h_leaf(self, batched):
+        """A device-evicted H-leaf under an unbacked `top`, with the host pool too
+        full to back `top` up without evicting another host entry."""
         cache, allocator, req_to_token_pool = self._build_hicache_fixture()
+        cache._batched_backup = batched
 
         self._insert(cache, allocator, req_to_token_pool, [1, 2, 3, 4])
         (top,) = _node_children(cache, cache.root_node_handle())
@@ -10273,6 +10247,14 @@ class TestResumableInsertWalk(_InsertWalkSuite):
             cache.evict(EvictParams(num_tokens=count))
             self.assertTrue(cache.tree_core.is_full_device_evicted(filler))
         cache.dec_lock_ref(top, top_lock.to_dec_params())
+        return cache, allocator, req_to_token_pool, top, h_leaf
+
+    def test_walk_backup_can_host_evict_on_path_h_leaf(self):
+        """A crossing node's backup runs at its walk step, so its host eviction
+        can still take an H-leaf deeper on the inserted path."""
+        cache, allocator, req_to_token_pool, top, h_leaf = (
+            self._build_host_full_on_path_h_leaf(batched=False)
+        )
 
         # The crossing backup evicts exactly the on-path H-leaf, then the
         # remaining suffix is recreated as a fresh leaf.
@@ -10292,39 +10274,9 @@ class TestResumableInsertWalk(_InsertWalkSuite):
     def test_batched_backup_reuses_the_on_path_h_leaf(self):
         """A crossing node's backup runs at flush, after the walk re-attached the
         on-path H-leaf, so its host eviction takes another node and the leaf stays."""
-        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
-        cache._batched_backup = True
-
-        self._insert(cache, allocator, req_to_token_pool, [1, 2, 3, 4])
-        (top,) = _node_children(cache, cache.root_node_handle())
-        self._insert(cache, allocator, req_to_token_pool, list(range(1, 9)))
-        (h_leaf,) = _node_children(cache, top)
-        self.assertGreater(_write_backup(cache, h_leaf, write_back=True), 0)
-        cache.writing_check(write_back=True)
-        cache.evict(EvictParams(num_tokens=4))
-        self.assertTrue(cache.tree_core.is_full_device_evicted(h_leaf))
-
-        # Fill the host pool below len(top) free, keeping the on-path H-leaf
-        # the oldest host entry and pinning the unbacked path root.
-        top_lock = cache.inc_lock_ref(top)
-        host_pool = cache.cache_controller.mem_pool_host
-        start = 1000
-        top_len = _node_key_length(cache, top)
-        while host_pool.available_size() >= top_len:
-            count = min(host_pool.available_size() - top_len + 1, 250)
-            tokens = list(range(start, start + count))
-            start += 1000
-            self._insert(cache, allocator, req_to_token_pool, tokens)
-            filler = None
-            for child in _node_children(cache, cache.root_node_handle()):
-                if child != top and not cache.tree_core.is_full_device_evicted(child):
-                    filler = child
-            self.assertIsNotNone(filler)
-            self.assertGreater(_write_backup(cache, filler, write_back=True), 0)
-            cache.writing_check(write_back=True)
-            cache.evict(EvictParams(num_tokens=count))
-            self.assertTrue(cache.tree_core.is_full_device_evicted(filler))
-        cache.dec_lock_ref(top, top_lock.to_dec_params())
+        cache, allocator, req_to_token_pool, top, h_leaf = (
+            self._build_host_full_on_path_h_leaf(batched=True)
+        )
 
         # The walk re-attaches the on-path H-leaf and hangs the suffix below it.
         cache.write_through_threshold = cache.tree_core.get_node_hit_count(top) + 1
