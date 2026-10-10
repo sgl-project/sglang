@@ -1981,6 +1981,21 @@ impl ::serde::Serialize for GenerateMetaInfo {
         if let Some(v) = &self.e2e_latency {
             ::serde::ser::SerializeMap::serialize_entry(&mut map, "e2e_latency", v)?;
         }
+        if let Some(v) = &self.cached_tokens {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "cached_tokens", v)?;
+        }
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "cached_tokens_details",
+            &self.cached_tokens_details,
+        )?;
+        if let Some(v) = &self.reasoning_tokens {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "reasoning_tokens", v)?;
+        }
+        if let Some(v) = &self.num_retractions {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "num_retractions", v)?;
+        }
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "dp_rank", &self.dp_rank)?;
         ::serde::ser::SerializeMap::end(map)
     }
 }
@@ -2009,6 +2024,11 @@ impl<'de> ::serde::Deserialize<'de> for GenerateMetaInfo {
                 let mut f_input_token_ids_logprobs = None;
                 let mut f_hidden_states = None;
                 let mut f_e2e_latency = None;
+                let mut f_cached_tokens = None;
+                let mut f_cached_tokens_details = None;
+                let mut f_reasoning_tokens = None;
+                let mut f_num_retractions = None;
+                let mut f_dp_rank = None;
                 while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
                     match key.as_ref() {
                         "id" => {
@@ -2114,6 +2134,41 @@ impl<'de> ::serde::Deserialize<'de> for GenerateMetaInfo {
                             }
                             f_e2e_latency = Some(map.next_value::<Option<f64>>()?);
                         }
+                        "cached_tokens" => {
+                            if f_cached_tokens.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("cached_tokens"));
+                            }
+                            f_cached_tokens = Some(map.next_value::<Option<u64>>()?);
+                        }
+                        "cached_tokens_details" => {
+                            if f_cached_tokens_details.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "cached_tokens_details",
+                                ));
+                            }
+                            f_cached_tokens_details =
+                                Some(map.next_value::<Option<CachedTokensDetails>>()?);
+                        }
+                        "reasoning_tokens" => {
+                            if f_reasoning_tokens.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "reasoning_tokens",
+                                ));
+                            }
+                            f_reasoning_tokens = Some(map.next_value::<Option<u64>>()?);
+                        }
+                        "num_retractions" => {
+                            if f_num_retractions.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("num_retractions"));
+                            }
+                            f_num_retractions = Some(map.next_value::<Option<u64>>()?);
+                        }
+                        "dp_rank" => {
+                            if f_dp_rank.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("dp_rank"));
+                            }
+                            f_dp_rank = Some(map.next_value::<Option<u32>>()?);
+                        }
                         _ => {
                             map.next_value::<::serde::de::IgnoredAny>()?;
                         }
@@ -2132,6 +2187,86 @@ impl<'de> ::serde::Deserialize<'de> for GenerateMetaInfo {
                     input_token_ids_logprobs: f_input_token_ids_logprobs.unwrap_or_default(),
                     hidden_states: f_hidden_states.unwrap_or_default(),
                     e2e_latency: f_e2e_latency.flatten(),
+                    cached_tokens: f_cached_tokens.flatten(),
+                    cached_tokens_details: f_cached_tokens_details.flatten(),
+                    reasoning_tokens: f_reasoning_tokens.flatten(),
+                    num_retractions: f_num_retractions.flatten(),
+                    dp_rank: f_dp_rank.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for CachedTokensDetails {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "device", &self.device)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "host", &self.host)?;
+        if let Some(v) = &self.storage {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "storage", v)?;
+        }
+        if let Some(v) = &self.storage_backend {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "storage_backend", v)?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for CachedTokensDetails {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = CachedTokensDetails;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct CachedTokensDetails")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_device = None;
+                let mut f_host = None;
+                let mut f_storage = None;
+                let mut f_storage_backend = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "device" => {
+                            if f_device.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("device"));
+                            }
+                            f_device = Some(map.next_value::<u64>()?);
+                        }
+                        "host" => {
+                            if f_host.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("host"));
+                            }
+                            f_host = Some(map.next_value::<u64>()?);
+                        }
+                        "storage" => {
+                            if f_storage.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("storage"));
+                            }
+                            f_storage = Some(map.next_value::<Option<u64>>()?);
+                        }
+                        "storage_backend" => {
+                            if f_storage_backend.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("storage_backend"));
+                            }
+                            f_storage_backend =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(CachedTokensDetails {
+                    device: f_device.unwrap_or_default(),
+                    host: f_host.unwrap_or_default(),
+                    storage: f_storage.flatten(),
+                    storage_backend: f_storage_backend.flatten(),
                 })
             }
         }

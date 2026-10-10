@@ -122,6 +122,21 @@ message GenerateMetaInfo {
   // Seconds from normalized-request acceptance to the terminal output; only
   // on the terminal frame.
   optional double e2e_latency = 12;
+  // Scheduler snapshots, including zero. Absent for legacy runtime frames.
+  optional uint64 cached_tokens = 13;
+  CachedTokensDetails cached_tokens_details = 14 [(sglang.json.v1.field_json).emit_null_when_absent = true];
+  optional uint64 reasoning_tokens = 15;
+  optional uint64 num_retractions = 16;
+  optional uint32 dp_rank = 17 [(sglang.json.v1.field_json).emit_null_when_absent = true];
+}
+
+// The scheduler's cache-source breakdown. Storage fields are omitted when
+// that tier/backend is not reported; device and host include zero counts.
+message CachedTokensDetails {
+  uint64 device = 1;
+  uint64 host = 2;
+  optional uint64 storage = 3;
+  optional string storage_backend = 4;
 }
 
 message GenerateResponse {

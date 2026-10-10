@@ -253,7 +253,7 @@ fn generate_response_matches_frame_value_shape() {
     };
     assert_eq!(
         serde_json::to_string(&frame).unwrap(),
-        r#"{"text":"ok","meta_info":{"id":"client-rid","prompt_tokens":5,"completion_tokens":2,"finish_reason":null},"output_ids":[7,8]}"#
+        r#"{"text":"ok","meta_info":{"id":"client-rid","prompt_tokens":5,"completion_tokens":2,"finish_reason":null,"cached_tokens_details":null,"dp_rank":null},"output_ids":[7,8]}"#
     );
 }
 

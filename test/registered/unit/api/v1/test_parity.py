@@ -197,7 +197,7 @@ class TestRequestFieldParity(CustomTestCase):
 class TestResponseParity(CustomTestCase):
     def test_python_server_meta_info_decodes_to_the_schema_subset(self):
         """The Python server's `meta_info` carries keys the schema does not
-        model (weight_version, num_retractions, spec stats, ...). The
+        model (weight_version, spec stats, ...). The
         generated types ignore them and re-emit the schema subset, so a
         Rust-server client and a Python-server client see one shape."""
         python_frame = {
@@ -210,6 +210,9 @@ class TestResponseParity(CustomTestCase):
                 "num_retractions": 0,
                 "completion_tokens": 2,
                 "cached_tokens": 1,
+                "cached_tokens_details": {"device": 1, "host": 0},
+                "reasoning_tokens": 0,
+                "dp_rank": None,
                 "spec_accept_rate": 0.5,
                 "e2e_latency": 0.25,
             },
@@ -224,6 +227,11 @@ class TestResponseParity(CustomTestCase):
                 "completion_tokens",
                 "finish_reason",
                 "e2e_latency",
+                "cached_tokens",
+                "cached_tokens_details",
+                "reasoning_tokens",
+                "num_retractions",
+                "dp_rank",
             ],
         )
         self.assertEqual(
@@ -232,9 +240,7 @@ class TestResponseParity(CustomTestCase):
         self.assertNotIn("output_ids", back)
 
     def test_response_key_order_is_the_proto_field_order(self):
-        """The Rust HTTP server's memoized cumulative frame writes these keys
-        by hand in this order (`Accumulated::frame_json`); the generated
-        serializers must keep matching it."""
+        """Both generated serializers preserve the proto's field order."""
         self.assertEqual(
             list(GenerateResponse.__struct_fields__),
             ["text", "meta_info", "output_ids", "index"],
@@ -243,7 +249,7 @@ class TestResponseParity(CustomTestCase):
             list(GenerateMetaInfo.__struct_fields__)[:4],
             ["id", "prompt_tokens", "completion_tokens", "finish_reason"],
         )
-        self.assertEqual(list(GenerateMetaInfo.__struct_fields__)[-1], "e2e_latency")
+        self.assertEqual(list(GenerateMetaInfo.__struct_fields__)[11], "e2e_latency")
 
 
 if __name__ == "__main__":

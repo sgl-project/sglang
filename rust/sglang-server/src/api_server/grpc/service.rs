@@ -256,6 +256,10 @@ mod tests {
             prompt_tokens: 3,
             text: text.into(),
             completion_tokens: 1,
+            metadata: Some(crate::message::response::SchedulerMetadata {
+                cached_tokens: 128,
+                ..Default::default()
+            }),
             extras: None,
         }
     }
@@ -413,7 +417,9 @@ mod tests {
         assert_eq!(output_ids(&first), [10]);
         assert_eq!(output_ids(&finished), [11]);
         assert_eq!(finished.text, "B");
-        assert_eq!(meta(&finished).completion_tokens, 2);
+        let finished_meta = meta(&finished);
+        assert_eq!(finished_meta.completion_tokens, 2);
+        assert_eq!(finished_meta.cached_tokens, Some(128));
         assert!(stream.next().await.is_none());
     }
 

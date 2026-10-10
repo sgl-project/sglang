@@ -282,6 +282,11 @@ class GenerateMetaInfo(msgspec.Struct, kw_only=True, frozen=True):
     input_token_ids_logprobs: List[NullableTopLogprobs] = []
     hidden_states: List[HiddenStateRow] = []
     e2e_latency: Optional[float] = None
+    cached_tokens: Optional[int] = None
+    cached_tokens_details: Optional[CachedTokensDetails] = None
+    reasoning_tokens: Optional[int] = None
+    num_retractions: Optional[int] = None
+    dp_rank: Optional[int] = None
 
     @classmethod
     def from_json_value(cls, value: Any) -> "GenerateMetaInfo":
@@ -291,6 +296,24 @@ class GenerateMetaInfo(msgspec.Struct, kw_only=True, frozen=True):
     def to_json_value(self) -> Dict[str, Any]:
         """Encode to a JSON-ready value (json.dumps-compatible)."""
         return encode_GenerateMetaInfo(self)
+
+
+class CachedTokensDetails(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.CachedTokensDetails: JSON object (unknown keys ignored)."""
+
+    device: int = 0
+    host: int = 0
+    storage: Optional[int] = None
+    storage_backend: Optional[str] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "CachedTokensDetails":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_CachedTokensDetails(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_CachedTokensDetails(self)
 
 
 class GenerateResponse(msgspec.Struct, kw_only=True, frozen=True):
@@ -1192,6 +1215,16 @@ def decode_GenerateMetaInfo(value: Any) -> GenerateMetaInfo:
             kw["hidden_states"] = [] if x is None else [decode_HiddenStateRow(e) for e in _expect_seq(x, expected="a sequence")]
         elif key == "e2e_latency":
             kw["e2e_latency"] = None if x is None else _expect_float(x, expected="f64")
+        elif key == "cached_tokens":
+            kw["cached_tokens"] = None if x is None else _expect_uint(x, expected="u64")
+        elif key == "cached_tokens_details":
+            kw["cached_tokens_details"] = None if x is None else decode_CachedTokensDetails(x)
+        elif key == "reasoning_tokens":
+            kw["reasoning_tokens"] = None if x is None else _expect_uint(x, expected="u64")
+        elif key == "num_retractions":
+            kw["num_retractions"] = None if x is None else _expect_uint(x, expected="u64")
+        elif key == "dp_rank":
+            kw["dp_rank"] = None if x is None else _expect_uint(x, expected="u32")
     return GenerateMetaInfo(**kw)
 
 
@@ -1217,6 +1250,40 @@ def encode_GenerateMetaInfo(v: GenerateMetaInfo) -> Dict[str, Any]:
         d["hidden_states"] = [encode_HiddenStateRow(e) for e in v.hidden_states]
     if v.e2e_latency is not None:
         d["e2e_latency"] = float(v.e2e_latency)
+    if v.cached_tokens is not None:
+        d["cached_tokens"] = v.cached_tokens
+    d["cached_tokens_details"] = None if v.cached_tokens_details is None else encode_CachedTokensDetails(v.cached_tokens_details)
+    if v.reasoning_tokens is not None:
+        d["reasoning_tokens"] = v.reasoning_tokens
+    if v.num_retractions is not None:
+        d["num_retractions"] = v.num_retractions
+    d["dp_rank"] = v.dp_rank
+    return d
+
+
+def decode_CachedTokensDetails(value: Any) -> CachedTokensDetails:
+    m = _expect_map(value, expected="struct CachedTokensDetails")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "device":
+            kw["device"] = _expect_uint(x, expected="u64")
+        elif key == "host":
+            kw["host"] = _expect_uint(x, expected="u64")
+        elif key == "storage":
+            kw["storage"] = None if x is None else _expect_uint(x, expected="u64")
+        elif key == "storage_backend":
+            kw["storage_backend"] = None if x is None else _expect_str(x, expected="a string")
+    return CachedTokensDetails(**kw)
+
+
+def encode_CachedTokensDetails(v: CachedTokensDetails) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["device"] = v.device
+    d["host"] = v.host
+    if v.storage is not None:
+        d["storage"] = v.storage
+    if v.storage_backend is not None:
+        d["storage_backend"] = v.storage_backend
     return d
 
 

@@ -9,7 +9,7 @@ use sglang_api_types::api::v1 as api;
 
 use super::CoreError;
 use crate::message::finish_reason::{FinishKind, FinishReason, Matched};
-use crate::message::response::{ChunkEvent, ChunkExtras};
+use crate::message::response::{ChunkEvent, ChunkExtras, SchedulerMetadata};
 use crate::message::types::TokenIds;
 
 /// Canonical transport-neutral output payload for generation events.
@@ -26,6 +26,7 @@ pub(crate) struct CoreOutput {
     pub(crate) prompt_tokens: u32,
     pub(crate) text: String,
     pub(crate) completion_tokens: u64,
+    pub(crate) metadata: Option<SchedulerMetadata>,
     pub(crate) extras: Option<Box<ChunkExtras>>,
 }
 
@@ -38,6 +39,7 @@ impl From<ChunkEvent> for CoreOutput {
             prompt_tokens,
             text,
             completion_tokens,
+            metadata,
             extras,
         } = output;
         Self {
@@ -46,6 +48,7 @@ impl From<ChunkEvent> for CoreOutput {
             prompt_tokens,
             text,
             completion_tokens,
+            metadata,
             extras,
         }
     }
@@ -63,6 +66,7 @@ impl CoreOutput {
         self.token_ids.extend_from_slice(&delta.token_ids);
         self.completion_tokens += delta.completion_tokens;
         self.prompt_tokens = delta.prompt_tokens;
+        self.metadata.clone_from(&delta.metadata);
         if delta.finish_reason.is_some() {
             self.finish_reason = delta.finish_reason.clone();
         }
@@ -198,6 +202,13 @@ impl CoreOutput {
             e2e_latency,
             ..Default::default()
         };
+        if let Some(metadata) = &self.metadata {
+            meta.cached_tokens = Some(metadata.cached_tokens);
+            meta.cached_tokens_details = metadata.cached_tokens_details.as_deref().cloned();
+            meta.reasoning_tokens = Some(metadata.reasoning_tokens);
+            meta.num_retractions = Some(metadata.num_retractions);
+            meta.dp_rank = metadata.dp_rank;
+        }
         let Some(extras) = self.extras.as_deref() else {
             return meta;
         };
@@ -377,6 +388,52 @@ mod tests {
 
     fn json<T: serde::Serialize>(value: &T) -> serde_json::Value {
         serde_json::to_value(value).unwrap()
+    }
+
+    #[test]
+    fn scheduler_statistics_replace_snapshots_and_preserve_zero_and_null() {
+        let populated = SchedulerMetadata {
+            cached_tokens: 128,
+            cached_tokens_details: Some(Box::new(api::CachedTokensDetails {
+                device: 128,
+                host: 0,
+                ..Default::default()
+            })),
+            reasoning_tokens: 4,
+            num_retractions: 2,
+            dp_rank: Some(1),
+        };
+        let mut accumulated = CoreOutput::default();
+        for _ in 0..2 {
+            accumulated.append_delta(&CoreOutput {
+                metadata: Some(populated.clone()),
+                completion_tokens: 1,
+                ..Default::default()
+            });
+            assert_eq!(accumulated.metadata, Some(populated.clone()));
+        }
+        let meta = json(&accumulated.meta_info("r", None));
+        assert_eq!(meta["cached_tokens"], 128);
+        assert_eq!(
+            meta["cached_tokens_details"],
+            serde_json::json!({"device":128,"host":0})
+        );
+        assert_eq!(meta["reasoning_tokens"], 4);
+        assert_eq!(meta["num_retractions"], 2);
+        assert_eq!(meta["dp_rank"], 1);
+        assert_eq!(accumulated.completion_tokens, 2);
+        accumulated.append_delta(&CoreOutput {
+            metadata: Some(SchedulerMetadata::default()),
+            ..Default::default()
+        });
+        let meta = json(&accumulated.meta_info("r", None));
+        assert_eq!(meta["cached_tokens"], 0);
+        assert_eq!(meta["reasoning_tokens"], 0);
+        assert_eq!(meta["num_retractions"], 0);
+        assert!(meta.get("cached_tokens_details").unwrap().is_null());
+        assert!(meta.get("dp_rank").unwrap().is_null());
+        let legacy = json(&CoreOutput::default().meta_info("r", None));
+        assert!(legacy.get("cached_tokens").is_none());
     }
 
     /// Python parity pinned on the typed shape: a NaN logprob is a null slot,

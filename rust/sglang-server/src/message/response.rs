@@ -4,6 +4,7 @@
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
+use sglang_api_types::api::v1::CachedTokensDetails;
 use tokio::sync::mpsc;
 
 use super::finish_reason::FinishReason;
@@ -134,9 +135,9 @@ pub fn frame_decode_batch_cols(header: &[u8], data_cols: &[&[u8]]) -> Bytes {
 }
 
 /// Columnar scalar header for a whole decode batch. The first four fields are
-/// required; every field after `tok_lens` defaults empty, so the hot path emits
-/// a four-element header. Field order is the wire ABI and must match
-/// `RustTokenizerManager.push_generation`'s `header_cols` in
+/// required; optional shape columns default empty and the trailing metadata
+/// block defaults absent for legacy producers. Field order must match
+/// `RustServer.push_generation`'s `header_cols` in
 /// `python/sglang/srt/rust_server/server.py`.
 ///
 /// Field names follow `direction_family_shape`:
@@ -179,6 +180,29 @@ pub struct BatchHeader {
     pub hidden_reqlens: Vec<u32>,
     #[serde(default)]
     pub hidden_poslens: Vec<u32>,
+    #[serde(default)]
+    pub metadata: Option<SchedulerMetadataColumns>,
+}
+
+/// One complete scheduler snapshot per request, columnar on the batch wire.
+/// A present block has all five columns; only their entries may be nullable.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct SchedulerMetadataColumns {
+    pub cached_tokens: Vec<u64>,
+    pub cached_tokens_details: Vec<Option<Box<CachedTokensDetails>>>,
+    pub reasoning_tokens: Vec<u64>,
+    pub retraction_counts: Vec<u64>,
+    pub dp_ranks: Vec<Option<u32>>,
+}
+
+/// Scheduler-owned counters, cache state, and worker rank. Snapshot, not delta.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SchedulerMetadata {
+    pub cached_tokens: u64,
+    pub cached_tokens_details: Option<Box<CachedTokensDetails>>,
+    pub reasoning_tokens: u64,
+    pub num_retractions: u64,
+    pub dp_rank: Option<u32>,
 }
 
 /// Read a request's flat logprob column (`l` val/idx pairs) from `data` at cursors
@@ -278,6 +302,19 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
     // and its unary drain pended forever. The producer already asserts this for the
     // extras columns; the four core ones were unchecked.
     if h.finish_reasons.len() != n || h.prompt_tokens.len() != n || h.tok_lens.len() != n {
+        reject!()
+    }
+    if let Some(metadata) = &h.metadata
+        && [
+            metadata.cached_tokens.len(),
+            metadata.cached_tokens_details.len(),
+            metadata.reasoning_tokens.len(),
+            metadata.retraction_counts.len(),
+            metadata.dp_ranks.len(),
+        ]
+        .into_iter()
+        .any(|len| len != n)
+    {
         reject!()
     }
     // The per-request extras columns are either absent (no request asked) or one
@@ -466,6 +503,13 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
             finish_reason: h.finish_reasons.get(i).cloned().flatten(),
             prompt_tokens: h.prompt_tokens.get(i).copied().unwrap_or(0),
             extras,
+            metadata: h.metadata.as_mut().map(|metadata| SchedulerMetadata {
+                cached_tokens: metadata.cached_tokens[i],
+                cached_tokens_details: metadata.cached_tokens_details[i].take(),
+                reasoning_tokens: metadata.reasoning_tokens[i],
+                num_retractions: metadata.retraction_counts[i],
+                dp_rank: metadata.dp_ranks[i],
+            }),
             // Listed explicitly, NOT `..Default::default()`: a new column added to
             // `ChunkEvent` and wired into the response must fail to compile here
             // until it is actually decoded. With the struct-update syntax it
@@ -573,6 +617,8 @@ pub struct ChunkEvent {
     /// `completion_tokens` is this chunk's count.
     pub text: String,
     pub completion_tokens: u64,
+    /// Latest scheduler snapshot; absent only on legacy/synthetic events.
+    pub metadata: Option<SchedulerMetadata>,
     /// Logprob + hidden-state columns — `None` unless the request asked for them.
     /// Boxed to keep the common token/text/finish frame small at large decode
     /// batches (the decoder allocates it only when a column is non-empty).
@@ -639,6 +685,61 @@ impl ChunkExtras {
 mod tests {
     use super::*;
     use crate::message::finish_reason::{FinishKind, Matched};
+
+    /// A Python-shaped map inside a grouped column header must survive decode;
+    /// short/partial blocks must fail before any request is routed.
+    #[test]
+    fn scheduler_statistics_decode_and_validate_as_one_block() {
+        let header = serde_json::json!([
+            ["a", "b"], [null, null], [192, 192], [0, 0],
+            [], [], [], [], [], [], [], [], [], [], [], [],
+            [[0, 128], [null, {"device": 100, "host": 20, "storage": 8,
+                               "storage_backend": "test"}],
+             [0, 4], [0, 2], [null, 1]]
+        ]);
+        let decode = |header: &serde_json::Value| {
+            let encoded = rmp_serde::to_vec(header).unwrap();
+            let frame = frame_decode_batch_cols(&encoded, &[]);
+            let mut events = Vec::new();
+            let decoded = for_each_chunk(&frame[1..], |event| events.push(event));
+            (decoded, events)
+        };
+        let (decoded, events) = decode(&header);
+        assert!(decoded.ok);
+        assert_eq!(events[0].metadata, Some(SchedulerMetadata::default()));
+        assert_eq!(
+            events[1].metadata,
+            Some(SchedulerMetadata {
+                cached_tokens: 128,
+                cached_tokens_details: Some(Box::new(CachedTokensDetails {
+                    device: 100,
+                    host: 20,
+                    storage: Some(8),
+                    storage_backend: Some("test".into()),
+                })),
+                reasoning_tokens: 4,
+                num_retractions: 2,
+                dp_rank: Some(1),
+            })
+        );
+        for index in 0..5 {
+            let mut bad = header.clone();
+            bad[16][index].as_array_mut().unwrap().pop();
+            let (decoded, events) = decode(&bad);
+            assert!(!decoded.ok);
+            assert!(events.is_empty());
+            assert_eq!(decoded.rids, vec![Rid::from("a"), Rid::from("b")]);
+        }
+        let mut partial = header.clone();
+        partial[16].as_array_mut().unwrap().pop();
+        assert!(!decode(&partial).0.ok);
+        let mut idle = vec![serde_json::json!([]); 16];
+        idle.push(serde_json::json!([[], [], [], [], []]));
+        let idle = serde_json::Value::Array(idle);
+        let (decoded, events) = decode(&idle);
+        assert!(decoded.ok);
+        assert!(events.is_empty());
+    }
 
     #[test]
     fn batch_cols_match_single_joined_buffer() {
@@ -719,6 +820,7 @@ mod tests {
         // `has_extras` guard must skip the extras machinery entirely for every
         // request (this is the from-scheduler hot path — see `for_each_chunk`).
         assert!(events.iter().all(|e| e.extras.is_none()));
+        assert!(events.iter().all(|e| e.metadata.is_none()));
     }
 
     /// A header whose column lengths exceed the data buffer (a Python/Rust
@@ -1179,12 +1281,12 @@ mod tests {
     }
 
     /// The common frame must stay small: logprob/hidden columns are boxed behind
-    /// `ChunkExtras`.
+    /// `ChunkExtras`; cache breakdowns are boxed separately.
     #[test]
     fn chunk_event_frame_stays_small() {
         let sz = std::mem::size_of::<ChunkEvent>();
         assert!(
-            sz <= 144,
+            sz <= 192,
             "ChunkEvent grew to {sz} bytes; keep rare columns behind ChunkExtras"
         );
     }
