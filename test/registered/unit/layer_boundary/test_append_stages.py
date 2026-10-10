@@ -36,10 +36,8 @@ from sglang.srt.layers.layer_boundary.residual.add_norm import (
     NormQuantReadout,
 )
 from sglang.srt.layers.layer_boundary.residual.stream import DeclaredSum
-from sglang.srt.layers.rotary_embedding import factory as rope_factory
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
-from sglang.srt.utils import common
-from sglang.srt.utils.common import is_building_neighbour_layer, make_layers
+from sglang.srt.utils.common import make_layers
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.communicator_patch import patch_communicator
 from sglang.test.test_utils import CustomTestCase
@@ -47,11 +45,19 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
+def layer_stages(sparse=False):
+    """The stages one decoder layer declares: attention, then an FFN. A
+    pipeline rank reads them for a layer another rank holds."""
+    return (
+        declare_attn(),
+        declare_ffn(sparse=sparse, next_layer_sparse=sparse),
+    )
+
+
 def layer(sparse=False):
-    """One decoder layer's stages: attention, then an FFN."""
+    """One decoder layer, declaring layer_stages."""
     return append_stages(
-        (declare_attn(), fixture.Norm()),
-        (declare_ffn(sparse=sparse, next_layer_sparse=sparse), fixture.Norm()),
+        *((declaration, fixture.Norm()) for declaration in layer_stages(sparse))
     )
 
 
@@ -94,41 +100,39 @@ class TestAppendStages(CustomTestCase):
             layer()
 
     def test_the_previous_layer_gives_the_first_stage_its_producer(self):
-        built = []
+        read = []
 
         def previous_layer():
-            built.append(None)
-            layer(sparse=True)
+            read.append(None)
+            return layer_stages(sparse=True)
 
         with layer_stack(previous_layers=[previous_layer]):
             first, _ = layer()
-        self.assertEqual(len(built), 1)
+        self.assertEqual(len(read), 1)
         self.assertTrue(first.declaration.previous.sparse)
         self.assertFalse(first.plan.enters_stack)
 
     def test_the_next_layer_gives_the_last_stage_its_consumer(self):
-        with layer_stack(
-            next_layers=[lambda: append_stages((declare_ffn(), fixture.Norm()))]
-        ):
+        with layer_stack(next_layers=[lambda: (declare_ffn(),)]):
             (stage,) = append_stages((mixer(), fixture.Norm()))
         self.assertFalse(stage.plan.terminal)
         # It leaves its sum to the FFN that follows it, which completes it.
         for edge in stage.plan.edges.values():
             self.assertTrue(edge.outgoing.produced.always_partial)
 
-    def test_a_stack_without_stages_builds_no_neighbour(self):
+    def test_a_stack_without_stages_reads_no_neighbour(self):
         def unexpected():
-            self.fail("a neighbour was built for a stack without stages")
+            self.fail("a neighbour was read for a stack without stages")
 
         with layer_stack(previous_layers=[unexpected], next_layers=[unexpected]):
             pass
 
-    def test_neighbours_are_built_after_the_stacks_own_layers(self):
+    def test_neighbours_are_read_after_the_stacks_own_layers(self):
         order = []
 
         def neighbour():
             order.append("neighbour")
-            layer()
+            return layer_stages()
 
         with layer_stack(previous_layers=[neighbour], next_layers=[neighbour]):
             order.append("own")
@@ -136,10 +140,12 @@ class TestAppendStages(CustomTestCase):
         self.assertEqual(order, ["own", "neighbour", "neighbour"])
 
     def test_a_neighbour_without_stages_is_passed_over(self):
-        with layer_stack(previous_layers=[lambda: None, lambda: layer(sparse=True)]):
+        with layer_stack(
+            previous_layers=[lambda: (), lambda: layer_stages(sparse=True)]
+        ):
             first, _ = layer()
         self.assertTrue(first.declaration.previous.sparse)
-        with layer_stack(previous_layers=[lambda: None], next_layers=[lambda: None]):
+        with layer_stack(previous_layers=[lambda: ()], next_layers=[lambda: ()]):
             first, last = layer()
         # No earlier layer declares a stage: the stack starts here, and ends
         # here when no later one does.
@@ -148,10 +154,9 @@ class TestAppendStages(CustomTestCase):
 
     def test_a_neighbour_is_read_without_joining_the_stack(self):
         def previous_layer():
-            # A layer with a dense FFN, then one with a MoE: the producer is
-            # the nearest stage, and neither joins this stack.
-            layer(sparse=False)
-            layer(sparse=True)
+            # A dense FFN, then a MoE: the producer is the nearest stage, and
+            # neither joins this stack.
+            return (declare_ffn(sparse=False), declare_ffn(sparse=True))
 
         with layer_stack(previous_layers=[previous_layer]):
             stages = layer()
@@ -271,7 +276,7 @@ class TestOneStagePerAppend(CustomTestCase):
         # or the final read, takes it on the rows that attention ran on, so
         # the a2a MoE before it returns it on the attention's rows.
         def ffn_layer():
-            append_stages((declare_ffn(sparse=True), fixture.Norm()))
+            return (declare_ffn(sparse=True),)
 
         for next_layers in ((), (ffn_layer,)):
             with self.subTest(hands_off=bool(next_layers)):
@@ -296,41 +301,43 @@ class TestOneStagePerAppend(CustomTestCase):
                     )
 
 
+def stage_facts(idx):
+    """The shared declaration function of TestMakeLayers' layers: layer 1
+    has a MoE."""
+    return layer_stages(sparse=idx == 1)
+
+
 class TestMakeLayers(CustomTestCase):
     """make_layers builds its layers in one stack, and on a pipeline stage
-    reads the stages the other stages' layers declare next to it."""
+    reads the stages the other stages' layers declare next to it from the
+    model's shared declaration function."""
 
     def setUp(self):
         self.planning = fixture.planning(fixture.parallel_of(attn_dp=1, attn_tp=2))
         self.planning.__enter__()
         self.addCleanup(self.planning.__exit__, None, None, None)
-        # These layers are built again on the meta device, as a model's on the
-        # transitional list are, unless a test gives a declaration function.
-        allowed = patch.object(
-            common,
-            "_NEIGHBOUR_BUILD_MODULES",
-            common._NEIGHBOUR_BUILD_MODULES | {__name__},
-        )
-        allowed.start()
-        self.addCleanup(allowed.stop)
 
-    def build(self, pp_rank=None, pp_size=None, *, declares=True):
-        """Build the layers; layer 1 has a MoE. Returns each layer_fn call as
-        (index, prefix, device, built as a neighbour) and the stages of the
-        layers built here."""
-        calls, stages = [], {}
+    def build(self, pp_rank=None, pp_size=None, *, declares=True, facts=stage_facts):
+        """Build the layers. Returns the indices layer_fn built and the stages
+        of the layers built here."""
+        built, stages = [], {}
 
         def layer_fn(idx, prefix):
-            device = torch.empty(()).device.type
-            calls.append((idx, prefix, device, is_building_neighbour_layer()))
+            self.assertEqual(prefix, f"layers.{idx}")
+            built.append(idx)
             if declares:
-                stages.setdefault(idx, layer(sparse=idx == 1))
+                stages[idx] = layer(sparse=idx == 1)
             return nn.Identity()
 
         make_layers(
-            NUM_LAYERS, layer_fn, pp_rank=pp_rank, pp_size=pp_size, prefix="layers"
+            NUM_LAYERS,
+            layer_fn,
+            pp_rank=pp_rank,
+            pp_size=pp_size,
+            prefix="layers",
+            stage_facts=facts,
         )
-        return calls, stages
+        return built, stages
 
     def test_the_layers_form_one_stack(self):
         _, stages = self.build()
@@ -338,27 +345,11 @@ class TestMakeLayers(CustomTestCase):
         self.assertEqual([s.plan.terminal for s in stages], [False] * 7 + [True])
         self.assertEqual([s.plan.enters_stack for s in stages], [True] + [False] * 7)
 
-    def test_a_pipeline_stage_builds_its_neighbours_on_meta_after_its_layers(self):
-        calls, _ = self.build(pp_rank=0, pp_size=2)
-        self.assertEqual(
-            calls,
-            [
-                (0, "layers.0", "cpu", False),
-                (1, "layers.1", "cpu", False),
-                (2, "layers.2", "meta", True),
-            ],
-        )
-        calls, _ = self.build(pp_rank=1, pp_size=2)
-        self.assertEqual(
-            calls,
-            [
-                (2, "layers.2", "cpu", False),
-                (3, "layers.3", "cpu", False),
-                (1, "layers.1", "meta", True),
-            ],
-        )
+    def test_a_pipeline_stage_builds_only_its_own_layers(self):
+        self.assertEqual(self.build(pp_rank=0, pp_size=2)[0], [0, 1])
+        self.assertEqual(self.build(pp_rank=1, pp_size=2)[0], [2, 3])
 
-    def test_the_neighbours_connect_the_stack_across_pipeline_stages(self):
+    def test_the_declaration_function_connects_the_stack_across_stages(self):
         _, first = self.build(pp_rank=0, pp_size=2)
         self.assertTrue(first[0][0].plan.enters_stack)
         self.assertFalse(first[1][1].plan.terminal)
@@ -367,33 +358,6 @@ class TestMakeLayers(CustomTestCase):
         self.assertTrue(last[2][0].declaration.previous.sparse)
         self.assertFalse(last[2][0].plan.enters_stack)
         self.assertTrue(last[3][1].plan.terminal)
-
-    def test_a_shared_declaration_function_stands_in_for_the_neighbours(self):
-        built, stages = [], {}
-
-        def layer_fn(idx, prefix):
-            built.append(idx)
-            stages[idx] = layer(sparse=idx == 1)
-            return nn.Identity()
-
-        def stage_facts(idx):
-            # The stages layer() declares, without building the layer.
-            return (
-                declare_attn(),
-                declare_ffn(sparse=idx == 1, next_layer_sparse=idx == 1),
-            )
-
-        make_layers(
-            NUM_LAYERS,
-            layer_fn,
-            pp_rank=1,
-            pp_size=2,
-            prefix="layers",
-            stage_facts=stage_facts,
-        )
-        self.assertEqual(built, [2, 3])
-        # Layer 2's attention follows layer 1's MoE, on the other stage.
-        self.assertTrue(stages[2][0].declaration.previous.sparse)
 
     def test_a_layer_must_declare_what_its_declaration_function_says(self):
         def layer_fn(idx, prefix):
@@ -413,25 +377,13 @@ class TestMakeLayers(CustomTestCase):
                 stage_facts=lambda idx: (declare_attn(), declare_ffn()),
             )
 
-    def test_a_model_off_the_list_needs_a_declaration_function(self):
-        with patch.object(common, "_NEIGHBOUR_BUILD_MODULES", frozenset()):
-            with self.assertRaisesRegex(ValueError, "stage_facts"):
-                self.build(pp_rank=1, pp_size=2)
+    def test_layers_with_stages_need_a_declaration_function(self):
+        with self.assertRaisesRegex(ValueError, "stage_facts"):
+            self.build(pp_rank=1, pp_size=2, facts=None)
 
-    def test_layers_without_stages_build_no_neighbour(self):
-        calls, _ = self.build(pp_rank=1, pp_size=2, declares=False)
-        self.assertEqual([call[0] for call in calls], [2, 3])
-
-    def test_a_neighbour_s_rope_modules_leave_the_cache(self):
-        def layer_fn(idx, prefix):
-            rope_factory._ROPE_DICT[("test", idx)] = None
-            layer()
-            return nn.Identity()
-
-        with patch.dict(rope_factory._ROPE_DICT):
-            make_layers(NUM_LAYERS, layer_fn, pp_rank=0, pp_size=2)
-            added = {key for key in rope_factory._ROPE_DICT if key[0] == "test"}
-        self.assertEqual(added, {("test", 0), ("test", 1)})
+    def test_layers_without_stages_need_no_declaration_function(self):
+        built, _ = self.build(pp_rank=1, pp_size=2, declares=False, facts=None)
+        self.assertEqual(built, [2, 3])
 
 
 class TestPipelineHandoff(CustomTestCase):
@@ -453,7 +405,7 @@ class TestPipelineHandoff(CustomTestCase):
         return stage.plan.paths[BatchVariant.ORDINARY]
 
     def test_the_sending_rank_returns_to_the_attention_rows(self):
-        with layer_stack(next_layers=[partial(layer, sparse=True)]):
+        with layer_stack(next_layers=[partial(layer_stages, sparse=True)]):
             first_attn, first_ffn, second_attn, second_ffn = [
                 s for _ in range(2) for s in layer(sparse=True)
             ]
@@ -470,7 +422,7 @@ class TestPipelineHandoff(CustomTestCase):
     def test_the_handoff_writes_what_the_move_leaves(self):
         # A move that leaves the residual, as for an FFN on an unpadded batch's
         # rows: the exit still writes the output into it.
-        with layer_stack(next_layers=[partial(layer, sparse=True)]):
+        with layer_stack(next_layers=[partial(layer_stages, sparse=True)]):
             ffn = [s for s in layer(sparse=True)][-1]
         steps = msgspec.structs.replace(self.path(ffn), output_move=keep_output)
         hidden, residual = torch.ones(4, 4), torch.full((4, 4), 2.0)
@@ -488,7 +440,7 @@ class TestPipelineHandoff(CustomTestCase):
         torch.testing.assert_close(written, want)
 
     def test_the_receiving_rank_reads_the_attention_rows(self):
-        with layer_stack(previous_layers=[partial(layer, sparse=True)]):
+        with layer_stack(previous_layers=[partial(layer_stages, sparse=True)]):
             attention, _ = layer(sparse=True)
         self.assertIsNone(self.path(attention).entry.input_move)
         self.assertIs(attention.declaration.previous.exit_rows, ExitRows.ATTENTION)
@@ -496,7 +448,7 @@ class TestPipelineHandoff(CustomTestCase):
     def test_the_receiving_rank_reads_the_stream_as_written(self):
         # A residual beside it, as a captured graph's input buffer holds, is
         # not read.
-        with layer_stack(previous_layers=[partial(layer, sparse=True)]):
+        with layer_stack(previous_layers=[partial(layer_stages, sparse=True)]):
             attention, _ = layer(sparse=True)
         attention.plan.path_for = lambda _: self.path(attention)
         hidden, stale = torch.ones(4, 4), torch.full((4, 4), 2.0)
@@ -513,7 +465,7 @@ class TestPipelineHandoff(CustomTestCase):
     def test_a_handoff_from_the_attention_rows_carries_its_residual(self):
         # A dense FFN over the TP group computes on the attention's rows and
         # leaves the residual add to the receiver, which requires it.
-        with layer_stack(previous_layers=[partial(layer, sparse=False)]):
+        with layer_stack(previous_layers=[partial(layer_stages, sparse=False)]):
             attention, _ = layer(sparse=False)
         self.assertFalse(attention.declaration.previous.writes_at_handoff)
         attention.plan.path_for = lambda _: self.path(attention)
@@ -537,7 +489,7 @@ class TestInputScatteredHandoff(CustomTestCase):
             attn_dp=1, attn_tp=4, enable_attn_tp_input_scattered=True
         )
         with fixture.planning(parallel):
-            with layer_stack(next_layers=[layer]):
+            with layer_stack(next_layers=[layer_stages]):
                 stages = [s for _ in range(2) for s in layer(sparse=True)]
         for stage in stages:
             for variant, edges in stage.plan.edges.items():
@@ -565,8 +517,7 @@ def bind_cut(kinds, *, before=(), after=()):
     the pipeline ranks next to it."""
 
     def held_by_another_rank(kinds):
-        stages = [(CUT_STAGES[kind](), fixture.Norm()) for kind in kinds]
-        return [lambda: append_stages(*stages)] if kinds else []
+        return [lambda: tuple(CUT_STAGES[kind]() for kind in kinds)] if kinds else []
 
     with (
         BINDING,

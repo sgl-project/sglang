@@ -81,6 +81,18 @@ class TransformFacts(msgspec.Struct, frozen=True):
         return cls(before_reduce_scatter=transform.before_reduce_scatter)
 
 
+def residual_facts(ops):
+    """A layer's reads and updates (a LayerResidualOps) reduced to the
+    capabilities they declare, in the same shape: what its stages declare
+    without the modules and state the reads and updates hold."""
+    return type(ops)(
+        attn_readout=ReadFacts.of(ops.attn_readout),
+        attn_update=UpdateFacts.of(ops.attn_update),
+        ffn_readout=ReadFacts.of(ops.ffn_readout),
+        ffn_update=UpdateFacts.of(ops.ffn_update),
+    )
+
+
 def facts_of(declaration):
     """``declaration`` with its read, update and output transform reduced to
     the capabilities they declare, and without the declarations it was

@@ -28,7 +28,6 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
-from sglang.srt.distributed.utils import get_group_rank_size
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers import zero_copy_context
@@ -52,6 +51,7 @@ from sglang.srt.layers.layer_boundary import (
     declare_attn,
     declare_ffn,
 )
+from sglang.srt.layers.layer_boundary.residual import LayerResidualOps
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layer_boundary.residual.add_norm import (
     REPLACE_AT_EXIT,
@@ -72,6 +72,7 @@ from sglang.srt.layers.linear import (
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
+    resolve_linear_parallel_group,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import route_quant_handoff
@@ -273,6 +274,20 @@ def _merge_weights_as_views(
     return merged, sizes
 
 
+def _dense_mlp_parallel_group() -> str:
+    """The group the dense layers' MLP shards over: a K3 MLP's group when it
+    is not given one. The Ascend path shards the dense MLP inside each
+    attention-TP replica.  The GPU K3 refactor instead gathers all DP rows
+    and shards this one dense layer over the full TP group.  Keep the GPU
+    default, but allow the NPU launcher to retain the proven attention-TP
+    layout without a device-type branch in shared model code."""
+    return (
+        "attn_tp"
+        if get_parallel().enable_dense_mlp_attn_tp and is_dp_attention_enabled()
+        else "tp"
+    )
+
+
 class KimiK3MLP(nn.Module):
     """K3 MLP; SiLU or SiTU activation."""
 
@@ -288,18 +303,10 @@ class KimiK3MLP(nn.Module):
         parallel_group: Optional[LinearParallelGroup] = None,
     ) -> None:
         super().__init__()
-        # The Ascend path shards the dense MLP inside each attention-TP
-        # replica.  The GPU K3 refactor instead gathers all DP rows and shards
-        # this one dense layer over the full TP group.  Keep the GPU default,
-        # but allow the NPU launcher to retain the proven attention-TP layout
-        # without a device-type branch in shared model code.
-        self._dense_attn_tp = (
-            get_parallel().enable_dense_mlp_attn_tp
-            and is_dp_attention_enabled()
-            and parallel_group is None
-        )
-        if parallel_group is None:
-            parallel_group = "attn_tp" if self._dense_attn_tp else "tp"
+        default_group = parallel_group is None
+        if default_group:
+            parallel_group = _dense_mlp_parallel_group()
+        self._dense_attn_tp = default_group and parallel_group == "attn_tp"
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
@@ -417,6 +424,27 @@ def _k3_symm_o_proj_out(o_proj: RowParallelLinear, x: torch.Tensor) -> torch.Ten
     )
 
 
+def _uses_latent_moe(config: KimiLinearConfig) -> bool:
+    """Whether the MoE layers' routed experts run in a latent space narrower
+    than the hidden size (Latent MoE)."""
+    return config.routed_expert_hidden_size is not None
+
+
+def _uses_ep_a2a() -> bool:
+    """Whether the MoE all-to-all backend is an EP a2a one, which moves each
+    row to its experts directly: the MoE region then consumes whatever rows
+    this rank holds (SP-MoE shard or DP-local batch), with no DP gather and
+    no TP reduce anywhere in it."""
+    _a2a_backend = get_moe_a2a_backend()
+    return (
+        _a2a_backend.is_megamoe()
+        or _a2a_backend.is_deepep()
+        or _a2a_backend.is_mooncake()
+        or _a2a_backend.is_ascend_fuseep()
+        or _a2a_backend.is_mori()
+    )
+
+
 class KimiK3MoE(nn.Module):
     """K3 MoE with Latent MoE (experts run in moe_hidden_size space)."""
 
@@ -438,7 +466,7 @@ class KimiK3MoE(nn.Module):
         self.layer_idx = layer_idx
         self.alt_stream = alt_stream
 
-        self.use_latent_moe = config.routed_expert_hidden_size is not None
+        self.use_latent_moe = _uses_latent_moe(config)
         # Merged front weight ([H, gate_up + E + latent]), built after weight
         # loading by _merge_front_weights().
         self._front_w: Optional[torch.Tensor] = None
@@ -541,18 +569,7 @@ class KimiK3MoE(nn.Module):
                 "got a checkpoint with different constants"
             )
 
-        # EP a2a backends move each row to its experts directly, so the MoE
-        # region consumes whatever rows this rank holds (SP-MoE shard or
-        # DP-local batch). No DP gather and no TP reduce anywhere in the
-        # region.
-        _a2a_backend = get_moe_a2a_backend()
-        self._ep_a2a = (
-            _a2a_backend.is_megamoe()
-            or _a2a_backend.is_deepep()
-            or _a2a_backend.is_mooncake()
-            or _a2a_backend.is_ascend_fuseep()
-            or _a2a_backend.is_mori()
-        )
+        self._ep_a2a = _uses_ep_a2a()
 
         # Defer the trtllm-gen finalize (top-k weighted unpermute) into the
         # push all-reduce's staging pass (k3_ar_fusion.finalize_all_reduce_push_norm)
@@ -2358,14 +2375,7 @@ def _is_moe_layer(config: KimiLinearConfig, layer_idx: int) -> bool:
 def _shards_moe_rows() -> bool:
     """Whether an MoE layer runs on its attention-TP token shard (SP-MoE): an
     EP a2a backend with attention TP."""
-    backend = get_moe_a2a_backend()
-    return (
-        backend.is_megamoe()
-        or backend.is_deepep()
-        or backend.is_mooncake()
-        or backend.is_ascend_fuseep()
-        or backend.is_mori()
-    ) and get_parallel().attn_tp_group.world_size > 1
+    return _uses_ep_a2a() and get_parallel().attn_tp_group.world_size > 1
 
 
 def _fuses_attn_all_reduce(config: KimiLinearConfig) -> bool:
@@ -2380,7 +2390,7 @@ def _fuses_attn_all_reduce(config: KimiLinearConfig) -> bool:
     )
 
 
-def _carries_bank_slices(config: KimiLinearConfig) -> bool:
+def _carries_bank_slices(config: KimiLinearConfig, sp_collective: bool) -> bool:
     """Whether consecutive SP-MoE layers keep the stream and the
     attention-residual bank on each rank's attention-TP shard of the rows
     (SGLANG_K3_SP_ATTN_RES): each layer reads its attention input there, then
@@ -2388,11 +2398,12 @@ def _carries_bank_slices(config: KimiLinearConfig) -> bool:
     neither a later pipeline rank nor a draft model's capture of the target's
     hidden states can take them; it is decided at construction. Nor can a
     dense layer after an SP-MoE one, whose FFN reads every row of the bank:
-    every layer from the first MoE layer on must be one."""
+    every layer from the first MoE layer on must be one. ``sp_collective``:
+    whether K3's SP collective is enabled on this rank."""
     if not (
         _shards_moe_rows()
         and config.attn_res_block_size is not None
-        and k3_sp_collective.enabled()
+        and sp_collective
         and envs.SGLANG_K3_SP_ATTN_RES.get()
         and get_parallel().pp_size == 1
     ):
@@ -2402,6 +2413,84 @@ def _carries_bank_slices(config: KimiLinearConfig) -> bool:
         return False
     spec = SpeculativeAlgorithm.from_string(get_spec().speculative_algorithm)
     return not (spec.is_eagle3() or spec.is_dflash_family())
+
+
+def _latent_moe_writes_stream(config: KimiLinearConfig, layer_idx: int) -> bool:
+    """Whether a layer's FFN writes the next stream itself: a latent MoE on
+    this rank's rows adds the residual in its tail add and writes the next
+    stream itself; one gathered over attention DP returns its output to this
+    rank's tokens first."""
+    return (
+        config.attn_res_block_size is not None
+        and _is_moe_layer(config, layer_idx)
+        and _uses_latent_moe(config)
+        and not (is_dp_attention_enabled() and not _uses_ep_a2a())
+    )
+
+
+def _stage_facts(
+    config: KimiLinearConfig,
+    layer_idx: int,
+    *,
+    sp_collective: bool,
+    bank: Optional[LayerResidualOps] = None,
+):
+    """The attention and FFN stages the K3 layer at ``layer_idx`` declares:
+    the model's shared declaration function (see make_layers), which the
+    layer declares itself with. ``sp_collective`` is whether K3's SP
+    collective is enabled on this rank, which the model settles before it
+    builds a layer. ``bank`` is the layer's own reads and updates of the
+    attention-residual bank; without it, the stages declare what those do."""
+    is_moe = _is_moe_layer(config, layer_idx)
+    # Under attention DP the FFN input is read on this rank's rows
+    # once the attention's sum is complete, then gathered.
+    attn_ops = {}
+    ffn_ops = dict(read=NormReadout(reads_before_dp_gather=True))
+    if config.attn_res_block_size is not None:
+        if bank is None:
+            bank = AttnBankState.facts(
+                reads_slices=_carries_bank_slices(config, sp_collective)
+            )
+        attn_ops = dict(
+            read=bank.attn_readout,
+            update=bank.attn_update,
+            # The rows an SP-MoE layer left on each rank's shard are
+            # gathered in K3's tuned all-gather when it takes the batch:
+            # before this read, or after it while the bank stays on the
+            # shard.
+            attn_tp_gather=(
+                k3_sp_collective.all_gather
+                if sp_collective
+                and _shards_moe_rows()
+                and _is_moe_layer(config, layer_idx - 1)
+                else None
+            ),
+        )
+        ffn_ops = dict(
+            read=bank.ffn_readout,
+            update=(
+                REPLACE_AT_EXIT
+                if _latent_moe_writes_stream(config, layer_idx)
+                else bank.ffn_update
+            ),
+        )
+    return (
+        declare_attn(**attn_ops),
+        declare_ffn(
+            **ffn_ops,
+            sparse=is_moe,
+            next_layer_sparse=_is_moe_layer(config, layer_idx + 1),
+            # The TP width the dense MLP is built with.
+            dense_tp_size=(
+                None
+                if is_moe
+                else resolve_linear_parallel_group(_dense_mlp_parallel_group())[1]
+            ),
+            # A latent MoE completes its output sum together with
+            # the latent reduction its norm needs.
+            output_complete=is_moe and _uses_latent_moe(config),
+        ),
+    )
 
 
 class KimiK3DecoderLayer(nn.Module):
@@ -2419,7 +2508,6 @@ class KimiK3DecoderLayer(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.layer_idx = layer_idx
-        self._dp_attention = is_dp_attention_enabled()
         self._is_moe_layer = _is_moe_layer(config, layer_idx)
         # SP-MoE: with an EP a2a backend and attention TP, a MoE layer runs on
         # this rank's attention-TP shard of the rows.
@@ -2506,31 +2594,17 @@ class KimiK3DecoderLayer(nn.Module):
                 prefix=f"{prefix}.mlp_res_proj",
             )
 
-        # A latent MoE on this rank's rows adds the residual in its tail add and
-        # writes the next stream itself; one gathered over attention DP returns
-        # its output to this rank's tokens first.
-        self._ffn_writes_stream = (
-            self.use_attn_residuals
-            and self._is_moe_layer
-            and self.mlp.use_latent_moe
-            and not (self._dp_attention and not self.mlp._ep_a2a)
-        )
+        self._ffn_writes_stream = _latent_moe_writes_stream(config, layer_idx)
         self._declare_stages(config, layer_idx, attn_bank)
 
     def _declare_stages(self, config, layer_idx, attn_bank):
-        """Declare this layer's attention and FFN stages: the reads and updates
-        around them, the rows the FFN takes, and the kernels K3 supplies for
-        the bank path."""
-        # Under attention DP the FFN input is read on this rank's rows
-        # once the attention's sum is complete, then gathered.
-        attn_ops = {}
-        ffn_ops = dict(read=NormReadout(reads_before_dp_gather=True))
-        carries = _carries_bank_slices(config)
-        tuned_gather = (
-            k3_sp_collective.all_gather if k3_sp_collective.enabled() else None
-        )
+        """Declare this layer's attention and FFN stages as _stage_facts gives
+        them, with this layer's reads and updates of the bank and the kernels
+        K3 supplies for the bank path."""
+        sp_collective = k3_sp_collective.enabled()
+        bank = None
         if self.use_attn_residuals:
-            bank_ops = AttnBankState(
+            bank = AttnBankState(
                 attn_bank,
                 self.self_attention_res_proj,
                 self.self_attention_res_norm,
@@ -2539,48 +2613,16 @@ class KimiK3DecoderLayer(nn.Module):
                 writes_block=self.is_block_write_layer,
                 ffn_input_fusions=self._ffn_input_fusions(),
                 fuses_slice_collectives=self._sp_moe
-                and k3_sp_collective.enabled()
+                and sp_collective
                 and envs.SGLANG_K3_SP_ATTN_RES.get(),
-                reads_slices=carries,
+                reads_slices=_carries_bank_slices(config, sp_collective),
             ).residual_ops()
-            attn_ops = dict(
-                read=bank_ops.attn_readout,
-                update=bank_ops.attn_update,
-                # The rows an SP-MoE layer left on each rank's shard are
-                # gathered in K3's tuned all-gather when it takes the batch:
-                # before this read, or after it while the bank stays on the
-                # shard.
-                attn_tp_gather=(
-                    tuned_gather
-                    if _shards_moe_rows() and _is_moe_layer(config, layer_idx - 1)
-                    else None
-                ),
-            )
-            ffn_ops = dict(
-                read=bank_ops.ffn_readout,
-                update=(
-                    REPLACE_AT_EXIT if self._ffn_writes_stream else bank_ops.ffn_update
-                ),
-            )
+        attn, ffn = _stage_facts(
+            config, layer_idx, sp_collective=sp_collective, bank=bank
+        )
         self.attn_boundary, self.ffn_boundary = append_stages(
-            (declare_attn(**attn_ops), self.input_layernorm),
-            (
-                declare_ffn(
-                    **ffn_ops,
-                    sparse=self._is_moe_layer,
-                    next_layer_sparse=_is_moe_layer(config, layer_idx + 1),
-                    # The TP width the dense MLP is built with.
-                    dense_tp_size=(
-                        None
-                        if self._is_moe_layer
-                        else get_group_rank_size(self.mlp.down_proj.tp_group)[1]
-                    ),
-                    # A latent MoE completes its output sum together with
-                    # the latent reduction its norm needs.
-                    output_complete=self._is_moe_layer and self.mlp.use_latent_moe,
-                ),
-                self.post_attention_layernorm,
-            ),
+            (attn, self.input_layernorm),
+            (ffn, self.post_attention_layernorm),
         )
 
     def _ffn_input_fusions(self):
@@ -2673,7 +2715,10 @@ class KimiK3LinearModel(nn.Module):
         self.pp_group = get_parallel().pp_group
         self.dspark_layers_to_capture: Optional[list[int]] = None
         self._dp_attention = is_dp_attention_enabled()
-        self.carries_bank_slices = _carries_bank_slices(config)
+        # Whether K3's SP collective is enabled on this rank, which the layers'
+        # stage declarations depend on: settled once, before any is built.
+        sp_collective = k3_sp_collective.enabled()
+        self.carries_bank_slices = _carries_bank_slices(config, sp_collective)
 
         if self.pp_group.is_first_rank:
             embedding_quant_config = (
@@ -2731,7 +2776,7 @@ class KimiK3LinearModel(nn.Module):
                     # takes the batch.
                     attn_tp_gather=(
                         k3_sp_collective.all_gather
-                        if k3_sp_collective.enabled()
+                        if sp_collective
                         and _shards_moe_rows()
                         and _is_moe_layer(config, config.num_hidden_layers - 1)
                         else None
@@ -2753,6 +2798,9 @@ class KimiK3LinearModel(nn.Module):
             ),
             prefix=f"{prefix}.layers",
             final_read=self._final_read if self.pp_group.is_last_rank else None,
+            stage_facts=lambda idx: _stage_facts(
+                config, idx, sp_collective=sp_collective
+            ),
         )
 
     def forward(

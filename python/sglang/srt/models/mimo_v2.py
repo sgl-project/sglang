@@ -16,6 +16,7 @@ import logging
 import math
 import re
 from array import array
+from functools import partial
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -822,8 +823,7 @@ class MiMoV2DecoderLayer(nn.Module):
                 prefix=add_prefix("self_attn", prefix),
             )
 
-        self.is_layer_sparse = self.is_moe_layer(layer_id)
-        is_next_layer_sparse = self.is_moe_layer(layer_id + 1)
+        self.is_layer_sparse = self.is_moe_layer(config, layer_id)
 
         if self.is_layer_sparse:
             self.mlp = MiMoV2MoE(
@@ -849,14 +849,22 @@ class MiMoV2DecoderLayer(nn.Module):
             config.hidden_size, eps=config.layernorm_epsilon
         )
 
+        attn, ffn = self.stage_facts(config, layer_id)
         self.attn_boundary, self.ffn_boundary = append_stages(
-            (declare_attn(), self.input_layernorm),
-            (
-                declare_ffn(
-                    sparse=self.is_layer_sparse,
-                    next_layer_sparse=is_next_layer_sparse,
-                ),
-                self.post_attention_layernorm,
+            (attn, self.input_layernorm),
+            (ffn, self.post_attention_layernorm),
+        )
+
+    @classmethod
+    def stage_facts(cls, config, layer_id: int):
+        """The stages the layer at ``layer_id`` declares, in order: the model's
+        shared declaration function, which the layer declares with too (see
+        make_layers)."""
+        return (
+            declare_attn(),
+            declare_ffn(
+                sparse=cls.is_moe_layer(config, layer_id),
+                next_layer_sparse=cls.is_moe_layer(config, layer_id + 1),
             ),
         )
 
@@ -889,12 +897,13 @@ class MiMoV2DecoderLayer(nn.Module):
 
         return hidden_states
 
-    def is_moe_layer(self, layer_idx: int) -> bool:
+    @staticmethod
+    def is_moe_layer(config, layer_idx: int) -> bool:
         return (
-            hasattr(self.config, "moe_layer_freq")
-            and 0 <= layer_idx < len(self.config.moe_layer_freq)
-            and not isinstance(self.config.moe_layer_freq, int)
-            and self.config.moe_layer_freq[layer_idx]
+            hasattr(config, "moe_layer_freq")
+            and 0 <= layer_idx < len(config.moe_layer_freq)
+            and not isinstance(config.moe_layer_freq, int)
+            and config.moe_layer_freq[layer_idx]
         )
 
     def is_swa_layer(self) -> bool:
@@ -987,6 +996,7 @@ class MiMoV2Model(nn.Module):
                 prefix=prefix,
             ),
             prefix=add_prefix("layers", prefix),
+            stage_facts=partial(decoder_layer_type.stage_facts, config),
         )
         if self.pp_group.is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.layernorm_epsilon)

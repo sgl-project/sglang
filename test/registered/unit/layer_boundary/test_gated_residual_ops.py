@@ -180,9 +180,11 @@ class TestGatedResidualOps(CustomTestCase):
                     fixture.planning(fixture.parallel_of(attn_dp=1, attn_tp=4)),
                     layer_stack(),
                 ):
+                    # A MoE model type, whose layers run sparse FFNs.
                     _, ffn = _build_qwen4_exp_stages(
+                        SimpleNamespace(model_type="qwen4_exp_text"),
+                        0,
                         state.residual_ops(),
-                        sparse=True,
                     )
                 with patch(
                     "sglang.srt.layers.layer_boundary.exit.sum_output",

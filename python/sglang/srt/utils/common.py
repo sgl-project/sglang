@@ -1551,33 +1551,6 @@ def mark_end(name):
         time_infos[name].pretty_print()
 
 
-# Set while a layer another pipeline stage holds is built, only for the stage
-# boundaries it declares.
-_building_neighbour_layer = False
-
-
-def is_building_neighbour_layer() -> bool:
-    """Whether the layer under construction belongs to another pipeline stage
-    and is built here only to read the stage boundaries it declares. It is
-    built on the meta device and never loaded or run, so its constructor skips
-    the host and device resources a running layer needs: tables, streams,
-    engines and communicators."""
-    return _building_neighbour_layer
-
-
-@contextmanager
-def building_neighbour_layer():
-    """Build a pipeline neighbour layer: on the meta device, with
-    is_building_neighbour_layer() true."""
-    global _building_neighbour_layer
-    outer, _building_neighbour_layer = _building_neighbour_layer, True
-    try:
-        with torch.device("meta"):
-            yield
-    finally:
-        _building_neighbour_layer = outer
-
-
 class LayerFn(Protocol):
     def __call__(self, idx: int, prefix: str) -> torch.nn.Module: ...
 
@@ -1601,10 +1574,9 @@ def make_layers(
     ``stage_facts``: the model's shared declaration function, which returns
     the stages the layer at a global index declares without building it (an
     empty sequence when it declares none), and which the layer itself uses
-    for its own declarations. A model on the transitional list may omit it;
-    the stack then builds the layer again on the meta device to read them.
-    ``final_read`` is the stack's terminal read when it is not a plain final
-    norm (see layer_stack).
+    for its own declarations. A model whose layers declare stages must give
+    it to run under pipeline parallelism. ``final_read`` is the stack's
+    terminal read when it is not a plain final norm (see layer_stack).
     """
     # circular imports
     from sglang.srt.distributed import get_pp_indices
@@ -1628,10 +1600,8 @@ def make_layers(
 
     def neighbour(idx):
         if stage_facts is not None:
-            return functools.partial(_declared_stages, stage_facts, idx)
-        return functools.partial(
-            _build_neighbour_layer, layer_fn, idx, add_prefix(idx, prefix)
-        )
+            return functools.partial(stage_facts, idx)
+        return functools.partial(_no_stage_facts, layer_fn)
 
     def build(stack, idx):
         appended = len(stack.appends)
@@ -1690,84 +1660,15 @@ def make_pp_layers(
     )
 
 
-# The models whose layers a pipeline rank still builds on the meta device to
-# read the stages they declare, until each gives make_layers its shared
-# declaration function (stage_facts). Any other model must give one to run
-# under pipeline parallelism.
-_NEIGHBOUR_BUILD_MODULES = frozenset(
-    (
-        "sglang.srt.models.apertus",
-        "sglang.srt.models.arcee",
-        "sglang.srt.models.bailing_moe",
-        "sglang.srt.models.bailing_moe_linear",
-        "sglang.srt.models.bailing_moe_v3",
-        "sglang.srt.models.deepseek_v2",
-        "sglang.srt.models.dots3_common.modeling",
-        "sglang.srt.models.ernie45_moe_vl",
-        "sglang.srt.models.exaone4",
-        "sglang.srt.models.exaone_moe",
-        "sglang.srt.models.gemma4_causal",
-        "sglang.srt.models.gigachat35",
-        "sglang.srt.models.glm4",
-        "sglang.srt.models.glm4_moe",
-        "sglang.srt.models.glm4_moe_lite",
-        "sglang.srt.models.glm5_next",
-        "sglang.srt.models.gpt_oss",
-        "sglang.srt.models.granitemoehybrid",
-        "sglang.srt.models.kimi_k3",
-        "sglang.srt.models.kimi_linear",
-        "sglang.srt.models.laguna",
-        "sglang.srt.models.llada2",
-        "sglang.srt.models.llama",
-        "sglang.srt.models.mimo_v2",
-        "sglang.srt.models.minimax_m2",
-        "sglang.srt.models.minimax_m3",
-        "sglang.srt.models.ministral3",
-        "sglang.srt.models.mixtral",
-        "sglang.srt.models.nanbeige",
-        "sglang.srt.models.nemotron_nas",
-        "sglang.srt.models.qwen2",
-        "sglang.srt.models.qwen2_moe",
-        "sglang.srt.models.qwen3_5",
-        "sglang.srt.models.sarvam_moe",
-        "sglang.srt.models.sdar",
-        "sglang.srt.models.sdar_moe",
-        "sglang.srt.models.spark2_5",
-        "sglang.srt.models.step3p5",
-        "sglang.srt.models.xllm",
-        "sglang.srt.models.zaya",
-    )
-)
-
-
-def _declared_stages(stage_facts, idx: int):
-    """The stages the layer at ``idx`` declares, from the model's shared
-    declaration function, standing in for building it."""
-    from sglang.srt.layers.layer_boundary.factories import DeclaredStages
-
-    return DeclaredStages(tuple(stage_facts(idx)))
-
-
-def _build_neighbour_layer(layer_fn: LayerFn, idx: int, prefix: str) -> None:
-    """Build a layer another pipeline stage holds, only for the stage
-    boundaries it declares (see building_neighbour_layer). RoPE modules it
-    adds to the shared cache are meta, so they are dropped again."""
-    from sglang.srt.layers.rotary_embedding.factory import _ROPE_DICT
-
+def _no_stage_facts(layer_fn: LayerFn) -> None:
+    """Stands in for the shared declaration function of a model that gives
+    none: called only if this pipeline rank's layers declare stages."""
     module = getattr(getattr(layer_fn, "func", layer_fn), "__module__", None)
-    if module not in _NEIGHBOUR_BUILD_MODULES:
-        raise ValueError(
-            f"{module} declares stage boundaries under pipeline parallelism "
-            "without a shared declaration function: give make_layers its "
-            "stage_facts, the stages a layer declares without building it"
-        )
-    cached = set(_ROPE_DICT)
-    try:
-        with building_neighbour_layer():
-            layer_fn(idx=idx, prefix=prefix)
-    finally:
-        for key in set(_ROPE_DICT) - cached:
-            del _ROPE_DICT[key]
+    raise ValueError(
+        f"{module} declares stage boundaries under pipeline parallelism "
+        "without a shared declaration function: give make_layers its "
+        "stage_facts, the stages a layer declares without building it"
+    )
 
 
 def set_random_seed(seed: int) -> None:

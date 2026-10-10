@@ -7,7 +7,7 @@ import os
 import sys
 from dataclasses import dataclass, fields, is_dataclass, replace
 from types import MappingProxyType
-from typing import Callable, Mapping, NamedTuple, Optional, Tuple
+from typing import Callable, Mapping, NamedTuple, Optional
 
 from sglang.srt.environ import envs
 from sglang.srt.layers import layernorm_sp
@@ -302,11 +302,10 @@ class StageDeclaration:
             contiguous slice of the rows, it returns them all, in rank order,
             or None to leave the gather to the boundary. Called on every batch,
             so it must be CUDA-graph safe. Across a pipeline boundary the
-            producer's rank takes it from the neighbouring stage's declaration
-            (the model's shared declaration function, or, for a model on the
-            transitional list, the layer built again on the meta device), so it
-            may use only the communication state of the rank it runs on, not
-            the declaring layer's weights or buffers.
+            producer's rank takes it from the model's shared declaration
+            function, without the declaring layer, so it may use only the
+            communication state of the rank it runs on, not that layer's
+            weights or buffers.
         previous: The stage whose output this stage consumes, as the stack
             records it: only the facts binding reads of it (see facts_of),
             on this rank or another.
@@ -849,12 +848,13 @@ def layer_stack(*, previous_layers=(), next_layers=(), final_read=None):
     Args:
         previous_layers: For the layers before this stack that another
             pipeline rank holds, nearest first, callables that return the
-            stages the layer declares as DeclaredStages (from the model's
-            shared declaration function), or else build the layer so that it
-            appends them. Called only if this stack appended stages, after its
-            own layers are built, until one of them declares a stage: its last
-            stage is the producer of this stack's first. Only what binding
-            reads of that stage is kept (see facts_of).
+            stages the layer declares, in order, without building it (the
+            model's shared declaration function at that layer's index; an
+            empty sequence for a layer that declares none). Called only if
+            this stack appended stages, after its own layers are built, until
+            one of them declares a stage: its last stage is the producer of
+            this stack's first. Only what binding reads of that stage is kept
+            (see facts_of).
         next_layers: Likewise for the layers after this stack, whose first
             declared stage is the consumer of this stack's last.
         final_read: The model's final read of the stack's output (a
@@ -879,13 +879,6 @@ def layer_stack(*, previous_layers=(), next_layers=(), final_read=None):
             )
     finally:
         _stack = outer
-
-
-class DeclaredStages(NamedTuple):
-    """The stages a neighbouring layer declares, from the model's shared
-    declaration function, which stand in for building the layer."""
-
-    stages: Tuple[StageDeclaration, ...]
 
 
 def check_declared_stages(stack, appended: int, expected, where: str) -> None:
@@ -947,26 +940,9 @@ def _differing_fields(value, given, prefix=""):
 
 def _neighbour_stage(layers, *, last):
     """The stage a neighbouring layer declares next to this stack: the last
-    one of the nearest layer before it, or the first of the nearest after.
-    Branches are side paths, so they never stand next to the stack."""
-    global _stack
+    one of the nearest layer before it, or the first of the nearest after."""
     for layer in layers:
-        outer = _stack
-        _stack = _LayerStack()
-        try:
-            result = layer()
-            declared = (
-                result.stages
-                if isinstance(result, DeclaredStages)
-                else [
-                    declaration
-                    for append in _stack.appends
-                    if append.prepared_from is None
-                    for declaration in append.declarations
-                ]
-            )
-        finally:
-            _stack = outer
+        declared = tuple(layer())
         if declared:
             return facts_of(declared[-1] if last else declared[0])
     return None

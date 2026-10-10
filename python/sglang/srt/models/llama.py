@@ -364,15 +364,24 @@ class LlamaDecoderLayer(nn.Module):
             return
         self.input_layernorm.fuse_input_quant(self.self_attn.qkv_proj)
         self.post_attention_layernorm.fuse_input_quant(self.mlp.gate_up_proj)
+        attn, ffn = self.stage_facts(config, layer_id)
         self.attn_boundary, self.ffn_boundary = append_stages(
-            (declare_attn(read=self._attn_readout(layer_id)), self.input_layernorm),
-            (
-                declare_ffn(sparse=False, next_layer_sparse=False),
-                self.post_attention_layernorm,
-            ),
+            (attn, self.input_layernorm),
+            (ffn, self.post_attention_layernorm),
         )
 
-    def _attn_readout(self, layer_id: int):
+    @classmethod
+    def stage_facts(cls, config: LlamaConfig, layer_id: int):
+        """The stages a layer of this class declares, from the config alone:
+        the model's shared declaration function, which the layer declares
+        with too (see make_layers). A subclass's attention read takes part."""
+        return (
+            declare_attn(read=cls._attn_readout(layer_id)),
+            declare_ffn(sparse=False, next_layer_sparse=False),
+        )
+
+    @classmethod
+    def _attn_readout(cls, layer_id: int):
         return NORM_QUANT_READOUT
 
     def forward(
@@ -437,6 +446,7 @@ class LlamaModel(nn.Module):
                 prefix=prefix,
             ),
             prefix="model.layers",
+            stage_facts=lambda idx: LlamaDecoderLayer.stage_facts(config, idx),
         )
 
         if self.pp_group.is_last_rank:

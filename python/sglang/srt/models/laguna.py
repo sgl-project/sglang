@@ -418,12 +418,8 @@ class LagunaDecoderLayer(nn.Module):
             prefix=add_prefix("self_attn", prefix),
         )
 
-        mlp_types = config.mlp_layer_types
-        self.is_layer_sparse = mlp_types[layer_id] == "sparse"
-        is_next_layer_sparse = (
-            layer_id + 1 < config.num_hidden_layers
-            and mlp_types[layer_id + 1] == "sparse"
-        )
+        attn, ffn = self.stage_facts(config, layer_id)
+        self.is_layer_sparse = ffn.sparse
 
         if self.is_layer_sparse:
             self.mlp = LagunaMoE(
@@ -448,13 +444,25 @@ class LagunaDecoderLayer(nn.Module):
         )
 
         self.attn_boundary, self.ffn_boundary = append_stages(
-            (declare_attn(), self.input_layernorm),
-            (
-                declare_ffn(
-                    sparse=self.is_layer_sparse,
-                    next_layer_sparse=is_next_layer_sparse,
-                ),
-                self.post_attention_layernorm,
+            (attn, self.input_layernorm),
+            (ffn, self.post_attention_layernorm),
+        )
+
+    @staticmethod
+    def stage_facts(config: LagunaConfig, layer_id: int):
+        """The stages the layer at ``layer_id`` declares, from the config: the
+        model's shared declaration function (see make_layers)."""
+        mlp_types = config.mlp_layer_types
+        is_layer_sparse = mlp_types[layer_id] == "sparse"
+        is_next_layer_sparse = (
+            layer_id + 1 < config.num_hidden_layers
+            and mlp_types[layer_id + 1] == "sparse"
+        )
+        return (
+            declare_attn(),
+            declare_ffn(
+                sparse=is_layer_sparse,
+                next_layer_sparse=is_next_layer_sparse,
             ),
         )
 
@@ -519,6 +527,7 @@ class LagunaModel(nn.Module):
                 prefix=prefix,
             ),
             prefix=add_prefix("layers", prefix),
+            stage_facts=lambda idx: decoder_layer_type.stage_facts(config, idx),
         )
         if self.pp_group.is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
