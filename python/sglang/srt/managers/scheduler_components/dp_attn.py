@@ -32,7 +32,10 @@ from sglang.srt.model_executor.cuda_graph_config import (
     check_cuda_graph_backend,
     cuda_graph_fully_disabled,
 )
-from sglang.srt.model_executor.encoder_swa_replay import encoder_swa_fold_rows
+from sglang.srt.model_executor.encoder_swa_replay import (
+    decoder_swa_trim_rows,
+    encoder_swa_fold_rows,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.runner import PrefillCudaGraphRunner
 from sglang.srt.observability.metrics_collector import (
@@ -132,6 +135,8 @@ class MLPSyncBatchInfo:
     is_health_check: bool = False
     # Causal (query, key) pairs this rank attends this step.
     attention_pairs: int = 0
+    # Rows the decoder SWA tail drops before the late layers.
+    decoder_trim_rows: int = 0
 
     # some gathered elements
     tp0_info_cpu: torch.Tensor = None
@@ -140,6 +145,7 @@ class MLPSyncBatchInfo:
     global_num_tokens: list[int] = None
     global_num_tokens_for_logprob: list[int] = None
     global_attention_pairs: list[int] = None
+    global_decoder_trim_rows: list[int] = None
     tbo_split_seq_index: torch.Tensor = None
     global_forward_mode: int = None
     dp_cooperation_info: Optional[DPCooperationInfo] = None
@@ -158,6 +164,7 @@ class MLPSyncBatchInfo:
                 int(self.can_run_draft_cuda_graph),
                 int(self.is_health_check),
                 self.attention_pairs,
+                self.decoder_trim_rows,
             ],
             device=device,
             dtype=dtype,
@@ -177,6 +184,7 @@ class MLPSyncBatchInfo:
                 1,  # can_run_draft_cuda_graph
                 0,  # is_health_check
                 0,  # attention_pairs
+                0,  # decoder_trim_rows
             ],
             device=device,
             dtype=dtype,
@@ -188,6 +196,7 @@ class MLPSyncBatchInfo:
         self.global_num_tokens = [self.num_tokens]
         self.global_num_tokens_for_logprob = [self.num_tokens_for_logprob]
         self.global_attention_pairs = [self.attention_pairs]
+        self.global_decoder_trim_rows = [self.decoder_trim_rows]
         self.any_health_check = self.is_health_check
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(
@@ -265,6 +274,7 @@ class MLPSyncBatchInfo:
         self.can_run_draft_cuda_graph = bool(tp0_info_cpu[:, 8].min())
         self.any_health_check = bool(tp0_info_cpu[:, 9].max())
         self.global_attention_pairs = tp0_info_cpu[:, 10].tolist()
+        self.global_decoder_trim_rows = tp0_info_cpu[:, 11].tolist()
         self.sync_wait_seconds = time.perf_counter() - sync_start
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(
@@ -279,6 +289,7 @@ def _update_gather_batch(
     draft_require_mlp_tp_gather: Optional[bool] = None,
     skip_global_metadata=False,
 ):
+    batch.global_decoder_trim_rows = None
     if not require_mlp_tp_gather:
         batch.global_num_tokens = [mlp_sync_info.num_tokens]
         batch.global_num_tokens_for_logprob = [mlp_sync_info.num_tokens_for_logprob]
@@ -287,6 +298,9 @@ def _update_gather_batch(
         batch.global_num_tokens_for_logprob = (
             mlp_sync_info.global_num_tokens_for_logprob
         )
+        if any(mlp_sync_info.global_decoder_trim_rows or ()):
+            # Every rank resizes its late-layer DP gather when any rank trims.
+            batch.global_decoder_trim_rows = mlp_sync_info.global_decoder_trim_rows
     # Reuse the same all-gather result for a draft model whose A2A backend
     # requires a different local/full token-count representation.
     if draft_require_mlp_tp_gather is not None:
@@ -491,6 +505,7 @@ def prepare_mlp_sync_batch_raw(
     attn_tp_size = parallel.attn_tp_size
     tp_group = parallel.tp_group
     # Check if other DP workers have running batches
+    decoder_trim_rows = 0
     if (
         local_batch is None
         or local_batch.forward_mode.is_prebuilt()
@@ -503,9 +518,12 @@ def prepare_mlp_sync_batch_raw(
         num_tokens_for_logprob = num_tokens
     else:
         num_tokens = local_batch.extend_num_tokens
-        if model_runner.attn_backend.folds_encoder_swa_replay:
+        folds = model_runner.attn_backend.folds_encoder_swa_replay
+        if folds:
             # The worker prepends each hit's replay rows to this extend.
             num_tokens += encoder_swa_fold_rows(local_batch)
+        if get_exec().features.enable_decoder_swa_bounded_replay:
+            decoder_trim_rows = decoder_swa_trim_rows(local_batch, folds_encoder=folds)
         num_tokens_for_logprob = sum(
             # We should have at least 1 token for sample in every case.
             max(extend_len - logprob_start_len, 1)
@@ -597,6 +615,7 @@ def prepare_mlp_sync_batch_raw(
         # Gathered unconditionally like the other columns, so a per-process
         # metrics flag cannot make ranks disagree on what the tensor holds.
         attention_pairs=_local_attention_pairs(local_batch),
+        decoder_trim_rows=decoder_trim_rows,
     )
 
     if num_dp_ranks == 1:
