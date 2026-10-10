@@ -96,7 +96,8 @@ class TestLoRAQwen3_6_27BLogprobDiff(CustomTestCase):
             attention_backend="ascend",
             disable_cuda_graph=True,
             trust_remote_code=True,
-            dtype="bfloat16",
+            mamba_ssm_dtype="bfloat16",
+            
         )
 
         try:
