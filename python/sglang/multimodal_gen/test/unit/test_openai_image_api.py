@@ -2,6 +2,7 @@ import inspect
 import os
 from dataclasses import fields
 
+import pytest
 from fastapi import HTTPException
 from PIL import Image
 
@@ -15,6 +16,7 @@ from sglang.multimodal_gen.configs.sample.longcat_image import (
     LongCatImageSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.runtime.entrypoints.openai import image_api
 from sglang.multimodal_gen.runtime.entrypoints.openai.image_api import (
     _build_image_response_kwargs,
     _fallback_image_urls,
@@ -277,3 +279,16 @@ def test_select_image_variant_path_falls_back_to_single_file_path():
 
     assert _select_image_variant_path(item, None) == "only.png"
     assert _select_image_variant_path(item, "0") == "only.png"
+
+
+def test_request_validation_errors_are_client_errors(monkeypatch):
+    """A request that fails sampling-parameter validation returns 400, not 500."""
+
+    def reject(request_id, **kwargs):
+        raise ValueError("unsupported size")
+
+    monkeypatch.setattr(image_api, "build_sampling_params", reject)
+    with pytest.raises(HTTPException) as error:
+        image_api._build_request_sampling_params("request", size="7x7")
+    assert error.value.status_code == 400
+    assert "unsupported size" in error.value.detail

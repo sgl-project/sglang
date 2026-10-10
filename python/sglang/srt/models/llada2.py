@@ -1295,6 +1295,43 @@ class LLaDA2MoeModel(nn.Module):
             return hidden_states
 
 
+_EXPERT_PROJECTION_NAMES = frozenset({"gate_proj", "up_proj", "down_proj"})
+
+
+def _prepare_llada2_language_weights(
+    weights: Iterable[Tuple[str, torch.Tensor]],
+    *,
+    num_experts: int,
+) -> Iterable[Tuple[str, torch.Tensor]]:
+    """Normalize language-model prefixes and expand fused expert tensors."""
+    for name, loaded_weight in weights:
+        if name.startswith("model.language_model."):
+            name = "model." + name.removeprefix("model.language_model.")
+        elif name.startswith("model.lm_head."):
+            name = "lm_head." + name.removeprefix("model.lm_head.")
+
+        expert_prefix, separator, projection_name = name.rpartition(".")
+        is_fused_expert = (
+            separator
+            and expert_prefix.endswith(".mlp.experts")
+            and projection_name in _EXPERT_PROJECTION_NAMES
+        )
+        if not is_fused_expert:
+            yield name, loaded_weight
+            continue
+
+        if loaded_weight.ndim != 3 or loaded_weight.shape[0] != num_experts:
+            raise ValueError(
+                f"Invalid fused expert weight {name!r}: expected first dimension "
+                f"{num_experts}, got shape={tuple(loaded_weight.shape)}"
+            )
+        for expert_id in range(num_experts):
+            yield (
+                f"{expert_prefix}.{expert_id}.{projection_name}.weight",
+                loaded_weight[expert_id],
+            )
+
+
 class LLaDA2MoeModelLM(nn.Module):
     def __init__(
         self,
@@ -1335,6 +1372,9 @@ class LLaDA2MoeModelLM(nn.Module):
     @property
     def end_layer(self):
         return self.model.end_layer
+
+    def get_input_embeddings(self):
+        return self.model.word_embeddings
 
     def get_embed_and_head(self):
         """Used by the eagle_worker."""
@@ -1389,7 +1429,9 @@ class LLaDA2MoeModelLM(nn.Module):
         )
 
         params_dict = dict(self.named_parameters())
-        for name, loaded_weight in weights:
+        for name, loaded_weight in _prepare_llada2_language_weights(
+            weights, num_experts=self.config.num_experts
+        ):
             if (
                 ("v_head" in name)
                 or ("inv_freq" in name)
