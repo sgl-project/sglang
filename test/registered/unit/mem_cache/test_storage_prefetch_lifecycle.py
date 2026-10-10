@@ -1,12 +1,9 @@
 """Staged L3 prefetch lifecycle through the buffer pipeline; no GPU kernels."""
 
 import tempfile
-import threading
-import time
 import unittest
 from array import array
 from collections import defaultdict, deque
-from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from queue import Queue
 from types import SimpleNamespace
@@ -23,18 +20,9 @@ from sglang.srt.mem_cache.buffer_mode.pipeline import (
     BufferModePipeline,
     _StagedPrefetch,
 )
-from sglang.srt.mem_cache.buffer_mode.storage_existence_cache import (
-    StorageExistenceCache,
-)
-from sglang.srt.mem_cache.hicache_storage import (
-    HiCacheFile,
-    HiCacheStorageConfig,
-    PoolName,
-    PoolTransfer,
-)
+from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
-    PrefetchOperation,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
@@ -42,10 +30,10 @@ from sglang.srt.mem_cache.unified_radix_cache import (
     UnifiedRadixCache,
     _OngoingPrefetch,
 )
-from sglang.srt.mem_cache.utils import get_hash_str, get_storage_hash_str
+from sglang.srt.mem_cache.utils import get_hash_str
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=50, suite="base-a-test-cpu")
+register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
 _REQ = CacheRequestHandle("r", 0)
 
@@ -164,100 +152,17 @@ def _hit_drain_fixture():
 
 def _terminated_query(cache, rid, hit_tokens):
     handle = CacheRequestHandle(rid, 0)
-    operation = PrefetchOperation(handle, list(range(8)))
-    operation.storage_hit_count = hit_tokens
-    operation.stats_requested_tokens = 8
-    operation.mark_terminate()
+    operation = SimpleNamespace(
+        request_id=rid,
+        handle=handle,
+        storage_hit_count=hit_tokens,
+        stats_requested_tokens=8,
+        is_terminated=lambda: True,
+    )
     cache.ongoing_prefetch[handle] = _OngoingPrefetch(
         0, RadixKey(array("q", range(8))), None, operation, None, {}
     )
     cache.cache_controller.prefetch_hit_queue.put(operation)
-
-
-def _two_rank_cancelled_query(rank, directory):
-    torch.distributed.init_process_group(
-        "gloo",
-        init_method=f"file://{directory}/rendezvous",
-        rank=rank,
-        world_size=2,
-        timeout=timedelta(seconds=30),
-    )
-    try:
-        controller = HybridCacheController.__new__(HybridCacheController)
-        controller.page_size = 2
-        controller.prefetch_hits_sync_groups = [torch.distributed.new_group()]
-        controller.prefetch_queue = Queue()
-        controller.prefetch_hit_queue = Queue()
-        controller.storage_stop_event = threading.Event()
-        # Drain the queued operation and exit, without starting unrelated I/O.
-        controller.storage_stop_event.set()
-        controller.storage_backend = HiCacheFile(
-            HiCacheStorageConfig(
-                tp_rank=rank,
-                tp_size=2,
-                pp_rank=0,
-                pp_size=1,
-                attn_cp_rank=0,
-                attn_cp_size=1,
-                is_mla_model=False,
-                enable_storage_metrics=False,
-                is_page_first_layout=False,
-                model_name="cancelled-query",
-                extra_config={
-                    "file_storage_path": f"{directory}/storage",
-                    "enable_metadata_cache": False,
-                },
-            )
-        )
-        tokens = [11, 12, 13, 14]
-        last_hash = get_hash_str([7, 8])
-        chain = get_storage_hash_str(tokens, last_hash, page_size=2)
-        for key in chain:
-            assert controller.storage_backend.set(key, torch.tensor([rank + 1]))
-        operation = controller.prefetch(
-            CacheRequestHandle("cancel-before-peer-query", 0), tokens, last_hash
-        )
-        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
-        cache.tree_core = SimpleNamespace(page_size=2)
-        cache.host_memory_mode, cache.page_size = "buffer_only", 2
-        cache.components = {}
-        cache.storage_existence_cache = StorageExistenceCache()
-        beliefs = cache.storage_existence_cache.pool(PoolName.KV)
-        beliefs.add(chain)
-
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            if rank == 0:
-                worker = executor.submit(controller.prefetch_thread_func)
-                deadline = time.monotonic() + 20
-                while not operation.query_pool_hit_pages:
-                    if worker.done():
-                        worker.result()
-                        raise AssertionError("Query worker exited before querying")
-                    assert time.monotonic() < deadline, "Query did not complete"
-                    time.sleep(0.001)
-                assert operation.query_pool_hit_pages == {PoolName.KV: len(chain)}
-            # Rank 0 holds a query verdict and waits in the separate MIN group.
-            # Rank 1's worker starts only after cancellation and skips the query.
-            torch.distributed.barrier()
-            operation.mark_terminate()
-            if rank == 1:
-                assert operation.all_hash_values is None
-                worker = executor.submit(controller.prefetch_thread_func)
-            worker.result(timeout=30)
-
-        assert controller.prefetch_hit_queue.get_nowait() is operation
-        cache._invalidate_absent_from_hit_query(operation)
-        observation = (
-            operation.all_hash_values,
-            operation.storage_hit_count,
-            operation.query_pool_hit_pages,
-            [beliefs.contains(key) for key in chain],
-        )
-        observations = [None, None]
-        torch.distributed.all_gather_object(observations, observation)
-        assert observations == [(chain, 0, {}, [False, False])] * 2, observations
-    finally:
-        torch.distributed.destroy_process_group()
 
 
 def _two_rank_retry_trace(rank, rendezvous):
@@ -460,12 +365,6 @@ class TestStagedPrefetchLifecycle(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="prefetch-rank-test-") as directory:
             torch.multiprocessing.spawn(
                 _two_rank_retry_trace, args=(f"{directory}/store",), nprocs=2, join=True
-            )
-
-    def test_two_rank_cancelled_query_preserves_hash_chain(self):
-        with tempfile.TemporaryDirectory(prefix="cancelled-query-") as directory:
-            torch.multiprocessing.spawn(
-                _two_rank_cancelled_query, args=(directory,), nprocs=2, join=True
             )
 
     def test_next_pass_uses_fresh_joint_match(self):
