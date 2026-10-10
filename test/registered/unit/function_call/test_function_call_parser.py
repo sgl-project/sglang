@@ -3308,6 +3308,40 @@ class TestGlm4MoeDetector(unittest.TestCase):
         self.assertIsInstance(value, dict)
         self.assertEqual(value, {"pattern": "\\d+"})
 
+    def test_string_parameter_keeps_json_literal_text(self):
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="edit_file",
+                    description="Edit a file",
+                    parameters={
+                        "type": "object",
+                        "properties": {"new_str": {"type": "string"}},
+                        "required": ["new_str"],
+                    },
+                ),
+            )
+        ]
+        cases = ['"hello"', "true", "null", "1e2", '{"k":1}']
+        for raw in cases:
+            text = (
+                "<tool_call>edit_file\n"
+                "<arg_key>new_str</arg_key>\n"
+                f"<arg_value>{raw}</arg_value>\n"
+                "</tool_call>"
+            )
+            result = self.detector.detect_and_parse(text, tools)
+            self.assertEqual(len(result.calls), 1, raw)
+            self.assertEqual(json.loads(result.calls[0].parameters)["new_str"], raw)
+
+            streamed = ""
+            detector = Glm4MoeDetector()
+            for call in detector.parse_streaming_increment(text, tools).calls:
+                if call.parameters:
+                    streamed += call.parameters
+            self.assertEqual(json.loads(streamed)["new_str"], raw)
+
 
 class TestGlm47MoeDetector(unittest.TestCase):
     def setUp(self):
@@ -3617,6 +3651,37 @@ class TestGlm47MoeDetector(unittest.TestCase):
         self.assertTrue(is_good)
         self.assertIsInstance(value, dict)
         self.assertEqual(value, {"pattern": "\\d+"})
+
+    def test_string_parameter_keeps_quoted_literal(self):
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="edit_file",
+                    description="Edit a file",
+                    parameters={
+                        "type": "object",
+                        "properties": {"new_str": {"type": "string"}},
+                        "required": ["new_str"],
+                    },
+                ),
+            )
+        ]
+        raw = '"hello"'
+        text = (
+            "<tool_call>edit_file<arg_key>new_str</arg_key>"
+            f"<arg_value>{raw}</arg_value></tool_call>"
+        )
+        result = self.detector.detect_and_parse(text, tools)
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(json.loads(result.calls[0].parameters)["new_str"], raw)
+
+        streamed = ""
+        detector = Glm47MoeDetector()
+        for call in detector.parse_streaming_increment(text, tools).calls:
+            if call.parameters:
+                streamed += call.parameters
+        self.assertEqual(json.loads(streamed)["new_str"], raw)
 
     def test_get_model_structural_tag(self):
         """GLM-4.7/GLM-5 use xgrammar's native "glm_4_7" structural tag."""
