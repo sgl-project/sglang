@@ -51,5 +51,22 @@ class TestIpcInputA2AQkvGuard(unittest.TestCase):
             self.assertIsNone(usp._ipc_input_a2a_qkv(q, q.clone(), q.clone()))
 
 
+class TestIpcSkippedUnderCompile(unittest.TestCase):
+    """The transport's custom-class handles cannot be traced: a compiled graph
+    keeps the NCCL all-to-all instead of breaking at every exchange."""
+
+    def test_ipc_group_is_unavailable_while_compiling(self):
+        ready = mock.MagicMock(return_value=True)
+        with (
+            mock.patch.object(usp.torch.compiler, "is_compiling", lambda: True),
+            mock.patch(
+                "sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a.ipc_a2a_ready",
+                ready,
+            ),
+        ):
+            self.assertIsNone(usp._ipc_ready_group())
+        ready.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
