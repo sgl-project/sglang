@@ -605,7 +605,9 @@ def _dcp_lse_combine_kernel(
         partial_out = tl.load(recv_output_ptr + o_offsets).to(tl.float32)
         acc += partial_out * w
 
-    acc = acc / weight_sum
+    # Every nonempty row has a max-LSE contribution of exp(0) == 1.
+    # All-empty DP padding has zero weight and must keep its zero output.
+    acc = acc / tl.maximum(weight_sum, 1.0)
 
     out_offsets = (
         batch_idx * out_stride_B + head_idx * out_stride_H + d_offsets * out_stride_D
@@ -710,7 +712,7 @@ def _lse_weighted_combine_cpu(
         weights = torch.pow(2.0, centered)
 
     weight_sum = weights.sum(dim=0, keepdim=True)
-    weights = weights / weight_sum
+    weights = weights / weight_sum.clamp_min(1.0)
 
     combined = (partial_outputs * weights.unsqueeze(-1)).sum(dim=0)
     return combined

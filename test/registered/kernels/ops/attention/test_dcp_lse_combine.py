@@ -185,6 +185,17 @@ class TestLSECombineEdgeCases(CustomTestCase):
             raise unittest.SkipTest("CUDA required")
         cls.device = "cuda"
 
+    def test_all_empty_rows_stay_zero(self):
+        """A row with -inf LSE on every shard has no KV and must not become NaN."""
+        from sglang.kernels.ops.attention.dcp_kernels import dcp_lse_combine_triton
+
+        outputs = torch.ones(2, 2, 4, 64, device=self.device, dtype=torch.bfloat16)
+        lses = torch.zeros(2, 2, 4, device=self.device)
+        lses[:, 1] = -torch.inf
+        combined, _ = dcp_lse_combine_triton(outputs, lses, is_lse_base_on_e=False)
+        self.assertTrue((combined[0] == 1).all())
+        self.assertTrue((combined[1] == 0).all())
+
     def test_one_shard_dominant(self):
         """One shard has much larger LSE -- output should be close to that shard."""
         from sglang.kernels.ops.attention.dcp_kernels import (

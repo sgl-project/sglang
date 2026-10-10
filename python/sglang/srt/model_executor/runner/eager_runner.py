@@ -170,7 +170,9 @@ class EagerRunner(BaseRunner):
             num_tokens_per_req = mr.decode_num_tokens_per_req()
         return (
             self._alloc_dummy_decode_buffers(
-                self._eager_max_bs, num_tokens_per_req=num_tokens_per_req
+                self._eager_max_bs,
+                num_tokens_per_req=num_tokens_per_req,
+                allocate_logits_buffer=False,
             ),
             self._eager_max_bs,
         )

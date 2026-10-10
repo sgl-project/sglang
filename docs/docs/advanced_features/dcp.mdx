@@ -58,6 +58,18 @@ sglang serve \
   --port 30000
 ```
 
+GLM-5.3 on four Blackwell GPUs with DCP 2 inside TP 4:
+
+```bash Command
+sglang serve \
+  --model-path nvidia/GLM-5.3-NVFP4 \
+  --quantization modelopt_fp4 \
+  --tp-size 4 \
+  --dcp-size 2 \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
 See the [Kimi K3 cookbook](/cookbook/autoregressive/Moonshotai/Kimi-K3) for large-scale presets that combine DCP with DPA and expert parallelism.
 
 ## Why decode context parallelism?
@@ -151,6 +163,20 @@ Target verify and decode use the DCP-aware MLA kernel `cutedsl_mla`. It:
 3. Returns a rank-local `(output, LSE)` that the usual DCP all-to-all merge combines.
 
 Draft steps use the same backend against the replicated draft cache, so they skip DCP metadata. Kimi K3 DCP selects `cutedsl_mla` automatically.
+
+### DCP × sparse attention (DSA)
+
+GLM-5.3, GLM-5.2, and DeepSeek-V3.2 pick a top-k subset of the context with an indexer before MLA attention. DCP stripes the MLA KV and keeps the indexer keys replicated: every rank scores the full sequence, selects the same global top-k, and attends only to the selected slots it owns.
+
+1. The indexer returns global KV slots; fused top-k stays enabled.
+2. Each rank keeps the slots where `owner(v) = rank`, maps them to `floor(v / c)`, and passes the per-row count to the sparse kernel.
+3. The `trtllm` sparse kernel returns a rank-local `(output, LSE)` for decode and chunked prefill, which the usual DCP merge combines.
+
+Replicated index keys cost capacity. On GLM-5.3 with FP8 KV, a token stores 44,928 bytes of striped MLA KV and 2,772 bytes of index keys, so capacity grows by about `1.9x` at DCP 2 and `3.4x` at DCP 4 instead of `c`. Replicated Q is enabled by default on the a2a family.
+
+Checkpoint-native MTP composes as a single EAGLE chain (`--speculative-eagle-topk 1`, draft tokens = steps + 1), with a replicated draft cache as above.
+
+This composition requires SM100/SM103, the `trtllm` DSA backend, and FP8 or BF16 KV. HiSparse, HiCache, PD disaggregation, prefill context parallelism, and unified memory are not supported here.
 
 ### DCP × PD disaggregation
 

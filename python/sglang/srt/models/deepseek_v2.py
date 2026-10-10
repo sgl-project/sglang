@@ -3418,7 +3418,11 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         kv_cache_device,
         create_chunked_prefix_cache_kv_indices_fn,
     ):
-        if _is_npu:
+        if _is_npu or (
+            _is_cuda
+            and is_deepseek_dsa(self.config)
+            and self.config.qk_rope_head_dim > 0
+        ):
             return None
         return prepare_decode_context_parallel_metadata(
             seq_lens=seq_lens,

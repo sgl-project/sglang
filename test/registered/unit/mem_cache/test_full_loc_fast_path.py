@@ -320,6 +320,7 @@ class TestMlaWriteDoorsUnderDcp(unittest.TestCase):
         pool = object.__new__(MLATokenToKVPool)
         pool.size = 64
         pool.page_size = 1
+        pool.alloc_page_size = 1
         pool.start_layer = 0
         pool.dtype = torch.float16
         pool.store_dtype = torch.float16

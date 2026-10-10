@@ -10,9 +10,95 @@ from sglang.srt.arg_groups.model_override_base import (
     resolving_view,
     use_mla_backend,
 )
-from sglang.srt.runtime_context import get_platform
+from sglang.srt.runtime_context import derive_attn_tp_size, get_platform
 
 logger = logging.getLogger(__name__)
+
+
+def _dsa_dcp_overrides(cfg: Any, hf_config: Any) -> dict:
+    """Validate and default DCP for RoPE DSA (GLM-5.x, DeepSeek-V3.2) on CUDA."""
+    if (
+        cfg.dcp_size <= 1
+        or not get_platform().is_cuda
+        or hf_config.architectures[0] == "Glm5NextForConditionalGeneration"
+        or getattr(hf_config, "use_mla_nope", False)
+    ):
+        return {}
+
+    if not (get_platform().is_sm100 and get_platform().device_sm in (100, 103)):
+        raise ValueError("RoPE DSA DCP requires SM100 or SM103.")
+    if cfg.enable_hisparse:
+        raise ValueError("RoPE DSA DCP does not support HiSparse.")
+    if cfg.enable_prefill_cp or cfg.attn_cp_size > 1:
+        raise ValueError("RoPE DSA DCP does not support prefill context parallelism.")
+    if (
+        cfg.enable_hierarchical_cache
+        or cfg.hicache_storage_backend is not None
+        or cfg.enable_unified_cache_external_linker
+    ):
+        raise ValueError("RoPE DSA DCP does not support HiCache.")
+    if cfg.disaggregation_mode != "null":
+        raise ValueError("RoPE DSA DCP does not support PD disaggregation.")
+    if cfg.enable_unified_memory:
+        raise ValueError("RoPE DSA DCP does not support unified memory.")
+    if cfg.dcp_replicate_q_proj and cfg.enable_lora:
+        raise ValueError("RoPE DSA DCP does not support replicated Q with LoRA.")
+    if cfg.kv_cache_dtype not in ("auto", "fp8_e4m3", "bf16", "bfloat16"):
+        raise ValueError("RoPE DSA DCP requires an fp8_e4m3 or bfloat16 KV cache.")
+    if cfg.speculative_algorithm is not None and (
+        cfg.speculative_algorithm.upper() not in ("EAGLE", "NEXTN")
+        or cfg.speculative_eagle_topk != 1
+        or cfg.speculative_num_steps is None
+        or cfg.speculative_num_draft_tokens != cfg.speculative_num_steps + 1
+        or cfg.speculative_adaptive
+        or cfg.enable_multi_layer_eagle
+        or cfg.speculative_draft_model_path not in (None, cfg.model_path)
+        or cfg.speculative_draft_attention_backend not in (None, "dsa")
+        or cfg.speculative_draft_kv_cache_dtype is not None
+    ):
+        raise ValueError(
+            "RoPE DSA DCP supports only the checkpoint's MTP draft as a single "
+            "EAGLE chain: --speculative-eagle-topk 1 and "
+            "--speculative-num-draft-tokens equal to --speculative-num-steps + 1."
+        )
+    attn_tp_size = derive_attn_tp_size(
+        tp_size=cfg.tp_size,
+        attn_cp_size=cfg.attn_cp_size,
+        attn_dp_size=cfg.attn_dp_size,
+    )
+    if attn_tp_size % cfg.dcp_size != 0:
+        raise ValueError(
+            f"RoPE DSA DCP requires the attention TP size ({attn_tp_size}) to "
+            f"be divisible by --dcp-size ({cfg.dcp_size})."
+        )
+    if not all(
+        backend in (None, "dsa")
+        for backend in (
+            cfg.attention_backend,
+            cfg.prefill_attention_backend,
+            cfg.decode_attention_backend,
+        )
+    ):
+        raise ValueError("RoPE DSA DCP requires the dsa attention backend.")
+    if not all(
+        backend in (None, "trtllm")
+        for backend in (cfg.dsa_prefill_backend, cfg.dsa_decode_backend)
+    ):
+        raise ValueError("RoPE DSA DCP requires the trtllm DSA backend.")
+
+    overrides = {}
+    if cfg.dsa_prefill_backend is None:
+        overrides["dsa_prefill_backend"] = "trtllm"
+    if cfg.dsa_decode_backend is None:
+        overrides["dsa_decode_backend"] = "trtllm"
+    if (
+        cfg.dcp_replicate_q_proj is None
+        and cfg.dcp_comm_backend in ("a2a", "fi_a2a")
+        and not cfg.enable_lora
+    ):
+        logger.info("RoPE DSA DCP enables replicated Q projection by default.")
+        overrides["dcp_replicate_q_proj"] = True
+    return overrides
 
 
 @_register_for(
@@ -78,6 +164,7 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                     )
 
     if is_deepseek_dsa(hf_config):  # DeepSeek 3.2/GLM 5
+        overrides.update(_dsa_dcp_overrides(cfg, hf_config))
         # Set attention backend for DeepSeek
         if is_attention_backend_not_set(cfg):
             overrides["attention_backend"] = "dsa"

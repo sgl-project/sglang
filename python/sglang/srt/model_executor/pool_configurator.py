@@ -30,6 +30,7 @@ from sglang.srt.configs.model_config import (
     is_minimax_sparse,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa.dsa_dcp import dsa_indexer_dcp_scale
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_len_per_decode
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     collect_sources_by_ratio,
@@ -230,6 +231,12 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             num_layers = kvc.layer_info.num_effective_layers
 
         self._cell_size = self._compute_cell_size(kvc, num_layers)
+        self._dcp_pool_padding_bytes = (
+            self._cell_size * kvc.page_size
+            if is_deepseek_dsa(kvc.model_config.hf_config)
+            and dsa_indexer_dcp_scale(kvc) > 1
+            else 0
+        )
         has_kv_on_another_pp_stage = (
             self._cell_size == 0
             and mambaish is not None
@@ -262,8 +269,8 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                         kvc=kvc,
                         num_layers=num_layers,
                     )
-                    if _is_npu and dcp_size > 1:
-                        target_indexer_size *= dcp_size
+                    indexer_scale = dcp_size if _is_npu else dsa_indexer_dcp_scale(kvc)
+                    target_indexer_size *= indexer_scale
                     target_kv_size = self._cell_size - target_indexer_size
                     from sglang.srt.layers.cp.utils import (
                         get_glm_dsa_layer_split_effective_num_layers,
@@ -280,12 +287,14 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                         num_layers=draft_num_layers,
                         allocate_all_layers=True,
                     )
-                    # The draft pool is replicated and consumes the widened
-                    # allocator-global slot space on NPU DCP.
-                    if _is_npu and dcp_size > 1:
-                        draft_kv_size *= dcp_size
-                        draft_indexer_size *= dcp_size
+                    # Draft KV and index keys replicate allocator-global slots.
+                    draft_kv_size *= indexer_scale
+                    draft_indexer_size *= indexer_scale
                     self._cell_size += draft_kv_size + draft_indexer_size
+                    if self._dcp_pool_padding_bytes:
+                        self._dcp_pool_padding_bytes += (
+                            draft_kv_size + draft_indexer_size
+                        ) * kvc.page_size
                 else:
                     self._cell_size = int(
                         self._cell_size * (1 + draft_num_layers / int(num_layers))
@@ -382,6 +391,8 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 )
                 if _is_npu and not kvc.is_draft_worker and dcp_size > 1:
                     indexer_cell_size *= dcp_size
+                else:
+                    indexer_cell_size *= dsa_indexer_dcp_scale(kvc)
                 cell_size += indexer_cell_size
         elif is_minimax_sparse(model_config.hf_config):
             from sglang.srt.server_args import m3_fp8_attn_gemm_enabled
@@ -598,7 +609,8 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
-        available_bytes = max(available_bytes, 0)
+        # One physical MLA padding page plus one widened indexer padding page.
+        available_bytes = max(available_bytes - self._dcp_pool_padding_bytes, 0)
         max_total_num_tokens = (
             available_bytes // self._cell_size
             if self._cell_size

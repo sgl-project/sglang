@@ -32,6 +32,11 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.distributed.utils import get_pp_indices
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa.dsa_dcp import (
+    dsa_dcp_runtime_reservation_bytes,
+    dsa_indexer_dcp_scale,
+    is_cuda_rope_dsa,
+)
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     get_kv_cache_quant_method,
     resolve_kv_cache_quant,
@@ -1992,6 +1997,20 @@ class KVCacheConfigurator:
             pool_kwargs["layer_shard_size"] = dsa_cp_layer_shard_size
         else:
             PoolCls = dsa_pool_class
+        pool_page_size = self.pool_page_size
+        if is_cuda_rope_dsa(self) and self.is_draft_worker and self.loc_space_scale > 1:
+            # The draft pool is replicated over the widened allocator slots,
+            # while DSA kernels keep reading pages of the scheduler page size.
+            pool_kwargs["dcp_replicated"] = True
+            pool_kwargs["alloc_page_size"] = pool_page_size
+            pool_kwargs["index_alloc_page_size"] = pool_page_size
+            pool_page_size = get_schedule().page_size
+        indexer_scale = dsa_indexer_dcp_scale(self)
+        if indexer_scale > 1:
+            # Target KV is sharded; index keys stay replicated so every rank
+            # scores the whole sequence.
+            pool_kwargs["index_buf_size"] = max_total_num_tokens * indexer_scale
+            pool_kwargs["index_alloc_page_size"] = self.pool_page_size * indexer_scale
         if _should_elide_dsa_index_k(is_draft_worker=self.is_draft_worker):
             pool_kwargs["skip_topk_layers"] = [
                 dsa_layer_skips_topk(self.model_config.hf_config, layer_id)
@@ -2001,7 +2020,7 @@ class KVCacheConfigurator:
             ]
         token_to_kv_pool = PoolCls(
             max_total_num_tokens,
-            page_size=self.pool_page_size,
+            page_size=pool_page_size,
             dtype=self.kv_cache_dtype,
             kv_lora_rank=self.model_config.kv_lora_rank,
             qk_rope_head_dim=self.model_config.qk_rope_head_dim,
@@ -2593,6 +2612,15 @@ class KVCacheConfigurator:
             mm_feature_transport=get_mm().mm_feature_transport,
         )
         rest_memory = available_gpu_memory - slack_gb - mm_reservation_gb
+        dsa_dcp_reservation = dsa_dcp_runtime_reservation_bytes(
+            self, available_bytes=int(rest_memory * (1 << 30))
+        )
+        if dsa_dcp_reservation:
+            logger.info(
+                "Reserving %.2f GB for DSA DCP attention buffers.",
+                dsa_dcp_reservation / (1 << 30),
+            )
+            rest_memory -= dsa_dcp_reservation / (1 << 30)
         if self.mambaish_config is not None:
             rest_memory = self._handle_max_mamba_cache(rest_memory)
 
