@@ -32,9 +32,6 @@ from sglang.multimodal_gen.runtime.layers.linear import (
 from sglang.multimodal_gen.runtime.layers.quantization.weight_only_fp8 import (
     WeightOnlyFP8Linear,
 )
-from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
-    VocabParallelEmbedding,
-)
 from sglang.multimodal_gen.runtime.managers.forward_context import (
     get_forward_context_or_none,
 )
@@ -451,6 +448,37 @@ class BaseLayerWithLoRA(nn.Module):
         self._merge_lora_into_data(work, self.lora_weights_list)
         return work.to("cpu", dtype=target_dtype)
 
+    @torch.no_grad()
+    def merge_rounding_norms(self, max_rows: int = 1024) -> tuple[float, float] | None:
+        """Squared norms of the part of the active LoRA update that merging
+        into this layer's weight dtype would round away, and of the update,
+        over an even sample of rows. Nothing is written; None when there is
+        nothing to round or the adapter has no plain 2-D form here."""
+        lora_list = self._active_lora_list()
+        if self.disable_lora or not lora_list:
+            return None
+        src, _ = self._materialized_weight_src()
+        if not src.is_floating_point() or src.dtype == torch.float32:
+            return None
+        weight = src.reshape(-1, src.shape[-1])
+        device = get_local_torch_device()
+        rows = torch.linspace(0, weight.shape[0] - 1, min(max_rows, weight.shape[0]))
+        rows = rows.round().long().unique()
+        base = weight[rows.to(weight.device)].to(device, torch.float32)
+        delta = torch.zeros_like(base)
+        for lora_A, lora_B, _, strength, rank, alpha, _ in lora_list:
+            a = self.slice_lora_a_weights(lora_A.to(device, torch.float32))
+            b = self.slice_lora_b_weights(lora_B.to(device, torch.float32))
+            if not isinstance(b, torch.Tensor) or a.dim() > 2 or b.dim() > 2:
+                return None
+            scale = strength
+            if alpha is not None and rank is not None and alpha != rank:
+                scale *= alpha / rank
+            delta += scale * (b[rows.to(device)] @ a)
+        exact = base + delta
+        lost = exact.to(src.dtype).to(torch.float32) - exact
+        return float(lost.square().sum()), float(delta.square().sum())
+
     def install_merged_weight(
         self, merged: torch.Tensor, base_view: torch.Tensor
     ) -> None:
@@ -651,37 +679,7 @@ class BaseLayerWithLoRA(nn.Module):
         self.strength = 1.0
 
 
-class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
-    """
-    Vocab parallel embedding layer with support for LoRA (Low-Rank Adaptation).
-
-    Note: The current version does not yet implement the LoRA functionality.
-    This class behaves exactly the same as the base VocabParallelEmbedding.
-    Future versions will integrate LoRA functionality to support efficient parameter fine-tuning.
-    """
-
-    def __init__(
-        self,
-        base_layer: VocabParallelEmbedding,
-    ) -> None:
-        super().__init__(base_layer)
-
-    def forward(self, input_: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError(
-            "We don't support VocabParallelEmbeddingWithLoRA yet."
-        )
-
-
 class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
-    def __init__(
-        self,
-        base_layer: ColumnParallelLinear,
-        lora_rank: int | None = None,
-        lora_alpha: int | None = None,
-        snapshot_base: bool = True,
-    ) -> None:
-        super().__init__(base_layer, lora_rank, lora_alpha, snapshot_base)
-
     def forward(self, input_: torch.Tensor) -> torch.Tensor:
         if self.disable_lora or (self.merged and not self.has_lora_output_offset):
             return self.base_layer(input_)
@@ -738,15 +736,6 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
 
 
 class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
-    def __init__(
-        self,
-        base_layer: MergedColumnParallelLinear,
-        lora_rank: int | None = None,
-        lora_alpha: int | None = None,
-        snapshot_base: bool = True,
-    ) -> None:
-        super().__init__(base_layer, lora_rank, lora_alpha, snapshot_base)
-
     def slice_lora_b_weights(self, B: torch.Tensor) -> torch.Tensor:
         tp_rank = get_tp_rank()
         if B.dim() == 3:
@@ -772,15 +761,6 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
 
 
 class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
-    def __init__(
-        self,
-        base_layer: QKVParallelLinear,
-        lora_rank: int | None = None,
-        lora_alpha: int | None = None,
-        snapshot_base: bool = True,
-    ) -> None:
-        super().__init__(base_layer, lora_rank, lora_alpha, snapshot_base)
-
     def slice_lora_b_weights(
         self, B: list[torch.Tensor]
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -802,15 +782,6 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
 
 
 class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
-    def __init__(
-        self,
-        base_layer: RowParallelLinear,
-        lora_rank: int | None = None,
-        lora_alpha: int | None = None,
-        snapshot_base: bool = True,
-    ) -> None:
-        super().__init__(base_layer, lora_rank, lora_alpha, snapshot_base)
-
     def forward(self, input_: torch.Tensor):
         if self.disable_lora or (self.merged and not self.has_lora_output_offset):
             return self.base_layer(input_)
@@ -889,15 +860,6 @@ class LinearWithLoRA(BaseLayerWithLoRA):
     Unlike custom LinearBase classes, nn.Linear.forward() returns a single tensor,
     not a tuple of (output, bias).
     """
-
-    def __init__(
-        self,
-        base_layer: nn.Linear,
-        lora_rank: int | None = None,
-        lora_alpha: int | None = None,
-        snapshot_base: bool = True,
-    ) -> None:
-        super().__init__(base_layer, lora_rank, lora_alpha, snapshot_base)
 
     @torch.compile()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -989,7 +951,6 @@ def wrap_with_lora_layer(
     """
     supported_layer_types: dict[type[nn.Module], type[BaseLayerWithLoRA]] = {
         # the order matters
-        # VocabParallelEmbedding: VocabParallelEmbeddingWithLoRA,
         # Weight-only FP8 LoRA is currently dynamic-only and intended for
         # single-GPU deployments.
         WeightOnlyFP8Linear: WeightOnlyFP8LinearWithLoRA,

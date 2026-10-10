@@ -37,20 +37,6 @@ def handle_npu_backends(server_args: Any):
 
         set_default_server_args(server_args)
 
-        current = cfg.cuda_graph_config.prefill.tc_compiler
-        if current is not None and current != "eager":
-            logger.warning(
-                "At this moment Ascend platform only support prefill graph compilation with "
-                "cuda_graph_config[prefill].tc_compiler='eager'."
-            )
-            declare_resolution(
-                server_args,
-                "_handle_npu_backends",
-                cuda_graph_config=with_phase(
-                    cfg.cuda_graph_config, Phase.PREFILL, tc_compiler="eager"
-                ),
-            )
-
 
 def handle_mps_backends(server_args: Any):
     cfg = resolving_view(server_args)

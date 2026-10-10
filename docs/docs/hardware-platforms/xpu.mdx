@@ -177,7 +177,6 @@ SGLang enables XPU graph capture to reduce per-step kernel-launch overhead.
 | Phase | Backend | Mechanism | Default |
 |---|---|---|---|
 | Decode | `full` | One `torch.xpu.XPUGraph` per batch size, captured on startup | **Off** (opt-in) |
-| Prefill | `tc_piecewise` | `torch.compile` + XPU graph, one graph segment per token-length bucket | **Off** (opt-in) |
 | Prefill | `breakable` | Segmented `torch.xpu.XPUGraph` capture/replay (no `torch.compile`); eager break points at attention / MoE boundaries | **Off** (opt-in) |
 
 ### Enable Decode Graph
@@ -192,26 +191,7 @@ python -m sglang.launch_server --model-path <MODEL> --device xpu \
 ### Enable Prefill Graph
 
 Prefill graph capture is **opt-in** on XPU and must be enabled explicitly.
-Two backends are available: `tc_piecewise` and `breakable`.
-
-#### tc_piecewise
-
-Uses `torch.compile` plus an XPU graph, one graph segment per token-length
-bucket:
-
-```bash
-python -m sglang.launch_server --model-path <MODEL> --device xpu \
-    --cuda-graph-backend-prefill tc_piecewise
-```
-
-By default the prefill subgraphs are compiled with `eager` mode. Switch to
-`inductor` for higher-quality generated code at the cost of longer startup:
-
-```bash
-python -m sglang.launch_server --model-path <MODEL> --device xpu \
-    --cuda-graph-backend-prefill tc_piecewise \
-    --cuda-graph-tc-compiler inductor
-```
+Use the `breakable` backend. The former `tc_piecewise` backend has been removed.
 
 #### breakable
 
@@ -227,7 +207,7 @@ You can also configure both phases together with a single `--cuda-graph-config` 
 
 ```bash
 python -m sglang.launch_server --model-path <MODEL> --device xpu \
-    --cuda-graph-config '{"decode":{"backend":"full"},"prefill":{"backend":"tc_piecewise","tc_compiler":"eager"}}'
+    --cuda-graph-config '{"decode":{"backend":"full"},"prefill":{"backend":"breakable"}}'
 ```
 
 ### Enable torch.compile for Decode
@@ -241,11 +221,6 @@ but increases startup time.
 python -m sglang.launch_server --model-path <MODEL> --device xpu \
     --enable-torch-compile
 ```
-
-> **Note:** `--enable-torch-compile` is mutually exclusive with the prefill
-> `tc_piecewise` graph (the compatibility rules auto-disable it). Use them
-> separately or lock the prefill backend explicitly via `--cuda-graph-config`
-> if you need both.
 
 ### Disable XPU Graph
 
@@ -274,7 +249,7 @@ To specify explicit token-length buckets:
 ```bash
 python -m sglang.launch_server \
     --model-path <MODEL> --device xpu \
-    --cuda-graph-backend-prefill tc_piecewise \
+    --cuda-graph-backend-prefill breakable \
     --cuda-graph-bs-prefill 64 128 256 512
 ```
 
@@ -291,11 +266,10 @@ python -m sglang.launch_server \
 | Argument | XPU allowed values | Default | Description |
 |---|---|---|---|
 | `--cuda-graph-backend-decode` | `full`, `disabled` | `disabled` | Backend for the decode phase. Only `full` is supported on XPU. Set to `full` to enable. |
-| `--cuda-graph-backend-prefill` | `tc_piecewise`, `breakable`, `disabled` | `disabled`* | Backend for the prefill phase. Set to `tc_piecewise` or `breakable` explicitly to enable. |
-| `--cuda-graph-tc-compiler` | `eager`, `inductor` | `eager` | Compiler for `tc_piecewise` prefill subgraphs. `inductor` produces more optimized code but has longer startup. |
+| `--cuda-graph-backend-prefill` | `breakable`, `disabled` | `disabled`* | Backend for the prefill phase. Set to `breakable` explicitly to enable. |
 | `--cuda-graph-bs-prefill` | list of ints | auto | Explicit token-length buckets to capture for prefill. |
 | `--cuda-graph-bs-decode` | list of ints | auto | Explicit batch sizes to capture for decode. |
-| `--cuda-graph-config` | JSON string | — | One-shot JSON config for both phases, e.g. `'{"decode":{"backend":"full"},"prefill":{"backend":"tc_piecewise","tc_compiler":"eager"}}'`. Overrides all per-phase flags. |
+| `--cuda-graph-config` | JSON string | — | One-shot JSON config for both phases, e.g. `'{"decode":{"backend":"full"},"prefill":{"backend":"breakable"}}'`. Overrides all per-phase flags. |
 | `--disable-decode-cuda-graph` | — | `False` | Shorthand for `--cuda-graph-backend-decode=disabled`. |
 | `--disable-prefill-cuda-graph` | — | `False` | Shorthand for `--cuda-graph-backend-prefill=disabled`. |
 | `--enable-torch-compile` | — | `False` | Apply `torch.compile` on top of the decode XPU graph for further kernel optimization. |

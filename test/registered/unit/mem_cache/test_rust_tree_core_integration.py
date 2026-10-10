@@ -1285,9 +1285,10 @@ def test_empty_match_result_is_root_anchored(swa):
     assert empty.best_match_node == probe.best_match_node
     assert empty.last_device_node == probe.last_device_node
     assert empty.last_host_node == probe.last_host_node
-    core.dec_lock_ref(empty.best_match_node, DecLockRefParams())
-    core.dec_host_lock_ref(empty.best_match_node, DecLockRefParams())
-    released = core.dec_swa_lock_only(empty.best_match_node, DecLockRefParams())
+    receipt = DecLockRefParams(node_id=empty.best_match_node)
+    core.dec_lock_ref(empty.best_match_node, receipt)
+    core.dec_host_lock_ref(empty.best_match_node, receipt)
+    released = core.dec_swa_lock_only(empty.best_match_node, receipt)
     assert not released.device_frees
     assert not released.host_frees
     core.sanity_check([], [])
@@ -2192,12 +2193,7 @@ def test_swa_host_pressure_retains_device_resident_backups(backend, guard):
 
 @pytest.mark.parametrize("backend", ["python", "rust"])
 @pytest.mark.parametrize("resident_full", [(), (0,), (0, 1, 2, 3)])
-def test_swa_load_back_preserves_full_anchors_across_holes(backend, resident_full):
-    from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
-        HybridCacheController,
-    )
-    from sglang.srt.mem_cache.pool_host.group import PoolEntry
-
+def test_swa_load_back_spec_skips_resident_swa_holes(backend, resident_full):
     core, _ = _swa_transfer_core(backend)
     nodes = []
     boundaries = (0, 2, 5, 6, 8)
@@ -2241,52 +2237,10 @@ def test_swa_load_back_preserves_full_anchors_across_holes(backend, resident_ful
         )
         core.finish_load_back(nodes[index])
 
-    kv, auxiliary = core.build_load_back_spec(nodes[-1])
+    _, auxiliary = core.build_load_back_spec(nodes[-1])
     (swa,) = auxiliary[ComponentType.SWA]
     assert swa.nodes_to_load == [nodes[0], nodes[2], nodes[3]]
     assert swa.host_indices.tolist() == [300, 301, 305, 306, 307]
-    expected = {
-        (): [slice(0, 2), slice(5, 6), slice(6, 8)],
-        (0,): [torch.tensor([10, 11]), slice(3, 4), slice(4, 6)],
-        (0, 1, 2, 3): [
-            torch.tensor([10, 11]),
-            torch.tensor([15]),
-            torch.tensor([16, 17]),
-        ],
-    }[resident_full]
-    assert swa.anchor_index_parts is not None
-    assert len(swa.anchor_index_parts) == len(expected)
-    for actual, wanted in zip(swa.anchor_index_parts, expected):
-        if isinstance(wanted, slice):
-            assert actual == wanted
-        else:
-            torch.testing.assert_close(actual, wanted)
-
-    # Exercise the consumer too: new Full rows and resident virtual IDs must
-    # bind the same five SWA rows, without consuming the resident-SWA hole.
-    bind = Mock(side_effect=lambda indices: indices + 1000)
-    controller = object.__new__(HybridCacheController)
-    controller.mem_pool_host = SimpleNamespace(
-        entry_map={
-            PoolName.SWA: PoolEntry(
-                name=PoolName.SWA,
-                host_pool=SimpleNamespace(),
-                device_pool=SimpleNamespace(),
-                layer_mapper=lambda i: i,
-                device_indices_from_anchor_fn=bind,
-                device_free_fn=Mock(),
-            )
-        }
-    )
-    loaded = torch.arange(200, 200 + len(kv.host_indices))
-    assert controller._resolve_device_transfers([swa], loaded) is not None
-    expected_bound = {
-        (): [1200, 1201, 1205, 1206, 1207],
-        (0,): [1010, 1011, 1203, 1204, 1205],
-        (0, 1, 2, 3): [1010, 1011, 1015, 1016, 1017],
-    }[resident_full]
-    assert swa.device_indices.tolist() == expected_bound
-    assert bind.call_count == 1
 
 
 @pytest.mark.parametrize("backend", ["python", "rust"])
