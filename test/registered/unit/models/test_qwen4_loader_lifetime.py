@@ -22,6 +22,7 @@ def make_model(ple_dtype=None):
     nn.Module.__init__(model)
     model.config = SimpleNamespace(tie_word_embeddings=False, split_ngram_parts=2)
     model.language_model_only = False
+    model.pp_group = SimpleNamespace(is_last_rank=True)
     model.weight = nn.Parameter(torch.zeros(4), requires_grad=False)
     if ple_dtype is not None:
         ple = Qwen4ExpNGramEmbedding.__new__(Qwen4ExpNGramEmbedding)
