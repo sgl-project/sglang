@@ -61,11 +61,16 @@ class DsparkDraftSampler:
         self.folded_sampling = folded_sampling
         self._noise = noise
         self._tp_sync = tp_sync
-        # The requests' temperatures and greedy rows, staged before each replay.
+        # Staged before each replay: the requests' temperatures and greedy
+        # rows, and the draft temperature the tail reads, 0 for argmax rows.
         self.temperatures = torch.ones(
             (self.max_bs,), dtype=torch.float32, device=device
         )
         self.greedy_mask = torch.ones((self.max_bs,), dtype=torch.bool, device=device)
+        self.step_temperatures = torch.zeros(
+            (self.max_bs,), dtype=torch.float32, device=device
+        )
+        self._zero = torch.zeros((), dtype=torch.float32, device=device)
         # [max_bs, gamma, vocab] step logits the sampling accept reads.
         self.step_logits = (
             torch.empty(
@@ -85,6 +90,7 @@ class DsparkDraftSampler:
         if sampling_info is None:
             self.temperatures[:bs].fill_(1.0)
             self.greedy_mask[:bs].fill_(True)
+            self.step_temperatures[:bs].zero_()
             return
         torch.clamp(
             sampling_info.temperatures.view(-1)[:bs].to(torch.float32),
@@ -92,6 +98,12 @@ class DsparkDraftSampler:
             out=self.temperatures[:bs],
         )
         torch.le(sampling_info.top_ks.view(-1)[:bs], 1, out=self.greedy_mask[:bs])
+        torch.where(
+            self.greedy_mask[:bs],
+            self._zero,
+            self.temperatures[:bs],
+            out=self.step_temperatures[:bs],
+        )
 
     def __call__(self, hidden_states, input_ids):
         bs = hidden_states.shape[0] // self.query_token_num
@@ -109,17 +121,12 @@ class DsparkDraftSampler:
         anchor = input_ids.view(bs, self.query_token_num)[:, 0]
 
         logits_out = None if self.step_logits is None else self.step_logits[:bs]
-        step_temperatures = self.temperatures[:bs]
-        if self.folded_sampling:
-            step_temperatures = step_temperatures.masked_fill(
-                self.greedy_mask[:bs], 0.0
-            )
         draft_tokens, _ = draft_markov_block(
             markov_head=self.markov_head,
             base_logits=base_logits,
             anchor_tokens=anchor,
             draft_hidden=sample_hidden,
-            step_temperatures=step_temperatures,
+            step_temperatures=self.step_temperatures[:bs],
             noise=self._noise,
             tp_sync=self._tp_sync,
             logits_out=logits_out,
