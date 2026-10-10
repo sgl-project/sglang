@@ -59,12 +59,17 @@ from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
     BuildCausalSwaPageIndices,
     late_layer_tail_layout,
 )
+from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
+    Fp8GridActivation,
+    Mxfp8Activation,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention import deepseek_v4_backend as _cuda_backend
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.deepseek_v4_backend import (
     DeepseekV4AttnBackend,
     LateLayerTail,
+    _as_int_list,
     _tail_rows,
 )
 from sglang.srt.layers.attention.dsv4.compressor_v2 import (
@@ -99,7 +104,15 @@ from sglang.srt.layers.attention.hip_flash_mla import (
     resolve_hip_flashmla_backend,
 )
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
-from sglang.srt.layers.cp.utils import is_cp_active
+from sglang.srt.layers.cp.interleave import (
+    InterleaveContextParallelMetadata,
+    interleave_rows_per_request,
+)
+from sglang.srt.layers.cp.utils import cp_materialize_global_token_order, is_cp_active
+from sglang.srt.layers.dp_attention import (
+    get_local_dp_buffer_len,
+    set_local_dp_buffer_len,
+)
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.dsv41_request_window import window_layout
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -141,6 +154,18 @@ def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
     curr_size = x.shape[-1]
     target_size = ceil_align(curr_size, multiples_of)
     return F.pad(x, pad=(0, target_size - curr_size), mode="constant", value=-1)
+
+
+def _first_rows(act, n: int):
+    """The first n rows of a q_lora operand: a tensor, or the gfx950 fp8-grid form the
+    indexer's wq_b takes (row-major, scales included), which refuses plain slicing."""
+    if isinstance(act, torch.Tensor):
+        return act[:n]
+    if isinstance(act, Fp8GridActivation):
+        return Fp8GridActivation(act.x[:n])
+    if isinstance(act, Mxfp8Activation):
+        return Mxfp8Activation(act.q[:n], act.scale[:n])
+    raise TypeError(f"cannot take rows of {type(act).__name__}")
 
 
 # OPUS prefill applies from this many query rows; below it the decode kernel splits KV
@@ -851,7 +876,7 @@ class DeepseekV4HipRadixBackend(
     # the ratio-1/2 compressor and indexer orchestration is the CUDA backend's, taken
     # unbound; HIP differs only in the paged top-k (_low_ratio_index_topk below)
     forward_low_ratio_sources = DeepseekV4AttnBackend.forward_low_ratio_sources
-    _forward_low_ratio_sources_cp = DeepseekV4AttnBackend._forward_low_ratio_sources_cp
+    _late_layer_tail_cp_layout = DeepseekV4AttnBackend._late_layer_tail_cp_layout
     low_ratio_prefill_graph = DeepseekV4AttnBackend.low_ratio_prefill_graph
     _low_ratio_in_prefill_graph = DeepseekV4AttnBackend._low_ratio_in_prefill_graph
     _low_ratio_compress = DeepseekV4AttnBackend._low_ratio_compress
@@ -1089,13 +1114,23 @@ class DeepseekV4HipRadixBackend(
         # token map skip an implicit D2H.
         exact_num_tokens: bool = True,
         forward_batch: Optional[ForwardBatch] = None,
+        # the late-layer tail passes its own layout; the full extend reads the batch's
+        cp_metadata: Optional[InterleaveContextParallelMetadata] = None,
     ) -> DSV4Metadata:
         padded_num_tokens = out_cache_loc.shape[0]
         cp_active = forward_batch is not None and is_cp_active(forward_batch)
         if cp_active:
-            cp_metadata = forward_batch.attn_cp_metadata
+            if cp_metadata is None:
+                cp_metadata = forward_batch.attn_cp_metadata
             assert cp_metadata is not None
             padded_num_tokens = sum(cp_metadata.per_rank_actual_token)
+            if (
+                swa_replay_start is not None
+                and swa_replay_start.shape[0] < padded_num_tokens
+            ):
+                swa_replay_start = F.pad(
+                    swa_replay_start, (0, padded_num_tokens - swa_replay_start.shape[0])
+                )
 
         from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
             ExpandPrefillCausally,
@@ -1147,7 +1182,9 @@ class DeepseekV4HipRadixBackend(
             exact_num_tokens=exact_num_tokens or host_proves_exact_num_tokens,
         )
         if cp_active:
-            core_attn_metadata.apply_cp_reindex(num_tokens=num_tokens)
+            core_attn_metadata.apply_cp_reindex(
+                num_tokens=num_tokens, local_index=cp_metadata.local_index
+            )
             if need_compress:
                 core_attn_metadata.init_flashmla_related()
         if attach_decode_streams:
@@ -2103,6 +2140,13 @@ class DeepseekV4HipRadixBackend(
         )
         tail_lens = torch.tensor(tail_lens_cpu, dtype=torch.int32, device=device)
         num_tokens = sum(tail_lens_cpu)
+        # prefill CP: every rank runs the tail rows it already holds, padded to the
+        # largest share; the tail's compact metadata is sliced by its own local_index
+        cp_tail = (
+            self._late_layer_tail_cp_layout(forward_batch, token_indices, tail_lens)
+            if is_cp_active(forward_batch)
+            else None
+        )
         metadata = self.init_forward_metadata_prefill(
             max_seq_len=int(seq_lens_cpu.max().item()),
             req_pool_indices=forward_batch.req_pool_indices,
@@ -2114,6 +2158,8 @@ class DeepseekV4HipRadixBackend(
             extend_seq_lens_cpu=tail_lens_cpu,
             extend_start_loc=torch.cumsum(tail_lens, dim=0) - tail_lens,
             swa_replay_start=swa_replay_start,
+            forward_batch=forward_batch if cp_tail is not None else None,
+            cp_metadata=cp_tail["cp_metadata"] if cp_tail is not None else None,
         )
         request_layout = metadata.core_attn_metadata.request_window_layout
         swa_out_cache_loc = (
@@ -2135,14 +2181,30 @@ class DeepseekV4HipRadixBackend(
             contiguous_start=contiguous_start,
         )
         metadata.low_ratio_pos_i64 = positions.to(torch.int64)
-        metadata.late_layer_tail = LateLayerTail(
-            token_indices=token_indices,
-            positions=positions,
-            extend_seq_lens=tail_lens,
-            extend_seq_lens_cpu=tail_lens_cpu,
-            swa_out_cache_loc=swa_out_cache_loc,
-            contiguous_start=contiguous_start,
-        )
+        if cp_tail is None:
+            metadata.late_layer_tail = LateLayerTail(
+                token_indices=token_indices,
+                positions=positions,
+                extend_seq_lens=tail_lens,
+                extend_seq_lens_cpu=tail_lens_cpu,
+                swa_out_cache_loc=swa_out_cache_loc,
+                contiguous_start=contiguous_start,
+            )
+        else:
+            # rows index this rank's shard; the SWA store and the compressor read
+            # the gathered tail, so they keep the global rows
+            metadata.late_layer_tail = LateLayerTail(
+                token_indices=cp_tail["local_token_indices"],
+                positions=cp_tail["local_positions"],
+                extend_seq_lens=tail_lens,
+                extend_seq_lens_cpu=tail_lens_cpu,
+                swa_out_cache_loc=swa_out_cache_loc,
+                pad_rows=cp_tail["pad_rows"],
+                cp_metadata=cp_tail["cp_metadata"],
+                local_lens_cpu=cp_tail["local_lens_cpu"],
+                req_global=metadata.low_ratio_req_indices,
+                pos_global=metadata.low_ratio_pos_i64,
+            )
         self._refresh_fp4_prefill_workspace(forward_batch, metadata)
         return metadata
 
@@ -2151,9 +2213,20 @@ class DeepseekV4HipRadixBackend(
         return value. Each request's candidate mask is cut to its tail rows."""
         tail_metadata = self.tail_forward_metadata
         assert tail_metadata is not None, "no tail metadata for this forward"
-        saved = (self.forward_metadata, self.candidate_masks)
+        saved = (
+            self.forward_metadata,
+            self.candidate_masks,
+            forward_batch.attn_cp_metadata,
+            get_local_dp_buffer_len(),
+        )
         tail = tail_metadata.late_layer_tail
-        tail_lens_cpu = tail.extend_seq_lens_cpu
+        # A request's tail is a suffix of its extend, so under CP the tail rows a
+        # rank holds are the suffix of that request's local rows.
+        tail_lens_cpu = (
+            tail.local_lens_cpu
+            if tail.cp_metadata is not None
+            else tail.extend_seq_lens_cpu
+        )
         if isinstance(self.candidate_masks, list) and self.candidate_masks:
             # the last tail_len rows of each request's candidate publication
             self.candidate_masks = [
@@ -2198,10 +2271,19 @@ class DeepseekV4HipRadixBackend(
         window = self.token_to_kv_pool.request_window
         if window is not None:
             window.activate(tail_core.request_window_layout)
+        if tail.cp_metadata is not None:
+            forward_batch.attn_cp_metadata = tail.cp_metadata
+            set_local_dp_buffer_len(sum(tail.cp_metadata.per_rank_actual_token))
         return saved
 
     def exit_late_layer_tail(self, saved: tuple, forward_batch: ForwardBatch) -> None:
-        self.forward_metadata, self.candidate_masks = saved
+        (
+            self.forward_metadata,
+            self.candidate_masks,
+            forward_batch.attn_cp_metadata,
+            local_dp_buffer_len,
+        ) = saved
+        set_local_dp_buffer_len(local_dp_buffer_len)
         window = self.token_to_kv_pool.request_window
         if window is not None:
             window.activate(
@@ -3237,16 +3319,66 @@ class DeepseekV4HipRadixBackend(
                     "SGLANG_DSV41_TORCH_PREFILL_INDEXER (the torch prefill indexer "
                     "oracle) is not supported on HIP"
                 )
-            # HIP rejects V4.1 prefill CP, the only caller passing rows_per_request
-            assert rows_per_request is None, "V4.1 prefill CP is not supported on HIP"
             assert (
                 forward_batch.seq_lens_cpu is not None
                 and forward_batch.extend_seq_lens_cpu is not None
             ), "the HIP low-ratio prefill indexer needs the batch's CPU lengths"
-            low_ratio_index_topk_hip_extend(self, layer, x, q_lora, pos, forward_batch)
+            low_ratio_index_topk_hip_extend(
+                self,
+                layer,
+                x,
+                q_lora,
+                pos,
+                forward_batch,
+                rows_per_request=rows_per_request,
+            )
         else:
             raise NotImplementedError(
                 f"low-ratio indexer for {forward_batch.forward_mode} on HIP"
+            )
+
+    def _forward_low_ratio_sources_cp(
+        self, *, layer, x, q_lora, positions, forward_batch, run_compressor, run_indexer
+    ) -> None:
+        """Every rank writes the whole prompt's compressed state and scores only its own
+        rows, which are request-major like the extend's (interleave keeps the order)."""
+        cp_meta = forward_batch.attn_cp_metadata
+        total = int(cp_meta.total_seq_lens)
+        tail = self.forward_metadata.late_layer_tail
+        if tail is not None:
+            q_lens_cpu = tail.local_lens_cpu
+            req_global, pos_global = tail.req_global, tail.pos_global
+        else:
+            q_lens_cpu = interleave_rows_per_request(
+                _as_int_list(forward_batch.extend_seq_lens_cpu),
+                get_parallel().attn_cp_rank,
+                get_parallel().attn_cp_size,
+            )
+            req_global = token_req_indices(forward_batch, num_tokens=total)
+            pos_global = forward_batch.positions[:total].to(torch.int64)
+        num_local = sum(q_lens_cpu)
+        q_lora = _first_rows(q_lora, num_local)
+        if run_compressor and layer.compressor is not None:
+            x_global = cp_materialize_global_token_order(
+                x.contiguous(), forward_batch, torch.cuda.current_stream()
+            )[:total]
+            if tail is None:
+                # x_global is the extend itself, so the fused prefill store of the
+                # non-CP path applies with the batch's own extend offsets
+                self._low_ratio_compress(
+                    layer, x_global, req_global, pos_global, forward_batch
+                )
+            else:
+                self._low_ratio_compress_torch(layer, x_global, req_global, pos_global)
+        if run_indexer and layer.indexer is not None:
+            self._low_ratio_index_topk(
+                layer,
+                x[:num_local],
+                q_lora,
+                None,
+                positions[:num_local].to(torch.int64),
+                forward_batch,
+                rows_per_request=q_lens_cpu,
             )
 
     def expand_extend_with_same_length(

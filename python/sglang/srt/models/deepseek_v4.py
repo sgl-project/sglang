@@ -4391,7 +4391,10 @@ class DeepseekV4Model(nn.Module):
             )
         hidden_states = self.norm(hidden_states)
 
-        if tail is not None and not capture_dspark:
+        # HIP prefill CP: the runner gathers every output, DSpark captures included,
+        # by this rank's full shard layout, so the tail rows go back into it.
+        hip_cp_tail = _is_hip and tail is not None and is_cp_active(forward_batch)
+        if tail is not None and (not capture_dspark or hip_cp_tail):
             # The logits processor indexes rows by the full extend layout.
             num_tokens = input_ids.shape[0]
             hidden_states = _scatter_tail_rows(
@@ -4400,6 +4403,11 @@ class DeepseekV4Model(nn.Module):
             pre_hc_head = _scatter_tail_rows(
                 tail=tail, rows=pre_hc_head, num_tokens=num_tokens
             )
+        if hip_cp_tail and capture_dspark:
+            dspark_aux_hidden_states = [
+                _scatter_tail_rows(tail=tail, rows=aux, num_tokens=input_ids.shape[0])
+                for aux in dspark_aux_hidden_states
+            ]
 
         if capture_dspark:
             return (hidden_states, pre_hc_head), dspark_aux_hidden_states
