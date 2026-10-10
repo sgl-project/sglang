@@ -4,6 +4,7 @@ memory budget), the paged pool, or the published blocks of a sparse table."""
 
 from __future__ import annotations
 
+from functools import cache
 from typing import Iterator, Tuple
 
 import torch
@@ -15,6 +16,17 @@ from sglang.srt.layers.attention.mqa_logits_utils import (
 from sglang.srt.utils.common import ceil_align
 
 from .candidate_table import CANDIDATE_BLOCK_SIZE
+
+
+@cache
+def _uses_upstream_mqa_api() -> bool:
+    # Upstream replaced clean_logits with max_seqlen_k/schedule_meta.
+    # Probe the binding's signature rather than a distribution version:
+    # sgl-deep-gemm and deep_gemm install the same Python module name.
+    from deep_gemm import fp8_fp4_mqa_logits
+
+    signature = fp8_fp4_mqa_logits.__doc__ or ""
+    return "max_seqlen_k" in signature and "clean_logits" not in signature
 
 
 def flat_index_logits_rows_per_tile(
@@ -68,8 +80,7 @@ def flat_index_logits_tiles(
                 weights[tile],
                 tile_starts,
                 tile_starts + lengths[tile],
-                False,
-                width,
+                *((width,) if _uses_upstream_mqa_api() else (False, width)),
             ),
         )
 
@@ -97,7 +108,7 @@ def deep_gemm_fp4_paged_mqa_logits(
         page_table,
         deep_gemm_metadata,
         max_seq_len,
-        False,
+        *(() if _uses_upstream_mqa_api() else (False,)),
     )
 
 

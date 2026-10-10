@@ -342,16 +342,92 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
         self.assertIs(mega_call.args[2], experts.mega_l2_weights)
         self.assertEqual(mega_call.kwargs.get("activation_clamp"), 7.0)
 
-    def test_shape_check_rejects_unaligned_intermediate(self):
-        # Qwen3-30B-A3B: intermediate 768 leaves a 24-byte scale row.
-        with self.assertRaisesRegex(ValueError, "multiples of 512"):
-            mega_moe.check_mega_moe_shapes(2048, 768, "fp8xfp4")
-        mega_moe.check_mega_moe_shapes(4096, 1536, "fp8xfp4")
-        mega_moe.check_mega_moe_shapes(4096, 1024, "mxf4xmxf4")
-        # 768 is a multiple of 256, so the NVFP4 (g16) rule accepts it.
-        mega_moe.check_mega_moe_shapes(2048, 768, "nvfp4xnvfp4")
-        with self.assertRaisesRegex(ValueError, "multiples of 256"):
-            mega_moe.check_mega_moe_shapes(2048, 384, "nvfp4xnvfp4")
+    def test_locality_scheduler_uses_full_sms_and_restores_outer_budget(self):
+        deep_gemm = self.deep_gemm
+        deep_gemm.locality_domain = object()
+        deep_gemm.num_sms = 96
+        with patch.object(
+            torch.cuda,
+            "get_device_properties",
+            return_value=SimpleNamespace(multi_processor_count=148),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "kernel failed"):
+                with mega_moe._configure_mega_moe_deep_gemm_num_sms(deep_gemm):
+                    self.assertEqual(deep_gemm.num_sms, 148)
+                    raise RuntimeError("kernel failed")
+        self.assertEqual(deep_gemm.num_sms, 96)
+        self.assertEqual(deep_gemm.set_num_sms.call_args_list, [call(148), call(96)])
+
+    def test_shared_dispatch_accepts_upstream_positional_only_block_m(self):
+        # Upstream #462's pybind11 binding does not name its arguments.
+        def get_block_m(ranks, experts, capacity, tokens, topk, mma_type, /):
+            return 32
+
+        self.deep_gemm.get_block_m_for_mega_moe = MagicMock(side_effect=get_block_m)
+        self.deep_gemm.fp8_fp4_mega_moe = MagicMock()
+        buf = SimpleNamespace(
+            group=SimpleNamespace(size=lambda: 4),
+            num_experts=8,
+            num_max_tokens_per_rank=64,
+            num_topk=2,
+            mma_type="fp8xfp4",
+            x=object(),
+            x_sf=object(),
+            topk_idx=object(),
+            topk_weights=object(),
+            shared_l1_acts_sf=object(),
+        )
+        experts = SimpleNamespace(
+            num_experts=8,
+            _mega_moe_nvfp4=False,
+            _mega_moe_w4a4=False,
+            mega_l1_weights=object(),
+            mega_l2_weights=object(),
+        )
+        with (
+            patch.dict(sys.modules, {"deep_gemm": self.deep_gemm}),
+            patch.object(mega_moe, "_device_sm", 100),
+            patch.object(mega_moe, "_get_mega_moe_symm_buffer", return_value=buf),
+            patch.object(mega_moe, "mega_moe_pre_dispatch") as pre_dispatch,
+            patch.object(
+                mega_moe,
+                "_configure_mega_moe_deep_gemm_num_sms",
+                return_value=nullcontext(),
+            ),
+            patch(
+                "sglang.srt.runtime_context.get_parallel",
+                return_value=SimpleNamespace(
+                    moe_ep_group=SimpleNamespace(device_group=object())
+                ),
+            ),
+        ):
+            mega_moe.run_mega_routed_experts(
+                experts,
+                torch.zeros(3, 4, dtype=torch.bfloat16),
+                torch.zeros(3, 2, dtype=torch.int32),
+                torch.ones(3, 2, dtype=torch.float32),
+                hidden_size=4,
+                intermediate_size=8,
+                top_k=2,
+                num_tokens=3,
+                num_shared_experts=1,
+                shared_l1_weights=object(),
+                shared_l2_weights=object(),
+            )
+        self.deep_gemm.get_block_m_for_mega_moe.assert_called_once_with(
+            4, 8, 64, 3, 2, "fp8xfp4"
+        )
+        self.assertEqual(pre_dispatch.call_args.kwargs["shared_block_m"], 32)
+
+    def test_shape_check_uses_cluster_column_alignment(self):
+        for mma_type in ("fp8xfp4", "mxf4xmxf4", "nvfp4xnvfp4"):
+            with self.subTest(mma_type=mma_type):
+                mega_moe.check_mega_moe_shapes(2304, 1536, mma_type)
+                mega_moe.check_mega_moe_shapes(2048, 768, mma_type)
+                with self.assertRaisesRegex(ValueError, "multiples of 256 and 128"):
+                    mega_moe.check_mega_moe_shapes(2305, 1536, mma_type)
+                with self.assertRaisesRegex(ValueError, "multiples of 256 and 128"):
+                    mega_moe.check_mega_moe_shapes(2304, 1537, mma_type)
 
     def test_mxf4_l1_uses_packed_gate_up_interleave(self):
         source = torch.arange(32).reshape(1, 32)
