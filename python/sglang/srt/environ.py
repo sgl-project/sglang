@@ -1185,7 +1185,6 @@ class Envs:
     # the batch fits the chunk budget.
     SGLANG_TRITON_DENSE_PREFILL_ATTN = EnvBool(True)
     SGLANG_ENABLE_TORCH_COMPILE = EnvBool(False)
-    SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE = EnvInt(4096)
     SGLANG_TRITON_DECODE_SPLIT_TILE_SIZE = EnvInt(256)
 
     # ===================================================================
@@ -1516,6 +1515,11 @@ class Envs:
     # Think tokens budget: negative means unlimited, >= 0 caps thinking tokens
     SGLANG_MAX_THINK_TOKENS = EnvInt(-1)
     SGLANG_PATCH_TOKENIZER = EnvBool(True)
+    # Encode long rendered chat prompts as chunks on the tokenizers thread pool.
+    SGLANG_PARALLEL_PROMPT_ENCODE = EnvBool(True)
+    # Shorter prompts use the single-call encode; below this the gain is eaten
+    # by rayon dispatch and the id merge.
+    SGLANG_PARALLEL_PROMPT_ENCODE_MIN_CHARS = EnvInt(32768)
     SGLANG_REQUEST_STATE_WAIT_TIMEOUT = EnvInt(4)
     SGLANG_DEFAULT_THINKING = EnvBool(False)
 
@@ -1989,6 +1993,9 @@ _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
     "SGLANG_ENABLE_HICACHE_BUFFER_ANCHOR_LOCK": _DeprecatedEnv(
         note="Buffer-mode anchor pinning is always on; set "
         "SGLANG_HICACHE_BUFFER_ANCHOR_LOCK_CAP=0 to disable it."
+    ),
+    "SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE": _DeprecatedEnv(
+        note="Deterministic inference on triton no longer aligns prefill chunks."
     ),
     # Replaced by CLI flags.
     "SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE": _DeprecatedEnv(
