@@ -22,6 +22,20 @@ struct KeyNamespaceData {
     hash: u64,
 }
 
+/// An owned copy of a tensor's data. `Tensor::copy` zero-fills before it
+/// copies; this skips the fill, which is a kernel launch on device tensors.
+pub(crate) trait OwnedCopy {
+    fn owned_copy(&self) -> Tensor;
+}
+
+impl OwnedCopy for Tensor {
+    fn owned_copy(&self) -> Tensor {
+        let mut copy = self.empty_like();
+        copy.copy_(self);
+        copy
+    }
+}
+
 /// Compact, shared namespace stored on nodes and child edges.
 ///
 /// The default namespace is represented without an allocation. Non-default
@@ -601,8 +615,8 @@ impl<K: ChildKeyType> Node<K> {
             0 < split_len && split_len < len,
             "redistribute_child_value: split_len {split_len} out of range (0, {len}) on node {child_node_id}"
         );
-        let head = value.narrow(0, 0, split_len).copy();
-        let tail = value.narrow(0, split_len, len - split_len).copy();
+        let head = value.narrow(0, 0, split_len).owned_copy();
+        let tail = value.narrow(0, split_len, len - split_len).owned_copy();
         child_node.set_value_(slot, tail);
         parent_node.set_value_(slot, head);
     }

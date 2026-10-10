@@ -17,6 +17,7 @@ use crate::components::{
 use crate::node::Node;
 use crate::node::NodeArena;
 use crate::node::NodeSet;
+use crate::node::OwnedCopy;
 use crate::node::{ChildKeyType, HashDigest, KeyNamespace, KeyNamespaceRef};
 use crate::node::{
     NUM_VALUE_SLOTS, NodeAccessError, NodeId, NodeIdx_, TreeCoreRuntimeError, ValueSlotIdx,
@@ -1490,6 +1491,25 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         Ok(Tensor::cat(&prefix_chunks, 0))
     }
 
+    /// Length of what `collect_full_device_indices` would return, without
+    /// concatenating the values.
+    pub fn full_device_path_len(
+        &self,
+        from_node_id: NodeId,
+        until_node_id: NodeId,
+    ) -> Result<usize, NodeAccessError> {
+        let from_node_id = self.arena.resolve(from_node_id)?;
+        let until_node_id = self.arena.resolve(until_node_id)?;
+        let mut len = 0;
+        let mut node_id = from_node_id;
+        while node_id != until_node_id {
+            let node = self.arena.node(node_id);
+            len += node.device_value_len(FULL);
+            node_id = node.parent();
+        }
+        Ok(len)
+    }
+
     /// Refresh a node's access tick and component LRU positions.
     pub fn touch_node_(&mut self, node_id: NodeIdx_) {
         let tick = self.arena.get_and_bump_access_counter();
@@ -1827,7 +1847,6 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 );
             }
         } else {
-            let value_slice = state.value.narrow(0, cursor as i64, prefix_len as i64);
             let mut consumed_from = prefix_len;
             // Let each component claim ownership of overlapping KV slots.
             for i in 0..self.components.len() {
@@ -1837,7 +1856,6 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                     node_id,
                     prefix_len,
                     cursor,
-                    value_slice.shallow_clone(),
                     &params,
                     state
                         .result
@@ -1850,6 +1868,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
 
             let dup_start = state.prev_prefix_len.saturating_sub(cursor);
             if dup_start < consumed_from {
+                // Sliced only here: most walk steps neither free nor recover.
+                let value_slice = state.value.narrow(0, cursor as i64, prefix_len as i64);
                 // The duplicate slice may straddle this request's own eviction
                 // floor; below it only the full side is still ours to release.
                 let dup_len = consumed_from - dup_start;
@@ -2195,7 +2215,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             key, parent_id, priority, /* hit_count = */ 0, /* creation_counter = */ None,
             namespace,
         );
-        self.arena.set_device_value(new_node_id, FULL, value.copy());
+        self.arena
+            .set_device_value(new_node_id, FULL, value.owned_copy());
         self.set_tlru_lens_and_raise_history_(new_node_id, parent_id);
         let displaced = self
             .arena
@@ -2225,7 +2246,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         session_id: Option<&str>,
     ) {
         self.arena
-            .set_device_value(node_id, FULL, fresh_value.copy());
+            .set_device_value(node_id, FULL, fresh_value.owned_copy());
         let tokens = fresh_value.size()[0] as usize;
         // A value materialized under lock is protected; the last release
         // moves it to evictable.
@@ -3492,7 +3513,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                     FULL,
                     host_value
                         .narrow(0, matched_start as i64, prefix_len as i64)
-                        .copy(),
+                        .owned_copy(),
                 );
                 if self.arena.node(node_id).hash_value.is_none() {
                     let first_page = matched_start / self.page_size;
@@ -3569,7 +3590,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                     matched_length as i64,
                     (total_len - matched_length) as i64,
                 )
-                .copy(),
+                .owned_copy(),
         );
         let child_map_key = self.arena.node(new_node_id).key.child_key(self.page_size);
         let displaced = self
@@ -4515,7 +4536,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                     (seg_start - window_start) as i64,
                     (seg_end - seg_start) as i64,
                 )
-                .copy();
+                .owned_copy();
             self.set_component_device_value_(target, SWA, values);
         }
         Ok(actions)

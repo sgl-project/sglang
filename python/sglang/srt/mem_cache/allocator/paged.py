@@ -354,10 +354,16 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 torch.unique(free_index.cpu() // ps),
             )
 
-        self.free_page_ids(reps // ps)
+        # The division makes a fresh tensor, so a free group can hold it as is.
+        self._free_owned_page_ids(reps // ps)
 
     def free_page_ids(self, page_ids: torch.Tensor):
         """Free exactly these pages; no page twice, no dedup."""
+        if self.free_group is not None:
+            page_ids = self._copy_for_free_group(page_ids)
+        self._free_owned_page_ids(page_ids)
+
+    def _free_owned_page_ids(self, page_ids: torch.Tensor):
         if page_ids.numel() == 0:
             return
 
@@ -366,7 +372,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             if self.debug_mode:
                 self._debug_check_no_duplicate_pages()
         else:
-            self.free_page_ids_group.append(self._copy_for_free_group(page_ids))
+            self.free_page_ids_group.append(page_ids)
 
     def _debug_check_no_duplicate_pages(self):
         pages = self.get_all_free_pages()

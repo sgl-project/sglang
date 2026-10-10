@@ -478,6 +478,11 @@ class UnifiedTreeCoreInterface(ABC):
         ...
 
     @abstractmethod
+    def full_device_path_len(self, from_node_id: NodeId, until_node_id: NodeId) -> int:
+        """``len(collect_full_device_indices(...))`` without concatenating."""
+        ...
+
+    @abstractmethod
     def begin_insert(self, params: InsertParams) -> InsertStepResult:
         """Start the (single-flight) insert, running to its first barrier or completion."""
         ...

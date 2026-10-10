@@ -1573,6 +1573,20 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         tensor_to_py(py, value)
     }
 
+    /// Length of collect_full_device_indices(from_node, until_node).
+    fn full_device_path_len(
+        &self,
+        py: Python<'_>,
+        from_node_id: NodeId,
+        until_node_id: NodeId,
+    ) -> PyResult<usize> {
+        py.detach(|| {
+            self.core()
+                .full_device_path_len(from_node_id, until_node_id)
+        })
+        .map_err(node_access_error)
+    }
+
     /// Every FULL device value in the tree, concatenated.
     fn all_values_flatten(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let value = py.detach(|| self.core().all_values_flatten());
@@ -2987,6 +3001,19 @@ macro_rules! tree_core_binding {
                 catch_native_panic(|| {
                     self.inner
                         .collect_full_device_indices(py, from_node_id, until_node_id)
+                })
+            }
+
+            /// Length of collect_full_device_indices(from_node, until_node).
+            fn full_device_path_len(
+                &self,
+                py: Python<'_>,
+                from_node_id: NodeId,
+                until_node_id: NodeId,
+            ) -> PyResult<usize> {
+                catch_native_panic(|| {
+                    self.inner
+                        .full_device_path_len(py, from_node_id, until_node_id)
                 })
             }
 

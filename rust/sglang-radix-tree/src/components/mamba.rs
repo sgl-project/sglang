@@ -10,6 +10,7 @@ use crate::components::TreeComponent;
 use crate::components::{ComponentType, FULL, MAMBA};
 use crate::node::ChildKeyType;
 use crate::node::Node;
+use crate::node::OwnedCopy;
 use crate::node::{NodeId, NodeIdx_, TreeCoreRuntimeError, ValueSlotIdx};
 use crate::unified_tree_core::{
     CacheAction, CacheInitParams, CacheTransferPhase, DecLockRefParams, EvictLayer,
@@ -615,7 +616,7 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
                 {
                     let node = tree_core.arena.node_mut(node_id);
                     if !node.has_host_value(MAMBA) {
-                        node.set_host_value(MAMBA, host_indices.copy());
+                        node.set_host_value(MAMBA, host_indices.owned_copy());
                     }
                 }
             }
@@ -626,7 +627,11 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
                 if let Some(device_indices) = &transfer.device_indices {
                     // The materialization primitive owns the ledger/LRU moves,
                     // including crediting protected when restored under lock.
-                    tree_core.set_component_device_value_(node_id, MAMBA, device_indices.copy());
+                    tree_core.set_component_device_value_(
+                        node_id,
+                        MAMBA,
+                        device_indices.owned_copy(),
+                    );
                 }
             }
             // The python elif chain has no BACKUP_STORAGE arm.
@@ -678,7 +683,7 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
                 let host_indices = host_indices.expect("an attach target implies host indices");
                 tree_core
                     .arena
-                    .set_host_value(target, MAMBA, host_indices.copy());
+                    .set_host_value(target, MAMBA, host_indices.owned_copy());
                 if !tree_core.arena.has_device_value(target, MAMBA) {
                     let host_lru = tree_core.host_lru_list_mut(MAMBA);
                     if !host_lru.in_list(Some(target)) {

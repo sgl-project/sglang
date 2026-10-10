@@ -73,7 +73,10 @@ def _tree_core(**params_overrides) -> RustUnifiedTreeCore:
 
 
 def _path_indices(core: RustUnifiedTreeCore, node_id) -> torch.Tensor:
-    return core.collect_full_device_indices(node_id, core.root_node_handle(None))
+    root = core.root_node_handle(None)
+    indices = core.collect_full_device_indices(node_id, root)
+    assert core.full_device_path_len(node_id, root) == len(indices)
+    return indices
 
 
 def _key(token_ids: list[int]) -> RadixKey:
@@ -764,6 +767,12 @@ def test_stale_handle_operations_raise_key_error_without_poisoning_the_core():
             stale_root, live_root
         ),
         "collect_full_device_indices/until": lambda: core.collect_full_device_indices(
+            live_root, stale_root
+        ),
+        "full_device_path_len/from": lambda: core.full_device_path_len(
+            stale_root, live_root
+        ),
+        "full_device_path_len/until": lambda: core.full_device_path_len(
             live_root, stale_root
         ),
         "insert_host": lambda: core.insert_host(
