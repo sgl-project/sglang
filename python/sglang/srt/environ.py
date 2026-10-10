@@ -1071,6 +1071,11 @@ class Envs:
     # kernels/ops/gemm/configs/ (currently L40S), so it is a no-op on
     # any other GPU / untuned shape even when enabled.
     SGLANG_ENABLE_FP8_GEMM_CONFIG_TUNE = EnvBool(True)
+    # SM120: block-FP8 (32x32, UE8M0) linears served as MXFP8 (needs
+    # --fp8-gemm-backend flashinfer_cutlass or flashinfer_cutedsl) run their
+    # tuned decode shapes at up to 16 rows on a split-K Triton GEMM instead of
+    # FlashInfer. Set 0 to keep every row count on FlashInfer.
+    SGLANG_ENABLE_SM120_MXFP8_SKINNY_GEMM = EnvBool(True)
 
     # ===================================================================
     # Humming quantization
