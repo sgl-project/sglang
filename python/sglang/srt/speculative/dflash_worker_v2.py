@@ -660,16 +660,10 @@ class DFlashWorkerV2(BaseSpecWorker):
                     "device graph capture.",
                     type(current_platform).__name__,
                 )
-            if get_parallel().attn_dp_enabled and capture_decode_cuda_graph:
-                # Idle DP ranks skip the draft step, so they cannot join a
-                # shared graph capture/replay; keep the draft eager under dp
-                # attention.
-                capture_decode_cuda_graph = False
-                if self._target_tp_rank == 0:
-                    logger.warning(
-                        "Disable DFLASH draft cuda graph because dp attention "
-                        "is enabled (draft runs eager)."
-                    )
+            # Under DP attention each active rank drafts independently inside
+            # its attention-TP group. DecodeCudaGraphRunner classifies this
+            # draft forward as DP-local, so idle peer DP ranks do not need to
+            # participate in either capture or replay.
             if is_cuda() and capture_decode_cuda_graph:
                 available_mem = self._tp_sync.available_memory_gb(
                     SpecTpSyncSite.DFLASH_MEM,
@@ -1315,23 +1309,50 @@ class DFlashWorkerV2(BaseSpecWorker):
         if not get_parallel().attn_dp_enabled:
             return
 
-        tp_group = get_parallel().tp_group
-        tp_size = int(tp_group.world_size)
-        if tp_size <= 1:
-            return
-
         target_model = self._target_worker.model_runner.model
         embed_module = target_model.get_input_embeddings()
         local_w = embed_module.weight.data
         shard = getattr(embed_module, "shard_indices", None)
-        num_org = int(shard.num_org_elements) if shard else local_w.shape[0]
         vocab_size = int(self._target_worker.model_runner.model_config.vocab_size)
+        embedding_tp_size = int(getattr(embed_module, "tp_size", 1))
+        parts = [local_w]
+        if embedding_tp_size > 1:
+            tp_group = (
+                get_parallel().attn_tp_group
+                if embed_module.use_attn_tp_group
+                else get_parallel().tp_group
+            )
+            if int(tp_group.world_size) != embedding_tp_size:
+                raise ValueError(
+                    "DFLASH embedding TP size does not match its TP group."
+                )
+            # Gather equal-sized padded shards. The final rank can own fewer
+            # real vocabulary rows, so gathering num_org_elements is unsafe.
+            shard_t = local_w.contiguous()
+            parts = [torch.empty_like(shard_t) for _ in range(embedding_tp_size)]
+            dist.all_gather(parts, shard_t, group=tp_group.device_group)
 
-        shard_t = local_w[:num_org].contiguous()
-        parts = [torch.empty_like(shard_t) for _ in range(tp_size)]
-        dist.all_gather(parts, shard_t, group=tp_group.device_group)
-        self._full_embed_gpu = torch.cat(parts, dim=0)[:vocab_size]
-        if get_parallel().tp_rank == 0:
+        if shard is None:
+            self._full_embed_gpu = local_w[:vocab_size]
+        else:
+            num_org_padded = int(shard.num_org_elements_padded)
+            org_vocab_size = int(embed_module.org_vocab_size)
+            base_parts = [part[:num_org_padded] for part in parts]
+            base = (
+                base_parts[0] if len(base_parts) == 1 else torch.cat(base_parts, dim=0)
+            )[:org_vocab_size]
+            if embed_module.num_added_embeddings:
+                num_added_padded = int(shard.num_added_elements_padded)
+                added = torch.cat(
+                    [
+                        part[num_org_padded : num_org_padded + num_added_padded]
+                        for part in parts
+                    ],
+                    dim=0,
+                )[: int(embed_module.num_added_embeddings)]
+                base = torch.cat((base, added), dim=0)
+            self._full_embed_gpu = base[:vocab_size]
+        if self._target_tp_rank == 0:
             logger.info(
                 "DFLASH cached full embed on GPU for dp attention: shape=%s",
                 list(self._full_embed_gpu.shape),
@@ -2294,13 +2315,20 @@ class DFlashWorkerV2(BaseSpecWorker):
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
 
-            # An idle DP rank runs the empty target prefill above to stay in
-            # the DP collective, but must skip the draft KV materialization,
-            # which needs per-request extend info.
-            if batch.forward_mode.is_idle():
-                batch_output.next_draft_input = DFlashDraftInputV2.create_idle_input(
-                    device=self.device
-                )
+            # The global extend flag can also bring local IDLE/DECODE ranks
+            # here. They participate in the target forward, but have no prompt
+            # tokens to materialize into the draft KV cache.
+            if not batch.forward_mode.is_extend():
+                logits_output.hidden_states = None
+                if batch.forward_mode.is_idle():
+                    batch_output.next_draft_input = (
+                        DFlashDraftInputV2.create_idle_input(device=self.device)
+                    )
+                else:
+                    batch_output.next_draft_input = self._make_next_draft_input_prefill(
+                        bonus_tokens=next_token_ids,
+                        seq_lens=new_seq_lens,
+                    )
                 return batch_output
 
             if logits_output.hidden_states is None:
