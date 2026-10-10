@@ -105,7 +105,11 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.mem_cache.deepseek_v4_compress_state import KVAndScore
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+)
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
@@ -936,6 +940,24 @@ def _tail_rows(
     return t[token_indices]
 
 
+def late_layer_tail_lens(forward_batch: ForwardBatch) -> List[int]:
+    """Per-request tail under decoder SWA bounded replay: the last SWA_WINDOW extend
+    tokens, or the whole extend when earlier rows are read as hidden states or
+    prompt logprobs."""
+    extend_lens = forward_batch.extend_seq_lens_cpu
+    spec = forward_batch.spec_algorithm
+    if forward_batch.capture_hidden_mode == CaptureHiddenMode.FULL and not (
+        spec is not None and spec.is_dspark()
+    ):
+        return list(extend_lens)
+    if not forward_batch.return_logprob:
+        return [SWA_WINDOW] * len(extend_lens)
+    return [
+        n if start < n - SWA_WINDOW else SWA_WINDOW
+        for start, n in zip(forward_batch.extend_logprob_start_lens_cpu, extend_lens)
+    ]
+
+
 # Rows per logits chunk for the ratio-1/2 indexer inside the prefill CUDA graph;
 # its width is the graph's max_seq_len, and longer contexts replay eagerly.
 _PREFILL_GRAPH_INDEXER_ROW_CHUNK = 2048
@@ -1538,7 +1560,7 @@ class DeepseekV4AttnBackend(
     def _build_late_layer_tail_metadata(
         self, forward_batch: ForwardBatch
     ) -> DSV4Metadata:
-        # Each request contributes only its last SWA_WINDOW extend tokens, with the
+        # Each request contributes only its tail (late_layer_tail_lens), with the
         # window floored at the tail start: window KV before it is never written here.
         extend_lens_cpu = forward_batch.extend_seq_lens_cpu
         seq_lens_cpu = forward_batch.seq_lens_cpu
@@ -1547,7 +1569,8 @@ class DeepseekV4AttnBackend(
         token_indices, tail_lens_cpu, swa_replay_start = late_layer_tail_layout(
             extend_lens_cpu=extend_lens_cpu,
             seq_lens_cpu=seq_lens_cpu.tolist(),
-            tail_len=SWA_WINDOW,
+            tail_len=late_layer_tail_lens(forward_batch),
+            window=SWA_WINDOW,
             device=device,
         )
         contiguous_start = (

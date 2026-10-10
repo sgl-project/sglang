@@ -439,20 +439,27 @@ def late_layer_tail_layout(
     *,
     extend_lens_cpu: list[int],
     seq_lens_cpu: list[int],
-    tail_len: int,
+    tail_len: list[int],
+    window: int,
     device: torch.device,
 ) -> tuple[torch.Tensor, list[int], torch.Tensor]:
-    """Tail rows of each prefill extend: its last min(tail_len, extend_len) tokens.
+    """Tail rows of each prefill extend: its last min(tail_len[i], extend_len) tokens.
     Returns (token indices into the extend, per-request tail lengths, per-row
-    absolute window floor)."""
-    tail_lens_cpu = [min(tail_len, n) for n in extend_lens_cpu]
+    absolute window floor). The last `window` rows keep the floor of a window-long
+    tail; earlier rows are floored at the tail start."""
+    tail_lens_cpu = [min(t, n) for t, n in zip(tail_len, extend_lens_cpu)]
+    last_lens_cpu = [min(window, t) for t in tail_lens_cpu]
     if len(extend_lens_cpu) == 1:
         n, t, s = extend_lens_cpu[0], tail_lens_cpu[0], seq_lens_cpu[0]
-        floor = torch.full((t,), s - t, dtype=torch.int32, device=device)
+        w = last_lens_cpu[0]
+        floor = torch.full((t,), s - w, dtype=torch.int32, device=device)
+        floor[: t - w] = s - t
         return torch.arange(n - t, n, device=device), tail_lens_cpu, floor
-    # One H2D copy for the three length vectors; launch count does not grow with bs.
-    lens = torch.tensor([extend_lens_cpu, tail_lens_cpu, seq_lens_cpu], device=device)
-    extend_lens, tail_lens, seq_lens = lens[0], lens[1], lens[2]
+    # One H2D copy for the length vectors; launch count does not grow with bs.
+    lens = torch.tensor(
+        [extend_lens_cpu, tail_lens_cpu, seq_lens_cpu, last_lens_cpu], device=device
+    )
+    extend_lens, tail_lens, seq_lens, last_lens = lens[0], lens[1], lens[2], lens[3]
     total = sum(tail_lens_cpu)
     req = torch.repeat_interleave(
         torch.arange(len(tail_lens_cpu), device=device), tail_lens, output_size=total
@@ -462,7 +469,11 @@ def late_layer_tail_layout(
         - (torch.cumsum(tail_lens, 0) - tail_lens)[req]
     )
     token_indices = (torch.cumsum(extend_lens, 0) - tail_lens)[req] + offs
-    floor = (seq_lens - tail_lens)[req].to(torch.int32)
+    floor = torch.where(
+        offs >= (tail_lens - last_lens)[req],
+        (seq_lens - last_lens)[req],
+        (seq_lens - tail_lens)[req],
+    ).to(torch.int32)
     return token_indices, tail_lens_cpu, floor
 
 
