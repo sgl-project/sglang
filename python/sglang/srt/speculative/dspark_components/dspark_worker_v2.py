@@ -648,6 +648,11 @@ class DSparkWorkerV2(BaseSpecWorker):
             capture_hidden_mode=CaptureHiddenMode.FULL,
             return_kv_loc_plan=True,
         )
+        # Draft graphs lack target block waits. Wait for the final target boundary,
+        # which covers all draft layers, before context injection or draft replay.
+        counter = self.target_worker.hicache_layer_transfer_counter
+        if counter is not None:
+            counter.wait_until(counter.num_layers - 1)
         # BCG replay skips model-side Python, so re-evaluate the same pure predicate.
         target_hidden_is_projected = (
             self._target_hidden_projection_enabled

@@ -858,13 +858,22 @@ class HybridCacheController(BaseHiCacheController):
             ):
                 raise ValueError(f"Unresolved L2 transfer for {pool_transfer.name}.")
             entry = self.mem_pool_host.entry_map[pool_transfer.name]
+            layer_mapper = entry.layer_mapper
+            if (
+                self.l2_transfer_engine.batch_direct
+                and entry.name
+                in (PoolName.DRAFT, PoolName.DRAFT_SWA, PoolName.DRAFT_INDEXER)
+                and not entry.packed_draft_device_pools
+            ):
+                # Only batched restores drain independent draft layers beyond the target.
+                layer_mapper = None
             transfers.append(
                 L2Transfer(
                     host_pool=entry.host_pool,
                     device_pool=entry.device_pool,
                     host_indices=pool_transfer.host_indices,
                     device_indices=pool_transfer.device_indices,
-                    layer_mapper=entry.layer_mapper,
+                    layer_mapper=layer_mapper,
                 )
             )
         return transfers

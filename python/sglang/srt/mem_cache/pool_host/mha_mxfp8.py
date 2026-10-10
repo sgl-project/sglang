@@ -4,8 +4,9 @@ The fp8 payload rides the regular MHA host pool; this subclass adds the
 per-page UE8M0 scale blocks, which the device pool keeps in the FA4
 interleaved layout (num_pages, head, 32, page_size // 32, sf_dim). A page's
 scales are one contiguous block, so they move as whole-page rows of
-`n_heads * page_size * sf_dim` bytes with the same staged JIT kernels the
-payload uses, just at page granularity (page_size=1 in kernel terms).
+`n_heads * page_size * sf_dim` bytes. Direct DMA uses page_first_direct
+payloads so a layer's entire page is contiguous; staged JIT kernels keep
+the token-interleaved page_first payload layout. Both share page-first scales.
 """
 
 from __future__ import annotations
@@ -52,9 +53,9 @@ class MHATokenToKVPoolMXFP8Host(MHATokenToKVPoolHost):
         mtp_draft_device_pools: Sequence = (),
         pool_label: str = "kv",
     ):
-        if layout != "page_first":
+        if layout not in ("page_first", "page_first_direct"):
             raise NotImplementedError(
-                f"MXFP8 KV host pool supports only the page_first layout, got {layout!r}."
+                f"MXFP8 KV host pool requires page_first or page_first_direct, got {layout!r}."
             )
         if mtp_draft_device_pools:
             raise NotImplementedError(
@@ -87,9 +88,12 @@ class MHATokenToKVPoolMXFP8Host(MHATokenToKVPoolHost):
                 f"({self.page_size}) must equal the device page size "
                 f"({device_pool.page_size})."
             )
-        if not self.can_use_write_back_jit or not all(
-            can_use_write_back_jit_kernel(element_size=size)
-            for size in (self.k_sf_page_bytes, self.v_sf_page_bytes)
+        if layout == "page_first" and (
+            not self.can_use_write_back_jit
+            or not all(
+                can_use_write_back_jit_kernel(element_size=size)
+                for size in (self.k_sf_page_bytes, self.v_sf_page_bytes)
+            )
         ):
             raise NotImplementedError(
                 "MXFP8 KV host pool needs the staged JIT write-back kernel "
@@ -133,6 +137,8 @@ class MHATokenToKVPoolMXFP8Host(MHATokenToKVPoolHost):
             buf.view(torch.uint8).reshape(buf.shape[0], -1)
             for buf in self.device_pool.v_scale_buffer
         ]
+        if self.layout == "page_first_direct":
+            return
         self.k_scale_device_ptrs = torch.tensor(
             [rows.data_ptr() for rows in self.k_scale_device_rows],
             dtype=torch.uint64,
@@ -158,16 +164,84 @@ class MHATokenToKVPoolMXFP8Host(MHATokenToKVPoolHost):
         """Page-aligned token indices -> one page id per page, same device."""
         return indices[:: self.page_size] // self.page_size
 
+    def _validate_io_backend(self, io_backend: str) -> None:
+        if (self.layout, io_backend) not in (
+            ("page_first", "kernel"),
+            ("page_first_direct", "direct"),
+        ):
+            raise NotImplementedError(
+                "MXFP8 HiCache requires kernel/page_first or direct/page_first_direct, "
+                f"got {io_backend}/{self.layout}."
+            )
+
+    def _transfer_scale_block(
+        self,
+        host_pages: torch.Tensor,
+        device_pages: torch.Tensor,
+        layer_ids: list[int],
+        host_to_device: bool,
+    ) -> None:
+        from sglang.srt.mem_cache.pool_host.direct import transfer_layer_block
+
+        for host_buffer, host_rows, device_rows in (
+            (self.k_scale_host, self.k_scale_host_layers, self.k_scale_device_rows),
+            (self.v_scale_host, self.v_scale_host_layers, self.v_scale_device_rows),
+        ):
+            assert host_buffer is not None
+            host_layers = [host_rows[layer] for layer in layer_ids]
+            device_layers = [device_rows[layer] for layer in layer_ids]
+            transfer_layer_block(
+                host_layers if host_to_device else device_layers,
+                device_layers if host_to_device else host_layers,
+                host_pages if host_to_device else device_pages,
+                device_pages if host_to_device else host_pages,
+                host_buffer=host_buffer,
+            )
+
+    def load_to_device_layer_block(
+        self,
+        device_pool: MHATokenToKVPoolMXFP8,
+        host_indices: torch.Tensor,
+        device_indices: torch.Tensor,
+        layer_ids: list[int],
+        io_backend: str,
+        is_draft: bool = False,
+    ) -> None:
+        self._validate_io_backend(io_backend)
+        if io_backend == "direct":
+            host_pages = self._block_dma_page_ids(host_indices)
+            device_pages = self._block_dma_page_ids(device_indices)
+        super().load_to_device_layer_block(
+            device_pool,
+            host_indices,
+            device_indices,
+            layer_ids,
+            io_backend,
+            is_draft=is_draft,
+        )
+        if io_backend == "direct":
+            self._transfer_scale_block(
+                host_pages, device_pages, layer_ids, host_to_device=True
+            )
+
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
+        self._validate_io_backend(io_backend)
+        if io_backend == "direct":
+            host_pages = self._block_dma_page_ids(host_indices)
+            device_pages = self._block_dma_page_ids(device_indices)
         super().backup_from_device_all_layer(
             device_pool, host_indices, device_indices, io_backend
         )
-        if io_backend != "kernel":
-            raise NotImplementedError(
-                f"MXFP8 KV host pool supports only io_backend='kernel', got {io_backend!r}."
+        if io_backend == "direct":
+            self._transfer_scale_block(
+                host_pages,
+                device_pages,
+                list(range(self.layer_num)),
+                host_to_device=False,
             )
+            return
         device_pages = self._page_ids(device_indices)
         host_pages = self._page_ids(host_indices)
         if host_pages.is_cuda:
@@ -195,6 +269,17 @@ class MHATokenToKVPoolMXFP8Host(MHATokenToKVPoolHost):
         *,
         is_draft: bool = False,
     ):
+        self._validate_io_backend(io_backend)
+        if io_backend == "direct":
+            self.load_to_device_layer_block(
+                device_pool,
+                host_indices,
+                device_indices,
+                [layer_id],
+                io_backend,
+                is_draft=is_draft,
+            )
+            return
         super().load_to_device_per_layer(
             device_pool,
             host_indices,
@@ -203,13 +288,7 @@ class MHATokenToKVPoolMXFP8Host(MHATokenToKVPoolHost):
             io_backend,
             is_draft=is_draft,
         )
-        if is_draft:
-            raise NotImplementedError("MXFP8 KV host pool has no draft layers.")
-        if io_backend != "kernel":
-            raise NotImplementedError(
-                f"MXFP8 KV host pool supports only io_backend='kernel', got {io_backend!r}."
-            )
-        if not self._is_device_layer_owned(device_pool, layer_id):
+        if not is_draft and not self._is_device_layer_owned(device_pool, layer_id):
             return
         host_layer_id = self._host_layer_index(layer_id)
         device_pages = self._page_ids(device_indices)

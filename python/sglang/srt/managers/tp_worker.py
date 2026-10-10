@@ -442,7 +442,7 @@ class TpModelWorker(BaseTpWorker):
                 get_exec().graph.cuda_graph_config[phase].backend != Backend.DISABLED
                 for phase in Phase.ALL
             )
-            and runner.spec_algorithm.is_none()
+            and (runner.spec_algorithm.is_none() or runner.spec_algorithm.is_dspark())
             and not runner.mtp_draft_device_pools
             and not get_disagg().enable_pdmux
             and get_disagg().disaggregation_mode == "null"

@@ -167,23 +167,24 @@ class L2TransferEngine:
         with self._submission(
             transfers, self.host_to_device_stream, "host_to_device", start_event
         ) as (transfers, completion):
-            primary = transfers[0] if transfers else None
             for first, end in zip((0, *block_ends), block_ends):
                 for transfer in transfers:
-                    local_layers = []
-                    for layer_id in range(first, end):
-                        local = (
-                            transfer.layer_mapper(layer_id)
-                            if transfer.layer_mapper is not None
-                            else layer_id
+                    if transfer.layer_mapper is None:
+                        # Independent draft sidecars may be deeper than the
+                        # target. Drain their remaining layers before publishing
+                        # the final target completion event.
+                        local_end = (
+                            transfer.host_pool.layer_num
+                            if self.batch_direct and end == transfer_layer_id_max
+                            else min(end, transfer.host_pool.layer_num)
                         )
-                        if local is None or (
-                            transfer is not primary
-                            and transfer.layer_mapper is None
-                            and layer_id >= transfer.host_pool.layer_num
-                        ):
-                            continue
-                        local_layers.append(local)
+                        local_layers = list(range(first, local_end))
+                    else:
+                        local_layers = [
+                            local
+                            for layer_id in range(first, end)
+                            if (local := transfer.layer_mapper(layer_id)) is not None
+                        ]
                     if not local_layers:
                         continue
                     if self.batch_direct:
