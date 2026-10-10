@@ -1251,6 +1251,13 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     self._staging_outstanding[room] += 1
                     kv_chunk.staging_counted = True
 
+                # Same wait as mooncake's worker: before reading source KV, skipped
+                # for a failed room, cleared so a deferred re-enqueue does not wait.
+                if kv_chunk.wait_event is not None:
+                    if self.check_status(room) != KVPoll.Failed:
+                        kv_chunk.wait_event.synchronize()
+                    kv_chunk.wait_event = None
+
                 if self.check_status(room) == KVPoll.Failed:
                     self._staging_outstanding.pop(room, None)
                     if self.enable_deferred_decode_kv_release:
@@ -2827,6 +2834,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         aux_index: Optional[int] = None,
         state_indices: Optional[List] = None,
         num_kv_tokens: Optional[int] = None,
+        wait_event: Optional[object] = None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last_chunk or (is_last_chunk and aux_index is not None)
@@ -2858,6 +2866,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 prefill_aux_index=aux_index,
                 state_indices=state_indices,
                 num_kv_tokens=num_kv_tokens,
+                wait_event=wait_event,
             )
         )
         return None
@@ -3225,6 +3234,7 @@ class NixlKVSender(CommonKVSender):
             self.aux_index,
             state_indices,
             num_kv_tokens,
+            wait_event=self._take_early_send_wait_event(),
         )
         self._record_transfer_indices(kv_indices, state_indices)
         self.chunk_id += 1
