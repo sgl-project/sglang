@@ -19,7 +19,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.ops.diffusion.common.numerics import round_bf16_to_fp32
+from sglang.kernels.numerics import round_bf16_to_fp32
 
 # The constants sglang's per-token-group FP8 quantizer bakes in; these kernels
 # have to agree with it bit for bit, so they are its, not ours.
