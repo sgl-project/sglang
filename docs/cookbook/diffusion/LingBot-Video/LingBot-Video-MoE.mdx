@@ -9,7 +9,26 @@ import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
 
 <DiffusionModelTags tags={["video", "text-to-video", "mixture-of-experts", "30B-A3B"]} />
 
-## 1. Model Introduction
+import { Deployment } from '/src/snippets/_deployment.jsx';
+import { config } from '/src/snippets/configs/LingBot/lingbot-video.jsx';
+
+## 1. Quick start
+
+Follow the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installation) for your GPU platform.
+
+<Accordion title="Installation and prerequisites">
+
+<a id="2-installation" />
+
+Follow the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installation). Docker is recommended for Linux GPU deployments; run the commands below inside the container or your installed Python environment.
+
+</Accordion>
+
+<Deployment config={config} />
+
+<a id="1-model-introduction" />
+
+## 2. Model capabilities
 
 [LingBot Video MoE 30B-A3B](https://huggingface.co/robbyant/lingbot-video-moe-30b-a3b)
 is a text-to-video mixture-of-experts model served through a native SGLang
@@ -31,10 +50,6 @@ The public checkpoint served by the pipeline:
 The checkpoint expects a structured JSON caption rather than an unexpanded
 natural-language prompt. The JSON is passed as the request's `prompt` string;
 it is not an `extra_params` object.
-
-## 2. Installation
-
-Follow the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installation). Docker is recommended for Linux GPU deployments; run the commands below inside the container or your installed Python environment.
 
 ## 3. Serve LingBot Video MoE
 

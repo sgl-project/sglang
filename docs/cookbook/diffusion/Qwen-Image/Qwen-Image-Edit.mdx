@@ -1,25 +1,40 @@
 ---
 title: Qwen-Image-Edit-2511
+description: "Deploy Qwen-Image-Edit-2511 with SGLang - 20B image editing model with text rendering, character consistency, and geometric reasoning."
 metatags:
     description: "Deploy Qwen-Image-Edit-2511 with SGLang - 20B image editing model with text rendering, character consistency, and geometric reasoning."
 ---
 
 import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
-import { QwenImageEditDeployment } from '/src/snippets/diffusion/qwen-image-edit-deployment.jsx';
 
 <DiffusionModelTags tags={["image editing", "text replacement", "character consistency", "multi-person", "20B"]} />
 
-## 1. Model Introduction
+import { Deployment } from '/src/snippets/_deployment.jsx';
+import { config } from '/src/snippets/configs/Qwen/qwen-image-edit.jsx';
 
-[Qwen-Image-Edit-2511](https://huggingface.co/Qwen/Qwen-Image-Edit-2511) is the 20B editing counterpart to Qwen-Image. It is strongest at changing text, materials, lighting, viewpoint, or composition while reducing drift in regions that were not requested to change.
+## 1. Quick start
 
-Choose it for identity-sensitive portrait edits, multi-person composition, typography replacement, and geometry-aware design work. It is substantially heavier than small specialist editors, and consistency is improved rather than guaranteed; evaluate untouched-region drift on the actual editing workload.
+Follow the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installation) for your GPU platform.
 
-## 2. SGLang-diffusion Installation
+<Accordion title="Installation and prerequisites">
+
+<a id="2-sglang-diffusion-installation" />
 
 SGLang-diffusion offers multiple installation methods. You can choose the most suitable installation method based on your hardware platform and requirements.
 
 Please refer to the [official SGLang-diffusion installation guide](https://docs.sglang.io/docs/sglang-diffusion/installation) for installation instructions.
+
+</Accordion>
+
+<Deployment config={config} />
+
+<a id="1-model-introduction" />
+
+## 2. Model capabilities
+
+[Qwen-Image-Edit-2511](https://huggingface.co/Qwen/Qwen-Image-Edit-2511) is the 20B editing counterpart to Qwen-Image. It is strongest at changing text, materials, lighting, viewpoint, or composition while reducing drift in regions that were not requested to change.
+
+Choose it for identity-sensitive portrait edits, multi-person composition, typography replacement, and geometry-aware design work. It is substantially heavier than small specialist editors, and consistency is improved rather than guaranteed; evaluate untouched-region drift on the actual editing workload.
 
 ## 3. Model Deployment
 
@@ -29,9 +44,7 @@ This section provides deployment configurations optimized for different hardware
 
 Qwen-Image-Edit-2511 is a 20B parameter model optimized for image editing tasks. The recommended launch configurations vary by hardware.
 
-**Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform.
-
-<QwenImageEditDeployment />
+Use the [command builder](#1-quick-start) above.
 
 ### 3.2 Configuration Tips
 

@@ -1,15 +1,36 @@
 ---
 title: FLUX
+description: "Deploy FLUX diffusion models with SGLang - 12B/32B rectified flow transformers for high-quality text-to-image generation."
 metatags:
     description: "Deploy FLUX diffusion models with SGLang - 12B/32B rectified flow transformers for high-quality text-to-image generation."
 ---
 
 import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
-import { FluxDeployment } from '/src/snippets/diffusion/flux-deployment.jsx';
 
 <DiffusionModelTags tags={["image", "text-to-image", "image editing", "multi-reference", "rectified flow"]} />
 
-## 1. Model Introduction
+import { Deployment } from '/src/snippets/_deployment.jsx';
+import { config } from '/src/snippets/configs/BlackForestLabs/flux.jsx';
+
+## 1. Quick start
+
+Follow the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installation) for your GPU platform.
+
+<Accordion title="Installation and prerequisites">
+
+<a id="2-sglang-diffusion-installation" />
+
+SGLang-diffusion offers multiple installation methods. You can choose the most suitable installation method based on your hardware platform and requirements.
+
+Please refer to the [official SGLang-diffusion installation guide](https://docs.sglang.io/docs/sglang-diffusion/installation) for installation instructions.
+
+</Accordion>
+
+<Deployment config={config} />
+
+<a id="1-model-introduction" />
+
+## 2. Model capabilities
 
 [FLUX](https://blackforestlabs.ai/) is Black Forest Labs' rectified-flow image model family. [FLUX.1-dev](https://huggingface.co/black-forest-labs/FLUX.1-dev) is the smaller 12B text-to-image checkpoint; [FLUX.2-dev](https://huggingface.co/black-forest-labs/FLUX.2-dev) is a 32B model that adds instruction-based editing plus single- and multi-reference composition.
 
@@ -20,12 +41,6 @@ FLUX is a strong default when prompt adherence, polished image quality, or refer
 | `black-forest-labs/FLUX.1-dev` | High-quality text-to-image with the lighter FLUX deployment | No native multi-reference editing path |
 | `black-forest-labs/FLUX.2-dev` | Text-to-image, editing, and reference-guided composition in one model | 32B model with a larger memory footprint |
 
-## 2. SGLang-diffusion Installation
-
-SGLang-diffusion offers multiple installation methods. You can choose the most suitable installation method based on your hardware platform and requirements.
-
-Please refer to the [official SGLang-diffusion installation guide](https://docs.sglang.io/docs/sglang-diffusion/installation) for installation instructions.
-
 ## 3. Model Deployment
 
 This section provides deployment configurations optimized for different hardware platforms and use cases.
@@ -34,9 +49,7 @@ This section provides deployment configurations optimized for different hardware
 
 FLUX models are optimized for high-quality image generation. The recommended launch configurations vary by hardware and model version.
 
-**Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform and model version. SGLang supports serving FLUX on NVIDIA B200, H200, H100, and AMD MI355X, MI325X, MI300X GPUs, Ascend A2, A3 NPUs Series NPUs and Intel Arc B-series graphics(codename: BMG (Battlemage)).
-
-<FluxDeployment />
+Use the [command builder](#1-quick-start) above.
 
 ### 3.2 Configuration Tips
 

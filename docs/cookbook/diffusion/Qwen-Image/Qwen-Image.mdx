@@ -1,25 +1,40 @@
 ---
 title: Qwen-Image
+description: "Deploy Qwen-Image with SGLang - community contribution guide for Qwen's image generation model."
 metatags:
     description: "Deploy Qwen-Image with SGLang - community contribution guide for Qwen's image generation model."
 ---
 
 import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
-import { QwenImageDeployment } from '/src/snippets/diffusion/qwen-image-deployment.jsx';
 
 <DiffusionModelTags tags={["image", "text-to-image", "bilingual typography", "complex layouts", "NVFP4"]} />
 
-## 1. Model Introduction
+import { Deployment } from '/src/snippets/_deployment.jsx';
+import { config } from '/src/snippets/configs/Qwen/qwen-image.jsx';
 
-[Qwen-Image](https://huggingface.co/Qwen/Qwen-Image) is a 20B text-to-image model built for strong prompt following and precise rendering of English and Chinese text. It is especially useful for posters, signs, diagrams, and dense layouts where typography and spatial relationships matter as much as general image quality.
+## 1. Quick start
 
-This page covers generation rather than editing: use Qwen-Image-Edit when an existing image, subject identity, or untouched region must be preserved. The full checkpoint is memory-heavy, while the validated ModelOpt NVFP4 release provides a supported low-precision deployment option with an expected quality tradeoff.
+Follow the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installation) for your GPU platform.
 
-## 2. SGLang-diffusion Installation
+<Accordion title="Installation and prerequisites">
+
+<a id="2-sglang-diffusion-installation" />
 
 SGLang-diffusion offers multiple installation methods. You can choose the most suitable installation method based on your hardware platform and requirements.
 
 Please refer to the [official SGLang-diffusion installation guide](../../../docs/sglang-diffusion/installation) for installation instructions.
+
+</Accordion>
+
+<Deployment config={config} />
+
+<a id="1-model-introduction" />
+
+## 2. Model capabilities
+
+[Qwen-Image](https://huggingface.co/Qwen/Qwen-Image) is a 20B text-to-image model built for strong prompt following and precise rendering of English and Chinese text. It is especially useful for posters, signs, diagrams, and dense layouts where typography and spatial relationships matter as much as general image quality.
+
+This page covers generation rather than editing: use Qwen-Image-Edit when an existing image, subject identity, or untouched region must be preserved. The full checkpoint is memory-heavy, while the validated ModelOpt NVFP4 release provides a supported low-precision deployment option with an expected quality tradeoff.
 
 ## 3. Model Deployment
 
@@ -29,9 +44,7 @@ This section provides deployment configurations optimized for different hardware
 
 Qwen-Image is a text-to-image model. The recommended launch configurations vary by hardware. SGLang supports serving Qwen-Image on NVIDIA B200, B300, H200, H100, AMD MI300X, MI325X, MI355X GPUs and Ascend A2/A3 Series NPUs.
 
-**Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform.
-
-<QwenImageDeployment />
+Use the [command builder](#1-quick-start) above.
 
 For the validated ModelOpt NVFP4 checkpoint on Blackwell, load the published
 Qwen-Image-2512 NVFP4 repo directly:
