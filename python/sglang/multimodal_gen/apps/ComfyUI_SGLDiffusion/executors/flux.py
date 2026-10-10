@@ -6,6 +6,10 @@ from .adapter import ComfyUIModelAdapter, PackedForward
 from .base import SGLDiffusionExecutor
 
 
+# Width of Flux.1's CLIP-L pooled vector (vec_in_dim / pooled_projection_dim).
+_FLUX_POOLED_DIM = 768
+
+
 def _flux_guidance_scale(guidance) -> float:
     if guidance is None:
         return 3.5
@@ -28,11 +32,37 @@ class FluxAdapter(ComfyUIModelAdapter):
     patch_size = 2
 
     def pack(
-        self, x, timestep, context, y=None, guidance=None, **kwargs
+        self,
+        x,
+        timestep,
+        context,
+        y=None,
+        guidance=None,
+        ref_latents=None,
+        control=None,
+        **kwargs,
     ) -> PackedForward:
+        if ref_latents:
+            raise ValueError(
+                "FluxAdapter does not support FLUX.1 Kontext reference latents "
+                "(ComfyUI's ReferenceLatent node). Running the workflow would "
+                "silently drop the reference images and produce a plain "
+                "text-to-image result instead of a Kontext edit."
+            )
+        if control is not None:
+            raise ValueError(
+                "FluxAdapter does not support ControlNet conditioning. Running "
+                "the workflow would silently drop the ControlNet and produce an "
+                "unconditioned text-to-image result."
+            )
+        if y is None:
+            # Native ComfyUI Flux zero-fills a missing pooled vector.
+            y = torch.zeros(
+                x.shape[0], _FLUX_POOLED_DIM, device=context.device, dtype=context.dtype
+            )
         packed, padded_height, padded_width = self._pack_latents(x)
         t5_seq = int(context.shape[-2]) if context.ndim >= 2 else int(context.shape[0])
-        clip_batch = int(y.shape[0]) if y is not None else 1
+        clip_batch = int(y.shape[0])
         return PackedForward(
             latents=packed,
             timesteps=timestep * 1000.0,
