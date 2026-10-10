@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import itertools
+import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -141,6 +142,7 @@ class AutoWeightsLoader:
         skip_substrs: list[str] | None = None,
         ignore_unexpected_prefixes: list[str] | None = None,
         ignore_unexpected_suffixes: list[str] | None = None,
+        ignore_unexpected_patterns: Iterable[str] | None = None,
     ) -> None:
         self.module = module
         self.skip_prefixes = list(skip_prefixes or [])
@@ -150,6 +152,9 @@ class AutoWeightsLoader:
         ]
         self.ignore_unexpected_prefixes = list(ignore_unexpected_prefixes or [])
         self.ignore_unexpected_suffixes = list(ignore_unexpected_suffixes or [])
+        self.ignore_unexpected_patterns = [
+            re.compile(p) for p in ignore_unexpected_patterns or ()
+        ]
 
     def _groupby_prefix(
         self,
@@ -182,9 +187,11 @@ class AutoWeightsLoader:
         )
 
     def _can_ignore_unexpected(self, qualname: str) -> bool:
-        return any(
-            qualname.startswith(p) for p in self.ignore_unexpected_prefixes
-        ) or any(qualname.endswith(s) for s in self.ignore_unexpected_suffixes)
+        return (
+            any(qualname.startswith(p) for p in self.ignore_unexpected_prefixes)
+            or any(qualname.endswith(s) for s in self.ignore_unexpected_suffixes)
+            or any(p.search(qualname) for p in self.ignore_unexpected_patterns)
+        )
 
     def _load_param(
         self,
