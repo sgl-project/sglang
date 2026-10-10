@@ -363,7 +363,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use the CuTe DSL MegaMOE in-kernel FC2 reduction. This can reduce workspace size and improve large-batch performance, but BF16 atomic accumulation is nondeterministic. It is incompatible with quantized combine dtypes.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Permit CuTe DSL MegaMOE in-kernel FC2 reduction for NVFP4 W4A4, NVFP4 W4A16, and MXFP8. FlashInfer's tuning profile may still select external reduction. BF16 atomic accumulation is nondeterministic; leave disabled for reproducibility. Requires BF16 combine.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>"false"</code></td>
     </tr>
     <tr>
@@ -811,7 +811,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use BF16 activations and outputs with FlashInfer CuTe DSL NVFP4 weights on NVIDIA SM100-family GPUs (SM100/SM103). Serialized dense linear layers use this mode with <code>--fp4-gemm-backend flashinfer_cutedsl</code>. MoE layers use it with <code>--moe-runner-backend flashinfer_cutedsl</code>; the MoE path supports online weight quantization and serialized ModelOpt NVFP4 weights with either no A2A or FlashInfer A2A, and honors <code>SGLANG_FLASHINFER_MOE_FUSED_FINALIZE</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use BF16 activations and outputs with FlashInfer CuTe DSL NVFP4 weights on NVIDIA SM100-family GPUs (SM100/SM103). Serialized dense linear layers use this mode with <code>--fp4-gemm-backend flashinfer_cutedsl</code>. MoE layers use it with <code>--moe-runner-backend flashinfer_cutedsl</code>; the MoE path supports online weight quantization and serialized ModelOpt NVFP4 weights with either no A2A or FlashInfer A2A, and honors <code>SGLANG_FLASHINFER_MOE_FUSED_FINALIZE</code>. For SwiGLU models, also selects W4A16 with <code>--moe-runner-backend flashinfer_megamoe --moe-a2a-backend flashinfer_megamoe</code>, including <code>--quantization nvfp4_online</code>. MegaMOE requires BF16 activations, <code>--enable-dp-attention</code> with DP=TP=EP, and BF16 combine; Nemotron ReLU-squared experts are unsupported. Set <code>SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE=1</code> to permit nondeterministic BF16 in-kernel FC2 reduction. Requires the FlashInfer W4A16 MegaMOE API from <a href="https://github.com/flashinfer-ai/flashinfer/pull/5019">FlashInfer #5019</a>.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
     <tr>
