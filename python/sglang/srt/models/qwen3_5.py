@@ -1000,8 +1000,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 num_k_heads_tp = triton.cdiv(self.num_k_heads, self.attn_tp_size)
                 num_v_heads_tp = triton.cdiv(self.num_v_heads, self.attn_tp_size)
             use_strided_prefill_z = (
-                _is_cuda and forward_batch.forward_mode.is_extend_without_speculative()
-            )
+                _is_cuda or _is_hip
+            ) and forward_batch.forward_mode.is_extend_without_speculative()
             split_fn = (
                 qwen3_5_gdn_prefill_projection_views
                 if use_strided_prefill_z
