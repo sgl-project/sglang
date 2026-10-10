@@ -71,6 +71,12 @@ class TestSampleDraftBlock(CustomTestCase):
                     block.draft_tokens[greedy], logits[greedy].float().argmax(-1)
                 )
             )
+            # The sampled rows drew noise: they leave the argmax somewhere.
+            self.assertFalse(
+                torch.equal(
+                    block.draft_tokens[~greedy], logits[~greedy].float().argmax(-1)
+                )
+            )
             self.assertEqual(block.greedy_mask.tolist(), greedy.tolist())
             self.assertEqual(offset.item(), 1)
 
