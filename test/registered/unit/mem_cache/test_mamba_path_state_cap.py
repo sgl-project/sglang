@@ -283,10 +283,57 @@ class TestMambaPathCapWriteThroughOrdering(CustomTestCase):
         self.assertIsNotNone(leaf.component_data[ComponentType.MAMBA].host_value)
         cache.sanity_check()
 
-    def test_walk_backup_excludes_same_insert_restamped_mamba(self):
-        """The walked target's backup executes before commit hooks, so a mamba
-        value re-stamped by the same insert stays out of the host backup."""
+    def test_batched_backup_retry_keeps_the_capped_mamba_state(self):
+        """A retried backup is queued (locked) by the walk, so the path cap spares the
+        ancestor's mamba state and the flush backs it up with the KV."""
         cache, allocator, req_to_token_pool = self._build_hicache_fixture()
+        cache._batched_backup = True
+        cache.write_through_threshold = 1
+        mamba_comp = cache.components[ComponentType.MAMBA]
+
+        # A failed write-through leaves the ancestor unbacked with device state.
+        with mock.patch.object(cache, "_execute_kv_backup", return_value=None):
+            self._insert(cache, allocator, req_to_token_pool, [1, 2])
+            cache.flush_pending_backups()
+        ancestor = next(iter(cache.root_node.children.values()))
+        self.assertFalse(ancestor.backuped)
+        self.assertIsNotNone(ancestor.component_data[ComponentType.MAMBA].value)
+
+        # The merged backup of [ancestor, leaf] fails once and the node-by-node
+        # retry succeeds; the queue lock keeps the cap off the ancestor.
+        mamba_comp.mamba_max_states_per_path = 1
+        real_backup = cache._execute_kv_backup
+        attempts = []
+
+        def fail_once(*args, **kwargs):
+            attempts.append(args)
+            if len(attempts) == 1:
+                return None
+            return real_backup(*args, **kwargs)
+
+        with mock.patch.object(cache, "_execute_kv_backup", side_effect=fail_once):
+            self._insert(cache, allocator, req_to_token_pool, [1, 2, 3, 4])
+            cache.flush_pending_backups()
+        leaf = next(iter(ancestor.children.values()))
+        self.assertEqual(
+            [list(a[0]) for a in attempts],
+            [[ancestor.id, leaf.id], [ancestor.id], [leaf.id]],
+        )
+        cache.writing_check(write_back=True)
+
+        self.assertTrue(ancestor.backuped)
+        ancestor_cd = ancestor.component_data[ComponentType.MAMBA]
+        self.assertIsNotNone(ancestor_cd.value)
+        self.assertIsNotNone(ancestor_cd.host_value)
+        self.assertTrue(leaf.backuped)
+        self.assertIsNotNone(leaf.component_data[ComponentType.MAMBA].host_value)
+        cache.sanity_check()
+
+    def _backup_ancestor_with_same_insert_restamped_mamba(self, batched):
+        """Back the ancestor up from the insert that re-stamps its tombstoned
+        mamba state; returns the ancestor's mamba component data."""
+        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
+        cache._batched_backup = batched
         mamba_comp = cache.components[ComponentType.MAMBA]
 
         self._insert(cache, allocator, req_to_token_pool, [1, 2])
@@ -299,7 +346,7 @@ class TestMambaPathCapWriteThroughOrdering(CustomTestCase):
         self.assertIsNone(ancestor.component_data[ComponentType.MAMBA].value)
 
         # Re-inserting [1, 2] crosses the threshold and re-stamps the tombstone
-        # in the same insert; the backup must not carry the fresh mamba state.
+        # in the same insert.
         cache.write_through_threshold = ancestor.hit_count + 1
         self._insert(cache, allocator, req_to_token_pool, [1, 2])
         cache.writing_check(write_back=True)
@@ -307,7 +354,23 @@ class TestMambaPathCapWriteThroughOrdering(CustomTestCase):
         self.assertTrue(ancestor.backuped)
         ancestor_cd = ancestor.component_data[ComponentType.MAMBA]
         self.assertIsNotNone(ancestor_cd.value)
+        return ancestor_cd
+
+    def test_walk_backup_excludes_same_insert_restamped_mamba(self):
+        """The walked target's backup executes before commit hooks, so a mamba
+        value re-stamped by the same insert stays out of the host backup."""
+        ancestor_cd = self._backup_ancestor_with_same_insert_restamped_mamba(
+            batched=False
+        )
         self.assertIsNone(ancestor_cd.host_value)
+
+    def test_batched_backup_includes_same_insert_restamped_mamba(self):
+        """The walked target's backup runs at flush, after the commit hooks, so a
+        mamba value re-stamped by the same insert is backed up with it."""
+        ancestor_cd = self._backup_ancestor_with_same_insert_restamped_mamba(
+            batched=True
+        )
+        self.assertIsNotNone(ancestor_cd.host_value)
 
     def test_cap_walk_failure_still_drains_collected_frees(self):
         """A cap walk that raises mid-eviction must still free the tombstoned

@@ -34,11 +34,6 @@ class UnifiedTreeCoreInspector(UnifiedTreeCore, UnifiedTreeCoreInspectionInterfa
         """Whether the node id is live in the tree."""
         return node_id in self._node_arena
 
-    def get_parent_node_id(self, node_id: NodeId) -> Optional[NodeId]:
-        """The parent node id, or None for the root."""
-        parent = self.node_by_id(node_id).parent
-        return None if parent is None else parent.id
-
     def get_child_node_ids(self, node_id: NodeId) -> list[NodeId]:
         """The node's child ids."""
         return [child.id for child in self.node_by_id(node_id).children.values()]

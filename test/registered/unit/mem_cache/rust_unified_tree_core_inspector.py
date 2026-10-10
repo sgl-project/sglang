@@ -47,9 +47,6 @@ class RustUnifiedTreeCoreInspector(
     def contains_node(self, node_id: NodeId) -> bool:
         return self._binding.inspect_contains_node(node_id)
 
-    def get_parent_node_id(self, node_id: NodeId) -> Optional[NodeId]:
-        return self._binding.inspect_get_parent_node_id(node_id)
-
     def get_child_node_ids(self, node_id: NodeId) -> list[NodeId]:
         return self._binding.inspect_get_child_node_ids(node_id)
 

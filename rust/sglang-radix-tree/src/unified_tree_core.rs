@@ -3835,6 +3835,16 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         Ok(self.arena.node(node_id).is_root())
     }
 
+    /// The parent node's external handle, or None for the root.
+    pub fn parent_node_id(&self, node_id: NodeId) -> Result<Option<NodeId>, NodeAccessError> {
+        let node_id = self.arena.resolve(node_id)?;
+        Ok(self
+            .arena
+            .node(node_id)
+            .try_parent()
+            .map(|parent_id| self.arena.node(parent_id).id))
+    }
+
     /// The node's last page hash, or None when it was never hashed.
     pub fn get_last_hash_value(&self, node_id: NodeId) -> Result<Option<String>, NodeAccessError> {
         let node_id = self.arena.resolve(node_id)?;
@@ -5113,19 +5123,6 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     /// Whether the external node handle is currently live.
     pub fn inspect_contains_node(&self, node_id: NodeId) -> bool {
         self.arena.resolve(node_id).is_ok()
-    }
-
-    /// The parent node's external handle, or None for the root.
-    pub fn inspect_get_parent_node_id(
-        &self,
-        node_id: NodeId,
-    ) -> Result<Option<NodeId>, NodeAccessError> {
-        let node_id = self.arena.resolve(node_id)?;
-        Ok(self
-            .arena
-            .node(node_id)
-            .try_parent()
-            .map(|parent_id| self.arena.node(parent_id).id))
     }
 
     /// A materialized snapshot of the node's child handles.
