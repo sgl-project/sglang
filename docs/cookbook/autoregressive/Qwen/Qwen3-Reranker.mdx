@@ -1,0 +1,105 @@
+---
+title: Qwen3-Reranker
+metatags:
+    description: "Serve Qwen3-Reranker with SGLang - decoder-only yes/no logprob reranking with launch commands, request formats, and common pitfalls."
+---
+
+## 1. Model Introduction
+
+[Qwen3-Reranker](https://huggingface.co/Qwen/Qwen3-Reranker-0.6B) is a series of decoder-only reranker models (0.6B and 4B/8B) from the Qwen team. Instead of a cross-encoder head, they score query–document pairs with yes/no logprob scoring, and achieve strong performance on multilingual retrieval benchmarks.
+
+## 2. SGLang Installation
+
+SGLang offers multiple installation methods. You can choose the most suitable installation method based on your hardware platform and requirements.
+
+Please refer to the [official SGLang installation guide](https://docs.sglang.ai/get_started/install.html) for installation instructions.
+
+## 3. Model Deployment
+
+### 3.1 Launch Command
+
+```shell
+python3 -m sglang.launch_server \
+  --model-path Qwen/Qwen3-Reranker-0.6B \
+  --trust-remote-code \
+  --disable-radix-cache \
+  --host 0.0.0.0 \
+  --port 8001 \
+  --chat-template examples/chat_template/qwen3_reranker.jinja
+```
+
+<Note>
+Qwen3-Reranker uses decoder-only logprob scoring (yes/no). Do NOT launch it with `--is-embedding`.
+</Note>
+
+### 3.2 Common Pitfalls
+
+- **`--chat-template` is required.** Without `--chat-template examples/chat_template/qwen3_reranker.jinja`, the server does not recognize the model as a decoder-only reranker and returns a 400 error: `"This model does not appear to be an embedding model by default. Please add --is-embedding..."`. The fix is to add the chat template flag, NOT `--is-embedding`.
+- If you launch Qwen3-Reranker with `--is-embedding`, `/v1/rerank` cannot compute yes/no logprob scores. Relaunch **without** `--is-embedding`.
+- If you see a validation error like "score should be a valid number" and the backend returned a list, upgrade to a version that coerces `embedding[0]` into `score` for rerank responses.
+
+## 4. Model Invocation
+
+### 4.1 Example Client Request
+
+Supports optional `instruct`, `top_n`, and `return_documents`:
+
+```shell
+curl -X POST http://127.0.0.1:8001/v1/rerank \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen3-Reranker-0.6B",
+    "query": "What is the capital of France?",
+    "documents": [
+      "The capital of France is Paris.",
+      "The capital of Germany is Berlin.",
+      "Bananas are yellow fruit."
+    ],
+    "instruct": "Given a web search query, retrieve relevant passages that answer the query.",
+    "top_n": 2,
+    "return_documents": true
+  }'
+```
+
+**Request Parameters:**
+
+- `query` (required): The query text to rank documents against
+- `documents` (required): List of documents to be ranked
+- `model` (required): Model to use for reranking
+- `instruct` (optional): Instruction text for the reranker
+- `top_n` (optional): Maximum number of documents to return. Defaults to returning all documents. If specified value is greater than the total number of documents, all documents will be returned.
+- `return_documents` (optional): Whether to return documents in the response. Defaults to `True`.
+
+### 4.2 Response Format
+
+`/v1/rerank` returns a list of objects (sorted by descending score):
+
+- `score`: float, higher means more relevant
+- `document`: the original document string (only included when `return_documents` is `true`)
+- `index`: the original index in the input `documents`
+
+The number of returned results is controlled by the `top_n` parameter. If `top_n` is not specified or is greater than the total number of documents, all documents are returned.
+
+Example (with `return_documents: true`):
+
+```json
+[
+  {"score": 0.99, "document": "The capital of France is Paris.", "index": 0},
+  {"score": 0.01, "document": "The capital of Germany is Berlin.", "index": 1},
+  {"score": 0.00, "document": "Bananas are yellow fruit.", "index": 2}
+]
+```
+
+Example (with `top_n: 2`):
+
+```json
+[
+  {"score": 0.99, "document": "The capital of France is Paris.", "index": 0},
+  {"score": 0.01, "document": "The capital of Germany is Berlin.", "index": 1}
+]
+```
+
+## 5. References
+
+- [Qwen3-Reranker-0.6B](https://huggingface.co/Qwen/Qwen3-Reranker-0.6B) on Hugging Face
+- [SGLang rerank models documentation](https://docs.sglang.ai/supported_models/retrieval_ranking/rerank_models.html)
