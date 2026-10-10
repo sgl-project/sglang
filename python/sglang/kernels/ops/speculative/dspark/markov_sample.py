@@ -17,7 +17,9 @@ from triton.language.extra import libdevice
 
 from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda
 
-_BLOCK = 4096
+# Small blocks spread a few rows over many programs; the Philox noise per
+# block is the latency of a decode-sized step.
+_BLOCK = 1024
 _NO_INDEX = tl.constexpr(2147483647)
 # 2**-32: maps a 32-bit Philox word to a uniform in (0, 1].
 _UNIFORM_SCALE = tl.constexpr(2.3283064365386963e-10)
