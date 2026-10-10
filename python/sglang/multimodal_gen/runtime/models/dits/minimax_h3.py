@@ -737,9 +737,10 @@ def _minimax_h3_qknorm_rope_pipelined_attention(
     """The pipelined attention with QK-norm + RoPE writing into the exchange.
 
     q/k are the raw projections. Each destination block gets its heads'
-    normalized q/k and v written in place, so the in-place norm and the pack
-    become one pass. Same kernel arithmetic, so the result is bit-identical.
-    Returns None, having written nothing, when the call cannot pipeline.
+    normalized q and k written in place, so the in-place norm and the pack
+    become one pass, and v moves on the copy engine. Same kernel arithmetic,
+    so the result is bit-identical. Returns None, having written nothing,
+    when the call cannot pipeline.
     """
     # under graph capture the forward keeps the in-place norm, and the pipeline
     # runs from the attention core's eager break point instead
@@ -753,13 +754,15 @@ def _minimax_h3_qknorm_rope_pipelined_attention(
     head_dim = attention.head_dim
     q_weight, k_weight = attention.q_norm.weight, attention.k_norm.weight
 
-    def fill(head_start: int, head_count: int, dst: torch.Tensor) -> None:
+    def fill(
+        head_start: int, head_count: int, q_dst: torch.Tensor, k_dst: torch.Tensor
+    ) -> None:
         heads = slice(head_start, head_start + head_count)
         fused_qknorm_rope_out_of_place(
             q[:, heads],
             k[:, heads],
-            dst[..., :head_dim],
-            dst[..., head_dim : 2 * head_dim],
+            q_dst,
+            k_dst,
             q_weight,
             k_weight,
             cos_sin_cache,
@@ -770,7 +773,6 @@ def _minimax_h3_qknorm_rope_pipelined_attention(
             rope_dim=cos_sin_cache.shape[-1],
             round_norm_before_rope=True,
         )
-        dst[..., 2 * head_dim :].copy_(v[:, heads])
 
     return _minimax_h3_pipelined_dense_attention(
         attention,
@@ -1792,8 +1794,8 @@ class MiniMaxH3FinalLayer(nn.Module):
         if not 0 <= step < stack.shape[0]:
             raise ValueError(
                 f"MiniMax-H3 PDD has {stack.shape[0]} fused heads but the loop is at "
-                f"step {step}; run with --num-inference-steps {stack.shape[0] + 1} "
-                "(H3 counts sigma grid points, so that is one more than the steps)."
+                f"step {step}; run with --num-inference-steps {stack.shape[0]} "
+                "(num_inference_steps counts denoise transitions)."
             )
         weight = stack[step].to(device=h.device, dtype=h.dtype)
         bias = heads[f"{name}.bias"][step].to(device=h.device, dtype=h.dtype)

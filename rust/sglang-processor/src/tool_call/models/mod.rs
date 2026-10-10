@@ -12,6 +12,7 @@ pub(crate) fn tool_detector(
 ) -> Option<Box<dyn ToolDetector>> {
     let detector = match tool_parser {
         "deepseekv4" => deepseek_v4::DsmlDetector::new(deepseek_v4::DSML_TAGS, tool_names),
+        "deepseekv41" => deepseek_v4::DsmlDetector::new(deepseek_v4::DSML_TAGS_V41, tool_names),
         _ => return None,
     };
     Some(Box::new(detector))
