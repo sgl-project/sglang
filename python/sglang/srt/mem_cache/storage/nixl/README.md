@@ -455,6 +455,10 @@ When `use_direct_io = true` with any file-based backend (POSIX, GDS, GDS_MT, 3FS
 * **Zero-copy mode** (`page_first` / `page_first_direct` layout): the host memory pool is always mmap-backed and therefore page-aligned. If the per-page stride is also a multiple of 4 KiB, zero-copy transfers are used as-is.
 * **Copy mode** (all other layouts, or if stride alignment cannot be satisfied): SGLang pre-allocates page-aligned bounce buffers via `mmap` and falls back to copy mode, logging a warning. No user action is required -- this is fully automatic.
 
+**Startup write check**
+
+With any file-based backend, and regardless of `use_direct_io`, SGLang checks at startup that every storage directory accepts a buffered write and that its bucket subdirectories are writable. Buffered I/O is the fallback when `O_DIRECT` is unusable, so a permission or read-only error (`EACCES`, `EPERM`, `EROFS`) stops startup with the offending directory in the message; other errors such as a full disk only log a warning.
+
 To disable `O_DIRECT` (e.g. for debugging or when the filesystem does not support it):
 
 ```toml
