@@ -782,6 +782,7 @@ class DeepseekSparseAttnBackend(
         q_dtype: torch.dtype,
         kv_dtype: torch.dtype,
     ) -> dict:
+        kv_indptr = kv_indptr[: bs + 1]
         self._ensure_aiter_dsa_decode_metadata_buffer(
             max_seqlen_q=max_seqlen_q,
             batch_size=bs,
