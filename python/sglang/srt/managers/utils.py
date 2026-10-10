@@ -76,7 +76,13 @@ class GenerationBatchResult:
     copy_done: Optional[torch.cuda.Event] = None
     delay_sample_func: Optional[callable] = None
     future_indices: Optional[torch.Tensor] = None
+    # Configuration used by the completed verify forward.
+    speculative_num_steps: Optional[int] = None
     speculative_num_draft_tokens: Optional[int] = None
+    # Configuration used to build next_verify_chain, which may change after
+    # verify and before PP tail-draft.
+    next_speculative_num_steps: Optional[int] = None
+    next_speculative_num_draft_tokens: Optional[int] = None
     # Padded row width in flattened speculative output. Existing algorithms
     # default to speculative_num_draft_tokens; linear UNO emits F + 1 columns.
     speculative_output_stride: Optional[int] = None

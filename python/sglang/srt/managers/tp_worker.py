@@ -92,6 +92,9 @@ class BaseTpWorker(ABC):
         """No-op mirror of BaseSpecWorker's hook: PP+spec non-last stages
         process relayed spec results through a plain worker."""
 
+    def activate_speculative_step(self, speculative_num_steps: int) -> None:
+        """Activate a PP-relayed speculative runtime state, when supported."""
+
     @property
     def last_shared_read_runner(self):
         # The runner that runs the step's LAST shared-buffer-reading phase --
@@ -389,6 +392,7 @@ class TpModelWorker(BaseTpWorker):
         self.enable_overlap = not get_schedule().disable_overlap_schedule
         self.enable_spec = get_spec().speculative_algorithm is not None
         self.hicache_layer_transfer_counter = None
+        self._pp_adaptive_target_states = None
 
     def alloc_memory_pool(
         self,
@@ -430,6 +434,34 @@ class TpModelWorker(BaseTpWorker):
         )
         for mr in self.model_runner_list[1:]:
             mr.init_cuda_graphs(capture_decode_cuda_graph=capture_decode_cuda_graph)
+        if self._needs_pp_adaptive_target_states():
+            from sglang.srt.speculative.pp_adaptive_target_state import (
+                PPAdaptiveTargetStateManager,
+            )
+
+            self._pp_adaptive_target_states = PPAdaptiveTargetStateManager(
+                self.model_runner
+            )
+
+    def _needs_pp_adaptive_target_states(self) -> bool:
+        return (
+            envs.SGLANG_ENABLE_PP_SPEC.get()
+            and get_parallel().pp_size > 1
+            and get_spec().speculative_adaptive
+            and not self.is_draft_worker
+            and not self.pp_group.is_last_rank
+        )
+
+    def activate_speculative_step(self, speculative_num_steps: int) -> None:
+        manager = self._pp_adaptive_target_states
+        if manager is not None:
+            manager.activate(speculative_num_steps)
+        elif speculative_num_steps != get_spec().speculative_num_steps:
+            raise RuntimeError(
+                "PP requested speculative steps="
+                f"{speculative_num_steps}, but this target worker has no adaptive "
+                "runtime-state registry"
+            )
 
     def ensure_decode_cuda_graphs(self, capture_bs: Optional[List[int]] = None):
         """Idempotently capture decode cuda graphs for all model runners (used

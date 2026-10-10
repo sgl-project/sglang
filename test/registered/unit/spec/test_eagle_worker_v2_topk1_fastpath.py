@@ -13,6 +13,7 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.adaptive_runtime_state import SpecRuntimeState
@@ -333,6 +334,8 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
             draft_extend_attn_backend=object(),
             cuda_graph_runner=object(),
             cuda_graph_runner_for_draft_extend=object(),
+            _topk1_parents_prealloc=object(),
+            _topk1_score_indices_prealloc=object(),
             draft_runner=draft_runner,
             # _override_worker_state / apply_runtime_state call this hook; the
             # topk=1 buffers are exercised by the fast-path tests above.
@@ -347,6 +350,7 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
         )
         worker.speculative_num_steps = 2
         worker.speculative_num_draft_tokens = 3
+        worker.topk = 1
         worker.server_args = _fake_server_args(
             speculative_num_steps=2,
             speculative_num_draft_tokens=3,
@@ -373,6 +377,8 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
         # Switching to another step config must repoint the runner backend at
         # that config's draft-extend backend (read by the draft-extend forward).
         new_extend_backend = object()
+        new_parents = object()
+        new_score_indices = object()
         worker, dw = self._make_adaptive_worker(object())
 
         state = SpecRuntimeState(
@@ -384,10 +390,47 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
             target_graph_runner=object(),
             draft_extend_attn_backend=new_extend_backend,
             cuda_graph_runner_for_draft_extend=object(),
+            topk1_parents_prealloc=new_parents,
+            topk1_score_indices_prealloc=new_score_indices,
         )
         worker.apply_runtime_state(state)
 
         self.assertIs(dw.draft_runner.attn_backend, new_extend_backend)
+        self.assertIs(dw._topk1_parents_prealloc, new_parents)
+        self.assertIs(dw._topk1_score_indices_prealloc, new_score_indices)
+
+    def test_pp_selects_next_draft_state_from_completed_verify(self):
+        worker = object.__new__(EAGLEWorkerV2)
+        worker.adaptive_controller = MagicMock()
+        worker.adaptive_controller.activate_step_by_batch.return_value = 3
+        batch = SimpleNamespace(reqs=[object(), object()])
+        result = GenerationBatchResult(
+            accept_lens=torch.tensor([4, 2]),
+            speculative_num_steps=7,
+        )
+
+        worker._select_pp_next_draft_state(batch, result)
+
+        worker.adaptive_controller.on_verify_complete.assert_called_once_with(
+            [3, 1], batch_size=2, executed_steps=7
+        )
+        worker.adaptive_controller.activate_step_by_batch.assert_called_once_with(2)
+        self.assertEqual(result.next_speculative_num_steps, 3)
+        self.assertEqual(result.next_speculative_num_draft_tokens, 4)
+
+    def test_pp_next_draft_state_can_disable_drafting(self):
+        worker = object.__new__(EAGLEWorkerV2)
+        worker.adaptive_controller = MagicMock()
+        worker.adaptive_controller.activate_step_by_batch.return_value = 0
+        result = GenerationBatchResult(
+            accept_lens=torch.tensor([2]),
+            speculative_num_steps=1,
+        )
+
+        worker._select_pp_next_draft_state(SimpleNamespace(reqs=[object()]), result)
+
+        self.assertEqual(result.next_speculative_num_steps, 0)
+        self.assertEqual(result.next_speculative_num_draft_tokens, 1)
 
     def test_spec_v2_attn_backends_include_draft_extend_fallback(self):
         target_backend = object()

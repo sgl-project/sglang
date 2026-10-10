@@ -125,7 +125,6 @@ class EagleDraftWorkerBase(ABC):
             f"got {self.speculative_num_draft_tokens} and {self.speculative_num_steps}"
         )
         num_steps = self.speculative_num_steps
-        sa = self.server_args
         decode_max_bs = (
             get_exec().graph.cuda_graph_config.decode.max_bs
             if get_exec().graph.cuda_graph_config is not None

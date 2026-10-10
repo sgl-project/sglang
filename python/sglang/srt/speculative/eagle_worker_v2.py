@@ -1336,6 +1336,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
                         target_graph_runner=self._target_worker.model_runner.decode_cuda_graph_runner,
                         draft_extend_attn_backend=self._draft_worker.draft_extend_attn_backend,
                         cuda_graph_runner_for_draft_extend=self._draft_worker.cuda_graph_runner_for_draft_extend,
+                        topk1_parents_prealloc=self._draft_worker._topk1_parents_prealloc,
+                        topk1_score_indices_prealloc=self._draft_worker._topk1_score_indices_prealloc,
                     )
                 )
                 self.adaptive_controller.init_states(
@@ -1375,7 +1377,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
                         batch, plan, on_publish, grammar_barrier, pp_proxy_tensors
                     )
         else:
-            self.activate_step_by_batch(batch.seq_lens.shape[0])
+            # Under PP the relayed microbatch owns its runtime configuration;
+            # the scheduler activates it before rebuilding EagleVerifyInput.
+            # A process-local batch-size lookup here could overwrite that state
+            # while older configurations are still in flight.
+            if not (envs.SGLANG_ENABLE_PP_SPEC.get() and get_parallel().pp_size > 1):
+                self.activate_step_by_batch(batch.seq_lens.shape[0])
 
             if batch.spec_info is None:
                 capture_mode = (
@@ -1437,11 +1444,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
                         batch, batch_output, kv_loc_plan=verify_input.kv_loc_plan
                     )
 
-            if (
-                get_parallel().pp_size > 1
-                and not batch.forward_mode.is_idle()
-                and self.speculative_num_steps > 0
-            ):
+            is_pp_decode = (
+                get_parallel().pp_size > 1 and not batch.forward_mode.is_idle()
+            )
+            if is_pp_decode and self.adaptive_controller is not None:
+                self._select_pp_next_draft_state(batch, batch_output)
+
+            if is_pp_decode and self.speculative_num_steps > 0:
                 # PP tail-draft: draft the NEXT round's chain now — earlier
                 # stages must have the tokens before running their half of the
                 # next verify forward, so drafting cannot wait for the next
@@ -1477,6 +1486,36 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 batch_output.next_verify_top_scores_index = top_scores_index.clone()
 
             return batch_output
+
+    def _select_pp_next_draft_state(
+        self, batch: ScheduleBatch, batch_output: GenerationBatchResult
+    ) -> None:
+        """Select the state that produces the next PP proposal.
+
+        The current proposal has already been verified and draft KV has been
+        extended under its owning state. PP tail-draft is therefore the first
+        point where a new adaptive state can take effect without discarding or
+        relabelling an existing proposal.
+        """
+        if batch_output.accept_lens is None:
+            raise RuntimeError("PP adaptive verify result is missing accept_lens")
+        executed_steps = batch_output.speculative_num_steps
+        if executed_steps is None:
+            raise RuntimeError("PP adaptive verify result is missing executed steps")
+
+        accept_lens = batch_output.accept_lens.to("cpu").tolist()
+        num_non_draft = batch_output.num_non_draft_tokens_per_req
+        num_correct_drafts = [length - num_non_draft for length in accept_lens]
+        batch_size = len(batch.reqs)
+
+        self.adaptive_controller.on_verify_complete(
+            num_correct_drafts,
+            batch_size=batch_size,
+            executed_steps=executed_steps,
+        )
+        next_steps = self.adaptive_controller.activate_step_by_batch(batch_size)
+        batch_output.next_speculative_num_steps = next_steps
+        batch_output.next_speculative_num_draft_tokens = next_steps + 1
 
     def _forward_prefill_batch(
         self, batch, on_publish=None, pp_proxy_tensors=None, coordination_plan=None
@@ -1696,14 +1735,30 @@ class EAGLEWorkerV2(BaseSpecWorker):
     def on_verify_complete_cpu(
         self, num_correct_drafts_per_req: list[int], batch_size: int = 0
     ) -> None:
+        if envs.SGLANG_ENABLE_PP_SPEC.get() and get_parallel().pp_size > 1:
+            # PP updates the draft-host policy before tail-draft, where it can
+            # choose the state that generates the next proposal. Do not feed
+            # the same verify result again during scheduler result processing.
+            return
         if self.adaptive_controller is not None:
             self.adaptive_controller.on_verify_complete(
-                num_correct_drafts_per_req, batch_size=batch_size
+                num_correct_drafts_per_req,
+                batch_size=batch_size,
             )
 
     def activate_step_by_batch(self, batch_size: int) -> None:
         if self.adaptive_controller is not None:
             self.adaptive_controller.activate_step_by_batch(batch_size)
+
+    def activate_speculative_step(self, speculative_num_steps: int) -> None:
+        if self.adaptive_controller is not None:
+            self.adaptive_controller.activate_step(speculative_num_steps)
+        elif speculative_num_steps != self.speculative_num_steps:
+            raise RuntimeError(
+                "PP requested speculative steps="
+                f"{speculative_num_steps}, but the EAGLE worker has no adaptive "
+                "runtime-state registry"
+            )
 
     # -- Adaptive speculative decoding protocol --
 
@@ -1773,6 +1828,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 target_graph_runner=target_graph_runner,
                 draft_extend_attn_backend=self._draft_worker.draft_extend_attn_backend,
                 cuda_graph_runner_for_draft_extend=self._draft_worker.cuda_graph_runner_for_draft_extend,
+                topk1_parents_prealloc=self._draft_worker._topk1_parents_prealloc,
+                topk1_score_indices_prealloc=self._draft_worker._topk1_score_indices_prealloc,
             )
 
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
@@ -1817,7 +1874,16 @@ class EAGLEWorkerV2(BaseSpecWorker):
         if state.draft_extend_attn_backend is not None:
             dw.draft_runner.attn_backend = state.draft_extend_attn_backend
         dw.cuda_graph_runner_for_draft_extend = state.cuda_graph_runner_for_draft_extend
-        dw._rebuild_topk1_chain_buffers()
+        if getattr(self, "topk", None) == 1:
+            if (
+                state.topk1_parents_prealloc is None
+                or state.topk1_score_indices_prealloc is None
+            ):
+                raise RuntimeError(
+                    "Adaptive runtime state is missing its top-k-one chain buffers"
+                )
+            dw._topk1_parents_prealloc = state.topk1_parents_prealloc
+            dw._topk1_score_indices_prealloc = state.topk1_score_indices_prealloc
 
         # Target side
         self._target_worker.model_runner.attn_backend = state.target_attn_backend

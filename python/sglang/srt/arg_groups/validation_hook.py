@@ -64,11 +64,6 @@ def check_pipeline_parallel_compat(cfg: Any) -> None:
             assert cfg.disaggregation_mode == "null", (
                 "SGLANG_ENABLE_PP_SPEC is not compatible with --disaggregation-mode"
             )
-            # The PP relay slices spec results with the configured
-            # num_draft_tokens; adaptive spec changes it at runtime.
-            assert not cfg.speculative_adaptive, (
-                "SGLANG_ENABLE_PP_SPEC is not compatible with --speculative-adaptive"
-            )
             # Every stage rebuilds the same verify input from the relayed
             # per-request state, so all stages must see the same batch.
             # DP attention partitions it per DP rank.
