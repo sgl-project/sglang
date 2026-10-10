@@ -318,6 +318,61 @@ def test_fl2va_first_last_used_prefix_matches_comfyui():
     ]
 
 
+@pytest.mark.parametrize("keyframes", [False, True])
+def test_vsa_h3_tiles_cover_comfyui_packed_rows(keyframes):
+    """Integrated steps hand ComfyUI's own layout to the VSA-H3 tile builder,
+    which assumes text, cond and audio prefixes followed by the raster video
+    rows; a reordered layout would mis-tile attention silently."""
+    from types import SimpleNamespace
+
+    from sglang.multimodal_gen.configs.models.dits.minimax_h3 import MiniMaxH3DiTConfig
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.denoising import (
+        _maybe_prepare_vsa_h3_step_metadata,
+    )
+    from sglang.multimodal_gen.runtime.platforms.interface import AttentionBackendEnum
+
+    text_len, latent_t, latent_h, latent_w, audio_t = 7, 3, 8, 12, 5
+    layout = ComfyUIPackedLayout(
+        text_len,
+        latent_t,
+        latent_h,
+        latent_w,
+        audio_t,
+        keyframes=(
+            [{"resolved_frame_index": 0, "latent": torch.zeros(1, 24, 1, 8, 12)}]
+            if keyframes
+            else None
+        ),
+    )
+    packed = comfyui_layout_to_packed(serialize_comfyui_layout(layout))
+    model = SimpleNamespace(
+        _resolve_attention_backend_once=lambda: None,
+        _resolved_attention_backend=AttentionBackendEnum.VIDEO_SPARSE_ATTN_H3,
+    )
+    server_args = SimpleNamespace(
+        attention_backend_config={},
+        pipeline_config=SimpleNamespace(
+            vsa_sparsity=0.8, dit_config=MiniMaxH3DiTConfig()
+        ),
+    )
+    build = _maybe_prepare_vsa_h3_step_metadata(
+        model=model,
+        packed=packed,
+        is_ref2va=False,
+        latent_shape=(latent_t, latent_h, latent_w),
+        server_args=server_args,
+        device=torch.device("cpu"),
+    )
+    used = int(packed["cu_seqlens"][1])
+    assert build(0).total_seq_length == used
+    video = packed["img_pos"][packed["update_mask"].bool()]
+    video_start = used - video.numel()
+    assert torch.equal(video, torch.arange(video_start, used))
+    audio = packed["audio_pos"]
+    assert torch.equal(audio, torch.arange(video_start - audio.numel(), video_start))
+    assert torch.equal(packed["text_pos"], torch.arange(text_len))
+
+
 def test_ref2va_image_plus_video_audio_used_prefix_matches_comfyui():
     kwargs = dict(text_len=5, latent_t=2, latent_h=4, latent_w=4, audio_t=5)
     refs = [
