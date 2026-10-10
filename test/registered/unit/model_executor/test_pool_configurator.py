@@ -1349,7 +1349,9 @@ class TestSWAPoolFloor(CustomTestCase):
             sliding_window_size=128,
             page_size=256,
             spec_algorithm=spec,
-            spec_aux_config=SimpleNamespace(dflash_draft_num_layers=3),
+            spec_aux_config=SimpleNamespace(
+                dflash_draft_num_layers=40, dspark_num_stages=3
+            ),
         )
         planner = DSV4PoolConfigurator(kvc)
         self.assertEqual(planner.bytes_per_swa_token, 3 * 584)
@@ -1361,6 +1363,61 @@ class TestSWAPoolFloor(CustomTestCase):
             + planner._get_swa_fixed_bytes(),
             budget,
         )
+
+    def test_dsv4_replay_swa_fixed_prices_dspark_stages(self):
+        """A bundled DSpark head inherits the target's num_hidden_layers; the paged
+        SWA it owns under encoder replay must be priced by its stages only."""
+        from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
+
+        cfg = SimpleNamespace(
+            qk_nope_head_dim=448,
+            qk_rope_head_dim=64,
+            index_head_dim=128,
+            context_len=1048576,
+            compress_ratios=[0, 0] + [2] * 18 + [1] * 20,
+            window_size=128,
+            hf_config=SimpleNamespace(kv_source_layer_ids=[2, 8, 14, 20]),
+        )
+        spec = SimpleNamespace(is_dspark=lambda: True, is_none=lambda: False)
+        fixed = {}
+        for tails in (256, 4096):
+            _publish_config(
+                self,
+                enable_encoder_swa_bounded_replay=True,
+                speculative_algorithm="DSPARK",
+                speculative_num_draft_tokens=6,
+                speculative_dspark_block_size=5,
+                page_size=256,
+                max_running_requests=64,
+                chunked_prefill_size=8192,
+                swa_prefix_tails=tails,
+            )
+            kvc = SimpleNamespace(
+                kv_cache_dtype_str="fp8_e4m3",
+                model_config=cfg,
+                layer_info=SimpleNamespace(start_layer=0, end_layer=40),
+                pp_size=1,
+                attn_dp_size=1,
+                sliding_window_size=128,
+                page_size=256,
+                spec_algorithm=spec,
+                spec_aux_config=SimpleNamespace(
+                    dflash_draft_num_layers=40, dspark_num_stages=3
+                ),
+            )
+            planner = DSV4PoolConfigurator(kvc)
+            self.assertEqual(planner.paged_draft_layers, 3)
+            self.assertEqual(planner.bytes_per_swa_token, 3 * 584)
+            paged = planner.swa_cap_tokens * 3 * 584
+            self.assertEqual(
+                planner._get_swa_fixed_bytes(), planner.request_window_bytes + paged
+            )
+            fixed[tails] = (planner.swa_cap_tokens, paged)
+        # Cap tokens match the AgentX startup logs (DSV4 SWA sizing, TP0).
+        self.assertEqual(fixed[256][0], 189440)
+        self.assertEqual(fixed[4096][0], 1664000)
+        # 4096 tails cost < 3 GiB of draft SWA; at 40 layers it was ~36 GiB.
+        self.assertLess(fixed[4096][1], 3 << 30)
 
     def test_dsv4_trtllm_kv_bytes(self):
         from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator

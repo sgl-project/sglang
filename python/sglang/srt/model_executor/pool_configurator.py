@@ -1157,8 +1157,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.encoder_replay = get_exec().features.enable_encoder_swa_bounded_replay
         self.paged_draft_layers = 0
         if self.encoder_replay and kvc.spec_algorithm.is_dspark():
+            aux = kvc.spec_aux_config
             self.paged_draft_layers = int(
-                kvc.spec_aux_config.dflash_draft_num_layers or 0
+                aux.dspark_num_stages or aux.dflash_draft_num_layers or 0
             )
             assert self.paged_draft_layers > 0, "DSpark draft layer count is required"
         self.request_window_bytes = 0
