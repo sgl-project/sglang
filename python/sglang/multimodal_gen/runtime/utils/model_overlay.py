@@ -20,6 +20,7 @@ from requests.exceptions import RequestException
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.loader.weight_utils import get_lock
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.utils.common import retry_on_hub_rate_limit
 from sglang.utils import load_diffusion_overlay_registry_from_env
 
 logger = init_logger(__name__)
@@ -470,11 +471,13 @@ def download_overlay_metadata(
         overlay_repo_id,
     )
     return str(
-        snapshot_download_fn(
-            repo_id=overlay_repo_id,
-            allow_patterns=MODEL_OVERLAY_METADATA_PATTERNS,
-            revision=revision,
-            max_workers=4,
+        retry_on_hub_rate_limit(
+            lambda: snapshot_download_fn(
+                repo_id=overlay_repo_id,
+                allow_patterns=MODEL_OVERLAY_METADATA_PATTERNS,
+                revision=revision,
+                max_workers=4,
+            )
         )
     )
 

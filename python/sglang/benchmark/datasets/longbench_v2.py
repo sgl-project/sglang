@@ -1,3 +1,4 @@
+import json
 import random
 from argparse import Namespace
 from dataclasses import dataclass
@@ -8,7 +9,22 @@ from transformers import PreTrainedTokenizerBase
 from sglang.benchmark.datasets.common import BaseDataset, DatasetRow
 
 LONGBENCH_V2_REPO_ID = "THUDM/LongBench-v2"
+# Pinned to a commit so a cached copy loads without any Hub API call.
+LONGBENCH_V2_REVISION = "2b48e494f2c7a2f0af81aae178e05c7e1dde0fe9"
 LONGBENCH_V2_DEFAULT_OUTPUT_LEN = 10  # answer letter + short explanation
+
+
+def load_longbench_v2_examples() -> List[dict]:
+    from huggingface_hub import hf_hub_download
+
+    path = hf_hub_download(
+        LONGBENCH_V2_REPO_ID,
+        "data.json",
+        repo_type="dataset",
+        revision=LONGBENCH_V2_REVISION,
+    )
+    with open(path) as f:
+        return json.load(f)
 
 
 def _format_prompt(example: dict) -> str:
@@ -78,10 +94,7 @@ def sample_longbench_v2_requests(
             with open(dataset_path) as f:
                 examples = [json.loads(line) for line in f if line.strip()]
     else:
-        from datasets import load_dataset
-
-        ds = load_dataset(LONGBENCH_V2_REPO_ID, split="train")
-        examples = list(ds)
+        examples = load_longbench_v2_examples()
 
     random.shuffle(examples)
 

@@ -11,6 +11,7 @@ import re
 from typing import List, Optional, Tuple
 
 from datasets import concatenate_datasets, load_dataset
+from huggingface_hub import hf_hub_download
 from PIL import Image
 
 from sglang.test import simple_eval_common as common
@@ -22,6 +23,9 @@ from sglang.test.simple_eval_common import (
     SingleEvalResult,
     map_with_progress,
 )
+
+# Pinned to a commit so cached files load without any Hub API call.
+MMMU_REVISION = "876ce5cb130f7f7e290ce4d9984357737d4db5cf"
 
 
 class MMMUVLMEval(Eval):
@@ -100,7 +104,13 @@ class MMMUVLMEval(Eval):
         datasets = []
         for subj in subjects:
             try:
-                d = load_dataset("MMMU/MMMU", subj, split="validation")
+                path = hf_hub_download(
+                    "MMMU/MMMU",
+                    f"{subj}/validation-00000-of-00001.parquet",
+                    repo_type="dataset",
+                    revision=MMMU_REVISION,
+                )
+                d = load_dataset("parquet", data_files=path, split="train")
                 # attach subject info via transform
                 d = d.add_column("__subject__", [subj] * len(d))
                 datasets.append(d)

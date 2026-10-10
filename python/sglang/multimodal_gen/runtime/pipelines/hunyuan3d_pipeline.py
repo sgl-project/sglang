@@ -65,6 +65,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.h
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.precision_types import PRECISION_TO_TYPE
+from sglang.srt.utils.common import retry_on_hub_rate_limit
 
 logger = init_logger(__name__)
 
@@ -158,9 +159,11 @@ class Hunyuan3D2Pipeline(ComposedPipelineBase):
                 "Local path %s not found, downloading from HuggingFace Hub",
                 local_path,
             )
-            downloaded = snapshot_download(
-                repo_id=model_path,
-                allow_patterns=[f"{subfolder}/**"],
+            downloaded = retry_on_hub_rate_limit(
+                lambda: snapshot_download(
+                    repo_id=model_path,
+                    allow_patterns=[f"{subfolder}/**"],
+                )
             )
             local_path = os.path.join(downloaded, subfolder)
 
@@ -205,9 +208,11 @@ class Hunyuan3D2Pipeline(ComposedPipelineBase):
                 "Local path %s not found, downloading from HuggingFace Hub",
                 local_path,
             )
-            downloaded = snapshot_download(
-                repo_id=model_path,
-                allow_patterns=[f"{subfolder}/**"],
+            downloaded = retry_on_hub_rate_limit(
+                lambda: snapshot_download(
+                    repo_id=model_path,
+                    allow_patterns=[f"{subfolder}/**"],
+                )
             )
             local_path = os.path.join(downloaded, subfolder)
 

@@ -3946,12 +3946,22 @@ def has_fp8_weights_in_checkpoint(model_path: str) -> bool:
             from huggingface_hub import HfFileSystem
 
             fs = HfFileSystem()
+            snapshot_dir = find_local_repo_dir(model_path)
+
+            def _cached(name):
+                if snapshot_dir is None:
+                    return None
+                path = os.path.join(snapshot_dir, name)
+                return path if os.path.exists(path) else None
 
             def _open(name):
-                return fs.open(f"{model_path}/{name}", "rb")
+                path = _cached(name)
+                return (
+                    open(path, "rb") if path else fs.open(f"{model_path}/{name}", "rb")
+                )
 
             def _exists(name):
-                return fs.exists(f"{model_path}/{name}")
+                return _cached(name) is not None or fs.exists(f"{model_path}/{name}")
 
         if _exists("model.safetensors.index.json"):
             with _open("model.safetensors.index.json") as f:
@@ -4256,17 +4266,18 @@ def get_eager_max_batch_size(max_batch_size: int) -> int:
     return ceil_align(max_batch_size, get_cp_padding_align_size())
 
 
-def find_local_repo_dir(repo_id: str, revision: Optional[str] = None) -> Optional[str]:
+def find_local_repo_dir(
+    repo_id: str, revision: Optional[str] = None, cache_dir: Optional[str] = None
+) -> Optional[str]:
     import huggingface_hub as hf
 
     # Build cache path
     cache_path = os.path.join(
-        hf.constants.HF_HUB_CACHE,
+        cache_dir or hf.constants.HF_HUB_CACHE,
         hf.constants.REPO_ID_SEPARATOR.join(["models", *repo_id.split("/")]),
     )
 
-    # A branch or tag name (default "main") maps to a commit through refs/;
-    # snapshots/ is keyed by commit only.
+    # Snapshots are named by commit; a branch or tag maps to one through refs/.
     ref_path = os.path.join(cache_path, "refs", revision or "main")
     if os.path.isfile(ref_path):
         with open(ref_path) as f:
@@ -4279,6 +4290,59 @@ def find_local_repo_dir(repo_id: str, revision: Optional[str] = None) -> Optiona
             return rev_dir
 
     return None
+
+
+def _hub_rate_limit_response(error: Optional[BaseException]):
+    from huggingface_hub.errors import HfHubHTTPError
+
+    # snapshot_download re-raises an uncached 429 as LocalEntryNotFoundError.
+    while error is not None:
+        if (
+            isinstance(error, HfHubHTTPError)
+            and error.response is not None
+            and error.response.status_code == 429
+        ):
+            return error.response
+        error = error.__cause__
+    return None
+
+
+def retry_on_hub_rate_limit(fn: Callable[[], T], max_wait_s: float = 600) -> T:
+    from huggingface_hub.utils import parse_ratelimit_headers
+
+    deadline = time.monotonic() + max_wait_s
+    while True:
+        try:
+            return fn()
+        except Exception as e:
+            response = _hub_rate_limit_response(e)
+            remaining_s = deadline - time.monotonic()
+            if response is None or remaining_s <= 0:
+                raise
+            rate_limit = parse_ratelimit_headers(response.headers)
+            # Arbitrary fallback for a 429 without a RateLimit header.
+            wait_s = rate_limit.reset_in_seconds + 1 if rate_limit else 30
+            logger.warning(
+                "HF Hub rate limit hit, retrying in %ds: %s", wait_s, response.url
+            )
+            time.sleep(min(wait_s, remaining_s))
+
+
+def download_hf_file_if_exists(repo_id: str, filename: str, **kwargs) -> Optional[str]:
+    import huggingface_hub
+    from huggingface_hub.errors import LocalEntryNotFoundError, RemoteEntryNotFoundError
+
+    try:
+        return huggingface_hub.hf_hub_download(
+            repo_id=repo_id, filename=filename, **kwargs
+        )
+    except RemoteEntryNotFoundError:
+        return None
+    except LocalEntryNotFoundError:
+        # Offline, a file missing from the cache is absent; online, the Hub failed.
+        if huggingface_hub.constants.HF_HUB_OFFLINE or kwargs.get("local_files_only"):
+            return None
+        raise
 
 
 def read_system_prompt_from_file(model_name: str) -> str:

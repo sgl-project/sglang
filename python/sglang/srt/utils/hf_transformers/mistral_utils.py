@@ -421,7 +421,6 @@ def wrap_as_pixtral(processor, config):
 _MISTRAL_COMMON_REJECTED_KWARGS = frozenset(
     {
         "trust_remote_code",
-        "tokenizer_revision",
         "use_fast",
         "_from_auto",
         "clean_up_tokenization_spaces",

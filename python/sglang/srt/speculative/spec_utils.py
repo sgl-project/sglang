@@ -8,7 +8,7 @@ from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Callable, List, Literal, Optional, Tuple
 
 import torch
-from huggingface_hub import snapshot_download
+from huggingface_hub import hf_hub_download
 
 from sglang.kernels.ops.sampling import softmax as sampling_softmax
 from sglang.kernels.ops.speculative.cache_locs import (
@@ -726,19 +726,17 @@ def load_token_map(token_map_path: str) -> List[int]:
             if os.path.exists(cached_repo_path):
                 cache_dir = cached_repo_path
 
-        if cache_dir is None:
-            if envs.SGLANG_USE_MODELSCOPE.get():
-                from modelscope.hub.snapshot_download import (
-                    snapshot_download as download_func,
-                )
-            else:
-                download_func = snapshot_download
-            cache_dir = download_func(
-                repo_id,
-                ignore_patterns=["*.bin", "*.safetensors"],
-            )
+        if cache_dir is None and not envs.SGLANG_USE_MODELSCOPE.get():
+            token_map_path = hf_hub_download(repo_id=repo_id, filename=file_name)
+        else:
+            if cache_dir is None:
+                from modelscope.hub.snapshot_download import snapshot_download
 
-        token_map_path = os.path.join(cache_dir, file_name)
+                cache_dir = snapshot_download(
+                    repo_id,
+                    ignore_patterns=["*.bin", "*.safetensors"],
+                )
+            token_map_path = os.path.join(cache_dir, file_name)
     hot_token_id = torch.load(token_map_path, weights_only=True)
     return torch.tensor(hot_token_id, dtype=torch.int64)
 

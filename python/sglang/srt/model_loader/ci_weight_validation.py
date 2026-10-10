@@ -18,7 +18,11 @@ from typing import List, Optional, Tuple
 
 import safetensors
 
-from sglang.srt.utils import log_info_on_rank0
+from sglang.srt.utils import (
+    find_local_repo_dir,
+    log_info_on_rank0,
+    retry_on_hub_rate_limit,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -152,11 +156,20 @@ def validate_cache_lightweight(
                 custom_files = set()
                 for key, value in auto_map.items():
                     if isinstance(value, str) and "." in value:
-                        module_name = value.split(".")[0]
-                        custom_files.add(f"{module_name}.py")
+                        # "owner/repo--module.Class" loads its code from another repo.
+                        code_repo, _, reference = value.rpartition("--")
+                        code_dir = (
+                            find_local_repo_dir(code_repo)
+                            if code_repo
+                            else snapshot_dir
+                        )
+                        if code_dir is None:
+                            return False
+                        module_name = reference.split(".")[0]
+                        custom_files.add(os.path.join(code_dir, f"{module_name}.py"))
 
-                for custom_file in custom_files:
-                    custom_file_path = os.path.join(snapshot_dir, custom_file)
+                for custom_file_path in custom_files:
+                    custom_file = os.path.basename(custom_file_path)
                     if not os.path.exists(custom_file_path):
                         logger.debug(
                             "Custom module file not in snapshot: %s for %s",
@@ -782,19 +795,21 @@ def ci_download_with_validation_and_retry(
         hf_folder = None
         for attempt in range(max_retries):
             try:
-                hf_folder = snapshot_download(
-                    model_name_or_path,
-                    allow_patterns=allow_patterns,
-                    ignore_patterns=ignore_patterns,
-                    cache_dir=cache_dir,
-                    tqdm_class=DisabledTqdm,
-                    revision=revision,
-                    local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
-                    # Force single-threaded downloads to prevent race conditions
-                    # on NFS. HF hub defaults to max_workers=8, which can cause
-                    # .incomplete file conflicts when multiple threads operate
-                    # on the same files
-                    max_workers=1,
+                hf_folder = retry_on_hub_rate_limit(
+                    lambda: snapshot_download(
+                        model_name_or_path,
+                        allow_patterns=allow_patterns,
+                        ignore_patterns=ignore_patterns,
+                        cache_dir=cache_dir,
+                        tqdm_class=DisabledTqdm,
+                        revision=revision,
+                        local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
+                        # Force single-threaded downloads to prevent race conditions
+                        # on NFS. HF hub defaults to max_workers=8, which can cause
+                        # .incomplete file conflicts when multiple threads operate
+                        # on the same files
+                        max_workers=1,
+                    )
                 )
             except (FileNotFoundError, OSError) as e:
                 # Race condition: .incomplete file was moved/deleted by another
