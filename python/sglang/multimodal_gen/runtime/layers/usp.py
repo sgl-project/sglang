@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
-import torch.distributed._functional_collectives as ft_c
 from torch.distributed.tensor.experimental._attention import _cp_options
 
 from sglang.kernels.ops.diffusion import pack_qkv_destination_major, usp_merge_heads
@@ -26,16 +25,6 @@ if TYPE_CHECKING:
     )
 
 logger = logging.getLogger(__name__)
-
-
-def _maybe_wait(tensor: torch.Tensor) -> torch.Tensor:
-    """
-    When tracing the code, the result tensor is not an AsyncCollectiveTensor,
-    so we cannot call ``wait()``.
-    """
-    if isinstance(tensor, ft_c.AsyncCollectiveTensor):
-        return tensor.wait()
-    return tensor
 
 
 _A2A_STAGING_BUFFERS: dict[tuple[str, torch.dtype, int], torch.Tensor] = {}
@@ -99,6 +88,17 @@ def _usp_all_to_all_single(x: torch.Tensor, role: str | None = None) -> torch.Te
     assert ulysses_pg is not None, "Ulysses process group is not initialized."
     x_shape = x.shape
     x = x.flatten().contiguous()
+    if x.is_cuda:
+        from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a_multi import (
+            IPC_A2A_MULTI,
+            ipc_a2a_multi_ready,
+        )
+
+        if ipc_a2a_multi_ready(ulysses_pg):
+            world_size = torch.distributed.get_world_size(group=ulysses_pg)
+            received = IPC_A2A_MULTI.exchange(x.view(world_size, -1))
+            if received is not None:
+                return received.view(x_shape)
     if role is None:
         output = torch.empty_like(x)
     else:
@@ -424,6 +424,18 @@ def _usp_input_all_to_all_packed_qkv(
     return q, k, v
 
 
+def _packed_qkv_row_view_is_free(x: torch.Tensor) -> bool:
+    """True when ``x.view(b * s_local, h, d)`` costs no copy.
+
+    The pack kernel reads q/k/v through explicit row/head strides, so only the
+    head_size dim has to be unit-stride; full contiguity is not required. The
+    batch and sequence dims still have to merge into one, which is free when
+    batch is 1 or when the two dims are already adjacent in memory.
+    """
+    batch, seq_local = x.shape[0], x.shape[1]
+    return x.stride(-1) == 1 and (batch == 1 or x.stride(0) == seq_local * x.stride(1))
+
+
 def _can_use_packed_qkv_a2a_4d(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, world_size: int
 ) -> bool:
@@ -433,9 +445,9 @@ def _can_use_packed_qkv_a2a_4d(
         and q.shape == k.shape == v.shape
         and q.dtype == k.dtype == v.dtype
         and q.dtype in (torch.float16, torch.bfloat16)
-        and q.is_contiguous()
-        and k.is_contiguous()
-        and v.is_contiguous()
+        and _packed_qkv_row_view_is_free(q)
+        and _packed_qkv_row_view_is_free(k)
+        and _packed_qkv_row_view_is_free(v)
         and q.shape[2] % world_size == 0
         and not torch.compiler.is_compiling()
     )
@@ -452,7 +464,8 @@ def _usp_input_all_to_all_qkv(
     destination-major by one relayout kernel and exchanged in a single
     collective instead of three; only data movement changes, so the result is
     bit-identical to the unpacked path, which stays as the fallback for
-    ineligible inputs (CPU, GQA-mismatched shapes, non-contiguous layouts).
+    ineligible inputs (CPU, GQA-mismatched shapes, layouts whose row view
+    would copy).
     Adapted from the NVlabs Sana sol-engine branch (Apache-2.0).
     """
     world_size = get_ulysses_parallel_world_size()

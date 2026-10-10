@@ -154,10 +154,6 @@
       "destination": "/docs/advanced_features/pd_disaggregation"
     },
     {
-      "source": "/advanced_features/piecewise_cuda_graph.html",
-      "destination": "/docs/advanced_features/piecewise_cuda_graph"
-    },
-    {
       "source": "/advanced_features/pipeline_parallelism.html",
       "destination": "/docs/advanced_features/pipeline_parallelism"
     },
@@ -944,6 +940,7 @@
               "docs/advanced_features/structured_outputs_for_reasoning_models",
               "docs/advanced_features/tool_parser",
               "docs/advanced_features/separate_reasoning",
+              "docs/advanced_features/thinking_budget",
               "docs/advanced_features/quantization",
               "docs/advanced_features/quantized_kv_cache",
               "docs/advanced_features/reasoning_aware_compression",
@@ -969,7 +966,6 @@
               "docs/advanced_features/dp_for_multi_modal_encoder",
               "docs/advanced_features/cuda_graph_for_multi_modal_encoder",
               "docs/advanced_features/breakable_cuda_graph",
-              "docs/advanced_features/piecewise_cuda_graph",
               "docs/advanced_features/sgl_model_gateway",
               "docs/advanced_features/llm-d",
               "docs/advanced_features/deterministic_inference",
@@ -1339,6 +1335,7 @@
                     "group": "Google",
                     "pages": [
                       "cookbook/autoregressive/Google/EmbeddingGemma",
+                      "cookbook/autoregressive/Google/EmbeddingGemma2",
                       "cookbook/autoregressive/Google/Gemma4",
                       "cookbook/autoregressive/Google/DiffusionGemma"
                     ]
@@ -1488,6 +1485,12 @@
                       "cookbook/autoregressive/Perplexity/PPLX-Decider-v1.1-27B",
                       "cookbook/autoregressive/Perplexity/PPLX-Decider-v1-27B"
                     ]
+                  },
+                  {
+                    "group": "Cloudflare",
+                    "pages": [
+                      "cookbook/autoregressive/Cloudflare/clef"
+                    ]
                   }
                 ]
               },
@@ -1495,6 +1498,12 @@
                 "group": "Diffusion Models",
                 "pages": [
                   "cookbook/diffusion/intro",
+                  {
+                    "group": "Tencent",
+                    "pages": [
+                      "cookbook/diffusion/Tencent/HunyuanImage3"
+                    ]
+                  },
                   {
                     "group": "Cosmos",
                     "pages": [
@@ -1515,9 +1524,11 @@
                   },
                   {
                     "group": "Wan",
+                    "tag": "NEW",
                     "pages": [
                       "cookbook/diffusion/Wan/Wan2.1",
-                      "cookbook/diffusion/Wan/Wan2.2"
+                      "cookbook/diffusion/Wan/Wan2.2",
+                      "cookbook/diffusion/Wan/Wan-Animate-2"
                     ]
                   },
                   {
@@ -1528,7 +1539,6 @@
                   },
                   {
                     "group": "LTX",
-                    "tag": "NEW",
                     "pages": [
                       "cookbook/diffusion/LTX/LTX2 & LTX2.3",
                       "cookbook/diffusion/LTX/LTX2.5"
@@ -1562,14 +1572,12 @@
                   },
                   {
                     "group": "SenseNova",
-                    "tag": "NEW",
                     "pages": [
                       "cookbook/diffusion/SenseNova/SenseNova-U1.5-8B-MoT"
                     ]
                   },
                   {
                     "group": "LongCat-Image",
-                    "tag": "NEW",
                     "pages": [
                       "cookbook/diffusion/LongCat/LongCat-Image"
                     ]
@@ -1606,14 +1614,12 @@
                   },
                   {
                     "group": "SANA Video",
-                    "tag": "NEW",
                     "pages": [
                       "cookbook/diffusion/SANA-Video/SANA-Video"
                     ]
                   },
                   {
                     "group": "MiniMax",
-                    "tag": "NEW",
                     "pages": [
                       "cookbook/diffusion/MiniMax/MiniMax-H3"
                     ]
@@ -1628,7 +1634,6 @@
                   },
                   {
                     "group": "LingBot Video",
-                    "tag": "NEW",
                     "pages": [
                       "cookbook/diffusion/LingBot-Video/LingBot-Video-MoE"
                     ]
