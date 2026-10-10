@@ -58,6 +58,8 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos3video import (
     compute_mrope_position_ids_action,
     compute_mrope_position_ids_sound,
     compute_mrope_position_ids_vision,
+    sequence_shard_padding,
+    shard_sequence,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3 import (
     Cosmos3DecodingStage,
@@ -2073,6 +2075,31 @@ class TestCosmos3DurationTemplateSuppression(unittest.TestCase):
     def test_prose_prompt_still_gets_the_duration_suffix(self):
         final = self._run_prompt_stage("A curious raccoon.", use_duration_template=True)
         self.assertIn("seconds long", final)
+
+
+class TestCosmos3SequenceSharding(unittest.TestCase):
+    def test_sequence_sharding_helpers(self):
+        """Every GEN modality (video, control, action, sound) rides one pad-and-
+        shard rule under Ulysses: tokens pad with zeros, RoPE positions pad by
+        repeating the last entry, each rank gets one contiguous chunk, and
+        degree 1 returns the input itself."""
+        self.assertEqual(sequence_shard_padding(10, 1), 0)
+        self.assertEqual(sequence_shard_padding(10, 4), 2)
+        self.assertEqual(sequence_shard_padding(12, 4), 0)
+        tokens = torch.arange(10.0).view(1, 10, 1)
+        self.assertEqual(
+            shard_sequence(tokens, 4, 0, dim=1, pad_last=False).flatten().tolist(),
+            [0.0, 1.0, 2.0],
+        )
+        self.assertEqual(
+            shard_sequence(tokens, 4, 3, dim=1, pad_last=False).flatten().tolist(),
+            [9.0, 0.0, 0.0],
+        )
+        positions = torch.arange(10).view(1, 1, 10).expand(3, 1, 10)
+        last = shard_sequence(positions, 4, 3, dim=2, pad_last=True)
+        self.assertEqual(last.shape, (3, 1, 3))
+        self.assertEqual(last[0, 0].tolist(), [9, 9, 9])
+        self.assertIs(shard_sequence(tokens, 1, 0, dim=1, pad_last=False), tokens)
 
 
 if __name__ == "__main__":
