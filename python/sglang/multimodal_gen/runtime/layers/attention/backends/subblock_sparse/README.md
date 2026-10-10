@@ -108,8 +108,8 @@ pip install git+https://github.com/thu-ml/SpargeAttn.git --no-build-isolation
 
 SM120 requires FlashInfer's CuTe-DSL SM120 Sage backend and
 `quantize_sage_qkv_sm120`, added in
-[FlashInfer #4691](https://github.com/flashinfer-ai/flashinfer/pull/4691)
-and shipped since FlashInfer 0.7.1, so the default install has them.
+[FlashInfer #4691](https://github.com/flashinfer-ai/flashinfer/pull/4691),
+which the default FlashInfer install includes.
 
 Enable it on SM90 or SM120 with:
 
