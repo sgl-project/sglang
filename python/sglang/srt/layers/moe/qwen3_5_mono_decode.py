@@ -30,8 +30,9 @@ from sglang.kernels.ops.moe.qwen3_5_mono_flydsl import layout as L
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_context import get_attn_backend
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_memory, get_parallel
 from sglang.srt.utils import is_gfx95_supported, is_hip
+from sglang.srt.utils.common import get_device_core_count
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +59,12 @@ def _unsupported(model) -> str | None:
         return "needs TP8 without DP attention"
     if model.pp_group.world_size != 1:
         return "pipeline parallel"
+    # Every CTA spin-waits on the others, so all of them must be resident.
+    if get_device_core_count() < L.BLOCKS:
+        return f"fewer than {L.BLOCKS} compute units (a partitioned GPU)"
+    # Their copy kernels on another stream can hold CUs the spinning CTAs need.
+    if get_memory().enable_hierarchical_cache or get_memory().enable_lmcache:
+        return "hierarchical cache or LMCache"
     shape = (
         c.hidden_size == L.HIDDEN
         and c.linear_num_key_heads == L.NK * L.TP
