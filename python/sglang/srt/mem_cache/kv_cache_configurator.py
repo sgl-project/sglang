@@ -111,14 +111,16 @@ from sglang.srt.utils.common import (
 logger = logging.getLogger(__name__)
 
 
-def _should_elide_dsa_index_k(*, is_draft_worker: bool) -> bool:
+def _should_elide_dsa_index_k(
+    *, is_draft_worker: bool, allow_disaggregation: bool = False
+) -> bool:
     memory_config = get_memory()
     return (
         not memory_config.enable_hisparse
         and not is_draft_worker
         and not memory_config.enable_hierarchical_cache
         and not memory_config.enable_unified_cache_external_linker
-        and get_disagg().disaggregation_mode == "null"
+        and (allow_disaggregation or get_disagg().disaggregation_mode == "null")
     )
 
 
@@ -1889,10 +1891,11 @@ class KVCacheConfigurator:
         else:
             index_size = max_total_num_tokens * dcp_size
         is_arch35 = is_npu_arch35()
-        use_compact_indexer_layout = (
-            is_dsa_model
-            and is_arch35
-            and _should_elide_dsa_index_k(is_draft_worker=self.is_draft_worker)
+        use_compact_indexer_layout = is_dsa_model and _should_elide_dsa_index_k(
+            is_draft_worker=self.is_draft_worker,
+            # Ascend PD publishes per-entry layer ids and can transfer the
+            # compact indexer list without relying on dense layer positions.
+            allow_disaggregation=True,
         )
         indexer_layer_ids = None
         if use_compact_indexer_layout:

@@ -867,10 +867,11 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         ]
 
     def get_kv_layer_ids(self):
-        return (
-            list(range(self.start_layer, self.start_layer + self.layer_num)) * 2
-            + self.get_state_layer_ids()
-        )
+        layer_ids = list(range(self.start_layer, self.start_layer + self.layer_num))
+        # FP8 DSA packs latent KV, RoPE bytes and scales into k_buffer and does
+        # not register the zero-width v_buffer for PD.
+        main_kv_layer_ids = layer_ids * (1 if self.dsa_kv_cache_store_fp8 else 2)
+        return main_kv_layer_ids + self.get_state_layer_ids()
 
     def get_state_layer_ids(self):
         return list(self.indexer_layer_ids) * (

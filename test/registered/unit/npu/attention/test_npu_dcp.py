@@ -358,6 +358,26 @@ class TestNpuDcpSparseAttentionContract(unittest.TestCase):
 
 
 class TestNpuDcpBufferAndLseHelpers(unittest.TestCase):
+    def test_kv_layer_ids_follow_compact_bf16_registration(self):
+        pool = object.__new__(NPUMLATokenToKVPool)
+        pool.start_layer = 2
+        pool.layer_num = 2
+        pool.indexer_layer_ids = (2,)
+        pool.index_k_scale_buffer = None
+        pool.dsa_kv_cache_store_fp8 = False
+
+        self.assertEqual(pool.get_kv_layer_ids(), [2, 3, 2, 3, 2])
+
+    def test_kv_layer_ids_follow_compact_fp8_registration(self):
+        pool = object.__new__(NPUMLATokenToKVPool)
+        pool.start_layer = 2
+        pool.layer_num = 2
+        pool.indexer_layer_ids = (2,)
+        pool.index_k_scale_buffer = object()
+        pool.dsa_kv_cache_store_fp8 = True
+
+        self.assertEqual(pool.get_kv_layer_ids(), [2, 3, 2, 2])
+
     def test_retraction_indices_map_target_kv_to_rank_local_slots(self):
         pool = SimpleNamespace(dcp_size=4, dcp_rank=2, page_size=2)
         indices = torch.tensor([0, 1, 4, 5, 6, 7, 12, 13], dtype=torch.int64)

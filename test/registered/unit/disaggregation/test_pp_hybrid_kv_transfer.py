@@ -354,6 +354,24 @@ class TestBuildKvLayerIds(CustomTestCase):
             [],
         )
 
+    def test_npu_compact_entries_publish_their_exact_layer_ids(self):
+        target = SimpleNamespace(
+            get_kv_layer_ids=lambda: [2, 3, 2, 3, 2],
+        )
+        draft = SimpleNamespace(
+            get_kv_layer_ids=lambda: [0, 0, 0],
+        )
+
+        self.assertEqual(
+            build_kv_layer_ids(
+                token_to_kv_pool=target,
+                draft_token_to_kv_pool=draft,
+                num_draft_entries=3,
+                num_hidden_layers=60,
+            ),
+            [2, 3, 2, 3, 2, 60, 60, 60],
+        )
+
     def test_ragged_draft_registration_is_rejected(self):
         with self.assertRaises(RuntimeError):
             build_kv_layer_ids(

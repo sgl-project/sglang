@@ -1048,11 +1048,10 @@ def build_kv_layer_ids(
     Returns [] for pools that cannot report ids, leaving the peers on positional
     pairing.
     """
-    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
-
-    if not isinstance(token_to_kv_pool, HybridLinearKVPool):
+    get_layer_ids = getattr(token_to_kv_pool, "get_kv_layer_ids", None)
+    if not callable(get_layer_ids):
         return []
-    layer_ids = token_to_kv_pool.get_kv_layer_ids()
+    layer_ids = list(get_layer_ids())
     if draft_token_to_kv_pool is None:
         return layer_ids
 
@@ -1068,10 +1067,9 @@ def _remap_draft_layer_ids(layer_ids: List[int], num_hidden_layers: int) -> List
 
 
 def _draft_entry_layer_ids(*, pool, num_entries: int) -> List[int]:
-    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
-
-    if isinstance(pool, HybridLinearKVPool):
-        ids = pool.get_kv_layer_ids()
+    get_layer_ids = getattr(pool, "get_kv_layer_ids", None)
+    if callable(get_layer_ids):
+        ids = list(get_layer_ids())
     else:
         # Pools register k0..k(L-1) then v0..v(L-1), so ids repeat once per
         # group; derive the group count rather than assuming MHA vs MLA.
