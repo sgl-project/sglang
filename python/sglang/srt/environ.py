@@ -1547,8 +1547,11 @@ class Envs:
     SGLANG_ENCODER_DP_WORKER_MAX_INFLIGHT = EnvInt(64)
 
     # ===================================================================
-    # Native gRPC server
+    # HTTP authentication and native gRPC server
     # ===================================================================
+    # Secret fields are excluded from scheduler environment snapshots.
+    SGLANG_API_KEY = EnvStr(None, secret=True)
+    SGLANG_ADMIN_API_KEY = EnvStr(None, secret=True)
     # Native gRPC server. SGLANG_GRPC_PORT is the env fallback for the
     # --grpc-port CLI flag; setting either enables the native server alongside
     # HTTP. The worker-threads knob stays env-only (internal tuning, no CLI

@@ -83,7 +83,7 @@ from sglang.srt.entrypoints.sidecar import (
     build_sidecar_endpoint,
     start_sidecar,
 )
-from sglang.srt.environ import envs
+from sglang.srt.environ import envs, exportable_env_vars
 from sglang.srt.layers.cp.base import is_cp_enabled, is_interleave
 from sglang.srt.layers.moe.utils import (
     FlashinferA2ADispatchType,
@@ -100,6 +100,7 @@ from sglang.srt.runtime_context import (
     get_context,
     get_serving,
     override_platform,
+    publish,
 )
 from sglang.srt.server_args import PortArgs, ServerArgs, prepare_server_args
 from sglang.srt.utils.server_args_config_parser import ConfigArgumentMerger
@@ -120,6 +121,121 @@ _mock_device.start()
 
 
 class TestPrepareServerArgs(CustomTestCase):
+    def test_api_keys_from_environment_reach_serving_without_changing_input(self):
+        """Environment-only credentials must enable auth without entering the CLI."""
+        with (
+            envs.SGLANG_API_KEY.override("env-user"),
+            envs.SGLANG_ADMIN_API_KEY.override("env-admin"),
+        ):
+            args = prepare_server_args(["--model-path", "dummy"])
+            args.resolve_once()
+            self.assertIsNone(args.api_key)
+            self.assertIsNone(args.admin_api_key)
+            self.assertNotIn("env-user", args.launch_command)
+            self.assertNotIn("env-admin", args.launch_command)
+            self.assertNotIn("SGLANG_API_KEY", exportable_env_vars())
+            self.assertNotIn("SGLANG_ADMIN_API_KEY", exportable_env_vars())
+
+        with get_context().override_server_args():
+            publish(args, role="tokenizer")
+            self.assertEqual(get_serving().api_key, "env-user")
+            self.assertEqual(get_serving().admin_api_key, "env-admin")
+
+    def test_explicit_api_keys_take_precedence_over_environment(self):
+        """An explicit credential, including an empty string, overrides only its key."""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml") as config:
+            config.write("model-path: dummy\napi-key: config-user\n")
+            config.flush()
+            with (
+                envs.SGLANG_API_KEY.override("env-user"),
+                envs.SGLANG_ADMIN_API_KEY.override("env-admin"),
+            ):
+                cases = (
+                    (
+                        ServerArgs(model_path="dummy", api_key="sdk-user"),
+                        "sdk-user",
+                        "env-admin",
+                    ),
+                    (
+                        prepare_server_args(["--config", config.name]),
+                        "config-user",
+                        "env-admin",
+                    ),
+                    (
+                        prepare_server_args(
+                            [
+                                "--config",
+                                config.name,
+                                "--api-key",
+                                "cli-user",
+                                "--admin-api-key",
+                                "cli-admin",
+                            ]
+                        ),
+                        "cli-user",
+                        "cli-admin",
+                    ),
+                    (
+                        prepare_server_args(
+                            ["--model-path", "dummy", "--admin-api-key", "cli-admin"]
+                        ),
+                        "env-user",
+                        "cli-admin",
+                    ),
+                    (
+                        prepare_server_args(
+                            [
+                                "--model-path",
+                                "dummy",
+                                "--api-key",
+                                "",
+                                "--admin-api-key",
+                                "",
+                            ]
+                        ),
+                        "",
+                        "",
+                    ),
+                )
+                for args, api_key, admin_api_key in cases:
+                    with self.subTest(api_key=api_key, admin_api_key=admin_api_key):
+                        args.resolve_once()
+                        self.assertEqual(resolution_result(args, "api_key"), api_key)
+                        self.assertEqual(
+                            resolution_result(args, "admin_api_key"), admin_api_key
+                        )
+
+    def test_api_key_environment_empty_and_unset_values(self):
+        """Empty env strings retain the same meaning as explicit empty CLI keys."""
+        for value in (None, ""):
+            with (
+                self.subTest(value=value),
+                envs.SGLANG_API_KEY.override(value),
+                envs.SGLANG_ADMIN_API_KEY.override(value),
+            ):
+                if value is None:
+                    envs.SGLANG_API_KEY.clear()
+                    envs.SGLANG_ADMIN_API_KEY.clear()
+                args = prepare_server_args(["--model-path", "dummy"])
+                args.resolve_once()
+                self.assertEqual(resolution_result(args, "api_key"), value)
+                self.assertEqual(resolution_result(args, "admin_api_key"), value)
+
+    def test_native_grpc_rejects_api_keys_from_environment(self):
+        """Env credentials must not bypass the native listener's HTTP-auth guard."""
+        for api_key, admin_api_key in (("env-user", None), (None, "env-admin")):
+            with (
+                self.subTest(api_key=api_key, admin_api_key=admin_api_key),
+                envs.SGLANG_API_KEY.override(api_key),
+                envs.SGLANG_ADMIN_API_KEY.override(admin_api_key),
+            ):
+                args = prepare_server_args(
+                    ["--model-path", "dummy", "--grpc-port", "50051"]
+                )
+                args.resolve_once()
+                with self.assertRaisesRegex(ValueError, "bypasses HTTP auth"):
+                    handle_deprecated_args(args)
+
     def test_optimistic_prefill_allows_l2_write_through_only(self):
         for policy, expected in (
             ("write_back", 2),
