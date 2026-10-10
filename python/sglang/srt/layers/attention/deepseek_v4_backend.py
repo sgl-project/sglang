@@ -228,12 +228,12 @@ def _maybe_precompute_flashmla_sched_meta(
     from sglang.kernels.ops.attention.dsv4.flashmla_sched_meta import (
         META_INTS,
         flashmla_sched_meta,
+        sched_meta_fits,
     )
 
     b, s_q = q.shape[0], q.shape[1]
     num_sm_parts = max(_num_sms(q.device.index) // s_q, 1)
-    # Include statically allocated shared state and its CUDA alignment.
-    if 4 * (5 * b + 1 + num_sm_parts * META_INTS) + 64 > 48 * 1024:
+    if not sched_meta_fits(batch_size=b, num_sm_parts=num_sm_parts):
         return
     meta = torch.empty((num_sm_parts, META_INTS), dtype=torch.int32, device=q.device)
     num_splits = torch.empty((b + 1,), dtype=torch.int32, device=q.device)

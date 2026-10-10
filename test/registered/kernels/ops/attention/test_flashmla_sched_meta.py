@@ -170,8 +170,7 @@ def test_precompute_skips_oversized_schedule(monkeypatch):
 
     monkeypatch.setattr(backend, "_fast_flashmla_sched_shape", lambda q: True)
     monkeypatch.setattr(backend, "_num_sms", lambda _: 148)
-    max_batch = (48 * 1024 // 4 - 1 - 148 * 8) // 5
-    for b in (max_batch + 1, 5000, 16384):
+    for b in (_first_unfit_batch(148), 5000, 16384):
         meta = SimpleNamespace(tile_scheduler_metadata=None, num_splits=None)
         backend._maybe_precompute_flashmla_sched_meta(
             meta,
@@ -185,14 +184,24 @@ def test_precompute_skips_oversized_schedule(monkeypatch):
         assert meta.num_splits is None
 
 
-@pytest.mark.parametrize("b", range(2210, 2216))
-def test_precompute_launches_at_shared_memory_limit(b: int):
-    """A schedule within the kernel's static shared memory of 48 KiB must take the
-    fallback, not fail to launch (b = 2,212 to 2,214 on a 152-SM GB300)."""
+def _first_unfit_batch(num_sm_parts: int) -> int:
+    from sglang.kernels.ops.attention.dsv4.flashmla_sched_meta import sched_meta_fits
+
+    b = 1
+    while sched_meta_fits(batch_size=b, num_sm_parts=num_sm_parts):
+        b += 1
+    return b
+
+
+@pytest.mark.parametrize("offset", [-3, -2, -1, 0, 1, 2])
+def test_precompute_at_shared_memory_limit(offset: int):
+    """Around the 48 KiB limit for this GPU's SM count, a schedule that fits must
+    launch, and one that does not must take the fallback instead of failing."""
     from types import SimpleNamespace
 
     from sglang.srt.layers.attention import deepseek_v4_backend as backend
 
+    b = _first_unfit_batch(backend._num_sms(torch.cuda.current_device())) + offset
     topk = 512
     meta = SimpleNamespace(tile_scheduler_metadata=None, num_splits=None)
     backend._maybe_precompute_flashmla_sched_meta(
@@ -204,6 +213,7 @@ def test_precompute_launches_at_shared_memory_limit(b: int):
         extra_topk_length=None,
     )
     torch.cuda.synchronize()
+    assert (meta.tile_scheduler_metadata is not None) == (offset < 0)
 
 
 if __name__ == "__main__":
