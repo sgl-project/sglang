@@ -1,9 +1,11 @@
 """Regression tests for pipeline and model-helper bugs (CPU only)."""
 
+import pytest
 import torch
 
 from sglang.multimodal_gen.runtime.utils.camera_geometry import get_plucker_embeddings
 from sglang.multimodal_gen.runtime.utils.mesh3d_utils import (
+    ImageProcessorV2,
     MeshRender,
 )
 
@@ -30,3 +32,10 @@ def test_default_texture_follows_width_height_texture_size():
     render.texture_size = (64, 32)
 
     assert render.get_texture().shape == (32, 64, 3)
+
+
+def test_image_processor_rejects_unsupported_input_type():
+    """An input that was neither a path nor a PIL image fell through to an
+    UnboundLocalError on `mask`."""
+    with pytest.raises(TypeError, match="Unsupported image type"):
+        ImageProcessorV2(size=8).load_image(torch.zeros(3, 8, 8))
