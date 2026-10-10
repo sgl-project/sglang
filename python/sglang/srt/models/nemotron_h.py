@@ -299,8 +299,12 @@ class NemotronHMoE(nn.Module):
         self,
         hidden_states: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        if _is_cuda and (
-            not get_moe_a2a_backend().is_flashinfer() or get_is_capture_mode()
+        # Dynamo cannot replay the side-stream switches: the compiled graph
+        # looks the streams up in a side table that later traces reset.
+        if (
+            _is_cuda
+            and not torch.compiler.is_compiling()
+            and (not get_moe_a2a_backend().is_flashinfer() or get_is_capture_mode())
         ):
             return self._forward_core_shared_routed_overlap(hidden_states)
         return self._forward_core_normal(hidden_states)
