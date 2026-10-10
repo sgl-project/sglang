@@ -383,7 +383,7 @@ def decode_scores(
     ratio = inputs.compress_ratio
     indexer = inputs.indexer
     req, pos = inputs.req_rows, inputs.positions
-    paged = get_platform().is_sm90
+    paged = get_platform().is_sm90 or get_platform().is_sm120
     bs = req.shape[0]
     assert pos.shape[0] == bs, (
         f"decode expects one token per request, {pos.shape=} {bs=}"
