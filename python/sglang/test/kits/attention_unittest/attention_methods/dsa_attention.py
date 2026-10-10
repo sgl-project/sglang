@@ -17,6 +17,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_context, get_parallel
+from sglang.srt.utils import is_hip
 
 from .dense_attention import (
     DEFAULT_DEVICE,
@@ -287,10 +288,8 @@ class DSAMockModelRunner(ModelRunner):
         pool_batch_size = runner_batch_size or case.batch_size
         self.device = device
         self.dtype = dtype
-        # `kv_cache_dtype` is the dtype the *storage* uses. For FP8 KV
-        # cache the pool stores packed FP8 nope + scales + BF16 rope at
-        # 656 bytes/token while the model still projects K/V in BF16;
-        # `set_mla_kv_buffer` does the quantize on the way in.
+        # `kv_cache_dtype` is the dtype the *storage* uses. The model still
+        # projects K/V in BF16; `set_mla_kv_buffer` quantizes on the way in.
         self.kv_cache_dtype = torch.float8_e4m3fn if fp8_kv_cache else dtype
         self.kv_cache_dtype_str = "auto"
         # This runner's own resolved backends (production stamps these in
@@ -366,20 +365,17 @@ class DSAMockModelRunner(ModelRunner):
             enable_memory_saver=False,
         )
         max_token_loc = case.page_size + pool_batch_size * max_context_len
-        # FP8 KV cache: packed nope_fp8 (dim_nope) + scales (num_tiles*4) +
-        # rope_bf16_bytes (dim_rope*2) = 528 + 128 = 656 bytes/token for
-        # the production DSA shape (dim_nope=512, dim_rope=64). The pool
-        # flips `dsa_kv_cache_store_fp8=True` iff
-        # `dtype=torch.float8_e4m3fn AND override_kv_cache_dim is not None`
-        # (`DSATokenToKVPool.__init__`), so both must be passed in tandem.
         if fp8_kv_cache:
             pool_dtype = torch.float8_e4m3fn
             dim_nope = model_config.kv_lora_rank
             dim_rope = model_config.qk_rope_head_dim
-            num_tiles = dim_nope // DSATokenToKVPool.quant_block_size
-            # uint8 byte layout: [nope_fp8 (dim_nope B)] + [scales (num_tiles*4 B)] +
-            # [rope_bf16 (dim_rope*2 B)]
-            pool_kv_cache_dim = dim_nope + num_tiles * 4 + dim_rope * 2
+            if is_hip():
+                # AITER and TileLang consume the raw FP8 MLA row.
+                pool_kv_cache_dim = dim_nope + dim_rope
+            else:
+                # FlashMLA stores FP8 NoPE plus per-block scales and BF16 RoPE.
+                num_tiles = dim_nope // DSATokenToKVPool.quant_block_size
+                pool_kv_cache_dim = dim_nope + num_tiles * 4 + dim_rope * 2
         else:
             pool_dtype = dtype
             pool_kv_cache_dim = (
@@ -1248,13 +1244,13 @@ DSA_DECODE_IMPL_VARIANTS: tuple[str, ...] = (
 # Impls that accept an FP8-stored K cache. The flashmla *sparse* and FA3
 # kernels require BF16 K (`kv must have dtype torch::kBFloat16`), so they
 # fall back to the inline-quantize-of-bf16 path that production *doesn't*
-# take in FP8 deployments. The `flashmla_kv` decode kernel and *both*
-# flashmla prefill kernels are the production-relevant FP8 paths.
+# take in FP8 deployments. AITER decode, the `flashmla_kv` decode kernel,
+# and both flashmla prefill kernels are the production-relevant FP8 paths.
 DSA_FP8_COMPATIBLE_PREFILL_IMPLS: frozenset[str] = frozenset(
     {"flashmla_sparse", "flashmla_kv", "flashmla_auto", "triton_sparse_mla"}
 )
 DSA_FP8_COMPATIBLE_DECODE_IMPLS: frozenset[str] = frozenset(
-    {"flashmla_kv", "flashmla_auto"}
+    {"aiter", "flashmla_kv", "flashmla_auto"}
 )
 
 
@@ -1417,15 +1413,16 @@ def run_dsa_sparse_fp8_decode_case(
     *,
     dsa_decode_backend: str = "flashmla_kv",
 ) -> None:
-    """FP8-KV-cache decode. Only `flashmla_kv` (and `flashmla_auto`
-    which resolves to it for FP8) accepts an FP8-stored K cache;
-    `flashmla_sparse` and `fa3` decode kernels assert BF16 K and would
-    fall back to the inline-quantize-of-bf16 path that production
+    """FP8-KV-cache decode. AITER and `flashmla_kv` (including
+    `flashmla_auto`, which resolves to it for FP8) accept an FP8-stored K
+    cache; `flashmla_sparse` and `fa3` decode kernels assert BF16 K and
+    would fall back to the inline-quantize-of-bf16 path that production
     doesn't take in FP8 deployments."""
     if dsa_decode_backend not in DSA_FP8_COMPATIBLE_DECODE_IMPLS:
         testcase.skipTest(
             f"DSA decode impl `{dsa_decode_backend}` does not support FP8 KV "
-            f"cache (only `flashmla_kv` / `flashmla_auto` read FP8 K directly)."
+            f"cache (only `aiter`, `flashmla_kv`, and `flashmla_auto` read "
+            f"FP8 K directly)."
         )
     if not case.forward_mode.is_decode():
         raise ValueError("run_dsa_sparse_fp8_decode_case expects a DECODE case.")
