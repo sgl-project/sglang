@@ -136,10 +136,8 @@ class DsparkDraftSampler:
             tp_sync=self._tp_sync,
             site=self._site,
             logits_out=logits_out,
+            # Without folded sampling every row takes the argmax.
             keep_logits=self.folded_sampling,
-            # Without folded sampling every row takes the argmax and no
-            # temperature is read.
-            has_sampled_rows=None if self.folded_sampling else False,
         )
         self.out[: draft_tokens.numel()].copy_(draft_tokens.reshape(-1))
         if self.confidence_out is not None:

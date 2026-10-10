@@ -138,7 +138,6 @@ def draft_markov_block(
     site: SpecTpSyncSite,
     logits_out: Optional[torch.Tensor] = None,
     keep_logits: bool = True,
-    has_sampled_rows: Optional[bool] = None,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Draft ``gamma`` tokens per row, each step biased by the token before it;
     a row at temperature 0 takes the argmax. With ``keep_logits`` the step
@@ -165,7 +164,6 @@ def draft_markov_block(
             noise_offset=noise.offset,
             step=step,
             logits_out=logits_out[:, step] if keep_logits else None,
-            has_sampled_rows=has_sampled_rows,
         )
         prev_tokens = tp_sync.sync(site, prev_tokens)
         draft_tokens.append(prev_tokens)
@@ -216,7 +214,6 @@ def sample_draft_block(
             else SpecTpSyncSite.DSPARK_DRAFT_GREEDY
         ),
         keep_logits=keep_logits,
-        has_sampled_rows=any_sampling,
     )
     return DraftBlockResult(
         draft_tokens=draft_tokens,

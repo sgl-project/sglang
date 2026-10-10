@@ -85,7 +85,6 @@ class BaseDSparkMarkovHead(nn.Module, ABC):
         noise_offset: torch.Tensor,
         step: int,
         logits_out: Optional[torch.Tensor] = None,
-        has_sampled_rows: Optional[bool] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """One markov step: the next token per row, and the next state."""
         bias, state = self.step_bias(
@@ -99,7 +98,6 @@ class BaseDSparkMarkovHead(nn.Module, ABC):
             noise_offset=noise_offset,
             step=step,
             logits_out=logits_out,
-            has_sampled_rows=has_sampled_rows,
         )
         return tokens, state
 
@@ -113,12 +111,12 @@ class BaseDSparkMarkovHead(nn.Module, ABC):
         noise_offset: torch.Tensor,
         step: int,
         logits_out: Optional[torch.Tensor] = None,
-        has_sampled_rows: Optional[bool] = None,
     ) -> torch.Tensor:
         """One token per row from the step logits ``base_logits + bias``,
-        rounded to ``step_logits_dtype``: the argmax at temperature 0, a
-        Gumbel-max sample otherwise. ``logits_out`` receives the step logits,
-        ``step_logits_width`` wide."""
+        rounded to ``step_logits_dtype``. With ``logits_out``, which receives
+        them ``step_logits_width`` wide, a row takes the argmax at temperature
+        0 and a Gumbel-max sample otherwise; without it every row takes the
+        argmax."""
         return MarkovSampleStep.execute(
             base_logits=base_logits,
             bias=bias,
@@ -128,7 +126,7 @@ class BaseDSparkMarkovHead(nn.Module, ABC):
             step=step,
             step_dtype=self.step_logits_dtype(base_logits.dtype),
             logits_out=logits_out,
-            has_sampled_rows=has_sampled_rows,
+            has_sampled_rows=None if logits_out is not None else False,
             **self._vocab_shard_args(),
         )
 
@@ -184,16 +182,10 @@ class VanillaMarkov(BaseDSparkMarkovHead):
         noise_offset: torch.Tensor,
         step: int,
         logits_out: Optional[torch.Tensor] = None,
-        has_sampled_rows: Optional[bool] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         # One greedy row with no logits to keep: one kernel does the bias GEMV,
         # the add and the argmax without writing the bias.
-        if (
-            has_sampled_rows is False
-            and logits_out is None
-            and len(prev_tokens) == 1
-            and self._bias_is_w2_gemv()
-        ):
+        if logits_out is None and len(prev_tokens) == 1 and self._bias_is_w2_gemv():
             tokens = MarkovGreedyStep.execute(
                 base_logits=base_logits,
                 prev_embeds=self.get_prev_embeddings(prev_tokens),
@@ -210,7 +202,6 @@ class VanillaMarkov(BaseDSparkMarkovHead):
             noise_offset=noise_offset,
             step=step,
             logits_out=logits_out,
-            has_sampled_rows=has_sampled_rows,
         )
 
     def _bias_is_w2_gemv(self) -> bool:

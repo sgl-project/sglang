@@ -97,7 +97,6 @@ class TestDraftMarkovBlockGraph(CustomTestCase):
                 tp_sync=SimpleNamespace(sync=lambda site, value: value),
                 site=SpecTpSyncSite.DSPARK_GRAPH_GREEDY,
                 keep_logits=False,
-                has_sampled_rows=False,
             )
             assert logits is None
             tokens_out.copy_(tokens)
