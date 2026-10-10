@@ -66,6 +66,7 @@ def apply_all():
     _patch_removed_symbols()
     _patch_image_processor_kwargs()
     _patch_image_process_cuda_tensor()
+    _patch_list_style_tied_weights_keys()
 
     # v5 general patches
     _ensure_is_torch_fx_available_compat()
@@ -400,6 +401,45 @@ def _patch_image_process_cuda_tensor():
         logger.debug(
             "_patch_image_process_cuda_tensor: required modules not importable, patch skipped"
         )
+
+
+def _patch_list_style_tied_weights_keys():
+    try:
+        from transformers import PreTrainedModel
+    except ImportError:
+        return
+
+    if not hasattr(PreTrainedModel, "get_expanded_tied_weights_keys"):
+        return
+
+    _orig = PreTrainedModel.get_expanded_tied_weights_keys
+
+    def _patched(self, *args, **kwargs):
+        mapping = getattr(self, "_tied_weights_keys", None)
+        if isinstance(mapping, list):
+            try:
+                input_embeddings = self.get_input_embeddings()
+            except NotImplementedError:
+                # Some remote-code classes never override get_input_embeddings
+                # either -- leave _tied_weights_keys as the original list so
+                # this surfaces as the one well-understood crash below
+                # (AttributeError: 'list' object has no attribute 'keys'),
+                # not a confusing second failure from inside this patch.
+                input_embeddings = None
+            if input_embeddings is not None:
+                source = next(
+                    (
+                        f"{name}.weight"
+                        for name, module in self.named_modules()
+                        if module is input_embeddings
+                    ),
+                    None,
+                )
+                if source is not None:
+                    self._tied_weights_keys = {target: source for target in mapping}
+        return _orig(self, *args, **kwargs)
+
+    PreTrainedModel.get_expanded_tied_weights_keys = _patched
 
 
 # ---------------------------------------------------------------------------

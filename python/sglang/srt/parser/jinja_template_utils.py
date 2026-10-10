@@ -204,9 +204,13 @@ def process_content_for_template_format(
     Returns:
         Processed message dictionary
     """
-    if not isinstance(msg_dict.get("content"), list):
-        # Already a string or None, no processing needed
-        return {k: v for k, v in msg_dict.items() if v is not None}
+    content = msg_dict.get("content")
+    if not isinstance(content, list):
+        if content_format == "openai" and isinstance(content, str):
+            msg_dict = {**msg_dict, "content": [{"type": "text", "text": content}]}
+        else:
+            # Already a string or None, no processing needed
+            return {k: v for k, v in msg_dict.items() if v is not None}
 
     if content_format == "openai" or use_dpsk_v32_encoding:
         # OpenAI format: preserve structured content list, normalize types
