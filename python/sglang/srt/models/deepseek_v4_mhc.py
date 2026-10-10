@@ -28,6 +28,7 @@ import msgspec
 import torch
 import torch.nn.functional as F
 
+from sglang.kernels.ops.layernorm.mhc_mega import mhc_mega_boundary
 from sglang.kernels.ops.layernorm.mhc_post_split_h import mhc_post_split_h
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
@@ -129,6 +130,7 @@ class HcState(msgspec.Struct):
     streams: Union[torch.Tensor, HcPending, None]
     pre: Optional[torch.Tensor] = None
     input: Optional[HcPreOutput] = None
+    stats: Optional[HcTriplet] = None
 
     def release(self) -> None:
         """Empty the state at its last reader, the combine; the residual the post
@@ -138,6 +140,7 @@ class HcState(msgspec.Struct):
         self.streams = None
         self.pre = None
         self.input = None
+        self.stats = None
 
     @property
     def residual(self) -> torch.Tensor:
@@ -179,6 +182,7 @@ class HcNextBoundary(NamedTuple):
     norm: RMSNorm
     accepts_mxfp8: bool
     norm_fusable: bool
+    hc: Optional[HcSubLayer] = None
 
 
 def is_deferred_finalize(routed) -> bool:
@@ -190,7 +194,9 @@ def is_deferred_finalize(routed) -> bool:
     return isinstance(routed, FlashInferTrtllmDeferredFinalizeOutput)
 
 
-def make_boundary(norm: RMSNorm, *, accepts_mxfp8: bool) -> HcNextBoundary:
+def make_boundary(
+    norm: RMSNorm, *, accepts_mxfp8: bool, hc: Optional[HcSubLayer] = None
+) -> HcNextBoundary:
     """Can this hyper-connection's norm fold into the previous post, and does its
     sublayer take a pre-quantized input."""
     return HcNextBoundary(
@@ -204,6 +210,7 @@ def make_boundary(norm: RMSNorm, *, accepts_mxfp8: bool) -> HcNextBoundary:
             and norm.weight.shape == (5120,)
             and norm.weight.is_contiguous()
         ),
+        hc=hc,
     )
 
 
@@ -550,13 +557,26 @@ def _compute_triplet(
     hc: HcSubLayer,
     residual: torch.Tensor,
     stats_stream: Optional[torch.cuda.Stream],
+    precomputed: Optional[HcTriplet] = None,
 ) -> HcTriplet:
     """Issue the triplet (on the side stream, beside the sublayer) and join before
     the post reads it."""
+    if precomputed is not None:
+        return precomputed
     coefficients = mix_stats(hc, residual, stats_stream)
     if stats_stream is not None:
         torch.cuda.current_stream().wait_stream(stats_stream)
     return coefficients
+
+
+def can_use_mega_mhc_prefill(cfg: HcConfig, *, seam_open: bool = True) -> bool:
+    return (
+        envs.SGLANG_OPT_DSV41_MEGA_MHC_PREFILL.get()
+        and get_platform().is_sm100
+        and not _is_hip
+        and not cfg.cp_prefill
+        and seam_open
+    )
 
 
 def _post_fusion(
@@ -565,12 +585,31 @@ def _post_fusion(
     residual: torch.Tensor,
     coefficients: HcTriplet,
     next: Optional[HcNextBoundary],
+    mega_next: Optional[HcNextBoundary] = None,
 ) -> HcState:
     """Step 4 without a collective: the wide-tile kernel folds the next combine +
     norm in where it serves this seam, otherwise the pure post runs and the next
     combine computes itself."""
     cfg = hc.cfg
     pre, post_mix, comb = coefficients
+    if mega_next is not None and mega_next.norm_fusable and mega_next.hc is not None:
+        nxt = mega_next.hc
+        updated, normalized, stats = mhc_mega_boundary(
+            y,
+            residual,
+            pre,
+            post_mix,
+            comb,
+            nxt.fn,
+            nxt.scale,
+            nxt.base,
+            nxt.norm.weight,
+            nxt.cfg.rms_eps,
+            nxt.cfg.eps,
+            nxt.norm.variance_epsilon,
+            nxt.cfg.sinkhorn_iters,
+        )
+        return HcState(updated, pre, HcNormed(normalized), stats)
     if (
         next is not None
         and next.norm_fusable
@@ -607,6 +646,8 @@ def run_attn_post(
     stats_stream: Optional[torch.cuda.Stream],
     next: Optional[HcNextBoundary],
     world_size: int,
+    precomputed: Optional[HcTriplet] = None,
+    mega_mhc: bool = False,
 ) -> HcState:
     """The attention post. An `AttnOutput` rides the collective kernel (which also
     folds ``next``'s norm); the attention may decline the handover even when asked,
@@ -617,7 +658,7 @@ def run_attn_post(
         )
 
         assert next is not None
-        pre, post_mix, comb = _compute_triplet(hc, residual, stats_stream)
+        pre, post_mix, comb = _compute_triplet(hc, residual, stats_stream, precomputed)
         _, updated, normalized = all_reduce_mhc_post_combine_norm(
             out.partial,
             residual,
@@ -629,8 +670,10 @@ def run_attn_post(
             world_size=world_size,
         )
         return HcState(updated, pre, HcNormed(normalized))
-    coefficients = _compute_triplet(hc, residual, stats_stream)
-    return _post_fusion(hc, out, residual, coefficients, next)
+    coefficients = _compute_triplet(hc, residual, stats_stream, precomputed)
+    return _post_fusion(
+        hc, out, residual, coefficients, next, next if mega_mhc else None
+    )
 
 
 def run_moe_post(
@@ -641,6 +684,8 @@ def run_moe_post(
     stats_stream: Optional[torch.cuda.Stream],
     next: Optional[HcNextBoundary],
     world_size: int,
+    precomputed: Optional[HcTriplet] = None,
+    mega_next: Optional[HcNextBoundary] = None,
 ) -> HcState:
     """The MoE post. A deferred finalize the push plane can carry rides the
     collective kernel (finalize + shared add + all-reduce, quantizing ``next``'s
@@ -657,7 +702,7 @@ def run_moe_post(
         # [T x top_k (padded)] view and overstates the plane load by ~6x.
         and can_fuse_all_reduce(out.routed.expert_weights.shape[0], hc.cfg.hidden)
     ):
-        pre, post_mix, comb = _compute_triplet(hc, residual, stats_stream)
+        pre, post_mix, comb = _compute_triplet(hc, residual, stats_stream, precomputed)
         args = (
             out.routed.gemm2_out,
             out.routed.expanded_idx_to_permuted_idx,
@@ -711,5 +756,5 @@ def run_moe_post(
             and should_add_replicated_moe_output()
         ):
             out += pieces.shared
-    coefficients = _compute_triplet(hc, residual, stats_stream)
-    return _post_fusion(hc, out, residual, coefficients, next)
+    coefficients = _compute_triplet(hc, residual, stats_stream, precomputed)
+    return _post_fusion(hc, out, residual, coefficients, next, mega_next)
