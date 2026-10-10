@@ -143,7 +143,7 @@ class TestDPBalanceStats(CustomTestCase):
             )
         )
         with (
-            get_context().override_server_args(enable_fault_tolerance=False),
+            get_context().override_server_args(),
             clock,
             envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.override(False),
             patch.object(dp_attn, "_ENABLE_METRICS_DP_ATTENTION", True),
@@ -569,7 +569,7 @@ class TestPrefillCudaGraphVote(CustomTestCase):
         values = torch.cat([i._get_local_tensor(device="cpu") for i in infos])
         gather.side_effect = lambda output, *a, **kw: output.copy_(values)
         parallel.return_value.tp_group.active_ranks_cpu = torch.ones(2)
-        with get_context().override_server_args(enable_fault_tolerance=False):
+        with get_context().override_server_args():
             for info in infos:
                 info.all_gather(device="cpu", group=None)
                 self.assertFalse(info.can_run_prefill_cuda_graph)
