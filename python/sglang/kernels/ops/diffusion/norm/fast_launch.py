@@ -22,7 +22,8 @@ from __future__ import annotations
 import torch
 
 try:
-    import sgl_launch
+    # setup.py installs the crate at its declared python-module path.
+    from sglang.kernels.ops.diffusion.norm import sgl_launch
 
     _HAVE_RUST_LAUNCH = True
 except ImportError:  # pragma: no cover - extension not built

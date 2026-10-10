@@ -21,7 +21,7 @@ type CUfunction = *mut c_void;
 type CUstream = *mut c_void;
 
 #[link(name = "cuda")]
-extern "C" {
+unsafe extern "C" {
     fn cuLaunchKernel(
         f: CUfunction,
         grid_x: c_uint,
