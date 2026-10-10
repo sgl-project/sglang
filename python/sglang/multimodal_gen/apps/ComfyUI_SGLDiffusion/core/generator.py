@@ -9,7 +9,7 @@ import os
 import sys
 
 from ..executors.flux import FluxExecutor
-from ..executors.minimax_h3 import MiniMaxH3Executor, FastH3Executor, VDNH3Executor
+from ..executors.minimax_h3 import FastH3Executor, MiniMaxH3Executor, VDNH3Executor
 from ..executors.zimage import ZImageExecutor
 from .preflight import check_sgld_options
 
@@ -44,7 +44,9 @@ def _spawn_without_launcher_main():
     from ComfyUI, so hide the launcher while they start.
     """
     main_dict = vars(sys.modules["__main__"])
-    saved = {key: main_dict[key] for key in ("__file__", "__spec__") if key in main_dict}
+    saved = {
+        key: main_dict[key] for key in ("__file__", "__spec__") if key in main_dict
+    }
     main_dict.pop("__file__", None)
     main_dict["__spec__"] = None
     try:

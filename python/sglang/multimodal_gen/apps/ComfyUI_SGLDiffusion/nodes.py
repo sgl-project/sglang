@@ -3,8 +3,8 @@ ComfyUI nodes for SGLang Diffusion integration.
 Provides nodes for connecting to SGLang Diffusion server and generating images/videos.
 """
 
-import os
 import json
+import os
 import uuid
 
 import folder_paths
@@ -289,6 +289,7 @@ class SGLDOptions:
         advanced = object_json(advanced_server_args_json, "advanced_server_args_json")
         if advanced is not None:
             import dataclasses
+
             from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
             valid = {

@@ -299,6 +299,7 @@ def test_cached_base_model_resets_request_accelerations_after_spectrum_run():
 
 def test_failed_lora_request_does_not_claim_adapter_is_active():
     import pytest
+
     from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.base import (
         SGLDiffusionExecutor,
     )

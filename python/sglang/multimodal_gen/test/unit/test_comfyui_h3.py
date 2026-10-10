@@ -1284,6 +1284,7 @@ def test_comfyui_sparse_stream_layout_preserves_target_and_condition_roles():
 @pytest.mark.parametrize("model_type,nfe", [("fast_h3", 4), ("vdn_h3", 8)])
 def test_distilled_h3_rejects_wrong_grid_and_reference_task(model_type, nfe):
     from types import SimpleNamespace
+
     from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.minimax_h3 import (
         validate_distilled_h3_step,
     )
@@ -1345,10 +1346,12 @@ def test_h3_masked_velocities_match_comfyui_before_audio_carry_transform():
 
 def test_comfyui_h3_rejects_bcg_with_offload_before_cuda_capture():
     from types import SimpleNamespace
+
+    import pytest
+
     from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.comfyui_step import (
         MiniMaxH3ComfyUIStepStage,
     )
-    import pytest
 
     batch = SimpleNamespace(sampling_params=SimpleNamespace(quality="lossless"))
     args = SimpleNamespace(
