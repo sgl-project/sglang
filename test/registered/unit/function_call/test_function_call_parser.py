@@ -1562,6 +1562,30 @@ class TestDeepSeekV3Detector(unittest.TestCase):
         self.assertEqual(params1["city"], "Shanghai")
         self.assertEqual(params2["city"], "Beijing")
 
+    def test_streaming_closing_fence_and_end_tokens_in_one_chunk(self):
+        """Bug regression: when a call's closing fence and end tokens arrive in one
+        increment (MTP, stream_interval > 1), its arguments must still stream."""
+        chunks = [
+            "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather\n",
+            '```json\n{"city": "Paris"}\n',
+            "```<｜tool▁call▁end｜>",
+            "\n<｜tool▁call▁begin｜>function<｜tool▁sep｜>get_tourist_attractions\n",
+            '```json\n{"city": "Tokyo"}\n',
+            "```<｜tool▁call▁end｜><｜tool▁calls▁end｜>",
+        ]
+
+        names, args = {}, {}
+        for chunk in chunks:
+            for call in self.detector.parse_streaming_increment(
+                chunk, self.tools
+            ).calls:
+                if call.name:
+                    names[call.tool_index] = call.name
+                args[call.tool_index] = args.get(call.tool_index, "") + call.parameters
+
+        self.assertEqual(names, {0: "get_weather", 1: "get_tourist_attractions"})
+        self.assertEqual(args, {0: '{"city": "Paris"}', 1: '{"city": "Tokyo"}'})
+
 
 class TestDeepSeekV32Detector(unittest.TestCase):
     def setUp(self):
