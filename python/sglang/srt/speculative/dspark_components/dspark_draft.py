@@ -145,24 +145,21 @@ def draft_markov_block(
     logits land in ``logits_out`` ([bs, gamma, local vocab]), allocated here
     when not given."""
     bs, gamma = base_logits.shape[:2]
+    if keep_logits and logits_out is None:
+        logits_out = torch.empty(
+            (bs, gamma, base_logits.shape[-1]),
+            dtype=markov_head.step_logits_dtype(base_logits.dtype),
+            device=base_logits.device,
+        )
     state = markov_head.init_state(draft_hidden)
     prev_tokens = anchor_tokens.long()
     draft_tokens = []
     for step in range(gamma):
-        step_hidden = None if draft_hidden is None else draft_hidden[:, step]
-        bias, state = markov_head.step_bias(
-            prev_tokens, hidden_states=step_hidden, state=state
-        )
-        step_base = base_logits[:, step]
-        if keep_logits and logits_out is None:
-            logits_out = torch.empty(
-                (bs, gamma, step_base.shape[-1]),
-                dtype=markov_head.step_logits_dtype(step_base.dtype, bias.dtype),
-                device=step_base.device,
-            )
-        prev_tokens = markov_head.sample_step(
-            step_base,
-            bias,
+        prev_tokens, state = markov_head.draft_step(
+            prev_tokens,
+            base_logits[:, step],
+            hidden_states=None if draft_hidden is None else draft_hidden[:, step],
+            state=state,
             temperatures=step_temperatures,
             noise_key=noise.key,
             noise_offset=noise.offset,

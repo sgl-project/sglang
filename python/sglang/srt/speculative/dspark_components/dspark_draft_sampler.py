@@ -141,12 +141,14 @@ def _local_vocab_width(model) -> int:
 
 
 def _step_logits_dtype(model) -> torch.dtype:
-    markov_dtype = next(model.markov_head.parameters()).dtype
     # A quantized lm_head's packed weight carries no logits dtype; its kernel
     # emits the activation dtype, the draft's own parameter dtype.
     weight = model.lm_head.weight
-    base_dtype = weight.dtype if weight.is_floating_point() else markov_dtype
-    return model.markov_head.step_logits_dtype(base_dtype, markov_dtype)
+    if weight.is_floating_point():
+        base_dtype = weight.dtype
+    else:
+        base_dtype = next(model.markov_head.parameters()).dtype
+    return model.markov_head.step_logits_dtype(base_dtype)
 
 
 def _resolve_folded_sampling(
