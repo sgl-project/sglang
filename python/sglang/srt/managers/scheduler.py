@@ -367,6 +367,7 @@ from sglang.srt.utils.weight_versions import (
     compute_weight_version_spans,
     record_weight_version_events,
 )
+from sglang.srt.weight_sync.gpu_delta.session import with_gpu_delta_controls
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 if is_mps():
@@ -1825,6 +1826,10 @@ class Scheduler(
                     self.list_external_corpora,
                 ),
             ]
+        )
+
+        self._request_dispatcher = with_gpu_delta_controls(
+            self, self._request_dispatcher
         )
 
     def get_init_info(self) -> Dict[str, Any]:
