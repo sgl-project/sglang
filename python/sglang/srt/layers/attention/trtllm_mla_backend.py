@@ -66,12 +66,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
-from sglang.srt.runtime_context import (
-    get_buffer,
-    get_parallel,
-    get_schedule,
-    get_spec,
-)
+from sglang.srt.runtime_context import get_buffer, get_parallel, get_schedule, get_spec
 from sglang.srt.utils import is_flashinfer_available, is_float4_e2m1fn_x2
 
 if is_flashinfer_available():
@@ -169,6 +164,8 @@ class TRTLLMMLAPrefillMetadata:
     max_seq_len: int
     cum_seq_lens: torch.Tensor
     seq_lens: torch.Tensor
+    # CPU mirrors avoid synchronization in FlashInfer's empty-row check.
+    seq_lens_cpu: torch.Tensor
     fallback_to_flashinfer_impl: bool = False
 
 
@@ -716,7 +713,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         fallback_to_flashinfer_impl = (
             (self.disable_chunked_prefix_cache and has_prefix)
             or is_in_tc_piecewise_cuda_graph()
-            or is_in_breakable_cuda_graph()
+            or (self.disable_chunked_prefix_cache and is_in_breakable_cuda_graph())
         )
         if fallback_to_flashinfer_impl:
             super().init_mha_chunk_metadata(
@@ -787,7 +784,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             fallback_to_flashinfer_impl = (
                 (self.disable_chunked_prefix_cache and has_prefix)
                 or is_in_tc_piecewise_cuda_graph()
-                or is_in_breakable_cuda_graph()
+                or (self.disable_chunked_prefix_cache and is_in_breakable_cuda_graph())
             )
             if fallback_to_flashinfer_impl:
                 super().init_forward_metadata(forward_batch)
@@ -802,10 +799,12 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 )
             ).int()
             max_seq_len = max(forward_batch.extend_seq_lens_cpu)
+            # DCP gathers prefix KV back to global lengths before prefill.
             self.forward_prefill_metadata = TRTLLMMLAPrefillMetadata(
                 max_seq_len,
                 cum_seq_lens_q,
                 seq_lens,
+                torch.tensor(forward_batch.extend_seq_lens_cpu, dtype=torch.int32),
                 fallback_to_flashinfer_impl,
             )
         elif (
@@ -1066,6 +1065,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         return_lse: bool,
         out_buffer: torch.Tensor,
         o_sf_scale: float = 1.0,
+        q_seq_lens_cpu: Optional[torch.Tensor] = None,
+        kv_seq_lens_cpu: Optional[torch.Tensor] = None,
     ):
         """Hook for subclasses to swap the ragged prefill kernel. Q/K/V arrive
         in model-native dtype; subclasses do any kernel-specific quantization.
@@ -1073,7 +1074,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         q_scale = k_scale = v_scale = 1.0
         if self.data_type == torch.float8_e4m3fn:
             q, k, v, k_scale, v_scale = _quantize_fp8_qkv(q, k, v, layer)
-        return flashinfer.prefill.trtllm_ragged_attention_deepseek(
+        result = flashinfer.prefill.trtllm_ragged_attention_deepseek(
+            q_seq_lens_cpu=q_seq_lens_cpu,
+            kv_seq_lens_cpu=kv_seq_lens_cpu,
             query=q,
             key=k,
             value=v,
@@ -1094,6 +1097,11 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             out=out_buffer,
             skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
         )
+        if return_lse:
+            output, lse = result
+            # TRT-LLM returns log2 LSE; merge_state consumes natural-log LSE.
+            return output, lse.mul_(math.log(2))
+        return result
 
     def _set_kv_and_concat_q_fused(
         self,
@@ -1713,6 +1721,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 return_lse=True,
                 out_buffer=out,
                 o_sf_scale=-1.0,
+                q_seq_lens_cpu=self.forward_prefill_metadata.seq_lens_cpu,
+                kv_seq_lens_cpu=forward_batch.prefix_chunk_seq_lens_cpu[chunk_idx],
             )
 
             # The TRT-LLM ragged attention cubin kernel does not correctly
@@ -1756,6 +1766,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 return_lse=forward_batch.mha_return_lse,
                 out_buffer=out,
                 o_sf_scale=1.0,
+                q_seq_lens_cpu=self.forward_prefill_metadata.seq_lens_cpu,
+                kv_seq_lens_cpu=self.forward_prefill_metadata.seq_lens_cpu,
             )
 
 
