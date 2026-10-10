@@ -79,6 +79,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue.scheduler = SimpleNamespace(
             sliding_window_size=2047,
             server_args=SimpleNamespace(disable_radix_cache=True),
+            enable_overlap=False,
         )
         queue._uses_swa_tail_prealloc = MagicMock(return_value=True)
         queue._swa_aware_allocatable_token_budgets = MagicMock(
