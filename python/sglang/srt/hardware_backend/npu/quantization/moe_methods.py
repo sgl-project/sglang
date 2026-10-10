@@ -337,6 +337,11 @@ class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
             packed, block_scale = self._quantize_weight_online(
                 weight.data, weight_prefix, fp4_dtype
             )
+            # Online quantization returns [E, N, K/64, 2], while the shared
+            # helper expects flat checkpoint scales or an already prepared
+            # [E, K/64, N, 2] layout. Flatten the online pairs before delegation.
+            if block_scale.dim() == 4:
+                block_scale = block_scale.flatten(-2)
             weight = Parameter(packed, requires_grad=False)
             layer.register_parameter(f"{weight_prefix}_weight", weight)
             layer.register_parameter(

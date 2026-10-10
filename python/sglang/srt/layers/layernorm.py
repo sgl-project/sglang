@@ -190,7 +190,7 @@ if _is_npu:
         # sgl-kernel-npu wheels built before the target-specific Gemma provider
         # landed expose only the torch_npu operator, which is exactly what that
         # provider binds to on A2/A3 — so those deployments keep working
-        # unchanged. On A5 the operator is unregistered and the first Gemma
+        # unchanged. On Ascend 950 the operator is unregistered and the first Gemma
         # forward fails loudly, same as before this indirection existed. The
         # kernels registry (sglang/kernels/ops/layernorm) deliberately does not
         # fall back: a backend selected by name there must not silently run a
