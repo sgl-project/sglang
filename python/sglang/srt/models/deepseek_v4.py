@@ -1588,7 +1588,7 @@ class MQALayer(MqaAttentionBase):
         q_out: Optional[torch.Tensor] = None,
         x_quant=None,
     ) -> torch.Tensor:
-        """Overlap Q with CP gathers, then prepare cache/indexer sources."""
+        """Submit CP gathers before Q, then prepare cache/indexer sources."""
         assert self.alt_streams is not None
         assert len(self.alt_streams) >= 3
         current_stream = torch.cuda.current_stream()
@@ -1600,11 +1600,9 @@ class MQALayer(MqaAttentionBase):
             qkv_a, _ = self.wqkv_a(x_linear)
         q_lora, q_for_wqb = self._compute_q_a(x_linear, qkv_a=qkv_a)
 
-        # Q needs only the local q_lora. Start it before the gathers, rather
-        # than alongside the compressor GEMM, on the existing SWA writer stream.
+        # Snapshot q_lora readiness before the gathers. Waiting here rather than
+        # at the Q launch below keeps Q independent of collective completion.
         stream_kv.wait_stream(current_stream)
-        with torch.cuda.stream(stream_kv):
-            q = self._compute_q_b(q_for_wqb, positions, q_out)
 
         # Collectives must launch in identical parent-stream order on every CP
         # rank. Workers that read gathered inputs wait for both gathers below.
@@ -1614,6 +1612,12 @@ class MQALayer(MqaAttentionBase):
             x_global = cp_materialize_global_token_order(
                 x.contiguous(), forward_batch, current_stream
             )
+
+        # Submit the long-running gathers before the SM-heavy Q GEMM. Q still
+        # waits only for q_lora and runs on the existing SWA writer stream, not
+        # the collective stream.
+        with torch.cuda.stream(stream_kv):
+            q = self._compute_q_b(q_for_wqb, positions, q_out)
 
         captured = is_in_breakable_cuda_graph()
         capture_indexer = captured and self.indexer is not None
