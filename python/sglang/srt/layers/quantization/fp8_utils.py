@@ -1423,7 +1423,7 @@ def aiter_w8a8_block_fp8_linear(
             _ck_safe_m is not None and input_2d.shape[0] > _ck_safe_m
         )
     elif _use_aiter_gfx942:
-        use_triton = envs.SGLANG_AITER_GFX942_BLOCKSCALE_USE_TRITON.get()
+        use_triton = not envs.SGLANG_AITER_GFX942_BLOCKSCALE_USE_CK.get()
     else:
         use_triton = True
 
