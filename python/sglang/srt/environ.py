@@ -1421,6 +1421,11 @@ class Envs:
     # Saves the per-step draft forward, but the draft KV goes stale: an upshift
     # back to steps>0 starts from a cold draft state (low accept until it recovers).
     SGLANG_SPEC_SKIP_ZERO_STEP_DRAFT_EXTEND = EnvBool(False)
+    # Opt-in: the large linears of a DFLASH or DSpark draft read int8 weights
+    # (one fp32 scale per output row) on decode steps of up to 16 rows. The
+    # target is untouched, so only the acceptance length can move. See
+    # speculative/draft_int8.py.
+    SGLANG_SPEC_DRAFT_INT8_WEIGHTS = EnvBool(False)
     # Which speculative decisions rank 0 broadcasts to its TP group; narrowing
     # it under live traffic isolates where ranks actually diverge. Comma
     # separated presets ("all", "rng", "init", "off"), or SpecTpSyncSite slugs
