@@ -852,3 +852,72 @@ def test_load_cache_to_device_buffer_rocm_large_lru_writeback() -> None:
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))
+
+
+@pytest.mark.skipif(is_xpu(), reason="KPool tail columns use the JIT kernel.")
+@pytest.mark.parametrize("block_size", [256, 960, 1024])
+@pytest.mark.parametrize("seq_len", [3, 8192])
+def test_kpool_tail_columns_and_chunked_scan(block_size, seq_len):
+    hot_size, top_k, tail_slots = 4096, 2051, 3
+    # Raw FP8 rows are copied byte-for-byte, without interpreting their values.
+    item_bytes = 512
+    host = torch.empty((8192, 1, item_bytes), dtype=torch.uint8, pin_memory=True)
+    host.copy_(
+        torch.arange(host.numel() // 4, dtype=torch.int32)
+        .view(torch.uint8)
+        .view_as(host)
+    )
+    device = torch.zeros(
+        (hot_size + 1, 1, item_bytes), dtype=torch.uint8, device=DEVICE
+    )
+    device[:hot_size].copy_(host[:hot_size])
+    device[hot_size].copy_(host[seq_len - 1])
+    locs = torch.arange(hot_size + 1, dtype=torch.int32, device=DEVICE)[None, :]
+    tokens = locs.clone()
+    lru = torch.arange(hot_size, dtype=torch.int16, device=DEVICE)[None, :]
+    selected = torch.full((1, top_k), -1, dtype=torch.int32, device=DEVICE)
+    if seq_len == 3:
+        selected[0, :3] = torch.tensor([0, 1, 2], device=DEVICE)
+        selected[0, 3] = 0  # Stale padding must not become an attention entry.
+        selected[0, -3:] = torch.tensor([1, 2, -1], device=DEVICE)
+    else:
+        # Mix hits and misses across multiple scan iterations, plus duplicates.
+        selected[0, :2048] = torch.arange(3072, 5120, device=DEVICE)
+        selected[0, -3:] = torch.tensor([8191, 5000, -1], device=DEVICE)
+    out = torch.full_like(selected, 123)
+    kwargs = dict(
+        top_k_tokens=selected,
+        device_buffer_tokens=tokens,
+        host_cache_locs=torch.arange(8192, dtype=torch.int64, device=DEVICE)[None, :],
+        device_buffer_locs=locs,
+        host_cache=host,
+        device_buffer=device,
+        top_k_device_locs=out,
+        req_pool_indices=torch.tensor([0], dtype=torch.int64, device=DEVICE),
+        seq_lens=torch.tensor([seq_len], dtype=torch.int32, device=DEVICE),
+        lru_slots=lru,
+        item_size_bytes=item_bytes,
+        num_top_k=top_k,
+        hot_buffer_size=hot_size,
+        page_size=1,
+        block_size=block_size,
+        num_tail_slots=tail_slots,
+    )
+    valid = selected[0] >= 0
+    if seq_len == 3:
+        valid[3:2048] = False
+    for _ in range(2):
+        load_cache_to_device_buffer_mla(**kwargs)
+        get_device_module().synchronize()
+        assert torch.all(out[0, ~valid] == -1)
+        assert torch.all((out[0, valid] >= 0) & (out[0, valid] <= hot_size))
+        torch.testing.assert_close(
+            device[out[0, valid].long()].cpu(),
+            host[selected[0, valid].long().cpu()],
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            lru[0].sort().values,
+            torch.arange(hot_size, dtype=torch.int16, device=DEVICE),
+        )

@@ -178,9 +178,9 @@ def _jit_sparse_module(
     top_k_is_blocks: bool = False,
     record_miss_plan: bool = False,
     skip_io: bool = False,
+    num_tail_slots: int = 0,
 ) -> Module:
-    # record_miss_plan / skip_io are compile-time kernel flags; the
-    # (False, False) production instantiation stays byte-identical.
+    # Compile-time options preserve the ordinary top-k layout by default.
     template_args = make_cpp_args(
         block_size,
         num_top_k,
@@ -191,6 +191,7 @@ def _jit_sparse_module(
         top_k_is_blocks,
         record_miss_plan,
         skip_io,
+        num_tail_slots,
     )
     cache_args = make_cpp_args(
         item_size_bytes,
@@ -203,6 +204,7 @@ def _jit_sparse_module(
         top_k_is_blocks,
         record_miss_plan,
         skip_io,
+        num_tail_slots,
     )
     return load_jit(
         "sparse_cache",
@@ -297,11 +299,26 @@ def _load_cache_to_device_buffer_mla(
     miss_dst: torch.Tensor | None,
     miss_count: torch.Tensor | None,
     skip_io: bool,
+    num_tail_slots: int = 0,
 ) -> None:
     assert hot_buffer_size >= num_top_k, (
         f"hot_buffer_size ({hot_buffer_size}) must be >= num_top_k ({num_top_k})"
     )
 
+    if (
+        top_k_tokens.ndim != 2
+        or top_k_tokens.shape[1] != num_top_k
+        or top_k_device_locs.shape != top_k_tokens.shape
+        or top_k_tokens.dtype != torch.int32
+        or top_k_device_locs.dtype != torch.int32
+        or top_k_tokens.stride(1) != 1
+        or top_k_device_locs.stride(1) != 1
+    ):
+        raise ValueError(
+            "HiSparse top-k must be int32 [batch, num_top_k] with contiguous columns."
+        )
+    if not 0 <= num_tail_slots < num_top_k:
+        raise ValueError("HiSparse tail slots must be in [0, num_top_k).")
     record_miss_plan = miss_src is not None
     module = _jit_sparse_module(
         item_size_bytes,
@@ -312,6 +329,7 @@ def _load_cache_to_device_buffer_mla(
         is_dsv4_layout=is_dsv4_layout,
         record_miss_plan=record_miss_plan,
         skip_io=skip_io,
+        num_tail_slots=num_tail_slots,
     )
 
     empty = torch.empty(0, device=top_k_tokens.device)
@@ -374,8 +392,12 @@ def load_cache_to_device_buffer_mla(
     miss_dst: torch.Tensor | None = None,
     miss_count: torch.Tensor | None = None,
     skip_io: bool = False,
+    num_tail_slots: int = 0,
 ) -> None:
     """Generic MLA hisparse swap-in: device + host both linear (stride=item_size_bytes).
+
+    num_tail_slots counts trailing KPool columns, valid independently of the
+    ordinary top-k prefix for short sequences.
 
     Optional miss_src/miss_dst/miss_count record the miss plan for replay by
     copy_cache_planned_mla; skip_io elides only the KV bytes (timing probe).
@@ -402,6 +424,7 @@ def load_cache_to_device_buffer_mla(
         miss_dst=miss_dst,
         miss_count=miss_count,
         skip_io=skip_io,
+        num_tail_slots=num_tail_slots,
     )
 
 

@@ -19,6 +19,74 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
+class TestHybridHiSparseBackingPool(CustomTestCase):
+    def test_mapping_uses_dsa_pool_and_preserves_hybrid_wrapper(self):
+        from sglang.srt.mem_cache.allocator.hisparse import (
+            HiSparseTokenToKVPoolAllocator,
+        )
+        from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
+        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+
+        backing = object.__new__(HiSparseDSATokenToKVPool)
+        backing.register_mapping = MagicMock()
+        wrapper = object.__new__(HybridLinearKVPool)
+        wrapper.full_kv_pool = backing
+        wrapper.mamba_pool = object()
+        allocator = HiSparseTokenToKVPoolAllocator(
+            size=16,
+            page_size=1,
+            dtype=torch.bfloat16,
+            device="cpu",
+            kvcache=wrapper,
+            need_sort=False,
+            host_to_device_ratio=2,
+        )
+        self.assertIs(allocator.get_kvcache(), wrapper)
+        self.assertIs(allocator.hisparse_kvcache, backing)
+        backing.register_mapping.assert_called_once()
+        self.assertEqual(
+            backing.register_mapping.call_args.args[0].data_ptr(),
+            allocator.full_to_hisparse_device_index_mapping.data_ptr(),
+        )
+        self.assertEqual(allocator.logical_attn_allocator.size, 32)
+        self.assertEqual(allocator.hisparse_attn_allocator.size, 16)
+        indices = torch.tensor([1, 2])
+        backing.translate_loc_to_hisparse_device = MagicMock(return_value=indices + 4)
+        torch.testing.assert_close(
+            wrapper.translate_loc_to_hisparse_device(indices), indices + 4
+        )
+
+    def test_rejects_dense_hybrid_backing_pool(self):
+        from sglang.srt.mem_cache.allocator.hisparse import (
+            HiSparseTokenToKVPoolAllocator,
+        )
+        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+
+        wrapper = object.__new__(HybridLinearKVPool)
+        wrapper.full_kv_pool = object()
+        with self.assertRaisesRegex(TypeError, "HiSparse DSA backing pool"):
+            HiSparseTokenToKVPoolAllocator(
+                size=16,
+                page_size=1,
+                dtype=torch.bfloat16,
+                device="cpu",
+                kvcache=wrapper,
+                need_sort=False,
+            )
+
+    def test_swap_maps_global_layer_to_backing_layer(self):
+        from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+
+        coordinator = object.__new__(HiSparseCoordinator)
+        coordinator.full_attention_layer_id_mapping = {3: 0, 7: 1}
+        coordinator.enable_prefetch = False
+        coordinator._run_swap_in_kernel = MagicMock(return_value="locations")
+        self.assertEqual(
+            coordinator.swap_in_selected_pages(None, None, None, 7), "locations"
+        )
+        coordinator._run_swap_in_kernel.assert_called_once_with(None, None, None, 1)
+
+
 class TestHiSparseDecodeRemap(CustomTestCase):
     def test_page_size_one_reclaims_temporary_device_slot(self):
         """Decode remapping must reclaim its temporary slot without freeing the live slot."""

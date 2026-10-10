@@ -529,6 +529,7 @@ def _check_dsa_backend_constraints(
     decode_backend: Optional[str],
     *,
     hip: bool,
+    dcp_size: int = 1,
 ) -> None:
     """Validate DSA backend / platform / kv-cache-dtype constraints."""
     chosen = {prefill_backend, decode_backend}
@@ -541,15 +542,21 @@ def _check_dsa_backend_constraints(
             "(flashmla_kv on Hopper, trtllm on Blackwell)."
         )
 
-    cuda_fp8_unsupported = {"tilelang"} & chosen
-    if not hip and kv_cache_dtype == "fp8_e4m3" and cuda_fp8_unsupported:
+    if hip or kv_cache_dtype != "fp8_e4m3" or "tilelang" not in chosen:
+        return
+    if prefill_backend != "tilelang" or decode_backend != "tilelang":
         raise ValueError(
-            f"The {'/'.join(sorted(cuda_fp8_unsupported))} DSA prefill/decode kernels "
-            "only support an fp8_e4m3 KV cache on ROCm/HIP; on CUDA they require "
-            "a bfloat16 KV cache. Use --kv-cache-dtype bfloat16, or keep "
-            "--kv-cache-dtype fp8_e4m3 and pick an fp8-capable DSA backend "
-            "(flashmla_kv on Hopper, trtllm on Blackwell)."
+            "CUDA TileLang FP8 KV requires both DSA backends to be tilelang; "
+            "raw and scaled FP8 KV layouts cannot be mixed."
         )
+    if dcp_size > 1:
+        raise ValueError("CUDA TileLang FP8 KV does not support --dcp-size > 1.")
+
+    import torch
+
+    major, minor = torch.cuda.get_device_capability()
+    if (major, minor) < (8, 9):
+        raise ValueError("CUDA TileLang FP8 KV requires SM89 or newer.")
 
 
 def _check_tilelang_dsa_fp8_kv(
@@ -558,10 +565,11 @@ def _check_tilelang_dsa_fp8_kv(
     decode_backend: Optional[str],
     *,
     hip: bool,
+    dcp_size: int = 1,
 ) -> None:
     """Backward-compatible entry point for the TileLang DSA validation."""
     _check_dsa_backend_constraints(
-        kv_cache_dtype, prefill_backend, decode_backend, hip=hip
+        kv_cache_dtype, prefill_backend, decode_backend, hip=hip, dcp_size=dcp_size
     )
 
 
@@ -652,11 +660,13 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
             declared["dsa_decode_backend"] = backend
         prefill = declared.get("dsa_prefill_backend", view.dsa_prefill_backend)
         decode = declared.get("dsa_decode_backend", view.dsa_decode_backend)
-        # The hisparse allow-list in hisparse_hook is platform- but not
-        # dtype-aware, so an explicitly requested backend still has to clear the
-        # shared backend/kv-cache-dtype rules before this arm returns early.
+        # HiSparse also requires compatible KV layouts on both DSA backends.
         _check_dsa_backend_constraints(
-            kv_cache_dtype, prefill, decode, hip=get_platform().is_hip
+            kv_cache_dtype,
+            prefill,
+            decode,
+            hip=get_platform().is_hip,
+            dcp_size=getattr(view, "dcp_size", 1) or 1,
         )
         logger.warning(
             f"HiSparse enabled ({kv_cache_dtype}): using DSA backends "
@@ -686,7 +696,11 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
     prefill = declared.get("dsa_prefill_backend", view.dsa_prefill_backend)
     decode = declared.get("dsa_decode_backend", view.dsa_decode_backend)
     _check_dsa_backend_constraints(
-        kv_cache_dtype, prefill, decode, hip=get_platform().is_hip
+        kv_cache_dtype,
+        prefill,
+        decode,
+        hip=get_platform().is_hip,
+        dcp_size=getattr(view, "dcp_size", 1) or 1,
     )
     logger.warning(
         f"Set DSA backends for {kv_cache_dtype} KV Cache: "

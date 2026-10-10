@@ -1961,6 +1961,7 @@ class KVCacheConfigurator:
         max_total_num_tokens: int,
         max_running_requests: int,
         dsa_pool_class: type,
+        full_attention_layer_ids: Optional[list[int]] = None,
     ) -> KVCache:
         from sglang.srt.layers.cp.utils import get_glm_dsa_cp_layer_shard_info
 
@@ -1993,11 +1994,20 @@ class KVCacheConfigurator:
             pool_kwargs["layer_shard_size"] = dsa_cp_layer_shard_size
         else:
             PoolCls = dsa_pool_class
+        # Hybrid pools expose global layer IDs but store only DSA layers.
+        start_layer = self.layer_info.start_layer
+        end_layer = self.layer_info.end_layer
+        layer_num = self.layer_info.num_effective_layers
+        if full_attention_layer_ids is not None:
+            start_layer = 0
+            end_layer = layer_num = len(full_attention_layer_ids)
         if _should_elide_dsa_index_k(is_draft_worker=self.is_draft_worker):
             pool_kwargs["skip_topk_layers"] = [
                 dsa_layer_skips_topk(self.model_config.hf_config, layer_id)
-                for layer_id in range(
-                    self.layer_info.start_layer, self.layer_info.end_layer
+                for layer_id in (
+                    full_attention_layer_ids
+                    if full_attention_layer_ids is not None
+                    else range(start_layer, end_layer)
                 )
             ]
         token_to_kv_pool = PoolCls(
@@ -2006,15 +2016,15 @@ class KVCacheConfigurator:
             dtype=self.kv_cache_dtype,
             kv_lora_rank=self.model_config.kv_lora_rank,
             qk_rope_head_dim=self.model_config.qk_rope_head_dim,
-            layer_num=self.layer_info.num_effective_layers,
+            layer_num=layer_num,
             device=self.device,
             kv_cache_dim=calculate_mla_kv_cache_dim(
                 model_config=self.model_config,
                 kv_cache_dtype=self.kv_cache_dtype,
             ),
             enable_memory_saver=get_exec().features.enable_memory_saver,
-            start_layer=self.layer_info.start_layer,
-            end_layer=self.layer_info.end_layer,
+            start_layer=start_layer,
+            end_layer=end_layer,
             index_head_dim=get_dsa_index_head_dim(self.model_config.hf_config),
             index_kpool=get_dsa_index_kpool(self.model_config.hf_config),
             index_kpool_compress=get_dsa_index_kpool_compress(
@@ -2260,6 +2270,13 @@ class KVCacheConfigurator:
                     extra_args.update(
                         tail_extra_slots=(max_speculative_num_draft_tokens() or 0),
                         max_running_requests=(req_to_token_pool.req_to_token.shape[0]),
+                    )
+                if get_memory().enable_hisparse and not self.is_draft_worker:
+                    extra_args["full_kv_pool"] = self._build_dsa_kv_pool(
+                        max_total_num_tokens=max_total_num_tokens,
+                        max_running_requests=req_to_token_pool.req_to_token.shape[0],
+                        dsa_pool_class=dsa_pool_class,
+                        full_attention_layer_ids=full_attention_layer_ids,
                     )
         quant_method = self._build_mha_quant_method(
             num_layers=len(full_attention_layer_ids)
@@ -3012,6 +3029,14 @@ def calculate_mla_kv_cache_dim(
     if _is_hip and (
         get_exec().kernel.dsa_prefill_backend in ("tilelang", "triton", "aiter")
         or get_exec().kernel.dsa_decode_backend in ("tilelang", "triton", "aiter")
+    ):
+        return kv_cache_dim
+
+    # CUDA TileLang uses raw FP8 rows without per-block scales. Argument
+    # validation requires both consumers to use the same TileLang layout.
+    if (
+        get_exec().kernel.dsa_prefill_backend == "tilelang"
+        and get_exec().kernel.dsa_decode_backend == "tilelang"
     ):
         return kv_cache_dim
 

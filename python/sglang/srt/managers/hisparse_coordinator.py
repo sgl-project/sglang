@@ -43,7 +43,11 @@ from sglang.srt.mem_cache.allocator.hisparse import (
 from sglang.srt.mem_cache.hisparse_memory_pool import (
     HiSparseDSATokenToKVPool,
 )
-from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool, ReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import (
+    HybridLinearKVPool,
+    MiniMaxSparseKVPool,
+    ReqToTokenPool,
+)
 from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
 from sglang.srt.mem_cache.pool_host.mha import HiSparseMHATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
@@ -151,6 +155,7 @@ class HiSparseCoordinator:
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.top_k = top_k
+        self.num_tail_slots = 0
         self.device_buffer_size = device_buffer_size
         self.device = device
         self.swap_in_block_size = swap_in_block_size
@@ -165,6 +170,7 @@ class HiSparseCoordinator:
             )
         self.compress_ratio = self.token_to_kv_pool_allocator.compress_ratio
 
+        self.full_attention_layer_id_mapping = None
         kvcache = self.token_to_kv_pool_allocator.get_kvcache()
         self.is_dsv4_hisparse = isinstance(
             self.token_to_kv_pool_allocator, DeepSeekV4HiSparseTokenToKVPoolAllocator
@@ -208,7 +214,28 @@ class HiSparseCoordinator:
                 )
                 self.item_size_bytes = self.mem_pool_device.bytes_per_token_k
             else:
-                self.mem_pool_device: HiSparseDSATokenToKVPool = kvcache
+                self.mem_pool_device: HiSparseDSATokenToKVPool = (
+                    self.token_to_kv_pool_allocator.hisparse_kvcache
+                )
+                if isinstance(kvcache, HybridLinearKVPool):
+                    self.full_attention_layer_id_mapping = (
+                        kvcache.full_attention_layer_id_mapping
+                    )
+                    if shared_index_layers is not None:
+                        shared_index_layers = [
+                            shared_index_layers[layer_id]
+                            for layer_id in self.full_attention_layer_id_mapping
+                        ]
+                self.num_tail_slots = self.mem_pool_device.index_kpool - 1
+                if self.num_tail_slots and _is_xpu:
+                    raise ValueError(
+                        "HiSparse KPool tail columns are not supported on XPU yet."
+                    )
+                self.top_k += self.num_tail_slots
+                if self.device_buffer_size < self.top_k:
+                    raise ValueError(
+                        "HiSparse device_buffer_size must cover top-k and tail columns."
+                    )
                 self.mem_pool_host = MLATokenToKVPoolHost(
                     device_pool=self.mem_pool_device,
                     host_to_device_ratio=host_to_device_ratio,
@@ -843,6 +870,8 @@ class HiSparseCoordinator:
         assert not self.is_dsv4_hisparse, (
             "naive_load_topk is not implemented for dsv4 hisparse"
         )
+        if self.full_attention_layer_id_mapping is not None:
+            layer_id = self.full_attention_layer_id_mapping[layer_id]
         num_reqs = req_pool_indices.size(0)
         top_k_indices = torch.full(
             (num_reqs, self.top_k), -1, dtype=torch.int32, device=self.device
@@ -850,20 +879,16 @@ class HiSparseCoordinator:
 
         for i in range(num_reqs):
             seq_len = int(seq_lens[i].item())
-            top_n = min(seq_len, self.top_k)
+            row = top_k_tokens[i].to(dtype=torch.int64)
+            valid = (row >= 0) & (row < seq_len)
+            if seq_len <= self.device_buffer_size:
+                history_end = self.top_k - self.num_tail_slots
+                valid[min(seq_len, history_end) : history_end] = False
+            selected_tokens = row[valid]
+            top_n = selected_tokens.numel()
             if top_n == 0:
                 continue
-
             req_idx = int(req_pool_indices[i].item())
-            selected_tokens = top_k_tokens[i, :top_n].to(dtype=torch.int64)
-
-            assert torch.all(selected_tokens >= 0), (
-                f"Req {req_idx}: selected tokens contain negative positions"
-            )
-            assert torch.all(selected_tokens < seq_len), (
-                f"Req {req_idx}: selected tokens {selected_tokens.tolist()} "
-                f"out of range for seq_len={seq_len}"
-            )
 
             if seq_len <= self.device_buffer_size:
                 device_indices = self.req_to_device_buffer[req_idx, selected_tokens]
@@ -903,7 +928,7 @@ class HiSparseCoordinator:
                         io_backend="kernel",
                     )
 
-            top_k_indices[i, :top_n] = device_indices.to(torch.int32)
+            top_k_indices[i, valid] = device_indices.to(torch.int32)
 
         return top_k_indices
 
@@ -1022,6 +1047,8 @@ class HiSparseCoordinator:
             if record_plan
             else {}
         )
+        if not self.is_dsv4_hisparse and not _is_xpu:
+            plan["num_tail_slots"] = self.num_tail_slots
         skip_io_kwargs = {} if _is_xpu else dict(skip_io=self.skip_io)
         swap_in_fn(
             top_k_tokens=top_k_result,
@@ -1113,6 +1140,8 @@ class HiSparseCoordinator:
         With prefetch enabled, anchors swap in synchronously (recording the miss
         plan) and prefetch their skip layers' copies; skip layers just wait.
         """
+        if self.full_attention_layer_id_mapping is not None:
+            layer_id = self.full_attention_layer_id_mapping[layer_id]
         if not self.enable_prefetch:
             return self._run_swap_in_kernel(
                 req_pool_indices,
