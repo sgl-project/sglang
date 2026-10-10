@@ -111,6 +111,7 @@ from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
 from sglang.srt.managers.mm_utils import wrap_shm_features
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.schedule_batch import (
+    Modality,
     MultimodalDataItem,
     get_request_return_hidden_states_mode,
 )
@@ -124,6 +125,7 @@ from sglang.srt.managers.utils import (
 from sglang.srt.model_executor.forward_batch_info import (
     get_server_return_hidden_states_mode,
 )
+from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.multimodal.transport import determine_tensor_transport_mode
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.metrics_collector import (
@@ -869,6 +871,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Normalize the request
         obj.normalize_batch_and_arguments()
+        if isinstance(obj, GenerateReqInput) and obj.input_ids is not None:
+            self._validate_generation_input_ids(obj)
         self._set_default_priority(obj)
         if (
             isinstance(obj, GenerateReqInput)
@@ -1497,6 +1501,58 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 raise ValueError(
                     f"token_ids_logprob contains out-of-vocabulary token id "
                     f"{token_id}; valid range is [0, {vocab_size})."
+                )
+
+    def _validate_generation_input_ids(self, obj: GenerateReqInput) -> None:
+        # Normalization aligns each prompt with its own media. Check caller IDs
+        # before processing or request-state creation, without treating another
+        # batch item's media as permission to use a placeholder in this prompt.
+        # Read columns directly: obj[i] caches a child request and would freeze
+        # priority/trace metadata before the later setup populates it.
+        sequences = (obj.input_ids,) if obj.is_single else obj.input_ids
+        for index, input_ids in enumerate(sequences):
+            mm_token_ids = set()
+            if self.mm_processor is not None:
+                for modality, column in (
+                    (Modality.IMAGE, obj.image_data),
+                    (Modality.VIDEO, obj.video_data),
+                    (Modality.AUDIO, obj.audio_data),
+                ):
+                    data = column if obj.is_single else column[index]
+                    if has_valid_data(data):
+                        mm_token_ids.update(
+                            self.mm_processor.get_input_token_ids_for_data(
+                                modality, data
+                            )
+                        )
+            # The output vocabulary can differ (e.g. GLM-Image predicts vision
+            # tokens). Ordinary prompt IDs belong to the text embedding domain.
+            self._validate_input_ids_in_vocab(
+                input_ids,
+                self.model_config.hf_text_config.vocab_size,
+                mm_token_ids,
+            )
+
+    def _validate_input_ids_in_vocab(
+        self,
+        input_ids: Union[List[int], List[List[int]]],
+        vocab_size: int,
+        mm_token_ids: frozenset[int] | set[int] = frozenset(),
+    ) -> None:
+        # Empty prompts are resolved by request normalization/session history.
+        if not input_ids:
+            return
+        sequences = input_ids if isinstance(input_ids[0], list) else (input_ids,)
+        for sequence in sequences:
+            if any(
+                (token_id < 0 or token_id >= vocab_size)
+                and token_id not in mm_token_ids
+                for token_id in sequence
+            ):
+                raise ValueError(
+                    "input_ids contains out-of-vocabulary token IDs; "
+                    f"valid range is [0, {vocab_size}), apart from the active "
+                    "multimodal processor's placeholders for the supplied media."
                 )
 
     def _create_tokenized_object(

@@ -703,6 +703,7 @@ def _make_tm_for_generate(case, enable_lora=False) -> TokenizerManager:
 
 def _make_generate_obj(rid, is_single):
     obj = MagicMock(spec=GenerateReqInput)
+    obj.input_ids = None
     obj.routed_dp_rank = None
     obj.is_single = is_single
     obj.rid = rid

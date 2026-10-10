@@ -179,6 +179,16 @@ class InklingMultimodalProcessor(SGLangBaseProcessor):
             tokenizer=self._tokenizer,
         )
 
+    def get_input_token_ids(self, modality: Modality) -> set[int]:
+        token_ids = super().get_input_token_ids(modality)
+        token_id = {
+            Modality.IMAGE: self.IMAGE_TOKEN_ID,
+            Modality.AUDIO: self.AUDIO_TOKEN_ID,
+        }.get(modality)
+        if token_id is not None:
+            token_ids.add(token_id)
+        return token_ids
+
     # ---- core (pure, testable) ------------------------------------------
 
     def assemble(
