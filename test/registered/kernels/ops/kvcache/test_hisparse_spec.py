@@ -191,8 +191,9 @@ class TestHiSparseSpec(CustomTestCase):
             device=DEVICE,
         )
         pool.data_strides = torch.full_like(pool.data_ptrs, pool.bytes_per_token)
-        src = torch.tensor([6, 1, 8, 3, 0, 0], device=DEVICE)
-        dst = torch.tensor([1, 1, 3, 3, 0, 0], device=DEVICE)
+        # Verify slots and persistent destinations are disjoint; padding stays put.
+        src = torch.tensor([26, 27, 28, 29], device=DEVICE)
+        dst = torch.tensor([24, 27, 25, 29], device=DEVICE)
 
         pool.transfer_values_on_device(dst, src)
         torch.cuda.synchronize()
@@ -204,7 +205,7 @@ class TestHiSparseSpec(CustomTestCase):
         graph.replay()
 
         for buf, original in zip(pool.kv_buffer, originals):
-            original[[1, 3]] = original[[6, 8]]
+            original[[24, 25]] = original[[26, 28]]
             torch.testing.assert_close(buf, original)
 
     def test_deduplicates_repeated_misses_and_copies_full_items(self) -> None:
