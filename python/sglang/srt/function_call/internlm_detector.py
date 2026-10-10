@@ -246,3 +246,25 @@ class InternlmDetector(BaseFormatDetector):
             end="}<|action_end|>",
             trigger="<|action_start|> <|plugin|>",
         )
+
+    def finish(self, tools: list[Tool]) -> StreamingParseResult:
+        """Release only user-visible text when the stream ends.
+
+        A buffer that reaches the opening marker holds a truncated tool call:
+        the closing marker can no longer arrive, so the protocol block is
+        dropped and only the prose in front of the marker is returned (already
+        streamed in the normal case). A buffer without the marker is a
+        truncated marker prefix or trailing prose, which is safe to release as
+        normal text. Same rule as the Spark2.5 / Kimi-K3 / DeepSeek-V3.2
+        detectors.
+        """
+        if not self._buffer:
+            return StreamingParseResult()
+        buffered = self._buffer
+        self._buffer = ""
+        open_idx = buffered.find(self.bot_token)
+        if open_idx != -1:
+            buffered = buffered[:open_idx]
+        if buffered:
+            return StreamingParseResult(normal_text=buffered)
+        return StreamingParseResult()
