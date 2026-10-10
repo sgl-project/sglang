@@ -654,6 +654,7 @@ def sglang_per_token_group_quant_fp8_row_padded(
     group_size: int,
     eps: float = 1e-10,
     row_alignment: int = 4,
+    scale_ue8m0: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Per-token-group quant writing into row-padded buffers (col-major scales).
 
@@ -691,18 +692,41 @@ def sglang_per_token_group_quant_fp8_row_padded(
         (k // group_size, m_pad), device=x.device, dtype=torch.float32
     ).transpose(0, 1)
     if m > 0:
-        _run_per_token_group_quant_8bit_kernel(
-            x,
-            x_q[:m],
-            x_s[:m],
-            group_size,
-            eps,
-            fp8_min,
-            fp8_max,
-            scale_ue8m0=False,
-            fuse_silu_and_mul=False,
-            masked_m=None,
-        )
+        if scale_ue8m0:
+            # The FP32 UE8M0 kernel writes scales row-major regardless of the
+            # destination view strides. Quantize scales into a contiguous
+            # temporary, then copy into CUTLASS's column-major padded buffer.
+            x_s_row_major = torch.empty(
+                (m, k // group_size),
+                device=x.device,
+                dtype=torch.float32,
+            )
+            _run_per_token_group_quant_8bit_kernel(
+                x,
+                x_q[:m],
+                x_s_row_major,
+                group_size,
+                eps,
+                fp8_min,
+                fp8_max,
+                scale_ue8m0=True,
+                fuse_silu_and_mul=False,
+                masked_m=None,
+            )
+            x_s[:m].copy_(x_s_row_major)
+        else:
+            _run_per_token_group_quant_8bit_kernel(
+                x,
+                x_q[:m],
+                x_s[:m],
+                group_size,
+                eps,
+                fp8_min,
+                fp8_max,
+                scale_ue8m0=False,
+                fuse_silu_and_mul=False,
+                masked_m=None,
+            )
     if m_pad != m:
         # Tail rows feed the cutlass GEMM's padded region; zero them so the padded
         # GEMM stays bit-exact with the legacy pad_tensor path (torch.empty is garbage).
