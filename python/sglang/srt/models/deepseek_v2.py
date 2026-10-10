@@ -1134,11 +1134,15 @@ class DeepseekV2MoE(nn.Module):
                 )
                 ready = self.routed_quant_stream.record_event()
             routed_pre_quant_input = Mxfp8RoutedInputPreQuant(x_q, x_sf, ready)
+        supports_deferred_finalize = (
+            self.experts.supports_deferred_finalize
+            if topk_output.format == TopKOutputFormat.BYPASSED
+            else self.experts.supports_routed_deferred_finalize
+        )
         deferred_finalize = (
             has_shared_output
             and not self._shared_expert_tp1
-            and topk_output.format == TopKOutputFormat.BYPASSED
-            and self.experts.supports_deferred_finalize
+            and supports_deferred_finalize
             and (
                 self._deferred_finalize_max_tokens <= 0
                 or hidden_states.shape[0] <= self._deferred_finalize_max_tokens

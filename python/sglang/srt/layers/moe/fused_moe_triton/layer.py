@@ -520,12 +520,25 @@ class FusedMoE(torch.nn.Module):
             get_moe_runner_backend().is_flashinfer_trtllm()
             and (nvfp4_deferred or qwen35_fp8_deferred or qwen4_bf16_deferred)
         )
+        # The routed kernel defers the same way; the standard dispatcher passes
+        # the deferred triple through, an A2A combine cannot.
+        self.supports_routed_deferred_finalize = (
+            get_moe_runner_backend().is_flashinfer_trtllm_routed()
+            and nvfp4_deferred
+            and get_moe_a2a_backend().is_none()
+            # No deferred consumer rescales, so the top-k weights must carry it.
+            and _fuses_routed_scaling_factor_in_topk(self.quant_method)
+        )
         global _deferred_finalize_info_logged
         if not _deferred_finalize_info_logged:
             _deferred_finalize_info_logged = True
+            deferred_finalize_supported = (
+                self.supports_deferred_finalize
+                or self.supports_routed_deferred_finalize
+            )
             logging.getLogger(__name__).debug(
                 "FlashInfer TRTLLM MoE deferred finalize is "
-                f"{'enabled' if self.supports_deferred_finalize else 'disabled'} "
+                f"{'enabled' if deferred_finalize_supported else 'disabled'} "
                 f"(moe_runner_backend={get_exec().moe.moe_runner_backend}, "
                 f"quant_method={type(self.quant_method).__name__})."
             )
