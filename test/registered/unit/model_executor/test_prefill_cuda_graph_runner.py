@@ -107,6 +107,26 @@ class _FakeBatchRegistry:
 
 
 class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
+    def test_full_backend_accepts_mixed_chunks(self):
+        """Full pads the token and request axes and refreshes attention
+        metadata on every replay, so the mixed-chunk startup guard must not
+        reject it; it used to accept Breakable only."""
+        with (
+            get_context().override_server_args(
+                enable_mixed_chunk=True,
+                cuda_graph_config=SimpleNamespace(
+                    prefill=SimpleNamespace(backend=Backend.FULL)
+                ),
+            ),
+            patch.object(
+                runner_module.BaseCudaGraphRunner,
+                "__init__",
+                side_effect=RuntimeError("reached base initialization"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "reached base initialization"),
+        ):
+            PrefillCudaGraphRunner(object())
+
     @patch(
         "sglang.srt.model_executor.model_runner.require_gathered_buffer",
         return_value=True,
