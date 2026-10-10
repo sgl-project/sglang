@@ -40,6 +40,7 @@ class SGLDOptions:
                         "qwen_image",
                         "qwen_image_edit",
                         "flux",
+                        "flux2",
                         "lumina2",
                         "minimax_h3",
                     ],

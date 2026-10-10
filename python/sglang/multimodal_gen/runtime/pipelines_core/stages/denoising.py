@@ -1232,7 +1232,22 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             device=device,
         )
 
-    def get_or_build_guidance(self, bsz: int, dtype, device):
+    @staticmethod
+    def _comfyui_request_guidance(batch: Req, server_args: ServerArgs) -> float | None:
+        """FLUX.2 under ComfyUI takes its embedded guidance from the request.
+
+        Other models send a placeholder guidance_scale that was never meant as
+        embedded guidance, so they keep the pipeline config's value.
+        """
+        if server_args.comfyui_mode and isinstance(
+            server_args.pipeline_config, Flux2PipelineConfig
+        ):
+            return batch.guidance_scale
+        return None
+
+    def get_or_build_guidance(
+        self, bsz: int, dtype, device, request_guidance_scale: float | None = None
+    ):
         """
         Get the guidance tensor, using a cached version if available.
 
@@ -1241,8 +1256,12 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         preventing repeated tensor creation within the denoising loop.
         """
         if self.server_args.pipeline_config.should_use_guidance:
-            # TODO: should the guidance_scale be picked-up from sampling_params?
-            guidance_val = self.server_args.pipeline_config.embedded_cfg_scale
+            # ComfyUI owns guidance (FluxGuidance), so its per-request value wins.
+            guidance_val = (
+                request_guidance_scale
+                if request_guidance_scale is not None
+                else self.server_args.pipeline_config.embedded_cfg_scale
+            )
             return self._build_guidance(bsz, dtype, device, guidance_val)
         else:
             return None
@@ -1408,6 +1427,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             latents.shape[0],
             latents.dtype,
             latents.device,
+            request_guidance_scale=self._comfyui_request_guidance(batch, server_args),
         )
 
         image_kwargs = self.prepare_extra_func_kwargs(

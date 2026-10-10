@@ -24,6 +24,7 @@ The plugin supports two modes of operation: **Server Mode** (via HTTP API) and *
 - **Z-Image**: High-speed image generation models (e.g., `Z-Image-Turbo`)
 - **FLUX**: State-of-the-art text-to-image models (e.g., `FLUX.1-dev`)
 - **Qwen-Image**: Multi-modal image generation models (e.g., `Qwen-Image`,`Qwen-Image-2512`). *Note: Image editing support is currently experimental and may have some issues.*
+- **FLUX.2 / FLUX.2 Klein**: Image generation and reference-image editing (`model_type=flux2`, auto-detected). Integrated mode only; see [FLUX.2 in Integrated Mode](#flux2-in-integrated-mode).
 - **MiniMax-H3**: Joint video-and-audio DiT (`model_type=minimax_h3`). Integrated mode: T2V / I2VA / FL2VA use an `fl2va` checkpoint; R2V needs `ref2va`. CLIP and VAE stay in ComfyUI. Server mode uses `SGLDiffusion Generate MiniMax-H3`.
 
 ### Mode 1: Server Mode (HTTP API)
@@ -46,6 +47,19 @@ decode on the worker).
 2. **Configure Options**: Use the `SGLDiffusion Options` node to set runtime parameters like `num_gpus`, `tp_size`, `model_type`, or `enable_torch_compile`.
 3. **Sample**: Connect the loaded model to standard ComfyUI samplers. Each step is packed by a model adapter and sent to the SGLang scheduler.
 4. **LoRA Support**: Use the `SGLDiffusion LoRA Loader` for native LoRA integration.
+
+### FLUX.2 in Integrated Mode
+
+Load the BF16 BFL-layout checkpoint (FLUX.2 dev, or Klein 4B / 9B, distilled or base) with the
+`SGLDiffusion UNET Loader`. The text encoder (Mistral for dev, Qwen3 for Klein) and the VAE stay in
+ComfyUI. The family is chosen from the checkpoint: dev by its 15360-wide text input, Klein otherwise.
+Embedded guidance is used only when the checkpoint carries guidance weights (dev does; the Klein
+4B releases, distilled and base, do not).
+
+- **Guidance:** `FluxGuidance` reaches the DiT for FLUX.2. Distilled Klein has no guidance input.
+- **Reference images:** `ReferenceLatent` conditioning (Klein editing, multi-reference) is applied, in the same order and with the same position ids as ComfyUI.
+- **Batches:** positive and negative prompts that ComfyUI stacks into one call are handled.
+- **Not supported yet:** fp8 / quantized checkpoints (rejected with an error), and attention masks.
 
 ## Adding a Model
 
@@ -85,6 +99,9 @@ Reference workflow files are provided in the `workflows/` directory:
 - **`z-image_sgld.json`**: High-speed image generation using Z-Image.
 - **`sgld_text2img.json`**: Server-mode text-to-image generation with LoRA support.
 - **`sgld_image2video.json`**: Server-mode image-to-video generation.
+- **`flux2_dev_t2i_sgld.json`**: FLUX.2 dev text-to-image.
+- **`flux2_klein_t2i_sgld.json`**: FLUX.2 Klein (distilled) text-to-image.
+- **`flux2_klein_edit_sgld.json`**: FLUX.2 Klein reference-image editing.
 - **`minimax_h3_t2v_sgld.json`**: MiniMax-H3 T2V / I2VA / FL2VA (`fl2va` DiT).
 - **`minimax_h3_r2v_sgld.json`**: MiniMax-H3 reference-to-video (`ref2va` DiT).
 - **`minimax_h3_t2v_sgld_upscaler.json`**: H3 two-pass latent upscale (low-res then 3D ×2 refine).
