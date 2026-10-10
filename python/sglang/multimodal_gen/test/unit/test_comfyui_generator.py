@@ -369,3 +369,36 @@ def test_fasth3_single_file_as_base_h3_is_rejected_before_worker_load(
     )
     with pytest.raises(ValueError, match="model_type fast_h3"):
         runtime.load_model(model_path=str(path), sgld_options={})
+
+
+def test_fasth3_runtime_dir_is_checked_before_worker_load(tmp_path) -> None:
+    """The 4-step preview and a raw (unmaterialized) FastH3 V2 download were
+    only rejected by the worker after a full model load."""
+    import json
+
+    import pytest
+
+    release = {
+        "schema_version": 1,
+        "partition": "fl2va",
+        "tasks": ["t2va"],
+        "task_aliases": {},
+        "sigma_shift_scales": {"video": 10.0, "audio": 3.0},
+    }
+    (tmp_path / "transformer").mkdir()
+    index = tmp_path / "transformer" / "diffusion_pytorch_model.safetensors.index.json"
+    runtime = SGLDiffusionGenerator()
+    runtime.get_comfyui_model = lambda *a: (SimpleNamespace(), None, "minimax_h3")
+    runtime.init_generator = lambda *a: (_ for _ in ()).throw(
+        AssertionError("worker must not start")
+    )
+    options = {"model_type": "fast_h3", "runtime_model_path": str(tmp_path)}
+    for dmd, weight_map, message in (
+        (None, {}, "no trained DMD rungs"),
+        ([999, 500], {"blocks.0.x": "a.safetensors"}, "raw FastH3 download"),
+    ):
+        meta = dict(release, **({"dmd_denoising_steps": dmd} if dmd else {}))
+        (tmp_path / "model_index.json").write_text(json.dumps({"_minimax_h3": meta}))
+        index.write_text(json.dumps({"weight_map": weight_map}))
+        with pytest.raises(ValueError, match=message):
+            runtime.load_model(model_path="h3.safetensors", sgld_options=options)

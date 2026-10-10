@@ -41,16 +41,9 @@ class SGLDH3DistilledSigmas:
     CATEGORY = "SGLDiffusion"
 
     def build(self, model_type):
-        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.time_request import (
-            minimax_h3_time_shift_sigmas,
-        )
+        from .executors.minimax_h3 import distilled_h3_sigmas
 
-        if model_type not in ("fast_h3", "vdn_h3"):
-            raise ValueError("Distilled sigma grid requires fast_h3 or vdn_h3")
-        n = 5 if model_type == "fast_h3" else 9
-        return (
-            torch.tensor(minimax_h3_time_shift_sigmas(num_steps=n, shift_scale=12.0)),
-        )
+        return (torch.tensor(distilled_h3_sigmas(model_type)),)
 
 
 class SGLDOptions:

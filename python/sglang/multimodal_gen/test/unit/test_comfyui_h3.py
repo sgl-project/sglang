@@ -1283,30 +1283,117 @@ def test_comfyui_sparse_stream_layout_preserves_target_and_condition_roles():
     ).any()
 
 
-@pytest.mark.parametrize("model_type,nfe", [("fast_h3", 4), ("vdn_h3", 8)])
-def test_distilled_h3_rejects_wrong_grid_and_reference_task(model_type, nfe):
+@pytest.mark.parametrize("model_type", ["fast_h3", "vdn_h3"])
+def test_distilled_h3_rejects_wrong_grid_and_reference_task(model_type):
     from types import SimpleNamespace
 
     from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.minimax_h3 import (
+        distilled_h3_sigmas,
         validate_distilled_h3_step,
     )
-    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.time_request import (
-        minimax_h3_time_shift_sigmas,
-    )
 
-    sigmas = torch.tensor(
-        minimax_h3_time_shift_sigmas(num_steps=nfe, shift_scale=12.0)
-    )
+    expected = distilled_h3_sigmas(model_type)
+    sigmas = torch.tensor(expected)
     packed = SimpleNamespace(extra_req={"h3_sample_sigmas": sigmas})
-    validate_distilled_h3_step(packed, model_type)
-    packed.extra_req["h3_sample_sigmas"] = torch.linspace(1, 0, nfe + 1)
+    validate_distilled_h3_step(packed, model_type, expected)
+    packed.extra_req["h3_sample_sigmas"] = torch.linspace(1, 0, len(expected))
     with pytest.raises(ValueError, match="trained"):
-        validate_distilled_h3_step(packed, model_type)
+        validate_distilled_h3_step(packed, model_type, expected)
     packed.extra_req.update(
         h3_sample_sigmas=sigmas, h3_payload={"refs": [{"kind": "image"}]}
     )
     with pytest.raises(ValueError, match="reference"):
-        validate_distilled_h3_step(packed, model_type)
+        validate_distilled_h3_step(packed, model_type, expected)
+
+
+def test_fasth3_comfy_grid_matches_native_8_step_v2_contract():
+    """The plugin pinned fast_h3 to the 4-NFE preview grid (shift 12) after the
+    runtime moved to FastH3 8-Step V2, so V2 could not run in ComfyUI."""
+    from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.minimax_h3 import (
+        distilled_h3_sigmas,
+    )
+    from sglang.multimodal_gen.configs.sample.minimax_h3 import FastH3SamplingParams
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.time_request import (
+        minimax_h3_time_shift_sigmas,
+    )
+
+    # FastVideo/FastVideo-FastH3-8-Step-V2 model_index.json._minimax_h3
+    rungs = (999, 874, 749, 624, 500, 375, 250, 125)
+    native = minimax_h3_time_shift_sigmas(
+        num_steps=8, shift_scale=10.0, dmd_steps=rungs
+    )
+    assert distilled_h3_sigmas("fast_h3") == native
+    assert len(native) == FastH3SamplingParams().num_inference_steps + 1
+
+
+def _fasth3_executor(tmp_path, minimax_h3):
+    import json
+    from types import SimpleNamespace
+
+    from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.minimax_h3 import (
+        FastH3Executor,
+    )
+
+    (tmp_path / "model_index.json").write_text(
+        json.dumps({"_class_name": "FastH3Pipeline", "_minimax_h3": minimax_h3})
+    )
+    sent = []
+
+    class Recording(FastH3Executor):
+        def _execute_packed(self, packed, x, timestep):
+            sent.append(packed)
+            return x
+
+    config = SimpleNamespace(unet_config={"dtype": torch.bfloat16})
+    return Recording(None, str(tmp_path), None, config), sent
+
+
+_FASTH3_V2_RELEASE = {
+    "schema_version": 1,
+    "partition": "fl2va",
+    "tasks": ["t2va"],
+    "task_aliases": {},
+    "sigma_shift_scales": {"video": 10.0, "audio": 3.0},
+    "dmd_denoising_steps": [999, 874, 749, 624, 500, 375, 250, 125],
+}
+
+
+def test_fasth3_executor_uses_trained_shifts_and_rejects_conflicts(tmp_path):
+    """Without a MiniMaxH3SigmaShift node the audio sigma was derived with the
+    base 12/3 shifts instead of FastH3's trained 10/3."""
+    ex, sent = _fasth3_executor(tmp_path, _FASTH3_V2_RELEASE)
+    x = [torch.ones(1, 24, 2, 4, 4), torch.ones(1, 32, 2, 3)]
+    kwargs = dict(minimax_payload={"audio_scale": 1.0})
+    sigmas = torch.tensor(ex.expected_sigmas)
+    ex(
+        x,
+        torch.tensor([500.0]),
+        torch.ones(1, 8, 16),
+        transformer_options={"sample_sigmas": sigmas},
+        **kwargs,
+    )
+    opts = sent[0].extra_req["h3_transformer_options"]
+    assert opts["minimax_h3_sigma_shift_video"] == 10.0
+    assert opts["minimax_h3_sigma_shift_audio"] == 3.0
+    with pytest.raises(ValueError, match="distilled with sigma shift video/audio 10/3"):
+        ex(
+            x,
+            torch.tensor([500.0]),
+            torch.ones(1, 8, 16),
+            transformer_options={
+                "sample_sigmas": sigmas,
+                "minimax_h3_sigma_shift_video": 12.0,
+            },
+            **kwargs,
+        )
+
+
+def test_fasth3_executor_rejects_runtime_without_trained_rungs(tmp_path):
+    release = {
+        k: v for k, v in _FASTH3_V2_RELEASE.items() if k != "dmd_denoising_steps"
+    }
+    with pytest.raises(ValueError, match="no trained DMD rungs"):
+        _fasth3_executor(tmp_path, release)
 
 
 def test_h3_carried_audio_matches_comfyui_without_double_sigma_derivative():

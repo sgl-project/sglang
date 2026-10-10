@@ -515,6 +515,10 @@ class SGLDiffusionGenerator:
         if set_model_type is not None and set_model_type in self.pipeline_class_dict:
             model_type = set_model_type
 
+        if model_type == "fast_h3":
+            from ..executors.minimax_h3 import load_fasth3_release
+
+            load_fasth3_release(runtime_model_path)
         if model_type == "minimax_h3" and not runtime_model_path:
             if detect_path.endswith(".safetensors") and _has_vsa_gate(detect_path):
                 raise ValueError(
