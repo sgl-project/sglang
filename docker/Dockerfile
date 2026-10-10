@@ -406,6 +406,11 @@ ARG GITHUB_ARTIFACTORY
 ARG BRANCH_TYPE
 ARG SGL_VERSION
 ARG USE_LATEST_SGLANG
+ARG GATEWAY_BUILD_JOBS=1
+
+# Cargo otherwise uses every visible CPU, which can exhaust file descriptors
+# in restricted build containers. Maturin's Cargo subprocess inherits this too.
+ENV CARGO_BUILD_JOBS=${GATEWAY_BUILD_JOBS}
 
 WORKDIR /build
 
@@ -420,6 +425,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && python3 -m pip install maturin \
     && cd /build/sgl-model-gateway/bindings/python \
     && ulimit -S -n "$(ulimit -H -n)" \
+    && printf 'Gateway build: jobs=%s nofile soft=%s hard=%s\n' "$CARGO_BUILD_JOBS" "$(ulimit -S -n)" "$(ulimit -H -n)" \
     && maturin build --release --features vendored-openssl --out /build/gateway_wheels \
     && cd /build/sgl-model-gateway \
     && cargo build --release --bin sgl-model-gateway --features vendored-openssl \

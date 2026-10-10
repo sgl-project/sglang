@@ -43,6 +43,15 @@ The gateway build raises its soft open-file limit only to the inherited hard
 limit. Older checkouts use `ulimit -n 65536`, which aborts on restricted build
 containers when that hard limit cannot be raised. Replace it with
 `ulimit -S -n "$(ulimit -H -n)"` to respect the container's existing ceiling.
+If Cargo then fails to spawn `rustc` with `Too many open files (os error 24)`,
+the available limit is still exhausted. The gateway stage defaults to
+`GATEWAY_BUILD_JOBS=1`, exported as `CARGO_BUILD_JOBS` for both maturin and the
+gateway binary build. This trades build speed for lower resource use; it does
+not change inference settings. Override with `--build-arg GATEWAY_BUILD_JOBS=N`
+when the build environment has sufficient resources. The stage logs the job
+count and effective soft/hard open-file limits before compiling. For an older
+checkout, adding `ENV CARGO_BUILD_JOBS=1` immediately after
+`FROM base AS gateway_builder` applies the same one-job limit.
 The full image build and GPU execution still require validation on the host.
 
 ## Run
