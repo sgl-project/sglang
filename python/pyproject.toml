@@ -37,7 +37,7 @@ dependencies = [
   "distro",
   "easydict",  # Required by remote model code (e.g. DeepSeek-OCR) loaded via trust_remote_code; validated by transformers 5.4+ check_imports
   "einops",
-  "fastapi",
+  "fastapi>=0.142",
   "flash-attn-4>=4.0.0b18",
   "flashinfer_python[cu13]==0.7.0.post1", # keep it aligned with jit-cache version in Dockerfile
   "gguf",

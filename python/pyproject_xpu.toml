@@ -26,7 +26,7 @@ dependencies = [
   "datasets",
   "easydict",
   "einops",
-  "fastapi",
+  "fastapi>=0.142",
   "gguf",
   "interegular",
   "IPython",

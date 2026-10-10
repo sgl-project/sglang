@@ -26,7 +26,7 @@ dependencies = [
   "decord2 ; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'armv7l')",
   "easydict",
   "einops",
-  "fastapi",
+  "fastapi>=0.142",
   "gguf",
   "hf_transfer",
   "huggingface_hub",

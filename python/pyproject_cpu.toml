@@ -25,7 +25,7 @@ dependencies = [
   "datasets",
   "easydict",
   "einops",
-  "fastapi",
+  "fastapi>=0.142",
   "gguf",
   "intel-openmp; platform_machine == 'x86_64'",
   "interegular",
