@@ -607,7 +607,7 @@ def _unpack_dcp_kv_kernel(
     metadata,
     out_k,
     out_pe,
-    rank_rows: tl.constexpr,
+    rank_rows,
     world_size: tl.constexpr,
     k_dim: tl.constexpr,
     pe_dim: tl.constexpr,
@@ -626,28 +626,32 @@ def _unpack_dcp_kv_kernel(
         length = tl.load(metadata + req * 4 + 2)
         output_start = tl.load(metadata + req * 4 + 3)
     dim = k_dim + pe_dim
-    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    token, feature = offsets // dim, offsets % dim
-    position = start + token
-    source_row = (
-        position % world_size * rank_rows + padded_start + position // world_size
-    )
-    value = tl.load(
-        gathered + source_row.to(tl.int64) * dim + feature,
-        mask=token < length,
-        other=0.0,
-    )
-    output_row = (output_start + token).to(tl.int64)
-    tl.store(
-        out_k + output_row * k_stride + feature,
-        value,
-        mask=(token < length) & (feature < k_dim),
-    )
-    tl.store(
-        out_pe + output_row * pe_stride + feature - k_dim,
-        value,
-        mask=(token < length) & (feature >= k_dim),
-    )
+    # Keep tile arithmetic in int32 even when metadata stores int64 lengths.
+    for block in range(
+        tl.program_id(0), tl.cdiv(length * dim, BLOCK).to(tl.int32), tl.num_programs(0)
+    ):
+        offsets = block * BLOCK + tl.arange(0, BLOCK)
+        token, feature = offsets // dim, offsets % dim
+        position = start + token
+        source_row = (
+            position % world_size * rank_rows + padded_start + position // world_size
+        )
+        value = tl.load(
+            gathered + source_row.to(tl.int64) * dim + feature,
+            mask=token < length,
+            other=0.0,
+        )
+        output_row = (output_start + token).to(tl.int64)
+        tl.store(
+            out_k + output_row * k_stride + feature,
+            value,
+            mask=(token < length) & (feature < k_dim),
+        )
+        tl.store(
+            out_pe + output_row * pe_stride + feature - k_dim,
+            value,
+            mask=(token < length) & (feature >= k_dim),
+        )
 
 
 def unpack_dcp_kv(
@@ -677,7 +681,13 @@ def unpack_dcp_kv(
     else:
         metadata = metadata.to(device=gathered.device, non_blocking=True)
     dim = out_k.shape[-1] + out_pe.shape[-1]
-    _unpack_dcp_kv_kernel[(triton.cdiv(max_prefix_len * dim, 2048), num_requests)](
+    # Limit the grid by the average packed size; long requests use a grid-stride
+    # loop instead of launching their maximum tile count for every short request.
+    blocks_per_request = min(
+        triton.cdiv(max_prefix_len * dim, 2048),
+        max(1, triton.cdiv(gathered.numel(), 2048 * num_requests)),
+    )
+    _unpack_dcp_kv_kernel[(blocks_per_request, num_requests)](
         gathered,
         metadata,
         out_k,
