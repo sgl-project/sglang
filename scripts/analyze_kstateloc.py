@@ -126,6 +126,52 @@ def diff2(l1, l2, lo, hi):
     _show_xdiff(x2 if x2 else x1, tag="log2" if x2 else "log1")
 
 
+RE_BATCH = re.compile(r"(Prefill|Decode) batch.*?#cached-token:\s*(\d+)")
+
+
+def phases(path, lo, hi):
+    """Segment the log at scheduler 'Prefill/Decode batch ... #cached-token:N'
+    lines, so the SAME layer under MISS (cached=0) vs HIT (cached>0) can be
+    compared WITHOUT a rebuiid. Prints per-phase window stateLoc + input hash."""
+    segs = []            # list of (phase_label, [rw...], [xdiff...])
+    label, rws, xds = None, [], []
+    with open(path, "r", errors="ignore") as fh:
+        for ln in fh:
+            m = RE_BATCH.search(ln)
+            if m:
+                if rws or xds:
+                    segs.append((label, rws, xds))
+                label, rws, xds = f"{m.group(1)} cached={m.group(2)}", [], []
+                continue
+            rw = _rw_from(ln)
+            if rw is not None:
+                rws.append(rw)
+                continue
+            xd = _xdiff_from(ln)
+            if xd is not None:
+                xds.append(xd)
+        if rws or xds:
+            segs.append((label, rws, xds))
+    print(f"{path}: {len(segs)} phase-segments  window[{lo},{hi})")
+    for label, rws, xds in segs:
+        per = collections.defaultdict(set)
+        for op, b, p, col, sl, blk, row in rws:
+            if lo <= p < hi:
+                per[p].add(sl)
+        if not per and not xds:
+            continue
+        print(f"\n-- {label}")
+        for p in sorted(per):
+            print(f"   pos={p} stateLoc={sorted(per[p])}")
+        if xds:
+            xd = collections.defaultdict(list)
+            for layer, idx, start, ntok, shape, s, am, md5 in xds:
+                xd[layer].append(md5)
+            for layer in sorted(xd):
+                uniq = list(collections.OrderedDict.fromkeys(xd[layer]))
+                print(f"   [XDIFF] layer={layer}: {'IDENTICAL' if len(uniq) == 1 else 'DIFFERS(' + str(len(uniq)) + ')'}")
+
+
 def _show_xdiff(xdiff, tag=""):
     if not xdiff:
         return
@@ -172,13 +218,16 @@ def main():
     ap.add_argument("--hi", type=int, default=17540)
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--verbose", action="store_true")
+    ap.add_argument("--phases", action="store_true")
     a = ap.parse_args()
     if a.selftest:
         selftest()
         return
     if not a.log:
         ap.error("log path required (or --selftest)")
-    if a.log2:
+    if a.phases:
+        phases(a.log, a.lo, a.hi)
+    elif a.log2:
         diff2(a.log, a.log2, a.lo, a.hi)
     else:
         single(a.log, a.lo, a.hi, verbose=a.verbose)
