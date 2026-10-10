@@ -159,7 +159,7 @@ class BaseDSparkMarkovHead(nn.Module, ABC):
     ) -> torch.Tensor:
         """One token per row from ``step_logits(base_logits, bias)``: the argmax
         at temperature 0, a Gumbel-max sample otherwise. ``logits_out`` receives
-        this rank's step logits ([bs, local vocab])."""
+        the step logits, ``step_logits_width`` wide."""
         return MarkovSampleStep.execute(
             base_logits=base_logits,
             bias=bias,
@@ -176,9 +176,9 @@ class BaseDSparkMarkovHead(nn.Module, ABC):
     def _vocab_shard_args(self) -> dict:
         return {}
 
-    def gather_vocab(self, local_logits: torch.Tensor) -> torch.Tensor:
-        """[bs, gamma, local vocab] step logits -> [bs, gamma, vocab]."""
-        return local_logits
+    def step_logits_width(self, base_width: int) -> int:
+        """The width of the step logits over base logits ``base_width`` wide."""
+        return base_width
 
     @property
     def supports_sharded_greedy(self) -> bool:

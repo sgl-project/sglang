@@ -140,10 +140,10 @@ def draft_markov_block(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Draft ``gamma`` tokens per row, each step biased by the token before it;
     a row at temperature 0 takes the argmax. Returns the tokens and the step
-    logits, [bs, gamma, local vocab]."""
+    logits, [bs, gamma, vocab]."""
     bs, gamma = base_logits.shape[:2]
     logits_out = torch.empty(
-        (bs, gamma, base_logits.shape[-1]),
+        (bs, gamma, markov_head.step_logits_width(base_logits.shape[-1])),
         dtype=markov_head.step_logits_dtype(base_logits.dtype),
         device=base_logits.device,
     )
@@ -194,7 +194,7 @@ def sample_draft_block(
     temperatures = resolve_draft_temperatures(
         bs=bs, sampling_info=sampling_info, device=device
     )
-    draft_tokens, local_logits = draft_markov_block(
+    draft_tokens, step_logits = draft_markov_block(
         markov_head=markov_head,
         base_logits=base_logits,
         anchor_tokens=anchor_tokens,
@@ -211,9 +211,7 @@ def sample_draft_block(
     )
     return DraftBlockResult(
         draft_tokens=draft_tokens,
-        corrected_logits=expect(
-            _DRAFT_STEP_LOGITS, markov_head.gather_vocab(local_logits)
-        ),
+        corrected_logits=expect(_DRAFT_STEP_LOGITS, step_logits),
         greedy_mask=greedy_mask,
         temperatures=temperatures,
     )

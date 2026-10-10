@@ -524,18 +524,12 @@ class DSparkV4MarkovHead(BaseDSparkMarkovHead):
         return dict(
             vocab_start=shard.org_vocab_start,
             gather=self._vocab_gather.gather_stacked,
+            gather_logits=self._vocab_gather,
         )
 
-    def gather_vocab(self, local_logits: torch.Tensor) -> torch.Tensor:
-        if self._tp_shard is None:
-            return local_logits
-        # One gather per step keeps each call within the NVLink pull capacity,
-        # which is sized for one step's rows.
-        steps = [
-            self._vocab_gather(local_logits[:, step].contiguous())[:, : self.vocab_size]
-            for step in range(local_logits.shape[1])
-        ]
-        return torch.stack(steps, dim=1)
+    def step_logits_width(self, base_width: int) -> int:
+        # Kept step logits are gathered whole over the sharded vocab.
+        return base_width if self._tp_shard is None else self.vocab_size
 
     @property
     def supports_sharded_greedy(self) -> bool:
