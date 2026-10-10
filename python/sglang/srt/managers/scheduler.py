@@ -1665,8 +1665,7 @@ class Scheduler(
         self.use_ngram_embedding = self.tp_worker.model_config.use_ngram_embedding
 
     def init_deterministic_prefill_chunk_align(self):
-        """Deterministic flashinfer prefill is bit-exact across chunkings only when
-        every chunk starts on its q-tile grid; triton tiles keys at absolute positions."""
+        """Align prefill chunks to the flashinfer q-tile grid under deterministic inference."""
         self.truncation_align_size = None
         if not get_exec().deterministic.enable_deterministic_inference:
             return

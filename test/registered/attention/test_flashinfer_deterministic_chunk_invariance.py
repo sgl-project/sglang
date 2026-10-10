@@ -1,7 +1,5 @@
-"""Deterministic flashinfer (fa2, fixed split-KV) prefill must reproduce the
-unchunked prefill bit for bit when every chunk starts on a 128-token boundary,
-which is what the scheduler's chunk truncation relies on; a chunk that starts
-off that grid is not reproduced, so the truncation cannot be dropped."""
+"""Deterministic fa2 prefill chunked on the 128-token grid must match the
+unchunked prefill bit for bit; a chunk off the grid must not."""
 
 import unittest
 
@@ -21,7 +19,6 @@ DTYPE = torch.bfloat16
 
 
 def _prefill(wrapper, q, k, v, q_start, q_len, kv_len, num_qo_heads, num_kv_heads):
-    """Causal extend of q rows [q_start, q_start + q_len) over KV slots [0, kv_len)."""
     device = q.device
     wrapper.plan(
         torch.tensor([0, q_len], dtype=torch.int32, device=device),
@@ -86,8 +83,6 @@ class TestFlashinferDeterministicChunkInvariance(CustomTestCase):
                     )
 
     def test_chunk_off_tile_grid_differs(self):
-        # Turns red once the kernel tiles at absolute positions, at which point
-        # the scheduler no longer needs to align chunks.
         for num_qo_heads, num_kv_heads, bound in ((8, 2, 100), (8, 8, 64)):
             with self.subTest(gqa=num_qo_heads // num_kv_heads, bound=bound):
                 self.assertFalse(
