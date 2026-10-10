@@ -745,13 +745,17 @@ def _resolve_remote_repo_model_index_path(
         # Cache-aware: no local_dir, so the selected Hub reuses its cache and
         # revalidates the remote file when online.
         return hf_hub_download(repo_id=model_name_or_path, filename=filename)
-    except EntryNotFoundError:
-        if filename == "model_index.json":
-            return _resolve_remote_repo_model_index_path(
-                model_name_or_path, "modular_model_index.json"
-            )
-        raise
     except Exception as online_err:
+        # LocalEntryNotFoundError subclasses EntryNotFoundError but means the
+        # Hub was unreachable and nothing was cached, not that the file is absent.
+        if isinstance(online_err, EntryNotFoundError) and not isinstance(
+            online_err, LocalEntryNotFoundError
+        ):
+            if filename == "model_index.json":
+                return _resolve_remote_repo_model_index_path(
+                    model_name_or_path, "modular_model_index.json"
+                )
+            raise
         cached_path = None
         if not envs.SGLANG_USE_MODELSCOPE.get():
             from huggingface_hub import try_to_load_from_cache

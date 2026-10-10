@@ -438,3 +438,25 @@ def test_modelscope_selected_partition_cache_hit_requires_a_file(monkeypatch, tm
         )
 
     assert result == str(tmp_path)
+
+
+def test_unreachable_hub_falls_back_to_cached_model_index(monkeypatch, tmp_path):
+    """LocalEntryNotFoundError subclasses EntryNotFoundError, so an offline Hub was
+    treated as "no model_index.json" and the cache fallback never ran."""
+    cached = tmp_path / "model_index.json"
+    cached.write_text("{}")
+
+    def offline(**kwargs):
+        raise LocalEntryNotFoundError("offline")
+
+    monkeypatch.setattr(hf_diffusers_utils, "hf_hub_download", offline)
+    monkeypatch.setattr(
+        "huggingface_hub.try_to_load_from_cache",
+        lambda repo_id, filename: (
+            str(cached) if filename == "model_index.json" else None
+        ),
+    )
+
+    assert hf_diffusers_utils._resolve_remote_repo_model_index_path("org/model") == str(
+        cached
+    )
