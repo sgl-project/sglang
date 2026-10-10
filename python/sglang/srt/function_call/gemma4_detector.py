@@ -88,12 +88,22 @@ def _parse_gemma4_array(arr_str: str) -> list:
             sub_start = i + 1
             i += 1
             while i < n and depth > 0:
+                if arr_str[i : i + len(STRING_DELIM)] == STRING_DELIM:
+                    i += len(STRING_DELIM)
+                    next_delim = arr_str.find(STRING_DELIM, i)
+                    i = next_delim + len(STRING_DELIM) if next_delim != -1 else n
+                    continue
                 if arr_str[i] == "[":
                     depth += 1
                 elif arr_str[i] == "]":
                     depth -= 1
                 i += 1
             items.append(_parse_gemma4_array(arr_str[sub_start : i - 1]))
+
+        # Stray closing bracket (malformed output): skip it, otherwise the
+        # bare-value branch below would not advance and loop forever.
+        elif arr_str[i] == "]":
+            i += 1
 
         # Bare value
         else:
