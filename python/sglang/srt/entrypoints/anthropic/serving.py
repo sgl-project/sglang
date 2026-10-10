@@ -684,6 +684,8 @@ class AnthropicServing:
         # would deceive the caller, so raise an explicit 400.
         if anthropic_request.tool_choice is not None:
             tc_type = anthropic_request.tool_choice.type
+            if anthropic_request.tool_choice.disable_parallel_tool_use:
+                chat_request.parallel_tool_calls = False
             if tc_type == "none":
                 chat_request.tool_choice = "none"
             elif chat_request.tools:
