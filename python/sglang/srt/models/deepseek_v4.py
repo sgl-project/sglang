@@ -3305,6 +3305,10 @@ class DeepseekV4DecoderLayer(nn.Module):
         stats_stream = None
         if mhc.use_stats_stream(self.hc_cfg, forward_batch, state.residual):
             stats_stream = self.hc_stats_stream
+        decode = (
+            forward_batch.forward_mode.is_decode_or_idle()
+            or forward_batch.forward_mode.is_target_verify()
+        )
 
         def run_attn_hc(state: mhc.HcState) -> mhc.HcState:
             assert self.attn_hc is not None
@@ -3334,6 +3338,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 stats_stream=stats_stream,
                 next=self.local_boundary,
                 world_size=world_size,
+                decode=decode,
             )
 
         def run_ffn_hc(state: mhc.HcState) -> mhc.HcState:
@@ -3362,6 +3367,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 stats_stream=stats_stream,
                 next=nxt,
                 world_size=self.mlp.tp_size,
+                decode=decode,
             )
 
         return run_ffn_hc(run_attn_hc(state))
