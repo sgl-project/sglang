@@ -27,6 +27,11 @@ of the heads (``Geo``) on the full input; nothing crosses ranks. One launch,
                       bf16 o -> OV
                norm   RMSNormGated over the head (all 128 o from OV) * silu(z)
                       -> the task's 8 core rows
+    out_proj (``oproj``, TP2 from ``normed``): every CTA's core rows ready (one
+             flag a CTA) -> CTAs 0 .. 159 qdq the S core rows and run their 32
+             hidden columns of out_proj's K share (``dense_ffn``'s o_proj stage)
+             in the stock GEMM's K splits (``O_SPLITS``), each chained in order,
+             the splits summed in order -> bf16 ``out``, the rank's partial
 
 Bit-exact with the stock decode path (the Triton conv update,
 ``fused_recurrent_gated_delta_rule_packed_decode``, RMSNormGated): the same
@@ -53,6 +58,7 @@ from flydsl.expr import range_constexpr
 from flydsl.expr.typing import Int32, Int64, T
 
 from sglang.kernels.ops.moe.k3_mono_flydsl.common.ops import (
+    CM_DEV,
     CM_NT,
     bf16_round,
     bf_hi,
@@ -73,7 +79,7 @@ from sglang.kernels.ops.moe.k3_mono_flydsl.common.plan import (
     key_tuple,
     pair_layout,
 )
-from sglang.kernels.ops.moe.k3_mono_flydsl.common.sync import Mailbox, sreg
+from sglang.kernels.ops.moe.k3_mono_flydsl.common.sync import Mailbox, publish, sreg
 from sglang.kernels.ops.moe.qwen3_5_mono_flydsl import dense_ffn as D
 from sglang.kernels.ops.moe.qwen3_5_mono_flydsl.layer import step_tag
 from sglang.kernels.ops.moe.qwen3_5_mono_flydsl.sources import digest
@@ -112,6 +118,9 @@ ROW_ORDER = (16, 8, 4, 2, 1)
 
 assert VCH == WAVES and BA_STEPS * BA_E == STEPS
 TP_SIZES = (1, 2)
+# The stock out_proj GEMM's split-K at TP2 (aiter get_splitk, K 3072): fp32
+# sums are not associative, so the fold keeps its partition.
+O_SPLITS = 3
 
 
 class Geo(NamedTuple):
@@ -188,8 +197,11 @@ class K1Build:
     tp: int = 1  # this rank's heads (``Geo``)
     # hidden is input_layernorm's output (the stock norm ran): no add, no norm
     normed: bool = False
+    # out_proj folded in (``normed`` only): ``out`` gets its bf16 [S, HIDDEN]
+    # output (the rank's partial at TP2), ``w_o`` / ``w_os`` its shuffled weights
+    oproj: bool = False
     stamps: bool = False  # debug: per-CTA s_memrealtime stamps -> scratch "stamps"
-    stop: int = 99  # debug: phases < stop (1 front, 2 in_proj, 3 gdn)
+    stop: int = 99  # debug: phases < stop (1 front, 2 in_proj, 3 gdn, 4 out_proj)
 
 
 ABI = KernelAbi(
@@ -214,6 +226,9 @@ ABI = KernelAbi(
         "rs_seq",
         "st_idx",
         "core",
+        "w_o",
+        "w_os",
+        "out",
         "scratch",
         "epoch",
         "layer",
@@ -231,6 +246,7 @@ def scratch_layout(key: K1Build) -> dict:
             ("bap", geo.ba_ctas * s * ROWS),
             ("qk", s * geo.nk * 2 * HD),
             ("ov", s * geo.nv * HD),
+            ("ordy", BLOCKS),
         )
     )
     end = max(o + n for o, n in lay.values())
@@ -772,7 +788,51 @@ def gdn_norm(c, g):
             sig = fx.Float32(1.0) / (fx.Float32(1.0) + tl_exp(-z))
             y.append(x[j] * rstd * ld_bf(a["norm_w"], 2 * lane + j) * (sig * z))
         if _live((wave + WAVES * n < nt) & (lane // (VCH // 2) == ch), ok):
-            bo.buffer_store(D.pack_bf(y)[0], rsrc(a["core"]), (t * geo.val + e) // 2)
+            # with oproj read by other CTAs: past the CU's cache
+            bo.buffer_store(
+                D.pack_bf(y)[0],
+                rsrc(a["core"]),
+                (t * geo.val + e) // 2,
+                cache_modifier=CM_DEV if c["oproj"] else 0,
+            )
+
+
+# ---------------------------------------------------------------- out_proj
+@traced
+def o_core(c):
+    """Every CTA's core rows ready -> the S core rows through MXFP4 qdq (a
+    thread a 1 x 32 block) -> the LDS o rows."""
+    s, tid, a, geo = c["S"], c["tid"], c["args"], c["G"]
+    if tid < BLOCKS:
+        c["poll"]([(c["ordy"], tid, 1)])
+    gpu.barrier()
+    nblk = geo.val // 32
+    nb = s * nblk
+    raw = []
+    for i in range_constexpr((nb + THREADS - 1) // THREADS):
+        b = fx.min(tid + THREADS * i, nb - 1)
+        at = (b // nblk * geo.val + 32 * (b % nblk)) // 2
+        raw.append([D.ld4(rsrc(a["core"]), at + 4 * k, CM_DEV) for k in range(4)])
+    D.block_quant(c, raw, geo.val, c["oq"], c["os"], geo.val // 8 + 4, geo.val // 32)
+
+
+@traced
+def o_out(c):
+    """Thread (t, j), owner CTAs: its 8 of the 32 columns summed over the K
+    quarters in order -> bf16 -> ``out``."""
+    s, tid, bid = c["S"], c["tid"], c["bid"]
+    t = fx.min(tid // 4, s - 1)
+    j = tid % 4
+    y = [
+        bf16_round(D.row_sum_waves(c["red"], 8 * (j % 2) + e, t, j // 2, O_SPLITS))
+        for e in range(8)
+    ]
+    if (tid < s * 4) & (bid < D.O_CTAS):
+        bo.buffer_store(
+            fx.Vector.from_elements(D.pack_bf(y), fx.Int32),
+            rsrc(c["args"]["out"]),
+            (t * HIDDEN + 2 * ROWS * bid + 8 * j) // 2,
+        )
 
 
 # ---------------------------------------------------------------- kernel
@@ -784,9 +844,10 @@ def build(key: K1Build):
         return _BUILDS[key]
     s = key.tokens
     assert 1 <= s <= MAX_TOKENS
-    assert key.tp in TP_SIZES
+    assert key.tp in TP_SIZES and (key.normed or not key.oproj)
     lay = scratch_layout(key)
     geo = Geo(key.tp)
+    assert not key.oproj or (key.tp == 2 and geo.val // D.STEP % O_SPLITS == 0)
     nt = n_tasks(geo, s)
 
     @fx.struct
@@ -800,10 +861,16 @@ def build(key: K1Build):
         vloc: fx.Array[fx.Float32, nt * VCH, 16]
         scal: fx.Array[fx.Float32, nt * 2, 16]
 
+    @fx.struct
+    class OLds:
+        oq: fx.Array[fx.Int32, s * (geo.val // 8 + 4), 16]
+        os: fx.Array[fx.Int32, s * (geo.val // 32), 16]
+
     @fx.union
     class StageLds:
         x: XLds
         g: GLds
+        o: OLds
 
     @fx.struct
     class Smem:
@@ -813,7 +880,7 @@ def build(key: K1Build):
     keyed = key_tuple(key, digest())
     name = (
         f"qwen38_27b_k1_s{s}_f{int(key.first)}_tp{key.tp}_n{int(key.normed)}"
-        f"_t{int(key.stamps)}_p{key.stop}"
+        f"_o{int(key.oproj)}_t{int(key.stamps)}_p{key.stop}"
     )
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
@@ -838,6 +905,9 @@ def build(key: K1Build):
         rs_seq: Int32,
         st_idx: Int64,
         core: Int64,
+        w_o: Int64,
+        w_os: Int64,
+        out: Int64,
         scratch: Int64,
         epoch: Int64,
         layer: Int32,
@@ -848,7 +918,7 @@ def build(key: K1Build):
         alloc = fx.SharedAllocator()
         lds = alloc.allocate(Smem).peek()
         st_lds = alloc.allocate(StageLds)
-        xl, gl = st_lds.x.peek(), st_lds.g.peek()
+        xl, gl, ol = st_lds.x.peek(), st_lds.g.peek(), st_lds.o.peek()
         mb = Mailbox(step_tag(epoch, layer) - 1)
         c = {
             "S": s,
@@ -858,6 +928,7 @@ def build(key: K1Build):
             "lane": tid % 64,
             "wave": tid // 64,
             "first": key.first,
+            "oproj": key.oproj,
             "eps": key.eps,
             "norm_eps": key.norm_eps,
             "stamps": scratch + fx.Int64(lay["stamps"][0]) if key.stamps else None,
@@ -871,6 +942,8 @@ def build(key: K1Build):
             "qkl": gl.qkl.ptr,
             "vloc": gl.vloc.ptr,
             "scal": gl.scal.ptr,
+            "oq": ol.oq.ptr,
+            "os": ol.os.ptr,
             "args": {
                 "hidden": hidden,
                 "residual": residual,
@@ -892,9 +965,12 @@ def build(key: K1Build):
                 "rs_seq": rs_seq,
                 "st_idx": st_idx,
                 "core": core,
+                "w_o": w_o,
+                "w_os": w_os,
+                "out": out,
             },
         }
-        for region in ("nsum", "xmb", "proj", "bap", "qk", "ov"):
+        for region in ("nsum", "xmb", "proj", "bap", "qk", "ov", "ordy"):
             c[region] = sreg(scratch, lay[region][0], region)
         D.stamp(c, 0)
         # the norm's inputs first, then the in_proj weights (vmcnt drains in order)
@@ -926,6 +1002,13 @@ def build(key: K1Build):
             D.stamp(c, 5)
             gdn_norm(c, g)
             D.stamp(c, 6)
+        if const_expr(key.stop > 4 and key.oproj):
+            publish(c["put"], c["ordy"], bid, fx.Int32(1), tid == 0)
+            oops = D.o_loads(c, width=geo.val, splits=O_SPLITS)
+            o_core(c)
+            D.stamp(c, 7)
+            D.o_stage(c, oops, width=geo.val, splits=O_SPLITS)
+            o_out(c)
 
     @flyc.jit
     def launch(
@@ -949,6 +1032,9 @@ def build(key: K1Build):
         rs_seq: Int32,
         st_idx: Int64,
         core: Int64,
+        w_o: Int64,
+        w_os: Int64,
+        out: Int64,
         scratch: Int64,
         epoch: Int64,
         layer: Int32,
@@ -958,7 +1044,7 @@ def build(key: K1Build):
         k1(
             hidden, residual, res_out, ln_w, w_qkvz, w_qkvzs, w_ba, w_bas, conv_w,
             conv_st, cs_seq, cs_dim, cs_tok, a_log, dt_bias, norm_w, rstate, rs_seq,
-            st_idx, core, scratch, epoch, layer,
+            st_idx, core, w_o, w_os, out, scratch, epoch, layer,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)  # fmt: skip
 
     ABI.check(k1, launch)
@@ -988,6 +1074,9 @@ def dense_gdn_pre(
     scratch,
     epoch,
     layer,
+    w_o=None,
+    w_os=None,
+    out=None,
 ):
     """Host launcher. ``hidden`` the full rows: the layer input, ``residual``
     None on the first layer (``key.first``); with ``key.normed`` the input norm's
@@ -996,7 +1085,9 @@ def dense_gdn_pre(
     (``dense_ffn.shuffle_w``); ``conv_state`` [slots, conv, 3] (strides read);
     ``rstate`` [slots, nv, HD, HD] fp32, a slot dense; ``core`` [S, val].
     ``st_idx`` [>= S] int32, -1 a pad row; ``epoch`` a device int32 bumped once
-    a step, ``layer`` this launch's tag slot."""
+    a step, ``layer`` this launch's tag slot. ``key.oproj``: out_proj's rank
+    share ``w_o`` [HIDDEN, val / 2] shuffled, ``w_os``, and ``out`` [S, HIDDEN]
+    bf16 (``core`` still written)."""
     s, geo = key.tokens, Geo(key.tp)
     qkvz, ba = geo.qkvz, geo.ba
     if key.normed:
@@ -1018,8 +1109,14 @@ def dense_gdn_pre(
     assert a_log.numel() == geo.nv and dt_bias.numel() == geo.nv
     assert norm_w.dtype == torch.bfloat16 and norm_w.numel() == HD
     assert st_idx.dtype == torch.int32 and st_idx.numel() >= s
+    if key.oproj:
+        assert w_o.shape == (HIDDEN, geo.val // 2)
+        assert w_os.shape == (HIDDEN, geo.val // 32) and w_os.is_contiguous()
+        assert out.shape == (s, HIDDEN) and out.dtype == torch.bfloat16
+    else:
+        w_o = w_os = out = core
     assert scratch.numel() >= scratch_bytes(key)
-    for t in (hidden, res_out, w_qkvz, w_qkvzs, w_ba, w_bas, conv_w, core):
+    for t in (hidden, res_out, w_qkvz, w_qkvzs, w_ba, w_bas, conv_w, core, w_o, out):
         assert t.is_contiguous()
     f = build(key)
     f(
@@ -1047,6 +1144,9 @@ def dense_gdn_pre(
                 "rs_seq": rstate.stride(0),
                 "st_idx": st_idx.data_ptr(),
                 "core": core.data_ptr(),
+                "w_o": w_o.data_ptr(),
+                "w_os": w_os.data_ptr(),
+                "out": out.data_ptr(),
                 "scratch": scratch.data_ptr(),
                 "epoch": epoch.data_ptr(),
                 "layer": layer,

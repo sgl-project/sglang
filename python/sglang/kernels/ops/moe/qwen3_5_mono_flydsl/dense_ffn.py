@@ -157,11 +157,7 @@ TP_SIZES = (1, 2)
 
 # o_proj (FfnBuild.oproj): CTA b < O_CTAS owns hidden columns 32 b .. 32 b + 31
 CORE = 6144
-O_STEPS = CORE // STEP  # 48
-O_Q = O_STEPS // 4  # 12: a wave's K quarter
 O_CTAS = HIDDEN // (2 * ROWS)  # 160
-WO_DW = CORE // 8  # 768
-WOS_DW = CORE // 32 // 4  # 48
 OQROW = CORE // 8 + 4
 OSROW = CORE // 32
 X_PAIRS = 5  # a (token, owner) x hand-off: 4 fp4 words, the code
@@ -497,21 +493,28 @@ def o_res_loads(c):
     )
 
 
-def o_loads(c):
-    """Wave w: the owner's row group w % 2, K quarter w / 2; past the weight (no
-    traffic) in a CTA that owns none."""
+def o_loads(c, width=CORE, splits=4):
+    """Wave w: the owner's row group w % 2, K split w / 2 of ``splits`` (of
+    o_proj's K, ``width``: the stock GEMM's split-K partition); past the weight
+    (no traffic) in a CTA that owns none, or a wave past the splits."""
     lane, wave, bid, a = c["lane"], c["wave"], c["bid"], c["args"]
+    o_q = width // STEP // splits
     row = (2 * bid + wave % 2) * ROWS + lane % ROWS
-    row = (bid < O_CTAS).select(row, fx.Int32(HIDDEN))
-    r_w = rsrc(a["w_o"], HIDDEN * CORE // 2)
-    r_s = rsrc(a["w_os"], HIDDEN * CORE // 32)
-    steps = [wave // 2 * O_Q + i for i in range(O_Q)]
+    live = bid < O_CTAS
+    if const_expr(2 * splits < WAVES):
+        live = live & (wave < 2 * splits)
+    row = live.select(row, fx.Int32(HIDDEN))
+    r_w = rsrc(a["w_o"], HIDDEN * width // 2)
+    r_s = rsrc(a["w_os"], HIDDEN * width // 32)
+    steps = [wave // 2 * o_q + i for i in range(o_q)]
     tiles = [
-        ld4(r_w, row // ROWS * (ROWS * WO_DW) + st * 256 + lane * 4, CM_NT)
+        ld4(r_w, row // ROWS * (ROWS * width // 8) + st * 256 + lane * 4, CM_NT)
         for st in steps
     ]
     words = [
-        fx.Int32(bo.buffer_load(r_s, row * WOS_DW + st, vec_width=1, dtype=T.i32))
+        fx.Int32(
+            bo.buffer_load(r_s, row * (width // 128) + st, vec_width=1, dtype=T.i32)
+        )
         for st in steps
     ]
     return tiles, words
@@ -529,16 +532,27 @@ def x_quant(c, xraw):
 
 
 @traced
-def o_stage(c, ops):
+def o_stage(c, ops, width=CORE, splits=4):
+    """The wave's K split of the owner's row group, its steps chained in order
+    -> red (the core rows' qdq in LDS, ``width // 8 + 4`` i32 a row)."""
     lane, wave = c["lane"], c["wave"]
+    o_q = width // STEP // splits
     gl = lane // ROWS
     t = fx.min(lane % ROWS, c["S"] - 1)
     tiles, words = ops
     acc = fx.Vector.filled(4, 0.0, fx.Float32)
-    for i in range_constexpr(O_Q):
-        st = wave // 2 * O_Q + i
+    for i in range_constexpr(o_q):
+        st = wave // 2 * o_q + i
         acc = scaled_step(
-            c["oq"], c["os"], t * OQROW, t * OSROW, st, gl, tiles[i], words[i], acc
+            c["oq"],
+            c["os"],
+            t * (width // 8 + 4),
+            t * (width // 32),
+            fx.min(st, width // STEP - 1),
+            gl,
+            tiles[i],
+            words[i],
+            acc,
         )
     fx.ptr_store(acc, c["red"] + (wave * 64 + lane) * 4)
     gpu.barrier()
@@ -796,11 +810,11 @@ def qt_live(c, pred):
     return pred
 
 
-def row_sum_waves(red, r, t, gu):
+def row_sum_waves(red, r, t, gu, n=4):
     """Row r, token t summed over the waves of gate (gu 0: 0, 2, 4, 6) or up
-    (1, 3, 5, 7), in order (gu traced)."""
+    (1, 3, 5, 7), the first ``n`` of them, in order (gu traced)."""
     tot = fx.Float32(0.0)
-    for k in range(4):
+    for k in range(n):
         w = 2 * k + gu
         tot = tot + fx.ptr_load(red + ((w * 64 + 16 * (r // 4) + t) * 4 + r % 4))
     return tot

@@ -22,10 +22,11 @@ checkpoint layout.
 
 At TP2 the stock layers run the step and the kernels take the rank's share
 between the all-reduces: each GDN layer's ``linear_attn`` takes K1 (its half of
-the heads, from the stock input_layernorm's output) up to out_proj, and each
-layer's ``mlp`` takes K2 (``SGLANG_QWEN3_8_DENSE_MONO_K2``, its half of the
+the heads, from the stock input_layernorm's output) up to out_proj's partial
+(out_proj folded in with ``SGLANG_QWEN3_8_DENSE_MONO_OPROJ``, else stock), and
+each layer's ``mlp`` takes K2 (``SGLANG_QWEN3_8_DENSE_MONO_K2``, its half of the
 intermediate, from the stock post_attention_layernorm's output) up to down's
-partial. out_proj / o_proj, the all-reduces, the norms and attention stay stock.
+partial. The all-reduces, the norms, attention and its o_proj stay stock.
 
 The decode CUDA graph captures the step per batch size; any other step takes
 the stock layers. Mailbox tags carry a device epoch bumped once a step
@@ -275,6 +276,12 @@ class DenseMono:
         self.oproj = self.whole_step and envs.SGLANG_QWEN3_8_DENSE_MONO_OPROJ.get()
         k1_flag = envs.SGLANG_QWEN3_8_DENSE_MONO_K1.get()
         self.k1 = k1_flag and (self.oproj or not self.whole_step)
+        # TP2: out_proj folded into K1
+        self.k1_oproj = (
+            self.k1
+            and not self.whole_step
+            and envs.SGLANG_QWEN3_8_DENSE_MONO_OPROJ.get()
+        )
         # TP2: K2 in each layer's mlp
         self.k2 = not self.whole_step and envs.SGLANG_QWEN3_8_DENSE_MONO_K2.get()
         # out_proj / o_proj return their input while a mono step traces the layers
@@ -320,7 +327,9 @@ class DenseMono:
         """K1's build at width ``s``: at TP2 from the stock norm's output."""
         if self.whole_step:
             return dense_gdn.K1Build(tokens=s, first=first, eps=eps, norm_eps=norm_eps)
-        return dense_gdn.K1Build(tokens=s, norm_eps=norm_eps, tp=self.tp, normed=True)
+        return dense_gdn.K1Build(
+            tokens=s, norm_eps=norm_eps, tp=self.tp, normed=True, oproj=self.k1_oproj
+        )
 
     def _k2_key(self, D, s: int, eps=1e-6):
         """K2's build at width ``s``: at TP2 from the stock norm's output."""
@@ -346,14 +355,17 @@ class DenseMono:
             "%s, FFN %s, GDN K1 %s (%.1f GiB of shuffled weights)",
             self._max_tokens(),
             self.tp,
-            "folded" if self.oproj else "stock",
+            "folded" if self.oproj else "in K1" if self.k1_oproj else "stock",
             "K2" if self.whole_step or self.k2 else "stock",
             "on" if self.k1 else "off",
-            sum(w.numel() for w in self.w13 + self.w2 + self.w_o) / 2**30
+            sum(w.numel() for w in self.w13 + self.w2 + self.w_o if w is not None)
+            / 2**30
             + sum(a.numel() + b.numel() for a, b in filter(None, self.w_in)) / 2**30,
         )
 
     def _prepare(self) -> str | None:
+        from sglang.kernels.ops.moe.qwen3_5_mono_flydsl import dense_ffn as D
+
         for layer in self.model.layers:
             if self.whole_step or self.k2:
                 why = _weights_unsupported(layer, self.oproj, self.tp)
@@ -361,6 +373,13 @@ class DenseMono:
                     return f"layer {layer.layer_id} {why}"
             if self.k1 and _is_gdn(layer):
                 why = _k1_weights_unsupported(layer.linear_attn, self.tp)
+                if why is None and self.k1_oproj:
+                    why = _mxfp4_unsupported(
+                        layer.linear_attn.out_proj,
+                        D.HIDDEN,
+                        D.CORE // self.tp,
+                    )
+                    why = None if why is None else f"out_proj: {why}"
                 if why is not None:
                     if not self.whole_step:
                         return f"K1 needed at TP2: layer {layer.layer_id} {why}"
@@ -411,6 +430,9 @@ class DenseMono:
                 o = _o_proj(layer)
                 self.w_o.append(D.shuffle_w(o.weight.data))
                 self._wrap_o(o)
+            if self.k1_oproj:
+                o = layer.linear_attn.out_proj if _is_gdn(layer) else None
+                self.w_o.append(None if o is None else D.shuffle_w(o.weight.data))
             self.w_in.append(None)
             if self.k1 and _is_gdn(layer):
                 a = layer.linear_attn
@@ -433,7 +455,8 @@ class DenseMono:
 
     def _wrap_linear_attn(self, i, layer) -> None:
         """TP2: on a mono step the GDN mixer is K1 on the stock norm's output,
-        then the stock out_proj."""
+        with out_proj folded in or then the stock out_proj (its partial left
+        to the stock all-reduce)."""
         a = layer.linear_attn
         stock = a.forward
 
@@ -441,8 +464,9 @@ class DenseMono:
             # A fused AR + norm + quant read hands a tuple; K1 reads bf16 rows.
             if not self._gdn_step or not isinstance(hidden_states, torch.Tensor):
                 return stock(hidden_states, forward_batch)
-            core = self._k1_from_normed(i, layer, hidden_states, forward_batch)
-            out, _ = a.out_proj(core)
+            core, out = self._k1_from_normed(i, layer, hidden_states, forward_batch)
+            if out is None:
+                out, _ = a.out_proj(core)
             return out
 
         a.forward = forward
@@ -467,12 +491,12 @@ class DenseMono:
         idx = lab.forward_metadata.mamba_cache_indices
         a = layer.linear_attn
         st = lab.req_to_token_pool.mamba2_layer_cache(a.layer_id)
-        core = self._k1(i, layer, st.conv[0], st.temporal, idx, x, None)[0]
+        core, _, out = self._k1(i, layer, st.conv[0], st.temporal, idx, x, None)
         # The stock decode's copies to prefix-cache track slots.
         lab._track_mamba_state_decode(
             forward_batch, st.conv[0], st.temporal, idx, a.layer_id
         )
-        return core
+        return core, out
 
     def _self_check(self) -> str | None:
         why = self._ffn_check() if self.whole_step or self.k2 else None
@@ -511,8 +535,8 @@ class DenseMono:
 
     def _k1_check(self) -> str | None:
         """The first GDN layer at widths 1 and 8 (with and without the residual,
-        a pad row) on synthetic conv / SSM states: core, residual (TP1) and both
-        states, of this rank's heads."""
+        a pad row) on synthetic conv / SSM states: core, residual (TP1), both
+        states of this rank's heads, and with the fold out_proj's partial."""
         from sglang.kernels.ops.moe.qwen3_5_mono_flydsl import dense_gdn as K
 
         geo = K.Geo(self.tp)
@@ -540,22 +564,27 @@ class DenseMono:
             conv_ref, ssm_ref = conv.clone(), ssm.clone()
             core_ref, res_ref = stock_gdn_decode(layer, h, r, conv_ref, ssm_ref, idx)
             self.epoch.add_(1)
+            out = out_ref = None
             if self.whole_step:
-                core, res = self._k1(i, layer, conv, ssm, idx, h, r)
+                core, res, _ = self._k1(i, layer, conv, ssm, idx, h, r)
             else:
                 x = (
                     layer.input_layernorm(h)
                     if r is None
                     else layer.input_layernorm(h, r)[0]
                 )
-                core, res = self._k1(i, layer, conv, ssm, idx, x, None)[0], res_ref
+                core, _, out = self._k1(i, layer, conv, ssm, idx, x, None)
+                res = res_ref
+                if out is not None:
+                    out_ref, _ = layer.linear_attn.out_proj(core_ref)
             for name, got, ref in (
                 ("core", core, core_ref),
                 ("res_out", res, res_ref),
                 ("conv state", conv, conv_ref),
                 ("SSM state", ssm, ssm_ref),
+                ("out_proj partial", out, out_ref),
             ):
-                if not torch.equal(got, ref):
+                if got is not None and not torch.equal(got, ref):
                     return f"K1 {name} at width {s}"
         return None
 
@@ -641,7 +670,7 @@ class DenseMono:
             if self.k1 and _is_gdn(layer):
                 a = layer.linear_attn
                 st = lab.req_to_token_pool.mamba2_layer_cache(a.layer_id)
-                core, res = self._k1(
+                core, res, _ = self._k1(
                     i, layer, st.conv[0], st.temporal, idx, h, residual
                 )
                 # The stock decode's copies to prefix-cache track slots.
@@ -665,8 +694,9 @@ class DenseMono:
         return h, residual
 
     def _k1(self, i, layer, conv_state, ssm_state, idx, h, residual):
-        """-> core, residual out; at TP2 ``h`` is input_layernorm's output and
-        the residual out None."""
+        """-> core, residual out, out_proj's output; at TP2 ``h`` is
+        input_layernorm's output and the residual out None, the last None
+        unless out_proj is folded in."""
         from sglang.kernels.ops.moe.qwen3_5_mono_flydsl import dense_gdn
 
         a = layer.linear_attn
@@ -682,12 +712,15 @@ class DenseMono:
             s, dense_gdn.Geo(self.tp).val, dtype=h.dtype, device=h.device
         )
         front = {"hidden": h.contiguous()}
-        res_out = None
+        res_out = out = None
         if not key.normed:
             res_out = torch.empty_like(h)
             front.update(
                 residual=residual, res_out=res_out, ln_w=layer.input_layernorm.weight
             )
+        if key.oproj:
+            out = torch.empty_like(h)
+            front.update(w_o=self.w_o[i], w_os=a.out_proj.weight_scale, out=out)
         w_qkvz, w_ba = self.w_in[i]
         dense_gdn.dense_gdn_pre(
             key,
@@ -708,7 +741,7 @@ class DenseMono:
             epoch=self.epoch,
             layer=i,
         )
-        return core, res_out
+        return core, res_out, out
 
     def _ffn(self, i, layer, h, residual) -> tuple[torch.Tensor, torch.Tensor]:
         from sglang.kernels.ops.moe.qwen3_5_mono_flydsl import dense_ffn as D

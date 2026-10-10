@@ -14,7 +14,8 @@ against the ROCm Triton Gemma norm, the MXFP4 linears, ``causal_conv1d_update``,
 the residual and both states must match, on the first layer (no residual) and
 with pad rows (slot -1); other slots stay untouched. At TP2 (from the stock input
 norm's output, as the runtime runs it there) each rank's half of the heads, its
-column-parallel slices of the same layer, against the stock path on them.
+column-parallel slices of the same layer, against the stock path on them, with
+out_proj folded in (its partial, from the rank's K columns) and without.
 
 Widths 1..8, each with its own weights and Mailbox layer tag, over many input
 draws: a norm reduced in another order than the stock kernel's still matches on
@@ -211,6 +212,7 @@ def _gdn_weights(g, K):
     }
     w["w_qkvz"], w["w_qkvzs"] = _mxfp4(g, K.QKVZ, K.HIDDEN)
     w["w_ba"], w["w_bas"] = _mxfp4(g, K.BA, K.HIDDEN)
+    w["w_o"], w["w_os"] = _mxfp4(g, K.HIDDEN, K.VAL)
     gn = RMSNormGated(
         K.HD, eps=EPS, group_size=None, norm_before_gate=True, dtype=BF
     ).cuda()
@@ -241,6 +243,7 @@ def _rank_slice(K, w, tp, rank):
     out["conv_w"] = rows(w["conv_w"], qkvz[:3])
     out["a_log"] = w["a_log"][heads].contiguous()
     out["dt_bias"] = w["dt_bias"][heads].contiguous()
+    out["w_o"], out["w_os"] = _k_cols(w["w_o"], w["w_os"], K.VAL, tp, rank)
     return out
 
 
@@ -291,9 +294,12 @@ class DenseGdnTest(CustomTestCase):
 
     def test_bit_exact_tp2(self):
         for rank in range(2):
-            self._check(tp=2, rank=rank, normed=True)
+            self._check(tp=2, rank=rank, normed=True, oproj=True)
 
-    def _check(self, tp, rank, normed):
+    def test_bit_exact_tp2_stock_out_proj(self):
+        self._check(tp=2, rank=0, normed=True, draws=GDN_DRAWS // 4)
+
+    def _check(self, tp, rank, normed, oproj=False, draws=GDN_DRAWS):
         from sglang.kernels.ops.moe.qwen3_5_mono_flydsl import dense_ffn as D
         from sglang.kernels.ops.moe.qwen3_5_mono_flydsl import dense_gdn as K
 
@@ -305,8 +311,18 @@ class DenseGdnTest(CustomTestCase):
             w = _rank_slice(K, _gdn_weights(g, K), tp, rank)
             w_qkvz, w_ba = D.shuffle_w(w["w_qkvz"]), D.shuffle_w(w["w_ba"])
             key = K.K1Build(
-                tokens=s, first=first, eps=EPS, norm_eps=EPS, tp=tp, normed=normed
+                tokens=s,
+                first=first,
+                eps=EPS,
+                norm_eps=EPS,
+                tp=tp,
+                normed=normed,
+                oproj=oproj,
             )
+            fold = {}
+            if oproj:
+                out = torch.empty(s, K.HIDDEN, dtype=BF, device="cuda")
+                fold = dict(w_o=D.shuffle_w(w["w_o"]), w_os=w["w_os"], out=out)
             core = torch.empty(s, geo.val, dtype=BF, device="cuda")
             res_out = torch.empty(s, K.HIDDEN, dtype=BF, device="cuda")
             epoch = torch.zeros(1, dtype=torch.int32, device="cuda")
@@ -317,7 +333,7 @@ class DenseGdnTest(CustomTestCase):
             if s > 1:
                 idx[1] = -1  # a pad row
             bad = []
-            for draw in range(GDN_DRAWS):
+            for draw in range(draws):
                 h = _rnd(g, s, K.HIDDEN, scale=0.5)
                 residual = None if first else _rnd(g, s, K.HIDDEN, scale=2.0)
                 # The mamba pool's layout: conv (slots, dim, 3) dim-first, SSM fp32.
@@ -356,6 +372,7 @@ class DenseGdnTest(CustomTestCase):
                     scratch=scratch,
                     epoch=epoch,
                     layer=layer,
+                    **fold,
                 )
                 exact = (
                     (normed or torch.equal(res_out, res_ref))
@@ -363,11 +380,16 @@ class DenseGdnTest(CustomTestCase):
                     and torch.equal(conv, conv_ref)
                     and torch.equal(ssm, ssm_ref)
                 )
+                if oproj:
+                    o_ref = _linear(core_ref, w["w_o"], w["w_os"])
+                    exact = exact and torch.equal(out, o_ref)
                 if s > 1:
                     exact = exact and not core[1].any()
                 if not exact:
                     bad.append(draw)
-            with self.subTest(tp=tp, rank=rank, s=s, first=first, layer=layer):
+            with self.subTest(
+                tp=tp, rank=rank, s=s, first=first, oproj=oproj, layer=layer
+            ):
                 self.assertEqual(bad, [])
 
 

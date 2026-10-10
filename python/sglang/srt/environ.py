@@ -884,7 +884,8 @@ class Envs:
     # ROCm FlyDSL Qwen3.8-27B dense mono decode for steps of <= 8 rows (gfx950,
     # TP1). See srt/layers/qwen3_8_dense_mono.py.
     SGLANG_QWEN3_8_DENSE_MONO = EnvBool(False)
-    # With it: fold out_proj / o_proj into the FFN launch.
+    # With it: fold out_proj / o_proj into the FFN launch (TP1), or each GDN
+    # layer's out_proj into K1 (TP2).
     SGLANG_QWEN3_8_DENSE_MONO_OPROJ = EnvBool(True)
     # With the o_proj fold: each GDN layer's input norm .. gated norm as one launch.
     SGLANG_QWEN3_8_DENSE_MONO_K1 = EnvBool(True)
