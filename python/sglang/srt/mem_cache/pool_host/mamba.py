@@ -11,6 +11,7 @@ import torch
 from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.mem_cache.pool_host.base import (
     HostKVCache,
+    host_memory_allocation_bytes,
     host_memory_budget_bytes,
     sync_fixed_hicache_size,
     synchronized,
@@ -144,18 +145,24 @@ class MambaPoolHost(HostKVCache):
                 device_capacity,
             )
 
-        requested_bytes = self.size * self.size_per_token
-        available_bytes = host_memory_budget_bytes(requested_bytes)
-        if requested_bytes > available_bytes:
+        allocation_bytes = host_memory_allocation_bytes(
+            self.get_mapping_lengths(),
+            self.allocator,
+            self.device_pool.device,
+        )
+        available_bytes = host_memory_budget_bytes(
+            allocation_bytes, self.allocator, self.device_pool.device
+        )
+        if allocation_bytes > available_bytes:
             raise ValueError(
                 f"Not enough host memory available. Requesting "
-                f"{requested_bytes / 1e9:.2f} GB but only have "
+                f"{allocation_bytes / 1e9:.2f} GB but only have "
                 f"{available_bytes / 1e9:.2f} GB free. Please reduce the "
                 f"size of the hierarchical cache."
             )
         logger.info(
             "Allocating %.2f GB host memory for hierarchical Mamba cache (layout=%s).",
-            requested_bytes / 1e9,
+            allocation_bytes / 1e9,
             self.layout,
         )
 
@@ -386,6 +393,18 @@ class MambaPoolHost(HostKVCache):
 
     def get_ksize_per_token(self):
         return self.get_size_per_token()
+
+    def get_mapping_lengths(self) -> list[int]:
+        token_layer_bytes = self.size * self.num_mamba_layers
+        return [
+            token_layer_bytes
+            * self.temporal_state_elem_size
+            * self.temporal_dtype.itemsize,
+            *(
+                token_layer_bytes * elem_size * self.conv_dtype.itemsize
+                for elem_size in self.conv_state_elem_sizes
+            ),
+        ]
 
     @staticmethod
     def _item_size_per_index(tensor: torch.Tensor) -> int:
@@ -910,16 +929,23 @@ class MambaPoolHost(HostKVCache):
         if self.layout not in ["page_first", "page_first_direct"]:
             return False
         temporal_stride = (
-            self.num_mamba_layers
+            self.page_size
+            * self.num_mamba_layers
             * self.temporal_state_elem_size
             * self.temporal_dtype.itemsize
         )
-        if self.temporal_buffer.data_ptr() % page_size_bytes != 0:
-            return False
-        if temporal_stride % page_size_bytes != 0:
+        if self.temporal_state_elem_size > 0 and (
+            self.temporal_buffer.data_ptr() % page_size_bytes != 0
+            or temporal_stride % page_size_bytes != 0
+        ):
             return False
         for buf, elem_size in zip(self.conv_buffer, self.conv_state_elem_sizes):
-            conv_stride = self.num_mamba_layers * elem_size * self.conv_dtype.itemsize
+            conv_stride = (
+                self.page_size
+                * self.num_mamba_layers
+                * elem_size
+                * self.conv_dtype.itemsize
+            )
             if buf.data_ptr() % page_size_bytes != 0:
                 return False
             if conv_stride % page_size_bytes != 0:

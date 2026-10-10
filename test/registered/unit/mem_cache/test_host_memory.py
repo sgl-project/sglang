@@ -24,19 +24,25 @@ class TestHostMemory(unittest.TestCase):
         self.mount = self.root / "cgroup mount"
         self.mount.mkdir()
 
-    def configure(self, membership="/task/engine", mount_root="/", v1=False):
-        controllers = "memory" if v1 else ""
+    def configure(
+        self, membership="/task/engine", mount_root="/", v1=False, controller="memory"
+    ):
+        controllers = controller if v1 else ""
         (self.proc / "self/cgroup").write_text(f"0:{controllers}:{membership}\n")
         filesystem = "cgroup" if v1 else "cgroup2"
-        options = "rw,memory" if v1 else "rw"
+        options = f"rw,{controller}" if v1 else "rw"
         escaped = str(self.mount).replace(" ", r"\040")
         (self.proc / "self/mountinfo").write_text(
             f"1 0 0:1 {mount_root} {escaped} rw - {filesystem} cgroup {options}\n"
         )
 
-    def memory(self, path, usage, maximum="max", high="max", v1=False, stat=None):
+    def write_files(self, path, files):
         directory = self.mount / path
         directory.mkdir(parents=True, exist_ok=True)
+        for name, value in files.items():
+            (directory / name).write_text(str(value))
+
+    def memory(self, path, usage, maximum="max", high="max", v1=False, stat=None):
         files = (
             {"memory.limit_in_bytes": maximum, "memory.usage_in_bytes": usage}
             if v1
@@ -47,8 +53,19 @@ class TestHostMemory(unittest.TestCase):
         files["memory.stat"] = "".join(
             f"{key} {value}\n" for key, value in stat.items()
         )
-        for name, value in files.items():
-            (directory / name).write_text(str(value))
+        self.write_files(path, files)
+
+    def hugetlb(self, path, usage, maximum="max", label="2MB", v1=False):
+        prefix = f"hugetlb.{label}"
+        self.write_files(
+            path,
+            {f"{prefix}.limit_in_bytes": maximum, f"{prefix}.usage_in_bytes": usage}
+            if v1
+            else {f"{prefix}.max": maximum, f"{prefix}.current": usage},
+        )
+
+    def hugetlb_headroom(self, page_size=2 * 1024**2):
+        return host_memory.cgroup_hugetlb_headroom_bytes(page_size, self.proc)
 
     def test_v2_parent_and_high_limits(self):
         self.configure()
@@ -200,6 +217,28 @@ class TestHostMemory(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "set --hicache-size"):
                     self.available()
                 self.assertEqual(self.available(allow_cgroup_fallback=True), 5000)
+
+    def test_hugetlb_v1_limits(self):
+        self.configure(v1=True, controller="hugetlb")
+        self.hugetlb("task/engine", 100, 1000, v1=True)
+        self.assertEqual(self.hugetlb_headroom(), 900)
+
+    def test_hugetlb_v2_limits(self):
+        self.configure(controller="hugetlb")
+        self.hugetlb("task/engine", 100, 1000)
+        self.hugetlb("task", 400, 1000)
+        self.assertEqual(self.hugetlb_headroom(), 600)
+
+    def test_hugetlb_controller_not_enabled(self):
+        # The v2 hierarchy is mounted but has no hugetlb.* files anywhere.
+        self.configure(controller="hugetlb")
+        (self.mount / "task/engine").mkdir(parents=True)
+        self.assertIsNone(self.hugetlb_headroom())
+
+    def test_hugetlb_page_size_selects_the_pool_label(self):
+        self.configure(controller="hugetlb")
+        self.hugetlb("task/engine", 48, 2048, label="1GB")
+        self.assertEqual(self.hugetlb_headroom(1024**3), 2000)
 
 
 if __name__ == "__main__":
