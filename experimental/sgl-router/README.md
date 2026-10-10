@@ -410,10 +410,11 @@ text, as does any model whose template fails to load or render.
 
 Some chats additionally forward the rendered tokens to the engine as
 `input_ids`, retaining the original messages, so the engine skips
-re-tokenizing. How many depends on the model's renderer. DeepSeek-V4's and
-V4.1's native encoders and GLM-5.3's template are fixture-verified against SGLang's
-request normalization, so they forward every chat except multimodal ones and those with
-caller-provided `input_ids`. Renderers without that verification (HF Jinja templates, Kimi-K3)
+re-tokenizing. How many depends on the model's renderer. DeepSeek-V4's, V4.1's
+and Kimi-K3's native encoders and GLM-5.3's template are fixture-verified against
+SGLang's request normalization, so they forward every chat except multimodal ones
+and those with caller-provided `input_ids`. Renderers without that verification
+(HF Jinja templates)
 forward only plain text chat requests (string `content`, no tools, no template
 kwargs or reasoning controls or historical `reasoning_content`, no assistant
 continuation, no consecutive users or non-leading system turns) and warn
@@ -508,7 +509,8 @@ own route as sent: workers that disagree on those args or never
 reported them, `--completion-template`, `return_hidden_states` and other
 `sglext` outputs, `echo` or `logprobs` without a router tokenizer, and bodies
 SGLang would reject. Chat also needs a renderer verified against SGLang (the
-`AllText` scope, DeepSeek-V4, V4.1 and GLM-5.3 today), router `--default-chat-template-kwargs`
+`AllText` scope, DeepSeek-V4, V4.1 and GLM-5.3 today; Kimi-K3 chats keep the
+engine's route, whose OpenAI layer special-cases K3), router `--default-chat-template-kwargs`
 equal to the workers', a reasoning parser the processor reproduces
 (`deepseek-v4`, `deepseek-v41`, `glm45`) or none, and no media yet. Tools are served with `tool_choice`
 `auto` or `none`, non-strict, with standard JSON-schema types, and a tool
@@ -596,13 +598,18 @@ tools keep the engine's route (see above).
 
 ## Kimi-K3
 
-Kimi-K3 renders through dynamo-render's native XTML formatter with SGLang's
-request semantics (reasoning controls, tools, `response_format`, continuations)
-and the checkpoint's chunked tiktoken encoding. `--tokenizer-path` accepts a
+Kimi-K3 rendering comes from `rust/sglang-processor` on dynamo-render's native
+XTML formatter, following SGLang's serving path (reasoning controls, tools,
+`response_format`, continuations), and is tokenized with the checkpoint's
+chunked tiktoken encoding. `--tokenizer-path` accepts a
 local `tiktoken.model` or an HF repo id, whose `tiktoken.model`, `config.json`
 and `tokenizer_config.json` are downloaded when it has no `tokenizer.json`.
-An explicit null `thinking_effort` with thinking enabled is not representable
-in the pinned formatter and falls back to engine-side rendering.
+Shapes the pinned formatter renders differently are left to the worker: an
+explicit null `thinking_effort` with thinking enabled, whitespace-only
+reasoning history, tool-call arguments that are not a JSON object, numbers
+serde_json prints unlike Python (`1e-06`, integers beyond 64 bits, `-0`),
+tokenizer arguments in `chat_template_kwargs`, and tool declarations Dynamo
+rejects.
 
 ## HTTP/2
 

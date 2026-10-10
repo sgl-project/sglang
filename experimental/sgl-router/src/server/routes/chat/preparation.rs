@@ -414,6 +414,11 @@ fn lower_openai(
     if forwarding_scope(ctx, model) != ForwardingScope::AllText {
         return Err("chat_rendering_unverified");
     }
+    // SGLang's OpenAI layer special-cases Kimi-K3 (reported prompt tokens,
+    // `response_format`, special tokens), which `lower_chat` does not reproduce.
+    if ctx.tokenizers.is_kimi_k3(&model.0) {
+        return Err("kimi_k3_openai_layer");
+    }
     let engine_kwargs = settings
         .default_chat_template_kwargs
         .clone()

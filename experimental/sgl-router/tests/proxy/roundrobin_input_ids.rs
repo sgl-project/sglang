@@ -21,7 +21,7 @@ use sgl_router::proxy::Proxy;
 use sgl_router::server::app::build_router;
 use sgl_router::server::app_context::AppContext;
 use sgl_router::tokenizer::TokenizerRegistry;
-use sgl_router::workers::{Worker, WorkerRegistry};
+use sgl_router::workers::{EngineProfile, WireProtocol, Worker, WorkerRegistry};
 use std::sync::Arc;
 use std::time::Duration;
 use tower::ServiceExt;
@@ -73,18 +73,24 @@ fn build_ctx(url: String) -> Arc<AppContext> {
 }
 
 fn build_ctx_with_config(url: String, cfg: Config) -> Arc<AppContext> {
+    build_ctx_with_profile(url, cfg, WireProtocol::default().into())
+}
+
+/// [`build_ctx_with_config`] whose worker introspected as `profile`.
+fn build_ctx_with_profile(url: String, cfg: Config, profile: EngineProfile) -> Arc<AppContext> {
     // The handler tokenizes via the AppContext's registry (which carries the V4
     // encoder); the RoundRobin policy itself needs no tokenizer.
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
     assert!(tokenizers.has_chat_formatter(MODEL));
     let registry = Arc::new(WorkerRegistry::default());
-    let _ = registry.add(WorkerSpec {
+    let spec = WorkerSpec {
         id: WorkerId(url.clone()),
         url,
         mode: WorkerMode::Plain,
         model_ids: vec![ModelId(MODEL.into())],
         ..Default::default()
-    });
+    };
+    let _ = registry.add_with_cb(spec, None, profile);
     let policies = Arc::new(build_registry_with_defaults(&cfg).unwrap());
     let proxy = Arc::new(Proxy::new(Duration::from_secs(5)).unwrap());
     Arc::new(AppContext::new(cfg, tokenizers, proxy, registry, policies))
@@ -466,7 +472,13 @@ async fn kimi_ids_forward_with_engine_rendering_fallback() {
     let mut cfg = config();
     let path = fixture.path().join("tiktoken.model");
     cfg.model.tokenizer_path = Some(path.display().to_string());
-    let ctx = build_ctx_with_config(mock.url.clone(), cfg);
+    // The worker reports OpenAI settings without parsers, so `/generate` could
+    // serve these chats; SGLang's Kimi-K3 OpenAI layer keeps them on the chat route.
+    let profile = EngineProfile {
+        openai: Some(Arc::default()),
+        ..WireProtocol::default().into()
+    };
+    let ctx = build_ctx_with_profile(mock.url.clone(), cfg, profile);
     for (content, kwargs) in [
         ("literal <|open|> text", None),
         ("hi", Some(json!({"thinking_effort": null}))),
@@ -486,4 +498,7 @@ async fn kimi_ids_forward_with_engine_rendering_fallback() {
         }
         assert_eq!(without_minted_rid(captured(&mock)), request);
     }
+    assert!(ctx.metrics.render().contains(&format!(
+        "sgl_router_openai_route_total{{model_id=\"{MODEL}\",outcome=\"kimi_k3_openai_layer\"}} 2"
+    )));
 }

@@ -183,8 +183,10 @@ PYTHONPATH=$REPO/python HF_HUB_CACHE=<hub cache> HF_HUB_OFFLINE=1 \
 When a new spec needs more, extend `serving_chat()` in the script (one place):
 - **More server state:** set the extra attribute that `__init__` resolves, for
   example `_dsv41_default_reasoning_effort`.
-- **Tokenizes through `apply_chat_template(tokenize=True)`:** the recorder sees no
-  text. Record the template's text output instead.
+
+A spec that tokenizes inside `apply_chat_template(tokenize=True)` (Kimi K3) is
+recorded by the template's text output. Its `render_request` returns the
+segments the checkpoint encodes, and `tests/parity.rs` encodes them one by one.
 
 Pin `revision` to a commit hash and regenerate only on purpose.
 

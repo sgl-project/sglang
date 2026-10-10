@@ -189,7 +189,7 @@ impl TokenizerRegistry {
                      and SGLANG_DSV4_REASONING_EFFORT or SGLANG_DSV41_REASONING_EFFORT"),
                 ForwardingScope::Guarded => tracing::warn!(model = %m.id,
                     "UNVERIFIED input_ids forwarding: router rendering is verified against SGLang only \
-                     for DeepSeek-V4, V4.1 and GLM-5.3, so this model forwards only guarded request shapes (plain text \
+                     for DeepSeek-V4, V4.1, GLM-5.3 and Kimi-K3, so this model forwards only guarded shapes (plain text \
                      chat). Requires the workers' model files and --default-chat-template-kwargs; \
                      worker parser overrides, content-format detection, and conversation-template stop \
                      strings are not replicated. Pass --disable-input-ids-forwarding unless you have \
@@ -240,6 +240,12 @@ impl TokenizerRegistry {
         self.formatters
             .get(model_id)
             .map_or(ForwardingScope::Never, |e| e.formatter.forwarding_scope())
+    }
+
+    pub fn is_kimi_k3(&self, model_id: &str) -> bool {
+        self.formatters
+            .get(model_id)
+            .is_some_and(|e| e.formatter.is_kimi_k3())
     }
 
     /// Render with dynamo-render and tokenize; return `None` when unavailable or unsuccessful.
