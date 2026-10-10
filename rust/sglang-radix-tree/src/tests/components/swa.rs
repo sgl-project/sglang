@@ -3195,7 +3195,6 @@ fn internal_swa_backup_guards_keep_the_existing_inline_tombstone() {
         "no_hicache",
         "write_through",
         "no_swa_pool",
-        "full_host",
         "swa_host",
         "pending",
     ] {
@@ -3205,12 +3204,6 @@ fn internal_swa_backup_guards_keep_the_existing_inline_tombstone() {
             "no_hicache" => tc.enable_hicache = false,
             "write_through" => tc.is_write_back = false,
             "no_swa_pool" => tc.has_swa_host_pool = false,
-            "full_host" => {
-                tc.commit_backup(a, Tensor::from_slice(&[100i64]), HashMap::new())
-                    .unwrap();
-                tc.mark_write_through_pending(vec![a], a).unwrap();
-                tc.finish_write_through(vec![a], a).unwrap();
-            }
             "swa_host" => {
                 let (_, mut transfers) = tc.build_backup_spec(a).unwrap();
                 transfers.get_mut(&SWA).unwrap()[0].host_indices =
@@ -3233,6 +3226,29 @@ fn internal_swa_backup_guards_keep_the_existing_inline_tombstone() {
         tc.evict_device_end(SWA);
         tc.sanity_check(&[], &[]);
     }
+}
+
+#[test]
+fn internal_swa_backup_runs_when_full_kv_is_already_on_host() {
+    let (mut tc, [a, _, _]) = internal_swa_write_back_fixture(2, 1, false);
+    // Back up only A's Full KV, leaving its SWA KV device-only.
+    tc.commit_backup(a, Tensor::from_slice(&[100i64]), HashMap::new())
+        .unwrap();
+    tc.mark_write_through_pending(vec![a], a).unwrap();
+    tc.finish_write_through(vec![a], a).unwrap();
+    tc.evict_device_start(SWA, 1);
+    request_internal_swa_backup(&mut tc, a, 1);
+    let (full, _) = tc.build_backup_spec(a).unwrap();
+    assert_eq!(full.numel(), 0);
+    commit_internal_swa_backup(&mut tc, a);
+    let step = tc.finish_swa_state_eviction(a);
+    assert_eq!(step.tracker, HashMap::from([(SWA, 1)]));
+    let node = tc.arena.node(tc.arena.resolve(a).unwrap());
+    assert!(!node.has_device_value(SWA));
+    assert!(node.has_host_value(SWA));
+    assert!(node.host_value(FULL).equal(&Tensor::from_slice(&[100i64])));
+    tc.evict_device_end(SWA);
+    tc.sanity_check(&[], &[]);
 }
 
 #[test]

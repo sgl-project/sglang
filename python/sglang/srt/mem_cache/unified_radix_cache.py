@@ -1591,10 +1591,12 @@ class UnifiedRadixCache(BasePrefixCache):
         # Finish it before building a new transfer and claiming ack ownership.
         if self.ongoing_write_through:
             self.writing_check(write_back=True)
-        written = self._execute_and_commit_kv_backup(
+        self._execute_and_commit_kv_backup(
             BackupKV(node_ids=[node_id]), write_back=True
         )
-        if written == 0:
+        # A state-only backup (Full KV already on host) writes 0 Full tokens,
+        # so success is the node's pending ack, not the returned count.
+        if node_id not in self.ongoing_write_through:
             return False
         self.writing_check(write_back=True)
         return True
