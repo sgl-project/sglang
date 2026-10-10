@@ -3,8 +3,10 @@ Generator for SGLang Diffusion ComfyUI integration.
 """
 
 import atexit
+import contextlib
 import logging
 import os
+import sys
 
 from ..executors.flux import FluxExecutor
 from ..executors.minimax_h3 import MiniMaxH3Executor, FastH3Executor, VDNH3Executor
@@ -29,6 +31,27 @@ class _HeaderTensor:
         return n
 
     nelement = numel
+
+
+@contextlib.contextmanager
+def _spawn_without_launcher_main():
+    """Keep spawned diffusion workers from re-executing ComfyUI's main.py.
+
+    spawn re-runs ``__main__`` in every child. ComfyUI's main.py initializes
+    CUDA and DynamicVRAM at module scope, and with ``ComfyUI/comfy`` first on
+    sys.path (custom-node init) its ``import utils`` resolves to comfy/utils.py
+    and the worker dies before reporting ready. The workers import nothing
+    from ComfyUI, so hide the launcher while they start.
+    """
+    main_dict = vars(sys.modules["__main__"])
+    saved = {key: main_dict[key] for key in ("__file__", "__spec__") if key in main_dict}
+    main_dict.pop("__file__", None)
+    main_dict["__spec__"] = None
+    try:
+        yield
+    finally:
+        main_dict.pop("__spec__", None)
+        main_dict.update(saved)
 
 
 def _looks_like_gguf(path: str) -> bool:
@@ -213,11 +236,12 @@ class SGLDiffusionGenerator:
         kwargs.setdefault("dit_cpu_offload", False)
         kwargs = self._server_args_kwargs(kwargs)
         try:
-            self.generator = DiffGenerator.from_pretrained(
-                model_path=model_path,
-                pipeline_class_name=pipeline_class_name,
-                **kwargs,
-            )
+            with _spawn_without_launcher_main():
+                self.generator = DiffGenerator.from_pretrained(
+                    model_path=model_path,
+                    pipeline_class_name=pipeline_class_name,
+                    **kwargs,
+                )
         except EOFError as error:
             # A worker that raises while loading closes its pipe without a message.
             raise RuntimeError(

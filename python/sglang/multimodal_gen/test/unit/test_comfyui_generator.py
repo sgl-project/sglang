@@ -318,3 +318,29 @@ def test_failed_lora_request_does_not_claim_adapter_is_active():
             target=["all", "all"],
         )
     assert runtime._lora_input is None
+
+
+def test_spawned_workers_do_not_reexecute_launcher_main() -> None:
+    """Workers must not re-run ComfyUI's main.py; its imports break under spawn."""
+    import multiprocessing.spawn
+    import sys
+
+    from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.core.generator import (
+        _spawn_without_launcher_main,
+    )
+
+    main_dict = vars(sys.modules["__main__"])
+    before = {k: main_dict.get(k, "<absent>") for k in ("__file__", "__spec__")}
+    main_dict["__file__"] = "/comfy/main.py"
+    try:
+        with _spawn_without_launcher_main():
+            data = multiprocessing.spawn.get_preparation_data("worker")
+            assert "init_main_from_path" not in data
+            assert "init_main_from_name" not in data
+        assert main_dict["__file__"] == "/comfy/main.py"
+    finally:
+        for key, value in before.items():
+            if value == "<absent>":
+                main_dict.pop(key, None)
+            else:
+                main_dict[key] = value
