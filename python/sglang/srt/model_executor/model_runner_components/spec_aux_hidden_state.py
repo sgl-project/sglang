@@ -7,8 +7,8 @@ import msgspec
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.runtime_context import (
-    configured_tp_size,
     get_model,
+    get_parallel,
     get_spec,
 )
 
@@ -44,6 +44,11 @@ class SpecAuxHiddenStateConfig(msgspec.Struct, kw_only=True):
     dflash_target_layer_ids: Any = None
     # DFLASH draft KV bytes/token; None when unresolved.
     dflash_draft_cell_size_per_token: int | None = None
+    # The draft checkpoint read in draft mode, and its KV layer count, for
+    # every drafting algorithm: the fused-draft placement's input. A private
+    # EAGLE draft pool is sized by `eagle_draft_num_layers` instead.
+    draft_model_config: Optional[ModelConfig] = None
+    draft_kv_num_layers: Optional[int] = None
 
 
 def resolve_spec_aux_hidden_state_config(
@@ -57,6 +62,7 @@ def resolve_spec_aux_hidden_state_config(
     _resolve_eagle_aux_hidden_state(
         config=config,
         server_args=server_args,
+        model_config=model_config,
         spec_algorithm=spec_algorithm,
         is_draft_worker=is_draft_worker,
     )
@@ -74,55 +80,67 @@ def _resolve_eagle_aux_hidden_state(
     *,
     config: SpecAuxHiddenStateConfig,
     server_args: ServerArgs,
+    model_config: ModelConfig,
     spec_algorithm: SpeculativeAlgorithm,
     is_draft_worker: bool,
 ) -> None:
-    if (
+    if not (
         (spec_algorithm.is_eagle() or spec_algorithm.is_standalone())
         and not is_draft_worker
-        and get_spec().speculative_draft_model_path
     ):
-        # Load draft config to get layer count for KV cache sizing
-        draft_model_config = ModelConfig.from_server_args(
-            server_args,
-            model_path=get_spec().speculative_draft_model_path,
-            model_revision=get_spec().speculative_draft_model_revision,
-            is_draft_model=True,
+        return
+
+    draft_path = get_spec().speculative_draft_model_path
+    # The draft read in draft mode. A path-less NEXTN/MTP head is the TARGET
+    # checkpoint rewritten to its MTP form, which is where its
+    # `num_nextn_predict_layers` gets filled in.
+    draft_mode_config = ModelConfig.from_server_args(
+        server_args,
+        model_path=draft_path,
+        model_revision=get_spec().speculative_draft_model_revision,
+        is_draft_model=True,
+    )
+    if draft_mode_config.num_nextn_predict_layers is not None:
+        config.draft_kv_num_layers = int(draft_mode_config.num_nextn_predict_layers)
+    elif draft_path:
+        config.draft_kv_num_layers = int(
+            max(
+                draft_mode_config.num_hidden_layers,
+                draft_mode_config.num_attention_layers,
+            )
         )
-        num_nextn_predict_layers = draft_model_config.num_nextn_predict_layers
-        if num_nextn_predict_layers is not None:
-            config.eagle_draft_num_layers = int(num_nextn_predict_layers)
-        else:
-            config.eagle_draft_num_layers = int(
-                max(
-                    draft_model_config.num_hidden_layers,
-                    draft_model_config.num_attention_layers,
-                )
-            )
+    if config.draft_kv_num_layers is not None:
+        config.draft_model_config = draft_mode_config
 
-        if (
-            draft_model_config.is_hybrid_swa
-            and not draft_model_config.is_deepseek_v4_arch
-        ):
-            config.eagle_draft_swa_num_layers = len(
-                draft_model_config.swa_attention_layer_ids
-            )
+    # A private draft pool is sized off the TARGET config when path-less, so
+    # a path-less MTP deployment's token budget does not depend on the
+    # draft-mode rewrite.
+    draft_model_config = draft_mode_config if draft_path else model_config
+    num_nextn_predict_layers = draft_model_config.num_nextn_predict_layers
+    if num_nextn_predict_layers is not None:
+        config.eagle_draft_num_layers = int(num_nextn_predict_layers)
+    elif draft_path:
+        config.eagle_draft_num_layers = config.draft_kv_num_layers
+    else:
+        return
 
-        if spec_algorithm.is_eagle3():
-            config.eagle_use_aux_hidden_state = True
-            try:
-                eagle_config = getattr(
-                    draft_model_config.hf_config, "eagle_config", None
-                )
-                config.eagle_use_aux_hidden_state = eagle_config.get(
-                    "use_aux_hidden_state", True
-                )
-                config.eagle_aux_hidden_state_layer_ids = eagle_config[
-                    "eagle_aux_hidden_state_layer_ids"
-                ]
-            except:
-                # if there is no aux layer, set to None
-                config.eagle_aux_hidden_state_layer_ids = None
+    if draft_model_config.is_hybrid_swa and not draft_model_config.is_deepseek_v4_arch:
+        config.eagle_draft_swa_num_layers = len(
+            draft_model_config.swa_attention_layer_ids
+        )
+
+    if spec_algorithm.is_eagle3():
+        config.eagle_use_aux_hidden_state = True
+        try:
+            eagle_config = getattr(draft_model_config.hf_config, "eagle_config", None)
+            config.eagle_use_aux_hidden_state = eagle_config.get(
+                "use_aux_hidden_state", True
+            )
+            config.eagle_aux_hidden_state_layer_ids = eagle_config[
+                "eagle_aux_hidden_state_layer_ids"
+            ]
+        except Exception:
+            config.eagle_aux_hidden_state_layer_ids = None
 
 
 def _resolve_dflash_aux_hidden_state(
@@ -158,6 +176,9 @@ def _resolve_dflash_aux_hidden_state(
                 f"in config. Got target={target_num_layers}."
             )
         target_num_layers = int(target_num_layers)
+        # Loop models: target layer ids span num_hidden_layers * num_loops.
+        num_loops = getattr(model_config.hf_text_config, "num_loops", 1)
+        target_num_layers = target_num_layers * int(num_loops)
 
         if (
             trained_target_layers is not None
@@ -201,9 +222,10 @@ def _resolve_dflash_aux_hidden_state(
 
         config.dflash_use_aux_hidden_state = True
         config.dflash_draft_num_layers = int(draft_num_layers)
+        config.draft_model_config = draft_model_config
+        config.draft_kv_num_layers = int(draft_num_layers)
         config.dflash_target_layer_ids = target_layer_ids
         config.dflash_draft_cell_size_per_token = _resolve_dflash_draft_cell_size(
-            server_args=server_args,
             draft_model_config=draft_model_config,
             draft_num_layers=int(draft_num_layers),
         )
@@ -211,7 +233,6 @@ def _resolve_dflash_aux_hidden_state(
 
 def _resolve_dflash_draft_cell_size(
     *,
-    server_args: ServerArgs,
     draft_model_config: ModelConfig,
     draft_num_layers: int,
 ) -> int | None:
@@ -242,7 +263,8 @@ def _resolve_dflash_draft_cell_size(
             draft_model_config=draft_model_config,
             draft_num_layers=draft_num_layers,
             draft_kv_cache_dtype=draft_kv_cache_dtype,
-            tp_size=configured_tp_size(),
+            # The draft pool shards KV heads like the target pool (by attention TP).
+            tp_size=get_parallel().attn_tp_size,
         )
     except Exception as e:  # noqa: BLE001
         logger.warning(

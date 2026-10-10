@@ -6,6 +6,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers import zero_copy_context
+from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils import is_cuda
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -14,7 +15,10 @@ _is_cuda = is_cuda()
 if _is_cuda:
     from sgl_kernel import moe_sum_reduce
 
-    from sglang.kernels.ops.activation.activation import silu_and_mul
+    from sglang.kernels.ops.activation.activation import (
+        silu_and_mul,
+        silu_and_mul_with_activation_rounding,
+    )
     from sglang.kernels.ops.moe.moe_wna16_marlin import moe_wna16_marlin_gemm
 
 
@@ -109,6 +113,17 @@ def swiglu_limit_func(
     swiglu_limit: float = 0.0,
 ) -> None:
     d = input.shape[1] // 2
+    if (
+        _is_cuda
+        and get_platform().is_sm90
+        and input.is_cuda
+        and input.dtype in (torch.bfloat16, torch.float16)
+        and d % 16 == 0
+        and input.is_contiguous()
+        and output.is_contiguous()
+    ):
+        silu_and_mul_with_activation_rounding(input, output, clamp_limit=swiglu_limit)
+        return
     gate = input[:, :d]
     up = input[:, d:]
 
@@ -194,9 +209,9 @@ def fused_marlin_moe(
 
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
     assert hidden_states.shape[1] == w1.shape[1] * 16, "Hidden size mismatch w1"
-    assert hidden_states.shape[1] == w2.shape[2] // (
-        num_bits // 2
-    ), "Hidden size mismatch w2"
+    assert hidden_states.shape[1] == w2.shape[2] // (num_bits // 2), (
+        "Hidden size mismatch w2"
+    )
     assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
     assert w1.is_contiguous(), "Expert weights1 must be contiguous"
     assert w2.is_contiguous(), "Expert weights2 must be contiguous"
@@ -221,12 +236,12 @@ def fused_marlin_moe(
             f"activations, got {hidden_states.dtype}"
         )
     elif not is_nvfp4_marlin:
-        assert (
-            hidden_states.dtype == w1_scale.dtype
-        ), f"moe_wna16_marlin_gemm assumes hidden_states.dtype ({hidden_states.dtype}) == w1_scale.dtype ({w1_scale.dtype})"
-        assert (
-            hidden_states.dtype == w2_scale.dtype
-        ), f"moe_wna16_marlin_gemm assumes hidden_states.dtype ({hidden_states.dtype}) == w2_scale.dtype ({w2_scale.dtype})"
+        assert hidden_states.dtype == w1_scale.dtype, (
+            f"moe_wna16_marlin_gemm assumes hidden_states.dtype ({hidden_states.dtype}) == w1_scale.dtype ({w1_scale.dtype})"
+        )
+        assert hidden_states.dtype == w2_scale.dtype, (
+            f"moe_wna16_marlin_gemm assumes hidden_states.dtype ({hidden_states.dtype}) == w2_scale.dtype ({w2_scale.dtype})"
+        )
     assert num_bits in [4, 8]
 
     M, K = hidden_states.shape

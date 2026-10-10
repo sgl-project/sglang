@@ -16,6 +16,7 @@
 """Inference-only MiniCPM-o model compatible with HuggingFace weights."""
 
 import math
+from array import array
 from dataclasses import dataclass
 from typing import Any, Iterable, List, Literal, Optional, Tuple, Union
 
@@ -1188,7 +1189,6 @@ class MiniCPMWhisperEncoderLayer(nn.Module):
 
 # Copied from from transformers.models.whisper.modeling_whisper.WhisperEncoder and add use_cache for streaming inference
 class MiniCPMWhisperEncoder(WhisperEncoder):
-
     def __init__(self, config: WhisperConfig):
         super().__init__(config)
         self.layers = nn.ModuleList(
@@ -1355,9 +1355,9 @@ class MiniCPMWhisperEncoder(WhisperEncoder):
 
         # check if head_mask has a correct number of layers specified if desired
         if head_mask is not None:
-            assert head_mask.size()[0] == (
-                len(self.layers)
-            ), f"The head_mask should be specified for {len(self.layers)} layers, but it is for {head_mask.size()[0]}."
+            assert head_mask.size()[0] == (len(self.layers)), (
+                f"The head_mask should be specified for {len(self.layers)} layers, but it is for {head_mask.size()[0]}."
+            )
 
         for idx, encoder_layer in enumerate(self.layers):
             if output_hidden_states:
@@ -1457,9 +1457,9 @@ class MiniCPMO(MiniCPMBaseModel):
         logger.info("TTS is disabled for now")
         if self.config.init_tts:
             # print("tts enabled")
-            assert (
-                _tts_deps
-            ), "please make sure vector_quantize_pytorch and vocos are installed."
+            assert _tts_deps, (
+                "please make sure vector_quantize_pytorch and vocos are installed."
+            )
             self.tts = self.init_tts_module()
 
     def init_tts_module(self):
@@ -1519,7 +1519,7 @@ class MiniCPMO(MiniCPMBaseModel):
 
         return resampler.to(device=get_device(), dtype=torch.get_default_dtype())
 
-    def pad_input_ids(self, input_ids: List[int], mm_input: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_input: MultimodalInputs) -> array:
         # Get all special token IDs
         im_start_id: int = mm_input.im_start_id
         im_end_id: int = mm_input.im_end_id
@@ -1878,7 +1878,6 @@ class MiniCPMO(MiniCPMBaseModel):
 
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
-
             if "rotary_emb.inv_freq~" in name or "projector" in name:
                 continue
             if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:

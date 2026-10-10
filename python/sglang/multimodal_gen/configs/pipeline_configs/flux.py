@@ -20,12 +20,12 @@ from sglang.multimodal_gen.configs.models.vaes.flux import Flux2VAEConfig, FluxV
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ImagePipelineConfig,
     ModelTaskType,
+    pack_latents_2x2,
     shard_rotary_emb_for_sp,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.hunyuan import (
     clip_postprocess_text,
 )
-from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import _pack_latents
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 
 
@@ -141,7 +141,9 @@ class FluxPipelineConfig(ImagePipelineConfig):
         width = 2 * (batch.width // (self.vae_config.arch_config.vae_scale_factor * 2))
         num_channels_latents = self.dit_config.arch_config.in_channels // 4
         # pack latents
-        return _pack_latents(latents, batch_size, num_channels_latents, height, width)
+        return pack_latents_2x2(
+            latents, batch_size, num_channels_latents, height, width
+        )
 
     def get_pos_prompt_embeds(self, batch):
         return batch.prompt_embeds[1]
@@ -823,3 +825,61 @@ class Flux2KleinBasePipelineConfig(Flux2KleinPipelineConfig):
                 txt_seq_lens,
             )
         }
+
+
+def register():
+    from sglang.multimodal_gen.configs.sample.flux import (
+        Flux2KleinBaseSamplingParams,
+        Flux2KleinSamplingParams,
+        Flux2SamplingParams,
+        FluxSamplingParams,
+    )
+    from sglang.multimodal_gen.registry import register_configs
+
+    register_configs(
+        sampling_param_cls=FluxSamplingParams,
+        pipeline_config_cls=FluxPipelineConfig,
+        hf_model_paths=[
+            "black-forest-labs/FLUX.1-dev",
+        ],
+        model_detectors=[lambda hf_id: "flux.1" in hf_id.lower()],
+    )
+    register_configs(
+        sampling_param_cls=Flux2KleinSamplingParams,
+        pipeline_config_cls=Flux2KleinPipelineConfig,
+        hf_model_paths=[
+            "black-forest-labs/FLUX.2-klein-4B",
+            "black-forest-labs/FLUX.2-klein-9B",
+        ],
+        model_detectors=[
+            lambda hf_id: (
+                ("flux.2-klein" in hf_id.lower() or "flux2-klein" in hf_id.lower())
+                and "base" not in hf_id.lower()
+            )
+        ],
+    )
+    register_configs(
+        sampling_param_cls=Flux2KleinBaseSamplingParams,
+        pipeline_config_cls=Flux2KleinBasePipelineConfig,
+        hf_model_paths=[
+            "black-forest-labs/FLUX.2-klein-base-4B",
+            "black-forest-labs/FLUX.2-klein-base-9B",
+        ],
+        model_detectors=[
+            lambda hf_id: (
+                ("flux.2-klein" in hf_id.lower() or "flux2-klein" in hf_id.lower())
+                and "base" in hf_id.lower()
+            )
+        ],
+    )
+    register_configs(
+        sampling_param_cls=Flux2SamplingParams,
+        pipeline_config_cls=Flux2PipelineConfig,
+        hf_model_paths=[
+            "black-forest-labs/FLUX.2-dev",
+            "black-forest-labs/FLUX.2-dev-NVFP4",
+        ],
+        model_detectors=[
+            lambda hf_id: "flux.2" in hf_id.lower() and "klein" not in hf_id.lower()
+        ],
+    )

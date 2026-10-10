@@ -20,6 +20,7 @@ KV caching events
 import atexit
 import enum
 import logging
+import os
 import queue
 import threading
 import time
@@ -32,6 +33,9 @@ from typing import Any, Callable, Optional, Union
 import msgspec
 import zmq
 from pydantic import BaseModel
+
+from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils.network import NetworkAddress
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +62,173 @@ def select_kv_publisher_dp_rank(
     return dp_rank or 0
 
 
+def is_kv_publisher_rank(kv_events_config: Optional[str]) -> bool:
+    """Whether this scheduler owns a KV-event publisher slot: one per
+    independent KV cache (pp/attn-TP/attn-CP rank 0). Shared by
+    `SchedulerKvEventsPublisher` and `SchedulerLoadPublisher`, which must
+    gate identically or their /server_info-derived ports disagree.
+    """
+    parallel = get_parallel()
+    return bool(
+        kv_events_config
+        and parallel.pp_rank == 0
+        and parallel.attn_tp_rank == 0
+        and parallel.attn_cp_rank == 0
+    )
+
+
+# Advertised as `load_topic` in /server_info; the load socket carries only
+# load, so subscribers can subscribe-all.
+LOAD_TOPIC = "load"
+
+# Hosts a PUB socket binds rather than connects to. Matched on the parsed
+# host, not a substring: "::" appears inside every IPv6 address, so a
+# substring test would wrongly call a concrete remote host bindable.
+_BIND_WILDCARD_HOSTS = frozenset({"*", "0.0.0.0", "::"})
+
+
+def parse_tcp_port(endpoint: Optional[str]) -> Optional[int]:
+    """Legal port of a tcp:// endpoint regardless of host, or None.
+
+    Host-agnostic: answers "which ports does something else occupy" for the
+    collision checks (the replay ROUTER binds any host spelling).
+    """
+    if not endpoint or not endpoint.startswith("tcp://"):
+        return None
+    try:
+        port = NetworkAddress.parse(endpoint[len("tcp://") :]).port
+    except ValueError:
+        return None
+    return port if 0 < port <= 65535 else None
+
+
+def parse_advertisable_tcp(endpoint: Optional[str]) -> Optional[tuple[str, int]]:
+    """``(host, port)`` of a tcp:// endpoint fit for /server_info, else None.
+
+    Any host (KV events work connect-style); IPv6 re-bracketed so consumers
+    can splice ``tcp://{host}:{port}``. Bare unbracketed IPv6 is rejected —
+    same parse as the resolver, so descriptor and bind agree.
+    """
+    if not endpoint or not endpoint.startswith("tcp://"):
+        return None
+    try:
+        addr = NetworkAddress.parse(endpoint[len("tcp://") :])
+    except ValueError:
+        return None
+    if not addr.host or not (0 < addr.port <= 65535):
+        return None
+    host = f"[{addr.host}]" if addr.is_ipv6 else addr.host
+    return host, addr.port
+
+
+def parse_bindable_tcp(endpoint: Optional[str]) -> Optional[tuple[str, int]]:
+    """``(host, port)`` if a PUB socket can BIND this tcp:// endpoint, else
+    None. A concrete host is connect-style here, so a load PUB there would
+    reach nobody while reporting no error."""
+    if not endpoint or not endpoint.startswith("tcp://"):
+        return None
+    try:
+        addr = NetworkAddress.parse(endpoint[len("tcp://") :])
+    except ValueError:
+        return None
+    if addr.host not in _BIND_WILDCARD_HOSTS or not (0 < addr.port <= 65535):
+        return None
+    return addr.host, addr.port
+
+
+def resolve_load_pub_range(
+    *,
+    kv_endpoint: Optional[str],
+    replay_endpoint: Optional[str],
+    dp_size: int,
+    load_publish_endpoint: Optional[str] = None,
+) -> tuple[Optional[tuple[str, int]], Optional[str]]:
+    """``((host, base), reason)`` for the load PUB range — exactly one is None.
+
+    Rank ``r`` binds ``base + r`` and ``/server_info`` advertises ``base``.
+    Single source of truth for both the bind (`SchedulerLoadPublisher`) and
+    the advertisement (`describe_kv_events_publisher`), so they cannot drift.
+
+    Opt-in via ``--load-publish-endpoint``: unset (or ``off``) disables it, so
+    an upgrade never reserves a port a co-hosted neighbor's KV publisher would
+    bind. ``auto`` packs the range after the KV-event range, bumping past an
+    overlapping replay ROUTER range (with the conventional replay = kv + 1,
+    always); an explicit ``tcp://`` address sets it outright.
+
+    ``reason`` is set when an operator would want to know why publishing is
+    off (unusable endpoint, collision, u16 overflow) and None when the decline
+    is unremarkable (feature off). Callers log it once; /server_info calls
+    this per request, so it must not log here.
+
+    Two inherited limits, both from the KV-event discovery structure: with
+    ``page_size`` <= 0 `describe_kv_events_publisher` suppresses the whole
+    block, so the range binds unadvertised; and with DP-attention across
+    ``nnodes`` > 1 the single advertised base is paired with one worker-URL
+    host, so ranks on other nodes are unreachable at that host.
+    """
+    # Opt-in: off unless the operator sets `auto` (derive) or an address, so an
+    # upgrade never claims a port a co-hosted neighbor's KV publisher binds.
+    mode = (load_publish_endpoint or "").strip()
+    if dp_size < 1 or not mode or mode.lower() == "off":
+        return None, None
+
+    if mode.lower() == "auto":
+        resolved = parse_bindable_tcp(kv_endpoint)
+        if resolved is None:
+            why = (
+                "--kv-events-config is not set"
+                if kv_endpoint is None
+                else f"{kv_endpoint!r} is not one"
+            )
+            return None, (
+                f"--load-publish-endpoint=auto needs a bindable wildcard-host "
+                f"tcp:// --kv-events-config endpoint to pack after; {why}"
+            )
+        host, kv_base = resolved
+        base = kv_base + dp_size
+        replay_base = parse_tcp_port(replay_endpoint)
+        if (
+            replay_base is not None
+            and base < replay_base + dp_size
+            and replay_base < base + dp_size
+        ):
+            # Overlap implies kv < replay < kv + 2*dp_size, so packing after
+            # the replay range also clears the KV range.
+            base = replay_base + dp_size
+    else:
+        # Explicit address. Discovery still needs the kv_events block, absent
+        # for a non-tcp KV endpoint — so the range would bind but never
+        # advertise.
+        if parse_tcp_port(kv_endpoint) is None:
+            absent = (
+                "without --kv-events-config"
+                if kv_endpoint is None
+                else f"for endpoint {kv_endpoint!r}"
+            )
+            return None, (
+                f"--load-publish-endpoint={mode!r} needs a routable tcp:// "
+                f"--kv-events-config endpoint: routers discover the load range "
+                f"through /server_info's kv_events block, absent {absent}, so "
+                f"the socket would be bound but never advertised"
+            )
+        resolved = parse_bindable_tcp(mode)
+        if resolved is None:
+            return None, (
+                f"--load-publish-endpoint={mode!r} is not a bindable tcp:// "
+                f"address (a concrete host would be connected to, not bound)"
+            )
+        host, base = resolved
+        for port in (parse_tcp_port(kv_endpoint), parse_tcp_port(replay_endpoint)):
+            if port is not None and base < port + dp_size and port < base + dp_size:
+                return None, (
+                    f"--load-publish-endpoint range [{base}, {base + dp_size}) "
+                    f"overlaps the kv-events range [{port}, {port + dp_size})"
+                )
+    if base + dp_size - 1 > 65535:
+        return None, f"load port range from {base} would run past the u16 ceiling"
+    return (host, base), None
+
+
 class EventBatch(
     msgspec.Struct,
     array_like=True,  # type: ignore[call-arg]
@@ -70,11 +241,20 @@ class EventBatch(
 
 class KVCacheEvent(
     msgspec.Struct,
-    array_like=True,  # type: ignore[call-arg]
+    omit_defaults=True,  # type: ignore[call-arg]
     gc=False,  # type: ignore[call-arg]
     tag=True,
 ):
-    """Base class for all KV cache-related events"""
+    """Base class for all KV cache-related events.
+
+    Events are tagged msgpack maps: ``type`` carries the class name and every
+    other key is a field name. Optional fields left at ``None`` are omitted, so
+    adding an optional field never changes the shape an older consumer sees.
+    This is the same encoding vLLM uses for its ``KVCacheEvent``, so a consumer
+    such as Dynamo decodes both engines with one code path.
+
+    ``EventBatch`` stays a positional array ``[ts, events, attn_dp_rank]``.
+    """
 
 
 class StorageMedium(str, enum.Enum):
@@ -86,27 +266,13 @@ class StorageMedium(str, enum.Enum):
     EXTERNAL = "EXTERNAL"  # L4: shared / remote pool (e.g. Mooncake)
 
 
-class BlockStoredMetadata(msgspec.Struct, omit_defaults=True, gc=False):
-    """Typed request metadata attached to a stored KV block."""
+class OffloadedState(msgspec.Struct):
+    """Decode-side offload progress for one request, keyed by Req in the manager."""
 
-    cache_salt: str
-
-
-class OffloadedState:
-    """
-    OffloadedState represents the state of a KV cache block offloaded to the hicache.
-
-    - prefill_len (int): The length of the prefill part of the KV cache block.
-    - inc_len (int): The length of the incremental part of the KV cache block.
-    - last_hash (Optional[str]): The hash of the last token in the KV cache block.
-    """
-
-    def __init__(
-        self, prefill_len: int, inc_len: int = 0, last_hash: Optional[str] = None
-    ):
-        self.prefill_len = prefill_len
-        self.inc_len = inc_len
-        self.last_hash = last_hash
+    # Decode-incremental length already submitted for D2H offload.
+    inc_len: int = 0
+    # Tail of the page hash chain, extended as each offloaded chunk is backed up.
+    last_hash: Optional[str] = None
 
 
 class BlockStored(KVCacheEvent):
@@ -116,16 +282,13 @@ class BlockStored(KVCacheEvent):
     block_size: int
     lora_id: Optional[int]
     medium: Optional[str] = None
-
-
-class BlockStoredWithMetadata(BlockStored, tag="BlockStored", kw_only=True):
-    """BlockStored wire extension used only when typed metadata is present.
-
-    A separate struct keeps unsalted events at their legacy array length; an
-    optional field on BlockStored would still serialize a trailing null.
-    """
-
-    metadata: BlockStoredMetadata
+    # Salt of the request that stored these blocks. Block hashes are already
+    # namespaced by it; consumers index the emitted hashes rather than
+    # recompute them.
+    cache_salt: Optional[str] = None
+    # Session that triggered this store. Attribution only: the blocks may be
+    # shared with other sessions, and the hash does not depend on it.
+    session_id: Optional[str] = None
 
 
 class BlockRemoved(KVCacheEvent):
@@ -138,10 +301,6 @@ class AllBlocksCleared(KVCacheEvent):
 
 
 class KVEventBatch(EventBatch):
-    # BlockStoredWithMetadata deliberately stays out of this tagged union.
-    # Existing typed consumers decode its shared "BlockStored" tag as the base
-    # type and ignore the trailing metadata; adding both types would give
-    # msgspec duplicate tags and make the union invalid.
     events: list[Union[BlockStored, BlockRemoved, AllBlocksCleared]]
 
 
@@ -171,6 +330,10 @@ class EventPublisher(ABC):
     def shutdown(self) -> None:
         """Shutdown the publisher."""
 
+    def describe_local_source(self, block_size: int) -> Optional[dict[str, Any]]:
+        """Describe a source accessible to a separate local process, if any."""
+        return None
+
 
 class NullEventPublisher(EventPublisher):
     """No-op implementation (default when disabled)."""
@@ -191,7 +354,7 @@ class ZmqEventPublisher(EventPublisher):
     ----------
     endpoint:
         PUB address. Use ``tcp://*:5557`` to bind or ``tcp://host:5557`` to
-        connect.
+        connect, unless overridden by ``bind``.
     replay_endpoint:
         Optional ROUTER address for replay requests. When given, subscribers can
         request missed batches by sending the starting sequence number as an
@@ -204,6 +367,9 @@ class ZmqEventPublisher(EventPublisher):
         Maximum number of events to buffer in memory.
     topic:
         Topic to publish events to.
+    bind:
+        Whether to bind the PUB socket. When unset, preserve the endpoint-based
+        heuristic: bind wildcard, IPC and inproc addresses; connect otherwise.
     """
 
     SHUTDOWN_TIMEOUT: float = 1.0
@@ -218,6 +384,7 @@ class ZmqEventPublisher(EventPublisher):
         hwm: int = 100_000,
         max_queue_size: int = 100_000,
         topic: str = "",
+        bind: Optional[bool] = None,
     ) -> None:
         # Storage
         self._event_queue = Queue[Optional[EventBatch]](maxsize=max_queue_size)
@@ -226,9 +393,12 @@ class ZmqEventPublisher(EventPublisher):
         # ZMQ sockets
         self._ctx = zmq.Context.instance()
         self._pub: Optional[zmq.Socket] = None
+        self._local_pub_endpoint: Optional[str] = None
+        self._local_replay_endpoint: Optional[str] = None
         self._replay: Optional[zmq.Socket] = None
         self._dp_rank = attn_dp_rank
         self._endpoint = self.offset_endpoint_port(endpoint, self._dp_rank)
+        self._bind = bind
         self._replay_endpoint = self.offset_endpoint_port(
             replay_endpoint, self._dp_rank
         )
@@ -256,6 +426,43 @@ class ZmqEventPublisher(EventPublisher):
         if events.attn_dp_rank is None:
             events.attn_dp_rank = self._dp_rank
         self._event_queue.put(events)
+
+    def describe_local_source(self, block_size: int) -> Optional[dict[str, Any]]:
+        """Report the bound socket, not a port reconstructed from global DP size.
+
+        Connect-style publishers and inproc sockets have no subscribable local
+        endpoint. They keep working as before, but are not advertised to external
+        processes. Wildcard binds are reachable on loopback from this node.
+        """
+
+        def local_endpoint(endpoint: Optional[str]) -> Optional[str]:
+            if endpoint is None:
+                return None
+            if endpoint.startswith("ipc://"):
+                return endpoint
+            if parse_advertisable_tcp(endpoint) is None:
+                return None
+            address = NetworkAddress.parse(endpoint[len("tcp://") :])
+            host = address.host
+            if host in ("*", "0.0.0.0"):
+                host = "127.0.0.1"
+            elif host == "::":
+                host = "::1"
+            return NetworkAddress(host, address.port).to_tcp()
+
+        endpoint = local_endpoint(self._local_pub_endpoint)
+        if endpoint is None:
+            return None
+        source = {
+            "dp_rank": self._dp_rank,
+            "endpoint": endpoint,
+            "topic": self._topic_bytes.decode("utf-8"),
+            "block_size": block_size,
+        }
+        replay_endpoint = local_endpoint(self._local_replay_endpoint)
+        if replay_endpoint is not None:
+            source["replay_endpoint"] = replay_endpoint
+        return source
 
     def shutdown(self) -> None:
         """Stop the publisher thread and clean up resources."""
@@ -295,23 +502,27 @@ class ZmqEventPublisher(EventPublisher):
         if self._pub is None:
             self._pub = self._ctx.socket(zmq.PUB)
             self._pub.set_hwm(self._hwm)
-            # Heuristic: bind if wildcard / * present, else connect.
+            # Default heuristic: bind if wildcard / * present, else connect.
             # bind stable, connect volatile convention.
             # ``0.0.0.0`` is the IPv4 bind-all wildcard alongside ``*``
             # and ``::``; ``/server_info`` advertises it as a wildcard,
             # so the publisher must bind it for the advertised endpoint
             # to actually be listening.
-            if (
-                "*" in self._endpoint
-                or "::" in self._endpoint
-                or "0.0.0.0" in self._endpoint
-                or self._endpoint.startswith("ipc://")
-                or self._endpoint.startswith("inproc://")
-            ):
+            should_bind = self._bind
+            if should_bind is None:
+                should_bind = (
+                    "*" in self._endpoint
+                    or "::" in self._endpoint
+                    or "0.0.0.0" in self._endpoint
+                    or self._endpoint.startswith("ipc://")
+                    or self._endpoint.startswith("inproc://")
+                )
+            if should_bind:
                 logger.debug(
                     f"ZmqEventPublisher socket publisher_endpoint bind to {self._endpoint}"
                 )
                 self._pub.bind(self._endpoint)
+                self._local_pub_endpoint = self._bound_endpoint(self._pub)
             else:
                 self._pub.connect(self._endpoint)
 
@@ -325,6 +536,19 @@ class ZmqEventPublisher(EventPublisher):
                 f"ZmqEventPublisher socket replay_endpoint bind to {self._replay_endpoint}"
             )
             self._replay.bind(self._replay_endpoint)
+            self._local_replay_endpoint = self._bound_endpoint(self._replay)
+
+    @staticmethod
+    def _bound_endpoint(socket: zmq.Socket) -> str:
+        endpoint = socket.getsockopt_string(zmq.LAST_ENDPOINT)
+        if endpoint.startswith("ipc://"):
+            path = endpoint[len("ipc://") :]
+            # Capture the publisher's working directory at bind time so a
+            # separate process can use the address. Abstract IPC names are
+            # independent of the filesystem and must remain unchanged.
+            if not path.startswith("@"):
+                endpoint = f"ipc://{os.path.abspath(path)}"
+        return endpoint
 
     def _publisher_thread(self) -> None:
         """Background thread that processes the event queue."""
@@ -429,6 +653,11 @@ class KVEventsConfig(BaseModel):
 
     endpoint: str = "tcp://*:5557"
     """The zmq endpoint to use for publishing kv events.
+    """
+
+    bind: Optional[bool] = None
+    """Bind (true) or connect (false) the PUB socket. When unset, infer from
+    the endpoint as before. Use true to bind a concrete address such as loopback.
     """
 
     replay_endpoint: Optional[str] = None

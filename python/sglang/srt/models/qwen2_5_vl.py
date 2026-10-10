@@ -25,6 +25,7 @@
 
 import logging
 import re
+from array import array
 from functools import partial
 from typing import Iterable, List, Optional, Tuple, Type
 
@@ -38,7 +39,6 @@ from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import (
     Qwen2_5_VLVisionConfig,
 )
 
-from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention.vision import (
@@ -50,6 +50,7 @@ from sglang.srt.layers.conv import Conv3dLayer
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
+    LinearParallelGroup,
     MergedColumnParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
@@ -140,21 +141,15 @@ class Qwen2_5_VLMLP(nn.Module):
         prefix: str = "",
         use_data_parallel: bool = False,
         fuse_gate_up: bool = True,
-        tp_size: Optional[int] = None,
-        tp_rank: Optional[int] = None,
+        parallel_group: Optional[LinearParallelGroup] = None,
     ):
         super().__init__()
+        if use_data_parallel and parallel_group is not None:
+            raise ValueError("Explicit MLP TP cannot be combined with data parallel")
         if use_data_parallel:
-            if tp_size is not None or tp_rank is not None:
-                raise ValueError(
-                    "Explicit MLP TP cannot be combined with data parallel"
-                )
-            self.tp_size, self.tp_rank = 1, 0
-        else:
-            if (tp_size is None) != (tp_rank is None):
-                raise ValueError("MLP tp_size and tp_rank must be set together")
-            self.tp_size = get_parallel().tp_size if tp_size is None else tp_size
-            self.tp_rank = get_parallel().tp_rank if tp_rank is None else tp_rank
+            parallel_group = "replicated"
+        elif parallel_group is None:
+            parallel_group = "tp"
         self.fuse_gate_up = fuse_gate_up
         if fuse_gate_up:
             self.gate_up_proj = MergedColumnParallelLinear(
@@ -163,8 +158,7 @@ class Qwen2_5_VLMLP(nn.Module):
                 bias=bias,
                 quant_config=quant_config,
                 prefix=add_prefix("gate_up_proj", prefix),
-                tp_size=self.tp_size,
-                tp_rank=self.tp_rank,
+                parallel_group=parallel_group,
             )
         else:
             projection_kwargs = dict(
@@ -172,8 +166,7 @@ class Qwen2_5_VLMLP(nn.Module):
                 output_size=hidden_features,
                 bias=bias,
                 quant_config=quant_config,
-                tp_size=self.tp_size,
-                tp_rank=self.tp_rank,
+                parallel_group=parallel_group,
             )
             self.gate_proj = ColumnParallelLinear(
                 **projection_kwargs,
@@ -183,7 +176,11 @@ class Qwen2_5_VLMLP(nn.Module):
                 **projection_kwargs,
                 prefix=add_prefix("up_proj", prefix),
             )
-        if not self.fuse_gate_up and self.tp_size == 1:
+        self.tp_group = (
+            self.gate_up_proj if self.fuse_gate_up else self.gate_proj
+        ).tp_group
+        tp_size = self.tp_group.world_size if self.tp_group is not None else 1
+        if not self.fuse_gate_up and tp_size == 1:
             self.down_proj = ReplicatedLinear(
                 hidden_features,
                 in_features,
@@ -198,8 +195,7 @@ class Qwen2_5_VLMLP(nn.Module):
                 bias=bias,
                 quant_config=quant_config,
                 prefix=add_prefix("down_proj", prefix),
-                tp_size=self.tp_size,
-                tp_rank=self.tp_rank,
+                parallel_group=parallel_group,
             )
         self.hidden_act = hidden_act
         if self.fuse_gate_up and self.hidden_act == "silu":
@@ -228,7 +224,6 @@ class Qwen2_5_VLMLP(nn.Module):
 
 
 class Qwen2_5_VisionBlock(nn.Module):
-
     def __init__(
         self,
         dim: int,
@@ -306,7 +301,6 @@ class Qwen2_5_VisionBlock(nn.Module):
 
 
 class Qwen2_5_VisionPatchMerger(nn.Module):
-
     def __init__(
         self,
         dim: int,
@@ -328,8 +322,6 @@ class Qwen2_5_VisionPatchMerger(nn.Module):
             cast_x_before_out_mul=cast_x_before_out_mul,
             force_native=force_native_norm,
         )
-        tp_size = 1 if use_data_parallel else get_parallel().tp_size
-        tp_rank = 0 if use_data_parallel else get_parallel().tp_rank
         self.mlp = nn.ModuleList(
             [
                 ColumnParallelLinear(
@@ -338,8 +330,7 @@ class Qwen2_5_VisionPatchMerger(nn.Module):
                     bias=True,
                     quant_config=quant_config,
                     prefix=add_prefix("mlp.0", prefix),
-                    tp_size=tp_size,
-                    tp_rank=tp_rank,
+                    parallel_group="replicated" if use_data_parallel else "tp",
                 ),
                 nn.GELU(),
                 RowParallelLinear(
@@ -348,8 +339,7 @@ class Qwen2_5_VisionPatchMerger(nn.Module):
                     bias=True,
                     quant_config=quant_config,
                     prefix=add_prefix("mlp.2", prefix),
-                    tp_size=tp_size,
-                    tp_rank=tp_rank,
+                    parallel_group="replicated" if use_data_parallel else "tp",
                 ),
             ]
         )
@@ -366,7 +356,6 @@ class Qwen2_5_VisionPatchMerger(nn.Module):
 
 
 class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
-
     def __init__(
         self,
         vision_config: Qwen2_5_VLVisionConfig,
@@ -433,7 +422,6 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
         )
 
         # Resource prepared for vit cuda graph
-        self.tp_size = 1 if use_data_parallel else get_parallel().tp_size
         self.max_context_len = max_context_len
         self.enable_cg = _is_cuda and envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get()
 
@@ -502,7 +490,7 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
 
         pos_ids = torch.cat(pos_ids, dim=0)
         max_grid_size = int(grid_thw[:, 1:].max())
-        # transformers 5.12's rotary forward takes 1-D position_ids on the input device (grid_thw is CPU).
+        # The vision rotary forward takes 1-D position_ids on the input device (grid_thw is CPU).
         rotary_pos_emb_full = self.rotary_pos_emb(
             torch.arange(max_grid_size, device=self.device)
         )
@@ -616,6 +604,11 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
         rotary_pos_emb = self.rot_pos_emb(grid_thw)
 
         window_index, cu_window_seqlens = self.get_window_index(grid_thw)
+        cu_window_layout = tuple(
+            value
+            for index, value in enumerate(cu_window_seqlens)
+            if index == 0 or value != cu_window_seqlens[index - 1]
+        )
         cu_window_seqlens = torch.tensor(
             cu_window_seqlens,
             device=x.device,
@@ -658,6 +651,11 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
             ]
         )
         cu_seqlens = torch.cat([cu_seqlens.new_zeros(1), cu_seqlens])
+        full_layout = [0, 0]
+        total_tokens = 0
+        for temporal, height, width in grid_thw.tolist():
+            total_tokens += temporal * height * width
+            full_layout.append(total_tokens)
 
         return self.cuda_graph_runner.run(
             x=x,
@@ -665,6 +663,7 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
             cu_seqlens=cu_seqlens,
             cu_window_seqlens=cu_window_seqlens,
             output_indices=reverse_indices,
+            attention_layout_key=(tuple(full_layout), cu_window_layout),
         )
 
 
@@ -713,7 +712,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
     ) -> None:
         super().__init__()
 
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
         self.use_data_parallel = get_mm().mm_enable_dp_encoder
 
@@ -760,7 +759,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
@@ -786,7 +785,6 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
             if current_dim == expected_dim:
                 return pixel_values
             if current_dim != raw_patch_dim:
-
                 return pixel_values
 
         assert pixel_values.dim() == 2, pixel_values.dim()

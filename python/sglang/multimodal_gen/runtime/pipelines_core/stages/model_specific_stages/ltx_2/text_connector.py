@@ -55,8 +55,7 @@ class LTX2TextConnectorStage(PipelineStage):
 
         if prompt_embeds is None or prompt_attention_mask is None:
             raise ValueError(
-                "LTX2TextConnectorStage requires prompt embeddings and "
-                "attention mask."
+                "LTX2TextConnectorStage requires prompt embeddings and attention mask."
             )
 
         if batch.do_classifier_free_guidance:

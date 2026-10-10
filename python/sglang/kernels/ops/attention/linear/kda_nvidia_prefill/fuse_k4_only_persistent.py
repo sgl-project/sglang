@@ -407,7 +407,6 @@ def k4_persistent_kernel(
 
     # ==== WG1: State readout + decay ====
     if warpgroup_idx == STATE_WG:
-
         cId_128 = cute.make_identity_tensor((M6, N6))
         tCtState_mn = transform_partitioned_tensor_layout(tCtState)
 
@@ -698,7 +697,6 @@ def k4_persistent_kernel(
 
     # ==== TMA warp (warp 2) ====
     elif warp_idx == TMA_WARP:
-
         cta_layout = cute.make_layout(1)
 
         scheduler = GDNTileScheduler.create(
@@ -995,7 +993,6 @@ def k4_persistent_kernel(
 
     # ==== WG2: W/NV/O readout (SS-mode, no Phase 2) ====
     elif warpgroup_idx == READOUT_WG:
-
         tCtW_mn = transform_partitioned_tensor_layout(tCtW)
         tCtNV_mn = transform_partitioned_tensor_layout(tCtNV)
         tCtO_mn = transform_partitioned_tensor_layout(tCtO)

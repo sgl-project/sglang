@@ -1,7 +1,8 @@
 """sglang build hooks.
 
-Rust extensions are auto-discovered from the cargo workspace in ../rust: every
-crate whose Cargo.toml declares
+Rust extensions are auto-discovered from the Cargo workspace in ../rust and
+the extension manifests declared by its workspace metadata. Every crate whose
+Cargo.toml declares
 
     [package.metadata.sglang]
     python-module = "sglang.srt.<pkg>._core"   # import path inside the wheel
@@ -28,6 +29,7 @@ Two filters can narrow the discovered set:
 import json
 import os
 import re
+import runpy
 import subprocess
 from pathlib import Path
 
@@ -45,14 +47,17 @@ except ModuleNotFoundError as exc:
 _BUILD_RUST_EXTS_ENV = "SGLANG_BUILD_RUST_EXTS"
 _PYTHON_DIR = Path(__file__).resolve().parent
 _RUST_WORKSPACE_DIR = _PYTHON_DIR.parent / "rust"
+_RUST_BUILD_HELPERS = runpy.run_path(
+    os.fspath(_PYTHON_DIR / "sglang" / "srt" / "rust_extensions" / "torch_build.py")
+)
+_torch_build_configuration = _RUST_BUILD_HELPERS["torch_build_configuration"]
 
 
-def _cargo_workspace_metadata():
-    """The rust/ cargo workspace as JSON, straight from cargo's own parser."""
-    manifest_path = _RUST_WORKSPACE_DIR / "Cargo.toml"
+def _cargo_metadata(manifest_path):
+    """One Cargo workspace/package manifest as Cargo's own JSON metadata."""
     if not manifest_path.is_file():
         raise RuntimeError(
-            f"no cargo workspace at {manifest_path} (building outside a repo "
+            f"no Cargo manifest at {manifest_path} (building outside a repo "
             f"checkout?); set {_BUILD_RUST_EXTS_ENV}=none to build without "
             "Rust extensions"
         )
@@ -83,6 +88,27 @@ def _cargo_workspace_metadata():
     return json.loads(out.stdout)
 
 
+def _cargo_workspace_metadata():
+    """Root workspace metadata plus explicitly declared extension workspaces."""
+    root_manifest = _RUST_WORKSPACE_DIR / "Cargo.toml"
+    document = _cargo_metadata(root_manifest)
+    external_manifests = (
+        (document.get("metadata") or {})
+        .get("sglang", {})
+        .get("extension-manifests", [])
+    )
+    packages = list(document["packages"])
+    for relative_manifest in external_manifests:
+        external = (_RUST_WORKSPACE_DIR / relative_manifest).resolve()
+        if _RUST_WORKSPACE_DIR not in external.parents:
+            raise RuntimeError(
+                f"external Rust extension manifest escapes rust/: {relative_manifest}"
+            )
+        packages.extend(_cargo_metadata(external)["packages"])
+    document["packages"] = packages
+    return document
+
+
 def _match_by_substring(declared, tokens, source):
     """Match tokens as case-insensitive substrings of extension names."""
     matched = set()
@@ -111,17 +137,22 @@ def _discovered_rust_extensions():
         sglang_meta = (package["metadata"] or {}).get("sglang", {})
         if "python-module" not in sglang_meta:
             continue
-        extensions.append(
-            RustExtension(
-                target=sglang_meta["python-module"],
-                path=package["manifest_path"],
-                binding=Binding.PyO3,
-                debug=sglang_meta.get("debug"),
-                # Crates that gate their PyO3 bindings behind a non-default
-                # feature (so the pure-Rust core stays pyo3-free) declare it here.
-                features=sglang_meta.get("features"),
-            )
+        extension = RustExtension(
+            target=sglang_meta["python-module"],
+            path=package["manifest_path"],
+            binding=Binding.PyO3,
+            debug=sglang_meta.get("debug"),
+            # Crates that gate their PyO3 bindings behind a non-default
+            # feature (so the pure-Rust core stays pyo3-free) declare it here.
+            features=sglang_meta.get("features"),
+            cargo_manifest_args=["--locked"],
         )
+        # Preserve Cargo metadata until the selected extension is actually
+        # built. Alternate platform pyprojects filter the Rust TreeCore extension
+        # out before this point and therefore do not need torch as a build dependency.
+        extension._sglang_metadata = sglang_meta
+        extension._sglang_manifest_path = package["manifest_path"]
+        extensions.append(extension)
     if not extensions:
         raise RuntimeError(
             f"no crate under {_RUST_WORKSPACE_DIR} declares "
@@ -187,6 +218,19 @@ if build_rust is not None:
 
     class BuildRust(build_rust):
         """Build only the Rust extensions selected by SGLANG_BUILD_RUST_EXTS."""
+
+        def run_for_extension(self, extension) -> None:
+            metadata = extension._sglang_metadata
+            compat_header = metadata.get("torch-compat-header")
+            if compat_header is not None:
+                manifest = Path(extension._sglang_manifest_path)
+                build = _torch_build_configuration(
+                    compat_header=manifest.parent / compat_header,
+                    python_module=extension.name,
+                    include_absolute_rpath=False,
+                )
+                extension.env.env = build.environment
+            super().run_for_extension(extension)
 
         def run(self) -> None:
             rust_extensions = _selected_rust_extensions(self.extensions or [])

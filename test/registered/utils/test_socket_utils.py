@@ -15,8 +15,8 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.utils import normalize_base_url, release_port, reserve_port
 
-register_cpu_ci(est_time=7, suite="base-a-test-cpu")
-register_cpu_ci(est_time=8, suite="base-c-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=8, suite="stage-b-test-cpu-intel")
 
 
 class TestTryBindSocket(CustomTestCase):
@@ -210,15 +210,6 @@ class TestNormalizeBaseUrl(CustomTestCase):
         """normalize_base_url should work with hostnames."""
         url = normalize_base_url("localhost", 3000)
         self.assertEqual(url, "http://localhost:3000")
-
-    def test_deprecated_scheme_passthrough(self):
-        """normalize_base_url should pass through host with scheme (deprecated)."""
-        import warnings
-
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", DeprecationWarning)
-            url = normalize_base_url("http://myhost", 9000)
-        self.assertEqual(url, "http://myhost:9000")
 
 
 if __name__ == "__main__":

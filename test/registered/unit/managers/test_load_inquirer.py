@@ -12,7 +12,7 @@ from sglang.srt.managers.scheduler_components.load_inquirer import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class TestSchedulePolicyWaitingQueueMatching(unittest.TestCase):
@@ -31,16 +31,19 @@ class TestSchedulePolicyWaitingQueueMatching(unittest.TestCase):
         policy.tree_cache = SimpleNamespace(supports_fast_match_prefix=lambda: True)
         self.assertTrue(policy.waiting_queue_prefix_matched([]))
 
-    def test_lpm_queue_limit_can_disable_matching(self):
+    def test_lpm_queue_limit_respects_fast_matching_capability(self):
         policy = self.make_policy(CacheAwarePolicy.LPM, False)
         self.assertTrue(policy.waiting_queue_prefix_matched([None] * 128))
         self.assertFalse(policy.waiting_queue_prefix_matched([None] * 129))
+
+        policy.tree_cache = SimpleNamespace(supports_fast_match_prefix=lambda: True)
+        self.assertTrue(policy.waiting_queue_prefix_matched([None] * 129))
 
 
 class TestSchedulerLoadInquirer(unittest.TestCase):
     def make_inquirer(self, waiting_queue_prefix_matched):
         waiting_req = SimpleNamespace(seqlen=100, num_matched_prefix_tokens=20)
-        chunked_req = SimpleNamespace(seqlen=50, prefix_indices=range(10))
+        chunked_req = SimpleNamespace(seqlen=50, prefix_len=10)
         return SimpleNamespace(
             disaggregation_mode=DisaggregationMode.NULL,
             get_waiting_queue=lambda: [waiting_req],

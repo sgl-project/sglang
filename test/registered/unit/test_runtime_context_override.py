@@ -8,12 +8,14 @@ field aborts before any write; provenance is recorded.
 
 import unittest
 
+import msgspec
+
 from sglang.srt import runtime_context as rc
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class TestContextOverride(CustomTestCase):
@@ -31,11 +33,15 @@ class TestContextOverride(CustomTestCase):
 
     def test_override_writes_bag_not_server_args(self):
         sa = self._publish()
-        before = sa.hicache_ratio
+        # The published leaf, not the field: `hicache_ratio` is resolved by
+        # declaration, so the field still holds what the caller passed.
+        before = rc.get_memory().hicache_ratio
+        pristine = sa.hicache_ratio
         rc.get_context().override("test", hicache_ratio=before + 1.0)
         self.assertEqual(rc.get_memory().hicache_ratio, before + 1.0)
-        # server_args stays the pristine startup record.
-        self.assertEqual(sa.hicache_ratio, before)
+        # server_args stays the pristine startup record: the override does not
+        # touch it, and neither did resolution.
+        self.assertEqual(sa.hicache_ratio, pristine)
 
     def test_override_routes_across_namespaces(self):
         self._publish()
@@ -106,7 +112,7 @@ class TestContextOverride(CustomTestCase):
         # server_args is read-only after resolution: resolved config changes go
         # to the bags, a per-runner config to a derived variant.
         sa = ServerArgs(model_path="dummy")
-        object.__setattr__(sa, "_declarations_materialized", True)
+        msgspec.Struct.__setattr__(sa, "_resolution_finished", True)
         with self.assertRaises(AttributeError):
             sa.page_size = 999
 

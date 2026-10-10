@@ -12,6 +12,7 @@ in a functional manner, reducing the need for explicit parameter passing.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import pprint
 from collections import Counter
@@ -38,12 +39,15 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     init_logger,
 )
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestMetrics
-from sglang.multimodal_gen.utils import align_to
 from sglang.srt.observability.trace import TraceNullContext, TraceReqContext
 
 logger = init_logger(__name__)
 
 SAMPLING_PARAMS_FIELDS = {f.name for f in fields(SamplingParams)}
+
+
+def _align_to(value: int, alignment: int) -> int:
+    return int(math.ceil(value / alignment) * alignment)
 
 
 @dataclass
@@ -78,6 +82,7 @@ class Req:
     """
 
     sampling_params: SamplingParams | None = None
+    runtime_lora_scale: float = 1.0
 
     generator: torch.Generator | list[torch.Generator] | None = None
 
@@ -108,6 +113,10 @@ class Req:
     pooled_embeds: list[torch.Tensor] = field(default_factory=list)
     neg_pooled_embeds: list[torch.Tensor] = field(default_factory=list)
 
+    # GLM-Image autoregressive prior tokens
+    prior_token_id: torch.Tensor | None = None
+    prior_token_image_ids: torch.Tensor | list[torch.Tensor] | None = None
+
     # Additional text-related parameters
     max_sequence_length: int | None = None
     prompt_template: dict[str, Any] | None = None
@@ -137,6 +146,7 @@ class Req:
     did_sp_shard_audio_latents: bool = False
     sp_audio_start_frame: int = 0
     sp_audio_orig_num_frames: int = 0
+    sp_audio_has_padding: bool = False
 
     # Audio Parameters
     generate_audio: bool = True
@@ -147,7 +157,8 @@ class Req:
     raw_latent_shape: torch.Tensor | None = None
     did_sp_shard_latents: bool = False
     sp_video_start_frame: int = 0
-    noise_pred: torch.Tensor | None = None
+    sp_video_has_padding: bool = False
+    noise_pred: torch.Tensor | list | tuple | None = None
     # vae-encoded condition image
     image_latent: torch.Tensor | list[torch.Tensor] | None = None
     condition_image_latent_ids: torch.Tensor | list[torch.Tensor] | None = None
@@ -337,12 +348,42 @@ class Req:
         self.suppress_logs = True
         self.metrics.suppress_stage_breakdown = True
         self.extra["cache_dit_num_inference_steps"] = self.num_inference_steps
-        self.num_inference_steps = warmup_steps
+        self.extra["warmup_target_num_inference_steps"] = self.num_inference_steps
+        floor = getattr(type(self.sampling_params), "min_num_inference_steps", 1)
+        self.num_inference_steps = max(warmup_steps, floor)
 
     def copy_as_warmup(self, warmup_steps: int = 1) -> Req:
         req = deepcopy(self)
         req.set_as_warmup(warmup_steps)
         return req
+
+    def record_stage_iterations(
+        self,
+        measured_iterations: int,
+        target_iterations: int | None = None,
+    ) -> None:
+        """Record a stage loop against its full default-request work.
+
+        Most stages declare the count as a formula of the step count
+        (``PipelineStage.default_workload_iterations``) and never call this.
+        It is for loops whose length is only known inside them (chunked or
+        block-wise schedules); ``target_iterations`` defaults to scaling the
+        measured count from the probe's steps to the default workload's.
+        """
+        if not self.is_warmup or self.metrics is None:
+            return
+        measured = max(1, int(measured_iterations))
+        if target_iterations is None:
+            measured_request_steps = max(1, int(self.num_inference_steps))
+            target_request_steps = int(
+                self.extra.get(
+                    "warmup_target_num_inference_steps", measured_request_steps
+                )
+            )
+            target_iterations = (
+                measured * max(1, target_request_steps) + measured_request_steps - 1
+            ) // measured_request_steps
+        self.metrics.record_stage_iterations(measured, target_iterations)
 
     def validate(self):
         """Initialize dependent fields after dataclass initialization."""
@@ -353,13 +394,7 @@ class Req:
             self.metrics = RequestMetrics(request_id=self.request_id)
             return
 
-        # Prefer true_cfg_scale when it is explicitly provided.
-        cfg_scale = (
-            self.true_cfg_scale
-            if self.true_cfg_scale is not None
-            else self.guidance_scale
-        )
-        if cfg_scale > 1.0 and self.negative_prompt is not None:
+        if self.sampling_params.should_use_classifier_free_guidance():
             self.do_classifier_free_guidance = True
         if self.negative_prompt_embeds is None:
             self.negative_prompt_embeds = []
@@ -392,11 +427,11 @@ class Req:
 
         # TODO: in some cases (e.g., TI2I), height and weight might be undecided at this moment
         if self.height:
-            target_height = align_to(self.height, 16)
+            target_height = _align_to(self.height, 16)
         else:
             target_height = -1
         if self.width:
-            target_width = align_to(self.width, 16)
+            target_width = _align_to(self.width, 16)
         else:
             target_width = -1
 
@@ -433,6 +468,13 @@ class Req:
                  save_output: {self.save_output}
             output_file_path: {self.output_file_path()}
         """  # type: ignore[attr-defined]
+        # Add model-specific fields if present
+        bot_task = getattr(self, "bot_task", None)
+        system_prompt = getattr(self, "system_prompt", None)
+        if bot_task is not None:
+            debug_str += f"            bot_task: {bot_task}\n"
+        if system_prompt is not None:
+            debug_str += f"               system_prompt: {system_prompt}\n"
         logger.info(debug_str)
 
 
@@ -449,6 +491,12 @@ class OutputBatch:
     raw_frame_metadata: dict[str, Any] | None = None
     audio: torch.Tensor | None = None
     audio_sample_rate: int | None = None
+    # The effective fps the worker actually produced ``output`` at (e.g. a model whose input
+    # stage resamples / resolves the request's nominal fps to a source-derived one, such as
+    # Kandinsky6 SR). ``None`` means the worker did not resolve its own fps; callers that save
+    # ``output`` client-side (return_file_paths_only=False) then fall back to the originating
+    # request's own fps field, as before this field existed.
+    fps: int | None = None
     action_pred: torch.Tensor | None = None
     action_mode: str | None = None
     action_domain_id: int | None = None
@@ -465,7 +513,7 @@ class OutputBatch:
     metrics_list: Optional[list[Optional[RequestMetrics]]] = None
 
     # For ComfyUI integration: noise prediction from denoising stage
-    noise_pred: torch.Tensor | None = None
+    noise_pred: torch.Tensor | list | tuple | None = None
     peak_memory_mb: float = 0.0
     usage: dict[str, Any] | None = None
 

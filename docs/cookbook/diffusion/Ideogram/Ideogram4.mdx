@@ -1,5 +1,6 @@
 ---
 title: Ideogram 4
+description: "Deploy Ideogram 4 with SGLang Diffusion for high-aesthetic text-to-image generation."
 metatags:
     description: "Deploy Ideogram 4 with SGLang Diffusion for high-aesthetic text-to-image generation."
 ---
@@ -8,7 +9,31 @@ import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
 
 <DiffusionModelTags tags={["image", "text-to-image", "typography", "8/20-step distilled", "NF4 / FP8 / NVFP4"]} />
 
-## 1. Model Introduction
+import { Deployment } from '/src/snippets/_deployment.jsx';
+import { config } from '/src/snippets/configs/Ideogram/ideogram4.jsx';
+
+## 1. Quick start
+
+Follow the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installation) for your GPU platform.
+
+Set `HF_TOKEN` with access to the gated Ideogram repositories. Install `bitsandbytes>=0.46.1` and `accelerate>=1.1.0` for NF4 and the shared NF4 text encoder.
+
+<Accordion title="Installation and prerequisites">
+
+<a id="2-prerequisites" />
+
+- NVIDIA CUDA GPU.
+- SGLang installed with diffusion dependencies.
+- `bitsandbytes>=0.46.1` and `accelerate>=1.1.0` for the NF4 checkpoint and the fal variants' shared NF4 text encoder.
+- `HF_TOKEN` with access to the Ideogram 4 gated repositories.
+
+</Accordion>
+
+<Deployment config={config} />
+
+<a id="1-model-introduction" />
+
+## 2. Model capabilities
 
 [Ideogram 4](https://huggingface.co/ideogram-ai/ideogram-4-nf4) is a text-to-image family focused on polished composition and typography-aware generation. SGLang supports the official NF4 and FP8 checkpoints, Comfy-Org's NVFP4 transformer, and fal's distilled Fast and Instant variants.
 
@@ -23,13 +48,6 @@ Choose NF4 when memory is the primary constraint, FP8/NVFP4 for supported accele
 | Instant | `fal/ideogram-v4-instant` | 8-step, CFG- and timestep-distilled BF16 checkpoint. Defaults to `V4_INSTANT_8`. |
 
 The fal repositories contain only the transformer component. When either model ID is passed directly to `--model-path`, SGLang loads the text encoder, tokenizer, VAE, and scheduler from the `ideogram-ai/ideogram-4-nf4-diffusers` revision referenced by fal's model cards, then runs the distilled transformer without the unconditional branch.
-
-## 2. Prerequisites
-
-- NVIDIA CUDA GPU.
-- SGLang installed with diffusion dependencies.
-- `bitsandbytes>=0.46.1` and `accelerate>=1.1.0` for the NF4 checkpoint and the fal variants' shared NF4 text encoder.
-- `HF_TOKEN` with access to the Ideogram 4 gated repositories.
 
 ## 3. Serve the model
 
@@ -187,3 +205,15 @@ response = client.images.generate(
 ```
 
 Base Ideogram 4 presets are `V4_DEFAULT_20`, `V4_QUALITY_48`, and `V4_TURBO_12`. The fal variants automatically select `V4_FAST_20` and `V4_INSTANT_8`, respectively. A preset controls both `num_inference_steps` and guidance, so do not set those fields directly.
+
+You can also produce captions with a separate SRT LLM using
+[prompt enhancement](/docs/sglang-diffusion/models_with_pe). Configure an
+Ideogram-specific JSON caption template and schema; the generic prose template
+is not appropriate for these checkpoints. This does not reproduce fal's
+checkpoint-specific prompt expander or establish equivalent image quality.
+
+## 5. Run in ComfyUI
+
+import { ComfyUISupport } from '/src/snippets/diffusion/comfyui-support.jsx';
+
+<ComfyUISupport model="image" />

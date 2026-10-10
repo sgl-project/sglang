@@ -1,9 +1,12 @@
+import fcntl
 import logging
 import math
 import os
 import time
 from contextlib import contextmanager, nullcontext
 from enum import IntEnum, auto
+from functools import partial
+from pathlib import Path
 from typing import Dict, List, Tuple
 
 import torch
@@ -14,14 +17,18 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     restore_symmetric_memory_context,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM
+from sglang.srt.layers.deep_gemm_wrapper.configurer import (
+    DEEPGEMM_NEED_TMA_ALIGNED_SCALES,
+    DEEPGEMM_SCALE_UE8M0,
+    ENABLE_JIT_DEEPGEMM,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import (
+    get_device,
     get_disagg,
     get_parallel,
     get_schedule,
 )
-from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import ceil_align, ceil_div, get_available_gpu_memory, is_musa
 
 logger = logging.getLogger(__name__)
@@ -49,7 +56,7 @@ os.environ["DG_JIT_CACHE_DIR"] = envs.SGLANG_DG_CACHE_DIR.get()
 os.environ["DG_JIT_USE_NVRTC"] = os.getenv("SGL_DG_USE_NVRTC", "0")
 
 
-def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
+def update_deep_gemm_config(gpu_id: int):
     global _BUILTIN_M_LIST
     global _DO_COMPILE_ALL
     global _IS_FIRST_RANK_ON_NODE
@@ -94,7 +101,7 @@ def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
         m_max = min(1024 * 128, m_max)
         _BUILTIN_M_LIST += list(range(1, m_max + 1))
 
-    _IS_FIRST_RANK_ON_NODE = server_args.base_gpu_id == gpu_id
+    _IS_FIRST_RANK_ON_NODE = get_device().base_gpu_id == gpu_id
 
     # Check if is the first rank on node.
     # Default each rank will try compile all Ms to
@@ -109,10 +116,34 @@ class DeepGemmKernelType(IntEnum):
     GROUPED_GEMM_NT_BF16_MASKED = auto()
     GROUPED_GEMM_NT_BF16_CONTIG = auto()
     GEMM_NT_F8F8BF16 = auto()
+    GEMM_NT_F8F8BF16_BLOCK32 = auto()
     GEMM_NT_BF16BF16F32 = auto()
 
 
 _INITIALIZATION_DICT: Dict[Tuple[DeepGemmKernelType, int, int, int], bool] = dict()
+
+
+@contextmanager
+def _local_rank_compile_lock(
+    kernel_type: DeepGemmKernelType, n: int, k: int, num_groups: int
+):
+    """Serialize one pre-compile group across the ranks sharing DG_JIT_CACHE_DIR.
+
+    Every rank lazily walks the same (kernel_type, n, k, num_groups) groups in
+    the same order, so without a lock N local ranks nvcc-compile N identical
+    copies of every kernel. The lock holder compiles into the shared cache;
+    waiters then find the cubins already present and their pass over the M
+    list is execution warmup only.
+    """
+    lock_dir = Path(os.environ["DG_JIT_CACHE_DIR"]) / "locks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = lock_dir / f"{kernel_type.name}_n{n}_k{k}_g{num_groups}.lock"
+    with open(lock_path, "w") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
 
 
 # TODO improve code
@@ -151,13 +182,14 @@ def _maybe_compile_deep_gemm_one_type_all(
             f"{' It only takes a little time (typically 1 sec) if you have run `python3 -m sglang.compile_deep_gemm`. ' if not _IN_PRECOMPILE_STAGE else ''}"
         )
 
-        _compile_deep_gemm_one_type_all(
-            kernel_type=kernel_type,
-            n=n,
-            k=k,
-            num_groups=num_groups,
-            m_list=_BUILTIN_M_LIST,
-        )
+        with _local_rank_compile_lock(kernel_type, n, k, num_groups):
+            _compile_deep_gemm_one_type_all(
+                kernel_type=kernel_type,
+                n=n,
+                k=k,
+                num_groups=num_groups,
+                m_list=_BUILTIN_M_LIST,
+            )
 
 
 # NOTE(alcanderian): get_num_sms should be change when 2-batch-overlap is introduced
@@ -239,6 +271,9 @@ class _BaseWarmupExecutor:
     def create(kernel_type: DeepGemmKernelType, **kwargs):
         return {
             DeepGemmKernelType.GEMM_NT_F8F8BF16: _NormalWarmupExecutor,
+            DeepGemmKernelType.GEMM_NT_F8F8BF16_BLOCK32: partial(
+                _NormalWarmupExecutor, block_size=32
+            ),
             DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG: _GroupedContWarmupExecutor,
             DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED: _GroupedMaskedWarmupExecutor,
             DeepGemmKernelType.GEMM_NT_BF16BF16F32: _BF16F32WarmupExecutor,
@@ -249,13 +284,51 @@ class _BaseWarmupExecutor:
     @staticmethod
     def get_memory_requirement(
         kernel_type: DeepGemmKernelType, max_m: int, n: int, k: int, num_groups: int
-    ) -> int:
-        # Return the required memory space in GB for warmup executor
+    ) -> float:
+        # FP32 input scales remain live while DeepGEMM converts their layout.
         _GB = 1 << 30
-        if kernel_type == DeepGemmKernelType.GEMM_NT_F8F8BF16:
-            return (max_m * k + n * k + max_m * n * 2) / _GB
+        is_dense_fp8 = kernel_type in (
+            DeepGemmKernelType.GEMM_NT_F8F8BF16,
+            DeepGemmKernelType.GEMM_NT_F8F8BF16_BLOCK32,
+        )
+        block_size = (
+            32
+            if kernel_type == DeepGemmKernelType.GEMM_NT_F8F8BF16_BLOCK32
+            else _BLOCK_SIZE
+        )
+        lhs_scales = max_m * ceil_div(k, block_size) * 4
+        rhs_scales = ceil_div(n, block_size) * ceil_div(k, block_size) * 4
+        scale_workspace = _get_fp8_scale_workspace(
+            max_m,
+            n,
+            k,
+            lhs_groups=(
+                num_groups
+                if kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED
+                else 1
+            ),
+            rhs_groups=1 if is_dense_fp8 else num_groups,
+            block_size=block_size,
+        )
+        if is_dense_fp8:
+            return (
+                max_m * k
+                + n * k
+                + max_m * n * 2
+                + lhs_scales
+                + rhs_scales
+                + scale_workspace
+            ) / _GB
         elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG:
-            return (max_m * k + num_groups * n * k + max_m * 4 + max_m * n * 2) / _GB
+            return (
+                max_m * k
+                + num_groups * n * k
+                + max_m * 4
+                + max_m * n * 2
+                + lhs_scales
+                + scale_workspace
+                + num_groups * rhs_scales
+            ) / _GB
         elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_BF16_CONTIG:
             return (
                 max_m * k * 2 + num_groups * n * k * 2 + max_m * 4 + max_m * n * 2
@@ -266,6 +339,8 @@ class _BaseWarmupExecutor:
                 + num_groups * n * k
                 + num_groups * 4
                 + num_groups * max_m * n * 2
+                + num_groups * (lhs_scales + rhs_scales)
+                + scale_workspace
             ) / _GB
         elif kernel_type == DeepGemmKernelType.GEMM_NT_BF16BF16F32:
             # bf16 lhs + bf16 rhs + fp32 out
@@ -284,22 +359,49 @@ class _BaseWarmupExecutor:
         raise NotImplementedError
 
 
-def _empty_token_fp8(size):
+def _packed_scale_workspace(rows: int, cols: int, groups: int) -> tuple[int, int]:
+    packed_bytes = groups * ceil_align(rows, 4) * ceil_div(cols, 4) * 4
+    peak_bytes = packed_bytes
+    if groups > 1 and rows * cols % 4:
+        # DeepGEMM's PyTorch fallback keeps the initial packed allocation while
+        # shifting FP32 bits to uint8, padding, and transposing a second copy.
+        token_scales = groups * rows * cols
+        peak_bytes += max(5 * token_scales, token_scales + 2 * packed_bytes)
+    return packed_bytes, peak_bytes
+
+
+def _get_fp8_scale_workspace(
+    max_m: int, n: int, k: int, lhs_groups: int, rhs_groups: int, block_size: int = 128
+) -> int:
+    scale_k = ceil_div(k, block_size)
+    if DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
+        return lhs_groups * ceil_align(max_m, 4) * scale_k * 4
+    if DEEPGEMM_SCALE_UE8M0:
+        lhs_packed, lhs_peak = _packed_scale_workspace(max_m, scale_k, lhs_groups)
+        _, rhs_peak = _packed_scale_workspace(n, scale_k, rhs_groups)
+        # RHS block scales are broadcast to token scales before packing. The
+        # int64 index tensor dies before packing; the packed LHS stays live.
+        rhs_broadcast = rhs_groups * n * scale_k * 4
+        return max(lhs_peak, lhs_packed + rhs_broadcast + max(n * 8, rhs_peak))
+    return 0
+
+
+def _empty_token_fp8(size, block_size=128):
     *dims, k = size
     return (
         torch.empty(size, device="cuda", dtype=torch.float8_e4m3fn),
         torch.ones(
-            (*dims, ceil_div(k, _BLOCK_SIZE)), device="cuda", dtype=torch.float32
+            (*dims, ceil_div(k, block_size)), device="cuda", dtype=torch.float32
         ),
     )
 
 
-def _empty_block_fp8(size):
+def _empty_block_fp8(size, block_size=128):
     *dims, n, k = size
     return (
         torch.empty(size, device="cuda", dtype=torch.float8_e4m3fn),
         torch.ones(
-            (*dims, ceil_div(n, _BLOCK_SIZE), ceil_div(k, _BLOCK_SIZE)),
+            (*dims, ceil_div(n, block_size), ceil_div(k, block_size)),
             device="cuda",
             dtype=torch.float32,
         ),
@@ -310,9 +412,12 @@ _BLOCK_SIZE = 128
 
 
 class _NormalWarmupExecutor(_BaseWarmupExecutor):
-    def __init__(self, max_m: int, n: int, k: int, num_groups: int):
-        self.lhs_q, self.lhs_s = _empty_token_fp8((max_m, k))
-        self.rhs_q, self.rhs_s = _empty_block_fp8((n, k))
+    def __init__(
+        self, max_m: int, n: int, k: int, num_groups: int, block_size: int = 128
+    ):
+        self.recipe = (1, block_size, block_size)
+        self.lhs_q, self.lhs_s = _empty_token_fp8((max_m, k), block_size)
+        self.rhs_q, self.rhs_s = _empty_block_fp8((n, k), block_size)
         self.out = torch.empty((max_m, n), device="cuda", dtype=torch.bfloat16)
 
     def execute(self, m):
@@ -320,6 +425,7 @@ class _NormalWarmupExecutor(_BaseWarmupExecutor):
             (self.lhs_q[:m], self.lhs_s[:m]),
             (self.rhs_q, self.rhs_s),
             self.out[:m],
+            recipe=self.recipe,
         )
 
 
@@ -451,7 +557,7 @@ def pp_parallel_deep_gemm_warmup(runner) -> None:
     cp = max(get_cp_padding_align_size(), 1)
 
     attn_tp_size = get_parallel().attn_tp_size
-    mlp_sync = require_mlp_sync(model_runner.server_args)
+    mlp_sync = require_mlp_sync()
 
     def _align(bs: int) -> int:
         # Align to lcm(cp, attn_tp_size) so the CP multiple isn't undone by a
@@ -483,8 +589,8 @@ def pp_parallel_deep_gemm_warmup(runner) -> None:
     logger.info(
         "PP-parallel DeepGEMM warmup start "
         "(pp_rank=%d, tp_rank=%d, batch_sizes=%s, disagg=%s).",
-        model_runner.ps.pp_rank,
-        model_runner.ps.tp_rank,
+        get_parallel().pp_rank,
+        get_parallel().tp_rank,
         batch_sizes,
         disagg_mode,
     )
@@ -512,5 +618,5 @@ def pp_parallel_deep_gemm_warmup(runner) -> None:
     logger.info(
         "PP-parallel DeepGEMM warmup done in %.2fs (pp_rank=%d).",
         time.perf_counter() - t0,
-        model_runner.ps.pp_rank,
+        get_parallel().pp_rank,
     )
