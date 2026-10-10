@@ -437,7 +437,14 @@ def _extend_blocked(
     h_out = None
     h_pos = 0
     num_chunks = sum(-(-n // _KDA_CHUNK_TOKENS) for n in seq_lens)
-    common = dict(common, fuse_intra=q.shape[0] * num_chunks * q.shape[-2] <= 256)
+    # Precomputed chunk tables describe the whole extend; each block builds
+    # its own from its cu_seqlens.
+    common = {
+        key: value
+        for key, value in common.items()
+        if key not in ("chunk_indices", "chunk_offsets")
+    }
+    common["fuse_intra"] = q.shape[0] * num_chunks * q.shape[-2] <= 256
 
     def run(s, e, cu_list, initial_state, indices, seq_start, seq_end, chunk_offset=0):
         nonlocal h_out, h_pos

@@ -216,6 +216,7 @@ def _run(
     track_state=None,
     track_chunk_idx=None,
     lower_bound=-5.0,
+    chunk_tables=None,
 ):
     """Run extend with SGLANG_KDA_EXTEND_BLOCK_TOKENS=block on a fresh pool
     copy. ``kernel`` replaces kda_triton.chunk_kda for the call; ``seq_lens``
@@ -245,6 +246,11 @@ def _run(
             return_intermediate_states=return_intermediate_states,
             track_state=track_state,
             track_chunk_idx=track_chunk_idx,
+            **(
+                dict(chunk_indices=chunk_tables[0], chunk_offsets=chunk_tables[1])
+                if chunk_tables is not None
+                else {}
+            ),
         )
     if return_intermediate_states:
         o, h = out
@@ -517,6 +523,7 @@ class _FakeChunkKda:
                 tokens=q.shape[1],
                 cu=cu,
                 fuse_intra=kwargs.get("fuse_intra"),
+                chunk_tables=(kwargs.get("chunk_indices"), kwargs.get("chunk_offsets")),
                 indices=indices,
                 state=initial_state,
                 cu_seqlens=cu_seqlens,
@@ -761,6 +768,22 @@ class TestKdaExtendBlockedPlan(CustomTestCase, _Checks):
                 single = _FakeChunkKda()
                 _run(0, inputs, kernel=single)
                 self.assertEqual([c["fuse_intra"] for c in single.calls], [None])
+
+    def test_blocks_build_their_own_chunk_tables(self):
+        # Chunk tables passed by the caller index the whole extend; a block
+        # call must derive its own from its cu_seqlens.
+        inputs = _int_inputs(SEQ_LENS, SLOT_INDICES)
+        tables = (torch.zeros(4, 2, dtype=torch.int32), torch.zeros(5, dtype=torch.int32))
+        single = _FakeChunkKda()
+        _run(0, inputs, kernel=single, chunk_tables=tables)
+        self.assertIs(single.calls[0]["chunk_tables"][0], tables[0])
+        self.assertIs(single.calls[0]["chunk_tables"][1], tables[1])
+        blocked = _FakeChunkKda()
+        _run(BLOCK, inputs, kernel=blocked, chunk_tables=tables)
+        self.assertEqual([c["tokens"] for c in blocked.calls], CALLS)
+        self.assertEqual(
+            [c["chunk_tables"] for c in blocked.calls], [(None, None)] * len(CALLS)
+        )
 
     def test_standard_gate_reference_values(self):
         # The expected values the GPU standard-gate regression checks against.
