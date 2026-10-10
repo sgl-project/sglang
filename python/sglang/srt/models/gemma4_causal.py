@@ -55,7 +55,11 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
-from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.base_config import (
+    QuantizationConfig,
+    QuantizeMethodBase,
+)
+from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
@@ -76,6 +80,58 @@ from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
 from sglang.srt.utils import add_prefix, make_pp_layers
 
 logger = logging.getLogger(__name__)
+
+
+class _SharedKVScaleMethod(QuantizeMethodBase):
+    """Finalize an FP8 writer once, then publish its scales to sharing readers."""
+
+    def __init__(self, method, *, reader=False):
+        self.method = method
+        self.reader = reader
+        self.readers = []
+
+    def create_weights(self, layer, *args, **kwargs):
+        return self.method.create_weights(layer, *args, **kwargs)
+
+    def apply(self, layer, *args, **kwargs):
+        return self.method.apply(layer, *args, **kwargs)
+
+    def restore_weights_before_loading(self, layer):
+        return self.method.restore_weights_before_loading(layer)
+
+    def process_weights_after_loading(self, layer):
+        if self.reader:
+            return
+        self.method.process_weights_after_loading(layer)
+        for reader in self.readers:
+            reader.k_scale.copy_(layer.k_scale)
+            reader.v_scale.copy_(layer.v_scale)
+            reader.k_scale_float = layer.k_scale_float
+            reader.v_scale_float = layer.v_scale_float
+
+
+def _bind_shared_fp8_scales(layers, quant_config):
+    if getattr(quant_config, "kv_cache_quant_algo", None) != "FP8":
+        return
+    for decoder in layers:
+        attention = getattr(decoder, "self_attn", None)
+        if attention is None or not attention.is_kv_shared_layer:
+            continue
+        owner = layers[attention.kv_shared_layer_index]
+        if not hasattr(owner, "self_attn"):
+            raise ValueError(
+                "Calibrated FP8 KV sharing requires a writer on the same pipeline rank"
+            )
+        writer = owner.self_attn.attn
+        reader = attention.attn
+        if not isinstance(reader.quant_method, BaseKVCacheMethod):
+            continue
+        if isinstance(writer.quant_method, BaseKVCacheMethod):
+            writer.quant_method = _SharedKVScaleMethod(writer.quant_method)
+        if not isinstance(writer.quant_method, _SharedKVScaleMethod):
+            raise ValueError("Calibrated FP8 KV sharing requires a writer scale method")
+        writer.quant_method.readers.append(reader)
+        reader.quant_method = _SharedKVScaleMethod(reader.quant_method, reader=True)
 
 
 # Aligned with HF's implementation, using sliding window inclusive with the last token
@@ -920,6 +976,7 @@ class Gemma4TextModel(PreTrainedModel):
             ),
             prefix=add_prefix("layers", prefix),
         )
+        _bind_shared_fp8_scales(self.layers, quant_config)
 
         if self.pp_group.is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
