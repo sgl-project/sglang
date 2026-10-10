@@ -228,6 +228,9 @@ __global__ void fused_qknorm_rope_warp(const QKNormRopeParamsT<kPackKV, kOutOfPl
   constexpr uint32_t kRotaryLanes = kRopeDim / kElemsPerThread;
   constexpr uint32_t kHalfRotaryLanes = kRotaryLanes / 2;
   constexpr uint32_t kActiveMask = active_mask<kRotaryLanes>();
+#ifdef USE_ROCM
+  (void)kActiveMask;  // unused on ROCm: __shfl below takes a width, not a mask
+#endif
   constexpr int64_t kCacheRotaryDim = kCacheHasFullWidth ? 2 * kRopeDim : kRopeDim;
   constexpr int64_t kCosSinStrideBytes = kCacheRotaryDim * sizeof(CacheDType);
 
@@ -346,7 +349,20 @@ __global__ void fused_qknorm_rope_warp(const QKNormRopeParamsT<kPackKV, kOutOfPl
           for (uint32_t j = 0; j < kVecSize; ++j) {
             auto partner_vec = output_vec[j];
             auto partner_bits = reinterpret_cast<const uint32_t&>(partner_vec);
+#ifndef USE_ROCM
             partner_bits = __shfl_sync(kActiveMask, partner_bits, partner_lane);
+#else
+            // Two distinct problems, only the first of which fails to build.
+            // (1) HIP's __shfl_sync requires a 64-bit mask; kActiveMask is
+            //     uint32_t, so it trips a static_assert.
+            // (2) Its shuffle width defaults to the physical wave64, while
+            //     partner_lane indexes the kWarpThreads-wide (32) logical warp
+            //     this kernel builds on top of it -- so at width 64 the upper
+            //     half of every wave would read the lower half's lanes.
+            // Widening the mask alone would fix (1) and silently keep (2), so
+            // use the maskless __shfl and pass the width explicitly.
+            partner_bits = __shfl(partner_bits, partner_lane, device::kWarpThreads);
+#endif
             reinterpret_cast<uint32_t&>(partner_vec) = partner_bits;
             auto& values = unpack(output_vec[j]);
             const auto& partner_values = unpack(partner_vec);
@@ -425,7 +441,13 @@ __global__ void fused_qknorm_rope_warp(const QKNormRopeParamsT<kPackKV, kOutOfPl
 
 #pragma unroll
         for (uint32_t i = 0; i < kElemsPerThread; ++i) {
+#ifndef USE_ROCM
           float swapped = __shfl_sync(kActiveMask, elems[i], partner_lane);
+#else
+          // Same 32-wide logical warp as above; see the note at the packed
+          // path for why this is __shfl with an explicit width.
+          float swapped = __shfl(elems[i], partner_lane, device::kWarpThreads);
+#endif
           if (lane_id < kHalfRotaryLanes) {
             swapped = -swapped;
           }
