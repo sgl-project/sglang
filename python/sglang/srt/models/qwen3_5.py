@@ -1872,16 +1872,19 @@ class Qwen3_5ForCausalLM(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         input_deepstack_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
-        if self._dense_mono is not None and self._dense_mono.eligible(
-            input_ids,
-            forward_batch,
-            input_embeds,
-            pp_proxy_tensors,
-            input_deepstack_embeds,
-        ):
-            return self._dense_mono.forward(
-                input_ids, positions, forward_batch, input_embeds
+        if self._dense_mono is not None:
+            dense_mono_step = self._dense_mono.eligible(
+                input_ids,
+                forward_batch,
+                input_embeds,
+                pp_proxy_tensors,
+                input_deepstack_embeds,
             )
+            if dense_mono_step and self._dense_mono.whole_step:
+                return self._dense_mono.forward(
+                    input_ids, positions, forward_batch, input_embeds
+                )
+            self._dense_mono.set_gdn_step(dense_mono_step)
         if self._mono is not None and self._mono.eligible(
             input_ids, forward_batch, input_embeds, pp_proxy_tensors
         ):

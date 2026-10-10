@@ -1,19 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
-"""K1 for Qwen3.8-27B at TP1 (``dense_gdn_pre``): one GDN layer of a decode step
-from the layer's input (the previous layer's FFN output + residual) to the
-gated core (out_proj's input, ``dense_ffn``'s with ``oproj``), S <= 8 rows,
-one token a request. One launch, ``BLOCKS`` x ``THREADS``:
+"""K1 for Qwen3.8-27B at TP1 or TP2 (``dense_gdn_pre``): one GDN layer of a
+decode step from the layer's input (the previous layer's FFN output + residual;
+at TP2 after its all-reduce) to the gated core (out_proj's input, ``dense_ffn``'s
+with ``oproj``), S <= 8 rows, one token a request. At TP2 a rank runs its half
+of the heads (``Geo``) on the full input; nothing crosses ranks. One launch,
+``BLOCKS`` x ``THREADS`` (sizes at TP1, TP2 in brackets):
 
     front    (CTAs 0 .. 159, 32 hidden columns each): h + residual -> ``res_out``;
              sum-of-squares partials -> rstd -> input_layernorm (Gemma, 1 + w)
              -> bf16 x -> MXFP4 blocks put for every CTA -> the LDS x rows
-             (``dense_ffn``'s distributed norm)
-    in_proj  in_proj_qkvz: 1024 groups of 16 rows, CTA b groups 4 b ..; wave w
-             group w / 2, K half w % 2 -> bf16 PROJ entries. in_proj_ba: 6
-             groups x 8 K eighths on CTAs 0 .. 47 -> fp32 partials (BAP)
-    gdn      tasks of 8 state rows (48 value heads x 16 chunks a token: 3 S a
-             CTA), phase by phase over the CTA's tasks so each hand-off is
-             waited on once:
+             (``dense_ffn``'s distributed norm). With ``normed`` (the stock
+             input norm ran) every CTA quantizes the normed rows itself
+    in_proj  in_proj_qkvz: 1024 [512] groups of 16 rows, CTA b groups 4 b ..
+             [2 b ..]; wave w group w / 2, K half w % 2 -> bf16 PROJ entries.
+             in_proj_ba: 6 [3] groups x 8 K eighths on CTAs 0 .. 47 [23] -> fp32
+             partials (BAP)
+    gdn      tasks of 8 state rows (48 [24] value heads x 16 chunks a token:
+             3 S [ceil(1.5 S)] a CTA), phase by phase over the CTA's tasks so
+             each hand-off is waited on once:
                conv   the task's 8 v channels; the key head's first value head
                       also its 8 q and 8 k channels (out through QK). Window
                       updated in place, products rounded to bf16, SiLU -> bf16
@@ -30,12 +34,13 @@ rounding, lane layouts, reduction orders, FMA contractions and transcendental
 lowerings as their gfx950 code. A row whose state slot is -1 (a pad row) writes
 no state and a zero core row, as stock.
 
-Weights: in_proj_qkvz [q | k | v | z] and in_proj_ba [b | a] as MXFP4 in the
-(16, 16)-shuffled order (``dense_ffn.shuffle_w``), e8m0 scales [N, K / 32].
+Weights: in_proj_qkvz [q | k | v | z] and in_proj_ba [b | a] (the rank's) as
+MXFP4 in the (16, 16)-shuffled order (``dense_ffn.shuffle_w``), e8m0 scales [N, K / 32].
 """
 
 import struct
 from dataclasses import dataclass
+from typing import NamedTuple
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -58,6 +63,7 @@ from sglang.kernels.ops.moe.k3_mono_flydsl.common.ops import (
     rsrc,
     traced,
     uniform,
+    xred,
 )
 from sglang.kernels.ops.moe.k3_mono_flydsl.common.plan import (
     BLOCKS,
@@ -85,24 +91,16 @@ CONV = 2 * KEY + VAL  # 10240 conv channels: q | k | v
 CORE = VAL
 CONV_W = 4
 SL = CONV_W - 1
-V0 = 2 * KEY  # conv channel / PROJ entry of v
-Z0 = CONV  # PROJ entry of z
 
 STEPS = HIDDEN // D.STEP  # 40
-QG = QKVZ // ROWS  # 1024 qkvz groups
-QG_CTA = QG // BLOCKS  # 4
 Q_HALF = STEPS // 2  # 20
-BA_G = BA // ROWS  # 6
 BA_E = 8  # K eighths a ba group
 BA_STEPS = STEPS // BA_E  # 5
-BA_CTAS = BA_G * BA_E  # 48
 W_DW = HIDDEN // 8  # 640 dwords a weight row
 WS_DW = HIDDEN // 32 // 4  # 40 scale dwords a row
 
 VCH = 8  # state rows a task
 NVCH = HD // VCH  # 16
-TPT = NV * NVCH  # 768 tasks a token
-TPC = TPT // BLOCKS  # 3 a CTA a token
 CI = 3 * VCH  # conv items a task: 8 v, 8 q, 8 k
 SOFTPLUS_THRESHOLD = 20.0
 LOG2E = 1.4426950408889634
@@ -112,8 +110,71 @@ LOG2E = 1.4426950408889634
 VEC_ORDER = D.WAVE_ORDER
 ROW_ORDER = (16, 8, 4, 2, 1)
 
-assert QG == QG_CTA * BLOCKS and TPT == TPC * BLOCKS and VCH == WAVES
-assert BA_STEPS * BA_E == STEPS and QG_CTA * 2 == WAVES
+assert VCH == WAVES and BA_STEPS * BA_E == STEPS
+TP_SIZES = (1, 2)
+
+
+class Geo(NamedTuple):
+    """A rank's GDN shapes at tensor parallel size ``tp``: 1 / tp of the key and
+    value heads, each of in_proj_qkvz's q | k | v | z, in_proj_ba's b | a and
+    the conv's q | k | v sliced contiguously (the stock column-parallel split)."""
+
+    tp: int
+
+    @property
+    def nk(self) -> int:
+        return NK // self.tp
+
+    @property
+    def nv(self) -> int:
+        return NV // self.tp
+
+    @property
+    def key(self) -> int:
+        return self.nk * HD
+
+    @property
+    def val(self) -> int:
+        return self.nv * HD
+
+    @property
+    def qkvz(self) -> int:
+        return 2 * self.key + 2 * self.val
+
+    @property
+    def ba(self) -> int:
+        return 2 * self.nv
+
+    @property
+    def conv(self) -> int:
+        return 2 * self.key + self.val
+
+    @property
+    def qg_cta(self) -> int:
+        """qkvz groups of 16 rows a CTA (4 at TP1, 2 at TP2): wave w group w / 2."""
+        return self.qkvz // ROWS // BLOCKS
+
+    @property
+    def ba_ctas(self) -> int:
+        """CTAs of in_proj_ba: its groups x K eighths (48 at TP1, 24 at TP2)."""
+        return self.ba // ROWS * BA_E
+
+    @property
+    def tpt(self) -> int:
+        """Tasks a token (768 at TP1, 384 at TP2)."""
+        return self.nv * NVCH
+
+
+for _g in map(Geo, TP_SIZES):
+    assert _g.qg_cta * ROWS * BLOCKS == _g.qkvz and 2 * _g.qg_cta <= WAVES
+    assert _g.ba % ROWS == 0 and _g.ba_ctas <= BLOCKS and _g.nv % _g.nk == 0
+
+
+def n_tasks(geo: Geo, s: int) -> int:
+    """Tasks a CTA at S rows: task k of CTA b is ``k BLOCKS + b`` of the S x tpt
+    (3 S at TP1; at TP2 ceil(1.5 S), the last one dead on half the CTAs at odd S)."""
+    return (geo.tpt * s + BLOCKS - 1) // BLOCKS
+
 
 _STREAM = fx.Stream(None)
 
@@ -124,6 +185,9 @@ class K1Build:
     first: bool = False  # the model's first layer: no residual (residual := hidden)
     eps: float = 1e-6  # input_layernorm
     norm_eps: float = 1e-6  # the gated norm
+    tp: int = 1  # this rank's heads (``Geo``)
+    # hidden is input_layernorm's output (the stock norm ran): no add, no norm
+    normed: bool = False
     stamps: bool = False  # debug: per-CTA s_memrealtime stamps -> scratch "stamps"
     stop: int = 99  # debug: phases < stop (1 front, 2 in_proj, 3 gdn)
 
@@ -158,15 +222,15 @@ ABI = KernelAbi(
 
 
 def scratch_layout(key: K1Build) -> dict:
-    s = key.tokens
+    s, geo = key.tokens, Geo(key.tp)
     lay = pair_layout(
         (
             ("nsum", D.CHUNKS * s),
             ("xmb", s * D.O_CTAS * D.X_PAIRS),
-            ("proj", s * QKVZ),
-            ("bap", BA_CTAS * s * ROWS),
-            ("qk", s * NK * 2 * HD),
-            ("ov", s * NV * HD),
+            ("proj", s * geo.qkvz),
+            ("bap", geo.ba_ctas * s * ROWS),
+            ("qk", s * geo.nk * 2 * HD),
+            ("ov", s * geo.nv * HD),
         )
     )
     end = max(o + n for o, n in lay.values())
@@ -303,6 +367,43 @@ def front_z(c, raw):
     return z, lnw
 
 
+def x_loads(c):
+    """``normed``: chunk ``tid + 512 i`` (8 columns) of the S normed rows."""
+    s, tid, a = c["S"], c["tid"], c["args"]
+    n = s * D.CHUNKS
+    return [
+        D.ld4(rsrc(a["hidden"]), fx.min(tid + THREADS * i, n - 1) * 4)
+        for i in range((n + THREADS - 1) // THREADS)
+    ]
+
+
+@traced
+def x_quant(c, raw):
+    """``normed``: every CTA quantizes all S rows itself, by 32 columns (four
+    lanes a block, as ``dense_ffn.run_norm``) -> the LDS x rows."""
+    s, tid = c["S"], c["tid"]
+    n = s * D.CHUNKS
+    for i in range_constexpr(len(raw)):
+        ch_raw = tid + THREADS * i
+        ch = fx.min(ch_raw, n - 1)
+        t = ch // D.CHUNKS
+        col = ch % D.CHUNKS * 8
+        x = []
+        for d in range_constexpr(4):
+            x += [bf_lo(raw[i][d]), bf_hi(raw[i][d])]
+        amax = fx.Float32(0.0)
+        for e in range_constexpr(8):
+            amax = fx.max(amax, fx.Float32(fmath.absf(x[e])))
+        amax = xred(xred(amax, 1, fx.max), 2, fx.max)
+        code = D.mx_code(amax)
+        w = D.pack8(x, code)
+        if ch_raw < n:
+            fx.ptr_store(w, c["xq"] + (t * D.XQROW + col // 8))
+            if ch % 4 == 0:
+                fx.ptr_store(code, c["xs"] + (t * D.XSROW + col // 32))
+    gpu.barrier()
+
+
 # ---------------------------------------------------------------- in_proj
 def wloads(c, w, ws, nrows, row, steps):
     """This lane's tiles of (shuffled) weight row ``row`` at K steps ``steps``
@@ -322,31 +423,34 @@ def wloads(c, w, ws, nrows, row, steps):
 
 
 def qkvz_loads(c):
-    a, lane, wave, bid = c["args"], c["lane"], c["wave"], c["bid"]
-    row = (QG_CTA * bid + wave // 2) * ROWS + lane % ROWS
+    """Wave w: group w / 2 of the CTA's, K half w % 2; past the weight (no
+    traffic) when the CTA has fewer groups than 4."""
+    a, lane, wave, bid, geo = c["args"], c["lane"], c["wave"], c["bid"], c["G"]
+    row = (geo.qg_cta * bid + wave // 2) * ROWS + lane % ROWS
+    row = (wave < 2 * geo.qg_cta).select(row, fx.Int32(geo.qkvz))
     return wloads(
         c,
         a["w_qkvz"],
         a["w_qkvzs"],
-        QKVZ,
+        geo.qkvz,
         row,
         [wave % 2 * Q_HALF + i for i in range(Q_HALF)],
     )
 
 
 def ba_loads(c):
-    """CTA b < 48: group b / 8, K eighth b % 8, wave w < 5 its step w; the other
-    waves and CTAs past the weight."""
-    a, lane, wave, bid = c["args"], c["lane"], c["wave"], c["bid"]
+    """CTA b < ba_ctas: group b / 8, K eighth b % 8, wave w < 5 its step w; the
+    other waves and CTAs past the weight."""
+    a, lane, wave, bid, geo = c["args"], c["lane"], c["wave"], c["bid"], c["G"]
     row = (bid // BA_E) * ROWS + lane % ROWS
-    row = ((bid < BA_CTAS) & (wave < BA_STEPS)).select(row, fx.Int32(BA))
+    row = ((bid < geo.ba_ctas) & (wave < BA_STEPS)).select(row, fx.Int32(geo.ba))
     st = (bid % BA_E) * BA_STEPS + fx.min(wave, BA_STEPS - 1)
-    return wloads(c, a["w_ba"], a["w_bas"], BA, row, [st])
+    return wloads(c, a["w_ba"], a["w_bas"], geo.ba, row, [st])
 
 
 @traced
 def stage_qkvz(c, ops):
-    """The CTA's 4 groups: the two K halves in order -> bf16 PROJ."""
+    """The CTA's groups: the two K halves in order -> bf16 PROJ."""
     s, tid, lane, wave, red, bid = (
         c["S"],
         c["tid"],
@@ -358,19 +462,20 @@ def stage_qkvz(c, ops):
     acc = D.gu_mfmas(c, ops[0], ops[1], [wave % 2 * Q_HALF + i for i in range(Q_HALF)])
     fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
     gpu.barrier()
-    if tid < QG_CTA * ROWS * s:
+    geo = c["G"]
+    if tid < geo.qg_cta * ROWS * s:
         q = tid // (ROWS * s)
         rem = tid % (ROWS * s)
         t = rem // ROWS
         r = rem % ROWS
         v = bf16_round(row_sum(red, r, t, waves=(2 * q, 2 * q + 1)))
-        c["put"](c["proj"], t * QKVZ + (QG_CTA * bid + q) * ROWS + r, v)
+        c["put"](c["proj"], t * geo.qkvz + (geo.qg_cta * bid + q) * ROWS + r, v)
     gpu.barrier()
 
 
 @traced
 def stage_ba(c, ops):
-    """CTAs 0 .. 47: the eighth's fp32 partial (waves 0 .. 4 in order) -> BAP."""
+    """CTAs below ba_ctas: the eighth's fp32 partial (waves 0 .. 4 in order) -> BAP."""
     s, tid, lane, wave, red, bid = (
         c["S"],
         c["tid"],
@@ -395,7 +500,7 @@ def stage_ba(c, ops):
     )
     fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
     gpu.barrier()
-    if (bid < BA_CTAS) & (tid < ROWS * s):
+    if (bid < c["G"].ba_ctas) & (tid < ROWS * s):
         t2 = tid // ROWS
         r = tid % ROWS
         v = row_sum(red, r, t2, waves=tuple(range(BA_STEPS)))
@@ -404,21 +509,32 @@ def stage_ba(c, ops):
 
 # ---------------------------------------------------------------- gdn
 def task_of(c, k):
-    """The CTA's task k (a Python int): token, value head, chunk."""
-    w = (k % TPC) * BLOCKS + c["bid"]
-    return k // TPC, w // NVCH, w % NVCH
+    """The CTA's task k (``n_tasks``) -> token, value head, chunk and whether it
+    exists (None: all of them do). A dead task aliases the last live one: it may
+    read, never write."""
+    s, geo = c["S"], c["G"]
+    if geo.tpt % BLOCKS == 0:
+        # A whole number of tasks a token a CTA (TP1): no division by tpt.
+        tpc = geo.tpt // BLOCKS
+        w = (k % tpc) * BLOCKS + c["bid"]
+        return k // tpc, w // NVCH, w % NVCH, None
+    n = geo.tpt * s
+    g = k * BLOCKS + c["bid"]
+    ok = None if n % BLOCKS == 0 else g < n
+    if ok is not None:
+        g = fx.min(g, n - 1)
+    w = g % geo.tpt
+    return g // geo.tpt, w // NVCH, w % NVCH, ok
 
 
-def task_traced(c, k):
-    """Task k (traced) -> token, value head, chunk."""
-    w = (k % TPC) * BLOCKS + c["bid"]
-    return k // TPC, w // NVCH, w % NVCH
+def _live(pred, ok):
+    return pred if ok is None else pred & ok
 
 
 def recur_task(c, m):
     """Task pair m: waves 0 .. 3 take task 2 m, waves 4 .. 7 task 2 m + 1 (clamped)
     and whether it exists. Wave w % 4 holds rows 2 (w % 4) + lane / 32 of it."""
-    nt = TPC * c["S"]
+    nt = n_tasks(c["G"], c["S"])
     kk = 2 * m + c["wave"] // 4
     return fx.min(kk, nt - 1), kk < nt
 
@@ -427,18 +543,20 @@ def gdn_loads(c):
     """Every task pair's slot and state rows (the stock layout: 4 columns
     4 (lane % 32) .. a lane), issued before the first GDN hand-off; per conv
     item its window and weights."""
-    s, tid, a = c["S"], c["tid"], c["args"]
-    nt = TPC * s
-    g = {"live": [], "sbase": [], "st": [], "soff": []}
+    s, tid, a, geo = c["S"], c["tid"], c["args"], c["G"]
+    nt = n_tasks(geo, s)
+    g = {"valid": [], "live": [], "sbase": [], "st": [], "soff": []}
     for m in range((nt + 1) // 2):
         k, valid = recur_task(c, m)
-        t, h, ch = task_traced(c, k)
+        t, h, ch, ok = task_of(c, k)
+        valid = _live(valid, ok)
         slot = uniform(
             fx.Int32(bo.buffer_load(rsrc(a["st_idx"]), t, vec_width=1, dtype=T.i32))
         )
         sbase = a["rstate"] + fx.Int64(fx.max(slot, 0)) * fx.Int64(a["rs_seq"]) * 4
         row = ch * VCH + 2 * (c["wave"] % 4) + c["lane"] // 32
         soff = (h * HD + row) * HD + 4 * (c["lane"] % 32)
+        g["valid"].append(valid)
         g["live"].append(valid & (slot >= 0))
         g["sbase"].append(sbase)
         g["soff"].append(soff)
@@ -452,16 +570,13 @@ def gdn_loads(c):
         i = fx.min(tid + THREADS * r, ni - 1)
         k = i // CI
         cc = i % CI
-        # task k's (t, h, ch) from a traced k
-        w = (k % TPC) * BLOCKS + c["bid"]
-        t = k // TPC
-        h = w // NVCH
-        ch = w % NVCH
+        t, h, ch, ok = task_of(c, k)
         kh = h // HPK
         part = cc // VCH  # 0 v, 1 q, 2 k
         d = cc % VCH
         chan = (part == 0).select(
-            V0 + h * HD + ch * VCH + d, (part - 1) * KEY + kh * HD + ch * VCH + d
+            2 * geo.key + h * HD + ch * VCH + d,
+            (part - 1) * geo.key + kh * HD + ch * VCH + d,
         )
         slot = fx.Int32(bo.buffer_load(rsrc(a["st_idx"]), t, vec_width=1, dtype=T.i32))
         cs = a["conv_st"] + fx.Int64(fx.max(slot, 0)) * fx.Int64(a["cs_seq"]) * 2
@@ -486,7 +601,7 @@ def gdn_loads(c):
                 "co": co,
                 "win": win,
                 "cw": [bf_lo(cw[0]), bf_hi(cw[0]), bf_lo(cw[1]), bf_hi(cw[1])],
-                "live": live,
+                "live": _live(live, ok),
             }
         )
     g["items"] = items
@@ -498,9 +613,9 @@ def gdn_conv(c, g):
     """Every conv item: x (PROJ) -> window shifted in place; the width-4 conv
     (products rounded to bf16, fp32 sum in tap order), SiLU -> bf16; v -> LDS,
     q / k -> QK."""
-    s, a = c["S"], c["args"]
+    a, geo = c["args"], c["G"]
     items = g["items"]
-    got = c["poll"]([(c["proj"], it["t"] * QKVZ + it["chan"], 1) for it in items])
+    got = c["poll"]([(c["proj"], it["t"] * geo.qkvz + it["chan"], 1) for it in items])
     for n in range_constexpr(len(items)):
         it = items[n]
         x = f32_of(got[n][0])
@@ -522,7 +637,7 @@ def gdn_conv(c, g):
             fx.ptr_store(o, c["vloc"] + (it["k"] * VCH + it["d"]))
         if it["live"] & (it["part"] > 0):
             at = (
-                ((it["t"] * NK + it["kh"]) * 2 + it["part"] - 1) * HD
+                ((it["t"] * geo.nk + it["kh"]) * 2 + it["part"] - 1) * HD
                 + it["ch"] * VCH
                 + it["d"]
             )
@@ -534,24 +649,23 @@ def gdn_conv(c, g):
 def gdn_gates(c):
     """Every task's q, k (QK) -> LDS; b, a (BAP, the eighths in order) -> beta,
     decay; then q / k l2-normed (q * HD^-1/2)."""
-    s, tid, lane, wave, bid, a = (
+    s, tid, lane, wave, a, geo = (
         c["S"],
         c["tid"],
         c["lane"],
         c["wave"],
-        c["bid"],
         c["args"],
+        c["G"],
     )
-    nt = TPC * s
+    nt = n_tasks(geo, s)
     ni = nt * 2 * HD
     specs, dst = [], []
     for r in range_constexpr((ni + THREADS - 1) // THREADS):
         i = fx.min(tid + THREADS * r, ni - 1)
         k = i // (2 * HD)
         e = i % (2 * HD)
-        w = (k % TPC) * BLOCKS + bid
-        kh = w // NVCH // HPK
-        specs.append((c["qk"], ((k // TPC) * NK + kh) * 2 * HD + e, 1))
+        t, h, _, _ = task_of(c, k)
+        specs.append((c["qk"], (t * geo.nk + h // HPK) * 2 * HD + e, 1))
         dst.append(i)
     got = c["poll"](specs)
     for r in range_constexpr(len(specs)):
@@ -560,10 +674,8 @@ def gdn_gates(c):
     if tid < 2 * nt:
         k = tid // 2
         which = tid % 2  # 0 b, 1 a
-        w = (k % TPC) * BLOCKS + bid
-        h = w // NVCH
-        t = k // TPC
-        row = which * NV + h
+        t, h, _, _ = task_of(c, k)
+        row = which * geo.nv + h
         gb = row // ROWS
         r = row % ROWS
         got2 = c["poll"](
@@ -600,12 +712,12 @@ def gdn_gates(c):
 def gdn_recur(c, g):
     """Task pair by pair (``recur_task``), the stock decode kernel's arithmetic:
     decay, the delta rule, the new state (in place), o = bf16(h q) -> OV."""
-    lane, wave = c["lane"], c["wave"]
-    nt = TPC * c["S"]
+    lane, wave, geo = c["lane"], c["wave"], c["G"]
+    nt = n_tasks(geo, c["S"])
     col = 4 * (lane % 32)
     for m in range_constexpr((nt + 1) // 2):
-        k, valid = recur_task(c, m)
-        t, h, ch = task_traced(c, k)
+        k, _ = recur_task(c, m)
+        t, h, ch, _ = task_of(c, k)
         row = 2 * (wave % 4) + lane // 32
         live = g["live"][m]
         beta = fx.ptr_load(c["scal"] + 2 * k)
@@ -625,10 +737,10 @@ def gdn_recur(c, g):
                 rsrc(g["sbase"][m]),
                 g["soff"][m],
             )
-        if valid & (lane % 32 == 0):
+        if g["valid"][m] & (lane % 32 == 0):
             c["put"](
                 c["ov"],
-                (t * NV + h) * HD + ch * VCH + row,
+                (t * geo.nv + h) * HD + ch * VCH + row,
                 live.select(o, fx.Float32(0.0)),
             )
 
@@ -637,14 +749,17 @@ def gdn_recur(c, g):
 def gdn_norm(c, g):
     """Wave by task: the head's 128 o (OV, two a lane, the stock RMSNormGated
     layout and order) -> rstd; the task's 8 rows bf16(o rstd w silu(z)) -> core."""
-    lane, wave, a = c["lane"], c["wave"], c["args"]
-    nt = TPC * c["S"]
+    lane, wave, a, geo = c["lane"], c["wave"], c["args"], c["G"]
+    nt = n_tasks(geo, c["S"])
     for n in range_constexpr((nt + WAVES - 1) // WAVES):
         k = fx.min(wave + WAVES * n, nt - 1)
-        t, h, ch = task_traced(c, k)
+        t, h, ch, ok = task_of(c, k)
         e = h * HD + 2 * lane
         got = c["poll"](
-            [(c["ov"], t * NV * HD + e, 2), (c["proj"], t * QKVZ + Z0 + e, 2)]
+            [
+                (c["ov"], t * geo.nv * HD + e, 2),
+                (c["proj"], t * geo.qkvz + geo.conv + e, 2),
+            ]
         )
         x = [f32_of(got[0][j]) for j in range(2)]
         rstd = hw_rsq(
@@ -656,8 +771,8 @@ def gdn_norm(c, g):
             z = f32_of(got[1][j])
             sig = fx.Float32(1.0) / (fx.Float32(1.0) + tl_exp(-z))
             y.append(x[j] * rstd * ld_bf(a["norm_w"], 2 * lane + j) * (sig * z))
-        if (wave + WAVES * n < nt) & (lane // (VCH // 2) == ch):
-            bo.buffer_store(D.pack_bf(y)[0], rsrc(a["core"]), (t * CORE + e) // 2)
+        if _live((wave + WAVES * n < nt) & (lane // (VCH // 2) == ch), ok):
+            bo.buffer_store(D.pack_bf(y)[0], rsrc(a["core"]), (t * geo.val + e) // 2)
 
 
 # ---------------------------------------------------------------- kernel
@@ -669,8 +784,10 @@ def build(key: K1Build):
         return _BUILDS[key]
     s = key.tokens
     assert 1 <= s <= MAX_TOKENS
+    assert key.tp in TP_SIZES
     lay = scratch_layout(key)
-    nt = TPC * s
+    geo = Geo(key.tp)
+    nt = n_tasks(geo, s)
 
     @fx.struct
     class XLds:
@@ -694,7 +811,10 @@ def build(key: K1Build):
         rst: fx.Array[fx.Float32, MAX_TOKENS, 16]
 
     keyed = key_tuple(key, digest())
-    name = f"qwen38_27b_k1_s{s}_f{int(key.first)}_t{int(key.stamps)}_p{key.stop}"
+    name = (
+        f"qwen38_27b_k1_s{s}_f{int(key.first)}_tp{key.tp}_n{int(key.normed)}"
+        f"_t{int(key.stamps)}_p{key.stop}"
+    )
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def k1(
@@ -732,6 +852,7 @@ def build(key: K1Build):
         mb = Mailbox(step_tag(epoch, layer) - 1)
         c = {
             "S": s,
+            "G": geo,
             "tid": tid,
             "bid": bid,
             "lane": tid % 64,
@@ -777,13 +898,19 @@ def build(key: K1Build):
             c[region] = sreg(scratch, lay[region][0], region)
         D.stamp(c, 0)
         # the norm's inputs first, then the in_proj weights (vmcnt drains in order)
-        raw = front_loads(c)
-        qops = qkvz_loads(c)
-        bops = ba_loads(c)
-        z, lnw = front_z(c, raw)
-        D.o_rstd(c)
-        D.o_x(c, z, lnw)
-        D.o_gather(c)
+        if const_expr(key.normed):
+            xraw = x_loads(c)
+            qops = qkvz_loads(c)
+            bops = ba_loads(c)
+            x_quant(c, xraw)
+        else:
+            raw = front_loads(c)
+            qops = qkvz_loads(c)
+            bops = ba_loads(c)
+            z, lnw = front_z(c, raw)
+            D.o_rstd(c)
+            D.o_x(c, z, lnw)
+            D.o_gather(c)
         D.stamp(c, 1)
         if const_expr(key.stop > 2):
             stage_qkvz(c, qops)
@@ -843,9 +970,9 @@ def dense_gdn_pre(
     key: K1Build,
     *,
     hidden,
-    residual,
-    res_out,
-    ln_w,
+    residual=None,
+    res_out=None,
+    ln_w=None,
     w_qkvz,
     w_qkvzs,
     w_ba,
@@ -862,22 +989,33 @@ def dense_gdn_pre(
     epoch,
     layer,
 ):
-    """Host launcher. ``residual`` None on the first layer (``key.first``);
-    ``w_qkvz`` / ``w_ba`` shuffled (``dense_ffn.shuffle_w``); ``conv_state``
-    [slots, CONV, 3] (strides read); ``rstate`` [slots, NV, HD, HD] fp32, a slot
-    dense; ``st_idx`` [>= S] int32, -1 a pad row; ``epoch`` a device int32
-    bumped once a step, ``layer`` this launch's tag slot."""
-    s = key.tokens
-    assert (residual is None) == key.first
-    assert hidden.shape == (s, HIDDEN) and res_out.shape == (s, HIDDEN)
-    assert core.shape == (s, CORE) and ln_w.shape == (HIDDEN,)
-    assert w_qkvz.shape == (QKVZ, HIDDEN // 2) and w_qkvzs.shape == (QKVZ, HIDDEN // 32)
-    assert w_ba.shape == (BA, HIDDEN // 2) and w_bas.shape == (BA, HIDDEN // 32)
-    assert conv_w.numel() == CONV * CONV_W and conv_w.dtype == torch.bfloat16
-    assert conv_state.dtype == torch.bfloat16 and conv_state.shape[1:] == (CONV, SL)
-    assert rstate.dtype == torch.float32 and rstate.shape[1:] == (NV, HD, HD)
+    """Host launcher. ``hidden`` the full rows: the layer input, ``residual``
+    None on the first layer (``key.first``); with ``key.normed`` the input norm's
+    output, no ``residual`` / ``res_out`` / ``ln_w``. Every head-sliced operand
+    this rank's share (``Geo(key.tp)``): ``w_qkvz`` / ``w_ba`` shuffled
+    (``dense_ffn.shuffle_w``); ``conv_state`` [slots, conv, 3] (strides read);
+    ``rstate`` [slots, nv, HD, HD] fp32, a slot dense; ``core`` [S, val].
+    ``st_idx`` [>= S] int32, -1 a pad row; ``epoch`` a device int32 bumped once
+    a step, ``layer`` this launch's tag slot."""
+    s, geo = key.tokens, Geo(key.tp)
+    qkvz, ba = geo.qkvz, geo.ba
+    if key.normed:
+        assert residual is None and res_out is None and ln_w is None
+        assert not key.first
+        res_out = ln_w = hidden
+    else:
+        assert (residual is None) == key.first
+        assert res_out.shape == (s, HIDDEN) and ln_w.shape == (HIDDEN,)
+    assert hidden.shape == (s, HIDDEN) and core.shape == (s, geo.val)
+    assert w_qkvz.shape == (qkvz, HIDDEN // 2) and w_qkvzs.shape == (qkvz, HIDDEN // 32)
+    assert w_ba.shape == (ba, HIDDEN // 2) and w_bas.shape == (ba, HIDDEN // 32)
+    assert conv_w.numel() == geo.conv * CONV_W and conv_w.dtype == torch.bfloat16
+    assert conv_state.dtype == torch.bfloat16
+    assert conv_state.shape[1:] == (geo.conv, SL)
+    assert rstate.dtype == torch.float32 and rstate.shape[1:] == (geo.nv, HD, HD)
     assert rstate[0].is_contiguous()
     assert a_log.dtype == torch.float32 and dt_bias.dtype == torch.bfloat16
+    assert a_log.numel() == geo.nv and dt_bias.numel() == geo.nv
     assert norm_w.dtype == torch.bfloat16 and norm_w.numel() == HD
     assert st_idx.dtype == torch.int32 and st_idx.numel() >= s
     assert scratch.numel() >= scratch_bytes(key)

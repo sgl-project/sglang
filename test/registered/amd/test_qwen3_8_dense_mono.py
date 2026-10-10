@@ -10,7 +10,9 @@ in_proj_qkvz / in_proj_ba -> conv1d -> the gated delta rule -> the gated norm,
 against the ROCm Triton Gemma norm, the MXFP4 linears, ``causal_conv1d_update``,
 ``fused_recurrent_gated_delta_rule_packed_decode`` and RMSNormGated. The core,
 the residual and both states must match, on the first layer (no residual) and
-with pad rows (slot -1); other slots stay untouched.
+with pad rows (slot -1); other slots stay untouched. At TP2 (from the stock input
+norm's output, as the runtime runs it there) each rank's half of the heads, its
+column-parallel slices of the same layer, against the stock path on them.
 
 Widths 1..8, each with its own weights and Mailbox layer tag, over many input
 draws: a norm reduced in another order than the stock kernel's still matches on
@@ -152,8 +154,34 @@ def _gdn_weights(g, K):
     return w
 
 
-def _stock_gdn(K, w, h, residual, conv, ssm, idx):
-    """-> core, residual out; ``conv`` / ``ssm`` updated in place."""
+def _rank_slice(K, w, tp, rank):
+    """The rank's column-parallel share of a GDN layer: each of q | k | v | z,
+    b | a, the conv's q | k | v and the heads' A_log / dt_bias cut in tp."""
+    if tp == 1:
+        return w
+    geo = K.Geo(tp)
+
+    def rows(t, parts):
+        return torch.cat(
+            [t[o + rank * n : o + (rank + 1) * n] for o, n in parts]
+        ).contiguous()
+
+    qkvz = [(0, geo.key), (K.KEY, geo.key), (2 * K.KEY, geo.val), (K.CONV, geo.val)]
+    heads = slice(rank * geo.nv, (rank + 1) * geo.nv)
+    out = dict(w)
+    out["w_qkvz"] = rows(w["w_qkvz"], qkvz)
+    out["w_qkvzs"] = rows(w["w_qkvzs"], qkvz)
+    out["w_ba"] = rows(w["w_ba"], [(0, geo.nv), (K.NV, geo.nv)])
+    out["w_bas"] = rows(w["w_bas"], [(0, geo.nv), (K.NV, geo.nv)])
+    out["conv_w"] = rows(w["conv_w"], qkvz[:3])
+    out["a_log"] = w["a_log"][heads].contiguous()
+    out["dt_bias"] = w["dt_bias"][heads].contiguous()
+    return out
+
+
+def _stock_gdn(K, geo, w, h, residual, conv, ssm, idx):
+    """The rank's heads (``geo``) -> core, residual out; ``conv`` / ``ssm``
+    updated in place."""
     from sglang.kernels.ops.attention.fla.fused_recurrent import (
         fused_recurrent_gated_delta_rule_packed_decode,
     )
@@ -162,17 +190,17 @@ def _stock_gdn(K, w, h, residual, conv, ssm, idx):
     x, res = _gemma_norm(h, residual, w["ln_w"])
     qkvz = _linear(x, w["w_qkvz"], w["w_qkvzs"])
     ba = _linear(x, w["w_ba"], w["w_bas"])
-    q, k, v, z = qkvz.split([K.KEY, K.KEY, K.VAL, K.VAL], dim=-1)
-    b, a = ba.split([K.NV, K.NV], dim=-1)
+    q, k, v, z = qkvz.split([geo.key, geo.key, geo.val, geo.val], dim=-1)
+    b, a = ba.split([geo.nv, geo.nv], dim=-1)
     mixed = causal_conv1d_update(
         torch.cat([q, k, v], dim=-1),
         conv,
-        w["conv_w"].view(K.CONV, K.CONV_W),
+        w["conv_w"].view(geo.conv, K.CONV_W),
         None,
         "silu",
         conv_state_indices=idx,
     )
-    o = torch.empty(h.size(0), 1, K.NV, K.HD, dtype=BF, device="cuda")
+    o = torch.empty(h.size(0), 1, geo.nv, K.HD, dtype=BF, device="cuda")
     fused_recurrent_gated_delta_rule_packed_decode(
         mixed_qkv=mixed,
         a=a.contiguous(),
@@ -186,7 +214,7 @@ def _stock_gdn(K, w, h, residual, conv, ssm, idx):
         use_qk_l2norm_in_kernel=True,
     )
     core = w["gated_norm"](o.view(-1, K.HD), z.reshape(-1, K.HD))
-    return core.view(h.size(0), K.CORE), res
+    return core.view(h.size(0), geo.val), res
 
 
 @unittest.skipUnless(_gfx950(), "needs FlyDSL and aiter on gfx950")
@@ -194,17 +222,27 @@ class DenseGdnTest(CustomTestCase):
     SLOTS = 12
 
     def test_bit_exact(self):
+        self._check(tp=1, rank=0, normed=False)
+
+    def test_bit_exact_tp2(self):
+        for rank in range(2):
+            self._check(tp=2, rank=rank, normed=True)
+
+    def _check(self, tp, rank, normed):
         from sglang.kernels.ops.moe.qwen3_5_mono_flydsl import dense_ffn as D
         from sglang.kernels.ops.moe.qwen3_5_mono_flydsl import dense_gdn as K
 
+        geo = K.Geo(tp)
         for s in WIDTHS:
-            first = s in (1, 5)
+            first = s in (1, 5) and not normed
             g = torch.Generator(device="cuda").manual_seed(100 + s)
             layer = LAYER_TAGS[s % len(LAYER_TAGS)]
-            w = _gdn_weights(g, K)
+            w = _rank_slice(K, _gdn_weights(g, K), tp, rank)
             w_qkvz, w_ba = D.shuffle_w(w["w_qkvz"]), D.shuffle_w(w["w_ba"])
-            key = K.K1Build(tokens=s, first=first, eps=EPS, norm_eps=EPS)
-            core = torch.empty(s, K.CORE, dtype=BF, device="cuda")
+            key = K.K1Build(
+                tokens=s, first=first, eps=EPS, norm_eps=EPS, tp=tp, normed=normed
+            )
+            core = torch.empty(s, geo.val, dtype=BF, device="cuda")
             res_out = torch.empty(s, K.HIDDEN, dtype=BF, device="cuda")
             epoch = torch.zeros(1, dtype=torch.int32, device="cuda")
             scratch = torch.zeros(
@@ -218,22 +256,26 @@ class DenseGdnTest(CustomTestCase):
                 h = _rnd(g, s, K.HIDDEN, scale=0.5)
                 residual = None if first else _rnd(g, s, K.HIDDEN, scale=2.0)
                 # The mamba pool's layout: conv (slots, dim, 3) dim-first, SSM fp32.
-                conv = _rnd(g, self.SLOTS, K.CONV, K.SL)
+                conv = _rnd(g, self.SLOTS, geo.conv, K.SL)
                 ssm = _rnd(
-                    g, self.SLOTS, K.NV, K.HD, K.HD, scale=0.05, dtype=torch.float32
+                    g, self.SLOTS, geo.nv, K.HD, K.HD, scale=0.05, dtype=torch.float32
                 )
                 conv_ref, ssm_ref = conv.clone(), ssm.clone()
                 core_ref, res_ref = _stock_gdn(
-                    K, w, h, residual, conv_ref, ssm_ref, idx
+                    K, geo, w, h, residual, conv_ref, ssm_ref, idx
                 )
                 core.fill_(7.0)
                 epoch.add_(1)
+                if normed:
+                    x, _ = _gemma_norm(h, residual, w["ln_w"])
+                    front = dict(hidden=x)
+                else:
+                    front = dict(
+                        hidden=h, residual=residual, res_out=res_out, ln_w=w["ln_w"]
+                    )
                 K.dense_gdn_pre(
                     key,
-                    hidden=h,
-                    residual=residual,
-                    res_out=res_out,
-                    ln_w=w["ln_w"],
+                    **front,
                     w_qkvz=w_qkvz,
                     w_qkvzs=w["w_qkvzs"],
                     w_ba=w_ba,
@@ -251,7 +293,7 @@ class DenseGdnTest(CustomTestCase):
                     layer=layer,
                 )
                 exact = (
-                    torch.equal(res_out, res_ref)
+                    (normed or torch.equal(res_out, res_ref))
                     and torch.equal(core, core_ref)
                     and torch.equal(conv, conv_ref)
                     and torch.equal(ssm, ssm_ref)
@@ -260,7 +302,7 @@ class DenseGdnTest(CustomTestCase):
                     exact = exact and not core[1].any()
                 if not exact:
                     bad.append(draw)
-            with self.subTest(s=s, first=first, layer=layer):
+            with self.subTest(tp=tp, rank=rank, s=s, first=first, layer=layer):
                 self.assertEqual(bad, [])
 
 
