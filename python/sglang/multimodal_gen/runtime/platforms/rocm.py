@@ -9,7 +9,6 @@ adjusted to match the structure and interface of `cuda.py`.
 
 import types
 from functools import lru_cache
-from typing import Any
 
 import torch
 import torch.nn as nn
@@ -19,36 +18,19 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 import sglang.multimodal_gen.envs as envs
 from sglang.multimodal_gen.runtime.platforms.interface import (
     AttentionBackendEnum,
-    DeviceCapability,
-    Platform,
-    PlatformEnum,
+    MMPlatform,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.platforms.rocm import RocmDeviceMixin
 from sglang.srt.utils import is_gfx1250_supported
 
 logger = init_logger(__name__)
 
 
 # ROCm uses the same torch.cuda interface
-class RocmPlatform(Platform):
-    _enum = PlatformEnum.ROCM
-    device_name: str = "rocm"
-    device_type: str = "cuda"  # torch uses 'cuda' backend string
+class RocmPlatform(RocmDeviceMixin, MMPlatform):
     dispatch_key: str = "CUDA"
     device_control_env_var: str = "CUDA_VISIBLE_DEVICES"
-
-    @classmethod
-    def get_local_torch_device(cls) -> torch.device:
-        return torch.device(f"cuda:{envs.LOCAL_RANK}")
-
-    @classmethod
-    def get_device_capability(cls, device_id: int = 0) -> DeviceCapability:
-        major, minor = torch.cuda.get_device_capability(device_id)
-        return DeviceCapability(major=major, minor=minor)
-
-    @classmethod
-    def get_device_name(cls, device_id: int = 0) -> str:
-        return str(torch.cuda.get_device_name(device_id))
 
     @classmethod
     @lru_cache(maxsize=1)
@@ -64,11 +46,6 @@ class RocmPlatform(Platform):
         )
 
     @classmethod
-    @lru_cache(maxsize=1)
-    def get_device_total_memory(cls, device_id: int = 0) -> int:
-        return torch.cuda.get_device_properties(device_id).total_memory
-
-    @classmethod
     def is_async_output_supported(cls, enforce_eager: bool | None) -> bool:
         if enforce_eager:
             logger.warning(
@@ -77,36 +54,6 @@ class RocmPlatform(Platform):
             )
             return False
         return True
-
-    @classmethod
-    def get_current_memory_usage(cls, device: torch.device | None = None) -> float:
-        torch.cuda.reset_peak_memory_stats(device)
-        return float(torch.cuda.max_memory_allocated(device))
-
-    @classmethod
-    def get_available_gpu_memory(
-        cls,
-        device_id: int | None = None,
-        distributed: bool = False,
-        empty_cache: bool = True,
-        cpu_group: Any = None,
-    ) -> float:
-        if empty_cache:
-            torch.cuda.empty_cache()
-
-        if device_id is None:
-            device_id = torch.cuda.current_device()
-
-        free_gpu_memory, _ = torch.cuda.mem_get_info(device_id)
-
-        if distributed:
-            import torch.distributed as dist
-
-            tensor = torch.tensor(free_gpu_memory, dtype=torch.float32, device="cuda")
-            dist.all_reduce(tensor, op=dist.ReduceOp.MIN, group=cpu_group)
-            free_gpu_memory = float(tensor.item())
-
-        return free_gpu_memory / (1 << 30)
 
     @classmethod
     def get_attn_backend_cls_str(
@@ -206,9 +153,12 @@ class RocmPlatform(Platform):
 
         return "sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn.FlashAttentionBackend"
 
-    @classmethod
-    def get_device_communicator_cls(cls) -> str:
-        return "sglang.multimodal_gen.runtime.distributed.device_communicators.cuda_communicator.CudaCommunicator"  # works for ROCm too
+    def get_communicator_class(self) -> type:
+        from sglang.multimodal_gen.runtime.distributed.device_communicators.cuda_communicator import (
+            CudaCommunicator,
+        )
+
+        return CudaCommunicator
 
     @classmethod
     def optimize_vae(cls, vae: torch.nn.Module) -> torch.nn.Module:

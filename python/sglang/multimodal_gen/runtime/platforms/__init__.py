@@ -11,16 +11,17 @@ from dataclasses import dataclass
 from importlib.metadata import EntryPoint, entry_points
 from pkgutil import resolve_name
 
-from sglang.multimodal_gen import envs
-
 # imported by other files, do not remove
 from sglang.multimodal_gen.runtime.platforms.interface import (  # noqa: F401
     AttentionBackendEnum,
+    MMPlatform,
     Platform,
     PlatformEnum,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.third_party import pynvml
+from sglang.srt.environ import envs
+from sglang.srt.platforms.device_mixin import DeviceMixin
 
 logger = init_logger(__name__)
 
@@ -209,7 +210,7 @@ class _PlatformSelection:
 
 
 def _select_current_platform() -> _PlatformSelection:
-    selected = envs.SGLANG_DIFFUSION_PLATFORM_OVERRIDE.strip()
+    selected = envs.SGLANG_PLATFORM.get().strip()
     if selected:
         builtin_name = selected.lower()
         if builtin_name in BUILTIN_PLATFORM_NAMES:
@@ -292,7 +293,7 @@ def _resolve_selected_platform(
     if not matches:
         available = ", ".join(repr(entry_point.name) for entry_point in entries)
         raise ValueError(
-            f"Unsupported SGLANG_DIFFUSION_PLATFORM_OVERRIDE={selected!r}; "
+            f"Unsupported SGLANG_PLATFORM={selected!r}; "
             "entry point not found in group "
             f"{PLATFORM_PLUGINS_GROUP!r} (available: "
             f"{available or 'none'})."
@@ -300,7 +301,7 @@ def _resolve_selected_platform(
 
     _validate_platform_entries(matches)
     logger.info(
-        "Selecting platform plugin %s via SGLANG_DIFFUSION_PLATFORM_OVERRIDE",
+        "Selecting platform plugin %s via SGLANG_PLATFORM",
         selected,
     )
     selection = _platform_selection(matches[0], matches[0].load()())
@@ -337,16 +338,30 @@ def _resolve_automatic_platform(
     names = ", ".join(repr(selection.plugin_name) for selection in activated)
     raise RuntimeError(
         f"Multiple platform plugins activated: {names}. "
-        "Set SGLANG_DIFFUSION_PLATFORM_OVERRIDE to select one."
+        "Set SGLANG_PLATFORM to select one."
+    )
+
+
+_RENAMED_PLATFORM_METHODS = {
+    "get_device_communicator_cls": "get_communicator_class",
+    "get_all_to_all_communicator_cls": "get_all_to_all_communicator_class",
+}
+
+
+def _declares(platform_cls: type, attribute: str) -> bool:
+    return any(
+        attribute in vars(klass)
+        for klass in platform_cls.__mro__
+        if klass is not DeviceMixin
     )
 
 
 def _load_platform_class(
     qualname: str, *, external: bool | None = None
-) -> type[Platform]:
+) -> type[MMPlatform]:
     platform_cls = resolve_name(qualname)
-    if not isinstance(platform_cls, type) or not issubclass(platform_cls, Platform):
-        raise TypeError(f"Expected a Platform subclass: {qualname}")
+    if not isinstance(platform_cls, type) or not issubclass(platform_cls, MMPlatform):
+        raise TypeError(f"Expected an MMPlatform subclass: {qualname}")
     if external is None:
         external = qualname not in _BUILTIN_PLATFORM_QUALNAMES.values()
     if external and platform_cls._enum is not PlatformEnum.OOT:
@@ -354,20 +369,27 @@ def _load_platform_class(
             f"External diffusion platform {qualname} must set "
             "_enum = sglang.multimodal_gen.runtime.platforms.PlatformEnum.OOT"
         )
+    if external:
+        for old, new in _RENAMED_PLATFORM_METHODS.items():
+            if _declares(platform_cls, old):
+                raise TypeError(
+                    f"External diffusion platform {qualname} defines {old}(); "
+                    f"rename it to {new}() and return the class, not its qualname"
+                )
     return platform_cls
 
 
-_current_platform: Platform | None = None
+_current_platform: MMPlatform | None = None
 _current_platform_selection: _PlatformSelection | None = None
 _init_trace: str = ""
 
 _backend_init_done = False
 _backend_init_error: BaseException | None = None
 
-current_platform: Platform
+current_platform: MMPlatform
 
 
-def _resolve_current_platform() -> Platform:
+def _resolve_current_platform() -> MMPlatform:
     # Platform plugins import this module to subclass Platform, so resolution
     # must remain lazy.
     global _current_platform, _current_platform_selection, _init_trace
@@ -382,8 +404,12 @@ def _resolve_current_platform() -> Platform:
     platform = platform_cls()
     if selection.is_external:
         for attribute in ("device_name", "device_type"):
-            value = getattr(platform, attribute, None)
-            if not isinstance(value, str) or not value.strip():
+            value = getattr(platform, attribute)
+            if (
+                not _declares(platform_cls, attribute)
+                or not isinstance(value, str)
+                or not value.strip()
+            ):
                 raise TypeError(
                     f"External diffusion platform {selection.qualname} must "
                     f"define a non-empty {attribute}"
@@ -446,6 +472,7 @@ def __getattr__(name: str):
 __all__ = [
     "BUILTIN_PLATFORM_NAMES",
     "PLATFORM_PLUGINS_GROUP",
+    "MMPlatform",
     "Platform",
     "PlatformEnum",
     "current_platform",

@@ -53,7 +53,7 @@ class TestDiffusionPlatformPlugins(unittest.TestCase):
     def setUp(self):
         self.env = patch.dict(
             os.environ,
-            {"SGLANG_DIFFUSION_PLATFORM_OVERRIDE": ""},
+            {"SGLANG_PLATFORM": ""},
         )
         self.env.start()
         self.addCleanup(self.env.stop)
@@ -84,13 +84,13 @@ class TestDiffusionPlatformPlugins(unittest.TestCase):
                     _entry_point("selected", "vendor.platform.Platform", "vendor-pkg"),
                     _entry_point("inactive", None, "other-pkg"),
                 ]
-                os.environ["SGLANG_DIFFUSION_PLATFORM_OVERRIDE"] = override
+                os.environ["SGLANG_PLATFORM"] = override
 
                 self.assertEqual(platforms.get_selected_platform_dist(), "vendor-pkg")
                 self.assertIsInstance(platforms._current_platform, _FakeOot)
 
     def test_accessor_reports_no_distribution_for_a_builtin(self):
-        os.environ["SGLANG_DIFFUSION_PLATFORM_OVERRIDE"] = "cpu"
+        os.environ["SGLANG_PLATFORM"] = "cpu"
         self._reset_current_platform()
 
         self.assertIsNone(platforms.get_selected_platform_dist())
@@ -108,7 +108,7 @@ class TestDiffusionPlatformPlugins(unittest.TestCase):
             _entry_point("cuda", "squatter.Platform"),
         ]
         entry_points.return_value = [selected, *ignored]
-        os.environ["SGLANG_DIFFUSION_PLATFORM_OVERRIDE"] = "selected"
+        os.environ["SGLANG_PLATFORM"] = "selected"
 
         self.assertEqual(
             platforms.resolve_current_platform_cls_qualname(),
@@ -150,7 +150,7 @@ class TestDiffusionPlatformPlugins(unittest.TestCase):
         for entries, selected, message in cases:
             with self.subTest(message=message):
                 entry_points.return_value = entries
-                os.environ["SGLANG_DIFFUSION_PLATFORM_OVERRIDE"] = selected
+                os.environ["SGLANG_PLATFORM"] = selected
                 with self.assertRaisesRegex(RuntimeError, message):
                     platforms.resolve_current_platform_cls_qualname()
                 for entry_point in entries:
@@ -162,7 +162,7 @@ class TestDiffusionPlatformPlugins(unittest.TestCase):
             ([], ValueError, "not found"),
             ([_entry_point("selected", None)], RuntimeError, "returned None"),
         )
-        os.environ["SGLANG_DIFFUSION_PLATFORM_OVERRIDE"] = "selected"
+        os.environ["SGLANG_PLATFORM"] = "selected"
         for entries, error_type, message in cases:
             with self.subTest(message=message):
                 entry_points.return_value = entries
@@ -185,12 +185,36 @@ class TestDiffusionPlatformPlugins(unittest.TestCase):
                 self.subTest(name=name),
                 patch.object(platforms, "entry_points") as entry_points,
             ):
-                os.environ["SGLANG_DIFFUSION_PLATFORM_OVERRIDE"] = name
+                os.environ["SGLANG_PLATFORM"] = name
                 self.assertEqual(
                     platforms.resolve_current_platform_cls_qualname(),
                     qualname,
                 )
                 entry_points.assert_not_called()
+
+    def test_deprecated_diffusion_override_still_selects_platform(self):
+        del os.environ["SGLANG_PLATFORM"]
+        os.environ["SGLANG_DIFFUSION_PLATFORM_OVERRIDE"] = "cpu"
+        with self.assertWarns(DeprecationWarning):
+            qualname = platforms.resolve_current_platform_cls_qualname()
+        self.assertEqual(
+            qualname, "sglang.multimodal_gen.runtime.platforms.cpu.CpuPlatform"
+        )
+
+    def test_external_platform_with_renamed_hooks_is_rejected(self):
+        class _LegacyOot(platforms.MMPlatform):
+            _enum = platforms.PlatformEnum.OOT
+            device_name = "legacy"
+            device_type = "legacy"
+
+            def get_device_communicator_cls(self) -> str:
+                return "vendor.Communicator"
+
+        with (
+            patch.object(platforms, "resolve_name", return_value=_LegacyOot),
+            self.assertRaisesRegex(TypeError, "rename it to get_communicator_class"),
+        ):
+            platforms._load_platform_class("vendor.Legacy", external=True)
 
     @patch.object(platforms, "entry_points", return_value=[])
     def test_xpu_keeps_automatic_detection_priority(self, _entry_points):
@@ -222,7 +246,7 @@ class TestDiffusionPlatformPlugins(unittest.TestCase):
                 "vendor-pkg",
             )
         ]
-        os.environ["SGLANG_DIFFUSION_PLATFORM_OVERRIDE"] = "selected"
+        os.environ["SGLANG_PLATFORM"] = "selected"
 
         with self.assertRaisesRegex(TypeError, "PlatformEnum.OOT"):
             platforms.get_selected_platform_dist()
@@ -259,7 +283,7 @@ class TestDiffusionPlatformPlugins(unittest.TestCase):
     @patch.object(platforms, "entry_points")
     def test_explicit_plugin_must_return_a_class_qualname(self, entry_points):
         entry_points.return_value = [_entry_point("selected", 42, "vendor-pkg")]
-        os.environ["SGLANG_DIFFUSION_PLATFORM_OVERRIDE"] = "selected"
+        os.environ["SGLANG_PLATFORM"] = "selected"
 
         with self.assertRaisesRegex(TypeError, "non-empty class qualname"):
             platforms.resolve_current_platform_cls_qualname()

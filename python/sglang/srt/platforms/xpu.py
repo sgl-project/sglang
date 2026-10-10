@@ -36,6 +36,9 @@ class XpuDeviceMixin(DeviceMixin):
     def set_device(self, device: "torch.device") -> None:
         torch.xpu.set_device(device)
 
+    def current_device(self) -> int:
+        return torch.xpu.current_device()
+
     def get_device_name(self, device_id: int = 0) -> str:
         return str(torch.xpu.get_device_name(device_id))
 

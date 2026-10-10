@@ -27,11 +27,14 @@ class NPUDeviceMixin(DeviceMixin):
     ) -> float:
         return float(torch.npu.max_memory_allocated(device))
 
-    def get_device(self, local_rank: int) -> "torch.device":
-        return torch.device("npu", local_rank)
+    def get_device(self, device_id: int = 0) -> "torch.device":
+        return torch.device("npu", device_id)
 
     def set_device(self, device: "torch.device") -> None:
         torch.npu.set_device(device)
+
+    def current_device(self) -> int:
+        return torch.npu.current_device()
 
     def get_device_name(self, device_id: int = 0) -> str:
         return str(torch.npu.get_device_name(device_id))

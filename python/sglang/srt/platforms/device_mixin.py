@@ -30,7 +30,7 @@ import random
 from collections.abc import Iterator
 from contextlib import contextmanager
 from functools import cached_property
-from typing import NamedTuple, Optional
+from typing import Any, NamedTuple, Optional
 
 import numpy as np
 import torch
@@ -171,52 +171,84 @@ class DeviceMixin:
         """[Active] Temporarily remap a physical device to logical device 0."""
         yield device_id
 
-    # ------------------------------------------------------------------
-    # Planned methods — reserved interface.  Core still uses hardcoded
-    # calls (e.g. torch.cuda.*).  OOT implementations will NOT take
-    # effect until the core is migrated in a future PR.
-    # ------------------------------------------------------------------
-
     # ---- Device management ----
 
-    def get_device(self, device_id: int = 0) -> str:
-        """[Planned] Return ``torch.device`` for the given device id."""
-        raise NotImplementedError
+    def get_device(self, device_id: int = 0) -> "torch.device":
+        """[Active] Return the ``torch.device`` for the given device id."""
+        raise NotImplementedError(f"{type(self).__name__} must implement get_device()")
 
     def set_device(self, device: "torch.device") -> None:
-        """[Planned] Set the current device."""
-        raise NotImplementedError
+        """[Active] Set the current device."""
+        raise NotImplementedError(f"{type(self).__name__} must implement set_device()")
+
+    def current_device(self) -> int:
+        """[Active] Return the index of the current device."""
+        raise NotImplementedError(
+            f"{type(self).__name__} must implement current_device()"
+        )
 
     def get_device_name(self, device_id: int = 0) -> str:
-        """[Planned] Get human-readable device name."""
+        """[Active] Get human-readable device name."""
         raise NotImplementedError
 
     def get_device_uuid(self, device_id: int = 0) -> str:
-        """[Planned] Get unique device identifier string."""
+        """[Active] Get unique device identifier string."""
         raise NotImplementedError
 
     def get_device_capability(self, device_id: int = 0) -> Optional["DeviceCapability"]:
-        """[Planned] Get device compute capability. None if N/A."""
+        """[Active] Get device compute capability. None if N/A."""
         raise NotImplementedError
 
+    def has_device_capability(
+        self, capability: tuple[int, int] | int, device_id: int = 0
+    ) -> bool:
+        """[Active] Whether the device is at least ``(major, minor)`` or ``<major><minor>``."""
+        current = self.get_device_capability(device_id=device_id)
+        if current is None:
+            return False
+        if isinstance(capability, tuple):
+            return current >= capability
+        return current.to_int() >= capability
+
     def empty_cache(self) -> None:
-        """[Planned] Release cached device memory. No-op for CPU-like platforms."""
+        """[Active] Release cached device memory. No-op for CPU-like platforms."""
         pass
 
     def synchronize(self) -> None:
-        """[Planned] Synchronize device operations. No-op for CPU-like platforms."""
+        """[Active] Synchronize device operations. No-op for CPU-like platforms."""
         pass
 
     # ---- Memory ----
 
     def get_available_memory(self, device_id: int = 0) -> tuple[int, int]:
-        """[Planned] Return ``(free_bytes, total_bytes)``."""
+        """[Active] Return ``(free_bytes, total_bytes)``."""
         raise NotImplementedError
+
+    def get_available_gpu_memory(
+        self,
+        device_id: int | None = None,
+        distributed: bool = False,
+        empty_cache: bool = True,
+        cpu_group: Any = None,
+    ) -> float:
+        """[Active] Free GiB from ``get_available_memory``; MIN over ``cpu_group`` if ``distributed``."""
+        if empty_cache:
+            self.empty_cache()
+        if device_id is None:
+            device_id = self.current_device()
+        free_bytes, _ = self.get_available_memory(device_id)
+        if distributed:
+            tensor = torch.tensor(free_bytes, dtype=torch.float32)
+            torch.distributed.all_reduce(
+                tensor, op=torch.distributed.ReduceOp.MIN, group=cpu_group
+            )
+            free_bytes = tensor.item()
+        return free_bytes / (1 << 30)
 
     # ---- Distributed ----
 
     def get_torch_distributed_backend_str(self) -> str:
-        """Return the torch.distributed backend string (e.g. "nccl", "hccl").
+        """[Active] Return the torch.distributed backend string (e.g. "nccl", "hccl").
 
         Default: lookup ``self.device_type`` in ``_DEVICE_TO_DISTRIBUTED_BACKEND``,
         falling back to ``"gloo"``. Subclasses override only when they need a
@@ -225,15 +257,37 @@ class DeviceMixin:
         return _DEVICE_TO_DISTRIBUTED_BACKEND.get(self.device_type, "gloo")
 
     def get_communicator_class(self) -> type | None:
-        """[Planned] Return platform-specific communicator class, or None for default."""
+        """[Active] Return platform-specific communicator class, or None for default."""
         return None
-
-    # ---- Misc ----
 
     @classmethod
     def inference_mode(cls):
-        """[Planned] Return inference mode context manager."""
+        """[Active] Return inference mode context manager."""
         return torch.inference_mode(mode=True)
+
+    # ---- Misc ----
+
+    @cached_property
+    def cpu_arch(self) -> "CpuArchEnum":
+        return self.get_cpu_architecture()
+
+    @classmethod
+    def get_cpu_architecture(cls) -> "CpuArchEnum":
+        """[Active] Detect CPU architecture."""
+        import platform as _platform
+
+        machine = _platform.machine().lower()
+        if machine in ("x86_64", "amd64", "i386", "i686"):
+            return CpuArchEnum.X86
+        elif machine in ("arm64", "aarch64"):
+            return CpuArchEnum.ARM
+        return CpuArchEnum.UNSPECIFIED
+
+    # ------------------------------------------------------------------
+    # Planned methods — reserved interface.  Core still uses hardcoded
+    # calls (e.g. torch.cuda.*).  OOT implementations will NOT take
+    # effect until the core is migrated in a future PR.
+    # ------------------------------------------------------------------
 
     @classmethod
     def seed_everything(cls, seed: int | None = None) -> None:
@@ -246,22 +300,6 @@ class DeviceMixin:
     def verify_quantization(self, quant: str) -> None:
         """[Planned] Validate that a quantization method is supported. No-op by default."""
         pass
-
-    @cached_property
-    def cpu_arch(self) -> "CpuArchEnum":
-        return self.get_cpu_architecture()
-
-    @classmethod
-    def get_cpu_architecture(cls) -> "CpuArchEnum":
-        """[Planned] Detect CPU architecture."""
-        import platform as _platform
-
-        machine = _platform.machine().lower()
-        if machine in ("x86_64", "amd64", "i386", "i686"):
-            return CpuArchEnum.X86
-        elif machine in ("arm64", "aarch64"):
-            return CpuArchEnum.ARM
-        return CpuArchEnum.UNSPECIFIED
 
     def get_torch_profiler_activity_str(self) -> str:
         """[Planned] Return the torch profiler activity string."""

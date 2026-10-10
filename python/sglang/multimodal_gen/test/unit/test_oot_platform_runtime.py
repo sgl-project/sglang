@@ -39,9 +39,12 @@ class _DispatchKeyOotPlatform(_OotPlatform):
 
 
 class _ExistingCommunicatorPlatform(_OotPlatform):
-    @classmethod
-    def get_device_communicator_cls(cls) -> str:
-        return "test.LegacyCommunicator"
+    def get_communicator_class(self) -> type:
+        return _TestCommunicator
+
+
+class _TestCommunicator(DeviceCommunicatorBase):
+    pass
 
 
 class _TestOp(CustomOp):
@@ -52,10 +55,6 @@ class _TestOp(CustomOp):
 class _CudaCompatibleTestOp(_TestOp):
     def forward_cuda(self, value):
         return ("cuda", value)
-
-
-class _TestCommunicator(DeviceCommunicatorBase):
-    pass
 
 
 class TestOotCustomOpDispatch(unittest.TestCase):
@@ -230,9 +229,9 @@ class TestOotRequiredConfiguration(unittest.TestCase):
         with self.assertRaisesRegex(NotImplementedError, "define dispatch_key"):
             platform.get_torch_library_dispatch_key()
         with self.assertRaisesRegex(
-            NotImplementedError, "implement get_all_to_all_communicator_cls"
+            NotImplementedError, "implement get_all_to_all_communicator_class"
         ):
-            platform.get_all_to_all_communicator_cls()
+            platform.get_all_to_all_communicator_class()
 
         self.assertEqual(
             _DispatchKeyOotPlatform().get_torch_library_dispatch_key(),
@@ -254,9 +253,9 @@ class TestOotRequiredConfiguration(unittest.TestCase):
         self.assertEqual(XpuPlatform().get_torch_library_dispatch_key(), "CUDA")
 
     def test_existing_communicator_override_remains_the_fallback(self):
-        self.assertEqual(
-            _ExistingCommunicatorPlatform.get_all_to_all_communicator_cls(),
-            "test.LegacyCommunicator",
+        self.assertIs(
+            _ExistingCommunicatorPlatform().get_all_to_all_communicator_class(),
+            _TestCommunicator,
         )
 
 
@@ -278,30 +277,20 @@ class TestOotRuntimeHooks(unittest.TestCase):
 
     def test_platform_selects_all_to_all_communicator(self):
         platform = MagicMock()
-        platform.get_all_to_all_communicator_cls.return_value = "vendor.Communicator"
+        platform.get_all_to_all_communicator_class.return_value = _TestCommunicator
 
-        with (
-            patch.object(group_coordinator, "current_platform", platform),
-            patch.object(
-                group_coordinator,
-                "resolve_name",
-                return_value=_TestCommunicator,
-            ) as resolve_name,
-        ):
+        with patch.object(group_coordinator, "current_platform", platform):
             self.assertIs(
                 group_coordinator._resolve_all_to_all_communicator_cls(),
                 _TestCommunicator,
             )
 
-        resolve_name.assert_called_once_with("vendor.Communicator")
-
     def test_rejects_invalid_all_to_all_communicator(self):
         platform = MagicMock()
-        platform.get_all_to_all_communicator_cls.return_value = "vendor.Communicator"
+        platform.get_all_to_all_communicator_class.return_value = object
 
         with (
             patch.object(group_coordinator, "current_platform", platform),
-            patch.object(group_coordinator, "resolve_name", return_value=object),
             self.assertRaisesRegex(TypeError, "DeviceCommunicatorBase subclass"),
         ):
             group_coordinator._resolve_all_to_all_communicator_cls()

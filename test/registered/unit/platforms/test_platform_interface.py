@@ -135,6 +135,21 @@ class TestDeviceMixin(CustomTestCase):
         self.assertFalse(mixin.is_pin_memory_available())
         self.assertFalse(mixin.is_pin_memory_available(device="cpu"))
 
+    def test_available_gpu_memory_defaults_to_current_device_in_gib(self):
+        class _Device(DeviceMixin):
+            def current_device(self) -> int:
+                return 3
+
+            def get_available_memory(self, device_id: int = 0) -> tuple[int, int]:
+                self.queried = device_id
+                return 3 << 30, 8 << 30
+
+        device = _Device()
+        with patch.object(device, "empty_cache") as empty_cache:
+            self.assertEqual(device.get_available_gpu_memory(), 3.0)
+        self.assertEqual(device.queried, 3)
+        empty_cache.assert_called_once_with()
+
     @patch("platform.machine")
     def test_get_cpu_architecture(self, mock_machine):
         """get_cpu_architecture maps common strings to CpuArchEnum."""
@@ -205,6 +220,17 @@ class TestCudaDeviceMixin(CustomTestCase):
     def test_default_get_device_returns_cuda_device(self):
         base = CudaSRTPlatform()
         self.assertEqual(base.get_device(2), torch.device("cuda", 2))
+
+    @patch("sglang.srt.platforms.cuda.psutil.virtual_memory")
+    @patch("torch.cuda.mem_get_info")
+    @patch("torch.cuda.get_device_properties")
+    def test_integrated_device_reports_host_available_memory(
+        self, mock_props, mock_mem_get_info, mock_virtual_memory
+    ):
+        mock_props.return_value = MagicMock(is_integrated=True, total_memory=128)
+        mock_virtual_memory.return_value = MagicMock(available=96)
+        self.assertEqual(CudaSRTPlatform().get_available_memory(0), (96, 128))
+        mock_mem_get_info.assert_not_called()
 
     def test_pin_memory_available_for_cuda_targets(self):
         base = CudaSRTPlatform()
@@ -647,6 +673,14 @@ class TestResolvePlatformWithEnv(CustomTestCase):
             result = _resolve_platform()
             mock_load.assert_called_once_with("pkg.Mod:MyPlatform")
             self.assertEqual(result, mock_instance)
+
+    @patch("sglang.srt.platforms.entry_points")
+    @patch("sglang.srt.platforms.envs")
+    def test_builtin_name_skips_plugin_discovery(self, mock_envs, mock_ep):
+        """Built-in names shared with diffusion select the in-tree platform."""
+        mock_envs.SGLANG_PLATFORM.get.return_value = "CPU"
+        self.assertIsInstance(_resolve_platform(), CpuSRTPlatform)
+        mock_ep.assert_not_called()
 
     @patch("sglang.srt.platforms.entry_points")
     @patch("sglang.srt.platforms.envs")

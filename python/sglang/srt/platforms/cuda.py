@@ -5,6 +5,7 @@ import os
 from contextlib import contextmanager
 from typing import Optional
 
+import psutil
 import torch
 
 from sglang.srt.platforms.device_mixin import (
@@ -38,6 +39,9 @@ class CudaDeviceMixin(DeviceMixin):
     def set_device(self, device: "torch.device") -> None:
         torch.cuda.set_device(device)
 
+    def current_device(self) -> int:
+        return torch.cuda.current_device()
+
     def get_device_name(self, device_id: int = 0) -> str:
         return str(torch.cuda.get_device_name(device_id))
 
@@ -55,6 +59,9 @@ class CudaDeviceMixin(DeviceMixin):
         torch.cuda.synchronize()
 
     def get_available_memory(self, device_id: int = 0) -> tuple[int, int]:
+        props = torch.cuda.get_device_properties(device_id)
+        if props.is_integrated:
+            return psutil.virtual_memory().available, props.total_memory
         return torch.cuda.mem_get_info(device_id)
 
     def is_pin_memory_available(self, device=None) -> bool:

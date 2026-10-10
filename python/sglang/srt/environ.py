@@ -1864,7 +1864,9 @@ class Envs:
     # ===================================================================
     # Plugin system
     # ===================================================================
-    SGLANG_PLATFORM = EnvStr("")
+    SGLANG_PLATFORM = EnvStrWithAlias(
+        "", deprecated_name="SGLANG_DIFFUSION_PLATFORM_OVERRIDE"
+    )
     SGLANG_PLUGINS = EnvStr("")
 
     # ===================================================================
