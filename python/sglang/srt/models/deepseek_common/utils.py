@@ -29,6 +29,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_gfx95_supported,
+    is_gfx942_supported,
     is_gfx1250_supported,
     is_hip,
     is_musa,
@@ -48,6 +49,7 @@ _is_cpu = is_cpu()
 _is_xpu = is_xpu()
 _device_sm = get_device_sm()
 _is_gfx95_supported = is_gfx95_supported()
+_is_gfx942_supported = is_gfx942_supported()
 # gfx1250 reuses the gfx95 (CDNA4) code paths for MXFP4 q/k-norm kernels, but its
 # aiter rope kernels (ck_tile) do not build, so it runs sglang's native rope which
 # lacks the separate cos_cache/sin_cache buffers the gfx95 fused-rope decode path
