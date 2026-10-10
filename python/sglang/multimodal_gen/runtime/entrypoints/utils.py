@@ -47,7 +47,6 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import CYAN, RESET, init_logger
 from sglang.multimodal_gen.runtime.utils.profiler import maybe_record_function
 from sglang.srt.observability.trace import TraceReqContext
-from sglang.srt.utils.memfd import MFD_CLOEXEC, memfd_create
 
 logger = init_logger(__name__)
 
@@ -71,7 +70,10 @@ class _CudaMemfdVideoBuffer:
         self._registered = False
 
         try:
-            self.fd = memfd_create("sglang-video-frames", MFD_CLOEXEC)
+            self.fd = os.memfd_create(
+                "sglang-video-frames",
+                flags=getattr(os, "MFD_CLOEXEC", 0),
+            )
             os.ftruncate(self.fd, self.nbytes)
             self.mapping = mmap.mmap(
                 self.fd,
@@ -437,7 +439,7 @@ class CudaVideoEncoder:
         max_queued_frames: int = 0,
     ) -> "CudaVideoEncoder | None":
         """Start ffmpeg, or return None when this output cannot use the path."""
-        if device.type != "cuda":
+        if not hasattr(os, "memfd_create") or device.type != "cuda":
             return None
         if os.path.splitext(save_file_path)[1].lower() != ".mp4":
             return None

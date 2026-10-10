@@ -11,7 +11,6 @@ import weakref
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.utils.memfd import MFD_CLOEXEC, memfd_create
 
 logger = logging.getLogger(__name__)
 
@@ -194,8 +193,11 @@ def alloc_shm(dims: tuple, dtype: torch.dtype) -> tuple[torch.Tensor, int, mmap.
     fd = None
     try:
         # MFD_CLOEXEC is standard on Linux 3.17+
-        fd = memfd_create(f"sglang_host_pool_{uuid.uuid4().hex}", MFD_CLOEXEC)
-    except OSError:
+        fd = os.memfd_create(
+            f"sglang_host_pool_{uuid.uuid4().hex}",
+            flags=getattr(os, "MFD_CLOEXEC", 1),
+        )
+    except (AttributeError, OSError):
         # Fallback to creating a file in /dev/shm if memfd_create is not supported
         shm_path = f"/dev/shm/sglang_host_pool_{uuid.uuid4().hex}.mmap"
         try:
