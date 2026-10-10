@@ -238,6 +238,7 @@ def test_sampler_selects_lora_from_each_patcher_and_clears_previous_adapter():
     events = []
     payload = {"lora_path": "four-step.safetensors", "strength": 1.0}
     runtime = SimpleNamespace(
+        _ensure_runtime=None,
         _lora_input=payload.copy(),
         generator=SimpleNamespace(unmerge_lora_weights=lambda: events.append("clear")),
         begin_sampler_run=lambda: events.append("begin"),
@@ -272,7 +273,10 @@ def test_cached_base_model_resets_request_accelerations_after_spectrum_run():
     )
 
     runtime = SimpleNamespace(
-        _lora_input=None, begin_sampler_run=lambda: None, end_sampler_run=lambda: None
+        _ensure_runtime=None,
+        _lora_input=None,
+        begin_sampler_run=lambda: None,
+        end_sampler_run=lambda: None,
     )
     accelerated = SimpleNamespace(
         model_patcher=SimpleNamespace(

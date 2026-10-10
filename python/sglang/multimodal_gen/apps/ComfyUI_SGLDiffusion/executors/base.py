@@ -85,6 +85,9 @@ class SGLDiffusionExecutor(torch.nn.Module):
         self._lora_input = None
         self._sgld_reload = None
         self._ensure_runtime = None
+        self.request_options: dict = {}
+        self.enable_cache_dit = None
+        self.cache_dit_params = None
         if self.adapter_cls is None:
             raise TypeError(f"{type(self).__name__} must set adapter_cls")
         self.adapter = self.adapter_cls()
@@ -134,23 +137,21 @@ class SGLDiffusionExecutor(torch.nn.Module):
         """Run cache is evicted on the next bind of a newer id for this executor."""
 
     def sampler_sample_wrapper(self, executor, *args, **kwargs):
-        ensure = getattr(self, "_ensure_runtime", None)
-        if ensure is not None:
-            ensure(self)
-        model_wrap = args[0] if args else kwargs.get("model_wrap")
-        patcher = getattr(model_wrap, "model_patcher", None)
-        if patcher is not None:
-            flags = patcher.model_options.get("sgld_request_flags", {})
-            self.enable_cache_dit = flags.get("enable_cache_dit")
-            self.cache_dit_params = flags.get("cache_dit_params")
-            self.request_options = dict(flags.get("request_options", {}))
-            desired = patcher.model_options.get("sgld_lora_input")
-            if desired != self._lora_input:
-                if self._lora_input is not None:
-                    self.generator.unmerge_lora_weights()
-                    self._lora_input = None
-                if desired is not None:
-                    self.set_lora(**desired)
+        if self._ensure_runtime is not None:
+            self._ensure_runtime(self)
+        model_wrap = args[0] if args else kwargs["model_wrap"]
+        model_options = model_wrap.model_patcher.model_options
+        flags = model_options.get("sgld_request_flags", {})
+        self.enable_cache_dit = flags.get("enable_cache_dit")
+        self.cache_dit_params = flags.get("cache_dit_params")
+        self.request_options = dict(flags.get("request_options", {}))
+        desired = model_options.get("sgld_lora_input")
+        if desired != self._lora_input:
+            if self._lora_input is not None:
+                self.generator.unmerge_lora_weights()
+                self._lora_input = None
+            if desired is not None:
+                self.set_lora(**desired)
         self.begin_sampler_run()
         try:
             return executor(*args, **kwargs)
