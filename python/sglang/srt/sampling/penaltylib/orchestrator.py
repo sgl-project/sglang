@@ -52,6 +52,27 @@ class BatchedPenalizerOrchestrator:
         for penalizer in self.penalizers.values():
             penalizer.cumulate_output_tokens(output_ids=output_ids)
 
+    def cumulate_output_tokens_padded(
+        self, output_ids: torch.Tensor, valid: torch.Tensor
+    ):
+        """
+        Feed several output tokens per request to the penalizers.
+
+        Speculative decoding can commit a different number of tokens per request
+        in one step, so the tokens come as a padded block.
+
+        Args:
+            output_ids (torch.Tensor): [batch_size, num_tokens] token ids, in
+                generation order along dim 1; padding entries may hold any id.
+            valid (torch.Tensor): [batch_size, num_tokens] bool, True for the
+                entries that are real output tokens.
+        """
+        for column in range(output_ids.shape[1]):
+            for penalizer in self.penalizers.values():
+                penalizer.cumulate_output_tokens(
+                    output_ids=output_ids[:, column], valid=valid[:, column]
+                )
+
     def apply(self, logits: torch.Tensor, repeat: Optional[int] = None):
         """
         Apply all penalizers to the logits in-place.
@@ -209,11 +230,16 @@ class _BatchedPenalizer(abc.ABC):
         self._teardown()
         self._is_prepared = False
 
-    def cumulate_output_tokens(self, output_ids: torch.Tensor):
+    def cumulate_output_tokens(
+        self, output_ids: torch.Tensor, valid: Optional[torch.Tensor] = None
+    ):
         if not self._is_prepared:
             return
 
-        self._cumulate_output_tokens(output_ids=output_ids)
+        if valid is None:
+            self._cumulate_output_tokens(output_ids=output_ids)
+        else:
+            self._cumulate_output_tokens(output_ids=output_ids, valid=valid)
 
     def apply(self, logits: torch.Tensor) -> torch.Tensor:
         if not self._is_prepared:
@@ -251,10 +277,14 @@ class _BatchedPenalizer(abc.ABC):
         pass
 
     @abc.abstractmethod
-    def _cumulate_output_tokens(self, output_ids: torch.Tensor):
+    def _cumulate_output_tokens(
+        self, output_ids: torch.Tensor, valid: Optional[torch.Tensor] = None
+    ):
         """
         Cumulate the output tokens.
         Orchestrator will call this function to feed the output tokens to the penalizer.
+        `output_ids` holds one token per request; when `valid` is given, only the
+        requests where it is True receive their token.
         """
         pass
 

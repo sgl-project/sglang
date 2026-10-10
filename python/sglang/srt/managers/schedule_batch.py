@@ -1068,6 +1068,10 @@ class Req(ReqDllmMixin):
         # full_untruncated_fill_ids from lengths alone, so in-place rewrites
         # that preserve length would silently corrupt fill_ids.
         self.output_ids = array("q")
+        # How many output_ids the penalizer orchestrator row of this request has
+        # been fed. Used by speculative decoding that commits several tokens per
+        # step; reset whenever a new orchestrator is built for the request.
+        self.penalizer_cumulated_len = 0
         # Full untruncated sequence: origin + output (+ DLLM mask block).
         # Kept in sync by refresh_fill_ids; admission only updates
         # extend_end, never mutates this array's length.
@@ -3533,6 +3537,36 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         ).to(self.device, non_blocking=True)
         self.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
             latest_output_ids
+        )
+
+    def cumulate_penalty_committed_output_tokens(self):
+        """Feed every output token committed since the previous call.
+
+        cumulate_penalty_output_tokens feeds one token per step, which loses
+        tokens when a speculative step commits several of them. Under overlap
+        output_ids lags by one step; the remaining tokens are fed next time.
+        """
+        new_tokens = []
+        for req in self.reqs:
+            start = min(req.penalizer_cumulated_len, len(req.output_ids))
+            new_tokens.append(req.output_ids[start:].tolist())
+            req.penalizer_cumulated_len = len(req.output_ids)
+        width = max(map(len, new_tokens), default=0)
+        if width == 0:
+            return
+        pin_memory = is_pin_memory_available(self.device)
+        output_ids = torch.tensor(
+            [tokens + [0] * (width - len(tokens)) for tokens in new_tokens],
+            dtype=torch.int64,
+            pin_memory=pin_memory,
+        ).to(self.device, non_blocking=True)
+        valid = torch.tensor(
+            [[i < len(tokens) for i in range(width)] for tokens in new_tokens],
+            dtype=torch.bool,
+            pin_memory=pin_memory,
+        ).to(self.device, non_blocking=True)
+        self.sampling_info.penalizer_orchestrator.cumulate_output_tokens_padded(
+            output_ids, valid
         )
 
     def prepare_for_decode(self):
