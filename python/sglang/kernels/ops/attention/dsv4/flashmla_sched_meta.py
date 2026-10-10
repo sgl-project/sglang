@@ -13,15 +13,12 @@ if TYPE_CHECKING:
 
 # sizeof(DecodingSchedMeta) / 4, fixed by FlashMLA's params.h.
 META_INTS = 8
-# The kernel's static __shared__ state (total_num_blocks_shared, warp_sums and
-# first_idle_part_shared: 40 B at kBlockSize 256) plus the dynamic region's
-# alignment. On 152 SMs b = 2,211 launches and 2,212 fails, so this is 45 to 64 B.
+# The kernel's static __shared__ variables plus the dynamic region's alignment.
 STATIC_SMEM_BYTES = 64
 _SMEM_LIMIT_BYTES = 48 * 1024
 
 
 def sched_meta_fits(batch_size: int, num_sm_parts: int) -> bool:
-    """Whether the schedule kernel fits the default 48 KiB of shared memory."""
     dynamic = 4 * (5 * batch_size + 1 + num_sm_parts * META_INTS)
     return dynamic + STATIC_SMEM_BYTES <= _SMEM_LIMIT_BYTES
 
@@ -52,9 +49,7 @@ def flashmla_sched_meta(
     Produces the schedule FlashMLA computes for itself when handed no metadata,
     so passing the filled tensors as the cached ``tile_scheduler_metadata`` /
     ``num_splits`` lets it skip its own kernel. The schedule has to fit in 48 KiB
-    of shared memory, ``4 * (5 * batch_size + 1 + 8 * num_sm_parts)`` dynamic
-    bytes plus ``STATIC_SMEM_BYTES``, so a few thousand requests at most; check
-    with ``sched_meta_fits`` before calling.
+    of shared memory (``sched_meta_fits``), so a few thousand requests at most.
 
     Args:
         tile_scheduler_metadata: ``[num_sm_parts, 8]`` int32, written.

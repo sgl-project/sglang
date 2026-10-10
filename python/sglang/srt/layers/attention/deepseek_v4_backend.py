@@ -980,8 +980,6 @@ class DSV4Metadata:
     # Set only on the metadata built for the late layers under bounded SWA replay.
     late_layer_tail: Optional[LateLayerTail] = None
 
-    # This step's sparse-prefill choice, from the live batch: read the FP8 cache
-    # directly instead of the bf16 workspace.
     sparse_prefill_direct: bool = False
 
     @property
@@ -1091,7 +1089,6 @@ class _GraphBucket(enum.Enum):
         raise NotImplementedError(f"unsupported {forward_mode=}")
 
 
-# Measured on SM100 (GB300) only; other platforms keep the workspace unless set.
 _SM100_DIRECT_PREFIX_PER_ROW = 5
 _SM100_DIRECT_PREFIX_PER_ROW_GRAPH = 8
 
@@ -1120,8 +1117,7 @@ def _prefill_reads_fp8_direct(
     prefix = forward_batch.extend_prefix_lens_cpu
     if per_row <= 0 or prefix is None:
         return False
-    # The bf16 workspace pays per cached token, the direct kernel per query row;
-    # one choice per forward from the batch totals.
+    # Workspace cost grows with cached tokens, direct-read cost with query rows.
     return sum(prefix) >= per_row * sum(forward_batch.extend_seq_lens_cpu)
 
 
@@ -2688,7 +2684,6 @@ class DeepseekV4AttnBackend(
         )
         assert isinstance(capture_metadata, DSV4Metadata)
         capture_metadata.refresh_for_breakable_cuda_graph_replay_(static_metadata)
-        # The attention break reads this live; the padded static batch may add rows.
         capture_metadata.sparse_prefill_direct = _prefill_reads_fp8_direct(
             forward_batch, in_prefill_graph=True
         )
@@ -3363,7 +3358,7 @@ class DeepseekV4AttnBackend(
             or self.token_to_kv_pool.request_window is not None
             or not envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
             or self.forward_metadata.sparse_prefill_direct
-            # A captured indexer keeps this choice, so any replay may still read direct.
+            # A captured indexer serves every replay, and any replay may read direct.
             or (
                 is_in_breakable_cuda_graph()
                 and _direct_prefix_per_row(in_prefill_graph=True) > 0

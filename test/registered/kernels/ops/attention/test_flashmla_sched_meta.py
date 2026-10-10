@@ -195,8 +195,7 @@ def _first_unfit_batch(num_sm_parts: int) -> int:
 
 @pytest.mark.parametrize("offset", [-3, -2, -1, 0, 1, 2])
 def test_precompute_at_shared_memory_limit(offset: int):
-    """Around the 48 KiB limit for this GPU's SM count, a schedule that fits must
-    launch, and one that does not must take the fallback instead of failing."""
+    """Schedules that fit launch; the first size that does not takes the fallback."""
     from types import SimpleNamespace
 
     from sglang.srt.layers.attention import deepseek_v4_backend as backend
