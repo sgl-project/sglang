@@ -364,9 +364,13 @@ def concat_and_cast_q_fp8_pad_kernel(
     no = tl.arange(0, NOPE)
     src_n = tl.load(q_nope_ptr + pid * nope_s0 + hr[:, None] * nope_s1 + no[None, :])
     tl.store(qpad_head + no[None, :], src_n)
-    ro = tl.arange(0, ROPE)
-    src_r = tl.load(q_rope_ptr + pid * rope_s0 + hr[:, None] * rope_s1 + ro[None, :])
-    tl.store(qpad_head + NOPE + ro[None, :], src_r)
+    # NoPE models pass ROPE=0; tl.arange rejects empty ranges, so skip statically.
+    if ROPE > 0:
+        ro = tl.arange(0, ROPE)
+        src_r = tl.load(
+            q_rope_ptr + pid * rope_s0 + hr[:, None] * rope_s1 + ro[None, :]
+        )
+        tl.store(qpad_head + NOPE + ro[None, :], src_r)
 
 
 def concat_and_cast_q_fp8_pad(q_fp8_pad, q_nope, q_rope, num_heads):
@@ -374,7 +378,7 @@ def concat_and_cast_q_fp8_pad(q_fp8_pad, q_nope, q_rope, num_heads):
     [:, :num_heads, :] slice of the padded fp8 q buffer.  Bit-exact replacement for the
     two strided converting copy_() in the Q8KV8 prefill q-prep, ~3.7x faster.  Requires
     num_heads / nope_dim / rope_dim to be powers of two (always true for DeepSeek: 128
-    heads / any TP, 512 nope, 64 rope)."""
+    heads / any TP, 512 nope, 64 rope); rope_dim may also be 0 for NoPE models."""
     num_tokens = q_nope.shape[0]
     nope_dim = q_nope.shape[-1]
     rope_dim = q_rope.shape[-1]

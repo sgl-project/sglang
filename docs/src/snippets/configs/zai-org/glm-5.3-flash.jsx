@@ -91,6 +91,22 @@ export const config = {
             "--dsa-decode-backend tilelang",
           ],
         },
+        // Order matters: a disabled pick is re-seated onto the first enabled
+        // option, so this entry must stay after BF16 + TileLang to keep the
+        // Hopper default unchanged.
+        {
+          id: "bf16-q8-prefill",
+          label: "BF16 + Q8 sparse prefill",
+          disabled: (s) => !["h100", "h200"].includes(s.hw),
+          disableReason: "The Q8KV8 sparse prefill kernel is SM90-only (Hopper).",
+          stripPrefixes: ["--kv-cache-dtype", "--dsa-prefill-backend", "--dsa-decode-backend"],
+          flags: [
+            "--kv-cache-dtype bfloat16",
+            "--dsa-prefill-backend flashmla_sparse_q8",
+            "--dsa-decode-backend tilelang",
+          ],
+          hints: ["Measured on H200: higher prefill throughput than BF16 + TileLang; requires a build with PR #41790."],
+        },
       ],
     },
     {
@@ -927,7 +943,9 @@ sgl-eval run gsm8k \\
       verified: true,
       verificationStatus: (s) =>
         s.bcg !== "off" ? "unverified" :
-        ["off", "l2"].includes(s.hicache) ? "verified" : "unverified",
+        ["off", "l2"].includes(s.hicache)
+          ? (s.kvDsaPair === "bf16-q8-prefill" ? "in-progress" : "verified")
+          : "unverified",
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -975,7 +993,9 @@ sgl-eval run gsm8k \\
       verified: true,
       verificationStatus: (s) =>
         s.bcg !== "off" ? "unverified" :
-        ["off", "l2"].includes(s.hicache) ? "verified" : "unverified",
+        ["off", "l2"].includes(s.hicache)
+          ? (s.kvDsaPair === "bf16-q8-prefill" ? "in-progress" : "verified")
+          : "unverified",
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",

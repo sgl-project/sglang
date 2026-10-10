@@ -122,6 +122,8 @@ Keep the checkpoint's KDA lower-bound setting unchanged. In particular, do not o
 
 On Blackwell, the recipes default to an FP8 KV cache with TRT-LLM DSA: on GB300 this pairing measured 2.9–5.7% higher throughput and about 1.8x the KV token capacity at identical pool bytes, with GSM8K accuracy within noise of BF16. BF16 KV with TileLang DSA remains selectable in the deployment panel and is the default on H100 and H200, where FP8 KV with TRT-LLM DSA is disabled. MI355X instead uses FP8 KV with TileLang DSA in the recorded ROCm recipe. Switch the dtype and both DSA backends together; TileLang DSA with FP8 KV is not a valid CUDA combination, and TRT-LLM DSA is not the MI355X backend.
 
+On Hopper, BF16 KV can also run the sparse prefill in FP8 with `--dsa-prefill-backend flashmla_sparse_q8` (decode stays on `tilelang` and the cache stays BF16): on H200 this pairing measured 5.8–12.1% higher throughput on prefill-only requests, with GSM8K accuracy within noise of BF16 + TileLang. It is SM90-only and requires a build that includes [PR #41790](https://github.com/sgl-project/sglang/pull/41790); FP8 KV is not available with it for this model.
+
 ### Extend the cache hierarchy
 
 Keep **HiCache** off when GPU memory is sufficient. Select **L1 + L2** to spill reusable cache entries into host memory. Select **+ L3** only after configuring Mooncake on every serving node; the generated command exposes the required configuration path. These options remain selectable but are marked **Not Verified** until the resulting command is validated on the chosen hardware.
