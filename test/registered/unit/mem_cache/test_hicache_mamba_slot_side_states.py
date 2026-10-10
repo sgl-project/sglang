@@ -19,6 +19,7 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.mem_cache.device_pool_info import MambaStateBufferInfo
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -78,6 +79,10 @@ def _make_pools(with_side_state: bool):
 
     host = MambaPoolHost.__new__(MambaPoolHost)
     host.device_pool = device_pool
+    host.buffer_info = MambaStateBufferInfo(
+        temporal=device_pool.mamba_cache.temporal,
+        conv=tuple(device_pool.mamba_cache.conv),
+    )
     host.page_size = 1
     host.layout = "page_first"
     host.device = "cpu"

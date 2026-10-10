@@ -9,7 +9,11 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
-from sglang.srt.mem_cache.memory_pool import MHATokenToKOnlyPool, MHATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import (
+    MambaPool,
+    MHATokenToKOnlyPool,
+    MHATokenToKVPool,
+)
 from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4PagedHostPool,
     LogicalHostPool,
@@ -277,6 +281,33 @@ class TestLazyHostPoolRelease(CustomTestCase):
 
     def test_mamba_pool_lazy_release(self):
         self._assert_lazy_release(self._make_mamba_pool())
+
+    def test_mamba_host_preserves_empty_pp_stage(self):
+        pool = MambaPool.__new__(MambaPool)
+        pool.mamba_layer_ids = []
+        pool.mamba_cache = SimpleNamespace(
+            temporal=torch.empty((0, 5, 2, 2)),
+            conv=[torch.empty((0, 5, 3, 2))],
+        )
+        pool._slot_siblings = []
+        (info,) = pool.get_device_pool_infos()
+        info.buffer_info.validate(layer_ids=info.layer_ids)
+        host = MambaPoolHost(
+            info.buffer_info,
+            host_to_device_ratio=2,
+            host_size=0,
+            device_capacity=4,
+            layout="page_first",
+            pin_memory=False,
+        )
+        try:
+            self.assertEqual(info.layer_ids, ())
+            self.assertEqual(host.num_mamba_layers, 0)
+            self.assertEqual(host.size_per_token, 0)
+            self.assertEqual(host.size, 9)
+            self.assertEqual(host.kv_buffer, [])
+        finally:
+            host.destroy()
 
     def test_deepseek_v4_pool_lazy_release(self):
         pool = self._make_deepseek_v4_pool()
