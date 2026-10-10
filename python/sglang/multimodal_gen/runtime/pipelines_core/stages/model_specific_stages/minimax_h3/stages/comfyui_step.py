@@ -554,6 +554,7 @@ def comfyui_payload_to_branch_inputs(
         "used": used,
         "orig_video_shape": orig_shape,
         "padded_video_shape": tuple(video.shape),
+        "is_ref2va": bool(refs),
         "sample_sigmas": sample_sigmas,
         "sigma_v": float(sigma_v),
         "shift_v": shift_v,
@@ -737,6 +738,7 @@ class MiniMaxH3ComfyUIStepStage(PipelineStage):
     ) -> MiniMaxH3ComfyUIRunState:
         from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.denoising import (
             _build_cube_attn_metadata,
+            _maybe_prepare_vsa_h3_step_metadata,
             _precompute_refined_prompt_embeds,
         )
 
@@ -779,17 +781,28 @@ class MiniMaxH3ComfyUIStepStage(PipelineStage):
                 num_steps=max((n_sigmas or 2) - 1, 1),
                 device=device,
             )
-            hybrid = prepare_hybrid_attention_metadata(
+            # VSA-H3 tiles assume the native row order (text, cond, audio, raster
+            # video); ComfyUI layouts match it, see test_comfyui_h3 layout tests.
+            build_step_metadata = _maybe_prepare_vsa_h3_step_metadata(
                 model=self.transformer,
                 packed=inputs["packed"],
+                is_ref2va=inputs["is_ref2va"],
                 latent_shape=tuple(inputs["padded_video_shape"][-3:]),
                 server_args=server_args,
                 device=device,
             )
+            if build_step_metadata is None:
+                build_step_metadata = prepare_hybrid_attention_metadata(
+                    model=self.transformer,
+                    packed=inputs["packed"],
+                    latent_shape=tuple(inputs["padded_video_shape"][-3:]),
+                    server_args=server_args,
+                    device=device,
+                )
             return MiniMaxH3ComfyUIRunState(
                 branch=branch,
                 attn_metadata=metadata,
-                build_step_metadata=hybrid,
+                build_step_metadata=build_step_metadata,
                 used=inputs["used"],
                 orig_video_shape=inputs["orig_video_shape"],
                 padded_video_shape=inputs["padded_video_shape"],
@@ -860,7 +873,7 @@ class MiniMaxH3ComfyUIStepStage(PipelineStage):
         self._maybe_mount_cache_dit(batch, state)
         if state.steps_done == 0:
             _logger.info(
-                "ComfyUI H3 effective backend=%s; cube_metadata=%s; hybrid_metadata=%s; sparse_query_mask=%s",
+                "ComfyUI H3 effective backend=%s; cube_metadata=%s; step_metadata=%s; sparse_query_mask=%s",
                 self.transformer._resolved_attention_backend,
                 state.attn_metadata is not None,
                 state.build_step_metadata is not None,
