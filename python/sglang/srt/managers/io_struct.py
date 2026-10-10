@@ -1943,6 +1943,8 @@ class UpdateWeightsFromDistributedReqInput(BaseReq, kw_only=True):
     selector: Literal["target", "draft", "all"] = "all"
     # Whether to call torch.cuda.empty_cache() during flush
     torch_empty_cache: bool = False
+    # Opaque per-round payload for the group's external receiver.
+    receiver_payload: Optional[Dict[str, Any]] = None
 
 
 class UpdateWeightsFromDistributedReqOutput(BaseReq, kw_only=True):
@@ -2062,6 +2064,11 @@ class InitWeightsUpdateGroupReqInput(BaseReq, kw_only=True):
     group_name: str = "weight_update_group"
     # The backend
     backend: str = "nccl"
+    # External receiver factory import path; must be listed in
+    # --weight-update-receivers. None keeps the torch process group path.
+    receiver: Optional[str] = None
+    # Opaque payload handed to the receiver factory; never interpreted.
+    receiver_init_payload: Optional[Dict[str, Any]] = None
 
 
 class InitWeightsUpdateGroupReqOutput(BaseReq, kw_only=True):
