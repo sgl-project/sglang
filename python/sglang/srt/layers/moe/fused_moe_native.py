@@ -49,34 +49,32 @@ def fused_moe_forward_native(
 
     if not moe_runner_config.is_gated:
         x1 = torch.einsum("ti,taoi -> tao", x, w13_weights)
-        x1 = _apply_ungated_activation(x1, moe_runner_config.activation)
-        expert_outs = torch.einsum("tao, taio -> tai", x1, w2_weights)
-        expert_outs = torch.einsum(
-            "tai,ta -> ti", expert_outs, topk_weights.to(expert_outs.dtype)
-        )
-        return StandardCombineInput(hidden_states=expert_outs)
-
-    w1_weights, w3_weights = torch.chunk(w13_weights, 2, dim=2)
-    x1 = torch.einsum("ti,taoi -> tao", x, w1_weights)
-    if moe_runner_config.activation == "silu":
-        x1 = F.silu(x1)
-    elif moe_runner_config.activation == "gelu":
-        x1 = F.gelu(x1)
-    elif moe_runner_config.activation == "situ":
-        beta = (
-            moe_runner_config.gemm1_alpha
-            if moe_runner_config.gemm1_alpha is not None
-            else 4.0
-        )
-        x1 = beta * torch.tanh(x1.float() / beta) * torch.sigmoid(x1.float())
-        x1 = x1.to(x.dtype)
+        intermediate = _apply_ungated_activation(x1, moe_runner_config.activation)
     else:
-        raise ValueError(f"Unsupported activation: {moe_runner_config.activation=}")
-    x3 = torch.einsum("ti, taoi -> tao", x, w3_weights)
-    expert_outs = torch.einsum("tao, taio -> tai", (x1 * x3), w2_weights)
+        w1_weights, w3_weights = torch.chunk(w13_weights, 2, dim=2)
+        x1 = torch.einsum("ti,taoi -> tao", x, w1_weights)
+        if moe_runner_config.activation == "silu":
+            x1 = F.silu(x1)
+        elif moe_runner_config.activation == "gelu":
+            x1 = F.gelu(x1)
+        elif moe_runner_config.activation == "situ":
+            beta = (
+                moe_runner_config.gemm1_alpha
+                if moe_runner_config.gemm1_alpha is not None
+                else 4.0
+            )
+            x1 = beta * torch.tanh(x1.float() / beta) * torch.sigmoid(x1.float())
+            x1 = x1.to(x.dtype)
+        else:
+            raise ValueError(f"Unsupported activation: {moe_runner_config.activation=}")
+        intermediate = x1 * torch.einsum("ti, taoi -> tao", x, w3_weights)
+    expert_outs = torch.einsum("tao, taio -> tai", intermediate, w2_weights)
     expert_outs = torch.einsum(
         "tai,ta -> ti", expert_outs, topk_weights.to(expert_outs.dtype)
     )
+    # The Triton runner this path replaces scales the combined routed output.
+    if moe_runner_config.routed_scaling_factor is not None:
+        expert_outs = expert_outs * moe_runner_config.routed_scaling_factor
     return StandardCombineInput(hidden_states=expert_outs)
 
 

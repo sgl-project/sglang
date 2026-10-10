@@ -14,13 +14,16 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 
-def _make_config(activation: str, is_gated: bool) -> SimpleNamespace:
+def _make_config(
+    activation: str, is_gated: bool, routed_scaling_factor: float | None = None
+) -> SimpleNamespace:
     return SimpleNamespace(
         activation=activation,
         is_gated=is_gated,
         apply_router_weight_on_input=False,
         gemm1_alpha=None,
         gemm1_clamp_limit=None,
+        routed_scaling_factor=routed_scaling_factor,
     )
 
 
@@ -140,6 +143,47 @@ class TestFusedMoeNative(CustomTestCase):
 
                 torch.testing.assert_close(fused_output, reference)
                 torch.testing.assert_close(looped_output, reference)
+
+    def test_fused_native_applies_routed_scaling_factor(self):
+        """Matches the Triton runner, which scales the combined routed output."""
+        num_experts, hidden_size, intermediate_size, top_k = 4, 8, 6, 2
+        for activation, is_gated in (("relu2", False), ("silu", True)):
+            with self.subTest(activation=activation, is_gated=is_gated):
+                torch.manual_seed(0)
+                w13_rows = intermediate_size * (2 if is_gated else 1)
+                layer = SimpleNamespace(
+                    w13_weight=torch.randn(num_experts, w13_rows, hidden_size),
+                    w2_weight=torch.randn(num_experts, hidden_size, intermediate_size),
+                    moe_runner_config=_make_config(
+                        activation=activation,
+                        is_gated=is_gated,
+                        routed_scaling_factor=2.5,
+                    ),
+                )
+                hidden_states = torch.randn(5, hidden_size)
+                topk_weights = torch.rand(5, top_k)
+                topk_ids = torch.stack(
+                    [torch.randperm(num_experts)[:top_k] for _ in range(5)]
+                )
+                reference = _reference_moe(
+                    hidden_states,
+                    layer.w13_weight,
+                    layer.w2_weight,
+                    topk_weights,
+                    topk_ids,
+                    activation,
+                    is_gated,
+                )
+
+                output = fused_moe_forward_native(
+                    layer,
+                    SimpleNamespace(
+                        hidden_states=hidden_states,
+                        topk_output=(topk_weights, topk_ids, None),
+                    ),
+                ).hidden_states
+
+                torch.testing.assert_close(output, 2.5 * reference)
 
     def test_non_gated_rejects_unknown_activation(self):
         layer = SimpleNamespace(
