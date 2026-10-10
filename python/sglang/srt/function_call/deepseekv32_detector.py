@@ -3,6 +3,7 @@ import logging
 import re
 
 from sglang.srt.entrypoints.openai.protocol import Tool
+from sglang.srt.environ import envs
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
@@ -12,6 +13,10 @@ from sglang.srt.function_call.core_types import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class MalformedDSMLToolCall(ValueError):
+    """A malformed invoke body rejected by strict DSML parsing."""
 
 
 def _reject_json_constant(value: str) -> None:
@@ -99,6 +104,8 @@ class DeepSeekV32Detector(BaseFormatDetector):
             rf"|>(?P<body>.*?)(?P<end>(?:</{invoke}>|$)))"
         )
         self.current_tool_id = -1
+        self.strict = envs.SGLANG_ENABLE_STRICT_DSML_TOOL_CALLS.get()
+        self._poisoned_block = False
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a deepseek v32 format tool call."""
@@ -141,9 +148,14 @@ class DeepSeekV32Detector(BaseFormatDetector):
         # First, try to parse as direct JSON (new format)
         invoke_content_stripped = invoke_content.strip()
         if invoke_content_stripped.startswith("{"):
-            parsed = json.loads(
-                invoke_content_stripped, parse_constant=_reject_json_constant
-            )
+            try:
+                parsed = json.loads(
+                    invoke_content_stripped, parse_constant=_reject_json_constant
+                )
+            except ValueError as e:
+                if self.strict:
+                    raise MalformedDSMLToolCall(f"invalid JSON body: {e}") from e
+                raise
             if not isinstance(parsed, dict):
                 raise ValueError("DeepSeek tool arguments must be a JSON object")
             return invoke_content_stripped
@@ -185,6 +197,10 @@ class DeepSeekV32Detector(BaseFormatDetector):
         leftover.append(invoke_content[last_match_end:])
 
         leftover_text = "".join(leftover)
+        if self.strict and leftover_text.strip():
+            raise MalformedDSMLToolCall(
+                f"unparsed text inside the invoke body: {leftover_text[:80]!r}"
+            )
         if self.dsml_token in leftover_text or (
             not param_matches and leftover_text.strip()
         ):
@@ -230,10 +246,19 @@ class DeepSeekV32Detector(BaseFormatDetector):
                         logger.warning(
                             f"Dropping unclosed DeepSeek invoke '{func_name}'"
                         )
+                        if self.strict:
+                            return StreamingParseResult(normal_text=text)
                         continue
                     try:
                         func_args = self._parse_parameters_from_xml(invoke_content)
                     except ValueError as e:
+                        if self.strict:
+                            logger.warning(
+                                "Malformed DSML tool call for %s dropped; forwarding the turn as text: %s",
+                                func_name,
+                                e,
+                            )
+                            return StreamingParseResult(normal_text=text)
                         logger.warning(f"Dropping malformed DeepSeek invoke: {e}")
                         continue
                     # construct match_result for parse_base_json
@@ -258,6 +283,8 @@ class DeepSeekV32Detector(BaseFormatDetector):
         """
         self._buffer += new_text
         current_text = self._buffer
+        if self._poisoned_block:
+            return self._forward_poisoned_block(current_text, tools)
 
         # Check if buffer contains any DSML markers or ends with potential tag prefix
         # This handles partial/streaming DSML content
@@ -310,6 +337,11 @@ class DeepSeekV32Detector(BaseFormatDetector):
                 if not is_tool_end:
                     break
 
+                raw_head = preamble
+                block_start = invoke_match.start()
+                bot_pos = current_text.rfind(self.bot_token, 0, block_start)
+                if bot_pos != -1:
+                    block_start = bot_pos
                 # Initialize state on the first complete invoke, malformed or
                 # not: the preamble is released once and the trailing DSML is
                 # withheld by finish() either way.
@@ -323,10 +355,25 @@ class DeepSeekV32Detector(BaseFormatDetector):
                         call_start = bot_pos
                     # Same trailing-newline trim as detect_and_parse, so both agree.
                     preamble = current_text[:call_start].removesuffix("\n\n")
+                    raw_head = current_text[:block_start]
 
                 try:
                     current_params = self._parse_parameters_from_xml(invoke_content)
                 except ValueError as e:
+                    if self.strict:
+                        logger.warning(
+                            "Malformed DSML tool call for %s dropped; forwarding the block as text: %s",
+                            func_name,
+                            e,
+                        )
+                        self._poisoned_block = True
+                        forwarded = self._forward_poisoned_block(
+                            current_text[block_start:], tools
+                        )
+                        return StreamingParseResult(
+                            normal_text=raw_head + forwarded.normal_text,
+                            calls=all_calls + forwarded.calls,
+                        )
                     # Fail closed: drop this invoke, keep going for the next one.
                     logger.warning(f"Dropping malformed DeepSeek invoke: {e}")
                     self._buffer = current_text[invoke_match.end() :]
@@ -371,12 +418,35 @@ class DeepSeekV32Detector(BaseFormatDetector):
                 preamble = self._text_before_dsml(current_text)
             return StreamingParseResult(normal_text=preamble, calls=all_calls)
 
+    def _forward_poisoned_block(
+        self, current_text: str, tools: list[Tool]
+    ) -> StreamingParseResult:
+        """Forward a malformed calls block as text, then resume after its closer."""
+        end = current_text.find(self.eot_token)
+        if end == -1:
+            hold = self._ends_with_partial_token(current_text, self.eot_token)
+            keep = len(current_text) - hold
+            self._buffer = current_text[keep:]
+            return StreamingParseResult(normal_text=current_text[:keep])
+        cut = end + len(self.eot_token)
+        self._buffer = ""
+        self._poisoned_block = False
+        normal_text, calls = current_text[:cut], []
+        if current_text[cut:]:
+            rest = self.parse_streaming_increment(current_text[cut:], tools)
+            normal_text += rest.normal_text
+            calls = rest.calls
+        return StreamingParseResult(normal_text=normal_text, calls=calls)
+
     def finish(self, tools: list[Tool]) -> StreamingParseResult:
         if not self._buffer:
             return StreamingParseResult()
 
         buffered = self._buffer
         self._buffer = ""
+        if self._poisoned_block:
+            self._poisoned_block = False
+            return StreamingParseResult(normal_text=buffered)
         if self.current_tool_id != -1:
             return StreamingParseResult()
 
