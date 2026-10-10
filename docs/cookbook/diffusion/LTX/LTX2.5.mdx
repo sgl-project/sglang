@@ -66,11 +66,7 @@ decoder choice does not change anything upstream of it.
 
 ## 2. SGLang-diffusion Installation
 
-```bash
-uv pip install "sglang[diffusion]" --prerelease=allow
-```
-
-For platform-specific setup, see the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installation).
+Follow the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installation). Docker is recommended for Linux GPU deployments; run the commands below inside the container or your installed Python environment.
 
 NATTEN is an optional extra, worth installing only if you plan to use the
 [diffusion decoder](#4-6-diffusion-decoder) — see that section for why.
@@ -196,8 +192,6 @@ right one from the checkpoint, so nothing needs to be passed.
 
 ### 4.3 Auto-duration
 
-<span style={{fontSize: "0.7em", verticalAlign: "middle", padding: "2px 8px", borderRadius: "9999px", background: "#16a34a", color: "#fff"}}>NEW</span>
-
 LTX-2.5 ships a duration head — a small module that reads the encoded caption
 and regresses the natural length of the shot it describes. Use it when the
 prompt implies a duration ("a quick glance" vs "a slow pan across the valley")
@@ -276,8 +270,6 @@ Note that `from_pretrained` only fetches what `model_index.json` lists, so a
 partial snapshot download will not include `transformer_full/` (another 38 GB).
 
 ### 4.6 Diffusion decoder
-
-<span style={{fontSize: "0.7em", verticalAlign: "middle", padding: "2px 8px", borderRadius: "9999px", background: "#16a34a", color: "#fff"}}>NEW</span>
 
 LTX-2.5 adds a diffusion-based video decoder as an alternative to the
 convolutional VAE decoder. Rather than deconvolving the latent it denoises

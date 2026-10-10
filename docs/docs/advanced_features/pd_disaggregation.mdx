@@ -20,6 +20,60 @@ For the design details, please refer to [link](https://docs.google.com/document/
 
 Currently, we support Mooncake and NIXL as the transfer engine.
 
+## Decode allocation policy
+
+By default, decode reserves each request's destination KV slots before prefill
+finishes. Long prefills can hold these slots while decode waits for the KV data.
+To delay this reservation, set the following flag on **both prefill and decode**:
+
+```bash
+--disaggregation-decode-allocation-policy prefill_complete
+```
+
+With `prefill_complete`, prefill computes without waiting for destination slots,
+then signals readiness after accepting its final prefill result. Decode reserves
+slots and starts the existing KV transfer handshake only after that signal.
+This changes per-request KV reservation, not the size or creation of the global
+KV pool. The default `early` policy preserves the existing behavior.
+
+Deferring allocation can help when long prefills compete with active decode
+requests for destination KV capacity. It also retains KV on prefill longer and
+removes overlap between chunked prefill and KV transfer. Compare both policies
+for your workload; this option is not a general throughput improvement.
+
+This initial implementation requires Mooncake (RDMA or `mooncake_tcp`), the Python
+bootstrap registry, and attention TP/CP and pipeline sizes of one. Attention DP
+is allowed when each DP rank has attention TP size one. Prefill automatically
+resolves `--optimistic-prefill-attempts` from zero to one; configurations that
+disable optimistic prefill after model validation are rejected.
+Chunked prefill does not yield just because decode has not admitted the request.
+Completed requests retain their KV in the existing optimistic-prefill inflight
+queue until decode supplies destination indices; readiness alone never starts
+a KV write.
+After a successful transfer, prefill clears the room's readiness and transfer
+state before notifying decode of success. Retraction recovery can then reuse
+the same bootstrap room. This notification waits for worker and scheduler
+cleanup; failure and cancellation records remain until their timeout expires.
+Retries remain eligible for prefill after the optimistic attempt budget is
+exhausted and remain subject to the existing cancellation and timeout handling.
+
+On prefill, `SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT` starts after the final
+prefill result, giving decode admission its own budget. On decode,
+`SGLANG_DISAGGREGATION_WAITING_TIMEOUT` bounds the wait for prefill completion,
+then starts afresh for admission and again when destination indices are sent
+for transfer.
+
+The option does not support staging buffers, runtime PD role switching, PD
+multiplexing, encoder disaggregation, decoupled speculation, HiSparse, decode radix cache, decode
+HiCache, or non-DSA auxiliary state pools. Prefill HiCache is limited to L2 with
+`write_back` and no storage backend. Unsupported configurations fail validation.
+
+All communicating workers must use the same revision and enable the same policy. This
+version of the decode worker rejects policy or peer-layout mismatches before
+destination registration. Older decode workers do not enforce this check. Keep
+`early` on both sides until every worker has been upgraded, then enable the new
+policy on both sides.
+
 ## Profiling in PD Disaggregation Mode
 
 When you need to profile prefill or decode workers in PD disaggregation mode, please refer to the [Profile In PD Disaggregation Mode](../developer_guide/benchmark_and_profiling#profile-in-pd-disaggregation-mode) section in the Benchmark and Profiling guide. Due to torch profiler limitations, prefill and decode workers must be profiled separately using dedicated command-line options.
@@ -28,6 +82,25 @@ When you need to profile prefill or decode workers in PD disaggregation mode, pl
 
 For deploying PD disaggregation at scale with load balancing and fault tolerance, SGLang provides a router. The router can distribute requests between prefill and decode instances using various routing policies. For detailed information on setting up routing with PD disaggregation, including configuration options and deployment patterns, see the [SGLang Model Gateway (former Router)](./sgl_model_gateway#prefill-decode-disaggregation).
 
+### Responses API under HTTP PD
+
+HTTP PD supports foreground generation through `POST /v1/responses`, including streaming generation with `stream=true` through the HTTP PD router. This requires both the router's Responses dispatch support and serving workers that accept Responses PD routing metadata.
+
+Store-backed and stateful Responses features are **not supported under PD**:
+
+- Response persistence (`store`) and response history.
+- Conversation chaining with `previous_response_id`.
+- Background Responses (`background=true`), including background streams.
+- Retrieval by response ID (`GET /v1/responses/{id}`).
+- Cancel-by-ID (`POST /v1/responses/{id}/cancel`).
+- Other workflows requiring shared process-local Responses history.
+
+Prefill and decode run in separate serving processes. Their process-local Responses stores cannot provide coherent shared state: both legs need the same conversation history to reconstruct the prompt, and prefill's stored response is not available to decode. Send explicit conversation history in foreground requests instead of relying on stored response IDs.
+
+Built-in tools (`web_search`, `code_interpreter`) are also unsupported under PD: each tool call requires another generation, but the router dispatches exactly one prefill/decode pair per HTTP request.
+
+Serving-side capability enforcement is tracked in [#39122](https://github.com/sgl-project/sglang/pull/39122). That change introduces opt-in standalone storage with `--enable-response-store`, disallows it under PD, and rejects stateful requests with HTTP 400 before generation. These checks require a serving version containing that change; older versions must not be assumed to reject every unsupported workflow at admission. The HTTP PD router also rejects detached background requests because it does not implement their retrieval/cancel lifecycle.
+
 
 ## Mooncake
 ### Requirements
@@ -35,6 +108,39 @@ For deploying PD disaggregation at scale with load balancing and fault tolerance
 ```bash
 uv pip install mooncake-transfer-engine
 ```
+
+### AWS EFA
+
+On an x86_64 AWS EFA instance, replace the standard CUDA 13 Mooncake package with the EFA build. The two packages install the same `mooncake` Python module, so do not install them side by side.
+
+The following commands replace the package in an SGLang CUDA 13 environment while preserving its existing Python dependencies:
+
+```bash
+python3 -m pip uninstall -y \
+  mooncake-transfer-engine-cuda13 \
+  mooncake-transfer-engine-efa-cuda13
+python3 -m pip install --no-deps \
+  mooncake-transfer-engine-efa-cuda13==0.3.13.post1
+
+export LD_LIBRARY_PATH="/opt/amazon/efa/lib:/opt/amazon/efa/lib64:${LD_LIBRARY_PATH:-}"
+export MOONCAKE_PROTOCOL=efa
+
+python3 -c 'from mooncake import engine; assert engine.SUPPORT_EFA'
+fi_info -p efa -t FI_EP_RDM
+```
+
+The EFA wheel expects a compatible AWS EFA userspace installation on the host and does not bundle `libfabric` or `libefa`. The current wheel is available only for x86_64. It is built without Mooncake EP/PG and the NVLink/MNNVL components, so use the standard Mooncake CUDA package for those features.
+
+The current libfabric EFA provider cannot transfer CUDA VMM-backed buffers. Until [libfabric issue #12853](https://github.com/ofiwg/libfabric/issues/12853) is resolved, apply these settings to both prefill and decode workers:
+
+- Do not set `SGLANG_MOONCAKE_CUSTOM_MEM_POOL` to `NVLINK` or `BAREX`.
+  `INTRA_NODE_NVLINK` is supported because it uses the default CUDA allocator.
+- Do not enable `expandable_segments:True` in `PYTORCH_CUDA_ALLOC_CONF` or `PYTORCH_ALLOC_CONF`.
+- Post-capture KV sizing is automatically disabled for the EFA protocol because
+  its KV cache uses CUDA VMM allocations.
+- Do not set `MC_FORCE_MNNVL` or `NCCL_MNNVL_ENABLE`; EFA is not an MNNVL transport.
+
+SGLang validates the first two constraints at startup to avoid a later `fi_read` or `fi_write` failure from libfabric.
 
 ### IB Device Configuration
 
@@ -80,8 +186,7 @@ python -m sglang.launch_server \
   --nnodes 2 \
   --node-rank 0 \
   --tp-size 16 \
-  --dp-size 8 \
-  --enable-dp-attention \
+  --attn-dp-size 8 \
   --moe-a2a-backend deepep \
   --mem-fraction-static 0.8
 # prefill 1
@@ -96,8 +201,7 @@ python -m sglang.launch_server \
   --nnodes 2 \
   --node-rank 1 \
   --tp-size 16 \
-  --dp-size 8 \
-  --enable-dp-attention \
+  --attn-dp-size 8 \
   --moe-a2a-backend deepep \
   --mem-fraction-static 0.8
 # decode 0
@@ -112,8 +216,7 @@ python -m sglang.launch_server \
   --nnodes 2 \
   --node-rank 0 \
   --tp-size 16 \
-  --dp-size 8 \
-  --enable-dp-attention \
+  --attn-dp-size 8 \
   --moe-a2a-backend deepep \
   --mem-fraction-static 0.8 \
   --max-running-requests 128
@@ -129,8 +232,7 @@ python -m sglang.launch_server \
   --nnodes 2 \
   --node-rank 1 \
   --tp-size 16 \
-  --dp-size 8 \
-  --enable-dp-attention \
+  --attn-dp-size 8 \
   --moe-a2a-backend deepep \
   --mem-fraction-static 0.8 \
   --max-running-requests 128
@@ -296,8 +398,7 @@ python -m sglang.launch_server \
   --disaggregation-mode decode \
   --port 30001 \
   --tp 4 \
-  --dp 4 \
-  --enable-dp-attention \
+  --attn-dp-size 4 \
   --trust-remote-code \
   --disaggregation-ib-device mlx5_3,mlx5_4
 
@@ -361,8 +462,7 @@ python -m sglang.launch_server \
   --nnodes 2 \
   --node-rank 0 \
   --tp-size 16 \
-  --dp-size 8 \
-  --enable-dp-attention \
+  --attn-dp-size 8 \
   --moe-a2a-backend deepep \
   --mem-fraction-static 0.8
 # prefill 1
@@ -377,8 +477,7 @@ python -m sglang.launch_server \
   --nnodes 2 \
   --node-rank 1 \
   --tp-size 16 \
-  --dp-size 8 \
-  --enable-dp-attention \
+  --attn-dp-size 8 \
   --moe-a2a-backend deepep \
   --mem-fraction-static 0.8
 # decode 0
@@ -393,8 +492,7 @@ python -m sglang.launch_server \
   --nnodes 2 \
   --node-rank 0 \
   --tp-size 16 \
-  --dp-size 8 \
-  --enable-dp-attention \
+  --attn-dp-size 8 \
   --moe-a2a-backend deepep \
   --mem-fraction-static 0.8 \
   --max-running-requests 128
@@ -410,8 +508,7 @@ python -m sglang.launch_server \
   --nnodes 2 \
   --node-rank 1 \
   --tp-size 16 \
-  --dp-size 8 \
-  --enable-dp-attention \
+  --attn-dp-size 8 \
   --moe-a2a-backend deepep \
   --mem-fraction-static 0.8 \
   --max-running-requests 128
@@ -654,7 +751,7 @@ do
         --disaggregation-transfer-backend ascend --max-running-requests 32 --context-length 8192  --disable-radix-cache \
         --chunked-prefill-size -1 --max-prefill-tokens 10240 --moe-a2a-backend deepep --deepep-mode normal \
         --speculative-algorithm NEXTN --speculative-num-steps 1 --speculative-eagle-topk 1 --speculative-num-draft-tokens 2  \
-        --dp-size 8 --enable-dp-attention --disable-shared-experts-fusion --dtype bfloat16
+        --attn-dp-size 8 --disable-shared-experts-fusion --dtype bfloat16
         NODE_RANK=$i
         break
     fi
@@ -678,9 +775,9 @@ do
         export HCCL_SOCKET_IFNAME=data0.3001
         export GLOO_SOCKET_IFNAME=data0.3001
         python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} \
-        --port 8001 --trust-remote-code --nnodes 1 --node-rank 0 --tp-size 16 --dp-size 16 \
+        --port 8001 --trust-remote-code --nnodes 1 --node-rank 0 --tp-size 16 --attn-dp-size 16 \
         --mem-fraction-static 0.8 --max-running-requests 448 --attention-backend ascend --device npu --quantization modelslim \
-        --moe-a2a-backend deepep --enable-dp-attention --deepep-mode low_latency --enable-dp-lm-head \
+        --moe-a2a-backend deepep --deepep-mode low_latency --enable-dp-lm-head \
         --cuda-graph-bs-decode 2 4 6 8 10 12 14 16 18 20 22 24 26 28 --disaggregation-transfer-backend ascend --watchdog-timeout 9000 --context-length 8192 \
         --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --disable-shared-experts-fusion --dtype bfloat16 --tokenizer-worker-num 4 \
        	--load-balance-method round_robin

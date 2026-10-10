@@ -70,8 +70,7 @@ class BaseTestNPULoadBalanceMethodDPDisaggregation(TestDisaggregationBase):
             "prefill",
             "--tp-size",
             "2",
-            "--enable-dp-attention",
-            "--dp",
+            "--attn-dp-size",
             "2",
             "--load-balance-method",
             cls.prefill_load_balance_method,
@@ -107,8 +106,7 @@ class BaseTestNPULoadBalanceMethodDPDisaggregation(TestDisaggregationBase):
             2,
             "--tp-size",
             "2",
-            "--enable-dp-attention",
-            "--dp",
+            "--attn-dp-size",
             "2",
             "--load-balance-method",
             cls.decode_load_balance_method,
@@ -143,7 +141,7 @@ class BaseTestNPULoadBalanceMethodDPDisaggregation(TestDisaggregationBase):
             num_questions=200,
             max_new_tokens=512,
             parallel=128,
-            host=f"http://{self.url.hostname}",
+            host=self.url.hostname,
             port=int(self.url.port),
         )
 

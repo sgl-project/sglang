@@ -5,10 +5,14 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.basic_api_contract_kit import BasicAPIContractMixin
 from sglang.test.kits.basic_decode_correctness_kit import BasicDecodeCorrectnessMixin
 from sglang.test.kits.basic_scheduler_stress_kit import BasicSchedulerStressMixin
-from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
+from sglang.test.kits.eval_accuracy_kit import MMLUSanityMixin
 from sglang.test.kits.fwd_occupancy_kit import FwdOccupancyMixin
 from sglang.test.kits.json_constrained_kit import JSONConstrainedMixin
-from sglang.test.kits.spec_server_kits import SpecGrammarKit, SpecLogprobKit
+from sglang.test.kits.spec_server_kits import (
+    SpecGrammarKit,
+    SpecLogprobKit,
+    SpecSamplingMaskKit,
+)
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -35,10 +39,11 @@ class TestBasicSanityDSpark(
     BasicDecodeCorrectnessMixin,
     BasicSchedulerStressMixin,
     FwdOccupancyMixin,
-    GSM8KMixin,
+    MMLUSanityMixin,
     JSONConstrainedMixin,
     SpecGrammarKit,
     SpecLogprobKit,
+    SpecSamplingMaskKit,
     CustomTestCase,
 ):
     served_model_name = TARGET_MODEL
@@ -48,9 +53,8 @@ class TestBasicSanityDSpark(
     fwd_occupancy_max_new_tokens = 4096
     fwd_occupancy_acc_length_threshold: float = 2.0
 
-    gsm8k_num_questions = 200
-    gsm8k_accuracy_thres = 0.80
-    gsm8k_accept_length_thres = 2.0
+    mmlu_score_threshold = 0.70
+    mmlu_accept_length_thres = 3.0
 
     attention_backend = ATTENTION_BACKEND
     draft_attention_backend = DRAFT_ATTENTION_BACKEND

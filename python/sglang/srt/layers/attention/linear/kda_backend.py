@@ -10,6 +10,12 @@ from sglang.kernels.ops.mamba.causal_conv1d_triton import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
+from sglang.srt.layers.attention.linear.kda_prefill_graph import (
+    KDAPrefillGraphMetadata,
+    KDAPrefillTrackRows,
+    build_track_rows,
+    kda_extend_in_graph,
+)
 from sglang.srt.layers.attention.linear.kernels.kda_flashinfer import (
     build_fused_accept_indices,
 )
@@ -17,9 +23,10 @@ from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKerne
 from sglang.srt.layers.attention.linear.utils import (
     LinearAttnKernelBackend,
     build_verify_intermediate_state_indices,
+    select_verify_intermediate_state_indices,
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
-from sglang.srt.utils import is_cpu, is_cuda, is_npu
+from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu
 from sglang.srt.utils.common import is_gfx95_supported, rank0_log
 
 # KDA always uses the triton causal_conv1d_fn (no CUDA override).
@@ -33,14 +40,60 @@ elif is_cpu():
 
     causal_conv1d_update = causal_conv1d_update_cpu
 
+from sglang.srt.model_executor.cuda_graph_config import Backend as CudaGraphBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
     get_memory,
+    get_platform,
     get_spec,
+    mamba_cache_chunk_size,
 )
+
+
+def _validate_flashinfer_kda_prefill(
+    *,
+    chunk_size: int,
+    enable_two_batch_overlap: bool,
+    prefill_cuda_graph_backend: CudaGraphBackend,
+) -> None:
+    if chunk_size <= 0 or chunk_size % 32:
+        raise ValueError(
+            "FlashInfer KDA checkpoint interval must be positive and divisible by 32"
+        )
+    if enable_two_batch_overlap:
+        raise ValueError("FlashInfer KDA prefill does not support two-batch overlap")
+    if prefill_cuda_graph_backend == CudaGraphBackend.FULL:
+        raise ValueError(
+            "FlashInfer KDA prefill requires eager linear attention; use disabled or breakable prefill CUDA graphs"
+        )
+
+
+def flashinfer_kda_prefill_default(model_runner: ModelRunner) -> Optional[str]:
+    """Default safe-gate KDA prefill to FlashInfer on SM100/SM103."""
+    from sglang.srt.configs.bailing_hybrid import BailingHybridConfig
+    from sglang.srt.configs.hybrid_arch import hybrid_kda_config
+
+    config = hybrid_kda_config(model_runner.model_config)
+    lower_bound = (
+        config.kda_lower_bound
+        if isinstance(config, BailingHybridConfig)
+        else config.linear_attn_config.get("gate_lower_bound")
+    )
+    execution = get_exec()
+    if (
+        lower_bound is not None
+        and execution.mamba.linear_attn_backend == "triton"
+        and not execution.deterministic.enable_deterministic_inference
+        and not execution.overlap.enable_two_batch_overlap
+        and execution.graph.cuda_graph_config.prefill.backend != CudaGraphBackend.FULL
+        and is_cuda()
+        and torch.cuda.get_device_capability() in ((10, 0), (10, 3))
+    ):
+        return "flashinfer"
+    return None
 
 
 class KDAKernelDispatcher:
@@ -53,6 +106,7 @@ class KDAKernelDispatcher:
         verify_backend: LinearAttnKernelBackend,
     ):
         self.verify_backend = verify_backend
+        self.prefill_backend = prefill_backend
         triton_kernel = TritonKDAKernel()
         self.triton_kernel = triton_kernel
         helion_kernel = None
@@ -84,7 +138,6 @@ class KDAKernelDispatcher:
             self.decode_kernel = CuteDSLKDAKernel()
         elif decode_backend.is_flashinfer():
             # FlashInfer recurrent_kda: SM100 decode + MTP (target_verify).
-            # Prefill stays on Triton / CuTe DSL (FlashInfer has no KDA chunk kernel).
             if not is_cuda():
                 raise ValueError("KDA FlashInfer backend requires CUDA")
             from sglang.srt.layers.attention.linear.kernels.kda_flashinfer import (
@@ -143,6 +196,14 @@ class KDAKernelDispatcher:
             )
 
             self.extend_kernel = FlashKDAKernel()
+        elif prefill_backend.is_flashinfer():
+            if not is_cuda():
+                raise ValueError("KDA FlashInfer prefill backend requires CUDA")
+            from sglang.srt.layers.attention.linear.kernels.kda_flashinfer_prefill import (
+                FlashInferKDAPrefillKernel,
+            )
+
+            self.extend_kernel = FlashInferKDAPrefillKernel()
         elif prefill_backend.is_cutedsl():
             if not is_cuda():
                 raise ValueError("KDA CuTe DSL backend requires CUDA")
@@ -172,7 +233,7 @@ class KDAKernelDispatcher:
             else:
                 self.extend_kernel = triton_kernel
                 rank0_log(
-                    "PTX KDA prefill needs SM103 (GB300); falling back to Triton "
+                    "PTX KDA prefill needs SM100 or SM103; falling back to Triton "
                     "extend."
                 )
         elif prefill_backend.is_nvidia_kda():
@@ -193,9 +254,9 @@ class KDAKernelDispatcher:
         else:
             raise ValueError(
                 f"Unsupported KDA prefill backend: {prefill_backend}. "
-                "KDA supports 'triton', 'helion', 'flashkda', 'cutedsl', "
+                "KDA supports 'triton', 'helion', 'flashinfer', 'flashkda', 'cutedsl', "
                 "'nvidia_kda', or 'ptx_kda' (cutedsl/nvidia_kda prefill need "
-                "SM100, ptx_kda SM103)."
+                "SM100, ptx_kda SM100 or SM103)."
             )
 
         self.supports_packed_decode = getattr(
@@ -330,10 +391,11 @@ class KDAKernelDispatcher:
             **kwargs,
         )
 
-    def effective_extend_kernel(self, lower_bound: Optional[float]):
-        """The kernel ``extend`` will actually run: safe-gate models reroute
-        kernels without ``supports_safe_gate`` to Triton."""
+    def effective_extend_kernel(self, lower_bound: Optional[float], num_tokens: int):
+        """The packed FlashInfer prefill kernel requires more than one token."""
         kernel = self.extend_kernel
+        if self.prefill_backend.is_flashinfer() and num_tokens <= 1:
+            return self.triton_kernel
         if lower_bound is not None and not getattr(kernel, "supports_safe_gate", True):
             kernel = self.triton_kernel
         return kernel
@@ -351,7 +413,7 @@ class KDAKernelDispatcher:
         query_start_loc: torch.Tensor,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        kernel = self.effective_extend_kernel(kwargs.get("lower_bound"))
+        kernel = self.effective_extend_kernel(kwargs.get("lower_bound"), q.shape[1])
         return kernel.extend(
             q,
             k,
@@ -399,8 +461,13 @@ class KDAAttnBackend(MambaAttnBackendBase):
     # force-flush path.
     needs_cpu_seq_lens: bool = False
 
+    # Set while a breakable prefill CUDA graph captures or replays a bucket:
+    # forward_extend then runs the graph-safe chain on these static tables.
+    prefill_graph_metadata: Optional[KDAPrefillGraphMetadata] = None
+
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
+        self.prefill_graph_max_seqs = envs.SGLANG_KDA_PREFILL_GRAPH_MAX_SEQS.get()
         # Needed by the extra_buffer track path: _init_track_conv_indices reads
         # conv_states_shape[-1] as the conv window length (kernel_size - 1).
         # The KDA pool stores conv states as [kernel-1, dim] — transposed vs
@@ -427,6 +494,12 @@ class KDAAttnBackend(MambaAttnBackendBase):
         self.kernel_dispatcher = KDAKernelDispatcher(
             decode_backend, prefill_backend, verify_backend
         )
+        if prefill_backend.is_flashinfer():
+            _validate_flashinfer_kda_prefill(
+                chunk_size=self.mamba_chunk_size,
+                enable_two_batch_overlap=get_exec().overlap.enable_two_batch_overlap,
+                prefill_cuda_graph_backend=get_exec().graph.cuda_graph_config.prefill.backend,
+            )
         # One-shot; emitted at the first fused-decode interception below.
         self._fused_override_notice = (
             "K3 fused KDA decode engaged: --linear-attn-decode-backend "
@@ -529,17 +602,140 @@ class KDAAttnBackend(MambaAttnBackendBase):
             metadata.fused_accept_num_accepted,
         )
 
+    def supports_prefill_graph_extend(self) -> bool:
+        return (
+            not envs.SGLANG_DISABLE_KDA_PREFILL_GRAPH_EXTEND.get()
+            # Only the Triton chain guards padded rows (-1 state slots, chunks past T).
+            and isinstance(self.kernel_dispatcher.extend_kernel, TritonKDAKernel)
+            # Fused-accept staging (flashinfer verify) writes per extend.
+            and self.accept_lens_pool is None
+        )
+
+    def prefill_graph_extend_active(self) -> bool:
+        return self.prefill_graph_metadata is not None
+
+    def init_prefill_graph_metadata(
+        self, forward_batch: ForwardBatch
+    ) -> KDAPrefillGraphMetadata:
+        cache_indices = self._prefill_graph_cache_indices(forward_batch)
+        meta = KDAPrefillGraphMetadata.allocate(
+            num_tokens=forward_batch.positions.shape[0],
+            max_seqs_cap=self.prefill_graph_max_seqs,
+            # Any replay of this bucket may carry prefix-cache snapshots (the
+            # extra buffer is only on with the radix cache).
+            track=get_exec().mamba.enable_mamba_extra_buffer,
+            cache_index_dtype=cache_indices.dtype,
+            device=self.device,
+        )
+        self._fill_prefill_graph_metadata(
+            meta=meta, forward_batch=forward_batch, cache_indices=cache_indices
+        )
+        return meta
+
+    def refresh_prefill_graph_metadata(
+        self, meta: KDAPrefillGraphMetadata, forward_batch: ForwardBatch
+    ) -> None:
+        self._fill_prefill_graph_metadata(
+            meta=meta,
+            forward_batch=forward_batch,
+            cache_indices=self._prefill_graph_cache_indices(forward_batch),
+        )
+
+    def _prefill_graph_cache_indices(self, forward_batch: ForwardBatch):
+        # Same slot resolution as MambaAttnBackendBase._forward_metadata.
+        cache_indices = self._translate_mamba_indices(
+            self.req_to_token_pool.get_mamba_indices(forward_batch.req_pool_indices)
+        )
+        real_bs = forward_batch._original_batch_size
+        if real_bs is not None and real_bs < cache_indices.shape[0]:
+            cache_indices = cache_indices.clone()
+            cache_indices[real_bs:] = -1
+        return cache_indices
+
+    def _fill_prefill_graph_metadata(
+        self,
+        *,
+        meta: KDAPrefillGraphMetadata,
+        forward_batch: ForwardBatch,
+        cache_indices: torch.Tensor,
+    ) -> None:
+        if forward_batch.mamba_track_indices is not None:
+            # Same one-time in-place translation as the eager metadata path.
+            forward_batch.mamba_track_indices = self._translate_mamba_indices(
+                forward_batch.mamba_track_indices
+            )
+        track_rows = None
+        if forward_batch.mamba_track_mask is not None:
+            assert meta.track, (
+                "prefix-cache track batch replayed on a bucket captured without "
+                "track tables"
+            )
+            track_rows = self._prefill_graph_track_rows(forward_batch)
+        meta.fill(
+            extend_seq_lens=list(forward_batch.extend_seq_lens_cpu),
+            cache_indices=cache_indices,
+            extend_prefix_lens=forward_batch.extend_prefix_lens,
+            track_rows=track_rows,
+        )
+        self.prefill_graph_metadata = meta
+
+    def _prefill_graph_track_rows(
+        self, forward_batch: ForwardBatch
+    ) -> Optional[KDAPrefillTrackRows]:
+        bs = forward_batch.batch_size
+        if self._has_cpu_prefill_track_metadata(forward_batch):
+            track_mask = list(forward_batch.mamba_prefill_track_mask_cpu)
+            track_seq_lens = list(forward_batch.mamba_track_seqlens_cpu)
+            extend_prefix_lens = list(forward_batch.extend_prefix_lens_cpu)
+        else:
+            # The same host copies the eager path takes without CPU metadata.
+            track_mask = forward_batch.mamba_track_mask[:bs].tolist()
+            track_seq_lens = forward_batch.mamba_track_seqlens[:bs].tolist()
+            extend_prefix_lens = forward_batch.extend_prefix_lens[:bs].tolist()
+        return build_track_rows(
+            track_mask=track_mask,
+            track_seq_lens=track_seq_lens,
+            extend_seq_lens=list(forward_batch.extend_seq_lens_cpu),
+            extend_prefix_lens=extend_prefix_lens,
+            state_chunk_size=self.mamba_chunk_size,
+            cache_chunk_size=mamba_cache_chunk_size(),
+            conv_len=self.conv_states_shape[-1],
+            dst=forward_batch.mamba_track_indices,
+        )
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        # An eager forward never runs on a graph bucket's tables.
+        self.prefill_graph_metadata = None
         super().init_forward_metadata(forward_batch)
         if self.forward_metadata.has_mamba_track_mask:
-            self.forward_metadata.mamba_track_mask_indices = (
-                forward_batch.mamba_track_mask.nonzero(as_tuple=True)[0]
-            )
+            if self.forward_metadata.mamba_track_mask_indices is None:
+                self.forward_metadata.mamba_track_mask_indices = (
+                    forward_batch.mamba_track_mask.nonzero(as_tuple=True)[0]
+                )
             self.forward_metadata.conv_states_mask_indices = (
                 forward_batch.mamba_track_indices[
                     self.forward_metadata.mamba_track_mask_indices
                 ]
             )
+            if (
+                self.kernel_dispatcher.extend_kernel.uses_state_checkpoints
+                and forward_batch.forward_mode.is_extend_without_speculative()
+                and self.forward_metadata.track_ssm_h_src is not None
+                and self.forward_metadata.track_ssm_h_src.numel() > 0
+            ):
+                from sglang.srt.layers.attention.linear.kernels.kda_flashinfer_prefill import (
+                    build_flashinfer_kda_checkpoint_plan,
+                )
+
+                assert self._has_cpu_prefill_track_metadata(forward_batch), (
+                    "FlashInfer KDA checkpoints require host prefill tracking metadata"
+                )
+                build_flashinfer_kda_checkpoint_plan(
+                    forward_batch,
+                    self.forward_metadata,
+                    self.device,
+                    self.mamba_chunk_size,
+                )
 
     def forward_decode(
         self,
@@ -643,7 +839,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             # The model deferred f_b only after publishing static fallback
             # weights. Materialize the original gate before entering the
             # unchanged conv + packed-KDA fallback chain.
-            from sglang.kernels.ops.kimi_k3 import kimi_k3_tiny_gemm
+            from sglang.kernels.ops.gemm import kimi_k3_tiny_gemm
 
             if fused_static is None:
                 raise RuntimeError("K3 deferred f_b is missing fallback weights")
@@ -791,6 +987,28 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
         return core_attn_out
 
+    def _convolve_prefill(
+        self,
+        layer: RadixLinearAttention,
+        forward_batch: ForwardBatch,
+        mixed_qkv: torch.Tensor,
+        conv_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        # Depthwise conv is channel-independent, so one packed call over the
+        # full qkv width matches the decode path and saves two kernel launches.
+        return causal_conv1d_fn(
+            mixed_qkv.transpose(0, 1),
+            layer.conv_weights,
+            layer.bias,
+            activation="silu",
+            conv_states=conv_states,
+            has_initial_state=forward_batch.extend_prefix_lens > 0,
+            cache_indices=cache_indices,
+            query_start_loc=self.forward_metadata.query_start_loc,
+            seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+        ).transpose(0, 1)
+
     def forward_extend(
         self,
         layer: RadixLinearAttention,
@@ -805,6 +1023,21 @@ class KDAAttnBackend(MambaAttnBackendBase):
         if forward_batch.forward_mode.is_target_verify():
             return self._forward_target_verify(layer, forward_batch, mixed_qkv, a, b)
 
+        if self.prefill_graph_metadata is not None:
+            # Breakable prefill CUDA graph bucket: host-free chain on static
+            # tables refreshed before each replay.
+            layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+            return kda_extend_in_graph(
+                layer=layer,
+                meta=self.prefill_graph_metadata,
+                conv_pool=layer_cache.conv[0],
+                ssm_states=layer_cache.temporal,
+                kernel_dispatcher=self.kernel_dispatcher,
+                mixed_qkv=mixed_qkv,
+                a=a,
+                b=b,
+            )
+
         query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
 
@@ -818,10 +1051,11 @@ class KDAAttnBackend(MambaAttnBackendBase):
             raise RuntimeError(
                 "extend_prefix_lens cannot be None in non-TARGET_VERIFY mode."
             )
-        has_initial_state = forward_batch.extend_prefix_lens > 0
 
         physical_num_tokens = mixed_qkv.shape[0]
-        logical_num_tokens = int(query_start_loc[-1])
+        logical_num_tokens = self.forward_metadata.logical_num_tokens
+        if logical_num_tokens is None:
+            logical_num_tokens = int(query_start_loc[-1])
         if logical_num_tokens < physical_num_tokens:
             mixed_qkv = mixed_qkv[:logical_num_tokens]
             a = a[:, :logical_num_tokens]
@@ -837,27 +1071,16 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 self.forward_metadata.conv_states_mask_indices
             ] = mixed_qkv[self.forward_metadata.track_conv_indices]
 
-        # Depthwise conv is channel-independent, so one packed call over the
-        # full qkv width matches the decode path and saves two kernel launches.
-        qkv = causal_conv1d_fn(
-            mixed_qkv.transpose(0, 1),
-            layer.conv_weights,
-            layer.bias,
-            activation="silu",
-            conv_states=conv_states,
-            has_initial_state=has_initial_state,
-            cache_indices=cache_indices,
-            query_start_loc=query_start_loc,
-            seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-        ).transpose(0, 1)
+        qkv = self._convolve_prefill(
+            layer, forward_batch, mixed_qkv, conv_states, cache_indices
+        )
         q, k, v = qkv.split([layer.q_dim, layer.k_dim, layer.v_dim], dim=-1)
 
         q = q.unflatten(-1, (-1, layer.head_q_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
         k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
         v = v.unflatten(-1, (-1, layer.head_v_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
 
-        gate_was_flat = a.ndim == 3
-        if gate_was_flat:
+        if a.ndim == 3:
             a = a.unflatten(-1, (-1, layer.head_k_dim))
 
         track_ssm = self.forward_metadata.has_mamba_track_mask
@@ -876,7 +1099,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             # Check the kernel the dispatcher will actually run (safe-gate
             # reroute included), not just the configured one.
             extend_kernel = self.kernel_dispatcher.effective_extend_kernel(
-                layer.lower_bound
+                layer.lower_bound, q.shape[1]
             )
             assert extend_kernel.supports_track_state_snapshot, (
                 f"{type(extend_kernel).__name__} cannot write the fp32 track "
@@ -901,8 +1124,10 @@ class KDAAttnBackend(MambaAttnBackendBase):
             A_log=layer.A_log,
             dt_bias=layer.dt_bias,
             lower_bound=layer.lower_bound,
-            beta_is_raw=gate_was_flat,
+            beta_is_raw=True,
             extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            extend_prefix_lens=forward_batch.extend_prefix_lens,
+            layer_id=layer.layer_id,
             # draft_extend_v2 must stay rollback-able, so kernels that commit state
             # in place (e.g. FlashKDA) must not run for it.
             is_spec_decode=forward_batch.forward_mode.is_draft_extend_v2(),
@@ -915,6 +1140,13 @@ class KDAAttnBackend(MambaAttnBackendBase):
             ),
             track_state=h_track_buf,
             track_chunk_idx=(track_chunk_idx if h_track_buf is not None else None),
+            state_checkpoint_cu_starts=self.forward_metadata.state_checkpoint_cu_starts,
+            num_state_checkpoints=self.forward_metadata.num_state_checkpoints,
+            state_checkpoint_every_n_tokens=(
+                self.forward_metadata.state_checkpoint_every_n_tokens
+            ),
+            state_checkpoint_indices=self.forward_metadata.state_checkpoint_indices,
+            track_ssm_h_batch_src=self.forward_metadata.track_ssm_h_batch_src,
         )
         if track_ssm:
             # Snapshot the SSM state at the last track-aligned chunk boundary
@@ -988,8 +1220,34 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 "KDA target_verify requires a speculative mamba cache "
                 "(MambaPool.SpeculativeState); none found."
             )
+        # ReplaySSM: the ring-write is fused into the verify kernel
+        # (CACHE_RING) on both the fused chain-verify and the unfused triton
+        # paths; commit replays the ring instead of reading per-step
+        # snapshots. ring_kwargs stays empty for non-triton verify kernels,
+        # which never see replayssm. Ragged layouts work natively on the
+        # unfused path -- step_idx is the within-row step under varlen, so
+        # row i writes ring[slot][0..verify_lens[i]) and commit folds at most
+        # commit_lens of them (absorb overflow is bounded in-kernel).
+        replayssm_rawk = replayssm_g = replayssm_beta = None
+        ring_kwargs = {}
+        if replayssm_on:
+            replayssm_rawk = mamba_cache_params.replayssm_rawk
+            replayssm_g = mamba_cache_params.replayssm_g
+            replayssm_beta = mamba_cache_params.replayssm_beta
+            ring_kwargs = dict(
+                cache_ring=True,
+                replayssm_rawv=replayssm_rawv,
+                replayssm_rawk=replayssm_rawk,
+                replayssm_g=replayssm_g,
+                replayssm_beta=replayssm_beta,
+            )
         intermediate_conv_window_cache = mamba_cache_params.intermediate_conv_window[0]
-        intermediate_state_indices = self.verify_intermediate_state_indices
+        intermediate_state_indices = select_verify_intermediate_state_indices(
+            self.verify_intermediate_state_indices,
+            forward_batch.req_pool_indices,
+            cache_indices[: query_start_loc.shape[0] - 1] >= 0,
+            self.req_to_token_pool.size,
+        )
 
         draft_token_num = forward_batch.spec_info.draft_token_num
         ragged_layout = forward_batch.spec_info.ragged_verify_layout
@@ -1047,6 +1305,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 retrieve_next_sibling=retrieve_next_sibling,
                 retrieve_parent_token=retrieve_parent_token,
                 replayssm_rawv=replayssm_rawv,
+                replayssm_rawk=replayssm_rawk,
+                replayssm_g=replayssm_g,
+                replayssm_beta=replayssm_beta,
             ):
                 return self._fused_chain_verify_fn(
                     mixed_qkv=mixed_qkv,
@@ -1077,6 +1338,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
                     head_k_dim=layer.head_k_dim,
                     head_v_dim=layer.head_v_dim,
                     lower_bound=layer.lower_bound,
+                    **ring_kwargs,
                 )
             dense_token_indices = None
             mixed_qkv_dense = mixed_qkv.view(batch_size, draft_token_num, -1)
@@ -1134,22 +1396,6 @@ class KDAAttnBackend(MambaAttnBackendBase):
         q = q.unflatten(-1, (-1, layer.head_q_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
         k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)
         v = v.unflatten(-1, (-1, layer.head_v_dim)).unsqueeze(0)
-
-        # ReplaySSM: the ring-write is fused into the triton verify kernel
-        # (CACHE_RING). Ragged layouts work natively -- step_idx is the
-        # within-row step under varlen, so row i writes
-        # ring[slot][0..verify_lens[i]) and commit folds at most commit_lens
-        # of them (absorb overflow is bounded in-kernel). ring_kwargs stays
-        # empty for non-triton verify kernels, which never see replayssm.
-        ring_kwargs = {}
-        if replayssm_rawv is not None:
-            ring_kwargs = dict(
-                cache_ring=True,
-                replayssm_rawv=replayssm_rawv,
-                replayssm_rawk=mamba_cache_params.replayssm_rawk,
-                replayssm_g=mamba_cache_params.replayssm_g,
-                replayssm_beta=mamba_cache_params.replayssm_beta,
-            )
 
         core_attn_out = self.kernel_dispatcher.target_verify(
             A_log=layer.A_log,
@@ -1210,10 +1456,13 @@ class KDAAttnBackend(MambaAttnBackendBase):
         retrieve_next_sibling: Optional[torch.Tensor],
         retrieve_parent_token: Optional[torch.Tensor],
         replayssm_rawv: Optional[torch.Tensor],
+        replayssm_rawk: Optional[torch.Tensor],
+        replayssm_g: Optional[torch.Tensor],
+        replayssm_beta: Optional[torch.Tensor],
     ) -> bool:
         if self._fused_chain_verify_fn is None or not mixed_qkv.is_cuda:
             return False
-        if replayssm_rawv is not None or any(
+        if any(
             value is not None
             for value in (
                 retrieve_next_token,
@@ -1222,6 +1471,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             )
         ):
             return False
+        replayssm_on = replayssm_rawv is not None
         if draft_token_num < 3 or mixed_qkv.shape[0] % draft_token_num != 0:
             return False
         if (
@@ -1240,6 +1490,25 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
         seq_len, dim = mixed_qkv.shape
         batch_size = seq_len // draft_token_num
+        if replayssm_on and (
+            batch_size != 1 or not (get_platform().is_sm90 or get_platform().is_sm100)
+        ):
+            # The runtime still uses BV=4, not the benchmark's best-BV sweep:
+            # fused+ring wins at B=1 but regresses from B=4 (B=2 at T=8) on
+            # both enabled architectures. Keep the ring path conservative until
+            # other batch/architecture combinations are measured. The snapshot
+            # path and the separate CuTe path are unchanged.
+            return False
+        if is_hip() and not (
+            is_gfx95_supported()
+            and 1 <= batch_size <= 16
+            and draft_token_num in (6, 8)
+            and mixed_qkv.dtype == torch.bfloat16
+            and layer.conv_weights.dtype == torch.float32
+        ):
+            # measured gfx950 wins only: larger batches lose the launch saving to
+            # duplicated convolution work
+            return False
         expected_dim = (
             2 * layer.num_q_heads * layer.head_k_dim
             + layer.num_v_heads * layer.head_v_dim
@@ -1273,7 +1542,21 @@ class KDAAttnBackend(MambaAttnBackendBase):
             layer.A_log.dtype != torch.float32
             or layer.dt_bias.dtype != torch.float32
             or ssm_states.dtype != torch.float32
-            or intermediate_state_cache is None
+        ):
+            return False
+        if replayssm_on:
+            if not self._replayssm_ring_ok(
+                layer=layer,
+                draft_token_num=draft_token_num,
+                mixed_qkv=mixed_qkv,
+                replayssm_rawv=replayssm_rawv,
+                replayssm_rawk=replayssm_rawk,
+                replayssm_g=replayssm_g,
+                replayssm_beta=replayssm_beta,
+            ):
+                return False
+        elif (
+            intermediate_state_cache is None
             or intermediate_state_cache.dtype != torch.float32
         ):
             return False
@@ -1283,7 +1566,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             or b.stride(-1) != 1
             or not conv_states.is_contiguous()
             or not ssm_states.is_contiguous()
-            or not intermediate_state_cache.is_contiguous()
+            or (not replayssm_on and not intermediate_state_cache.is_contiguous())
         ):
             return False
         if (
@@ -1301,10 +1584,15 @@ class KDAAttnBackend(MambaAttnBackendBase):
             or ssm_states.ndim != 4
             or tuple(ssm_states.shape[-3:])
             != (layer.num_v_heads, layer.head_v_dim, layer.head_k_dim)
-            or intermediate_state_cache.ndim != 5
-            or intermediate_state_cache.shape[1] < draft_token_num
-            or tuple(intermediate_state_cache.shape[-3:])
-            != (layer.num_v_heads, layer.head_v_dim, layer.head_k_dim)
+            or (
+                not replayssm_on
+                and (
+                    intermediate_state_cache.ndim != 5
+                    or intermediate_state_cache.shape[1] < draft_token_num
+                    or tuple(intermediate_state_cache.shape[-3:])
+                    != (layer.num_v_heads, layer.head_v_dim, layer.head_k_dim)
+                )
+            )
         ):
             return False
         if (
@@ -1324,14 +1612,75 @@ class KDAAttnBackend(MambaAttnBackendBase):
             b,
             conv_states,
             ssm_states,
-            intermediate_state_cache,
             intermediate_conv_window_cache,
             cache_indices,
             intermediate_state_indices,
         )
         if layer.bias is not None:
             tensors += (layer.bias,)
+        # Ring devices are validated in _replayssm_ring_ok.
+        if not replayssm_on:
+            tensors += (intermediate_state_cache,)
         return all(tensor.device == mixed_qkv.device for tensor in tensors)
+
+    @staticmethod
+    def _replayssm_ring_ok(
+        *,
+        layer: RadixLinearAttention,
+        draft_token_num: int,
+        mixed_qkv: torch.Tensor,
+        replayssm_rawv: torch.Tensor,
+        replayssm_rawk: Optional[torch.Tensor],
+        replayssm_g: Optional[torch.Tensor],
+        replayssm_beta: Optional[torch.Tensor],
+    ) -> bool:
+        """Whether the per-layer ReplaySSM rings fit the fused ring-write.
+
+        Layouts follow memory_pool.py's KDA spec rings: rawv [slots, HV, L, V]
+        and rawk [slots, H, L, K] in the activation dtype, g [slots, HV, L, K]
+        fp32 (per-K KDA gate), beta [slots, HV, L] fp32. The kernel uses
+        stride(0) as the slot pitch and assumes packed inner dims; anything
+        else falls back to the unfused path, which handles it.
+        """
+        if replayssm_rawk is None or replayssm_g is None or replayssm_beta is None:
+            return False
+        if (
+            replayssm_rawv.ndim != 4
+            or replayssm_rawk.ndim != 4
+            or replayssm_g.ndim != 4
+            or replayssm_beta.ndim != 3
+        ):
+            return False
+        H, HV = layer.num_q_heads, layer.num_v_heads
+        K, V = layer.head_k_dim, layer.head_v_dim
+        ring_len = replayssm_rawv.shape[-2]
+        if ring_len < draft_token_num:
+            return False
+        if (
+            tuple(replayssm_rawv.shape[1:]) != (HV, ring_len, V)
+            or tuple(replayssm_rawk.shape[1:]) != (H, ring_len, K)
+            or tuple(replayssm_g.shape[1:]) != (HV, ring_len, K)
+            or tuple(replayssm_beta.shape[1:]) != (HV, ring_len)
+        ):
+            return False
+        if (
+            replayssm_rawv.dtype != mixed_qkv.dtype
+            or replayssm_rawk.dtype != mixed_qkv.dtype
+            or replayssm_g.dtype != torch.float32
+            or replayssm_beta.dtype != torch.float32
+        ):
+            return False
+        if (
+            replayssm_rawv.stride()[1:] != (ring_len * V, V, 1)
+            or replayssm_rawk.stride()[1:] != (ring_len * K, K, 1)
+            or replayssm_g.stride()[1:] != (ring_len * K, K, 1)
+            or replayssm_beta.stride()[1:] != (ring_len, 1)
+        ):
+            return False
+        return all(
+            ring.device == mixed_qkv.device
+            for ring in (replayssm_rawv, replayssm_rawk, replayssm_g, replayssm_beta)
+        )
 
     def _can_run_dspark_cutedsl_mtp(
         self,
@@ -1438,7 +1787,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         replayssm_g: Optional[torch.Tensor] = None,
         replayssm_beta: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        from sglang.kernels.ops.kimi_k3.kda_decode_mtp import (
+        from sglang.kernels.ops.attention.kda_decode_mtp import (
             fused_kda_decode_mtp_dspark,
         )
 
@@ -1477,6 +1826,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             onorm_eps = None
             onorm_gate = None
 
+        a = a.reshape(1, seq_len, h, layer.head_k_dim)
         out = fused_kda_decode_mtp_dspark(
             x_q=x_q,
             x_k=x_k,

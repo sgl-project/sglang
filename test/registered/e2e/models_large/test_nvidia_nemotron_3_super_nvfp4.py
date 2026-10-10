@@ -12,7 +12,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=1200, stage="nightly", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=1600, stage="nightly", runner_config="4-gpu-b200")
 
 NEMOTRON_3_SUPER_NVFP4_MODEL = "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
 
@@ -30,9 +30,8 @@ NEMOTRON_3_SUPER_NVFP4_ARGS = [
 ]
 
 DP_ATTENTION_EP_ARGS = [
-    "--dp-size",
+    "--attn-dp-size",
     "4",
-    "--enable-dp-attention",
     "--enable-dp-lm-head",
     "--ep-size",
     "4",
@@ -70,7 +69,7 @@ MTP_ARGS = [
 ]
 
 
-def _run_gsm8k(test_case):
+def _run_gsm8k(test_case, threshold=0.96):
     args = SimpleNamespace(
         model=test_case.model,
         eval_name="gsm8k",
@@ -82,12 +81,12 @@ def _run_gsm8k(test_case):
         temperature=1.0,
         top_p=0.95,
         base_url=test_case.base_url,
-        host="http://127.0.0.1",
+        host="127.0.0.1",
         port=int(test_case.base_url.split(":")[-1]),
     )
     metrics = run_eval(args)
     print(f"{metrics=}")
-    test_case.assertGreaterEqual(metrics["score"], 0.96)
+    test_case.assertGreaterEqual(metrics["score"], threshold)
 
 
 class TestNvidiaNemotron3SuperNVFP4(CustomTestCase):
@@ -109,6 +108,33 @@ class TestNvidiaNemotron3SuperNVFP4(CustomTestCase):
 
     def test_gsm8k(self):
         _run_gsm8k(self)
+
+
+class TestNvidiaNemotron3SuperNVFP4PerToken(CustomTestCase):
+    """Per-token NVFP4 activations on the FlashInfer TRT-LLM ReLU2 MoE."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = NEMOTRON_3_SUPER_NVFP4_MODEL
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        with (
+            envs.SGLANG_ENABLE_ASYNC_ASSERT.override(0),
+            envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.override(True),
+        ):
+            cls.process = popen_launch_server(
+                cls.model,
+                cls.base_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=NEMOTRON_3_SUPER_NVFP4_ARGS
+                + ["--moe-runner-backend", "flashinfer_trtllm"],
+            )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def test_gsm8k(self):
+        _run_gsm8k(self, threshold=0.93)
 
 
 class TestNvidiaNemotron3SuperNVFP4MTP(CustomTestCase):

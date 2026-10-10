@@ -22,8 +22,8 @@ from sglang.multimodal_gen.runtime.layers.quantization.comfy_fp8 import ComfyFp8
 from sglang.multimodal_gen.runtime.layers.quantization.comfy_nvfp4 import (
     ComfyNvfp4Config,
 )
-from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_int8_config import (
-    KitchenInt8Config,
+from sglang.multimodal_gen.runtime.layers.quantization.configs.convrot_int8_config import (
+    ConvRotInt8Config,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_w4a4_config import (
     KitchenW4A4Config,
@@ -395,7 +395,7 @@ def resolve_comfy_checkpoint_quantization(
         return None
     formats = sorted({str(marker.get("format")) for marker in layer_markers.values()})
     if formats == ["int8_tensorwise"]:
-        return KitchenInt8Config(layer_markers=layer_markers)
+        return ConvRotInt8Config(layer_markers=layer_markers)
     if formats == ["asym_w4a8_int8"]:
         return KitchenW4A8Config(layer_markers)
     if formats == ["asym_w4a8_int8", "int8_tensorwise"]:
@@ -436,14 +436,6 @@ def normalize_flat_modelopt_quant_config(
     normalized = dict(quant_cfg)
     normalized.setdefault("quant_type", quant_algo)
     return normalized
-
-
-def _infer_nvfp4_group_size_from_tensors(weight, scale) -> Optional[int]:
-    """Infer NVFP4 group_size from serialized weight/scale tensor shapes."""
-    return _infer_nvfp4_group_size_from_shapes(
-        getattr(weight, "shape", ()),
-        getattr(scale, "shape", ()),
-    )
 
 
 def _infer_nvfp4_group_size_from_shapes(weight_shape, scale_shape) -> Optional[int]:
@@ -741,7 +733,7 @@ def _canonicalize_modulation_exclude(module_name: str) -> str:
     return module_name
 
 
-def _build_nvfp4_config_from_safetensors_files(
+def build_nvfp4_config_from_safetensors_list(
     file_paths: list[str],
     param_names_mapping_dict: Optional[dict] = None,
     reverse_param_names_mapping_dict: Optional[dict] = None,
@@ -953,32 +945,3 @@ def _build_nvfp4_config_from_safetensors_files(
             e,
         )
         return None
-
-
-def build_nvfp4_config_from_safetensors(
-    file_path: str,
-    param_names_mapping_dict: Optional[dict] = None,
-    reverse_param_names_mapping_dict: Optional[dict] = None,
-    fallback_group_size: Optional[int] = None,
-) -> Optional[QuantizationConfig]:
-    """Backward-compatible wrapper for a single safetensors file."""
-    return _build_nvfp4_config_from_safetensors_files(
-        [file_path],
-        param_names_mapping_dict,
-        reverse_param_names_mapping_dict,
-        fallback_group_size,
-    )
-
-
-def build_nvfp4_config_from_safetensors_list(
-    file_paths: list[str],
-    param_names_mapping_dict: Optional[dict] = None,
-    reverse_param_names_mapping_dict: Optional[dict] = None,
-    fallback_group_size: Optional[int] = None,
-) -> Optional[QuantizationConfig]:
-    return _build_nvfp4_config_from_safetensors_files(
-        file_paths,
-        param_names_mapping_dict,
-        reverse_param_names_mapping_dict,
-        fallback_group_size,
-    )

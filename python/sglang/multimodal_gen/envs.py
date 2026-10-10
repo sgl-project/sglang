@@ -5,11 +5,20 @@
 
 import logging
 import os
+import warnings
 from typing import TYPE_CHECKING, Any, Callable
 
 from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
 
 logger = logging.getLogger(__name__)
+
+if "SGLANG_DIFFUSION_TRACE_FUNCTION" in os.environ:
+    warnings.warn(
+        "SGLANG_DIFFUSION_TRACE_FUNCTION was unused and has been removed. "
+        "Use Python profiling tools for function-level tracing.",
+        FutureWarning,
+        stacklevel=2,
+    )
 
 if TYPE_CHECKING:
     SGLANG_DIFFUSION_NCCL_SO_PATH: str | None = None
@@ -20,7 +29,6 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_CONFIG_ROOT: str = os.path.expanduser("~/.config/sgl_diffusion")
     SGLANG_DIFFUSION_LOGGING_LEVEL: str = "INFO"
     SGLANG_DIFFUSION_LOGGING_PREFIX: str = ""
-    SGLANG_DIFFUSION_TRACE_FUNCTION: int = 0
     SGLANG_DIFFUSION_DISABLE_EARLY_VAE_DECODER_CAST: bool = False
     SGLANG_DIFFUSION_DISABLE_VAE_DECODER_STORE: bool = False
     SGLANG_DIFFUSION_DISABLE_MAPPED_WILLNEED: bool = False
@@ -28,7 +36,6 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_DEBUG_HOST_MEMORY: bool = False
     SGLANG_DIFFUSION_DEBUG_LAYERWISE_TIMING: bool = False
     SGLANG_DIFFUSION_DISABLE_LORA_MERGE_CACHE: bool = False
-    SGLANG_DIFFUSION_WORKER_MULTIPROC_METHOD: str = "fork"
     SGLANG_DIFFUSION_TARGET_DEVICE: str = "cuda"
     SGLANG_DIFFUSION_PLATFORM_OVERRIDE: str = ""
     SGLANG_EXTERNAL_MODEL_PACKAGE: str = ""
@@ -36,6 +43,7 @@ if TYPE_CHECKING:
     NVCC_THREADS: str | None = None
     CMAKE_BUILD_TYPE: str | None = None
     VERBOSE: bool = False
+    SGLANG_DIFFUSION_DISABLE_SP_PAD_MASK: bool = False
     SGLANG_DIFFUSION_SERVER_DEV_MODE: bool = False
     SGLANG_DIFFUSION_DISABLE_MAPPED_COURIER: bool = False
     SGLANG_DIFFUSION_HOST_SPILL_DIR: str = os.path.expanduser(
@@ -48,12 +56,23 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY: bool = False
     SGLANG_DIFFUSION_MINIMAX_H3_ADALN_GPU_PLANS: int = 64
     SGLANG_DIFFUSION_MINIMAX_H3_ADALN_FP32: bool = False
+    SGLANG_DIFFUSION_CONVROT_INT8_BACKEND: str = "auto"
+    SGLANG_DIFFUSION_MINIMAX_H3_PDD_HEADS: str | None = None
+    SGLANG_DIFFUSION_FLUX3_NATTEN_BACKEND: str | None = None
     SGLANG_DIFFUSION_CFG_GATE_STEP: float = 1.0
     # cache-dit env vars (primary transformer)
     # on by default; engages only on 2 ranks with peer-to-peer access and falls
     # back to NCCL when unavailable. Set 0 to force NCCL. Keep this in step with
     # the resolver below -- that is the value the runtime reads.
     SGLANG_DIFFUSION_IPC_A2A: bool = True
+    # copy-engine all-to-all for Ulysses groups of any size on one host; off by
+    # default while it is validated. Falls back to NCCL when unavailable.
+    SGLANG_DIFFUSION_IPC_A2A_MULTI: bool = False
+    # head groups for pipelining MiniMax-H3's Ulysses exchange against dense
+    # attention over the copy-engine transport: -1 picks a count that divides
+    # the heads per rank and steps aside when its buffers do not fit, 0 or 1
+    # keeps the sequential exchange, N >= 2 forces N groups
+    SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS: int = -1
     # a deadlock backstop, not a per-step budget: a rank can legitimately stall
     # for seconds (layerwise offload, wan2.2 expert-tower swaps), and expiry now
     # retires the transport on every rank and fails the request
@@ -69,6 +88,11 @@ if TYPE_CHECKING:
     SGLANG_CACHE_DIT_MC: int = 3
     SGLANG_CACHE_DIT_TAYLORSEER: bool = False
     SGLANG_CACHE_DIT_TS_ORDER: int = 1
+    SGLANG_CACHE_DIT_DMD: bool = False
+    SGLANG_CACHE_DIT_DMD_HISTORY: int = 6
+    SGLANG_CACHE_DIT_DMD_RANK: int = 0
+    SGLANG_CACHE_DIT_DMD_RIDGE: float = 1e-8
+    SGLANG_CACHE_DIT_DMD_SVD_PRECISION: str = "medium"
     SGLANG_CACHE_DIT_SCM_PRESET: str = "none"
     SGLANG_CACHE_DIT_SCM_COMPUTE_BINS: str | None = None
     SGLANG_CACHE_DIT_SCM_CACHE_BINS: str | None = None
@@ -81,12 +105,18 @@ if TYPE_CHECKING:
     SGLANG_CACHE_DIT_SECONDARY_MC: int = 3
     SGLANG_CACHE_DIT_SECONDARY_TAYLORSEER: bool = False
     SGLANG_CACHE_DIT_SECONDARY_TS_ORDER: int = 1
+    SGLANG_CACHE_DIT_SECONDARY_DMD: bool = False
+    SGLANG_CACHE_DIT_SECONDARY_DMD_HISTORY: int = 6
+    SGLANG_CACHE_DIT_SECONDARY_DMD_RANK: int = 0
+    SGLANG_CACHE_DIT_SECONDARY_DMD_RIDGE: float = 1e-8
+    SGLANG_CACHE_DIT_SECONDARY_DMD_SVD_PRECISION: str = "medium"
     # model loading
     SGLANG_USE_RUNAI_MODEL_STREAMER: bool = True
     SGLANG_LINGBOT_ENABLE_INTERACTIVE_KV_WINDOW: bool = False
     SGLANG_LINGBOT_LAZY_VAE_ENCODE_BLACK_FRAMES: int | None = None
     SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND: str | None = None
     SGLANG_DIFFUSION_ENABLE_W8A8_FP8_GEMM: bool = False
+    SGLANG_DIFFUSION_MXFP8_FA_HEAD_CHUNK_SIZE: int = 4
     SGLANG_DIFFUSION_FP8_WEIGHT_DEQUANT_CACHE: bool = True
     SGLANG_DIFFUSION_ENABLE_COSMOS3_STEP_MIXED_PRECISION: bool = True
     SGLANG_DIFFUSION_COSMOS3_STEP_MIXED_PRECISION_FIRST_STEPS: int = 3
@@ -215,10 +245,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # if set, SGLANG_DIFFUSION_LOGGING_PREFIX will be prepended to all log messages
     "SGLANG_DIFFUSION_LOGGING_PREFIX": _lazy_str("SGLANG_DIFFUSION_LOGGING_PREFIX", ""),
-    # Trace function calls
-    # If set to 1, sgl_diffusion will trace function calls
-    # Useful for debugging
-    "SGLANG_DIFFUSION_TRACE_FUNCTION": _lazy_int("SGLANG_DIFFUSION_TRACE_FUNCTION", 0),
     # Path to the attention configuration file. Only used for sliding tile
     # attention for now.
     "SGLANG_DIFFUSION_ATTENTION_CONFIG": _lazy_path(
@@ -228,13 +254,29 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_ATTENTION_BACKEND": _lazy_str(
         "SGLANG_DIFFUSION_ATTENTION_BACKEND"
     ),
-    # Use dedicated multiprocess context for workers.
-    # Both spawn and fork work
-    "SGLANG_DIFFUSION_WORKER_MULTIPROC_METHOD": _lazy_str(
-        "SGLANG_DIFFUSION_WORKER_MULTIPROC_METHOD", "fork"
+    # MXFP8 Attention quantization
+    # Applies to both online ``MXFP8Config`` and offline ``ModelSlimConfig`` (W8A8_MXFP8)
+    # Q/K/V are getting offline rotating in case of rotation matrices in quant_config
+    # Otherwise rotation matrix are generating online
+    "SGLANG_DIFFUSION_ENABLE_MXFP8_ATTENTION": _lazy_bool(
+        "SGLANG_DIFFUSION_ENABLE_MXFP8_ATTENTION", "false"
     ),
-    # Internal per-worker platform override used by disaggregated role launch.
-    # Empty means normal platform auto-detection.
+    # Number of attention heads processed by each MXFP8 FA call.
+    # Smaller chunks can improve performance for large head counts
+    # The default value set to 4 is better for video generation
+    # For image generation task depends on image quality and the model config
+    "SGLANG_DIFFUSION_MXFP8_FA_HEAD_CHUNK_SIZE": _lazy_int(
+        "SGLANG_DIFFUSION_MXFP8_FA_HEAD_CHUNK_SIZE", 4
+    ),
+    # Drop the SP tail-pad attention mask and run dense (unmasked) attention on
+    # the padded layout, instead of the packed-varlen path. Applies only when
+    # sequence parallelism is active and the mask is derived purely from the
+    # shard pad span.
+    "SGLANG_DIFFUSION_DISABLE_SP_PAD_MASK": _lazy_bool(
+        "SGLANG_DIFFUSION_DISABLE_SP_PAD_MASK"
+    ),
+    # Select a built-in platform or an installed platform entry point.
+    # Empty means automatic plugin activation followed by built-in detection.
     "SGLANG_DIFFUSION_PLATFORM_OVERRIDE": _lazy_str(
         "SGLANG_DIFFUSION_PLATFORM_OVERRIDE", ""
     ),
@@ -292,7 +334,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Plan slots in the MiniMax-H3 --minimax-h3-adaln-online GPU slab
     # (9.25 MiB per slot-timestep; 64 x width 4 = 2.31 GiB). A request needs
-    # up to num_inference_steps - 1 slots; the default covers the 50-step
+    # up to num_inference_steps slots; the default covers the 50-step
     # serving schedule, so this is an escape hatch, not a deployment knob.
     "SGLANG_DIFFUSION_MINIMAX_H3_ADALN_GPU_PLANS": _lazy_int(
         "SGLANG_DIFFUSION_MINIMAX_H3_ADALN_GPU_PLANS", 64
@@ -307,6 +349,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # last conditional-minus-unconditional residual. Keep 1.0 to disable.
     "SGLANG_DIFFUSION_CFG_GATE_STEP": _lazy_float(
         "SGLANG_DIFFUSION_CFG_GATE_STEP", 1.0
+    ),
+    # Kernel backend for convrot_int8 (online or serialized ConvRot INT8):
+    # "auto" prefers SGLang's JIT-compiled convrot_int8 ops where they build
+    # and run (CC 9.0, 10.0, 12.0, 12.1 with nvcc) and falls back to
+    # comfy_kitchen; "jit" or "comfy_kitchen" forces one backend.
+    "SGLANG_DIFFUSION_CONVROT_INT8_BACKEND": _lazy_str(
+        "SGLANG_DIFFUSION_CONVROT_INT8_BACKEND", "auto"
+    ),
+    # Path to a Parallel Decoding Distillation head stack (one fused output head
+    # per denoise step, produced by fuse_minimax_h3_pdd_heads.py). Set only when serving a
+    # PDD-distilled checkpoint; an ordinary run leaves the projection alone.
+    "SGLANG_DIFFUSION_MINIMAX_H3_PDD_HEADS": _lazy_str(
+        "SGLANG_DIFFUSION_MINIMAX_H3_PDD_HEADS"
+    ),
+    # NATTEN backend of the FLUX 3 video VAE (blackwell-fna, hopper-fna,
+    # cutlass-fna or flex-fna); probed per GPU when unset.
+    "SGLANG_DIFFUSION_FLUX3_NATTEN_BACKEND": _lazy_str(
+        "SGLANG_DIFFUSION_FLUX3_NATTEN_BACKEND"
     ),
     "SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D": _lazy_str(
         "SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D", "auto"
@@ -353,6 +413,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable cache-dit acceleration for DiT inference
     # CUDA-IPC transport for 2-rank Ulysses all-to-all (NVLink same-node)
     "SGLANG_DIFFUSION_IPC_A2A": _lazy_bool("SGLANG_DIFFUSION_IPC_A2A", "true"),
+    "SGLANG_DIFFUSION_IPC_A2A_MULTI": _lazy_bool(
+        "SGLANG_DIFFUSION_IPC_A2A_MULTI", "false"
+    ),
+    "SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS": _lazy_int(
+        "SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS", -1
+    ),
     "SGLANG_DIFFUSION_IPC_A2A_TIMEOUT_MS": _lazy_float(
         "SGLANG_DIFFUSION_IPC_A2A_TIMEOUT_MS", 10000.0
     ),
@@ -374,6 +440,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_CACHE_DIT_TAYLORSEER": _lazy_bool("SGLANG_CACHE_DIT_TAYLORSEER", "false"),
     # TaylorSeer order (1 or 2)
     "SGLANG_CACHE_DIT_TS_ORDER": _lazy_int("SGLANG_CACHE_DIT_TS_ORDER", 1),
+    # Enable DMD (Dynamic Mode Decomposition) calibrator (mutually exclusive
+    # with TaylorSeer). DMD forecasts Bn residuals via an exponential basis.
+    "SGLANG_CACHE_DIT_DMD": _lazy_bool("SGLANG_CACHE_DIT_DMD", "false"),
+    # DMD snapshot window length (>= 4 uniformly spaced snapshots to engage)
+    "SGLANG_CACHE_DIT_DMD_HISTORY": _lazy_int("SGLANG_CACHE_DIT_DMD_HISTORY", 6),
+    # DMD SVD truncation rank (0 = automatic)
+    "SGLANG_CACHE_DIT_DMD_RANK": _lazy_int("SGLANG_CACHE_DIT_DMD_RANK", 0),
+    # DMD Tikhonov regularisation term added to inverted singular values
+    "SGLANG_CACHE_DIT_DMD_RIDGE": _lazy_float("SGLANG_CACHE_DIT_DMD_RIDGE", 1e-8),
+    # DMD SVD precision mode: low, medium, high
+    "SGLANG_CACHE_DIT_DMD_SVD_PRECISION": _lazy_str(
+        "SGLANG_CACHE_DIT_DMD_SVD_PRECISION", "medium"
+    ),
     # SCM preset: none, slow, medium, fast, ultra
     "SGLANG_CACHE_DIT_SCM_PRESET": _lazy_str("SGLANG_CACHE_DIT_SCM_PRESET", "none"),
     # SCM custom compute bins (e.g., "8,3,3,2,2")
@@ -450,6 +529,10 @@ _CACHE_DIT_SECONDARY_CONFIGS = [
     ("RDT", float, "0.24"),
     ("MC", int, "3"),
     ("TS_ORDER", int, "1"),
+    ("DMD_HISTORY", int, "6"),
+    ("DMD_RANK", int, "0"),
+    ("DMD_RIDGE", float, "1e-8"),
+    ("DMD_SVD_PRECISION", str, "medium"),
 ]
 
 
@@ -482,6 +565,17 @@ def _secondary_taylorseer_getter():
 environment_variables["SGLANG_CACHE_DIT_SECONDARY_TAYLORSEER"] = (
     _secondary_taylorseer_getter
 )
+
+
+# Special handling for boolean secondary var (DMD)
+def _secondary_dmd_getter():
+    return get_bool_env_var(
+        "SGLANG_CACHE_DIT_SECONDARY_DMD",
+        default=os.getenv("SGLANG_CACHE_DIT_DMD", "false"),
+    )
+
+
+environment_variables["SGLANG_CACHE_DIT_SECONDARY_DMD"] = _secondary_dmd_getter
 
 
 # end-env-vars-definition

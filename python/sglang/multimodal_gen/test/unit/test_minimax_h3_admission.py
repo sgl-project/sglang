@@ -248,7 +248,7 @@ def test_hybrid_override_loads_ref_config_and_admits_all_native_tasks(weights):
     stage = MiniMaxH3PartitionAdmissionStage(pipeline.release_metadata)
     for task in ("t2va", "fl2va", "ref2va"):
         batch = SimpleNamespace(
-            sampling_params=SimpleNamespace(task=task, quality="lossless"),
+            sampling_params=SimpleNamespace(task=task, quality="exact"),
             num_inference_steps=50,
         )
         assert (
@@ -408,6 +408,7 @@ def test_high_quality_request_warns_when_bcg_suppresses_cache_dit():
             _explicit_fields={"quality"},
             enable_cache_dit=None,
             cache_dit_params=None,
+            enable_spectrum=False,
         )
     )
 
@@ -439,7 +440,7 @@ def test_admission_rejects_steps_exceeding_online_adaln_gpu_plans():
     server_args = _quality_server_args()
     server_args.minimax_h3_adaln_online = True
     batch = SimpleNamespace(
-        sampling_params=SimpleNamespace(task="t2va", quality="lossless"),
+        sampling_params=SimpleNamespace(task="t2va", quality="exact"),
         num_inference_steps=50,
         is_warmup=False,
     )
@@ -450,21 +451,37 @@ def test_admission_rejects_steps_exceeding_online_adaln_gpu_plans():
             stage.forward(batch, server_args)
 
         batch.num_inference_steps = 9
+        with pytest.raises(ValueError, match="9 AdaLN plans.*slab holds 8"):
+            stage.forward(batch, server_args)
+
+        batch.num_inference_steps = 8
+        assert stage.forward(batch, server_args) is batch
+
+        batch.num_inference_steps = 1
+        assert stage.forward(batch, server_args) is batch
+
+        batch.num_inference_steps = 0
+        with pytest.raises(ValueError, match="num_inference_steps >= 1"):
+            stage.forward(batch, server_args)
+
+        server_args.minimax_h3_adaln_online = False
+        batch.num_inference_steps = 50
         assert stage.forward(batch, server_args) is batch
 
 
-def test_extra_high_quality_does_not_enable_h3_cache_dit():
+def test_lossless_quality_does_not_enable_h3_cache_dit():
     stage = MiniMaxH3DenoisingStage.__new__(MiniMaxH3DenoisingStage)
     stage.server_args = SimpleNamespace(enable_breakable_cuda_graph=False)
     stage._cache_dit_enabled = False
     stage._minimax_h3_cache_mode = None
-    stage._minimax_h3_quality = "lossless"
+    stage._minimax_h3_quality = "exact"
     batch = SimpleNamespace(
         sampling_params=SimpleNamespace(
-            quality="extra-high",
+            quality="lossless",
             _explicit_fields={"quality"},
             enable_cache_dit=None,
             cache_dit_params=None,
+            enable_spectrum=False,
         )
     )
 
@@ -473,7 +490,7 @@ def test_extra_high_quality_does_not_enable_h3_cache_dit():
     with patch.object(DenoisingStage, "_cache_dit_requested", return_value=True):
         stage._maybe_enable_cache_dit(50, batch)
 
-    assert stage._minimax_h3_quality == "extra-high"
+    assert stage._minimax_h3_quality == "lossless"
     assert stage._minimax_h3_cache_mode is None
     assert not stage._cache_dit_enabled
 
@@ -532,7 +549,7 @@ def test_quality_admission_fails_closed_outside_validated_request():
     server_args.attention_backend = "sage_attn"
     assert stage.forward(batch, server_args) is batch
 
-    batch.sampling_params.quality = "extra-high"
+    batch.sampling_params.quality = "lossless"
     assert stage.forward(batch, server_args) is batch
 
     batch.sampling_params.quality = "ultra"
@@ -550,7 +567,7 @@ def test_validate_server_args_requires_packed_varlen_backend():
         resolve_component_attention_backend=lambda *_names: (None, None),
     )
     with patch(
-        "sglang.multimodal_gen.configs.pipeline_configs.minimax_h3.get_attn_backend"
+        "sglang.multimodal_gen.runtime.layers.attention.selector.get_attn_backend"
     ) as get_attn_backend:
         MiniMaxH3PipelineConfig.validate_server_args(config, server_args)
     get_attn_backend.assert_called_once_with(
@@ -560,7 +577,7 @@ def test_validate_server_args_requires_packed_varlen_backend():
         attention_requirements=AttentionRequirements(packed_varlen=True),
     )
     with patch(
-        "sglang.multimodal_gen.configs.pipeline_configs.minimax_h3.get_attn_backend",
+        "sglang.multimodal_gen.runtime.layers.attention.selector.get_attn_backend",
         side_effect=ValueError("does not implement packed varlen attention"),
     ):
         with pytest.raises(ValueError, match="does not implement packed varlen"):
@@ -590,7 +607,7 @@ def test_validate_server_args_accepts_transformer_backend_override():
     )
 
     with patch(
-        "sglang.multimodal_gen.configs.pipeline_configs.minimax_h3.get_attn_backend"
+        "sglang.multimodal_gen.runtime.layers.attention.selector.get_attn_backend"
     ) as get_attn_backend:
         MiniMaxH3PipelineConfig.validate_server_args(config, server_args)
     get_attn_backend.assert_called_once_with(
@@ -621,7 +638,7 @@ def test_resolve_transformer_attention_backend_uses_selector_precedence():
             ),
         )
         with patch(
-            "sglang.multimodal_gen.configs.pipeline_configs.minimax_h3."
+            "sglang.multimodal_gen.runtime.layers.attention.selector."
             "get_global_forced_attn_backend",
             return_value=forced_backend,
         ):

@@ -4,7 +4,7 @@ import sys
 import unittest
 from contextlib import nullcontext
 from types import ModuleType, SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import torch
 
@@ -13,7 +13,11 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.layers.moe import mega_moe
+from sglang.srt.layers.moe import MoeA2ABackend, MoeRunnerBackend, mega_moe
+from sglang.srt.layers.moe.fused_moe_triton import layer as fused_moe_layer_module
+from sglang.srt.layers.moe.utils import draft_model_build_scope
+from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
+from sglang.srt.runtime_context import get_context, get_exec, get_flags, get_parallel
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
@@ -22,26 +26,29 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
     def setUp(self):
         super().setUp()
         mega_moe._MEGA_MOE_SYMM_BUFFER.clear()
+        self.deep_gemm = ModuleType("deep_gemm")
+        self.deep_gemm.num_sms = 132
+        self.deep_gemm.get_num_sms = MagicMock(
+            side_effect=lambda: self.deep_gemm.num_sms
+        )
+        self.deep_gemm.set_num_sms = MagicMock(
+            side_effect=lambda num_sms: setattr(self.deep_gemm, "num_sms", num_sms)
+        )
+        max_num_sms = patch.object(mega_moe, "_mega_moe_max_num_sms", return_value=130)
+        self.max_num_sms = max_num_sms.start()
+        self.addCleanup(max_num_sms.stop)
 
     def tearDown(self):
         mega_moe._MEGA_MOE_SYMM_BUFFER.clear()
         super().tearDown()
 
     def test_mxf4_buffer_uses_typed_api(self):
-        deep_gemm = ModuleType("deep_gemm")
+        deep_gemm = self.deep_gemm
         expected_buffer = object()
         deep_gemm.get_symm_buffer_for_mega_moe = MagicMock(return_value=expected_buffer)
         group = object()
 
-        with (
-            patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
-            patch.object(
-                mega_moe,
-                "_mega_moe_mma_type",
-                return_value="mxf4xmxf4",
-                create=True,
-            ),
-        ):
+        with patch.dict(sys.modules, {"deep_gemm": deep_gemm}):
             actual_buffer = mega_moe._get_mega_moe_symm_buffer(
                 group,
                 num_experts=8,
@@ -49,6 +56,7 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
                 num_topk=2,
                 hidden=128,
                 intermediate_hidden=256,
+                mma_type="mxf4xmxf4",
             )
 
         self.assertIs(actual_buffer, expected_buffer)
@@ -56,29 +64,13 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
         self.assertEqual(call.kwargs.get("mma_type"), "mxf4xmxf4")
         self.assertNotIn("use_fp8_dispatch", call.kwargs)
 
-    def test_server_flag_selects_mxf4_mma_type(self):
-        for enabled, expected in ((False, "fp8xfp4"), (True, "mxf4xmxf4")):
-            with self.subTest(enabled=enabled):
-                config = SimpleNamespace(
-                    moe=SimpleNamespace(enable_w4a4_mxfp4_megamoe=enabled)
-                )
-                with patch.object(mega_moe, "get_exec", return_value=config):
-                    self.assertEqual(mega_moe._mega_moe_mma_type(), expected)
-
     def test_buffer_cache_separates_mma_types(self):
-        deep_gemm = ModuleType("deep_gemm")
+        deep_gemm = self.deep_gemm
         expected_buffers = (object(), object())
         deep_gemm.get_symm_buffer_for_mega_moe = MagicMock(side_effect=expected_buffers)
         group = object()
 
-        with (
-            patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
-            patch.object(
-                mega_moe,
-                "_mega_moe_mma_type",
-                side_effect=("fp8xfp4", "mxf4xmxf4"),
-            ),
-        ):
+        with patch.dict(sys.modules, {"deep_gemm": deep_gemm}):
             actual_buffers = tuple(
                 mega_moe._get_mega_moe_symm_buffer(
                     group,
@@ -87,8 +79,9 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
                     num_topk=2,
                     hidden=128,
                     intermediate_hidden=256,
+                    mma_type=mma_type,
                 )
-                for _ in range(2)
+                for mma_type in ("fp8xfp4", "mxf4xmxf4")
             )
 
         self.assertEqual(actual_buffers, expected_buffers)
@@ -100,6 +93,63 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
             ],
             ["fp8xfp4", "mxf4xmxf4"],
         )
+
+    def test_buffer_cache_uses_effective_sm_budget(self):
+        deep_gemm = self.deep_gemm
+        deep_gemm.get_symm_buffer_for_mega_moe = MagicMock(
+            side_effect=lambda *_args, **_kwargs: SimpleNamespace(
+                num_sms=deep_gemm.get_num_sms()
+            )
+        )
+        group = object()
+        buffers = []
+
+        for current_num_sms, expected_num_sms in (
+            (132, 130),
+            (131, 130),
+            (96, 96),
+            (97, 96),
+            (132, 130),
+        ):
+            with self.subTest(current_num_sms=current_num_sms):
+                deep_gemm.set_num_sms(current_num_sms)
+                buf = self._get_test_buffer(group)
+                buffers.append(buf)
+                self.assertEqual(buf.num_sms, expected_num_sms)
+                self.assertEqual(deep_gemm.get_num_sms(), current_num_sms)
+                with mega_moe._configure_mega_moe_deep_gemm_num_sms(deep_gemm):
+                    self.assertEqual(buf.num_sms, deep_gemm.get_num_sms())
+                self.assertEqual(deep_gemm.get_num_sms(), current_num_sms)
+
+        self.assertIs(buffers[0], buffers[1])
+        self.assertIs(buffers[0], buffers[4])
+        self.assertIs(buffers[2], buffers[3])
+        self.assertIsNot(buffers[0], buffers[2])
+        self.assertEqual(deep_gemm.get_symm_buffer_for_mega_moe.call_count, 2)
+
+    def test_buffer_allocation_without_sm_override(self):
+        deep_gemm = self.deep_gemm
+        self.max_num_sms.return_value = None
+        deep_gemm.get_symm_buffer_for_mega_moe = MagicMock(
+            side_effect=lambda *_args, **_kwargs: deep_gemm.get_num_sms()
+        )
+
+        buf = self._get_test_buffer(object())
+        self.assertEqual(buf, 132)
+        deep_gemm.set_num_sms.assert_not_called()
+
+    def test_buffer_allocation_failure_restores_sm_budget(self):
+        deep_gemm = self.deep_gemm
+        deep_gemm.get_symm_buffer_for_mega_moe = MagicMock(
+            side_effect=RuntimeError("allocation failed")
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "allocation failed"):
+            self._get_test_buffer(object())
+
+        self.assertEqual(deep_gemm.get_num_sms(), 132)
+        self.assertEqual(deep_gemm.set_num_sms.call_args_list, [call(130), call(132)])
+        self.assertEqual(mega_moe._MEGA_MOE_SYMM_BUFFER, {})
 
     def test_mxf4_weight_transform_uses_matching_mma_type(self):
         from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
@@ -135,6 +185,8 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
         with (
             patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
             patch.object(mega_moe, "_mega_moe_mma_type", return_value="mxf4xmxf4"),
+            # Toy shapes.
+            patch.object(mega_moe, "check_mega_moe_shapes"),
         ):
             method.process_weights_after_loading(layer)
 
@@ -156,6 +208,9 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
             mega_l1_weights=object(),
             mega_l2_weights=object(),
             should_fuse_routed_scaling_factor_in_topk=True,
+            moe_runner_config=SimpleNamespace(swiglu_limit=None),
+            _mega_moe_weights_built=True,
+            _mega_moe_nvfp4=False,
         )
         topk_output = SimpleNamespace(
             topk_ids=torch.tensor([[0, 1]]),
@@ -175,6 +230,8 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
             num_fused_shared_experts=0,
             layer_id=0,
             routed_scaling_factor=1.0,
+            mega_shared_l1_weights=None,
+            mega_shared_l2_weights=None,
         )
 
         with (
@@ -191,14 +248,15 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
                 "_configure_mega_moe_deep_gemm_num_sms",
                 return_value=nullcontext(),
             ),
+            # Toy shapes.
+            patch.object(mega_moe, "check_mega_moe_shapes"),
             patch.object(
                 mega_moe.ExpertLocationDispatchInfo,
                 "init_new",
                 return_value=object(),
             ),
-            patch(
-                "sglang.srt.distributed.parallel_state.get_moe_ep_group",
-                return_value=SimpleNamespace(device_group=object()),
+            get_parallel().override(
+                moe_ep_group=SimpleNamespace(device_group=object())
             ),
         ):
             mega_moe._run_mega_routed(
@@ -213,6 +271,87 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
         call = deep_gemm.mega_moe_pre_dispatch.call_args
         self.assertEqual(call.kwargs.get("mma_type"), "mxf4xmxf4")
         self.assertNotIn("use_fp4_acts", call.kwargs)
+
+    def test_run_mega_routed_experts_generic_entry(self):
+        deep_gemm = ModuleType("deep_gemm")
+        deep_gemm.fp8_fp4_mega_moe = MagicMock()
+        buffer = SimpleNamespace(
+            x=object(),
+            x_sf=object(),
+            topk_idx=object(),
+            topk_weights=object(),
+        )
+        experts = SimpleNamespace(
+            num_experts=8,
+            mega_l1_weights=object(),
+            mega_l2_weights=object(),
+            _mega_moe_weights_built=True,
+            _mega_moe_nvfp4=False,
+        )
+        hidden_states = torch.zeros((3, 4), dtype=torch.bfloat16)
+        topk_ids = torch.tensor([[0, 1], [2, 3], [4, 5]], dtype=torch.int64)
+        topk_weights = torch.full((3, 2), 0.5, dtype=torch.bfloat16)
+
+        with (
+            patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
+            patch.object(mega_moe, "_device_sm", 100),
+            patch.object(mega_moe, "_mega_moe_mma_type", return_value="fp8xfp4"),
+            patch.object(mega_moe, "mega_moe_pre_dispatch") as pre_dispatch,
+            patch.object(
+                mega_moe, "_get_mega_moe_symm_buffer", return_value=buffer
+            ) as get_buffer,
+            patch.object(
+                mega_moe,
+                "_configure_mega_moe_deep_gemm_num_sms",
+                return_value=nullcontext(),
+            ),
+            # Toy shapes.
+            patch.object(mega_moe, "check_mega_moe_shapes"),
+            patch(
+                "sglang.srt.runtime_context.get_parallel",
+                return_value=SimpleNamespace(
+                    moe_ep_group=SimpleNamespace(device_group=object())
+                ),
+            ),
+        ):
+            out = mega_moe.run_mega_routed_experts(
+                experts,
+                hidden_states,
+                topk_ids,
+                topk_weights,
+                hidden_size=4,
+                intermediate_size=8,
+                top_k=2,
+                num_tokens=3,
+                activation_clamp=7.0,
+                routed_scaling_factor=1.0,
+            )
+
+        self.assertEqual(out.shape, (3, 4))
+        self.assertEqual(out.dtype, torch.bfloat16)
+        buf_call = get_buffer.call_args
+        self.assertEqual(buf_call.kwargs.get("num_topk"), 2)
+        self.assertEqual(buf_call.kwargs.get("hidden"), 4)
+        self.assertEqual(buf_call.kwargs.get("intermediate_hidden"), 8)
+        # The kernel wants int32 ids and fp32 weights regardless of the router dtype.
+        ids_arg, weights_arg = pre_dispatch.call_args.args[1:3]
+        self.assertEqual(ids_arg.dtype, torch.int32)
+        self.assertEqual(weights_arg.dtype, torch.float32)
+        mega_call = deep_gemm.fp8_fp4_mega_moe.call_args
+        self.assertIs(mega_call.args[1], experts.mega_l1_weights)
+        self.assertIs(mega_call.args[2], experts.mega_l2_weights)
+        self.assertEqual(mega_call.kwargs.get("activation_clamp"), 7.0)
+
+    def test_shape_check_rejects_unaligned_intermediate(self):
+        # Qwen3-30B-A3B: intermediate 768 leaves a 24-byte scale row.
+        with self.assertRaisesRegex(ValueError, "multiples of 512"):
+            mega_moe.check_mega_moe_shapes(2048, 768, "fp8xfp4")
+        mega_moe.check_mega_moe_shapes(4096, 1536, "fp8xfp4")
+        mega_moe.check_mega_moe_shapes(4096, 1024, "mxf4xmxf4")
+        # 768 is a multiple of 256, so the NVFP4 (g16) rule accepts it.
+        mega_moe.check_mega_moe_shapes(2048, 768, "nvfp4xnvfp4")
+        with self.assertRaisesRegex(ValueError, "multiples of 256"):
+            mega_moe.check_mega_moe_shapes(2048, 384, "nvfp4xnvfp4")
 
     def test_mxf4_l1_uses_packed_gate_up_interleave(self):
         source = torch.arange(32).reshape(1, 32)
@@ -256,6 +395,98 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
         actual = mega_moe._interleave_mega_moe_gate_up(source, gran=16)
 
         torch.testing.assert_close(actual, expected)
+
+    def test_draft_layers_keep_their_own_w4a4_choice(self):
+        """Draft MegaMoE layers must not follow the target's MMA type once built.
+
+        The draft forward runs outside draft_model_build_scope, so a layer that
+        re-read the global flag would pair draft weights with the wrong kernel.
+        """
+        for target_flag, draft_flag, expected_target, expected_draft in (
+            (True, False, "mxf4xmxf4", "fp8xfp4"),
+            (True, None, "mxf4xmxf4", "mxf4xmxf4"),
+            (False, True, "fp8xfp4", "mxf4xmxf4"),
+            (False, None, "fp8xfp4", "fp8xfp4"),
+        ):
+            with self.subTest(
+                enable_w4a4_mxfp4_megamoe=target_flag,
+                speculative_enable_w4a4_mxfp4_megamoe=draft_flag,
+            ):
+                with get_context().override_server_args(
+                    model_path="dummy",
+                    enable_w4a4_mxfp4_megamoe=target_flag,
+                    speculative_enable_w4a4_mxfp4_megamoe=draft_flag,
+                ):
+                    target = self._build_fused_moe()
+                    with draft_model_build_scope():
+                        draft = self._build_fused_moe()
+
+                    self.assertEqual(
+                        get_exec().moe.enable_w4a4_mxfp4_megamoe, target_flag
+                    )
+                    self.assertEqual(
+                        mega_moe._mega_moe_mma_type(target), expected_target
+                    )
+                    self.assertEqual(mega_moe._mega_moe_mma_type(draft), expected_draft)
+
+    def test_draft_build_scope_restores_w4a4_on_exception(self):
+        """A failed draft build must not leave the target on the draft's MMA type."""
+        with get_context().override_server_args(
+            model_path="dummy",
+            enable_w4a4_mxfp4_megamoe=False,
+            speculative_enable_w4a4_mxfp4_megamoe=True,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "draft build failed"):
+                with draft_model_build_scope():
+                    self.assertTrue(get_exec().moe.enable_w4a4_mxfp4_megamoe)
+                    raise RuntimeError("draft build failed")
+
+            self.assertFalse(get_exec().moe.enable_w4a4_mxfp4_megamoe)
+            target = self._build_fused_moe()
+            self.assertEqual(mega_moe._mega_moe_mma_type(target), "fp8xfp4")
+
+    def _build_fused_moe(self):
+        method = UnquantizedFusedMoEMethod()
+        with (
+            patch.object(method, "create_weights"),
+            patch.object(method, "create_moe_runner"),
+            patch.object(
+                fused_moe_layer_module,
+                "create_moe_dispatcher",
+                return_value=SimpleNamespace(),
+            ),
+            get_flags().moe.override(
+                runner_backend=MoeRunnerBackend.AUTO,
+                a2a_backend=MoeA2ABackend.MEGAMOE,
+            ),
+            get_parallel().override(
+                moe_ep_size=1,
+                moe_ep_rank=0,
+                moe_tp_size=1,
+                moe_tp_rank=0,
+                tp_size=1,
+                tp_rank=0,
+            ),
+        ):
+            return fused_moe_layer_module.FusedMoE(
+                num_experts=2,
+                hidden_size=4,
+                intermediate_size=8,
+                layer_id=0,
+                quant_method=method,
+            )
+
+    def _get_test_buffer(self, group):
+        with patch.dict(sys.modules, {"deep_gemm": self.deep_gemm}):
+            return mega_moe._get_mega_moe_symm_buffer(
+                group,
+                num_experts=8,
+                num_max_tokens_per_rank=64,
+                num_topk=2,
+                hidden=128,
+                intermediate_hidden=256,
+                mma_type="fp8xfp4",
+            )
 
 
 if __name__ == "__main__":
