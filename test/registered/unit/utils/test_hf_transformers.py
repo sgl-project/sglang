@@ -529,6 +529,38 @@ class TestGetHfTextConfig(CustomTestCase):
         self.assertIs(result, inner_text)
         self.assertEqual(inner_text.torch_dtype, "float16")
 
+    def test_thinker_config_preserves_text_sub_config_dtype_when_thinker_dtype_is_none(self):
+        # Issue #43157: thinker_config without dtype should not erase existing dtype on text_config
+        import torch
+
+        inner_text = PretrainedConfig(num_attention_heads=8, dtype=torch.bfloat16)
+        thinker_cfg = PretrainedConfig()
+        thinker_cfg.text_config = inner_text
+        cfg = PretrainedConfig()
+        cfg.architectures = ["Qwen2_5OmniForConditionalGeneration"]
+        cfg.thinker_config = thinker_cfg
+
+        result = get_hf_text_config(cfg)
+        self.assertIs(result, inner_text)
+        self.assertEqual(result.dtype, torch.bfloat16)
+        self.assertEqual(inner_text.dtype, torch.bfloat16)
+
+    def test_thinker_config_propagates_dtype_when_text_sub_config_dtype_is_none(self):
+        import torch
+
+        inner_text = PretrainedConfig(num_attention_heads=8)
+        self.assertIsNone(getattr(inner_text, "dtype", None))
+        thinker_cfg = PretrainedConfig(dtype=torch.float16)
+        thinker_cfg.text_config = inner_text
+        cfg = PretrainedConfig()
+        cfg.architectures = ["Qwen2_5OmniForConditionalGeneration"]
+        cfg.thinker_config = thinker_cfg
+
+        result = get_hf_text_config(cfg)
+        self.assertIs(result, inner_text)
+        self.assertEqual(result.dtype, torch.float16)
+        self.assertEqual(inner_text.dtype, torch.float16)
+
     def test_converts_dict_sub_config(self):
         cfg = PretrainedConfig()
         cfg.architectures = ["SomeModel"]

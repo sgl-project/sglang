@@ -580,11 +580,10 @@ def get_hf_text_config(config: PretrainedConfig):
         # qwen2.5 omni
         thinker_config = config.thinker_config
         if hasattr(thinker_config, "text_config"):
-            setattr(
-                thinker_config.text_config,
-                "dtype",
-                getattr(thinker_config, "dtype", None),
-            )
+            if getattr(thinker_config.text_config, "dtype", None) is None:
+                thinker_config.text_config.dtype = getattr(
+                    thinker_config, "dtype", None
+                )
             text_config = thinker_config.text_config
         else:
             text_config = thinker_config
