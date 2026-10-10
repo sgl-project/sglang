@@ -1504,6 +1504,14 @@ class Envs:
     # Sequences a captured KDA extend bucket accepts; a larger prefill batch on
     # any dp rank runs the step eagerly. Bounds the padded grids and scratch.
     SGLANG_KDA_PREFILL_GRAPH_MAX_SEQS = EnvInt(128)
+    # Directory for allocator-history forensics snapshots (unset = disabled).
+    # Snapshots map damaged addresses to the allocation site of the block a
+    # captured CUDA graph still writes through.
+    SGLANG_MEM_FORENSICS_DIR = EnvStr(None)
+    SGLANG_MEM_FORENSICS_MAX_ENTRIES = EnvInt(300000)
+    # Log per-phase device-memory peaks for extend forwards (see
+    # utils/extend_mem_profile.py). Host-side counters only; no device sync.
+    SGLANG_EXTEND_MEM_PROFILE = EnvBool(False)
 
     # ===================================================================
     # Tokenizer, request state, embeddings, and reasoning controls
