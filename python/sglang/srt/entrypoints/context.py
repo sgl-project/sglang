@@ -13,7 +13,14 @@ try:
 except ImportError as e:
     mcp = e
 
-from openai_harmony import Author, Message, Role, StreamState, TextContent
+from openai_harmony import (
+    Author,
+    HarmonyError,
+    Message,
+    Role,
+    StreamState,
+    TextContent,
+)
 
 from sglang.srt.entrypoints.harmony_utils import (
     get_encoding,
@@ -77,13 +84,42 @@ class HarmonyContext(ConversationContext):
         self.num_output_tokens = 0
         self.num_reasoning_tokens = 0
         self.finish_reason = None
+        self._parser_desynced = False
+
+    def _process_token(self, token_id: int) -> None:
+        """Feed one token to the harmony parser, tolerating malformed output.
+
+        gpt-oss occasionally samples a malformed message header (e.g. a
+        duplicated "to=" in a tool-call header), which makes
+        `StreamableParser.process` raise `HarmonyError` for that token and
+        every following one until the next message start. Letting it
+        propagate turns a model-side failure into a client-visible one: the
+        non-streaming Responses path reports it as a 400
+        invalid_request_error, and the streaming path dies mid-stream
+        without an error event. Instead, skip the token so the parser can
+        re-synchronize at the next message start, mirroring how the
+        tool-call detectors degrade on malformed model output.
+        """
+        try:
+            self.parser.process(token_id)
+            self._parser_desynced = False
+        except HarmonyError as e:
+            if not self._parser_desynced:
+                self._parser_desynced = True
+                logger.error(
+                    "Failed to parse model output token %d: %s. Skipping "
+                    "tokens until the parser re-synchronizes at the next "
+                    "message start.",
+                    token_id,
+                    e,
+                )
 
     def append_output(self, output) -> None:
         if isinstance(output, dict) and "output_ids" in output:
             output_token_ids = output["output_ids"]
 
             for token_id in output_token_ids:
-                self.parser.process(token_id)
+                self._process_token(token_id)
             output_msgs = self.parser.messages
 
             meta_info = output["meta_info"]
@@ -218,7 +254,7 @@ class StreamingHarmonyContext(HarmonyContext):
             self._record_finish_reason(meta_info)
 
             for token_id in new_token_ids:
-                self.parser.process(token_id)
+                self._process_token(token_id)
 
         else:
             # Handle the case of tool output in direct message format
@@ -230,7 +266,7 @@ class StreamingHarmonyContext(HarmonyContext):
                 msg.recipient = "assistant"
             toks = self.encoding.render(msg)
             for tok in toks:
-                self.parser.process(tok)
+                self._process_token(tok)
             self.last_tok = toks[-1]
 
     def is_expecting_start(self) -> bool:
@@ -251,6 +287,6 @@ class StreamingHarmonyContext(HarmonyContext):
             to_process.append(rendered_tokens[last_n])
             last_n -= 1
         for tok in reversed(to_process):
-            self.parser.process(tok)
+            self._process_token(tok)
 
         return rendered_tokens
