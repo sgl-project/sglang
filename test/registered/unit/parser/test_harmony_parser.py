@@ -1,5 +1,6 @@
 """Unit tests for srt/parser/harmony_parser.py"""
 
+import time
 import unittest
 
 from sglang.srt.parser.harmony_parser import (
@@ -627,6 +628,27 @@ class TestEdgeCases(CustomTestCase):
         self.assertEqual(events[1].event_type, "reasoning")
         self.assertEqual(events[0].content, "first reasoning")
         self.assertEqual(events[1].content, "second reasoning")
+
+    def test_long_whitespace_and_unknown_markers_parse_in_linear_time(self):
+        """Long whitespace runs and many unclosed unknown `<|` markers must not
+        stall parsing (it runs on the event loop); results are unchanged."""
+        start = time.perf_counter()
+
+        held = HarmonyParser()
+        self.assertEqual(held.parse("x" + " " * 40000), [])
+        self.assertEqual(held.parse("y"), [])
+
+        events = HarmonyParser().parse(" " * 40000 + "analysis thinking")
+        self.assertEqual(
+            [(e.event_type, e.content) for e in events], [("reasoning", " thinking")]
+        )
+
+        events = HarmonyParser().parse(
+            "<|start|>assistant<|channel|>final<|message|>" + "<|a" * 30000
+        )
+        self.assertEqual([e.event_type for e in events], ["normal"])
+
+        self.assertLess(time.perf_counter() - start, 1.0)
 
 
 class TestAdditionalEdgeCases(CustomTestCase):
