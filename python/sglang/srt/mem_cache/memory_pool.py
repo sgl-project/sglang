@@ -47,6 +47,7 @@ from sglang.kernels.ops.kvcache.cache_move import (
     copy_all_layer_kv_cache_func,
     set_kv_buffer_prefix_valid_tiled,
     set_kv_buffer_prefix_valid_tiled_fp8,
+    store_cache_fp8,
 )
 from sglang.kernels.ops.kvcache.kvcache import can_use_store_cache, store_cache
 from sglang.kernels.ops.quantization.fp8_kernel import (
@@ -2293,6 +2294,15 @@ class MHATokenToKVPool(KVCache):
         # for store_cache JIT kernel
         self.row_dim = self.head_num * self.head_dim
         self.v_row_dim = self.head_num * self.v_head_dim
+        # Triton's native E4M3 conversion requires SM89 or newer. Older CUDA
+        # devices retain the eager writer, as do non-device-backed pools.
+        self._enable_fp8_store = (
+            _is_cuda
+            and torch.device(self.device).type == "cuda"
+            and self.dtype == fp8_dtype
+            and self.kv_cache_layout == "nhd"
+            and torch.cuda.get_device_capability(self.device) >= (8, 9)
+        )
 
     def _init_kv_copy_and_warmup(self):
         # Zero-layer pool (e.g. all-SWA model's full sub-pool) has no buffers.
@@ -2804,6 +2814,8 @@ class MHATokenToKVPool(KVCache):
         layer_id_override: Optional[int] = None,
         dcp_kv_mask: Optional[torch.Tensor] = None,
     ):
+        # Quantization may mutate inputs in the eager fallback. Callers retaining
+        # K/V must keep private copies even when a fused writer leaves them intact.
         loc, _, _ = unwrap_write_loc(loc_info)
         self._check_physical_write_loc(loc_info, "set_kv_buffer (MHA)")
         # Catch stale slot ids here instead of as illegal-addr / silent KV
@@ -2829,10 +2841,26 @@ class MHATokenToKVPool(KVCache):
             return
 
         if cache_k.dtype != self.dtype:
+            if self._can_fuse_fp8_store(
+                cache_k, cache_v, k_scale, v_scale, dcp_kv_mask
+            ):
+                store_cache_fp8(
+                    cache_k,
+                    cache_v,
+                    self.k_buffer[layer_id - self.start_layer].view(self.dtype),
+                    self.v_buffer[layer_id - self.start_layer].view(self.dtype),
+                    loc,
+                    k_scale,
+                    v_scale,
+                )
+                return
             if k_scale is not None:
                 cache_k.div_(k_scale)
             if v_scale is not None:
                 cache_v.div_(v_scale)
+            if self.dtype == fp8_dtype:
+                cache_k = saturate_to_fp8_range(cache_k, self.dtype)
+                cache_v = saturate_to_fp8_range(cache_v, self.dtype)
             cache_k = cache_k.to(self.dtype)
             cache_v = cache_v.to(self.dtype)
 
@@ -2875,6 +2903,31 @@ class MHATokenToKVPool(KVCache):
             return
 
         self._store_kv_layer(layer_id - self.start_layer, loc, cache_k, cache_v)
+
+    def _can_fuse_fp8_store(self, k, v, k_scale, v_scale, dcp_kv_mask):
+        if not (
+            self._enable_fp8_store
+            and dcp_kv_mask is None
+            and k.dtype == v.dtype
+            and k.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        ):
+            return False
+        for value in (k, v):
+            if value.ndim != 3 or value.stride(-1) != 1:
+                return False
+            if value.stride(-2) != value.shape[-1]:
+                return False
+        for scale in (k_scale, v_scale):
+            if scale is None or isinstance(scale, (float, int)):
+                continue
+            if not (
+                isinstance(scale, torch.Tensor)
+                and scale.ndim == 0
+                and scale.dtype == torch.float32
+                and scale.device == k.device
+            ):
+                return False
+        return True
 
     def _store_kv_layer(
         self,

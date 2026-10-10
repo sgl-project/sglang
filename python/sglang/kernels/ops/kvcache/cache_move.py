@@ -77,6 +77,26 @@ def _saturate_to_fp8_range(val, FP8_MAX: tl.constexpr, DTYPE: tl.constexpr):
 
 
 @triton.jit
+def _quantize_kv_fp8(
+    value,
+    scale,
+    SCALE_IS_TENSOR: tl.constexpr,
+    SRC_DTYPE: tl.constexpr,
+    DST_DTYPE: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+):
+    # Preserve eager div_'s scale-kind and source-dtype rounding before conversion.
+    value = value.to(tl.float32)
+    if SCALE_IS_TENSOR:
+        scale = scale.to(SRC_DTYPE).to(tl.float32)
+        value = tl.div_rn(value, scale)
+    else:
+        value = value * tl.div_rn(1.0, scale)
+    value = value.to(SRC_DTYPE)
+    return _saturate_to_fp8_range(value, FP8_MAX, SRC_DTYPE).to(DST_DTYPE)
+
+
+@triton.jit
 def set_kv_buffer_prefix_valid_tiled_fp8(
     src_k_ptr,
     src_v_ptr,
@@ -116,30 +136,114 @@ def set_kv_buffer_prefix_valid_tiled_fp8(
     dst_k_row_ptr = dst_k_ptr + loc * dst_k_row_stride + elem_off
     dst_v_row_ptr = dst_v_ptr + loc * dst_v_row_stride + elem_off
 
-    # Tensor division rounds the divisor first and uses correctly rounded division.
-    k_val = tl.load(src_k_row_ptr, mask=mask_elem, other=0).to(tl.float32)
-    if K_SCALE_IS_TENSOR:
-        k_scale = k_scale.to(src_k_ptr.dtype.element_ty).to(tl.float32)
-        k_val = tl.div_rn(k_val, k_scale)
-    else:
-        # Eager host-scalar division multiplies by a rounded FP32 reciprocal.
-        k_val = k_val * tl.div_rn(1.0, k_scale)
-    k_val = k_val.to(src_k_ptr.dtype.element_ty)
-    k_val = _saturate_to_fp8_range(k_val, FP8_MAX, src_k_ptr.dtype.element_ty)
-    k_val = k_val.to(dst_k_ptr.dtype.element_ty)
-
-    v_val = tl.load(src_v_row_ptr, mask=mask_elem, other=0).to(tl.float32)
-    if V_SCALE_IS_TENSOR:
-        v_scale = v_scale.to(src_v_ptr.dtype.element_ty).to(tl.float32)
-        v_val = tl.div_rn(v_val, v_scale)
-    else:
-        v_val = v_val * tl.div_rn(1.0, v_scale)
-    v_val = v_val.to(src_v_ptr.dtype.element_ty)
-    v_val = _saturate_to_fp8_range(v_val, FP8_MAX, src_v_ptr.dtype.element_ty)
-    v_val = v_val.to(dst_v_ptr.dtype.element_ty)
+    k_val = _quantize_kv_fp8(
+        tl.load(src_k_row_ptr, mask=mask_elem, other=0),
+        k_scale,
+        K_SCALE_IS_TENSOR,
+        src_k_ptr.dtype.element_ty,
+        dst_k_ptr.dtype.element_ty,
+        FP8_MAX,
+    )
+    v_val = _quantize_kv_fp8(
+        tl.load(src_v_row_ptr, mask=mask_elem, other=0),
+        v_scale,
+        V_SCALE_IS_TENSOR,
+        src_v_ptr.dtype.element_ty,
+        dst_v_ptr.dtype.element_ty,
+        FP8_MAX,
+    )
 
     tl.store(dst_k_row_ptr, k_val, mask=mask_elem)
     tl.store(dst_v_row_ptr, v_val, mask=mask_elem)
+
+
+@triton.jit
+def _store_cache_fp8(
+    k,
+    v,
+    k_cache,
+    v_cache,
+    indices,
+    k_scale,
+    v_scale,
+    k_stride,
+    v_stride,
+    k_cache_stride,
+    v_cache_stride,
+    index_stride,
+    K_WIDTH: tl.constexpr,
+    V_WIDTH: tl.constexpr,
+    K_SCALE_IS_TENSOR: tl.constexpr,
+    V_SCALE_IS_TENSOR: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+    SIZE_LIMIT: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    slot = tl.load(indices + row * index_stride).to(tl.int64)
+    # Slot zero is the ordinary writer's reserved CUDA-graph padding slot.
+    valid = (slot > 0) & (slot < SIZE_LIMIT)
+    tl.device_assert((slot >= 0) & (slot < SIZE_LIMIT), "KV slot out of bounds")
+    offsets = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    if K_SCALE_IS_TENSOR:
+        k_scale = tl.load(k_scale)
+    if V_SCALE_IS_TENSOR:
+        v_scale = tl.load(v_scale)
+    kk = _quantize_kv_fp8(
+        tl.load(k + row * k_stride + offsets, (offsets < K_WIDTH) & valid, 0),
+        k_scale,
+        K_SCALE_IS_TENSOR,
+        k.dtype.element_ty,
+        k_cache.dtype.element_ty,
+        FP8_MAX,
+    )
+    vv = _quantize_kv_fp8(
+        tl.load(v + row * v_stride + offsets, (offsets < V_WIDTH) & valid, 0),
+        v_scale,
+        V_SCALE_IS_TENSOR,
+        v.dtype.element_ty,
+        v_cache.dtype.element_ty,
+        FP8_MAX,
+    )
+    tl.store(k_cache + slot * k_cache_stride + offsets, kk, (offsets < K_WIDTH) & valid)
+    tl.store(v_cache + slot * v_cache_stride + offsets, vv, (offsets < V_WIDTH) & valid)
+
+
+def store_cache_fp8(k, v, k_cache, v_cache, indices, k_scale, v_scale):
+    """Store E4M3 NHD rows on CUDA SM89+, using prefix-commit numerics.
+
+    Inputs are not mutated. Sources have contiguous head/dimension axes;
+    token strides may differ. Scales
+    are host numbers, None, or scalar FP32 device tensors. Slot zero is reserved.
+    The pool owns layout and scale eligibility; other forms use its eager writer.
+    """
+    if indices.numel() == 0:
+        return
+    k_width = k.shape[-2] * k.shape[-1]
+    v_width = v.shape[-2] * v.shape[-1]
+    block = 256
+    _store_cache_fp8[(indices.numel(), triton.cdiv(max(k_width, v_width), block))](
+        k,
+        v,
+        k_cache,
+        v_cache,
+        indices,
+        1.0 if k_scale is None else k_scale,
+        1.0 if v_scale is None else v_scale,
+        k.stride(0),
+        v.stride(0),
+        k_cache.stride(0),
+        v_cache.stride(0),
+        indices.stride(0),
+        K_WIDTH=k_width,
+        V_WIDTH=v_width,
+        K_SCALE_IS_TENSOR=isinstance(k_scale, torch.Tensor),
+        V_SCALE_IS_TENSOR=isinstance(v_scale, torch.Tensor),
+        FP8_MAX=torch.finfo(k_cache.dtype).max,
+        SIZE_LIMIT=k_cache.shape[0],
+        BLOCK=block,
+        debug=True,
+    )
 
 
 @triton.jit
