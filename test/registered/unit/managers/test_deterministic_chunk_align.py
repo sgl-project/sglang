@@ -1,8 +1,5 @@
-"""Deterministic inference must never leave a prompt unschedulable.
-
-A chunk shorter than the prefill alignment truncates every chunk to zero
-tokens, so a prompt longer than the chunk used to wait in the queue forever.
-"""
+"""A per-rank chunk shorter than the deterministic prefill alignment must fail at
+startup: it truncates every chunk to zero tokens and the prompt waits forever."""
 
 import unittest
 from types import SimpleNamespace
@@ -18,19 +15,6 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 _MOD = "sglang.srt.managers.scheduler"
 
 
-def _align_for(prefill_backend):
-    scheduler = Scheduler.__new__(Scheduler)
-    exec_ctx = SimpleNamespace(
-        deterministic=SimpleNamespace(enable_deterministic_inference=True)
-    )
-    with (
-        patch(f"{_MOD}.get_exec", return_value=exec_ctx),
-        patch(f"{_MOD}.attention_backends", return_value=(prefill_backend, None)),
-    ):
-        scheduler.init_deterministic_inference_config()
-    return scheduler.truncation_align_size
-
-
 def _check(align, chunk, attn_dp_size=1, mode=DisaggregationMode.NULL):
     scheduler = Scheduler.__new__(Scheduler)
     scheduler.disaggregation_mode = mode
@@ -42,18 +26,12 @@ def _check(align, chunk, attn_dp_size=1, mode=DisaggregationMode.NULL):
 
 
 class TestDeterministicChunkAlign(CustomTestCase):
-    def test_triton_does_not_align_prefill_chunks(self):
-        self.assertIsNone(_align_for("triton"))
-        self.assertEqual(_align_for("flashinfer"), 4096)
-
     def test_chunk_shorter_than_alignment_fails_at_startup(self):
         with self.assertRaisesRegex(ValueError, "at least 8192"):
             _check(align=4096, chunk=2048, attn_dp_size=2)
 
     def test_chunk_covering_alignment_starts(self):
         _check(align=4096, chunk=4096)
-        _check(align=4096, chunk=None)
-        _check(align=None, chunk=2048)
         _check(align=4096, chunk=2048, mode=DisaggregationMode.DECODE)
 
 

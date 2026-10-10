@@ -300,18 +300,10 @@ def align_window_kv_to_tiles(
     bs: int,
     tile: int = 128,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Prepend copies of each request's first window key so its KV list starts on
-    an absolute multiple of ``tile`` (a multiple of every BLOCK_N).
-
-    After a chunked prefill the window's KV list starts mid-sequence, so the
-    unified kernel's key tiles, and the order it sums them in, differ from an
-    unchunked prefill. The copies sit before the window and are masked out by
-    the sliding-window mask; they only move the tile boundaries back onto the
-    absolute positions an unchunked prefill uses.
-
-    Returns:
-        (aligned_kv_indptr, aligned_kv_indices)
-    """
+    """Pad each request's window KV list with copies of its first key so the list
+    starts on an absolute multiple of ``tile`` (a multiple of every BLOCK_N). The
+    unified kernel then sums a chunked prefill's keys in the same tiles as an
+    unchunked one; the copies sit before the window and are masked out."""
     pad = window_start_pos[:bs] % tile
     lens = window_kv_indptr[1 : bs + 1] - window_kv_indptr[:bs] + pad
     aligned_kv_indptr = torch.zeros_like(window_kv_indptr[: bs + 1])
