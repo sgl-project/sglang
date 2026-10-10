@@ -74,6 +74,7 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
     UnquantizedLinearMethod,
+    apply_amx_packed_linear,
     apply_unquantized_linear,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
@@ -111,6 +112,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     is_in_breakable_cuda_graph,
 )
+from sglang.srt.utils import use_intel_amx_backend
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
 _QWEN_NORM_OUT = BitExactFusionGate("Qwen-Image fused norm_out", per_signature=True)
@@ -216,6 +218,9 @@ def _split_unquantized_merged_linear(
     sizes = linear.output_partition_sizes
     if len(sizes) != 3:
         raise ValueError(f"Expected three packed projection shards, got {sizes}")
+    if use_intel_amx_backend(linear):
+        merged = apply_amx_packed_linear(x=x, weight=linear.weight, bias=linear.bias)
+        return tuple(merged.split(sizes, dim=-1))
     weights = linear.weight.split(sizes, dim=0)
     biases = (
         linear.bias.split(sizes, dim=0)
@@ -923,6 +928,7 @@ class QwenImageCrossAttention(nn.Module):
                 AttentionBackendEnum.AITER,
                 AttentionBackendEnum.AITER_SAGE,
                 AttentionBackendEnum.TORCH_SDPA,
+                AttentionBackendEnum.AMX_ATTN,
                 AttentionBackendEnum.SAGE_ATTN,
                 AttentionBackendEnum.SAGE_ATTN_3,
                 AttentionBackendEnum.SPARGE_ATTN,

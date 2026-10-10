@@ -312,6 +312,7 @@ class PiGemmaAttention(nn.Module):
                 AttentionBackendEnum.FA,
                 AttentionBackendEnum.FA2,
                 AttentionBackendEnum.TORCH_SDPA,
+                AttentionBackendEnum.AMX_ATTN,
             },
             compute_dtype=config_compute_dtype(config),
             allow_cudnn_sdp=True,
@@ -327,6 +328,7 @@ class PiGemmaAttention(nn.Module):
                     AttentionBackendEnum.FA,
                     AttentionBackendEnum.FA2,
                     AttentionBackendEnum.TORCH_SDPA,
+                    AttentionBackendEnum.AMX_ATTN,
                 },
                 allow_cudnn_sdp=True,
             )
