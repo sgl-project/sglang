@@ -36,8 +36,8 @@ export const DiffusionModelCatalog = ({ category }) => {
       cookbook: "/cookbook/diffusion/Qwen-Image/Qwen-Image",
     },
     {
-      name: "Qwen-Image 2.1",
-      modelIds: ["Qwen/Qwen-Image-2.1"],
+      name: "Qwen-Image 2.1 / Turbo",
+      modelIds: ["Qwen/Qwen-Image-2.1", "Qwen/Qwen-Image-2.1-Turbo"],
       cookbook: "/cookbook/diffusion/Qwen-Image/Qwen-Image-2.1",
     },
     {

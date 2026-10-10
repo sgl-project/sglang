@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Numerical primitives shared by bit-exact diffusion Triton kernels."""
+"""Numerical primitives shared by bit-exact Triton kernels."""
 
 import triton  # type: ignore
 import triton.language as tl  # type: ignore

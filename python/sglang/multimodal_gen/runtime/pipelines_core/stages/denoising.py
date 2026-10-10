@@ -31,6 +31,7 @@ from sglang.kernels.ops.diffusion import (
     mount_lingbot_video_rmsnorm,
     mount_ltx2_qknorm_split_rope,
     mount_ltx2_rms_norm_modulate,
+    mount_minimax_h3_norm_modulate,
     mount_nvfp4_bias_gelu,
     mount_qwen_image_added_qkv,
     mount_sana_video_linear_attention,
@@ -44,6 +45,7 @@ from sglang.kernels.ops.diffusion import (
     unmount_lingbot_video_rmsnorm,
     unmount_ltx2_qknorm_split_rope,
     unmount_ltx2_rms_norm_modulate,
+    unmount_minimax_h3_norm_modulate,
     unmount_nvfp4_bias_gelu,
     unmount_qwen_image_added_qkv,
     unmount_sana_video_linear_attention,
@@ -260,6 +262,12 @@ _QUALITY_FUSION_HANDLERS: tuple[
         "Helios per-token gated residual",
         mount_helios_gated_residual,
         unmount_helios_gated_residual,
+    ),
+    (
+        "lossless",
+        "MiniMax-H3 fused RMSNorm + AdaLN",
+        mount_minimax_h3_norm_modulate,
+        unmount_minimax_h3_norm_modulate,
     ),
     (
         # the first attention GEMM takes BF16 inputs where the reference
