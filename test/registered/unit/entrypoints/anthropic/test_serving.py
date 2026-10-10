@@ -199,6 +199,130 @@ class TestAnthropicServing(unittest.TestCase):
             overrides["tools"] = tools
         return self._anthropic_request(**overrides)
 
+    def test_non_streaming_stop_sequence_is_reported(self):
+        openai_response = ChatCompletionResponse.model_validate(
+            {
+                "id": "chatcmpl-test",
+                "model": "test-model",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": "one two three",
+                        },
+                        "finish_reason": "stop",
+                        "matched_stop": "FENCE",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 5,
+                    "completion_tokens": 3,
+                    "total_tokens": 8,
+                },
+            }
+        )
+
+        serving = AnthropicServing(_FakeNonStreamingOpenAI(openai_response))
+        anthropic_request = self._anthropic_request(
+            stream=False,
+            stop_sequences=["FENCE"],
+        )
+        chat_request = serving._convert_to_chat_completion_request(anthropic_request)
+
+        response = asyncio.run(
+            serving._handle_non_streaming(
+                chat_request,
+                anthropic_request,
+                object(),
+            )
+        )
+        payload = json.loads(response.body)
+
+        self.assertEqual(payload["stop_reason"], "stop_sequence")
+        self.assertEqual(payload["stop_sequence"], "FENCE")
+
+    def test_stream_stop_sequence_is_reported(self):
+        serving = self._serving(
+            [
+                _chunk([_choice({"role": "assistant", "content": ""})]),
+                _chunk([_choice({"content": "one two three"})]),
+                _chunk(
+                    [
+                        {
+                            "index": 0,
+                            "delta": {},
+                            "finish_reason": "stop",
+                            "matched_stop": "FENCE",
+                        }
+                    ]
+                ),
+                "data: [DONE]\n\n",
+            ]
+        )
+
+        anthropic_request = self._anthropic_request(
+            stop_sequences=["FENCE"],
+        )
+
+        events = asyncio.run(_collect_anthropic_events(serving, anthropic_request))
+
+        message_delta = next(
+            event for event in events if event["type"] == "message_delta"
+        )
+
+        self.assertEqual(
+            message_delta["delta"]["stop_reason"],
+            "stop_sequence",
+        )
+        self.assertEqual(
+            message_delta["delta"]["stop_sequence"],
+            "FENCE",
+        )
+
+    def test_non_streaming_unmatched_stop_is_end_turn(self):
+        openai_response = ChatCompletionResponse.model_validate(
+            {
+                "id": "chatcmpl-test",
+                "model": "test-model",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": "done",
+                        },
+                        "finish_reason": "stop",
+                        "matched_stop": 12345,
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 5,
+                    "completion_tokens": 1,
+                    "total_tokens": 6,
+                },
+            }
+        )
+
+        serving = AnthropicServing(_FakeNonStreamingOpenAI(openai_response))
+        anthropic_request = self._anthropic_request(
+            stream=False,
+            stop_sequences=["FENCE"],
+        )
+        chat_request = serving._convert_to_chat_completion_request(anthropic_request)
+
+        response = asyncio.run(
+            serving._handle_non_streaming(
+                chat_request,
+                anthropic_request,
+                object(),
+            )
+        )
+        payload = json.loads(response.body)
+
+        self.assertEqual(payload["stop_reason"], "end_turn")
+        self.assertNotIn("stop_sequence", payload)
+
     def test_messages_preserves_pd_rendezvous_through_native_conversion(self):
         """PD routers inject bootstrap fields into /v1/messages bodies; dropping
         them in the Chat Completions conversion strands the decode request."""

@@ -70,6 +70,24 @@ STOP_REASON_MAP = {
     "tool_calls": "tool_use",
 }
 
+
+def _anthropic_stop_fields(
+    finish_reason: Optional[str],
+    matched_stop: Union[None, int, str],
+    stop_sequences: Optional[list[str]],
+) -> tuple[str, Optional[str]]:
+    effective_finish = finish_reason or "stop"
+
+    if (
+        effective_finish == "stop"
+        and isinstance(matched_stop, str)
+        and matched_stop in (stop_sequences or [])
+    ):
+        return "stop_sequence", matched_stop
+
+    return STOP_REASON_MAP.get(effective_finish, "end_turn"), None
+
+
 ERROR_TYPE_MAP = {
     400: "invalid_request_error",
     401: "authentication_error",
@@ -772,7 +790,10 @@ class AnthropicServing:
             return self._convert_openai_error_response(response)
 
         # Convert to Anthropic response
-        anthropic_response = self._convert_response(response)
+        anthropic_response = self._convert_response(
+            response,
+            anthropic_request.stop_sequences,
+        )
         return JSONResponse(content=anthropic_response.model_dump(exclude_none=True))
 
     async def _handle_streaming(
@@ -841,6 +862,7 @@ class AnthropicServing:
         content_block_type: Optional[str] = None
         captured_thinking_signature: str = ""
         finish_reason: Optional[str] = None
+        matched_stop: Union[None, int, str] = None
         final_usage: Optional[AnthropicUsage] = None
         message_started = False
         had_content_delta = False
@@ -1061,10 +1083,17 @@ class AnthropicServing:
                         "Unmapped streaming finish_reason %r; defaulting to end_turn",
                         effective_finish,
                     )
-                stop_reason = STOP_REASON_MAP.get(effective_finish, "end_turn")
+                stop_reason, stop_sequence = _anthropic_stop_fields(
+                    effective_finish,
+                    matched_stop,
+                    anthropic_request.stop_sequences,
+                )
                 yield _emit(
                     MessageDeltaEvent(
-                        delta=AnthropicMessageEndDelta(stop_reason=stop_reason),
+                        delta=AnthropicMessageEndDelta(
+                            stop_reason=stop_reason,
+                            stop_sequence=stop_sequence,
+                        ),
                         usage=final_usage or AnthropicUsage(output_tokens=0),
                     )
                 )
@@ -1127,6 +1156,8 @@ class AnthropicServing:
             # one-token reply. Fall through to the delta handlers below.
             if choice.finish_reason is not None:
                 finish_reason = choice.finish_reason
+            if choice.matched_stop is not None:
+                matched_stop = choice.matched_stop
 
             delta = choice.delta
 
@@ -1245,7 +1276,9 @@ class AnthropicServing:
                 had_content_delta = True
 
     def _convert_response(
-        self, response: ChatCompletionResponse
+        self,
+        response: ChatCompletionResponse,
+        stop_sequences: Optional[list[str]] = None,
     ) -> AnthropicMessagesResponse:
         """Convert an OpenAI ChatCompletionResponse to an Anthropic Messages response."""
         if not response.choices:
@@ -1302,7 +1335,11 @@ class AnthropicServing:
                 "Unmapped OpenAI finish_reason %r; defaulting to end_turn",
                 finish_reason,
             )
-        stop_reason = STOP_REASON_MAP.get(finish_reason, "end_turn")
+        stop_reason, stop_sequence = _anthropic_stop_fields(
+            finish_reason,
+            choice.matched_stop,
+            stop_sequences,
+        )
 
         # Anthropic requires ``content`` to contain at least one block.
         # Empty string completions (max_tokens=1 stop, content filter, etc.)
@@ -1315,6 +1352,7 @@ class AnthropicServing:
             content=content,
             model=response.model,
             stop_reason=stop_reason,
+            stop_sequence=stop_sequence,
             usage=_anthropic_usage_from_openai(
                 response.usage,
                 include_input=True,
