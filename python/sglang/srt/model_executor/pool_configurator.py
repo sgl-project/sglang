@@ -1165,8 +1165,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.encoder_replay = get_exec().features.enable_encoder_swa_bounded_replay
         self.paged_draft_layers = 0
         if self.encoder_replay and kvc.spec_algorithm.is_dspark():
+            aux = kvc.spec_aux_config
             self.paged_draft_layers = int(
-                kvc.spec_aux_config.dflash_draft_num_layers or 0
+                aux.dspark_num_stages or aux.dflash_draft_num_layers or 0
             )
             assert self.paged_draft_layers > 0, "DSpark draft layer count is required"
         self.request_window_bytes = 0
@@ -1269,7 +1270,14 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             # Nothing is kept for reuse, so the request cap alone bounds the pool.
             return 0
         max_running_requests = self.requested_max_running_requests_per_worker
-        return 4 * max_running_requests if max_running_requests is not None else 0
+        if max_running_requests is None:
+            return 0
+        tails = 4 * max_running_requests
+        if self.encoder_replay and self.paged_draft_layers:
+            # A replay tail pays for draft layers only; spend the non-replay
+            # default's bytes on proportionally more tails.
+            tails *= max(1, self.num_layers_total // self.paged_draft_layers)
+        return tails
 
     def _resolve_swa_cap_tokens(self) -> Optional[int]:
         """SWA slots to reserve in cap mode, None to keep ratio sizing. Cap mode

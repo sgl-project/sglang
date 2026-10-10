@@ -44,6 +44,9 @@ class SpecAuxHiddenStateConfig(msgspec.Struct, kw_only=True):
     dflash_target_layer_ids: Any = None
     # DFLASH draft KV bytes/token; None when unresolved.
     dflash_draft_cell_size_per_token: int | None = None
+    # DSpark draft stages (DeepseekV4DSpark.num_stages); a bundled DSpark head
+    # inherits the target's num_hidden_layers, so dflash_draft_num_layers overcounts.
+    dspark_num_stages: Optional[int] = None
     # The draft checkpoint read in draft mode, and its KV layer count, for
     # every drafting algorithm: the fused-draft placement's input. A private
     # EAGLE draft pool is sized by `eagle_draft_num_layers` instead.
@@ -219,6 +222,7 @@ def _resolve_dflash_aux_hidden_state(
                 )
             if dspark_draft_config.target_layer_ids is not None:
                 target_layer_ids = list(dspark_draft_config.target_layer_ids)
+                config.dspark_num_stages = len(target_layer_ids)
 
         config.dflash_use_aux_hidden_state = True
         config.dflash_draft_num_layers = int(draft_num_layers)
