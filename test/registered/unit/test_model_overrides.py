@@ -2386,6 +2386,29 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     "dsa_decode_backend": "flashmla_kv",
                 },
             )
+            self.assertEqual(
+                _dsa_split_backend_resolution(
+                    _view(
+                        enable_hisparse=True,
+                        dsa_prefill_backend="tilelang",
+                        dsa_decode_backend="tilelang",
+                    )
+                ),
+                {},
+            )
+            with self.assertRaisesRegex(ValueError, "both DSA backends"):
+                _dsa_split_backend_resolution(
+                    _view(enable_hisparse=True, dsa_decode_backend="tilelang")
+                )
+            with self.assertRaisesRegex(ValueError, "dcp-size"):
+                _dsa_split_backend_resolution(
+                    _view(
+                        enable_hisparse=True,
+                        dsa_prefill_backend="tilelang",
+                        dsa_decode_backend="tilelang",
+                        dcp_size=2,
+                    )
+                )
             for arch in ("HYV4ForCausalLM", "HYV4ForCausalLMNextN"):
                 with self.subTest(arch=arch, backends="default"):
                     self.assertEqual(

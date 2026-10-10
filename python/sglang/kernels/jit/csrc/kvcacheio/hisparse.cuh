@@ -350,6 +350,7 @@ template <
     bool TopKIsBlocks,
     bool RecordMissPlan,
     bool SkipIO,
+    int NUM_TAIL_SLOTS,
     typename SeqLensT,
     typename ReqPoolIndicesT>
 __global__ void load_cache_to_device_buffer_kernel(
@@ -378,6 +379,8 @@ __global__ void load_cache_to_device_buffer_kernel(
     int32_t* __restrict__ miss_count_out,
     int64_t plan_stride) {
   static_assert(!IsDsv4Layout || IsMLA, "DSv4 page-padded layout is K-only (MLA).");
+  static_assert(NUM_TAIL_SLOTS >= 0 && NUM_TAIL_SLOTS < NUM_TOP_K, "Invalid top-k tail slots.");
+  static_assert(!TopKIsBlocks || NUM_TAIL_SLOTS == 0, "Block top-k does not use tail columns.");
   static_assert(SPARSE_BLOCK_SIZE > 0, "SPARSE_BLOCK_SIZE must be positive.");
   // Cache residency and LRU replacement remain token-granular even when the
   // sparse-attention selection arrives as block ids.
@@ -425,7 +428,7 @@ __global__ void load_cache_to_device_buffer_kernel(
         if (token_pos >= 0 && token_pos < seq_len) {
           device_loc = req_device_buffer_locs[token_pos];
         }
-      } else if (i < count && token_pos >= 0) {
+      } else if ((i < count || i >= NUM_TOP_K_TOKENS - NUM_TAIL_SLOTS) && token_pos >= 0 && token_pos < seq_len) {
         device_loc = req_device_buffer_locs[token_pos];
       }
       req_top_k_device_locs[i] = device_loc;
@@ -483,12 +486,10 @@ __global__ void load_cache_to_device_buffer_kernel(
   // Insert top-k tokens into shared-memory hash table.
   for (int i = tid; i < NUM_TOP_K_TOKENS; i += BLOCK_SIZE) {
     const int32_t token_idx = resolve_selected_token<SPARSE_BLOCK_SIZE, TopKIsBlocks>(req_top_k, i);
-    if constexpr (TopKIsBlocks) {
-      if (token_idx < 0 || token_idx >= seq_len) {
-        s_top_k_tokens[i] = TOKEN_HIT;
-        req_top_k_device_locs[i] = -1;
-        continue;
-      }
+    if (token_idx < 0 || token_idx >= seq_len) {
+      s_top_k_tokens[i] = TOKEN_HIT;
+      req_top_k_device_locs[i] = -1;
+      continue;
     }
     if (token_idx == newest_token) {
       // If topk includes the latest token, bind its canonical occurrence to newest_slot (at HOT_BUFFER_SIZE) and mark
@@ -558,23 +559,13 @@ __global__ void load_cache_to_device_buffer_kernel(
     __syncthreads();
 
     if (warp_id == 0) {
-#ifdef USE_ROCM
-      // ROCm wavefront64: WARP_SIZE (64) > NUM_WARPS (16 at block_size=1024),
-      // so the wide-count form below would let lanes beyond this iteration's
-      // NUM_WARPS-wide window write the accumulator into s_chunk_offset
-      // positions belonging to future iterations, corrupting their reads.
-      // Bound the scan window to NUM_WARPS lanes.
+      // Each iteration produces NUM_WARPS chunks, not a full warp of chunks.
       const int scan_offset = iter * NUM_WARPS + 1;
       const int scan_count = min(scan_offset + NUM_WARPS, NUM_BUFFER_CHUNKS + 1);
       total_hit_count = warp_inclusive_scan(s_chunk_offset, lane_id, scan_offset, scan_count, total_hit_count);
       total_evict_count =
           warp_inclusive_scan(s_evict_chunk_offset, lane_id, scan_offset, scan_count, total_evict_count);
-#else
-      total_hit_count =
-          warp_inclusive_scan(s_chunk_offset, lane_id, chunk_idx + 1, NUM_BUFFER_CHUNKS + 1, total_hit_count);
-      total_evict_count =
-          warp_inclusive_scan(s_evict_chunk_offset, lane_id, chunk_idx + 1, NUM_BUFFER_CHUNKS + 1, total_evict_count);
-#endif
+
       if (tid == 0) {
         s_total_hits = total_hit_count;
       }
@@ -633,13 +624,10 @@ __global__ void load_cache_to_device_buffer_kernel(
     __syncthreads();
 
     if (warp_id == 0) {
-#ifdef USE_ROCM
       const int scan_offset = iter * NUM_WARPS + 1;
       const int scan_count = min(scan_offset + NUM_WARPS, NUM_TOKEN_CHUNKS + 1);
       total_misses = warp_inclusive_scan(s_chunk_offset, lane_id, scan_offset, scan_count, total_misses);
-#else
-      total_misses = warp_inclusive_scan(s_chunk_offset, lane_id, chunk_idx + 1, NUM_TOKEN_CHUNKS + 1, total_misses);
-#endif
+
       if (tid == 0) {
         s_total_misses = total_misses;
       }
@@ -730,7 +718,8 @@ template <
     int SPARSE_BLOCK_SIZE,
     bool TopKIsBlocks,
     bool RecordMissPlan,
-    bool SkipIO>
+    bool SkipIO,
+    int NUM_TAIL_SLOTS = 0>
 void load_cache_to_device_buffer(
     tvm::ffi::TensorView top_k,
     tvm::ffi::TensorView device_buffer_tokens,
@@ -827,6 +816,7 @@ void load_cache_to_device_buffer(
             TopKIsBlocks,
             RecordMissPlan,
             SkipIO,
+            NUM_TAIL_SLOTS,
             int64_t,
             int64_t>,
         static_cast<const int64_t*>(seq_lens.data_ptr()),
@@ -843,6 +833,7 @@ void load_cache_to_device_buffer(
             TopKIsBlocks,
             RecordMissPlan,
             SkipIO,
+            NUM_TAIL_SLOTS,
             int64_t,
             int32_t>,
         static_cast<const int64_t*>(seq_lens.data_ptr()),
@@ -859,6 +850,7 @@ void load_cache_to_device_buffer(
             TopKIsBlocks,
             RecordMissPlan,
             SkipIO,
+            NUM_TAIL_SLOTS,
             int32_t,
             int64_t>,
         static_cast<const int32_t*>(seq_lens.data_ptr()),
@@ -875,6 +867,7 @@ void load_cache_to_device_buffer(
             TopKIsBlocks,
             RecordMissPlan,
             SkipIO,
+            NUM_TAIL_SLOTS,
             int32_t,
             int32_t>,
         static_cast<const int32_t*>(seq_lens.data_ptr()),
