@@ -189,6 +189,8 @@ from sglang.srt.utils.watchdog import Watchdog
 from sglang.srt.utils.weight_versions import add_weight_versions_to_meta_info
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
+from concurrent.futures import ThreadPoolExecutor
+
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
@@ -616,6 +618,20 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
         else:
             self.async_dynamic_batch_tokenizer = None
+
+        if(
+            envs.SGLANG_ENABLE_CHAT_ENCODE_THREAD_POOL.get()
+            and self.tokenizer is not None
+            and not self.model.config.is_multimodal
+
+        ): 
+            self.chat_encode_thread_pool = ThreadPoolExecutor(
+                max_workers = max(1, min(8, os.cpu_count() // 2)),
+                thread_name_prefix = "chat_encode_thread_pool",
+            )
+        else:
+            self.chat_encode_thread_pool = None
+
 
     def _validate_cuda_vmm_feature_transport_support(self) -> None:
         if get_mm().mm_feature_transport != "cuda_vmm":
