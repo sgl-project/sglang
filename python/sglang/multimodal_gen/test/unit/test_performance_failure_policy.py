@@ -9,6 +9,7 @@ import pytest
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
 from sglang.multimodal_gen.test.runner.pytest_runner import (
     _estimate_failed_test_time,
+    _extract_short_test_summary,
     _is_retryable_failure,
     run_pytest,
 )
@@ -58,6 +59,23 @@ def test_e2e_only_does_not_require_stage_metrics(monkeypatch, generate_baseline)
 )
 def test_validation_failures_are_not_retryable(output):
     assert not _is_retryable_failure(output)
+
+
+def test_failure_summary_uses_outer_pytest_session():
+    output = "\n".join(
+        [
+            "=== short test summary info ===",
+            "FAILED nested/test_retry.py::test_slow - AssertionError: [performance]",
+            "=== 1 failed ===",
+            "nested failure was expected; outer test PASSED",
+            "=== short test summary info ===",
+            "FAILED test_parallel.py::test_destroy - AssertionError",
+            "=== 1 failed, 10 passed ===",
+        ]
+    )
+    assert _extract_short_test_summary(output) == [
+        "FAILED test_parallel.py::test_destroy - AssertionError"
+    ]
 
 
 @pytest.mark.parametrize(
