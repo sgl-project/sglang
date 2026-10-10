@@ -43,8 +43,8 @@ from sglang.kernels.ops.attention.dsv4.topk import (
 from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-register_amd_ci(est_time=30, stage="jit-kernel-unit", runner_config="amd")
+register_cuda_ci(est_time=180, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_amd_ci(est_time=60, stage="jit-kernel-unit", runner_config="amd")
 
 PAGE_SIZE = 64  # c4 page size = 256 // 4
 PAGE_BITS = PAGE_SIZE.bit_length() - 1
@@ -414,6 +414,139 @@ def _assert_topk_values(window, indices, k):
     expected = window.topk(k).values.sort().values
     actual = window[indices].sort().values
     assert torch.equal(actual, expected)
+
+
+# Different FP32 scores in the same coarse bucket must still produce exact
+# selected values. These are public-API regressions: they make no assertion
+# about occupancy, planner thresholds, cluster size, or launch selection.
+@pytest.mark.parametrize(
+    "batch,seq", [(2, 8192), (2, 16384), (2, 32768), (1, 131072), (64, 131072)]
+)
+@pytest.mark.parametrize("count", [2048, 2049, 4096])
+@pytest.mark.parametrize("k", [512, 2048])
+@pytest.mark.parametrize("mode", ["raw", "paged", "dual"])
+@torch.inference_mode()
+def test_topk_v2_threshold_bucket_overflow(
+    batch: int, seq: int, count: int, k: int, mode: str
+) -> None:
+    if is_hip() and seq > 65536:
+        pytest.skip("ROCm split selection uses a separate implementation")
+    torch.manual_seed(batch + seq + count + k)
+    scores = torch.full((batch, seq), -2000.0, device="cuda")
+    # Distinct scores in [1000, 1001) lie in one coarse threshold bucket.
+    scores[:, :count] = 1000 + torch.arange(count, device="cuda").float() / 4096
+    lengths = torch.full((batch,), seq, dtype=torch.int32, device="cuda")
+    if batch == 64:
+        lengths[:48] = 32768
+    for row, length in enumerate(lengths.cpu().tolist()):
+        # Previously selected values above the threshold bucket must survive.
+        scores[row, length - 32 : length] = 2000
+
+    if mode == "raw":
+        selected = _run_raw(scores, lengths, k)
+    else:
+        pages, inverse = _make_page_table(
+            batch, seq // PAGE_SIZE, "perm", "cuda", per_row=True
+        )
+        if mode == "paged":
+            selected = _run(scores, lengths, pages, inverse, k)
+        else:
+            selected, raw = _run_dual(scores, lengths, pages, inverse, k)
+            for mapped_row, raw_row in zip(selected, raw):
+                assert sorted(mapped_row) == sorted(raw_row)
+    for row, length in enumerate(lengths.cpu().tolist()):
+        _assert_topk_values(scores[row, :length], torch.tensor(selected[row]), k)
+
+
+@pytest.mark.skipif(
+    is_hip(), reason="ROCm split selection uses a separate implementation"
+)
+@pytest.mark.parametrize("layout", ["contiguous", "strided"])
+@torch.inference_mode()
+def test_topk_v2_overflow_graph(layout: str) -> None:
+    torch.manual_seed(2026)
+    batch, seq, k, count = 64, 131072, 512, 4096
+    scores = torch.full((batch, seq), -2000.0, device="cuda")
+    i = torch.arange(count, device="cuda")
+    positions = i if layout == "contiguous" else (i // 512) * 8192 + 512 + i % 512
+    # The strided layout also exercises concentrated per-block populations in
+    # today's CUDA implementation, without requiring a particular launch path.
+    scores[:, positions] = 1000 + i.float() / count
+    lengths = torch.full((batch,), seq, dtype=torch.int32, device="cuda")
+    lengths[:48] = 32768
+    for row, length in enumerate(lengths.cpu().tolist()):
+        scores[row, length - 32 : length] = 2000
+    pages, _ = _make_page_table(batch, seq // PAGE_SIZE, "perm", "cuda", per_row=True)
+    # Keep the plan alive for every replay. Planning is outside this graph,
+    # matching the existing helpers and production metadata preparation.
+    metadata = _plan(lengths)
+    out = torch.empty((batch, k), dtype=torch.int32, device="cuda")
+    raw = torch.empty_like(out)
+
+    def invoke():
+        out.fill_(-2)
+        raw.fill_(-2)
+        topk_transform_paged_v2(scores, lengths, pages, out, PAGE_SIZE, metadata, raw)
+
+    def check():
+        for row, length in enumerate(lengths.cpu().tolist()):
+            _assert_topk_values(scores[row, :length], raw[row], k)
+        expected = (
+            pages.gather(1, raw.long() // PAGE_SIZE) * PAGE_SIZE + raw % PAGE_SIZE
+        )
+        assert torch.equal(out, expected)
+
+    invoke()
+    check()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        invoke()
+    stream.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        invoke()
+    for replay in range(3):
+        if replay == 1:
+            scores.copy_(scores.roll(127, dims=1))
+        elif replay == 2:
+            lengths.copy_(lengths.flip(0))
+            updated_metadata = _plan(lengths)
+            metadata.copy_(updated_metadata)
+        graph.replay()
+        check()
+
+
+@pytest.mark.parametrize("value", [-float("inf"), -1000.0, 0.0, float("inf")])
+@torch.inference_mode()
+def test_topk_v2_large_equal_bucket(value: float) -> None:
+    scores = torch.full((2, 32768), value, dtype=torch.float32, device="cuda")
+    lengths = torch.full((2,), 32768, dtype=torch.int32, device="cuda")
+    selected = _run_raw(scores, lengths, 2048)
+    for row in range(2):
+        _assert_topk_values(scores[row], torch.tensor(selected[row]), 2048)
+
+
+@pytest.mark.parametrize("length", [8190, 32766])
+@pytest.mark.parametrize("k", [512, 2048])
+@torch.inference_mode()
+def test_topk_v2_ragged_bucket_overflow(length: int, k: int) -> None:
+    starts_cpu = (1, 2, 3)
+    starts = torch.tensor(starts_cpu, device="cuda", dtype=torch.int32)
+    lengths = torch.full((3,), length, dtype=torch.int32, device="cuda")
+    offsets = torch.tensor([9, 100003, 200009], device="cuda", dtype=torch.int32)
+    scores = torch.full((3, (length + 6) & ~3), 2000.0, device="cuda")
+    for row, start in enumerate(starts_cpu):
+        scores[row, start : start + length] = -2000
+        scores[row, start : start + 4096] = (
+            1000 + torch.arange(4096, device="cuda").float() / 4096
+        )
+    before = scores.clone()
+    selected = _run_ragged(scores, lengths, starts, offsets, k)
+    for row, start in enumerate(starts_cpu):
+        _assert_topk_values(
+            before[row, start : start + length], torch.tensor(selected[row]), k
+        )
 
 
 @pytest.mark.parametrize("num_ties", [48, 96])
