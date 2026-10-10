@@ -86,9 +86,7 @@ def _resolve_flash_attn_varlen_func():
     from sglang.srt.utils import is_hip, is_sm121
 
     if is_sm121():
-        from sglang.kernels.ops.attention import (
-            qwen38_qsa_sm121_varlen,
-        )
+        from sglang.kernels.ops.attention import qwen38_qsa_sm121_varlen
 
         return qwen38_qsa_sm121_varlen
     if is_hip():
@@ -586,6 +584,21 @@ class QwenSparseAttnBackend(AttentionBackend):
             self.device = forward_batch.seq_lens.device
         if not self.max_context_len:
             self.max_context_len = self.req_to_token.shape[1]
+        if forward_batch.forward_mode.is_mixed():
+            # Mixed chunked prefill injects running decode rows into an
+            # EXTEND batch (ForwardMode.MIXED): each decode row is given
+            # extend_len == 1 so its prefix_len == seq_len - 1, which is
+            # almost never a multiple of indexer_compress_ratio. That
+            # violates the ratio-aligned prefix invariant the compressed
+            # write plan relies on, so the ratio assert in
+            # ``_qsa_build_write_plan`` would fire device-side.
+            raise NotImplementedError(
+                "Compressed QSA does not support ForwardMode.MIXED "
+                "(--enable-mixed-chunk): decode rows mixed into an extend "
+                "batch have prefix_len = seq_len - 1, which is not a "
+                "multiple of indexer_compress_ratio and breaks the "
+                "compressed write plan. Disable --enable-mixed-chunk."
+            )
         if forward_batch.forward_mode.is_idle() or forward_batch.seq_lens.numel() == 0:
             # DP idle forwards reach metadata init even though layers skip attention;
             # so do the zero-row DECODE steps the MTP wrapper makes of them.
@@ -1042,7 +1055,6 @@ class QwenSparseAttnBackend(AttentionBackend):
         )
 
     def _stage_extend_lens(self, spec_info, bs: int, num_tokens: int):
-
         extend_lens = getattr(spec_info, "extend_seq_lens_tensor", None)
         if extend_lens is not None and extend_lens.numel() >= bs:
             return extend_lens[:bs]
@@ -1077,9 +1089,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         """Sync-free replay refresh: nothing here may read back to the host,
         since launch_graph_metadata rebuilds every per-row graph buffer on device."""
 
-        from sglang.srt.layers.attention.qsa.graph_metadata import (
-            launch_graph_metadata,
-        )
+        from sglang.srt.layers.attention.qsa.graph_metadata import launch_graph_metadata
 
         indexer = metadata.indexer_metadata
         pool = indexer.token_to_kv_pool
