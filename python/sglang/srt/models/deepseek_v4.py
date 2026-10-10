@@ -956,6 +956,12 @@ class MqaAttentionBase(nn.Module):
             prefix=add_prefix("wo_b", prefix),
             parallel_group="attn_tp",
         )
+        # Lets weight post-processing that repacks these linears (FP8 Marlin)
+        # also prepare their rank-local decode shards; see maybe_use_decode_attn_tp.
+        if get_parallel().enable_cp_decode_attn_tp:
+            get_cp_decode_attn_tp_ctx().register_linears(
+                [self.wq_b, self.wo_a, self.wo_b]
+            )
 
         from sglang.kernels.ops.attention.deepseek_v4_rope import precompute_freqs_cis
 
