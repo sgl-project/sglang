@@ -93,6 +93,10 @@ def _build_page_interleaved_dcp_plan(
 
 
 class AscendKVManager(MooncakeKVManager):
+    # The relay is a CUDA/Triton kernel over an NVLink NCCL group, neither of
+    # which exists here; reject at the gate instead of in the relay kernel.
+    supports_decode_kv_broadcast = False
+
     def __init__(
         self,
         args,
