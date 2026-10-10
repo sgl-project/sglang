@@ -377,6 +377,7 @@ class CompletionRequest(PDRoutingFields):
     routed_experts_start_len: int = 0
     return_cached_tokens_details: bool = False
     return_spec_tokens_details: bool = False
+    return_request_metrics: bool = False
     return_token_ids: bool = False
 
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
@@ -443,6 +444,28 @@ class SpecTokensDetails(BaseModel):
     spec_cap_lens_histogram: List[int] = Field(default_factory=list)
 
 
+class RequestMetrics(BaseModel):
+    """Opt-in per-request timing metrics.
+
+    All durations are expressed in milliseconds. Fields that cannot be derived
+    for a given request (e.g. decode metrics for a single-token response) are
+    omitted rather than reported as zero.
+    """
+
+    queue_time_ms: Optional[float] = None
+    time_to_first_token_ms: Optional[float] = None
+    generation_time_ms: Optional[float] = None
+    end_to_end_latency_ms: Optional[float] = None
+    mean_itl_ms: Optional[float] = None
+    tokens_per_second: Optional[float] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        # Drop unavailable metrics instead of emitting them as null.
+        return {k: v for k, v in data.items() if v is not None}
+
+
 class SglExt(BaseModel):
     """SGLang extension fields for OpenAI-compatible responses.
 
@@ -457,6 +480,7 @@ class SglExt(BaseModel):
     )
     input_ids: Optional[List[int]] = None
     output_ids: Optional[List[List[int]]] = None
+    request_metrics: Optional[RequestMetrics] = None
 
     def split_ids(self) -> Tuple[Optional[SglExt], Optional[SglExt]]:
         """Split set fields into (non_ids, ids); a side with no set fields is None."""
@@ -902,6 +926,7 @@ class ChatCompletionRequest(PDRoutingFields):
     return_meta_info: bool = False
     return_input_ids_in_sglext: bool = False
     return_output_ids_in_sglext: bool = False
+    return_request_metrics: bool = False
     return_sampling_mask: bool = False
     sampling_logprobs_mode: Optional[Literal["selected", "support"]] = None
     reasoning_effort: ReasoningEffortType = Field(
