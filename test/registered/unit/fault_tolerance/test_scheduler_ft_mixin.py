@@ -14,14 +14,17 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 @pytest.fixture
 def scheduler(monkeypatch):
     parallel = SimpleNamespace(
-        enable_fault_tolerance=True,
         dp_rank=0,
         attn_tp_rank=0,
         attn_cp_rank=0,
+    )
+    features = SimpleNamespace(
+        enable_fault_tolerance=True,
         fault_tolerance_on_error_strategy="pause",
         fault_tolerance_pause_timeout=30,
     )
     monkeypatch.setattr(ft, "get_parallel", lambda: parallel)
+    monkeypatch.setattr(ft, "get_exec", lambda: SimpleNamespace(features=features))
     monkeypatch.setattr(ft.time, "monotonic", lambda: 100.0)
     scheduler = ft.SchedulerFaultToleranceMixin()
     scheduler.init_fault_tolerance()
@@ -45,7 +48,7 @@ def test_normal_exit_does_not_restart(scheduler):
 
 @pytest.mark.parametrize("strategy", ["pause", "continue"])
 def test_fault_reenters_loop_with_expected_state(scheduler, monkeypatch, strategy):
-    ft.get_parallel().fault_tolerance_on_error_strategy = strategy
+    ft.get_exec().features.fault_tolerance_on_error_strategy = strategy
     queue = deque([(SimpleNamespace(reqs=[]), None)])
     scheduler.result_queue = queue
     calls = []

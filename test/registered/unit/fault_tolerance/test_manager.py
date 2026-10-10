@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from sglang.srt.arg_groups import parallel_hook
+from sglang.srt.fault_tolerance import manager as ft_manager
 from sglang.srt.fault_tolerance.ft_state import FaultToleranceState
 from sglang.srt.fault_tolerance.manager import FaultToleranceManager
 from sglang.srt.fault_tolerance.protocol import parse_apply_request
@@ -33,7 +34,14 @@ def test_fault_tolerance_validates_attention_dp(monkeypatch, attn_dp_size):
         parallel_hook.handle_fault_tolerance(cfg)
 
 
-def test_protocol_and_state_contract():
+def test_protocol_and_state_contract(monkeypatch):
+    monkeypatch.setattr(
+        ft_manager,
+        "get_exec",
+        lambda: SimpleNamespace(
+            features=SimpleNamespace(fault_tolerance_on_error_strategy="pause")
+        ),
+    )
     request = parse_apply_request(
         b'{"instruction":"scale_down","params":{"removed_dp_ranks":[1]}}'
     )
@@ -56,7 +64,6 @@ def test_protocol_and_state_contract():
             attn_dp_size=2,
             num_dp_ranks=2,
             tp_size=2,
-            fault_tolerance_on_error_strategy="pause",
         ),
         zmq_context=Mock(),
         send_to_scheduler=AsyncMock(),

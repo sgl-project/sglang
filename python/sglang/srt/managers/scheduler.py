@@ -1890,7 +1890,7 @@ class Scheduler(
         self._war_barrier_enabled = is_cuda() or envs.SGLANG_ENABLE_WAR_BARRIER.get()
         with self.device_module.StreamContext(self.schedule_stream):
             self.metrics_reporter.start_scheduler_time_accounting()
-            if get_parallel().enable_fault_tolerance:
+            if get_exec().features.enable_fault_tolerance:
                 self._run_event_loop_fault_tolerance(dispatch_event_loop)
             else:
                 dispatch_event_loop(self)

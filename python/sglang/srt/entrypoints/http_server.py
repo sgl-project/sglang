@@ -315,7 +315,7 @@ async def lifespan(fast_api_app: FastAPI):
             thread_label = "Decode" + thread_label
         trace_set_thread_info(thread_label)
 
-    if get_parallel().enable_fault_tolerance:
+    if get_exec().features.enable_fault_tolerance:
         _global_state.tokenizer_manager.auto_create_handle_loop()
 
     # Initialize OpenAI serving handlers

@@ -2444,8 +2444,8 @@ class ModelRunner:
     ) -> ModelRunnerOutput:
         state = ElasticEPStateManager.instance()
         if (
-            get_parallel().enable_fault_tolerance
-            and get_parallel().fault_tolerance_on_error_strategy == "pause"
+            get_exec().features.enable_fault_tolerance
+            and get_exec().features.fault_tolerance_on_error_strategy == "pause"
             and state is not None
             and bool(
                 (state.last_active_ranks.bool() & ~state.active_ranks.bool()).any()

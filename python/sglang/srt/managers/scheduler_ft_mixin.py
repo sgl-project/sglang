@@ -17,7 +17,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ScheduleBatch
 from sglang.srt.mem_cache.common import release_kv_cache
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import notify_node_main_process_failure
 
 if TYPE_CHECKING:
@@ -42,12 +42,13 @@ class SchedulerFaultToleranceMixin:
                 if self._ft_result_queue is None:
                     self._ft_result_queue = getattr(self, "result_queue", None)
                 self._ft_abort_inflight_window()
-                if get_parallel().fault_tolerance_on_error_strategy == "continue":
+                if get_exec().features.fault_tolerance_on_error_strategy == "continue":
                     self._ft_discard_inflight_window()
                 else:
                     self._engine_paused = True
                     self._ft_pause_deadline = (
-                        time.monotonic() + get_parallel().fault_tolerance_pause_timeout
+                        time.monotonic()
+                        + get_exec().features.fault_tolerance_pause_timeout
                     )
                 self.ipc_channels.send_to_tokenizer.send_output(
                     FaultToleranceRankFaultOutput(
@@ -139,7 +140,7 @@ class SchedulerFaultToleranceMixin:
         )
 
     def _check_ft_pause_deadline(self: Scheduler) -> None:
-        if not get_parallel().enable_fault_tolerance:
+        if not get_exec().features.enable_fault_tolerance:
             return
         deadline = self._ft_pause_deadline
         if deadline is None or time.monotonic() < deadline:
@@ -147,7 +148,7 @@ class SchedulerFaultToleranceMixin:
         self._ft_pause_deadline = None
         logger.error(
             "Fault tolerance pause unattended: timeout_sec=%s dp_rank=%s",
-            get_parallel().fault_tolerance_pause_timeout,
+            get_exec().features.fault_tolerance_pause_timeout,
             get_parallel().dp_rank,
         )
         notify_node_main_process_failure()

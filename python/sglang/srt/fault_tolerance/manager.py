@@ -28,6 +28,7 @@ from sglang.srt.managers.io_struct import (
     WatchdogHeartbeatOutput,
     async_sock_send,
 )
+from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.network import get_zmq_socket
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
@@ -54,14 +55,13 @@ class PendingFTCommand:
 
 class FaultToleranceManager:
     def __init__(self, *, server_args, zmq_context, send_to_scheduler):
-        self.server_args = server_args
         self._zmq_context = zmq_context
         self.send_to_scheduler = send_to_scheduler
         self.send_to_watchdog: Dict[int, zmq.asyncio.Socket] = {}
         self._watchdog_endpoints: Dict[int, str] = {}
         self.state = FaultToleranceState(
             dp_size=server_args.num_dp_ranks,
-            strategy=server_args.fault_tolerance_on_error_strategy,
+            strategy=get_exec().features.fault_tolerance_on_error_strategy,
             global_rank_count=server_args.tp_size,
         )
         self.event_loop = None
@@ -124,7 +124,7 @@ class FaultToleranceManager:
         }
 
     async def _run_submitted_apply(self, request: FaultToleranceApplyRequest) -> None:
-        timeout = self.server_args.fault_tolerance_timeout
+        timeout = get_exec().features.fault_tolerance_timeout
 
         if not self.state.has_unresolved_expected_dp_fault():
             self._finish_submitted_apply(

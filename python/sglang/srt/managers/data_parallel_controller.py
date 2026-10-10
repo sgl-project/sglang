@@ -173,7 +173,7 @@ class DataParallelController:
                 self.context, zmq.PULL, port_args.scheduler_input_ipc_name, False
             )
         self.send_to_tokenizer = None
-        if get_parallel().enable_fault_tolerance:
+        if get_exec().features.enable_fault_tolerance:
             ft_tokenizer_endpoint = port_args.tokenizer_ipc_name
             if get_exec().moe.ep_join_mode == "recover":
                 # Recover uses private ports, but FT reports go to the primary.
@@ -256,7 +256,7 @@ class DataParallelController:
             self.control_message_step = 1
 
         self._scheduler_watchdog = None
-        if get_parallel().enable_fault_tolerance and self.scheduler_procs:
+        if get_exec().features.enable_fault_tolerance and self.scheduler_procs:
             self._scheduler_watchdog = DPCFaultToleranceWatchdog(
                 context=self.context,
                 tokenizer_endpoint=ft_tokenizer_endpoint,
@@ -327,7 +327,10 @@ class DataParallelController:
                 for i in range(self.max_dp_size)
             ]
             self._refresh_active_workers()
-            if get_parallel().enable_fault_tolerance and ranks.request_id is not None:
+            if (
+                get_exec().features.enable_fault_tolerance
+                and ranks.request_id is not None
+            ):
                 ack = RouteUpdateAckOutput(request_id=ranks.request_id)
                 sock_send(self.send_to_tokenizer, ack)
             return
@@ -408,7 +411,7 @@ class DataParallelController:
 
         time_stats.set_dp_dispatch_time()
         req.time_stats = wrap_as_pickle(time_stats)
-        if get_parallel().enable_fault_tolerance and not self._active_workers:
+        if get_exec().features.enable_fault_tolerance and not self._active_workers:
             self._reject_req(req, "no active DP rank")
         else:
             self.dispatching(req)
@@ -800,7 +803,7 @@ class DataParallelController:
                         ):
                             proc.start()
                         self.scheduler_procs.append(proc)
-                if get_parallel().enable_fault_tolerance:
+                if get_exec().features.enable_fault_tolerance:
                     self.scheduler_process_dp_ranks.append(dp_rank)
                     rank_offset = (
                         get_parallel().ep_join_rank_offset
@@ -841,7 +844,7 @@ class DataParallelController:
                 or rank not in self._active_workers
                 or self.workers[rank] is None
             ):
-                if get_parallel().enable_fault_tolerance:
+                if get_exec().features.enable_fault_tolerance:
                     self._reject_req(req, f"routed_dp_rank={rank} is inactive")
                     return True
                 raise ValueError(f"DP rank {rank} is not active.")

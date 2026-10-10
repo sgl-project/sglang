@@ -427,6 +427,8 @@ _SCHEDULER_EXIT_TIMEOUT_SECS = 15
 class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     """TokenizerManager is a process that tokenizes the text."""
 
+    fault_tolerance: Optional[FaultToleranceManager] = None
+
     # Set by whoever owns the event loop, and left None for Engine and grpc,
     # which own no server. Class-level to leave the frozen __init__ alone.
     _server_stop_hook: Optional[Callable[[], None]] = None
@@ -699,7 +701,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
     def init_fault_tolerance(self):
         self.fault_tolerance: Optional[FaultToleranceManager] = None
-        if not get_parallel().enable_fault_tolerance:
+        if not get_exec().features.enable_fault_tolerance:
             return
 
         # Scheduler commands reuse the primary DPC and its scheduler connections.
@@ -876,7 +878,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 (ElasticScaleUpdateReq, self.forward_elastic_scale_update),
             ]
         )
-        if get_parallel().enable_fault_tolerance and self.fault_tolerance is not None:
+        if self.fault_tolerance is not None:
             self._result_dispatcher += self.fault_tolerance.init_request_dispatcher()
         self.init_communicators()
 
@@ -913,7 +915,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 raise ValueError(
                     f"routed_dp_rank={obj.routed_dp_rank} out of range [0, {num_dp_ranks})"
                 )
-        if get_parallel().enable_fault_tolerance and self.fault_tolerance is not None:
+        if self.fault_tolerance is not None:
             routed_dp_rank = (
                 obj.routed_dp_rank if isinstance(obj, GenerateReqInput) else None
             )
@@ -2254,12 +2256,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self.is_pause_cond.notify_all()
 
     def fault_tolerance_status(self):
-        if not get_parallel().enable_fault_tolerance or self.fault_tolerance is None:
+        if self.fault_tolerance is None:
             return 503, {"message": "fault_tolerance_disabled"}
         return self.fault_tolerance.status()
 
     def fault_tolerance_apply(self, obj: FaultToleranceApplyRequest):
-        if not get_parallel().enable_fault_tolerance or self.fault_tolerance is None:
+        if self.fault_tolerance is None:
             return 503, {"message": "fault_tolerance_disabled"}
         return self.fault_tolerance.submit(obj)
 
@@ -2417,7 +2419,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             loop.create_task(print_exception_wrapper(self.handle_loop))
         )
         self.event_loop = loop
-        if get_parallel().enable_fault_tolerance and self.fault_tolerance is not None:
+        if self.fault_tolerance is not None:
             self.fault_tolerance.bind_event_loop(loop)
 
         # We only add signal handler when the tokenizer manager is in the main thread
@@ -3577,7 +3579,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         state.event.set()
 
     def update_active_ranks(self, ranks: ActiveRanksOutput):
-        if get_parallel().enable_fault_tolerance and self.fault_tolerance is not None:
+        if self.fault_tolerance is not None:
             ranks = self.fault_tolerance.observe_active_ranks(ranks)
             if ranks is None:
                 return
@@ -3638,7 +3640,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         return responses[0]
 
     def update_process_active_ranks(self, ranks: ProcessActiveRanksOutput):
-        if get_parallel().enable_fault_tolerance and self.fault_tolerance is not None:
+        if self.fault_tolerance is not None:
             active_ranks = self.fault_tolerance.observe_process_active_ranks(ranks)
             if active_ranks is not None:
                 self._dispatch_to_scheduler(active_ranks)

@@ -52,6 +52,22 @@ class ExecFeatures(msgspec.Struct):
     # -------------------------------------------------------------------------
     # Misc runtime features
     # -------------------------------------------------------------------------
+    enable_fault_tolerance: A[
+        bool,
+        "Enable the DP-only fault-tolerance control plane.",
+    ] = False
+    fault_tolerance_on_error_strategy: A[
+        Literal["pause", "continue"],
+        "Fault-tolerance strategy for scheduler exceptions.",
+    ] = "pause"
+    fault_tolerance_timeout: A[
+        int,
+        "Timeout in seconds for each fault-tolerance control phase.",
+    ] = 60
+    fault_tolerance_pause_timeout: A[
+        float,
+        "Fail-stop timeout in seconds for an unattended fault-tolerance pause.",
+    ] = 300
     enable_memory_saver: A[
         bool,
         "Allow saving memory using release_memory_occupation and resume_memory_occupation",
