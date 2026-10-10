@@ -676,10 +676,38 @@ class PrefillAdder:
         # that mamba-recoverable budget separately or an over-admit hits the
         # fail-loud `RuntimeError`. `None` outside the unified Mamba pool.
         self.rem_mamba_slots = None
+        # MAMBA-ADMIT-FIX: per-request slot charge factor (the same constant
+        # alloc_req_slots reserves with); 1 keeps the unified-pool ledger
+        # byte-for-byte upstream-identical.
+        self._mamba_slots_per_req = 1
         if self._mamba_slot_cost:
             self.rem_mamba_slots = self.token_to_kv_pool_allocator.mamba_allocator.schedulable_available_size()
             if self.is_hybrid_ssm_cache:
                 self.rem_mamba_slots += self.tree_cache.mamba_evictable_size()
+        elif (
+            self.is_hybrid_ssm_cache
+            and getattr(self.tree_cache, "req_to_token_pool", None) is not None
+            and hasattr(self.tree_cache.req_to_token_pool, "mamba_allocator")
+        ):
+            # MAMBA-ADMIT-FIX: classic HybridReqToTokenPool (non-unified
+            # memory) has its own slot free-list that the ledger above never
+            # sees. Mirror alloc_req_slots' sizing so admission cannot
+            # over-commit slots that no eviction can recover.
+            from sglang.srt.mem_cache.common import (
+                MAMBA_STATE_PER_REQ_PREFIX_CACHE,
+                MAMBA_STATE_PER_REQ_PREFIX_CACHE_LAZY,
+            )
+
+            pool = self.tree_cache.req_to_token_pool
+            self._mamba_slots_per_req = (
+                MAMBA_STATE_PER_REQ_PREFIX_CACHE_LAZY
+                if getattr(pool, "enable_mamba_extra_buffer_lazy", False)
+                else MAMBA_STATE_PER_REQ_PREFIX_CACHE
+            )
+            self.rem_mamba_slots = (
+                pool.mamba_allocator.schedulable_available_size()
+                + self.tree_cache.mamba_evictable_size()
+            )
 
         self.priority_scheduling_preemption_threshold = (
             priority_scheduling_preemption_threshold
@@ -807,6 +835,9 @@ class PrefillAdder:
         also account for missing tracking buffers)."""
         if self._mamba_slot_cost and not req.kv.holds_mamba:
             return self._mamba_slot_cost
+        # MAMBA-ADMIT-FIX: slot-count budget for the classic hybrid pool.
+        if self.rem_mamba_slots is not None and not req.kv.holds_mamba:
+            return self._mamba_slots_per_req
         return 0
 
     def ceil_paged_tokens(self, tokens: int) -> int:
@@ -817,7 +848,9 @@ class PrefillAdder:
         # Gate new mamba slots separately: rem_total_tokens' full_evictable can't
         # cover a mamba slot, which needs mamba-recoverable bytes (see __init__).
         if not no_token and self.rem_mamba_slots is not None:
-            no_token = self.rem_mamba_slots <= 0
+            # MAMBA-ADMIT-FIX: gate on the FULL per-request charge; <=0 lets
+            # the request in exactly when the next full factor fits.
+            no_token = self.rem_mamba_slots < self._mamba_slots_per_req
         if no_token:
             return AddReqResult.NO_TOKEN
 
@@ -873,7 +906,10 @@ class PrefillAdder:
         # The new mamba slot also consumes one mamba-recoverable slot (gated
         # separately so full_evictable can't cover it — see __init__).
         if mamba_gap_reserve and self.rem_mamba_slots is not None:
-            self.rem_mamba_slots -= 1
+            # MAMBA-ADMIT-FIX: subtract the per-request factor; unified-pool
+            # bookkeeping keeps `_mamba_slots_per_req == 1` (upstream-identical
+            # — the byte cost lives in memory_budget.reserve, not here).
+            self.rem_mamba_slots -= self._mamba_slots_per_req
         self.rem_input_tokens -= compute_charge
 
         if self.dllm_config is not None:
