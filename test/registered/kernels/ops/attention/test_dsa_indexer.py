@@ -22,6 +22,10 @@ from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
     DSATopKBackend,
     TopkTransformMethod,
 )
+from sglang.srt.layers.attention.dsa.utils import (
+    _fp8_mqa_logits_torch,
+    _fp8_paged_mqa_logits_torch,
+)
 from sglang.srt.layers.attention.dsa_backend import (
     DeepseekSparseAttnBackend,
     DSAMetadata,
@@ -927,10 +931,10 @@ class TestDSAIndexer(CustomTestCase):
             )
         )
 
-    @patch("sglang.srt.layers.attention.dsa.dsa_indexer.deep_gemm")
-    def test_indexer_basic_creation(self, mock_deep_gemm):
+    @patch("sglang.srt.layers.attention.dsa.dsa_indexer.resolve_num_sms")
+    def test_indexer_basic_creation(self, mock_resolve_num_sms):
         """Test basic indexer creation and initialization."""
-        mock_deep_gemm.get_num_sms.return_value = 132
+        mock_resolve_num_sms.return_value = 132
 
         indexer = self._create_indexer()
 
@@ -941,16 +945,30 @@ class TestDSAIndexer(CustomTestCase):
         self.assertEqual(indexer.index_topk, self.config["index_topk"])
         self.assertEqual(indexer.layer_id, self.config["layer_id"])
 
-    @patch("sglang.srt.layers.attention.dsa.dsa_indexer.deep_gemm")
+    @patch("sglang.srt.layers.attention.dsa.dsa_indexer.resolve_num_sms")
+    @patch(
+        "sglang.srt.layers.attention.dsa.dsa_indexer.resolve_fp8_paged_mqa_logits_fn"
+    )
+    @patch("sglang.srt.layers.attention.dsa.dsa_indexer.resolve_fp8_mqa_logits_fn")
+    @patch(
+        "sglang.srt.layers.attention.dsa.dsa_indexer.resolve_paged_mqa_logits_metadata_fn"
+    )
     @patch("sglang.kernels.ops.attention.dsa.triton_kernel.act_quant")
-    def test_forward_extend_mode(self, mock_act_quant, mock_deep_gemm):
+    def test_forward_extend_mode(
+        self,
+        mock_act_quant,
+        mock_resolve_metadata,
+        mock_resolve_mqa_logits,
+        mock_resolve_paged_mqa_logits,
+        mock_resolve_num_sms,
+    ):
         """Test indexer forward pass in extend mode."""
         if not self.supports_fp8:
             self.skipTest("FP8 requires Hopper GPU or newer")
 
         # Setup mocks
-        mock_deep_gemm.get_num_sms.return_value = 132
-        mock_deep_gemm.get_paged_mqa_logits_metadata.return_value = MagicMock()
+        mock_resolve_num_sms.return_value = 132
+        mock_resolve_metadata.return_value = MagicMock(return_value=MagicMock())
 
         def mock_quant(x, *args, **kwargs):
             # Return FP8 tensor and scale
@@ -971,7 +989,7 @@ class TestDSAIndexer(CustomTestCase):
                 num_queries, max_kv_len, dtype=torch.float32, device="cuda"
             )
 
-        mock_deep_gemm.fp8_mqa_logits.side_effect = mock_mqa_logits
+        mock_resolve_mqa_logits.return_value = mock_mqa_logits
 
         # Also mock the paged version for completeness
         def mock_paged_mqa_logits(q, kv, weights, *args, **kwargs):
@@ -979,7 +997,7 @@ class TestDSAIndexer(CustomTestCase):
             seq_len = 128
             return torch.randn(batch_size, seq_len, dtype=torch.float32, device="cuda")
 
-        mock_deep_gemm.fp8_paged_mqa_logits.side_effect = mock_paged_mqa_logits
+        mock_resolve_paged_mqa_logits.return_value = mock_paged_mqa_logits
 
         self._init_model_runner()
 
@@ -1023,16 +1041,28 @@ class TestDSAIndexer(CustomTestCase):
             topk_indices, self.batch_size, self.seq_len, self.config["index_topk"]
         )
 
-    @patch("sglang.srt.layers.attention.dsa.dsa_indexer.deep_gemm")
+    @patch("sglang.srt.layers.attention.dsa.dsa_indexer.resolve_num_sms")
+    @patch(
+        "sglang.srt.layers.attention.dsa.dsa_indexer.resolve_fp8_paged_mqa_logits_fn"
+    )
+    @patch(
+        "sglang.srt.layers.attention.dsa.dsa_indexer.resolve_paged_mqa_logits_metadata_fn"
+    )
     @patch("sglang.kernels.ops.attention.dsa.triton_kernel.act_quant")
-    def test_forward_decode_mode(self, mock_act_quant, mock_deep_gemm):
+    def test_forward_decode_mode(
+        self,
+        mock_act_quant,
+        mock_resolve_metadata,
+        mock_resolve_paged_mqa_logits,
+        mock_resolve_num_sms,
+    ):
         """Test indexer forward pass in decode mode."""
         if not self.supports_fp8:
             self.skipTest("FP8 requires Hopper GPU or newer")
 
         # Setup mocks
-        mock_deep_gemm.get_num_sms.return_value = 132
-        mock_deep_gemm.get_paged_mqa_logits_metadata.return_value = MagicMock()
+        mock_resolve_num_sms.return_value = 132
+        mock_resolve_metadata.return_value = MagicMock(return_value=MagicMock())
 
         def mock_quant(x, *args, **kwargs):
             return x.to(torch.float8_e4m3fn), torch.ones(
@@ -1042,11 +1072,16 @@ class TestDSAIndexer(CustomTestCase):
         mock_act_quant.side_effect = mock_quant
 
         def mock_paged_mqa_logits(q, kv, weights, *args, **kwargs):
-            batch_size = q.shape[0]
-            seq_len = 128
-            return torch.randn(batch_size, seq_len, dtype=torch.float32, device="cuda")
+            # In decode mode: q is (batch_size, 1) or (batch_size,)
+            # Return logits with shape (batch_size, seq_len) for scoring against cached keys
+            batch_size = q.shape[0] if len(q.shape) > 1 else q.shape[0]
+            seq_len = 128  # Context length from self.seq_len
+            logits = torch.randn(
+                batch_size, seq_len, dtype=torch.float32, device="cuda"
+            )
+            return logits
 
-        mock_deep_gemm.fp8_paged_mqa_logits.side_effect = mock_paged_mqa_logits
+        mock_resolve_paged_mqa_logits.return_value = mock_paged_mqa_logits
 
         self._init_model_runner()
 
@@ -1088,6 +1123,127 @@ class TestDSAIndexer(CustomTestCase):
         self._verify_topk_output(
             topk_indices, self.batch_size, 1, self.config["index_topk"]
         )
+
+    def test_fp8_mqa_logits_torch_matches_reference(self):
+        """Test pure-torch prefill MQA logits fallback against a direct reference."""
+        if not self.supports_fp8:
+            self.skipTest("FP8 requires Hopper GPU or newer")
+
+        num_q, num_kv, num_heads, head_dim = 7, 11, 3, 16
+        q_fp8 = torch.randn(
+            num_q, num_heads, head_dim, dtype=torch.bfloat16, device=self.device
+        ).to(torch.float8_e4m3fn)
+        k_fp8 = torch.randn(
+            num_kv, head_dim, dtype=torch.bfloat16, device=self.device
+        ).to(torch.float8_e4m3fn)
+        k_scale = torch.rand(num_kv, dtype=torch.float32, device=self.device) + 0.5
+        weights = torch.rand(num_q, num_heads, dtype=torch.float32, device=self.device)
+        ks = torch.tensor([0, 1, 2, 0, 4, 3, 5], dtype=torch.int32, device=self.device)
+        ke = torch.tensor(
+            [num_kv, 9, 7, 5, num_kv, 8, 10], dtype=torch.int32, device=self.device
+        )
+
+        actual = _fp8_mqa_logits_torch(q_fp8, (k_fp8, k_scale), weights, ks, ke)
+
+        q = q_fp8.to(torch.bfloat16)
+        k_t = k_fp8.to(torch.bfloat16).t()
+        expected = torch.zeros(num_q, num_kv, dtype=torch.float32, device=self.device)
+        for h in range(num_heads):
+            expected.addcmul_(
+                torch.relu(torch.mm(q[:, h], k_t)).float(), weights[:, h : h + 1]
+            )
+        expected *= k_scale.reshape(1, num_kv).float()
+        positions = torch.arange(num_kv, device=self.device).unsqueeze(0)
+        expected.masked_fill_(
+            ~((positions >= ks.unsqueeze(1)) & (positions < ke.unsqueeze(1))), 0.0
+        )
+
+        torch.testing.assert_close(actual, expected, rtol=1e-3, atol=1e-3)
+
+        # topk_v2 needs a row stride that is a multiple of 4.
+        self.assertEqual(actual.stride(1), 1)
+        self.assertEqual(actual.stride(0) % 4, 0)
+
+    def test_fp8_paged_mqa_logits_torch_matches_reference(self):
+        """Test paged pure-torch MQA logits fallback against a direct reference."""
+        if not self.supports_fp8:
+            self.skipTest("FP8 requires Hopper GPU or newer")
+
+        batch_size, num_heads, head_dim = 3, 2, 128
+        block_size, num_blocks, max_pages = 64, 5, 3
+        max_seq_len = 160
+        q_fp8 = torch.randn(
+            batch_size,
+            1,
+            num_heads,
+            head_dim,
+            dtype=torch.bfloat16,
+            device=self.device,
+        ).to(torch.float8_e4m3fn)
+        kv_values_fp8 = torch.randn(
+            num_blocks, block_size, head_dim, dtype=torch.bfloat16, device=self.device
+        ).to(torch.float8_e4m3fn)
+        kv_scales = (
+            torch.rand(num_blocks, block_size, dtype=torch.float32, device=self.device)
+            + 0.5
+        )
+        # Page-blocked layout (as written by SetKAndS and read by DeepGEMM): each
+        # page holds all block_size * head_dim value bytes, then all block_size * 4
+        # scale bytes -- not per-token [value, scale] pairs.
+        kv_pages = torch.zeros(
+            num_blocks,
+            block_size * (head_dim + 4),
+            dtype=torch.uint8,
+            device=self.device,
+        )
+        kv_pages[:, : block_size * head_dim] = kv_values_fp8.view(torch.uint8).reshape(
+            num_blocks, block_size * head_dim
+        )
+        kv_pages[:, block_size * head_dim :] = (
+            kv_scales.contiguous().view(torch.uint8).reshape(num_blocks, block_size * 4)
+        )
+        kv_cache_fp8 = kv_pages.view(num_blocks, block_size, 1, head_dim + 4)
+
+        weights = torch.rand(
+            batch_size, num_heads, dtype=torch.float32, device=self.device
+        )
+        context_lens = torch.tensor(
+            [70, 129, 150], dtype=torch.int32, device=self.device
+        )
+        block_table = torch.tensor(
+            [[0, 1, 2], [2, 3, 4], [4, 1, 0]], dtype=torch.int32, device=self.device
+        )
+
+        actual = _fp8_paged_mqa_logits_torch(
+            q_fp8,
+            kv_cache_fp8,
+            weights,
+            context_lens,
+            block_table,
+            None,
+            max_seq_len,
+            clean_logits=False,
+        )
+
+        q = q_fp8[:, 0].to(torch.bfloat16)
+        expected = torch.zeros(
+            batch_size, max_seq_len, dtype=torch.float32, device=self.device
+        )
+        kv_values = kv_values_fp8.to(torch.bfloat16)
+        for b in range(batch_size):
+            pages = block_table[b]
+            k = kv_values[pages].reshape(max_pages * block_size, head_dim)
+            scale = kv_scales[pages].reshape(max_pages * block_size)
+            scores = torch.zeros(
+                max_pages * block_size, dtype=torch.float32, device=self.device
+            )
+            for h in range(num_heads):
+                scores += torch.relu(torch.mv(k, q[b, h])).float() * weights[b, h]
+            scores *= scale
+            scores[int(context_lens[b].item()) :] = 0.0
+            expected[b, :max_seq_len] = scores[:max_seq_len]
+
+        torch.testing.assert_close(actual, expected, rtol=1e-3, atol=1e-3)
 
     def test_rotate_activation(self):
         """Test the Hadamard transform (rotate_activation) function."""
@@ -1289,20 +1445,20 @@ class TestDSAIndexer(CustomTestCase):
     #             indexer = self._create_indexer(index_topk=topk)
     #             self.assertEqual(indexer.index_topk, topk)
 
-    @patch("sglang.srt.layers.attention.dsa.dsa_indexer.deep_gemm")
-    def test_indexer_with_fused_wk(self, mock_deep_gemm):
+    @patch("sglang.srt.layers.attention.dsa.dsa_indexer.resolve_num_sms")
+    def test_indexer_with_fused_wk(self, mock_resolve_num_sms):
         """Test indexer creation with fused wk and weights projection."""
-        mock_deep_gemm.get_num_sms.return_value = 132
+        mock_resolve_num_sms.return_value = 132
 
         # Note: fuse_wk_and_weights_proj feature is not currently implemented
         # This test verifies basic indexer creation still works
         indexer = self._create_indexer()
         self.assertIsNotNone(indexer)
 
-    @patch("sglang.srt.layers.attention.dsa.dsa_indexer.deep_gemm")
-    def test_indexer_with_alt_stream(self, mock_deep_gemm):
+    @patch("sglang.srt.layers.attention.dsa.dsa_indexer.resolve_num_sms")
+    def test_indexer_with_alt_stream(self, mock_resolve_num_sms):
         """Test indexer creation with alternative CUDA stream."""
-        mock_deep_gemm.get_num_sms.return_value = 132
+        mock_resolve_num_sms.return_value = 132
 
         alt_stream = torch.cuda.Stream()
         indexer = self._create_indexer(alt_stream=alt_stream)
