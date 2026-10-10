@@ -78,7 +78,41 @@ Other deployment flags:
 For native LTX-2.3 two-stage serving without a user LoRA, `resident` is the fastest high-VRAM path. LTX-2 still applies the distilled LoRA during the stage switch, so `--ltx2-two-stage-device-mode` is mainly an LTX-2.3 optimization. When you pass `--lora-path`, SGLang still applies the user LoRA during the two-stage switch, so use `resident` on H200-class GPUs for enough VRAM, but do not expect the same premerged-stage2 benefit as the no-user-LoRA path.
 </Note>
 
-### 3.3 Fast multi-GPU presets
+### 3.3 Breakable CUDA graphs
+
+At CI-sized requests (for example 768x512, 25 frames) LTX is host-bound: each
+denoising step issues tens of thousands of PyTorch ops and the GPU waits on the
+CPU. `--enable-breakable-cuda-graph` replays each step's DiT forward as captured
+graph segments, cutting host ops per step by about 10x with bit-identical output.
+On H100 with LTX-2 two-stage at 768x512 / 25 frames, a step drops from 128-137 ms
+to 45 ms.
+
+Graphs replay only the exact signatures captured at warmup, so declare the
+served workload:
+
+```bash
+sglang serve \
+  --model-path Lightricks/LTX-2.3 \
+  --pipeline-class-name LTX2TwoStagePipeline \
+  --num-gpus 2 \
+  --enable-cfg-parallel \
+  --enable-breakable-cuda-graph \
+  --warmup-resolutions 768x512 \
+  --warmup-num-frames 25
+```
+
+- `--warmup-resolutions` and `--warmup-num-frames` must match the requests;
+  other shapes run eager.
+- For image-conditioned requests, name a warmup image with
+  `--warmup-sampling-params '{"image_path": "..."}'`; without it warmup captures
+  only text-to-video signatures.
+- Requests at a non-default `quality` need the same level in
+  `--warmup-sampling-params`, since graphs are captured per quality level.
+- Keep the DiT resident: graphs hold its weight addresses, so DiT
+  component/snapshot offload is not compatible.
+- Graph memory adds a few GB of peak VRAM.
+
+### 3.4 Fast multi-GPU presets
 
 For latency-oriented LTX serving, prefer CFG parallel over sequence parallelism. CFG parallel splits guidance branches across GPUs, while SP/Ulysses is mainly a memory/long-sequence tool for LTX.
 
@@ -95,7 +129,7 @@ Use `--enable-cfg-parallel` for degree-2 CFG parallel. Use `--cfg-parallel-size`
 
 On high-VRAM GPUs, add `--text-encoder-cpu-offload false` if text encoding latency matters and you have enough memory.
 
-#### 3.3.1 Two GPUs
+#### 3.4.1 Two GPUs
 
 ```bash
 sglang serve \
@@ -106,7 +140,7 @@ sglang serve \
   --ltx2-two-stage-device-mode resident
 ```
 
-#### 3.3.2 Four GPUs
+#### 3.4.2 Four GPUs
 
 ```bash
 sglang serve \

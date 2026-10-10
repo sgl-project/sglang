@@ -31,6 +31,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.longlive2 import (
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2_5 import LTX25PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.sana_wm import SanaWMPipelineConfig
 from sglang.multimodal_gen.configs.sample.longlive2 import LongLive2SamplingParams
+from sglang.multimodal_gen.configs.sample.ltx_2 import LTX23SamplingParams
 from sglang.multimodal_gen.configs.sample.ltx_2_5 import LTX25SamplingParams
 from sglang.multimodal_gen.configs.sample.minimax_h3 import MiniMaxH3SamplingParams
 from sglang.multimodal_gen.configs.sample.sampling_params import (
@@ -941,6 +942,15 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
                 request_based_expected[task_type],
                 task_type.name,
             )
+
+    def test_ltx23_warmup_carries_stage1_guider_params(self):
+        req = Req(prompt="prompt", sampling_params=LTX23SamplingParams())
+        req.sampling_params.prepare_synthetic_warmup_request_for_queue(
+            req, server_args=None
+        )
+        self.assertEqual(
+            req.extra["ltx2_stage1_guider_params"]["video_stg_blocks"], [28]
+        )
 
     def test_action_pipeline_skips_synthetic_warmup_before_sampling_defaults(self):
         server_args = MagicMock()

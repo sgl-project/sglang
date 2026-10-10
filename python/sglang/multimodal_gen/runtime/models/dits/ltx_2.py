@@ -302,9 +302,12 @@ def _ltx2_build_batched_perturbation_states(
             cache_key = tuple(keep_values)
             mask = mask_cache.get(cache_key)
             if mask is None:
-                mask = torch.tensor(
-                    keep_values, device=values.device, dtype=values.dtype
-                ).view(len(keep_values), *([1] * (values.ndim - 1)))
+                # Fill on device: a host->device copy is illegal inside a
+                # breakable CUDA graph capture.
+                mask = values.new_ones((len(keep_values), *([1] * (values.ndim - 1))))
+                for item_idx, keep in enumerate(keep_values):
+                    if not keep:
+                        mask[item_idx] = 0
                 mask_cache[cache_key] = mask
             states[block_idx] = (mask, False)
     return states
