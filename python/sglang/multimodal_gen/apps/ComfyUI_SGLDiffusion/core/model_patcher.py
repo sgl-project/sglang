@@ -62,11 +62,18 @@ class SGLDModelPatcher(ModelPatcher):
         return n
 
     def model_size(self):
-        """Get the model size in bytes."""
-        if self.model_type in self.model_size_dict:
-            return self.model_size_dict[self.model_type]
-        else:
-            return 0
+        """Get the model size in bytes.
+
+        `self.size` is the real byte count the loader computed from the
+        checkpoint header for whichever architecture was loaded. Only fall
+        back to the hardcoded table when a caller built this patcher without
+        that (e.g. ``clone()``, which does pass `self.size` through, or old
+        callers), so every model type gets consistent VRAM accounting
+        instead of just the two that happened to have a table entry.
+        """
+        if self.size:
+            return self.size
+        return self.model_size_dict.get(self.model_type, 0)
 
     def load(
         self,

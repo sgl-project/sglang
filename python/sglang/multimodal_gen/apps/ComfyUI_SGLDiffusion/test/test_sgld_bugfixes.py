@@ -360,3 +360,85 @@ def test_get_comfyui_model_raises_clear_error_instead_of_returning_none():
             gen.get_comfyui_model("/tmp/model.safetensors")
 
 
+# --- Bug 12: VRAM accounting was 0 for qwen_image/minimax_h3, hardcoded for others
+
+
+def test_model_size_uses_real_computed_size_for_every_model_type():
+    patcher_h3 = SGLDModelPatcher(
+        model=object(),
+        load_device="cpu",
+        offload_device="cpu",
+        size=13_000_000_000,
+        model_type="minimax_h3",
+    )
+    assert patcher_h3.model_size() == 13_000_000_000
+
+    patcher_qwen = SGLDModelPatcher(
+        model=object(),
+        load_device="cpu",
+        offload_device="cpu",
+        size=20_000_000_000,
+        model_type="qwen_image",
+    )
+    assert patcher_qwen.model_size() == 20_000_000_000
+
+
+def test_gguf_model_size_comes_from_the_gguf_file_not_the_bf16_companion():
+    """Regression for a bug introduced while fixing #12: load_model used to
+    size a GGUF load from the BF16 companion's header (needed only for
+    ComfyUI's architecture detect), wildly overstating VRAM use for the one
+    case GGUF quantization exists to reduce.
+    """
+    gen = GENERATOR.SGLDiffusionGenerator()
+    gen.pipeline_class_dict = {"flux": "FluxPipeline"}
+    gen.executor_class_dict = {"flux": mock.MagicMock()}
+
+    with tempfile.TemporaryDirectory() as tmp:
+        companion = os.path.join(tmp, "flux1-dev.safetensors")
+        with open(companion, "wb") as fh:
+            fh.write(b"\x00" * 10_000_000)  # stand-in for a ~27GB real file
+        gguf_path = os.path.join(tmp, "flux1-schnell-Q4.gguf")
+        with open(gguf_path, "wb") as fh:
+            fh.write(b"\x00" * 4_000_000)  # much smaller, as real GGUF quant is
+
+        fake_config = mock.MagicMock()
+        model_management = sys.modules["comfy.model_management"]
+        model_management.get_torch_device = lambda: "cpu"
+        model_management.unet_offload_device = lambda: "cpu"
+        fake_patcher_module = sys.modules[f"{PKG}.core.model_patcher"]
+        with (
+            mock.patch.object(
+                gen,
+                "get_comfyui_model",
+                return_value=(
+                    mock.MagicMock(),
+                    fake_config,
+                    "flux",
+                    999_999_999_999,  # size computed from the (large) companion
+                ),
+            ),
+            mock.patch.object(gen, "init_generator", return_value=mock.MagicMock()),
+            mock.patch.object(
+                fake_patcher_module,
+                "SGLDModelPatcher",
+                side_effect=lambda model, *a, **k: mock.MagicMock(size=k.get("size")),
+            ),
+        ):
+            patcher = gen.load_model(gguf_path)
+        gguf_size = os.path.getsize(gguf_path)
+
+    assert patcher.size == gguf_size
+    assert patcher.size != 999_999_999_999
+
+
+def test_model_size_falls_back_to_table_only_when_size_unknown():
+    patcher = SGLDModelPatcher(
+        model=object(),
+        load_device="cpu",
+        offload_device="cpu",
+        size=0,
+        model_type="flux",
+    )
+    assert patcher.model_size() == 27 * 1024 * 1024 * 1024
+
+
