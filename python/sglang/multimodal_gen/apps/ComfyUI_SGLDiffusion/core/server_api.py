@@ -13,14 +13,24 @@ import requests
 class SGLDiffusionServerAPI:
     """Client for SGLang Diffusion HTTP server API."""
 
-    def __init__(self, base_url: str, api_key: str = "sk-proj-1234567890"):
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str = "sk-proj-1234567890",
+        image_timeout: int = 300,
+    ):
         """
         Initialize the API client.
 
         Args:
             base_url: Base URL of the SGLang Diffusion server (e.g., "http://localhost:30010/v1")
             api_key: API key for authentication (default: "sk-proj-1234567890")
+            image_timeout: Seconds to wait for an image generate/edit request
+                before timing out. A large job (big size, or a first request
+                that triggers torch.compile/warmup) can need more than the
+                previous hardcoded 300s.
         """
+        self.image_timeout = image_timeout
         # Ensure base_url doesn't end with /v1 if it's already there
         if base_url.endswith("/v1"):
             self.base_url = base_url
@@ -169,7 +179,7 @@ class SGLDiffusionServerAPI:
                     files=files,
                     data=data,
                     headers=headers,
-                    timeout=300,  # 5 minutes timeout for generation
+                    timeout=self.image_timeout,
                 )
                 response.raise_for_status()
                 return response.json()
@@ -193,7 +203,7 @@ class SGLDiffusionServerAPI:
                     f"{self.base_url}/images/generations",
                     json=payload,
                     headers=self.headers,
-                    timeout=300,  # 5 minutes timeout for generation
+                    timeout=self.image_timeout,
                 )
                 response.raise_for_status()
                 return response.json()

@@ -285,7 +285,21 @@ class SGLDiffusionServerModel:
                         "multiline": False,
                     },
                 ),
-            }
+            },
+            "optional": {
+                "image_timeout": (
+                    "INT",
+                    {
+                        "default": 300,
+                        "min": 1,
+                        "max": 3600,
+                        "tooltip": "Seconds to wait for an image "
+                        "generate/edit request (e.g. a large job, or "
+                        "torch.compile warmup on the first request, can "
+                        "need more than 300s)",
+                    },
+                ),
+            },
         }
 
     RETURN_TYPES = ("SGLD_CLIENT", "STRING")
@@ -293,9 +307,13 @@ class SGLDiffusionServerModel:
     FUNCTION = "load_server"
     CATEGORY = "SGLDiffusion"
 
-    def load_server(self, base_url: str, api_key: str):
+    def load_server(
+        self, base_url: str, api_key: str, image_timeout: int = 300
+    ):
         """Initialize OpenAI client for SGLang Diffusion server."""
-        client = SGLDiffusionServerAPI(base_url=base_url, api_key=api_key)
+        client = SGLDiffusionServerAPI(
+            base_url=base_url, api_key=api_key, image_timeout=image_timeout
+        )
         try:
             model_info = client.get_model_info()
             # Format model_info as a readable string

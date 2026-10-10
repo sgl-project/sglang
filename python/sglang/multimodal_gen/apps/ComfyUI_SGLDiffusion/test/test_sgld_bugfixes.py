@@ -442,3 +442,20 @@ def test_model_size_falls_back_to_table_only_when_size_unknown():
     assert patcher.model_size() == 27 * 1024 * 1024 * 1024
 
 
+# --- Bug 9: hardcoded 300s timeout on image requests -----------------------
+
+
+def test_image_timeout_is_configurable():
+    client = SGLDiffusionServerAPI(base_url="http://127.0.0.1:1234", image_timeout=900)
+    captured = {}
+
+    def fake_post(url, json=None, headers=None, timeout=None, **kwargs):
+        captured["timeout"] = timeout
+        return _Response({"data": [{"b64_json": "x"}]})
+
+    with mock.patch(f"{PKG}.core.server_api.requests.post", side_effect=fake_post):
+        client.generate_image(prompt="a cat")
+
+    assert captured["timeout"] == 900
+
+
