@@ -97,6 +97,7 @@ from sglang.multimodal_gen.runtime.server_args import (
     MAX_SCHEDULER_RPC_TIMEOUT_S,
     ServerArgs,
 )
+from sglang.multimodal_gen.runtime.server_args import server_args as server_args_module
 from sglang.multimodal_gen.runtime.utils.argparse import FlexibleArgumentParser
 
 
@@ -1112,7 +1113,7 @@ class TestWarmupModeNormalization(unittest.TestCase):
                 self.assertEqual(sa.warmup_resolutions, ["1024x1024"])
                 self.assertEqual(sa.warmup_mode, "server")
 
-    def test_flux_bcg_requires_both_supported_checkpoint_and_pipeline(self):
+    def test_bcg_warns_but_stays_enabled_off_the_validated_lists(self):
         for model_path, config in (
             ("black-forest-labs/FLUX.2-dev", Flux2PipelineConfig()),
             ("black-forest-labs/FLUX.1-schnell", FluxPipelineConfig()),
@@ -1121,10 +1122,26 @@ class TestWarmupModeNormalization(unittest.TestCase):
             with self.subTest(model_path=model_path, config=type(config).__name__):
                 sa = ServerArgs.__new__(ServerArgs)
                 sa.model_path = model_path
+                sa.model_id = None
                 sa.pipeline_config = config
                 sa.enable_breakable_cuda_graph = True
-                sa._adjust_breakable_cuda_graph_support()
-                self.assertFalse(sa.enable_breakable_cuda_graph)
+                sa.warmup_resolutions = ["1024x1024"]
+                with patch.object(server_args_module.logger, "warning") as warning:
+                    sa._adjust_breakable_cuda_graph_support()
+                self.assertTrue(sa.enable_breakable_cuda_graph)
+                self.assertIn("not validated", warning.call_args[0][0])
+
+    def test_bcg_does_not_warn_for_a_validated_model(self):
+        sa = ServerArgs.__new__(ServerArgs)
+        sa.model_path = "black-forest-labs/FLUX.1-dev"
+        sa.model_id = None
+        sa.pipeline_config = FluxPipelineConfig()
+        sa.enable_breakable_cuda_graph = True
+        sa.warmup_resolutions = ["1024x1024"]
+        with patch.object(server_args_module.logger, "warning") as warning:
+            sa._adjust_breakable_cuda_graph_support()
+        self.assertTrue(sa.enable_breakable_cuda_graph)
+        warning.assert_not_called()
 
     def test_disagg_role_disables_server_warmup(self):
         from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
