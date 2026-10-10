@@ -5,7 +5,6 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.environ import DsparkFoldedSampling, envs
 from sglang.srt.speculative.dspark_components.dspark_draft import (
     DraftNoise,
     draft_markov_block,
@@ -15,15 +14,10 @@ from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 
 logger = logging.getLogger(__name__)
 
-# Free GPU memory the draft graph capture needs left over, in GB.
-DRAFT_CAPTURE_MIN_FREE_GB = 1.0
-
 
 class DsparkDraftSampler:
     """The draft proposal folded into the draft cuda graph as its tail: the
-    eager path's markov block, run over the graph's hidden states. Without
-    folded sampling every row takes the argmax, so the tail drafts
-    greedily and keeps no step logits."""
+    eager path's markov block, run over the graph's hidden states."""
 
     def __init__(
         self,
@@ -36,7 +30,6 @@ class DsparkDraftSampler:
         tp_sync: SpecTpSync,
         confidence_fn=None,
         out=None,
-        folded_sampling: bool = True,
     ):
         self.model = model
         self.markov_head = model.markov_head
@@ -58,14 +51,8 @@ class DsparkDraftSampler:
             if confidence_fn is not None
             else None
         )
-        self.folded_sampling = folded_sampling
         self._noise = noise
         self._tp_sync = tp_sync
-        self._site = (
-            SpecTpSyncSite.DSPARK_GRAPH_SAMPLE
-            if folded_sampling
-            else SpecTpSyncSite.DSPARK_GRAPH_GREEDY
-        )
         # Staged before each replay: the requests' temperatures and greedy
         # rows, and the draft temperature the tail reads, 0 for argmax rows.
         self.temperatures = torch.ones(
@@ -77,21 +64,15 @@ class DsparkDraftSampler:
         )
         self._zero = torch.zeros((), dtype=torch.float32, device=device)
         # [max_bs, gamma, vocab] step logits the sampling accept reads.
-        self.step_logits = (
-            torch.empty(
-                (self.max_bs, self.gamma, _step_logits_width(model)),
-                dtype=_step_logits_dtype(model),
-                device=device,
-            )
-            if folded_sampling
-            else None
+        self.step_logits = torch.empty(
+            (self.max_bs, self.gamma, _step_logits_width(model)),
+            dtype=_step_logits_dtype(model),
+            device=device,
         )
 
     def stage_sampling_params(self, *, bs: int, sampling_info) -> None:
         """Host-side refresh of the static sampling params; must run before the
         draft graph replay that consumes them."""
-        if not self.folded_sampling:
-            return
         if sampling_info is None:
             self.temperatures[:bs].fill_(1.0)
             self.greedy_mask[:bs].fill_(True)
@@ -125,7 +106,6 @@ class DsparkDraftSampler:
         base_logits = base_logits.view(bs, self.gamma, -1)
         anchor = input_ids.view(bs, self.query_token_num)[:, 0]
 
-        logits_out = None if self.step_logits is None else self.step_logits[:bs]
         draft_tokens, _ = draft_markov_block(
             markov_head=self.markov_head,
             base_logits=base_logits,
@@ -134,10 +114,8 @@ class DsparkDraftSampler:
             step_temperatures=self.step_temperatures[:bs],
             noise=self._noise,
             tp_sync=self._tp_sync,
-            site=self._site,
-            logits_out=logits_out,
-            # Without folded sampling every row takes the argmax.
-            keep_logits=self.folded_sampling,
+            site=SpecTpSyncSite.DSPARK_GRAPH_SAMPLE,
+            logits_out=self.step_logits[:bs],
         )
         self.out[: draft_tokens.numel()].copy_(draft_tokens.reshape(-1))
         if self.confidence_out is not None:
@@ -166,34 +144,6 @@ def _step_logits_dtype(model) -> torch.dtype:
     return model.markov_head.step_logits_dtype(base_dtype)
 
 
-def _resolve_folded_sampling(
-    *, model, gamma, max_bs, device, tp_rank, available_memory_gb: float
-) -> bool:
-    """The step-logits buffer is baked into the captured draft graph, so AUTO
-    must decide before capture from a free-memory probe. ``available_memory_gb``
-    is the group minimum, so every rank folds identically."""
-    mode = envs.SGLANG_DSPARK_FOLDED_SAMPLING.get()
-    if mode == DsparkFoldedSampling.OFF:
-        return False
-    if mode == DsparkFoldedSampling.FORCE:
-        return True
-    itemsize = _step_logits_dtype(model).itemsize
-    need_gb = max_bs * gamma * _step_logits_width(model) * itemsize / (1 << 30)
-    if available_memory_gb - need_gb >= DRAFT_CAPTURE_MIN_FREE_GB:
-        return True
-    if tp_rank == 0:
-        logger.warning(
-            "DSpark folded sampling disabled: its step-logits buffer needs %.2f GB "
-            "but only %.2f GB GPU memory is free; sampling batches will take "
-            "the eager proposal path. Set SGLANG_DSPARK_FOLDED_SAMPLING=%d "
-            "to force.",
-            need_gb,
-            available_memory_gb,
-            int(DsparkFoldedSampling.FORCE),
-        )
-    return False
-
-
 def maybe_build_draft_sampler(
     *,
     draft_model,
@@ -203,7 +153,6 @@ def maybe_build_draft_sampler(
     tp_rank: int,
     noise: DraftNoise,
     tp_sync: SpecTpSync,
-    available_memory_gb: float,
     confidence_fn=None,
     out=None,
 ) -> Optional[DsparkDraftSampler]:
@@ -219,19 +168,8 @@ def maybe_build_draft_sampler(
         return _eager("gamma<=0")
     if draft_model.markov_head is None:
         return _eager("no markov head")
-    folded_sampling = _resolve_folded_sampling(
-        model=draft_model,
-        gamma=gamma,
-        max_bs=max_bs,
-        device=device,
-        tp_rank=tp_rank,
-        available_memory_gb=available_memory_gb,
-    )
     if tp_rank == 0:
-        logger.info(
-            "DSpark draft proposal (%s) folded into the draft cuda graph.",
-            "greedy + sampling" if folded_sampling else "greedy only",
-        )
+        logger.info("DSpark draft proposal folded into the draft cuda graph.")
     return DsparkDraftSampler(
         model=draft_model,
         gamma=gamma,
@@ -241,5 +179,4 @@ def maybe_build_draft_sampler(
         tp_sync=tp_sync,
         confidence_fn=confidence_fn,
         out=out,
-        folded_sampling=folded_sampling,
     )
