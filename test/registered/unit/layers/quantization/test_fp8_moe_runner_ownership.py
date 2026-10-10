@@ -161,6 +161,44 @@ class TestFp8MoEAiterQuantInfo(CustomTestCase):
         self.assertEqual(quant_info.fused_moe_kwargs, {"gate_mode": "separated"})
         self.assertIs(quant_info.expert_mask, layer.dispatcher.expert_mask_gpu)
 
+    def test_native_fp4_forwards_interleaved_layout_without_clamp(self):
+        method = Fp8MoEMethod(
+            Fp8Config(
+                is_checkpoint_fp8_serialized=True,
+                weight_block_size=[128, 128],
+                is_fp4_experts=True,
+            )
+        )
+        method.moe_runner_config = MoeRunnerConfig(swiglu_limit=0.0)
+        layer = SimpleNamespace(
+            w13_weight=torch.zeros((1, 4, 4), dtype=torch.uint8),
+            w2_weight=torch.zeros((1, 4, 2), dtype=torch.uint8),
+            w13_weight_scale_inv=torch.ones((1, 4, 1), dtype=torch.float32),
+            w2_weight_scale_inv=torch.ones((1, 4, 1), dtype=torch.float32),
+            hidden_pad=0,
+            intermediate_pad=0,
+            _aiter_gate_up_interleaved=True,
+            dispatcher=SimpleNamespace(expert_mask_gpu=torch.tensor([True, False])),
+        )
+        fake_moe_common = types.ModuleType("aiter.ops.flydsl.moe_common")
+        fake_moe_common.GateMode = SimpleNamespace(
+            SEPARATED=SimpleNamespace(value="separated"),
+            INTERLEAVE=SimpleNamespace(value="interleave"),
+        )
+
+        with (
+            patch.dict(sys.modules, {"aiter.ops.flydsl.moe_common": fake_moe_common}),
+            patch.object(fp8_module, "_use_aiter", True),
+            patch.object(fp8_module, "_require_fp4_dtype", return_value=torch.uint8),
+        ):
+            quant_info = method.maybe_get_hip_aiter_quant_info(layer)
+
+        self.assertIsNotNone(quant_info)
+        self.assertEqual(quant_info.quant_type, AiterQuantType.PER_1X32)
+        self.assertEqual(quant_info.swiglu_limit, 0.0)
+        self.assertEqual(quant_info.fused_moe_kwargs, {"gate_mode": "interleave"})
+        self.assertIs(quant_info.expert_mask, layer.dispatcher.expert_mask_gpu)
+
 
 if __name__ == "__main__":
     unittest.main()
