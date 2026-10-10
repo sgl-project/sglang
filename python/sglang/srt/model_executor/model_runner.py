@@ -1157,6 +1157,7 @@ class ModelRunner:
         self.decode_cuda_graph_runner = capture.decode.runner
         self.graph_memory_usage = capture.memory_usage
         self.graph_time_usage = capture.time_usage
+        self._update_decode_cuda_graph_state()
 
         if is_scale_joiner:
             if self._elastic_cuda_graph_enabled():
@@ -1561,12 +1562,19 @@ class ModelRunner:
             capture.time_usage,
             phases=("decode", "target_verify", "draft_decode"),
         )
-        # Bookkeeping for the PD role switch: mark the graphs as captured (makes
-        # the on-flip capture idempotent) and record the captured bs so it can be
-        # queried via /get_server_info.
-        self.decode_cuda_graph_captured = self.decode_cuda_graph_runner is not None
-        self.decode_cuda_graph_capture_bs = list(
-            getattr(self.decode_cuda_graph_runner, "capture_bs", []) or []
+        self._update_decode_cuda_graph_state()
+
+    def _update_decode_cuda_graph_state(self):
+        # Startup and on-switch capture must publish the same state. An eager
+        # runner returned by deferred capture does not own a decode graph.
+        runner = self.decode_cuda_graph_runner
+        self.decode_cuda_graph_captured = (
+            runner is not None and runner is not self.eager_runner
+        )
+        self.decode_cuda_graph_capture_bs = (
+            list(getattr(runner, "capture_bs", []) or [])
+            if self.decode_cuda_graph_captured
+            else []
         )
 
     def recapture_decode_cuda_graph(self):
