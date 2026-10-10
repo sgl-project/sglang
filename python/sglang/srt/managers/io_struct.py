@@ -1234,6 +1234,9 @@ class EmbeddingReqInput:
 
     # The number of dimensions the resulting output embeddings should have. It is applicable for Matryoshka Embeddings.
     dimensions: Optional[int] = None
+    # "float" (default / None) returns list[float]; "tensor" returns the raw
+    # torch.Tensor at the engine's native compute dtype.
+    encoding_format: Optional[str] = None
     # Whether to return pooled hidden states (pre-head transformer output)
     return_pooled_hidden_states: bool = False
     # Whether to return prompt token IDs without computing logprobs
@@ -1428,6 +1431,7 @@ class EmbeddingReqInput:
                 priority=self.priority,
                 return_pooled_hidden_states=self.return_pooled_hidden_states,
                 return_prompt_token_ids=self.return_prompt_token_ids,
+                encoding_format=self.encoding_format,
                 multi_item_delimiter_indices=(
                     self.multi_item_delimiter_indices[i]
                     if self.multi_item_delimiter_indices is not None
@@ -1460,6 +1464,7 @@ class EmbeddingReqInput:
                 http_worker_ipc=self.http_worker_ipc,
                 priority=self.priority,
                 dimensions=self.dimensions,
+                encoding_format=self.encoding_format,
                 return_pooled_hidden_states=self.return_pooled_hidden_states,
                 return_prompt_token_ids=self.return_prompt_token_ids,
                 external_trace_header=self.external_trace_header,
@@ -1504,6 +1509,8 @@ class TokenizedEmbeddingReqInput(BaseReq, kw_only=True):
     priority: Optional[int] = None
     # The number of dimensions the resulting output embeddings should have. It is applicable for Matryoshka Embeddings.
     dimensions: Optional[int] = None
+    # Encoding format for the returned embedding. See EmbeddingReqInput.
+    encoding_format: Optional[str] = None
     # Whether to return pooled hidden states (pre-head transformer output)
     return_pooled_hidden_states: bool = False
     # Pre-computed delimiter indices for multi-item scoring
@@ -1781,6 +1788,9 @@ class BatchEmbeddingOutput(BaseBatchReq, kw_only=True):
     finished_reasons: List[Optional[FinishReasonDict]]
     # The output embedding
     embeddings: List[Union[List[Union[float, List[float]]], Dict[int, float], float]]
+    # Tensor-format embeddings use a separate typed field because msgspec does not
+    # allow a custom type such as torch.Tensor in a union with other value types.
+    tensor_embeddings: Optional[List[Optional[torch.Tensor]]] = None
     # Token counts
     prompt_tokens: List[int]
     cached_tokens: List[int]

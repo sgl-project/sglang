@@ -3483,6 +3483,7 @@ class Scheduler(
             routed_dp_rank=recv_req.routed_dp_rank,
             priority=recv_req.priority,
             dimensions=recv_req.dimensions,
+            encoding_format=recv_req.encoding_format,
             lora_id=recv_req.lora_id,
             http_worker_ipc=recv_req.http_worker_ipc,
             time_stats=recv_req.time_stats,

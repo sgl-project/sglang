@@ -277,6 +277,10 @@ def _handle_output_by_index(output, i):
             rids=[output.rids[i]],
             finished_reasons=_extract_field_by_index(output, "finished_reasons", i),
             embeddings=_extract_field_by_index(output, "embeddings", i),
+            tensor_embeddings=_extract_field_by_index(
+                output, "tensor_embeddings", i, check_length=False
+            ),
+            retraction_counts=_extract_field_by_index(output, "retraction_counts", i),
             prompt_tokens=_extract_field_by_index(output, "prompt_tokens", i),
             cached_tokens=_extract_field_by_index(output, "cached_tokens", i),
             placeholder_tokens_idx=None,

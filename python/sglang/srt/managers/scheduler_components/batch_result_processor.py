@@ -447,7 +447,7 @@ class SchedulerBatchResultProcessor:
             if result.copy_done is not None:
                 result.copy_done.synchronize()
 
-            embeddings = self._convert_embeddings(result=result)
+            embeddings = self._convert_embeddings(result=result, batch=batch)
             phs = result.pooled_hidden_states
 
             if phs is not None:
@@ -461,7 +461,9 @@ class SchedulerBatchResultProcessor:
                 if req.is_retracted:
                     continue
 
-                req.embedding = embeddings[i]
+                req.embedding = self._convert_embedding_for_response(
+                    embeddings[i], req.encoding_format
+                )
                 if req.return_pooled_hidden_states and phs is not None:
                     req.pooled_hidden_state = phs[i]
                 if req.inflight_middle_chunks <= 0:
@@ -496,7 +498,9 @@ class SchedulerBatchResultProcessor:
                 dp_cooperation_info=batch.dp_cooperation_info,
             )
 
-    def _convert_embeddings(self, *, result: EmbeddingBatchResult) -> list:
+    def _convert_embeddings(
+        self, *, result: EmbeddingBatchResult, batch: ScheduleBatch
+    ) -> list:
         is_sparse = envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set()
 
         embeddings = result.embeddings
@@ -509,11 +513,28 @@ class SchedulerBatchResultProcessor:
             for i in range(batch_ids.shape[0]):
                 embeddings[batch_ids[i].item()][token_ids[i].item()] = values[i].item()
         else:
-            if isinstance(embeddings, torch.Tensor):
+            keep_tensors = any(
+                not req.is_retracted
+                and req.encoding_format is not None
+                and req.encoding_format.lower() != "float"
+                for req in batch.reqs
+            )
+            if keep_tensors:
+                embeddings = [tensor.detach().cpu() for tensor in embeddings]
+            elif isinstance(embeddings, torch.Tensor):
                 embeddings = embeddings.tolist()
             else:
                 embeddings = [tensor.tolist() for tensor in embeddings]
         return embeddings
+
+    @staticmethod
+    def _convert_embedding_for_response(
+        embedding: Union[torch.Tensor, List[float]],
+        encoding_format: Optional[str],
+    ) -> Union[torch.Tensor, List[float]]:
+        if encoding_format is not None and encoding_format.lower() != "float":
+            return embedding
+        return embedding.tolist() if isinstance(embedding, torch.Tensor) else embedding
 
     def move_logprobs_to_cpu(
         self,

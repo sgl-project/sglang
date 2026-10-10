@@ -85,6 +85,7 @@ class TestRadixAttentionGraphInterface(CustomTestCase):
             forward_batch=forward_batch,
             attention_layers=attention_layers,
             mha_companion_layers=mha_companion_layers,
+            moe_layers=[],
             num_tokens=None,
             raw_num_tokens=None,
         )

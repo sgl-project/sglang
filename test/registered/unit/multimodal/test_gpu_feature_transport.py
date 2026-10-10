@@ -981,6 +981,7 @@ class TestSchedulerMmTransportBoundary(CustomTestCase):
             routed_dp_rank=None,
             priority=None,
             dimensions=None,
+            encoding_format=None,
             lora_id=None,
             http_worker_ipc=None,
             time_stats=None,
