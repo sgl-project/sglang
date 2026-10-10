@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import threading
 from typing import Optional, Sequence
 
 import torch
@@ -24,11 +23,9 @@ from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
     HostKVCache,
-    sync_fixed_hicache_size,
 )
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
-    get_allocator_from_storage,
     make_kernel_ptr_table,
 )
 from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
@@ -90,35 +87,50 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         self.mtp_draft_device_pools = tuple(mtp_draft_device_pools)
         self._is_dummy = is_dummy
 
+        self.device_pool = device_pool
+        self.dtype = device_pool.store_dtype
+        self.layout = layout
+        device_capacity = getattr(device_pool, "host_capacity_tokens", None)
         if is_dummy:
-            self._init_dummy(
-                device_pool,
-                host_to_device_ratio,
-                host_size,
-                page_size,
-                layout,
-                pin_memory,
-                device,
-                allocator_type,
-                dcp_size,
-                dcp_rank,
-                pool_label,
-            )
-            return
-
+            device_capacity = device_capacity or device_pool.size
         super().__init__(
-            device_pool,
-            host_to_device_ratio,
-            host_size,
-            page_size,
-            layout,
-            pin_memory,
-            device,
-            allocator_type,
+            dtype=self.dtype,
+            device_capacity_tokens=(
+                device_pool.size if device_capacity is None else device_capacity
+            ),
+            size_per_token=self.get_size_per_token(),
+            start_layer=device_pool.start_layer,
+            end_layer=device_pool.end_layer,
+            host_to_device_ratio=host_to_device_ratio,
+            host_size=host_size,
+            page_size=page_size,
+            layout=layout,
+            pin_memory=pin_memory,
+            device=device,
+            allocator_type=allocator_type,
             dcp_size=dcp_size,
             dcp_rank=dcp_rank,
             pool_label=pool_label,
+            is_dummy=is_dummy,
         )
+        if is_dummy:
+            self.token_stride_size = self.kv_cache_dim * self.dtype.itemsize
+            self.layout_dim = self.token_stride_size * self.layer_num
+            self.can_use_jit = False
+            self.staging_page_capacity = 0
+            self.staging_token_capacity = 0
+            self.staging_buffer = None
+            self.kv_buffer = None
+            self.data_refs = None
+            self.data_ptrs = None
+            logger.info(
+                "MLATokenToKVPoolHost dummy mode: allocator-only, size=%d tokens, "
+                "saving %.2f GB host memory",
+                self.size,
+                self.size * self.size_per_token / 1e9,
+            )
+            return
+
         # The JIT HiCache kernels also build with hipcc (ROCm): the PTX-only
         # helpers in hicache.cuh are guarded by USE_ROCM and the staged
         # write-back kernel has a ROCm path, so enable them on HIP too. This
@@ -155,71 +167,6 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             for buf in getattr(pool, "kv_buffer", None) or ()
         )
         self._init_write_back_staging_buffers()
-
-    def _init_dummy(
-        self,
-        device_pool: MLATokenToKVPool,
-        host_to_device_ratio: float,
-        host_size: int,
-        page_size: int,
-        layout: str,
-        pin_memory: bool,
-        device: str,
-        allocator_type: str,
-        dcp_size: int,
-        dcp_rank: int,
-        pool_label: str,
-    ) -> None:
-        self.device_pool = device_pool
-        self.pool_label = pool_label
-        self.dcp_size = dcp_size
-        self.dcp_rank = dcp_rank
-        assert page_size % dcp_size == 0, (
-            f"HiCache host pool page_size ({page_size}) must be a multiple of "
-            f"dcp_size ({dcp_size})."
-        )
-        self.page_size = page_size // dcp_size
-        self.layout = layout
-        self.pin_memory = pin_memory
-        self.device = device
-        self.allocator = get_allocator_from_storage(allocator_type)
-
-        self.dtype = device_pool.store_dtype
-        self.size_per_token = self.get_size_per_token()
-        if host_size > 0:
-            self.size = sync_fixed_hicache_size(
-                int(host_size * 1e9 // self.size_per_token), host_size
-            )
-        else:
-            self.size = int(
-                (getattr(device_pool, "host_capacity_tokens", None) or device_pool.size)
-                * host_to_device_ratio
-            )
-        self.page_num = self.size // self.page_size + 1
-        self.size = self.page_num * self.page_size
-        self.start_layer = device_pool.start_layer
-        self.end_layer = device_pool.end_layer
-
-        self.token_stride_size = self.kv_cache_dim * self.dtype.itemsize
-        self.layout_dim = self.token_stride_size * self.layer_num
-        self.can_use_jit = False
-        self.can_use_write_back_jit = False
-        self.staging_page_capacity = 0
-        self.staging_token_capacity = 0
-        self.staging_buffer = None
-        self.kv_buffer = None
-        self.data_refs = None
-        self.data_ptrs = None
-
-        logger.info(
-            "MLATokenToKVPoolHost dummy mode: allocator-only, size=%d tokens, "
-            "saving %.2f GB host memory",
-            self.size,
-            self.size * self.size_per_token / 1e9,
-        )
-
-        self.lock = threading.RLock()
-        self.clear()
 
     def get_contiguous_buf_infos(self):
         """Return (data_ptrs, data_lens, item_lens) in the same format as device pool,
