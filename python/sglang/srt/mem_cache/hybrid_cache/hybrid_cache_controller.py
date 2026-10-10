@@ -348,6 +348,7 @@ class HybridCacheController(BaseHiCacheController):
         if not isinstance(self.mem_pool_host, HostPoolGroup):
             raise TypeError("Dynamic HiCache sidecars require HostPoolGroup.")
         self.mem_pool_host.add_entry(entry)
+        self.l2_transfer_engine.configure_batch_direct(self.mem_pool_host)
         if not entry.is_primary_index_anchor:
             self.extra_host_mem_release_queues.setdefault(entry.name, Queue())
         if self.enable_storage and self.storage_backend is not None:
@@ -851,7 +852,10 @@ class HybridCacheController(BaseHiCacheController):
                     layer_mapper=anchor.layer_mapper,
                 )
             )
-        for pool_transfer in pool_transfers or []:
+        # Sort Rust's unordered pools so cached DMA views and metadata are reusable.
+        for pool_transfer in sorted(
+            pool_transfers or [], key=lambda transfer: transfer.name
+        ):
             if (
                 pool_transfer.host_indices is None
                 or pool_transfer.device_indices is None

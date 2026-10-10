@@ -448,7 +448,7 @@ class HiCacheController:
         self.load_fence_stream: Optional[torch.cuda.Stream] = None
         self.ack_write_queue: List[HiCacheAck] = []
 
-        self.l2_transfer_engine = L2TransferEngine(io_backend)
+        self.l2_transfer_engine = L2TransferEngine(io_backend, mem_pool_host)
 
         # If a storage backend is provided at startup, treat it as an implicit attach,
         # so init/runtime share the same lifecycle semantics and code paths.
