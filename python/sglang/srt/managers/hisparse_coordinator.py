@@ -46,7 +46,11 @@ from sglang.srt.mem_cache.allocator.hisparse import (
 from sglang.srt.mem_cache.hisparse_memory_pool import (
     HiSparseDSATokenToKVPool,
 )
-from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool, ReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import (
+    HybridLinearKVPool,
+    MiniMaxSparseKVPool,
+    ReqToTokenPool,
+)
 from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
 from sglang.srt.mem_cache.pool_host.mha import HiSparseMHATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
@@ -564,6 +568,7 @@ class HiSparseCoordinator:
             )
         self.compress_ratio = self.token_to_kv_pool_allocator.compress_ratio
 
+        self.full_attention_layer_id_mapping = None
         kvcache = self.token_to_kv_pool_allocator.get_kvcache()
         self.is_dsv4_hisparse = isinstance(
             self.token_to_kv_pool_allocator, DeepSeekV4HiSparseTokenToKVPoolAllocator
@@ -614,7 +619,18 @@ class HiSparseCoordinator:
                 )
                 self.item_size_bytes = self.mem_pool_device.bytes_per_token_k
             else:
-                self.mem_pool_device: HiSparseDSATokenToKVPool = kvcache
+                self.mem_pool_device: HiSparseDSATokenToKVPool = (
+                    self.token_to_kv_pool_allocator.hisparse_kvcache
+                )
+                if isinstance(kvcache, HybridLinearKVPool):
+                    self.full_attention_layer_id_mapping = (
+                        kvcache.full_attention_layer_id_mapping
+                    )
+                    if shared_index_layers is not None:
+                        shared_index_layers = [
+                            shared_index_layers[layer_id]
+                            for layer_id in self.full_attention_layer_id_mapping
+                        ]
                 self.mem_pool_host = MLATokenToKVPoolHost(
                     buffer_info=self.mem_pool_device.get_device_pool_infos()[
                         0
@@ -1289,6 +1305,8 @@ class HiSparseCoordinator:
         assert not self.is_dsv4_hisparse, (
             "naive_load_topk is not implemented for dsv4 hisparse"
         )
+        if self.full_attention_layer_id_mapping is not None:
+            layer_id = self.full_attention_layer_id_mapping[layer_id]
         num_reqs = req_pool_indices.size(0)
         top_k_indices = torch.full(
             (num_reqs, self.top_k), -1, dtype=torch.int32, device=self.device
@@ -1589,6 +1607,8 @@ class HiSparseCoordinator:
         With prefetch enabled, anchors swap in synchronously (recording the miss
         plan) and prefetch their skip layers' copies; skip layers just wait.
         """
+        if self.full_attention_layer_id_mapping is not None:
+            layer_id = self.full_attention_layer_id_mapping[layer_id]
         if not self.enable_prefetch:
             return self._run_swap_in_kernel(
                 req_pool_indices,
