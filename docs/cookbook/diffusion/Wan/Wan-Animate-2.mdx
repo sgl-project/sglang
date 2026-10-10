@@ -159,8 +159,9 @@ implementation, not the official Diffusers implementation.
 Start with **Auto**, or choose **Memory** for more GPU headroom. Memory usage
 depends on the input video, pixel-area budget, and `clip_len`; see the
 [hardware comparison](#5-1-hardware-comparison) for measured configurations.
-On two B300 GPUs, choose **2 GPUs: CFG** and **CFG parity** for the recommended
-speed/memory balance. The RTX 4090 entry selects its single-GPU memory recipe.
+For two B300 GPUs, set **GPUs / node** to **2** and **Memory policy** to **CFG parity**;
+**Auto** CFG parallelism enables the measured two-GPU recipe. The RTX 4090 entry
+selects its single-GPU memory recipe.
 
 Routing to the native Wan-Animate-2 pipeline is automatic from the checkpoint's
 `model_index.json` (`_class_name: WanAnimate2Pipeline`); pass
