@@ -18,7 +18,7 @@ class SpecTpSyncSite(IntEnum):
     """
 
     # -- DSpark --
-    DSPARK_MEM = 1  # gates both graph capture and folded sampling
+    DSPARK_MEM = 1  # gates the draft graph capture
     DSPARK_DRAFT = 2  # each draft step's tokens, in the graph tail or eager
     DSPARK_PLAN = 7
     DSPARK_ACCEPT_GREEDY = 8
