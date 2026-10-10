@@ -276,6 +276,8 @@ class PlainAdd:
     is_plain_add = True
     applied_at_exit = False
     outlives_layer = True
+    writes_stream = False
+    quantized_sum = True
 
     def update(self, hidden_states, residual):
         hidden_states += residual
@@ -297,6 +299,8 @@ class ReplaceAtExit:
     is_plain_add = False
     applied_at_exit = True
     outlives_layer = True
+    writes_stream = True
+    quantized_sum = False
 
     def update(self, hidden_states, residual):
         return hidden_states
@@ -320,10 +324,17 @@ class NormQuantReadout:
     """The input is the residual's norm, fused with the quantization the
     consumer asks for (``quant_format``) and a post-residual addition; a plain
     add of the previous output runs in the same kernel. An empty batch skips
-    the norm."""
+    the norm.
+
+    ``post_residual_addition`` is added after a plain add and before the norm.
+    It is not applied by the aiter mxfp4 and fp8-group kernels, after an
+    update other than a plain add, or by ``read``, which has no add."""
 
     is_plain_norm = True
+    completing_fusions = ()
+    gathering_reads = ()
     reads_before_dp_gather: bool = False
+    reads_after_attn_tp_gather = False
     fp8_input: Optional[Fp8Input] = None
 
     def init_residual(self, hidden_states):
@@ -355,10 +366,15 @@ class NormQuantReadout:
 @dataclass(frozen=True)
 class NormReadout:
     """The input is the residual's norm; a plain add of the previous output
-    runs in the same kernel. An empty batch skips the norm."""
+    runs in the same kernel. An empty batch skips the norm. It rejects a
+    ``quant_format`` and a ``post_residual_addition``, except that the latter
+    is not applied after an update other than a plain add."""
 
     is_plain_norm = True
+    completing_fusions = ()
+    gathering_reads = ()
     reads_before_dp_gather: bool = False
+    reads_after_attn_tp_gather = False
 
     def init_residual(self, hidden_states):
         return hidden_states
@@ -402,6 +418,8 @@ class UnfusedNormReadout(NormReadout):
     in models that add their residual themselves. No fused kernel takes it."""
 
     is_plain_norm = False
+    completing_fusions = ()
+    gathering_reads = ()
 
     def update_and_read(
         self,

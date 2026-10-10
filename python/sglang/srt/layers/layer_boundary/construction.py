@@ -313,6 +313,14 @@ def _bind_stage(declaration, norm, incoming, outgoing, *, final_read=None, **opt
         raise ValueError("connections do not match the stage declaration")
     if incoming.entries.keys() != outgoing.exits.keys():
         raise ValueError("incoming and outgoing batch variants disagree")
+    update = declaration.update
+    if declaration.terminal and not (update.is_plain_add or update.applied_at_exit):
+        # The final read adds the last output into the residual itself, as a
+        # plain add, before its norm.
+        raise NotImplementedError(
+            f"the layer stack ends on a stage whose {type(update).__name__} "
+            "update the final read would apply as a plain add"
+        )
     variants = {}
     for variant, edge in incoming.entries.items():
         if (
@@ -321,13 +329,17 @@ def _bind_stage(declaration, norm, incoming, outgoing, *, final_read=None, **opt
             in edge.produced.layout.sharded - edge.need.layout.sharded
             and not _cp_gathers_over_attn_cp()
         ):
-            raise NotImplementedError("MHC with a gather over attention CP")
+            raise NotImplementedError(
+                "an update applied at the stage's exit with a gather over attention CP"
+            )
         attn_input_adapter = None
         if declaration.kind is StageKind.ATTENTION:
+            # On an input-scattered batch the step gathers the rows itself for
+            # an attention whose QKV hook does not gather them after the
+            # projection.
             attn_input_adapter = (
                 _attn_input_scattered
                 if variant is BatchVariant.INPUT_SCATTERED
-                and not declaration.update.is_plain_add
                 else _attn_input_default
             )
         moves = _cp_moves() if variant is BatchVariant.CONTEXT_PARALLEL else None

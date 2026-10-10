@@ -135,9 +135,8 @@ def _reduce_update_read(
         if result is not None:
             return result
     if group is SumGroup.ATTN_TP:
-        # MHC sums its streams in full precision.
         hidden_states = attn_tp_all_reduce(
-            hidden_states, forward_batch, may_quantize=update.is_plain_add
+            hidden_states, forward_batch, may_quantize=update.quantized_sum
         )
     elif group is SumGroup.TP:
         hidden_states = tensor_model_parallel_all_reduce(hidden_states)

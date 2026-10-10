@@ -45,12 +45,14 @@ from sglang.srt.layers.layer_boundary.layout import (
     token_axis_sizes,
 )
 from sglang.srt.layers.layer_boundary.output import OutputTransform
-from sglang.srt.layers.layer_boundary.residual import ResidualReadout, ResidualUpdate
+from sglang.srt.layers.layer_boundary.residual import (
+    ResidualReadout,
+    ResidualUpdate,
+)
 from sglang.srt.layers.layer_boundary.residual.add_norm import (
     NORM_QUANT_READOUT,
     NORM_READOUT,
     PLAIN_ADD,
-    REPLACE_AT_EXIT,
 )
 from sglang.srt.layers.layer_boundary.stage import StageBoundary
 from sglang.srt.layers.moe import is_moe_input_scattered_across_dp_ranks
@@ -150,6 +152,8 @@ def _resolve_ffn(
         group = SumGroup.MOE_OUTPUT
     else:
         group = SumGroup.ATTN_TP if on_attention_rows else SumGroup.TP
+    # An FFN that writes the next stream itself hands on a complete output.
+    complete = on_rank_rows or update.writes_stream or output_complete
     if variant is BatchVariant.SEQUENCE_PARALLEL:
         return (
             StageContract(
@@ -172,8 +176,9 @@ def _resolve_ffn(
                 InputContract(full, read=read),
                 OutputContract(
                     attention,
-                    group=group,
-                    may_reduce_scatter=use_reduce_scatter
+                    group=None if complete else group,
+                    may_reduce_scatter=not complete
+                    and use_reduce_scatter
                     and (scattered_residual or not terminal),
                     update=update,
                     transform=output_transform,
@@ -199,8 +204,6 @@ def _resolve_ffn(
         rows = Layout.sharded_over(
             *((TokenAxis.ATTN_CP,) if on_cp_shards else ()), axis_sizes=axes
         )
-    # An FFN that writes the next stream itself hands on a complete output.
-    complete = on_rank_rows or update is REPLACE_AT_EXIT or output_complete
     produced = (
         OutputContract(rows, update=update, transform=output_transform)
         if complete
@@ -301,6 +304,51 @@ class StageDeclaration:
         for source in (self.previous, self.prepared_from):
             if source is not None and not isinstance(source, StageDeclaration):
                 raise TypeError("stage sources must be declarations")
+        _check_update(self.update)
+        _check_read(self.read)
+
+
+# The members every ResidualUpdate and ResidualReadout must set: the binding
+# reads each of them, and none has a default that is correct for every
+# implementation.
+_UPDATE_FACTS = (
+    "is_plain_add",
+    "applied_at_exit",
+    "outlives_layer",
+    "writes_stream",
+    "quantized_sum",
+)
+_READ_FACTS = ("is_plain_norm", "reads_before_dp_gather", "reads_after_attn_tp_gather")
+# The kernels a read supplies, which the binding also reads; empty when it
+# supplies none.
+_READ_KERNELS = ("completing_fusions", "gathering_reads")
+
+
+def _require(protocol, implementation, facts):
+    missing = [name for name in facts if not hasattr(implementation, name)]
+    if missing:
+        raise TypeError(
+            f"{type(implementation).__name__} does not set {', '.join(missing)}, "
+            f"which every {protocol} must"
+        )
+
+
+def _check_update(update):
+    _require("ResidualUpdate", update, _UPDATE_FACTS)
+    name = type(update).__name__
+    if update.writes_stream and (update.is_plain_add or not update.applied_at_exit):
+        raise ValueError(
+            f"{name} writes the next stream itself, which only an update "
+            "applied at its exit and other than a plain add does"
+        )
+    if update.quantized_sum and not update.is_plain_add:
+        raise ValueError(
+            f"{name} lets its sum run quantized, which only a plain add does"
+        )
+
+
+def _check_read(read):
+    _require("ResidualReadout", read, _READ_FACTS + _READ_KERNELS)
 
 
 @dataclass(frozen=True)
@@ -420,11 +468,13 @@ def _resolve_stage(stage, variant, following=None):
     if stage.update.applied_at_exit:
         if stage.sparse and moe_gathers_over_moe_cp():
             raise NotImplementedError(
-                "MHC does not support a MoE gathered over the MoE-CP group"
+                "an update applied at the stage's exit with a MoE gathered over "
+                "the MoE-CP group"
             )
         if get_parallel().attn_cp_size > 1 and _input_scattered_possible():
             raise NotImplementedError(
-                "MHC with input-scattered attention under attention CP"
+                "an update applied at the stage's exit with input-scattered "
+                "attention under attention CP"
             )
     if stage.kind is StageKind.FFN:
         declaration, residual, returned = _resolve_ffn(
@@ -439,8 +489,7 @@ def _resolve_stage(stage, variant, following=None):
         )
         exit_rows = resolve_exit_rows(stage.exit_rows)
         if exit_rows is ExitRows.ATTENTION or (
-            following is not None
-            and getattr(following.read, "reads_after_attn_tp_gather", False)
+            following is not None and following.read.reads_after_attn_tp_gather
         ):
             returned = attention
         elif exit_rows is ExitRows.SLICE:
@@ -706,11 +755,12 @@ def layer_stack(*, previous_layers=(), next_layers=(), final_read=None):
             stack's first. What they build is discarded.
         next_layers: Likewise for the layers after this stack, whose first
             declared stage is the consumer of this stack's last.
-        final_read: The model's final read of the stack's output, when it is
-            not a plain final norm: the consumer of the last stage when no
-            later layer declares one. Its ``attn_tp_gather`` gathers the rows
-            that stage leaves on this rank's attention-TP slice, and with
-            ``reads_attn_tp_slices`` it reads that slice instead.
+        final_read: The model's final read of the stack's output (a
+            ``FinalRead``), when it is not a plain final norm: the consumer of
+            the last stage when no later layer declares one. Its
+            ``attn_tp_gather`` gathers the rows that stage leaves on this
+            rank's attention-TP slice, and with ``reads_attn_tp_slices`` it
+            reads that slice instead.
     """
     global _stack
     outer = _stack

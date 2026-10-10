@@ -195,6 +195,8 @@ class _BankReadout:
 
     is_plain_norm = False
     reads_before_dp_gather = True
+    completing_fusions = ()
+    gathering_reads = ()
 
     def __init__(self, state: AttnBankState):
         self.state = state
@@ -217,7 +219,8 @@ class _BankReadout:
 
 class _AttnReadout(_BankReadout):
     """The attention input: the bank aggregation and this layer's input norm.
-    A write layer snapshots the residual this read forms."""
+    A write layer snapshots the residual this read forms. ``read`` rejects a
+    ``post_residual_addition``; ``update_and_read`` does not apply one."""
 
     @property
     def reads_after_attn_tp_gather(self):
@@ -246,6 +249,8 @@ class _AttnReadout(_BankReadout):
 class _FfnReadout(_BankReadout):
     """The FFN input: the attention output's add folded into the bank
     aggregation, and this layer's post-attention norm."""
+
+    reads_after_attn_tp_gather = False
 
     @property
     def completing_fusions(self) -> Tuple[ReadoutFusion, ...]:

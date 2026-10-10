@@ -35,7 +35,6 @@ from sglang.srt.layers.layer_boundary.ops import sum_output
 from sglang.srt.layers.layer_boundary.residual.access import buffer, from_pp
 from sglang.srt.layers.layer_boundary.residual.add_norm import (
     PLAIN_ADD,
-    REPLACE_AT_EXIT,
 )
 from sglang.srt.layers.layer_boundary.residual.batch import stream_of
 from sglang.srt.layers.layer_boundary.residual.stream import DeclaredSum, ResidualStream
@@ -281,11 +280,11 @@ class StageBoundary:
         """Complete the sum over ``group`` that one part of this FFN's output
         owes.
 
-        For an FFN that builds the next stream itself (REPLACE_AT_EXIT) from
+        For an FFN that builds the next stream itself (``writes_stream``) from
         several complete parts, normalizing each before combining them; the
         stream it hands to its exit is then complete.
         """
-        if self.declaration.update is not REPLACE_AT_EXIT:
+        if not self.declaration.update.writes_stream:
             raise RuntimeError(
                 "only an FFN that writes the next stream itself sums its parts"
             )

@@ -114,9 +114,12 @@ class GatedResidualState:
 
 class _AttnReadout:
     """The normalized, gated mix of the streams, from streams that already hold
-    the previous layer's output: such a layer takes its input written back."""
+    the previous layer's output: such a layer takes its input written back. A
+    ``post_residual_addition`` is not applied."""
 
     is_plain_norm = False
+    completing_fusions = ()
+    gathering_reads = ()
     reads_before_dp_gather = False
 
     def __init__(self, state: GatedResidualState):
@@ -150,6 +153,8 @@ class _AttnUpdate:
     is_plain_add = False
     applied_at_exit = False
     outlives_layer = False
+    writes_stream = False
+    quantized_sum = False
 
     def __init__(self, state: GatedResidualState):
         self.state = state
@@ -168,7 +173,10 @@ class _FfnReadout:
     """The attention output's injection and the FFN input's mix."""
 
     is_plain_norm = False
+    completing_fusions = ()
+    gathering_reads = ()
     reads_before_dp_gather = False
+    reads_after_attn_tp_gather = False
 
     def __init__(self, state: GatedResidualState):
         self.state = state
@@ -198,6 +206,8 @@ class _FfnUpdate:
     is_plain_add = False
     applied_at_exit = True
     outlives_layer = False
+    writes_stream = False
+    quantized_sum = False
 
     def __init__(self, state: GatedResidualState):
         self.state = state

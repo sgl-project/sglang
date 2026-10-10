@@ -417,11 +417,14 @@ class TestPipelineResidualReception(CustomTestCase):
         from dataclasses import replace
 
         from sglang.srt.layers.layer_boundary import declare_ffn
+        from sglang.srt.layers.layer_boundary.residual.add_norm import (
+            REPLACE_AT_EXIT,
+        )
 
         stage = stub_stage(comm_instance, StageKind.ATTENTION)
         stage.declaration = replace(
             stage.declaration,
-            previous=declare_ffn(update=SimpleNamespace(applied_at_exit=True)),
+            previous=declare_ffn(update=REPLACE_AT_EXIT),
         )
         hidden = stage.from_pp(PPProxyTensors({"hidden_states": streams}), batch)
         residual = batch.residual_stream
