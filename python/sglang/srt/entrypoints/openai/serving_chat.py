@@ -123,6 +123,7 @@ from sglang.srt.parser.response_template import (
     ResponseTemplateReasoningDetector,
     ResponseTemplateToolDetector,
     configure_response_template_request,
+    grammar_holds_calls,
     tool_close_tokens,
 )
 from sglang.srt.parser.template_detection import detect_inline_system_support
@@ -2832,7 +2833,10 @@ class OpenAIServingChat(OpenAIServingBase):
                     request.tool_choice,
                     history_tool_calls_cnt,
                     request._response_parser_prefix,
-                    request._response_parser_tool_grammar,
+                    grammar_holds_calls(
+                        request._response_parser_tool_grammar,
+                        request._response_parser_grammar_start,
+                    ),
                 )
 
             # Extract prompt_token_ids if requested
@@ -3480,6 +3484,10 @@ class OpenAIServingChat(OpenAIServingBase):
             is_required = request.tool_choice == "required" or isinstance(
                 request.tool_choice, ToolChoice
             )
+            constrained = grammar_holds_calls(
+                request._response_parser_tool_grammar,
+                request._response_parser_grammar_start,
+            )
             # For required/named tool choice: use JsonArrayParser when the
             # constrained output is plain JSON (detector doesn't support
             # structural_tag or no parser configured). Use FunctionCallParser
@@ -3494,7 +3502,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         tokenizer=self.tokenizer_manager.tokenizer,
                         tool_choice=request.tool_choice,
                         prefix=request._response_parser_prefix,
-                        constrained=request._response_parser_tool_grammar,
+                        constrained=constrained,
                     )
                     use_native_parser = probe.owns_tool_format()
                 if use_native_parser:
@@ -3507,7 +3515,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     tool_call_parser=self.tool_call_parser,
                     tokenizer=self.tokenizer_manager.tokenizer,
                     prefix=request._response_parser_prefix,
-                    constrained=request._response_parser_tool_grammar,
+                    constrained=constrained,
                 )
 
         parser = parser_dict[index]

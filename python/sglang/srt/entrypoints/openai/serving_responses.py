@@ -103,7 +103,10 @@ from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.reasoning_parser import ReasoningParser
-from sglang.srt.parser.response_template import ResponseTemplateReasoningDetector
+from sglang.srt.parser.response_template import (
+    ResponseTemplateReasoningDetector,
+    grammar_holds_calls,
+)
 from sglang.srt.runtime_context import get_disagg, get_serving
 from sglang.srt.sampling.sampling_params import (
     set_request_reasoning_end_token_ids,
@@ -1200,7 +1203,10 @@ class OpenAIServingResponses(OpenAIServingChat):
                 tokenizer=self.tokenizer_manager.tokenizer,
                 tool_choice=tool_choice,
                 prefix=request._response_parser_prefix,
-                constrained=request._response_parser_tool_grammar,
+                constrained=grammar_holds_calls(
+                    request._response_parser_tool_grammar,
+                    request._response_parser_grammar_start,
+                ),
             )
             detector_owns_format = self._tool_parser_owns_format(parser)
             should_try_native = not is_required or detector_owns_format
@@ -2174,6 +2180,10 @@ class OpenAIServingResponses(OpenAIServingChat):
         tool_parser: Optional[Union[FunctionCallParser, JsonArrayParser]] = None
         if chat_tools and request.tool_choice != "none":
             detector_owns_format = False
+            constrained = grammar_holds_calls(
+                request._response_parser_tool_grammar,
+                request._response_parser_grammar_start,
+            )
             if self.tool_call_parser:
                 probe = FunctionCallParser(
                     chat_tools,
@@ -2181,7 +2191,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                     tokenizer=self.tokenizer_manager.tokenizer,
                     tool_choice=tool_choice,
                     prefix=request._response_parser_prefix,
-                    constrained=request._response_parser_tool_grammar,
+                    constrained=constrained,
                 )
                 detector_owns_format = self._tool_parser_owns_format(probe)
             if is_required and not detector_owns_format:
@@ -2193,7 +2203,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                     tokenizer=self.tokenizer_manager.tokenizer,
                     tool_choice=tool_choice,
                     prefix=request._response_parser_prefix,
-                    constrained=request._response_parser_tool_grammar,
+                    constrained=constrained,
                 )
         reasoning_parser_obj: Optional[ReasoningParser] = None
         if self.reasoning_parser:

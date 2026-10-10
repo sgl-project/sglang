@@ -905,6 +905,36 @@ def supports_tool_call_structural_tag(
     return tag is not None
 
 
+def holds_arguments(field: ResponseTemplateField, parameters: dict[str, Any]) -> bool:
+    """Whether `strict_arguments` holds `xml-inline` arguments to typed
+    `parameters`, as only that parser reads values as JSON."""
+    if field.content != "xml-inline":
+        return False
+    return _holds_xml_arguments(
+        json.dumps(field.content_args, sort_keys=True),
+        tuple(_closers(field) or ()),
+        json.dumps(parameters, sort_keys=True),
+    )
+
+
+# Every request parses the calls of its tools anew.
+@lru_cache(maxsize=512)
+def _holds_xml_arguments(
+    content_args: str, closers: tuple[str, ...], parameters: str
+) -> bool:
+    try:
+        format = _xml_arguments_format(
+            json.loads(content_args),
+            json.loads(parameters),
+            strict=True,
+            closers=list(closers),
+            sorted_arguments=False,
+        )
+    except ValueError:
+        return False
+    return format is not None
+
+
 def tool_call_structural_tag(
     field: ResponseTemplateField | None,
     tools: list[dict[str, Any]],

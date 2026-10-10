@@ -69,6 +69,8 @@ BEAM_RESPONSE_TEMPLATE: dict[str, Any] = {
 class BeamReasoningDetector(ResponseTemplateReasoningDetector):
     response_template = BEAM_RESPONSE_TEMPLATE
     reasoning_default = "always"
+    # Unheld, Beam's arguments drift from their schemas.
+    strict_arguments = True
 
     def answer_rest_structural_tag(self, prefix: str) -> dict[str, Any] | None:
         parser = ResponseParser(self.response_template, prefix=prefix)
@@ -104,6 +106,5 @@ class BeamReasoningDetector(ResponseTemplateReasoningDetector):
             undeclared_names=undeclared_names,
             # Beam also writes arguments sorted by name.
             sorted_arguments=True,
-            # Unheld, Beam's arguments drift from their schemas.
-            strict_arguments=True,
+            strict_arguments=self.strict_arguments,
         )

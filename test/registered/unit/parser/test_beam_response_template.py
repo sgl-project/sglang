@@ -417,10 +417,11 @@ class TestBeamResponseTemplate(CustomTestCase):
         )
         for tool in (note, place):
             tool.function.strict = True
+        spot = _tool("set_spot", {"loc": {"type": "object", "properties": strings}})
         weather = _tool()
         weather.function.parameters["additionalProperties"] = True
         parser = FunctionCallParser(
-            tools=[weather, note, place],
+            tools=[weather, note, place, spot],
             tool_call_parser="beam",
             prefix=PREFIX,
             constrained=True,
@@ -470,6 +471,11 @@ class TestBeamResponseTemplate(CustomTestCase):
                 "set_place",
                 _parameter("loc", '{"mark": "a<|end|>b"}'),
                 {"loc": {"mark": "a<|end|>b"}},
+            ),
+            (
+                "set_spot",
+                _parameter("loc", '{"x": "a<|end|><|start|>assistantb"}'),
+                {"loc": {"x": "a<|end|><|start|>assistantb"}},
             ),
         ]
 

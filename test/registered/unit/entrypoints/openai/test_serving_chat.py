@@ -964,11 +964,7 @@ class ServingChatTestCase(CustomTestCase):
         ):
             self._use_delimited_response_template(reasoning_parser)
             reasoning = "Check the forecast." if reasoning_parser else ""
-            city = (
-                "a</call>b"
-                if reasoning_parser and constraint.get("tool_choice")
-                else "Paris"
-            )
+            city = "a</call>b" if reasoning_parser else "Paris"
             call = "<call:get_weather>" + json.dumps({"city": city}) + "</call>"
             text = (f"<think>{reasoning}</think>" if reasoning else "") + call
             for stream in (False, True):
