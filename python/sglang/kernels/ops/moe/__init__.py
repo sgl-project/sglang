@@ -324,3 +324,12 @@ register_kernel(
         capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(8, 9))}),
     )
 )
+
+register_kernel(
+    KernelSpec(
+        op="moe.bailing_moe_biased_grouped_topk",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.moe.bailing_moe_topk:bailing_moe_biased_grouped_topk",
+        capabilities=_CUDA,
+    )
+)
