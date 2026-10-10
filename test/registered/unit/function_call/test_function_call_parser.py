@@ -1,5 +1,6 @@
 import functools
 import json
+import time
 import unittest
 import warnings
 
@@ -2946,6 +2947,46 @@ class TestGlm4MoeDetector(unittest.TestCase):
         )
         self.assertEqual(result.normal_text, "")
 
+    def test_unclosed_tool_call_tags_parse_in_linear_time(self):
+        """Many opening tags without a closing tag must not stall the parser
+        (it runs on the event loop); earlier complete calls still parse."""
+        complete = (
+            "<tool_call>get_weather\n"
+            "<arg_key>city</arg_key>\n<arg_value>Beijing</arg_value>\n"
+            "<arg_key>date</arg_key>\n<arg_value>2024-06-27</arg_value>\n"
+            "</tool_call>"
+        )
+        unclosed = "<tool_call> " * 20000
+
+        start = time.perf_counter()
+        result = self.detector.detect_and_parse(complete + unclosed, self.tools)
+        self.detector.parse_streaming_increment(unclosed, self.tools)
+        elapsed = time.perf_counter() - start
+
+        self.assertLess(elapsed, 1.0)
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(
+            result.calls[0].parameters, '{"city": "Beijing", "date": "2024-06-27"}'
+        )
+
+    def test_unpaired_arg_keys_parse_in_linear_time(self):
+        """Many `<arg_key>` tags that never get a value must not stall the
+        parser; the complete pair before them still parses."""
+        text = (
+            "<tool_call>get_weather\n"
+            "<arg_key>city</arg_key>\n<arg_value>Beijing</arg_value>\n"
+            + "<arg_key>a</arg_key>" * 20000
+            + "</tool_call>"
+        )
+
+        start = time.perf_counter()
+        result = self.detector.detect_and_parse(text, self.tools)
+        elapsed = time.perf_counter() - start
+
+        self.assertLess(elapsed, 1.0)
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(json.loads(result.calls[0].parameters), {"city": "Beijing"})
+
     def test_streaming_tool_call(self):
         chunks = [
             "<tool_call>get_weather\n",
@@ -3981,6 +4022,20 @@ class TestLing3Detector(unittest.TestCase):
                 self.assertEqual(len(tool_calls), 1)
                 self.assertEqual(tool_calls[0]["name"], "get_weather")
                 self.assertEqual(tool_calls[0]["parameters"], expected)
+
+    def test_streaming_whitespace_after_tag_parses_in_linear_time(self):
+        """A long whitespace run after the opening tag must not stall the
+        stream; the call that follows it still parses."""
+        start = time.perf_counter()
+        tool_calls = self._collect_streaming_tool_calls(
+            ["<tool_call>" + " " * 20000, "get_date", "</tool_call>"]
+        )
+        elapsed = time.perf_counter() - start
+
+        self.assertLess(elapsed, 1.0)
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0]["name"], "get_date")
+        self.assertEqual(tool_calls[0]["parameters"], "{}")
 
 
 class TestJsonArrayParser(unittest.TestCase):
