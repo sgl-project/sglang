@@ -117,9 +117,9 @@ def test_single_operation():
     assert result is True, f"❌get operation failed for key: {key}"
 
     # Compare the data using proper tensor indices
-    assert torch.allclose(
-        set_slice, get_slice, atol=1e-6
-    ), f"❌get operation failed for key: {key}"
+    assert torch.allclose(set_slice, get_slice, atol=1e-6), (
+        f"❌get operation failed for key: {key}"
+    )
 
     logger.info(f"✅ Single operation passed")
 
@@ -154,15 +154,16 @@ def test_batch_operation(config: HiCacheStorageConfig):
     assert all(result), "batch set operation failed"
 
     # Test batch exists operation
-    assert (
-        store.batch_exists(keys) == kv_num
-    ), "keys should exist after batch set operation"
+    assert store.batch_exists(keys) == kv_num, (
+        "keys should exist after batch set operation"
+    )
 
     # Test batch get operation
     get_slices = [
         buffer[
-            (kv_num * entries_per_page + i)
-            * value_elements : (kv_num * entries_per_page + i + 1)
+            (kv_num * entries_per_page + i) * value_elements : (
+                kv_num * entries_per_page + i + 1
+            )
             * value_elements
         ]
         for i in range(kv_num * entries_per_page)
@@ -171,9 +172,9 @@ def test_batch_operation(config: HiCacheStorageConfig):
     result = store.batch_get_v1(keys, get_indices)
     assert all(result), "❌batch get operation failed"
     for i in range(kv_num * entries_per_page):
-        assert torch.allclose(
-            set_slices[i], get_slices[i], atol=1e-6
-        ), f"❌batch get operation failed for key: {keys[i // entries_per_page]}"
+        assert torch.allclose(set_slices[i], get_slices[i], atol=1e-6), (
+            f"❌batch get operation failed for key: {keys[i // entries_per_page]}"
+        )
 
     logger.info(f"✅ Batch operation passed")
 

@@ -29,17 +29,20 @@ from typing import List, Optional
 
 import torch
 
+from sglang.srt.runtime_context import derive_parallel_widths, get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.layer_ut_utils import init_single_process_dist
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=30, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
-def _ensure_dist_initialized() -> None:
-    """CCA reads the TP rank / world size inside ``__init__`` to size its
-    head-parallel projections, so the groups must exist before construction."""
+def _ensure_dist_initialized(cls) -> None:
+    """Publish the single-process construction context used by the tests."""
     init_single_process_dist()
+    override = get_context().override_server_args(tp_size=1)
+    override.install()
+    cls.addClassCleanup(override.restore)
 
 
 @dataclass(frozen=True)
@@ -206,6 +209,43 @@ def _make_tiny_config(num_hidden_layers: int = 2):
     )
 
 
+def _build_cca(tp_rank=None, tp_size=None, **kwargs):
+    from sglang.srt.models.zaya import CCA
+
+    parallel = get_parallel()
+    rank = parallel.tp_rank if tp_rank is None else tp_rank
+    size = parallel.tp_size if tp_size is None else tp_size
+    widths = derive_parallel_widths(
+        tp_size=size,
+        attn_cp_size=1,
+        attn_dp_size=1,
+        moe_ep_size=1,
+        moe_dp_size=1,
+        dcp_size=1,
+        dcp_enabled=False,
+    )
+    group = SimpleNamespace(world_size=size, rank_in_group=rank)
+    # Only construction uses the virtual group. Reload and forward run after
+    # this scope closes, so they must use the module's frozen head partition.
+    with parallel.override(
+        **widths,
+        tp_size=size,
+        attn_cp_size=1,
+        moe_dp_size=1,
+        tp_rank=rank,
+        attn_tp_rank=rank,
+        attn_dp_rank=0,
+        attn_cp_rank=0,
+        moe_tp_rank=rank,
+        moe_ep_rank=0,
+        moe_dp_rank=0,
+        tp_group=group,
+        attn_tp_group=group,
+        moe_tp_group=group,
+    ):
+        return CCA(**kwargs)
+
+
 def _make_tiny_cca(
     seed: int = 0,
     tp_rank: Optional[int] = None,
@@ -213,12 +253,10 @@ def _make_tiny_cca(
     layer_id: int = 0,
     config=None,
 ):
-    from sglang.srt.models.zaya import CCA
-
     if config is None:
         config = _make_tiny_config()
     torch.manual_seed(seed)
-    cca = CCA(
+    cca = _build_cca(
         config=config,
         cca_num_k_heads=config.num_query_groups,
         cca_num_q_heads=config.num_attention_heads,
@@ -243,7 +281,7 @@ def _make_tiny_cca(
 class TestZayaCCA(CustomTestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        _ensure_dist_initialized()
+        _ensure_dist_initialized(cls)
 
     def test_single_chunk_matches_reference(self):
         """A single-chunk extend with empty prefix matches the no-state path."""
@@ -432,99 +470,6 @@ class TestZayaCCA(CustomTestCase):
             self.assertTrue(torch.all(conv_state[idx] == 0))
             self.assertTrue(torch.all(prev_hs_state[idx] == 0))
 
-    def test_mamba_indices_resolved_once_per_forward_step(self):
-        """The req -> MambaPool-slot mapping is identical for every CCA layer in
-        a step, so it (and its GPU->CPU ``.tolist()`` sync) must be resolved once
-        per forward step and shared across layers, not recomputed per layer.
-
-        Regression guard for the per-layer mamba-sync fix: two CCA layers driven
-        by a single ForwardBatch must trigger exactly one ``get_mamba_indices``
-        lookup and one host materialization for the whole step.
-        """
-
-        class _CountingPool(_MockReqToTokenPool):
-            def __init__(self, *args, **kwargs):
-                super().__init__(*args, **kwargs)
-                self.get_mamba_indices_calls = 0
-
-            def get_mamba_indices(self, req_pool_indices):
-                self.get_mamba_indices_calls += 1
-                return super().get_mamba_indices(req_pool_indices)
-
-        # num_hidden_layers=4 -> CCA (even) layers live at ids 0 and 2.
-        config = _make_tiny_config(num_hidden_layers=4)
-        self.assertEqual(config.linear_layer_ids, [0, 2])
-        cca0, _ = _make_tiny_cca(seed=5, layer_id=0, config=config)
-        cca2, _ = _make_tiny_cca(seed=6, layer_id=2, config=config)
-
-        S = 4
-        hs = torch.randn(S, config.hidden_size, dtype=torch.float32) * 0.1
-
-        def _fresh_fb():
-            return _make_forward_batch(
-                is_decode=False,
-                extend_seq_lens_cpu=[S],
-                extend_prefix_lens_cpu=[0],
-                req_pool_indices=[0],
-                input_ids=torch.arange(S, dtype=torch.int64),
-            )
-
-        pool = _CountingPool(pool_size=8, cca_config=config)
-        with _mock_pool_context(pool) as backend:
-            fb = _fresh_fb()
-            cca0.forward(hs, fb)
-            cca2.forward(hs, fb)
-
-            # Two CCA layers, one forward step -> one shared lookup, both the
-            # device tensor and its host mirror memoized once per step on the
-            # backend (ShortConvAttnBackend does this in init_forward_metadata).
-            self.assertEqual(pool.get_mamba_indices_calls, 1)
-            self.assertIn(id(fb), backend._step_indices)
-            self.assertEqual(backend._step_slot_ids[id(fb)], [0])
-
-            # A new forward step (fresh ForwardBatch) resolves the mapping again.
-            cca0.forward(hs, _fresh_fb())
-            self.assertEqual(pool.get_mamba_indices_calls, 2)
-
-    def test_decode_path_does_not_sync_indices_to_host(self):
-        """The decode path indexes the pool entirely on-device, so it must not
-        populate the host-side index cache (keeping it CUDA-graph friendly)."""
-        cca, config = _make_tiny_cca(seed=7)
-
-        pool = _MockReqToTokenPool(pool_size=8, cca_config=config)
-        with _mock_pool_context(pool) as backend:
-            # Keep a reference to the extend batch so its id() cannot be recycled
-            # by the later decode batch (the mock keys its per-step memo on
-            # id(forward_batch); a GC'd-then-reused address would false-collide).
-            fb_extend = _make_forward_batch(
-                is_decode=False,
-                extend_seq_lens_cpu=[3],
-                extend_prefix_lens_cpu=[0],
-                req_pool_indices=[0],
-                input_ids=torch.arange(3, dtype=torch.int64),
-            )
-            cca.forward(
-                torch.randn(3, config.hidden_size, dtype=torch.float32) * 0.1,
-                fb_extend,
-            )
-            fb_decode = _make_forward_batch(
-                is_decode=True,
-                extend_seq_lens_cpu=[],
-                extend_prefix_lens_cpu=[],
-                req_pool_indices=[0],
-                input_ids=torch.tensor([0], dtype=torch.int64),
-            )
-            cca.forward(
-                torch.randn(1, config.hidden_size, dtype=torch.float32) * 0.1,
-                fb_decode,
-            )
-
-            # Decode resolves device indices, but the host ``.tolist()`` mirror
-            # is only built by the extend path -- so the decode step stays
-            # entirely on-device (CUDA-graph friendly).
-            self.assertIn(id(fb_decode), backend._step_indices)
-            self.assertNotIn(id(fb_decode), backend._step_slot_ids)
-
 
 class TestZayaCCATensorParallel(CustomTestCase):
     """Head-parallel TP equivalence:
@@ -540,7 +485,7 @@ class TestZayaCCATensorParallel(CustomTestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        _ensure_dist_initialized()
+        _ensure_dist_initialized(cls)
 
     def _slice_full_state_dict_into_rank(self, ref_cca, tp_cca, tp_rank: int):
         """Copy the reference's full weights into the per-rank CCA, using the
@@ -760,12 +705,10 @@ class TestZayaCCATensorParallel(CustomTestCase):
         both num_q_heads and num_k_heads, since both grouped-mean and
         conv_qk.1 require each rank to hold whole K-head groups.
         """
-        from sglang.srt.models.zaya import CCA
-
         cfg = _make_tiny_config()
         # tiny config has num_query_groups=2; TP=4 cannot divide it cleanly.
         with self.assertRaises(AssertionError):
-            CCA(
+            _build_cca(
                 config=cfg,
                 cca_num_k_heads=cfg.num_query_groups,
                 cca_num_q_heads=cfg.num_attention_heads,

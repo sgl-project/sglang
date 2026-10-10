@@ -106,9 +106,9 @@ class FlatPairColumns:
         # decoder cannot catch it — the data buffer only grows, so the receiver's
         # bounds check still passes and it hands the client another column's bytes
         # reinterpreted as logprobs, with a 200.
-        assert len(ii) == len(
-            vv
-        ), f"{self.name}: request {j} has {len(ii)} idx entries but {len(vv)} vals"
+        assert len(ii) == len(vv), (
+            f"{self.name}: request {j} has {len(ii)} idx entries but {len(vv)} vals"
+        )
         if self.first_none_to_nan and vv and vv[0] is None:
             self.v.append(float("nan"))
             self.v.extend(vv[1:])

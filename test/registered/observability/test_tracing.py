@@ -47,6 +47,9 @@ logger = logging.getLogger(__name__)
 
 # CI registration
 register_cuda_ci(est_time=113, stage="extra-a", runner_config="1-gpu-small")
+# Backend-specific: the span assertions require PREFILL_FORWARD/DECODE_FORWARD
+# to be emitted from the scheduler forward path, which ROCm reaches through its
+# own attention backend and graph replay.
 register_amd_ci(est_time=113, suite="stage-b-test-1-gpu-small-amd")
 
 

@@ -41,7 +41,9 @@
 //                      command rendering. Shape:
 //                      {defaultSelection, resource: {limits, verifiedRecipes,
 //                      autoTopology(sel), validateTopology(sel)},
-//                      resolveDeployment(sel)}. The resolver returns a cell plus
+//                      resolveDeployment(sel)}. Recipes may use verifiedWhen(sel)
+//                      to qualify the recommendation badge by checkpoint or mode.
+//                      The resolver returns a cell plus
 //                      `builder` metadata (topologySummary, errors, warnings,
 //                      verification, resolvedSettings). UI-only scope/expand and
 //                      local head-address/rank state never enter the URL hash.
@@ -61,6 +63,12 @@
 //                      may also be a function of the selection, for a cell whose
 //                      verification depends on an overlay pick (e.g. one
 //                      speculative option still being validated).
+//   resolveRecipe      optional — (cell, selection) => resolved cell. Used for
+//                      PD role/concurrency recipes; shared with the playground.
+//                      For cell.pd, cell.nnodes is the per-worker node count
+//                      (a 1P1D deployment has two nodes, one per worker).
+//                      cell.pd, pdMode, router, commands, hints, dockerImage,
+//                      dockerMounts carry role-specific rendering metadata.
 //   modelNames         HF slug lookup, `hw|variant|quant`, `variant|quant`,
 //                      `hw|quant`, `quant`, `hw`, then `default`
 //   placeholders       {{KEY}} → {target: 'command'|'curl', label, default?}
@@ -80,6 +88,7 @@
 //                      Legacy "Mean" data is being re-measured to P50; drop once done
 //   multiNodeHints     optional — {[hwId]: string[]} prepended as `# ...` lines
 //   dockerImages       optional — `docker run` image, keyed by
+//                      `hw|variant|quant` then `variant|quant` then
 //                      `hw|quant|strategy` then `hw|quant` then `hw`;
 //                      falls back to `lmsysorg/sglang:dev`
 //   dockerHostNetworkWhen optional — `(selection, {flags, env}) => boolean`
@@ -91,6 +100,9 @@
 //                      defaults to both, in that order
 //   showPlaygroundLink optional — false hides the "Open the Playground" footer
 //                      for cookbooks that only expose the deployment matrix
+// Component props besides `config` / `benchmarks`:
+//   agenticLink        optional — heading id of the page's agentic long-context
+//                      section; adds a footer link to it under the Playground link
 //   github             optional — "Submit verified cell" issue-template overrides
 //   playgroundFeatures optional — consumed by _playground.jsx (see its header)
 //
@@ -101,13 +113,18 @@
 //     HTML tags only; factor into helper functions, not sub-components.
 //   - Import plain-data config from the MDX file, pass through as a prop.
 
-export const Deployment = ({ config, benchmarks }) => {
+export const Deployment = ({ config, benchmarks, agenticLink }) => {
   if (!config) {
     return <div style={{padding: 12, color: "#b91c1c"}}>Deployment: missing <code>config</code> prop</div>;
   }
 
   // ==== 1. Hardware catalog (shared across cookbooks) ====
   // VRAM is per-GPU on-chip memory, not per-module.
+  const AMD_RDMA_DOCKER_FLAGS = [
+    "--device /dev/infiniband", "--cap-add IPC_LOCK",
+    "--ulimit memlock=-1", "--ulimit stack=67108864",
+    "--ulimit nofile=1048576:1048576",
+  ];
   const HARDWARE_CATALOG = {
     blackwell: [
       { id: "b300",  label: "B300",  vram: "288GB" },
@@ -127,16 +144,28 @@ export const Deployment = ({ config, benchmarks }) => {
       { id: "h20-3e", label: "H20-3e", vram: "141GB" },
       { id: "h800",  label: "H800",  vram: "80GB"  },
     ],
+    // ROCm multi-node runs the RDMA NICs straight through: /dev/infiniband
+    // covers rdma_cm plus the per-NIC uverbsN nodes, IPC_LOCK + an unlimited
+    // memlock let the transport pin its registered buffers, and the stack /
+    // nofile raises are for the per-QP file descriptors a full 8-NIC mesh opens.
     amd: [
-      { id: "mi300x", label: "MI300X", vram: "192GB" },
-      { id: "mi325x", label: "MI325X", vram: "256GB" },
-      { id: "mi350x", label: "MI350X", vram: "288GB" },
-      { id: "mi355x", label: "MI355X", vram: "288GB" },
+      { id: "mi300x", label: "MI300X", vram: "192GB",
+        multiNodeDockerFlags: [...AMD_RDMA_DOCKER_FLAGS] },
+      { id: "mi325x", label: "MI325X", vram: "256GB",
+        multiNodeDockerFlags: [...AMD_RDMA_DOCKER_FLAGS] },
+      { id: "mi350x", label: "MI350X", vram: "288GB",
+        multiNodeDockerFlags: [...AMD_RDMA_DOCKER_FLAGS] },
+      { id: "mi355x", label: "MI355X", vram: "288GB",
+        multiNodeDockerFlags: [...AMD_RDMA_DOCKER_FLAGS] },
     ],
-    // Atlas 800I A3 (910C): 1 card = 2 dies, so --tp-size is 2× the card
-    // count (32 cards -> --tp-size 64).
+    // Ascend device layout: one /dev/davinciN per core. An A3 Series card is
+    // the exception — 2 dies per card, so an 8-card node exposes 16 devices
+    // and --tp-size is twice the card count. A 950PR/DT Series card is a
+    // single core, so the device count and --tp-size follow the cards. Both
+    // counts feed the docker `--device` list (`npuDevices`).
     npu: [
-      { id: "a3", label: "Atlas 800I A3", vram: "64GB/die" },
+      { id: "a3", label: "A3 Series",        vram: "64GB/die", npuDevices: 16 },
+      { id: "a5", label: "950PR/DT Series",  vram: "128GB",    npuDevices: 8  },
     ],
   };
 
@@ -409,13 +438,33 @@ export const Deployment = ({ config, benchmarks }) => {
 
     // grid (not <table>) — Mintlify wraps <table> with scroll wrappers.
     // gridTemplateColumns set inline (depends on measurements.length).
+    // Horizontal-scroll box for a table wider than the card. The class is
+    // what opts it out of the site-wide scrollbar suppression at the top of
+    // custom.css: without it the box scrolls but paints NO scrollbar, so the
+    // off-card columns look like they do not exist.
+    // marginTop lives here rather than on benchTable because overflow makes
+    // this box a BFC — a margin inside it would stop collapsing with the
+    // preceding sibling's margin-bottom and silently add 4px.
+    benchTableScroll: {
+      overflowX: "auto",
+      // Pin the block axis: a lone overflow-x would compute overflow-y to
+      // `auto` and clip anything painting outside the box.
+      overflowY: "hidden",
+      marginTop: "4px",
+    },
     benchTable: {
       display: "grid",
       // columnGap 0 so cells' bottom borders form one continuous line.
       columnGap: 0,
       rowGap: "3px",
-      marginTop: "4px",
       alignItems: "baseline",
+      // Without this the grid box stays at the scroll container's width while
+      // the tracks overflow past it, and the sticky label column — which can
+      // only stick inside its containing block — slides away after that
+      // width. Growing the box to the tracks makes the whole scroll range its
+      // containing block. Inert when the table fits: max-content is then
+      // narrower than the card and `width: auto` still wins.
+      minWidth: "max-content",
     },
     benchTableHead: {
       textAlign: "right",
@@ -427,6 +476,16 @@ export const Deployment = ({ config, benchmarks }) => {
     },
     benchTableCornerHead: {
       paddingBottom: "4px",
+      // Pinned with the label column below it; background must match
+      // benchBlock's so scrolled-under values do not show through.
+      position: "sticky",
+      left: 0,
+      background: isDark ? "#111827" : "#fafafa",
+      zIndex: 1,
+      // This cell is empty, and the grid aligns items to the baseline, so it
+      // would otherwise be only as tall as its padding (4px vs the header
+      // row's 23px) and the scrolled-under header would show above it.
+      alignSelf: "stretch",
     },
     // Header underline — one div spanning all columns (continuous line).
     benchTableSeparator: {
@@ -439,6 +498,13 @@ export const Deployment = ({ config, benchmarks }) => {
       textAlign: "left", fontSize: "12px",
       color: isDark ? "#9ca3af" : "#6b7280",
       whiteSpace: "nowrap",
+      // The table scrolls horizontally, so this column has to stay put:
+      // scrolled to the right end the rows are otherwise four unlabeled
+      // numbers in four different units. Inert when nothing overflows.
+      position: "sticky",
+      left: 0,
+      background: isDark ? "#111827" : "#fafafa",
+      zIndex: 1,
     },
     benchTableValue: {
       textAlign: "right", fontSize: "12px",
@@ -575,11 +641,20 @@ export const Deployment = ({ config, benchmarks }) => {
   // where `disabled` is reserved for combinations that cannot work at all.
   const optionSoft = (opt, sel) =>
     typeof opt.soft === "function" ? opt.soft(sel) : !!opt.soft;
-  const findCell = (cells, sel) =>
-    cells.find((c) => DIMENSIONS.every((d) => c.match[d] === sel[d]));
+  const findCell = (cells, sel) => {
+    const cell = cells.find((c) => DIMENSIONS.every((d) => c.match[d] === sel[d]));
+    return cell && typeof config.resolveRecipe === "function"
+      ? config.resolveRecipe(cell, sel) : cell;
+  };
 
-  const findBenchmark = (list, sel) =>
-    (list || []).find((b) => DIMENSIONS.every((d) => b.match[d] === sel[d])) || null;
+  // Entries may also key on overlay dims (e.g. kvDsaPair): an entry applies
+  // only when every declared key equals the selection, and the most specific
+  // match wins, so plain hw×strategy entries stay the fallback.
+  const findBenchmark = (list, sel) => {
+    const hits = (list || []).filter((b) =>
+      Object.entries(b.match || {}).every(([k, v]) => sel[k] === v));
+    return hits.sort((a, b) => Object.keys(b.match).length - Object.keys(a.match).length)[0] || null;
+  };
 
   // Accepts a single measurement object or an array; always returns an array.
   const normalizeSpeed = (speed) => {
@@ -671,12 +746,19 @@ export const Deployment = ({ config, benchmarks }) => {
     // Overlay dims ride along: they never key cells, so snapping must not drop
     // them (it did — a strict-mode hash round-trip lost the spec default).
     // Keep the parsed value when it names a real option, else the row default.
+    // A hash can also name an option that showWhen hides (or a rule disables)
+    // for the composed selection; snap those like an interactive reseat would.
     for (const spec of overlayDimSpecs) {
       const want = parsed[spec.id];
       const opts = spec.options || [];
-      valid[spec.id] = opts.some((o) => o.id === want)
+      const picked = opts.some((o) => o.id === want)
         ? want
         : spec.default ?? (opts[0] && opts[0].id) ?? "";
+      const withPick = { ...valid, [spec.id]: picked };
+      const usable = visibleOptions(spec, withPick).filter((o) => !optionDisabled(o, withPick));
+      valid[spec.id] = usable.some((o) => o.id === picked)
+        ? picked
+        : (usable[0] && usable[0].id) ?? picked;
     }
     return valid;
   };
@@ -717,7 +799,8 @@ export const Deployment = ({ config, benchmarks }) => {
     return m ? parseInt(m[1], 10) : 1;
   };
   const cellNnodes = (cell, sel) =>
-    sel.nodes !== undefined ? parseNnodes(sel.nodes) : (cell.nnodes || 1);
+    cell.pd ? (cell.nnodes || 1)
+      : sel.nodes !== undefined ? parseNnodes(sel.nodes) : (cell.nnodes || 1);
 
   // Role-specific serving ports for PD deployments — keep in sync with PD_PORTS
   // in _playground.jsx, which the generated router command targets. Each role
@@ -734,6 +817,7 @@ export const Deployment = ({ config, benchmarks }) => {
   const renderCommand = (cell, sel, envValues, mode = "python") => {
     if (!cell) return "# No command available for the current selection.";
     const modelName = resolveModelName(sel);
+    if (cell.pd && cell.commands) return interpolate(cell.commands[mode] || cell.commands.python, envValues, modelName);
     const nnodes = cellNnodes(cell, sel);
     const multinode = nnodes > 1;
     const cellEnv = [...(cell.env || []), ...overlayEnv(sel)];
@@ -742,7 +826,8 @@ export const Deployment = ({ config, benchmarks }) => {
       // Insert the multi-node trio after the last parallelism flag,
       // falling back to right after --model-path.
       const PARALLELISM_ANCHORS = new Set([
-        "--enable-dp-attention", "--dp-size", "--dp", "--tp-size", "--tp",
+        "--attn-dp-size", "--attention-data-parallel-size",
+        "--dp-size", "--dp", "--tp-size", "--tp",
         "--sp-degree", "--ulysses-degree", "--ring-degree",
       ]);
       let i = flags.reduce(
@@ -756,7 +841,10 @@ export const Deployment = ({ config, benchmarks }) => {
         `--dist-init-addr {{NODE0_IP}}:20000`);
     }
 
-    const pdServePort = PD_SERVE_PORTS[sel.pdMode];
+    // A resolved recipe owns its role; hidden picks from that overlay must
+    // not alter a legacy cell after switching hardware or model.
+    const pdServePort = PD_SERVE_PORTS[cell.pd ? cell.pdMode
+      : config.resolveRecipe ? null : sel.pdMode];
     if (pdServePort !== undefined) {
       for (let j = 0; j < flags.length; j++) {
         if (flags[j].split(/[\s=]/)[0] === "--port") {
@@ -767,18 +855,22 @@ export const Deployment = ({ config, benchmarks }) => {
 
     let cmd;
     if (mode === "docker") {
-      // Image keyed by `hw|quant|strategy` (most specific), then `hw|quant`,
-      // then `hw`; `:dev` if unmapped. The strategy key covers a tier that
-      // needs its own build (e.g. a spec-decoding preview image).
+      // Image keyed by `hw|variant|quant` (most specific), then `variant|quant`,
+      // then `hw|quant|strategy`, `hw|quant`, `hw`; `:dev` if unmapped. The
+      // variant keys cover a checkpoint that needs its own build (e.g. a
+      // new-variant preview image); the strategy key covers a tier that needs
+      // one (e.g. a spec-decoding preview image).
       const di = config.dockerImages || {};
-      const image = di[`${sel.hw}|${sel.quant}|${sel.strategy}`]
+      const image = (cell.pd && cell.dockerImage) || di[`${sel.hw}|${sel.variant}|${sel.quant}`]
+        || di[`${sel.variant}|${sel.quant}`]
+        || di[`${sel.hw}|${sel.quant}|${sel.strategy}`]
         || di[`${sel.hw}|${sel.quant}`] || di[sel.hw] || "lmsysorg/sglang:dev";
       const dockerRunCommand = typeof config.dockerRunCommand === "function"
         ? config.dockerRunCommand(sel)
         : (config.dockerRunCommand || "sglang serve");
       const portFlag = flags.find((x) => x.split(/[\s=]/)[0] === "--port");
       const servePort = portFlag ? portFlag.slice("--port".length).trim() : "{{PORT}}";
-      const hostNetwork = multinode || (typeof config.dockerHostNetworkWhen === "function"
+      const hostNetwork = multinode || cell.pd || (typeof config.dockerHostNetworkWhen === "function"
         && config.dockerHostNetworkWhen(sel, { flags, env: cellEnv }));
       const vendorOf = (hwId) => {
         for (const [vendor, list] of Object.entries(HARDWARE_CATALOG)) {
@@ -788,14 +880,31 @@ export const Deployment = ({ config, benchmarks }) => {
         return (extra && extra.vendor) || "nvidia";
       };
       // `config.hardware` overrides by id, as in buildHardwareGroups.
-      const fabricFlagsOf = (hwId) => {
+      const catalogEntryOf = (hwId) => {
         const extra = (config.hardware || []).find((h) => h.id === hwId);
-        if (extra) return extra.multiNodeDockerFlags || [];
+        if (extra) return extra;
         for (const list of Object.values(HARDWARE_CATALOG)) {
           const hit = list.find((h) => h.id === hwId);
-          if (hit) return hit.multiNodeDockerFlags || [];
+          if (hit) return hit;
         }
-        return [];
+        return null;
+      };
+      const fabricFlagsOf = (hwId) =>
+        (catalogEntryOf(hwId) || {}).multiNodeDockerFlags || [];
+      // NPU cards are reached with --device, one per /dev/davinciN core;
+      // `npuDevices` carries the per-product-line count (16 on an A3 Series
+      // node, 8 on a 950PR/DT Series node), four devices per line as the host
+      // docs show.
+      const davinciLines = (devices) => {
+        const lines = [];
+        for (let i = 0; i < devices; i += 4) {
+          const group = [];
+          for (let k = i; k < Math.min(i + 4, devices); k++) {
+            group.push(`--device=/dev/davinci${k}`);
+          }
+          lines.push("  " + group.join(" "));
+        }
+        return lines;
       };
       const gpuAccessLines = vendorOf(sel.hw) === "amd"
         ? [
@@ -807,14 +916,10 @@ export const Deployment = ({ config, benchmarks }) => {
           ]
         : vendorOf(sel.hw) === "npu"
         ? [
-            // NPU: --privileged grants the davinci devices (16 dies on an
-            // 8-card Atlas 800I A3 node); the host CANN driver/firmware/state
-            // must be mounted in.
+            // NPU: --privileged grants the davinci devices; the host CANN
+            // driver/firmware/state must be mounted in.
             "docker run --privileged --shm-size=16g",
-            "  --device=/dev/davinci0 --device=/dev/davinci1 --device=/dev/davinci2 --device=/dev/davinci3",
-            "  --device=/dev/davinci4 --device=/dev/davinci5 --device=/dev/davinci6 --device=/dev/davinci7",
-            "  --device=/dev/davinci8 --device=/dev/davinci9 --device=/dev/davinci10 --device=/dev/davinci11",
-            "  --device=/dev/davinci12 --device=/dev/davinci13 --device=/dev/davinci14 --device=/dev/davinci15",
+            ...davinciLines((catalogEntryOf(sel.hw) || {}).npuDevices || 16),
             "  --device=/dev/davinci_manager",
             "  --device=/dev/hisi_hdc",
             "  -v /usr/local/sbin:/usr/local/sbin",
@@ -834,11 +939,11 @@ export const Deployment = ({ config, benchmarks }) => {
         // (--dist-init-addr) and NCCL/GLOO traffic are reachable; single-node
         // just maps the serve port.
         hostNetwork ? "  --network host" : `  -p ${servePort}:${servePort}`,
-        ...(multinode ? fabricFlagsOf(sel.hw).map((f) => "  " + f) : []),
+        ...((multinode || cell.pd) ? fabricFlagsOf(sel.hw).map((f) => "  " + f) : []),
         // The NPU device block already mounts ~/.cache/.
         ...(vendorOf(sel.hw) === "npu"
           ? [] : ["  -v ~/.cache/huggingface:/root/.cache/huggingface"]),
-        ...(config.dockerMounts || []).map((mount) => `  -v ${mount}`),
+        ...[...(config.dockerMounts || []), ...(cell.pd ? cell.dockerMounts || [] : [])].map((mount) => `  -v ${mount}`),
         // HF token only for gated checkpoints — configs that declare an HF_TOKEN placeholder.
         ...(config.placeholders && config.placeholders.HF_TOKEN
           ? [`  --env "HF_TOKEN={{HF_TOKEN}}"`] : []),
@@ -856,6 +961,7 @@ export const Deployment = ({ config, benchmarks }) => {
     }
 
     const hintLines = [
+      ...(cell.pd ? cell.hints || [] : []),
       ...overlayHints(sel),
       ...(multinode && config.multiNodeHints && config.multiNodeHints[sel.hw]
         ? config.multiNodeHints[sel.hw]
@@ -926,6 +1032,12 @@ export const Deployment = ({ config, benchmarks }) => {
     // Split workload fields into shared (uniform → context line) vs differing
     // (→ per-column header). max_concurrency is always per-column.
     const ALWAYS_PER_COLUMN = new Set(["max_concurrency"]);
+    // isl and osl print as one `in/out=I/O` token, so they have to be
+    // classified together. Classified apart — isl varying, osl uniform — the
+    // shared context line rendered the FIRST measurement's isl as if it held
+    // for every column: the GLM-5.3-Flash FP8 + TRT-LLM cell says
+    // "in/out=1000/1000" above a table that is half 8000/1000.
+    const ATOMIC_WORKLOAD_GROUPS = [["isl", "osl"]];
     const partitionWorkload = (measurements) => {
       const shared = new Set();
       const differing = new Set();
@@ -941,6 +1053,10 @@ export const Deployment = ({ config, benchmarks }) => {
         if (ALWAYS_PER_COLUMN.has(k) || seen.size > 1) differing.add(k);
         else shared.add(k);
       }
+      for (const group of ATOMIC_WORKLOAD_GROUPS) {
+        if (!group.some((k) => differing.has(k))) continue;
+        for (const k of group) if (shared.delete(k)) differing.add(k);
+      }
       return { shared, differing };
     };
 
@@ -954,34 +1070,48 @@ export const Deployment = ({ config, benchmarks }) => {
           {sharedText && (
             <div style={s.benchWorkload}>{sharedText}</div>
           )}
+          {/* tabIndex + role: a scroll box with no focusable child is
+              unreachable without a pointer (WCAG 2.1.1). A lone value column
+              is `max-content` + `1fr` and so can never exceed the card — no
+              scrolling, hence no tab stop. */}
           <div
-            style={{
-              ...s.benchTable,
-              gridTemplateColumns:
-                `max-content repeat(${colCount}, minmax(0, 1fr))`,
-            }}
+            className="sg-bench-scroll"
+            style={s.benchTableScroll}
+            {...(colCount > 1 ? {
+              tabIndex: 0,
+              role: "group",
+              "aria-label": sharedText ? `${title} — ${sharedText}` : title,
+            } : {})}
           >
-            {showColHeaders && (
-              <div key="corner" style={s.benchTableCornerHead}></div>
-            )}
-            {showColHeaders && colHeaders.map((h, i) => (
-              <div key={`hdr-${i}`} style={s.benchTableHead}>{h}</div>
-            ))}
-            {showColHeaders && (
-              <div key="sep" style={s.benchTableSeparator}></div>
-            )}
-            {rows.map((r) => [
-              <div key={`lbl-${r.label}`} style={s.benchTableLabel}>{r.label}</div>,
-              ...r.values.map((v, i) => (
-                <div key={`val-${r.label}-${i}`} style={
-                  v === null
-                    ? { ...s.benchTableValue, ...s.benchTableValueMissing }
-                    : s.benchTableValue
-                }>
-                  {v !== null ? v : "—"}
-                </div>
-              )),
-            ])}
+            <div
+              style={{
+                ...s.benchTable,
+                gridTemplateColumns:
+                  `max-content repeat(${colCount}, minmax(max-content, 1fr))`,
+              }}
+            >
+              {showColHeaders && (
+                <div key="corner" style={s.benchTableCornerHead}></div>
+              )}
+              {showColHeaders && colHeaders.map((h, i) => (
+                <div key={`hdr-${i}`} style={s.benchTableHead}>{h}</div>
+              ))}
+              {showColHeaders && (
+                <div key="sep" style={s.benchTableSeparator}></div>
+              )}
+              {rows.map((r) => [
+                <div key={`lbl-${r.label}`} style={s.benchTableLabel}>{r.label}</div>,
+                ...r.values.map((v, i) => (
+                  <div key={`val-${r.label}-${i}`} style={
+                    v === null
+                      ? { ...s.benchTableValue, ...s.benchTableValueMissing }
+                      : s.benchTableValue
+                  }>
+                    {v !== null ? v : "—"}
+                  </div>
+                )),
+              ])}
+            </div>
           </div>
           {legend && (
             <div style={s.benchLegend}>
@@ -1246,6 +1376,7 @@ export const Deployment = ({ config, benchmarks }) => {
   };
 
   const [sel, setSel] = useState(() => initialSelectionFromCells());
+  const [selectionHydrated, setSelectionHydrated] = useState(false);
   const INTERNAL_HASH_STATE_KEY = "__sglangDeployInternalHash";
   const DEPLOYMENT_COMPONENT_ID = "deployment-configurator";
   useEffect(() => {
@@ -1279,12 +1410,14 @@ export const Deployment = ({ config, benchmarks }) => {
       if (el) el.scrollIntoView({ behavior: "smooth", block: "start" });
     };
     hydrate();
+    setSelectionHydrated(true);
     window.addEventListener("hashchange", hydrate);
     return () => window.removeEventListener("hashchange", hydrate);
   }, []);
   // history.replaceState does NOT fire hashchange — dispatch a custom event so
   // the Playground hears chip-click selection changes.
   useEffect(() => {
+    if (!selectionHydrated) return;
     const target = "#" + new URLSearchParams(sel).toString();
     if (window.location.hash !== target) {
       const historyState =
@@ -1298,7 +1431,7 @@ export const Deployment = ({ config, benchmarks }) => {
       );
     }
     window.dispatchEvent(new CustomEvent("sglang-deploy-sel", { detail: sel }));
-  }, [sel]);
+  }, [sel, selectionHydrated]);
 
   const [modal, setModal] = useState(null); // 'curl' | 'env' | 'bench' | null
   useEffect(() => {
@@ -1465,7 +1598,8 @@ export const Deployment = ({ config, benchmarks }) => {
   const modelName = resolveModelName(sel);
   const curlTemplate =
     typeof config.curl === "function" ? config.curl(sel, cell) : config.curl;
-  const curlText = interpolate(curlTemplate || "", env, modelName);
+  const curlText = interpolate(curlTemplate || "",
+    cell && cell.pd && cell.router ? { ...env, CURL_PORT: String(cell.router.port) } : env, modelName);
   const hwGroups = buildHardwareGroups();
   const benchEntry = benchmarks ? findBenchmark(benchmarks, sel) : null;
 
@@ -1749,20 +1883,25 @@ export const Deployment = ({ config, benchmarks }) => {
       || sel[dim.id]
       || "—";
     const recommendedRecipe = recommendedBuilderRecipe(sel.hw);
+    const recommendedIsVerified = !!recommendedRecipe && !recommendedRecipe.unverified
+      && (typeof recommendedRecipe.verifiedWhen !== "function" || recommendedRecipe.verifiedWhen(sel));
     const recommendedInUse = !!recommendedRecipe
       && Number(sel.nodes) === recommendedRecipe.nodes
       && Number(sel.gpus_per_node) === recommendedRecipe.gpus_per_node
       && sel.topology_mode === "auto"
-      && ["auto", recommendedRecipe.placement].includes(sel.placement)
-      && sel.attention === "platform"
-      && sel.precision === "native"
-      && ["auto", recommendedRecipe.encoder].includes(sel.encoder)
-      && sel.execution === "eager";
+      && serveDims.every((dim) => {
+        const expected = recommendedRecipe[dim.id] ?? dim.default;
+        if (dim.id === "attention") return sel.attention === "platform";
+        return expected === undefined || sel[dim.id] === expected
+          || (["placement", "encoder"].includes(dim.id) && sel[dim.id] === "auto");
+      });
 
     const restoreRecommendedRecipe = () => {
       if (!recommendedRecipe) return;
       setSel((prev) => reseatHiddenPicks(normalizeBuilderSelection({
         ...prev,
+        ...Object.fromEntries(serveDims
+          .map((dim) => [dim.id, recommendedRecipe[dim.id] ?? dim.default ?? dim.options?.[0]?.id])),
         nodes: recommendedRecipe.nodes,
         gpus_per_node: recommendedRecipe.gpus_per_node,
         topology_mode: "auto",
@@ -1773,7 +1912,7 @@ export const Deployment = ({ config, benchmarks }) => {
         attention: "platform",
         precision: "native",
         encoder: recommendedRecipe.encoder || "auto",
-        execution: "eager",
+        execution: recommendedRecipe.execution || "eager",
       })));
     };
 
@@ -1869,7 +2008,7 @@ export const Deployment = ({ config, benchmarks }) => {
               {/* This is the verified operating point, not sizing advice — a
                   hardware whose validation ran on 8 GPUs is not "recommending"
                   8 over a smaller deployment. */}
-              <span>{recommendedRecipe.unverified ? "Derived recipe" : "Verified recipe"} · {sel.hw.toUpperCase()}</span>
+              <span>{recommendedIsVerified ? "Verified recipe" : "Derived recipe"} · {sel.hw.toUpperCase()}</span>
               <strong>
                 {[
                   `${recommendedRecipe.nodes * recommendedRecipe.gpus_per_node} GPUs`,
@@ -1881,10 +2020,10 @@ export const Deployment = ({ config, benchmarks }) => {
               </strong>
             </div>
             <div>
-              {renderStatus(recommendedRecipe.unverified ? "unverified" : "verified")}
+              {renderStatus(recommendedIsVerified ? "verified" : "unverified")}
               {recommendedInUse
                 ? <small>In use</small>
-                : <button type="button" className="sgd-builder-text-action" onClick={restoreRecommendedRecipe}>{recommendedRecipe.unverified ? "Use derived recipe" : "Use verified recipe"}</button>}
+                : <button type="button" className="sgd-builder-text-action" onClick={restoreRecommendedRecipe}>{recommendedIsVerified ? "Use verified recipe" : "Use derived recipe"}</button>}
             </div>
           </section>
         )}
@@ -1980,7 +2119,7 @@ export const Deployment = ({ config, benchmarks }) => {
       const options = visibleOptions(dim, sel);
       const currentOption = selectedOption(dim);
       return (
-        <section className={`sgd-builder-context ${className}`} aria-live={direct ? undefined : "polite"}>
+        <section className={["sgd-builder-context", className].filter(Boolean).join(" ")} aria-live={direct ? undefined : "polite"}>
           <div className="sgd-builder-context-heading">
             <div>
               <span>{direct ? dim.title : `${dim.title} options`}</span>
@@ -2232,6 +2371,13 @@ export const Deployment = ({ config, benchmarks }) => {
           </div>
         </div>
 
+        {builderScope === "serve" && (
+          <p className="sgd-builder-docs-tip">
+            <strong>Tip:</strong> For more server options, see the{" "}
+            <a href="/docs/sglang-diffusion/api/cli">CLI reference</a>.
+          </p>
+        )}
+
         {modal === "env" && (
           <div style={s.modalBackdrop} onClick={() => setModal(null)}>
             <div style={s.modalBox} onClick={(event) => event.stopPropagation()}>
@@ -2405,6 +2551,44 @@ export const Deployment = ({ config, benchmarks }) => {
         </div>
       )}
 
+      {/* Agentic long-context link (opt-in per page) — same scroll-only pattern. */}
+      {agenticLink && (
+        <div
+          style={{
+            padding: "0 12px 6px",
+            fontSize: "12px",
+            color: isDark ? "#9ca3af" : "#6b7280",
+            display: "flex",
+            flexWrap: "wrap",
+            alignItems: "center",
+            gap: "2px 6px",
+          }}
+        >
+          <span>Need to serve Agentic Long-Context workloads?</span>
+          <button
+            type="button"
+            onClick={() => {
+              const el = document.getElementById(agenticLink);
+              if (el) el.scrollIntoView({ behavior: "smooth", block: "start" });
+            }}
+            style={{
+              background: "transparent",
+              border: "none",
+              padding: 0,
+              color: isDark ? "#FDBA74" : "#C2410C",
+              cursor: "pointer",
+              fontSize: "12px",
+              fontWeight: 600,
+              textDecoration: "underline",
+              textUnderlineOffset: "2px",
+              whiteSpace: "nowrap",
+            }}
+          >
+            Refer to the Agentic Long-Context section →
+          </button>
+        </div>
+      )}
+
       {/* cURL modal */}
       {modal === "curl" && (
         <div style={s.modalBackdrop} onClick={() => setModal(null)}>
@@ -2488,8 +2672,16 @@ export const Deployment = ({ config, benchmarks }) => {
       {modal === "bench" && benchEntry && (() => {
         const bc = buildBenchCommands(benchEntry, sel);
         if (!bc) return null;
-        const selSummary =
-          `${sel.hw.toUpperCase()} · ${sel.variant} · ${sel.quant.toUpperCase()} · ${sel.strategy} · ${sel.nodes}`;
+        const selSummary = [
+          sel.hw && sel.hw.toUpperCase(),
+          sel.variant,
+          sel.quant && sel.quant.toUpperCase(),
+          sel.strategy,
+          sel.kvDsaPair,
+          sel.nodes,
+        ]
+          .filter((part) => part !== undefined && part !== null && part !== "")
+          .join(" · ");
         let selConc = null;
         let speedCmd = null;
         if (bc.speed) {

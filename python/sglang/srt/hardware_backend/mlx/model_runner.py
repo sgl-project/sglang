@@ -379,7 +379,7 @@ class MlxModelRunner:
 
         chunk_size = mamba_cache_chunk_size()
         track_len = prefix_len + (new_token_count // chunk_size) * chunk_size
-        branching_len = getattr(req, "mamba_branching_seqlen", None)
+        branching_len = req.mamba_branching_seqlen
         if (
             branching_len is not None
             and prefix_len < branching_len <= prefix_len + new_token_count
@@ -407,7 +407,7 @@ class MlxModelRunner:
         if pool is None or not hasattr(pool, "store_cache"):
             return
 
-        track_buffer = getattr(req, "mamba_ping_pong_track_buffer", None)
+        track_buffer = req.kv.mamba_ping_pong_track_buffer
         if track_buffer is None:
             track_buffer = pool.alloc(1)
             if track_buffer is None:
@@ -416,16 +416,16 @@ class MlxModelRunner:
                     "falling back to leaf-only auxiliary-state radix caching."
                 )
                 return
-            req.mamba_ping_pong_track_buffer = track_buffer
-            req.mamba_next_track_idx = 0
-            req.mamba_last_track_idx = 0
+            req.kv.mamba_ping_pong_track_buffer = track_buffer
+            req.kv.mamba_next_track_idx = 0
+            req.kv.mamba_last_track_idx = 0
 
         pool.store_cache(
             track_buffer[0],
             cache,
             self._cache_layout.auxiliary_layer_indices,
         )
-        req.mamba_last_track_seqlen = track_len
+        req.kv.mamba_last_track_seqlen = track_len
 
     def _cache_with_pool_backed_attention(
         self, prefix_slot_ids: list[int], prefix_len: int
@@ -839,14 +839,17 @@ class MlxModelRunner:
         )
         self._attention_kv_pool.set_kv_all_layers(slot_ids_mx, k_all, v_all)
 
-    def _sync_decode_kv_to_pool(self, req_id: str) -> None:
-        """Sync un-flushed decode KV for *req_id* to the shared pool."""
+    def _sync_decode_kv_to_pool(self, req_id: str, end: int | None = None) -> None:
+        """Sync un-flushed decode KV for *req_id* to the shared pool, up to
+        position *end* when given."""
         if self._attention_kv_pool is None or self._req_to_token_pool is None:
             return
         cache = self._req_caches.get(req_id)
         if cache is None:
             return
         current_offset = self._first_attention_cache(cache).offset
+        if end is not None:
+            current_offset = min(current_offset, end)
         synced_offset = self._req_synced_offset.get(req_id, 0)
         if current_offset <= synced_offset:
             return
@@ -864,12 +867,13 @@ class MlxModelRunner:
         self._sync_new_kv_to_pool(cache, synced_offset, slot_ids)
         self._req_synced_offset[req_id] = current_offset
 
-    def flush_all_decode_kv(self) -> None:
-        """Sync all active requests' un-flushed decode KV to the pool."""
-        if self.disable_radix_cache or self._attention_kv_pool is None:
-            return
-        for req_id in list(self._req_caches.keys()):
-            self._sync_decode_kv_to_pool(req_id)
+    def release_request_row(self, req_id: str, owned_len: int) -> None:
+        """Sync decode KV only within the first *owned_len* positions (chained
+        decode steps own no slots past it), then forget the row, which the
+        scheduler may reuse once released."""
+        if not self.disable_radix_cache:
+            self._sync_decode_kv_to_pool(req_id, end=owned_len)
+        self._req_pool_idx.pop(req_id, None)
 
     def decode_batch(self, req_ids: list[str]) -> list[int]:
         """Decode one token per request.
@@ -905,7 +909,7 @@ class MlxModelRunner:
         """
         prefix_len = len(prefix_slot_ids)
         if req is not None:
-            req.mamba_last_track_seqlen = None
+            req.kv.mamba_last_track_seqlen = None
         if self._enable_sampling:
             self._req_sampling[req_id] = (
                 MlxSamplingParams.from_req(
@@ -1081,9 +1085,9 @@ class MlxModelRunner:
         output the scheduler discards; the logit head is skipped when the
         model exposes a headless trunk.
         """
-        assert (
-            req_id in self._req_caches
-        ), f"extend_start called for unknown request {req_id}"
+        assert req_id in self._req_caches, (
+            f"extend_start called for unknown request {req_id}"
+        )
 
         cache = self._req_caches[req_id]
 
@@ -1491,8 +1495,7 @@ class MlxModelRunner:
             cache.state = new_cache.state
             return
         raise RuntimeError(
-            f"Cannot copy {type(new_cache).__name__} state into "
-            f"{type(cache).__name__}"
+            f"Cannot copy {type(new_cache).__name__} state into {type(cache).__name__}"
         )
 
     def _decode_with_native_cache(
@@ -1680,10 +1683,8 @@ class MlxModelRunner:
         return req_id in self._req_caches
 
     def remove_request(self, req_id: str):
-        """Sync remaining decode KV to pool, then release request state."""
-        if not self.disable_radix_cache:
-            self._sync_decode_kv_to_pool(req_id)
-
+        """Release request state without syncing: decode KV reaches the pool
+        only through release_request_row, while the request owns its row."""
         self._req_token_ids.pop(req_id, None)
         self._req_sampling.pop(req_id, None)
         cache = self._req_caches.pop(req_id, None)
