@@ -61,6 +61,7 @@ from sglang.srt.models.deepseek_common.utils import (
     enable_nextn_moe_bf16_cast_to_fp8,
     is_wint4afp8_or_wint4a16_config,
 )
+from sglang.srt.runtime_context import get_model
 from sglang.srt.utils import bind_or_assign, get_bool_env_var, log_info_on_rank0
 
 if _use_aiter_gfx95:
@@ -262,7 +263,9 @@ class DeepseekV2WeightLoaderMixin:
             assert self.num_fused_shared_experts == 1
             log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
 
-        with concurrent.futures.ThreadPoolExecutor() as executor:
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=get_model().weight_loader_copy_num_threads
+        ) as executor:
             futures = []
             params_dict = dict(self.named_parameters())
             indexer_present_prefixes = {
