@@ -68,6 +68,7 @@ __global__ void TreeSpeculativeSamplingTargetOnly(
   accept_index[bx * num_speculative_tokens] = last_accepted_retrive_idx;
   uint32_t num_accepted_tokens = 0;
   IdType2 cur_index = 0;
+  IdType2 last_rejected_token_id = -1;
 
   for (uint32_t j = 1; j < num_speculative_tokens; ++j) {
     cur_index = retrive_next_token[bx * num_draft_tokens + cur_index];
@@ -81,6 +82,7 @@ __global__ void TreeSpeculativeSamplingTargetOnly(
       if (has_target_mass && (coin < prob_acc / threshold_acc || target_prob_single >= threshold_single)) {
         // accept token
         prob_acc = 0.;
+        last_rejected_token_id = -1;
         cur_prob_offset = (bx * num_draft_tokens + cur_index) * d;
         coin = uniform_samples[bx * num_draft_tokens + cur_index];
         predicts[last_accepted_retrive_idx] = draft_token_id;
@@ -89,6 +91,9 @@ __global__ void TreeSpeculativeSamplingTargetOnly(
         last_accepted_retrive_idx = draft_index;
         break;
       } else {
+        if (has_target_mass) {
+          last_rejected_token_id = draft_token_id;
+        }
         // FIXME: leverage draft probs
         draft_probs[cur_prob_offset + draft_token_id] = target_probs[cur_prob_offset + draft_token_id];
         cur_index = retrive_next_sibling[bx * num_draft_tokens + cur_index];
@@ -164,7 +169,8 @@ __global__ void TreeSpeculativeSamplingTargetOnly(
   int sampled_id = temp_storage.sampled_id;
   if (sampled_id == d) {
     if (temp_storage.last_valid_id == -1) {
-      sampled_id = d - 1;
+      // Rejected candidates can exhaust target support when the rounded CDF is at or below the coin.
+      sampled_id = last_rejected_token_id != -1 ? last_rejected_token_id : d - 1;
     } else {
       sampled_id = temp_storage.last_valid_id;
     }
