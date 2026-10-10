@@ -667,6 +667,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Has to be None when cuda graph is captured.
     global_num_tokens_for_logprob_cpu: Optional[List[int]] = None
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor] = None
+    # Per DP rank, the rows the decoder SWA tail drops before the late layers;
+    # None when no rank trims (see DeepseekV4Model's late-layer DP switch).
+    global_decoder_trim_rows_cpu: Optional[List[int]] = None
 
     # Real (non-padding) token count, held at two scopes whose meaning never
     # changes once set:
@@ -762,6 +765,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For ngram embedding
     ngram_embedding_info: Optional[NgramEmbeddingInfo] = None
     encoder_swa_replay: bool = False
+    # Encoder replay folded into the extend: per-row window floor [num_tokens]
+    # int64 (the request's replay start, 0 for other requests), and per-request
+    # leading replay rows the low-ratio compressors skip [bs] int32.
+    encoder_swa_row_floor: Optional[torch.Tensor] = None
+    encoder_swa_compress_skip: Optional[torch.Tensor] = None
+    encoder_swa_compress_rows: Optional[torch.Tensor] = None  # non-replay rows, int64
 
     # DeepSeek-V4.1 engram, extend only: the n - 1 tokens before each request's
     # first extend token, oldest first, [bs, n - 1] int32 (see EngramHasher).
@@ -1114,6 +1123,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         ret.init_mlp_sync_metadata(
             batch, device, is_draft_worker=model_runner.is_draft_worker
         )
+        if not model_runner.is_draft_worker:
+            ret.global_decoder_trim_rows_cpu = batch.global_decoder_trim_rows
 
         if ret.forward_mode.is_idle():
             ret.positions = torch.empty((0,), dtype=torch.int64, device=device)

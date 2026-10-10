@@ -94,6 +94,7 @@ from sglang.srt.layers.dp_attention import (
     is_allocation_symmetric,
     is_dp_attention_enabled,
     is_dp_gatherv_active,
+    set_dp_buffer_len_from_batch,
 )
 from sglang.srt.layers.engram import Engram, EngramHasher, EngramLayout
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
@@ -2674,6 +2675,46 @@ def _every_row_routed(forward_batch: ForwardBatch, num_rows: int):
         ) = saved
 
 
+def _enter_dp_late_layers(forward_batch: ForwardBatch) -> tuple:
+    """Resize the DP gather to the late layers' rows: every rank, trimming or
+    not, drops the rows its decoder tail trims. Returns what the exit restores."""
+    # MAX_LEN pads every rank to one width; only SUM_LEN slots can shrink per rank.
+    assert not forward_batch.dp_padding_mode.is_max_len()
+    full = forward_batch.global_num_tokens_padded_cpu
+    trims = forward_batch.global_decoder_trim_rows_cpu
+    late = [n - t for n, t in zip(full, trims, strict=True)]
+    assert min(late) >= 0, (full, trims)
+    saved = (
+        forward_batch.global_num_tokens_cpu,
+        forward_batch.global_num_tokens_padded_cpu,
+        forward_batch.global_num_tokens_gpu,
+        forward_batch.global_dp_buffer_len,
+        forward_batch.dp_local_start_pos,
+        forward_batch.dp_local_num_tokens,
+    )
+    forward_batch.global_num_tokens_cpu = late
+    forward_batch.global_num_tokens_padded_cpu = late
+    forward_batch.global_num_tokens_gpu = torch.tensor(late, dtype=torch.int64).to(
+        forward_batch.global_num_tokens_gpu.device, non_blocking=True
+    )
+    forward_batch.global_dp_buffer_len = sum(late)
+    forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
+    set_dp_buffer_len_from_batch(forward_batch)
+    return saved
+
+
+def _exit_dp_late_layers(forward_batch: ForwardBatch, saved: tuple) -> None:
+    (
+        forward_batch.global_num_tokens_cpu,
+        forward_batch.global_num_tokens_padded_cpu,
+        forward_batch.global_num_tokens_gpu,
+        forward_batch.global_dp_buffer_len,
+        forward_batch.dp_local_start_pos,
+        forward_batch.dp_local_num_tokens,
+    ) = saved
+    set_dp_buffer_len_from_batch(forward_batch)
+
+
 class DeepseekV4DecoderLayer(nn.Module):
     def __init__(
         self,
@@ -3939,6 +3980,8 @@ class DeepseekV4Model(nn.Module):
                 0,
                 1,
             }, f"late layers must not compress on their own, got ratios {late_ratios}"
+            # Under DP attention the late layers' gather carries no token ids.
+            assert self.late_layer_start >= getattr(config, "num_hash_layers", 0)
 
     def get_input_embeddings(self) -> nn.Module:
         return self.embed_tokens
@@ -4046,7 +4089,7 @@ class DeepseekV4Model(nn.Module):
             self._check_late_layer_tail_readers(forward_batch)
             attn_backend = get_attn_backend()
             tail = attn_backend.tail_forward_metadata.late_layer_tail
-        saved_full = None
+        saved_full = saved_dp = None
         # A pending post never meets a residual reader: the HIP boundary's defer_post
         # gate excludes Engram/DSpark-capture layers and the model end.
         # mHC assumes full token rows per rank; LayerNorm SP needs its own path.
@@ -4064,6 +4107,14 @@ class DeepseekV4Model(nn.Module):
                 positions = tail.positions
                 if hash_ids is not None:
                     hash_ids = tail.rows(hash_ids)
+            if (
+                i == self.late_layer_start
+                and forward_batch.global_decoder_trim_rows_cpu is not None
+            ):
+                # A DP rank trims to its tail, so every rank's MoE gather resizes;
+                # late layers are not hash-routed and read no gathered token ids.
+                saved_dp = _enter_dp_late_layers(forward_batch)
+                input_ids_global = None
             engram = self.layers[i].engram
             if engram is not None:
                 before_engram = state.residual
@@ -4119,6 +4170,8 @@ class DeepseekV4Model(nn.Module):
                     seam_open=tail is None,
                 )
         state = state.materialized(self.layers[self.end_layer - 1].hc_cfg)
+        if saved_dp is not None:
+            _exit_dp_late_layers(forward_batch, saved_dp)
         if saved_full is not None:
             attn_backend.exit_late_layer_tail(saved_full, forward_batch)
             return state.residual, state.pre, tail
