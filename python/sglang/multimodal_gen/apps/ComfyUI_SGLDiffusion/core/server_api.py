@@ -5,7 +5,7 @@ Provides a low-level interface for interacting with SGLang Diffusion HTTP server
 
 import os
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 import requests
 
@@ -228,9 +228,15 @@ class SGLDiffusionServerAPI:
         input_reference: Optional[str] = None,
         output_path: Optional[str] = None,
         extra_fields: Optional[Dict[str, Any]] = None,
+        progress_callback: Optional[Callable[[int], None]] = None,
+        check_interrupt: Optional[Callable[[], None]] = None,
     ) -> Dict[str, Any]:
         """
         Generate a video using SGLang Diffusion API and wait for completion.
+
+        ``progress_callback`` gets the job's ``progress`` (0-100) on each poll.
+        ``check_interrupt`` is called between polls and may raise to stop
+        waiting; the server has no abort yet, so the job itself keeps running.
 
         Args:
             prompt: Text prompt for video generation
@@ -350,6 +356,8 @@ class SGLDiffusionServerAPI:
             start_time = time.time()
 
             while time.time() - start_time < max_wait_time:
+                if check_interrupt:
+                    check_interrupt()
                 try:
                     status_response = requests.get(
                         f"{self.base_url}/videos/{video_id}",
@@ -361,6 +369,9 @@ class SGLDiffusionServerAPI:
 
                     # Reset error counter on successful request
                     consecutive_errors = 0
+
+                    if progress_callback and status.get("progress") is not None:
+                        progress_callback(int(status["progress"]))
 
                     if status.get("status") == "completed":
                         return self._localize_video_result(
@@ -390,7 +401,11 @@ class SGLDiffusionServerAPI:
                             f"Network error after {consecutive_errors} consecutive failures: {str(e)}"
                         )
 
-                time.sleep(poll_interval)
+                # Sleep in short slices so Cancel is honoured within ~1s.
+                for _ in range(poll_interval):
+                    if check_interrupt:
+                        check_interrupt()
+                    time.sleep(1)
 
             raise TimeoutError(
                 f"Video generation timed out after {max_wait_time} seconds"

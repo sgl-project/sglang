@@ -793,6 +793,90 @@ def test_ensure_executor_wakes_a_sleeping_worker(monkeypatch):
     ]
 
 
+# --- server-mode video jobs: no progress bar, Cancel was ignored ------------
+
+
+def _video_client_with_statuses(statuses):
+    client = SGLDiffusionServerAPI(base_url="http://127.0.0.1:1234")
+    polled = iter(statuses)
+
+    def fake_get(url, **kwargs):
+        return _Response(next(polled))
+
+    def fake_post(url, **kwargs):
+        return _Response({"id": "vid1"})
+
+    return client, fake_get, fake_post
+
+
+def test_generate_video_reports_server_progress():
+    client, fake_get, fake_post = _video_client_with_statuses(
+        [
+            {"status": "queued", "progress": 0},
+            {"status": "in_progress", "progress": 40},
+            {"status": "completed", "progress": 100, "file_path": "/tmp/x.mp4"},
+        ]
+    )
+    seen = []
+    with (
+        mock.patch.object(SERVER_API.requests, "get", fake_get),
+        mock.patch.object(SERVER_API.requests, "post", fake_post),
+        mock.patch.object(SERVER_API.time, "sleep"),
+        mock.patch.object(client, "_localize_video_result", lambda s, *a: s),
+    ):
+        client.generate_video(prompt="a cat", progress_callback=seen.append)
+    assert seen == [0, 40, 100]
+
+
+def test_generate_video_stops_polling_when_interrupted():
+    client, fake_get, fake_post = _video_client_with_statuses(
+        [{"status": "in_progress", "progress": 10}] * 50
+    )
+    checks = {"n": 0}
+
+    class Interrupted(Exception):
+        pass
+
+    def check_interrupt():
+        checks["n"] += 1
+        if checks["n"] > 2:
+            raise Interrupted()
+
+    with (
+        mock.patch.object(SERVER_API.requests, "get", fake_get),
+        mock.patch.object(SERVER_API.requests, "post", fake_post),
+        mock.patch.object(SERVER_API.time, "sleep"),
+    ):
+        with pytest.raises(Interrupted):
+            client.generate_video(prompt="a cat", check_interrupt=check_interrupt)
+    assert checks["n"] == 3  # stopped promptly, did not poll to completion
+
+
+def test_video_node_wires_comfy_progress_bar_and_interrupt():
+    client = SGLDiffusionServerAPI(base_url="http://127.0.0.1:1234")
+    node = NODES.SGLDiffusionGenerateVideo()
+    captured = {}
+
+    def fake_generate_video(**kwargs):
+        captured.update(kwargs)
+        return {"file_path": "/tmp/x.mp4", "size": "1280x720"}
+
+    with mock.patch.object(client, "generate_video", fake_generate_video):
+        node.generate_video(
+            sgld_client=client, positive_prompt="a cat", width=1280, height=720
+        )
+    captured["progress_callback"](55)
+    assert sys.modules["comfy.utils"].ProgressBar.instances[-1].values == [55]
+    sys.modules["comfy.model_management"]._test_interrupt["flag"] = True
+    try:
+        with pytest.raises(
+            sys.modules["comfy.model_management"].InterruptProcessingException
+        ):
+            captured["check_interrupt"]()
+    finally:
+        sys.modules["comfy.model_management"]._test_interrupt["flag"] = False
+
+
 def test_set_lora_wakes_a_sleeping_worker(monkeypatch):
     gen, sent = _live_generator(monkeypatch)
     gen.generator.set_lora = lambda **kw: sent.append("set_lora")
