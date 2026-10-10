@@ -253,7 +253,34 @@ class FluxPipelineConfig(ImagePipelineConfig):
             "pooled_projections": (
                 batch.pooled_embeds[0] if batch.pooled_embeds else None
             ),
-        }
+        } | self.prepare_control_residual_kwargs(batch, device, dtype)
+
+    def prepare_control_residual_kwargs(self, batch, device, dtype):
+        """Map ComfyUI ControlNet residuals in ``batch.extra`` to DiT kwargs.
+
+        Residuals arrive full-length on the sender's device and dtype; move
+        them to the compute dtype and shard them like the image latents.
+        """
+        control = (batch.extra or {}).get("comfyui_control")
+        if not control:
+            return {}
+
+        def prepare(residuals):
+            out = []
+            for residual in residuals:
+                if residual is not None:
+                    residual = residual.to(device=device, dtype=dtype)
+                    if batch.did_sp_shard_latents:
+                        residual, _ = self.shard_latents_for_sp(batch, residual)
+                out.append(residual)
+            return out
+
+        kwargs = {}
+        if control.get("input"):
+            kwargs["controlnet_block_samples"] = prepare(control["input"])
+        if control.get("output"):
+            kwargs["controlnet_single_block_samples"] = prepare(control["output"])
+        return kwargs
 
     def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
         """Build Flux negative-conditioning kwargs using T5 sequence lengths."""
