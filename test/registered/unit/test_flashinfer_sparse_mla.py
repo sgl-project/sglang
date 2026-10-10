@@ -5,11 +5,14 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.kernels.ops.attention import flash_mla_sm120
 from sglang.kernels.ops.attention.flash_mla_sm120 import (
     _validate_flashinfer_sparse_mla_backend,
+    flashinfer_dsv4_decode_supports_num_heads,
     flashinfer_sparse_mla_forward,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
@@ -125,6 +128,50 @@ class TestFlashInferSparseMLABackendGate(unittest.TestCase):
         self.assertIn("model_arch='DeepseekV3ForCausalLM'", message)
         self.assertIn("sm_major=12", message)
         self.assertIn("kv_cache_dtype=torch.float8_e4m3fn", message)
+
+
+class _MembershipOnlyDispatch:
+    """FlashInfer 0.7's dispatch envelope: answers `in`, cannot be iterated."""
+
+    def __contains__(self, pair):
+        num_heads, topk = pair
+        return 1 <= num_heads <= 128 and topk >= 1
+
+
+class TestFlashInferDSV4DecodeHeads(CustomTestCase):
+    """The native-head decode probe must read FlashInfer's dispatch through
+    membership; FlashInfer 0.7 made it a non-iterable envelope."""
+
+    def _supports(self, dispatch, num_heads, num_tokens=1):
+        sparse_mla_sm120 = ModuleType("flashinfer.mla._sparse_mla_sm120")
+        sparse_mla_sm120._DECODE_DSV4_DISPATCH = dispatch
+        sparse_mla_sm120._DECODE_MAX_TOKENS = 64
+        flash_mla_sm120._flashinfer_dsv4_decode_capabilities.cache_clear()
+        try:
+            with patch.dict(
+                sys.modules,
+                {"flashinfer.mla._sparse_mla_sm120": sparse_mla_sm120},
+            ):
+                return flashinfer_dsv4_decode_supports_num_heads(num_heads, num_tokens)
+        finally:
+            flash_mla_sm120._flashinfer_dsv4_decode_capabilities.cache_clear()
+
+    def test_membership_envelope(self):
+        dispatch = _MembershipOnlyDispatch()
+        self.assertTrue(self._supports(dispatch, 16))
+        self.assertTrue(self._supports(dispatch, 12))
+        self.assertFalse(self._supports(dispatch, 256))
+        self.assertFalse(self._supports(dispatch, 16, num_tokens=65))
+
+    def test_pair_set(self):
+        dispatch = frozenset(
+            (heads, topk)
+            for heads in (8, 16, 32, 64, 128)
+            for topk in (128, 192, 256, 512, 1024)
+        )
+        self.assertTrue(self._supports(dispatch, 16))
+        self.assertFalse(self._supports(dispatch, 12))
+        self.assertFalse(self._supports(dispatch, 16, num_tokens=65))
 
 
 if __name__ == "__main__":
