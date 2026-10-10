@@ -31,13 +31,23 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import HiCacheController
+from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheFile,
     HiCacheStorageConfig,
     MetadataCache,
+    PoolHitPolicy,
+    PoolName,
+    PoolTransfer,
 )
+from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+    HybridCacheController,
+    PrefetchOperation,
+)
+from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.storage.file.lru_file_evictor import _parse_size_to_bytes
+from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -652,6 +662,177 @@ class TestDcpStorage(unittest.TestCase):
         self.assertTrue(readers[1].exists("page"))
         self.assertEqual([b._evictor._total_bytes for b in readers], [2, 2, 0, 0])
 
+    def _hybrid_backend(self, rank, dcp=2, max_size=0):
+        cfg = _dcp_config(
+            rank,
+            dcp=dcp,
+            extra_config={
+                "max_size": max_size,
+                "min_free_space": 0,
+                "eviction_ratio": 1,
+                "enable_metadata_cache": False,
+            },
+        )
+        backend = HiCacheFile(cfg)
+        data = torch.tensor([[rank, 10], [rank, 20]], dtype=torch.uint8)
+        backend.register_mem_host_pool_v2(
+            SimpleNamespace(
+                page_size=1,
+                data=data,
+                get_data_page=lambda index, flat=False: data[index].clone(),
+                get_dummy_flat_data_page=lambda: torch.empty(2, dtype=torch.uint8),
+                set_from_flat_data_page=lambda index, value: data[index].copy_(value),
+            ),
+            PoolName.MAMBA,
+        )
+        return backend
+
+    def test_kda_keys_and_state_slots(self):
+        for dcp in (1, 2):
+            with self.subTest(dcp=dcp):
+                backends = [self._hybrid_backend(rank, dcp) for rank in range(4)]
+                self.assertEqual(
+                    len({b._get_component_key("page") for b in backends}), dcp
+                )
+                self.assertEqual(
+                    len(
+                        {b._get_component_key("page", PoolName.MAMBA) for b in backends}
+                    ),
+                    4,
+                )
+                transfer = PoolTransfer(
+                    name=PoolName.MAMBA,
+                    host_indices=torch.tensor([1]),
+                    keys=["page"],
+                    hit_policy=PoolHitPolicy.TRAILING_PAGES,
+                )
+                for rank, backend in enumerate(backends):
+                    cc = HybridCacheController.__new__(HybridCacheController)
+                    cc.storage_config = _dcp_config(rank, dcp=dcp)
+                    self.assertTrue(cc.should_backup(transfer))
+                    self.assertEqual(cc.backup_skip, rank >= dcp)
+                    # Old MLA state keys must miss, even when KV exists.
+                    backend.set("page", _t(2))
+                    backend.set("page.mamba", _t(2, 99))
+                    self.assertEqual(
+                        backend.batch_exists_v2(["page"], [transfer]).kv_hit_pages, 0
+                    )
+                    self.assertEqual(
+                        backend.batch_set_v2([transfer]), {PoolName.MAMBA: [True]}
+                    )
+                    reader = self._hybrid_backend(rank, dcp)
+                    state = reader.registered_pools[PoolName.MAMBA].data
+                    state.zero_()
+                    self.assertEqual(
+                        reader.batch_get_v2([transfer]), {PoolName.MAMBA: [True]}
+                    )
+                    torch.testing.assert_close(
+                        state, torch.tensor([[0, 0], [rank, 20]], dtype=torch.uint8)
+                    )
+
+    def test_sparse_checkpoint_intersection_and_cancelled_rank(self):
+        tokens = list(range(1024))
+        keys = get_storage_hash_str(tokens, None, page_size=128)
+        transfer = PoolTransfer(
+            name=PoolName.MAMBA,
+            keys=["__placeholder__"],
+            hit_policy=PoolHitPolicy.TRAILING_PAGES,
+        )
+        controllers, operations = [], []
+        for rank, checkpoints in enumerate(([4, 8], [4, 6])):
+            backend = self._hybrid_backend(rank)
+            for key in keys:
+                self.assertTrue(backend.set(key, _t(2)))
+            for page in checkpoints:
+                key = backend._log_key(PoolName.MAMBA, keys[page - 1])
+                self.assertTrue(backend.set(key, _t(2)))
+            result = backend.batch_exists_v2(keys, [transfer])
+            self.assertEqual(result.restorable_prefix_pages, checkpoints)
+            cc = HybridCacheController.__new__(HybridCacheController)
+            cc.storage_backend = backend
+            cc.page_size = 128
+            cc.prefetch_hits_sync_groups = []
+            # Even a KV-only hit hint must not assume every KDA boundary exists.
+            op = PrefetchOperation(
+                CacheRequestHandle("test", 0),
+                tokens,
+                pool_transfers=[transfer],
+                assume_stored=True,
+            )
+            _, hit = cc._storage_hit_query(op)
+            self.assertEqual(hit, checkpoints[-1] * 128)
+            controllers.append(cc)
+            operations.append(op)
+
+        for rank, cc in enumerate(controllers):
+            other = operations[1 - rank]
+            peer = torch.zeros(9, dtype=torch.int)
+            peer[0] = 1
+            peer[other.pool_storage_result.restorable_prefix_pages] = 1
+
+            def reduce(tensor, op, groups, peer=peer):
+                self.assertEqual(tensor.shape, peer.shape)
+                self.assertEqual(op, torch.distributed.ReduceOp.MIN)
+                tensor.copy_(torch.minimum(tensor, peer))
+
+            cc._all_reduce = mock.Mock(side_effect=reduce)
+            local = operations[rank]
+            self.assertEqual(
+                cc._sync_storage_hit_count(
+                    local, local.pool_storage_result.kv_hit_pages * 128
+                ),
+                512,
+            )
+            local.mark_terminate()
+            self.assertEqual(cc._sync_storage_hit_count(local, 0), 0)
+            self.assertEqual(cc._all_reduce.call_count, 2)
+
+    def test_eviction_owns_only_local_state_and_selected_mla(self):
+        # Ranks 0 and 2 share MLA keys. Both still own their distinct KDA files.
+        writer = self._hybrid_backend(0)
+        peer = self._hybrid_backend(2)
+        self.assertTrue(writer.set("kv", _t(2)))
+        self.assertTrue(
+            writer.set(
+                writer._log_key(PoolName.MAMBA, "state0"),
+                _t(2),
+            )
+        )
+        self.assertTrue(
+            peer.set(
+                peer._log_key(PoolName.MAMBA, "state2"),
+                _t(2),
+            )
+        )
+        backend = self._hybrid_backend(2, max_size=2)
+        owned = backend._get_component_key("state2", PoolName.MAMBA)
+        self.assertEqual(list(backend._evictor._lru), [owned])
+        # A read of shared MLA must not adopt it into rank 2's eviction ledger.
+        self.assertIsNotNone(backend.get("kv", torch.empty(2, dtype=torch.uint8)))
+        self.assertEqual(list(backend._evictor._lru), [owned])
+        self.assertFalse(backend.set("new-kv", _t(2)))
+        self.assertTrue(
+            backend.set(
+                backend._log_key(PoolName.MAMBA, "new-state"),
+                _t(2, 1),
+            )
+        )
+        self.assertFalse((Path(self.directory) / f"{owned}.bin").exists())
+        self.assertTrue(writer.exists("kv"))
+        self.assertTrue(writer.exists(writer._log_key(PoolName.MAMBA, "state0")))
+        self.assertEqual(backend._evictor._total_bytes, 2)
+        # The selected MLA writer shares one cap between its MLA and KDA files.
+        selected = self._hybrid_backend(0, max_size=4)
+        self.assertEqual(selected._evictor._total_bytes, 4)
+        self.assertTrue(
+            selected.set(
+                selected._log_key(PoolName.MAMBA, "next"),
+                _t(2, 1),
+            )
+        )
+        self.assertLessEqual(selected._evictor._total_bytes, 4)
+        self.assertTrue(backend.exists(backend._log_key(PoolName.MAMBA, "new-state")))
+
     def test_attachment_guards(self):
         for case in (
             "backend",
@@ -662,6 +843,9 @@ class TestDcpStorage(unittest.TestCase):
             "extra_pool",
             "file",
             "mooncake",
+            "file_kda",
+            "mooncake_kda",
+            "wrong_pool",
         ):
             host = MLATokenToKVPoolHost.__new__(MLATokenToKVPoolHost)
             host.kv_buffer = None if case == "dummy" else object()
@@ -674,10 +858,18 @@ class TestDcpStorage(unittest.TestCase):
             cc = HiCacheController.__new__(HiCacheController)
             cc.enable_storage = False
             cc.storage_host_pool = object() if case == "non_mla" else host
-            cc.mem_pool_host = SimpleNamespace(
-                entries=[host] * (2 if case == "extra_pool" else 1)
-            )
-            accepted = case in ("file", "mooncake")
+            entries = [SimpleNamespace(name=PoolName.KV, host_pool=host)]
+            if case in ("extra_pool", "wrong_pool", "file_kda", "mooncake_kda"):
+                entries.append(
+                    SimpleNamespace(
+                        name=PoolName.SWA if case == "extra_pool" else PoolName.MAMBA,
+                        host_pool=object()
+                        if case == "wrong_pool"
+                        else MambaPoolHost.__new__(MambaPoolHost),
+                    )
+                )
+            cc.mem_pool_host = SimpleNamespace(entries=entries)
+            accepted = case in ("file", "mooncake", "file_kda", "mooncake_kda")
             cc._stop_storage_threads = mock.Mock(
                 side_effect=RuntimeError("past validation") if accepted else None
             )
@@ -695,7 +887,7 @@ class TestDcpStorage(unittest.TestCase):
                     "nixl"
                     if case == "backend"
                     else "mooncake"
-                    if case == "mooncake"
+                    if case.startswith("mooncake")
                     else "file"
                 )
             self.assertEqual(cc._stop_storage_threads.call_count, int(accepted))
