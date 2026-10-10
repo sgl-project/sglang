@@ -541,7 +541,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             with self.subTest(num_qo_tokens=num_qo_tokens):
                 backend = self._make_prefill_backend()
                 build = backend._build_sparse_prefill_chunk_cache
-                backend._sparse_prefill_direct = True
+                backend.forward_metadata.sparse_prefill_direct = True
 
                 with (
                     envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.override(False),
