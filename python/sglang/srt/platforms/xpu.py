@@ -10,7 +10,7 @@ from sglang.srt.platforms.device_mixin import (
     DeviceMixin,
     PlatformEnum,
 )
-from sglang.srt.platforms.interface import SRTPlatform
+from sglang.srt.platforms.interface import PlatformCapabilities, SRTPlatform
 
 logger = logging.getLogger(__name__)
 
@@ -30,8 +30,8 @@ class XpuDeviceMixin(DeviceMixin):
     ) -> float:
         return float(torch.xpu.max_memory_allocated(device))
 
-    def get_device(self, local_rank: int) -> "torch.device":
-        return torch.device("xpu", local_rank)
+    def get_device(self, device_id: int = 0) -> "torch.device":
+        return torch.device("xpu", device_id)
 
     def set_device(self, device: "torch.device") -> None:
         torch.xpu.set_device(device)
@@ -94,11 +94,8 @@ class XpuDeviceMixin(DeviceMixin):
 class XpuSRTPlatform(XpuDeviceMixin, SRTPlatform):
     """Default in-tree XPU SRT platform."""
 
-    def supports_fp8(self) -> bool:
-        return False
-
-    def support_cuda_graph(self) -> bool:
-        return True
-
-    def support_piecewise_cuda_graph(self) -> bool:
-        return True
+    capabilities = PlatformCapabilities(
+        supports_triton=True,
+        graph_capture=True,
+        piecewise_graph=True,
+    )

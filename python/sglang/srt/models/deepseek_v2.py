@@ -97,6 +97,7 @@ from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
+    LinearParallelGroup,
     MergedColumnParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
@@ -282,13 +283,13 @@ class DeepseekV2MLP(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         reduce_results: bool = True,
         prefix: str = "",
-        tp_rank: Optional[int] = None,
-        tp_size: Optional[int] = None,
         swiglu_limit: Optional[float] = None,
         allow_fused_down: Optional[bool] = None,
+        *,
+        parallel_group: LinearParallelGroup = "tp",
     ) -> None:
         super().__init__()
-        self.tp_size = tp_size
+        self.is_replicated = parallel_group == "replicated"
         self.swiglu_limit = swiglu_limit
         # The fused down path calls deepgemm directly and runs no all-reduce.
         self.allow_fused_down = (
@@ -301,8 +302,7 @@ class DeepseekV2MLP(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("gate_up_proj", prefix),
-            tp_rank=tp_rank,
-            tp_size=tp_size,
+            parallel_group=parallel_group,
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
@@ -311,8 +311,7 @@ class DeepseekV2MLP(nn.Module):
             quant_config=quant_config,
             reduce_results=reduce_results,
             prefix=add_prefix("down_proj", prefix),
-            tp_rank=tp_rank,
-            tp_size=tp_size,
+            parallel_group=parallel_group,
         )
         if not hasattr(self.gate_up_proj, "weight") and hasattr(
             self.gate_up_proj, "weight_packed"
@@ -338,7 +337,7 @@ class DeepseekV2MLP(nn.Module):
         gemm_output_zero_allocator: BumpAllocator = None,
         gateup_pre_quant: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ):
-        if (self.tp_size == 1) and x.shape[0] == 0:
+        if self.is_replicated and x.shape[0] == 0:
             return x
 
         if (
@@ -827,7 +826,7 @@ class DeepseekV2MoE(nn.Module):
                 reduce_results=False,
                 swiglu_limit=getattr(config, "swiglu_limit", None),
                 prefix=add_prefix("shared_experts", prefix),
-                **(dict(tp_rank=0, tp_size=1) if _shared_expert_use_tp1 else {}),
+                parallel_group="replicated" if _shared_expert_use_tp1 else "tp",
             )
             # Flags must be set before weight load so
             # process_weights_after_loading sees them and builds the
@@ -1776,7 +1775,8 @@ class DeepseekV2MoE(nn.Module):
             if gate_up.weight.shape[0] % 64 != 0 or gate_up.weight.shape[1] % 128 != 0:
                 return False, "gate_up weight shape unsupported by deepgemm"
         else:
-            return False, f"w8a8 linear backend {linear_fn.__name__} unsupported"
+            backend_name = getattr(linear_fn, "__name__", type(linear_fn).__name__)
+            return False, f"w8a8 linear backend {backend_name} unsupported"
         # Routed side: standard dispatcher + triton fused func with dynamic
         # per-token-group-128 fp8 activation quant.
         experts = self.experts
@@ -2016,7 +2016,6 @@ class DeepseekV2AttentionMLA(
         self.kv_lora_rank = kv_lora_rank
         self.quant_config = quant_config
         self.is_nextn = is_nextn
-        attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
         self.use_dsa = is_deepseek_dsa(config)
         self.num_heads = num_heads
@@ -2047,8 +2046,7 @@ class DeepseekV2AttentionMLA(
                 bias=False,
                 quant_config=self._get_q_b_proj_quant_config(quant_config),
                 prefix=add_prefix("q_b_proj", prefix),
-                tp_rank=attn_tp_rank,
-                tp_size=attn_tp_size,
+                parallel_group="attn_tp",
             )
         else:
             self.q_proj = ColumnParallelLinear(
@@ -2057,8 +2055,7 @@ class DeepseekV2AttentionMLA(
                 bias=False,
                 quant_config=quant_config,
                 prefix=add_prefix("q_proj", prefix),
-                tp_rank=attn_tp_rank,
-                tp_size=attn_tp_size,
+                parallel_group="attn_tp",
             )
             self.kv_a_proj_with_mqa = ReplicatedLinear(
                 self.hidden_size,
@@ -2116,8 +2113,7 @@ class DeepseekV2AttentionMLA(
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("kv_b_proj", prefix),
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
         )
         # O projection.
         self.o_proj = RowParallelLinear(
@@ -2127,8 +2123,7 @@ class DeepseekV2AttentionMLA(
             quant_config=quant_config,
             reduce_results=reduce_results,
             prefix=add_prefix("o_proj", prefix),
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
         )
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
 
@@ -2611,18 +2606,14 @@ class DeepseekV2DecoderLayer(nn.Module):
                 reduce_results=False,
             )
         else:
-            if is_dense_ffn_fully_dp():
-                mlp_tp_rank, mlp_tp_size = 0, 1
-            else:
-                mlp_tp_rank, mlp_tp_size = None, None
+            mlp_parallel_group = "replicated" if is_dense_ffn_fully_dp() else "tp"
             self.mlp = DeepseekV2MLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
-                tp_rank=mlp_tp_rank,
-                tp_size=mlp_tp_size,
+                parallel_group=mlp_parallel_group,
                 swiglu_limit=getattr(config, "swiglu_limit", None),
                 reduce_results=False,
                 allow_fused_down=False,

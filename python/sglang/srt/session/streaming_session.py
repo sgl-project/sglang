@@ -4,8 +4,6 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
-import torch
-
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
@@ -138,12 +136,8 @@ class StreamingSession:
 
         self._free_tail(req.kv, prefix_len)
 
-        device_indices = self.cache.req_to_token_pool.req_to_token[
-            req.kv.req_pool_idx, :prefix_len
-        ].to(dtype=torch.int64)
-
         return MatchResult(
-            device_indices=device_indices,
+            device_prefix_len=prefix_len,
             last_device_node=slot.virtual_node,
             last_host_node=slot.virtual_node,
             best_match_node=slot.virtual_node,
@@ -188,10 +182,8 @@ class StreamingSession:
         return True
 
     def try_checkpoint(self, req: Req, *, up_to: int, **kwargs) -> bool:
-        """A turn on the slot's record publishes nothing of its own, so only
-        the chunk cursor is kept. The exception is the first prompt: the slot
-        publishes it for other requests to share, and its lock follows the
-        insert."""
+        # A turn publishes nothing of its own, except the first prompt: the slot
+        # publishes it for other requests to share, and its lock follows the insert.
         slot = self.borrowed_slot(req)
         if slot is None:
             return False
@@ -199,11 +191,6 @@ class StreamingSession:
             req.lock, slot.lock = slot.lock, None
             self.cache.checkpoint_into_tree(req, up_to=up_to, **kwargs)
             self._lock_to_slot(req, slot)
-            return True
-        kv_indices = self.cache.req_to_token_pool.req_to_token[
-            req.kv.req_pool_idx, :up_to
-        ]
-        req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
         return True
 
     # -- Record ownership --
@@ -293,9 +280,9 @@ class StreamingSession:
     def _free_kv_aligned(self, kv: ReqKvInfo, target: int, end: int) -> None:
         """Free [ceil_align(target), end): paged free returns whole pages, so
         the partial page stays until release_session."""
-        if end <= target:
-            return
         start = target
         if self.cache.page_size > 1:
             start = ceil_align(start, self.cache.page_size)
+        if end <= start:
+            return
         self.cache.free_kv_row(kv, [(start, end)])
