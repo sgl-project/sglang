@@ -318,6 +318,39 @@ std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule_cpu(
     const at::Tensor& initial_state_indices,
     double eps = 1e-6);
 
+at::Tensor selective_state_update_cpu(
+    at::Tensor& state,
+    const at::Tensor& x,
+    const at::Tensor& dt,
+    const at::Tensor& A,
+    const at::Tensor& B,
+    const at::Tensor& C,
+    const std::optional<at::Tensor>& D,
+    const std::optional<at::Tensor>& z,
+    const std::optional<at::Tensor>& dt_bias,
+    bool dt_softplus,
+    const std::optional<at::Tensor>& state_batch_indices,
+    int64_t pad_slot_id,
+    bool disable_state_update,
+    const std::optional<at::Tensor>& out);
+
+std::tuple<at::Tensor, at::Tensor> mamba_chunk_scan_combined_cpu(
+    const at::Tensor& x,
+    const at::Tensor& dt,
+    const at::Tensor& A,
+    const at::Tensor& B,
+    const at::Tensor& C,
+    int64_t chunk_size,
+    const std::optional<at::Tensor>& D,
+    const std::optional<at::Tensor>& z,
+    const std::optional<at::Tensor>& dt_bias,
+    const std::optional<at::Tensor>& initial_states,
+    bool dt_softplus,
+    double dt_min,
+    double dt_max,
+    const std::optional<at::ScalarType>& state_dtype,
+    const std::optional<at::Tensor>& out);
+
 // weight prepack
 at::Tensor convert_weight_packed(at::Tensor& weight);
 
@@ -824,6 +857,18 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor initial_state, bool output_final_state, Tensor cu_seqlens, bool head_first, "
       "bool use_qk_l2norm_in_kernel, Tensor initial_state_indices, float eps=1e-6) -> (Tensor, Tensor)");
   m.impl("chunk_gated_delta_rule_cpu", torch::kCPU, &chunk_gated_delta_rule_cpu);
+
+  m.def(
+      "selective_state_update_cpu(Tensor(a!) state, Tensor x, Tensor dt, Tensor A, Tensor B, Tensor C, "
+      "Tensor? D, Tensor? z, Tensor? dt_bias, bool dt_softplus, Tensor? state_batch_indices, "
+      "int pad_slot_id, bool disable_state_update, Tensor? out) -> Tensor");
+  m.impl("selective_state_update_cpu", torch::kCPU, &selective_state_update_cpu);
+
+  m.def(
+      "mamba_chunk_scan_combined_cpu(Tensor x, Tensor dt, Tensor A, Tensor B, Tensor C, int chunk_size, "
+      "Tensor? D, Tensor? z, Tensor? dt_bias, Tensor? initial_states, bool dt_softplus, float dt_min, "
+      "float dt_max, ScalarType? state_dtype, Tensor? out) -> (Tensor, Tensor)");
+  m.impl("mamba_chunk_scan_combined_cpu", torch::kCPU, &mamba_chunk_scan_combined_cpu);
 
   // weight prepack
   m.def("convert_weight_packed(Tensor weight) -> Tensor");
