@@ -2,7 +2,10 @@ import json
 import unittest
 
 from sglang.srt.entrypoints.openai.protocol import Function, Tool
-from sglang.srt.function_call.glm47_moe_detector import Glm47MoeDetector
+from sglang.srt.function_call.glm47_moe_detector import (
+    Glm47MoeDetector,
+    parse_arguments,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -356,6 +359,20 @@ class TestGlm47SchemaTypes(unittest.TestCase):
             json.loads("".join(call.parameters for call in first.calls + last.calls)),
             {"value": "hello"},
         )
+
+    def test_bare_comma_value_is_not_split_into_an_array(self):
+        """#43147: "1,000" for a number arg reached the tool as [1, 0]."""
+        self.check_arguments(
+            {"type": "object", "properties": {"n": {"type": "number"}}},
+            {"n": "1,000"},
+        )
+
+    def test_parse_arguments_bare_comma(self):
+        """#43147: literal_eval turns a bare comma into a tuple. Non-array args
+        keep the raw string; array args keep the list they got before."""
+        self.assertEqual(parse_arguments("1,000", "number"), ("1,000", True))
+        self.assertEqual(parse_arguments('"a","b"', "object"), ('"a","b"', True))
+        self.assertEqual(parse_arguments("1, 2", "array"), ([1, 2], True))
 
 
 if __name__ == "__main__":
