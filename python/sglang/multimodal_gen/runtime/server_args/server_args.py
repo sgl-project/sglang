@@ -810,24 +810,28 @@ class ServerArgs(DisaggServerArgsMixin):
 
         pipeline_config = getattr(self, "pipeline_config", None)
         pipeline_config_name = type(pipeline_config).__name__
-        if (
+        # The lists record validated checkpoints, not what can capture. An
+        # explicit request elsewhere stays on with a warning: warmup reports a
+        # denoising stage that captures nothing, and a captured segment that
+        # branches on Python-side state replays its capture-time branch.
+        if not (
             pipeline_config_name in BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS
             and self._is_breakable_cuda_graph_supported_model()
         ):
-            if not self.warmup_resolutions:
-                self._default_bcg_warmup_resolution()
-            return
-
-        logger.warning(
-            "[Diffusion BCG] disabled for %s: only Anima Base v1.0, FLUX.1-dev, "
-            "FLUX.2-Klein, Ideogram-4, jdopensource/JoyAI-Echo, Lightricks/LTX-2, "
-            "LongCat-Image, MiniMax-H3, Qwen/Qwen-Image, Qwen/Qwen-Image-2512, "
-            "Qwen/Qwen-Image-2.1, SANA1.5, "
-            "SANA-Video, Tongyi-MAI/Z-Image/Z-Image-Turbo, and "
-            "zai-org/GLM-Image are currently supported.",
-            pipeline_config_name,
-        )
-        self.enable_breakable_cuda_graph = False
+            logger.warning(
+                "[Diffusion BCG] not validated for %s (%s); enabling it as "
+                "requested. Warmup warns if nothing gets captured; compare outputs "
+                "against eager before relying on it. Validated: Anima Base v1.0, "
+                "FLUX.1-dev, FLUX.2-Klein, "
+                "Ideogram-4, jdopensource/JoyAI-Echo, Lightricks/LTX-2, "
+                "LongCat-Image, MiniMax-H3, Qwen/Qwen-Image, Qwen/Qwen-Image-2512, "
+                "Qwen/Qwen-Image-2.1, SANA1.5, SANA-Video, "
+                "Tongyi-MAI/Z-Image/Z-Image-Turbo, and zai-org/GLM-Image.",
+                pipeline_config_name,
+                self.model_path,
+            )
+        if not self.warmup_resolutions:
+            self._default_bcg_warmup_resolution()
 
     def _is_breakable_cuda_graph_supported_model(self) -> bool:
         refs = _normalized_bcg_model_refs(self.model_id)

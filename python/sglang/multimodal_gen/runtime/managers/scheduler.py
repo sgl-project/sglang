@@ -204,6 +204,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         self._warmup_processed = 0
         self._warmup_progress_bar: Any | None = None
         self._logged_server_ready_after_warmup = False
+        self._checked_bcg_capture = False
 
         # Maximum consecutive errors before terminating the event loop
         self._max_consecutive_errors = 3
