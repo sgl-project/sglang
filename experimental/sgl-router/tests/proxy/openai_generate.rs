@@ -99,6 +99,26 @@ async fn an_aborted_choice_ends_the_stream_at_once() {
     assert_eq!(events[1..], ["[DONE]"]);
 }
 
+/// The engine's `[DONE]` finishes the request, so its stream is read to the
+/// end rather than dropped, which would abort the finished request.
+#[tokio::test]
+async fn a_finished_stream_sends_no_abort() {
+    let frames = vec![
+        "data: {\"text\":\"ok\",\"meta_info\":{\"id\":\"r\",\"finish_reason\":{\"type\":\"stop\"}}}\n\n",
+        "data: [DONE]\n\n",
+        "", // the engine closes its body a moment after `[DONE]`
+    ];
+    let engine = MockWorker::start_slow_stream(frames, Duration::from_millis(50)).await;
+    let app = openai_router(&[(&engine, WorkerMode::Plain)]);
+
+    let request = json!({"model": MODEL, "prompt": "hi", "stream": true});
+    let (status, body) = complete(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(parse_sse_data(&body).last().unwrap(), "[DONE]");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(engine.abort_log.lock().unwrap().is_empty());
+}
+
 #[tokio::test]
 async fn completions_go_to_the_engine_route_when_unsupported() {
     let engine = MockWorker::start(vec![]).await;

@@ -1,15 +1,34 @@
 ---
 title: Wan-Animate-2
+tag: NEW
 description: Run Wan-Animate-2 character animation (reference image + reference video) with SGLang Diffusion.
 metatags:
     description: "Deploy and use the Wan2.2-Animate-2 14B character-animation model with SGLang Diffusion: reference-image + reference-video conditioning, single-expert native pipeline, config-file and /v1/videos invocation, and multi-GPU presets."
 ---
 
 import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
+import { Deployment } from '/src/snippets/_deployment.jsx';
+import { config } from '/src/snippets/configs/Wan/wan-animate-2.jsx';
 
 <DiffusionModelTags tags={["video", "character animation", "image + reference video", "single-expert", "640×800 / 720×1280"]} />
 
-## 1. Model Introduction
+<a id="2-sglang-diffusion-installation" />
+<a id="3-1-basic-configuration" />
+
+## 1. Quick start
+
+Follow the [installation guide](/docs/sglang-diffusion/installation) on Linux with
+NVIDIA CUDA, then select a verified recipe.
+
+<Deployment config={config} />
+
+Provide both a reference image and a server-readable reference video. See
+[HTTP invocation](#4-2-serve-and-request-over-http) for polling and downloading
+the finished video.
+
+<a id="1-model-introduction" />
+
+## 2. Model capabilities
 
 [Wan-Animate-2](https://huggingface.co/Wan-AI/Wan2.2-Animate-2-14B-Diffusers) is a
 14B character-animation model in the Wan2.2 family. Instead of the text- or
@@ -36,7 +55,9 @@ reference image and a reference video, so it is invoked differently from the
 other Wan2.2 models. See [section 4](#4-model-invocation).
 </Warning>
 
-### 1.1 Inputs
+<a id="1-1-inputs" />
+
+### 2.1 Inputs
 
 | Input | Field | Passed via |
 | --- | --- | --- |
@@ -50,7 +71,9 @@ online API forwards `video_path` into the pipeline while the reference image rid
 `input_reference`. Local paths must be readable by the server process. HTTP(S)
 video URLs use SGLang's shared media loader before decoding, without a disk cache.
 
-### 1.2 Defaults
+<a id="1-2-defaults" />
+
+### 2.2 Defaults
 
 | Parameter | Default | Notes |
 | --- | --- | --- |
@@ -129,25 +152,16 @@ not general speedup claims; both comparisons used PyTorch 2.13.0+cu130,
 Transformers 5.12.1, and Diffusers 0.37.0. The baseline was the initial native
 implementation, not the official Diffusers implementation.
 
-## 2. SGLang-diffusion Installation
-
-SGLang-diffusion offers multiple installation methods. You can choose the most
-suitable installation method based on your hardware platform and requirements.
-
-Please refer to the [official SGLang-diffusion installation guide](/docs/sglang-diffusion/installation)
-for installation instructions.
-
 ## 3. Model Deployment
 
-### 3.1 Basic Configuration
+### 3.1 Recommended configurations
 
-On a single high-VRAM GPU, launch the native pipeline with:
-
-```bash Command
-sglang serve \
-  --model-path Wan-AI/Wan2.2-Animate-2-14B-Diffusers \
-  --port 30010
-```
+Start with **Auto**, or choose **Memory** for more GPU headroom. Memory usage
+depends on the input video, pixel-area budget, and `clip_len`; see the
+[hardware comparison](#5-1-hardware-comparison) for measured configurations.
+For two B300 GPUs, set **GPUs / node** to **2** and **Memory policy** to **CFG parity**;
+**Auto** CFG parallelism enables the measured two-GPU recipe. The RTX 4090 entry
+selects its single-GPU memory recipe.
 
 Routing to the native Wan-Animate-2 pipeline is automatic from the checkpoint's
 `model_index.json` (`_class_name: WanAnimate2Pipeline`); pass
@@ -169,12 +183,13 @@ acceleration features and their runtime requirements.
 
 | Target | Recommended server flags | Notes |
 | --- | --- | --- |
-| 1 GPU, 96 GB or more | *(no extra flags)* | DiT resident: about 70 GiB peak per GPU at the default workload. Add `--text-encoder-cpu-offload` to keep the fp32 text encoder off the GPU. |
-| 1 GPU, 80 GB | `--dit-layerwise-offload --layerwise-offload-components transformer` | Streams the DiT layer by layer: about 40 GiB peak at the same end-to-end time as the resident DiT; output identical. |
+| 1 GPU, ample VRAM | *(no extra flags)* | Automatic placement. Start here on H200 or B300. On H200, `speed` used more memory without improving measured latency. |
+| 1 GPU, memory priority | `--performance-mode memory` | Layerwise offload for supported components. On the measured H200 workload, 31.7 GiB peak versus 68.9 GiB with auto, at nearly the same latency and identical RGB output. |
+| 1x RTX 4090, 24 GB | `--performance-mode memory` with `PYTORCH_ALLOC_CONF=expandable_segments:True` | Short-video recipe with little spare VRAM. The default allocator OOMed on the measured workload; offload also requires sufficient host RAM. |
 | 2+ GPUs, long sequences | `--num-gpus N --ulysses-degree N` | Sequence parallel across ranks (ring degree stays 1). |
 | 2+ GPUs, large DiT | `--num-gpus N --tp-size N` | Tensor parallel across attention heads. With `--tp-size` smaller than `--num-gpus` (or than half of it with `--enable-cfg-parallel`), the leftover GPUs are auto-assigned to Ulysses sequence parallelism (last row). |
 | 2 GPUs, split CFG | `--num-gpus 2 --enable-cfg-parallel` | Splits the guided/unguided branches. |
-| 2 GPUs, 80 GB cards | `--num-gpus 2 --enable-cfg-parallel --dit-layerwise-offload --layerwise-offload-components transformer --encoder-parallel replicate --vae-config.use-parallel-decode false` with `SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D=1` | Same speed as resident CFG-parallel at about 43 GiB per GPU, output bit-identical to a single GPU (the CI configuration). |
+| 2x B300, recommended | **CFG parity** in the picker: `--num-gpus 2 --enable-cfg-parallel --dit-layerwise-offload --layerwise-offload-components transformer --encoder-parallel replicate --vae-config.use-parallel-decode false` with `SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D=1` | 54.03 s, 39.53 GiB peak per GPU, and RGB identical to the single-B300 baseline. Only 0.50 s slower than plain CFG, with substantially less GPU memory. |
 | 4 GPUs | `--num-gpus 4 --enable-cfg-parallel --ulysses-degree 2` | CFG-parallel across two pairs of Ulysses ranks: the fastest 4-GPU layout; pass the flags explicitly to pin the layout instead of relying on the automatic assignment. Ulysses shards the attention sequence, so 4-GPU outputs match the single-GPU video to about 30 dB mean PSNR rather than bit for bit. On 80 GB cards add `--dit-layerwise-offload --layerwise-offload-components transformer` (about 35 GiB per GPU, same speed). |
 | FSDP sharding | `--use-fsdp-inference` is **not supported** | Rejected at startup, before any weights load; use `--tp-size` to shard the DiT or `--dit-layerwise-offload` to cut peak memory. |
 | 4+ GPUs, TP x Ulysses | `--num-gpus 4 --tp-size 2 --ulysses-degree 2` | Tensor parallel across attention heads, Ulysses across the TP-local heads: `--tp-size` must divide the 40 heads and `--ulysses-degree` the per-shard count (`40 / tp`). The memory-leaning 4-GPU layout: about 33 GiB peak per GPU (25 GiB torch reserved), the lowest 4-GPU peak after `--tp-size 4`, at about 13 percent slower than CFG-parallel x tensor parallel and 27 percent slower than the default CFG-parallel x Ulysses layout; use the default for speed and this layout for memory. CFG-parallel can be added on top with twice the GPUs (`--num-gpus 8 --enable-cfg-parallel --tp-size 2 --ulysses-degree 2`). |
@@ -216,7 +231,7 @@ Any value in the YAML can also be passed as a CLI flag (for example
 `POST /v1/videos` creates an asynchronous job. Send the **reference image** as the
 `input_reference` part and the **reference video** as `video_path`, then poll
 the job and download the finished MP4. `size` is the pixel-area budget described in
-[section 1.2](#1-2-defaults); the output dimensions follow the reference image's
+[section 2.2](#2-2-defaults); the output dimensions follow the reference image's
 aspect ratio.
 
 ```bash Command
@@ -229,6 +244,7 @@ job_id=$(curl -sS -X POST http://127.0.0.1:30010/v1/videos \
   --form-string "guidance_scale=3.0" \
   --form-string "fps=16" \
   --form-string "seed=42" \
+  --form-string "enable_audio=false" \
   --form "input_reference=@/path/to/reference.png;type=image/png" \
   | python -c 'import json, sys; print(json.load(sys.stdin)["id"])')
 
@@ -244,9 +260,9 @@ curl -sS -L "http://127.0.0.1:30010/v1/videos/${job_id}/content" \
   -o wan_animate_2.mp4
 ```
 
-The same request from the OpenAI Python client. The reference image is the
-`input_reference` file, and `video_path` (a path the server can read) and
-`clip_len` ride `extra_body`:
+These examples produce silent video; use `enable_audio=true` to retain reference
+audio. With the OpenAI Python client, pass the image as `input_reference` and
+the server-readable `video_path` and `clip_len` through `extra_body`:
 
 ```python Python
 from openai import OpenAI
@@ -270,21 +286,87 @@ For more API usage and request examples, see the
 
 ### 4.3 Reducing memory
 
-When a single GPU is tight on VRAM, stream the DiT one layer at a time instead of
-resident-loading it:
+Use memory mode to stream supported components layer by layer from host RAM:
 
 ```bash Command
 sglang serve \
   --model-path Wan-AI/Wan2.2-Animate-2-14B-Diffusers \
-  --dit-layerwise-offload \
-  --layerwise-offload-components transformer \
+  --performance-mode memory \
   --port 30010
 ```
 
-Combine with `--text-encoder-cpu-offload --pin-cpu-memory` to also keep the text
-encoder off the GPU between uses. Lowering `clip_len` also reduces peak memory.
+For DiT-only offload, choose **DiT layerwise offload** in the picker instead.
+On RTX 4090, prefix the command with `PYTORCH_ALLOC_CONF=expandable_segments:True`
+as shown in its hardware preset; memory mode alone OOMed in the tested workload.
+Lowering `clip_len` also reduces memory, but shortens each clip's temporal context.
 
 ## 5. Benchmark
+
+### 5.1 Hardware comparison
+
+Native inference at [SGLang `23d0a949a525`](https://github.com/sgl-project/sglang/commit/23d0a949a525006fa309c476f6f824c0644215af),
+with PyTorch 2.14.1+cu130, Transformers 5.19.0, and Diffusers 0.37.0.
+The [checkpoint revision](https://huggingface.co/Wan-AI/Wan2.2-Animate-2-14B-Diffusers/tree/7d48412d7b903ff3a89f4f5a960d99e1899605a1)
+and [reference inputs](https://github.com/sgl-project/ci-data-diffusion/tree/31d8ad69f2434727aad518f0678fbd57823856fe/diffusion-ci/inputs/wan_animate_2)
+are pinned. The workload uses the [CI prompt](https://github.com/sgl-project/sglang/blob/23d0a949a525006fa309c476f6f824c0644215af/python/sglang/multimodal_gen/test/server/testcase_configs.py#L900-L904)
+and produces 24 frames at 576x1024: `clip_len=37`, 40 steps, CFG 3,
+seed 42, and 16 FPS, without audio.
+
+E2E is the median of three warm `DiffGenerator` requests, including MP4 saving
+and raw-frame return; loading and the first request are excluded. Runs use
+`--warmup-mode off` and `SGLANG_DIFFUSION_SYNC_STAGE_PROFILING=1`. The same prompt
+is repeated with the default conditioning cache enabled. GPU memory is the
+maximum per-GPU device usage sampled at 10 Hz across loading and all four requests,
+including allocator reservation. It is **not** a minimum VRAM requirement;
+offload also uses host RAM.
+
+| Hardware | Server flags | Warm E2E (s) | Peak GPU memory (GiB) |
+| --- | --- | ---: | ---: |
+| 1x RTX 4090 | `--performance-mode memory` with `PYTORCH_ALLOC_CONF=expandable_segments:True` | 634.70 | 23.78 |
+| 1x H200 | Default (`auto`) | 192.27 | 68.88 |
+| 1x H200 | `--performance-mode memory` | 193.08 | 31.69 |
+| 1x H200 | `--dit-layerwise-offload --layerwise-offload-components transformer` | 193.28 | 36.18 |
+| 1x H200 | `--performance-mode speed` | 192.58 | 90.65 |
+| 1x B300 | Default (`auto`) | 101.99 | 67.67 |
+| 1x B300 | `--performance-mode memory` | 104.07 | 30.71 |
+| 2x B300 | `--num-gpus 2 --enable-cfg-parallel` | 53.52 | 64.93 |
+| 2x B300 | **CFG parity** preset | 54.03 | 39.53 |
+| 2x B300 | `--num-gpus 2 --ulysses-degree 2` | 56.17 | 58.42 |
+| 2x B300 | `--num-gpus 2 --tp-size 2` | 62.97 | 38.88 |
+
+RTX 4090 fits this short input only with the expandable allocator; both default
+`auto` and `memory` without it OOMed. All four successful runs produced identical
+RGB. This leaves little VRAM headroom and does not validate longer videos. The
+test host had 1 TiB of RAM; smaller desktop RAM budgets were not validated.
+
+On this H200 workload, `memory` reduced the GPU peak by 54% with less than 0.5%
+additional latency; all 16 raw RGB outputs were identical. Start with `auto`
+when memory is plentiful, or choose `memory` for headroom. `speed` offered no
+measured latency benefit here.
+
+On B300, **CFG parity** is the recommended two-GPU recipe: 1.89x faster than one
+GPU with byte-identical RGB on this workload. Plain CFG is slightly faster but
+uses more memory and changes the output. Memory mode on one B300 also preserves
+RGB while reducing the GPU peak by 55%, with about 2% additional latency.
+
+<Accordion title="Output consistency on B300">
+Comparison against the single-B300 baseline, using all 24 raw RGB frames from
+the first warm request. SSIM is the per-frame mean; PSNR is computed from the
+global RGB mean squared error. This checks numerical consistency on one input,
+not perceptual quality across prompts or parity with the official implementation.
+
+| Recipe | Byte-identical | Mean / worst SSIM | Global / worst-frame PSNR (dB) |
+| --- | --- | --- | --- |
+| Memory; CFG parity | Yes | 1.0000 / 1.0000 | Infinite |
+| CFG | No | 0.9857 / 0.9574 | 35.36 / 27.65 |
+| Ulysses | No | 0.9895 / 0.9602 | 37.92 / 27.77 |
+| TP | No | 0.9896 / 0.9808 | 37.82 / 33.34 |
+</Accordion>
+
+### 5.2 GB200 reference benchmark
+
+This older benchmark uses a longer video and different settings; its numbers
+are not directly comparable with the hardware comparison above.
 
 Test Environment:
 
@@ -338,7 +420,7 @@ synchronizes the device so the per-stage timings are accurate.
   </Tab>
 </Tabs>
 
-### 5.1 Native regression coverage
+### 5.3 Native regression coverage
 
 A separate regression used two B300 GPUs, CFG-parallel with replicated encoders
 and serial VAE decode, a 576x1024 area budget, 40 steps, `clip_len=37`, CFG=3,

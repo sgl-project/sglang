@@ -23,7 +23,6 @@ import torch
 import torch.distributed as dist
 
 from sglang.kernels.ops.communication.ipc_a2a import load_ipc_a2a_sync
-from sglang.kernels.ops.diffusion import pack_qkv_destination_major
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a import (
     _Unsupported,
@@ -50,6 +49,38 @@ def _member_devices(group, device: int) -> list[int]:
     return devices
 
 
+_CU_MEMORYTYPE_DEVICE = 2
+
+
+def _memcpy2d_struct():
+    import ctypes
+
+    class Memcpy2D(ctypes.Structure):  # CUDA_MEMCPY2D
+        _fields_ = [
+            ("srcXInBytes", ctypes.c_size_t),
+            ("srcY", ctypes.c_size_t),
+            ("srcMemoryType", ctypes.c_int),
+            ("srcHost", ctypes.c_void_p),
+            ("srcDevice", ctypes.c_uint64),
+            ("srcArray", ctypes.c_void_p),
+            ("srcPitch", ctypes.c_size_t),
+            ("dstXInBytes", ctypes.c_size_t),
+            ("dstY", ctypes.c_size_t),
+            ("dstMemoryType", ctypes.c_int),
+            ("dstHost", ctypes.c_void_p),
+            ("dstDevice", ctypes.c_uint64),
+            ("dstArray", ctypes.c_void_p),
+            ("dstPitch", ctypes.c_size_t),
+            ("WidthInBytes", ctypes.c_size_t),
+            ("Height", ctypes.c_size_t),
+        ]
+
+    return Memcpy2D
+
+
+_Memcpy2D = _memcpy2d_struct()
+
+
 class _StreamMemOps:
     """Front-end signal and wait (cuStreamWriteValue32 / cuStreamWaitValue32).
 
@@ -69,6 +100,9 @@ class _StreamMemOps:
         for fn in (self._write, self._wait):
             fn.argtypes = args
             fn.restype = ctypes.c_int
+        self._copy2d = cuda.cuMemcpy2DAsync_v2
+        self._copy2d.argtypes = [ctypes.POINTER(_Memcpy2D), ctypes.c_void_p]
+        self._copy2d.restype = ctypes.c_int
         # drivers can disable stream memory operations; find out here, inside
         # the group's agreed initialization, rather than mid-forward
         flag = torch.zeros(1, dtype=torch.int32, device="cuda")
@@ -92,14 +126,41 @@ class _StreamMemOps:
         if rc:
             raise RuntimeError(f"cuStreamWaitValue32 failed with CUresult {rc}")
 
+    def copy2d(
+        self,
+        stream,
+        dst: int,
+        dst_pitch: int,
+        src: int,
+        src_pitch: int,
+        width: int,
+        height: int,
+    ) -> None:
+        """`height` rows of `width` bytes between pitched device pointers, on the
+        copy engine (a peer mapping is a device pointer like any other)."""
+        desc = _Memcpy2D(
+            srcMemoryType=_CU_MEMORYTYPE_DEVICE,
+            srcDevice=src,
+            srcPitch=src_pitch,
+            dstMemoryType=_CU_MEMORYTYPE_DEVICE,
+            dstDevice=dst,
+            dstPitch=dst_pitch,
+            WidthInBytes=width,
+            Height=height,
+        )
+        rc = self._copy2d(desc, stream.cuda_stream)
+        if rc:
+            raise RuntimeError(f"cuMemcpy2DAsync failed with CUresult {rc}")
+
 
 class _PipelineBuffers:
     """Receive slots and flags for one pipelined-attention shape.
 
-    Input slots are group-major ([2, groups, world, chunk]) so a group's rows
-    form one [S, group_heads, 3 * head_dim] tensor for attention; output slots
-    are source-major ([2, world, groups, chunk]), each block a peer's rows for
-    one head group, copied into the merged output as it arrives.
+    Input slots are [2, groups, 3, world, chunk]: group g's q (k, v) rows from
+    every rank form one contiguous [S, group_heads, head_dim] tensor for
+    attention. Output slots are source-major ([2, world, groups, chunk]), each
+    block a peer's rows for one head group, copied into the merged output as it
+    arrives.
     """
 
     def __init__(self, state, s_local, heads, head_dim, groups, dtype):
@@ -108,7 +169,7 @@ class _PipelineBuffers:
         rows = s_local * self.group_heads
         zeros = lambda *shape, dt=dtype: torch.zeros(*shape, dtype=dt, device="cuda")
         self.inb = state._share(
-            zeros(2, groups, world, rows * 3 * head_dim), state.group
+            zeros(2, groups, 3, world, rows * head_dim), state.group
         )
         self.outb = state._share(zeros(2, world, groups, rows * head_dim), state.group)
         # fin[p]: groups peer p has delivered; fout[g, p]: calls whose group g
@@ -116,11 +177,13 @@ class _PipelineBuffers:
         # output counter could be lowered by a signal that lands late.
         self.fin = state._share(zeros(world, dt=torch.int32), state.group)
         self.fout = state._share(zeros(groups, world, dt=torch.int32), state.group)
+        # the caller's q/k for each peer block; v moves straight from its source
         self.send = torch.empty(
             world * groups,
+            2,
             s_local,
             self.group_heads,
-            3 * head_dim,
+            head_dim,
             dtype=dtype,
             device="cuda",
         )
@@ -256,20 +319,22 @@ class IpcA2AMultiState:
 
         q/k/v are [s_local, heads, head_dim], sequence-sharded with every head.
         ``attend(q, k, v)`` runs attention on [S, heads / (world * groups),
-        head_dim] views of one head group and must treat heads independently,
+        head_dim] tensors of one head group and must treat heads independently,
         which keeps the result bit-identical to the sequential exchange.
         Group g's copies run on the copy engine while group g-1 attends, and
         each group attends on its own stream and sends its output from there,
-        so no stream waits on a kernel still running on another. Returns
-        [s_local, heads, head_dim], or None when this call cannot pipeline.
-        ``groups < 0`` picks the count and steps aside, on every rank, when
-        the buffers would not fit.
+        so no stream waits on a kernel still running on another. Every copy,
+        the merge into the output included, is a pitched copy-engine copy, so
+        the exchange takes no SMs. Returns [s_local, heads, head_dim], or None
+        when this call cannot pipeline. ``groups < 0`` picks the count and
+        steps aside, on every rank, when the buffers would not fit.
 
-        ``fill(head_start, head_count, dst)``, when given, writes those heads'
-        q/k/v into a [s_local, head_count, 3 * head_dim] block in place of the
-        pack (the caller's QK-norm writes its output there); blocks for this
-        rank go straight into its own receive slot. It is only called once the
-        call is known to pipeline.
+        ``fill(head_start, head_count, q_dst, k_dst)``, when given, writes those
+        heads' q and k into two [s_local, head_count, head_dim] blocks in place
+        of a copy (the caller's QK-norm writes its output there); blocks for
+        this rank go straight into its own receive slot, and v always moves
+        straight from ``v``. It is only called once the call is known to
+        pipeline.
         """
         world, r = self.world, self.rank
         s_local, heads, head_dim = q.shape
@@ -278,10 +343,14 @@ class IpcA2AMultiState:
             groups = next(
                 (n for n in _AUTO_PIPELINE_GROUPS if heads % (world * n) == 0), 0
             )
+        # each token's heads of one group must be one contiguous run to move
+        # with a pitched copy
+        copied = (v,) if fill is not None else (q, k, v)
         if (
             not groups
             or heads % (world * groups)
             or not (q.shape == k.shape == v.shape)
+            or any(t.stride(2) != 1 or t.stride(1) != head_dim for t in copied)
         ):
             return None
         key = ("pipeline", s_local, heads, head_dim, groups, q.dtype)
@@ -289,8 +358,8 @@ class IpcA2AMultiState:
         if bufs is None:
             if torch.cuda.is_current_stream_capturing() or key in self.declined:
                 return None
-            # send + both receive and output slots: 11 * s_local * heads * head_dim
-            need = 11 * s_local * heads * head_dim * q.element_size()
+            # send + both receive and output slots: 10 * s_local * heads * head_dim
+            need = 10 * s_local * heads * head_dim * q.element_size()
             if auto and not self._fits_on_every_rank(need):
                 logger.info(
                     "Ulysses pipeline buffers (%.1f GiB) do not fit; using the "
@@ -312,62 +381,82 @@ class IpcA2AMultiState:
         bufs.calls += 1
         call = bufs.calls
         peers = [(r + step) % world for step in range(1, world)]
-        own = []
-        if fill is None:
-            # block p * groups + g is contiguous: group g of the heads rank p owns
-            send = pack_qkv_destination_major(q, k, v, world * groups, out=bufs.send)
-            cin.wait_stream(main)
-            with torch.cuda.stream(cin):
-                for g in range(groups):
-                    bufs.inb[r][slot, g, r].copy_(
-                        send[r * groups + g].view(-1), non_blocking=True
-                    )
-                    own.append(cin.record_event())
-                    for p in peers:
-                        bufs.inb[p][slot, g, r].copy_(
-                            send[p * groups + g].view(-1), non_blocking=True
-                        )
-                    for p in peers:
-                        mem.write(cin, bufs.fin[p].narrow(0, r, 1), base + g + 1)
-        else:
-            # Group by group: the peers' blocks first, so their copies start
-            # while this rank fills its own block straight into its slot.
-            send = bufs.send
-            block = lambda t: t.view(s_local, hg, 3 * head_dim)
-            sent = []
+        esz = q.element_size()
+        width = hg * head_dim * esz  # one token's heads of one group
+        chunk = s_local * width  # one rank's rows of one group, one of q/k/v
+        start = lambda p, g: (p * groups + g) * hg  # first head of block (p, g)
+        slot_of = lambda p, g, part: bufs.inb[p][slot, g, part, r]  # my rows there
+
+        def send_rows(stream, t, p, g, part):
+            src = t[:, start(p, g)]
+            mem.copy2d(
+                stream,
+                slot_of(p, g, part).data_ptr(),
+                width,
+                src.data_ptr(),
+                t.stride(0) * esz,
+                width,
+                s_local,
+            )
+
+        ready = main.record_event()
+        own, sent = [], []
+        if fill is not None:
+            # group by group: the peers' blocks first, so their copies start
+            # while this rank fills its own block straight into its slot
+            block = lambda t: t.view(s_local, hg, head_dim)
             for g in range(groups):
                 for p in peers:
-                    fill((p * groups + g) * hg, hg, block(send[p * groups + g]))
+                    qk = bufs.send[p * groups + g]
+                    fill(start(p, g), hg, qk[0], qk[1])
                 sent.append(main.record_event())
-                fill((r * groups + g) * hg, hg, block(bufs.inb[r][slot, g, r]))
+                fill(start(r, g), hg, block(slot_of(r, g, 0)), block(slot_of(r, g, 1)))
                 own.append(main.record_event())
-            with torch.cuda.stream(cin):
-                for g in range(groups):
+        own_cin = []
+        cin.wait_event(ready)
+        with torch.cuda.stream(cin):
+            for g in range(groups):
+                for p in (r, *peers):
+                    send_rows(cin, v, p, g, 2)
+                    if fill is None:
+                        send_rows(cin, q, p, g, 0)
+                        send_rows(cin, k, p, g, 1)
+                    if p == r:
+                        own_cin.append(cin.record_event())
+                if fill is not None:
                     cin.wait_event(sent[g])
                     for p in peers:
-                        bufs.inb[p][slot, g, r].copy_(
-                            send[p * groups + g].view(-1), non_blocking=True
+                        # q then k: two rows of `chunk`, one part apart in the slot
+                        mem.copy2d(
+                            cin,
+                            slot_of(p, g, 0).data_ptr(),
+                            slot_of(p, g, 1).data_ptr() - slot_of(p, g, 0).data_ptr(),
+                            bufs.send[p * groups + g].data_ptr(),
+                            chunk,
+                            chunk,
+                            2,
                         )
-                    for p in peers:
-                        mem.write(cin, bufs.fin[p].narrow(0, r, 1), base + g + 1)
+                for p in peers:
+                    mem.write(cin, bufs.fin[p].narrow(0, r, 1), base + g + 1)
         # Head block b = p * groups + g of the output is group g of rank p's
         # heads. Each group stream writes its blocks as soon as they exist, so
         # the merge overlaps the groups still attending instead of trailing them.
         merged = torch.empty(s_local, heads, head_dim, dtype=q.dtype, device=q.device)
         merged_blocks = merged.view(s_local, world * groups, hg, head_dim)
+        merged_pitch = heads * head_dim * esz
         done = []
         for g in range(groups):
             stream = self.pipe_group_streams[g]
-            stream.wait_event(own[g])
+            if fill is not None:
+                stream.wait_event(own[g])
+            stream.wait_event(own_cin[g])
             with torch.cuda.stream(stream):
                 for p in peers:
                     mem.wait(stream, bufs.fin[r].narrow(0, p, 1), base + g + 1)
-                qkv = bufs.inb[r][slot, g].view(world * s_local, hg, 3 * head_dim)
-                out = attend(
-                    qkv[..., :head_dim],
-                    qkv[..., head_dim : 2 * head_dim],
-                    qkv[..., 2 * head_dim :],
+                part = lambda i: bufs.inb[r][slot, g, i].view(
+                    world * s_local, hg, head_dim
                 )
+                out = attend(part(0), part(1), part(2)).contiguous()
                 rows = lambda p: out[p * s_local : (p + 1) * s_local]
                 for p in peers:
                     bufs.outb[p][slot, r, g].copy_(
@@ -375,16 +464,31 @@ class IpcA2AMultiState:
                     )
                 for p in peers:
                     mem.write(stream, bufs.fout[p][g].narrow(0, r, 1), call)
-                merged_blocks[:, r * groups + g].copy_(rows(r))
+                mem.copy2d(
+                    stream,
+                    merged_blocks[:, r * groups + g].data_ptr(),
+                    merged_pitch,
+                    rows(r).data_ptr(),
+                    width,
+                    width,
+                    s_local,
+                )
                 for p in peers:
                     mem.wait(stream, bufs.fout[r][g].narrow(0, p, 1), call)
-                    merged_blocks[:, p * groups + g].copy_(
-                        bufs.outb[r][slot, p, g].view(s_local, hg, head_dim)
+                    mem.copy2d(
+                        stream,
+                        merged_blocks[:, p * groups + g].data_ptr(),
+                        merged_pitch,
+                        bufs.outb[r][slot, p, g].data_ptr(),
+                        width,
+                        width,
+                        s_local,
                     )
                 done.append(stream.record_event())
         for event in done:
             main.wait_event(event)
-        # the next call's pack rewrites `send`, which the copy stream reads
+        # the next call's fill rewrites `send` and the caller may free `v`, both
+        # read by the copy stream
         main.wait_stream(cin)
         return merged
 

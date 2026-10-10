@@ -31,20 +31,7 @@ pub(crate) fn render(
         check_tool_arguments(message)?;
     }
     let request = &request;
-    let mut prefix = String::new();
-    if let Some(last) = messages.last_mut().filter(|m| m["role"] == "assistant")
-        && let Some(content) = last["content"].as_str().map(str::to_owned)
-    {
-        if request
-            .get("continue_final_message")
-            .map_or(Ok(false), pydantic_bool)?
-        {
-            prefix = content;
-            messages.pop();
-        } else {
-            *last = json!({"role": "user", "content": content});
-        }
-    }
+    let prefix = split_continuation(&mut messages, request)?;
     // SGLang fails on `messages[0]` here.
     if messages.is_empty() {
         return Err("no messages to render".into());
@@ -57,16 +44,7 @@ pub(crate) fn render(
             .ok_or("task requires a user or developer message")?;
         message["task"] = task.clone();
     }
-    // SGLang drops a later user's task when merging it into a user or tool-result turn.
-    // Workaround for ai-dynamo/frontend-crates#366; drop once dynamo-renderer includes it.
-    for index in 1..messages.len() {
-        if messages[index]["role"] == "user"
-            && matches!(messages[index - 1]["role"].as_str(), Some("user" | "tool"))
-            && let Some(message) = messages[index].as_object_mut()
-        {
-            message.remove("task");
-        }
-    }
+    drop_merged_tasks(&mut messages);
     normalize_messages(&mut messages)?;
     if messages.first().is_none_or(|m| m["role"] != "system") {
         messages.insert(0, json!({"role": "system", "content": ""}));
@@ -88,6 +66,43 @@ pub(crate) fn render(
     let prompt = v4::encode_messages_with_options(&messages, mode, true, true, effort)
         .map_err(|error| error.to_string())?;
     Ok((prompt, prefix))
+}
+
+/// The `continue_final_message` prefix, taken off a final assistant turn with
+/// text content; without the flag that turn renders as a user turn.
+pub(super) fn split_continuation(
+    messages: &mut Vec<Value>,
+    request: &Value,
+) -> Result<String, String> {
+    let Some(last) = messages.last_mut().filter(|m| m["role"] == "assistant") else {
+        return Ok(String::new());
+    };
+    let Some(content) = last["content"].as_str().map(str::to_owned) else {
+        return Ok(String::new());
+    };
+    if request
+        .get("continue_final_message")
+        .map_or(Ok(false), pydantic_bool)?
+    {
+        messages.pop();
+        return Ok(content);
+    }
+    *last = json!({"role": "user", "content": content});
+    Ok(String::new())
+}
+
+/// `merge_tool_messages` folds a user turn into a preceding user or
+/// tool-result turn, dropping the later turn's task.
+/// Workaround for ai-dynamo/frontend-crates#366; drop once dynamo-renderer includes it.
+pub(super) fn drop_merged_tasks(messages: &mut [Value]) {
+    for index in 1..messages.len() {
+        if messages[index]["role"] == "user"
+            && matches!(messages[index - 1]["role"].as_str(), Some("user" | "tool"))
+            && let Some(message) = messages[index].as_object_mut()
+        {
+            message.remove("task");
+        }
+    }
 }
 
 /// `serving_chat.py`: kwargs `thinking` wins, then what `reasoning` and the
@@ -136,7 +151,7 @@ fn effort(
 
 /// The pydantic dump SGLang renders: roles lowercased, unknown and null fields
 /// dropped, `user` reduced to role and content, null content blanked.
-fn engine_message(message: Value) -> Value {
+pub(super) fn engine_message(message: Value) -> Value {
     let mut message = match message {
         Value::Object(message) => message,
         _ => Map::new(),
@@ -179,7 +194,7 @@ fn flatten_content(message: &mut Value) {
 
 /// `serving_chat.normalize_assistant_tool_call_arguments`: string arguments must
 /// be a JSON object; other values wait for the final-turn handling.
-fn check_tool_arguments(message: &mut Value) -> Result<(), String> {
+pub(super) fn check_tool_arguments(message: &mut Value) -> Result<(), String> {
     for arguments in tool_arguments(message) {
         if let Some(text) = arguments.as_str()
             && (serde_json::from_str::<IgnoredAny>(text).is_err()
@@ -193,7 +208,7 @@ fn check_tool_arguments(message: &mut Value) -> Result<(), String> {
 
 /// The messages the encoder sees: empty tool lists dropped, message tools dumped,
 /// and tool arguments as JSON object text, which Dynamo parses itself.
-fn normalize_messages(messages: &mut [Value]) -> Result<(), String> {
+pub(super) fn normalize_messages(messages: &mut [Value]) -> Result<(), String> {
     for message in messages {
         for arguments in tool_arguments(message) {
             match arguments {
@@ -261,7 +276,7 @@ fn normalize_tools(tools: &[Value]) -> Result<Vec<Value>, String> {
 }
 
 /// pydantic's lax `bool`: booleans, 0 and 1, and the yes/no words in any case.
-fn pydantic_bool(value: &Value) -> Result<bool, String> {
+pub(super) fn pydantic_bool(value: &Value) -> Result<bool, String> {
     let parsed = match value {
         Value::Bool(value) => Some(*value),
         Value::Number(number) => match number.as_f64() {
