@@ -46,7 +46,7 @@ from sglang.srt.disaggregation.common.utils import (
     pack_int_lists,
     unpack_int_lists,
 )
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.utils import DisaggregationMode, is_elided_entry
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.common import run_with_deadline
@@ -103,7 +103,10 @@ def _pack_mem_desc_lists(mems_per_comp: List[List[MemoryDesc]]) -> bytes:
     if not mems_per_comp:
         return b""
     return msgspec.msgpack.encode(
-        [[mem.pack() for mem in comp] for comp in mems_per_comp]
+        [
+            [None if mem is None else mem.pack() for mem in comp]
+            for comp in mems_per_comp
+        ]
     )
 
 
@@ -111,7 +114,9 @@ def _unpack_mem_desc_lists(blob: bytes) -> List[List[MemoryDesc]]:
     if not blob:
         return []
     nested = msgspec.msgpack.decode(blob)
-    return [[MemoryDesc.unpack(b) for b in comp] for comp in nested]
+    return [
+        [None if b is None else MemoryDesc.unpack(b) for b in comp] for comp in nested
+    ]
 
 
 @dataclasses.dataclass
@@ -334,7 +339,7 @@ class MoriKVManager(CommonKVManager):
         self.engine_desc = self.engine.get_engine_desc()
         self.kv_mem_descs: List[MemoryDesc] = []
         self.aux_mem_descs: List[MemoryDesc] = []
-        self.state_mem_descs: List[List[MemoryDesc]] = []
+        self.state_mem_descs: List[List[Optional[MemoryDesc]]] = []
         self.transfer_lock = threading.Lock()
         self._submission_local = _SubmissionLocal()
         self._zmq_ctx = zmq.Context()
@@ -454,8 +459,13 @@ class MoriKVManager(CommonKVManager):
             self.kv_args.state_data_ptrs,
             getattr(self.kv_args, "state_data_lens", []),
         ):
-            component_descs: List[MemoryDesc] = []
+            component_descs: List[Optional[MemoryDesc]] = []
             for ptr, length in zip(component_ptrs, component_lens):
+                if length == 0:
+                    # Elided DSA index-K; ibv_reg_mr would abort on size 0.
+                    # Keep the slot so descs stay index-aligned.
+                    component_descs.append(None)
+                    continue
                 desc = self.engine.register_memory(
                     ptr,
                     length,
@@ -1003,6 +1013,8 @@ class MoriKVManager(CommonKVManager):
                         pass
             for component_descs in self.state_mem_descs:
                 for desc in component_descs:
+                    if desc is None:
+                        continue
                     try:
                         self.engine.deregister_memory(desc)
                     except Exception:
@@ -1493,6 +1505,7 @@ class MoriKVManager(CommonKVManager):
                         src_descs,
                         src_lens,
                         dst_descs,
+                        dst_lens,
                         st,
                     )
                 )
@@ -1600,6 +1613,7 @@ class MoriKVManager(CommonKVManager):
         src_state_mem_descs: List[MemoryDesc],
         src_state_item_lens: List[int],
         dst_state_mem_descs: List[MemoryDesc],
+        dst_state_item_lens: List[int],
         state_type: str,
     ) -> List[TransferStatus]:
         # TP mismatch check for non-MLA SWA
@@ -1678,6 +1692,12 @@ class MoriKVManager(CommonKVManager):
         for i, src_desc in enumerate(src_state_mem_descs):
             dst_desc = dst_state_mem_descs[i]
             state_item_len = src_state_item_lens[i]
+            if is_elided_entry(state_item_len, dst_state_item_lens, i):
+                # DSA index-K elision gives every shared-topk layer a 0-row
+                # buffer; either peer eliding it means nothing moves, and the
+                # descriptor describes an empty allocation. Skipping keeps the
+                # index alignment with state_mem_descs that registration relies on.
+                continue
 
             statuses.extend(
                 self._submit_batch_transfer_plan(
