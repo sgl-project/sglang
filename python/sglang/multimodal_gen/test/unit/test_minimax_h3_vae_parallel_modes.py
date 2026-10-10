@@ -44,7 +44,10 @@ from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.vit_utils im
     create_token_ids,
     prepare_rotary_pos_emb,
 )
-from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 
 requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="fused qk-norm+RoPE kernel needs CUDA"
@@ -306,7 +309,7 @@ def _h3_shaped_decoder():
     return decoder
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="requires NVIDIA CUDA")
 def test_fused_decoder_matches_unfused_forward():
     from sglang.multimodal_gen.runtime.managers.forward_context import (
         set_forward_context,
@@ -346,3 +349,27 @@ def test_fused_decoder_matches_unfused_forward():
             os.environ["MINIMAX_H3_VAE_DECODER_FUSED_NORM"] = previous
 
     torch.testing.assert_close(fused, eager, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+def test_fused_decoder_is_disabled_off_nvidia():
+    # On ROCm tensor.is_cuda is true, but the fused Triton norms decoded to NaN
+    # on MI300; the decoder must keep the unfused path there.
+    decoder = _h3_shaped_decoder()
+    latent = torch.randn(2, 4, 1, 2, 2, device="cuda", dtype=torch.float16)
+    from sglang.kernels.ops import diffusion as diffusion_ops
+
+    vae_dir = "sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae"
+    with (
+        torch.no_grad(),
+        torch.autocast("cuda", dtype=torch.float16),
+        set_forward_context(current_timestep=0, attn_metadata=None),
+        mock.patch.dict(os.environ, {"MINIMAX_H3_VAE_DECODER_FUSED_NORM": "1"}),
+        mock.patch(f"{vae_dir}.vae_vit.current_platform.is_cuda", return_value=False),
+        mock.patch(f"{vae_dir}.attention.current_platform.is_cuda", return_value=False),
+        mock.patch.object(diffusion_ops, "h3_vae_scale_add_rmsnorm") as scale_add,
+        mock.patch.object(diffusion_ops, "h3_vae_qk_rmsnorm_rope") as qk_rope,
+    ):
+        decoder(latent)
+    scale_add.assert_not_called()
+    qk_rope.assert_not_called()
