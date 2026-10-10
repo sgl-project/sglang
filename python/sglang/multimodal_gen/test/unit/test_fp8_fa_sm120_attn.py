@@ -5,6 +5,9 @@ Needs an SM120 GPU; skipped elsewhere. Shapes are kept small (8 heads) so the
 CuTe-DSL compile and the runs stay in seconds.
 """
 
+from types import SimpleNamespace
+from unittest import mock
+
 import pytest
 import torch
 
@@ -18,17 +21,27 @@ HEAD_DIM = 128
 SOFTMAX_SCALE = HEAD_DIM**-0.5
 
 
-def _make_impls(causal=False):
-    from sglang.multimodal_gen.runtime.layers.attention.backends.fp8_fa_sm120_attn import (
-        FP8FlashAttentionSM120Impl,
+def _make_impls(causal=False, prefix="", attention_backend_config=None):
+    from sglang.multimodal_gen.runtime.layers.attention.backends import (
+        fp8_fa_sm120_attn,
     )
     from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import (
         CudnnSDPAImpl,
     )
 
-    ours = FP8FlashAttentionSM120Impl(
-        num_heads=HEADS, head_size=HEAD_DIM, causal=causal, softmax_scale=SOFTMAX_SCALE
+    server_args = SimpleNamespace(
+        attention_backend_config=attention_backend_config or {}
     )
+    with mock.patch.object(
+        fp8_fa_sm120_attn, "get_global_server_args", return_value=server_args
+    ):
+        ours = fp8_fa_sm120_attn.FP8FlashAttentionSM120Impl(
+            num_heads=HEADS,
+            head_size=HEAD_DIM,
+            causal=causal,
+            softmax_scale=SOFTMAX_SCALE,
+            prefix=prefix,
+        )
     reference = CudnnSDPAImpl(
         num_heads=HEADS, head_size=HEAD_DIM, causal=causal, softmax_scale=SOFTMAX_SCALE
     )
@@ -194,6 +207,33 @@ def test_prep_defines_every_padded_byte():
 
 def test_causal_falls_back_to_cudnn():
     ours, reference = _make_impls(causal=True)
+    q, k, v = _fused_qkv_views(1024)
+    kernels_before = _compiled_kernels()
+
+    output = ours.forward(q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0), None)
+    expected = reference.forward(q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0), None)
+
+    assert torch.equal(output, expected)
+    assert _compiled_kernels() == kernels_before
+
+
+def test_bf16_layers_match_exact_layer_prefixes():
+    """A listed layer returns the cuDNN BF16 result; an unlisted layer whose name the
+    listed one contains (blocks.4.attn in blocks.45.attn) still runs FP8."""
+    config = {"bf16_layers": ["blocks.45.attn"]}
+    kept, reference = _make_impls(
+        prefix="blocks.45.attn", attention_backend_config=config
+    )
+    fp8, _ = _make_impls(prefix="blocks.4.attn", attention_backend_config=config)
+    q, k, v = (t.unsqueeze(0) for t in _fused_qkv_views(4096, seed=3))
+
+    expected = reference.forward(q, k, v, None)
+    assert torch.equal(kept.forward(q, k, v, None), expected)
+    assert not torch.equal(fp8.forward(q, k, v, None), expected)
+
+
+def test_min_seq_len_runs_short_sequences_in_bf16():
+    ours, reference = _make_impls(attention_backend_config={"min_seq_len": 2048})
     q, k, v = _fused_qkv_views(1024)
     kernels_before = _compiled_kernels()
 
