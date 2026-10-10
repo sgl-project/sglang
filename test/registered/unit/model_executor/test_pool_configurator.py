@@ -5,6 +5,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import torch
+
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.runtime_context import (
     get_memory,
@@ -832,6 +834,177 @@ class TestEagleConfigurator(CustomTestCase):
         total_layers = num_layers + eagle_draft_num_layers
         used = config.max_total_num_tokens * full_pt * total_layers
         self.assertLessEqual(used, available)
+
+    def _fp4_eagle_config(
+        self,
+        *,
+        prefill_backend,
+        native_scale_layout=True,
+        draft_layers=4,
+        implicit_mtp=False,
+        draft_backend=None,
+        draft_dtype=None,
+        fused_entry=None,
+    ):
+        mr = _make_model_runner(self, num_layers=32)
+        mr.kv_cache_dtype = torch.float4_e2m1fn_x2
+        mr.kv_cache_dtype_str = "nvfp4"
+        mr.device = "cpu"
+        mr.model_dtype = torch.bfloat16
+        mr.spec_algorithm.is_eagle.return_value = True
+        mr.spec_algorithm.is_none.return_value = False
+        mr.spec_aux_config.eagle_draft_num_layers = (
+            None if implicit_mtp else draft_layers
+        )
+        mr.spec_aux_config.draft_kv_num_layers = draft_layers
+        mr.spec_aux_config.draft_model_config = SimpleNamespace(dtype=torch.bfloat16)
+        mr.fused_entry_bytes.return_value = fused_entry
+        _publish_config(
+            self,
+            kv_cache_dtype="nvfp4",
+            attention_backend=None,
+            prefill_attention_backend=prefill_backend,
+            decode_attention_backend="trtllm_mha",
+            speculative_draft_attention_backend=draft_backend,
+            speculative_draft_kv_cache_dtype=draft_dtype,
+        )
+        mr.server_args = get_server_args()
+        with (
+            mock_cpu_env(kv_size=1),
+            # Respect dtype overrides in the draft while keeping all tensors on CPU.
+            patch(
+                "torch._utils._element_size", side_effect=lambda dtype: dtype.itemsize
+            ),
+            patch(
+                "sglang.srt.layers.quantization.fp4_kv_cache_quant_method.get_platform",
+                return_value=SimpleNamespace(is_sm100=native_scale_layout),
+            ),
+        ):
+            from sglang.srt.model_executor.pool_configurator import (
+                DefaultPoolConfigurator,
+            )
+
+            cfg = DefaultPoolConfigurator(mr)
+            config = cfg.calculate_pool_sizes(10_000_000, page_size=1)
+        return cfg, config
+
+    def test_fp4_eagle_prices_each_workers_selected_buffers(self):
+        # Four heads * 64 elements. SM100 mixed mode owns linear/native scales
+        # and a shared FP8 workspace. SM120 reuses linear scales for native reads.
+        for prefill, native_layout, expected in [
+            ("flashinfer", True, 12_544),
+            ("flashinfer", False, 11_392),
+            ("trtllm_mha", True, 10_368),
+            ("trtllm_mha", False, 10_368),
+        ]:
+            with self.subTest(prefill=prefill, native_layout=native_layout):
+                cfg, config = self._fp4_eagle_config(
+                    prefill_backend=prefill, native_scale_layout=native_layout
+                )
+                self.assertEqual(cfg._cell_size, expected)
+                self.assertLessEqual(config.max_total_num_tokens * expected, 10_000_000)
+
+    def test_fp4_eagle_reserves_implicit_mtp_private_pool(self):
+        # The resolver keeps eagle_draft_num_layers=None for path-less MTP.
+        # Its draft-mode KV layer count must still reserve a separate FP4 pool.
+        for prefill, native_layout, expected in [
+            ("flashinfer", True, 11_584),
+            ("flashinfer", False, 10_528),
+            ("trtllm_mha", True, 9_504),
+            ("trtllm_mha", False, 9_504),
+        ]:
+            with self.subTest(prefill=prefill, native_layout=native_layout):
+                cfg, config = self._fp4_eagle_config(
+                    prefill_backend=prefill,
+                    native_scale_layout=native_layout,
+                    draft_layers=1,
+                    implicit_mtp=True,
+                )
+                self.assertEqual(cfg._cell_size, expected)
+                self.assertLessEqual(config.max_total_num_tokens * expected, 10_000_000)
+
+    def test_fp4_eagle_draft_backend_keeps_allocator_selected_buffers(self):
+        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+            NVFP4KVCacheMethod,
+        )
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+
+        for target_prefill, draft_backend, target_cost, expected in [
+            ("flashinfer", "trtllm_mha", 10_752, 12_544),
+            ("trtllm_mha", "flashinfer", 9_216, 10_368),
+        ]:
+            with self.subTest(target=target_prefill, draft=draft_backend):
+                cfg, _ = self._fp4_eagle_config(
+                    prefill_backend=target_prefill, draft_backend=draft_backend
+                )
+                # Exercise the actual allocation recipe: the configurator reads
+                # the shared server_args, regardless of the draft execution backend.
+                allocator = object.__new__(KVCacheConfigurator)
+                allocator.kv_cache_dtype = torch.float4_e2m1fn_x2
+                allocator.kv_cache_dtype_str = "nvfp4"
+                allocator.device = "cpu"
+                allocator.page_size = 1
+                allocator.server_args = get_server_args()
+                allocator.model = None
+                with (
+                    patch(
+                        "sglang.srt.layers.quantization.fp4_kv_cache_quant_method."
+                        "get_platform",
+                        return_value=SimpleNamespace(is_sm100=True),
+                    ),
+                    patch.object(NVFP4KVCacheMethod, "load_scales_from_model"),
+                ):
+                    method = allocator._build_fp4_quant_method(num_layers=4)
+                    allocated_draft_cost = method.compute_cell_size(4, 64, 4, 1)
+                self.assertEqual(cfg._cell_size, expected)
+                self.assertEqual(cfg._cell_size, target_cost + allocated_draft_cost)
+                self.assertEqual(
+                    method.needs_dequant_workspace(), target_prefill == "flashinfer"
+                )
+
+    def test_fp4_eagle_respects_draft_dtype_override(self):
+        for draft_dtype, expected in [
+            ("bf16", 14_848),
+            ("fp8_e4m3", 12_800),
+            # The draft's loaded quant config may reduce this conservative cost.
+            ("auto", 14_848),
+        ]:
+            with self.subTest(draft_dtype=draft_dtype):
+                cfg, _ = self._fp4_eagle_config(
+                    prefill_backend="flashinfer", draft_dtype=draft_dtype
+                )
+                self.assertEqual(cfg._cell_size, expected)
+                from sglang.srt.mem_cache.kv_cache_dtype import configure_kv_cache_dtype
+
+                # This is the loaded draft's dtype resolution. For auto, a model
+                # quant config can choose FP8; reserving BF16 must still fit it.
+                loaded_draft = SimpleNamespace(
+                    quant_config=SimpleNamespace(kv_cache_quant_algo="FP8")
+                )
+                _, allocated_dtype = configure_kv_cache_dtype(
+                    server_args_kv_cache_dtype="nvfp4",
+                    speculative_draft_kv_cache_dtype=draft_dtype,
+                    model=loaded_draft,
+                    model_dtype=torch.bfloat16,
+                    is_draft_worker=True,
+                    is_dflash=False,
+                    speculative_draft_attention_backend=None,
+                )
+                actual_draft_cost = 4 * (64 + 64) * 4 * allocated_dtype.itemsize
+                self.assertGreaterEqual(cfg._cell_size, 10_752 + actual_draft_cost)
+                if draft_dtype != "auto":
+                    self.assertEqual(cfg._cell_size, 10_752 + actual_draft_cost)
+
+    def test_fp4_eagle_fused_entry_is_not_charged_a_private_pool(self):
+        for implicit_mtp in [False, True]:
+            with self.subTest(implicit_mtp=implicit_mtp):
+                cfg, config = self._fp4_eagle_config(
+                    prefill_backend="flashinfer",
+                    implicit_mtp=implicit_mtp,
+                    fused_entry=12_000,
+                )
+                self.assertEqual(cfg._cell_size, 12_000)
+                self.assertLessEqual(config.max_total_num_tokens * 12_000, 10_000_000)
 
     @patch(
         "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
