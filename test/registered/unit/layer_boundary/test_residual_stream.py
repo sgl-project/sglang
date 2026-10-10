@@ -21,7 +21,6 @@ from sglang.srt.layers.layer_boundary.output import UnreducedOutput
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layer_boundary.residual.add_norm import PLAIN_ADD
 from sglang.srt.layers.layer_boundary.residual.stream import (
-    DeclaredSum,
     OwedOutput,
     ResidualStream,
 )
@@ -139,7 +138,9 @@ class TestResidualStream(CustomTestCase):
                 update=SimpleNamespace(is_plain_add=False),
             )
 
-    def test_declared_sum_snapshot_and_pipeline_handoff_preserve_the_partial(self):
+    def test_a_declared_sum_s_snapshot_keeps_the_partial_and_its_export_completes_it(
+        self,
+    ):
         stream = ResidualStream(self.residual)
         hidden = stream.record(self.partial, PLAIN_ADD, declared_sum=SumGroup.TP)
         self.assertIsInstance(hidden, OwedOutput)
@@ -148,16 +149,15 @@ class TestResidualStream(CustomTestCase):
             return_value=self.group,
         ):
             snapshot = stream.snapshot(hidden)
-        torch.testing.assert_close(snapshot, torch.full((2, 4), 5.0))
-        torch.testing.assert_close(self.partial, torch.ones(2, 4))
-        wire, residual = stream.export(hidden, preserve_declared=True)
-        self.assertIs(wire, self.partial)
-        self.assertIsInstance(stream.pending.owed, DeclaredSum)
-        received, rebuilt = ResidualStream.from_handoff(
-            wire, residual, PLAIN_ADD, declared_sum=SumGroup.TP
-        )
-        self.assertIsInstance(received, OwedOutput)
-        self.assertIs(rebuilt.pending.owed.group, SumGroup.TP)
+            torch.testing.assert_close(snapshot, torch.full((2, 4), 5.0))
+            torch.testing.assert_close(self.partial, torch.ones(2, 4))
+            # A pipeline handoff sends it complete.
+            wire, residual = stream.export(hidden)
+        torch.testing.assert_close(wire, torch.full((2, 4), 2.0))
+        self.assertIsNone(stream.pending.owed)
+        received, rebuilt = ResidualStream.from_handoff(wire, residual, PLAIN_ADD)
+        self.assertIs(received, wire)
+        self.assertIsNone(rebuilt.pending.owed)
 
     def test_materialized_declared_sum_is_not_reduced_again(self):
         rows = Layout(frozenset())

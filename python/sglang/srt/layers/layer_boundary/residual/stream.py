@@ -102,15 +102,14 @@ class ResidualStream:
         self.pending = None
 
     @classmethod
-    def from_handoff(cls, hidden, residual, update, *, declared_sum=None):
+    def from_handoff(cls, hidden, residual, update):
         """Reconstruct a stream from a tensor handoff, including a TBO microbatch.
 
         Args:
-            hidden: Received output or already-written residual tensor.
+            hidden: Received output, complete, or already-written residual tensor.
             residual: Separate residual tensor. None means hidden already holds
                 the written residual, rather than an uninitialized stack.
             update: Producer operation for a separate contribution/residual pair.
-            declared_sum: Static sum owed by hidden when residual is separate.
 
         Returns:
             (handle, stream). Use start() for a fresh, uninitialized stack instead.
@@ -118,7 +117,7 @@ class ResidualStream:
         stream = cls(residual)
         if residual is None:
             return stream.write(hidden), stream
-        return stream.record(hidden, update, declared_sum=declared_sum), stream
+        return stream.record(hidden, update), stream
 
     def write(self, residual):
         if self.pending is not None:
@@ -208,25 +207,21 @@ class ResidualStream:
             raise NotImplementedError("a finalize handoff requires main-output capture")
         return value.clone() if self.residual is None else value + self.residual
 
-    def export(self, hidden, *, takes_handoff=False, preserve_declared=False):
+    def export(self, hidden, *, takes_handoff=False):
         """Export the output/residual pair without closing or consuming the stream.
 
         Args:
             hidden: Current stream tensor or opaque owed handle.
             takes_handoff: Pass a producer-specific finalize handoff through for a
                 terminal adapter that can consume it; otherwise complete it here.
-            preserve_declared: Export a raw declared partial sum for a receiver
-                whose incoming contract reconstructs that sum (for example PP).
 
         Returns:
-            (output, residual), completing outstanding work unless explicitly
-            preserved. Does not apply the pending residual update.
+            (output, residual), completing outstanding work. Does not apply the
+            pending residual update.
         """
         self.check(hidden)
         if self.pending is None:
             return hidden, None
-        if preserve_declared and isinstance(self.pending.owed, DeclaredSum):
-            return self.pending.value, self.residual
         if takes_handoff and isinstance(self.pending.owed, DeferredFinalize):
             return self.pending.owed, self.residual
         return self.pending.complete(), self.residual

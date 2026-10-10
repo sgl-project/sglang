@@ -733,9 +733,7 @@ class NemotronHModel(nn.Module):
             )
 
         if not self.pp_group.is_last_rank:
-            return residual_batch.to_pp(
-                hidden_states, forward_batch, preserve_declared=True
-            )
+            return residual_batch.to_pp(hidden_states, forward_batch)
         hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
         if self.end_layer in self.layers_to_capture:
             aux_hidden_states.append(

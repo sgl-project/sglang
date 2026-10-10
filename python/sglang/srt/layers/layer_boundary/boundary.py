@@ -494,6 +494,14 @@ def _select_entry_step(
             # rows around it (MHC on an input-scattered batch).
             if gathered or owes not in (None, SumGroup.ATTN_TP):
                 raise NotImplementedError(f"{produced=} {residual=} {need=}")
+            parallel = get_parallel()
+            if parallel.attn_tp_size != parallel.tp_size:
+                # The step reduce-scatters over the full TP group.
+                raise NotImplementedError(
+                    "a residual kept on each rank's attention-TP slice while "
+                    "the stage takes the full rows needs attention TP to span "
+                    "the TP group"
+                )
             return EntryStep(
                 partial(
                     _tp_reduce_scatter_update_read_gather,

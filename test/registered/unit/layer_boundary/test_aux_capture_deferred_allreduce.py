@@ -429,12 +429,9 @@ class TestPipelineResidualReception(CustomTestCase):
         self.assertIsNone(residual.pending)
         self.assertIs(residual.residual, hidden)
 
-    def test_optional_residual_and_declared_partial_keep_the_wire_values(self):
+    def test_optional_residual_keeps_the_wire_values(self):
         comm_instance = stub_plan()
         comm_instance.norm = None
-        comm_instance.path_for = lambda batch: SimpleNamespace(
-            entry=SimpleNamespace(declared_sum=None)
-        )
         batch = SimpleNamespace(residual_stream=None)
         partial = torch.randn(2, 4)
         prior = torch.randn_like(partial)
