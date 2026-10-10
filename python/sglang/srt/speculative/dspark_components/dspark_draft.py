@@ -142,12 +142,12 @@ def draft_markov_block(
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Draft ``gamma`` tokens per row, each step biased by the token before it;
     a row at temperature 0 takes the argmax. With ``keep_logits`` the step
-    logits land in ``logits_out`` ([bs, gamma, local vocab]), allocated here
+    logits land in ``logits_out`` ([bs, gamma, vocab]), allocated here
     when not given."""
     bs, gamma = base_logits.shape[:2]
     if keep_logits and logits_out is None:
         logits_out = torch.empty(
-            (bs, gamma, base_logits.shape[-1]),
+            (bs, gamma, markov_head.step_logits_width(base_logits.shape[-1])),
             dtype=markov_head.step_logits_dtype(base_logits.dtype),
             device=base_logits.device,
         )
@@ -198,7 +198,7 @@ def sample_draft_block(
     temperatures = resolve_draft_temperatures(
         bs=bs, sampling_info=sampling_info, device=device
     )
-    draft_tokens, local_logits = draft_markov_block(
+    draft_tokens, step_logits = draft_markov_block(
         markov_head=markov_head,
         base_logits=base_logits,
         anchor_tokens=anchor_tokens,
@@ -215,9 +215,7 @@ def sample_draft_block(
     )
     return DraftBlockResult(
         draft_tokens=draft_tokens,
-        corrected_logits=expect(
-            _DRAFT_STEP_LOGITS, markov_head.gather_vocab(local_logits)
-        ),
+        corrected_logits=expect(_DRAFT_STEP_LOGITS, step_logits),
         greedy_mask=greedy_mask,
         temperatures=temperatures,
     )
@@ -318,9 +316,7 @@ class DraftBlockProposer:
                 greedy_mask = draft_sampler.greedy_mask[:bs]
                 temperatures = draft_sampler.temperatures[:bs]
                 if not all_greedy:
-                    corrected_logits = self.draft_model.markov_head.gather_vocab(
-                        draft_sampler.step_logits[:bs]
-                    )
+                    corrected_logits = draft_sampler.step_logits[:bs]
             else:
                 # Greedy-only tail: no params were staged.
                 greedy_mask = resolve_greedy_mask(

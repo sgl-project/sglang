@@ -117,8 +117,8 @@ class BaseDSparkMarkovHead(nn.Module, ABC):
     ) -> torch.Tensor:
         """One token per row from the step logits ``base_logits + bias``,
         rounded to ``step_logits_dtype``: the argmax at temperature 0, a
-        Gumbel-max sample otherwise. ``logits_out`` receives this rank's step
-        logits ([bs, local vocab])."""
+        Gumbel-max sample otherwise. ``logits_out`` receives the step logits,
+        ``step_logits_width`` wide."""
         return MarkovSampleStep.execute(
             base_logits=base_logits,
             bias=bias,
@@ -135,13 +135,9 @@ class BaseDSparkMarkovHead(nn.Module, ABC):
     def _vocab_shard_args(self) -> dict:
         return {}
 
-    def local_vocab_width(self, lm_head: nn.Module) -> int:
-        """Width of the base logits this rank sees: the cropped vocab."""
-        return int(lm_head.org_vocab_size)
-
-    def gather_vocab(self, local_logits: torch.Tensor) -> torch.Tensor:
-        """[bs, gamma, local vocab] step logits -> [bs, gamma, vocab]."""
-        return local_logits
+    def step_logits_width(self, base_width: int) -> int:
+        """The width of the step logits over base logits ``base_width`` wide."""
+        return base_width
 
 
 class VanillaMarkov(BaseDSparkMarkovHead):

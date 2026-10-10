@@ -71,10 +71,10 @@ class DsparkDraftSampler:
             (self.max_bs,), dtype=torch.float32, device=device
         )
         self.greedy_mask = torch.ones((self.max_bs,), dtype=torch.bool, device=device)
-        # [max_bs, gamma, local vocab] step logits the sampling accept reads.
+        # [max_bs, gamma, vocab] step logits the sampling accept reads.
         self.step_logits = (
             torch.empty(
-                (self.max_bs, self.gamma, _local_vocab_width(model)),
+                (self.max_bs, self.gamma, _step_logits_width(model)),
                 dtype=_step_logits_dtype(model),
                 device=device,
             )
@@ -145,8 +145,9 @@ class DsparkDraftSampler:
             self.confidence_out[:bs].copy_(confidence)
 
 
-def _local_vocab_width(model) -> int:
-    return model.markov_head.local_vocab_width(model.lm_head)
+def _step_logits_width(model) -> int:
+    # Unsharded base logits span the cropped vocab.
+    return model.markov_head.step_logits_width(int(model.lm_head.org_vocab_size))
 
 
 def _step_logits_dtype(model) -> torch.dtype:
@@ -172,7 +173,7 @@ def _resolve_folded_sampling(
     if mode == DsparkFoldedSampling.FORCE:
         return True
     itemsize = _step_logits_dtype(model).itemsize
-    need_gb = max_bs * gamma * _local_vocab_width(model) * itemsize / (1 << 30)
+    need_gb = max_bs * gamma * _step_logits_width(model) * itemsize / (1 << 30)
     if available_memory_gb - need_gb >= DRAFT_CAPTURE_MIN_FREE_GB:
         return True
     if tp_rank == 0:
