@@ -276,7 +276,9 @@ class SchedulePolicy:
             else:
                 raise ValueError(f"Unknown CacheAgnostic Policy: {policy=}")
 
-        self._touch_waiting_prefixes(policy, waiting_queue, forward_ct)
+        self._touch_waiting_prefixes(
+            policy=policy, waiting_queue=waiting_queue, forward_ct=forward_ct
+        )
 
     def _touch_waiting_prefixes(
         self, policy: Policy, waiting_queue: List[Req], forward_ct: Optional[int]

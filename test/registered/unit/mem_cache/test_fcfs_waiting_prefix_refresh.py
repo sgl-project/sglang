@@ -83,9 +83,13 @@ class TestFcfsWaitingPrefixRefresh(CustomTestCase):
             ServerArgs(model_path="dummy", radix_eviction_policy=eviction_policy),
             role="test",
         )
-        SchedulePolicy("fcfs", cache, False, False, False).calc_priority(
-            queue, forward_ct=0
-        )
+        SchedulePolicy(
+            policy="fcfs",
+            tree_cache=cache,
+            enable_hierarchical_cache=False,
+            enable_priority_scheduling=False,
+            schedule_low_priority_values_first=False,
+        ).calc_priority(waiting_queue=queue, forward_ct=0)
         cache.evict(EvictParams(num_tokens=len(OLDER_PREFIX)))
         return [
             cache.match_prefix(
@@ -105,13 +109,25 @@ class TestFcfsWaitingPrefixRefresh(CustomTestCase):
         """TP/PP ranks fed the same calls must refresh on the same calls,
         however far apart in time each rank makes them."""
         publish(
-            ServerArgs(model_path="dummy", radix_eviction_policy="lru"), role="test"
+            server_args=ServerArgs(model_path="dummy", radix_eviction_policy="lru"),
+            role="test",
         )
-        queue = [Req(1, "", array("q", OLDER_PREFIX), SamplingParams())]
+        queue = [
+            Req(
+                rid=1,
+                origin_input_text="",
+                origin_input_ids=array("q", OLDER_PREFIX),
+                sampling_params=SamplingParams(),
+            )
+        ]
 
         def refreshes(gap_s):
             policy = SchedulePolicy(
-                "fcfs", RadixCache.create_simulated(), False, False, False
+                policy="fcfs",
+                tree_cache=RadixCache.create_simulated(),
+                enable_hierarchical_cache=False,
+                enable_priority_scheduling=False,
+                schedule_low_priority_values_first=False,
             )
             touched = []
             for forward_ct in range(3):
@@ -120,7 +136,7 @@ class TestFcfsWaitingPrefixRefresh(CustomTestCase):
                 with mock.patch(
                     "sglang.srt.managers.schedule_policy.touch_waiting_prefix"
                 ) as touch:
-                    policy.calc_priority(queue, forward_ct=forward_ct)
+                    policy.calc_priority(waiting_queue=queue, forward_ct=forward_ct)
                 touched.append(touch.called)
             return touched
 
