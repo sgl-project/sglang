@@ -238,8 +238,8 @@ from sglang.srt.utils.device_timer import device_timer_ctx
 from sglang.srt.utils.nvtx_pytorch_hooks import PytHooks
 from sglang.srt.utils.nvtx_utils import profile_range
 from sglang.srt.utils.offloader import (
+    OffloaderContext,
     create_offloader,
-    get_offloader,
     set_offloader,
 )
 from sglang.srt.utils.profile_utils import build_step_span_name
@@ -456,7 +456,16 @@ class ModelRunner:
         self.prefill_shared_read_stager: Optional[Callable[[ForwardBatch], bool]] = None
 
         # CPU offload
-        set_offloader(create_offloader())
+        self.offloader = create_offloader(
+            OffloaderContext(
+                device=self.device,
+                gpu_id=self.gpu_id,
+                tp_rank=get_parallel().tp_rank,
+                model_config=self.model_config,
+                is_draft_worker=self.is_draft_worker,
+            )
+        )
+        set_offloader(self.offloader)
 
         self._weight_checker = WeightChecker(get_model=lambda: self.model)
 
@@ -1275,9 +1284,18 @@ class ModelRunner:
             self.remote_instance_weight_transporter.weight_info = (
                 loaded.remote_instance_weight_info
             )
+        # A placement provider may replace the model. Do not retain the old
+        # model through the load result while measuring the final placement.
+        del loaded
 
         if not self.is_draft_worker:
-            get_offloader().post_init()
+            self.offloader.post_init()
+            model = self.offloader.post_load_model(self.model)
+            if not isinstance(model, torch.nn.Module):
+                raise TypeError(
+                    "BaseOffloader.post_load_model must return a torch.nn.Module"
+                )
+            self.model = model
 
         self.maybe_precompile_model_kernels_after_loading()
 

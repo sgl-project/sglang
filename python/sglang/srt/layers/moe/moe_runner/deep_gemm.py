@@ -48,7 +48,7 @@ from sglang.srt.utils import (
     is_musa,
     is_npu,
 )
-from sglang.srt.utils.offloader import get_offloader
+from sglang.srt.utils.offloader import forbid_copy_engine_usage
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher.deepep import (
@@ -1425,7 +1425,7 @@ def pre_permute_deepep_normal_to_deep_gemm(
     m_indices = buffer_init(all_tokens, device=hidden_states.device, dtype=torch.int32)
     output_index = torch.empty_like(topk_ids)
 
-    if get_offloader().forbid_copy_engine_usage:
+    if forbid_copy_engine_usage():
         num_recv_tokens_per_expert_gpu = copy_list_to_gpu_no_ce(
             num_recv_tokens_per_expert
         )

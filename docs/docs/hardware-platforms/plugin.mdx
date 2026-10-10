@@ -878,6 +878,103 @@ sglang serve --model-path <model> [options]
 # Look for "Scheduler initialized!" in logs
 ```
 
+### Weight placement providers
+
+An SRT general plugin can register a weight offloader without replacing private
+model-loading methods. Use `register_offloader_factory` from
+`sglang.srt.utils.offloader` during plugin registration. Each worker process
+accepts one factory: registering the same callable again is harmless; registering
+a different callable raises an error.
+
+The factory receives an `OffloaderContext`, a frozen `msgspec.Struct` with
+runner-local fields:
+
+| Field | Meaning |
+| --- | --- |
+| `device: str` | Runner device type, such as `cuda` or `cpu` |
+| `gpu_id: int` | Runner device index |
+| `tp_rank: int` | Tensor-parallel rank |
+| `model_config: ModelConfig` | This runner's model configuration |
+| `is_draft_worker: bool` | Whether the runner loads a speculative draft model |
+
+Return a fresh `BaseOffloader` instance for each runner, or `None` to use SGLang's
+native offloader selection for that runner. The context's fields cannot be
+reassigned; this does not make the referenced `model_config` deeply immutable.
+Copy-engine eligibility is conservative across the process: if any live offloader
+returns `True` from `forbid_copy_engine_usage`, the shared copy-engine path is
+unavailable to other runners too. Separate instances do not imply support for
+concurrent or reentrant model construction.
+
+For example, create `my_weight_plugin/__init__.py` with this no-op provider:
+
+```python
+from sglang.srt.utils.offloader import (
+    BaseOffloader,
+    OffloaderContext,
+    register_offloader_factory,
+)
+
+
+class PlacementOffloader(BaseOffloader):
+    def __init__(self, context: OffloaderContext):
+        self.context = context
+
+    def post_load_model(self, model):
+        # Finalize your target model's placement here.
+        return model
+
+
+def create_offloader(context: OffloaderContext):
+    return PlacementOffloader(context)
+
+
+def register():
+    register_offloader_factory(create_offloader)
+```
+
+Use this `pyproject.toml` beside the package directory, then install the package
+with `pip install -e .` in your SGLang environment:
+
+```toml
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "my-weight-plugin"
+version = "0.1.0"
+
+[project.entry-points."sglang.srt.plugins"]
+weight_placement = "my_weight_plugin:register"
+```
+
+This example leaves placement unchanged and uses the device selected by your
+existing SGLang launch configuration. If you filter general plugins with
+`SGLANG_PLUGINS`, include `weight_placement`.
+
+For a target runner, SGLang calls the provider's `post_load_model(model)` once,
+after the platform's `post_load_model` and the offloader's `post_init`, but before
+profiling hooks, weight-memory measurement, KV-cache sizing, and CUDA Graph
+capture. It must return a `torch.nn.Module`; the default returns the input model.
+Returning the same model preserves its identity. If you return a replacement,
+you must preserve the model interface and any references or hooks installed by
+the loader or platform. Draft runners use the provider's `wrap_modules` during
+construction but do not call its `post_init` or `post_load_model`.
+`wrap_modules` runs once per `make_layers` stack; its `submodule_accessor` and
+`whitelist_param_names_creator` arguments may be `None`.
+
+The plugin owns tensor relocation and the forward behavior needed to use those
+tensors. Moving weights to CPU alone does not provide on-demand GPU transfers or
+guarantee a larger KV cache. Validate inference and memory accounting for each
+supported model and platform.
+
+An active provider cannot be combined with `--cpu-offload-gb` greater than zero,
+`--offload-group-size` greater than zero, or `--startup-weight-load-mode=overlap`.
+These checks apply only when the factory returns a provider; returning `None`
+retains native behavior. Factory and `post_load_model` exceptions abort runner
+initialization. General-plugin discovery and registration retain their existing
+error-handling policy, so inspect startup logs to confirm your plugin registered.
+
 ### Hook Types
 
 `HookRegistry` supports four hook types:
