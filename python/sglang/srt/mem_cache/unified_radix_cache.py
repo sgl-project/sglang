@@ -3466,6 +3466,8 @@ class UnifiedRadixCache(BasePrefixCache):
         return 0, last_best_match_device_node_id
 
     def load_back_is_cache_owned(self) -> bool:
+        # Linker-loaded slots stay request-owned until the load succeeds.
+        # Keep cache_protected_len unchanged so failed loads can be freed.
         return self.linker is None
 
     def finish_external_linker_loads(self, reqs: list[Req]) -> list[Req]:
