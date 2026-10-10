@@ -668,6 +668,12 @@ class TraceReqContext:
             logger.warning(
                 f"Slice name mismatch: {name} != {cur_slice.slice_name} or level mismatch: {level} != {cur_slice.level}"
             )
+            # End the span before discarding the slice. Once it is popped
+            # nothing can reach it again, so leaving it unended keeps it
+            # recording forever and it is never exported. abort() ends the
+            # slices it discards for the same reason.
+            if cur_slice.span:
+                cur_slice.span.end(end_time=ts)
             self.thread_context.cur_slice_stack.pop()
             return
 
