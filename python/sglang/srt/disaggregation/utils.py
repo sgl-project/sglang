@@ -1440,7 +1440,14 @@ def setup_state_kv_args(
             )
         if token_to_kv_pool.index_k_pool is not None:
             dp, dl, il = token_to_kv_pool.get_index_k_state_buf_infos()
-            append_state_component(kv_args, StateType.MINIMAX_INDEX_K, dp, dl, il)
+            append_state_component(
+                kv_args,
+                StateType.MINIMAX_INDEX_K,
+                dp,
+                dl,
+                il,
+                layer_ids=list(token_to_kv_pool.index_k_layer_id_mapping),
+            )
         append_state_component(
             kv_args,
             StateType.MINIMAX_DENSE_KV,

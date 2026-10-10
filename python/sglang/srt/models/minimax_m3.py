@@ -45,6 +45,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layer_boundary import (
+    BatchVariant,
     append_stages,
     declare_attn,
     declare_ffn,
@@ -266,6 +267,34 @@ class _FusedQKVIndexProj(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self._qm.apply(self, x, None)
+
+
+def _normalize_scattered_pp_proxy_tensors_for_cuda_graph(
+    pp_proxy_tensors: PPProxyTensors,
+    *,
+    positions: torch.Tensor,
+    attn_tp_size: int,
+) -> PPProxyTensors:
+    """Slice graph dummy PP inputs to the token-local shape used by EP."""
+    global_num_tokens = positions.shape[0]
+    if attn_tp_size <= 1 or global_num_tokens % attn_tp_size != 0:
+        return pp_proxy_tensors
+
+    token_keys = ("hidden_states", "residual")
+    if not all(
+        key in pp_proxy_tensors.tensors
+        and pp_proxy_tensors[key].shape[0] == global_num_tokens
+        for key in token_keys
+    ):
+        return pp_proxy_tensors
+
+    local_num_tokens = global_num_tokens // attn_tp_size
+    return PPProxyTensors(
+        {
+            key: (value[:local_num_tokens] if key in token_keys else value)
+            for key, value in pp_proxy_tensors.tensors.items()
+        }
+    )
 
 
 def build_minimax_fused_qkv_index(model: nn.Module) -> None:
@@ -1684,7 +1713,17 @@ class MiniMaxM3Model(nn.Module):
             residual_batch.start(forward_batch)
         else:
             assert pp_proxy_tensors is not None
-            hidden_states = self.layers[self.start_layer].attn_boundary.from_pp(
+            first_layer = self.layers[self.start_layer]
+            if (
+                first_layer.attn_boundary.plan.variant_for(forward_batch)
+                is BatchVariant.INPUT_SCATTERED
+            ):
+                pp_proxy_tensors = _normalize_scattered_pp_proxy_tensors_for_cuda_graph(
+                    pp_proxy_tensors,
+                    positions=positions,
+                    attn_tp_size=get_parallel().attn_tp_size,
+                )
+            hidden_states = first_layer.attn_boundary.from_pp(
                 pp_proxy_tensors, forward_batch
             )
 

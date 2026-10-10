@@ -2068,10 +2068,15 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 if self.request_status.get(req.room, KVPoll.Failed) == KVPoll.Failed:
                     return rc
             elif st in (StateType.MINIMAX_INDEX_K, StateType.MINIMAX_DENSE_KV):
-                # Compacted layer lists require equal TP and PP=1 on both peers.
-                if self.pp_size is not None and self.pp_size > 1:
+                # Dense state still has no global layer identity. Sparse index
+                # entries can support PP by pairing them by global layer id.
+                if (
+                    st == StateType.MINIMAX_DENSE_KV
+                    and self.pp_size is not None
+                    and self.pp_size > 1
+                ):
                     raise RuntimeError(
-                        "PD disagg: PP>1 not supported for MiniMax state yet."
+                        "PD disagg: PP>1 not supported for MiniMax dense state yet."
                     )
                 if (
                     target_rank_registration_info is not None
@@ -2103,7 +2108,18 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         prefill_data_indices=np.array(src_indices, dtype=np.int32),
                         dst_data_indices=np.array(dst_indices_local, dtype=np.int32),
                         executor=executor,
+                        state_type=st,
                         force_flat=True,
+                        src_layer_ids=(
+                            src_state_layer_ids
+                            if st == StateType.MINIMAX_INDEX_K
+                            else None
+                        ),
+                        dst_layer_ids=(
+                            dst_state_layer_ids
+                            if st == StateType.MINIMAX_INDEX_K
+                            else None
+                        ),
                     )
                     or rc
                 )
