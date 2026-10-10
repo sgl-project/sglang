@@ -1080,6 +1080,8 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         kv_pool_cls: type = DeepSeekV4SingleKVPool
 
         self.request_window = None
+        # Stays None when request windows hold the SWA rows and no allocator pages them.
+        self.full_to_swa_index_mapping: Optional[torch.Tensor] = None
         encoder_replay = get_exec().features.enable_encoder_swa_bounded_replay
         # DSpark's draft shares the target's full-to-SWA mapping, so the target
         # keeps its paged SWA allocator even under encoder replay.

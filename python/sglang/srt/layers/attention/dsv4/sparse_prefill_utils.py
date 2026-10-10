@@ -348,7 +348,7 @@ class SparsePrefillChunkCache:
         query_pos: torch.Tensor,
         req_pool_indices: torch.Tensor,
         req_to_token: torch.Tensor,
-        full_to_swa: torch.Tensor,
+        full_to_swa: Optional[torch.Tensor],
         swa_window_size: int,
         swa_page_size: int,
         num_qo_tokens: int,
