@@ -224,6 +224,52 @@ def _two_rank_retry_trace(rank, rendezvous):
 
 
 class TestStagedPrefetchLifecycle(unittest.TestCase):
+    def test_device_covered_prefetch_preserves_loss_detection_boundary(self):
+        for phase in ("hit_commit", "staged_admission"):
+            with self.subTest(phase=phase):
+                retries = StoragePrefetchRetries()
+                req = SimpleNamespace(
+                    rid="r",
+                    cache_request_handle=_REQ,
+                    prefix_len=8,
+                    storage_prefetch_last_match_len=0,
+                )
+                pipeline = BufferModePipeline.__new__(BufferModePipeline)
+                pipeline._cache = SimpleNamespace(
+                    storage_prefetch_retries=retries,
+                    ongoing_prefetch={
+                        _REQ: SimpleNamespace(
+                            prefetch_key=RadixKey(array("q", range(8)))
+                        )
+                    },
+                    tree_core=SimpleNamespace(is_eagle=False),
+                    match_prefix=Mock(
+                        return_value=SimpleNamespace(device_prefix_len=8)
+                    ),
+                )
+                pipeline._prefetch_prefix_ctx = {_REQ: ([], None, None)}
+                pipeline.release_staged_hold = Mock()
+                if phase == "hit_commit":
+                    self.assertTrue(pipeline.staged_span_covered(_REQ, 8))
+                else:
+                    pipeline._resolve_device_covered(req)
+                    pipeline.release_staged_hold.assert_called_once_with(
+                        _REQ, reason="device_covered"
+                    )
+                # A sibling made the fetch redundant, then its prefix evicted
+                # before this request reached admission. The original match was 0.
+                req.prefix_len = 0
+                retries.update_device_coverage(req)
+                self.assertEqual(req.storage_prefetch_last_match_len, 8)
+                self.assertGreater(req.storage_prefetch_last_match_len, req.prefix_len)
+                # Abort/reset must not leak a boundary to another request attempt.
+                for cleanup in (lambda: retries.cancel(req.rid), retries.clear):
+                    retries.record_device_coverage(req.rid, 8)
+                    cleanup()
+                    req.storage_prefetch_last_match_len = 0
+                    retries.update_device_coverage(req)
+                    self.assertEqual(req.storage_prefetch_last_match_len, 0)
+
     def test_trim_and_stage_preserve_raw_token_boundaries(self):
         for bigram in (False, True):
             for trims in ((2,), (2, 2), (8,), (2, 6)):
