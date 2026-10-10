@@ -184,7 +184,7 @@ class Hunyuan3D2Pipeline(ComposedPipelineBase):
             pattern = "*.safetensors" if use_safetensors else "*.ckpt"
             files = glob.glob(os.path.join(local_path, pattern))
             if files:
-                ckpt_path = files[0]
+                ckpt_path = sorted(files)[0]
 
         logger.info("Config path: %s", config_path)
         logger.info("Checkpoint path: %s", ckpt_path)
