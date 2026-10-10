@@ -43,6 +43,7 @@ from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.jinja_template_utils import (
     jinja_template_may_reorder_tool_results,
 )
+from sglang.srt.parser.reasoning_parser import MiniMaxM3Detector
 from sglang.srt.parser.template_detection import ReasoningToggleConfig
 from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.sampling.sampling_params import (
@@ -4446,6 +4447,36 @@ class ServingChatTestCase(CustomTestCase):
         self.assertEqual(message.content, "\n\nThe answer is 42.\n")
 
     # ------------- reasoning config tests -------------
+    def test_minimax_m3_reasoning_toggle_round_trips(self):
+        """Regression: MiniMax-M3 thinking overrides must round-trip and preserve
+        unrelated template kwargs even when toggle metadata is absent or unset.
+        """
+        self.chat.reasoning_parser = "minimax-m3"
+        self.chat._reasoning_detector = MiniMaxM3Detector()
+
+        for config_name, config in (
+            ("absent", None),
+            ("uninferred", ReasoningToggleConfig()),
+        ):
+            self.template_manager.reasoning_config = config
+            for enabled, thinking_mode in ((True, "enabled"), (False, "disabled")):
+                with self.subTest(config=config_name, enabled=enabled):
+                    request = ChatCompletionRequest(
+                        model="x",
+                        messages=[{"role": "user", "content": "Hi?"}],
+                        chat_template_kwargs={"preserved": "value"},
+                    )
+
+                    self.chat.apply_reasoning_enabled(request, enabled)
+
+                    self.assertEqual(
+                        request.chat_template_kwargs,
+                        {"preserved": "value", "thinking_mode": thinking_mode},
+                    )
+                    self.assertEqual(
+                        self.chat._get_reasoning_from_request(request), enabled
+                    )
+
     def test_get_reasoning_from_request_default_true_toggle(self):
         self.tm.server_args.reasoning_parser = "qwen3"
         self.chat.reasoning_parser = "qwen3"

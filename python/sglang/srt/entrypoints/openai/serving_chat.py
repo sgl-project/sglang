@@ -2904,6 +2904,13 @@ class OpenAIServingChat(OpenAIServingBase):
                 request.reasoning_effort = "medium" if enabled else "no_think"
             return
 
+        if self.reasoning_parser == "minimax-m3":
+            request.chat_template_kwargs = {
+                **(request.chat_template_kwargs or {}),
+                "thinking_mode": "enabled" if enabled else "disabled",
+            }
+            return
+
         if self.reasoning_parser == "iquest_q1":
             request.chat_template_kwargs = {
                 **(request.chat_template_kwargs or {}),
