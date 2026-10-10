@@ -70,7 +70,7 @@ jobs:
         run: |
           uv pip install -e "python" --index-strategy unsafe-best-match --prerelease allow
           uv pip install pytest
-          uv pip install -e "tools/sglang-simulator[aic]"
+          uv pip install "./tools/sglang-simulator[aic]"
 
       - name: Prebuild HiCache native hash extension
         timeout-minutes: 5

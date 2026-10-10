@@ -221,6 +221,12 @@ Supported predictors:
 Relative predictor paths are resolved from the simulator configuration location.
 Environment variables in paths use `${NAME}` syntax.
 
+## Collect baselines
+
+Use [collect_baseline](src/sglang_simulator/tools/collect_baseline/README.md) to capture request traces
+and synchronized batch steps from a real SGLang server. Installing the package
+provides the `sglang-simulator-collect` command.
+
 ## Workload formats
 
 The Autobench trace format uses timestamps in milliseconds:
