@@ -17,13 +17,14 @@ register_cuda_ci(est_time=300, stage="base-b", runner_config="2-gpu-large")
 
 class TestFlashInferPrefillCPServer(GSM8KMixin, CustomTestCase):
     gsm8k_backend = "sgl_eval"
-    gsm8k_score_threshold = 0.38
+    gsm8k_score_threshold = 0.90
     gsm8k_num_examples = 200
-    gsm8k_max_tokens = 512
+    gsm8k_num_threads = 8
+    gsm8k_max_tokens = 1024
 
     @classmethod
     def setUpClass(cls):
-        cls.model = "Qwen/Qwen3-0.6B"
+        cls.model = "Qwen/Qwen3-8B"
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
