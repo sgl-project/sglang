@@ -1573,6 +1573,13 @@ def get_mha_host_pool_cls(device_pool: MHATokenToKVPool) -> type:
         )
 
         return MHATokenToKVPoolMXFP8Host
+    from sglang.srt.mem_cache.pool_host.mha_fp4 import (
+        MHATokenToKVPoolFP4Host,
+        is_fp4_packed_pool,
+    )
+
+    if is_fp4_packed_pool(device_pool):
+        return MHATokenToKVPoolFP4Host
     if device_pool.head_dim != device_pool.v_head_dim:
         return AsymmetricMHATokenToKVPoolHost
     return MHATokenToKVPoolHost
