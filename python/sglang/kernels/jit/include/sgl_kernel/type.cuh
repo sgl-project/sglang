@@ -6,16 +6,26 @@
 /// Use `device::cast<To>(from_value)` for type conversion on device.
 
 #pragma once
+#include <sgl_kernel/cxx_compat.h>
+
 #include <sgl_kernel/utils.cuh>
 
+#if SGL_USE_CONCEPTS
+#include <concepts>
+#endif
 #include <cstddef>
 #include <limits>
 #include <type_traits>
 
 namespace sglang {
 
+#if SGL_USE_CONCEPTS
+template <typename T>
+struct DTypeTrait {};
+#else
 template <typename T, typename = void>
 struct DTypeTrait {};
+#endif
 
 #define SGL_REGISTER_PACKED(SELF, PACKED) \
   using self_t = SELF;                    \
@@ -55,8 +65,13 @@ struct DTypeTrait {};
   }                                                                 \
   static_assert(true)
 
+#if SGL_USE_CONCEPTS
+template <std::integral T>
+struct DTypeTrait<T> {
+#else
 template <typename T>
 struct DTypeTrait<T, std::enable_if_t<std::is_integral_v<T>>> {
+#endif
   SGL_REGISTER_PACKED(T, void);
   SGL_REGISTER_UNPACK(T, 1);
   SGL_REGISTER_FROM_DEFAULT();
