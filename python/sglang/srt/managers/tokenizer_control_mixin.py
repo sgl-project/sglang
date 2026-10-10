@@ -204,7 +204,44 @@ class TokenizerControlMixin:
                 import uuid
 
                 obj.corpus_id = uuid.uuid4().hex
-            if obj.file_path is not None:
+            if obj.token_chunks is not None:
+                if obj.file_path is not None or obj.documents is not None:
+                    raise ValueError(
+                        "token_chunks cannot be combined with file_path or documents."
+                    )
+                if (
+                    not isinstance(obj.token_chunks, list)
+                    or not obj.token_chunks
+                    or any(
+                        not isinstance(chunk, list)
+                        or not chunk
+                        or any(
+                            type(token) is not int or not 0 <= token < 2**31
+                            for token in chunk
+                        )
+                        for chunk in obj.token_chunks
+                    )
+                ):
+                    raise ValueError(
+                        "token_chunks must be a nonempty list of nonempty lists "
+                        "of nonnegative int32 token IDs."
+                    )
+                if any(
+                    token >= self.model_config.vocab_size
+                    for chunk in obj.token_chunks
+                    for token in chunk
+                ):
+                    raise ValueError(
+                        "token_chunks contains out-of-vocabulary token IDs."
+                    )
+                max_tokens = (
+                    self.server_args.speculative_ngram_external_corpus_max_tokens
+                )
+                if sum(map(len, obj.token_chunks)) > max_tokens:
+                    raise ValueError(
+                        "token_chunks exceeds speculative_ngram_external_corpus_max_tokens."
+                    )
+            elif obj.file_path is not None:
                 from sglang.srt.speculative.cpp_ngram.external_corpus import (
                     iter_external_corpus_chunks,
                 )
@@ -248,7 +285,7 @@ class TokenizerControlMixin:
             else:
                 return AddExternalCorpusReqOutput(
                     success=False,
-                    message="Either file_path or documents must be provided.",
+                    message="One of token_chunks, file_path or documents must be provided.",
                 )
             obj.file_path = None
             obj.documents = None

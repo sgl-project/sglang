@@ -1671,6 +1671,8 @@ class AddExternalCorpusReqInput(BaseReq, kw_only=True):
     corpus_id: Optional[str] = None
     file_path: Optional[str] = None
     documents: Optional[List[str]] = None
+    # Contiguous chunks of pretokenized input. Public callers supply vocabulary
+    # token IDs; the tokenizer does not add BOS or document separators.
     token_chunks: Optional[List[List[int]]] = None
 
 
