@@ -1115,8 +1115,8 @@ def maybe_download_model(
             if not is_lora:
                 is_valid, cleanup_performed = _ci_validate_diffusers_model(local_path)
                 if not is_valid:
-                    # In CI, if validation fails after download, we have a serious issue
-                    # If cleanup was performed, the next retry should get a fresh download
+                    # Not retried: the generic handler below re-raises it as a ValueError.
+                    # Cleanup, if performed, makes the next call download afresh.
                     raise ValueError(
                         f"CI validation failed for downloaded model at {local_path}. "
                         f"Some safetensors shards are missing. Cleanup performed: {cleanup_performed}."
