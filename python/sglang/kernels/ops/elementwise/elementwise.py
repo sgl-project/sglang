@@ -570,6 +570,7 @@ def _launch_fused_gate_sigmoid_mul(
         hidden_dim=hidden_dim,
         DO_ADD=do_add,
         USE_PDL=use_pdl,
+        GATE_ONLY=False,
         **config,
         **pdl_kwargs,
     )

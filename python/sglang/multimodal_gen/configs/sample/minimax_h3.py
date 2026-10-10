@@ -25,8 +25,7 @@ def _optional_unit_float(value: Any, field_name: str) -> float | None:
 
 @dataclass
 class MiniMaxH3SamplingParams(SamplingParams):
-    # The video/audio sigma schedules include both interval endpoints.
-    min_num_inference_steps: ClassVar[int] = 2
+    min_num_inference_steps: ClassVar[int] = 1
 
     height: int = 512
     width: int = 896
@@ -348,14 +347,15 @@ class MiniMaxH3SamplingParams(SamplingParams):
 class FastH3SamplingParams(MiniMaxH3SamplingParams):
     """FastH3 8-Step V2: nine sigma points, i.e. eight DiT forwards on the trained rungs."""
 
-    num_inference_steps: int = 9
+    num_inference_steps: int = 8
     quality: str = "lossless"
 
     def _validate(self) -> None:
         super()._validate()
-        if self.num_inference_steps != 9:
+        if self.num_inference_steps != 8:
             raise ValueError(
-                "FastH3 is distilled for exactly nine sigma grid points (eight DiT "
+                "FastH3 is distilled for exactly eight inference steps (nine sigma "
+                "grid points, eight DiT "
                 f"forwards); got num_inference_steps={self.num_inference_steps}. "
                 "Use MiniMaxAI/MiniMax-H3 for other schedules."
             )
