@@ -420,6 +420,12 @@ def handle_linear_attn_backend(server_args: Any):
                     f"algorithm={cfg.speculative_algorithm!r}, "
                     f"verify={verify!r}. Use SGLANG_RAGGED_VERIFY_MODE=static."
                 )
+        if envs.SGLANG_ENABLE_GDN_REPLAYSSM_FOLD.get() and cfg.pp_size > 1:
+            raise ValueError(
+                "SGLANG_ENABLE_GDN_REPLAYSSM_FOLD does not support pipeline "
+                f"parallelism (--pp-size={cfg.pp_size}); unset it to use the "
+                "circular ring."
+            )
         if cfg.disaggregation_mode == "prefill":
             raise ValueError(
                 "--enable-linear-replayssm-spec is not supported on a PD "

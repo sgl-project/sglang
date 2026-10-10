@@ -1482,17 +1482,21 @@ class KVCacheConfigurator:
         max_num_reqs: int,
         extra_max_context_len: int,
     ) -> ReqToTokenPool:
-        # DSPARK/DFLASH commit routes through the backend fold (KDA-only); a
-        # non-KDA model there would scatter a None intermediate_ssm and crash.
+        # DSPARK/DFLASH commit through update_mamba_state_after_mtp_verify: KDA
+        # folds there, and GDN takes the ring commit for DFLASH's linear chain.
+        # DSPARK on GDN is not wired; it would scatter a None intermediate_ssm.
         _algo = (get_spec().speculative_algorithm or "").upper()
         if (
             get_exec().mamba.enable_linear_replayssm_spec
-            and _algo in ("DSPARK", "DFLASH")
             and self.hybrid_kda_config is None
+            and (
+                _algo == "DSPARK"
+                or (_algo == "DFLASH" and self.hybrid_gdn_config is None)
+            )
         ):
             raise ValueError(
-                "--enable-linear-replayssm-spec with DSPARK/DFLASH requires a KDA "
-                "model; got a non-KDA model."
+                "--enable-linear-replayssm-spec with DSPARK requires a KDA model, and "
+                "with DFLASH a KDA or GDN model."
             )
         req_to_token_pool = HybridReqToTokenPool(
             size=max_num_reqs,
@@ -2848,7 +2852,13 @@ class KVCacheConfigurator:
         else:
             replayssm_ring_per_req = 0
         replayssm_ring_per_req = int(replayssm_ring_per_req * pp_layer_scale)
-        if replayssm_active and self.hybrid_kda_config is None:
+        # GDN compact replay is request scratch; the fold rings (KDA, and GDN
+        # under SGLANG_ENABLE_GDN_REPLAYSSM_FOLD) are attached to each mamba slot.
+        if (
+            replayssm_active
+            and self.hybrid_kda_config is None
+            and not envs.SGLANG_ENABLE_GDN_REPLAYSSM_FOLD.get()
+        ):
             replay_req_slots = (
                 get_schedule().max_running_requests // self.attn_dp_size + 1
             )
