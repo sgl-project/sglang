@@ -10,6 +10,7 @@ from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4PagedHostPool,
     DeepSeekV4StateHostPool,
 )
+from sglang.srt.mem_cache.pool_host import base
 from sglang.srt.mem_cache.pool_host import mha as mha_pool_host
 from sglang.srt.mem_cache.pool_host import mla as mla_pool_host
 from sglang.srt.mem_cache.pool_host.common import (
@@ -196,10 +197,10 @@ class TestHiCacheHostRegister(unittest.TestCase):
                         memory_pool_host,
                         "host_memory_budget_bytes",
                         return_value=1024**3,
-                    ),
+                    ) as budget,
                     mock.patch.dict(ALLOC_MEMORY_FUNCS, {"cpu": alloc}),
                 ):
-                    DeepSeekV4PagedHostPool(
+                    pool = DeepSeekV4PagedHostPool(
                         pool_name="test",
                         device_buffers=device_buffers,
                         item_bytes=11,
@@ -208,6 +209,9 @@ class TestHiCacheHostRegister(unittest.TestCase):
                         layout=layout,
                     )
 
+                budget.assert_called_once_with(
+                    allocator=pool.allocator, device=torch.device("cpu")
+                )
                 self.assertEqual(
                     alloc.call_args.kwargs["registration_granularity_bytes"],
                     3 * 11,
@@ -229,10 +233,10 @@ class TestHiCacheHostRegister(unittest.TestCase):
                         memory_pool_host,
                         "host_memory_budget_bytes",
                         return_value=1024**3,
-                    ),
+                    ) as budget,
                     mock.patch.dict(ALLOC_MEMORY_FUNCS, {"cpu": alloc}),
                 ):
-                    DeepSeekV4StateHostPool(
+                    pool = DeepSeekV4StateHostPool(
                         pool_name="test",
                         state_pools=state_pools,
                         num_host_pages=4,
@@ -240,10 +244,45 @@ class TestHiCacheHostRegister(unittest.TestCase):
                         layout=layout,
                     )
 
+                budget.assert_called_once_with(
+                    allocator=pool.allocator, device=torch.device("cpu")
+                )
                 self.assertEqual(
                     alloc.call_args.kwargs["registration_granularity_bytes"],
                     2 * 2 * 3,
                 )
+
+    def test_layer_first_v4_pool_checks_per_mapping_hugetlb_rounding(self):
+        alloc = mock.Mock(return_value=torch.empty(1, dtype=torch.uint8))
+        device_buffers = [torch.empty(1, dtype=torch.uint8) for _ in range(3)]
+        with (
+            envs.SGLANG_HUGEPAGE_MODE.override("prefer"),
+            envs.SGLANG_HUGEPAGE_SIZE.override("1GB"),
+            mock.patch.object(
+                memory_pool_host,
+                "host_memory_budget_bytes",
+                return_value=2 * 1024**3,
+            ),
+            mock.patch.object(base, "device_uses_allocator", return_value=True),
+            mock.patch.dict(ALLOC_MEMORY_FUNCS, {"cpu": alloc}),
+        ):
+            with self.assertRaises(ValueError):
+                DeepSeekV4PagedHostPool(
+                    pool_name="test",
+                    device_buffers=device_buffers,
+                    item_bytes=11,
+                    num_host_pages=4,
+                    slot_page_size=2,
+                    layout="layer_first",
+                )
+            DeepSeekV4PagedHostPool(
+                pool_name="test",
+                device_buffers=device_buffers,
+                item_bytes=11,
+                num_host_pages=4,
+                slot_page_size=2,
+                layout="page_first",
+            )
 
     def test_k_only_mha_page_layouts_use_page_registration_granularity(self):
         for layout in ("page_first", "page_first_direct"):
