@@ -4,8 +4,9 @@ Slim, KV-aware, OpenAI-compatible router for SGLang workers.
 
 Serves a single model and routes across its workers. Exposes
 `/v1/tokenize`, `/v1/detokenize`, `/v1/models`, [`/v1/embeddings`](#embeddings),
-[`/v1/classify`](#classify), [`/v1/rerank`](#rerank), `/v1/chat/completions` and
-SGLang's native [`/generate`](#native-generate) (buffered and SSE), plus
+[`/v1/classify`](#classify), [`/v1/rerank`](#rerank),
+[`/v1/chat/completions` and `/v1/completions`](#openai-over-generate) and SGLang's native
+[`/generate`](#native-generate) (buffered and SSE), plus
 `/healthz` / `/readyz` and `/metrics`. Worker pools come from either a static URL
 list or Kubernetes EndpointSlice discovery. Both edges speak cleartext HTTP/2
 where the peer does — see [HTTP/2](#http2).
@@ -176,8 +177,8 @@ an engine whose KV tokens have reached 95% of its capacity.
 Unsupported legacy options fail at startup.
 
 `--bucket-config buckets.json` replaces the default plain and P/D buckets. Each
-bucket is plain or P/D, and each group may set its own engines, policy and
-admission; see [POLICY_DESIGN.md](POLICY_DESIGN.md#7-configuration-and-compatibility):
+bucket is plain or P/D, and each group may set its own engines, policy,
+admission and affinity; see [POLICY_DESIGN.md](POLICY_DESIGN.md#7-configuration-and-compatibility):
 
 ```json
 {"buckets": [{
@@ -207,10 +208,20 @@ Omitting `--chat-routing` keeps the existing policies and defaults.
 Both reorg affinity policies accept `--affinity-mode prefer` (default) or
 `balanced`. Prefer keeps an admissible session binding or the best admissible
 prefix owner. Balanced samples a power-of-two alternative and switches only
-when the affinity engine's waiting uncached tokens exceed both
+when the affinity engine's load exceeds both
 `alternative * --affinity-load-factor` (default 2) and
-`alternative + --affinity-load-gap` (default 1024). Missing fresh native load
-preserves admissible affinity; ties also preserve it.
+`alternative + --affinity-load-gap`. `--affinity-balanced-by` picks the load:
+`prefill-tokens` (default; gap default 1024) is the engine's waiting uncached
+tokens plus the prompt tokens it would prefill for this request, so a cache owner
+is credited for its prefix (session-aware assumes the whole prompt on either
+engine); `running-requests` (gap default 4) ignores the request. Missing fresh load preserves admissible
+affinity; ties also preserve it.
+
+A bucket group may override these with `"affinity": {"mode", "balanced_by",
+"load_factor", "load_gap"}`; unset fields take the CLI values, and the balanced
+fields require `"mode": "balanced"`. For example, a session-aware group balanced
+by running requests:
+`"plain": {"affinity": {"mode": "balanced", "balanced_by": "running_requests"}}`.
 
 Both modes fall back within the group when affinity fails admission, excluding
 rejected engines. The fallback winner must pass admission; failure advances to
@@ -243,6 +254,29 @@ client sent. The router picks the first of these that applies:
 In PD mode, decode is ranked by load only. The bootstrap room satisfies
 `room % prefill_dp_size == prefill_rank`, which is how a decode engine finds
 the prefill rank.
+
+### Retries
+
+`--retry-max-attempts N` (default 1, which disables retries; 3 is typical) lets
+a request that fails before any response reaches the client be sent again to a
+worker it has not tried yet. A failure is a transport error, an open circuit
+breaker, a 5xx, a 429, or a timeout: `--request-timeout-secs` bounds a whole
+non-streaming response, and a streaming one until its headers arrive. SGLang's
+chat endpoint sends those headers with the first token, so for streaming chat
+the same flag bounds time to first token, queueing included; raise it for
+long-context or deeply queued fleets. Once a streaming response's 2xx status
+has been sent, it is never retried, and neither is any other 2xx or 4xx. In PD mode the failed
+side is excluded, or both sides when the caller set `rid`, which an engine still
+running it would refuse; a new pair gets a new bootstrap room. Retries share the
+request's `--stale-request-timeout-secs` deadline, and none starts after it. When
+every eligible worker has failed, the client gets the last failure.
+`sgl_router_retries_total` counts the retried attempts.
+
+Each retry first waits out a jittered exponential backoff: a random delay in
+`[d/2, d]`, where `d` starts at `--retry-initial-backoff-ms` (default 50),
+doubles per retry, and is capped at `--retry-max-backoff-ms` (default 2000).
+Set the initial backoff to 0 to retry immediately. A backoff never waits past
+the request's stale deadline.
 
 ### Engines with `--api-key`
 
@@ -365,16 +399,15 @@ text, as does any model whose template fails to load or render.
 
 Some chats additionally forward the rendered tokens to the engine as
 `input_ids`, retaining the original messages, so the engine skips
-re-tokenizing. How many depends on the model's renderer. DeepSeek-V4's native
-encoder is fixture-verified against SGLang's request normalization, so it
-forwards every chat except multimodal ones and those with caller-provided
-`input_ids`. Renderers without that verification (HF Jinja templates, Kimi-K3)
+re-tokenizing. How many depends on the model's renderer. DeepSeek-V4's and
+V4.1's native encoders are fixture-verified against SGLang's request
+normalization, so they forward every chat except multimodal ones and those with
+caller-provided `input_ids`. Renderers without that verification (HF Jinja templates, Kimi-K3)
 forward only plain text chat requests (string `content`, no tools, no template
 kwargs or reasoning controls or historical `reasoning_content`, no assistant
 continuation, no consecutive users or non-leading system turns) and warn
 `UNVERIFIED` at startup; every other request shape is rendered for routing
-only. DeepSeek-V4.1 forwards nothing — its renderer is not verified against
-current SGLang — while routing tokenization keeps working.
+only.
 
 Use matching model files on the router and workers, and set
 the same `--default-chat-template-kwargs`, `SGLANG_DEFAULT_THINKING`,
@@ -450,6 +483,32 @@ a single prompt that has none, and `--override-sampling-params` defaults. Under
 batch or `n > 1` request leaves the prefill rank to the engine, which gives item
 `i` the bootstrap room `room + i`.
 
+## OpenAI over /generate
+
+`/v1/completions` and `/v1/chat/completions` behave as the engine's own routes,
+but the router runs SGLang's OpenAI layer itself (`sglang-processor`'s `openai` module): it lowers
+the request to the `GenerateReqInput` SGLang would build, sends it to
+`/generate` like a native request, and builds the OpenAI response, buffered or
+SSE, from the engine's output. The engine's `/server_info` supplies the server
+args that layer reads (`--enable-cache-report`,
+`--stream-response-default-include-usage`, `--incremental-streaming-output`, the
+custom-labels header). Requests it cannot reproduce exactly go to the engine's
+own route as sent: workers that disagree on those args or never
+reported them, `--completion-template`, `return_hidden_states` and other
+`sglext` outputs, `echo` or `logprobs` without a router tokenizer, and bodies
+SGLang would reject. Chat also needs a renderer verified against SGLang (the
+`AllText` scope, DeepSeek-V4 and V4.1 today), router `--default-chat-template-kwargs`
+equal to the workers', a reasoning parser the processor reproduces
+(`deepseek-v4`, `deepseek-v41`) or none, and no media yet. Tools are served with `tool_choice`
+`auto` or `none`, non-strict, with standard JSON-schema types, and a tool
+parser the processor reproduces (`deepseekv4`, `deepseekv41`); `required`, named and strict
+tools take a constraint from the engine's xgrammar, so they go to the engine.
+The router reads the model's `config.json` and `generation_config.json` beside
+`--tokenizer-path` (or from the HF repo), as the engine reads them, so a local
+path should point into the model's directory. Engine env vars that change the
+layer (`SGLANG_TOOL_STRICT_LEVEL`, `SGLANG_FORWARD_UNKNOWN_TOOLS`) are taken as
+unset. `sgl_router_openai_route_total` counts each outcome.
+
 ## Embeddings
 
 `/v1/embeddings` has the engine's interface: the same OpenAI `EmbeddingRequest`
@@ -477,22 +536,20 @@ forwarded as sent, since the engine renders and tokenizes each query-document
 pair. Routing is on load, with each pair's size estimated from its text. As for
 embeddings, a PD fleet answers 400 and `--dp-aware` pins no rank.
 
-## DeepSeek V4
+## DeepSeek V4 and V4.1
 
-Native V4 rendering follows SGLang's serving path (`serving_chat.py`), not
-Dynamo's OpenAI defaults: all declared tools are rendered with SGLang's schema
+Native V4 and V4.1 rendering comes from `rust/sglang-processor`, shared with SGLang's Rust
+server, and follows SGLang's serving path (`serving_chat.py`), not Dynamo's
+OpenAI defaults: all declared tools are rendered with SGLang's schema
 defaults, reasoning effort comes from `reasoning` / `reasoning_effort`, and the
 official/preview effort profile is detected from the checkpoint's
 `encoding/encoding_dsv4.py` or overridden by `dsv4_reasoning_effort_profile` in
 `config.json`, as in SGLang. Reference prompts live in `tests/fixtures/deepseek/`
 and are regenerated by `tests/scripts/generate_deepseek_parity.py`.
 
-V4.1 Flash uses Dynamo's separate V4.1 encoder with SGLang's numeric reasoning
-budgets, tool payloads, and `<｜System｜>` markers — for routing tokenization
-only, since V4.1 never forwards `input_ids`. Developer messages and media are
-left to the worker (the pinned encoder renders them differently), and a
-non-default `SGLANG_DSV41_REASONING_EFFORT` still matters for cache-aware
-routing-hash parity.
+V4.1 Flash uses Dynamo's V4.1 encoder with SGLang's numeric reasoning budgets
+and tool payloads. Developer messages and media are left to the worker, since
+the encoder renders them differently.
 
 ## Kimi-K3
 

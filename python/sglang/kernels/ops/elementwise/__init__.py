@@ -13,6 +13,18 @@ from sglang.kernels.spec import CapabilityRequirement, KernelBackend, KernelSpec
 
 __all__ = []
 
+for _fn in ("hc_combine_gate", "hc_combine_apply", "hc_combine_apply_norm"):
+    register_kernel(
+        KernelSpec(
+            op=f"elementwise.{_fn}",
+            backend=KernelBackend.JIT,
+            target=f"sglang.kernels.ops.elementwise.hc_combine_decode:{_fn}",
+            capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(9, 0))}),
+            description="BF16 HC decode with four branches of width 2560 and PDL.",
+        )
+    )
+del _fn
+
 
 # Public entry points inventoried by logical operator group (RFC #29630).
 register_kernel(
