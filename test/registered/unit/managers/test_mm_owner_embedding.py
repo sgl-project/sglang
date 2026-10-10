@@ -346,7 +346,9 @@ def _run_cp_extend(model, forward_batch, coordinator):
 def _interleave_cp(cp_size, **parallel):
     init_cp_strategy(enable_prefill_cp=True, cp_size=cp_size, cp_strategy="interleave")
     try:
-        with get_parallel().override(attn_cp_size=cp_size, **parallel):
+        with get_parallel().override(
+            attn_cp_size=cp_size, enable_cp_tp_group_sharing=False, **parallel
+        ):
             yield
     finally:
         init_cp_strategy(enable_prefill_cp=False, cp_size=1, cp_strategy="interleave")

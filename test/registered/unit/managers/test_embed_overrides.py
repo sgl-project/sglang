@@ -659,6 +659,7 @@ class TestEmbedOverridesRejectMultimodal(CustomTestCase):
         self.manager.num_reserved_tokens = 0
         self.manager.allow_auto_truncate = False
         self.manager.validate_total_tokens = False
+        self.manager.model_config = SimpleNamespace(joint_head_config=None)
 
     def test_requests_with_overrides_and_images_are_rejected(self):
         """EmbeddingReqInput resolves embed_overrides only after validation, so

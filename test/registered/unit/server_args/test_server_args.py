@@ -4392,6 +4392,7 @@ class TestDeepseekV41VisionPrefillCPArgs(CustomTestCase):
             ),
             nvfp4_moe_meta=None,
             is_fp4_experts=False,
+            decision_config=None,
         )
         # The dummy path does not initialize phase configs.
         server_args.cuda_graph_config = CudaGraphConfig(

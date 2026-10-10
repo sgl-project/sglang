@@ -203,7 +203,10 @@ class TestDeepseekV41VisionPrefillCPInputs(CustomTestCase):
 
             with (
                 get_parallel().override(
-                    attn_cp_rank=rank, attn_cp_size=CP_SIZE, attn_cp_group=object()
+                    attn_cp_rank=rank,
+                    attn_cp_size=CP_SIZE,
+                    attn_cp_group=object(),
+                    enable_cp_tp_group_sharing=False,
                 ),
                 self._cp_collectives(full, rank),
                 torch.no_grad(),

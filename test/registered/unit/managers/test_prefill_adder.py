@@ -347,6 +347,7 @@ class TestPrefillAdder(CustomTestCase):
         self.mock_tree_cache.is_tree_cache.return_value = False
         self.mock_tree_cache.supports_fast_match_prefix.return_value = False
         self.mock_tree_cache.storage_prefetch_retries = None
+        self.mock_tree_cache.supports_prefix_sharing.return_value = False
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.grammar_manager = SimpleNamespace(has_waiting_grammars=lambda: False)
         scheduler.enable_priority_preemption = False
@@ -381,6 +382,7 @@ class TestPrefillAdder(CustomTestCase):
         scheduler.req_to_token_pool = SimpleNamespace()
         scheduler.disaggregation_mode = DisaggregationMode.NULL
         scheduler.enable_hicache_storage = False
+        scheduler.enable_lmcache = False
         scheduler.enable_hierarchical_cache = False
         scheduler.enable_unified_cache_external_linker = False
         scheduler.truncation_align_size = None
@@ -405,7 +407,7 @@ class TestPrefillAdder(CustomTestCase):
             return []
         admitted = list(schedule_batch.init_new.call_args.args[0])
         for req in admitted:
-            req.prefix_indices = list(range(req.extend_range.end))
+            req.prefix_len = req.extend_end
         return admitted
 
     def test_fcfs_admits_override_request_once_image_continuation_drains(self):
@@ -420,10 +422,11 @@ class TestPrefillAdder(CustomTestCase):
             req.positional_embed_overrides = object() if overrides else None
             req.beam_group = None
             req.inflight_middle_chunks = 0
+            req.kv = SimpleNamespace(holds_mamba=False)
             return req
 
         continuation = tagged("image-continuation", 20, multimodal=True)
-        continuation.prefix_indices = list(range(16))
+        continuation.prefix_len = 16
         scheduler = self.create_admission_scheduler(chunked_req=continuation)
         text = tagged("text", 2)
         override = tagged("override", 4, overrides=True)
