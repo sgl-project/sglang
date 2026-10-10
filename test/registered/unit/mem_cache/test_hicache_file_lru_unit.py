@@ -16,9 +16,11 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
+import concurrent.futures
 import os
 import shutil
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -214,6 +216,64 @@ class TestCapBasedEviction(HiCacheFileLRUTestBase):
         self.assertTrue(b.set("a", _t(100)))
         self.assertEqual(b._evictor._total_bytes, 100)
         self.assertEqual(len(b._evictor._lru), 1)
+
+    def test_same_key_writers_cannot_unpin_an_unfinished_write(self):
+        # Both committing and aborting a duplicate used to clear the original
+        # writer's reservation, allowing it to publish after eviction.
+        for fail_duplicate in (False, True):
+            with self.subTest(fail_duplicate=fail_duplicate):
+                b = self.make_backend(max_size="128", eviction_ratio=1.0)
+                ready = threading.Event()
+                release = threading.Event()
+                original_replace = os.replace
+                key_path = os.path.join(
+                    b.file_path, f"{b._get_suffixed_key('same')}.bin"
+                )
+
+                def controlled_replace(src, dst):
+                    if threading.current_thread().name.startswith("first-writer"):
+                        ready.set()
+                        if not release.wait(10):
+                            raise RuntimeError("first writer was not released")
+                    elif fail_duplicate and dst == key_path:
+                        raise OSError("duplicate publication failed")
+                    return original_replace(src, dst)
+
+                with (
+                    mock.patch(
+                        "sglang.srt.mem_cache.hicache_storage.os.replace",
+                        side_effect=controlled_replace,
+                    ),
+                    concurrent.futures.ThreadPoolExecutor(
+                        max_workers=1, thread_name_prefix="first-writer"
+                    ) as executor,
+                ):
+                    first = executor.submit(b.set, "same", _t(64, fill=7))
+                    try:
+                        self.assertTrue(ready.wait(10))
+                        duplicate = b.set("same", _t(64, fill=7))
+                        competing = b.set("other", _t(128, fill=9))
+                    finally:
+                        release.set()
+                    self.assertTrue(first.result(timeout=10))
+
+                stored_bytes = sum(
+                    os.path.getsize(os.path.join(b.file_path, name))
+                    for name in os.listdir(b.file_path)
+                    if name.endswith(".bin")
+                )
+                self.assertLessEqual(stored_bytes, 128)
+                self.assertFalse(duplicate)
+                self.assertFalse(competing)
+                torch.testing.assert_close(b.get("same", _t(64)), _t(64, fill=7))
+                # A rejected writer must leave no temporary files or prevent a
+                # later retry from evicting the now-completed original.
+                self.assertFalse(
+                    any(n.endswith(".tmp") for n in os.listdir(b.file_path))
+                )
+                self.assertTrue(b.set("other", _t(128, fill=9)))
+                self.assertFalse(b.exists("same"))
+                torch.testing.assert_close(b.get("other", _t(128)), _t(128, fill=9))
 
     def test_clear_resets_state(self):
         b = self.make_backend(max_size="300")
