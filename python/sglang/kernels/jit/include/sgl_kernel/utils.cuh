@@ -40,6 +40,9 @@
 #else
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp16.h>
+#if SGL_HIP_FP8_TYPES
+#include <hip/hip_fp8.h>
+#endif
 #include <hip/hip_runtime.h>
 #ifndef __grid_constant__
 #define __grid_constant__
@@ -89,15 +92,25 @@ using fp32x4_t = float4;
 using fp32_t = float;
 using fp16_t = __half;
 using bf16_t = __hip_bfloat16;
-using fp8_e4m3_t = uint8_t;
-using fp8_e5m2_t = uint8_t;
 using fp32x2_t = float2;
 using fp16x2_t = half2;
 using bf16x2_t = __hip_bfloat162;
+#if SGL_HIP_FP8_TYPES
+// gfx950 (OCP e4m3fn): HIP's fp8 types, so casts convert and the matcher tells fp8 from bytes as on CUDA
+using fp8_e4m3_t = __hip_fp8_e4m3;
+using fp8_e5m2_t = __hip_fp8_e5m2;
+using fp8x2_e4m3_t = __hip_fp8x2_e4m3;
+using fp8x2_e5m2_t = __hip_fp8x2_e5m2;
+using fp8x4_e4m3_t = __hip_fp8x4_e4m3;
+using fp8x4_e5m2_t = __hip_fp8x4_e5m2;
+#else
+using fp8_e4m3_t = uint8_t;
+using fp8_e5m2_t = uint8_t;
 using fp8x2_e4m3_t = uint16_t;
 using fp8x2_e5m2_t = uint16_t;
 using fp8x4_e4m3_t = uint32_t;
 using fp8x4_e5m2_t = uint32_t;
+#endif
 using fp32x4_t = float4;
 #endif
 

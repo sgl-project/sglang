@@ -123,6 +123,9 @@ def get_default_target_flags(arch: ArchInfo | None = None) -> List[str]:
                 flags.append("-DHIP_FP8_TYPE_FNUZ=1")
             else:
                 flags.append("-DHIP_FP8_TYPE_E4M3=1")
+            if "gfx950" in gcn_arch:
+                # fp8_*_t are HIP's fp8 types (utils.cuh); a -D flag, so host and device agree
+                flags.append("-DSGL_HIP_FP8_TYPES=1")
         except Exception:
             flags.append("-DHIP_FP8_TYPE_E4M3=1")
         return flags
