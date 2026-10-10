@@ -4268,6 +4268,56 @@ class TestNoneMeansUnset(CustomTestCase):
         self.assertIsNotNone(server_args.mamba_full_memory_ratio)
 
 
+class TestDcpGroupGeometryValidation(CustomTestCase):
+    """A DCP group must be a whole number of ranks inside one attention-TP
+    group -- one DP replica at one CP rank.
+
+    Both group families are built as contiguous chunks of the same TP group:
+    DCP in chunks of dcp_size, attention-TP in chunks of attn_tp_size. So the
+    binding constraint is attn_tp_size % dcp_size, and tp_size % dcp_size does
+    not imply it.
+    """
+
+    @staticmethod
+    def _args(**kwargs):
+        args = ServerArgs(model_path="dummy", **kwargs)
+        args._model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"]),
+            hf_text_config=SimpleNamespace(model_type="llama"),
+            is_multimodal=False,
+        )
+        return args
+
+    def test_ragged_split_is_rejected(self):
+        with self.assertRaises(ValueError) as caught:
+            handle_context_parallelism(self._args(tp_size=4, dcp_size=3))
+        self.assertIn("--dcp-size", str(caught.exception))
+        self.assertIn("tp_size=4", str(caught.exception))
+
+    def test_dcp_wider_than_the_attention_tp_group_is_rejected(self):
+        """The case tp_size % dcp_size misses: 4 % 4 == 0, but DP attention
+        halves the attention-TP width, so a 4-rank DCP group would straddle two
+        replicas decoding different batches."""
+        with self.assertRaises(ValueError) as caught:
+            handle_context_parallelism(
+                self._args(tp_size=4, attn_dp_size=2, dcp_size=4)
+            )
+        self.assertIn("attn_tp_size=2", str(caught.exception))
+
+    def test_cp_declared_by_a_model_override_is_counted(self):
+        """Prefill-CP model overrides declare attn_cp_size during resolution,
+        after the DCP flags are read; the check must see the declared width."""
+        args = self._args(tp_size=4, dcp_size=4)
+        declare_resolution(args, "test", attn_cp_size=2)
+        with self.assertRaises(ValueError) as caught:
+            handle_context_parallelism(args)
+        self.assertIn("attn_cp_size=2", str(caught.exception))
+
+    def test_dcp_nested_inside_each_dp_replica_is_accepted(self):
+        # Two 2-rank DCP groups, one per replica: [0,1] and [2,3].
+        handle_context_parallelism(self._args(tp_size=4, attn_dp_size=2, dcp_size=2))
+
+
 class TestTpLmHeadAllToAllNcclGraphRegister(unittest.TestCase):
     """The graph-captured TP LM-head all-to-all must not run with NCCL's
     graph buffer registration: registered graph-pool temporaries deadlock the

@@ -161,6 +161,26 @@ def handle_context_parallelism(server_args: Any):
             "Aiter allreduce fusion is not supported with context parallelism"
         )
 
+    # Must run here: the DP and CP widths are final only after DWDP and the
+    # model's prefill-CP overrides.
+    if cfg.dcp_size > 1:
+        attn_tp_size = derive_attn_tp_size(
+            tp_size=cfg.tp_size,
+            attn_cp_size=view.attn_cp_size,
+            attn_dp_size=view.attn_dp_size,
+        )
+        # DCP groups are contiguous dcp_size chunks of the TP group, so one
+        # that does not divide attention TP spans ranks holding other tokens.
+        if attn_tp_size % cfg.dcp_size != 0:
+            raise ValueError(
+                "Decode context parallelism must nest inside one attention-TP "
+                "group: the attention TP size must be evenly divisible by "
+                "--dcp-size / --decode-context-parallel-size, but got "
+                f"attn_tp_size={attn_tp_size} and dcp_size={cfg.dcp_size} "
+                f"(tp_size={cfg.tp_size}, attn_dp_size={view.attn_dp_size}, "
+                f"attn_cp_size={view.attn_cp_size})."
+            )
+
     if cfg.moe_dp_size > 1:
         # The tp_size is the world size, not the real tensor parallel size
         assert cfg.tp_size % cfg.moe_dp_size == 0, (
