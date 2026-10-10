@@ -52,9 +52,18 @@ class OutlinesGrammar(BaseGrammarObject):
         self.guide = guide
         self.jump_forward_map = jump_forward_map
         self.state = 0
+        self.eos_token_ids = set(guide.eos_tensor.tolist())
+        self.terminated = False
 
     def accept_token(self, token: int):
+        if self.terminated:
+            return
         self.state = self.guide.get_next_state(self.state, token)
+        # EOS moves the guide to state -1, which permits only EOS from then on.
+        self.terminated = self.state == -1 and token in self.eos_token_ids
+
+    def is_terminated(self):
+        return self.terminated
 
     def allocate_vocab_mask(
         self, vocab_size: int, batch_size: int, device

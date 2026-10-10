@@ -1926,7 +1926,13 @@ class Req(ReqDllmMixin):
             self.finished_len = self.sampling_params.max_new_tokens
             return
 
-        if self.grammar is not None and self.grammar.is_terminated():
+        # A grammar terminates on its stop token, so like EOS it does not end the
+        # request under ignore_eos; decoding continues unconstrained.
+        if (
+            self.grammar is not None
+            and self.grammar.is_terminated()
+            and not self.sampling_params.ignore_eos
+        ):
             self.finished_reason = FINISH_MATCHED_TOKEN(matched=self.output_ids[-1])
             return
 
