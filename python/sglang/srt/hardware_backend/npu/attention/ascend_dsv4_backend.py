@@ -929,6 +929,28 @@ class CompressorAscendBackendMixin:
             except Exception as _exc:
                 print(f"[XDIFF] skipped: {_exc}", flush=True)
 
+        # S232 Option D: dump positions_cmp_padding_c{ratio} (the RoPE position
+        # input to the op) so a MISS run vs a HIT run can be diffed for
+        # position/RoPE parity. Env DSV4_DUMP_C4POS=<any>, INDEXER only.
+        _want_pos = os.environ.get("DSV4_DUMP_C4POS")
+        if _want_pos and bool(compressor.is_in_indexer):
+            try:
+                import hashlib as _hlpos
+
+                _p = getattr(fm, f"positions_cmp_padding_c{ratio}")
+                _pc = _p.detach().to(torch.int64).cpu()
+                _n = int(_pc.numel())
+                print(
+                    f"[C4POS] layer={compressor.layer_id} idx=1 n={_n} "
+                    f"first={int(_pc[0]) if _n else -1} "
+                    f"last={int(_pc[-1]) if _n else -1} "
+                    f"md5={_hlpos.md5(_pc.numpy().tobytes()).hexdigest()[:16] if _n else 'empty'} "
+                    f"sum={int(_pc.sum().item()) if _n else 0}",
+                    flush=True,
+                )
+            except Exception as _exc:
+                print(f"[C4POS] skipped: {_exc}", flush=True)
+
         compressor_op = torch.ops.npu.compressor
         cmp_kv = compressor_op(
             x,
