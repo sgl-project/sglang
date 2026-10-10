@@ -38,6 +38,27 @@ def validator(monkeypatch):
     return PerformanceValidator(scenario, ToleranceConfig(0.25, 0, 0, 0, 0), [])
 
 
+@pytest.mark.parametrize("is_hip", [False, True])
+@pytest.mark.parametrize("metric", ["e2e", "load"])
+def test_latency_guard_platform_policy(validator, monkeypatch, is_hip, metric):
+    monkeypatch.setattr(utils.current_platform, "is_hip", lambda: is_hip)
+    warning = Mock()
+    monkeypatch.setattr(utils.logger, "warning", warning)
+    validate = getattr(validator, f"validate_{metric}")
+    validate(PerformanceSummary(1000, 0, 0, {}, [], {}, {}, load_time_ms=4000))
+    warning.assert_not_called()
+
+    slow = PerformanceSummary(10000, 0, 0, {}, [], {}, {}, load_time_ms=10000)
+    if is_hip:
+        validate(slow)
+        warning.assert_called_once()
+        assert "[AMD PERF WARNING]" in warning.call_args.args[0]
+    else:
+        with pytest.raises(AssertionError, match="Latency"):
+            validate(slow)
+        warning.assert_not_called()
+
+
 def test_slow_loading_fails_even_when_inference_passes(validator):
     summary = PerformanceSummary(1000, 0, 0, {}, [], {}, {}, load_time_ms=6000)
     validator.validate_e2e(summary)
