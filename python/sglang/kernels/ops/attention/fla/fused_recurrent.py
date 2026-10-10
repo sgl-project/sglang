@@ -252,7 +252,9 @@ def fused_recurrent_gated_delta_rule_packed_decode_kernel(
     x = a_val + dt_bias_val
     softplus_x = tl.where(x <= SOFTPLUS_THRESHOLD, tl.log(1.0 + tl.exp(x)), x)
     g_val = -tl.exp(A_log_val) * softplus_x
-    beta_val = tl.sigmoid(b_val).to(b.dtype.element_ty).to(tl.float32)
+    # no round-trip through the activation dtype -- beta feeds the persistent
+    # state and the rounding accumulates over decode steps (cf. vllm#53877)
+    beta_val = tl.sigmoid(b_val).to(tl.float32)
 
     b_h *= exp(g_val)
     b_v -= tl.sum(b_h * b_k[None, :], 1)
