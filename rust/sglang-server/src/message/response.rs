@@ -27,6 +27,13 @@ pub enum SinkError {
 }
 
 impl ResponseSink {
+    /// Whether the frontend has dropped this request's response receiver.
+    pub fn is_closed(&self) -> bool {
+        match self {
+            ResponseSink::Local(tx) => tx.is_closed(),
+        }
+    }
+
     /// Non-blocking send. `Err(Full)` = backpressure, `Err(Closed)` = client gone.
     pub fn try_send(&self, item: ResponseItem) -> Result<(), SinkError> {
         match self {
