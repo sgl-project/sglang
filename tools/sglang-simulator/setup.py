@@ -18,4 +18,7 @@ setup(
     packages=find_packages(where="src"),
     package_dir={"": "src"},
     py_modules=["usercustomize"],
+    package_data={
+        "sglang_simulator.tools.collect_baseline": ["README.md"],
+    },
 )

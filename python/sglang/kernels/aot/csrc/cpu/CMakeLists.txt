@@ -116,25 +116,22 @@ if("$ENV{SGLANG_CPU_FP8_CVT_FTZ}" STREQUAL "1")
     add_compile_definitions(SGLANG_CPU_FP8_CVT_FTZ)
 endif()
 
-if(MY_ARCH_DIR STREQUAL "x86_64")
+option(SGLANG_CPU_ENABLE_AVX512 "Enable AVX-512 and AMX optimizations on x86-64" ON)
+add_compile_options(-O3 -Wno-unknown-pragmas -fopenmp)
+
+if(MY_ARCH_DIR STREQUAL "x86_64" AND SGLANG_CPU_ENABLE_AVX512)
     add_compile_options(
-        -O3
-        -Wno-unknown-pragmas
         -march=x86-64-v4
         -mavx512bf16
         -mavx512vnni
         -mamx-tile
         -mamx-bf16
         -mamx-int8
-        -fopenmp
     )
+elseif(MY_ARCH_DIR STREQUAL "x86_64")
+    add_compile_options(-march=x86-64-v2)
 else()
-    add_compile_options(
-        -O3
-        -Wno-unknown-pragmas
-        -march=native
-        -fopenmp
-    )
+    add_compile_options(-march=native)
 endif()
 
 Python_add_library(common_ops MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
