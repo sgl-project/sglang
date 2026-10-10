@@ -14,6 +14,7 @@ from sglang.srt.constrained.base_grammar_backend import (
 from sglang.srt.constrained.reasoner_grammar_backend import ReasonerGrammarObject
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.environ import envs
+from sglang.srt.managers.io_struct import matches_abort_rid
 from sglang.srt.runtime_context import get_parallel, get_serving
 from sglang.srt.sampling.sampling_params import (
     get_request_reasoning_end_token_ids,
@@ -112,7 +113,7 @@ class GrammarManager:
 
     def abort_requests(self, recv_req: AbortReq):
         for req in self.grammar_queue:
-            if recv_req.abort_all or req.rid.startswith(recv_req.rid):
+            if recv_req.abort_all or matches_abort_rid(req.rid, recv_req.rid):
                 logger.debug(f"Abort grammar queue request. {req.rid=}")
                 if isinstance(req.grammar, futures.Future) and req.grammar:
                     req.grammar.cancel()
