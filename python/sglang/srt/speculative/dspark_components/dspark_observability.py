@@ -766,7 +766,14 @@ class DsparkStepObservers:
                 "SGLANG_SIMULATE_ACC_LEN (simulated correct_len breaks the "
                 "accept-probability bookkeeping of the estimator)."
             )
-        self._sts_collect_path = envs.SGLANG_DSPARK_STS_COLLECT_PATH.get()
+        self._sts_collect_path = (
+            envs.SGLANG_DSPARK_STS_COLLECT_PATH.get() if tp_rank == 0 else ""
+        )
+        if self._simulate_acc_len > 0 and self._sts_collect_path:
+            raise ValueError(
+                "SGLANG_DSPARK_STS_COLLECT_PATH cannot be combined with "
+                "SGLANG_SIMULATE_ACC_LEN (STS labels come from correct_len)."
+            )
         self._sts_recorder: Optional[StsDataRecorder] = None
 
     # --- step lifecycle -------------------------------------------------
@@ -839,11 +846,7 @@ class DsparkStepObservers:
     ) -> None:
         planner = self._planner
         if not proposal_folded:
-            self._maybe_record_sts_collect(
-                verify_ids_2d=verify_ids_2d,
-                target_logits=target_logits,
-                bs=bs,
-            )
+            self._maybe_record_sts_collect(correct_len=correct_len, layout=layout)
             self._confidence_probe.maybe_observe(
                 carries_confidence=planner.carries_confidence,
                 is_compact_mode=planner.is_compact_mode,
@@ -926,13 +929,7 @@ class DsparkStepObservers:
                 )
             )
 
-    def _maybe_record_sts_collect(
-        self,
-        *,
-        verify_ids_2d: torch.Tensor,
-        target_logits: Optional[torch.Tensor],
-        bs: int,
-    ) -> None:
+    def _maybe_record_sts_collect(self, *, correct_len: torch.Tensor, layout) -> None:
         if not self._sts_collect_path:
             return
         if not self._planner.carries_confidence:
@@ -946,14 +943,10 @@ class DsparkStepObservers:
                 gamma=self._gamma,
                 flush_every=_STS_COLLECT_FLUSH_EVERY,
             )
-        target_predict = torch.argmax(target_logits, dim=-1).view(
-            bs, self._verify_num_draft_tokens
-        )
-        num_correct_drafts, _ = compute_dflash_correct_drafts_and_bonus(
-            candidates=verify_ids_2d,
-            target_predict=target_predict,
-        )
+        # Label with the step's actual acceptance (greedy or rejection
+        # sampling), capped at the compact verify window.
         self._sts_recorder.record(
             confidence_raw=confidence_raw,
-            num_correct_drafts=num_correct_drafts,
+            num_correct_drafts=correct_len,
+            verify_lens=None if layout is None else layout.verify_lens,
         )
