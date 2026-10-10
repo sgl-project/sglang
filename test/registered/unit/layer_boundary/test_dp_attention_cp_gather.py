@@ -220,6 +220,10 @@ class TestDpCpGather(CustomTestCase):
                     ((dp_attention, "world_dp_gather_enabled"), lambda: False),
                     ((dp_attention, "_note_dp_gather_in_prefill_graph"), lambda: None),
                     ((dp_attention, "memcpy_func"), dp_attention.memcpy_cpu),
+                    (
+                        (dp_attention, "memcpy_with_zero_fill_func"),
+                        dp_attention.memcpy_cpu_with_zero_fill,
+                    ),
                     ((dp_attention, "tensor_model_parallel_all_reduce"), all_reduce),
                     (
                         (comm, "attention_tensor_model_parallel_all_reduce"),
