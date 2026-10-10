@@ -50,7 +50,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     check_cuda_graph_backend,
 )
 from sglang.srt.runtime_context import get_memory, get_parallel
-from sglang.srt.utils import get_device_module
+from sglang.srt.utils import get_device_module, is_cuda
 
 logger = logging.getLogger(__name__)
 
@@ -446,6 +446,8 @@ class HiCacheController:
         # Set by the scheduler to the forward stream; gates load-back H2D
         # behind in-flight forwards (see start_loading).
         self.load_fence_stream: Optional[torch.cuda.Stream] = None
+        self.restore_backward_overlap = False
+        self.restore_allocators = []
         self.ack_write_queue: List[HiCacheAck] = []
 
         self.l2_transfer_engine = L2TransferEngine(io_backend, mem_pool_host)
@@ -938,6 +940,53 @@ class HiCacheController:
     def _num_tokens_by_pool(self, op: CacheOperation) -> dict[str, int]:
         return {PoolName.KV.value: len(op.device_indices)}
 
+    def set_load_fence_stream(
+        self, stream: torch.cuda.Stream, restore_backward_overlap: bool = False
+    ) -> None:
+        self.load_fence_stream = stream
+        self.restore_backward_overlap = restore_backward_overlap
+        self.restore_allocators = []
+        if not restore_backward_overlap:
+            return
+
+        from sglang.srt.mem_cache.allocator import (
+            PagedTokenToKVPoolAllocator,
+            TokenToKVPoolAllocator,
+        )
+        from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+        from sglang.srt.mem_cache.pool_host import HostPoolGroup
+
+        assert is_cuda() and self.io_backend == "direct"
+        if isinstance(self.mem_pool_host, HostPoolGroup):
+            assert self.mem_pool_host.entry_map.keys() <= {
+                PoolName.KV,
+                PoolName.SWA,
+                PoolName.MAMBA,
+                # These sidecars share the target's destination page IDs.
+                PoolName.DRAFT,
+                PoolName.DRAFT_SWA,
+                PoolName.DRAFT_INDEXER,
+            }
+        allocator = self.mem_pool_device_allocator
+        self.restore_allocators = (
+            [allocator.full_attn_allocator, allocator.swa_attn_allocator]
+            if type(allocator) is SWATokenToKVPoolAllocator
+            else [allocator]
+        )
+        for allocator in self.restore_allocators:
+            # Relocating pools can reuse storage outside these free lists.
+            assert type(allocator) in (
+                TokenToKVPoolAllocator,
+                PagedTokenToKVPoolAllocator,
+            )
+            allocator.reset_reuse_tracking()
+
+    def begin_forward(self) -> None:
+        # Selection already submitted its restores. The scheduler's WAR wait
+        # for this forward orders the next restore after all older forwards.
+        for allocator in self.restore_allocators:
+            allocator.reset_reuse_tracking()
+
     def load(
         self,
         host_indices: torch.Tensor,
@@ -1049,10 +1098,12 @@ class HiCacheController:
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()
 
-        if self.load_fence_stream is not None:
-            # in overlap scheduling, reclaimed pages might still be written by the forward thread
-            # therefore a fence is needed for loading thread to prevent memory corruption
-            # todo: it's possible to use a finer-grained fence
+        needs_forward_fence = not self.restore_backward_overlap or any(
+            a.needs_restore_fence for a in self.restore_allocators
+        )
+        if self.load_fence_stream is not None and needs_forward_fence:
+            # Capture the prior forward dependency before the next forward can
+            # wait for this restore. Safe destinations need no payload fence.
             self.l2_transfer_engine.host_to_device_stream.wait_stream(
                 self.load_fence_stream
             )

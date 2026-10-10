@@ -1759,7 +1759,12 @@ class UnifiedRadixCache(BasePrefixCache):
         host_anchor_params: DecLockRefParams,
     ) -> bool:
         # Build the KV + per-component aux transfers.
-        kv_xfer, comp_xfers = self.tree_core.build_load_back_spec(node_id, req=req)
+        backward_overlap = get_memory().hicache_restore_backward_overlap
+        # Restore cache state only; forward-stream CoW preserves an in-flight
+        # request slot until its previous reader has finished.
+        kv_xfer, comp_xfers = self.tree_core.build_load_back_spec(
+            node_id, req=None if backward_overlap else req
+        )
         kv_tokens = len(kv_xfer.host_indices)
         sidecar_xfers = self._build_sidecar_transfers(
             CacheTransferPhase.LOAD_BACK, kv_xfer, comp_xfers
@@ -1827,6 +1832,12 @@ class UnifiedRadixCache(BasePrefixCache):
             self.inc_lock_ref(node_id).to_dec_params(),
             host_anchor_params,
         )
+
+        if backward_overlap and req is not None and ComponentType.MAMBA in comp_xfers:
+            req.kv.mamba_cow_src_index = self.tree_core.get_component_device_value(
+                node_id, ComponentType.MAMBA
+            )
+            req.kv.mamba_needs_clear = False
 
         return True
 

@@ -55,6 +55,9 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         self.device = device
         self._kvcache = kvcache
         self.need_sort = need_sort
+        # Newly freed pages stay at the free-list tail; None disables tracking.
+        self._pending_free_count: int | None = None
+        self._reused_pending_pages = False
 
         self.free_pages = None
         self.release_pages = None
@@ -179,6 +182,35 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     def available_size(self):
         return (len(self.free_pages) + len(self.release_pages)) * self.page_size
 
+    def reset_reuse_tracking(self) -> None:
+        """Reset pending-free accounting for a new reuse interval.
+
+        Caller WAR ordering must finish older forwards before the next restore.
+        """
+        self._pending_free_count = 0
+        self._reused_pending_pages = False
+
+    @property
+    def needs_restore_fence(self) -> bool:
+        return self._reused_pending_pages
+
+    def _consume_free_pages(self, num_pages: int) -> None:
+        if self._pending_free_count:
+            ready = self.available_size() // self.page_size - self._pending_free_count
+            pending = max(0, num_pages - ready)
+            self._reused_pending_pages |= pending > 0
+            self._pending_free_count -= pending
+        self.free_pages = self.free_pages[num_pages:]
+
+    def _sort_free_pages(self, pages: torch.Tensor) -> torch.Tensor:
+        if not self.need_sort:
+            return pages
+        pending = self._pending_free_count or 0
+        if pending:
+            ready = len(pages) - pending
+            return torch.cat((pages[:ready].sort().values, pages[ready:]))
+        return pages.sort().values
+
     def get_kvcache(self):
         return self._kvcache
 
@@ -207,7 +239,7 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     def merge_and_sort_free(self):
         if len(self.release_pages) > 0:
             self.free_pages = torch.cat((self.free_pages, self.release_pages))
-            self.free_pages, _ = torch.sort(self.free_pages)
+            self.free_pages = self._sort_free_pages(self.free_pages)
             self.release_pages = torch.empty(
                 (0,), dtype=self.release_pages.dtype, device=self.device
             )

@@ -34,12 +34,23 @@ class MambaSlotAllocator:
     def __init__(self, size: int, device: str):
         self.size = size
         self.device = device
+        self._pending_free_count: int | None = None
+        self._reused_pending_pages = False
         # Set by alloc_group_begin(); alloc(1) drains it until alloc_group_end().
         self._alloc_iter: Optional[Iterator] = None
         self.clear()
 
     def available_size(self) -> int:
         return len(self.free_slots)
+
+    def reset_reuse_tracking(self) -> None:
+        """Use the same restore interval as BaseTokenToKVPoolAllocator.reset_reuse_tracking."""
+        self._pending_free_count = 0
+        self._reused_pending_pages = False
+
+    @property
+    def needs_restore_fence(self) -> bool:
+        return self._reused_pending_pages
 
     def schedulable_available_size(self) -> int:
         """Planner-facing free count. Same as ``available_size`` for a static pool;
@@ -72,6 +83,11 @@ class MambaSlotAllocator:
     def _do_alloc(self, need_size: int) -> Optional[torch.Tensor]:
         if need_size > len(self.free_slots):
             return None
+        if self._pending_free_count:
+            ready = len(self.free_slots) - self._pending_free_count
+            pending = max(0, need_size - ready)
+            self._reused_pending_pages |= pending > 0
+            self._pending_free_count -= pending
         select_index = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
         return select_index
@@ -79,6 +95,8 @@ class MambaSlotAllocator:
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
+        if self._pending_free_count is not None:
+            self._pending_free_count += len(free_index)
         self.free_slots = torch.cat((self.free_slots, free_index))
 
     def clear(self):
@@ -86,3 +104,5 @@ class MambaSlotAllocator:
         self.free_slots = torch.arange(
             1, self.size + 1, dtype=torch.int64, device=self.device
         )
+        if self._pending_free_count is not None:
+            self.reset_reuse_tracking()

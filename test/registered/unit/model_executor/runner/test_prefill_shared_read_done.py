@@ -12,12 +12,19 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.runner_utils import (
     maybe_publish_prefill_shared_read_done,
 )
+from sglang.srt.runtime_context import get_context, get_memory
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_registry import CustomSpecAlgo
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+
+
+@pytest.fixture(autouse=True)
+def _restore_overlap_disabled():
+    with get_context().override_server_args(hicache_restore_backward_overlap=False):
+        yield
 
 
 class _Event:
@@ -218,6 +225,16 @@ class TestPrefillReadDoneCapability(CustomTestCase):
                         runner, _batch(mode), _DEVICE_MODULE
                     )
                 self.assertIsNone(runner.shared_read_done_event)
+
+
+def test_restore_overlap_enables_prefill_read_done():
+    runner = _model_runner()
+    with (
+        envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.override(False),
+        get_memory().override(hicache_restore_backward_overlap=True),
+    ):
+        maybe_publish_prefill_shared_read_done(runner, _batch(), _DEVICE_MODULE)
+    assert runner.shared_read_done_event.recorded
 
 
 if __name__ == "__main__":

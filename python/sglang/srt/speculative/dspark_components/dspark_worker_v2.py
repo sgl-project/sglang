@@ -25,6 +25,7 @@ from sglang.srt.model_loader.weight_utils import get_pp_stage_load_group
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
+    get_memory,
     get_parallel,
     get_schedule,
     get_spec,
@@ -316,6 +317,11 @@ class DSparkWorkerV2(BaseSpecWorker):
             verify_num_draft_tokens=self.verify_num_draft_tokens,
             block_pos_offsets=self._block_pos_offsets,
         )
+        if get_memory().hicache_restore_backward_overlap:
+            assert not self._draft_is_moe, (
+                "HiCache backward overlap requires static MHA pools"
+            )
+
         self._proposer = DraftBlockProposer(
             draft_model=self.draft_model,
             draft_model_runner=self.draft_model_runner,

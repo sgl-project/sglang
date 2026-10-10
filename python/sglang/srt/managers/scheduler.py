@@ -598,9 +598,26 @@ class Scheduler(
         if self.enable_hierarchical_cache:
             cache_controller = self.tree_cache.cache_controller
             if cache_controller is not None:
-                cache_controller.load_fence_stream = (
-                    self.tp_worker.model_runner.forward_stream
+                cache_controller.set_load_fence_stream(
+                    self.tp_worker.model_runner.forward_stream,
+                    restore_backward_overlap=get_memory().hicache_restore_backward_overlap,
                 )
+                if get_memory().hicache_restore_backward_overlap:
+                    from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
+                    from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
+
+                    assert self.enable_overlap
+                    assert (
+                        self.spec_algorithm.is_none() or self.spec_algorithm.is_dspark()
+                    )
+                    assert self.is_generation and not self.enable_pdmux
+                    assert get_parallel().pp_size == 1
+                    assert get_disagg().disaggregation_mode == "null"
+                    if isinstance(self.req_to_token_pool, HybridReqToTokenPool):
+                        allocator = self.req_to_token_pool.mamba_allocator
+                        assert type(allocator) is MambaSlotAllocator
+                        allocator.reset_reuse_tracking()
+                        cache_controller.restore_allocators.append(allocator)
                 if self.enable_unified_memory:
                     # Keep device rows stable until host transfers are acknowledged.
                     # Queue reads and relocation both run on the scheduler thread.
@@ -1964,6 +1981,11 @@ class Scheduler(
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
         self.enable_skip_finishing_decode = True
+        restore_controller = (
+            self.tree_cache.cache_controller
+            if get_memory().hicache_restore_backward_overlap
+            else None
+        )
         self.result_queue: Deque[
             Tuple[ScheduleBatch, Union[GenerationBatchResult, EmbeddingBatchResult]]
         ] = deque()
@@ -2009,6 +2031,8 @@ class Scheduler(
 
             # Launch the current batch
             if batch:
+                if restore_controller is not None:
+                    restore_controller.begin_forward()
                 batch_result = self.run_batch(batch)
                 # Fence result processing behind this forward's shared reads.
                 self._apply_war_barrier()
