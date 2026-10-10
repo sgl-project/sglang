@@ -1255,13 +1255,15 @@ class USPAttention(nn.Module):
             if get_ring_parallel_world_size() > 1:
                 if (
                     meta_only_pad
-                    and self.backend == AttentionBackendEnum.FA
+                    and self.attn_impl.supports_ring_kv_chunk()
                     and not self.causal
                 ):
                     return self._forward_ring_tail_pad(q, k, v, attn_mask_meta)
                 raise NotImplementedError(
                     "USPAttention masked path supports ring parallelism only "
-                    "for non-causal tail-pad metadata on the FA backend."
+                    "for non-causal tail-pad metadata on a backend with a ring "
+                    f"KV-chunk kernel; got {self.backend.name} with "
+                    f"causal={self.causal}."
                 )
             if attn_mask is not None and attn_mask.dim() != 2:
                 raise NotImplementedError(

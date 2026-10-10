@@ -57,6 +57,10 @@ class AttentionBackend(ABC):
         return cls.get_impl_cls().forward_varlen is not AttentionImpl.forward_varlen
 
     @classmethod
+    def supports_ring_kv_chunk(cls) -> bool:
+        return cls.get_impl_cls().supports_ring_kv_chunk()
+
+    @classmethod
     def supports_ring_rotation(cls) -> bool:
         """Whether this backend can serve as the ring-attention kernel; the
         per-hop online-softmax merge needs the kernel's softmax LSE."""
@@ -185,6 +189,10 @@ class AttentionImpl(ABC, Generic[T]):
         raise NotImplementedError(
             f"{type(self).__name__} does not implement ring KV-chunk attention"
         )
+
+    @classmethod
+    def supports_ring_kv_chunk(cls) -> bool:
+        return cls.forward_ring_kv_chunk is not AttentionImpl.forward_ring_kv_chunk
 
 
 def wrap_attention_impl_forward(attn_impl: AttentionImpl) -> AttentionImpl:

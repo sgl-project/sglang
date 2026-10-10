@@ -127,6 +127,10 @@ def _mock_cuda_platform(
             return_value=True,
         ),
         patch(
+            "sglang.multimodal_gen.runtime.platforms.current_platform.is_rocm",
+            return_value=False,
+        ),
+        patch(
             "sglang.multimodal_gen.runtime.platforms.current_platform.get_device_total_memory",
             return_value=memory_gb * 1024**3,
         ),
@@ -996,6 +1000,48 @@ class TestServerArgsPathExpansion(_CudaPlatformTestCase):
             )
 
         self.assertEqual(server_args.warmup_mode, "request")
+
+
+class TestRingAttentionBackendDefault(unittest.TestCase):
+    """`_adjust_attention_backend` picks the ring kernel the platform can serve."""
+
+    def _ring_kwargs(self, **extra):
+        return {
+            "model_path": "/fake",
+            "num_gpus": 2,
+            "sp_degree": 2,
+            "ring_degree": 2,
+            "performance_mode": "manual",
+            **extra,
+        }
+
+    def test_cuda_defaults_to_fa(self):
+        args = _from_dict_without_model_resolution(self._ring_kwargs())
+        self.assertEqual(args.attention_backend, "fa")
+
+    def test_rocm_defaults_to_aiter(self):
+        # FA dispatches through FA3 (CUDA-only), so ROCm resolves a "fa"
+        # default to a backend with no softmax LSE and cannot ring at all.
+        # is_rocm is entered after the CUDA fixture, which pins it to False.
+        with (
+            patch.object(
+                PipelineConfig, "from_kwargs", return_value=QwenImagePipelineConfig()
+            ),
+            _mock_cuda_platform(),
+            patch(
+                "sglang.multimodal_gen.runtime.platforms.current_platform.is_rocm",
+                return_value=True,
+            ),
+        ):
+            args = ServerArgs.from_dict(self._ring_kwargs())
+
+        self.assertEqual(args.attention_backend, "aiter")
+
+    def test_explicit_backend_survives_the_ring_default(self):
+        args = _from_dict_without_model_resolution(
+            self._ring_kwargs(attention_backend="sage_attn")
+        )
+        self.assertEqual(args.attention_backend, "sage_attn")
 
 
 class TestWarmupModeNormalization(unittest.TestCase):
