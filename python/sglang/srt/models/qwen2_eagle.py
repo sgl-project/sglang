@@ -24,6 +24,9 @@ from typing import Iterable, Optional, Tuple
 import torch
 from torch import nn
 
+from sglang.srt.layers.layer_boundary import layer_stack
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
+from sglang.srt.layers.layer_boundary.residual.post_norm import PLAIN_READOUT
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -51,7 +54,11 @@ class Qwen2DecoderLayer(Qwen2DecoderLayer):
         # https://github.com/SafeAILab/EAGLE/blob/35c78f6cdc19a73e05cf5c330b4c358dad970c6a/eagle/model/cnets.py#L427
         if layer_id == 0:
             del self.input_layernorm
-            setattr(self, "input_layernorm", lambda x, quant_linear=None: x)
+
+    def _attn_readout(self, layer_id: int):
+        if layer_id == 0:
+            return PLAIN_READOUT
+        return super()._attn_readout(layer_id)
 
 
 class Qwen2Model(nn.Module):
@@ -69,17 +76,18 @@ class Qwen2Model(nn.Module):
             config.hidden_size,
             prefix=add_prefix("embed_tokens", prefix),
         )
-        self.layers = nn.ModuleList(
-            [
-                Qwen2DecoderLayer(
-                    config,
-                    i,
-                    quant_config=quant_config,
-                    prefix=add_prefix(f"layers.{i}", prefix),
-                )
-                for i in range(config.num_hidden_layers)
-            ]
-        )
+        with layer_stack():
+            self.layers = nn.ModuleList(
+                [
+                    Qwen2DecoderLayer(
+                        config,
+                        i,
+                        quant_config=quant_config,
+                        prefix=add_prefix(f"layers.{i}", prefix),
+                    )
+                    for i in range(config.num_hidden_layers)
+                ]
+            )
         self.fc = torch.nn.Linear(config.hidden_size * 2, config.hidden_size)
 
     def forward(
@@ -99,16 +107,11 @@ class Qwen2Model(nn.Module):
             torch.cat((hidden_states, forward_batch.spec_info.hidden_states), dim=-1)
         )
 
-        residual = None
-        for i in range(len(self.layers)):
-            layer = self.layers[i]
-            hidden_states, residual = layer(
-                positions,
-                hidden_states,
-                forward_batch,
-                residual,
-            )
-        return hidden_states + residual
+        residual_batch.start(forward_batch)
+        for layer in self.layers:
+            hidden_states = layer(positions, hidden_states, forward_batch)
+        hidden_states = residual_batch.fold(hidden_states, forward_batch)
+        return residual_batch.take_output(hidden_states, forward_batch)
 
 
 class Qwen2ForCausalLMEagle(Qwen2ForCausalLM):

@@ -21,6 +21,12 @@ from openai.types.responses import (
     ResponseOutputText,
     ResponseReasoningItem,
 )
+from openai.types.responses.response_content_part_added_event import (
+    PartReasoningText as ResponseReasoningTextAddedPart,
+)
+from openai.types.responses.response_content_part_done_event import (
+    PartReasoningText as ResponseReasoningTextDonePart,
+)
 from openai.types.responses.response_custom_tool_call import ResponseCustomToolCall
 from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
 from openai.types.responses.response_output_text import Logprob, LogprobTopLogprob
@@ -1604,6 +1610,10 @@ class OpenAIServingResponses(OpenAIServingChat):
         # so chat templates render a single assistant block per turn.
         messages = self._merge_consecutive_assistant_messages(messages)
 
+        # Preserve the history prefix when a later instruction is appended.
+        if self.supports_inline_system:
+            return messages
+
         # Most chat templates expect a single leading ``system`` message;
         # coalesce any ``instructions`` + interleaved ``developer`` entries.
         system_chunks: list[str] = []
@@ -2285,6 +2295,18 @@ class OpenAIServingResponses(OpenAIServingChat):
                         text=text,
                     )
                 )
+                events.append(
+                    openai_responses_types.ResponseContentPartDoneEvent(
+                        type="response.content_part.done",
+                        item_id=reasoning_state["item_id"],
+                        sequence_number=-1,
+                        output_index=reasoning_state["output_index"],
+                        content_index=0,
+                        part=ResponseReasoningTextDonePart(
+                            type="reasoning_text", text=text
+                        ),
+                    )
+                )
             events += [
                 openai_responses_types.ResponseOutputItemDoneEvent(
                     type="response.output_item.done",
@@ -2521,6 +2543,17 @@ class OpenAIServingResponses(OpenAIServingChat):
                                 summary_index=0,
                                 part=ResponseReasoningSummaryAddedPart(
                                     type="summary_text", text=""
+                                ),
+                                sequence_number=-1,
+                            )
+                        else:
+                            yield openai_responses_types.ResponseContentPartAddedEvent(
+                                type="response.content_part.added",
+                                item_id=item_id,
+                                output_index=reasoning_state["output_index"],
+                                content_index=0,
+                                part=ResponseReasoningTextAddedPart(
+                                    type="reasoning_text", text=""
                                 ),
                                 sequence_number=-1,
                             )

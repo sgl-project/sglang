@@ -103,7 +103,7 @@ class TestLayerNormSPValidation(CustomTestCase):
     VALID = dict(
         architecture="Qwen3ForCausalLM",
         tp_size=2,
-        enable_dp_attention=False,
+        attn_dp_enabled=False,
         speculative_algorithm=None,
     )
 
@@ -119,8 +119,8 @@ class TestLayerNormSPValidation(CustomTestCase):
             validate_layernorm_sp(**{**self.VALID, "tp_size": 1})
 
     def test_rejects_dp_attention(self):
-        with self.assertRaisesRegex(ValueError, "dp-attention"):
-            validate_layernorm_sp(**{**self.VALID, "enable_dp_attention": True})
+        with self.assertRaisesRegex(ValueError, "attention DP"):
+            validate_layernorm_sp(**{**self.VALID, "attn_dp_enabled": True})
 
     def test_rejects_speculative(self):
         with self.assertRaisesRegex(ValueError, "speculative"):

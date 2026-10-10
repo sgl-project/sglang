@@ -136,6 +136,14 @@ pub enum SnapshotOutcome {
 }
 
 impl SnapshotOutcome {
+    /// Every variant, so the metrics surface can emit a zero row per label.
+    pub const ALL: [Self; 4] = [
+        Self::Accepted,
+        Self::Unreachable,
+        Self::ColdPeer,
+        Self::Rejected,
+    ];
+
     pub fn as_label(self) -> &'static str {
         match self {
             Self::Accepted => "accepted",
@@ -164,6 +172,15 @@ pub enum SweepOutcome {
 }
 
 impl SweepOutcome {
+    /// Every variant, so the metrics surface can emit a zero row per label.
+    pub const ALL: [Self; 5] = [
+        Self::Found,
+        Self::NoPeers,
+        Self::FleetCold,
+        Self::TimedOut,
+        Self::RanksResolved,
+    ];
+
     pub fn as_label(self) -> &'static str {
         match self {
             Self::Found => "found",
@@ -204,6 +221,19 @@ pub enum RankOutcome {
 }
 
 impl RankOutcome {
+    /// Every variant, so the metrics surface can emit a zero row per label.
+    pub const ALL: [Self; 9] = [
+        Self::Warm,
+        Self::Gap,
+        Self::WarmUnwitnessed,
+        Self::Uncovered,
+        Self::Abandoned,
+        Self::Overflow,
+        Self::PublisherReset,
+        Self::TreeRejected,
+        Self::FromOrigin,
+    ];
+
     pub fn as_label(self) -> &'static str {
         match self {
             Self::Warm => "warm",
@@ -470,6 +500,26 @@ mod tests {
             snap.wire_cursor_for("http://a:30000", 1),
             None,
             "a listed worker with no cursor entry is not a witness",
+        );
+    }
+
+    /// Connect and read cut a dead or stalled peer loose well inside the total
+    /// cap, which is what lets the cap be generous enough for a large healthy
+    /// snapshot.
+    #[test]
+    fn fetch_bounds_separate_hung_from_big() {
+        assert!(
+            SNAPSHOT_FETCH_CONNECT_TIMEOUT < DEFAULT_SNAPSHOT_FETCH_TIMEOUT_CAP,
+            "connect must cut a dead peer long before the total bound",
+        );
+        assert!(
+            SNAPSHOT_FETCH_READ_TIMEOUT < DEFAULT_SNAPSHOT_FETCH_TIMEOUT_CAP,
+            "an idle bound above the total can never fire, leaving the total as \
+             the hang detector again",
+        );
+        assert!(
+            DEFAULT_SNAPSHOT_FETCH_TIMEOUT_CAP >= Duration::from_secs(90),
+            "a cap this side of ~90s cannot seed a warm fleet",
         );
     }
 }

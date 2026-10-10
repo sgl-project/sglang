@@ -14,6 +14,7 @@
 """What each stage produces and needs, and the boundary steps chosen from those
 declarations."""
 
+from dataclasses import dataclass
 from functools import partial
 from typing import Callable, NamedTuple, Optional, Tuple
 
@@ -50,11 +51,13 @@ from sglang.srt.layers.layer_boundary.ops import (
     tp_slice,
     update_attn_tp_gather_output,
 )
+from sglang.srt.layers.layer_boundary.output import OutputTransform
 from sglang.srt.layers.layer_boundary.prepare import (
     _attn_tp_reduce_scatter_update_read,
     _attn_tp_slice_update_read,
     _dispatch_by_update,
     _dp_gather_sum_read,
+    _move_before_read,
     _reduce_update_read,
     _reduce_update_read_dp_gather,
     _run_entry,
@@ -64,6 +67,7 @@ from sglang.srt.layers.layer_boundary.prepare import (
     _tp_sum_with_residual_read,
     _update_read,
 )
+from sglang.srt.layers.layer_boundary.residual import ResidualReadout
 from sglang.srt.runtime_context import get_parallel
 
 
@@ -112,9 +116,6 @@ class ExitMove(NamedTuple):
     # Whether output_move also completes the sum the producer leaves.
     output_move_completes_sum: bool = False
     returns_over_dp: bool = False
-    # When output_move completes the sum: the move of an output compute has
-    # already reduced onto the same rows.
-    complete_output_move: Optional[Callable] = None
 
 
 def input_rows(edge: EdgeContract) -> Layout:
@@ -136,6 +137,48 @@ def _capture_move(edge: EdgeContract) -> Tuple[Optional[Callable], bool]:
     return move, bool(edge.residual_to.sharded - edge.produced.layout.sharded)
 
 
+@dataclass(frozen=True)
+class _TransformedRead:
+    """The read of an output its producer declared an OutputTransform on: the
+    transform runs on the complete sum, then the update and ``inner``. Not a
+    plain norm, so no fused add + norm and no residual-first order takes it."""
+
+    inner: ResidualReadout
+    transform: OutputTransform
+
+    is_plain_norm = False
+
+    @property
+    def reads_before_dp_gather(self):
+        return self.inner.reads_before_dp_gather
+
+    def init_residual(self, hidden_states):
+        return self.inner.init_residual(hidden_states)
+
+    def read(self, residual, norm, quant_format="", post_residual_addition=None):
+        return self.inner.read(residual, norm, quant_format, post_residual_addition)
+
+    def update_and_read(
+        self,
+        update,
+        hidden_states,
+        residual,
+        norm,
+        quant_format="",
+        post_residual_addition=None,
+    ):
+        if hidden_states.shape[0] != 0:
+            hidden_states = self.transform.apply(hidden_states)
+        return self.inner.update_and_read(
+            update,
+            hidden_states,
+            residual,
+            norm,
+            quant_format=quant_format,
+            post_residual_addition=post_residual_addition,
+        )
+
+
 def bind_entry(
     edge: EdgeContract,
     *,
@@ -144,6 +187,7 @@ def bind_entry(
     cp_moves: Optional[CpMoves] = None,
     enters_stack: bool = False,
     attn_input_adapter: Optional[Callable] = None,
+    attn_tp_gather: Optional[Callable] = None,
 ) -> EntryPath:
     """Bind the consumer half of an edge at construction time.
 
@@ -154,17 +198,34 @@ def bind_entry(
         cp_moves: Context-parallel strategy operations for this edge, if needed.
         enters_stack: Whether the read must initialize the stack's residual.
         attn_input_adapter: Hands an attention its input once it is on its rows.
+        attn_tp_gather: The stage's implementation of a gather over attention
+            TP, tried before the default one.
 
     Returns:
         An EntryPath whose prepare accepts the actual update from the stream.
         Multiple update capabilities select among preconstructed paths; a single
         capability needs no runtime dispatcher.
     """
+    if edge.produced.transform is not None:
+        # An attention's transform, run once its sum is complete.
+        edge = msgspec.structs.replace(
+            edge,
+            need=msgspec.structs.replace(
+                edge.need,
+                read=_TransformedRead(edge.need.read, edge.produced.transform),
+            ),
+            residual_joins_sum=False,
+        )
     capabilities = edge.arriving_plain_add
     if not capabilities:
         if edge.produced.update is None:
             raise ValueError("an arrival must declare its update capabilities")
         capabilities = (edge.produced.update.is_plain_add,)
+    gather_input = (
+        attn_tp_gather_input
+        if attn_tp_gather is None
+        else partial(attn_tp_gather_input, gather=attn_tp_gather)
+    )
     paths = {
         capability: _bind_entry_path(
             edge,
@@ -174,6 +235,7 @@ def bind_entry(
             cp_moves=cp_moves,
             enters_stack=enters_stack,
             attn_input_adapter=attn_input_adapter,
+            gather_input=gather_input,
         )
         for capability in capabilities
     }
@@ -201,6 +263,7 @@ def _bind_entry_path(
     cp_moves: Optional[CpMoves] = None,
     enters_stack: bool = False,
     attn_input_adapter: Optional[Callable] = None,
+    gather_input: Callable = attn_tp_gather_input,
 ) -> EntryPath:
     """The consumer's half of ``edge``, chosen from the edge's declarations and
     the producer's update: what a value carries for a batch (a sum or a handoff
@@ -224,6 +287,8 @@ def _bind_entry_path(
         residual_joins_sum=edge.residual_joins_sum,
         cp_moves=cp_moves,
         enters_stack=enters_stack,
+        gather_input=gather_input,
+        arrives_written=edge.arrives_written,
     )
     completed_step = None
     if edge.produced.always_partial:
@@ -290,7 +355,12 @@ def _bind_entry_path(
     )
 
 
-def bind_exit(edge: EdgeContract, *, cp_moves: Optional[CpMoves] = None) -> ExitMove:
+def bind_exit(
+    edge: EdgeContract,
+    *,
+    cp_moves: Optional[CpMoves] = None,
+    attn_tp_gather: Optional[Callable] = None,
+) -> ExitMove:
     """Bind the producer half of a layer or branch exit.
 
     Args:
@@ -298,6 +368,8 @@ def bind_exit(edge: EdgeContract, *, cp_moves: Optional[CpMoves] = None) -> Exit
             must outlive the producer; pipeline handoffs require a plain add
             or a residual already written by the producer.
         cp_moves: Context-parallel return operations, when the edge needs them.
+        attn_tp_gather: The stage's implementation of a gather over attention
+            TP, tried before the default one.
 
     Returns:
         An ExitMove with fixed transport or a marker for batch-dependent DP
@@ -320,6 +392,20 @@ def bind_exit(edge: EdgeContract, *, cp_moves: Optional[CpMoves] = None) -> Exit
         residual=edge.residual,
         to=edge.residual_to,
         cp_moves=cp_moves,
+        attn_tp_gather=attn_tp_gather,
+    )
+
+
+def _read_fusions(read, owes, is_plain_add, *, scatters):
+    """The kernels a read supplies that complete ``owes`` on the rows this
+    entry completes it on. They take the residual add themselves, so only a
+    plain one."""
+    if not is_plain_add:
+        return ()
+    return tuple(
+        f
+        for f in getattr(read, "completing_fusions", ())
+        if f.completes is owes and f.scatters == scatters
     )
 
 
@@ -334,6 +420,8 @@ def _select_entry_step(
     residual_joins_sum: bool,
     cp_moves: Optional[CpMoves],
     enters_stack: bool,
+    gather_input: Callable = attn_tp_gather_input,
+    arrives_written: bool = False,
 ) -> Tuple[Callable, Optional[Callable]]:
     """The steps into a stage for a value that is complete or owes the sum its
     producer always leaves, the fused kernels they try first, and the move
@@ -352,6 +440,36 @@ def _select_entry_step(
         raise NotImplementedError(f"{produced=}")
     gathered = produced.layout.sharded - need.layout.sharded - need.gathered_by_compute
     sliced = need.layout.sharded - produced.layout.sharded
+    if residual_to.sharded - produced.layout.sharded == {TokenAxis.ATTN_CP}:
+        # A head-parallel mixer consumes full context, but its residual and
+        # readout coefficients remain on the CP shard. Complete the producer's
+        # sum onto that shard before the (possibly nonlinear) update/read.
+        if (
+            residual != residual_to
+            or cp_moves is None
+            or owes not in (None, SumGroup.ATTN_CP)
+            or (owes is not None and cp_moves.reduce_scatter is None)
+        ):
+            raise NotImplementedError(f"{produced=} {residual=} {need=}")
+        local = msgspec.structs.replace(
+            produced, layout=residual_to, group=None, always_partial=False
+        )
+        read_local, input_move = _select_entry_step(
+            local,
+            residual=residual,
+            residual_to=residual_to,
+            need=need,
+            is_plain_add=is_plain_add,
+            fusions=(),
+            residual_joins_sum=False,
+            cp_moves=cp_moves,
+            enters_stack=enters_stack,
+        )
+        return partial(
+            _move_before_read,
+            move=cp_moves.reduce_scatter if owes is not None else cp_moves.take_back,
+            read=read_local,
+        ), input_move
     if sliced:
         # Each attention-TP rank takes its own slice: the reduce-scatter
         # completes the attention-TP sum and slices in one collective; a
@@ -364,14 +482,15 @@ def _select_entry_step(
             or residual not in (produced.layout, need.layout)
         ):
             raise NotImplementedError(f"{produced=} {residual=} {need=}")
+        if owes is SumGroup.ATTN_TP:
+            step = partial(
+                _attn_tp_reduce_scatter_update_read,
+                read_fusions=_read_fusions(read, owes, is_plain_add, scatters=True),
+            )
+        else:
+            step = _attn_tp_slice_update_read
         return (
-            partial(
-                _attn_tp_reduce_scatter_update_read
-                if owes is SumGroup.ATTN_TP
-                else _attn_tp_slice_update_read,
-                scatters_residual=residual != residual_to,
-                read=read,
-            ),
+            partial(step, scatters_residual=residual != residual_to, read=read),
             None,
         )
     if residual_to.sharded - produced.layout.sharded == {TokenAxis.ATTN_TP}:
@@ -424,7 +543,7 @@ def _select_entry_step(
         return (partial(cp_moves.gather, gather=on_chunk), None)
     if gathered == {TokenAxis.ATTN_TP}:
         # A complete input on each rank's slice, gathered over attention TP
-        # once it is read.
+        # once it is read, unless one of the read's own kernels gathers it.
         if (
             owes is not None
             or residual != residual_to
@@ -437,8 +556,13 @@ def _select_entry_step(
                 pre_move=None,
                 enters_stack=enters_stack,
                 read=read,
+                read_gathers=(
+                    getattr(read, "gathering_reads", ())
+                    if is_plain_add or arrives_written
+                    else ()
+                ),
             ),
-            attn_tp_gather_input,
+            gather_input,
         )
     if (
         residual_to != produced.layout
@@ -484,22 +608,24 @@ def _select_entry_step(
             return (partial(_tp_sum_with_residual_read, read=read), None)
         # A sum over TP completes only on rows every TP rank holds: the TP group
         # spans attention DP and CP.
-        if owes is not SumGroup.ATTN_TP and (
+        if owes not in (SumGroup.ATTN_TP, SumGroup.ATTN_CP) and (
             owes is not SumGroup.TP or produced.layout.sharded
         ):
             raise NotImplementedError(f"{produced=} {need=}")
         fused = tuple(f for f in fusions if f.completes is owes)
+        read_fused = _read_fusions(read, owes, is_plain_add, scatters=False)
         return (
             partial(
                 _reduce_update_read,
                 gathers_residual=gathers_residual,
                 fusions=tuple(f.run for f in fused),
+                read_fusions=read_fused,
                 group=owes,
                 read=read,
             ),
             None,
         )
-    if owes not in (None, SumGroup.ATTN_TP):
+    if owes not in (None, SumGroup.ATTN_TP, SumGroup.ATTN_CP):
         raise NotImplementedError(f"{produced=} {need=}")
     owes_attention_tp = owes is SumGroup.ATTN_TP
     # The partial order adds the residual on attention-TP rank 0 before the DP
@@ -527,7 +653,8 @@ def _select_entry_step(
         partial(
             _reduce_update_read_dp_gather,
             gathers_residual=gathers_residual,
-            reduces_attention_tp=owes_attention_tp,
+            reduces_attention_tp=owes is not None,
+            group=owes,
             places_cp_shards=places_cp_shards,
             read=read,
         ),
@@ -541,12 +668,12 @@ def _select_exit_move(
     residual: Layout,
     to: Layout,
     cp_moves: Optional[CpMoves] = None,
+    attn_tp_gather: Optional[Callable] = None,
 ) -> ExitMove:
     """How the FFN output reaches the rows the layer hands on: by undoing the
     attention-DP gather (the FFN exit and finish run that step), or else the
-    move that takes it there, None when there is none to choose here; whether
-    that move also completes the sum the FFN leaves, and if so the move for an
-    output compute already reduced."""
+    move that takes it there, None when there is none to choose here; and
+    whether that move also completes the sum the FFN leaves."""
 
     update = produced.update
     if produced.layout == residual:
@@ -555,7 +682,13 @@ def _select_exit_move(
         if to.sharded == residual.sharded - {TokenAxis.ATTN_TP}:
             # Each rank's slice back to the attention's rows: write the output
             # into the residual, then gather over attention TP.
-            return ExitMove(partial(update_attn_tp_gather_output, update=update))
+            return ExitMove(
+                partial(
+                    update_attn_tp_gather_output,
+                    update=update,
+                    gather=attn_tp_gather,
+                )
+            )
         raise NotImplementedError(f"{produced=} {residual=} {to=}")
     returned = residual.sharded - produced.layout.sharded
     if returned == {TokenAxis.ATTN_TP} and to in (residual, produced.layout):
@@ -579,12 +712,6 @@ def _select_exit_move(
                 update=update,
             ),
             output_move_completes_sum=True,
-            complete_output_move=partial(
-                residual_slice_output,
-                sums=False,
-                gathers_back=to != residual,
-                update=update,
-            ),
         )
     if to != residual or not produced.layout.sharded <= residual.sharded:
         raise NotImplementedError(f"{produced=} {residual=} {to=}")
@@ -594,17 +721,16 @@ def _select_exit_move(
         if not produced.may_reduce_scatter:
             # A complete output: this rank's block of it, nothing summed.
             return ExitMove(cp_moves.take_back)
-        # The FFN leaves its sum: only a take-back that sums over the same
-        # ranks completes it.
-        if cp_moves.reduce_scatter is None or not _same_ranks(
-            _sum_group(produced.group), cp_moves.reduce_scatter_group()
-        ):
+        if cp_moves.reduce_scatter is None:
             raise NotImplementedError(f"{produced=} {residual=} {to=}")
-        return ExitMove(
-            cp_moves.reduce_scatter,
-            output_move_completes_sum=True,
-            complete_output_move=cp_moves.take_back,
-        )
+        # Only a take-back over the FFN's sum group can complete its reduction.
+        # With attention TP > 1, the full TP sum spans more ranks than CP:
+        # let the exit complete that sum, then take this rank's CP rows.
+        if not _same_ranks(_sum_group(produced.group), cp_moves.reduce_scatter_group()):
+            if produced.always_partial:
+                raise NotImplementedError(f"{produced=} {residual=} {to=}")
+            return ExitMove(cp_moves.take_back)
+        return ExitMove(cp_moves.reduce_scatter, output_move_completes_sum=True)
     if returned == {TokenAxis.ATTN_DP, TokenAxis.ATTN_CP}:
         # This rank's CP shard, from where the DP gather put it.
         return ExitMove(dp_cp_take_back_output)

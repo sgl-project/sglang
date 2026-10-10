@@ -235,7 +235,7 @@ class TestUnoLoRATargets(CustomTestCase):
     def test_manager_rejects_uno_with_dp_attention(self):
         with (
             get_context().override_server_args(
-                enable_dp_attention=True, enable_lora_overlap_loading=False
+                tp_size=2, attn_dp_size=2, enable_lora_overlap_loading=False
             ) as args,
             get_parallel().override(attn_tp_size=1),
             self.assertRaisesRegex(

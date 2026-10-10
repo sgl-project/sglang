@@ -5,10 +5,9 @@ mod regex;
 mod request;
 mod sampling;
 mod service;
-mod template;
 mod tokenizer;
 
-pub(crate) use chat::{ChatPreprocessor, LoweredChat, dynamo_parser_name};
+pub(crate) use chat::{ChatPreprocessor, LoweredChat};
 pub use chat::{ChatRequest, ReasoningEffort};
 pub use request::{
     GenerateRequest, GenerateRequestMetadata, GenerateSamplingParams, GenerationOptions,
@@ -17,11 +16,10 @@ pub use request::{
 pub(crate) use request::{GenerateRequestIdentity, TextRequestGroup};
 pub use sampling::SamplingParams;
 pub use service::{PreparedChat, RendererService};
-pub(crate) use template::ChatFormatter;
+pub(crate) use sglang_processor::ChatFormatter;
 #[cfg(test)]
 pub(crate) fn load_test_chat_formatter(name: &str) -> ChatFormatter {
-    template::load_chat_formatter(None, None, Some(name)).unwrap()
+    sglang_processor::load_chat_formatter(None, None, None, Some(name)).unwrap()
 }
-pub use tokenizer::{DynamoTokenizer, TextTokenizer, load_tokenizer};
-#[cfg(feature = "http")]
-pub(crate) use tokenizer::{resolve_model_file, resolve_tokenizer_file};
+pub use sglang_processor::{DynamoTokenizer, TextTokenizer, load_tokenizer};
+pub(crate) use sglang_processor::{resolve_model_file, resolve_tokenizer_file};

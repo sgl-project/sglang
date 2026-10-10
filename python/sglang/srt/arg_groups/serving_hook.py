@@ -368,6 +368,11 @@ def handle_deprecated_args(server_args: Any):
             )
         if cfg.grpc_port is None:
             raise ValueError("--sidecar requires --grpc-port or SGLANG_GRPC_PORT.")
+        if envs.SGLANG_RUST_SERVER.get():
+            raise ValueError(
+                "--sidecar is not yet supported with SGLANG_RUST_SERVER: "
+                "Rust-server mode does not run the Python sidecar lifecycle."
+            )
     if native_grpc:
         if cfg.use_ray:
             raise ValueError(
@@ -488,6 +493,16 @@ def handle_other_validations(server_args: Any):
                 "_handle_other_validations",
                 optimistic_prefill_attempts=0,
             )
+
+    if (
+        cfg.disaggregation_decode_allocation_policy == "prefill_complete"
+        and cfg.disaggregation_mode == "prefill"
+        and resolving_view(server_args).optimistic_prefill_attempts <= 0
+    ):
+        raise ValueError(
+            "prefill_complete requires optimistic prefill, but the resolved "
+            "model/cache configuration disabled it."
+        )
 
     # Handle model inference tensor dump.
     if cfg.debug_tensor_dump_output_folder is not None:

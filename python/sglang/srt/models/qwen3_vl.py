@@ -41,9 +41,15 @@ from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.conv import Conv3dLayer
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
+    reject_attn_tp_shard_with_tp_reduce,
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
-from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
+from sglang.srt.layers.linear import (
+    ColumnParallelLinear,
+    LinearParallelGroup,
+    RowParallelLinear,
+    resolve_linear_parallel_group,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -110,23 +116,16 @@ _is_cpu = is_cpu()
 _VECTORIZED_VL_POS_EMBED_MIN_IMAGES = 6
 
 
-def _resolve_vision_tp(
+def _resolve_vision_parallel_group(
     *,
     use_data_parallel: bool,
-    tp_size: Optional[int],
-    tp_rank: Optional[int],
-) -> tuple[int, int]:
+    parallel_group: Optional[LinearParallelGroup],
+) -> LinearParallelGroup:
     if use_data_parallel:
-        if tp_size is not None or tp_rank is not None:
+        if parallel_group is not None:
             raise ValueError("Explicit vision TP cannot be combined with data parallel")
-        return 1, 0
-    if (tp_size is None) != (tp_rank is None):
-        raise ValueError("Vision tp_size and tp_rank must be set together")
-    if tp_size is None:
-        parallel = get_parallel()
-        return parallel.attn_tp_size, parallel.attn_tp_rank
-    assert tp_rank is not None
-    return tp_size, tp_rank
+        return "replicated"
+    return "attn_tp" if parallel_group is None else parallel_group
 
 
 class Qwen3_VisionMLP(nn.Module):
@@ -139,14 +138,22 @@ class Qwen3_VisionMLP(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         use_data_parallel: bool = False,
-        tp_size: Optional[int] = None,
-        tp_rank: Optional[int] = None,
+        parallel_group: Optional[LinearParallelGroup] = None,
     ):
         super().__init__()
-        self.tp_size, self.tp_rank = _resolve_vision_tp(
-            use_data_parallel=use_data_parallel,
-            tp_size=tp_size,
-            tp_rank=tp_rank,
+        parallel_group = _resolve_vision_parallel_group(
+            use_data_parallel=use_data_parallel, parallel_group=parallel_group
+        )
+        _, tp_size = resolve_linear_parallel_group(parallel_group)
+        # TODO: this layer shards over attention TP but reduces over the full TP
+        # group without attention DP; reduce over the attention-TP group so
+        # attention CP narrower than TP can run it.
+        reject_attn_tp_shard_with_tp_reduce(
+            type(self).__name__,
+            shard_tp_size=tp_size,
+            reduces_over_attn_tp=is_dp_attention_enabled(),
+            multimodal_encoder=True,
+            hint=", or --mm-enable-dp-encoder where the model supports it",
         )
         self.linear_fc1 = ColumnParallelLinear(
             in_features,
@@ -154,17 +161,16 @@ class Qwen3_VisionMLP(nn.Module):
             bias=bias,
             quant_config=quant_config,
             prefix=add_prefix("linear_fc1", prefix),
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
+            parallel_group=parallel_group,
         )
+        self.tp_group = self.linear_fc1.tp_group
         self.linear_fc2 = RowParallelLinear(
             hidden_features,
             in_features,
             bias=bias,
             quant_config=quant_config,
             prefix=add_prefix("linear_fc2", prefix),
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
+            parallel_group=parallel_group,
             use_dp_attention_reduce=is_dp_attention_enabled(),
         )
         self.act = ACT2FN[hidden_act]
@@ -295,8 +301,7 @@ class Qwen3VLMoeVisionPatchMerger(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         use_data_parallel: bool = False,
-        tp_size: Optional[int] = None,
-        tp_rank: Optional[int] = None,
+        parallel_group: Optional[LinearParallelGroup] = None,
         disable_merger_proj: bool = False,
     ) -> None:
         super().__init__()
@@ -312,10 +317,19 @@ class Qwen3VLMoeVisionPatchMerger(nn.Module):
             self.hidden_size if use_postshuffle_norm else context_dim
         )
         if not disable_merger_proj:
-            self.tp_size, self.tp_rank = _resolve_vision_tp(
-                use_data_parallel=use_data_parallel,
-                tp_size=tp_size,
-                tp_rank=tp_rank,
+            parallel_group = _resolve_vision_parallel_group(
+                use_data_parallel=use_data_parallel, parallel_group=parallel_group
+            )
+            _, tp_size = resolve_linear_parallel_group(parallel_group)
+            # TODO: this layer shards over attention TP but reduces over the full TP
+            # group without attention DP; reduce over the attention-TP group so
+            # attention CP narrower than TP can run it.
+            reject_attn_tp_shard_with_tp_reduce(
+                type(self).__name__,
+                shard_tp_size=tp_size,
+                reduces_over_attn_tp=is_dp_attention_enabled(),
+                multimodal_encoder=True,
+                hint=", or --mm-enable-dp-encoder where the model supports it",
             )
             self.linear_fc1 = ColumnParallelLinear(
                 self.hidden_size,
@@ -323,9 +337,9 @@ class Qwen3VLMoeVisionPatchMerger(nn.Module):
                 bias=True,
                 quant_config=quant_config,
                 prefix=add_prefix("linear_fc1", prefix),
-                tp_size=self.tp_size,
-                tp_rank=self.tp_rank,
+                parallel_group=parallel_group,
             )
+            self.tp_group = self.linear_fc1.tp_group
             self.act_fn = nn.GELU()
             self.linear_fc2 = RowParallelLinear(
                 self.padded_context_dim,
@@ -333,8 +347,7 @@ class Qwen3VLMoeVisionPatchMerger(nn.Module):
                 bias=True,
                 quant_config=quant_config,
                 prefix=add_prefix("linear_fc2", prefix),
-                tp_size=self.tp_size,
-                tp_rank=self.tp_rank,
+                parallel_group=parallel_group,
                 use_dp_attention_reduce=is_dp_attention_enabled(),
             )
 
@@ -1763,17 +1776,24 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         return self.model.embed_tokens.weight, self.lm_head.weight
 
     def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
+        if not self.pp_group.is_last_rank:
+            return
         self.capture_aux_hidden_states = True
         self.model.capture_aux_hidden_states = True
         if layer_ids is None:
             num_layers = self.config.num_hidden_layers
-            self.model.layers_to_capture = [
+            layers_to_capture = [
                 2,
                 num_layers // 2,
                 num_layers - 3,
             ]  # Specific layers for EAGLE3 support
         else:
-            self.model.layers_to_capture = [val + 1 for val in layer_ids]
+            layers_to_capture = [val + 1 for val in layer_ids]
+
+        if hasattr(self.model, "set_eagle3_layers_to_capture"):
+            self.model.set_eagle3_layers_to_capture(layers_to_capture)
+        else:
+            self.model.layers_to_capture = layers_to_capture
 
 
 def _require_vision(model) -> None:

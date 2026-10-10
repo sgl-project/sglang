@@ -80,7 +80,7 @@ struct FusedQNormRopeParams {
   float eps;
 };
 
-template <typename DType, int64_t kHeadDim, int64_t kRopeDim, typename PosT, bool kUsePDL>
+template <typename DType, int64_t kHeadDim, int64_t kRopeDim, typename PosT, bool kUsePDL, bool kApplyNorm>
 Q_KERNEL void fused_q_norm_rope(const __grid_constant__ FusedQNormRopeParams params) {
   using namespace device;
 
@@ -129,24 +129,26 @@ Q_KERNEL void fused_q_norm_rope(const __grid_constant__ FusedQNormRopeParams par
 
   const auto freq = mem_freq.load(params.freqs_cis + position * kRopeDim);
 
-  float sum_of_squares = 0.0f;
+  if constexpr (kApplyNorm) {
+    float sum_of_squares = 0.0f;
 #pragma unroll
-  for (int i = 0; i < kLocalSize; ++i) {
+    for (int i = 0; i < kLocalSize; ++i) {
 #pragma unroll
-    for (int j = 0; j < kVecSize; ++j) {
-      const auto x = cast<float>(input_vec[i][j]);
-      sum_of_squares += x * x;
+      for (int j = 0; j < kVecSize; ++j) {
+        const auto x = cast<float>(input_vec[i][j]);
+        sum_of_squares += x * x;
+      }
     }
-  }
-  sum_of_squares = warp::reduce_sum(sum_of_squares);
-  const auto norm_factor = math::rsqrt(sum_of_squares / kHeadDim + params.eps);
+    sum_of_squares = warp::reduce_sum(sum_of_squares);
+    const auto norm_factor = math::rsqrt(sum_of_squares / kHeadDim + params.eps);
 
 #pragma unroll
-  for (int i = 0; i < kLocalSize; ++i) {
+    for (int i = 0; i < kLocalSize; ++i) {
 #pragma unroll
-    for (int j = 0; j < kVecSize; ++j) {
-      const auto x = cast<float>(input_vec[i][j]);
-      input_vec[i][j] = cast<DType>(x * norm_factor);
+      for (int j = 0; j < kVecSize; ++j) {
+        const auto x = cast<float>(input_vec[i][j]);
+        input_vec[i][j] = cast<DType>(x * norm_factor);
+      }
     }
   }
 
@@ -172,17 +174,34 @@ Q_KERNEL void fused_q_norm_rope(const __grid_constant__ FusedQNormRopeParams par
   const auto elem = mem_elem.load(s_rope[warp_id]);
   const auto [x_real, x_imag] = cast<fp32x2_t>(elem);
   const auto [freq_real, freq_imag] = freq;
-  const fp32x2_t rotated = {
-      x_real * freq_real - x_imag * freq_imag,
-      x_real * freq_imag + x_imag * freq_real,
-  };
+#ifdef USE_ROCM
+  // gfx950 batched RoPE rounds the sine product, then one fma with the cosine. Only the
+  // kApplyNorm = false specialization replaces a kernel that rounded that way, so only it
+  // matches it; the norm path keeps the order it has always had.
+  constexpr bool kBatchedRopeOrder = !kApplyNorm;
+#else
+  constexpr bool kBatchedRopeOrder = false;
+#endif
+  fp32x2_t rotated;
+  if constexpr (kBatchedRopeOrder) {
+    rotated = {
+        fmaf(x_real, freq_real, -__fmul_rn(x_imag, freq_imag)),
+        fmaf(x_imag, freq_real, __fmul_rn(x_real, freq_imag)),
+    };
+  } else {
+    rotated = {
+        x_real * freq_real - x_imag * freq_imag,
+        x_real * freq_imag + x_imag * freq_real,
+    };
+  }
   mem_elem.store(output_ptr + (kHeadDim - kRopeDim), cast<DType2>(rotated));
 }
 
-template <typename DType, int64_t kHeadDim, int64_t kRopeDim, bool kUsePDL>
+// kApplyNorm = false only rotates the rope tail while copying Q into a (padded) output.
+template <typename DType, int64_t kHeadDim, int64_t kRopeDim, bool kApplyNorm, bool kUsePDL>
 struct FusedQNormRopeKernel {
   template <typename PosT>
-  static constexpr auto kernel = fused_q_norm_rope<DType, kHeadDim, kRopeDim, PosT, kUsePDL>;
+  static constexpr auto kernel = fused_q_norm_rope<DType, kHeadDim, kRopeDim, PosT, kUsePDL, kApplyNorm>;
 
   static void forward(
       const tvm::ffi::TensorView q_input,

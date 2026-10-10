@@ -7,10 +7,13 @@ reaching the client is covered by scheduler/test_scheduler_control.py.
 
 import time
 import unittest
+from collections import deque
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import (
     CustomTestCase,
@@ -21,6 +24,7 @@ from sglang.test.test_utils import (
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.managers.schedule_batch import FINISH_ABORT
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
@@ -61,6 +65,8 @@ def _batch(reqs):
 
 def _scheduler(waiting_queue, running_reqs=(), last_batch_reqs=()):
     s = Scheduler.__new__(Scheduler)
+    s.enable_continuous_input_polling = False
+    s.result_queue = deque()
     s.waiting_queue = waiting_queue
     s.enable_hierarchical_cache = False
     s.enable_hicache_storage = False
@@ -155,6 +161,61 @@ class TestRunningTimeout(CustomTestCase):
         with envs.SGLANG_REQ_RUNNING_TIMEOUT.override(1.0):
             aborts = s._poll_timeout_aborts()
         self.assertEqual([a.rid for a in aborts], ["stale"])
+
+    def test_pending_abort_is_not_emitted_again_while_forward_is_running(self):
+        stale = _req("stale", forward_entry=time.perf_counter() - 10)
+        fresh = _req("fresh", forward_entry=time.perf_counter())
+        s = _scheduler([], last_batch_reqs=[fresh])
+        s.enable_continuous_input_polling = True
+        s.result_queue = deque([(_batch([stale]), None), (s.last_batch, None)])
+        s.disaggregation_mode = DisaggregationMode.PREFILL
+        s.chunked_req = None
+        s.mm_receiver = None
+        s.dllm_config = None
+        s.grammar_manager = MagicMock()
+        s.disagg_prefill_bootstrap_queue = SimpleNamespace(queue=[])
+        s.disagg_prefill_inflight_queue = []
+        with envs.SGLANG_REQ_RUNNING_TIMEOUT.override(1.0):
+            aborts = s._poll_timeout_aborts()
+            self.assertEqual([abort.rid for abort in aborts], ["stale"])
+            # The broadcast abort marks to_finish before the GPU result arrives.
+            s.abort_request(aborts[0])
+            self.assertIsInstance(stale.to_finish, FINISH_ABORT)
+            self.assertIsNone(fresh.to_finish)
+            self.assertFalse(stale.finished())
+            for _ in range(3):
+                self.assertEqual(s._poll_timeout_aborts(), [])
+
+    def test_queued_result_remains_visible_after_a_new_forward_launches(self):
+        now = time.perf_counter()
+        older = _req("older", forward_entry=now - 10)
+        newer = _req("newer", forward_entry=now - 10)
+        for pp_size in (1, 2):
+            with (
+                self.subTest(pp_size=pp_size),
+                get_parallel().override(pp_size=pp_size),
+            ):
+                # Polling re-enters intake before last_batch advances to newer.
+                last_req = older if pp_size == 1 else newer
+                s = _scheduler([], last_batch_reqs=[last_req])
+                s.enable_continuous_input_polling = pp_size == 1
+                s.running_mbs = [s.running_batch]
+                s.mbs = [s.last_batch, _batch([older])]
+                if pp_size == 1:
+                    s.result_queue = deque(
+                        [(_batch([older]), None), (_batch([newer]), None)]
+                    )
+
+                with envs.SGLANG_REQ_RUNNING_TIMEOUT.override(1.0):
+                    aborts = s._poll_timeout_aborts()
+                    # Abort and weight-version updates share this request inventory.
+                    self.assertEqual(s.collect_inflight_reqs(), {older, newer})
+
+                self.assertEqual(
+                    [a.rid for a in aborts],
+                    ["older", "newer"] if pp_size == 1 else ["newer", "older"],
+                )
+                self.assertEqual(len(s.result_queue), 2 if pp_size == 1 else 0)
 
     def test_unset_forward_entry_time_is_never_emitted(self):
         s = _scheduler([], running_reqs=[_req("unstamped", forward_entry=0.0)])

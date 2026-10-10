@@ -1,6 +1,6 @@
 use super::*;
 use crate::components::{ComponentSet, FULL, MAMBA, SWA};
-use crate::test_utils::{accumulate_step, action_kinds};
+use crate::test_utils::{accumulate_step, action_kinds, matched_device_indices};
 use crate::unified_tree_core::CacheInitParams;
 
 #[test]
@@ -630,7 +630,7 @@ fn match_prefix_uses_request_ring_layout_instead_of_hicache_pool_presence() {
         assert_eq!(result.full_kv_hit_length, 8);
         let expected = if swa_req_ring { &values[..8] } else { &[] };
         assert!(
-            result.device_indices.equal(&Tensor::from_slice(expected)),
+            matched_device_indices(&tc, &result).equal(&Tensor::from_slice(expected)),
             "ring={swa_req_ring}, hicache={enable_hicache}, swa_host={has_swa_host_pool}"
         );
     }
@@ -871,7 +871,7 @@ fn insert_params_swa<'k>(
         prev_prefix_len,
         swa_evicted_seqlen,
         swa_branching_seqlen: None,
-        chunked: false,
+        inserted_len: 0,
         priority: 0,
         session_id: None,
         track_adopted_ranges: false,
@@ -1827,9 +1827,12 @@ fn acquire_lock_walks_until_the_window_fills_and_stamps_the_crossing_node() {
     assert_eq!(tc.arena.device_lock_ref(b, SWA), 1);
     assert_eq!(tc.arena.device_lock_ref(a, SWA), 0);
     // The walk fills the 2-atom window at b; b carries the first minted uuid.
-    assert_eq!(result.component_lock_uuids[&(SWA.idx() as u8)], Some(2));
+    assert_eq!(
+        result.component_lock_uuids[&(SWA.idx() as u8)],
+        Some(100_000_000_000_001)
+    );
     assert!(result.component_host_lock_uuids.is_empty());
-    assert_eq!(node_swa_uuid(&tc, b), Some(2));
+    assert_eq!(node_swa_uuid(&tc, b), Some(100_000_000_000_001));
     assert_eq!(node_swa_uuid(&tc, c), None);
     assert_eq!(tc.swa_evictable_size(), 1);
     assert_eq!(tc.swa_protected_size(), 2);
@@ -1880,8 +1883,11 @@ fn acquire_lock_overshooting_the_window_stops_at_the_crossing_node() {
     assert_eq!(tc.arena.device_lock_ref(c, SWA), 1);
     assert_eq!(tc.arena.device_lock_ref(b, SWA), 1);
     assert_eq!(tc.arena.device_lock_ref(a, SWA), 0);
-    assert_eq!(result.component_lock_uuids[&(SWA.idx() as u8)], Some(2));
-    assert_eq!(node_swa_uuid(&tc, b), Some(2));
+    assert_eq!(
+        result.component_lock_uuids[&(SWA.idx() as u8)],
+        Some(100_000_000_000_001)
+    );
+    assert_eq!(node_swa_uuid(&tc, b), Some(100_000_000_000_001));
     assert_eq!(node_swa_uuid(&tc, a), None);
     assert_eq!(tc.swa_evictable_size(), 2);
     assert_eq!(tc.swa_protected_size(), 4);
@@ -2059,10 +2065,10 @@ fn acquire_host_lock_walks_until_the_window_fills_and_stamps_the_host_uuid() {
     // The window fills at b; b carries the host uuid and leaves the host LRU.
     assert_eq!(
         result.component_host_lock_uuids[&(SWA.idx() as u8)],
-        Some(2)
+        Some(100_000_000_000_001)
     );
     assert!(result.component_lock_uuids.is_empty());
-    assert_eq!(node_swa_host_uuid(&tc, b), Some(2));
+    assert_eq!(node_swa_host_uuid(&tc, b), Some(100_000_000_000_001));
     assert_eq!(node_swa_host_uuid(&tc, c), None);
     assert!(!tc.host_lru_list(SWA).in_list(Some(c)));
     assert!(!tc.host_lru_list(SWA).in_list(Some(b)));
@@ -2198,9 +2204,9 @@ fn acquire_host_lock_stamps_the_host_tier_uuid_field_only() {
     // The boundary uuid lands on the host-tier field; the device field stays clear.
     assert_eq!(
         result.component_host_lock_uuids[&(SWA.idx() as u8)],
-        Some(2)
+        Some(100_000_000_000_001)
     );
-    assert_eq!(node_swa_host_uuid(&tc, b), Some(2));
+    assert_eq!(node_swa_host_uuid(&tc, b), Some(100_000_000_000_001));
     assert_eq!(node_swa_uuid(&tc, b), None);
     assert_eq!(node_swa_host_uuid(&tc, c), None);
     assert_eq!(node_swa_uuid(&tc, c), None);
@@ -2228,10 +2234,16 @@ fn device_and_host_lock_walks_mint_independent_uuids() {
         IncLockRefResult::default(),
         /* lock_host = */ true,
     );
-    assert_eq!(device.component_lock_uuids[&(SWA.idx() as u8)], Some(2));
-    assert_eq!(host.component_host_lock_uuids[&(SWA.idx() as u8)], Some(3));
-    assert_eq!(node_swa_uuid(&tc, b), Some(2));
-    assert_eq!(node_swa_host_uuid(&tc, b), Some(3));
+    assert_eq!(
+        device.component_lock_uuids[&(SWA.idx() as u8)],
+        Some(100_000_000_000_001)
+    );
+    assert_eq!(
+        host.component_host_lock_uuids[&(SWA.idx() as u8)],
+        Some(100_000_000_000_002)
+    );
+    assert_eq!(node_swa_uuid(&tc, b), Some(100_000_000_000_001));
+    assert_eq!(node_swa_host_uuid(&tc, b), Some(100_000_000_000_002));
 }
 
 #[test]
@@ -3657,6 +3669,38 @@ fn redistribute_on_node_split_preserves_host_lock_state() {
 }
 
 #[test]
+fn host_lock_receipt_releases_every_split_fragment() {
+    let mut tc = swa_core(/* window = */ 4, /* page_size = */ 1);
+    tc.insert(&insert_params_swa(
+        &vec![1, 2, 3, 4],
+        &[10, 11, 12, 13],
+        0,
+        0,
+    ));
+    let root = tc.arena.root();
+    let node = child_of(&tc, root, &[1]);
+    set_swa_host(&mut tc, node);
+
+    let node_handle = tc.arena.node(node).id;
+    let lock = tc.inc_host_lock_ref(node_handle).expect("live test node");
+    assert!(
+        lock.component_host_lock_uuids
+            .contains_key(&(SWA.idx() as u8))
+    );
+
+    let (parent, _) = tc.split_node_(node, /* split_len = */ 2);
+    assert_eq!(tc.arena.host_lock_ref(parent, SWA), 1);
+    assert_eq!(tc.arena.host_lock_ref(node, SWA), 1);
+
+    tc.dec_host_lock_ref(node_handle, &lock.to_dec_params())
+        .expect("live test node");
+    assert_eq!(tc.arena.host_lock_ref(parent, SWA), 0);
+    assert_eq!(tc.arena.host_lock_ref(node, SWA), 0);
+    assert!(tc.host_lru_list(SWA).in_list(Some(parent)));
+    assert!(tc.host_lru_list(SWA).in_list(Some(node)));
+}
+
+#[test]
 fn finalize_window_arithmetic_at_page_boundaries() {
     let mut tc = swa_core(/* window = */ 4, /* page_size = */ 2);
     let root = tc.arena.root();
@@ -3808,7 +3852,7 @@ fn match_prefix_with_an_empty_key_on_a_swa_core_is_a_clean_miss() {
         key: &Vec::new(),
         namespace: Default::default(),
     });
-    assert_eq!(result.device_indices.size()[0], 0);
+    assert_eq!(result.device_prefix_len, 0);
     assert_eq!(result.swa_host_hit_length, 0);
     let root = tc.arena.root();
     assert_eq!(result.best_match_node_id, tc.arena.node(root).id);
@@ -5871,7 +5915,7 @@ fn deep_request_ring_tree_survives_full_backup_evict_and_load_back_rounds() {
         tc.sanity_check(&[], &[]);
     }
     let matched = tc.match_prefix(&match_params(&vec![1, 2, 3, 4, 5, 6]));
-    assert_eq!(matched.device_indices.numel(), 6);
+    assert_eq!(matched.device_prefix_len, 6);
     tc.sanity_check(&[], &[]);
 }
 
@@ -6328,7 +6372,7 @@ fn finalize_branching(
         .finalize_match_result_in_tree_core(
             tc,
             MatchResult {
-                device_indices: Tensor::from_slice(&vec![0i64; device_len]),
+                device_prefix_len: device_len,
                 host_hit_length,
                 full_kv_hit_length,
                 ..tc.empty_match_result()

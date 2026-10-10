@@ -55,6 +55,13 @@ class QwenImage21InputValidationStage(InputValidationStage):
         batch = super().forward(batch, server_args)
         if batch.height % 32 or batch.width % 32:
             raise ValueError("Qwen-Image 2.1 height and width must be divisible by 32")
+        batch.sigmas = server_args.pipeline_config.prepare_sigmas(
+            batch.sigmas, batch.num_inference_steps
+        )
+        if not batch.sigmas:
+            raise ValueError("Qwen-Image 2.1 requires a non-empty sigma schedule")
+        # the preset or explicit sigma grid determines the denoising step count
+        batch.num_inference_steps = len(batch.sigmas)
         return batch
 
 

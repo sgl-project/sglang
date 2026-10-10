@@ -1,5 +1,6 @@
 """Exercise container and ancestor budgets using synthetic procfs/cgroup files."""
 
+import functools
 import tempfile
 import unittest
 from pathlib import Path
@@ -7,6 +8,8 @@ from unittest.mock import Mock, patch
 
 from sglang.srt.mem_cache import host_memory
 from sglang.test.ci.ci_register import register_cpu_ci
+
+_cgroup_memory_headroom = host_memory._cgroup_memory_headroom
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
@@ -31,13 +34,18 @@ class TestHostMemory(unittest.TestCase):
             f"1 0 0:1 {mount_root} {escaped} rw - {filesystem} cgroup {options}\n"
         )
 
-    def memory(self, path, usage, maximum="max", high="max", v1=False):
+    def memory(self, path, usage, maximum="max", high="max", v1=False, stat=None):
         directory = self.mount / path
         directory.mkdir(parents=True, exist_ok=True)
         files = (
             {"memory.limit_in_bytes": maximum, "memory.usage_in_bytes": usage}
             if v1
             else {"memory.max": maximum, "memory.high": high, "memory.current": usage}
+        )
+        prefix = "total_" if v1 else ""
+        stat = {f"{prefix}active_file": 0, f"{prefix}inactive_file": 0} | (stat or {})
+        files["memory.stat"] = "".join(
+            f"{key} {value}\n" for key, value in stat.items()
         )
         for name, value in files.items():
             (directory / name).write_text(str(value))
@@ -74,6 +82,32 @@ class TestHostMemory(unittest.TestCase):
         self.memory("task", 400, 1000, v1=True)
         self.assertEqual(host_memory._cgroup_memory_headroom(self.proc), 600)
 
+    def test_reclaimable_page_cache_is_not_used(self):
+        """Page cache charged to the cgroup, such as a checkpoint just read, is
+        reclaimed under the limit and must not shrink the headroom. Shared
+        memory is counted in file/cache but cannot be reclaimed."""
+        v2 = {"file": 700, "shmem": 200, "active_file": 200, "inactive_file": 300}
+        v1 = {
+            "cache": 700,
+            "shmem": 200,
+            "active_file": 0,
+            "inactive_file": 0,
+            "total_active_file": 200,
+            "total_inactive_file": 300,
+        }
+        for is_v1, stat, usage, expected in [
+            (False, v2, 900, 600),
+            (True, v1, 900, 600),
+            # v1 usage is approximate and may trail the cache counters.
+            (True, v1, 400, 1000),
+        ]:
+            with self.subTest(v1=is_v1, usage=usage):
+                self.configure(v1=is_v1)
+                self.memory("task/engine", usage, 1000, v1=is_v1, stat=stat)
+                self.assertEqual(
+                    host_memory._cgroup_memory_headroom(self.proc), expected
+                )
+
     def test_independent_engines_have_separate_allowances(self):
         # Both engines see the same host RAM but have different charged usage.
         for task, usage, expected in [("a", 300, 700), ("b", 600, 400)]:
@@ -98,9 +132,14 @@ class TestHostMemory(unittest.TestCase):
                     )
 
     def test_host_availability_is_also_a_bound(self):
-        for cgroup, expected in [(None, 100), (200, 100), (50, 50)]:
+        for cgroup, allow_fallback, expected in [
+            (None, False, 100),
+            (200, False, 100),
+            (50, False, 50),
+            (50, True, 50),
+        ]:
             with (
-                self.subTest(cgroup=cgroup),
+                self.subTest(cgroup=cgroup, allow_fallback=allow_fallback),
                 patch.object(
                     host_memory.psutil,
                     "virtual_memory",
@@ -110,20 +149,57 @@ class TestHostMemory(unittest.TestCase):
                     host_memory, "_cgroup_memory_headroom", return_value=cgroup
                 ),
             ):
-                self.assertEqual(host_memory.available_host_memory_bytes(), expected)
+                self.assertEqual(
+                    host_memory.available_host_memory_bytes(
+                        allow_cgroup_fallback=allow_fallback
+                    ),
+                    expected,
+                )
 
-    def test_unmounted_memory_cgroup_fails(self):
-        self.configure()
-        (self.proc / "self/mountinfo").write_text("")
-        with self.assertRaisesRegex(RuntimeError, "Cannot locate"):
-            host_memory._cgroup_memory_headroom(self.proc)
+    def available(self, host_available=5000, *, allow_cgroup_fallback=False):
+        """Public sizing entry point over the synthetic procfs."""
+        with (
+            patch.object(
+                host_memory.psutil,
+                "virtual_memory",
+                return_value=Mock(available=host_available),
+            ),
+            patch.object(
+                host_memory,
+                "_cgroup_memory_headroom",
+                functools.partial(_cgroup_memory_headroom, self.proc),
+            ),
+        ):
+            return host_memory.available_host_memory_bytes(
+                allow_cgroup_fallback=allow_cgroup_fallback
+            )
 
-    def test_missing_usage_for_known_limit_fails(self):
-        self.configure()
-        self.memory("task/engine", 100, 1000)
-        (self.mount / "task/engine/memory.current").unlink()
-        with self.assertRaises(FileNotFoundError):
-            host_memory._cgroup_memory_headroom(self.proc)
+    def without_cgroupfs(self, v1=False):
+        # A container sharing the host cgroup namespace, no cgroupfs mounted.
+        self.configure("/system.slice/engine.scope", v1=v1)
+        (self.proc / "self/mountinfo").write_text("1 0 0:1 / /proc rw - proc proc rw\n")
+
+    def test_unavailable_cgroup_requires_explicit_sizing(self):
+        for v1 in [False, True]:
+            for mounted in [False, True]:
+                with self.subTest(v1=v1, mounted=mounted):
+                    if mounted:
+                        self.configure("/system.slice/engine.scope", v1=v1)
+                    else:
+                        self.without_cgroupfs(v1=v1)
+                    with self.assertRaisesRegex(RuntimeError, "set --hicache-size"):
+                        self.available()
+                    self.assertEqual(self.available(allow_cgroup_fallback=True), 5000)
+
+    def test_missing_counters_for_known_limit_requires_explicit_sizing(self):
+        for name in ("memory.current", "memory.stat"):
+            with self.subTest(name=name):
+                self.configure()
+                self.memory("task/engine", 100, 1000)
+                (self.mount / "task/engine" / name).unlink()
+                with self.assertRaisesRegex(RuntimeError, "set --hicache-size"):
+                    self.available()
+                self.assertEqual(self.available(allow_cgroup_fallback=True), 5000)
 
 
 if __name__ == "__main__":

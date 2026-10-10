@@ -98,6 +98,7 @@ class JoyEchoDMDDenoisingStage(LTX2AVDenoisingStage):
             seq_len=seq_v,
             batch_size=batch_size,
             key="sp_video_valid_token_count",
+            has_padding=batch.sp_video_has_padding,
             device=model_inputs.latent_model_input.device,
         )
         video_coords = server_args.pipeline_config.prepare_video_rope_coords_for_sp(
@@ -129,6 +130,7 @@ class JoyEchoDMDDenoisingStage(LTX2AVDenoisingStage):
                 seq_len=seq_a,
                 batch_size=batch_size,
                 key="sp_audio_valid_token_count",
+                has_padding=batch.sp_audio_has_padding,
                 device=model_inputs.audio_latent_model_input.device,
             )
             audio_coords = server_args.pipeline_config.prepare_audio_rope_coords_for_sp(
