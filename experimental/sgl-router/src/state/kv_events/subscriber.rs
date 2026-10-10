@@ -686,15 +686,14 @@ async fn fetch_replay(
     dealer.send(request).await?;
     loop {
         let reply = dealer.recv().await?;
-        let topic_offset = usize::from(reply.len() == 4);
-        let (3 | 4, Some(delim), Some(seq), Some(payload)) = (
-            reply.len(),
-            reply.get(0),
-            reply.get(1 + topic_offset),
-            reply.get(2 + topic_offset),
-        ) else {
-            return Err(anyhow!("replay reply has {} frames", reply.len()));
+        let seq_index = match reply.len() {
+            3 => 1, // Legacy: [delimiter, sequence, payload]
+            4 => 2, // Current: [delimiter, topic, sequence, payload]
+            len => return Err(anyhow!("replay reply has {len} frames")),
         };
+        let delim = reply.get(0).context("replay delimiter frame")?;
+        let seq = reply.get(seq_index).context("replay seq frame")?;
+        let payload = reply.get(seq_index + 1).context("replay payload frame")?;
         if !delim.is_empty() {
             return Err(anyhow!("replay reply lacks the empty delimiter frame"));
         }
