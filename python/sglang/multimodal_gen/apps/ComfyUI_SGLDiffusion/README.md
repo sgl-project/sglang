@@ -43,7 +43,7 @@ runs one forward per sampler step (pass-through scheduler, no text encode /
 decode on the worker).
 
 1. **Load Model**: Use the `SGLDiffusion UNET Loader` node to load your diffusion model.
-2. **Configure Options**: Use the `SGLDiffusion Options` node to set runtime parameters like `num_gpus`, `tp_size`, `model_type`, or `enable_torch_compile`.
+2. **Configure Options**: Use the `SGLDiffusion Options` node to set runtime parameters like `num_gpus`, `tp_size`, `model_type`, or `enable_torch_compile`. `extra_server_args` takes a JSON object of any other SGLang `ServerArgs` (e.g. `{"master_port": 30105, "scheduler_port": 5655}` to run a second worker beside another one).
 3. **Sample**: Connect the loaded model to standard ComfyUI samplers. Each step is packed by a model adapter and sent to the SGLang scheduler.
 4. **LoRA Support**: Use the `SGLDiffusion LoRA Loader` for native LoRA integration.
 

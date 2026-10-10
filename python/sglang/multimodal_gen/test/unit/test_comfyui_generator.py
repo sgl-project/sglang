@@ -171,3 +171,38 @@ def test_should_suppress_logs_accepts_batched_timestep() -> None:
 
     assert SGLDiffusionExecutor.should_suppress_logs(torch.tensor([0.5, 0.5]))
     assert not SGLDiffusionExecutor.should_suppress_logs(torch.tensor([2.0, 2.0]))
+
+
+def test_extra_server_args_merge_into_sgld_options() -> None:
+    """Lets two workers run side by side, e.g. on different master ports."""
+    import sys
+    import types
+    from unittest import mock
+
+    import pytest
+
+    folder_paths = types.ModuleType("folder_paths")
+    folder_paths.folder_names_and_paths = {}
+    comfy_api_input = types.ModuleType("comfy_api.input")
+    comfy_api_input.VideoInput = type("VideoInput", (), {})
+    comfy_api = types.ModuleType("comfy_api")
+    comfy_api.input = comfy_api_input
+    stubs = {
+        "folder_paths": folder_paths,
+        "comfy_api": comfy_api,
+        "comfy_api.input": comfy_api_input,
+    }
+    with mock.patch.dict(sys.modules, stubs):
+        from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion import nodes
+    # Do not leak the stub-bound module: later `from ... import nodes` would
+    # find it on the package even though patch.dict dropped it from sys.modules.
+    package = sys.modules.get("sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion")
+    if package is not None and getattr(package, "nodes", None) is nodes:
+        delattr(package, "nodes")
+
+    (options,) = nodes.SGLDOptions().create_options(
+        extra_server_args='{"master_port": 30105, "scheduler_port": 5655}'
+    )
+    assert options["master_port"] == 30105 and options["scheduler_port"] == 5655
+    with pytest.raises(ValueError, match="JSON object"):
+        nodes.SGLDOptions().create_options(extra_server_args="[1]")
