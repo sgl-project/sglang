@@ -223,6 +223,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         )
 
         config = model_runner.model_config
+        self.is_kimi_k3 = (
+            "KimiK3ForConditionalGeneration"
+            in model_runner.model_config.hf_config.architectures
+        )
 
         # Model parameters
         self.num_q_heads = config.num_attention_heads // get_parallel().attn_tp_size
@@ -1029,6 +1033,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             seq_lens if seq_lens.dtype == torch.int32 else seq_lens.to(torch.int32)
         )
         extra_kwargs = {"backend": self.backend} if self.backend != "trtllm-gen" else {}
+        split_kv = self._kimi_k3_split_kv_override(query)
+        if split_kv is not None:
+            extra_kwargs["split_kv"] = split_kv
+            extra_kwargs["cute_dsl_impl"] = "monolithic"
         if self.backend == "trtllm-gen":
             extra_kwargs["multi_ctas_kv_counter_buffer"] = (
                 self._multi_ctas_kv_counter_buffer
@@ -1049,6 +1057,20 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
             **extra_kwargs,
         )
+
+    def _kimi_k3_split_kv_override(self, query: torch.Tensor) -> Optional[int]:
+        """Return the experimental split override for its measured Kimi-K3 shape."""
+        split_kv = envs.SGLANG_KIMI_K3_CUTE_DSL_MLA_SPLIT_KV.get()
+        q_len = query.shape[1] if query.dim() == 4 else 1
+        if (
+            self.is_kimi_k3
+            and self.backend == "cute-dsl"
+            and query.shape[0] == 48
+            and q_len == 1
+            and split_kv > 0
+        ):
+            return split_kv
+        return None
 
     def _run_prefill_kernel(
         self,
