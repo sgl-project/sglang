@@ -27,7 +27,7 @@ Use browser in-page search (`Ctrl+F` / `Cmd+F`) or the site search box with the 
 | Choose quantization | [Quantization decision guide](#quantization-decision-guide) |
 | Compare TPOT across models | [Benchmark snapshot](#benchmark-snapshot-representative-configs) |
 | A specific model's launch commands | [Model catalog](#model-catalog) |
-| Graph mode tuning | [NPU Graph (`--cuda-graph-bs`)](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning#npu-graph---cuda-graph-bs) |
+| Graph mode tuning | [NPU Graph (`--cuda-graph-bs`)](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning#feature-descriptions) |
 | Profiling bottlenecks | [Performance Profiling](/docs/hardware-platforms/ascend-npus/optimization/profiling) |
 | Accuracy / perf methodology | [Accuracy Evaluation](/docs/hardware-platforms/ascend-npus/evaluation/accuracy_evaluation), [Performance Testing](/docs/hardware-platforms/ascend-npus/evaluation/performance_testing) |
 | Errors during serving | [Troubleshooting and FAQ](/docs/hardware-platforms/ascend-npus/faq) + [Common issues index](#common-issues-index) |
@@ -40,7 +40,7 @@ Use this order when standing up a new model on Ascend NPU:
 2. **Pick deploy mode** — PD Mixed (simpler ops) vs PD Disaggregation (scale prefill/decode independently). Large MoE models (DeepSeek-R1 / V3.2 class) usually need PD Disaggregation for published low-latency points.
 3. **Start from the model Best Practices row** that matches your **dataset shape** (e.g. 3.5k+1.5k) and latency target — do not copy GPU-only flags.
 4. **Choose quantization** with the [decision guide](#quantization-decision-guide): BF16 for accuracy baselines; W8A8 for most production latency; W4A8 when memory/throughput dominates on supported MoE paths.
-5. **Enable NPU Graph** with a **small** `--cuda-graph-bs-decode` / `--cuda-graph-bs-prefill` list from the model page (often ≤10 sizes). See [NPU Graph (`--cuda-graph-bs`)](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning#npu-graph---cuda-graph-bs).
+5. **Enable NPU Graph** with a **small** `--cuda-graph-bs-decode` / `--cuda-graph-bs-prefill` list from the model page (often ≤10 sizes). See [NPU Graph (`--cuda-graph-bs`)](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning#feature-descriptions).
 6. **Validate** with [Performance Testing](/docs/hardware-platforms/ascend-npus/evaluation/performance_testing) and, for correctness-sensitive changes, [Accuracy Evaluation](/docs/hardware-platforms/ascend-npus/evaluation/accuracy_evaluation).
 7. **Profile** only after functional smoke: [Performance Profiling](/docs/hardware-platforms/ascend-npus/optimization/profiling).
 
@@ -167,7 +167,7 @@ Each row links to the **tutorial** (deployment steps) and **best practices** (fu
 
 | Switch / env | Purpose | Deep dive |
 | --- | --- | --- |
-| `--cuda-graph-bs-decode` / `--cuda-graph-bs-prefill` | NPU Graph capture sizes | [NPU Graph (`--cuda-graph-bs`)](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning#npu-graph---cuda-graph-bs) |
+| `--cuda-graph-bs-decode` / `--cuda-graph-bs-prefill` | NPU Graph capture sizes | [NPU Graph (`--cuda-graph-bs`)](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning#feature-descriptions) |
 | `--disable-radix-cache` | Prefix cache control | [Parameter Tuning](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning) |
 | `SGLANG_NPU_USE_MLAPO=1` | MLA fusion for DeepSeek-style models | Parameter Tuning |
 | `SGLANG_NPU_USE_MULTI_STREAM=1` | MoE shared/routed overlap | Parameter Tuning |
@@ -196,7 +196,7 @@ python3 -m sglang.launch_server \
 
 | Symptom / keyword | FAQ entry |
 | --- | --- |
-| PD disaggregation GLOO / context corruption | [FAQ §1](/docs/hardware-platforms/ascend-npus/faq#1-context-corruption-with-gloo-oppreamblelength--opnbytes-in-pd-disaggregation) |
+| PD disaggregation GLOO / context corruption | [FAQ](/docs/hardware-platforms/ascend-npus/faq) |
 | Graph mode Fill / ACL 507000 | [FAQ §2](/docs/hardware-platforms/ascend-npus/faq#2-graph-mode-aclnninplacefillscalar-error) |
 | Prefill alloc / aivec errors | [FAQ §3](/docs/hardware-platforms/ascend-npus/faq#3-alloc_extend_kernel-error) |
 | Too many captured graphs | [FAQ §2 Graph mode Fill / ACL](/docs/hardware-platforms/ascend-npus/faq#2-graph-mode-aclnninplacefillscalar-error) |
@@ -222,4 +222,4 @@ When changing published TPOT numbers on a Best Practices page, update the matchi
 - [Supported Features](/docs/hardware-platforms/ascend-npus/reference/support_features)
 - [Environment Variables](/docs/hardware-platforms/ascend-npus/reference/environment_variables)
 - [Parameter Tuning](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning)
-- [NPU Graph (`--cuda-graph-bs`)](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning#npu-graph---cuda-graph-bs)
+- [NPU Graph (`--cuda-graph-bs`)](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning#feature-descriptions)
