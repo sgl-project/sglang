@@ -72,6 +72,28 @@ def _resolve_image_output_format(
     return sampling_params_cls.default_image_output_format()
 
 
+def _reject_unsupported_mask(mask: Optional[UploadFile]) -> None:
+    """Reject an uploaded mask instead of silently ignoring it.
+
+    /v1/images/edits declares ``mask`` for OpenAI API compatibility, but the
+    multimodal pipelines never consume a mask image (downstream,
+    ``image_path`` is treated as a single condition image - e.g.
+    ``DiffusersPipeline._get_condition_image`` keeps only the first entry).
+    A caller uploading a mask used to get a successful response that simply
+    ignored the mask; fail loudly instead so the incompatibility is visible.
+    """
+    if mask is None:
+        return
+    raise HTTPException(
+        status_code=501,
+        detail=(
+            "mask-based editing is not supported: the configured pipeline "
+            "does not consume a mask image. The `mask` field is accepted "
+            "for OpenAI API compatibility but was previously silently ignored."
+        ),
+    )
+
+
 def _read_b64_for_paths(paths: list[str]) -> list[str]:
     """Read and base64-encode each file. Must be called before cloud upload deletes them."""
     result = []
@@ -424,6 +446,8 @@ async def edits(
         raise HTTPException(
             status_code=422, detail="Field 'image' or 'url' is required"
         )
+
+    _reject_unsupported_mask(mask)
 
     image_list = merge_image_input_list(images, urls)
 
