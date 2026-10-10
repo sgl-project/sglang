@@ -99,6 +99,7 @@ These fusion families mount under both `quality="lossless"` and
 | LingBot Video fused RMSNorm | Replaces the handwritten cast, square, mean, rsqrt, and multiply chain with existing Triton RMSNorm kernels |
 | LingBot Video per-token gated residual + RMSNorm modulate | Folds `residual + gate * update` (per-token `[B, S, 1]` gate) and the `rmsnorm(x) * (1 + scale) + shift` adaLN chain (strided `[B, S, 6D]` chunk views) into single kernels |
 | SANA-Video BF16-input linear attention | Keeps the first linear-attention GEMM's inputs in BF16 with FP32 accumulation/output; the second GEMM remains FP32 |
+| Dynamic LoRA delta | An unmerged adapter's scaled update accumulated onto the base output by its second GEMM (`addmm`, one rounding), and a row-parallel layer's bias added in the base GEMM's epilogue, instead of materializing the `[tokens, out]` delta and scaling and adding it in separate passes |
 | FLUX-family VAE fast paths | Channels-last decode, GroupNorm(+SiLU), upsample, and attention replacements for FLUX.2 and AutoencoderKL-based FLUX.1, Z-Image, and SD3 pipelines |
 | Wan VAE RMSNorm + SiLU | Replaces the channel-first RMSNorm/SiLU chain while keeping the decode in `channels_last_3d` |
 | MiniMax-H3 VAE decoder fast path | Per-head fp32 RMSNorm, rounded to the activation dtype, and NeoX RoPE in one launch over the strided Q/K views of the ViT decoder's QKV buffer; cuDNN SDPA for the block's attention |
