@@ -1,4 +1,4 @@
-from functools import lru_cache
+from functools import cache, lru_cache
 from typing import Optional
 
 import msgspec
@@ -6,12 +6,108 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sglang.kernels.ops.gemm.hc_mix import fused_hc_mix, fused_hc_mix_supported
+from sglang.kernels.ops.gemm.hc_mix import (
+    _deterministic_inference,
+    fused_hc_mix,
+    fused_hc_mix_supported,
+)
 
 
 @lru_cache(None)
 def _hc_gate_stream(device: int) -> torch.cuda.Stream:
     return torch.cuda.Stream(device=device)
+
+
+@cache
+def _sum_state_type():
+    from sglang.kernels.ops.elementwise.hc_sum_state import HCSumState
+
+    return HCSumState
+
+
+class _HCSumContext:
+    """Mix-owned buffers carried through the active attention/MoE boundary."""
+
+    def __init__(self, operator, state, buffers):
+        self.operator = operator
+        self.state = state
+        self.buffers = buffers
+        self.sliced = False
+
+    def slice_rows(self, rank, size):
+        def split(tensor):
+            return tensor.tensor_split(size)[rank]
+
+        state = self.state._replace(
+            residual=split(self.state.residual), sum_sq=split(self.state.sum_sq)
+        )
+        output = self.buffers.output._replace(
+            residual=split(self.buffers.output.residual),
+            sum_sq=split(self.buffers.output.sum_sq),
+        )
+        buffers = self.buffers._replace(
+            mixed=split(self.buffers.mixed),
+            alpha=split(self.buffers.alpha),
+            output=output,
+        )
+        context = _HCSumContext(self.operator, state, buffers)
+        context.sliced = True
+        return context
+
+    def combine(self, block_output):
+        if not self.sliced:
+            return self.operator.combine(self.state, self.buffers, block_output)
+        from sglang.kernels.ops.elementwise.hc_apply_sum import hc_apply_sum
+
+        # Projections already ran on the full rows; only Apply follows this slice.
+        hc_apply_sum(
+            block_output,
+            self.state.residual,
+            self.buffers.alpha,
+            out=self.buffers.output.residual,
+            sum_sq=self.buffers.output.sum_sq,
+        )
+        return self.buffers.output
+
+
+class _HCCheckpointWeight(nn.Module):
+    """CPU checkpoint storage; only the prepared HC layout is uploaded to CUDA."""
+
+    def __init__(self, shape, dtype):
+        super().__init__()
+        self.weight = nn.Parameter(
+            torch.empty(shape, device="cpu", dtype=dtype), requires_grad=False
+        )
+
+    def _apply(self, fn, recurse=True):
+        # Honor pre-load dtype conversion without moving checkpoint payloads
+        # to CUDA. The parent rejects migration once prepared weights exist.
+        dtype = fn(self.weight.new_empty(0)).dtype
+        self.weight.data = self.weight.data.to(dtype=dtype)
+        return self
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        key = prefix + "weight"
+        if key in state_dict:
+            try:
+                self.weight.weight_loader(self.weight, state_dict[key])
+            except (ValueError, RuntimeError) as exc:
+                error_msgs.append(f"{key}: {exc}")
+        elif strict:
+            missing_keys.append(key)
+        if strict:
+            unexpected_keys.extend(
+                name for name in state_dict if name.startswith(prefix) and name != key
+            )
 
 
 class HyperConnectionConfig(msgspec.Struct, frozen=True):
@@ -125,8 +221,38 @@ class GatedResidual(HyperConnectionBase):
         use_mix: bool = True,
         use_combine: bool = True,
         role: Optional[str] = None,
+        *,
+        packed_weights: bool = False,
     ):
         super().__init__(config, use_mix, use_combine, role)
+
+        # Only explicitly selected, structurally supported full HC instances
+        # omit the original GPU parameters. Final mixers and other paths keep
+        # their existing storage, loader and Tensor ABI.
+        lowrank = config.hc_lowrank
+        self._packed_sum_weights = (
+            packed_weights
+            and use_mix
+            and use_combine
+            and config.hc_per_branch_norm
+            and self.hc_count == 4
+            and 0 < self.hidden_size <= 16384
+            and self.hidden_size % 512 == 0
+            and lowrank > 0
+            and lowrank % 8 == 0
+            and lowrank + 4 <= ((lowrank + 127) // 128) * 128
+            and config.params_dtype in (torch.bfloat16, torch.float16)
+            and torch.cuda.is_available()
+            and torch.cuda.get_device_capability()[0] == 10
+        )
+        if self._packed_sum_weights and _deterministic_inference():
+            raise ValueError(
+                "Optimized HC does not support --enable-deterministic-inference; "
+                "disable the flag to use packed HC weights"
+            )
+        self._hc_loaded_weights = set()
+        self.register_buffer("_hc_packed_down", None, persistent=False)
+        self.register_buffer("_hc_packed_norm", None, persistent=False)
 
         norm_dim = (
             self.config.hidden_size * self.hc_count
@@ -136,16 +262,27 @@ class GatedResidual(HyperConnectionBase):
         norm_group_size = (
             self.config.hidden_size if self.config.hc_per_branch_norm else None
         )
-        self.hc_norm = GroupedGemmaRMSNorm(
-            norm_dim, eps=self.config.rms_norm_eps, group_size=norm_group_size
-        )
+        if self._packed_sum_weights:
+            self.hc_norm = _HCCheckpointWeight((norm_dim,), config.params_dtype)
+            self.hc_norm.weight.data.zero_()
+        else:
+            self.hc_norm = GroupedGemmaRMSNorm(
+                norm_dim, eps=self.config.rms_norm_eps, group_size=norm_group_size
+            )
 
         if use_mix:
-            self.input_mix_weight_down = nn.Linear(
-                self.hidden_size * self.hc_count,
-                self.config.hc_lowrank,
-                bias=False,
-                dtype=config.params_dtype,
+            self.input_mix_weight_down = (
+                _HCCheckpointWeight(
+                    (self.config.hc_lowrank, self.hidden_size * self.hc_count),
+                    config.params_dtype,
+                )
+                if self._packed_sum_weights
+                else nn.Linear(
+                    self.hidden_size * self.hc_count,
+                    self.config.hc_lowrank,
+                    bias=False,
+                    dtype=config.params_dtype,
+                )
             )
             self.input_mix_weight_up = nn.Linear(
                 self.config.hc_lowrank,
@@ -167,11 +304,18 @@ class GatedResidual(HyperConnectionBase):
 
         self._gate_stream = None
         if use_combine:
-            self.block_inject_weight = nn.Linear(
-                self.hidden_size * self.hc_count,
-                self.hc_count,
-                bias=False,
-                dtype=config.params_dtype,
+            self.block_inject_weight = (
+                _HCCheckpointWeight(
+                    (self.hc_count, self.hidden_size * self.hc_count),
+                    config.params_dtype,
+                )
+                if self._packed_sum_weights
+                else nn.Linear(
+                    self.hidden_size * self.hc_count,
+                    self.hc_count,
+                    bias=False,
+                    dtype=config.params_dtype,
+                )
             )
             # hc_combine rejects other shapes; device and dtype are checked per call.
             self._jit_combine_ok = (
@@ -185,7 +329,8 @@ class GatedResidual(HyperConnectionBase):
                 and (self.hidden_size // 8) % (vecs // 8) == 0
             )
             if (
-                self.hc_count == 4
+                not self._packed_sum_weights
+                and self.hc_count == 4
                 and self.hidden_size == 2560
                 and config.hc_per_branch_norm
                 and config.params_dtype == torch.bfloat16
@@ -232,12 +377,345 @@ class GatedResidual(HyperConnectionBase):
 
         self._mix_compute = torch.compile(_mix_compute)
         self._combine_compute = torch.compile(_combine_compute)
+        self._sum_operators = None
+        self._hc_source_packed = None
+        self._sum_weights_dirty = True
+        if use_mix and use_combine:
+            for parameter in (
+                self.hc_norm.weight,
+                self.input_mix_weight_down.weight,
+                self.input_mix_weight_up.weight,
+                self.block_inject_weight.weight,
+            ):
+                parameter.weight_loader = self._load_sum_source_weight
+                # Direct loading must not run arbitrary sharded weight_loaders.
+                # HC explicitly opts into this replicated-parameter callback.
+                parameter.hc_weight_loader = self._load_sum_source_weight
+        self.register_load_state_dict_pre_hook(self._before_sum_state_dict_load)
+        self.register_load_state_dict_post_hook(self._after_sum_state_dict_load)
+
+    def _load_sum_source_weight(self, parameter, loaded_weight):
+        # These are replicated, non-sharded HC parameters. Keep checkpoint
+        # names/storage authoritative; derived layouts are refreshed at the end
+        # of the model's load_weights transaction, never on the inference path.
+        if parameter.shape != loaded_weight.shape:
+            raise ValueError("HC source weight shape mismatch")
+        if self._packed_sum_weights:
+            names = (
+                ("down", self.input_mix_weight_down.weight),
+                ("inject", self.block_inject_weight.weight),
+                ("norm", self.hc_norm.weight),
+                ("up", self.input_mix_weight_up.weight),
+            )
+            name = next(name for name, target in names if parameter is target)
+            # Down/Inject/RMS stay on CPU for exact checkpoint round-trips.
+            # Only Up keeps its original CUDA parameter layout.
+            parameter.data.copy_(loaded_weight)
+            self._hc_loaded_weights.add(name)
+            self._sum_weights_dirty = True
+            return
+        parameter.data.copy_(loaded_weight)
+        self._sum_weights_dirty = True
+
+    def _before_sum_state_dict_load(
+        self,
+        module,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        if not self._packed_sum_weights:
+            return
+        names = {
+            "down": "input_mix_weight_down.weight",
+            "inject": "block_inject_weight.weight",
+            "norm": "hc_norm.weight",
+            "up": "input_mix_weight_up.weight",
+        }
+        loaded = {name for name, key in names.items() if prefix + key in state_dict}
+        if len(loaded & {"down", "inject"}) == 1:
+            raise ValueError(
+                "Packed HC requires Down and Inject to be updated together"
+            )
+        # Ordinary Up child loads bypass the per-parameter loader hook.
+        self._hc_loaded_weights.update(loaded)
+        if loaded:
+            self._sum_weights_dirty = True
+
+    def _after_sum_state_dict_load(self, module, incompatible_keys):
+        self.prepare_sum_state_weights()
+
+    def _apply(self, fn, recurse=True):
+        if self._packed_sum_weights and self._hc_packed_down is not None:
+            raise RuntimeError(
+                "Place/cast packed HC before loading weights; recreate and reload "
+                "the checkpoint to change its device/dtype after preparation"
+            )
+        # A device/dtype conversion invalidates derived storage and requires
+        # graph recapture, just like conversion of the original parameters.
+        result = super()._apply(fn, recurse=recurse)
+        self._sum_operators = None
+        self._hc_source_packed = None
+        self._sum_weights_dirty = True
+        return result
+
+    @torch.no_grad()
+    def _prepare_packed_sum_state_weights(self):
+        if len(self._hc_loaded_weights & {"down", "inject"}) == 1:
+            raise ValueError(
+                "Packed HC requires Down and Inject to be updated together"
+            )
+        if self._sum_operators is not None and not self._sum_weights_dirty:
+            return True
+        up, norm = self.input_mix_weight_up.weight, self.hc_norm.weight
+        if (
+            not up.is_cuda
+            or norm.device.type != "cpu"
+            or norm.dtype != up.dtype
+            or up.dtype not in (torch.bfloat16, torch.float16)
+        ):
+            raise ValueError("Packed HC requires CUDA Up and CPU RMS in BF16/FP16")
+        c, h, lowrank = self.hc_count, self.hidden_size, self.config.hc_lowrank
+        npad = ((lowrank + c + 7) // 8) * 8
+        # Fold on CPU in FP32, cast once and reorder before the single upload.
+        # No full original, FP32-folded or second prepared matrix lives on GPU.
+        gamma = 1.0 + norm.detach().to(device="cpu", dtype=torch.float32)
+        folded = torch.zeros((npad, c * h), device="cpu", dtype=up.dtype)
+        folded[:lowrank] = (self.input_mix_weight_down.weight.float() * gamma).to(
+            up.dtype
+        )
+        folded[lowrank : lowrank + c] = (
+            self.block_inject_weight.weight.float() * gamma
+        ).to(up.dtype)
+        host_packed = folded.view(npad, c, h).permute(1, 0, 2).contiguous()
+        packed = self._hc_packed_down
+        if packed is None:
+            packed = host_packed.to(up.device)
+        else:
+            if (
+                packed.shape != host_packed.shape
+                or packed.dtype != up.dtype
+                or packed.device != up.device
+            ):
+                raise ValueError("Packed HC storage changed; recreate and reload")
+            packed.copy_(host_packed)
+        # Upload RMS directly in the shared [H,C] layout. Do not create an
+        # original [C,H] CUDA copy merely to transpose it during preparation.
+        host_norm = norm.detach().view(c, h).T.contiguous().flatten()
+        packed_norm = self._hc_packed_norm
+        if packed_norm is None:
+            packed_norm = host_norm.to(up.device)
+        else:
+            if (
+                packed_norm.shape != host_norm.shape
+                or packed_norm.dtype != up.dtype
+                or packed_norm.device != up.device
+            ):
+                raise ValueError("Packed RMS storage changed; recreate and reload")
+            packed_norm.copy_(host_norm)
+        return self._bind_packed_sum_state_weights(packed, packed_norm)
+
+    @torch.no_grad()
+    def restore_sum_state_from_ipc(self):
+        """Rebuild client-local operators without writing shared IPC weights."""
+        if self._packed_sum_weights:
+            self._bind_packed_sum_state_weights(
+                self._hc_packed_down, self._hc_packed_norm
+            )
+
+    def _bind_packed_sum_state_weights(self, packed, packed_norm):
+        from sglang.kernels.ops.elementwise.hc_down_batched_sum import (
+            BatchedDownWeights,
+        )
+        from sglang.kernels.ops.elementwise.hc_sum_state import SmallTSumHCShell
+        from sglang.kernels.ops.elementwise.hc_sum_state_large import LargeTSumHCShell
+
+        c, h, lowrank = self.hc_count, self.hidden_size, self.config.hc_lowrank
+        npad = ((lowrank + c + 7) // 8) * 8
+        if (
+            packed is None
+            or packed_norm is None
+            or packed.shape != (c, npad, h)
+            or not packed.is_contiguous()
+        ):
+            raise ValueError("Packed HC requires loaded Down/Inject and RMS buffers")
+        weights = BatchedDownWeights(packed.transpose(1, 2), h, lowrank, c)
+        operators = (
+            SmallTSumHCShell(
+                self, down_weights=weights, norm_weight_permuted=packed_norm
+            ),
+            LargeTSumHCShell(
+                self, down_weights=weights, norm_weight_permuted=packed_norm
+            ),
+        )
+        self._hc_packed_down = packed
+        self._hc_packed_norm = packed_norm
+        self._sum_operators = operators
+        # IPC mapping replaces Parameter objects, so restore all loader hooks.
+        for parameter in (
+            self.input_mix_weight_down.weight,
+            self.block_inject_weight.weight,
+            self.input_mix_weight_up.weight,
+            self.hc_norm.weight,
+        ):
+            parameter.weight_loader = self._load_sum_source_weight
+            parameter.hc_weight_loader = self._load_sum_source_weight
+        self._hc_loaded_weights.clear()
+        self._sum_weights_dirty = False
+        return True
+
+    @torch.no_grad()
+    def prepare_sum_state_weights(self, *, force: bool = False):
+        """Prepare both paths after a complete weight-load transaction.
+
+        Packed instances retain CPU checkpoint values and one shared CUDA
+        Down/Inject storage plus one shared [H,C] RMS storage. Down and Inject
+        must be updated together; unchanged Up/RMS need not be resent.
+        ``force`` handles loaders that copy through
+        state_dict instead of weight_loader. Reloading requires graph recapture.
+        Legacy instances keep their existing source/derived-storage behavior.
+        Large-T Up shares its original parameter storage in both cases.
+        Like the existing HC dispatcher, a layer executes on the worker's
+        serialized compute stream; per-call outputs are not cached on it.
+        """
+        if self._packed_sum_weights:
+            if force:
+                self._sum_weights_dirty = True
+            return self._prepare_packed_sum_state_weights()
+        from sglang.kernels.ops.elementwise.hc_mix import pad_lowrank
+
+        if not (
+            self.config.hc_per_branch_norm
+            and self.hc_count == 4
+            and 0 < self.hidden_size <= 16384
+            and self.hidden_size % 512 == 0
+            and self.config.hc_lowrank > 0
+            and self.config.hc_lowrank % 8 == 0
+            and self.config.hc_lowrank + 4 <= pad_lowrank(self.config.hc_lowrank)
+            and hasattr(self, "input_mix_weight_down")
+            and hasattr(self, "block_inject_weight")
+            and self.hc_norm.weight.is_cuda
+            and self.hc_norm.weight.dtype in (torch.bfloat16, torch.float16)
+            and torch.cuda.get_device_capability(self.hc_norm.weight.device)[0] == 10
+            and not _deterministic_inference()
+        ):
+            self._sum_operators = None
+            return False
+        from sglang.kernels.ops.elementwise.hc_sum_state import SmallTSumHCShell
+        from sglang.kernels.ops.elementwise.hc_sum_state_large import LargeTSumHCShell
+
+        # One physical checkpoint storage; the old parameter names remain
+        # loader/state_dict/fallback-compatible views. Folded small/large GEMM
+        # layouts below are derived from this storage and the RMS weight.
+        down = self.input_mix_weight_down.weight
+        inject = self.block_inject_weight.weight
+        shape = (self.config.hc_lowrank + 4, 4 * self.hidden_size)
+        if self._hc_source_packed is None:
+            self._hc_source_packed = down.new_empty(shape)
+        packed = self._hc_source_packed
+        if (
+            packed.shape != shape
+            or packed.device != down.device
+            or packed.dtype != down.dtype
+        ):
+            raise RuntimeError("HC checkpoint storage changed; recreate and recapture")
+        packed[: self.config.hc_lowrank].copy_(down)
+        packed[self.config.hc_lowrank :].copy_(inject)
+        down.data = packed[: self.config.hc_lowrank]
+        inject.data = packed[self.config.hc_lowrank :]
+
+        # load_state_dict(assign=True) may replace Parameter objects.
+        for parameter in (
+            self.hc_norm.weight,
+            self.input_mix_weight_down.weight,
+            self.input_mix_weight_up.weight,
+            self.block_inject_weight.weight,
+        ):
+            parameter.weight_loader = self._load_sum_source_weight
+            parameter.hc_weight_loader = self._load_sum_source_weight
+        small = SmallTSumHCShell(self)
+        new = (
+            small,
+            LargeTSumHCShell(self, norm_weight_permuted=small.weights.norm_permuted),
+        )
+        old = self._sum_operators
+        if old is None:
+            self._sum_operators = new
+        else:
+            pairs = [
+                (old[0].weights.down_inject, new[0].weights.down_inject),
+                (old[0].weights.up, new[0].weights.up),
+                (old[0].weights.norm_permuted, new[0].weights.norm_permuted),
+                (old[1].weights.matrix, new[1].weights.matrix),
+            ]
+            if any(
+                a.shape != b.shape or a.dtype != b.dtype or a.device != b.device
+                for a, b in pairs
+            ):
+                raise RuntimeError(
+                    "HC storage metadata changed; move/recreate the module and recapture graphs"
+                )
+            for destination, source in pairs:
+                destination.copy_(source)
+            # Up shares source storage; both paths share the refreshed RMS.
+            old[1].up_weight = new[1].up_weight
+            old[1].norm_weight = old[0].weights.norm_permuted
+        self._sum_weights_dirty = False
+        return True
+
+    def can_use_sum_state(self, residual):
+        if (
+            torch.is_grad_enabled()
+            or self._sum_operators is None
+            or self._sum_weights_dirty
+        ):
+            return False
+        large = self._sum_operators[1]
+        w = large.weights
+        return (
+            residual.ndim == 2
+            and residual.shape[1] == 4 * self.hidden_size
+            and residual.shape[0] <= large.max_rows
+            and residual.device == w.matrix.device
+            and residual.dtype == w.matrix.dtype
+            and residual.is_contiguous()
+            and residual.data_ptr() % 32 == 0
+        )
+
+    def bootstrap_sum_state(self, residual):
+        if not self.can_use_sum_state(residual):
+            raise ValueError("HC sum-state weights/input are not prepared or supported")
+        return self._sum_operators[int(residual.shape[0] > 24)].bootstrap(residual)
 
     def mix(
         self,
         hyper_input: torch.Tensor,
         normalized_input: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]]:
+        *,
+        use_sum_state: bool = False,
+    ):
+        state_type = _sum_state_type()
+        is_state = isinstance(hyper_input, state_type)
+        residual = hyper_input.residual if is_state else hyper_input
+        use_prepared = (
+            self._packed_sum_weights or use_sum_state or is_state
+        ) and self.can_use_sum_state(residual)
+        if self._packed_sum_weights and not use_prepared:
+            raise ValueError(
+                "Packed HC requires prepared weights and supported inference input"
+            )
+        if use_prepared:
+            operator = self._sum_operators[int(residual.shape[0] > 24)]
+            state = hyper_input if is_state else operator.bootstrap(residual)
+            buffers = operator.allocate_buffers(residual.shape[0])
+            mixed, _ = operator.mix(state, buffers)
+            return mixed, _HCSumContext(operator, state, buffers)
+        if is_state:
+            hyper_input = residual
         assert hyper_input.shape[-1] == self.hc_count * self.hidden_size
         if hyper_input.shape[0] == 0:
             mixed_input = hyper_input.new_empty(
@@ -315,6 +793,34 @@ class GatedResidual(HyperConnectionBase):
             hyper_input_normed.record_stream(stream)
         return mixed_input, (hyper_input, hyper_input_normed, partials)
 
+    def mix_prepared(self, residual, prepared_input=None):
+        if isinstance(prepared_input, _sum_state_type()):
+            previous = prepared_input.residual
+            same_rows = previous is residual or (
+                previous.shape == residual.shape
+                and previous.stride() == residual.stride()
+                and previous.dtype == residual.dtype
+                and previous.device == residual.device
+                and previous.data_ptr() == residual.data_ptr()
+            )
+            if same_rows:
+                # An odd row slice offsets [T,4] statistics by 16 bytes.
+                if prepared_input.sum_sq.data_ptr() % 32:
+                    prepared_input = prepared_input._replace(
+                        sum_sq=prepared_input.sum_sq.clone()
+                    )
+                return self.mix(prepared_input)
+            return self.mix(residual, use_sum_state=True)
+        return self.mix(residual, normalized_input=prepared_input)
+
+    def combine_and_prepare(self, block_output, residuals, next_norm=None):
+        if isinstance(residuals, _HCSumContext):
+            state = residuals.combine(block_output)
+            return state.residual, state
+        if not isinstance(next_norm, GroupedGemmaRMSNorm):
+            next_norm = None
+        return self.combine_and_normalize(block_output, residuals, next_norm)
+
     def combine_and_normalize(
         self,
         block_output: torch.Tensor,
@@ -353,8 +859,10 @@ class GatedResidual(HyperConnectionBase):
     def combine(
         self,
         block_output: torch.Tensor,
-        residuals: tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]],
-    ) -> torch.Tensor:
+        residuals,
+    ):
+        if isinstance(residuals, _HCSumContext):
+            return residuals.combine(block_output)
         hyper_input, hyper_input_normed, partials = residuals
         if partials is not None:
             from sglang.kernels.ops.elementwise.hc_combine_decode import (
