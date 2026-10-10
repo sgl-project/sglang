@@ -114,15 +114,6 @@ def handle_context_parallelism(server_args: Any):
                 "Prefill CP on HIP is only supported for "
                 f"DeepseekV4ForCausalLM, got {model_arch!r}."
             )
-        if (
-            cfg.enable_prefill_cp
-            and model_arch == "DeepseekV32ForCausalLM"
-            and cfg.cp_strategy == "zigzag"
-        ):
-            raise ValueError(
-                "DeepSeek V3.2 prefill CP does not support --cp-strategy "
-                "zigzag; use interleave."
-            )
         if cfg.enable_prefill_cp and model_arch in (
             "MiMoV2ForCausalLM",
             "MiMoV2FlashForCausalLM",

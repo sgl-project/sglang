@@ -1504,7 +1504,7 @@ class TestContextParallelServerArgs(CustomTestCase):
             handle_context_parallelism(server_args)
 
     @override_platform(is_hip=False, is_npu=False)
-    def test_deepseek_v32_prefill_cp_rejects_zigzag(self):
+    def test_deepseek_v32_prefill_cp_accepts_zigzag(self):
         server_args = self._new_cp_args(
             model_path="deepseek-ai/DeepSeek-V3.2",
             enable_prefill_cp=True,
@@ -1516,8 +1516,7 @@ class TestContextParallelServerArgs(CustomTestCase):
             is_multimodal=False,
         )
 
-        with self.assertRaisesRegex(ValueError, "DeepSeek V3.2.*interleave"):
-            handle_context_parallelism(server_args)
+        handle_context_parallelism(server_args)
 
     def test_generic_v1_cp_options_are_not_public_cli(self):
         removed_options = (

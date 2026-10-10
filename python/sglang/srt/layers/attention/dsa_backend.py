@@ -71,7 +71,6 @@ from sglang.srt.layers.attention.dsa.kpool_plan import (
     KPoolWritePlan,
 )
 from sglang.srt.layers.attention.dsa.utils import (
-    can_dsa_prefill_cp_interleave,
     compute_dsa_seqlens,
     dsa_use_prefill_cp,
     is_dsa_enable_prefill_cp,
@@ -82,7 +81,7 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
     grow_multi_ctas_kv_counter_buffer_if_needed,
     make_persistent_multi_ctas_kv_counter_buffer,
 )
-from sglang.srt.layers.cp.base import get_cp_strategy
+from sglang.srt.layers.cp.base import ContextParallelStrategyKind, get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import (
@@ -122,12 +121,13 @@ def prepare_kv_for_attention(
         return k_nope, k_pe
     strategy = get_cp_strategy()
     assert strategy is not None
-    return strategy.materialize_full_mla_kv(
-        forward_batch,
-        attn_mla.attn_mqa,
-        k_nope,
-        k_pe,
+    # DSA consumes full-layout tensors; the dense zigzag MLA hook instead
+    # writes the cache and returns None. Keep these boundary contracts separate.
+    width = k_nope.shape[-1]
+    latent = strategy.gather_kv_cache(
+        torch.cat((k_nope, k_pe), dim=-1).contiguous(), forward_batch
     )
+    return latent[..., :width], latent[..., width:]
 
 
 _is_cuda = is_cuda()
@@ -1010,11 +1010,11 @@ class DeepseekSparseAttnBackend(
         topk_transform_method = self.get_topk_transform_method(
             forward_batch.forward_mode
         )
-        # Batch indices selected when cp enabled: After splitting multiple sequences,
-        # a certain cp rank may not have some of these sequences.
-        # We use bs_idx_cpu to mark which sequences are finally selected by the current cp rank,
-        # a default value of None indicates that all sequences are selected.
+        # Request IDs for consecutive local Q segments. Interleave can omit
+        # requests; zigzag repeats them in early-all/late-all order. None keeps
+        # the original global request layout.
         bs_idx_cpu = None
+        cp_zigzag = False
         # seq_len_cpu of selected sequences
         indexer_seq_lens_cpu = forward_batch.seq_lens_cpu
         indexer_seq_lens = forward_batch.seq_lens
@@ -1133,9 +1133,15 @@ class DeepseekSparseAttnBackend(
                 )
                 kpool_inputs.full_seqlens_expanded = seqlens_expanded
 
-            if can_dsa_prefill_cp_interleave(forward_batch):
+            if dsa_use_prefill_cp(forward_batch) and is_cp_active(forward_batch):
                 strategy = get_cp_strategy()
-                seqlens_expanded = strategy.shard_local_tokens(seqlens_expanded)
+                cp_zigzag = strategy.kind == ContextParallelStrategyKind.ZIGZAG
+                if cp_zigzag and use_kpool:
+                    raise ValueError("Zigzag DSA CP requires index_kpool=1.")
+                query_indices = strategy.local_q_indices(
+                    sum(extend_seq_lens_cpu), forward_batch
+                )
+                seqlens_expanded = seqlens_expanded.index_select(0, query_indices)
                 extend_seq_lens_cpu, extend_seq_lens, bs_idx_cpu, bs_idx = (
                     strategy.shard_per_request(extend_seq_lens_cpu, extend_seq_lens)
                 )
@@ -1165,9 +1171,10 @@ class DeepseekSparseAttnBackend(
             )
             forward_batch.using_mha_one_shot_fp8_dequant = mha_dequantize_needed
 
-            # page_table_1_flattened is only used when prefix sharing is enabled:
+            # Zigzag represents early/late blocks as separate Q segments.
+            # Their repeated K segments need the same layout even without prefix.
             has_prefix_sharing = any(forward_batch.extend_prefix_lens_cpu)
-            if has_prefix_sharing and (
+            if (has_prefix_sharing or cp_zigzag) and (
                 topk_transform_method == TopkTransformMethod.RAGGED
                 or mha_dequantize_needed
             ):
@@ -1204,7 +1211,11 @@ class DeepseekSparseAttnBackend(
             assert False, f"Unsupported {forward_batch.forward_mode = }"
 
         indexer_k_start_end, token_to_batch_idx = self._cal_indexer_k_start_end(
-            forward_batch, bs_idx_cpu
+            forward_batch,
+            bs_idx_cpu,
+            extend_seq_lens if bs_idx_cpu is not None else None,
+            cache_seqlens_int32 if bs_idx_cpu is not None else None,
+            seqlens_expanded if bs_idx_cpu is not None else None,
         )
         # 1D, expanded seqlens (1D means cheap to compute, so always compute it)
         dsa_cache_seqlens_int32 = compute_dsa_seqlens(
@@ -1284,12 +1295,30 @@ class DeepseekSparseAttnBackend(
         self,
         forward_batch: ForwardBatch,
         bs_idx: Optional[List[int]] = None,
+        local_query_lens: Optional[torch.Tensor] = None,
+        local_key_lens: Optional[torch.Tensor] = None,
+        local_visible_lens: Optional[torch.Tensor] = None,
     ):
         if not forward_batch.forward_mode.is_extend_without_speculative():
             return None, None
         if forward_batch.batch_size == 0 or (bs_idx is not None and len(bs_idx) == 0):
             empty_t = torch.empty(0, dtype=torch.int32, device=self.device)
             return (empty_t, empty_t), empty_t
+
+        if bs_idx is not None:
+            # Each contiguous Q segment owns one K-table row. A zigzag request
+            # occurs twice, so list.index(request) would alias the late segment
+            # onto the early segment's keys.
+            assert local_query_lens is not None
+            assert local_key_lens is not None
+            assert local_visible_lens is not None
+            offsets = local_key_lens.cumsum(0, dtype=torch.int32) - local_key_lens
+            ks = torch.repeat_interleave(offsets, local_query_lens)
+            token_to_batch = torch.repeat_interleave(
+                torch.arange(len(bs_idx), device=self.device, dtype=torch.int32),
+                local_query_lens,
+            )
+            return (ks, ks + local_visible_lens), token_to_batch
 
         # Suppose there are two requests, with extend_seq_len = [3, 2]
         # and seq_lens = [10, 4]
@@ -1335,26 +1364,15 @@ class DeepseekSparseAttnBackend(
             ks_list.append(ks)
             ke_list.append(ke)
 
-            # bi: The index within the selected batch bs_idx. Entries that were not selected are ignored.
-            bi = bs_idx.index(i) if (bs_idx is not None and i in bs_idx) else i
-            tb = torch.full(
-                (extend_seq_len,), bi, dtype=torch.int32, device=self.device
-            )
+            tb = torch.full((extend_seq_len,), i, dtype=torch.int32, device=self.device)
             token_to_batch_idx.append(tb)
 
-            if bs_idx is None or i in bs_idx:  # skip batch not included in bs_idx
-                q_offset += extend_seq_len
-                k_offset += seq_len
+            q_offset += extend_seq_len
+            k_offset += seq_len
 
         ks = torch.cat(ks_list, dim=0)
         ke = torch.cat(ke_list, dim=0)
         token_to_batch_idx = torch.cat(token_to_batch_idx, dim=0)
-        if bs_idx is not None:
-            assert can_dsa_prefill_cp_interleave(forward_batch)
-            split_per_token = get_cp_strategy().shard_local_tokens
-            ks = split_per_token(ks)
-            ke = split_per_token(ke)
-            token_to_batch_idx = split_per_token(token_to_batch_idx)
         return (ks, ke), token_to_batch_idx
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
@@ -2150,6 +2168,16 @@ class DeepseekSparseAttnBackend(
                     if topk_indices_offset.ndim == 1
                     else topk_indices_offset
                 )
+                # The indexer offsets cover logical Q rows; attention also
+                # carries physical CP/DP padding with all top-k entries -1.
+                padding = topk_indices.shape[0] - topk_indices_offset.shape[0]
+                if padding > 0:
+                    topk_indices_offset = torch.cat(
+                        (
+                            topk_indices_offset,
+                            topk_indices_offset.new_zeros((padding, 1)),
+                        )
+                    )
                 topk_indices = torch.where(
                     mask, topk_indices + topk_indices_offset, topk_indices
                 )
@@ -2214,7 +2242,8 @@ class DeepseekSparseAttnBackend(
             "triton_sparse_mla",
         ):
             if topk_transform_method == TopkTransformMethod.RAGGED:
-                _has_prefix = any(forward_batch.extend_prefix_lens_cpu)
+                # Also materialize the repeated K segments for zigzag CP.
+                use_paged_ragged_kv = metadata.page_table_1_flattened is not None
                 page_table_1 = topk_indices
 
                 # `flashmla_sparse_q8` = native FP8 sparse prefill (constructor
@@ -2223,7 +2252,7 @@ class DeepseekSparseAttnBackend(
                 # q_all is materialized on this path. The prefix path hands over the
                 # paged fp8 KV as-is; the non-prefix path passes the gathered bf16 KV.
                 if dsa_impl == "flashmla_sparse_q8":
-                    if _has_prefix:
+                    if use_paged_ragged_kv:
                         page_table_1_flattened = (
                             self.forward_metadata.page_table_1_flattened
                         )
@@ -2272,14 +2301,19 @@ class DeepseekSparseAttnBackend(
                 # bf16 path: `flashmla_sparse` and `triton_sparse_mla` take the
                 # same inputs (concatenated q, dequantized bf16 KV, top-k list
                 # as the slot table) and differ only in the kernel they call.
-                if _has_prefix:
+                if use_paged_ragged_kv:
                     page_table_1_flattened = (
                         self.forward_metadata.page_table_1_flattened
                     )
                     assert page_table_1_flattened is not None
-                    kv_cache = dequantize_k_cache_paged(
-                        kv_cache, page_table_1_flattened
-                    )
+                    if kv_cache.dtype == torch.float8_e4m3fn:
+                        kv_cache = dequantize_k_cache_paged(
+                            kv_cache, page_table_1_flattened
+                        )
+                    else:
+                        kv_cache = kv_cache.view(-1, 1, layer.head_dim).index_select(
+                            0, page_table_1_flattened.to(torch.long)
+                        )
                 else:
                     kv_cache = _cat([k, k_rope], dim=-1)
 
