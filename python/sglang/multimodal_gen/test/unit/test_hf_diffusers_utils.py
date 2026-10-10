@@ -483,3 +483,15 @@ def test_unreachable_hub_is_not_reported_as_single_model_repo(monkeypatch):
     with pytest.raises(ValueError, match="Failed to download or parse"):
         hf_diffusers_utils.maybe_download_model_index("org/model")
     assert downloads == []
+
+
+def test_component_config_ignores_scheduler_in_parent_directory(tmp_path):
+    """Only the component's own directory name selects scheduler_config.json; a
+    parent such as `scheduler_ablation/` must not redirect every component."""
+    component = tmp_path / "scheduler_ablation" / "unet"
+    component.mkdir(parents=True)
+    (component / "config.json").write_text(json.dumps({"_class_name": "UNet"}))
+
+    config = hf_diffusers_utils.get_diffusers_component_config(str(component))
+
+    assert config["_class_name"] == "UNet"
