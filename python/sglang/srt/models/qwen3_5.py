@@ -1884,7 +1884,7 @@ class Qwen3_5ForCausalLM(nn.Module):
                 return self._dense_mono.forward(
                     input_ids, positions, forward_batch, input_embeds
                 )
-            self._dense_mono.set_gdn_step(dense_mono_step)
+            self._dense_mono.set_step(dense_mono_step)
         if self._mono is not None and self._mono.eligible(
             input_ids, forward_batch, input_embeds, pp_proxy_tensors
         ):

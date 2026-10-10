@@ -20,10 +20,12 @@ The kernels read (16, 16)-shuffled copies of the MXFP4 weights (about 11 GiB),
 made before decode graph capture; prefill keeps the stock GEMMs on the
 checkpoint layout.
 
-At TP2 only K1 runs, on the rank's half of the GDN heads, from the stock
-input_layernorm's output (after the stock all-reduce): the stock layers run the
-step, and each GDN layer's ``linear_attn`` takes K1 up to out_proj. out_proj, the
-all-reduces, attention layers and the FFN stay stock.
+At TP2 the stock layers run the step and the kernels take the rank's share
+between the all-reduces: each GDN layer's ``linear_attn`` takes K1 (its half of
+the heads, from the stock input_layernorm's output) up to out_proj, and each
+layer's ``mlp`` takes K2 (``SGLANG_QWEN3_8_DENSE_MONO_K2``, its half of the
+intermediate, from the stock post_attention_layernorm's output) up to down's
+partial. out_proj / o_proj, the all-reduces, the norms and attention stay stock.
 
 The decode CUDA graph captures the step per batch size; any other step takes
 the stock layers. Mailbox tags carry a device epoch bumped once a step
@@ -123,12 +125,14 @@ def _mxfp4_unsupported(proj, n: int, k: int) -> str | None:
     return None
 
 
-def _weights_unsupported(layer, k1: bool, oproj: bool) -> str | None:
+def _weights_unsupported(layer, oproj: bool, tp: int) -> str | None:
+    """Why K2 cannot run this layer's FFN share at TP ``tp``, else None."""
     from sglang.kernels.ops.moe.qwen3_5_mono_flydsl import dense_ffn as D
 
+    inter = D.FGeo(tp).inter
     projs = [
-        ("gate_up_proj", layer.mlp.gate_up_proj, 2 * D.INTER, D.HIDDEN),
-        ("down_proj", layer.mlp.down_proj, D.HIDDEN, D.INTER),
+        ("gate_up_proj", layer.mlp.gate_up_proj, 2 * inter, D.HIDDEN),
+        ("down_proj", layer.mlp.down_proj, D.HIDDEN, inter),
     ]
     if oproj:
         projs.append(("o_proj", _o_proj(layer), D.HIDDEN, D.CORE))
@@ -266,28 +270,32 @@ class DenseMono:
         # per layer: the shuffled (in_proj_qkvz, in_proj_ba) of a GDN layer, else None
         self.w_in: list[tuple[torch.Tensor, torch.Tensor] | None] = []
         self.tp = get_tp_group().world_size
-        # TP1 runs the whole step (K1 + K2); TP2 only K1 inside the stock layers.
+        # TP1 runs the whole step (K1 + K2); TP2 K1 / K2 inside the stock layers.
         self.whole_step = self.tp == 1
         self.oproj = self.whole_step and envs.SGLANG_QWEN3_8_DENSE_MONO_OPROJ.get()
         k1_flag = envs.SGLANG_QWEN3_8_DENSE_MONO_K1.get()
         self.k1 = k1_flag and (self.oproj or not self.whole_step)
+        # TP2: K2 in each layer's mlp
+        self.k2 = not self.whole_step and envs.SGLANG_QWEN3_8_DENSE_MONO_K2.get()
         # out_proj / o_proj return their input while a mono step traces the layers
         self._skip_o = False
         # TP2: whether the step being run (or captured) takes K1 in linear_attn
+        # and K2 in mlp
         self._gdn_step = False
+        self._ffn_step = False
         self._prepared = False
         self._runtime_ok: bool | None = None
-        if self.ok and not self.whole_step and not self.k1:
-            self.ok, why = False, "TP2 runs only K1 (SGLANG_QWEN3_8_DENSE_MONO_K1=0)"
+        if self.ok and not self.whole_step and not (self.k1 or self.k2):
+            self.ok, why = False, "TP2 with neither K1 nor K2"
         if not self.ok:
             logger.info("Qwen3.8 dense mono off: %s", why)
             return
         dev = model.embed_tokens.weight.device
         self.scratch = None
-        if self.whole_step:
+        if self.whole_step or self.k2:
             self.scratch = torch.zeros(
                 max(
-                    D.scratch_bytes(D.FfnBuild(tokens=s))
+                    D.scratch_bytes(self._k2_key(D, s))
                     for s in range(1, D.MAX_TOKENS + 1)
                 ),
                 dtype=torch.uint8,
@@ -314,6 +322,12 @@ class DenseMono:
             return dense_gdn.K1Build(tokens=s, first=first, eps=eps, norm_eps=norm_eps)
         return dense_gdn.K1Build(tokens=s, norm_eps=norm_eps, tp=self.tp, normed=True)
 
+    def _k2_key(self, D, s: int, eps=1e-6):
+        """K2's build at width ``s``: at TP2 from the stock norm's output."""
+        if self.whole_step:
+            return D.FfnBuild(tokens=s, eps=eps, shuffled=True, oproj=self.oproj)
+        return D.FfnBuild(tokens=s, shuffled=True, tp=self.tp, normed=True)
+
     def prepare(self) -> None:
         """Before decode graph capture: the weight checks, the shuffled copies,
         then the kernels checked bit-exact against the stock layers. At TP2 the
@@ -333,7 +347,7 @@ class DenseMono:
             self._max_tokens(),
             self.tp,
             "folded" if self.oproj else "stock",
-            "K2" if self.whole_step else "stock",
+            "K2" if self.whole_step or self.k2 else "stock",
             "on" if self.k1 else "off",
             sum(w.numel() for w in self.w13 + self.w2 + self.w_o) / 2**30
             + sum(a.numel() + b.numel() for a, b in filter(None, self.w_in)) / 2**30,
@@ -341,8 +355,8 @@ class DenseMono:
 
     def _prepare(self) -> str | None:
         for layer in self.model.layers:
-            if self.whole_step:
-                why = _weights_unsupported(layer, self.k1, self.oproj)
+            if self.whole_step or self.k2:
+                why = _weights_unsupported(layer, self.oproj, self.tp)
                 if why is not None:
                     return f"layer {layer.layer_id} {why}"
             if self.k1 and _is_gdn(layer):
@@ -388,9 +402,11 @@ class DenseMono:
         from sglang.kernels.ops.moe.qwen3_5_mono_flydsl import dense_ffn as D
 
         for i, layer in enumerate(self.model.layers):
-            if self.whole_step:
+            if self.whole_step or self.k2:
                 self.w13.append(D.shuffle_w(layer.mlp.gate_up_proj.weight.data))
                 self.w2.append(D.shuffle_w(layer.mlp.down_proj.weight.data))
+            if self.k2:
+                self._wrap_mlp(i, layer)
             if self.oproj:
                 o = _o_proj(layer)
                 self.w_o.append(D.shuffle_w(o.weight.data))
@@ -431,6 +447,19 @@ class DenseMono:
 
         a.forward = forward
 
+    def _wrap_mlp(self, i, layer) -> None:
+        """TP2: on a mono step the FFN is K2 on the stock norm's output, its
+        partial left to the stock all-reduce."""
+        mlp = layer.mlp
+        stock = mlp.forward
+
+        def forward(x):
+            if not self._ffn_step or not isinstance(x, torch.Tensor):
+                return stock(x)
+            return self._ffn_partial(i, layer, x)
+
+        mlp.forward = forward
+
     def _k1_from_normed(self, i, layer, x, forward_batch):
         from sglang.srt.model_executor.forward_context import get_attn_backend
 
@@ -446,12 +475,14 @@ class DenseMono:
         return core
 
     def _self_check(self) -> str | None:
-        why = self._ffn_check() if self.whole_step else None
+        why = self._ffn_check() if self.whole_step or self.k2 else None
         if why is None and self.k1:
             why = self._k1_check()
         return why
 
     def _ffn_check(self) -> str | None:
+        """The first layer at widths 1 and 8: out and res_out (TP1), or this
+        rank's down partial (TP2)."""
         layer = self.model.layers[0]
         dev = self.epoch.device
         g = torch.Generator(device=dev).manual_seed(0)
@@ -464,6 +495,12 @@ class DenseMono:
             x, res_ref = layer.post_attention_layernorm(h.clone(), r.clone())
             ref = layer.mlp(x)
             self.epoch.add_(1)
+            if not self.whole_step:
+                out = self._ffn_partial(0, layer, x)
+                if not torch.equal(out, ref):
+                    d = (out.float() - ref.float()).abs().max().item()
+                    return f"K2 partial at width {s}: max abs err {d}"
+                continue
             out, res = self._ffn(0, layer, core if self.oproj else h, r)
             if not torch.equal(res, res_ref):
                 return f"K2 res_out at width {s}"
@@ -561,13 +598,14 @@ class DenseMono:
                 logger.warning("Qwen3.8 dense mono K1 off: %s", why)
                 self.k1 = False
             self._runtime_ok = why is None
-        return self.k1 or self.whole_step
+        return self.k1 or self.whole_step or self.k2
 
-    def set_gdn_step(self, on: bool) -> None:
+    def set_step(self, on: bool) -> None:
         """TP2, before the stock layers run a step: whether its GDN mixers take
-        K1 (``eligible``)."""
+        K1 and its FFNs K2 (``eligible``)."""
         self._gdn_step = on and self.k1
-        if self._gdn_step:
+        self._ffn_step = on and self.k2
+        if self._gdn_step or self._ffn_step:
             self.epoch.add_(1)
 
     def _skip(self, why: str) -> bool:
@@ -679,11 +717,8 @@ class DenseMono:
         out = torch.empty_like(residual)
         res_out = torch.empty_like(residual)
         D.dense_ffn(
-            D.FfnBuild(
-                tokens=h.size(0),
-                eps=layer.post_attention_layernorm.variance_epsilon,
-                shuffled=True,
-                oproj=self.oproj,
+            self._k2_key(
+                D, h.size(0), eps=layer.post_attention_layernorm.variance_epsilon
             ),
             hidden=h,
             w_o=self.w_o[i] if self.oproj else None,
@@ -701,3 +736,27 @@ class DenseMono:
             layer=i,
         )
         return out, res_out
+
+    def _ffn_partial(self, i, layer, x) -> torch.Tensor:
+        """TP2: K2 on post_attention_layernorm's output -> this rank's down
+        partial (before the all-reduce)."""
+        from sglang.kernels.ops.moe.qwen3_5_mono_flydsl import dense_ffn as D
+
+        mlp = layer.mlp
+        out = torch.empty_like(x)
+        D.dense_ffn(
+            self._k2_key(D, x.size(0)),
+            hidden=x.contiguous(),
+            residual=None,
+            ln_w=None,
+            w13=self.w13[i],
+            w13s=mlp.gate_up_proj.weight_scale,
+            w2=self.w2[i],
+            w2s=mlp.down_proj.weight_scale,
+            out=out,
+            res_out=None,
+            scratch=self.scratch,
+            epoch=self.epoch,
+            layer=i,
+        )
+        return out

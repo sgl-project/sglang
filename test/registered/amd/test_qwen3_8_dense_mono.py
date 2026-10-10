@@ -3,7 +3,9 @@ gfx950) against the stock decode path, on random MXFP4 weights.
 
 ``DenseFfnTest`` (K2, ``dense_ffn``): out_proj / o_proj + the residual add +
 post_attention_layernorm + gate_up, SiLU-mul and down, against dynamic_mxfp4_quant
-+ Triton ``gemm_afp4wfp4``, the ROCm Triton Gemma norm and SiluAndMul.
++ Triton ``gemm_afp4wfp4``, the ROCm Triton Gemma norm and SiluAndMul. At TP2
+(from the stock norm's output) each rank's down partial before the all-reduce,
+from its half of gate_up's rows and down's K columns.
 
 ``DenseGdnTest`` (K1, ``dense_gdn``): the residual add + input_layernorm ->
 in_proj_qkvz / in_proj_ba -> conv1d -> the gated delta rule -> the gated norm,
@@ -70,6 +72,15 @@ def _linear(x, w, ws):
     return y
 
 
+def _k_cols(w, ws, k, tp, rank):
+    """Row-parallel: the rank's input columns of an MXFP4 [n, k]."""
+    n = k // tp
+    return (
+        w[:, rank * n // 2 : (rank + 1) * n // 2].contiguous(),
+        ws[:, rank * n // 32 : (rank + 1) * n // 32].contiguous(),
+    )
+
+
 def _gemma_norm(x, residual, w):
     """GemmaRMSNorm as the stock path runs it on ROCm with aiter -> x, residual."""
     from sglang.kernels.ops.layernorm import minimax_m3_rmsnorm as M
@@ -132,6 +143,60 @@ class DenseFfnTest(CustomTestCase):
                     bad.append(draw)
             with self.subTest(s=s, layer=layer):
                 self.assertEqual(bad, [])
+
+    def test_bit_exact_tp2(self):
+        from sglang.kernels.ops.moe.qwen3_5_mono_flydsl import dense_ffn as D
+        from sglang.srt.layers.activation import SiluAndMul
+
+        act = SiluAndMul()
+        inter = D.FGeo(2).inter
+        for rank in range(2):
+            for s in WIDTHS:
+                g = torch.Generator(device="cuda").manual_seed(200 + s)
+                layer = LAYER_TAGS[s % len(LAYER_TAGS)]
+                w13, w13s = _mxfp4(g, 2 * D.INTER, D.HIDDEN)
+                w2, w2s = _mxfp4(g, D.HIDDEN, D.INTER)
+                ln_w = _rnd(g, D.HIDDEN, scale=0.1)
+                # Column-parallel gate_up: the rank's half of gate, then of up.
+                rows = [
+                    slice(o + rank * inter, o + (rank + 1) * inter)
+                    for o in (0, D.INTER)
+                ]
+                w13 = torch.cat([w13[r] for r in rows]).contiguous()
+                w13s = torch.cat([w13s[r] for r in rows]).contiguous()
+                w2, w2s = _k_cols(w2, w2s, D.INTER, 2, rank)
+                w13_sh, w2_sh = D.shuffle_w(w13), D.shuffle_w(w2)
+                key = D.FfnBuild(tokens=s, shuffled=True, tp=2, normed=True)
+                out = torch.empty(s, D.HIDDEN, dtype=BF, device="cuda")
+                epoch = torch.zeros(1, dtype=torch.int32, device="cuda")
+                scratch = torch.zeros(
+                    D.scratch_bytes(key), dtype=torch.uint8, device="cuda"
+                )
+                bad = []
+                for draw in range(FFN_DRAWS // 2):
+                    h = _rnd(g, s, D.HIDDEN, scale=0.5)
+                    x, _ = _gemma_norm(h, _rnd(g, s, D.HIDDEN, scale=2.0), ln_w)
+                    out_ref = _linear(act(_linear(x, w13, w13s)), w2, w2s)
+                    epoch.add_(1)
+                    D.dense_ffn(
+                        key,
+                        hidden=x,
+                        residual=None,
+                        ln_w=None,
+                        w13=w13_sh,
+                        w13s=w13s,
+                        w2=w2_sh,
+                        w2s=w2s,
+                        out=out,
+                        res_out=None,
+                        scratch=scratch,
+                        epoch=epoch,
+                        layer=layer,
+                    )
+                    if not torch.equal(out, out_ref):
+                        bad.append(draw)
+                with self.subTest(rank=rank, s=s, layer=layer):
+                    self.assertEqual(bad, [])
 
 
 def _gdn_weights(g, K):

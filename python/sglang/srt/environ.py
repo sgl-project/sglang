@@ -888,6 +888,8 @@ class Envs:
     SGLANG_QWEN3_8_DENSE_MONO_OPROJ = EnvBool(True)
     # With the o_proj fold: each GDN layer's input norm .. gated norm as one launch.
     SGLANG_QWEN3_8_DENSE_MONO_K1 = EnvBool(True)
+    # TP2: each layer's FFN (gate_up .. down, before the all-reduce) as one launch.
+    SGLANG_QWEN3_8_DENSE_MONO_K2 = EnvBool(True)
     # Fuse MiniMax-M3 main/index QK norm + RoPE with main KV and index-K cache
     # insertion. Requires an AITER build with the fp8_e4m3_unit cache contract.
     # Enabled by default for supported configurations; set to 0 to disable.
