@@ -488,7 +488,25 @@ class RustServer:
         :func:`_build_server_args`; ``family`` / ``resample`` become the
         extension's ``MmFamily`` / ``MmResample`` enums)."""
         ext = cls._load_extension()
-        family = {"qwen_vl": ext.MmFamily.QwenVl}[spec.family]
+        family = {
+            "qwen_vl": ext.MmFamily.QwenVl,
+            "intern_vl": ext.MmFamily.InternVl,
+        }[spec.family]
+        if spec.family == "intern_vl":
+            return ext.MmSpec(
+                family=family,
+                feature_shm=spec.feature_shm,
+                image_token_id=spec.image_token_id,
+                image_mean=spec.image_mean,
+                image_std=spec.image_std,
+                image_size=spec.image_size,
+                num_image_token=spec.num_image_token,
+                max_num=spec.max_num,
+                use_thumbnail=spec.use_thumbnail,
+                img_context_token_id=spec.img_context_token_id,
+                img_start_token_id=spec.img_start_token_id,
+                img_end_token_id=spec.img_end_token_id,
+            )
         resample = {"aten_u8": ext.MmResample.AtenU8, "pil": ext.MmResample.Pil}[
             spec.resample
         ]

@@ -59,6 +59,10 @@ pub enum DecodedMedia {
 pub enum Geometry {
     /// `[t, h, w]` patch grid (`t` = 1 for still images).
     Grid([u32; 3]),
+    /// InternVL-style item: the tile count (including the optional thumbnail).
+    /// The family's `layout` turns this into an explicit
+    /// `<img> + <IMG_CONTEXT>*N + </img>` sequence.
+    Tiles(u32),
 }
 
 /// One processed media item, mirroring Python's `MultimodalDataItem`: the
@@ -75,9 +79,13 @@ pub struct ProcessedItem {
 pub enum TokenPattern {
     /// N copies of one placeholder id (qwen-style).
     Repeat { id: i64, n: usize },
-    /// An explicit id sequence — tile markers, row separators, wrapper
-    /// tokens (minicpm/internvl-style structured expansions).
-    Explicit(Vec<i64>),
+    /// An explicit id sequence, together with the inclusive range within it
+    /// that maps to the media item. Tokens outside `content` are wrapper
+    /// markers (`<img>` / `</img>`) and stay out of the reported offsets.
+    Explicit {
+        ids: Vec<i64>,
+        content: std::ops::Range<usize>,
+    },
 }
 
 /// One span of the expanded prompt.

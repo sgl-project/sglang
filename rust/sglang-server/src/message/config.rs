@@ -453,49 +453,74 @@ pub struct MmSpec {
 
 #[pyo3::pymethods]
 impl MmSpec {
-    /// The parameter list is flat because every family so far shares the
-    /// Qwen-VL processor geometry; a family with different knobs adds its own
-    /// keywords and match arm here.
+    /// The constructor takes the union of the Qwen-VL and InternVL knobs as
+    /// optional keywords; each family arm unwraps only the parameters it uses.
     #[new]
     #[pyo3(signature = (*,
         family,
         feature_shm,
         image_token_id,
-        patch_size,
-        merge_size,
-        temporal_patch_size,
-        min_pixels,
-        max_pixels,
+        patch_size=None,
+        merge_size=None,
+        temporal_patch_size=None,
+        min_pixels=None,
+        max_pixels=None,
         image_mean,
         image_std,
-        resample,
+        resample=None,
+        image_size=None,
+        num_image_token=None,
+        max_num=None,
+        use_thumbnail=None,
+        img_context_token_id=None,
+        img_start_token_id=None,
+        img_end_token_id=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn py_new(
         family: MmFamily,
         feature_shm: bool,
         image_token_id: i64,
-        patch_size: usize,
-        merge_size: usize,
-        temporal_patch_size: usize,
-        min_pixels: usize,
-        max_pixels: usize,
+        patch_size: Option<usize>,
+        merge_size: Option<usize>,
+        temporal_patch_size: Option<usize>,
+        min_pixels: Option<usize>,
+        max_pixels: Option<usize>,
         image_mean: [f32; 3],
         image_std: [f32; 3],
-        resample: MmResample,
+        resample: Option<MmResample>,
+        image_size: Option<usize>,
+        num_image_token: Option<usize>,
+        max_num: Option<usize>,
+        use_thumbnail: Option<bool>,
+        img_context_token_id: Option<i64>,
+        img_start_token_id: Option<i64>,
+        img_end_token_id: Option<i64>,
     ) -> Self {
         use sglang_mm::registry::PipelineSpec;
         let pipeline = match family {
             MmFamily::QwenVl => PipelineSpec::QwenVl(sglang_mm::qwen_vl::QwenVlSpec {
                 image_token_id,
-                patch_size,
-                merge_size,
-                temporal_patch_size,
-                min_pixels,
-                max_pixels,
+                patch_size: patch_size.unwrap_or(0),
+                merge_size: merge_size.unwrap_or(0),
+                temporal_patch_size: temporal_patch_size.unwrap_or(0),
+                min_pixels: min_pixels.unwrap_or(0),
+                max_pixels: max_pixels.unwrap_or(0),
                 image_mean,
                 image_std,
-                resample: resample.into(),
+                resample: resample.unwrap_or(MmResample::AtenU8).into(),
+            }),
+            MmFamily::InternVl => PipelineSpec::InternVl(sglang_mm::internvl::InternVlSpec {
+                image_token_id,
+                img_context_token_id: img_context_token_id.unwrap_or(-1),
+                img_start_token_id: img_start_token_id.unwrap_or(-1),
+                img_end_token_id: img_end_token_id.unwrap_or(-1),
+                image_size: image_size.unwrap_or(0) as u32,
+                num_image_token: num_image_token.unwrap_or(0) as u32,
+                max_num: max_num.unwrap_or(0) as u32,
+                use_thumbnail: use_thumbnail.unwrap_or(true),
+                image_mean,
+                image_std,
             }),
         };
         Self {
@@ -507,7 +532,8 @@ impl MmSpec {
 
 /// Which `sglang_mm` family pipeline serves the model — one variant per
 /// [`sglang_mm::registry::PipelineSpec`] arm. Exposed to Python as an enum
-/// (`MmFamily.QwenVl`); `RustMmFamily.name` maps onto it at handoff.
+/// (`MmFamily.QwenVl` / `MmFamily.InternVl`); `RustMmFamily.name` maps onto
+/// it at handoff.
 #[pyo3::pyclass(
     eq,
     frozen,
@@ -517,9 +543,10 @@ impl MmSpec {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MmFamily {
     QwenVl,
+    InternVl,
 }
 
-/// The HF image processor the Rust resize must reproduce bit-exactly (see
+/// The Qwen-VL image processor the Rust resize must reproduce bit-exactly (see
 /// [`sglang_mm::qwen_vl::Resampler`]). Exposed to Python as an enum
 /// (`MmResample.AtenU8` / `.Pil`); `RustMmFamily.image_processors` maps each
 /// processor class onto it.
