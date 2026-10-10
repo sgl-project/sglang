@@ -1248,6 +1248,87 @@ class ServingChatTestCase(CustomTestCase):
 
         self.assertIsNone(processed.tool_call_constraint)
 
+    def _glm47_tool_constraint_ebnf(self, reasoning_config, reasoning_parser):
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.template_manager.reasoning_config = reasoning_config
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        self.chat.tool_call_parser = "glm47"
+        self.chat.reasoning_parser = reasoning_parser
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "What is 2+2?"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "add",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "a": {"type": "integer"},
+                                "b": {"type": "integer"},
+                            },
+                        },
+                    },
+                }
+            ],
+            chat_template_kwargs={"enable_thinking": False},
+        )
+
+        kind, ebnf = self.chat._process_messages(
+            req, is_multimodal=False
+        ).tool_call_constraint
+        self.assertEqual(kind, "full_assistant_ebnf")
+        return ebnf
+
+    @staticmethod
+    def _ebnf_accepts(ebnf, text):
+        import xgrammar as xgr
+
+        compiler = xgr.GrammarCompiler(
+            xgr.TokenizerInfo(
+                [bytes([i]) for i in range(256)], vocab_type=xgr.VocabType.RAW
+            ),
+            max_threads=1,
+        )
+        matcher = xgr.GrammarMatcher(
+            compiler.compile_grammar(xgr.Grammar.from_ebnf(ebnf))
+        )
+        return matcher.accept_string(text) and matcher.is_completed()
+
+    def test_glm47_constraint_lets_always_think_template_close_think(self):
+        """GLM-5.3's generation prompt opens <think> on every turn and ignores
+        enable_thinking, so the model has to emit </think> before its answer
+        or tool call. Building the tool grammar from the raw
+        enable_thinking=False kwarg forbade that token, so every tool-bearing
+        request stayed inside the thinking block until max_tokens (#41939)."""
+        always = ReasoningToggleConfig(special_case="always")
+        tool_call = (
+            "<tool_call>add<arg_key>a</arg_key><arg_value>2</arg_value>"
+            "<arg_key>b</arg_key><arg_value>2</arg_value></tool_call>"
+        )
+        for reasoning_parser in ("glm45", None):
+            with self.subTest(reasoning_parser=reasoning_parser):
+                ebnf = self._glm47_tool_constraint_ebnf(always, reasoning_parser)
+                self.assertTrue(self._ebnf_accepts(ebnf, "2+2 is 4.</think>4"))
+                self.assertTrue(
+                    self._ebnf_accepts(ebnf, f"Use the tool.</think>{tool_call}")
+                )
+
+    def test_glm47_constraint_keeps_rejecting_think_end_for_toggle_template(
+        self,
+    ):
+        """A toggle template really omits the think block when enable_thinking
+        is False, so the grammar must still reject a stray </think> there."""
+        toggle = ReasoningToggleConfig(
+            toggle_param="enable_thinking", default_enabled=True
+        )
+        ebnf = self._glm47_tool_constraint_ebnf(toggle, "glm45")
+        self.assertFalse(self._ebnf_accepts(ebnf, "2+2 is 4.</think>4"))
+        self.assertTrue(self._ebnf_accepts(ebnf, "4"))
+
     def test_jinja_tool_schema_fallback_to_flat_function(self):
         """Fallback to function-only schema when template rejects OpenAI wrapper."""
         self.template_manager.chat_template_name = None
