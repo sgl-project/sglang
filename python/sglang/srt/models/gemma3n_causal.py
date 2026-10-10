@@ -780,13 +780,9 @@ class Gemma3nTextModel(PreTrainedModel):
         per_layer_inputs: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
-        if (input_ids is None) ^ (input_embeds is not None):
-            raise ValueError(
-                "You must specify exactly one of input_ids or inputs_embeds"
-            )
-
-        if input_ids is not None:
+        if input_embeds is None:
             input_embeds = self.embed_tokens(input_ids)
+        if per_layer_inputs is None and input_ids is not None:
             per_layer_inputs = self.get_per_layer_inputs(input_ids)
 
         per_layer_inputs = self.project_per_layer_inputs(input_embeds, per_layer_inputs)
