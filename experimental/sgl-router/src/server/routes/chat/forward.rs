@@ -266,7 +266,9 @@ fn prompt_dp_rank(
         .flatten()
         .find_map(|name| nonempty_header(headers, name));
     let prefix_depths = match (key, &ctx.dp_rank_prefix_provider, &request.tokens) {
-        (None, Some(provider), Some(tokens)) => provider.rank_depths(&tokens.ids, &worker.url),
+        (None, Some(provider), Some(tokens)) => {
+            provider.rank_depths(&tokens.ids, &worker.url, tokens.cache_salt.as_deref())
+        }
         _ => Vec::new(),
     };
     select_dp_rank(worker, key, &prefix_depths)

@@ -2,7 +2,7 @@
 //!
 //! This is the gateway-side mirror of SGLang's per-page SHA256 chaining used
 //! to derive `BlockStored.block_hashes` on workers (Python:
-//! `python/sglang/srt/mem_cache/radix_cache.py::hash_page` and
+//! `python/sglang/srt/mem_cache/utils.py::compute_node_event_hash_values` and
 //! `python/sglang/srt/mem_cache/utils.py::hash_str_to_int64`).
 //!
 //! ### Algorithm
@@ -15,6 +15,9 @@
 //! 4. Take the 32-byte digest as the new "prior" for the next page.
 //! 5. Truncate the digest to a signed i64 by reading the first 16 hex chars
 //!    (top 64 bits) and reinterpreting as signed.
+//!
+//! For a nonempty request `cache_salt`, the initial prior digest is
+//! `SHA256(b"sglang-cache-salt-v1\0" + salt.as_bytes())` instead of no prior.
 //!
 //! ### Why no `parent_hash: Option<i64>` argument
 //!
@@ -55,6 +58,21 @@ use sha2::{Digest, Sha256};
 /// up-front against the worker-published `block_size`; an invalid value is
 /// a programmer/config bug, not a runtime input we should swallow.
 pub fn compute_block_hashes(token_ids: &[u32], block_size: usize) -> Vec<i64> {
+    compute_block_hashes_with_salt(token_ids, block_size, None)
+}
+
+/// Compute event hashes in the request's cache namespace. Missing and empty
+/// salts are equivalent, matching `GenerateReqInput` and `RadixKey`.
+///
+/// A nonempty salt seeds the first page with the full SHA256 digest of
+/// `b"sglang-cache-salt-v1\0" + salt.encode("utf-8")`. This is the engine's
+/// KV-event seed, not its storage namespace seed (which also includes LoRA).
+/// Panics if `block_size == 0`, like [`compute_block_hashes`].
+pub fn compute_block_hashes_with_salt(
+    token_ids: &[u32],
+    block_size: usize,
+    cache_salt: Option<&str>,
+) -> Vec<i64> {
     assert!(block_size > 0, "block_size must be positive");
     if token_ids.is_empty() {
         return Vec::new();
@@ -63,7 +81,7 @@ pub fn compute_block_hashes(token_ids: &[u32], block_size: usize) -> Vec<i64> {
     let n = token_ids.len();
     let num_blocks = n.div_ceil(block_size);
     let mut out = Vec::with_capacity(num_blocks);
-    let mut prior: Option<[u8; 32]> = None;
+    let mut prior = cache_salt_seed(cache_salt);
 
     let mut start = 0;
     while start < n {
@@ -110,8 +128,7 @@ pub fn sha256_to_i64(digest: &[u8; 32]) -> i64 {
 
 /// Bigram variant of [`compute_block_hashes`], matching SGLang's `radix_cache`
 /// worker when the model runs **EAGLE speculative decoding** (`is_bigram =
-/// is_eagle`). Mirrors `RadixKey.hash_page` (Python:
-/// `mem_cache/radix_cache.py`) on the bigram path:
+/// is_eagle`). Mirrors the bigram path in `mem_cache/cpp_utils/hash_binding.cpp`:
 ///
 /// - The logical sequence is the `N-1` overlapping bigrams of `N` raw tokens,
 ///   so the page count is `ceil((len-1) / block_size)`. Fewer than 2 tokens
@@ -127,6 +144,15 @@ pub fn sha256_to_i64(digest: &[u8; 32]) -> i64 {
 /// hashes won't match the worker's stored bigram block hashes and cache-aware
 /// routing silently degrades to min-load.
 pub fn compute_block_hashes_bigram(token_ids: &[u32], block_size: usize) -> Vec<i64> {
+    compute_block_hashes_bigram_with_salt(token_ids, block_size, None)
+}
+
+/// Bigram variant of [`compute_block_hashes_with_salt`].
+pub fn compute_block_hashes_bigram_with_salt(
+    token_ids: &[u32],
+    block_size: usize,
+    cache_salt: Option<&str>,
+) -> Vec<i64> {
     assert!(block_size > 0, "block_size must be positive");
     // N raw tokens -> N-1 overlapping bigrams; fewer than 2 tokens -> no blocks.
     let logical_len = token_ids.len().saturating_sub(1);
@@ -135,7 +161,7 @@ pub fn compute_block_hashes_bigram(token_ids: &[u32], block_size: usize) -> Vec<
     }
     let num_blocks = logical_len.div_ceil(block_size);
     let mut out = Vec::with_capacity(num_blocks);
-    let mut prior: Option<[u8; 32]> = None;
+    let mut prior = cache_salt_seed(cache_salt);
 
     let mut start = 0;
     while start < logical_len {
@@ -147,6 +173,15 @@ pub fn compute_block_hashes_bigram(token_ids: &[u32], block_size: usize) -> Vec<
     }
 
     out
+}
+
+fn cache_salt_seed(cache_salt: Option<&str>) -> Option<[u8; 32]> {
+    cache_salt.filter(|salt| !salt.is_empty()).map(|salt| {
+        let mut hasher = Sha256::new();
+        hasher.update(b"sglang-cache-salt-v1\0");
+        hasher.update(salt.as_bytes());
+        hasher.finalize().into()
+    })
 }
 
 /// Hash a single bigram page: for each unit `j` in `[start, end)`, feed
