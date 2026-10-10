@@ -4,12 +4,21 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from sglang.srt.arg_groups.deepseek_v4_hook import validate_deepseek_v4_cp
+from sglang.srt.arg_groups.deepseek_v4_hook import (
+    validate_deepseek_v4_cp,
+    validate_deepseek_v41_features,
+)
 from sglang.srt.arg_groups.parallel_hook import (
     handle_context_parallelism,
     validate_prefill_cp_platform,
 )
 from sglang.srt.layers.cp.base import init_cp_strategy
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    Phase,
+    default_cuda_graph_config,
+    with_phase,
+)
 from sglang.srt.runtime_context import override_platform
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -141,6 +150,52 @@ class TestPlatformPrefillCPPolicy(CustomTestCase):
                     validate_prefill_cp_platform(args)
                     self.assertTrue(args.enable_prefill_cp)
                     self.assertEqual(args.cp_strategy, strategy)
+
+
+class TestDecoderBoundedReplayPrefillGraph(CustomTestCase):
+    def _args(self, backend, **overrides):
+        args = _cp_args(
+            "DeepseekV41ForCausalLM",
+            "deepseek_v41",
+            enable_prefill_cp=False,
+            enable_decoder_swa_bounded_replay=True,
+            cuda_graph_config=with_phase(
+                default_cuda_graph_config(), Phase.PREFILL, backend=backend
+            ),
+            **overrides,
+        )
+        return args
+
+    @override_platform(is_hip=False, is_npu=False, is_musa=False)
+    def test_only_the_breakable_prefill_graph_is_admitted(self):
+        """Only the breakable graph re-runs the switch onto the late-layer tail at
+        replay; any other captured prefill would run the late layers on stale rows."""
+        for backend in (Backend.DISABLED, Backend.BREAKABLE):
+            with self.subTest(backend=backend):
+                args = self._args(backend)
+                validate_deepseek_v41_features(args)
+                # The indexer runs at a graph break here, so no context cap applies.
+                self.assertIsNone(args.cuda_graph_config.prefill.max_seq_len)
+        for backend in (Backend.FULL, Backend.TC_PIECEWISE):
+            with (
+                self.subTest(backend=backend),
+                self.assertRaisesRegex(ValueError, f"{backend} prefill CUDA graph"),
+            ):
+                validate_deepseek_v41_features(self._args(backend))
+
+    def test_breakable_prefill_graph_is_rejected_where_the_tail_is_not_captured(self):
+        with (
+            override_platform(is_hip=True, is_npu=False, is_musa=False),
+            self.assertRaisesRegex(ValueError, "on ROCm"),
+        ):
+            validate_deepseek_v41_features(self._args(Backend.BREAKABLE))
+        with (
+            override_platform(is_hip=False, is_npu=False, is_musa=False),
+            self.assertRaisesRegex(ValueError, "under context parallelism"),
+        ):
+            validate_deepseek_v41_features(
+                self._args(Backend.BREAKABLE, attn_cp_size=2)
+            )
 
 
 if __name__ == "__main__":
