@@ -616,6 +616,20 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     && ( if [ -f python/kernels.lock ]; then mv python/kernels.lock /root/.cache/sglang/; fi ) \
     && ( find /opt/sglang/lib/python3.12/site-packages -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true )
 
+# natten (neighborhood attention) is an optional kernel for the Cosmos3 LiDAR
+# range-map VAE in the diffusion runtime, selected with
+# SGLANG_DIFFUSION_COSMOS3_LIDAR_USE_NATTEN=1; by default the VAE runs a compiled
+# FlexAttention block mask and needs no extra package. Its wheels are built per
+# torch+CUDA pair and live on the project's own index (PyPI only has the sdist,
+# which would compile CUDA kernels here), so pick the prebuilt wheel and, like the
+# sgl-flash-attn3 cubins above, fall back with a warning instead of failing the
+# build when none matches.
+ARG NATTEN_VERSION=0.21.7
+RUN --mount=type=cache,target=/root/.cache/pip \
+    ( python3 -m pip install --only-binary :all: "natten==${NATTEN_VERSION}" -f https://whl.natten.org \
+      && python3 -c "import natten; print('natten', natten.__version__)" ) \
+    || echo "WARNING: no prebuilt natten ${NATTEN_VERSION} wheel for this torch+CUDA; the Cosmos3 LiDAR VAE uses its built-in FlexAttention kernel"
+
 ENV SGLANG_RUST_BUILD_MODE=never
 
 
