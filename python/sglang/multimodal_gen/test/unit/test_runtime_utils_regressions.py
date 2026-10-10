@@ -5,10 +5,14 @@ import io
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import numpy as np
 import pytest
 import torch
 from PIL import Image
 
+from sglang.multimodal_gen.runtime.pipelines.diffusers_pipeline import (
+    DiffusersExecutionStage,
+)
 from sglang.multimodal_gen.runtime.utils import common, vision
 from sglang.multimodal_gen.runtime.utils.camera_geometry import get_plucker_embeddings
 from sglang.multimodal_gen.runtime.utils.image_io import save_base64_image_to_path
@@ -102,3 +106,23 @@ def test_image_processor_rejects_unsupported_input_type():
     UnboundLocalError on `mask`."""
     with pytest.raises(TypeError, match="Unsupported image type"):
         ImageProcessorV2(size=8).load_image(torch.zeros(3, 8, 8))
+
+
+@pytest.mark.parametrize(
+    "data, expected_shape",
+    [
+        (np.random.rand(2, 5, 16, 16, 3).astype("float32"), (2, 3, 5, 16, 16)),
+        ([[Image.new("RGB", (16, 16)) for _ in range(5)]], (1, 3, 5, 16, 16)),
+        ([[Image.new("RGB", (16, 16)) for _ in range(3)]], (1, 3, 3, 16, 16)),
+        ([Image.new("RGB", (16, 16)) for _ in range(2)], (2, 3, 16, 16)),
+    ],
+    ids=["np-video", "pil-video", "pil-video-3-frames", "pil-image-batch"],
+)
+def test_diffusers_output_layout_is_channels_first(data, expected_shape):
+    """Video outputs were permuted twice (np) or misread as a batch (PIL lists), and
+    several PIL images from an image pipeline were stacked as video frames."""
+    stage = DiffusersExecutionStage.__new__(DiffusersExecutionStage)
+
+    output = stage._postprocess_output(stage._convert_to_tensor(data))
+
+    assert tuple(output.shape) == expected_shape
