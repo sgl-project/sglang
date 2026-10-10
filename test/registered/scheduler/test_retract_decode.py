@@ -62,8 +62,8 @@ class TestRetractDecode(CustomTestCase):
         assert self.process.poll() is None, "Server crashed during test"
 
 
-class TestRetractDecodeChunkCachePaged(TestRetractDecode):
-    """python -m unittest test_retract_decode.TestRetractDecodeChunkCachePaged"""
+class TestRetractDecodeRadixDisabledPaged(TestRetractDecode):
+    """python -m unittest test_retract_decode.TestRetractDecodeRadixDisabledPaged"""
 
     other_args = ["--disable-radix-cache", "--page-size", "16"]
 
@@ -102,8 +102,8 @@ class TestRetractDecodeLongOutput(CustomTestCase):
 
 
 @unittest.skipIf(is_in_ci(), "Skipped in CI due to long runtime")
-class TestRetractDecodeLongOutputChunkCache(TestRetractDecodeLongOutput):
-    """python -m unittest test_retract_decode.TestRetractDecodeLongOutputChunkCache"""
+class TestRetractDecodeLongOutputRadixDisabled(TestRetractDecodeLongOutput):
+    """python -m unittest test_retract_decode.TestRetractDecodeLongOutputRadixDisabled"""
 
     other_args = ["--disable-radix-cache"]
 
