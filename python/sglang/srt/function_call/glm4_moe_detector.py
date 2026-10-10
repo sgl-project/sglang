@@ -306,15 +306,14 @@ class Glm4MoeDetector(BaseFormatDetector):
             # Ensure proper JSON string formatting with quotes
             return json.dumps(value, ensure_ascii=False)
         elif value_type == "number":
-            try:
-                num = _convert_to_number(value.strip())
+            num = _convert_to_number(value.strip())
+            # _convert_to_number returns the input unchanged when it is not
+            # numeric, so an isinstance check is required: returning str(num)
+            # blindly would emit a bare, invalid JSON token (123abc).
+            if isinstance(num, (int, float)) and not isinstance(num, bool):
                 return str(num)
-            except (ValueError, AttributeError):
-                # Fallback to string if not a valid number
-                logger.warning(
-                    f"Failed to parse '{value}' as number, treating as string"
-                )
-                return json.dumps(str(value), ensure_ascii=False)
+            logger.warning(f"Failed to parse '{value}' as number, treating as string")
+            return json.dumps(str(value), ensure_ascii=False)
         else:
             # For object/array types, return as-is (should already be valid JSON)
             return value
@@ -364,8 +363,11 @@ class Glm4MoeDetector(BaseFormatDetector):
                     self._current_value = ""
                     self._xml_tag_buffer = ""
                     self._value_started = False
-                    # Determine and cache the value type at the start
-                    self._cached_value_type = self._get_value_type(
+                    # Only the schema-declared type is known this early. Value
+                    # based auto-detection is deferred to </arg_value>, because
+                    # _current_value is still empty here and inferring now would
+                    # always fall back to "string".
+                    self._cached_value_type = get_argument_type(
                         func_name, self._current_key, tools
                     )
 
@@ -373,6 +375,13 @@ class Glm4MoeDetector(BaseFormatDetector):
                 if self._xml_tag_buffer.endswith("</arg_value>"):
                     final_value = self._xml_tag_buffer[:-12]
                     self._current_value += final_value
+
+                    # The schema declared no type, so infer it now that the
+                    # complete value is known.
+                    if self._cached_value_type is None:
+                        self._cached_value_type = self._get_value_type(
+                            func_name, self._current_key, tools
+                        )
 
                     # Use cached value type for consistency
                     value_type = self._cached_value_type or "string"
@@ -409,9 +418,18 @@ class Glm4MoeDetector(BaseFormatDetector):
                     if not is_potential_closing:
                         content = self._xml_tag_buffer
                         # Use cached value type for consistency
-                        value_type = self._cached_value_type or "string"
+                        value_type = self._cached_value_type
 
-                        if value_type == "string":
+                        if value_type is None:
+                            # No schema type for this argument. Buffer the value
+                            # instead of emitting it: the type can only be
+                            # decided once the whole value is known. Guessing
+                            # from the leading characters would quote a number
+                            # (123 -> "123") or emit malformed JSON.
+                            if content:
+                                self._current_value += content
+                                self._xml_tag_buffer = ""
+                        elif value_type == "string":
                             if not self._value_started:
                                 json_output += '"'
                                 self._value_started = True
