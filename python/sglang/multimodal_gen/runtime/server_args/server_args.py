@@ -341,6 +341,8 @@ class ServerArgs(DisaggServerArgsMixin):
     performance_mode: str = "auto"
     base_gpu_id: int = 0
     gpu_ids: list[int] | None = None
+    # i-th entry: NUMA node of the worker on local GPU i; None auto-detects
+    numa_node: list[int] | None = None
     # cross-node: num_gpus is the total world size across all nodes; each
     # node runs num_gpus // nnodes local GPU workers (mirrors srt's
     # tp_size_per_node convention)
@@ -2390,6 +2392,17 @@ class ServerArgs(DisaggServerArgsMixin):
             ),
         )
         parser.add_argument(
+            "--numa-node",
+            type=int,
+            nargs="+",
+            default=ServerArgs.numa_node,
+            help=(
+                "NUMA node for each GPU worker; the i-th value is for the worker "
+                "on local GPU i. If unset, each worker binds to its GPU's NUMA "
+                "node on multi-socket NUMA hosts (disable with SGLANG_AUTO_NUMA_BIND=0)."
+            ),
+        )
+        parser.add_argument(
             "--tp-size",
             type=int,
             default=None,
@@ -3998,6 +4011,12 @@ class ServerArgs(DisaggServerArgsMixin):
         if self.num_gpus % self.nnodes != 0:
             raise ValueError(
                 f"num_gpus ({self.num_gpus}) must be divisible by nnodes ({self.nnodes})"
+            )
+        local_num_gpus = self.num_gpus // self.nnodes
+        if self.numa_node is not None and len(self.numa_node) < local_num_gpus:
+            raise ValueError(
+                f"--numa-node needs one node per local GPU worker ({local_num_gpus}), "
+                f"got {self.numa_node}"
             )
 
         if self.sp_degree > self.num_gpus or self.num_gpus % self.sp_degree != 0:
