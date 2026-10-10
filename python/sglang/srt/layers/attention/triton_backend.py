@@ -15,6 +15,7 @@ from sglang.srt.configs.model_config import (
     AttentionArch,
     is_dspark_draft,
     is_kimi_k3,
+    is_minimax_sparse,
     is_qwen3_5,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -87,7 +88,9 @@ def _mla_decode_kv_splits_cap(
     return max(base_max_kv_splits, min(sm_cap, ctx_cap))
 
 
-def _should_use_verify_shared_kv(model_config, topk, use_mla, use_verify_splitkv):
+def _should_use_verify_shared_kv(
+    model_config, topk, use_mla, use_verify_splitkv, target_hf_config
+):
     if not is_gfx95_supported() or topk != 1:
         return False
     if use_mla:
@@ -96,7 +99,8 @@ def _should_use_verify_shared_kv(model_config, topk, use_mla, use_verify_splitkv
         return use_verify_splitkv
     return (
         use_verify_splitkv
-        and is_qwen3_5(model_config.hf_config)
+        # M3's EAGLE3 draft has its target's attention shape, so it follows the target
+        and (is_qwen3_5(model_config.hf_config) or is_minimax_sparse(target_hf_config))
         and model_config.get_num_kv_heads(
             get_parallel().attn_tp_size, get_parallel().attn_dcp_size
         )
@@ -158,6 +162,7 @@ class TritonAttnBackend(AttentionBackend):
         kv_indptr_buf: Optional[torch.Tensor] = None,
         *,
         dllm_fa4: bool = False,
+        target_hf_config=None,
     ):
         # Lazy import to avoid the initialization of cuda context
         from sglang.kernels.ops.attention.decode_attention import (
@@ -236,13 +241,30 @@ class TritonAttnBackend(AttentionBackend):
             and self.topk == 1
         )
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
-        # The grouped-head verify kernel is tuned for Kimi-K3 MLA and Qwen3.5
-        # GQA with exactly one TP-local KV head.
+        # The grouped-head verify kernel is tuned for Kimi-K3 MLA and GQA with
+        # exactly one TP-local KV head (Qwen3.5, MiniMax-M3 and its EAGLE3 draft).
+        # a draft runner's own config does not name the target it drafts for, so the
+        # speculative worker passes the target's; a target runner is its own target
+        if target_hf_config is None:
+            target_hf_config = model_runner.model_config.hf_config
         self.use_verify_shared_kv = _should_use_verify_shared_kv(
             model_runner.model_config,
             self.topk,
             self.use_mla,
             self.use_verify_splitkv,
+            target_hf_config,
+        )
+        # M3's EAGLE3 draft also runs draft extend and draft decode through the verify kernel
+        self.use_shared_kv_for_draft_steps = (
+            self.use_verify_shared_kv
+            and model_runner.is_draft_worker
+            and is_minimax_sparse(target_hf_config)
+        )
+        # decode is one extend row per request
+        self._decode_shared_kv_qo_indptr = (
+            torch.arange(max_bs + 1, dtype=torch.int32, device=model_runner.device)
+            if self.use_shared_kv_for_draft_steps
+            else None
         )
         # TODO: this logic should be fixed in non-hip platform
         self.is_hip_dspark_draft = (
@@ -1771,7 +1793,7 @@ class TritonAttnBackend(AttentionBackend):
         # sliding-window / ragged / topk>1), so we fall through to
         # extend_attention_fwd below. Correctness is never at risk.
         # Route target-verify to the grouped-head kernel when eligible, else the
-        # per-head split-KV kernel.
+        # per-head split-KV kernel. M3's v2 draft-extend is the same constant-length chain.
         if self.use_verify_shared_kv:
             verify_fwd = self.verify_shared_kv_fwd
         elif self.use_verify_splitkv:
@@ -1781,7 +1803,13 @@ class TritonAttnBackend(AttentionBackend):
         if (
             verify_fwd is not None
             and score_mod is None
-            and forward_batch.forward_mode.is_target_verify()
+            and (
+                forward_batch.forward_mode.is_target_verify()
+                or (
+                    self.use_shared_kv_for_draft_steps
+                    and forward_batch.forward_mode.is_draft_extend_v2()
+                )
+            )
             and verify_fwd(
                 q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                 k.contiguous(),
@@ -2372,6 +2400,40 @@ class TritonAttnBackend(AttentionBackend):
             o = cp_lse_ag_out_rs_mha(o_for_decode, local_lse, group)
             return o.reshape(-1, layer.tp_q_head_num * layer.v_head_dim).to(q.dtype)
 
+        # grouped-head decode: the new token is the extend row, so trim it from the prefix
+        if (
+            self._decode_shared_kv_qo_indptr is not None
+            and score_mod is None
+            and k is not None
+            and v is not None
+            and q.shape[0] < self._decode_shared_kv_qo_indptr.shape[0]
+            and self.verify_shared_kv_fwd(
+                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                k.reshape(-1, layer.tp_k_head_num, layer.qk_head_dim),
+                v.reshape(-1, layer.tp_v_head_num, layer.v_head_dim),
+                o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                self.token_to_kv_pool.get_key_buffer(layer.layer_id),
+                self.token_to_kv_pool.get_value_buffer(layer.layer_id),
+                self._decode_shared_kv_qo_indptr[: q.shape[0] + 1],
+                kv_indptr,
+                kv_indices,
+                None,
+                True,
+                None,
+                1,
+                k_descale,
+                v_descale,
+                layer.scaling,
+                logit_cap=logits_soft_cap,
+                sliding_window_size=layer.sliding_window_size,
+                sinks=sinks,
+                xai_temperature_len=layer.xai_temperature_len,
+                max_bs=self.req_to_token_pool.size,
+                kv_len_adjust=-1,
+            )
+        ):
+            return o
+
         self.decode_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             self.token_to_kv_pool.get_key_buffer(layer.layer_id),
@@ -2416,6 +2478,7 @@ class TritonMultiStepDraftBackend:
         model_runner: ModelRunner,
         topk: int,
         speculative_num_steps: int,
+        target_hf_config=None,
     ):
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
@@ -2435,6 +2498,7 @@ class TritonMultiStepDraftBackend:
                     model_runner,
                     skip_prefill=True,
                     kv_indptr_buf=self.kv_indptr[i],
+                    target_hf_config=target_hf_config,
                 )
             )
         self.max_context_len = self.attn_backends[0].max_context_len

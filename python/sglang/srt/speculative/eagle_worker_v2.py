@@ -379,6 +379,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.speculative_num_steps,
             seed_dsa_topk_from_draft_extend=self.seed_dsa_topk_from_draft_extend,
             qsa_profile=parse_qsa_profile(self.draft_runner.model_config.hf_config),
+            target_hf_config=self.target_worker.model_runner.model_config.hf_config,
         )
 
         # Initialize decode attention backend
