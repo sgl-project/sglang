@@ -15,6 +15,7 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.postprocess import FrameInterpolator
+from sglang.multimodal_gen.runtime.postprocess.rife_interpolator import Model as RIFEModel
 from sglang.multimodal_gen.runtime.realtime.video import build_raw_rgb_frame_batches
 
 
@@ -195,3 +196,23 @@ def test_materialize_output_sample_rejects_out_of_range_interpolation_exp(
             enable_frame_interpolation=True,
             frame_interpolation_exp=exp,
         )
+
+
+@pytest.mark.parametrize(
+    "h, w",
+    [
+        (480, 832),   # 480p: old pad=480 not divisible by 64 at scale=0.5
+        (720, 1280),  # 720p: old pad=736 not divisible by 64 at scale=0.5
+    ],
+)
+def test_rife_inference_scale_half_pads_to_64_boundary(h, w):
+    """scale=0.5 requires padding to multiples of 64, not 32.
+
+    Regresses the bug where Model.inference always padded to 32, causing a
+    shape mismatch inside IFBlock at 480p and 720p with scale=0.5.
+    """
+    model = RIFEModel().eval()
+    img0 = torch.zeros(1, 3, h, w)
+    img1 = torch.zeros(1, 3, h, w)
+    out = model.inference(img0, img1, scale=0.5)
+    assert out.shape == (1, 3, h, w), f"expected (1,3,{h},{w}), got {out.shape}"
