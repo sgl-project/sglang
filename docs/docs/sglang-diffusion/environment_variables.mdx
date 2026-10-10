@@ -94,6 +94,11 @@ description: "Configure SGLang diffusion behavior with environment variables."
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Maximum cached IPC staging-buffer shape pairs. Cap this for multi-resolution serving to bound permanent staging memory.</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>-1</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Head groups for pipelining the Ulysses exchange against dense attention over the copy engine. <code>-1</code> picks the largest count that divides the heads per rank while each group still fills the GPU; <code>0</code> keeps the sequential exchange; <code>N</code> forces <code>N</code> groups. Results are bit-identical either way.</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_USE_RUNAI_MODEL_STREAMER</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>true</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Use Run:AI model streamer for model loading</td>

@@ -755,9 +755,11 @@ class HiSparseCoordinator:
         if not backup_indices:
             return
 
+        # Use a pinned, non-blocking H2D copy to avoid synchronizing the host
+        # with pending work on the schedule stream.
         backup_indices_gpu = torch.tensor(
-            backup_indices, dtype=torch.int64, device=self.device
-        )
+            backup_indices, dtype=torch.int64, device="cpu", pin_memory=True
+        ).to(self.device, non_blocking=True)
         backup_req_indices = req_pool_indices[backup_indices_gpu]
 
         # The previous compressed token's position and its device buffer slot:
