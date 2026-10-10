@@ -209,16 +209,45 @@ class ModelSlimConfig(QuantizationConfig):
 
         Kimi-K3's upstream model uses ``mlp`` internally while its ModelSlim
         checkpoint retains the Hugging Face ``block_sparse_moe`` hierarchy.
-        Some multimodal checkpoints also keep the outer ``language_model``
-        prefix.  Resolve those layout-only differences at the quantization
-        boundary.
+        GLM-Next checkpoints may additionally keep an outer
+        ``model.language_model`` wrapper and the upstream ``forget_gate`` / mHC
+        module hierarchy, while the runtime uses flattened module names.  Keep
+        these ModelSlim-only aliases at the quantization boundary instead of
+        mutating the shared model implementation or copying ``quant_description``.
         """
         candidates = [prefix]
         if ".mlp." in prefix:
             candidates.append(prefix.replace(".mlp.", ".block_sparse_moe."))
 
+        # GLM-Next runtime modules flatten these checkpoint-only containers:
+        #   self_attn.forget_gate.f_a_proj -> self_attn.f_a_proj
+        #   attn_hc.base                  -> hc_attn_base
+        #   ffn_hc.fn                     -> hc_ffn_fn
+        # Generate the checkpoint spelling from the runtime prefix.  Exact
+        # prefixes stay first, so these aliases cannot override a native match.
         for candidate in list(candidates):
-            if candidate.startswith("language_model."):
+            proj_name = candidate.rsplit(".", 1)[-1]
+            if (
+                proj_name in {"f_a_proj", "f_b_proj"}
+                and ".forget_gate." not in candidate
+            ):
+                parent, proj_name = candidate.rsplit(".", 1)
+                candidates.append(f"{parent}.forget_gate.{proj_name}")
+            if ".hc_attn_" in candidate:
+                candidates.append(candidate.replace(".hc_attn_", ".attn_hc."))
+            if ".hc_ffn_" in candidate:
+                candidates.append(candidate.replace(".hc_ffn_", ".ffn_hc."))
+
+        for candidate in list(candidates):
+            if candidate.startswith("model.language_model."):
+                candidates.append(
+                    "model." + candidate.removeprefix("model.language_model.")
+                )
+            elif candidate.startswith("model."):
+                candidates.append(
+                    "model.language_model." + candidate.removeprefix("model.")
+                )
+            elif candidate.startswith("language_model."):
                 candidates.append(candidate.removeprefix("language_model."))
             else:
                 candidates.append(f"language_model.{candidate}")

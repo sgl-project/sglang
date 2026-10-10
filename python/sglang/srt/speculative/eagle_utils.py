@@ -28,6 +28,7 @@ from sglang.srt.utils import (
     is_hip,
     is_musa,
     is_npu,
+    is_npu_a5,
     is_xpu,
 )
 from sglang.srt.utils.async_probe import maybe_detect_oob
@@ -228,7 +229,24 @@ def build_tree_kernel_efficient(
     # then, positions = [7, 8, 8, 9]
     positions = torch.empty((bs * num_verify_tokens,), device=device, dtype=torch.long)
 
-    if _is_npu:
+    if _is_npu and is_npu_a5() and tree_mask_mode == TreeMaskMode.FULL_MASK:
+        # The vendor build-tree binary fails on A5. Use the Ascend Triton
+        # implementation for its supported FULL_MASK layout.
+        from sglang.kernels.ops.speculative.spec_tree_npu import build_full_tree_npu
+
+        build_full_tree_npu(
+            parent_list=parent_list.to(dtype=torch.int64),
+            selected_index=top_scores_index,
+            verified_seq_len=seq_lens,
+            tree_mask=tree_mask,
+            positions=positions,
+            retrieve_index=retrieve_index,
+            retrieve_next_token=retrieve_next_token,
+            retrieve_next_sibling=retrieve_next_sibling,
+            topk=topk,
+            draft_token_num=num_verify_tokens,
+        )
+    elif _is_npu:
         torch.ops.npu.build_tree_kernel_efficient(
             parent_list.to(dtype=torch.int64),
             top_scores_index,

@@ -76,6 +76,7 @@ from sglang.srt.runtime_context import (
     get_schedule,
 )
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils import is_npu
 from sglang.srt.utils.network import NetworkAddress
 
 logger = logging.getLogger(__name__)
@@ -2121,6 +2122,20 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         label: str,
     ) -> int:
         try:
+            # PP1 Hybrid Ascend registers target+draft as one component. Do not
+            # silently treat a missing draft half as a legal PP layer slice.
+            if is_npu() and self.is_hybrid_mla_backend and self.pp_size == 1:
+                if not (
+                    len(src_ptrs)
+                    == len(src_item_lens)
+                    == len(dst_ptrs)
+                    == len(dst_item_lens)
+                ):
+                    raise ValueError(
+                        "Ascend Hybrid PP1 DSA tail metadata mismatch before slicing: "
+                        f"src={len(src_ptrs)}/{len(src_item_lens)}, "
+                        f"dst={len(dst_ptrs)}/{len(dst_item_lens)}"
+                    )
             dst_ptrs = slice_dsa_tail_dst_ptrs_for_pp(
                 src_ptrs,
                 dst_ptrs,

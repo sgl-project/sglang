@@ -70,6 +70,85 @@ from enum import Enum, IntEnum, auto
 import torch
 import torch.distributed as dist
 
+if use_deepep and _is_npu:
+    # NPU workaround: normal mode -> HCCL alltoall strategy (Cam IPC-window
+    # combine kernel deadlocks on ep rank 0 under cross-rank skew); LL stays
+    # default.
+    import deep_ep.ep_strategy as _TDbEps
+    import torch_npu
+    from deep_ep import EventOverlap as _TDbEventOverlap
+    from deep_ep.strategies.normal_strategy import (
+        AlltoAllNormalCommStrategy as _TDbA2AStrategy,
+    )
+
+    def _TDb_get_strategy(cls, deep_mode):
+        return (_TDbEps.NormalStrategy.ALLTOALL, _TDbEps.LowLatencyStrategy.DEFAULT)
+
+    _TDbEps.StrategyMap.get_strategy = classmethod(_TDb_get_strategy)
+
+    # sglang passes newer kwargs (e.g. quant_mode) that the AlltoAll dispatch
+    # signature does not accept; filter them out.
+    import inspect as _TDbInspect
+
+    _TDb_orig_a2a_dispatch = _TDbA2AStrategy.dispatch
+
+    def _TDb_a2a_dispatch(self, *args, **kwargs):
+        sig = _TDbInspect.signature(_TDb_orig_a2a_dispatch)
+        accepted = set(sig.parameters)
+        filtered = {k: v for k, v in kwargs.items() if k in accepted}
+        return _TDb_orig_a2a_dispatch(self, *args, **filtered)
+
+    _TDbA2AStrategy.dispatch = _TDb_a2a_dispatch
+
+    def _TDb_combine(
+        self,
+        x,
+        handle,
+        topk_weights=None,
+        bias=None,
+        config=None,
+        previous_event=None,
+        async_finish=False,
+        allocate_on_comm_stream=False,
+        combine_send_cost_stats=None,
+    ):
+        input_splits = handle["input_splits"]
+        output_splits = handle["output_splits"]
+        topk_weights_h = handle["topk_weights"]
+        reversed_local_mapping = handle["reversed_local_mapping"]
+        reversed_global_mapping = handle["reversed_global_mapping"]
+        hidden_shape = handle["hidden_shape"]
+        hidden_shape_before_permute = handle["hidden_shape_before_permute"]
+        num_local_experts = handle["num_local_experts"]
+
+        if (
+            x.shape[0] > 0
+            and num_local_experts > 1
+            and reversed_global_mapping is not None
+        ):
+            x = torch_npu.npu_moe_token_unpermute(x, reversed_global_mapping)
+
+        _, local_tokens, a2a_handle = self._async_all_to_all(
+            x,
+            input_splits,
+            output_splits,
+            self.group,
+        )
+        a2a_handle.wait()
+        x.untyped_storage().resize_(0)
+
+        output = torch_npu.npu_moe_token_unpermute(
+            permuted_tokens=local_tokens,
+            sorted_indices=reversed_local_mapping.to(torch.int32),
+            probs=topk_weights_h,
+            restore_shape=hidden_shape_before_permute,
+        )
+        output = output.view(hidden_shape)
+
+        return output, None, _TDbEventOverlap()
+
+    _TDbA2AStrategy.combine = _TDb_combine
+
 from sglang.srt.runtime_context import get_resources
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()

@@ -125,6 +125,7 @@ from sglang.srt.utils.common import (
     BumpAllocator,
     LazyValue,
     add_prefix,
+    is_npu,
     log_info_on_rank0,
     make_pp_layers,
     set_weight_attrs,
@@ -147,7 +148,21 @@ _MHC_POST_MULT_VALUE = 2.0
 _MHC_FUSED_BOUNDARY_MAX_TOKENS = 16
 
 
-@torch.compile
+def _remap_glm5_next_weight_name(name: str) -> str:
+    """Map GLM-Next checkpoint names to this runtime's module layout."""
+    if name.startswith("model.language_model."):
+        name = "model." + name.removeprefix("model.language_model.")
+    elif name.startswith("language_model."):
+        name = name.removeprefix("language_model.")
+
+    return (
+        name.replace(".forget_gate.", ".")
+        .replace(".attn_hc.", ".hc_attn_")
+        .replace(".ffn_hc.", ".hc_ffn_")
+    )
+
+
+@torch.compile(disable=is_npu())
 def swiglu_clamped(y: torch.Tensor, limit: float):
     gate, up = torch.chunk(y, 2, dim=-1)
     gate = torch.clamp(gate, max=limit)
@@ -238,6 +253,9 @@ class Glm5NextVisionBlock(GlmOcrVisionBlock):
             qkv_bias=attn_qkv_bias,
             proj_bias=True,
             qk_normalization_by_head_size=True,
+            layer_norm_eps=rms_norm_eps,
+            # Match the reference vision RoPE: rotate in FP32, then cast Q/K back.
+            rotary_embedding_in_fp32=is_npu(),
             flatten_batch=True,
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
@@ -289,6 +307,8 @@ class Glm5NextVisionModel(GlmOcrVisionModel):
             max_position=8192,
             base=10000.0,
             is_neox_style=True,
+            # NPU otherwise rounds this cache to the model's default BF16 dtype.
+            dtype=torch.float32 if is_npu() else None,
         )
 
         self.blocks = nn.ModuleList(
@@ -1329,10 +1349,15 @@ class Glm5NextForConditionalGeneration(nn.Module):
 
     @classmethod
     def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):
-        # Kept in lockstep with the wrapper gate below: a divergence drops the
-        # shared-expert weights and runs the fused slot uninitialized.
+        """Why this checkpoint cannot fuse its shared expert, or ``None``.
+
+        The loader evaluates this gate before constructing any layers.  GLM5
+        Next is a multimodal wrapper, so use the same text config that is later
+        passed to ``Glm5NextModel``.
+        """
         text_config = getattr(hf_config, "text_config", hf_config)
-        if not getattr(text_config, "n_shared_experts", None):
+        n_shared_experts = getattr(text_config, "n_shared_experts", None)
+        if not n_shared_experts:
             return "No shared experts are defined in the config."
         if getattr(text_config, "n_shared_experts", None) != 1:
             return "Shared experts fusion requires exactly one shared expert."
@@ -1471,6 +1496,10 @@ class Glm5NextForConditionalGeneration(nn.Module):
         return None
 
     def determine_num_fused_shared_experts(self):
+        # The loader installs the gate's decision before this model and its
+        # nested DeepseekV2MoE layers are constructed.  Both readers must use
+        # this same ACTIVE value; otherwise the outer weight remap can target a
+        # different shared-expert layout than the inner MoE actually allocated.
         self.num_fused_shared_experts = (
             0 if is_shared_experts_fusion_disabled() else self.config.n_shared_experts
         )
@@ -1730,6 +1759,10 @@ class Glm5NextForConditionalGeneration(nn.Module):
             return name
 
         weight_names = []
+        # A visual weight that matches no parameter keeps its random init and
+        # only degrades multimodal accuracy (text stays correct), so track it.
+        visual_seen: set[str] = set()
+        visual_matched: set[str] = set()
         for name, loaded_weight in weights:
             is_visual_weight = "visual" in name
             if getattr(self, "encoder_only", False) and not is_visual_weight:
@@ -1737,8 +1770,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
             if getattr(self, "language_only", False) and is_visual_weight:
                 continue
 
-            if "language_model." in name:
-                name = name.replace("language_model.", "")
+            name = _remap_glm5_next_weight_name(name)
             if "model.visual." in name:
                 name = name.replace("model.visual.", "visual.")
 
@@ -1749,6 +1781,9 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 )
 
             weight_names.append(name)
+            visual_name = name if is_visual_weight else None
+            if visual_name is not None:
+                visual_seen.add(visual_name)
 
             if self.num_fused_shared_experts > 0 and "mlp.shared_experts" in name:
                 name = name.replace(
@@ -1812,6 +1847,8 @@ class Glm5NextForConditionalGeneration(nn.Module):
                     continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
+                if visual_name is not None:
+                    visual_matched.add(visual_name)
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
@@ -1896,7 +1933,21 @@ class Glm5NextForConditionalGeneration(nn.Module):
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )
+                    if visual_name is not None:
+                        visual_matched.add(visual_name)
                     weight_loader(param, loaded_weight)
+
+        if not is_nextn:
+            unmatched_visual = {
+                n
+                for n in visual_seen - visual_matched
+                if "rotary_emb.inv_freq" not in n and "hc_head" not in n
+            }
+            if unmatched_visual:
+                raise RuntimeError(
+                    f"Visual weights matched no parameter and would stay "
+                    f"randomly initialized: {sorted(unmatched_visual)}"
+                )
 
         if getattr(self, "encoder_only", False):
             run_post = False
@@ -1916,6 +1967,21 @@ class Glm5NextForConditionalGeneration(nn.Module):
         DeepseekV2WeightLoaderMixin.post_load_weights(
             self, is_nextn=is_nextn, weight_names=weight_names
         )
+        # The DSA NPU forward path unconditionally bmm's w_kc; catch a silently
+        # skipped kv_b_proj post-process at load time instead of failing later
+        # inside CUDA-graph capture.
+        for layer_id in range(self.model.start_layer, self.model.end_layer):
+            attn = getattr(self.model.layers[layer_id], "self_attn", None)
+            if (
+                attn is not None
+                and getattr(attn, "use_dsa", False)
+                and attn.w_kc is None
+            ):
+                raise RuntimeError(
+                    f"post_load_weights left w_kc unset for DSA layer {layer_id} "
+                    f"(local layers [{self.model.start_layer}, {self.model.end_layer})); "
+                    "kv_b_proj was not processed"
+                )
 
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
         if self.model is None:

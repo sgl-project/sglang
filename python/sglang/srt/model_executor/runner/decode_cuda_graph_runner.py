@@ -262,6 +262,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.speculative_algorithm = get_spec().speculative_algorithm
         self.enable_profile_cuda_graph = get_exec().graph.enable_profile_cuda_graph
 
+        self.attn_tp_size = get_parallel().attn_tp_size
+        self.attn_tp_rank = get_parallel().attn_tp_rank
+        # A2A-MoE models leave the PP-boundary hidden states scattered across
+        # the attn-TP group (num_tokens // attn_tp_size rows per rank).
+        self.pp_proxy_input_scattered = model_runner.is_pp_proxy_input_scattered()
         # True if the DSA or MLA prefill-CP flavor is active. These flavors
         # feed a zigzag-split rank-local layout into the runner; MHA-arch
         # prefill CP (Qwen3/Qwen2 MoE via PR #18233) keeps an
@@ -450,6 +455,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             ),
             pp_proxy_dspark_hidden_size=(
                 self.model_runner.get_pp_proxy_dspark_hidden_size()
+            ),
+            pp_proxy_num_token_divisor=(
+                self.attn_tp_size if self.pp_proxy_input_scattered else 1
             ),
             aux_hidden_states_width=self.model_runner.get_aux_hidden_states_width(),
         )
@@ -1016,8 +1024,17 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         pp_proxy_tensors = None
         # pipeline parallelism
         if self.pp_size > 1:
+            num_rows = num_tokens
+            if self.pp_proxy_input_scattered:
+                # Scattered boundary: each rank owns num_tokens // attn_tp_size
+                # rows; the first local layer's all-gather restores the full count.
+                assert num_tokens % self.attn_tp_size == 0, (
+                    f"scattered PP-boundary capture needs num_tokens divisible "
+                    f"by attn_tp_size, got {num_tokens} % {self.attn_tp_size}"
+                )
+                num_rows //= self.attn_tp_size
             pp_proxy_tensors = PPProxyTensors(
-                {k: v[:num_tokens] for k, v in buffers.pp_proxy_tensors.items()}
+                {k: v[:num_rows] for k, v in buffers.pp_proxy_tensors.items()}
             )
 
         global_num_tokens_cpu = self._global_num_tokens_for_graph(num_tokens)

@@ -12,6 +12,7 @@ from sglang.srt.utils import (
     is_hip,
     is_musa,
     is_npu,
+    is_npu_a5,
     is_xpu,
     next_power_of_2,
 )
@@ -533,10 +534,12 @@ def assign_extend_cache_locs_uniform_func(
     draft_token_num tokens, e.g. spec target-verify prep). Computes end
     offsets inside the kernel, removing the eager `seq_lens + draft_token_num`
     add from the host critical path."""
-    if _is_cuda or _is_hip or _is_musa or _is_xpu:
+    # The vendor cache_loc_update binary faults on A5 (cache_loc_assign_1).
+    # Reuse the device-side Triton gather and retain the NPU int32 ABI.
+    if _is_cuda or _is_hip or _is_musa or _is_xpu or (_is_npu and is_npu_a5()):
         out_cache_loc = torch.empty(
             (batch_size * draft_token_num,),
-            dtype=torch.int64,
+            dtype=torch.int32 if _is_npu else torch.int64,
             device=device,
         )
         assign_extend_cache_locs_uniform[(batch_size,)](
@@ -582,10 +585,12 @@ def assign_extend_cache_locs_func(
             device=device,
         )
 
-    if _is_cuda or _is_hip or _is_musa or _is_xpu:
+    # The vendor cache_loc_update binary faults on A5 (cache_loc_assign_1).
+    # Reuse the device-side Triton gather and retain the NPU int32 ABI.
+    if _is_cuda or _is_hip or _is_musa or _is_xpu or (_is_npu and is_npu_a5()):
         out_cache_loc = torch.empty(
             (batch_size * draft_token_num,),
-            dtype=torch.int64,
+            dtype=torch.int32 if _is_npu else torch.int64,
             device=device,
         )
         assign_extend_cache_locs[(batch_size,)](

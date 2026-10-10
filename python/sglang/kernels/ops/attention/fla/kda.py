@@ -31,6 +31,7 @@ from sglang.kernels.ops.attention.fla.utils import (
     is_intel,
     is_nvidia,
 )
+from sglang.srt.utils.common import is_npu
 
 if is_intel:
     from sglang.srt.hardware_backend.xpu.kernels.fla.chunk_delta_h import (
@@ -1216,7 +1217,7 @@ def chunk_kda_fwd(
     )
     _H_pr = q.shape[-2]
     _B = q.shape[0]
-    _small_grid = _B * _NT_pr * _H_pr <= 256
+    _small_grid = not is_npu() and _B * _NT_pr * _H_pr <= 256
     w, u, _, kg, Aqk, _ = chunk_kda_fwd_intra(
         q=q,
         k=k,

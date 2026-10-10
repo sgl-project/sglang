@@ -1376,6 +1376,66 @@ def get_kv_transfer_buf_infos(pool):
     return pool.get_contiguous_buf_infos()
 
 
+def merge_npu_hybrid_dsa_tail(target_pool, draft_pool):
+    """Register this rank's target+draft rings as one interleaved component.
+
+    The merge is rank-local: the target half holds only the layers hosted by
+    this PP stage, while the draft half (1 layer) exists only on the last PP
+    stage. Cross-stage window alignment is handled at transfer time by
+    slice_dsa_tail_dst_ptrs_for_pp: decode registers the full model
+    [target keys, draft key, target scores, draft score], and the last stage's
+    merged src list has exactly one more layer than its target-only span, so
+    the slice pulls the trailing draft entry of each half into the window.
+    """
+    geometry = None
+    infos = []
+    for name, pool in (("target", target_pool), ("draft", draft_pool)):
+        pool_size = int(pool.index_kpool)
+        tail_width = pool_size + int(pool.tail_extra_slots)
+        current = (pool_size, bool(pool.index_kpool_compress), tail_width)
+        if (
+            pool_size <= 1
+            or not current[1]
+            or not pool.kpool_use_compress
+            or tail_width < pool_size
+        ):
+            raise ValueError(f"Invalid {name} DSA compress-tail geometry: {current}")
+        if geometry is not None and current != geometry:
+            raise ValueError(
+                f"Target/draft DSA compress-tail geometry differs: {geometry} vs {current}"
+            )
+        geometry = current
+        layers = int(pool.layer_num)
+        buf_infos = tuple(list(values) for values in pool.get_compress_tail_buf_infos())
+        if (
+            layers <= 0
+            or len(buf_infos) != 3
+            or any(len(values) != 2 * layers for values in buf_infos)
+        ):
+            raise ValueError(f"Invalid {name} DSA tail metadata for {layers} layers")
+        _, data_lens, item_lens = buf_infos
+        for data_len, item_len in zip(data_lens, item_lens):
+            # Zero-row skip-topk entries remain in place to preserve layer order.
+            if (
+                item_len < 0
+                or data_len < 0
+                or item_len % tail_width
+                or (item_len == 0 and data_len != 0)
+                or (item_len > 0 and data_len % item_len)
+            ):
+                raise ValueError(f"Invalid {name} DSA tail row bytes: {item_len}")
+        infos.append((layers, buf_infos))
+    target_layers, target_infos = infos[0]
+    draft_layers, draft_infos = infos[1]
+    return tuple(
+        target[:target_layers]
+        + draft[:draft_layers]
+        + target[target_layers:]
+        + draft[draft_layers:]
+        for target, draft in zip(target_infos, draft_infos)
+    )
+
+
 def setup_state_kv_args(
     kv_args: KVArgs,
     token_to_kv_pool,
@@ -1542,7 +1602,18 @@ def setup_state_kv_args(
                     dsa_lens,
                     dsa_item_lens,
                 )
-                append_dsa_tail(dsa_pool)
+                if (
+                    is_npu()
+                    and isinstance(dsa_pool, NPUMLATokenToKVPool)
+                    and isinstance(draft_token_to_kv_pool, NPUMLATokenToKVPool)
+                ):
+                    append_state_component(
+                        kv_args,
+                        StateType.DSA_TAIL,
+                        *merge_npu_hybrid_dsa_tail(dsa_pool, draft_token_to_kv_pool),
+                    )
+                else:
+                    append_dsa_tail(dsa_pool)
             if isinstance(token_to_kv_pool, QSATokenToKVPool):
                 qsa_ptrs, qsa_lens, qsa_item_lens = (
                     token_to_kv_pool.get_qsa_pending_state_buf_infos()

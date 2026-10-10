@@ -47,6 +47,7 @@ from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.utils import (
     get_bool_env_var,
     get_current_device_stream_fast,
+    is_npu_a5,
     next_power_of_2,
 )
 
@@ -531,7 +532,7 @@ class AscendAttnBackend(AttentionBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
-        self.forward_metadata = ForwardMetadata()
+        self.forward_metadata = self._create_forward_metadata()
         seq_lens_max = forward_batch.seq_lens.max()
         if forward_batch.forward_mode.is_target_verify():
             if (
@@ -715,6 +716,14 @@ class AscendAttnBackend(AttentionBackend):
 
         self.graph_mode = False
 
+    def _create_forward_metadata(self) -> ForwardMetadata:
+        """Create the metadata object owned by one forward pass.
+
+        Model-specific Ascend backends override this factory when they need to
+        extend the common metadata without maintaining a second source of truth.
+        """
+        return ForwardMetadata()
+
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         total_context_len = self.max_context_len + self.page_size - 1
         if self.speculative_num_draft_tokens is not None:
@@ -805,7 +814,7 @@ class AscendAttnBackend(AttentionBackend):
         out_cache_loc: Optional[torch.Tensor] = None,
     ) -> ForwardMetadata:
         """Create and store the per-bs ForwardMetadata for CUDA graph capture."""
-        metadata = ForwardMetadata()
+        metadata = self._create_forward_metadata()
         if self.enable_sparsity_driven_kv_offload:
             from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.host_callback import (
                 register_npu_host_callback_stream,
@@ -1364,12 +1373,30 @@ class AscendAttnBackend(AttentionBackend):
 
         if save_kv_cache:
             k = k.view(-1, layer.tp_k_head_num, self.kv_lora_rank)
-            k_rope = k_rope.view(-1, layer.tp_k_head_num, self.qk_rope_head_dim)
+            k_rope = k_rope.reshape(
+                k_rope.shape[0], layer.tp_k_head_num, self.qk_rope_head_dim
+            )
             self.token_to_kv_pool.set_kv_buffer(
                 layer, forward_batch.out_cache_loc, k, k_rope
             )
         q_nope, q_pe = q, q_rope
         k_nope, k_pe = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+
+        # SFA's MLA interface requires a fixed 64-dimensional query_rope even
+        # for models without RoPE. Keep the model/cache contract at dimension 0
+        # and materialize an operator-only zero tensor here.
+        if self.qk_rope_head_dim == 0 and is_npu_a5():
+            k_pe = self._a5_zero_rope(k_nope, (*k_nope.shape[:-1], 64))
+            q_pe = self._a5_zero_rope(q_nope, (q.shape[0], layer.tp_q_head_num, 64))
+        elif self.qk_rope_head_dim == 0:
+            k_pe = k_nope.new_zeros((*k_nope.shape[:-1], 64))
+            q_pe = q_nope.new_zeros(
+                (
+                    q.shape[0],
+                    layer.tp_q_head_num,
+                    64,
+                )
+            )
 
         if is_prefill:
             if self.forward_metadata.actual_seq_lengths_q is not None:
@@ -1492,6 +1519,15 @@ class AscendAttnBackend(AttentionBackend):
                 )
 
         return attn_out
+
+    def _a5_zero_rope(self, reference, shape):
+        # Cache the large pool-shaped dummy across graph captures/layers.
+        if not hasattr(self, "_a5_zero_rope_cache"):
+            self._a5_zero_rope_cache = {}
+        key = (tuple(shape), reference.dtype, reference.device)
+        if key not in self._a5_zero_rope_cache:
+            self._a5_zero_rope_cache[key] = reference.new_zeros(shape)
+        return self._a5_zero_rope_cache[key]
 
     def forward_extend(
         self,
@@ -3424,6 +3460,10 @@ class AscendAttnMultiStepDraftBackend:
     draft decoding steps
     """
 
+    # Allow DSA subclasses to replace the backend for each step without
+    # duplicating the entire multi-step scheduling logic.
+    backend_cls = AscendAttnBackend
+
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -3435,8 +3475,10 @@ class AscendAttnMultiStepDraftBackend:
 
         self.attn_backends = []
         for step_id in range(self.speculative_num_steps):
+            # Construct through an overridable type so DSA draft decode can
+            # generate indexer metadata.
             self.attn_backends.append(
-                AscendAttnBackend(model_runner, speculative_step_id=step_id)
+                self.backend_cls(model_runner, speculative_step_id=step_id)
             )
 
     def common_template(self, forward_batch: ForwardBatch, call_fn: int):

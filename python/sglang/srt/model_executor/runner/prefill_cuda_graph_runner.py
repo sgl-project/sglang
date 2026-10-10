@@ -328,6 +328,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # Classification/reward forwards branch on return_pooled_hidden_states;
         # capture must use the same flag value as replay for those models.
         self.capture_return_pooled_hidden_states = not model_runner.is_generation
+        # A2A-MoE models leave the PP-boundary hidden states scattered across
+        # the attn-TP group (num_tokens // attn_tp_size rows per rank).
+        self.pp_proxy_input_scattered = model_runner.is_pp_proxy_input_scattered()
 
         # --- prefill graph config -------------------------------------
         prefill_config = get_exec().graph.cuda_graph_config.prefill
@@ -429,6 +432,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             ),
             pp_proxy_dspark_hidden_size=(
                 self.model_runner.get_pp_proxy_dspark_hidden_size()
+            ),
+            pp_proxy_num_token_divisor=(
+                get_parallel().attn_tp_size if self.pp_proxy_input_scattered else 1
             ),
         )
         self.buffers.share_buffers()
@@ -766,6 +772,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         buffers = self.buffers.pp_proxy_tensors
         if buffers is None or self.model_runner.pp_group.is_first_rank:
             return None
+        if self.pp_proxy_input_scattered:
+            # Scattered boundary: each rank owns num_tokens // attn_tp_size
+            # rows; the first local layer's all-gather restores the full count.
+            attn_tp_size = self.model_runner.ps.attn_tp_size
+            assert num_tokens % attn_tp_size == 0, (
+                f"scattered PP-boundary capture needs num_tokens divisible "
+                f"by attn_tp_size, got {num_tokens} % {attn_tp_size}"
+            )
+            num_tokens //= attn_tp_size
         return PPProxyTensors(
             {name: buffer[:num_tokens] for name, buffer in buffers.items()}
         )

@@ -87,6 +87,7 @@ def _allocate_decode_buffers(
     hc_hidden_size: Optional[int] = None,
     pp_proxy_topk_size: Optional[int] = None,
     pp_proxy_residual_num_blocks: Optional[int] = None,
+    pp_proxy_num_token_divisor: int = 1,
     allocate_logits_buffer: bool = True,
 ) -> SimpleNamespace:
     """Allocate the FB-shared decode buffers."""
@@ -128,6 +129,7 @@ def _allocate_decode_buffers(
 
         if parallel.pp_size > 1:
             # mHC (e.g. DSV4) flattens residual into hidden_states (size = hc_hidden_size).
+            # Scattered PP boundary (a2a MoE): each rank holds max_num_token // divisor rows.
             is_mhc = hc_hidden_size is not None
             hs = hc_hidden_size if is_mhc else hidden_size
             # Sized in tokens, not requests: under speculative decoding the
@@ -135,23 +137,24 @@ def _allocate_decode_buffers(
             # _dummy_run slices these buffers to num_tokens (same as
             # topk_indices below). Identical for plain decode where
             # num_tokens_per_req == 1.
+            proxy_tokens = max_num_token // pp_proxy_num_token_divisor
             pp_proxy_tensors = {
-                "hidden_states": torch.zeros((max_num_token, hs), dtype=dtype),
+                "hidden_states": torch.zeros((proxy_tokens, hs), dtype=dtype),
             }
             if pp_proxy_residual_num_blocks is not None:
                 # Only Kimi K3 supplies num_blocks: its attention-residual bank
                 # is token-major [T, blocks, H] and takes the residual's place.
                 pp_proxy_tensors["attn_res_bank"] = torch.zeros(
-                    (max_num_token, pp_proxy_residual_num_blocks, hidden_size),
+                    (proxy_tokens, pp_proxy_residual_num_blocks, hidden_size),
                     dtype=dtype,
                 )
             elif not is_mhc:
                 pp_proxy_tensors["residual"] = torch.zeros(
-                    (max_num_token, hidden_size), dtype=dtype
+                    (proxy_tokens, hidden_size), dtype=dtype
                 )
             if pp_proxy_topk_size is not None:
                 pp_proxy_tensors["topk_indices"] = torch.zeros(
-                    (max_num_token, pp_proxy_topk_size), dtype=torch.int32
+                    (proxy_tokens, pp_proxy_topk_size), dtype=torch.int32
                 )
         else:
             pp_proxy_tensors = None
@@ -448,6 +451,9 @@ class BaseRunner(ABC):
             hc_hidden_size=getattr(mr.model_config, "hc_hidden_size", None),
             pp_proxy_topk_size=mr.get_pp_proxy_topk_size(),
             pp_proxy_residual_num_blocks=mr.get_pp_proxy_residual_num_blocks(),
+            pp_proxy_num_token_divisor=(
+                get_parallel().attn_tp_size if mr.is_pp_proxy_input_scattered() else 1
+            ),
             allocate_logits_buffer=allocate_logits_buffer,
         )
 
@@ -610,6 +616,16 @@ class BaseRunner(ABC):
                 and get_parallel().attn_cp_size > 1
             ):
                 pp_hidden_tokens = num_tokens // get_parallel().attn_cp_size
+            if mr.is_pp_proxy_input_scattered():
+                # Scattered boundary: each rank holds pp_hidden_tokens //
+                # attn_tp_size rows; the first local layer's all-gather
+                # restores the full count.
+                attn_tp_size = get_parallel().attn_tp_size
+                assert pp_hidden_tokens % attn_tp_size == 0, (
+                    f"scattered PP-boundary dummy run needs {pp_hidden_tokens} "
+                    f"divisible by attn_tp_size {attn_tp_size}"
+                )
+                pp_hidden_tokens //= attn_tp_size
             pp_proxy_tensors = PPProxyTensors(
                 {k: v[:pp_hidden_tokens] for k, v in buffers.pp_proxy_tensors.items()}
             )

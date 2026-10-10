@@ -3085,6 +3085,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     # See _force_track_h() for more details.
                     mamba_track_seqlen = _force_track_h(req.mamba_branching_seqlen)
                     mamba_track_seqlen_aligned = req.mamba_branching_seqlen
+            if (
+                getattr(self.req_to_token_pool.mamba_pool, "is_kda", False)
+                and mamba_track_seqlen_aligned < mamba_track_seqlen
+            ):
+                mamba_track_seqlen = mamba_track_seqlen_aligned + 1
             req.kv.mamba_last_track_seqlen = mamba_track_seqlen_aligned
 
         return _MambaRadixCacheV2TrackEntry(

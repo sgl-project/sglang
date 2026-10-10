@@ -657,6 +657,10 @@ class MambaPool:
 
         self.size = size
         self.device = device
+        # Exposed to the scheduler so KDA can encode checkpoint boundaries
+        # against the kernel's fixed chunk size instead of the (potentially
+        # larger) radix/page-aligned cache chunk size.
+        self.is_kda = cache_params.is_kda
         self.debug_memory_pool = envs.SGLANG_DEBUG_MEMORY_POOL.get()
         self.enable_linear_replayssm = enable_linear_replayssm
         self.linear_replayssm_cache_len = linear_replayssm_cache_len
@@ -722,7 +726,7 @@ class MambaPool:
                     for conv_shape in conv_state_shape
                 ]
 
-                if _is_npu:
+                if _is_npu and (not cache_params.is_kda):
                     from sglang.srt.hardware_backend.npu.memory_pool_npu import (
                         _init_npu_conv_state,
                     )
@@ -856,8 +860,23 @@ class MambaPool:
                     )
 
             if speculative_num_draft_tokens is not None:
-                # Cache intermediate SSM states per draft token during target verify
-                # Shape: [num_layers, size + 1, speculative_num_draft_tokens, HV, V, K]
+                # NPU GDN/Mamba operators use [HV, K, V], so retain the existing
+                # transpose. KDA Triton operators always access contiguous
+                # [HV, V, K] and must not apply this transpose. The current
+                # KDA V == K hides the shape difference, but a transposed view
+                # would silently redirect PyTorch assignments such as the
+                # extend track into the transposed SSM state.
+                if _is_npu and not cache_params.is_kda:
+                    temporal_state = temporal_state.transpose(-1, -2)
+                    temporal_state_shape = (
+                        *temporal_state_shape[:-2],
+                        temporal_state_shape[-1],
+                        temporal_state_shape[-2],
+                    )
+                # The intermediate SSM follows the persistent state's dimension
+                # order so target-verify writes and post-acceptance rollback use
+                # the same layout: [..., draft_tokens, HV, V, K] for KDA and
+                # [..., draft_tokens, HV, K, V] for NPU GDN/Mamba.
                 #
                 # ReplaySSM spec-verify owns rollback via the ring + cursors (the
                 # verify kernel never writes per-draft snapshots; the commit never
@@ -934,14 +953,7 @@ class MambaPool:
                     # Original dense layout (NPU/CPU, or EAGLE tree verify): one
                     # [dim, K-1] window per draft token.
                     # Shape: [num_layers, size+1, draft_tokens, dim, K-1]
-                    dense_conv_shapes = [
-                        (
-                            (conv_shape[1], conv_shape[0])
-                            if _is_npu and cache_params.is_kda
-                            else conv_shape
-                        )
-                        for conv_shape in conv_state_shape
-                    ]
+                    dense_conv_shapes = conv_state_shape
                     intermediate_conv_window_cache = [
                         torch.zeros(
                             size=(
@@ -4134,6 +4146,8 @@ class HybridLinearKVPool(KVCache):
         max_running_requests: Optional[int] = None,
         skip_topk_layers: Optional[List[bool]] = None,
         start_layer: Optional[int] = None,
+        layer_shard_rank: Optional[int] = None,
+        layer_shard_size: int = 1,
         full_kv_pool_class: Optional[type] = None,
         quant_method=None,
         # When provided (shared-KV-pool path), use this pool for the
@@ -4190,11 +4204,25 @@ class HybridLinearKVPool(KVCache):
             assert index_head_dim is not None and kv_cache_dim is not None, (
                 "HybridLinearKVPool with use_dsa requires index_head_dim and kv_cache_dim"
             )
-            DSAPoolClass = (
-                full_kv_pool_class
-                if full_kv_pool_class is not None
-                else DSATokenToKVPool
-            )
+            pool_kwargs = {}
+            if full_kv_pool_class is not None:
+                DSAPoolClass = full_kv_pool_class
+            elif _is_npu:
+                from sglang.srt.hardware_backend.npu.memory_pool_npu import (
+                    NPUMLATokenToKVPool,
+                )
+
+                DSAPoolClass = NPUMLATokenToKVPool
+            else:
+                DSAPoolClass = DSATokenToKVPool
+            if layer_shard_rank is not None and layer_shard_size > 1:
+                from sglang.srt.mem_cache.dsa_cache_layer_split import (
+                    LayerSplitDSATokenToKVPool,
+                )
+
+                DSAPoolClass = LayerSplitDSATokenToKVPool
+                pool_kwargs["layer_shard_rank"] = layer_shard_rank
+                pool_kwargs["layer_shard_size"] = layer_shard_size
             self.full_kv_pool = DSAPoolClass(
                 size=size,
                 page_size=self.page_size,
@@ -4211,6 +4239,7 @@ class HybridLinearKVPool(KVCache):
                 tail_extra_slots=tail_extra_slots,
                 max_running_requests=max_running_requests,
                 skip_topk_layers=skip_topk_layers,
+                **pool_kwargs,
             )
         else:
             MLAPoolClass = (

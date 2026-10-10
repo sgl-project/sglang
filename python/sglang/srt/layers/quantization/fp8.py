@@ -105,6 +105,7 @@ from sglang.srt.utils import (
     is_hip,
     is_musa,
     is_npu,
+    is_npu_a5,
     is_xpu,
     log_info_on_rank0,
     mxfp8_block_convert_required,
@@ -2636,6 +2637,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         if get_moe_runner_backend().is_hpc_ops():
             self._prepare_hpc_ops_weights(layer)
 
+        if (
+            is_npu_a5()
+            and self._owns_moe_runner
+            and self.runner.runner_backend.is_ascend()
+        ):
+            layer.w13_kernel.process_weights_after_loading(layer, "w13")
+            layer.w2_kernel.process_weights_after_loading(layer, "w2")
+
         if hasattr(layer, "dispatcher"):
             layer.dispatcher.set_quant_config(
                 {
@@ -2844,8 +2853,27 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 and get_moe_a2a_backend().supports_aiter()
             ):
                 moe_runner_backend = MoeRunnerBackend.AITER
+            elif is_npu_a5():
+                moe_runner_backend = MoeRunnerBackend.ASCEND
             else:
                 moe_runner_backend = MoeRunnerBackend.TRITON
+
+        if is_npu_a5() and moe_runner_backend.is_ascend():
+            if (
+                not self.block_quant
+                or self.use_mxfp8
+                or self.weight_block_size != [128, 128]
+            ):
+                raise ValueError("A5 FP8 MoE requires [128, 128] block quantization")
+            from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
+                NPUFp8MoEMethod,
+            )
+
+            # Set kernel types before the runner selects its activation.
+            # Weight layout conversion happens after checkpoint loading.
+            moe_runner_config.layer = layer
+            layer.w13_kernel = NPUFp8MoEMethod()
+            layer.w2_kernel = NPUFp8MoEMethod()
 
         if (
             moe_runner_backend.is_flashinfer_cutlass()
@@ -2867,6 +2895,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             or moe_runner_backend.is_flashinfer_trtllm_routed()
             or moe_runner_backend.is_hpc_ops()
             or moe_runner_backend.is_flashinfer_megamoe()
+            or (is_npu_a5() and moe_runner_backend.is_ascend())
         ):
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
             self._owns_moe_runner = True
@@ -3213,6 +3242,15 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
         elif self.runner.runner_backend.is_hpc_ops():
             quant_info = self._get_hpc_ops_quant_info(layer)
+        elif is_npu_a5() and self.runner.runner_backend.is_ascend():
+            from sglang.srt.layers.moe.moe_runner.ascend import AscendQuantInfo
+
+            quant_info = AscendQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                w13_weight_scale=layer.w13_weight_scale_inv,
+                w2_weight_scale=layer.w2_weight_scale_inv,
+            )
         elif self.runner.runner_backend.is_triton():
             quant_info = self.get_triton_quant_info(layer)
         else:

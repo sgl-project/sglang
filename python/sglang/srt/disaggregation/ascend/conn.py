@@ -124,22 +124,35 @@ class AscendKVManager(MooncakeKVManager):
             disaggregation_mode=self.disaggregation_mode,
         )
 
-    def register_buffer_to_engine(self):
+    def _registerable_regions(self) -> List[Tuple[int, int]]:
+        # Skip-topk layers retain zero-length DSA-tail entries so that PD peers
+        # agree on layer positions. Filter only the registration view, leaving
+        # kv_args intact. The inherited register/deregister paths both use it.
         # MemFabric aligns registered buffers to 2 MiB. Register everything in
         # one batch so overlapping aligned ranges from small tensors are merged
         # before they are published to the peer.
-        ptrs = list(self.kv_args.kv_data_ptrs)
-        lens = list(self.kv_args.kv_data_lens)
-        ptrs.extend(self.kv_args.aux_data_ptrs)
-        lens.extend(self.kv_args.aux_data_lens)
-        for component_ptrs, component_lens in zip(
-            self.kv_args.state_data_ptrs or [],
-            self.kv_args.state_data_lens or [],
-        ):
-            ptrs.extend(component_ptrs)
-            lens.extend(component_lens)
-        if ptrs:
-            self.engine.batch_register(ptrs, lens)
+        buffer_groups = [
+            (self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens),
+            (self.kv_args.aux_data_ptrs, self.kv_args.aux_data_lens),
+        ]
+        buffer_groups.extend(
+            zip(self.kv_args.state_data_ptrs or [], self.kv_args.state_data_lens or [])
+        )
+        regions = []
+        seen = set()
+        for ptrs, lengths in buffer_groups:
+            for ptr, length in zip(ptrs or [], lengths or []):
+                if length == 0:
+                    continue
+                if ptr <= 0 or length < 0:
+                    raise ValueError(
+                        f"Invalid Ascend PD memory region: ptr={ptr}, length={length}"
+                    )
+                region = (ptr, length)
+                if region not in seen:
+                    seen.add(region)
+                    regions.append(region)
+        return regions
 
     def requires_dcp_relayout(self, dst_dcp_size: int, dst_dcp_rank: int) -> bool:
         if self._is_npu_dsa_layout() and self.dcp_size != dst_dcp_size:
