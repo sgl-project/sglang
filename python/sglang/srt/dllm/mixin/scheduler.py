@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, List, Optional, Set, Union
 
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.dllm.mixin.req import DllmReqPhase
+from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.mem_cache.common import release_kv_cache
@@ -480,7 +481,7 @@ class DllmManager:
         self.waiting_queue = [req for req in self.waiting_queue if not req.finished()]
         self.staging_queue = [req for req in self.staging_queue if not req.finished()]
 
-    def pop_aborted_reqs(self, abort_all: bool, rid: str) -> List[Req]:
+    def pop_aborted_reqs(self, recv_req: AbortReq) -> List[Req]:
         aborted_reqs: List[Req] = []
         seen: Set[int] = set()
 
@@ -488,7 +489,7 @@ class DllmManager:
             queue = getattr(self, queue_name)
             kept_queue = []
             for req in queue:
-                if abort_all or req.rid.startswith(rid):
+                if recv_req.matches_rid(req.rid):
                     req_id = id(req)
                     if req_id not in seen:
                         aborted_reqs.append(req)

@@ -28,6 +28,7 @@ from transformers import PretrainedConfig
 from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
+    AbortReq,
     EncoderDispatchErrorReq,
     GenerateReqInput,
     TokenizedGenerateReqInput,
@@ -2029,13 +2030,13 @@ class MMReceiverBase(ABC):
     def process_waiting_requests(self, recv_reqs):
         pass
 
-    def abort_waiting_requests(self, recv_req) -> None:
+    def abort_waiting_requests(self, recv_req: AbortReq) -> None:
         """Mark matching waiting requests FAIL and free their resources; the
         next process_waiting_requests tick reports the abort through the
         existing FAIL channel. AbortReq is broadcast, so every TP rank does
         this and the status all-reduce stays consistent."""
         for waiting_req in self.waiting_list:
-            if not (recv_req.abort_all or waiting_req.rid.startswith(recv_req.rid)):
+            if not recv_req.matches_rid(waiting_req.rid):
                 continue
             if waiting_req.status in (
                 WaitingMMRequestStatus.PENDING,
