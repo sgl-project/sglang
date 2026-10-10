@@ -15,44 +15,78 @@ This is the Baseten-inspired reconstruction, not an exact reproduction of the
 unpublished settings behind TRT PR #11434. The runner implements the comparison;
 GPU performance and output agreement still need to be measured.
 
-## Build the SGLang environment
+## Use the prebuilt SGLang environment (recommended)
 
-From a standalone clone of this branch on the Linux GPU host, outside the TRT
-container:
+Run from a standalone clone of `aaron/ngram-code-edit-benchmark` on the Linux
+GPU host, outside the TRT container. **No Docker build is required.** The launcher
+uses `docker.io/lmsysorg/sglang:v0.5.19`, mounts this checkout read-only, and puts
+its `python/` directory first on `PYTHONPATH`. This runs our experimental source
+using the release image's installed dependencies; it does not run stock NGRAM.
+
+The release's core pins match this branch: Torch 2.13.0, FlashInfer 0.6.18,
+sglang-kernel 0.4.6.post1, TVM FFI 0.1.11, Transformers 5.12.1, and Tokenizers
+0.22.2. See the [release dependency file](https://github.com/sgl-project/sglang/blob/v0.5.19/python/pyproject.toml).
+`check_env.py` verifies these installed versions, compiler tools, source import
+path, CUDA 13 PyTorch, and visibility of exactly one GPU before each launch.
+The published image still needs an initial download and a compatible host
+NVIDIA driver/container integration. Container execution has not yet been
+validated on the assigned H200.
+
+First export `trt-inputs.json` in the existing TRT environment as described below.
+Then, on the host, set your assigned GPU UUID (obtain it with
+`nvidia-smi --query-gpu=index,uuid,name --format=csv`; do not assume GPU index 0):
 
 ```bash
-docker build -f docker/Dockerfile --target framework_final \
-  --build-arg BRANCH_TYPE=local --build-arg CUDA_VERSION=13.0.3 \
-  --build-arg SGLANG_BUILD_COMMIT="$(git rev-parse HEAD)" \
-  -t sglang-code-edit:local .
+export BENCH_GPU_UUID=GPU-YOUR-ASSIGNED-UUID
+export BENCH_INPUTS_DIR="$HOME/sa-bench"
+
+bash benchmark/ngram/run_container.sh \
+  python benchmark/ngram/bench_code_edits.py run 10 1 /work/sglang-smoke \
+  --inputs-dir /work --tokens /work/trt-inputs.json --fail-on-mismatch
+
+bash benchmark/ngram/run_container.sh \
+  python benchmark/ngram/bench_code_edits.py run 100 3 /work/sglang-results \
+  --inputs-dir /work --tokens /work/trt-inputs.json --fail-on-mismatch
 ```
 
-The Dockerfile uses fully qualified `docker.io/nvidia/cuda` base images so
-Podman can resolve them without an unqualified-search registry configuration.
-Shared build-argument defaults are declared before the first `FROM` and consumed
-in each stage, so Podman does not need to inherit defaults from a parent stage.
-If an older checkout fails with `Invalid requirement: 'sglang-kernel=='`, the
-kernel version reached the install stage empty. For this revision, adding
-`--build-arg SGL_KERNEL_VERSION=0.4.6.post1` fixes that argument; use the updated
-Dockerfile to preserve the other shared defaults too. Do not pass an empty
-`SGL_KERNEL_VERSION` override. The kernel pin matches `python/pyproject.toml`.
-Podman's warnings about omitted `SGL_VERSION`, `PIP_DEFAULT_INDEX`, and
-`UBUNTU_MIRROR` are harmless for this local-source build. To suppress them, add
-`--build-arg SGL_VERSION= --build-arg PIP_DEFAULT_INDEX= --build-arg UBUNTU_MIRROR=`.
-The gateway build raises its soft open-file limit only to the inherited hard
-limit. Older checkouts use `ulimit -n 65536`, which aborts on restricted build
-containers when that hard limit cannot be raised. Replace it with
-`ulimit -S -n "$(ulimit -H -n)"` to respect the container's existing ceiling.
-If Cargo then fails to spawn `rustc` with `Too many open files (os error 24)`,
-the available limit is still exhausted. The gateway stage defaults to
-`GATEWAY_BUILD_JOBS=1`, exported as `CARGO_BUILD_JOBS` for both maturin and the
-gateway binary build. This trades build speed for lower resource use; it does
-not change inference settings. Override with `--build-arg GATEWAY_BUILD_JOBS=N`
-when the build environment has sufficient resources. The stage logs the job
-count and effective soft/hard open-file limits before compiling. For an older
-checkout, adding `ENV CARGO_BUILD_JOBS=1` immediately after
-`FROM base AS gateway_builder` applies the same one-job limit.
-The full image build and GPU execution still require validation on the host.
+Run the full matrix after inspecting the smoke results. Both output directories
+must be new. Host `BENCH_INPUTS_DIR` is mounted read-write at `/work`; source is
+mounted at `/workspace/sglang`. The launcher uses Podman when installed, otherwise
+Docker; `CONTAINER_ENGINE=docker` or `CONTAINER_ENGINE=podman` selects explicitly.
+It also recognizes a `docker` executable backed by Podman. Podman uses the
+assigned UUID through NVIDIA CDI; Docker uses `--gpus device=UUID`. With no command,
+`bash benchmark/ngram/run_container.sh` opens a shell after the same checks.
+Keep the host checkout unchanged while a benchmark runs. Stop the TRT workload
+before using that same GPU for SGLang.
+
+The Python HTTP/text benchmark does not need the gateway or a Rust build.
+Runtime Rust builds are disabled. NGRAM's modified C++ retrieval extension and
+GPU kernels can still compile on first server startup, outside measured requests.
+This workflow avoids rebuilding CUDA dependencies, the gateway, and the complete
+SGLang image. It does not change the workload, scheduler settings, or timing rules.
+
+The runner records the image reference, checkout commit/diff, and key package
+versions. A release tag is not an immutable digest. For a fixed environment,
+record the pulled image's `RepoDigests` with `podman image inspect` (or Docker),
+then set `SGLANG_BENCHMARK_IMAGE=docker.io/lmsysorg/sglang@sha256:...` for subsequent
+runs. Use the actual digest from that image, not an arbitrary newer release.
+
+### Optional benchmark Dockerfile
+
+If you want a locally named image, this thin Dockerfile reuses the same release
+and checks its dependencies. It installs no packages and compiles no Rust:
+
+```bash
+docker build -f benchmark/ngram/Dockerfile -t sglang-code-edit:local .
+SGLANG_BENCHMARK_IMAGE=localhost/sglang-code-edit:local \
+  bash benchmark/ngram/run_container.sh
+```
+
+For a Docker daemon use `SGLANG_BENCHMARK_IMAGE=sglang-code-edit:local`; Podman
+qualifies locally built image names with `localhost/`. Source and data are still
+mounted by the launcher. The optional `SGLANG_BASE_IMAGE` build argument accepts
+the release image's immutable digest. The root `docker/Dockerfile` is the full
+source-build route; it is unnecessary for this benchmark setup.
 
 ## Run
 

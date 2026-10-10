@@ -568,6 +568,7 @@ def run(args):
     provenance = {
         "schema_version": 1,
         "framework": "sglang",
+        "container_image": os.environ.get("SGLANG_BENCHMARK_IMAGE"),
         "source_revision": capture(["git", "rev-parse", "HEAD"]),
         "source_status": capture(["git", "status", "--short"]),
         "tracked_diff_sha256": hashlib.sha256(
@@ -576,7 +577,15 @@ def run(args):
         "runner_sha256": sha256(__file__),
         "reporter_sha256": sha256(Path(__file__).with_name("code_edit_report.py")),
         "packages": package_versions(
-            ["sglang", "torch", "transformers", "tokenizers", "flashinfer-python"]
+            [
+                "sglang",
+                "torch",
+                "transformers",
+                "tokenizers",
+                "flashinfer-python",
+                "sglang-kernel",
+                "apache-tvm-ffi",
+            ]
         ),
         "platform": platform.platform(),
         "python": sys.version,
