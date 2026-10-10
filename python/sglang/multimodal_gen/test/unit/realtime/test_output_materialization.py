@@ -15,7 +15,9 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.postprocess import FrameInterpolator
-from sglang.multimodal_gen.runtime.postprocess.rife_interpolator import Model as RIFEModel
+from sglang.multimodal_gen.runtime.postprocess.rife_interpolator import (
+    Model as RIFEModel,
+)
 from sglang.multimodal_gen.runtime.realtime.video import build_raw_rgb_frame_batches
 
 
@@ -201,7 +203,7 @@ def test_materialize_output_sample_rejects_out_of_range_interpolation_exp(
 @pytest.mark.parametrize(
     "h, w",
     [
-        (480, 832),   # 480p: old pad=480 not divisible by 64 at scale=0.5
+        (480, 832),  # 480p: old pad=480 not divisible by 64 at scale=0.5
         (720, 1280),  # 720p: old pad=736 not divisible by 64 at scale=0.5
     ],
 )
