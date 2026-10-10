@@ -1011,6 +1011,13 @@ class ImageProcessorV2:
             image = image.convert("RGBA")
             image = np.asarray(image)
             image, mask = self.recenter(image, border_ratio=border_ratio)
+        elif isinstance(image, np.ndarray):
+            image, mask = self.recenter(image, border_ratio=border_ratio)
+        else:
+            raise TypeError(
+                f"Unsupported image type {type(image).__name__}; "
+                "expected a path, PIL image or numpy array"
+            )
 
         image = cv2.resize(image, (self.size, self.size), interpolation=cv2.INTER_CUBIC)
         mask = cv2.resize(mask, (self.size, self.size), interpolation=cv2.INTER_NEAREST)
