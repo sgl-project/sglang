@@ -885,6 +885,63 @@ def _gather_ple_embedding_from_pinned_kernel(
     )
 
 
+_PLE_REUSE_STATS = {"skipped": 0, "copied": 0, "rows_skipped": 0}
+
+
+def _ple_shard_matches(dst: torch.Tensor, src: torch.Tensor) -> bool:
+    """True when ``dst`` already holds ``src``, by sampled byte-window compare.
+
+    The file backend keeps its sparse backing file across restarts, so after the
+    first boot most shards are already on disk. Rewriting them is a
+    read-modify-write per 4 KiB page and dominates the boot. Sampling the
+    destination against the source lets an unchanged shard skip the copy.
+
+    This is a content check, not a filename/mtime/size heuristic: a stale,
+    truncated or wrong-revision file fails the sample and falls through to the
+    normal copy for that shard, so it cannot serve wrong weights.
+
+    Ported from ple_reuse.py by Shantanu Goel
+    (shantanugoel/qwen38-flash-next-sglang-dgx-spark, Apache-2.0).
+    """
+    if not envs.SGLANG_QWEN4_PLE_FILE_REUSE.get():
+        return False
+    if dst.shape != src.shape or dst.dtype != src.dtype:
+        return False
+    if dst.numel() == 0:
+        return True
+    try:
+        a = dst.reshape(-1).view(torch.uint8)
+        b = src.reshape(-1).contiguous().view(torch.uint8)
+    except RuntimeError:
+        return False
+
+    n = int(a.numel())
+    win = 4096
+    if n <= win * 2:
+        return bool(torch.equal(a, b))
+    k = max(4, envs.SGLANG_QWEN4_PLE_FILE_REUSE_WINDOWS.get())
+    gen = torch.Generator().manual_seed(0x5150 ^ n)
+    offs = (torch.randint(0, (n - win) // win, (k,), generator=gen) * win).tolist()
+    for off in sorted(set(offs + [0, n - win])):
+        if not torch.equal(a[off : off + win], b[off : off + win]):
+            return False
+    return True
+
+
+def _ple_reuse_report() -> None:
+    stats = _PLE_REUSE_STATS
+    total = stats["skipped"] + stats["copied"]
+    if not total:
+        return
+    logger.info(
+        "PLE table: %d/%d shards already on disk (%d rows), %d copied",
+        stats["skipped"],
+        total,
+        stats["rows_skipped"],
+        stats["copied"],
+    )
+
+
 class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
     """PLE table read directly from host memory (pinned, or a file-backed mmap).
 
@@ -2273,11 +2330,18 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 local_start = ov_start - tp_start
                 src_start = ov_start - row_start
                 n_rows = ov_end - ov_start
-                emb.weight.data[local_start : local_start + n_rows].copy_(
-                    loaded_weight[src_start : src_start + n_rows].to(
-                        device=emb.weight.device, dtype=emb.weight.dtype
-                    )
+                dst = emb.weight.data[local_start : local_start + n_rows]
+                src = loaded_weight[src_start : src_start + n_rows].to(
+                    device=emb.weight.device, dtype=emb.weight.dtype
                 )
+                # The backing file survives restarts: only rewrite rows that
+                # actually differ, verified by content rather than by name.
+                if _ple_shard_matches(dst, src):
+                    _PLE_REUSE_STATS["skipped"] += 1
+                    _PLE_REUSE_STATS["rows_skipped"] += n_rows
+                else:
+                    _PLE_REUSE_STATS["copied"] += 1
+                    dst.copy_(src)
 
         def load_qwen4_exp_ple_shard(name: str, loaded_weight: torch.Tensor) -> bool:
             if ".ngram_embedding.shard_" not in name:
@@ -2551,6 +2615,7 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
             if isinstance(module, Qwen3_5GatedDeltaNet):
                 module.finalize_fused_in_proj()
 
+        _ple_reuse_report()
         return loaded_params
 
     def precompile_kernels_after_loading(self) -> None:
