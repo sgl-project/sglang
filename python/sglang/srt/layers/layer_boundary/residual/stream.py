@@ -13,6 +13,7 @@
 # ==============================================================================
 """One forward's residual and its producer's outstanding contribution."""
 
+from dataclasses import dataclass
 from typing import Optional, Union
 
 import msgspec
@@ -23,7 +24,10 @@ from sglang.srt.layers.layer_boundary.output import DeferredFinalize, UnreducedO
 from sglang.srt.layers.layer_boundary.residual import ResidualUpdate
 
 
-class DeclaredSum(msgspec.Struct, frozen=True):
+# These per-forward objects are constructed inside torch.compile regions.
+# Use Python dataclasses so Dynamo can trace their construction and mutation.
+@dataclass(frozen=True)
+class DeclaredSum:
     """A sum every output of this producer owes to its declared input edge."""
 
     group: SumGroup
@@ -32,7 +36,8 @@ class DeclaredSum(msgspec.Struct, frozen=True):
         return _sum_group(self.group).all_reduce(value)
 
 
-class Contribution(msgspec.Struct):
+@dataclass
+class Contribution:
     """Own a producer's output, residual update and outstanding completion.
 
     Fields:
@@ -71,7 +76,8 @@ class Contribution(msgspec.Struct):
         self.owed = None
 
 
-class OwedOutput(msgspec.Struct, frozen=True):
+@dataclass(frozen=True)
+class OwedOutput:
     """Opaque model-facing handle. Only its boundary may read the contribution."""
 
     contribution: Contribution

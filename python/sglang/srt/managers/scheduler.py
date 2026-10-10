@@ -362,6 +362,7 @@ from sglang.srt.utils.hf_transformers_utils import (
     get_tokenizer_from_processor,
     resolve_image_processor_backend,
 )
+from sglang.srt.utils.npu_pinned_host_diagnostics import PinnedHostMemoryMonitor
 from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.weight_versions import (
@@ -6005,9 +6006,20 @@ def run_scheduler_process(
         trace_set_thread_info(thread_label, tp_rank, dp_rank, pp_rank)
 
     # Create a scheduler and run the event loop
+    host_memory_monitor = PinnedHostMemoryMonitor(
+        enabled=_is_npu,
+        details={
+            "tp_rank": tp_rank,
+            "pp_rank": pp_rank,
+            "dp_rank": dp_rank,
+            "device_id": gpu_id,
+        },
+    )
     scheduler = None
     try:
+        host_memory_monitor.start()
         scheduler = Scheduler(server_args, port_args)
+        host_memory_monitor.mark_runtime()
 
         # Send initialization info back to the parent process
         pipe_writer.send(scheduler.get_init_info())
@@ -6015,9 +6027,10 @@ def run_scheduler_process(
         # Run the event loop (blocks until a ShutdownReq sets gracefully_exit)
         scheduler.run_event_loop()
 
-    except Exception:
+    except Exception as exc:
         traceback = get_exception_traceback()
         logger.error(f"Scheduler hit an exception: {traceback}")
+        host_memory_monitor.log_failure(exc)
         parent_process.send_signal(signal.SIGQUIT)
         # Opt-in: SIGKILL the pgroup so sibling ranks don't spew thousands
         # of NCCL/TCPStore tracebacks before they finally die.
@@ -6027,6 +6040,7 @@ def run_scheduler_process(
             except Exception:
                 pass
     finally:
+        host_memory_monitor.stop()
         if scheduler is not None:
             # FPM has a background ZMQ publisher thread that needs explicit
             # teardown to flush queued metrics and close the socket cleanly.

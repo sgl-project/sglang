@@ -17,7 +17,11 @@ from sglang.srt.utils.common import (
     ceil_align,
     flatten_arrays_to_pinned_cpu,
     is_hip,
+    is_npu,
     is_pin_memory_available,
+)
+from sglang.srt.utils.npu_pinned_host_diagnostics import (
+    trace_npu_pinned_host_allocation,
 )
 from sglang.srt.utils.weight_versions import (
     WeightVersionEvent,
@@ -2736,13 +2740,25 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Stay on pinned CPU; H2D is deferred to forward stream via
         # resolve_forward_inputs.
         pinned_input_ids = flatten_arrays_to_pinned_cpu(input_ids, _pin)
-        seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int64, pin_memory=_pin).to(
-            self.device, non_blocking=True
-        )
+        with trace_npu_pinned_host_allocation(
+            "schedule_batch.prepare_for_extend.seq_lens",
+            enabled=_pin and is_npu(),
+            requested_bytes=len(seq_lens) * 8,
+            details={"shape": (len(seq_lens),), "dtype": "torch.int64"},
+        ):
+            seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int64, pin_memory=_pin)
+        seq_lens_tensor = seq_lens_tensor.to(self.device, non_blocking=True)
         seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
-        orig_seq_lens_tensor = torch.tensor(
-            orig_seq_lens, dtype=torch.int32, pin_memory=_pin
-        ).to(self.device, non_blocking=True)
+        with trace_npu_pinned_host_allocation(
+            "schedule_batch.prepare_for_extend.orig_seq_lens",
+            enabled=_pin and is_npu(),
+            requested_bytes=len(orig_seq_lens) * 4,
+            details={"shape": (len(orig_seq_lens),), "dtype": "torch.int32"},
+        ):
+            orig_seq_lens_tensor = torch.tensor(
+                orig_seq_lens, dtype=torch.int32, pin_memory=_pin
+            )
+        orig_seq_lens_tensor = orig_seq_lens_tensor.to(self.device, non_blocking=True)
 
         # Set batch fields needed by alloc_for_extend
         self.prefix_lens = prefix_lens
