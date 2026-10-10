@@ -24,11 +24,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
-from sglang.srt.utils.common import (
-    is_cpu,
-    is_mps,
-    parse_connector_type,
-)
+from sglang.srt.utils.common import is_cpu, is_mps, parse_connector_type
 from sglang.srt.utils.hf_transformers_utils import check_gguf_file
 
 logger = logging.getLogger(__name__)
@@ -118,7 +114,6 @@ def apply_cuda_graph_compatibility(server_args: Any):
     prefill backend, whichever value they chose (the contract the removed
     --enforce-piecewise-cuda-graph used to spell).
     """
-
     cfg = resolving_view(server_args)
     if (Phase.PREFILL, "backend") in server_args._cuda_graph_config_locked:
         return
@@ -151,9 +146,9 @@ def apply_cuda_graph_compatibility(server_args: Any):
         and not model_config_of(
             server_args
         ).is_multimodal_breakable_cuda_graph_supported
-        # Keep trtllm_mla on the preferred breakable path, which now serves
-        # MLA by falling back to the flashinfer MLA impl for extend.
-        and attention_backends_of(resolved_view(server_args))[0] != "trtllm_mla"
+        # Only trtllm_mla configs that still need the FlashInfer paged-MLA
+        # fallback (see trtllm_mla_backend.py) stay excluded.
+        and trtllm_mla_has_varlen_absorbed(server_args)
     ):
         logger.info(
             "Using tc_piecewise CUDA graph for validated multimodal decoder prefill."
@@ -172,6 +167,21 @@ def apply_cuda_graph_compatibility(server_args: Any):
         disable_breakable_cudagraph_if_incompatible(server_args)
     elif cfg.cuda_graph_config.prefill.backend == Backend.FULL:
         disable_full_prefill_cudagraph_if_incompatible(server_args)
+
+
+def trtllm_mla_has_varlen_absorbed(server_args: Any) -> bool:
+    from sglang.srt.arg_groups.overrides import attention_backends_of
+
+    cfg = resolved_view(server_args)
+    if attention_backends_of(cfg)[0] != "trtllm_mla":
+        return True
+    from sglang.srt.layers.attention.trtllm_mla_backend import (
+        configured_varlen_absorbed_mla_supported,
+    )
+
+    return configured_varlen_absorbed_mla_supported(
+        cfg.kv_cache_dtype, model_config_of(server_args).dtype
+    )
 
 
 def disable_tc_piecewise_cudagraph_if_incompatible(server_args: Any):
@@ -279,10 +289,7 @@ def disable_breakable_cudagraph_if_incompatible(server_args: Any):
     """
 
     cfg = resolving_view(server_args)
-    from sglang.srt.configs.model_config import (
-        is_deepseek_v4,
-        uses_kda_attention,
-    )
+    from sglang.srt.configs.model_config import is_deepseek_v4, uses_kda_attention
     from sglang.srt.layers.cp.bcg import supports_prefill_cp_bcg
 
     rules = [
@@ -376,11 +383,8 @@ def disable_full_prefill_cudagraph_if_incompatible(server_args: Any):
 
 
 def disable_prefill_cuda_graph_for_deepseek_trtllm_mla(server_args: Any):
-    """Disable prefill CUDA graph for dsr1 by default when using the trtllm_mla
-    attention backend. Under any captured prefill CUDA graph (tc_piecewise or
-    breakable) trtllm_mla falls back to FlashAttention for prefill and regresses
-    performance, so disable whichever prefill graph backend is in effect.
-    """
+    """Disable dsr1 prefill CUDA graphs on trtllm_mla by default; their gain with
+    varlen absorbed MLA is not yet measured on DeepSeek-V3."""
 
     cfg = resolving_view(server_args)
 
@@ -398,9 +402,8 @@ def disable_prefill_cuda_graph_for_deepseek_trtllm_mla(server_args: Any):
         return
     logger.warning(
         "Disabling prefill CUDA graph (%s) by default for the DeepSeek-V3 arch on "
-        "the trtllm_mla attention backend (a captured prefill graph forces a "
-        "FlashAttention fallback that regresses prefill). Set the prefill cuda graph "
-        "backend explicitly (e.g. --cuda-graph-backend-prefill tc_piecewise) to override.",
+        "the trtllm_mla attention backend. Set the prefill cuda graph backend "
+        "explicitly (e.g. --cuda-graph-backend-prefill tc_piecewise) to override.",
         cfg.cuda_graph_config.prefill.backend,
     )
     declare_resolution(

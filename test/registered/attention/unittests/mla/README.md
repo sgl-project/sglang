@@ -20,7 +20,7 @@ Columns are runner modes; rows are attention backends. Cells use:
 | `triton` | ✓ 10 input layouts (page 1/16/32, prefix/decode edges) | ✓ MLA decode page-boundary | ✓ ragged page-boundary extend | ✓ ragged page-boundary extend | ✓ EAGLE chain (topk=1) | ✓ EAGLE tree (topk=2) | — (V1 DE not enabled for Triton MLA; Triton uses V2 path) | — | ✓ fixed-tokens-per-req | ✓ chain (topk=1) + tree (topk=2) | ✓ via `DRAFT_EXTEND_V2` graph runner | — (no FKVMTP wiring for MLA) |
 | `flashinfer` | ✓ 10 input layouts with DeepSeek-like `kv_lora_rank=512`, `qk_rope_head_dim=64` | ✓ MLA decode page-boundary | ✓ ragged page-boundary extend | ✓ ragged page-boundary extend | ✓ EAGLE chain (topk=1) | ✓ EAGLE chain (topk=1) | ✓ EAGLE ragged-accept | ✓ EAGLE ragged-accept | blocked: `is_draft_extend()` default `include_v2=False` (`flashinfer_mla_backend.py:432,501,454-455,512`) | ✓ chain (topk=1) only — tree blocked by `topk=1` reject (`flashinfer_mla_backend.py:910-913`) | ✓ EAGLE ragged-accept (V1) | — (no FKVMTP wiring for MLA) |
 | `flashmla` | ✓ FlashMLA-compatible page-size-64 cases (zero-prefix exact page, input page edges 63/64/65, prefix exact page, total exact page, cross page, ragged, decode page-boundary, decode bsz=1 nonzero prefix) | ✓ page-size-64 decode page-boundary | ✓ ragged page-boundary extend | ✓ ragged page-boundary extend | ✓ EAGLE chain (topk=1) | ✓ EAGLE chain (topk=1) | ✓ EAGLE ragged-accept | deferred: parent FlashInfer-MLA capture path expects 1D `cuda_graph_kv_indices`, FlashMLA allocates 2D `[max_bs, (max_context+PAGE_SIZE)//PAGE_SIZE]` (`flashmla_backend.py:347-348` + parent `init_forward_metadata_capture_cuda_graph`) | — (FlashMLA does not implement V2) | ✓ chain (topk=1) only — tree blocked by `topk=1` reject (`flashmla_backend.py:555-558`) | — (DE CG deferred above) | — |
-| `trtllm_mla` | skip:hw — needs SM 12.0a / 12.1a (`is_sm120_supported`) | — | — | — | blocked: `topk=1` only (`trtllm_mla_backend.py:1223-1229` inherits from FlashInfer MLA) | — | — | — | — | — | — | — |
+| `trtllm_mla` | skip:hw — needs SM 12.0a / 12.1a (`is_sm120_supported`) | — | ✓ 10 varlen-absorbed cases, FP8 KV, page 32/64 (zero-prefix, exact page, cross page, ragged bs=2/3/4, CuTeDSL auto-dispatch); skip:hw — SM 10.x only, see below | ✓ same 10 cases under `enable_breakable_cuda_graph()`; skip:hw — SM 10.x only, see below | blocked: `topk=1` only (`trtllm_mla_backend.py:1223-1229` inherits from FlashInfer MLA) | — | — | — | — | — | — | — |
 | `tokenspeed_mla` | skip:hw — needs `find_spec("tokenspeed_mla")`, SM 10.0+, and `kv_cache_dtype=fp8_e4m3` (`server_args.py:2814-2818`); current MLA fixture does not emit FP8 KV cache | — | — | — | blocked: `topk=1` only (`tokenspeed_mla_backend.py:341-347` inherits from TRT-LLM MLA) | — | — | — | — | — | — | — |
 
 ## Input And Config Coverage
@@ -38,6 +38,22 @@ Columns are runner modes; rows are attention backends. Cells use:
   and decode bsz=1 nonzero-prefix.
 - Nonzero MLA rope dimension support is present in the fixture, but RoPE math
   is intentionally orthogonal to the runner/backend matrix.
+
+## `trtllm_mla` PCG/BCG Extend (Varlen Absorbed MLA)
+
+Under a captured `tc_piecewise` **or** `breakable` prefill graph, the
+DeepSeek/Kimi dispatcher returns `AttnForwardMethod.MLA` even for a genuine
+extend, so `trtllm_mla` serves it with absorbed MLA over a ragged `q`
+(`_run_varlen_absorbed_kernel`) instead of the FlashInfer paged-MLA parent.
+The piecewise and breakable tests share ten numerical cases, including ragged
+batches, page boundaries, real capture/replay, and the 65–127-head range where
+FlashInfer `backend="auto"` selects monolithic CuTeDSL. The dedicated
+`cutedsl_mla` SGLang backend remains decode-only; its prefill side is
+`trtllm_mla`, which owns this extend path.
+
+`varlen_absorbed_mla_supported()` admits SM10.x with BF16 or FP8-E4M3 KV.
+Other dtypes and DCP keep the paged fallback. ServerArgs and runtime use the
+same predicate, and `test_mla_varlen_absorbed_gate.py` covers that contract.
 
 ## Production-Unsupported
 
