@@ -29,6 +29,10 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.utils.weight_versions import (
+    WeightVersionSpan,
+    compute_weight_version_spans,
+)
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 register_cpu_ci(est_time=8, suite="stage-b-test-cpu-intel")
@@ -603,6 +607,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         req = SimpleNamespace(
             finished=lambda: False,
             output_ids=[10, 11, 12],
+            weight_version_events=[],
             time_stats=MagicMock(),
         )
         scheduler.running_batch.reqs = [req]
@@ -621,6 +626,69 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         # the device->host KV offload rather than offload-then-delete it.
         mock_retract_all.assert_called_once()
         self.assertEqual(mock_retract_all.call_args.kwargs["offload_kv"], False)
+
+    def _pd_retract_weight_version_spans(self, next_version: str):
+        scheduler = self._new_scheduler()
+        scheduler.disaggregation_mode = DisaggregationMode.DECODE
+        scheduler.collect_inflight_reqs = lambda: set()
+        held = []
+        scheduler.disagg_decode_prealloc_queue = MagicMock()
+        scheduler.disagg_decode_prealloc_queue.hold_rebootstrap.side_effect = (
+            held.append
+        )
+        scheduler.disagg_decode_prealloc_queue.enqueue_held_rebootstrap.side_effect = (
+            held.clear
+        )
+        req = self._make_req("pd-rebootstrap")
+        req.output_ids.extend([10, 11, 12])
+        scheduler.running_batch.reqs = [req]
+
+        serving = SimpleNamespace(weight_version="v1")
+        context = SimpleNamespace(
+            override=lambda source, **fields: setattr(
+                serving, "weight_version", fields["weight_version"]
+            )
+        )
+        with (
+            patch("sglang.srt.managers.scheduler.get_serving", return_value=serving),
+            patch("sglang.srt.managers.scheduler.get_context", return_value=context),
+            patch("sglang.srt.managers.scheduler.retract_all"),
+        ):
+            scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
+            self.assertEqual(list(req.output_ids), [10, 11])
+            self.assertEqual(req.pd_rebootstrap_forced_output_id, 12)
+            self.assertEqual(held, [req])
+
+            scheduler.record_weight_version_change(new_version=next_version)
+            scheduler.continue_generation(
+                ContinueGenerationReqInput(torch_empty_cache=False)
+            )
+            self.assertEqual(held, [])
+
+        # The prefill handoff replays the already-emitted boundary token; the
+        # following decode token is generated under the current weights.
+        req.output_ids.append(req.pd_rebootstrap_forced_output_id)
+        req.output_ids.append(13)
+        return compute_weight_version_spans(
+            req.weight_version_events,
+            current_version=serving.weight_version,
+            num_output_tokens=len(req.output_ids),
+        )
+
+    def test_pd_rebootstrap_preserves_pre_update_token_versions(self):
+        self.assertEqual(
+            self._pd_retract_weight_version_spans("v2"),
+            [
+                WeightVersionSpan(version="v1", start=0, end=3),
+                WeightVersionSpan(version="v2", start=3, end=4),
+            ],
+        )
+
+    def test_pd_rebootstrap_without_update_keeps_one_version_span(self):
+        self.assertEqual(
+            self._pd_retract_weight_version_spans("v1"),
+            [WeightVersionSpan(version="v1", start=0, end=4)],
+        )
 
     def test_pd_decode_retract_completes_offload_before_free(self):
         """PD decode retract must not free KV an offload copy is still reading, and
