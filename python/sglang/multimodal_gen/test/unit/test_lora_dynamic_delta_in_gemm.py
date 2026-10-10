@@ -3,7 +3,9 @@
 At "exact" the delta keeps the reference chain (GEMM, alpha scale, strength,
 request scale, add) and only drops multiplications by 1.0, which are exact. At
 "lossless" the second GEMM accumulates the scaled delta onto the base output and
-rounds once, and a row-parallel bias moves into the base GEMM's epilogue.
+rounds once, and a row-parallel bias moves into the base GEMM's epilogue. A
+forward whose stage does not put its request in the forward context runs the
+exact chain.
 """
 
 from types import SimpleNamespace
@@ -71,18 +73,19 @@ def _reference_chain(layer, out, x, runtime_scale):
     return out + delta.to(dtype=out.dtype)
 
 
+@pytest.mark.parametrize("request_batch", [_batch("exact"), None])
 @pytest.mark.parametrize("stacked", [False, True])
 @pytest.mark.parametrize(
     "alpha, strength, runtime_scale",
     [(RANK, 1.0, 1.0), (2 * RANK, 1.0, 1.0), (RANK, 0.7, 1.0), (8, 0.7, 0.5)],
 )
 def test_exact_tier_keeps_the_reference_chain_bit_for_bit(
-    stacked, alpha, strength, runtime_scale
+    stacked, alpha, strength, runtime_scale, request_batch
 ):
     a, b = _adapter(stacked, torch.bfloat16)
     layer = _layer(a, b, alpha, strength)
     x = _activations(TOKENS, IN_DIM, seed=2).to(torch.bfloat16)
-    with torch.inference_mode(), set_forward_context(0, None, _batch("exact")):
+    with torch.inference_mode(), set_forward_context(0, None, request_batch):
         out = layer.base_layer(x)
         actual = layer._add_lora_delta(out.clone(), x, runtime_scale)
         expected = _reference_chain(layer, out, x, runtime_scale)
@@ -112,14 +115,18 @@ def test_lossless_tier_is_admitted_against_the_fp64_math(stacked, adapter_dtype)
     )
 
 
-def test_the_default_quality_takes_the_lossless_path():
-    assert _request_allows_lossless()  # no forward context
+def test_only_a_request_that_allows_it_takes_the_lossless_path():
+    # LTX-2's denoising, among others, sets the context without forward_batch
+    assert not _request_allows_lossless()  # no forward context
+    with set_forward_context(0, None):
+        assert not _request_allows_lossless()
     with set_forward_context(0, None, SimpleNamespace(runtime_lora_scale=1.0)):
-        assert _request_allows_lossless()
+        assert not _request_allows_lossless()
     with set_forward_context(0, None, _batch("exact")):
         assert not _request_allows_lossless()
-    with set_forward_context(0, None, _batch("high")):
-        assert _request_allows_lossless()
+    for quality in ("lossless", "high"):
+        with set_forward_context(0, None, _batch(quality)):
+            assert _request_allows_lossless()
 
 
 class _RowLinear(nn.Module):

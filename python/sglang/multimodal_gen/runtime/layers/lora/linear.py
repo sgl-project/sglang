@@ -78,10 +78,13 @@ def _compute_lora_delta(
 
 
 def _request_allows_lossless() -> bool:
+    # only a request that allows it: many stages set the forward context
+    # without forward_batch, and an exact request must still get exact bytes
     context = get_forward_context_or_none()
     forward_batch = None if context is None else context.forward_batch
     sampling_params = getattr(forward_batch, "sampling_params", None)
-    return quality_allows(getattr(sampling_params, "quality", "lossless"), "lossless")
+    quality = getattr(sampling_params, "quality", None)
+    return quality is not None and quality_allows(quality, "lossless")
 
 
 def _can_add_lora_delta_in_gemm(
