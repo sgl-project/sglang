@@ -173,11 +173,6 @@ def _all_gather_dcp_kv_cache(kv_a: torch.Tensor):
         )
     else:
         parallel.dcp_group.all_gather_into_tensor(gathered_kv_a, kv_a)
-    gathered_kv_a = (
-        gathered_kv_a.reshape((dcp_world_size,) + kv_a.shape)
-        .transpose(0, 1)
-        .reshape(-1, *kv_a.shape[1:])
-    )
     return gathered_kv_a
 
 
@@ -187,72 +182,62 @@ def all_gather_kv_cache_for_mha_chunk_extend(
     prefix_kv_lens_cpu: torch.Tensor,
     prefix_starts_cpu: torch.Tensor = None,
 ):
-    if get_parallel().dcp_enabled:
-        kv_a = kv_a.unsqueeze(1)
-        gathered_kv = all_gather_kv_cache_for_dcp(
-            kv_a,
-            k_pe,
-            prefix_kv_lens_cpu,
-            prefix_starts_cpu,
-        )
-        kv_a, k_pe = gathered_kv.split([kv_a.shape[-1], k_pe.shape[-1]], dim=-1)
-        kv_a = kv_a.squeeze(1)
-    return kv_a.contiguous(), k_pe.contiguous()
+    if not get_parallel().dcp_enabled:
+        return kv_a.contiguous(), k_pe.contiguous()
+    rows = int(prefix_kv_lens_cpu.sum())
+    output = (
+        kv_a.new_empty(rows, 1, kv_a.shape[-1]),
+        k_pe.new_empty(rows, 1, k_pe.shape[-1]),
+    )
+    all_gather_kv_cache_for_dcp(
+        kv_a.unsqueeze(1),
+        k_pe,
+        prefix_kv_lens_cpu,
+        prefix_starts_cpu,
+        output=output,
+    )
+    return output[0].squeeze(1), output[1]
 
 
 def all_gather_kv_cache_for_mha_extend(
     token_to_kv_pool,
     attn_mqa,
     dcp_local_prefix_kv_indices,
-    seq_lens,
-    extend_prefix_lens,
     extend_prefix_lens_cpu: list[int],
-    extend_seq_lens,
+    extend_seq_lens_cpu: list[int],
     kv_a: torch.Tensor,
     k_pe: torch.Tensor,
 ):
     prefix_kv_a, prefix_k_pe = token_to_kv_pool.get_mla_kv_buffer(
         attn_mqa, dcp_local_prefix_kv_indices, dst_dtype=kv_a.dtype
     )
-    extend_prefix_lens_cpu = torch.tensor(extend_prefix_lens_cpu)
-    gathered_kv_cache = all_gather_kv_cache_for_dcp(
+    # Request-major final inputs: [prefix_0, extend_0, prefix_1, extend_1, ...].
+    output_rows = sum(extend_prefix_lens_cpu) + sum(extend_seq_lens_cpu)
+    output = (
+        kv_a.new_empty(output_rows, 1, kv_a.shape[-1]),
+        k_pe.new_empty(output_rows, 1, k_pe.shape[-1]),
+    )
+    output_starts = []
+    output_start = extend_start = 0
+    for prefix_n, extend_n in zip(extend_prefix_lens_cpu, extend_seq_lens_cpu):
+        output_starts.append(output_start)
+        suffix_start = output_start + prefix_n
+        output[0][suffix_start : suffix_start + extend_n, 0].copy_(
+            kv_a[extend_start : extend_start + extend_n]
+        )
+        output[1][suffix_start : suffix_start + extend_n].copy_(
+            k_pe[extend_start : extend_start + extend_n]
+        )
+        output_start = suffix_start + extend_n
+        extend_start += extend_n
+    all_gather_kv_cache_for_dcp(
         prefix_kv_a,
         prefix_k_pe,
-        extend_prefix_lens_cpu,
+        torch.tensor(extend_prefix_lens_cpu),
+        output=output,
+        output_starts_cpu=torch.tensor(output_starts),
     )
-    prefix_kv_a, prefix_k_pe = gathered_kv_cache.split(
-        [kv_a.shape[-1], k_pe.shape[-1]], dim=-1
-    )
-    prefix_kv_a = prefix_kv_a.squeeze(1)
-    # torch.cat can't promote fp8 (gathered prefix) + bf16 (current extend), so
-    # align dtypes first (dequant the fp8 prefix; exact for the scale=1.0 default).
-    if prefix_kv_a.dtype != kv_a.dtype:
-        prefix_kv_a = prefix_kv_a.to(kv_a.dtype)
-    if prefix_k_pe.dtype != k_pe.dtype:
-        prefix_k_pe = prefix_k_pe.to(k_pe.dtype)
-    # re-organize kv with query orders
-    prefix_lens_cu = torch.zeros(
-        len(seq_lens) + 1,
-        dtype=torch.int32,
-        device=kv_a.device,
-    )
-    extend_lens_cu = torch.zeros_like(prefix_lens_cu)
-    prefix_lens_cu[1:] = torch.cumsum(extend_prefix_lens, dim=0)
-    extend_lens_cu[1:] = torch.cumsum(extend_seq_lens, dim=0)
-    kv_a_tuple = ()
-    k_pe_tuple = ()
-    for i in range(len(seq_lens)):
-        kv_a_tuple += (
-            prefix_kv_a[prefix_lens_cu[i] : prefix_lens_cu[i + 1]],
-            kv_a[extend_lens_cu[i] : extend_lens_cu[i + 1]],
-        )
-        k_pe_tuple += (
-            prefix_k_pe[prefix_lens_cu[i] : prefix_lens_cu[i + 1]],
-            k_pe[extend_lens_cu[i] : extend_lens_cu[i + 1]],
-        )
-    kv_a = torch.cat(kv_a_tuple, dim=0)
-    k_pe = torch.cat(k_pe_tuple, dim=0)
-    return kv_a.contiguous(), k_pe.contiguous()
+    return output[0].squeeze(1), output[1]
 
 
 def all_gather_q_for_mla_decode(
@@ -283,21 +268,19 @@ def all_gather_kv_cache_for_mla_extend(
     k_nope,
     k_pe,
 ):
-    # On hip, skip the all-gather when there is no cached prefix to avoid crash
-    if not _is_hip or dcp_extend_prefix_lens_sum > 0:
+    if dcp_extend_prefix_lens_sum > 0:
         cache_k_nope, cache_k_rope = token_to_kv_pool.get_mla_kv_buffer(
             attn_mqa,
             dcp_local_prefix_kv_indices,
         )
-        extend_prefix_lens_cpu = torch.tensor(extend_prefix_lens_cpu)
-        # all gather kv cache into forward_batch.attn_dcp_metadata.dcp_kv_buffer
-        gathered_kv = all_gather_kv_cache_for_dcp(
+        all_gather_kv_cache_for_dcp(
             cache_k_nope,
             cache_k_rope,
-            extend_prefix_lens_cpu,
-            prefix_starts_cpu=torch.zeros_like(extend_prefix_lens_cpu),
+            torch.tensor(extend_prefix_lens_cpu),
+            output=dcp_kv_buffer[:dcp_extend_prefix_lens_sum].split(
+                [kv_lora_rank, k_pe.shape[-1]], dim=-1
+            ),
         )
-        dcp_kv_buffer[:dcp_extend_prefix_lens_sum] = gathered_kv
 
     # copy local kv cache into forward_batch.attn_dcp_metadata.dcp_kv_buffer
     dcp_kv_buffer[
@@ -318,13 +301,18 @@ def all_gather_kv_cache_for_dcp(
     prefix_k_pe: torch.Tensor,
     prefix_kv_lens_cpu: torch.Tensor,
     prefix_starts_cpu: torch.Tensor = None,
+    *,
+    output: tuple[torch.Tensor, torch.Tensor],
+    output_starts_cpu: Optional[torch.Tensor] = None,
 ):
+    """Gather rank-major KV and unpack directly into the final latent/RoPE views.
+
+    ``output_starts_cpu`` leaves room for each request's current-token rows.
+    Outputs may be separate tensors or views of a combined MLA buffer.
     """
-    prefix_kv_a and prefix_k_pe should have same shape, expect for last dim
-    """
+    if not len(prefix_kv_lens_cpu) or int(prefix_kv_lens_cpu.max()) == 0:
+        return
     parallel = get_parallel()
-    if not parallel.dcp_enabled:
-        return torch.cat([prefix_kv_a, prefix_k_pe], dim=-1)
     # 1. compute max kv_lens for each seq
     dcp_world_size = parallel.dcp_size
     dcp_rank = parallel.dcp_rank
@@ -362,25 +350,58 @@ def all_gather_kv_cache_for_dcp(
 
     padded_kv_cache = torch.cat(padded_kv_cache_arr, dim=0)
 
-    gatherd_kv_cache = _all_gather_dcp_kv_cache(padded_kv_cache)
-
-    # 2. re-org kv cache to query orders
-    padded_lens_cu = torch.zeros(
-        len(prefix_kv_lens_cpu) + 1,
-        dtype=torch.int32,
-    )
-    padded_lens_cu[1:] = torch.cumsum(padded_lens, dim=0)
-    kv_cache_tuple = ()
-    for req_idx in range(len(prefix_kv_lens_cpu)):
-        kv_cache_tuple += (
-            gatherd_kv_cache[
-                padded_lens_cu[req_idx] * dcp_world_size
-                + (prefix_starts_cpu[req_idx] % dcp_world_size) :
-            ][: prefix_kv_lens_cpu[req_idx]],
+    gathered_kv_cache = _all_gather_dcp_kv_cache(padded_kv_cache)
+    if len(prefix_kv_lens_cpu) == 1:
+        metadata = (
+            0,
+            int(prefix_starts_cpu[0]) % dcp_world_size,
+            int(prefix_kv_lens_cpu[0]),
+            int(output_starts_cpu[0]) if output_starts_cpu is not None else 0,
         )
-    gatherd_kv_cache = torch.cat(kv_cache_tuple, dim=0)
+    else:
+        if output_starts_cpu is None:
+            output_starts_cpu = prefix_kv_lens_cpu.cumsum(0) - prefix_kv_lens_cpu
+        metadata = torch.stack(
+            (
+                padded_lens.cumsum(0) - padded_lens,
+                prefix_starts_cpu % dcp_world_size,
+                prefix_kv_lens_cpu,
+                output_starts_cpu,
+            ),
+            dim=1,
+        ).to(dtype=torch.int64)
 
-    return gatherd_kv_cache
+    if prefix_kv_a.is_cuda and not _is_hip:
+        from sglang.kernels.ops.kvcache.dcp_gather import unpack_dcp_kv
+
+        unpack_dcp_kv(
+            gathered_kv_cache,
+            metadata,
+            *output,
+            dcp_world_size,
+            int(prefix_kv_lens_cpu.max()),
+        )
+    else:
+        # Same direct layout for platforms without the CUDA unpack kernel.
+        rank_major = gathered_kv_cache.view(
+            dcp_world_size, -1, *gathered_kv_cache.shape[1:]
+        )
+        requests = [metadata] if isinstance(metadata, tuple) else metadata.tolist()
+        for padded_start, start, length, output_start in requests:
+            for rank in range(dcp_world_size):
+                first = (rank - start) % dcp_world_size
+                if first >= length:
+                    continue
+                count = (length - first + dcp_world_size - 1) // dcp_world_size
+                source = padded_start + (start + first) // dcp_world_size
+                rows = rank_major[rank, source : source + count]
+                for dst, src in zip(
+                    output,
+                    rows.split([prefix_kv_a.shape[-1], prefix_k_pe.shape[-1]], dim=-1),
+                ):
+                    dst[
+                        output_start + first : output_start + length : dcp_world_size
+                    ].copy_(src)
 
 
 # ---------------------------------------------------------------------------
