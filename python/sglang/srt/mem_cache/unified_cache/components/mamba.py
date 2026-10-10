@@ -58,6 +58,25 @@ if TYPE_CHECKING:
     )
 
 
+import os as _os
+
+_MAMBA_CKPT_PROBE = _os.environ.get("SGLANG_MAMBA_CKPT_PROBE", "0") == "1"
+if _MAMBA_CKPT_PROBE:
+    from collections import Counter as _Counter
+
+    _CKPT_PROBE_STATS = _Counter()
+else:
+    _CKPT_PROBE_STATS = None
+
+
+def _ckpt_probe(*parts: object) -> None:
+    """Probe hook for --enable-int8-mamba-checkpoint debugging. Enabled only
+    when SGLANG_MAMBA_CKPT_PROBE=1; flushed lines so each TP-rank server
+    process surfaces its own trace without buffering."""
+    if _MAMBA_CKPT_PROBE:
+        print("[INT8_CKPT_PROBE] " + " ".join(str(p) for p in parts), flush=True)
+
+
 class MambaComponent(TreeComponent):
     component_type = ComponentType.MAMBA
 
@@ -530,6 +549,15 @@ class MambaComponent(TreeComponent):
             active_slots.view(-1),
             ckpt_slot,
         )
+        if _MAMBA_CKPT_PROBE:
+            _CKPT_PROBE_STATS["commit_total"] += 1
+            _ckpt_probe(
+                "commit",
+                f"#{_CKPT_PROBE_STATS['commit_total']}",
+                f"int8_free={self.int8_ckpt_pool.available_size()}",
+                "active_free="
+                + str(self.cache.req_to_token_pool.mamba_allocator.available_size()),
+            )
         return ckpt_slot
 
     def _free_mamba_value(self, mamba_value: torch.Tensor) -> None:
@@ -547,6 +575,8 @@ class MambaComponent(TreeComponent):
         cache_len = req.kv.mamba_last_track_seqlen or 0
 
         if cache_len <= token_ids_len:
+            if _MAMBA_CKPT_PROBE:
+                _CKPT_PROBE_STATS["select_ok"] += 1
             return cache_len, keep_idx
 
         # Overshoot: the latest state ran past the key. The other slot always
@@ -557,7 +587,26 @@ class MambaComponent(TreeComponent):
             or previous_cache_len is None
             or previous_cache_len > token_ids_len
         ):
+            if _MAMBA_CKPT_PROBE:
+                _CKPT_PROBE_STATS["select_none"] += 1
+                _ckpt_probe(
+                    "select_NONE",
+                    f"rid={req.rid}",
+                    f"cache_len={cache_len}",
+                    f"token_ids_len={token_ids_len}",
+                    f"prev={previous_cache_len}",
+                    f"bufsz={pool.mamba_ping_pong_track_buffer_size}",
+                )
             return None
+        if _MAMBA_CKPT_PROBE:
+            _CKPT_PROBE_STATS["select_overshoot_fallback"] += 1
+            _ckpt_probe(
+                "select_overshoot_fallback",
+                f"rid={req.rid}",
+                f"cache_len={cache_len}",
+                f"prev={previous_cache_len}",
+                f"token_ids_len={token_ids_len}",
+            )
         return previous_cache_len, pool.get_mamba_ping_pong_other_idx(keep_idx)
 
     def prepare_for_caching_req(
@@ -590,6 +639,13 @@ class MambaComponent(TreeComponent):
             if self.cache.enable_mamba_extra_buffer:
                 checkpoint = self._select_finished_checkpoint(req, token_ids_len)
                 if checkpoint is None:
+                    if _MAMBA_CKPT_PROBE:
+                        _ckpt_probe(
+                            "finished_skip",
+                            f"rid={req.rid}",
+                            f"token_ids_len={token_ids_len}",
+                            f"int8_on={self.int8_ckpt_pool is not None}",
+                        )
                     return 0
                 cache_len, keep_idx = checkpoint
                 insert_params.mamba_keep_idx = keep_idx
