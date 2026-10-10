@@ -95,4 +95,4 @@ def test_auto_decision_measures_once_and_follows_the_threshold() -> None:
     assert run("fine") is False
     # measured once per configuration, attached unmerged to measure
     assert len(calls) == 2 and all(c["merge_weights"] is False for c in calls)
-    assert AUTO_MERGE_MAX_ROUNDING_LOSS == 0.3
+    assert AUTO_MERGE_MAX_ROUNDING_LOSS == 0.5
