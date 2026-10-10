@@ -276,21 +276,30 @@ impl CoreHandle {
             bootstrap_room: self.inner.is_disaggregation.then_some(0),
             ..Default::default()
         };
-        // The probe is intentionally not drained. Its call stays alive while
-        // the heartbeat is observed, then aborts on drop to clean up a probe
-        // that a busy scheduler skipped without producing a terminal frame.
-        let _probe = self.generate(probe).await?;
-
         let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            if self.response_activity() != baseline {
-                return Ok(HealthStatus::Healthy);
+        let observe_activity = async {
+            loop {
+                if self.response_activity() != baseline {
+                    return HealthStatus::Healthy;
+                }
+                let now = tokio::time::Instant::now();
+                if now >= deadline {
+                    return HealthStatus::Stalled;
+                }
+                tokio::time::sleep_until((now + Duration::from_millis(50)).min(deadline)).await;
             }
-            if tokio::time::Instant::now() >= deadline {
-                return Ok(HealthStatus::Stalled);
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+        };
+        tokio::pin!(observe_activity);
+
+        // Monitor the heartbeat and deadline even while intake is backpressured.
+        // Dropping a pending submission cancels it before admission. Once admitted,
+        // the undrained call stays alive until health is decided, then aborts on drop.
+        let _probe = tokio::select! {
+            biased;
+            result = self.generate(probe) => result?,
+            status = &mut observe_activity => return Ok(status),
+        };
+        Ok(observe_activity.await)
     }
 
     /// One generation mirroring the Python `_execute_server_warmup` text request;
@@ -966,6 +975,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn health_timeout_includes_pending_admission() {
+        let (intake_tx, intake_rx) = flume::bounded(0);
+        let (abort_tx, abort_rx) = flume::unbounded();
+        let handle = configured_handle(
+            intake_tx,
+            abort_tx,
+            8,
+            Default::default(),
+            true,
+            false,
+            BTreeMap::new(),
+        );
+        let mut probe = Box::pin(handle.probe_health(Duration::from_millis(1)));
+        let result = match futures::poll!(&mut probe) {
+            std::task::Poll::Ready(result) => result,
+            std::task::Poll::Pending => {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                futures::FutureExt::now_or_never(probe)
+                    .expect("health timeout must include waiting for intake capacity")
+            }
+        };
+        assert_eq!(result.unwrap(), HealthStatus::Stalled);
+        assert!(intake_rx.try_recv().is_err());
+        assert!(abort_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn healthy_activity_does_not_wait_for_probe_admission() {
+        let (intake_tx, intake_rx) = flume::bounded(0);
+        let (abort_tx, abort_rx) = flume::unbounded();
+        let activity: ActivityCounter = Default::default();
+        let handle = configured_handle(
+            intake_tx,
+            abort_tx,
+            8,
+            activity.clone(),
+            true,
+            false,
+            BTreeMap::new(),
+        );
+        let mut probe = Box::pin(handle.probe_health(Duration::from_secs(1)));
+        assert!(matches!(
+            futures::poll!(&mut probe),
+            std::task::Poll::Pending
+        ));
+
+        activity.fetch_add(1, Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let result = futures::FutureExt::now_or_never(probe).expect(
+            "scheduler activity must keep a busy server healthy during intake backpressure",
+        );
+        assert_eq!(result.unwrap(), HealthStatus::Healthy);
+        assert!(intake_rx.try_recv().is_err());
+        assert!(abort_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
     async fn stalled_pd_probe_has_bootstrap_pair_and_cleans_up() {
         let (intake_tx, intake_rx) = flume::unbounded();
         let (abort_tx, abort_rx) = flume::unbounded();
@@ -979,10 +1045,12 @@ mod tests {
             BTreeMap::new(),
         );
 
-        let probe_task =
-            tokio::spawn(
-                async move { handle.probe_health(Duration::from_millis(1)).await.unwrap() },
-            );
+        let probe_task = tokio::spawn(async move {
+            handle
+                .probe_health(Duration::from_millis(50))
+                .await
+                .unwrap()
+        });
         let request = accept_intake(intake_rx.recv_async().await.unwrap());
         let rid = request.rid.clone();
         let RequestKind::Generate(probe) = request.kind else {
