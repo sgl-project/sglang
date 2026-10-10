@@ -128,6 +128,8 @@ def _measure_config(int8_enabled, plan):
         "extra_buffer",
         "--max-mamba-cache-size",
         str(MAX_MAMBA_CACHE_SIZE),
+        "--mamba-ssm-dtype",
+        "bfloat16",
     ]
     if BASE_GPU_ID is not None:
         other_args += ["--base-gpu-id", BASE_GPU_ID]
