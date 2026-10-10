@@ -900,6 +900,12 @@ class DeepSeekV4UnifiedKVPool:
 
 
 class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
+    # HiCache may use one file namespace for all CP ranks only when every rank's
+    # device pool contains the full KV cache in global token order.  The CUDA
+    # and HIP DSV4 paths materialize that representation before writing it.
+    # Platform-specific subclasses must override this when they keep CP-local KV.
+    supports_hicache_shared_cp_storage = True
+
     # object.__new__ stubs (disagg wire test) skip __init__; False is the env
     # default, so the fp8 PD/HiCache refuses don't AttributeError on them.
     _unified_kv_fp8 = False
