@@ -756,7 +756,7 @@ class BeamModel(nn.Module):
             VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
-                use_attn_tp_group=get_parallel().enable_dp_attention,
+                use_attn_tp_group=get_parallel().attn_dp_enabled,
                 prefix=add_prefix("embed_tokens", prefix),
             )
             if self.pp_group.is_first_rank
