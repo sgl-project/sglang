@@ -3,7 +3,6 @@
 
 pub mod adapter;
 pub mod chat_formatter;
-mod deepseek;
 mod kimi;
 pub mod stats;
 
@@ -11,7 +10,7 @@ use anyhow::Result;
 use chat_formatter::ChatFormatter;
 use dashmap::DashMap;
 use dynamo_tokenizers::{EncodeSegment, Tokenizer};
-use sglang_processor::openai::{OpenAiTokenizer, TokenPieces};
+use sglang_processor::openai::{ChatModel, OpenAiTokenizer, TokenPieces};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -69,6 +68,33 @@ pub struct TokenizerRegistry {
     prompt_affixes: Option<adapter::PromptAffixes>,
     /// What SGLang's OpenAI layer asks of the tokenizer; needs `tokenizer.json`.
     openai: Option<Arc<dyn OpenAiTokenizer>>,
+    /// The model config SGLang's OpenAI chat layer reads.
+    chat_model: ChatModel,
+}
+
+/// `get_context_length` over the model's text config.
+fn context_length(config: &serde_json::Value) -> u64 {
+    let config = config.get("text_config").unwrap_or(config);
+    let scaling = &config["rope_scaling"];
+    let factor = match scaling.as_object() {
+        Some(s)
+            if !s.contains_key("original_max_position_embeddings")
+                && s.get("rope_type").and_then(|t| t.as_str()) != Some("llama3") =>
+        {
+            s.get("factor").and_then(|f| f.as_f64()).unwrap_or(1.0)
+        }
+        _ => 1.0,
+    };
+    [
+        "max_sequence_length",
+        "seq_length",
+        "max_seq_len",
+        "model_max_length",
+        "max_position_embeddings",
+    ]
+    .iter()
+    .find_map(|key| config[*key].as_f64())
+    .map_or(2048, |len| (factor * len) as u64)
 }
 
 /// The served model's tokenizer as SGLang's OpenAI layer uses it.
@@ -82,8 +108,8 @@ impl OpenAiTokenizer for OpenAiTokens {
         adapter::decode_complete(&self.tokenizer, ids, true).ok()
     }
 
-    fn byte_level_piece(&self, id: u32) -> Option<String> {
-        self.pieces.byte_level_piece(id).map(str::to_owned)
+    fn byte_level_bytes(&self, id: u32) -> Option<Vec<u8>> {
+        self.pieces.byte_level_bytes(id)
     }
 }
 
@@ -114,6 +140,19 @@ impl TokenizerRegistry {
                 pieces: TokenPieces::from_tokenizer_json(&json),
             }));
         }
+        me.chat_model = ChatModel {
+            context_length: files
+                .json("config.json")
+                .ok()
+                .flatten()
+                .map(|config| context_length(&config)),
+            generation_config: files
+                .json("generation_config.json")
+                .ok()
+                .flatten()
+                .and_then(|config| config.as_object().cloned())
+                .unwrap_or_default(),
+        };
         me.inner.insert(m.id.clone(), t);
         me.stats = stats;
         me.prompt_affixes = adapter::prompt_affixes(tokenizer_path, &files)
@@ -144,19 +183,14 @@ impl TokenizerRegistry {
                 ForwardingScope::AllText => tracing::info!(model = %m.id,
                     "router-generated input_ids forwarding enabled for all text chats; requires the \
                      workers' model files, --default-chat-template-kwargs, SGLANG_DEFAULT_THINKING, \
-                     and SGLANG_DSV4_REASONING_EFFORT"),
+                     and SGLANG_DSV4_REASONING_EFFORT or SGLANG_DSV41_REASONING_EFFORT"),
                 ForwardingScope::Guarded => tracing::warn!(model = %m.id,
                     "UNVERIFIED input_ids forwarding: router rendering is verified against SGLang only \
-                     for DeepSeek-V4, so this model forwards only guarded request shapes (plain text \
+                     for DeepSeek-V4 and V4.1, so this model forwards only guarded request shapes (plain text \
                      chat). Requires the workers' model files and --default-chat-template-kwargs; \
                      worker parser overrides, content-format detection, and conversation-template stop \
                      strings are not replicated. Pass --disable-input-ids-forwarding unless you have \
                      verified parity for this model"),
-                ForwardingScope::Never if me.has_chat_formatter(&m.id) => {
-                    tracing::warn!(model = %m.id,
-                    "input_ids forwarding disabled: the DeepSeek-V4.1 renderer is not verified against \
-                     current SGLang; workers tokenize messages")
-                }
                 ForwardingScope::Never => {}
             }
         }
@@ -165,6 +199,10 @@ impl TokenizerRegistry {
 
     pub fn openai(&self) -> Option<Arc<dyn OpenAiTokenizer>> {
         self.openai.clone()
+    }
+
+    pub fn chat_model(&self) -> &ChatModel {
+        &self.chat_model
     }
 
     pub fn stats(&self) -> &stats::TokenizerStats {

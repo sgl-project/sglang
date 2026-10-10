@@ -36,8 +36,8 @@ export const DiffusionModelCatalog = ({ category }) => {
       cookbook: "/cookbook/diffusion/Qwen-Image/Qwen-Image",
     },
     {
-      name: "Qwen-Image 2.1",
-      modelIds: ["Qwen/Qwen-Image-2.1"],
+      name: "Qwen-Image 2.1 / Turbo",
+      modelIds: ["Qwen/Qwen-Image-2.1", "Qwen/Qwen-Image-2.1-Turbo"],
       cookbook: "/cookbook/diffusion/Qwen-Image/Qwen-Image-2.1",
     },
     {
@@ -172,6 +172,11 @@ export const DiffusionModelCatalog = ({ category }) => {
         "Wan-AI/Wan2.2-I2V-A14B-Diffusers",
       ],
       cookbook: "/cookbook/diffusion/Wan/Wan2.2",
+    },
+    {
+      name: "Wan-Animate-2",
+      modelIds: ["Wan-AI/Wan2.2-Animate-2-14B-Diffusers"],
+      cookbook: "/cookbook/diffusion/Wan/Wan-Animate-2",
     },
     {
       name: "FastWan / TurboWan",

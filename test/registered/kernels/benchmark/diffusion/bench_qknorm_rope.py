@@ -41,6 +41,9 @@ BENCH_CASES = (
     # Z-Image-Turbo default 1024x1024 config: dim=3840, num_heads=30 -> head_dim=128.
     CaseSpec("zimage_1024", 1, 4096, 30, 128, 128, False),
     CaseSpec("longcat_1024", 1, 4608, 24, 128, 128, False, True, True),
+    # MiniMax-H3 Ref2VA at Ulysses 2: 24826 tokens per rank, NeoX over the first
+    # 96 of 128 dims, norm rounded before RoPE (the two-rows-per-warp kernel).
+    CaseSpec("minimax_h3_ref2va", 1, 24826, 56, 128, 96, True, False, True),
     CaseSpec("batch2_medium", 2, 2048, 24, 128, 128, False),
 )
 CASE_BY_NAME = {case.name: case for case in BENCH_CASES}

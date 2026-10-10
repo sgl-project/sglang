@@ -72,6 +72,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler._engine_paused = False
         scheduler.enable_overlap = False
         scheduler.enable_skip_finishing_decode = False
+        scheduler.enable_overlap_mlx = False
         scheduler.last_batch = None
         scheduler.cur_batch_for_debug = None
         scheduler.chunked_req = None
