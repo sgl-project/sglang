@@ -139,6 +139,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
 from sglang.srt.utils import (
     get_available_gpu_memory,
+    get_cuda_graph_max_batch_size,
     is_cuda,
     is_npu,
     require_attn_tp_gather,
@@ -160,6 +161,15 @@ _MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR = 2
 # Prefix attention adds one loop body per chunk to the captured topology, so
 # capture a small geometric set and round each replay up to the nearest one.
 _CHUNKED_PREFIX_VARIANTS = (1, 2, 4, 8, 16)
+
+
+def get_prefill_num_tokens_to_capture(capture_tokens: Sequence[int]) -> list[int]:
+    """Align capture and replay buckets to the same TP/CP token-shard widths.
+
+    Dummy capture batches bypass eager padding. Unequal shards can mismatch
+    collectives when a dense FFN runs with moe_dense_tp_size=1.
+    """
+    return sorted({get_cuda_graph_max_batch_size(n) for n in capture_tokens})
 
 
 def _chunked_prefix_variant(num_chunks: int) -> str:
@@ -295,9 +305,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     def __init__(self, model_runner: ModelRunner):
         if get_schedule().enable_mixed_chunk:
             backend = get_exec().graph.cuda_graph_config.prefill.backend
-            assert backend == Backend.BREAKABLE, (
-                "Mixed chunk prefill requires the breakable prefill CUDA "
-                f"graph backend; got '{backend}'."
+            assert backend in (Backend.BREAKABLE, Backend.FULL), (
+                "Mixed chunk prefill requires a padded prefill CUDA graph "
+                f"backend; got '{backend}'."
             )
         super().__init__(model_runner)
         self.dllm_attention = model_runner.attn_backend.dllm_attention
@@ -335,7 +345,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # tc_piecewise) — one shape knob per phase.
         capture_tokens = prefill_config.bs
         assert capture_tokens is not None, "cuda_graph_config[prefill].bs is not set"
-        self.capture_num_tokens = sorted(capture_tokens)
+        self.capture_num_tokens = get_prefill_num_tokens_to_capture(capture_tokens)
         assert self.capture_num_tokens, "cuda_graph_config[prefill].bs is empty"
 
         # --- runner bounds --------------------------------------------

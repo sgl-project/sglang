@@ -358,10 +358,10 @@ impl ChatPreprocessor {
             )
         })?;
         let mut request = request.clone();
-        // DeepSeek-V4 continues the final turn as SGLang's encoder path does,
+        // DeepSeek-V4 and V4.1 continue the final turn as SGLang's encoder path does,
         // null and parts content included.
         let final_message = match formatter {
-            ChatFormatter::DeepSeekV4(_) => None,
+            ChatFormatter::DeepSeekV4(_) | ChatFormatter::DeepSeekV41 => None,
             _ => prepare_continuation(&mut request),
         };
         let template_args = request.chat_template_args.get_or_insert_with(HashMap::new);

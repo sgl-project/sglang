@@ -16,7 +16,11 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     restore_symmetric_memory_context,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM
+from sglang.srt.layers.deep_gemm_wrapper.configurer import (
+    DEEPGEMM_NEED_TMA_ALIGNED_SCALES,
+    DEEPGEMM_SCALE_UE8M0,
+    ENABLE_JIT_DEEPGEMM,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import (
     get_device,
@@ -275,13 +279,43 @@ class _BaseWarmupExecutor:
     @staticmethod
     def get_memory_requirement(
         kernel_type: DeepGemmKernelType, max_m: int, n: int, k: int, num_groups: int
-    ) -> int:
-        # Return the required memory space in GB for warmup executor
+    ) -> float:
+        # FP32 input scales remain live while DeepGEMM converts their layout.
         _GB = 1 << 30
+        lhs_scales = max_m * ceil_div(k, _BLOCK_SIZE) * 4
+        rhs_scales = ceil_div(n, _BLOCK_SIZE) * ceil_div(k, _BLOCK_SIZE) * 4
+        scale_workspace = _get_fp8_scale_workspace(
+            max_m,
+            n,
+            k,
+            lhs_groups=(
+                num_groups
+                if kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED
+                else 1
+            ),
+            rhs_groups=(
+                1 if kernel_type == DeepGemmKernelType.GEMM_NT_F8F8BF16 else num_groups
+            ),
+        )
         if kernel_type == DeepGemmKernelType.GEMM_NT_F8F8BF16:
-            return (max_m * k + n * k + max_m * n * 2) / _GB
+            return (
+                max_m * k
+                + n * k
+                + max_m * n * 2
+                + lhs_scales
+                + rhs_scales
+                + scale_workspace
+            ) / _GB
         elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG:
-            return (max_m * k + num_groups * n * k + max_m * 4 + max_m * n * 2) / _GB
+            return (
+                max_m * k
+                + num_groups * n * k
+                + max_m * 4
+                + max_m * n * 2
+                + lhs_scales
+                + scale_workspace
+                + num_groups * rhs_scales
+            ) / _GB
         elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_BF16_CONTIG:
             return (
                 max_m * k * 2 + num_groups * n * k * 2 + max_m * 4 + max_m * n * 2
@@ -292,6 +326,8 @@ class _BaseWarmupExecutor:
                 + num_groups * n * k
                 + num_groups * 4
                 + num_groups * max_m * n * 2
+                + num_groups * (lhs_scales + rhs_scales)
+                + scale_workspace
             ) / _GB
         elif kernel_type == DeepGemmKernelType.GEMM_NT_BF16BF16F32:
             # bf16 lhs + bf16 rhs + fp32 out
@@ -308,6 +344,33 @@ class _BaseWarmupExecutor:
 
     def execute(self, m):
         raise NotImplementedError
+
+
+def _packed_scale_workspace(rows: int, cols: int, groups: int) -> tuple[int, int]:
+    packed_bytes = groups * ceil_align(rows, 4) * ceil_div(cols, 4) * 4
+    peak_bytes = packed_bytes
+    if groups > 1 and rows * cols % 4:
+        # DeepGEMM's PyTorch fallback keeps the initial packed allocation while
+        # shifting FP32 bits to uint8, padding, and transposing a second copy.
+        token_scales = groups * rows * cols
+        peak_bytes += max(5 * token_scales, token_scales + 2 * packed_bytes)
+    return packed_bytes, peak_bytes
+
+
+def _get_fp8_scale_workspace(
+    max_m: int, n: int, k: int, lhs_groups: int, rhs_groups: int
+) -> int:
+    scale_k = ceil_div(k, _BLOCK_SIZE)
+    if DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
+        return lhs_groups * ceil_align(max_m, 4) * scale_k * 4
+    if DEEPGEMM_SCALE_UE8M0:
+        lhs_packed, lhs_peak = _packed_scale_workspace(max_m, scale_k, lhs_groups)
+        _, rhs_peak = _packed_scale_workspace(n, scale_k, rhs_groups)
+        # RHS block scales are broadcast to token scales before packing. The
+        # int64 index tensor dies before packing; the packed LHS stays live.
+        rhs_broadcast = rhs_groups * n * scale_k * 4
+        return max(lhs_peak, lhs_packed + rhs_broadcast + max(n * 8, rhs_peak))
+    return 0
 
 
 def _empty_token_fp8(size):
