@@ -115,6 +115,31 @@ class AttentionBackend(ABC):
         Default: no-op.
         """
 
+    def prepare_host_metadata(self, fb_view) -> Optional[dict]:
+        """Optional host-eager phase for metadata glue-graph split.
+
+        When a backend's replay prep mixes host-derived plan inputs with
+        device ops, the host portion must re-run every replay (CUDA graph
+        capture only records device ops). Implementations fill static /
+        pinned buffers here and return an opaque dict of pointer-stable
+        inputs for :py:meth:`apply_device_metadata`.
+
+        Return ``None`` to fall back to the single-phase
+        :py:meth:`init_forward_metadata_out_graph` path (default).
+        """
+        return None
+
+    def apply_device_metadata(self, fb_view, host_inputs: Optional[dict]) -> None:
+        """Optional device phase for metadata glue-graph split.
+
+        Called after :py:meth:`prepare_host_metadata`. When ``host_inputs``
+        is not None, the body should only issue graph-recordable device ops
+        that read the pointer-stable buffers prepared on the host. When
+        ``host_inputs`` is None, fall back to
+        :py:meth:`init_forward_metadata_out_graph`.
+        """
+        self.init_forward_metadata_out_graph(fb_view)
+
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
         """Graph-recordable static-shape GPU op.
 
