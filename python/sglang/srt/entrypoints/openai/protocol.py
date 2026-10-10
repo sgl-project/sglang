@@ -400,6 +400,8 @@ class CompletionRequest(PDRoutingFields):
     custom_logit_processor: Optional[str] = None
 
     images_config: Optional[Dict] = None
+    # Per-request overrides handed to the multimodal processor.
+    mm_processor_kwargs: Optional[Dict] = None
 
     # Deprecated: use routed_dp_rank instead
     data_parallel_rank: Optional[int] = None
@@ -954,6 +956,10 @@ class ChatCompletionRequest(PDRoutingFields):
 
     images_config: Optional[Dict] = None
     video_config: Optional[Dict] = None
+
+    # Per-request overrides handed to the multimodal processor, e.g.
+    # `{"downsample_mode": "4x", "max_slice_nums": 4}` for MiniCPM-V.
+    mm_processor_kwargs: Optional[Dict] = None
 
     # Custom logit processor for advanced sampling control
     custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None

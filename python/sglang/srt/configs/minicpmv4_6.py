@@ -17,7 +17,7 @@ from typing import Any, Dict, Optional, Union
 from transformers import AutoConfig, PretrainedConfig
 from transformers.models.auto import CONFIG_MAPPING
 
-from sglang.srt.configs.qwen3_5 import Qwen3_5TextConfig
+from sglang.srt.configs.qwen3_5 import Qwen3_5MoeTextConfig, Qwen3_5TextConfig
 
 
 class MiniCPMV4_6VisionConfig(PretrainedConfig):
@@ -61,8 +61,12 @@ def _resolve_text_config_class(model_type: Optional[str]) -> type:
     ``CONFIG_MAPPING.get`` returns ``None`` even on hit — go through
     ``__getitem__`` to trigger the lazy class import.
     """
-    if model_type == Qwen3_5TextConfig.model_type:
-        return Qwen3_5TextConfig
+    # transformers ships both backbone configs natively, so the registration
+    # above never takes effect for them and the sglang classes have to win
+    # explicitly — the dense and MoE backbones are distinct model_types.
+    for cls in (Qwen3_5TextConfig, Qwen3_5MoeTextConfig):
+        if model_type == cls.model_type:
+            return cls
     if model_type and model_type in CONFIG_MAPPING:
         return CONFIG_MAPPING[model_type]
     raise KeyError(f"Unknown text_config model_type: {model_type!r}")

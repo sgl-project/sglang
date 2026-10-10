@@ -21,6 +21,7 @@
 # limitations under the License.
 """Inference-only MiniCPM-V model compatible with HuggingFace weights."""
 
+import re
 import types
 from array import array
 from functools import partial
@@ -45,6 +46,7 @@ from torch import nn
 from torch.nn.init import trunc_normal_
 from transformers import PretrainedConfig
 
+from sglang.srt.configs.qwen3_5 import Qwen3_5MoeTextConfig
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -68,7 +70,7 @@ from sglang.srt.models.minicpmv_vit import (
 )
 from sglang.srt.models.qwen2 import Qwen2Config, Qwen2ForCausalLM
 from sglang.srt.models.qwen3 import Qwen3Config, Qwen3ForCausalLM
-from sglang.srt.models.qwen3_5 import Qwen3_5ForCausalLM
+from sglang.srt.models.qwen3_5 import Qwen3_5ForCausalLM, Qwen3_5MoeForCausalLM
 from sglang.srt.utils import add_prefix, flatten_nested_list, get_device
 
 RawImageType = Union[Image.Image, torch.Tensor]
@@ -572,9 +574,14 @@ class Resampler4_5(BaseResampler):
 
 
 def get_version_by_config(config: PretrainedConfig) -> Tuple[int, ...]:
-    # 4.6 ships its own ``model_type`` instead of a numeric ``version``.
-    if getattr(config, "model_type", None) == "minicpmv4_6":
+    # 4.6 and 4.7 ship their own ``model_type`` instead of a numeric
+    # ``version``; the 4.7 checkpoints still carry the 4.6-era
+    # ``version: 4.1``, so ``model_type`` is the only reliable signal.
+    model_type = getattr(config, "model_type", None)
+    if model_type == "minicpmv4_6":
         return 4, 6
+    if model_type == "minicpmv4_7":
+        return 4, 7
 
     version_float = getattr(config, "version", None)
 
@@ -1390,6 +1397,10 @@ class MiniCPMV4_6(MiniCPMBaseModel):
     embedding_modules = {}
     embedding_padding_modules = []
 
+    # Versions this class implements; 4.7 reuses it with a different checkpoint
+    # layout (see ``MiniCPMV4_7``).
+    supported_versions = ((4, 6),)
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -1397,7 +1408,7 @@ class MiniCPMV4_6(MiniCPMBaseModel):
         prefix: str = "",
     ):
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
-        assert self.version == (4, 6)
+        assert self.version in self.supported_versions
         # ``Qwen3_5ForCausalLM`` returns plain hidden states (body only, no LM
         # head, no LogitsProcessor). Add them here so the downstream sampler
         # sees a ``LogitsProcessorOutput``. With ``tie_word_embeddings=True``
@@ -1421,9 +1432,17 @@ class MiniCPMV4_6(MiniCPMBaseModel):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> nn.Module:
-        # 4.6 nests the LLM config under ``text_config``.
+        # 4.6 nests the LLM config under ``text_config``. The dense and MoE
+        # backbones are distinct classes over that same config, and the MoE
+        # variant carries the expert mixin — building the dense class for a
+        # ``qwen3_5_moe_text`` config leaves every expert tensor unloaded.
+        text_config = config.text_config
+        if getattr(text_config, "model_type", None) == Qwen3_5MoeTextConfig.model_type:
+            return Qwen3_5MoeForCausalLM(
+                config=text_config, quant_config=quant_config, prefix=prefix
+            )
         return Qwen3_5ForCausalLM(
-            config=config.text_config, quant_config=quant_config, prefix=prefix
+            config=text_config, quant_config=quant_config, prefix=prefix
         )
 
     def forward(
@@ -1495,11 +1514,9 @@ class MiniCPMV4_6(MiniCPMBaseModel):
         )
         return hidden
 
-    def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        if items and items[0].format == MultimodalInputFormat.PRECOMPUTED_EMBEDDING:
-            result = torch.cat([item.feature for item in items])
-            return result.reshape(-1, result.shape[-1])
-
+    def _vision_embeddings(
+        self, items: List[MultimodalDataItem], use_vit_merger: bool
+    ) -> torch.Tensor:
         pixel_values = flatten_nested_list([item.feature for item in items])
         tgt_sizes = torch.stack(
             flatten_nested_list([item.tgt_size for item in items]), dim=0
@@ -1530,8 +1547,6 @@ class MiniCPMV4_6(MiniCPMBaseModel):
             patch_attn_mask.size(2), device=patch_attn_mask.device
         ).unsqueeze(0) < mask_shapes.unsqueeze(1)
 
-        use_vit_merger = getattr(self.config, "downsample_mode", "16x") != "4x"
-
         vision_embedding, tgt_sizes_out = self.vpm(
             all_pixel_values.type(dtype),
             patch_attention_mask=patch_attn_mask,
@@ -1539,6 +1554,36 @@ class MiniCPMV4_6(MiniCPMBaseModel):
             use_vit_merger=use_vit_merger,
         )
         return self.resampler(vision_embedding, tgt_sizes_out)
+
+    def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        if items and items[0].format == MultimodalInputFormat.PRECOMPUTED_EMBEDDING:
+            result = torch.cat([item.feature for item in items])
+            return result.reshape(-1, result.shape[-1])
+
+        default_use_vit_merger = getattr(self.config, "downsample_mode", "16x") != "4x"
+        # ``use_vit_merger`` is per request (``mm_processor_kwargs``), but the
+        # runner batches patches from several requests together. Encoding a
+        # mixed batch with one flag would apply one request's downsample mode to
+        # another's patches, so split into contiguous runs of equal flag and
+        # encode each run separately. The outputs are concatenated in item
+        # order, exactly as a single call would produce them.
+        runs: List[Tuple[bool, List[MultimodalDataItem]]] = []
+        for item in items:
+            flag = item.model_specific_data.get(
+                "use_vit_merger", default_use_vit_merger
+            )
+            if flag is None:
+                flag = default_use_vit_merger
+            flag = bool(flag)
+            if runs and runs[-1][0] == flag:
+                runs[-1][1].append(item)
+            else:
+                runs.append((flag, [item]))
+
+        return torch.cat(
+            [self._vision_embeddings(run_items, flag) for flag, run_items in runs],
+            dim=0,
+        )
 
     # Video frames take the same vision path as image patches; the mm
     # processor emits one ``MultimodalDataItem`` per patch regardless of
@@ -1606,11 +1651,62 @@ class MiniCPMV4_6(MiniCPMBaseModel):
                 weight_loader(param, loaded_weight)
 
 
+class MiniCPMV4_7(MiniCPMV4_6):
+    """MiniCPM-V 4.7 (OCR).
+
+    Same modules as 4.6 — the checkpoints only differ in how they name their
+    tensors: the OCR release keeps the sglang-style ``llm`` / ``vpm`` /
+    ``resampler`` top-level prefixes (plus a top-level ``vit_merger``) instead
+    of the ``model.{language_model,vision_tower,merger}`` nesting 4.6 uses, and
+    stores the connector MLPs as an ``nn.Sequential`` (``mlp.0`` / ``mlp.2``)
+    rather than named ``linear_1`` / ``linear_2`` layers.
+
+    ``downsample_mode`` ("16x", the default, or "4x" which keeps 4x more visual
+    tokens by skipping the mid-ViT merger) is read from the config, so it can
+    be selected per deployment with
+    ``--json-model-override-args '{"downsample_mode": "4x"}'``.
+    """
+
+    supported_versions = ((4, 7),)
+
+    @staticmethod
+    def _remap_weight_name(name: str) -> Optional[str]:
+        """OCR checkpoint tensor name -> the 4.6 name for the same parameter."""
+        if name == "llm.lm_head.weight":
+            # ``Qwen3_5ForCausalLM`` is body-only; the head lives on the
+            # wrapper, tied to the embedding for every released checkpoint.
+            return "lm_head.weight"
+        if name.startswith("llm.model."):
+            return "model.language_model." + name[len("llm.model.") :]
+        if name.startswith("vit_merger."):
+            return "model.vision_tower.vit_merger." + name[len("vit_merger.") :]
+        if name.startswith("vpm."):
+            return "model.vision_tower." + name[len("vpm.") :]
+        if name.startswith("resampler."):
+            suffix = name[len("resampler.") :]
+            suffix = re.sub(r"^mlp\.(\d+)\.mlp\.0\.", r"mlp.\1.linear_1.", suffix)
+            suffix = re.sub(r"^mlp\.(\d+)\.mlp\.2\.", r"mlp.\1.linear_2.", suffix)
+            return "model.merger." + suffix
+        return name
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        tie_word_embeddings = getattr(self.config, "tie_word_embeddings", False)
+
+        def remapped():
+            for name, weight in weights:
+                if name == "llm.lm_head.weight" and tie_word_embeddings:
+                    continue
+                yield self._remap_weight_name(name), weight
+
+        return super().load_weights(remapped())
+
+
 _SUPPORT_VERSION = {
     (2, 6): MiniCPMV2_6,
     (4, 0): MiniCPMV4_0,
     (4, 5): MiniCPMV4_5,
     (4, 6): MiniCPMV4_6,
+    (4, 7): MiniCPMV4_7,
 }
 
 
@@ -1646,11 +1742,14 @@ class MiniCPMV:
     ) -> None:
         super().__init__()
 
-        # 4.6 carries ``model_type == "minicpmv4_6"`` instead of a numeric
+        # 4.6 / 4.7 carry their own ``model_type`` instead of a numeric
         # ``config.version``; older versionless configs keep the legacy
         # ``(2, 6)`` default.
-        if getattr(config, "model_type", None) == "minicpmv4_6":
+        model_type = getattr(config, "model_type", None)
+        if model_type == "minicpmv4_6":
             version = (4, 6)
+        elif model_type == "minicpmv4_7":
+            version = (4, 7)
         elif not hasattr(config, "version"):
             version = (2, 6)
         else:
@@ -1751,4 +1850,12 @@ class MiniCPMV4_6ForConditionalGeneration(MiniCPMV):
     pass
 
 
-EntryClass = [MiniCPMV, MiniCPMV4_6ForConditionalGeneration]
+class MiniCPMV4_7ForConditionalGeneration(MiniCPMV):
+    pass
+
+
+EntryClass = [
+    MiniCPMV,
+    MiniCPMV4_6ForConditionalGeneration,
+    MiniCPMV4_7ForConditionalGeneration,
+]
