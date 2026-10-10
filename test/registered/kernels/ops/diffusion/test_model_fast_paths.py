@@ -1966,5 +1966,46 @@ def test_qwen21_vae_optimizer_passes_other_vaes_through():
     )
 
 
+@pytest.mark.skipif(torch.version.hip is not None, reason="NVIDIA CUDA required")
+def test_anima_rope_dispatch_and_fallback():
+    import sglang.kernels.ops.diffusion as ops
+    import sglang.multimodal_gen.runtime.models.dits.anima as anima
+
+    generator = torch.Generator(device="cuda").manual_seed(42)
+    q, k = [
+        torch.randn(
+            2, 17, 3, 128, device="cuda", dtype=torch.bfloat16, generator=generator
+        )
+        for _ in range(2)
+    ]
+    angles = torch.randn(17, 128, device="cuda", generator=generator)
+    cos, sin = angles.cos(), angles.sin()
+    args = q, k, cos, sin
+    expected = anima._anima_rope_eager(*args)
+    expected_fp32 = anima._anima_rope_eager(q.float(), k.float(), cos, sin)
+    gate = BitExactFusionGate("Anima test", per_signature=True)
+    with (
+        patch.object(anima, "_ANIMA_ROPE", gate),
+        patch.object(
+            ops, "fused_rope_rotate_half_fp32", wraps=ops.fused_rope_rotate_half_fp32
+        ) as fused,
+        patch.object(
+            anima, "_anima_rope_eager", wraps=anima._anima_rope_eager
+        ) as eager,
+    ):
+        for _ in range(2):
+            outputs = anima._anima_rope(*args)
+            assert all(torch.equal(out, ref) for out, ref in zip(outputs, expected))
+        assert fused.call_count == 2
+        assert eager.call_count == 1  # Only the first call verifies against eager.
+        assert gate.is_verified((q.device, q.dtype, q.shape)) and not gate.disabled
+
+        fused.reset_mock()
+        outputs = anima._anima_rope(q.float(), k.float(), cos, sin)
+        fused.assert_not_called()
+        assert eager.call_count == 2
+        assert all(torch.equal(out, ref) for out, ref in zip(outputs, expected_fp32))
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

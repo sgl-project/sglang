@@ -17,6 +17,7 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 class _SwaCache(RadixCache):
     def __init__(self, *, auxiliary=False):
+        self.disable = False
         self.sliding_window_size = 128
         self.page_size = 16
         self.req_to_token_pool = SimpleNamespace(
@@ -47,7 +48,7 @@ class TestSWAEvictionInterval(unittest.TestCase):
             with (
                 self.subTest(protected=protected, shield=shield, auxiliary=auxiliary),
                 envs.SGLANG_SWA_EVICTION_INTERVAL.override(128),
-                envs.SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW.override(False),
+                envs.SGLANG_OPT_RELEASE_PREFILL_SWA.override(False),
             ):
                 cache = _SwaCache(auxiliary=auxiliary)
                 req = SimpleNamespace(
@@ -113,7 +114,7 @@ class TestSWAEvictionInterval(unittest.TestCase):
             patch("sglang.srt.managers.schedule_batch._is_hip", True),
             envs.SGLANG_AMD_USE_FLYDSL_MEGA_MOE.override(True),
             envs.SGLANG_SWA_EVICTION_INTERVAL.override(128),
-            envs.SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW.override(False),
+            envs.SGLANG_OPT_RELEASE_PREFILL_SWA.override(False),
         ):
             batch.maybe_evict_swa()
             free.assert_not_called()

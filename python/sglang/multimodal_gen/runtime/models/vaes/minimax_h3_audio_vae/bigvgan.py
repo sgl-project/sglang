@@ -3,13 +3,19 @@
 #   Licensed under the MIT license.
 
 # Adapted from https://github.com/jik876/hifi-gan under the MIT license.
+#
+# The alias-free resampling primitives (LowPassFilter1d/UpSample1d/
+# DownSample1d/Activation1d) are architecture-agnostic DSP building blocks
+# shared with the sibling ``kandinsky6_audio_vae/bigvgan.py`` -- both import
+# ``Activation1d`` from ``runtime/models/vaes/alias_free.py`` (sibling of
+# this package, alongside ``common.py``) instead of each keeping its own copy.
 
 import torch
 import torch.nn as nn
 from torch.nn import Conv1d, ConvTranspose1d, Parameter
 from torch.nn.utils.parametrizations import weight_norm
 
-from .alias_free import Activation1d
+from sglang.multimodal_gen.runtime.models.vaes.alias_free import Activation1d
 
 
 def get_padding(kernel_size, dilation=1):
@@ -43,7 +49,6 @@ class SnakeBeta(nn.Module):
 
         self.alpha.requires_grad = alpha_trainable
         self.beta.requires_grad = alpha_trainable
-        self.no_div_by_zero = 0.000000001
 
     def forward(self, x):
         alpha = self.alpha.unsqueeze(0).unsqueeze(-1)

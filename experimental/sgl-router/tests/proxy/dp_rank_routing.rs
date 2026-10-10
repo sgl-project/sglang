@@ -12,12 +12,13 @@ use serde_json::json;
 use sgl_router::config::{Config, PolicyKind, StickyConfig, StickyFallbackKind};
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
 use sgl_router::policies::factory::build_registry;
-use sgl_router::policies::prefix_provider::RadixTreePrefixProvider;
 use sgl_router::policies::request_tokens_for;
 use sgl_router::proxy::Proxy;
 use sgl_router::server::app::build_router;
 use sgl_router::server::app_context::AppContext;
-use sgl_router::state::kv_events::{compute_block_hashes, BlockSizeOracle, HashTree, KvWorkerId};
+use sgl_router::state::kv_events::{
+    compute_block_hashes, BlockSizeOracle, HashTree, KvWorkerId, RadixTreePrefixProvider,
+};
 use sgl_router::tokenizer::TokenizerRegistry;
 use sgl_router::workers::{EngineProfile, WireProtocol, WorkerRegistry};
 use tower::ServiceExt;
@@ -57,10 +58,12 @@ fn router(
             model_ids: vec![ModelId(MODEL.into())],
             bootstrap_port: (mode == WorkerMode::Prefill).then_some(8998),
             version_group: None,
+            services: Default::default(),
         };
         let profile = EngineProfile {
             protocol: WireProtocol::default(),
             dp_ranks,
+            openai: None,
         };
         registry.add_with_cb(spec, None, profile).unwrap();
     }
@@ -226,6 +229,10 @@ async fn pd_fan_out_leaves_the_prefill_rank_to_the_engine() {
     for (path, mut body) in [
         ("/v1/chat/completions", chat),
         ("/generate", json!({"text": ["a", "b"]})),
+        (
+            "/v1/completions",
+            json!({"model": MODEL, "prompt": ["a", "b"]}),
+        ),
     ] {
         // A caller's rank is replaced too.
         body["routed_dp_rank"] = 3.into();

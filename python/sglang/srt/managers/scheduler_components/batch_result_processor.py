@@ -126,7 +126,7 @@ class SchedulerBatchResultProcessor:
                 req.time_stats.set_quick_finish_time()
                 if get_memory().enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
-                release_kv_cache(req, self.tree_cache)
+                release_kv_cache(req, self.tree_cache, checkpoint=True)
 
         # Note: Logprobs should be handled on the prefill engine.
         self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
@@ -374,10 +374,12 @@ class SchedulerBatchResultProcessor:
                         if sampling_mask_finish_reason is None:
                             self._maybe_collect_routed_experts(req)
                             self._maybe_collect_indexer_topk(req)
+                        if batch.decoding_reqs and req in batch.decoding_reqs:
+                            self._prepare_kv_cache_release(req)
                         release_kv_cache(
                             req,
                             self.tree_cache,
-                            is_insert=sampling_mask_finish_reason is None,
+                            checkpoint=sampling_mask_finish_reason is None,
                         )
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
@@ -469,7 +471,7 @@ class SchedulerBatchResultProcessor:
                     req.update_finish_state()
 
                     if req.finished():
-                        release_kv_cache(req, self.tree_cache)
+                        release_kv_cache(req, self.tree_cache, checkpoint=True)
                         req.time_stats.set_completion_time()
                     else:
                         checkpoint_kv_cache(req, self.tree_cache)
@@ -1323,6 +1325,14 @@ class SchedulerBatchResultProcessor:
             "InternalServerError",
         )
 
+    def _prepare_kv_cache_release(self, req: Req) -> None:
+        # Only workers that keep KV outside the pool (MLX) define the hook.
+        prepare_release = getattr(
+            self.model_worker, "prepare_for_kv_cache_release", None
+        )
+        if callable(prepare_release):
+            prepare_release(req)
+
     def _handle_sampling_mask_abort(self, req: Req) -> None:
         """Release a request whose sampled token must not be committed."""
         if req.multimodal_inputs is not None and req.session is None:
@@ -1332,12 +1342,8 @@ class SchedulerBatchResultProcessor:
         else:
             if get_memory().enable_hisparse:
                 self.hisparse_coordinator.request_finished(req)
-            prepare_release = getattr(
-                self.model_worker, "prepare_for_kv_cache_release", None
-            )
-            if callable(prepare_release):
-                prepare_release(req)
-            release_kv_cache(req, self.tree_cache, is_insert=False)
+            self._prepare_kv_cache_release(req)
+            release_kv_cache(req, self.tree_cache, checkpoint=False)
         req.time_stats.set_completion_time()
 
     def _handle_finish_state_updated_req(
@@ -1377,7 +1383,7 @@ class SchedulerBatchResultProcessor:
                 and known_mamba_boundary
                 and req.kv.mamba_next_track_idx == req.kv.mamba_last_track_idx
             ):
-                req.mamba_lazy_is_insert = False
+                req.mamba_lazy_checkpoint = False
 
         # Called here (after update_finish_state) so req.finished() is valid
         # for mamba_lazy_post_decode_at_boundary inside.
@@ -1419,17 +1425,13 @@ class SchedulerBatchResultProcessor:
             else:
                 if get_memory().enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
-                prepare_release = getattr(
-                    self.model_worker, "prepare_for_kv_cache_release", None
-                )
-                if callable(prepare_release):
-                    prepare_release(req)
-                is_insert = (
-                    req.mamba_lazy_is_insert
+                self._prepare_kv_cache_release(req)
+                checkpoint = (
+                    req.mamba_lazy_checkpoint
                     if get_exec().mamba.enable_mamba_extra_buffer_lazy
                     else True
                 )
-                release_kv_cache(req, self.tree_cache, is_insert=is_insert)
+                release_kv_cache(req, self.tree_cache, checkpoint=checkpoint)
 
             req.time_stats.set_completion_time()
 
@@ -1552,7 +1554,7 @@ class SchedulerBatchResultProcessor:
                 or keep_written_by_this_step
                 or keep_may_be_written_in_flight
             ):
-                req.mamba_lazy_is_insert = False
+                req.mamba_lazy_checkpoint = False
             return
 
         if not crossed or planned_pos is None:
