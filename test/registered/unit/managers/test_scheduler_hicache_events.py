@@ -26,6 +26,7 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
         s.scheduler_stage_metrics = None
         s.enable_hierarchical_cache = True
         s.enable_unified_cache_external_linker = False
+        s.enable_lmcache = False
         s.enable_hicache_storage = True
         s.tree_cache = SimpleNamespace(check_hicache_events=self.calls.drain)
         s._process_storage_prefetch_retries = self.calls.retry
@@ -123,7 +124,8 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
         s.running_mbs = [self.running_batch]
         s.last_mbs = [None]
         s.ingest_requests = Mock(return_value=[])
-        s._pp_pd_get_bootstrapped_ids = Mock(return_value=[])
+        s.waiting_queue = []
+        s.disagg_prefill_bootstrap_queue = SimpleNamespace(pop_bootstrapped=lambda: [])
         s._pp_pd_get_prefill_transferred_ids = Mock(return_value=[])
         s._pp_commit_comm_work = Mock()
         s.get_new_batch_prefill = self.calls.admit

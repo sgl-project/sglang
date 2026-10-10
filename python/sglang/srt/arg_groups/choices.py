@@ -4,6 +4,7 @@ LOAD_FORMAT_CHOICES = [
     "auto",
     "pt",
     "safetensors",
+    "instanttensor",
     "npcache",
     "dummy",
     "sharded_state",
@@ -128,7 +129,7 @@ DISAGG_TRANSFER_BACKEND_CHOICES = [
 
 GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
 
-SAMPLING_BACKEND_CHOICES = {"flashinfer", "pytorch", "ascend"}
+SAMPLING_BACKEND_CHOICES = {"flashinfer", "pytorch", "ascend", "intel_xpu"}
 
 MOE_RUNNER_BACKEND_CHOICES = [
     "auto",
