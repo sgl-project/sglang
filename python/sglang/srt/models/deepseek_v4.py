@@ -108,7 +108,7 @@ from sglang.srt.layers.moe.utils import (
     should_skip_post_experts_all_reduce,
     uses_per_rank_fused_shared_slots,
 )
-from sglang.srt.layers.mori_gemm_ar import fused_wo_b
+from sglang.srt.layers.mori_gemm_ar import fused_wo_b, prepare_wo_b_weight
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
 from sglang.srt.layers.quantization.fp8_utils import (
     Mxfp8DenseGemmBackend,
@@ -2634,6 +2634,9 @@ class MQALayer(MqaAttentionBase):
         o_in = o.flatten(1) if isinstance(o, torch.Tensor) else o
         # Fusing *performs* the all-reduce, where a deferred one is skipped so
         # the mHC post can fold it in -- a correctness constraint, not a gap.
+        # `defer_all_reduce` being false is not on its own a licence to fuse:
+        # it is also false when the layer reduces over another group or not at
+        # all. `fused_wo_b` checks that for itself against the layer.
         fused_o = None if defer_all_reduce else fused_wo_b(self.wo_b, o_in)
         if fused_o is not None:
             o = fused_o
@@ -4795,6 +4798,11 @@ class DeepseekV4ForCausalLM(nn.Module):
             ):
                 self_attn.indexer.compressor.apply_ape_hotfix()
             layer.refresh_mhc_norm_weight_cache()
+            # Before the memory profiler sizes the KV cache: the fused wo_b
+            # keeps a second, re-laid-out copy of this weight, and building it
+            # on the first fused call would allocate it behind the profiler's
+            # back.
+            prepare_wo_b_weight(self_attn.wo_b)
         layers = self.model.layers
         for i, layer in enumerate(layers):
             if isinstance(layer, DeepseekV4DecoderLayer):

@@ -30,11 +30,15 @@ fusing is worth it at this shape.
 from __future__ import annotations
 
 import logging
-import os
 
 import torch
 import triton
 import triton.language as tl
+
+# Module scope, not inside the kernel: Triton resolves a called `@triton.jit`
+# function when it compiles the caller's AST, and a local import does not
+# reliably reach it.
+from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import fp8_grid_quant
 from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
@@ -134,7 +138,7 @@ def _mxfp8_quant_packed_kernel(
     sqk,
     BLOCK_M: tl.constexpr,
 ):
-    """sglang's ``_mxfp8_quant_kernel`` writing mori's scale layout directly.
+    """``fp8_grid_quant`` writing mori's scale layout directly.
 
     A variant rather than a stride argument on the original, because the layout
     is not expressible as strides: mori wants element ``(m, kb)`` at
@@ -143,6 +147,15 @@ def _mxfp8_quant_packed_kernel(
 
     Free here: the destination stays inside the 64 bytes this program already
     owns, so only the store's order changes.
+
+    The scale rule is imported rather than restated. This used to carry its own
+    copy of it -- ``ceil(log2(amax / 448))`` -- which is not the same function:
+    ``fp8_grid_quant`` reads the exponent off the IEEE bits and is therefore
+    exact when ``amax / 448`` is a power of two, where an approximate ``log2``
+    can land just above the integer and ``ceil`` then picks one exponent too
+    high. Both rules agreeing is exactly what ``fused_wo_b``'s claim that
+    re-quantising an ``Fp8GridActivation`` is lossless rests on, so there must
+    be one of them.
     """
     pid_m = tl.program_id(0)
     pid_b = tl.program_id(1)
@@ -154,11 +167,7 @@ def _mxfp8_quant_packed_kernel(
         mask=m_mask[:, None],
         other=0.0,
     ).to(tl.float32)
-    amax = tl.maximum(tl.max(tl.abs(x), axis=1), 1e-30)
-    sb = tl.ceil(tl.log2(amax / 448.0)) + 127.0
-    sb = tl.minimum(tl.maximum(sb, 0.0), 254.0)
-    descale = tl.exp2(sb - 127.0)
-    xq = tl.clamp(x / descale[:, None], -448.0, 448.0).to(xq_ptr.dtype.element_ty)
+    xq, sb = fp8_grid_quant(x)
     tl.store(
         xq_ptr + offs_m[:, None] * sqm + offs_k[None, :] * sqk,
         xq,
@@ -210,21 +219,19 @@ _MIN_PAD_FILL = 0.80
 _state: _FusedWoB | None = None
 _disabled = False
 _warned_layout = False
-_warned_reject = False
+_warned_window = False
 _mori_ok: bool | None = None
+_switch_on: bool | None = None
 
-#: M is the token count of one forward, not of one request, so whether the
-#: fused path engages depends on how the scheduler batches it.
-_SHAPE_LOG = os.environ.get("SGLANG_OPT_FUSED_WO_B_AR_SHAPE_LOG") == "1"
 _shape_hist: dict = {}
 _shape_calls = 0
 #: 61 wo_b calls make one forward, so this logs roughly every ten of them.
 _SHAPE_EVERY = 610
 
 
-def _record_shape(m, eligible, world_size):
+def _record_shape(m, m_pad, eligible):
     global _shape_calls
-    key = (m, _padded_m(m, world_size), bool(eligible))
+    key = (m, m_pad, bool(eligible))
     _shape_hist[key] = _shape_hist.get(key, 0) + 1
     _shape_calls += 1
     if _shape_calls >= _SHAPE_EVERY:
@@ -259,6 +266,28 @@ def _shuffled_once():
         return True
     _logged_config = True
     return False
+
+
+def prepare_wo_b_weight(layer) -> None:
+    """Build this layer's fused B operand now, at weight-processing time.
+
+    ``mori_weight`` re-lays the weight out, which is a full second copy of it
+    -- the original stays, because decode and every declined call still read
+    it. Doing that lazily on the first fused call allocated it *while serving*,
+    after the memory profiler had already sized the KV cache around its
+    absence: 61 layers of it, about 1.3 GiB at TP2. Preparing here puts it in
+    front of the profiler instead, and turns a mid-serving OOM into one at
+    startup.
+
+    Best effort on purpose. A failure here leaves ``_mori_b`` unset, the per
+    call path falls back to building it, and that path is identical on every
+    rank -- so this is not a place where ranks can disagree.
+    """
+    if not fused_wo_b_available() or not _reduces_over_tp_group(layer):
+        return
+    if not mxfp8_ready(layer) or not hasattr(layer, "weight_scale_mx_e8m0"):
+        return
+    mori_weight(layer)
 
 
 def _fused_weight(layer):
@@ -331,9 +360,7 @@ class _FusedWoB:
                 m_max=m_max,
                 quant="mxfp8",
                 gather_dtype=gather_dtype,
-                gather_transport=os.environ.get(
-                    "SGLANG_OPT_FUSED_WO_B_AR_GATHER_TRANSPORT", "lsa"
-                ),
+                gather_transport=envs.SGLANG_OPT_FUSED_WO_B_AR_GATHER_TRANSPORT.get(),
             )
             # Prove the collective moves bytes before serving a token. A mori
             # built with BUILD_CCO_SDMA=OFF compiles the puts out: the kernels
@@ -364,25 +391,118 @@ class _FusedWoB:
     def run(self, q_input, x_scale_raw, weight, weight_scale) -> torch.Tensor:
         return self.op(q_input, weight, x_scale_raw, weight_scale)
 
+    def close(self) -> None:
+        """Release the communicator's VMM reservation.
+
+        Used when a peer failed to construct: this rank's op is sound but
+        useless, and the reservation is a per-process cost for the lifetime of
+        the server whether or not anything calls it.
+        """
+        self.op = None
+        self._comm_ctx.__exit__(None, None, None)
+
+
+def _construct_collectively(m_max: int, n: int, k: int) -> bool:
+    """Build the op on every rank, or disable the path on every rank.
+
+    The decision has to be collective. mori's phases end in device-side
+    cross-rank barriers, so a rank that builds and uses the op while a peer
+    fell back to the split path spins on the GPU forever: no timeout, no
+    error, a hung server. That is what a rank-local ``_disabled`` produced.
+
+    Rank-local failures are realistic -- an OOM in ``Communicator.init``'s VMM
+    reservation, or in ``self_test``'s buffers -- so this agrees on the outcome
+    over the CPU group before any rank is allowed to call the op, and the ranks
+    that *succeeded* tear their communicator down again when a peer did not.
+
+    Construction is attempted once per process. A failure disables the path for
+    good rather than being retried: every retry is another broadcast, another
+    multi-hundred-MiB VMM reservation and another teardown, 61 times a forward.
+    """
+    global _state, _disabled
+
+    import torch.distributed as dist
+
+    from sglang.srt.distributed import get_tp_group
+
+    tp = get_tp_group()
+    state = None
+    err = None
+    try:
+        state = _FusedWoB(m_max=m_max, n=n, k=k)
+    except Exception as exc:  # noqa: BLE001 - reported below, then disabled
+        err = exc
+
+    ok = torch.tensor([0 if err is not None else 1], dtype=torch.int32)
+    dist.all_reduce(ok, op=dist.ReduceOp.MIN, group=tp.cpu_group)
+    if int(ok.item()) == 1:
+        _state = state
+        return True
+
+    _disabled = True
+    if state is not None:
+        state.close()
+    if err is not None:
+        logger.warning(
+            "mori fused wo_b could not be constructed on rank %d; the fused "
+            "path is off for this process on every rank: %s",
+            tp.rank_in_group,
+            err,
+        )
+    else:
+        logger.warning(
+            "mori fused wo_b could not be constructed on a peer rank; the "
+            "fused path is off for this process on every rank"
+        )
+    return False
+
 
 def _window_m_max(m_pad: int, world_size: int) -> int:
     """Rows the symmetric window is sized for.
 
-    Taken from the chunked-prefill limit rather than the first request seen, so
-    a short prompt arriving first cannot fix a window too small for a full chunk
-    later -- the window cannot grow once allocated.
-    """
-    # `get_global_server_args()` is retired; the scheduling namespace carries
-    # the value in effect, which is what the other layers read.
-    from sglang.srt.runtime_context import get_schedule
+    Taken from the deployment's prefill ceiling rather than the first request
+    seen, because the window cannot grow once allocated: a short prompt
+    arriving first would otherwise fix a window too small for everything after
+    it, and every later call would silently fall back for the life of the
+    process.
 
-    limit = get_schedule().chunked_prefill_size
-    if limit is not None and limit > 0:
-        return max(m_pad, _padded_m(limit, world_size))
+    ``max_prefill_buffer_tokens`` is what the other buffer-sizing callers here
+    use, and it answers in the cases a bare ``chunked_prefill_size`` does not
+    -- chunked prefill disabled, and PP dynamic chunking, which probes above
+    the chunk size. Its own zero case falls through to ``max_prefill_tokens``,
+    the same way ``disaggregation/common/conn.py`` does it.
+    """
+    from sglang.srt.runtime_context import get_schedule, max_prefill_buffer_tokens
+
+    limit = max_prefill_buffer_tokens() or get_schedule().max_prefill_tokens
+    if limit:
+        return max(m_pad, _padded_m(int(limit), world_size))
+    # Nothing declares a ceiling. Sizing from this call is then the only option
+    # left, and `_warn_once_over_window` reports it if a later M outgrows it.
     return m_pad
 
 
-def _eligible(m: int, n: int, k: int, world_size: int) -> bool:
+def _warn_once_over_window(m_pad: int, m_max: int) -> None:
+    """Report the first M the window cannot hold.
+
+    Declining is correct -- the window cannot grow -- but it is also permanent
+    for every M at least this large, so it should not be silent. One line,
+    because it then repeats on most prefills.
+    """
+    global _warned_window
+    if _warned_window:
+        return
+    _warned_window = True
+    logger.warning(
+        "mori fused wo_b: M=%d exceeds the window's %d rows, falling back for "
+        "this and any larger M; size it with --chunked-prefill-size or "
+        "--max-prefill-tokens. Further declines are silent.",
+        m_pad,
+        m_max,
+    )
+
+
+def _eligible(m: int, m_pad: int, n: int, k: int, world_size: int) -> bool:
     """Whether fusing is both expressible and worth it at this shape.
 
     mori's ``supports`` answers the first; the thresholds here answer the
@@ -397,8 +517,55 @@ def _eligible(m: int, n: int, k: int, world_size: int) -> bool:
         if envs.SGLANG_OPT_FUSED_WO_B_AR_FP8_GATHER.get()
         else _MIN_FUSED_M
     )
-    m_pad = _padded_m(m, world_size)
     return m_pad >= floor and m >= _MIN_PAD_FILL * m_pad
+
+
+def _reduces_over_tp_group(layer) -> bool:
+    """Whether this layer's own all-reduce is the one the op would perform.
+
+    Fusing *performs* the all-reduce, so it is a substitute only where the
+    split path would have done the same one. The op always reduces over the
+    full TP group, while ``wo_b`` is declared ``parallel_group="attn_tp"`` --
+    the same ranks only when attention is not data-parallel. Under
+    ``--attn-dp-size 8`` the attn-TP group is one rank, the split path reduces
+    nothing, and fusing would sum rows belonging to eight unrelated DP ranks.
+
+    The conditions are ``RowParallelLinear.forward``'s own, read off the layer
+    rather than restated at the call site. That is where the previous version
+    got it wrong: the caller gated ``defer_all_reduce`` and let everything
+    making *that* false through to the fused path, including the cases where
+    the layer reduces over another group or does not reduce at all.
+
+    Static -- true or false for the life of the process -- so weight prep can
+    ask it too. ``_substitutes_layer_all_reduce`` adds the per-forward flag.
+
+    Not checked: ``quantize_communications`` would make the split path's reduce
+    numerically different, but it is rejected at startup on anything but NPU.
+    ``skip_all_reduce`` is the caller's own argument, and it passes False
+    whenever it reaches here.
+    """
+    from sglang.srt.distributed import get_tp_group
+    from sglang.srt.distributed.utils import get_group_rank_size
+
+    _, tp_size = get_group_rank_size(layer.tp_group)
+    if not (layer.reduce_results and tp_size > 1):
+        return False
+    # Both of these reduce over the attn-TP group instead.
+    if layer.use_decode_attn_tp or layer.use_dp_attention_reduce:
+        return False
+    # Equal size would do while attn_tp is a subgroup of tp, but comparing the
+    # ranks says what is meant and does not rest on that staying true.
+    return tuple(layer.tp_group.ranks) == tuple(get_tp_group().ranks)
+
+
+def _substitutes_layer_all_reduce(layer) -> bool:
+    """``_reduces_over_tp_group`` plus the flags that vary per forward."""
+    from sglang.srt.layers.moe.utils import should_skip_mlp_all_reduce
+
+    # The mHC post folds the reduce in; the split path skips it here.
+    if should_skip_mlp_all_reduce():
+        return False
+    return _reduces_over_tp_group(layer)
 
 
 def _mori_has_gemm_ar() -> bool:
@@ -426,12 +593,20 @@ def _mori_has_gemm_ar() -> bool:
 
 
 def fused_wo_b_available() -> bool:
-    """Static gate, cheap enough to call per layer."""
-    return (
-        not _disabled
-        and envs.SGLANG_OPT_FUSED_WO_B_AR.get()
-        and _mori_has_gemm_ar()
-    )
+    """Static gate, called for every layer of every forward.
+
+    The switch is memoised because it cannot change after startup and this sits
+    on the per-layer path of decode and of non-ROCm runs alike, where it was an
+    env lookup per call to return False 61 times a forward. ``_disabled`` stays
+    dynamic -- it is what a collective construction failure sets -- and is
+    checked first so the off path is one bool.
+    """
+    global _switch_on
+    if _disabled:
+        return False
+    if _switch_on is None:
+        _switch_on = envs.SGLANG_OPT_FUSED_WO_B_AR.get()
+    return _switch_on and _mori_has_gemm_ar()
 
 
 def fused_wo_b(layer, x: torch.Tensor) -> torch.Tensor | None:
@@ -450,6 +625,9 @@ def fused_wo_b(layer, x: torch.Tensor) -> torch.Tensor | None:
 
     from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import Fp8GridActivation
     from sglang.srt.distributed import get_tp_group
+
+    if not _substitutes_layer_all_reduce(layer):
+        return None
 
     # wo_a hands wo_b either a plain bf16 activation or an Fp8GridActivation --
     # a bf16 tensor already rounded onto wo_b's fp8 grid, so quantising it below
@@ -471,57 +649,52 @@ def fused_wo_b(layer, x: torch.Tensor) -> torch.Tensor | None:
     if w_k != k:
         return None
     world_size = get_tp_group().world_size
-    eligible = _eligible(m, n, k, world_size)
-    if _SHAPE_LOG:
-        _record_shape(m, eligible, world_size)
+    # Computed once and threaded through: it was recomputed in `_eligible`, in
+    # `_record_shape` and again below, and it is a call into mori.
+    m_pad = _padded_m(m, world_size)
+    eligible = _eligible(m, m_pad, n, k, world_size)
+    # M is the token count of one forward, not of one request, so whether the
+    # fused path engages depends on how the scheduler batches it. Read per call
+    # rather than at import, so `envs....override()` in a test is honoured.
+    if envs.SGLANG_OPT_FUSED_WO_B_AR_SHAPE_LOG.get():
+        _record_shape(m, m_pad, eligible)
     if not eligible:
         return None
 
-    m_pad = _padded_m(m, world_size)
-    try:
-        if _state is None:
-            _state = _FusedWoB(
-                m_max=_window_m_max(m_pad, world_size),
-                n=n,
-                k=k,
-            )
-        if m_pad > _state.m_max or n != _state.n or k != _state.k:
-            return None
-        prepared = _fused_weight(layer)
-        if prepared is None:
-            return None
-        weight, b_scale = prepared
-        x_in = x if m_pad == m else _state.pad_rows(x, m_pad)
-        # The quantiser writes mori's packed scale layout itself, so there is no
-        # conversion pass after it. Zero-padded rows quantise to zero values
-        # (their scale is tiny but finite), and rows are independent in a GEMM,
-        # so the padding contributes nothing to any real row.
-        q_input, x_scale = quantize_packed(x_in)
-        out = _state.run(q_input, x_scale, weight, b_scale)
-        out = out[:m]
-    except ValueError as err:
-        # A shape or contract rejection is about *this call*, not about the
-        # path. Disabling the process on one would be a standing hazard: the op
-        # raises ValueError for an M it cannot serve, and a server's M changes
-        # with every batch, so one unlucky shape used to switch the whole
-        # optimisation off for good.
-        global _warned_reject
-        if not _warned_reject:
-            _warned_reject = True
-            logger.warning(
-                "mori fused wo_b declined a call and fell back for it; further "
-                "declines are silent: %s",
-                err,
-            )
+    if _state is None and not _construct_collectively(
+        _window_m_max(m_pad, world_size), n, k
+    ):
         return None
-    except Exception as err:  # noqa: BLE001 - anything else is not per-call
-        _disabled = True
-        logger.warning(
-            "mori fused wo_b failed and is disabled for this process; "
-            "falling back to the split path: %s",
-            err,
-        )
+
+    # Every reason to decline a call is a check here rather than an exception
+    # caught below, and every one of them reads the same on all ranks -- the
+    # shape is identical across a TP group, and `_substitutes_layer_all_reduce`
+    # has already excluded the configurations where it is not. That matters
+    # more than it looks: declining on one rank and fusing on another hangs the
+    # group on mori's device-side barriers.
+    if m_pad > _state.m_max:
+        _warn_once_over_window(m_pad, _state.m_max)
         return None
+    if n != _state.n or k != _state.k:
+        return None
+    prepared = _fused_weight(layer)
+    if prepared is None:
+        return None
+    weight, b_scale = prepared
+
+    # Past this point there is no fallback, deliberately. An OOM in pad_rows or
+    # quantize_packed is rank-local, and `run` is collective: returning None
+    # from either would put this rank on the split path while its peers sit in
+    # mori's barriers, which is a silent hang rather than a visible failure. A
+    # process that dies is the better outcome and is what the caller can see.
+    x_in = x if m_pad == m else _state.pad_rows(x, m_pad)
+    # The quantiser writes mori's packed scale layout itself, so there is no
+    # conversion pass after it. Zero-padded rows quantise to zero values (their
+    # scale is tiny but finite), and rows are independent in a GEMM, so the
+    # padding contributes nothing to any real row.
+    q_input, x_scale = quantize_packed(x_in)
+    out = _state.run(q_input, x_scale, weight, b_scale)
+    out = out[:m]
 
     if envs.SGLANG_DEBUG_FUSED_WO_B_AR.get():
         if not _shuffled_once():
