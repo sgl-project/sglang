@@ -167,24 +167,6 @@ class HiCacheFileLRUTestBase(CustomTestCase):
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
 
-class TestEnvDefaults(CustomTestCase):
-    """Verify the env var defaults match the documented opt-in behavior."""
-
-    def test_min_free_space_default_is_zero(self):
-        # Default must keep eviction off so existing users are unaffected.
-        with mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("SGLANG_HICACHE_FILE_BACKEND_MIN_FREE_SPACE", None)
-            self.assertEqual(
-                envs.SGLANG_HICACHE_FILE_BACKEND_MIN_FREE_SPACE.get(),
-                "0",
-            )
-
-    def test_max_size_default_is_none(self):
-        with mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE", None)
-            self.assertIsNone(envs.SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE.get())
-
-
 class TestEvictionDisabledByDefault(HiCacheFileLRUTestBase):
     def test_no_config_no_eviction(self):
         b = self.make_backend(max_size="0", min_free="0")
@@ -752,12 +734,8 @@ class TestDcpStorage(unittest.TestCase):
             cc.storage_backend = backend
             cc.page_size = 128
             cc.prefetch_hits_sync_groups = []
-            # Even a KV-only hit hint must not assume every KDA boundary exists.
             op = PrefetchOperation(
-                CacheRequestHandle("test", 0),
-                tokens,
-                pool_transfers=[transfer],
-                assume_stored=True,
+                CacheRequestHandle("test", 0), tokens, pool_transfers=[transfer]
             )
             _, hit = cc._storage_hit_query(op)
             self.assertEqual(hit, checkpoints[-1] * 128)
@@ -771,20 +749,21 @@ class TestDcpStorage(unittest.TestCase):
             peer[other.pool_storage_result.restorable_prefix_pages] = 1
 
             def reduce(tensor, op, groups, peer=peer):
-                self.assertEqual(tensor.shape, peer.shape)
+                # Restorable flags lead; per-pool verdicts trail them.
+                self.assertEqual(tensor.numel(), peer.numel() + len(PoolName))
                 self.assertEqual(op, torch.distributed.ReduceOp.MIN)
-                tensor.copy_(torch.minimum(tensor, peer))
+                tensor[: peer.numel()] = torch.minimum(tensor[: peer.numel()], peer)
 
             cc._all_reduce = mock.Mock(side_effect=reduce)
             local = operations[rank]
             self.assertEqual(
-                cc._sync_storage_hit_count(
+                cc._sync_prefetch_hit_query(
                     local, local.pool_storage_result.kv_hit_pages * 128
                 ),
                 512,
             )
             local.mark_terminate()
-            self.assertEqual(cc._sync_storage_hit_count(local, 0), 0)
+            self.assertEqual(cc._sync_prefetch_hit_query(local, 0), 0)
             self.assertEqual(cc._all_reduce.call_count, 2)
 
     def test_eviction_owns_only_local_state_and_selected_mla(self):

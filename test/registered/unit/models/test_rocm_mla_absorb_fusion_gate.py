@@ -23,6 +23,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 _CAN_FUSE = forward_mla_rocm._can_fuse_bmm_rope_cat_and_cache
+_ABSORB_CONFIG = forward_mla_rocm._absorb_bmm_config
 
 
 def _attn(**overrides):
@@ -88,6 +89,40 @@ class TestFusedAbsorbGate(CustomTestCase):
         ):
             with self.subTest(term=name):
                 self.assertFalse(_CAN_FUSE(_attn(**{name: broken})))
+
+
+class TestAbsorbBmmConfig(CustomTestCase):
+    def setUp(self):
+        self._saved = forward_mla_rocm._absorb_bmm_num_cu
+        forward_mla_rocm._absorb_bmm_num_cu = 256
+        self.addCleanup(
+            setattr,
+            forward_mla_rocm,
+            "_absorb_bmm_num_cu",
+            self._saved,
+        )
+
+    def test_decode_tiles(self):
+        cases = (
+            ((16, 1, 512), (16, 32, 1)),
+            ((16, 48, 512), (16, 128, 1)),
+            ((16, 200, 512), (32, 128, 2)),
+        )
+        for args, expected in cases:
+            with self.subTest(args=args):
+                config = _ABSORB_CONFIG(*args)
+                self.assertEqual(
+                    (
+                        config["BLOCK_SIZE_M"],
+                        config["BLOCK_SIZE_N"],
+                        config["waves_per_eu"],
+                    ),
+                    expected,
+                )
+
+    def test_large_row_count_falls_back(self):
+        self.assertIsNone(_ABSORB_CONFIG(16, 0, 512))
+        self.assertIsNone(_ABSORB_CONFIG(16, 257, 512))
 
 
 if __name__ == "__main__":

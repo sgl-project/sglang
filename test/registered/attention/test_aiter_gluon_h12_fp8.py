@@ -237,6 +237,10 @@ class TestForwardMlaDecodeDispatch(CustomTestCase):
         be.kv_cache_dtype = fp8_dtype
         be.head_pad_mode = "zero"
         be.num_head_padded = 16
+        # The head count the asm kernel runs at. Without DCP it is the padded
+        # per-rank count, so 16 here. _asm_ps_supports_qlen reads it.
+        be.mla_kernel_num_head_padded = 16
+        be.mla_decode_backend = "asm"
         be.forward_metadata = mock.Mock(
             max_q_len=max_q_len,
             kv_indices=torch.zeros(4, dtype=torch.int32),
@@ -283,7 +287,9 @@ class TestForwardMlaDecodeDispatch(CustomTestCase):
         return_value=True,
     )
     @mock.patch("sglang.srt.layers.attention.aiter_backend.mla_gluon_decode")
+    @mock.patch("sglang.srt.layers.attention.aiter_backend._use_mla_ps_kernel", False)
     def test_uses_gluon_output_when_preferred(self, mock_gluon, _prefer):
+        """Gluon wins when it is preferred and the asm PS kernel is off."""
         gluon_out = torch.ones(4, 12, 512)
         mock_gluon.return_value = gluon_out
         be = self._make_backend()
@@ -302,9 +308,52 @@ class TestForwardMlaDecodeDispatch(CustomTestCase):
         return_value=True,
     )
     @mock.patch("sglang.srt.layers.attention.aiter_backend.mla_gluon_decode")
+    def test_asm_ps_wins_over_preferred_gluon(self, mock_gluon, _prefer):
+        """The asm PS kernel takes a width it supports, even over preferred Gluon."""
+        be = self._make_backend()
+        be._forward_mla_decode(
+            torch.zeros(4, 12, 576, dtype=torch.bfloat16),
+            _layer(),
+            mock.Mock(),
+            k_descale=1.0,
+        )
+        mock_gluon.assert_not_called()
+        be._mla_decode_fwd_with_head_pad.assert_called_once()
+
+    @mock.patch(
+        "sglang.srt.layers.attention.aiter_backend.prefer_mla_gluon_decode",
+        return_value=True,
+    )
+    @mock.patch("sglang.srt.layers.attention.aiter_backend.mla_gluon_decode")
+    def test_decode_backend_gluon_keeps_gluon(self, mock_gluon, _prefer):
+        """SGLANG_AITER_MLA_DECODE_BACKEND=gluon holds decode on Gluon."""
+        gluon_out = torch.ones(4, 12, 512)
+        mock_gluon.return_value = gluon_out
+        be = self._make_backend()
+        be.mla_decode_backend = "gluon"
+        out = be._forward_mla_decode(
+            torch.zeros(4, 12, 576, dtype=torch.bfloat16),
+            _layer(),
+            mock.Mock(),
+            k_descale=1.0,
+        )
+        mock_gluon.assert_called_once()
+        be._mla_decode_fwd_with_head_pad.assert_not_called()
+        self.assertIs(out, gluon_out)
+
+    @mock.patch(
+        "sglang.srt.layers.attention.aiter_backend.prefer_mla_gluon_decode",
+        return_value=True,
+    )
+    @mock.patch("sglang.srt.layers.attention.aiter_backend.mla_gluon_decode")
+    @mock.patch("sglang.srt.layers.attention.aiter_backend._use_mla_ps_kernel", False)
     def test_passes_max_q_len_as_qlen(self, mock_gluon, _prefer):
-        """Target-verify must reach the kernel as qlen, not be silently dropped:
-        the ASM fallback cannot serve this topology above qSeqLen 4 at all."""
+        """Target verify must reach the kernel as qlen, not be silently dropped.
+
+        The asm PS kernel is off here, so the width is Gluon's to serve. With
+        it on, a bf16 query stops at qSeqLen 4 and an fp8 query goes above it;
+        _asm_ps_supports_qlen owns that decision.
+        """
         mock_gluon.return_value = torch.ones(32, 12, 512)
         be = self._make_backend(max_q_len=8)
         be._forward_mla_decode(
@@ -351,18 +400,20 @@ class TestMlaDcpAsmDecode(CustomTestCase):
         layer.logit_cap = 0.0
         return layer
 
-    @mock.patch("sglang.srt.layers.attention.aiter_backend.mla_decode_fwd")
+    @mock.patch("sglang.srt.layers.attention.aiter_backend.mla_decode_fwd", create=True)
     @mock.patch("sglang.srt.layers.attention.aiter_backend.scaled_fp8_quant")
-    def test_asm_quantizes_gathered_q_and_returns_lse(self, mock_quant, mock_mla):
+    def test_asm_casts_gathered_q_and_returns_lse(self, mock_quant, mock_mla):
+        """Q reaches the kernel as a plain fp8 cast at a scale of 1.0.
+
+        Scaling by the tensor maximum first is no more accurate on this query
+        and costs about twice the time, so scaled_fp8_quant is not called.
+        """
         from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
 
         be = self._make_backend()
         layer = self._make_layer()
         q = torch.zeros(2, 96, 576, dtype=torch.bfloat16)
-        q_fp8 = torch.zeros(2, 96 * 576, dtype=fp8_dtype)
-        q_scale = torch.tensor([0.25], dtype=torch.float32)
         lse = torch.arange(2 * 96, dtype=torch.float32).view(2, 96)
-        mock_quant.return_value = (q_fp8, q_scale)
         mock_mla.return_value = (None, lse)
 
         out, actual_lse = be._forward_decode_dcp(
@@ -376,7 +427,8 @@ class TestMlaDcpAsmDecode(CustomTestCase):
         self.assertEqual(out.dtype, torch.bfloat16)
         self.assertTrue(torch.equal(actual_lse, lse))
         self.assertEqual(mock_mla.call_args.args[0].dtype, fp8_dtype)
-        self.assertIs(mock_mla.call_args.kwargs["q_scale"], q_scale)
+        mock_quant.assert_not_called()
+        self.assertEqual(mock_mla.call_args.kwargs["q_scale"].item(), 1.0)
         self.assertTrue(mock_mla.call_args.kwargs["return_lse"])
         self.assertFalse(mock_mla.call_args.kwargs["intra_batch_mode"])
 

@@ -5,6 +5,7 @@
 
 import math
 from enum import IntEnum, auto
+from functools import partial
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
@@ -20,21 +21,22 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layer_boundary import (
+    append_stages,
     declare_attn,
     declare_ffn,
     is_dense_ffn_fully_dp,
-    make_stages,
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
+    LinearParallelGroup,
     MergedColumnParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
-from sglang.srt.layers.moe import reduce_moe_output
+from sglang.srt.layers.moe import post_experts_output_is_complete
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
@@ -47,6 +49,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
@@ -179,8 +182,8 @@ class SarvamMoEMLP(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         reduce_results: bool = True,
-        tp_rank: Optional[int] = None,
-        tp_size: Optional[int] = None,
+        *,
+        parallel_group: LinearParallelGroup = "tp",
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
@@ -189,8 +192,7 @@ class SarvamMoEMLP(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("gate_up_proj", prefix),
-            tp_rank=tp_rank,
-            tp_size=tp_size,
+            parallel_group=parallel_group,
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
@@ -199,8 +201,7 @@ class SarvamMoEMLP(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("down_proj", prefix),
             reduce_results=reduce_results,
-            tp_rank=tp_rank,
-            tp_size=tp_size,
+            parallel_group=parallel_group,
         )
         if hidden_act != "silu":
             raise ValueError(
@@ -297,10 +298,6 @@ class SarvamMoESparseMoeBlock(nn.Module):
             and config.num_shared_experts > 0
         ):
             intermediate_size = config.moe_intermediate_size * config.num_shared_experts
-            if is_dense_ffn_fully_dp():
-                shared_tp_rank, shared_tp_size = 0, 1
-            else:
-                shared_tp_rank, shared_tp_size = None, None
             self.shared_experts = SarvamMoEMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=intermediate_size,
@@ -308,8 +305,11 @@ class SarvamMoESparseMoeBlock(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("shared_experts", prefix),
                 reduce_results=False,
-                tp_rank=shared_tp_rank,
-                tp_size=shared_tp_size,
+                # The shared output joins the routed output's TP sum; where that
+                # output is already complete on each rank, it is not TP-sharded.
+                parallel_group="replicated"
+                if post_experts_output_is_complete(is_tp_path=True)
+                else "tp",
             )
         else:
             self.shared_experts = None
@@ -367,7 +367,6 @@ class SarvamMoESparseMoeBlock(nn.Module):
                 final_hidden_states = final_hidden_states * self.routed_scaling_factor
         current_stream.wait_stream(self.alt_stream)
         final_hidden_states = final_hidden_states + shared_out
-        final_hidden_states = reduce_moe_output(final_hidden_states)
         return final_hidden_states.view(num_tokens, hidden_dim)
 
     def forward_normal(
@@ -402,8 +401,6 @@ class SarvamMoESparseMoeBlock(nn.Module):
         elif self.routed_scaling_factor != 1.0:
             final_hidden_states = final_hidden_states * self.routed_scaling_factor
 
-        final_hidden_states = reduce_moe_output(final_hidden_states)
-
         return final_hidden_states.view(num_tokens, hidden_dim)
 
 
@@ -428,7 +425,6 @@ class SarvamMoEMLAAttention(nn.Module):
         self.alt_stream = alt_stream
         self.quant_config = quant_config
 
-        attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
 
         self.qk_nope_head_dim = config.qk_nope_head_dim
@@ -456,8 +452,7 @@ class SarvamMoEMLAAttention(nn.Module):
                 bias=False,
                 quant_config=quant_config,
                 prefix=add_prefix("q_proj", prefix),
-                tp_rank=attn_tp_rank,
-                tp_size=attn_tp_size,
+                parallel_group="attn_tp",
             )
             self.kv_a_proj_with_mqa = ReplicatedLinear(
                 self.hidden_size,
@@ -481,8 +476,7 @@ class SarvamMoEMLAAttention(nn.Module):
                 bias=False,
                 quant_config=quant_config,
                 prefix=add_prefix("q_b_proj", prefix),
-                tp_rank=attn_tp_rank,
-                tp_size=attn_tp_size,
+                parallel_group="attn_tp",
             )
             self.kv_a_proj_with_mqa = ReplicatedLinear(
                 self.hidden_size,
@@ -499,8 +493,7 @@ class SarvamMoEMLAAttention(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("kv_b_proj", prefix),
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
         )
 
         self.o_proj = RowParallelLinear(
@@ -509,8 +502,7 @@ class SarvamMoEMLAAttention(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("o_proj", prefix),
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             reduce_results=False,
         )
 
@@ -650,7 +642,7 @@ class SarvamMoEMLAAttention(nn.Module):
 
         get_token_to_kv_pool().set_mla_kv_buffer(
             self.attn_mha,
-            forward_batch.out_cache_loc,
+            KVWriteLoc.for_batch(forward_batch),
             k_nope,
             k_pe,
         )
@@ -995,26 +987,7 @@ class SarvamMoEMLADecoderLayer(nn.Module):
             alt_stream=alt_stream,
         )
 
-        first_k_dense = getattr(config, "first_k_dense_replace", 1)
-        moe_layer_freq = getattr(config, "moe_layer_freq", 1)
-        has_moe = getattr(config, "num_experts", None) is not None
-        self.is_layer_sparse = (
-            has_moe
-            and layer_id >= first_k_dense
-            and (layer_id - first_k_dense) % moe_layer_freq == 0
-        )
-        is_previous_layer_sparse = (
-            has_moe
-            and layer_id > 0
-            and (layer_id - 1) >= first_k_dense
-            and (layer_id - 1 - first_k_dense) % moe_layer_freq == 0
-        )
-        is_next_layer_sparse = (
-            has_moe
-            and layer_id < config.num_hidden_layers - 1
-            and (layer_id + 1) >= first_k_dense
-            and (layer_id + 1 - first_k_dense) % moe_layer_freq == 0
-        )
+        self.is_layer_sparse = self._is_layer_sparse(config, layer_id)
 
         if self.is_layer_sparse:
             self.mlp = SarvamMoESparseMoeBlock(
@@ -1025,18 +998,15 @@ class SarvamMoEMLADecoderLayer(nn.Module):
                 alt_stream=alt_stream,
             )
         else:
-            if is_dense_ffn_fully_dp():
-                mlp_tp_rank, mlp_tp_size = 0, 1
-            else:
-                mlp_tp_rank, mlp_tp_size = None, None
+            mlp_parallel_group = "replicated" if is_dense_ffn_fully_dp() else "tp"
             self.mlp = SarvamMoEMLP(
                 hidden_size=self.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
-                tp_rank=mlp_tp_rank,
-                tp_size=mlp_tp_size,
+                parallel_group=mlp_parallel_group,
+                reduce_results=False,
             )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -1044,25 +1014,50 @@ class SarvamMoEMLADecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
-        self.attn_boundary, self.ffn_boundary = make_stages(
+        attn, ffn = self.stage_facts(config, layer_id)
+        self.attn_boundary, self.ffn_boundary = append_stages(
             (
-                declare_attn(),
+                attn,
                 self.input_layernorm,
                 {"qkv_latent_func": self.self_attn.prepare_qkv_latent},
             ),
-            (
-                declare_ffn(
-                    sparse=self.is_layer_sparse,
-                    next_layer_sparse=is_next_layer_sparse,
-                ),
-                self.post_attention_layernorm,
+            (ffn, self.post_attention_layernorm),
+        )
+
+    @classmethod
+    def stage_facts(cls, config: PretrainedConfig, layer_id: int):
+        """The stages the layer at ``layer_id`` declares, in order: the model's
+        shared declaration function, which the layer declares with too (see
+        make_layers)."""
+        return (
+            declare_attn(),
+            declare_ffn(
+                sparse=cls._is_layer_sparse(config, layer_id),
+                next_layer_sparse=cls._is_next_layer_sparse(config, layer_id),
             ),
-            previous=declare_ffn(
-                sparse=is_previous_layer_sparse, next_layer_sparse=self.is_layer_sparse
-            )
-            if layer_id != 0
-            else None,
-            terminal=layer_id == config.num_hidden_layers - 1,
+        )
+
+    @staticmethod
+    def _is_layer_sparse(config: PretrainedConfig, layer_id: int) -> bool:
+        first_k_dense = getattr(config, "first_k_dense_replace", 1)
+        moe_layer_freq = getattr(config, "moe_layer_freq", 1)
+        has_moe = getattr(config, "num_experts", None) is not None
+        return (
+            has_moe
+            and layer_id >= first_k_dense
+            and (layer_id - first_k_dense) % moe_layer_freq == 0
+        )
+
+    @staticmethod
+    def _is_next_layer_sparse(config: PretrainedConfig, layer_id: int) -> bool:
+        first_k_dense = getattr(config, "first_k_dense_replace", 1)
+        moe_layer_freq = getattr(config, "moe_layer_freq", 1)
+        has_moe = getattr(config, "num_experts", None) is not None
+        return (
+            has_moe
+            and layer_id < config.num_hidden_layers - 1
+            and (layer_id + 1) >= first_k_dense
+            and (layer_id + 1 - first_k_dense) % moe_layer_freq == 0
         )
 
     def forward(
@@ -1080,9 +1075,8 @@ class SarvamMoEMLADecoderLayer(nn.Module):
             )
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
-        with self.ffn_boundary.exit(forward_batch) as ffn_exit:
-            hidden_states = self.mlp(hidden_states, forward_batch)
-        hidden_states = ffn_exit.finish(hidden_states)
+        hidden_states = self.mlp(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.finish(hidden_states, forward_batch)
         return hidden_states
 
 
@@ -1121,6 +1115,7 @@ class SarvamMLAModel(nn.Module):
                 alt_stream=self.alt_stream,
             ),
             prefix="model.layers",
+            stage_facts=partial(SarvamMoEMLADecoderLayer.stage_facts, config),
         )
 
         if self.pp_group.is_last_rank:
