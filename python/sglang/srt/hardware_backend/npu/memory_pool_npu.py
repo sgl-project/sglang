@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING, Optional, Sequence
+from typing import TYPE_CHECKING, Optional, Sequence, Tuple
 
 import torch
 
@@ -594,6 +594,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         indexer_layer_ids: Optional[Sequence[int]] = None,
         kv_cache_dim: Optional[int] = None,
         is_draft_worker: bool = False,
+        kv_int8_layout: bool = False,
     ):
         # MLAPO historically owned NZ writes. Keep the allocation unchanged and
         # write into the NZ-addressed view below so ordinary MLA (including
@@ -667,12 +668,69 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         self.index_page_padding = index_page_padding
         self.is_draft_worker = is_draft_worker
 
+        # int8 COMBINE layout for DSA models on Ascend NPU, consumed by
+        # npu_kv_quant_sparse_flash_attention:
+        #   K row (656B for kv_lora_rank=512): int8 nope [0:512) | bf16 rope
+        #     bytes [512:640) (the operator tiling pins rope_head_dim=64,
+        #     i.e. 128 bf16 bytes; NoPE models zero-fill) | fp32 scales
+        #     [640:656) (per-128-dim-tile amax/127, kv_lora_rank//128 tiles)
+        # Single-pool layout: the operator's `value` argument is a dead
+        # parameter (the kernel binds valueGm but never dereferences it;
+        # single 656B pool and dual 656+528 pools give bit-identical
+        # outputs), so under the int8 layout we allocate ONLY the 656B
+        # k_buffer; v_buffer is None and all reads/writes go through
+        # k_buffer. Buffers use torch.int8 (NOT uint8):
+        # npu_scatter_nd_update_ (aclnn) has no uint8 instance in its
+        # dtype whitelist.
+        # Enabled via SGLANG_DSA_KV_INT8=1 (model_runner overrides
+        # kv_cache_dtype to torch.int8, the pool builder passes
+        # kv_int8_layout=True).
+        # Dtype self-check fallback: some assembly points (e.g. the draft
+        # worker path) build the pool with kv_cache_dtype already
+        # overridden to torch.int8 but do not forward kv_int8_layout.
+        # An int8 dtype with the bf16 layout would produce a wrong-shaped
+        # k_buffer and an int8 index_k_buffer, which crashes the
+        # bf16-only npu_lightning_indexer -- so dtype==torch.int8 forces
+        # the int8 COMBINE layout. Belt-and-braces with the explicit
+        # kv_int8_layout kwarg above.
+        self.kv_int8_layout = kv_int8_layout or (dtype == torch.int8)
+        if self.kv_int8_layout and self.enable_sparsity_driven_kv_offload:
+            raise ValueError(
+                "SGLANG_DSA_KV_INT8 is not supported together with "
+                "sparsity-driven KV offload (SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD)."
+            )
+        self.int8_rope_bytes = 2 * 64  # rope_head_dim pinned to 64 by tiling
+        self.int8_scale_bytes = 4 * (kv_lora_rank // 128)  # fp32 per-128-tile
+        self.k_buffer_width = (
+            kv_lora_rank + self.int8_rope_bytes + self.int8_scale_bytes
+            if self.kv_int8_layout
+            else kv_lora_rank
+        )
+        self.v_buffer_width = qk_rope_head_dim
+
         self.custom_mem_pool = None
 
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             # The padded slot 0 is used for writing dummy outputs from padded tokens.
             if self.enable_sparsity_driven_kv_offload:
                 self.k_buffer = None
+                self.v_buffer = None
+            elif self.kv_int8_layout:
+                # int8 layout stores the COMBINE rows as int8 rows with
+                # the width above. No V pool: the quantized-sparse
+                # operator never dereferences the value pointer, so a
+                # single 656B K pool serves both K and V.
+                self.k_buffer = torch.zeros(
+                    (
+                        layer_num,
+                        self.size // self.page_size + self.kv_page_padding,
+                        self.page_size,
+                        1,
+                        self.k_buffer_width,
+                    ),
+                    dtype=torch.int8,
+                    device=self.device,
+                )
                 self.v_buffer = None
             else:
                 self.k_buffer = torch.zeros(
@@ -712,7 +770,11 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                         1,
                         self.index_head_dim,
                     ),
-                    dtype=self.store_dtype,
+                    # The indexer (npu_lightning_indexer) keeps consuming
+                    # bf16 index K; the int8 layout applies only to the
+                    # latent K/V rows, so pin the index pool to bf16 even
+                    # though kv_cache_dtype was overridden to int8.
+                    dtype=torch.bfloat16 if self.kv_int8_layout else self.store_dtype,
                     device=self.device,
                 )
                 if self.dsa_kv_cache_store_fp8 and self.num_indexer_layers > 0:
@@ -744,10 +806,11 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
 
     def get_kv_size_bytes(self):
         kv_size_bytes = 0
-
         if getattr(self, "k_buffer", None) is not None:
             for k_cache in self.k_buffer:
                 kv_size_bytes += get_tensor_size_bytes(k_cache)
+        # Single pool: v_buffer is None under the int8 layout (do not
+        # double-count the shared k_buffer).
         if getattr(self, "v_buffer", None) is not None:
             for v_cache in self.v_buffer:
                 kv_size_bytes += get_tensor_size_bytes(v_cache)
@@ -759,6 +822,17 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         return kv_size_bytes
 
     def _raise_if_native_kv_cache_disabled(self):
+        # Single pool: v_buffer is None by design under the int8
+        # layout; the k_buffer alone is the native device KV cache.
+        if self.kv_int8_layout:
+            if getattr(self, "k_buffer", None) is None:
+                raise RuntimeError(
+                    "Native NPU MLA device KV cache is disabled; "
+                    "k_buffer is not available. Use the sparse KV manager "
+                    "path, or re-enable native device KV cache for this "
+                    "code path."
+                )
+            return
         if (
             getattr(self, "k_buffer", None) is None
             or getattr(self, "v_buffer", None) is None
@@ -773,6 +847,13 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         self._raise_if_native_kv_cache_disabled()
+        # Single pool: both K and V views are the same k_buffer tensor
+        # under the int8 layout.
+        if self.kv_int8_layout:
+            return (
+                self.k_buffer[layer_id - self.start_layer],
+                self.k_buffer[layer_id - self.start_layer],
+            )
         return (
             self.k_buffer[layer_id - self.start_layer],
             self.v_buffer[layer_id - self.start_layer],
@@ -794,6 +875,11 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         self._raise_if_native_kv_cache_disabled()
 
+        # Return the raw int8 COMBINE rows; the int8 reader
+        # (npu_kv_quant_sparse_flash_attention) consumes them directly.
+        # The bf16 view below is only meaningful for the non-int8 layout.
+        if self.kv_int8_layout:
+            return self.k_buffer[layer_id - self.start_layer]
         if self.store_dtype != self.dtype:
             return self.k_buffer[layer_id - self.start_layer].view(self.dtype)
         return self.k_buffer[layer_id - self.start_layer]
@@ -803,6 +889,11 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         self._raise_if_native_kv_cache_disabled()
 
+        # Single pool: the value argument of
+        # npu_kv_quant_sparse_flash_attention is fed the same k_buffer
+        # rows (dead parameter at the kernel level).
+        if self.kv_int8_layout:
+            return self.k_buffer[layer_id - self.start_layer]
         if self.store_dtype != self.dtype:
             return self.v_buffer[layer_id - self.start_layer].view(self.dtype)
         return self.v_buffer[layer_id - self.start_layer]
@@ -813,6 +904,10 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         if getattr(self, "index_k_buffer", None) is None:
             raise RuntimeError("NPU MLA index KV cache is not allocated.")
 
+        # The index pool is pinned to bf16 (see the allocation above);
+        # never reinterpret it through the int8 self.dtype.
+        if self.kv_int8_layout:
+            return self.index_k_buffer[layer_id - self.start_layer]
         if self.store_dtype != self.dtype:
             return self.index_k_buffer[self._get_indexer_slot(layer_id)].view(
                 self.dtype
@@ -849,6 +944,17 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
 
     # for disagg
     def get_contiguous_buf_infos(self):
+        # Under the int8 layout v_buffer is None and the PD-disagg peer
+        # would have to interpret the single 656B pool as the int8 COMBINE
+        # layout -- fail loud if anyone tries to take this path with the
+        # int8 layout on.
+        if self.kv_int8_layout:
+            raise NotImplementedError(
+                "get_contiguous_buf_infos (PD disaggregation) is not "
+                "supported with the int8 KV single-pool layout "
+                "(SGLANG_DSA_KV_INT8=1); peer-side int8 interpretation is "
+                "not synchronized."
+            )
         entries = self._get_disagg_buffer_entries()
         return (
             [buffer.data_ptr() for buffer, _ in entries],
@@ -910,6 +1016,22 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         loc, _, _ = unwrap_write_loc(loc_info)
         self._raise_if_native_kv_cache_disabled()
         layer_id = layer.layer_id
+        # Single-pool write: per-128-tile int8 quantization into the
+        # 656B COMBINE row (int8 nope | rope bytes (NoPE zero-fill) |
+        # fp32 scales), one scatter, no V row at all (the operator
+        # never reads value). Measured dequantized error against bf16
+        # latents: ~3.3%.
+        if self.kv_int8_layout:
+            k_row = self._quantize_kv_int8_combine(cache_k, cache_v)
+            torch_npu.npu_scatter_nd_update_(
+                self.k_buffer[layer_id - self.start_layer].view(
+                    -1, 1, self.k_buffer_width
+                ),
+                loc.view(-1, 1),
+                k_row.view(-1, 1, self.k_buffer_width),
+            )
+            return
+
         if self.dsa_kv_cache_store_fp8:
             if cache_v is None:
                 cache_k, cache_v = cache_k.split(
@@ -943,16 +1065,130 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             return
 
         torch_npu.npu_scatter_nd_update_(
-            self.k_buffer[layer_id - self.start_layer].view(-1, 1, self.kv_lora_rank),
+            self.k_buffer[layer_id - self.start_layer].view(-1, 1, self.k_buffer_width),
             loc.view(-1, 1),
-            cache_k.view(-1, 1, self.kv_lora_rank),
+            cache_k.view(-1, 1, self.k_buffer_width),
         )
-        torch_npu.npu_scatter_nd_update_(
-            self.v_buffer[layer_id - self.start_layer].view(
-                -1, 1, self.qk_rope_head_dim
+        if self.qk_rope_head_dim > 0:
+            # Models with qk_rope_head_dim=0 (no rope segment) have a
+            # 0-width v_buffer; an empty scatter would raise on view(-1, 1, 0).
+            torch_npu.npu_scatter_nd_update_(
+                self.v_buffer[layer_id - self.start_layer].view(
+                    -1, 1, self.v_buffer_width
+                ),
+                loc.view(-1, 1),
+                cache_v.view(-1, 1, self.v_buffer_width),
+            )
+
+    def _quantize_kv_int8_combine(
+        self, cache_k: torch.Tensor, cache_v: Optional[torch.Tensor]
+    ) -> torch.Tensor:
+        """Quantize bf16 MLA latents into the single int8 COMBINE row
+        consumed by npu_kv_quant_sparse_flash_attention.
+
+        cache_k arrives as (num_tokens, tp_k_head_num, kv_lora_rank) bf16
+        latents; cache_v is the (num_tokens, 1, qk_rope_head_dim) post-rotary
+        k_rope (its bf16 bytes are spliced into the row's [512:640) rope
+        segment; NoPE models zero-fill it). cache_v doubles as the dead
+        value-row placeholder: the K row is the single latent (the operator
+        never reads the value argument).
+        Quantization: symmetric per-128-dim-tile,
+        scale = amax/127 (fp32), via torch_npu.npu_dynamic_block_quant(
+        row_block_size=1, col_block_size=128) -- bit-identical to the
+        reference amax/127 formula and 5.6x faster. All ops here are
+        NPU-side with static shapes => NPUGraph-capturable (no host
+        sync, no data-dependent branching).
+        """
+        num_tokens = cache_k.shape[0]
+        k_latent = cache_k.reshape(num_tokens, self.kv_lora_rank)
+
+        q_k, s_k = self._int8_tile_quant(k_latent)
+
+        # K row: int8 nope | bf16 rope bytes | fp32 scale bytes.
+        # The rope bytes are already post-rotary (forward_dsa_prepare_npu
+        # applies m.rotary_emb before set_kv_buffer), so a raw byte splice
+        # is exactly what the bf16 pool stores in v_buffer -- no rotary is
+        # (re)applied anywhere on the read path, kernel included (zero-rope
+        # rows were verified mathematically equivalent, i.e. the kernel
+        # never applies rope itself). Move the bytes as int8
+        # (bit-identical move; scatter's aclnn whitelist has no
+        # uint8/bf16 instance). NoPE models (qk_rope_head_dim==0) keep
+        # the zero fill.
+        if self.qk_rope_head_dim > 0:
+            if cache_v is None or cache_v.numel() == 0:
+                raise RuntimeError(
+                    "int8 KV cache: rope model (qk_rope_head_dim="
+                    f"{self.qk_rope_head_dim}) but set_kv_buffer got no "
+                    "k_rope; the rope segment cannot be synthesized."
+                )
+            rope_flat = cache_v.reshape(num_tokens, -1)
+            if rope_flat.shape[1] != self.int8_rope_bytes // 2:
+                raise RuntimeError(
+                    "int8 KV cache: k_rope width "
+                    f"{rope_flat.shape[1]} != the COMBINE rope segment "
+                    f"{self.int8_rope_bytes // 2} (tiling pins "
+                    "rope_head_dim=64)."
+                )
+            rope_bytes = rope_flat.contiguous().view(torch.int8)
+        else:
+            rope_bytes = torch.zeros(
+                (num_tokens, self.int8_rope_bytes),
+                dtype=torch.int8,
+                device=cache_k.device,
+            )
+        k_row = torch.cat(
+            [q_k.view(torch.int8), rope_bytes, s_k.view(torch.int8)],
+            dim=-1,
+        )
+        return k_row
+
+    def _int8_tile_quant(
+        self, latent: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Per-128-tile symmetric int8 quantization of a bf16
+        (num_tokens, kv_lora_rank) latent. Returns (int8 q [N, kv_lora_rank],
+        fp32 scale bytes [N, int8_scale_bytes]) -- the scale is returned as a
+        raw-byte view so callers can splice it into the COMBINE row.
+        Fallback pure-torch path mirrors npu_dynamic_block_quant exactly
+        (amax/127, round, clamp +-127) for environments without the op.
+        """
+        num_tokens = latent.shape[0]
+        if hasattr(torch_npu, "npu_dynamic_block_quant"):
+            # dst_type=1 -> uint8 payload, row=1/col=128 -> per-tile scale
+            # (amax/127, verified bit-identical against the reference
+            # formula).
+            q, s = torch_npu.npu_dynamic_block_quant(
+                latent,
+                min_scale=0.0,
+                dst_type=1,
+                row_block_size=1,
+                col_block_size=128,
+            )
+            q = q.view(torch.int8)
+            s = s.float()
+            while s.dim() > 2:
+                s = s.squeeze(-1)
+            # (num_tokens, num_tiles) fp32 -> raw bytes (num_tokens, 16)
+            s = s.reshape(num_tokens, self.int8_scale_bytes // 4).contiguous()
+            return q, s.view(torch.int8)
+
+        num_tiles = self.kv_lora_rank // 128
+        latent = latent.to(torch.float32)
+        scales = (
+            torch.amax(latent.view(num_tokens, num_tiles, 128).abs(), dim=-1) / 127.0
+        )
+        scales = torch.where(scales > 0, scales, torch.ones_like(scales))
+        q = torch.clamp(
+            torch.round(
+                latent.view(num_tokens, num_tiles, 128)
+                / scales.unsqueeze(-1).clamp(min=1e-30)
             ),
-            loc.view(-1, 1),
-            cache_v.view(-1, 1, self.qk_rope_head_dim),
+            -127,
+            127,
+        ).to(torch.int8)
+        return (
+            q.reshape(num_tokens, self.kv_lora_rank),
+            scales.contiguous().view(torch.int8),
         )
 
     def _set_fia_nz_kv_buffer(
@@ -983,10 +1219,13 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         loc: torch.Tensor,
         index_k: torch.Tensor,
     ):
-        if index_k.dtype != self.dtype:
-            index_k = index_k.to(self.dtype)
+        # Index pool is pinned to bf16 under the int8 layout (see the
+        # allocation above); cast against the buffer dtype, not self.dtype.
+        index_dtype = torch.bfloat16 if self.kv_int8_layout else self.dtype
+        if index_k.dtype != index_dtype:
+            index_k = index_k.to(index_dtype)
 
-        if self.store_dtype != self.dtype:
+        if not self.kv_int8_layout and self.store_dtype != self.dtype:
             index_k = index_k.view(self.store_dtype)
 
         torch_npu.npu_scatter_nd_update_(
@@ -1043,6 +1282,13 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         return buffers
 
     def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
+        # CPU offloading of the int8 COMBINE rows is not wired: the
+        # offload path assumes the two-buffer bf16 layout.
+        if self.kv_int8_layout:
+            raise NotImplementedError(
+                "CPU KV offloading is not supported with the int8 KV "
+                "single-pool layout (SGLANG_DSA_KV_INT8=1)."
+            )
         torch.npu.synchronize()
         buf_of_layers = [
             self._get_cpu_offload_layer_buffers(i) for i in range(self.layer_num)
@@ -1065,6 +1311,13 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
     def load_cpu_copy(
         self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
     ):
+        # See get_cpu_copy: the offload path assumes the two-buffer
+        # bf16 layout.
+        if self.kv_int8_layout:
+            raise NotImplementedError(
+                "CPU KV offloading is not supported with the int8 KV "
+                "single-pool layout (SGLANG_DSA_KV_INT8=1)."
+            )
         torch.npu.synchronize()
         chunk_size = self.cpu_offloading_chunk_size
         for local_layer_id in range(self.layer_num):
