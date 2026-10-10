@@ -1580,6 +1580,28 @@ class Envs:
     # Quantize the SWA fp8 KV cache from bf16-rounded values (matches
     # trainer-side QAT and the DSA-CP path) instead of fp32 registers.
     SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE = EnvBool(False)
+    # Decoder SWA bounded replay: eager prefill steps run the trimmed late layers
+    # from CUDA graphs captured per tail-row bucket (multiples of 128) up to this
+    # many rows; 0 keeps them eager. 2048 rows (16 buckets) took 0.11 GiB per GPU
+    # on GB300 TP4.
+    SGLANG_DSV4_DECODER_REPLAY_GRAPH_MAX_ROWS = EnvInt(2048)
+    # Eager prefill steps run the full-width layers before the decoder-replay tail
+    # from CUDA graphs captured at startup per 256-token bucket up to this many
+    # tokens; 0 keeps them eager, -1 = the chunked prefill size, at most 8192.
+    SGLANG_DSV4_FULL_LAYER_GRAPH_MAX_TOKENS = EnvInt(-1)
+    # Debug only: the full-layer graphs stop before this layer (0 = the decoder tail).
+    SGLANG_DSV4_FULL_LAYER_GRAPH_END = EnvInt(0)
+    # Eager replay graphs: skip pad-row zeroing in the attention break and reuse one
+    # per-step token-to-request map across the low-ratio layers.
+    SGLANG_DSV4_EAGER_GRAPH_LEAN_BREAKS = EnvBool(True)
+    # Eager replay graphs: one break per late layer for the SWA store and the attention.
+    SGLANG_DSV4_EAGER_GRAPH_MERGED_KV_STORE = EnvBool(True)
+    # Eager replay graphs capture into the prefill graphs' global pool instead of
+    # their own (they never run concurrently); off pins a separate pool (about 4 GiB).
+    SGLANG_DSV4_EAGER_GRAPH_GLOBAL_POOL = EnvBool(True)
+    # Debug only: replay decoder replay graphs one segment at a time with a sync,
+    # naming the segment or break that faults.
+    SGLANG_DSV4_DECODER_REPLAY_GRAPH_DEBUG = EnvBool(False)
     # Paged KV layout of the DeepSeek-V4 family pools: "v4" (584 B/token, every
     # GPU), "v41" (the SM100 FlashMLA V4.1 formats: 528 B fp8 SWA cache, fp8 or
     # fp4 compressed caches) or "auto" (v41 on SM100, v4 elsewhere).

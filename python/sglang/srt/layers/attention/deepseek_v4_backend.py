@@ -962,6 +962,8 @@ class DSV4Metadata:
     # Shared by all low-ratio source layers; graph replay refreshes them live.
     low_ratio_req_indices: Optional[torch.Tensor] = None
     low_ratio_pos_i64: Optional[torch.Tensor] = None
+    # Eager steps: each token's request, computed by the step's first ratio 1/2 layer.
+    eager_req_rows: Optional[torch.Tensor] = None
 
     # Per-step scratch for TP-padded query heads, zeroed by the first user.
     # Later layers overwrite real heads and preserve the zero padding.
@@ -2765,7 +2767,13 @@ class DeepseekV4AttnBackend(
             # live rows only and falls through.
             req, pos = hoisted_req, hoisted_pos
         else:
-            req = token_req_indices(forward_batch, num_tokens=positions.shape[0])
+            cached = meta.eager_req_rows
+            if cached is not None and cached.shape[0] == positions.shape[0]:
+                req = cached
+            else:
+                req = token_req_indices(forward_batch, num_tokens=positions.shape[0])
+                if envs.SGLANG_DSV4_EAGER_GRAPH_LEAN_BREAKS.get():
+                    meta.eager_req_rows = req
             pos = positions
         if (
             forward_batch.forward_mode.is_extend()
@@ -2872,8 +2880,16 @@ class DeepseekV4AttnBackend(
         from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
             is_in_breakable_cuda_graph,
         )
+        from sglang.srt.models.deepseek_v4_replay_graphs import (
+            in_decoder_replay_graph,
+        )
 
-        return self.low_ratio_prefill_graph and is_in_breakable_cuda_graph()
+        # Decoder replay graphs run the low-ratio sources as an eager break.
+        return (
+            self.low_ratio_prefill_graph
+            and is_in_breakable_cuda_graph()
+            and not in_decoder_replay_graph()
+        )
 
     def _low_ratio_compress_decode(self, layer, x, req, pos) -> None:
         # Projection layout and fused-write support are fixed together at load time.

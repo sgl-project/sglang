@@ -175,6 +175,14 @@ from sglang.srt.models.deepseek_v2 import (
     _is_npu,
     _is_xpu,
 )
+from sglang.srt.models.deepseek_v4_replay_graphs import (
+    TAIL_ROW_STEP,
+    TOKEN_STEP,
+    EagerReplayGraphs,
+    _late_kv_store,
+    bcg_late_kv_store,
+    in_decoder_replay_graph,
+)
 from sglang.srt.models.deepseek_v41_vit import Aligner, ViT
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.multimodal.deepseek_v41_image_processing import (
@@ -188,6 +196,7 @@ from sglang.srt.runtime_context import (
     get_forward,
     get_parallel,
     get_platform,
+    get_schedule,
 )
 from sglang.srt.utils import (
     LazyValue,
@@ -706,9 +715,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
-@register_custom_op(mutates_args=["output"])
-@register_split_op()
-def deepseek_v4_attention_with_output(
+def _attention_with_output(
     query: torch.Tensor,
     key_value: torch.Tensor,
     output: torch.Tensor,
@@ -727,11 +734,15 @@ def deepseek_v4_attention_with_output(
         output.zero_()
         return
 
-    query = query[:real_num_tokens]
-    key_value = key_value[:real_num_tokens]
+    # An unpadded break (a decoder replay bucket the tail fills) skips the slicing.
+    padded = real_num_tokens != query.shape[0]
+    if padded:
+        query = query[:real_num_tokens]
+        key_value = key_value[:real_num_tokens]
 
     original_out_cache_loc = forward_batch.out_cache_loc
-    forward_batch.out_cache_loc = original_out_cache_loc[:real_num_tokens]
+    if padded:
+        forward_batch.out_cache_loc = original_out_cache_loc[:real_num_tokens]
 
     attn_backend = get_attn_backend()
     try:
@@ -748,18 +759,44 @@ def deepseek_v4_attention_with_output(
     finally:
         forward_batch.out_cache_loc = original_out_cache_loc
 
-    assert output[:real_num_tokens].numel() == ret.numel(), (
-        f"Output tensor element mismatch: {output[:real_num_tokens].numel()} != {ret.numel()}"
-    )
-
-    output[:real_num_tokens].view(ret.shape).copy_(ret)
-    output[real_num_tokens:].zero_()
+    assert ret.shape[0] == real_num_tokens, (ret.shape, real_num_tokens)
+    (output[:real_num_tokens] if padded else output).view(ret.shape).copy_(ret)
+    # Under eager replay graphs no real row reads a pad row's attention output.
+    if not (
+        in_decoder_replay_graph() and envs.SGLANG_DSV4_EAGER_GRAPH_LEAN_BREAKS.get()
+    ):
+        output[real_num_tokens:].zero_()
     return
 
 
-bcg_deepseek_v4_attention_with_output = eager_on_graph(True)(
-    deepseek_v4_attention_with_output
-)
+@register_custom_op(mutates_args=["output"])
+@register_split_op()
+def deepseek_v4_attention_with_output(
+    query: torch.Tensor,
+    key_value: torch.Tensor,
+    output: torch.Tensor,
+    layer_id: int,
+    compress_ratio: int,
+    attn_sink: torch.Tensor,
+    save_kv_cache: bool,
+) -> None:
+    _attention_with_output(
+        query, key_value, output, layer_id, compress_ratio, attn_sink, save_kv_cache
+    )
+
+
+# Eager breaks call the body directly; the op's dispatch is for the compiled split path.
+bcg_deepseek_v4_attention_with_output = eager_on_graph(True)(_attention_with_output)
+
+
+def _late_kv_store_then_attention(attention, x, positions, qkv_a, *attn_args) -> None:
+    # One break per late layer: nothing between the SWA store and the attention
+    # reads the SWA cache (the low-ratio sources write the compressed caches).
+    _late_kv_store(attention, x, positions, qkv_a)
+    _attention_with_output(*attn_args)
+
+
+bcg_late_kv_store_then_attention = eager_on_graph(True)(_late_kv_store_then_attention)
 
 
 def deepseek_v4_low_ratio_sources(layer, x, q_lora, positions) -> None:
@@ -1158,6 +1195,8 @@ class MQALayer(MqaAttentionBase):
         else:
             self.alt_streams = None
             self.alt_streams_indexer = None
+        # Eager replay graphs: the deferred SWA store's inputs, for the attention break.
+        self._deferred_late_kv = None
 
         self._multi_stream_bs_limit = 128 if get_platform().is_blackwell else 64
 
@@ -2089,6 +2128,13 @@ class MQALayer(MqaAttentionBase):
                     positions=global_positions,
                 )
                 kv = None
+            elif in_decoder_replay_graph():
+                assert not fuse_q_rope
+                if envs.SGLANG_DSV4_EAGER_GRAPH_MERGED_KV_STORE.get():
+                    self._deferred_late_kv = (x_linear, positions, qkv_a)
+                else:
+                    bcg_late_kv_store(self, x_linear, positions, qkv_a)
+                kv = None
             else:
                 self._compute_kv_to_cache(
                     x_linear,
@@ -2108,7 +2154,10 @@ class MQALayer(MqaAttentionBase):
             if (
                 forward_batch.forward_mode.is_extend()
                 and is_in_breakable_cuda_graph()
-                and not getattr(attn_backend, "low_ratio_prefill_graph", False)
+                and (
+                    not getattr(attn_backend, "low_ratio_prefill_graph", False)
+                    or in_decoder_replay_graph()
+                )
             ):
                 bcg_deepseek_v4_low_ratio_sources(self, x, q_lora, positions)
             else:
@@ -2185,6 +2234,9 @@ class MQALayer(MqaAttentionBase):
             envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
             and self.alt_streams is not None
             and get_is_capture_mode()
+            # Its fused K store reads the step's slots inside the captured segment;
+            # eager replay graphs keep that store an eager break.
+            and not in_decoder_replay_graph()
             and (
                 is_in_breakable_cuda_graph()
                 or x.shape[0] <= self._multi_stream_bs_limit
@@ -2438,7 +2490,7 @@ class MQALayer(MqaAttentionBase):
                 o = attn_q.new_empty(
                     (*attn_q.shape[:-1], self.attn_mqa.v_head_dim),
                 )
-                bcg_deepseek_v4_attention_with_output(
+                attn_args = (
                     attn_q,
                     attn_k,
                     o,
@@ -2447,7 +2499,15 @@ class MQALayer(MqaAttentionBase):
                     attn_sink,
                     save_kv_cache,
                 )
+                deferred, self._deferred_late_kv = self._deferred_late_kv, None
+                if deferred is not None:
+                    bcg_late_kv_store_then_attention(self, *deferred, *attn_args)
+                else:
+                    bcg_deepseek_v4_attention_with_output(*attn_args)
             else:
+                deferred, self._deferred_late_kv = self._deferred_late_kv, None
+                if deferred is not None:
+                    _late_kv_store(self, *deferred)
                 o = attn_backend.forward(
                     q=attn_q,
                     k=attn_k,
@@ -3808,6 +3868,21 @@ def _scatter_tail_rows(
     return full
 
 
+# Each 256-token bucket took about 0.39 GiB per GPU on GB300 TP4 (32 buckets: 12.6 GiB).
+_FULL_LAYER_GRAPH_DEFAULT_MAX_TOKENS = 8192
+
+
+def _full_layer_graph_max_tokens() -> int:
+    tokens = envs.SGLANG_DSV4_FULL_LAYER_GRAPH_MAX_TOKENS.get()
+    if tokens >= 0:
+        return tokens
+    # Default: cover every chunk-sized eager step, capped to bound capture memory.
+    chunk = get_schedule().chunked_prefill_size
+    if chunk is None or chunk <= 0:
+        return _FULL_LAYER_GRAPH_DEFAULT_MAX_TOKENS
+    return min(chunk, _FULL_LAYER_GRAPH_DEFAULT_MAX_TOKENS)
+
+
 class DeepseekV4Model(nn.Module):
     fall_back_to_pt_during_load = False
 
@@ -3939,6 +4014,37 @@ class DeepseekV4Model(nn.Module):
                 0,
                 1,
             }, f"late layers must not compress on their own, got ratios {late_ratios}"
+        # Eager prefill steps replay graphs of the late layers (tail rows) and of
+        # the full-width layers before them (step tokens); see deepseek_v4_replay_graphs.
+        self.decoder_replay_graphs: Optional[EagerReplayGraphs] = None
+        self.full_layer_graphs: Optional[EagerReplayGraphs] = None
+        tail_rows = envs.SGLANG_DSV4_DECODER_REPLAY_GRAPH_MAX_ROWS.get()
+        full_tokens = _full_layer_graph_max_tokens()
+        if self.late_layer_start is not None and not _is_hip:
+            if tail_rows > 0:
+                self.decoder_replay_graphs = EagerReplayGraphs(
+                    name="decoder-replay",
+                    model=self,
+                    run_layers=self._run_late_layers,
+                    buckets=list(range(TAIL_ROW_STEP, tail_rows + 1, TAIL_ROW_STEP)),
+                    tail_rows=True,
+                )
+            # Debug bisect aid: the graphs stop before this layer; the rest run eagerly.
+            self.full_graph_end = (
+                envs.SGLANG_DSV4_FULL_LAYER_GRAPH_END.get() or self.late_layer_start
+            )
+            if full_tokens > 0:
+                self.full_layer_graphs = EagerReplayGraphs(
+                    name="full-layer",
+                    model=self,
+                    run_layers=self._run_full_layers,
+                    buckets=list(range(TOKEN_STEP, full_tokens + 1, TOKEN_STEP)),
+                    tail_rows=False,
+                )
+
+    @property
+    def eager_replay_graphs(self) -> List[EagerReplayGraphs]:
+        return [g for g in (self.full_layer_graphs, self.decoder_replay_graphs) if g]
 
     def get_input_embeddings(self) -> nn.Module:
         return self.embed_tokens
@@ -3978,6 +4084,90 @@ class DeepseekV4Model(nn.Module):
             norm_eps=self.norm_eps,
             hc_eps=self.hc_eps,
         )
+
+    def _eager_graphs_apply(
+        self,
+        graphs: Optional[EagerReplayGraphs],
+        tail: Optional[LateLayerTail],
+        capture_dspark: bool,
+        forward_batch: ForwardBatch,
+    ) -> bool:
+        # Prefill graph steps keep every layer inside their own graph.
+        return (
+            graphs is not None
+            and tail is not None
+            and not capture_dspark
+            and tail.cp_metadata is None
+            and not is_in_breakable_cuda_graph()
+            and not get_is_capture_mode()
+            and not forward_batch.contains_mm_inputs()
+        )
+
+    def _run_full_layers(
+        self,
+        state: mhc.HcState,
+        *,
+        positions: torch.Tensor,
+        input_ids: torch.Tensor,
+        input_ids_global: torch.Tensor,
+        forward_batch: ForwardBatch,
+        hash_ids: Optional[torch.Tensor] = None,
+    ) -> mhc.HcState:
+        """The full-width layers before the tail: the full-layer graphs' body."""
+        for i in range(self.start_layer, self.full_graph_end):
+            engram = self.layers[i].engram
+            if engram is not None:
+                state = state.with_residual(
+                    engram(
+                        state.residual,
+                        hash_ids[:, engram.layer_hash_index],
+                        forward_batch,
+                        cp_all_tokens=False,
+                    )
+                )
+            ctx = (
+                nullcontext()
+                if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
+                else get_global_expert_distribution_recorder().with_current_layer(i)
+            )
+            with ctx:
+                state = self.layers[i].forward_hc_pre_from_prev(
+                    positions=positions,
+                    state=state,
+                    input_ids=input_ids,
+                    forward_batch=forward_batch,
+                    input_ids_global=input_ids_global,
+                    seam_open=False,
+                )
+        return state
+
+    def _run_late_layers(
+        self,
+        state: mhc.HcState,
+        *,
+        positions: torch.Tensor,
+        input_ids: torch.Tensor,
+        input_ids_global: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> mhc.HcState:
+        """The late layers on the tail rows: the decoder replay graphs' body."""
+        for i in range(self.late_layer_start, self.end_layer):
+            assert self.layers[i].engram is None
+            ctx = (
+                nullcontext()
+                if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
+                else get_global_expert_distribution_recorder().with_current_layer(i)
+            )
+            with ctx:
+                state = self.layers[i].forward_hc_pre_from_prev(
+                    positions=positions,
+                    state=state,
+                    input_ids=input_ids,
+                    forward_batch=forward_batch,
+                    input_ids_global=input_ids_global,
+                    seam_open=False,
+                )
+        return state.materialized(self.layers[self.end_layer - 1].hc_cfg)
 
     def _check_late_layer_tail_readers(self, forward_batch: ForwardBatch) -> None:
         # Rows outside the tail are never computed past the last kv_source layer.
@@ -4052,7 +4242,21 @@ class DeepseekV4Model(nn.Module):
         # mHC assumes full token rows per rank; LayerNorm SP needs its own path.
         assert not get_forward().sp_active
         state = mhc.HcState(hidden_states)
-        for i in range(self.start_layer, self.end_layer):
+        first_layer = self.start_layer
+        if self._eager_graphs_apply(
+            self.full_layer_graphs, tail, capture_dspark, forward_batch
+        ):
+            out = self.full_layer_graphs.run(
+                state=state,
+                forward_batch=forward_batch,
+                positions=positions,
+                input_ids=input_ids,
+                input_ids_global=input_ids_global,
+                hash_ids=hash_ids,
+            )
+            if out is not None:
+                state, first_layer = out, self.full_graph_end
+        for i in range(first_layer, self.end_layer):
             if tail is not None and i == self.late_layer_start:
                 # Decode reaches back at most SWA_WINDOW positions.
                 saved_full = attn_backend.enter_late_layer_tail(forward_batch)
@@ -4064,6 +4268,20 @@ class DeepseekV4Model(nn.Module):
                 positions = tail.positions
                 if hash_ids is not None:
                     hash_ids = tail.rows(hash_ids)
+                out = None
+                if self._eager_graphs_apply(
+                    self.decoder_replay_graphs, tail, capture_dspark, forward_batch
+                ):
+                    out = self.decoder_replay_graphs.run(
+                        state=state,
+                        forward_batch=forward_batch,
+                        positions=positions,
+                        input_ids=input_ids,
+                        input_ids_global=input_ids_global,
+                    )
+                if out is not None:
+                    attn_backend.exit_late_layer_tail(saved_full, forward_batch)
+                    return out.residual, out.pre, tail
             engram = self.layers[i].engram
             if engram is not None:
                 before_engram = state.residual
