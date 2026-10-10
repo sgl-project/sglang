@@ -567,6 +567,7 @@ class ParallelLMHead(VocabParallelEmbedding):
         enable_tp: bool = True,
         use_attn_tp_group: bool = False,
         use_presharded_weights: bool = False,
+        use_fp32_lm_head: bool = False,
     ):
         super().__init__(
             num_embeddings,
@@ -583,11 +584,17 @@ class ParallelLMHead(VocabParallelEmbedding):
         self.quant_config = quant_config
 
         # We only support pack LMHead if it's not quantized.
+        # skip amx packing when using fp32 LM head
         if _is_cpu and _is_cpu_amx_available:
-            if hasattr(self, "weight") and self.weight.dtype in [
-                torch.bfloat16,
-                torch.float16,
-            ]:
+            if (
+                not use_fp32_lm_head
+                and hasattr(self, "weight")
+                and self.weight.dtype
+                in [
+                    torch.bfloat16,
+                    torch.float16,
+                ]
+            ):
                 self.quant_method = PackWeightMethod(weight_names=["weight"])
 
         if bias:

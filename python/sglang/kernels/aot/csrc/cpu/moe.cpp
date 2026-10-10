@@ -829,8 +829,9 @@ static inline void check_moe_scales(
   } else if constexpr (quant == CPUQuantMethod::FP8_W8A16) {
     TORCH_CHECK(w1_scale.has_value(), "missing w1_scale for fp8 w8a16.");
     TORCH_CHECK(w2_scale.has_value(), "missing w2_scale for fp8 w8a16.");
-    TORCH_CHECK(block_size.has_value(), "missing block_size for fp8 w8a16.");
-    TORCH_CHECK(block_size.value().size() == 2, "expect block_size.size() to be 2.");
+    if (block_size.has_value()) {
+      TORCH_CHECK(block_size.value().size() == 2, "expect block_size.size() to be 2.");
+    }
   } else if constexpr (quant == CPUQuantMethod::MXFP4) {
     TORCH_CHECK(w1_scale.has_value(), "missing w1_scale for mxfp4.");
     TORCH_CHECK(w2_scale.has_value(), "missing w2_scale for mxfp4.");
@@ -1072,38 +1073,76 @@ at::Tensor fused_experts_cpu(
       scalar_t* __restrict__ B_tmp = (scalar_t*)((void*)(intermediate_cache0 + M * topk * 2 * N));
       bool with_bias = w1_bias.has_value();
 
-      CHECK_MOE_SCALES_FP8(1, 2);
-      fused_experts_fp_kernel_impl<scalar_t, at::Float8_e4m3fn, float, false>(
-          out_hidden_states.data_ptr<scalar_t>(),
-          intermediate_cache0,
-          intermediate_cache1,
-          intermediate_cache2,
-          A_tmp,
-          B_tmp,
-          C_tmp,
-          hidden_states.data_ptr<scalar_t>(),
-          packed_w1.data_ptr<at::Float8_e4m3fn>(),
-          packed_w2.data_ptr<at::Float8_e4m3fn>(),
-          with_bias ? w1_bias.value().data_ptr<float>() : nullptr,
-          with_bias ? w2_bias.value().data_ptr<float>() : nullptr,
-          w1s.data_ptr<float>(),
-          w2s.data_ptr<float>(),
-          block_size_N,
-          block_size_K,
-          topk_weights_.data_ptr<float>(),
-          sorted_ids,
-          expert_ids,
-          offsets,
-          M,
-          N,
-          K,
-          E,
-          topk,
-          num_tokens_post_pad,
-          alpha.has_value() ? float(alpha.value()) : 0,
-          limit.has_value() ? float(limit.value()) : 0,
-          act_func,
-          with_bias);
+      if (block_size.has_value()) {
+        CHECK_MOE_SCALES_FP8(1, 2)
+        fused_experts_fp_kernel_impl<scalar_t, at::Float8_e4m3fn, float, false>(
+            out_hidden_states.data_ptr<scalar_t>(),
+            intermediate_cache0,
+            intermediate_cache1,
+            intermediate_cache2,
+            A_tmp,
+            B_tmp,
+            C_tmp,
+            hidden_states.data_ptr<scalar_t>(),
+            packed_w1.data_ptr<at::Float8_e4m3fn>(),
+            packed_w2.data_ptr<at::Float8_e4m3fn>(),
+            with_bias ? w1_bias.value().data_ptr<float>() : nullptr,
+            with_bias ? w2_bias.value().data_ptr<float>() : nullptr,
+            w1s.data_ptr<float>(),
+            w2s.data_ptr<float>(),
+            block_size_N,
+            block_size_K,
+            topk_weights_.data_ptr<float>(),
+            sorted_ids,
+            expert_ids,
+            offsets,
+            M,
+            N,
+            K,
+            E,
+            topk,
+            num_tokens_post_pad,
+            alpha.has_value() ? float(alpha.value()) : 0,
+            limit.has_value() ? float(limit.value()) : 0,
+            act_func,
+            with_bias);
+      } else {
+        auto w1s = w1_scale.value();
+        auto w2s = w2_scale.value();
+        TORCH_CHECK(w1s.scalar_type() == at::kFloat, "expect per-tensor fp8 w1_scale to be float32.");
+        TORCH_CHECK(w2s.scalar_type() == at::kFloat, "expect per-tensor fp8 w2_scale to be float32.");
+        TORCH_CHECK(w1s.numel() == E, "expect per-tensor fp8 w1_scale.numel() == num_experts.");
+        TORCH_CHECK(w2s.numel() == E, "expect per-tensor fp8 w2_scale.numel() == num_experts.");
+        fused_experts_fp8_pertensor_kernel_impl<scalar_t>(
+            out_hidden_states.data_ptr<scalar_t>(),
+            intermediate_cache0,
+            intermediate_cache1,
+            intermediate_cache2,
+            A_tmp,
+            B_tmp,
+            C_tmp,
+            hidden_states.data_ptr<scalar_t>(),
+            packed_w1.data_ptr<at::Float8_e4m3fn>(),
+            packed_w2.data_ptr<at::Float8_e4m3fn>(),
+            with_bias ? w1_bias.value().data_ptr<float>() : nullptr,
+            with_bias ? w2_bias.value().data_ptr<float>() : nullptr,
+            w1s.data_ptr<float>(),
+            w2s.data_ptr<float>(),
+            topk_weights_.data_ptr<float>(),
+            sorted_ids,
+            expert_ids,
+            offsets,
+            M,
+            N,
+            K,
+            E,
+            topk,
+            num_tokens_post_pad,
+            alpha.has_value() ? float(alpha.value()) : 0,
+            limit.has_value() ? float(limit.value()) : 0,
+            act_func,
+            with_bias);
+      }
     } else if (moe_comp_method == CPUQuantMethod::MXFP4) {
       scalar_t* __restrict__ A_tmp = (scalar_t*)((void*)(intermediate_cache2 + M * topk * K));
       float* __restrict__ C_tmp = (float*)((void*)(A_tmp + num_threads * BLOCK_M * K));
