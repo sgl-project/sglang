@@ -57,6 +57,8 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
     vae_precision: str = "fp32"
     vae_decode_precision: str = "fp16"
     audio_vae_precision: str = "fp32"
+    # Default VSA-H3 sparsity; --attention-backend-config VSA_sparsity overrides.
+    vsa_sparsity: float = 0.9
     text_encoder_configs: tuple[MiniMaxH3Qwen3VLConfig, ...] = field(
         default_factory=lambda: (MiniMaxH3Qwen3VLConfig(),)
     )
@@ -68,15 +70,8 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
     output_audio_channels: int | None = 2
     output_av_drift_tolerance_s: float | None = 0.25
 
-    def accepts_audio_input(self) -> bool:
-        return True
-
     def supports_disaggregation(self) -> bool:
         return False
-
-    @property
-    def requires_audio_output(self) -> bool:
-        return True
 
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
         return ModelDeploymentConfig(
@@ -160,6 +155,7 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
             "is_dit_layerwise_offload_selected": (
                 server_args.is_dit_layerwise_offload_selected
             ),
+            "lora_path": server_args.lora_path,
             "model_variant": model_variant,
             "num_gpus": server_args.num_gpus,
             "performance_mode": server_args.performance_mode,
@@ -170,6 +166,7 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
             "ring_degree": server_args.ring_degree,
             "sp_degree": server_args.sp_degree,
             "tp_size": server_args.tp_size,
+            "transformer_weights_path": server_args.transformer_weights_path,
             "ulysses_degree": server_args.ulysses_degree,
             "use_fsdp_inference": server_args.use_fsdp_inference,
         }
@@ -183,6 +180,7 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
             "enable_breakable_cuda_graph": False,
             "enable_torch_compile": False,
             "is_dit_layerwise_offload_selected": False,
+            "lora_path": None,
             "model_variant": "fl2va",
             "num_gpus": 4,
             "performance_mode": "speed",
@@ -193,6 +191,7 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
             "ring_degree": 1,
             "sp_degree": 4,
             "tp_size": 1,
+            "transformer_weights_path": None,
             "ulysses_degree": 4,
             "use_fsdp_inference": False,
         }
@@ -333,16 +332,20 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
 
 @dataclass
 class FastH3PipelineConfig(MiniMaxH3PipelineConfig):
-    """FastH3: 4-step VSA-distilled MiniMax-H3, t2va only."""
+    """FastH3 8-Step V2: VSA-distilled MiniMax-H3, t2va only."""
+
+    # The checkpoint's trained sparsity (fastvideo_inference.json).
+    vsa_sparsity: float = 0.8
 
     def __post_init__(self) -> None:
         self.dit_config.arch_config.has_gate_compress = True
+        self.vae_config.stack_tiling = True
 
     def validate_quality_deployment(self, server_args) -> None:
         raise ValueError(
             'quality="high" is audited only for the base MiniMax-H3 50-step '
-            "4xH200 deployment; the FastH3 4-step distilled checkpoint has no "
-            'audited high-quality deployment. Use quality="lossless".'
+            "4xH200 deployment; FastH3 has no audited high-quality deployment. "
+            'Use quality="exact", or the default "lossless".'
         )
 
     def validate_server_args(self, server_args) -> None:
@@ -356,3 +359,38 @@ class FastH3PipelineConfig(MiniMaxH3PipelineConfig):
 
 
 __all__ = ["FastH3PipelineConfig", "MiniMaxH3PipelineConfig"]
+
+
+def register():
+    from sglang.multimodal_gen.configs.sample.minimax_h3 import (
+        FastH3SamplingParams,
+        MiniMaxH3SamplingParams,
+    )
+    from sglang.multimodal_gen.registry import register_configs
+
+    register_configs(
+        sampling_param_cls=MiniMaxH3SamplingParams,
+        pipeline_config_cls=MiniMaxH3PipelineConfig,
+        hf_model_paths=[
+            "MiniMaxAI/MiniMax-H3",
+            "MiniMax/MiniMax-H3",
+        ],
+        model_detectors=[
+            lambda model_id: (
+                "minimaxh3" in model_id.lower().replace("-", "").replace("_", "")
+                and "vdn" not in model_id.lower()
+            )
+        ],
+    )
+    register_configs(
+        sampling_param_cls=FastH3SamplingParams,
+        pipeline_config_cls=FastH3PipelineConfig,
+        hf_model_paths=[
+            "FastVideo/FastVideo-FastH3-8-Step-V2",
+        ],
+        model_detectors=[
+            lambda model_id: (
+                "fasth3" in model_id.lower().replace("-", "").replace("_", "")
+            )
+        ],
+    )

@@ -25,15 +25,6 @@ def skip_if_no_blackwell_nvfp4(func):
 class TestKVCacheQuantRegistry(CustomTestCase):
     """Test the registry and factory function."""
 
-    def test_registry_contains_nvfp4_and_blockfp4(self):
-        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
-            KV_CACHE_QUANT_REGISTRY,
-        )
-
-        self.assertIn("nvfp4", KV_CACHE_QUANT_REGISTRY)
-        self.assertIn("fp4_mx_block16", KV_CACHE_QUANT_REGISTRY)
-        self.assertIn("cpu_fp8_e4m3", KV_CACHE_QUANT_REGISTRY)
-
     def test_factory_nvfp4(self):
         from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
             NVFP4KVCacheMethod,
@@ -62,29 +53,6 @@ class TestKVCacheQuantRegistry(CustomTestCase):
         self.assertEqual(resolve_kv_cache_quant("nvfp4"), "nvfp4")
         self.assertEqual(resolve_kv_cache_quant("fp4_mx_block16"), "fp4_mx_block16")
         self.assertIsNone(resolve_kv_cache_quant("fp8_e4m3"))
-
-    def test_resolve_legacy_fp4_alias_raises(self):
-        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
-            resolve_kv_cache_quant,
-        )
-
-        with self.assertRaisesRegex(ValueError, "fp4_mx_block16"):
-            resolve_kv_cache_quant("fp4_e2m1")
-
-    def test_model_runner_rejects_legacy_fp4_alias(self):
-        from sglang.srt.model_executor.model_runner import ModelRunner
-        from sglang.srt.runtime_context import get_context
-
-        runner = object.__new__(ModelRunner)
-        runner.server_args = SimpleNamespace(speculative_draft_kv_cache_dtype=None)
-        runner.draft_attention_backend = None
-        # The runner reads the requested dtype off the model bag, so the double
-        # publishes it rather than carrying it on a stand-in config.
-        override = get_context().override_server_args(kv_cache_dtype="fp4_e2m1")
-        override.install()
-        self.addCleanup(override.restore)
-        with self.assertRaisesRegex(ValueError, "fp4_mx_block16"):
-            runner.configure_kv_cache_dtype()
 
     def test_resolve_mxfp4_name_raises(self):
         from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (

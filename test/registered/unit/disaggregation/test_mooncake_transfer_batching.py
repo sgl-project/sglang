@@ -1,12 +1,20 @@
 import concurrent.futures
+import ctypes
 import unittest
+from collections import defaultdict
+from queue import SimpleQueue
+from threading import Event, Lock
 from types import SimpleNamespace
-from unittest.mock import MagicMock, call
+from unittest.mock import MagicMock, call, patch
 
 import numpy as np
 
-from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
+from sglang.srt.disaggregation.base.conn import KVPoll, StateType
+from sglang.srt.disaggregation.common.utils import TransferKVChunk
+from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager, MooncakeKVSender
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
@@ -128,6 +136,61 @@ class TestMooncakeTransferBatching(unittest.TestCase):
             ],
             any_order=True,
         )
+
+
+class TestMiniMaxStateTransfer(CustomTestCase):
+    def test_index_truncates_but_dense_rejects_mismatched_page_lists(self):
+        """Legacy index transfers copy the common prefix; incomplete dense KV must fail."""
+
+        def copy_bytes(session, sources, destinations, lengths):
+            for src, dst, length in zip(sources, destinations, lengths, strict=True):
+                ctypes.memmove(dst, src, length)
+            return 0
+
+        for state in (StateType.MINIMAX_INDEX_K, StateType.MINIMAX_DENSE_KV):
+            for src_pages, dst_pages in (([1], [0]), ([1, 2], [0]), ([1], [0, 2])):
+                with self.subTest(state=state, src=src_pages, dst=dst_pages):
+                    src = np.arange(3, dtype=np.int32)
+                    dst = np.full(3, -1, dtype=np.int32)
+                    manager = MooncakeKVManager.__new__(MooncakeKVManager)
+                    manager.kv_args = SimpleNamespace(
+                        state_types=[state],
+                        state_data_ptrs=[[src.ctypes.data]],
+                        state_item_lens=[[src.itemsize]],
+                        state_dim_per_tensor=[[]],
+                        state_layer_ids=[[]],
+                    )
+                    manager.engine = SimpleNamespace(batch_transfer_sync=copy_bytes)
+                    manager.pp_size = manager.attn_tp_size = 1
+                    manager.is_mla_backend = manager.is_hybrid_mla_backend = False
+                    manager.enable_custom_mem_pool = False
+                    manager.max_transfer_batch_indices = 0
+                    peer = SimpleNamespace(
+                        dst_state_data_ptrs=[[dst.ctypes.data]],
+                        dst_state_item_lens=[[dst.itemsize]],
+                        dst_state_dim_per_tensor=[[]],
+                        dst_state_layer_ids=[[]],
+                        dst_attn_tp_size=1,
+                    )
+                    kwargs = dict(
+                        req=SimpleNamespace(
+                            mooncake_session_id="cpu", dst_state_indices=[dst_pages]
+                        ),
+                        prefill_state_indices=[src_pages],
+                        executor=None,
+                        target_rank_registration_info=peer,
+                    )
+                    if state == StateType.MINIMAX_DENSE_KV and len(src_pages) != len(
+                        dst_pages
+                    ):
+                        with self.assertRaisesRegex(
+                            RuntimeError, "state index length mismatch"
+                        ):
+                            manager.maybe_send_extra(**kwargs)
+                        np.testing.assert_array_equal(dst, [-1, -1, -1])
+                    else:
+                        self.assertEqual(manager.maybe_send_extra(**kwargs), 0)
+                        np.testing.assert_array_equal(dst, [1, -1, -1])
 
 
 class TestDcpDraftHeadTransfer(unittest.TestCase):
@@ -284,6 +347,199 @@ class TestDcpDraftHeadTransfer(unittest.TestCase):
                 np.arange(tokens * 8).reshape(tokens, 8).astype(np.uint8)[owned],
             )
             self.assertFalse(dst_buffers[1000000].any())
+
+
+class TestDcpPackLifetime(CustomTestCase):
+    def test_failed_transfer_drains_before_pack_buffer_reuse(self):
+        """A failed layer must not release the pack buffer while another transfer reads it."""
+        manager = TestMooncakeTransferBatching._make_manager(
+            enable_custom_mem_pool=True
+        )
+        manager.kv_args = SimpleNamespace(
+            page_size=1, kv_layer_ids=[], kv_data_ptrs=[1000, 2000], num_draft_entries=0
+        )
+        source = np.array([11], dtype=np.uint8)
+        observed = []
+        running, release = Event(), Event()
+
+        def transfer(session, blocks):
+            if blocks[0][0] == 1000:
+                self.assertTrue(running.wait(10))
+                return 17
+            running.set()
+            self.assertTrue(release.wait(10))
+            observed.append(int(source[0]))
+            return 0
+
+        def send(executor):
+            result = MooncakeKVManager.send_kvcache_dcp(
+                manager,
+                "session",
+                np.array([0, 1], dtype=np.int32),
+                [5000, 6000],
+                np.array([0], dtype=np.int32),
+                dcp_token_item_lens=[1, 1],
+                dst_dcp_size=2,
+                dst_dcp_rank=0,
+                src_page_offset=0,
+                decode_prefix_len=0,
+                num_kv_tokens=2,
+                executor=executor,
+                dst_layer_ids=[],
+                pack_buffer=object(),
+            )
+            source[0] = 22
+            return result
+
+        manager._transfer_data = transfer
+        with (
+            patch(
+                "sglang.srt.disaggregation.common.dcp_pack.try_pack_dcp_src",
+                return_value=([1000, 2000], np.array([0], dtype=np.int64)),
+            ),
+            concurrent.futures.ThreadPoolExecutor(max_workers=2) as transfers,
+            concurrent.futures.ThreadPoolExecutor(max_workers=1) as worker,
+        ):
+            future = worker.submit(send, transfers)
+            try:
+                self.assertTrue(running.wait(10))
+                with self.assertRaises(concurrent.futures.TimeoutError):
+                    future.result(timeout=1)
+            finally:
+                release.set()
+            self.assertEqual(future.result(timeout=10), 17)
+        self.assertEqual(observed, [11])
+
+
+class TestMooncakeEarlySend(unittest.TestCase):
+    def test_sender_queues_event_once_without_waiting_on_scheduler(self):
+        for last in (False, True):
+            with self.subTest(last=last):
+                ready = MagicMock()
+                manager = MagicMock()
+                sender = SimpleNamespace(
+                    kv_mgr=manager,
+                    bootstrap_room=1,
+                    aux_index=0,
+                    trace_ctx=MagicMock(),
+                    _early_send_wait_event=ready,
+                    _prepare_send_indices=lambda ids, state: (
+                        ids,
+                        slice(0, 1),
+                        last,
+                        False,
+                    ),
+                    _record_transfer_indices=MagicMock(),
+                )
+                MooncakeKVSender.send(sender, [0])
+                self.assertIs(
+                    manager.add_transfer_request.call_args.kwargs["wait_event"], ready
+                )
+                ready.synchronize.assert_not_called()
+                MooncakeKVSender.send(sender, [1])
+                self.assertIsNone(
+                    manager.add_transfer_request.call_args.kwargs["wait_event"]
+                )
+
+    def test_manager_preserves_event_in_queued_chunk(self):
+        queue = SimpleQueue()
+        ready = MagicMock()
+        manager = SimpleNamespace(
+            disaggregation_mode=DisaggregationMode.PREFILL,
+            request_status={1: KVPoll.WaitingForInput},
+            check_status=lambda room: KVPoll.WaitingForInput,
+            transfer_infos={1: {"127.0.0.1:80": object()}},
+            transfer_queues=[queue],
+        )
+        MooncakeKVManager.add_transfer_request(
+            manager, 1, [0], slice(0, 1), False, wait_event=ready
+        )
+        self.assertIs(queue.get_nowait().wait_event, ready)
+        ready.synchronize.assert_not_called()
+
+    def _worker(self, event):
+        chunk = TransferKVChunk(
+            1, [0], slice(0, 1), False, None, None, wait_event=event
+        )
+        queue = SimpleQueue()
+        queue.put(chunk)
+        queue.put(None)
+        peer = SimpleNamespace(
+            is_dummy=False,
+            mooncake_session_id="peer",
+            dst_device_kv_indices=None,
+            dst_kv_indices=[10],
+        )
+        registration = SimpleNamespace(
+            requires_dcp_relayout=False,
+            dst_kv_ptrs=[1000],
+            dst_kv_layer_ids=[0],
+            dst_kv_item_len=16,
+            dst_attn_tp_size=1,
+        )
+        manager = SimpleNamespace(
+            enable_trace=False,
+            enable_staging=False,
+            enable_deferred_decode_kv_release=True,
+            _staging_outstanding=defaultdict(int),
+            request_status={1: KVPoll.WaitingForInput},
+            transfer_infos={1: {"peer": peer}},
+            _prefill_unique_rank=lambda: 0,
+            session_lock=Lock(),
+            failed_sessions=set(),
+            # Read under session_lock alongside failed_sessions on every
+            # non-dummy req, and invoked by the worker's except path.
+            state_layout_rejections={},
+            poison_deferred_ack_room=MagicMock(),
+            decode_kv_args_table={"peer": registration},
+            _get_dsa_cache_transfer_skip_flags=lambda reg: (False, False),
+            kv_args=SimpleNamespace(kv_data_ptrs=[1]),
+            is_mla_backend=True,
+            send_kvcache=MagicMock(return_value=0),
+            _maybe_ack_drained_abort=MagicMock(),
+            bootstrap_port=8998,
+        )
+        manager.check_status = lambda room: manager.request_status[room]
+        return manager, queue
+
+    def test_worker_waits_before_reading_kv(self):
+        ready = MagicMock()
+        manager, queue = self._worker(ready)
+
+        def transfer(*args, **kwargs):
+            ready.synchronize.assert_called_once_with()
+            return 0
+
+        manager.send_kvcache.side_effect = transfer
+        MooncakeKVManager.transfer_worker(manager, queue, MagicMock())
+        manager.send_kvcache.assert_called_once()
+
+    def test_abort_during_wait_prevents_transfer_and_releases_ack(self):
+        ready = MagicMock()
+        manager, queue = self._worker(ready)
+        ready.synchronize.side_effect = lambda: manager.request_status.update(
+            {1: KVPoll.Failed}
+        )
+        MooncakeKVManager.transfer_worker(manager, queue, MagicMock())
+        ready.synchronize.assert_called_once_with()
+        manager.send_kvcache.assert_not_called()
+        manager._maybe_ack_drained_abort.assert_called_once_with(1)
+        self.assertNotIn(1, manager._staging_outstanding)
+
+    def test_failed_room_skips_wait(self):
+        ready = MagicMock()
+        manager, queue = self._worker(ready)
+        manager.request_status[1] = KVPoll.Failed
+        MooncakeKVManager.transfer_worker(manager, queue, MagicMock())
+        ready.synchronize.assert_not_called()
+        manager.send_kvcache.assert_not_called()
+        manager._maybe_ack_drained_abort.assert_called_once_with(1)
+        self.assertNotIn(1, manager._staging_outstanding)
+
+    def test_worker_preserves_no_event_path(self):
+        manager, queue = self._worker(None)
+        MooncakeKVManager.transfer_worker(manager, queue, MagicMock())
+        manager.send_kvcache.assert_called_once()
 
 
 if __name__ == "__main__":

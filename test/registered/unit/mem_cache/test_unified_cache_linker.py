@@ -18,7 +18,8 @@ from test_unified_radix_cache_unittest import (
     build_fixture,
 )
 
-from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
+from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req, ReqKvInfo
+from sglang.srt.mem_cache.allocation import _prefix_kv_indices
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     InitLoadBackParams,
@@ -399,18 +400,18 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
         match = consumer.match_prefix(
             MatchPrefixParams(key=RadixKey(array("q", tokens)), req=req)
         )
-        self.assertEqual(match.device_indices.numel(), 0)
+        self.assertEqual(match.device_prefix_len, 0)
         self.assertEqual(match.host_hit_length, len(tokens))
         self._apply_match_to_req(req, match)
 
-        loaded, loaded_node = consumer.init_load_back(
+        loaded_len, loaded_node = consumer.init_load_back(
             InitLoadBackParams(
                 best_match_node=match.best_match_node,
                 host_hit_length=match.host_hit_length,
                 req=req,
             )
         )
-        self.assertEqual(loaded.numel(), len(tokens))
+        self.assertEqual(loaded_len, len(tokens))
         self.assertNotEqual(loaded_node, consumer.root_node_handle())
         (kv_load,) = consumer_linker.queued_loads[req.rid]
         self.assertEqual(kv_load.name, PoolName.KV)
@@ -424,7 +425,7 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
         final_match = consumer.match_prefix(
             MatchPrefixParams(key=RadixKey(array("q", tokens)))
         )
-        self.assertEqual(final_match.device_indices.numel(), len(tokens))
+        self.assertEqual(final_match.device_prefix_len, len(tokens))
         self.assertEqual(consumer_linker.offload_calls, [])
         consumer.sanity_check()
 
@@ -465,7 +466,7 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
         match = consumer.match_prefix(MatchPrefixParams(key=lookup_key, req=req))
 
         self.assertTrue(lookup_key.is_bigram)
-        self.assertEqual(match.device_indices.numel(), 4)
+        self.assertEqual(match.device_prefix_len, 4)
         self.assertEqual(match.host_hit_length, 4)
         self.assertEqual(len(consumer_linker.lookup_calls), 1)
         _, transfers = consumer_linker.lookup_calls[0]
@@ -576,7 +577,7 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
         match = consumer.match_prefix(
             MatchPrefixParams(key=RadixKey(array("q", tokens)), req=req)
         )
-        self.assertEqual(match.device_indices.numel(), 2)
+        self.assertEqual(match.device_prefix_len, 2)
         self.assertEqual(match.host_hit_length, 2)
         self.assertEqual(match.swa_host_hit_length, 2)
         self._apply_match_to_req(req, match)
@@ -585,17 +586,20 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
         raced_match = consumer.match_prefix(
             MatchPrefixParams(key=RadixKey(array("q", tokens[:3])))
         )
-        raced_full = raced_match.device_indices[-1:].clone()
+        raced_full = consumer.path_device_indices(raced_match.last_device_node)[
+            -1:
+        ].clone()
         raced_swa = consumer_allocator.translate_loc_from_full_to_swa(raced_full)
 
-        loaded, loaded_node = consumer.init_load_back(
+        loaded_len, loaded_node = consumer.init_load_back(
             InitLoadBackParams(
                 best_match_node=match.best_match_node,
                 host_hit_length=match.host_hit_length,
                 req=req,
             )
         )
-        self.assertEqual(loaded.numel(), 2)
+        self.assertEqual(loaded_len, 2)
+        loaded = consumer.path_device_indices(loaded_node)[-loaded_len:]
         self.assertTrue(torch.equal(loaded[:1], raced_full))
         load_by_pool = {
             transfer.name: transfer
@@ -619,7 +623,7 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
         final_match = consumer.match_prefix(
             MatchPrefixParams(key=RadixKey(array("q", tokens[:4])))
         )
-        self.assertEqual(final_match.device_indices.numel(), 4)
+        self.assertEqual(final_match.device_prefix_len, 4)
         self.assertEqual(_device_lock_ref(consumer, loaded_node, ComponentType.FULL), 0)
         consumer.sanity_check()
 
@@ -809,7 +813,7 @@ def test_pp0_queries_and_later_stage_reuses_hit_boundary(hit_pages, device_hit_l
 
     key = RadixKey(array("q", [1, 2, 3, 4]))
     empty_match = MatchResult(
-        device_indices=torch.empty(0, dtype=torch.int64),
+        device_prefix_len=0,
         last_device_node=0,
         last_host_node=0,
         best_match_node=0,
@@ -830,7 +834,7 @@ def test_pp0_queries_and_later_stage_reuses_hit_boundary(hit_pages, device_hit_l
     pp1_req = SimpleNamespace(
         rid="rid", external_cache_hit_length=pp0_req.external_cache_hit_length
     )
-    local_match = empty_match._replace(device_indices=torch.arange(device_hit_len))
+    local_match = empty_match._replace(device_prefix_len=device_hit_len)
     pp1_result = pp1.match(key, pp1_req, local_match)
 
     assert pp1_result.host_hit_length == max(0, hit_pages * 2 - device_hit_len)
@@ -868,6 +872,7 @@ def pp_cache():
             token_to_kv_pool_allocator=allocator,
             page_size=1,
             pp_size=2,
+            pp_rank=0,
             sliding_window_size=4,
             tree_components=(ComponentType.FULL, ComponentType.SWA),
         )
@@ -881,41 +886,66 @@ def pp_cache():
         origin_input_ids=array("q", [1, 2, 3, 4, 5]),
         sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
     )
-    req_pool.alloc([req])
     req.init_next_round_input(cache)
     return cache, allocator, req, backend
 
 
 @pytest.mark.parametrize("overlap", [0, 2, 4])
 @pytest.mark.parametrize("outcome", ["finished", "unfinished", "abort"])
-def test_pp_load_uses_normal_request_insert_and_release(pp_cache, overlap, outcome):
+@pytest.mark.parametrize("holds_row", [False, True])
+def test_pp_load_uses_normal_request_insert_and_release(
+    pp_cache, overlap, outcome, holds_row
+):
     cache, allocator, req, backend = pp_cache
     key = RadixKey(req.origin_input_ids)
-    loaded, last_node = cache.linker.load_back(req)
+    if holds_row:
+        cache.req_to_token_pool.alloc([req])
+    available_rows = cache.req_to_token_pool.available_size()
+    loaded_len, last_node = cache.linker.load_back(req)
 
-    assert len(loaded) == 4
+    assert loaded_len == 4
     assert last_node == req.last_node == cache.root_node_handle()
     assert req.kv.cache_protected_len == 0
-    assert cache.match_prefix(MatchPrefixParams(key=key)).device_indices.numel() == 0
+    assert cache.match_prefix(MatchPrefixParams(key=key)).device_prefix_len == 0
+    assert cache.req_to_token_pool.available_size() == available_rows
+    assert (req.rid in cache.linker.pending_pp_prefixes) == (not holds_row)
+
+    req.prefix_len = loaded_len
+    req.extend_end = 5
+    batch = SimpleNamespace(req_to_token_pool=cache.req_to_token_pool, tree_cache=cache)
+    loaded = _prefix_kv_indices(batch, req)
+    assert len(loaded) == loaded_len
+    # Reading a staged prefix cannot claim its slots before allocation succeeds.
+    assert (req.rid in cache.linker.pending_pp_prefixes) == (not holds_row)
 
     # A different microbatch may publish overlapping KV before this PP result returns.
     existing = allocator.alloc(overlap)
     if overlap:
         cache.insert(InsertParams(key=key[:overlap], value=existing))
-    req.prefix_indices = loaded
-    req.set_extend_range(4, 5)
     values = torch.cat([loaded, allocator.alloc(1)])
+    cache.req_to_token_pool.alloc([req])
     cache.req_to_token_pool.write((req.kv.req_pool_idx, slice(0, 5)), values)
+    req.kv.kv_allocated_len = req.kv.kv_committed_len = 5
+    cache.maybe_hand_to_session(req)
+    assert not cache.linker.pending_pp_prefixes
     backend.completed_loads.append([req.rid])
     cache.linker.drain_loads(1)
     assert allocator.full_available_size() == 32 - 5 - overlap
 
     if outcome == "unfinished":
-        cache.cache_unfinished_req(req)
+        cache.checkpoint(req, up_to=5)
     else:
-        cache.cache_finished_req(req, is_insert=outcome == "finished", owned_kv_len=5)
+        if outcome == "finished":
+            req.finished_reason = FINISH_LENGTH(length=0)
+            cache.checkpoint(req, up_to=5)
+        cache.free_kv_row(req.kv, [(req.kv.cache_protected_len, 5)])
+        cache.unlock(req.lock)
+        req.lock = None
 
-    matched = cache.match_prefix(MatchPrefixParams(key=key)).device_indices
+    match = cache.match_prefix(MatchPrefixParams(key=key))
+    matched = cache.path_device_indices(match.last_device_node)[
+        : match.device_prefix_len
+    ]
     expected = (
         existing if outcome == "abort" else torch.cat([existing, values[overlap:]])
     )
@@ -940,7 +970,44 @@ def test_pp_load_queue_failure_releases_full_and_swa_slots(pp_cache, raises):
         cache.linker.load_back(req)
     assert allocator.full_available_size() == allocator.swa_available_size() == 32
     assert not cache.linker.pending_loads
+    assert not cache.linker.pending_pp_prefixes
+    assert not req.kv.holds_kv
     assert not cache.tree_core.root_node.children
+
+
+@pytest.mark.parametrize(
+    "cancel_queued,already_completed", [(True, False), (False, False), (False, True)]
+)
+def test_pp_unclaimed_prefix_release_waits_for_dma(
+    pp_cache, cancel_queued, already_completed
+):
+    cache, allocator, req, backend = pp_cache
+    cache.linker.load_back(req)
+    if not cancel_queued:
+        backend.queued_loads.clear()
+    if already_completed:
+        backend.completed_loads.append([req.rid])
+        cache.linker.drain_loads(1)
+    cache.linker.release_request(req.rid)
+    if not cancel_queued and not already_completed:
+        assert allocator.full_available_size() == 28
+        assert allocator.swa_available_size() == 28
+        assert req.rid in cache.linker.pending_pp_prefixes
+        backend.completed_loads.append([req.rid])
+        cache.linker.drain_loads(1)
+    assert allocator.full_available_size() == allocator.swa_available_size() == 32
+    assert not cache.linker.pending_pp_prefixes
+    assert not cache.linker.pending_loads
+
+
+@pytest.mark.parametrize("operation", ["reset", "close"])
+def test_pp_unclaimed_prefix_quiesce_releases_slots(pp_cache, operation):
+    cache, allocator, req, backend = pp_cache
+    cache.linker.load_back(req)
+    getattr(cache.linker, operation)()
+    assert allocator.full_available_size() == allocator.swa_available_size() == 32
+    assert not cache.linker.pending_pp_prefixes
+    assert not cache.linker.pending_loads
 
 
 def test_async_offload_pins_node_until_completion():
@@ -1335,7 +1402,7 @@ def test_linker_filters_request_relative_swa_from_lookup(
     wrapper = UnifiedCacheLinkerWrapper(cache, backend)
     assert wrapper._components == (full,)
     result = MatchResult(
-        device_indices=torch.empty(0, dtype=torch.int64),
+        device_prefix_len=0,
         last_device_node=0,
         last_host_node=0,
         best_match_node=0,
@@ -1428,7 +1495,8 @@ def test_linker_load_preserves_swa_boundaries(
     def prepare(phase, req, full_transfer, transfer, prefix_len, **kwargs):
         if phase == ExternalLinkerLoadPhase.PREPARE:
             req.kv = ReqKvInfo(
-                kv_allocated_len=prefix_len, swa_evicted_seqlen=prefix_len - 2
+                kv_allocated_len=prefix_len,
+                component_evicted_seqlens={ComponentType.SWA: prefix_len - 2},
             )
         return transfer
 
@@ -1449,9 +1517,6 @@ def test_linker_load_preserves_swa_boundaries(
         components={ComponentType.FULL: full, ComponentType.SWA: swa},
         token_to_kv_pool_allocator=_swa_allocator(swa_req_ring),
         tree_core=SimpleNamespace(
-            empty_match_result=SimpleNamespace(
-                device_indices=torch.empty(0, dtype=torch.int64)
-            ),
             collect_full_device_indices=lambda node, ancestor: full_indices,
             mark_external_cache_stored_path=MagicMock(),
         ),
@@ -1461,6 +1526,7 @@ def test_linker_load_preserves_swa_boundaries(
             )
         ),
         resolve_node_handle=lambda node_id: SimpleNamespace(id=0),
+        prefix_device_indices=lambda req: torch.empty(0, dtype=torch.int64),
     )
     wrapper = UnifiedCacheLinkerWrapper(cache, _FakeLinker())
     wrapper.hit_markers["rid"] = ExternalCacheHitMarker(
@@ -1473,27 +1539,31 @@ def test_linker_load_preserves_swa_boundaries(
         None
         if previous_boundary is None
         else ReqKvInfo(
-            kv_allocated_len=previous_boundary, swa_evicted_seqlen=previous_boundary
+            kv_allocated_len=previous_boundary,
+            component_evicted_seqlens={ComponentType.SWA: previous_boundary},
         )
     )
     req = SimpleNamespace(
         rid="rid",
         kv=kv,
-        prefix_indices=torch.empty(0, dtype=torch.int64),
+        prefix_len=0,
         last_node=0,
         priority=0,
     )
-    restored, last_node = wrapper.load_back(req)
+    restored_len, last_node = wrapper.load_back(req)
 
-    assert restored.tolist() == full_indices.tolist()
+    assert restored_len == len(full_indices)
     assert last_node == 0
-    assert req.kv.swa_evicted_seqlen == expected_boundary
+    assert req.kv.get_evicted_seqlen(ComponentType.SWA) == expected_boundary
     assert req.kv.kv_allocated_len == (previous_boundary or 4)
     if pp_size > 1:
         cache.insert.assert_not_called()
         cache.tree_core.mark_external_cache_stored_path.assert_not_called()
     else:
-        assert cache.insert.call_args.args[0].swa_evicted_seqlen == expected_boundary
+        assert (
+            cache.insert.call_args.args[0].get_evicted_seqlen(ComponentType.SWA)
+            == expected_boundary
+        )
         cache.tree_core.mark_external_cache_stored_path.assert_called_once_with(0, 0)
     assert [c.args[0] for c in full.build_external_linker_transfer.call_args_list] == [
         LinkerTransferPhase.LOAD

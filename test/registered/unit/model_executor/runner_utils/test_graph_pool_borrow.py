@@ -376,6 +376,9 @@ class TestGraphPoolBorrow(CustomTestCase):
                     logits = torch.randn(rows, 4096, device="cuda")
                     token_ids = torch.randint(0, 4096, (rows,), device="cuda")
                     split = rows // 2
+                    # Exercise tied top-k scores in both sequences explicitly.
+                    for row in (0, split):
+                        logits[row, :4] = logits[row].max() + 1
                     sample_indices = [split - 1, rows - 1]
                     metadata = SimpleNamespace(
                         sample_indices_cpu=sample_indices,
@@ -424,14 +427,22 @@ class TestGraphPoolBorrow(CustomTestCase):
                     )
                     self.assertTrue(torch.equal(sampled, logits[sample_indices]))
                     for i, (lo, hi) in enumerate(((0, split), (split, rows))):
-                        values, indices = expected[lo:hi].topk(
-                            metadata.top_logprobs_nums[i]
+                        values = (
+                            expected[lo:hi].topk(metadata.top_logprobs_nums[i]).values
                         )
                         self.assertEqual(
                             output.input_top_logprobs_val[i], values.tolist()
                         )
+                        # topk(max_k)[:k] and topk(k) may choose different tied
+                        # tokens. Check that the returned IDs select the right
+                        # scores and never repeat a token within one row.
+                        actual_indices = output.input_top_logprobs_idx[i]
+                        indices = torch.tensor(actual_indices, device=expected.device)
                         self.assertEqual(
-                            output.input_top_logprobs_idx[i], indices.tolist()
+                            expected[lo:hi].gather(1, indices).tolist(), values.tolist()
+                        )
+                        self.assertTrue(
+                            all(len(set(row)) == len(row) for row in actual_indices)
                         )
                         self.assertEqual(
                             output.input_token_ids_logprobs_val[i],

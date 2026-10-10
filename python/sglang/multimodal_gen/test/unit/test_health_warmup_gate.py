@@ -53,6 +53,37 @@ class TestHealthWarmupGate(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resp, {"status": "ok"})
 
 
+class TestRouteModelPrebuild(unittest.TestCase):
+    def _app(self):
+        from fastapi import APIRouter, FastAPI
+        from pydantic import BaseModel
+
+        class Body(BaseModel):
+            value: int
+
+        router = APIRouter()
+
+        @router.post("/thing")
+        async def thing(body: Body) -> Body:
+            return body
+
+        app = FastAPI()
+        app.include_router(router)
+        return app
+
+    def test_prebuild_resolves_route_models_before_the_first_request(self):
+        app = self._app()
+        self.assertIsNone(app.openapi_schema)
+        http_server.build_route_request_models(app)
+        self.assertIn("/thing", app.openapi_schema["paths"])
+
+    def test_prebuild_failure_does_not_break_startup(self):
+        app = self._app()
+        with mock.patch.object(app, "openapi", side_effect=RuntimeError("bad schema")):
+            http_server.build_route_request_models(app)
+        self.assertIsNone(app.openapi_schema)
+
+
 class _FakeResponse:
     def __init__(self, status_code: int):
         self.status_code = status_code
