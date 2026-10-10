@@ -197,3 +197,24 @@ def test_registry_source_revision_survives_upstream_removing_required_file(
     )
 
     assert os.path.isdir(resolved)
+
+
+def test_sibling_hf_cache_repo_does_not_match_overlay(monkeypatch, tmp_path):
+    """A cache dir of `ltx-2.3-distilled` must not resolve to the `ltx-2.3`
+    overlay just because the shorter repo name is a substring of the path."""
+    spec = {"overlay_repo_id": "overlay/ltx-2.3"}
+    monkeypatch.setattr(
+        model_overlay,
+        "_load_model_overlay_registry",
+        lambda: {"Lightricks/LTX-2.3": spec},
+    )
+    sibling = tmp_path / "models--lightricks--ltx-2.3-distilled" / "snapshots" / "abc"
+    sibling.mkdir(parents=True)
+    exact = tmp_path / "models--lightricks--ltx-2.3" / "snapshots" / "abc"
+    exact.mkdir(parents=True)
+
+    assert model_overlay.resolve_model_overlay_target(str(sibling)) is None
+    assert model_overlay.resolve_model_overlay_target(str(exact)) == (
+        "Lightricks/LTX-2.3",
+        spec,
+    )
