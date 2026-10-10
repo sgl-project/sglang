@@ -1,10 +1,9 @@
 """ModelSlim MXFP4 scheme for pre-quantized weight inference on NPU.
 
-Loads weights pre-quantized by msmodelslim and runs MXFP4 dual-level
-matmul at inference via npu_dual_level_quant_matmul.
+Loads repacked msmodelslim weights and selects single/dual-level MXFP4 matmul.
 
 Checkpoint tensor formats (verified from msmodelslim export):
-  weight:           [out, in]           float8_e4m3fn  (FP4 data in fp8 container)
+  weight:           [out, in/2]         uint8          (packed FP4 E2M1)
   weight_scale:     [out, in/32]        uint8          (L1 block scales, e8m0+127)
   weight_dual_scale:[out, in/512, 1]    float32        (L0 coarse scales)
   mul_scale:        [in]                float32        (smooth quant activation scale)
@@ -14,19 +13,20 @@ from typing import List, Optional
 
 import torch
 
-from sglang.multimodal_gen.runtime.platforms import current_platform
-
-_is_npu = current_platform.is_npu()
-
-if _is_npu:
-    import torch_npu
-
+from sglang.multimodal_gen.runtime.layers.quantization.modelslim_mxfp_utils import (
+    mxfp4_quant_kwargs,
+    resolve_precision,
+)
 from sglang.multimodal_gen.runtime.models.parameter import (
-    BasevLLMParameter,
     GroupQuantScaleParameter,
     ModelWeightParameter,
+    RowvLLMParameter,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.srt.layers.quantization.modelslim.schemes import ModelSlimLinearScheme
+
+if current_platform.is_npu():
+    import torch_npu  # noqa: E402
 
 MXFP4_BLOCK_SIZE = 32
 # L1 (dual) scale groups this many L0 blocks together.
@@ -52,17 +52,20 @@ class ModelSlimMXFP4Scheme(ModelSlimLinearScheme):
         self.legacy_mul_scale_key = prefix + ".div.mul_scale"
         self.has_mul_scale = (
             self.legacy_mul_scale_key in quant_config
-            and self.mul_scale_key in quant_config
+            or self.mul_scale_key in quant_config
         )
         self.single_level_kernel = None
+        self.w4a8_kernel = None
         if not self.is_dual_scale:
             from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
+                NPUMXFP4W4A8OfflineLinearMethod,
                 NPUSingleLevelMXFP4OfflineLinearMethod,
             )
 
             self.single_level_kernel = NPUSingleLevelMXFP4OfflineLinearMethod()
+            self.w4a8_kernel = NPUMXFP4W4A8OfflineLinearMethod()
         else:
-            if self.is_dual_scale_key not in self.quant_config:
+            if self.dual_scale_key not in self.quant_config:
                 raise ValueError(
                     f"Dual-level MXFP4 quantization requires missing '{self.dual_scale_key}' in quant_config."
                     "Check that the model was exported with dual-level quantization."
@@ -80,10 +83,13 @@ class ModelSlimMXFP4Scheme(ModelSlimLinearScheme):
     ):
         weight_loader = extra_weight_attrs.get("weight_loader")
         output_size_per_partition = sum(output_partition_sizes)
+        alignment = 512 if self.is_dual_scale else 64
+        if input_size_per_partition % alignment:
+            raise ValueError(
+                f"{self.prefix}: MXFP4 input partition must be divisible by {alignment}"
+            )
 
-        # msmodelslim exports weight as float8_e4m3fn, shape [out, in].
-        # Each byte is a float8 container for FP4 data; the actual FP4 packing
-        # (npu_dtype_cast → float4_e2m1fn_x2) happens in process_weights_after_loading.
+        # wan_repack converts numeric FP8 containers to packed FP4 bytes.
         weight = ModelWeightParameter(
             data=torch.empty(
                 (
@@ -96,6 +102,7 @@ class ModelSlimMXFP4Scheme(ModelSlimLinearScheme):
             output_dim=0,
             weight_loader=weight_loader,
         )
+        weight.missing_param_init = "error"
         layer.register_parameter("weight", weight)
 
         # L1 block scale: uint8 [out, in/32], e8m0 scale with +127 offset.
@@ -109,6 +116,7 @@ class ModelSlimMXFP4Scheme(ModelSlimLinearScheme):
             output_dim=0,
             weight_loader=weight_loader,
         )
+        weight_scale.missing_param_init = "error"
         layer.register_parameter("weight_scale", weight_scale)
         if self.is_dual_scale:
             # L0 (coarse) scale for dual-level quantization matmul.
@@ -132,11 +140,12 @@ class ModelSlimMXFP4Scheme(ModelSlimLinearScheme):
             # After repack, it becomes `<prefix>.mul_scale`.
             # This is CRITICAL: the offline-quantized weights were calibrated with
             # x * mul_scale applied to the activation. Omitting it causes mosaic output.
-            mul_scale = BasevLLMParameter(
+            mul_scale = RowvLLMParameter(
                 data=torch.empty(
                     (input_size_per_partition,),
                     dtype=torch.float32,
                 ),
+                input_dim=0,
                 weight_loader=weight_loader,
             )
             mul_scale.missing_param_init = "error"
@@ -144,7 +153,23 @@ class ModelSlimMXFP4Scheme(ModelSlimLinearScheme):
 
     def process_weights_after_loading(self, layer: torch.nn.Module):
         if not self.is_dual_scale:
-            self.single_level_kernel.process_weights_after_loading(layer)
+            policy = self.quant_config.get("timestep_policy", {}).get("w4a4_linear", {})
+            uses_w4a8 = "W4A8" in policy.values()
+            # resolve_precision falls back to W4A4 for steps the policy does not
+            # cover, so a policy without a W4A8 "default" still executes W4A4.
+            uses_w4a4 = "W4A4" in policy.values() or "default" not in policy
+            if uses_w4a8 and uses_w4a4:
+                raise NotImplementedError(
+                    f"{self.prefix}: mixed W4A4/W4A8 linear timestep policies are "
+                    "unsupported for single-level MXFP4. Both load paths now lay "
+                    "the weight out as FRACTAL_NZ, but the two applies quantize "
+                    "activations differently (FP8 vs FP4) and the per-timestep "
+                    "switch has not been verified on hardware; use a uniform "
+                    "policy."
+                )
+            kernel = self.w4a8_kernel if uses_w4a8 else self.single_level_kernel
+            kernel.process_weights_after_loading(layer)
+            layer.mxfp4_quant_kwargs = mxfp4_quant_kwargs(self.quant_config)
             if self.has_mul_scale:
                 mul_scale = layer.mul_scale.data
                 if not mul_scale.is_npu:
@@ -155,11 +180,10 @@ class ModelSlimMXFP4Scheme(ModelSlimLinearScheme):
                 layer.use_mul_scale = False
             return
 
-        # Cast weight from fp8 container to FP4 packed format
+        # Preserve packed FP4 bytes when changing the storage format.
         weight = layer.weight.data
         if not weight.is_npu:
             weight = weight.to(f"npu:{torch.npu.current_device()}")
-        weight = torch_npu.npu_dtype_cast(weight, torch_npu.float4_e2m1fn_x2)
         # npu_dual_level_quant_matmul requires x2 in FRACTAL_NZ format (format 29).
         weight = torch_npu.npu_format_cast(
             weight.view(torch.int8), 29, customize_dtype=torch.int8
@@ -204,10 +228,19 @@ class ModelSlimMXFP4Scheme(ModelSlimLinearScheme):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        precision = resolve_precision(self.quant_config, "w4a4_linear", "W4A4")
         if not self.is_dual_scale:
             if getattr(layer, "use_mul_scale", False):
                 x = x * layer.mul_scale.to(x.dtype)
-            return self.single_level_kernel.apply(layer, x, bias)
+            kernel = (
+                self.w4a8_kernel if precision == "W4A8" else self.single_level_kernel
+            )
+            return kernel.apply(layer, x, bias)
+
+        if precision != "W4A4":
+            raise NotImplementedError(
+                "Dual-scale MXFP4 does not support W4A8 timestep switching"
+            )
 
         original_dtype = x.dtype
         if original_dtype not in (torch.float16, torch.bfloat16):
@@ -221,9 +254,8 @@ class ModelSlimMXFP4Scheme(ModelSlimLinearScheme):
         # Apply smooth quant scale before activation quantization.
         # The offline-quantized weights were calibrated under x * mul_scale,
         # so we MUST apply it here for scale alignment.
-        mul_scale = layer.mul_scale
         if getattr(layer, "use_mul_scale", False):
-            x_2d = x_2d * mul_scale.to(x_2d.dtype)
+            x_2d = x_2d * layer.mul_scale.to(x_2d.dtype)
 
         # Dual-level MXFP4 activation quantization
         x1, l0_scale, l1_scale = torch_npu.npu_dynamic_dual_level_mx_quant(

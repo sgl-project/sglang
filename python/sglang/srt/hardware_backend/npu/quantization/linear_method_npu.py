@@ -699,7 +699,8 @@ class NPUSingleLevelMXFP4LinearMethod(_NPULinearMethodBase):
 
     Weight quantization (process_weights_after_loading):
         BF16/FP16 weight → npu_dynamic_mx_quant(dst=float4_e2m1fn_x2)
-        → (packed FP4 [out, in//2], UE8M0 block scale) → transpose [in//2, out]
+        → (packed FP4 [out, in//2], UE8M0 block scale) → FRACTAL_NZ
+        → transpose [in//2, out]
 
     Inference (apply):
         BF16/FP16 activation → npu_dynamic_mx_quant(dst=float4_e2m1fn_x2)  (A4)
@@ -707,7 +708,8 @@ class NPUSingleLevelMXFP4LinearMethod(_NPULinearMethodBase):
                            group_sizes=[1, 1, MXFP4_BLOCK_SIZE])
 
     Triggered by ``--quantization mxfp4`` on NPU. Hardware: A5 NPU with a recent
-    torch_npu exposing ``float4_e2m1fn_x2``.
+    torch_npu exposing ``float4_e2m1fn_x2`` and accepting a FRACTAL_NZ x2 in the
+    fp4 ``npu_quant_matmul`` (same torch_npu-build caveat as the W4A8 path).
     """
 
     def create_weights(
@@ -767,12 +769,19 @@ class NPUSingleLevelMXFP4LinearMethod(_NPULinearMethodBase):
         qw, w_scale = torch.ops.npu.npu_dynamic_mx_quant(
             weight_fp, dst_type=fp4_dtype, round_mode="round"
         )
-        # Pre-transpose the weight to [in//2, out] for npu_quant_matmul; use
-        # .data= to preserve the non-contiguous transpose view (npu_quant_matmul
-        # reads strides directly — .contiguous() would reorder data and break
-        # block-scale alignment).
-        layer.weight = Parameter(qw, requires_grad=False)
-        layer.weight.data = layer.weight.data.transpose(0, 1)
+        # Lay the packed FP4 weight out as FRACTAL_NZ, mirroring the W4A8
+        # path, then transpose to [in//2, out] for npu_quant_matmul. The NZ
+        # layout keeps the fp4 GEMM on the Cube-friendly data path on A5.
+        # Requires a torch_npu build whose fp4 npu_quant_matmul accepts an NZ
+        # x2 (same caveat as the W4A8 path below); on older builds revert
+        # this to the plain ND transpose view.
+        qw_nz = npu_format_cast(
+            qw.view(torch.uint8),
+            NPUACLFormat.ACL_FORMAT_FRACTAL_NZ,
+            customize_dtype=torch.float8_e4m3fn,
+            input_dtype=fp4_dtype,
+        )
+        layer.weight = Parameter(qw_nz.transpose(-1, -2), requires_grad=False)
 
         # weight_scale -> [in//64, out, 2] (3D), matching the offline W4A4 and
         # W4A8 paths. npu_dynamic_mx_quant
@@ -804,7 +813,10 @@ class NPUSingleLevelMXFP4LinearMethod(_NPULinearMethodBase):
 
         # Dynamic single-level MXFP4 activation quantisation (A4 — FP4).
         qx, input_scale = torch.ops.npu.npu_dynamic_mx_quant(
-            x_2d, dst_type=fp4_dtype, round_mode="round"
+            x_2d,
+            dst_type=fp4_dtype,
+            round_mode="round",
+            **getattr(layer, "mxfp4_quant_kwargs", {}),
         )
 
         # Single-level MXFP4 matmul (weight & scale already transposed at load
@@ -834,18 +846,26 @@ class NPUSingleLevelMXFP4OfflineLinearMethod(NPUSingleLevelMXFP4LinearMethod):
     Kernel for the offline ``ModelSlimMXFP4Scheme`` (delegated as ``self.kernel``).
     The msmodelslim ``W4A4_MXFP4`` checkpoint stores weights as packed ``uint8``
     [out, in//2] (two FP4 values per byte) plus UE8M0 block scales (``uint8``
-    [out, in//32]). The weight is transposed and the scale reshaped to 3D; it then
-    shares the online :class:`NPUSingleLevelMXFP4LinearMethod` matmul (``apply``)
-    exactly — only the weight source differs (msmodelslim checkpoint vs online RTN).
+    [out, in/32]). The weight is cast to FRACTAL_NZ, transposed, and the scale
+    reshaped to 3D; it then shares the online
+    :class:`NPUSingleLevelMXFP4LinearMethod` matmul (``apply``) exactly — only
+    the weight source differs (msmodelslim checkpoint vs online RTN).
     """
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         weight = layer.weight.data
         if not weight.is_npu:
             weight = weight.to(f"npu:{torch.npu.current_device()}")
-        # The checkpoint is already packed two-FP4-per-byte. Preserve the strided
-        # transpose used by the online path.
-        layer.weight = Parameter(weight.transpose(0, 1), requires_grad=False)
+        # The checkpoint is already packed two-FP4-per-byte [out, in//2].
+        # Cast to FRACTAL_NZ (same layout as the W4A8 offline kernel) and
+        # transpose to [in//2, out] for npu_quant_matmul.
+        weight = npu_format_cast(
+            weight,
+            NPUACLFormat.ACL_FORMAT_FRACTAL_NZ,
+            customize_dtype=torch.float8_e4m3fn,
+            input_dtype=_get_float4_e2m1fn_x2_dtype(),
+        )
+        layer.weight = Parameter(weight.transpose(-1, -2), requires_grad=False)
 
         weight_scale = layer.weight_scale.data
         if not weight_scale.is_npu:

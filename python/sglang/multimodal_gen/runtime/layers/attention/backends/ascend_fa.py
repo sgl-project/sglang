@@ -256,15 +256,39 @@ class AscendFAImpl(AttentionImpl):
         self.causal = causal
         self.softmax_scale = softmax_scale
         quant_config = extra_impl_args.get("quant_config")
-        self._quant_scheme = resolve_mx_fa_scheme(quant_config)
-        self.use_offline_qk_rotation = (
-            quant_config.use_offline_qk_rotation
-            if hasattr(quant_config, "use_offline_qk_rotation")
-            else False
+        descriptor_scheme = (
+            quant_config.get_attention_scheme(prefix)
+            if hasattr(quant_config, "get_attention_scheme")
+            else None
+        )
+        self._modelslim_attention = None
+        self._quant_scheme = (
+            resolve_mx_fa_scheme(quant_config) if descriptor_scheme is None else None
+        )
+        description = getattr(quant_config, "quant_description", {})
+        attention_prefix = prefix.removesuffix(".impl")
+        self.use_offline_qk_rotation = all(
+            description.get(f"{attention_prefix}.{name}") == "FLOAT"
+            for name in ("q_rot", "k_rot")
+        ) or (
+            not attention_prefix
+            and getattr(quant_config, "use_offline_qk_rotation", False)
         )
         self._is_cross_attention = bool(
             extra_impl_args.get("is_cross_attention", False)
         )
+        if descriptor_scheme in ("FP8", "MXFP4"):
+            from sglang.multimodal_gen.runtime.layers.attention.backends.ascend_modelslim import (
+                ModelSlimAttention,
+            )
+
+            if self._is_cross_attention:
+                raise NotImplementedError(
+                    "ModelSlim quantized attention is supported only for Wan self-attention"
+                )
+            self._modelslim_attention = ModelSlimAttention(
+                descriptor_scheme, description, head_size, causal
+            )
         if self._quant_scheme is not None:
             self._head_size = head_size
             self._mxfp8_head_chunk_size = envs.SGLANG_DIFFUSION_MXFP8_FA_HEAD_CHUNK_SIZE
@@ -308,6 +332,10 @@ class AscendFAImpl(AttentionImpl):
         attn_metadata: AttentionMetadata,
         return_softmax_lse: bool = False,
     ) -> torch.Tensor:
+        if self._modelslim_attention is not None:
+            return self._modelslim_attention.forward(
+                query, key, value, self.softmax_scale, return_softmax_lse
+            )
         if (
             self._quant_scheme == "MXFP8"
             and not self.causal
@@ -372,6 +400,10 @@ class AscendFAImpl(AttentionImpl):
         cu_seqlens_host: tuple[int, ...] | None = None,
     ) -> torch.Tensor:
         del max_seqlen
+        if self._modelslim_attention is not None:
+            raise NotImplementedError(
+                "ModelSlim Wan quantized attention does not support packed/masked sequences"
+            )
         if (
             self._quant_scheme == "MXFP8"
             and not self.causal

@@ -18,6 +18,7 @@ if _is_npu:
 from sglang.multimodal_gen.runtime.models.parameter import (
     GroupQuantScaleParameter,
     ModelWeightParameter,
+    RowvLLMParameter,
 )
 from sglang.srt.layers.quantization.modelslim.schemes import ModelSlimLinearScheme
 
@@ -25,6 +26,12 @@ MXFP8_BLOCK_SIZE = 32
 
 
 class ModelSlimMXFP8Scheme(ModelSlimLinearScheme):
+    def __init__(self, quant_config=None, prefix=""):
+        self.has_mul_scale = any(
+            key in (quant_config or {})
+            for key in (prefix + ".mul_scale", prefix + ".div.mul_scale")
+        )
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -37,6 +44,8 @@ class ModelSlimMXFP8Scheme(ModelSlimLinearScheme):
     ):
         weight_loader = extra_weight_attrs.get("weight_loader")
         output_size_per_partition = sum(output_partition_sizes)
+        if input_size_per_partition % 64:
+            raise ValueError("MXFP8 input partition must be divisible by 64")
 
         # msmodelslim exports weight as float8_e4m3fn, shape [out, in]
         weight = ModelWeightParameter(
@@ -48,6 +57,7 @@ class ModelSlimMXFP8Scheme(ModelSlimLinearScheme):
             output_dim=0,
             weight_loader=weight_loader,
         )
+        weight.missing_param_init = "error"
         layer.register_parameter("weight", weight)
 
         # msmodelslim exports weight_scale as uint8, shape [out, in/32].
@@ -66,7 +76,16 @@ class ModelSlimMXFP8Scheme(ModelSlimLinearScheme):
             output_dim=0,
             weight_loader=weight_loader,
         )
+        weight_scale.missing_param_init = "error"
         layer.register_parameter("weight_scale", weight_scale)
+        if self.has_mul_scale:
+            mul_scale = RowvLLMParameter(
+                data=torch.empty(input_size_per_partition, dtype=torch.float32),
+                input_dim=0,
+                weight_loader=weight_loader,
+            )
+            mul_scale.missing_param_init = "error"
+            layer.register_parameter("mul_scale", mul_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module):
         # weight is already float8_e4m3fn, no cast needed
@@ -98,6 +117,8 @@ class ModelSlimMXFP8Scheme(ModelSlimLinearScheme):
         # we restore the original shape from the output.
         input_shape = x.shape
         x_2d = x.reshape(-1, x.shape[-1])
+        if self.has_mul_scale:
+            x_2d = x_2d * layer.mul_scale.to(x_2d.dtype)
 
         # Dynamic MXFP8 activation quantisation
         qx, input_scale = torch_npu.npu_dynamic_mx_quant(

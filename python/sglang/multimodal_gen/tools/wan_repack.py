@@ -3,9 +3,11 @@
 import argparse
 import json
 import pathlib
+import re
 import shutil
 from typing import Any, Dict, List
 
+import torch
 from safetensors.torch import load_file, save_file
 
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -37,6 +39,8 @@ TRANSFORMER_KEYS_RENAME_DICT = {
     # for the FLF2V model
     "img_emb.emb_pos": "condition_embedder.image_embedder.pos_embed",
     # Add attention component mappings
+    "self_attn.q_rot": "attn1.q_rot",
+    "self_attn.k_rot": "attn1.k_rot",
     "self_attn.q": "attn1.to_q",
     "self_attn.k": "attn1.to_k",
     "self_attn.v": "attn1.to_v",
@@ -52,6 +56,7 @@ TRANSFORMER_KEYS_RENAME_DICT = {
     "attn2.to_k_img": "attn2.add_k_proj",
     "attn2.to_v_img": "attn2.add_v_proj",
     "attn2.norm_k_img": "attn2.norm_added_k",
+    "self_attn": "attn1",
     # MXFP4 msmodelslim wraps Linear layers with a `.linear.` subpath;
     # strip it so keys match the SGLang model parameters.
     ".linear.": ".",
@@ -111,6 +116,105 @@ def load_sharded_safetensors(directory: pathlib.Path, pattern: str) -> dict:
     return state_dict
 
 
+def pack_fp4_weight(weight: torch.Tensor) -> torch.Tensor:
+    if weight.dtype == torch.uint8:
+        return weight
+    if weight.dtype != torch.float8_e4m3fn or weight.shape[-1] % 2:
+        raise ValueError(
+            "MXFP4 weights must be packed uint8 or even-width FP8 containers"
+        )
+    # Convert numeric E2M1 values before the loader casts to the target dtype.
+    values = weight.float()
+    magnitudes = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6], device=weight.device)
+    codes = torch.searchsorted(magnitudes, values.abs()).clamp(max=7)
+    if not torch.equal(magnitudes[codes], values.abs()):
+        raise ValueError(
+            "FP8 container contains values that are not representable as FP4 E2M1"
+        )
+    codes = (codes | (torch.signbit(values).long() << 3)).to(torch.uint8)
+    return (codes[..., 0::2] | (codes[..., 1::2] << 4)).contiguous()
+
+
+def load_quant_description(model_path: pathlib.Path) -> Dict[str, Any]:
+    """Load the inference description, ignoring quantization-time artifacts.
+
+    w4a4_mxfp4 exports place per-variant descriptions next to the shared
+    weight file (e.g. `quant_model_description_w4a4_mxfp4_svd.json` for the
+    SVD-calibrated variant) plus `calib_data_*.pth` and `configuration.json`.
+    Those describe how the export was calibrated, not how it is served; the
+    plain `quant_model_description*.json` is the inference contract.
+    """
+    candidates = sorted(model_path.glob("quant_model_description*.json"))
+    ignored = [c for c in candidates if c.stem.endswith("_svd")]
+    for path in ignored:
+        logger.info(
+            "Ignoring quantization-time description %s (inference uses the "
+            "plain variant)",
+            path.name,
+        )
+    candidates = [c for c in candidates if c not in ignored]
+    if not candidates:
+        raise FileNotFoundError(
+            f"No quant_model_description*.json found in {model_path}"
+        )
+    if len(candidates) > 1:
+        names = ", ".join(c.name for c in candidates)
+        raise ValueError(
+            f"Multiple candidate descriptions in {model_path}: {names}; "
+            "remove the unused variants"
+        )
+    logger.info("Using quantization description %s", candidates[0].name)
+    with open(candidates[0]) as f:
+        return json.load(f)
+
+
+def summarize_quant_description(
+    quant_config: Dict[str, Any], state_dict: Dict[str, torch.Tensor]
+) -> None:
+    """Log the per-expert quantization mix and warn about anomalies that the
+    runtime would otherwise reject mid-load."""
+    linear_counts: Dict[str, int] = {}
+    for key, quant_type in quant_config.items():
+        if key.endswith(".weight"):
+            linear_counts[quant_type] = linear_counts.get(quant_type, 0) + 1
+    logger.info("Linear quantization: %s", linear_counts)
+
+    attn_counts: Dict[str, int] = {}
+    for key, quant_type in quant_config.items():
+        if key.endswith(".self_attn.quant_type"):
+            attn_counts[quant_type] = attn_counts.get(quant_type, 0) + 1
+    logger.info("Self-attention quantization: %s", attn_counts)
+
+    rotation_blocks = sum(
+        1
+        for key in quant_config
+        if key.endswith(".self_attn.q_rot") or key.endswith(".self_attn.k_rot")
+    )
+    logger.info("Blocks with exported Q/K rotations: %d", rotation_blocks)
+
+    for key, quant_type in quant_config.items():
+        if quant_type.startswith("W4A4") and key not in state_dict:
+            logger.warning(
+                "%s is marked %s but missing from the weight checkpoint", key, quant_type
+            )
+        prefix = key.removesuffix(".self_attn.quant_type")
+        if (
+            key.endswith(".self_attn.quant_type")
+            and quant_type == "FP8_DYNAMIC"
+            and "FLOAT"
+            not in (
+                quant_config.get(f"{prefix}.self_attn.q_rot"),
+                quant_config.get(f"{prefix}.self_attn.k_rot"),
+            )
+        ):
+            logger.warning(
+                "%s is FP8_DYNAMIC but %s lacks exported Q/K rotations; "
+                "the runtime rejects FP8 attention without them",
+                key,
+                prefix,
+            )
+
+
 def convert_transformer(
     model_type: str, model_dir: pathlib.Path, output_dir: pathlib.Path
 ) -> None:
@@ -122,23 +226,40 @@ def convert_transformer(
 
     state_dict = load_sharded_safetensors(model_path, "quant_model_weight*.safetensors")
 
-    json_candidates = sorted(model_path.glob("quant_model_description*.json"))
-    if not json_candidates:
-        raise FileNotFoundError(
-            f"No quant_model_description*.json found in {model_path}"
-        )
-    with open(json_candidates[0]) as f:
-        quant_config = json.load(f)
+    quant_config = load_quant_description(model_path)
 
-    for key in list(state_dict.keys()):
-        new_key = key[:]
-        for replace_key, rename_key in RENAME_DICT.items():
-            new_key = new_key.replace(replace_key, rename_key)
-        if new_key != key:
-            update_dict_(state_dict, key, new_key)
-            # The quant JSON only covers quantized layers, not all model keys
-            if key in quant_config:
-                update_dict_(quant_config, key, new_key)
+    # Reports export-side key names: run before the rename loop below rewrites
+    # both dicts to model-side names.
+    summarize_quant_description(quant_config, state_dict)
+
+    # Attention descriptors need not have a corresponding checkpoint tensor.
+    for mapping in (state_dict, quant_config):
+        renamed = {}
+        for key, value in mapping.items():
+            new_key = key
+            for replace_key, rename_key in RENAME_DICT.items():
+                if replace_key.startswith("."):
+                    new_key = new_key.replace(replace_key, rename_key)
+                else:
+                    # Projection names must not match quant_type or q_rot.
+                    new_key = re.sub(
+                        r"(?<!\w)" + re.escape(replace_key) + r"(?!\w)",
+                        rename_key,
+                        new_key,
+                    )
+            if new_key in renamed:
+                raise ValueError(f"Checkpoint keys collide after renaming: {new_key}")
+            renamed[new_key] = value
+        mapping.clear()
+        mapping.update(renamed)
+
+    for key, weight in state_dict.items():
+        if key.endswith(".weight") and quant_config.get(key) in (
+            "W4A4_MXFP4",
+            "W4A4_MXFP4_DYNAMIC",
+            "W4A4_MXFP4_DUALSCALE",
+        ):
+            state_dict[key] = pack_fp4_weight(weight)
 
     save_file(state_dict, out_path / "diffusion_pytorch_model.safetensors")
 

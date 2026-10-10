@@ -499,6 +499,20 @@ class WanTransformerBlock(nn.Module):
         tp_size = get_tp_world_size()
         self.local_num_heads = divide(num_heads, tp_size)
         self_attn_backends = supported_attention_backends
+        attention_prefix = add_prefix("attn1", prefix)
+        self.attention_quant_scheme = (
+            quant_config.get_attention_scheme(attention_prefix)
+            if hasattr(quant_config, "get_attention_scheme")
+            else None
+        )
+        self.attention_quant_description = getattr(
+            quant_config, "quant_description", {}
+        )
+        if self.attention_quant_scheme in ("FP8", "MXFP4"):
+            if not current_platform.is_npu() or attention_type != "original":
+                raise NotImplementedError(
+                    "ModelSlim quantized Wan attention requires dense NPU attention"
+                )
 
         if attention_type in ("sla", "sagesla"):
             self.attn1 = MinimalA2AAttnOp(
@@ -513,14 +527,22 @@ class WanTransformerBlock(nn.Module):
                 prefix=add_prefix("attn1", prefix),
             )
         else:
-            # TODO Need to create mxfp8 attention scheme and port the code below
-            from sglang.multimodal_gen import envs
-
             quant_description = getattr(quant_config, "quant_description", {})
+            rotations = [
+                quant_description.get(f"{attention_prefix}.{name}") == "FLOAT"
+                for name in ("q_rot", "k_rot")
+            ]
+            if any(rotations) and not all(rotations):
+                raise ValueError(
+                    f"{attention_prefix}: both Q/K rotation descriptors are required"
+                )
+            if self.attention_quant_scheme == "FP8" and not all(rotations):
+                raise ValueError(
+                    f"{attention_prefix}: ModelSlim FP8 attention requires exported Q/K rotations"
+                )
             self.use_offline_qk_rotation = (
                 quant_description.get(f"{prefix}.attn1.q_rot") == "FLOAT"
                 and quant_description.get(f"{prefix}.attn1.k_rot") == "FLOAT"
-                and envs.SGLANG_DIFFUSION_ENABLE_MXFP8_ATTENTION
             )
             if self.use_offline_qk_rotation:
                 self.register_buffer(
@@ -541,7 +563,6 @@ class WanTransformerBlock(nn.Module):
                     ),
                     persistent=True,
                 )
-                quant_config.use_offline_qk_rotation = True
 
             self.attn1 = USPAttention(
                 num_heads=self.local_num_heads,
@@ -551,6 +572,11 @@ class WanTransformerBlock(nn.Module):
                 prefix=add_prefix("attn1", prefix),
                 quant_config=quant_config,
                 is_cross_attention=False,
+                required_attention_backend=(
+                    AttentionBackendEnum.FA
+                    if self.attention_quant_scheme in ("FP8", "MXFP4")
+                    else None
+                ),
             )
 
         if qk_norm == "rms_norm":
@@ -754,13 +780,27 @@ class WanTransformerBlock(nn.Module):
                 _apply_rotary_emb(key, cos, sin, is_neox_style=False),
             )
 
-        if (
-            self.use_offline_qk_rotation
+        from sglang.multimodal_gen import envs
+        from sglang.multimodal_gen.runtime.layers.quantization.modelslim_mxfp_utils import (
+            resolve_precision,
+        )
+
+        descriptor_rotation = (
+            self.attention_quant_scheme in ("FP8", "MXFP4")
+            and resolve_precision(
+                self.attention_quant_description, "fa", self.attention_quant_scheme
+            )
+            != "FLOAT"
+        )
+        legacy_rotation = (
+            self.attention_quant_scheme is None
+            and envs.SGLANG_DIFFUSION_ENABLE_MXFP8_ATTENTION
             and self.attn1.backend is AttentionBackendEnum.FA
             and query.shape[1:3] == key.shape[1:3]
             and key.shape == value.shape
             and (query.shape[0] * query.shape[1]) % 64 == 0
-        ):
+        )
+        if self.use_offline_qk_rotation and (descriptor_rotation or legacy_rotation):
             self.q_rot = self.q_rot.to(device=query.device, dtype=query.dtype)
             self.k_rot = self.k_rot.to(device=key.device, dtype=key.dtype)
             query = torch.matmul(query, self.q_rot)
