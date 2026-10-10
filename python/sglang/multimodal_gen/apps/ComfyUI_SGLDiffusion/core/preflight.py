@@ -28,13 +28,8 @@ def requested_attention_backends(sgld_options: dict) -> dict[str, str]:
     requested = {}
     if sgld_options.get("attention_backend"):
         requested["attention_backend"] = sgld_options["attention_backend"]
-    components = sgld_options.get("component_attention_backends") or {}
-    if isinstance(components, str):
-        components = dict(
-            item.split("=", 1) for item in components.split(",") if "=" in item
-        )
-    for component, backend in components.items():
-        requested[f"component_attention_backends.{component.strip()}"] = backend
+    for component, backend in _components(sgld_options).items():
+        requested[f"component_attention_backends.{component}"] = backend
     override = (sgld_options.get("request_options") or {}).get(
         "attention_backend_override"
     )
@@ -111,21 +106,47 @@ def check_sgld_options(sgld_options: dict) -> None:
     check_parallel_layout(sgld_options)
 
 
-def check_h3_request_options(request_options: dict, sgld_options: dict) -> None:
-    """Per-request attention options the MiniMax-H3 DiT cannot honor."""
-    if request_options.get("attention_backend_override"):
-        raise ValueError(
-            "MiniMax H3 cannot switch attention per request (its DiT has no "
-            "switchable attention layers); set attention_backend in SGLDOptions"
+def _components(sgld_options: dict) -> dict[str, str]:
+    components = sgld_options.get("component_attention_backends") or {}
+    if isinstance(components, str):
+        components = dict(
+            item.split("=", 1) for item in components.split(",") if "=" in item
         )
+    return {key.strip(): value.strip() for key, value in components.items()}
+
+
+def transformer_backend(sgld_options: dict) -> str | None:
+    """The attention backend the SGLD worker will give the DiT."""
+    return _components(sgld_options).get("transformer") or sgld_options.get(
+        "attention_backend"
+    )
+
+
+def set_transformer_backend(sgld_options: dict, backend: str) -> None:
+    components = _components(sgld_options)
+    if "transformer" in components:
+        components["transformer"] = backend
+        sgld_options["component_attention_backends"] = components
+    else:
+        sgld_options["attention_backend"] = backend
+
+
+def fold_h3_attention_requests(sgld_options: dict, request_options: dict) -> None:
+    """Serve H3 per-request attention choices with the worker's DiT backend.
+
+    The MiniMax-H3 DiT has no per-request switchable attention layers, so the
+    choice becomes part of the worker configuration: a different backend
+    restarts the SGLD worker, the same one reuses it.
+    """
+    override = request_options.pop("attention_backend_override", None)
+    if override:
+        set_transformer_backend(sgld_options, override)
     if request_options.get("skip_softmax_params"):
-        requested = requested_attention_backends(sgld_options)
-        backend = requested.get(
-            "component_attention_backends.transformer",
-            requested.get("attention_backend"),
-        )
-        if (backend or "").strip().lower() != "fa":
+        backend = transformer_backend(sgld_options)
+        if not backend:
+            set_transformer_backend(sgld_options, "fa")
+        elif backend.lower() != "fa":
             raise ValueError(
-                "skip_softmax_params runs on FlashAttention; set attention_backend=fa "
-                f"in SGLDOptions (the DiT currently uses {backend or 'the default backend'})"
+                "skip_softmax_params runs on FlashAttention, but the DiT is set to "
+                f"{backend}; drop the backend choice or set it to fa"
             )
