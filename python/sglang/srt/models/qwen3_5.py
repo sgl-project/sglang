@@ -48,6 +48,7 @@ from sglang.srt.configs.qwen3_5 import (
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.layers import qwen3_8_dense_mono
 from sglang.srt.layers.attention.mamba.mamba import mamba_v2_sharded_weight_loader
 from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
@@ -1808,6 +1809,10 @@ class Qwen3_5ForCausalLM(nn.Module):
 
         self.layers_to_capture = []
 
+        self._dense_mono = None
+        if not is_nextn and qwen3_8_dense_mono.enabled():
+            self._dense_mono = qwen3_8_dense_mono.DenseMono(self)
+
         self._mono = None
         if not is_nextn and qwen3_5_mono_decode.enabled():
             self._mono = qwen3_5_mono_decode.MonoDecode(self)
@@ -1827,6 +1832,8 @@ class Qwen3_5ForCausalLM(nn.Module):
         return self.embed_tokens
 
     def prepare_before_cuda_graph_capture(self, model_runner) -> None:
+        if self._dense_mono is not None:
+            self._dense_mono.prepare()
         if _use_aiter and self.config.model_type in _QWEN3_5_ROCM_PACKED_MODEL_TYPES:
             packed = 0
             for module in self.modules():
@@ -1865,6 +1872,16 @@ class Qwen3_5ForCausalLM(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         input_deepstack_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
+        if self._dense_mono is not None and self._dense_mono.eligible(
+            input_ids,
+            forward_batch,
+            input_embeds,
+            pp_proxy_tensors,
+            input_deepstack_embeds,
+        ):
+            return self._dense_mono.forward(
+                input_ids, positions, forward_batch, input_embeds
+            )
         if self._mono is not None and self._mono.eligible(
             input_ids, forward_batch, input_embeds, pp_proxy_tensors
         ):
@@ -2367,6 +2384,9 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
     def should_apply_lora(self, module_name: str) -> bool:
         return module_name.startswith("model.layers.")
+
+    def prepare_before_cuda_graph_capture(self, model_runner) -> None:
+        self.model.prepare_before_cuda_graph_capture(model_runner)
 
     @property
     def start_layer(self) -> int:
