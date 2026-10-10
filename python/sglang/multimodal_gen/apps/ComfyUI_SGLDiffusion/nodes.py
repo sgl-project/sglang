@@ -43,6 +43,7 @@ class SGLDOptions:
                         "flux",
                         "lumina2",
                         "minimax_h3",
+                        "ltxav",
                     ],
                     {"default": "auto-detect"},
                 ),

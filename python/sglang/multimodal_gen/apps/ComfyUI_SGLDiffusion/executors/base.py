@@ -24,6 +24,8 @@ class SGLDiffusionExecutor(torch.nn.Module):
     """Shared ComfyUI DiT-forward executor. Per-model logic lives on the adapter."""
 
     adapter_cls = None
+    # LoRA merge mode for set_lora; None keeps the server default.
+    lora_merge_mode: str | None = None
 
     def __init__(self, generator, model_path, model, config):
         super(SGLDiffusionExecutor, self).__init__()
@@ -69,6 +71,7 @@ class SGLDiffusionExecutor(torch.nn.Module):
                 lora_path=lora_path,
                 strength=strength,
                 target=target,
+                merge_mode=self.lora_merge_mode,
             )
 
     def begin_sampler_run(self) -> None:
