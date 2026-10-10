@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
+import os
+
 # Copyright 2024 xDiT team.
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/main/vllm/distributed/parallel_state.py
@@ -207,8 +209,12 @@ class GroupCoordinator:
         # TODO: fix it for other platforms
         self.device = get_local_torch_device()
         self.shm_handle = None
+        global_world_size = torch.distributed.get_world_size()
+        local_size = int(os.environ.get("LOCAL_SIZE", "0"))
+        self.is_single_node = local_size > 0 and global_world_size == local_size
         if (
             current_platform.is_cpu()
+            and self.is_single_node
             and self.world_size > 1
             and hasattr(torch.ops.sgl_kernel, "shm_group_initialize")
             and self.unique_name.startswith(("tp", "sp"))

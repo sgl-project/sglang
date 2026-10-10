@@ -20,6 +20,7 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.srt.utils.common import torch_release
 
 _cp_options.enable_load_balance = False
+SHM_ALLTOALL_MAX_BYTES = 32 * 1024 * 1024
 
 if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
@@ -108,7 +109,14 @@ def _usp_all_to_all_single(x: torch.Tensor, role: str | None = None) -> torch.Te
 
     # USP calls this collective many times per denoising step and waits
     # immediately, so avoid the extra wrapper overhead of functional collectives.
-    if current_platform.is_cpu() and sp_group.ulysses_shm_handle >= 0:
+    handle = sp_group.ulysses_shm_handle
+    input_bytes = x.numel() * x.element_size()
+    if (
+        current_platform.is_cpu()
+        and handle is not None
+        and handle >= 0
+        and input_bytes <= SHM_ALLTOALL_MAX_BYTES
+    ):
         torch.ops.sgl_kernel.shm_alltoall(output, x, sp_group.ulysses_shm_handle)
     else:
         torch.distributed.all_to_all_single(output, x, group=ulysses_pg)
