@@ -66,30 +66,24 @@ configure_environment() {
     fi
     uv --version
 
-    SYS_PYTHON_VER=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
-    # Set to empty to install into the system Python, which must then be >= 3.11.
-    CI_PYTHON_VER="${SGLANG_TEST_CI_PYTHON-3.12}"
-    echo "SGLANG_TEST_CI_PYTHON=${CI_PYTHON_VER} (system python ${SYS_PYTHON_VER})"
+    # Every job installs into a uv-managed venv, whatever Python the runner image ships.
+    CI_PYTHON_VER="${SGLANG_TEST_CI_PYTHON:-3.12}"
+    echo "SGLANG_TEST_CI_PYTHON=${CI_PYTHON_VER}"
 
-    UV_VENV=""
+    # Managed builds ship Python.h, which Triton's runtime launcher compiles against.
+    # --upgrade repoints uv's minor-version link at the latest patch; a kept venv follows it.
+    uv python install --upgrade "$CI_PYTHON_VER" --python-preference only-managed
+
     UV_VENV_COMPLETE_MARKER=""
     if [ "$USE_VENV" = "1" ]; then
         UV_VENV="/tmp/sglang-ci-${GITHUB_RUN_ID:-norun}-${GITHUB_JOB:-nojob}-$$"
-        if [ -n "$CI_PYTHON_VER" ]; then
-            uv python install --upgrade "$CI_PYTHON_VER" --python-preference only-managed
-            uv venv "$UV_VENV" --python "$CI_PYTHON_VER" --python-preference only-managed --seed
-        else
-            uv venv "$UV_VENV" --python "python${SYS_PYTHON_VER}" --seed
-        fi
-    elif [ -n "$CI_PYTHON_VER" ] && [ "$SYS_PYTHON_VER" != "$CI_PYTHON_VER" ]; then
+        uv venv "$UV_VENV" --python "$CI_PYTHON_VER" --python-preference only-managed --seed
+    else
         # Kept across jobs so installs stay incremental and path-keyed JIT caches hit.
         UV_VENV="/opt/sglang-ci-py${CI_PYTHON_VER}"
         # A cancelled install leaves dist-info that later installs treat as satisfied;
         # rebuild unless the last install ran to completion.
         UV_VENV_COMPLETE_MARKER="$UV_VENV/.install-complete"
-        # --upgrade repoints uv's minor-version link at the latest patch; the kept venv follows it.
-        # Managed builds ship Python.h, which Triton's runtime launcher compiles against.
-        uv python install --upgrade "$CI_PYTHON_VER" --python-preference only-managed
         if [ ! -f "$UV_VENV_COMPLETE_MARKER" ]; then
             rm -rf "$UV_VENV"
             uv venv "$UV_VENV" --python "$CI_PYTHON_VER" --python-preference only-managed --seed
@@ -97,29 +91,25 @@ configure_environment() {
         rm -f "$UV_VENV_COMPLETE_MARKER"
     fi
 
-    if [ -n "$UV_VENV" ]; then
-        # shellcheck disable=SC1091
-        source "$UV_VENV/bin/activate"
-        [ "${VIRTUAL_ENV:-}" = "$UV_VENV" ] || { echo "FATAL: venv activation did not set VIRTUAL_ENV correctly"; exit 1; }
-        [ "$(command -v python3)" = "$UV_VENV/bin/python3" ] || { echo "FATAL: python3 still resolves outside venv (got $(command -v python3))"; exit 1; }
+    # shellcheck disable=SC1091
+    source "$UV_VENV/bin/activate"
+    [ "${VIRTUAL_ENV:-}" = "$UV_VENV" ] || { echo "FATAL: venv activation did not set VIRTUAL_ENV correctly"; exit 1; }
+    [ "$(command -v python3)" = "$UV_VENV/bin/python3" ] || { echo "FATAL: python3 still resolves outside venv (got $(command -v python3))"; exit 1; }
 
-        if [ -n "${GITHUB_ENV:-}" ]; then
-            # Self-heal: see install_rustup.sh for context on missing _runner_file_commands/.
-            mkdir -p "$(dirname "$GITHUB_ENV")" 2>/dev/null || true
-            echo "VIRTUAL_ENV=$UV_VENV" >> "$GITHUB_ENV" || true
-            # ci_cleanup_venv.sh deletes this path, so only the per-job venv exports it.
-            if [ "$USE_VENV" = "1" ]; then
-                echo "SGLANG_CI_VENV_PATH=$UV_VENV" >> "$GITHUB_ENV" || true
-            fi
-            echo "BASH_ENV=$UV_VENV/env.sh" >> "$GITHUB_ENV" || true
-            : > "$UV_VENV/env.sh"
+    if [ -n "${GITHUB_ENV:-}" ]; then
+        # Self-heal: see install_rustup.sh for context on missing _runner_file_commands/.
+        mkdir -p "$(dirname "$GITHUB_ENV")" 2>/dev/null || true
+        echo "VIRTUAL_ENV=$UV_VENV" >> "$GITHUB_ENV" || true
+        # ci_cleanup_venv.sh deletes this path, so only the per-job venv exports it.
+        if [ "$USE_VENV" = "1" ]; then
+            echo "SGLANG_CI_VENV_PATH=$UV_VENV" >> "$GITHUB_ENV" || true
         fi
-        if [ -n "${GITHUB_PATH:-}" ]; then
-            mkdir -p "$(dirname "$GITHUB_PATH")" 2>/dev/null || true
-            echo "$UV_VENV/bin" >> "$GITHUB_PATH" || true
-        fi
-    else
-        echo "No venv: installing into system Python ${SYS_PYTHON_VER}"
+        echo "BASH_ENV=$UV_VENV/env.sh" >> "$GITHUB_ENV" || true
+        : > "$UV_VENV/env.sh"
+    fi
+    if [ -n "${GITHUB_PATH:-}" ]; then
+        mkdir -p "$(dirname "$GITHUB_PATH")" 2>/dev/null || true
+        echo "$UV_VENV/bin" >> "$GITHUB_PATH" || true
     fi
 
     mark_step_done "${FUNCNAME[0]}"
@@ -417,12 +407,8 @@ release_cargo_cache_lock() {
 }
 
 setup_pip_toolchain() {
-    if [ -n "$UV_VENV" ]; then
-        # The bootstrap upgrade hit system pip; this upgrades the venv's own.
-        python3 -m pip install --upgrade pip
-    else
-        export UV_SYSTEM_PYTHON=1
-    fi
+    # The bootstrap upgrade hit system pip; this upgrades the venv's own.
+    python3 -m pip install --upgrade pip
 
     export UV_LINK_MODE=copy
     PIP_CMD="uv pip"
@@ -581,9 +567,8 @@ require_prebuilt_rust_exts() {
     # Exact EXT_SUFFIX rather than an _*.so glob: no crate sets abi3, so a module
     # built for another minor version satisfies the glob while the import system
     # ignores it, leaving is_rust_server_built() false and the Rust-server tests
-    # silently skipped. Stages have no setup-python, so the interpreter is whatever
-    # the image ships, and the pools are not on one version (h20 is 3.12 while
-    # h100 is 3.10) - a mismatch is drift to route around, not a failure.
+    # silently skipped. A SGLANG_TEST_CI_PYTHON outside the build matrix has no module;
+    # build it from source rather than fail.
     local suffix
     suffix=$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))')
     local missing=()
@@ -870,9 +855,7 @@ setup_ld_library_path() {
     VENV_LD="${NVIDIA_LIBS}${TORCH_LIB}"
     export LD_LIBRARY_PATH="${VENV_LD}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
-    if [ -n "$UV_VENV" ]; then
-        echo "export LD_LIBRARY_PATH=\"$LD_LIBRARY_PATH\"" >> "$UV_VENV/env.sh"
-    fi
+    echo "export LD_LIBRARY_PATH=\"$LD_LIBRARY_PATH\"" >> "$UV_VENV/env.sh"
     if [ -n "${GITHUB_ENV:-}" ]; then
         echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH" >> "$GITHUB_ENV" || echo "WARNING: GITHUB_ENV write failed; LD_LIBRARY_PATH will be set via BASH_ENV instead"
     fi
