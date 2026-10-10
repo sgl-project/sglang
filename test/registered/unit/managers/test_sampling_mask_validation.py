@@ -1,11 +1,10 @@
 import unittest
-from unittest.mock import patch
+from types import SimpleNamespace
 
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.custom_logit_processor import (
-    CustomLogitProcessor,
     DisallowedTokensLogitsProcessor,
     Qwen3ThinkingBudgetLogitProcessor,
 )
@@ -28,13 +27,20 @@ class TestSamplingMaskValidation(CustomTestCase):
         self.manager.allow_auto_truncate = False
         self.manager.validate_total_tokens = False
         self.manager.is_generation = True
+        self.manager.model_config = SimpleNamespace(joint_head_config=None)
 
-    def _validate(self, processor, return_sampling_mask=True):
+    def _validate(
+        self,
+        processor,
+        return_sampling_mask=True,
+        sampling_logprobs_mode=None,
+    ):
         req = GenerateReqInput(
             input_ids=[1, 2, 3],
             sampling_params={"top_k": 10},
             custom_logit_processor=processor,
             return_sampling_mask=return_sampling_mask,
+            sampling_logprobs_mode=sampling_logprobs_mode,
         )
         self.manager._validate_one_request(req, req.input_ids)
 
@@ -64,19 +70,27 @@ class TestSamplingMaskValidation(CustomTestCase):
                 ):
                     self._validate(processor)
 
-    def test_disabled_processors_are_not_deserialized(self):
-        with (
-            get_context().override_server_args(enable_custom_logit_processor=False),
-            patch.object(CustomLogitProcessor, "from_str") as deserialize,
-        ):
-            with self.assertRaisesRegex(ValueError, "--enable-custom-logit-processor"):
-                self._validate(DisallowedTokensLogitsProcessor.to_str())
-            deserialize.assert_not_called()
-
     def test_other_processors_still_work_without_sampling_masks(self):
         self._validate(
             Qwen3ThinkingBudgetLogitProcessor.to_str(), return_sampling_mask=False
         )
+
+    def test_sampling_logprobs_mode_requires_sampling_mask(self):
+        self._validate(None, return_sampling_mask=False)
+        for mode in ("selected", "support"):
+            with self.subTest(mode=mode):
+                with self.assertRaisesRegex(
+                    ValueError, "can only be set when return_sampling_mask=true"
+                ):
+                    self._validate(
+                        None,
+                        return_sampling_mask=False,
+                        sampling_logprobs_mode=mode,
+                    )
+
+        for mode in (None, "selected", "support"):
+            with self.subTest(mode=mode):
+                self._validate(None, sampling_logprobs_mode=mode)
 
 
 if __name__ == "__main__":

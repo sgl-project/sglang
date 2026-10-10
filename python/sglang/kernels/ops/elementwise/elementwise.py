@@ -3,10 +3,9 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
-from sglang.srt.utils import is_hip, is_npu
+from sglang.srt.utils import is_hip
 
 _is_hip = is_hip()
-_is_npu = is_npu()
 
 
 rmsnorm_autotune = triton.autotune(
@@ -387,6 +386,9 @@ def _fused_sigmoid_mul_kernel(
     hidden_dim: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     BLOCK_H: tl.constexpr,
+    q_ptr=None,
+    s_ptr=None,
+    QUANT: tl.constexpr = False,
 ):
     """Fuse sigmoid(gate) * attn_output into a single kernel."""
     pid_row = tl.program_id(0).to(tl.int64)
@@ -404,13 +406,21 @@ def _fused_sigmoid_mul_kernel(
     g = tl.load(gate_ptr + gate_off, mask=mask, other=0.0).to(tl.float32)
 
     result = attn * tl.sigmoid(g)
-    tl.store(output_ptr + attn_off, result, mask=mask)
+    if QUANT:  # the block is one row: per-token FP8 as _per_token_group_quant_8bit
+        y = tl.where(mask, result.to(output_ptr.dtype.element_ty).to(tl.float32), 0.0)
+        y_s = tl.maximum(tl.max(tl.abs(y)), 1e-10) / 448.0
+        y_q = tl.clamp(y * (1.0 / y_s), -448.0, 448.0).to(q_ptr.dtype.element_ty)
+        tl.store(q_ptr + attn_off, y_q, mask=mask)
+        tl.store(s_ptr + pid_row, y_s)
+    else:
+        tl.store(output_ptr + attn_off, result, mask=mask)
 
 
 def fused_sigmoid_mul(
     attn_output: torch.Tensor,
     gate: torch.Tensor,
     inplace: bool = False,
+    quant: bool = False,
 ) -> torch.Tensor:
     """
     Fused sigmoid-mul for attention output gating.
@@ -444,17 +454,14 @@ def fused_sigmoid_mul(
         gate_stride_row = hidden_dim
         gate_stride_head = hidden_dim
 
-    if _is_npu and torch.compiler.is_compiling():
-        gate_reshaped = (
-            gate.view_as(attn_output) if gate.numel() == attn_output.numel() else gate
-        )
-        if inplace:
-            attn_output.mul_(torch.sigmoid(gate_reshaped))
-            return attn_output
-        return attn_output * torch.sigmoid(gate_reshaped)
-
     out = attn_output if inplace else torch.empty_like(attn_output)
     block_h = 1024 if num_tokens < 1024 else 2048
+    kwargs = {}
+    if quant:  # one block per row; returns per-token FP8 (q, scale [T, 1])
+        block_h = triton.next_power_of_2(hidden_dim)
+        q = torch.empty_like(attn_output, dtype=torch.float8_e4m3fn)
+        s = torch.empty((num_tokens, 1), dtype=torch.float32, device=q.device)
+        kwargs = {"q_ptr": q, "s_ptr": s, "QUANT": True}
     grid = (num_tokens, triton.cdiv(hidden_dim, block_h))
     _fused_sigmoid_mul_kernel[grid](
         out,
@@ -466,8 +473,9 @@ def fused_sigmoid_mul(
         HEAD_DIM=head_dim,
         BLOCK_H=block_h,
         num_warps=4,
+        **kwargs,
     )
-    return out
+    return (q, s) if quant else out
 
 
 @triton.jit
@@ -480,6 +488,7 @@ def _fused_gate_sigmoid_mul_add_kernel(
     BLOCK_SIZE: tl.constexpr,
     DO_ADD: tl.constexpr = True,
     USE_PDL: tl.constexpr = False,
+    GATE_ONLY: tl.constexpr = False,
 ):
     pid = tl.program_id(axis=0).to(tl.int64)
     row_offset = pid * hidden_dim
@@ -495,23 +504,30 @@ def _fused_gate_sigmoid_mul_add_kernel(
     h = tl.load(hidden_states_ptr + row_offset + offsets, mask=mask, other=0.0).to(
         tl.float32
     )
-    s = tl.load(shared_output_ptr + row_offset + offsets, mask=mask, other=0.0).to(
-        tl.float32
-    )
-    if DO_ADD:
-        f = tl.load(output_ptr + row_offset + offsets, mask=mask, other=0.0).to(
+    if not GATE_ONLY:
+        s = tl.load(shared_output_ptr + row_offset + offsets, mask=mask, other=0.0).to(
             tl.float32
         )
+        if DO_ADD:
+            f = tl.load(output_ptr + row_offset + offsets, mask=mask, other=0.0).to(
+                tl.float32
+            )
 
-    if USE_PDL:
-        tl.extra.cuda.gdc_launch_dependents()
+        if USE_PDL:
+            tl.extra.cuda.gdc_launch_dependents()
 
     gate_val = tl.sigmoid(tl.sum(h * w, axis=0))
-    result = gate_val * s
-    if DO_ADD:
-        result += f
-
-    tl.store(output_ptr + row_offset + offsets, result, mask=mask)
+    if GATE_ONLY:
+        # Preserve FP32 for the later shared-add FMA, without an intermediate
+        # BF16 gated shared output. Keep the standalone gate's PDL ordering.
+        if USE_PDL:
+            tl.extra.cuda.gdc_launch_dependents()
+        tl.store(output_ptr + pid, gate_val)
+    else:
+        result = gate_val * s
+        if DO_ADD:
+            result += f
+        tl.store(output_ptr + row_offset + offsets, result, mask=mask)
 
 
 def _launch_fused_gate_sigmoid_mul(
@@ -554,6 +570,7 @@ def _launch_fused_gate_sigmoid_mul(
         hidden_dim=hidden_dim,
         DO_ADD=do_add,
         USE_PDL=use_pdl,
+        GATE_ONLY=False,
         **config,
         **pdl_kwargs,
     )

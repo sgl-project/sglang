@@ -1,16 +1,23 @@
-"""Tests dLLM FDFO KV slot reuse in alloc_for_extend."""
+"""Tests dLLM KV reuse and committed-token boundaries."""
 
 import unittest
 from array import array
 from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import torch
 
-from sglang.srt.dllm.mixin.scheduler import DllmManager
-from sglang.srt.managers.schedule_batch import ReqKvInfo
+from sglang.srt.dllm.algorithm.joint_threshold import JointThreshold
+from sglang.srt.dllm.algorithm.low_confidence import LowConfidence
+from sglang.srt.dllm.config import DllmConfig
+from sglang.srt.dllm.mixin.scheduler import DllmManager, SchedulerDllmMixin
+from sglang.srt.managers.schedule_batch import Req, ReqKvInfo, ScheduleBatch
 from sglang.srt.mem_cache.allocation import alloc_for_extend
+from sglang.srt.mem_cache.base_prefix_cache import InsertParams
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sglang.srt.runtime_context import get_context
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -54,14 +61,21 @@ class _FakeTreeCache:
         self.page_size = allocator.page_size
         self.token_to_kv_pool_allocator = allocator
 
-    def is_chunk_cache(self):
-        return True
+    def supports_prefix_sharing(self):
+        return False
+
+    def maybe_hand_to_session(self, req):
+        pass
+
+    def prefix_device_indices(self, req):
+        return req.tree_prefix
 
 
 def _make_req(rid, prefix, block_size, *, req_pool_idx=None, reuse=False):
     return SimpleNamespace(
         rid=rid,
-        prefix_indices=torch.tensor(prefix, dtype=torch.int32),
+        tree_prefix=torch.tensor(prefix, dtype=torch.int32),
+        prefix_len=len(prefix),
         dllm_incomplete_ids=array("q", range(block_size)) if reuse else array("q"),
         inflight_middle_chunks=1 if req_pool_idx is not None else 0,
         kv=ReqKvInfo(
@@ -82,10 +96,7 @@ def _remove_allocated_req_slots(pool, *reqs):
 
 def _make_batch(pool, allocator, reqs, extend_lens):
     seq_lens_cpu = torch.tensor(
-        [
-            len(req.prefix_indices) + extend_len
-            for req, extend_len in zip(reqs, extend_lens)
-        ],
+        [req.prefix_len + extend_len for req, extend_len in zip(reqs, extend_lens)],
         dtype=torch.int64,
     )
     return SimpleNamespace(
@@ -94,7 +105,7 @@ def _make_batch(pool, allocator, reqs, extend_lens):
         req_to_token_pool=pool,
         token_to_kv_pool_allocator=allocator,
         tree_cache=_FakeTreeCache(allocator),
-        prefix_lens=[len(req.prefix_indices) for req in reqs],
+        prefix_lens=[req.prefix_len for req in reqs],
         extend_lens=extend_lens,
         seq_lens=seq_lens_cpu,
         seq_lens_cpu=seq_lens_cpu,
@@ -105,8 +116,8 @@ def _make_batch(pool, allocator, reqs, extend_lens):
 
 
 def _seed_retained_block(pool, req, values):
-    prefix_len = len(req.prefix_indices)
-    pool.req_to_token[req.kv.req_pool_idx, :prefix_len] = req.prefix_indices
+    prefix_len = req.prefix_len
+    pool.req_to_token[req.kv.req_pool_idx, :prefix_len] = req.tree_prefix
     pool.req_to_token[req.kv.req_pool_idx, prefix_len : prefix_len + len(values)] = (
         torch.tensor(values, dtype=torch.int32)
     )
@@ -219,6 +230,169 @@ class TestDllmFdfoKvReuse(unittest.TestCase):
         )
         self.assertEqual(manager.waiting_queue, [keep])
         self.assertEqual(manager.staging_queue, [])
+
+
+class TestDllmFdfoResolvedBlockKeepsRow(unittest.TestCase):
+    def test_resolved_block_keeps_row_until_next_block(self):
+        """A resolved FDFO block used to hand its row back to the pool while the
+        request kept running. An abort before the next block then skipped
+        release_kv_cache (it only runs for row holders), leaking the request's
+        tree lock and any KV the tree does not own."""
+        pool = ReqToTokenPool(
+            size=4, max_context_len=16, device="cpu", enable_memory_saver=False
+        )
+        req = SimpleNamespace(
+            dllm_incomplete_ids=array("q"),
+            is_dllm_prefill=lambda: False,
+            kv=ReqKvInfo(kv_allocated_len=8, kv_committed_len=8),
+        )
+        pool.alloc([req])
+        row = req.kv.req_pool_idx
+        scheduler = SimpleNamespace(
+            dllm_config=SimpleNamespace(
+                first_done_first_out_mode=True,
+                requires_separate_context_encoding=False,
+            ),
+            req_to_token_pool=pool,
+            stash_chunked_request=Mock(),
+        )
+
+        SchedulerDllmMixin.finish_dllm_forward(scheduler, req)
+
+        scheduler.stash_chunked_request.assert_called_once_with(req)
+        self.assertTrue(req.kv.holds_kv)
+        self.assertEqual(req.kv.req_pool_idx, row)
+        self.assertNotIn(row, pool.free_slots)
+
+
+class TestDllmCommittedTokens(unittest.TestCase):
+    @staticmethod
+    def make_req(prompt, output=()):
+        req = Req(
+            rid="committed-tokens",
+            origin_input_text="",
+            origin_input_ids=array("q", prompt),
+            sampling_params=SamplingParams(max_new_tokens=16, temperature=0),
+            vocab_size=128,
+            dllm_config=DllmConfig("LowConfidence", {}, 4, 99, 4),
+        )
+        req.output_ids.extend(output)
+        return req
+
+    def test_cache_lookup_stops_before_partial_prompt_and_synthetic_masks(self):
+        # A different request legitimately cached these literal mask IDs. Only
+        # the first complete block belongs to this request's committed prefix.
+        cache = RadixCache.create_simulated(page_size=4)
+        cache.insert(
+            InsertParams(
+                key=RadixKey(array("q", [1, 2, 3, 4, 5, 99, 99, 99])),
+                value=torch.arange(8),
+            )
+        )
+        req = self.make_req([1, 2, 3, 4, 5])
+        req.init_next_round_input(cache)
+        self.assertEqual(req.prefix_len, 4)
+        self.assertEqual(req.dllm_block_offset, 4)
+        self.assertFalse(req.is_dllm_prefill())
+        self.assertEqual(list(req.full_untruncated_fill_ids[4:8]), [5, 99, 99, 99])
+
+    def test_retraction_reencodes_committed_outputs_before_denoising(self):
+        req = self.make_req([1, 99, 2], [7, 99, 8, 9, 10])
+        req.reset_for_retract()
+        req.init_next_round_input()
+        self.assertEqual(list(req.output_ids), [7, 99, 8, 9, 10])
+        self.assertTrue(req.is_dllm_prefill())
+        # The second complete block consists of already-emitted output tokens.
+        req.prefix_len = 4
+        req.determine_dllm_phase()
+        self.assertTrue(req.is_dllm_prefill())
+        req.prefix_len = 8
+        req.determine_dllm_phase()
+        self.assertFalse(req.is_dllm_prefill())
+
+    def test_repeated_denoise_passes_do_not_subtract_cache_hits(self):
+        req = self.make_req([1, 2, 3, 4, 5])
+        req._init_fill_ids_for_dllm()
+        req.prefix_len = 4
+        req.extend_end = 8
+        req.already_computed = 8
+        req.cached_tokens = 4
+        req._cache_breakdown_computed = True
+        batch = ScheduleBatch(
+            reqs=[req],
+            device="cpu",
+            dllm_config=req.dllm_config,
+            model_config=SimpleNamespace(is_encoder_decoder=False, vocab_size=128),
+        )
+        execution = SimpleNamespace(
+            features=SimpleNamespace(enable_encoder_swa_bounded_replay=False),
+            mamba=SimpleNamespace(enable_mamba_extra_buffer=False),
+        )
+        # Allocation and sampling are collaborators; exercise the scheduler's
+        # real cache accounting on two revisits of the same fixed-size block.
+        with (
+            patch(
+                "sglang.srt.managers.schedule_batch.get_exec", return_value=execution
+            ),
+            patch(
+                "sglang.srt.managers.schedule_batch.alloc_for_extend",
+                return_value=(torch.arange(4), torch.tensor([0]), torch.tensor([0])),
+            ),
+            patch(
+                "sglang.srt.managers.schedule_batch.SamplingBatchInfo.from_schedule_batch"
+            ),
+        ):
+            for _ in range(2):
+                batch.prepare_for_extend()
+                self.assertEqual(req.cached_tokens, 4)
+
+    def test_literal_prompt_masks_are_preserved_and_not_emitted(self):
+        class Runner:
+            def forward(self, batch, **kwargs):
+                logits = torch.zeros(4, 16)
+                logits[:, 7] = 20
+                return SimpleNamespace(
+                    logits_output=SimpleNamespace(full_logits=logits),
+                    can_run_graph=False,
+                )
+
+        for cls, vectorized in (
+            (LowConfidence, False),
+            (JointThreshold, False),
+            (JointThreshold, True),
+        ):
+            for fdfo in (False, True):
+                with self.subTest(
+                    algorithm=cls.__name__, vectorized=vectorized, fdfo=fdfo
+                ):
+                    algorithm = cls(
+                        DllmConfig(
+                            cls.__name__,
+                            {"vectorized_decoding": vectorized},
+                            4,
+                            15,
+                            1,
+                            fdfo,
+                        )
+                    )
+                    batch = SimpleNamespace(
+                        batch_size=1,
+                        input_ids=torch.tensor([15, 2, 15, 15]),
+                        dllm_prompt_mask=torch.tensor([[True, True, False, False]]),
+                    )
+                    states = None
+                    for _ in range(32):
+                        _, output, accepted, states, _ = algorithm.run(
+                            Runner(), batch, states
+                        )
+                        self.assertEqual(batch.input_ids[:2].tolist(), [15, 2])
+                        if not fdfo or accepted == [4]:
+                            break
+                    else:
+                        self.fail("denoising did not finish")
+                    self.assertEqual(batch.input_ids.tolist(), [15, 2, 7, 7])
+                    if not fdfo:
+                        self.assertEqual(output[0].tolist(), [7, 7])
 
 
 if __name__ == "__main__":

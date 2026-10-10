@@ -45,6 +45,8 @@ def _batch(rids, block_size, *, sampling_seeds=None, encoder=False, empty=False)
         sampling_info=sampling_info,
         forward_mode=(ForwardMode.EXTEND if encoder else ForwardMode.DLLM_EXTEND),
         input_embeds=None,
+        dllm_input_preparation_state=None,
+        dllm_prompt_mask=None,
     )
 
 
@@ -203,7 +205,7 @@ class TestGemma4Renoise(unittest.TestCase):
             dcp_size=1,
             attn_cp_size=1,
             attention_backend="flashinfer",
-            prefill_attention_backend="fa3",
+            prefill_attention_backend="fa4",
             decode_attention_backend=None,
             disable_radix_cache=False,
             cuda_graph_config=CudaGraphConfig(
@@ -216,12 +218,12 @@ class TestGemma4Renoise(unittest.TestCase):
         Gemma4Renoise.configure_server_args(server_args)
 
         self.assertEqual(server_args.attention_backend, "flashinfer")
-        self.assertEqual(server_args.prefill_attention_backend, "fa3")
+        self.assertEqual(server_args.prefill_attention_backend, "fa4")
         self.assertIsNone(server_args.decode_attention_backend)
         resolved = resolving_view(server_args)
         self.assertTrue(resolved.disable_radix_cache)
         self.assertEqual(resolved.cuda_graph_config.decode.backend, Backend.FULL)
-        self.assertEqual(resolved.cuda_graph_config.prefill.backend, Backend.DISABLED)
+        self.assertEqual(resolved.cuda_graph_config.prefill.backend, Backend.FULL)
         self.assertEqual(resolved.chunked_prefill_size, -1)
         self.assertFalse(server_args.disable_radix_cache)
         self.assertEqual(server_args.cuda_graph_config.decode.backend, Backend.FULL)
@@ -299,7 +301,9 @@ class TestGemma4Renoise(unittest.TestCase):
         repeat = algorithm.init_step_state(_batch(["other-a", "other-b"], 4))
         for first, second in zip(states, repeat):
             torch.testing.assert_close(first["current"], second["current"])
-            torch.testing.assert_close(first["rng_state"], second["rng_state"])
+            torch.testing.assert_close(
+                first["generator"].get_state(), second["generator"].get_state()
+            )
 
     def test_entropy_bound_and_state_progression(self):
         algorithm = Gemma4Renoise(
@@ -323,7 +327,7 @@ class TestGemma4Renoise(unittest.TestCase):
         log_probabilities = torch.log_softmax(processed, dim=-1)
         probabilities = log_probabilities.exp()
         generator = torch.Generator(device="cpu")
-        generator.set_state(state["rng_state"])
+        generator.set_state(state["generator"].get_state())
         sampled = torch.multinomial(
             probabilities, num_samples=1, generator=generator
         ).squeeze(-1)
@@ -386,7 +390,10 @@ class TestGemma4Renoise(unittest.TestCase):
         for rid in first_by_rid:
             left, right = first_by_rid[rid], second_by_rid[rid]
             self.assertEqual(left["step"], right["step"])
-            for key in ("current", "argmax", "self_conditioning", "rng_state"):
+            torch.testing.assert_close(
+                left["generator"].get_state(), right["generator"].get_state()
+            )
+            for key in ("current", "argmax", "self_conditioning"):
                 torch.testing.assert_close(left[key], right[key])
 
     def test_max_step_completion_is_idempotent(self):

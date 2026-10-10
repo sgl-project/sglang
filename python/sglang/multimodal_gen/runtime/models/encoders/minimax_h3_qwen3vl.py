@@ -410,6 +410,14 @@ class MiniMaxH3Qwen3VLEncoder(TextEncoder):
                 )
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             try:
+                if (
+                    name == "model.visual.patch_embed.proj.weight"
+                    and param.ndim == 5
+                    and tuple(loaded_weight.shape)
+                    == (param.shape[0] * param.shape[1], *param.shape[2:])
+                ):
+                    # H3 GGUF folds the Conv3D output and input channel axes.
+                    loaded_weight = loaded_weight.reshape(param.shape)
                 can_keep_checkpoint_tensor = bool(
                     getattr(self, "_keep_checkpoint_mapping", False)
                     and weight_loader is default_weight_loader

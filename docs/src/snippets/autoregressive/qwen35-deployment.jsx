@@ -15,7 +15,7 @@ export const Qwen35Deployment = () => {
   //   9B/4B/2B/0.8B: tp=1 on all hardware (including MI300X, MI325X, MI355X)
   //
   // GPU requirements (FP8, where available):
-  //   397B-A17B: H100 tp=8, H200 tp=8 ep=8, B200 tp=4, B300 tp=4, GB200 tp=4, GB300 tp=4, MI300X tp=4, MI325X tp=2, MI355X tp=2
+  //   397B-A17B: H100 tp=8, H200 tp=8 ep=8, B200 tp=4, B300 tp=4, GB200 tp=4, GB300 tp=4, MI300X tp=4, MI325X tp=2, MI355X tp=2 (tp=4 with HiCache, the long-context agentic recipe)
   //   122B-A10B: H100 tp=2 (tp=4 w/ MTP), H200 tp=2, B200 tp=1, B300 tp=1, GB200 tp=1, GB300 tp=1, MI300X tp=1, MI325X tp=1, MI355X tp=1
   //   35B-A3B:   H100 tp=1, H200 tp=1, B200 tp=1, B300 tp=1, GB200 tp=1, GB300 tp=1, MI300X tp=1, MI325X tp=1, MI355X tp=1
   //   27B:       tp=1 on all hardware (including MI300X, MI325X, MI355X)
@@ -117,9 +117,12 @@ export const Qwen35Deployment = () => {
     kvOffload: {
       name: 'kvOffload',
       title: 'KV Cache Offloading',
-      // HiCache adds a host-DRAM tier below the device KV cache. Only wired up
-      // for the MI355X MXFP4 recipe, which is the arm it is tuned on.
-      condition: (values) => values.hardware === 'mi355x' && values.quantization === 'fp4',
+      // HiCache adds a host-DRAM tier below the device KV cache. Wired up for
+      // the MI355X MXFP4 recipe, which is the arm it is tuned on, and
+      // separately for the 397B FP8 long-context agentic recipe.
+      condition: (values) => values.hardware === 'mi355x' &&
+        (values.quantization === 'fp4' ||
+          (values.quantization === 'fp8' && values.model === '397b')),
       items: [
         { id: 'disabled', label: 'Disabled',            default: true  },
         { id: 'hicache',  label: 'Host DRAM (HiCache)', default: false }
@@ -364,6 +367,12 @@ export const Qwen35Deployment = () => {
     if (model === '397b' && hardware === 'b200' && quantization === 'fp4' && speculative === 'enabled') {
       hwConfig = { ...hwConfig, tp: 2, ep: 2, mem: 0.8 };
     }
+    // 397B MI355X FP8 with HiCache: the long-context agentic recipe runs tp=4.
+    // tp=2 holds the ~400GB checkpoint but leaves too little device KV headroom
+    // to feed a host-DRAM tier at agentic context lengths.
+    if (model === '397b' && hardware === 'mi355x' && quantization === 'fp8' && kvOffload === 'hicache') {
+      hwConfig = { ...hwConfig, tp: 4, mem: 0.8 };
+    }
 
     let modelName;
     if (quantization === 'fp4') {
@@ -560,6 +569,19 @@ export const Qwen35Deployment = () => {
     // once the kernel is fixed upstream.
     if (hardware === 'b300' && quantization === 'bf16' && (model === '0.8b' || model === '2b')) {
       cmd += ` \\\n  --max-running-requests 4064`;
+    }
+
+    // MI355X FP8 long-context agentic recipe: a host-DRAM KV tier plus an FP8 KV
+    // cache, which together keep enough prefix resident to reach agentic
+    // concurrency. AITER allreduce fusion stays on (emitted by the AMD block
+    // above) — unlike the MXFP4 recipe this arm does not use quick all-reduce.
+    if (model === '397b' && hardware === 'mi355x' && quantization === 'fp8' && kvOffload === 'hicache') {
+      cmd += ' \\\n  --enable-hierarchical-cache';
+      cmd += ' \\\n  --hicache-ratio 1.5';
+      cmd += ' \\\n  --hicache-write-policy write_through_selective';
+      cmd += ' \\\n  --hicache-io-backend kernel';
+      cmd += ' \\\n  --hicache-mem-layout page_first';
+      cmd += ' \\\n  --kv-cache-dtype fp8_e4m3';
     }
 
     // FP4-specific backend settings

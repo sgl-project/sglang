@@ -100,11 +100,11 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 - `--warmup-mode {off|request|server}`: control startup warmup for `sglang serve`; `off` skips warmup, `request` primes the request path, and `server` runs a full synthetic server warmup before serving traffic
 - `--enable-torch-compile {true|false}`: compile native diffusion hot paths. When no warmup mode is configured, this also enables server warmup so first real requests do not pay compile latency.
 - `--offload-during-compile {true|false}`: when compile warmup is active, temporarily layerwise-offload DiT weights and move resident non-DiT components off-device so `max-autotune` fits on tighter-memory GPUs; the configured serving residency is restored before real traffic. Skipped under existing layerwise offload, Cache-DiT, or FSDP.
-- `--enable-breakable-cuda-graph {true|false}`: capture supported DiT forwards as breakable CUDA graph segments to reduce launch overhead. Requires `--warmup-resolutions` for every served resolution because each resolution is captured separately. An `extra-high` or `high` request is rejected when it would mount request-scoped DiT fusions that were not present during lossless graph capture; VAE-only request-gated paths remain compatible.
+- `--enable-breakable-cuda-graph {true|false}`: capture supported DiT forwards as breakable CUDA graph segments to reduce launch overhead. Requires `--warmup-resolutions` for every served resolution because each resolution is captured separately. An `lossless` or `high` request is rejected when it would mount request-scoped DiT fusions that were not present during lossless graph capture; VAE-only request-gated paths remain compatible.
 - `--bcg-text-buckets {N...}`: prompt-length padding buckets for breakable CUDA graph capture/replay reuse.
 - `--attention-backend {BACKEND}`: attention backend for native SGLang and diffusers pipelines
 - `--enable-attention-backend-autotune {true|false}`: for SGLang-native pipelines, benchmark compatible attention backends on each layer's first sufficiently large input and keep a backend only when it is both numerically compatible and measurably faster. Disabled by default and currently validated on SM90 and SM12x. Explicit `--attention-backend`, component overrides, and model-required backends are never replaced.
-- `--component-attention-backends {MAP}`: per-component attention backend overrides, for example `text_encoder=torch_sdpa,transformer=fa`
+- `--component-attention-backends {MAP}`: per-component attention backend overrides, for example `text_encoder=torch_sdpa,transformer=fa`. A key may carry a `.self` or `.cross` role suffix to override one kind of attention only, for example `transformer.cross=fa`
 - `--attention-backend-config {CONFIG}`: attention backend configuration
 - `--srt-encoder-url {HTTPADDRESS}`: address of SGLang srt server with AR model for GLM-Image like models. See [Models with AR Stage](/docs/sglang-diffusion/models_with_ar).
 - `--srt-encoder-timeout {SECONDS}`: Timeout in seconds for HTTP requests to the SGLang encoder server
@@ -115,6 +115,7 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 - `--otlp-service-name {NAME}`: `service.name` attached to exported traces. Resolution order is this flag, `OTEL_SERVICE_NAME`, then `sglang-diffusion`.
 - `--enable-metrics`: expose Prometheus metrics at `/metrics` (default: disabled). Includes request counts, queue time, host-side stage timing and LoRA state, separated by role and DP replica. See [Production metrics](/docs/sglang-diffusion/production_metrics) for metric semantics and disaggregated scraping.
 - `--pe-server-url {HTTPADDRESS}`: url of SGLang server hosting the PE model (e.g., for ERNIE-Image). See [Models with Prompt Enhancement](/docs/sglang-diffusion/models_with_pe).
+- `--prompt-enhancer-config {JSON_FILE}`: configure an independent SRT LLM/VLM for opt-in HTTP prompt rewriting. Requests use `enhance_prompt=true`; no enhancer runs by default. See [Prompt enhancement](/docs/sglang-diffusion/models_with_pe).
 
 ### Sampling and output
 
@@ -122,7 +123,7 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 - `--image-path {PATH} [{PATH} ...]`: input image(s) for image-to-video or image-to-image generation
 - `--num-inference-steps {STEPS}` and `--seed {SEED}`
 - `--num-outputs-per-prompt {N}` / `--num-outputs {N}`: generate multiple outputs for each prompt. A scalar seed expands as `seed + output_index`.
-- `--quality {lossless,extra-high,high}`: cumulative request-level optimization tier. `lossless` (default) keeps the selected deployment's reference path and all unconditional bit-exact replacements. `extra-high` adds only request-gated DiT/VAE kernel fusions; the tier does not itself enable sparse, caching, or other approximate paths. `high` includes the complete `extra-high` set and may also enable model-owned approximate optimizations. Separately configured quantization, attention, or caching options still apply. Support and validation constraints are model-specific.
+- `--quality {exact,lossless,high}`: cumulative request-level optimization tier. `lossless` (default) runs every fast path that keeps the reference math and the precision of every operand, moving only where the rounding happens; it does not enable quantization, sparsity, caching, or another approximate path. `exact` restricts it to the fast paths that reproduce the reference's rounding exactly, so output is bit-identical in the same environment -- ask for it when a run has to be reproducible. `high` includes the complete `lossless` set and may also enable model-owned approximate optimizations. `extra-high` is accepted as the former name of `lossless`. Separately configured quantization, attention, or caching options still apply. Support and validation constraints are model-specific.
 - `skip_softmax_params` (online request only): explicitly enables lossy BLASST/Skip-Softmax attention for compatible FA self-attention layers. See [Attention Backends](../attention_backends#request-scoped-skip-softmax).
 - `--height {HEIGHT}`, `--width {WIDTH}`, `--num-frames {N}`, `--fps {FPS}`
 - `--output-path {PATH}`, `--output-file-name {NAME}`, `--save-output`, `--return-frames`
@@ -274,6 +275,13 @@ HTTP server-only arguments are ignored by `sglang generate`.
 
 For supported native pipelines, set `SGLANG_CACHE_DIT_ENABLED=true` to enable Cache-DiT. It can run with DiT layerwise offload; it cannot run with FSDP. For the diffusers backend, use `--backend diffusers --cache-dit-config ...`. See [Cache-DiT](/docs/sglang-diffusion/cache_dit).
 
+Native conditioning reuse is enabled by default, independently of Cache-DiT:
+
+- `--disable-conditioning-cache`: disable cross-request text/image conditioning reuse and VAE posterior caching. Reuse within a grouped stage remains enabled.
+- `--conditioning-cache-max-size-mb {MiB}`: shared CPU and device LRU capacity per executor/rank, default `512`; `0` disables cross-request caching. Consumed negative text conditioning stays on its original device; other entries live on the CPU. The cache holds at most 128 entries and bypasses oversized outputs.
+
+See [conditioning cache](/docs/sglang-diffusion/caching-acceleration#conditioning-cache) for model coverage, invalidation, and the distinction between cold and repeated-input latency.
+
 For supported image pipelines, breakable CUDA graph can be enabled with `--enable-breakable-cuda-graph`, but you must declare every served resolution in `--warmup-resolutions` so warmup captures matching graph signatures.
 
 LongCat-Image is supported by this path. Its DiT always consumes a fixed
@@ -324,6 +332,16 @@ The available modes are:
 Selectors match exact loaded component keys from `model_index.json`, including names such as `transformer_2`, `audio_vae`, and `connectors`. The group selectors `dit`, `text_encoder`, `image_encoder`, and `vae` are also available, together with `all`. An exact key overrides a matching group, and a group overrides `all`. Components without a matching canonical selector retain their explicit legacy setting or automatic/model default.
 
 The existing `--dit-cpu-offload`, `--text-encoder-cpu-offload`, `--image-encoder-cpu-offload`, `--vae-cpu-offload`, and `--cpu-offload-components` options remain supported. New and legacy options may be mixed: `--component-residency` wins only for components it matches, while unmatched legacy settings remain effective. Legacy layerwise selectors take precedence over legacy component-offload selectors for the same component. Explicit `--dit-layerwise-offload false` makes the DiT resident unless another explicit DiT selector, such as `--dit-cpu-offload true` or `--component-residency dit=component-offload`, selects a different mode.
+
+Explicit component placement also applies during warmup and request cleanup. Pipeline
+preferences cannot keep or reload an explicitly offloaded component merely to
+prepare for the next request. An explicitly `resident` component remains resident.
+This applies to matching exact, group, and `all` selectors, as well as legacy
+offload options. Components without an explicit placement may still use the
+pipeline's warmup retention and request-end preload preferences. Selecting one component does
+not disable those preferences for other components. On-demand loading and
+prefetch for upcoming uses within a request are unchanged; explicit offload may
+therefore add weight-transfer latency to the first real request after warmup.
 
 Layerwise selection is strict. A native weighted component selected for `layerwise-offload` must declare its layer structure; otherwise startup fails with the unsupported component name instead of silently changing modes. Explicit non-resident placement also requires a request-time component-use declaration, so it cannot silently select a module that the pipeline does not manage. FSDP applies only to resident components. The Diffusers backend supports only pipeline-wide `all=resident` and `all=component-offload`.
 
@@ -406,6 +424,13 @@ sglang serve \
   --port 30010
 ```
 
+### Asynchronous output saving
+
+Use `--async-output-save` to overlap output saving with the next request during
+native NVIDIA CUDA serving. It is disabled by default. See
+[Asynchronous output saving](/docs/sglang-diffusion/performance-optimization#asynchronous-output-saving)
+for an example, eligible requests, and the response latency and memory tradeoffs.
+
 ### Health endpoints
 
 SGLang Diffusion separates process liveness from inference readiness:
@@ -481,6 +506,21 @@ sglang generate \
   --component-attention-backends.text_encoder torch_sdpa \
   --component-attention-backends.transformer fa
 ```
+
+A component key may end in `.self` or `.cross` to override one kind of attention
+only. This helps when a backend's per-call overhead pays off for self-attention
+but not for the lighter cross-attention:
+
+```bash Command
+sglang generate \
+  --model-path <MODEL_PATH_OR_ID> \
+  --component-attention-backends.transformer.self sage_attn \
+  --component-attention-backends.transformer.cross fa
+```
+
+A role override outranks the component-wide backend for layers of that role and
+is equally strict: it fails the load if it never reaches a layer of that role.
+See [Attention Backends](/docs/sglang-diffusion/attention_backends#per-role-overrides).
 
 ## Diffusers Backend
 
