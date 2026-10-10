@@ -59,7 +59,7 @@ __all__ = ["reshape_and_cache_flash"]
 # Other Triton kernels migrated into this group (from attention/mem_cache
 # triton_ops); registered for inventory. Import them from their modules.
 _TRITON_KERNELS = [
-    ("dcp_gather", "unpack_dcp_kv"),
+    ("mla_buffer", "unpack_dcp_kv"),
     ("cache_ops", "concat_and_cast_mha_k_triton"),
     ("cache_ops", "launch_reshape_and_cache_flash"),
     ("pd_dcp_gather", "copy_mla_rows_into_pack"),

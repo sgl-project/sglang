@@ -372,7 +372,7 @@ def all_gather_kv_cache_for_dcp(
         ).to(dtype=torch.int64)
 
     if prefix_kv_a.is_cuda and not _is_hip:
-        from sglang.kernels.ops.kvcache.dcp_gather import unpack_dcp_kv
+        from sglang.kernels.ops.kvcache.mla_buffer import unpack_dcp_kv
 
         unpack_dcp_kv(
             gathered_kv_cache,
