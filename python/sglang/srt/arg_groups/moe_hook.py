@@ -35,6 +35,29 @@ from sglang.srt.utils.common import is_sm100_supported, parse_connector_type
 logger = logging.getLogger(__name__)
 
 
+def validate_return_routed_experts_moe_backend(server_args: Any) -> None:
+    """Reject runners whose from-logits kernels do not expose routed IDs."""
+    view = resolved_view(server_args)
+    if not view.enable_return_routed_experts:
+        return
+
+    backend = view.moe_runner_backend
+    uses_bypassed_topk = backend in (
+        "flashinfer_trtllm",
+        "experimental_sgl_trtllm",
+    )
+    if backend == "flashinfer_mxfp4":
+        uses_bypassed_topk = not model_config_of(server_args).is_fp4_experts
+
+    if uses_bypassed_topk:
+        raise ValueError(
+            "--enable-return-routed-experts is not supported with "
+            f"--moe-runner-backend {backend}: routing is performed inside the "
+            "fused MoE kernel and expert IDs are not exposed. Use a pre-routed "
+            "backend or disable routed-expert returns."
+        )
+
+
 def handle_moe_kernel_config(server_args: Any):
     # The quantization-driven runner resolutions moved to the pipeline
     # (arg_groups/overrides.py: _moe_runner_backend_quant_constraints);
@@ -527,6 +550,10 @@ def handle_a2a_moe(server_args: Any):
                 "must be >= the per-rank pplx dispatch tokens "
                 "(chunked_prefill_size, or the decode cuda-graph batch size)"
             )
+
+    # Keep this last: A2A resolution can replace a from-logits runner with a
+    # pre-routed variant once dispatch supplies explicit top-k ids and weights.
+    validate_return_routed_experts_moe_backend(server_args)
 
 
 def validate_deepep_v2_speculative_draft(server_args: Any) -> None:
