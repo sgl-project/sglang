@@ -2886,8 +2886,11 @@ def add_prometheus_track_response_middleware(
     async def track_http_status_code(request, call_next):
         # With recording all requests, we have the risk of high cardinality if requests have arbitrary unhandled paths.
         # But given that SGLang engines with metrics enabled are usually behind routers this looks safe.
-        path, is_handled_path = _get_fastapi_request_path(request)
-        method = request.method
+        path, is_handled_path = _get_normalized_fastapi_request_path_for_metrics(
+            request
+        )
+        method = _get_normalized_http_method_for_metrics(request.method)
+
         routing_key = request.headers.get("x-smg-routing-key")
 
         http_request_counter.labels(**extra_labels, endpoint=path, method=method).inc()
@@ -2918,12 +2921,44 @@ def add_prometheus_track_response_middleware(
 def _get_fastapi_request_path(request) -> Tuple[str, bool]:
     from starlette.routing import Match
 
-    for route in request.app.routes:
-        match, child_scope = route.matches(request.scope)
-        if match == Match.FULL:
-            return getattr(route, "path", request.url.path), True
+    route_matches = [
+        (route, match)
+        for route in request.app.routes
+        if (match := route.matches(request.scope)[0]) in (Match.FULL, Match.PARTIAL)
+    ]
 
+    full_match = [route for route, match in route_matches if match == Match.FULL]
+    partial_match = [route for route, match in route_matches if match == Match.PARTIAL]
+
+    matched_request_path = full_match or partial_match
+    if matched_request_path:
+        route_path = getattr(matched_request_path[0], "path", None)
+        if route_path is not None:
+            return route_path, True
     return request.url.path, False
+
+
+def _get_normalized_fastapi_request_path_for_metrics(request) -> Tuple[str, bool]:
+    """Return a route path suitable for metrics labels.
+
+    Matched routes with a path template use that template. Unknown paths and
+    matched routes without a path template are collapsed to a single label
+    to prevent unbounded cardinality growth.
+    """
+    path, is_handled_path = _get_fastapi_request_path(request)
+    if not is_handled_path:
+        # Collapse arbitrary unknown paths to prevent unbounded cardinality growth.
+        path = "__unhandled__"
+    return path, is_handled_path
+
+
+_METRIC_HTTP_METHODS = frozenset(
+    {"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "CONNECT", "TRACE"}
+)
+
+
+def _get_normalized_http_method_for_metrics(method: str) -> str:
+    return method if method in _METRIC_HTTP_METHODS else "__unknown__"
 
 
 # Copy from pytorch and OpenRLHF to allow creating multiple main groups.
