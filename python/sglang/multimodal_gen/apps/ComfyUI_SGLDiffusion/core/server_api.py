@@ -429,6 +429,7 @@ class SGLDiffusionServerAPI:
         lora_nickname: str,
         lora_path: Optional[str] = None,
         target: str = "all",
+        strength: Optional[float] = None,
     ) -> Dict[str, Any]:
         """
         Set a LoRA adapter for the specified transformer(s).
@@ -442,6 +443,8 @@ class SGLDiffusionServerAPI:
                 - "transformer": Apply only to the primary transformer (high noise for Wan2.2)
                 - "transformer_2": Apply only to transformer_2 (low noise for Wan2.2)
                 - "critic": Apply only to the critic model
+            strength: LoRA merge strength. The server defaults to 1.0 when
+                not given; values < 1.0 reduce the effect.
 
         Returns:
             Dictionary containing the API response with status and message
@@ -458,6 +461,8 @@ class SGLDiffusionServerAPI:
         # Add optional lora_path if provided
         if lora_path:
             payload["lora_path"] = lora_path
+        if strength is not None:
+            payload["strength"] = strength
 
         try:
             response = requests.post(
