@@ -29,6 +29,7 @@ from sglang.kernels.ops.layernorm.rmsnorm_fanout import (
 )
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.layers.activation import GeluAndMul
+from sglang.srt.layers.dual_gemm import DualGemm
 from sglang.srt.layers.layernorm import Gemma4RMSNorm, RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -252,10 +253,22 @@ class DiffusionGemmaSelfConditioning(nn.Module):
             prefix=add_prefix("down_proj", prefix),
         )
         self.act_fn = GeluAndMul()
+        self.dual_gemm = DualGemm(
+            self.gate_up_proj,
+            self.down_proj,
+            config.hidden_size,
+            activation="gelu_tanh",
+        )
+        self.pre_norm.fuse_input_quant(self.gate_up_proj)
 
     def forward(self, inputs_embeds, signal):
-        gate_up, _ = self.gate_up_proj(self.pre_norm(signal))
-        h, _ = self.down_proj(self.act_fn(gate_up))
+        signal = self.pre_norm(signal)
+        if self.dual_gemm.can_run(signal, self.gate_up_proj):
+            h = self.dual_gemm(signal, self.gate_up_proj)
+        else:
+            gate_up, _ = self.gate_up_proj(signal)
+            h = self.act_fn(gate_up)
+        h, _ = self.down_proj(h)
         return self.post_norm(inputs_embeds + h)
 
 
@@ -326,6 +339,8 @@ class DiffusionGemmaDecoderLayer(nn.Module):
         self.post_feedforward_layernorm = RMSNorm(config.hidden_size, eps=eps)
         self.post_feedforward_layernorm_1 = RMSNorm(config.hidden_size, eps=eps)
         self.post_feedforward_layernorm_2 = RMSNorm(config.hidden_size, eps=eps)
+        self.input_layernorm.fuse_input_quant(self.self_attn.qkv_proj)
+        self.pre_feedforward_layernorm.fuse_input_quant(self.mlp.gate_up_proj)
 
         # Encoder and decoder use the same weights but distinct per-layer scalars.
         self.register_buffer("layer_scalar", torch.ones(1), persistent=True)
