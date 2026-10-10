@@ -202,7 +202,7 @@ class TestCudaAttentionBackendSelection(unittest.TestCase):
 
     def test_invalid_backend_raises(self):
         with self.assertRaisesRegex(ValueError, "Invalid attention backend"):
-            self.resolve(AttentionBackendEnum.AITER_SAGE)
+            self.resolve(AttentionBackendEnum.AITER_QUANT)
 
     def test_sage_attention_head_sizes(self):
         sage_cls_str = (

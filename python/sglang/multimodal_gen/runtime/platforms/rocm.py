@@ -132,15 +132,18 @@ class RocmPlatform(Platform):
             logger.info("Using AITer backend on ROCm.")
             return "sglang.multimodal_gen.runtime.layers.attention.backends.aiter.AITerBackend"
 
-        elif selected_backend == AttentionBackendEnum.AITER_SAGE:
-            if dtype in (torch.float16, torch.bfloat16):
-                logger.info("Using AITER Sage backend on ROCm.")
-                return "sglang.multimodal_gen.runtime.layers.attention.backends.aiter_sage.AITERSageBackend"
-            else:
+        elif selected_backend == AttentionBackendEnum.AITER_QUANT:
+            if dtype is not torch.bfloat16:
+                # mha_v4 quantizes from BF16 operands and rejects every other
+                # input dtype, fp16 included.
                 logger.warning(
-                    "AITER Sage backend only supports bf16/fp16 inputs but got dtype=%s.",
+                    "AITER quant backend takes BF16 inputs, which it quantizes "
+                    "to the selected format, but got dtype=%s. Proceeding "
+                    "anyway; aiter will reject the call.",
                     dtype,
                 )
+            logger.info("Using aiter_quant attention backend on ROCm.")
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.aiter_quant.AITERQuantBackend"
 
         elif selected_backend in (
             AttentionBackendEnum.SLIDING_TILE_ATTN,
