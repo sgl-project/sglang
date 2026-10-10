@@ -200,6 +200,8 @@ class TestNPUMambaPathStateCapEvictable(CustomTestCase):
             "--enable-metrics",
             "--mamba-max-states-per-path",
             str(cap),
+            "--mamba-ssm-dtype",
+            "bfloat16",
         ]
         return popen_launch_server(
             MODEL,
