@@ -4014,29 +4014,6 @@ class UnifiedRadixCacheSuite:
     # Buffer-only host memory mode (host = transient staging, L3 = cache)
     # ================================================================
 
-    def test_buffer_only_rejects_mamba(self):
-        if (
-            self.cfg.components
-            != (
-                ComponentType.FULL,
-                ComponentType.MAMBA,
-            )
-            or self.cfg.page_size != 1
-        ):
-            self.skipTest("one FULL+MAMBA page_size=1 fixture covers this guard")
-
-        cache, _, _ = build_fixture(self.cfg)
-        storage_dir = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
-        with self.assertRaisesRegex(ValueError, "supports only FULL/SWA"):
-            self._init_hicache(
-                cache,
-                storage_backend="file",
-                storage_dir=storage_dir,
-                prefetch_threshold=1,
-                host_memory_mode="buffer_only",
-            )
-
     def _init_buffer_hicache(
         self,
         cache,
@@ -4047,8 +4024,8 @@ class UnifiedRadixCacheSuite:
     ):
         if self.cfg.has_mamba:
             self.skipTest(
-                "buffer_only is FULL/SWA-only (no Mamba state-handoff channel "
-                "on the admission-time load-back read path)"
+                "load-back requests here are Mocks; buffer_only Mamba is "
+                "covered by TestUnifiedHybridBufferOnlyBitExact"
             )
         self._init_hicache(
             cache,
