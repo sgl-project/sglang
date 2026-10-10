@@ -14,7 +14,7 @@ KIMI_LINEAR_MODEL = "moonshotai/Kimi-Linear-48B-A3B-Instruct"
 SERVER_ENV = {"SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM": "0"}
 
 PAGE_SIZE = 16
-CHUNKED_PREFILL_SIZE = 64
+CHUNKED_PREFILL_SIZE = 128
 DCP_SIZE = 2
 # Prefill checkpoints the linear-attn state every 64 tokens, so shorter
 # prompts never get a radix hit.

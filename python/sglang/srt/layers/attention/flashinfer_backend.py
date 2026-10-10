@@ -291,6 +291,13 @@ def fast_prefill_plan(
     self._plan_info = self._cached_module.plan(*args)
 
 
+# The fa2 prefill kernel packs GQA heads into 128-row q tiles and rounds each
+# tile's causal bound, so under deterministic inference an extend reproduces the
+# unchunked prefill bit for bit only when it starts on a 128-token boundary
+# (test/registered/attention/test_flashinfer_deterministic_chunk_invariance.py).
+PREFILL_Q_TILE_TOKENS = 128
+
+
 class FlashInferAttnBackend(AttentionBackend):
     """Flashinfer attention kernels."""
 
