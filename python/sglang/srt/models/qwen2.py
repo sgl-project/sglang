@@ -28,6 +28,7 @@ from sglang.srt.distributed import (
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.dual_gemm import DualGemm
 from sglang.srt.layers.layer_boundary import (
     append_stages,
     declare_attn,
@@ -100,6 +101,7 @@ class Qwen2MLP(nn.Module):
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
+        self.dual_gemm = DualGemm(self.gate_up_proj, self.down_proj, hidden_size)
 
     def forward(
         self,
@@ -109,8 +111,11 @@ class Qwen2MLP(nn.Module):
         if get_exec().deterministic.rl_on_policy_target is not None:
             x = x.bfloat16()
 
-        gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
+        if self.dual_gemm.can_run(x, self.gate_up_proj):
+            x = self.dual_gemm(x, self.gate_up_proj)
+        else:
+            gate_up, _ = self.gate_up_proj(x)
+            x = self.act_fn(gate_up)
         x, _ = self.down_proj(x, forward_batch=forward_batch)
         return x
 
