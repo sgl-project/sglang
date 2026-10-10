@@ -1216,6 +1216,15 @@ def is_gfx942_supported():
 
 
 @lru_cache(maxsize=1)
+def is_gfx120x_supported():
+    """Whether the selected HIP device is gfx1200 or gfx1201 (RDNA4)."""
+    if torch.version.hip:
+        arch = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
+        return arch in ("gfx1200", "gfx1201")
+    return False
+
+
+@lru_cache(maxsize=1)
 def is_gfx1250_supported():
     """
     Returns whether the current platform is AMD RDNA4 (gfx1250).
