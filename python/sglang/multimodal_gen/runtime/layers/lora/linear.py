@@ -123,6 +123,14 @@ class BaseLayerWithLoRA(nn.Module):
     def bias(self):
         return getattr(self.base_layer, "bias", None)
 
+    def _scale_lora_delta(
+        self, delta: torch.Tensor, runtime_lora_scale: float
+    ) -> torch.Tensor:
+        if self.lora_alpha != self.lora_rank:
+            delta = delta * (self.lora_alpha / self.lora_rank)  # type: ignore
+        scale = self.strength * runtime_lora_scale
+        return delta if scale == 1.0 else delta * scale
+
     @staticmethod
     def _runtime_lora_scale() -> float:
         context = get_forward_context_or_none()
@@ -174,11 +182,7 @@ class BaseLayerWithLoRA(nn.Module):
             lora_B.to(device=x.device, non_blocking=True)
         )
         delta = _compute_lora_delta(x_lora, lora_A_sliced, lora_B_sliced)
-        if self.lora_alpha != self.lora_rank:
-            delta = delta * (
-                self.lora_alpha / self.lora_rank  # type: ignore
-            )  # type: ignore
-        delta = delta * self.strength * runtime_lora_scale
+        delta = self._scale_lora_delta(delta, runtime_lora_scale)
         out, output_bias = self.base_layer(x)
         out = out + delta.to(dtype=out.dtype)
         return self._add_lora_output_offset(out), output_bias
@@ -710,11 +714,7 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
             delta_parallel = _compute_lora_delta(
                 input_lora, lora_A_sliced, lora_B_sliced
             )
-            if self.lora_alpha != self.lora_rank:
-                delta_parallel = delta_parallel * (
-                    self.lora_alpha / self.lora_rank  # type: ignore
-                )  # type: ignore
-            delta_parallel = delta_parallel * self.strength * runtime_lora_scale
+            delta_parallel = self._scale_lora_delta(delta_parallel, runtime_lora_scale)
             output_parallel = output_parallel + delta_parallel.to(
                 dtype=output_parallel.dtype
             )
@@ -819,11 +819,7 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
             delta_parallel = _compute_lora_delta(
                 input_parallel_lora, lora_A_sliced, lora_B_sliced
             )
-            if self.lora_alpha != self.lora_rank:
-                delta_parallel = delta_parallel * (
-                    self.lora_alpha / self.lora_rank  # type: ignore
-                )  # type: ignore
-            delta_parallel = delta_parallel * self.strength * runtime_lora_scale
+            delta_parallel = self._scale_lora_delta(delta_parallel, runtime_lora_scale)
             output_parallel = output_parallel + delta_parallel.to(
                 dtype=output_parallel.dtype
             )
@@ -885,11 +881,7 @@ class LinearWithLoRA(BaseLayerWithLoRA):
                 lora_B.to(device=x.device, non_blocking=True)
             )
             delta = _compute_lora_delta(x_lora, lora_A_sliced, lora_B_sliced)
-            if self.lora_alpha != self.lora_rank:
-                delta = delta * (
-                    self.lora_alpha / self.lora_rank  # type: ignore
-                )  # type: ignore
-            delta = delta * self.strength * runtime_lora_scale
+            delta = self._scale_lora_delta(delta, runtime_lora_scale)
             # nn.Linear.forward() returns a single tensor, not a tuple
             out = self.base_layer(x)
             out = out + delta.to(dtype=out.dtype)
