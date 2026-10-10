@@ -209,9 +209,11 @@ class FlashAttentionBackend(AttentionBackend):
         # only; draft-side instances must not allocate it.
         self.is_draft_runner = model_runner.is_draft_worker
 
+        # SWA hybrid models split the KV cache into full and SWA pools with
+        # separate index spaces; SWA layers need a translated page_table.
+        self._swa_kv_pool: Optional[SWAKVPool] = self._resolve_swa_kv_pool(model_runner)
         self.use_sliding_window_kv_pool = (
-            isinstance(model_runner.token_to_kv_pool, SWAKVPool)
-            and model_runner.token_to_kv_pool.swa_layer_nums > 0
+            self._swa_kv_pool is not None and self._swa_kv_pool.swa_layer_nums > 0
         )
 
         self._kv_shard_pool = get_kv_shard_pool(self.token_to_kv_pool)
@@ -380,6 +382,27 @@ class FlashAttentionBackend(AttentionBackend):
             _should_disable_scheduler_metadata_precompute()
         )
 
+    @staticmethod
+    def _resolve_swa_kv_pool(model_runner: ModelRunner) -> Optional[SWAKVPool]:
+        """Return the SWAKVPool to translate against, or None for non-SWA models.
+
+        EAGLE draft workers share the target allocator for token bookkeeping,
+        but own a separate draft KV pool. Do not use the target allocator's
+        SWA mapping for that draft pool. FROZEN_KV MTP is the exception: its
+        draft path reads target KV directly, so it still needs the allocator
+        pool when the active pool is not SWA.
+        """
+        active_pool = model_runner.token_to_kv_pool
+        if isinstance(active_pool, SWAKVPool):
+            return active_pool
+
+        if model_runner.is_draft_worker:
+            if not model_runner.spec_algorithm.is_frozen_kv_mtp():
+                return None
+
+        kvcache = model_runner.token_to_kv_pool_allocator.get_kvcache()
+        return kvcache if isinstance(kvcache, SWAKVPool) else None
+
     def _maybe_init_local_attn_builder(
         self, model_runner: ModelRunner
     ) -> Optional[LocalAttentionMetadataBuilder]:
@@ -400,7 +423,7 @@ class FlashAttentionBackend(AttentionBackend):
             max_context_len=self.max_context_len,
             device=self.device,
             swa_translate=(
-                self.token_to_kv_pool.translate_loc_from_full_to_swa
+                self._swa_kv_pool.translate_loc_from_full_to_swa
                 if self.use_sliding_window_kv_pool
                 else None
             ),
@@ -516,7 +539,7 @@ class FlashAttentionBackend(AttentionBackend):
         # rebuild path.
         if not self.use_sliding_window_kv_pool:
             return None
-        return self.token_to_kv_pool.full_to_swa_index_mapping
+        return self._swa_kv_pool.full_to_swa_index_mapping
 
     def draft_extend_metadata_captured_in_graph(self) -> bool:
         # A translating backend rebuilds out of graph: the captured gather
@@ -525,7 +548,7 @@ class FlashAttentionBackend(AttentionBackend):
             return False
         return (
             not self.use_sliding_window_kv_pool
-            or self.token_to_kv_pool.full_to_swa_index_mapping is not None
+            or self._swa_kv_pool.full_to_swa_index_mapping is not None
         )
 
     def init_forward_metadata_out_graph(
@@ -783,7 +806,7 @@ class FlashAttentionBackend(AttentionBackend):
             if self.use_sliding_window_kv_pool:
                 # SWA block table: translate the page-start full slots to their
                 # SWA cache locations, then reduce to SWA page indices.
-                swa_starts = self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                swa_starts = self._swa_kv_pool.translate_loc_from_full_to_swa(
                     page_indices
                 )
                 m.swa_page_table[:, :max_seq_pages].copy_(swa_starts // self.page_size)
@@ -1242,11 +1265,9 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.swa_out_cache_loc = swa_out_cache_loc
         elif self.use_sliding_window_kv_pool:
             # FA3 requires an int32 page_table.
-            metadata.swa_page_table = (
-                self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                    metadata.page_table
-                ).to(torch.int32)
-            )
+            metadata.swa_page_table = self._swa_kv_pool.translate_loc_from_full_to_swa(
+                metadata.page_table
+            ).to(torch.int32)
             metadata.swa_out_cache_loc = swa_out_cache_loc
 
         # Logical-page KV sharding: capture the batch's gather plan and swap the
@@ -1592,7 +1613,7 @@ class FlashAttentionBackend(AttentionBackend):
                 if metadata.swa_page_table is not None:
                     page_table = metadata.swa_page_table
                 else:
-                    page_table = self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                    page_table = self._swa_kv_pool.translate_loc_from_full_to_swa(
                         metadata.page_table
                     ).to(torch.int32)
             cu_seqlens_q = metadata.cu_seqlens_q
@@ -2166,11 +2187,9 @@ class FlashAttentionBackend(AttentionBackend):
                     if metadata.swa_page_table is not None:
                         page_table = metadata.swa_page_table
                     else:
-                        page_table = (
-                            self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                                metadata.page_table
-                            ).to(torch.int32)
-                        )
+                        page_table = self._swa_kv_pool.translate_loc_from_full_to_swa(
+                            metadata.page_table
+                        ).to(torch.int32)
                 cache_seqlens = metadata.cache_seqlens_int32
                 max_seqlen_q = metadata.max_seq_len_q
 
@@ -2891,7 +2910,7 @@ class FlashAttentionBackend(AttentionBackend):
             seq_len_delta,
             self.page_size,
             metadata.swa_page_table,
-            self.token_to_kv_pool if self.use_sliding_window_kv_pool else None,
+            self._swa_kv_pool if self.use_sliding_window_kv_pool else None,
             skip_page_table=translated,
         )
         if translated:
@@ -3256,10 +3275,8 @@ class FlashAttentionBackend(AttentionBackend):
                     self.use_sliding_window_kv_pool
                     and metadata.swa_page_table is not None
                 ):
-                    swa_page_indices = (
-                        self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                            page_indices
-                        )
+                    swa_page_indices = self._swa_kv_pool.translate_loc_from_full_to_swa(
+                        page_indices
                     )
                     metadata.swa_page_table[:, :max_seq_pages].copy_(
                         swa_page_indices // self.page_size
@@ -3356,10 +3373,10 @@ class FlashAttentionBackend(AttentionBackend):
         page_table_a = metadata.page_table
         page_table_b = metadata_expand.page_table
         if self.use_sliding_window_kv_pool:
-            page_table_a = self.token_to_kv_pool.translate_loc_from_full_to_swa(
+            page_table_a = self._swa_kv_pool.translate_loc_from_full_to_swa(
                 page_table_a
             ).to(torch.int32)
-            page_table_b = self.token_to_kv_pool.translate_loc_from_full_to_swa(
+            page_table_b = self._swa_kv_pool.translate_loc_from_full_to_swa(
                 page_table_b
             ).to(torch.int32)
 
