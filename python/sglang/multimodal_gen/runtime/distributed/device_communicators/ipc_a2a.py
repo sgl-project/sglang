@@ -30,6 +30,23 @@ class _Unsupported(RuntimeError):
     """This topology cannot run the transport -- an expected outcome, not a bug."""
 
 
+def ipc_shareable_zeros(*shape: int, dtype: torch.dtype) -> torch.Tensor:
+    """Zeros for a buffer exported over CUDA IPC, kept out of expandable segments.
+
+    Freeing an expandable segment that was exported over IPC breaks the CUDA
+    allocator on fabric-handle systems (GB200/GB300): empty_cache raises
+    "std::get: wrong index for variant" or "bad optional access" on some ranks,
+    which then diverge and hang the next collective.
+    """
+    if "expandable_segments:True" not in torch._C._accelerator_getAllocatorSettings():
+        return torch.zeros(*shape, dtype=dtype, device="cuda")
+    torch._C._accelerator_setAllocatorSettings("expandable_segments:False")
+    try:
+        return torch.zeros(*shape, dtype=dtype, device="cuda")
+    finally:
+        torch._C._accelerator_setAllocatorSettings("expandable_segments:True")
+
+
 def _peer_cuda_device(group, rank: int, device: int) -> int:
     """Return the peer's local CUDA ordinal for a two-rank same-host group."""
     world_size = dist.get_world_size(group=group)
@@ -160,9 +177,9 @@ class IpcA2AState:
         # kernel-level dereference of peer mappings needs explicit peer access
         ctypes.CDLL("libcudart.so").cudaDeviceEnablePeerAccess(peer_dev, 0)
         self.ops = load_ipc_a2a_sync()
-        self.flag = torch.zeros(1, dtype=torch.int32, device="cuda")
+        self.flag = ipc_shareable_zeros(1, dtype=torch.int32)
         self.my_seq = torch.zeros(1, dtype=torch.int32, device="cuda")
-        self.timed_out = torch.zeros(1, dtype=torch.int32, device="cuda")
+        self.timed_out = ipc_shareable_zeros(1, dtype=torch.int32)
         self.budget_ns = int(envs.SGLANG_DIFFUSION_IPC_A2A_TIMEOUT_MS * 1e6)
         self.max_buffers = envs.SGLANG_DIFFUSION_IPC_A2A_MAX_BUFFERS
         self.peer_flag = self._share(self.flag, group)
@@ -183,7 +200,7 @@ class IpcA2AState:
         if pair is None:
             if torch.cuda.is_current_stream_capturing():
                 return None
-            local = torch.zeros(2, n_local, dtype=dtype, device="cuda")
+            local = ipc_shareable_zeros(2, n_local, dtype=dtype)
             peer = self._share(local, group)
             pair = (local, peer)
             if len(self.staging) >= self.max_buffers:
