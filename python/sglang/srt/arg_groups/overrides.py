@@ -660,15 +660,7 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
             declared["dsa_decode_backend"] = backend
         prefill = declared.get("dsa_prefill_backend", view.dsa_prefill_backend)
         decode = declared.get("dsa_decode_backend", view.dsa_decode_backend)
-        if (
-            not get_platform().is_hip
-            and kv_cache_dtype == "fp8_e4m3"
-            and "tilelang" in (prefill, decode)
-        ):
-            raise ValueError("CUDA TileLang FP8 KV does not support HiSparse.")
-        # The hisparse allow-list in hisparse_hook is platform- but not
-        # dtype-aware, so an explicitly requested backend still has to clear the
-        # shared backend/kv-cache-dtype rules before this arm returns early.
+        # HiSparse also requires compatible KV layouts on both DSA backends.
         _check_dsa_backend_constraints(
             kv_cache_dtype,
             prefill,
