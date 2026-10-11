@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Callable, Optional
 import torch
 
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
+from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     deployment_attn_dp_size,
@@ -42,6 +43,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_spec,
 )
+from sglang.srt.speculative.draft_checkpoint import refresh_track_indices, track_indices
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
 from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
@@ -73,6 +75,7 @@ def resolve_draft_extend_seq_len_fill_value(
 class EagleDraftExtendInputBuffers(ForwardInputBuffers):
     input_ids: torch.Tensor
     req_pool_indices: torch.Tensor
+    mamba_track_indices: Optional[torch.Tensor]
     out_cache_loc: torch.Tensor
     positions: torch.Tensor
     mrope_positions: torch.Tensor
@@ -267,6 +270,11 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         self.buffers = EagleDraftExtendInputBuffers(
             input_ids=input_ids,
             req_pool_indices=req_pool_indices,
+            mamba_track_indices=(
+                torch.zeros(self.max_bs, dtype=torch.int64, device=self.device)
+                if get_exec().mamba.enable_mamba_extra_buffer
+                else None
+            ),
             out_cache_loc=out_cache_loc,
             positions=positions,
             mrope_positions=mrope_positions,
@@ -419,6 +427,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             batch_size=bs,
             input_ids=input_ids,
             req_pool_indices=req_pool_indices,
+            mamba_track_indices=track_indices(buffers.mamba_track_indices, bs),
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens_cpu,
             next_token_logits_buffer=next_token_logits_buffer,
@@ -438,6 +447,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             spec_info=spec_info,
             capture_hidden_mode=CaptureHiddenMode.LAST,
         )
+        self.model_runner.kv_index_translator.bind_runner_slots(forward_batch)
 
         if self.buffers.dsa_seed_topk_capture is not None:
             spec_info.dsa_seed_topk_capture = self.buffers.dsa_seed_topk_capture[
@@ -550,7 +560,11 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             forward_batch.req_pool_indices,
         ]
         if self.model_runner.model_config.model_is_mrope:
-            buffers.mrope_positions.zero_()
+            if (
+                bs * self.captured_req_width != num_tokens
+                or forward_batch.mrope_positions is None
+            ):
+                buffers.mrope_positions.zero_()
             if forward_batch.mrope_positions is not None:
                 copy_dsts.append(buffers.mrope_positions[:, :num_tokens])
                 copy_srcs.append(forward_batch.mrope_positions)
@@ -566,6 +580,14 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             copy_srcs.append(forward_batch.spec_info.num_accept_tokens)
         copy_dsts.append(buffers.select_index[:raw_bs])
         copy_srcs.append(select_index)
+        refresh_track_indices(
+            buffers.mamba_track_indices,
+            forward_batch.mamba_track_indices,
+            raw_bs=raw_bs,
+            bs=bs,
+            copy_dsts=copy_dsts,
+            copy_srcs=copy_srcs,
+        )
         _grouped_foreach_copy_(copy_dsts, copy_srcs)
 
         # hidden_states is large + contiguous: copy_() uses the cudaMemcpyAsync
@@ -626,23 +648,35 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             ),
             encoder_lens=None,
             out_cache_loc=buffers.out_cache_loc[:num_tokens],
+            out_cache_loc_virtual=forward_batch.out_cache_loc_virtual,
+            kv_loc_plan=forward_batch.kv_loc_plan,
+            kv_loc_cols=forward_batch.kv_loc_cols,
             out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
+            # Virtual input stays separate from the backend's physical buffer.
+            mamba_track_indices=track_indices(buffers.mamba_track_indices, bs),
             spec_info=forward_batch.spec_info,
         )
         self.draft_extend_attn_backend.init_forward_metadata_out_graph(fb_view)
 
-        # Snapshot built -- the forward is done reading the shared pool. Publish
-        # a read-done event the scheduler's WAR barrier waits on (draft extend
-        # is the EAGLE-family last shared-read phase; last write wins the mailbox).
-        read_done = self.device_module.Event()
-        read_done.record()
-        self.model_runner.shared_read_done_event = read_done
+        # Draft extend is the last shared reader. UNKNOWN must discard any
+        # earlier phase's event so the scheduler uses its whole-forward fence.
+        self.model_runner.shared_read_done_event = None
+        shared_read_ends = self.draft_extend_attn_backend.shared_read_ends(
+            self.forward_mode
+        )
+        if shared_read_ends is SharedReadEnds.PRE_REPLAY:
+            self._publish_read_done(in_graph=False)
 
         self.raw_bs = raw_bs
         self.bs = bs
         shape_key = self._make_graph_key(bs)
         with device_timer_ctx(self.model_runner.device_timer, "eagle_draft_extend"):
             out = self._replay_graph(shape_key, forward_batch)
+
+        # This runner has no in-graph read-done marker. A later event is safe;
+        # an event before replay cannot cover metadata reads inside the graph.
+        if shared_read_ends in (SharedReadEnds.IN_REPLAY, SharedReadEnds.POST_REPLAY):
+            self._publish_read_done(in_graph=False)
 
         out = LogitsProcessorOutput(
             next_token_logits=out.next_token_logits[:raw_bs],

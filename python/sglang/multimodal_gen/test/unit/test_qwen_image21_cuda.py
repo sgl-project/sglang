@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Request-scoped prefix KV and graph replay regression tests; no checkpoint needed."""
 
+import json
 from copy import deepcopy
 
 import pytest
@@ -38,6 +39,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.qwen_image21 import (
     QwenImage21DenoisingStage,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import (
     ServerArgs,
     set_global_server_args,
@@ -46,7 +48,10 @@ from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import
     ensure_distributed_env_defaults,
 )
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+pytestmark = pytest.mark.skipif(
+    not (torch.cuda.is_available() and current_platform.is_cuda()),
+    reason="requires NVIDIA CUDA fusions",
+)
 
 
 @pytest.fixture(scope="module")
@@ -192,11 +197,47 @@ def test_bf16_qk_norm_matches_reference(model):
         torch.testing.assert_close(norm(x), reference(x), atol=0, rtol=0)
 
 
+def _save_lora_and_add_delta(reference, path, adapter_format):
+    """Save a rank-2 LoRA in a published checkpoint layout and add its delta to reference."""
+    scale, metadata = 1.0, None
+    if adapter_format == "diffusers_metadata_alpha":
+        # diffusers keeps alpha only in this JSON blob; alpha 4 over rank 2 doubles B @ A.
+        scale = 2.0
+        packed = {"transformer.r": 2, "transformer.lora_alpha": 4}
+        metadata = {"lora_adapter_metadata": json.dumps(packed)}
+    fused = adapter_format == "comfyui_fused_gate_up"
+    prefix = "diffusion_model." if fused else "transformer."
+    weights = {}
+    for name in ("transformer_blocks.0.attn.to_q", "transformer_blocks.0.img_mlp.out"):
+        layer = reference.get_submodule(name)
+        a = torch.randn(2, layer.weight.shape[1], device="cuda") * 0.2
+        b = torch.randn(layer.weight.shape[0], 2, device="cuda") * 0.2
+        weights[f"{prefix}{name}.lora_A.weight"] = a.cpu()
+        weights[f"{prefix}{name}.lora_B.weight"] = b.cpu()
+        layer.weight.add_(scale * (b @ a))
+    if fused:
+        # ComfyUI's native checkpoint fuses the SwiGLU inputs row-wise as [gate; up].
+        mlp = reference.transformer_blocks[1].img_mlp
+        a = torch.randn(2, mlp.gate_layer.weight.shape[1], device="cuda") * 0.2
+        b = torch.randn(2 * mlp.gate_layer.weight.shape[0], 2, device="cuda") * 0.2
+        weights[f"{prefix}transformer_blocks.1.img_mlp.gate_up.lora_A.weight"] = a.cpu()
+        weights[f"{prefix}transformer_blocks.1.img_mlp.gate_up.lora_B.weight"] = b.cpu()
+        gate, up = b.chunk(2, dim=0)
+        mlp.gate_layer.weight.add_(gate @ a)
+        mlp.proj.weight.add_(up @ a)
+    save_file(weights, str(path), metadata=metadata)
+
+
+@pytest.mark.parametrize(
+    "adapter_format",
+    ["diffusers", "diffusers_metadata_alpha", "comfyui_fused_gate_up"],
+)
 @pytest.mark.parametrize("merge_mode", ["dynamic", "merge"])
 @torch.no_grad()
-def test_diffusers_lora_matches_weight_delta_and_restores_base(
-    model, tmp_path, monkeypatch, merge_mode
+def test_published_lora_layouts_match_weight_delta_and_restore_base(
+    model, tmp_path, monkeypatch, merge_mode, adapter_format
 ):
+    """Fused gate_up rows and metadata-only alpha must reach the layers, not be dropped."""
     # Reuse loaded native components, then exercise the real adapter loader.
     monkeypatch.setattr(ComposedPipelineBase, "__init__", lambda self: None)
     pipeline = object.__new__(QwenImage21Pipeline)
@@ -214,16 +255,8 @@ def test_diffusers_lora_matches_weight_delta_and_restores_base(
         loaded.load_state_dict(model.state_dict())
     pipeline.modules = {"transformer": actual_model}
     pipeline.__init__()
-    weights = {}
-    for name in ("transformer_blocks.0.attn.to_q", "transformer_blocks.0.img_mlp.out"):
-        layer = reference.get_submodule(name)
-        a = torch.randn(2, layer.weight.shape[1], device="cuda") * 0.2
-        b = torch.randn(layer.weight.shape[0], 2, device="cuda") * 0.2
-        weights[f"transformer.{name}.lora_A.weight"] = a.cpu()
-        weights[f"transformer.{name}.lora_B.weight"] = b.cpu()
-        layer.weight.add_(b @ a)
     adapter = tmp_path / "adapter.safetensors"
-    save_file(weights, str(adapter))
+    _save_lora_and_add_delta(reference, adapter, adapter_format)
     kwargs = dict(inputs(5, False), prefix_caches=None)
     with set_forward_context(None, None):
         baseline = actual_model(**kwargs)

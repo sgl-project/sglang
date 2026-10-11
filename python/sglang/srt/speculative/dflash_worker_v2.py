@@ -19,12 +19,15 @@ from sglang.kernels.ops.speculative.dspark.dspark_accept import (
 )
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
+from sglang.srt.layers.dp_attention import get_dp_tp_group
 from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.mem_cache.kv_loc_plan import KVLocPlan
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -401,11 +404,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._full_embed_gpu: Optional[torch.Tensor] = None
         # Under dp attention, peer DP ranks run different (idle) paths, so
         # spec broadcasts must stay within the attn-TP group.
-        self._tp_sync = SpecTpSync(
-            get_parallel().attn_tp_group
-            if get_parallel().attn_dp_enabled
-            else get_parallel().tp_group
-        )
+        self._tp_sync = SpecTpSync(get_dp_tp_group())
 
         # Under dp attention, the draft worker runs on the per-DP attn-TP
         # group, independent of idle peer DP ranks; it is built and run under
@@ -467,6 +466,22 @@ class DFlashWorkerV2(BaseSpecWorker):
                 lm_head=lm_head,
                 prefix_gru=prefix_gru,
                 embed_proj=embed_proj,
+            )
+        self._block_verification = get_spec().speculative_use_block_verification
+        if (
+            self._block_verification
+            and (
+                self._is_domino
+                or (self.selector is None and not self._lilicorr_sampling_enabled)
+            )
+            and get_parallel().tp_rank == 0
+        ):
+            # A greedy draft is a point mass, where token-wise verification
+            # already accepts every prefix with its target probability.
+            logger.warning(
+                "--speculative-use-block-verification has no effect for this DFLASH "
+                "draft: it proposes greedy tokens, and block verification only "
+                "differs from token-wise verification for sampled proposals."
             )
         if get_spec().speculative_num_draft_tokens is None:
             # Should not happen (ServerArgs should have inferred it), but keep a fallback.
@@ -637,7 +652,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             if (
                 capture_decode_cuda_graph
                 and current_platform.is_out_of_tree()
-                and not current_platform.support_cuda_graph()
+                and not current_platform.capabilities.graph_capture
             ):
                 capture_decode_cuda_graph = False
                 logger.warning(
@@ -1159,7 +1174,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         *,
         batch_seq_lens_cpu: Optional[torch.Tensor],
         nxt_kv_lens_cpu: Optional[torch.Tensor],
-        draft_prefix_lens: torch.Tensor,
         out: torch.Tensor,
     ) -> None:
         """Fill the seq_lens_cpu planning bound, sync-free when a host-side
@@ -1170,8 +1184,11 @@ class DFlashWorkerV2(BaseSpecWorker):
         elif nxt_kv_lens_cpu is not None:
             self._compute_compact_draft_seq_lens_host(nxt_kv_lens_cpu, out=out)
         else:
-            # Last resort: the legacy blocking D2H copy.
-            out.copy_(draft_prefix_lens)
+            # Compact device lengths never exceed the window plus one page.
+            out.fill_(
+                int(self.draft_window_size)
+                + (self.page_size if self.page_size > 1 else 0)
+            )
 
     def _rebuild_compact_draft_cache(
         self,
@@ -1483,6 +1500,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 gamma=gamma,
                 verify_num_draft_tokens=block,
                 cutoff_verify_lens=None,
+                block_verification=self._block_verification,
             )
         finally:
             # Here, not before the next write: candidate_ids may be a view of a
@@ -1744,6 +1762,11 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         return out_tokens
 
+    def _draft_write_ids(self, plan: KVLocPlan) -> torch.Tensor:
+        """The plan's write ids as the draft pool indexes them: the target's
+        physical ids for a fused draft, the virtual ids for a private one."""
+        return plan.write_ids(self.draft_model_runner.kv_index_translator)
+
     def _append_target_hidden_to_draft_kv_by_loc(
         self,
         *,
@@ -1759,6 +1782,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         For the spec-v2 overlap path, callers can pass dense `[bs, block_size]`
         `cache_loc_2d` plus `commit_lens`; the prefix-valid writer then commits
         only the live prefix rows without constructing masked/packed index tensors.
+        `cache_loc_2d` holds the same ids as `cache_loc`, row-major.
         """
         if target_hidden is None:
             raise RuntimeError("DFLASH missing target hidden context features.")
@@ -1844,6 +1868,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             if commit_lens.dtype != torch.int32:
                 commit_lens = commit_lens.to(torch.int32)
 
+        # `cache_loc` arrives in the draft pool's id space (`_draft_write_ids`);
+        # the callers' window buffers stay virtual for the compact
+        # req_to_token rebuild.
         with (
             torch.inference_mode(),
             draft_tp_context(self.draft_owns_attention),
@@ -1952,7 +1979,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             v = v.view(-1, attn.num_kv_heads, attn.head_dim)
             self.draft_model_runner.token_to_kv_pool.set_kv_buffer(
                 attn.attn,
-                ctx_cache_loc,
+                KVWriteLoc(ctx_cache_loc, physical=True),
                 k,
                 v,
                 attn.attn.k_scale,
@@ -1991,7 +2018,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             else:
                 token_to_kv_pool.set_kv_buffer(
                     attn,
-                    ctx_cache_loc,
+                    KVWriteLoc(ctx_cache_loc, physical=True),
                     cache_k,
                     cache_v,
                     attn.k_scale,
@@ -2253,7 +2280,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                 batch,
                 pp_proxy_tensors=pp_proxy_tensors,
                 capture_hidden_mode=CaptureHiddenMode.FULL,
+                return_kv_loc_plan=True,
             )
+            kv_loc_plan, batch_output.kv_loc_plan = batch_output.kv_loc_plan, None
 
             logits_output, next_token_ids = (
                 batch_output.logits_output,
@@ -2304,9 +2333,10 @@ class DFlashWorkerV2(BaseSpecWorker):
                 ctx_lens,
                 int(sum(batch.extend_lens)),
             )
+            # The draft KV goes to the slots the target prefill just wrote.
             self._append_target_hidden_to_draft_kv_by_loc(
                 target_hidden=logits_output.hidden_states,
-                cache_loc=batch.out_cache_loc,
+                cache_loc=self._draft_write_ids(kv_loc_plan),
                 positions=positions,
                 extend_lens=ctx_lens,
             )
@@ -2482,6 +2512,19 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         positions = positions_2d.reshape(-1)
         verify_out_cache_loc = verify_out_cache_loc_2d.reshape(-1)
+        # The iteration's window -- the draft block, the verify and the
+        # target-hidden KV writes all write it -- planned once.
+        kv_loc_plan = self.target_worker.model_runner.kv_index_translator.plan(
+            req_pool_indices=batch.req_pool_indices,
+            seq_lens=prefix_lens,
+            seq_lens_cpu=(
+                batch.seq_lens_cpu
+                if batch.seq_lens_cpu is not None
+                else draft_input.nxt_kv_lens_cpu
+            ),
+            write_virtual=verify_out_cache_loc,
+            read_extent=block_size,
+        )
 
         seq_lens_cpu = self._draft_seq_lens_cpu_buf[:bs]
         if self.use_compact_draft_cache:
@@ -2490,7 +2533,6 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._fill_compact_seq_lens_cpu_bound(
                 batch_seq_lens_cpu=batch.seq_lens_cpu,
                 nxt_kv_lens_cpu=draft_input.nxt_kv_lens_cpu,
-                draft_prefix_lens=draft_prefix_lens,
                 out=seq_lens_cpu,
             )
             self._rebuild_compact_draft_cache(
@@ -2518,8 +2560,10 @@ class DFlashWorkerV2(BaseSpecWorker):
                 seq_lens_cpu.copy_(draft_input.nxt_kv_lens_cpu)
                 draft_seq_lens_sum = int(draft_input.nxt_kv_lens_sum)
             else:
-                seq_lens_cpu.copy_(prefix_lens.to("cpu", dtype=torch.int32))
-                draft_seq_lens_sum = int(prefix_lens.sum().item())
+                # Allocated lengths include the in-flight verify reservation.
+                for i, req in enumerate(batch.reqs):
+                    seq_lens_cpu[i] = req.kv.kv_allocated_len
+                draft_seq_lens_sum = int(seq_lens_cpu.sum())
 
         forward_batch = ForwardBatch(
             forward_mode=ForwardMode.TARGET_VERIFY,
@@ -2542,6 +2586,20 @@ class DFlashWorkerV2(BaseSpecWorker):
             ),
             global_num_token_non_padded_cpu=bs * block_size,
         )
+        # The draft block writes the whole window. A compact draft reads its
+        # own `req_to_token` rows over its own lengths.
+        draft_translator = self.draft_model_runner.kv_index_translator
+        draft_plan = (
+            kv_loc_plan.reads_from(
+                draft_translator,
+                seq_lens=draft_seq_lens,
+                seq_lens_cpu=seq_lens_cpu,
+                read_extent=block_size,
+            )
+            if self.use_compact_draft_cache
+            else kv_loc_plan
+        )
+        draft_plan.bind(forward_batch, draft_translator)
 
         if self.selector is not None or self.lilicorr is not None:
             self._selector_sample = None
@@ -2696,6 +2754,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_token_num=int(self.block_size),
             custom_mask=custom_mask,
             capture_hidden_mode=CaptureHiddenMode.FULL,
+            kv_loc_plan=kv_loc_plan,
         )
 
         batch.out_cache_loc = verify_out_cache_loc
@@ -2860,10 +2919,11 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         # Consume in this step: every decode graph size shares one aux output,
         # which the next target forward overwrites (resolve_aux_hidden_states_width).
+        cache_loc = self._draft_write_ids(kv_loc_plan)
         self._append_target_hidden_to_draft_kv_by_loc(
             target_hidden=hidden.reshape(-1, hidden.shape[-1]),
-            cache_loc=verify_out_cache_loc,
-            cache_loc_2d=verify_out_cache_loc_2d,
+            cache_loc=cache_loc,
+            cache_loc_2d=cache_loc.view(verify_out_cache_loc_2d.shape),
             positions=positions,
             commit_lens=commit_lens,
         )

@@ -50,6 +50,7 @@ from sglang.srt.mem_cache.utils import (
     get_eviction_strategy,
     split_node_hash_value,
 )
+from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -286,8 +287,11 @@ class RadixCache(BasePrefixCache):
         self.is_eagle = params.is_eagle
         self.eviction_policy = params.eviction_policy.lower()
 
+        # A disabled tree holds nothing, so it reports no KV events and never
+        # evicts; its eviction policy config is not built or validated.
         self.kv_events = KVCacheEventRecorder(
-            enabled=params.enable_kv_cache_events, page_size=self.page_size
+            enabled=params.enable_kv_cache_events and not self.disable,
+            page_size=self.page_size,
         )
 
         if params.enable_metrics:
@@ -303,7 +307,8 @@ class RadixCache(BasePrefixCache):
             self.device = torch.device("cpu")
 
         self.eviction_strategy = get_eviction_strategy(
-            self.eviction_policy, params.eviction_policy_config
+            "lru" if self.disable else self.eviction_policy,
+            None if self.disable else params.eviction_policy_config,
         )
 
         self.evictable_leaves = set()
@@ -339,12 +344,11 @@ class RadixCache(BasePrefixCache):
         self.evictable_size_ = 0
         self.protected_size_ = 0
         self.evictable_leaves.clear()
+        self._empty_device_indices = torch.empty(
+            (0,), dtype=torch.int64, device=self.device
+        )
         self._empty_match_result = MatchResult(
-            device_indices=torch.empty(
-                (0,),
-                dtype=torch.int64,
-                device=self.device,
-            ),
+            device_prefix_len=0,
             last_device_node=self.root_node,
             last_host_node=self.root_node,
             best_match_node=self.root_node,
@@ -373,9 +377,8 @@ class RadixCache(BasePrefixCache):
                 empty result with the root as the last node.
 
         Returns:
-            MatchResult: ``device_indices`` is a 1-D ``torch.int64`` tensor of
-            the concatenated KV cache indices corresponding to the longest
-            cached prefix (may be length 0).
+            MatchResult: ``device_prefix_len`` is the length of the longest
+            cached prefix (may be 0).
             ``last_device_node`` and ``last_host_node`` (currently the same) are the tree node objects
             representing the terminal node of the matched prefix. This method
             may mutate internal structure by splitting an existing node if the
@@ -400,16 +403,21 @@ class RadixCache(BasePrefixCache):
             return self._empty_match_result
 
         value, last_node = self._match_prefix_helper(self.root_node, key)
-        if value:
-            value = torch.cat(value)
-        else:
-            value = self._empty_match_result.device_indices
         return MatchResult(
-            device_indices=value,
+            device_prefix_len=sum(len(v) for v in value),
             last_device_node=last_node,
             last_host_node=last_node,
             best_match_node=last_node,
         )
+
+    def touch_prefix(self, key: RadixKey) -> None:
+        key, _ = key.maybe_to_bigram_view(self.is_eagle)
+        if self.disable or len(key) == 0:
+            return
+        key = key.page_aligned(self.page_size)
+        if len(key) == 0:
+            return
+        self._match_prefix_helper(self.root_node, key)
 
     def insert(self, params: InsertParams) -> InsertResult:
         if self.disable:
@@ -418,7 +426,7 @@ class RadixCache(BasePrefixCache):
         key = params.key
         value = params.value
         priority = params.priority
-        chunked = params.chunked
+        inserted_len = params.inserted_len
 
         key, value = key.maybe_to_bigram_view(self.is_eagle, value)
         key = key.page_aligned(self.page_size)
@@ -429,7 +437,7 @@ class RadixCache(BasePrefixCache):
             value = torch.tensor(key.token_ids[: len(key)], dtype=torch.int64)
 
         prefix_len, last_node = self._insert_helper(
-            self.root_node, key, value, priority, chunked
+            self.root_node, key, value, priority, inserted_len
         )
         return InsertResult(prefix_len=prefix_len, last_device_node=last_node)
 
@@ -438,7 +446,6 @@ class RadixCache(BasePrefixCache):
         req: Req,
         token_ids,
         *,
-        chunked: bool = False,
         key_limit: Optional[int] = None,
         split_prompt: bool = False,
     ) -> Tuple[RadixKey, torch.Tensor, int]:
@@ -462,9 +469,13 @@ class RadixCache(BasePrefixCache):
         priority = req.priority or 0
         result = self.insert(
             InsertParams(
-                key=radix_key, value=values, chunked=chunked, priority=priority
+                key=radix_key,
+                value=values,
+                inserted_len=req.kv.cache_inserted_len,
+                priority=priority,
             )
         )
+        req.kv.cache_inserted_len = max(req.kv.cache_inserted_len, key_len)
         if split_prompt:
             # Split the leaf at the prompt boundary so eviction can drop the
             # output KV without the prompt; a prefix re-insert only changes topology.
@@ -479,10 +490,8 @@ class RadixCache(BasePrefixCache):
                     InsertParams(
                         key=prompt_key,
                         value=values[: len(prompt_key)],
+                        inserted_len=len(prompt_key),
                         priority=priority + 1,
-                        # The request created these nodes moments ago; another
-                        # hit_count bump would promote every prompt node.
-                        chunked=True,
                     )
                 )
 
@@ -492,28 +501,23 @@ class RadixCache(BasePrefixCache):
         )
         return radix_key, kv_indices, result.prefix_len
 
-    def insert_req(self, req: Req, *, up_to: int):
+    def checkpoint(self, req: Req, *, up_to: int):
         if self.disable:
             return
-        token_ids = (req.origin_input_ids + req.output_ids)[:up_to]
-        radix_key, _, _ = self._insert_cache(req, token_ids, split_prompt=True)
-        req.kv.cache_protected_len = len(radix_key)
-
-    def cache_unfinished_req(self, req: Req, chunked=False):
-        """Cache request when it is unfinished."""
-        if self.disable:
-            return
-
-        radix_key, kv_indices, _ = self._insert_cache(
-            req, req.get_fill_ids(), chunked=chunked
+        token_ids = req.full_untruncated_fill_ids[:up_to]
+        # Pure-SWA trees never cache what the window already evicted.
+        swa_evict_floor = req.kv.swa_evict_floor
+        key_limit = (
+            ceil_align(swa_evict_floor, self.page_size) if swa_evict_floor > 0 else None
+        )
+        radix_key, _, _ = self._insert_cache(
+            req, token_ids, key_limit=key_limit, split_prompt=True
         )
 
         # The prefix indices could be updated, reuse it
         match_result = self.match_prefix(MatchPrefixParams(key=radix_key))
-        new_indices, new_last_node = (
-            match_result.device_indices,
-            match_result.last_device_node,
-        )
+        new_last_node = match_result.last_device_node
+        new_indices = self.path_device_indices(new_last_node)
         assert len(new_indices) == len(radix_key), (
             f"{len(new_indices)=}, {len(radix_key)=}"
         )
@@ -523,24 +527,13 @@ class RadixCache(BasePrefixCache):
             new_indices[req.kv.cache_protected_len :],
         )
 
-        # With page_size > 1 the partial page sits in req.prefix_indices but not
+        # With page_size > 1 the partial page stays in the request's row but not
         # in the tree; cache_protected_len marks the tree-owned part so the next
-        # cache_unfinished_req or release_kv_cache frees the rest.
+        # checkpoint or release_kv_cache frees the rest.
         req.kv.cache_protected_len = len(new_indices)
 
-        self.dec_lock_ref(req.last_node)
-        self.inc_lock_ref(new_last_node)
-
-        # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
-        # - page_size != 1: there is a partial page at the end, keep the full kv_indices
-        # - eagle case: bigram keys will only cache len - 1 kv indices
-        if len(new_indices) < len(kv_indices):
-            req.prefix_indices = torch.cat(
-                [new_indices, kv_indices[len(new_indices) :]]
-            )
-        else:
-            req.prefix_indices = new_indices
-
+        self.unlock(req.lock)
+        req.lock = self.lock(new_last_node)
         req.last_node = new_last_node
 
     def pretty_print(self):
@@ -616,6 +609,9 @@ class RadixCache(BasePrefixCache):
             node = node.parent
         return DecLockRefResult(delta=delta)
 
+    def supports_prefix_sharing(self) -> bool:
+        return not self.disable
+
     def evictable_size(self):
         return self.evictable_size_
 
@@ -635,6 +631,16 @@ class RadixCache(BasePrefixCache):
         return torch.cat(values)
 
     ##### Internal Helper Functions #####
+
+    def path_device_indices(self, node: TreeNode) -> torch.Tensor:
+        values = []
+        while node is not self.root_node:
+            values.append(node.value)
+            node = node.parent
+        if not values:
+            return self._empty_device_indices
+        values.reverse()
+        return torch.cat(values)
 
     def _match_prefix_helper(self, node: TreeNode, key: RadixKey):
         access_time = time.monotonic()
@@ -687,12 +693,7 @@ class RadixCache(BasePrefixCache):
 
         return new_node
 
-    def _inc_hit_count(self, node: TreeNode, chunked: bool = False):
-        # Skip the hit count update for chunked requests to avoid self-referencing
-        # inflation where a chunked request increments hit_count on nodes it created
-        # in previous chunks.
-        if chunked:
-            return
+    def _inc_hit_count(self, node: TreeNode):
         node.hit_count += 1
 
     def _insert_helper(
@@ -701,7 +702,7 @@ class RadixCache(BasePrefixCache):
         key: RadixKey,
         value,
         priority: int = 0,
-        chunked: bool = False,
+        inserted_len: int = 0,
     ):
         # Convert None priority to 0
         if priority is None:
@@ -727,11 +728,12 @@ class RadixCache(BasePrefixCache):
             if prefix_len < len(node.key):
                 new_node = self._split_node(node.key, node, prefix_len)
                 new_node.priority = max(new_node.priority, priority)
-                self._inc_hit_count(new_node, chunked)
                 node = new_node
             else:
                 node.priority = max(node.priority, priority)
-                self._inc_hit_count(node, chunked)
+            # Nodes this request already inserted were counted back then.
+            if total_prefix_length > inserted_len:
+                self._inc_hit_count(node)
             if len(key):
                 child_key = key.child_key(self.page_size)
 
@@ -740,7 +742,8 @@ class RadixCache(BasePrefixCache):
             new_node.parent = node
             new_node.key = key
             new_node.value = value.clone()
-            self._inc_hit_count(new_node, chunked)
+            if total_prefix_length + len(key) > inserted_len:
+                self._inc_hit_count(new_node)
             node.children[child_key] = new_node
             self.evictable_size_ += len(key)
             self._update_leaf_status(node)

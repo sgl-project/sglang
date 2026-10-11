@@ -1888,6 +1888,34 @@ def hc_expand(x: torch.Tensor, n: int) -> torch.Tensor:
     return x.repeat(1, n)
 
 
+@triton.jit
+def _hc_broadcast_kernel(
+    x_ptr, y_ptr, H, x_stride_m, HC: tl.constexpr, BLOCK_H: tl.constexpr
+):
+    row = tl.program_id(0).to(tl.int64)
+    offs = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
+    mask = offs < H
+    x = tl.load(x_ptr + row * x_stride_m + offs, mask=mask)
+    y_row = y_ptr + row * (HC * H)
+    for k in tl.static_range(HC):
+        tl.store(y_row + k * H + offs, x, mask=mask)
+
+
+def hc_broadcast(x: torch.Tensor, hc_mult: int) -> torch.Tensor:
+    """[T, H] -> [T, hc_mult, H], every copy equal to x: the initial mHC residual."""
+    if not x.is_cuda or x.stride(-1) != 1:
+        return x.unsqueeze(1).repeat(1, hc_mult, 1)
+    num_tokens, hidden = x.shape
+    y = x.new_empty(num_tokens, hc_mult, hidden)
+    if num_tokens == 0:
+        return y
+    block_h = 1024
+    _hc_broadcast_kernel[(num_tokens, triton.cdiv(hidden, block_h))](
+        x, y, hidden, x.stride(0), HC=hc_mult, BLOCK_H=block_h, num_warps=4
+    )
+    return y
+
+
 def hc_contract(x: torch.Tensor, n: int) -> torch.Tensor:
     return x.unflatten(-1, (n, -1)).mean(dim=-2)
 
@@ -2611,7 +2639,10 @@ def hc_mix_stats_sinkhorn_bf16x3(
     m, k = x.shape
     mix = (2 + hc_mult) * hc_mult
     slices = _HC_MIX_COMPENSATED_SLICES
-    assert x.is_contiguous() and x.dtype == torch.bfloat16 and 4096 <= m <= 65536
+    hopper_medium = get_platform().is_sm90 and 32 <= m < 4096
+    block_m = 64 if hopper_medium else _HC_MIX_BF16X3_BLOCK_M
+    assert x.is_contiguous() and x.dtype == torch.bfloat16
+    assert hopper_medium or 4096 <= m <= 65536
     assert k % (slices * _HC_MIX_BLOCK_K) == 0
     assert len(weight_parts) == 3
     assert all(
@@ -2623,7 +2654,7 @@ def hc_mix_stats_sinkhorn_bf16x3(
     pre = torch.empty((m, hc_mult), device=x.device, dtype=torch.float32)
     post = torch.empty_like(pre)
     comb = torch.empty((m, hc_mult, hc_mult), device=x.device, dtype=torch.float32)
-    _hc_mix_stats_bf16x3_kernel[(triton.cdiv(m, _HC_MIX_BF16X3_BLOCK_M), slices)](
+    _hc_mix_stats_bf16x3_kernel[(triton.cdiv(m, block_m), slices)](
         x,
         *weight_parts,
         part_mix,
@@ -2634,7 +2665,7 @@ def hc_mix_stats_sinkhorn_bf16x3(
         MIX_COLS=mix,
         MIX_PAD=triton.next_power_of_2(mix),
         BLOCK_K=_HC_MIX_BLOCK_K,
-        BLOCK_M=_HC_MIX_BF16X3_BLOCK_M,
+        BLOCK_M=block_m,
         num_warps=4,
         num_stages=3,
     )

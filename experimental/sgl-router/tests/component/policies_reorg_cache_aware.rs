@@ -7,15 +7,15 @@ use std::time::{Duration, Instant};
 
 use sgl_kv_indexer::{PrefixIndex, PrefixIndexError, PrefixMatch, PrefixOutcome};
 use sgl_router::buckets_reorg::{Bucket, BucketGroups, BucketResolver, EngineGroup};
-use sgl_router::config::AffinityConfig;
+use sgl_router::config::{AffinityConfig, AffinityMode, BalancedBy};
 use sgl_router::discovery::{ModelId, WorkerId, WorkerSpec};
-use sgl_router::policies::prefix_provider::RadixTreePrefixProvider;
 use sgl_router::policies_reorg::admission::{Decision, EngineAdmission, EngineMetrics};
 use sgl_router::policies_reorg::cache_aware::{CacheAwarePolicy, CacheSource, PrefixMemo};
 use sgl_router::policies_reorg::power_of_two::PowerOfTwoPolicy;
 use sgl_router::policies_reorg::{PickError, PickRequest, Policy, Stage};
 use sgl_router::state::kv_events::{
     compute_block_hashes, compute_block_hashes_bigram, BlockSizeOracle, HashTree, KvWorkerId,
+    RadixTreePrefixProvider,
 };
 use sgl_router::state::load_monitor::engine_reported_load::{
     EngineReportedLoadTable, LoadStat, NativeCacheRankLoad,
@@ -30,7 +30,7 @@ fn engine(id: &str, active: usize) -> Arc<Worker> {
         url: format!("http://{id}"),
         mode: Stage::Plain,
         model_ids: vec![ModelId("m".into())],
-        bootstrap_port: None,
+        ..Default::default()
     }));
     engine.active_requests.store(active, Ordering::Relaxed);
     engine
@@ -38,6 +38,7 @@ fn engine(id: &str, active: usize) -> Arc<Worker> {
 
 fn config() -> AffinityConfig {
     AffinityConfig {
+        mode: AffinityMode::Prefer,
         cache_affinity_min_matched_tokens: Some(1),
         cache_switch_margin_tokens: 0,
         ..Default::default()
@@ -373,86 +374,27 @@ async fn missing_tokens_or_block_size_skip_io_and_bigram_hashes_match_workers() 
 }
 
 #[tokio::test]
-async fn queue_diversion_and_saturation_use_only_this_group() {
-    let engines = [engine("owner", 0), engine("cold", 9), engine("outside", 0)];
-    let model = ModelId("m".into());
-    for (cold_waiting, floor, expected, reason) in [
-        (0, None, "cold", "no_cache_candidate"),
-        (5, None, "owner", "saturation_pin"),
-        (3, Some(2), "owner", "saturation_pin"),
-    ] {
-        let table = EngineReportedLoadTable::new();
-        report(&table, &engines[0], 5, 100, Instant::now());
-        report(&table, &engines[1], cold_waiting, 1, Instant::now());
-        report(&table, &engines[2], 0, 0, Instant::now());
-        let policy = CacheAwarePolicy::new(
-            local(&[(&engines[0], 8)]),
-            table,
-            AffinityConfig {
-                worker_queue_limit: Some(4),
-                saturation_queue_floor: floor,
-                ..config()
-            },
-        )
-        .unwrap();
-        let pick = policy.pick(&engines[..2], &request(&model)).await.unwrap();
-        assert_eq!(pick.engine.id.0, expected);
-        assert_eq!(pick.reason, reason);
-    }
-}
-
-#[tokio::test]
-async fn hard_rejection_never_becomes_cold_fallback_or_saturation_bypass() {
+async fn balanced_affinity_requires_both_thresholds_and_fresh_load() {
     let engines = [engine("owner", 0), engine("cold", 9)];
     let model = ModelId("m".into());
-    for floor in [None, Some(2)] {
+    for (mode, a, b, stale, expected) in [
+        (AffinityMode::Prefer, 100, 1, false, "owner"),
+        (AffinityMode::Balanced, 100, 50, false, "owner"),
+        (AffinityMode::Balanced, 10, 0, false, "owner"),
+        (AffinityMode::Balanced, 100, 40, false, "cold"),
+        // The cold engine would also prefill the owner's 8 cached tokens:
+        // 100 vs 45 + 8 misses the factor, and 20 vs 5 + 8 misses the gap.
+        (AffinityMode::Balanced, 100, 45, false, "owner"),
+        (AffinityMode::Balanced, 20, 5, false, "owner"),
+        (AffinityMode::Balanced, 100, 40, true, "owner"),
+    ] {
         let table = EngineReportedLoadTable::new();
-        for engine in &engines {
-            report(&table, engine, 5, 100, Instant::now());
-        }
-        let mut policy = CacheAwarePolicy::new(
-            local(&[(&engines[0], 8)]),
-            table,
-            AffinityConfig {
-                worker_queue_limit: Some(4),
-                saturation_queue_floor: floor,
-                ..config()
-            },
-        )
-        .unwrap();
-        let admission = Reject::new("owner");
-        policy.admission = admission.clone();
-        assert!(matches!(
-            policy.pick(&engines, &request(&model)).await,
-            Err(PickError::NoAdmissibleEngine(_))
-        ));
-        assert_eq!(
-            *admission.calls.lock().unwrap(),
-            vec![("owner".into(), Some(5))]
-        );
-    }
-    let mut policy =
-        CacheAwarePolicy::new(local(&[]), EngineReportedLoadTable::new(), config()).unwrap();
-    policy.admission = Reject::new("owner");
-    assert!(matches!(
-        policy.pick(&engines, &request(&model)).await,
-        Err(PickError::AdmissionRejected(_))
-    ));
-}
-
-#[tokio::test]
-async fn guard_switches_near_ties_only_with_complete_fresh_telemetry() {
-    let engines = [engine("deep", 0), engine("shallow", 9)];
-    let model = ModelId("m".into());
-    for (margin, stale, expected) in [(0, false, "deep"), (1, false, "shallow"), (1, true, "deep")]
-    {
-        let table = EngineReportedLoadTable::new();
-        report(&table, &engines[0], 5, 100, Instant::now());
+        report(&table, &engines[0], 5, a, Instant::now());
         report(
             &table,
             &engines[1],
             1,
-            1,
+            b,
             Instant::now()
                 - if stale {
                     Duration::from_secs(3600)
@@ -461,15 +403,160 @@ async fn guard_switches_near_ties_only_with_complete_fresh_telemetry() {
                 },
         );
         let policy = CacheAwarePolicy::new(
-            local(&[(&engines[0], 8), (&engines[1], 7)]),
+            local(&[(&engines[0], 8)]),
             table,
             AffinityConfig {
-                cache_switch_margin_tokens: margin,
-                pressure_abs_threshold_tokens: 10,
+                mode,
+                load_factor: 2.0,
+                load_gap: Some(10),
                 ..config()
             },
         )
         .unwrap();
+        assert_eq!(
+            policy
+                .pick(&engines, &request(&model))
+                .await
+                .unwrap()
+                .engine
+                .id
+                .0,
+            expected
+        );
+    }
+}
+
+#[tokio::test]
+async fn balanced_charges_capped_out_prefix_holders_only_their_uncached_tokens() {
+    // The candidate cap keeps only the owner, but the alternative holds 7 of 8
+    // tokens: 20 vs 5 + 1 switches, where charging the whole prompt would not.
+    let engines = [engine("owner", 0), engine("warm", 9)];
+    let model = ModelId("m".into());
+    let table = EngineReportedLoadTable::new();
+    report(&table, &engines[0], 0, 20, Instant::now());
+    report(&table, &engines[1], 0, 5, Instant::now());
+    let policy = CacheAwarePolicy::new(
+        local(&[(&engines[0], 8), (&engines[1], 7)]),
+        table,
+        AffinityConfig {
+            mode: AffinityMode::Balanced,
+            load_gap: Some(10),
+            cache_candidate_min_workers: 1,
+            ..config()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        policy
+            .pick(&engines, &request(&model))
+            .await
+            .unwrap()
+            .engine
+            .id
+            .0,
+        "warm"
+    );
+}
+
+#[tokio::test]
+async fn balanced_credits_the_prefix_once_per_batch() {
+    // A 16-token batch whose longest prompt the owner fully caches: 30 + 8 vs
+    // 0 + 16 switches, where crediting the whole batch (30 vs 16) would not.
+    let engines = [engine("owner", 0), engine("cold", 9)];
+    let model = ModelId("m".into());
+    let table = EngineReportedLoadTable::new();
+    report(&table, &engines[0], 0, 30, Instant::now());
+    report(&table, &engines[1], 0, 0, Instant::now());
+    let policy = CacheAwarePolicy::new(
+        local(&[(&engines[0], 8)]),
+        table,
+        AffinityConfig {
+            mode: AffinityMode::Balanced,
+            load_gap: Some(10),
+            ..config()
+        },
+    )
+    .unwrap();
+    let request = PickRequest {
+        total_input_tokens: 16,
+        ..request(&model)
+    };
+    assert_eq!(
+        policy.pick(&engines, &request).await.unwrap().engine.id.0,
+        "cold"
+    );
+}
+
+#[tokio::test]
+async fn balanced_by_running_requests_uses_basic_load_and_default_gap() {
+    let engines = [engine("owner", 0), engine("cold", 9)];
+    let model = ModelId("m".into());
+    // Default gap is 4 requests; no native load is reported, and the owner's
+    // cached prefix does not count.
+    for (owner, cold, expected) in [
+        (10, Some(2), "cold"),
+        (10, Some(6), "owner"),
+        (4, Some(0), "owner"),
+        (10, None, "owner"),
+    ] {
+        let table = EngineReportedLoadTable::new();
+        for (engine, running) in [(&engines[0], Some(owner)), (&engines[1], cold)] {
+            let Some(running) = running else { continue };
+            table.set(
+                &engine.url,
+                0,
+                LoadStat {
+                    num_running_reqs: running,
+                    num_waiting_reqs: 0,
+                    num_tokens: 10,
+                    max_total_num_tokens: 100,
+                    native_cache: None,
+                },
+                Instant::now(),
+            );
+        }
+        let policy = CacheAwarePolicy::new(
+            local(&[(&engines[0], 8)]),
+            table,
+            AffinityConfig {
+                mode: AffinityMode::Balanced,
+                balanced_by: BalancedBy::RunningRequests,
+                ..config()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            policy
+                .pick(&engines, &request(&model))
+                .await
+                .unwrap()
+                .engine
+                .id
+                .0,
+            expected
+        );
+    }
+}
+
+#[tokio::test]
+async fn rejected_owner_falls_back_but_rejected_alternative_preserves_affinity() {
+    let engines = [engine("owner", 0), engine("cold", 9)];
+    let model = ModelId("m".into());
+    for (reject, expected) in [("owner", "cold"), ("cold", "owner")] {
+        let table = EngineReportedLoadTable::new();
+        report(&table, &engines[0], 5, 100, Instant::now());
+        report(&table, &engines[1], 0, 0, Instant::now());
+        let mut policy = CacheAwarePolicy::new(
+            local(&[(&engines[0], 8)]),
+            table,
+            AffinityConfig {
+                mode: AffinityMode::Balanced,
+                load_gap: Some(10),
+                ..config()
+            },
+        )
+        .unwrap();
+        policy.admission = Reject::new(reject);
         assert_eq!(
             policy
                 .pick(&engines, &request(&model))
@@ -499,11 +586,17 @@ async fn candidate_cap_is_applied_before_admission() {
     .unwrap();
     let admission = Reject::new("deep");
     policy.admission = admission.clone();
-    assert!(matches!(
-        policy.pick(&engines, &request(&model)).await,
-        Err(PickError::NoAdmissibleEngine(_))
-    ));
-    assert_eq!(admission.calls.lock().unwrap().len(), 1);
+    assert_eq!(
+        policy
+            .pick(&engines, &request(&model))
+            .await
+            .unwrap()
+            .engine
+            .id
+            .0,
+        "shallow"
+    );
+    assert_eq!(admission.calls.lock().unwrap().len(), 2);
 }
 
 #[tokio::test]

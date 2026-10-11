@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import ctypes
 import errno
+import functools
 import glob
 import logging
 import mmap
@@ -33,6 +34,9 @@ from sglang.kernels.ops.embeddings.engram_hash import (
     engram_hash_ids_and_commit,
 )
 from sglang.srt.distributed import tensor_model_parallel_all_reduce
+from sglang.srt.distributed.device_communicators.cuda_wrapper import (
+    find_loaded_library,
+)
 from sglang.srt.distributed.parallel_state import inplace_all_reduce
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
@@ -243,6 +247,11 @@ class EngramHasher(nn.Module):
         self.image_token_id: Optional[int] = None
         self.history: Optional[torch.Tensor] = None
         self.pad_row = 0
+        # typing only
+        self.token_map: torch.Tensor
+        self.multipliers: torch.Tensor
+        self.primes: torch.Tensor
+        self.offsets: torch.Tensor
 
     def init_history(self, num_req_slots: int, device) -> None:
         """Allocate oldest-first history with a spare row for graph padding."""
@@ -313,7 +322,13 @@ class EngramHasher(nn.Module):
             )
             lens = forward_batch.extend_seq_lens.to(torch.int64)
             starts = forward_batch.extend_start_loc.to(torch.int64)
-            row = torch.repeat_interleave(torch.arange(bs, device=device), lens)
+            lens_cpu = forward_batch.extend_seq_lens_cpu
+            row = torch.repeat_interleave(
+                torch.arange(bs, device=device),
+                lens,
+                # The host total skips the device sum's sync.
+                output_size=sum(lens_cpu) if lens_cpu is not None else None,
+            )
             num_real = row.shape[0]
             kmode = MODE_EXTEND
             if forward_batch.engram_history is not None:
@@ -548,6 +563,39 @@ def _drop_page_cache_once(reason: str) -> None:
     )
 
 
+@functools.cache
+def _hip_runtime() -> ctypes.CDLL:
+    """
+    torch.cuda.cudart() does not expose hipHostGetDevicePointer, so call it
+    through ctypes to map a registered host address to its device address.
+    """
+    path = find_loaded_library("libamdhip64")
+    if path is None:
+        raise RuntimeError("libamdhip64 is not loaded in the current process")
+    lib = ctypes.CDLL(path)
+    lib.hipHostGetDevicePointer.restype = ctypes.c_int
+    lib.hipHostGetDevicePointer.argtypes = [
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.c_void_p,
+        ctypes.c_uint,
+    ]
+    return lib
+
+
+def _registered_device_ptr(host_ptr: int) -> int:
+    """
+    Address kernels must use for registered host memory.
+    UVA makes it the host address on CUDA; HIP may map it elsewhere.
+    """
+    if not _is_hip:
+        return host_ptr
+    device_ptr = ctypes.c_void_p()
+    err = _hip_runtime().hipHostGetDevicePointer(ctypes.byref(device_ptr), host_ptr, 0)
+    if err != 0 or not device_ptr.value:
+        raise RuntimeError(f"hipHostGetDevicePointer failed: {err}")
+    return device_ptr.value
+
+
 class _HostTable:
     """Host-memory backing for one engram table ('shared' or 'per_rank' layout).
 
@@ -596,6 +644,7 @@ class _HostTable:
         err = torch.cuda.cudart().cudaHostRegister(self.bytes.data_ptr(), nbytes, 0)
         if int(err) != 0:
             raise RuntimeError(f"cudaHostRegister({nbytes} bytes) failed: {err}")
+        self.device_ptr = _registered_device_ptr(self.bytes.data_ptr())
 
     def _open_shared_fd(self, nbytes: int, name: str) -> int:
         owner = None
@@ -718,10 +767,17 @@ class EngramEmbedding(nn.Module):
         scale = raw[w_bytes:].view(torch.float8_e8m0fnu).view(n, dim // FP8_BLOCK_SIZE)
         self.weight = nn.Parameter(weight, requires_grad=False)
         self.scale = nn.Parameter(scale, requires_grad=False)
+        device_ptr = self.host_table.device_ptr
+        self._host_table_ptrs = (device_ptr, device_ptr + w_bytes)
 
     @property
     def _shared(self) -> bool:
         return self.host_table is not None and self.host_table.layout == "shared"
+
+    def _table_ptrs(self) -> tuple[int, int]:
+        if self.host_table is None:
+            return self.weight.data_ptr(), self.scale.data_ptr()
+        return self._host_table_ptrs
 
     def _load_rows(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         rows = slice(self.row_start, self.row_start + self.rows)
@@ -749,8 +805,7 @@ class EngramEmbedding(nn.Module):
                 return self._empty(indices)
             out = self._empty(indices)
             engram_gather(
-                self.weight.data_ptr(),
-                self.scale.data_ptr(),
+                *self._table_ptrs(),
                 indices.reshape(-1),
                 out.view(-1, self.dim),
                 self.dim,
@@ -809,8 +864,7 @@ class EngramEmbedding(nn.Module):
             return values.to(torch.bfloat16).masked_fill(~owned.unsqueeze(-1), 0)
         out = self._empty(indices)
         engram_gather(
-            self.weight.data_ptr(),
-            self.scale.data_ptr(),
+            *self._table_ptrs(),
             indices.reshape(-1),
             out.view(-1, self.dim),
             self.dim,

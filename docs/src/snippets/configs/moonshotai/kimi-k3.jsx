@@ -984,10 +984,10 @@ export const config = {
         // dispatch. Env var, not a flag, so it emits via env/stripEnv.
         id: "kdaFusedDecode", title: "Fused KDA Decode (AMD gfx950)",
         showWhen: (b) => ["mi350x", "mi355x"].includes(b.hw),
-        stripEnv: ["SGLANG_K3_KDA_FUSED_BACKEND"],
+        stripEnv: ["SGLANG_ROCM_K3_KDA_FUSED_BACKEND"],
         options: [
           { id: "off",   label: "Off" },
-          { id: "aiter", label: "On (AITER fused boundary)", env: ["SGLANG_K3_KDA_FUSED_BACKEND=aiter"] },
+          { id: "aiter", label: "On (AITER fused boundary)", env: ["SGLANG_ROCM_K3_KDA_FUSED_BACKEND=aiter"] },
         ],
       },
       {
@@ -1013,13 +1013,13 @@ export const config = {
         ],
       },
       {
-        // A decode server runs a chunk cache by default (1 state slot/req);
+        // A decode server disables the radix cache by default (1 state slot/req);
         // radix restores prefix reuse at the unified per-request slot cost.
         id: "pdDecodeRadix", title: "PD Decode Radix Cache",
         showWhen: (b) => b.pdMode === "decode",
         stripPrefixes: ["--disaggregation-decode-enable-radix-cache"],
         options: [
-          { id: "off", label: "Off (chunk cache)" },
+          { id: "off", label: "Off" },
           { id: "on",  label: "On", flags: ["--disaggregation-decode-enable-radix-cache"] },
         ],
       },
@@ -1917,7 +1917,7 @@ export const config = {
     // shared PP2 x TP8 prefill. Comparisons hold; absolutes would be higher
     // behind the PP16 x TP1 prefill cell above.
     //
-    // Decode runs the KV cache as a chunk cache, so the unified 5-slots-per-
+    // Decode runs with the radix cache disabled, so the unified 5-slots-per-
     // request reservation (1 state + ping-pong copies for radix reuse) drops to
     // a single slot, and --mamba-radix-cache-strategy stops having any effect.
     // In-transfer requests holding a slot before decode starts are the only
