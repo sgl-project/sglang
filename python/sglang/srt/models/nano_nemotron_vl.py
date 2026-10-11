@@ -128,6 +128,16 @@ class NemotronH_Nano_VL_V2(EVS):
 
         self.config = config
 
+    @property
+    def routed_experts_weights_of_layer(self):
+        return self.language_model.routed_experts_weights_of_layer
+
+    @classmethod
+    def get_model_config_for_expert_location(cls, config):
+        return NemotronHForCausalLM.get_model_config_for_expert_location(
+            config.llm_config
+        )
+
     def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         im_start_id: int = mm_inputs.im_start_id
         im_end_id: int = mm_inputs.im_end_id
