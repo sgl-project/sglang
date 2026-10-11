@@ -491,7 +491,8 @@ Notice for ggml-org/llama.cpp
 -------------------------------
 
 csrc/quantization/gguf/llama_mmq/ggml (MMQ kernels, vendored from commit
-23b0202a189c44a54625aadcb37a946dd1d6278d) and code derived from it in
+23b0202a189c44a54625aadcb37a946dd1d6278d; built with the changes in
+csrc/quantization/gguf/llama_mmq/patches applied) and code derived from it in
 csrc/quantization/gguf/llama_mmq/ (mmq_dense.cu, quantize_mmq_q8_1.cu, ggml_shim.cu).
 
 MIT License

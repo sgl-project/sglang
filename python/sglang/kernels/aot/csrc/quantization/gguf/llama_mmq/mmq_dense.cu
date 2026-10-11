@@ -2,7 +2,8 @@
 // Mirrors the dense (non-ids) path of ggml_cuda_mul_mat_q() in llama.cpp's ggml/src/ggml-cuda/mmq.cu
 // (commit in ggml/LLAMA_CPP_COMMIT) with ne02 = ne03 = ne12 = ne13 = 1 and the activations always
 // quantized to q8_1 (GGML_PREC_Q8). The mul_mat_q_case<type> instances are compiled from the vendored
-// ggml/src/ggml-cuda/template-instances/mmq-instance-*.cu files.
+// ggml/src/ggml-cuda/template-instances/mmq-instance-*.cu files, built from a copy of ggml/ with the patches in
+// patches/ applied (0001: dst in f32, f16 or bf16).
 // Derived from llama.cpp (MIT License, Copyright (c) 2023-2026 The ggml authors, see ggml/LICENSE).
 
 #include <climits>
@@ -117,7 +118,8 @@ void mul_mat(
     int64_t type_i,
     const void* yq,
     int64_t M,
-    float* dst,
+    void* dst,
+    XType dst_type,
     int64_t ld_dst,
     cudaStream_t stream) {
   const ggml_type type = (ggml_type)type_i;
@@ -169,7 +171,7 @@ void mul_mat(
                          /*y=*/(const int*)yq,
                          /*ids_dst=*/nullptr,
                          /*expert_bounds=*/nullptr,
-                         /*dst=*/dst,
+                         /*dst=*/(float*)dst,
                          /*y_scale=*/nullptr,
                          /*ncols_x=*/K,
                          /*nrows_x=*/rows,
@@ -188,7 +190,10 @@ void mul_mat(
                          /*stride_sample_y=*/s12,
                          /*stride_sample_dst=*/s2,
                          /*ncols_max=*/M,
-                         /*J_best=*/J_best};
+                         /*J_best=*/J_best,
+                         /*type_dst=*/dst_type == XType::F32 ? GGML_TYPE_F32
+                         : dst_type == XType::F16            ? GGML_TYPE_F16
+                                                             : GGML_TYPE_BF16};
 
   g_cur_stream = stream;
   mul_mat_q_switch_type(device_context(id), args, stream);
