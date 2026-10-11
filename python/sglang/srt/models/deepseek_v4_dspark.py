@@ -454,14 +454,14 @@ class DSparkV4MarkovHead(BaseDSparkMarkovHead):
                 "Disable SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD."
             )
         self._shard_group = shard_group
-        self._vocab_gather = make_vocab_gather(
+        vocab_gather = make_vocab_gather(
             shard_group,
             local_width=per_partition,
             prefer_nvlink=self._is_dsv41
             and envs.SGLANG_DSPARK_NVLINK_VOCAB_GATHER.get(),
         )
         if shard_group.rank == 0:
-            cls_name = type(self._vocab_gather).__name__
+            cls_name = type(vocab_gather).__name__
             logger.info("DSpark markov_w2 vocab gather: %s", cls_name)
         self._tp_shard = MarkovW2ShardGeometry(
             tp_size=tp_size,
@@ -471,7 +471,7 @@ class DSparkV4MarkovHead(BaseDSparkMarkovHead):
             num_embeddings_padded=num_padded,
         )
         self.vocab_shard = VocabShard(
-            start=self._tp_shard.org_vocab_start, gather=self._vocab_gather
+            start=self._tp_shard.org_vocab_start, gather=vocab_gather
         )
 
     def get_prev_embeddings(self, token_ids: torch.Tensor) -> torch.Tensor:
