@@ -17,6 +17,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
     BuildStepLocal,
     CommitKvProj,
 )
+from sglang.kernels.ops.speculative.dspark.markov_sample import MarkovSampleStep
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.distributed.device_communicators.vocab_gather import make_vocab_gather
 from sglang.srt.environ import envs
@@ -522,21 +523,25 @@ class DSparkV4MarkovHead(BaseDSparkMarkovHead):
     def sample_block_greedy_fused(self, base_logits, *, first_prev_tokens):
         if not self.supports_sharded_greedy or not base_logits.is_cuda:
             return None
-        from sglang.kernels.ops.speculative.dspark.sharded_greedy import (
-            sharded_greedy_step,
-        )
-
         shard = self._tp_shard
         prev = first_prev_tokens.long()
+        # The greedy-only variant reads neither, so nothing fills them.
+        greedy = torch.empty(prev.shape[0], dtype=torch.float32, device=prev.device)
+        offset = torch.empty(1, dtype=torch.int64, device=prev.device)
         tokens = []
         for step in range(base_logits.shape[1]):
             bias, _ = self.step_bias(prev, hidden_states=None, state=None)
-            prev = sharded_greedy_step(
-                bias,
-                base_logits[:, step],
-                group=self._shard_group,
+            prev = MarkovSampleStep.triton(
+                base_logits=base_logits[:, step],
+                bias=bias,
+                temperatures=greedy,
+                key=0,
+                offset=offset,
+                step=step,
+                step_dtype=torch.float32,
                 vocab_start=shard.org_vocab_start,
                 gather=self._vocab_gather.gather_stacked,
+                has_sampled_rows=False,
             )
             tokens.append(prev)
         return torch.stack(tokens, dim=1)
