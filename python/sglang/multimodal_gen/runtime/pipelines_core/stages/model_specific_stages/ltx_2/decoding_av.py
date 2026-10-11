@@ -1,14 +1,20 @@
 import torch
+from diffusers.video_processor import VideoProcessor
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
+from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     StageParallelismType,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import DecodingStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.encode_while_decoding import (
+    EncodeWhileDecoding,
+    streamed_video_output_path,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.precision import (
@@ -35,9 +41,6 @@ class LTX2AVDecodingStage(DecodingStage):
         # Replaces the convolutional decoder; latents and denormalization are
         # identical either way.
         self.diffusion_decoder = diffusion_decoder
-        # Add video processor for postprocessing
-        from diffusers.video_processor import VideoProcessor
-
         self.video_processor = VideoProcessor(vae_scale_factor=32)
 
     def component_uses(
@@ -48,7 +51,11 @@ class LTX2AVDecodingStage(DecodingStage):
         audio_vae_dtype = resolve_precision(
             server_args, "audio_vae", precision_attr="audio_vae_precision"
         )
-        uses = [ComponentUse(stage_name, "vae", target_dtype=vae_dtype)]
+        uses = [
+            ComponentUse(stage_name, "audio_vae", target_dtype=audio_vae_dtype),
+            ComponentUse(stage_name, "vocoder"),
+            ComponentUse(stage_name, "vae", target_dtype=vae_dtype),
+        ]
         if self.diffusion_decoder is not None:
             uses.append(
                 ComponentUse(
@@ -58,12 +65,6 @@ class LTX2AVDecodingStage(DecodingStage):
                     allow_prefetch=False,
                 )
             )
-        uses.extend(
-            [
-                ComponentUse(stage_name, "audio_vae", target_dtype=audio_vae_dtype),
-                ComponentUse(stage_name, "vocoder"),
-            ]
-        )
         return uses
 
     @staticmethod
@@ -101,6 +102,56 @@ class LTX2AVDecodingStage(DecodingStage):
 
     def forward(self, batch: Req, server_args: ServerArgs) -> OutputBatch:
         self.load_model()
+        output_batch = OutputBatch(
+            output=None,
+            trajectory_timesteps=batch.trajectory_timesteps,
+            trajectory_latents=batch.trajectory_latents,
+            trajectory_decoded=None,
+            metrics=batch.metrics,
+            rollout_trajectory_data=batch.rollout_trajectory_data,
+        )
+        save_path = None
+        if (
+            not batch.use_diffusion_decoder
+            and not batch.return_trajectory_decoded
+            and isinstance(self.vae, ParallelTiledVAE)
+            and self.vae.supports_decode_on_frames
+        ):
+            save_path = streamed_video_output_path(
+                batch, server_args, int(batch.latents.shape[0])
+            )
+        # every rank decodes audio first, including ranks that do not write the MP4
+        audio_first = not batch.use_diffusion_decoder
+        if audio_first:
+            self._decode_audio(batch, server_args, output_batch)
+        stream = None
+        if save_path is not None:
+            # ffmpeg needs the audio input before it can consume the first video frames
+            stream = EncodeWhileDecoding(
+                save_path,
+                batch,
+                finish_frames=lambda frames: (frames.float() / 2 + 0.5).clamp(0, 1),
+                audio=output_batch.audio,
+                audio_sample_rate=output_batch.audio_sample_rate,
+            )
+        try:
+            video = self._decode_video(batch, server_args, on_frames=stream)
+            output_paths = stream.finish() if stream is not None else None
+        except BaseException:
+            if stream is not None:
+                stream.abort()
+            raise
+        if output_paths is not None:
+            output_batch.output_file_paths = output_paths
+        else:
+            output_batch.output = self.video_processor.postprocess_video(
+                video, output_type="np"
+            )
+        if not audio_first:
+            self._decode_audio(batch, server_args, output_batch)
+        return output_batch
+
+    def _decode_video(self, batch: Req, server_args: ServerArgs, on_frames=None):
 
         vae_dtype = resolve_decode_precision(server_args, "vae")
         vae_autocast_enabled = autocast_enabled(vae_dtype, server_args.disable_autocast)
@@ -151,7 +202,8 @@ class LTX2AVDecodingStage(DecodingStage):
                     with temporary_module_dtype(
                         self.vae, vae_dtype, enabled=should_cast_vae
                     ) as vae:
-                        decode_output = vae.decode(latents)
+                        decode_kwargs = {} if on_frames is None else {"on_frames": on_frames}
+                        decode_output = vae.decode(latents, **decode_kwargs)
 
         if isinstance(decode_output, tuple):
             video = decode_output[0]
@@ -159,18 +211,9 @@ class LTX2AVDecodingStage(DecodingStage):
             video = decode_output
         else:
             video = decode_output.sample
-        video = self.video_processor.postprocess_video(video, output_type="np")
+        return video
 
-        output_batch = OutputBatch(
-            output=video,
-            trajectory_timesteps=batch.trajectory_timesteps,
-            trajectory_latents=batch.trajectory_latents,
-            trajectory_decoded=None,
-            metrics=batch.metrics,
-            rollout_trajectory_data=batch.rollout_trajectory_data,
-        )
-
-        # 2. Decode Audio
+    def _decode_audio(self, batch: Req, server_args: ServerArgs, output_batch: OutputBatch):
         try:
             audio_latents = batch.audio_latents
         except AttributeError:
@@ -288,4 +331,3 @@ class LTX2AVDecodingStage(DecodingStage):
                 vocoder_sr or audio_vae_sr or pipeline_audio_sr
             )
 
-        return output_batch
