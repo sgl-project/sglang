@@ -135,7 +135,7 @@ def cases(backend: str, prefix: str) -> tuple:
 
 
 class VarlenAbsorbedExtendMixin:
-    """Assertions shared by piecewise and breakable capture tests."""
+    """Assertions for the breakable captured-prefill-graph tests."""
 
     CASES: tuple = ()
     MODE_KWARGS: dict = {}
@@ -239,7 +239,6 @@ class VarlenAbsorbedExtendMixin:
                 fp8_kv_cache=True,
                 atol=2e-1,
                 rtol=2e-1,
-                **self.MODE_KWARGS,
                 **MLA_SHAPE_KWARGS,
             )
         self.assertIsNotNone(
@@ -278,7 +277,6 @@ class VarlenAbsorbedExtendMixin:
                 fp8_kv_cache=True,
                 atol=2e-1,
                 rtol=2e-1,
-                **self.MODE_KWARGS,
                 **MLA_SHAPE_KWARGS,
             )
         self.assertIsNotNone(

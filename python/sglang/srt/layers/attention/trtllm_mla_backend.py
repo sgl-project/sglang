@@ -221,8 +221,7 @@ def varlen_absorbed_extend_may_run(
     inside a captured prefill graph, without DCP or skip-softmax decode."""
     return (
         cuda_graph_config is not None
-        and cuda_graph_config.prefill.backend
-        in (Backend.TC_PIECEWISE, Backend.BREAKABLE)
+        and cuda_graph_config.prefill.backend == Backend.BREAKABLE
         and not dcp_enabled
         and envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get() is None
     )
@@ -870,7 +869,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             # A captured graph forces MLA on a genuine extend; absorbed MLA over a
             # ragged q avoids the FlashInfer fallback's whole-KV-pool conversion.
             use_varlen_absorbed = (
-                (is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph())
+                is_in_breakable_cuda_graph()
                 and self._varlen_absorbed_workspace_buffer is not None
                 and forward_batch.spec_info is None
             )
@@ -913,6 +912,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 max_seqlen_pad = self._calc_padded_blocks(max_seq_k)
                 self.forward_prefill_metadata.block_kv_indices = (
                     self._create_block_kv_indices(
+                        forward_batch.kv_loc_plan,
                         bs,
                         max_seqlen_pad,
                         forward_batch.req_pool_indices,
@@ -1151,8 +1151,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         cum_seq_lens_q: torch.Tensor,
         max_q_len: int,
     ) -> torch.Tensor:
-        """Absorbed MLA over a ragged query, for a captured tc_piecewise or
-        breakable prefill graph.
+        """Absorbed MLA over a ragged query, for a captured breakable prefill
+        graph.
 
         Separate from _run_decode_kernel(): that hook serves the dense
         [bs, draft_token_num] verify layout, while `query` here is the ragged
