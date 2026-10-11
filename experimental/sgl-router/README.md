@@ -411,10 +411,10 @@ text, as does any model whose template fails to load or render.
 Some chats additionally forward the rendered tokens to the engine as
 `input_ids`, retaining the original messages, so the engine skips
 re-tokenizing. How many depends on the model's renderer. DeepSeek-V4's, V4.1's
-and Kimi-K3's native encoders and GLM-5.3's template are fixture-verified against
-SGLang's request normalization, so they forward every chat except multimodal ones
-and those with caller-provided `input_ids`. Renderers without that verification
-(HF Jinja templates)
+and Kimi-K3's native encoders and GLM-5.3's and Qwen3.8's templates are
+fixture-verified against SGLang's request normalization, so they forward every
+chat except multimodal ones and those with caller-provided `input_ids`. Renderers
+without that verification (HF Jinja templates)
 forward only plain text chat requests (string `content`, no tools, no template
 kwargs or reasoning controls or historical `reasoning_content`, no assistant
 continuation, no consecutive users or non-leading system turns) and warn
@@ -509,7 +509,7 @@ own route as sent: workers that disagree on those args or never
 reported them, `--completion-template`, `return_hidden_states` and other
 `sglext` outputs, `echo` or `logprobs` without a router tokenizer, and bodies
 SGLang would reject. Chat also needs a renderer verified against SGLang (the
-`AllText` scope: DeepSeek-V4, V4.1, GLM-5.3 and Kimi-K3 today), router `--default-chat-template-kwargs`
+`AllText` scope: DeepSeek-V4, V4.1, GLM-5.3, Kimi-K3 and Qwen3.8 today), router `--default-chat-template-kwargs`
 equal to the workers', a reasoning parser the processor reproduces
 (`deepseek-v4`, `deepseek-v41`, `glm45`, `kimi_k3`) or none, and no media yet. Tools are served with `tool_choice`
 `auto` or `none`, non-strict, with standard JSON-schema types, and a tool
@@ -595,6 +595,16 @@ so every text chat forwards `input_ids`. Media, a `chat_template` kwarg, `-0` in
 or tool arguments, and U+001C..U+001F in assistant history render on the worker. With
 the cookbook's parsers, chats without tools are served through `/generate`; chats with
 tools keep the engine's route (see above).
+
+## Qwen3.8
+
+Qwen3.8 (Max, 27B and Flash-Next) renders with the checkpoint's `chat_template.jinja`
+through `rust/sglang-processor`, which picks it by its template and builds the
+template context SGLang's Jinja path builds. Every text chat forwards `input_ids`.
+Media, a `chat_template` key in `chat_template_kwargs`, and text or tool numbers
+Python's `trim` or `json.dumps` treat unlike Dynamo's (such as `1e-06`) render on the
+worker. The processor does not reproduce the `qwen3` reasoning and `qwen3_coder`
+tool parsers, so with them (the cookbook's flags) chats take the engine's own OpenAI route.
 
 ## Kimi-K3
 

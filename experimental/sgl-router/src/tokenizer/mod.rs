@@ -193,7 +193,7 @@ impl TokenizerRegistry {
                      and SGLANG_DSV4_REASONING_EFFORT or SGLANG_DSV41_REASONING_EFFORT"),
                 ForwardingScope::Guarded => tracing::warn!(model = %m.id,
                     "UNVERIFIED input_ids forwarding: router rendering is verified against SGLang only \
-                     for DeepSeek-V4, V4.1, GLM-5.3 and Kimi-K3, so this model forwards only guarded shapes (plain text \
+                     for DeepSeek-V4, V4.1, GLM-5.3, Kimi-K3 and Qwen3.8, so this model forwards only guarded shapes (plain text \
                      chat). Requires the workers' model files and --default-chat-template-kwargs; \
                      worker parser overrides, content-format detection, and conversation-template stop \
                      strings are not replicated. Pass --disable-input-ids-forwarding unless you have \
