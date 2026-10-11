@@ -113,12 +113,12 @@ class TestStreamedEncode(CustomTestCase):
         config = HunyuanVAEConfig(
             arch_config=HunyuanVAEArchConfig(
                 latent_channels=4,
-                block_out_channels=(8,),
-                down_block_types=("HunyuanVideoDownBlock3D",),
-                up_block_types=("HunyuanVideoUpBlock3D",),
+                block_out_channels=(8, 8, 8),
+                down_block_types=("HunyuanVideoDownBlock3D",) * 3,
+                up_block_types=("HunyuanVideoUpBlock3D",) * 3,
                 layers_per_block=1,
                 norm_num_groups=4,
-                temporal_compression_ratio=1,
+                temporal_compression_ratio=4,
                 mid_block_add_attention=False,
             ),
             load_encoder=False,
@@ -129,7 +129,7 @@ class TestStreamedEncode(CustomTestCase):
             streamed, one_shot = Path(tmp, "stream.mp4"), Path(tmp, "normal.mp4")
             stream = EncodeWhileDecoding(str(streamed), _video_request())
             frames = stage.decode(
-                torch.randn(1, 4, 5, 40, 48, device="cuda"),
+                torch.randn(1, 4, 2, 10, 12, device="cuda"),
                 server_args,
                 vae_dtype=torch.float32,
                 on_frames=stream,
