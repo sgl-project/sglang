@@ -50,6 +50,9 @@ class MockHybridPool:
     def _get_hybrid_pool_buffer(self):
         return [self.temporal_buffer, *self.conv_buffer]
 
+    def get_page_component_names(self):
+        return ["temporal", "conv_0"]
+
     def get_page_buffer_meta(self, indices):
         ptr_list = []
         size_list = []
@@ -74,6 +77,28 @@ class MockHybridPool:
 
     def is_stride_page_aligned(self, page_size_bytes: int = 4096) -> bool:
         return True
+
+
+class MockMambaPoolWithSideState(MockHybridPool):
+    """Mamba page that also carries a registered slot side state."""
+
+    def __init__(self):
+        super().__init__()
+        self.side_buffer = torch.zeros_like(self.temporal_buffer)
+
+    def _get_hybrid_pool_buffer(self):
+        return [self.temporal_buffer, *self.conv_buffer, self.side_buffer]
+
+    def get_page_component_names(self):
+        return ["temporal", "conv_0", "ple_ngram_0"]
+
+    def get_page_buffer_meta(self, indices):
+        ptr_list, size_list = [], []
+        for index in indices.tolist():
+            for buf in self._get_hybrid_pool_buffer():
+                ptr_list.append(buf[index].data_ptr())
+                size_list.append(buf[index].numel())
+        return ptr_list, size_list
 
 
 class MockMemPoolHost:
@@ -618,6 +643,46 @@ class TestNixlUnified(CustomTestCase):
         )
         self.assertEqual(len(captured["host_buffers"]), 4)
         self.assertEqual(captured["direction"], "WRITE")
+
+    def test_zero_copy_mamba_keys_follow_host_pool_component_names(self):
+        pool = MockMambaPoolWithSideState()
+        self.hicache.register_mem_host_pool_v2(pool, PoolName.MAMBA)
+
+        captured = {}
+
+        def fake_batch_xfer(keys, key_strs, host_buffers, direction):
+            captured["keys"] = key_strs
+            captured["host_buffers"] = host_buffers
+            return [True] * len(key_strs)
+
+        self.hicache._batch_xfer = fake_batch_xfer
+        results = self.hicache.batch_set_v2(
+            [
+                PoolTransfer(
+                    name=PoolName.MAMBA,
+                    keys=["p0"],
+                    host_indices=torch.tensor([1], dtype=torch.int64),
+                )
+            ]
+        )
+
+        self.assertEqual(results[PoolName.MAMBA], [True])
+        base = self.hicache._get_suffixed_key("p0")
+        self.assertEqual(
+            captured["keys"],
+            [
+                f"{base}_mamba_temporal",
+                f"{base}_mamba_conv_0",
+                f"{base}_mamba_ple_ngram_0",
+            ],
+        )
+        self.assertEqual(
+            [ptr for ptr, _ in captured["host_buffers"]],
+            pool.get_page_buffer_meta(torch.tensor([1]))[0],
+        )
+        self.assertEqual(
+            self.hicache._get_hybrid_key_multiplier(PoolName.MAMBA, pool), 3
+        )
 
     def test_batch_get_v2_uses_bounce_buffer_for_non_zero_copy_pool(self):
         pool = MockHybridPool(expose_zero_copy=False)

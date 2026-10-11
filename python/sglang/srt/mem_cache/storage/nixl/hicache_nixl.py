@@ -198,14 +198,19 @@ class HiCacheNixl(HiCacheStorage):
         return [self._get_component_key(key, pool_name) for key in keys]
 
     def _get_hybrid_component_keys(
-        self, keys: List[str], pool_name: PoolName, key_multiplier: int
+        self,
+        keys: List[str],
+        pool_name: PoolName,
+        key_multiplier: int,
+        host_pool: HostKVCache,
     ) -> List[str]:
         if key_multiplier == 1:
             return self._get_component_keys(keys, pool_name)
 
         if pool_name == PoolName.MAMBA:
-            suffixes = [f"_{pool_name}_temporal"] + [
-                f"_{pool_name}_conv_{i}" for i in range(key_multiplier - 1)
+            suffixes = [
+                f"_{pool_name}_{component}"
+                for component in host_pool.get_page_component_names()
             ]
         elif key_multiplier == 2:
             suffixes = [f"_{pool_name}_k", f"_{pool_name}_v"]
@@ -480,7 +485,7 @@ class HiCacheNixl(HiCacheStorage):
         self, pool_name: PoolName, host_pool: HostKVCache
     ) -> int:
         if pool_name == PoolName.MAMBA:
-            return 1 + len(getattr(host_pool, "conv_buffer", []) or [])
+            return len(host_pool.get_page_component_names())
         if hasattr(host_pool, "v_buffer"):
             return 2
         return 1
@@ -509,7 +514,7 @@ class HiCacheNixl(HiCacheStorage):
             return [], [], 0
         key_multiplier = len(ptr_list) // page_num
         key_strs = self._get_hybrid_component_keys(
-            transfer.keys or [], transfer.name, key_multiplier
+            transfer.keys or [], transfer.name, key_multiplier, ctx.host_pool
         )
         if len(key_strs) != len(ptr_list):
             logger.error(
@@ -907,7 +912,7 @@ class HiCacheNixl(HiCacheStorage):
                 else 1
             )
             component_keys = self._get_hybrid_component_keys(
-                keys[:kv_pages], transfer.name, key_multiplier
+                keys[:kv_pages], transfer.name, key_multiplier, ctx.host_pool
             )
             exists_results = self._query_keys_exist(component_keys)
             page_exists = self._page_results(exists_results, key_multiplier)
