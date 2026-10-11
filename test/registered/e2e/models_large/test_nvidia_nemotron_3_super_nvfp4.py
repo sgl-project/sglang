@@ -53,6 +53,18 @@ DP_ATTENTION_EP_ARGS = [
     "8192",
 ]
 
+EPLB_ARGS = [
+    "--ep-size",
+    "4",
+    "--moe-runner-backend",
+    "flashinfer_trtllm_routed",
+    "--enable-eplb",
+    "--ep-num-redundant-experts",
+    "32",
+    "--eplb-rebalance-num-iterations",
+    "50",
+]
+
 MTP_ARGS = [
     "--speculative-algorithm",
     "EAGLE",
@@ -148,6 +160,34 @@ class TestNvidiaNemotron3SuperNVFP4MTP(CustomTestCase):
                 cls.base_url,
                 timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
                 other_args=NEMOTRON_3_SUPER_NVFP4_ARGS + MTP_ARGS,
+            )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def test_gsm8k(self):
+        _run_gsm8k(self)
+
+
+class TestNvidiaNemotron3SuperNVFP4EPLB(CustomTestCase):
+    """EP with dynamic EPLB on the hybrid Mamba/attention/MoE stack.
+
+    A wrong expert-location layer index, an unmigrated expert tensor, or routing
+    that skips the remap sends tokens to the wrong expert after a rebalance, which
+    degrades the score instead of failing.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = NEMOTRON_3_SUPER_NVFP4_MODEL
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        with envs.SGLANG_ENABLE_ASYNC_ASSERT.override(0):
+            cls.process = popen_launch_server(
+                cls.model,
+                cls.base_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=NEMOTRON_3_SUPER_NVFP4_ARGS + EPLB_ARGS,
             )
 
     @classmethod
