@@ -8,11 +8,12 @@ from unittest.mock import Mock
 
 from sglang.srt.disaggregation.ascend.conn import AscendKVManager
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
-class TestAscendMemoryRegistration(unittest.TestCase):
+class TestAscendMemoryRegistration(CustomTestCase):
     def make_manager(self, **overrides):
         args = dict(
             kv_data_ptrs=[0x1000, 0],
@@ -121,6 +122,34 @@ class TestAscendMemoryRegistration(unittest.TestCase):
                     manager.register_buffer_to_engine()
 
                 manager.engine.batch_register.assert_not_called()
+
+    def test_zero_length_kv_placeholders_never_reach_memfabric(self):
+        """A PP prefill may publish empty KV entries for layer pairing.
+
+        MemFabric rejects a batch containing their null addresses, so only
+        populated entries may be included in the actual write batch.
+        """
+        manager = self.make_manager(
+            kv_data_ptrs=[0x1000, 0, 0x3000],
+            kv_data_lens=[256, 0, 256],
+        )
+        manager.engine.batch_transfer_sync.side_effect = (
+            lambda _session, _src, _dst, lengths: -2000 if 0 in lengths else 0
+        )
+
+        rc = manager._transfer_data(
+            "session",
+            [(0x1000, 0x5000, 64), (0, 0, 0), (0x3000, 0x7000, 128)],
+        )
+
+        self.assertEqual(rc, 0)
+        manager.engine.batch_transfer_sync.assert_called_once_with(
+            "session", [0x1000, 0x3000], [0x5000, 0x7000], [64, 128]
+        )
+
+        manager.engine.batch_transfer_sync.reset_mock()
+        self.assertEqual(manager._transfer_data("session", [(0, 0, 0)]), 0)
+        manager.engine.batch_transfer_sync.assert_not_called()
 
 
 if __name__ == "__main__":
