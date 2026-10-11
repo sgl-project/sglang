@@ -395,6 +395,19 @@ class HostKVCache(abc.ABC):
         """
         raise NotImplementedError()
 
+    def load_to_device_layer_block(
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        layer_ids,
+        io_backend,
+        is_draft: bool = False,
+    ) -> None:
+        raise NotImplementedError(
+            "This host pool does not implement direct layer blocks"
+        )
+
     @abc.abstractmethod
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend

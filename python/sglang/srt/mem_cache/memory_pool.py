@@ -1078,16 +1078,18 @@ class MambaPool:
     # UnifiedMambaPool skips super().__init__.
     @cached_property
     def _conv_fuse_ok(self) -> bool:
-        """Whether clear/copy may use the fused kernel: CUDA bf16 contiguous conv.
-        Strided (page-major / unified envelope) or non-bf16 conv fall back to the
-        per-tensor Python loop."""
+        """Fused addressing uses layer/slot strides; only each feature block
+        must be contiguous, including in page-major pools.
+        """
         convs = self.mamba_cache.conv
         return (
             not _is_npu
             and len(convs) > 0
             and convs[0].shape[0] > 0
             and convs[0].is_cuda
-            and all(c.dtype == torch.bfloat16 and c.is_contiguous() for c in convs)
+            and all(
+                c.dtype == torch.bfloat16 and c[0, 0].is_contiguous() for c in convs
+            )
         )
 
     @cached_property

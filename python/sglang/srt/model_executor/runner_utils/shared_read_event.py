@@ -8,6 +8,7 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.runtime_context import get_memory
 from sglang.srt.utils import is_cuda
 
 logger = logging.getLogger(__name__)
@@ -27,7 +28,10 @@ def maybe_publish_prefill_shared_read_done(
     model_runner, forward_batch, device_module
 ) -> None:
     """Publish prefill read-done after compliant metadata initialization."""
-    if not envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.get():
+    if not (
+        envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.get()
+        or get_memory().hicache_restore_backward_overlap
+    ):
         return
     if forward_batch.forward_mode != ForwardMode.EXTEND:
         return

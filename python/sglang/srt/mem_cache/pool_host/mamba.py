@@ -20,6 +20,7 @@ from sglang.srt.mem_cache.pool_host.common import (
     get_allocator_from_storage,
 )
 from sglang.srt.utils import is_cuda, is_hip, is_npu
+from sglang.srt.utils.nvtx_utils import profile_method
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -637,6 +638,33 @@ class MambaPoolHost(HostKVCache):
                 dst.index_copy_(0, host_indices, values)
         else:
             raise ValueError(f"Unsupported io_backend: {io_backend}")
+
+    @profile_method("hicache.mamba_direct_block")
+    def load_to_device_layer_block(
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        layer_ids,
+        io_backend,
+        is_draft: bool = False,
+    ):
+        from sglang.srt.mem_cache.pool_host.direct import transfer_mamba_block
+
+        assert not is_draft
+        host_buffers = list(self.conv_buffer)
+        device_buffers = list(device_pool.mamba_cache.conv)
+        if self.temporal_state_elem_size > 0:
+            host_buffers.append(self.temporal_buffer)
+            device_buffers.append(device_pool.mamba_cache.temporal)
+        return transfer_mamba_block(
+            host_buffers,
+            device_buffers,
+            host_indices,
+            device_indices,
+            layer_ids,
+            host_to_device=True,
+        )
 
     def load_to_device_per_layer(
         self,

@@ -3,12 +3,15 @@ from __future__ import annotations
 import logging
 from contextlib import contextmanager
 from functools import cache
-from typing import Any, Callable, NamedTuple, Optional
+from typing import TYPE_CHECKING, Any, Callable, NamedTuple, Optional
 
 import torch
 
 from sglang.srt.mem_cache.pool_host.base import shared_host_layout_domains
-from sglang.srt.utils import get_device_module
+from sglang.srt.utils import get_device_module, is_cuda
+
+if TYPE_CHECKING:
+    from sglang.srt.mem_cache.pool_host.direct import DirectTransfer
 
 logger = logging.getLogger(__name__)
 device_module = get_device_module()
@@ -48,13 +51,73 @@ class TransferCompletion(NamedTuple):
     timing_enabled: bool
 
 
+def local_layers_for_block(
+    transfer: L2Transfer, first: int, end: int, last: int | None = None
+) -> list[int]:
+    if transfer.layer_mapper is not None:
+        return [
+            local
+            for layer in range(first, end)
+            if (local := transfer.layer_mapper(layer)) is not None
+        ]
+    # Batched draft restores can extend beyond the target's final block.
+    local_end = (
+        transfer.host_pool.layer_num
+        if end == last
+        else min(end, transfer.host_pool.layer_num)
+    )
+    return list(range(first, local_end))
+
+
 class L2TransferEngine:
     """Runs resolved device↔host transfers without owning cache state."""
 
-    def __init__(self, io_backend: str):
+    def __init__(self, io_backend: str, host_pool=None):
         self.io_backend = io_backend
+        self.batch_direct = False
         self.device_to_host_stream = device_module.Stream()
         self.host_to_device_stream = device_module.Stream()
+        self._direct_layouts: dict[bool, tuple[tuple, DirectTransfer]] = {}
+        if host_pool is not None:
+            self.configure_batch_direct(host_pool)
+
+    def _prepare_direct(
+        self, transfers: list[L2Transfer], block_ends: tuple[int, ...] | None = None
+    ) -> DirectTransfer | None:
+        if not self.batch_direct:
+            return None
+        from sglang.srt.mem_cache.pool_host.direct import (
+            _direct_layout_key,
+            prepare_direct_transfer,
+        )
+
+        # Cache one layout per direction. Buffer changes invalidate it and release
+        # the old pools and pinned views.
+        key = _direct_layout_key(transfers, block_ends)
+        direction = block_ends is not None
+        cached = self._direct_layouts.get(direction)
+        if cached is None or cached[0] != key:
+            cached = (key, prepare_direct_transfer(transfers, block_ends))
+            self._direct_layouts[direction] = cached
+        return cached[1]
+
+    def configure_batch_direct(self, host_pool) -> None:
+        if self.io_backend != "direct" or not is_cuda():
+            return
+        from sglang.srt.mem_cache.pool_host.direct import can_batch_direct
+
+        self._direct_layouts.clear()
+        self.batch_direct = can_batch_direct(host_pool)
+        if self.batch_direct:
+            self.enable_batch_direct()
+
+    def enable_batch_direct(self) -> None:
+        from sglang.srt.mem_cache.pool_host.direct import load_block_dma_module
+
+        assert self.io_backend == "direct" and is_cuda()
+        # Compile during cache initialization, never on the first restore.
+        load_block_dma_module()
+        self.batch_direct = True
 
     @staticmethod
     def _resolve_device_indices(transfer: L2Transfer) -> torch.Tensor:
@@ -129,17 +192,7 @@ class L2TransferEngine:
                 )
 
     def submit_device_to_host(self, transfers: list[L2Transfer]) -> TransferCompletion:
-        with self._submission(
-            transfers, self.device_to_host_stream, "device_to_host"
-        ) as (transfers, completion):
-            for transfer in transfers:
-                transfer.host_pool.backup_from_device_all_layer_physical(
-                    transfer.device_pool,
-                    transfer.host_indices,
-                    transfer.device_indices,
-                    self.io_backend,
-                )
-        return completion
+        return self._submit(transfers, None)
 
     def submit_host_to_device(
         self,
@@ -148,35 +201,70 @@ class L2TransferEngine:
         transfer_layer_id_max: int,
         start_event=None,
         on_layer_done=None,
+        layer_block_ends: Optional[tuple[int, ...]] = None,
     ) -> TransferCompletion:
-        with self._submission(
-            transfers, self.host_to_device_stream, "host_to_device", start_event
-        ) as (transfers, completion):
-            primary = transfers[0] if transfers else None
-            for layer_id in range(transfer_layer_id_max):
-                for transfer in transfers:
-                    local_layer_id = (
-                        transfer.layer_mapper(layer_id)
-                        if transfer.layer_mapper is not None
-                        else layer_id
-                    )
-                    if local_layer_id is None or (
-                        transfer is not primary
-                        and transfer.layer_mapper is None
-                        and layer_id >= transfer.host_pool.layer_num
-                    ):
-                        continue
+        block_ends = (
+            layer_block_ends
+            if layer_block_ends is not None
+            else tuple(range(1, transfer_layer_id_max + 1))
+        )
+        return self._submit(transfers, block_ends, start_event, on_layer_done)
+
+    def _submit(
+        self,
+        transfers: list[L2Transfer],
+        block_ends: tuple[int, ...] | None,
+        start_event: Any = None,
+        on_layer_done: Callable[[int], None] | None = None,
+    ) -> TransferCompletion:
+        stream = (
+            self.host_to_device_stream
+            if block_ends is not None
+            else self.device_to_host_stream
+        )
+        transfer_key = "host_to_device" if block_ends is not None else "device_to_host"
+        with self._submission(transfers, stream, transfer_key, start_event) as (
+            transfers,
+            completion,
+        ):
+            direct = self._prepare_direct(transfers, block_ends)
+            device_indices = [transfer.device_indices for transfer in transfers]
+            if direct is not None:
+                direct.submit(transfers, device_indices, stream, on_layer_done)
+            else:
+                self._submit_pools(transfers, device_indices, block_ends, on_layer_done)
+        return completion
+
+    def _submit_pools(
+        self,
+        transfers: list[L2Transfer],
+        device_indices: list[torch.Tensor],
+        block_ends: tuple[int, ...] | None,
+        on_layer_done: Callable[[int], None] | None,
+    ) -> None:
+        if block_ends is None:
+            for transfer, dev_idx in zip(transfers, device_indices):
+                transfer.host_pool.backup_from_device_all_layer_physical(
+                    transfer.device_pool,
+                    transfer.host_indices,
+                    dev_idx,
+                    self.io_backend,
+                )
+            return
+        for first, end in zip((0, *block_ends), block_ends):
+            for transfer, dev_idx in zip(transfers, device_indices):
+                for layer in local_layers_for_block(transfer, first, end):
                     transfer.host_pool.load_to_device_per_layer_physical(
                         transfer.device_pool,
                         transfer.host_indices,
-                        transfer.device_indices,
-                        local_layer_id,
+                        dev_idx,
+                        layer,
                         self.io_backend,
                         is_draft=transfer.is_draft,
                     )
-                if on_layer_done is not None:
-                    on_layer_done(layer_id)
-        return completion
+            if on_layer_done is not None:
+                # Includes all auxiliary pools, including a partial last block.
+                on_layer_done(end - 1)
 
     @staticmethod
     def _start_event(start_event):

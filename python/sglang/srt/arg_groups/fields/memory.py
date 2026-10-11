@@ -129,6 +129,14 @@ class Memory(msgspec.Struct):
             choices=["direct", "kernel", "kernel_ascend"],
         ),
     ] = "kernel"
+    hicache_load_block_layers: A[
+        int,
+        "Number of model layers per HiCache restore block. Must be positive; 1 preserves layerwise loading. Each pipeline stage ends with a partial block if needed.",
+    ] = 1
+    hicache_restore_backward_overlap: A[
+        bool,
+        "Overlap direct HiCache restores with the previous forward when destination pages are safe. Reusing pages released by an unfinished forward retains the DMA fence. Supports static KV/SWA/Mamba pools in ordinary and DSpark overlap scheduling. Disabled by default; independent of restore block size.",
+    ] = False
     hicache_mem_layout: A[
         str,
         Arg(

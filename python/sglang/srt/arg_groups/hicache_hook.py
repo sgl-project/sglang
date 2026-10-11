@@ -23,6 +23,8 @@ def handle_hicache(server_args: Any):
     2) Storage <-> layout compatibility (may rewrite layout).
     """
     cfg = resolving_view(server_args)
+    if cfg.hicache_restore_backward_overlap and not cfg.enable_hierarchical_cache:
+        raise ValueError("--hicache-restore-backward-overlap requires HiCache.")
     if cfg.enable_linker_mla_dedup and (
         not cfg.enable_unified_cache_external_linker
         or cfg.unified_cache_external_linker_backend != "mooncake"
@@ -51,6 +53,9 @@ def handle_hicache(server_args: Any):
         )
     ):
         return
+
+    if cfg.hicache_load_block_layers < 1:
+        raise ValueError("--hicache-load-block-layers must be a positive integer")
 
     validate_hicache_host_memory_mode(server_args)
 

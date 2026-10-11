@@ -8286,6 +8286,240 @@ class UnifiedRadixCacheSuite:
             self.assertTrue(torch.equal(actual, expected))
         self._release_ongoing_load_back_locks(cache)
 
+    def test_backward_overlap_restores_mamba_through_deferred_cow(self):
+        from itertools import product
+
+        from sglang.srt.managers.schedule_batch import ScheduleBatch
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.srt.model_executor.model_runner import ModelRunner
+        from sglang.srt.runtime_context import get_context
+
+        if (
+            self.cfg.components != (ComponentType.FULL, ComponentType.MAMBA)
+            or self.cfg.page_size != 1
+        ):
+            self.skipTest("requires page_size=1 Full+Mamba")
+        for backend, aux_only, held_slot in product(
+            ("python", "rust"), (False, True), (False, True)
+        ):
+            with self.subTest(backend=backend, aux_only=aux_only, held_slot=held_slot):
+                # Reuse the pool fixture while exercising each production TreeCore.
+                with mock.patch.object(
+                    sys.modules[__name__], "_TREE_CORE_TEST_BACKEND", "python"
+                ):
+                    fixture, allocator, pool = build_fixture(self.cfg)
+                with envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override(backend):
+                    cache = UnifiedRadixCache(params=fixture.cache_init_params)
+                cache.cache_init_params = fixture.cache_init_params
+                self._init_hicache(cache)
+                tokens = [1, 2, 3]
+                self._insert(cache, allocator, pool, tokens)
+                leaf = cache.match_prefix(
+                    MatchPrefixParams(key=RadixKey(array("q", tokens)))
+                ).last_device_node
+                node_slot = _device_value(cache, leaf, ComponentType.MAMBA)
+                self._fill_mamba_state(pool, node_slot, marker=11)
+                expected = self._snapshot_mamba_state(pool, node_slot)
+                self.assertGreater(
+                    cache._execute_and_commit_kv_backup(
+                        BackupKV(node_ids=[leaf]),
+                        write_back=True,
+                    ),
+                    0,
+                )
+                cache.writing_check(write_back=True)
+                self.assertTrue(cache.tree_core.is_backuped(leaf))
+                if aux_only:
+                    # An internal node can lose its Mamba checkpoint while FULL stays resident.
+                    self._insert(cache, allocator, pool, tokens + [4])
+                cache.evict(
+                    EvictParams(
+                        num_tokens=0 if aux_only else len(tokens),
+                        mamba_num=1 if aux_only else 0,
+                    )
+                )
+                self.assertIsNone(_device_value(cache, leaf, ComponentType.MAMBA))
+                self.assertEqual(
+                    cache.tree_core.is_full_device_evicted(leaf), not aux_only
+                )
+
+                req = self._make_req(pool)
+                if held_slot:
+                    self._fill_mamba_state(
+                        pool, req.kv.mamba_pool_idx.unsqueeze(0), marker=29
+                    )
+                    old_state = self._snapshot_mamba_state(
+                        pool, req.kv.mamba_pool_idx.unsqueeze(0)
+                    )
+                else:
+                    pool.mamba_allocator.free(req.kv.mamba_pool_idx.unsqueeze(0))
+                    req.kv.mamba_pool_idx = None
+                old_slot = req.kv.mamba_pool_idx
+                match = cache.match_prefix(
+                    MatchPrefixParams(key=RadixKey(array("q", tokens)), req=req)
+                )
+                self._apply_match_to_req(req, match)
+                occupied = None
+                if not aux_only:
+                    occupied = pool.mamba_allocator.alloc(
+                        pool.mamba_allocator.available_size() - 1
+                    )
+                    self.assertIsNotNone(occupied)
+                    if not held_slot:
+                        # One ready slot cannot cover both cache restore and request CoW.
+                        full_available = allocator.available_size()
+                        with get_context().override_server_args(
+                            hicache_restore_backward_overlap=True
+                        ):
+                            self.assertFalse(cache.load_back(leaf, req=req))
+                        self.assertIsNone(req.kv.mamba_pool_idx)
+                        self.assertIsNone(req.kv.mamba_cow_src_index)
+                        self.assertFalse(cache.cache_controller.load_queue)
+                        self.assertEqual(pool.mamba_allocator.available_size(), 1)
+                        self.assertEqual(allocator.available_size(), full_available)
+                        pool.mamba_allocator.free(occupied)
+                        occupied = None
+                available_before = pool.mamba_allocator.available_size()
+                with get_context().override_server_args(
+                    hicache_restore_backward_overlap=True
+                ):
+                    loaded = cache.init_load_back(
+                        InitLoadBackParams(
+                            best_match_node=req.best_match_node,
+                            host_hit_length=req.host_hit_length,
+                            req=req,
+                        )
+                    )
+                self.assertIsNotNone(loaded)
+                loaded_len, req.last_node = loaded
+                req.prefix_len += loaded_len
+                self.assertEqual(req.prefix_len, len(tokens))
+                if held_slot:
+                    self.assertIs(req.kv.mamba_pool_idx, old_slot)
+                else:
+                    self.assertIsNotNone(req.kv.mamba_pool_idx)
+                    self._fill_mamba_state(
+                        pool, req.kv.mamba_pool_idx.unsqueeze(0), marker=29
+                    )
+                    old_state = self._snapshot_mamba_state(
+                        pool, req.kv.mamba_pool_idx.unsqueeze(0)
+                    )
+                reserved_slot = req.kv.mamba_pool_idx
+                self.assertEqual(
+                    pool.mamba_allocator.available_size(),
+                    available_before - (1 if held_slot else 2),
+                )
+                if occupied is not None:
+                    pool.mamba_allocator.free(occupied)
+                self.assertFalse(req.kv.mamba_needs_clear)
+                source_slot = _device_value(cache, leaf, ComponentType.MAMBA)
+                torch.testing.assert_close(req.kv.mamba_cow_src_index, source_slot)
+                self.assertNotEqual(source_slot.item(), reserved_slot.item())
+                transfers = [
+                    transfer
+                    for transfer in cache.cache_controller.load_queue[0].pool_transfers
+                    if transfer.name == PoolName.MAMBA
+                ]
+                self.assertEqual(len(transfers), 1)
+                torch.testing.assert_close(transfers[0].device_indices, source_slot)
+                self.assertEqual(
+                    cache.cache_controller.load_queue[0].device_indices.numel(),
+                    0 if aux_only else len(tokens),
+                )
+
+                # The request lock must survive release of the DMA load-back lock.
+                req.lock_receipt = cache.inc_lock_ref(req.last_node).to_dec_params()
+                self._finish_pending_loads(cache)
+                self.assertFalse(cache.ongoing_load_back)
+                cache.evict(EvictParams(mamba_num=pool.mamba_pool.size))
+                torch.testing.assert_close(
+                    _device_value(cache, leaf, ComponentType.MAMBA), source_slot
+                )
+                self.assertIs(req.kv.mamba_pool_idx, reserved_slot)
+                torch.testing.assert_close(
+                    self._snapshot_mamba_state(pool, reserved_slot.unsqueeze(0)),
+                    old_state,
+                )
+
+                # Only forward-stream CoW may overwrite the reserved request slot.
+                pool.write(
+                    (req.kv.req_pool_idx, slice(0, len(tokens))),
+                    cache.tree_core.collect_full_device_indices(
+                        req.last_node, cache.root_node_handle()
+                    ),
+                )
+                req.kv.kv_allocated_len = len(tokens)
+                self.assertIsNotNone(pool.alloc([req]))
+                batch = object.__new__(ScheduleBatch)
+                batch._collect_deferred_mamba_cow_and_clear([req])
+                self.assertIsNone(req.kv.mamba_cow_src_index)
+                self.assertFalse(req.kv.mamba_needs_clear)
+                forward_batch = SimpleNamespace(
+                    forward_mode=ForwardMode.EXTEND,
+                    mamba_clear_indices=batch.mamba_clear_indices,
+                    mamba_cow_src_indices=batch.mamba_cow_src_indices,
+                    mamba_cow_dst_indices=batch.mamba_cow_dst_indices,
+                )
+                runner = object.__new__(ModelRunner)
+                runner.req_to_token_pool = pool
+                runner.is_draft_worker = False
+                forward = torch.cuda.Stream()
+                forward.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(forward):
+                    runner._maybe_execute_deferred_mamba_cow_and_clear(forward_batch)
+                forward.synchronize()
+                torch.testing.assert_close(
+                    self._snapshot_mamba_state(
+                        pool, req.kv.mamba_pool_idx.unsqueeze(0)
+                    ),
+                    expected,
+                )
+                cache.dec_lock_ref(req.last_node, req.lock_receipt)
+                cache.sanity_check()
+
+    def test_load_back_marks_reused_inflight_mamba_slots_for_fencing(self):
+        from sglang.srt.runtime_context import get_context
+
+        if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:
+            self.skipTest("requires page_size=1 Full+Mamba")
+        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
+        chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
+        leaf = chain[-1]
+        self._backup_node(cache, leaf)
+        cache.evict(EvictParams(num_tokens=_node_key_length(cache, leaf)))
+        req = self._make_req(req_to_token_pool)
+        tokens = self._match_tokens_for_chain(cache, chain)
+        match = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", tokens)), req=req)
+        )
+        self._apply_match_to_req(req, match)
+        params = InitLoadBackParams(
+            best_match_node=req.best_match_node,
+            host_hit_length=req.host_hit_length,
+            req=req,
+        )
+        previous = req.kv.mamba_pool_idx
+        mamba = req_to_token_pool.mamba_allocator
+        remaining = mamba.alloc(mamba.available_size())
+        mamba.reset_reuse_tracking()
+        mamba.free(remaining)
+        self.assertFalse(mamba.needs_restore_fence)
+
+        with get_context().override_server_args(hicache_restore_backward_overlap=True):
+            loaded = cache.init_load_back(params)
+            self.assertIsNotNone(loaded)
+            self.assertGreater(loaded[0], 0)
+            self.assertTrue(mamba.needs_restore_fence)
+            self.assertTrue(cache.ongoing_load_back)
+            self.assertIs(req.kv.mamba_pool_idx, previous)
+            torch.testing.assert_close(
+                req.kv.mamba_cow_src_index,
+                _device_value(cache, leaf, ComponentType.MAMBA),
+            )
+        self._finish_pending_loads(cache)
+        self._release_ongoing_load_back_locks(cache)
+        cache.sanity_check()
+
     def test_prepare_load_back_mamba(self):
         if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:
             self.skipTest("requires page_size=1 Full+Mamba")

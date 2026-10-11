@@ -124,6 +124,7 @@ class DecodeKVCacheOffloadManager:
                 page_size=self.page_size,
                 tp_group=tp_group,
                 io_backend=get_memory().hicache_io_backend,
+                load_block_layers=get_memory().hicache_load_block_layers,
                 load_cache_event=threading.Event(),
                 storage_backend=get_memory().hicache_storage_backend,
                 model_name=get_serving().served_model_name,

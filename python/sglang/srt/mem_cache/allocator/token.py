@@ -46,20 +46,22 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
         self.free_group = None
         self.release_pages = torch.empty((0,), dtype=torch.int64, device=self.device)
+        if self._pending_free_count is not None:
+            self.reset_reuse_tracking()
 
     def available_size(self):
         # To avoid minor "len(free_pages) * 1" overhead
         return len(self.free_pages) + len(self.release_pages)
 
     def alloc(self, need_size: int):
-        if self.need_sort and need_size > len(self.free_pages):
+        if need_size > len(self.free_pages):
             self.merge_and_sort_free()
 
         if need_size > len(self.free_pages):
             return None
 
         select_index = self.free_pages[:need_size]
-        self.free_pages = self.free_pages[need_size:]
+        self._consume_free_pages(need_size)
         return select_index
 
     def free(self, free_index: torch.Tensor):
@@ -67,7 +69,9 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return
 
         if self.free_group is None:
-            if self.need_sort:
+            if self._pending_free_count is not None:
+                self._pending_free_count += len(free_index)
+            if self.need_sort or self._pending_free_count is not None:
                 self.release_pages = torch.cat((self.release_pages, free_index))
             else:
                 self.free_pages = torch.cat((self.free_pages, free_index))

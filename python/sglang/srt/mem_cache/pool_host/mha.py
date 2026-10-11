@@ -170,9 +170,9 @@ class MHATokenToKVPoolHost(HostKVCache):
             element_size=self.element_dim * self.dtype.itemsize,
         )
 
-        if self.layout == "page_first":
-            # Transpose [page, layer, ...] -> [layer, page, ...] to get per-layer views
-            # This swaps strides without copying data
+        if self.layout in ("page_first", "page_first_direct"):
+            # Select layers without copying: rows are tokens for page_first
+            # and whole pages for page_first_direct.
             k_transposed = self.k_buffer.transpose(0, 1)
             v_transposed = self.v_buffer.transpose(0, 1)
             self.k_data_refs = [k_transposed[i] for i in range(self.layer_num)]
@@ -308,6 +308,47 @@ class MHATokenToKVPoolHost(HostKVCache):
     @property
     def v_buffer(self):
         return self.kv_buffer[1]
+
+    def _block_dma_page_ids(self, indices: torch.Tensor) -> torch.Tensor:
+        from sglang.srt.mem_cache.pool_host.direct import load_block_dma_module
+
+        pages = load_block_dma_module().page_indices([(indices, self.page_size)])
+        return torch.from_dlpack(pages[0])
+
+    def load_to_device_layer_block(
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        layer_ids,
+        io_backend,
+        is_draft: bool = False,
+    ):
+        from sglang.srt.mem_cache.pool_host.direct import transfer_layer_block
+
+        assert not is_draft and not self.mtp_draft_device_pools
+        device_layers = [
+            buf[layer]
+            for layer in layer_ids
+            for buf in (device_pool.k_buffer, device_pool.v_buffer)
+        ]
+        if self.layout == "page_first_direct":
+            host_indices = self._block_dma_page_ids(host_indices)
+            device_indices = self._block_dma_page_ids(device_indices)
+            device_layers = [
+                buf.unflatten(0, (-1, self.page_size)) for buf in device_layers
+            ]
+        transfer_layer_block(
+            [
+                buf[layer]
+                for layer in layer_ids
+                for buf in (self.k_data_refs, self.v_data_refs)
+            ],
+            device_layers,
+            host_indices,
+            device_indices,
+            host_buffer=self.kv_buffer,
+        )
 
     def load_to_device_per_layer(
         self,

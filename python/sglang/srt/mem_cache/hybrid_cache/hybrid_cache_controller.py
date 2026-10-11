@@ -20,7 +20,6 @@ from sglang.srt.managers.cache_controller import (
     HiCacheController as BaseHiCacheController,
 )
 from sglang.srt.managers.cache_controller import (
-    LayerDoneCounter,
     PrefetchAck,
 )
 from sglang.srt.managers.cache_controller import (
@@ -217,6 +216,7 @@ class HybridCacheController(BaseHiCacheController):
         transfer_layer_id_max: Optional[int] = None,
         enable_storage_metrics: bool = False,
         host_memory_mode: str = "cache",
+        load_block_layers: int = 1,
     ):
         startup_storage_backend = storage_backend
         self.extra_host_mem_release_queues: dict[PoolName, Queue[torch.Tensor]] = {}
@@ -243,15 +243,9 @@ class HybridCacheController(BaseHiCacheController):
             storage_backend_extra_config=storage_backend_extra_config,
             enable_storage_metrics=enable_storage_metrics,
             host_memory_mode=host_memory_mode,
+            load_block_layers=load_block_layers,
+            transfer_layer_id_max=transfer_layer_id_max,
         )
-        # Hybrid transfer IDs span every component pool, including holes for
-        # uncached layers that the anchor pool alone cannot describe.
-        if (
-            transfer_layer_id_max is not None
-            and transfer_layer_id_max != self.transfer_layer_id_max
-        ):
-            self.transfer_layer_id_max = transfer_layer_id_max
-            self.layer_done_counter = LayerDoneCounter(self.transfer_layer_id_max)
 
         self.storage_host_pool = mem_pool_host.anchor_entry.host_pool
         if startup_storage_backend is not None:
@@ -354,6 +348,7 @@ class HybridCacheController(BaseHiCacheController):
         if not isinstance(self.mem_pool_host, HostPoolGroup):
             raise TypeError("Dynamic HiCache sidecars require HostPoolGroup.")
         self.mem_pool_host.add_entry(entry)
+        self.l2_transfer_engine.configure_batch_direct(self.mem_pool_host)
         if not entry.is_primary_index_anchor:
             self.extra_host_mem_release_queues.setdefault(entry.name, Queue())
         if self.enable_storage and self.storage_backend is not None:
@@ -857,20 +852,32 @@ class HybridCacheController(BaseHiCacheController):
                     layer_mapper=anchor.layer_mapper,
                 )
             )
-        for pool_transfer in pool_transfers or []:
+        # Sort Rust's unordered pools so cached DMA views and metadata are reusable.
+        for pool_transfer in sorted(
+            pool_transfers or [], key=lambda transfer: transfer.name
+        ):
             if (
                 pool_transfer.host_indices is None
                 or pool_transfer.device_indices is None
             ):
                 raise ValueError(f"Unresolved L2 transfer for {pool_transfer.name}.")
             entry = self.mem_pool_host.entry_map[pool_transfer.name]
+            layer_mapper = entry.layer_mapper
+            if (
+                self.l2_transfer_engine.batch_direct
+                and entry.name
+                in (PoolName.DRAFT, PoolName.DRAFT_SWA, PoolName.DRAFT_INDEXER)
+                and not entry.packed_draft_device_pools
+            ):
+                # Only batched restores drain independent draft layers beyond the target.
+                layer_mapper = None
             transfers.append(
                 L2Transfer(
                     host_pool=entry.host_pool,
                     device_pool=entry.device_pool,
                     host_indices=pool_transfer.host_indices,
                     device_indices=pool_transfer.device_indices,
-                    layer_mapper=entry.layer_mapper,
+                    layer_mapper=layer_mapper,
                 )
             )
         return transfers

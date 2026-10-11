@@ -174,7 +174,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def merge_and_sort_free(self):
         if not self.staged_pages:
             return
-        self.free_pages, _ = torch.sort(self.get_all_free_pages())
+        self.free_pages = self._sort_free_pages(self.get_all_free_pages())
         self.staged_pages = []
         self.num_staged_pages = 0
 
@@ -192,7 +192,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return None
 
         out_pages = self.free_pages[:num_pages]
-        self.free_pages = self.free_pages[num_pages:]
+        self._consume_free_pages(num_pages)
 
         out_indices = (
             out_pages[:, None] * self.page_size
@@ -273,7 +273,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 prefix_lens=prefix_lens_cpu,
             )
 
-        self.free_pages = self.free_pages[num_new_pages:]
+        self._consume_free_pages(num_new_pages)
         return out_indices
 
     def alloc_decode(
@@ -322,7 +322,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if self.debug_mode:
             assert len(torch.unique(out_indices)) == len(out_indices)
 
-        self.free_pages = self.free_pages[num_new_pages:]
+        self._consume_free_pages(num_new_pages)
         return out_indices
 
     def free(self, free_index: torch.Tensor):
@@ -362,6 +362,8 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return
 
         if self.free_group is None:
+            if self._pending_free_count is not None:
+                page_ids = self._copy_for_free_group(page_ids)
             self._release_page_ids(page_ids)
             if self.debug_mode:
                 self._debug_check_no_duplicate_pages()
@@ -373,7 +375,9 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         assert len(torch.unique(pages)) == len(pages)
 
     def _release_page_ids(self, *page_ids: torch.Tensor):
-        if self.need_sort:
+        if self._pending_free_count is not None:
+            self._pending_free_count += sum(ids.numel() for ids in page_ids)
+        if self.need_sort or self._pending_free_count is not None:
             self.staged_pages.extend(page_ids)
             self.num_staged_pages += sum(ids.numel() for ids in page_ids)
         else:
@@ -399,9 +403,11 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
         self.free_group = None
         self.free_page_ids_group = []
-        # need_sort only: freed pages wait here, unsorted, until an alloc runs short.
+        # Sorting must not interleave pending pages with the ready prefix.
         self.staged_pages: list[torch.Tensor] = []
         self.num_staged_pages = 0
+        if self._pending_free_count is not None:
+            self.reset_reuse_tracking()
 
     def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
         return self._kvcache.get_cpu_copy(
