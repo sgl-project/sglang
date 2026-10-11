@@ -1829,11 +1829,18 @@ class _WindowLockTree:
         self.locks[node] -= 1
         return DecLockRefResult()
 
+    def lock(self, node, skip_lock_components=()):
+        return TreeLock(node, self.inc_lock_ref(node).to_dec_params())
+
+    def unlock(self, lock):
+        if lock is not None:
+            self.dec_lock_ref(lock.node, lock.receipt)
+
     def init_load_back(self, params):
         self.swa_available -= params.req.swa_host_hit_length
         # The in-flight load holds its own lock until the H2D ack.
         self.inc_lock_ref(params.best_match_node)
-        return torch.arange(params.host_hit_length), params.best_match_node
+        return params.host_hit_length, params.best_match_node
 
 
 class TestHiCacheLoadBackSWAWindow(CustomTestCase):
@@ -1869,6 +1876,8 @@ class TestHiCacheLoadBackSWAWindow(CustomTestCase):
         tree_cache.swa_evictable_size.side_effect = tree.swa_evictable_size
         tree_cache.inc_lock_ref.side_effect = tree.inc_lock_ref
         tree_cache.dec_lock_ref.side_effect = tree.dec_lock_ref
+        tree_cache.lock.side_effect = tree.lock
+        tree_cache.unlock.side_effect = tree.unlock
         tree_cache.inc_host_lock_ref.return_value = IncLockRefResult()
         tree_cache.dec_host_lock_ref.return_value = DecLockRefResult()
         tree_cache.init_load_back.side_effect = tree.init_load_back
@@ -1904,7 +1913,10 @@ class TestHiCacheLoadBackSWAWindow(CustomTestCase):
         req.rid = rid
         req.cache_request_handle = CacheRequestHandle(rid, 0)
         req.priority = 0
-        req.prefix_indices = torch.arange(prefix_len)
+        req.prefix_len = prefix_len
+        # A spec=Req mock gets a per-instance class; derive extend_len like Req.
+        type(req).extend_len = Req.extend_len
+        req.extend_end = None
         req.full_untruncated_fill_ids = list(range(fill_len))
         req.output_ids = []
         req.sampling_params = SimpleNamespace(
@@ -1923,11 +1935,6 @@ class TestHiCacheLoadBackSWAWindow(CustomTestCase):
         req.last_node = last_node
         req.best_match_node = last_node
         req.kv = SimpleNamespace(cache_protected_len=prefix_len, holds_mamba=False)
-        req.set_extend_range = MagicMock(
-            side_effect=lambda start, end: setattr(
-                req, "extend_range", Range(start, end)
-            )
-        )
         return req
 
     def _admit_batch(self, *, swa_available):
@@ -1960,7 +1967,7 @@ class TestHiCacheLoadBackSWAWindow(CustomTestCase):
 
     def _assert_allocatable(self, tree, adder):
         # alloc_for_extend takes every admitted extend from free + evictable SWA.
-        demand = sum(req.extend_range.length for req in adder.can_run_list)
+        demand = sum(req.extend_len for req in adder.can_run_list)
         self.assertLessEqual(demand, tree.swa_available + tree.swa_evictable_size())
 
     def test_load_back_waits_when_its_window_lock_overcommits_swa(self):
@@ -1970,7 +1977,7 @@ class TestHiCacheLoadBackSWAWindow(CustomTestCase):
         self.assertIs(verdict, AddReqResult.NO_TOKEN)
         # A refused candidate starts no H2D and leaves no lock behind.
         adder.tree_cache.init_load_back.assert_not_called()
-        loaded.set_extend_range.assert_not_called()
+        self.assertIsNone(loaded.extend_end)
         self.assertEqual(+tree.locks, Counter())
         self.assertEqual(
             tree.swa_evictable_size(),
