@@ -20,7 +20,6 @@ from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.flux import (
     FluxAdapter,
     FluxExecutor,
 )
-from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.flux import FluxAdapter
 from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.zimage import (
     ZImageAdapter,
 )
@@ -355,6 +354,8 @@ def test_unbatched_forward_is_a_single_request() -> None:
     av = [torch.zeros(2, 16, 1, 4, 4), torch.zeros(2, 8, 4)]
     ex(av, torch.tensor([0.5, 0.5]), torch.zeros(2, 3, 8))
     assert len(adapter.calls) == 2 and adapter.calls[1][0] is av
+
+
 def _pack_flux(**kwargs):
     x = torch.zeros(2, 16, 8, 8)
     return FluxAdapter().pack(
