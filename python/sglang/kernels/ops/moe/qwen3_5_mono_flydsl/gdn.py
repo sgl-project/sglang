@@ -109,6 +109,7 @@ class K1Build:
     first: bool = False  # the model's first layer: no residual (residual := hidden)
     eps: float = 1e-6  # input_layernorm
     norm_eps: float = 1e-6  # the gated norm
+    state_bf16: bool = False  # bf16 recurrent state: fp32 math, rounded on store
     diag: bool = False  # bounded waits recording into ``diag`` (debug)
     # debug: run phases < stop only (1 front, 2 in_proj, 3 gdn)
     stop: int = 99
@@ -324,12 +325,14 @@ def gdn_stage(c, t, h, ch):
     # recurrence: thread -> state row ch 16 + tid / 32, K columns (tid % 32) 4 ..
     vr = ch * VCH + tid // 32
     k["head_off"] = (h * HD + vr) * HD + (tid % 32) * 4
-    k["sbase"] = (
-        a["rstate"] + fx.Int64(fx.max(k["slot"], 0)) * fx.Int64(a["rs_seq"]) * 4
+    sbf = c["state_bf16"]
+    k["sbase"] = a["rstate"] + fx.Int64(fx.max(k["slot"], 0)) * fx.Int64(
+        a["rs_seq"]
+    ) * (2 if sbf else 4)
+    st = bo.buffer_load(
+        rsrc(k["sbase"]), k["head_off"], vec_width=4, dtype=T.bf16 if sbf else T.f32
     )
-    k["st"] = fx.Vector(
-        bo.buffer_load(rsrc(k["sbase"]), k["head_off"], vec_width=4, dtype=T.f32)
-    )
+    k["st"] = fx.Vector(st).to(fx.Float32) if sbf else fx.Vector(st)
     k["a_log"] = ld_f32(a["a_log"], h)
     k["dtb"] = ld_bf(a["dt_bias"], h)
     return k
@@ -421,12 +424,11 @@ def gdn_recur(c, k, t, h, ch):
     o = stv[0] * qv[0] + stv[1] * qv[1] + stv[2] * qv[2] + stv[3] * qv[3]
     o = bf16_round(butterfly(o, (16, 8, 4, 2, 1)))
     o = live.select(o, fx.Float32(0.0))
+    new = fx.Vector.from_elements(stv, fx.Float32)
+    if const_expr(c["state_bf16"]):
+        new = new.to(fx.BFloat16)
     if live:
-        bo.buffer_store(
-            fx.Vector.from_elements(stv, fx.Float32),
-            rsrc(k["sbase"]),
-            k["head_off"],
-        )
+        bo.buffer_store(new, rsrc(k["sbase"]), k["head_off"])
     if lane % 32 == 0:
         fx.ptr_store(o, c["ol"] + v)
     gpu.barrier()
@@ -508,7 +510,10 @@ def build(key: K1Build):
         red: fx.Array[fx.Float32, THREADS * 4, 16]
 
     keyed = key_tuple(key, digest())
-    name = f"qwen38_mono_k1_s{s}_f{int(key.first)}_g{int(key.diag)}_p{key.stop}"
+    name = (
+        f"qwen38_mono_k1_s{s}_f{int(key.first)}_b{int(key.state_bf16)}"
+        f"_g{int(key.diag)}_p{key.stop}"
+    )
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def k1(
@@ -553,6 +558,7 @@ def build(key: K1Build):
             "lane": tid % 64,
             "wave": tid // 64,
             "first": key.first,
+            "state_bf16": key.state_bf16,
             "eps": key.eps,
             "norm_eps": key.norm_eps,
             "put": mb.put,
@@ -684,9 +690,9 @@ def gdn_pre(
     """Host launcher; every weight as vLLM holds it after loading. ``residual``
     None on the first layer (``key.first``). ``conv_state`` [slots, dim, 3] or a
     transposed view of [slots, 3, dim] (strides read); ``rstate`` [slots, 16,
-    128, 128] fp32, a slot dense, slots strided; ``st_idx`` [>= S] int32, <= 0 a
-    pad row; ``epoch`` a device int32 bumped once a step, ``layer`` this
-    launch's slot below ``TAG_SLOTS``."""
+    128, 128] fp32 (bf16 with ``key.state_bf16``), a slot dense, slots strided;
+    ``st_idx`` [>= S] int32, <= 0 a pad row; ``epoch`` a device int32 bumped
+    once a step, ``layer`` this launch's slot below ``TAG_SLOTS``."""
     s = key.tokens
     bf = torch.bfloat16
     need((residual is None) == key.first, "residual given iff not the first layer")
@@ -704,9 +710,10 @@ def gdn_pre(
         conv_state.dtype == bf and conv_state.shape[1:] == (L.CONV, SL),
         "conv state: bf16 [slots, 2560, 3]",
     )
+    sdt = bf if key.state_bf16 else torch.float32
     need(
-        rstate.dtype == torch.float32 and rstate.shape[1:] == (NV, HD, HD),
-        "recurrent state: fp32 [slots, 16, 128, 128]",
+        rstate.dtype == sdt and rstate.shape[1:] == (NV, HD, HD),
+        f"recurrent state: {sdt} [slots, 16, 128, 128]",
     )
     need(rstate[0].is_contiguous(), "a recurrent state slot must be dense")
     need(a_log.dtype == torch.float32 and dt_bias.dtype == bf, "A_log / dt_bias dtype")

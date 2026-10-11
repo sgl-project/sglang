@@ -160,6 +160,72 @@ class GdnPreTest(CustomTestCase):
                 self.assertTrue(torch.equal(rstate[keep], rstate0[keep]))
                 self.assertTrue(torch.equal(conv[keep], conv0[keep]))
 
+    def test_bf16_state_is_fp32_math_rounded(self):
+        """A bf16 state runs the fp32 recurrence on the widened state and stores
+        it rounded: the same core and conv state as the fp32 kernel, and the
+        fp32 kernel's new state in bf16, bit for bit."""
+        from sglang.kernels.ops.moe.qwen3_5_mono_flydsl import gdn
+        from sglang.kernels.ops.moe.qwen3_5_mono_flydsl.layout import (
+            BA,
+            CONV,
+            CORE,
+            HD,
+            HIDDEN,
+            NV,
+            QKVZ,
+        )
+
+        g = torch.Generator(device="cuda").manual_seed(1)
+
+        def rnd(*shape, scale=1.0, dtype=BF):
+            return (torch.randn(*shape, generator=g, device="cuda") * scale).to(dtype)
+
+        s, slots = 4, 8
+        w = {
+            "hidden": rnd(s, HIDDEN, scale=2.0),
+            "residual": rnd(s, HIDDEN, scale=2.0),
+            "ln_w": rnd(HIDDEN, scale=0.1),
+            "w_qkvz": rnd(QKVZ, HIDDEN, scale=0.02),
+            "w_ba": rnd(BA, HIDDEN, scale=0.05),
+            "conv_w": rnd(CONV, 1, 4, scale=0.4),
+            "a_log": rnd(NV, scale=0.5, dtype=torch.float32),
+            "dt_bias": rnd(NV, scale=0.5),
+            "norm_w": (1 + rnd(HD, scale=0.1, dtype=torch.float32)).to(BF),
+        }
+        conv = rnd(slots, CONV, 3)
+        state = rnd(slots, NV, HD, HD, scale=0.05)
+        idx = torch.tensor([1, 2, -1, 4], dtype=torch.int32, device="cuda")
+        out = {}
+        for bf in (False, True):
+            key = gdn.K1Build(tokens=s, state_bf16=bf)
+            out[bf] = {
+                "conv": conv.clone(),
+                "rstate": state.clone() if bf else state.float(),
+                "core": torch.empty(s, CORE, dtype=BF, device="cuda"),
+                "res_out": torch.empty(s, HIDDEN, dtype=BF, device="cuda"),
+            }
+            o = out[bf]
+            gdn.gdn_pre(
+                key,
+                **w,
+                res_out=o["res_out"],
+                conv_state=o["conv"],
+                rstate=o["rstate"],
+                st_idx=idx,
+                core=o["core"],
+                scratch=torch.zeros(
+                    gdn.scratch_bytes(key), dtype=torch.uint8, device="cuda"
+                ),
+                epoch=torch.ones(1, dtype=torch.int32, device="cuda"),
+                layer=0,
+            )
+        torch.cuda.synchronize()
+        f32, b16 = out[False], out[True]
+        self.assertFalse(torch.equal(b16["rstate"], state))
+        for name in ("core", "res_out", "conv"):
+            self.assertTrue(torch.equal(f32[name], b16[name]), name)
+        self.assertTrue(torch.equal(f32["rstate"].to(BF), b16["rstate"]))
+
 
 if __name__ == "__main__":
     unittest.main()

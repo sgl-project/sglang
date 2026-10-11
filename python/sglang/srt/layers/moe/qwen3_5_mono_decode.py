@@ -14,8 +14,8 @@ two persistent launches:
 
 The decode CUDA graph captures the step per batch size; any other step takes
 the stock layers. Needs the shared expert unfused
-(``--disable-shared-experts-fusion``). K1 also needs an fp32 SSM state (no
-``--mamba-ssm-dtype bfloat16``) and no ReplaySSM ring.
+(``--disable-shared-experts-fusion``). K1 also needs an fp32 or bf16 SSM
+state and no ReplaySSM ring.
 
 With speculative decoding, a target-verify step of at most ``MAX_TOKENS``
 rows (batch x draft tokens) runs K2 only: K1 writes no per-draft-token state
@@ -189,8 +189,8 @@ class MonoDecode:
                 if a.A_log.dtype != torch.float32:
                     return "A_log not fp32"
                 st = pool.mamba2_layer_cache(a.layer_id)
-                if st.temporal.dtype != torch.float32:
-                    return "SSM state not fp32 (drop --mamba-ssm-dtype bfloat16)"
+                if st.temporal.dtype not in (torch.float32, bf):
+                    return f"SSM state {st.temporal.dtype}"
                 if getattr(st, "replayssm_d", None) is not None:
                     return "ReplaySSM ring"
                 if st.conv[0].dtype != bf or st.conv[0].shape[1:] != (
@@ -303,6 +303,7 @@ class MonoDecode:
                 first=residual is None,
                 eps=layer.input_layernorm.variance_epsilon,
                 norm_eps=a.norm.eps,
+                state_bf16=st.temporal.dtype == torch.bfloat16,
             ),
             hidden=h,
             residual=residual,
