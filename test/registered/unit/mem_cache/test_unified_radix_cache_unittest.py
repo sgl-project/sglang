@@ -11175,7 +11175,7 @@ class TestSWACacheWindowMargin(CustomTestCase):
         req.origin_input_ids = array("q", tokens)
         req.output_ids = array("q")
         req.full_untruncated_fill_ids = array("q", tokens)
-        req.set_extend_range(0, self.prompt_len)
+        req.extend_end = self.prompt_len
         req_to_token_pool.write(
             (req.kv.req_pool_idx, slice(0, self.prompt_len)),
             self._alloc(allocator, self.prompt_len),
@@ -11183,7 +11183,7 @@ class TestSWACacheWindowMargin(CustomTestCase):
         req.kv.kv_committed_len = self.prompt_len
         req.last_node = cache.root_node_handle()
         req.kv.cache_protected_len = 0
-        req.lock_receipt = DecLockRefParams()
+        req.lock = None
         req.extra_key = None
         return req, tokens
 
@@ -11204,7 +11204,7 @@ class TestSWACacheWindowMargin(CustomTestCase):
         match = cache.match_prefix(
             MatchPrefixParams(key=RadixKey(array("q", next_turn)))
         )
-        return len(match.device_indices)
+        return match.device_prefix_len
 
     def test_next_turn_matches_short_of_the_cached_prompt(self):
         for margin, expected in ((0, 0), (self.template_cut, 21)):
@@ -11222,7 +11222,7 @@ class TestSWACacheWindowMargin(CustomTestCase):
                     len(_node_token_ids(cache, req.last_node)),
                     self.cfg.sliding_window_size + margin,
                 )
-                cache.dec_lock_ref(req.last_node, req.lock_receipt)
+                cache.unlock(req.lock)
                 self.assertEqual(self._next_turn_match_len(cache, tokens), expected)
                 cache.sanity_check()
 
