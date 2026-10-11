@@ -3,13 +3,14 @@
 """DeepSeek-V4.1-Flash mono decode layer: host side.
 
 One ``DSV41MonoLayer`` a TP rank runs every mono layer of a decode step (M <= 48
-rows): a layer whose attention vLLM runs (``ffn``) takes one persistent launch
-(``layer``) from its unreduced attention output to its outputs at the next
-attention seam -- the MoE's reduced output, the residual after the FFN seam and
-that seam's mixes -- with both TP all-reduces inside the kernel (symmetric peer
-memory). Every argument is a device pointer: the launches can be captured in a
-HIP graph. The kernels move their mailbox epoch on themselves; every rank runs
-the same launches, so the ranks' epochs agree.
+rows): the FFN launch (``ffn``) from the layer's unreduced attention output to
+the MoE's reduced output, the residual after the FFN seam and that seam's mixes,
+with both TP all-reduces inside the kernel (symmetric peer memory). K1, launched
+by the model glue, writes its outputs into this runner's buffers (``q``,
+``res_mid``, ``post_a``, ``comb_a``, ``pre_a``). Every argument is a device
+pointer: the launches can be captured in a HIP graph. The kernels move their
+mailbox epoch on themselves; every rank runs the same launches, so the ranks'
+epochs agree.
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ from pathlib import Path
 
 import torch
 
+from .attention.plan import HEAD_DIM, KEYS, Dims
 from .common.plan import BLOCKS
 from .layer import (
     EPOCH_WORDS,
@@ -113,10 +115,24 @@ class DSV41MonoLayer:
         from .common.peer_memory import PeerBuffer
 
         self.tp, self.rank = tp, rank
+        self.d = Dims(tp)
         dev = self.device = torch.device(device)
         self._scratch: dict[int, torch.Tensor] = {}
         # [epoch, -, -, -, a mark per CTA, the MoE's counters]
         self.epoch = torch.zeros(EPOCH_WORDS, dtype=torch.int32, device=dev)
+        self.q = torch.zeros(
+            MAX_TOKENS, self.d.heads, HEAD_DIM, dtype=torch.bfloat16, device=dev
+        )
+        self.kt = torch.zeros(MAX_TOKENS * KEYS, dtype=torch.int32, device=dev)
+        self.klen = torch.zeros(2 * MAX_TOKENS, dtype=torch.int32, device=dev)
+        self._dummy = torch.zeros(4, dtype=torch.int32, device=dev)
+        # K1's outputs: the attention seam's residual and mixes
+        self.res_mid = torch.zeros(
+            MAX_TOKENS, HC, HIDDEN, dtype=torch.bfloat16, device=dev
+        )
+        self.post_a = torch.zeros(MAX_TOKENS, HC, dtype=torch.float32, device=dev)
+        self.comb_a = torch.zeros(MAX_TOKENS, HC, HC, dtype=torch.float32, device=dev)
+        self.pre_a = torch.zeros(MAX_TOKENS, HC, dtype=torch.float32, device=dev)
         self.peer = PeerBuffer(2 * peer_half_bytes(tp), group, rank, tp, dev)
         self.peer.bytes.zero_()
         self._kernels: dict = {}
@@ -145,7 +161,7 @@ class DSV41MonoLayer:
     def ffn_kernel(self, tokens: int):
         key = (tokens, "ffn")
         if key not in self._kernels:
-            self._kernels[key] = build_mono_ffn(MonoBuild(tokens, self.tp))
+            self._kernels[key] = build_mono_ffn(MonoBuild(tokens, self.tp, 0))
         return self._kernels[key]
 
     @staticmethod

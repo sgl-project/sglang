@@ -1638,6 +1638,9 @@ class Envs:
     # gfx950 DeepSeek-V4.1 decode steps of <= 48 rows: each layer's attention all-reduce, FFN mHC seam,
     # MoE and MoE all-reduce run as one persistent FlyDSL launch (models/deepseek_common/amd/dsv41_mono).
     SGLANG_ROCM_MONO_DECODE = EnvBool(False)
+    # with SGLANG_ROCM_MONO_DECODE: on the standard layers (no compressor or indexer), the attention mHC
+    # seam and the attention front (wqkv, q / kv norms, RoPE, SWA KV insert, wq_b) run as one launch too
+    SGLANG_ROCM_MONO_K1 = EnvBool(False)
 
     # cache, GEMM, and distributed
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)

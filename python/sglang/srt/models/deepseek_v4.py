@@ -2171,7 +2171,10 @@ class MQALayer(MqaAttentionBase):
         forward_batch: ForwardBatch,
         x_quant: Optional[torch.Tensor] = None,
         defer_all_reduce: bool = False,
+        mono_q: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, mhc.AttnOutput]:
+        """``mono_q``: the roped q of the mono K1 launch, which also stored the step's KV rows; then ``x``
+        only gives the row count."""
         if not get_attn_tp_context().input_scattered and x.shape[0] == 0:
             return x
 
@@ -2328,7 +2331,12 @@ class MQALayer(MqaAttentionBase):
                 q_out = q_padded[:, tp_slice, :]
         attn_sink = self._local_attn_sink(kernel_num_heads)
 
-        if enable_multi_stream:
+        if mono_q is not None:
+            assert not unified and q_out is None and q_padded is None, (
+                "mono K1 needs the unpadded bf16 q of the paged SWA path"
+            )
+            q, kv = mono_q, None
+        elif enable_multi_stream:
             # Multi-stream path always fuses cache write into the K kernel,
             # so the bf16 KV intermediate is gone.
             if _is_hip:
@@ -5373,6 +5381,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
 
         if not is_nextn:
+            dsv41_mono_decode.stash_k1_weights(self.model.layers)
             for i, layer in enumerate(self.model.layers):
                 if getattr(layer, "engram", None) is not None:
                     layer.engram.embed.finish_load(label=f"layer {i}")

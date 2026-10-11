@@ -162,8 +162,11 @@ def slice_row(c, c0, e, got):
     for h in range_constexpr(1, HC - 1):
         v = v + cm[h] * r[h]
     # bf16 R_new is what the collapse, the sums of squares and the
-    # mix projection all read
-    v = bf16_round(fma(cm[HC - 1], r[HC - 1], v))
+    # mix projection all read; SGLang's Triton boundary has no fma
+    if const_expr(c.get("sgl", False)):
+        v = bf16_round(v + cm[HC - 1] * r[HC - 1])
+    else:
+        v = bf16_round(fma(cm[HC - 1], r[HC - 1], v))
     bo.buffer_store(v.to(fx.BFloat16), rsrc(a["res_out"]), (t * HC + o) * HIDDEN + col)
     fx.ptr_store(v, c["rl"] + (t * KT + o * COLS + e % COLS))
 
@@ -339,16 +342,34 @@ def stage_norm(c, t, store):
         for k in range_constexpr(4):
             v += [bf_lo(words[k][0]), bf_hi(words[k][0])]
         xs.append([(cols[ch] < HIDDEN).select(x, fx.Float32(0.0)) for x in v])
-    acc = fx.Float32(0.0)
-    for ch in range_constexpr(3):
-        for x in xs[ch]:
-            acc = acc + x * x
-    acc = butterfly(acc, (1, 2, 4, 8, 16, 32))
+    sgl = c.get("sgl", False)
+    if const_expr(sgl):
+        # SGLang's rmsnorm_fake_quant_row tree: per column (c0^2 + c1^2) + c2^2,
+        # the 8 columns as ((0+2)+(4+6)) + ((1+3)+(5+7)), the wave's
+        # DPP rows 8, 4, 2, 1 then 16, 32, the waves as (w0+w2) + (w1+w3)
+        e = [
+            fma(xs[2][j], xs[2][j], fma(xs[0][j], xs[0][j], xs[1][j] * xs[1][j]))
+            for j in range(8)
+        ]
+        acc = ((e[0] + e[2]) + (e[4] + e[6])) + ((e[1] + e[3]) + (e[5] + e[7]))
+        acc = butterfly(acc, (8, 4, 2, 1, 16, 32))
+    else:
+        acc = fx.Float32(0.0)
+        for ch in range_constexpr(3):
+            for x in xs[ch]:
+                acc = acc + x * x
+        acc = butterfly(acc, (1, 2, 4, 8, 16, 32))
     if (lane == 0) & mine:
         fx.ptr_store(acc, red + wave)
     gpu.barrier()
-    tot = butterfly(fx.ptr_load(red + lane % 4), (1, 2))
-    r = hw_rsq(fma(tot, fx.Float32(1.0 / HIDDEN), fx.Float32(EPS)))
+    if const_expr(sgl):
+        # rstd = 1 / sqrt_rn(sum / K + eps), IEEE division and sqrt
+        tot = butterfly(fx.ptr_load(red + lane % 4), (2, 1))
+        var = tot / fx.Float32(float(HIDDEN)) + fx.Float32(EPS)
+        r = fx.Float32(1.0) / fx.Float32(fmath.sqrt(var))
+    else:
+        tot = butterfly(fx.ptr_load(red + lane % 4), (1, 2))
+        r = hw_rsq(fma(tot, fx.Float32(1.0 / HIDDEN), fx.Float32(EPS)))
     for ch in range_constexpr(3):
         col = fx.min(cols[ch], HIDDEN - 8)
         ys = [

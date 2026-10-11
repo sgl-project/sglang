@@ -1,13 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""The mono decode layer's FFN launch, for a layer whose attention vLLM runs: a
-push of vLLM's unreduced wo_b output to every rank (``seam.stage_push``) + the
-FFN seam (the TP sum folded in) + the MoE (``stages.moe``, its all-reduce
-in-kernel too).
+"""The mono decode layer's two launches: K1 = the attention seam (``stages.seam``:
+slice, gate, the norm into the attention's MXFP8) + the attention front
+(``attention.front``); the FFN launch = a push of the attention's unreduced wo_b
+output to every rank (``seam.stage_push``) + the FFN seam (the TP sum folded in)
++ the MoE (``stages.moe``, its all-reduce in-kernel too).
 
-Tags: the launch's hand-offs carry 2 e + 2 (e: the epoch, moved on by the
-launch's CTA 0 at its end). Peer regions alternate by e's parity; every rank
-runs the same launches, so the epochs agree across ranks.
+Tags: K1's hand-offs carry 2 e + 1, the FFN launch's 2 e + 2 (e: the epoch,
+moved on by the FFN launch's CTA 0 at its end), so the FFN seam may reuse K1's
+seam regions. Peer regions alternate by e's parity; every rank runs the same
+launches, so the epochs agree across ranks.
 """
 
 from dataclasses import dataclass
@@ -15,12 +17,15 @@ from dataclasses import dataclass
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
-from flydsl.expr import const_expr, gpu, range_constexpr
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int32, Int64, T
 
+from .attention import front as mb_front
+from .attention.plan import Dims, back_scratch, front_scratch
 from .common.epoch import EPOCH_MARKS, epoch_begin, epoch_end, gstore, kernel_symbol
-from .common.ops import CM_DEV, peer_bases, rsrc, traced
-from .common.plan import BLOCKS, THREADS, WAVES, cdiv, first_task, key_tuple
+from .common.mx import clamp_fp8
+from .common.ops import CM_DEV, butterfly, fp8_pack4, peer_bases, rsrc, traced
+from .common.plan import BLOCKS, THREADS, WAVES, first_task, key_tuple
 from .common.sync import Mailbox, publish, sreg
 from .sources import SOURCES
 from .stages import moe, seam
@@ -30,7 +35,13 @@ from .stages.moe_shape import SORT_NETS, MoeBuild, route_shape
 _STREAM = fx.Stream(None)
 MAX_TOKENS = 48
 HIDDEN = seam.HIDDEN
+X_WORDS = HIDDEN // 4
+X_GROUPS = HIDDEN // 32
 SLICES = seam.SLICES  # 160
+# K1's MXFP8 x and the MoE's: plain words in both, the same size, so the two
+# launches share the MoE's (placed later); any other name is one region, so a
+# word is never a tag to one launch and data to another
+SHARED_REGIONS = ("x8", "x8s")
 COUNTER_WORDS = 2 * 256  # the MoE's ug queue and down counts, a word a slot
 COUNTERS = ("ugq", "dq")
 # the epoch buffer, in words: the epoch, a mark a CTA (epoch.EPOCH_MARKS), then on
@@ -43,46 +54,26 @@ EPOCH_WORDS = EPOCH_COUNTERS + COUNTER_WORDS
 class MonoBuild:
     tokens: int
     tp: int
+    ratio: int  # the layer's compress ratio (its attention's key sources)
+    timeline: bool = False
 
 
 def _moe_key(key: MonoBuild) -> MoeBuild:
     return MoeBuild(tokens=key.tokens, tp=key.tp)
 
 
-def _end(sizes) -> int:
-    """The end of regions of these byte sizes, laid out in order 256-aligned."""
-    off = 0
-    for n in sizes:
-        off = -(-off // 256) * 256 + n
-    return off
-
-
-def _attn_bytes(s: int, tp: int) -> tuple:
-    """Byte sizes of the attention launches of vllm-project/vllm#60397, which
-    this package does not include. They stay reserved so that every FFN
-    scratch offset matches the tested layout."""
-    heads, groups = 64 // tp, 8 // tp
-    q_rows, o_rows = heads * 512, groups * 1024
-    chunk = 64 if heads // 16 == 2 and s * cdiv(640, 64) <= 256 else 128
-    n = s * cdiv(640, chunk)
-    front = _end(
-        [s * HIDDEN, s * HIDDEN // 8, 16 * s, 16 * s * 1792, s * 1280, s * 160, 8 * s]
-    )
-    back = _end(
-        [n * heads * 1024, n * heads * 8, n * 8, s * q_rows, s * q_rows // 8,
-         s * heads, s * o_rows, s * o_rows // 8, o_rows // 4]
-    )  # fmt: skip
-    return front, back
+def _front_key(key: MonoBuild):
+    return mb_front.FrontBuild(key.tokens, key.tp, key.ratio, key.timeline)
 
 
 def scratch_layout(s: int, tp: int) -> dict:
-    """Every region of step width s's launch -> (byte offset, bytes), disjoint:
-    the seam's, the MoE's regions, the normed rows and their flags. Each width
-    has a scratch of its own (``DSV41MonoLayer.scratch``): under another width's
-    layout a mailbox pair's tag word could be plain data, which a poll may take
-    for a current tag. The MoE's counters, whose slots outlive a step width,
-    are in the epoch buffer."""
-    front, back = _attn_bytes(s, tp)
+    """Every region of step width s's launches -> (byte offset, bytes), disjoint:
+    K1's front and seam, the attention back's (``plan.back_scratch``), the MoE's
+    regions, the normed rows and their flags. Each width has a scratch of its own (``DSV41MonoLayer.scratch``):
+    under another width's layout a mailbox pair's tag word could be plain data,
+    which a poll may take for a current tag. The MoE's counters, whose slots
+    outlive a step width, are in the epoch buffer."""
+    d = Dims(tp)
     out: dict = {}
     off = 0
 
@@ -90,15 +81,15 @@ def scratch_layout(s: int, tp: int) -> dict:
         nonlocal off
         base = off
         for name, (o, n) in regions.items():
-            assert name not in out, name
+            assert name not in out or name in SHARED_REGIONS, name
             out[name] = (base + o, n)
         off = max(off, base + max(o + n for o, n in regions.values()))
         off = -(-off // 256) * 256
 
-    place({"attn_front": (0, front)})
+    place(front_scratch(s, d))
     place(seam.scratch_layout(s))
-    place({"attn_back": (0, back)})
-    regions = moe.scratch_layout(_moe_key(MonoBuild(s, tp))).items()
+    place(back_scratch(s, d, start=0))
+    regions = moe.scratch_layout(_moe_key(MonoBuild(s, tp, 1))).items()
     mr = {n: v for n, v in regions if n not in COUNTERS}
     lo = min(o for o, _ in mr.values())
     place({n: (o - lo, n_) for n, (o, n_) in mr.items()})
@@ -117,6 +108,289 @@ def peer_half_bytes(tp: int) -> int:
 
 def _epoch(epoch):
     return fx.Int32(bo.buffer_load(rsrc(epoch), 0, vec_width=1, dtype=T.i32))
+
+
+# ---------------------------------------------------------------- K1
+
+
+@traced
+def store_x8(c, t, col, ys, live):
+    """The attention seam's norm output (``seam.stage_norm``'s 8 columns at
+    ``col``) -> vLLM's MXFP8 of each 32 (the attention's input quant) -> the
+    front's X8 / X8S, plain at device scope."""
+    amax = abs(ys[0])
+    for y in ys[1:]:
+        amax = fx.max(amax, abs(y))
+    code = moe.vllm_mx_code(butterfly(amax, (1, 2), fx.max))
+    mul = ((254 - code) << 23).bitcast(fx.Float32)
+    w0 = fp8_pack4(*[clamp_fp8(ys[i] * mul) for i in range(4)])
+    w1 = fp8_pack4(*[clamp_fp8(ys[4 + i] * mul) for i in range(4)])
+    if live:
+        bo.buffer_store(
+            fx.Vector.from_elements([w0, w1], fx.Int32),
+            rsrc(c["x8"]),
+            t * X_WORDS + col // 4,
+            cache_modifier=CM_DEV,
+        )
+        if c["tid"] % 4 == 0:
+            bo.buffer_store(
+                code, rsrc(c["x8s"]), t * X_GROUPS + col // 32, cache_modifier=CM_DEV
+            )
+
+
+@traced
+def publish_x8(c, t):
+    """Token t's two XRDY flags (one a wqkv K half) once its X8 / X8S landed."""
+    rocdl.s_waitcnt(vmcnt=0)
+    gpu.barrier()
+    if c["tid"] < 2:
+        c["mb"].put(c["xrdy"], 2 * t + c["tid"], fx.Int32(1))
+    gpu.barrier()
+
+
+def build_mono_k1(key: MonoBuild):
+    s, tp = key.tokens, key.tp
+    assert 1 <= s <= MAX_TOKENS
+    layout = scratch_layout(s, tp)
+    fkey = _front_key(key)
+    FrontLds = mb_front.front_lds(s, Dims(tp))
+    NORM0 = SLICES  # the norms on the CTAs past the slices: the wqkv waits on them
+    GATE0 = SLICES + s
+    assert GATE0 + s <= BLOCKS
+
+    @fx.struct
+    class SeamLds:
+        red: fx.Array[fx.Float32, WAVES * 2 * 64 * 4, 16]
+        rl: fx.Array[fx.Float32, s * seam.KT, 16]
+        fl: fx.Array[fx.Float32, seam.MIX * seam.KT, 16]
+
+    @fx.union
+    class K1Lds:
+        seam: SeamLds
+        front: FrontLds  # type: ignore[valid-type]
+
+    name = kernel_symbol("dsv41_mono_k1", s=s, tp=tp, r=key.ratio, tl=key.timeline)
+    keyed = key_tuple(key, SOURCES)
+
+    @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
+    def k1(
+        res_in: Int64,
+        pend: Int64,
+        post_in: Int64,
+        comb_in: Int64,
+        pre_in: Int64,
+        hc_fn: Int64,
+        hc_scale: Int64,
+        hc_base: Int64,
+        attn_w: Int64,
+        res_out: Int64,
+        post_out: Int64,
+        comb_out: Int64,
+        pre_out: Int64,
+        wqkv: Int64,
+        wqkv_s: Int64,
+        qn_w: Int64,
+        kvn_w: Int64,
+        wqb: Int64,
+        wqb_s: Int64,
+        cos_sin: Int64,
+        pos: Int64,
+        slot: Int64,
+        swa: Int64,
+        swa_stride: Int64,
+        swa_block: Int32,
+        q: Int64,
+        swa_idx: Int64,
+        swa_lens: Int64,
+        comp_block: Int32,
+        comp_bt: Int64,
+        bt_stride: Int32,
+        topk: Int64,
+        t2r: Int64,
+        kt: Int64,
+        klen: Int64,
+        scratch: Int64,
+        epoch: Int64,
+        tl: Int64,
+    ):
+        _ = keyed
+        bid = fx.block_idx.x
+        lds = fx.SharedAllocator().allocate(K1Lds)
+        sl = lds.seam.peek()
+        ep = _epoch(epoch)
+        tag = (ep << 1) + 1
+        fargs = {
+            "x": 0,
+            "x_stride": 0,
+            "wqkv": wqkv,
+            "wqkv_s": wqkv_s,
+            "qn_w": qn_w,
+            "kvn_w": kvn_w,
+            "wqb": wqb,
+            "wqb_s": wqb_s,
+            "cos_sin": cos_sin,
+            "pos": pos,
+            "slot": slot,
+            "swa": swa,
+            "swa_stride": swa_stride,
+            "swa_block": swa_block,
+            "q": q,
+            "swa_idx": swa_idx,
+            "swa_lens": swa_lens,
+            "comp_block": comp_block,
+            "comp_bt": comp_bt,
+            "bt_stride": bt_stride,
+            "topk": topk,
+            "t2r": t2r,
+            "kt": kt,
+            "klen": klen,
+        }
+        flayout = {n: layout[n] for n in front_scratch(s, Dims(tp))}
+        c = mb_front.front_context(fkey, lds.front.peek(), fargs, scratch, tag, flayout)
+        amb = Mailbox(tag)
+        tid = fx.thread_idx.x
+        ca = {
+            "S": s,
+            "tid": tid,
+            "bid": bid,
+            "lane": tid % 64,
+            "wave": tid // 64,
+            "rl": sl.rl.ptr,
+            "fl": sl.fl.ptr,
+            "red": sl.red.ptr,
+            "put": amb.put,
+            "put_bf": amb.put_bf,
+            "put_words": amb.put_words,
+            "poll": amb.poll,
+            "args": {
+                "res_in": res_in,
+                "pend": pend,
+                "post_in": post_in,
+                "comb_in": comb_in,
+                "pre_in": pre_in,
+                "hc_fn": hc_fn,
+                "hc_scale": hc_scale,
+                "hc_base": hc_base,
+                "norm_w": attn_w,
+                "res_out": res_out,
+                "post_out": post_out,
+                "comb_out": comb_out,
+                "pre_out": pre_out,
+            },
+            "d": StageDims(tp),
+            # SGLang's Triton boundary + rmsnorm arithmetic (seam.slice_row, stage_norm)
+            "sgl": True,
+        }
+        for region in ("lin", "pmix"):
+            ca[region] = sreg(scratch, layout[region][0], region)
+        if const_expr(key.timeline):
+            c["tl"], c["tl_points"] = tl, mb_front.FRONT_POINTS
+
+        def seam_slice():
+            for task in range(first_task(bid, 0), SLICES, BLOCKS):
+                seam.stage_slice(ca, task)
+            gpu.barrier()
+
+        def seam_rest():
+            for t in range(first_task(bid, NORM0), s, BLOCKS):
+                seam.stage_norm(ca, t, lambda *v: store_x8(c, *v))
+                publish_x8(c, t)
+            for t in range(first_task(bid, GATE0), s, BLOCKS):
+                seam.stage_gate(ca, t)
+            gpu.barrier()
+
+        mb_front.run_front(
+            c, fkey, bid, x8_given=True, before_wqkv=seam_slice, after_wqkv=seam_rest
+        )
+
+    @flyc.jit
+    def launch(
+        res_in: Int64,
+        pend: Int64,
+        post_in: Int64,
+        comb_in: Int64,
+        pre_in: Int64,
+        hc_fn: Int64,
+        hc_scale: Int64,
+        hc_base: Int64,
+        attn_w: Int64,
+        res_out: Int64,
+        post_out: Int64,
+        comb_out: Int64,
+        pre_out: Int64,
+        wqkv: Int64,
+        wqkv_s: Int64,
+        qn_w: Int64,
+        kvn_w: Int64,
+        wqb: Int64,
+        wqb_s: Int64,
+        cos_sin: Int64,
+        pos: Int64,
+        slot: Int64,
+        swa: Int64,
+        swa_stride: Int64,
+        swa_block: Int32,
+        q: Int64,
+        swa_idx: Int64,
+        swa_lens: Int64,
+        comp_block: Int32,
+        comp_bt: Int64,
+        bt_stride: Int32,
+        topk: Int64,
+        t2r: Int64,
+        kt: Int64,
+        klen: Int64,
+        scratch: Int64,
+        epoch: Int64,
+        tl: Int64,
+        stream: fx.Stream = _STREAM,
+    ):
+        _ = keyed
+        k1(
+            res_in,
+            pend,
+            post_in,
+            comb_in,
+            pre_in,
+            hc_fn,
+            hc_scale,
+            hc_base,
+            attn_w,
+            res_out,
+            post_out,
+            comb_out,
+            pre_out,
+            wqkv,
+            wqkv_s,
+            qn_w,
+            kvn_w,
+            wqb,
+            wqb_s,
+            cos_sin,
+            pos,
+            slot,
+            swa,
+            swa_stride,
+            swa_block,
+            q,
+            swa_idx,
+            swa_lens,
+            comp_block,
+            comp_bt,
+            bt_stride,
+            topk,
+            t2r,
+            kt,
+            klen,
+            scratch,
+            epoch,
+            tl,
+        ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)
+
+    return launch
+
+
+# ---------------------------------------------------------------- the FFN launch
 
 
 @traced
@@ -242,9 +516,6 @@ def run_ffn(key: MonoBuild, lds, a: dict, amb, bases, own, rank, ep, part=None):
             gstore(cb[region].value + fx.Int64(slot * 4), fx.Int32(0), words=1)
 
     epoch_end({"bid": bid, "tid": tid}, a["epoch"], ep, reset)
-
-
-# ---------------------------------------------------------------- the FFN launch
 
 
 def build_mono_ffn(key: MonoBuild):

@@ -587,6 +587,26 @@ def forward_hc_pre_from_prev_fused_boundary(
     """ROCm form of DeepseekV4DecoderLayer.forward_hc_pre_from_prev.
     pending_post is the previous layer's unapplied FFN hc_post (x, residual, post,
     comb); with defer_post this layer's is returned the same way and hidden_states is None."""
+    k1 = dsv41_mono_decode.k1_launch(layer, forward_batch, pending_post, prev_pre)
+    if k1 is not None:
+        # K1 runs this boundary and the attention front; the attention starts from its q
+        q, residual, post, comb, pre = k1(
+            positions, forward_batch, *pending_post, prev_pre
+        )
+        mono = dsv41_mono_decode.ffn_launch(layer, forward_batch, residual.shape[0])
+        with layer.self_attn.maybe_use_decode_attn_tp(forward_batch):
+            x = layer.self_attn(
+                x=residual[:, 0],
+                positions=positions,
+                forward_batch=forward_batch,
+                defer_all_reduce=True,
+                mono_q=q,
+            )
+        assert isinstance(x, AttnOutput)
+        x, residual, post, comb, pre = mono(x.partial, residual, post, comb, pre)
+        if defer_post:
+            return None, pre, (x, residual, post, comb)
+        return layer.hc_post(x, residual, post, comb), pre, None
     if pending_post is None:
         pending_post = (None, hidden_states, None, None)
     residual, x, attn_coefficients = hc_boundary(
