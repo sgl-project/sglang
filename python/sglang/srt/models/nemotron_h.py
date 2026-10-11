@@ -18,6 +18,7 @@
 """Inference-only NemotronH model."""
 
 from collections.abc import Iterable
+from functools import partial
 
 import torch
 from torch import nn
@@ -38,6 +39,7 @@ from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
+    LinearParallelGroup,
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
@@ -76,7 +78,7 @@ from sglang.srt.model_loader.weight_utils import (
     replace_prefix,
     replace_substrings,
 )
-from sglang.srt.models.nemotron_h_utils import make_stage_boundary
+from sglang.srt.models.nemotron_h_utils import make_stage_boundary, stage_facts
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import (
@@ -105,9 +107,9 @@ class NemotronHMLP(nn.Module):
         quant_config: QuantizationConfig | None = None,
         bias: bool = False,
         reduce_results: bool = True,
-        tp_rank: int | None = None,
-        tp_size: int | None = None,
         prefix: str = "",
+        *,
+        parallel_group: LinearParallelGroup = "tp",
     ) -> None:
         super().__init__()
 
@@ -116,8 +118,7 @@ class NemotronHMLP(nn.Module):
             output_size=intermediate_size,
             bias=bias,
             quant_config=quant_config,
-            tp_rank=tp_rank,
-            tp_size=tp_size,
+            parallel_group=parallel_group,
             prefix=f"{prefix}.up_proj",
         )
         self.down_proj = RowParallelLinear(
@@ -126,8 +127,7 @@ class NemotronHMLP(nn.Module):
             bias=bias,
             quant_config=quant_config,
             reduce_results=reduce_results,
-            tp_rank=tp_rank,
-            tp_size=tp_size,
+            parallel_group=parallel_group,
             prefix=f"{prefix}.down_proj",
         )
         self.act_fn = ReLU2()
@@ -232,7 +232,7 @@ class NemotronHMoE(nn.Module):
                 quant_config=quant_config,
                 reduce_results=False,
                 **(
-                    dict(tp_rank=0, tp_size=1)
+                    dict(parallel_group="replicated")
                     if get_moe_a2a_backend().is_deepep()
                     or get_moe_a2a_backend().is_flashinfer()
                     or get_moe_a2a_backend().is_flashinfer_megamoe()
@@ -541,7 +541,6 @@ class NemotronHAttention(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
-        tp_rank = get_parallel().attn_tp_rank
         tp_size = get_parallel().attn_tp_size
         self.total_num_heads = config.num_attention_heads
         assert self.total_num_heads % tp_size == 0
@@ -571,8 +570,7 @@ class NemotronHAttention(nn.Module):
             self.total_num_kv_heads,
             bias=False,
             quant_config=quant_config,
-            tp_rank=tp_rank,
-            tp_size=tp_size,
+            parallel_group="attn_tp",
             prefix=f"{prefix}.qkv_proj",
         )
         self.o_proj = RowParallelLinear(
@@ -580,8 +578,7 @@ class NemotronHAttention(nn.Module):
             config.hidden_size,
             bias=False,
             quant_config=quant_config,
-            tp_rank=tp_rank,
-            tp_size=tp_size,
+            parallel_group="attn_tp",
             reduce_results=False,
             use_dp_attention_reduce=is_dp_attention_enabled(),
             prefix=f"{prefix}.o_proj",
@@ -694,6 +691,7 @@ class NemotronHModel(nn.Module):
             len(config.hybrid_override_pattern),
             get_layer,
             prefix=f"{prefix}.layers",
+            stage_facts=partial(stage_facts, config.hybrid_override_pattern),
         )
         if self.pp_group.is_last_rank:
             self.norm_f = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
@@ -737,9 +735,7 @@ class NemotronHModel(nn.Module):
             )
 
         if not self.pp_group.is_last_rank:
-            return residual_batch.to_pp(
-                hidden_states, forward_batch, preserve_declared=True
-            )
+            return residual_batch.to_pp(hidden_states, forward_batch)
         hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
         if self.end_layer in self.layers_to_capture:
             aux_hidden_states.append(

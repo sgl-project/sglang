@@ -231,7 +231,7 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
                 req_pool, allocator = tp_worker.get_memory_pool()
                 kv_pool = allocator.get_kvcache()
                 min_tokens = decode_retraction_max_tokens(req_pool, kv_pool)
-                if disagg.disaggregation_decode_host_receive_threshold > 0:
+                if disagg.disaggregation_decode_host_receive_threshold < 1:
                     # One request can receive while another is retracted.
                     min_tokens *= 2
                 ratio = max(ratio, min_tokens / kv_pool.size)
@@ -367,7 +367,6 @@ def build_kv_cache(
         is_dsa=is_dsa,
         enable_hierarchical_cache=enable_hierarchical_cache,
         disable_radix_cache=disable_radix_cache,
-        effective_chunked_prefill_size=effective_chunked_prefill_size,
         tp_worker=tp_worker,
         model_config=model_config,
         tp_size=parallel.tp_size,

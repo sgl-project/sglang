@@ -195,9 +195,6 @@ def _resolve_folded_sampling(
         return False
     if mode == DsparkFoldedSampling.FORCE:
         return True
-    # The V4.1 TP head reduces compact argmax summaries in the greedy graph.
-    if getattr(model.markov_head, "supports_sharded_greedy", False):
-        return False
     vocab = int(model.lm_head.org_vocab_size)
     noise_bytes = max_bs * vocab * 4
     logits_bytes = max_bs * gamma * vocab * _base_logits_dtype(model).itemsize
