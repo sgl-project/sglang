@@ -1884,7 +1884,10 @@ class Qwen3_5ForCausalLM(nn.Module):
                 return self._dense_mono.forward(
                     input_ids, positions, forward_batch, input_embeds
                 )
-            self._dense_mono.set_step(dense_mono_step)
+            rows = input_ids if input_embeds is None else input_embeds
+            self._dense_mono.set_step(
+                dense_mono_step, rows=0 if rows is None else rows.size(0)
+            )
         if self._mono is not None and self._mono.eligible(
             input_ids, forward_batch, input_embeds, pp_proxy_tensors
         ):

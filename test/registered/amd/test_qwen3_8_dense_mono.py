@@ -21,10 +21,11 @@ norm's output, as the runtime runs it there) each rank's half of the heads, its
 column-parallel slices of the same layer, against the stock path on them, with
 out_proj folded in (its partial, from the rank's K columns) and without.
 
-Widths 1..8, each with its own weights and Mailbox layer tag, over many input
-draws: a norm reduced in another order than the stock kernel's still matches on
-most rows, and shows on about one row in 640. Run directly with
-``python test/registered/amd/test_qwen3_8_dense_mono.py``.
+Widths 1..8 at TP1 and 1..16 at TP2, each with its own weights and Mailbox
+layer tag, over many input draws: a norm reduced in another order than the stock
+kernel's still matches on most rows, and shows on about one row in 640. Above 12
+rows K2's down reduce has more units than threads; widths 13..16 cover that.
+Run directly with ``python test/registered/amd/test_qwen3_8_dense_mono.py``.
 """
 
 import unittest
@@ -38,7 +39,6 @@ register_amd_ci(est_time=600, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 BF = torch.bfloat16
 EPS = 1e-6
-WIDTHS = range(1, 9)
 FFN_DRAWS = 512
 GDN_DRAWS = 512
 # Mailbox tag slots: the layer index a launch passes as ``layer``.
@@ -62,6 +62,12 @@ def _mxfp4(g, n, k):
         120, 127, (n, k // 32), dtype=torch.uint8, device="cuda", generator=g
     )
     return w, ws
+
+
+def _widths(tp):
+    from sglang.kernels.ops.moe.qwen3_5_mono_flydsl import dense_ffn as D
+
+    return range(1, D.max_tokens(tp) + 1)
 
 
 def _rnd(g, *shape, scale=1.0, dtype=BF):
@@ -113,7 +119,7 @@ class DenseFfnTest(CustomTestCase):
         from sglang.srt.layers.activation import SiluAndMul
 
         act = SiluAndMul()
-        for s in WIDTHS:
+        for s in _widths(1):
             g = torch.Generator(device="cuda").manual_seed(s)
             layer = LAYER_TAGS[s % len(LAYER_TAGS)]
             w_o, w_os = _mxfp4(g, D.HIDDEN, D.CORE)
@@ -167,7 +173,7 @@ class DenseFfnTest(CustomTestCase):
         act = SiluAndMul()
         inter = D.FGeo(2).inter
         for rank in range(2):
-            for s in WIDTHS:
+            for s in _widths(2):
                 g = torch.Generator(device="cuda").manual_seed(200 + s)
                 layer = LAYER_TAGS[s % len(LAYER_TAGS)]
                 w13, w13s = _mxfp4(g, 2 * D.INTER, D.HIDDEN)
@@ -327,7 +333,7 @@ def _stock_gdn(K, geo, w, h, residual, conv, ssm, idx):
 
 @unittest.skipUnless(_gfx950(), "needs FlyDSL and aiter on gfx950")
 class DenseGdnTest(CustomTestCase):
-    SLOTS = 12
+    SLOTS = 20  # slots 2 .. 17 at width 16, the rest untouched
 
     def test_bit_exact(self):
         self._check(tp=1, rank=0, normed=False)
@@ -344,7 +350,7 @@ class DenseGdnTest(CustomTestCase):
         from sglang.kernels.ops.moe.qwen3_5_mono_flydsl import dense_gdn as K
 
         geo = K.Geo(tp)
-        for s in WIDTHS:
+        for s in _widths(tp):
             first = s in (1, 5) and not normed
             g = torch.Generator(device="cuda").manual_seed(100 + s)
             layer = LAYER_TAGS[s % len(LAYER_TAGS)]

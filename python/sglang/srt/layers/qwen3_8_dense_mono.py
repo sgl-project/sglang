@@ -1,8 +1,9 @@
 """ROCm FlyDSL dense mono decode for Qwen3.8-27B (``SGLANG_QWEN3_8_DENSE_MONO=1``,
 gfx950, TP1 or TP2).
 
-A pure decode step of at most ``MAX_TOKENS`` rows runs each decoder layer as at
-most two persistent launches (``sglang.kernels.ops.moe.qwen3_5_mono_flydsl``):
+A pure decode step of at most 8 rows (16 at TP2, see below) runs each decoder
+layer as at most two persistent launches
+(``sglang.kernels.ops.moe.qwen3_5_mono_flydsl``):
 
 - K1 (``dense_gdn``, GDN layers, ``SGLANG_QWEN3_8_DENSE_MONO_K1``): the residual
   add + input_layernorm -> in_proj_qkvz / in_proj_ba -> conv1d -> the gated
@@ -27,6 +28,9 @@ the heads, from the stock input_layernorm's output) up to out_proj's partial
 each layer's ``mlp`` takes K2 (``SGLANG_QWEN3_8_DENSE_MONO_K2``, its half of the
 intermediate, from the stock post_attention_layernorm's output) up to down's
 partial. The all-reduces, the norms, attention and its o_proj stay stock.
+K1 and K2 each take steps of up to 8 rows by default, up to 16 with
+``SGLANG_QWEN3_8_DENSE_MONO_K1_MAX_ROWS`` / ``_K2_MAX_ROWS``; a step wider than
+one kernel's cap runs that part stock.
 
 The decode CUDA graph captures the step per batch size; any other step takes
 the stock layers. Mailbox tags carry a device epoch bumped once a step
@@ -284,6 +288,8 @@ class DenseMono:
         )
         # TP2: K2 in each layer's mlp
         self.k2 = not self.whole_step and envs.SGLANG_QWEN3_8_DENSE_MONO_K2.get()
+        # the widest step K1 / K2 take
+        self.k1_rows, self.k2_rows = self._row_caps()
         # out_proj / o_proj return their input while a mono step traces the layers
         self._skip_o = False
         # TP2: whether the step being run (or captured) takes K1 in linear_attn
@@ -303,7 +309,7 @@ class DenseMono:
             self.scratch = torch.zeros(
                 max(
                     D.scratch_bytes(self._k2_key(D, s))
-                    for s in range(1, D.MAX_TOKENS + 1)
+                    for s in range(1, self.k2_rows + 1)
                 ),
                 dtype=torch.uint8,
                 device=dev,
@@ -316,12 +322,33 @@ class DenseMono:
             self.k1_scratch = torch.zeros(
                 max(
                     dense_gdn.scratch_bytes(self._k1_key(dense_gdn, s, first=f))
-                    for s in range(1, D.MAX_TOKENS + 1)
+                    for s in range(1, self.k1_rows + 1)
                     for f in (False, True)
                 ),
                 dtype=torch.uint8,
                 device=dev,
             )
+
+    def _row_caps(self) -> tuple[int, int]:
+        """K1's and K2's widest step: 8 at TP1, the env caps (1..16) at TP2."""
+        from sglang.kernels.ops.moe.qwen3_5_mono_flydsl import dense_ffn as D
+
+        if self.whole_step:
+            return D.MAX_TOKENS, D.MAX_TOKENS
+        top = D.max_tokens(self.tp)
+        caps = []
+        for env in (
+            envs.SGLANG_QWEN3_8_DENSE_MONO_K1_MAX_ROWS,
+            envs.SGLANG_QWEN3_8_DENSE_MONO_K2_MAX_ROWS,
+        ):
+            cap = env.get()
+            if not 1 <= cap <= top:
+                cap = min(max(cap, 1), top)
+                logger.warning(
+                    "%s=%d: not in 1..%d, using %d", env.name, env.get(), top, cap
+                )
+            caps.append(cap)
+        return caps[0], caps[1]
 
     def _k1_key(self, dense_gdn, s: int, *, first: bool, eps=1e-6, norm_eps=1e-6):
         """K1's build at width ``s``: at TP2 from the stock norm's output."""
@@ -356,8 +383,8 @@ class DenseMono:
             self._max_tokens(),
             self.tp,
             "folded" if self.oproj else "in K1" if self.k1_oproj else "stock",
-            "K2" if self.whole_step or self.k2 else "stock",
-            "on" if self.k1 else "off",
+            f"K2 (<= {self.k2_rows} rows)" if self.whole_step or self.k2 else "stock",
+            f"on (<= {self.k1_rows} rows)" if self.k1 else "off",
             sum(w.numel() for w in self.w13 + self.w2 + self.w_o if w is not None)
             / 2**30
             + sum(a.numel() + b.numel() for a, b in filter(None, self.w_in)) / 2**30,
@@ -406,11 +433,17 @@ class DenseMono:
             return "off on another TP rank"
         return why
 
-    @staticmethod
-    def _max_tokens() -> int:
-        from sglang.kernels.ops.moe.qwen3_5_mono_flydsl import dense_ffn as D
+    def _max_tokens(self) -> int:
+        """The widest step a kernel takes (K1 may turn off on the first step)."""
+        return max(
+            self.k1_rows if self.k1 else 0,
+            self.k2_rows if self.whole_step or self.k2 else 0,
+        )
 
-        return D.MAX_TOKENS
+    @staticmethod
+    def _check_widths(cap: int) -> list[int]:
+        """The self-check's widths: 1, 8 and the cap."""
+        return sorted({1, min(8, cap), cap})
 
     def _off(self, why: str) -> None:
         self.ok = False
@@ -505,12 +538,12 @@ class DenseMono:
         return why
 
     def _ffn_check(self) -> str | None:
-        """The first layer at widths 1 and 8: out and res_out (TP1), or this
-        rank's down partial (TP2)."""
+        """The first layer at widths 1, 8 and K2's cap: out and res_out (TP1), or
+        this rank's down partial (TP2)."""
         layer = self.model.layers[0]
         dev = self.epoch.device
         g = torch.Generator(device=dev).manual_seed(0)
-        for s in (1, 8):
+        for s in self._check_widths(self.k2_rows):
             h = torch.randn(s, 5120, generator=g, device=dev).mul_(0.5).bfloat16()
             r = torch.randn(s, 5120, generator=g, device=dev).mul_(2).bfloat16()
             core = torch.randn(s, 6144, generator=g, device=dev).mul_(0.5).bfloat16()
@@ -534,16 +567,18 @@ class DenseMono:
         return None
 
     def _k1_check(self) -> str | None:
-        """The first GDN layer at widths 1 and 8 (with and without the residual,
-        a pad row) on synthetic conv / SSM states: core, residual (TP1), both
-        states of this rank's heads, and with the fold out_proj's partial."""
+        """The first GDN layer at widths 1, 8 and K1's cap (with and without the
+        residual, a pad row) on synthetic conv / SSM states: core, residual
+        (TP1), both states of this rank's heads, and with the fold out_proj's
+        partial."""
         from sglang.kernels.ops.moe.qwen3_5_mono_flydsl import dense_gdn as K
 
         geo = K.Geo(self.tp)
         i, layer = next((i, l) for i, l in enumerate(self.model.layers) if _is_gdn(l))
         dev = self.epoch.device
         g = torch.Generator(device=dev).manual_seed(1)
-        for s, first in ((1, True), (8, False)):
+        for s in self._check_widths(self.k1_rows):
+            first = s == 1
             h = torch.randn(s, K.HIDDEN, generator=g, device=dev).mul_(0.5).bfloat16()
             r = (
                 None
@@ -591,7 +626,7 @@ class DenseMono:
     def eligible(
         self, input_ids, forward_batch, input_embeds, pp_proxy_tensors, deepstack
     ):
-        """A pure decode step of at most ``MAX_TOKENS`` rows. The VL wrapper hands
+        """A pure decode step no wider than a kernel's cap. The VL wrapper hands
         a text decode step in as ``input_embeds``."""
         if not self.ok or not self._prepared or pp_proxy_tensors is not None:
             return False
@@ -606,8 +641,10 @@ class DenseMono:
             return self._skip("spec_info set")
         if self.model.layers_to_capture:
             return self._skip("layers_to_capture set")
-        if self.k1:
-            return self._k1_eligible(rows.size(0))
+        s = rows.size(0)
+        if self.k1 and s <= self.k1_rows:
+            # K1 may turn off here; then only K2's cap counts
+            return self._k1_eligible(s) and s <= self._max_tokens()
         return True
 
     def _k1_eligible(self, s) -> bool:
@@ -629,11 +666,11 @@ class DenseMono:
             self._runtime_ok = why is None
         return self.k1 or self.whole_step or self.k2
 
-    def set_step(self, on: bool) -> None:
-        """TP2, before the stock layers run a step: whether its GDN mixers take
-        K1 and its FFNs K2 (``eligible``)."""
-        self._gdn_step = on and self.k1
-        self._ffn_step = on and self.k2
+    def set_step(self, on: bool, rows: int) -> None:
+        """TP2, before the stock layers run a step of ``rows``: whether its GDN
+        mixers take K1 and its FFNs K2 (``eligible``, then each kernel's cap)."""
+        self._gdn_step = on and self.k1 and rows <= self.k1_rows
+        self._ffn_step = on and self.k2 and rows <= self.k2_rows
         if self._gdn_step or self._ffn_step:
             self.epoch.add_(1)
 

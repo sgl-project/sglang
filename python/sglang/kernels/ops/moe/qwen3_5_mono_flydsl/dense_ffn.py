@@ -77,6 +77,8 @@ INTER = 17408
 ROWS = 16
 STEP = 128  # K an fp4 tile step covers (a lane: 32 fp4 of one row)
 MAX_TOKENS = 8
+# TP2 takes up to 16 rows: a token is lane % 16 of the MFMA tile (one N-tile).
+MAX_TOKENS_TP2 = 16
 
 # K partition: gate_up and down sum K in quarters, wave runs and fp32 adds, not
 # in the stock GEMM's split-K (gate_up 2 splits; down 2 at TP1, 1 at TP2).
@@ -164,6 +166,12 @@ class FGeo(NamedTuple):
 
 
 TP_SIZES = (1, 2)
+
+
+def max_tokens(tp: int) -> int:
+    """The widest step K1 / K2 build for at TP ``tp``."""
+    return MAX_TOKENS_TP2 if tp == 2 else MAX_TOKENS
+
 
 # o_proj (FfnBuild.oproj): CTA b < O_CTAS owns hidden columns 32 b .. 32 b + 31
 CORE = 6144
@@ -967,9 +975,8 @@ def load_h(c, q):
 
 @traced
 def stage_down(c, q, rg0, ops):
-    """The wave's units -> fp32 accumulators a row group -> LDS; then thread
-    (row group, token, row pair): the CTA's partial; quarters 1..3 put it,
-    quarter 0 adds theirs in order -> bf16 out."""
+    """The wave's units -> fp32 accumulators a row group -> LDS; then the reduce
+    (``down_reduce``)."""
     s, tid, lane, wave, geo = c["S"], c["tid"], c["lane"], c["wave"], c["G"]
     dred = c["dred"]
     tiles, words = ops
@@ -988,9 +995,19 @@ def stage_down(c, q, rg0, ops):
         fx.ptr_store(acc, dred + ((k * WAVES + wave) * 64 + lane) * 4)
     gpu.barrier()
     n = D_RG * s * (ROWS // 2)
-    if tid < n:
-        k = tid // (s * (ROWS // 2))
-        rem = tid % (s * (ROWS // 2))
+    # More units than threads above 12 rows: a thread takes one a round.
+    for rnd in range_constexpr((n + THREADS - 1) // THREADS):
+        down_reduce(c, q, rg0, tid + THREADS * rnd, n)
+
+
+@traced
+def down_reduce(c, q, rg0, u, n):
+    """Unit ``u`` < ``n`` (row group, token, row pair) of down's reduce: the CTA's
+    partial; quarters 1..3 put it, quarter 0 adds theirs in order -> bf16 out."""
+    s, dred = c["S"], c["dred"]
+    if u < n:
+        k = u // (s * (ROWS // 2))
+        rem = u % (s * (ROWS // 2))
         tt = rem // (ROWS // 2)
         rp = rem % (ROWS // 2)
         base = dred + k * (WAVES * 64 * 4)
@@ -1028,7 +1045,7 @@ def build(key: FfnBuild):
     if key in _BUILDS:
         return _BUILDS[key]
     s = key.tokens
-    assert 1 <= s <= MAX_TOKENS and key.tp in TP_SIZES
+    assert key.tp in TP_SIZES and 1 <= s <= max_tokens(key.tp)
     # TP2 runs from the stock norm's output only
     assert key.normed == (key.tp > 1) and not (key.normed and key.oproj)
     geo = FGeo(key.tp)
@@ -1060,8 +1077,8 @@ def build(key: FfnBuild):
     class Smem:
         red: fx.Array[fx.Float32, WAVES * 64 * 4, 16]
         nrm: fx.Array[fx.Float32, MAX_ROUNDS * WAVES, 16]
-        rst: fx.Array[fx.Float32, MAX_TOKENS, 16]
-        qown: fx.Array[fx.Float32, MAX_TOKENS * 2 * ROWS, 16]
+        rst: fx.Array[fx.Float32, max_tokens(key.tp), 16]
+        qown: fx.Array[fx.Float32, max_tokens(key.tp) * 2 * ROWS, 16]
 
     keyed = key_tuple(key, digest())
     name = (

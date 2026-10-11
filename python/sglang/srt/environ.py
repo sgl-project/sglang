@@ -891,6 +891,9 @@ class Envs:
     SGLANG_QWEN3_8_DENSE_MONO_K1 = EnvBool(True)
     # TP2: each layer's FFN (gate_up .. down, before the all-reduce) as one launch.
     SGLANG_QWEN3_8_DENSE_MONO_K2 = EnvBool(True)
+    # TP2: the widest decode step K1 / K2 take (1..16; TP1 stays at 8).
+    SGLANG_QWEN3_8_DENSE_MONO_K1_MAX_ROWS = EnvInt(8)
+    SGLANG_QWEN3_8_DENSE_MONO_K2_MAX_ROWS = EnvInt(8)
     # Fuse MiniMax-M3 main/index QK norm + RoPE with main KV and index-K cache
     # insertion. Requires an AITER build with the fp8_e4m3_unit cache contract.
     # Enabled by default for supported configurations; set to 0 to disable.

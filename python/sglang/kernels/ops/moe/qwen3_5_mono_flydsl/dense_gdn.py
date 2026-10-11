@@ -30,7 +30,7 @@ of the heads (``Geo``) on the full input; nothing crosses ranks. One launch,
     out_proj (``oproj``, TP2 from ``normed``): every CTA's core rows ready (one
              flag a CTA) -> CTAs 0 .. 159 qdq the S core rows and run their 32
              hidden columns of out_proj's K share (``dense_ffn``'s o_proj stage)
-             in the stock GEMM's K splits (``O_SPLITS``), each chained in order,
+             in the stock GEMM's K splits (``o_splits``), each chained in order,
              the splits summed in order -> bf16 ``out``, the rank's partial
 
 Bit-exact with the stock decode path (the Triton conv update,
@@ -84,7 +84,7 @@ from sglang.kernels.ops.moe.qwen3_5_mono_flydsl import dense_ffn as D
 from sglang.kernels.ops.moe.qwen3_5_mono_flydsl.layer import step_tag
 from sglang.kernels.ops.moe.qwen3_5_mono_flydsl.sources import digest
 
-HIDDEN, ROWS, MAX_TOKENS = D.HIDDEN, D.ROWS, D.MAX_TOKENS
+HIDDEN, ROWS = D.HIDDEN, D.ROWS
 HD = 128
 NK = 16
 NV = 48
@@ -119,8 +119,13 @@ ROW_ORDER = (16, 8, 4, 2, 1)
 assert VCH == WAVES and BA_STEPS * BA_E == STEPS
 TP_SIZES = (1, 2)
 # The stock out_proj GEMM's split-K at TP2 (aiter get_splitk, K 3072): fp32
-# sums are not associative, so the fold keeps its partition.
+# sums are not associative, so the fold keeps its partition. Its configs give
+# NUM_KSPLIT 4 (3 after get_splitk) up to M 8, and 1 at M 9..16.
 O_SPLITS = 3
+
+
+def o_splits(s: int) -> int:
+    return O_SPLITS if s <= 8 else 1
 
 
 class Geo(NamedTuple):
@@ -824,7 +829,7 @@ def o_out(c):
     t = fx.min(tid // 4, s - 1)
     j = tid % 4
     y = [
-        bf16_round(D.row_sum_waves(c["red"], 8 * (j % 2) + e, t, j // 2, O_SPLITS))
+        bf16_round(D.row_sum_waves(c["red"], 8 * (j % 2) + e, t, j // 2, o_splits(s)))
         for e in range(8)
     ]
     if (tid < s * 4) & (bid < D.O_CTAS):
@@ -843,11 +848,11 @@ def build(key: K1Build):
     if key in _BUILDS:
         return _BUILDS[key]
     s = key.tokens
-    assert 1 <= s <= MAX_TOKENS
-    assert key.tp in TP_SIZES and (key.normed or not key.oproj)
+    assert key.tp in TP_SIZES and 1 <= s <= D.max_tokens(key.tp)
+    assert key.normed or not key.oproj
     lay = scratch_layout(key)
     geo = Geo(key.tp)
-    assert not key.oproj or (key.tp == 2 and geo.val // D.STEP % O_SPLITS == 0)
+    assert not key.oproj or (key.tp == 2 and geo.val // D.STEP % o_splits(s) == 0)
     nt = n_tasks(geo, s)
 
     @fx.struct
@@ -875,7 +880,7 @@ def build(key: K1Build):
     @fx.struct
     class Smem:
         red: fx.Array[fx.Float32, WAVES * 64 * 4, 16]
-        rst: fx.Array[fx.Float32, MAX_TOKENS, 16]
+        rst: fx.Array[fx.Float32, D.max_tokens(key.tp), 16]
 
     keyed = key_tuple(key, digest())
     name = (
@@ -1004,10 +1009,10 @@ def build(key: K1Build):
             D.stamp(c, 6)
         if const_expr(key.stop > 4 and key.oproj):
             publish(c["put"], c["ordy"], bid, fx.Int32(1), tid == 0)
-            oops = D.o_loads(c, width=geo.val, splits=O_SPLITS)
+            oops = D.o_loads(c, width=geo.val, splits=o_splits(s))
             o_core(c)
             D.stamp(c, 7)
-            D.o_stage(c, oops, width=geo.val, splits=O_SPLITS)
+            D.o_stage(c, oops, width=geo.val, splits=o_splits(s))
             o_out(c)
 
     @flyc.jit
