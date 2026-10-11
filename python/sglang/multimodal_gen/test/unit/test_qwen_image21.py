@@ -33,6 +33,7 @@ from sglang.multimodal_gen.runtime.cache.conditioning import ConditioningCache
 from sglang.multimodal_gen.runtime.entrypoints.openai.image_api import (
     _resolve_image_output_format,
 )
+from sglang.multimodal_gen.runtime.layers.linear import UnquantizedLinearMethod
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ResidencyState,
 )
@@ -697,6 +698,17 @@ def test_registry_routes_local_checkpoint_and_preserves_legacy():
         _get_config_info("Qwen/Qwen-Image").pipeline_config_cls
         is not QwenImage21PipelineConfig
     )
+
+
+def test_packed_qkv_weight_skips_offloaded_placeholders():
+    # Layerwise offload swaps every weight for one shared 1-D placeholder; the
+    # packing check runs from _apply and must not unpack it as [rows, cols].
+    placeholder = torch.empty((1,), dtype=torch.bfloat16)
+    projection = SimpleNamespace(
+        quant_method=UnquantizedLinearMethod(), weight=placeholder
+    )
+    attention = SimpleNamespace(to_q=projection, to_k=projection, to_v=projection)
+    assert QwenImage21Attention.packed_qkv_weight(attention) is None
 
 
 def test_packed_qkv_projection_is_skipped_under_compile():
