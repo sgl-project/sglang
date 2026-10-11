@@ -138,7 +138,7 @@ class LTX2AVDecodingStage(DecodingStage):
                     host[batch_idx, start:end].copy_(frames, non_blocking=True)
         except torch.cuda.OutOfMemoryError:
             stream.synchronize()
-            del host
+            host = None
             return self.video_processor.postprocess_video(video.cpu(), output_type="np")
         stream.synchronize()
         return host.numpy()
