@@ -5,12 +5,11 @@ from __future__ import annotations
 import contextlib
 import os
 import sys
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, is_dataclass, replace
 from types import MappingProxyType
-from typing import Callable, Mapping, Optional
+from typing import Callable, Mapping, NamedTuple, Optional
 
-import msgspec
-
+from sglang.srt.environ import envs
 from sglang.srt.layers import layernorm_sp
 from sglang.srt.layers.layer_boundary.adapters.overlap import (
     resolve_exit_rows,
@@ -20,10 +19,6 @@ from sglang.srt.layers.layer_boundary.boundary import _cp_moves
 from sglang.srt.layers.layer_boundary.construction import (
     BatchVariant,
     _bind_stage,
-    _input_scattered_possible,
-    _reject_unsupported_cp_moe,
-    _unpadded_possible,
-    _use_ag_after_qlora,
 )
 from sglang.srt.layers.layer_boundary.contracts import (
     EdgeContract,
@@ -34,38 +29,76 @@ from sglang.srt.layers.layer_boundary.contracts import (
     StageContract,
     StageKind,
 )
+from sglang.srt.layers.layer_boundary.facts import facts_of
 from sglang.srt.layers.layer_boundary.layout import (
     Layout,
     SumGroup,
     TokenAxis,
     _cp_gathers_over_attn_cp,
     _prefill_cp_shards_tokens,
+    batches_are_unpadded,
+    input_scattered_configured,
     is_dense_ffn_fully_dp,
     moe_gathers_over_moe_cp,
     token_axis_sizes,
 )
-from sglang.srt.layers.layer_boundary.ops import (
-    attn_tp_gather_input,
-    update_attn_tp_gather_output,
-)
 from sglang.srt.layers.layer_boundary.output import OutputTransform
-from sglang.srt.layers.layer_boundary.residual import ResidualReadout, ResidualUpdate
+from sglang.srt.layers.layer_boundary.residual import (
+    ResidualReadout,
+    ResidualUpdate,
+)
 from sglang.srt.layers.layer_boundary.residual.add_norm import (
     NORM_QUANT_READOUT,
     NORM_READOUT,
     PLAIN_ADD,
-    REPLACE_AT_EXIT,
 )
 from sglang.srt.layers.layer_boundary.stage import StageBoundary
 from sglang.srt.layers.moe import is_moe_input_scattered_across_dp_ranks
 from sglang.srt.runtime_context import get_exec, get_parallel
+
+_use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
+
+
+def _reject_unsupported_cp_moe(moe_on_local_rows: bool, cp_shards: bool) -> None:
+    """A MoE layer under attention CP whose tokens the steps cannot bring
+    to it: under a prefill CP, one dispatched per DP shard under attention DP
+    and GQA CP, and one on the TP group whose data-parallel groups are the CP
+    ranks under DSA or MLA CP; and under attention DP, one on the TP group
+    whose data-parallel groups are the CP ranks."""
+    parallel = get_parallel()
+    gqa = not _cp_gathers_over_attn_cp()
+    if moe_on_local_rows:
+        if cp_shards and gqa and parallel.attn_dp_size > 1:
+            raise NotImplementedError(
+                "a MoE dispatched per DP shard under attention DP and GQA prefill CP"
+            )
+    elif parallel.moe_dp_size == parallel.attn_cp_size:
+        if cp_shards and not gqa:
+            raise NotImplementedError(
+                "a MoE on the TP group with moe_dp_size == attn_cp_size under "
+                "DSA or MLA prefill CP"
+            )
+        if parallel.attn_dp_size > 1:
+            raise NotImplementedError(
+                "a MoE on the TP group with moe_dp_size == attn_cp_size under "
+                "attention DP and attention CP"
+            )
+
+
+def _unpadded_possible() -> bool:
+    """Whether a batch whose rows do not divide over attention TP may reach an
+    FFN that would run on this rank's attention-TP slice, so that FFN needs a
+    variant that stays on the attention's rows."""
+    return batches_are_unpadded() and (
+        is_moe_input_scattered_across_dp_ranks() or is_dense_ffn_fully_dp()
+    )
 
 
 def _active_variants():
     yield BatchVariant.ORDINARY
     if _prefill_cp_shards_tokens():
         yield BatchVariant.CONTEXT_PARALLEL
-    if _input_scattered_possible():
+    if input_scattered_configured():
         yield BatchVariant.INPUT_SCATTERED
     if layernorm_sp.layernorm_sp_enabled():
         yield BatchVariant.SEQUENCE_PARALLEL
@@ -122,8 +155,6 @@ def _resolve_ffn(
     cp_shards = _prefill_cp_shards_tokens()
     axes, attention, local, full = _row_layouts(variant)
     on_rank_rows = _ffn_on_rank_rows(sparse, dense_tp_size)
-    if parallel.attn_cp_size > 1 and sparse:
-        _reject_unsupported_cp_moe(on_rank_rows, cp_shards)
     if variant is BatchVariant.UNPADDED and on_rank_rows:
         # Rows that do not divide over attention TP stay whole: the FFN runs on
         # the attention's rows (an a2a MoE dispatches them from every
@@ -154,6 +185,8 @@ def _resolve_ffn(
         group = SumGroup.MOE_OUTPUT
     else:
         group = SumGroup.ATTN_TP if on_attention_rows else SumGroup.TP
+    # An FFN that writes the next stream itself hands on a complete output.
+    complete = on_rank_rows or update.writes_stream or output_complete
     if variant is BatchVariant.SEQUENCE_PARALLEL:
         return (
             StageContract(
@@ -176,8 +209,9 @@ def _resolve_ffn(
                 InputContract(full, read=read),
                 OutputContract(
                     attention,
-                    group=group,
-                    may_reduce_scatter=use_reduce_scatter
+                    group=None if complete else group,
+                    may_reduce_scatter=not complete
+                    and use_reduce_scatter
                     and (scattered_residual or not terminal),
                     update=update,
                     transform=output_transform,
@@ -203,8 +237,6 @@ def _resolve_ffn(
         rows = Layout.sharded_over(
             *((TokenAxis.ATTN_CP,) if on_cp_shards else ()), axis_sizes=axes
         )
-    # An FFN that writes the next stream itself hands on a complete output.
-    complete = on_rank_rows or update is REPLACE_AT_EXIT or output_complete
     produced = (
         OutputContract(rows, update=update, transform=output_transform)
         if complete
@@ -270,11 +302,13 @@ class StageDeclaration:
             contiguous slice of the rows, it returns them all, in rank order,
             or None to leave the gather to the boundary. Called on every batch,
             so it must be CUDA-graph safe. Across a pipeline boundary the
-            producer's rank takes it from the neighbouring layer it builds on
-            the meta device, so it may use only the communication state of the
-            rank it runs on, not the declaring layer's weights or buffers.
-        previous: Declaration whose output this stage consumes, as the stack
-            records it; across pipeline ranks it is built locally.
+            producer's rank takes it from the model's shared declaration
+            function, without the declaring layer, so it may use only the
+            communication state of the rank it runs on, not that layer's
+            weights or buffers.
+        previous: The stage whose output this stage consumes, as the stack
+            records it: only the facts binding reads of it (see facts_of),
+            on this rank or another.
         prepared_from: Declaration whose already-read input a branch reuses.
             Mutually exclusive with previous; avoids a second update/read.
 
@@ -305,6 +339,51 @@ class StageDeclaration:
         for source in (self.previous, self.prepared_from):
             if source is not None and not isinstance(source, StageDeclaration):
                 raise TypeError("stage sources must be declarations")
+        _check_update(self.update)
+        _check_read(self.read)
+
+
+# The members every ResidualUpdate and ResidualReadout must set: the binding
+# reads each of them, and none has a default that is correct for every
+# implementation.
+_UPDATE_FACTS = (
+    "is_plain_add",
+    "applied_at_exit",
+    "outlives_layer",
+    "writes_stream",
+    "quantized_sum",
+)
+_READ_FACTS = ("is_plain_norm", "reads_before_dp_gather", "reads_after_attn_tp_gather")
+# The kernels a read supplies, which the binding also reads; empty when it
+# supplies none.
+_READ_KERNELS = ("completing_fusions", "gathering_reads")
+
+
+def _require(protocol, implementation, facts):
+    missing = [name for name in facts if not hasattr(implementation, name)]
+    if missing:
+        raise TypeError(
+            f"{type(implementation).__name__} does not set {', '.join(missing)}, "
+            f"which every {protocol} must"
+        )
+
+
+def _check_update(update):
+    _require("ResidualUpdate", update, _UPDATE_FACTS)
+    name = type(update).__name__
+    if update.writes_stream and (update.is_plain_add or not update.applied_at_exit):
+        raise ValueError(
+            f"{name} writes the next stream itself, which only an update "
+            "applied at its exit and other than a plain add does"
+        )
+    if update.quantized_sum and not update.is_plain_add:
+        raise ValueError(
+            f"{name} lets its sum run quantized, which only a plain add does"
+        )
+
+
+def _check_read(read):
+    _require("ResidualReadout", read, _READ_FACTS + _READ_KERNELS)
 
 
 @dataclass(frozen=True)
@@ -419,17 +498,74 @@ def declare_ffn(
     )
 
 
-def _resolve_stage(stage, variant, following=None):
-    axes, attention, local, full = _row_layouts(variant)
+def _reject_unsupported(stage):
+    """Reject a stage whose declared capabilities this parallel configuration
+    cannot bind, naming the combination. The rejections that depend on the
+    rows of one edge are made where that edge binds (``_bind_stage``)."""
+    parallel = get_parallel()
     if stage.update.applied_at_exit:
         if stage.sparse and moe_gathers_over_moe_cp():
             raise NotImplementedError(
-                "MHC does not support a MoE gathered over the MoE-CP group"
+                "an update applied at the stage's exit with a MoE gathered over "
+                "the MoE-CP group"
             )
-        if get_parallel().attn_cp_size > 1 and _input_scattered_possible():
+        if parallel.attn_cp_size > 1 and input_scattered_configured():
             raise NotImplementedError(
-                "MHC with input-scattered attention under attention CP"
+                "an update applied at the stage's exit with input-scattered "
+                "attention under attention CP"
             )
+    if stage.kind is StageKind.FFN and stage.sparse and parallel.attn_cp_size > 1:
+        _reject_unsupported_cp_moe(
+            _ffn_on_rank_rows(stage.sparse, stage.dense_tp_size),
+            _prefill_cp_shards_tokens(),
+        )
+
+
+class _Arrival(NamedTuple):
+    """What reaches a stage's entry from its producer, for one batch variant.
+    ``plain_add`` is None after an attention that always leaves its sum: the
+    entry receives that update with the output."""
+
+    produced: OutputContract
+    residual: Layout
+    plain_add: Optional[bool]
+    written: bool
+
+
+class _Flow(NamedTuple):
+    """One stage's residual data flow for one batch variant."""
+
+    contract: StageContract
+    arrival: _Arrival
+    during: Layout
+    returned: Layout
+
+
+def _stack_arrival(variant):
+    """What reaches the first stage of the model's layer stack: its input, on
+    the attention's rows (this rank's slice of them under sequence
+    parallelism), owing the TP sum an input-scattered batch leaves."""
+    _, attention, local, _ = _row_layouts(variant)
+    rows = local if variant is BatchVariant.SEQUENCE_PARALLEL else attention
+    owes = variant is BatchVariant.INPUT_SCATTERED
+    return _Arrival(
+        OutputContract(
+            rows,
+            group=SumGroup.TP if owes else None,
+            always_partial=owes,
+            update=None,
+        ),
+        rows,
+        True,
+        False,
+    )
+
+
+def _resolve_stage(stage, variant, arrival, following=None):
+    """``stage``'s data flow for ``variant``, given what arrives at its entry
+    and the stage after it (None when it ends the stack or a branch)."""
+    axes, attention, local, full = _row_layouts(variant)
+    _reject_unsupported(stage)
     if stage.kind is StageKind.FFN:
         declaration, residual, returned = _resolve_ffn(
             variant,
@@ -443,15 +579,14 @@ def _resolve_stage(stage, variant, following=None):
         )
         exit_rows = resolve_exit_rows(stage.exit_rows)
         if exit_rows is ExitRows.ATTENTION or (
-            following is not None
-            and getattr(following.read, "reads_after_attn_tp_gather", False)
+            following is not None and following.read.reads_after_attn_tp_gather
         ):
             returned = attention
         elif exit_rows is ExitRows.SLICE:
             # The residual's rows during the FFN: this rank's slice for an FFN
             # on its own rows, else the attention's.
             returned = residual
-        return declaration, residual, returned
+        return _Flow(declaration, arrival, residual, returned)
     sp = variant is BatchVariant.SEQUENCE_PARALLEL
     scattered = variant is BatchVariant.INPUT_SCATTERED
     gathers = (
@@ -497,170 +632,178 @@ def _resolve_stage(stage, variant, following=None):
             transform=stage.output_transform,
         ),
     )
-    return declaration, None, attention
+    # An attention moves no residual: it keeps the rows it arrives on, except
+    # that one that always leaves its sum completes an input-scattered sum
+    # it receives onto this rank's slice of them.
+    during = arrival.residual
+    if (
+        variant is BatchVariant.INPUT_SCATTERED
+        and arrival.produced.always_partial
+        and arrival.produced.update is None
+        and stage.reduction is ProducerReduction.ALWAYS_PARTIAL
+    ):
+        during = Layout(during.sharded | {TokenAxis.ATTN_TP})
+    return _Flow(declaration, arrival, during, attention)
 
 
-def _connect(producer, consumer, *, residual_from=None):
-    """Resolve producer and consumer declarations; None denotes an external endpoint.
+def _arrival(producer, flow, variant):
+    """What reaches the stage after ``producer`` from it, given its flow."""
+    output = flow.contract.output
+    if (
+        producer.kind is StageKind.ATTENTION
+        and producer.reduction is ProducerReduction.ALWAYS_PARTIAL
+    ):
+        # The output owes its sum, and the residual is where it ran.
+        return _Arrival(output, flow.during, None, False)
+    if (
+        producer.kind is StageKind.ATTENTION
+        and producer.reduction is ProducerReduction.EXIT_SCOPED
+        and (output.always_partial or output.may_defer_to_next)
+    ):
+        # A mixer's exit leaves the next entry the sum it declares; a sum it
+        # may carry on arrives with the value, if at all.
+        owes, group = output.always_partial, output.group
+    else:
+        # On an input-scattered batch, the next entry's reduce-scatter
+        # completes the TP sum of an output not written at its exit.
+        owes = (
+            variant is BatchVariant.INPUT_SCATTERED
+            and not producer.update.applied_at_exit
+        )
+        group = SumGroup.TP
+    return _Arrival(
+        OutputContract(
+            flow.returned,
+            group=group if owes else None,
+            always_partial=owes,
+            update=None,
+        ),
+        flow.returned,
+        producer.update.is_plain_add,
+        producer.update.applied_at_exit,
+    )
 
-    A missing producer is the stack input; a missing consumer is a layer or stack exit
-    whose next read is bound separately (or the terminal output).
-    ``residual_from`` names the boundary that placed the producer's residual.
-    It is needed for attention, whose residual can stay on finer rows than its
-    compute input. No executable stage participates in this construction.
-    """
-    if producer is None and consumer is None:
-        raise ValueError("a boundary needs at least one declared side")
-    before, after = producer, consumer
-    exits, entries = {}, {}
-    for variant in _active_variants():
-        _, attention, local, _ = _row_layouts(variant)
-        written = False
-        if before is None:
-            rows = local if variant is BatchVariant.SEQUENCE_PARALLEL else attention
-            owes = variant is BatchVariant.INPUT_SCATTERED
-            arrived = OutputContract(
-                rows,
-                group=SumGroup.TP if owes else None,
-                always_partial=owes,
-                update=None,
-            )
-            residual = rows
-            capabilities = (True,)
-        else:
-            decl, during, returned = _resolve_stage(before, variant, following=after)
-            if during is None:
-                if residual_from is not None:
-                    if residual_from.consumer != producer:
-                        raise ValueError("residual source must enter the producer")
-                    during = residual_from.entries[variant].residual_to
-                elif (
-                    before.kind is StageKind.ATTENTION
-                    and before.reduction is ProducerReduction.EXIT_SCOPED
-                ):
-                    during = attention
-                else:
-                    raise ValueError(
-                        "attention output needs its incoming residual placement"
-                    )
-            exits[variant] = EdgeContract(
-                decl.output, InputContract(returned), during, returned
-            )
+
+def _entry_edge(stage, flow, variant):
+    """The edge into ``stage`` as its entry binds it."""
+    arrival = flow.arrival
+    joins = (
+        variant is BatchVariant.INPUT_SCATTERED
+        and arrival.produced.update is not None
+        and arrival.produced.update.is_plain_add
+        and stage.kind is StageKind.FFN
+    )
+    return EdgeContract(
+        arrival.produced,
+        flow.contract.input,
+        arrival.residual,
+        flow.during,
+        residual_joins_sum=joins,
+        arriving_plain_add=arrival.plain_add,
+        arrives_written=arrival.written,
+    )
+
+
+def _exit_edge(stage, flow, entry):
+    """The edge out of ``stage`` as its exit binds it. An attention that always
+    leaves its sum has no exit: its edge is its consumer's entry edge, when
+    there is a consumer."""
+    if entry is not None and (
+        stage.kind is StageKind.ATTENTION
+        and stage.reduction is ProducerReduction.ALWAYS_PARTIAL
+    ):
+        return entry
+    return EdgeContract(
+        flow.contract.output, InputContract(flow.returned), flow.during, flow.returned
+    )
+
+
+def _connect_line(line, origins, *, before=None, after=None, arrivals=None):
+    """The connections along a chain of stages, each resolved once per batch
+    variant: into ``line[0]``, between each two, and out of ``line[-1]`` to
+    ``after`` (a stage on the next rank, or None at the end of the stack or a
+    branch). What arrives at ``line[0]`` is ``arrivals``, else what ``before``
+    (a stage on the previous rank, or None for the stack input) hands on; that
+    rank's own entry is taken as the stack input's. An error resolving a stage
+    names the append at ``origins[i]`` that declared ``line[i]``, or the one
+    next to the neighbouring rank's stage."""
+    variants = tuple(_active_variants())
+
+    def resolve(position, stage, arrivals, following=None):
+        try:
+            return {
+                v: _resolve_stage(stage, v, arrivals[v], following) for v in variants
+            }
+        except Exception as error:
+            _note_origin(error, origins[position])
+            raise
+
+    if arrivals is None:
+        arrivals = {v: _stack_arrival(v) for v in variants}
+        if before is not None:
             if (
-                before.kind is StageKind.ATTENTION
+                before.output_transform is not None
+                and before.kind is StageKind.ATTENTION
                 and before.reduction is ProducerReduction.ALWAYS_PARTIAL
             ):
-                arrived, residual, capabilities = decl.output, during, ()
-            else:
-                owes = (
-                    variant is BatchVariant.INPUT_SCATTERED
-                    and not before.update.applied_at_exit
+                # Its transform runs at the next stage's input, which would be
+                # on this rank, without the module that declares it.
+                error = NotImplementedError(
+                    "a pipeline rank that ends on an attention transforming the "
+                    "output whose sum it leaves"
                 )
-                carries = (
-                    (
-                        before.kind is StageKind.ATTENTION
-                        and before.reduction is ProducerReduction.EXIT_SCOPED
-                    )
-                    or resolve_exit_rows(before.exit_rows) is ExitRows.ATTENTION
-                ) and (decl.output.always_partial or decl.output.may_defer_to_next)
-                arrived = OutputContract(
-                    returned,
-                    group=decl.output.group
-                    if carries
-                    else (SumGroup.TP if owes else None),
-                    always_partial=decl.output.always_partial if carries else owes,
-                    may_defer_to_next=decl.output.may_defer_to_next
-                    if carries
-                    else False,
-                    update=None,
-                )
-                residual, capabilities = returned, (before.update.is_plain_add,)
-                written = before.update.applied_at_exit
-        if after is None:
-            continue
-        decl, during, _ = _resolve_stage(after, variant)
-        if after.kind is StageKind.ATTENTION:
-            during = (
-                Layout(residual.sharded | {TokenAxis.ATTN_TP})
-                if variant is BatchVariant.INPUT_SCATTERED
-                and arrived.always_partial
-                and arrived.update is None
-                and after.reduction is ProducerReduction.ALWAYS_PARTIAL
-                else residual
+                _note_origin(error, origins[0])
+                raise error
+            flow = resolve(0, before, arrivals, line[0])
+            arrivals = {v: _arrival(before, flow[v], v) for v in variants}
+    flows = []
+    for position, stage in enumerate(line):
+        following = line[position + 1] if position + 1 < len(line) else after
+        flow = resolve(position, stage, arrivals, following)
+        flows.append(flow)
+        arrivals = {v: _arrival(stage, flow[v], v) for v in variants}
+    if after is not None:
+        flows.append(resolve(len(line) - 1, after, arrivals))
+    entries = [
+        {v: _entry_edge(stage, flow[v], v) for v in variants}
+        for stage, flow in zip([*line, after], flows)
+    ]
+    connections = [StageConnection(before, line[0], {}, entries[0])]
+    for position, stage in enumerate(line):
+        consumer = line[position + 1] if position + 1 < len(line) else after
+        following = entries[position + 1] if consumer is not None else {}
+        connections.append(
+            StageConnection(
+                stage,
+                consumer,
+                {
+                    v: _exit_edge(stage, flows[position][v], following.get(v))
+                    for v in variants
+                },
+                following,
             )
-        elif resolve_exit_rows(after.exit_rows) is ExitRows.ATTENTION:
-            during = (
-                decl.input.layout
-                if residual.sharded <= decl.input.layout.sharded
-                else residual
-            )
-        joins = (
-            variant is BatchVariant.INPUT_SCATTERED
-            and arrived.update is not None
-            and arrived.update.is_plain_add
-            and after.kind is StageKind.FFN
         )
-        edge = EdgeContract(
-            arrived,
-            decl.input,
-            residual,
-            during,
-            residual_joins_sum=joins,
-            arriving_plain_add=capabilities,
-            arrives_written=written,
-        )
-        entries[variant] = edge
-        if (
-            before is not None
-            and before.kind is StageKind.ATTENTION
-            and before.reduction is ProducerReduction.ALWAYS_PARTIAL
-        ):
-            exits[variant] = edge
-    return StageConnection(producer, consumer, exits, entries)
+    return connections
 
 
-def _fork_input(prepared, consumer):
-    """Place an already-read input onto a branch's computation rows.
-
-    The branch adapter performs the move and forks the stream. It does not
-    execute the branch's input norm again.
-    """
-    entries = {}
+def _fork_input(prepared):
+    """What reaches a branch's first stage: an already-read input, placed onto
+    the branch's computation rows by the branch adapter, which forks the
+    stream without running the branch's input norm again."""
+    arrivals = {}
     for variant in _active_variants():
         if variant is not BatchVariant.ORDINARY:
             raise NotImplementedError(
                 "prepared branch transport requires ordinary token rows"
             )
         source = prepared.entries[variant]
-        declaration, during, _ = _resolve_stage(consumer, variant)
-        entries[variant] = EdgeContract(
+        arrivals[variant] = _Arrival(
             OutputContract(source.need.layout, update=None),
-            declaration.input,
             source.residual_to,
-            during,
-            arriving_plain_add=(True,),
+            True,
+            False,
         )
-    return StageConnection(prepared.consumer, consumer, {}, entries)
-
-
-def _incoming(stage):
-    if stage.prepared_from is not None:
-        return _fork_input(_incoming(stage.prepared_from), stage)
-    previous = stage.previous
-    # A normal attention may retain a finer residual than its output rows.
-    # FFN and mixer exits declare their returned residual placement directly.
-    source = (
-        _incoming(previous)
-        if previous is not None
-        and previous.kind is StageKind.ATTENTION
-        and previous.reduction is ProducerReduction.ALWAYS_PARTIAL
-        else None
-    )
-    return _connect(
-        previous,
-        stage,
-        residual_from=source,
-    )
+    return arrivals
 
 
 class _Append:
@@ -703,18 +846,23 @@ def layer_stack(*, previous_layers=(), next_layers=(), final_read=None):
     stage ends the model's layer stack unless a later layer declares a stage.
 
     Args:
-        previous_layers: Callables that build, nearest first, the layers before
-            this stack that another pipeline rank holds. Called only if this
-            stack appended stages, after its own layers are built, until one of
-            them declares a stage: its last stage is the producer of this
-            stack's first. What they build is discarded.
+        previous_layers: For the layers before this stack that another
+            pipeline rank holds, nearest first, callables that return the
+            stages the layer declares, in order, without building it (the
+            model's shared declaration function at that layer's index; an
+            empty sequence for a layer that declares none). Called only if
+            this stack appended stages, after its own layers are built, until
+            one of them declares a stage: its last stage is the producer of
+            this stack's first. Only what binding reads of that stage is kept
+            (see facts_of).
         next_layers: Likewise for the layers after this stack, whose first
             declared stage is the consumer of this stack's last.
-        final_read: The model's final read of the stack's output, when it is
-            not a plain final norm: the consumer of the last stage when no
-            later layer declares one. Its ``attn_tp_gather`` gathers the rows
-            that stage leaves on this rank's attention-TP slice, and with
-            ``reads_attn_tp_slices`` it reads that slice instead.
+        final_read: The model's final read of the stack's output (a
+            ``FinalRead``), when it is not a plain final norm: the consumer of
+            the last stage when no later layer declares one. Its
+            ``attn_tp_gather`` gathers the rows that stage leaves on this
+            rank's attention-TP slice, and with ``reads_attn_tp_slices`` it
+            reads that slice instead.
     """
     global _stack
     outer = _stack
@@ -733,21 +881,70 @@ def layer_stack(*, previous_layers=(), next_layers=(), final_read=None):
         _stack = outer
 
 
-def _neighbour_stage(build_layers, *, last):
+def check_declared_stages(stack, appended: int, expected, where: str) -> None:
+    """Check that what a layer appended to ``stack`` since it held
+    ``appended`` appends is what its shared declaration function says it
+    declares, as far as binding reads it: another pipeline rank binds this
+    layer's stages from that function alone."""
+    declared = [
+        facts_of(declaration)
+        for append in stack.appends[appended:]
+        if append.prepared_from is None
+        for declaration in append.declarations
+    ]
+    expected = [facts_of(declaration) for declaration in expected]
+    if declared != expected:
+        raise ValueError(
+            f"{where} declares stages its shared declaration function does "
+            f"not: {_first_difference(declared, expected)}"
+        )
+
+
+def _first_difference(declared, expected) -> str:
+    """Where the stages a layer declares first differ from those its shared
+    declaration function gives, field by field."""
+    if len(declared) != len(expected):
+        return (
+            f"it declares {[stage.kind.name for stage in declared]}, the "
+            f"function {[stage.kind.name for stage in expected]}"
+        )
+    index, (stage, given) = next(
+        (index, pair)
+        for index, pair in enumerate(zip(declared, expected))
+        if pair[0] != pair[1]
+    )
+    return f"stage {index} ({stage.kind.name}): " + "; ".join(
+        f"{name} is {value!r}, the function says {given_value!r}"
+        for name, value, given_value in _differing_fields(stage, given)
+    )
+
+
+def _differing_fields(value, given, prefix=""):
+    """(dotted name, value, given value) for each leaf field that differs,
+    descending into declarations and the facts they hold."""
+    if is_dataclass(value):
+        names = [field.name for field in fields(value)]
+    else:
+        names = getattr(type(value), "__struct_fields__", None)
+    if names is None or type(value) is not type(given):
+        return [(prefix.rstrip("."), value, given)]
+    return [
+        difference
+        for name in names
+        if getattr(value, name) != getattr(given, name)
+        for difference in _differing_fields(
+            getattr(value, name), getattr(given, name), f"{prefix}{name}."
+        )
+    ]
+
+
+def _neighbour_stage(layers, *, last):
     """The stage a neighbouring layer declares next to this stack: the last
-    one of the nearest layer before it, or the first of the nearest after.
-    Branches are side paths, so they never stand next to the stack."""
-    global _stack
-    for build_layer in build_layers:
-        outer = _stack
-        _stack = _LayerStack()
-        try:
-            build_layer()
-            appends = [a for a in _stack.appends if a.prepared_from is None]
-        finally:
-            _stack = outer
-        if appends:
-            return appends[-1].declarations[-1] if last else appends[0].declarations[0]
+    one of the nearest layer before it, or the first of the nearest after."""
+    for layer in layers:
+        declared = tuple(layer())
+        if declared:
+            return facts_of(declared[-1] if last else declared[0])
     return None
 
 
@@ -764,55 +961,6 @@ def _note_origin(error: Exception, origin: str) -> None:
     add_note = getattr(error, "add_note", None)
     if add_note is not None:
         add_note(f"while binding the stages appended at {origin}")
-
-
-class _PendingStage:
-    """The last stage of a linear append. Its consumer is the next append's
-    first stage, or the stack exit, so it binds only once that is known."""
-
-    __slots__ = (
-        "boundary",
-        "declaration",
-        "norm",
-        "options",
-        "predecessor",
-        "predecessor_incoming",
-        "predecessor_boundary",
-        "origin",
-    )
-
-    def __init__(
-        self,
-        boundary,
-        declaration,
-        norm,
-        options,
-        predecessor,
-        predecessor_incoming,
-        predecessor_boundary,
-        origin,
-    ):
-        self.boundary = boundary
-        self.declaration = declaration
-        self.norm = norm
-        self.options = options
-        # The stage before it within the same append, or None when it is the
-        # append's only stage and takes its input from the stack.
-        self.predecessor = predecessor
-        self.predecessor_incoming = predecessor_incoming
-        self.predecessor_boundary = predecessor_boundary
-        self.origin = origin
-
-
-class _Chain:
-    """The stage a following append extends, and the one stage still waiting
-    for its consumer, while the stack binds its appends in order."""
-
-    __slots__ = ("previous", "pending")
-
-    def __init__(self, previous):
-        self.previous = _detached(_handed_off(previous))
-        self.pending = None
 
 
 def _handed_off(declaration):
@@ -833,56 +981,183 @@ def _handed_off(declaration):
     )
 
 
-def _detached(declaration):
-    """The declaration a following append extends, without its own history.
-
-    A stage's incoming edge reads its producer's own incoming edge only when
-    the producer is an attention that always leaves its sum; the copy has no
-    history, so that lookback stops at the producer.
-    """
-    if declaration is None:
-        return None
-    return replace(declaration, previous=None, prepared_from=None)
+def _return_before_trailing_attention(line):
+    """When the stack ends on attentions that always leave their sum, the next
+    rank or the final read takes the residual on the rows they ran on, which
+    is where the FFN before them returned it: no exit moves it after them.
+    That FFN returns it on the attention's rows, as one that ends the stack or
+    hands off does, instead of on its own rows."""
+    trailing = False
+    for append in reversed(line):
+        declarations = append.declarations
+        for index in reversed(range(len(declarations))):
+            declaration = declarations[index]
+            if (
+                declaration.kind is StageKind.ATTENTION
+                and declaration.reduction is ProducerReduction.ALWAYS_PARTIAL
+            ):
+                trailing = True
+                continue
+            if (
+                trailing
+                and declaration.kind is StageKind.FFN
+                and _ffn_on_rank_rows(declaration.sparse, declaration.dense_tp_size)
+            ):
+                declarations[index] = replace(declaration, exit_rows=ExitRows.ATTENTION)
+            return
 
 
 def _bind_stack(appends, *, previous, following, final_read=None):
-    """Bind every appended stage, in order, and fill in the boundaries each
-    append returned."""
+    """Bind every appended stage and fill in the boundaries each append
+    returned.
+
+    The stages of the appends that extend the stack form one line, chained in
+    append order, and every connection between two of them is built once:
+    each stage's outgoing connection is the next one's incoming. A branch
+    then starts from the incoming connection of the stage it branches from.
+    """
+    line = [a for a in appends if a.prepared_from is None]
     if following is not None:
         # The last stage hands off to the next rank.
-        last = next(a for a in reversed(appends) if a.prepared_from is None)
-        last.declarations[-1] = _handed_off(last.declarations[-1])
-    chain = _Chain(previous)
-    # A returned declaration's boundary as bound, for the branches that read it.
+        line[-1].declarations[-1] = _handed_off(line[-1].declarations[-1])
+    _return_before_trailing_attention(line)
+    if following is None:
+        # Without a stage on a later rank, the last one ends the model's stack,
+        # read by the final read.
+        line[-1].declarations[-1] = _ended(
+            replace(line[-1].declarations[-1], terminal=True), final_read
+        )
+    stages = [
+        (append, index) for append in line for index in range(len(append.bindings))
+    ]
+    bound = {id(append): [None] * len(append.bindings) for append in appends}
+    # A returned declaration's stage as bound, for the branches that start from it.
     sources = {}
-    bound = []
-    for append in appends:
-        prepared_from = append.prepared_from
-        if prepared_from is not None:
-            source = sources.get(id(prepared_from))
-            if source is None:
-                raise ValueError(
-                    "prepared_from must be the declaration of a stage appended "
-                    f"earlier to the same layer stack (at {append.origin})"
-                )
-            prepared_from = source.declaration
-        boundaries = _extend(chain, append, prepared_from)
-        for returned, boundary in zip(append.boundaries, boundaries):
-            sources[id(returned.declaration)] = boundary
-        bound.append(boundaries)
-    # The last stage's consumer is the next rank's first stage, if any;
-    # without one it ends the model's layer stack, read by the final read.
-    _bind_pending(
-        chain,
-        consumer=following,
-        terminal=following is None,
+    producer = facts_of(_handed_off(previous))
+    chained = []
+    for append, index in stages:
+        chained.append(
+            replace(append.declarations[index], previous=producer, prepared_from=None)
+        )
+        producer = facts_of(chained[-1])
+    connections = _connect_line(
+        chained,
+        [append.origin for append, _ in stages],
+        before=chained[0].previous,
+        after=following,
+    )
+    _bind_line(
+        stages,
+        chained,
+        connections,
+        bound,
+        sources,
         final_read=final_read if following is None else None,
     )
+    for append in appends:
+        if append.prepared_from is None:
+            continue
+        source = sources.get(id(append.prepared_from))
+        if source is None:
+            raise ValueError(
+                "prepared_from must be the declaration of a stage appended "
+                f"earlier to the same layer stack (at {append.origin})"
+            )
+        source_declaration, source_incoming = source
+        branch = [(append, index) for index in range(len(append.bindings))]
+        chained = []
+        for index, declaration in enumerate(append.declarations):
+            chained.append(
+                replace(
+                    declaration,
+                    previous=facts_of(chained[-1]) if chained else None,
+                    prepared_from=None if chained else facts_of(source_declaration),
+                )
+            )
+        try:
+            arrivals = _fork_input(source_incoming)
+        except Exception as error:
+            _note_origin(error, append.origin)
+            raise
+        connections = _connect_line(
+            chained,
+            [append.origin] * len(chained),
+            before=source_declaration,
+            arrivals=arrivals,
+        )
+        _bind_line(branch, chained, connections, bound, sources)
+    bound = [tuple(bound[id(append)]) for append in appends]
     _check_declared_gathers(appends, bound, remote_producer=previous is not None)
     for append, boundaries in zip(appends, bound):
         for returned, boundary in zip(append.boundaries, boundaries):
             returned.plan = boundary.plan
             returned.declaration = boundary.declaration
+
+
+def _bind_line(stages, chained, connections, bound, sources, *, final_read=None):
+    """Bind a chain of stages from its connections, ``connections[i]`` into
+    ``chained[i]`` and ``connections[i + 1]`` out of it. An attention that
+    always leaves its sum binds after the FFN that follows it in the same
+    append, so the attention's entry keeps the residual that FFN's capture
+    needs."""
+    last = len(chained) - 1
+    boundaries = [None] * len(chained)
+
+    def bind(position):
+        append, index = stages[position]
+        norm, options = append.bindings[index]
+        consumer = None
+        if position < last and stages[position + 1][0] is append:
+            consumer = chained[position + 1]
+            if _carries_capture(chained[position], consumer):
+                bind(position + 1)
+        try:
+            boundary = _bind_stage(
+                chained[position],
+                norm,
+                connections[position],
+                connections[position + 1],
+                final_read=final_read if position == last else None,
+                capture_preserves_residual=(
+                    _preserves_residual(boundaries[position + 1])
+                    if consumer is not None
+                    and _carries_capture(chained[position], consumer)
+                    else None
+                ),
+                **options,
+            )
+        except Exception as error:
+            _note_origin(error, append.origin)
+            raise
+        boundaries[position] = boundary
+        bound[id(append)][index] = boundary
+        sources[id(append.boundaries[index].declaration)] = (
+            boundary.declaration,
+            connections[position],
+        )
+
+    for position in range(len(chained)):
+        if boundaries[position] is None:
+            bind(position)
+
+
+def _carries_capture(producer, consumer):
+    """Whether an attention that always leaves its sum keeps the residual its
+    FFN's entry needs for capture. Only between stages of one append."""
+    return (
+        producer.kind is StageKind.ATTENTION
+        and producer.reduction is ProducerReduction.ALWAYS_PARTIAL
+        and consumer.kind is StageKind.FFN
+    )
+
+
+def _preserves_residual(consumer):
+    """Each variant's check that the FFN's entry leaves the residual in place."""
+    return {
+        variant: path.entry.preserves_residual
+        for variant, path in consumer.plan.paths.items()
+        if path.entry.preserves_residual is not None
+    }
 
 
 def _check_declared_gathers(appends, bound, *, remote_producer):
@@ -897,13 +1172,13 @@ def _check_declared_gathers(appends, bound, *, remote_producer):
     ]
     for (origin, consumer), producer in zip(line, [None, *(b for _, b in line)]):
         if consumer.declaration.attn_tp_gather is None or any(
-            _gathers_input(path) for path in consumer.plan.paths.values()
+            path.entry.input_gather_declared for path in consumer.plan.paths.values()
         ):
             continue
         if producer is None and remote_producer:
             continue
         if producer is not None and any(
-            _gathers_output(path) for path in producer.plan.paths.values()
+            path.output_gathers_attn_tp for path in producer.plan.paths.values()
         ):
             continue
         error = ValueError(
@@ -912,14 +1187,6 @@ def _check_declared_gathers(appends, bound, *, remote_producer):
         )
         _note_origin(error, origin)
         raise error
-
-
-def _gathers_input(path):
-    return getattr(path.entry.input_move, "func", None) is attn_tp_gather_input
-
-
-def _gathers_output(path):
-    return getattr(path.output_move, "func", None) is update_attn_tp_gather_output
 
 
 def _ended(declaration, final_read):
@@ -931,62 +1198,6 @@ def _ended(declaration, final_read):
     ):
         return replace(declaration, exit_rows=ExitRows.SLICE)
     return declaration
-
-
-def _bind_pending(chain: _Chain, *, consumer, terminal, final_read=None):
-    pending = chain.pending
-    if pending is None:
-        return
-    chain.pending = None
-    try:
-        declaration = replace(pending.declaration, terminal=terminal)
-        if terminal:
-            declaration = _ended(declaration, final_read)
-        if pending.predecessor is None:
-            incoming = _incoming(declaration)
-        else:
-            incoming = _connect(
-                pending.predecessor,
-                declaration,
-                residual_from=pending.predecessor_incoming,
-            )
-        outgoing = _connect(declaration, consumer, residual_from=incoming)
-        bound = _bind_stage(
-            declaration,
-            pending.norm,
-            incoming,
-            outgoing,
-            final_read=final_read,
-            **pending.options,
-        )
-    except Exception as error:
-        _note_origin(error, pending.origin)
-        raise
-    pending.boundary.plan = bound.plan
-    pending.boundary.declaration = declaration
-    if pending.predecessor_boundary is not None:
-        _carry_capture(pending.predecessor_boundary, pending.boundary)
-
-
-def _carry_capture(producer, consumer):
-    """Let an attention that always leaves its sum preserve the residual its
-    FFN's entry needs for capture. Only between stages of one append."""
-    if not (
-        producer.kind is StageKind.ATTENTION
-        and producer.declaration.reduction is ProducerReduction.ALWAYS_PARTIAL
-        and consumer.kind is StageKind.FFN
-    ):
-        return
-    for variant, steps in producer.plan.paths.items():
-        next_steps = consumer.plan.paths[variant]
-        predicate = next_steps.entry.preserves_residual
-        if predicate is not None:
-            producer.plan.paths[variant] = msgspec.structs.replace(
-                steps,
-                entry=msgspec.structs.replace(
-                    steps.entry, capture_preserves_residual=predicate
-                ),
-            )
 
 
 _STAGE_OPTIONS = {
@@ -1056,61 +1267,3 @@ def append_stages(*stages, prepared_from=None):
         _Append(declarations, bindings, prepared_from, boundaries, _origin(stack))
     )
     return boundaries
-
-
-def _extend(chain, append, prepared_from):
-    """Chain one append onto the stack and bind what can be bound."""
-    declarations, bindings = append.declarations, append.bindings
-    branch = prepared_from is not None
-    if not branch:
-        # This append's first stage is the consumer the pending stage waited for.
-        _bind_pending(chain, consumer=declarations[0], terminal=False)
-    try:
-        chained = []
-        for index, declaration in enumerate(declarations):
-            chained.append(
-                replace(
-                    declaration,
-                    previous=(
-                        chained[-1] if index else (None if branch else chain.previous)
-                    ),
-                    prepared_from=prepared_from if index == 0 else None,
-                )
-            )
-        boundaries = []
-        last = len(chained) - 1
-        # incoming feeds the stage being bound; previous_incoming fed the one
-        # before.
-        previous_incoming, incoming = None, _incoming(chained[0])
-        for index, (declaration, (norm, options)) in enumerate(zip(chained, bindings)):
-            if index == last and not branch:
-                boundaries.append(StageBoundary(None, declaration=declaration))
-                chain.pending = _PendingStage(
-                    boundaries[-1],
-                    declaration,
-                    norm,
-                    options,
-                    predecessor=chained[index - 1] if index else None,
-                    predecessor_incoming=previous_incoming,
-                    predecessor_boundary=boundaries[-2] if index else None,
-                    origin=append.origin,
-                )
-                break
-            following = chained[index + 1] if index < last else None
-            outgoing = _connect(declaration, following, residual_from=incoming)
-            boundaries.append(
-                _bind_stage(declaration, norm, incoming, outgoing, **options)
-            )
-            previous_incoming, incoming = incoming, outgoing
-    except Exception as error:
-        _note_origin(error, append.origin)
-        raise
-    if branch:
-        for producer, consumer in zip(boundaries, boundaries[1:]):
-            _carry_capture(producer, consumer)
-    else:
-        # The pair that ends on the pending stage is carried when it binds.
-        for producer, consumer in zip(boundaries[:-2], boundaries[1:-1]):
-            _carry_capture(producer, consumer)
-        chain.previous = _detached(chained[-1])
-    return tuple(boundaries)
