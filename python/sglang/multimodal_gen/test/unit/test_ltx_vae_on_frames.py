@@ -1,25 +1,25 @@
 # SPDX-License-Identifier: Apache-2.0
 """LTX's frame callback must preserve the existing decode and final crop."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 from diffusers.video_processor import VideoProcessor
-
-from sglang.multimodal_gen.runtime.entrypoints.utils import (
-    _sample_to_uint8_frames,
-    _save_video_ffmpeg,
-    _try_save_video_with_audio,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.stages.encode_while_decoding import (
-    EncodeWhileDecoding,
-)
-from types import SimpleNamespace
 
 from sglang.multimodal_gen.configs.models.vaes.ltx_video import (
     LTXVideoVAEArchConfig,
     LTXVideoVAEConfig,
 )
+from sglang.multimodal_gen.runtime.entrypoints.utils import (
+    _sample_to_uint8_frames,
+    _save_video_ffmpeg,
+    _try_save_video_with_audio,
+)
 from sglang.multimodal_gen.runtime.models.vaes.ltx_2_vae import AutoencoderKLLTX2Video
+from sglang.multimodal_gen.runtime.pipelines_core.stages.encode_while_decoding import (
+    EncodeWhileDecoding,
+)
 
 
 def tiny_vae(device="cpu", dtype=torch.float32):
@@ -121,8 +121,12 @@ def test_stream_matches_cpu_postprocessing(tmp_path, dtype, audio):
     )
     if audio:
         assert _try_save_video_with_audio(
-            save_file_path=str(cpu_path), frames=frames, fps=13,
-            audio=sound, audio_sample_rate=13000, quality=5,
+            save_file_path=str(cpu_path),
+            frames=frames,
+            fps=13,
+            audio=sound,
+            audio_sample_rate=13000,
+            quality=5,
         )
     else:
         _save_video_ffmpeg(str(cpu_path), frames, fps=13, quality=5)

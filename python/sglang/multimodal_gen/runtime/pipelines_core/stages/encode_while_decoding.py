@@ -73,15 +73,22 @@ class EncodeWhileDecoding:
         if self._failed:
             return
         try:
-            if self._finish_frames is not None:
-                frames = self._finish_frames(frames)
-            frames = frames[0]
-            if self._encoder is None:
-                self._encoder = self._open(frames)
+            # Untiled decoders can hand over an entire clip. Bound FP32
+            # postprocessing too, not just the queued uint8 frame copies.
+            height, width = frames.shape[-2:]
+            chunk_frames = max(
+                1, _STREAMED_VIDEO_QUEUE_BYTES // (4 * 3 * height * width * 4)
+            )
+            for chunk in frames.split(chunk_frames, dim=2):
+                if self._finish_frames is not None:
+                    chunk = self._finish_frames(chunk)
+                chunk = chunk[0]
                 if self._encoder is None:
-                    self._failed = True
-                    return
-            self._encoder.write(frames)
+                    self._encoder = self._open(chunk)
+                    if self._encoder is None:
+                        self._failed = True
+                        return
+                self._encoder.write(chunk)
         except Exception:
             self._fail()
 
