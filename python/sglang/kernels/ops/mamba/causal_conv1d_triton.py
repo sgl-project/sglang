@@ -709,7 +709,7 @@ QWEN38_GDN_QKV_DIM = (
 def can_use_qwen38_gdn_prefill_prologue(
     x: torch.Tensor,
     weight: torch.Tensor,
-    bias: torch.Tensor,
+    bias: Optional[torch.Tensor],
     conv_states: torch.Tensor,
     query_start_loc: torch.Tensor,
     seq_lens_cpu: List[int],
@@ -722,10 +722,10 @@ def can_use_qwen38_gdn_prefill_prologue(
     activation: Optional[str] = "silu",
 ) -> tuple[bool, str]:
     """Fail-closed contract for the Qwen3.8 TP1 fused prefill producer."""
+    # The Qwen3.8 GDN Conv1D has no bias, so bias may be None.
     tensors = (
         x,
         weight,
-        bias,
         conv_states,
         query_start_loc,
         cache_indices,
@@ -734,7 +734,7 @@ def can_use_qwen38_gdn_prefill_prologue(
         a,
         b,
         dt_bias,
-    )
+    ) + (() if bias is None else (bias,))
     if not all(isinstance(tensor, torch.Tensor) for tensor in tensors):
         return False, "all inputs must be torch.Tensor instances"
     if torch.version.hip is None or not all(tensor.is_cuda for tensor in tensors):
@@ -753,7 +753,7 @@ def can_use_qwen38_gdn_prefill_prologue(
     num_tokens = x.shape[1]
     if weight.shape != (QWEN38_GDN_QKV_DIM, 4):
         return False, "Conv1D weight must have shape [10240, 4]"
-    if bias.shape != (QWEN38_GDN_QKV_DIM,):
+    if bias is not None and bias.shape != (QWEN38_GDN_QKV_DIM,):
         return False, "Conv1D bias must have shape [10240]"
     if (
         conv_states.ndim != 3
@@ -790,6 +790,7 @@ def can_use_qwen38_gdn_prefill_prologue(
     if any(
         tensor.dtype is not torch.bfloat16
         for tensor in (weight, bias, conv_states, a, b)
+        if tensor is not None
     ):
         return False, "Conv1D, state, and raw gate tensors must be BF16"
     if A_log.dtype is not torch.float32:
@@ -805,7 +806,7 @@ def can_use_qwen38_gdn_prefill_prologue(
 
     if x.stride(0) != 1 or x.stride(1) < QWEN38_GDN_QKV_DIM:
         return False, "x must be non-overlapping with a unit feature stride"
-    if weight.stride(1) != 1 or bias.stride(0) != 1:
+    if weight.stride(1) != 1 or (bias is not None and bias.stride(0) != 1):
         return False, "Conv1D weight/bias inner dimensions must be contiguous"
     if a.stride(1) != 1 or b.stride(1) != 1:
         return False, "raw A/B head dimensions must have unit stride"
@@ -823,7 +824,7 @@ def can_use_qwen38_gdn_prefill_prologue(
 def qwen38_gdn_prefill_prologue(
     x: torch.Tensor,
     weight: torch.Tensor,
-    bias: torch.Tensor,
+    bias: Optional[torch.Tensor],
     conv_states: torch.Tensor,
     query_start_loc: torch.Tensor,
     seq_lens_cpu: List[int],
@@ -922,7 +923,7 @@ def qwen38_gdn_prefill_prologue(
         b.stride(0),
         b.stride(1),
         PAD_SLOT_ID,
-        HAS_BIAS=True,
+        HAS_BIAS=bias is not None,
         KERNEL_WIDTH=weight.shape[1],
         SILU_ACTIVATION=activation in ("silu", "swish"),
         HAS_INITIAL_STATES=True,
