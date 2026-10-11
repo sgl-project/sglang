@@ -124,10 +124,26 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
         )
 
     if cfg.cp_strategy == "zigzag" and not is_npu():
-        raise ValueError(
-            "DeepSeekV4 zigzag CP requires the NPU backend; CUDA/HIP backends "
-            "reindex with interleave order."
+        if get_platform().is_hip:
+            raise ValueError("DeepSeekV4 zigzag CP is not supported on HIP.")
+        hf_config = model_config_of(server_args).hf_config
+        unsupported = (
+            ("DeepSeek-V4.1", hf_config.model_type == "deepseek_v41"),
+            (
+                "compression ratios other than SWA/c4/c128",
+                any(
+                    ratio not in (0, 4, 128)
+                    for ratio in getattr(hf_config, "compress_ratios", ())
+                ),
+            ),
+            ("Engram", bool(getattr(hf_config, "engram_layer_ids", ()))),
+            ("decoder SWA bounded replay", cfg.enable_decoder_swa_bounded_replay),
         )
+        for feature, enabled in unsupported:
+            if enabled:
+                raise ValueError(
+                    f"DeepSeekV4 CUDA zigzag CP does not support {feature} yet."
+                )
     if get_platform().is_hip:
         prefill_backend, decode_backend = attention_backends_of(
             resolved_view(server_args)

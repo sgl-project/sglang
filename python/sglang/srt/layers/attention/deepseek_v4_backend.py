@@ -91,6 +91,11 @@ from sglang.srt.layers.attention.verify_mask import (
     VerifyMask,
     maybe_create_verify_mask,
 )
+from sglang.srt.layers.cp.base import (
+    BaseContextParallelMetadata,
+    get_cp_strategy,
+    is_zigzag,
+)
 from sglang.srt.layers.cp.interleave import (
     InterleaveContextParallelMetadata,
     interleave_rows_per_request,
@@ -1375,7 +1380,7 @@ class DeepseekV4AttnBackend(
         dspark_block_size: Optional[int] = None,
         forward_batch: Optional[ForwardBatch] = None,
         swa_replay_start: Optional[torch.Tensor] = None,
-        cp_metadata: Optional[InterleaveContextParallelMetadata] = None,
+        cp_metadata: Optional[BaseContextParallelMetadata] = None,
         dspark_swa_buffers: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> DSV4Metadata:
         padded_num_tokens = out_cache_loc.shape[0]
@@ -1419,8 +1424,45 @@ class DeepseekV4AttnBackend(
             num_groups=len(extend_seq_lens_cpu),
         )
         if cp_active:
+            # Tail replay supplies an explicit interleave layout. Ordinary CP
+            # uses the strategy's logical query order, including zigzag's
+            # early blocks of every request followed by all late blocks.
+            local_index = (
+                cp_metadata.local_index
+                if isinstance(cp_metadata, InterleaveContextParallelMetadata)
+                else None
+            )
+            if local_index is None:
+                local_index = (
+                    get_cp_strategy()
+                    .local_q_indices(num_tokens, forward_batch)
+                    .to(
+                        device=core_attn_metadata.seq_lens_casual.device,
+                        dtype=torch.long,
+                    )
+                )
+                physical_len = cp_metadata.per_rank_actual_token[
+                    get_parallel().attn_cp_rank
+                ]
+                pad_count = physical_len - local_index.numel()
+                assert pad_count >= 0
+                assert num_tokens + pad_count <= padded_num_tokens
+                if pad_count:
+                    # Select the prebuilt padding metadata rather than a live
+                    # query. CP gathers discard these padded output rows.
+                    local_index = torch.cat(
+                        (
+                            local_index,
+                            torch.arange(
+                                num_tokens,
+                                num_tokens + pad_count,
+                                device=local_index.device,
+                                dtype=torch.long,
+                            ),
+                        )
+                    )
             core_attn_metadata.apply_cp_reindex(
-                num_tokens=num_tokens, local_index=cp_metadata.local_index
+                num_tokens=num_tokens, local_index=local_index
             )
             core_attn_metadata.init_flashmla_related(is_prefill=True)
         indexer_metadata = (
@@ -3480,9 +3522,13 @@ class DeepseekV4AttnBackend(
                     f"{extra_indices.shape=}'s last dimension is not aligned to 64"
                 )
 
+            # Chunked sparse prefill assumes one contiguous query interval per
+            # request. Zigzag has separate early/late intervals, so use the
+            # per-query page-table path even above the automatic size threshold.
             # RequestWindow sparse gathering does not support CP yet.
             if (
                 forward_batch.forward_mode.is_extend_without_speculative()
+                and not (is_cp_active(forward_batch) and is_zigzag())
                 and not get_platform().is_sm120
                 and (
                     (
