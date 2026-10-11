@@ -29,6 +29,9 @@ from sglang.srt.speculative.ragged_verify import (
     read_ragged_verify_mode,
 )
 
+if TYPE_CHECKING:
+    from sglang.srt.distributed.device_communicators.vocab_gather import VocabGather
+
 logger = logging.getLogger(__name__)
 
 StepSampler = Callable[[torch.Tensor, int], torch.Tensor]
@@ -86,10 +89,6 @@ def run_markov_block(
     )
 
 
-if TYPE_CHECKING:
-    from sglang.srt.distributed.device_communicators.vocab_gather import VocabGather
-
-
 class VocabShard(msgspec.Struct, frozen=True):
     """Where a rank's vocab slice starts, and the gather over its group."""
 
@@ -100,6 +99,10 @@ class VocabShard(msgspec.Struct, frozen=True):
 class BaseDSparkMarkovHead(nn.Module, ABC):
     """Corrects a draft block step by step: each step's base logits get a bias
     computed from the token drafted at the step before."""
+
+    vocab_size: int
+    # The rank's slice of a TP-sharded vocab; None when the vocab is whole.
+    vocab_shard: Optional[VocabShard] = None
 
     def init_state(
         self, hidden_states: Optional[torch.Tensor]
@@ -125,9 +128,6 @@ class BaseDSparkMarkovHead(nn.Module, ABC):
     @abstractmethod
     def step_logits_dtype(self, base_dtype: torch.dtype) -> torch.dtype:
         """The dtype of ``base_logits + bias``."""
-
-    # The rank's slice of a TP-sharded vocab; None when the vocab is whole.
-    vocab_shard: Optional[VocabShard] = None
 
     @property
     def supports_sharded_greedy(self) -> bool:
