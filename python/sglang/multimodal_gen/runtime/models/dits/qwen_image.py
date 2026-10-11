@@ -744,7 +744,6 @@ class QwenImageCrossAttention(nn.Module):
         self.window_size = window_size
         self.qk_norm = qk_norm
         self.eps = eps
-        self.parallel_attention = parallel_attention
         self.added_kv_proj_dim = added_kv_proj_dim
         self.prefix = prefix
         self.defer_output_bias = _defer_modelopt_output_bias(quant_config)

@@ -64,6 +64,10 @@ from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.encoder.receiver import create_mm_receiver
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
+from sglang.srt.layers.joint_schema_head import (
+    max_joint_prompt_tokens,
+    parse_decision_layout,
+)
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
 from sglang.srt.managers.disagg_service import start_disagg_service
@@ -1295,6 +1299,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 raise ValueError(
                     "encoder SWA replay cannot return cached prompt logprobs"
                 )
+        # A decision layout indexes the whole prompt, so it is checked before any
+        # truncation below could cut the prompt.
+        self._validate_joint_schema_request(obj, input_ids)
         _max_req_len = self.context_len
         input_token_num = len(input_ids) if input_ids is not None else 0
         input_token_num += self.num_reserved_tokens
@@ -1398,6 +1405,36 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     "sampling_logprobs_mode can only be set when "
                     "return_sampling_mask=true."
                 )
+
+    def _validate_joint_schema_request(
+        self, obj: Union[GenerateReqInput, EmbeddingReqInput], input_ids: List[int]
+    ) -> None:
+        """A Clef checkpoint scores the spans of a decision layout, and nothing else."""
+        if self.model_config.joint_head_config is None:
+            return
+        if isinstance(obj, GenerateReqInput) or obj.decision_layout is None:
+            # Health checks only need a response, which is an empty embedding.
+            if (
+                isinstance(obj, EmbeddingReqInput)
+                and isinstance(obj.rid, str)
+                and obj.rid.startswith(HEALTH_CHECK_RID_PREFIX)
+            ):
+                return
+            raise ValueError(
+                "This checkpoint answers schema decisions, send them to /v1/systemone"
+            )
+        limit = max_joint_prompt_tokens(
+            context_len=self.context_len,
+            num_reserved_tokens=self.num_reserved_tokens,
+            max_req_input_len=self.max_req_input_len,
+            max_prefill_tokens=get_schedule().max_prefill_tokens,
+        )
+        if len(input_ids) > limit:
+            raise ValueError(
+                f"The prompt has {len(input_ids)} tokens, but this server scores "
+                f"at most {limit} in one prefill"
+            )
+        parse_decision_layout(obj.decision_layout, len(input_ids))
 
     def _validate_mm_limits(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]
@@ -1575,6 +1612,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 return_pooled_hidden_states=obj.return_pooled_hidden_states,
                 multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
                 token_indices_to_pool=obj.token_indices_to_pool,
+                decision_layout=obj.decision_layout,
             )
 
         tokenized_obj.time_stats = self.rid_to_state[obj.rid].time_stats

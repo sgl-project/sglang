@@ -218,6 +218,24 @@ def test_trim_overshoot_postcondition():
     assert [t.tolist() for t in allocator.freed] == [[38, 39, 40, 41], [42, 43]]
 
 
+@pytest.mark.parametrize(
+    "target, end, freed",
+    [(17, 20, []), (17, 32, []), (17, 40, [(32, 40)]), (32, 48, [(32, 48)])],
+)
+def test_free_kv_aligned_skips_a_range_inside_the_partial_page(target, end, freed):
+    """Rounding ``target`` up to a page boundary can move the start of the
+    range at or past ``end``; such a rewind frees nothing and must not reach
+    the cache at all, while a range that still spans a whole page is freed."""
+    calls = []
+    session = StreamingSession(
+        SimpleNamespace(
+            page_size=16, free_kv_row=lambda _kv, ranges: calls.extend(ranges)
+        )
+    )
+    session._free_kv_aligned(None, target, end)
+    assert calls == freed
+
+
 @pytest.mark.parametrize("operation", ["trim", "match"])
 @pytest.mark.parametrize("component", [ComponentType.SWA, ComponentType.AUXILIARY_SWA])
 def test_session_rewind_keeps_component_cursors_page_aligned(operation, component):

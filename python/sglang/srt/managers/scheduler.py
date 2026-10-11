@@ -671,6 +671,7 @@ class Scheduler(
         # Init prefill kv split size when deterministic inference is enabled with various attention backends
         self.init_deterministic_inference_config()
         self.init_dsa_kpool_truncation_align()
+        self.check_truncation_align_fits_chunk()
 
         self.init_weight_updater()
 
@@ -1287,6 +1288,7 @@ class Scheduler(
             tuple[ScheduleBatch, GenerationBatchResult | EmbeddingBatchResult]
         ] = deque()
         self.enable_continuous_input_polling = False
+        self.enable_skip_finishing_decode = False
         self.forward_ct = 0
         self.return_health_check_ipcs: Deque[Optional[str]] = deque()
         self.flush_wrapper = SchedulerFlushWrapper(
@@ -1670,12 +1672,11 @@ class Scheduler(
             self.truncation_align_size = None
             return
 
+        # Only flashinfer needs chunks on its prefill split tiles; triton tiles
+        # keys at absolute positions (align_window_kv_to_tiles).
         backend_sizes = {
             "flashinfer": ("SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE", 4096),
-            "triton": ("SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE", 4096),
         }
-        # Both entries are prefill knobs (SPLIT_TILE / PREFILL_TRUNCATION):
-        # the prefill half decides.
         prefill_backend, _ = attention_backends()
         env_var, default_size = backend_sizes.get(prefill_backend, (None, None))
         self.truncation_align_size = (
@@ -1703,6 +1704,31 @@ class Scheduler(
             self.truncation_align_size = math.lcm(
                 self.truncation_align_size, dsa_index_kpool
             )
+
+    def check_truncation_align_fits_chunk(self):
+        """A chunk shorter than the alignment truncates to zero tokens, so a prompt
+        longer than the chunk would wait in the queue forever."""
+        align = self.truncation_align_size
+        chunk = self.chunked_prefill_size
+        if align is None or chunk is None or chunk >= align:
+            return
+        if self.disaggregation_mode == DisaggregationMode.DECODE:
+            # A decode server never prefills a prompt.
+            return
+        attn_dp_size = get_parallel().attn_dp_size
+        dp_note = (
+            f" (--chunked-prefill-size is split across {attn_dp_size} DP attention ranks)"
+            if attn_dp_size > 1
+            else ""
+        )
+        raise ValueError(
+            f"Chunked prefill is aligned to {align} tokens, but each rank's "
+            f"chunked prefill size is {chunk}{dp_note}; a prompt longer than "
+            f"{chunk} tokens could never be scheduled. Raise --chunked-prefill-size "
+            f"to at least {align * attn_dp_size}, or, with the flashinfer backend "
+            f"under deterministic inference, lower "
+            f"SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE."
+        )
 
     def init_request_dispatcher(self):
         self._request_dispatcher = TypeBasedDispatcher(
@@ -1937,6 +1963,7 @@ class Scheduler(
     @DynamicGradMode()
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
+        self.enable_skip_finishing_decode = True
         self.result_queue: Deque[
             Tuple[ScheduleBatch, Union[GenerationBatchResult, EmbeddingBatchResult]]
         ] = deque()
@@ -2723,7 +2750,6 @@ class Scheduler(
     def _maybe_namespace_elastic_radix_cache(self, req: Req) -> None:
         if (
             get_exec().moe.elastic_ep_backend is None
-            or self.disable_radix_cache
             or not self.tree_cache.supports_prefix_sharing()
         ):
             return
@@ -3463,6 +3489,7 @@ class Scheduler(
             return_pooled_hidden_states=recv_req.return_pooled_hidden_states,
             multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
             token_indices_to_pool=recv_req.token_indices_to_pool,
+            decision_layout=recv_req.decision_layout,
         )
         req.tokenizer = self.tokenizer
         self._maybe_namespace_elastic_radix_cache(req)
@@ -3664,17 +3691,17 @@ class Scheduler(
             self.dllm_manager.filter_finished_reqs()
 
         # Merge the prefill batch into the running batch
-        chunked_req_to_exclude = set()
+        reqs_to_exclude = set()
 
         if self.dllm_config is not None and self.dllm_manager.any_staging_reqs():
-            chunked_req_to_exclude.update(self.dllm_manager.staging_queue)
+            reqs_to_exclude.update(self.dllm_manager.staging_queue)
             for req in self.dllm_manager.staging_queue:
                 self.finish_dllm_forward(req)
 
         if self.chunked_req is not None:
             # Move the chunked request out of the batch so that we can merge
             # only finished requests to running_batch.
-            chunked_req_to_exclude.add(self.chunked_req)
+            reqs_to_exclude.add(self.chunked_req)
 
             # A parked chunk (add_chunked_req hybrid-SWA early-return) leaves
             # extend_end at prefix_len: it computed no new KV, so nothing to stash.
@@ -3702,14 +3729,14 @@ class Scheduler(
             if last_batch.chunked_req is not None:
                 # In the context pipeline parallelism, after the last chunk, the current microbatch still track outdated chunked_req.
                 # We need to discard it.
-                chunked_req_to_exclude.add(last_batch.chunked_req)
+                reqs_to_exclude.add(last_batch.chunked_req)
 
             if self.dllm_config is not None and last_batch.reqs:
-                chunked_req_to_exclude.update(last_batch.reqs)
+                reqs_to_exclude.update(last_batch.reqs)
 
             # Filter batch
             last_bs = last_batch.batch_size()
-            last_batch.filter_batch(chunked_req_to_exclude=list(chunked_req_to_exclude))
+            last_batch.filter_batch(reqs_to_exclude=list(reqs_to_exclude))
             if last_batch.batch_size() < last_bs:
                 running_batch.batch_is_full = False
 
@@ -3760,8 +3787,12 @@ class Scheduler(
         else:
             # Run decode (skip for prefill-only batches)
             if not running_batch.is_empty() and not running_batch.is_prefill_only:
-                running_batch = self.update_running_batch(running_batch)
-                ret = running_batch if not running_batch.is_empty() else None
+                decode_batch = self.update_running_batch(running_batch)
+                ret = (
+                    decode_batch
+                    if decode_batch is not None and not decode_batch.is_empty()
+                    else None
+                )
             else:
                 ret = None
 
@@ -4145,7 +4176,10 @@ class Scheduler(
             and all(r.beam_group is None for r in running_batch.reqs)
         ):
             # TODO (lianmin): support return_logprob + mixed chunked prefill
-            running_batch.filter_batch()
+            finishing_reqs = self._reqs_finishing_inflight(running_batch)
+            running_batch.filter_batch(reqs_to_exclude=finishing_reqs)
+            if finishing_reqs:
+                running_batch.batch_is_full = False
             if not running_batch.is_empty():
                 running_batch.prepare_for_decode()
                 new_batch.mix_with_running(running_batch)
@@ -4197,17 +4231,40 @@ class Scheduler(
                 new_lora_set
             )
 
+    def _reqs_finishing_inflight(self, batch: ScheduleBatch) -> List[Req]:
+        """Requests whose queued result commits their last output by length."""
+        if not self.enable_skip_finishing_decode or not self.result_queue:
+            return []
+        # At scheduling time the overlap loop has processed every result but the last.
+        assert len(self.result_queue) == 1
+        queued_reqs = set(self.result_queue[0][0].reqs)
+        return [
+            req
+            for req in batch.reqs
+            if req in queued_reqs
+            and req.beam_group is None
+            and req.next_output_finishes_by_length()
+        ]
+
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
-        """Update the current running decoding batch."""
+        """Update the running decoding batch in place; None skips decode this step."""
         initial_bs = batch.batch_size()
 
-        batch.filter_batch()
+        finishing_reqs = self._reqs_finishing_inflight(batch)
+        batch.filter_batch(reqs_to_exclude=finishing_reqs)
         if batch.is_empty():
             batch.batch_is_full = False
             return batch
 
+        kv_full_retract_flag = not batch.check_decode_mem()
+        if kv_full_retract_flag and finishing_reqs:
+            # The queued result frees the finishing requests' KV at the end of
+            # this step; decode the rest next step instead of retracting them.
+            batch.batch_is_full = False
+            return None
+
         # Check if decode out of memory
-        if (kv_full_retract_flag := not batch.check_decode_mem()) or (
+        if kv_full_retract_flag or (
             TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0
         ):
             if self.decode_offload_manager is not None:
@@ -5332,7 +5389,7 @@ class Scheduler(
             )
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
             if self.disaggregation_mode == DisaggregationMode.DECODE:
-                if get_disagg().disaggregation_decode_host_receive_threshold > 0:
+                if get_disagg().disaggregation_decode_host_receive_threshold < 1:
                     discard_kv_cache_backup(req, self.tree_cache, "host_pool")
                 if self.enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
@@ -5470,6 +5527,8 @@ class Scheduler(
                 req.tmp_end_idx = min(req.extend_end, len(req.origin_input_ids))
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
+        elif self.enable_overlap_mlx:
+            self._drain_mlx_pending_jobs()
 
         retract_reqs = [r for r in self.running_batch.reqs if not r.finished()]
         if (
@@ -5807,6 +5866,7 @@ def dispatch_event_loop(scheduler: Scheduler):
 def _dispatch_event_loop_once(scheduler: Scheduler):
     # A PD role switch can select a different loop on the same scheduler.
     scheduler.enable_continuous_input_polling = False
+    scheduler.enable_skip_finishing_decode = False
     disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
     if disaggregation_mode == DisaggregationMode.NULL:
         if scheduler.enable_pdmux:

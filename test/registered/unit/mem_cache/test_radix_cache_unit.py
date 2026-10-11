@@ -44,6 +44,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertParams,
     MatchPrefixParams,
 )
+from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.events import KVCacheEventRecorder
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.utils import get_device
@@ -324,6 +325,27 @@ class TestRadixCache(CustomTestCase):
                 self.assertEqual(cache.device, torch.device("cpu"))
                 self.assertIsNotNone(cache.root_node)
                 self.assertEqual(len(cache.root_node.key), 0)
+
+    def test_disabled_cache_skips_events_and_eviction_config(self):
+        def make(disable):
+            return RadixCache(
+                CacheInitParams(
+                    disable=disable,
+                    req_to_token_pool=None,
+                    token_to_kv_pool_allocator=None,
+                    page_size=1,
+                    enable_kv_cache_events=True,
+                    eviction_policy="lru",
+                    eviction_policy_config={"not_an_lru_option": 1},
+                )
+            )
+
+        cache = make(disable=True)
+        cache.reset()
+        self.assertEqual(cache.take_events(), [])
+
+        with self.assertRaises(TypeError):
+            make(disable=False)
 
     def test_reset(self):
         """Test reset method."""
