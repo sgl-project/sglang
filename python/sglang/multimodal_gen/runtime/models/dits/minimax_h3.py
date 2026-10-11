@@ -682,6 +682,14 @@ def _minimax_h3_bind_attention_backend(
         )
 
 
+# FlashAttention on Hopper and cuDNN SDPA on Blackwell give a head group the
+# same bytes as those heads inside the full call (checked at H3's shapes)
+_PIPELINED_ATTENTION_BACKENDS = (
+    AttentionBackendEnum.FA,
+    AttentionBackendEnum.DYNAMIC_CUDNN_SDPA,
+)
+
+
 def _minimax_h3_pipelined_dense_attention(
     attention: MiniMaxH3Attention,
     q: torch.Tensor,
@@ -693,18 +701,20 @@ def _minimax_h3_pipelined_dense_attention(
     max_seqlen: int,
     fill=None,
 ) -> torch.Tensor | None:
-    """Dense FA with the Ulysses exchange pipelined over head groups.
+    """Dense attention with the Ulysses exchange pipelined over head groups.
 
     Returns None (caller keeps the sequential exchange) unless head-group
-    pipelining is enabled and the dense FlashAttention path would run.
+    pipelining is enabled and a dense backend that runs a head group exactly
+    as it runs those heads in the full call would serve it.
     """
     groups = envs.SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS
     if groups in (0, 1) or torch.compiler.is_compiling():
         return None
-    if attention._attention_backend_enum is not AttentionBackendEnum.FA:
+    if attention._attention_backend_enum not in _PIPELINED_ATTENTION_BACKENDS:
         return None
     impl = attention._attention_impl
-    if impl._request_skip_softmax_threshold()[0]:
+    skip_softmax = getattr(impl, "_request_skip_softmax_threshold", None)
+    if skip_softmax is not None and skip_softmax()[0]:
         return None
     from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a_multi import (
         ulysses_pipelined_attention,
@@ -737,9 +747,10 @@ def _minimax_h3_qknorm_rope_pipelined_attention(
     """The pipelined attention with QK-norm + RoPE writing into the exchange.
 
     q/k are the raw projections. Each destination block gets its heads'
-    normalized q/k and v written in place, so the in-place norm and the pack
-    become one pass. Same kernel arithmetic, so the result is bit-identical.
-    Returns None, having written nothing, when the call cannot pipeline.
+    normalized q and k written in place, so the in-place norm and the pack
+    become one pass, and v moves on the copy engine. Same kernel arithmetic,
+    so the result is bit-identical. Returns None, having written nothing,
+    when the call cannot pipeline.
     """
     # under graph capture the forward keeps the in-place norm, and the pipeline
     # runs from the attention core's eager break point instead
@@ -753,13 +764,15 @@ def _minimax_h3_qknorm_rope_pipelined_attention(
     head_dim = attention.head_dim
     q_weight, k_weight = attention.q_norm.weight, attention.k_norm.weight
 
-    def fill(head_start: int, head_count: int, dst: torch.Tensor) -> None:
+    def fill(
+        head_start: int, head_count: int, q_dst: torch.Tensor, k_dst: torch.Tensor
+    ) -> None:
         heads = slice(head_start, head_start + head_count)
         fused_qknorm_rope_out_of_place(
             q[:, heads],
             k[:, heads],
-            dst[..., :head_dim],
-            dst[..., head_dim : 2 * head_dim],
+            q_dst,
+            k_dst,
             q_weight,
             k_weight,
             cos_sin_cache,
@@ -770,7 +783,6 @@ def _minimax_h3_qknorm_rope_pipelined_attention(
             rope_dim=cos_sin_cache.shape[-1],
             round_norm_before_rope=True,
         )
-        dst[..., 2 * head_dim :].copy_(v[:, heads])
 
     return _minimax_h3_pipelined_dense_attention(
         attention,
@@ -1792,8 +1804,8 @@ class MiniMaxH3FinalLayer(nn.Module):
         if not 0 <= step < stack.shape[0]:
             raise ValueError(
                 f"MiniMax-H3 PDD has {stack.shape[0]} fused heads but the loop is at "
-                f"step {step}; run with --num-inference-steps {stack.shape[0] + 1} "
-                "(H3 counts sigma grid points, so that is one more than the steps)."
+                f"step {step}; run with --num-inference-steps {stack.shape[0]} "
+                "(num_inference_steps counts denoise transitions)."
             )
         weight = stack[step].to(device=h.device, dtype=h.dtype)
         bias = heads[f"{name}.bias"][step].to(device=h.device, dtype=h.dtype)

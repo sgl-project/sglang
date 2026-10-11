@@ -20,6 +20,7 @@
 """SGLang LLaDA2MoeModelLM model."""
 
 import logging
+from functools import partial
 from typing import Iterable, Optional, Tuple, Union
 
 import torch
@@ -1150,7 +1151,6 @@ class LLaDA2MoeBlock(nn.Module):
         self.layer_id = layer_id
 
         self.is_layer_sparse = self._is_layer_sparse(config, layer_id=layer_id)
-        is_next_layer_sparse = self._is_layer_sparse(config, layer_id=layer_id + 1)
 
         if self.is_layer_sparse:
             self.mlp = LLaDA2MoeSparseMoeBlock(
@@ -1173,18 +1173,27 @@ class LLaDA2MoeBlock(nn.Module):
 
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=config.rms_norm_eps)
 
+        attn, ffn = self.stage_facts(config, layer_id)
         self.attn_boundary, self.ffn_boundary = append_stages(
-            (declare_attn(), self.input_layernorm),
-            (
-                declare_ffn(
-                    sparse=self.is_layer_sparse,
-                    next_layer_sparse=is_next_layer_sparse,
-                ),
-                self.post_attention_layernorm,
+            (attn, self.input_layernorm),
+            (ffn, self.post_attention_layernorm),
+        )
+
+    @classmethod
+    def stage_facts(cls, config: PretrainedConfig, layer_id: int):
+        """The stages the layer at ``layer_id`` declares, in order: the model's
+        shared declaration function, which the layer declares with too (see
+        make_layers)."""
+        return (
+            declare_attn(),
+            declare_ffn(
+                sparse=cls._is_layer_sparse(config, layer_id=layer_id),
+                next_layer_sparse=cls._is_layer_sparse(config, layer_id=layer_id + 1),
             ),
         )
 
-    def _is_layer_sparse(self, config: PretrainedConfig, layer_id: int) -> bool:
+    @staticmethod
+    def _is_layer_sparse(config: PretrainedConfig, layer_id: int) -> bool:
         return (
             config.num_experts is not None and layer_id >= config.first_k_dense_replace
         )
@@ -1253,6 +1262,7 @@ class LLaDA2MoeModel(nn.Module):
                 alt_stream=alt_stream,
             ),
             prefix=add_prefix("layers", prefix),
+            stage_facts=partial(LLaDA2MoeBlock.stage_facts, config),
         )
         if self.pp_group.is_last_rank:
             self.norm = RMSNorm(self.embed_dim, eps=config.rms_norm_eps)

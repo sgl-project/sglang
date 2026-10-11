@@ -448,6 +448,37 @@ class BaseLayerWithLoRA(nn.Module):
         self._merge_lora_into_data(work, self.lora_weights_list)
         return work.to("cpu", dtype=target_dtype)
 
+    @torch.no_grad()
+    def merge_rounding_norms(self, max_rows: int = 1024) -> tuple[float, float] | None:
+        """Squared norms of the part of the active LoRA update that merging
+        into this layer's weight dtype would round away, and of the update,
+        over an even sample of rows. Nothing is written; None when there is
+        nothing to round or the adapter has no plain 2-D form here."""
+        lora_list = self._active_lora_list()
+        if self.disable_lora or not lora_list:
+            return None
+        src, _ = self._materialized_weight_src()
+        if not src.is_floating_point() or src.dtype == torch.float32:
+            return None
+        weight = src.reshape(-1, src.shape[-1])
+        device = get_local_torch_device()
+        rows = torch.linspace(0, weight.shape[0] - 1, min(max_rows, weight.shape[0]))
+        rows = rows.round().long().unique()
+        base = weight[rows.to(weight.device)].to(device, torch.float32)
+        delta = torch.zeros_like(base)
+        for lora_A, lora_B, _, strength, rank, alpha, _ in lora_list:
+            a = self.slice_lora_a_weights(lora_A.to(device, torch.float32))
+            b = self.slice_lora_b_weights(lora_B.to(device, torch.float32))
+            if not isinstance(b, torch.Tensor) or a.dim() > 2 or b.dim() > 2:
+                return None
+            scale = strength
+            if alpha is not None and rank is not None and alpha != rank:
+                scale *= alpha / rank
+            delta += scale * (b[rows.to(device)] @ a)
+        exact = base + delta
+        lost = exact.to(src.dtype).to(torch.float32) - exact
+        return float(lost.square().sum()), float(delta.square().sum())
+
     def install_merged_weight(
         self, merged: torch.Tensor, base_view: torch.Tensor
     ) -> None:
