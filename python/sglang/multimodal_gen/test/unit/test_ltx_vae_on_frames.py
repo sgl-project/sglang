@@ -13,16 +13,24 @@ from sglang.multimodal_gen.configs.models.vaes.ltx_video import (
     LTXVideoVAEConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
-from sglang.multimodal_gen.configs.sample.sampling_params import DataType
+from sglang.multimodal_gen.configs.sample.joy_echo import JoyEchoSamplingParams
+from sglang.multimodal_gen.configs.sample.sampling_params import (
+    DataType,
+    SamplingParams,
+)
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
     _sample_to_uint8_frames,
     _save_video_ffmpeg,
     _try_save_video_with_audio,
 )
 from sglang.multimodal_gen.runtime.models.vaes.ltx_2_vae import AutoencoderKLLTX2Video
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.encode_while_decoding import (
     EncodeWhileDecoding,
     can_encode_while_decoding,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.joy_echo.setup import (
+    JoyEchoMultishotSetupStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ltx_2.decoding_av import (
     LTX2AVDecodingStage,
@@ -159,16 +167,23 @@ def test_audio_order_and_encode_fallback(
     stage.video_processor = VideoProcessor()
     calls = []
     video = torch.zeros(1, 3, 1, 8, 8)
-    request = SimpleNamespace(
+    request = Req(
+        sampling_params=(
+            JoyEchoSamplingParams() if enable_memory_bank else SamplingParams()
+        ),
         latents=video,
-        enable_memory_bank=enable_memory_bank,
-        use_diffusion_decoder=False,
-        return_trajectory_decoded=False,
-        trajectory_timesteps=None,
-        trajectory_latents=None,
-        metrics=None,
-        rollout_trajectory_data=None,
     )
+    request.use_diffusion_decoder = False
+    request.return_trajectory_decoded = False
+    if enable_memory_bank:
+        setup = JoyEchoMultishotSetupStage(
+            SimpleNamespace(
+                multishot_index=0,
+                _multishot_session_id=None,
+                reset_memory_bank=mock.Mock(),
+            )
+        )
+        setup.forward(request, None)
     module = LTX2AVDecodingStage.__module__
     encoder = mock.Mock()
     encoder.finish.return_value = saved
@@ -212,16 +227,29 @@ def test_audio_order_and_encode_fallback(
 
 @pytest.mark.parametrize("enable_memory_bank", [False, True])
 def test_memory_bank_retains_decoded_frames(enable_memory_bank):
-    request = SimpleNamespace(
-        save_output=True,
-        return_file_paths_only=True,
-        return_raw_frames=False,
-        enable_memory_bank=enable_memory_bank,
-        data_type=DataType.VIDEO,
-        enable_frame_interpolation=False,
-        enable_upscaling=False,
-        extra={},
+    request = Req(
+        sampling_params=(
+            JoyEchoSamplingParams() if enable_memory_bank else SamplingParams()
+        )
     )
+    request.save_output = True
+    request.return_file_paths_only = True
+    request.return_raw_frames = False
+    request.data_type = DataType.VIDEO
+    request.enable_frame_interpolation = False
+    request.enable_upscaling = False
+    if enable_memory_bank:
+        setup = JoyEchoMultishotSetupStage(
+            SimpleNamespace(
+                multishot_index=0,
+                _multishot_session_id=None,
+                reset_memory_bank=mock.Mock(),
+            )
+        )
+        setup.forward(request, None)
+    else:
+        with pytest.raises(AttributeError):
+            request.enable_memory_bank
     server_args = SimpleNamespace(
         enable_torch_compile=False, pipeline_config=PipelineConfig()
     )

@@ -157,7 +157,7 @@ class LTX2AVDecodingStage(DecodingStage):
         if output_paths is not None:
             output_batch.output_file_paths = output_paths
         elif (
-            batch.enable_memory_bank
+            batch.extra.get("retain_decoded_frames", False)
             or not model_parallel_is_initialized()
             or get_replica_group().rank_in_group == 0
         ):
