@@ -609,6 +609,18 @@ def refresh_kpool_topk_v2_plan(*, plan: torch.Tensor, pool_lens: torch.Tensor) -
     plan_topk_v2(pool_lens.to(torch.int32), out=plan)
 
 
+def _kpool_topk_v2_layout_ok(*, logits: torch.Tensor, pool_size: int) -> bool:
+    return (
+        _kpool_topk_v2_enabled()
+        and logits.dtype == torch.float32
+        and logits.stride(1) == 1
+        and logits.stride(0) % 4 == 0
+        and logits.data_ptr() % 16 == 0
+        and pool_size > 1
+        and pool_size & (pool_size - 1) == 0
+    )
+
+
 def _can_use_kpool_topk_v2(
     *,
     logits: torch.Tensor,
@@ -619,14 +631,8 @@ def _can_use_kpool_topk_v2(
     return (
         row_starts is None
         and page_table_row_index is None
-        and _kpool_topk_v2_enabled()
-        and logits.dtype == torch.float32
-        and logits.stride(1) == 1
-        and logits.stride(0) % 4 == 0
         and logits.shape[1] % 4 == 0
-        and logits.data_ptr() % 16 == 0
-        and pool_size > 1
-        and pool_size & (pool_size - 1) == 0
+        and _kpool_topk_v2_layout_ok(logits=logits, pool_size=pool_size)
     )
 
 
@@ -646,6 +652,52 @@ def kpool_topk_v2_plan_for_rows(
     ):
         return None
     return build_kpool_topk_v2_plan(pool_lens)
+
+
+def _alloc_kpool_topk_out(
+    *, logits: torch.Tensor, rows: int, out_cols: int, out_rows: int | None
+) -> torch.Tensor:
+    if out_rows is None or out_rows == rows:
+        return logits.new_empty((rows, out_cols), dtype=torch.int32)
+    return logits.new_full((out_rows, out_cols), -1, dtype=torch.int32)
+
+
+def _kpool_topk_v2_ragged(
+    *,
+    logits: torch.Tensor,
+    group_lengths: torch.Tensor,
+    pool_size: int,
+    topk: int,
+    page_table: torch.Tensor | None,
+    page_table_row_index: torch.Tensor | None,
+    topk_offsets: torch.Tensor | None,
+    seq_lens: torch.Tensor | None,
+    row_starts: torch.Tensor | None,
+    out_rows: int | None,
+) -> torch.Tensor:
+    from sglang.kernels.ops.attention.dsv4.topk import topk_transform_kpool_ragged_v2
+
+    rows = logits.shape[0]
+    out_cols = topk + (pool_size - 1 if seq_lens is not None else 0)
+    full = _alloc_kpool_topk_out(
+        logits=logits, rows=rows, out_cols=out_cols, out_rows=out_rows
+    )
+    topk_transform_kpool_ragged_v2(
+        scores=logits,
+        pool_lens=group_lengths.to(torch.int32),
+        out=full[:rows],
+        pool_size=pool_size,
+        row_starts=None if row_starts is None else row_starts.to(torch.int32),
+        token_seq_lens=None if seq_lens is None else seq_lens.to(torch.int32),
+        page_table=page_table,
+        page_table_row_index=(
+            None
+            if page_table_row_index is None
+            else page_table_row_index.to(torch.int32)
+        ),
+        out_offsets=topk_offsets,
+    )
+    return full
 
 
 def _kpool_topk_v2(
@@ -670,10 +722,9 @@ def _kpool_topk_v2(
     )
     group_lengths = group_lengths.to(torch.int32)
     out_cols = topk + (pool_size - 1 if seq_lens is not None else 0)
-    if out_rows is None or out_rows == rows:
-        full = logits.new_empty((rows, out_cols), dtype=torch.int32)
-    else:
-        full = logits.new_full((out_rows, out_cols), -1, dtype=torch.int32)
+    full = _alloc_kpool_topk_out(
+        logits=logits, rows=rows, out_cols=out_cols, out_rows=out_rows
+    )
     topk_transform_kpool_v2(
         scores=logits,
         pool_lens=group_lengths,
@@ -717,6 +768,19 @@ def _try_kpool_topk_v2(
             seq_lens=seq_lens,
             out_rows=out_rows,
             topk_v2_plan=topk_v2_plan,
+        )
+    if _kpool_topk_v2_layout_ok(logits=logits, pool_size=kpool):
+        return _kpool_topk_v2_ragged(
+            logits=logits,
+            group_lengths=group_lengths,
+            pool_size=kpool,
+            topk=topk,
+            page_table=page_table,
+            page_table_row_index=page_table_row_index,
+            topk_offsets=topk_offsets,
+            seq_lens=seq_lens,
+            row_starts=row_starts,
+            out_rows=out_rows,
         )
     return None
 

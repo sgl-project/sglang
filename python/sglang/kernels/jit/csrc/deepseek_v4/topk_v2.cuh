@@ -302,6 +302,90 @@ TOPK_KERNEL void topk_ragged_kernel(const __grid_constant__ TopKRaggedParams par
   // PDL trigger secondary at the end the block typically has no use, so ignore it
 }
 
+struct TopKRaggedKpoolParams {
+  float* __restrict__ scores;
+  const int32_t* __restrict__ pool_lens;
+  const int32_t* __restrict__ row_starts;
+  const int32_t* __restrict__ token_seq_lens;
+  const int32_t* __restrict__ page_table;
+  const int32_t* __restrict__ page_table_row_index;
+  const int32_t* __restrict__ out_offsets;
+  int32_t* __restrict__ out;
+  int64_t score_stride;
+  int64_t page_table_stride;
+  int64_t out_stride;
+  uint32_t topk;
+  uint32_t page_bits;
+  uint32_t pool_bits;
+  uint32_t out_cols;
+
+  SGL_DEVICE PageTransform get_transform(uint32_t bx) const {
+    const auto table_row = page_table_row_index == nullptr ? bx : static_cast<uint32_t>(page_table_row_index[bx]);
+    const uint32_t pool_mask = (1u << pool_bits) - 1u;
+    auto transform = PageTransform{
+        page_table == nullptr ? nullptr : page_table + static_cast<int64_t>(table_row) * page_table_stride,
+        page_bits,
+        nullptr};
+    transform.offset = out_offsets == nullptr ? 0 : out_offsets[bx];
+    transform.pool_bits = pool_bits;
+    transform.tail_count = token_seq_lens == nullptr ? 0u : static_cast<uint32_t>(token_seq_lens[bx]) & pool_mask;
+    transform.out_cols = out_cols;
+    return transform;
+  }
+};
+
+template <bool kPDL>
+TOPK_KERNEL void topk_ragged_kpool_kernel(const __grid_constant__ TopKRaggedKpoolParams params) {
+  device::enable_smem_spilling();
+  constexpr uint32_t kVecSize = impl::TopKStreaming::kVecSize;
+  __shared__ impl::MaxSmem<Register2::Smem, Register4::Smem, Streaming::Smem> smem;
+  __shared__ int32_t s_topk_indices[kMaxTopK];
+
+  const auto bx = blockIdx.x;
+  const auto seq_len = static_cast<uint32_t>(params.pool_lens[bx]);
+  const auto row_start = params.row_starts == nullptr ? 0u : static_cast<uint32_t>(params.row_starts[bx]);
+  const auto transform = params.get_transform(bx);
+  const auto out = params.out + bx * params.out_stride;
+  const auto score = params.scores + bx * params.score_stride;
+
+  auto problem = TopKProblem{
+      .in = score + row_start,
+      .out = out,
+      .topk = params.topk,
+      .seq_len = seq_len,
+  };
+  if (seq_len <= params.topk) {
+    return trivial_transform<kPDL, TopKMode::KPOOL>(problem, transform);
+  }
+
+  const auto rem = row_start % kVecSize;
+  if (rem != 0) {
+    device::PDLWaitPrimary<kPDL>();
+    static_assert(kVecSize <= kBlockSize, "not enough threads ");
+    if (const auto tx = threadIdx.x; tx < rem) {
+      score[row_start - rem + tx] = impl::padding_value();
+    }
+  }
+  using device::topk::broadcast;
+  problem.in -= rem;
+  problem.out = s_topk_indices;
+  problem.seq_len = seq_len + rem;
+  problem.bias = broadcast(-static_cast<int32_t>(rem));
+  problem.input_start = broadcast(rem);
+
+  if (problem.seq_len <= Register2::kMaxSeqLen) {
+    Register2::forward<kPDL>(problem, &smem);
+  } else if (problem.seq_len <= Register4::kMaxSeqLen) {
+    Register4::forward<kPDL>(problem, &smem);
+  } else {
+    Streaming::forward<kPDL>(problem, &smem);
+  }
+  device::PDLTriggerSecondary<kPDL>();
+  __syncthreads();
+  problem.seq_len = seq_len;
+  paged_transform<TopKMode::KPOOL>(problem, out, transform);
+}
+
 #ifdef USE_ROCM
 // Only the ROCm DSA prefill emits this layout today, so CUDA/XPU builds stay
 // unchanged. Nothing below is AMD-specific; the guard can be dropped later.
@@ -1393,6 +1477,79 @@ struct TopKKernel {
     LaunchKernel(static_cast<uint32_t>(B.unwrap()), kBlockSize, device_.unwrap())
         .config({.use_pdl = kUsePDL})
         .launch(topk_ragged_kernel<kUsePDL>, params);
+  }
+
+  static void transform_kpool_ragged(
+      const tvm::ffi::TensorView scores,
+      const tvm::ffi::TensorView pool_lens,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> row_starts,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> token_seq_lens,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> page_table,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> page_table_row_index,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> out_offsets,
+      const tvm::ffi::TensorView out,
+      const uint32_t page_size,
+      const uint32_t pool_size) {
+    using namespace host;
+    auto B = SymbolicSize{"batch_size"};
+    auto S = SymbolicSize{"score_stride"};
+    auto C = SymbolicSize{"out_cols"};
+    auto O = SymbolicSize{"out_stride"};
+    auto device_ = SymbolicDevice{};
+    device_.set_options<kDLGPU>();
+
+    TensorMatcher({B, -1}).with_strides({S, 1}).with_dtype<float>().with_device(device_).ensure_alignment(16).verify(
+        scores);
+    TensorMatcher({B}).with_dtype<int32_t>().with_device(device_).verify(pool_lens);
+    TensorMatcher({B, C}).with_strides({O, 1}).with_dtype<int32_t>().with_device(device_).verify(out);
+    const auto optional_rows = [&](const tvm::ffi::Optional<tvm::ffi::TensorView>& t) -> const int32_t* {
+      if (!t.has_value()) return nullptr;
+      TensorMatcher({B}).with_dtype<int32_t>().with_device(device_).verify(t.value());
+      return static_cast<const int32_t*>(t.value().data_ptr());
+    };
+    const int32_t* page_table_ptr = nullptr;
+    int64_t page_table_stride = 0;
+    if (page_table.has_value()) {
+      TensorMatcher({-1, -1}).with_strides({-1, 1}).with_dtype<int32_t>().with_device(device_).verify(
+          page_table.value());
+      if (!page_table_row_index.has_value()) {
+        RuntimeCheck(page_table.value().size(0) == B.unwrap(), "page_table needs one row per score row");
+      }
+      page_table_ptr = static_cast<const int32_t*>(page_table.value().data_ptr());
+      page_table_stride = page_table.value().stride(0);
+    }
+    RuntimeCheck(!page_table_row_index.has_value() || page_table.has_value(), "page_table_row_index needs page_table");
+    RuntimeCheck(!(page_table.has_value() && out_offsets.has_value()), "page_table and out_offsets are exclusive");
+
+    RuntimeCheck(std::has_single_bit(page_size), "page_size must be power of 2");
+    RuntimeCheck(pool_size > 1 && std::has_single_bit(pool_size), "pool_size must be a power of 2 > 1");
+    RuntimeCheck(S.unwrap() % 4 == 0, "score_stride must be a multiple of 4 (16-byte vectorized load)");
+    const auto out_cols = static_cast<uint32_t>(C.unwrap());
+    const auto tail_cols = token_seq_lens.has_value() ? pool_size - 1 : 0u;
+    RuntimeCheck(out_cols > tail_cols && (out_cols - tail_cols) % pool_size == 0, "invalid out width ", out_cols);
+    const auto topk = (out_cols - tail_cols) / pool_size;
+    RuntimeCheck(topk > 0 && topk <= kMaxTopK, "pool-level topk must be in (0, 2048]");
+
+    const auto params = TopKRaggedKpoolParams{
+        .scores = static_cast<float*>(scores.data_ptr()),
+        .pool_lens = static_cast<const int32_t*>(pool_lens.data_ptr()),
+        .row_starts = optional_rows(row_starts),
+        .token_seq_lens = optional_rows(token_seq_lens),
+        .page_table = page_table_ptr,
+        .page_table_row_index = optional_rows(page_table_row_index),
+        .out_offsets = optional_rows(out_offsets),
+        .out = static_cast<int32_t*>(out.data_ptr()),
+        .score_stride = S.unwrap(),
+        .page_table_stride = page_table_stride,
+        .out_stride = O.unwrap(),
+        .topk = topk,
+        .page_bits = static_cast<uint32_t>(std::countr_zero(page_size)),
+        .pool_bits = static_cast<uint32_t>(std::countr_zero(pool_size)),
+        .out_cols = out_cols,
+    };
+    LaunchKernel(static_cast<uint32_t>(B.unwrap()), kBlockSize, device_.unwrap())
+        .config({.use_pdl = kUsePDL})
+        .launch(topk_ragged_kpool_kernel<kUsePDL>, params);
   }
 
 #ifdef USE_ROCM  // see the packed kernel above

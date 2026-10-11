@@ -55,6 +55,7 @@ def _jit_topk_v2_module():
         ("topk_transform_ragged", f"{kernel}::transform_ragged"),
         ("topk_plan", f"{kernel}::plan"),
         ("topk_transform_kpool", f"{kernel}::transform_kpool"),
+        ("topk_transform_kpool_ragged", f"{kernel}::transform_kpool_ragged"),
     ]
     if is_hip_runtime():
         # transform_packed only exists under USE_ROCM, see topk_v2.cuh
@@ -313,6 +314,33 @@ def topk_transform_kpool_v2(
         page_size,
         pool_size,
         metadata,
+    )
+
+
+def topk_transform_kpool_ragged_v2(
+    scores: torch.Tensor,
+    pool_lens: torch.Tensor,
+    out: torch.Tensor,
+    pool_size: int,
+    *,
+    row_starts: Optional[torch.Tensor] = None,
+    token_seq_lens: Optional[torch.Tensor] = None,
+    page_table: Optional[torch.Tensor] = None,
+    page_table_row_index: Optional[torch.Tensor] = None,
+    page_size: int = 1,
+    out_offsets: Optional[torch.Tensor] = None,
+) -> None:
+    _jit_topk_v2_module().topk_transform_kpool_ragged(
+        scores,
+        pool_lens,
+        row_starts,
+        token_seq_lens,
+        page_table,
+        page_table_row_index,
+        out_offsets,
+        out,
+        page_size,
+        pool_size,
     )
 
 
