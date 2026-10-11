@@ -130,7 +130,7 @@ class LTX2AVDecodingStage(DecodingStage):
             stream = EncodeWhileDecoding(
                 save_path,
                 batch,
-                finish_frames=lambda frames: (frames.float() / 2 + 0.5).clamp(0, 1),
+                finish_frames=lambda frames: (frames / 2 + 0.5).clamp(0, 1).float(),
                 audio=output_batch.audio,
                 audio_sample_rate=output_batch.audio_sample_rate,
             )
@@ -202,7 +202,9 @@ class LTX2AVDecodingStage(DecodingStage):
                     with temporary_module_dtype(
                         self.vae, vae_dtype, enabled=should_cast_vae
                     ) as vae:
-                        decode_kwargs = {} if on_frames is None else {"on_frames": on_frames}
+                        decode_kwargs = (
+                            {} if on_frames is None else {"on_frames": on_frames}
+                        )
                         decode_output = vae.decode(latents, **decode_kwargs)
 
         if isinstance(decode_output, tuple):
@@ -213,7 +215,9 @@ class LTX2AVDecodingStage(DecodingStage):
             video = decode_output.sample
         return video
 
-    def _decode_audio(self, batch: Req, server_args: ServerArgs, output_batch: OutputBatch):
+    def _decode_audio(
+        self, batch: Req, server_args: ServerArgs, output_batch: OutputBatch
+    ):
         try:
             audio_latents = batch.audio_latents
         except AttributeError:
@@ -330,4 +334,3 @@ class LTX2AVDecodingStage(DecodingStage):
             output_batch.audio_sample_rate = (
                 vocoder_sr or audio_vae_sr or pipeline_audio_sr
             )
-

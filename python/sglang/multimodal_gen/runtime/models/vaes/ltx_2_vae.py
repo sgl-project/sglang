@@ -1981,7 +1981,9 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
         else:
             decoded = self._decode(z, temb, causal=causal, on_frames=on_frames).sample
 
-        tile_latent_frames = self.tile_sample_min_num_frames // self.temporal_compression_ratio
+        tile_latent_frames = (
+            self.tile_sample_min_num_frames // self.temporal_compression_ratio
+        )
         if on_frames is not None and not (
             self.use_framewise_decoding
             and z.shape[2] > tile_latent_frames

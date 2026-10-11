@@ -3,6 +3,17 @@
 
 import pytest
 import torch
+from diffusers.video_processor import VideoProcessor
+
+from sglang.multimodal_gen.runtime.entrypoints.utils import (
+    _sample_to_uint8_frames,
+    _save_video_ffmpeg,
+    _try_save_video_with_audio,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.encode_while_decoding import (
+    EncodeWhileDecoding,
+)
+from types import SimpleNamespace
 
 from sglang.multimodal_gen.configs.models.vaes.ltx_video import (
     LTXVideoVAEArchConfig,
@@ -60,7 +71,14 @@ def test_frames_are_final_and_match_legacy_decode(batch_size, slicing, temporal)
     vae.use_framewise_decoding = temporal
     vae.use_slicing = slicing
     z = torch.randn(batch_size, 4, 7, 4, 4)
-    expected = legacy_temporal_decode(vae, z) if temporal else vae.decode(z).sample
+    if temporal:
+        expected = (
+            torch.cat([legacy_temporal_decode(vae, sample) for sample in z.split(1)])
+            if slicing
+            else legacy_temporal_decode(vae, z)
+        )
+    else:
+        expected = vae.decode(z).sample
     chunks = []
     snapshots = []
 
@@ -74,3 +92,38 @@ def test_frames_are_final_and_match_legacy_decode(batch_size, slicing, temporal)
     for frames, snapshot in zip(chunks, snapshots):
         torch.testing.assert_close(frames, snapshot, rtol=0, atol=0)
     assert len(chunks) > 1 if temporal and batch_size == 1 else len(chunks) == 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA encoder")
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("audio", [False, True])
+@torch.no_grad()
+def test_stream_matches_cpu_postprocessing(tmp_path, dtype, audio):
+    vae = tiny_vae("cuda", dtype)
+    vae.use_framewise_decoding = True
+    z = torch.randn(1, 4, 7, 8, 8, device="cuda", dtype=dtype)
+    cpu_path, stream_path = tmp_path / "cpu.mp4", tmp_path / "stream.mp4"
+    sound = torch.zeros(1, 13000) if audio else None
+    request = SimpleNamespace(
+        fps=13, num_frames=13, output_compression=None, x264_preset=None
+    )
+    stream = EncodeWhileDecoding(
+        str(stream_path),
+        request,
+        finish_frames=lambda frames: (frames / 2 + 0.5).clamp(0, 1).float(),
+        audio=sound,
+        audio_sample_rate=13000 if audio else None,
+    )
+    decoded = vae.decode(z, on_frames=stream).sample
+    assert stream.finish() == [str(stream_path)]
+    frames = _sample_to_uint8_frames(
+        VideoProcessor().postprocess_video(decoded, output_type="np")[0]
+    )
+    if audio:
+        assert _try_save_video_with_audio(
+            save_file_path=str(cpu_path), frames=frames, fps=13,
+            audio=sound, audio_sample_rate=13000, quality=5,
+        )
+    else:
+        _save_video_ffmpeg(str(cpu_path), frames, fps=13, quality=5)
+    assert cpu_path.read_bytes() == stream_path.read_bytes()
