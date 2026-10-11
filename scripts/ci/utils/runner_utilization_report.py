@@ -561,6 +561,7 @@ def calculate_utilization(
     hours: float = 24,
     runner_filter: str = None,
     lookback_hours: float = None,
+    job_name_filter: str = None,
 ):
     """Calculate runner utilization metrics.
 
@@ -713,6 +714,18 @@ def calculate_utilization(
                 failed_runs.append((run_id, err))
             elif jobs:
                 all_jobs.extend(jobs)
+
+    if job_name_filter:
+        import re as _re_jnf
+
+        _jnf = _re_jnf.compile(job_name_filter, _re_jnf.IGNORECASE)
+        n_before = len(all_jobs)
+        all_jobs = [j for j in all_jobs if _jnf.search(j.get("name") or "")]
+        print(
+            f"Job-name filter {job_name_filter!r}: kept "
+            f"{len(all_jobs)}/{n_before} jobs — utilization below reads as "
+            f"the share of each pool consumed by the matching jobs."
+        )
 
     print(f"Processing {len(all_jobs)} jobs...")
     if failed_runs:
@@ -1050,6 +1063,15 @@ def main():
     parser.add_argument(
         "--filter", type=str, help="Filter runner labels (e.g., '5090', 'h200')"
     )
+    parser.add_argument(
+        "--job-name-filter",
+        type=str,
+        help=(
+            "Regex; only jobs whose NAME matches are counted (e.g. "
+            "'multimodal|diffusion'). Utilization then reads as the share "
+            "of each pool consumed by the matching jobs."
+        ),
+    )
     parser.add_argument("--output", type=str, help="Output file (default: stdout)")
     parser.add_argument(
         "--queue-series-out",
@@ -1059,7 +1081,16 @@ def main():
     args = parser.parse_args()
 
     results, fetch_failure_pct, longest_waits, coverage_hours = calculate_utilization(
-        args.repo, args.hours, args.filter, lookback_hours=args.lookback_hours
+        args.repo,
+        args.hours,
+        args.filter,
+        lookback_hours=args.lookback_hours,
+        job_name_filter=args.job_name_filter,
+    )
+    title_suffix = (
+        f" — jobs matching {args.job_name_filter!r} only"
+        if args.job_name_filter
+        else ""
     )
     report = format_report(
         results,
@@ -1068,6 +1099,12 @@ def main():
         longest_waits=longest_waits,
         coverage_hours=coverage_hours,
     )
+    if args.job_name_filter:
+        report = report.replace(
+            "# Runner Utilization Report",
+            "# Runner Utilization Report" + title_suffix,
+            1,
+        )
 
     if args.queue_series_out:
         # Every bucket carries its own start, so the window needs no separate

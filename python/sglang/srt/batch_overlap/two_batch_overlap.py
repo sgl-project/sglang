@@ -1119,25 +1119,31 @@ def _model_forward_tbo_merge_outputs(output_a, output_b, original_len):
             output["hidden_states"]
         )
 
-    def _handle_key(name):
-        value_a = output_a[name]
-        value_b = output_b[name]
-        assert (value_a is None) == (value_b is None)
-        if value_a is None:
-            return None
-        s0, t0 = output_a["forward_batch"].tbo_parent_token_range
-        s1, t1 = output_b["forward_batch"].tbo_parent_token_range
-        res = torch.zeros(
-            (original_len, *value_a.shape[1:]),
-            dtype=value_a.dtype,
-            device=value_a.device,
-        )
-        res[slice(s0, t0)] = value_a[: t0 - s0]
-        res[slice(s1, t1)] = value_b[: t1 - s1]
-        return res
-
-    hidden, residual = _handle_key("hidden_states"), _handle_key("residual")
+    hidden = _model_forward_tbo_merge_key(
+        output_a, output_b, "hidden_states", original_len
+    )
+    residual = _model_forward_tbo_merge_key(
+        output_a, output_b, "residual", original_len
+    )
     return ResidualStream.from_handoff(hidden, residual, update)
+
+
+def _model_forward_tbo_merge_key(output_a, output_b, name, original_len):
+    value_a = output_a[name]
+    value_b = output_b[name]
+    assert (value_a is None) == (value_b is None)
+    if value_a is None:
+        return None
+    s0, t0 = output_a["forward_batch"].tbo_parent_token_range
+    s1, t1 = output_b["forward_batch"].tbo_parent_token_range
+    res = torch.zeros(
+        (original_len, *value_a.shape[1:]),
+        dtype=value_a.dtype,
+        device=value_a.device,
+    )
+    res[slice(s0, t0)] = value_a[: t0 - s0]
+    res[slice(s1, t1)] = value_b[: t1 - s1]
+    return res
 
 
 # -------------------------------- Utilities and wrappers ---------------------------------------

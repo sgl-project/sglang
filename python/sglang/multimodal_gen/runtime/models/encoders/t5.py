@@ -158,9 +158,6 @@ class T5LayerFF(nn.Module):
 
 # T5 has attn_bias and does not use softmax scaling
 class T5MultiHeadAttention(nn.Module):
-    def __init__(self) -> None:
-        super().__init__()
-
     def forward(self, q, k, v, attn_bias=None):
         b, _, n, c = q.shape
         attn = torch.einsum("binc,bjnc->bnij", q, k)
@@ -509,7 +506,6 @@ class T5Stack(nn.Module):
     ):
         super().__init__()
         self.embed_tokens = embed_tokens
-        self.is_umt5 = is_umt5
         if is_umt5:
             self.block = nn.ModuleList(
                 [

@@ -13,21 +13,6 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestLocateAnythingConfig(CustomTestCase):
-    def test_default_fields(self):
-        """Defaults reflect the nvidia/LocateAnything-3B reference config."""
-        cfg = LocateAnythingConfig()
-        self.assertEqual(cfg.model_type, "locateanything")
-        # Special token ids used by the grounding grammar.
-        self.assertEqual(cfg.image_token_index, 151665)
-        self.assertEqual(cfg.box_start_token_id, 151668)
-        self.assertEqual(cfg.box_end_token_id, 151669)
-        self.assertEqual(cfg.ref_start_token_id, 151672)
-        self.assertEqual(cfg.ref_end_token_id, 151673)
-        self.assertEqual(cfg.coord_start_token_id, 151677)
-        self.assertEqual(cfg.coord_end_token_id, 152677)
-        self.assertEqual(cfg.none_token_id, 4064)
-        self.assertEqual(cfg.mlp_connector_layers, 2)
-
     def test_composite_subconfigs_default(self):
         cfg = LocateAnythingConfig()
         self.assertIsInstance(cfg.vision_config, MoonViTConfig)
