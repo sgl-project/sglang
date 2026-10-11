@@ -182,12 +182,36 @@ class TestStreamedEncode(CustomTestCase):
                 SimpleNamespace(**{**vars(server_args), "enable_torch_compile": True}),
             ),
             ("stage_decode", _stage(stage.vae, server_args, OwnDecode), server_args),
-            ("vae", _stage(torch.nn.Identity(), server_args), server_args),
         ):
             with self.subTest(name=name):
                 self.assertIsNone(
                     candidate._encode_while_decoding(_video_request(), args)
                 )
+
+    @torch.no_grad()
+    def test_decoder_without_callback_hands_over_the_complete_clip(self):
+        server_args = _server_args()
+        stage = _stage(_vae(_vae_config(wan22=False), "cuda"), server_args)
+        # The shared stage must not inject a keyword into an ordinary decoder.
+        stage.vae.supports_decode_on_frames = False
+        expected = torch.randn(1, 3, 5, 40, 48, device="cuda")
+        decode = mock.Mock(side_effect=lambda latents: expected)
+        for output in (expected, expected[:, :, 0]):
+            with self.subTest(shape=output.shape):
+                decode.side_effect = lambda latents: output
+                received = []
+                with mock.patch.object(
+                    stage, "_get_vae_decode_fn", return_value=decode
+                ):
+                    actual = stage.decode(
+                        torch.zeros(1, Z_DIM, 2, 2, 2, device="cuda"),
+                        server_args,
+                        vae_dtype=torch.float32,
+                        on_frames=received.append,
+                    )
+                self.assertEqual(len(received), int(output.ndim == 5))
+                if received:
+                    torch.testing.assert_close(received[0], actual, rtol=0, atol=0)
 
 
 if __name__ == "__main__":

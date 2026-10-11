@@ -200,6 +200,13 @@ file-path-only requests use this path automatically; raw frames, compilation,
 interpolation, upscaling, and custom post-decoding hooks keep the normal path.
 LTX's diffusion decoder is not included.
 
+Other VAEs using the shared `DecodingStage` automatically hand over their complete
+RGB video tensor, without implementing a callback. This covers ordinary Hunyuan
+and Qwen video decode paths as well as externally registered VAEs. Image, audio,
+and mesh outputs are not MP4 inputs. Custom decoding stages retain their original
+path unless they explicitly integrate the shared encoder, preserving their output
+transforms and audio muxing.
+
 LTX without temporal tiling hands over the complete clip after decode. This
 reduces CPU float-frame materialization but does not overlap VAE decoding with
 encoding. Existing temporal tiling can emit finalized, blended prefixes while
