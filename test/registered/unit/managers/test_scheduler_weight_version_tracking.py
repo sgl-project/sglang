@@ -2,6 +2,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import torch
+
 from sglang.srt.managers.io_struct import (
     BeginWeightUpdateReqInput,
     EndWeightUpdateReqInput,
@@ -10,6 +12,9 @@ from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
     _WeightUpdateSession,
+)
+from sglang.srt.model_executor.model_runner_components.weight_updater import (
+    WeightUpdater,
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -293,7 +298,9 @@ class TestWeightUpdateSession(_WeightUpdaterManagerTestBase):
         """load_weights already ran post_load_weights; running it twice would double-apply."""
         target, draft = _runner(), _runner()
         manager = self._manager(target, draft)
-        manager._session = _WeightUpdateSession(selector="all", loaded_weights=True)
+        manager._session = _WeightUpdateSession(
+            selector="all", loaded_roles=frozenset({"target", "draft"})
+        )
 
         manager.end_weight_update(EndWeightUpdateReqInput())
 
@@ -348,6 +355,167 @@ class TestWeightUpdateSession(_WeightUpdaterManagerTestBase):
         self.assertFalse(output.success)
         self.assertIn("begin_weight_update", output.message)
         target.weight_updater.receive_weights_from_distributed.assert_not_called()
+
+
+class _PostLoadModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.register_buffer("weight", torch.tensor(1.0))
+
+    def load_weights(self, named_tensors):
+        for _, tensor in named_tensors:
+            self.weight.copy_(tensor)
+        self.post_load_weights()
+
+    def post_load_weights(self):
+        self.weight.mul_(2)
+
+
+def _stateful_runner(*, fail=False):
+    model = _PostLoadModel()
+    updater = SimpleNamespace(device="cpu", get_model=lambda: model)
+
+    def load(named_tensors, **kwargs):
+        if fail:
+            return False, "draft load failed"
+        model.load_weights(named_tensors)
+        return True, "Success"
+
+    updater.begin_weight_update = lambda: None
+    updater.receive_weights_from_distributed = lambda **kwargs: [
+        ("weight", torch.tensor(3.0))
+    ]
+    updater.load_weights_from_distributed = load
+    updater.update_weights_from_tensor = load
+    updater.end_weight_update = lambda **kwargs: WeightUpdater.end_weight_update(
+        updater, **kwargs
+    )
+    return SimpleNamespace(model=model, weight_updater=updater)
+
+
+class TestWeightUpdatePartialLoads(_WeightUpdaterManagerTestBase):
+    def _stateful_manager(self, *, draft_fails=False, draft_steps=1):
+        target = _stateful_runner()
+        drafts = [
+            _stateful_runner(fail=draft_fails and step == draft_steps - 1)
+            for step in range(draft_steps)
+        ]
+        draft = drafts[-1]
+        manager = self._manager(target, draft, session=False)
+        manager.draft_worker.weight_update_runners = lambda: [
+            ("draft" if draft_steps == 1 else f"draft_step_{step}", runner)
+            for step, runner in enumerate(drafts)
+        ]
+        manager.tp_worker.deserialize_own_rank = lambda payloads: [
+            ("weight", torch.tensor(3.0))
+        ]
+        cache = ["tokens computed with old weights"]
+        manager.flush_cache = lambda **kwargs: cache.clear() or True
+        manager.begin_weight_update(BeginWeightUpdateReqInput())
+        return manager, target.model, draft.model, cache
+
+    def test_partial_failure_invalidates_target_cache(self):
+        """A failed draft refit must not leave cached tokens from the old target."""
+        for source in ("distributed", "tensor"):
+            with self.subTest(source=source):
+                manager, target, _, cache = self._stateful_manager(draft_fails=True)
+                output = getattr(manager, f"update_weights_from_{source}")(_request())
+
+                self.assertFalse(output.success)
+                self.assertEqual(target.weight.item(), 6.0)
+                self.assertEqual(cache, [])
+                self.assertEqual(self.recorded, [])
+
+    def test_partial_failure_finalizes_each_runner_once(self):
+        """Closing a failed fan-out must not apply the target's model fixup twice."""
+        for source in ("distributed", "tensor"):
+            with self.subTest(source=source):
+                manager, target, draft, _ = self._stateful_manager(draft_fails=True)
+                output = getattr(manager, f"update_weights_from_{source}")(_request())
+                self.assertFalse(output.success)
+
+                manager.end_weight_update(EndWeightUpdateReqInput())
+
+                self.assertEqual(target.weight.item(), 6.0)
+                self.assertEqual(draft.weight.item(), 2.0)
+                self.assertIsNone(manager._session)
+
+    def test_subset_load_still_finalizes_unloaded_runner(self):
+        """Loading one role must not suppress the other role's end-of-session fixup."""
+        for source in ("distributed", "tensor"):
+            for selector in ("target", "draft"):
+                with self.subTest(source=source, selector=selector):
+                    manager, target, draft, _ = self._stateful_manager()
+                    output = getattr(manager, f"update_weights_from_{source}")(
+                        _request(selector=selector)
+                    )
+                    self.assertTrue(output.success)
+
+                    manager.end_weight_update(EndWeightUpdateReqInput())
+
+                    self.assertEqual(
+                        (target.weight.item(), draft.weight.item()),
+                        (6.0, 2.0) if selector == "target" else (2.0, 6.0),
+                    )
+
+    def test_separate_updates_accumulate_loaded_roles(self):
+        """A later role update must not forget the earlier role's completed fixup."""
+        manager, target, draft, _ = self._stateful_manager()
+        manager.update_weights_from_tensor(_request(selector="target"))
+        manager.update_weights_from_distributed(_request(selector="draft"))
+
+        manager.end_weight_update(EndWeightUpdateReqInput())
+
+        self.assertEqual((target.weight.item(), draft.weight.item()), (6.0, 6.0))
+
+    def test_later_draft_failure_preserves_earlier_draft_fixup(self):
+        """A failed later draft step must not reapply a completed earlier step's fixup."""
+        for source in ("distributed", "tensor"):
+            with self.subTest(source=source):
+                manager, target, _, _ = self._stateful_manager(
+                    draft_fails=True, draft_steps=2
+                )
+                draft_models = [
+                    runner.model
+                    for _, runner in manager.draft_worker.weight_update_runners()
+                ]
+                output = getattr(manager, f"update_weights_from_{source}")(_request())
+                self.assertFalse(output.success)
+
+                manager.end_weight_update(EndWeightUpdateReqInput())
+
+                self.assertEqual(
+                    [model.weight.item() for model in [target, *draft_models]],
+                    [6.0, 6.0, 2.0],
+                )
+                self.assertEqual(self.recorded, [])
+
+    def test_draft_exception_still_invalidates_target_cache(self):
+        """A loader exception must not strand old cache entries after a target refit."""
+        for source in ("distributed", "tensor"):
+            with self.subTest(source=source):
+                manager, target, draft, cache = self._stateful_manager()
+
+                def fail(*args, **kwargs):
+                    raise RuntimeError("draft loader raised")
+
+                draft_runner = manager.draft_worker.weight_update_runners()[0][1]
+                setattr(
+                    draft_runner.weight_updater,
+                    "load_weights_from_distributed"
+                    if source == "distributed"
+                    else "update_weights_from_tensor",
+                    fail,
+                )
+                with self.assertRaisesRegex(RuntimeError, "draft loader raised"):
+                    getattr(manager, f"update_weights_from_{source}")(_request())
+
+                self.assertEqual(cache, [])
+                self.assertEqual(self.recorded, [])
+                manager.end_weight_update(EndWeightUpdateReqInput())
+                self.assertEqual(
+                    (target.weight.item(), draft.weight.item()), (6.0, 2.0)
+                )
 
 
 if __name__ == "__main__":
