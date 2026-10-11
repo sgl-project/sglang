@@ -887,8 +887,7 @@ def accept_draft_tokens(
             fused_argmax=fused_argmax,
         )
     if draft_block.greedy_draft:
-        # An argmax draft puts all its mass on the drafted token: rejection
-        # then accepts with the target probability and resamples the rest.
+        # An argmax draft is one-hot: rejection accepts at the target probability.
         draft_tokens = draft_block.draft_tokens
         draft_probs = torch.zeros(
             (*draft_tokens.shape, target_logits.shape[-1]),

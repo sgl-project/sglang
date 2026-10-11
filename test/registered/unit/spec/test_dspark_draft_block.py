@@ -104,8 +104,7 @@ class TestSampleDraftBlock(CustomTestCase):
 
 class TestFusedGreedyEligibility(CustomTestCase):
     def test_only_the_plain_w2_gemv_head_fuses(self):
-        # The fused kernel recomputes the bias from the raw w2 weight; a head
-        # that changes the bias must keep the shared op.
+        # A head that changes the bias must keep the shared op.
         for cls, fuses in (
             (VanillaMarkov, True),
             (Nemotron35VanillaMarkov, False),

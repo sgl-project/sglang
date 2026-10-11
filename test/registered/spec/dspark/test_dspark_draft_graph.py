@@ -74,9 +74,7 @@ class TestDraftMarkovBlockGraph(CustomTestCase):
         self.assertTrue(torch.equal(tokens_out[::2], eager_tokens[::2]))
 
     def test_one_greedy_row_matches_eager_and_fp32_reference(self):
-        # A one-row greedy draft folds the bias GEMV into the argmax: the graph
-        # replays the eager pick, and both pick the argmax of the FP32 step
-        # logits.
+        # The fused one-row kernel runs; the graph replays eager; both match FP32.
         torch.manual_seed(2)
         head = VanillaMarkov(vocab_size=VOCAB, markov_rank=RANK).to(DEVICE)
         head = head.to(torch.bfloat16)

@@ -535,9 +535,8 @@ class Envs:
     SGLANG_DSPARK_ENABLE_SPS_RECORD = EnvBool(False)
     SGLANG_DSPARK_FAST_KERNEL = EnvBool(True)
     SGLANG_DSPARK_FP32_LM_HEAD = EnvBool(False)
-    # Draft every row by argmax, also for sampling requests, which are then
-    # accepted against a one-hot draft distribution: no step logits kept, at
-    # some acceptance cost for sampling traffic.
+    # Argmax every draft row, sampling requests included, accepted as a one-hot
+    # draft: no step logits kept, lower acceptance at high temperatures.
     SGLANG_DSPARK_USE_GREEDY_DRAFT = EnvBool(False)
     SGLANG_DSPARK_FOLDED_PROPOSAL = EnvBool(True)
     SGLANG_DSPARK_STACKED_CTX_KV = EnvBool(True)

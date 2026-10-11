@@ -63,8 +63,8 @@ class DsparkDraftSampler:
             (self.max_bs,), dtype=torch.float32, device=device
         )
         self._zero = torch.zeros((), dtype=torch.float32, device=device)
-        # [max_bs, gamma, vocab] step logits the sampling accept reads; a
-        # greedy draft keeps none.
+        # [max_bs, gamma, vocab] step logits for the sampling accept; a greedy
+        # draft keeps none.
         self.step_logits = (
             None
             if greedy_draft

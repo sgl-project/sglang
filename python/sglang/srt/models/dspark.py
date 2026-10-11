@@ -178,8 +178,7 @@ class VanillaMarkov(BaseDSparkMarkovHead):
         step: int,
         logits_out: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        # One greedy row with no logits to keep: one kernel does the bias GEMV,
-        # the add and the argmax without writing the bias.
+        # One greedy row, no logits kept: one kernel does the GEMV, add and argmax.
         if (
             logits_out is None
             and len(prev_tokens) == 1
@@ -206,8 +205,8 @@ class VanillaMarkov(BaseDSparkMarkovHead):
         )
 
     def _bias_is_w2_gemv(self) -> bool:
-        # The fused kernel recomputes this class's bias from the raw w2 weight;
-        # a subclass that changes the bias keeps the op.
+        # The fused kernel recomputes this class's bias; a subclass that changes
+        # it keeps the shared op.
         cls = type(self)
         return (
             cls.step_bias is VanillaMarkov.step_bias

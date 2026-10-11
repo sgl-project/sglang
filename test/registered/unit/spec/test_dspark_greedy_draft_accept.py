@@ -16,8 +16,7 @@ BS, GAMMA, VOCAB = 3, 4, 50
 
 class TestGreedyDraftAccept(CustomTestCase):
     def test_sampling_accept_reads_a_one_hot_draft(self):
-        # A greedy draft keeps no step logits: the sampling accept gets the
-        # drafted token as a one-hot distribution at the target vocab width.
+        # The sampling accept gets a one-hot draft at the target vocab width.
         torch.manual_seed(0)
         draft_tokens = torch.randint(0, VOCAB, (BS, GAMMA))
         block = DraftBlockResult(

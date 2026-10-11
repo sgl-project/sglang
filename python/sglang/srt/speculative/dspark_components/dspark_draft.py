@@ -51,8 +51,7 @@ class DraftBlockResult(msgspec.Struct, frozen=True):
     corrected_logits: Optional[torch.Tensor]
     greedy_mask: torch.Tensor
     temperatures: torch.Tensor
-    # Every row was drafted by argmax, so sampling accept treats the draft
-    # distribution as one-hot instead of reading corrected_logits.
+    # Drafted by argmax: the sampling accept uses a one-hot draft distribution.
     greedy_draft: bool
 
 
