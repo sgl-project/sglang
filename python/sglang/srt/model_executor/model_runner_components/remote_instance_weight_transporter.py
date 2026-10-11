@@ -158,6 +158,10 @@ class RemoteInstanceWeightTransporter:
             "transfer_engine_info": {
                 "session_id": self.session_id,
                 "weights_info_dict": self.weight_info,
+                "weight_dtypes": {
+                    name: str(weight.dtype).removeprefix("torch.")
+                    for name, weight in self.model.named_parameters()
+                },
             },
         }
 

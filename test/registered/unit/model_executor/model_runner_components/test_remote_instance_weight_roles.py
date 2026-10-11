@@ -44,6 +44,8 @@ def _start_bootstrap_server():
 
 
 def _publish(role, session_id, port):
+    model = torch.nn.Module()
+    model.add_module(role, torch.nn.Linear(4, 1, bias=False, dtype=torch.bfloat16))
     model_config = SimpleNamespace(
         remote_instance_weight_loader_backend=None, engine_info_bootstrap_port=port
     )
@@ -65,7 +67,7 @@ def _publish(role, session_id, port):
     ):
         transporter = RemoteInstanceWeightTransporter(
             server_args=SimpleNamespace(registers_parallelism_config=lambda: True),
-            get_model=lambda: torch.nn.Module(),
+            get_model=lambda: model,
             gpu_id=0,
         )
         transporter.engine = object()
@@ -98,6 +100,14 @@ class TestPublicationRoles(CustomTestCase):
             ["draft-session", {"draft.weight": [1, 4, 2]}],
         )
         self.assertEqual(get("get_parallelism_config"), {"published_by": "target"})
+        self.assertEqual(
+            get("get_transfer_engine_info")["weight_dtypes"],
+            {"target.weight": "bfloat16"},
+        )
+        self.assertEqual(
+            get("get_transfer_engine_info", role="draft")["weight_dtypes"],
+            {"draft.weight": "bfloat16"},
+        )
         self.assertEqual(
             get("get_parallelism_config", role="draft"), {"published_by": "draft"}
         )

@@ -43,6 +43,7 @@ class EngineInfoBootstrapServer:
 
         # Storage: {(role, tp_rank): (session_id, weights_info_dict)}
         self.transfer_engine_info: Dict[Tuple[str, int], Tuple] = {}
+        self.weight_dtypes: Dict[Tuple[str, int], dict] = {}
         # Storage: {(role, tp_rank): parallelism_config_dict}
         self.parallelism_config: Dict[Tuple[str, int], dict] = {}
         self.lock = threading.Lock()
@@ -67,6 +68,7 @@ class EngineInfoBootstrapServer:
                         session_id,
                         weights_info_dict,
                     )
+                    self.weight_dtypes[(role, tp_rank)] = info.get("weight_dtypes", {})
 
                 logger.info(
                     f"Registered transfer engine info for role={role} tp_rank={tp_rank}, "
@@ -84,6 +86,7 @@ class EngineInfoBootstrapServer:
 
             with self.lock:
                 info = self.transfer_engine_info.get((role, rank))
+                weight_dtypes = self.weight_dtypes.get((role, rank), {})
 
             if info is None:
                 raise HTTPException(
@@ -91,7 +94,11 @@ class EngineInfoBootstrapServer:
                     detail=f"No transfer engine info for role {role} rank {rank}",
                 )
 
-            return {"rank": rank, "remote_instance_transfer_engine_info": list(info)}
+            return {
+                "rank": rank,
+                "remote_instance_transfer_engine_info": list(info),
+                "weight_dtypes": weight_dtypes,
+            }
 
         config = uvicorn.Config(app, host=host, port=port, log_level="warning")
         self._server = uvicorn.Server(config)
