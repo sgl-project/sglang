@@ -36,6 +36,19 @@ def test_image_edits_declares_perf_dump_path_form_field():
     assert "perf_dump_path" in inspect.signature(edits).parameters
 
 
+def test_image_requests_accept_request_level_profiling():
+    request = ImageGenerationsRequest(
+        prompt="p", profile=True, num_profiled_timesteps=4, profile_all_stages=True
+    )
+    assert (request.profile, request.num_profiled_timesteps) == (True, 4)
+    assert request.profile_all_stages is True
+    edit_params = inspect.signature(edits).parameters
+    sampling_fields = {f.name for f in fields(SamplingParams)}
+    for name in ("profile", "num_profiled_timesteps", "profile_all_stages"):
+        assert name in edit_params
+        assert name in sampling_fields
+
+
 def test_url_response_returns_one_item_per_output_path():
     paths = ["first.png", "second.png"]
 
