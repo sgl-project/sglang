@@ -1,3 +1,5 @@
+from collections.abc import Callable
+
 import torch
 from diffusers.video_processor import VideoProcessor
 
@@ -52,11 +54,7 @@ class LTX2AVDecodingStage(DecodingStage):
         audio_vae_dtype = resolve_precision(
             server_args, "audio_vae", precision_attr="audio_vae_precision"
         )
-        uses = [
-            ComponentUse(stage_name, "audio_vae", target_dtype=audio_vae_dtype),
-            ComponentUse(stage_name, "vocoder"),
-            ComponentUse(stage_name, "vae", target_dtype=vae_dtype),
-        ]
+        uses = [ComponentUse(stage_name, "vae", target_dtype=vae_dtype)]
         if self.diffusion_decoder is not None:
             uses.append(
                 ComponentUse(
@@ -66,6 +64,12 @@ class LTX2AVDecodingStage(DecodingStage):
                     allow_prefetch=False,
                 )
             )
+        uses.extend(
+            [
+                ComponentUse(stage_name, "audio_vae", target_dtype=audio_vae_dtype),
+                ComponentUse(stage_name, "vocoder"),
+            ]
+        )
         return uses
 
     @staticmethod
@@ -156,7 +160,12 @@ class LTX2AVDecodingStage(DecodingStage):
             self._decode_audio(batch, server_args, output_batch)
         return output_batch
 
-    def _decode_video(self, batch: Req, server_args: ServerArgs, on_frames=None):
+    def _decode_video(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+        on_frames: Callable[[torch.Tensor], None] | None = None,
+    ) -> torch.Tensor:
         vae_dtype = resolve_decode_precision(server_args, "vae")
         vae_autocast_enabled = autocast_enabled(vae_dtype, server_args.disable_autocast)
 

@@ -83,8 +83,9 @@ class EncodeWhileDecoding:
             # Untiled decoders can hand over an entire clip. Bound FP32
             # postprocessing too, not just the queued uint8 frame copies.
             height, width = frames.shape[-2:]
+            float_frame_bytes = 3 * height * width * 4
             chunk_frames = max(
-                1, _STREAMED_VIDEO_QUEUE_BYTES // (4 * 3 * height * width * 4)
+                1, (_STREAMED_VIDEO_QUEUE_BYTES // 4) // float_frame_bytes
             )
             for chunk in frames.split(chunk_frames, dim=2):
                 if self._finish_frames is not None:
