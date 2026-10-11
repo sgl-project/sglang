@@ -21,12 +21,12 @@ class TestFlux3SwiGLUFp8(CustomTestCase):
         super().setUp()
         # Unsupported fallback layouts can disable the existing SwiGLU gate;
         # isolate that real state machine so other model tests are unaffected.
-        self.enterContext(
-            patch(
-                "sglang.multimodal_gen.runtime.models.dits.flux3._SWIGLU",
-                BitExactFusionGate("FLUX3 test SwiGLU", per_signature=True),
-            )
+        swiglu_patch = patch(
+            "sglang.multimodal_gen.runtime.models.dits.flux3._SWIGLU",
+            BitExactFusionGate("FLUX3 test SwiGLU", per_signature=True),
         )
+        self.addCleanup(swiglu_patch.stop)
+        swiglu_patch.start()
 
     @staticmethod
     def _output(result, tuple_output):
