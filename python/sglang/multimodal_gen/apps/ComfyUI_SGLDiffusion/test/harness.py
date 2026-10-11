@@ -77,7 +77,6 @@ def load_plugin():
         core.SGLDiffusionGenerator = object
         sys.modules[f"{PKG}.core"] = core
 
-        _load(f"{PKG}.recipe", "recipe.py")
         utils = _load(f"{PKG}.utils", "utils.py")
         nodes = _load(f"{PKG}.nodes", "nodes.py")
         plugin_modules = {

@@ -22,7 +22,6 @@ def _enable_gguf_in_diffusion_models() -> None:
 
 
 _enable_gguf_in_diffusion_models()
-from .recipe import FORMATS, build_recipe, find_target, render
 from .utils import (
     convert_b64_to_tensor_image,
     convert_video_to_comfy_video,
@@ -1307,48 +1306,6 @@ class SGLDiffusionServerLoraStack:
         return adapters
 
 
-class SGLDiffusionApiRecipe:
-    """Node that turns this workflow's SGLDiffusion generate node into an API call.
-
-    Emits a ready-to-run curl command, Python snippet, or `sglang generate`
-    command with the node's current settings filled in. The server's API key is
-    never written out; the snippets read $SGLANG_API_KEY.
-    """
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {"format": (FORMATS, {"default": "curl"})},
-            "optional": {
-                "node_id": (
-                    "STRING",
-                    {
-                        "default": "",
-                        "tooltip": "Id of the generate node to export; leave "
-                        "blank when the workflow has only one",
-                    },
-                ),
-            },
-            "hidden": {"prompt": "PROMPT"},
-        }
-
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("recipe",)
-    FUNCTION = "make_recipe"
-    CATEGORY = "SGLDiffusion"
-    OUTPUT_NODE = True
-
-    @classmethod
-    def IS_CHANGED(cls, **kwargs):
-        # The graph is a hidden input, so the cache cannot see it change.
-        return float("nan")
-
-    def make_recipe(self, format: str, prompt: dict, node_id: str = ""):
-        target = find_target(prompt, node_id.strip())
-        text = render(build_recipe(prompt, target), format)
-        return {"ui": {"text": [text]}, "result": (text,)}
-
-
 class SGLDiffusionServerUnsetLora:
     """Node to unset LoRA adapter for SGLang Diffusion server."""
 
@@ -1404,7 +1361,6 @@ NODE_CLASS_MAPPINGS = {
     "SGLDiffusionServerSetLora": SGLDiffusionServerSetLora,
     "SGLDiffusionServerListLoras": SGLDiffusionServerListLoras,
     "SGLDiffusionServerLoraStack": SGLDiffusionServerLoraStack,
-    "SGLDiffusionApiRecipe": SGLDiffusionApiRecipe,
     "SGLDiffusionServerUnsetLora": SGLDiffusionServerUnsetLora,
     "SGLDUNETLoader": SGLDUNETLoader,
     "SGLDOptions": SGLDOptions,
@@ -1421,7 +1377,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SGLDiffusionServerSetLora": "SGLDiffusion Server Set LoRA",
     "SGLDiffusionServerListLoras": "SGLDiffusion Server List LoRAs",
     "SGLDiffusionServerLoraStack": "SGLDiffusion Server LoRA Stack",
-    "SGLDiffusionApiRecipe": "SGLDiffusion Workflow to API Recipe",
     "SGLDiffusionServerUnsetLora": "SGLDiffusion Server Unset LoRA",
     "SGLDUNETLoader": "SGLDiffusion UNET Loader",
     "SGLDOptions": "SGLDiffusion Options",
