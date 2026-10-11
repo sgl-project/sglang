@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import threading
 from typing import Optional, Sequence
 
 import torch
@@ -19,15 +18,15 @@ from sglang.kernels.ops.kvcache.hicache import (
 from sglang.kernels.ops.kvcache.hicache import (
     transfer_hicache_one_layer_mla as jit_transfer_hicache_one_layer_mla,
 )
+from sglang.srt.layers.dcp.layout import maybe_dcp_kernel_indices
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
     HostKVCache,
-    sync_fixed_hicache_size,
 )
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
-    get_allocator_from_storage,
+    make_kernel_ptr_table,
 )
 from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
 from sglang.srt.mem_cache.pool_host.npu_memfabric import (
@@ -38,6 +37,7 @@ from sglang.srt.mem_cache.pool_host.npu_memfabric import (
     to_device_no_sync,
     track_pinned_staging,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
 
 _is_cuda = is_cuda()
@@ -45,7 +45,7 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 _is_mps = is_mps()
-if _is_cuda or _is_hip:
+if _is_cuda or _is_hip or _is_xpu:
     from sgl_kernel.kvcacheio import (
         transfer_kv_all_layer_direct_lf_pf,
         transfer_kv_all_layer_mla,
@@ -87,41 +87,57 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         self.mtp_draft_device_pools = tuple(mtp_draft_device_pools)
         self._is_dummy = is_dummy
 
+        self.device_pool = device_pool
+        self.dtype = device_pool.store_dtype
+        self.layout = layout
+        device_capacity = getattr(device_pool, "host_capacity_tokens", None)
         if is_dummy:
-            self._init_dummy(
-                device_pool,
-                host_to_device_ratio,
-                host_size,
-                page_size,
-                layout,
-                pin_memory,
-                device,
-                allocator_type,
-                dcp_size,
-                dcp_rank,
-                pool_label,
-            )
-            return
-
+            device_capacity = device_capacity or device_pool.size
         super().__init__(
-            device_pool,
-            host_to_device_ratio,
-            host_size,
-            page_size,
-            layout,
-            pin_memory,
-            device,
-            allocator_type,
+            dtype=self.dtype,
+            device_capacity_tokens=(
+                device_pool.size if device_capacity is None else device_capacity
+            ),
+            size_per_token=self.get_size_per_token(),
+            start_layer=device_pool.start_layer,
+            end_layer=device_pool.end_layer,
+            host_to_device_ratio=host_to_device_ratio,
+            host_size=host_size,
+            page_size=page_size,
+            layout=layout,
+            pin_memory=pin_memory,
+            device=device,
+            allocator_type=allocator_type,
             dcp_size=dcp_size,
             dcp_rank=dcp_rank,
             pool_label=pool_label,
+            is_dummy=is_dummy,
         )
+        if is_dummy:
+            self.token_stride_size = self.kv_cache_dim * self.dtype.itemsize
+            self.layout_dim = self.token_stride_size * self.layer_num
+            self.can_use_jit = False
+            self.staging_page_capacity = 0
+            self.staging_token_capacity = 0
+            self.staging_buffer = None
+            self.kv_buffer = None
+            self.data_refs = None
+            self.data_ptrs = None
+            logger.info(
+                "MLATokenToKVPoolHost dummy mode: allocator-only, size=%d tokens, "
+                "saving %.2f GB host memory",
+                self.size,
+                self.size * self.size_per_token / 1e9,
+            )
+            return
+
         # The JIT HiCache kernels also build with hipcc (ROCm): the PTX-only
         # helpers in hicache.cuh are guarded by USE_ROCM and the staged
         # write-back kernel has a ROCm path, so enable them on HIP too. This
         # keeps the ROCm write-back path consistent with CUDA.
         self.can_use_jit = (_is_cuda or _is_hip) and can_use_hicache_jit_kernel(
-            element_size=self.kv_cache_dim * self.dtype.itemsize
+            page_size=self.page_size,
+            element_size=self.kv_cache_dim * self.dtype.itemsize,
         )
 
         if self.layout in ("page_first", "page_first_kv_split"):
@@ -132,10 +148,10 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             self.data_refs = [transposed[i] for i in range(self.layer_num)]
         else:
             self.data_refs = [self.kv_buffer[i] for i in range(self.layer_num)]
-        self.data_ptrs = torch.tensor(
-            [x.data_ptr() for x in self.data_refs],
-            dtype=torch.uint64,
-            device=self.device_pool.device,
+        self.data_ptrs = make_kernel_ptr_table(
+            self.data_refs,
+            self.device_pool.device,
+            host_memory_registered=self.pin_memory,
         )
         if self.mtp_draft_device_pools:
             device_pools = (self.device_pool, *self.mtp_draft_device_pools)
@@ -145,76 +161,19 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             self.packed_device_kv_buffers = [
                 buffer for pool in device_pools for buffer in pool.kv_buffer
             ]
+        self._init_device_row_stride(
+            buf
+            for pool in (self.device_pool, *self.mtp_draft_device_pools)
+            for buf in getattr(pool, "kv_buffer", None) or ()
+        )
         self._init_write_back_staging_buffers()
-
-    def _init_dummy(
-        self,
-        device_pool: MLATokenToKVPool,
-        host_to_device_ratio: float,
-        host_size: int,
-        page_size: int,
-        layout: str,
-        pin_memory: bool,
-        device: str,
-        allocator_type: str,
-        dcp_size: int,
-        dcp_rank: int,
-        pool_label: str,
-    ) -> None:
-        self.device_pool = device_pool
-        self.pool_label = pool_label
-        self.dcp_size = dcp_size
-        self.dcp_rank = dcp_rank
-        assert page_size % dcp_size == 0, (
-            f"HiCache host pool page_size ({page_size}) must be a multiple of "
-            f"dcp_size ({dcp_size})."
-        )
-        self.page_size = page_size // dcp_size
-        self.layout = layout
-        self.pin_memory = pin_memory
-        self.device = device
-        self.allocator = get_allocator_from_storage(allocator_type)
-
-        self.dtype = device_pool.store_dtype
-        self.size_per_token = self.get_size_per_token()
-        if host_size > 0:
-            self.size = sync_fixed_hicache_size(
-                int(host_size * 1e9 // self.size_per_token), host_size
-            )
-        else:
-            self.size = int(device_pool.size * host_to_device_ratio)
-        self.page_num = self.size // self.page_size + 1
-        self.size = self.page_num * self.page_size
-        self.start_layer = device_pool.start_layer
-        self.end_layer = device_pool.end_layer
-
-        self.token_stride_size = self.kv_cache_dim * self.dtype.itemsize
-        self.layout_dim = self.token_stride_size * self.layer_num
-        self.can_use_jit = False
-        self.can_use_write_back_jit = False
-        self.staging_page_capacity = 0
-        self.staging_token_capacity = 0
-        self.staging_buffer = None
-        self.kv_buffer = None
-        self.data_refs = None
-        self.data_ptrs = None
-
-        logger.info(
-            "MLATokenToKVPoolHost dummy mode: allocator-only, size=%d tokens, "
-            "saving %.2f GB host memory",
-            self.size,
-            self.size * self.size_per_token / 1e9,
-        )
-
-        self.lock = threading.RLock()
-        self.clear()
 
     def get_contiguous_buf_infos(self):
         """Return (data_ptrs, data_lens, item_lens) in the same format as device pool,
         for registering host memory with the disaggregation transfer engine."""
         if self._is_dummy:
             return [], [], []
-        data_ptrs = [int(self.data_ptrs[i].item()) for i in range(self.layer_num)]
+        data_ptrs = [tensor.data_ptr() for tensor in self.data_refs]
         if self.layout == "page_first_kv_split":
             # data_refs are per-layer views of the k_buffer (page-major), so
             # take the per-layer slab size instead of kv_buffer[i] (a page slab).
@@ -396,7 +355,12 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         self.staging_token_capacity = 0
         self.staging_buffer = None
         self.can_use_write_back_jit = False
-        if self.layout != "page_first" or (_is_npu or _is_xpu or _is_mps):
+        # The staged kernel reads whole device pages, so it needs packed rows.
+        if (
+            self.layout != "page_first"
+            or not self.device_rows_packed
+            or not current_platform.capabilities.hicache_device_kernels
+        ):
             return
 
         # The staged write-back JIT kernel builds with hipcc and has a ROCm
@@ -652,8 +616,12 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         assert not getattr(self, "_is_dummy", False), (
             "load on a dummy (non-src MLA) host pool"
         )
-        host_indices = self.maybe_dcp_kernel_indices(host_indices)
-        device_indices = self.maybe_dcp_kernel_indices(device_indices)
+        host_indices = maybe_dcp_kernel_indices(
+            host_indices, self.dcp_size, self.dcp_rank
+        )
+        device_indices = maybe_dcp_kernel_indices(
+            device_indices, self.dcp_size, self.dcp_rank
+        )
         # MTP draft layers do not participate in CP layer sharding.
         host_layer_id = layer_id if is_draft else self._host_layer_index(layer_id)
         device_layer_id = 0 if is_draft else layer_id
@@ -662,6 +630,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             if self.layout == "layer_first":
                 if self.can_use_jit:
                     jit_transfer_hicache_one_layer_mla(
+                        page_size=self.page_size,
                         cache_dst=device_pool.kv_buffer[device_layer_id],
                         cache_src=self.kv_buffer[host_layer_id],
                         indices_dst=device_indices,
@@ -669,6 +638,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                         element_dim=self.kv_cache_dim,
                     )
                 else:
+                    self._require_packed_device_rows("transfer_kv_per_layer_mla")
                     transfer_kv_per_layer_mla(
                         src=self.kv_buffer[host_layer_id],
                         dst=device_pool.kv_buffer[device_layer_id],
@@ -679,6 +649,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             elif self.layout == "page_first":
                 if self.can_use_jit:
                     jit_transfer_hicache_one_layer_mla(
+                        page_size=self.page_size,
                         cache_dst=device_pool.kv_buffer[device_layer_id],
                         cache_src=self.data_refs[host_layer_id],
                         indices_dst=device_indices,
@@ -686,6 +657,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                         element_dim=self.kv_cache_dim,
                     )
                 else:
+                    self._require_packed_device_rows("transfer_kv_per_layer_mla_pf_lf")
                     transfer_kv_per_layer_mla_pf_lf(
                         src=self.kv_buffer,
                         dst=device_pool.kv_buffer[device_layer_id],
@@ -788,6 +760,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             if self.layout == "layer_first":
                 if self.can_use_jit:
                     jit_transfer_hicache_one_layer_mla(
+                        page_size=self.page_size,
                         cache_dst=self.kv_buffer[host_layer_id],
                         cache_src=device_pool.kv_buffer[device_layer_id],
                         indices_dst=host_indices,
@@ -795,6 +768,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                         element_dim=self.kv_cache_dim,
                     )
                 else:
+                    self._require_packed_device_rows("transfer_kv_per_layer_mla")
                     transfer_kv_per_layer_mla(
                         src=device_pool.kv_buffer[device_layer_id],
                         dst=self.kv_buffer[host_layer_id],
@@ -805,6 +779,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             elif self.layout == "page_first":
                 if self.can_use_jit:
                     jit_transfer_hicache_one_layer_mla(
+                        page_size=self.page_size,
                         cache_dst=self.data_refs[host_layer_id],
                         cache_src=device_pool.kv_buffer[device_layer_id],
                         indices_dst=host_indices,
@@ -850,8 +825,12 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         assert not getattr(self, "_is_dummy", False), (
             "backup on a dummy (non-src MLA) host pool"
         )
-        host_indices = self.maybe_dcp_kernel_indices(host_indices)
-        device_indices = self.maybe_dcp_kernel_indices(device_indices)
+        host_indices = maybe_dcp_kernel_indices(
+            host_indices, self.dcp_size, self.dcp_rank
+        )
+        device_indices = maybe_dcp_kernel_indices(
+            device_indices, self.dcp_size, self.dcp_rank
+        )
         if self._is_device_layer_sharded(device_pool):
             for layer_id in self._owned_device_layer_ids(device_pool):
                 self._backup_from_device_per_layer(
@@ -883,15 +862,17 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             if self.layout == "layer_first":
                 if self.can_use_jit:
                     jit_transfer_hicache_all_layer_mla(
+                        page_size=self.page_size,
                         ptr_dst=self.data_ptrs,
                         indices_dst=host_indices,
                         ptr_src=device_data_ptrs,
                         indices_src=device_indices,
                         cache_dst_stride_bytes=self.token_stride_size,
-                        cache_src_stride_bytes=self.token_stride_size,
+                        cache_src_stride_bytes=self.device_row_stride_bytes,
                         element_size=self.kv_cache_dim * self.dtype.itemsize,
                     )
                 else:
+                    self._require_packed_device_rows("transfer_kv_all_layer_mla")
                     transfer_kv_all_layer_mla(
                         src_layers=device_data_ptrs,
                         dst_layers=self.data_ptrs,
@@ -910,7 +891,21 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                         dst=self.kv_buffer,
                         page_size=self.page_size,
                     )
+                elif self.can_use_jit and not self.device_rows_packed:
+                    # The per-layer host views of page_first rows sit
+                    # `layout_dim` apart, which the all-layer kernel can step.
+                    jit_transfer_hicache_all_layer_mla(
+                        page_size=self.page_size,
+                        ptr_dst=self.data_ptrs,
+                        indices_dst=host_indices,
+                        ptr_src=device_data_ptrs,
+                        indices_src=device_indices,
+                        cache_dst_stride_bytes=self.layout_dim,
+                        cache_src_stride_bytes=self.device_row_stride_bytes,
+                        element_size=self.kv_cache_dim * self.dtype.itemsize,
+                    )
                 else:
+                    self._require_packed_device_rows("transfer_kv_all_layer_mla_lf_pf")
                     transfer_kv_all_layer_mla_lf_pf(
                         src_layers=device_data_ptrs,
                         dst=self.kv_buffer,

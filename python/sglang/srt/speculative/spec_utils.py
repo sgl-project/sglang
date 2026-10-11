@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Callable, List, Literal, Optional, Tuple
 import torch
 from huggingface_hub import snapshot_download
 
+from sglang.kernels.ops.sampling import softmax as sampling_softmax
 from sglang.kernels.ops.speculative.cache_locs import (
     align_evict_mask_to_page_size as align_evict_mask_to_page_size,
 )
@@ -31,15 +32,17 @@ from sglang.kernels.ops.speculative.cache_locs import (
 from sglang.kernels.ops.speculative.eagle import (
     fill_accept_out_cache_loc_func as fill_accept_out_cache_loc_func,
 )
+from sglang.kernels.ops.speculative.row_argmax import row_argmax
+from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.constrained.base_grammar_backend import GrammarMask
 from sglang.srt.distributed.parallel_state import (
-    GroupCoordinator,
     get_self_pp_group,
     patch_pipeline_parallel_group,
     patch_tensor_parallel_group,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
 from sglang.srt.managers.schedule_batch import set_mamba_track_indices_from_reqs
 from sglang.srt.managers.utils import _async_d2h
 from sglang.srt.mem_cache.allocation import (
@@ -50,6 +53,7 @@ from sglang.srt.mem_cache.allocation import (
 )
 from sglang.srt.runtime_context import (
     get_exec,
+    get_parallel,
     get_spec,
     mamba_track_grid,
     max_speculative_num_draft_tokens,
@@ -64,6 +68,7 @@ from sglang.srt.utils import (
     next_power_of_2,
 )
 from sglang.srt.utils.async_probe import maybe_detect_oob
+from sglang.srt.utils.common import fast_topk
 from sglang.srt.utils.nvtx_utils import profile_range
 
 _is_cuda = is_cuda()
@@ -80,13 +85,6 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 
-
-if _is_cuda:
-    from sgl_kernel import fast_topk
-elif _is_hip:
-    from sgl_kernel import fast_topk
-else:
-    from sglang.srt.utils.common import fast_topk
 
 if _is_cpu:
     from sgl_kernel import assign_extend_cache_locs_cpu
@@ -142,7 +140,7 @@ def fast_sample(probs: torch.Tensor, num_samples: int = 1):
     q.clamp_min_(torch.finfo(torch.float32).tiny)
     scores = probs.float() / q
     if num_samples == 1:
-        sample_index = scores.argmax(dim=-1, keepdim=True)
+        sample_index = row_argmax(scores).unsqueeze(-1)
     else:
         sample_index = scores.topk(num_samples, dim=-1).indices
     sample_p = probs.gather(1, sample_index)
@@ -161,19 +159,50 @@ def renorm_draft_probs(
     temperature (higher acceptance; correctness holds for any q).
     """
     if not use_rejection_sampling or not next_token_logits.size(0):
-        return torch.softmax(next_token_logits, dim=-1)
-    return torch.softmax(next_token_logits / sampling_info.temperatures, dim=-1)
+        return sampling_softmax(next_token_logits)
+    return sampling_softmax(next_token_logits, temperatures=sampling_info.temperatures)
 
 
-def sample_draft_proposal(next_token_logits: torch.Tensor, temperatures: torch.Tensor):
+def sample_draft_proposal(
+    next_token_logits: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_ks: Optional[torch.Tensor] = None,
+):
     """Leviathan draft proposal: q = softmax(logits / T), X ~ q.
 
     Returns (q, q(X), X). The verify's accept test coin*q(X) < p(X) is unbiased
     only if q is exactly the distribution X was drawn from, so callers must hand
     the returned q (not a recomputed one) to the verify.
+
+    A greedy row (``top_k == 1``) proposes its argmax instead. SamplingParams
+    rewrites temperature 0 to ``temperature=1.0, top_k=1``, so T alone cannot
+    tell a greedy request from a T=1 one, and sampling a sharp-but-not-
+    degenerate distribution proposes a non-argmax token often enough to cost
+    real accept length.
+
+    That row's X is then not drawn from the q returned beside it, which the
+    unbiasedness argument above otherwise rests on. It stays correct because
+    eagle_sample renormalises the target by the same per-row ``top_ks`` before
+    the accept test, so a greedy row's p is one-hot: X equal to the target
+    argmax accepts (p(X) = 1), any other X rejects (p(X) = 0) and the residual
+    (p - q)+ it resamples from is p itself. Both arms commit the target argmax,
+    which is what greedy means. Drop that renorm and this stops holding.
     """
-    probs = torch.softmax(next_token_logits / temperatures, dim=-1)
+    probs = sampling_softmax(next_token_logits, temperatures=temperatures)
     topk_p, topk_index = fast_sample(probs, num_samples=1)
+    if top_ks is not None:
+        # Assert rather than skip on a device mismatch: a host-side top_ks would
+        # make this correction silently vanish, and the symptom -- draft accept
+        # length quietly dropping about 20% -- reads as a model problem, not a
+        # plumbing one.
+        assert top_ks.device == probs.device, (
+            f"top_ks must be on {probs.device} to reach the draft proposal, "
+            f"got {top_ks.device}; the caller has to carry the real per-request "
+            "top_k, not a host placeholder"
+        )
+        greedy = (top_ks <= 1).view(-1, 1)
+        topk_index = torch.where(greedy, probs.argmax(dim=-1, keepdim=True), topk_index)
+        topk_p = probs.gather(1, topk_index)
     return probs, topk_p, topk_index
 
 
@@ -211,6 +240,41 @@ def draft_kv_indices_used_len(
     num_steps = i + 1 (per-step slice) and speculative_num_steps (capacity assert).
     """
     return seq_lens_sum * topk + bs * num_steps
+
+
+def resolve_draft_decode_window(model_runner) -> Tuple[int, int]:
+    """Resolve (window_size, sink_size) for generate_draft_decode_kv_indices.
+
+    Returns (0, 0) -- full draft attention, the pristine read plan -- when
+    --speculative-draft-window-size is unset, and also when the draft model
+    already has a sliding window of its own: the index builder emits one KV list
+    shared by every draft layer, so it cannot express a per-layer window, and the
+    draft model's own window is authoritative -- whether it comes from the
+    checkpoint or, for LlamaForCausalLMEagle3, from this same flag.
+    """
+    # Read through the resolving view: handle_speculative_decoding declares both
+    # fields rather than assigning them, so the raw field holds the unvalidated input.
+    cfg = resolving_view(model_runner.server_args)
+    window_size = int(cfg.speculative_draft_window_size or 0)
+    if window_size <= 0:
+        return 0, 0
+    # The runner's resolved window, not the raw config field: config keys
+    # (sliding_window / window_size) are overloaded across model families, while
+    # this is the same value the attention backends key their own SWA paths on.
+    native_window = getattr(model_runner, "sliding_window_size", None)
+    if native_window is not None and native_window > 0:
+        # An equal window is the one that was asked for, applied per layer instead
+        # of here (LlamaForCausalLMEagle3 routes this flag into its own window).
+        if native_window != window_size:
+            logger.warning(
+                "Ignoring --speculative-draft-window-size=%d: this draft model has a "
+                "sliding window of %d, which the attention backend applies per layer. "
+                "Draft-decode windowing stays off.",
+                window_size,
+                native_window,
+            )
+        return 0, 0
+    return window_size, int(cfg.speculative_draft_sink_size or 0)
 
 
 def record_stream_each(tensors, stream):
@@ -251,6 +315,8 @@ def record_stream_for_v2_verify(batch, verify_input, fwd_stream):
                     "draft_token",
                     "custom_mask",
                     "positions",
+                    "prepared_out_cache_loc",
+                    "prepared_mrope_positions",
                     "retrieve_index",
                     "retrieve_next_token",
                     "retrieve_next_sibling",
@@ -685,12 +751,19 @@ def draft_pp_context():
         yield
 
 
-@contextmanager
-def draft_tp_context(tp_group: GroupCoordinator):
-    # Draft model doesn't use dp and has its own tp group.
-    # We disable mscclpp now because it doesn't support 2 comm groups.
-    with patch_tensor_parallel_group(tp_group):
-        yield
+def draft_tp_context(owns_attention: bool):
+    """Enter the TP placement that draft work runs under.
+
+    Work that owns attention (an attention-owning draft, or DSpark's DP-MoE
+    sync) runs on the target's attention-TP group; other draft work keeps the
+    target's TP placement. Enter it from outside any draft scope, where
+    ``attn_tp_group`` is still the target's.
+    """
+    if not owns_attention:
+        return contextlib.nullcontext()
+    return patch_tensor_parallel_group(
+        get_parallel().attn_tp_group, owns_attention=True
+    )
 
 
 def spec_stage_span(name: str):
@@ -791,6 +864,8 @@ def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:
     set_mamba_track_indices_from_reqs(batch, track_positions)
     batch.mamba_track_mask = None
     batch.mamba_track_seqlens = None
+    batch.mamba_prefill_track_mask_cpu = None
+    batch.mamba_track_seqlens_cpu = None
 
 
 def _verify_commit_step_indices(
@@ -861,6 +936,7 @@ def commit_mamba_states_after_verify(
     accept_lens: torch.Tensor,
     accept_index: torch.Tensor,
     draft_token_num: int,
+    prepared_step_indices: Optional[Tuple[torch.Tensor, Optional[torch.Tensor]]] = None,
 ) -> None:
     """Commit accepted per-step mamba states into the persistent caches.
 
@@ -887,6 +963,10 @@ def commit_mamba_states_after_verify(
     # ring is allocated only then; KDA never allocates the cursors.
     req_pool = model_runner.req_to_token_pool
     mamba_pool = getattr(req_pool, "mamba_pool", None)
+    bs = accept_lens.shape[0]
+    src_indices_raw = (
+        batch.req_pool_indices[:bs] if pp_spec_stable_rows_enabled() else None
+    )
 
     # Fold-every-commit: replay the accepted prefix from the ring into
     # `temporal`; the same fold stores the interval-crossing state to the
@@ -904,12 +984,17 @@ def commit_mamba_states_after_verify(
 
         spec_state = req_pool.get_speculative_mamba2_params_all_layers()
         state_batch_indices = req_pool.get_mamba_indices(batch.req_pool_indices)
-        last_correct_step_indices, mamba_steps_to_track = _verify_commit_step_indices(
-            batch=batch,
-            accept_index=accept_index,
-            accept_lens=accept_lens,
-            draft_token_num=draft_token_num,
-        )
+        if prepared_step_indices is None:
+            last_correct_step_indices, mamba_steps_to_track = (
+                _verify_commit_step_indices(
+                    batch=batch,
+                    accept_index=accept_index,
+                    accept_lens=accept_lens,
+                    draft_token_num=draft_token_num,
+                )
+            )
+        else:
+            last_correct_step_indices, mamba_steps_to_track = prepared_step_indices
         commit_gdn_replayssm_fold_after_verify(
             spec_state=spec_state,
             state_batch_indices=state_batch_indices,
@@ -917,6 +1002,7 @@ def commit_mamba_states_after_verify(
             last_correct_step_indices=last_correct_step_indices,
             mamba_track_indices=batch.mamba_track_indices,
             mamba_steps_to_track=mamba_steps_to_track,
+            src_indices_raw=src_indices_raw,
             null_block_id=-1,
         )
         return
@@ -937,15 +1023,19 @@ def commit_mamba_states_after_verify(
         )
 
         spec_state = req_pool.get_speculative_mamba2_params_all_layers()
-        bs = accept_lens.shape[0]
         state_batch_indices = req_pool.get_mamba_indices(batch.req_pool_indices)
         replay_indices = batch.req_pool_indices
-        last_correct_step_indices, mamba_steps_to_track = _verify_commit_step_indices(
-            batch=batch,
-            accept_index=accept_index,
-            accept_lens=accept_lens,
-            draft_token_num=draft_token_num,
-        )
+        if prepared_step_indices is None:
+            last_correct_step_indices, mamba_steps_to_track = (
+                _verify_commit_step_indices(
+                    batch=batch,
+                    accept_index=accept_index,
+                    accept_lens=accept_lens,
+                    draft_token_num=draft_token_num,
+                )
+            )
+        else:
+            last_correct_step_indices, mamba_steps_to_track = prepared_step_indices
         # Advance the per-request circular cursors by the accepted count (incl. the
         # bonus token). max_cache_len = ring length L = replayssm_d.shape[-2].
         commit_gdn_replayssm_spec(
@@ -984,6 +1074,7 @@ def commit_mamba_states_after_verify(
             spec_state.intermediate_conv_window[0],
             state_batch_indices,
             last_correct_step_indices,
+            src_indices_raw,
         )
         if batch.mamba_track_indices is not None:
             fused_conv_window_scatter_with_mask(
@@ -991,6 +1082,7 @@ def commit_mamba_states_after_verify(
                 spec_state.intermediate_conv_window[0],
                 batch.mamba_track_indices,
                 mamba_steps_to_track,
+                src_indices_raw,
             )
         return
 
@@ -1012,7 +1104,6 @@ def commit_mamba_states_after_verify(
         )
 
         spec_state = req_pool.get_speculative_mamba2_params_all_layers()
-        bs = accept_lens.shape[0]
         state_batch_indices = req_pool.get_mamba_indices(batch.req_pool_indices)
         accept_indices_offset = torch.arange(
             0,
@@ -1052,21 +1143,26 @@ def commit_mamba_states_after_verify(
             last_correct_step_indices=last_correct_step_indices,
             mamba_track_indices=mamba_track_indices,
             mamba_steps_to_track=mamba_steps_to_track,
+            src_indices_raw=src_indices_raw,
             null_block_id=-1,  # SGLang: valid slots >= 0, padding == -1
         )
         return
 
     attn_backend = model_runner.attn_backend
 
-    bs = accept_lens.shape[0]
     # `accept_lens` already includes the bonus token (drafts + 1 per req).
     if not batch.forward_mode.is_idle() and accept_index.numel() > 0:
-        last_correct_step_indices, mamba_steps_to_track = _verify_commit_step_indices(
-            batch=batch,
-            accept_index=accept_index,
-            accept_lens=accept_lens,
-            draft_token_num=draft_token_num,
-        )
+        if prepared_step_indices is None:
+            last_correct_step_indices, mamba_steps_to_track = (
+                _verify_commit_step_indices(
+                    batch=batch,
+                    accept_index=accept_index,
+                    accept_lens=accept_lens,
+                    draft_token_num=draft_token_num,
+                )
+            )
+        else:
+            last_correct_step_indices, mamba_steps_to_track = prepared_step_indices
 
         if hasattr(attn_backend, "update_mamba_state_after_mtp_verify"):
             attn_backend.update_mamba_state_after_mtp_verify(

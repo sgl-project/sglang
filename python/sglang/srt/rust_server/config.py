@@ -1,11 +1,12 @@
-"""Configuration handoff and CPU placement for the embedded Rust server."""
+"""Configuration and CPU placement for the embedded Rust server."""
 
 from __future__ import annotations
 
 import json
 import logging
 import os
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from types import ModuleType
+from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
 
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.managers.utils import compute_num_reserved_tokens
@@ -25,8 +26,10 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _build_server_args(scheduler: Scheduler) -> ServerArgs:
-    """The typed launch handoff for the scheduler's embedded Rust server:
+def _build_server_args(
+    scheduler: Scheduler, *, extension: Optional[ModuleType] = None
+) -> ServerArgs:
+    """The typed launch configuration for the scheduler's embedded Rust server:
     the ``server_args`` fields it reads, the already-resolved
     ``model_config``, and launch-time facts — as the Rust extension's own
     ``ServerArgs`` class. Its constructor takes every field as a required
@@ -35,7 +38,7 @@ def _build_server_args(scheduler: Scheduler) -> ServerArgs:
     running on a silently-defaulted knob."""
     from sglang.srt.rust_extensions import load_rust_extension
 
-    ext = load_rust_extension("sglang.srt.rust_extensions._server")
+    ext = extension or load_rust_extension("sglang.srt.rust_extensions._server")
 
     sa = resolving_view(scheduler.server_args)
     mc = scheduler.model_config
@@ -44,6 +47,11 @@ def _build_server_args(scheduler: Scheduler) -> ServerArgs:
         "prefill": ext.DisaggregationMode.Prefill,
         "decode": ext.DisaggregationMode.Decode,
     }[get_disagg().disaggregation_mode]
+    grpc_port = (
+        None
+        if get_serving().smg_grpc_mode or get_serving().grpc_mode
+        else get_serving().grpc_port
+    )
     return ext.ServerArgs(
         model_path=get_model().model_path,
         served_model_name=get_serving().served_model_name,
@@ -53,6 +61,9 @@ def _build_server_args(scheduler: Scheduler) -> ServerArgs:
         weight_version=get_serving().weight_version,
         host=get_serving().host,
         port=get_serving().port,
+        # The shared field is also populated for legacy SMG mode; only forward
+        # it when it selects SGLang's native gRPC transport.
+        grpc_port=grpc_port,
         log_level=get_observability().log_level,
         log_level_http=get_observability().log_level_http,
         chat_template=get_serving().chat_template,
@@ -69,6 +80,7 @@ def _build_server_args(scheduler: Scheduler) -> ServerArgs:
             context_len=mc.context_len,
             vocab_size=mc.vocab_size,
             is_multimodal=mc.is_multimodal,
+            model_type=getattr(mc.hf_config, "model_type", None),
             # Resolved default sampling params (generation_config.json when
             # `--sampling-defaults model`, {} otherwise). The rust server
             # consumes these for omitted temperature/top_p in chat
@@ -99,6 +111,7 @@ def _build_server_args(scheduler: Scheduler) -> ServerArgs:
 
 def _partition_cores(
     mm_workers: int = 0,
+    server_core_budget: Optional[Callable[[int, int], int]] = None,
 ) -> Tuple[Optional[List[int]], Optional[List[int]]]:
     """Split this rank's allowed cores into ``(launch_cores, server_cores)``.
 
@@ -137,7 +150,11 @@ def _partition_cores(
     # once bounded. The budget covers the CPU-hot threads (MM workers, plus
     # the I/O-shaped tokenizer/ingress/egress/api ones that are rarely all hot
     # at once) and leaves the rest of the node to the scheduler ranks.
-    pool_budget = max(8, mm_workers + 4)
+    pool_budget = (
+        server_core_budget(len(allowed), mm_workers)
+        if server_core_budget is not None
+        else max(8, mm_workers + 4)
+    )
     server_cores = allowed[reserve : reserve + pool_budget]
     logger.info(
         "rust server cores=%s, scheduler launch cores=%s",

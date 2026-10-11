@@ -132,6 +132,7 @@ class TestMooncakeKvCacheDtype(unittest.TestCase):
         )
         # Covers both a byte-backed host pool and a hybrid facade with no dtype.
         controller.enable_storage_metrics = False
+        controller.storage_host_pool = SimpleNamespace(storage_format_tag=None)
         controller.get_attn_cp_rank_and_size = lambda: (0, 1)
         parallel = SimpleNamespace(tp_rank=0, tp_size=1, pp_rank=0, pp_size=1)
         with (

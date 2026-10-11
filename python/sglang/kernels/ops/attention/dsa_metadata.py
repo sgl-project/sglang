@@ -33,7 +33,7 @@ def _fused_dsa_decode_metadata_kernel(
     bs: tl.constexpr,
     max_len,
     dsa_index_topk: tl.constexpr,
-    real_page_size: tl.constexpr,
+    physical_page_size: tl.constexpr,
     HAS_REAL_PAGE_TABLE: tl.constexpr,
     HAS_PAGE_TABLE_1: tl.constexpr,
     BLOCK_BS: tl.constexpr,
@@ -98,13 +98,13 @@ def _fused_dsa_decode_metadata_kernel(
         )
 
     if HAS_REAL_PAGE_TABLE:
-        real_mask = mask & ((offs_n % real_page_size) == 0)
-        real_cols = offs_n // real_page_size
+        real_mask = mask & ((offs_n % physical_page_size) == 0)
+        real_cols = offs_n // physical_page_size
         tl.store(
             real_page_table
             + row.to(tl.int64) * real_page_table_stride_0
             + real_cols * real_page_table_stride_1,
-            vals // real_page_size,
+            vals // physical_page_size,
             mask=real_mask,
         )
 
@@ -122,15 +122,15 @@ def fused_dsa_decode_metadata(
     bs: int,
     max_len: int,
     dsa_index_topk: int,
-    real_page_size: int,
+    physical_page_size: int,
 ) -> None:
     """Fill decode-graph DSA metadata (seqlens + page tables) from req_to_token.
 
     ``page_table_1`` (the wide page_size=1 table) is optional: pass ``None`` to
     skip materializing it and write only the compact ``real_page_table``
-    (page_size=``real_page_size``). This is used by the fused decode CUDA graph,
+    (page_size=``physical_page_size``). This is used by the fused decode CUDA graph,
     where the wide table is never read (attention uses topk_indices, the indexer
-    uses real_page_table); ``real_page_size`` must be >1 in that case. When a
+    uses real_page_table); ``physical_page_size`` must be >1 in that case. When a
     tensor is passed, behavior is unchanged (both tables are written).
 
     Contract: each page-table row is written only over its live prefix
@@ -150,7 +150,7 @@ def fused_dsa_decode_metadata(
         dsa_cu_seqlens_k[:1].zero_()
         return
 
-    has_real_page_table = real_page_size > 1
+    has_real_page_table = physical_page_size > 1
     if has_real_page_table:
         assert real_page_table is not None
         assert real_page_table.is_cuda
@@ -194,7 +194,7 @@ def fused_dsa_decode_metadata(
         bs,
         max_len,
         dsa_index_topk,
-        real_page_size,
+        physical_page_size,
         has_real_page_table,
         has_page_table_1,
         BLOCK_BS=block_bs,
@@ -234,7 +234,7 @@ def _fused_dsa_target_verify_metadata_kernel(
     bs: tl.constexpr,
     max_seqlen_k,
     dsa_index_topk: tl.constexpr,
-    real_page_size: tl.constexpr,
+    physical_page_size: tl.constexpr,
     next_n: tl.constexpr,
     HAS_REAL_PAGE_TABLE: tl.constexpr,
     HAS_PAGED_MQA_CTX_LENS: tl.constexpr,
@@ -330,13 +330,13 @@ def _fused_dsa_target_verify_metadata_kernel(
         )
 
     if HAS_REAL_PAGE_TABLE:
-        real_mask = mask & ((offs_n % real_page_size) == 0)
-        real_cols = offs_n // real_page_size
+        real_mask = mask & ((offs_n % physical_page_size) == 0)
+        real_cols = offs_n // physical_page_size
         tl.store(
             real_page_table
             + out_row.to(tl.int64) * real_page_table_stride_0
             + real_cols * real_page_table_stride_1,
-            vals // real_page_size,
+            vals // physical_page_size,
             mask=real_mask,
         )
 
@@ -355,7 +355,7 @@ def fused_dsa_target_verify_metadata(
     bs: int,
     max_seqlen_k: int,
     dsa_index_topk: int,
-    real_page_size: int,
+    physical_page_size: int,
     next_n: int,
     paged_mqa_ctx_lens_2d: torch.Tensor = None,
 ) -> None:
@@ -374,7 +374,7 @@ def fused_dsa_target_verify_metadata(
         return
     assert next_n > 0
 
-    has_real_page_table = real_page_size > 1
+    has_real_page_table = physical_page_size > 1
     if has_real_page_table:
         assert real_page_table is not None
         assert real_page_table.is_cuda
@@ -433,7 +433,7 @@ def fused_dsa_target_verify_metadata(
         bs,
         max_seqlen_k,
         dsa_index_topk,
-        real_page_size,
+        physical_page_size,
         next_n,
         has_real_page_table,
         has_paged_mqa_ctx_lens,
@@ -477,7 +477,7 @@ def _fused_dsa_draft_extend_metadata_kernel(
     total_len,
     max_seqlen_k,
     dsa_index_topk: tl.constexpr,
-    real_page_size: tl.constexpr,
+    physical_page_size: tl.constexpr,
     HAS_REAL_PAGE_TABLE: tl.constexpr,
     HAS_PAGE_TABLE_1: tl.constexpr,
     STATIC_EXTEND_LEN: tl.constexpr,
@@ -603,13 +603,13 @@ def _fused_dsa_draft_extend_metadata_kernel(
         )
 
     if HAS_REAL_PAGE_TABLE:
-        real_mask = mask & ((offs_n[None, :] % real_page_size) == 0)
-        real_cols = offs_n // real_page_size
+        real_mask = mask & ((offs_n[None, :] % physical_page_size) == 0)
+        real_cols = offs_n // physical_page_size
         tl.store(
             real_page_table
             + out_rows.to(tl.int64)[:, None] * real_page_table_stride_0
             + real_cols[None, :] * real_page_table_stride_1,
-            (vals // real_page_size)[None, :],
+            (vals // physical_page_size)[None, :],
             mask=real_mask,
         )
 
@@ -630,7 +630,7 @@ def fused_dsa_draft_extend_metadata(
     total_len: int,
     max_seqlen_k: int,
     dsa_index_topk: int,
-    real_page_size: int,
+    physical_page_size: int,
     max_extend_len: int,
     max_total_len: int,
     static_extend_len: bool = False,
@@ -663,7 +663,7 @@ def fused_dsa_draft_extend_metadata(
     assert max_extend_len > 0
     assert total_len <= bs * max_extend_len
 
-    has_real_page_table = real_page_size > 1
+    has_real_page_table = physical_page_size > 1
     if has_real_page_table:
         assert real_page_table is not None
         assert real_page_table.is_cuda
@@ -712,7 +712,7 @@ def fused_dsa_draft_extend_metadata(
         total_len,
         max_seqlen_k,
         dsa_index_topk,
-        real_page_size,
+        physical_page_size,
         has_real_page_table,
         has_page_table_1,
         static_extend_len,

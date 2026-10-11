@@ -36,12 +36,6 @@ class TestMmProcessConfigValidation(CustomTestCase):
         args = self._validate_config({})
         self.assertEqual(resolution_result(args, "mm_process_config"), {})
 
-    def test_none_config_defaults_to_empty_dict(self):
-        args = self._validate_config(None)
-        # None is kept as-is for dummy models (default happens after early return)
-        # but for real models it would be set to {}
-        self.assertIsNone(resolution_result(args, "mm_process_config"))
-
     def test_top_level_non_dict_rejected(self):
         with self.assertRaises(TypeError) as ctx:
             self._validate_config("bad")
@@ -74,6 +68,21 @@ class TestMmProcessConfigValidation(CustomTestCase):
 
 class TestBaseProcessorConfigExtraction(CustomTestCase):
     """Verify BaseMultimodalProcessor.__init__ extracts configs from server_args."""
+
+    def _patch_platform(self, cuda_alike, device_type):
+        platforms = SimpleNamespace(
+            current_platform=SimpleNamespace(
+                is_cuda_alike=lambda: cuda_alike,
+                device_type=device_type,
+            )
+        )
+        return patch.multiple(
+            "sglang.srt.multimodal.processors.base_processor",
+            _is_cpu=False,
+            _is_xpu=False,
+            _is_npu=False,
+            platforms=platforms,
+        )
 
     def _make_processor(
         self,
@@ -210,11 +219,22 @@ class TestBaseProcessorConfigExtraction(CustomTestCase):
         9.30 -> 4.02 req/s on GB300 for full-page images."""
         from transformers import BaseImageProcessor
 
-        proc = self._make_processor(
-            {}, image_processor=MagicMock(spec=BaseImageProcessor)
-        )
+        with self._patch_platform(cuda_alike=True, device_type="cuda"):
+            proc = self._make_processor(
+                {}, image_processor=MagicMock(spec=BaseImageProcessor)
+            )
         self.assertEqual(proc.mm_processor_worker_num, 1)
         self.assertIsNone(proc.mm_processor_executor)
+
+    def test_non_accelerator_fast_processor_gets_two_workers(self):
+        from transformers import BaseImageProcessor
+
+        with self._patch_platform(cuda_alike=False, device_type="custom"):
+            proc = self._make_processor(
+                {}, image_processor=MagicMock(spec=BaseImageProcessor)
+            )
+        self.assertEqual(proc.mm_processor_worker_num, 2)
+        self.assertIsNotNone(proc.mm_processor_executor)
 
     def test_explicit_request_overrides_the_path_decision(self):
         """The server argument wins: an operator who measured their own workload
@@ -240,7 +260,10 @@ class TestBaseProcessorConfigExtraction(CustomTestCase):
             BaseMultimodalProcessor,
         )
 
-        with patch.object(BaseMultimodalProcessor, "auto_mm_processor_worker_num", 3):
+        with (
+            patch.object(BaseMultimodalProcessor, "auto_mm_processor_worker_num", 3),
+            self._patch_platform(cuda_alike=True, device_type="cuda"),
+        ):
             proc = self._make_processor(
                 {}, image_processor=MagicMock(spec=BaseImageProcessor)
             )
@@ -415,6 +438,25 @@ class TestStreamOrderedMmFeaturePool(CustomTestCase):
 
         with get_parallel().override(tp_rank=6, attn_tp_rank=2):
             self.assertEqual(resolve_consumer_rank(8), 6)
+
+    def test_attention_dp_uses_only_the_routed_scheduler_group(self):
+        from sglang.srt.multimodal.transport.memory_pool import (
+            get_mm_feature_consumer_count,
+            resolve_consumer_rank,
+        )
+        from sglang.srt.runtime_context import get_parallel
+
+        with get_parallel().override(
+            tp_size=8,
+            attn_dp_enabled=True,
+            num_dp_ranks=2,
+            tp_rank=6,
+            attn_tp_rank=0,
+            attn_dcp_size=2,
+        ):
+            count = get_mm_feature_consumer_count()
+            self.assertEqual(count, 4)
+            self.assertEqual(resolve_consumer_rank(count), 2)
 
     def test_complete_group_acknowledges_each_consumer_slot(self):
         from sglang.srt.multimodal.transport import memory_pool

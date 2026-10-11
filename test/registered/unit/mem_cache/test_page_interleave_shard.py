@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Unit tests for logical-page KV cache sharding (CPU only).
+"""Tests for logical-page KV cache sharding.
 
 Pins the pure arithmetic that rotated owner-classed allocation hangs on:
 
@@ -24,36 +24,57 @@ Pins the pure arithmetic that rotated owner-classed allocation hangs on:
 3. The host rotation base on ``UnifiedTreeNode`` — stamped at insert, copied
    on split, read through ``last_node``, and the pre-flight that declines an
    insert whose pages carry a different base than the chain it would join.
+4. ``translate_loc_to_scratch`` — the per-batch page->scratch-page lookup mapping
+   any consumer index vector onto the owner-major ``[prefix | chunk | trash]``
+   scratch, checked against a brute-force reference.
+5. ``begin_shard_extend`` plan capture (page positions, padded send rows,
+   owner-congruence guard) with the gather stubbed out, following the
+   SimpleNamespace binding pattern of ``test_dsa_layer_shard_utils.py``.
 """
 
+import shutil
 import unittest
 import unittest.mock
 from array import array
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import torch
+from parameterized import parameterized_class
 
+from sglang.srt.environ import envs
+from sglang.srt.managers.schedule_batch import ReqKvInfo
+from sglang.srt.mem_cache import page_interleave
 from sglang.srt.mem_cache.allocator.page_interleave import (
     PageInterleavePoolAllocator,
     page_interleave_shard_size,
 )
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
-    DecLockRefParams,
+    EvictResult,
     InsertParams,
     MatchPrefixParams,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.common import _evict_until_allocatable
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
 from sglang.srt.mem_cache.page_interleave import (
     PageInterleavePlacement,
     PageShardSpec,
+    compute_page_shard_scratch_bytes,
+    make_page_shard_spec,
+)
+from sglang.srt.mem_cache.page_interleave_pool import (
+    PageInterleaveKVPoolMixin,
+    PageInterleaveMHATokenToKVPool,
+    PageInterleaveMLATokenToKVPool,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
-from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.srt.utils import ceil_div
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.mem_cache_utils import finish_req
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
@@ -61,6 +82,147 @@ register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 N = 4  # shard size
 PS = 16  # physical page size
 GS = N * PS  # full-group span (N physical pages)
+
+
+class TestPageShardScratchSizing(CustomTestCase):
+    @contextmanager
+    def _fixture(
+        self,
+        *,
+        enabled=True,
+        draft=False,
+        shard_size=4,
+        use_mla=True,
+        context_len=4096,
+        chunk_tokens=256,
+        prefill_max_requests=None,
+        max_running_requests=None,
+        dp_size=1,
+        tp_size=4,
+        num_kv_heads=8,
+        head_dim=96,
+        v_head_dim=64,
+    ):
+        group = SimpleNamespace(world_size=shard_size, rank_in_group=0)
+        parallel = SimpleNamespace(
+            enable_kv_cache_sharding=enabled,
+            attn_cp_group=(SimpleNamespace(world_size=1) if use_mla else group),
+            attn_tp_group=group,
+            attn_tp_size=tp_size,
+            attn_dp_size=dp_size,
+        )
+        schedule = SimpleNamespace(
+            chunked_prefill_size=chunk_tokens,
+            prefill_max_requests=prefill_max_requests,
+            max_running_requests=max_running_requests,
+        )
+        kvc = SimpleNamespace(
+            is_draft_worker=draft,
+            use_mla_backend=use_mla,
+            page_size=16,
+            kv_cache_dtype=torch.bfloat16,
+            model_config=SimpleNamespace(
+                context_len=context_len,
+                kv_lora_rank=16,
+                qk_rope_head_dim=8,
+                head_dim=head_dim,
+                v_head_dim=v_head_dim,
+                get_num_kv_heads=lambda tp: num_kv_heads // tp,
+            ),
+        )
+        with (
+            unittest.mock.patch.object(
+                page_interleave, "get_parallel", return_value=parallel
+            ),
+            unittest.mock.patch.object(
+                page_interleave, "get_schedule", return_value=schedule
+            ),
+        ):
+            yield kvc
+
+    def test_disabled_draft_and_trivial_group_need_no_scratch(self):
+        for options in (
+            {"enabled": False},
+            {"draft": True},
+            {"shard_size": 1},
+        ):
+            with self.subTest(options=options), self._fixture(**options) as kvc:
+                self.assertIsNone(make_page_shard_spec(kvc))
+                self.assertEqual(compute_page_shard_scratch_bytes(kvc), 0)
+
+    def test_eight_contexts_are_reserved_independently_of_batch_limits(self):
+        for options in (
+            {},
+            {"prefill_max_requests": 1},
+            {"max_running_requests": 1},
+            {"max_running_requests": 4, "dp_size": 4},
+            {"chunk_tokens": 16},
+            {"chunk_tokens": 8192, "prefill_max_requests": 32},
+        ):
+            with self.subTest(options=options), self._fixture(**options) as kvc:
+                spec = make_page_shard_spec(kvc)
+                self.assertEqual(spec.max_prefix_tokens, 8 * 4096)
+                self.assertEqual(spec.chunk_tokens, options.get("chunk_tokens", 256))
+                self.assertEqual(
+                    spec.scratch_rows, spec.max_prefix_tokens + spec.chunk_tokens + 16
+                )
+
+    def test_each_context_is_aligned_before_multiplying_by_eight(self):
+        with self._fixture(context_len=4097, chunk_tokens=33) as kvc:
+            spec = make_page_shard_spec(kvc)
+        # Each request's prefix gather pads independently to 64 tokens.
+        # Aligning only 8 * context_len would reserve too few rows.
+        self.assertEqual(spec.max_prefix_tokens, 8 * 4160)
+        self.assertGreater(spec.max_prefix_tokens, 32832)
+        self.assertEqual(spec.chunk_tokens, 48)
+        self.assertEqual(spec.max_prefix_tokens % spec.logical_page_size, 0)
+
+    def test_wide_gqa_keeps_eight_contexts_without_a_byte_cap(self):
+        with self._fixture(
+            use_mla=False,
+            context_len=65536,
+            chunk_tokens=4096,
+            tp_size=1,
+            num_kv_heads=64,
+            head_dim=128,
+            v_head_dim=128,
+        ) as kvc:
+            spec = make_page_shard_spec(kvc)
+            estimated = compute_page_shard_scratch_bytes(kvc)
+        # Numerical sizing only: do not allocate this large scratch on CPU.
+        # 64 heads * (128 K + 128 V) * two-byte BF16 = 32 KiB per row.
+        self.assertEqual(spec.max_prefix_tokens, 8 * 65536)
+        self.assertEqual(spec.chunk_tokens, 4096)
+        self.assertEqual(estimated, 2 * (8 * 65536 + 4096 + 16) * 32768)
+        self.assertGreater(estimated, 64 << 20)
+
+    def test_estimate_matches_actual_mla_and_gqa_scratch_tensors(self):
+        for use_mla in (True, False):
+            with (
+                self.subTest(use_mla=use_mla),
+                self._fixture(use_mla=use_mla, context_len=128, tp_size=2) as kvc,
+            ):
+                spec = make_page_shard_spec(kvc)
+                estimated = compute_page_shard_scratch_bytes(kvc)
+                pool = SimpleNamespace(
+                    device="cpu",
+                    store_dtype=kvc.kv_cache_dtype,
+                    kv_cache_dim=24,
+                    head_num=4,
+                    head_dim=96,
+                    v_head_dim=64,
+                )
+                pool_cls = (
+                    PageInterleaveMLATokenToKVPool
+                    if use_mla
+                    else PageInterleaveMHATokenToKVPool
+                )
+                tensors = pool_cls._scratch_tensor_specs(pool, spec.scratch_rows)
+                actual = 2 * sum(
+                    tensor.numel() * tensor.element_size()
+                    for tensor in tensors.values()
+                )
+                self.assertEqual(estimated, actual)
 
 
 def _make_spec(shard_rank=0, max_prefix_groups=64, chunk_pages=32):
@@ -391,8 +553,6 @@ class TestEvictUntilAllocatable(CustomTestCase):
         return alloc, outs
 
     def _tree_stub(self, alloc, frees):
-        from sglang.srt.mem_cache.base_prefix_cache import EvictResult
-
         stub = SimpleNamespace(calls=0)
 
         def evict(params):
@@ -407,8 +567,6 @@ class TestEvictUntilAllocatable(CustomTestCase):
         return stub
 
     def test_iterates_until_min_class_covers(self):
-        from sglang.srt.mem_cache.common import _evict_until_allocatable
-
         alloc, outs = self._allocator_with_tight_class()
         # Each round frees ONE class-3 page (a whole 1-page chain): reaching
         # a min-class floor of 2 pages takes 2 rounds.
@@ -418,8 +576,6 @@ class TestEvictUntilAllocatable(CustomTestCase):
         self.assertEqual(tree.calls, 2)
 
     def test_terminates_when_tree_dry(self):
-        from sglang.srt.mem_cache.common import _evict_until_allocatable
-
         alloc, _ = self._allocator_with_tight_class()
         tree = self._tree_stub(alloc, [])  # nothing evictable
         _evict_until_allocatable(tree, alloc, PS)
@@ -478,16 +634,25 @@ def _insert(tree, tokens, rotation_base=None, value=None):
     )
 
 
-def _node(tree, node_id):
-    return tree.tree_core.node_by_id(node_id)
-
-
 def _match_len(tree, tokens):
     res = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
-    return len(res.device_indices)
+    return res.device_prefix_len
 
 
-class TestUnifiedRotationBase(CustomTestCase):
+class _TreeCoreBackendCase(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        if self.tree_core_backend == "rust" and shutil.which("cargo") is None:
+            self.skipTest("the Rust backend builds with cargo")
+        override = envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override(
+            self.tree_core_backend
+        )
+        override.__enter__()
+        self.addCleanup(override.__exit__, None, None, None)
+
+
+@parameterized_class(("tree_core_backend",), [("python",), ("rust",)])
+class TestUnifiedRotationBase(_TreeCoreBackendCase):
     """The host rotation base on UnifiedTreeNode: the one new piece of
     metadata. The Full component's value is a device tensor, so the base must
     survive inserts and splits purely host-side or the alloc path gains a D2H
@@ -502,12 +667,12 @@ class TestUnifiedRotationBase(CustomTestCase):
         probe = list(range(8)) + [99, 98, 97, 96]
         _insert(tree, probe, rotation_base=2)
         res = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", probe))))
-        tail = _node(tree, res.last_device_node)
-        self.assertEqual(tail.rotation_base, 2)
-        parent = tail.parent
-        self.assertEqual(parent.rotation_base, 2)
-        for child in parent.children.values():
-            self.assertEqual(child.rotation_base, 2)
+        self.assertEqual(tree.rotation_base_of(res.last_device_node), 2)
+        for tokens in (list(range(8)), list(range(12))):
+            matched = tree.match_prefix(
+                MatchPrefixParams(key=RadixKey(array("q", tokens)))
+            )
+            self.assertEqual(tree.rotation_base_of(matched.last_device_node), 2)
 
     def test_new_chain_gets_its_own_base(self):
         tree = _unified_tree()
@@ -517,8 +682,8 @@ class TestUnifiedRotationBase(CustomTestCase):
         r2 = tree.match_prefix(
             MatchPrefixParams(key=RadixKey(array("q", range(100, 108))))
         )
-        self.assertEqual(_node(tree, r1.last_device_node).rotation_base, 1)
-        self.assertEqual(_node(tree, r2.last_device_node).rotation_base, 3)
+        self.assertEqual(tree.rotation_base_of(r1.last_device_node), 1)
+        self.assertEqual(tree.rotation_base_of(r2.last_device_node), 3)
 
     def test_extension_tail_node_stamped_from_request(self):
         tree = _unified_tree()
@@ -527,13 +692,13 @@ class TestUnifiedRotationBase(CustomTestCase):
         # tail node with the (same, chain-constant) base.
         _insert(tree, list(range(16)), rotation_base=1)
         res = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", range(16)))))
-        self.assertEqual(_node(tree, res.last_device_node).rotation_base, 1)
+        self.assertEqual(tree.rotation_base_of(res.last_device_node), 1)
 
     def test_unsharded_inserts_keep_none(self):
         tree = _unified_tree()
         _insert(tree, list(range(8)))
         res = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", range(8)))))
-        self.assertIsNone(_node(tree, res.last_device_node).rotation_base)
+        self.assertIsNone(tree.rotation_base_of(res.last_device_node))
 
     def test_rotation_base_of_reads_through_the_cache_boundary(self):
         """The alloc path holds a NodeId, not a node: the base must be
@@ -548,12 +713,13 @@ class TestUnifiedRotationBase(CustomTestCase):
         self.assertIsNone(tree.rotation_base_of(tree.tree_core.root_node_handle()))
 
 
-class TestShardedCoreGate(CustomTestCase):
+@parameterized_class(("tree_core_backend",), [("python",), ("rust",)])
+class TestShardedCoreGate(_TreeCoreBackendCase):
     """A tree core that does not model rotation_base would never decline a
     cross-base graft. Pairing one with a sharded allocator must fail at
     construction, not produce wrong-owner gathers at serve time."""
 
-    def test_python_core_supports_rotation_base(self):
+    def test_core_supports_rotation_base(self):
         tree = _unified_tree()
         self.assertTrue(tree.tree_core.supports_rotation_base)
 
@@ -568,56 +734,61 @@ class TestShardedCoreGate(CustomTestCase):
             tree_components=(ComponentType.FULL,),
         )
         with unittest.mock.patch.object(
-            UnifiedTreeCore, "supports_rotation_base", False
+            type(tree.tree_core), "supports_rotation_base", False
         ):
             with self.assertRaisesRegex(ValueError, "rotation bases"):
                 UnifiedRadixCache(params)
 
     def test_unsharded_allocator_accepts_any_core(self):
+        tree = _unified_tree()
         params = CacheInitParams(
             disable=False,
             req_to_token_pool=ReqToTokenPool(
                 size=8, max_context_len=128, device="cpu", enable_memory_saver=False
             ),
-            token_to_kv_pool_allocator=_unified_tree().token_to_kv_pool_allocator,
+            token_to_kv_pool_allocator=tree.token_to_kv_pool_allocator,
             page_size=4,
             eviction_policy="lru",
             tree_components=(ComponentType.FULL,),
         )
         with unittest.mock.patch.object(
-            UnifiedTreeCore, "supports_rotation_base", False
+            type(tree.tree_core), "supports_rotation_base", False
         ):
             UnifiedRadixCache(params)  # no raise: sharding is off
 
 
 class _GraftReq:
-    """Minimal Req stand-in for cache_unfinished/finished_req."""
+    """Minimal Req stand-in for checkpoint."""
 
     def __init__(self, fill_ids, req_pool_idx=0):
         self.fill_ids = list(fill_ids)
         self.origin_input_ids = array("q", fill_ids)
+        self.full_untruncated_fill_ids = self.origin_input_ids
         self.output_ids = array("q", [])
-        self.kv = SimpleNamespace(
-            req_pool_idx=req_pool_idx,
-            cache_protected_len=0,
-            swa_evicted_seqlen=0,
-        )
+        self.kv = ReqKvInfo(req_pool_idx=req_pool_idx)
         self.extra_key = None
         self.cache_salt = None
-        self.prefix_indices = torch.empty(0, dtype=torch.int64)
+        self.prefix_len = 0
         self.last_node = None
         self.priority = 0
         self.kv_rotation_base = None
-        self.lock_receipt = DecLockRefParams()
-        self.swa_prefix_lock_released = False
+        self.lock = None
         self.finished_reason = None
         self.session = None
+        self.session_id = None
 
     def get_fill_ids(self):
         return array("q", self.fill_ids)
 
+    def refresh_fill_ids(self):
+        pass  # fill ids are fixed for the stand-in
 
-class TestRotationGraftDecline(CustomTestCase):
+    def finished(self):
+        return self.finished_reason is not None
+
+
+@parameterized_class(("tree_core_backend",), [("python",), ("rust",)])
+class TestRotationGraftDecline(_TreeCoreBackendCase):
     """The overlap disagg-prefill loop plans batch t+1 before batch t's radix
     insert lands, so two requests sharing a prefix can allocate under
     different rotation bases. Grafting the second one's tail under the first
@@ -649,7 +820,7 @@ class TestRotationGraftDecline(CustomTestCase):
             freed.extend(torch.as_tensor(seg).clone() for seg, _start in segments)
             return real_free_segments(segments)
 
-        def spy_segment(free_index, *, start_pos):
+        def spy_segment(free_index, start_pos):
             freed.append(torch.as_tensor(free_index).clone())
             return real_free_segment(free_index, start_pos=start_pos)
 
@@ -722,28 +893,29 @@ class TestRotationGraftDecline(CustomTestCase):
         res = _insert(tree, list(range(12)), rotation_base=3)
         self.assertTrue(res.rotation_tail_declined)
 
-    def test_cache_unfinished_decline_keeps_request_on_own_pages(self):
+    def test_insert_decline_keeps_request_on_own_pages(self):
         tree, freed = self._tree_with_spy()
         self._seed_chain(tree, list(range(8)), base=1)
         req = _GraftReq(list(range(8)) + [90, 91, 92, 93])
         req.kv_rotation_base = 3
         own_locs = self._own_row(tree, req, 12)
-        tree.cache_unfinished_req(req)
+        tree.checkpoint(req, up_to=len(req.fill_ids))
         # No dedup free, no rebind: the request keeps its own locs whole.
         self.assertEqual([t.tolist() for t in freed], [])
-        self.assertTrue(torch.equal(req.prefix_indices, own_locs))
+        row = tree.req_to_token_pool.req_to_token[req.kv.req_pool_idx, :12]
+        self.assertTrue(torch.equal(row.to(dtype=torch.int64), own_locs))
         self.assertEqual(req.kv.cache_protected_len, 0)
         self.assertTrue(
             torch.equal(tree.req_to_token_pool.req_to_token[0, :12], own_locs)
         )
 
-    def test_cache_finished_decline_frees_duplicates_and_suffix(self):
+    def test_checkpoint_decline_frees_duplicates_and_suffix(self):
         tree, freed = self._tree_with_spy()
         self._seed_chain(tree, list(range(8)), base=1)
         req = _GraftReq(list(range(8)) + [90, 91, 92, 93])
         req.kv_rotation_base = 3
         own_locs = self._own_row(tree, req, 12)
-        tree.cache_finished_req(req, kv_len_to_handle=12)
+        finish_req(tree, req, 12)
         released = torch.cat(freed)
         # Everything past the protected prefix is released: the duplicates of
         # the matched region AND the declined tail (nothing leaks, nothing is
@@ -751,7 +923,7 @@ class TestRotationGraftDecline(CustomTestCase):
         self.assertEqual(set(released.tolist()), set(own_locs.tolist()))
         self.assertEqual(_match_len(tree, req.fill_ids), 8)
 
-    def test_cache_finished_same_base_keeps_the_tail_cached(self):
+    def test_checkpoint_same_base_keeps_the_tail_cached(self):
         """Control for the decline test: with an agreeing base the tail is
         grafted and only the matched duplicates are freed."""
         tree, freed = self._tree_with_spy()
@@ -759,11 +931,400 @@ class TestRotationGraftDecline(CustomTestCase):
         req = _GraftReq(list(range(8)) + [90, 91, 92, 93])
         req.kv_rotation_base = 1
         own_locs = self._own_row(tree, req, 12)
-        tree.cache_finished_req(req, kv_len_to_handle=12)
+        req.last_node = tree.root_node_handle()
+        finish_req(tree, req, 12)
         self.assertEqual(_match_len(tree, req.fill_ids), 12)
         released = torch.cat(freed) if freed else torch.empty(0, dtype=torch.int64)
         # Only the 8 duplicate rows go back; the tail stays live in the tree.
         self.assertEqual(set(released.tolist()), set(own_locs[:8].tolist()))
+
+
+def _chain_pages(base, n_pages, local_start=5):
+    """Logical page ids of one chain: page P has owner (base + P) % N and an
+    arbitrary (here: increasing) local page on its owner."""
+    counter = {r: local_start for r in range(N)}
+    pages = []
+    for p in range(n_pages):
+        r = (base + p) % N
+        pages.append(counter[r] * N + r)
+        counter[r] += 1
+    return pages
+
+
+def _chain_row(pages, seq_len):
+    row = torch.empty(seq_len, dtype=torch.int32)
+    for i in range(seq_len):
+        row[i] = pages[i // PS] * PS + i % PS
+    return row
+
+
+def _make_pool_stub(spec, shard_rank=0, debug=True, table_pages=4096):
+    """A SimpleNamespace carrying exactly the state begin_shard_extend /
+    translate_loc_to_scratch read."""
+    stub = SimpleNamespace()
+    stub.shard_spec = spec
+    stub.shard_rank = shard_rank
+    stub.device = "cpu"
+    stub.start_layer = 0
+    stub._chunk_base = spec.max_prefix_tokens
+    stub._trash_base = spec.max_prefix_tokens + spec.chunk_tokens
+    stub._page_pos = torch.full(
+        (table_pages,), stub._trash_base // PS, dtype=torch.int32
+    )
+    stub._local_page_stride = table_pages
+    stub._epoch = 0
+    stub._write_plan_key = stub._write_plan = None
+    stub._translate_cache = {}
+    stub._debug_plan_checks = debug
+    stub.translate_loc_to_scratch = lambda loc: (
+        PageInterleaveKVPoolMixin.translate_loc_to_scratch(stub, loc)
+    )
+    stub.prefetched = []
+    stub._prefetch_layer = lambda layer_id: stub.prefetched.append(layer_id)
+    return stub
+
+
+def _run_begin(stub, prefix_lens, seq_lens, rows):
+    width = max(r.numel() for r in rows)
+    padded = [
+        torch.cat([r, torch.zeros(width - r.numel(), dtype=torch.int32)]) for r in rows
+    ]
+    PageInterleaveKVPoolMixin.begin_shard_extend(
+        stub,
+        torch.stack(padded),
+        torch.arange(len(rows)),
+        prefix_lens,
+        seq_lens,
+    )
+    return stub
+
+
+def _reference_prefix_slots(per_request_prefix_pages):
+    """Brute-force reference of the owner-major slot assignment: the batch's
+    unique prefix pages sorted by (owner, local page), rank r's pages
+    contiguous at r * block; block = sum of per-request ceil(K_i / N)."""
+    block = sum(ceil_div(len(pages), N) for pages in per_request_prefix_pages)
+    uniq = sorted({p for pages in per_request_prefix_pages for p in pages})
+    slots = {}
+    counts = {r: 0 for r in range(N)}
+    for page in sorted(uniq, key=lambda p: (p % N, p // N)):
+        owner = page % N
+        slots[page] = owner * block + counts[owner]
+        counts[owner] += 1
+    return slots, block
+
+
+class TestBeginShardExtendPlan(CustomTestCase):
+    def test_plan_with_rotated_prefix(self):
+        """7 prefix pages of a base-2 chain + 9 chunk pages (last partial):
+        owner-major slots, send rows owner-filtered in the same order and
+        padded to the block bound ceil(7/4) = 2 pages."""
+        pages = _chain_pages(base=2, n_pages=16)
+        prefix_len, seq_len = 7 * PS, 16 * PS - 5
+        row = _chain_row(pages, seq_len)
+        slots, block = _reference_prefix_slots([pages[:7]])
+        for rank in range(N):
+            stub = _run_begin(
+                _make_pool_stub(_make_spec(), rank), [prefix_len], [seq_len], [row]
+            )
+            self.assertEqual(stub._block_pages, block)
+            self.assertTrue(stub._shard_extend_active)
+            self.assertEqual(stub._epoch, 1)
+            self.assertEqual(stub.prefetched, [0])  # first layer kicked
+            for page, slot in slots.items():
+                self.assertEqual(int(stub._page_pos[page]), slot)
+            for j, page in enumerate(pages[7:]):
+                self.assertEqual(int(stub._page_pos[page]), stub._chunk_base // PS + j)
+            own = sorted((p for p in pages[:7] if p % N == rank), key=lambda p: p // N)
+            expect = torch.cat(
+                [torch.arange((p // N) * PS, (p // N + 1) * PS) for p in own]
+            )
+            if len(own) < block:  # padded with the trash page (local page 0)
+                expect = torch.cat([expect, torch.arange((block - len(own)) * PS)])
+            self.assertTrue(torch.equal(stub._send_rows, expect))
+
+    def test_multi_request_plan_shared_prefix_dedup(self):
+        """bs > 1: request 0 and request 1 share a 3-page cached prefix
+        (request 1 extends it by 2 pages); request 2 is an unrelated base-2
+        chain. Shared pages must gather into ONE slot (no duplicate plan
+        entries), the block is the per-request ceil sum, and every request's
+        locs translate through the same table."""
+        chain_a = _chain_pages(base=0, n_pages=5)
+        chain_c = _chain_pages(base=2, n_pages=4, local_start=20)
+        # rows: request 0 = A[:3] prefix + 1 chunk page; request 1 = A[:5]
+        # prefix + 2 chunk pages; request 2 = C[:2] prefix + 2 chunk pages.
+        chunk0 = _chain_pages(base=3, n_pages=1, local_start=40)
+        chunk1 = _chain_pages(base=1, n_pages=2, local_start=50)
+        chunk2 = _chain_pages(base=0, n_pages=2, local_start=60)
+        rows = [
+            _chain_row(chain_a[:3] + chunk0, 4 * PS),
+            _chain_row(chain_a[:5] + chunk1, 7 * PS),
+            _chain_row(chain_c[:2] + chunk2, 4 * PS - 3),
+        ]
+        stub = _run_begin(
+            _make_pool_stub(_make_spec()),
+            [3 * PS, 5 * PS, 2 * PS],
+            [4 * PS, 7 * PS, 4 * PS - 3],
+            rows,
+        )
+        slots, block = _reference_prefix_slots([chain_a[:3], chain_a[:5], chain_c[:2]])
+        self.assertEqual(block, 1 + 2 + 1)
+        self.assertEqual(stub._block_pages, block)
+        for page, slot in slots.items():
+            self.assertEqual(int(stub._page_pos[page]), slot)
+        # Chunk slots are absolute scratch pages in batch order.
+        for j, page in enumerate(chunk0 + chunk1 + chunk2):
+            self.assertEqual(int(stub._page_pos[page]), stub._chunk_base // PS + j)
+        # Shared pages: both requests' locs hit the SAME scratch rows.
+        shared_loc_r0 = rows[0][:PS].long()
+        shared_loc_r1 = rows[1][:PS].long()
+        t0 = PageInterleaveKVPoolMixin.translate_loc_to_scratch(stub, shared_loc_r0)
+        t1 = PageInterleaveKVPoolMixin.translate_loc_to_scratch(stub, shared_loc_r1)
+        self.assertTrue(torch.equal(t0, t1))
+        # Per-rank send lists fit the block and pad with the trash page.
+        all_prefix = sorted(set(chain_a[:5] + chain_c[:2]))
+        for rank in range(N):
+            stub_r = _run_begin(
+                _make_pool_stub(_make_spec(), rank),
+                [3 * PS, 5 * PS, 2 * PS],
+                [4 * PS, 7 * PS, 4 * PS - 3],
+                rows,
+            )
+            own = sorted((p for p in all_prefix if p % N == rank), key=lambda p: p // N)
+            self.assertLessEqual(len(own), block)
+            self.assertEqual(stub_r._send_rows.numel(), block * PS)
+            expect_head = torch.cat(
+                [torch.arange((p // N) * PS, (p // N + 1) * PS) for p in own]
+            )
+            self.assertTrue(
+                torch.equal(stub_r._send_rows[: len(own) * PS], expect_head)
+            )
+
+    def test_send_order_follows_local_page_not_position(self):
+        """A freed-and-reused page can give a chain a LOWER local page id at
+        a later position. Slot assignment and send packing must both order
+        by local page id (they only need to agree — a mismatch reads the
+        wrong rank rows)."""
+        # Owner-0 pages appear at positions 0 and 4 with locals 9 then 3.
+        pages = [9 * N + 0, 5 * N + 1, 5 * N + 2, 5 * N + 3, 3 * N + 0]
+        row = _chain_row(pages, 5 * PS)
+        stub = _run_begin(
+            _make_pool_stub(_make_spec(), shard_rank=0),
+            [5 * PS],
+            [5 * PS + PS],
+            [torch.cat([row, _chain_row([7 * N + 1], PS)])],
+        )
+        slots, block = _reference_prefix_slots([pages])
+        self.assertEqual(block, 2)
+        # local 3 gets owner-0's first slot although it sits at position 4.
+        self.assertEqual(int(stub._page_pos[3 * N + 0]), 0)
+        self.assertEqual(int(stub._page_pos[9 * N + 0]), 1)
+        expect = torch.cat(
+            [torch.arange(3 * PS, 4 * PS), torch.arange(9 * PS, 10 * PS)]
+        )
+        self.assertTrue(torch.equal(stub._send_rows, expect))
+
+    def test_plan_without_prefix(self):
+        pages = _chain_pages(base=0, n_pages=2)
+        stub = _run_begin(
+            _make_pool_stub(_make_spec()), [0], [PS + 5], [_chain_row(pages, PS + 5)]
+        )
+        self.assertEqual(stub._block_pages, 0)
+        self.assertTrue(stub._shard_extend_active)
+        self.assertEqual(stub.prefetched, [])  # nothing to gather
+        self.assertIsNone(stub._send_rows)
+        self.assertEqual(int(stub._page_pos[pages[0]]), stub._chunk_base // PS)
+        self.assertEqual(int(stub._page_pos[pages[1]]), stub._chunk_base // PS + 1)
+
+    def test_unaligned_prefix_rejected(self):
+        # The tree quantum is the PHYSICAL page: a prefix that is not a
+        # ps-multiple can never come out of match_prefix.
+        pages = _chain_pages(base=0, n_pages=4)
+        with self.assertRaises(AssertionError):
+            _run_begin(
+                _make_pool_stub(_make_spec()),
+                [PS + 3],
+                [4 * PS],
+                [_chain_row(pages, 4 * PS)],
+            )
+
+    def test_owner_congruence_guard(self):
+        """A rotation-base bug that breaks a request's prefix-owner
+        cyclicity invalidates the sync-free block bound (a rank can own more
+        than ceil(K/N) pages); the debug guard must catch it at plan time."""
+        pages = _chain_pages(base=1, n_pages=8)
+        pages[2], pages[5] = pages[5], pages[2]  # same multiset, not cyclic
+        with self.assertRaises(AssertionError) as ctx:
+            _run_begin(
+                _make_pool_stub(_make_spec()),
+                [6 * PS],
+                [8 * PS],
+                [_chain_row(pages, 8 * PS)],
+            )
+        self.assertIn("cyclic", str(ctx.exception))
+
+
+class TestLayerTransferCounterRefused(CustomTestCase):
+    """Layer-wise KV load-back must fail loud at registration.
+
+    The gather reads pool rows directly (`_gather_pairs`), so it never passes
+    through the base getters' `layer_transfer_counter.wait_until` hook, and
+    `begin_shard_extend` kicks the first gather before any getter runs.
+    """
+
+    class _Base:
+        def register_layer_transfer_counter(self, counter):
+            self.counter = counter
+
+    class _Pool(PageInterleaveKVPoolMixin, _Base):
+        def __init__(self):
+            pass
+
+    def test_a_real_counter_is_refused(self):
+        pool = self._Pool()
+        with self.assertRaises(NotImplementedError) as cm:
+            pool.register_layer_transfer_counter(object())
+        self.assertIn("logical-page KV sharding", str(cm.exception))
+
+    def test_none_stays_a_no_op(self):
+        """The SWA/hybrid wrappers disable the counter by passing None."""
+        pool = self._Pool()
+        pool.register_layer_transfer_counter(None)
+        self.assertIsNone(pool.counter)
+
+
+class TestScratchTranslation(CustomTestCase):
+    def _plan(self, base=2, n_prefix=7, n_chunk=9, rank=1):
+        pages = _chain_pages(base=base, n_pages=n_prefix + n_chunk)
+        seq_len = (n_prefix + n_chunk) * PS
+        stub = _run_begin(
+            _make_pool_stub(_make_spec(), rank),
+            [n_prefix * PS],
+            [seq_len],
+            [_chain_row(pages, seq_len)],
+        )
+        return stub, pages[:n_prefix], pages[n_prefix:]
+
+    def _reference_row(self, stub, prefix_pages, chunk_pages, loc):
+        """Brute-force reference: owner-major (owner, local-page)-sorted
+        prefix slots, sequence-order chunk."""
+        spec = stub.shard_spec
+        page, off = loc // PS, loc % PS
+        if page in prefix_pages:
+            slots, _ = _reference_prefix_slots([prefix_pages])
+            return slots[page] * PS + off
+        if page in chunk_pages:
+            k = chunk_pages.index(page)
+            return spec.max_prefix_tokens + k * PS + off
+        return stub._trash_base + off
+
+    def test_translation_matches_reference(self):
+        stub, prefix_pages, chunk_pages = self._plan()
+        locs = (
+            [p * PS + o for p in prefix_pages + chunk_pages for o in (0, 3, PS - 1)]
+            + list(range(0, N))  # reserved pages -> trash
+            + [3000, 3001]  # off-plan -> trash
+        )
+        got = PageInterleaveKVPoolMixin.translate_loc_to_scratch(
+            stub, torch.tensor(locs, dtype=torch.int64)
+        )
+        expect = torch.tensor(
+            [self._reference_row(stub, prefix_pages, chunk_pages, l) for l in locs],
+            dtype=torch.int64,
+        )
+        self.assertTrue(torch.equal(got, expect))
+
+    def test_translation_is_injective_over_the_plan(self):
+        stub, prefix_pages, chunk_pages = self._plan(base=3, n_prefix=5, n_chunk=4)
+        locs = [p * PS + o for p in prefix_pages + chunk_pages for o in range(PS)]
+        rows = PageInterleaveKVPoolMixin.translate_loc_to_scratch(
+            stub, torch.tensor(locs, dtype=torch.int64)
+        )
+        self.assertEqual(len(torch.unique(rows)), len(locs))
+        # Prefix rows stay inside the (padded) gather span, chunk rows inside
+        # the chunk region.
+        n_prefix_tokens = len(prefix_pages) * PS
+        self.assertTrue(
+            bool((rows[:n_prefix_tokens] < N * stub._block_pages * PS).all())
+        )
+        self.assertTrue(
+            bool(
+                (rows[n_prefix_tokens:] >= stub.shard_spec.max_prefix_tokens).all()
+                and (rows[n_prefix_tokens:] < stub._trash_base).all()
+            )
+        )
+
+    def test_int32_page_table_input(self):
+        stub, prefix_pages, chunk_pages = self._plan(base=0, n_prefix=4, n_chunk=1)
+        table = torch.tensor(
+            [prefix_pages[0] * PS, prefix_pages[1] * PS, chunk_pages[0] * PS, 0],
+            dtype=torch.int32,
+        )
+        rows = PageInterleaveKVPoolMixin.translate_loc_to_scratch(stub, table)
+        self.assertEqual(rows.dtype, torch.int64)
+        # Page-aligned inputs land on page-aligned scratch rows (the FA3
+        # stride-divide contract).
+        self.assertTrue(bool((rows[:3] % PS == 0).all()))
+        self.assertEqual(int(rows[3]), stub._trash_base)
+
+    def test_translation_cache_cleared_with_new_plan(self):
+        pages = _chain_pages(base=0, n_pages=2)
+        stub = _make_pool_stub(_make_spec())
+
+        # The first batch treats page 0 as part of the current chunk.
+        _run_begin(stub, [0], [PS], [_chain_row(pages[:1], PS)])
+        loc = _chain_row(pages[:1], PS).long()
+        first = PageInterleaveKVPoolMixin._translate_loc_cached(stub, loc)
+        again = PageInterleaveKVPoolMixin._translate_loc_cached(stub, loc)
+        self.assertIs(again, first)
+
+        # The next batch reuses the same loc tensor after page 0 becomes a
+        # cached prefix. Installing the new plan must discard the old mapping.
+        _run_begin(stub, [PS], [2 * PS], [_chain_row(pages, 2 * PS)])
+        fresh = PageInterleaveKVPoolMixin._translate_loc_cached(stub, loc)
+        self.assertIsNot(fresh, first)
+        self.assertFalse(torch.equal(fresh, first))
+
+
+class TestWritePlan(CustomTestCase):
+    def test_owner_filter_cached_per_loc_tensor(self):
+        spec = _make_spec(shard_rank=2)
+        stub = SimpleNamespace()
+        stub.placement = PageInterleavePlacement(spec)
+        stub.shard_rank = 2
+        stub._epoch = 1
+        stub._write_plan_key = stub._write_plan = None
+
+        loc = torch.arange(5 * GS, 7 * GS)  # two whole groups
+        owned_idx, local_rows = PageInterleaveKVPoolMixin._get_write_plan(stub, loc)
+        self.assertEqual(owned_idx.numel(), 2 * PS)
+        # Owned rows are ps-contiguous runs at [Q*ps, (Q+1)*ps).
+        self.assertTrue(
+            torch.equal(
+                local_rows,
+                torch.cat([torch.arange(5 * PS, 6 * PS), torch.arange(6 * PS, 7 * PS)]),
+            )
+        )
+        # Same tensor + same epoch -> cached (identity).
+        again = PageInterleaveKVPoolMixin._get_write_plan(stub, loc)
+        self.assertIs(again[0], owned_idx)
+        # Epoch bump invalidates.
+        stub._epoch = 2
+        fresh = PageInterleaveKVPoolMixin._get_write_plan(stub, loc)
+        self.assertIsNot(fresh[0], owned_idx)
+
+    def test_partial_tail_page_may_own_nothing(self):
+        spec = _make_spec(shard_rank=3)
+        stub = SimpleNamespace()
+        stub.placement = PageInterleavePlacement(spec)
+        stub.shard_rank = 3
+        stub._epoch = 1
+        stub._write_plan_key = stub._write_plan = None
+        # 10 tokens: all inside owner-0's page of the group.
+        loc = torch.arange(8 * GS, 8 * GS + 10)
+        owned_idx, local_rows = PageInterleaveKVPoolMixin._get_write_plan(stub, loc)
+        self.assertEqual(owned_idx.numel(), 0)
+        self.assertEqual(local_rows.numel(), 0)
 
 
 if __name__ == "__main__":

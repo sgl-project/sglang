@@ -42,7 +42,7 @@ from sglang.srt.mem_cache.unified_cache.components import (
     LinkerTransferPhase,
     TreeComponent,
 )
-from sglang.srt.mem_cache.utils import get_hash_str
+from sglang.srt.mem_cache.utils import get_storage_hash_str
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -193,7 +193,7 @@ class UnifiedCacheLinkerWrapper:
         cache = self.cache
         key, _ = key.maybe_to_bigram_view(cache.tree_core.is_eagle)
         page = cache.page_size
-        device_hit_len = int(result.device_indices.numel())
+        device_hit_len = result.device_prefix_len
         if device_hit_len >= len(key):
             return result
 
@@ -279,7 +279,7 @@ class UnifiedCacheLinkerWrapper:
         tail_len = (len(key) - device_hit_len) // page * page
         if tail_len == 0:
             return []
-        return get_hash_str(
+        return get_storage_hash_str(
             key[device_hit_len : device_hit_len + tail_len],
             last_hash,
             page_size=page,
@@ -287,12 +287,11 @@ class UnifiedCacheLinkerWrapper:
 
     # ---- init_load_back: remote -> device, then insert ----
 
-    def load_back(self, req: Req) -> tuple[torch.Tensor, NodeId]:
+    def load_back(self, req: Req) -> tuple[int, NodeId]:
         cache = self.cache
-        empty_indices = cache.tree_core.empty_match_result.device_indices
         hit = self.hit_markers.pop(req.rid, None)
         if hit is None:
-            return empty_indices, req.last_node
+            return 0, req.last_node
 
         device_hit_len = hit.device_hit_len
         tail_hashes = hit.tail_hashes
@@ -311,7 +310,7 @@ class UnifiedCacheLinkerWrapper:
                     component_transfers,
                     prefix_len,
                 )
-                return empty_indices, req.last_node
+                return 0, req.last_node
             component_transfers.append((component, transfer))
 
         full_transfer = component_transfers[0][1]
@@ -330,16 +329,15 @@ class UnifiedCacheLinkerWrapper:
             if req.kv is None:
                 from sglang.srt.managers.schedule_batch import ReqKvInfo
 
-                req.kv = ReqKvInfo(
-                    kv_allocated_len=prefix_len,
-                    swa_evicted_seqlen=prefix_len,
-                )
-            else:
-                req.kv.swa_evicted_seqlen = max(req.kv.swa_evicted_seqlen, prefix_len)
+                req.kv = ReqKvInfo(kv_allocated_len=prefix_len)
+            req.kv.set_evicted_seqlen(
+                ComponentType.SWA,
+                max(req.kv.get_evicted_seqlen(ComponentType.SWA), prefix_len),
+            )
 
         # Insert the newly loaded tail into the tree.
         prefix_indices = torch.cat(
-            [req.prefix_indices.to(torch.int64), full_transfer.device_indices]
+            [cache.prefix_device_indices(req), full_transfer.device_indices]
         )
         mamba_transfer = next(
             (
@@ -359,11 +357,13 @@ class UnifiedCacheLinkerWrapper:
                     else None
                 ),
                 prev_prefix_len=device_hit_len,
-                swa_evicted_seqlen=(
-                    req.kv.swa_evicted_seqlen if req.kv is not None else 0
+                component_evicted_seqlens=(
+                    req.kv.component_evicted_seqlens.copy()
+                    if req.kv is not None
+                    else {}
                 ),
-                chunked=True,
-                priority=getattr(req, "priority", 0) or 0,
+                inserted_len=len(hit.prefix_key),
+                priority=req.priority or 0,
                 track_adopted_ranges=True,
             )
         )
@@ -390,7 +390,7 @@ class UnifiedCacheLinkerWrapper:
         cache.tree_core.mark_external_cache_stored_path(
             insert_result.last_device_node, req.last_node
         )
-        return canonical_tail, insert_result.last_device_node
+        return len(canonical_tail), insert_result.last_device_node
 
     def _queue_load(
         self, rid: str, node_id: NodeId, transfers: list[PoolTransfer]

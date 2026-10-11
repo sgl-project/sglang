@@ -48,7 +48,7 @@ import triton  # type: ignore
 import triton.language as tl  # type: ignore
 
 from sglang.kernels.jit.utils import get_jit_cuda_arch
-from sglang.kernels.ops.diffusion.common.numerics import (
+from sglang.kernels.numerics import (
     cuda_rsqrtf,
     div_rn_f32,
     round_bf16_to_fp32,
@@ -171,7 +171,7 @@ def _push_vec4(
     return mean, m2, cnt
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["seq_len", "n_rows"])
 def _layernorm_modulate_kernel(
     y_ptr,
     y_q_ptr,
@@ -190,6 +190,8 @@ def _layernorm_modulate_kernel(
     FP8_MAX: tl.constexpr,
     STORE_BF16: tl.constexpr,
     QUANTIZE_FP8: tl.constexpr,
+    HAS_SHIFT: tl.constexpr = True,
+    POST_OP: tl.constexpr = "bf16_modulate",
 ):
     pid = tl.program_id(0).to(tl.int64)
     row_offs = pid * ROWS + tl.arange(0, ROWS)
@@ -255,19 +257,37 @@ def _layernorm_modulate_kernel(
             mask=mask,
             other=0.0,
         ).to(tl.float32)
-        y = round_bf16_to_fp32(rstd * (x - mean))
+        y = rstd * (x - mean)
+        if POST_OP == "bf16_modulate":
+            y = round_bf16_to_fp32(y)
         sc = tl.load(
             scale_ptr + batch[:, None] * scale_row_stride + cols[None, :],
             mask=mask,
             other=0.0,
         ).to(tl.float32)
-        sh = tl.load(
-            shift_ptr + batch[:, None] * scale_row_stride + cols[None, :],
-            mask=mask,
-            other=0.0,
-        ).to(tl.float32)
-        one_plus = round_bf16_to_fp32(1.0 + sc)
-        y = round_bf16_to_fp32(y * one_plus) + sh
+        if POST_OP == "bf16_modulate":
+            one_plus = round_bf16_to_fp32(1.0 + sc)
+            y = round_bf16_to_fp32(y * one_plus)
+            if HAS_SHIFT:
+                sh = tl.load(
+                    shift_ptr + batch[:, None] * scale_row_stride + cols[None, :],
+                    mask=mask,
+                    other=0.0,
+                ).to(tl.float32)
+                y = y + sh
+        else:
+            sh = tl.load(
+                shift_ptr + batch[:, None] * scale_row_stride + cols[None, :],
+                mask=mask,
+                other=0.0,
+            ).to(tl.float32)
+            if POST_OP == "fp32_affine":
+                # Native FP32 LayerNorm contracts gamma * normalized + beta.
+                y = tl.fma(y, sc, sh)
+            else:
+                # Native FP32 LN, separate FP32 multiply/add, one BF16 store.
+                # The caller disables implicit FMA contraction.
+                y = y * (1.0 + sc) + sh
         if STORE_BF16:
             tl.store(y_ptr + row_base[:, None] + cols[None, :], y, mask=mask)
         if QUANTIZE_FP8:
@@ -333,7 +353,7 @@ def _qk_ln_head_one(
     tl.store(dst + row_base[:, None] + cols2[None, :], y, mask=out_mask)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["n_rows"])
 def _qk_ln_head_kernel(
     q_out_ptr,
     k_out_ptr,
@@ -382,54 +402,130 @@ def _qk_head_launch_config() -> tuple[int, int]:
 def _mod_row_stride(t: torch.Tensor, batch: int, hidden: int) -> int | None:
     # (batch, hidden) modulation rows, possibly strided views of a chunked
     # adaLN projection; the last dim must be packed.
-    if t.dim() != 2 or t.shape != (batch, hidden) or t.stride(1) != 1:
+    if t.shape != (batch, hidden) or t.stride(1) != 1:
         return None
     return t.stride(0) if batch > 1 else hidden
 
 
-def can_use_fused_layernorm_modulate(
-    x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor
-) -> bool:
+def can_use_fused_layernorm_modulate(dtype: torch.dtype, hidden: int) -> bool:
+    """Select the BF16 vectorized LayerNorm reduction replicated below."""
+    return (
+        is_cuda() and dtype is torch.bfloat16 and 0 < hidden <= 8192 and hidden % 4 == 0
+    )
+
+
+def _validate_layernorm_modulate(x, scale, shift) -> tuple[int, int, int, int]:
+    shape = x.shape
     if not (
         _is_bf16_cuda(x)
-        and x.dim() == 3
+        and len(shape) == 3
         and x.numel() > 0
         and x.is_contiguous()
-        and x.shape[-1] % 4 == 0
-        and x.shape[-1] <= 8192
-        and _is_bf16_cuda(scale)
-        and _is_bf16_cuda(shift)
-        and scale.device == x.device
-        and shift.device == x.device
+        and 0 < shape[-1] <= 8192
+        and shape[-1] % 4 == 0
     ):
-        return False
-    batch, _, hidden = x.shape
-    q = _mod_row_stride(scale, batch, hidden)
-    v = _mod_row_stride(shift, batch, hidden)
-    return q is not None and v is not None and q == v
+        raise RuntimeError(
+            "LayerNorm modulation expects contiguous BF16 CUDA [B, S, D], D divisible by 4 and <= 8192"
+        )
+    batch, seq_len, hidden = shape
+    device = x.device
+    stride = _mod_row_stride(scale, batch, hidden)
+    if not (
+        stride is not None and scale.dtype is torch.bfloat16 and scale.device == device
+    ):
+        raise RuntimeError("scale must have packed BF16 [B, D] rows on x's device")
+    if shift is not None and not (
+        shift.dtype is torch.bfloat16
+        and shift.device == device
+        and _mod_row_stride(shift, batch, hidden) == stride
+    ):
+        raise RuntimeError("shift must match scale's row layout and dtype/device")
+    return batch, seq_len, hidden, stride
 
 
 def _fake_ln_modulate(
-    x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor, eps: float
+    x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor | None, eps: float
 ) -> torch.Tensor:
     return torch.empty_like(x)
 
 
+def try_fused_fp32_layernorm_bf16(
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    eps: float,
+    *,
+    affine: bool = False,
+) -> torch.Tensor | None:
+    """BF16 input/output with native FP32 LN and FP32 affine or adaLN math.
+
+    Replicate ``layer_norm(x.float()).bfloat16()`` with FP32 affine rows,
+    or affine-free FP32 LN followed by ``* (1 + scale) + shift``. Callers
+    must verify the live Torch reduction dispatch before enabling this path.
+    """
+    if (
+        not _is_bf16_cuda(x)
+        or torch.is_grad_enabled()
+        or torch.compiler.is_compiling()
+        or x.ndim != 3
+        or x.numel() == 0
+        or not x.is_contiguous()
+        or x.shape[-1] % 4 != 0
+        or x.shape[-1] > 8192
+        or scale.dtype != torch.float32
+        or shift.dtype != torch.float32
+        or scale.device != x.device
+        or shift.device != x.device
+    ):
+        return None
+    batch, tokens, channels = x.shape
+    stride = _mod_row_stride(scale, batch, channels)
+    if stride is None or _mod_row_stride(shift, batch, channels) != stride:
+        return None
+    output = torch.empty_like(x)
+    rows = 2
+    _layernorm_modulate_kernel[(triton.cdiv(batch * tokens, rows),)](
+        output,
+        output,
+        x,
+        scale,
+        shift,
+        scale,
+        tokens,
+        batch * tokens,
+        stride,
+        eps,
+        D=channels,
+        ROWS=rows,
+        FP8_DTYPE=fp8_dtype_to_triton(fp8_dtype),
+        FP8_MIN=fp8_min,
+        FP8_MAX=fp8_max,
+        STORE_BF16=True,
+        QUANTIZE_FP8=False,
+        POST_OP="fp32_affine" if affine else "fp32_modulate",
+        num_warps=4 if channels >= 2048 else 2,
+        enable_fp_fusion=False,
+    )
+    return output
+
+
 def fused_layernorm_modulate_raw(
-    x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor, eps: float
+    x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor | None, eps: float
 ) -> torch.Tensor:
     """``LN(x) * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)``, bit-exact
     vs the eager aten chain (LayerNorm without affine).
+
+    With ``shift=None``, omit the addition, preserving signed zeros in
+    scale-only modulation.
 
     Direct-call variant without the ``torch.ops`` dispatch (which costs tens
     of microseconds per call); use it on CPU-launch-bound eager hot paths
     (e.g. Sana), and the registered custom op under ``torch.compile``.
     """
-    batch, seq_len, hidden = x.shape
+    batch, seq_len, hidden, stride = _validate_layernorm_modulate(x, scale, shift)
     n_rows = batch * seq_len
     rows = 2
     out = torch.empty_like(x)
-    stride = _mod_row_stride(scale, batch, hidden)
     with torch.cuda.device(x.device):
         _layernorm_modulate_kernel[(triton.cdiv(n_rows, rows),)](
             out,
@@ -449,6 +545,7 @@ def fused_layernorm_modulate_raw(
             FP8_MAX=fp8_max,
             STORE_BF16=True,
             QUANTIZE_FP8=False,
+            HAS_SHIFT=shift is not None,
             # H200-tuned: 38.5us at (1, 4096, 4096) vs the 121.8us eager
             # chain, 14.3us at Sana's (2, 1024, 2240) vs 43.1us.  ROWS=1 +
             # 4 warps triggers pathological Triton layout conversions in
@@ -472,11 +569,10 @@ def fused_layernorm_modulate_fp8_quant_raw(
     Unlike that two-op chain, this path does not materialize the intermediate
     BF16 activation because FLUX.2 feeds it directly into an FP8 projection.
     """
-    batch, seq_len, hidden = x.shape
+    batch, seq_len, hidden, stride = _validate_layernorm_modulate(x, scale, shift)
     n_rows = batch * seq_len
     rows = 2
     out = torch.empty_like(x, dtype=fp8_dtype)
-    stride = _mod_row_stride(scale, batch, hidden)
     with torch.cuda.device(x.device):
         _layernorm_modulate_kernel[(triton.cdiv(n_rows, rows),)](
             out,
@@ -509,19 +605,13 @@ fused_layernorm_modulate = register_custom_op(
 )
 
 
-def can_use_fused_qk_head_layernorm(q: torch.Tensor, k: torch.Tensor) -> bool:
-    head_dim = q.shape[-1] if q.dim() == 4 else 0
+def can_use_fused_qk_head_layernorm(dtype: torch.dtype, head_dim: int) -> bool:
+    """Select the BF16 per-head LayerNorm reduction."""
     return (
-        _is_bf16_cuda(q)
-        and _is_bf16_cuda(k)
-        and q.device == k.device
-        and q.dim() == 4
-        and q.shape == k.shape
-        and head_dim % 4 == 0
+        is_cuda()
+        and dtype is torch.bfloat16
         and 0 < head_dim <= 128
-        and q.numel() > 0
-        and q.is_contiguous()
-        and k.is_contiguous()
+        and head_dim % 4 == 0
     )
 
 
@@ -541,7 +631,23 @@ def fused_qk_head_layernorm(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Per-head ``nn.LayerNorm(dim_head)`` (no affine) over q and k in one
     launch, bit-exact vs the eager aten kernel."""
-    head_dim = q.shape[-1]
+    shape = q.shape
+    if not (
+        _is_bf16_cuda(q)
+        and len(shape) == 4
+        and q.numel() > 0
+        and 0 < shape[-1] <= 128
+        and shape[-1] % 4 == 0
+        and k.dtype is torch.bfloat16
+        and k.device == q.device
+        and k.shape == shape
+        and q.is_contiguous()
+        and k.is_contiguous()
+    ):
+        raise RuntimeError(
+            "QK LayerNorm expects matching contiguous BF16 CUDA [B, S, H, D], D divisible by 4 and <= 128"
+        )
+    head_dim = shape[-1]
     n_rows = q.numel() // head_dim
     # Architecture sweeps at the production GLM shape select 32 rows / 1 warp
     # on B300 (SM103) and 8 rows / 4 warps on RTX 5090 (SM120). Preserve the
