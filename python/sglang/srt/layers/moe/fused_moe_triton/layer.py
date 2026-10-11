@@ -1215,8 +1215,17 @@ class FusedMoE(torch.nn.Module):
 
         if is_gguf_weight:
             output_dim = getattr(param, "output_dim", None)
+            if self.moe_tp_size > 1 and shard_id == "w2":
+                # The down projection would have to be split along its input
+                # (intermediate) dim, i.e. inside the rows of GGUF blocks;
+                # splitting its output dim like w1/w3 gives the wrong shapes.
+                raise NotImplementedError(
+                    "GGUF MoE weights do not support MoE tensor "
+                    "parallelism; use expert parallelism (--ep-size equal to "
+                    "--tp-size)."
+                )
             if self.moe_tp_size > 1:
-                if shard_id in ["w1", "w3", "w2"] and output_dim == 0:
+                if shard_id in ["w1", "w3"] and output_dim == 0:
                     shard_size = loaded_weight.size(0) // self.moe_tp_size
                     start_idx = self.moe_tp_rank * shard_size
                     loaded_weight = loaded_weight.narrow(
