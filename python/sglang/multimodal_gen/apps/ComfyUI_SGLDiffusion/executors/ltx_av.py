@@ -115,9 +115,6 @@ class LTXAVAdapter(ComfyUIModelAdapter):
 
 class LTXAVExecutor(SGLDiffusionExecutor):
     adapter_cls = LTXAVAdapter
-    # Like ComfyUI, fold LoRA into the (FP8) weights once instead of adding a
-    # low-rank delta per layer and step.
-    lora_merge_mode = "merge"
 
     @staticmethod
     def should_suppress_logs(timestep):
