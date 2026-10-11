@@ -1888,6 +1888,34 @@ def hc_expand(x: torch.Tensor, n: int) -> torch.Tensor:
     return x.repeat(1, n)
 
 
+@triton.jit
+def _hc_broadcast_kernel(
+    x_ptr, y_ptr, H, x_stride_m, HC: tl.constexpr, BLOCK_H: tl.constexpr
+):
+    row = tl.program_id(0).to(tl.int64)
+    offs = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
+    mask = offs < H
+    x = tl.load(x_ptr + row * x_stride_m + offs, mask=mask)
+    y_row = y_ptr + row * (HC * H)
+    for k in tl.static_range(HC):
+        tl.store(y_row + k * H + offs, x, mask=mask)
+
+
+def hc_broadcast(x: torch.Tensor, hc_mult: int) -> torch.Tensor:
+    """[T, H] -> [T, hc_mult, H], every copy equal to x: the initial mHC residual."""
+    if not x.is_cuda or x.stride(-1) != 1:
+        return x.unsqueeze(1).repeat(1, hc_mult, 1)
+    num_tokens, hidden = x.shape
+    y = x.new_empty(num_tokens, hc_mult, hidden)
+    if num_tokens == 0:
+        return y
+    block_h = 1024
+    _hc_broadcast_kernel[(num_tokens, triton.cdiv(hidden, block_h))](
+        x, y, hidden, x.stride(0), HC=hc_mult, BLOCK_H=block_h, num_warps=4
+    )
+    return y
+
+
 def hc_contract(x: torch.Tensor, n: int) -> torch.Tensor:
     return x.unflatten(-1, (n, -1)).mean(dim=-2)
 

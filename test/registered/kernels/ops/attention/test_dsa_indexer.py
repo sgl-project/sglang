@@ -1235,7 +1235,7 @@ class TestDSAIndexer(CustomTestCase):
             with self.subTest(topk_backend=topk_backend.value):
                 backend = object.__new__(DeepseekSparseAttnBackend)
                 backend.device = self.device
-                backend.real_page_size = 64
+                backend.physical_page_size = 64
                 backend.hisparse_coordinator = None
                 backend.speculative_num_draft_tokens = 0
                 backend.use_fused_topk = True

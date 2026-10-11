@@ -484,7 +484,7 @@ class TestDSAIndexerPoolDecl(CustomTestCase):
             index_head_dim=128,
             quant_block_size=128,
             page_size=64,
-            slots_per_page=64,
+            index_page_size=64,
             skip_topk_layers=[False] * 5,
         )
 

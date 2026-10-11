@@ -52,7 +52,6 @@ class EvictDeviceNextNodeResult(BaseEvictionResult):
     """
 
     node_id: Optional[NodeId] = None
-    backup_kv: Optional[BackupKV] = None
     made_progress: bool = False
     unbacked_tokens: int = 0
     mamba_backup_node_id: Optional[NodeId] = None
@@ -438,7 +437,7 @@ class UnifiedTreeCoreInterface(ABC):
 
     @abstractmethod
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
-        """Match a key against the tree; returns device indices + boundary NodeIds."""
+        """Match a key; returns the device prefix length + boundary NodeIds."""
         ...
 
     @abstractmethod
@@ -463,7 +462,7 @@ class UnifiedTreeCoreInterface(ABC):
     @property
     @abstractmethod
     def empty_match_result(self) -> MatchResult:
-        """A shared empty MatchResult (empty device indices + boundary NodeIds)."""
+        """A shared empty MatchResult (zero device prefix + boundary NodeIds)."""
         ...
 
     @abstractmethod
@@ -522,13 +521,6 @@ class UnifiedTreeCoreInterface(ABC):
     def set_hicache_enabled(self) -> None:
         """Mark the host tier (HiCache) as wired."""
         ...
-
-    def enable_swa_write_back_eviction_barrier(self) -> None:
-        """Enable a backend-managed barrier when needed.
-
-        The Python core demotes through SWAComponent directly. Native cores
-        may return a backup action to the cache executor before eviction.
-        """
 
     @abstractmethod
     def set_host_memory_buffer_only(self) -> None:
