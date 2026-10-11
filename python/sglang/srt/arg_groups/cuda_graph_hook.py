@@ -22,6 +22,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     default_cuda_graph_config,
     with_phase,
 )
+from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import (
     parse_connector_type,
 )
@@ -328,12 +329,13 @@ def apply_inkling_prefill_cuda_graph_default(server_args: Any):
         "InklingForConditionalGenerationMTP",
     ):
         return
-    # Triton cannot capture EXTEND; only fa4 opts into a full prefill graph.
-    from sglang.srt.arg_groups.model_overrides.inkling import (
-        resolve_inkling_attention_backend,
-    )
-
-    if resolve_inkling_attention_backend(server_args) != "fa4":
+    # Only fa4 captures EXTEND; an unset backend defaults to fa4 on SM90/SM100.
+    prefill_backend, _ = attention_backends_of(cfg)
+    if prefill_backend is None:
+        platform = get_platform()
+        if not (platform.is_sm90 or platform.is_sm100):
+            return
+    elif prefill_backend != "fa4":
         return
     declare_resolution(
         server_args,

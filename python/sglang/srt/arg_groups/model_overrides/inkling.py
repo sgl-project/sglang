@@ -1,7 +1,7 @@
 """Config-time override declarations for inkling."""
 
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 from sglang.srt.arg_groups.model_override_base import (
     _register_for,
@@ -11,15 +11,6 @@ from sglang.srt.arg_groups.model_override_base import (
 from sglang.srt.runtime_context import get_platform
 
 logger = logging.getLogger(__name__)
-
-
-def resolve_inkling_attention_backend(server_args: Any) -> Optional[str]:
-    """The backend Inkling prefill runs on; the prefill-graph default reads it
-    before overrides materialize."""
-    cfg = resolving_view(server_args)
-    if not is_attention_backend_not_set(cfg):
-        return cfg.prefill_attention_backend or cfg.attention_backend
-    return "fa4" if get_platform().is_sm90 or get_platform().is_sm100 else "triton"
 
 
 @_register_for(
@@ -75,7 +66,10 @@ def _inkling_overrides(server_args: Any, hf_config: Any) -> dict:
     # (mirrors the MiniMax-M3 SM100 fa4-default above); an explicit
     # --attention-backend / --prefill/decode-attention-backend still wins.
     if is_attention_backend_not_set(cfg):
-        inkling_attn_backend = resolve_inkling_attention_backend(server_args)
+        if get_platform().is_sm90 or get_platform().is_sm100:
+            inkling_attn_backend = "fa4"
+        else:
+            inkling_attn_backend = "triton"
         overrides["attention_backend"] = inkling_attn_backend
         logger.info(
             f"Use {inkling_attn_backend} as the attention backend for Inkling "
