@@ -6,6 +6,9 @@ from typing import TYPE_CHECKING, Optional
 import msgspec
 import torch
 
+from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
+    MarkovGreedyStep,
+)
 from sglang.kernels.ops.speculative.dspark.markov_sample import MarkovSampleStep
 from sglang.srt.environ import envs
 from sglang.srt.lora.layers import unwrap_lora_layer
@@ -55,6 +58,8 @@ class DraftBlockResult(msgspec.Struct, frozen=True):
     corrected_logits: Optional[torch.Tensor]
     greedy_mask: torch.Tensor
     temperatures: torch.Tensor
+    # Drafted by argmax: the sampling accept uses a one-hot draft distribution.
+    greedy_draft: bool
 
 
 class DraftForwardResult(msgspec.Struct, frozen=True):
@@ -145,6 +150,17 @@ def _draft_step(
     step: int,
     logits_out: Optional[torch.Tensor],
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    if logits_out is None and len(prev_tokens) == 1:
+        # One greedy row, no logits kept: one kernel does the GEMV, add and argmax.
+        w2_weight = markov_head.greedy_w2_weight()
+        # The kernel reads one w2 row per base-logit column.
+        if w2_weight is not None and w2_weight.shape[0] == base_logits.shape[-1]:
+            tokens = MarkovGreedyStep.execute(
+                base_logits=base_logits,
+                prev_embeds=markov_head.get_prev_embeddings(prev_tokens),
+                w2_weight=w2_weight,
+            )
+            return tokens, state
     bias, state = markov_head.step_bias(
         prev_tokens, hidden_states=hidden_states, state=state
     )
@@ -184,11 +200,12 @@ def draft_markov_block(
     noise: DraftNoise,
     tp_sync: SpecTpSync,
     logits_out: Optional[torch.Tensor] = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    greedy_draft: bool = False,
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Returns the drafted tokens and the [bs, gamma, vocab] step logits,
-    written to ``logits_out`` or allocated here."""
+    written to ``logits_out`` or allocated here; a greedy draft keeps none."""
     bs, gamma = base_logits.shape[:2]
-    if logits_out is None:
+    if not greedy_draft and logits_out is None:
         logits_out = torch.empty(
             (bs, gamma, step_logits_width(markov_head, base_logits.shape[-1])),
             dtype=markov_head.step_logits_dtype(base_logits.dtype),
@@ -207,10 +224,12 @@ def draft_markov_block(
             temperatures=step_temperatures,
             noise=noise,
             step=step,
-            logits_out=logits_out[:, step],
+            logits_out=None if greedy_draft else logits_out[:, step],
         )
         prev_tokens = tp_sync.sync(SpecTpSyncSite.DSPARK_DRAFT, prev_tokens)
         draft_tokens.append(prev_tokens)
+    if greedy_draft:
+        return torch.stack(draft_tokens, dim=1), None
     noise.offset.add_(1)
     return torch.stack(draft_tokens, dim=1), logits_out
 
@@ -233,6 +252,7 @@ def sample_draft_block(
     noise: DraftNoise,
     device: torch.device,
     tp_sync: SpecTpSync,
+    greedy_draft: bool,
 ) -> DraftBlockResult:
     bs = base_logits.shape[0]
     greedy_mask = resolve_greedy_mask(bs=bs, sampling_info=sampling_info, device=device)
@@ -247,12 +267,16 @@ def sample_draft_block(
         step_temperatures=temperatures.masked_fill(greedy_mask, 0.0),
         noise=noise,
         tp_sync=tp_sync,
+        greedy_draft=greedy_draft,
     )
     return DraftBlockResult(
         draft_tokens=draft_tokens,
-        corrected_logits=expect(_DRAFT_STEP_LOGITS, step_logits),
+        corrected_logits=(
+            None if greedy_draft else expect(_DRAFT_STEP_LOGITS, step_logits)
+        ),
         greedy_mask=greedy_mask,
         temperatures=temperatures,
+        greedy_draft=greedy_draft,
     )
 
 
@@ -267,6 +291,7 @@ class DraftBlockProposer:
         draft_block_spec_info,
         tp_sync: SpecTpSync,
         random_seed: int,
+        greedy_draft: bool,
         dp_moe_sync: bool = False,
     ) -> None:
         self.draft_model = draft_model
@@ -277,6 +302,7 @@ class DraftBlockProposer:
         self._mask_token_id = mask_token_id
         self._draft_block_spec_info = draft_block_spec_info
         self._tp_sync = tp_sync
+        self._greedy_draft = greedy_draft
         self._noise = DraftNoise(
             key=draft_noise_key(random_seed),
             offset=torch.zeros(
@@ -344,9 +370,12 @@ class DraftBlockProposer:
             folded = True
             draft_block = DraftBlockResult(
                 draft_tokens=draft_sampler.out[: bs * self.gamma].view(bs, self.gamma),
-                corrected_logits=draft_sampler.step_logits[:bs],
+                corrected_logits=(
+                    None if self._greedy_draft else draft_sampler.step_logits[:bs]
+                ),
                 greedy_mask=draft_sampler.greedy_mask[:bs],
                 temperatures=draft_sampler.temperatures[:bs],
+                greedy_draft=self._greedy_draft,
             )
             if draft_sampler.confidence_out is not None:
                 folded_confidence = draft_sampler.confidence_out[:bs]
@@ -365,6 +394,7 @@ class DraftBlockProposer:
                 noise=self._noise,
                 device=device,
                 tp_sync=self._tp_sync,
+                greedy_draft=self._greedy_draft,
             )
         proposal_block_ids = (
             draft_block_ids

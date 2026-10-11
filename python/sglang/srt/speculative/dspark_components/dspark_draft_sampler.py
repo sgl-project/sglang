@@ -28,6 +28,7 @@ class DsparkDraftSampler:
         device,
         noise: DraftNoise,
         tp_sync: SpecTpSync,
+        greedy_draft: bool,
         confidence_fn=None,
         out=None,
     ):
@@ -51,6 +52,7 @@ class DsparkDraftSampler:
             if confidence_fn is not None
             else None
         )
+        self.greedy_draft = greedy_draft
         self._noise = noise
         self._tp_sync = tp_sync
         # Staged before each replay; step_temperatures is 0 on argmax rows.
@@ -62,11 +64,16 @@ class DsparkDraftSampler:
             (self.max_bs,), dtype=torch.float32, device=device
         )
         self._zero = torch.zeros((), dtype=torch.float32, device=device)
-        # [max_bs, gamma, vocab] step logits the sampling accept reads.
-        self.step_logits = torch.empty(
-            (self.max_bs, self.gamma, _step_logits_width(model)),
-            dtype=_step_logits_dtype(model),
-            device=device,
+        # [max_bs, gamma, vocab] step logits for the sampling accept; a greedy
+        # draft keeps none.
+        self.step_logits = (
+            None
+            if greedy_draft
+            else torch.empty(
+                (self.max_bs, self.gamma, _step_logits_width(model)),
+                dtype=_step_logits_dtype(model),
+                device=device,
+            )
         )
 
     def stage_sampling_params(self, *, bs: int, sampling_info) -> None:
@@ -112,7 +119,8 @@ class DsparkDraftSampler:
             step_temperatures=self.step_temperatures[:bs],
             noise=self._noise,
             tp_sync=self._tp_sync,
-            logits_out=self.step_logits[:bs],
+            logits_out=None if self.greedy_draft else self.step_logits[:bs],
+            greedy_draft=self.greedy_draft,
         )
         self.out[: draft_tokens.numel()].copy_(draft_tokens.reshape(-1))
         if self.confidence_out is not None:
@@ -148,6 +156,7 @@ def maybe_build_draft_sampler(
     device,
     tp_rank: int,
     noise: DraftNoise,
+    greedy_draft: bool,
     tp_sync: SpecTpSync,
     confidence_fn=None,
     out=None,
@@ -165,7 +174,10 @@ def maybe_build_draft_sampler(
     if draft_model.markov_head is None:
         return _eager("no markov head")
     if tp_rank == 0:
-        logger.info("DSpark draft proposal folded into the draft cuda graph.")
+        logger.info(
+            "DSpark draft proposal (%s) folded into the draft cuda graph.",
+            "greedy draft" if greedy_draft else "sampling",
+        )
     return DsparkDraftSampler(
         model=draft_model,
         gamma=gamma,
@@ -173,6 +185,7 @@ def maybe_build_draft_sampler(
         device=device,
         noise=noise,
         tp_sync=tp_sync,
+        greedy_draft=greedy_draft,
         confidence_fn=confidence_fn,
         out=out,
     )

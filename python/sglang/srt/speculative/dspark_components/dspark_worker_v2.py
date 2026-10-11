@@ -316,6 +316,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             verify_num_draft_tokens=self.verify_num_draft_tokens,
             block_pos_offsets=self._block_pos_offsets,
         )
+        self._greedy_draft = envs.SGLANG_DSPARK_USE_GREEDY_DRAFT.get()
         self._proposer = DraftBlockProposer(
             draft_model=self.draft_model,
             draft_model_runner=self.draft_model_runner,
@@ -324,6 +325,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             draft_block_spec_info=self._draft_block_spec_info,
             tp_sync=self._tp_sync,
             random_seed=target_worker.random_seed,
+            greedy_draft=self._greedy_draft,
             dp_moe_sync=self._draft_is_moe and get_parallel().attn_dp_enabled,
         )
         self._verify_epilogue = None
@@ -527,6 +529,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             device=self.device,
             tp_rank=self._target_tp_rank,
             noise=self._proposer.noise,
+            greedy_draft=self._greedy_draft,
             tp_sync=self._tp_sync,
             confidence_fn=(
                 self._verify_planner.compute_confidence_tensor

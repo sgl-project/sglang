@@ -84,6 +84,11 @@ class BaseDSparkMarkovHead(nn.Module, ABC):
     def step_logits_dtype(self, base_dtype: torch.dtype) -> torch.dtype:
         """The dtype of ``base_logits + bias``."""
 
+    def greedy_w2_weight(self) -> Optional[torch.Tensor]:
+        """The w2 weight when the bias is exactly the GEMV of the previous
+        token's embedding, for the fused greedy kernel; otherwise None."""
+        return None
+
 
 class VanillaMarkov(BaseDSparkMarkovHead):
     def __init__(self, *, vocab_size: int, markov_rank: int) -> None:
@@ -116,6 +121,18 @@ class VanillaMarkov(BaseDSparkMarkovHead):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         del hidden_states
         return self.project_bias(self.get_prev_embeddings(prev_tokens)), state
+
+    def greedy_w2_weight(self) -> Optional[torch.Tensor]:
+        return self.markov_w2.weight if self._bias_is_w2_gemv() else None
+
+    def _bias_is_w2_gemv(self) -> bool:
+        # The fused kernel recomputes this class's bias; a subclass that changes
+        # it keeps the shared op.
+        cls = type(self)
+        return (
+            cls.step_bias is VanillaMarkov.step_bias
+            and cls.project_bias is VanillaMarkov.project_bias
+        )
 
 
 class Nemotron35VanillaMarkov(VanillaMarkov):

@@ -886,13 +886,23 @@ def accept_draft_tokens(
             cutoff_verify_lens=cutoff_verify_lens,
             fused_argmax=fused_argmax,
         )
-    bs, gamma_rows, vocab = draft_block.corrected_logits.shape
-    draft_probs = SoftmaxTemp.execute(
-        logits=draft_block.corrected_logits.reshape(bs * gamma_rows, vocab),
-        temperatures=draft_block.temperatures,
-        rows_per_request=gamma_rows,
-    ).view(bs, gamma_rows, vocab)
-    expect(_VERIFY_DRAFT_PROBS, draft_probs)
+    if draft_block.greedy_draft:
+        # An argmax draft is one-hot: rejection accepts at the target probability.
+        draft_tokens = draft_block.draft_tokens
+        draft_probs = torch.zeros(
+            (*draft_tokens.shape, target_logits.shape[-1]),
+            dtype=torch.float32,
+            device=target_logits.device,
+        )
+        draft_probs.scatter_(-1, draft_tokens.unsqueeze(-1), 1.0)
+    else:
+        bs, gamma_rows, vocab = draft_block.corrected_logits.shape
+        draft_probs = SoftmaxTemp.execute(
+            logits=draft_block.corrected_logits.reshape(bs * gamma_rows, vocab),
+            temperatures=draft_block.temperatures,
+            rows_per_request=gamma_rows,
+        ).view(bs, gamma_rows, vocab)
+        expect(_VERIFY_DRAFT_PROBS, draft_probs)
     if not sampling_info.is_any_greedy:
         return AcceptSampling.execute(
             candidates=candidates,

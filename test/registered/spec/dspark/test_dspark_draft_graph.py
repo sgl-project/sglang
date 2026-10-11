@@ -1,8 +1,12 @@
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
+from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
+    MarkovGreedyStep,
+)
 from sglang.srt.models.dspark import VanillaMarkov
 from sglang.srt.speculative.dspark_components.dspark_draft import (
     DraftNoise,
@@ -69,6 +73,52 @@ class TestDraftMarkovBlockGraph(CustomTestCase):
         self.assertFalse(torch.equal(tokens_out[1::2], eager_tokens[1::2]))
         self.assertTrue(torch.equal(tokens_out[::2], eager_tokens[::2]))
 
+    def test_one_greedy_row_matches_eager_and_fp32_reference(self):
+        # The fused one-row kernel runs; the graph replays eager; both match FP32.
+        torch.manual_seed(2)
+        head = VanillaMarkov(vocab_size=VOCAB, markov_rank=RANK).to(DEVICE)
+        head = head.to(torch.bfloat16)
+        base = torch.randn(1, GAMMA, VOCAB, device=DEVICE).to(torch.bfloat16)
+        anchor = torch.randint(0, VOCAB, (1,), device=DEVICE)
+        noise = DraftNoise(
+            key=3, offset=torch.zeros(1, dtype=torch.int64, device=DEVICE)
+        )
+        tokens_out = torch.empty(1, GAMMA, dtype=torch.int64, device=DEVICE)
+
+        def block():
+            tokens, logits = draft_markov_block(
+                markov_head=head,
+                base_logits=base,
+                anchor_tokens=anchor,
+                draft_hidden=None,
+                step_temperatures=torch.zeros(1, device=DEVICE),
+                noise=noise,
+                tp_sync=SimpleNamespace(sync=lambda site, value: value),
+                greedy_draft=True,
+            )
+            assert logits is None
+            tokens_out.copy_(tokens)
+
+        with mock.patch.object(
+            MarkovGreedyStep, "execute", wraps=MarkovGreedyStep.execute
+        ) as fused:
+            block()
+        self.assertEqual(fused.call_count, GAMMA)
+        eager_tokens = tokens_out.clone()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            block()
+        tokens_out.zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+        self.assertTrue(torch.equal(tokens_out, eager_tokens))
+
+        prev = anchor
+        for step in range(GAMMA):
+            bias = head.markov_w1(prev).float() @ head.markov_w2.weight.float().T
+            prev = (base[:, step].float() + bias).argmax(-1)
+            self.assertEqual(eager_tokens[0, step].item(), prev.item())
+
     def test_captured_sampler_matches_eager_block(self):
         # The real tail (staging, static buffers, [:bs] views) against eager.
         torch.manual_seed(1)
@@ -92,6 +142,7 @@ class TestDraftMarkovBlockGraph(CustomTestCase):
             device=DEVICE,
             noise=noise,
             tp_sync=tp_sync,
+            greedy_draft=False,
         )
         hidden = torch.randn(BS * GAMMA, 64, device=DEVICE).to(torch.bfloat16)
         input_ids = torch.randint(0, VOCAB, (BS * GAMMA,), device=DEVICE)
@@ -121,6 +172,7 @@ class TestDraftMarkovBlockGraph(CustomTestCase):
             noise=eager_noise,
             device=DEVICE,
             tp_sync=tp_sync,
+            greedy_draft=False,
         )
         self.assertTrue(
             torch.equal(sampler.out[: BS * GAMMA].view(BS, GAMMA), eager.draft_tokens)
