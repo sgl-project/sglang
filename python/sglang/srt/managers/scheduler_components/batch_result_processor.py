@@ -1451,21 +1451,20 @@ class SchedulerBatchResultProcessor:
         ):
             return True
 
-        # no_buffer donates the live recurrent state. Verify advanced that state
-        # through the entire accepted run, before CPU grammar/finish truncation.
-        # A shorter key cannot describe it; retain existing checkpoints instead.
+        # no_buffer donates the live state, which cannot be shortened with the key.
+        if req.owned_kv_len() != req.kv.kv_committed_len:
+            return False
+
+        # Grammar may discard tokens that the live state has already consumed.
+        retained = result.grammar_retained_tokens
+        if retained is None or retained[i] is None:
+            return True
+
         num_verified = (
             result.num_correct_drafts_per_req_cpu[i]
             + result.num_non_draft_tokens_per_req
         )
-        retained = result.grammar_retained_tokens
-        num_committed = (
-            len(retained[i])
-            if retained is not None and retained[i] is not None
-            else num_verified
-        )
-        live_state_len = req.kv.kv_committed_len + num_verified - num_committed
-        return live_state_len == req.owned_kv_len()
+        return len(retained[i]) == num_verified
 
     def _maybe_update_reasoning_tokens(
         self,
