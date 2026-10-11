@@ -24,8 +24,7 @@ VOCAB, RANK, BS, GAMMA = 10000, 16, 8, 5
 
 class TestDraftMarkovBlockGraph(CustomTestCase):
     def test_captured_block_matches_eager(self):
-        # The graph tail replays the eager markov block: same tokens, same step
-        # logits, and the noise counter advances once per replay.
+        # Same tokens and logits as eager; the noise counter advances per replay.
         torch.manual_seed(0)
         head = VanillaMarkov(vocab_size=VOCAB, markov_rank=RANK).to(DEVICE)
         head = head.to(torch.bfloat16)
@@ -73,8 +72,7 @@ class TestDraftMarkovBlockGraph(CustomTestCase):
         self.assertTrue(torch.equal(tokens_out[::2], eager_tokens[::2]))
 
     def test_captured_sampler_matches_eager_block(self):
-        # The graph tail itself: staged temperatures, the static step-logits
-        # buffer and the [:bs] views, against the eager draft of the same batch.
+        # The real tail (staging, static buffers, [:bs] views) against eager.
         torch.manual_seed(1)
         head = VanillaMarkov(vocab_size=VOCAB, markov_rank=RANK).to(DEVICE)
         head = head.to(torch.bfloat16)
