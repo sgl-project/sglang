@@ -248,16 +248,6 @@ class InvariantCheckLevel(IntEnum):
     STRICT = 2
 
 
-class DsparkFoldedSampling(IntEnum):
-    """Sampling support in the graph-folded DSpark draft proposal: OFF =
-    greedy-only folding, AUTO = on when its buffers fit in free GPU memory,
-    FORCE = always."""
-
-    OFF = 0
-    AUTO = 1
-    FORCE = 2
-
-
 class Envs:
     # Organization principles for this registry:
     # - Put every field in exactly one topical section. Prefer an existing
@@ -542,15 +532,16 @@ class Envs:
     SGLANG_DSPARK_ENABLE_SPS_RECORD = EnvBool(False)
     SGLANG_DSPARK_FAST_KERNEL = EnvBool(True)
     SGLANG_DSPARK_FP32_LM_HEAD = EnvBool(False)
-    SGLANG_DSPARK_FAST_SAMPLING = EnvBool(True)
-    SGLANG_DSPARK_FOLDED_SAMPLING = EnvInt(DsparkFoldedSampling.AUTO)
+    # Argmax every draft row, sampling requests included, accepted as a one-hot
+    # draft: no step logits kept, lower acceptance at high temperatures.
+    SGLANG_DSPARK_USE_GREEDY_DRAFT = EnvBool(False)
     SGLANG_DSPARK_FOLDED_PROPOSAL = EnvBool(True)
     SGLANG_DSPARK_STACKED_CTX_KV = EnvBool(True)
     SGLANG_DSPARK_EMBED_IN_GRAPH = EnvBool(True)
     SGLANG_DSPARK_OPT_MARKOV_W2_BF16 = EnvBool(True)
     SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD = EnvBool(True)
-    SGLANG_DSPARK_OPT_FUSED_GREEDY_MARKOV = EnvBool(False)
-    # With the TP-sharded markov_w2, gather each step's vocab-parallel logits over
+    # With the TP-sharded markov_w2, run the draft's vocab all-gathers (each
+    # step's per-shard token candidates, and the step logits sampling keeps) over
     # the NVLink push collective (CustomAllReduceV2's multicast plane) instead of
     # the NCCL ring. Only taken when the group's communicator has a multicast
     # plane; off, or no such plane, keeps the NCCL all-gather.
@@ -1424,7 +1415,7 @@ class Envs:
     # Which speculative decisions rank 0 broadcasts to its TP group; narrowing
     # it under live traffic isolates where ranks actually diverge. Comma
     # separated presets ("all", "rng", "init", "off"), or SpecTpSyncSite slugs
-    # and numbers, each negatable with a leading "-": "all,-dspark-plan,-6".
+    # and numbers, each negatable with a leading "-": "all,-dspark-plan,-dspark-draft".
     SGLANG_SPEC_TP_SYNC = EnvStr("all")
     # Kill-switch for the draft-extend cuda graph. Draft extend then always runs
     # eager. Escape hatch for setups where the capture's memory pool costs more
@@ -1987,6 +1978,18 @@ _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
         note="Strategy-based prefill context parallelism is now the only generic implementation."
     ),
     "SGLANG_TRACE_QWEN35_FINAL_NORM": _DeprecatedEnv(),
+    "SGLANG_DSPARK_FAST_SAMPLING": _DeprecatedEnv(
+        note="DSpark draft sampling always uses Gumbel-max."
+    ),
+    "SGLANG_DSPARK_OPT_FUSED_GREEDY_MARKOV": _DeprecatedEnv(
+        note="A one-row step of SGLANG_DSPARK_USE_GREEDY_DRAFT on a vanilla markov "
+        "head fuses the bias GEMV."
+    ),
+    "SGLANG_DSPARK_FOLDED_SAMPLING": _DeprecatedEnv(
+        note="A folded DSpark draft proposal samples; set "
+        "SGLANG_DSPARK_USE_GREEDY_DRAFT=1 for an argmax-only draft, or "
+        "SGLANG_DSPARK_FOLDED_PROPOSAL=0 to keep the proposal out of the graph."
+    ),
     "SGLANG_SKIP_RUST_TESTS": _DeprecatedEnv(
         note="The Rust tests run in pr-test-rust-workspace.yml now."
     ),
