@@ -21,6 +21,7 @@ pub use self::loader::load_chat_formatter;
 pub use self::models::DeepSeekV4Profile;
 use self::models::{
     deep_sort, deepseek_v4_thinking, encode_tools_to_typescript, render_deepseek_v4,
+    render_deepseek_v41,
 };
 pub use self::reasoning::{requested_effort, requested_thinking};
 pub use self::selection::{ChatFormatterOptions, select_chat_formatter};
@@ -46,6 +47,7 @@ pub enum ChatFormatter {
         thinking: ThinkingTemplates,
     },
     DeepSeekV4(DeepSeekV4Profile),
+    DeepSeekV41,
     Legacy(Box<LegacyFormatter>),
 }
 
@@ -81,7 +83,7 @@ impl ChatFormatter {
                 }
                 render_oai(formatter, &TemplateArgsRequest { request, args })
             }
-            ChatFormatter::DeepSeekV4(_) => {
+            ChatFormatter::DeepSeekV4(_) | ChatFormatter::DeepSeekV41 => {
                 // Typed messages serialize straight to JSON, skipping minijinja.
                 let messages = match request.typed_messages() {
                     Some(messages) => serde_json::to_value(messages),
@@ -116,19 +118,20 @@ impl ChatFormatter {
     /// `chat_template_kwargs`, returning the prompt and the
     /// `continue_final_message` prefix SGLang tokenizes separately.
     /// The body must be one SGLang's `ChatCompletionRequest` accepts; it is not
-    /// re-validated. Only DeepSeek-V4 renders this way; others use [`Self::render_prompt`].
+    /// re-validated. Only DeepSeek-V4 and V4.1 render this way; others use [`Self::render_prompt`].
     pub fn render_request(
         &self,
         request: Value,
         default_kwargs: &HashMap<String, Value>,
     ) -> Result<(String, String), TemplateError> {
-        let ChatFormatter::DeepSeekV4(profile) = self else {
-            return Err(TemplateError::Renderer {
-                message: "this formatter renders through render_prompt".into(),
-            });
-        };
-        render_deepseek_v4(*profile, request, default_kwargs)
-            .map_err(|message| TemplateError::Renderer { message })
+        match self {
+            ChatFormatter::DeepSeekV4(profile) => {
+                render_deepseek_v4(*profile, request, default_kwargs)
+            }
+            ChatFormatter::DeepSeekV41 => render_deepseek_v41(request, default_kwargs),
+            _ => Err("this formatter renders through render_prompt".into()),
+        }
+        .map_err(|message| TemplateError::Renderer { message })
     }
 
     /// The template's stop strings — Python `Conversation.stop_str`
@@ -139,7 +142,8 @@ impl ChatFormatter {
         match self {
             ChatFormatter::HuggingFace { .. }
             | ChatFormatter::KimiK25 { .. }
-            | ChatFormatter::DeepSeekV4(_) => None,
+            | ChatFormatter::DeepSeekV4(_)
+            | ChatFormatter::DeepSeekV41 => None,
             ChatFormatter::Legacy(formatter) => formatter.spec.stop_str.clone(),
         }
     }
@@ -157,7 +161,7 @@ impl ChatFormatter {
             | ChatFormatter::KimiK25 { thinking, .. } => thinking
                 .for_request(tools_enabled)
                 .apply(args, named_tool_choice),
-            ChatFormatter::DeepSeekV4(_) => {
+            ChatFormatter::DeepSeekV4(_) | ChatFormatter::DeepSeekV41 => {
                 let enabled = deepseek_v4_thinking(
                     &serde_json::json!({ "chat_template_kwargs": args }),
                     &HashMap::new(),
