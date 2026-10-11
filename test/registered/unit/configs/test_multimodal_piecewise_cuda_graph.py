@@ -103,6 +103,16 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
         with patch(target, return_value=False):
             self.assertFalse(runner.can_run_graph(forward_batch))
 
+    def test_breakable_prefill_takes_nonzero_prefix_off_cuda_for_dsa(self):
+        runner = self._make_prefill_runner(Backend.BREAKABLE)
+        runner._attn_backend_forces_mla = True
+        forward_batch = self._make_multimodal_forward_batch()
+        forward_batch.extend_prefix_lens_cpu = [1]
+
+        target = "sglang.srt.model_executor.runner.prefill_cuda_graph_runner.is_cuda"
+        with patch(target, return_value=False):
+            self.assertTrue(runner.can_run_graph(forward_batch))
+
     def test_embedding_gemma_forces_breakable_prefill(self):
         args = ServerArgs(model_path="dummy")
         args._model_config = SimpleNamespace(
