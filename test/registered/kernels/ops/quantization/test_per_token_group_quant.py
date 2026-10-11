@@ -26,6 +26,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
     create_per_token_group_quant_fp8_output_scale,
     fp8_dtype,
     fp8_max,
+    sglang_per_token_group_quant_fp8_row_padded,
 )
 from sglang.kernels.ops.quantization.per_token_group_quant import (
     per_token_group_quant,
@@ -680,6 +681,89 @@ def test_auto_allocation(out_dtype, column_major_scales, scale_ue8m0):
     assert s_auto.dtype == s_buf.dtype and s_auto.shape == s_buf.shape
     assert torch.equal(q_auto.view(torch.int8), q_buf.view(torch.int8)), "codes differ"
     assert torch.equal(_as_int32(s_auto), _as_int32(s_buf)), "scales differ"
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("group_size", [16, 32, 64, 128, 256])
+@pytest.mark.parametrize("rows", [1, 2, 3, 4, 5, 127, 129])
+def test_row_padded_outputs(dtype, group_size, rows):
+    # Three groups also exercise a partial warp for every supported subwarp size.
+    torch.manual_seed(rows)
+    hidden = group_size * 3
+    padded = (rows + 3) // 4 * 4
+    x = torch.randn(rows, hidden, device="cuda", dtype=dtype)
+    q = torch.empty(padded, hidden, device="cuda", dtype=fp8_dtype)
+    s = torch.empty(3, padded, device="cuda", dtype=torch.float32).T
+    q.view(torch.uint8).fill_(127)
+    s.fill_(float("nan"))
+    per_token_group_quant(x, q, s, group_size)
+    reference_q, reference_s = per_token_group_quant(x, group_size=group_size)
+    assert torch.equal(q[:rows].view(torch.uint8), reference_q.view(torch.uint8))
+    assert torch.equal(s[:rows], reference_s)
+    assert torch.equal(s[:rows], _group_amax(x, group_size) * (1.0 / FMAX))
+    assert torch.count_nonzero(q[rows:].view(torch.uint8)) == 0
+    assert torch.count_nonzero(s[rows:]) == 0
+
+
+def test_row_padded_graph_replay():
+    x = torch.randn(5, 4096, device="cuda", dtype=torch.bfloat16)
+    q = torch.empty(8, 4096, device="cuda", dtype=fp8_dtype)
+    storage = torch.full((32, 12), float("nan"), device="cuda")
+    s = storage[:, :8].T
+    per_token_group_quant(x, q, s)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        per_token_group_quant(x, q, s)
+    for scale in [0, 1e-8, 1, 100]:
+        x.normal_().mul_(scale)
+        q.view(torch.uint8).fill_(127)
+        storage.fill_(float("nan"))
+        graph.replay()
+        reference_q, reference_s = per_token_group_quant(x)
+        assert torch.equal(q[:5].view(torch.uint8), reference_q.view(torch.uint8))
+        assert torch.equal(s[:5], reference_s)
+        assert torch.count_nonzero(q[5:].view(torch.uint8)) == 0
+        assert torch.count_nonzero(s[5:]) == 0
+        assert torch.isnan(storage[:, 8:]).all()
+
+
+@pytest.mark.parametrize(
+    "rows,alignment", [(0, 4), (1, 1), (1, 3), (1, 8), (3, 3), (5, 8), (8, 4)]
+)
+def test_row_padded_helper(rows, alignment):
+    x = torch.randn(rows, 256, device="cuda", dtype=torch.bfloat16)
+    q, s = sglang_per_token_group_quant_fp8_row_padded(x, 128, row_alignment=alignment)
+    padded = (rows + alignment - 1) // alignment * alignment
+    assert q.shape == (padded, 256)
+    assert s.shape == (padded, 2) and s.stride(0) == 1
+    if rows:
+        reference_q, reference_s = per_token_group_quant(x)
+        assert torch.equal(q[:rows].view(torch.uint8), reference_q.view(torch.uint8))
+        assert torch.equal(s[:rows], reference_s)
+    assert torch.count_nonzero(q[rows:].view(torch.uint8)) == 0
+    assert torch.count_nonzero(s[rows:]) == 0
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    ["empty_input", "short_output", "scale_rows", "scale_overlap", "q_alignment"],
+)
+def test_row_padded_invalid_buffers(invalid):
+    x = torch.randn(1, 384, device="cuda", dtype=torch.bfloat16)
+    q = torch.empty(4, 384, device="cuda", dtype=fp8_dtype)
+    s = torch.empty(3, 4, device="cuda", dtype=torch.float32).T
+    if invalid == "empty_input":
+        x = x[:0]
+    elif invalid == "short_output":
+        x = x.expand(5, -1).contiguous()
+    elif invalid == "scale_rows":
+        s = s[:3]
+    elif invalid == "scale_overlap":
+        s = s.as_strided((4, 3), (1, 2))
+    else:
+        q = torch.empty(4 * 384 + 1, device="cuda", dtype=fp8_dtype)[1:].view(4, 384)
+    with pytest.raises(RuntimeError):
+        per_token_group_quant(x, q, s)
 
 
 if __name__ == "__main__":

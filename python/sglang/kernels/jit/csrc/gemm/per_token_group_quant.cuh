@@ -394,9 +394,9 @@ struct QuantTrait {
 // ---------------------------------------------------------------------------
 // Flat schedule: one subwarp (kNumLanes) per group over a linear grid.
 // ---------------------------------------------------------------------------
-template <typename Trait, bool kUsePDL>
+template <typename Trait, bool kUsePDL, bool kRowPadded = false>
 __global__ __launch_bounds__(Trait::kBlockSize) void per_token_group_quant_flat_kernel(
-    const __grid_constant__ QuantKernelParams params) {
+    const __grid_constant__ QuantKernelParams params, const uint32_t output_tokens) {
   using namespace device;
   constexpr uint32_t kNumLanes = Trait::kNumLanes;
   constexpr uint32_t kWorkPerWarp = kWarpThreads / kNumLanes;
@@ -413,6 +413,18 @@ __global__ __launch_bounds__(Trait::kBlockSize) void per_token_group_quant_flat_
   const auto group_idx = work_id % num_groups;
   PDLWaitPrimary<kUsePDL>();
   Trait::run(params, 0, token_idx, group_idx, lane_id);
+  if constexpr (kRowPadded) {
+    // The last real row also initializes its groups in the padded rows. Keep
+    // the quantization arithmetic and the GEMM's padded shape unchanged.
+    if (token_idx + 1 == params.num_tokens) {
+      AlignedVector<uint8_t, Trait::kVecSize> zeros;
+      zeros.fill(0);
+      for (uint32_t row = params.num_tokens; row < output_tokens; ++row) {
+        zeros.store(params.output.get<uint8_t>(0, row) + group_idx * Trait::kGroupSize, lane_id);
+        if (lane_id == 0) params.scale.store<false, false, true>(0, row, group_idx, 0.f);
+      }
+    }
+  }
   PDLTriggerSecondary<kUsePDL>();
 }
 
@@ -459,7 +471,7 @@ struct QuantHostContext {
   DLDevice device;
 };
 
-template <typename Trait, bool kMasked>
+template <typename Trait, bool kMasked, bool kRowPadded = false>
 QuantHostContext<Trait> build_quant_context( //
     const tvm::ffi::TensorView& input,
     const tvm::ffi::TensorView& output_q,
@@ -483,6 +495,17 @@ QuantHostContext<Trait> build_quant_context( //
     TensorMatcher({E, N, G}).with_strides({-1, -1, -1}).with_dtype<S>().with_device(device).verify(output_s);
     CHECK_HOST((input.stride(0) * sizeof(T)) % 32 == 0)
         << "input expert stride must keep rows 32B-aligned for the vectorized loads";
+  } else if constexpr (kRowPadded) {
+    static_assert(!kMasked && !Trait::kUe8m0 && !Trait::kRowMajor && !Trait::kFuseSiluAndMul);
+    static_assert(std::is_same_v<Q, fp8_e4m3_t>);
+    auto padded = SymbolicSize{"padded_tokens"};
+    TensorMatcher({N, -1}).with_strides({-1, 1}).with_dtype<T>().with_device(device).verify(input);
+    TensorMatcher({padded, H}).with_dtype<Q>().with_device(device).ensure_alignment(16).verify(output_q);
+    TensorMatcher({padded, G}).with_strides({1, -1}).with_dtype<S>().with_device(device).verify(output_s);
+    CHECK_HOST(N.unwrap() > 0 && padded.unwrap() >= N.unwrap() && padded.unwrap() <= UINT32_MAX)
+        << "row-padded quant requires 0 < input rows <= output rows <= UINT32_MAX";
+    CHECK_HOST(output_s.stride(1) >= padded.unwrap() && output_s.stride(1) <= UINT32_MAX)
+        << "row-padded scale columns must not overlap and their stride must fit uint32";
   } else {
     TensorMatcher({N, -1}).with_strides({-1, 1}).with_dtype<T>().with_device(device).verify(input);
     TensorMatcher({N, H}).with_strides({-1, 1}).with_dtype<Q>().with_device(device).verify(output_q);
@@ -537,7 +560,7 @@ QuantHostContext<Trait> build_quant_context( //
     }
   }
   // The scale store indexes with uint32 strides; guard against overflow.
-  scale_args.check_overflow(num_experts, num_tokens);
+  scale_args.check_overflow(num_experts, kRowPadded ? static_cast<uint32_t>(output_q.size(0)) : num_tokens);
   const auto input_args = detail::TensorArgs{
       .ptr = input.data_ptr(),
       .expert_stride = kMasked ? input.stride(0) : 0,
@@ -575,14 +598,26 @@ struct PerTokenGroupQuantFlatKernel {
   using Trait = QuantTrait<InputType, QuantType, kGroupSize, kUe8m0, kRowMajor, kAligned, kFuseSiluAndMul>;
 
   static void run(tvm::ffi::TensorView input, tvm::ffi::TensorView output_q, tvm::ffi::TensorView output_s) {
+    if constexpr (std::is_same_v<QuantType, fp8_e4m3_t> && !kUe8m0 && !kRowMajor && !kFuseSiluAndMul) {
+      if (input.ndim() == 2 && output_q.ndim() == 2 && input.size(0) != output_q.size(0)) {
+        return run_impl<true>(input, output_q, output_s);
+      }
+    }
+    run_impl<false>(input, output_q, output_s);
+  }
+
+ private:
+  template <bool kRowPadded>
+  static void run_impl(tvm::ffi::TensorView input, tvm::ffi::TensorView output_q, tvm::ffi::TensorView output_s) {
     using namespace host;
-    const auto ctx = build_quant_context<Trait, /*kMasked=*/false>(input, output_q, output_s);
+    const auto ctx = build_quant_context<Trait, /*kMasked=*/false, kRowPadded>(input, output_q, output_s);
     const auto& p = ctx.params;
     const int64_t total_threads = int64_t{p.num_tokens} * p.scale.num_groups * Trait::kNumLanes;
     if (total_threads == 0) return;
     const uint32_t num_blocks = div_ceil(total_threads, int64_t{Trait::kBlockSize});
     LaunchKernel(num_blocks, Trait::kBlockSize, ctx.device)
-        .config({.use_pdl = kUsePDL})(per_token_group_quant_flat_kernel<Trait, kUsePDL>, p);
+        .config({.use_pdl = kUsePDL})(
+            per_token_group_quant_flat_kernel<Trait, kUsePDL, kRowPadded>, p, static_cast<uint32_t>(output_q.size(0)));
   }
 };
 

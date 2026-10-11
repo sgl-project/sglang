@@ -179,6 +179,10 @@ def per_token_group_quant(
     (default fp8_e4m3), ``scale_ue8m0`` and ``column_major_scales``. Either way
     the two tensors are returned.
 
+    For vanilla FP8 with column-major FP32 scales, supplied contiguous
+    ``output_q`` and matching ``output_s`` may have more rows than a nonempty
+    input. The extra rows in both outputs are zero-filled by the quant kernel.
+
     Input / output shapes:
       vanilla:            input [T, hidden],      output_q [T, hidden]
       fuse_silu_and_mul:  input [T, hidden*2],    output_q [T, hidden]
