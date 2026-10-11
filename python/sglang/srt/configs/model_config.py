@@ -1593,7 +1593,7 @@ class ModelConfig:
 
         DCP ranks replicate KV, so heads shard across ``tp // dcp`` groups;
         ``dcp_size`` is the caller's own KV width (a draft passes its draft
-        width, see ``ModelRunner.kv_dcp``). With fewer heads than groups,
+        width, see ``ParallelContext.kv_dcp_size``). With fewer heads than groups,
         each GPU keeps one.
         """
         total_num_kv_heads = self.get_total_num_kv_heads()

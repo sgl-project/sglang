@@ -458,7 +458,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             # cell_size is already a sum over heterogeneous sub-pools.
             return main_pool_bytes + indexer_bytes * full_pool_ratio
         else:
-            n = model_config.get_num_kv_heads(tp_size, kvc.kv_dcp_size)
+            n = model_config.get_num_kv_heads(
+                tp_size, get_parallel().kv_dcp_size(is_draft_worker=kvc.is_draft_worker)
+            )
             cell_size = (
                 n
                 * (model_config.head_dim + model_config.v_head_dim)

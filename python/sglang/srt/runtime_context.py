@@ -432,6 +432,14 @@ class ParallelContext:
         """Drop every stamped name, ranks included."""
         self._stamp.clear()
 
+    def kv_dcp_size(self, *, is_draft_worker: bool) -> int:
+        """DCP width a worker's KV rows shard the sequence with: the draft's own
+        (`--speculative-dcp-size`) or the attention group's."""
+        return self.draft_dcp_size if is_draft_worker else self.attn_dcp_size
+
+    def kv_dcp_rank(self, *, is_draft_worker: bool) -> int:
+        return self.draft_dcp_rank if is_draft_worker else self.attn_dcp_rank
+
     @contextmanager
     def override(self, **kwargs):
         """Temporarily force parallel values, restoring on exit. Validates keys and
