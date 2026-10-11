@@ -8,13 +8,16 @@ cache turns itself off when a full encode disagrees.
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from tokenizers import AddedToken, Tokenizer, models, normalizers, pre_tokenizers
 from tokenizers.trainers import BpeTrainer
 from transformers import PreTrainedTokenizerFast
 
+from sglang.srt.entrypoints.openai import parallel_prompt_encode as ppe
 from sglang.srt.entrypoints.openai.prompt_segment_cache import PromptSegmentCache
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -322,6 +325,46 @@ class TestRenderAndEncode(CustomTestCase):
         self._encode(server, 3)
 
         self.assertEqual(tokenizer.encoded, [_render(tokenizer, 3)])
+
+    def test_an_absent_or_disabled_cache_keeps_parallel_encoding(self):
+        """The cache must not remove the upstream long-prompt encoding path."""
+        tokenizer = _tokenizer()
+        messages = _conversation(3, [content * 256 for content in CORPUS])
+        text = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        reference = tokenizer.encode(text)
+        original_split = ppe.split_prompt
+
+        for disabled in (False, True):
+            with self.subTest(disabled_cache=disabled):
+                cache = PromptSegmentCache.create(tokenizer) if disabled else None
+                if cache is not None:
+                    cache.enabled = False
+                chunks = []
+
+                def split_prompt(*args, **kwargs):
+                    result = original_split(*args, **kwargs)
+                    chunks.extend(result)
+                    return result
+
+                with (
+                    envs.SGLANG_PARALLEL_PROMPT_ENCODE.override(True),
+                    envs.SGLANG_PARALLEL_PROMPT_ENCODE_MIN_CHARS.override(0),
+                    patch.object(ppe, "_parallel_ok", True),
+                    patch.object(ppe, "split_prompt", side_effect=split_prompt),
+                ):
+                    ids, _ = render_and_encode(
+                        self._server(tokenizer, cache),
+                        messages,
+                        tools=None,
+                        template_kwargs={},
+                        encode_kwargs={},
+                        use_cache=False,
+                    )
+
+                self.assertEqual(ids, reference)
+                self.assertGreater(len(chunks), 1)
 
 
 if __name__ == "__main__":

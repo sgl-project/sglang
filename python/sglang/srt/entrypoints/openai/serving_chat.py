@@ -1861,7 +1861,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 **template_kwargs,
             )
             segment_cache = self._prompt_segment_cache
-            if segment_cache is not None:
+            if segment_cache is not None and segment_cache.enabled:
                 prompt_ids = segment_cache.encode(rendered_prompt, encode_kwargs)
             else:
                 prompt_ids = parallel_prompt_encode(
