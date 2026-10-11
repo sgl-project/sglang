@@ -1144,7 +1144,7 @@ class TestDflashDraftKvBudget(CustomTestCase):
 
     def test_dcp_replication_scales_draft_budget(self):
         """The draft pool spans the virtual locations of the DCP ranks it is
-        replicated across: attn_dcp_size // draft_dcp_size of them."""
+        replicated across: attn_dcp_size // speculative_dcp_size of them."""
         draft_kv_per_token = 10_240
         mr = _make_model_runner(self)
         mr.spec_algorithm.is_dflash_family.return_value = True
@@ -1162,7 +1162,7 @@ class TestDflashDraftKvBudget(CustomTestCase):
                 with (
                     mock_cpu_env(tp_size=8),
                     get_parallel().override(
-                        attn_dcp_size=dcp_size, draft_dcp_size=draft_dcp_size
+                        attn_dcp_size=dcp_size, speculative_dcp_size=draft_dcp_size
                     ),
                 ):
                     from sglang.srt.model_executor.pool_configurator import (

@@ -725,21 +725,12 @@ class TestParallelDCP(_IsolatedOverrides):
         leaves the draft at width one, rank zero on every TP rank."""
         parallel = self._placed(5, tp_size=8, dcp_size=8)
         self.assertEqual(parallel.attn_dcp_size, 8)
-        self.assertEqual(parallel.draft_dcp_size, 1)
-        self.assertEqual(parallel.draft_dcp_rank, 0)
+        self.assertEqual(parallel.speculative_dcp_size, 1)
+        self.assertEqual(parallel.speculative_dcp_rank, 0)
 
     def test_the_draft_rank_answers_without_a_spawn_bundle(self):
         parallel = self._published(tp_size=8, dcp_size=8)
-        self.assertEqual(parallel.draft_dcp_rank, 0)
-
-    def test_the_kv_width_is_chosen_by_the_worker(self):
-        """A target and a draft in one process read different KV DCP widths
-        off the same bag, so neither runner nor pool carries a copy."""
-        parallel = self._placed(5, tp_size=8, dcp_size=8)
-        self.assertEqual(parallel.kv_dcp_size(is_draft_worker=False), 8)
-        self.assertEqual(parallel.kv_dcp_rank(is_draft_worker=False), 5)
-        self.assertEqual(parallel.kv_dcp_size(is_draft_worker=True), 1)
-        self.assertEqual(parallel.kv_dcp_rank(is_draft_worker=True), 0)
+        self.assertEqual(parallel.speculative_dcp_rank, 0)
 
     def test_the_width_does_not_consult_the_platform(self):
         with patch("sglang.srt.utils.is_cuda", return_value=False) as is_cuda:

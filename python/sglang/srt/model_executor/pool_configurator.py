@@ -459,7 +459,12 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             return main_pool_bytes + indexer_bytes * full_pool_ratio
         else:
             n = model_config.get_num_kv_heads(
-                tp_size, get_parallel().kv_dcp_size(is_draft_worker=kvc.is_draft_worker)
+                tp_size,
+                (
+                    get_parallel().speculative_dcp_size
+                    if kvc.is_draft_worker
+                    else get_parallel().attn_dcp_size
+                ),
             )
             cell_size = (
                 n

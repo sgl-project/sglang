@@ -102,14 +102,13 @@ def _should_use_verify_shared_kv(
     if is_dspark_draft(model_config.hf_config):
         return use_verify_splitkv
     parallel = get_parallel()
+    dcp_size = (
+        parallel.speculative_dcp_size if is_draft_worker else parallel.attn_dcp_size
+    )
     return (
         use_verify_splitkv
         and is_qwen3_5(model_config.hf_config)
-        and model_config.get_num_kv_heads(
-            parallel.attn_tp_size,
-            parallel.kv_dcp_size(is_draft_worker=is_draft_worker),
-        )
-        == 1
+        and model_config.get_num_kv_heads(parallel.attn_tp_size, dcp_size) == 1
     )
 
 
@@ -254,12 +253,13 @@ class TritonAttnBackend(AttentionBackend):
             self.use_verify_splitkv,
             is_draft_worker=model_runner.is_draft_worker,
         )
-        self.dcp_size = get_parallel().kv_dcp_size(
-            is_draft_worker=model_runner.is_draft_worker
-        )
-        self.dcp_rank = get_parallel().kv_dcp_rank(
-            is_draft_worker=model_runner.is_draft_worker
-        )
+        parallel = get_parallel()
+        if model_runner.is_draft_worker:
+            self.dcp_size = parallel.speculative_dcp_size
+            self.dcp_rank = parallel.speculative_dcp_rank
+        else:
+            self.dcp_size = parallel.attn_dcp_size
+            self.dcp_rank = parallel.attn_dcp_rank
         self.num_head = (
             model_runner.model_config.get_max_num_attention_heads()
             // get_parallel().attn_tp_size

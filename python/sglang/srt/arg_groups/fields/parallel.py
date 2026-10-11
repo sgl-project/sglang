@@ -56,6 +56,13 @@ class Parallel(msgspec.Struct):
             aliases=["--decode-context-parallel-size"],
         ),
     ] = 1
+    speculative_dcp_size: A[
+        int,
+        "Decode context parallelism size for the speculative draft KV cache. The "
+        "draft KV cache is head-sharded across the TP group like the target's; set "
+        "to 1 (the default) to keep it that way. Sharding the draft KV cache along "
+        "the sequence (> 1) is not supported yet and is rejected.",
+    ] = 1
     pp_size: A[
         int,
         Arg(
@@ -324,13 +331,6 @@ class Parallel(msgspec.Struct):
         fn="sglang.srt.runtime_context.attn_dcp_size_of",
         doc="Decode context-parallel width inside the attention TP group.",
     )
-    draft_dcp_size = Derived(
-        fn="sglang.srt.runtime_context.draft_dcp_size_of",
-        doc="Decode context-parallel width of the speculative draft KV cache "
-        "(`--speculative-dcp-size`). The draft pool shards along the sequence "
-        "at this width, not at `attn_dcp_size`; one means it is replicated "
-        "across the target's DCP ranks.",
-    )
     moe_ep_size = Derived(
         fn="sglang.srt.runtime_context.moe_ep_size_of",
         doc="MoE expert-parallel width, normalised from the configured value.",
@@ -369,10 +369,10 @@ class Parallel(msgspec.Struct):
             "zero where decode context parallelism is off."
         )
     )
-    draft_dcp_rank = Derived(
+    speculative_dcp_rank = Derived(
         doc=(
-            "This process's place in the draft KV cache's decode "
-            "context-parallel slice, zero while `draft_dcp_size` is one."
+            "This process's place in the speculative draft KV cache's decode "
+            "context-parallel slice, zero while `speculative_dcp_size` is one."
         )
     )
     attn_dp_rank = Derived(

@@ -145,7 +145,7 @@ class TestDcpLogicalCapacity(CustomTestCase):
         runner.kv_cache_configurator = make_configurator(is_draft_worker=True)
         self.assertEqual(runner.logical_max_total_num_tokens, 64)
         # A draft sharded at its own width replicates over fewer ranks.
-        with get_parallel().override(draft_dcp_size=2):
+        with get_parallel().override(speculative_dcp_size=2):
             self.assertEqual(runner.logical_max_total_num_tokens, 64 * 2)
         runner.is_hybrid_swa = True
         runner.kv_cache_configurator = make_configurator(is_hybrid_swa=True)

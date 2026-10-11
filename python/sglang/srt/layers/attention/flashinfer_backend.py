@@ -372,8 +372,10 @@ class FlashInferAttnBackend(AttentionBackend):
             // get_parallel().attn_tp_size,
             num_kv_heads=model_runner.model_config.get_num_kv_heads(
                 get_parallel().attn_tp_size,
-                get_parallel().kv_dcp_size(
-                    is_draft_worker=model_runner.is_draft_worker
+                (
+                    get_parallel().speculative_dcp_size
+                    if model_runner.is_draft_worker
+                    else get_parallel().attn_dcp_size
                 ),
             ),
         )
@@ -1562,7 +1564,11 @@ class FlashInferIndicesUpdaterDecode:
         )
         self.num_kv_heads = model_runner.model_config.get_num_kv_heads(
             get_parallel().attn_tp_size,
-            get_parallel().kv_dcp_size(is_draft_worker=model_runner.is_draft_worker),
+            (
+                get_parallel().speculative_dcp_size
+                if model_runner.is_draft_worker
+                else get_parallel().attn_dcp_size
+            ),
         )
         self.head_dim = model_runner.model_config.head_dim
         self.data_type = attn_backend.flashinfer_kv_cache_dtype
@@ -1853,7 +1859,11 @@ class FlashInferIndicesUpdaterPrefill:
         )
         self.num_kv_heads = model_runner.model_config.get_num_kv_heads(
             get_parallel().attn_tp_size,
-            get_parallel().kv_dcp_size(is_draft_worker=model_runner.is_draft_worker),
+            (
+                get_parallel().speculative_dcp_size
+                if model_runner.is_draft_worker
+                else get_parallel().attn_dcp_size
+            ),
         )
         self.head_dim = model_runner.model_config.head_dim
         self.data_type = attn_backend.flashinfer_kv_cache_dtype

@@ -227,11 +227,6 @@ def dcp_enabled_of(cfg: Any):
     return parallel_widths_of(cfg)["dcp_enabled"]
 
 
-def draft_dcp_size_of(cfg: Any):
-    """`draft_dcp_size`, computed at publish: the draft KV cache's own DCP width."""
-    return cfg.speculative_dcp_size
-
-
 class SpawnRanks(msgspec.Struct, frozen=True):
     """Process placement supplied by the launcher.
 
@@ -253,7 +248,7 @@ _RANK_AND_WIDTH = (
     ("attn_dp_rank", "attn_dp_size"),
     ("attn_cp_rank", "attn_cp_size"),
     ("moe_ep_rank", "moe_ep_size"),
-    ("draft_dcp_rank", "draft_dcp_size"),
+    ("speculative_dcp_rank", "speculative_dcp_size"),
 )
 
 # MoE-DP may alias a wider attention-CP group, so its configured width
@@ -431,14 +426,6 @@ class ParallelContext:
     def clear_stamp(self) -> None:
         """Drop every stamped name, ranks included."""
         self._stamp.clear()
-
-    def kv_dcp_size(self, *, is_draft_worker: bool) -> int:
-        """DCP width a worker's KV rows shard the sequence with: the draft's own
-        (`--speculative-dcp-size`) or the attention group's."""
-        return self.draft_dcp_size if is_draft_worker else self.attn_dcp_size
-
-    def kv_dcp_rank(self, *, is_draft_worker: bool) -> int:
-        return self.draft_dcp_rank if is_draft_worker else self.attn_dcp_rank
 
     @contextmanager
     def override(self, **kwargs):
@@ -1573,8 +1560,8 @@ def _configure_context(
     # Disabled DCP has rank zero even in processes without a rank bundle.
     if not context.parallel.dcp_enabled:
         context.parallel.override_permanently(attn_dcp_rank=0)
-    if context.parallel.draft_dcp_size == 1:
-        context.parallel.override_permanently(draft_dcp_rank=0)
+    if context.parallel.speculative_dcp_size == 1:
+        context.parallel.override_permanently(speculative_dcp_rank=0)
     # The device is assigned by the launcher; it is not a config field.
     context.config_bag("device")._set(
         "gpu_id", ranks.gpu_id if ranks is not None else None
@@ -1601,7 +1588,9 @@ def _configure_context(
         if parallel.dcp_enabled:
             placement["dcp_rank"] = placement["tp_rank"] % parallel.dcp_size
         placement["attn_dcp_rank"] = placement.get("dcp_rank", 0)
-        placement["draft_dcp_rank"] = placement["tp_rank"] % parallel.draft_dcp_size
+        placement["speculative_dcp_rank"] = (
+            placement["tp_rank"] % parallel.speculative_dcp_size
+        )
         parallel.override_permanently(**placement)
         _validate_parallel(parallel, "publish")
     if _ROLE_NS_MODE == "record":

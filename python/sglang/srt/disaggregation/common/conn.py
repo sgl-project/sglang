@@ -322,8 +322,8 @@ class CommonKVManager(BaseKVManager):
         self.attn_cp_rank = parallel.attn_cp_rank
         self.dcp_size = parallel.attn_dcp_size
         self.dcp_rank = parallel.attn_dcp_rank
-        self.draft_dcp_size = parallel.draft_dcp_size
-        self.draft_dcp_rank = parallel.draft_dcp_rank
+        self.draft_dcp_size = parallel.speculative_dcp_size
+        self.draft_dcp_rank = parallel.speculative_dcp_rank
         self.attn_dp_size = parallel.attn_dp_size
         self.attn_dp_rank = parallel.attn_dp_rank
         self.system_dp_size = get_parallel().dp_size
