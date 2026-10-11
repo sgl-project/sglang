@@ -2,9 +2,8 @@ import argparse
 import bisect
 import json
 import time
-from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Dict
 
 parser = argparse.ArgumentParser(
     description="Convert SGLang OTEL trace files to Perfetto format.",
@@ -126,12 +125,16 @@ OtelSpan = Dict[str, Any]
 def load_otel_data(path: str | Path):
     p = Path(path)
     with p.open("rt", encoding="utf-8") as f:
-        first = f.read(1)
-        f.seek(0)
-        if first == "[":
-            data = json.load(f)  # JSON array
-        else:
-            data = [json.loads(line) for line in f if line.strip()]  # JSONL
+        content = f.read()
+    # JSON allows insignificant leading whitespace; detect the format from the
+    # first non-whitespace character so a whitespace-prefixed array is not
+    # mistaken for JSONL.
+    if content.lstrip().startswith("["):
+        data = json.loads(content)  # JSON array
+    else:
+        data = [
+            json.loads(line) for line in content.splitlines() if line.strip()
+        ]  # JSONL
     return data
 
 
@@ -447,6 +450,12 @@ def main():
     otel_data = load_otel_data(args.input_file)
     engine_otel_spans, smg_otel_spans = extract_all_otel_spans(otel_data)
     engine_root_spans = build_otel_span_tree(engine_otel_spans)
+    # SMG spans are not part of the engine span tree, but the shared perfetto
+    # converters expect the internal "child" field that build_otel_span_tree
+    # initializes. Initialize it here so an OTLP exporter never has to
+    # provide the converter's internal field itself.
+    for span in smg_otel_spans:
+        span.setdefault("child", [])
     thread_meta_data = {}
     generate_perfetto_span(engine_root_spans, smg_otel_spans, thread_meta_data)
     slot_meta_data = []
