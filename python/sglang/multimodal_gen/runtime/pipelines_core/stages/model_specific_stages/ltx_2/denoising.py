@@ -1956,9 +1956,13 @@ class LTX2DenoisingStage(DenoisingStage):
         stage1_cfg_world_size = (
             get_classifier_free_guidance_world_size() if stage1_cfg_parallel else 1
         )
-        # Legacy LTX-2.3 one-stage keeps one forward per guidance pass so its
-        # numerics match the reference schedule.
-        use_legacy_exact_passes = ctx.use_ltx23_legacy_one_stage
+        # Legacy LTX-2.3 one-stage batches its guidance passes into one forward
+        # (perturbation masks are exact per item; only GEMM/attention rounding
+        # can move with the batch size). quality="exact" keeps the reference
+        # one-pass-per-forward schedule, which is bit-identical to it.
+        use_legacy_exact_passes = ctx.use_ltx23_legacy_one_stage and not (
+            quality_allows(batch.quality, "lossless")
+        )
         # NOTE: this flag must be identical across all SP ranks so that every
         # rank executes the same number of model-forward calls (each of which
         # contains NCCL collectives).
