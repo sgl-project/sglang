@@ -766,6 +766,20 @@ def _get_cp_rank_page_bounds(
     return local_start, local_start + n_pages
 
 
+def filter_kv_indices_for_shard_rank(
+    *,
+    kv_indices: np.ndarray,
+    index_slice: slice,
+    shard_rank: int,
+    shard_size: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Logical page l lives on rank l % N as local page l // N; returns the owned
+    local ids and their send positions, which replace the contiguous index_slice."""
+    owned = kv_indices % shard_size == shard_rank
+    positions = np.arange(index_slice.start, index_slice.stop, dtype=np.int64)
+    return kv_indices[owned] // shard_size, positions[owned]
+
+
 def filter_kv_indices_for_cp_rank(
     kv_mgr: CommonKVManager,
     kv_indices: np.ndarray,
