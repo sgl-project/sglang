@@ -3772,7 +3772,8 @@ class Scheduler(
             ret, need_sync=need_mlp_sync
         )
         # Decode->extend conversion keeps a heterogeneous dp step replayable.
-        # A converted running batch stays the running batch.
+        # A converted running batch stays the running batch; next step it comes
+        # back as last_batch and is filtered in place, not merged with itself.
         ret = self.dp_attn_adapter.maybe_convert_decode_to_extend(ret)
         self._arm_prefill_decode_interval(ret)
 
@@ -5471,6 +5472,9 @@ class Scheduler(
         if (
             self.last_batch is not None
             and self.last_batch.forward_mode.is_extend()
+            # A running batch that DP attention converted to extend is
+            # last_batch itself; its requests are already listed above.
+            and self.last_batch is not self.running_batch
             # Skip merge for disagg prefill: completed prefill requests are
             # already in disagg_prefill_inflight_queue. Merging them into
             # running_batch leaks them, since the prefill event loop never
