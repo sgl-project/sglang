@@ -2720,6 +2720,9 @@ class KimiK3LinearModel(nn.Module):
         self.config = config
         self.pp_group = get_parallel().pp_group
         self.dspark_layers_to_capture: Optional[list[int]] = None
+        # One-based completed-layer ids from the draft config's
+        # eagle_aux_hidden_state_layer_ids ([2, 46, 90] for kimi-k3-eagle3.1-mla).
+        self.eagle3_layers_to_capture: Optional[tuple[int, ...]] = None
         self._dp_attention = is_dp_attention_enabled()
         # Whether K3's SP collective is enabled on this rank, which the layers'
         # stage declarations depend on: settled once, before any is built.
@@ -2853,28 +2856,23 @@ class KimiK3LinearModel(nn.Module):
             self.attn_bank.open(hidden_states, attn_res_block_num, inherited)
 
         packs_aux = self.packs_aux_hidden_states
+        captures = self.capture_layer_ids or ()
         aux_hidden_states: AuxHiddenStateAccumulator = (
-            AuxHiddenStatePacker.for_batch(
-                forward_batch, len(self.dspark_layers_to_capture)
-            )
+            AuxHiddenStatePacker.for_batch(forward_batch, len(captures))
             if packs_aux
             else AuxHiddenStateList()
         )
-        captures = self.dspark_layers_to_capture or ()
         # On the standard residual path the stream a layer hands on is what the
         # next layer's attention input reads, captured there on every row (the
         # final norm's, after the last layer). The bank's is the mixture the
         # next read would form, captured after the layer.
         captures_at_input = self.attn_bank is None
-        if (
-            self.dspark_layers_to_capture is not None
-            and not self.pp_group.is_first_rank
-        ):
+        if self.capture_layer_ids is not None and not self.pp_group.is_first_rank:
             if "dspark_hidden_states" in pp_proxy_tensors.tensors:
                 aux_hidden_states.append(pp_proxy_tensors["dspark_hidden_states"])
             if self.start_layer - 1 in captures and not captures_at_input:
                 aux_hidden_states.append(
-                    self._dspark_capture_stream(
+                    self._capture_bank_stream(
                         self.start_layer - 1, hidden_states, forward_batch
                     )
                 )
@@ -2897,7 +2895,7 @@ class KimiK3LinearModel(nn.Module):
                 and (i + 1 < self.end_layer or self.pp_group.is_last_rank)
             ):
                 aux_hidden_states.append(
-                    self._dspark_capture_stream(i, hidden_states, forward_batch)
+                    self._capture_bank_stream(i, hidden_states, forward_batch)
                 )
 
         if not self.pp_group.is_last_rank:
@@ -2932,16 +2930,36 @@ class KimiK3LinearModel(nn.Module):
 
         if packs_aux:
             return hidden_states, aux_hidden_states.finalize()
-        if self.dspark_layers_to_capture is not None:
+        if self.capture_layer_ids is not None:
             return hidden_states, aux_hidden_states
         return hidden_states
 
     @property
+    def capture_layer_ids(self) -> Optional[tuple[int, ...]]:
+        """Zero-based layers whose output stream the draft captures: DSPARK
+        names them as such, EAGLE3 as one-based completed layers."""
+        if self.dspark_layers_to_capture is not None:
+            return tuple(self.dspark_layers_to_capture)
+        if self.eagle3_layers_to_capture is not None:
+            return tuple(layer_id - 1 for layer_id in self.eagle3_layers_to_capture)
+        return None
+
+    @property
     def packs_aux_hidden_states(self) -> bool:
         # PP stages keep the list: inherited captures arrive pre-concatenated.
-        return (
-            self.dspark_layers_to_capture is not None and self.pp_group.world_size == 1
-        )
+        return self.capture_layer_ids is not None and self.pp_group.world_size == 1
+
+    def _capture_bank_stream(
+        self,
+        layer_idx: int,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        # kimi-k3-eagle3.1-mla is trained on the plain prefix stream; DSPARK on
+        # the bank mixture its next consumer would read.
+        if self.eagle3_layers_to_capture is not None:
+            return residual_batch.snapshot(hidden_states, forward_batch)
+        return self._dspark_capture_stream(layer_idx, hidden_states, forward_batch)
 
     def _dspark_capture_stream(
         self,
@@ -3032,7 +3050,9 @@ class KimiK3LinearForCausalLM(nn.Module):
         return self.model.embed_tokens
 
     def get_pp_proxy_dspark_hidden_size(self) -> int:
-        layers = self.model.dspark_layers_to_capture or []
+        # Captures banked by earlier stages ride the proxy, for DSPARK and
+        # EAGLE3 alike (capture_layer_ids is zero-based for both).
+        layers = self.model.capture_layer_ids or ()
         return self.config.hidden_size * sum(
             layer < self.model.start_layer - 1 for layer in layers
         )
@@ -3040,7 +3060,10 @@ class KimiK3LinearForCausalLM(nn.Module):
     def get_aux_hidden_states_width(self) -> int:
         if not self.model.packs_aux_hidden_states:
             return 0
-        return len(self.model.dspark_layers_to_capture) * self.config.hidden_size
+        return len(self.model.capture_layer_ids) * self.config.hidden_size
+
+    def get_embed_and_head(self):
+        return self.model.embed_tokens.weight, self.lm_head.weight
 
     def set_dspark_layers_to_capture(self, layer_ids: list[int]) -> None:
         if layer_ids is None:
@@ -3060,6 +3083,38 @@ class KimiK3LinearForCausalLM(nn.Module):
         # DFLASH target_layer_ids name layer outputs, which is what the DSPARK
         # taps already capture here, so reuse them without the usual +1 shift.
         self.set_dspark_layers_to_capture(layer_ids)
+
+    def set_eagle3_layers_to_capture(
+        self, layer_ids: Optional[list[int]] = None
+    ) -> None:
+        # One-based completed-layer ids, the draft config's convention
+        # ([2, 46, 90] on the 93-layer target); the model taps the plain
+        # prefix stream after those layers.
+        # Every PP stage keeps the ids: earlier stages capture their layers
+        # and forward them on the proxy, as for DSPARK.
+        if self.model.carries_bank_slices:
+            raise RuntimeError(
+                "the model keeps each rank's shard of the rows across SP-MoE "
+                "layers (SGLANG_K3_SP_ATTN_RES), which leaves no layer output "
+                "to capture whole"
+            )
+        num_layers = self.config.num_hidden_layers
+        if layer_ids is None:
+            layer_ids = [2, num_layers // 2, num_layers - 3]
+        selected = list(layer_ids)
+        if selected != sorted(selected) or len(set(selected)) != len(selected):
+            raise ValueError(
+                "K3 EAGLE3 layer ids must be unique and sorted ascending, "
+                f"got {selected}."
+            )
+        invalid = [val for val in selected if not 1 <= val <= num_layers]
+        if invalid:
+            raise ValueError(
+                "K3 EAGLE3 layer ids are one-based completed-layer ids; got "
+                f"invalid ids {invalid} for {num_layers} layers."
+            )
+        self.capture_aux_hidden_states = True
+        self.model.eagle3_layers_to_capture = tuple(selected)
 
     @torch.no_grad()
     def forward(
@@ -3562,6 +3617,22 @@ class KimiK3ForConditionalGeneration(nn.Module):
                 "DSPARK layer capture is not available in encoder-only mode"
             )
         self.language_model.set_dspark_layers_to_capture(layer_ids)
+
+    def set_eagle3_layers_to_capture(
+        self, layer_ids: Optional[list[int]] = None
+    ) -> None:
+        if self.language_model is None:
+            raise AttributeError(
+                "EAGLE3 layer capture is not available in encoder-only mode"
+            )
+        self.language_model.set_eagle3_layers_to_capture(layer_ids)
+
+    def get_embed_and_head(self):
+        if self.language_model is None:
+            raise AttributeError(
+                "get_embed_and_head() is not available in encoder-only mode"
+            )
+        return self.language_model.get_embed_and_head()
 
     def get_aux_hidden_states_width(self) -> int:
         if self.language_model is None:
