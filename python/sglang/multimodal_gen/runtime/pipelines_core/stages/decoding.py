@@ -239,6 +239,8 @@ class DecodingStage(PipelineStage):
         normalized_on_frames = (
             (lambda frames: on_frames(_to_unit_range(frames)))
             if on_frames is not None
+            and isinstance(self.vae, ParallelTiledVAE)
+            and self.vae.supports_decode_on_frames
             else None
         )
         image = self.decode_raw(
@@ -247,7 +249,15 @@ class DecodingStage(PipelineStage):
             vae_dtype=vae_dtype,
             on_frames=normalized_on_frames,
         )
-        return _to_unit_range(image)
+        image = _to_unit_range(image)
+        if (
+            on_frames is not None
+            and normalized_on_frames is None
+            and image.ndim == 5
+            and image.shape[:2] == (1, 3)
+        ):
+            on_frames(image)
+        return image
 
     @torch.no_grad()
     def decode_raw(
@@ -361,6 +371,8 @@ class DecodingStage(PipelineStage):
         if (
             type(self).forward is not DecodingStage.forward
             or type(self).decode is not DecodingStage.decode
+            or not isinstance(self.vae, ParallelTiledVAE)
+            or not self.vae.supports_decode_on_frames
             or batch.return_trajectory_decoded
             or not isinstance(batch.latents, torch.Tensor)
         ):

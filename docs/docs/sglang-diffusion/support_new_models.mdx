@@ -169,8 +169,10 @@ LTX, extend that implementation before starting from an empty file.
 ## Video encode hand-off
 
 Reuse `EncodeWhileDecoding` and `streamed_video_output_path` instead of adding a
-model-specific ffmpeg writer. The shared `DecodingStage` already hands over the
-completed RGB video for VAEs without callbacks; no decoder modification is needed.
+model-specific ffmpeg writer. Explicit `DecodingStage.decode(..., on_frames=...)`
+calls can hand over the completed RGB video for VAEs without callbacks; no decoder
+modification is needed. This whole-clip path is not automatically enabled:
+ordinary decoders already use GPU-direct saving and may not benefit.
 To overlap encoding with existing incremental decoding, a native VAE can declare
 `supports_decode_on_frames = True` and accept `decode(..., on_frames=callback)`.
 Emit read-only `[1, 3, T, H, W]` runs in presentation order, only after overlap

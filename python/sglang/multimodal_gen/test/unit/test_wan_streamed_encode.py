@@ -241,6 +241,7 @@ class TestStreamedEncode(CustomTestCase):
         stage = _stage(_vae(config, "cuda"), server_args)
         # The shared stage must not inject a keyword into an ordinary decoder.
         stage.vae.supports_decode_on_frames = False
+        self.assertIsNone(stage._encode_while_decoding(_video_request(), server_args))
         expected = torch.randn(1, 3, 5, 40, 48, device="cuda")
         decode = mock.Mock(side_effect=lambda latents: expected)
         for output in (expected, expected[:, :, 0]):
