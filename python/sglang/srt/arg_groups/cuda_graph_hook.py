@@ -22,7 +22,6 @@ from sglang.srt.model_executor.cuda_graph_config import (
     default_cuda_graph_config,
     with_phase,
 )
-from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import (
     parse_connector_type,
 )
@@ -324,24 +323,15 @@ def apply_inkling_prefill_cuda_graph_default(server_args: Any):
     ):
         return
     arch = model_config_of(server_args).hf_config.architectures[0]
-    if arch not in (
+    if arch in (
         "InklingForConditionalGeneration",
         "InklingForConditionalGenerationMTP",
     ):
-        return
-    # Only fa4 captures EXTEND; an unset backend defaults to fa4 on SM90/SM100.
-    prefill_backend, _ = attention_backends_of(cfg)
-    if prefill_backend is None:
-        platform = get_platform()
-        if not (platform.is_sm90 or platform.is_sm100):
-            return
-    elif prefill_backend != "fa4":
-        return
-    declare_resolution(
-        server_args,
-        "_apply_inkling_prefill_cuda_graph_default",
-        cuda_graph_backend_prefill=Backend.FULL,
-    )
+        declare_resolution(
+            server_args,
+            "_apply_inkling_prefill_cuda_graph_default",
+            cuda_graph_backend_prefill=Backend.FULL,
+        )
 
 
 def apply_muse_glimmer_prefill_cuda_graph_max_bs_default(server_args: Any):
