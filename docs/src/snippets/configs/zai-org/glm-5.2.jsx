@@ -97,7 +97,7 @@ sgl-eval run aime25 \\
     gb300: "lmsysorg/sglang:latest",
     b300:  "lmsysorg/sglang:latest",
     mi355x: "lmsysorg/sglang-rocm:v0.5.13.post1-rocm720-mi35x-20260618",
-    "mi355x|mxfp4": "lmsysorg/sglang-rocm:v0.5.20-rocm720-mi35x-20260923",
+    "mi355x|mxfp4": "lmsysorg/sglang-rocm:v0.5.21-rocm720-mi35x-20261008",
     mi325x: "lmsysorg/sglang-rocm:v0.5.13.post1-rocm700-mi30x-20260616",
     mi300x: "lmsysorg/sglang-rocm:v0.5.13.post1-rocm700-mi30x-20260616",
   },
@@ -997,11 +997,13 @@ sgl-eval run aime25 \\
     // weights fit a 4-GPU slice, mirroring the amd/GLM-5.1-MXFP4 MI355X recipe (same DSA
     // architecture family) — --trust-remote-code (Quark custom quant config)
     // and --kv-cache-dtype fp8_e4m3 both come from that precedent. Pinned to a
-    // newer image (v0.5.20, see dockerImages["mi355x|mxfp4"]) than the FP8/BF16
+    // newer image (v0.5.21, see dockerImages["mi355x|mxfp4"]) than the FP8/BF16
     // mi355x cells. Low-Latency uses validated TP8/EP1; High-Throughput uses
     // validated TP4/EP4. Both use five-step MTP from InferenceX PR #2900.
     // DSA backend: triton (SGLang's ROCm default). Five-step MTP cells select
-    // the top-k v2 indexer kernel, matching InferenceX PR #3724.
+    // the top-k v2 indexer kernel, matching InferenceX PR #3724. Their 32K
+    // prefill chunks, 0.85 static memory fraction and 180 GB/rank TP4/EP4
+    // HiCache host pool match InferenceX PR #3851.
     // ====================================================================
     {
       match: { hw: "mi355x", variant: "default", quant: "mxfp4", strategy: "low-latency", nodes: "single" },
@@ -1019,8 +1021,8 @@ sgl-eval run aime25 \\
         "--speculative-num-steps 5",
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 6",
-        "--chunked-prefill-size 131072",
-        "--mem-fraction-static 0.80",
+        "--chunked-prefill-size 32768",
+        "--mem-fraction-static 0.85",
         "--watchdog-timeout 1200",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -1062,8 +1064,9 @@ sgl-eval run aime25 \\
         "--speculative-num-steps 5",
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 6",
+        "--chunked-prefill-size 32768",
         "--enable-hierarchical-cache",
-        "--hicache-ratio 1.0",
+        "--hicache-size 180",
         "--mem-fraction-static 0.85",
         "--cuda-graph-max-bs-decode 256",
         "--max-running-requests 256",
