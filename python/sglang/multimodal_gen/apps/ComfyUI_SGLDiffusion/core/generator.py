@@ -9,6 +9,7 @@ import os
 from ..executors.flux import FluxExecutor
 from ..executors.minimax_h3 import MiniMaxH3Executor
 from ..executors.zimage import ZImageExecutor
+from .preflight import check_sgld_options
 
 logger = logging.getLogger(__name__)
 
@@ -101,10 +102,16 @@ def _load_state_dict_for_detection(model_path: str):
 
 try:
     from sglang.multimodal_gen import DiffGenerator
-except ImportError:
+except ImportError as exc:
+    # Keep the nodes importable so ComfyUI shows this; fail clearly on first use.
+    _RUNTIME_IMPORT_ERROR: ImportError | None = exc
     logger.error(
-        "Error: sglang.multimodal_gen is not installed. Please install it using 'pip install sglang[diffusion]'"
+        "Failed to import the SGLang diffusion runtime: %r. Install the diffusion "
+        "extras with 'pip install sglang[diffusion]'.",
+        exc,
     )
+else:
+    _RUNTIME_IMPORT_ERROR = None
 
 
 def _load_executor_classes():
@@ -185,6 +192,10 @@ class SGLDiffusionGenerator:
         """Initialize the diffusion generator."""
         if self.generator is not None:
             return self.generator
+        if _RUNTIME_IMPORT_ERROR is not None:
+            raise RuntimeError(
+                "SGLang diffusion runtime failed to import"
+            ) from _RUNTIME_IMPORT_ERROR
         if kwargs is None:
             kwargs = {}
         # Set comfyui_mode for ComfyUI integration
@@ -194,12 +205,24 @@ class SGLDiffusionGenerator:
         # policy otherwise sets dit_cpu_offload=True and every sampler step
         # reloads the DiT from CPU.
         kwargs.setdefault("dit_cpu_offload", False)
+        # ComfyUI sends cond and uncond as separate requests, so worker-side CFG
+        # parallel only recomputes; its auto-enable also needs a model_index.json,
+        # which a non-H3 single file lacks, and fails worker startup on >= 2 GPUs.
+        if not kwargs.get("enable_cfg_parallel"):
+            kwargs.setdefault("cfg_parallel_degree", 1)
         kwargs = self._server_args_kwargs(kwargs)
-        self.generator = DiffGenerator.from_pretrained(
-            model_path=model_path,
-            pipeline_class_name=pipeline_class_name,
-            **kwargs,
-        )
+        try:
+            self.generator = DiffGenerator.from_pretrained(
+                model_path=model_path,
+                pipeline_class_name=pipeline_class_name,
+                **kwargs,
+            )
+        except EOFError as error:
+            # A worker that raises while loading closes its pipe without a message.
+            raise RuntimeError(
+                "The SGLD worker exited while loading the model; its traceback is in "
+                "the ComfyUI console output above this error"
+            ) from error
         return self.generator
 
     @staticmethod
@@ -391,6 +414,14 @@ class SGLDiffusionGenerator:
         }
         sgld_options = dict(raw_sgld_options)
         model_options = dict(reload_kwargs["model_options"])
+        if model_options.get("dtype") is not None:
+            # Only the ComfyUI architecture companion would get this dtype; the
+            # worker loads its own weights, so the choice would be silently lost.
+            raise ValueError(
+                "SGLDUNETLoader weight_dtype must be 'default': the SGLD worker "
+                "does not use it; select quantization in SGLDOptions instead"
+            )
+        check_sgld_options(sgld_options)
         plugin_flags = {}
         if "enable_cache_dit" in sgld_options:
             plugin_flags["enable_cache_dit"] = sgld_options.pop("enable_cache_dit")

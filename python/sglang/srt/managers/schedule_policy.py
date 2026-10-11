@@ -751,12 +751,14 @@ class PrefillAdder:
         )
 
     def _get_running_request_total_token_offset(self, req: Req) -> int:
+        # Fixed-length requests cannot benefit from the early-EOS estimate.
+        ratio = 1.0 if req.sampling_params.ignore_eos else self.new_token_ratio
         return (
             min(
                 (req.sampling_params.max_new_tokens - len(req.output_ids)),
                 CLIP_MAX_NEW_TOKENS,
             )
-            * self.new_token_ratio
+            * ratio
         )
 
     @property
@@ -1357,7 +1359,8 @@ class PrefillAdder:
                 ):
                     full_load_tokens = req.host_hit_length
                     if (
-                        isinstance(self.tree_cache, UnifiedRadixCache)
+                        self.memory_budget.load_back_needs_full_tokens
+                        and isinstance(self.tree_cache, UnifiedRadixCache)
                         and self.tree_cache.buffer_pipeline is None
                         and not (
                             self.tree_cache.linker is not None

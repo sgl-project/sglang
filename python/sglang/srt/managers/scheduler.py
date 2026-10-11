@@ -671,6 +671,7 @@ class Scheduler(
         # Init prefill kv split size when deterministic inference is enabled with various attention backends
         self.init_deterministic_inference_config()
         self.init_dsa_kpool_truncation_align()
+        self.check_truncation_align_fits_chunk()
 
         self.init_weight_updater()
 
@@ -1671,12 +1672,11 @@ class Scheduler(
             self.truncation_align_size = None
             return
 
+        # Only flashinfer needs chunks on its prefill split tiles; triton tiles
+        # keys at absolute positions (align_window_kv_to_tiles).
         backend_sizes = {
             "flashinfer": ("SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE", 4096),
-            "triton": ("SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE", 4096),
         }
-        # Both entries are prefill knobs (SPLIT_TILE / PREFILL_TRUNCATION):
-        # the prefill half decides.
         prefill_backend, _ = attention_backends()
         env_var, default_size = backend_sizes.get(prefill_backend, (None, None))
         self.truncation_align_size = (
@@ -1704,6 +1704,31 @@ class Scheduler(
             self.truncation_align_size = math.lcm(
                 self.truncation_align_size, dsa_index_kpool
             )
+
+    def check_truncation_align_fits_chunk(self):
+        """A chunk shorter than the alignment truncates to zero tokens, so a prompt
+        longer than the chunk would wait in the queue forever."""
+        align = self.truncation_align_size
+        chunk = self.chunked_prefill_size
+        if align is None or chunk is None or chunk >= align:
+            return
+        if self.disaggregation_mode == DisaggregationMode.DECODE:
+            # A decode server never prefills a prompt.
+            return
+        attn_dp_size = get_parallel().attn_dp_size
+        dp_note = (
+            f" (--chunked-prefill-size is split across {attn_dp_size} DP attention ranks)"
+            if attn_dp_size > 1
+            else ""
+        )
+        raise ValueError(
+            f"Chunked prefill is aligned to {align} tokens, but each rank's "
+            f"chunked prefill size is {chunk}{dp_note}; a prompt longer than "
+            f"{chunk} tokens could never be scheduled. Raise --chunked-prefill-size "
+            f"to at least {align * attn_dp_size}, or, with the flashinfer backend "
+            f"under deterministic inference, lower "
+            f"SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE."
+        )
 
     def init_request_dispatcher(self):
         self._request_dispatcher = TypeBasedDispatcher(
@@ -2725,7 +2750,6 @@ class Scheduler(
     def _maybe_namespace_elastic_radix_cache(self, req: Req) -> None:
         if (
             get_exec().moe.elastic_ep_backend is None
-            or self.disable_radix_cache
             or not self.tree_cache.supports_prefix_sharing()
         ):
             return
@@ -5365,7 +5389,7 @@ class Scheduler(
             )
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
             if self.disaggregation_mode == DisaggregationMode.DECODE:
-                if get_disagg().disaggregation_decode_host_receive_threshold > 0:
+                if get_disagg().disaggregation_decode_host_receive_threshold < 1:
                     discard_kv_cache_backup(req, self.tree_cache, "host_pool")
                 if self.enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
@@ -5503,6 +5527,8 @@ class Scheduler(
                 req.tmp_end_idx = min(req.extend_end, len(req.origin_input_ids))
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
+        elif self.enable_overlap_mlx:
+            self._drain_mlx_pending_jobs()
 
         retract_reqs = [r for r in self.running_batch.reqs if not r.finished()]
         if (
