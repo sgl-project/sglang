@@ -9,6 +9,7 @@ from sglang.srt.speculative.dspark_components.dspark_draft import (
     DraftNoise,
     draft_markov_block,
     select_draft_hidden_without_anchor,
+    step_logits_width,
 )
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 
@@ -127,7 +128,7 @@ class DsparkDraftSampler:
 
 def _step_logits_width(model) -> int:
     # Unsharded base logits span the cropped vocab.
-    return model.markov_head.step_logits_width(int(model.lm_head.org_vocab_size))
+    return step_logits_width(model.markov_head, int(model.lm_head.org_vocab_size))
 
 
 def _step_logits_dtype(model) -> torch.dtype:

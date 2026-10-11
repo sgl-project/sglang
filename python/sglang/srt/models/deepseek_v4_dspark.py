@@ -47,6 +47,7 @@ from sglang.srt.models.deepseek_v4 import (
 from sglang.srt.models.dspark import (
     BaseDSparkMarkovHead,
     DSparkConfidenceHead,
+    VocabShard,
     gather_and_crop_vocab,
     project_through_lm_head,
 )
@@ -467,6 +468,9 @@ class DSparkV4MarkovHead(BaseDSparkMarkovHead):
             num_embeddings_per_partition=per_partition,
             num_embeddings_padded=num_padded,
         )
+        self.vocab_shard = VocabShard(
+            start=self._tp_shard.org_vocab_start, gather=self._vocab_gather
+        )
 
     def get_prev_embeddings(self, token_ids: torch.Tensor) -> torch.Tensor:
         return self.markov_w1(token_ids.long())
@@ -503,20 +507,6 @@ class DSparkV4MarkovHead(BaseDSparkMarkovHead):
         # The bias is FP32 or upcast into an FP32 add, sharded or not.
         del base_dtype
         return torch.float32
-
-    def _vocab_shard_args(self) -> dict:
-        shard = self._tp_shard
-        if shard is None:
-            return {}
-        return dict(
-            vocab_start=shard.org_vocab_start,
-            gather=self._vocab_gather.gather_stacked,
-            gather_logits=self._vocab_gather,
-        )
-
-    def step_logits_width(self, base_width: int) -> int:
-        # Kept step logits are gathered whole over the sharded vocab.
-        return base_width if self._tp_shard is None else self.vocab_size
 
     def forward(self, token_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         embed = self.get_prev_embeddings(token_ids)
