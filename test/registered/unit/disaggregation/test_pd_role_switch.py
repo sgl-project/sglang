@@ -305,7 +305,7 @@ class TestPdRoleSwitchStartupValidation(unittest.TestCase):
         base = dict(
             disaggregation_transfer_backend="mori",
             disaggregation_mode="prefill",
-            disaggregation_decode_host_receive_threshold=0.0,
+            disaggregation_decode_host_receive_threshold=1.0,
             enable_pd_role_switch=True,
             attn_dp_size=1,
             ep_join_mode=None,
