@@ -28,7 +28,7 @@ each layer's ``mlp`` takes K2 (``SGLANG_QWEN3_8_DENSE_MONO_K2``, its half of the
 intermediate, from the stock post_attention_layernorm's output) up to down's
 partial. The all-reduces, the norms, attention and its o_proj stay stock.
 
-Each kernel takes steps up to its row cap, by TP: K1 8 rows; K2 4 at TP1 and 8
+Each kernel takes steps up to its row cap, by TP: 4 rows each at TP1, 8 each
 at TP2. ``SGLANG_QWEN3_8_DENSE_MONO_K1_MAX_ROWS`` / ``_K2_MAX_ROWS`` override
 them (up to 8 at TP1, 16 at TP2). A step wider than one kernel's cap runs that
 part stock: at TP1 a step wider than K2's runs K1, then the stock out_proj,
@@ -55,7 +55,7 @@ _CHECK_SLOTS = 4
 
 # K1's and K2's default row caps by TP. Chosen on MI355X with the AITER ASM FP4
 # GEMM as the stock path; re-measure when that path changes.
-_DEFAULT_ROWS = {1: (8, 4), 2: (8, 8)}
+_DEFAULT_ROWS = {1: (4, 4), 2: (8, 8)}
 
 
 def enabled() -> bool:

@@ -234,9 +234,9 @@ class RowCapsTest(CustomTestCase):
         k1 = envs.SGLANG_QWEN3_8_DENSE_MONO_K1_MAX_ROWS
         k2 = envs.SGLANG_QWEN3_8_DENSE_MONO_K2_MAX_ROWS
         for v1, v2, want1, want2 in (
-            (None, None, (8, 4), (8, 8)),
+            (None, None, (4, 4), (8, 8)),
             (6, 2, (6, 2), (6, 2)),
-            (None, 16, (8, 8), (8, 16)),
+            (None, 16, (4, 8), (8, 16)),
             (0, 99, (1, 8), (1, 16)),
         ):
             with self.subTest(k1=v1, k2=v2), k1.override(v1), k2.override(v2):
