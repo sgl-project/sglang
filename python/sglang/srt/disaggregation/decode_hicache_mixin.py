@@ -159,25 +159,24 @@ class DecodeHiCachePreallocMixin:
         return sum(
             dr.prefix_match.restore_token_count
             for dr in self.transfer_queue.queue
-            if dr.prefix_match is not None
-            and dr.hicache_restore_status == HiCacheRestoreResult.PENDING
-            and dr.hicache_restore_lock is None
+            if dr.prefix_match is not None and dr.hicache_restore_lock is None
         )
 
 
 class HiCacheRestoreGatedKVReceiver:
-    """Wraps a kv_receiver so KVPoll.Success is gated on HiCache restore READY."""
+    """Wraps a kv_receiver so the HiCache restore outcome enters the KV poll."""
 
     def __init__(self, decode_req: DecodeRequest):
         self.decode_req = decode_req
 
     def poll(self) -> KVPoll:
         poll = self.decode_req.kv_receiver.poll()
-        if (
-            poll == KVPoll.Success
-            and self.decode_req.hicache_restore_status == HiCacheRestoreResult.PENDING
-        ):
-            return KVPoll.Transferring
+        if poll == KVPoll.Success:
+            restore_status = self.decode_req.hicache_restore_status
+            if restore_status == HiCacheRestoreResult.PENDING:
+                return KVPoll.Transferring
+            if restore_status == HiCacheRestoreResult.FAILED:
+                return KVPoll.Failed
         return poll
 
 

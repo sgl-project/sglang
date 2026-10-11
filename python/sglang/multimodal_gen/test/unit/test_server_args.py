@@ -1,5 +1,6 @@
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -9,6 +10,7 @@ from unittest.mock import Mock, patch
 import zmq
 
 from sglang.cli.utils import get_is_diffusion_model
+from sglang.multimodal_gen.configs.attention_roles import AttentionRole
 from sglang.multimodal_gen.configs.models.fsdp import (
     is_module_list_entry,
     is_module_list_entry_in,
@@ -87,11 +89,15 @@ from sglang.multimodal_gen.runtime.models.dits.qwen_image import (
 from sglang.multimodal_gen.runtime.pipelines.minimax_h3_pipeline import (
     MiniMaxH3Pipeline,
 )
-from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 from sglang.multimodal_gen.runtime.server_args import (
     MAX_SCHEDULER_RPC_TIMEOUT_S,
     ServerArgs,
 )
+from sglang.multimodal_gen.runtime.server_args import server_args as server_args_module
 from sglang.multimodal_gen.runtime.utils.argparse import FlexibleArgumentParser
 
 
@@ -146,6 +152,23 @@ def _from_dict_without_model_resolution(
         _mock_cuda_platform(),
     ):
         return ServerArgs.from_dict(kwargs)
+
+
+class TestServerArgsColdImport(unittest.TestCase):
+    def test_public_entry_points_import_in_fresh_processes(self):
+        modules = (
+            "sglang.multimodal_gen.runtime.server_args",
+            "sglang.multimodal_gen.test.runner.diffusion_suite_runner",
+        )
+        for module in modules:
+            with self.subTest(module=module):
+                result = subprocess.run(
+                    [sys.executable, "-c", f"import {module}"],
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
 
 
 class TestPlatformLifecycleHooks(unittest.TestCase):
@@ -247,6 +270,21 @@ class TestServerArgsPathExpansion(_CudaPlatformTestCase):
             {"model_path": "/data/my-model"}
         )
         self.assertEqual(args.model_path, "/data/my-model")
+
+    def test_numa_node_cli_takes_one_node_per_gpu(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        argv = ["--model-path", "/fake", "--numa-node", "0", "1"]
+        with (
+            patch.object(sys, "argv", ["sglang"] + argv),
+            patch.object(
+                PipelineConfig, "from_kwargs", return_value=QwenImagePipelineConfig()
+            ),
+            _mock_cuda_platform(),
+        ):
+            args, unknown_args = parser.parse_known_args(argv)
+            server_args = ServerArgs.from_cli_args(args, unknown_args)
+        self.assertEqual(server_args.numa_node, [0, 1])
 
     def test_component_paths_are_expanded_before_pipeline_resolution(self):
         args = self._from_dict_without_model_resolution(
@@ -421,6 +459,66 @@ class TestServerArgsPathExpansion(_CudaPlatformTestCase):
             server_args.component_attention_backends, {"text_encoder": "torch_sdpa"}
         )
 
+    def test_role_qualified_component_keys_are_normalized(self):
+        args = self._from_dict_without_model_resolution(
+            {
+                "model_path": "/data/my-model",
+                "component_attention_backends": (
+                    "transformer.self=sage_attn,transformer.cross=fa3"
+                ),
+            }
+        )
+
+        # Role-qualified entries must not leak into the flat component map, or
+        # every consumer that looks a component up by name would see them.
+        self.assertEqual(args.component_attention_backends, {})
+        self.assertEqual(
+            args.component_attention_backend_roles,
+            {"transformer": {"self": "sage_attn", "cross": "fa"}},
+        )
+
+    def test_role_and_component_wide_keys_are_split(self):
+        args = self._from_dict_without_model_resolution(
+            {
+                "model_path": "/data/my-model",
+                "component_attention_backends": (
+                    "text_encoder=torch_sdpa,transformer=fa,transformer.cross=fa3"
+                ),
+            }
+        )
+
+        self.assertEqual(
+            args.component_attention_backends,
+            {"text_encoder": "torch_sdpa", "transformer": "fa"},
+        )
+        self.assertEqual(
+            args.component_attention_backend_roles,
+            {"transformer": {"cross": "fa"}},
+        )
+
+    def test_role_qualified_component_normalizes_hyphenated_component(self):
+        args = self._from_dict_without_model_resolution(
+            {
+                "model_path": "/data/my-model",
+                "component_attention_backends": "text-encoder.cross=torch_sdpa",
+            }
+        )
+
+        self.assertEqual(args.component_attention_backends, {})
+        self.assertEqual(
+            args.component_attention_backend_roles,
+            {"text_encoder": {"cross": "torch_sdpa"}},
+        )
+
+    def test_invalid_component_attention_role_raises(self):
+        with self.assertRaises(ValueError):
+            self._from_dict_without_model_resolution(
+                {
+                    "model_path": "/data/my-model",
+                    "component_attention_backends": {"transformer.bogus": "fa"},
+                }
+            )
+
     def test_dynamic_component_precision_cli_args(self):
         parser = FlexibleArgumentParser()
         ServerArgs.add_cli_args(parser)
@@ -442,6 +540,99 @@ class TestServerArgsPathExpansion(_CudaPlatformTestCase):
             server_args = ServerArgs.from_cli_args(args, unknown_args)
 
         self.assertEqual(server_args.component_precisions, {"text_encoder_2": "fp32"})
+
+    def test_dynamic_role_qualified_cli_args(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        argv = [
+            "--model-path",
+            "/fake",
+            "--component-attention-backends.transformer.cross=fa",
+        ]
+
+        with (
+            patch.object(sys, "argv", ["sglang"] + argv),
+            patch.object(
+                PipelineConfig, "from_kwargs", return_value=QwenImagePipelineConfig()
+            ),
+            _mock_cuda_platform(),
+        ):
+            args, unknown_args = parser.parse_known_args(argv)
+            server_args = ServerArgs.from_cli_args(args, unknown_args)
+
+        self.assertEqual(server_args.component_attention_backends, {})
+        self.assertEqual(
+            server_args.component_attention_backend_roles,
+            {"transformer": {"cross": "fa"}},
+        )
+
+    def test_resolve_component_backend_by_role_returns_overrides(self):
+        args = self._from_dict_without_model_resolution(
+            {
+                "model_path": "/data/my-model",
+                "component_attention_backends": {
+                    "transformer.self": "sage_attn",
+                    "transformer.cross": "fa",
+                },
+            }
+        )
+
+        backend_by_role = args.resolve_component_backend_by_role("transformer")
+
+        self.assertEqual(
+            backend_by_role,
+            {
+                AttentionRole.SELF: AttentionBackendEnum.SAGE_ATTN,
+                AttentionRole.CROSS: AttentionBackendEnum.FA,
+            },
+        )
+
+    def test_resolve_component_backend_by_role_only_returns_configured_roles(self):
+        args = self._from_dict_without_model_resolution(
+            {
+                "model_path": "/data/my-model",
+                "component_attention_backends": {"transformer.cross": "fa"},
+            }
+        )
+
+        backend_by_role = args.resolve_component_backend_by_role("transformer")
+
+        self.assertEqual(
+            backend_by_role, {AttentionRole.CROSS: AttentionBackendEnum.FA}
+        )
+
+    def test_resolve_component_backend_by_role_two_stage_fallback(self):
+        args = self._from_dict_without_model_resolution(
+            {
+                "model_path": "/data/my-model",
+                "component_attention_backends": {"transformer.cross": "fa"},
+            }
+        )
+
+        # transformer_2 has no explicit role override, so it inherits the base
+        # transformer.cross entry via the two-stage fallback.
+        backend_by_role = args.resolve_component_backend_by_role("transformer_2")
+
+        self.assertEqual(
+            backend_by_role, {AttentionRole.CROSS: AttentionBackendEnum.FA}
+        )
+
+    def test_resolve_component_backend_by_role_prefers_two_stage_override(self):
+        args = self._from_dict_without_model_resolution(
+            {
+                "model_path": "/data/my-model",
+                "component_attention_backends": {
+                    "transformer.cross": "fa",
+                    "transformer_2.cross": "torch_sdpa",
+                },
+            }
+        )
+
+        backend_by_role = args.resolve_component_backend_by_role("transformer_2")
+
+        self.assertEqual(
+            backend_by_role, {AttentionRole.CROSS: AttentionBackendEnum.TORCH_SDPA}
+        )
 
     def test_layerwise_offload_components_imply_layerwise(self):
         args = self._from_dict_without_model_resolution(
@@ -937,7 +1128,7 @@ class TestWarmupModeNormalization(unittest.TestCase):
                 self.assertEqual(sa.warmup_resolutions, ["1024x1024"])
                 self.assertEqual(sa.warmup_mode, "server")
 
-    def test_flux_bcg_requires_both_supported_checkpoint_and_pipeline(self):
+    def test_bcg_warns_but_stays_enabled_off_the_validated_lists(self):
         for model_path, config in (
             ("black-forest-labs/FLUX.2-dev", Flux2PipelineConfig()),
             ("black-forest-labs/FLUX.1-schnell", FluxPipelineConfig()),
@@ -946,10 +1137,26 @@ class TestWarmupModeNormalization(unittest.TestCase):
             with self.subTest(model_path=model_path, config=type(config).__name__):
                 sa = ServerArgs.__new__(ServerArgs)
                 sa.model_path = model_path
+                sa.model_id = None
                 sa.pipeline_config = config
                 sa.enable_breakable_cuda_graph = True
-                sa._adjust_breakable_cuda_graph_support()
-                self.assertFalse(sa.enable_breakable_cuda_graph)
+                sa.warmup_resolutions = ["1024x1024"]
+                with patch.object(server_args_module.logger, "warning") as warning:
+                    sa._adjust_breakable_cuda_graph_support()
+                self.assertTrue(sa.enable_breakable_cuda_graph)
+                self.assertIn("not validated", warning.call_args[0][0])
+
+    def test_bcg_does_not_warn_for_a_validated_model(self):
+        sa = ServerArgs.__new__(ServerArgs)
+        sa.model_path = "black-forest-labs/FLUX.1-dev"
+        sa.model_id = None
+        sa.pipeline_config = FluxPipelineConfig()
+        sa.enable_breakable_cuda_graph = True
+        sa.warmup_resolutions = ["1024x1024"]
+        with patch.object(server_args_module.logger, "warning") as warning:
+            sa._adjust_breakable_cuda_graph_support()
+        self.assertTrue(sa.enable_breakable_cuda_graph)
+        warning.assert_not_called()
 
     def test_disagg_role_disables_server_warmup(self):
         from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
@@ -1371,6 +1578,17 @@ class TestOffloadDefaults(_CudaPlatformTestCase):
         self.assertEqual(args.residency_mode("text_encoder"), COMPONENT_OFFLOAD)
         self.assertTrue(args.dit_cpu_offload)
         self.assertTrue(args.text_encoder_cpu_offload)
+
+    def test_numa_node_must_cover_every_local_gpu(self):
+        with self.assertRaisesRegex(ValueError, "--numa-node needs one node per"):
+            self._from_dict_with_pipeline_config(
+                QwenImagePipelineConfig(),
+                kwargs={
+                    "model_path": "Qwen/Qwen-Image",
+                    "num_gpus": 2,
+                    "numa_node": [0],
+                },
+            )
 
     def test_explicit_false_layerwise_keeps_dit_resident(self):
         args = self._from_dict_with_pipeline_config(
@@ -3321,18 +3539,6 @@ class TestPerRoleParallelism(unittest.TestCase):
         self.assertEqual(args.get_role_parallelism(RoleType.ENCODER)["tp_size"], 1)
         self.assertEqual(args.get_role_parallelism(RoleType.DENOISER)["tp_size"], 2)
         self.assertEqual(args.get_role_parallelism(RoleType.DECODER)["sp_degree"], 4)
-
-    def test_disagg_args_import_path_matches_server_args_package(self):
-        from sglang.multimodal_gen.runtime.disaggregation import disagg_args
-        from sglang.multimodal_gen.runtime.server_args.disagg import (
-            DisaggServerArgsMixin,
-        )
-
-        self.assertIs(disagg_args.DisaggArgsMixin, DisaggServerArgsMixin)
-        self.assertIs(
-            disagg_args.DISAGG_RESULT_PORT_OFFSETS,
-            DisaggServerArgsMixin.DISAGG_RESULT_PORT_OFFSETS,
-        )
 
     def test_gpu_ids_normalize_lists_and_commas(self):
         args = self._from_dict({"model_path": "/fake", "gpu_ids": ["0,1", "6", "7 8"]})

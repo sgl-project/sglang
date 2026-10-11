@@ -55,6 +55,13 @@ class QwenImage21InputValidationStage(InputValidationStage):
         batch = super().forward(batch, server_args)
         if batch.height % 32 or batch.width % 32:
             raise ValueError("Qwen-Image 2.1 height and width must be divisible by 32")
+        batch.sigmas = server_args.pipeline_config.prepare_sigmas(
+            batch.sigmas, batch.num_inference_steps
+        )
+        if not batch.sigmas:
+            raise ValueError("Qwen-Image 2.1 requires a non-empty sigma schedule")
+        # the preset or explicit sigma grid determines the denoising step count
+        batch.num_inference_steps = len(batch.sigmas)
         return batch
 
 
@@ -257,13 +264,6 @@ def prepare_qwen21_mu(batch, server_args):
 
 
 class QwenImage21DenoisingStage(DenoisingStage):
-    def _bcg_pad_prompt_kwargs(
-        self, call_kwargs, current_model=None, force_bucket=None
-    ):
-        # Prefill runs eagerly. Later steps use exact-length prefix KV, so text
-        # padding only creates duplicate graphs without enabling more replay.
-        return call_kwargs
-
     def _predict_noise(
         self,
         current_model,
