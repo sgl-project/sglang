@@ -947,6 +947,7 @@ def _flashinfer_allreduce_fusion_auto_enable(view: Any) -> dict:
             and model_config.dtype == torch.bfloat16
             and view.tp_size in SUPPORTED_TP_SIZES
             and view.attn_cp_size == 1
+            and not view.encoder_only
             and not view.enable_pdmux
         ):
             return {}
