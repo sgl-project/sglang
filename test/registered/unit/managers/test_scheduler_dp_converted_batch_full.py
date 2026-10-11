@@ -36,9 +36,9 @@ class _RunningBatch:
     def is_empty(self):
         return not self.reqs
 
-    def filter_batch(self, chunked_req_to_exclude=()):
+    def filter_batch(self, reqs_to_exclude=()):
         self.reqs = [
-            r for r in self.reqs if not r.finished and r not in chunked_req_to_exclude
+            r for r in self.reqs if not r.finished and r not in reqs_to_exclude
         ]
 
     def merge_batch(self, other):
