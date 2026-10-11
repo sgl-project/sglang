@@ -128,6 +128,7 @@ from sglang.srt.model_executor.runner_utils.forward_batch import set_forward_bat
 from sglang.srt.model_executor.runner_utils.pool import (
     get_or_create_global_graph_capture_stream,
 )
+from sglang.srt.model_executor.runner_utils.prefill_graph import prefill_graph_scope
 from sglang.srt.model_loader.utils import resolve_language_model
 from sglang.srt.runtime_context import (
     get_exec,
@@ -780,6 +781,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     ):
         with (
             set_forward_batch(forward_batch),
+            prefill_graph_scope(
+                full_graph=self._is_full_backend, raw_num_tokens=raw_num_tokens
+            ),
             forward_context(
                 ForwardContext(attn_backend=self.model_runner.attn_backend)
             ),
@@ -913,6 +917,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         with (
             set_forward_batch(fb),
+            prefill_graph_scope(full_graph=self._is_full_backend),
             forward_context(
                 ForwardContext(attn_backend=self.model_runner.attn_backend)
             ),
