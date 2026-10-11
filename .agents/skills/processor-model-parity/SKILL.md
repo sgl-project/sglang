@@ -39,10 +39,12 @@ renders the model:
   give the model a dedicated `ChatFormatter` variant and `render_request` arm, like
   DeepSeek-V4. If `selection.rs` already wires the model to a Dynamo
   `PromptFormatter`, replace that branch.
-- **Python calls `apply_chat_template`** (Jinja, spec `None`): the first such model
-  adds one generic arm that adapts the body into `OAIChatLikeRequest`, in its own
-  PR. sgl-router's `ChatRequest` in
-  `experimental/sgl-router/src/tokenizer/chat_formatter.rs` is a working adapter.
+- **Python calls `apply_chat_template`** (Jinja, spec `None`): give the model a
+  variant holding Dynamo's Jinja `PromptFormatter`, picked in
+  `ChatFormatter::from_tokenizer_config` from the template text as
+  `parser/template_detection.py` picks it, and build the template context that
+  `_process_messages` and `_apply_jinja_template` build, like GLM-5.3
+  (`models/glm53.rs`).
 
 ## Method
 
@@ -142,12 +144,16 @@ renders the model:
 
 `tests/scripts/generate_parity.py` loads the pinned snapshot and resolves the
 spec and per-checkpoint state with SGLang's own resolvers. It then renders every
-case through the real `OpenAIServingChat._apply_jinja_template` and writes:
+case through the real `OpenAIServingChat._process_messages`, under the case's
+`default_chat_template_kwargs` (the server's `--default-chat-template-kwargs`), and
+writes:
 - `prompt`, `token_count` and `token_sha256` for each case, or `error` when
-  Python raises (`name`, `request` and `known_gap` are kept as written). An
-  `AttributeError` aborts instead: the stub server lacks something, so extend it;
+  Python raises (`name`, `request`, `default_chat_template_kwargs` and `known_gap`
+  are kept as written). An `AttributeError` aborts instead: the stub server lacks
+  something, so extend it;
 - the fixture-level `config` (the `config.json` fields the processor reads, plus
-  resolved overrides such as the effort profile) and `bos_token_id`.
+  resolved overrides such as the effort profile), `bos_token_id`, and for a Jinja
+  checkpoint its `chat_template`, so the test renders offline.
 
 ```sh
 cd rust/sglang-processor

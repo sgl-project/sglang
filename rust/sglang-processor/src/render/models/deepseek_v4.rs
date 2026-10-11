@@ -251,7 +251,7 @@ fn tool_arguments(message: &mut Value) -> impl Iterator<Item = &mut Value> {
 
 /// `protocol.py::Function.model_dump()`, in declared field order; the encoder
 /// serializes it verbatim.
-fn normalize_tools(tools: &[Value]) -> Result<Vec<Value>, String> {
+pub(super) fn normalize_tools(tools: &[Value]) -> Result<Vec<Value>, String> {
     tools
         .iter()
         .map(|tool| {
