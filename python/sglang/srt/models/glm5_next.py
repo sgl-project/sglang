@@ -666,6 +666,24 @@ class Glm5NextLinearAttention(nn.Module):
             forget_gate = forget_gate.unsqueeze(0)
         beta = beta.unsqueeze(0)
 
+        # Fused output norm (attempt-and-verify, as in Kimi K3): in target verify,
+        # offer the output-norm gate so the nv_cutedsl verify kernel can fold the
+        # gated RMSNorm into the recurrence. If the backend leaves the gate
+        # unconsumed (another verify backend or an uncovered shape), apply o_norm
+        # here as before.
+        if getattr(self, "_fused_onorm_args", None) is None:
+            # Built on the first (eager) forward, never inside a graph capture. The
+            # verify kernel reads the fp32 weight and eps at positions 5 and 6.
+            self._fused_onorm_args = (None,) * 5 + (
+                self.o_norm.weight.data.float().contiguous(),
+                float(self.o_norm.eps),
+            )
+        fused_onorm = forward_batch.forward_mode.is_target_verify()
+        if fused_onorm:
+            self.attn._k3_fused_decode_args = self._fused_onorm_args
+            self.attn._k3_onorm_gate = g_proj_states
+            self.attn._k3_onorm_consumed = False
+
         core_attn_out = self.attn(
             forward_batch,
             mixed_qkv=mixed_qkv,
@@ -673,8 +691,13 @@ class Glm5NextLinearAttention(nn.Module):
             b=beta,
         )
 
-        norm_gate = g_proj_states.unflatten(-1, (-1, self.head_dim))
-        core_attn_out = self.o_norm(core_attn_out, norm_gate)
+        if fused_onorm:
+            self.attn._k3_fused_decode_args = None
+            self.attn._k3_onorm_gate = None
+            fused_onorm = self.attn._k3_onorm_consumed
+        if not fused_onorm:
+            norm_gate = g_proj_states.unflatten(-1, (-1, self.head_dim))
+            core_attn_out = self.o_norm(core_attn_out, norm_gate)
         core_attn_out = core_attn_out.squeeze(0).flatten(-2)
 
         return cp_sequence_to_interleave_order(
