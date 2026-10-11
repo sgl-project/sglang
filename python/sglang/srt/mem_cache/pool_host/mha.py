@@ -40,6 +40,7 @@ from sglang.srt.mem_cache.pool_host.base import (
 )
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
+    _cuda_host_unregister,
     get_allocator_from_storage,
     make_kernel_ptr_table,
 )
@@ -822,6 +823,7 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
         device: str = "cpu",
         allocator_type: str = "default",
     ):
+        self._destroyed = False
         self.device_pool = device_pool
         self.page_size = anchor_host.page_size
         self.layout = layout
@@ -883,6 +885,15 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
             self.device_pool.device,
             host_memory_registered=self.pin_memory,
         )
+
+    def destroy(self):
+        if self._destroyed:
+            return
+        if self.pin_memory and (_is_cuda or _is_hip):
+            _cuda_host_unregister(self.k_buffer)
+        self.k_buffer = None
+        self.k_data_refs = []
+        super().destroy()
 
     def get_size_per_token(self):
         return self.head_dim * self.head_num * self.layer_num * self.dtype.itemsize

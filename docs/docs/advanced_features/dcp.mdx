@@ -162,7 +162,7 @@ A dense prefill page cannot be copied directly into striped decode storage. The 
 
 The plan includes the exact token count, so stale rows do not leak out of a partial final page. Mooncake and NIXL use the same plan. KDA state keeps its attention-TP mapping and bypasses DCP filtering.
 
-This composition requires Mooncake or NIXL, matching physical page size and KV dtype, prefill attention CP `1`, and decode chunk cache. Decode radix cache and HiCache are not supported here.
+This composition requires Mooncake or NIXL, matching physical page size and KV dtype, and prefill attention CP `1`. Decode radix cache and HiCache are not supported here.
 
 ### DCP × HiCache L2
 

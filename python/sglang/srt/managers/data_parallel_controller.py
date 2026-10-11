@@ -21,6 +21,7 @@ import threading
 import time
 from collections.abc import Callable
 from enum import Enum, auto
+from multiprocessing.connection import Connection, wait
 
 import psutil
 import setproctitle
@@ -146,6 +147,9 @@ class DataParallelController:
         server_args: ServerArgs,
         port_args: PortArgs,
         run_scheduler_process_func: Callable,
+        prelaunched_schedulers: (
+            dict[tuple[int, int], tuple[int, Connection]] | None
+        ) = None,
     ) -> None:
         # Parse args
         self.server_args = server_args
@@ -154,6 +158,7 @@ class DataParallelController:
             get_parallel().load_balance_method
         )
         self.run_scheduler_process_func = run_scheduler_process_func
+        self.prelaunched_schedulers = prelaunched_schedulers
 
         # Init inter-process communication
         self.context = zmq.Context(1 + get_parallel().num_dp_ranks)
@@ -672,7 +677,6 @@ class DataParallelController:
                     rank_port_args.nccl_port = port_args.nccl_port
                     rank_port_args.instance_id = port_args.instance_id
 
-                reader, writer = mp.Pipe(duplex=False)
                 gpu_id = (
                     get_device().base_gpu_id
                     + base_gpu_id
@@ -697,27 +701,34 @@ class DataParallelController:
                 display_dp_rank = dp_rank + offset if dp_rank is not None else None
 
                 with self.env_lock, maybe_reindex_device_id(gpu_id) as gpu_id:
-                    proc = mp.Process(
-                        target=self.run_scheduler_process_func,
-                        args=(
-                            server_args,
-                            rank_port_args,
-                            gpu_id,
-                            tp_rank,
-                            pp_rank,
-                            dp_rank,
-                            writer,
-                            display_tp_rank,
-                            display_dp_rank,
-                            display_moe_ep_rank,
-                        ),
+                    scheduler_args = (
+                        server_args,
+                        rank_port_args,
+                        gpu_id,
+                        tp_rank,
+                        pp_rank,
+                        dp_rank,
                     )
-                    with (
-                        memory_saver_adapter.configure_subprocess(),
-                        numa_utils.configure_subprocess(server_args, gpu_id),
-                    ):
-                        proc.start()
-                self.scheduler_procs.append(proc)
+                    display_ranks = (
+                        display_tp_rank,
+                        display_dp_rank,
+                        display_moe_ep_rank,
+                    )
+                    if self.prelaunched_schedulers is not None:
+                        _, reader = self.prelaunched_schedulers[pp_rank, tp_rank]
+                        reader.send((scheduler_args, display_ranks))
+                    else:
+                        reader, writer = mp.Pipe(duplex=False)
+                        proc = mp.Process(
+                            target=self.run_scheduler_process_func,
+                            args=(*scheduler_args, writer, *display_ranks),
+                        )
+                        with (
+                            memory_saver_adapter.configure_subprocess(),
+                            numa_utils.configure_subprocess(server_args, gpu_id),
+                        ):
+                            proc.start()
+                        self.scheduler_procs.append(proc)
                 scheduler_pipe_readers.append(reader)
 
         # Wait for model to finish loading
@@ -813,11 +824,22 @@ class DataParallelController:
                 self._request_dispatcher(recv_req)
 
 
+def run_scheduler_process_with_init_pipe(run_scheduler_process_func: Callable, pipe):
+    # Unpickling the callable imports the scheduler before waiting for DP setup.
+    kill_itself_when_parent_died()
+    try:
+        scheduler_args, display_ranks = pipe.recv()
+        run_scheduler_process_func(*scheduler_args, pipe, *display_ranks)
+    finally:
+        pipe.close()
+
+
 def run_data_parallel_controller_process(
     server_args: ServerArgs,
     port_args: PortArgs,
     pipe_writer,
     run_scheduler_process_func: Callable = run_scheduler_process,
+    prelaunched_schedulers: dict[tuple[int, int], tuple[int, Connection]] | None = None,
 ):
     setproctitle.setproctitle("sglang::data_parallel_controller")
     faulthandler.enable()
@@ -843,11 +865,13 @@ def run_data_parallel_controller_process(
 
     try:
         controller = DataParallelController(
-            server_args, port_args, run_scheduler_process_func
+            server_args, port_args, run_scheduler_process_func, prelaunched_schedulers
         )
-        scheduler_pids = [
-            proc.pid for proc in controller.scheduler_procs if proc is not None
-        ]
+        scheduler_pids = (
+            [pid for pid, _ in prelaunched_schedulers.values()]
+            if prelaunched_schedulers is not None
+            else [proc.pid for proc in controller.scheduler_procs if proc is not None]
+        )
         init_info = {
             "status": "ready",
             "max_total_num_tokens": controller.max_total_num_tokens,
@@ -865,6 +889,9 @@ def run_data_parallel_controller_process(
         # The primary owns routing for the expanded scheduler set.
         if get_parallel().node_rank == 0 and not get_exec().moe.is_ep_scale_joiner:
             controller.event_loop()
+        if prelaunched_schedulers is not None:
+            # The launcher owns these processes. Their pipes close when they exit.
+            wait([pipe for _, pipe in prelaunched_schedulers.values()])
         for proc in controller.scheduler_procs:
             proc.join()
             logger.error(
