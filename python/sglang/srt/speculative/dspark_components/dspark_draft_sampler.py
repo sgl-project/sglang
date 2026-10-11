@@ -16,8 +16,7 @@ logger = logging.getLogger(__name__)
 
 
 class DsparkDraftSampler:
-    """The draft proposal folded into the draft cuda graph as its tail: the
-    eager path's markov block, run over the graph's hidden states."""
+    """The eager path's markov block, run as the draft cuda graph's tail."""
 
     def __init__(
         self,
@@ -53,8 +52,7 @@ class DsparkDraftSampler:
         )
         self._noise = noise
         self._tp_sync = tp_sync
-        # Staged before each replay: the requests' temperatures and greedy
-        # rows, and the draft temperature the tail reads, 0 for argmax rows.
+        # Staged before each replay; step_temperatures is 0 on argmax rows.
         self.temperatures = torch.ones(
             (self.max_bs,), dtype=torch.float32, device=device
         )
@@ -71,8 +69,7 @@ class DsparkDraftSampler:
         )
 
     def stage_sampling_params(self, *, bs: int, sampling_info) -> None:
-        """Host-side refresh of the static sampling params; must run before the
-        draft graph replay that consumes them."""
+        """Must run before the draft graph replay that reads these buffers."""
         if sampling_info is None:
             self.temperatures[:bs].fill_(1.0)
             self.greedy_mask[:bs].fill_(True)
@@ -133,8 +130,7 @@ def _step_logits_width(model) -> int:
 
 
 def _step_logits_dtype(model) -> torch.dtype:
-    # A quantized lm_head's packed weight carries no logits dtype; its kernel
-    # emits the activation dtype, the draft's own parameter dtype.
+    # A quantized head's packed weight has no logits dtype; it emits the draft's.
     weight = model.lm_head.weight
     if weight.is_floating_point():
         base_dtype = weight.dtype
