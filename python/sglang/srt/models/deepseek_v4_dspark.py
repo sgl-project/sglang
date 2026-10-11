@@ -13,11 +13,7 @@ from sglang.kernels.ops.attention.dsv4 import fused_q_norm_rope, fused_rope_inpl
 from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
     is_unified_kv_triton,
 )
-from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
-    BuildStepLocal,
-    CommitKvProj,
-)
-from sglang.kernels.ops.speculative.dspark.markov_sample import MarkovSampleStep
+from sglang.kernels.ops.speculative.dspark.dspark_draft_model import CommitKvProj
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.distributed.device_communicators.vocab_gather import make_vocab_gather
 from sglang.srt.environ import envs
@@ -458,14 +454,14 @@ class DSparkV4MarkovHead(BaseDSparkMarkovHead):
                 "Disable SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD."
             )
         self._shard_group = shard_group
-        self._vocab_gather = make_vocab_gather(
+        vocab_gather = make_vocab_gather(
             shard_group,
             local_width=per_partition,
             prefer_nvlink=self._is_dsv41
             and envs.SGLANG_DSPARK_NVLINK_VOCAB_GATHER.get(),
         )
         if shard_group.rank == 0:
-            cls_name = type(self._vocab_gather).__name__
+            cls_name = type(vocab_gather).__name__
             logger.info("DSpark markov_w2 vocab gather: %s", cls_name)
         self._tp_shard = MarkovW2ShardGeometry(
             tp_size=tp_size,
@@ -475,7 +471,7 @@ class DSparkV4MarkovHead(BaseDSparkMarkovHead):
             num_embeddings_padded=num_padded,
         )
         self.vocab_shard = VocabShard(
-            start=self._tp_shard.org_vocab_start, gather=self._vocab_gather
+            start=self._tp_shard.org_vocab_start, gather=vocab_gather
         )
 
     def get_prev_embeddings(self, token_ids: torch.Tensor) -> torch.Tensor:
@@ -509,51 +505,10 @@ class DSparkV4MarkovHead(BaseDSparkMarkovHead):
             return F.linear(latent.to(weight_local.dtype), weight_local), state
         return F.linear(latent.float(), weight_local), state
 
-    def step_logits(
-        self, base_logits: torch.Tensor, bias: torch.Tensor
-    ) -> torch.Tensor:
-        if self._tp_shard is None:
-            return base_logits + bias
-        step_local = BuildStepLocal.execute(bias=bias, base_local=base_logits)
-        full = self._vocab_gather(step_local)
-        return full[..., : self.vocab_size]
-
     def step_logits_dtype(self, base_dtype: torch.dtype) -> torch.dtype:
         # The bias is FP32 or upcast into an FP32 add, sharded or not.
         del base_dtype
         return torch.float32
-
-    @property
-    def supports_sharded_greedy(self) -> bool:
-        return (
-            self._is_dsv41 and self._tp_shard is not None and self._opt_markov_w2_bf16
-        )
-
-    def sample_block_greedy_fused(self, base_logits, *, first_prev_tokens):
-        if not self.supports_sharded_greedy or not base_logits.is_cuda:
-            return None
-        shard = self._tp_shard
-        prev = first_prev_tokens.long()
-        # The greedy-only variant reads neither, so nothing fills them.
-        greedy = torch.empty(prev.shape[0], dtype=torch.float32, device=prev.device)
-        offset = torch.empty(1, dtype=torch.int64, device=prev.device)
-        tokens = []
-        for step in range(base_logits.shape[1]):
-            bias, _ = self.step_bias(prev, hidden_states=None, state=None)
-            prev = MarkovSampleStep.triton(
-                base_logits=base_logits[:, step],
-                bias=bias,
-                temperatures=greedy,
-                key=0,
-                offset=offset,
-                step=step,
-                step_dtype=torch.float32,
-                vocab_start=shard.org_vocab_start,
-                gather=self._vocab_gather.gather_stacked,
-                has_sampled_rows=False,
-            )
-            tokens.append(prev)
-        return torch.stack(tokens, dim=1)
 
     def forward(self, token_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         embed = self.get_prev_embeddings(token_ids)

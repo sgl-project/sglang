@@ -509,9 +509,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 # from being the intended precision fallback, skipping the
                 # unused hook avoids paying for two proposal computations.
                 if envs.SGLANG_DSPARK_FOLDED_PROPOSAL.get():
-                    self._draft_sampler = self._maybe_build_draft_sampler(
-                        available_memory_gb=available_mem
-                    )
+                    self._draft_sampler = self._maybe_build_draft_sampler()
                     if self._draft_sampler is not None:
                         self.draft_model_runner.capture_tail_hooks.append(
                             make_draft_sampler_capture_hook(self._draft_sampler)
@@ -521,15 +519,15 @@ class DSparkWorkerV2(BaseSpecWorker):
                 capture_decode_cuda_graph=capture_decode_cuda_graph
             )
 
-    def _maybe_build_draft_sampler(self, *, available_memory_gb: float):
+    def _maybe_build_draft_sampler(self):
         return maybe_build_draft_sampler(
             draft_model=self.draft_model,
             gamma=self.gamma,
             max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
             device=self.device,
             tp_rank=self._target_tp_rank,
+            noise=self._proposer.noise,
             tp_sync=self._tp_sync,
-            available_memory_gb=available_memory_gb,
             confidence_fn=(
                 self._verify_planner.compute_confidence_tensor
                 if self._verify_planner.carries_confidence

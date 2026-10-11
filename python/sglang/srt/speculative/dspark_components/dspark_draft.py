@@ -184,14 +184,17 @@ def draft_markov_block(
     noise: DraftNoise,
     tp_sync: SpecTpSync,
     site: SpecTpSyncSite,
+    logits_out: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Returns the drafted tokens and the [bs, gamma, vocab] step logits."""
+    """Returns the drafted tokens and the [bs, gamma, vocab] step logits,
+    written to ``logits_out`` or allocated here."""
     bs, gamma = base_logits.shape[:2]
-    logits_out = torch.empty(
-        (bs, gamma, step_logits_width(markov_head, base_logits.shape[-1])),
-        dtype=markov_head.step_logits_dtype(base_logits.dtype),
-        device=base_logits.device,
-    )
+    if logits_out is None:
+        logits_out = torch.empty(
+            (bs, gamma, step_logits_width(markov_head, base_logits.shape[-1])),
+            dtype=markov_head.step_logits_dtype(base_logits.dtype),
+            device=base_logits.device,
+        )
     state = markov_head.init_state(draft_hidden)
     prev_tokens = anchor_tokens.long()
     draft_tokens = []
@@ -298,6 +301,10 @@ class DraftBlockProposer:
             else None
         )
 
+    @property
+    def noise(self) -> DraftNoise:
+        return self._noise
+
     def attach_draft_sampler(self, draft_sampler) -> None:
         self._draft_sampler = draft_sampler
 
@@ -321,7 +328,6 @@ class DraftBlockProposer:
             else target_model.get_input_embeddings()
         )
         draft_sampler = self._draft_sampler
-        all_greedy = sampling_info is None or sampling_info.is_all_greedy
         fwd = self._run_forward(
             batch=batch,
             draft_input=draft_input,
@@ -341,41 +347,13 @@ class DraftBlockProposer:
             envs.SGLANG_DSPARK_FOLDED_PROPOSAL.get()
             and draft_sampler is not None
             and fwd.can_run_graph
-            and (all_greedy or draft_sampler.folded_sampling)
         ):
             folded = True
-            if draft_sampler.folded_sampling:
-                greedy_mask = draft_sampler.greedy_mask[:bs]
-                temperatures = draft_sampler.temperatures[:bs]
-                # The sampling accept path needs the markov-corrected block
-                # logits; greedy accept only compares tokens.
-                corrected_logits = (
-                    None
-                    if all_greedy
-                    else draft_sampler.corrected_out[: bs * self.gamma].view(
-                        bs, self.gamma, -1
-                    )
-                )
-            else:
-                # Greedy-only folding: the hook argmaxed every row and kept no
-                # sampling buffers, so derive the params on the fly.
-                greedy_mask = resolve_greedy_mask(
-                    bs=bs, sampling_info=sampling_info, device=device
-                )
-                if sampling_info is None:
-                    temperatures = torch.ones(bs, dtype=torch.float32, device=device)
-                else:
-                    temperatures = (
-                        sampling_info.temperatures.view(-1)
-                        .to(torch.float32)
-                        .clamp_min(1e-5)
-                    )
-                corrected_logits = None
             draft_block = DraftBlockResult(
                 draft_tokens=draft_sampler.out[: bs * self.gamma].view(bs, self.gamma),
-                corrected_logits=corrected_logits,
-                greedy_mask=greedy_mask,
-                temperatures=temperatures,
+                corrected_logits=draft_sampler.step_logits[:bs],
+                greedy_mask=draft_sampler.greedy_mask[:bs],
+                temperatures=draft_sampler.temperatures[:bs],
             )
             if draft_sampler.confidence_out is not None:
                 folded_confidence = draft_sampler.confidence_out[:bs]
