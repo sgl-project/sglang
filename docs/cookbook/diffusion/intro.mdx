@@ -14,6 +14,12 @@ Image models generate one image request as a bounded denoising job, usually with
 
 <CardGroup cols={3}>
   <Card
+    title="HunyuanImage-3.0-Instruct"
+    mode="card"
+    href="/cookbook/diffusion/Tencent/HunyuanImage3"
+    img="/cards/logos/tencent.png"
+  />
+  <Card
     title="FLUX"
     mode="card"
     href="/cookbook/diffusion/FLUX/FLUX"
