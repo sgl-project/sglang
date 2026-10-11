@@ -79,7 +79,6 @@ class NanoNemotronVLImageProcessor(BaseMultimodalProcessor):
                 NemotronH_Omni_Reasoning_V3_Config: NemotronH_Omni_Reasoning_V3,
             },
         )
-        Image.MAX_IMAGE_PIXELS = None
         self.image_size = hf_config.image_size
         self.VIDEO_CONTEXT_TOKEN = hf_config.video_context_token
         self.IMG_CONTEXT_TOKEN = hf_config.img_context_token
