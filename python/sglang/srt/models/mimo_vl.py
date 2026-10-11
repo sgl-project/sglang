@@ -180,6 +180,7 @@ class MiMoVisionBlock(nn.Module):
             prefix=add_prefix("attn", prefix),
             num_dummy_heads=num_dummy_heads,
             use_sink=use_sink,
+            sink_mode="first_key",
             window_size=window_size,
             use_data_parallel=use_data_parallel,
         )
