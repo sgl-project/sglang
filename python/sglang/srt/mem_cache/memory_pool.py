@@ -48,6 +48,7 @@ from sglang.kernels.ops.kvcache.cache_move import (
     set_kv_buffer_prefix_valid_tiled,
     set_kv_buffer_prefix_valid_tiled_fp8,
 )
+from sglang.kernels.ops.kvcache.cache_ops import launch_reshape_and_cache_flash
 from sglang.kernels.ops.kvcache.kvcache import can_use_store_cache, store_cache
 from sglang.kernels.ops.quantization.fp8_kernel import (
     fp8_dtype,
@@ -2868,6 +2869,19 @@ class MHATokenToKVPool(KVCache):
             # A slot is [page, :, off, :] (not a contiguous row), so scatter by (page, off).
             k_buf = self.k_buffer[layer_id - self.start_layer]
             v_buf = self.v_buffer[layer_id - self.start_layer]
+            if (
+                _is_cuda
+                and self.head_dim == self.v_head_dim
+                and cache_k.stride()[1:] == cache_v.stride()[1:] == (self.head_dim, 1)
+            ):
+                launch_reshape_and_cache_flash(
+                    cache_k,
+                    cache_v,
+                    k_buf.permute(0, 2, 1, 3),
+                    v_buf.permute(0, 2, 1, 3),
+                    loc,
+                )
+                return
             pages = loc // self.page_size
             offs = loc % self.page_size
             k_buf[pages, :, offs, :] = cache_k
