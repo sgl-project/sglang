@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import msgspec
 import torch
@@ -27,6 +27,9 @@ from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.srt.speculative.spec_utils import draft_tp_context
 from sglang.srt.utils.common import is_pin_memory_available
 from sglang.srt.utils.invariants import Bucket, Invariant, NotNaN, expect
+
+if TYPE_CHECKING:
+    from sglang.srt.models.dspark import BaseDSparkMarkovHead
 
 logger = logging.getLogger(__name__)
 
@@ -125,13 +128,13 @@ class DraftNoise(msgspec.Struct, frozen=True):
     offset: torch.Tensor
 
 
-def step_logits_width(markov_head, base_width: int) -> int:
+def step_logits_width(markov_head: BaseDSparkMarkovHead, base_width: int) -> int:
     # Kept step logits are gathered whole over a sharded vocab.
     return base_width if markov_head.vocab_shard is None else markov_head.vocab_size
 
 
 def _draft_step(
-    markov_head,
+    markov_head: BaseDSparkMarkovHead,
     prev_tokens: torch.Tensor,
     base_logits: torch.Tensor,
     *,
