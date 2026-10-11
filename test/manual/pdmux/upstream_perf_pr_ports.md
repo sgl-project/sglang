@@ -32,6 +32,32 @@ PYTHONPATH=python python -m pytest -q \
   test/registered/unit/layers/test_dsv41_prefill_submission.py
 ```
 
+## PR #41294: fused low-ratio compressor on Hopper
+
+Source: [sgl-project/sglang#41294](https://github.com/sgl-project/sglang/pull/41294),
+head `8ab1eefaed6d3eed8f18a3ad6ed5e36c02e7663d`.
+
+Enables the existing c1/c2 fused paths on SM90, including split prefill and
+equal-block DSPARK verify. CPU, unsupported CUDA devices and existing SM100/HIP
+admission retain their previous behavior. No new graph tiers are introduced.
+
+```bash
+export SGLANG_OPT_USE_FUSED_DSV41_COMPRESS_SM90=1
+```
+
+Set to `0` and **restart** to roll back: the flag fixes the c2 packed weight
+layout before loading and graph capture, and is not a runtime toggle.
+
+```bash
+PYTHONPATH=python python -m pytest -q \
+  test/registered/unit/layers/test_dsv41_compressor_dispatch.py \
+  test/registered/attention/unittests/dsv4/test_dsv41_fused_compress.py \
+  test/registered/kernels/ops/attention/dsv4/test_c2_prefill_ring.py
+```
+
+GPU acceptance includes odd/even pair starts, unfinished pairs crossing chunk
+boundaries, padded rows, shared KV source layers and prefill-to-decode migration.
+
 ## Combination acceptance
 
 Run each optimization alone and then together, with the same checkpoint,
