@@ -46,6 +46,8 @@ class AITERSageImpl(AttentionImpl):
         dropout_p: float = 0.0,
         **extra_impl_args,
     ) -> None:
+        self.causal = causal
+        self.softmax_scale = softmax_scale
         self.packed_trailing_padding = extra_impl_args.get(
             "packed_trailing_padding", False
         )
@@ -78,7 +80,13 @@ class AITERSageImpl(AttentionImpl):
             Output tensor of shape [batch_size, seq_len, head_num, head_dim]
         """
 
-        output = self.aiter_sage_attn_fn(query, key, value)
+        output = self.aiter_sage_attn_fn(
+            query,
+            key,
+            value,
+            softmax_scale=self.softmax_scale,
+            causal=self.causal,
+        )
         return output
 
     def forward_varlen(

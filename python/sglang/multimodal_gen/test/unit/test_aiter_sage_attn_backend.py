@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""AITER Sage backend: packed varlen attention (no GPU or aiter needed)."""
+"""AITER Sage backend: kernel arguments and packed varlen attention (no GPU or aiter needed)."""
 
 import sys
 import types
@@ -8,13 +8,19 @@ import pytest
 import torch
 
 
+class _Calls(list):
+    kwargs: list
+
+
 @pytest.fixture
 def calls(monkeypatch):
-    """Stub aiter's fav3_sage kernel; record the sequence length of each call."""
-    calls = []
+    """Stub aiter's fav3_sage kernel; record the sequence length (and kwargs) of each call."""
+    calls = _Calls()
+    calls.kwargs = []
 
-    def fav3_sage_wrapper_func(q, k, v):
+    def fav3_sage_wrapper_func(q, k, v, softmax_scale=None, causal=False):
         calls.append(q.shape[1])
+        calls.kwargs.append({"softmax_scale": softmax_scale, "causal": causal})
         return q + 2
 
     fav3 = types.ModuleType("aiter.ops.triton.attention.fav3_sage")
@@ -36,6 +42,16 @@ def _impl(**extra):
     )
 
     return AITERSageImpl(num_heads=4, head_size=128, softmax_scale=0.125, **extra)
+
+
+def test_forward_passes_softmax_scale_and_causal(calls):
+    q, k, v = (torch.randn(1, 16, 4, 128, dtype=torch.bfloat16) for _ in range(3))
+    _impl().forward(q, k, v)
+    _impl(causal=True).forward(q, k, v)
+    assert calls.kwargs == [
+        {"softmax_scale": 0.125, "causal": False},
+        {"softmax_scale": 0.125, "causal": True},
+    ]
 
 
 def _packed_qkv(tokens):
