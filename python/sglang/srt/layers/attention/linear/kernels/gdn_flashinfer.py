@@ -15,7 +15,6 @@ import os
 from typing import TYPE_CHECKING, Optional
 
 import torch
-from sglang.srt.environ import envs
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
@@ -250,7 +249,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             mtp_bf16_fn,
         ) = _get_flashinfer_gdn_kernels()
 
-        if available and envs.SGLANG_PREPARE_LINEAR_ATTN.get():
+        if available:
             _enable_gdn_aot_cache()
 
         if not available:

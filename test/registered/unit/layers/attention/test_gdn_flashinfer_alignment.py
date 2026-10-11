@@ -3,8 +3,10 @@ from unittest import mock
 
 import torch
 
+from sglang.kernels.jit.cute_aot_cache import JITCache
 from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
     FlashInferGDNKernel,
+    _FlashInferGDNCache,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -408,6 +410,26 @@ class TestFlashInferGDNAlignment(unittest.TestCase):
         self.assertEqual(captured_ptrs[0], captured_ptrs[1])
         torch.testing.assert_close(first_pool, torch.ones_like(first_pool))
         torch.testing.assert_close(second_pool, torch.full_like(second_pool, 2))
+
+
+class TestFlashInferGDNCache(unittest.TestCase):
+    def test_flashinfer_bridge_reuses_aot_cache(self):
+        kernel = type("Kernel", (), {"__module__": "flashinfer.gdn_kernels.test"})
+        ffi_option = type("EnableTVMFFI", (), {})
+        key = (((kernel, object), ("head_dim", 128)), ((ffi_option, True),))
+        aot = JITCache()
+        first = _FlashInferGDNCache({}, aot)
+        assert first.get(key) is None
+        compiled = object()
+        first[key] = compiled
+        assert aot[key] is compiled
+        second = _FlashInferGDNCache({}, aot)
+        assert second.get(key) is compiled
+        assert second[key] is compiled
+        other_key = ("non-GDN", ())
+        second[other_key] = compiled
+        assert second.get(other_key) is compiled
+        assert other_key not in aot
 
 
 if __name__ == "__main__":

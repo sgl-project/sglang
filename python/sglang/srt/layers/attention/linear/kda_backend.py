@@ -494,13 +494,6 @@ class KDAAttnBackend(MambaAttnBackendBase):
         self.kernel_dispatcher = KDAKernelDispatcher(
             decode_backend, prefill_backend, verify_backend
         )
-        if envs.SGLANG_PREPARE_LINEAR_ATTN.get():
-            from sglang.srt.layers.attention.linear.precompile import (
-                precompile_linear_attention,
-            )
-
-            precompile_linear_attention(model_runner, self)
-
         if prefill_backend.is_flashinfer():
             _validate_flashinfer_kda_prefill(
                 chunk_size=self.mamba_chunk_size,
