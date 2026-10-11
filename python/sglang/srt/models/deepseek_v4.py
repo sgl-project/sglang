@@ -2842,12 +2842,14 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.local_boundary = mhc.make_boundary(
             self.post_attention_layernorm,
             accepts_mxfp8=False,
+            hc=self.ffn_hc,
         )
         # MOE[i] -> ATTN[i+1]
         if self._next_layer is not None:
             self.next_boundary = mhc.make_boundary(
                 self._next_layer.input_layernorm,
                 accepts_mxfp8=self._next_layer.self_attn.accepts_mxfp8_swizzled_input(),
+                hc=self._next_layer.attn_hc,
             )
 
     def refresh_mhc_norm_weight_cache(self):
@@ -3297,11 +3299,16 @@ class DeepseekV4DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         input_ids_global: torch.Tensor,
         seam_open: bool = True,
+        mega_mhc_seam_open: bool = True,
     ) -> mhc.HcState:
         """The layer's two hyper-connections, each collapsing with the previous one's
-        pre-mix. ``seam_open`` is False when the late-layer tail narrows the rows after
-        this layer, so nothing precomputed for the next one would still describe it."""
+        pre-mix. ``seam_open`` preserves the existing tail-mode boundary policy;
+        ``mega_mhc_seam_open`` disables Mega mHC for both sublayers in the layer
+        immediately before row selection."""
         self._init_boundaries()
+        mega_mhc_prefill = mhc.can_use_mega_mhc_prefill(
+            self.hc_cfg, seam_open=mega_mhc_seam_open
+        )
         stats_stream = None
         if mhc.use_stats_stream(self.hc_cfg, forward_batch, state.residual):
             stats_stream = self.hc_stats_stream
@@ -3312,6 +3319,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             quantized = [] if self.self_attn.accepts_mxfp8_swizzled_input() else None
             mhc.fork_stats_stream(stats_stream)
             x = mhc.combine(self.attn_hc, state, quantized)
+            precomputed = state.stats
             state.release()
             del state
             world_size = self.self_attn.attn_tp_size
@@ -3334,6 +3342,8 @@ class DeepseekV4DecoderLayer(nn.Module):
                 stats_stream=stats_stream,
                 next=self.local_boundary,
                 world_size=world_size,
+                precomputed=precomputed,
+                mega_mhc=mega_mhc_prefill,
             )
 
         def run_ffn_hc(state: mhc.HcState) -> mhc.HcState:
@@ -3341,6 +3351,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             residual = state.residual
             mhc.fork_stats_stream(stats_stream)
             x = mhc.combine(self.ffn_hc, state)
+            precomputed = state.stats
             state.release()
             del state
             nxt = self.next_boundary if seam_open else None
@@ -3362,6 +3373,8 @@ class DeepseekV4DecoderLayer(nn.Module):
                 stats_stream=stats_stream,
                 next=nxt,
                 world_size=self.mlp.tp_size,
+                precomputed=precomputed,
+                mega_next=self.next_boundary if mega_mhc_prefill else None,
             )
 
         return run_ffn_hc(run_attn_hc(state))
@@ -3682,8 +3695,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             positions=state.positions,
             hidden_states=hidden_states,
             # DSV4 non-fused layers carry no residual across layers; the key is
-            # required by the next layer's op_mhc_prepare_attn (ignored) and by
-            # _model_forward_tbo_merge_outputs (None -> None).
+            # required by the next layer's op_mhc_prepare_attn (ignored).
             residual=None,
             forward_batch=state.forward_batch,
             tbo_subbatch_index=state.tbo_subbatch_index,
@@ -4118,6 +4130,7 @@ class DeepseekV4Model(nn.Module):
                     forward_batch=forward_batch,
                     input_ids_global=input_ids_global,
                     seam_open=tail is None,
+                    mega_mhc_seam_open=i + 1 != self.late_layer_start,
                 )
         state = state.materialized(self.layers[self.end_layer - 1].hc_cfg)
         if saved_full is not None:
@@ -4163,7 +4176,7 @@ class DeepseekV4Model(nn.Module):
         from sglang.srt.batch_overlap.operations_strategy import OperationsStrategy
         from sglang.srt.batch_overlap.two_batch_overlap import (
             _model_forward_filter_inputs,
-            _model_forward_tbo_merge_outputs,
+            _model_forward_tbo_merge_key,
         )
 
         layers = [self.layers[i] for i in range(self.start_layer, self.end_layer)]
@@ -4237,10 +4250,9 @@ class DeepseekV4Model(nn.Module):
             delta_stages=[0, operations_strategy.tbo_delta_stages],
         )
 
-        hidden_states, _ = _model_forward_tbo_merge_outputs(
-            outputs_arr[0], outputs_arr[1], hidden_states.shape[0]
+        return _model_forward_tbo_merge_key(
+            outputs_arr[0], outputs_arr[1], "hidden_states", hidden_states.shape[0]
         )
-        return hidden_states
 
     @torch.no_grad()
     def forward(
@@ -4457,10 +4469,14 @@ class DeepseekV4ForCausalLM(nn.Module):
             if (
                 get_parallel().attn_cp_size != 1
                 or get_parallel().pp_group.world_size != 1
-                or not get_moe_a2a_backend().is_none()
+                or not (
+                    get_moe_a2a_backend().is_none()
+                    or (_is_cuda and get_moe_a2a_backend().is_megamoe())
+                )
             ):
                 raise ValueError(
-                    "V4.1 vision currently supports TP/EP/DP without CP, PP or MoE A2A"
+                    "V4.1 vision supports TP/EP/DP without CP or PP; "
+                    "MoE A2A requires CUDA MegaMoE"
                 )
 
             args = SimpleNamespace(**vars(config), dim=config.hidden_size)
@@ -4524,7 +4540,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         spans = []
         device, dtype = self.image_start.device, self.image_start.dtype
         for item in items:
-            item.reconstruct(device.index, ipc_consumer_count=self.tp_size)
+            item.reconstruct(device.index)
             h, w = int(item.n_vit_h), int(item.n_vit_w)
             pixels = torch.as_tensor(item.feature, device=device)
             plan = item.model_specific_data.get(GPU_PLAN_KEY)

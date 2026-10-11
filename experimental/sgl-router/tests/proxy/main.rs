@@ -22,6 +22,7 @@ mod graceful_shutdown;
 mod h2c_forward;
 mod header_forwarding;
 mod inbound_h2c;
+mod openai_generate;
 mod pd_bootstrap_injection;
 mod pd_pool_isolation;
 mod pd_protocol_binding;

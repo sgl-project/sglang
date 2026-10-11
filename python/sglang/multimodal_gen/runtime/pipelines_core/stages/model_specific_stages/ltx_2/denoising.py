@@ -9,6 +9,7 @@ from diffusers.utils.torch_utils import randn_tensor
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     is_ltx23_native_variant,
 )
+from sglang.multimodal_gen.configs.sample.sampling_params import quality_allows
 from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
     get_sp_world_size,
@@ -967,12 +968,19 @@ class LTX2DenoisingStage(DenoisingStage):
         seq_len: int,
         batch_size: int,
         key: str,
+        has_padding: bool,
         device: torch.device,
     ) -> torch.Tensor | None:
         valid = getattr(batch, key, None)
         if valid is None:
             return None
         valid = int(valid)
+        # all SP ranks must agree on mask presence to preserve collective order
+        # a locally all-valid shard still needs a mask when another rank has padding
+        # eliding an all-valid mask changes attention kernel rounding
+        # exact requests must keep the reference masked path
+        if not has_padding and quality_allows(batch.quality, "lossless"):
+            return None
         mask = torch.ones((batch_size, int(seq_len)), device=device, dtype=torch.bool)
         if valid < int(seq_len):
             mask[:, max(0, valid) :] = False
@@ -1224,6 +1232,7 @@ class LTX2DenoisingStage(DenoisingStage):
                 seq_len=int(latent_model_input.shape[1]),
                 batch_size=batch_size,
                 key="sp_video_valid_token_count",
+                has_padding=batch.sp_video_has_padding,
                 device=latent_model_input.device,
             )
             audio_self_attention_mask = self._build_ltx2_sp_padding_mask(
@@ -1231,6 +1240,7 @@ class LTX2DenoisingStage(DenoisingStage):
                 seq_len=audio_num_frames_latent,
                 batch_size=batch_size,
                 key="sp_audio_valid_token_count",
+                has_padding=batch.sp_audio_has_padding,
                 device=audio_latent_model_input.device,
             )
             a2v_cross_attention_mask = audio_self_attention_mask
