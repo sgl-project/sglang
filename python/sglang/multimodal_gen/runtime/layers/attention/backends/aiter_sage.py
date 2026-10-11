@@ -80,10 +80,12 @@ class AITERSageImpl(AttentionImpl):
             Output tensor of shape [batch_size, seq_len, head_num, head_dim]
         """
 
+        # aiter's Sage quantization assumes dense inputs; strided views such as
+        # slices of a fused QKV projection give wrong results (ROCm/aiter#6222).
         output = self.aiter_sage_attn_fn(
-            query,
-            key,
-            value,
+            query.contiguous(),
+            key.contiguous(),
+            value.contiguous(),
             softmax_scale=self.softmax_scale,
             causal=self.causal,
         )

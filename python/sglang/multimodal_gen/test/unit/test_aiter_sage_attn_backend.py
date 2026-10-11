@@ -10,6 +10,7 @@ import torch
 
 class _Calls(list):
     kwargs: list
+    contiguous: list
 
 
 @pytest.fixture
@@ -17,10 +18,12 @@ def calls(monkeypatch):
     """Stub aiter's fav3_sage kernel; record the sequence length (and kwargs) of each call."""
     calls = _Calls()
     calls.kwargs = []
+    calls.contiguous = []
 
     def fav3_sage_wrapper_func(q, k, v, softmax_scale=None, causal=False):
         calls.append(q.shape[1])
         calls.kwargs.append({"softmax_scale": softmax_scale, "causal": causal})
+        calls.contiguous.append(all(t.is_contiguous() for t in (q, k, v)))
         return q + 2
 
     fav3 = types.ModuleType("aiter.ops.triton.attention.fav3_sage")
@@ -52,6 +55,15 @@ def test_forward_passes_softmax_scale_and_causal(calls):
         {"softmax_scale": 0.125, "causal": False},
         {"softmax_scale": 0.125, "causal": True},
     ]
+
+
+def test_forward_makes_strided_inputs_contiguous(calls):
+    qkv = torch.randn(1, 16, 3 * 4 * 128, dtype=torch.bfloat16)
+    q, k, v = (t.view(1, 16, 4, 128) for t in qkv.split(4 * 128, dim=-1))
+    assert not v.is_contiguous()
+    out = _impl().forward(q, k, v)
+    assert calls.contiguous == [True]
+    assert torch.equal(out, q + 2)
 
 
 def _packed_qkv(tokens):
