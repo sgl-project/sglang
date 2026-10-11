@@ -14,13 +14,21 @@ from unittest import mock
 
 import torch
 
+from sglang.multimodal_gen.configs.models.vaes.hunyuanvae import (
+    HunyuanVAEArchConfig,
+    HunyuanVAEConfig,
+)
 from sglang.multimodal_gen.configs.models.vaes.wanvae import (
     WanVAEArchConfig,
     WanVAEConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.hunyuan import HunyuanConfig
 from sglang.multimodal_gen.configs.pipeline_configs.wan import WanT2V480PConfig
 from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 from sglang.multimodal_gen.runtime.entrypoints.utils import _try_save_cuda_video_direct
+from sglang.multimodal_gen.runtime.models.vaes.hunyuanvae import (
+    AutoencoderKLHunyuanVideo,
+)
 from sglang.multimodal_gen.runtime.models.vaes.wanvae import AutoencoderKLWan
 from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import DecodingStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.encode_while_decoding import (
@@ -100,6 +108,44 @@ def _video_request(**overrides) -> SimpleNamespace:
     "needs CUDA and memfd",
 )
 class TestStreamedEncode(CustomTestCase):
+    @torch.no_grad()
+    def test_hunyuan_without_callback_matches_one_shot_mp4(self):
+        config = HunyuanVAEConfig(
+            arch_config=HunyuanVAEArchConfig(
+                latent_channels=4,
+                block_out_channels=(8,),
+                down_block_types=("HunyuanVideoDownBlock3D",),
+                up_block_types=("HunyuanVideoUpBlock3D",),
+                layers_per_block=1,
+                norm_num_groups=4,
+                temporal_compression_ratio=1,
+                mid_block_add_attention=False,
+            ),
+            load_encoder=False,
+        )
+        server_args = _server_args(HunyuanConfig(vae_config=config))
+        stage = _stage(AutoencoderKLHunyuanVideo(config).cuda().eval(), server_args)
+        with tempfile.TemporaryDirectory() as tmp:
+            streamed, one_shot = Path(tmp, "stream.mp4"), Path(tmp, "normal.mp4")
+            stream = EncodeWhileDecoding(str(streamed), _video_request())
+            frames = stage.decode(
+                torch.randn(1, 4, 5, 40, 48, device="cuda"),
+                server_args,
+                vae_dtype=torch.float32,
+                on_frames=stream,
+            )
+            self.assertEqual(stream.finish(), [str(streamed)])
+            self.assertTrue(
+                _try_save_cuda_video_direct(
+                    save_file_path=str(one_shot),
+                    sample=frames[0],
+                    fps=FPS,
+                    audio_sample_rate=None,
+                    output_compression=None,
+                )
+            )
+            self.assertEqual(one_shot.read_bytes(), streamed.read_bytes())
+
     @torch.no_grad()
     def test_streamed_mp4_matches_the_one_shot_save(self):
         generator = torch.Generator(device="cuda").manual_seed(0)
@@ -190,8 +236,9 @@ class TestStreamedEncode(CustomTestCase):
 
     @torch.no_grad()
     def test_decoder_without_callback_hands_over_the_complete_clip(self):
-        server_args = _server_args()
-        stage = _stage(_vae(_vae_config(wan22=False), "cuda"), server_args)
+        config = _vae_config(wan22=False)
+        server_args = _server_args(WanT2V480PConfig(vae_config=config))
+        stage = _stage(_vae(config, "cuda"), server_args)
         # The shared stage must not inject a keyword into an ordinary decoder.
         stage.vae.supports_decode_on_frames = False
         expected = torch.randn(1, 3, 5, 40, 48, device="cuda")
