@@ -170,6 +170,63 @@ class TestMamba(unittest.TestCase):
             req_to_token_pool.mamba_allocator.available_size() == mamba_cache_size - 1
         )
 
+    @unittest.skipUnless(torch.cuda.is_available(), "sync check needs CUDA")
+    def test_alloc_writes_mappings_without_synchronizing(self):
+        num_layers = 8
+        mamba_layers = [i for i in range(num_layers) if i % 4 != 3]
+        shape = Mamba2StateShape.create(
+            tp_world_size=1,
+            intermediate_size=256,
+            n_groups=1,
+            num_heads=2,
+            head_dim=16,
+            state_size=16,
+            conv_kernel=4,
+        )
+        with envs.SGLANG_MAMBA_SSM_DTYPE.override("bfloat16"):
+            cache_params = Mamba2CacheParams(shape=shape, layers=mamba_layers)
+        pool = HybridReqToTokenPool(
+            size=8,
+            mamba_size=24,
+            mamba_spec_state_size=8,
+            max_context_len=64,
+            device="cuda",
+            enable_memory_saver=False,
+            cache_params=cache_params,
+            mamba_layer_ids=mamba_layers,
+            enable_mamba_extra_buffer=True,
+            speculative_num_draft_tokens=3,
+        )
+        reqs = [
+            Req(
+                rid=i,
+                origin_input_text="",
+                origin_input_ids=array("q"),
+                sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+            )
+            for i in range(3)
+        ]
+
+        torch.cuda.synchronize()
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            pool.alloc(reqs)
+        finally:
+            torch.cuda.set_sync_debug_mode("default")
+
+        for req in reqs:
+            row = req.kv.req_pool_idx
+            self.assertEqual(
+                pool.req_index_to_mamba_index_mapping[row].item(),
+                req.kv.mamba_pool_idx.item(),
+            )
+            self.assertTrue(
+                torch.equal(
+                    pool.req_index_to_mamba_ping_pong_track_buffer_mapping[row],
+                    req.kv.mamba_ping_pong_track_buffer,
+                )
+            )
+
     def test_mamba_pool_deduplicated_conv_window_axis(self):
         class WindowFirstMambaPool(MambaPool):
             conv_window_axis = 0
