@@ -217,6 +217,18 @@ def _attention_on_real_rows(
         forward_batch.positions = positions
         forward_batch._attn_output = attn_output
 
+    # The TileLang and Triton (ROCm) sparse MLA kernels return [1, rows, heads, dim];
+    # with one real row that shape is also rows first, which the path below pads.
+    batched = (
+        isinstance(ret, torch.Tensor)
+        and ret.dim() == 4
+        and ret.shape[0] == 1
+        and ret.shape[1] == real_num_tokens
+        and real_num_tokens > 1
+    )
+    if batched:
+        ret = ret[0]
+
     def padded(t):
         if not isinstance(t, torch.Tensor) or t.shape[0] != real_num_tokens:
             return t
@@ -233,8 +245,10 @@ def _attention_on_real_rows(
         or ret.shape[0] != real_num_tokens
         or ret.numel() != output[:real_num_tokens].numel()
     ):
-        return padded(ret)
-    if ret.data_ptr() != output.data_ptr():
-        output[:real_num_tokens].view(ret.shape).copy_(ret)
-    output[real_num_tokens:].zero_()
-    return output.view(num_tokens, *ret.shape[1:])
+        result = padded(ret)
+    else:
+        if ret.data_ptr() != output.data_ptr():
+            output[:real_num_tokens].view(ret.shape).copy_(ret)
+        output[real_num_tokens:].zero_()
+        result = output.view(num_tokens, *ret.shape[1:])
+    return result.unsqueeze(0) if batched else result
