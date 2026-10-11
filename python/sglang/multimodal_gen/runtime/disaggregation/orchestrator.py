@@ -294,8 +294,13 @@ class DiffusionServer:
             )
 
     def _event_loop(self) -> None:
+        # Peers connect to the configured endpoints, so never move to another port.
         frontend, _ = get_zmq_socket(
-            self._context, zmq.ROUTER, self._frontend_endpoint, bind=True
+            self._context,
+            zmq.ROUTER,
+            self._frontend_endpoint,
+            bind=True,
+            same_port=True,
         )
 
         encoder_pushes: list[zmq.Socket] = []
@@ -321,13 +326,25 @@ class DiffusionServer:
             decoder_pushes.append(sock)
 
         encoder_result_pull, _ = get_zmq_socket(
-            self._context, zmq.PULL, self._encoder_result_endpoint, bind=True
+            self._context,
+            zmq.PULL,
+            self._encoder_result_endpoint,
+            bind=True,
+            same_port=True,
         )
         denoiser_result_pull, _ = get_zmq_socket(
-            self._context, zmq.PULL, self._denoiser_result_endpoint, bind=True
+            self._context,
+            zmq.PULL,
+            self._denoiser_result_endpoint,
+            bind=True,
+            same_port=True,
         )
         decoder_result_pull, _ = get_zmq_socket(
-            self._context, zmq.PULL, self._decoder_result_endpoint, bind=True
+            self._context,
+            zmq.PULL,
+            self._decoder_result_endpoint,
+            bind=True,
+            same_port=True,
         )
 
         poller = zmq.Poller()
