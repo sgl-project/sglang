@@ -69,7 +69,6 @@ from typing import (
     Generic,
     Iterator,
     List,
-    NamedTuple,
     Optional,
     Protocol,
     Sequence,
@@ -648,11 +647,12 @@ def device_stream_context(stream):
 
 def is_device_stream_capturing(device: torch.device) -> bool:
     """Whether ``device``'s current stream is mid graph capture (False if unsupported)."""
-    # Every platform answering support_cuda_graph() already calls
-    # device_module.is_current_stream_capturing() during capture, so it cannot be missing.
-    if device.type != current_platform.device_type:
+    # Every platform declaring capabilities.graph_capture calls
+    # device_module.is_current_stream_capturing() during capture, except CPU,
+    # whose graph runner compiles instead of capturing a stream.
+    if device.type != current_platform.device_type or device.type == "cpu":
         return False
-    if not current_platform.support_cuda_graph():
+    if not current_platform.capabilities.graph_capture:
         return False
     return torch.get_device_module(device).is_current_stream_capturing()
 
@@ -1335,15 +1335,6 @@ def get_current_device_stream_fast():
 # ==============================================================================
 
 
-class Range(NamedTuple):
-    start: int
-    end: int
-
-    @property
-    def length(self) -> int:
-        return self.end - self.start
-
-
 def assert_int64_array(values: array, name: str) -> None:
     """Require a signed int64 array suitable for zero-copy tensor views."""
     assert (
@@ -1446,7 +1437,10 @@ def temp_set_env(*, allow_sglang: bool = False, **env_vars: Any):
 
 
 def support_triton(backend: str) -> bool:
-    return backend not in ["torch_native", "intel_amx"]
+    return current_platform.capabilities.supports_triton and backend not in [
+        "torch_native",
+        "intel_amx",
+    ]
 
 
 _ENABLE_TORCH_INFERENCE_MODE = get_bool_env_var(
@@ -1557,33 +1551,6 @@ def mark_end(name):
         time_infos[name].pretty_print()
 
 
-# Set while a layer another pipeline stage holds is built, only for the stage
-# boundaries it declares.
-_building_neighbour_layer = False
-
-
-def is_building_neighbour_layer() -> bool:
-    """Whether the layer under construction belongs to another pipeline stage
-    and is built here only to read the stage boundaries it declares. It is
-    built on the meta device and never loaded or run, so its constructor skips
-    the host and device resources a running layer needs: tables, streams,
-    engines and communicators."""
-    return _building_neighbour_layer
-
-
-@contextmanager
-def building_neighbour_layer():
-    """Build a pipeline neighbour layer: on the meta device, with
-    is_building_neighbour_layer() true."""
-    global _building_neighbour_layer
-    outer, _building_neighbour_layer = _building_neighbour_layer, True
-    try:
-        with torch.device("meta"):
-            yield
-    finally:
-        _building_neighbour_layer = outer
-
-
 class LayerFn(Protocol):
     def __call__(self, idx: int, prefix: str) -> torch.nn.Module: ...
 
@@ -1596,17 +1563,27 @@ def make_layers(
     prefix: str = "",
     return_tuple: bool = False,
     offloader_kwargs: Optional[Dict[str, Any]] = None,
+    final_read: Optional[Any] = None,
+    stage_facts: Optional[Callable[[int], Sequence[Any]]] = None,
 ) -> Tuple[torch.nn.Module, int, int]:
     """Make a list of layers with the given layer function.
 
     The local layers are built inside one layer stack, so layers that declare
     stage boundaries connect in order without naming their neighbours. Across
-    a pipeline stage boundary the stack learns the neighbouring stage from the
-    layer itself, built again on the meta device.
+    a pipeline stage boundary the stack learns the neighbouring stage from
+    ``stage_facts``: the model's shared declaration function, which returns
+    the stages the layer at a global index declares without building it (an
+    empty sequence when it declares none), and which the layer itself uses
+    for its own declarations. A model whose layers declare stages must give
+    it to run under pipeline parallelism. ``final_read`` is the stack's
+    terminal read when it is not a plain final norm (see layer_stack).
     """
     # circular imports
     from sglang.srt.distributed import get_pp_indices
-    from sglang.srt.layers.layer_boundary.factories import layer_stack
+    from sglang.srt.layers.layer_boundary.factories import (
+        check_declared_stages,
+        layer_stack,
+    )
     from sglang.srt.layers.utils import PPMissingLayer
     from sglang.srt.utils.offloader import get_offloader
 
@@ -1622,21 +1599,27 @@ def make_layers(
     )
 
     def neighbour(idx):
-        return functools.partial(
-            _build_neighbour_layer, layer_fn, idx, add_prefix(idx, prefix)
-        )
+        if stage_facts is not None:
+            return functools.partial(stage_facts, idx)
+        return functools.partial(_no_stage_facts, layer_fn)
+
+    def build(stack, idx):
+        appended = len(stack.appends)
+        layer = layer_fn(idx=idx, prefix=add_prefix(idx, prefix))
+        if stage_facts is not None and (pp_size or 1) > 1:
+            # Another rank binds this layer's stages from stage_facts alone.
+            check_declared_stages(stack, appended, stage_facts(idx), f"layer {idx}")
+        return layer
 
     with layer_stack(
         previous_layers=[neighbour(idx) for idx in reversed(range(start_layer))],
         next_layers=[neighbour(idx) for idx in range(end_layer, num_hidden_layers)],
-    ):
+        final_read=final_read,
+    ) as stack:
         modules = torch.nn.ModuleList(
             [PPMissingLayer(return_tuple=return_tuple) for _ in range(start_layer)]
             + get_offloader().wrap_modules(
-                (
-                    layer_fn(idx=idx, prefix=add_prefix(idx, prefix))
-                    for idx in range(start_layer, end_layer)
-                ),
+                (build(stack, idx) for idx in range(start_layer, end_layer)),
                 **(offloader_kwargs or {}),
             )
             + [
@@ -1655,10 +1638,13 @@ def make_pp_layers(
     prefix: str = "",
     return_tuple: bool = False,
     offloader_kwargs: Optional[Dict[str, Any]] = None,
+    final_read: Optional[Any] = None,
+    stage_facts: Optional[Callable[[int], Sequence[Any]]] = None,
 ) -> Tuple[torch.nn.Module, int, int]:
     """Make this pipeline stage's layers, and return them with the stage's range.
 
     Layers outside ``[start_layer, end_layer)`` are ``PPMissingLayer`` stand-ins.
+    ``stage_facts`` is the model's shared declaration function (see make_layers).
     """
     parallel = get_parallel()
     return make_layers(
@@ -1669,22 +1655,20 @@ def make_pp_layers(
         prefix=prefix,
         return_tuple=return_tuple,
         offloader_kwargs=offloader_kwargs,
+        final_read=final_read,
+        stage_facts=stage_facts,
     )
 
 
-def _build_neighbour_layer(layer_fn: LayerFn, idx: int, prefix: str) -> None:
-    """Build a layer another pipeline stage holds, only for the stage
-    boundaries it declares (see building_neighbour_layer). RoPE modules it
-    adds to the shared cache are meta, so they are dropped again."""
-    from sglang.srt.layers.rotary_embedding.factory import _ROPE_DICT
-
-    cached = set(_ROPE_DICT)
-    try:
-        with building_neighbour_layer():
-            layer_fn(idx=idx, prefix=prefix)
-    finally:
-        for key in set(_ROPE_DICT) - cached:
-            del _ROPE_DICT[key]
+def _no_stage_facts(layer_fn: LayerFn) -> None:
+    """Stands in for the shared declaration function of a model that gives
+    none: called only if this pipeline rank's layers declare stages."""
+    module = getattr(getattr(layer_fn, "func", layer_fn), "__module__", None)
+    raise ValueError(
+        f"{module} declares stage boundaries under pipeline parallelism "
+        "without a shared declaration function: give make_layers its "
+        "stage_facts, the stages a layer declares without building it"
+    )
 
 
 def set_random_seed(seed: int) -> None:
@@ -4227,11 +4211,15 @@ def require_mlp_sync():
     return get_parallel().attn_dp_enabled or require_gathered_buffer()
 
 
-def get_cuda_graph_batch_size_alignment() -> int:
+def get_cuda_graph_batch_size_alignment(
+    *, gathered_buffer_required: Optional[bool] = None
+) -> int:
+    if gathered_buffer_required is None:
+        gathered_buffer_required = require_gathered_buffer()
     alignment = 1
     if get_exec().overlap.enable_two_batch_overlap:
         alignment *= 2
-    if require_gathered_buffer():
+    if gathered_buffer_required:
         alignment *= get_parallel().attn_tp_size
     # TODO: unverified on NVIDIA; drop the gate once validated on CUDA.
     if not is_hip() and alignment % get_parallel().attn_cp_size != 0:
@@ -4262,12 +4250,12 @@ def find_local_repo_dir(repo_id: str, revision: Optional[str] = None) -> Optiona
         hf.constants.REPO_ID_SEPARATOR.join(["models", *repo_id.split("/")]),
     )
 
-    # Get revision from main ref if not specified
-    if not revision:
-        ref_path = os.path.join(cache_path, "refs", "main")
-        if os.path.isfile(ref_path):
-            with open(ref_path) as f:
-                revision = f.read().strip()
+    # A branch or tag name (default "main") maps to a commit through refs/;
+    # snapshots/ is keyed by commit only.
+    ref_path = os.path.join(cache_path, "refs", revision or "main")
+    if os.path.isfile(ref_path):
+        with open(ref_path) as f:
+            revision = f.read().strip()
 
     # List files from revision directory
     if revision:
