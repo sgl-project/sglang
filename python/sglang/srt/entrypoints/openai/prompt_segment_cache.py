@@ -11,12 +11,14 @@ joined, if every cut is a token boundary. This cache cuts the rendered prompt
 in front of the special tokens that the chat template writes, keeps the ids of
 each piece, and encodes only the pieces it has not seen. It uses a special
 token as a cut point only if no added token can start before it and reach into
-it.
+it. The post-processor must preserve the sequence ids. Requests that ask a
+post-processor to add special tokens keep the full encode.
 
 The result is checked against a full encode on the first calls and then at a
 fixed interval. On a mismatch the cache turns itself off.
 """
 
+import json
 import logging
 import re
 from array import array
@@ -24,6 +26,8 @@ from collections import OrderedDict
 from typing import Any, Dict, Iterator, List, Optional
 
 from tokenizers import Tokenizer
+
+from sglang.srt.entrypoints.openai.parallel_prompt_encode import _post_processor_safe
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +49,12 @@ class PromptSegmentCache:
         check_every: int = _DEFAULT_CHECK_EVERY,
     ):
         self._tokenizer = tokenizer
+        post_processor = tokenizer.backend_tokenizer.post_processor
+        self._specials_added = (
+            post_processor.num_special_tokens_to_add(False)
+            if post_processor is not None
+            else 0
+        )
         # Longest first: the regex takes the first alternative that matches.
         self._markers = re.compile(
             "|".join(
@@ -78,7 +88,9 @@ class PromptSegmentCache:
             yield text[start:]
 
     def encode(self, text: str, encode_kwargs: Dict[str, Any]) -> List[int]:
-        if not self.enabled:
+        if not self.enabled or (
+            self._specials_added and encode_kwargs.get("add_special_tokens", True)
+        ):
             return self._tokenizer.encode(text, **encode_kwargs)
         kwargs_key = tuple(sorted(encode_kwargs.items()))
         ids: List[int] = []
@@ -117,6 +129,11 @@ def _split_markers(tokenizer) -> List[str]:
     # The module docstring describes the HuggingFace `tokenizers` backend only.
     # Other backends and slow tokenizers keep the full encode.
     if not isinstance(backend, Tokenizer) or backend.normalizer is not None:
+        return []
+    post_processor = backend.post_processor
+    if post_processor is not None and not _post_processor_safe(
+        json.loads(post_processor.__getstate__())
+    ):
         return []
     # With this setting the backend encodes special tokens as plain text.
     if getattr(tokenizer, "split_special_tokens", False):

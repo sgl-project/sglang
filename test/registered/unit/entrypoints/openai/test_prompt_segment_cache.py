@@ -10,7 +10,14 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from tokenizers import AddedToken, Tokenizer, models, normalizers, pre_tokenizers
+from tokenizers import (
+    AddedToken,
+    Tokenizer,
+    models,
+    normalizers,
+    pre_tokenizers,
+    processors,
+)
 from tokenizers.trainers import BpeTrainer
 from transformers import PreTrainedTokenizerFast
 
@@ -118,6 +125,43 @@ def _unchecked_cache(tokenizer, **kwargs):
 
 
 class TestPromptSegmentCache(CustomTestCase):
+    def test_special_adding_post_processors_keep_full_prompt_ids(self):
+        for nested in (False, True):
+            with self.subTest(nested=nested):
+                tokenizer = _tokenizer()
+                post_processor = processors.TemplateProcessing(
+                    single="<|assistant|> $A",
+                    special_tokens=[
+                        (
+                            "<|assistant|>",
+                            tokenizer.convert_tokens_to_ids("<|assistant|>"),
+                        )
+                    ],
+                )
+                if nested:
+                    post_processor = processors.Sequence(
+                        [processors.ByteLevel(), post_processor]
+                    )
+                tokenizer.backend_tokenizer.post_processor = post_processor
+                cache = PromptSegmentCache.create(tokenizer)
+                self.assertIsNotNone(cache)
+                first = "<|user|>query the logs"
+                for _ in range(3):
+                    self.assertEqual(
+                        cache.encode(first, {"add_special_tokens": False}),
+                        tokenizer.encode(first, add_special_tokens=False),
+                    )
+                text = first + "<|user|>root cause"
+                for kwargs in (
+                    {},
+                    {"add_special_tokens": True},
+                    {"add_special_tokens": False},
+                ):
+                    self.assertEqual(
+                        cache.encode(text, kwargs), tokenizer.encode(text, **kwargs)
+                    )
+                self.assertTrue(cache.enabled)
+
     def test_ids_equal_a_full_encode_on_every_turn(self):
         tokenizer = _tokenizer()
         cache = _unchecked_cache(tokenizer)
@@ -304,6 +348,43 @@ class TestRenderAndEncode(CustomTestCase):
         tail = len(tokenizer._tokenizer.encode("<|assistant|>\n"))
         self.assertEqual(second[: len(first) - tail], first[:-tail])
         self.assertEqual(len(tokenizer.encoded), 2)
+
+    def test_a_sequence_duplicating_post_processor_keeps_full_prompt_ids(self):
+        for nested in (False, True):
+            with self.subTest(nested=nested):
+                tokenizer = _tokenizer(
+                    template="{% for m in messages %}<|user|>{{ m['content'] }}{% endfor %}"
+                )
+                post_processor = processors.TemplateProcessing(
+                    single="$A $A", special_tokens=[]
+                )
+                if nested:
+                    post_processor = processors.Sequence(
+                        [processors.ByteLevel(), post_processor]
+                    )
+                tokenizer.backend_tokenizer.post_processor = post_processor
+                cache = PromptSegmentCache.create(tokenizer)
+                server = self._server(tokenizer, cache)
+                messages = [{"role": "user", "content": "query the logs"}]
+                # One segment hides the duplication during the initial checks.
+                for request in range(4):
+                    if request == 3:
+                        messages.append({"role": "user", "content": "root cause"})
+                    text = tokenizer.apply_chat_template(
+                        messages, tokenize=False, add_generation_prompt=True
+                    )
+                    prompt_ids, _ = render_and_encode(
+                        server,
+                        messages,
+                        tools=None,
+                        template_kwargs={},
+                        encode_kwargs={"add_special_tokens": False},
+                        use_cache=False,
+                    )
+                    self.assertEqual(
+                        prompt_ids, tokenizer.encode(text, add_special_tokens=False)
+                    )
+                self.assertIsNone(cache)
 
     def test_without_a_cache_the_prompt_is_encoded_whole(self):
         tokenizer = CountingTokenizer(_tokenizer())
