@@ -4,12 +4,14 @@ The bootstrap thread records the ACK target while a transfer is outstanding.
 Only the transfer worker can send that ACK after its write has drained.
 """
 
+import threading
 import unittest
 from collections import defaultdict
 from unittest.mock import MagicMock, patch
 
 import numpy as np
 from test_deferred_decode_kv_release import (
+    ABORT_GENERATION,
     DeferredAbortNotificationScenarios,
     TaggedAbortNotificationScenarios,
     WorkerFailureAbortScenarios,
@@ -20,9 +22,11 @@ from sglang.srt.disaggregation.common.conn import (
     ABORT_ACK_TAG,
     ABORT_TAG,
     AbortNotification,
+    AckTarget,
+    CommonKVManager,
 )
 from sglang.srt.disaggregation.common.utils import TransferKVChunk
-from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
+from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager, TransferInfo
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -130,6 +134,82 @@ class TestMooncakeAbortNotification(
                 self.assertEqual(manager.request_status[ROOM], KVPoll.Failed)
                 self.assertEqual(manager._deferred_ack_targets, {})
                 self.assertEqual(manager._sent, [])
+
+    def _run_worker_with_failed_send(self, manager) -> None:
+        """Run one chunk through transfer_worker with send_kvcache returning -1."""
+        session = "decode-session"
+        manager.enable_trace = False
+        manager.enable_staging = False
+        manager.is_mla_backend = True
+        manager.is_hybrid_mla_backend = False
+        manager.bootstrap_port = 8998
+        manager.attn_tp_rank = manager.pp_rank = manager.attn_cp_rank = 0
+        manager.pp_size = manager.attn_cp_size = 1
+        manager._staging_outstanding = defaultdict(int)
+        manager.session_lock = threading.Lock()
+        manager.session_failures = defaultdict(int)
+        manager.failed_sessions = set()
+        manager.state_layout_rejections = {}
+        manager.kv_args = MagicMock(kv_data_ptrs=[0x1000])
+        manager.decode_kv_args_table = {session: MagicMock(requires_dcp_relayout=False)}
+        manager._get_dsa_cache_transfer_skip_flags = lambda info: (False, False)
+        manager.transfer_infos = {
+            ROOM: {
+                (DECODE_IP, DECODE_PORT): TransferInfo(
+                    room=ROOM,
+                    endpoint=DECODE_IP,
+                    dst_port=DECODE_PORT,
+                    mooncake_session_id=session,
+                    dst_kv_indices=np.array([1], dtype=np.int32),
+                    dst_aux_index=0,
+                    dst_state_indices=[],
+                    required_dst_info_num=1,
+                    is_dummy=False,
+                )
+            }
+        }
+        manager.send_kvcache = MagicMock(return_value=-1)
+        manager.conclude_failure = MagicMock(
+            side_effect=lambda **kw: manager.update_status(
+                kw["bootstrap_room"], KVPoll.Failed
+            )
+        )
+        queue = MagicMock()
+        queue.get.side_effect = [_chunk(), None]
+
+        manager.transfer_worker(queue, MagicMock())
+
+        manager.send_kvcache.assert_called_once()
+        manager.conclude_failure.assert_called_once()
+        self.assertEqual(manager.request_status[ROOM], KVPoll.Failed)
+        self.assertEqual(manager._staging_outstanding[ROOM], 0)
+
+    def test_failed_send_never_acks_drained(self):
+        # batch_transfer_sync can return -1 with the batch still writing, so a
+        # failed send must leave decode to its release timeout, whether the
+        # ABORT arrived mid-send or only after the Failed status.
+        target = AckTarget(DECODE_IP, DECODE_PORT, ABORT_GENERATION)
+        for name, abort_before_send in (("mid-send", True), ("after", False)):
+            with self.subTest(name=name):
+                manager = _manager()
+                if abort_before_send:
+                    manager._deferred_ack_targets[ROOM] = {
+                        (target.ip, target.port): target
+                    }
+
+                self._run_worker_with_failed_send(manager)
+                self.assertEqual(manager._sent, [])
+                self.assertNotIn(ROOM, manager._deferred_ack_targets)
+
+                self._dispatch_abort(manager)
+                self.assertEqual(manager._sent, [])
+                self.assertNotIn(ROOM, manager._deferred_ack_targets)
+
+                # A new lifecycle of the same bootstrap_room acks again.
+                manager.request_status.pop(ROOM, None)
+                CommonKVManager.update_status(manager, ROOM, KVPoll.Bootstrapping)
+                self._dispatch_abort(manager)
+                self.assertEqual(manager._sent, [(ROOM, target)])
 
     def test_feature_off_sends_legacy_ack(self):
         manager = _manager(enabled=False)

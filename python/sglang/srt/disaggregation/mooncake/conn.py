@@ -2292,6 +2292,16 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
         return self._transfer_data(req.mooncake_session_id, transfer_blocks)
 
+    def _poison_unsettled_send(self, room: int) -> None:
+        """Keep the drain ack from firing after a submitted transfer failed.
+
+        batch_transfer_sync returns -1 on its wall-clock timeout with the batch
+        still running (freeBatchID refuses a busy batch and the handle is
+        dropped), so a failed send may still be writing decode's pages; decode
+        falls back to its release timeout instead."""
+        if self.enable_deferred_decode_kv_release:
+            self.poison_deferred_ack_room(room)
+
     def transfer_worker(
         self,
         queue: FastQueue,
@@ -2546,6 +2556,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                     logger.error(
                                         f"Session {req.mooncake_session_id} failed."
                                     )
+                            self._poison_unsettled_send(kv_chunk.room)
                             self.conclude_failure(
                                 bootstrap_room=kv_chunk.room,
                                 failure_reason=(
@@ -2578,6 +2589,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                         self.failed_sessions.add(
                                             req.mooncake_session_id
                                         )
+                                    self._poison_unsettled_send(kv_chunk.room)
                                     self.conclude_failure(
                                         bootstrap_room=kv_chunk.room,
                                         failure_reason=(
@@ -2600,6 +2612,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             # Only sync status when all the dst ranks have received the kvcache
                             if len(polls) == req.required_dst_info_num:
                                 status = KVPoll.Success if all(polls) else KVPoll.Failed
+                                if status == KVPoll.Failed:
+                                    # The aux write targets decode's metadata
+                                    # slot, which the deferred release also frees.
+                                    self._poison_unsettled_send(req.room)
                                 self.conclude_transfer(
                                     bootstrap_room=req.room,
                                     status=status,
