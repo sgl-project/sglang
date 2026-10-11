@@ -384,6 +384,8 @@ def test_unbatched_forward_is_a_single_request() -> None:
     av = [torch.zeros(2, 16, 1, 4, 4), torch.zeros(2, 8, 4)]
     ex(av, torch.tensor([0.5, 0.5]), torch.zeros(2, 3, 8))
     assert len(adapter.calls) == 2 and adapter.calls[1][0] is av
+
+
 class _FakePatcher:
     def __init__(self, model_options, executor):
         self.model_options = model_options

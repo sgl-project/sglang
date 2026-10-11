@@ -260,6 +260,8 @@ def test_multi_gpu_single_file_starts_without_cfg_parallel(
         str(path), "FluxPipeline", {"num_gpus": 2, "enable_cfg_parallel": True}
     )
     assert "cfg_parallel_degree" not in seen
+
+
 def test_loader_cache_dit_flag_change_reuses_worker() -> None:
     runtime = SGLDiffusionGenerator()
     patcher = object()
