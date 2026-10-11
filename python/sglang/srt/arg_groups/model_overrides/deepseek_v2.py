@@ -141,12 +141,14 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                 )
             else:
                 index_kpool = get_dsa_index_kpool(hf_config)
-                if index_kpool > 1 and getattr(cfg, "dcp_size", 1) > 1:
+                if index_kpool > 1 and cfg.dcp_size > 1:
                     raise ValueError(
                         "--dcp-size > 1 is not supported for DSA with "
                         f"index_kpool={index_kpool}: a pooled index key spans "
                         "positions owned by different DCP ranks."
                     )
+                # A logical page must own a whole pooled index group so that a
+                # prefix hit never ends inside one.
                 page_size = 64 * index_kpool
                 overrides["page_size"] = page_size
                 logger.warning(f"Setting page size to {page_size} for DeepSeek DSA.")

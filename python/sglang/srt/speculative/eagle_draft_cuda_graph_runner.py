@@ -459,7 +459,6 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
 
         forward_batch = ForwardBatch(
             forward_mode=ForwardMode.DECODE,
-            out_cache_loc_is_physical=True,
             batch_size=num_seqs,
             input_ids=None,
             req_pool_indices=req_pool_indices,
@@ -485,6 +484,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                 spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
             ),
         )
+        self.model_runner.kv_index_translator.bind_runner_slots(forward_batch)
 
         def run_once():
             self.draft_attn_backend.init_forward_metadata_in_graph(forward_batch)
