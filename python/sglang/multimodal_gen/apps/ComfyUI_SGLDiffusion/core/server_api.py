@@ -3,11 +3,34 @@ SGLang Diffusion Server API client.
 Provides a low-level interface for interacting with SGLang Diffusion HTTP server.
 """
 
+import json
+import logging
 import os
 import time
 from typing import Any, Dict, List, Optional, Union
 
 import requests
+
+logger = logging.getLogger(__name__)
+
+_LOG_VALUE_LIMIT = 200
+
+
+def _log_request(url: str, body: Dict[str, Any]) -> None:
+    """Log the endpoint and JSON body of a generation request, so it can be
+    copied into a script. The auth header is not logged; long values (base64
+    images, long paths) are shortened."""
+    if not logger.isEnabledFor(logging.INFO):
+        return
+    shown = {
+        k: (
+            f"{v[:_LOG_VALUE_LIMIT]}...<{len(v)} chars>"
+            if isinstance(v, str) and len(v) > _LOG_VALUE_LIMIT
+            else v
+        )
+        for k, v in body.items()
+    }
+    logger.info("SGLDiffusion request: POST %s %s", url, json.dumps(shown, default=str))
 
 
 def _error_detail(error: requests.exceptions.RequestException) -> str:
@@ -217,6 +240,7 @@ class SGLDiffusionServerAPI:
                 "Authorization": f"Bearer {self.api_key}",
             }
 
+            _log_request(f"{self.base_url}/images/edits", data)
             try:
                 response = requests.post(
                     f"{self.base_url}/images/edits",
@@ -242,6 +266,7 @@ class SGLDiffusionServerAPI:
             if style:
                 payload["style"] = style
 
+            _log_request(f"{self.base_url}/images/generations", payload)
             try:
                 response = requests.post(
                     f"{self.base_url}/images/generations",
@@ -353,6 +378,7 @@ class SGLDiffusionServerAPI:
         if extra_fields:
             payload.update(extra_fields)
 
+        _log_request(f"{self.base_url}/videos", payload)
         try:
             # Create video generation job
             response = requests.post(
