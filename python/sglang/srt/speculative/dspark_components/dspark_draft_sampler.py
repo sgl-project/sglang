@@ -126,7 +126,7 @@ class DsparkDraftSampler:
         # Gated/RNN subclasses return None (hidden-state-dependent bias); fall
         # through to the block sampler below.
         draft_tokens = None
-        fused_greedy = getattr(self.markov_head, "supports_sharded_greedy", False) or (
+        fused_greedy = self.markov_head.supports_sharded_greedy or (
             envs.SGLANG_DSPARK_OPT_FUSED_GREEDY_MARKOV.get()
             and isinstance(self.markov_head, VanillaMarkov)
         )

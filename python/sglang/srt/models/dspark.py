@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from abc import ABC, abstractmethod
 from typing import Callable, Iterable, Optional, Tuple
 
 import torch
@@ -50,7 +51,7 @@ def project_through_lm_head(hidden: torch.Tensor, lm_head: nn.Module) -> torch.T
 
 
 def run_markov_block(
-    head: nn.Module,
+    head: BaseDSparkMarkovHead,
     base_logits: torch.Tensor,
     *,
     first_prev_tokens: torch.Tensor,
@@ -58,6 +59,7 @@ def run_markov_block(
     sampler: StepSampler,
     collect_corrected: bool = True,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    state = head.init_state(hidden_states)
     batch_size, proposal_len = base_logits.shape[:2]
     if proposal_len == 0:
         empty = torch.empty(batch_size, 0, dtype=torch.long, device=base_logits.device)
@@ -68,11 +70,10 @@ def run_markov_block(
     prev_tokens = first_prev_tokens.long()
     for step_idx in range(proposal_len):
         step_hidden = None if hidden_states is None else hidden_states[:, step_idx, ...]
-        step_logits = head.apply_step_logits(
-            base_logits[:, step_idx, :],
-            token_ids=prev_tokens,
-            hidden_states=step_hidden,
+        bias, state = head.step_bias(
+            prev_tokens, hidden_states=step_hidden, state=state
         )
+        step_logits = head.step_logits(base_logits[:, step_idx, :], bias)
         next_tokens = sampler(step_logits, step_idx)
         sampled_tokens.append(next_tokens)
         if collect_corrected:
@@ -84,53 +85,34 @@ def run_markov_block(
     )
 
 
-class VanillaMarkov(nn.Module):
-    markov_head_type = "vanilla"
+class BaseDSparkMarkovHead(nn.Module, ABC):
+    """Corrects a draft block step by step: each step's base logits get a bias
+    computed from the token drafted at the step before."""
 
-    def __init__(self, *, vocab_size: int, markov_rank: int) -> None:
-        super().__init__()
-        self.vocab_size = int(vocab_size)
-        self.markov_rank = int(markov_rank)
-        if self.markov_rank <= 0:
-            raise ValueError(
-                f"VanillaMarkov requires markov_rank > 0, got {self.markov_rank}."
-            )
-        self.markov_w1 = nn.Embedding(self.vocab_size, self.markov_rank)
-        self.markov_w2 = nn.Linear(self.markov_rank, self.vocab_size, bias=False)
-
-    def get_prev_embeddings(self, token_ids: torch.Tensor) -> torch.Tensor:
-        return self.markov_w1(token_ids.long())
-
-    def project_bias(self, latent_states: torch.Tensor) -> torch.Tensor:
-        return self.markov_w2(latent_states)
-
-    def compute_step_bias(
-        self,
-        token_ids: torch.Tensor,
-        hidden_states: Optional[torch.Tensor],
-    ) -> torch.Tensor:
+    def init_state(
+        self, hidden_states: Optional[torch.Tensor]
+    ) -> Optional[torch.Tensor]:
         del hidden_states
-        return self.project_bias(self.get_prev_embeddings(token_ids))
+        return None
 
-    def apply_step_logits(
+    @abstractmethod
+    def step_bias(
         self,
-        logits: torch.Tensor,
+        prev_tokens: torch.Tensor,
         *,
-        token_ids: torch.Tensor,
         hidden_states: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        return logits + self.compute_step_bias(token_ids, hidden_states)
+        state: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Return this step's bias and the state the next step reads."""
 
-    def apply_block_logits(
-        self,
-        base_logits: torch.Tensor,
-        *,
-        token_ids: torch.Tensor,
-        hidden_states: Optional[torch.Tensor],
+    def step_logits(
+        self, base_logits: torch.Tensor, bias: torch.Tensor
     ) -> torch.Tensor:
-        if base_logits.size(-2) == 0:
-            return base_logits
-        return base_logits + self.compute_step_bias(token_ids, hidden_states)
+        return base_logits + bias
+
+    @property
+    def supports_sharded_greedy(self) -> bool:
+        return False
 
     def sample_block(
         self,
@@ -149,6 +131,35 @@ class VanillaMarkov(nn.Module):
             sampler=sampler,
             collect_corrected=collect_corrected,
         )
+
+
+class VanillaMarkov(BaseDSparkMarkovHead):
+    def __init__(self, *, vocab_size: int, markov_rank: int) -> None:
+        super().__init__()
+        self.vocab_size = int(vocab_size)
+        self.markov_rank = int(markov_rank)
+        if self.markov_rank <= 0:
+            raise ValueError(
+                f"VanillaMarkov requires markov_rank > 0, got {self.markov_rank}."
+            )
+        self.markov_w1 = nn.Embedding(self.vocab_size, self.markov_rank)
+        self.markov_w2 = nn.Linear(self.markov_rank, self.vocab_size, bias=False)
+
+    def get_prev_embeddings(self, token_ids: torch.Tensor) -> torch.Tensor:
+        return self.markov_w1(token_ids.long())
+
+    def project_bias(self, latent_states: torch.Tensor) -> torch.Tensor:
+        return self.markov_w2(latent_states)
+
+    def step_bias(
+        self,
+        prev_tokens: torch.Tensor,
+        *,
+        hidden_states: Optional[torch.Tensor],
+        state: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        del hidden_states
+        return self.project_bias(self.get_prev_embeddings(prev_tokens)), state
 
     def sample_block_greedy_fused(
         self,
@@ -219,8 +230,6 @@ class Nemotron35VanillaMarkov(VanillaMarkov):
 
 
 class GatedMarkovHead(VanillaMarkov):
-    markov_head_type = "gated"
-
     def __init__(self, *, vocab_size: int, markov_rank: int, hidden_size: int) -> None:
         super().__init__(vocab_size=vocab_size, markov_rank=markov_rank)
         self.gate_proj = nn.Linear(int(hidden_size) + markov_rank, markov_rank)
@@ -236,16 +245,18 @@ class GatedMarkovHead(VanillaMarkov):
         gate_inputs = torch.cat([hidden_states, prev_embeddings], dim=-1)
         return torch.sigmoid(self.gate_proj(gate_inputs))
 
-    def compute_step_bias(
+    def step_bias(
         self,
-        token_ids: torch.Tensor,
+        prev_tokens: torch.Tensor,
+        *,
         hidden_states: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        prev_embeddings = self.get_prev_embeddings(token_ids)
-        gate = self.compute_gate(token_ids, hidden_states).to(
+        state: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        prev_embeddings = self.get_prev_embeddings(prev_tokens)
+        gate = self.compute_gate(prev_tokens, hidden_states).to(
             dtype=prev_embeddings.dtype
         )
-        return self.project_bias(gate * prev_embeddings)
+        return self.project_bias(gate * prev_embeddings), state
 
     def sample_block_greedy_fused(
         self,
@@ -259,8 +270,6 @@ class GatedMarkovHead(VanillaMarkov):
 
 
 class RNNHead(VanillaMarkov):
-    markov_head_type = "rnn"
-
     def __init__(self, *, vocab_size: int, markov_rank: int, hidden_size: int) -> None:
         super().__init__(vocab_size=vocab_size, markov_rank=markov_rank)
         self.hidden_size = int(hidden_size)
@@ -281,84 +290,28 @@ class RNNHead(VanillaMarkov):
         bias = self.project_bias(torch.tanh(output_raw))
         return new_state, bias
 
-    def compute_step_bias(
-        self,
-        token_ids: torch.Tensor,
-        hidden_states: Optional[torch.Tensor],
-    ) -> torch.Tensor:
+    def init_state(
+        self, hidden_states: Optional[torch.Tensor]
+    ) -> Optional[torch.Tensor]:
         if hidden_states is None:
             raise ValueError("RNNHead requires hidden_states.")
-        prev_embeddings = self.get_prev_embeddings(token_ids)
-        state = torch.zeros_like(prev_embeddings)
-        _, bias = self._rnn_step(state, prev_embeddings, hidden_states)
-        return bias
-
-    def apply_block_logits(
-        self,
-        base_logits: torch.Tensor,
-        *,
-        token_ids: torch.Tensor,
-        hidden_states: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        if hidden_states is None:
-            raise ValueError("RNNHead requires hidden_states.")
-        block_size = base_logits.size(-2)
-        if block_size == 0:
-            return base_logits
-        leading_shape = base_logits.shape[:-2]
-        state = torch.zeros(
-            *leading_shape,
+        return torch.zeros(
+            hidden_states.shape[0],
             self.markov_rank,
-            device=base_logits.device,
+            device=hidden_states.device,
             dtype=hidden_states.dtype,
         )
-        output_logits = []
-        for k in range(block_size):
-            prev_emb = self.get_prev_embeddings(token_ids[..., k])
-            state, bias = self._rnn_step(state, prev_emb, hidden_states[..., k, :])
-            output_logits.append(base_logits[..., k, :] + bias)
-        return torch.stack(output_logits, dim=-2)
 
-    def sample_block(
+    def step_bias(
         self,
-        base_logits: torch.Tensor,
+        prev_tokens: torch.Tensor,
         *,
-        first_prev_tokens: torch.Tensor,
         hidden_states: Optional[torch.Tensor],
-        sampler: StepSampler,
-        collect_corrected: bool = True,
+        state: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        if hidden_states is None:
-            raise ValueError("RNNHead requires hidden_states.")
-        batch_size, proposal_len = base_logits.shape[:2]
-        if proposal_len == 0:
-            empty = torch.empty(
-                batch_size, 0, dtype=torch.long, device=base_logits.device
-            )
-            return empty, base_logits
-
-        state = torch.zeros(
-            batch_size,
-            self.markov_rank,
-            device=base_logits.device,
-            dtype=hidden_states.dtype,
-        )
-        sampled_tokens = []
-        corrected_logits = []
-        prev_tokens = first_prev_tokens.long()
-        for step_idx in range(proposal_len):
-            prev_emb = self.get_prev_embeddings(prev_tokens)
-            state, bias = self._rnn_step(state, prev_emb, hidden_states[:, step_idx, :])
-            step_logits = base_logits[:, step_idx, :] + bias
-            next_tokens = sampler(step_logits, step_idx)
-            sampled_tokens.append(next_tokens)
-            if collect_corrected:
-                corrected_logits.append(step_logits.unsqueeze(1))
-            prev_tokens = next_tokens
-        return (
-            torch.stack(sampled_tokens, dim=1),
-            torch.cat(corrected_logits, dim=1) if collect_corrected else None,
-        )
+        prev_emb = self.get_prev_embeddings(prev_tokens)
+        state, bias = self._rnn_step(state, prev_emb, hidden_states)
+        return bias, state
 
     def sample_block_greedy_fused(
         self,

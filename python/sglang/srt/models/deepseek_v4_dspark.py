@@ -48,11 +48,10 @@ from sglang.srt.models.deepseek_v4 import (
     make_hc_head_params,
 )
 from sglang.srt.models.dspark import (
+    BaseDSparkMarkovHead,
     DSparkConfidenceHead,
-    StepSampler,
     gather_and_crop_vocab,
     project_through_lm_head,
-    run_markov_block,
 )
 from sglang.srt.runtime_context import (
     get_parallel,
@@ -398,9 +397,7 @@ class MarkovW2ShardGeometry(msgspec.Struct, frozen=True):
     num_embeddings_padded: int
 
 
-class DSparkV4MarkovHead(nn.Module):
-    markov_head_type = "vanilla"
-
+class DSparkV4MarkovHead(BaseDSparkMarkovHead):
     def __init__(
         self, *, vocab_size: int, markov_rank: int, is_dsv41: bool = False
     ) -> None:
@@ -487,38 +484,32 @@ class DSparkV4MarkovHead(nn.Module):
             return F.linear(latent_states.to(weight.dtype), weight).float()
         return F.linear(latent_states.float(), weight)
 
-    def compute_step_bias(
-        self, token_ids: torch.Tensor, hidden_states: Optional[torch.Tensor]
-    ) -> torch.Tensor:
-        del hidden_states
-        return self.project_bias(self.get_prev_embeddings(token_ids))
-
-    def apply_step_logits(
+    def step_bias(
         self,
-        logits: torch.Tensor,
+        prev_tokens: torch.Tensor,
         *,
-        token_ids: torch.Tensor,
         hidden_states: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        if self._tp_shard is not None:
-            return self._apply_step_logits_sharded(
-                base_local=logits, token_ids=token_ids
-            )
-        return logits + self.compute_step_bias(token_ids, hidden_states)
-
-    def _apply_step_logits_sharded(
-        self, *, base_local: torch.Tensor, token_ids: torch.Tensor
-    ) -> torch.Tensor:
+        state: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        del hidden_states
+        latent = self.get_prev_embeddings(prev_tokens)
         shard = self._tp_shard
-        latent = self.get_prev_embeddings(token_ids)
+        if shard is None:
+            return self.project_bias(latent), state
         weight_local = self.markov_w2.weight[
             shard.org_vocab_start : shard.org_vocab_end
         ]
         if self._opt_markov_w2_bf16:
-            bias = F.linear(latent.to(weight_local.dtype), weight_local)
-        else:
-            bias = F.linear(latent.float(), weight_local)
-        step_local = BuildStepLocal.execute(bias=bias, base_local=base_local)
+            # Keep the bias in BF16; the step add upcasts it to FP32.
+            return F.linear(latent.to(weight_local.dtype), weight_local), state
+        return F.linear(latent.float(), weight_local), state
+
+    def step_logits(
+        self, base_logits: torch.Tensor, bias: torch.Tensor
+    ) -> torch.Tensor:
+        if self._tp_shard is None:
+            return base_logits + bias
+        step_local = BuildStepLocal.execute(bias=bias, base_local=base_logits)
         full = self._vocab_gather(step_local)
         return full[..., : self.vocab_size]
 
@@ -536,13 +527,10 @@ class DSparkV4MarkovHead(nn.Module):
         )
 
         shard = self._tp_shard
-        weight = self.markov_w2.weight[shard.org_vocab_start : shard.org_vocab_end]
         prev = first_prev_tokens.long()
         tokens = []
         for step in range(base_logits.shape[1]):
-            latent = self.get_prev_embeddings(prev)
-            # Preserve the same BF16 GEMM rounding before the FP32 logits add.
-            bias = F.linear(latent.to(weight.dtype), weight)
+            bias, _ = self.step_bias(prev, hidden_states=None, state=None)
             prev = sharded_greedy_step(
                 bias,
                 base_logits[:, step],
@@ -557,24 +545,6 @@ class DSparkV4MarkovHead(nn.Module):
         embed = self.get_prev_embeddings(token_ids)
         logits = self.project_bias(embed)
         return logits, embed
-
-    def sample_block(
-        self,
-        base_logits: torch.Tensor,
-        *,
-        first_prev_tokens: torch.Tensor,
-        hidden_states: Optional[torch.Tensor],
-        sampler: StepSampler,
-        collect_corrected: bool = True,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        return run_markov_block(
-            self,
-            base_logits,
-            first_prev_tokens=first_prev_tokens,
-            hidden_states=hidden_states,
-            sampler=sampler,
-            collect_corrected=collect_corrected,
-        )
 
 
 def build_dspark_v4_confidence_head(
