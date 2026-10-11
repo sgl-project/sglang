@@ -260,6 +260,8 @@ def test_multi_gpu_single_file_starts_without_cfg_parallel(
         str(path), "FluxPipeline", {"num_gpus": 2, "enable_cfg_parallel": True}
     )
     assert "cfg_parallel_degree" not in seen
+
+
 def _status_runtime(alive=True):
     from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.worker_status import (
         StepLatency,
