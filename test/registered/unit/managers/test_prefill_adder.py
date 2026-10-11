@@ -128,7 +128,9 @@ class TestPrefillAdder(CustomTestCase):
         req.extend_end = None
         req.full_untruncated_fill_ids = []
         req.output_ids = [0] * output_len
-        req.sampling_params = SimpleNamespace(max_new_tokens=max_new_tokens)
+        req.sampling_params = SimpleNamespace(
+            max_new_tokens=max_new_tokens, ignore_eos=False
+        )
         req.time_stats = SimpleNamespace(wait_queue_entry_time=wait_time)
         req.retracted_stain = False
         req.host_hit_length = 0

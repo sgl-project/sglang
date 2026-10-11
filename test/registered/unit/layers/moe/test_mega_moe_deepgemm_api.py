@@ -14,7 +14,9 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.layers.moe import MoeA2ABackend, MoeRunnerBackend, mega_moe
+from sglang.srt.layers.moe import topk as topk_module
 from sglang.srt.layers.moe.fused_moe_triton import layer as fused_moe_layer_module
+from sglang.srt.layers.moe.topk import TopKConfig
 from sglang.srt.layers.moe.utils import draft_model_build_scope
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.runtime_context import get_context, get_exec, get_flags, get_parallel
@@ -224,7 +226,9 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
                 swiglu_limit=None,
             ),
             experts=experts,
-            gate=MagicMock(return_value=torch.empty((1, 8))),
+            gate=MagicMock(
+                return_value=torch.empty((1, 8)), e_score_correction_bias_vl=None
+            ),
             topk=MagicMock(return_value=topk_output),
             is_hash=False,
             num_fused_shared_experts=0,
@@ -342,15 +346,143 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
         self.assertIs(mega_call.args[2], experts.mega_l2_weights)
         self.assertEqual(mega_call.kwargs.get("activation_clamp"), 7.0)
 
-    def test_shape_check_rejects_unaligned_intermediate(self):
-        # Qwen3-30B-A3B: intermediate 768 leaves a 24-byte scale row.
-        with self.assertRaisesRegex(ValueError, "multiples of 512"):
-            mega_moe.check_mega_moe_shapes(2048, 768, "fp8xfp4")
+    def test_v41_megamoe_selects_image_bias_on_local_rows(self):
+        """Image rows must retain their router bias after attention-TP sharding.
+
+        Equal logits make the two biases select disjoint experts. A numerical
+        expert boundary exposes accidentally routing image rows as text, and
+        padded rows must contribute nothing.
+        """
+        for fused_shared in (0, 1):
+            for scale_in_topk in (False, True):
+                with self.subTest(
+                    fused_shared=fused_shared, scale_in_topk=scale_in_topk
+                ):
+                    moe = self._v41_moe(fused_shared, scale_in_topk)
+                    ids = torch.tensor([7, 99, 99])
+                    hidden = torch.ones((3, 4))
+                    batch = SimpleNamespace(
+                        moe_num_token_non_padded=lambda: torch.tensor(
+                            2, dtype=torch.int32
+                        )
+                    )
+
+                    def run_experts(_experts, x, topk_ids, weights, **kwargs):
+                        # Routed experts multiply x by their physical ID + 1;
+                        # the rank-1 shared slot (ID 5) is an identity expert.
+                        factors = (topk_ids + 1).float()
+                        factors[topk_ids == 5] = 1.0
+                        self.assertTrue((topk_ids[2] == -1).all())
+                        return x * (
+                            (factors * weights).sum(-1, keepdim=True)
+                            * kwargs["routed_scaling_factor"]
+                        )
+
+                    with (
+                        get_flags().moe.override(a2a_backend=MoeA2ABackend.MEGAMOE),
+                        get_parallel().override(moe_ep_size=2, moe_ep_rank=1),
+                        patch.object(
+                            mega_moe.ExpertLocationDispatchInfo,
+                            "init_new",
+                            return_value=None,
+                        ),
+                        patch.object(mega_moe, "run_mega_routed_experts", run_experts),
+                        # The fused padded-row fill requires Triton/GPU.
+                        patch(
+                            "sglang.srt.multimodal.dsv41.vl_routing.is_cuda",
+                            return_value=False,
+                        ),
+                        patch.object(topk_module, "_is_cuda", False),
+                        patch.object(
+                            topk_module, "_can_fuse_padded_region", return_value=False
+                        ),
+                    ):
+                        out = mega_moe._run_mega_routed(
+                            moe, hidden, batch, ids, num_tokens=3
+                        )
+                        text_out = mega_moe._run_mega_routed(
+                            moe, hidden, batch, None, num_tokens=3
+                        )
+                    # Text selects logical 0/1; image selects logical 2/3. With
+                    # a shared slot, rank-1 routed IDs shift by one (2/3 -> 3/4).
+                    expected = torch.tensor(
+                        [3.0 + fused_shared, 7.0 + 3.0 * fused_shared, 0.0]
+                    )[:, None].expand_as(hidden)
+                    torch.testing.assert_close(out, expected)
+                    text_expected = torch.tensor(
+                        [3.0 + fused_shared, 3.0 + fused_shared, 0.0]
+                    )[:, None].expand_as(hidden)
+                    torch.testing.assert_close(text_out, text_expected)
+
+    def test_v41_megamoe_empty_rank_still_participates(self):
+        """An idle DP rank must reach A2A combine without running its router."""
+        moe = self._v41_moe(0, False)
+        hidden = torch.empty((0, 4))
+
+        def run_experts(_experts, x, ids, weights, **kwargs):
+            self.assertIsNone(ids)
+            self.assertIsNone(weights)
+            # The collective boundary owns the result even on an idle rank.
+            return x.new_empty((0, kwargs["hidden_size"]))
+
+        with patch.object(mega_moe, "run_mega_routed_experts", run_experts):
+            out = mega_moe._run_mega_routed(
+                moe, hidden, None, torch.empty(0, dtype=torch.long), num_tokens=0
+            )
+        self.assertEqual(out.shape, (0, 4))
+        moe.gate.assert_not_called()
+
+    @staticmethod
+    def _v41_moe(fused_shared, scale_in_topk):
+        return SimpleNamespace(
+            config=SimpleNamespace(
+                hidden_size=4,
+                num_experts_per_tok=2,
+                moe_intermediate_size=8,
+                image_token_id=99,
+            ),
+            experts=SimpleNamespace(
+                should_fuse_routed_scaling_factor_in_topk=scale_in_topk,
+                moe_runner_config=SimpleNamespace(swiglu_limit=None),
+            ),
+            gate=MagicMock(
+                return_value=torch.zeros((3, 4)),
+                e_score_correction_bias=torch.tensor([4.0, 3.0, 0.0, 0.0]),
+                e_score_correction_bias_vl=torch.tensor([0.0, 0.0, 3.0, 4.0]),
+            ),
+            topk=SimpleNamespace(
+                topk_config=TopKConfig(
+                    top_k=2 + fused_shared,
+                    num_fused_shared_experts=fused_shared,
+                    renormalize=True,
+                    routed_scaling_factor=2.0,
+                    apply_routed_scaling_factor_on_output=scale_in_topk,
+                )
+            ),
+            is_hash=False,
+            num_fused_shared_experts=fused_shared,
+            layer_id=0,
+            routed_scaling_factor=2.0,
+            mega_shared_l1_weights=None,
+            mega_shared_l2_weights=None,
+        )
+
+    def test_shape_check_uses_pinned_fp8_fp4_alignment(self):
+        # Packed SF groups need 128 elements, not a 16-byte token SF row.
+        mega_moe.check_mega_moe_shapes(2048, 768, "fp8xfp4")
+        mega_moe.check_mega_moe_shapes(5120, 2304, "fp8xfp4")
+        mega_moe.check_mega_moe_shapes(512, 128, "fp8xfp4")
+        with self.assertRaisesRegex(ValueError, "intermediate_size.*multiple of 128"):
+            mega_moe.check_mega_moe_shapes(2048, 736, "fp8xfp4")
+        with self.assertRaisesRegex(ValueError, "hidden_size.*multiple of 512"):
+            mega_moe.check_mega_moe_shapes(2016, 768, "fp8xfp4")
+        with self.assertRaisesRegex(ValueError, "hidden_size.*multiple of 512"):
+            mega_moe.check_mega_moe_shapes(256, 128, "fp8xfp4")
         mega_moe.check_mega_moe_shapes(4096, 1536, "fp8xfp4")
         mega_moe.check_mega_moe_shapes(4096, 1024, "mxf4xmxf4")
         # 768 is a multiple of 256, so the NVFP4 (g16) rule accepts it.
         mega_moe.check_mega_moe_shapes(2048, 768, "nvfp4xnvfp4")
-        with self.assertRaisesRegex(ValueError, "multiples of 256"):
+        with self.assertRaisesRegex(ValueError, "intermediate_size.*multiple of 256"):
             mega_moe.check_mega_moe_shapes(2048, 384, "nvfp4xnvfp4")
 
     def test_mxf4_l1_uses_packed_gate_up_interleave(self):

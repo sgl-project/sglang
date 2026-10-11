@@ -61,22 +61,25 @@ def handle_deprecated_dp_attention(server_args: Any):
     )
 
 
-def _boundary_parallelism_overrides(cfg, model_type: str) -> dict:
+def _boundary_parallelism_overrides(cfg, model_type: str, architecture: str) -> dict:
     """Resolve the token-row modes the model's forward actually enters."""
     nemotron = model_type in ("nemotron_h", "nemotron_h_puzzle")
     longcat = model_type == "longcat_flash"
+    kimi_k3 = architecture in (
+        "KimiK3ForConditionalGeneration",
+        "KimiK3LinearForCausalLM",
+    )
     if nemotron and cfg.attn_cp_size > 1:
         raise ValueError("Nemotron-H does not support --attn-cp-size > 1")
     if longcat and cfg.enable_prefill_cp and cfg.attn_cp_size > 1:
         raise ValueError(
             "LongCat-Flash does not support --enable-prefill-cp with --attn-cp-size > 1"
         )
-    if (nemotron or longcat) and cfg.enable_attn_tp_input_scattered:
-        # Neither model enters the input-scattered attention scope. Preserve
-        # their existing ordinary execution and make the effective flag explicit.
+    if (nemotron or longcat or kimi_k3) and cfg.enable_attn_tp_input_scattered:
+        # None of these models enters the input-scattered attention scope.
         logger.warning(
             "Disabling input-scattered attention for %s: its forward does not enter that scope",
-            model_type,
+            architecture,
         )
         return {"enable_attn_tp_input_scattered": False}
     return {}
@@ -99,7 +102,7 @@ def handle_context_parallelism(server_args: Any):
             server_args,
             "boundary_parallelism",
             **_boundary_parallelism_overrides(
-                cfg, model_config.hf_text_config.model_type
+                cfg, model_config.hf_text_config.model_type, model_arch
             ),
         )
         if (

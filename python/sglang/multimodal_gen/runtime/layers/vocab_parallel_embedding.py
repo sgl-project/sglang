@@ -15,6 +15,7 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_tp_group,
     tensor_model_parallel_all_reduce,
 )
+from sglang.multimodal_gen.runtime.layers.linear import UnquantizedLinearMethod
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
@@ -23,7 +24,6 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
 from sglang.multimodal_gen.runtime.layers.utils import get_group_rank, get_group_size
 from sglang.multimodal_gen.runtime.models.parameter import BasevLLMParameter
 from sglang.multimodal_gen.runtime.platforms import current_platform
-from sglang.multimodal_gen.runtime.utils.weight_attrs import set_weight_attrs
 
 DEFAULT_VOCAB_PADDING_SIZE = 64
 
@@ -31,29 +31,7 @@ DEFAULT_VOCAB_PADDING_SIZE = 64
 class UnquantizedEmbeddingMethod(QuantizeMethodBase):
     """Unquantized method for embeddings."""
 
-    def create_weights(
-        self,
-        layer: torch.nn.Module,
-        input_size_per_partition: int,
-        output_partition_sizes: list[int],
-        input_size: int,
-        output_size: int,
-        params_dtype: torch.dtype,
-        **extra_weight_attrs,
-    ):
-        """Create weights for embedding layer."""
-
-        weight = Parameter(
-            torch.empty(
-                sum(output_partition_sizes),
-                input_size_per_partition,
-                dtype=params_dtype,
-            ),
-            requires_grad=False,
-        )
-        set_weight_attrs(weight, {"input_dim": 1, "output_dim": 0})
-        layer.register_parameter("weight", weight)
-        set_weight_attrs(weight, extra_weight_attrs)
+    create_weights = UnquantizedLinearMethod.create_weights
 
     def apply(
         self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None
@@ -343,71 +321,6 @@ class VocabParallelEmbedding(torch.nn.Module):
             added_vocab_start_index,
             added_vocab_end_index,
         )
-
-    def get_sharded_to_full_mapping(self) -> list[int] | None:
-        """Get a mapping that can be used to reindex the gathered
-        logits for sampling.
-
-        During sampling, we gather logits from all ranks. The relationship
-        of index->token_id will follow the same format as outlined in the class
-        docstring. However, after the gather, we want to reindex the final
-        logits tensor to map index->token_id one-to-one (the index is always
-        equal the token_id it corresponds to). The indices returned by this
-        method allow us to do that.
-        """
-        if self.tp_size < 2:
-            return None
-
-        base_embeddings: list[int] = []
-        added_embeddings: list[int] = []
-        padding: list[int] = []
-        for tp_rank in range(self.tp_size):
-            shard_indices = self._get_indices(
-                self.num_embeddings_padded,
-                self.org_vocab_size_padded,
-                self.num_embeddings,
-                self.org_vocab_size,
-                tp_rank,
-                self.tp_size,
-            )
-            range_start = self.num_embeddings_per_partition * tp_rank
-            range_end = self.num_embeddings_per_partition * (tp_rank + 1)
-            base_embeddings.extend(
-                range(range_start, range_start + shard_indices.num_org_elements)
-            )
-            padding.extend(
-                range(
-                    range_start + shard_indices.num_org_elements,
-                    range_start + shard_indices.num_org_elements_padded,
-                )
-            )
-            added_embeddings.extend(
-                range(
-                    range_start + shard_indices.num_org_elements_padded,
-                    range_start
-                    + shard_indices.num_org_elements_padded
-                    + shard_indices.num_added_elements,
-                )
-            )
-            padding.extend(
-                range(
-                    range_start
-                    + shard_indices.num_org_elements_padded
-                    + shard_indices.num_added_elements,
-                    range_start
-                    + shard_indices.num_org_elements_padded
-                    + shard_indices.num_added_elements_padded,
-                )
-            )
-            assert (
-                range_start
-                + shard_indices.num_org_elements_padded
-                + shard_indices.num_added_elements_padded
-                == range_end
-            )
-        ret = base_embeddings + added_embeddings + padding
-        assert len(ret) == self.num_embeddings_padded
-        return ret
 
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
         output_dim = getattr(param, "output_dim", None)
