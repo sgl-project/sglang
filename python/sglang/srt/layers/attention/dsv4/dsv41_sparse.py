@@ -18,6 +18,7 @@ from sglang.kernels.ops.attention.dsv4.torch_quant import (
 from sglang.kernels.ops.gemm.bf16_fp32 import linear_bf16_fp32
 from sglang.kernels.ops.gemm.router_gemv_hip import rocm_gemv_split_k_max_tokens
 from sglang.kernels.ops.layernorm.rmsnorm_fp32 import rmsnorm_fp32
+from sglang.srt.environ import envs
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.utils import add_prefix, is_gfx95_supported
@@ -99,14 +100,18 @@ def rope_tail(
 
 
 def fused_low_ratio_compress_supported() -> bool:
-    """The fused c1 / c2 / index-K decode kernels need sm100+ on CUDA (they pack fp4
-    with `cvt.rn.satfinite.e2m1x2`) or gfx950 on ROCm; the answer also fixes the
-    ratio-2 weight layout (`wkv_gate`, or `wkv` plus `wgate`)."""
+    """The fused c1 / c2 / index-K decode kernels need sm90+ on CUDA or gfx950 on
+    ROCm; the answer also fixes the ratio-2 weight layout (`wkv_gate`, or `wkv`
+    plus `wgate`). Hopper is opt-in until the PDMux GPU regression passes;
+    the decision is stored on the compressor before loading/capturing."""
     if not torch.cuda.is_available():
         return False
     if torch.version.hip is not None:
         return is_gfx95_supported()
-    return torch.cuda.get_device_capability()[0] >= 10
+    major = torch.cuda.get_device_capability()[0]
+    return major >= 10 or (
+        major == 9 and envs.SGLANG_OPT_USE_FUSED_DSV41_COMPRESS_SM90.get()
+    )
 
 
 class DeepseekV41Compressor(nn.Module):

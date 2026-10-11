@@ -22,9 +22,10 @@ from sglang.srt.utils import is_cuda
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-# The c2 JIT kernels are the SM100 build; the only Blackwell runner config is the
+# The c2 JIT kernels serve SM90 and SM100; the only Blackwell runner config is the
 # four-GPU one.
 register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 HEAD_DIM = 512
 ROPE_DIM = 64
@@ -36,8 +37,8 @@ EPS = 1e-6
 SLOT_BASE = 64
 
 
-def _sm100() -> bool:
-    return is_cuda() and torch.cuda.get_device_capability()[0] == 10
+def _fused_c2_device() -> bool:
+    return is_cuda() and torch.cuda.get_device_capability()[0] in (9, 10)
 
 
 class Stream:
@@ -167,7 +168,7 @@ class TestC2PrefillRing(CustomTestCase):
             )
         return caches, latents
 
-    @unittest.skipUnless(_sm100(), "the c2 JIT kernels are the SM100 build")
+    @unittest.skipUnless(_fused_c2_device(), "the c2 JIT kernels need SM90 or SM100")
     def test_chunked_extend_matches_decode(self):
         # Request 0 starts even, request 1 odd and spans more rows than the ring,
         # request 2 odd with a single row in its first chunk.

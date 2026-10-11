@@ -1598,6 +1598,9 @@ class Envs:
     # restores the torch scoring. Opt in until the SM90 PDMux GPU regression
     # has passed; unsupported devices/dtypes keep the existing scorer.
     SGLANG_OPT_USE_FUSED_DSV41_INDEXER_SCORES = EnvBool(False)
+    # Opt into the fused low-ratio compressor on Hopper. Read at model load:
+    # changing the ratio-2 weight layout requires restarting the server.
+    SGLANG_OPT_USE_FUSED_DSV41_COMPRESS_SM90 = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
     # gfx950 DeepSeek-V4.1 prefill: attend with aiter's OPUS sparse kernel over a bf16
