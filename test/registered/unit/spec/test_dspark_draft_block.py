@@ -105,14 +105,23 @@ class TestSampleDraftBlock(CustomTestCase):
 class TestFusedGreedyEligibility(CustomTestCase):
     def test_only_the_plain_w2_gemv_head_fuses(self):
         # A head that changes the bias must keep the shared op.
-        for cls, fuses in (
-            (VanillaMarkov, True),
-            (Nemotron35VanillaMarkov, False),
-            (GatedMarkovHead, False),
-            (RNNHead, False),
-        ):
-            with self.subTest(head=cls.__name__):
-                self.assertIs(object.__new__(cls)._bias_is_w2_gemv(), fuses)
+        heads = (
+            (VanillaMarkov(vocab_size=VOCAB, markov_rank=RANK), True),
+            (
+                Nemotron35VanillaMarkov(
+                    vocab_size=VOCAB, markov_rank=RANK, quant_config=None, prefix=""
+                ),
+                False,
+            ),
+            (
+                GatedMarkovHead(vocab_size=VOCAB, markov_rank=RANK, hidden_size=HIDDEN),
+                False,
+            ),
+            (RNNHead(vocab_size=VOCAB, markov_rank=RANK, hidden_size=HIDDEN), False),
+        )
+        for head, fuses in heads:
+            with self.subTest(head=type(head).__name__):
+                self.assertIs(head.greedy_w2_weight() is not None, fuses)
 
 
 if __name__ == "__main__":

@@ -26,6 +26,9 @@ from sglang.srt.speculative.ragged_verify import (
     read_ragged_verify_mode,
 )
 
+if TYPE_CHECKING:
+    from sglang.srt.distributed.device_communicators.vocab_gather import VocabGather
+
 logger = logging.getLogger(__name__)
 
 
@@ -46,10 +49,6 @@ def project_through_lm_head(hidden: torch.Tensor, lm_head: nn.Module) -> torch.T
     return torch.matmul(hidden.to(weight.dtype), weight.T)
 
 
-if TYPE_CHECKING:
-    from sglang.srt.distributed.device_communicators.vocab_gather import VocabGather
-
-
 class VocabShard(msgspec.Struct, frozen=True):
     """Where a rank's vocab slice starts, and the gather over its group."""
 
@@ -60,6 +59,10 @@ class VocabShard(msgspec.Struct, frozen=True):
 class BaseDSparkMarkovHead(nn.Module, ABC):
     """Corrects a draft block step by step: each step's base logits get a bias
     computed from the token drafted at the step before."""
+
+    vocab_size: int
+    # The rank's slice of a TP-sharded vocab; None when the vocab is whole.
+    vocab_shard: Optional[VocabShard] = None
 
     def init_state(
         self, hidden_states: Optional[torch.Tensor]
@@ -81,14 +84,9 @@ class BaseDSparkMarkovHead(nn.Module, ABC):
     def step_logits_dtype(self, base_dtype: torch.dtype) -> torch.dtype:
         """The dtype of ``base_logits + bias``."""
 
-    # The rank's slice of a TP-sharded vocab; None when the vocab is whole.
-    vocab_shard: Optional[VocabShard] = None
-
-    def w2_gemv_inputs(
-        self, prev_tokens: torch.Tensor
-    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-        """The previous tokens' embeddings and the w2 weight when the bias is
-        exactly their GEMV, for the fused greedy kernel; otherwise None."""
+    def greedy_w2_weight(self) -> Optional[torch.Tensor]:
+        """The w2 weight when the bias is exactly the GEMV of the previous
+        token's embedding, for the fused greedy kernel; otherwise None."""
         return None
 
 
@@ -124,12 +122,8 @@ class VanillaMarkov(BaseDSparkMarkovHead):
         del hidden_states
         return self.project_bias(self.get_prev_embeddings(prev_tokens)), state
 
-    def w2_gemv_inputs(
-        self, prev_tokens: torch.Tensor
-    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-        if not self._bias_is_w2_gemv():
-            return None
-        return self.get_prev_embeddings(prev_tokens), self.markov_w2.weight
+    def greedy_w2_weight(self) -> Optional[torch.Tensor]:
+        return self.markov_w2.weight if self._bias_is_w2_gemv() else None
 
     def _bias_is_w2_gemv(self) -> bool:
         # The fused kernel recomputes this class's bias; a subclass that changes

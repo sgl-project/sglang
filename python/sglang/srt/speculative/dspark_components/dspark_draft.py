@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import msgspec
 import torch
@@ -30,6 +30,9 @@ from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.srt.speculative.spec_utils import draft_tp_context
 from sglang.srt.utils.common import is_pin_memory_available
 from sglang.srt.utils.invariants import Bucket, Invariant, NotNaN, expect
+
+if TYPE_CHECKING:
+    from sglang.srt.models.dspark import BaseDSparkMarkovHead
 
 logger = logging.getLogger(__name__)
 
@@ -130,13 +133,13 @@ class DraftNoise(msgspec.Struct, frozen=True):
     offset: torch.Tensor
 
 
-def step_logits_width(markov_head, base_width: int) -> int:
+def step_logits_width(markov_head: BaseDSparkMarkovHead, base_width: int) -> int:
     # Kept step logits are gathered whole over a sharded vocab.
     return base_width if markov_head.vocab_shard is None else markov_head.vocab_size
 
 
 def _draft_step(
-    markov_head,
+    markov_head: BaseDSparkMarkovHead,
     prev_tokens: torch.Tensor,
     base_logits: torch.Tensor,
     *,
@@ -149,12 +152,13 @@ def _draft_step(
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     if logits_out is None and len(prev_tokens) == 1:
         # One greedy row, no logits kept: one kernel does the GEMV, add and argmax.
-        gemv = markov_head.w2_gemv_inputs(prev_tokens)
+        w2_weight = markov_head.greedy_w2_weight()
         # The kernel reads one w2 row per base-logit column.
-        if gemv is not None and gemv[1].shape[0] == base_logits.shape[-1]:
-            prev_embeds, w2_weight = gemv
+        if w2_weight is not None and w2_weight.shape[0] == base_logits.shape[-1]:
             tokens = MarkovGreedyStep.execute(
-                base_logits=base_logits, prev_embeds=prev_embeds, w2_weight=w2_weight
+                base_logits=base_logits,
+                prev_embeds=markov_head.get_prev_embeddings(prev_tokens),
+                w2_weight=w2_weight,
             )
             return tokens, state
     bias, state = markov_head.step_bias(
