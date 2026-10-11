@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, field
 from http import HTTPStatus
 from typing import (
     TYPE_CHECKING,
@@ -82,6 +83,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# A release costs about half a millisecond of CPU; 8 per decode step stay inside
+# the headroom the overlap loop has under one decode forward.
+_KV_RELEASES_PER_DECODE_STEP = 8
+
 
 def _get_speculative_output_stride(result: GenerationBatchResult) -> int:
     """Return the padded per-request width in flattened speculative output."""
@@ -113,6 +118,41 @@ class SchedulerBatchResultProcessor:
     output_streamer: SchedulerOutputStreamer
     beam_coordinator: BeamCoordinator
     abort_request: Callable
+    # Finished requests whose KV is not released yet, oldest first.
+    deferred_kv_releases: deque = field(default_factory=deque)
+
+    def release_deferred_kv_caches(self, limit: Optional[int] = None) -> None:
+        """Release the oldest deferred finished requests, at most ``limit``."""
+        n = len(self.deferred_kv_releases)
+        if limit is not None:
+            n = min(n, limit)
+        for _ in range(n):
+            req, checkpoint = self.deferred_kv_releases.popleft()
+            release_kv_cache(req, self.tree_cache, checkpoint=checkpoint)
+
+    def release_deferred_kv_caches_continued_by(self, waiting_reqs: List[Req]) -> None:
+        """Release the deferred requests a waiting request may continue, so its
+        prefix match finds them in the tree; a false positive only releases early."""
+        if not self.deferred_kv_releases or not waiting_reqs:
+            return
+        continued, kept = [], deque()
+        for req, checkpoint in self.deferred_kv_releases:
+            ids = req.full_untruncated_fill_ids
+            n = len(ids)
+            if n and any(
+                len(w.origin_input_ids) >= n
+                and w.origin_input_ids[n - 1] == ids[n - 1]
+                and w.origin_input_ids[0] == ids[0]
+                for w in waiting_reqs
+            ):
+                continued.append((req, checkpoint))
+            else:
+                kept.append((req, checkpoint))
+        if continued:
+            self.deferred_kv_releases.clear()
+            self.deferred_kv_releases.extend(kept)
+            for req, checkpoint in continued:
+                release_kv_cache(req, self.tree_cache, checkpoint=checkpoint)
 
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
@@ -1061,6 +1101,10 @@ class SchedulerBatchResultProcessor:
                     self._accept_grammar_tokens(req, next_token_id)
                 req.grammar.finished = req.finished()
 
+        # A finish wave's releases are spread over the next decode steps, so the
+        # CPU time per step stays under the forward the overlap loop hides it in.
+        self.release_deferred_kv_caches(limit=_KV_RELEASES_PER_DECODE_STEP)
+
         if auxiliary_output is not None:
             self.consume_auxiliary_output(
                 batch,
@@ -1431,7 +1475,7 @@ class SchedulerBatchResultProcessor:
                     if get_exec().mamba.enable_mamba_extra_buffer_lazy
                     else True
                 )
-                release_kv_cache(req, self.tree_cache, checkpoint=checkpoint)
+                self.deferred_kv_releases.append((req, checkpoint))
 
             req.time_stats.set_completion_time()
 

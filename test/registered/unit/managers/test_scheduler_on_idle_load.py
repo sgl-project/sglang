@@ -7,6 +7,7 @@ test_scheduler_flush_cache.
 """
 
 import unittest
+from collections import deque
 from unittest.mock import MagicMock, patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -23,6 +24,7 @@ register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 class TestOnIdleStallPublish(CustomTestCase):
     def _stalled_scheduler(self) -> Scheduler:
         s = Scheduler.__new__(Scheduler)
+        s.batch_result_processor = MagicMock(deferred_kv_releases=deque())
         s.scheduler_stage_metrics = None
         s.enable_hicache_storage = False
         s.disaggregation_mode = DisaggregationMode.NULL

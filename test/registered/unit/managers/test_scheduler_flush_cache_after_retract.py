@@ -32,6 +32,7 @@ class TestSchedulerFlushCacheAfterRetract(unittest.TestCase):
 
     def _new_scheduler(self) -> Scheduler:
         scheduler = Scheduler.__new__(Scheduler)
+        scheduler.batch_result_processor = MagicMock(deferred_kv_releases=deque())
         scheduler._engine_paused = True
         scheduler.enable_overlap = False
         scheduler.last_batch = None

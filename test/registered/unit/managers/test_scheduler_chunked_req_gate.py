@@ -2,6 +2,7 @@
 
 import unittest
 from array import array
+from collections import deque
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -57,6 +58,8 @@ def _make_tree_cache() -> BasePrefixCache:
 
 def _scheduler_for_get_next_batch(*, tree_cache, chunked_req) -> Scheduler:
     s = Scheduler.__new__(Scheduler)
+    s.batch_result_processor = MagicMock(deferred_kv_releases=deque())
+    s.waiting_queue = []
     s.scheduler_stage_metrics = None
     s.disaggregation_mode = DisaggregationMode.NULL
     s.dllm_config = None
