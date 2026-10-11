@@ -76,12 +76,12 @@ from sglang.srt.layers.attention.dsa.utils import (
     maybe_prefetch_next_full_attention_kv,
 )
 from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
-from sglang.srt.layers.dcp.dsa import dcp_forward_scope
 from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
     AuxHiddenStatePacker,
 )
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
+from sglang.srt.layers.dcp.dsa import dcp_forward_scope
 from sglang.srt.layers.dcp.planner import (
     prepare_decode_context_parallel_metadata,
 )

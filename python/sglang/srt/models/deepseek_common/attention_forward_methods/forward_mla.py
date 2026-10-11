@@ -92,9 +92,7 @@ def _select_local_dcp_heads_for_autotune(
     return attn_output.narrow(1, rank * num_local_heads, num_local_heads)
 
 
-def is_dcp_mla_decode_phase(
-    forward_batch: ForwardBatch, use_dsa: bool = False
-) -> bool:
+def is_dcp_mla_decode_phase(forward_batch: ForwardBatch, use_dsa: bool = False) -> bool:
     if not get_parallel().dcp_enabled:
         return False
     return (
