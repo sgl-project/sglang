@@ -56,7 +56,8 @@ def test_concat_and_cast_q_fp8_pad_matches_torch_cast(rope, heads, tokens):
     )
     q_rope = q_rope.split([256, rope], dim=-1)[1]
     dst = torch.zeros(tokens + 3, 64, NOPE + rope, dtype=FP8, device="cuda")
-    _bytes(dst[:, :heads]).fill_(0x7F)
+    # Poison in place: _bytes() would copy the strided heads < 64 slice.
+    dst[:, :heads].view(torch.uint8).fill_(0x7F)
     concat_and_cast_q_fp8_pad(dst, q_nope, q_rope, heads)
     expected = torch.cat([q_nope, q_rope], dim=-1).to(FP8)
     assert torch.equal(_bytes(dst[:tokens, :heads]), _bytes(expected))
