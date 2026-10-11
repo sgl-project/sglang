@@ -99,6 +99,28 @@ class LTX2AVDecodingStage(DecodingStage):
             latents, server_args, vae=module
         )
 
+    def _postprocess_video(self, video: torch.Tensor):
+        # Keep the processor's source-dtype denormalization, then arrange the
+        # FP32 NumPy output on the GPU. The default NumPy route casts and
+        # stacks full videos on the CPU after the device-to-host copy.
+        video = self.video_processor.postprocess_video(video, output_type="pt")
+        video = (
+            video.permute(0, 1, 3, 4, 2)
+            .to(dtype=torch.float32, memory_format=torch.contiguous_format)
+            .contiguous()
+        )
+        if video.is_cuda:
+            try:
+                host = torch.empty(
+                    video.shape, dtype=video.dtype, device="cpu", pin_memory=True
+                )
+            except RuntimeError:
+                return video.cpu().numpy()
+            host.copy_(video, non_blocking=True)
+            torch.cuda.current_stream(video.device).synchronize()
+            return host.numpy()
+        return video.cpu().numpy()
+
     def forward(self, batch: Req, server_args: ServerArgs) -> OutputBatch:
         self.load_model()
 
@@ -159,7 +181,7 @@ class LTX2AVDecodingStage(DecodingStage):
             video = decode_output
         else:
             video = decode_output.sample
-        video = self.video_processor.postprocess_video(video, output_type="np")
+        video = self._postprocess_video(video)
 
         output_batch = OutputBatch(
             output=video,
