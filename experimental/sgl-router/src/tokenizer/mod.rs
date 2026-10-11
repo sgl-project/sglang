@@ -3,7 +3,6 @@
 
 pub mod adapter;
 pub mod chat_formatter;
-mod deepseek;
 mod kimi;
 pub mod stats;
 
@@ -184,19 +183,14 @@ impl TokenizerRegistry {
                 ForwardingScope::AllText => tracing::info!(model = %m.id,
                     "router-generated input_ids forwarding enabled for all text chats; requires the \
                      workers' model files, --default-chat-template-kwargs, SGLANG_DEFAULT_THINKING, \
-                     and SGLANG_DSV4_REASONING_EFFORT"),
+                     and SGLANG_DSV4_REASONING_EFFORT or SGLANG_DSV41_REASONING_EFFORT"),
                 ForwardingScope::Guarded => tracing::warn!(model = %m.id,
                     "UNVERIFIED input_ids forwarding: router rendering is verified against SGLang only \
-                     for DeepSeek-V4, so this model forwards only guarded request shapes (plain text \
+                     for DeepSeek-V4 and V4.1, so this model forwards only guarded request shapes (plain text \
                      chat). Requires the workers' model files and --default-chat-template-kwargs; \
                      worker parser overrides, content-format detection, and conversation-template stop \
                      strings are not replicated. Pass --disable-input-ids-forwarding unless you have \
                      verified parity for this model"),
-                ForwardingScope::Never if me.has_chat_formatter(&m.id) => {
-                    tracing::warn!(model = %m.id,
-                    "input_ids forwarding disabled: the DeepSeek-V4.1 renderer is not verified against \
-                     current SGLang; workers tokenize messages")
-                }
                 ForwardingScope::Never => {}
             }
         }
