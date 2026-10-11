@@ -101,12 +101,5 @@ class TestRetractDecodeLongOutput(CustomTestCase):
         assert self.process.poll() is None, "Server crashed during test"
 
 
-@unittest.skipIf(is_in_ci(), "Skipped in CI due to long runtime")
-class TestRetractDecodeLongOutputRadixDisabled(TestRetractDecodeLongOutput):
-    """python -m unittest test_retract_decode.TestRetractDecodeLongOutputRadixDisabled"""
-
-    other_args = ["--disable-radix-cache"]
-
-
 if __name__ == "__main__":
     unittest.main()

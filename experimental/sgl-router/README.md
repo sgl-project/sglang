@@ -171,9 +171,20 @@ sgl-router --model-id qwen3 --worker-urls http://localhost:30001 \
 
 Reorg supports `power_of_two` (its default), `cache_aware`, and `session_aware`.
 Discovery supplies the plain or PD workers; decode uses power-of-two. Cache
-settings, external indexers, session headers/timeouts, and `--filter overloaded`
-with `--max-in-flight` retain their existing flags. `--max-kv-usage 0.95` rejects
-an engine whose KV tokens have reached 95% of its capacity.
+settings, external indexers and session headers/timeouts retain their existing
+flags. Admission flags set the default per-engine caps; an engine at a cap is
+skipped, and affinity falls back to the others:
+
+| Flag | Rejects an engine at |
+|---|---|
+| `--max-in-flight N` | `N` requests this router has in flight to it (no `--filter overloaded` needed) |
+| `--max-waiting-requests N` | `N` engine-reported waiting requests |
+| `--max-pending-prefill-tokens N` | `N` engine-reported waiting uncached tokens |
+| `--max-running-usage F` | share `F` of its reported running-request capacity |
+| `--max-kv-usage F` | share `F` of its reported KV capacity |
+
+Engine-reported caps lag by one load report, so a burst can pass them; the
+router-local `--max-in-flight` counts dispatches as they happen.
 Unsupported legacy options fail at startup.
 
 `--bucket-config buckets.json` replaces the default plain and P/D buckets. Each

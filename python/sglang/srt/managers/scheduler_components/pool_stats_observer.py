@@ -33,10 +33,13 @@ def kv_private_tokens(kv: ReqKvInfo, page_size: int) -> int:
 
 
 def kv_private_swa_tokens(kv: ReqKvInfo, page_size: int) -> int:
+    # Window eviction frees only [swa_dead_lo, evicted); [protected, swa_dead_lo)
+    # stays held until the request finishes, even after the cursor jumps past it.
     allocated = ceil_align(kv.kv_allocated_len, page_size)
-    return allocated - max(
-        kv.cache_protected_len, kv.get_evicted_seqlen(ComponentType.SWA)
+    window_freed = max(
+        0, kv.get_evicted_seqlen(ComponentType.SWA) - kv.swa_dead_lo(page_size)
     )
+    return allocated - kv.cache_protected_len - window_freed
 
 
 def kv_mamba_slots(kv: ReqKvInfo) -> int:
