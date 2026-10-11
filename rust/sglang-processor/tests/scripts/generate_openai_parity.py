@@ -40,6 +40,7 @@ from sglang.srt.entrypoints.openai.protocol import (
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.entrypoints.openai.serving_completions import OpenAIServingCompletion
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.parser.template_manager import TemplateManager
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.hf_transformers.common import get_context_length
@@ -220,16 +221,7 @@ def lower(case, settings, model):
         request_logger=SimpleNamespace(log_requests=False),
         create_abort_task=lambda obj: None,
     )
-    # A checkpoint without a Jinja template, as DeepSeek-V4's.
-    template_manager = SimpleNamespace(
-        completion_template_name=settings.get("completion_template"),
-        chat_template_name=None,
-        jinja_template_content_format="string",
-        jinja_template_may_reorder_tool_results=False,
-        reasoning_config=None,
-        force_reasoning=False,
-    )
-    handler = handler_type(tokenizer_manager, template_manager)
+    handler = handler_type(tokenizer_manager, template_manager(model, settings))
     raw_request = Request(
         {
             "type": "http",
@@ -263,6 +255,30 @@ def run_case(case, settings, model, engine_url, defaults, sampling_defaults):
     return recorded
 
 
+def template_manager(model, settings):
+    """The server's `TemplateManager` for the checkpoint's Jinja template."""
+    if model.template_manager is not None:
+        return model.template_manager
+    # A checkpoint without a Jinja template, as DeepSeek-V4's.
+    return SimpleNamespace(
+        completion_template_name=settings.get("completion_template"),
+        chat_template_name=None,
+        jinja_template_content_format="string",
+        jinja_template_may_reorder_tool_results=False,
+        reasoning_config=None,
+        force_reasoning=False,
+    )
+
+
+def load_template_manager(path, tokenizer):
+    if not tokenizer.chat_template:
+        return None
+    manager = TemplateManager()
+    owner = SimpleNamespace(tokenizer=tokenizer, processor=None)
+    manager.load_chat_template(owner, None, path)
+    return manager
+
+
 def load_model(path):
     config = json.loads(Path(path, "config.json").read_text())
     generation_file = Path(path, "generation_config.json")
@@ -270,9 +286,11 @@ def load_model(path):
         json.loads(generation_file.read_text()) if generation_file.exists() else {}
     )
     keys = ("repetition_penalty", "temperature", "top_k", "top_p", "min_p")
+    tokenizer = get_tokenizer(path, trust_remote_code=True)
     return SimpleNamespace(
         path=path,
-        tokenizer=get_tokenizer(path, trust_remote_code=True),
+        tokenizer=tokenizer,
+        template_manager=load_template_manager(path, tokenizer),
         hf_config=SimpleNamespace(**config, to_dict=lambda: config),
         text_config=SimpleNamespace(**config.get("text_config", config)),
         sampling_defaults={
@@ -284,9 +302,12 @@ def load_model(path):
 def generate(path, model, engine_url):
     fixture = json.loads(path.read_text())
     # The model facts the host reads, so the test runs without the checkpoint.
+    reasoning_config = template_manager(model, {}).reasoning_config
     fixture["chat_model"] = {
         "context_length": get_context_length(model.text_config),
         "generation_config": model.sampling_defaults,
+        "always_thinks": reasoning_config is not None
+        and reasoning_config.special_case == "always",
     }
     defaults = generate_defaults()
     fixture["generate_defaults"] = {

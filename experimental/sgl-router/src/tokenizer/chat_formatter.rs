@@ -251,6 +251,13 @@ impl ChatFormatter {
         })
     }
 
+    /// Whether the template always reasons, which SGLang's OpenAI layer reads.
+    pub fn always_thinks(&self) -> bool {
+        self.processor
+            .as_ref()
+            .is_some_and(ProcessorFormatter::always_thinks)
+    }
+
     /// DeepSeek-V4, V4.1 and GLM-5.3 are fixture-verified against SGLang for every text chat.
     pub fn forwarding_scope(&self) -> super::ForwardingScope {
         match self.processor {

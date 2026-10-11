@@ -3520,7 +3520,7 @@
       }
     }
   ],
-  "chat_model": {"context_length": 1048576, "generation_config": {}},
+  "chat_model": {"context_length": 1048576, "generation_config": {}, "always_thinks": false},
   "generate_defaults": {
     "rid": null,
     "session_id": null,

@@ -155,6 +155,12 @@ impl ChatFormatter {
         }
     }
 
+    /// Whether the template always reasons, as `template_detection` resolves
+    /// GLM-5.3's (`glm53_always_think`).
+    pub fn always_thinks(&self) -> bool {
+        matches!(self, ChatFormatter::Glm53(_))
+    }
+
     /// Resolve the template's effective thinking mode and materialize its
     /// default under the exact kwarg the template consumes.
     pub fn resolve_thinking(

@@ -2,7 +2,7 @@
   "model": "deepseek-ai/DeepSeek-V4-Flash-0731",
   "revision": "7872f01b1d1fe23eabc4c98b48bffcef5a386062",
   "settings": {"reasoning_parser": "deepseek-v4", "tool_call_parser": "deepseekv4"},
-  "chat_model": {"context_length": 1048576, "generation_config": {"temperature": 1.0, "top_p": 1.0}},
+  "chat_model": {"context_length": 1048576, "generation_config": {"temperature": 1.0, "top_p": 1.0}, "always_thinks": false},
   "cases": [
     {
       "name": "text",

@@ -510,10 +510,13 @@ reported them, `--completion-template`, `return_hidden_states` and other
 SGLang would reject. Chat also needs a renderer verified against SGLang (the
 `AllText` scope, DeepSeek-V4, V4.1 and GLM-5.3 today), router `--default-chat-template-kwargs`
 equal to the workers', a reasoning parser the processor reproduces
-(`deepseek-v4`, `deepseek-v41`) or none, and no media yet. Tools are served with `tool_choice`
+(`deepseek-v4`, `deepseek-v41`, `glm45`) or none, and no media yet. Tools are served with `tool_choice`
 `auto` or `none`, non-strict, with standard JSON-schema types, and a tool
 parser the processor reproduces (`deepseekv4`, `deepseekv41`); `required`, named and strict
 tools take a constraint from the engine's xgrammar, so they go to the engine.
+With `--tool-call-parser glm47`, a chat with tools also goes to the engine: SGLang
+constrains it with a full-assistant grammar flagged `ebnf_full_assistant`, which
+`/generate` does not accept.
 The router reads the model's `config.json` and `generation_config.json` beside
 `--tokenizer-path` (or from the HF repo), as the engine reads them, so a local
 path should point into the model's directory. Engine env vars that change the
@@ -567,10 +570,12 @@ the encoder renders them differently.
 GLM-5.3 and GLM-5.3-Flash render with the checkpoint's `chat_template.jinja` through
 `rust/sglang-processor`, which picks them by their template as SGLang does and builds
 the template context SGLang's Jinja path builds. Every text chat forwards `input_ids`.
-Media, a `chat_template` key in `chat_template_kwargs`, and tools or tool arguments
-with numbers serde_json prints unlike Python (such as `1e-06`) render on the worker.
-The processor does not reproduce the `glm45` reasoning and `glm47` tool parsers, so
-with them (the cookbook's `auto`) chats take the engine's own OpenAI route.
+Media, a `chat_template` key in `chat_template_kwargs` or the default kwargs, and `-0`
+in tools or tool arguments render on the worker. With the cookbook's parsers
+(`glm45` and `glm47`, which `auto` resolves to) chats without tools are served
+through `/generate`, with the router splitting reasoning as SGLang does. Chats with
+tools take the engine's own route, still with the router's `input_ids`, since
+`/generate` cannot carry the grammar `glm47` constrains them with.
 
 ## Kimi-K3
 

@@ -152,6 +152,8 @@ impl TokenizerRegistry {
                 .flatten()
                 .and_then(|config| config.as_object().cloned())
                 .unwrap_or_default(),
+            // Read from the chat formatter below.
+            always_thinks: false,
         };
         me.inner.insert(m.id.clone(), t);
         me.stats = stats;
@@ -165,6 +167,7 @@ impl TokenizerRegistry {
         match ChatFormatter::load_from(&m.id, &files) {
             Ok(Some(formatter)) => {
                 let formatter = formatter.with_defaults(&m.default_chat_template_kwargs);
+                me.chat_model.always_thinks = formatter.always_thinks();
                 me.formatters
                     .insert(m.id.clone(), Arc::new(ChatFormatterEntry::new(formatter)));
                 tracing::info!(model = %m.id, "dynamo-render chat rendering enabled");
