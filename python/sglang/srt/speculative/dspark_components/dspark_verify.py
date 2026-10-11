@@ -118,6 +118,7 @@ class TargetVerifyExecutor:
         tp_sync: SpecTpSync,
         verify_epilogue=None,
         simulate_acc_len: float = 0.0,
+        simulated_correct_len: Optional[torch.Tensor] = None,
         block_verification: bool = False,
     ) -> None:
         self.target_worker = target_worker
@@ -139,8 +140,7 @@ class TargetVerifyExecutor:
         self._verify_backend_self_adds_seq_lens_cache: Optional[bool] = None
         self._simulate_acc_len = float(simulate_acc_len)
         self._block_verification = block_verification
-        self._simulated_correct_drafts_buf: Optional[torch.Tensor] = None
-        self._step_simulated_correct_len = 0
+        self._simulated_correct_len = simulated_correct_len
 
     def accept_and_finalize(
         self,
@@ -167,7 +167,7 @@ class TargetVerifyExecutor:
         if folded_accept:
             return self.verify_epilogue.read_accept(bs)
 
-        simulate = self._simulate_acc_len > 0
+        simulate = self._simulated_correct_len is not None
         # Simulated acceptance overwrites correct_len below, so a sampling accept
         # (draft/target softmax + rejection) would be computed only to be discarded.
         accept_sampling_info = None if simulate and _is_hip else sampling_info
@@ -184,9 +184,7 @@ class TargetVerifyExecutor:
             block_verification=self._block_verification,
         )
         if simulate:
-            correct_len = self._simulated_correct_len(
-                bs=bs, dtype=correct_len.dtype, device=correct_len.device
-            )
+            correct_len = self._simulated_correct_len.repeat(bs).to(correct_len.dtype)
             if simulate_bonus_sampling_info is not None:
                 bonus = sample_simulated_bonus(
                     target_logits=target_logits,
@@ -230,30 +228,12 @@ class TargetVerifyExecutor:
     def begin_simulated_step(self) -> None:
         """Draw this step's SGLANG_SIMULATE_ACC_LEN correct length, before the
         target verify, so the folded accept in the graph applies it too."""
-        if self._simulate_acc_len <= 0:
+        if self._simulated_correct_len is None:
             return
         simulated_acc_len = sample_simulated_acc_len(
             self._simulate_acc_len, SIMULATE_ACC_METHOD, self.gamma + 1
         )
-        self._step_simulated_correct_len = simulated_acc_len - 1
-        if self.verify_epilogue is not None:
-            self.verify_epilogue.stage_simulated_correct_len(
-                self._step_simulated_correct_len
-            )
-
-    def _simulated_correct_len(
-        self, *, bs: int, dtype: torch.dtype, device: torch.device
-    ) -> torch.Tensor:
-        buf = self._simulated_correct_drafts_buf
-        if (
-            buf is None
-            or buf.numel() < bs
-            or buf.dtype != dtype
-            or buf.device != device
-        ):
-            buf = torch.empty((max(bs, 512),), dtype=dtype, device=device)
-            self._simulated_correct_drafts_buf = buf
-        return buf[:bs].fill_(self._step_simulated_correct_len)
+        self._simulated_correct_len.fill_(simulated_acc_len - 1)
 
     def run_idle_participation(
         self,
@@ -580,7 +560,7 @@ class DsparkVerifyEpilogue:
         tp_sync: SpecTpSync,
         commit_ctx: Optional[CommitInjectCtx] = None,
         fused_argmax: bool = False,
-        simulate: bool = False,
+        simulated_correct_len: Optional[torch.Tensor] = None,
     ) -> None:
         self.max_bs = int(max_bs)
         self.stride = int(verify_num_draft_tokens)
@@ -611,12 +591,8 @@ class DsparkVerifyEpilogue:
         self.out_tokens_buf = torch.zeros(
             (self.max_bs, self.stride), dtype=torch.int64, device=device
         )
-        # SGLANG_SIMULATE_ACC_LEN: the step's correct length, staged per replay.
-        self.simulated_correct_len_buf = (
-            torch.zeros((self.max_bs,), dtype=torch.int64, device=device)
-            if simulate
-            else None
-        )
+        # SGLANG_SIMULATE_ACC_LEN: the step's correct length, filled per step.
+        self.simulated_correct_len = simulated_correct_len
         self.strided_logits: Optional[torch.Tensor] = None
         self.strided_hidden: Optional[torch.Tensor] = None
         self._static_step_state: Optional[tuple[int, bool]] = None
@@ -655,9 +631,6 @@ class DsparkVerifyEpilogue:
             if bs < self.max_bs:
                 self.verify_lens_buf[bs:].zero_()
         self.inject_gate_buf.fill_(1 if armed else 0)
-
-    def stage_simulated_correct_len(self, correct_len: int) -> None:
-        self.simulated_correct_len_buf.fill_(correct_len)
 
     def begin_static_step(self, bs: int, armed: bool) -> None:
         state = (bs, armed)
@@ -802,9 +775,9 @@ class DsparkVerifyEpilogue:
             cutoff_verify_lens=cutoff_verify_lens,
             fused_argmax=self._fused_argmax,
         )
-        if self.simulated_correct_len_buf is not None:
+        if self.simulated_correct_len is not None:
             # The accept runs as served; only its length is replaced.
-            correct_len = self.simulated_correct_len_buf[:bs].to(correct_len.dtype)
+            correct_len = self.simulated_correct_len.repeat(bs).to(correct_len.dtype)
         self._tp_sync.sync(SpecTpSyncSite.DSPARK_ACCEPT_GRAPH, correct_len)
         self._tp_sync.sync(SpecTpSyncSite.DSPARK_ACCEPT_GRAPH, bonus)
         self._tp_sync.sync(SpecTpSyncSite.DSPARK_ACCEPT_GRAPH, cap_trim_lens)
