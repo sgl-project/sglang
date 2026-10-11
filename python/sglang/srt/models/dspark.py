@@ -113,7 +113,7 @@ class BaseDSparkMarkovHead(nn.Module, ABC):
 
     @abstractmethod
     def step_logits_dtype(self, base_dtype: torch.dtype) -> torch.dtype:
-        """The dtype of ``base_logits + bias`` for base logits of ``base_dtype``."""
+        """The dtype of ``base_logits + bias``."""
 
     def draft_step(
         self,
@@ -128,7 +128,6 @@ class BaseDSparkMarkovHead(nn.Module, ABC):
         step: int,
         logits_out: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """One markov step: the next token per row, and the next state."""
         bias, state = self.step_bias(
             prev_tokens, hidden_states=hidden_states, state=state
         )
@@ -154,10 +153,8 @@ class BaseDSparkMarkovHead(nn.Module, ABC):
         step: int,
         logits_out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """One token per row from ``step_logits(base_logits, bias)``. With
-        ``logits_out``, which receives the step logits ``step_logits_width``
-        wide, a row takes the argmax at temperature 0 and a Gumbel-max sample
-        otherwise; without it every row takes the argmax."""
+        """Rows sample at their temperatures when ``logits_out`` keeps the step
+        logits; without it every row takes the argmax."""
         return MarkovSampleStep.execute(
             base_logits=base_logits,
             bias=bias,
@@ -175,7 +172,6 @@ class BaseDSparkMarkovHead(nn.Module, ABC):
         return {}
 
     def step_logits_width(self, base_width: int) -> int:
-        """The width of the step logits over base logits ``base_width`` wide."""
         return base_width
 
     @property

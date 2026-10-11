@@ -35,7 +35,6 @@ def _draft(head, sampling_info, offset):
 
 
 def _step_logits_along(head, base, hidden, anchor, tokens):
-    # The head's own per-step logits on the drafted path.
     state = head.init_state(hidden)
     prev = anchor
     rows = []
