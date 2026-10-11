@@ -169,6 +169,8 @@ def draft_markov_block(
         )
         prev_tokens = tp_sync.sync(SpecTpSyncSite.DSPARK_DRAFT, prev_tokens)
         draft_tokens.append(prev_tokens)
+    if greedy_draft:
+        return torch.stack(draft_tokens, dim=1), None
     noise.offset.add_(1)
     return torch.stack(draft_tokens, dim=1), logits_out
 

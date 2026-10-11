@@ -1,8 +1,12 @@
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
+from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
+    MarkovGreedyStep,
+)
 from sglang.srt.models.dspark import VanillaMarkov
 from sglang.srt.speculative.dspark_components.dspark_draft import (
     DraftNoise,
@@ -98,7 +102,11 @@ class TestDraftMarkovBlockGraph(CustomTestCase):
             assert logits is None
             tokens_out.copy_(tokens)
 
-        block()
+        with mock.patch.object(
+            MarkovGreedyStep, "execute", wraps=MarkovGreedyStep.execute
+        ) as fused:
+            block()
+        self.assertEqual(fused.call_count, GAMMA)
         eager_tokens = tokens_out.clone()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):

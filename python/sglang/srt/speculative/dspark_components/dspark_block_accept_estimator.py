@@ -42,7 +42,7 @@ def block_accept_skip_reason(
             "probabilities would be state-dependent"
         )
     if corrected_logits is None:
-        return "corrected_logits unavailable (greedy-only folded draft or greedy draft)"
+        return "corrected_logits unavailable (greedy draft)"
     return None
 
 

@@ -1988,7 +1988,8 @@ _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
         "head fuses the bias GEMV."
     ),
     "SGLANG_DSPARK_FOLDED_SAMPLING": _DeprecatedEnv(
-        note="A folded DSpark draft proposal always samples; set "
+        note="A folded DSpark draft proposal samples; set "
+        "SGLANG_DSPARK_USE_GREEDY_DRAFT=1 for an argmax-only draft, or "
         "SGLANG_DSPARK_FOLDED_PROPOSAL=0 to keep the proposal out of the graph."
     ),
     "SGLANG_QWEN35_NATIVE_FINAL_NORM": _DeprecatedEnv(),

@@ -185,7 +185,13 @@ class VanillaMarkov(BaseDSparkMarkovHead):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         # One greedy row with no logits to keep: one kernel does the bias GEMV,
         # the add and the argmax without writing the bias.
-        if logits_out is None and len(prev_tokens) == 1 and self._bias_is_w2_gemv():
+        if (
+            logits_out is None
+            and len(prev_tokens) == 1
+            and self._bias_is_w2_gemv()
+            # The kernel reads one w2 row per base-logit column.
+            and self.markov_w2.weight.shape[0] == base_logits.shape[-1]
+        ):
             tokens = MarkovGreedyStep.execute(
                 base_logits=base_logits,
                 prev_embeds=self.get_prev_embeddings(prev_tokens),
