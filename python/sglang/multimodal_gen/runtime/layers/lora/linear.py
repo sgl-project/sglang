@@ -13,6 +13,7 @@ from torch.distributed._composable.fsdp import (
 )
 from torch.distributed.tensor import DTensor
 
+from sglang.multimodal_gen.configs.sample.sampling_params import quality_allows
 from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
     get_tp_rank,
@@ -74,6 +75,71 @@ def _compute_lora_delta(
         "LoRA A/B projections must both be 2D or both be 3D, got "
         f"{tuple(lora_A.shape)} and {tuple(lora_B.shape)}"
     )
+
+
+def _request_allows_lossless() -> bool:
+    # only a request that allows it: many stages set the forward context
+    # without forward_batch, and an exact request must still get exact bytes
+    context = get_forward_context_or_none()
+    forward_batch = None if context is None else context.forward_batch
+    sampling_params = getattr(forward_batch, "sampling_params", None)
+    quality = getattr(sampling_params, "quality", None)
+    return quality is not None and quality_allows(quality, "lossless")
+
+
+def _can_add_lora_delta_in_gemm(
+    out: torch.Tensor, lora_A: torch.Tensor, lora_B: torch.Tensor
+) -> bool:
+    if not isinstance(lora_B, torch.Tensor) or lora_A.dim() != lora_B.dim():
+        return False
+    if lora_A.dim() == 3 and lora_A.shape[0] != lora_B.shape[0]:
+        return False
+    return lora_A.dim() in (2, 3) and out.is_contiguous() and _request_allows_lossless()
+
+
+def _add_lora_delta_in_gemm(
+    out: torch.Tensor,
+    x: torch.Tensor,
+    lora_A: torch.Tensor,
+    lora_B: torch.Tensor,
+    scale: float,
+) -> torch.Tensor:
+    """``out + scale * delta``, accumulated onto ``out`` by the second GEMM.
+
+    Lossless tier: the reference path rounds the delta after the GEMM, after
+    each scale and after the add, moving the full ``[tokens, out]`` delta
+    through memory for each; here it is never materialized. The scale goes on
+    the rank-wide intermediate as a tensor op, not as the GEMM's ``alpha``: a
+    compiled forward reads the request scale as a symbolic float, which a
+    kwarg would freeze at its first value.
+    """
+    out_2d = out.view(-1, out.shape[-1])
+    x_2d = x.reshape(-1, x.shape[-1])
+    if lora_A.dim() == 2:
+        hidden = x_2d @ lora_A.t()
+    else:
+        hidden = x_2d @ lora_A.reshape(-1, lora_A.shape[-1]).t()
+    if scale != 1.0:
+        hidden = hidden * scale
+    if lora_A.dim() == 2:
+        groups = [(out_2d, hidden, lora_B)]
+    else:
+        # stacked [groups, rank, in] / [groups, out, rank], one GEMM per group
+        rank, width = lora_A.shape[1], lora_B.shape[1]
+        groups = [
+            (
+                out_2d[:, g * width : (g + 1) * width],
+                hidden[:, g * rank : (g + 1) * rank],
+                lora_B[g],
+            )
+            for g in range(lora_B.shape[0])
+        ]
+    for target, rows, b in groups:
+        if target.dtype == rows.dtype:
+            target.addmm_(rows, b.t())
+        else:
+            target.add_(rows @ b.t())
+    return out
 
 
 class BaseLayerWithLoRA(nn.Module):
@@ -154,34 +220,47 @@ class BaseLayerWithLoRA(nn.Module):
 
     @torch.compile()
     def _forward_with_delta(self, x: torch.Tensor) -> torch.Tensor:
-        lora_A = self.lora_A
-        lora_B = self.lora_B
-        if isinstance(self.lora_B, DTensor):
-            lora_B = self.lora_B.to_local()
-            lora_A = self.lora_A.to_local()
-
         # TODO: Support multiple LoRA adapters when use not merged mode
         runtime_lora_scale = self._runtime_lora_scale()
         if runtime_lora_scale == 0.0:
             return self.base_layer(x)
 
-        lora_dtype = lora_A.dtype
-        x_lora = x.to(dtype=lora_dtype)
-        lora_A_sliced = self.slice_lora_a_weights(
+        out, output_bias = self.base_layer(x)
+        out = self._add_lora_delta(out, x, runtime_lora_scale)
+        return self._add_lora_output_offset(out), output_bias
+
+    def _add_lora_delta(
+        self, out: torch.Tensor, x: torch.Tensor, runtime_lora_scale: float
+    ) -> torch.Tensor:
+        """``out`` plus the active adapter's update for input ``x``."""
+        lora_A = self.lora_A
+        lora_B = self.lora_B
+        if isinstance(lora_B, DTensor):
+            lora_B = lora_B.to_local()
+            lora_A = lora_A.to_local()
+
+        x_lora = x.to(dtype=lora_A.dtype)
+        lora_A = self.slice_lora_a_weights(
             lora_A.to(device=x.device, non_blocking=True)
         )
-        lora_B_sliced = self.slice_lora_b_weights(
+        lora_B = self.slice_lora_b_weights(
             lora_B.to(device=x.device, non_blocking=True)
         )
-        delta = _compute_lora_delta(x_lora, lora_A_sliced, lora_B_sliced)
+        if _can_add_lora_delta_in_gemm(out, lora_A, lora_B):
+            scale = self.strength * runtime_lora_scale
+            if self.lora_alpha != self.lora_rank:
+                scale *= self.lora_alpha / self.lora_rank  # type: ignore
+            return _add_lora_delta_in_gemm(out, x_lora, lora_A, lora_B, scale)
+
+        delta = _compute_lora_delta(x_lora, lora_A, lora_B)
         if self.lora_alpha != self.lora_rank:
-            delta = delta * (
-                self.lora_alpha / self.lora_rank  # type: ignore
-            )  # type: ignore
-        delta = delta * self.strength * runtime_lora_scale
-        out, output_bias = self.base_layer(x)
-        out = out + delta.to(dtype=out.dtype)
-        return self._add_lora_output_offset(out), output_bias
+            delta = delta * (self.lora_alpha / self.lora_rank)  # type: ignore
+        # x * 1.0 is exact, so skipping a unit scale keeps the reference bits
+        if self.strength != 1.0:
+            delta = delta * self.strength
+        if runtime_lora_scale != 1.0:
+            delta = delta * runtime_lora_scale
+        return out + delta.to(dtype=out.dtype)
 
     def slice_lora_a_weights(self, A: torch.Tensor) -> torch.Tensor:
         return A
@@ -448,6 +527,37 @@ class BaseLayerWithLoRA(nn.Module):
         self._merge_lora_into_data(work, self.lora_weights_list)
         return work.to("cpu", dtype=target_dtype)
 
+    @torch.no_grad()
+    def merge_rounding_norms(self, max_rows: int = 1024) -> tuple[float, float] | None:
+        """Squared norms of the part of the active LoRA update that merging
+        into this layer's weight dtype would round away, and of the update,
+        over an even sample of rows. Nothing is written; None when there is
+        nothing to round or the adapter has no plain 2-D form here."""
+        lora_list = self._active_lora_list()
+        if self.disable_lora or not lora_list:
+            return None
+        src, _ = self._materialized_weight_src()
+        if not src.is_floating_point() or src.dtype == torch.float32:
+            return None
+        weight = src.reshape(-1, src.shape[-1])
+        device = get_local_torch_device()
+        rows = torch.linspace(0, weight.shape[0] - 1, min(max_rows, weight.shape[0]))
+        rows = rows.round().long().unique()
+        base = weight[rows.to(weight.device)].to(device, torch.float32)
+        delta = torch.zeros_like(base)
+        for lora_A, lora_B, _, strength, rank, alpha, _ in lora_list:
+            a = self.slice_lora_a_weights(lora_A.to(device, torch.float32))
+            b = self.slice_lora_b_weights(lora_B.to(device, torch.float32))
+            if not isinstance(b, torch.Tensor) or a.dim() > 2 or b.dim() > 2:
+                return None
+            scale = strength
+            if alpha is not None and rank is not None and alpha != rank:
+                scale *= alpha / rank
+            delta += scale * (b[rows.to(device)] @ a)
+        exact = base + delta
+        lost = exact.to(src.dtype).to(torch.float32) - exact
+        return float(lost.square().sum()), float(delta.square().sum())
+
     def install_merged_weight(
         self, merged: torch.Tensor, base_view: torch.Tensor
     ) -> None:
@@ -657,35 +767,13 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
         if runtime_lora_scale == 0.0:
             return self.base_layer(input_)
 
-        lora_A = self.lora_A
-        lora_B = self.lora_B
-        if isinstance(self.lora_B, DTensor):
-            lora_B = self.lora_B.to_local()
-            lora_A = self.lora_A.to_local()
-
         bias = self.base_layer.bias if not self.base_layer.skip_bias_add else None
         output_parallel = self.base_layer.quant_method.apply(
             self.base_layer, input_, bias
         )
         if not self.merged and not self.disable_lora:
-            lora_dtype = lora_A.dtype
-            input_lora = input_.to(dtype=lora_dtype)
-            lora_A_sliced = self.slice_lora_a_weights(
-                lora_A.to(device=input_.device, non_blocking=True)
-            )
-            lora_B_sliced = self.slice_lora_b_weights(
-                lora_B.to(device=input_.device, non_blocking=True)
-            )
-            delta_parallel = _compute_lora_delta(
-                input_lora, lora_A_sliced, lora_B_sliced
-            )
-            if self.lora_alpha != self.lora_rank:
-                delta_parallel = delta_parallel * (
-                    self.lora_alpha / self.lora_rank  # type: ignore
-                )  # type: ignore
-            delta_parallel = delta_parallel * self.strength * runtime_lora_scale
-            output_parallel = output_parallel + delta_parallel.to(
-                dtype=output_parallel.dtype
+            output_parallel = self._add_lora_delta(
+                output_parallel, input_, runtime_lora_scale
             )
         output_parallel = self._add_lora_output_offset(output_parallel)
         if self.base_layer.gather_output:
@@ -759,12 +847,6 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
         if runtime_lora_scale == 0.0:
             return self.base_layer(input_)
 
-        lora_A = self.lora_A
-        lora_B = self.lora_B
-        if isinstance(self.lora_B, DTensor):
-            lora_B = self.lora_B.to_local()
-            lora_A = self.lora_A.to_local()
-
         if self.base_layer.input_is_parallel:
             input_parallel = input_
         else:
@@ -773,28 +855,22 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
                 input_, num_partitions=self.base_layer.tp_size
             )
             input_parallel = splitted_input[tp_rank].contiguous()
+        bias = self.base_layer.bias
+        # Lossless tier: the bias goes into the GEMM epilogue on rank 0, as in
+        # RowParallelLinear, instead of a separate pass after the reduce.
+        bias_in_gemm = (
+            bias is not None
+            and not self.base_layer.skip_bias_add
+            and _request_allows_lossless()
+        )
         output_parallel = self.base_layer.quant_method.apply(
-            self.base_layer, input_parallel
+            self.base_layer,
+            input_parallel,
+            bias=bias if bias_in_gemm and self.base_layer.tp_rank == 0 else None,
         )
         if not self.merged and not self.disable_lora:
-            lora_dtype = lora_A.dtype
-            input_parallel_lora = input_parallel.to(dtype=lora_dtype)
-            lora_A_sliced = self.slice_lora_a_weights(
-                lora_A.to(device=input_parallel.device, non_blocking=True)
-            )
-            lora_B_sliced = self.slice_lora_b_weights(
-                lora_B.to(device=input_parallel.device, non_blocking=True)
-            )
-            delta_parallel = _compute_lora_delta(
-                input_parallel_lora, lora_A_sliced, lora_B_sliced
-            )
-            if self.lora_alpha != self.lora_rank:
-                delta_parallel = delta_parallel * (
-                    self.lora_alpha / self.lora_rank  # type: ignore
-                )  # type: ignore
-            delta_parallel = delta_parallel * self.strength * runtime_lora_scale
-            output_parallel = output_parallel + delta_parallel.to(
-                dtype=output_parallel.dtype
+            output_parallel = self._add_lora_delta(
+                output_parallel, input_parallel, runtime_lora_scale
             )
 
         if self.base_layer.reduce_results and self.base_layer.tp_size > 1:
@@ -804,9 +880,7 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
 
         if not self.base_layer.skip_bias_add:
             output = (
-                output_ + self.base_layer.bias
-                if self.base_layer.bias is not None
-                else output_
+                output_ + bias if bias is not None and not bias_in_gemm else output_
             )
             output_bias = None
         else:
@@ -832,39 +906,16 @@ class LinearWithLoRA(BaseLayerWithLoRA):
 
     @torch.compile()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        lora_A = self.lora_A
-        lora_B = self.lora_B
-        if isinstance(self.lora_B, DTensor):
-            lora_B = self.lora_B.to_local()
-            lora_A = self.lora_A.to_local()
-
         # TODO: Support multiple LoRA adapters when use not merged mode
         runtime_lora_scale = self._runtime_lora_scale()
         if runtime_lora_scale == 0.0:
             # nn.Linear.forward() returns a single tensor
             return self.base_layer(x)
 
+        # nn.Linear.forward() returns a single tensor, not a tuple
+        out = self.base_layer(x)
         if not self.merged and not self.disable_lora:
-            lora_dtype = lora_A.dtype
-            x_lora = x.to(dtype=lora_dtype)
-            lora_A_sliced = self.slice_lora_a_weights(
-                lora_A.to(device=x.device, non_blocking=True)
-            )
-            lora_B_sliced = self.slice_lora_b_weights(
-                lora_B.to(device=x.device, non_blocking=True)
-            )
-            delta = _compute_lora_delta(x_lora, lora_A_sliced, lora_B_sliced)
-            if self.lora_alpha != self.lora_rank:
-                delta = delta * (
-                    self.lora_alpha / self.lora_rank  # type: ignore
-                )  # type: ignore
-            delta = delta * self.strength * runtime_lora_scale
-            # nn.Linear.forward() returns a single tensor, not a tuple
-            out = self.base_layer(x)
-            out = out + delta.to(dtype=out.dtype)
-        else:
-            # nn.Linear.forward() returns a single tensor
-            out = self.base_layer(x)
+            out = self._add_lora_delta(out, x, runtime_lora_scale)
         return self._add_lora_output_offset(out)
 
 

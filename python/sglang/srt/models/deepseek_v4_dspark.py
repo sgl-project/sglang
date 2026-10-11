@@ -257,7 +257,9 @@ class DSparkAttention(MqaAttentionBase):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        if _is_npu and forward_batch.forward_mode.is_idle():
+        # Idle ranks have no draft KV rows or attention metadata, but still
+        # participate in the shared MoE forward later in the draft stage.
+        if forward_batch.forward_mode.is_idle():
             return torch.zeros_like(hidden_states)
 
         from sglang.srt.model_executor.forward_context import get_attn_backend
