@@ -191,6 +191,35 @@ Compare the flag on and off with the same model, output shape, format, and clien
 concurrency. Keep it disabled when the reply latency or extra memory outweighs
 the throughput gain.
 
+## Encoding during VAE decode
+
+Native Wan, H3, and LTX video VAEs can hand completed frames to the shared MP4
+encoder within the current request. Unlike `--async-output-save`, this does not
+require a second request to obtain a benefit. Eligible single-video, CUDA,
+file-path-only requests use this path automatically; raw frames, compilation,
+interpolation, upscaling, and custom post-decoding hooks keep the normal path.
+LTX's diffusion decoder is not included.
+
+Ordinary VAEs without frame callbacks keep the existing GPU-direct saving path.
+Handing over a complete clip cannot overlap encoding with decode, and is not
+automatically enabled: it can add overhead to short requests. The shared
+`DecodingStage.decode(..., on_frames=...)` supports an explicit complete-clip
+hand-off for custom integrations. Custom decoding stages retain their original
+path unless they explicitly integrate the encoder, preserving output transforms
+and audio muxing. Image, audio, and mesh outputs are not MP4 inputs.
+
+LTX without temporal tiling hands over the complete clip after decode. This
+reduces CPU float-frame materialization but does not overlap VAE decoding with
+encoding. Existing temporal tiling can emit finalized, blended prefixes while
+later tiles decode. This optimization does **not** enable temporal tiling:
+changing the tile schedule can change the video.
+
+Keep the same decode, output compression, and x264 preset when measuring.
+Include time until the MP4 is fully written, not just the decoding-stage timer.
+The encoder bounds queued frames and frame-conversion intermediates, and a
+failed encode falls back to normal saving. Model authors can follow the
+[frame hand-off contract](/docs/sglang-diffusion/support_new_models#video-encode-hand-off).
+
 ## Quality-Tradeoff / Lossy Or Approximate Levers
 
 These techniques can change the denoising path, numerical representation, or generated output. They are useful after you have a baseline and an acceptance criterion for quality.

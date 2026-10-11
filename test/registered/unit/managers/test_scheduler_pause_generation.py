@@ -365,6 +365,31 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         self.assertIsNone(scheduler.chunked_req)
         self.assertIsNone(scheduler.last_batch)
 
+    def test_retract_after_dp_conversion_releases_each_req_once(self):
+        """retract after DP attention converted the running batch to extend
+        (running_batch is last_batch) releases each request once."""
+        scheduler = self._new_scheduler()
+        run_req_a = self._make_req("run-a")
+        run_req_b = self._make_req("run-b")
+        converted = self._make_batch(
+            scheduler,
+            reqs=[run_req_a, run_req_b],
+            forward_mode=ForwardMode.EXTEND,
+            with_tensors=True,
+        )
+        scheduler.running_batch = converted
+        scheduler.last_batch = converted
+        requeue_log = self._spy_requeue(scheduler)
+
+        scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
+
+        self.assertEqual(
+            [entry["req"] for entry in requeue_log], [run_req_a, run_req_b]
+        )
+        self.assertEqual(
+            [req.retraction_count for req in (run_req_a, run_req_b)], [1, 1]
+        )
+
     def test_retract_with_empty_running_uses_last_batch_reqs(self):
         """retract with empty running batch releases and requeues the last extend reqs."""
         scheduler = self._new_scheduler()
