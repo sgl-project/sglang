@@ -2126,6 +2126,9 @@ class Envs:
     SGLANG_DEBUG_SYMM_MEM = EnvBool(False)
 
     # Qwen3.5 and GDN
+    # ROCm GDN decode: the packed recurrent kernel streams its fp32 state past the caches,
+    # and the fused QKVZ/BA Conv1D update runs one feature per lane. Bit-identical to stock.
+    SGLANG_DISABLE_ROCM_GDN_DECODE_TUNING = EnvBool(False)
     SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV = EnvBool(True)
 
     # ===================================================================

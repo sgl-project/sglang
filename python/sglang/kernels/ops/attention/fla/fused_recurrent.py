@@ -10,6 +10,12 @@ import triton.language as tl
 
 from sglang.kernels.ops.attention.fla.op import exp
 from sglang.kernels.ops.attention.fla.utils import input_guard
+from sglang.srt.environ import envs
+from sglang.srt.utils import is_hip
+
+_stream_packed_decode_state = (
+    is_hip() and not envs.SGLANG_DISABLE_ROCM_GDN_DECODE_TUNING.get()
+)
 
 
 @triton.jit(do_not_specialize=["T"])
@@ -209,6 +215,7 @@ def fused_recurrent_gated_delta_rule_packed_decode_kernel(
     BV: tl.constexpr,
     SOFTPLUS_THRESHOLD: tl.constexpr,
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
+    STREAM_STATE: tl.constexpr = False,
 ):
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_hv = i_nh // HV, i_nh % HV
@@ -230,7 +237,12 @@ def fused_recurrent_gated_delta_rule_packed_decode_kernel(
 
     p_h0 = h0 + state_idx * stride_init_state_token
     p_h0 = p_h0 + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
-    b_h = tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
+    # Each state tile is read and written exactly once per step: keep it out of the caches.
+    if STREAM_STATE:
+        b_h = tl.load(p_h0, mask=mask_h, other=0, eviction_policy="evict_first")
+    else:
+        b_h = tl.load(p_h0, mask=mask_h, other=0)
+    b_h = b_h.to(tl.float32)
 
     p_mixed = mixed_qkv + i_n * stride_mixed_qkv_tok
     q_off = i_h * K + o_k
@@ -263,7 +275,10 @@ def fused_recurrent_gated_delta_rule_packed_decode_kernel(
 
     p_ht = ht + state_idx * stride_final_state_token
     p_ht = p_ht + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
-    tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
+    if STREAM_STATE:
+        tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h, cache_modifier=".cs")
+    else:
+        tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
 
 
 def fused_recurrent_gated_delta_rule_packed_decode(
@@ -408,6 +423,7 @@ def fused_recurrent_gated_delta_rule_packed_decode(
         BV=BV,
         SOFTPLUS_THRESHOLD=20.0,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
+        STREAM_STATE=_stream_packed_decode_state,
         num_warps=num_warps,
         num_stages=num_stages,
     )
