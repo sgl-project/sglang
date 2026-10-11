@@ -12,6 +12,8 @@ from sglang.multimodal_gen.configs.models.vaes.ltx_video import (
     LTXVideoVAEArchConfig,
     LTXVideoVAEConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
+from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
     _sample_to_uint8_frames,
     _save_video_ffmpeg,
@@ -20,6 +22,7 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
 from sglang.multimodal_gen.runtime.models.vaes.ltx_2_vae import AutoencoderKLLTX2Video
 from sglang.multimodal_gen.runtime.pipelines_core.stages.encode_while_decoding import (
     EncodeWhileDecoding,
+    can_encode_while_decoding,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ltx_2.decoding_av import (
     LTX2AVDecodingStage,
@@ -147,7 +150,10 @@ def test_stream_matches_cpu_postprocessing(tmp_path, dtype, audio):
     ],
 )
 @pytest.mark.parametrize("initialized,rank", [(False, 0), (True, 0), (True, 1)])
-def test_audio_order_and_encode_fallback(eligible, path, saved, initialized, rank):
+@pytest.mark.parametrize("enable_memory_bank", [False, True])
+def test_audio_order_and_encode_fallback(
+    eligible, path, saved, initialized, rank, enable_memory_bank
+):
     stage = object.__new__(LTX2AVDecodingStage)
     stage.vae = tiny_vae()
     stage.video_processor = VideoProcessor()
@@ -155,6 +161,7 @@ def test_audio_order_and_encode_fallback(eligible, path, saved, initialized, ran
     video = torch.zeros(1, 3, 1, 8, 8)
     request = SimpleNamespace(
         latents=video,
+        enable_memory_bank=enable_memory_bank,
         use_diffusion_decoder=False,
         return_trajectory_decoded=False,
         trajectory_timesteps=None,
@@ -194,10 +201,34 @@ def test_audio_order_and_encode_fallback(eligible, path, saved, initialized, ran
     if saved is not None:
         assert result.output is None
         assert result.output_file_paths == saved
-    elif initialized and rank != 0:
+    elif initialized and rank != 0 and not enable_memory_bank:
         assert result.output is None
     else:
         assert result.output.shape == (1, 1, 8, 8, 3)
     assert postprocess.call_count == int(
-        saved is None and (not initialized or rank == 0)
+        saved is None and (enable_memory_bank or not initialized or rank == 0)
     )
+
+
+@pytest.mark.parametrize("enable_memory_bank", [False, True])
+def test_memory_bank_retains_decoded_frames(enable_memory_bank):
+    request = SimpleNamespace(
+        save_output=True,
+        return_file_paths_only=True,
+        return_raw_frames=False,
+        enable_memory_bank=enable_memory_bank,
+        data_type=DataType.VIDEO,
+        enable_frame_interpolation=False,
+        enable_upscaling=False,
+        extra={},
+    )
+    server_args = SimpleNamespace(
+        enable_torch_compile=False, pipeline_config=PipelineConfig()
+    )
+    with mock.patch(
+        "sglang.multimodal_gen.runtime.pipelines_core.stages.encode_while_decoding.current_platform.is_cuda",
+        return_value=True,
+    ):
+        assert can_encode_while_decoding(request, server_args, 1) == (
+            not enable_memory_bank
+        )

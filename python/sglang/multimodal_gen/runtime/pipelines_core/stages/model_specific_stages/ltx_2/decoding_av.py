@@ -157,7 +157,8 @@ class LTX2AVDecodingStage(DecodingStage):
         if output_paths is not None:
             output_batch.output_file_paths = output_paths
         elif (
-            not model_parallel_is_initialized()
+            batch.enable_memory_bank
+            or not model_parallel_is_initialized()
             or get_replica_group().rank_in_group == 0
         ):
             output_batch.output = self.video_processor.postprocess_video(
