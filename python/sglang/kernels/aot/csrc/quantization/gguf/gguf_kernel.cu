@@ -431,13 +431,9 @@ torch::Tensor ggml_mul_mat_a8(
   torch::Tensor quant_X = torch::empty({sgl_llama_mmq::q8_buffer_bytes(M, K)}, X.options().dtype(torch::kUInt8));
   sgl_llama_mmq::quantize_q8_1_mmq(Xk.data_ptr(), xtype, M, K, Xk.stride(0), type, quant_X.data_ptr(), stream);
 
-  // The kernel writes fp32; half-precision outputs are converted afterwards.
-  torch::Tensor D = X.scalar_type() == torch::kFloat ? Y : torch::empty({M, row}, X.options().dtype(torch::kFloat));
+  // fp32 accumulation, rounded once to X's dtype when stored.
   sgl_llama_mmq::mul_mat(
-      Wk.data_ptr(), row, K, Wk.stride(0), type, quant_X.data_ptr(), M, D.data_ptr<float>(), row, stream);
-  if (!D.is_same(Y)) {
-    Y.copy_(D);
-  }
+      Wk.data_ptr(), row, K, Wk.stride(0), type, quant_X.data_ptr(), M, Y.data_ptr(), xtype, row, stream);
   return Y;
 }
 #endif  // USE_MUSA

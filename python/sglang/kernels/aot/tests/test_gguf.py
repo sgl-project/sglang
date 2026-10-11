@@ -329,18 +329,56 @@ def test_mmq_unsupported_type_raises(quant_type: GGMLQuantizationType):
         ggml_mul_mat_a8(qweight.cuda(), x, quant_type, 128)
 
 
+# (rows, cols, tokens): enough output tiles for the stream-k decomposition, whose
+# tiles are split between thread blocks and summed by a fix-up kernel, on any GPU
+# size; plus a partial last tile in both directions.
+MMQ_HALF_OUTPUT_CASES = [
+    (1000, 2304, 9),
+    (1000, 2304, 129),
+    (1000, 2304, 300),
+    (4096, 2048, 100),
+    (4096, 2048, 2050),
+]
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("quant_type", MMQ_SYNTHETIC_QUANT_TYPES)
+@torch.inference_mode()
+def test_mmq_half_output_is_rounded_fp32(
+    quant_type: GGMLQuantizationType, dtype: torch.dtype
+):
+    # The kernel stores bf16 / fp16 outputs directly: each value must be the fp32
+    # result rounded once (to nearest even), bit for bit, including the outputs of
+    # tiles that the stream-k decomposition splits between thread blocks. The fp32
+    # result comes from the same call with x.float(): the q8_1 activations are
+    # quantized from the same values either way.
+    for rows, cols, num_tokens in MMQ_HALF_OUTPUT_CASES:
+        qweight = padded_gguf_weight(
+            random_gguf_blocks(quant_type, rows, cols, seed=int(quant_type)), quant_type
+        )
+        x = torch.randn(num_tokens, cols, device="cuda").to(dtype)
+        out = ggml_mul_mat_a8(qweight, x, quant_type, rows)
+        assert out.dtype == dtype and out.shape == (num_tokens, rows)
+        ref = ggml_mul_mat_a8(qweight, x.float(), quant_type, rows).to(dtype)
+        assert torch.equal(out.view(torch.int16), ref.view(torch.int16)), (
+            f"{quant_type.name} {rows}x{cols} M={num_tokens} {dtype}: "
+            f"{(out.view(torch.int16) != ref.view(torch.int16)).sum().item()} values differ"
+        )
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize(
     "quant_type", [GGMLQuantizationType.Q5_K, GGMLQuantizationType.IQ3_XXS]
 )
 @torch.inference_mode()
-def test_mmq_cuda_graph(quant_type: GGMLQuantizationType):
+def test_mmq_cuda_graph(quant_type: GGMLQuantizationType, dtype: torch.dtype):
     # Captured without a warm-up call of this shape: the kernel set-up (shared
     # memory limit, stream-k scratch buffer) also runs under capture.
     rows, cols, num_tokens = 1000, 2304, 200
     qweight = padded_gguf_weight(
         random_gguf_blocks(quant_type, rows, cols, seed=1), quant_type
     )
-    x = torch.randn(num_tokens, cols, device="cuda", dtype=torch.bfloat16)
+    x = torch.randn(num_tokens, cols, device="cuda", dtype=dtype)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         out = ggml_mul_mat_a8(qweight, x, quant_type, rows)
@@ -350,6 +388,12 @@ def test_mmq_cuda_graph(quant_type: GGMLQuantizationType):
         torch.cuda.synchronize()
         torch.testing.assert_close(
             out, ggml_mul_mat_a8(qweight, x, quant_type, rows), rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            out,
+            ggml_mul_mat_a8(qweight, x.float(), quant_type, rows).to(dtype),
+            rtol=0,
+            atol=0,
         )
 
 

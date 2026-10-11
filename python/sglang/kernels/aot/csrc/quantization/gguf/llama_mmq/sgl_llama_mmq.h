@@ -40,8 +40,9 @@ enum class XType : int { F32 = 0, F16 = 1, BF16 = 2 };
 void quantize_q8_1_mmq(
     const void* x, XType xtype, int64_t M, int64_t K, int64_t ldx, int64_t type, void* yq, cudaStream_t stream);
 
-// dst[M, rows] (row stride ld_dst floats) = yq[M, K] @ W[rows, K]^T. W rows are raw GGUF blocks with a row stride
-// of ldw_bytes (a multiple of the block size); the weight storage must hold weight_tail_bytes() past the last row.
+// dst[M, rows] (row stride ld_dst elements of dst_type) = yq[M, K] @ W[rows, K]^T, accumulated in fp32 and
+// rounded once to dst_type (round to nearest even). W rows are raw GGUF blocks with a row stride of ldw_bytes
+// (a multiple of the block size); the weight storage must hold weight_tail_bytes() past the last row.
 void mul_mat(
     const void* w,
     int64_t rows,
@@ -50,7 +51,8 @@ void mul_mat(
     int64_t type,
     const void* yq,
     int64_t M,
-    float* dst,
+    void* dst,
+    XType dst_type,
     int64_t ld_dst,
     cudaStream_t stream);
 

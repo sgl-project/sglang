@@ -321,9 +321,51 @@ set(INCLUDES
 #     collide with other sources or other libraries in the process;
 #   * -use_fast_math as in llama.cpp's own build;
 #   * SASS for one architecture per family only: sm_80 code runs on sm_86/87/89 and these
-#     kernels take the same code path there (the Ampere config), sm_90 code runs on sm_90a.
+#     kernels take the same code path there (the Ampere config), sm_90 code runs on sm_90a;
+#   * the vendored tree stays byte-identical to llama.cpp: SGLang's changes are the patches in
+#     llama_mmq/patches, applied in order to a copy of ggml/ in the build tree, which is what
+#     gets compiled. The copy is remade when a vendored file or a patch changes.
 set(SGL_LLAMA_MMQ_DIR "${CMAKE_CURRENT_SOURCE_DIR}/csrc/quantization/gguf/llama_mmq")
-set(SGL_LLAMA_MMQ_INSTANCES "${SGL_LLAMA_MMQ_DIR}/ggml/src/ggml-cuda/template-instances")
+set(SGL_LLAMA_MMQ_GGML "${CMAKE_CURRENT_BINARY_DIR}/llama_mmq/ggml")
+file(GLOB_RECURSE SGL_LLAMA_MMQ_VENDORED LIST_DIRECTORIES false CONFIGURE_DEPENDS "${SGL_LLAMA_MMQ_DIR}/ggml/*")
+file(GLOB SGL_LLAMA_MMQ_PATCHES CONFIGURE_DEPENDS "${SGL_LLAMA_MMQ_DIR}/patches/*.patch")
+list(SORT SGL_LLAMA_MMQ_VENDORED)
+list(SORT SGL_LLAMA_MMQ_PATCHES)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${SGL_LLAMA_MMQ_VENDORED} ${SGL_LLAMA_MMQ_PATCHES})
+set(_sgl_llama_mmq_stamp "")
+foreach(_f IN LISTS SGL_LLAMA_MMQ_VENDORED SGL_LLAMA_MMQ_PATCHES)
+    file(SHA256 "${_f}" _h)
+    file(RELATIVE_PATH _r "${SGL_LLAMA_MMQ_DIR}" "${_f}")
+    string(APPEND _sgl_llama_mmq_stamp "${_h}  ${_r}\n")
+endforeach()
+set(_sgl_llama_mmq_stamp_file "${CMAKE_CURRENT_BINARY_DIR}/llama_mmq/inputs.sha256")
+set(_sgl_llama_mmq_old_stamp "")
+if(EXISTS "${_sgl_llama_mmq_stamp_file}")
+    file(READ "${_sgl_llama_mmq_stamp_file}" _sgl_llama_mmq_old_stamp)
+endif()
+if(NOT _sgl_llama_mmq_old_stamp STREQUAL _sgl_llama_mmq_stamp OR NOT EXISTS "${SGL_LLAMA_MMQ_GGML}")
+    find_program(SGL_PATCH_EXECUTABLE patch)
+    if(NOT SGL_PATCH_EXECUTABLE)
+        message(FATAL_ERROR "llama_mmq: the `patch` program is needed to apply llama_mmq/patches")
+    endif()
+    file(REMOVE_RECURSE "${SGL_LLAMA_MMQ_GGML}" "${_sgl_llama_mmq_stamp_file}")
+    file(COPY "${SGL_LLAMA_MMQ_DIR}/ggml/" DESTINATION "${SGL_LLAMA_MMQ_GGML}")
+    # file(COPY) keeps the source timestamps, which can be older than objects built from a previous copy.
+    file(GLOB_RECURSE _sgl_llama_mmq_copied LIST_DIRECTORIES false "${SGL_LLAMA_MMQ_GGML}/*")
+    file(TOUCH ${_sgl_llama_mmq_copied})
+    foreach(_p IN LISTS SGL_LLAMA_MMQ_PATCHES)
+        execute_process(
+            COMMAND ${SGL_PATCH_EXECUTABLE} -p1 --forward --batch --no-backup-if-mismatch -i "${_p}"
+            WORKING_DIRECTORY "${SGL_LLAMA_MMQ_GGML}"
+            RESULT_VARIABLE _rc OUTPUT_VARIABLE _out ERROR_VARIABLE _out)
+        if(NOT _rc EQUAL 0)
+            message(FATAL_ERROR "llama_mmq: ${_p} does not apply:\n${_out}")
+        endif()
+    endforeach()
+    file(WRITE "${_sgl_llama_mmq_stamp_file}" "${_sgl_llama_mmq_stamp}")
+    message(STATUS "llama_mmq: ggml/ copied to ${SGL_LLAMA_MMQ_GGML}, patches applied: ${SGL_LLAMA_MMQ_PATCHES}")
+endif()
+set(SGL_LLAMA_MMQ_INSTANCES "${SGL_LLAMA_MMQ_GGML}/src/ggml-cuda/template-instances")
 set(SGL_LLAMA_MMQ_SOURCES
     "${SGL_LLAMA_MMQ_DIR}/ggml_shim.cu"
     "${SGL_LLAMA_MMQ_DIR}/mmq_dense.cu"
@@ -362,9 +404,9 @@ add_library(sgl_llama_mmq OBJECT ${SGL_LLAMA_MMQ_SOURCES})
 target_compile_options(sgl_llama_mmq PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${SGL_LLAMA_MMQ_CUDA_FLAGS}>)
 target_include_directories(sgl_llama_mmq PRIVATE
     ${SGL_LLAMA_MMQ_DIR}
-    ${SGL_LLAMA_MMQ_DIR}/ggml/include
-    ${SGL_LLAMA_MMQ_DIR}/ggml/src
-    ${SGL_LLAMA_MMQ_DIR}/ggml/src/ggml-cuda
+    ${SGL_LLAMA_MMQ_GGML}/include
+    ${SGL_LLAMA_MMQ_GGML}/src
+    ${SGL_LLAMA_MMQ_GGML}/src/ggml-cuda
 )
 set_target_properties(sgl_llama_mmq PROPERTIES
     CUDA_SEPARABLE_COMPILATION OFF
