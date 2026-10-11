@@ -316,6 +316,13 @@ class DSparkWorkerV2(BaseSpecWorker):
             verify_num_draft_tokens=self.verify_num_draft_tokens,
             block_pos_offsets=self._block_pos_offsets,
         )
+        self._simulate_acc_len = float(envs.SGLANG_SIMULATE_ACC_LEN.get())
+        # The step's simulated correct length, read by the eager and graph accepts.
+        self._simulated_correct_len = (
+            torch.zeros((1,), dtype=torch.int64, device=self.device)
+            if self._simulate_acc_len > 0
+            else None
+        )
         self._greedy_draft = envs.SGLANG_DSPARK_USE_GREEDY_DRAFT.get()
         self._proposer = DraftBlockProposer(
             draft_model=self.draft_model,
@@ -357,6 +364,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 device=self.device,
                 tp_sync=self._tp_sync,
                 fused_argmax=target_is_dsv41,
+                simulated_correct_len=self._simulated_correct_len,
                 commit_ctx=CommitInjectCtx(
                     draft_model=self.draft_model,
                     block_pos_offsets=self._block_pos_offsets,
@@ -371,7 +379,6 @@ class DSparkWorkerV2(BaseSpecWorker):
                 self._verify_epilogue.capture_hook
             )
 
-        self._simulate_acc_len = float(envs.SGLANG_SIMULATE_ACC_LEN.get())
         self._simulate_acc_greedy = (
             _is_hip
             and self._simulate_acc_len > 0
@@ -404,6 +411,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             tp_sync=self._tp_sync,
             verify_epilogue=self._verify_epilogue,
             simulate_acc_len=self._simulate_acc_len,
+            simulated_correct_len=self._simulated_correct_len,
             block_verification=get_spec().speculative_use_block_verification,
         )
 
@@ -936,9 +944,11 @@ class DSparkWorkerV2(BaseSpecWorker):
             # draft proposal itself folded.
             and (sampling_info is None or sampling_info.is_all_greedy)
             and verify_logits_adjustments_are_noop(sampling_info)
-            and self._simulate_acc_len <= 0
+            # The graph accept is greedy, so a sampled simulated bonus is eager.
+            and simulate_bonus_sampling_info is None
             and not batch.has_grammar
         )
+        self._verify_executor.begin_simulated_step()
         prepare_mamba_track_for_verify(batch)
         with self._observers.segment(InfoSegment.TARGET_VERIFY):
             if run_compact:
