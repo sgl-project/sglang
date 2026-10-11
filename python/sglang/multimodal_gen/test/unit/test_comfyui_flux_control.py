@@ -19,6 +19,14 @@ BATCH, GRID_H, GRID_W, TEXT_LEN = 2, 4, 6, 5
 SEQ = GRID_H * GRID_W
 
 
+@pytest.fixture
+def cpu_timestep_embedding(monkeypatch):
+    # On a CUDA machine the timestep kernel is chosen and rejects CPU tensors.
+    from sglang.multimodal_gen.runtime.layers import visual_embedding
+
+    monkeypatch.setattr(visual_embedding, "_is_cuda", False)
+
+
 def _tiny_config() -> FluxConfig:
     config = FluxConfig()
     arch = config.arch_config
@@ -141,7 +149,9 @@ def _build_comfyui_flux():
     return model.eval()
 
 
-def test_dit_residual_hook_matches_block_output_hooks(single_process_model_parallel):
+def test_dit_residual_hook_matches_block_output_hooks(
+    single_process_model_parallel, cpu_timestep_embedding
+):
     """Residuals added by forward hooks on the blocks are the reference."""
     from sglang.multimodal_gen.runtime.models.dits.flux import FluxTransformer2DModel
 
@@ -184,8 +194,43 @@ def test_dit_residual_hook_matches_block_output_hooks(single_process_model_paral
     torch.testing.assert_close(_run_dit(dit, step), base)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+def test_dit_applies_control_residuals_on_cuda(single_process_model_parallel):
+    """Residuals on the worker device and compute dtype change the output, and
+    leaving them out reproduces the plain forward."""
+    from sglang.multimodal_gen.runtime.models.dits.flux import FluxTransformer2DModel
+
+    dtype = torch.bfloat16  # the RoPE kernel has no fp32 path
+    torch.manual_seed(0)
+    config = _tiny_config()
+    config.arch_config.guidance_embeds = True
+    dit = FluxTransformer2DModel(config=config, hf_config={}).eval()
+    for param in dit.parameters():
+        torch.nn.init.normal_(param, std=0.05)
+    dit = dit.to("cuda", dtype)
+
+    def to_cuda(value):
+        if value is None:
+            return None
+        return value.to("cuda", dtype) if value.is_floating_point() else value.cuda()
+
+    step = {k: to_cuda(v) for k, v in _step_inputs().items()}
+    step["img_ids"], step["txt_ids"] = step["img_ids"].float(), step["txt_ids"].float()
+    double, single = ([to_cuda(r) for r in rs] for rs in _residuals())
+    base = _run_dit(dit, step)
+    controlled = _run_dit(
+        dit,
+        step,
+        controlnet_block_samples=double,
+        controlnet_single_block_samples=single,
+    )
+    assert torch.isfinite(controlled).all()
+    assert (controlled - base).abs().max() > 0.05
+    torch.testing.assert_close(_run_dit(dit, step), base)
+
+
 def test_dit_matches_comfyui_with_control(
-    monkeypatch, tmp_path, single_process_model_parallel
+    monkeypatch, tmp_path, single_process_model_parallel, cpu_timestep_embedding
 ):
     """Needs a ComfyUI checkout: COMFYUI_PATH=/path/to/ComfyUI."""
     torch.manual_seed(0)
