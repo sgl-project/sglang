@@ -311,6 +311,66 @@ set(INCLUDES
     ${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src
 )
 
+# ======================= llama.cpp MMQ (GGUF kernels) ======================= #
+# llama.cpp's int8 tensor-core MMQ kernels behind ggml_mul_mat_a8, vendored under
+# csrc/quantization/gguf/llama_mmq/ggml (see LLAMA_CPP_COMMIT there; MIT). Built once and
+# linked into both common_ops libraries:
+#   * own include paths: the vendored ggml headers define the same block structs as
+#     csrc/quantization/gguf/ggml-common.h, the two only meet through llama_mmq/sgl_llama_mmq.h;
+#   * whole-program device code (no -rdc) and hidden host symbols, so nothing of ggml can
+#     collide with other sources or other libraries in the process;
+#   * -use_fast_math as in llama.cpp's own build;
+#   * SASS for one architecture per family only: sm_80 code runs on sm_86/87/89 and these
+#     kernels take the same code path there (the Ampere config), sm_90 code runs on sm_90a.
+set(SGL_LLAMA_MMQ_DIR "${CMAKE_CURRENT_SOURCE_DIR}/csrc/quantization/gguf/llama_mmq")
+set(SGL_LLAMA_MMQ_INSTANCES "${SGL_LLAMA_MMQ_DIR}/ggml/src/ggml-cuda/template-instances")
+set(SGL_LLAMA_MMQ_SOURCES
+    "${SGL_LLAMA_MMQ_DIR}/ggml_shim.cu"
+    "${SGL_LLAMA_MMQ_DIR}/mmq_dense.cu"
+    "${SGL_LLAMA_MMQ_DIR}/quantize_mmq_q8_1.cu"
+    "${SGL_LLAMA_MMQ_INSTANCES}/mmq-instance-iq1_s.cu"
+    "${SGL_LLAMA_MMQ_INSTANCES}/mmq-instance-iq2_s.cu"
+    "${SGL_LLAMA_MMQ_INSTANCES}/mmq-instance-iq2_xs.cu"
+    "${SGL_LLAMA_MMQ_INSTANCES}/mmq-instance-iq2_xxs.cu"
+    "${SGL_LLAMA_MMQ_INSTANCES}/mmq-instance-iq3_s.cu"
+    "${SGL_LLAMA_MMQ_INSTANCES}/mmq-instance-iq3_xxs.cu"
+    "${SGL_LLAMA_MMQ_INSTANCES}/mmq-instance-iq4_nl.cu"
+    "${SGL_LLAMA_MMQ_INSTANCES}/mmq-instance-iq4_xs.cu"
+    "${SGL_LLAMA_MMQ_INSTANCES}/mmq-instance-q2_k.cu"
+    "${SGL_LLAMA_MMQ_INSTANCES}/mmq-instance-q3_k.cu"
+    "${SGL_LLAMA_MMQ_INSTANCES}/mmq-instance-q4_0.cu"
+    "${SGL_LLAMA_MMQ_INSTANCES}/mmq-instance-q4_1.cu"
+    "${SGL_LLAMA_MMQ_INSTANCES}/mmq-instance-q4_k.cu"
+    "${SGL_LLAMA_MMQ_INSTANCES}/mmq-instance-q5_0.cu"
+    "${SGL_LLAMA_MMQ_INSTANCES}/mmq-instance-q5_1.cu"
+    "${SGL_LLAMA_MMQ_INSTANCES}/mmq-instance-q5_k.cu"
+    "${SGL_LLAMA_MMQ_INSTANCES}/mmq-instance-q6_k.cu"
+    "${SGL_LLAMA_MMQ_INSTANCES}/mmq-instance-q8_0.cu"
+)
+set(SGL_LLAMA_MMQ_CUDA_FLAGS ${SGL_KERNEL_CUDA_FLAGS})
+list(FILTER SGL_LLAMA_MMQ_CUDA_FLAGS EXCLUDE REGEX "^-gencode=arch=compute_(86|87|89|90a),")
+list(APPEND SGL_LLAMA_MMQ_CUDA_FLAGS
+    "-use_fast_math"
+    "-Xcompiler=-fvisibility=hidden"
+    "-U__CUDA_NO_HALF_OPERATORS__"
+    "-U__CUDA_NO_HALF_CONVERSIONS__"
+    "-U__CUDA_NO_HALF2_OPERATORS__"
+    "-U__CUDA_NO_BFLOAT16_CONVERSIONS__"
+    "-U__CUDA_NO_BFLOAT16_OPERATORS__"
+)
+add_library(sgl_llama_mmq OBJECT ${SGL_LLAMA_MMQ_SOURCES})
+target_compile_options(sgl_llama_mmq PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${SGL_LLAMA_MMQ_CUDA_FLAGS}>)
+target_include_directories(sgl_llama_mmq PRIVATE
+    ${SGL_LLAMA_MMQ_DIR}
+    ${SGL_LLAMA_MMQ_DIR}/ggml/include
+    ${SGL_LLAMA_MMQ_DIR}/ggml/src
+    ${SGL_LLAMA_MMQ_DIR}/ggml/src/ggml-cuda
+)
+set_target_properties(sgl_llama_mmq PROPERTIES
+    CUDA_SEPARABLE_COMPILATION OFF
+    POSITION_INDEPENDENT_CODE ON
+)
+
 # =========================== Common SM90 Build ============================= #
 # Build SM90 library with fast math optimization (same namespace, different directory)
 Python_add_library(common_ops_sm90_build MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
@@ -355,8 +415,8 @@ else()
     set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -D_GLIBCXX_USE_CXX11_ABI=1")
 endif()
 
-target_link_libraries(common_ops_sm90_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt)
-target_link_libraries(common_ops_sm100_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt)
+target_link_libraries(common_ops_sm90_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt sgl_llama_mmq)
+target_link_libraries(common_ops_sm100_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt sgl_llama_mmq)
 
 # sparse flash attention
 target_compile_definitions(common_ops_sm90_build PRIVATE
