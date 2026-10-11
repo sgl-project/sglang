@@ -1593,6 +1593,11 @@ class Envs:
     # Run the DeepSeek-V4.1 ratio-1/2 prefill indexer on the torch path instead
     # of the DeepGEMM dense fp4 logits kernel (test oracle / fallback).
     SGLANG_DSV41_TORCH_PREFILL_INDEXER = EnvBool(False)
+    # Score the torch prefill indexer with one Triton kernel instead of the
+    # einsum/relu/weight/sum chain; False, or SGLANG_DSV41_TORCH_PREFILL_INDEXER,
+    # restores the torch scoring. Opt in until the SM90 PDMux GPU regression
+    # has passed; unsupported devices/dtypes keep the existing scorer.
+    SGLANG_OPT_USE_FUSED_DSV41_INDEXER_SCORES = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
     # gfx950 DeepSeek-V4.1 prefill: attend with aiter's OPUS sparse kernel over a bf16
