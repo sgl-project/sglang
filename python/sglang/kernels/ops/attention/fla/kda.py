@@ -969,6 +969,7 @@ def kda_gate_chunk_cumsum_vector_kernel(
     HAS_SCALE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     USE_LOWER_BOUND: tl.constexpr,
+    IS_NPU: tl.constexpr,
 ):
     i_s, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_b, i_h = i_bh // H, i_bh % H
@@ -1048,11 +1049,15 @@ def kda_gate_chunk_cumsum_vector_kernel(
                 mask=offsets_t < T,
                 other=0.0,
             ).to(tl.float32)
-            # Not tl.sigmoid: tl.exp and Triton's / are approximate on CUDA. This
-            # matches the unfused path's beta.float().sigmoid() bit for bit.
+            if IS_NPU:
+                b_beta = tl.sigmoid(b_beta)
+            else:
+                # CUDA needs the precise operations to match the unfused path's
+                # beta.float().sigmoid() bit for bit.
+                b_beta = tl.div_rn(1.0, 1.0 + libdevice.exp(-b_beta))
             tl.store(
                 beta_out + (bos + offsets_t) * H + i_h,
-                tl.div_rn(1.0, 1.0 + libdevice.exp(-b_beta)),
+                b_beta,
                 mask=offsets_t < T,
             )
 
@@ -1141,6 +1146,7 @@ def kda_gate_chunk_cumsum(
         H=H,
         S=S,
         BT=BT,
+        IS_NPU=is_npu(),
     )
     return g if beta is None else (g, beta_out)
 
