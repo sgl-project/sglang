@@ -28,19 +28,13 @@ def build_stages(*stages, previous=None, terminal=False):
         terminal: Whether the last stage ends the model's layer stack;
             otherwise the next layer's attention follows it on the same rank.
     """
-    # The stack's neighbour hooks build layers another pipeline rank holds;
-    # here they stand for this rank's, so nothing is handed off to them.
+    # The stack's neighbours are layers another pipeline rank holds; here
+    # they stand for this rank's, so nothing is handed off to them.
     with (
         mock.patch.object(factories, "_handed_off", lambda declaration: declaration),
         layer_stack(
-            previous_layers=(
-                [lambda: append_stages((previous, None))]
-                if previous is not None
-                else []
-            ),
-            next_layers=(
-                [] if terminal else [lambda: append_stages((declare_attn(), None))]
-            ),
+            previous_layers=[lambda: (previous,)] if previous is not None else [],
+            next_layers=[] if terminal else [lambda: (declare_attn(),)],
         ),
     ):
         return append_stages(*stages)
@@ -98,6 +92,7 @@ def stub_plan():
     plan._unpadded_attn_tp_size = None
     plan.paths = {}
     plan.enters_stack = False
+    plan.finishes_directly = False
     return plan
 
 

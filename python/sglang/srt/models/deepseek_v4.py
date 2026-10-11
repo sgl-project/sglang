@@ -2842,12 +2842,14 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.local_boundary = mhc.make_boundary(
             self.post_attention_layernorm,
             accepts_mxfp8=False,
+            hc=self.ffn_hc,
         )
         # MOE[i] -> ATTN[i+1]
         if self._next_layer is not None:
             self.next_boundary = mhc.make_boundary(
                 self._next_layer.input_layernorm,
                 accepts_mxfp8=self._next_layer.self_attn.accepts_mxfp8_swizzled_input(),
+                hc=self._next_layer.attn_hc,
             )
 
     def refresh_mhc_norm_weight_cache(self):
@@ -3297,11 +3299,16 @@ class DeepseekV4DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         input_ids_global: torch.Tensor,
         seam_open: bool = True,
+        mega_mhc_seam_open: bool = True,
     ) -> mhc.HcState:
         """The layer's two hyper-connections, each collapsing with the previous one's
-        pre-mix. ``seam_open`` is False when the late-layer tail narrows the rows after
-        this layer, so nothing precomputed for the next one would still describe it."""
+        pre-mix. ``seam_open`` preserves the existing tail-mode boundary policy;
+        ``mega_mhc_seam_open`` disables Mega mHC for both sublayers in the layer
+        immediately before row selection."""
         self._init_boundaries()
+        mega_mhc_prefill = mhc.can_use_mega_mhc_prefill(
+            self.hc_cfg, seam_open=mega_mhc_seam_open
+        )
         stats_stream = None
         if mhc.use_stats_stream(self.hc_cfg, forward_batch, state.residual):
             stats_stream = self.hc_stats_stream
@@ -3312,6 +3319,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             quantized = [] if self.self_attn.accepts_mxfp8_swizzled_input() else None
             mhc.fork_stats_stream(stats_stream)
             x = mhc.combine(self.attn_hc, state, quantized)
+            precomputed = state.stats
             state.release()
             del state
             world_size = self.self_attn.attn_tp_size
@@ -3334,6 +3342,8 @@ class DeepseekV4DecoderLayer(nn.Module):
                 stats_stream=stats_stream,
                 next=self.local_boundary,
                 world_size=world_size,
+                precomputed=precomputed,
+                mega_mhc=mega_mhc_prefill,
             )
 
         def run_ffn_hc(state: mhc.HcState) -> mhc.HcState:
@@ -3341,6 +3351,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             residual = state.residual
             mhc.fork_stats_stream(stats_stream)
             x = mhc.combine(self.ffn_hc, state)
+            precomputed = state.stats
             state.release()
             del state
             nxt = self.next_boundary if seam_open else None
@@ -3362,6 +3373,8 @@ class DeepseekV4DecoderLayer(nn.Module):
                 stats_stream=stats_stream,
                 next=nxt,
                 world_size=self.mlp.tp_size,
+                precomputed=precomputed,
+                mega_next=self.next_boundary if mega_mhc_prefill else None,
             )
 
         return run_ffn_hc(run_attn_hc(state))
@@ -4117,6 +4130,7 @@ class DeepseekV4Model(nn.Module):
                     forward_batch=forward_batch,
                     input_ids_global=input_ids_global,
                     seam_open=tail is None,
+                    mega_mhc_seam_open=i + 1 != self.late_layer_start,
                 )
         state = state.materialized(self.layers[self.end_layer - 1].hc_cfg)
         if saved_full is not None:
