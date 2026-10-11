@@ -120,11 +120,11 @@ def handle_kv_cache_sharding(server_args: Any, gpu_mem: Optional[float] = None) 
             "(--dcp-size) are mutually exclusive users of the widened "
             "allocator index space."
         )
-    if cfg.enable_hierarchical_cache:
+    if cfg.enable_hierarchical_cache and cfg.hicache_storage_backend is not None:
         raise ValueError(
-            "--enable-kv-cache-sharding does not support "
-            "--enable-hierarchical-cache yet: HiCache backup/load assumes "
-            "each rank holds full pages."
+            "--enable-kv-cache-sharding supports HiCache host offload but not "
+            "--hicache-storage-backend yet: the storage path reads and writes "
+            "whole pages per rank, not each rank's own stripe."
         )
     if cfg.enable_lmcache:
         raise ValueError(
