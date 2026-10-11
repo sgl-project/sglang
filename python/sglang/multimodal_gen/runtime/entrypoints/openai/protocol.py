@@ -82,6 +82,9 @@ class ImageGenerationsRequest(BaseModel):
     diffusers_kwargs: Optional[Dict[str, Any]] = None  # kwargs for diffusers backend
     # Performance profiling
     perf_dump_path: Optional[str] = None
+    profile: Optional[bool] = False
+    num_profiled_timesteps: Optional[int] = None
+    profile_all_stages: Optional[bool] = False
     # Progressive resolution generation
     progressive_mode: Optional[str] = None
     progressive_levels: Optional[int] = None
@@ -171,10 +174,6 @@ class VideoGenerationsRequest(BaseModel):
 class VideoListResponse(BaseModel):
     data: List[VideoResponse]
     object: str = "list"
-
-
-class VideoRemixRequest(BaseModel):
-    prompt: str
 
 
 class RealtimeVideoGenerationsRequest(VideoGenerationsRequest):
