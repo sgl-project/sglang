@@ -9,10 +9,10 @@ import torch
 
 def is_mega_gate_available() -> bool:
     try:
-        import deep_gemm
+        from deep_gemm import bf16_mega_gate as impl
     except ImportError:
         return False
-    return callable(getattr(deep_gemm, "bf16_mega_gate", None))
+    return callable(impl)
 
 
 def bf16_mega_gate(

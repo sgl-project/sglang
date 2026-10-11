@@ -20,11 +20,11 @@ def should_use_mega_gate(moe, hidden_states, device_sm, dispatch_info) -> bool:
     if (
         not envs.SGLANG_OPT_DEEPGEMM_MEGA_GATE.get()
         or device_sm // 10 != 10
-        or getattr(moe.config, "model_type", None) != "deepseek_v41"
+        or moe.config.model_type != "deepseek_v41"
         or not 0 < hidden_states.shape[0] <= (1 << 20)
         or hidden_states.dtype != torch.bfloat16
         or not hidden_states.is_contiguous()
-        or getattr(moe.topk, "enable_waterfill", False)
+        or moe.topk.enable_waterfill
         or get_exec().deterministic.enable_deterministic_inference
         or envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
         or envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()

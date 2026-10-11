@@ -481,6 +481,7 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
             moe.is_hash = True
             moe.gate.e_score_correction_bias = None
             moe.topk = SimpleNamespace(
+                enable_waterfill=False,
                 topk=2 + fused_shared,
                 num_fused_shared_experts=fused_shared,
                 routed_scaling_factor=2.0,
@@ -687,7 +688,7 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
                         SimpleNamespace(ep_dispatch_algorithm=algorithm),
                     )
                 )
-            with patch.object(moe.topk, "enable_waterfill", True, create=True):
+            with patch.object(moe.topk, "enable_waterfill", True):
                 self.assertFalse(
                     mega_gate_runtime.should_use_mega_gate(moe, hidden, 100, None)
                 )
@@ -784,13 +785,14 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
                 e_score_correction_bias_vl=torch.tensor([0.0, 0.0, 3.0, 4.0]),
             ),
             topk=SimpleNamespace(
+                enable_waterfill=False,
                 topk_config=TopKConfig(
                     top_k=2 + fused_shared,
                     num_fused_shared_experts=fused_shared,
                     renormalize=True,
                     routed_scaling_factor=2.0,
                     apply_routed_scaling_factor_on_output=scale_in_topk,
-                )
+                ),
             ),
             is_hash=False,
             num_fused_shared_experts=fused_shared,
