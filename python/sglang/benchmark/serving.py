@@ -346,7 +346,9 @@ async def async_request_openai_completions(
                         if not chunk_bytes:
                             continue
 
-                        chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data: ")
+                        chunk = remove_prefix(
+                            chunk_bytes.decode("utf-8"), "data:"
+                        ).removeprefix(" ")
                         latency = time.perf_counter() - st
                         if chunk == "[DONE]":
                             pass
@@ -533,7 +535,9 @@ async def async_request_openai_chat_completions(
                             if not chunk_bytes:
                                 continue
 
-                            chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data: ")
+                            chunk = remove_prefix(
+                                chunk_bytes.decode("utf-8"), "data:"
+                            ).removeprefix(" ")
                             latency = time.perf_counter() - st
                             if chunk == "[DONE]":
                                 pass
@@ -640,7 +644,9 @@ async def async_request_truss(
                         if not chunk_bytes:
                             continue
 
-                        chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data: ")
+                        chunk = remove_prefix(
+                            chunk_bytes.decode("utf-8"), "data:"
+                        ).removeprefix(" ")
                         latency = time.perf_counter() - st
                         if chunk == "[DONE]":
                             pass
@@ -742,11 +748,7 @@ async def async_request_sglang_generate(
 
                         # Cumulative chunks make parsing O(n^2) per request on this
                         # single asyncio thread; orjson on raw bytes is ~2.2x cheaper.
-                        sse_data = (
-                            chunk_bytes[6:]
-                            if chunk_bytes.startswith(b"data: ")
-                            else chunk_bytes
-                        )
+                        sse_data = chunk_bytes.removeprefix(b"data:").removeprefix(b" ")
                         latency = time.perf_counter() - st
                         if sse_data == b"[DONE]":
                             pass
