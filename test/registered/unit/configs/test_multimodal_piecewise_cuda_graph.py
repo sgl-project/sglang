@@ -2,7 +2,7 @@
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from sglang.srt.arg_groups.cuda_graph_hook import apply_cuda_graph_compatibility
 from sglang.srt.arg_groups.model_hook import handle_model_capability_adjustments
@@ -11,6 +11,7 @@ from sglang.srt.configs.embedding_model_spec import resolve_embedding_model_spec
 from sglang.srt.configs.model_config import (
     AttentionArch,
 )
+from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     CudaGraphConfig,
@@ -45,6 +46,7 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
         runner.capture_num_tokens = [4, 16]
         runner.max_context_size = None
         runner.max_num_tokens = 16
+        runner.model_runner = SimpleNamespace(attn_backend=MagicMock())
         return runner
 
     def _make_multimodal_forward_batch(self):
@@ -105,7 +107,7 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
 
     def test_breakable_prefill_takes_nonzero_prefix_off_cuda_for_dsa(self):
         runner = self._make_prefill_runner(Backend.BREAKABLE)
-        runner._attn_backend_forces_mla = True
+        runner.model_runner.attn_backend = MagicMock(spec=DeepseekSparseAttnBackend)
         forward_batch = self._make_multimodal_forward_batch()
         forward_batch.extend_prefix_lens_cpu = [1]
 

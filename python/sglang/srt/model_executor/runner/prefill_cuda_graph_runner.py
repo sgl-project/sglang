@@ -301,8 +301,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     _fa4_prefill = False
     _backend_can_run_prefill_cuda_graph = None
     _captured_attn_metadata_max_bs: Optional[int] = None
-    _attn_backend_forces_mla = False
     dllm_attention = None
+
+    @property
+    def _attn_backend_is_dsa(self) -> bool:
+        from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
+
+        # DSA sets use_mha=False inside piecewise/breakable graphs, so the MHA
+        # companion never runs there and any prefix goes through sparse MLA.
+        return isinstance(self.model_runner.attn_backend, DeepseekSparseAttnBackend)
 
     def __init__(self, model_runner: ModelRunner):
         if get_schedule().enable_mixed_chunk:
@@ -461,13 +468,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self.mha_companion_layers = self.model_runner.mha_companion_layers
         self.has_mha_companion_layers = any(
             layer is not None for layer in self.mha_companion_layers
-        )
-        from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
-
-        # DSA sets use_mha=False inside piecewise/breakable graphs, so the MHA
-        # companion never runs there and any prefix goes through sparse MLA.
-        self._attn_backend_forces_mla = isinstance(
-            self.model_runner.attn_backend, DeepseekSparseAttnBackend
         )
         self.moe_layers = self.model_runner.moe_layers
         self.moe_fusions = self.model_runner.moe_fusions
@@ -1324,14 +1324,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             return False
         if replace_embeds is not None:
             return False
-        # Off CUDA, BCG takes the MHA companion, whose prefix path is uncapturable.
+        # Off CUDA, BCG takes the MHA companion, whose prefix path is
+        # uncapturable. DSA is exempt: it stays on sparse MLA under BCG.
         if (
             self.prefill_backend_name == Backend.BREAKABLE
             and self.has_mha_companion_layers
-            and not self._attn_backend_forces_mla
             and not is_cuda()
             and prefix_lens is not None
             and any(prefix_lens)
+            and not self._attn_backend_is_dsa
         ):
             return False
         # FullCG's chunked-prefix topology covers a bounded prefix. Its capture
