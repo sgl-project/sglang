@@ -78,6 +78,16 @@ ROWS = 16
 STEP = 128  # K an fp4 tile step covers (a lane: 32 fp4 of one row)
 MAX_TOKENS = 8
 
+# K partition: gate_up and down sum K in quarters, wave runs and fp32 adds, not
+# in the stock GEMM's split-K (gate_up 2 splits; down 2 at TP1, 1 at TP2).
+# The bits still match: an fp4 x fp4 product scaled by e8m0 codes is exact in
+# fp32, and the stock output is bf16(fp32(exact sum)) on real weights, so any
+# partition whose fp32 partials are exact gives the same bf16. That fails only
+# when a row's exact sum spans more than 24 bits (products whose block scales
+# differ by more than about 2^14), where the partitions round differently;
+# hence the load-time self-check and StockAccumulationTest. The out_proj fold
+# in dense_gdn (core rows, wider ranges) keeps stock's splits instead.
+
 # gate_up
 GU_STEPS = HIDDEN // STEP  # 40
 GU_Q = GU_STEPS // 4  # 10: a wave's K quarter

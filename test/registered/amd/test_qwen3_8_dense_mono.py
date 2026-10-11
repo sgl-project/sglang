@@ -7,6 +7,10 @@ post_attention_layernorm + gate_up, SiLU-mul and down, against dynamic_mxfp4_qua
 (from the stock norm's output) each rank's down partial before the all-reduce,
 from its half of gate_up's rows and down's K columns.
 
+``StockAccumulationTest``: the property K2's K partition relies on (see
+``dense_ffn``): the stock MXFP4 GEMM's output is bf16(fp32(exact sum)) at K2's
+K sizes, so any K partition with exact fp32 partials gives the stock bits.
+
 ``DenseGdnTest`` (K1, ``dense_gdn``): the residual add + input_layernorm ->
 in_proj_qkvz / in_proj_ba -> conv1d -> the gated delta rule -> the gated norm,
 against the ROCm Triton Gemma norm, the MXFP4 linears, ``causal_conv1d_update``,
@@ -80,6 +84,17 @@ def _k_cols(w, ws, k, tp, rank):
         w[:, rank * n // 2 : (rank + 1) * n // 2].contiguous(),
         ws[:, rank * n // 32 : (rank + 1) * n // 32].contiguous(),
     )
+
+
+_FP4 = (0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6)
+
+
+def _dequant(wq, ws):
+    """MXFP4 [n, k / 2] (low nibble the even column), e8m0 [n, k / 32] -> fp64."""
+    lut = torch.tensor(_FP4, dtype=torch.float64, device=wq.device)
+    v = torch.stack([lut[(wq & 0xF).long()], lut[(wq >> 4).long()]], -1)
+    s = torch.pow(2.0, ws.double() - 127.0).repeat_interleave(32, dim=1)
+    return v.reshape(wq.size(0), -1) * s
 
 
 def _gemma_norm(x, residual, w):
@@ -198,6 +213,31 @@ class DenseFfnTest(CustomTestCase):
                         bad.append(draw)
                 with self.subTest(rank=rank, s=s, layer=layer):
                     self.assertEqual(bad, [])
+
+
+@unittest.skipUnless(_gfx950(), "needs aiter on gfx950")
+class StockAccumulationTest(CustomTestCase):
+    # K2's GEMM K sizes: gate_up, down at TP1, down at TP2.
+    KS = (5120, 17408, 8704)
+
+    def test_stock_gemm_is_exact_sum_rounded(self):
+        from sglang.srt.layers.quantization.quark.schemes import quark_w4a4_mxfp4 as q
+
+        g = torch.Generator(device="cuda").manual_seed(7)
+        for k in self.KS:
+            w, ws = _mxfp4(g, 512, k)
+            wd = _dequant(w, ws)
+            bad = 0
+            for draw in range(8):
+                x = torch.randn(8, k, generator=g, device="cuda")
+                if draw % 2:  # heavy-tailed rows
+                    x = x * torch.randn(8, k, generator=g, device="cuda").mul(2).exp()
+                x = x.to(BF)
+                xq, xs = q.dynamic_mxfp4_quant(x)
+                exact = _dequant(xq.view(torch.uint8), xs.view(torch.uint8)) @ wd.T
+                bad += (_linear(x, w, ws) != exact.float().to(BF)).sum().item()
+            with self.subTest(k=k):
+                self.assertEqual(bad, 0)
 
 
 def _gdn_weights(g, K):
