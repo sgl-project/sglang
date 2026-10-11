@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from collections import defaultdict
 from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
@@ -13,6 +14,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertResult,
     MatchPrefixParams,
     MatchResult,
+    zero_match_result,
 )
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
@@ -56,6 +58,9 @@ if TYPE_CHECKING:
         UnifiedRadixCache,
         UnifiedTreeNode,
     )
+
+
+logger = logging.getLogger(__name__)
 
 
 class MambaComponent(TreeComponent):
@@ -213,7 +218,15 @@ class MambaComponent(TreeComponent):
                 self.cache.dec_lock_ref(
                     result.best_match_node, lock_result.to_dec_params()
                 )
-                assert dst_index is not None, "Can not alloc mamba cache"
+                if dst_index is None:
+                    # MAMBA-ADMIT-FIX: no slot for copy-on-write of the
+                    # matched state == this request gets NO prefix reuse.
+                    # Recompute from scratch instead of killing the engine.
+                    logger.warning(
+                        "Mamba COW slot unavailable; dropping prefix reuse "
+                        "for this request (full recompute)."
+                    )
+                    return zero_match_result(self.cache, result)
             req.kv.mamba_pool_idx = dst_index[0]
         req.kv.mamba_cow_src_index = src_index
         req.kv.mamba_needs_clear = False
@@ -508,7 +521,18 @@ class MambaComponent(TreeComponent):
         if slot is None:
             self.cache.evict_for_alloc(EvictParams(num_tokens=0, mamba_num=1))
             slot = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
-            assert slot is not None, "Can not alloc mamba cache"
+            if slot is None:
+                # MAMBA-ADMIT-FIX: donors run mid-request (chunk boundaries /
+                # decode tracks); killing the scheduler there punishes every
+                # request for one lost checkpoint. Skip the donation instead
+                # — the request's live slot is untouched and re-donates at
+                # the next boundary.
+                logger.warning(
+                    "Mamba checkpoint donation skipped: no slot left "
+                    "(consider --max-mamba-cache-size or fewer concurrent "
+                    "long requests)."
+                )
+                return None
         return slot
 
     @property
@@ -610,6 +634,8 @@ class MambaComponent(TreeComponent):
             if self.int8_ckpt_pool is not None:
                 if self.cache.enable_mamba_extra_buffer:
                     new_slot = self._alloc_mamba_slot()
+                    if new_slot is None:
+                        return 0
                     src_active = (
                         self.cache.req_to_token_pool.donate_mamba_ping_pong_slot(
                             req, new_slot
@@ -623,6 +649,8 @@ class MambaComponent(TreeComponent):
                     )
             elif self.cache.enable_mamba_extra_buffer:
                 new_slot = self._alloc_mamba_slot()
+                if new_slot is None:
+                    return 0
                 mamba_value_donated = (
                     self.cache.req_to_token_pool.donate_mamba_ping_pong_slot(
                         req, new_slot
@@ -630,6 +658,8 @@ class MambaComponent(TreeComponent):
                 )
             else:
                 mamba_value_donated = self._alloc_mamba_slot()
+                if mamba_value_donated is None:
+                    return 0
                 # mamba_pool is a pure PHYSICAL store; translate both slot ids
                 # virtual->physical (identity for the non-unified memory pool) first.
                 translate = self.cache.req_to_token_pool.translate_mamba_indices
