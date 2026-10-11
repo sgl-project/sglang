@@ -65,6 +65,46 @@ BLOCK_TOPK = TOKEN_TOPK // COMPRESS_RATIO
 FINAL_TOPK = TOKEN_TOPK + COMPRESS_RATIO - 1
 
 
+@pytest.mark.parametrize("tp_size", [1, 2, 4])
+def test_qsa_unsharded_multi_kv_decode_preserves_local_heads(monkeypatch, tp_size):
+    monkeypatch.setattr(
+        qsa_backend_module,
+        "get_parallel",
+        lambda: SimpleNamespace(attn_tp_size=tp_size, attn_tp_rank=0),
+    )
+    backend = QwenSparseAttnBackend.__new__(QwenSparseAttnBackend)
+    backend._fused_kv_pool_eligible = False
+    backend.owner_sparse_attn_group = None
+    backend.owner_sparse_attn_runtime = None
+    backend.qsa_profile = SimpleNamespace(block_topk=BLOCK_TOPK)
+    backend.forward_metadata = SimpleNamespace(
+        token_to_batch_idx=torch.arange(2),
+        sequence_lengths=torch.tensor([6, 5]),
+        token_slot_table=torch.arange(12).reshape(2, 6),
+        is_cuda_graph=False,
+    )
+    generator = torch.Generator().manual_seed(42)
+    q = torch.randn(2, 32 // tp_size, 8, generator=generator)
+    k = torch.randn(12, 2, 8, generator=generator)
+    v = torch.randn(12, 2, 8, generator=generator)
+    backend.token_to_kv_pool = SimpleNamespace(
+        get_key_buffer=lambda _: k,
+        get_value_buffer=lambda _: v,
+    )
+    # RadixAttention carries local head counts, not the model config.
+    layer = SimpleNamespace(
+        layer_id=0, scaling=8**-0.5, tp_q_head_num=32 // tp_size, head_dim=8
+    )
+    indices = torch.tensor([[0, 2, 5], [0, 3, 4]], dtype=torch.int32)
+    slots = torch.tensor([[0, 2, 5], [6, 9, 10]], dtype=torch.int32)
+    batch = SimpleNamespace(forward_mode=ForwardMode.DECODE)
+    actual = backend.forward_decode(
+        q, None, None, layer, batch, save_kv_cache=False, topk_indices=indices
+    )
+    expected = qsa_sparse_attention(q, k, v, slots, layer.scaling).reshape(2, -1)
+    torch.testing.assert_close(actual, expected)
+
+
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
 @pytest.mark.parametrize("is_graph", [False, True])
 @pytest.mark.parametrize("expanded", [False, True])

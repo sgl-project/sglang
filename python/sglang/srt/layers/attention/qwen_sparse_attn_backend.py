@@ -2087,7 +2087,6 @@ class QwenSparseAttnBackend(AttentionBackend):
         v_buffer = pool.get_value_buffer(layer.layer_id)
         metadata = self._resolve_metadata(forward_batch)
         topk_indices = self._expand_block_indices(topk_indices, metadata)
-        k_buffer, v_buffer = self._select_attention_kv_heads(k_buffer, v_buffer, layer)
         if not q.is_cuda:
             slots = self._logical_to_physical(topk_indices, metadata)
             output = qsa_sparse_attention(q, k_buffer, v_buffer, slots, layer.scaling)
