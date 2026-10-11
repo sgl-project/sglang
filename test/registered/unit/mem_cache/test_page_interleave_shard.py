@@ -31,6 +31,8 @@ allocation hangs on:
 5. ``begin_shard_extend`` plan capture (page positions, padded send rows,
    owner-congruence guard) with the gather stubbed out, following the
    SimpleNamespace binding pattern of ``test_dsa_layer_shard_utils.py``.
+6. The P/D send filter ``filter_kv_indices_for_shard_rank`` and the sender's
+   skip of a non-final chunk this rank owns no page of.
 
 The GPU tests exercise real pools and NCCL collectives: MLA and MHA gathers
 on 2 ranks (``TestPageInterleaveGatherMultiGpu``), and byte-exact DSA indexer
@@ -49,10 +51,13 @@ from array import array
 from contextlib import contextmanager
 from types import SimpleNamespace
 
+import numpy as np
 import torch
 import torch.multiprocessing as mp
 from parameterized import parameterized_class
 
+from sglang.srt.disaggregation.common.conn import CommonKVSender
+from sglang.srt.disaggregation.utils import filter_kv_indices_for_shard_rank
 from sglang.srt.distributed import (
     init_distributed_environment,
     initialize_model_parallel,
@@ -1344,6 +1349,44 @@ class TestWritePlan(CustomTestCase):
         owned_idx, local_rows = PageInterleaveKVPoolMixin._get_write_plan(stub, loc)
         self.assertEqual(owned_idx.numel(), 0)
         self.assertEqual(local_rows.numel(), 0)
+
+
+class TestShardSendFilter(CustomTestCase):
+    """P/D send side: rank r sends the pages with l % N == r, as its local page
+    l // N, at their request-global send positions."""
+
+    def test_ranks_partition_a_rotated_chunk(self):
+        # A base-2 rotated chain: owners are not position-congruent.
+        pages = np.array(_chain_pages(base=2, n_pages=9), dtype=np.int64)
+        positions = []
+        for rank in range(N):
+            local, pos = filter_kv_indices_for_shard_rank(
+                kv_indices=pages,
+                index_slice=slice(20, 29),
+                shard_rank=rank,
+                shard_size=N,
+            )
+            np.testing.assert_array_equal(pages[pos - 20] % N, rank)
+            np.testing.assert_array_equal(local, pages[pos - 20] // N)
+            positions.append(pos)
+        np.testing.assert_array_equal(
+            np.sort(np.concatenate(positions)), np.arange(20, 29)
+        )
+
+    def test_empty_chunk_is_skipped_unless_final(self):
+        # One page per owner 0..3, sent as two 2-page chunks.
+        pages = np.array(_chain_pages(base=0, n_pages=4), dtype=np.int64)
+        for rank, expect_skip in ((3, [True, False]), (1, [False, False])):
+            sender = SimpleNamespace(
+                kv_mgr=SimpleNamespace(kv_shard_rank=rank, kv_shard_size=N),
+                curr_idx=0,
+                num_kv_indices=len(pages),
+            )
+            skips = [
+                CommonKVSender._prepare_send_indices(sender, chunk)[3]
+                for chunk in (pages[:2], pages[2:])
+            ]
+            self.assertEqual(skips, expect_skip)
 
 
 # =============================================================================
