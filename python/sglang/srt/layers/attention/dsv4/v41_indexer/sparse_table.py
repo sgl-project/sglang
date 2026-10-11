@@ -41,11 +41,13 @@ from .scoring import (
     get_deep_gemm_decode_data,
     get_deep_gemm_prefill_data,
     get_index_k_cache,
+    quantize_index_q,
     score_tiles,
     topk_ragged,
 )
 from .types import (
     CandidateMetadata,
+    CapturedPrefillInputs,
     DecodeInputs,
     PrefillInputs,
     get_tail_row_indices,
@@ -88,6 +90,13 @@ class _SparsePrefillTable(_SparseTable):
             tail_rows_per_request=rows_per_request,
             device=self.blocks.device,
         )
+        return self.tail_rows(rows, rows_per_request)
+
+    def tail_rows(
+        self, rows: torch.Tensor, rows_per_request: Optional[List[int]] = None
+    ) -> _SparsePrefillTable:
+        """The table of ``rows`` (a gather, graph-safe for a persistent index
+        buffer): the prefill graph's late-layer tail block."""
         compress_lens = self.compress_lens[rows].contiguous()
         _, valid_lens = candidate_row_lens(compress_lens, self.blocks.shape[1])
         return _build_prefill_table(
@@ -96,7 +105,7 @@ class _SparsePrefillTable(_SparseTable):
             page_table=self.page_table[rows].contiguous(),
             page_size=self.page_size,
             request_ids=self.request_ids[rows].contiguous(),
-            rows_per_request=rows_per_request,
+            rows_per_request=rows_per_request if rows_per_request is not None else [],
             q_dtype=self.q_dtype,
             valid_lens=valid_lens,
         )
@@ -171,6 +180,46 @@ class SparseTableBackend:
             out_positions=inputs.out_raw_indices[: data.num_rows],
         )
         data.write_page_indices(inputs)
+
+    def consume_prefill_captured(
+        self, inputs: CapturedPrefillInputs, published: Optional[_SparseTable]
+    ) -> None:
+        """A consumer under the prefill CUDA graph: sparse scores of the published
+        blocks, top-k as pool slots and as compressed positions."""
+        assert published is not None, (
+            "prefill graph candidate table missing: the candidate source layer "
+            "must run under the same graph before its consumers"
+        )
+        indexer = inputs.indexer
+        q_fp4, q_sf = quantize_index_q(inputs.q)
+        rows, heads = q_fp4.shape[0], q_fp4.shape[1]
+        k_cache = get_index_k_cache(
+            token_to_kv_pool=self.token_to_kv_pool,
+            layer_id=inputs.layer_id,
+            page_size=inputs.paged_metadata.compressed_page_size,
+        )
+        logits = sparse_logits(
+            q_fp4.view(rows, 1, heads, 64),
+            q_sf.view(rows, 1, heads),
+            k_cache,
+            inputs.weights.to(torch.bfloat16),
+            published.schedule,
+            published.blocks.shape[1],
+        )
+        topk = min(indexer.index_topk, published.blocks.shape[1] * CANDIDATE_BLOCK_SIZE)
+
+        def transform(blocks: torch.Tensor, out: torch.Tensor) -> None:
+            target = out[:rows, :topk]
+            if target.is_contiguous():
+                topk_transform_sparse(logits, published.valid_lens, blocks, target)
+                return
+            tmp = torch.empty((rows, topk), dtype=torch.int32, device=out.device)
+            topk_transform_sparse(logits, published.valid_lens, blocks, tmp)
+            target.copy_(tmp)
+
+        if inputs.out_page_indices is not None:
+            transform(published.phys_blocks, inputs.out_page_indices)
+        transform(published.blocks, inputs.out_raw_indices)
 
     def publish_decode(self, inputs: DecodeInputs):
         data = get_deep_gemm_decode_data(inputs, self.token_to_kv_pool)
