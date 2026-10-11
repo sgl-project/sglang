@@ -10,7 +10,25 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionMetadataBuilder,
     trailing_padding_used_len,
 )
-from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
+
+
+def _gfx1201_sage_attention():
+    """aiter's SageAttention op for RDNA4 (gfx1201), or None on other GPUs."""
+    if not (
+        current_platform.is_rocm()
+        and current_platform.get_gcn_arch_name().startswith("gfx1201")
+    ):
+        return None
+    import aiter
+
+    return getattr(aiter, "gfx1201_sage_attention", None)
 
 
 class AITERSageBackend(AttentionBackend):
@@ -48,6 +66,15 @@ class AITERSageImpl(AttentionImpl):
     ) -> None:
         self.causal = causal
         self.softmax_scale = softmax_scale
+        # The gfx1201 op covers non-causal BF16 attention with head_dim 128 and
+        # equal Q/K/V shapes; dtype and shapes are checked per call.
+        self.gfx1201_sage_attn_fn = (
+            _gfx1201_sage_attention()
+            if head_size == 128 and not causal and num_kv_heads in (None, num_heads)
+            else None
+        )
+        if self.gfx1201_sage_attn_fn is not None:
+            logger.info_once("AITER Sage: using aiter.gfx1201_sage_attention")
         self.packed_trailing_padding = extra_impl_args.get(
             "packed_trailing_padding", False
         )
@@ -80,6 +107,18 @@ class AITERSageImpl(AttentionImpl):
             Output tensor of shape [batch_size, seq_len, head_num, head_dim]
         """
 
+        if (
+            self.gfx1201_sage_attn_fn is not None
+            and query.dtype == torch.bfloat16
+            and key.shape == query.shape
+            and value.shape == query.shape
+        ):
+            return self.gfx1201_sage_attn_fn(
+                query.contiguous(),
+                key.contiguous(),
+                value.contiguous(),
+                softmax_scale=self.softmax_scale,
+            )
         # aiter's Sage quantization assumes dense inputs; strided views such as
         # slices of a fused QKV projection give wrong results (ROCm/aiter#6222).
         output = self.aiter_sage_attn_fn(
