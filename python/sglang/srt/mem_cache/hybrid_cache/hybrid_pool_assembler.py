@@ -1181,6 +1181,30 @@ def build_deepseek_v4_hicache_stack(
     return host_pool_group, cache_controller
 
 
+def build_mamba_host_pool(
+    mamba_pool, *, host_size: float, layout: str, mtp_draft_device_pools=()
+):
+    (pool_info,) = mamba_pool.get_device_pool_infos()
+    pool_info.buffer_info.validate(layer_ids=pool_info.layer_ids)
+    draft_buffer_infos = []
+    for draft_pool in mtp_draft_device_pools:
+        (draft_info,) = draft_pool.get_device_pool_infos()
+        draft_info.buffer_info.validate(layer_ids=draft_info.layer_ids)
+        draft_buffer_infos.append(draft_info.buffer_info)
+    capacity = mamba_pool.host_capacity_tokens
+    if capacity is None:
+        capacity = mamba_pool.size
+    return MambaPoolHost(
+        pool_info.buffer_info,
+        get_memory().hicache_ratio,
+        host_size,
+        device_capacity=capacity,
+        mtp_draft_buffer_infos=draft_buffer_infos,
+        allocator_type=_get_allocator_type(),
+        layout=layout,
+    )
+
+
 def build_hybrid_mamba_stack(
     *,
     params: CacheInitParams,
@@ -1244,11 +1268,9 @@ def build_hybrid_mamba_stack(
         if get_memory().hicache_mem_layout == "page_first_kv_split"
         else get_memory().hicache_mem_layout
     )
-    mamba_host_pool = MambaPoolHost(
+    mamba_host_pool = build_mamba_host_pool(
         mamba_pool,
-        get_memory().hicache_ratio,
-        mamba_host_size,
-        allocator_type=_get_allocator_type(),
+        host_size=mamba_host_size,
         layout=mamba_layout,
         mtp_draft_device_pools=params.mtp_draft_mamba_pools,
     )
@@ -1374,11 +1396,9 @@ def build_hybrid_mamba_swa_stack(
         mtp_swa_full_device_pools=_mtp_swa_device_pools(params, full_indices=True),
         transfer_layer_id_max=transfer_layer_id_max,
     )
-    mamba_host_pool = MambaPoolHost(
+    mamba_host_pool = build_mamba_host_pool(
         mamba_pool,
-        get_memory().hicache_ratio,
-        mamba_host_size,
-        allocator_type=_get_allocator_type(),
+        host_size=mamba_host_size,
         layout=get_memory().hicache_mem_layout,
         mtp_draft_device_pools=params.mtp_draft_mamba_pools,
     )

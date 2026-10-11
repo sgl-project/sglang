@@ -9,7 +9,7 @@ import torch
 from sglang.srt.configs import model_config as model_config_module
 from sglang.srt.configs.inkling import InklingMMConfig
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.mem_cache.pool_host import mamba as mamba_module
+from sglang.srt.mem_cache.device_pool_info import MambaStateBufferInfo
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.model_executor.model_runner_components.layer_setup import (
     resolve_layer_indices,
@@ -129,46 +129,62 @@ def test_separate_state_requires_compatible_slot_ownership(monkeypatch, missing_
         spec.BaseSpecWorker._build_hicache_draft_plan(worker)
 
 
-def test_ascend_packed_state_roundtrip_uses_per_layer_destinations(monkeypatch):
-    # Exercise the portable NPU fallback on CPU. The bulk NPU transfer cannot
-    # consume target and draft tensors from separate allocations.
+@pytest.mark.parametrize("temporal_width", [0, 4])
+def test_ascend_packed_state_roundtrip_uses_buffer_descriptors(
+    monkeypatch, temporal_width
+):
     monkeypatch.setenv("SGLANG_NPU_HICACHE_MAMBA_IO", "sync")
-
-    def unexpected_bulk_transfer(**kwargs):
-        raise AssertionError("Packed state must not use the whole-pool NPU kernel")
-
-    monkeypatch.setattr(mamba_module, "transfer_mamba_state", unexpected_bulk_transfer)
-    layers = [torch.arange(32).reshape(8, 4) + 100 * i for i in range(5)]
-    src_ids = torch.tensor([2, 5])
-    host_ids = torch.tensor([1, 4])
-    dst_ids = torch.tensor([3, 6])
-    host = MambaPoolHost.__new__(MambaPoolHost)
-    host.layout = "page_first"
-    host.mtp_draft_device_pools = (object(),) * 3
-    host.num_mamba_layers = len(layers)
-    host.temporal_state_elem_size = 0
-    host.conv_state_shapes = [(4,)]
-    host.conv_buffer = [torch.full((8, len(layers), 1, 4), -1)]
-    MambaPoolHost._copy_tensor_all_layers_lf_pf(
-        src_layers=layers,
-        dst=host.conv_buffer[0],
-        src_indices=src_ids,
-        dst_indices=host_ids,
-        num_layers=len(layers),
-        io_backend="kernel_ascend",
-        src_ptrs=torch.empty(0),
-    )
-    for i, source in enumerate(layers):
-        assert torch.equal(host.conv_buffer[0][host_ids, i, 0], source[src_ids])
-        is_draft = i >= 2
-        destination = torch.full((1 if is_draft else 2, 8, 4), -1)
-        pool = SimpleNamespace(mamba_cache=SimpleNamespace(conv=[destination]))
-        host.load_to_device_per_layer(
-            pool, host_ids, dst_ids, i, io_backend="kernel_ascend", is_draft=is_draft
+    infos = tuple(
+        MambaStateBufferInfo(
+            temporal=torch.arange(layers * 8 * temporal_width).reshape(
+                layers, 8, temporal_width
+            )
+            + 100 * i,
+            conv=(torch.arange(layers * 8 * 4).reshape(layers, 8, 4) + 100 * i,),
+            extra_checkpoint_buffers=(torch.arange(16).reshape(8, 2) + 100 * i,),
         )
-        expected = torch.full_like(destination, -1)
-        expected[0 if is_draft else i, dst_ids] = source[src_ids]
-        assert torch.equal(destination, expected)
+        for i, layers in enumerate((2, 1, 1, 1))
+    )
+    host = MambaPoolHost(
+        infos[0],
+        host_to_device_ratio=2,
+        host_size=0,
+        device_capacity=7,
+        pin_memory=False,
+        layout="page_first",
+        mtp_draft_buffer_infos=infos[1:],
+    )
+    try:
+        assert host.num_mamba_layers == 5
+        assert host.temporal_device_ptrs.tolist() == [
+            layer.data_ptr() for info in infos for layer in info.temporal.unbind(0)
+        ]
+        src_ids = torch.tensor([2, 5])
+        host_ids = torch.tensor([1, 2])
+        dst_ids = torch.tensor([3, 6])
+        tensors = [
+            layer
+            for info in infos
+            for tensor in (*info.conv, info.temporal)
+            for layer in tensor.unbind(0)
+        ] + [buf for info in infos for buf in info.extra_checkpoint_buffers]
+        expected = [tensor[src_ids].clone() for tensor in tensors]
+        host.backup_from_device_all_layer(None, host_ids, src_ids, "kernel_ascend")
+        for tensor in tensors:
+            tensor.zero_()
+        for layer_id in range(host.num_mamba_layers):
+            host.load_to_device_per_layer(
+                None,
+                host_ids,
+                dst_ids,
+                layer_id,
+                "kernel_ascend",
+                is_draft=layer_id >= 2,
+            )
+        for tensor, reference in zip(tensors, expected, strict=True):
+            assert torch.equal(tensor[dst_ids], reference)
+    finally:
+        host.destroy()
 
 
 if __name__ == "__main__":

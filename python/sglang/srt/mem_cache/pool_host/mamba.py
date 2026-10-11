@@ -8,7 +8,7 @@ from typing import Optional, Sequence
 import numpy as np
 import torch
 
-from sglang.srt.mem_cache.memory_pool import MambaPool
+from sglang.srt.mem_cache.device_pool_info import MambaStateBufferInfo
 from sglang.srt.mem_cache.pool_host.base import (
     HostKVCache,
     host_memory_budget_bytes,
@@ -72,7 +72,7 @@ def _npu_hicache_mamba_io_mode() -> str:
 
 
 class MambaPoolHost(HostKVCache):
-    mtp_draft_device_pools: tuple[MambaPool, ...] = ()
+    mtp_draft_buffer_infos: tuple[MambaStateBufferInfo, ...] = ()
 
     # Class-level defaults so a model without side state, and the test stubs that
     # skip __init__, still read an empty pair rather than raising.
@@ -81,18 +81,22 @@ class MambaPoolHost(HostKVCache):
 
     def __init__(
         self,
-        device_pool: MambaPool,
+        buffer_info: MambaStateBufferInfo,
         host_to_device_ratio: float,
         host_size: int,
+        *,
+        device_capacity: int,
         pin_memory: bool = True,
         device: str = "cpu",
         allocator_type: str = "default",
         layout: str = "layer_first",
-        *,
-        mtp_draft_device_pools: Sequence[MambaPool] = (),
+        mtp_draft_buffer_infos: Sequence[MambaStateBufferInfo] = (),
     ):
-        self.device_pool = device_pool
-        self.mtp_draft_device_pools = tuple(mtp_draft_device_pools)
+        buffer_info.validate()
+        self.buffer_info = buffer_info
+        self.device_pool = None
+        self._buffer_device = buffer_info.temporal.device
+        self.mtp_draft_buffer_infos = tuple(mtp_draft_buffer_infos)
         self.page_size = 1
 
         assert layout in [
@@ -104,62 +108,51 @@ class MambaPoolHost(HostKVCache):
         self.pin_memory = pin_memory
         self.device = device
         self.allocator = get_allocator_from_storage(allocator_type)
-        self.num_mamba_layers = device_pool.num_mamba_layers + len(
-            self.mtp_draft_device_pools
+        self.num_mamba_layers = buffer_info.temporal.shape[0] + len(
+            self.mtp_draft_buffer_infos
         )
 
-        device_pools = (device_pool, *self.mtp_draft_device_pools)
-        for draft_pool in self.mtp_draft_device_pools:
-            assert draft_pool.num_mamba_layers == 1
-            assert draft_pool.size == device_pool.size
-            assert len(draft_pool.mamba_cache.conv) == len(device_pool.mamba_cache.conv)
+        buffer_infos = (buffer_info, *self.mtp_draft_buffer_infos)
+        for draft_info in self.mtp_draft_buffer_infos:
+            draft_info.validate()
+            assert draft_info.temporal.shape[0] == 1
+            assert len(draft_info.conv) == len(buffer_info.conv)
             for target, draft in zip(
-                (*device_pool.mamba_cache.conv, device_pool.mamba_cache.temporal),
-                (*draft_pool.mamba_cache.conv, draft_pool.mamba_cache.temporal),
+                (*buffer_info.conv, buffer_info.temporal),
+                (*draft_info.conv, draft_info.temporal),
                 strict=True,
             ):
-                assert target.shape[2:] == draft.shape[2:]
+                assert target.shape[1:] == draft.shape[1:]
                 assert target.dtype == draft.dtype
                 assert target.device == draft.device
 
         self.temporal_device_layers = [
-            layer
-            for pool in device_pools
-            for layer in pool.mamba_cache.temporal.unbind(0)
+            layer for info in buffer_infos for layer in info.temporal.unbind(0)
         ]
         self.conv_device_layers = [
-            [
-                layer
-                for pool in device_pools
-                for layer in pool.mamba_cache.conv[i].unbind(0)
-            ]
-            for i in range(len(device_pool.mamba_cache.conv))
+            [layer for info in buffer_infos for layer in info.conv[i].unbind(0)]
+            for i in range(len(buffer_info.conv))
         ]
 
         self.conv_state_shapes = [
-            conv_state.shape[2:] for conv_state in device_pool.mamba_cache.conv
+            conv_state.shape[2:] for conv_state in self.buffer_info.conv
         ]
-        self.temporal_state_shape = device_pool.mamba_cache.temporal.shape[2:]
+        self.temporal_state_shape = self.buffer_info.temporal.shape[2:]
         self.temporal_state_elem_size = int(np.prod(self.temporal_state_shape))
         self.conv_state_elem_sizes = [
             int(np.prod(conv_shape)) for conv_shape in self.conv_state_shapes
         ]
-        self.conv_dtype = device_pool.mamba_cache.conv[0].dtype
-        self.temporal_dtype = device_pool.mamba_cache.temporal.dtype
+        self.conv_dtype = self.buffer_info.conv[0].dtype
+        self.temporal_dtype = self.buffer_info.temporal.dtype
         self.dtype = self.conv_dtype
         # Registered side states share the checkpoint slot with conv/temporal,
         # so a host round trip that skips them leaves the previous occupant's rows.
         self.slot_state_device_tensors = [
-            state
-            for sibling in device_pool._slot_siblings
-            for _, state, _, _ in sibling.iter_transfer_state_entries()
+            buf for info in buffer_infos for buf in info.extra_checkpoint_buffers
         ]
         self.slot_state_buffers = []
         self.size_per_token = self.get_size_per_token()
 
-        device_capacity = getattr(device_pool, "host_capacity_tokens", None)
-        if device_capacity is None:
-            device_capacity = device_pool.size
         if host_size > 0:
             self.size = sync_fixed_hicache_size(
                 int(host_size * 1e9 // self.size_per_token), host_size
@@ -197,13 +190,13 @@ class MambaPoolHost(HostKVCache):
         self.temporal_device_ptrs = torch.tensor(
             [layer.data_ptr() for layer in self.temporal_device_layers],
             dtype=torch.uint64,
-            device=self.device_pool.device,
+            device=self._buffer_device,
         )
         self.conv_device_ptrs = [
             torch.tensor(
                 [layer.data_ptr() for layer in layers],
                 dtype=torch.uint64,
-                device=self.device_pool.device,
+                device=self._buffer_device,
             )
             for layers in self.conv_device_layers
         ]
@@ -240,7 +233,7 @@ class MambaPoolHost(HostKVCache):
         logger.info("NPU HiCache Mamba state transfer mode: native async.")
 
     def init_kv_buffer(self):
-        _host_alloc = ALLOC_MEMORY_FUNCS[self.device_pool.device]
+        _host_alloc = ALLOC_MEMORY_FUNCS[self._buffer_device.type]
 
         def alloc_func(dims, *, dtype, device, pin_memory, allocator):
             # conv-only linear attention has no ssm state: mmap can't map the
@@ -690,7 +683,16 @@ class MambaPoolHost(HostKVCache):
         *,
         is_draft: bool = False,
     ):
-        device_layer_id = 0 if is_draft else layer_id
+        temporal_layers = (
+            self.temporal_device_layers
+            if self.mtp_draft_buffer_infos
+            else self.buffer_info.temporal
+        )
+        conv_layers = (
+            self.conv_device_layers
+            if self.mtp_draft_buffer_infos
+            else self.buffer_info.conv
+        )
 
         # Side state is not per-layer, so it rides on the first layer's call --
         # before that layer's completion event, which is what every reader of a
@@ -701,7 +703,7 @@ class MambaPoolHost(HostKVCache):
             if (
                 io_backend == "kernel_ascend"
                 and transfer_mamba_state is not None
-                and not self.mtp_draft_device_pools
+                and not self.mtp_draft_buffer_infos
             ):
                 # NPU: transfer all layers at once via dedicated kernel.
                 # layer_id == 0 covers every layer, so later calls must skip.
@@ -710,7 +712,7 @@ class MambaPoolHost(HostKVCache):
                     # transfer errors, same guard as the per-layer path below
                     if self.temporal_state_elem_size > 0:
                         transfer_mamba_state(
-                            device_buf=device_pool.mamba_cache.temporal,
+                            device_buf=self.buffer_info.temporal,
                             host_buf=self.temporal_buffer,
                             device_indices=device_indices,
                             host_indices=host_indices,
@@ -718,7 +720,7 @@ class MambaPoolHost(HostKVCache):
                         )
                     for conv_idx in range(len(self.conv_state_shapes)):
                         transfer_mamba_state(
-                            device_buf=device_pool.mamba_cache.conv[conv_idx],
+                            device_buf=self.buffer_info.conv[conv_idx],
                             host_buf=self.conv_buffer[conv_idx],
                             device_indices=device_indices,
                             host_indices=host_indices,
@@ -729,7 +731,7 @@ class MambaPoolHost(HostKVCache):
                 if self.temporal_state_elem_size > 0:
                     self._copy_tensor_pf_lf(
                         src=self.temporal_buffer,
-                        dst=device_pool.mamba_cache.temporal[device_layer_id],
+                        dst=temporal_layers[layer_id],
                         src_indices=host_indices,
                         dst_indices=device_indices,
                         layer_id=layer_id,
@@ -739,7 +741,7 @@ class MambaPoolHost(HostKVCache):
                 for conv_idx in range(len(self.conv_state_shapes)):
                     self._copy_tensor_pf_lf(
                         src=self.conv_buffer[conv_idx],
-                        dst=device_pool.mamba_cache.conv[conv_idx][device_layer_id],
+                        dst=conv_layers[conv_idx][layer_id],
                         src_indices=host_indices,
                         dst_indices=device_indices,
                         layer_id=layer_id,
@@ -749,7 +751,7 @@ class MambaPoolHost(HostKVCache):
         else:
             self._copy_tensor(
                 self.temporal_buffer[layer_id],
-                device_pool.mamba_cache.temporal[device_layer_id],
+                temporal_layers[layer_id],
                 host_indices,
                 device_indices,
                 io_backend,
@@ -757,7 +759,7 @@ class MambaPoolHost(HostKVCache):
             for conv_idx in range(len(self.conv_state_shapes)):
                 self._copy_tensor(
                     self.conv_buffer[conv_idx][layer_id],
-                    device_pool.mamba_cache.conv[conv_idx][device_layer_id],
+                    conv_layers[conv_idx][layer_id],
                     host_indices,
                     device_indices,
                     io_backend,
@@ -768,13 +770,13 @@ class MambaPoolHost(HostKVCache):
     ):
         temporal_layers = (
             self.temporal_device_layers
-            if self.mtp_draft_device_pools
-            else device_pool.mamba_cache.temporal
+            if self.mtp_draft_buffer_infos
+            else self.buffer_info.temporal
         )
         conv_layers = (
             self.conv_device_layers
-            if self.mtp_draft_device_pools
-            else device_pool.mamba_cache.conv
+            if self.mtp_draft_buffer_infos
+            else self.buffer_info.conv
         )
         if self.layout in ["page_first", "page_first_direct"]:
             if io_backend == "kernel" and host_indices.device != device_indices.device:
