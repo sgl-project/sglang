@@ -13,6 +13,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import DecodingStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.encode_while_decoding import (
     EncodeWhileDecoding,
+    can_encode_while_decoding,
     streamed_video_output_path,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -110,18 +111,22 @@ class LTX2AVDecodingStage(DecodingStage):
             metrics=batch.metrics,
             rollout_trajectory_data=batch.rollout_trajectory_data,
         )
-        save_path = None
-        if (
+        audio_first = (
             not batch.use_diffusion_decoder
             and not batch.return_trajectory_decoded
             and isinstance(self.vae, ParallelTiledVAE)
             and self.vae.supports_decode_on_frames
-        ):
-            save_path = streamed_video_output_path(
+            and can_encode_while_decoding(
                 batch, server_args, int(batch.latents.shape[0])
             )
-        # every rank decodes audio first, including ranks that do not write the MP4
-        audio_first = not batch.use_diffusion_decoder
+        )
+        save_path = (
+            streamed_video_output_path(batch, server_args, int(batch.latents.shape[0]))
+            if audio_first
+            else None
+        )
+        # All ranks use the same order. Raw-frame and unsupported requests keep
+        # the original video-before-audio order.
         if audio_first:
             self._decode_audio(batch, server_args, output_batch)
         stream = None
@@ -152,7 +157,6 @@ class LTX2AVDecodingStage(DecodingStage):
         return output_batch
 
     def _decode_video(self, batch: Req, server_args: ServerArgs, on_frames=None):
-
         vae_dtype = resolve_decode_precision(server_args, "vae")
         vae_autocast_enabled = autocast_enabled(vae_dtype, server_args.disable_autocast)
 

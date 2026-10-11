@@ -25,11 +25,11 @@ logger = init_logger(__name__)
 _STREAMED_VIDEO_QUEUE_BYTES = 256 * 1024 * 1024
 
 
-def streamed_video_output_path(
+def can_encode_while_decoding(
     batch: Req, server_args: ServerArgs, batch_size: int
-) -> str | None:
-    """Where the output rank can write the MP4 during the decode, if anywhere."""
-    if not (
+) -> bool:
+    """Rank-independent eligibility, including ranks that only decode audio/video."""
+    return (
         batch.save_output
         and batch.return_file_paths_only
         and not batch.return_raw_frames
@@ -42,7 +42,14 @@ def streamed_video_output_path(
         and type(server_args.pipeline_config).post_decoding
         is PipelineConfig.post_decoding
         and current_platform.is_cuda()
-    ):
+    )
+
+
+def streamed_video_output_path(
+    batch: Req, server_args: ServerArgs, batch_size: int
+) -> str | None:
+    """Where the output rank can write the MP4 during the decode, if anywhere."""
+    if not can_encode_while_decoding(batch, server_args, batch_size):
         return None
     if model_parallel_is_initialized() and get_replica_group().rank_in_group != 0:
         return None

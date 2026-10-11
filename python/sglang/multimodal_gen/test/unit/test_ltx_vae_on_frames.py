@@ -2,6 +2,7 @@
 """LTX's frame callback must preserve the existing decode and final crop."""
 
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 import torch
@@ -19,6 +20,9 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
 from sglang.multimodal_gen.runtime.models.vaes.ltx_2_vae import AutoencoderKLLTX2Video
 from sglang.multimodal_gen.runtime.pipelines_core.stages.encode_while_decoding import (
     EncodeWhileDecoding,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ltx_2.decoding_av import (
+    LTX2AVDecodingStage,
 )
 
 
@@ -131,3 +135,53 @@ def test_stream_matches_cpu_postprocessing(tmp_path, dtype, audio):
     else:
         _save_video_ffmpeg(str(cpu_path), frames, fps=13, quality=5)
     assert cpu_path.read_bytes() == stream_path.read_bytes()
+
+
+@pytest.mark.parametrize(
+    "eligible,path,saved",
+    [
+        (False, None, None),
+        (True, None, None),
+        (True, "/tmp/clip.mp4", None),
+        (True, "/tmp/clip.mp4", ["/tmp/clip.mp4"]),
+    ],
+)
+def test_audio_order_and_encode_fallback(eligible, path, saved):
+    stage = object.__new__(LTX2AVDecodingStage)
+    stage.vae = tiny_vae()
+    stage.video_processor = VideoProcessor()
+    calls = []
+    video = torch.zeros(1, 3, 1, 8, 8)
+    request = SimpleNamespace(
+        latents=video,
+        use_diffusion_decoder=False,
+        return_trajectory_decoded=False,
+        trajectory_timesteps=None,
+        trajectory_latents=None,
+        metrics=None,
+        rollout_trajectory_data=None,
+    )
+    module = LTX2AVDecodingStage.__module__
+    encoder = mock.Mock()
+    encoder.finish.return_value = saved
+    with (
+        mock.patch.object(stage, "load_model"),
+        mock.patch.object(
+            stage, "_decode_audio", side_effect=lambda *args: calls.append("audio")
+        ),
+        mock.patch.object(
+            stage,
+            "_decode_video",
+            side_effect=lambda *args, **kwargs: (calls.append("video"), video)[1],
+        ),
+        mock.patch(f"{module}.can_encode_while_decoding", return_value=eligible),
+        mock.patch(f"{module}.streamed_video_output_path", return_value=path),
+        mock.patch(f"{module}.EncodeWhileDecoding", return_value=encoder),
+    ):
+        result = stage.forward(request, None)
+    assert calls == (["audio", "video"] if eligible else ["video", "audio"])
+    if saved is not None:
+        assert result.output is None
+        assert result.output_file_paths == saved
+    else:
+        assert result.output.shape == (1, 1, 8, 8, 3)
