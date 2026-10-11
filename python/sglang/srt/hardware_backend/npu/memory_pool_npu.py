@@ -5,6 +5,11 @@ import torch
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.layers.dcp.layout import localize_dcp_indices
+from sglang.srt.mem_cache.kv_cache_dtype import (
+    QUANT_MODE_MXFP4,
+    QUANT_MODE_MXFP8,
+    QUANT_MODE_TOKEN_FP8,
+)
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKOnlyPool,
     MHATokenToKVPool,
@@ -594,6 +599,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         indexer_layer_ids: Optional[Sequence[int]] = None,
         kv_cache_dim: Optional[int] = None,
         is_draft_worker: bool = False,
+        indexer_quant_mode: Optional[int] = None,
     ):
         # MLAPO historically owned NZ writes. Keep the allocation unchanged and
         # write into the NZ-addressed view below so ordinary MLA (including
@@ -666,6 +672,11 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         self.kv_page_padding = kv_page_padding
         self.index_page_padding = index_page_padding
         self.is_draft_worker = is_draft_worker
+        # quant_lightning_indexer (v2) quant mode of the indexer cache
+        # (1 = token-wise FP8 + FP32 scale, 3 = block-32 MXFP8 + E8M0,
+        # 5 = block-32 MXFP4 + E8M0); None = quantized indexer disabled.
+        self.indexer_quant_mode = None
+        self.index_k_view_dtype = None
 
         self.custom_mem_pool = None
 
@@ -703,28 +714,89 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 )
             self.index_k_buffer = None
             if self.index_head_dim is not None:
-                self.index_k_buffer = torch.zeros(
-                    (
-                        self.num_indexer_layers,
-                        self.index_size // self.index_page_size
-                        + self.index_page_padding,
-                        self.index_page_size,
-                        1,
-                        self.index_head_dim,
-                    ),
-                    dtype=self.store_dtype,
-                    device=self.device,
-                )
+                # The quantized-indexer cache only exists on top of the FP8
+                # DSA packed store; without it the DSA indexer runs the
+                # legacy bf16 npu_lightning_indexer path.
                 if self.dsa_kv_cache_store_fp8 and self.num_indexer_layers > 0:
+                    mode = (
+                        indexer_quant_mode
+                        if indexer_quant_mode is not None
+                        else QUANT_MODE_MXFP8
+                    )
+                    assert mode in (
+                        QUANT_MODE_TOKEN_FP8,
+                        QUANT_MODE_MXFP8,
+                        QUANT_MODE_MXFP4,
+                    ), (
+                        f"Unsupported quant_lightning_indexer quant_mode {mode}; "
+                        "expected 1 (fp8_e4m3), 3 (mxfp8) or 5 (fp4_e2m1)."
+                    )
+                    self.indexer_quant_mode = mode
+                else:
+                    mode = None
+                if mode == QUANT_MODE_MXFP4:
+                    assert hasattr(torch, "float4_e2m1fn_x2"), (
+                        "quant_lightning_indexer quant_mode 5 (fp4_e2m1) "
+                        "requires torch.float4_e2m1fn_x2 support "
+                        "(PyTorch 2.8.0+)."
+                    )
+                    # Packed MXFP4: 2 e2m1 values per byte; store raw bytes
+                    # so the scatter writer stays on a generic int dtype.
+                    # Consumers get the e2m1 view via get_index_k_buffer().
+                    self.index_k_buffer = torch.zeros(
+                        (
+                            self.num_indexer_layers,
+                            self.size // self.page_size + self.index_page_padding,
+                            self.page_size,
+                            1,
+                            self.index_head_dim // 2,
+                        ),
+                        dtype=torch.uint8,
+                        device=self.device,
+                    )
+                    self.index_k_view_dtype = torch.float4_e2m1fn_x2
+                else:
+                    self.index_k_buffer = torch.zeros(
+                        (
+                            self.num_indexer_layers,
+                            self.size // self.page_size + self.index_page_padding,
+                            self.page_size,
+                            1,
+                            self.index_head_dim,
+                        ),
+                        dtype=self.store_dtype,
+                        device=self.device,
+                    )
+                    self.index_k_view_dtype = self.dtype
+                if mode is not None:
                     from sglang.srt.layers.attention.dsa.dsa_npu_indexer import (
                         create_npu_hadamard_128,
                     )
 
-                    self.index_k_scale_buffer = torch.zeros(
-                        (*self.index_k_buffer.shape[:-2], 1),
-                        dtype=torch.float32,
-                        device=self.device,
-                    )
+                    if mode == QUANT_MODE_TOKEN_FP8:
+                        # Token-wise FP32 scale: k_descale
+                        # (block_num, block_size, k_n) for quant_mode 1.
+                        self.index_k_scale_buffer = torch.zeros(
+                            (*self.index_k_buffer.shape[:-2], 1),
+                            dtype=torch.float32,
+                            device=self.device,
+                        )
+                    else:
+                        # Block-32 MX scales (quant_mode 3/5): one E8M0 byte
+                        # per 32-element block, per-token tail
+                        # (k_n, d/64, 2) == (1, 2, 2). Stored as uint8 so the
+                        # scatter writer stays on a generic int dtype;
+                        # consumers get the E8M0 view via
+                        # get_index_k_scale_buffer().
+                        self.index_k_scale_buffer = torch.zeros(
+                            (
+                                *self.index_k_buffer.shape[:-1],
+                                self.index_head_dim // 64,
+                                2,
+                            ),
+                            dtype=torch.uint8,
+                            device=self.device,
+                        )
                     self.indexer_hadamard_128 = create_npu_hadamard_128(
                         self.index_head_dim, self.device
                     )
@@ -813,11 +885,14 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         if getattr(self, "index_k_buffer", None) is None:
             raise RuntimeError("NPU MLA index KV cache is not allocated.")
 
+        buf = self.index_k_buffer[self._get_indexer_slot(layer_id)]
+        if self.indexer_quant_mode == QUANT_MODE_MXFP4:
+            # Packed MXFP4: byte storage viewed as 2 e2m1 values per byte,
+            # logical head width index_head_dim.
+            return buf.view(self.index_k_view_dtype)
         if self.store_dtype != self.dtype:
-            return self.index_k_buffer[self._get_indexer_slot(layer_id)].view(
-                self.dtype
-            )
-        return self.index_k_buffer[self._get_indexer_slot(layer_id)]
+            return buf.view(self.dtype)
+        return buf
 
     def _get_indexer_slot(self, layer_id: int) -> int:
         return self.indexer_layer_id_to_slot[layer_id]
@@ -825,13 +900,38 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
     def get_index_k_scale_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-        return self.index_k_scale_buffer[self._get_indexer_slot(layer_id)]
+        buf = self.index_k_scale_buffer[self._get_indexer_slot(layer_id)]
+        if self.indexer_quant_mode == QUANT_MODE_TOKEN_FP8:
+            # Token-wise FP32 scale: k_descale (block_num, block_size, k_n)
+            # for quant_lightning_indexer (v2) quant_mode 1, PA_BBND.
+            return buf
+        # E8M0 view of the raw byte storage: (block_num, block_size, k_n, d/64, 2),
+        # the k_descale layout quant_lightning_indexer (v2) expects with
+        # quant_mode 3/5 and layout_k PA_BBND.
+        return buf.view(torch.float8_e8m0fnu)
 
     def set_index_k_scale_buffer(self, layer_id: int, loc, scale):
+        # Scatter whole per-token scale rows so the scales keep the layout
+        # quant_lightning_indexer (v2) reads back: one FP32 per token-head
+        # (quant_mode 1) or (k_n, d/64, 2) E8M0 bytes (quant_mode 3/5).
+        buf = self.index_k_scale_buffer[self._get_indexer_slot(layer_id)]
+        tail = buf.shape[2:]
+        if self.indexer_quant_mode == QUANT_MODE_TOKEN_FP8:
+            assert scale.dtype == torch.float32, (
+                "index_k token-wise scale must be FP32, "
+                f"got dtype {scale.dtype}"
+            )
+            row = scale.reshape(-1, *tail)
+        else:
+            assert scale.element_size() == 1, (
+                "index_k scale must be a 1-byte (E8M0) MX scale, "
+                f"got dtype {scale.dtype}"
+            )
+            row = scale.reshape(-1, *tail).view(torch.uint8)
         torch_npu.npu_scatter_nd_update_(
-            self.index_k_scale_buffer[self._get_indexer_slot(layer_id)].view(-1, 1),
+            buf.view(-1, *tail),
             loc.view(-1, 1),
-            scale.view(-1, 1),
+            row,
         )
 
     def _get_disagg_buffer_entries(self):
@@ -983,6 +1083,18 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         loc: torch.Tensor,
         index_k: torch.Tensor,
     ):
+        if self.indexer_quant_mode == QUANT_MODE_MXFP4:
+            # Packed MXFP4 payload: scatter the raw bytes (2 e2m1 values per
+            # byte) directly.
+            index_k = index_k.view(torch.uint8)
+            torch_npu.npu_scatter_nd_update_(
+                self.index_k_buffer[self._get_indexer_slot(layer_id)].view(
+                    -1, 1, self.index_head_dim // 2
+                ),
+                loc.view(-1, 1),
+                index_k.view(-1, 1, self.index_head_dim // 2),
+            )
+            return
         if index_k.dtype != self.dtype:
             index_k = index_k.to(self.dtype)
 

@@ -58,6 +58,7 @@ _OVERRIDABLE_HOOKS: FrozenSet[str] = frozenset(
         "handle_linear_attn_backend",
         "handle_kv4_compatibility",
         "handle_mxfp8_kv_cache_compatibility",
+        "handle_indexer_kv_cache_compatibility",
         "handle_amd_specifics",
         "handle_nccl_pre_warm",
         "handle_grammar_backend",
