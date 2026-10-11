@@ -432,6 +432,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self._fused_in_proj_qkvz_width = 0
         self._fused_in_proj_ba_width = 0
         self._fused_in_proj_scale: Optional[torch.Tensor] = None
+        self._fused_in_proj_mxfp4 = False
         self._fused_in_proj_sources = None
         self._derived_weight_cache_error = None
         self._fused_input_proj_cpu_enabled = LazyValue(
@@ -695,7 +696,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         return query, key, value, z, b, a
 
     def finalize_fused_in_proj(self) -> None:
-        """Prepare one BF16 or FP8 GEMM for both input projections.
+        """Prepare one BF16, FP8 or MXFP4 GEMM for both input projections.
 
         BF16 parameters alias the packed rows. FP8 keeps the original layouts
         for the separate path and publishes its derived-cache update constraint.
@@ -714,7 +715,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         if _use_aiter and not get_bool_env_var("SGLANG_QWEN35_PACKED_IN_PROJ", "True"):
             return
         qkvz, ba = self.in_proj_qkvz, self.in_proj_ba
-        if _use_aiter and self._finalize_fused_fp8_in_proj():
+        if _use_aiter and (
+            self._finalize_fused_fp8_in_proj() or self._finalize_fused_mxfp4_in_proj()
+        ):
             return
         if not (
             isinstance(qkvz.quant_method, UnquantizedLinearMethod)
@@ -796,6 +799,83 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         )
         return True
 
+    def _finalize_fused_mxfp4_in_proj(self) -> bool:
+        """Pack Quark MXFP4 projections for one AITER ASM FP4 GEMM.
+
+        in_proj_qkvz runs the ASM GEMM; in_proj_ba is too narrow for it
+        (N <= 128) and keeps its raw layout for the Triton GEMM, so the packed
+        GEMM gets a shuffled, zero-padded copy of its rows. in_proj_qkvz
+        aliases the packed rows.
+        """
+        from sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4 import (
+            QuarkW4A4MXFP4,
+            pack_asm_fp4_weight_tail,
+        )
+
+        qkvz, ba = self.in_proj_qkvz, self.in_proj_ba
+        if not (
+            all(
+                type(getattr(proj, "scheme", None)) is QuarkW4A4MXFP4
+                and not getattr(proj, "dequantized_bf16", False)
+                and proj.bias is None
+                and proj.weight.is_cuda
+                for proj in (qkvz, ba)
+            )
+            and getattr(qkvz, "use_aiter_asm_fp4_gemm", False)
+            and not getattr(ba, "use_aiter_asm_fp4_gemm", False)
+        ):
+            return False
+        # Same uniform derived-cache constraint as the FP8 packer.
+        if get_parallel().pp_size != 1:
+            return False
+        packed = pack_asm_fp4_weight_tail(
+            qkvz.weight.data,
+            qkvz.weight_scale.data,
+            ba.weight.data,
+            ba.weight_scale.data,
+        )
+        if packed is None:
+            return False
+        weight, scale = packed
+        qkvz_width, ba_width = qkvz.weight.shape[0], ba.weight.shape[0]
+        qkvz.weight.data = weight[:qkvz_width]
+        qkvz.weight_scale.data = scale[:qkvz_width]
+        self._fused_in_proj_weight = weight
+        self._fused_in_proj_scale = scale
+        self._fused_in_proj_mxfp4 = True
+        self._fused_in_proj_qkvz_width = qkvz_width
+        self._fused_in_proj_ba_width = ba_width
+        self._fused_in_proj_sources = tuple(
+            (value, value.data_ptr(), None if value.is_inference() else value._version)
+            for proj in (qkvz, ba)
+            for value in (proj.weight, proj.weight_scale)
+        )
+        self._derived_weight_cache_error = (
+            "Online weight updates are not supported with packed MXFP4 GDN input "
+            "projections: captured graphs retain a packed copy of in_proj_ba. "
+            "Restart with SGLANG_QWEN35_PACKED_IN_PROJ=0 before updating weights."
+        )
+        return True
+
+    def _packed_mxfp4_in_proj(self, x_q: torch.Tensor, x_scales: torch.Tensor):
+        """The packed MXFP4 GEMM on an fp4x2 input with ASM-layout scales."""
+        from sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4 import (
+            gemm_a4w4,
+        )
+
+        fused_out = gemm_a4w4(
+            x_q,
+            self._fused_in_proj_weight,
+            x_scales,
+            self._fused_in_proj_scale,
+            torch.empty(0, dtype=self.in_proj_qkvz.scheme.out_dtype, device=x_q.device),
+        )
+        split = self._fused_in_proj_qkvz_width
+        return (
+            fused_out[:, :split],
+            fused_out[:, split : split + self._fused_in_proj_ba_width],
+        )
+
     def _fused_fp8_in_proj_sources_valid(self) -> bool:
         current = tuple(
             value
@@ -824,7 +904,15 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 and 0 < x.shape[0] <= 64
                 and not torch.compiler.is_compiling()
             ):
-                if self._fused_in_proj_scale is not None:
+                if self._fused_in_proj_mxfp4:
+                    if self._fused_fp8_in_proj_sources_valid():
+                        from sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4 import (
+                            per_1x32_f4_quant,
+                        )
+
+                        # Shuffled, 256-row-padded scales: the packed GEMM's layout.
+                        return self._packed_mxfp4_in_proj(*per_1x32_f4_quant(x))
+                elif self._fused_in_proj_scale is not None:
                     if self._fused_fp8_in_proj_sources_valid():
                         from sglang.srt.layers.quantization.fp8_utils import (
                             apply_fp8_linear,
@@ -1883,7 +1971,8 @@ class Qwen3_5ForCausalLM(nn.Module):
                     module.finalize_fused_in_proj()
                     packed += int(module._fused_in_proj_weight is not None)
             logger.info(
-                "Packed BF16/FP8 GDN input projection enabled for %d layers", packed
+                "Packed BF16/FP8/MXFP4 GDN input projection enabled for %d layers",
+                packed,
             )
 
     def set_dflash_layers_to_capture(self, layers_to_capture: list[int]):
@@ -2412,6 +2501,9 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
     def should_apply_lora(self, module_name: str) -> bool:
         return module_name.startswith("model.layers.")
+
+    def prepare_before_cuda_graph_capture(self, model_runner) -> None:
+        self.model.prepare_before_cuda_graph_capture(model_runner)
 
     @property
     def start_layer(self) -> int:
