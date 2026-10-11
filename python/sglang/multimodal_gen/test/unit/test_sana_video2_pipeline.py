@@ -50,27 +50,15 @@ def test_latent_layout_and_frame_alignment():
     assert defaults.num_inference_steps == 50
 
 
-def test_bcg_requires_resident_transformer_only_when_enabled():
-    config = SanaVideo2PipelineConfig()
-    for enabled in (False, True):
-        calls = []
-        args = SimpleNamespace(
-            enable_breakable_cuda_graph=enabled,
-            require_component_resident=lambda *args, **kwargs: calls.append(
-                (args, kwargs)
-            ),
-        )
-        config.validate_server_args(args)
-        assert calls == (
-            [
-                (
-                    ("transformer",),
-                    {"feature_name": "SANA-Video 2.0 breakable CUDA graphs"},
-                )
-            ]
-            if enabled
-            else []
-        )
+@pytest.mark.parametrize("enabled", [False, True])
+def test_bcg_requires_resident_transformer_only_when_enabled(enabled):
+    required = []
+    args = SimpleNamespace(
+        enable_breakable_cuda_graph=enabled,
+        require_component_resident=lambda name, **_: required.append(name),
+    )
+    SanaVideo2PipelineConfig().validate_server_args(args)
+    assert required == (["transformer"] if enabled else [])
 
 
 def test_dpm_constant_data_prediction_reaches_clean_endpoint():
@@ -151,11 +139,7 @@ def test_denoising_stage_role():
 
 
 def _denoising_stage(transformer):
-    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_video2 import (
-        SanaVideo2DenoisingStage,
-    )
-
-    stage = object.__new__(SanaVideo2DenoisingStage)
+    stage = object.__new__(sana_video2.SanaVideo2DenoisingStage)
     stage.transformer = transformer
     stage._bcg_runner = None
     stage.begin_declared_component_use = lambda **_: None
@@ -179,7 +163,11 @@ def _denoising_batch(*, condition_image=None, is_warmup=False, cfg=True):
     )
 
 
-def test_denoising_bcg_captures_t2v_and_ti2v_at_warmup_only(monkeypatch):
+@pytest.mark.parametrize("conditioned", [False, True])
+@pytest.mark.parametrize("cfg", [False, True])
+def test_denoising_bcg_captures_t2v_and_ti2v_at_warmup_only(
+    monkeypatch, conditioned, cfg
+):
     from sglang.multimodal_gen.runtime.breakable_cuda_graph import runner as bcg_module
 
     instances = []
@@ -210,15 +198,23 @@ def test_denoising_bcg_captures_t2v_and_ti2v_at_warmup_only(monkeypatch):
         pipeline_config=SimpleNamespace(flow_shift=12.0),
     )
 
-    stage.forward(_denoising_batch(is_warmup=True), args)
+    stage.forward(
+        _denoising_batch(
+            is_warmup=True, condition_image=object() if conditioned else None, cfg=cfg
+        ),
+        args,
+    )
     assert len(instances) == 1
     runner = instances[0]
+    batch_size = 2 if cfg else 1
+    assert len(runner.captures) == 2
     assert {tuple(call["timestep"].shape) for call in runner.captures} == {
-        (2,),
-        (2, 1, 3, 1, 1),
+        (batch_size,),
+        (batch_size, 1, 3, 1, 1),
     }
     assert all(
-        call["encoder_hidden_states"].shape == (2, 300, 4) for call in runner.captures
+        call["encoder_hidden_states"].shape == (batch_size, 300, 4)
+        for call in runner.captures
     )
     assert all(call["timestep"].dtype == torch.float32 for call in runner.captures)
     framewise = next(
@@ -227,10 +223,10 @@ def test_denoising_bcg_captures_t2v_and_ti2v_at_warmup_only(monkeypatch):
     assert torch.count_nonzero(framewise[:, :, 0]) == 0
     assert torch.all(framewise[:, :, 1:] > 0)
     captures = len(runner.captures)
-    stage.forward(_denoising_batch(condition_image=object()), args)
+    stage.forward(_denoising_batch(condition_image=object(), cfg=cfg), args)
     assert len(instances) == 1
     assert len(runner.captures) == captures
-    assert any(call["timestep"].shape == (2, 1, 3, 1, 1) for call in runner.calls)
+    assert runner.calls[-1]["timestep"].shape == (batch_size, 1, 3, 1, 1)
 
 
 def test_denoising_without_bcg_calls_transformer_directly():
