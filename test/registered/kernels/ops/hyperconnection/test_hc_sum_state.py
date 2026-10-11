@@ -513,22 +513,26 @@ class TestHCSumState(CustomTestCase):
                 {"block_inject_weight.weight": pair["block_inject_weight.weight"]},
                 strict=False,
             )
-        with self.assertRaisesRegex(ValueError, "Down and Inject"):
-            _model_load_weights_direct(
-                model,
-                [
-                    (
-                        "hc.input_mix_weight_down.weight",
-                        pair["input_mix_weight_down.weight"] * 2,
-                    )
-                ],
-            )
-        # A failed partial direct transaction is recovered with a complete pair.
-        _model_load_weights_direct(
-            model, [("hc." + name, value) for name, value in pair.items()]
-        )
-        self.check_storage(model.hc, checkpoint)
-        self.step(model.hc, self.tensor((25, 4 * h), dtype), checkpoint)
+        names = tuple(pair)
+        for scale, order in enumerate((names, names[::-1]), start=2):
+            with self.subTest(first=order[0]):
+                updated = {name: value * scale for name, value in pair.items()}
+                _model_load_weights_direct(
+                    model, [("hc." + order[0], updated[order[0]])]
+                )
+                with self.assertRaisesRegex(ValueError, "Down and Inject"):
+                    model.hc.validate_sum_state_weights()
+                with self.assertRaisesRegex(ValueError, "prepared weights"):
+                    model.hc.mix(self.tensor((1, 4 * h), dtype))
+
+                _model_load_weights_direct(
+                    model, [("hc." + order[1], updated[order[1]])]
+                )
+                model.hc.validate_sum_state_weights()
+                checkpoint.update(updated)
+                self.check_storage(model.hc, checkpoint)
+                for t in (24, 25):
+                    self.step(model.hc, self.tensor((t, 4 * h), dtype), checkpoint)
 
     @torch.no_grad()
     def test_ipc_restore_rebinds_without_repacking(self):

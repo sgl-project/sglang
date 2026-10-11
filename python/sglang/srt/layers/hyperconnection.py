@@ -448,6 +448,7 @@ class GatedResidual(HyperConnectionBase):
 
     def _after_sum_state_dict_load(self, module, incompatible_keys):
         self.prepare_sum_state_weights()
+        self.validate_sum_state_weights()
 
     def _apply(self, fn, recurse=True):
         if self._packed_sum_weights and self._hc_packed_down is not None:
@@ -466,9 +467,10 @@ class GatedResidual(HyperConnectionBase):
     @torch.no_grad()
     def _prepare_packed_sum_state_weights(self):
         if len(self._hc_loaded_weights & {"down", "inject"}) == 1:
-            raise ValueError(
-                "Packed HC requires Down and Inject to be updated together"
-            )
+            # A weight-update session may deliver the pair in separate buckets.
+            # Keep the previous operators unusable until the other half arrives.
+            self._sum_weights_dirty = True
+            return False
         if self._sum_operators is not None and not self._sum_weights_dirty:
             return True
         up, norm = self.input_mix_weight_up.weight, self.hc_norm.weight
@@ -568,13 +570,28 @@ class GatedResidual(HyperConnectionBase):
         self._sum_weights_dirty = False
         return True
 
+    def validate_sum_state_weights(self):
+        """Reject unfinished packed HC updates at a complete-load boundary."""
+        if not self._packed_sum_weights:
+            return
+        loaded_pair = self._hc_loaded_weights & {"down", "inject"}
+        if len(loaded_pair) == 1:
+            missing = "Inject" if "down" in loaded_pair else "Down"
+            raise ValueError(
+                "Packed HC requires Down and Inject to be updated together; "
+                f"missing {missing} at the end of the weight update"
+            )
+        if self._sum_operators is None or self._sum_weights_dirty:
+            raise ValueError("Packed HC weights are not prepared after loading")
+
     @torch.no_grad()
     def prepare_sum_state_weights(self, *, force: bool = False):
-        """Prepare both paths after a complete weight-load transaction.
+        """Prepare both paths once the pending Down/Inject pair is complete.
 
         Packed instances retain CPU checkpoint values and one shared CUDA
         Down/Inject storage plus one shared [H,C] RMS storage. Down and Inject
-        must be updated together; unchanged Up/RMS need not be resent.
+        may arrive in separate loader calls; an incomplete pair stays dirty.
+        Validate readiness when loading ends. Unchanged Up/RMS need not be resent.
         ``force`` handles loaders that copy through
         state_dict instead of weight_loader. Reloading requires graph recapture.
         Legacy instances keep their existing source/derived-storage behavior.
