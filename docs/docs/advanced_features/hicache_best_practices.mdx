@@ -29,6 +29,7 @@ L1 and L2 are private to a single inference instance; only L3 can be shared. Hos
 Notes:
 
 - Besides configuring `--hicache-storage-backend` at startup, SGLang also supports **runtime attach/detach** of the HiCache storage backend (no restart required) via HTTP admin endpoints. See [Runtime Attach/Detach HiCache Storage Backend](./hicache_storage_runtime_attach_detach).
+- Hybrid Mamba/GDN/KDA models keep a second host pool for recurrent states next to host KV. It is sized from the device Mamba pool (by `--hicache-ratio`, or by the device-byte split of `--hicache-size`), so with a small `--max-mamba-cache-size` it holds far fewer states than host KV holds requests and fills first. When it is full, its LRU drops the oldest states, and a prefix whose KV is still on host cannot be matched again until a request recomputes it. Watch `sglang:hicache_host_mamba_used_states` against `sglang:hicache_host_mamba_total_states`, and raise the ratio if the pool runs full.
 
 ## Key Configurations with Storage Backends Enabled
 

@@ -30,6 +30,8 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.scheduler_components.metrics_reporter import (
     SchedulerMetricsReporter,
 )
+from sglang.srt.mem_cache.hicache_storage import PoolName
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_EXPERT_DISPATCH,
     STAT_LOGGER_ROLE_RADIX_CACHE,
@@ -483,3 +485,80 @@ class TestRequestTimePerOutputToken(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestHiCacheHostMambaStats(CustomTestCase):
+    """Regression for sgl-project/sglang#33713: on hybrid-SSM models the host
+    Mamba pool fills long before host KV and its LRU drops the states that make
+    the host KV matchable, but only the KV pool was exported, so the resulting
+    misses looked like a radix-tree bug. The host Mamba pool must be reported
+    next to host KV, and only for models that have one."""
+
+    def setUp(self):
+        self.labels = {"model_name": "test"}
+
+    def _reporter(self, entry_map):
+        reporter = SchedulerMetricsReporter.__new__(SchedulerMetricsReporter)
+        tree_cache = MagicMock(spec=UnifiedRadixCache)
+        tree_cache.token_to_kv_pool_host = SimpleNamespace(
+            logical_size=1000, available_size=lambda: 400
+        )
+        tree_cache.host_pool_group = SimpleNamespace(entry_map=entry_map)
+        reporter.scheduler = SimpleNamespace(
+            enable_hierarchical_cache=True, tree_cache=tree_cache
+        )
+        reporter.stats = SchedulerStats()
+        return reporter
+
+    def _collector(self):
+        collector = MagicMock()
+        collector.labels = self.labels
+        collector.enable_hierarchical_cache = True
+        collector.hicache_host_mamba_used_states = _RecordingMetric(
+            name="sglang:hicache_host_mamba_used_states",
+            labelnames=self.labels.keys(),
+        )
+        collector.hicache_host_mamba_total_states = _RecordingMetric(
+            name="sglang:hicache_host_mamba_total_states",
+            labelnames=self.labels.keys(),
+        )
+        collector._log_gauge.side_effect = lambda gauge, data: (
+            SchedulerMetricsCollector._log_gauge(collector, gauge, data)
+        )
+        return collector
+
+    def test_reports_host_mamba_pool_next_to_host_kv(self):
+        mamba_pool = SimpleNamespace(logical_size=138, available_size=lambda: 10)
+        reporter = self._reporter(
+            {PoolName.MAMBA: SimpleNamespace(host_pool=mamba_pool)}
+        )
+
+        reporter._log_hicache_stats()
+
+        self.assertEqual(reporter.stats.hicache_host_used_tokens, 600)
+        self.assertEqual(reporter.stats.hicache_host_total_tokens, 1000)
+        self.assertEqual(reporter.stats.hicache_host_mamba_used_states, 128)
+        self.assertEqual(reporter.stats.hicache_host_mamba_total_states, 138)
+
+        collector = self._collector()
+        SchedulerMetricsCollector.log_stats(collector, reporter.stats)
+        self.assertEqual(
+            collector.hicache_host_mamba_used_states.sets, [(self.labels, 128)]
+        )
+        self.assertEqual(
+            collector.hicache_host_mamba_total_states.sets, [(self.labels, 138)]
+        )
+
+    def test_models_without_a_host_mamba_pool_export_no_series(self):
+        reporter = self._reporter({PoolName.KV: SimpleNamespace(host_pool=None)})
+
+        reporter._log_hicache_stats()
+
+        self.assertEqual(reporter.stats.hicache_host_used_tokens, 600)
+        self.assertEqual(reporter.stats.hicache_host_mamba_used_states, 0)
+        self.assertEqual(reporter.stats.hicache_host_mamba_total_states, 0)
+
+        collector = self._collector()
+        SchedulerMetricsCollector.log_stats(collector, reporter.stats)
+        self.assertEqual(collector.hicache_host_mamba_used_states.sets, [])
+        self.assertEqual(collector.hicache_host_mamba_total_states.sets, [])

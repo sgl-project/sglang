@@ -16,6 +16,8 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import EPLB_BALANCEDNESS_WINDOW_SIZES
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.mem_cache.hicache_storage import PoolName
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.observability.metrics_collector import (
     DPCooperationInfo,
     QueueCount,
@@ -1225,6 +1227,24 @@ class SchedulerMetricsReporter:
         host_total = host_pool.logical_size
         self.stats.hicache_host_used_tokens = host_total - host_pool.available_size()
         self.stats.hicache_host_total_tokens = host_total
+
+        mamba_host_pool = self._hicache_host_mamba_pool()
+        if mamba_host_pool is not None:
+            mamba_total = mamba_host_pool.logical_size
+            self.stats.hicache_host_mamba_used_states = (
+                mamba_total - mamba_host_pool.available_size()
+            )
+            self.stats.hicache_host_mamba_total_states = mamba_total
+
+    def _hicache_host_mamba_pool(self):
+        tree_cache = self.scheduler.tree_cache
+        if (
+            not isinstance(tree_cache, UnifiedRadixCache)
+            or tree_cache.host_pool_group is None
+        ):
+            return None
+        entry = tree_cache.host_pool_group.entry_map.get(PoolName.MAMBA)
+        return None if entry is None else entry.host_pool
 
     def _update_lora_metrics(self):
         """Update LoRA pool metrics for monitoring and autoscaling."""
