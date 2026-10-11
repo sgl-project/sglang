@@ -1,11 +1,13 @@
 """Numerical checks for kernels 1 and 4 against torch.mm and the standard
 top-k path respectively, and for the block-FP8 node 1 (the layers' own GEMMs
-feeding kernel 2 by row stride) against the packed layout kernel 1 writes.
+feeding kernel 2 by row stride) against the packed layout kernel 1 writes, plus
+the weight-dtype gate that picks between the bf16 and block-FP8 paths.
 
 Kernel 3 runs here only as the fixture that produces kernel 4's inputs; nothing
-asserts on its logits. Kernel 2 is NOT covered -- it is the kernel that *writes*
-the preshuffled FP8 cache, so testing it means comparing that cache byte for
-byte against indexer_k_quant_and_cache, which this file does not do."""
+asserts on its logits. Kernel 2 runs in the block-FP8 test, where its q, head
+gate and cache bytes are compared between the two input layouts only. Its cache
+is never compared against indexer_k_quant_and_cache, so a format mismatch with
+the standard writer would not be caught here."""
 
 import types
 import unittest
@@ -337,6 +339,34 @@ class TestGfx950FusedIndexerKernels(unittest.TestCase):
             PAGE_SIZE,
         )
         return out, q_fp8, gate
+
+
+class TestGfx950FusedIndexerWeightGate(unittest.TestCase):
+    def test_weight_dtypes(self):
+        from sglang.srt.layers.attention.dsa.dsa_indexer import (
+            _gfx950_fused_weights_ok,
+            fp8_dtype,
+        )
+
+        bf16 = types.SimpleNamespace(dtype=torch.bfloat16)
+        fp8 = types.SimpleNamespace(dtype=fp8_dtype)
+        fp32 = types.SimpleNamespace(dtype=torch.float32)
+        # (wk, weights_proj, wq_b) -> accepted
+        cases = {
+            "bf16": ((bf16, bf16, bf16), True),
+            "block_fp8": ((fp8, bf16, fp8), True),
+            "fp8_wq_b_bf16_wk": ((bf16, bf16, fp8), False),
+            "bf16_wq_b_fp8_wk": ((fp8, bf16, bf16), False),
+            "fp8_weights_proj": ((fp8, fp8, fp8), False),
+            "fp32_weights_proj": ((bf16, fp32, bf16), False),
+            "fp32_wk_wq_b": ((fp32, bf16, fp32), False),
+            "missing_wk": ((None, bf16, bf16), False),
+            "missing_weights_proj": ((bf16, None, bf16), False),
+            "missing_wq_b": ((fp8, bf16, None), False),
+        }
+        for name, (weights, expected) in cases.items():
+            with self.subTest(name):
+                self.assertEqual(_gfx950_fused_weights_ok(*weights), expected)
 
 
 class _Fp8Linear:

@@ -99,6 +99,17 @@ def _decline_fused(reason: str) -> None:
         logger.info("gfx950 fused DSA indexer declined this call: %s", reason)
 
 
+def _gfx950_fused_weights_ok(wk_w, wp_w, wq_b_w) -> bool:
+    return (
+        wk_w is not None
+        and wp_w is not None
+        and wq_b_w is not None
+        and wp_w.dtype == torch.bfloat16
+        and wk_w.dtype == wq_b_w.dtype
+        and wk_w.dtype in (torch.bfloat16, fp8_dtype)
+    )
+
+
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 
@@ -423,27 +434,21 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             num_local_tokens=self.num_local_tokens,
         )
         # Node 2 takes bf16 head weights, so weights_proj must be bf16. wq_b and
-        # wk may be bf16 (merged into the fused GEMV) or block-FP8 (their own
-        # GEMMs run, see Gfx950FusedIndexer._constants). Resolve every module
-        # defensively: use_dsa_indexer_fusion builds wk_weights_proj and leaves
-        # wk/weights_proj undefined, and a quantised checkpoint may name its
-        # parameter something other than `weight`, so neither the modules nor
-        # their `.weight` can be assumed to exist.
+        # wk must be both bf16 (merged into the fused GEMV) or both block-FP8
+        # (their own GEMMs run); Gfx950FusedIndexer._constants and run() handle
+        # no mix of the two. Resolve every module defensively:
+        # use_dsa_indexer_fusion builds wk_weights_proj and leaves wk/weights_proj
+        # undefined, and a quantised checkpoint may name its parameter something
+        # other than `weight`, so neither the modules nor their `.weight` can be
+        # assumed to exist.
         wk_w = getattr(getattr(self, "wk", None), "weight", None)
         wp_w = getattr(getattr(self, "weights_proj", None), "weight", None)
         wq_b_w = getattr(getattr(self, "wq_b", None), "weight", None)
-        gfx950_weights_ok = (
-            wk_w is not None
-            and wp_w is not None
-            and wq_b_w is not None
-            and wk_w.dtype in (torch.bfloat16, fp8_dtype)
-            and wp_w.dtype == torch.bfloat16
-            and wq_b_w.dtype in (torch.bfloat16, fp8_dtype)
-        )
+        gfx950_weights_ok = _gfx950_fused_weights_ok(wk_w, wp_w, wq_b_w)
         if gfx950_shape_ok and not gfx950_weights_ok:
             logger.info(
                 "gfx950 fused DSA indexer disabled: needs bf16 weights_proj and "
-                "bf16 or fp8 wk/wq_b, got %s/%s/%s",
+                "wk/wq_b both bf16 or both fp8, got wk=%s weights_proj=%s wq_b=%s",
                 getattr(wk_w, "dtype", None),
                 getattr(wp_w, "dtype", None),
                 getattr(wq_b_w, "dtype", None),
