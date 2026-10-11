@@ -250,7 +250,10 @@ def _environment_fingerprint() -> str:
             compilers.append((path, version))
         except (OSError, subprocess.SubprocessError) as error:
             logger.warning("Cannot fingerprint compiler %s: %s", path, error)
-            compilers.append((path, _file_digest(pathlib.Path(path)) or "missing"))
+            resolved_path = pathlib.Path(path)
+            if not resolved_path.is_absolute():
+                resolved_path = pathlib.Path(shutil.which(path) or path)
+            compilers.append((path, _file_digest(resolved_path) or "missing"))
 
     versions: List[Tuple[str, str]] = []
     for name in _VERSIONED_PACKAGES:

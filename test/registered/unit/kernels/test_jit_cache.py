@@ -156,6 +156,35 @@ def test_musa_target_flags_use_cxx17_without_changing_cuda(monkeypatch):
     assert "-std=c++20" in arch.get_default_target_flags(arch.make_jit_cuda_arch(9, 0))
 
 
+def test_compiler_fingerprint_resolves_host_compiler_from_path(monkeypatch, tmp_path):
+    first_compiler = _write(tmp_path / "bin" / "c++-first", "first")
+    second_compiler = _write(tmp_path / "bin" / "c++-second", "second")
+    selected_compiler = first_compiler
+
+    def resolve_compiler(name):
+        if name == "c++":
+            return str(selected_compiler)
+        return None
+
+    def fail_version(*args, **kwargs):
+        raise OSError("compiler probe failed")
+
+    monkeypatch.setattr(cache, "is_hip_runtime", lambda: False)
+    monkeypatch.setattr(cache, "is_musa_runtime", lambda: True)
+    monkeypatch.setattr(cache.toolchain, "device_compiler_path", lambda: "/missing/mcc")
+    monkeypatch.setattr(cache.toolchain, "host_compiler_path", lambda: "c++")
+    monkeypatch.setattr(cache.toolchain, "gpu_arch_name", lambda: "mp_31")
+    monkeypatch.setattr(cache.subprocess, "check_output", fail_version)
+    monkeypatch.setattr(cache.shutil, "which", resolve_compiler)
+    monkeypatch.setattr(cache, "_VERSIONED_PACKAGES", ())
+
+    first_fingerprint = cache._environment_fingerprint.__wrapped__()
+    selected_compiler = second_compiler
+    second_fingerprint = cache._environment_fingerprint.__wrapped__()
+
+    assert first_fingerprint != second_fingerprint
+
+
 def _publish_leaf(scope: pathlib.Path, paths, *, module_name="m") -> pathlib.Path:
     """Create a leaf the way commit_build would: name derived from its own list."""
     entries = _entries(paths)
