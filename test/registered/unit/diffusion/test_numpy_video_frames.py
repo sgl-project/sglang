@@ -7,10 +7,12 @@ from unittest.mock import patch
 import numpy as np
 
 from sglang.multimodal_gen.runtime.entrypoints import utils
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, stage="base")
+# This CPU-only logic imports diffusion modules, whose dependencies are installed
+# in the diffusion unit-test job.
+register_cuda_ci(est_time=5, stage="base-b", runner_config="diffusion-unit-1-gpu-h100")
 
 
 class TestNumpyVideoFrames(CustomTestCase):
