@@ -1,11 +1,5 @@
-"""One Markov draft step: add the step bias to the base logits and pick one token
-per row, the argmax at temperature 0 and a Gumbel-max sample otherwise.
-
-The vocab may be TP-sharded: each rank reduces its shard to one (value,
-global-index-bits) pair per block, and only those pairs are all-gathered. When
-the step logits are kept, they are gathered whole instead and every rank picks
-from the full vocab, so a step takes one collective either way.
-"""
+"""One Markov draft step: add the step bias and pick one token per row, the
+argmax at temperature 0 and a Gumbel-max sample otherwise."""
 
 import functools
 from typing import Callable, Optional
@@ -17,8 +11,7 @@ from triton.language.extra import libdevice
 
 from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda
 
-# Small blocks spread a few rows over many programs; the Philox noise per
-# block is the latency of a decode-sized step.
+# Measured fastest for 1-64 rows, where the per-block Philox work sets latency.
 _BLOCK = 1024
 _NO_INDEX = tl.constexpr(2147483647)
 # 2**-32: maps a 32-bit Philox word to a uniform in (0, 1].
@@ -110,8 +103,6 @@ def _select_block(
     PHILOX_ROUNDS: tl.constexpr,
 ):
     key = value
-    # Without SAMPLE every row is at temperature 0: no per-row temperature read
-    # on the critical path and no noise code.
     if SAMPLE:
         temperature = tl.load(T + row)
     else:
@@ -129,9 +120,7 @@ def _select_block(
             PHILOX_ROUNDS,
         )
         bits = tl.interleave(tl.interleave(w0, w2), tl.interleave(w1, w3))
-        # Small words convert to FP32 exactly, so the small exp_noise that wins
-        # keeps its resolution; value/T - log(exp_noise) is value/T plus Gumbel
-        # noise.
+        # Small words convert to FP32 exactly, so the winning small noise stays precise.
         uniform = (bits.to(tl.float32) + 0.5) * _UNIFORM_SCALE
         exp_noise = -libdevice.log1p(-uniform)
         key = value / temperature - tl.log(exp_noise)
@@ -174,8 +163,7 @@ def _markov_sample_finish_kernel(
 
 
 def _mul32(a: torch.Tensor, b: int) -> tuple[torch.Tensor, torch.Tensor]:
-    # (high, low) 32-bit words of a * b for a < 2**32 held in int64, without
-    # overflowing int64: split b into 16-bit halves.
+    # (high, low) 32-bit words of a * b; b splits in halves so int64 never overflows.
     product_lo = a * (b & 0xFFFF)
     product_hi = a * (b >> 16)
     high = (product_hi + (product_lo >> 16)) >> 16
@@ -212,6 +200,7 @@ def _launch_partial(
 ):
     # Returns the [rows, parts * 2] (value, index bits) candidates of each block.
     rows, padded = base_logits.shape
+    # The padded width fixes the transport shape on every rank; WIDTH masks padding.
     parts = triton.cdiv(padded, _BLOCK)
     assert parts > 0
     partial = torch.empty(
@@ -242,23 +231,14 @@ def _launch_partial(
         _PHILOX_ROUNDS,
         num_warps=4,
     )
-    # The padded shard width fixes the transport shape on all ranks; WIDTH
-    # masks real entries, including a completely empty final shard.
     return partial.view(rows, parts * 2)
 
 
 class MarkovSampleStep:
-    """``base_logits`` is the rank's padded vocab shard, ``bias`` its first
-    ``width`` columns (the rest is padding and never wins). The step logits are
-    their sum rounded to ``step_dtype``, the dtype the head's own add produces.
-    A temperature of 0 takes the argmax. ``gather`` stacks every rank's
-    ``[rows, k]`` candidates as ``[world * rows, k]``; None for an unsharded
-    vocab. ``logits_out``, when given, receives the step logits: of the whole
-    padded base unsharded, else of the first ``logits_out.shape[1]`` columns
-    of ``gather_logits``, which lays every rank's ``[rows, padded]`` shard side
-    by side; the rank then picks from those. ``has_sampled_rows=False`` takes
-    the argmax of every row and reads neither the temperatures nor the offset;
-    None decides per row on the device. Returns global token ids."""
+    """Returns global token ids. ``bias`` covers the first ``width`` columns of
+    the rank's padded shard ``base_logits``. Sharded, ``gather`` exchanges
+    per-block candidates, or ``gather_logits`` the kept ``logits_out`` whole.
+    ``has_sampled_rows=False`` argmaxes every row."""
 
     @classmethod
     def execute(cls, **kwargs) -> torch.Tensor:
@@ -448,7 +428,6 @@ class MarkovSampleStep:
             local = keys.argmax(dim=1)
             local_values = keys.gather(1, local[:, None]).squeeze(1)
             local_indices = (local + vocab_start).to(torch.int32)
-        # The same (value, index bits) transport as the triton path, one part.
         partial = torch.stack(
             [local_values.float(), local_indices.view(torch.float32)], dim=1
         )

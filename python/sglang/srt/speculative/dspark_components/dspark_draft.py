@@ -109,8 +109,7 @@ def resolve_greedy_mask(
     return (sampling_info.top_ks <= 1).view(-1)
 
 
-# XORed into the server seed so the draft noise key differs from the seed other
-# samplers use.
+# XORed into the server seed so the draft noise differs from other samplers'.
 _DRAFT_NOISE_DOMAIN = 0x2D2A9C317E44B1F3
 
 
@@ -119,8 +118,7 @@ def draft_noise_key(random_seed: int) -> int:
 
 
 class DraftNoise(msgspec.Struct, frozen=True):
-    """Philox key of the draft sampling noise, and its counter: one GPU int64
-    that every draft block advances by one."""
+    """Philox key of the draft noise, and a GPU counter each block advances."""
 
     key: int
     offset: torch.Tensor
@@ -138,9 +136,8 @@ def draft_markov_block(
     site: SpecTpSyncSite,
     logits_out: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Draft ``gamma`` tokens per row, each step biased by the token before it;
-    a row at temperature 0 takes the argmax. The step logits land in
-    ``logits_out`` ([bs, gamma, vocab]), allocated here when not given."""
+    """Returns the drafted tokens and the [bs, gamma, vocab] step logits,
+    written to ``logits_out`` or allocated here."""
     bs, gamma = base_logits.shape[:2]
     if logits_out is None:
         logits_out = torch.empty(
