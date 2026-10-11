@@ -13,7 +13,10 @@ from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
 from sglang.srt.environ import envs
 from sglang.srt.layers.linear import ReplicatedLinear
-from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
+from sglang.srt.layers.logits_processor import (
+    bf16_lm_head_matmul,
+    should_apply_lm_head_quant_method,
+)
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dflash import DFlashDraftModel
@@ -45,8 +48,7 @@ def project_through_lm_head(hidden: torch.Tensor, lm_head: nn.Module) -> torch.T
     quant_method = lm_head.quant_method
     if should_apply_lm_head_quant_method(lm_head, quant_method):
         return quant_method.apply(lm_head, hidden, None)
-    weight = lm_head.weight
-    return torch.matmul(hidden.to(weight.dtype), weight.T)
+    return bf16_lm_head_matmul(hidden, lm_head.weight)
 
 
 def run_markov_block(
