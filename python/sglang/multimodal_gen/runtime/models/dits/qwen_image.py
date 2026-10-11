@@ -34,7 +34,6 @@ from sglang.kernels.ops.diffusion import (
     try_fused_scale_residual_norm_scale_shift_fp8,
     try_fused_scale_residual_norm_scale_shift_nvfp4,
 )
-from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models.dits.qwenimage import QwenImageDitConfig
 from sglang.multimodal_gen.configs.models.fsdp import is_transformer_block
 from sglang.multimodal_gen.runtime.distributed import (
@@ -251,32 +250,6 @@ def _defer_modelopt_output_bias(quant_config: Optional[QuantizationConfig]) -> b
     return _can_defer_modelopt_output_bias(
         quant_config, current_platform.get_device_capability()
     )
-
-
-# Replicating the text FFN only pays off when its weights fit comfortably next
-# to the rest of the TP shard (it was tuned on 80 GB H100s). Below this, shard
-# it: on 24/32 GB cards the extra ~4.2 GiB/rank decides whether the DiT fits.
-_TXT_MLP_REPLICATION_MIN_DEVICE_BYTES = 48 * 1024**3
-
-
-@functools.lru_cache(maxsize=None)
-def _replicate_txt_mlp(tp_size: int) -> bool:
-    """Whether to keep the text-stream FFN replicated on every TP rank."""
-    if tp_size <= 1:
-        return True
-    override = envs.SGLANG_QWEN_IMAGE_REPLICATE_TXT_MLP.lower()
-    if override in ("1", "true", "yes", "on"):
-        return True
-    if override in ("0", "false", "no", "off"):
-        return False
-    if tp_size > 2:
-        return False
-    try:
-        device_index = torch.cuda.current_device() if torch.cuda.is_available() else 0
-        total = current_platform.get_device_total_memory(device_index)
-    except NotImplementedError:  # unknown platform: keep the tuned default
-        return True
-    return total >= _TXT_MLP_REPLICATION_MIN_DEVICE_BYTES
 
 
 def _gather_modulation_shards(
@@ -1523,14 +1496,6 @@ class QwenImageTransformerBlock(nn.Module):
                 dim_out=dim,
                 quant_config=quant_config,
                 prefix=f"{prefix}.txt_mlp",
-                # The text branch is ~1K tokens regardless of image size, so
-                # sharding its FFN saves less GEMM time than the per-block
-                # all-reduce it adds. Measured e2e crossover (H100, 1024x1024):
-                # tp=2 replication wins (5.58s -> 5.12s, -8%) but at tp=4 the
-                # duplicated GEMM outgrows the all-reduce saved (~1% loss), so
-                # gate on the TP degree. Replication also costs ~4.2 GiB/rank,
-                # so small-memory devices shard it (see _replicate_txt_mlp).
-                replicated=_replicate_txt_mlp(tp_size),
             )
 
         if nunchaku_enabled:

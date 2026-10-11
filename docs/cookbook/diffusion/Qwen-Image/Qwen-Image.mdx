@@ -100,9 +100,9 @@ also tested on this profile and did not improve steady-state latency.
 
 ### 3.3 Two 32 GB GPUs (RTX 5090)
 
-With `--tp-size 2`, the adaLN modulation projections and, on devices with
-less than 48 GiB, the text-stream FFN are sharded, so each rank holds about
-19 GiB of DiT weights and the DiT stays resident on 32 GB cards:
+With `--tp-size 2`, the adaLN modulation projections and the text-stream FFN
+are sharded, so each rank holds about 19 GiB of DiT weights and the DiT stays
+resident on 32 GB cards:
 
 ```bash Command
 sglang serve \
@@ -117,8 +117,7 @@ sglang serve \
 
 On 2x RTX 5090 (PCIe, no P2P) this measured 19.7 s at 1024x1024 with 50 steps
 and no CFG. Add `--dit-cpu-offload true` to cut peak memory to about 22 GB per
-GPU at 21.2 s. Set `SGLANG_QWEN_IMAGE_REPLICATE_TXT_MLP=1` or `0` to force the
-text FFN layout.
+GPU at 21.2 s.
 
 ### 3.4 Configuration Tips
 
