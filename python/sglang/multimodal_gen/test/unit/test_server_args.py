@@ -97,6 +97,7 @@ from sglang.multimodal_gen.runtime.server_args import (
     MAX_SCHEDULER_RPC_TIMEOUT_S,
     ServerArgs,
 )
+from sglang.multimodal_gen.runtime.server_args import server_args as server_args_module
 from sglang.multimodal_gen.runtime.utils.argparse import FlexibleArgumentParser
 
 
@@ -269,6 +270,21 @@ class TestServerArgsPathExpansion(_CudaPlatformTestCase):
             {"model_path": "/data/my-model"}
         )
         self.assertEqual(args.model_path, "/data/my-model")
+
+    def test_numa_node_cli_takes_one_node_per_gpu(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        argv = ["--model-path", "/fake", "--numa-node", "0", "1"]
+        with (
+            patch.object(sys, "argv", ["sglang"] + argv),
+            patch.object(
+                PipelineConfig, "from_kwargs", return_value=QwenImagePipelineConfig()
+            ),
+            _mock_cuda_platform(),
+        ):
+            args, unknown_args = parser.parse_known_args(argv)
+            server_args = ServerArgs.from_cli_args(args, unknown_args)
+        self.assertEqual(server_args.numa_node, [0, 1])
 
     def test_component_paths_are_expanded_before_pipeline_resolution(self):
         args = self._from_dict_without_model_resolution(
@@ -1112,7 +1128,7 @@ class TestWarmupModeNormalization(unittest.TestCase):
                 self.assertEqual(sa.warmup_resolutions, ["1024x1024"])
                 self.assertEqual(sa.warmup_mode, "server")
 
-    def test_flux_bcg_requires_both_supported_checkpoint_and_pipeline(self):
+    def test_bcg_warns_but_stays_enabled_off_the_validated_lists(self):
         for model_path, config in (
             ("black-forest-labs/FLUX.2-dev", Flux2PipelineConfig()),
             ("black-forest-labs/FLUX.1-schnell", FluxPipelineConfig()),
@@ -1121,10 +1137,26 @@ class TestWarmupModeNormalization(unittest.TestCase):
             with self.subTest(model_path=model_path, config=type(config).__name__):
                 sa = ServerArgs.__new__(ServerArgs)
                 sa.model_path = model_path
+                sa.model_id = None
                 sa.pipeline_config = config
                 sa.enable_breakable_cuda_graph = True
-                sa._adjust_breakable_cuda_graph_support()
-                self.assertFalse(sa.enable_breakable_cuda_graph)
+                sa.warmup_resolutions = ["1024x1024"]
+                with patch.object(server_args_module.logger, "warning") as warning:
+                    sa._adjust_breakable_cuda_graph_support()
+                self.assertTrue(sa.enable_breakable_cuda_graph)
+                self.assertIn("not validated", warning.call_args[0][0])
+
+    def test_bcg_does_not_warn_for_a_validated_model(self):
+        sa = ServerArgs.__new__(ServerArgs)
+        sa.model_path = "black-forest-labs/FLUX.1-dev"
+        sa.model_id = None
+        sa.pipeline_config = FluxPipelineConfig()
+        sa.enable_breakable_cuda_graph = True
+        sa.warmup_resolutions = ["1024x1024"]
+        with patch.object(server_args_module.logger, "warning") as warning:
+            sa._adjust_breakable_cuda_graph_support()
+        self.assertTrue(sa.enable_breakable_cuda_graph)
+        warning.assert_not_called()
 
     def test_disagg_role_disables_server_warmup(self):
         from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
@@ -1546,6 +1578,17 @@ class TestOffloadDefaults(_CudaPlatformTestCase):
         self.assertEqual(args.residency_mode("text_encoder"), COMPONENT_OFFLOAD)
         self.assertTrue(args.dit_cpu_offload)
         self.assertTrue(args.text_encoder_cpu_offload)
+
+    def test_numa_node_must_cover_every_local_gpu(self):
+        with self.assertRaisesRegex(ValueError, "--numa-node needs one node per"):
+            self._from_dict_with_pipeline_config(
+                QwenImagePipelineConfig(),
+                kwargs={
+                    "model_path": "Qwen/Qwen-Image",
+                    "num_gpus": 2,
+                    "numa_node": [0],
+                },
+            )
 
     def test_explicit_false_layerwise_keeps_dit_resident(self):
         args = self._from_dict_with_pipeline_config(
