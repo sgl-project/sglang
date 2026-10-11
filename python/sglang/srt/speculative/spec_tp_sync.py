@@ -19,12 +19,14 @@ class SpecTpSyncSite(IntEnum):
 
     # -- DSpark --
     DSPARK_MEM = 1  # gates the draft graph capture
-    DSPARK_DRAFT = 2  # each draft step's tokens, in the graph tail or eager
     DSPARK_PLAN = 7
     DSPARK_ACCEPT_GREEDY = 8
     DSPARK_ACCEPT_SAMPLE = 9
     DSPARK_ACCEPT_GRAPH = 10
     DSPARK_TARGET = 11
+    # Each draft step's tokens, in the graph tail or eager; a fresh number so
+    # the retired per-path numbers 2-6 cannot silently mean it.
+    DSPARK_DRAFT = 17
 
     # -- DFlash --
     DFLASH_MEM = 12
@@ -71,6 +73,7 @@ _RETIRED = {
         "dspark-draft-multinomial",
         "dspark-graph-sample",
         "dspark-graph-greedy",
+        "2",
         "3",
         "4",
         "5",
