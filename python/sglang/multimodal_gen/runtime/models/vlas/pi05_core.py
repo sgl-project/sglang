@@ -117,7 +117,6 @@ class PiGemmaRMSNorm(nn.Module):
         super().__init__()
         self.eps = eps
         self.dim = dim
-        self.cond_dim = cond_dim
         if cond_dim is None:
             self.weight = nn.Parameter(torch.zeros(dim))
             self.dense = None
@@ -1211,21 +1210,6 @@ class Pi05CoreModel(nn.Module):
             torch.empty(0, dtype=torch.float64),
             persistent=False,
         )
-
-    def retain_runtime_components(
-        self,
-        role: Literal["all", "prefix", "action", "idle"],
-    ) -> None:
-        if role == "all":
-            return
-        if role in ("prefix", "idle"):
-            self.paligemma_with_expert.gemma_expert = None
-            self.action_in_proj = None
-            self.action_out_proj = None
-            self.time_mlp_in = None
-            self.time_mlp_out = None
-        if role in ("action", "idle"):
-            self.paligemma_with_expert.paligemma = None
 
     def prepare_attention_masks_4d(
         self,
