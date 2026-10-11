@@ -325,6 +325,17 @@ def _prepare_hc_weights_after_loading(model: nn.Module) -> None:
         prepare = getattr(module, "prepare_sum_state_weights", None)
         if prepare is not None:
             prepare(force=True)
+    _validate_hc_weights_after_loading(model)
+
+
+def _validate_hc_weights_after_loading(model: nn.Module) -> None:
+    for name, module in model.named_modules():
+        validate = getattr(module, "validate_sum_state_weights", None)
+        if validate is not None:
+            try:
+                validate()
+            except ValueError as exc:
+                raise ValueError(f"{name or '<root>'}: {exc}") from exc
 
 
 def _modules_with_quant_method(model: nn.Module):
@@ -1033,6 +1044,7 @@ class DefaultModelLoader(BaseModelLoader):
     @staticmethod
     def load_weights_and_postprocess(model, weights, target_device):
         DefaultModelLoader.load_weights_only(model, weights, target_device)
+        _validate_hc_weights_after_loading(model)
         DefaultModelLoader.postprocess_weights(model, target_device)
 
     @staticmethod

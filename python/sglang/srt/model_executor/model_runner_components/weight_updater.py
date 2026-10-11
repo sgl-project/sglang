@@ -10,6 +10,7 @@ import torch
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.model_loader.loader import (
     DefaultModelLoader,
+    _validate_hc_weights_after_loading,
     get_model_loader,
     post_load_weights,
 )
@@ -312,9 +313,13 @@ class WeightUpdater:
             self.get_model(), torch.device(self.device)
         )
 
+    def validate_weight_update(self: WeightUpdater) -> None:
+        _validate_hc_weights_after_loading(self.get_model())
+
     def end_weight_update(self: WeightUpdater, *, run_post_load: bool) -> None:
         if run_post_load:
             post_load_weights(self.get_model())
+        self.validate_weight_update()
         DefaultModelLoader.postprocess_weights(
             self.get_model(), torch.device(self.device)
         )
@@ -451,7 +456,7 @@ def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tenso
         # rank-local direct tensor. Other parameters keep the original copy.
         loader = getattr(param, "hc_weight_loader", default_weight_loader)
         loader(param, tensor)
-    # Refresh only after the whole transaction (including both Down/Inject).
+    # Refresh complete pairs; incomplete pairs stay dirty until a later bucket.
     # Captured graphs must follow the normal recapture lifecycle after reload.
     _model_refresh_hc_weights(model)
 
