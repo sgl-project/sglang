@@ -133,14 +133,19 @@ class MonoDecode:
         self.k1_scratch = {
             s: buf(
                 max(
-                    gdn.scratch_bytes(gdn.K1Build(tokens=s, first=f))
+                    gdn.scratch_bytes(
+                        gdn.K1Build(tokens=s, first=f, **gdn.tuned(s, False))
+                    )
                     for f in (False, True)
                 )
             )
             for s in widths
         }
         self.k2_scratch = {
-            s: buf(layer.scratch_bytes(layer.K2Build(tokens=s))) for s in widths
+            s: buf(
+                layer.scratch_bytes(layer.K2Build(tokens=s, **layer.tuned(s, False)))
+            )
+            for s in widths
         }
         self.epoch = torch.zeros(1, dtype=torch.int32, device=dev)
         tp = get_tp_group()
@@ -304,6 +309,7 @@ class MonoDecode:
                 eps=layer.input_layernorm.variance_epsilon,
                 norm_eps=a.norm.eps,
                 state_bf16=st.temporal.dtype == torch.bfloat16,
+                **gdn.tuned(h.size(0), False),
             ),
             hidden=h,
             residual=residual,
@@ -336,7 +342,11 @@ class MonoDecode:
         out = torch.empty_like(residual)
         res_out = torch.empty_like(residual)
         k2.layer_post(
-            k2.K2Build(tokens=s, eps=layer.post_attention_layernorm.variance_epsilon),
+            k2.K2Build(
+                tokens=s,
+                eps=layer.post_attention_layernorm.variance_epsilon,
+                **k2.tuned(s, False),
+            ),
             core=core,
             residual=residual,
             w_o=w_o,
