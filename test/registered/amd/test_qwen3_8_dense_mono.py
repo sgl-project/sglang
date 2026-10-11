@@ -9,9 +9,12 @@ from its half of gate_up's rows and down's K columns.
 
 ``RowCapsTest``: K1's and K2's row caps by TP and their env overrides.
 
-``StockAccumulationTest``: the property K2's K partition relies on (see
-``dense_ffn``): the stock MXFP4 GEMM's output is bf16(fp32(exact sum)) at K2's
-K sizes, so any K partition with exact fp32 partials gives the stock bits.
+``StockAccumulationTest``: on typical inputs at K2's K sizes the stock MXFP4
+GEMM's output is bf16(fp32(exact sum)), so a mismatch there is a K2 bug rather
+than a rounding corner. ``StockSplitTest``: the split counts K2 follows are the
+stock GEMM's at every width. ``StockChainTest``: K2 is exact by construction, on
+rows whose exact sums need more than 24 bits, where the same GEMMs summed in K
+quarters differ from stock.
 
 ``DenseGdnTest`` (K1, ``dense_gdn``): the residual add + input_layernorm ->
 in_proj_qkvz / in_proj_ba -> conv1d -> the gated delta rule -> the gated norm,
@@ -25,8 +28,7 @@ out_proj folded in (its partial, from the rank's K columns) and without.
 
 Widths 1..8 at TP1 and 1..16 at TP2, each with its own weights and Mailbox
 layer tag, over many input draws: a norm reduced in another order than the stock
-kernel's still matches on most rows, and shows on about one row in 640. Above 12
-rows K2's down reduce has more units than threads; widths 13..16 cover that.
+kernel's still matches on most rows, and shows on about one row in 640.
 Run directly with ``python test/registered/amd/test_qwen3_8_dense_mono.py``.
 """
 
@@ -265,6 +267,177 @@ class StockAccumulationTest(CustomTestCase):
                 bad += (_linear(x, w, ws) != exact.float().to(BF)).sum().item()
             with self.subTest(k=k):
                 self.assertEqual(bad, 0)
+
+
+def _linear_parts(x, w, ws, splits=None, block_k=128):
+    """The stock GEMM's fp32 split partials [n, M, N] (``splits``: forced to
+    that many equal K splits), or its bf16 output [M, N] for one split."""
+    from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4
+
+    from sglang.srt.layers.quantization.quark.schemes import quark_w4a4_mxfp4 as q
+
+    xq, xs = q.dynamic_mxfp4_quant(x)
+    cfg = None
+    if splits is not None:
+        cfg = dict(
+            BLOCK_SIZE_M=16,
+            BLOCK_SIZE_N=64,
+            BLOCK_SIZE_K=block_k,
+            GROUP_SIZE_M=1,
+            num_warps=4,
+            num_stages=2,
+            waves_per_eu=2,
+            matrix_instr_nonkdim=16,
+            cache_modifier=None,
+            NUM_KSPLIT=splits,
+        )
+    return gemm_afp4wfp4(xq, w, xs, ws, BF, config=cfg, skip_reduce=True)
+
+
+def _linear_quartered(x, w, ws):
+    """The GEMM as four K quarters, each chained from zero, summed in order."""
+    p = _linear_parts(x, w, ws, splits=4)
+    assert p.dim() == 3 and p.size(0) == 4
+    return (((p[0] + p[1]) + p[2]) + p[3]).to(BF)
+
+
+@unittest.skipUnless(_gfx950(), "needs aiter on gfx950")
+class StockSplitTest(CustomTestCase):
+    def test_k2_follows_stock_splits(self):
+        """K2's split counts are the stock GEMM's at every width (from the
+        partials its config yields)."""
+        from sglang.kernels.ops.moe.qwen3_5_mono_flydsl import dense_ffn as D
+
+        g = torch.Generator(device="cuda").manual_seed(3)
+        for tp in D.TP_SIZES:
+            inter = D.FGeo(tp).inter
+            shapes = [("gate_up", 2 * inter, D.HIDDEN, D.gu_splits)]
+            shapes.append(("down", D.HIDDEN, inter, lambda s: D.d_splits(s, tp)))
+            if tp == 1:
+                shapes.append(("o_proj", D.HIDDEN, D.CORE, lambda s: D.O_SPLITS))
+            for name, n, k, want in shapes:
+                w, ws = _mxfp4(g, n, k)
+                for s in _widths(tp):
+                    p = _linear_parts(_rnd(g, s, k), w, ws)
+                    got = p.size(0) if p.dim() == 3 else 1
+                    with self.subTest(tp=tp, gemm=name, s=s):
+                        self.assertEqual(got, want(s))
+
+
+def _cancel_blocks(w, ws, rows, blocks, g):
+    """Rows ``rows`` of an MXFP4 [n, k] zeroed but for ``blocks``: (block, kind),
+    kind "big" (random fp4, scale 2^30), "neg" (the previous big block negated)
+    or "small" (random, scale 2^0)."""
+    k_blocks = ws.size(1)
+    for r in rows:
+        w[r] = 0
+        ws[r] = 127
+        prev = None
+        for b, kind in blocks:
+            assert 0 <= b < k_blocks
+            cols = slice(16 * b, 16 * b + 16)
+            if kind == "neg":
+                w[r, cols] = w[r, 16 * prev : 16 * prev + 16] ^ 0x88
+                ws[r, b] = ws[r, prev]
+                continue
+            w[r, cols] = torch.randint(
+                0, 256, (16,), dtype=torch.uint8, device="cuda", generator=g
+            )
+            ws[r, b] = 157 if kind == "big" else 127
+            prev = b
+
+
+def _copy_block(t, dst, src):
+    """Columns 32 dst .. of ``t`` (bf16 [.., k]) := columns 32 src .."""
+    t[..., 32 * dst : 32 * dst + 32] = t[..., 32 * src : 32 * src + 32]
+
+
+@unittest.skipUnless(_gfx950(), "needs FlyDSL and aiter on gfx950")
+class StockChainTest(CustomTestCase):
+    """K2 reproduces the stock GEMMs' arithmetic, not only their exact sums: on
+    rows whose exact sums span more than 24 bits (a 2^30-scaled block and its
+    negation, small blocks next to them), stock differs from the same GEMMs
+    summed in K quarters, and K2 still matches stock. Gate rows (seen through
+    down rows reading only their columns) and down rows each get a pair across
+    a quarter boundary inside a split (P1) and across the split boundary (P2)."""
+
+    def _weights(self, g, hidden, inter):
+        w13, w13s = _mxfp4(g, 2 * inter, hidden)
+        w2, w2s = _mxfp4(g, hidden, inter)
+        for w, ws, rows, k in ((w13, w13s, (0, 4), hidden), (w2, w2s, (0, 4), inter)):
+            nb = k // 32
+            qb, sb = nb // 4, nb // 2
+            p1 = [(qb - 1, "big"), (qb, "neg"), (qb + 1, "small")]
+            p2 = [(1, "small"), (sb - 1, "big"), (sb, "neg"), (nb - 1, "small")]
+            _cancel_blocks(w, ws, range(rows[0], rows[0] + 4), p1, g)
+            _cancel_blocks(w, ws, range(rows[1], rows[1] + 4), p2, g)
+        # down's big blocks read equal H blocks: gate / up rows copied
+        nb = inter // 32
+        for dst, src in ((nb // 4, nb // 4 - 1), (nb // 2, nb // 2 - 1)):
+            for base in (0, inter):
+                w13[base + 32 * dst : base + 32 * dst + 32] = w13[
+                    base + 32 * src : base + 32 * src + 32
+                ]
+                w13s[base + 32 * dst : base + 32 * dst + 32] = w13s[
+                    base + 32 * src : base + 32 * src + 32
+                ]
+        # down rows 8 .. 11 read the crafted gate rows' columns (H block 0) only
+        w2[8:12, 16:] = 0
+        return w13, w13s, w2, w2s
+
+    def test_stock_chains(self):
+        from sglang.kernels.ops.moe.qwen3_5_mono_flydsl import dense_ffn as D
+        from sglang.srt.layers.activation import SiluAndMul
+
+        act = SiluAndMul()
+        for tp in D.TP_SIZES:
+            inter = D.FGeo(tp).inter
+            g = torch.Generator(device="cuda").manual_seed(40 + tp)
+            w13, w13s, w2, w2s = self._weights(g, D.HIDDEN, inter)
+            w13_sh, w2_sh = D.shuffle_w(w13), D.shuffle_w(w2)
+            nb = D.HIDDEN // 32
+            for s in _widths(tp):
+                h = _rnd(g, s, D.HIDDEN, scale=0.5)
+                r = _rnd(g, s, D.HIDDEN, scale=2.0)
+                ln_w = _rnd(g, D.HIDDEN, scale=0.1)
+                # the gate rows' big blocks read equal x blocks
+                for t in (h, r, ln_w):
+                    _copy_block(t, nb // 4, nb // 4 - 1)
+                    _copy_block(t, nb // 2, nb // 2 - 1)
+                x, res_ref = _gemma_norm(h, r, ln_w)
+                ref = _linear(act(_linear(x, w13, w13s)), w2, w2s)
+                quart = _linear_quartered(act(_linear_quartered(x, w13, w13s)), w2, w2s)
+                epoch = torch.ones(1, dtype=torch.int32, device="cuda")
+                out = torch.empty(s, D.HIDDEN, dtype=BF, device="cuda")
+                if tp == 1:
+                    key = D.FfnBuild(tokens=s, eps=EPS, shuffled=True)
+                    args = dict(hidden=h, residual=r, ln_w=ln_w)
+                    res_out = torch.empty_like(out)
+                else:
+                    key = D.FfnBuild(tokens=s, shuffled=True, tp=2, normed=True)
+                    args = dict(hidden=x, residual=None, ln_w=None)
+                    res_out = None
+                scratch = torch.zeros(
+                    D.scratch_bytes(key), dtype=torch.uint8, device="cuda"
+                )
+                D.dense_ffn(
+                    key,
+                    **args,
+                    w13=w13_sh,
+                    w13s=w13s,
+                    w2=w2_sh,
+                    w2s=w2s,
+                    out=out,
+                    res_out=res_out,
+                    scratch=scratch,
+                    epoch=epoch,
+                    layer=0,
+                )
+                with self.subTest(tp=tp, s=s):
+                    self.assertFalse(torch.equal(quart, ref))
+                    self.assertTrue(torch.equal(out, ref))
+                    if tp == 1:
+                        self.assertTrue(torch.equal(res_out, res_ref))
 
 
 def _gdn_weights(g, K):

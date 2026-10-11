@@ -8,21 +8,29 @@ persistent launch, ``BLOCKS`` x ``THREADS``, S <= 8 decode rows (TP1 below):
              qdq (1 x 32 blocks, Quark "even" scales, as aiter's Triton
              ``dynamic_mxfp4_quant``) -> LDS
     gate_up  (1088 groups of 16 intermediate columns: CTA b groups 4 b .. 4 b + 3
-             whole (wave w: gate / up by w % 2, K quarter w / 2), and K quarter
-             b % 4 of group 1024 + b / 4, first, its fp32 partial put to the
-             quarter-0 CTA): MXFP4 weights (fp4 -> bf16 by their e8m0 scales)
-             against the x rows -> bf16 g, u (the stock GEMM's output) ->
-             bf16(bf16(silu(g)) u) -> H; one ready flag a CTA
-    down     (CTA b: K quarter b / 64 of the intermediate, 5 of the 320 hidden
-             row groups, a wave a contiguous run of K steps): that quarter of H
-             through MXFP4 qdq -> LDS; the weights against it -> fp32 partials;
-             quarters 1..3 put theirs, quarter 0's CTA adds them in quarter order
-             -> bf16 ``out``
+             whole, then 4 columns of group 1024 + b / 4; wave w: gate / up by
+             w % 2, K quarter w / 2): MXFP4 weights against the x rows in the
+             stock GEMM's K chains (below) -> bf16 g, u -> bf16(bf16(silu(g)) u);
+             each pair of whole groups (a 32-column block) through MXFP4 qdq ->
+             HQ, the 4 columns bf16 -> H; one ready flag a CTA
+    down     (CTA b: hidden row group b whole, then 4 rows of group 256 + b / 4;
+             wave w: the group by w % 2, K quarter w / 2): HQ, and H's other
+             columns through MXFP4 qdq, -> LDS; the weights against them in the
+             stock GEMM's K chains -> bf16 ``out``
 
 At TP2 (``FfnBuild.tp``, ``normed``) a rank runs its half of the intermediate
 (``FGeo``) from the stock post_attention_layernorm's output, qdq'd per CTA, and
-writes down's partial before the all-reduce: 544 groups, 2 whole a CTA and K
-quarters of 32 split groups on CTAs 0 .. 127; down's quarters are 17 steps.
+writes down's partial before the all-reduce: 544 groups, 2 whole a CTA and 2
+columns of the 32 others.
+
+Every GEMM is bit-exact with the stock ``gemm_afp4wfp4`` by construction: each
+output takes the stock kernel's K splits (``gu_splits``, ``d_splits``,
+``O_SPLITS``), each a chain of scaled MFMAs over the 128-K steps in K order from
+a zero accumulator (a wave's quarter continues the previous quarter's
+accumulator), then the split partials added as the stock split-K reduce
+(``split_total``) and one bf16 rounding. The MFMA shape (16x16x128 here,
+32x32x64 in stock up to 8 rows) does not change the bits; any other K grouping
+does, on rows whose exact sums span more than 24 bits.
 
 Weights are the checkpoint's as SGLang keeps them for ``gemm_afp4wfp4``: fp4x2
 [N, K / 2] row-major (low nibble the even column), e8m0 scales [N, K / 32].
@@ -51,7 +59,6 @@ from sglang.kernels.ops.moe.k3_mono_flydsl.common.ops import (
     bf_lo,
     butterfly,
     memrealtime,
-    row_sum,
     rsrc,
     traced,
     xred,
@@ -80,35 +87,54 @@ MAX_TOKENS = 8
 # TP2 takes up to 16 rows: a token is lane % 16 of the MFMA tile (one N-tile).
 MAX_TOKENS_TP2 = 16
 
-# K partition: gate_up and down sum K in quarters, wave runs and fp32 adds, not
-# in the stock GEMM's split-K (gate_up 2 splits; down 2 at TP1, 1 at TP2).
-# The bits still match: an fp4 x fp4 product scaled by e8m0 codes is exact in
-# fp32, and the stock output is bf16(fp32(exact sum)) on real weights, so any
-# partition whose fp32 partials are exact gives the same bf16. That fails only
-# when a row's exact sum spans more than 24 bits (products whose block scales
-# differ by more than about 2^14), where the partitions round differently;
-# hence the load-time self-check and StockAccumulationTest. The out_proj fold
-# in dense_gdn (core rows, wider ranges) keeps stock's splits instead.
+# A tile's K chain is cut into quarters, wave 2 q + (gate / up or tile) the q-th.
+QUARTERS = 4
 
 # gate_up
 GU_STEPS = HIDDEN // STEP  # 40
-GU_Q = GU_STEPS // 4  # 10: a wave's K quarter
-QT_UNITS = 3  # a wave's steps of a quarter task (10 = 3 + 3 + 2 + 2)
+GU_Q = GU_STEPS // QUARTERS  # 10: a wave's K quarter
 W13_DW = HIDDEN // 8  # dwords a w13 row
 W13S_DW = HIDDEN // 32 // 4  # scale dwords a w13 row
 XQROW = HIDDEN // 8 + 4  # i32 (8 fp4 each) an LDS x row (padded)
 XSROW = HIDDEN // 32  # e8m0 codes (an i32 each) a row
 
-# down
-DQ = 4  # K quarters of the intermediate (and of gate_up's split groups)
-DCTA = BLOCKS // DQ  # 64 CTAs a quarter
-D_RG = HIDDEN // ROWS // DCTA  # 5 row groups a CTA
+# down: a CTA's whole row group of 16 hidden rows, then 4 rows of a split one
+D_FULL = BLOCKS
+D_SL = HIDDEN // ROWS - D_FULL  # 64 split row groups
+D_SL_ROWS = ROWS * D_SL // BLOCKS  # 4
+
+# The stock GEMMs' K splits (aiter gemm_afp4wfp4's configs, after get_splitk):
+# o_proj (K 6144) 4 up to 8 rows; see gu_splits, d_splits.
+O_SPLITS = 4
+
+
+def gu_splits(s: int) -> int:
+    """Stock gate_up's K splits (K 5120): 2 up to 8 rows, 1 above."""
+    return 2 if s <= MAX_TOKENS else 1
+
+
+def d_splits(s: int, tp: int) -> int:
+    """Stock down's K splits: 2 at TP1 (K 17408) up to 8 rows, else 1 (TP2's K
+    8704 at any width)."""
+    return 2 if tp == 1 and s <= MAX_TOKENS else 1
+
+
+def split_total(vals):
+    """fp32 split partials added as the stock split-K reduce: ``tl.sum`` over
+    the split axis padded with zeros to a power of 2 (adjacent pairs, then
+    pairs of pairs); one split is the chain itself."""
+    v = list(vals)
+    while len(v) & (len(v) - 1):
+        v.append(fx.Float32(0.0))
+    while len(v) > 1:
+        v = [v[2 * i] + v[2 * i + 1] for i in range(len(v) // 2)]
+    return v[0]
 
 
 class FGeo(NamedTuple):
     """A TP rank's share of the FFN: half the intermediate at TP2 (gate_up's N,
-    down's K). TP1: 1088 groups (4 whole a CTA, 64 split), down quarters of 34
-    steps; TP2: 544 (2 whole, 32 split), quarters of 17 steps."""
+    down's K). TP1: 1088 groups (4 whole a CTA, 4 columns of the 64 others),
+    down's K 136 steps; TP2: 544 (2 whole, 2 columns of 32), 68 steps."""
 
     tp: int
 
@@ -125,24 +151,24 @@ class FGeo(NamedTuple):
         return self.ng // BLOCKS
 
     @property
-    def g_split(self) -> int:  # groups split in K quarters over 4 CTAs each
-        return self.ng % BLOCKS
+    def sl_cols(self) -> int:  # a CTA's columns of the split groups
+        return self.ng % BLOCKS * ROWS // BLOCKS
 
     @property
-    def qt_ctas(self) -> int:  # CTAs with a quarter task
-        return self.g_split * DQ
+    def blocks(self) -> int:  # qdq blocks of 32 columns a token
+        return self.inter // 32
 
     @property
-    def dk(self) -> int:
-        return self.inter // DQ
+    def bulk_blocks(self) -> int:  # the whole groups' blocks (HQ)
+        return self.g_full * BLOCKS * ROWS // 32
 
     @property
     def d_steps(self) -> int:
-        return self.dk // STEP
+        return self.inter // STEP
 
     @property
-    def d_units(self) -> int:  # a wave's steps of a row group, at most
-        return -(-self.d_steps // WAVES)
+    def d_q(self) -> int:  # a wave's K quarter of down
+        return self.d_steps // QUARTERS
 
     @property
     def w2_dw(self) -> int:
@@ -153,16 +179,12 @@ class FGeo(NamedTuple):
         return self.inter // 32 // 4
 
     @property
-    def h_blocks(self) -> int:  # qdq blocks a token's quarter
-        return self.dk // 32
-
-    @property
     def hqrow(self) -> int:
-        return self.dk // 8 + 4
+        return self.inter // 8 + 4
 
     @property
     def hsrow(self) -> int:
-        return self.dk // 32
+        return self.inter // 32
 
 
 TP_SIZES = (1, 2)
@@ -189,10 +211,11 @@ NORM_WARPS = 16
 WAVE_ORDER = (8, 4, 2, 1, 16, 32)
 MAX_ROUNDS = (MAX_TOKENS * CHUNKS + THREADS - 1) // THREADS  # 10
 
-assert CHUNKS % 64 == 0 and D_RG * DCTA * ROWS == HIDDEN
+assert CHUNKS % 64 == 0 and D_SL * ROWS % BLOCKS == 0 and D_SL_ROWS % 2 == 0
 for _g in map(FGeo, TP_SIZES):
-    assert _g.qt_ctas <= BLOCKS and _g.d_steps * STEP == _g.dk
-assert FGeo(1).qt_ctas == BLOCKS and FGeo(1).d_units == 5
+    # pairs of whole groups make the qdq blocks; columns go out in pairs
+    assert _g.g_full % 2 == 0 and _g.sl_cols % 2 == 0
+    assert ROWS % _g.sl_cols == 0 and _g.d_steps % QUARTERS == 0
 
 _STREAM = fx.Stream(None)
 STAMPS = 8  # debug stamps a CTA
@@ -265,15 +288,17 @@ def scratch_layout(key: FfnBuild) -> dict:
     lay = pair_layout(
         (
             ("hrdy", BLOCKS),
-            ("gpart", geo.g_split * (DQ - 1) * s * 2 * ROWS),
-            ("dpart", (DQ - 1) * s * HIDDEN),
             ("nsum", CHUNKS * s),
             ("xmb", s * O_CTAS * X_PAIRS),
         )
     )
     end = max(o + n for o, n in lay.values())
+    # H: bf16 [S, inter] (the split groups' columns); HQ: its whole groups'
+    # blocks as fp4 words [S, blocks, 4] and e8m0 codes [S, blocks], an i32 each
     lay["h"] = ((end + 255) // 256 * 256, s * geo.inter * 2)
-    lay["stamps"] = (lay["h"][0] + lay["h"][1], BLOCKS * STAMPS * 8)
+    lay["hq"] = (lay["h"][0] + lay["h"][1], s * geo.inter // 2)
+    lay["hqs"] = (lay["hq"][0] + lay["hq"][1], s * geo.blocks * 4)
+    lay["stamps"] = (lay["hqs"][0] + lay["hqs"][1], BLOCKS * STAMPS * 8)
     return lay
 
 
@@ -578,9 +603,9 @@ def o_stage(c, ops, width=CORE, splits=4):
 
 @traced
 def o_finish(c, rraw):
-    """Norm thread (t, j): the o_proj rows summed over the K quarters in order
-    -> bf16 (the stock GEMM's output) + residual = z -> res_out; the chunk's sum
-    of squares -> NSUM. Returns z, 1 + w."""
+    """Norm thread (t, j): the o_proj rows' K splits added as stock's reduce ->
+    bf16 (the stock GEMM's output) + residual = z -> res_out; the chunk's sum of
+    squares -> NSUM. Returns z, 1 + w."""
     s, tid, bid = c["S"], c["tid"], c["bid"]
     t, j = o_lane(c)
     rw, wv = rraw
@@ -589,7 +614,13 @@ def o_finish(c, rraw):
         res += [bf_lo(rw[d]), bf_hi(rw[d])]
         lnw += [fx.Float32(1.0) + bf_lo(wv[d]), fx.Float32(1.0) + bf_hi(wv[d])]
     z = [
-        bf16_round(row_sum_waves(c["red"], 8 * (j % 2) + e, t, j // 2)) + res[e]
+        bf16_round(
+            split_total(
+                red_at(c["red"], 2 * k + j // 2, 8 * (j % 2) + e, t)
+                for k in range(O_SPLITS)
+            )
+        )
+        + res[e]
         for e in range(8)
     ]
     live = (tid < s * 4) & (bid < O_CTAS)
@@ -665,6 +696,39 @@ def o_gather(c):
     gpu.barrier()
 
 
+# ---------------------------------------------------------------- chains
+def red_at(red, w, r, t):
+    """Row r, token t of wave w's 16x16 MFMA accumulator (at ``red`` + (w * 64 +
+    lane) * 4)."""
+    return fx.ptr_load(red + ((w * 64 + 16 * (r // 4) + t) * 4 + r % 4))
+
+
+@traced
+def chained(c, buf, q, per, run):
+    """The tiles' K chains, a quarter a wave (wave 2 q + its tile, quarter q
+    traced): quarter q is position q % ``per`` of its split's chain. Phase p:
+    the waves at position p continue the accumulator of wave - 2 (zero at a
+    split's start) in ``buf`` (wave w's at (w * 64 + lane) * 4) by ``run`` and
+    store theirs there."""
+    lane, wave = c["lane"], c["wave"]
+    vec4 = fx.Vector.make_type(4, fx.Float32)
+    for p in range_constexpr(per):
+        if q % per == p:
+            if const_expr(p == 0):
+                acc = fx.Vector.filled(4, 0.0, fx.Float32)
+            else:
+                acc = fx.Vector(
+                    fx.ptr_load(buf + ((wave - 2) * 64 + lane) * 4, result_type=vec4)
+                )
+            fx.ptr_store(run(acc), buf + (wave * 64 + lane) * 4)
+        gpu.barrier()
+
+
+def split_ends(n, per):
+    """The quarters ending the ``n`` splits (``per`` quarters each)."""
+    return [per * k + per - 1 for k in range(n)]
+
+
 # ---------------------------------------------------------------- gate_up
 def w13_loads(c, row, steps):
     """This lane's w13 tiles of ``row`` at K steps ``steps`` (traced, each) and
@@ -685,44 +749,42 @@ def w13_loads(c, row, steps):
     return tiles, words
 
 
-def gu_loads(c, g):
-    """Whole group g: wave w's gate / up (w % 2) rows, K quarter w / 2."""
-    lane, wave = c["lane"], c["wave"]
-    row = ((wave % 2) * c["G"].ng + g) * ROWS + lane % ROWS
-    kq = wave // 2
-    return w13_loads(c, row, [kq * GU_Q + i for i in range(GU_Q)])
-
-
-def qt_bounds(wave):
-    """A quarter task's wave: gate / up by wave % 2; sub-run wave / 2 of the 10
-    steps (3, 3, 2, 2): (first step, steps)."""
-    sub = wave // 2
-    start = 3 * sub - fx.max(sub - 2, 0)
-    return start, (sub < 2).select(fx.Int32(3), fx.Int32(2))
-
-
-def qt_loads(c):
-    """CTA b's quarter task: K quarter b % 4 of split group 1024 + b / 4 (TP1);
-    a dead third step, and the whole task of a CTA past ``qt_ctas``, past the
-    weight."""
-    lane, wave, bid, geo = c["lane"], c["wave"], c["bid"], c["G"]
-    g = geo.g_full * BLOCKS + bid // DQ
-    kq = bid % DQ
-    start, n = qt_bounds(wave)
+def gu_row(c, g, sliver):
+    """This lane's w13 row of group g, gate / up by wave % 2; of the split group
+    (``sliver``) only the CTA's ``sl_cols`` columns, the others dead."""
+    lane, wave, geo = c["lane"], c["wave"], c["G"]
     row = ((wave % 2) * geo.ng + g) * ROWS + lane % ROWS
-    dead = fx.Int32(2 * geo.inter)
-    if const_expr(geo.qt_ctas < BLOCKS):
-        row = (bid < geo.qt_ctas).select(row, dead)
-    rows = [row, row, (n > 2).select(row, dead)]
-    lane_ops = [w13_loads(c, rows[i], [kq * GU_Q + start + i]) for i in range(QT_UNITS)]
-    return [o[0][0] for o in lane_ops], [o[1][0] for o in lane_ops]
+    if const_expr(sliver):
+        off = sl_off(c)
+        live = (lane % ROWS >= off) & (lane % ROWS < off + geo.sl_cols)
+        row = live.select(row, fx.Int32(2 * geo.inter))
+    return row
 
 
-def gu_mfmas(c, tiles, words, steps):
+def sl_off(c):
+    """The first of the CTA's columns in its split group."""
+    geo = c["G"]
+    return c["bid"] % (ROWS // geo.sl_cols) * geo.sl_cols
+
+
+def sl_group(c):
+    geo = c["G"]
+    return geo.g_full * BLOCKS + c["bid"] // (ROWS // geo.sl_cols)
+
+
+def gu_loads(c, g, sliver=False):
+    """Group g: wave w's gate / up rows (w % 2), its K quarter w / 2."""
+    kq = c["wave"] // 2
+    return w13_loads(c, gu_row(c, g, sliver), [kq * GU_Q + i for i in range(GU_Q)])
+
+
+def gu_mfmas(c, tiles, words, steps, acc=None):
+    """The steps chained in order onto ``acc`` (None: a chain from zero)."""
+    if acc is None:
+        acc = fx.Vector.filled(4, 0.0, fx.Float32)
     lane = c["lane"]
     gl = lane // ROWS
     t = fx.min(lane % ROWS, c["S"] - 1)
-    acc = fx.Vector.filled(4, 0.0, fx.Float32)
     for i in range_constexpr(len(tiles)):
         acc = scaled_step(
             c["xq"],
@@ -752,80 +814,99 @@ def scaled_step(aq, as_, qrow, srow, st, gl, tile, word, acc):
     return mfma_scaled(tile, bw, acc, sa, sb, FP4, FP4, 0, 0)
 
 
-def store_h(c, g, tt, cp, gv, uv):
-    """bf16 g, u of columns 16 g + 2 cp + (0, 1), token tt -> H."""
-    v = [silu_mul_bf(gv[d], uv[d]) for d in range(2)]
-    bo.buffer_store(
-        pack_bf(v)[0],
-        rsrc(c["hbuf"]),
-        (tt * c["G"].inter + g * ROWS + 2 * cp) // 2,
-        cache_modifier=CM_DEV,
-    )
-
-
 @traced
-def stage_gu(c, g, ops):
-    """Whole group g: the wave's 10 steps -> red; thread (token, column pair):
-    gate and up summed over the K quarters in order, bf16 each -> H."""
-    s, tid, lane, wave, red = c["S"], c["tid"], c["lane"], c["wave"], c["red"]
+def stage_gu(c, j, g, ops, sliver):
+    """Group g, the CTA's j-th: the K chains (``chained``) -> red; thread (token,
+    column pair): gate and up, the splits added as stock's reduce, bf16 each ->
+    h (``h_out``)."""
+    s, tid, wave, red = c["S"], c["tid"], c["wave"], c["red"]
+    n = gu_splits(s)
+    per = QUARTERS // n
     kq = wave // 2
-    acc = gu_mfmas(c, ops[0], ops[1], [kq * GU_Q + i for i in range(GU_Q)])
-    fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
-    gpu.barrier()
+    steps = [kq * GU_Q + i for i in range(GU_Q)]
+    chained(c, red, kq, per, lambda acc: gu_mfmas(c, ops[0], ops[1], steps, acc))
     if tid < s * (ROWS // 2):
         tt = tid // (ROWS // 2)
         cp = tid % (ROWS // 2)
+        ends = split_ends(n, per)
         gv = [
-            bf16_round(row_sum(red, 2 * cp + d, tt, waves=(0, 2, 4, 6)))
+            bf16_round(split_total(red_at(red, 2 * q, 2 * cp + d, tt) for q in ends))
             for d in range(2)
         ]
         uv = [
-            bf16_round(row_sum(red, 2 * cp + d, tt, waves=(1, 3, 5, 7)))
+            bf16_round(
+                split_total(red_at(red, 2 * q + 1, 2 * cp + d, tt) for q in ends)
+            )
             for d in range(2)
         ]
-        store_h(c, g, tt, cp, gv, uv)
+        h_out(c, j, g, tt, cp, gv, uv, sliver)
     gpu.barrier()
 
 
 @traced
-def stage_qt(c, ops):
-    """The quarter task: fp32 partial of gate | up (16 + 16 columns, S tokens);
-    quarters 1..3 put it, quarter 0 keeps its own in LDS (``qown``)."""
-    s, tid, lane, wave, red, bid = (
-        c["S"],
-        c["tid"],
-        c["lane"],
-        c["wave"],
-        c["red"],
-        c["bid"],
-    )
-    kq = bid % DQ
-    start, _ = qt_bounds(wave)
-    # a dead step's zero tile still reads x: keep it inside the row
-    steps = [kq * GU_Q + fx.min(start + i, GU_Q - 1) for i in range(QT_UNITS)]
-    acc = gu_mfmas(c, ops[0], ops[1], steps)
-    fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
-    gpu.barrier()
-    if qt_live(c, tid < s * 2 * ROWS):
-        tt = tid // (2 * ROWS)
-        gc = tid % (2 * ROWS)  # gate columns 0..15, up 16..31
-        gu = gc // ROWS
-        col = gc % ROWS
-        v = row_sum_waves(red, col, tt, gu)
-        if kq > 0:
-            at = (((bid // DQ) * (DQ - 1) + kq - 1) * s + tt) * 2 * ROWS + gc
-            c["put"](c["gpart"], at, v)
-        if kq == 0:
-            fx.ptr_store(v, c["qown"] + tid)
-    gpu.barrier()
+def h_out(c, j, g, tt, cp, gv, uv, sliver):
+    """bf16 h of columns 16 g + 2 cp + (0, 1), token tt: a whole group's -> the
+    LDS pair (HP, its half j % 2); the split group's live columns -> H."""
+    v = [silu_mul_bf(gv[d], uv[d]) for d in range(2)]
+    if const_expr(sliver):
+        off = sl_off(c)
+        if (2 * cp >= off) & (2 * cp < off + c["G"].sl_cols):
+            bo.buffer_store(
+                pack_bf(v)[0],
+                rsrc(c["hbuf"]),
+                (tt * c["G"].inter + g * ROWS + 2 * cp) // 2,
+                cache_modifier=CM_DEV,
+            )
+    else:
+        for d in range_constexpr(2):
+            fx.ptr_store(
+                bf16_round(v[d]), c["hp"] + (tt * 32 + (j % 2) * ROWS + 2 * cp + d)
+            )
 
 
-def qt_live(c, pred):
-    """``pred`` in a CTA with a quarter task."""
-    geo = c["G"]
-    if const_expr(geo.qt_ctas < BLOCKS):
-        return pred & (c["bid"] < geo.qt_ctas)
-    return pred
+@traced
+def h_quant(c, g):
+    """Thread t < S: the h of whole groups g - 1, g (one 1 x 32 block, in HP)
+    through MXFP4 qdq -> its fp4 words and code -> HQ."""
+    s, tid, geo = c["S"], c["tid"], c["G"]
+    if tid < s:
+        vs = [fx.ptr_load(c["hp"] + (tid * 32 + e)) for e in range(32)]
+        amax = fx.Float32(0.0)
+        for e in range_constexpr(32):
+            amax = fx.max(amax, fx.Float32(fmath.absf(vs[e])))
+        code = mx_code(amax)
+        qs = [pack8(vs[8 * k : 8 * k + 8], code) for k in range(4)]
+        blk = (g - 1) * ROWS // 32
+        bo.buffer_store(
+            fx.Vector.from_elements(qs, fx.Int32),
+            rsrc(c["hq4"]),
+            (tid * geo.blocks + blk) * 4,
+            cache_modifier=CM_DEV,
+        )
+        bo.buffer_store(
+            code, rsrc(c["hq4s"]), tid * geo.blocks + blk, cache_modifier=CM_DEV
+        )
+
+
+@traced
+def run_gate_up(c, ops):
+    """The whole groups (a group's weights in flight under the previous one,
+    ``ops`` the first's since the start) and each pair's qdq, then the split
+    group's columns; one flag."""
+    bid, tid, geo = c["bid"], c["tid"], c["G"]
+    g0 = geo.g_full * bid
+    for j in range_constexpr(geo.g_full + 1):
+        sliver = j == geo.g_full
+        if const_expr(j + 1 < geo.g_full):
+            ops_n = gu_loads(c, g0 + j + 1)
+        elif const_expr(j + 1 == geo.g_full):
+            ops_n = gu_loads(c, sl_group(c), sliver=True)
+        stage_gu(c, j, sl_group(c) if sliver else g0 + j, ops, sliver)
+        if const_expr(j % 2 == 1 and not sliver):
+            h_quant(c, g0 + j)
+        if const_expr(not sliver):
+            ops = ops_n
+    publish(c["put"], c["hrdy"], bid, fx.Int32(1), tid == 0)
 
 
 def row_sum_waves(red, r, t, gu, n=4):
@@ -838,122 +919,82 @@ def row_sum_waves(red, r, t, gu, n=4):
     return tot
 
 
-@traced
-def finish_qt(c):
-    """Quarter 0's CTA: its partial + quarters 1..3's, in order -> bf16 g, u ->
-    H of split group 1024 + b / 4."""
-    s, tid, bid = c["S"], c["tid"], c["bid"]
-    if qt_live(c, (bid % DQ == 0) & (tid < s * (ROWS // 2))):
-        tt = tid // (ROWS // 2)
-        cp = tid % (ROWS // 2)
-        lg = bid // DQ
-        got = c["poll"](
-            [
-                (
-                    c["gpart"],
-                    ((lg * (DQ - 1) + kq - 1) * s + tt) * 2 * ROWS + gu * ROWS + 2 * cp,
-                    2,
-                )
-                for kq in range(1, DQ)
-                for gu in range(2)
-            ]
-        )
-        vals = []
-        for gu in range_constexpr(2):
-            pair = []
-            for d in range_constexpr(2):
-                v = fx.ptr_load(c["qown"] + (tt * 2 * ROWS + gu * ROWS + 2 * cp + d))
-                for kq in range_constexpr(DQ - 1):
-                    v = v + got[kq * 2 + gu][d].bitcast(fx.Float32)
-                pair.append(bf16_round(v))
-            vals.append(pair)
-        store_h(c, c["G"].g_full * BLOCKS + lg, tt, cp, vals[0], vals[1])
-
-
-@traced
-def run_gate_up(c, qops, ops):
-    """The quarter task and the first whole group (their weights ``qops``,
-    ``ops`` in flight since the start), the other three (a group's weights in
-    flight under the previous one), the split group's sum, one flag."""
-    bid, tid = c["bid"], c["tid"]
-    g_full = c["G"].g_full
-    g0 = g_full * bid
-    stage_qt(c, qops)
-    for j in range_constexpr(g_full):
-        if const_expr(j + 1 < g_full):
-            ops_n = gu_loads(c, g0 + j + 1)
-        stage_gu(c, g0 + j, ops)
-        if const_expr(j + 1 < g_full):
-            ops = ops_n
-    finish_qt(c)
-    publish(c["put"], c["hrdy"], bid, fx.Int32(1), tid == 0)
-
-
 # ---------------------------------------------------------------- down
-def down_bounds(geo, wave, k):
-    """Row group k's steps for this wave: the waves rotated by e k, the first e
-    (rotated) take one step more than the rest (TP1: e = 2, 5 and 4 steps; TP2:
-    e = 1, 3 and 2): (first step, steps)."""
-    base, extra = divmod(geo.d_steps, WAVES)
-    wr = (wave + (WAVES - extra * k % WAVES)) % WAVES
-    start = base * wr + fx.min(wr, extra)
-    return start, (wr < extra).select(fx.Int32(base + 1), fx.Int32(base))
+def d_row(c):
+    """This lane's w2 row: tile wave % 2 of the CTA, its whole row group b or
+    ``D_SL_ROWS`` rows of split group 256 + b / 4 (the others dead)."""
+    lane, wave, bid = c["lane"], c["wave"], c["bid"]
+    off = d_off(c)
+    live = (lane % ROWS >= off) & (lane % ROWS < off + D_SL_ROWS)
+    sl = live.select(
+        (D_FULL + bid // (ROWS // D_SL_ROWS)) * ROWS + lane % ROWS, fx.Int32(HIDDEN)
+    )
+    return (wave % 2 == 0).select(bid * ROWS + lane % ROWS, sl)
 
 
-def down_loads(c, q, rg0):
-    """Every (row group, step) unit of this wave; the dead fifth past the
-    weight."""
-    lane, wave, geo = c["lane"], c["wave"], c["G"]
-    a = c["args"]
+def d_off(c):
+    """The first of the CTA's rows in its split row group."""
+    return c["bid"] % (ROWS // D_SL_ROWS) * D_SL_ROWS
+
+
+def down_loads(c):
+    """The wave's K quarter (wave / 2) of its row: tiles and scale words."""
+    lane, wave, geo, a = c["lane"], c["wave"], c["G"], c["args"]
     gl = lane // ROWS
     r_w = rsrc(a["w2"], HIDDEN * geo.inter // 2)
     r_s = rsrc(a["w2s"], HIDDEN * geo.inter // 32)
+    row = d_row(c)
+    kq = wave // 2
     tiles, words = [], []
-    for k in range(D_RG):
-        start, n = down_bounds(geo, wave, k)
-        row = (rg0 + k) * ROWS + lane % ROWS
-        for i in range(geo.d_units):
-            st = start + i
-            r = row
-            if i == geo.d_units - 1:
-                r = (n > i).select(row, fx.Int32(HIDDEN))
-            if c["shuffled"]:
-                at = (
-                    r // ROWS * (ROWS * geo.w2_dw)
-                    + (q * geo.d_steps + st) * 256
-                    + lane * 4
-                )
-            else:
-                at = r * geo.w2_dw + q * (geo.dk // 8) + st * 16 + 4 * gl
-            tiles.append(ld4(r_w, at, CM_NT))
-            words.append(
-                fx.Int32(
-                    bo.buffer_load(
-                        r_s,
-                        r * geo.w2s_dw + q * geo.d_steps + st,
-                        vec_width=1,
-                        dtype=T.i32,
-                    )
-                )
+    for i in range(geo.d_q):
+        st = kq * geo.d_q + i
+        if c["shuffled"]:
+            at = row // ROWS * (ROWS * geo.w2_dw) + st * 256 + lane * 4
+        else:
+            at = row * geo.w2_dw + st * 16 + 4 * gl
+        tiles.append(ld4(r_w, at, CM_NT))
+        words.append(
+            fx.Int32(
+                bo.buffer_load(r_s, row * geo.w2s_dw + st, vec_width=1, dtype=T.i32)
             )
+        )
     return tiles, words
 
 
 @traced
-def load_h(c, q):
-    """Every CTA's H ready -> H's quarter q through MXFP4 qdq (a thread a 1 x 32
-    block) -> LDS rows of HROW."""
+def load_h(c):
+    """Every CTA's H ready -> HQ's blocks, and the split groups' columns of H
+    through MXFP4 qdq (a thread a 1 x 32 block), -> LDS rows of hqrow / hsrow."""
     s, tid, geo = c["S"], c["tid"], c["G"]
     if tid < BLOCKS:
         c["poll"]([(c["hrdy"], tid, 1)])
     gpu.barrier()
-    nb = s * geo.h_blocks
-    r_h = rsrc(c["hbuf"])
+    nb = s * geo.bulk_blocks
     for i in range_constexpr((nb + THREADS - 1) // THREADS):
         b = fx.min(tid + THREADS * i, nb - 1)
-        t = b // geo.h_blocks
-        blk = b % geo.h_blocks
-        at = (t * geo.inter + q * geo.dk + 32 * blk) // 2
+        t = b // geo.bulk_blocks
+        blk = b % geo.bulk_blocks
+        w = ld4(rsrc(c["hq4"]), (t * geo.blocks + blk) * 4, CM_DEV)
+        code = fx.Int32(
+            bo.buffer_load(
+                rsrc(c["hq4s"]),
+                t * geo.blocks + blk,
+                vec_width=1,
+                dtype=T.i32,
+                cache_modifier=CM_DEV,
+            )
+        )
+        if tid + THREADS * i < nb:
+            fx.ptr_store(w, c["hq"] + (t * geo.hqrow + 4 * blk))
+            fx.ptr_store(code, c["hs"] + (t * geo.hsrow + blk))
+    sl_blocks = geo.blocks - geo.bulk_blocks
+    ns = s * sl_blocks
+    r_h = rsrc(c["hbuf"])
+    for i in range_constexpr((ns + THREADS - 1) // THREADS):
+        b = fx.min(tid + THREADS * i, ns - 1)
+        t = b // sl_blocks
+        blk = geo.bulk_blocks + b % sl_blocks
+        at = (t * geo.inter + 32 * blk) // 2
         ws = [ld4(r_h, at + 4 * k, CM_DEV) for k in range(4)]
         vs = []
         for k in range_constexpr(4):
@@ -964,7 +1005,7 @@ def load_h(c, q):
             amax = fx.max(amax, fx.Float32(fmath.absf(vs[e])))
         code = mx_code(amax)
         qs = [pack8(vs[8 * k : 8 * k + 8], code) for k in range(4)]
-        if tid + THREADS * i < nb:
+        if tid + THREADS * i < ns:
             fx.ptr_store(
                 fx.Vector.from_elements(qs, fx.Int32),
                 c["hq"] + (t * geo.hqrow + 4 * blk),
@@ -974,64 +1015,59 @@ def load_h(c, q):
 
 
 @traced
-def stage_down(c, q, rg0, ops):
-    """The wave's units -> fp32 accumulators a row group -> LDS; then the reduce
-    (``down_reduce``)."""
-    s, tid, lane, wave, geo = c["S"], c["tid"], c["lane"], c["wave"], c["G"]
+def stage_down(c, ops):
+    """The K chains (``chained``) -> DRED; thread (tile, token, row pair): the
+    splits added as stock's reduce -> bf16 ``out`` (of the split row group, the
+    CTA's rows only)."""
+    s, tid, lane, wave, geo, bid = (
+        c["S"],
+        c["tid"],
+        c["lane"],
+        c["wave"],
+        c["G"],
+        c["bid"],
+    )
     dred = c["dred"]
     tiles, words = ops
     gl = lane // ROWS
     t = fx.min(lane % ROWS, s - 1)
-    hq_row, hs_row = t * geo.hqrow, t * geo.hsrow
-    for k in range_constexpr(D_RG):
-        start, _ = down_bounds(geo, wave, k)
-        acc = fx.Vector.filled(4, 0.0, fx.Float32)
-        for i in range_constexpr(geo.d_units):
-            u = k * geo.d_units + i
-            st = fx.min(start + i, geo.d_steps - 1)
+    kq = wave // 2
+    n = d_splits(s, geo.tp)
+    per = QUARTERS // n
+
+    def run(acc):
+        for i in range_constexpr(geo.d_q):
             acc = scaled_step(
-                c["hq"], c["hs"], hq_row, hs_row, st, gl, tiles[u], words[u], acc
+                c["hq"],
+                c["hs"],
+                t * geo.hqrow,
+                t * geo.hsrow,
+                kq * geo.d_q + i,
+                gl,
+                tiles[i],
+                words[i],
+                acc,
             )
-        fx.ptr_store(acc, dred + ((k * WAVES + wave) * 64 + lane) * 4)
-    gpu.barrier()
-    n = D_RG * s * (ROWS // 2)
-    # More units than threads above 12 rows: a thread takes one a round.
-    for rnd in range_constexpr((n + THREADS - 1) // THREADS):
-        down_reduce(c, q, rg0, tid + THREADS * rnd, n)
+        return acc
 
-
-@traced
-def down_reduce(c, q, rg0, u, n):
-    """Unit ``u`` < ``n`` (row group, token, row pair) of down's reduce: the CTA's
-    partial; quarters 1..3 put it, quarter 0 adds theirs in order -> bf16 out."""
-    s, dred = c["S"], c["dred"]
-    if u < n:
-        k = u // (s * (ROWS // 2))
-        rem = u % (s * (ROWS // 2))
-        tt = rem // (ROWS // 2)
-        rp = rem % (ROWS // 2)
-        base = dred + k * (WAVES * 64 * 4)
-        v = [row_sum(base, 2 * rp + d, tt) for d in range(2)]
-        row = (rg0 + k) * ROWS + 2 * rp
-        if q > 0:
-            c["put_words"](
-                c["dpart"],
-                ((q - 1) * s + tt) * HIDDEN + row,
-                [v[0].bitcast(fx.Int32), v[1].bitcast(fx.Int32)],
+    chained(c, dred, kq, per, run)
+    if tid < 2 * s * (ROWS // 2):
+        tile = tid // (s * (ROWS // 2))
+        tt = tid % (s * (ROWS // 2)) // (ROWS // 2)
+        rp = tid % (ROWS // 2)
+        y = [
+            split_total(
+                red_at(dred, 2 * q + tile, 2 * rp + d, tt) for q in split_ends(n, per)
             )
-        if q == 0:
-            got = c["poll"](
-                [
-                    (c["dpart"], ((qq - 1) * s + tt) * HIDDEN + row, 2)
-                    for qq in range(1, DQ)
-                ]
-            )
-            y = []
-            for d in range_constexpr(2):
-                yd = v[d]
-                for qq in range_constexpr(DQ - 1):
-                    yd = yd + got[qq][d].bitcast(fx.Float32)
-                y.append(yd)
+            for d in range(2)
+        ]
+        off = d_off(c)
+        whole = tile == 0
+        row = (
+            whole.select(bid * ROWS, (D_FULL + bid // (ROWS // D_SL_ROWS)) * ROWS)
+            + 2 * rp
+        )
+        if whole | ((2 * rp >= off) & (2 * rp < off + D_SL_ROWS)):
             bo.buffer_store(
                 pack_bf(y)[0], rsrc(c["args"]["out"]), (tt * HIDDEN + row) // 2
             )
@@ -1060,7 +1096,7 @@ def build(key: FfnBuild):
     class DLds:
         hq: fx.Array[fx.Int32, s * geo.hqrow, 16]
         hs: fx.Array[fx.Int32, s * geo.hsrow, 16]
-        dred: fx.Array[fx.Float32, D_RG * WAVES * 64 * 4, 16]
+        dred: fx.Array[fx.Float32, WAVES * 64 * 4, 16]
 
     @fx.struct
     class OLds:
@@ -1078,12 +1114,12 @@ def build(key: FfnBuild):
         red: fx.Array[fx.Float32, WAVES * 64 * 4, 16]
         nrm: fx.Array[fx.Float32, MAX_ROUNDS * WAVES, 16]
         rst: fx.Array[fx.Float32, max_tokens(key.tp), 16]
-        qown: fx.Array[fx.Float32, max_tokens(key.tp) * 2 * ROWS, 16]
+        hp: fx.Array[fx.Float32, s * 2 * ROWS, 16]
 
     keyed = key_tuple(key, digest())
     name = (
         f"qwen38_dense_ffn_s{s}_p{key.stop}_t{int(key.stamps)}_w{int(key.shuffled)}"
-        f"_o{int(key.oproj)}_tp{key.tp}_n{int(key.normed)}_v5"
+        f"_o{int(key.oproj)}_tp{key.tp}_n{int(key.normed)}_v6"
     )
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
@@ -1127,7 +1163,7 @@ def build(key: FfnBuild):
             "red": lds.red.ptr,
             "nrm": lds.nrm.ptr,
             "rst": lds.rst.ptr,
-            "qown": lds.qown.ptr,
+            "hp": lds.hp.ptr,
             "xq": xl.xq.ptr,
             "xs": xl.xs.ptr,
             "hq": dl.hq.ptr,
@@ -1138,9 +1174,9 @@ def build(key: FfnBuild):
             "nsum": sreg(scratch, lay["nsum"][0], "nsum"),
             "xmb": sreg(scratch, lay["xmb"][0], "xmb"),
             "hbuf": scratch + fx.Int64(lay["h"][0]),
+            "hq4": scratch + fx.Int64(lay["hq"][0]),
+            "hq4s": scratch + fx.Int64(lay["hqs"][0]),
             "hrdy": sreg(scratch, lay["hrdy"][0], "hrdy"),
-            "gpart": sreg(scratch, lay["gpart"][0], "gpart"),
-            "dpart": sreg(scratch, lay["dpart"][0], "dpart"),
             "args": {
                 "hidden": hidden,
                 "residual": residual,
@@ -1166,7 +1202,6 @@ def build(key: FfnBuild):
             z, lnw = o_finish(c, rraw)
             stamp(c, 5)
             # the first gate_up weights before the norm's hand-offs
-            qops = qt_loads(c)
             gops = gu_loads(c, geo.g_full * bid)
             o_rstd(c)
             o_x(c, z, lnw)
@@ -1174,26 +1209,22 @@ def build(key: FfnBuild):
         elif const_expr(key.normed):
             # x first: vmcnt drains in issue order
             xraw = block_loads(c, HIDDEN)
-            qops = qt_loads(c)
             gops = gu_loads(c, geo.g_full * bid)
             x_quant(c, xraw)
         else:
             # the norm's loads first: vmcnt drains in issue order
             nraw = norm_loads(c)
-            qops = qt_loads(c)
             run_norm(c, nraw)
             gops = gu_loads(c, geo.g_full * bid)
         stamp(c, 1)
         if const_expr(key.stop > 2):
-            run_gate_up(c, qops, gops)
+            run_gate_up(c, gops)
             stamp(c, 2)
         if const_expr(key.stop > 3):
-            q = bid // DCTA
-            rg0 = (bid % DCTA) * D_RG
-            dops = down_loads(c, q, rg0)
-            load_h(c, q)
+            dops = down_loads(c)
+            load_h(c)
             stamp(c, 3)
-            stage_down(c, q, rg0, dops)
+            stage_down(c, dops)
             stamp(c, 4)
 
     @flyc.jit
