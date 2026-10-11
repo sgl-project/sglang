@@ -745,6 +745,8 @@ class HiCacheController:
             tp_lcm_size=tp_lcm_size,
             should_split_heads=should_split_heads,
             extra_config=storage_backend_extra_config,
+            # Host buffers may store different FP8 formats as uint8 bytes.
+            kv_cache_dtype=str(self.mem_pool_device.dtype).removeprefix("torch."),
         )
 
     def reset(self):

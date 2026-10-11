@@ -38,6 +38,8 @@ class HiCacheStorageConfig:
     tp_lcm_size: Optional[int] = None
     should_split_heads: bool = False
     extra_config: Optional[dict] = None
+    # Logical device-pool dtype. Host buffers may store FP8 as uint8 bytes.
+    kv_cache_dtype: Optional[str] = None
 
 
 @dataclass
