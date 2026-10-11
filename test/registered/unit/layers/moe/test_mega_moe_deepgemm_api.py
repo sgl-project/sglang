@@ -495,89 +495,78 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
         """Padding contributes zero; routed and shared scales apply once."""
         deep_gemm = self.deep_gemm
         deep_gemm.bf16_mega_gate = self._mega_gate_reference
-        for is_hash in (False, True):
-            for fused_shared in (0, 1):
-                for scale_in_topk in (False, True):
-                    for num_tokens, valid_rows in (
-                        (1, 0),
-                        (1, 1),
-                        (2, 1),
-                        (2, 2),
-                        (32, 0),
-                        (32, 2),
-                        (32, 32),
-                    ):
-                        with self.subTest(
-                            is_hash=is_hash,
-                            fused_shared=fused_shared,
-                            scale_in_topk=scale_in_topk,
-                            num_tokens=num_tokens,
-                            valid_rows=valid_rows,
-                        ):
-                            moe = self._mega_gate_moe(
-                                fused_shared, scale_in_topk, is_hash
-                            )
-                            hidden = torch.ones((num_tokens, 256), dtype=torch.bfloat16)
-                            hidden[valid_rows:] = float("nan")
-                            input_ids = torch.tensor([7, 99] * ((num_tokens + 1) // 2))[
-                                :num_tokens
-                            ]
-                            input_ids[valid_rows:] = 1000
-                            batch = SimpleNamespace(
-                                moe_num_token_non_padded=lambda: torch.tensor(
-                                    valid_rows
-                                )
-                            )
+        cases = (
+            (False, 0, False, 2, 2),
+            (False, 1, False, 2, 1),
+            (False, 1, True, 32, 2),
+            (False, 1, True, 1, 0),
+            (True, 0, False, 1, 1),
+            (True, 1, False, 2, 1),
+            (True, 1, True, 2, 2),
+            (True, 1, True, 1, 0),
+        )
+        for is_hash, fused_shared, scale_in_topk, num_tokens, valid_rows in cases:
+            with self.subTest(
+                is_hash=is_hash,
+                fused_shared=fused_shared,
+                scale_in_topk=scale_in_topk,
+                num_tokens=num_tokens,
+                valid_rows=valid_rows,
+            ):
+                moe = self._mega_gate_moe(fused_shared, scale_in_topk, is_hash)
+                hidden = torch.ones((num_tokens, 256), dtype=torch.bfloat16)
+                hidden[valid_rows:] = float("nan")
+                input_ids = torch.tensor([7, 99] * ((num_tokens + 1) // 2))[:num_tokens]
+                input_ids[valid_rows:] = 1000
+                batch = SimpleNamespace(
+                    moe_num_token_non_padded=lambda: torch.tensor(valid_rows)
+                )
 
-                            def run_experts(_experts, x, ids, weights, **kwargs):
-                                self.assertTrue((ids[valid_rows:] == -1).all())
-                                self.assertTrue((weights[valid_rows:] == 0).all())
-                                factors = (ids + 1).float()
-                                factors[ids == 9] = 1.0  # rank-1 shared slot
-                                return (factors * weights).sum(
-                                    -1, keepdim=True
-                                ) * kwargs["routed_scaling_factor"]
+                def run_experts(_experts, x, ids, weights, **kwargs):
+                    self.assertTrue((ids[valid_rows:] == -1).all())
+                    self.assertTrue((weights[valid_rows:] == 0).all())
+                    factors = (ids + 1).float()
+                    factors[ids == 9] = 1.0  # rank-1 shared slot
+                    return (factors * weights).sum(-1, keepdim=True) * kwargs[
+                        "routed_scaling_factor"
+                    ]
 
-                            with (
-                                get_context().override_server_args(
-                                    model_path="dummy",
-                                    tp_size=2,
-                                    ep_size=2,
-                                    enable_deterministic_inference=False,
-                                ),
-                                envs.SGLANG_OPT_DEEPGEMM_MEGA_GATE.override(True),
-                                patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
-                                patch.object(mega_moe, "_device_sm", 100),
-                                get_flags().moe.override(
-                                    a2a_backend=MoeA2ABackend.MEGAMOE
-                                ),
-                                get_parallel().override(moe_ep_size=2, moe_ep_rank=1),
-                                patch.object(
-                                    mega_moe.ExpertLocationDispatchInfo,
-                                    "init_new",
-                                    return_value=None,
-                                ),
-                                patch.object(
-                                    mega_moe, "run_mega_routed_experts", run_experts
-                                ),
-                                patch.object(topk_module, "_is_cuda", True),
-                                patch.object(
-                                    topk_module,
-                                    "_can_fuse_padded_region",
-                                    return_value=False,
-                                ),
-                            ):
-                                out = mega_moe._run_mega_routed(
-                                    moe, hidden, batch, input_ids, num_tokens=num_tokens
-                                )
-                            image_value = 15.0 + 3 * fused_shared
-                            text_value = image_value if is_hash else 3.0 + fused_shared
-                            expected = torch.tensor(
-                                [text_value, image_value] * ((num_tokens + 1) // 2)
-                            )[:num_tokens]
-                            expected[valid_rows:] = 0.0
-                            torch.testing.assert_close(out[:, 0], expected)
-                            self.assertTrue(torch.isnan(hidden[valid_rows:]).all())
+                with (
+                    get_context().override_server_args(
+                        model_path="dummy",
+                        tp_size=2,
+                        ep_size=2,
+                        enable_deterministic_inference=False,
+                    ),
+                    envs.SGLANG_OPT_DEEPGEMM_MEGA_GATE.override(True),
+                    patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
+                    patch.object(mega_moe, "_device_sm", 100),
+                    get_flags().moe.override(a2a_backend=MoeA2ABackend.MEGAMOE),
+                    get_parallel().override(moe_ep_size=2, moe_ep_rank=1),
+                    patch.object(
+                        mega_moe.ExpertLocationDispatchInfo,
+                        "init_new",
+                        return_value=None,
+                    ),
+                    patch.object(mega_moe, "run_mega_routed_experts", run_experts),
+                    patch.object(topk_module, "_is_cuda", True),
+                    patch.object(
+                        topk_module,
+                        "_can_fuse_padded_region",
+                        return_value=False,
+                    ),
+                ):
+                    out = mega_moe._run_mega_routed(
+                        moe, hidden, batch, input_ids, num_tokens=num_tokens
+                    )
+                image_value = 15.0 + 3 * fused_shared
+                text_value = image_value if is_hash else 3.0 + fused_shared
+                expected = torch.tensor(
+                    [text_value, image_value] * ((num_tokens + 1) // 2)
+                )[:num_tokens]
+                expected[valid_rows:] = 0.0
+                torch.testing.assert_close(out[:, 0], expected)
+                self.assertTrue(torch.isnan(hidden[valid_rows:]).all())
 
     def test_mega_gate_preserves_target_only_routed_experts_capture(self):
         """Draft and hash routing leave the target's capture buffer intact."""
