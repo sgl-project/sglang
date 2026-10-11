@@ -39,16 +39,23 @@ class TestNanoNemotronVLImageProcessor(CustomTestCase):
         )
         original = Image.MAX_IMAGE_PIXELS
         try:
-            with patch.object(
-                nano_nemotron_vl.BaseMultimodalProcessor, "__init__", _fake_base_init
-            ), patch.object(nano_nemotron_vl, "EVSProcessor"), patch.object(
-                nano_nemotron_vl,
-                "get_model",
-                return_value=SimpleNamespace(context_length=8192),
-            ), patch.object(
-                nano_nemotron_vl.MultimodalSpecialTokens,
-                "build",
-                lambda self, processor: self,
+            with (
+                patch.object(
+                    nano_nemotron_vl.BaseMultimodalProcessor,
+                    "__init__",
+                    _fake_base_init,
+                ),
+                patch.object(nano_nemotron_vl, "EVSProcessor"),
+                patch.object(
+                    nano_nemotron_vl,
+                    "get_model",
+                    return_value=SimpleNamespace(context_length=8192),
+                ),
+                patch.object(
+                    nano_nemotron_vl.MultimodalSpecialTokens,
+                    "build",
+                    lambda self, processor: self,
+                ),
             ):
                 NanoNemotronVLImageProcessor(hf_config, None, tokenizer)
 
