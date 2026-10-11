@@ -241,6 +241,16 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         self.kv_cache_dim = self.kv_lora_rank + self.qk_rope_head_dim
 
         # Runtime parameters
+        if backend == "trtllm-gen" and 64 < self.num_decode_q_heads < 128:
+            # flashinfer has no trtllm-gen MLA decode variant for this head
+            # count (e.g. a TP1 pipeline stage of a 96-head model) and would
+            # reject the multi-CTA counter buffer; run decode on cute-dsl.
+            logger.info(
+                "trtllm_mla: %d decode q heads per rank has no trtllm-gen MLA "
+                "decode kernel; using the cute-dsl runner for decode.",
+                self.num_decode_q_heads,
+            )
+            backend = "cute-dsl"
         self.backend = backend
         self.data_type = model_runner.kv_cache_dtype
         self.q_data_type = model_runner.dtype
@@ -1443,9 +1453,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # TODO refactor to avoid code duplication
         merge_query = q_rope is not None
         fused_fp8_query = None
-        if (
-            self.data_type == torch.float8_e4m3fn
-        ) and forward_batch.forward_mode.is_target_verify():
+        if self.data_type == torch.float8_e4m3fn and (
+            forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend_v2()
+        ):
             assert q_rope is not None and k_rope is not None
             if cos_sin_cache is None:
                 if save_kv_cache and self._fused_set_kv_concat_q_fp8:
@@ -1580,7 +1591,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 can_direct_view = bs > 0 and (total_tokens % bs == 0)
 
                 if can_direct_view:
-                    max_seq_len = metadata.max_seq_len_k + tokens_per_seq
+                    max_seq_len = metadata.max_seq_len_k + (
+                        0 if get_parallel().dcp_enabled else tokens_per_seq
+                    )
                     q = q.view(bs, tokens_per_seq, layer.tp_q_head_num, layer.head_dim)
                     needs_unpad = False
                 else:
@@ -1622,10 +1635,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
             assert kv_cache.dtype == self.data_type
 
-            if (
-                forward_batch.forward_mode.is_target_verify()
-                and get_parallel().dcp_enabled
-            ):
+            if get_parallel().dcp_enabled:
+                if needs_unpad:
+                    raise NotImplementedError("DCP MLA requires a dense draft window")
+                query_tokens_per_req = q.shape[1]
                 raw_out, lse = self._run_decode_kernel(
                     query=q,
                     kv_cache=kv_cache,
@@ -1639,17 +1652,17 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                     return_lse=True,
                 )
                 output = raw_out.view(
-                    bs * draft_token_num,
+                    bs * query_tokens_per_req,
                     layer.tp_q_head_num,
                     layer.v_head_dim,
                 )
-                lse = lse.view(bs * draft_token_num, layer.tp_q_head_num)
+                lse = lse.view(bs * query_tokens_per_req, layer.tp_q_head_num)
                 fixup_zero_kv_rows(
                     output,
                     lse,
                     metadata.seq_lens_k,
-                    self._dense_q_indptr(bs, draft_token_num),
-                    draft_token_num,
+                    self._dense_q_indptr(bs, query_tokens_per_req),
+                    query_tokens_per_req,
                 )
                 return output.flatten(1), lse
 
