@@ -14,20 +14,24 @@ from sglang.srt.layers.moe.topk import (
     _zero_topk_weights_padded_region,
 )
 from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.utils import is_sm100_supported
 
 
-def should_use_mega_gate(moe, hidden_states, device_sm, dispatch_info) -> bool:
+def mega_gate_supported(moe, dispatch_info) -> bool:
+    """Static admission: server config, gate weight layout, and routing mode."""
     if (
         not envs.SGLANG_OPT_DEEPGEMM_MEGA_GATE.get()
-        or device_sm // 10 != 10
+        or not is_sm100_supported()
+        or not is_mega_gate_available()
         or moe.config.model_type != "deepseek_v41"
-        or not 0 < hidden_states.shape[0] <= (1 << 20)
-        or hidden_states.dtype != torch.bfloat16
-        or not hidden_states.is_contiguous()
         or moe.topk.enable_waterfill
         or get_exec().deterministic.enable_deterministic_inference
         or envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
         or envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
+        or (
+            dispatch_info is not None
+            and dispatch_info.ep_dispatch_algorithm in ("lp", "fake")
+        )
     ):
         return False
     weight = moe.gate.weight
@@ -35,8 +39,6 @@ def should_use_mega_gate(moe, hidden_states, device_sm, dispatch_info) -> bool:
     if (
         weight.dtype != torch.bfloat16
         or not weight.is_contiguous()
-        or hidden != hidden_states.shape[1]
-        or hidden == 0
         or hidden % 256 != 0
         or not 0 < num_experts <= 512
         or num_experts % 4 != 0
@@ -51,27 +53,28 @@ def should_use_mega_gate(moe, hidden_states, device_sm, dispatch_info) -> bool:
             bias.dtype != torch.float32 or not bias.is_contiguous()
         ):
             return False
-    if dispatch_info is not None and dispatch_info.ep_dispatch_algorithm in (
-        "lp",
-        "fake",
-    ):
-        return False
     if moe.is_hash:
-        if moe.topk.score_func != "sqrtsoftplus":
-            return False
-    else:
-        config = moe.topk.topk_config
-        if (
-            config.scoring_func != "sqrtsoftplus"
-            or not config.renormalize
-            # vision_topk leaves top-k=1 weights unnormalized.
-            or (config.top_k == 1 and moe.gate.e_score_correction_bias_vl is not None)
-            or config.use_grouped_topk
-            or config.custom_routing_function is not None
-            or config.torch_native
-        ):
-            return False
-    return is_mega_gate_available()
+        return moe.topk.score_func == "sqrtsoftplus"
+    config = moe.topk.topk_config
+    return (
+        config.scoring_func == "sqrtsoftplus"
+        and config.renormalize
+        # vision_topk leaves top-k=1 weights unnormalized.
+        and not (config.top_k == 1 and moe.gate.e_score_correction_bias_vl is not None)
+        and not config.use_grouped_topk
+        and config.custom_routing_function is None
+        and not config.torch_native
+    )
+
+
+def should_use_mega_gate(moe, hidden_states, dispatch_info) -> bool:
+    if moe._mega_gate_supported is None:
+        moe._mega_gate_supported = mega_gate_supported(moe, dispatch_info)
+    return (
+        moe._mega_gate_supported
+        and hidden_states.dtype == torch.bfloat16
+        and hidden_states.is_contiguous()
+    )
 
 
 def run_mega_gate(moe, hidden_states, input_ids, num_token_non_padded, dispatch_info):

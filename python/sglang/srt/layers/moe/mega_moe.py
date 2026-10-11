@@ -267,7 +267,7 @@ def _run_mega_routed(
             else None
         )
         dispatch_info = ExpertLocationDispatchInfo.init_new(layer_id=moe.layer_id)
-        if should_use_mega_gate(moe, hidden_states, _device_sm, dispatch_info):
+        if should_use_mega_gate(moe, hidden_states, dispatch_info):
             import deep_gemm
 
             with _configure_mega_moe_deep_gemm_num_sms(deep_gemm):

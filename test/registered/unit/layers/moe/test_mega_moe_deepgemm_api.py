@@ -240,6 +240,7 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
             ),
             topk=MagicMock(return_value=topk_output),
             is_hash=False,
+            _mega_gate_supported=None,
             num_fused_shared_experts=0,
             layer_id=0,
             routed_scaling_factor=1.0,
@@ -541,6 +542,9 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
                     envs.SGLANG_OPT_DEEPGEMM_MEGA_GATE.override(True),
                     patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
                     patch.object(mega_moe, "_device_sm", 100),
+                    patch.object(
+                        mega_gate_runtime, "is_sm100_supported", return_value=True
+                    ),
                     get_flags().moe.override(a2a_backend=MoeA2ABackend.MEGAMOE),
                     get_parallel().override(moe_ep_size=2, moe_ep_rank=1),
                     patch.object(
@@ -605,36 +609,23 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
         hidden = torch.zeros((32, 256), dtype=torch.bfloat16)
         deep_gemm = ModuleType("deep_gemm")
         deep_gemm.bf16_mega_gate = self._mega_gate_reference
+        supported = mega_gate_runtime.mega_gate_supported
         with (
             get_context().override_server_args(
                 model_path="dummy", enable_deterministic_inference=False
             ),
             envs.SGLANG_OPT_DEEPGEMM_MEGA_GATE.override(True),
             patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
+            patch.object(mega_gate_runtime, "is_sm100_supported", return_value=True),
         ):
-            self.assertTrue(
-                mega_gate_runtime.should_use_mega_gate(moe, hidden, 100, None)
-            )
-            self.assertFalse(
-                mega_gate_runtime.should_use_mega_gate(moe, hidden[:0], 100, None)
-            )
-            for tokens in (1, 2, 16, 17):
-                self.assertTrue(
-                    mega_gate_runtime.should_use_mega_gate(
-                        moe, hidden[:tokens], 103, None
-                    )
-                )
+            self.assertTrue(supported(moe, None))
             with (
                 patch.object(moe.config, "num_experts_per_tok", 1),
                 patch.object(moe.topk.topk_config, "top_k", 1),
             ):
-                self.assertFalse(
-                    mega_gate_runtime.should_use_mega_gate(moe, hidden, 100, None)
-                )
+                self.assertFalse(supported(moe, None))
                 with patch.object(moe.gate, "e_score_correction_bias_vl", None):
-                    self.assertTrue(
-                        mega_gate_runtime.should_use_mega_gate(moe, hidden, 100, None)
-                    )
+                    self.assertTrue(supported(moe, None))
                     with (
                         get_parallel().override(moe_ep_rank=0),
                         patch.object(topk_module, "_is_cuda", True),
@@ -650,13 +641,11 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
             hash_moe.gate.e_score_correction_bias_vl = torch.zeros(
                 8, dtype=torch.bfloat16
             )
-            self.assertTrue(
-                mega_gate_runtime.should_use_mega_gate(hash_moe, hidden, 100, None)
-            )
-            for sm in (90, 120):
-                self.assertFalse(
-                    mega_gate_runtime.should_use_mega_gate(moe, hidden, sm, None)
-                )
+            self.assertTrue(supported(hash_moe, None))
+            with patch.object(
+                mega_gate_runtime, "is_sm100_supported", return_value=False
+            ):
+                self.assertFalse(supported(moe, None))
             for name, value in (
                 ("renormalize", False),
                 ("use_grouped_topk", True),
@@ -665,38 +654,32 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
                 ("torch_native", True),
             ):
                 with patch.object(moe.topk.topk_config, name, value):
-                    self.assertFalse(
-                        mega_gate_runtime.should_use_mega_gate(moe, hidden, 100, None)
-                    )
+                    self.assertFalse(supported(moe, None))
             for algorithm in ("lp", "fake"):
                 self.assertFalse(
-                    mega_gate_runtime.should_use_mega_gate(
-                        moe,
-                        hidden,
-                        100,
-                        SimpleNamespace(ep_dispatch_algorithm=algorithm),
-                    )
+                    supported(moe, SimpleNamespace(ep_dispatch_algorithm=algorithm))
                 )
             with patch.object(moe.topk, "enable_waterfill", True):
-                self.assertFalse(
-                    mega_gate_runtime.should_use_mega_gate(moe, hidden, 100, None)
-                )
+                self.assertFalse(supported(moe, None))
             with envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.override(True):
-                self.assertFalse(
-                    mega_gate_runtime.should_use_mega_gate(moe, hidden, 100, None)
-                )
+                self.assertFalse(supported(moe, None))
             with get_exec().deterministic.override(enable_deterministic_inference=True):
-                self.assertFalse(
-                    mega_gate_runtime.should_use_mega_gate(moe, hidden, 100, None)
-                )
+                self.assertFalse(supported(moe, None))
             with envs.SGLANG_OPT_DEEPGEMM_MEGA_GATE.override(False):
-                self.assertFalse(
-                    mega_gate_runtime.should_use_mega_gate(moe, hidden, 100, None)
-                )
-            del deep_gemm.bf16_mega_gate
+                self.assertFalse(supported(moe, None))
+
+            # The static verdict is cached per layer; only the input is rechecked.
+            self.assertTrue(mega_gate_runtime.should_use_mega_gate(moe, hidden, None))
+            self.assertTrue(moe._mega_gate_supported)
             self.assertFalse(
-                mega_gate_runtime.should_use_mega_gate(moe, hidden, 100, None)
+                mega_gate_runtime.should_use_mega_gate(moe, hidden.float(), None)
             )
+            self.assertFalse(
+                mega_gate_runtime.should_use_mega_gate(moe, hidden.T, None)
+            )
+            del deep_gemm.bf16_mega_gate
+            self.assertFalse(supported(moe, None))
+            self.assertTrue(mega_gate_runtime.should_use_mega_gate(moe, hidden, None))
 
     def test_mega_gate_maps_eplb_before_shared_slots_and_records_routed_ids(self):
         """Redundant-expert maps index routed IDs before per-rank slot insertion.
@@ -784,6 +767,7 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
                 ),
             ),
             is_hash=False,
+            _mega_gate_supported=None,
             num_fused_shared_experts=fused_shared,
             layer_id=0,
             routed_scaling_factor=2.0,
