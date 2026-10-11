@@ -2067,7 +2067,7 @@ If the value is int8, you must also set the environment variable:DEEP_NORMAL_MOD
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--cuda-graph-backend-prefill`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`None`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`disabled`, `tc_piecewise`<br/> (`tc_piecewise` currently supports Llama-3.1-8B-Instruct and Qwen2.5-7B-Instruct)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`disabled`<br/> (the former `tc_piecewise` prefill backend has been removed)</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>A2/A3 Series</td>
     </tr>
     <tr>
