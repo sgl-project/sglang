@@ -6,13 +6,15 @@ engine's `/generate` output for that body (recorded once from `--engine-url`,
 except for `synthetic` cases, whose output is written by hand), and the OpenAI
 response the handler builds from that output.
 
-Run from rust/sglang-processor in a SGLang Python environment:
-    python tests/scripts/generate_openai_parity.py --tokenizer DIR \
+Run from rust/sglang-processor in a SGLang Python environment, with `--model`
+the checkpoint directory (its tokenizer and config):
+    python tests/scripts/generate_openai_parity.py --model DIR \
         [--engine-url http://127.0.0.1:30000] [tests/fixtures/openai_parity/<name>.json ...]
 """
 
 import argparse
 import asyncio
+import copy
 import dataclasses
 import json
 import sys
@@ -29,15 +31,25 @@ from starlette.responses import Response
 # Record this checkout's SGLang, not whichever one is installed.
 sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "python"))
 
-from sglang.srt.entrypoints.openai.protocol import CompletionRequest
+from fixture_json import dump
+
+from sglang.srt.entrypoints.openai.protocol import (
+    ChatCompletionRequest,
+    CompletionRequest,
+)
+from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.entrypoints.openai.serving_completions import OpenAIServingCompletion
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils.hf_transformers.common import get_context_length
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures/openai_parity"
-HANDLERS = {"completions": (CompletionRequest, OpenAIServingCompletion)}
+HANDLERS = {
+    "completions": (CompletionRequest, OpenAIServingCompletion),
+    "chat": (ChatCompletionRequest, OpenAIServingChat),
+}
 SKIPPED_FIELDS = {"received_time"}
 # `meta_info` keys the OpenAI layer never reads; `spec_*` feeds only unlowered `sglext`.
 UNREAD_META = {
@@ -45,6 +57,13 @@ UNREAD_META = {
     "response_sent_to_client_ts",
     "num_retractions",
     "dp_rank",
+}
+# What each `/generate` stream frame repeats in full; fixtures keep only what a frame adds.
+GROWING = {"text", "output_ids", "output_token_logprobs", "output_top_logprobs"}
+# The bare request of each endpoint; cases keep only the sampling params they change.
+BARE_REQUESTS = {
+    "completions": {"prompt": "x"},
+    "chat": {"messages": [{"role": "user", "content": "x"}]},
 }
 
 
@@ -90,6 +109,45 @@ def trim_meta(output):
     return output
 
 
+def frame_delta(prev, frame):
+    """`frame` as stored: `index`, what it appends to `GROWING` and the keys that changed."""
+    delta = {}
+    for key, value in frame.items():
+        if key in GROWING:
+            delta[key] = value[len(prev[key]) :]
+        elif key == "meta_info":
+            delta[key] = frame_delta(prev[key], value)
+        elif key == "index" or prev.get(key) != value:
+            delta[key] = value
+    assert frame_merge(prev, delta) == frame
+    return delta
+
+
+def frame_merge(prev, delta):
+    frame = dict(prev)
+    for key, value in delta.items():
+        if key in GROWING:
+            frame[key] = prev[key] + value
+        elif key == "meta_info":
+            frame[key] = frame_merge(prev[key], value)
+        else:
+            frame[key] = value
+    return frame
+
+
+def stream_frames(frames, store):
+    """Each choice's stream frames as stored (`store`) or as the engine sent them."""
+    last, out = {}, []
+    for frame in frames:
+        prev = last.get(frame.get("index"))
+        if prev is not None and "meta_info" in frame:
+            out.append(frame_delta(prev, frame) if store else frame_merge(prev, frame))
+        else:
+            out.append(frame)
+        last[frame.get("index")] = frame if store else out[-1]
+    return out
+
+
 def record_frames(engine_url, body):
     response = requests.post(
         f"{engine_url}/generate", json=body, stream=body.get("stream")
@@ -100,7 +158,7 @@ def record_frames(engine_url, body):
     for line in response.iter_lines(decode_unicode=True):
         if line.startswith("data: ") and line != "data: [DONE]":
             frames.append(json.loads(line[len("data: ") :]))
-    return {"status": 200, "frames": frames}
+    return {"status": 200, "frames": stream_frames(frames, store=True)}
 
 
 def replay(output):
@@ -120,7 +178,7 @@ def replay(output):
                 raise ValueError(body["error"]["message"])
             yield internal(json.loads(json.dumps(body)))
             return
-        for frame in json.loads(json.dumps(output["frames"])):
+        for frame in json.loads(json.dumps(stream_frames(output["frames"], False))):
             if "error" in frame:
                 raise ValueError(frame["error"]["message"])
             yield internal(frame)
@@ -128,30 +186,48 @@ def replay(output):
     return generate_request
 
 
+def event_json(event):
+    data = event.removeprefix("data: ").strip()
+    return data if data == "[DONE]" else json.loads(data)
+
+
 async def openai_response(handler, request, raw_request):
     response = await handler.handle_request(request, raw_request)
     if isinstance(response, StreamingResponse):
         events = [chunk async for chunk in response.body_iterator]
-        return {"events": events}
+        return {"events": [event_json(event) for event in events]}
     if isinstance(response, Response):
         return {"status": response.status_code, "body": json.loads(response.body)}
     return {"status": 200, "body": jsonable_encoder(response)}
 
 
-def lower(case, settings, tokenizer):
-    """Python's handler for `case`, its parsed request and the `GenerateReqInput` it builds."""
+def lower(case, settings, model):
+    """Python's handler for `case`, its raw request and the `GenerateReqInput` it builds."""
     request_type, handler_type = HANDLERS[case["endpoint"]]
     reset_context()
-    server_args = ServerArgs(model_path="dummy", **settings)
+    server_args = ServerArgs(model_path=model.path, **settings)
     publish(server_args, role="tokenizer")
     tokenizer_manager = SimpleNamespace(
-        tokenizer=tokenizer,
+        tokenizer=model.tokenizer,
         server_args=server_args,
+        model_path=model.path,
+        model_config=SimpleNamespace(
+            hf_config=model.hf_config,
+            is_multimodal=False,
+            get_default_sampling_params=lambda: model.sampling_defaults,
+        ),
+        config_value=lambda name: getattr(server_args, name),
         request_logger=SimpleNamespace(log_requests=False),
         create_abort_task=lambda obj: None,
     )
+    # A checkpoint without a Jinja template, as DeepSeek-V4's.
     template_manager = SimpleNamespace(
-        completion_template_name=settings.get("completion_template")
+        completion_template_name=settings.get("completion_template"),
+        chat_template_name=None,
+        jinja_template_content_format="string",
+        jinja_template_may_reorder_tool_results=False,
+        reasoning_config=None,
+        force_reasoning=False,
     )
     handler = handler_type(tokenizer_manager, template_manager)
     raw_request = Request(
@@ -163,13 +239,15 @@ def lower(case, settings, tokenizer):
             ],
         }
     )
-    request = request_type(**case["request"])
+    request = request_type(**copy.deepcopy(case["request"]))
+    if handler._validate_request(request):
+        raise ValueError(f"{case['name']}: SGLang rejects this request")
     obj, _ = handler._convert_to_internal_request(request, raw_request)
-    return handler, request, raw_request, obj
+    return handler, raw_request, obj
 
 
-def run_case(case, settings, tokenizer, engine_url, defaults, sampling_defaults):
-    handler, request, raw_request, obj = lower(case, settings, tokenizer)
+def run_case(case, settings, model, engine_url, defaults, sampling_defaults):
+    handler, raw_request, obj = lower(case, settings, model)
     body = generate_body(obj, defaults)
     recorded = {"generate": without_sampling_defaults(body, sampling_defaults)}
     if case.get("lower_only"):
@@ -179,60 +257,68 @@ def run_case(case, settings, tokenizer, engine_url, defaults, sampling_defaults)
         case["engine"] = record_frames(engine_url, body)
     recorded["engine"] = trim_meta(case["engine"])
     handler.tokenizer_manager.generate_request = replay(case["engine"])
+    request_type, _ = HANDLERS[case["endpoint"]]
+    request = request_type(**copy.deepcopy(case["request"]))
     recorded["openai"] = asyncio.run(openai_response(handler, request, raw_request))
     return recorded
 
 
-def generate(path, tokenizer, engine_url):
+def load_model(path):
+    config = json.loads(Path(path, "config.json").read_text())
+    generation_file = Path(path, "generation_config.json")
+    generation = (
+        json.loads(generation_file.read_text()) if generation_file.exists() else {}
+    )
+    keys = ("repetition_penalty", "temperature", "top_k", "top_p", "min_p")
+    return SimpleNamespace(
+        path=path,
+        tokenizer=get_tokenizer(path, trust_remote_code=True),
+        hf_config=SimpleNamespace(**config, to_dict=lambda: config),
+        text_config=SimpleNamespace(**config.get("text_config", config)),
+        sampling_defaults={
+            k: generation[k] for k in keys if generation.get(k) is not None
+        },
+    )
+
+
+def generate(path, model, engine_url):
     fixture = json.loads(path.read_text())
+    # The model facts the host reads, so the test runs without the checkpoint.
+    fixture["chat_model"] = {
+        "context_length": get_context_length(model.text_config),
+        "generation_config": model.sampling_defaults,
+    }
     defaults = generate_defaults()
     fixture["generate_defaults"] = {
         name: value for name, value in defaults.items() if name not in SKIPPED_FIELDS
     }
     settings = fixture.get("settings", {})
-    # A bare request's sampling params; each case keeps only the ones it changes.
-    bare = {"endpoint": "completions", "request": {"prompt": "x"}}
-    sampling_defaults = lower(bare, settings, tokenizer)[3].sampling_params
-    fixture["sampling_defaults"] = sampling_defaults
+    fixture["sampling_defaults"] = {
+        endpoint: lower({"endpoint": endpoint, "request": bare}, settings, model)[
+            2
+        ].sampling_params
+        for endpoint, bare in BARE_REQUESTS.items()
+    }
     for case in fixture["cases"]:
         if case.get("unsupported"):
             continue
+        sampling_defaults = fixture["sampling_defaults"][case["endpoint"]]
         case.update(
-            run_case(case, settings, tokenizer, engine_url, defaults, sampling_defaults)
+            run_case(case, settings, model, engine_url, defaults, sampling_defaults)
         )
         print(f"{path.name}: {case['name']}", file=sys.stderr)
     path.write_text(dump(fixture))
 
 
-def dump(fixture):
-    return compact(fixture, 0) + "\n"
-
-
-def compact(value, indent):
-    """JSON indented by two, with each value that fits in 100 columns on one line."""
-    flat = json.dumps(value, ensure_ascii=False)
-    if not isinstance(value, (dict, list)) or not value or indent + len(flat) <= 100:
-        return flat
-    pad = " " * (indent + 2)
-    if isinstance(value, dict):
-        items = [
-            f"{pad}{json.dumps(k, ensure_ascii=False)}: {compact(v, indent + 2)}"
-            for k, v in value.items()
-        ]
-        return "{\n" + ",\n".join(items) + "\n" + " " * indent + "}"
-    items = [pad + compact(v, indent + 2) for v in value]
-    return "[\n" + ",\n".join(items) + "\n" + " " * indent + "]"
-
-
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--tokenizer", required=True)
+    parser.add_argument("--model", required=True)
     parser.add_argument("--engine-url")
     parser.add_argument("fixtures", nargs="*", type=Path)
     args = parser.parse_args()
-    tokenizer = get_tokenizer(args.tokenizer, trust_remote_code=True)
+    model = load_model(args.model)
     for path in args.fixtures or sorted(FIXTURES.glob("*.json")):
-        generate(path, tokenizer, args.engine_url)
+        generate(path, model, args.engine_url)
 
 
 if __name__ == "__main__":
