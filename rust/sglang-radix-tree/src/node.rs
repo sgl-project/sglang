@@ -112,6 +112,12 @@ impl KeyNamespace {
             .as_ref()
             .and_then(|namespace| namespace.cache_salt.clone())
     }
+
+    pub fn extra_key_arc(&self) -> Option<Arc<str>> {
+        self.0
+            .as_ref()
+            .and_then(|namespace| namespace.extra_key.clone())
+    }
 }
 
 impl PartialEq for KeyNamespace {
