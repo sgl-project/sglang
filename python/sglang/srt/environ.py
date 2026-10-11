@@ -1733,6 +1733,11 @@ class Envs:
     # DeepSeek-V4.1 ratio-1/2 index layers: the DeepGEMM fp4 logits kernels store bf16 instead
     # of fp32 (the reference ranks bf16 scores); every consumer of those logits must take bf16.
     SGLANG_OPT_DSV41_BF16_INDEX_LOGITS = EnvBool(False)
+    # Score the torch prefill indexer with one Triton kernel instead of the
+    # einsum/relu/weight/sum chain; False, or SGLANG_DSV41_TORCH_PREFILL_INDEXER,
+    # restores the torch scoring. Opt in until the SM90 PDMux GPU regression
+    # has passed; unsupported devices/dtypes keep the existing scorer.
+    SGLANG_OPT_USE_FUSED_DSV41_INDEXER_SCORES = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
     # gfx950 DeepSeek-V4.1 prefill: attend with aiter's OPUS sparse kernel over a bf16
