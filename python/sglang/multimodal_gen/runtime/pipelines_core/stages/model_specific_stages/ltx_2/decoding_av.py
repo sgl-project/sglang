@@ -1,6 +1,10 @@
 import torch
 
-from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.distributed import (
+    get_local_torch_device,
+    get_replica_group,
+    model_parallel_is_initialized,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
@@ -159,7 +163,15 @@ class LTX2AVDecodingStage(DecodingStage):
             video = decode_output
         else:
             video = decode_output.sample
-        video = self.video_processor.postprocess_video(video, output_type="np")
+        # Only the replica's rank 0 returns frames. The host-side numpy copy on
+        # other ranks is discarded and delays their next request broadcast.
+        if (
+            not model_parallel_is_initialized()
+            or get_replica_group().rank_in_group == 0
+        ):
+            video = self.video_processor.postprocess_video(video, output_type="np")
+        else:
+            video = None
 
         output_batch = OutputBatch(
             output=video,
