@@ -114,6 +114,9 @@ if TYPE_CHECKING:
     # default; set 0 to skip the plan and return the full decoded native
     # bucket untouched.
     SGLANG_HI3_OUTPUT_CROP: bool = True
+    # Qwen-Image: TP layout of the text-stream FFN. auto replicates it at
+    # tp<=2 on >=48 GiB devices; 1/0 force replicated/sharded.
+    SGLANG_QWEN_IMAGE_REPLICATE_TXT_MLP: str = "auto"
     SGLANG_CACHE_DIT_SECONDARY_DMD: bool = False
     SGLANG_CACHE_DIT_SECONDARY_DMD_HISTORY: int = 6
     SGLANG_CACHE_DIT_SECONDARY_DMD_RANK: int = 0
@@ -478,6 +481,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # HunyuanImage-3: post-decode output geometry (native crop/pad plus
     # exact-size resample). On by default; 0 returns the raw native bucket.
     "SGLANG_HI3_OUTPUT_CROP": _lazy_bool("SGLANG_HI3_OUTPUT_CROP", "true"),
+    # Qwen-Image: TP layout of the text-stream FFN. auto replicates it at
+    # tp<=2 on devices with >=48 GiB; 1/0 force replicated/sharded.
+    "SGLANG_QWEN_IMAGE_REPLICATE_TXT_MLP": _lazy_str(
+        "SGLANG_QWEN_IMAGE_REPLICATE_TXT_MLP", "auto"
+    ),
     # model loading
     "SGLANG_USE_RUNAI_MODEL_STREAMER": _lazy_bool(
         "SGLANG_USE_RUNAI_MODEL_STREAMER", "true"
