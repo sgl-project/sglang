@@ -494,7 +494,10 @@ class CommonKVManager(BaseKVManager):
         )
 
     def prepare_dcp_token_item_lens(
-        self, dst_page_item_lens: List[Optional[int]], dst_dcp_size: int
+        self,
+        dst_page_item_lens: List[Optional[int]],
+        dst_dcp_size: int,
+        draft_rows_collapsed: bool = False,
     ) -> List[int]:
         page_size = self.kv_args.page_size
         num_draft = self.kv_args.num_draft_entries
@@ -511,8 +514,9 @@ class CommonKVManager(BaseKVManager):
         for i, dst_item_len in enumerate(dst_page_item_lens):
             if dst_item_len is None:
                 continue
+            is_draft_entry = i >= num_entries - num_draft
             dst_page_scale = page_size * (
-                dst_dcp_size if i >= num_entries - num_draft else 1
+                dst_dcp_size if is_draft_entry and not draft_rows_collapsed else 1
             )
             if dst_item_len // dst_page_scale != src_token_lens[i]:
                 raise RuntimeError(

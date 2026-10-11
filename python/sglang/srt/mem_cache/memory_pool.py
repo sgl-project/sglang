@@ -1998,6 +1998,9 @@ class KvBufferDesc:
 class KVCache(abc.ABC):
     layer_shard_enabled: bool = False
     post_capture_active: bool = False
+    # Under DCP, rows are owner rows (loc // dcp_size) rather than raw widened
+    # locs; PD transfer must then map a draft like the target.
+    rows_are_dcp_collapsed: bool = False
     # Whether get_cpu_copy/load_cpu_copy carry the recurrent state. False when the
     # state lives on the request pool instead, and the caller has to move it.
     cpu_copy_carries_mamba: bool = False
@@ -4742,6 +4745,11 @@ class MLATokenToKVPool(KVCache):
     # False: this pool takes a WIDENED loc. The unified pool resolves it in
     # the plan's write translation (`translate_write_loc`) and flips this.
     write_loc_is_dcp_resolved = False
+
+    @property
+    def rows_are_dcp_collapsed(self) -> bool:
+        # Either the plan resolved the owner rule or the sharded kernel does.
+        return get_parallel().dcp_enabled
 
     @property
     def _write_loc_dcp_span(self) -> int:

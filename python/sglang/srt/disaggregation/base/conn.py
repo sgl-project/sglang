@@ -86,6 +86,9 @@ class KVArgs:
     kv_head_num: int
     total_kv_head_num: int
     page_size: int
+    # Decode side: its draft pool stores DCP owner rows, so PD transfer maps
+    # the draft like the target instead of raw widened rows.
+    draft_rows_dcp_collapsed: bool = False
     # for system dp
     system_dp_rank: int
     # Local Rust /route registry port; None on scheduler ranks without a listener.
