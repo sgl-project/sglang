@@ -251,6 +251,16 @@ def _get_or_init_flashinfer_megamoe_layer_state(layer: FusedMoE) -> Any:
     return layer._flashinfer_megamoe_layer
 
 
+def _in_kernel_fc2_reduce_kwargs(config_cls: type) -> dict:
+    # FlashInfer 0.7.1 renamed the megakernel field to enable_in_kernel_fc2_reduce.
+    name = (
+        "enable_in_kernel_fc2_reduce"
+        if "enable_in_kernel_fc2_reduce" in config_cls.__dataclass_fields__
+        else "in_kernel_fc2_reduce"
+    )
+    return {name: envs.SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE.get()}
+
+
 def _ensure_flashinfer_megamoe_layer(
     layer: FusedMoE,
     *,
@@ -360,7 +370,7 @@ def ensure_nvfp4_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
             top_k=layer.top_k,
             gate_up_clamp=layer.moe_runner_config.swiglu_limit,
             apply_topk_in_fc1=True,
-            in_kernel_fc2_reduce=envs.SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE.get(),
+            **_in_kernel_fc2_reduce_kwargs(Nvfp4CutedslMegaMoeConfig),
             combine_dtype=resolve_flashinfer_megamoe_combine_dtype(),
             input_norm_const=input_norm_const,
             fc1_alpha=layer.g1_alphas,
@@ -386,7 +396,7 @@ def ensure_mxfp8_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
             top_k=layer.top_k,
             kind="mxfp8_e4m3",
             gate_up_clamp=layer.moe_runner_config.swiglu_limit,
-            in_kernel_fc2_reduce=envs.SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE.get(),
+            **_in_kernel_fc2_reduce_kwargs(Mxfp8CutedslMegaMoeConfig),
         ),
         w13_scale=layer.w13_weight_scale_inv,
         w2_scale=layer.w2_weight_scale_inv,
@@ -566,6 +576,7 @@ def _ensure_shared_workspace(mega: Any) -> None:
         getattr(kc, "apply_topk_in_fc1", None),
         getattr(kc, "kind", None),
         getattr(kc, "in_kernel_fc2_reduce", None),
+        getattr(kc, "enable_in_kernel_fc2_reduce", None),
         getattr(kc, "combine_dtype", None),
         getattr(kc, "token_back_by_dispatch", None),
         getattr(kc, "fast_math", None),
