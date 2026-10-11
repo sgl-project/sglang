@@ -3289,6 +3289,27 @@ class DeepseekV4DecoderLayer(nn.Module):
             and mhc.can_fuse_post(self.hc_cfg)
         )
 
+    @functools.cached_property
+    def _can_overlap_attn_stats(self) -> bool:
+        """The static half of the wide-prefill stats overlap for attention: wo_b
+        can leave its TP all-reduce to the post. `mhc.use_prefill_stats_overlap`
+        is the per-forward half."""
+        return (
+            self.hc_stats_stream is not None
+            and get_parallel().tp_size == self.self_attn.attn_tp_size == 4
+            and self.self_attn.wo_b.reduce_results
+        )
+
+    @functools.cached_property
+    def _can_overlap_ffn_stats(self) -> bool:
+        """The MoE counterpart of `_can_overlap_attn_stats`."""
+        return (
+            self.hc_stats_stream is not None
+            and self.mlp.tp_size == 4
+            and get_moe_a2a_backend().is_none()
+            and self.mlp.reduce_results
+        )
+
     def forward_hc_pre_from_prev(
         self,
         positions: torch.Tensor,
@@ -3302,6 +3323,11 @@ class DeepseekV4DecoderLayer(nn.Module):
         pre-mix. ``seam_open`` is False when the late-layer tail narrows the rows after
         this layer, so nothing precomputed for the next one would still describe it."""
         self._init_boundaries()
+        # Wide prefill forks the stats stream at each sublayer's TP all-reduce
+        # instead of before its combine.
+        wide_prefill = mhc.use_prefill_stats_overlap(
+            self.hc_cfg, forward_batch, state.residual
+        )
         stats_stream = None
         if mhc.use_stats_stream(self.hc_cfg, forward_batch, state.residual):
             stats_stream = self.hc_stats_stream
@@ -3318,19 +3344,26 @@ class DeepseekV4DecoderLayer(nn.Module):
             fuse_all_reduce_mhc = self._can_fuse_attn_mhc and can_fuse_all_reduce(
                 x.shape[0], self.hc_cfg.hidden
             )
+            all_reduce_stats_stream = (
+                self.hc_stats_stream
+                if wide_prefill and self._can_overlap_attn_stats
+                else None
+            )
             with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
                 y = self.self_attn(
                     x=x,
                     positions=positions,
                     forward_batch=forward_batch,
                     x_quant=quantized[0] if quantized else None,
-                    defer_all_reduce=fuse_all_reduce_mhc,
+                    defer_all_reduce=fuse_all_reduce_mhc
+                    or all_reduce_stats_stream is not None,
                 )
             del x
             return mhc.run_attn_post(
                 self.attn_hc,
                 y,
                 residual,
+                all_reduce_stats_stream=all_reduce_stats_stream,
                 stats_stream=stats_stream,
                 next=self.local_boundary,
                 world_size=world_size,
@@ -3347,18 +3380,25 @@ class DeepseekV4DecoderLayer(nn.Module):
             fuse_all_reduce_mhc = self._can_fuse_ffn_mhc and can_fuse_all_reduce(
                 x.shape[0], self.hc_cfg.hidden
             )
+            all_reduce_stats_stream = (
+                self.hc_stats_stream
+                if wide_prefill and self._can_overlap_ffn_stats
+                else None
+            )
             y = self._run_moe_ffn_dp_sync(
                 x,
                 forward_batch,
                 input_ids=input_ids,
                 input_ids_global=input_ids_global,
-                return_moe_output=fuse_all_reduce_mhc,
+                return_moe_output=fuse_all_reduce_mhc
+                or all_reduce_stats_stream is not None,
             )
             del x
             return mhc.run_moe_post(
                 self.ffn_hc,
                 y,
                 residual,
+                all_reduce_stats_stream=all_reduce_stats_stream,
                 stats_stream=stats_stream,
                 next=nxt,
                 world_size=self.mlp.tp_size,

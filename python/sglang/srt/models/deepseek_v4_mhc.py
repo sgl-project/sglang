@@ -36,7 +36,7 @@ from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.runner import compile_in_capture_mode
 from sglang.srt.models.deepseek_v2 import MoEOutput, _is_hip, _is_npu, _is_xpu
-from sglang.srt.runtime_context import get_parallel, get_platform
+from sglang.srt.runtime_context import get_forward, get_parallel, get_platform
 from sglang.srt.utils import is_gfx95_supported
 
 _is_gfx95_supported = is_gfx95_supported()
@@ -97,7 +97,7 @@ HcPreOutput: TypeAlias = Union[HcNormed, HcQuantized]
 
 
 class AttnOutput(NamedTuple):
-    """Attention's wo_b rows with the TP reduction left to the fused post."""
+    """Attention's wo_b rows with the TP reduction left to the post."""
 
     partial: torch.Tensor
 
@@ -210,6 +210,29 @@ def make_boundary(norm: RMSNorm, *, accepts_mxfp8: bool) -> HcNextBoundary:
 # ---------------------------------------------------------------------------
 # Step 1 -- the mix GEMM and the triplet it splits into
 # ---------------------------------------------------------------------------
+
+
+def use_prefill_stats_overlap(
+    cfg: HcConfig, forward_batch: ForwardBatch, x: torch.Tensor
+) -> bool:
+    """Wide target prefill runs each triplet on the stats stream beside its
+    sublayer's TP all-reduce. The posts fork the stream right before that
+    collective rather than before the combine, so the mix GEMM and Sinkhorn
+    overlap the reduction instead of competing with the sublayer itself."""
+    if not (
+        cfg.pre_from_prev
+        and not cfg.cp_prefill
+        and x.is_cuda
+        and 4096 <= x.shape[0] <= 65536
+        and forward_batch.forward_mode.is_extend_without_speculative()
+        and get_platform().is_blackwell
+        and get_parallel().attn_dp_size == 1
+        and not get_forward().sp_active
+    ):
+        return False
+    from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+
+    return not is_batch_invariant_mode_enabled()
 
 
 def use_stats_stream(cfg: HcConfig, forward_batch: ForwardBatch, x: torch.Tensor):
@@ -559,6 +582,22 @@ def _compute_triplet(
     return coefficients
 
 
+def _reduce_beside_triplet(
+    hc: HcSubLayer,
+    residual: torch.Tensor,
+    stats_stream: torch.cuda.Stream,
+    all_reduce: Callable[[], torch.Tensor],
+) -> Tuple[torch.Tensor, HcTriplet]:
+    """Fork the stats stream right before the sublayer's TP all-reduce, issue the
+    triplet on it, run the collective on the main stream, and join before the
+    post reads either."""
+    fork_stats_stream(stats_stream)
+    coefficients = mix_stats(hc, residual, stats_stream)
+    y = all_reduce()
+    torch.cuda.current_stream().wait_stream(stats_stream)
+    return y, coefficients
+
+
 def _post_fusion(
     hc: HcSubLayer,
     y: torch.Tensor,
@@ -604,6 +643,7 @@ def run_attn_post(
     out: Union[torch.Tensor, AttnOutput],
     residual: torch.Tensor,
     *,
+    all_reduce_stats_stream: Optional[torch.cuda.Stream] = None,
     stats_stream: Optional[torch.cuda.Stream],
     next: Optional[HcNextBoundary],
     world_size: int,
@@ -611,6 +651,17 @@ def run_attn_post(
     """The attention post. An `AttnOutput` rides the collective kernel (which also
     folds ``next``'s norm); the attention may decline the handover even when asked,
     so the type is the ground truth."""
+    if all_reduce_stats_stream is not None and isinstance(out, AttnOutput):
+        # Wide prefill: the layer left the stats stream unforked at the combine;
+        # fork it here so the triplet runs beside the plain all-reduce.
+        from sglang.srt.layers.dp_attention import attn_tp_all_reduce
+
+        assert stats_stream is None
+        partial = out.partial
+        y, coefficients = _reduce_beside_triplet(
+            hc, residual, all_reduce_stats_stream, lambda: attn_tp_all_reduce(partial)
+        )
+        return _post_fusion(hc, y, residual, coefficients, next)
     if isinstance(out, AttnOutput):
         from sglang.kernels.ops.communication.all_reduce_mhc import (
             all_reduce_mhc_post_combine_norm,
@@ -638,6 +689,7 @@ def run_moe_post(
     out: Union[torch.Tensor, MoEOutput],
     residual: torch.Tensor,
     *,
+    all_reduce_stats_stream: Optional[torch.cuda.Stream] = None,
     stats_stream: Optional[torch.cuda.Stream],
     next: Optional[HcNextBoundary],
     world_size: int,
@@ -646,6 +698,29 @@ def run_moe_post(
     collective kernel (finalize + shared add + all-reduce, quantizing ``next``'s
     input when a boundary is given); anything else is finalized here and takes
     the plain post."""
+    if all_reduce_stats_stream is not None and isinstance(out, MoEOutput):
+        # Wide prefill, as in `run_attn_post`: merge the pieces, then run the
+        # triplet beside their all-reduce.
+        from sglang.srt.layers.moe import post_experts_all_reduce
+        from sglang.srt.layers.moe.utils import should_add_replicated_moe_output
+
+        assert stats_stream is None
+        pieces = out
+        merged = pieces.get_merged()
+        y, coefficients = _reduce_beside_triplet(
+            hc,
+            residual,
+            all_reduce_stats_stream,
+            lambda: post_experts_all_reduce(merged),
+        )
+        # As below: a replicated shared expert joins after the reduction.
+        if (
+            pieces.shared is not None
+            and pieces.shared_is_replicated
+            and should_add_replicated_moe_output()
+        ):
+            y += pieces.shared
+        return _post_fusion(hc, y, residual, coefficients, next)
     from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
         can_fuse_all_reduce,
     )
