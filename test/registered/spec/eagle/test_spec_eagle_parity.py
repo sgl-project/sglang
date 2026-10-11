@@ -36,7 +36,6 @@ class TestEagle3ParityCUDA(SpecParityKit, _Eagle3ParityBase):
     """
 
     disable_overlap = False
-    # Deterministic FlashInfer prefill requires chunks of at least one split tile.
     chunked_prefill_size = 4096
 
 
