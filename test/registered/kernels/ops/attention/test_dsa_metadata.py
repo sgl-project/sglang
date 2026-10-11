@@ -3,6 +3,7 @@ import unittest
 import torch
 
 from sglang.kernels.ops.attention.dsa_metadata import (
+    _fused_dsa_decode_metadata_kernel,
     fused_dsa_decode_metadata,
     fused_dsa_draft_extend_metadata,
     fused_dsa_target_verify_metadata,
@@ -498,6 +499,24 @@ class TestDSAMetadataKernels(CustomTestCase):
             max_total_len=4,
             static_extend_len=True,
         )
+
+    def test_decode_does_not_recompile_for_each_batch_size(self):
+        # The kernel runs outside CUDA graphs on every decode step, and the batch
+        # size changes whenever a request joins or finishes. Batch sizes with the
+        # same BLOCK_BS must reuse one compiled kernel.
+        kernel_cache = _fused_dsa_decode_metadata_kernel.device_caches[
+            self.device.index or 0
+        ][0]
+        for bs in (5, 6, 7):
+            self._check_decode(
+                list(range(9, 9 + bs)),
+                max_len=97,
+                dsa_index_topk=64,
+                physical_page_size=1,
+            )
+            if bs == 5:
+                compiled_after_first = len(kernel_cache)
+        self.assertEqual(len(kernel_cache), compiled_after_first)
 
     def test_large_batch_coverage(self):
         bs = 16 * 1024
