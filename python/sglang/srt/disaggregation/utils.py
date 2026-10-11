@@ -302,6 +302,7 @@ def poll_and_all_reduce_with_staging(
     staging_handler,
     gloo_group: dist.ProcessGroup,
     metadata_buffers: Optional[MetadataBuffers] = None,
+    pollers=None,
 ):
     """Staging-aware polling: advance scatter, demote incomplete transfers, all_reduce."""
     for decode_req in decode_reqs:
@@ -311,8 +312,9 @@ def poll_and_all_reduce_with_staging(
             staging_handler.advance_scatter(decode_req)
 
     # allow test injection of failure probability at runtime
-    receivers = [dr.kv_receiver for dr in decode_reqs]
-    raw_polls = _poll_with_failure_injection(receivers)
+    if pollers is None:
+        pollers = [dr.kv_receiver for dr in decode_reqs]
+    raw_polls = _poll_with_failure_injection(pollers)
     for i, decode_req in enumerate(decode_reqs):
         if decode_req.kv_receiver.require_staging and staging_handler.is_failed(
             decode_req

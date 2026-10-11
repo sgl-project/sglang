@@ -4105,6 +4105,10 @@ class Scheduler(
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
         if len(can_run_list) == 0:
+            # Preemption already released these requests; requeue them even
+            # though the request they made room for was not admitted.
+            for req in adder.preempt_list:
+                self._add_request_to_queue(req)
             return None, running_batch
 
         can_run_set = set(can_run_list)
@@ -4182,7 +4186,10 @@ class Scheduler(
             running_batch.filter_batch(reqs_to_exclude=finishing_reqs)
             if finishing_reqs:
                 running_batch.batch_is_full = False
-            if not running_batch.is_empty():
+            # The prefill admitted above may leave no KV room for the decode
+            # rows. They then sit out this step and decode on the next decode
+            # step, which fits them; a mixed step does not retract them.
+            if not running_batch.is_empty() and running_batch.check_decode_mem():
                 running_batch.prepare_for_decode()
                 new_batch.mix_with_running(running_batch)
                 new_batch.decoding_reqs = running_batch.reqs
