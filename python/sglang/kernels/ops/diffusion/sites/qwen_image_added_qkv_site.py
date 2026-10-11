@@ -2,7 +2,7 @@
 
 Packing the three BF16 text projections into one GEMM changes the reduction
 association and is therefore not bit-exact.  The packed weights stay resident
-for checkpoint compatibility, but ``quality="lossless"`` applies their three
+for checkpoint compatibility, but ``quality="exact"`` applies their three
 slices independently.  ``quality="high"`` mounts the single-GEMM path.
 """
 
