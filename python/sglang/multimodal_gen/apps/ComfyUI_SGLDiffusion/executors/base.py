@@ -7,6 +7,11 @@ import uuid
 
 import torch
 
+from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.worker_status import (
+    StepLatency,
+    timed_call,
+)
+
 try:
     from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
     from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
@@ -172,6 +177,15 @@ class SGLDiffusionExecutor(torch.nn.Module):
         self._sent_conds: set[str] = set()
         self._cond_key_cache: dict[tuple, str] = {}
 
+    @property
+    def step_latency(self) -> StepLatency:
+        # Created on first use so executors built without __init__ still work.
+        return self.__dict__.setdefault("_step_latency", StepLatency())
+
+    @step_latency.setter
+    def step_latency(self, value: StepLatency) -> None:
+        self.__dict__["_step_latency"] = value
+
     def state_dict(self, *args, **kwargs):
         raise RuntimeError(
             "The SGLD worker owns this diffusion model's weights, so ComfyUI weight "
@@ -209,6 +223,7 @@ class SGLDiffusionExecutor(torch.nn.Module):
         self._run_id += 1
         self._sent_conds = set()
         self._cond_key_cache = {}
+        self.step_latency.begin_run()
 
     def end_sampler_run(self) -> None:
         """Run cache is evicted on the next bind of a newer id for this executor."""
@@ -296,6 +311,12 @@ class SGLDiffusionExecutor(torch.nn.Module):
             "suppress_logs": self.should_suppress_logs(timestep),
         }
 
+    @staticmethod
+    def _timestep_scalar(timestep) -> float:
+        if torch.is_tensor(timestep):
+            return float(timestep.reshape(-1)[0].item())
+        return float(timestep)
+
     def _execute_packed(self, packed, x, timestep):
         if _RUNTIME_IMPORT_ERROR is not None:
             raise RuntimeError(
@@ -305,6 +326,8 @@ class SGLDiffusionExecutor(torch.nn.Module):
         if ensure is not None:
             ensure(self)
         self._mark_and_maybe_drop(packed)
+        # One sync; the float is reused for the log flag and the step key.
+        timestep = self._timestep_scalar(timestep)
         sampling_params = SamplingParams.from_user_sampling_params_args(
             self.model_path,
             server_args=self.generator.server_args,
@@ -325,7 +348,12 @@ class SGLDiffusionExecutor(torch.nn.Module):
         req.generator = [
             torch.Generator("cuda") for _ in range(req.num_outputs_per_prompt)
         ]
-        output_batch = self.generator._send_to_scheduler_and_wait_for_response([req])
+        output_batch = timed_call(
+            self.step_latency,
+            timestep,
+            self.generator._send_to_scheduler_and_wait_for_response,
+            [req],
+        )
         if output_batch.error:
             raise RuntimeError(f"SGLang Diffusion worker failed: {output_batch.error}")
         return self.adapter.unpack(output_batch.noise_pred, packed, x)

@@ -102,6 +102,16 @@ To use these workflows:
 SGLang's optimized kernels and parallelism (TP / SP, compile, cache) run on the
 DiT only. Text encoding and VAE stay in ComfyUI.
 
+## Worker Status Node
+
+`SGLDiffusion Worker Status` (category `SGLDiffusion`) takes the SGLD `MODEL`
+and prints the model, GPUs and VRAM (via NVML, else CUDA, else "unavailable"),
+parallel setup, worker liveness, per-sampler-step latency (mean/p50/p95/last, all DiT calls of a step summed,
+so CFG counts; calls_per_step shown; warmup step reported separately) and a one-line summary to paste into bug reports.
+Run it after the sampler (e.g. on a second queue). For a speedup line, run the
+same workflow with the stock UNETLoader, take 1 / it/s as seconds per sampler step and
+enter it in `native_seconds_per_step`; with 0 no speedup is shown.
+
 ## Architecture
 
 ```mermaid

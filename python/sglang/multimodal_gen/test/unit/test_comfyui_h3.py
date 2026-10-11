@@ -466,6 +466,7 @@ def test_begin_sampler_run_bumps_id_and_clears_sent_conds() -> None:
         session_id = "abc"
         _run_id = 0
         _sent_conds = {("old",)}
+        step_latency = SimpleNamespace(begin_run=lambda: None)
 
         begin_sampler_run = SGLDiffusionExecutor.begin_sampler_run
         comfyui_session_id = SGLDiffusionExecutor.comfyui_session_id
