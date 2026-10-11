@@ -178,6 +178,39 @@ def test_adapter_registration_and_payload() -> None:
         )
 
 
+class _CacheRecordingExecutor(QwenImage21Executor):
+    """Real forward and cond-cache bookkeeping; records the payload sent."""
+
+    def __init__(self):
+        torch.nn.Module.__init__(self)
+        self.adapter = QwenImage21Adapter()
+        self._sent_conds = set()
+        self._cond_key_cache = {}
+        self.sent = []
+
+    def _execute_packed(self, packed, x, timestep):
+        self._mark_and_maybe_drop(packed)
+        self.sent.append(packed.extra_req.get(COND_EXTRA_KEY))
+        return x
+
+
+def test_reference_latents_reach_the_worker_and_key_the_cond_cache() -> None:
+    """Edit workflows pass ref_latents: the executor must forward them, and two
+    conds that differ only in their reference must not share a cached cond."""
+    ex = _CacheRecordingExecutor()
+    x, timestep, context = (
+        torch.zeros(1, 64, 5, 7),
+        torch.tensor([0.5]),
+        torch.ones(1, 9, 32),
+    )
+    ref_a, ref_b = torch.zeros(1, 64, 4, 4), torch.ones(1, 64, 4, 4)
+    for ref in (ref_a, ref_b, ref_a):
+        ex(x, timestep, context, ref_latents=[ref], image_slots=[3])
+    assert torch.equal(ex.sent[0]["ref_latents"][0], ref_a)
+    assert torch.equal(ex.sent[1]["ref_latents"][0], ref_b)
+    assert ex.sent[2] is None  # an identical cond is restored by the worker
+
+
 def test_cfg_parallel_is_rejected() -> None:
     """ComfyUI owns CFG, so a CFG rank would only recompute the same DiT call."""
     with pytest.raises(ValueError, match="does not apply"):

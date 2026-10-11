@@ -30,6 +30,8 @@ def _dit_patches(transformer_options) -> bool:
 class QwenImage21Adapter(ComfyUIModelAdapter):
     model_types = ("qwen_image21",)
     pipeline_class_name = "QwenImage21Pipeline"
+    applied_conditioning = ("ref_latents",)
+    cached_extra_keys = ComfyUIModelAdapter.cached_extra_keys + (COND_EXTRA_KEY,)
 
     def pack(
         self,
@@ -68,10 +70,6 @@ class QwenImage21Adapter(ComfyUIModelAdapter):
         payload = packed.extra_req.get(COND_EXTRA_KEY)
         if payload is not None:
             req.extra = {**(req.extra or {}), COND_EXTRA_KEY: payload}
-
-    def drop_cached_fields(self, packed: PackedForward) -> None:
-        super().drop_cached_fields(packed)
-        packed.extra_req.pop(COND_EXTRA_KEY, None)
 
 
 class QwenImage21Executor(SGLDiffusionExecutor):
