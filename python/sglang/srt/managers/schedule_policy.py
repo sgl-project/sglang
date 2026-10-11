@@ -1410,6 +1410,15 @@ class PrefillAdder:
             ):
                 return AddReqResult.OTHER
 
+            # Reserve sharded scratch before any load-back is queued: a load
+            # must be consumed by this batch, whose prefix gather waits on it.
+            scratch_mark = (self.kv_shard_block_bound_pages, self.kv_shard_chunk_pages)
+            reserved_for = (admission.prefix_len, admission.extend_len)
+            if not self._kv_shard_reserve_scratch(
+                prefix_len=admission.prefix_len, extend_len=admission.extend_len
+            ):
+                return AddReqResult.OTHER
+
             if req.needs_host_load_back():
                 load_max_new = min(max_new, admission.max_new_tokens)
                 # Reclaim can write back device victims and evict host leaves.
@@ -1513,11 +1522,16 @@ class PrefillAdder:
                 if self.tree_cache.load_back_is_cache_owned():
                     req.kv.cache_protected_len = req.prefix_len
 
-            # Sharded pools cannot load host KV; reserve scratch after all other gates.
-            if not self._kv_shard_reserve_scratch(
-                prefix_len=admission.prefix_len, extend_len=admission.extend_len
-            ):
-                return AddReqResult.OTHER
+            if (admission.prefix_len, admission.extend_len) != reserved_for:
+                # No FULL was loaded (sharded trees have no aux components),
+                # so deferring here leaves no H2D without its consumer.
+                self.kv_shard_block_bound_pages, self.kv_shard_chunk_pages = (
+                    scratch_mark
+                )
+                if not self._kv_shard_reserve_scratch(
+                    prefix_len=admission.prefix_len, extend_len=admission.extend_len
+                ):
+                    return AddReqResult.OTHER
 
             self._commit_prefill_admission(req, admission, mamba_gap_reserve)
 

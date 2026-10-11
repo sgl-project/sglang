@@ -51,7 +51,7 @@ from sglang.srt.mem_cache.buffer_mode.storage_existence_cache import (
     StorageExistenceCache,
     default_belief_policy,
 )
-from sglang.srt.mem_cache.common import RetractionBackup
+from sglang.srt.mem_cache.common import RetractionBackup, _evict_until_allocatable
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -1744,7 +1744,12 @@ class UnifiedRadixCache(BasePrefixCache):
         aux_xfers.extend(sidecar_xfers)
         # Defer submission so the next flush can merge pending node backups.
         return self.cache_controller.write(
-            device_value, node_id=node_id, extra_pools=aux_xfers or None, flush=False
+            device_value,
+            node_id=node_id,
+            extra_pools=aux_xfers or None,
+            flush=False,
+            # KV sharding: host slots follow the owners of the device pages.
+            start_class=self.tree_core.rotation_phase_of(node_id),
         )
 
     def _track_write_through_node(
@@ -1888,6 +1893,8 @@ class UnifiedRadixCache(BasePrefixCache):
         if avail < kv_tokens:
             needed = kv_tokens - avail
             self.evict_for_alloc(EvictParams(num_tokens=needed))
+            # No-op unless KV sharding's min-class floor needs more passes.
+            _evict_until_allocatable(self, self.token_to_kv_pool_allocator, kv_tokens)
             if self._component_available_size(ComponentType.FULL) < kv_tokens:
                 self.dec_lock_ref(node_id, ancestor_lock_params)
                 self.dec_host_lock_ref(node_id, host_anchor_params)
