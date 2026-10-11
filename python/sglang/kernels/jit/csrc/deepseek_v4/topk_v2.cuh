@@ -175,8 +175,8 @@ kpool_expand(uint32_t num_pools, uint32_t topk, int32_t* out, const PageTransfor
   for (uint32_t col = threadIdx.x; col < t.out_cols; col += kBlockSize) {
     int32_t value = -1;
     if (col < history) {
-      const auto pool_id = static_cast<uint32_t>(selected(col >> pool_bits));
-      value = t.kpool_token((pool_id << pool_bits) | (col & pool_mask));
+      const int32_t pool_id = selected(col >> pool_bits);
+      if (pool_id >= 0) value = t.kpool_token((static_cast<uint32_t>(pool_id) << pool_bits) | (col & pool_mask));
     } else if (col < tail_end) {
       value = t.kpool_token(tail_base + (col - history));
     }
@@ -189,7 +189,8 @@ SGL_DEVICE void trivial_transform(const TopKProblem& problem, const PageTransfor
   device::PDLWaitPrimary<kPDL>();
   device::PDLTriggerSecondary<kPDL>();
   if constexpr (kMode == TopKMode::KPOOL) {
-    return kpool_expand(problem.seq_len, problem.topk, problem.out, transform, [](uint32_t r) { return r; });
+    return kpool_expand(
+        problem.seq_len, problem.topk, problem.out, transform, [](uint32_t r) { return static_cast<int32_t>(r); });
   }
   for_each_item(problem.topk, [&](uint32_t tx, uint32_t) {
     if constexpr (kMode == TopKMode::INDICES) {
@@ -334,32 +335,34 @@ struct TopKRaggedKpoolParams {
   }
 };
 
-template <bool kPDL>
-TOPK_KERNEL void topk_ragged_kpool_kernel(const __grid_constant__ TopKRaggedKpoolParams params) {
-  device::enable_smem_spilling();
+using RaggedSmem = impl::MaxSmem<Register2::Smem, Register4::Smem, Streaming::Smem>;
+
+// Writes `score` in place: the <= 3 columns ahead of an unaligned window are masked, as in topk_ragged_kernel.
+template <bool kPDL, TopKMode kMode>
+SGL_DEVICE void ragged_select_transform(
+    float* score,
+    const uint32_t row_start,
+    const uint32_t seq_len,
+    const uint32_t topk,
+    int32_t* out,
+    const PageTransform& transform,
+    int32_t* s_topk_indices,
+    RaggedSmem* smem) {
   constexpr uint32_t kVecSize = impl::TopKStreaming::kVecSize;
-  __shared__ impl::MaxSmem<Register2::Smem, Register4::Smem, Streaming::Smem> smem;
-  __shared__ int32_t s_topk_indices[kMaxTopK];
-
-  const auto bx = blockIdx.x;
-  const auto seq_len = static_cast<uint32_t>(params.pool_lens[bx]);
-  const auto row_start = params.row_starts == nullptr ? 0u : static_cast<uint32_t>(params.row_starts[bx]);
-  const auto transform = params.get_transform(bx);
-  const auto out = params.out + bx * params.out_stride;
-  const auto score = params.scores + bx * params.score_stride;
-
   auto problem = TopKProblem{
       .in = score + row_start,
       .out = out,
-      .topk = params.topk,
+      .topk = topk,
       .seq_len = seq_len,
   };
-  if (seq_len <= params.topk) {
-    return trivial_transform<kPDL, TopKMode::KPOOL>(problem, transform);
+  if (seq_len <= topk) {
+    return trivial_transform<kPDL, kMode>(problem, transform);
   }
 
   const auto rem = row_start % kVecSize;
   if (rem != 0) {
+    // The mask has to land after the indexer has retired
+    // Otherwise it may be accidentally overwritten by DG upstream
     device::PDLWaitPrimary<kPDL>();
     static_assert(kVecSize <= kBlockSize, "not enough threads ");
     if (const auto tx = threadIdx.x; tx < rem) {
@@ -368,22 +371,39 @@ TOPK_KERNEL void topk_ragged_kpool_kernel(const __grid_constant__ TopKRaggedKpoo
   }
   using device::topk::broadcast;
   problem.in -= rem;
-  problem.out = s_topk_indices;
+  problem.out = s_topk_indices;  // write into stage buffer in smem first
   problem.seq_len = seq_len + rem;
   problem.bias = broadcast(-static_cast<int32_t>(rem));
   problem.input_start = broadcast(rem);
 
   if (problem.seq_len <= Register2::kMaxSeqLen) {
-    Register2::forward<kPDL>(problem, &smem);
+    Register2::forward<kPDL>(problem, smem);
   } else if (problem.seq_len <= Register4::kMaxSeqLen) {
-    Register4::forward<kPDL>(problem, &smem);
+    Register4::forward<kPDL>(problem, smem);
   } else {
-    Streaming::forward<kPDL>(problem, &smem);
+    Streaming::forward<kPDL>(problem, smem);
   }
   device::PDLTriggerSecondary<kPDL>();
   __syncthreads();
   problem.seq_len = seq_len;
-  paged_transform<TopKMode::KPOOL>(problem, out, transform);
+  paged_transform<kMode>(problem, out, transform);
+}
+
+template <bool kPDL>
+TOPK_KERNEL void topk_ragged_kpool_kernel(const __grid_constant__ TopKRaggedKpoolParams params) {
+  device::enable_smem_spilling();
+  __shared__ RaggedSmem smem;
+  __shared__ int32_t s_topk_indices[kMaxTopK];
+  const auto bx = blockIdx.x;
+  ragged_select_transform<kPDL, TopKMode::KPOOL>(
+      params.scores + bx * params.score_stride,
+      params.row_starts == nullptr ? 0u : static_cast<uint32_t>(params.row_starts[bx]),
+      static_cast<uint32_t>(params.pool_lens[bx]),
+      params.topk,
+      params.out + bx * params.out_stride,
+      params.get_transform(bx),
+      s_topk_indices,
+      &smem);
 }
 
 #ifdef USE_ROCM
@@ -429,57 +449,18 @@ struct TopKPackedParams {
 template <bool kPDL>
 TOPK_KERNEL void topk_packed_kernel(const __grid_constant__ TopKPackedParams params) {
   device::enable_smem_spilling();
-  constexpr uint32_t kVecSize = impl::TopKStreaming::kVecSize;
-  __shared__ impl::MaxSmem<Register2::Smem, Register4::Smem, Streaming::Smem> smem;
+  __shared__ RaggedSmem smem;
   __shared__ int32_t s_topk_indices[kMaxTopK];
-
   const auto bx = blockIdx.x;
-  const auto seq_len = static_cast<uint32_t>(params.seq_lens[bx]);
-  const auto row_start = static_cast<uint32_t>(params.row_starts[bx]);
-  const auto topk = params.topk;
-  const auto transform = params.get_transform(bx);
-  const auto out = params.page_indices + bx * static_cast<int64_t>(topk);
-  const auto score = params.scores + bx * params.score_stride;
-
-  auto problem = TopKProblem{
-      .in = score + row_start,
-      .out = out,
-      .topk = topk,
-      .seq_len = seq_len,
-  };
-  if (seq_len <= topk) {
-    return trivial_transform<kPDL, TopKMode::PAGE_TABLE>(problem, transform);
-  }
-
-  // Round the window down to a `kVecSize` boundary and mask the <= 3 columns
-  // that pulls in, with the same bias / input_start as `topk_ragged_kernel`.
-  const auto rem = row_start % kVecSize;
-  if (rem != 0) {
-    // The mask has to land after the indexer has retired
-    // Otherwise it may be accidentally overwritten by DG upstream
-    device::PDLWaitPrimary<kPDL>();
-    static_assert(kVecSize <= kBlockSize, "not enough threads ");
-    if (const auto tx = threadIdx.x; tx < rem) {
-      score[row_start - rem + tx] = impl::padding_value();
-    }
-  }
-  using device::topk::broadcast;
-  problem.in -= rem;
-  problem.out = s_topk_indices;  // write into stage buffer in smem first
-  problem.seq_len = seq_len + rem;
-  problem.bias = broadcast(-static_cast<int32_t>(rem));
-  problem.input_start = broadcast(rem);
-
-  if (problem.seq_len <= Register2::kMaxSeqLen) {
-    Register2::forward<kPDL>(problem, &smem);
-  } else if (problem.seq_len <= Register4::kMaxSeqLen) {
-    Register4::forward<kPDL>(problem, &smem);
-  } else {
-    Streaming::forward<kPDL>(problem, &smem);
-  }
-  device::PDLTriggerSecondary<kPDL>();
-  __syncthreads();
-  paged_transform<TopKMode::PAGE_TABLE>(problem, out, transform);
+  ragged_select_transform<kPDL, TopKMode::PAGE_TABLE>(
+      params.scores + bx * params.score_stride,
+      static_cast<uint32_t>(params.row_starts[bx]),
+      static_cast<uint32_t>(params.seq_lens[bx]),
+      params.topk,
+      params.page_indices + bx * static_cast<int64_t>(params.topk),
+      params.get_transform(bx),
+      s_topk_indices,
+      &smem);
 }
 #endif  // USE_ROCM
 
@@ -1316,6 +1297,23 @@ struct TopKKernel {
     dispatch([&]<TopKMode kMode>() { launch<kMode>(params, max_seq_len, device); });
   }
 
+  /**
+   * \brief GLM k-pool variant of `transform_paged`: top-k over per-pool scores,
+   * fused with pool expansion, tail append and the output transform.
+   *
+   * Row `b` selects the `topk` best of `scores[b, :pool_lens[b]]`, where
+   * `topk = (out.size(1) - tail_cols) / pool_size` and `tail_cols` is
+   * `pool_size - 1` when `token_seq_lens` is given, else 0. Each selected pool `g`
+   * expands to tokens `g * pool_size + [0, pool_size)`; then the
+   * `token_seq_lens[b] % pool_size` tokens of the open tail pool follow. Tokens
+   * map through `page_table` (page size `page_size`) when given, else get
+   * `out_offsets[b]` added (0 when absent); the rest of the row is `-1`.
+   *
+   * \param scores 16-byte-aligned float32 rows; width and row stride must be multiples of 4.
+   * \param pool_lens NON-NEGATIVE; `metadata` must be `plan` over these values.
+   * \param metadata Read before the PDL wait, so it must be written before the kernel
+   * that produces `scores` is launched, not between that kernel and this one.
+   */
   static void transform_kpool(
       const tvm::ffi::TensorView scores,
       const tvm::ffi::TensorView pool_lens,
@@ -1479,6 +1477,17 @@ struct TopKKernel {
         .launch(topk_ragged_kernel<kUsePDL>, params);
   }
 
+  /**
+   * \brief Ragged (prefill) variant of `transform_kpool`: per-row window, no plan.
+   *
+   * Row `b` selects among `scores[b, ks : ks + pool_lens[b]]` (`ks = row_starts[b]`,
+   * 0 when absent), with the same expansion, tail and output transform as
+   * `transform_kpool`. `page_table_row_index[b]` picks the page-table row when
+   * several score rows share one; without it `page_table` needs one row per score row.
+   *
+   * `scores` is written in place: the <= 3 columns ahead of an unaligned window
+   * are masked, as in `transform_ragged`. The buffer must have no other consumer.
+   */
   static void transform_kpool_ragged(
       const tvm::ffi::TensorView scores,
       const tvm::ffi::TensorView pool_lens,

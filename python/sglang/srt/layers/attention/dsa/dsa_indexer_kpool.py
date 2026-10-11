@@ -31,14 +31,7 @@ from sglang.srt.layers.attention.mqa_logits_utils import (
 )
 from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
-from sglang.srt.utils import (
-    add_prefix,
-    ceil_align,
-    is_cuda,
-    is_hip,
-    is_npu,
-    print_warning_once,
-)
+from sglang.srt.utils import add_prefix, ceil_align, is_cuda, is_hip, is_npu
 
 if is_cuda():
     try:
@@ -85,25 +78,9 @@ def _should_fuse_kpool_topk(metadata: BaseIndexerMetadata) -> bool:
 def _topk_v2_plan_for(
     *, owned_plan: Optional[torch.Tensor], pool_lens: torch.Tensor
 ) -> Optional[torch.Tensor]:
-    from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
-        build_kpool_topk_v2_plan,
-    )
-
     if owned_plan is not None and owned_plan.shape[0] == pool_lens.shape[0] + 1:
         return owned_plan
-    if owned_plan is not None:
-        assert not (
-            capture_mode.is_capture_mode or torch.cuda.is_current_stream_capturing()
-        ), (
-            "k-pool top-k v2: metadata plan covers "
-            f"{owned_plan.shape[0] - 1} rows but the sliced pooled lengths have "
-            f"{pool_lens.shape[0]}; refusing to rebuild it inside a CUDA graph"
-        )
-        print_warning_once(
-            "k-pool top-k v2: metadata plan does not match the sliced pooled "
-            "lengths; rebuilding it per layer."
-        )
-    return build_kpool_topk_v2_plan(pool_lens)
+    return None
 
 
 def _slice_rows(
@@ -1139,19 +1116,11 @@ class IndexerKPool(MultiPlatformOp):
         row_chunks: Tuple[slice, ...],
         out_rows: Optional[int],
     ) -> torch.Tensor:
-        from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
-            kpool_topk_v2_plan_for_rows,
-        )
-
         # Each row's top-k reads only its own logits row, pooled length and
         # page-table row, so row chunks select the same pages as one pass.
         single_chunk = len(row_chunks) == 1
         topk_result = None
         for rows in row_chunks:
-            chunk_row_starts = _slice_rows(tensor=topk_row_starts, rows=rows)
-            chunk_page_table_row_index = _slice_rows(
-                tensor=page_table_row_index, rows=rows
-            )
             if kv_fp8 is None:
                 # No pooled keys yet: every row scores an empty key set.
                 logits = torch.empty(
@@ -1174,13 +1143,6 @@ class IndexerKPool(MultiPlatformOp):
             topk_chunk = self._topk_from_kpool_logits(
                 logits=logits,
                 pool_lens=pool_lens[rows],
-                topk_v2_plan=kpool_topk_v2_plan_for_rows(
-                    logits=logits,
-                    pool_lens=pool_lens[rows],
-                    kpool=self.index_kpool,
-                    row_starts=chunk_row_starts,
-                    page_table_row_index=chunk_page_table_row_index,
-                ),
                 seq_lens=_slice_rows(tensor=seq_lens, rows=rows),
                 # Addressed by request-pool ID through page_table_row_index,
                 # so never sliced; without a row index it is per-query.
@@ -1190,9 +1152,11 @@ class IndexerKPool(MultiPlatformOp):
                     else _slice_rows(tensor=page_table, rows=rows)
                 ),
                 topk_offsets=_slice_rows(tensor=topk_offsets, rows=rows),
-                row_starts=chunk_row_starts,
+                row_starts=_slice_rows(tensor=topk_row_starts, rows=rows),
                 out_rows=out_rows if single_chunk else None,
-                page_table_row_index=chunk_page_table_row_index,
+                page_table_row_index=_slice_rows(
+                    tensor=page_table_row_index, rows=rows
+                ),
             )
             if single_chunk:
                 return topk_chunk

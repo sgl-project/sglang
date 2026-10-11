@@ -605,7 +605,6 @@ def build_kpool_topk_v2_plan(pool_lens: torch.Tensor) -> Optional[torch.Tensor]:
 def refresh_kpool_topk_v2_plan(*, plan: torch.Tensor, pool_lens: torch.Tensor) -> None:
     from sglang.kernels.ops.attention.dsv4.topk import plan_topk_v2
 
-    plan.zero_()
     plan_topk_v2(pool_lens.to(torch.int32), out=plan)
 
 
@@ -634,24 +633,6 @@ def _can_use_kpool_topk_v2(
         and logits.shape[1] % 4 == 0
         and _kpool_topk_v2_layout_ok(logits=logits, pool_size=pool_size)
     )
-
-
-def kpool_topk_v2_plan_for_rows(
-    *,
-    logits: torch.Tensor,
-    pool_lens: torch.Tensor,
-    kpool: int,
-    row_starts: torch.Tensor | None,
-    page_table_row_index: torch.Tensor | None,
-) -> torch.Tensor | None:
-    if not _can_use_kpool_topk_v2(
-        logits=logits,
-        pool_size=kpool,
-        row_starts=row_starts,
-        page_table_row_index=page_table_row_index,
-    ):
-        return None
-    return build_kpool_topk_v2_plan(pool_lens)
 
 
 def _alloc_kpool_topk_out(
@@ -710,16 +691,11 @@ def _kpool_topk_v2(
     topk_offsets: torch.Tensor | None,
     seq_lens: torch.Tensor | None,
     out_rows: int | None,
-    topk_v2_plan: torch.Tensor | None,
+    topk_v2_plan: torch.Tensor,
 ) -> torch.Tensor:
     from sglang.kernels.ops.attention.dsv4.topk import topk_transform_kpool_v2
 
     rows = logits.shape[0]
-    assert topk_v2_plan is not None and topk_v2_plan.shape[0] == rows + 1, (
-        "k-pool top-k v2 needs a plan built from the same pooled lengths, "
-        f"got {None if topk_v2_plan is None else tuple(topk_v2_plan.shape)} "
-        f"for {rows} rows"
-    )
     group_lengths = group_lengths.to(torch.int32)
     out_cols = topk + (pool_size - 1 if seq_lens is not None else 0)
     full = _alloc_kpool_topk_out(
@@ -752,7 +728,7 @@ def _try_kpool_topk_v2(
     out_rows: int | None,
     topk_v2_plan: torch.Tensor | None,
 ) -> torch.Tensor | None:
-    if _can_use_kpool_topk_v2(
+    if topk_v2_plan is not None and _can_use_kpool_topk_v2(
         logits=logits,
         pool_size=kpool,
         row_starts=row_starts,
