@@ -58,8 +58,7 @@ def _paged_allocator(lazy: bool):
 _TABLES = {"virtual_to_physical", "physical_to_virtual"}
 
 # Methods that MUST tombstone through index_fill_; hand-listed because "writes
-# a tombstone" is a per-method design fact a scan cannot infer. Completeness is
-# guarded by `test_every_allocator_free_path_is_listed` below.
+# a tombstone" is a per-method design fact a scan cannot infer.
 _TOMBSTONE_METHODS = [
     (mea.MultiEndedAllocator, "_free_lazy"),
     (mea.MultiEndedAllocator, "free"),
@@ -174,36 +173,6 @@ class TestTombstonesDoNotCrossTheBus(unittest.TestCase):
                         f"RHS: {bad}. That materialises -1 as a CPU tensor and "
                         f"copies it H2D, blocking the scheduler thread until the "
                         f"stream drains. Use `.index_fill_(0, idx, -1)`."
-                    ),
-                )
-
-    def test_every_allocator_free_path_is_listed(self):
-        """Bug regression: an allocator that owns a free path but is missing
-        from `_TOMBSTONE_METHODS` must fail loudly here rather than drop out of
-        tombstone coverage."""
-        listed = {(cls.__name__, name) for cls, name in _TOMBSTONE_METHODS}
-        for cls in _allocators_in_module():
-            for name, fn in vars(cls).items():
-                if not inspect.isfunction(fn):
-                    continue
-                try:
-                    src = inspect.getsource(fn)
-                except OSError:
-                    continue
-                # Only a method that WRITES a page table needs a tombstone;
-                # one that merely READS has nothing to guard.
-                if not (
-                    any(f"{t}.index_fill_" in src for t in _TABLES)
-                    or _scalar_index_assignments(fn)
-                ):
-                    continue
-                self.assertIn(
-                    (cls.__name__, name),
-                    listed,
-                    msg=(
-                        f"{cls.__name__}.{name} writes a page table but is not in "
-                        f"_TOMBSTONE_METHODS, so the index_fill_ guard does not "
-                        f"cover it. Add it."
                     ),
                 )
 

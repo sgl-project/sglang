@@ -21,7 +21,6 @@ from sglang.srt.layers.layer_boundary.output import UnreducedOutput
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layer_boundary.residual.add_norm import PLAIN_ADD
 from sglang.srt.layers.layer_boundary.residual.stream import (
-    DeclaredSum,
     OwedOutput,
     ResidualStream,
 )
@@ -139,7 +138,9 @@ class TestResidualStream(CustomTestCase):
                 update=SimpleNamespace(is_plain_add=False),
             )
 
-    def test_declared_sum_snapshot_and_pipeline_handoff_preserve_the_partial(self):
+    def test_a_declared_sum_s_snapshot_keeps_the_partial_and_its_export_completes_it(
+        self,
+    ):
         stream = ResidualStream(self.residual)
         hidden = stream.record(self.partial, PLAIN_ADD, declared_sum=SumGroup.TP)
         self.assertIsInstance(hidden, OwedOutput)
@@ -148,16 +149,15 @@ class TestResidualStream(CustomTestCase):
             return_value=self.group,
         ):
             snapshot = stream.snapshot(hidden)
-        torch.testing.assert_close(snapshot, torch.full((2, 4), 5.0))
-        torch.testing.assert_close(self.partial, torch.ones(2, 4))
-        wire, residual = stream.export(hidden, preserve_declared=True)
-        self.assertIs(wire, self.partial)
-        self.assertIsInstance(stream.pending.owed, DeclaredSum)
-        received, rebuilt = ResidualStream.from_handoff(
-            wire, residual, PLAIN_ADD, declared_sum=SumGroup.TP
-        )
-        self.assertIsInstance(received, OwedOutput)
-        self.assertIs(rebuilt.pending.owed.group, SumGroup.TP)
+            torch.testing.assert_close(snapshot, torch.full((2, 4), 5.0))
+            torch.testing.assert_close(self.partial, torch.ones(2, 4))
+            # A pipeline handoff sends it complete.
+            wire, residual = stream.export(hidden)
+        torch.testing.assert_close(wire, torch.full((2, 4), 2.0))
+        self.assertIsNone(stream.pending.owed)
+        received, rebuilt = ResidualStream.from_handoff(wire, residual, PLAIN_ADD)
+        self.assertIs(received, wire)
+        self.assertIsNone(rebuilt.pending.owed)
 
     def test_materialized_declared_sum_is_not_reduced_again(self):
         rows = Layout(frozenset())
@@ -250,7 +250,7 @@ class TestResidualStream(CustomTestCase):
         events = []
         outputs = AuxHiddenStateList()
 
-        def prepare(hidden, stream, batch, **kwargs):
+        def prepare(hidden, stream, batch, steps, **kwargs):
             events.append("add_norm")
             self.assertIsNone(stream.pending.owed)
             # A fused read returns both the norm output and its updated residual.
@@ -263,13 +263,15 @@ class TestResidualStream(CustomTestCase):
             outputs.capture(value, owned=owned)
 
         boundary.norm = None
-        stub_stage(boundary, StageKind.ATTENTION)._prepare_input = Mock(
-            side_effect=prepare
-        )
-        stub_stage(boundary, StageKind.ATTENTION).entry = lambda batch: SimpleNamespace(
+        stub_stage(boundary, StageKind.ATTENTION)._prepare = Mock(side_effect=prepare)
+        entry = SimpleNamespace(
             capture_move=None,
             capture_move_allocates=False,
             capture_preserves_residual=None,
+        )
+        stub_stage(boundary, StageKind.ATTENTION)._select = lambda hidden, batch: (
+            hidden,
+            SimpleNamespace(entry=entry),
         )
         output, stream = prepare_attention(
             stub_stage(boundary, StageKind.ATTENTION),
@@ -280,7 +282,7 @@ class TestResidualStream(CustomTestCase):
         )
         self.assertEqual(events, ["add_norm", "capture"])
         self.group.all_reduce.assert_called_once()
-        stub_stage(boundary, StageKind.ATTENTION)._prepare_input.assert_called_once()
+        stub_stage(boundary, StageKind.ATTENTION)._prepare.assert_called_once()
         torch.testing.assert_close(output, torch.full((2, 4), 15.0))
         torch.testing.assert_close(outputs[0], torch.full((2, 4), 5.0))
         stream.residual.zero_()
@@ -291,7 +293,7 @@ class TestResidualStream(CustomTestCase):
         extra = torch.full_like(self.partial, 7.0)
         outputs = AuxHiddenStateList()
 
-        def prepare(hidden, stream, batch, **kwargs):
+        def prepare(hidden, stream, batch, steps, **kwargs):
             self.assertEqual(len(outputs), 1)
             self.assertIs(kwargs["post_residual_addition"], extra)
             updated = hidden + stream.residual + extra
@@ -299,13 +301,15 @@ class TestResidualStream(CustomTestCase):
             return updated * 3, stream
 
         boundary.norm = None
-        stub_stage(boundary, StageKind.ATTENTION)._prepare_input = Mock(
-            side_effect=prepare
-        )
-        stub_stage(boundary, StageKind.ATTENTION).entry = lambda batch: SimpleNamespace(
+        stub_stage(boundary, StageKind.ATTENTION)._prepare = Mock(side_effect=prepare)
+        entry = SimpleNamespace(
             capture_move=None,
             capture_move_allocates=False,
             capture_preserves_residual=None,
+        )
+        stub_stage(boundary, StageKind.ATTENTION)._select = lambda hidden, batch: (
+            hidden,
+            SimpleNamespace(entry=entry),
         )
         output, _ = prepare_attention(
             stub_stage(boundary, StageKind.ATTENTION),

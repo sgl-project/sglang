@@ -516,11 +516,13 @@ class DSV4AttnMetadata:
             raise ValueError(f"invalid {compress_ratio=}")
 
     def init_trtllm_sparse_buffers(self) -> None:
-        """Decode tables of 128 SWA columns then compressed KV, -1 for an invalid
-        index, lens counting all 128 SWA slots; only the c4 tail is per layer."""
+        """Build tile-padded TRT-LLM tables and lengths for indexed attention
+        or SWA-only DSpark blocks; indexed tails are refreshed per layer."""
 
         num_tokens = self.seq_lens_casual.shape[0]
-        assert self.swa_page_indices.shape == (num_tokens, SWA_WINDOW)
+        swa_width = self.swa_page_indices.shape[1]
+        assert self.swa_page_indices.shape[0] == num_tokens
+        assert swa_width >= SWA_WINDOW
 
         # VarSeq reads rows to the 64-token tile boundary. Back every live view
         # with an aligned parent whose extra rows contain inert values.
@@ -536,17 +538,40 @@ class DSV4AttnMetadata:
         if n_pad != num_tokens:
             self.seq_lens_casual = _tile_padded(1, self.seq_lens_casual)
             self.swa_page_indices = _tile_padded(
-                -1, self.swa_page_indices, width=SWA_WINDOW
+                -1, self.swa_page_indices, width=swa_width
             )
-        self.trtllm_swa_lens = _tile_padded(SWA_WINDOW)
-        if self.c4_sparse_page_indices is not None:
-            w4 = self.c4_sparse_page_indices.shape[-1]
+        self.trtllm_swa_lens = _tile_padded(
+            SWA_WINDOW,
+            self.swa_topk_lengths.clamp_min(SWA_WINDOW)
+            if swa_width > SWA_WINDOW
+            else None,
+        )
+        for ratio in self.low_ratios:
+            lengths = self.sparse_topk_lengths(ratio)
+            if lengths is not None:
+                # The FlashMLA metadata clamps empty compressed histories to
+                # one. TRT-LLM needs the true zero length: -1 loads zero KV,
+                # but does not by itself remove its softmax contribution.
+                torch.minimum(lengths, self.seq_lens_casual // ratio, out=lengths)
+        indexed_tables = [
+            table
+            for ratio in (1, 2, 4)
+            if ratio in self.present_ratios
+            if (table := self.sparse_page_indices(ratio)) is not None
+        ]
+        if indexed_tables:
+            assert swa_width == SWA_WINDOW
+            # Ratio 1/2/4 all select index_topk entries. Reuse the per-layer
+            # table; its contents are overwritten before every attention call.
+            w4 = indexed_tables[0].shape[-1]
+            assert all(table.shape[-1] == w4 for table in indexed_tables)
             assert w4 % 4 == 0, f"{w4=}"
-            # Unwritten c4 rows must remain inert until the per-layer fill.
+            # Unwritten indexed rows remain inert until the per-layer fill.
             self.trtllm_c4_indices = _tile_padded(-1, width=SWA_WINDOW + w4)
             self.trtllm_c4_indices[:, :SWA_WINDOW].copy_(self.swa_page_indices)
             self.trtllm_c4_lens = _tile_padded(SWA_WINDOW)
         if self.c128_page_indices is not None:
+            assert swa_width == SWA_WINDOW
             w128 = self.c128_page_indices.shape[-1]
             assert w128 % 4 == 0, f"{w128=}"
             self.trtllm_c128_indices = _tile_padded(-1, width=SWA_WINDOW + w128)
@@ -2111,6 +2136,8 @@ class DeepseekV4AttnBackend(
                 )
                 metadata.core_attn_metadata.swa_page_indices = swa_page_indices
                 metadata.core_attn_metadata.swa_topk_lengths = swa_topk_lengths
+                if self.trtllm_attn:
+                    metadata.core_attn_metadata.init_trtllm_sparse_buffers()
 
     def _dspark_seq_lens_casual(
         self, *, seq_lens: torch.Tensor, block_size: int
@@ -2921,7 +2948,11 @@ class DeepseekV4AttnBackend(
         kv_cache = pool.get_extra_key_buffer(layer_id)
         page_size = pool.get_extra_key_page_size(layer_id)
         # The pool's page format: V4, or the V4.1 fp8 / fp4 layouts.
-        kv_layout = pool.get_extra_key_layout(layer_id)
+        kv_layout = (
+            KVLayout.UNIFORM_FP8
+            if pool.uniform_fp8
+            else pool.get_extra_key_layout(layer_id)
+        )
         assert kv_cache is not None
 
         if layer.compress_ratio == 1:
@@ -3352,7 +3383,10 @@ class DeepseekV4AttnBackend(
         **_,
     ) -> torch.Tensor:
         if self.mtp_enabled and forward_batch.forward_mode.is_idle():
-            return q.new_empty(q.shape[0], q.shape[1], layer.v_head_dim)
+            return q.new_empty(
+                (q.shape[0], q.shape[1], layer.v_head_dim),
+                dtype=torch.bfloat16 if self.trtllm_attn else q.dtype,
+            )
 
         assert k is v, "DeepseekV4 shares k and v"
         swa_k = k
