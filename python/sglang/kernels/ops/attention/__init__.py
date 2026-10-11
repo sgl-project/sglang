@@ -185,6 +185,7 @@ for _mod, _fn in [
     ("dsv4.fp4_indexer", "quantize_fp4_indexer_tensor"),
     ("dsv4.fp4_indexer", "store_fp4_index_k_cache"),
     ("dsv4.fp4_indexer_prefill", "fused_index_scores"),
+    ("dsv4.candidate_bf16_mqa", "candidate_bf16_mqa_logits"),
 ]:
     register_kernel(
         KernelSpec(
@@ -361,7 +362,11 @@ register_kernel(
     )
 )
 
-for _fn in ("fp4_index_logits_paged", "finish_paged_indexer_topk"):
+for _fn in (
+    "fp4_index_logits_paged",
+    "fp4_index_logits_candidates",
+    "finish_paged_indexer_topk",
+):
     register_kernel(
         KernelSpec(
             op=f"attention.{_fn}",
