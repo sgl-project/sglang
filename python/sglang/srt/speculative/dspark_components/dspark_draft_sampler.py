@@ -11,7 +11,7 @@ from sglang.srt.speculative.dspark_components.dspark_draft import (
     select_draft_hidden_without_anchor,
     step_logits_width,
 )
-from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
+from sglang.srt.speculative.spec_tp_sync import SpecTpSync
 
 logger = logging.getLogger(__name__)
 
@@ -112,7 +112,6 @@ class DsparkDraftSampler:
             step_temperatures=self.step_temperatures[:bs],
             noise=self._noise,
             tp_sync=self._tp_sync,
-            site=SpecTpSyncSite.DSPARK_GRAPH_SAMPLE,
             logits_out=self.step_logits[:bs],
         )
         self.out[: draft_tokens.numel()].copy_(draft_tokens.reshape(-1))
