@@ -226,6 +226,27 @@ def ep_joiner_of(cfg: Any) -> bool:
     return cfg.ep_join_mode in ("scale", "recover")
 
 
+def context_parallel_attn_dp_size(cfg: Any, layout: str) -> int:
+    """The attention-DP width a DeepSeek context-parallel layout runs.
+
+    These layouts run data-parallel groups as attention DP, so `--dp-size N`
+    alone still means N attention-DP groups there. That reading is deprecated.
+    """
+    assert not (cfg.attn_dp_size > 1 and cfg.dp_size > 1), (
+        f"--dp-size {cfg.dp_size} with --attn-dp-size {cfg.attn_dp_size}: "
+        "data-parallel replicas combined with attention data parallelism "
+        "are not supported."
+    )
+    if cfg.dp_size > 1:
+        # TODO: reject `--dp-size > 1` here after 2026-12-31.
+        logger.warning(
+            f"--dp-size {cfg.dp_size} under {layout} runs {cfg.dp_size} attention "
+            "data-parallel groups. This is deprecated and will be rejected after "
+            f"2026-12-31; use --attn-dp-size {cfg.dp_size} instead."
+        )
+    return cfg.attn_dp_size * cfg.dp_size
+
+
 def ep_scale_joiner_of(cfg: Any) -> bool:
     """The scale-up arm of :func:`ep_joiner_of`."""
     return cfg.ep_join_mode == "scale"

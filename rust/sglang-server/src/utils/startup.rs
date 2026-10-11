@@ -16,11 +16,28 @@ pub(crate) fn listen_addr(
     server_args: &ServerArgs,
     port_offset: Option<u16>,
 ) -> Result<SocketAddr, String> {
+    listen_addr_for_port(server_args, server_args.port, port_offset)
+}
+
+pub(crate) fn grpc_listen_addr(
+    server_args: &ServerArgs,
+    port_offset: Option<u16>,
+) -> Result<Option<SocketAddr>, String> {
+    server_args
+        .grpc_port
+        .map(|port| listen_addr_for_port(server_args, port, port_offset))
+        .transpose()
+}
+
+fn listen_addr_for_port(
+    server_args: &ServerArgs,
+    base_port: u16,
+    port_offset: Option<u16>,
+) -> Result<SocketAddr, String> {
     let offset = port_offset.unwrap_or_default();
-    let port = server_args
-        .port
+    let port = base_port
         .checked_add(offset)
-        .ok_or_else(|| format!("port {} + offset {offset} exceeds 65535", server_args.port))?;
+        .ok_or_else(|| format!("port {base_port} + offset {offset} exceeds 65535"))?;
     let mut addr: SocketAddr = server_args
         .bind()
         .parse()
@@ -57,5 +74,33 @@ mod tests {
             ..Default::default()
         };
         assert!(listen_addr(&args, Some(1)).unwrap_err().contains("exceeds"));
+    }
+
+    #[test]
+    fn grpc_listen_addr_is_optional_and_uses_the_same_offset() {
+        let mut args = ServerArgs {
+            host: "::".into(),
+            ..Default::default()
+        };
+        assert_eq!(grpc_listen_addr(&args, Some(7)).unwrap(), None);
+
+        args.grpc_port = Some(50_051);
+        assert_eq!(
+            grpc_listen_addr(&args, Some(7)).unwrap(),
+            Some("[::]:50058".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn grpc_listen_addr_rejects_port_overflow() {
+        let args = ServerArgs {
+            grpc_port: Some(u16::MAX),
+            ..Default::default()
+        };
+        assert!(
+            grpc_listen_addr(&args, Some(1))
+                .unwrap_err()
+                .contains("exceeds")
+        );
     }
 }

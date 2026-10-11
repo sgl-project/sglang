@@ -1,6 +1,6 @@
 //! Concrete sampling parameters and shared preprocessing.
 //! Protocol lowering resolves defaults before the Python-compatible
-//! `__post_init__` → `normalize` → `verify` pipeline.
+//! `__post_init__` -> `normalize` -> `verify` pipeline.
 
 use std::collections::BTreeMap;
 

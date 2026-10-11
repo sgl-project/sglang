@@ -67,6 +67,15 @@ class TestTemplateManagerReasoningDetection(CustomTestCase):
         )
         return force, config, parser
 
+    def test_iquest_template_wins_over_generic_think_and_xml_rules(self):
+        template = "<|iquest_assistant|><think><iquest_tool_call><arg_key><arg_value>"
+        force, config, parser = self._detect(template, [])
+        self.assertEqual(parser, "iquest_q1")
+        self.assertEqual(
+            detect_tool_call_parser(template, _DummyTokenizer([]), config, force),
+            "iquest_q1",
+        )
+
     def test_gigachat35_gcml_template_wins_over_generic_think_tags(self):
         """The GCML marker must map both parsers to gigachat35; the template also
         carries <think>, so the rule has to outrank the generic deepseek-r1
