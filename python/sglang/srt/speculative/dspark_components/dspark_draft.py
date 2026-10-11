@@ -6,6 +6,10 @@ from typing import Optional
 import msgspec
 import torch
 
+from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
+    MarkovGreedyStep,
+)
+from sglang.kernels.ops.speculative.dspark.markov_sample import MarkovSampleStep
 from sglang.srt.environ import envs
 from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -126,6 +130,62 @@ class DraftNoise(msgspec.Struct, frozen=True):
     offset: torch.Tensor
 
 
+def step_logits_width(markov_head, base_width: int) -> int:
+    # Kept step logits are gathered whole over a sharded vocab.
+    return base_width if markov_head.vocab_shard is None else markov_head.vocab_size
+
+
+def _draft_step(
+    markov_head,
+    prev_tokens: torch.Tensor,
+    base_logits: torch.Tensor,
+    *,
+    hidden_states: Optional[torch.Tensor],
+    state: Optional[torch.Tensor],
+    temperatures: torch.Tensor,
+    noise: DraftNoise,
+    step: int,
+    logits_out: Optional[torch.Tensor],
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    if logits_out is None and len(prev_tokens) == 1:
+        # One greedy row, no logits kept: one kernel does the GEMV, add and argmax.
+        gemv = markov_head.w2_gemv_inputs(prev_tokens)
+        # The kernel reads one w2 row per base-logit column.
+        if gemv is not None and gemv[1].shape[0] == base_logits.shape[-1]:
+            prev_embeds, w2_weight = gemv
+            tokens = MarkovGreedyStep.execute(
+                base_logits=base_logits, prev_embeds=prev_embeds, w2_weight=w2_weight
+            )
+            return tokens, state
+    bias, state = markov_head.step_bias(
+        prev_tokens, hidden_states=hidden_states, state=state
+    )
+    shard = markov_head.vocab_shard
+    sharded = (
+        {}
+        if shard is None
+        else dict(
+            vocab_start=shard.start,
+            gather=shard.gather.gather_stacked,
+            gather_logits=shard.gather,
+        )
+    )
+    tokens = MarkovSampleStep.execute(
+        base_logits=base_logits,
+        bias=bias,
+        temperatures=temperatures,
+        key=noise.key,
+        offset=noise.offset,
+        step=step,
+        step_dtype=markov_head.step_logits_dtype(base_logits.dtype),
+        logits_out=logits_out,
+        # Rows sample at their temperatures only when the step logits are kept.
+        has_sampled_rows=None if logits_out is not None else False,
+        **sharded,
+    )
+    return tokens, state
+
+
 def draft_markov_block(
     *,
     markov_head,
@@ -143,7 +203,7 @@ def draft_markov_block(
     bs, gamma = base_logits.shape[:2]
     if not greedy_draft and logits_out is None:
         logits_out = torch.empty(
-            (bs, gamma, markov_head.step_logits_width(base_logits.shape[-1])),
+            (bs, gamma, step_logits_width(markov_head, base_logits.shape[-1])),
             dtype=markov_head.step_logits_dtype(base_logits.dtype),
             device=base_logits.device,
         )
@@ -151,14 +211,14 @@ def draft_markov_block(
     prev_tokens = anchor_tokens.long()
     draft_tokens = []
     for step in range(gamma):
-        prev_tokens, state = markov_head.draft_step(
+        prev_tokens, state = _draft_step(
+            markov_head,
             prev_tokens,
             base_logits[:, step],
             hidden_states=None if draft_hidden is None else draft_hidden[:, step],
             state=state,
             temperatures=step_temperatures,
-            noise_key=noise.key,
-            noise_offset=noise.offset,
+            noise=noise,
             step=step,
             logits_out=None if greedy_draft else logits_out[:, step],
         )
