@@ -142,15 +142,26 @@ class MHATokenToKVPoolHost(HostKVCache):
     ):
         self.mtp_draft_device_pools = tuple(mtp_draft_device_pools)
         self.target_layer_num = device_pool.layer_num
+        self.device_pool = device_pool
+        self.dtype = device_pool.store_dtype
+        # Scale-bearing subclasses need page coverage when computing token bytes.
+        self.page_size = page_size
+        device_capacity = getattr(device_pool, "host_capacity_tokens", None)
         super().__init__(
-            device_pool,
-            host_to_device_ratio,
-            host_size,
-            page_size,
-            layout,
-            pin_memory,
-            device,
-            allocator_type,
+            dtype=self.dtype,
+            device_capacity_tokens=(
+                device_pool.size if device_capacity is None else device_capacity
+            ),
+            size_per_token=self.get_size_per_token(),
+            start_layer=device_pool.start_layer,
+            end_layer=device_pool.end_layer,
+            host_to_device_ratio=host_to_device_ratio,
+            host_size=host_size,
+            page_size=page_size,
+            layout=layout,
+            pin_memory=pin_memory,
+            device=device,
+            allocator_type=allocator_type,
             pool_label=pool_label,
         )
         self.element_dim = self.head_num * self.head_dim
