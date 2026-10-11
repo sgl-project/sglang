@@ -94,7 +94,7 @@ class TestPriorityScheduling(CustomTestCase):
                 [
                     {
                         "priority": 1,
-                        "sampling_params": {"max_new_tokens": 10000},
+                        "sampling_params": {"max_new_tokens": 1000, "ignore_eos": True},
                     },  # starts being processed first and holds the running queue capacity
                     {"priority": 2},  # aborted by request 5
                     {"priority": 3},  # aborted by request 6
@@ -131,7 +131,7 @@ class TestPriorityScheduling(CustomTestCase):
                 [
                     {
                         "priority": 7,
-                        "sampling_params": {"max_new_tokens": 10000},
+                        "sampling_params": {"max_new_tokens": 1000, "ignore_eos": True},
                     },  # starts being processed first and holds the running queue capacity
                     {"priority": 6},  # second
                     {"priority": 5},  # third
