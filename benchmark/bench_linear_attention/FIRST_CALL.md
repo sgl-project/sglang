@@ -33,37 +33,42 @@ in unmodified 0.7.0.post1, GDN decode has a disk cache, but the SM120 GDN
 prefill `cached_compile` path has only an in-process dictionary. Startup
 preparation alone cannot fix that: it would recompile on every restart.
 
-A companion FlashInfer patch is provided at
-`patches/flashinfer-0.7.0.post1-gdn-disk-cache.patch`. It routes GDN's explicit
-compile-key cache through FlashInfer's existing `JitSpecCuteDsl` object export /
-load implementation. It retains SM12x PTX validation before export and uses
-specialization, architecture, source hashes, compiler-stack versions, Python ABI,
-Torch, TVM FFI and CUDA bindings versions to invalidate artifacts. Existing file
-locks and atomic export are reused. Non-GDN and non-TVM-FFI calls keep the original
-behavior; `FLASHINFER_CUTE_DSL_DISABLE_CACHE=1` disables persistence.
+SGLang now owns the missing prefill persistence in
+`python/sglang/srt/layers/attention/linear/gdn_cache.py`. **No FlashInfer package
+patch is required.** During init it restores exported callables into FlashInfer's
+existing process-local cache, runs the ordinary preparation calls, then exports
+new cache entries with CuTe's `export_to_c` API. Restart loading uses
+`cute.runtime.load_module`. FlashInfer source and function identities remain
+unchanged; its normal compilation path still performs SM12x PTX validation.
 
-Apply the companion patch **inside the venv running SGLang** (FlashInfer
-0.7.0.post1 only). From the SGLang repository, after activating that venv:
+The adapter uses the private `_in_mem_compile_cache` explicit-key contract tested
+with FlashInfer 0.7.0.post1 / CuTe 4.8.0. It recognizes GDN TVM-FFI keys only.
+Unsupported entries are skipped; failed exports or incompatible dependencies
+warn and fall back to ordinary preparation, so a future FlashInfer version needs a compatibility
+check before assuming compile-free restarts. It does not hook arbitrary runtime
+compilation or persist specializations first encountered after init.
 
-```bash
-FI_SITE=$(python -c 'import importlib.util,pathlib; print(pathlib.Path(importlib.util.find_spec("flashinfer").origin).parent.parent)')
-patch --dry-run -d "$FI_SITE" -p1 < benchmark/bench_linear_attention/patches/flashinfer-0.7.0.post1-gdn-disk-cache.patch
-patch -d "$FI_SITE" -p1 < benchmark/bench_linear_attention/patches/flashinfer-0.7.0.post1-gdn-disk-cache.patch
-export FLASHINFER_WORKSPACE_BASE=/path/to/persistent/flashinfer-cache
-```
+Objects and a JSON key manifest live under `$SGLANG_CACHE_DIR/gdn_prefill/`.
+The directory fingerprint includes architecture, GDN and adapter source hashes,
+compiler-stack versions, Python ABI, FlashInfer, Torch, TVM FFI and CUDA bindings.
+No pickle or imports from manifest contents are used. Exports and manifest
+updates use a file lock and atomic replacement; corrupt entries fall back to
+compilation and are repaired after successful preparation.
+`FLASHINFER_CUTE_DSL_DISABLE_CACHE=1` disables this persistence.
 
-Do not reapply to an already patched environment. A package upgrade can replace
-the patched file; this companion change is not an upstream release. The SGLang
-flag controls init preparation; the dependency patch provides disk persistence.
-Keep both the SGLang/Triton and FlashInfer cache directories between restarts.
+Keep the same `SGLANG_CACHE_DIR` and enable `SGLANG_PREPARE_LINEAR_ATTN=1` on
+**every startup**. First startup compiles/tunes and writes disk artifacts;
+later startups load them and prepare process-local handles. The previous
+companion dependency patch has been removed from this branch.
 
-With the companion patch on RTX5090, GDN prefill T256 preparation fell from a
-9.406 s cold start to a 0.154 s restart median (3 fresh interpreters). Restart
-first attention wall time was 0.554 ms, steady 0.216 ms. Five `.o` artifacts
-(total 1,145,320 bytes) were written. Separate restart tests prohibited CuTe
-compilation and Triton lowering/autotuning and still passed numerical checks
-for T256 and T4096. This proves disk reuse for those cases, not full-server
-coverage or first-call equality with steady state.
+On RTX5090, T256 init took 9.295 s cold and 0.158 s after restart
+(median of 3 fresh processes); first post-init wall time was 0.621 ms versus
+0.214 ms steady. Five objects totaling 1,144,920 bytes were saved.
+Separate restarts with unchanged FlashInfer passed T256 and T4096
+numerical checks while CuTe compilation and Triton lowering/autotuning were
+forbidden. Tests also asserted that FlashInfer's cache source bytes and function
+identities were unchanged. This verifies the measured operator paths, not a
+complete server startup, Hopper/B200, or first-call equality with steady state.
 
 For a server-level eager test, configure both graph phases as disabled:
 
@@ -114,3 +119,10 @@ Wall time includes Python dispatch and synchronization. CUDA event spans include
 CPU enqueue gaps, so they are not pure GPU execution times. Do not include
 diagnostic or sanitizer runs in latency summaries, and do not call the first
 post-init invocation the first-ever kernel execution.
+
+For a strict restart check, first seed the chosen operation with `--prepare`,
+then run it in a new process with `--prepare --forbid-compilation --diagnose`.
+The test-only flag makes CuTe compilation/build and Triton lowering/autotuning
+raise immediately; loading already compiled artifacts is still allowed. These
+guards modify compiler entry points only inside the benchmark process. The
+production SGLang cache adapter never replaces those functions.

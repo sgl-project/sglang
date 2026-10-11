@@ -191,6 +191,11 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             return 0
         from sglang.srt.layers.attention.linear.prepare import prepare_kernel
 
+        if mode == "prefill":
+            from sglang.srt.layers.attention.linear.gdn_cache import gdn_prefill_cache
+
+            with gdn_prefill_cache():
+                return prepare_kernel(self, spec, mode, sizes, kind="gdn")
         return prepare_kernel(self, spec, mode, sizes, kind="gdn")
 
     def __init__(self):

@@ -2,7 +2,8 @@
 
 This intentionally executes kernels during init, using private scratch state.
 It does not run a model forward, capture graphs, patch a compiler, or write to
-the request pool. Persistent compiler/autotuner caches are owned by the libraries.
+the request pool. SGLang also persists supported GDN prefill cache entries;
+other compiler/autotuner caches remain owned by their libraries.
 """
 
 from __future__ import annotations

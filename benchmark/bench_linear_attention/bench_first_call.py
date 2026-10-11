@@ -105,7 +105,31 @@ def poison_allocations(enabled):
             setattr(torch, name, fn)
 
 
+def forbid_compilation():
+    """Test-only guards: a disk hit may load, but must not compile or tune."""
+    from cutlass import cute
+    from flashinfer.jit.cute_dsl_core import JitSpecCuteDsl
+    from triton.compiler.compiler import ASTSource
+    from triton.runtime.autotuner import Autotuner
+
+    def fail(*args, **kwargs):
+        raise AssertionError("Compilation/autotuning forbidden in restart test")
+
+    class NoCompile:
+        __call__ = staticmethod(fail)
+
+        def __getitem__(self, options):
+            return self
+
+    cute.compile = NoCompile()
+    JitSpecCuteDsl.build = fail
+    ASTSource.make_ir = fail
+    Autotuner._bench = fail
+
+
 def main(args):
+    if args.forbid_compilation:
+        forbid_compilation()
     torch.set_num_threads(1)
     torch.set_grad_enabled(False)
     torch.manual_seed(42)
@@ -356,6 +380,11 @@ if __name__ == "__main__":
     parser.add_argument("--prepare", action="store_true")
     parser.add_argument("--qualify", action="store_true")
     parser.add_argument("--diagnose", action="store_true")
+    parser.add_argument(
+        "--forbid-compilation",
+        action="store_true",
+        help="Fail on CuTe compilation/build or Triton lowering/autotuning",
+    )
     parser.add_argument("--samples", type=int, default=50)
     parser.add_argument("--report", required=True)
     args = parser.parse_args()
