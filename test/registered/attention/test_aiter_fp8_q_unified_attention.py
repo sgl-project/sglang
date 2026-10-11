@@ -1,4 +1,5 @@
-"""Coverage for the AITER FP8-Q unified-attention prefill and decode paths."""
+"""Coverage for the AITER FP8-Q unified-attention prefill and decode paths and
+the gfx950 FP8 ASM prefill with GQA KV-head repeat."""
 
 import math
 import unittest
@@ -7,7 +8,7 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -22,7 +23,10 @@ if _RUNNABLE:
         fp8_dtype,
         scaled_fp8_quant,
     )
-    from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
+    from sglang.srt.layers.attention.aiter_backend import (
+        AiterAttnBackend,
+        _aiter_fp8_asm_gqa_repeat,
+    )
 
 
 class _FakeKVPool:
@@ -446,6 +450,136 @@ class TestAiterFP8QUnifiedAttention(CustomTestCase):
             actual.flatten(), expected.flatten(), dim=0
         ).item()
         self.assertGreater(cosine, 0.99)
+
+
+@unittest.skipUnless(
+    _RUNNABLE and is_gfx95_supported(), "requires gfx950 AITER FP8 ASM prefill"
+)
+class TestAiterFP8AsmPrefillGQARepeat(CustomTestCase):
+    def test_repeat_factor(self):
+        cases = {
+            (24, 4): 3,  # Qwen3.8-27B TP1: ratio 6 -> 2
+            (12, 2): 3,  # TP2
+            (12, 4): 3,  # ratio 3 -> 1
+            (16, 2): 1,  # ratio 8 is native
+            (64, 2): 1,  # ratio 32 has no supported power-of-two factor
+            (7, 2): 1,  # not a GQA layout
+        }
+        for (num_q_heads, num_kv_heads), repeat in cases.items():
+            with self.subTest(num_q_heads=num_q_heads, num_kv_heads=num_kv_heads):
+                self.assertEqual(
+                    _aiter_fp8_asm_gqa_repeat(num_q_heads, num_kv_heads), repeat
+                )
+
+    def _run_prefill(self, num_q_heads, num_kv_heads):
+        head_dim, device = 256, "cuda"
+        prefix_lens, extend_lens = [64, 50], [32, 77]
+        seq_lens = [p + e for p, e in zip(prefix_lens, extend_lens)]
+        ratio = num_q_heads // num_kv_heads
+        torch.manual_seed(0)
+
+        # Each query attends almost only to its own key, so head mapping,
+        # bottom-right causal alignment and varlen offsets all show in the output.
+        keys, values, queries = [], [], []
+        for prefix, seq_len in zip(prefix_lens, seq_lens):
+            k = 0.1 * torch.randn(seq_len, num_kv_heads, head_dim, device=device)
+            base = torch.randn(seq_len, head_dim, device=device)
+            k += 2 * base[:, None, :]
+            q = base[prefix:, None, :] + 0.05 * torch.randn(
+                seq_len - prefix, num_q_heads, head_dim, device=device
+            )
+            keys.append(k)
+            values.append(torch.randn(seq_len, num_kv_heads, head_dim, device=device))
+            queries.append(q)
+        k, v, q = (torch.cat(t).to(torch.bfloat16) for t in (keys, values, queries))
+
+        fp8_max = torch.finfo(fp8_dtype).max
+        k_scale = (k.abs().float().amax() / fp8_max).view(1)
+        v_scale = (v.abs().float().amax() / fp8_max).view(1)
+        k_fp8, _ = scaled_fp8_quant(k.reshape(-1, num_kv_heads * head_dim), k_scale)
+        v_fp8, _ = scaled_fp8_quant(v.reshape(-1, num_kv_heads * head_dim), v_scale)
+        q_fp8, _ = scaled_fp8_quant(q.reshape(q.shape[0], -1), k_scale)
+
+        # Scatter the KV rows to random cache slots (uint8: no fp8 index_put).
+        total_k = sum(seq_lens)
+        tok_idx = torch.randperm(total_k + 7, device=device)[:total_k]
+        k_cache = torch.zeros(
+            total_k + 7, num_kv_heads, head_dim, dtype=torch.uint8, device=device
+        )
+        v_cache = torch.zeros_like(k_cache)
+        k_cache[tok_idx] = k_fp8.view(torch.uint8).view(-1, num_kv_heads, head_dim)
+        v_cache[tok_idx] = v_fp8.view(torch.uint8).view(-1, num_kv_heads, head_dim)
+        k_cache, v_cache = k_cache.view(fp8_dtype), v_cache.view(fp8_dtype)
+
+        def cu(lengths):
+            out = torch.zeros(len(lengths) + 1, dtype=torch.int32, device=device)
+            out[1:] = torch.tensor(lengths, device=device).cumsum(0)
+            return out
+
+        backend = object.__new__(AiterAttnBackend)
+        backend.input_dtype = torch.bfloat16
+        backend.k_scale = k_scale
+        backend.qo_indptr = cu(extend_lens)
+        backend.token_to_kv_pool = _FakeKVPool(k_cache, v_cache)
+        backend.forward_metadata = SimpleNamespace(
+            max_q_len=max(extend_lens), max_kv_len=max(seq_lens)
+        )
+        layer = SimpleNamespace(
+            layer_id=0,
+            tp_q_head_num=num_q_heads,
+            tp_k_head_num=num_kv_heads,
+            qk_head_dim=head_dim,
+            v_head_dim=head_dim,
+            k_scale=k_scale,
+            scaling=head_dim**-0.5,
+        )
+        with mock.patch.object(
+            backend,
+            "_asm_context_prefill_indices",
+            return_value=(tok_idx.to(torch.int32), cu(seq_lens)),
+        ):
+            out = backend._forward_extend_fp8_asm_gqa_repeat(
+                q,
+                layer,
+                SimpleNamespace(batch_size=len(seq_lens)),
+                _aiter_fp8_asm_gqa_repeat(num_q_heads, num_kv_heads),
+                len(seq_lens) + 1,
+                k_scale,
+                v_scale,
+            )
+
+        # Float reference on the dequantized FP8 inputs.
+        q_ref = (q_fp8.float() * k_scale).view(-1, num_q_heads, head_dim)
+        k_ref = (k_fp8.float() * k_scale).view(-1, num_kv_heads, head_dim)
+        v_ref = (v_fp8.float() * v_scale).view(-1, num_kv_heads, head_dim)
+        expected, q_start, k_start = [], 0, 0
+        for prefix, seq_len in zip(prefix_lens, seq_lens):
+            ext = seq_len - prefix
+            qs = q_ref[q_start : q_start + ext].transpose(0, 1)
+            ks = k_ref[k_start : k_start + seq_len].repeat_interleave(ratio, dim=1)
+            vs = v_ref[k_start : k_start + seq_len].repeat_interleave(ratio, dim=1)
+            scores = qs @ ks.permute(1, 2, 0) * head_dim**-0.5
+            q_pos = torch.arange(prefix, seq_len, device=device)[:, None]
+            k_pos = torch.arange(seq_len, device=device)[None, :]
+            scores = scores.masked_fill(k_pos > q_pos, float("-inf"))
+            expected.append((scores.softmax(-1) @ vs.transpose(0, 1)).transpose(0, 1))
+            q_start, k_start = q_start + ext, k_start + seq_len
+        expected = torch.cat(expected)
+        actual = out.float().view_as(expected)
+
+        self.assertEqual(out.dtype, torch.bfloat16)
+        self.assertTrue(bool(torch.isfinite(actual).all()))
+        mismatch = (actual - expected).abs() > 0.1 + 0.1 * expected.abs()
+        self.assertLess(mismatch.float().mean().item(), 0.005)
+        cosine = torch.nn.functional.cosine_similarity(
+            actual.flatten(), expected.flatten(), dim=0
+        ).item()
+        self.assertGreater(cosine, 0.99)
+
+    def test_qwen38_27b_prefill_with_prefix_matches_reference(self):
+        for num_q_heads, num_kv_heads in ((24, 4), (12, 2)):
+            with self.subTest(num_q_heads=num_q_heads, num_kv_heads=num_kv_heads):
+                self._run_prefill(num_q_heads, num_kv_heads)
 
 
 if __name__ == "__main__":
