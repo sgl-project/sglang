@@ -3,7 +3,9 @@
 For topk=1 the draft tree degenerates to a chain, so `draft_forward` skips the
 cat/topk/sort/gather of the slow path and returns pre-allocated constants. These
 tests check that the pre-allocated `parent_list` / `top_scores_index` match the
-slow path (`organize_draft_results`) for num_steps in {1, 2, 3, 4}.
+slow path (`organize_draft_results`) for num_steps in {1, 2, 3, 4}, and that
+`draft_forward` under the CUDA and HIP gates returns the same chain as the
+token-list path.
 """
 
 import contextlib
