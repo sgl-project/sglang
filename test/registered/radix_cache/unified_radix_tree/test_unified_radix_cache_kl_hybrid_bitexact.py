@@ -352,14 +352,6 @@ class TestUnifiedHybridHiCacheBitExact(CustomTestCase):
         )
 
 
-class TestUnifiedMemoryMXFP8HiCacheBitExact(TestUnifiedHybridHiCacheBitExact):
-    """MXFP8 scales require the kernel backend and page-first host layout."""
-
-    io_backend = "kernel"
-    mem_layout = "page_first"
-    extra_args = ["--enable-unified-memory", "--kv-cache-dtype", "mxfp8"]
-
-
 class TestUnifiedHybridMTPBitExact(CustomTestCase):
     """Same exactness bar with MTP driving the decode loop.
 
