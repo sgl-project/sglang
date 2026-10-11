@@ -12,7 +12,6 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency 
     LAYERWISE_OFFLOAD,
     SNAPSHOT_OFFLOAD,
     ComponentResidencyError,
-    component_residency_selector_matches,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_strategies import (
     _WARMUP_PRELOAD_MARGIN_BYTES,
@@ -169,7 +168,6 @@ class ComponentResidencyManager:
         self._warmup_phase_full_weight_transition_components: tuple[str, ...] = ()
         self._warmup_phase_peaks: dict[str, WarmupPhasePeak] = {}
         self._completed_warmup_phase_peaks: dict[str, WarmupPhasePeak] = {}
-        self._warned_warmup_preload_selectors: set[str] = set()
 
     @property
     def host_pin_budget(self) -> HostPinBudget:
@@ -736,7 +734,6 @@ class ComponentResidencyManager:
                     self.placement_modules(),
                     label=f"after request {self._debug_requests_seen}",
                 )
-        self._warn_unmatched_warmup_preload()
 
     def _allows_warmup_preload(self, component_name: str) -> bool:
         """Missing method means auto, so hand-built test fakes keep today's policy."""
@@ -751,34 +748,6 @@ class ComponentResidencyManager:
         if margin is None:
             return _WARMUP_PRELOAD_MARGIN_BYTES
         return int(margin)
-
-    def _warn_unmatched_warmup_preload(self) -> None:
-        """Log once when a preload selector matches no loaded component.
-
-        Compared against pipeline modules and components this request used, so a
-        stage that did not run does not warn for a component that is loaded.
-        """
-        if not self.state.batch_is_warmup:
-            return
-        spec = getattr(self.server_args, "warmup_preload_components", "auto")
-        if not isinstance(spec, str) or spec in ("", "auto", "none"):
-            return
-        module_names = set(getattr(self.pipeline, "modules", {}) or ())
-        module_names.update(self._uses_seen)
-        for selector in spec.split(","):
-            if not selector or selector in self._warned_warmup_preload_selectors:
-                continue
-            if any(
-                component_residency_selector_matches(name, selector)
-                for name in module_names
-            ):
-                continue
-            self._warned_warmup_preload_selectors.add(selector)
-            logger.warning(
-                "Warmup preload selector %s matches no loaded component; "
-                "it will not preload anything.",
-                selector,
-            )
 
     def _begin_warmup_phase(
         self,

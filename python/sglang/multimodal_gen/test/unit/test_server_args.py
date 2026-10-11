@@ -1241,7 +1241,7 @@ class TestWarmupPreload(unittest.TestCase):
             self._resolve(components=" , ")
 
     def test_negative_and_non_finite_margin_are_rejected(self):
-        for margin in (-0.1, float("nan"), float("inf"), float("-inf")):
+        for margin in (-0.1, float("nan"), float("inf"), float("-inf"), 1e308):
             with self.subTest(margin=margin):
                 with self.assertRaisesRegex(ValueError, "non-negative finite"):
                     self._resolve(margin_gib=margin)

@@ -567,10 +567,9 @@ def test_warmup_preload_none_skips_hinted_text_encoder():
     assert preferred == {"text_encoder": False}
 
 
-def test_warmup_preload_dit_keeps_two_tower_transformer_only():
+def test_warmup_preload_dit_keeps_hinted_transformer_and_drops_text_encoder():
     modules = {
-        name: torch.nn.Linear(2, 2)
-        for name in ("text_encoder", "transformer", "transformer_2")
+        name: torch.nn.Linear(2, 2) for name in ("text_encoder", "transformer")
     }
     uses = (
         ComponentUse("encode", "text_encoder", preferred_ready_after_request=True),
@@ -615,7 +614,7 @@ def test_explicit_residency_wins_over_warmup_preload_list():
     )
     # Listed, but an explicit residency mode still wins.
     assert preferred["text_encoder"] is False
-    # The filter still preloads a listed two-tower DiT with no explicit mode.
+    # The filter still preloads hinted transformer, which dit matches.
     assert preferred["transformer"] is True
     # Hinted, but not in the list, so the filter drops it.
     assert preferred["vae"] is False
@@ -668,38 +667,23 @@ def test_missing_preload_policy_keeps_auto_on_warmup():
     )
 
 
-def test_unmatched_warmup_preload_selector_warns_once(monkeypatch):
-    warning = Mock()
-    monkeypatch.setattr(
-        "sglang.multimodal_gen.runtime.managers.memory_managers."
-        "component_manager.logger.warning",
-        warning,
-    )
-    module = torch.nn.Linear(2, 2)
+def test_begin_request_copies_warmup_preload_margin():
     use = ComponentUse("encode", "text_encoder", preferred_ready_after_request=True)
     stage = _Stage(use)
     pipeline = SimpleNamespace(
-        modules={"text_encoder": module},
+        modules={"text_encoder": torch.nn.Linear(2, 2)},
         _stage_name_mapping={"encode": stage},
         component_residency_strategies={},
     )
     server_args = SimpleNamespace(
         enable_layerwise_nvtx_marker=False,
         explicit_residency_mode=lambda _name: None,
-        warmup_preload_components="transfrmer,text_encoder",
+        warmup_preload_margin_bytes=0,
         pipeline_config=SimpleNamespace(supports_auto_residency=False),
     )
-    server_args.allows_warmup_preload = lambda name: ServerArgs.allows_warmup_preload(
-        server_args, name
-    )
     manager = ComponentResidencyManager(pipeline, server_args)
-    manager.strategy_for = Mock(return_value=Mock())
-    for _ in range(2):
-        manager.begin_request([stage], SimpleNamespace(is_warmup=True), server_args)
-        manager.ensure_ready(use, module=module)
-        manager.finish_request()
-    warning.assert_called_once()
-    assert warning.call_args.args[1] == "transfrmer"
+    manager.begin_request([stage], SimpleNamespace(is_warmup=True), server_args)
+    assert manager.state.warmup_preload_margin_bytes == 0
 
 
 def test_strategy_cache_replaces_stale_component_instance():

@@ -160,6 +160,12 @@ def _normalize_warmup_preload_margin_gib(value: object) -> float:
             "--warmup-preload-margin-gib must be a non-negative finite number, "
             f"got {value!r}"
         )
+    # A finite GiB value can still overflow when converted to bytes.
+    if not math.isfinite(margin * 1024**3):
+        raise ValueError(
+            "--warmup-preload-margin-gib must be a non-negative finite number, "
+            f"got {value!r}"
+        )
     return margin
 
 
@@ -2753,18 +2759,15 @@ class ServerArgs(DisaggServerArgsMixin):
             type=str,
             default=ServerArgs.warmup_preload_components,
             help=(
-                "Which preferred components to preload at the end of a warmup "
-                "request. 'auto' keeps today's pipeline hints. 'none' skips "
-                "those preloads and does not clear the GPU: components kept by "
-                "keep_ready_after_warmup stay up. Otherwise a comma-separated "
-                "list of exact module keys or the groups dit, text_encoder, "
-                "image_encoder, vae, and all. A group includes numbered suffixes "
-                "(text_encoder matches text_encoder_2; dit matches transformer, "
-                "transformer_2, video_dit, audio_dit, and the rest of the DiT "
-                "set). An exact key such as transformer matches only that "
-                "module. all matches every component, same as auto for this "
-                "filter. Names the pipeline did not mark preferred are not "
-                "preloaded."
+                "Allowlist of preferred components to copy onto the device at "
+                "the end of a warmup request. 'auto' (default) keeps the "
+                "pipeline hints. 'none' does not copy preferred components "
+                "back onto the device. Components with keep_ready_after_warmup "
+                "are left as they are. A comma-separated list keeps a hinted "
+                "component only when it matches. Selectors match the same way "
+                "as --component-residency. A name the pipeline did not mark "
+                "preferred is not preloaded. The filter does not apply to "
+                "real requests."
             ),
         )
         parser.add_argument(
