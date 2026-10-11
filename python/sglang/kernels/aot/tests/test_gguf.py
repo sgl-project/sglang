@@ -47,15 +47,20 @@ HIDDEN_SIZES = [256, 1024]
 NUM_TOKENS = [7, 2050]  # Arbitrary values for testing
 SEEDS = [0]
 # Relative L2 limits against gguf-py's dequantization (fp32). The dequant kernels
-# match it to ~1e-3 (half-precision scale arithmetic); MMVQ adds the q8_1
-# activation rounding (~6e-3), more for Q4_0 / Q5_0 / IQ1_S in this kernel.
+# match it to ~1e-3 (half-precision scale arithmetic); MMVQ and MMQ add the q8_1
+# activation rounding (~6e-3).
 DEQUANT_REL_L2 = 2e-3
-MMVQ_REL_L2 = 1e-2
-MMVQ_REL_L2_LOOSE = {
-    GGMLQuantizationType.Q4_0: 2.5e-2,
-    GGMLQuantizationType.Q5_0: 2.5e-2,
-    GGMLQuantizationType.IQ1_S: 2.5e-2,
-}
+MATMUL_REL_L2 = 1e-2
+MMQ_QUANT_TYPES = [
+    GGMLQuantizationType.Q2_K,
+    GGMLQuantizationType.Q3_K,
+    GGMLQuantizationType.Q4_K,
+    GGMLQuantizationType.Q5_K,
+    GGMLQuantizationType.Q6_K,
+    GGMLQuantizationType.Q4_0,
+    GGMLQuantizationType.Q5_0,
+    GGMLQuantizationType.Q8_0,
+]
 QUANT_TYPES = [
     # i-matrix
     GGMLQuantizationType.IQ1_M,
@@ -140,8 +145,29 @@ def test_mmvq_matches_gguf_py(hidden_size: int, quant_type: GGMLQuantizationType
         ).float()
         ref = x.float() @ weight.T
         rel = (torch.linalg.norm(out - ref) / torch.linalg.norm(ref)).item()
-        limit = MMVQ_REL_L2_LOOSE.get(quant_type, MMVQ_REL_L2)
-        assert rel < limit, f"{quant_type.name}: relative L2 {rel:.2e}"
+        assert rel < MATMUL_REL_L2, f"{quant_type.name}: relative L2 {rel:.2e}"
+
+
+@pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
+@pytest.mark.parametrize("quant_type", MMQ_QUANT_TYPES)
+@torch.inference_mode()
+def test_mmq_matches_gguf_py(hidden_size: int, quant_type: GGMLQuantizationType):
+    # Same check for MMQ (the batched path): its block minimum / offset terms read
+    # the q8_1 block sums, which must cover the quantized activations.
+    torch.manual_seed(0)
+    tensors = get_gguf_sample_tensors(hidden_size, quant_type)
+    for tensor in tensors:
+        shape = list(map(int, tensor.name.split("_")[-1].split("x")))
+        weight = torch.tensor(
+            dequantize(tensor.data, quant_type), device="cuda", dtype=torch.float32
+        )
+        x = torch.randn(300, shape[1], device="cuda", dtype=torch.bfloat16)
+        out = ggml_mul_mat_a8(
+            torch.tensor(tensor.data, device="cuda"), x, quant_type, shape[0]
+        ).float()
+        ref = x.float() @ weight.T
+        rel = (torch.linalg.norm(out - ref) / torch.linalg.norm(ref)).item()
+        assert rel < MATMUL_REL_L2, f"{quant_type.name}: relative L2 {rel:.2e}"
 
 
 @pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
