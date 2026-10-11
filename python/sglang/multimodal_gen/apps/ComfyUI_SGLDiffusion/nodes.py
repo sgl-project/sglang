@@ -29,6 +29,8 @@ from .utils import (
     get_image_path,
     get_video_path,
     is_empty_image,
+    make_image_grid,
+    parse_step_list,
 )
 
 
@@ -472,6 +474,153 @@ class SGLDiffusionGenerateImage:
         revised_prompt = response["data"][0].get("revised_prompt") or positive_prompt
 
         return (image, revised_prompt)
+
+
+class SGLDiffusionCheckpointSweep:
+    """Render one prompt and seed across training checkpoints and tile the results.
+
+    Each checkpoint is loaded into the running server with
+    /update_weights_from_disk, so no restart is needed between steps. The
+    server's original weights are restored afterwards.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "sgld_client": ("SGLD_CLIENT",),
+                "positive_prompt": ("STRING", {"default": "", "multiline": True}),
+                "checkpoint_template": (
+                    "STRING",
+                    {
+                        "default": "/path/to/run/checkpoint-{step}",
+                        "tooltip": "Directory of one checkpoint, readable by the "
+                        "server and laid out like the served model. {step} is "
+                        "replaced by each step below",
+                    },
+                ),
+                "checkpoint_steps": (
+                    "STRING",
+                    {
+                        "default": "500, 1000, 1500, 2000, 2500, "
+                        "3000, 3500, 4000, 4500, 5000",
+                        "tooltip": "Comma-separated training steps, laid out "
+                        "left to right, top to bottom",
+                    },
+                ),
+                "seed": (
+                    "INT",
+                    {
+                        "default": 1024,
+                        "min": 0,
+                        "max": 2**32 - 1,
+                        "tooltip": "Fixed so only the weights differ between cells",
+                    },
+                ),
+            },
+            "optional": {
+                "negative_prompt": ("STRING", {"default": ""}),
+                "sampling_steps": ("INT", {"default": 6, "min": 1, "max": 100}),
+                "cfg": ("FLOAT", {"default": 7.0, "min": 1.0, "max": 20.0}),
+                "width": ("INT", {"default": 1024, "min": 256, "max": 4096}),
+                "height": ("INT", {"default": 1024, "min": 256, "max": 4096}),
+                "columns": ("INT", {"default": 5, "min": 1, "max": 16}),
+                "restore_original": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": "Reload the weights the server started with "
+                        "when the sweep ends, even if it fails",
+                    },
+                ),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "IMAGE", "STRING")
+    RETURN_NAMES = ("grid", "images", "log")
+    FUNCTION = "sweep"
+    CATEGORY = "SGLDiffusion"
+
+    def sweep(
+        self,
+        sgld_client: SGLDiffusionServerAPI,
+        positive_prompt: str,
+        checkpoint_template: str,
+        checkpoint_steps: str,
+        seed: int,
+        negative_prompt: str = "",
+        sampling_steps: int = 6,
+        cfg: float = 7.0,
+        width: int = 1024,
+        height: int = 1024,
+        columns: int = 5,
+        restore_original: bool = True,
+    ):
+        if not positive_prompt:
+            raise ValueError("Prompt cannot be empty")
+        if "{step}" not in checkpoint_template:
+            raise ValueError("checkpoint_template must contain {step}")
+        if seed < 0:
+            raise ValueError(
+                "seed must be >= 0; a random seed makes cells incomparable"
+            )
+        steps = parse_step_list(checkpoint_steps)
+
+        # Read before the first swap: the worker rewrites its model_path on each update.
+        original_path = sgld_client.get_model_path() if restore_original else None
+        request = self._request(
+            prompt=positive_prompt,
+            negative_prompt=negative_prompt,
+            seed=seed,
+            steps=sampling_steps,
+            cfg=cfg,
+            width=width,
+            height=height,
+        )
+        images, log = [], []
+        try:
+            for step in steps:
+                path = checkpoint_template.replace("{step}", str(step))
+                try:
+                    sgld_client.update_weights_from_disk(path)
+                except Exception as e:
+                    raise RuntimeError(f"Checkpoint step {step} ({path}): {e}")
+                images.append(self._render(sgld_client, step=step, request=request))
+                log.append(f"step {step}: {path}")
+        finally:
+            if original_path is not None:
+                try:
+                    sgld_client.update_weights_from_disk(original_path)
+                    log.append(f"restored: {original_path}")
+                except Exception as e:
+                    log.append(f"WARNING: could not restore {original_path}: {e}")
+
+        batch = torch.cat(images, dim=0)
+        return (make_image_grid(batch, columns), batch, "\n".join(log))
+
+    @staticmethod
+    def _request(*, prompt, negative_prompt, seed, steps, cfg, width, height):
+        request = {
+            "prompt": prompt,
+            "size": f"{width}x{height}",
+            "response_format": "b64_json",
+            "guidance_scale": cfg,
+            "num_inference_steps": steps,
+            "seed": seed,
+        }
+        if negative_prompt:
+            request["negative_prompt"] = negative_prompt
+        return request
+
+    @staticmethod
+    def _render(sgld_client, *, step, request):
+        try:
+            response = sgld_client.generate_image(**request)
+        except Exception as e:
+            raise RuntimeError(f"Failed to generate at step {step}: {e}")
+        if not response["data"] or not response["data"][0]["b64_json"]:
+            raise RuntimeError(f"No image data in response at step {step}")
+        return convert_b64_to_tensor_image(response["data"][0]["b64_json"])
 
 
 class SGLDiffusionGenerateVideo:
@@ -1061,6 +1210,7 @@ class SGLDiffusionServerUnsetLora:
 NODE_CLASS_MAPPINGS = {
     "SGLDiffusionServerModel": SGLDiffusionServerModel,
     "SGLDiffusionGenerateImage": SGLDiffusionGenerateImage,
+    "SGLDiffusionCheckpointSweep": SGLDiffusionCheckpointSweep,
     "SGLDiffusionGenerateVideo": SGLDiffusionGenerateVideo,
     "SGLDiffusionGenerateAudioVideo": SGLDiffusionGenerateAudioVideo,
     "SGLDiffusionGenerateH3": SGLDiffusionGenerateH3,
@@ -1074,6 +1224,7 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "SGLDiffusionServerModel": "SGLDiffusion Server Model",
     "SGLDiffusionGenerateImage": "SGLDiffusion Generate Image",
+    "SGLDiffusionCheckpointSweep": "SGLDiffusion Checkpoint Sweep",
     "SGLDiffusionGenerateVideo": "SGLDiffusion Generate Video",
     "SGLDiffusionGenerateAudioVideo": "SGLDiffusion Generate Audio-Video",
     "SGLDiffusionGenerateH3": "SGLDiffusion Generate MiniMax-H3",

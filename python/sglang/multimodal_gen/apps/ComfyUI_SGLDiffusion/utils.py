@@ -77,6 +77,38 @@ def is_empty_image(image: torch.Tensor, tolerance: float = 1e-6) -> bool:
     return max_diff.item() <= tolerance
 
 
+def parse_step_list(text: str, limit: int = 64) -> list:
+    """Parse "500, 1000, 1500" into [500, 1000, 1500], dropping repeats."""
+    steps = []
+    for part in text.replace("\n", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if not part.isdigit():
+            raise ValueError(f"Not a checkpoint step: {part!r}")
+        if int(part) not in steps:
+            steps.append(int(part))
+    if not steps:
+        raise ValueError("No checkpoint steps given")
+    if len(steps) > limit:
+        raise ValueError(f"At most {limit} checkpoints per sweep, got {len(steps)}")
+    return steps
+
+
+def make_image_grid(images: torch.Tensor, columns: int) -> torch.Tensor:
+    """Tile a [N, H, W, C] batch into one [1, rows * H, columns * W, C] image."""
+    count, height, width, channels = images.shape
+    columns = max(1, min(columns, count))
+    rows = -(-count // columns)
+    grid = torch.zeros(rows * height, columns * width, channels, dtype=images.dtype)
+    for index in range(count):
+        row, col = divmod(index, columns)
+        grid[row * height : (row + 1) * height, col * width : (col + 1) * width] = (
+            images[index]
+        )
+    return grid.unsqueeze(0)
+
+
 def get_image_path(image: torch.Tensor) -> str:
     """
     Save tensor image to ComfyUI temp directory as PNG and return the path.

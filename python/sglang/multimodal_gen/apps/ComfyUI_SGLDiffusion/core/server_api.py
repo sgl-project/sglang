@@ -14,9 +14,14 @@ def _error_detail(error: requests.exceptions.RequestException) -> str:
     """Append the server's `detail` to an HTTP error, e.g. why a request was a 400."""
     if isinstance(error, requests.exceptions.HTTPError) and error.response is not None:
         try:
-            detail = error.response.json().get("detail")
+            body = error.response.json()
         except ValueError:
-            detail = None
+            body = None
+        detail = (
+            (body.get("detail") or body.get("message"))
+            if isinstance(body, dict)
+            else None
+        )
         if detail:
             return f"{error} ({detail})"
     return str(error)
@@ -68,6 +73,39 @@ class SGLDiffusionServerAPI:
             return response.json()
         except requests.exceptions.RequestException as e:
             raise RuntimeError(f"Failed to get model info: {str(e)}")
+
+    def get_model_path(self) -> str:
+        """Return the model path the server was launched with."""
+        try:
+            response = requests.get(
+                f"{self.base_url}/model_info", headers=self.headers, timeout=30
+            )
+            response.raise_for_status()
+            return response.json()["model_path"]
+        except requests.exceptions.RequestException as e:
+            raise RuntimeError(f"Failed to get model path: {_error_detail(e)}")
+
+    def update_weights_from_disk(
+        self, model_path: str, flush_cache: bool = True
+    ) -> Dict[str, Any]:
+        """Swap the served weights in place from `model_path`, without a restart."""
+        if not model_path:
+            raise ValueError("model_path cannot be empty")
+
+        try:
+            response = requests.post(
+                f"{self.base_url.removesuffix('/v1')}/update_weights_from_disk",
+                json={"model_path": model_path, "flush_cache": flush_cache},
+                headers=self.headers,
+                timeout=600,
+            )
+            response.raise_for_status()
+        except requests.exceptions.RequestException as e:
+            raise RuntimeError(f"Failed to update weights: {_error_detail(e)}")
+        result = response.json()
+        if not result.get("success"):
+            raise RuntimeError(f"Failed to update weights: {result.get('message')}")
+        return result
 
     def generate_image(
         self,
