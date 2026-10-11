@@ -51,6 +51,7 @@ from sglang.srt.models.deepseek_v4 import (
 from sglang.srt.models.dspark import (
     BaseDSparkMarkovHead,
     DSparkConfidenceHead,
+    VocabShard,
     gather_and_crop_vocab,
     project_through_lm_head,
 )
@@ -473,6 +474,9 @@ class DSparkV4MarkovHead(BaseDSparkMarkovHead):
             num_embeddings_per_partition=per_partition,
             num_embeddings_padded=num_padded,
         )
+        self.vocab_shard = VocabShard(
+            start=self._tp_shard.org_vocab_start, gather=self._vocab_gather
+        )
 
     def get_prev_embeddings(self, token_ids: torch.Tensor) -> torch.Tensor:
         return self.markov_w1(token_ids.long())
@@ -513,6 +517,11 @@ class DSparkV4MarkovHead(BaseDSparkMarkovHead):
         step_local = BuildStepLocal.execute(bias=bias, base_local=base_logits)
         full = self._vocab_gather(step_local)
         return full[..., : self.vocab_size]
+
+    def step_logits_dtype(self, base_dtype: torch.dtype) -> torch.dtype:
+        # The bias is FP32 or upcast into an FP32 add, sharded or not.
+        del base_dtype
+        return torch.float32
 
     @property
     def supports_sharded_greedy(self) -> bool:

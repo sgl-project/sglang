@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from typing import Callable, Iterable, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Iterable, Optional, Tuple
 
+import msgspec
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -27,6 +28,9 @@ from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyMode,
     read_ragged_verify_mode,
 )
+
+if TYPE_CHECKING:
+    from sglang.srt.distributed.device_communicators.vocab_gather import VocabGather
 
 logger = logging.getLogger(__name__)
 
@@ -85,9 +89,20 @@ def run_markov_block(
     )
 
 
+class VocabShard(msgspec.Struct, frozen=True):
+    """Where a rank's vocab slice starts, and the gather over its group."""
+
+    start: int
+    gather: VocabGather
+
+
 class BaseDSparkMarkovHead(nn.Module, ABC):
     """Corrects a draft block step by step: each step's base logits get a bias
     computed from the token drafted at the step before."""
+
+    vocab_size: int
+    # The rank's slice of a TP-sharded vocab; None when the vocab is whole.
+    vocab_shard: Optional[VocabShard] = None
 
     def init_state(
         self, hidden_states: Optional[torch.Tensor]
@@ -109,6 +124,10 @@ class BaseDSparkMarkovHead(nn.Module, ABC):
         self, base_logits: torch.Tensor, bias: torch.Tensor
     ) -> torch.Tensor:
         return base_logits + bias
+
+    @abstractmethod
+    def step_logits_dtype(self, base_dtype: torch.dtype) -> torch.dtype:
+        """The dtype of ``base_logits + bias``."""
 
     @property
     def supports_sharded_greedy(self) -> bool:
@@ -150,6 +169,10 @@ class VanillaMarkov(BaseDSparkMarkovHead):
 
     def project_bias(self, latent_states: torch.Tensor) -> torch.Tensor:
         return self.markov_w2(latent_states)
+
+    def step_logits_dtype(self, base_dtype: torch.dtype) -> torch.dtype:
+        # The bias comes out in the embedding's dtype.
+        return torch.promote_types(base_dtype, self.markov_w1.weight.dtype)
 
     def step_bias(
         self,
