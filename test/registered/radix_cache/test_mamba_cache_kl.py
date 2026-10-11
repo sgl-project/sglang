@@ -178,8 +178,6 @@ class TestMambaSpecTruncationKL(MambaCacheKLMixin, DefaultServerBase):
         "triton",
         "--linear-attn-prefill-backend",
         "triton",
-        "--linear-attn-verify-backend",
-        "triton",
         "--speculative-algorithm",
         "NEXTN",
         "--speculative-num-steps",
@@ -188,8 +186,6 @@ class TestMambaSpecTruncationKL(MambaCacheKLMixin, DefaultServerBase):
         "1",
         "--speculative-num-draft-tokens",
         "4",
-        "--random-seed",
-        "42",
     ]
 
     def test_reuse_distribution_after_length_truncation(self):
