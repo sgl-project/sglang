@@ -17,7 +17,7 @@ from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_pha
 # MoE and linear attention keep their TP partition (the linear attention
 # gathers the sequence where its recurrence needs it). Model ports register
 # here; every other model keeps the ordinary prefill CP path.
-_SUPPORTED_MODELS: set[str] = set()
+_SUPPORTED_MODELS: set[str] = {"Glm5NextForConditionalGeneration"}
 
 
 def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
@@ -34,11 +34,27 @@ def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
             "CP-TP group sharing requires --attn-cp-size == --tp-size, got "
             f"attn_cp_size={view.attn_cp_size}, tp_size={cfg.tp_size}."
         )
-    if cfg.cp_strategy != "zigzag":
-        raise ValueError("CP-TP group sharing requires --cp-strategy zigzag.")
+    strategy = (
+        "interleave"
+        if model.hf_config.architectures[0] == "Glm5NextForConditionalGeneration"
+        else "zigzag"
+    )
+    if cfg.cp_strategy != strategy:
+        raise ValueError(f"CP-TP group sharing requires --cp-strategy {strategy}.")
+
+    # This hook runs before speculative defaults and NEXTN alias resolution.
+    # Native MTP keeps the target's CP/TP placement; other draft architectures
+    # have their own topology and model-boundary contracts.
+    if cfg.speculative_algorithm is not None and (
+        model.hf_config.architectures[0] != "Glm5NextForConditionalGeneration"
+        or cfg.speculative_algorithm.upper() not in ("EAGLE", "NEXTN")
+        or cfg.speculative_draft_model_path not in (None, cfg.model_path)
+        or cfg.speculative_eagle_topk not in (None, 1)
+    ):
+        raise ValueError("CP/TP group sharing only supports native MTP with top-k 1.")
 
     unsupported = {
-        "speculative-algorithm": cfg.speculative_algorithm is not None,
+        "enable-dsa-cache-layer-split": cfg.enable_dsa_cache_layer_split,
         "dcp-size > 1": cfg.dcp_size > 1,
         "enable-mixed-chunk": cfg.enable_mixed_chunk,
         "moe-dp-size > 1": cfg.moe_dp_size > 1,

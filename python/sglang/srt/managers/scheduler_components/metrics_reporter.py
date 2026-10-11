@@ -1001,7 +1001,7 @@ class SchedulerMetricsReporter:
             msg += f"pre-allocated usage: {self.scheduler.disagg_decode_prealloc_queue.num_tokens_pre_allocated / self.scheduler.max_total_num_tokens:.2f}, "
             msg += f"#prealloc-req: {len(self.scheduler.disagg_decode_prealloc_queue.queue)}, "
             msg += f"#transfer-req: {len(self.scheduler.disagg_decode_transfer_queue.queue)}, "
-            if get_disagg().disaggregation_decode_host_receive_threshold > 0:
+            if get_disagg().disaggregation_decode_host_receive_threshold < 1:
                 msg += f"#host-receive-req: {self.stats.num_decode_host_receive_queue_reqs.total}, "
             msg += f"#retracted-req: {len(self.scheduler.disagg_decode_prealloc_queue.retracted_queue)}, "
 
@@ -1419,7 +1419,7 @@ class SchedulerMetricsReporter:
         )
         host_reqs = (
             [req for req in transfer_queue if req.host_staged]
-            if get_disagg().disaggregation_decode_host_receive_threshold > 0
+            if get_disagg().disaggregation_decode_host_receive_threshold < 1
             else []
         )
         self.stats.num_decode_host_receive_queue_reqs = QueueCount.from_reqs(

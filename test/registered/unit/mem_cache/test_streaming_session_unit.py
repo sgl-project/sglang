@@ -3,7 +3,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, FINISH_LENGTH, ReqKvInfo
+from sglang.srt.managers.schedule_batch import (
+    FINISH_ABORT,
+    FINISH_LENGTH,
+    Req,
+    ReqKvInfo,
+)
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
@@ -82,6 +87,8 @@ class _FakeInnerCache:
 
 
 class _FakeReq:
+    release_mm_inputs_on_abort = Req.release_mm_inputs_on_abort
+
     def __init__(
         self, session_id: str, req_pool_idx: int, committed: int, allocated: int
     ):
@@ -108,6 +115,8 @@ class _FakeReq:
         self.to_finish = None
         self.finished_reason = None
         self.finished_len = None
+        self.multimodal_inputs = None
+        self._session_mm_items = []
 
     def detach_kv(self):
         kv, self.kv = self.kv, ReqKvInfo()
@@ -216,6 +225,24 @@ def test_trim_overshoot_postcondition():
     assert len(req.output_ids) == 12
     # [38, 42) already gave its SWA back, so the free splits at 42.
     assert [t.tolist() for t in allocator.freed] == [[38, 39, 40, 41], [42, 43]]
+
+
+@pytest.mark.parametrize(
+    "target, end, freed",
+    [(17, 20, []), (17, 32, []), (17, 40, [(32, 40)]), (32, 48, [(32, 48)])],
+)
+def test_free_kv_aligned_skips_a_range_inside_the_partial_page(target, end, freed):
+    """Rounding ``target`` up to a page boundary can move the start of the
+    range at or past ``end``; such a rewind frees nothing and must not reach
+    the cache at all, while a range that still spans a whole page is freed."""
+    calls = []
+    session = StreamingSession(
+        SimpleNamespace(
+            page_size=16, free_kv_row=lambda _kv, ranges: calls.extend(ranges)
+        )
+    )
+    session._free_kv_aligned(None, target, end)
+    assert calls == freed
 
 
 @pytest.mark.parametrize("operation", ["trim", "match"])
