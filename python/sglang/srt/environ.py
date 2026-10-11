@@ -1473,6 +1473,11 @@ class Envs:
     # ===================================================================
     SGLANG_MAMBA_CONV_DTYPE = EnvStr("bfloat16")
     SGLANG_MAMBA_SSM_DTYPE = EnvStr(None)
+    # Opt-in operator-only startup warmup, independent of graph capture.
+    # Sizes describe coverage, not a guarantee for every runtime specialization.
+    SGLANG_PREPARE_LINEAR_ATTN = EnvBool(False)
+    SGLANG_LINEAR_ATTN_PREPARE_PREFILL_TOKENS = EnvStr("256,4096")
+    SGLANG_LINEAR_ATTN_PREPARE_DECODE_BATCH_SIZES = EnvStr("1")
     # Kill-switch for the fused per-slot conv clear/copy kernel (MambaPool);
     # falls back to the per-conv-type Python loop.
     SGLANG_DISABLE_FUSED_MAMBA_SLOT_OPS = EnvBool(False)

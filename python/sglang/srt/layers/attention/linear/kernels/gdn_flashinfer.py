@@ -186,6 +186,13 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
 
     uses_state_checkpoints = True
 
+    def prepare_for_inference(self, spec, mode: str, sizes: tuple[int, ...]) -> int:
+        if mode not in ("prefill", "decode"):
+            return 0
+        from sglang.srt.layers.attention.linear.prepare import prepare_kernel
+
+        return prepare_kernel(self, spec, mode, sizes, kind="gdn")
+
     def __init__(self):
         (
             available,

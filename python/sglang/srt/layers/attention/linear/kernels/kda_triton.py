@@ -30,6 +30,13 @@ class TritonKDAKernel(LinearAttnKernelBase):
     supports_fused_chain_verify: bool = not is_cpu() and not is_npu()
     supports_track_state_snapshot: bool = True
 
+    def prepare_for_inference(self, spec, mode: str, sizes: tuple[int, ...]) -> int:
+        if mode != "prefill":
+            return 0
+        from sglang.srt.layers.attention.linear.prepare import prepare_kernel
+
+        return prepare_kernel(self, spec, mode, sizes, kind="kda")
+
     def packed_decode(
         self,
         mixed_qkv: torch.Tensor,
