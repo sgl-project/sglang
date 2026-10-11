@@ -24,8 +24,7 @@ class SpecTpSyncSite(IntEnum):
     DSPARK_ACCEPT_SAMPLE = 9
     DSPARK_ACCEPT_GRAPH = 10
     DSPARK_TARGET = 11
-    # Each draft step's tokens, in the graph tail or eager; a fresh number so
-    # the retired per-path numbers 2-6 cannot silently mean it.
+    # A fresh number, so the retired 2-6 cannot silently select it.
     DSPARK_DRAFT = 17
 
     # -- DFlash --

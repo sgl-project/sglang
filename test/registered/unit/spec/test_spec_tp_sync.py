@@ -21,8 +21,7 @@ class TestParseSpecTpSync(CustomTestCase):
         self.assertEqual(sites, frozenset(SpecTpSyncSite) - {DRAFT})
 
     def test_draft_noise_is_not_an_rng_site(self):
-        # The draft noise is a function of its inputs, so ranks with the same
-        # logits draft the same tokens.
+        # Ranks with the same logits draw the same draft noise.
         self.assertNotIn(DRAFT, parse_spec_tp_sync("rng"))
         self.assertIn(DRAFT, parse_spec_tp_sync("dspark-draft"))
 
