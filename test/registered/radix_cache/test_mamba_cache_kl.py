@@ -1,16 +1,7 @@
-"""Guard lazy Mamba checkpoint reuse when the optional track slot is exhausted.
+"""KL regression tests for Mamba prefix-cache correctness.
 
-Keep overlap scheduling and decode CUDA graphs enabled. A four-slot pool holds
-two cached prefixes, the request's live state, and its keep checkpoint. The
-first decode must track in place; delayed prefill processing must not publish
-that buffer under the old checkpoint length.
-
-Compare full-vocabulary next-token distributions at the SAME 255-token prompt,
-before and after a 32-token decode seeds the cache. Comparing later free-running
-tokens would confound cache corruption with different generated histories.
-
-GB300 / Qwen3.5-0.8B: reverting the checkpoint invalidation gives KL=0.649448
-and a stale 192-token cache hit; with the fix KL=0 and the safe hit is 128 tokens.
+Keep each scenario in its own class so server configurations and cache-pressure
+requirements remain explicit.
 """
 
 import unittest
@@ -26,6 +17,21 @@ register_cuda_ci(est_time=120, stage="extra-a", runner_config="1-gpu-large")
 
 
 class TestMambaLazyInplaceKL(DefaultServerBase):
+    """Guard lazy Mamba checkpoint reuse when the optional track slot is exhausted.
+
+    Keep overlap scheduling and decode CUDA graphs enabled. A four-slot pool holds
+    two cached prefixes, the request's live state, and its keep checkpoint. The
+    first decode must track in place; delayed prefill processing must not publish
+    that buffer under the old checkpoint length.
+
+    Compare full-vocabulary next-token distributions at the SAME 255-token prompt,
+    before and after a 32-token decode seeds the cache. Comparing later free-running
+    tokens would confound cache corruption with different generated histories.
+
+    GB300 / Qwen3.5-0.8B: reverting the checkpoint invalidation gives KL=0.649448
+    and a stale 192-token cache hit; with the fix KL=0 and the safe hit is 128 tokens.
+    """
+
     model = "Qwen/Qwen3.5-0.8B"
     server_env = {
         "SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK": "0",
