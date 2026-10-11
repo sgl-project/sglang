@@ -341,6 +341,8 @@ class ServerArgs(DisaggServerArgsMixin):
     performance_mode: str = "auto"
     base_gpu_id: int = 0
     gpu_ids: list[int] | None = None
+    # i-th entry: NUMA node of the worker on local GPU i; None auto-detects
+    numa_node: list[int] | None = None
     # cross-node: num_gpus is the total world size across all nodes; each
     # node runs num_gpus // nnodes local GPU workers (mirrors srt's
     # tp_size_per_node convention)
@@ -810,24 +812,28 @@ class ServerArgs(DisaggServerArgsMixin):
 
         pipeline_config = getattr(self, "pipeline_config", None)
         pipeline_config_name = type(pipeline_config).__name__
-        if (
+        # The lists record validated checkpoints, not what can capture. An
+        # explicit request elsewhere stays on with a warning: warmup reports a
+        # denoising stage that captures nothing, and a captured segment that
+        # branches on Python-side state replays its capture-time branch.
+        if not (
             pipeline_config_name in BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS
             and self._is_breakable_cuda_graph_supported_model()
         ):
-            if not self.warmup_resolutions:
-                self._default_bcg_warmup_resolution()
-            return
-
-        logger.warning(
-            "[Diffusion BCG] disabled for %s: only Anima Base v1.0, FLUX.1-dev, "
-            "FLUX.2-Klein, Ideogram-4, jdopensource/JoyAI-Echo, Lightricks/LTX-2, "
-            "LongCat-Image, MiniMax-H3, Qwen/Qwen-Image, Qwen/Qwen-Image-2512, "
-            "Qwen/Qwen-Image-2.1, SANA1.5, "
-            "SANA-Video, Tongyi-MAI/Z-Image/Z-Image-Turbo, and "
-            "zai-org/GLM-Image are currently supported.",
-            pipeline_config_name,
-        )
-        self.enable_breakable_cuda_graph = False
+            logger.warning(
+                "[Diffusion BCG] not validated for %s (%s); enabling it as "
+                "requested. Warmup warns if nothing gets captured; compare outputs "
+                "against eager before relying on it. Validated: Anima Base v1.0, "
+                "FLUX.1-dev, FLUX.2-Klein, "
+                "Ideogram-4, jdopensource/JoyAI-Echo, Lightricks/LTX-2, "
+                "LongCat-Image, MiniMax-H3, Qwen/Qwen-Image, Qwen/Qwen-Image-2512, "
+                "Qwen/Qwen-Image-2.1, SANA1.5, SANA-Video, "
+                "Tongyi-MAI/Z-Image/Z-Image-Turbo, and zai-org/GLM-Image.",
+                pipeline_config_name,
+                self.model_path,
+            )
+        if not self.warmup_resolutions:
+            self._default_bcg_warmup_resolution()
 
     def _is_breakable_cuda_graph_supported_model(self) -> bool:
         refs = _normalized_bcg_model_refs(self.model_id)
@@ -2387,6 +2393,17 @@ class ServerArgs(DisaggServerArgsMixin):
                 "Physical GPU IDs for this instance, e.g. --gpu-ids 0 1 6 7 "
                 "or --gpu-ids 0,1,6,7. Overrides --base-gpu-id for standalone "
                 "disagg roles."
+            ),
+        )
+        parser.add_argument(
+            "--numa-node",
+            type=int,
+            nargs="+",
+            default=ServerArgs.numa_node,
+            help=(
+                "NUMA node for each GPU worker; the i-th value is for the worker "
+                "on local GPU i. If unset, each worker binds to its GPU's NUMA "
+                "node on multi-socket NUMA hosts (disable with SGLANG_AUTO_NUMA_BIND=0)."
             ),
         )
         parser.add_argument(
@@ -3998,6 +4015,12 @@ class ServerArgs(DisaggServerArgsMixin):
         if self.num_gpus % self.nnodes != 0:
             raise ValueError(
                 f"num_gpus ({self.num_gpus}) must be divisible by nnodes ({self.nnodes})"
+            )
+        local_num_gpus = self.num_gpus // self.nnodes
+        if self.numa_node is not None and len(self.numa_node) < local_num_gpus:
+            raise ValueError(
+                f"--numa-node needs one node per local GPU worker ({local_num_gpus}), "
+                f"got {self.numa_node}"
             )
 
         if self.sp_degree > self.num_gpus or self.num_gpus % self.sp_degree != 0:
