@@ -538,6 +538,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self.kernel_dispatcher = GDNKernelDispatcher(
             backends.decode, backends.prefill, backends.verify
         )
+        if envs.SGLANG_PREPARE_LINEAR_ATTN.get():
+            from sglang.srt.layers.attention.linear.precompile import (
+                precompile_linear_attention,
+            )
+
+            precompile_linear_attention(model_runner, self)
+
         # Sized past the pool for attn_tp-padded warmup/MLP-sync batches (see helper).
         self.verify_intermediate_state_indices = (
             build_verify_intermediate_state_indices(

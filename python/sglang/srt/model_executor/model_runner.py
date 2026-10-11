@@ -1077,13 +1077,6 @@ class ModelRunner:
         if get_parallel().dcp_enabled and get_parallel().dcp_replicate_q_proj:
             self._prepare_replicated_q_proj()
 
-        if envs.SGLANG_PREPARE_LINEAR_ATTN.get():
-            from sglang.srt.layers.attention.linear.prepare import (
-                prepare_model_linear_attention,
-            )
-
-            self.linear_attention_prepare_result = prepare_model_linear_attention(self)
-
     def _prepare_replicated_q_proj(self) -> None:
         # --dcp-replicate-q-proj: gather each rank's attn_tp head-shard of
         # q_b_proj / w_kc into full-head buffers once here (pre-capture) so the

@@ -15,7 +15,7 @@ import os
 from typing import TYPE_CHECKING, Optional
 
 import torch
-
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
@@ -118,6 +118,61 @@ def maybe_build_flashinfer_checkpoint_plan(
     forward_metadata.state_checkpoint_every_n_tokens = checkpoint_every_n_tokens
 
 
+class _FlashInferGDNCache(dict):
+    """Bridge FlashInfer's dict protocol to SGLang's existing CuTe AOT cache."""
+
+    def __init__(self, previous, aot):
+        super().__init__()
+        self.aot = aot
+        for key, value in previous.items():
+            self[key] = value
+
+    @staticmethod
+    def _supported(key):
+        # The shared FI cache also serves non-GDN/non-FFI kernels. Leave those
+        # process-local; only the explicit GDN TVM-FFI key contract is supported.
+        try:
+            mro, options = key[0][0], key[1]
+            return getattr(mro[0], "__module__", "").startswith(
+                "flashinfer.gdn_kernels."
+            ) and any(
+                getattr(cls, "__name__", "") == "EnableTVMFFI" and enabled is True
+                for cls, enabled in (options or ())
+            )
+        except (TypeError, IndexError, ValueError):
+            return False
+
+    def get(self, key, default=None):
+        if key not in self and self._supported(key) and key in self.aot:
+            super().__setitem__(key, self.aot[key])
+        return super().get(key, default)
+
+    def __setitem__(self, key, value):
+        if self._supported(key):
+            self.aot[key] = value
+        super().__setitem__(key, value)
+
+
+def _enable_gdn_aot_cache():
+    from pathlib import Path
+
+    from flashinfer.gdn_kernels.delta_rule_dsl import custom_compile_cache
+    from sglang.kernels.jit.cute_aot_cache import get_jit_cache
+
+    previous = custom_compile_cache._in_mem_compile_cache
+    if not isinstance(previous, _FlashInferGDNCache):
+        custom_compile_cache._in_mem_compile_cache = _FlashInferGDNCache(
+            previous,
+            get_jit_cache(
+                "flashinfer_gdn",
+                source_paths=(
+                    Path(custom_compile_cache.__file__).parent.parent,
+                    __file__,
+                ),
+            ),
+        )
+
+
 def _get_flashinfer_gdn_kernels():
     """Lazy import for FlashInfer GDN prefill, decode and verify (MTP) kernels.
 
@@ -186,18 +241,6 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
 
     uses_state_checkpoints = True
 
-    def prepare_for_inference(self, spec, mode: str, sizes: tuple[int, ...]) -> int:
-        if mode not in ("prefill", "decode"):
-            return 0
-        from sglang.srt.layers.attention.linear.prepare import prepare_kernel
-
-        if mode == "prefill":
-            from sglang.srt.layers.attention.linear.gdn_cache import gdn_prefill_cache
-
-            with gdn_prefill_cache():
-                return prepare_kernel(self, spec, mode, sizes, kind="gdn")
-        return prepare_kernel(self, spec, mode, sizes, kind="gdn")
-
     def __init__(self):
         (
             available,
@@ -206,6 +249,9 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             self._decode_fn,
             mtp_bf16_fn,
         ) = _get_flashinfer_gdn_kernels()
+
+        if available and envs.SGLANG_PREPARE_LINEAR_ATTN.get():
+            _enable_gdn_aot_cache()
 
         if not available:
             raise RuntimeError(

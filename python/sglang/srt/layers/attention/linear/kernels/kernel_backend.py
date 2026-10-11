@@ -23,14 +23,6 @@ class LinearAttnKernelBase(ABC):
     # tracked batches loudly (NotImplementedError) keep the default False.
     supports_track_state_snapshot: bool = False
 
-    def prepare_for_inference(self, spec, mode: str, sizes: tuple[int, ...]) -> int:
-        """Warm supported operator signatures on scratch state; return case count.
-
-        Called only during opt-in startup. Zero means the mode is unsupported;
-        it must not be interpreted as complete coverage.
-        """
-        return 0
-
     @abstractmethod
     def decode(
         self,
