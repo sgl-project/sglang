@@ -1,7 +1,7 @@
 """Config-time override declarations for inkling."""
 
 import logging
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from sglang.srt.arg_groups.model_override_base import (
     _register_for,
@@ -13,16 +13,13 @@ from sglang.srt.runtime_context import get_platform
 logger = logging.getLogger(__name__)
 
 
-def resolve_inkling_attention_backend(server_args: Any) -> str:
-    """Also read by the prefill-graph default, before overrides materialize."""
+def resolve_inkling_attention_backend(server_args: Any) -> Optional[str]:
+    """The backend Inkling prefill runs on; the prefill-graph default reads it
+    before overrides materialize."""
     cfg = resolving_view(server_args)
     if not is_attention_backend_not_set(cfg):
-        return (
-            cfg.attention_backend
-            or cfg.prefill_attention_backend
-            or cfg.decode_attention_backend
-        )
-    return "fa4" if get_platform().is_sm100 else "triton"
+        return cfg.prefill_attention_backend or cfg.attention_backend
+    return "fa4" if get_platform().is_sm90 or get_platform().is_sm100 else "triton"
 
 
 @_register_for(
@@ -70,7 +67,7 @@ def _inkling_overrides(server_args: Any, hf_config: Any) -> dict:
     # handle_mamba_radix_cache rejects extra_buffer on a model without it.
     if not cfg.disable_radix_cache:
         overrides["uses_mamba_radix_cache"] = True
-    # Inkling attention runs only on the fa4 (Blackwell) or triton backends --
+    # Inkling attention runs only on the fa4 (Hopper/Blackwell) or triton backends --
     # models/inkling_common/attn.py asserts attention_backend in {fa4, triton}.
     # The generic resolver would otherwise pick trtllm_mha (SM100) / fa3
     # (Hopper), so a bare launch fails on the first attention forward. Pin a

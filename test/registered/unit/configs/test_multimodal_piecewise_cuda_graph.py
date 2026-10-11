@@ -4,8 +4,12 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from sglang.srt.arg_groups.cuda_graph_hook import apply_cuda_graph_compatibility
+from sglang.srt.arg_groups.cuda_graph_hook import (
+    apply_cuda_graph_compatibility,
+    apply_inkling_prefill_cuda_graph_default,
+)
 from sglang.srt.arg_groups.model_hook import handle_model_capability_adjustments
+from sglang.srt.arg_groups.model_overrides.inkling import _inkling_overrides
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.configs.embedding_model_spec import resolve_embedding_model_spec
 from sglang.srt.configs.model_config import (
@@ -102,6 +106,43 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
             self.assertTrue(runner.can_run_graph(forward_batch))
         with patch(target, return_value=False):
             self.assertFalse(runner.can_run_graph(forward_batch))
+
+    def test_inkling_full_prefill_graph_follows_the_attention_backend(self):
+        # (platform, explicit backend flags) -> (attention backend, prefill graph)
+        cases = [
+            (dict(is_sm90=True, is_sm100=False), {}, "fa4", Backend.FULL),
+            (dict(is_sm90=False, is_sm100=True), {}, "fa4", Backend.FULL),
+            (dict(is_sm90=False, is_sm100=False), {}, "triton", None),
+            (
+                dict(is_sm90=True, is_sm100=False),
+                dict(attention_backend="triton"),
+                None,
+                None,
+            ),
+            (
+                dict(is_sm90=True, is_sm100=False),
+                dict(attention_backend="fa4", prefill_attention_backend="triton"),
+                None,
+                None,
+            ),
+        ]
+        for platform, flags, attention_backend, prefill_backend in cases:
+            with self.subTest(platform=platform, flags=flags):
+                args = ServerArgs(model_path="dummy", **flags)
+                args._model_config = SimpleNamespace(
+                    hf_config=SimpleNamespace(
+                        architectures=["InklingForConditionalGeneration"]
+                    ),
+                )
+                with override_platform(is_cuda=True, **platform):
+                    overrides = _inkling_overrides(args, None)
+                    apply_inkling_prefill_cuda_graph_default(args)
+
+                self.assertEqual(overrides.get("attention_backend"), attention_backend)
+                self.assertEqual(
+                    resolution_result(args, "cuda_graph_backend_prefill"),
+                    prefill_backend,
+                )
 
     def test_embedding_gemma_forces_breakable_prefill(self):
         args = ServerArgs(model_path="dummy")
