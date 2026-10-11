@@ -471,11 +471,12 @@ def _collect_image_span_requests(
             if (token_count := _item_overlap(item, chunk_start, chunk_end)) is not None
         ]
         for _idx, item, token_count in req_info.overlapping:
-            span = spans.setdefault(
-                (item.hash, token_count),
-                ImageSpanRequest(hash=item.hash, span_len=token_count, item=item),
-            )
-            if span.item is not item:
+            span = spans.get((item.hash, token_count))
+            if span is None:
+                spans[(item.hash, token_count)] = ImageSpanRequest(
+                    hash=item.hash, span_len=token_count, item=item
+                )
+            elif span.item is not item:
                 span.duplicates.append(item)
     return list(spans.values())
 

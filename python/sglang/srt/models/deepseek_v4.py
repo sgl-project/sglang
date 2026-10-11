@@ -4619,7 +4619,8 @@ class DeepseekV4ForCausalLM(nn.Module):
     def _image_span_signature(self, item, span_len: int):
         h, w = int(item.n_vit_h), int(item.n_vit_w)
         r = self.config.vision_downsample_ratio
-        expected = len(image_token_types((h + r - 1) // r, (w + r - 1) // r))
+        lh, lw = (h + r - 1) // r, (w + r - 1) // r
+        expected = 2 + lh * (lw + 1)
         if expected != span_len:
             raise ValueError(
                 f"image grid {(h, w)} yields {expected} span tokens, "
