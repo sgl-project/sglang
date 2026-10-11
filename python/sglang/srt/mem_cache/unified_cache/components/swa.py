@@ -69,12 +69,19 @@ class SWAComponent(TreeComponent):
     """
 
     def __init__(self, cache: UnifiedRadixCache, params: CacheInitParams):
+        from sglang.srt.mem_cache.allocator.hisparse import (
+            DeepSeekV4HiSparseTokenToKVPoolAllocator,
+        )
         from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 
+        # DeepSeek V4 HiSparse forces --disable-radix-cache, where this component
+        # only frees through free_swa_segment / free / free_group_*, which the
+        # HiSparse allocator defines.
         assert isinstance(
-            params.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator
+            params.token_to_kv_pool_allocator,
+            (SWATokenToKVPoolAllocator, DeepSeekV4HiSparseTokenToKVPoolAllocator),
         ), (
-            f"SWAComponent requires SWATokenToKVPoolAllocator, got {type(params.token_to_kv_pool_allocator)}"
+            f"SWAComponent requires an SWA allocator, got {type(params.token_to_kv_pool_allocator)}"
         )
         if params.sliding_window_size is None or params.sliding_window_size <= 0:
             raise ValueError("SWAComponent requires a positive sliding_window_size")
