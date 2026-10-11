@@ -74,7 +74,7 @@ def test_returns_video_audio_and_path(tmp_path):
     clip = tmp_path / "out.mp4"
     _write_mp4(clip, with_audio=True)
 
-    _, (video, audio, video_path) = _run_node(clip)
+    _, (video, audio, video_path, _) = _run_node(clip)
 
     assert video_path == str(clip)
     assert audio["sample_rate"] == SAMPLE_RATE
@@ -88,7 +88,7 @@ def test_clip_without_audio_yields_silent_audio(tmp_path):
     clip = tmp_path / "silent.mp4"
     _write_mp4(clip, with_audio=False)
 
-    _, (_, audio, _) = _run_node(clip)
+    _, (_, audio, _, _) = _run_node(clip)
 
     assert audio["waveform"].shape == (1, 1, 1)
     assert audio["waveform"].abs().max() == 0
@@ -122,4 +122,4 @@ def test_node_keeps_video_node_inputs_and_is_registered():
         not in NODES.SGLDiffusionGenerateVideo.INPUT_TYPES()["optional"]
     )
     assert "SGLDiffusionGenerateAudioVideo" in NODES.NODE_CLASS_MAPPINGS
-    assert NODES.SGLDiffusionGenerateVideo.RETURN_TYPES == ("VIDEO", "STRING")
+    assert NODES.SGLDiffusionGenerateVideo.RETURN_TYPES[:2] == ("VIDEO", "STRING")

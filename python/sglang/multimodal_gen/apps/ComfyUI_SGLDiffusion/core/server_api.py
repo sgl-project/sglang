@@ -10,6 +10,18 @@ from typing import Any, Dict, Optional
 import requests
 
 
+def _error_detail(error: requests.exceptions.RequestException) -> str:
+    """Append the server's `detail` to an HTTP error, e.g. why a request was a 400."""
+    if isinstance(error, requests.exceptions.HTTPError) and error.response is not None:
+        try:
+            detail = error.response.json().get("detail")
+        except ValueError:
+            detail = None
+        if detail:
+            return f"{error} ({detail})"
+    return str(error)
+
+
 class SGLDiffusionServerAPI:
     """Client for SGLang Diffusion HTTP server API."""
 
@@ -77,6 +89,7 @@ class SGLDiffusionServerAPI:
         background: Optional[str] = "auto",
         output_format: Optional[str] = None,
         generator_device: Optional[str] = "cuda",
+        enhance_prompt: bool = False,
     ) -> Dict[str, Any]:
         """
         Generate or edit an image using SGLang Diffusion API.
@@ -102,6 +115,8 @@ class SGLDiffusionServerAPI:
             background: Background type ("auto", "transparent", "opaque")
             output_format: Output format ("png", "jpeg", "webp")
             generator_device: Device for random generator ("cuda" or "cpu")
+            enhance_prompt: Rewrite the prompt server-side; the rewrite comes
+                back as `revised_prompt` on each result
 
         Returns:
             Dictionary containing the API response with generated/edited image data
@@ -130,6 +145,7 @@ class SGLDiffusionServerAPI:
             background=background,
             output_format=output_format,
             generator_device=generator_device,
+            enhance_prompt=enhance_prompt,
         )
 
         # If image_path is provided, use edit endpoint
@@ -174,7 +190,7 @@ class SGLDiffusionServerAPI:
                 response.raise_for_status()
                 return response.json()
             except requests.exceptions.RequestException as e:
-                raise RuntimeError(f"Failed to edit image: {str(e)}")
+                raise RuntimeError(f"Failed to edit image: {_error_detail(e)}")
             finally:
                 # Close file handles
                 for file_tuple in files.values():
@@ -198,7 +214,7 @@ class SGLDiffusionServerAPI:
                 response.raise_for_status()
                 return response.json()
             except requests.exceptions.RequestException as e:
-                raise RuntimeError(f"Failed to generate image: {str(e)}")
+                raise RuntimeError(f"Failed to generate image: {_error_detail(e)}")
 
     def generate_video(
         self,
@@ -218,6 +234,7 @@ class SGLDiffusionServerAPI:
         input_reference: Optional[str] = None,
         video_path: Optional[str] = None,
         output_path: Optional[str] = None,
+        enhance_prompt: bool = False,
         extra_fields: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
@@ -240,6 +257,8 @@ class SGLDiffusionServerAPI:
             input_reference: Path to input reference image for image-to-video
             video_path: Path or URL of a source clip for video-to-video
                 (restyling or extending an existing video)
+            enhance_prompt: Rewrite the prompt server-side; the rewrite comes
+                back as `revised_prompt` on the completed job
             extra_fields: Model-specific request fields merged into the payload
                 last, so a caller can reach a model's own request surface
                 (MiniMax-H3's `task`/`conditions`/`target`, per-model flow
@@ -281,6 +300,8 @@ class SGLDiffusionServerAPI:
             payload["seed"] = seed
         if enable_teacache:
             payload["enable_teacache"] = True
+        if enhance_prompt:
+            payload["enhance_prompt"] = True
         if generator_device:
             payload["generator_device"] = generator_device
         if input_reference:
@@ -358,7 +379,7 @@ class SGLDiffusionServerAPI:
                 f"Video generation timed out after {max_wait_time} seconds"
             )
         except requests.exceptions.RequestException as e:
-            raise RuntimeError(f"Failed to generate video: {str(e)}")
+            raise RuntimeError(f"Failed to generate video: {_error_detail(e)}")
 
     def _build_image_common_params(
         self,
@@ -374,6 +395,7 @@ class SGLDiffusionServerAPI:
         background: Optional[str] = None,
         output_format: Optional[str] = None,
         generator_device: Optional[str] = None,
+        enhance_prompt: bool = False,
     ) -> Dict[str, Any]:
         """
         Build common parameters for both image generation and editing.
@@ -405,6 +427,8 @@ class SGLDiffusionServerAPI:
             params["output_format"] = output_format
         if generator_device:
             params["generator_device"] = generator_device
+        if enhance_prompt:
+            params["enhance_prompt"] = True
 
         return params
 

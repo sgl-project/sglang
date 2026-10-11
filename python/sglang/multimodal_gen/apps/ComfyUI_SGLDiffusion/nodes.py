@@ -391,11 +391,20 @@ class SGLDiffusionGenerateImage:
                         "default": False,
                     },
                 ),
+                "enhance_prompt": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Rewrite the prompt on the server (needs "
+                        "--prompt-enhancer-config); the result is returned "
+                        "as revised_prompt",
+                    },
+                ),
             },
         }
 
-    RETURN_TYPES = ("IMAGE",)
-    RETURN_NAMES = ("image",)
+    RETURN_TYPES = ("IMAGE", "STRING")
+    RETURN_NAMES = ("image", "revised_prompt")
     FUNCTION = "generate_image"
     CATEGORY = "SGLDiffusion"
     OUTPUT_NODE = False
@@ -412,6 +421,7 @@ class SGLDiffusionGenerateImage:
         width: int = 1024,
         height: int = 1024,
         enable_teacache: bool = False,
+        enhance_prompt: bool = False,
     ):
         """Generate image using SGLang Diffusion API."""
         if not positive_prompt:
@@ -437,6 +447,8 @@ class SGLDiffusionGenerateImage:
             request_params["seed"] = seed
         if enable_teacache:
             request_params["enable_teacache"] = True
+        if enhance_prompt:
+            request_params["enhance_prompt"] = True
         if image is not None:
             # If the image is empty, use the size of the image to generate the image
             if is_empty_image(image):
@@ -457,8 +469,9 @@ class SGLDiffusionGenerateImage:
             raise RuntimeError("No image data in response")
         image_data = response["data"][0]["b64_json"]
         image = convert_b64_to_tensor_image(image_data)
+        revised_prompt = response["data"][0].get("revised_prompt") or positive_prompt
 
-        return (image,)
+        return (image, revised_prompt)
 
 
 class SGLDiffusionGenerateVideo:
@@ -576,19 +589,27 @@ class SGLDiffusionGenerateVideo:
                         "default": False,
                     },
                 ),
+                "enhance_prompt": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Rewrite the prompt on the server (needs "
+                        "--prompt-enhancer-config); the result is returned "
+                        "as revised_prompt",
+                    },
+                ),
             },
         }
 
-    RETURN_TYPES = ("VIDEO", "STRING")
-    RETURN_NAMES = ("video", "video_path")
+    RETURN_TYPES = ("VIDEO", "STRING", "STRING")
+    RETURN_NAMES = ("video", "video_path", "revised_prompt")
     FUNCTION = "generate_video"
     CATEGORY = "SGLDiffusion"
     OUTPUT_NODE = False
 
     def generate_video(self, **kwargs):
         """Generate video using SGLang Diffusion API."""
-        video, video_path = self._generate(**kwargs)
-        return (video, video_path)
+        return self._generate(**kwargs)
 
     def _generate(
         self,
@@ -606,6 +627,7 @@ class SGLDiffusionGenerateVideo:
         fps: int = 24,
         seconds: int = 5,
         enable_teacache: bool = False,
+        enhance_prompt: bool = False,
         extra_fields: dict = None,
     ):
         if not positive_prompt:
@@ -636,6 +658,8 @@ class SGLDiffusionGenerateVideo:
             request_params["seed"] = seed
         if enable_teacache:
             request_params["enable_teacache"] = True
+        if enhance_prompt:
+            request_params["enhance_prompt"] = True
         if num_frames is not None:
             request_params["num_frames"] = num_frames
         if image is not None:
@@ -657,7 +681,7 @@ class SGLDiffusionGenerateVideo:
         except Exception as e:
             raise RuntimeError(f"Failed to generate video: {str(e)}")
 
-        return video, video_path
+        return video, video_path, response.get("revised_prompt") or positive_prompt
 
 
 class SGLDiffusionGenerateAudioVideo(SGLDiffusionGenerateVideo):
@@ -682,8 +706,8 @@ class SGLDiffusionGenerateAudioVideo(SGLDiffusionGenerateVideo):
         )
         return types
 
-    RETURN_TYPES = ("VIDEO", "AUDIO", "STRING")
-    RETURN_NAMES = ("video", "audio", "video_path")
+    RETURN_TYPES = ("VIDEO", "AUDIO", "STRING", "STRING")
+    RETURN_NAMES = ("video", "audio", "video_path", "revised_prompt")
     FUNCTION = "generate_audio_video"
 
     def generate_audio_video(self, extra_request_json: str = "", **kwargs):
@@ -696,8 +720,10 @@ class SGLDiffusionGenerateAudioVideo(SGLDiffusionGenerateVideo):
             if not isinstance(extra_fields, dict):
                 raise ValueError("extra_request_json must be a JSON object")
 
-        video, video_path = self._generate(extra_fields=extra_fields, **kwargs)
-        return (video, extract_audio(video_path), video_path)
+        video, video_path, revised_prompt = self._generate(
+            extra_fields=extra_fields, **kwargs
+        )
+        return (video, extract_audio(video_path), video_path, revised_prompt)
 
 
 class SGLDiffusionGenerateH3:

@@ -36,7 +36,8 @@ Connect to a standalone SGLang Diffusion server.
    - `SGLDiffusion Generate Video`: For text-to-video, image-to-video, and video-to-video (connect a `VIDEO` to restyle or extend a clip).
    - `SGLDiffusion Generate Audio-Video`: One node for any model that muxes audio into its MP4 (MiniMax-H3, LTX-2, MOVA, Kandinsky-6). Returns `VIDEO` plus the soundtrack as `AUDIO` for ComfyUI's audio nodes; model-specific request fields go in `extra_request_json`. Needs PyAV, which ComfyUI already ships. There is no `AUDIO` input yet because `/v1/videos` has no audio-conditioning field.
    - `SGLDiffusion Generate MiniMax-H3`: For joint video-and-audio on a standalone server.
-4. **LoRA Support**: Use `SGLDiffusion Server Set LoRA` and `SGLDiffusion Server Unset LoRA`.
+4. **Prompt Enhancement**: Turn on `enhance_prompt` on the image, video, or audio-video node to have the server rewrite the prompt (the server must run with `--prompt-enhancer-config`). The rewrite comes out as the `revised_prompt` STRING, so you can show it, edit it, or feed it into another node.
+5. **LoRA Support**: Use `SGLDiffusion Server Set LoRA` and `SGLDiffusion Server Unset LoRA`.
 
 ### Mode 2: Integrated Mode (Tight Integration)
 ComfyUI keeps CLIP, VAE, and the sampler loop. SGLang loads only the DiT and
