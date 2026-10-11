@@ -216,6 +216,7 @@ class SGLDiffusionServerAPI:
         enable_teacache: bool = False,
         generator_device: Optional[str] = "cuda",
         input_reference: Optional[str] = None,
+        video_path: Optional[str] = None,
         output_path: Optional[str] = None,
         extra_fields: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
@@ -237,6 +238,8 @@ class SGLDiffusionServerAPI:
             enable_teacache: Enable TEA cache acceleration
             generator_device: Device for random generator ("cuda" or "cpu")
             input_reference: Path to input reference image for image-to-video
+            video_path: Path or URL of a source clip for video-to-video
+                (restyling or extending an existing video)
             extra_fields: Model-specific request fields merged into the payload
                 last, so a caller can reach a model's own request surface
                 (MiniMax-H3's `task`/`conditions`/`target`, per-model flow
@@ -282,6 +285,8 @@ class SGLDiffusionServerAPI:
             payload["generator_device"] = generator_device
         if input_reference:
             payload["input_reference"] = input_reference
+        if video_path:
+            payload["video_path"] = video_path
         if output_path:
             payload["output_path"] = output_path
         # merged last so a model-specific field wins over a generic default of

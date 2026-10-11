@@ -8,6 +8,7 @@ import uuid
 
 import folder_paths
 import torch
+from comfy_api.input import VideoInput
 
 from .core import SGLDiffusionGenerator, SGLDiffusionServerAPI
 
@@ -24,6 +25,7 @@ from .utils import (
     convert_b64_to_tensor_image,
     convert_video_to_comfy_video,
     get_image_path,
+    get_video_path,
     is_empty_image,
 )
 
@@ -488,6 +490,13 @@ class SGLDiffusionGenerateVideo:
                         "tooltip": "input image to use for image-to-video",
                     },
                 ),
+                "video": (
+                    "VIDEO",
+                    {
+                        "tooltip": "source clip for video-to-video "
+                        "(restyle or extend an existing video)",
+                    },
+                ),
                 "seed": (
                     "INT",
                     {
@@ -580,6 +589,7 @@ class SGLDiffusionGenerateVideo:
         positive_prompt: str,
         negative_prompt: str = "",
         image: torch.Tensor = None,
+        video: VideoInput = None,
         seed: int = 1024,
         steps: int = 6,
         cfg: float = 7.0,
@@ -627,6 +637,8 @@ class SGLDiffusionGenerateVideo:
                 request_params["size"] = size
             else:
                 request_params["input_reference"] = get_image_path(image)
+        if video is not None:
+            request_params["video_path"] = get_video_path(video)
 
         # Call API
         try:

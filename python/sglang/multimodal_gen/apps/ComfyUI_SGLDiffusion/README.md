@@ -33,7 +33,7 @@ Connect to a standalone SGLang Diffusion server.
 2. **Connect to Server**: Use the `SGLDiffusion Server Model` node to connect (default: `http://localhost:3000/v1`).
 3. **Generate Content**:
    - `SGLDiffusion Generate Image`: For text-to-image and image editing.
-   - `SGLDiffusion Generate Video`: For text-to-video and image-to-video.
+   - `SGLDiffusion Generate Video`: For text-to-video, image-to-video, and video-to-video (connect a `VIDEO` to restyle or extend a clip).
    - `SGLDiffusion Generate MiniMax-H3`: For joint video-and-audio on a standalone server.
 4. **LoRA Support**: Use `SGLDiffusion Server Set LoRA` and `SGLDiffusion Server Unset LoRA`.
 

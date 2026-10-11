@@ -97,6 +97,20 @@ def get_image_path(image: torch.Tensor) -> str:
     return file_path
 
 
+def get_video_path(video: VideoInput) -> str:
+    """Return a file path for a VIDEO value, writing an MP4 temp file if needed."""
+    if isinstance(video, SGLDVideoInput) and os.path.exists(video.video_path):
+        return video.video_path
+
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    file_path = os.path.join(
+        folder_paths.get_temp_directory(),
+        f"sgl_input_{ts}_{uuid.uuid4().hex[:8]}.mp4",
+    )
+    video.save_to(file_path)
+    return file_path
+
+
 def convert_b64_to_tensor_image(b64_image: str) -> torch.Tensor:
     """
     Convert base64 encoded image to ComfyUI IMAGE format (torch.Tensor).
