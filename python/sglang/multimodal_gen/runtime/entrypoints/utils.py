@@ -53,7 +53,6 @@ logger = init_logger(__name__)
 _MAX_CACHED_CUDA_VIDEO_BUFFER_BYTES = 1024 * 1024 * 1024
 _MAX_CUDA_VIDEO_CONVERSION_CHUNK_BYTES = 128 * 1024 * 1024
 _MAX_PARALLEL_CUDA_VIDEO_SAVES = 2
-_PARALLEL_NUMPY_VIDEO_MIN_BYTES = 64 * 1024 * 1024
 _cuda_video_buffer_cache_lock = threading.Lock()
 _cached_cuda_video_buffer: "_CudaMemfdVideoBuffer | None" = None
 
@@ -1089,10 +1088,6 @@ def _split_sample_audio(sample: Any) -> tuple[Any, Any]:
     return sample, None
 
 
-def _numpy_frame_to_uint8(frame: np.ndarray) -> np.ndarray:
-    return (np.clip(frame, 0.0, 1.0) * 255.0).astype(np.uint8)
-
-
 def _sample_to_uint8_frames(sample: Any) -> list[Any]:
     """return numpy frames in THCW format"""
     if isinstance(sample, torch.Tensor):
@@ -1141,12 +1136,7 @@ def _sample_to_uint8_frames(sample: Any) -> list[Any]:
         return list(videos)
 
     if arr.dtype != np.uint8:
-        if len(arr) > 1 and arr.nbytes >= _PARALLEL_NUMPY_VIDEO_MIN_BYTES:
-            # NumPy releases the GIL for these elementwise operations. Work on
-            # individual frames to avoid several full-video float temporaries.
-            with ThreadPoolExecutor(max_workers=min(4, len(arr))) as pool:
-                return list(pool.map(_numpy_frame_to_uint8, arr))
-        arr = _numpy_frame_to_uint8(arr)
+        arr = (np.clip(arr, 0.0, 1.0) * 255.0).astype(np.uint8)
     return list(arr)
 
 

@@ -4469,10 +4469,14 @@ class DeepseekV4ForCausalLM(nn.Module):
             if (
                 get_parallel().attn_cp_size != 1
                 or get_parallel().pp_group.world_size != 1
-                or not get_moe_a2a_backend().is_none()
+                or not (
+                    get_moe_a2a_backend().is_none()
+                    or (_is_cuda and get_moe_a2a_backend().is_megamoe())
+                )
             ):
                 raise ValueError(
-                    "V4.1 vision currently supports TP/EP/DP without CP, PP or MoE A2A"
+                    "V4.1 vision supports TP/EP/DP without CP or PP; "
+                    "MoE A2A requires CUDA MegaMoE"
                 )
 
             args = SimpleNamespace(**vars(config), dim=config.hidden_size)
@@ -4593,7 +4597,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         spans = []
         device, dtype = self.image_start.device, self.image_start.dtype
         for item in items:
-            item.reconstruct(device.index, ipc_consumer_count=self.tp_size)
+            item.reconstruct(device.index)
             h, w = int(item.n_vit_h), int(item.n_vit_w)
             pixels = torch.as_tensor(item.feature, device=device)
             plan = item.model_specific_data.get(GPU_PLAN_KEY)
