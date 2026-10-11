@@ -111,6 +111,38 @@ def get_video_path(video: VideoInput) -> str:
     return file_path
 
 
+def extract_audio(video_path: str) -> dict:
+    """
+    Decode the audio track of a video file into a ComfyUI AUDIO value.
+
+    Returns {"waveform": [1, channels, samples] float32, "sample_rate": int}.
+    A clip with no audio stream yields one silent sample so downstream audio
+    nodes still receive a valid value.
+    """
+    import av
+
+    with av.open(video_path) as container:
+        stream = next((s for s in container.streams if s.type == "audio"), None)
+        if stream is None:
+            return {"waveform": torch.zeros(1, 1, 1), "sample_rate": 44100}
+
+        sample_rate = stream.rate
+        resampler = av.AudioResampler(format="fltp", rate=sample_rate)
+        chunks = []
+        for frame in container.decode(stream):
+            for resampled in resampler.resample(frame):
+                chunks.append(torch.from_numpy(resampled.to_ndarray()))
+        for resampled in resampler.resample(None):
+            chunks.append(torch.from_numpy(resampled.to_ndarray()))
+
+    if not chunks:
+        return {"waveform": torch.zeros(1, 1, 1), "sample_rate": sample_rate}
+    return {
+        "waveform": torch.cat(chunks, dim=1).unsqueeze(0),
+        "sample_rate": sample_rate,
+    }
+
+
 def convert_b64_to_tensor_image(b64_image: str) -> torch.Tensor:
     """
     Convert base64 encoded image to ComfyUI IMAGE format (torch.Tensor).

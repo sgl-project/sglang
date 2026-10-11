@@ -34,6 +34,7 @@ Connect to a standalone SGLang Diffusion server.
 3. **Generate Content**:
    - `SGLDiffusion Generate Image`: For text-to-image and image editing.
    - `SGLDiffusion Generate Video`: For text-to-video, image-to-video, and video-to-video (connect a `VIDEO` to restyle or extend a clip).
+   - `SGLDiffusion Generate Audio-Video`: One node for any model that muxes audio into its MP4 (MiniMax-H3, LTX-2, MOVA, Kandinsky-6). Returns `VIDEO` plus the soundtrack as `AUDIO` for ComfyUI's audio nodes; model-specific request fields go in `extra_request_json`. Needs PyAV, which ComfyUI already ships. There is no `AUDIO` input yet because `/v1/videos` has no audio-conditioning field.
    - `SGLDiffusion Generate MiniMax-H3`: For joint video-and-audio on a standalone server.
 4. **LoRA Support**: Use `SGLDiffusion Server Set LoRA` and `SGLDiffusion Server Unset LoRA`.
 

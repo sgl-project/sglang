@@ -3,6 +3,7 @@ ComfyUI nodes for SGLang Diffusion integration.
 Provides nodes for connecting to SGLang Diffusion server and generating images/videos.
 """
 
+import json
 import os
 import uuid
 
@@ -24,6 +25,7 @@ _enable_gguf_in_diffusion_models()
 from .utils import (
     convert_b64_to_tensor_image,
     convert_video_to_comfy_video,
+    extract_audio,
     get_image_path,
     get_video_path,
     is_empty_image,
@@ -583,7 +585,12 @@ class SGLDiffusionGenerateVideo:
     CATEGORY = "SGLDiffusion"
     OUTPUT_NODE = False
 
-    def generate_video(
+    def generate_video(self, **kwargs):
+        """Generate video using SGLang Diffusion API."""
+        video, video_path = self._generate(**kwargs)
+        return (video, video_path)
+
+    def _generate(
         self,
         sgld_client: SGLDiffusionServerAPI,
         positive_prompt: str,
@@ -599,8 +606,8 @@ class SGLDiffusionGenerateVideo:
         fps: int = 24,
         seconds: int = 5,
         enable_teacache: bool = False,
+        extra_fields: dict = None,
     ):
-        """Generate video using SGLang Diffusion API."""
         if not positive_prompt:
             raise ValueError("Prompt cannot be empty")
 
@@ -615,6 +622,8 @@ class SGLDiffusionGenerateVideo:
             "fps": fps,
             "output_path": output_dir,
         }
+        if extra_fields:
+            request_params["extra_fields"] = extra_fields
 
         # Add optional parameters if provided
         if negative_prompt:
@@ -648,7 +657,47 @@ class SGLDiffusionGenerateVideo:
         except Exception as e:
             raise RuntimeError(f"Failed to generate video: {str(e)}")
 
-        return (video, video_path)
+        return video, video_path
+
+
+class SGLDiffusionGenerateAudioVideo(SGLDiffusionGenerateVideo):
+    """Generate a video and hand back its audio track as a ComfyUI AUDIO.
+
+    One node for every server model that muxes audio into its MP4 (MiniMax-H3,
+    LTX-2, MOVA, Kandinsky-6, ...). Model-specific request fields go through
+    `extra_request_json`, so a new model needs no new node.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        types = super().INPUT_TYPES()
+        types["optional"]["extra_request_json"] = (
+            "STRING",
+            {
+                "default": "",
+                "multiline": True,
+                "tooltip": "JSON object merged into the /v1/videos request, "
+                'e.g. {"flow_shift": 12.0}. Overrides the fields above.',
+            },
+        )
+        return types
+
+    RETURN_TYPES = ("VIDEO", "AUDIO", "STRING")
+    RETURN_NAMES = ("video", "audio", "video_path")
+    FUNCTION = "generate_audio_video"
+
+    def generate_audio_video(self, extra_request_json: str = "", **kwargs):
+        extra_fields = None
+        if extra_request_json.strip():
+            try:
+                extra_fields = json.loads(extra_request_json)
+            except json.JSONDecodeError as e:
+                raise ValueError(f"extra_request_json is not valid JSON: {e}")
+            if not isinstance(extra_fields, dict):
+                raise ValueError("extra_request_json must be a JSON object")
+
+        video, video_path = self._generate(extra_fields=extra_fields, **kwargs)
+        return (video, extract_audio(video_path), video_path)
 
 
 class SGLDiffusionGenerateH3:
@@ -987,6 +1036,7 @@ NODE_CLASS_MAPPINGS = {
     "SGLDiffusionServerModel": SGLDiffusionServerModel,
     "SGLDiffusionGenerateImage": SGLDiffusionGenerateImage,
     "SGLDiffusionGenerateVideo": SGLDiffusionGenerateVideo,
+    "SGLDiffusionGenerateAudioVideo": SGLDiffusionGenerateAudioVideo,
     "SGLDiffusionGenerateH3": SGLDiffusionGenerateH3,
     "SGLDiffusionServerSetLora": SGLDiffusionServerSetLora,
     "SGLDiffusionServerUnsetLora": SGLDiffusionServerUnsetLora,
@@ -999,6 +1049,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SGLDiffusionServerModel": "SGLDiffusion Server Model",
     "SGLDiffusionGenerateImage": "SGLDiffusion Generate Image",
     "SGLDiffusionGenerateVideo": "SGLDiffusion Generate Video",
+    "SGLDiffusionGenerateAudioVideo": "SGLDiffusion Generate Audio-Video",
     "SGLDiffusionGenerateH3": "SGLDiffusion Generate MiniMax-H3",
     "SGLDiffusionServerSetLora": "SGLDiffusion Server Set LoRA",
     "SGLDiffusionServerUnsetLora": "SGLDiffusion Server Unset LoRA",
