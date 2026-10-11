@@ -189,10 +189,17 @@ def test_kda_prefill_checkpoints(state_dtype, layout, prefix_len):
 
 
 @pytest.mark.parametrize(
-    "extend_lens", [(130, 128), (1,)], ids=["tracked_prefill", "single_token"]
+    "extend_lens",
+    [(130, 128), (1,), (1, 1), (2, 0)],
+    ids=[
+        "tracked_prefill",
+        "single_token",
+        "packed_single_tokens",
+        "padded_short_batch",
+    ],
 )
 def test_kda_backend_prefill_dispatch_and_tracked_state(extend_lens):
-    """Raw beta works in FlashInfer and the single-token Triton fallback."""
+    """Short packed batches must preserve FP32 state without entering recurrence."""
     with get_parallel().override(attn_dcp_rank=0, attn_dcp_size=1):
         case = KDAAttentionCase(
             name="flashinfer_kda_tracked_extend",
@@ -225,6 +232,7 @@ def test_kda_backend_prefill_dispatch_and_tracked_state(extend_lens):
         batch.mamba_track_seqlens_cpu = list(extend_lens)
         fixture.actual_module.attn.lower_bound = -5.0
         cache = fixture.runner.req_to_token_pool.mamba2_layer_cache(0)
+        assert cache.temporal.dtype == torch.float32
         initial_conv, initial_ssm = cache.conv[0].clone(), cache.temporal.clone()
 
         triton_output = run_kda_fixture_eager(fixture)
