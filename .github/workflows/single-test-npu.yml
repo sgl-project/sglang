@@ -58,7 +58,7 @@ jobs:
             fi
           done
           
-          pip install websocket-client websockets uvicorn==0.49.0
+          pip install websocket-client websockets uvicorn==0.49.0 peft
           # copy required file from our daily cache
           cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
           cp ~/.cache/modelscope/hub/datasets/tmp/test.jsonl /tmp
