@@ -4,6 +4,11 @@ export const DiffusionModelCatalog = ({ category }) => {
   const MODEL_CATALOG = {
   image: [
     {
+      name: "HunyuanImage-3.0",
+      modelIds: ["tencent/HunyuanImage-3.0", "tencent/HunyuanImage-3.0-Instruct"],
+      cookbook: "/cookbook/diffusion/Tencent/HunyuanImage3",
+    },
+    {
       name: "Anima",
       modelIds: ["circlestone-labs/Anima-Base-v1.0-Diffusers"],
       cookbook: "/cookbook/diffusion/CircleStone/Anima",
@@ -36,8 +41,8 @@ export const DiffusionModelCatalog = ({ category }) => {
       cookbook: "/cookbook/diffusion/Qwen-Image/Qwen-Image",
     },
     {
-      name: "Qwen-Image 2.1",
-      modelIds: ["Qwen/Qwen-Image-2.1"],
+      name: "Qwen-Image 2.1 / Turbo",
+      modelIds: ["Qwen/Qwen-Image-2.1", "Qwen/Qwen-Image-2.1-Turbo"],
       cookbook: "/cookbook/diffusion/Qwen-Image/Qwen-Image-2.1",
     },
     {
@@ -172,6 +177,11 @@ export const DiffusionModelCatalog = ({ category }) => {
         "Wan-AI/Wan2.2-I2V-A14B-Diffusers",
       ],
       cookbook: "/cookbook/diffusion/Wan/Wan2.2",
+    },
+    {
+      name: "Wan-Animate-2",
+      modelIds: ["Wan-AI/Wan2.2-Animate-2-14B-Diffusers"],
+      cookbook: "/cookbook/diffusion/Wan/Wan-Animate-2",
     },
     {
       name: "FastWan / TurboWan",

@@ -37,11 +37,11 @@ norm/        RMSNorm / LayerNorm / GroupNorm and their fused epilogues
 modulate/    adaLN modulate, gating, timestep conditioning
 rope/        rotary embeddings and the QK-norm chains fused into them
 activation/  SiLU / GLU / GELU fusions
-quantization/ MXFP8 producers whose scales land in the GEMM's swizzled layout
+quantization/ FP8 rowwise producers fused into the GEMM input path
 attention/   sparse linear attention, gated delta-net
 routing/     diffusion-model MoE routing and expert selection
 layout/      pure data movement: USP/Ulysses relayout, varlen pack, causal pad
-common/      numerics primitives, platform predicates, non-Triton fallbacks
+common/      platform predicates, non-Triton fallbacks (numerics: kernels/numerics.py)
 sites/       request-scoped mount policy — NOT kernels (see below)
 ext/         JIT C++/CUDA extensions (Hunyuan3D raster/inpaint) — NOT kernels
 ../../kda_kernels/  agent-generated implementations and their JIT CUDA sources
@@ -207,6 +207,8 @@ zero payload and scale `1e-12`. The local CUDA-graph benchmark is
 existing two kernels and the fusion, both alone and with the same FP8 GEMM.
 
 ### MXFP8 producers (online `mxfp8`, cuBLASLt block-scaled GEMM on SM100)
+
+Defined in `sglang.kernels.ops.quantization.mxfp8_swizzled_triton` and re-exported here.
 
 | Entry point | Backend | Contract |
 |---|---|---|
