@@ -68,14 +68,16 @@ SGLang is an inference framework meant for production level serving.
 It is designed to deliver low-latency and high-throughput inference across a wide range of setups, from a single GPU to large distributed clusters.
 
 <CardGroup cols={2}>
-<Card title="Install SGLang" icon="angles-down" href="./docs/get-started/install">
-  Install SGLang with pip, from source, or via Docker on your preferred hardware platform.
+<Card title="Quickstart" icon="zap" href="./docs/get-started/quickstart">
+  Start a model server and send a request to verify it is running.
 </Card>
 
-<Card title="Quickstart" icon="zap" href="./docs/get-started/quickstart">
-  Launch your first model server and send requests in minutes with OpenAI-compatible APIs.
+<Card title="Examples" icon="code" href="/docs/get-started/examples">
+  Stream replies, request tool calls, and process multiple prompts from Python.
 </Card>
 </CardGroup>
+
+For environment setup and other installation methods, see the [Installation guide](/docs/get-started/install).
 
 ## News and latest blogs
 
@@ -89,6 +91,116 @@ It is designed to deliver low-latency and high-throughput inference across a wid
       alignItems: "stretch",
     }}
   >
+    <a
+      href="https://lmsys.org/blog/2026-09-25-sglang-decision-models/"
+      target="_blank"
+      rel="noopener noreferrer"
+      style={{
+        display: "block",
+        border: "1px solid rgba(128, 128, 128, 0.3)",
+        borderRadius: "0.75rem",
+        overflow: "hidden",
+        textDecoration: "none",
+        color: "inherit",
+        height: "100%",
+      }}
+    >
+      <div
+        style={{
+          aspectRatio: "16 / 9",
+          overflow: "hidden",
+          background: "rgba(128, 128, 128, 0.15)",
+        }}
+      >
+        <img
+          src="https://lmsys.org/images/blog/sglang-decision-models/title-card.png"
+          alt="Scaling JEV-like Decision Models with SGLang"
+          style={{
+            width: "100%",
+            height: "100%",
+            objectFit: "cover",
+            objectPosition: "center",
+            display: "block",
+          }}
+        />
+      </div>
+      <div style={{ padding: "0.9rem 1rem 1rem" }}>
+        <p
+          style={{
+            margin: 0,
+            fontWeight: 600,
+            lineHeight: 1.35,
+            fontSize: "0.98rem",
+          }}
+        >
+          {"Scaling JEV-like Decision Models with SGLang"}
+        </p>
+        <p
+          style={{
+            margin: "0.55rem 0 0",
+            fontSize: "0.85rem",
+            opacity: 0.75,
+          }}
+        >
+          {"September 25, 2026"}
+        </p>
+      </div>
+    </a>
+    <a
+      href="https://lmsys.org/blog/2026-09-16-nvfp4-kv-cache/"
+      target="_blank"
+      rel="noopener noreferrer"
+      style={{
+        display: "block",
+        border: "1px solid rgba(128, 128, 128, 0.3)",
+        borderRadius: "0.75rem",
+        overflow: "hidden",
+        textDecoration: "none",
+        color: "inherit",
+        height: "100%",
+      }}
+    >
+      <div
+        style={{
+          aspectRatio: "16 / 9",
+          overflow: "hidden",
+          background: "rgba(128, 128, 128, 0.15)",
+        }}
+      >
+        <img
+          src="https://lmsys.org/images/blog/nvfp4-kv-cache/kv-cache-layout.svg"
+          alt="Accelerating Long-Context and Agentic Inference with NVFP4 KV Cache"
+          style={{
+            width: "100%",
+            height: "100%",
+            objectFit: "cover",
+            objectPosition: "center",
+            display: "block",
+          }}
+        />
+      </div>
+      <div style={{ padding: "0.9rem 1rem 1rem" }}>
+        <p
+          style={{
+            margin: 0,
+            fontWeight: 600,
+            lineHeight: 1.35,
+            fontSize: "0.98rem",
+          }}
+        >
+          {"Accelerating Long-Context and Agentic Inference with NVFP4 KV Cache"}
+        </p>
+        <p
+          style={{
+            margin: "0.55rem 0 0",
+            fontSize: "0.85rem",
+            opacity: 0.75,
+          }}
+        >
+          {"September 16, 2026"}
+        </p>
+      </div>
+    </a>
     <a
       href="https://lmsys.org/blog/2026-09-10-deepseek-v41/"
       target="_blank"
@@ -141,6 +253,61 @@ It is designed to deliver low-latency and high-throughput inference across a wid
           }}
         >
           {"September 10, 2026"}
+        </p>
+      </div>
+    </a>
+    <a
+      href="https://lmsys.org/blog/2026-08-29-sglang-ssd-expert-pack/"
+      target="_blank"
+      rel="noopener noreferrer"
+      style={{
+        display: "block",
+        border: "1px solid rgba(128, 128, 128, 0.3)",
+        borderRadius: "0.75rem",
+        overflow: "hidden",
+        textDecoration: "none",
+        color: "inherit",
+        height: "100%",
+      }}
+    >
+      <div
+        style={{
+          aspectRatio: "16 / 9",
+          overflow: "hidden",
+          background: "rgba(128, 128, 128, 0.15)",
+        }}
+      >
+        <img
+          src="https://lmsys.org/images/blog/sglang-ssd-expert-pack/expert-pack-layout.png"
+          alt="Running DeepSeek-V4-Flash and Kimi-K3 on Consumer Hardware with SSD Expert Pack"
+          style={{
+            width: "100%",
+            height: "100%",
+            objectFit: "cover",
+            objectPosition: "center",
+            display: "block",
+          }}
+        />
+      </div>
+      <div style={{ padding: "0.9rem 1rem 1rem" }}>
+        <p
+          style={{
+            margin: 0,
+            fontWeight: 600,
+            lineHeight: 1.35,
+            fontSize: "0.98rem",
+          }}
+        >
+          {"Running DeepSeek-V4-Flash and Kimi-K3 on Consumer Hardware with SSD Expert Pack"}
+        </p>
+        <p
+          style={{
+            margin: "0.55rem 0 0",
+            fontSize: "0.85rem",
+            opacity: 0.75,
+          }}
+        >
+          {"August 29, 2026"}
         </p>
       </div>
     </a>
@@ -254,251 +421,16 @@ It is designed to deliver low-latency and high-throughput inference across a wid
         </p>
       </div>
     </a>
-    <a
-      href="https://lmsys.org/blog/2026-08-26-qwen-flash-next/"
-      target="_blank"
-      rel="noopener noreferrer"
-      style={{
-        display: "block",
-        border: "1px solid rgba(128, 128, 128, 0.3)",
-        borderRadius: "0.75rem",
-        overflow: "hidden",
-        textDecoration: "none",
-        color: "inherit",
-        height: "100%",
-      }}
-    >
-      <div
-        style={{
-          aspectRatio: "16 / 9",
-          overflow: "hidden",
-          background: "rgba(128, 128, 128, 0.15)",
-        }}
-      >
-        <img
-          src="https://lmsys.org/images/blog/qwen-flash-next/cover.png"
-          alt="Qwen3.8-Flash-Next: Day-0 Support in SGLang"
-          style={{
-            width: "100%",
-            height: "100%",
-            objectFit: "cover",
-            objectPosition: "center",
-            display: "block",
-          }}
-        />
-      </div>
-      <div style={{ padding: "0.9rem 1rem 1rem" }}>
-        <p
-          style={{
-            margin: 0,
-            fontWeight: 600,
-            lineHeight: 1.35,
-            fontSize: "0.98rem",
-          }}
-        >
-          {"Qwen3.8-Flash-Next: Day-0 Support in SGLang"}
-        </p>
-        <p
-          style={{
-            margin: "0.55rem 0 0",
-            fontSize: "0.85rem",
-            opacity: 0.75,
-          }}
-        >
-          {"August 26, 2026"}
-        </p>
-      </div>
-    </a>
-    <a
-      href="https://lmsys.org/blog/2026-08-21-sglang-fast-recovery/"
-      target="_blank"
-      rel="noopener noreferrer"
-      style={{
-        display: "block",
-        border: "1px solid rgba(128, 128, 128, 0.3)",
-        borderRadius: "0.75rem",
-        overflow: "hidden",
-        textDecoration: "none",
-        color: "inherit",
-        height: "100%",
-      }}
-    >
-      <div
-        style={{
-          aspectRatio: "16 / 9",
-          overflow: "hidden",
-          background: "rgba(128, 128, 128, 0.15)",
-        }}
-      >
-        <img
-          src="https://lmsys.org/images/blog/sglang-fast-recovery/preview.png"
-          alt="Fast Engine Recovery: Sub-Second Engine Restart for SGLang via Weight Cache Daemon"
-          style={{
-            width: "100%",
-            height: "100%",
-            objectFit: "cover",
-            objectPosition: "center",
-            display: "block",
-          }}
-        />
-      </div>
-      <div style={{ padding: "0.9rem 1rem 1rem" }}>
-        <p
-          style={{
-            margin: 0,
-            fontWeight: 600,
-            lineHeight: 1.35,
-            fontSize: "0.98rem",
-          }}
-        >
-          {"Fast Engine Recovery: Sub-Second Engine Restart for SGLang via Weight Cache Daemon"}
-        </p>
-        <p
-          style={{
-            margin: "0.55rem 0 0",
-            fontSize: "0.85rem",
-            opacity: 0.75,
-          }}
-        >
-          {"August 21, 2026"}
-        </p>
-      </div>
-    </a>
-    <a
-      href="https://lmsys.org/blog/2026-08-21-ling3-flash-spec-decode-blackwell/"
-      target="_blank"
-      rel="noopener noreferrer"
-      style={{
-        display: "block",
-        border: "1px solid rgba(128, 128, 128, 0.3)",
-        borderRadius: "0.75rem",
-        overflow: "hidden",
-        textDecoration: "none",
-        color: "inherit",
-        height: "100%",
-      }}
-    >
-      <div
-        style={{
-          aspectRatio: "16 / 9",
-          overflow: "hidden",
-          background: "rgba(128, 128, 128, 0.15)",
-        }}
-      >
-        <img
-          src="https://lmsys.org/images/blog/ling3-flash-batch1/00_headline.png"
-          alt="Chasing the Batch-1 Floor: Ling-3.0-flash Speculative Decode on Blackwell"
-          style={{
-            width: "100%",
-            height: "100%",
-            objectFit: "cover",
-            objectPosition: "center",
-            display: "block",
-          }}
-        />
-      </div>
-      <div style={{ padding: "0.9rem 1rem 1rem" }}>
-        <p
-          style={{
-            margin: 0,
-            fontWeight: 600,
-            lineHeight: 1.35,
-            fontSize: "0.98rem",
-          }}
-        >
-          {"Chasing the Batch-1 Floor: Ling-3.0-flash Speculative Decode on Blackwell"}
-        </p>
-        <p
-          style={{
-            margin: "0.55rem 0 0",
-            fontSize: "0.85rem",
-            opacity: 0.75,
-          }}
-        >
-          {"August 21, 2026"}
-        </p>
-      </div>
-    </a>
   </div>
 </div>
 {/* END_LMSYS_SGLANG_BLOG_CARDS */}
 
 ---
 
-## Learn more and join the community
+## Community and resources
 
-<div className="not-prose">
-  <div
-    style={{
-      padding: "0.9rem 0",
-      borderTop: "1px solid rgba(128, 128, 128, 0.24)",
-      borderBottom: "1px solid rgba(128, 128, 128, 0.24)",
-    }}
-  >
-    <p
-      style={{
-        margin: "0 0 0.35rem",
-        fontSize: "0.82rem",
-        fontWeight: 700,
-        letterSpacing: "0.08em",
-        textTransform: "uppercase",
-        opacity: 0.72,
-      }}
-    >
-      Stay connected
-    </p>
-    <div
-      style={{
-        display: "grid",
-        gap: "0.55rem",
-        fontSize: "0.97rem",
-        lineHeight: 1.7,
-      }}
-    >
-      <div>
-        <span style={{ display: "inline-flex", alignItems: "center", verticalAlign: "-0.125em" }}>
-          <Icon icon="map" size={14} />
-        </span>{" "}
-        <a href="https://roadmap.sglang.io">Development roadmap</a>
-        <span style={{ opacity: 0.62 }}> to follow current priorities and upcoming work.</span>
-      </div>
-      <div>
-        <span style={{ display: "inline-flex", alignItems: "center", verticalAlign: "-0.125em" }}>
-          <Icon icon="calendar-days" size={14} />
-        </span>{" "}
-        <a href="https://meet.sglang.io">Weekly public development meeting</a>
-        <span style={{ opacity: 0.62 }}> to hear updates and join open discussions.</span>
-      </div>
-      <div>
-        <span style={{ display: "inline-flex", alignItems: "center", verticalAlign: "-0.125em" }}>
-          <Icon icon="slack" size={14} />
-        </span>{" "}
-        <a href="https://slack.sglang.io/">Slack</a>
-        <span style={{ opacity: 0.62 }}> for questions, feedback, and community support.</span>
-      </div>
-      <div>
-        <a href="https://x.com/lmsysorg">X Twitter</a>
-        <span style={{ opacity: 0.62 }}> and </span>
-        <span style={{ display: "inline-flex", alignItems: "center", verticalAlign: "-0.125em" }}>
-          <Icon icon="linkedin" size={14} />
-        </span>{" "}
-        <a href="https://www.linkedin.com/company/sgl-project/">LinkedIn</a>
-        <span style={{ opacity: 0.62 }}> for project updates.</span>
-      </div>
-      <div>
-        <span style={{ display: "inline-flex", alignItems: "center", verticalAlign: "-0.125em" }}>
-          <Icon icon="newspaper" size={14} />
-        </span>{" "}
-        <a href="https://lmsys.org/blog/">LMSYS blog</a>
-        <span style={{ opacity: 0.62 }}> for release notes, benchmarks, and technical deep dives.</span>
-      </div>
-      <div>
-        <span style={{ display: "inline-flex", alignItems: "center", verticalAlign: "-0.125em" }}>
-          <Icon icon="book-open" size={14} />
-        </span>{" "}
-        <a href="https://github.com/sgl-project/sgl-learning-materials">Learning materials</a>
-        <span style={{ opacity: 0.62 }}> for blogs, slides, and videos.</span>
-      </div>
-    </div>
-  </div>
-</div>
+- [Slack](https://slack.sglang.io/): Technical questions and development discussions.
+- Events: [Meetups, workshops, and office hours](https://www.sglang.io/events) | [Developer meetings](https://meet.sglang.io/).
+- Updates: [X](https://x.com/lmsysorg) | [LinkedIn](https://www.linkedin.com/company/sgl-project/) | [LMSYS Blog](https://lmsys.org/blog/).
+- Contribute: [Contributor guide](/docs/developer_guide/contribution_guide) | [Roadmap](https://roadmap.sglang.io/).
+- [Release notes](https://github.com/sgl-project/sglang/releases): Changes in each release.
