@@ -122,6 +122,10 @@ class TestLayerNormSPValidation(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "speculative"):
             validate_layernorm_sp(**{**self.VALID, "speculative_algorithm": "EAGLE3"})
 
+    def test_rejects_pipeline_parallelism(self):
+        with self.assertRaisesRegex(ValueError, "pipeline"):
+            validate_layernorm_sp(**{**self.VALID, "pp_size": 2})
+
 
 class _Norm:
     def __call__(self, x, residual=None, post_residual_addition=None):
