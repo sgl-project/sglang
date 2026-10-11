@@ -7,9 +7,9 @@ from unittest.mock import Mock
 import torch
 
 from sglang.kernels.ops.kv_canary.verify import CanaryLaunchTag
+from sglang.srt.kv_canary.config import CanaryConfig
 from sglang.srt.kv_canary.runner import stats_logger as stats_logger_module
 from sglang.srt.kv_canary.runner.health_checker import KernelRunCounterHealthChecker
-from sglang.srt.kv_canary.runner.sweep import SweepOrchestrator
 from sglang.srt.kv_canary.state import CanaryDeviceState
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kv_canary.runner_test_base import (
@@ -54,16 +54,19 @@ class TestSelfUnitManagerHealth(CanaryManagerTestCase):
         manager._outer_step_counter = 2000
         manager._health_checker.step()
 
-    def test_kernel_run_counter_watchdog_ignores_sweep_without_radix_cache(
+    def test_kernel_run_counter_watchdog_expects_sweep_on_target_only(
         self,
     ) -> None:
-        """An EAGLE draft runner has no radix cache, so its sweep never launches."""
+        """The scheduler attaches the radix cache only to the target runner:
+        a draft runner never sweeps, while a target whose sweep never launches
+        must still fail the watchdog."""
 
-        def check_twice(*, attach_radix_cache: bool) -> None:
-            config = make_config(sweep_interval=100)
-            manager = make_manager(device=self.device, config=config)
-            if attach_radix_cache:
-                manager.attach_radix_cache(Mock())
+        def check_twice(*, is_draft: bool) -> None:
+            manager = make_manager(
+                device=self.device,
+                config=make_config(sweep_interval=100),
+                is_eagle_draft_decode=is_draft,
+            )
             counters = manager._device_state.kernel_run_counters
             counters.zero_()
             for step in (1000, 2000):
@@ -77,9 +80,9 @@ class TestSelfUnitManagerHealth(CanaryManagerTestCase):
                 manager._outer_step_counter = step
                 manager._health_checker.step()
 
-        check_twice(attach_radix_cache=False)
+        check_twice(is_draft=True)
         with self.assertRaisesRegex(RuntimeError, "SWEEP_K_FULL"):
-            check_twice(attach_radix_cache=True)
+            check_twice(is_draft=False)
 
     def test_periodic_stats_log_every_n_step(self) -> None:
         """Verify periodic stats are logged at the configured interval."""
@@ -105,16 +108,17 @@ class TestKernelRunCounterDeltaCheck(CustomTestCase):
         active_tags: tuple[CanaryLaunchTag, ...],
         outer_step: int,
     ) -> KernelRunCounterHealthChecker:
-        sweep_orchestrator = Mock(spec=SweepOrchestrator)
-        sweep_orchestrator.is_enabled = False
+        config = Mock(spec=CanaryConfig)
+        config.sweep_interval = 0
         num_tags = len(CanaryLaunchTag)
         device_state = Mock(spec=CanaryDeviceState)
         device_state.kernel_run_counters = torch.zeros(num_tags, dtype=torch.int64)
         return KernelRunCounterHealthChecker(
+            config=config,
+            is_draft_runner=False,
             device_state=device_state,
             active_tags=active_tags,
             outer_step_counter_getter=lambda: outer_step,
-            sweep_orchestrator=sweep_orchestrator,
             d2h_stream=Mock(),
         )
 
