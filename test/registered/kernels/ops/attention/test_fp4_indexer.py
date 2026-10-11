@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import sys
-from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -604,7 +603,6 @@ def test_hopper_indexer_backends_replay(ratio):
     from sglang.srt.layers.attention.dsv4.v41_indexer.full_topk import FullTopKIndexer
     from sglang.srt.layers.attention.dsv4.v41_indexer.types import (
         DecodeInputs,
-        Selection,
     )
 
     batch, width, capacity, topk = 12, 193, 32772, 64
@@ -631,8 +629,6 @@ def test_hopper_indexer_backends_replay(ratio):
         paged_metadata=SimpleNamespace(max_compressed_seq_len=capacity),
         is_verify=True,
     )
-    inputs = DecodeInputs(q_lora=q, **common)
-    consumer_inputs = DecodeInputs(q_lora=consumer_q, **common)
     kwargs = dict(
         token_to_kv_pool=pool, req_to_token=req_table, use_deep_gemm_prefill=False
     )
@@ -641,17 +637,21 @@ def test_hopper_indexer_backends_replay(ratio):
         **kwargs, candidate_topk_blocks=4, candidate_block_size=8
     )
     outputs = [
-        Selection(
+        SimpleNamespace(
             page_indices=torch.empty(
                 (batch + 1, topk + 8), device=q.device, dtype=torch.int32
             ),
-            raw_indices=torch.empty(
-                (batch + 1, topk + 8), device=q.device, dtype=torch.int32
-            )
-            if ratio == 1
-            else None,
+            raw_indices=None,
         )
         for _ in range(3)
+    ]
+    decode_inputs = [
+        DecodeInputs(
+            q_lora=q if i < 2 else consumer_q,
+            out_page_indices=out.page_indices,
+            **common,
+        )
+        for i, out in enumerate(outputs)
     ]
     captured_scores = []
     captured_masks = []
@@ -663,9 +663,9 @@ def test_hopper_indexer_backends_replay(ratio):
         return result
 
     def run():
-        full.topk_decode(inputs, outputs[0])
-        published = candidates.publish_decode(inputs, outputs[1])
-        candidates.consume_decode(consumer_inputs, published, outputs[2])
+        full.topk_decode(decode_inputs[0])
+        published = candidates.publish_decode(decode_inputs[1])
+        candidates.consume_decode(decode_inputs[2], published)
         return published
 
     for _ in range(3):
@@ -750,8 +750,8 @@ def test_hopper_indexer_backends_replay(ratio):
 @pytest.mark.parametrize("rows", [0, 1, 32, 129])
 @pytest.mark.parametrize("topk", [0, 1, 65, 512])
 @pytest.mark.parametrize("write_raw", [False, True])
-def test_flat_indexer_selection_replay(rows, topk, write_raw):
-    from sglang.srt.layers.attention.dsv4.v41_indexer import scoring
+def test_flat_indexer_finalization_replay(rows, topk, write_raw):
+    from sglang.kernels.ops.attention.dsv4.fp4_indexer import finish_flat_indexer_topk
 
     torch.manual_seed(81 + rows + topk)
     indices = torch.randint(
@@ -762,22 +762,8 @@ def test_flat_indexer_selection_replay(rows, topk, write_raw):
     pages = torch.full((rows + 1, topk + 8), 12345, device="cuda", dtype=torch.int32)
     raw = torch.full_like(pages, 12345) if write_raw else None
 
-    data = SimpleNamespace(k_slots=slots, request_starts=starts)
-    selection = SimpleNamespace(page_indices=pages, raw_indices=raw)
-
     def run():
-        # Use real platform dispatch on Blackwell; also check integer
-        # finalization on other CUDA GPUs through the SM100 runtime entry.
-        platform = scoring.get_platform()
-        context = (
-            nullcontext()
-            if platform.is_sm100
-            else patch.object(
-                scoring, "get_platform", return_value=SimpleNamespace(is_sm100=True)
-            )
-        )
-        with context:
-            scoring.DeepGEMMPrefillData.write_selection(data, indices, selection)
+        finish_flat_indexer_topk(indices, slots, starts, pages, raw)
 
     for _ in range(3):
         run()

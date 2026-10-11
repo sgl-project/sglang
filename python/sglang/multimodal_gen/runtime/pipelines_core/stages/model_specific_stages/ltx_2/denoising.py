@@ -1,4 +1,5 @@
 import math
+from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 
@@ -8,6 +9,7 @@ from diffusers.utils.torch_utils import randn_tensor
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     is_ltx23_native_variant,
 )
+from sglang.multimodal_gen.configs.sample.sampling_params import quality_allows
 from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
     get_sp_world_size,
@@ -179,6 +181,10 @@ class LTX2DenoisingStage(DenoisingStage):
         self.sampler_name = sampler_name
         # set per request by _prepare_denoising_loop before the cache-dit hook
         self._disable_cache_dit_for_request = False
+        self._ltx2_coords_cache: OrderedDict[
+            tuple, tuple[torch.Tensor | None, torch.Tensor | None]
+        ] = OrderedDict()
+        self._ltx2_coords_cache_max_entries = 4
 
     def _scheduler_step_kwargs(self, batch: Req, scheduler) -> dict:
         return self.prepare_extra_func_kwargs(
@@ -962,12 +968,19 @@ class LTX2DenoisingStage(DenoisingStage):
         seq_len: int,
         batch_size: int,
         key: str,
+        has_padding: bool,
         device: torch.device,
     ) -> torch.Tensor | None:
         valid = getattr(batch, key, None)
         if valid is None:
             return None
         valid = int(valid)
+        # all SP ranks must agree on mask presence to preserve collective order
+        # a locally all-valid shard still needs a mask when another rank has padding
+        # eliding an all-valid mask changes attention kernel rounding
+        # exact requests must keep the reference masked path
+        if not has_padding and quality_allows(batch.quality, "lossless"):
+            return None
         mask = torch.ones((batch_size, int(seq_len)), device=device, dtype=torch.bool)
         if valid < int(seq_len):
             mask[:, max(0, valid) :] = False
@@ -1045,19 +1058,45 @@ class LTX2DenoisingStage(DenoisingStage):
             f"{audio_latent_model_input.ndim}, shape={tuple(audio_latent_model_input.shape)}"
         )
 
-    def _prepare_ltx2_model_inputs(
+    def _get_ltx2_rope_coords(
         self,
         ctx: LTX2DenoisingContext,
         step: DenoisingStepState,
         batch: Req,
         server_args: ServerArgs,
-        sigma: torch.Tensor,
-    ) -> LTX2ModelInputs:
-        latent_model_input = ctx.latents.to(ctx.target_dtype)
-        audio_latent_model_input = ctx.audio_latents.to(ctx.target_dtype)
-        audio_num_frames_latent = self._get_audio_num_frames_latent(
-            audio_latent_model_input
+        latent_model_input: torch.Tensor,
+        audio_latent_model_input: torch.Tensor,
+        audio_num_frames_latent: int,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        video_sp_start = (
+            int(batch.sp_video_start_frame) if batch.did_sp_shard_latents else None
         )
+        audio_sp_start = (
+            int(batch.sp_audio_start_frame)
+            if batch.did_sp_shard_audio_latents
+            else None
+        )
+        key = (
+            id(step.current_model),
+            id(server_args.pipeline_config),
+            latent_model_input.device,
+            audio_latent_model_input.device,
+            tuple(latent_model_input.shape),
+            tuple(audio_latent_model_input.shape),
+            ctx.latent_num_frames_for_model,
+            ctx.latent_height,
+            ctx.latent_width,
+            float(batch.fps),
+            audio_num_frames_latent,
+            ctx.use_ltx23_legacy_one_stage,
+            server_args.enable_breakable_cuda_graph,
+            video_sp_start,
+            audio_sp_start,
+        )
+        cached = self._ltx2_coords_cache.get(key)
+        if cached is not None:
+            self._ltx2_coords_cache.move_to_end(key)
+            return cached
 
         video_coords = None
         audio_coords = None
@@ -1076,7 +1115,7 @@ class LTX2DenoisingStage(DenoisingStage):
                 audio_latent_model_input,
                 num_frames=audio_num_frames_latent,
             )
-        video_coords, audio_coords = _prepare_ltx2_rope_coords_for_bcg(
+        coords = _prepare_ltx2_rope_coords_for_bcg(
             enabled=server_args.enable_breakable_cuda_graph,
             current_model=step.current_model,
             latent_model_input=latent_model_input,
@@ -1088,6 +1127,34 @@ class LTX2DenoisingStage(DenoisingStage):
             width=ctx.latent_width,
             audio_num_frames=audio_num_frames_latent,
             fps=batch.fps,
+        )
+        self._ltx2_coords_cache[key] = coords
+        if len(self._ltx2_coords_cache) > self._ltx2_coords_cache_max_entries:
+            self._ltx2_coords_cache.popitem(last=False)
+        return coords
+
+    def _prepare_ltx2_model_inputs(
+        self,
+        ctx: LTX2DenoisingContext,
+        step: DenoisingStepState,
+        batch: Req,
+        server_args: ServerArgs,
+        sigma: torch.Tensor,
+    ) -> LTX2ModelInputs:
+        latent_model_input = ctx.latents.to(ctx.target_dtype)
+        audio_latent_model_input = ctx.audio_latents.to(ctx.target_dtype)
+        audio_num_frames_latent = self._get_audio_num_frames_latent(
+            audio_latent_model_input
+        )
+
+        video_coords, audio_coords = self._get_ltx2_rope_coords(
+            ctx,
+            step,
+            batch,
+            server_args,
+            latent_model_input=latent_model_input,
+            audio_latent_model_input=audio_latent_model_input,
+            audio_num_frames_latent=audio_num_frames_latent,
         )
 
         batch_size = int(latent_model_input.shape[0])
@@ -1165,6 +1232,7 @@ class LTX2DenoisingStage(DenoisingStage):
                 seq_len=int(latent_model_input.shape[1]),
                 batch_size=batch_size,
                 key="sp_video_valid_token_count",
+                has_padding=batch.sp_video_has_padding,
                 device=latent_model_input.device,
             )
             audio_self_attention_mask = self._build_ltx2_sp_padding_mask(
@@ -1172,6 +1240,7 @@ class LTX2DenoisingStage(DenoisingStage):
                 seq_len=audio_num_frames_latent,
                 batch_size=batch_size,
                 key="sp_audio_valid_token_count",
+                has_padding=batch.sp_audio_has_padding,
                 device=audio_latent_model_input.device,
             )
             a2v_cross_attention_mask = audio_self_attention_mask

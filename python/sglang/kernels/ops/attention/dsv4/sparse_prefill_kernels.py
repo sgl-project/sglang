@@ -49,9 +49,13 @@ def _combine_topk_swa_indices_kernel(
     gather_lens_ptr,
     compressed_base_ptr,
     swa_base_ptr,
+    swa_indices_ptr,
+    swa_indices_stride,
+    swa_lengths_ptr,
     num_tokens,
     num_reqs,
     top_k,
+    EXPLICIT_SWA: tl.constexpr,
     COMPRESS_RATIO: tl.constexpr,
     WINDOW_SIZE: tl.constexpr,
     WIDTH: tl.constexpr,
@@ -92,7 +96,10 @@ def _combine_topk_swa_indices_kernel(
     # -1 entries inside the top-k span stay -1 (attention skips them).
     # top_k=0 disables the compressed portion for SWA-only layers.
     topk_len = tl.where(owned, tl.minimum((pos + 1) // COMPRESS_RATIO, top_k), 0)
-    swa_len = tl.where(owned, tl.minimum(pos + 1, WINDOW_SIZE), 0)
+    if EXPLICIT_SWA:
+        swa_len = tl.load(swa_lengths_ptr + token, mask=owned, other=0)
+    else:
+        swa_len = tl.where(owned, tl.minimum(pos + 1, WINDOW_SIZE), 0)
 
     combined_row = token.to(tl.int64)[:, None] * combined_indices_stride
     topk_row = token.to(tl.int64)[:, None] * topk_indices_stride
@@ -107,9 +114,19 @@ def _combine_topk_swa_indices_kernel(
     # Workspace SWA index: swa_base[r] + (gather_offset_in_buffer).
     # For positions [pos - swa_len + 1, pos], the buffer offsets are
     # [pos - swa_len + 1 - gather_start, pos - gather_start].
-    swa_start = swa_base + pos - swa_len + 1 - gather_start
-    swa_vals = swa_start[:, None] + (offset - topk_len[:, None])
     in_swa = offset < (topk_len + swa_len)[:, None]
+    if EXPLICIT_SWA:
+        swa_vals = tl.load(
+            swa_indices_ptr
+            + token.to(tl.int64)[:, None] * swa_indices_stride
+            + (offset - topk_len[:, None]),
+            mask=owned[:, None] & ~in_topk & in_swa,
+            other=-1,
+        )
+        swa_vals = tl.where(swa_vals >= 0, swa_base[:, None] + swa_vals, -1)
+    else:
+        swa_start = swa_base + pos - swa_len + 1 - gather_start
+        swa_vals = swa_start[:, None] + (offset - topk_len[:, None])
     vals = tl.where(
         in_topk,
         tl.where(topk_vals >= 0, topk_vals + compressed_base[:, None], -1),

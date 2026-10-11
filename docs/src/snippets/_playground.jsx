@@ -23,6 +23,8 @@
 // `(rowValues, base) => [...]` for cross-row composition (e.g. preset x cluster
 // size); a function returning null means "leave the base untouched".
 // Changing the Deploy selection resets every axis back to inherit-from-base.
+// config.playgroundExclusiveGroups declares {axes, when, note} groups whose
+// Enable controls turn each other off for matching selections.
 //   pdDisagg     — role + transfer backend + IB device + optional router
 //   hicache     — enable + backend + write policy
 //   hisparse    — enable + host ratio (decode-only)
@@ -147,8 +149,11 @@ export const Playground = ({ config }) => {
   // ==========================================================================
   // 2. Pure data helpers
   // ==========================================================================
-  const findCell = (cells, sel) =>
-    cells.find((c) => DIMENSIONS.every((d) => c.match[d] === sel[d]));
+  const findCell = (cells, sel) => {
+    const cell = cells.find((c) => DIMENSIONS.every((d) => c.match[d] === sel[d]));
+    return cell && typeof config.resolveRecipe === "function"
+      ? config.resolveRecipe(cell, sel) : cell;
+  };
 
   // After applying overrides, the resulting (env, flags) may equal another
   // cell sharing every match dim except strategy. Keep this generic so custom
@@ -164,7 +169,9 @@ export const Playground = ({ config }) => {
       for (const x of b) if (!set.has(x)) return false;
       return true;
     };
-    for (const c of cells) {
+    for (const raw of cells) {
+      const c = typeof config.resolveRecipe === "function"
+        ? config.resolveRecipe(raw, { ...sel, ...raw.match }) : raw;
       if (fixedDims.some((d) => c.match[d] !== sel[d])) continue;
       if (flagsEq(c.flags || [], pgFlags || []) && envEq(c.env || [], pgEnv || [])) {
         return c;
@@ -225,6 +232,34 @@ export const Playground = ({ config }) => {
       Array.isArray(vs) && vs.includes(base[k]));
   };
 
+  // Opt-in mutual exclusion is applied to UI state atomically, including
+  // inherited enablement, so the chips agree with the generated command.
+  const exclusiveGroupsFor = (axisId, base) =>
+    (config.playgroundExclusiveGroups || []).filter((group) =>
+      group.axes.includes(axisId) && matchConstraint(base, group.when));
+  const updateAxisDeltas = (deltas, axisId, next, base) => {
+    const updated = { ...deltas, [axisId]: next };
+    if (next?.enable === true) {
+      for (const group of exclusiveGroupsFor(axisId, base)) {
+        for (const peer of group.axes) {
+          if (peer !== axisId && updated[peer]) {
+            updated[peer] = { ...updated[peer], enable: false };
+          }
+        }
+      }
+    }
+    return updated;
+  };
+
+  // Backend tuning can be scoped to one recipe without replacing the shared
+  // backend defaults used by the other model/hardware combinations.
+  const backendEnv = (entry, base) => {
+    if (!entry) return [];
+    const override = (entry.envOverrides || []).find((r) =>
+      matchConstraint(base, r.when));
+    return override ? (override.env || []) : (entry.env || []);
+  };
+
   // The PD router is shared by every cell, so a platform whose prefill/decode
   // pair wants a different routing policy declares `routerOverrides: [{when,
   // port?, command}]` instead of rewriting the default out from under the rest.
@@ -265,10 +300,16 @@ export const Playground = ({ config }) => {
         disabled = matchConstraint(base, entry.disable);
       }
     }
+    // `labelWhen: [{when, label}]` renames an entry for the selections it
+    // matches, first match wins. One option can be the same flag value behind
+    // two different implementations (MegaMoE is DeepGEMM on Blackwell and
+    // MORI-backed Aiter MegaMoEv2 on ROCm); the label should say which.
+    const labelOverride = (entry.labelWhen || []).find(
+      (l) => l && l.when && matchConstraint(base, l.when));
     return {
       ...entry,
       value: entry.id !== undefined ? entry.id : entry.value,
-      label: entry.label,
+      label: labelOverride ? labelOverride.label : entry.label,
       hidden,
       disabled,
       disableReason,
@@ -698,7 +739,7 @@ export const Playground = ({ config }) => {
         };
       },
 
-      apply: ({ flags, env, value, fc, h, derived }) => {
+      apply: ({ flags, env, value, fc, sel, h, derived }) => {
         if (value.backend !== null) {
           flags = h.stripFlagsByFirstToken(flags, [
             "--moe-a2a-backend", "--moe-runner-backend",
@@ -708,21 +749,38 @@ export const Playground = ({ config }) => {
           // re-add the selected option's.
           const backendEnvKeys = [];
           for (const o of (fc.backend?.options || [])) {
-            for (const e of (o.env || [])) backendEnvKeys.push(e.split("=")[0]);
+            const allEnv = [...(o.env || []),
+              ...(o.envOverrides || []).flatMap((r) => r.env || [])];
+            for (const e of allEnv) backendEnvKeys.push(e.split("=")[0]);
           }
           if (backendEnvKeys.length) env = h.stripEnvByPrefix(env, backendEnvKeys);
           const opt = (fc.backend?.options || []).find((o) => o.id === value.backend);
           if (opt?.flags?.length) {
             flags = h.insertAfter(flags, h.ANCHOR_NEAR_DPATTN, opt.flags);
           }
-          if (opt?.env?.length) env = [...env, ...opt.env];
+          // `envWhen` scopes a backend option's env to the selections that need
+          // it (same shape as a PD transfer backend's). MegaMoE is configured by
+          // a different env family on ROCm than on Blackwell, so the option
+          // carries the ROCm one and gates it on the hardware.
+          const selectedEnv = backendEnv(opt, sel);
+          if (selectedEnv.length
+              && (!opt.envWhen || h.matchConstraint(sel, opt.envWhen))) {
+            env = [...env, ...selectedEnv];
+          }
         }
         // MegaMoE owns the MoE path: when the effective backend is megamoe, strip the
         // DeepEP dispatch + any prior MegaMoE quant settings, then re-add the
         // selected quant's flags/env. When the backend is explicitly switched
         // away from MegaMoE, only drop the MegaMoE quant settings (leave DeepEP
         // dispatch intact).
+        // `hideHw` drops the quant SELECTION where its env family does not apply:
+        // the ROCm FlyDSL MegaMoE path is configured by the backend option's own
+        // env (`SGLANG_AMD_FLYDSL_MEGA_*`), not by the DeepGEMM per-rank token
+        // budget these options set. The family STRIP stays unconditional — it is
+        // what keeps a stale quant flag from surviving a backend switch — so the
+        // gate is applied to the emit branches, not to `mq` itself.
         const mq = fc.megamoeQuant;
+        const mqActive = !!mq && !(mq.hideHw || []).includes(sel && sel.hw);
         if (mq) {
           const quantKeys = [];
           const quantFlagHeads = [];
@@ -733,7 +791,7 @@ export const Playground = ({ config }) => {
           flags = h.stripFlagsByFirstToken(flags, quantFlagHeads);
           const effBackend = value.backend !== null
             ? value.backend : (derived && derived.backend);
-          if (effBackend === "megamoe") {
+          if (effBackend === "megamoe" && mqActive) {
             env = h.stripEnvByPrefix(env, [...(mq.stripEnv || []), ...quantKeys]);
             const quant = value.mmQuant != null
               ? value.mmQuant : ((derived && derived.mmQuant) || "w4a8");
@@ -792,7 +850,8 @@ export const Playground = ({ config }) => {
                     { hideValues: [...hideNull("backend"), ...(mmAvail ? [] : ["megamoe"])] })}
                 </span>
               )}
-              {fc.megamoeQuant && backendIsMega && (
+              {fc.megamoeQuant && backendIsMega
+                && !(fc.megamoeQuant.hideHw || []).includes(base.hw) && (
                 <span style={s.field}>
                   <span style={s.fieldLabel}>Quantization</span>
                   {renderSelect(
@@ -918,7 +977,13 @@ export const Playground = ({ config }) => {
           const ok = opt.flags.every((pf) => baseSpec.includes(pf));
           if (ok) return opt.id;
         }
-        return "current";
+        // Resolved PD recipes display their inherited algorithm even when
+        // their block size is tuned. Legacy cells retain their original label.
+        if (!cell.pd) return "current";
+        const algorithm = flags.find((f) => f.startsWith("--speculative-algorithm "));
+        const algorithmOnly = (fc.options || []).find((opt) =>
+          opt.flags && opt.flags.length === 1 && opt.flags[0] === algorithm);
+        return algorithmOnly ? algorithmOnly.id : "current";
       },
 
       apply: ({ flags, env, value, fc, sel, h, derived }) => {
@@ -985,22 +1050,40 @@ export const Playground = ({ config }) => {
     // Owns the `--disaggregation-*` flags (unconditional strip). A backend may
     // carry hw-gated env (transferBackends[].env + .envWhen).
     pdDisagg: {
-      // The transport default is the config's first entry, so a model whose
-      // recipes standardize on one backend does not silently start on another.
-      // An entry with `defaultWhen` takes over as the default for the selections
-      // it matches (e.g. MORI and the rdmaN NIC list on ROCm).
+      // The transport default is the config's first entry that is VISIBLE for
+      // this selection, so a model whose recipes standardize on one backend does
+      // not silently start on another. Skipping hidden entries is what lets a
+      // transport be listed first for the platform it belongs to without
+      // becoming the default on platforms that hide it. An entry with
+      // `defaultWhen` takes over for the selections it matches (e.g. the rdmaN
+      // NIC list on ROCm).
       initState: (fc, base) => {
+        const visible = (entries) => (entries || []).filter((e) =>
+          e && !(e.hide && base && matchConstraint(base, e.hide)));
         const pick = (entries) => (entries || []).find((e) =>
           e && e.defaultWhen && base && matchConstraint(base, e.defaultWhen));
-        const backends = (fc && fc.transferBackends) || [];
+        const backends = visible(fc && fc.transferBackends);
+        const cell = findCell(config.cells, base || {});
         return {
-          mode: "off",
+          mode: cell && cell.pd ? cell.pdMode : "off",
           transferBackend: (pick(backends) || backends[0] || {}).id || "mooncake",
-          ibDevice: (pick(fc && fc.ibDevices) || {}).id || "auto",
+          ibDevice: (pick(visible(fc && fc.ibDevices)) || {}).id || "auto",
         };
       },
 
       apply: ({ flags, env, value, sel, fc, h }) => {
+        const cell = findCell(config.cells, sel);
+        if (cell && cell.pd) {
+          const replace = (head, arg) => {
+            const line = arg ? `${head} ${arg}` : null;
+            const present = flags.some((f) => f.split(/[\s=]/)[0] === head);
+            flags = flags.flatMap((f) => f.split(/[\s=]/)[0] === head ? (line ? [line] : []) : [f]);
+            if (!present && line) flags = h.insertBeforeTail(flags, [line]);
+          };
+          replace("--disaggregation-transfer-backend", value.transferBackend);
+          replace("--disaggregation-ib-device", value.ibDevice === "auto" ? null : value.ibDevice);
+          return { flags, env };
+        }
         // The bootstrap port is the base cell's to choose — the router's
         // --prefill positional has to match it — so carry it across the strip
         // rather than dropping it and silently falling back to the default.
@@ -1065,12 +1148,35 @@ export const Playground = ({ config }) => {
           const modeOk = !modeGate || Object.keys(modeGate).every(
             (k) => (modeGate[k] || []).includes(sel[k]));
           if (modeOk && roleSpec && roleSpec.flags && roleSpec.flags.length) {
-            flags = h.stripFlagsByFirstToken(
-              flags, roleSpec.flags.map((f) => f.split(/[\s=]/)[0]));
-            adds.push(...roleSpec.flags);
+            // In-place substitution, the same policy flagSelects uses: a flag
+            // the base cell already carries changes value WHERE IT STANDS, so
+            // the rendered command keeps the base cell's argument order and the
+            // diff shows one changed line instead of a removal mid-command plus
+            // an addition at the end. Only flags the base cell does not have
+            // join `adds` and append before the --host/--port tail.
+            const byHead = new Map();
+            for (const f of roleSpec.flags) {
+              const t = f.split(/[\s=]/)[0];
+              if (!byHead.has(t)) byHead.set(t, []);
+              byHead.get(t).push(f);
+            }
+            const consumed = new Set();
+            const next = [];
+            for (const f of flags) {
+              const t = f.split(/[\s=]/)[0];
+              if (!byHead.has(t)) { next.push(f); continue; }
+              if (consumed.has(t)) continue;      // drop a duplicate head
+              consumed.add(t);
+              for (const r of byHead.get(t)) next.push(r);
+            }
+            flags = next;
+            for (const [t, fs] of byHead) {
+              if (!consumed.has(t)) adds.push(...fs);
+            }
           }
-          // `stripFlags` drops base-cell flags the role has no use for (an
-          // aggregated-serving knob) without re-emitting a value of its own.
+          // `stripFlags` / `stripEnv` drop base-cell flags and env keys the role
+          // has no use for (an aggregated-serving knob, a comm scheme the role's
+          // MoE backend replaces) without re-emitting a value of its own.
           if (modeOk && roleSpec && roleSpec.stripFlags && roleSpec.stripFlags.length) {
             flags = h.stripFlagsByFirstToken(flags, roleSpec.stripFlags);
           }
@@ -1086,17 +1192,27 @@ export const Playground = ({ config }) => {
           flags = flags.map((f) =>
             f.split(/[\s=]/)[0] === "--port" ? `--port ${servePort}` : f);
 
+          // `stripEnv` drops BASE-CELL env keys the role re-values, so a role
+          // that disagrees with the base on a key emits one assignment rather
+          // than two conflicting ones (the appends below de-dupe on the whole
+          // `K=V` string, not on the key). It runs before the transport and role
+          // env are merged in: those are the role's own values and are never the
+          // thing being stripped.
+          if (modeOk && roleSpec && roleSpec.stripEnv && roleSpec.stripEnv.length) {
+            env = h.stripEnvByPrefix(env, roleSpec.stripEnv);
+          }
           // Add the selected backend's env (gated by hw via `envWhen`), keeping
           // any the base cell already carries in place. We don't strip base env
           // (e.g. gb200 NCCL_*): a blanket strip would drop it when PD is off and
           // show a spurious remove+add in the diff. apply is pure from baseEnv, so
           // no stale backend env accumulates across renders.
           const meta = backends.find((b) => b.id === backend);
-          if (meta && meta.env && meta.env.length) {
+          const selectedEnv = backendEnv(meta, sel);
+          if (meta && selectedEnv.length) {
             const gate = meta.envWhen;
             const ok = !gate || Object.keys(gate).every(
               (k) => (gate[k] || []).includes(sel[k]));
-            if (ok) env = [...env, ...meta.env.filter((e) => !env.includes(e))];
+            if (ok) env = [...env, ...selectedEnv.filter((e) => !env.includes(e))];
           }
           // Same for env declared on the selected role.
           if (modeOk && roleSpec && roleSpec.env && roleSpec.env.length) {
@@ -1112,15 +1228,17 @@ export const Playground = ({ config }) => {
         if ((fc.incompatibleSpeculativeAlgorithms || []).includes(specAlgorithm)) {
           return null;
         }
-        if (value.mode === "prefill" || value.mode === "decode") {
-          return { pdMode: value.mode };
+        const cell = findCell(config.cells, context.sel);
+        const mode = cell && cell.pd ? cell.pdMode : value.mode;
+        if (mode === "prefill" || mode === "decode") {
+          return { pdMode: mode };
         }
         return null;
       },
 
       render: ({ axisId, value, setValue, fc, base, s, h, renderSelect }) => {
         const setSlot = (k, v) => setValue({ ...value, [k]: v });
-        const showModes    = (fc.modes            || []).length > 0;
+        const showModes = (fc.modes || []).length > 0 && !findCell(config.cells, base)?.pd;
         const showBackends = (fc.transferBackends || []).length > 0;
         const showIb       = (fc.ibDevices        || []).length > 0;
         if (!showModes && !showBackends && !showIb) return null;
@@ -1390,13 +1508,28 @@ export const Playground = ({ config }) => {
 
       apply: ({ flags, env, value, fc, sel, h, derived }) => {
         const roleOverride = umbpRoleOverride(fc, sel, h);
+        const inherited = derived && derived.enable && findCell(config.cells, sel)?.pd;
+        const ownsOptimisticPrefill = inherited || exclusiveGroupsFor("umbp", sel).length > 0;
+        // Returning to the inherited settings is a no-op even when the UI
+        // stores explicit true / the original backend after a toggle. Keep
+        // the current order (and any unrelated playground overrides).
+        if (inherited && value.enable !== false
+          && (value.backend === null || value.backend === derived.backend)
+          && h.hasFlag(flags, "--enable-unified-cache-external-linker")
+          && !h.hasFlag(flags, "--enable-hierarchical-cache")) return { flags, env };
+        const linkerConfig = h.findFlagArg(flags, "--hicache-storage-backend-extra-config");
+        const optimisticPrefill = h.findFlagArg(flags, "--optimistic-prefill-attempts");
         const ownedHeads = [
+          ...(inherited ? ["--hicache-storage-backend-extra-config"] : []),
+          ...(ownsOptimisticPrefill ? ["--optimistic-prefill-attempts"] : []),
           "--enable-unified-cache-external-linker",
           "--unified-cache-external-linker-backend",
           ...((fc.requiredFlags || []).map((f) => f.split(/\s/)[0])),
         ];
         flags = h.stripFlagsByFirstToken(flags, ownedHeads);
         const ownedEnv = [...(fc.requiredEnv || []), ...((roleOverride && roleOverride.env) || [])];
+        const standalone = env.find((e) => e.startsWith("UMBP_STANDALONE_ADDRESS="));
+        if (inherited && standalone) ownedEnv.push(standalone);
         if (ownedEnv.length) {
           env = h.stripEnvByPrefix(env, ownedEnv.map((e) => e.split("=")[0]));
         }
@@ -1422,8 +1555,12 @@ export const Playground = ({ config }) => {
           `--unified-cache-external-linker-backend ${backend}`,
           ...(fc.requiredFlags || []),
           ...((roleOverride && roleOverride.flags) || []),
+          ...(ownsOptimisticPrefill && optimisticPrefill ? [`--optimistic-prefill-attempts ${optimisticPrefill}`] : []),
+          ...(inherited && backend === "mori" && linkerConfig
+            ? [`--hicache-storage-backend-extra-config ${linkerConfig}`] : []),
         ]);
         const extraEnv = [...(fc.requiredEnv || []), ...((roleOverride && roleOverride.env) || [])];
+        if (inherited && backend === "mori" && standalone) extraEnv.push(standalone);
         env = [...env, ...extraEnv.filter((e) => !env.includes(e))];
         return { flags, env };
       },
@@ -1442,7 +1579,10 @@ export const Playground = ({ config }) => {
         return (
           <div key={axisId} style={s.card}>
             <div style={s.compactRow}>
-              <span style={s.axisTitle}>UMBP</span>
+              {/* Named after the flags it owns (--enable-unified-cache-external-linker,
+                  --unified-cache-external-linker-backend). UMBP is one backend of
+                  this feature, not the feature itself. */}
+              <span style={s.axisTitle}>Unified Cache External Linker</span>
               <span style={s.field}>
                 {renderChip("Enable", enabled, true,
                   () => setSlot("enable", !enabled),
@@ -1453,7 +1593,7 @@ export const Playground = ({ config }) => {
               </span>
               {(fc.backends || []).length > 0 && (
                 <span style={s.field}>
-                  <span style={s.fieldLabel}>Store</span>
+                  <span style={s.fieldLabel}>Backend</span>
                   {renderSelect(backend, fc.backends,
                     (v) => setSlot("backend", v), base)}
                 </span>
@@ -1655,9 +1795,10 @@ export const Playground = ({ config }) => {
     // force DP-Attention off in the attention axis, which composes earlier).
     const pdFc = pgFeatures.pdDisagg;
     const pdDelta = allDeltas.pdDisagg;
-    const pdRoleSel = (pdFc && (pdFc.modes || []).length && pdDelta)
-      ? pdDelta.mode
-      : ((sel && sel.pdMode) || "off");
+    const resolvedCell = findCell(config.cells, sel);
+    const pdRoleSel = resolvedCell && resolvedCell.pd ? resolvedCell.pdMode
+      : (pdFc && (pdFc.modes || []).length && pdDelta)
+        ? pdDelta.mode : ((sel && sel.pdMode) || "off");
     for (const [axisId, handler] of Object.entries(AXIS_HANDLERS)) {
       const fc = pgFeatures[axisId];
       if (!fc) continue;
@@ -1666,7 +1807,8 @@ export const Playground = ({ config }) => {
       const derived = derivedMap ? derivedMap[axisId] : null;
       const specAlgorithm = (findFlagArg(
         flags, "--speculative-algorithm") || "").toUpperCase() || null;
-      const liveSel = { ...sel, specAlgorithm, pdMode: pdRoleSel };
+      const liveSel = { ...sel, specAlgorithm, pdMode: pdRoleSel,
+        workerNnodes: resolvedCell?.nnodes ?? parseNnodes(sel.nodes) };
       const out = handler.apply({ flags, env, value, fc, sel: liveSel, h: helpers, derived });
       flags = out.flags;
       env = out.env;
@@ -1684,15 +1826,16 @@ export const Playground = ({ config }) => {
   // callers can pass a modified env (e.g. MegaMoE's stripEnv + append).
   const renderCommandLines = (cell, flags, cellEnv, sel, envValues, pdMode = null, mode = "python") => {
     const modelName = resolveModelName(sel);
+    if (cell.pd && cell.commands) return interpolate(cell.commands[mode] || cell.commands.python, envValues, modelName);
+    pdMode = cell.pd ? cell.pdMode : pdMode;
     let f = [...flags];
     // Presets may replace the base cell's topology by emitting --nnodes
     // directly (for example, B300 1-node -> large-scale 4/8-node). Use that
     // effective value for Docker networking, hints, and the command banner.
     const nnodesFlag = f.find((x) => x.split(/[\s=]/)[0] === "--nnodes");
     const nnodesMatch = nnodesFlag && /^--nnodes(?:\s+|=)(\d+)$/.exec(nnodesFlag.trim());
-    const baseNnodes = sel.nodes !== undefined
-      ? parseNnodes(sel.nodes)
-      : ((cell && cell.nnodes) || 1);
+    const baseNnodes = cell && cell.pd ? (cell.nnodes || 1)
+      : sel.nodes !== undefined ? parseNnodes(sel.nodes) : ((cell && cell.nnodes) || 1);
     const nnodes = nnodesMatch ? parseInt(nnodesMatch[1], 10) : baseNnodes;
     const multinode = nnodes > 1;
     if (multinode && !f.some((x) => x.startsWith("--nnodes"))) {
@@ -1723,7 +1866,7 @@ export const Playground = ({ config }) => {
       // must resolve them too or it hands back an image that cannot run the
       // command.
       const di = config.dockerImages || {};
-      const image = di[`${sel.hw}|${sel.variant}|${sel.quant}`]
+      const image = (cell.pd && cell.dockerImage) || di[`${sel.hw}|${sel.variant}|${sel.quant}`]
         || di[`${sel.variant}|${sel.quant}`]
         || di[`${sel.hw}|${sel.quant}|${sel.strategy}`]
         || di[`${sel.hw}|${sel.quant}`] || di[sel.hw] || "lmsysorg/sglang:dev";
@@ -1804,7 +1947,7 @@ export const Playground = ({ config }) => {
         ...((multinode || pdMode) ? fabricFlags.map((x) => "  " + x) : []),
         // The NPU device block already mounts ~/.cache/.
         ...(npuDevices ? [] : ["  -v ~/.cache/huggingface:/root/.cache/huggingface"]),
-        ...(config.dockerMounts || []).map((mount) => `  -v ${mount}`),
+        ...[...(config.dockerMounts || []), ...(cell.pd ? cell.dockerMounts || [] : [])].map((mount) => `  -v ${mount}`),
         `  --env "HF_TOKEN={{HF_TOKEN}}"`,
         ...cellEnv.map((e) => `  --env ${e}`),
         "  --ipc=host",
@@ -1818,6 +1961,9 @@ export const Playground = ({ config }) => {
       const envBlock = cellEnv.length ? cellEnv.join(" \\\n") + " \\\n" : "";
       cmd = `${envBlock}sglang serve \\\n${flagBlock}`;
     }
+    const cellHints = (cell.pd ? cell.hints || [] : []).filter(() =>
+      f.some((x) => x === "--enable-unified-cache-external-linker"));
+    if (cellHints.length) cmd = cellHints.map((line) => "# " + line).join("\n") + "\n" + cmd;
     if (multinode && config.multiNodeHints && config.multiNodeHints[sel.hw]) {
       const hint = config.multiNodeHints[sel.hw]
         .map((line) => (line.length ? "# " + line : "#")).join("\n");
@@ -1831,7 +1977,7 @@ export const Playground = ({ config }) => {
         `#   <node0-ip>  = IP of the head node (reachable from all others)`;
       cmd = `${header}\n${cmd}`;
     }
-    if (pdMode === "prefill" || pdMode === "decode") {
+    if (!cell.pd && (pdMode === "prefill" || pdMode === "decode")) {
       const sibling = pdMode === "prefill" ? "decode" : "prefill";
       const routerCfg = resolveRouter(config.playgroundFeatures
         && config.playgroundFeatures.pdDisagg, sel);
@@ -2452,7 +2598,7 @@ export const Playground = ({ config }) => {
     : null;
   const constraintBase = {
     ...base, dpAttnOn, cpOn, cpStrategy, cpSizeTarget, effTp, pdMode,
-    specAlgorithm,
+    workerNnodes: baseCell?.nnodes ?? parseNnodes(base.nodes), specAlgorithm,
   };
 
   let baseCommand = "";
@@ -2563,7 +2709,7 @@ export const Playground = ({ config }) => {
 
   // PD-Disagg router, if configured. When a PD role is active, cURL retargets
   // to the router port and a companion router block renders below the command.
-  const pdRouter = (pdMode !== "off"
+  const pdRouter = (baseCell && baseCell.pd && baseCell.router) || (pdMode !== "off"
     && resolveRouter(config.playgroundFeatures
       && config.playgroundFeatures.pdDisagg, base)) || null;
   const curlEnv = (pdRouter && pdRouter.port != null)
@@ -2604,7 +2750,9 @@ export const Playground = ({ config }) => {
   // variant/quant/nodes or add its own (PD mode, ...), so nothing is hardcoded.
   const baseSummary = baseCell
     ? Object.entries(base)
-        .filter(([, v]) => v !== undefined && v !== "")
+        .filter(([k, v]) => v !== undefined && v !== ""
+          && (!config.resolveRecipe || !(config.overlayDims || []).some(
+            (d) => d.id === k && !rowVisible(d, base))))
         .map(([k, v]) => (k === "hw" ? String(v).toUpperCase() : String(v)))
         .join(" · ")
     : "(no verified cell at the current Deploy selection — showing playground only)";
@@ -2681,6 +2829,12 @@ export const Playground = ({ config }) => {
   // ==========================================================================
   // 12. JSX render
   // ==========================================================================
+  if (baseCell && baseCell.pd && baseCell.pdMode === "router") return (
+    <div style={s.baseStrip}>
+      Select Prefill or Decode in the Deployment panel to tune that worker.
+      The Router tab contains the shared frontend command.
+    </div>
+  );
   return (
     <div style={s.container} className="not-prose">
       {/* Inherited base summary */}
@@ -2714,13 +2868,24 @@ export const Playground = ({ config }) => {
         // An axis whose feature is not switched on in the Deploy panel has
         // nothing to tune — declared per config as `showWhen(base)`.
         if (typeof fc.showWhen === "function" && !fc.showWhen(constraintBase)) return null;
-        const setValue = (next) => setDeltas((d) => ({ ...d, [axisId]: next }));
-        return handler.render({
+        const setValue = (next) => setDeltas((d) =>
+          updateAxisDeltas(d, axisId, next, constraintBase));
+        const rendered = handler.render({
           axisId, value: deltas[axisId], setValue,
           // constraintBase = 5 cell dims + cross-axis facts (dpAttnOn, pdMode).
           fc, base: constraintBase, s, h: helpers, renderChip, renderSelect,
           derived: derivedMap[axisId] || null,
         });
+        const group = exclusiveGroupsFor(axisId, constraintBase).find(
+          (g) => g.axes[0] === axisId && g.note);
+        return rendered && group ? (
+          <div key={axisId}>
+            {rendered}
+            <div role="note" style={{ fontSize: 11, opacity: 0.75, margin: "4px 10px" }}>
+              {group.note}
+            </div>
+          </div>
+        ) : rendered;
       })}
 
       {/* Command box (diff vs verified base) */}

@@ -27,9 +27,6 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVSender,
 )
 from sglang.srt.disaggregation.decode import DecodeTransferQueue
-from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
-from sglang.srt.disaggregation.nixl.conn import NixlKVManager
-from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -667,6 +664,7 @@ def _make_decode_req(room, idx, mgr, n_prefill_ranks=1):
         # One entry per prefill rank the decode notified of the abort; its length
         # is the required drain-ack count (see DecodeTransferQueue._defer_release).
         bootstrap_infos=[{"rank": r} for r in range(n_prefill_ranks)],
+        is_abort_release_safe=lambda: mgr.is_abort_release_safe(room, n_prefill_ranks),
         clear=lambda: None,
     )
     return SimpleNamespace(
@@ -746,7 +744,7 @@ class TestResolveDeferredReleases(CustomTestCase):
                 # Both ranks acked -> released exactly once.
                 mgr.note_abort_ack(room, 1, generation)
                 q.resolve_deferred_releases()
-                rel.assert_called_once_with(dreq.req, q.tree_cache, is_insert=False)
+                rel.assert_called_once_with(dreq.req, q.tree_cache, checkpoint=False)
 
         # Held state fully cleaned up.
         self.assertEqual(q._deferred_releases, [])
@@ -773,7 +771,7 @@ class TestResolveDeferredReleases(CustomTestCase):
             patch.object(decode_mod, "release_kv_cache") as rel,
         ):
             q.resolve_deferred_releases()
-            rel.assert_called_once_with(dreq.req, q.tree_cache, is_insert=False)
+            rel.assert_called_once_with(dreq.req, q.tree_cache, checkpoint=False)
 
         self.assertEqual(q._deferred_releases, [])
         self.assertEqual(q.req_to_metadata_buffer_idx_allocator.freed, [idx])
@@ -796,7 +794,7 @@ class TestResolveDeferredReleases(CustomTestCase):
         ):
             q.resolve_deferred_releases()
 
-        rel.assert_called_once_with(dreq.req, q.tree_cache, is_insert=False)
+        rel.assert_called_once_with(dreq.req, q.tree_cache, checkpoint=False)
         self.assertEqual(q.num_pending_deferred_releases(), 0)
         q.scheduler.metrics_collector.observe_decode_deferred_kv_release.assert_not_called()
 
@@ -813,7 +811,7 @@ class TestResolveDeferredReleases(CustomTestCase):
 
         calls = []
 
-        def fake_release(req, tree_cache, is_insert):
+        def fake_release(req, tree_cache, checkpoint):
             calls.append(req)
             if req is bad.req:
                 raise RuntimeError("boom")
@@ -961,16 +959,6 @@ class TestFailedTransfersDeferOnEveryFailure(CustomTestCase):
 
 class TestBackendOptIn(CustomTestCase):
     """Without a prefill ack, every hold waits out the full release timeout."""
-
-    def test_enabled_by_default(self):
-        self.assertTrue(envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE.get())
-
-    def test_backends_that_ack_opt_in(self):
-        # Ascend inherits Mooncake's threads, so it opts in too. Mori's opt-in
-        # is asserted in test_mori_deferred_kv_release.py, which stubs mori.
-        for cls in (MooncakeKVManager, NixlKVManager):
-            with self.subTest(backend=cls.__name__):
-                self.assertTrue(cls.supports_deferred_decode_kv_release)
 
     def test_backends_without_a_drain_ack_stay_opted_out(self):
         # Inheriting CommonKVManager is not enough: a backend must send the

@@ -127,6 +127,9 @@ class _StaticAllocRecorder:
         self.mapping_calls.append((full, swa))
         self.full_to_swa_index_mapping[full.to(torch.int64)] = swa.to(torch.int64)
 
+    def translate_swa_indices_for_transfer(self, full):
+        return self.translate_loc_from_full_to_swa(full)
+
     def clear_full_to_swa_mapping(self, full):
         self.clear_calls.append(full)
         self.full_to_swa_index_mapping[full.to(torch.int64)] = 0

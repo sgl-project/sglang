@@ -40,10 +40,21 @@ def cake_softmax(logits: torch.Tensor) -> torch.Tensor:
     return get_kernel("sampling.softmax", KernelBackend.FLASHINFER)(logits)
 
 
-def softmax(logits: torch.Tensor) -> torch.Tensor:
-    """Softmax for sampler logits, with a qualified Blackwell fast path."""
+def softmax(
+    logits: torch.Tensor, temperatures: torch.Tensor | None = None
+) -> torch.Tensor:
+    """Softmax for sampler logits, optionally with per-row temperatures."""
     import torch
 
+    if temperatures is not None and logits.is_cuda and torch.version.hip is not None:
+        from sglang.kernels.ops.sampling.temperature_softmax import (
+            temperature_softmax,
+        )
+
+        return temperature_softmax(logits, temperatures)
+
+    if temperatures is not None:
+        logits = logits / temperatures
     from sglang.kernels.cake_kernels.sampling import supports_softmax
 
     if supports_softmax(logits):
@@ -98,5 +109,19 @@ register_kernel(
         op="sampling.murmur_hash32",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.sampling.murmur_hash:murmur_hash32",
+    )
+)
+
+
+register_kernel(
+    KernelSpec(
+        op="sampling.denoiser_statistics",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.sampling.denoiser_statistics:denoiser_statistics",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+        format_signature=FormatSignature(
+            supported_dtypes=("float32",),
+            description="FP32 probabilities, entropy and raw-logit argmax for contiguous [B,M,V] logits; optional BF16 probabilities.",
+        ),
     )
 )

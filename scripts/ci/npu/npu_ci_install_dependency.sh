@@ -7,7 +7,7 @@ DEVICE_TYPE=$1
 
 CANN_VERSION="${CANN_VERSION:-9.1.0}"
 PYTORCH_VERSION="${PYTORCH_VERSION:-2.10.0}"
-SGLANG_KERNEL_NPU_TAG="${SGLANG_KERNEL_NPU_TAG:-2026.9.0.post6}"
+SGLANG_KERNEL_NPU_TAG="${SGLANG_KERNEL_NPU_TAG:-2026.9.0.post9}"
 
 ASCEND_HOME_PATH="${ASCEND_HOME_PATH:-/usr/local/Ascend/cann-${CANN_VERSION}}"
 export ASCEND_HOME_PATH
@@ -79,7 +79,7 @@ ${PIP_INSTALL} torch-npu==2.10.0.post6 --extra-index-url https://ascend.devcloud
 
 case "$(arch)" in
 aarch64)
-    ${PIP_INSTALL} https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/ta/triton_ascend-3.2.2-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl
+    ${PIP_INSTALL} "${GITHUB_PROXY_URL}https://github.com/triton-lang/triton-ascend/releases/download/v3.2.2/triton_ascend-3.2.2-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl"
     ;;
 x86_64)
     ${PIP_INSTALL} "${GITHUB_PROXY_URL}https://github.com/triton-lang/triton-ascend/releases/download/v3.2.2/triton_ascend-3.2.2-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl"
