@@ -7,10 +7,7 @@
 # atom/mono/plan/arith.py
 # atom/mono/plan/shard.py
 # atom/mono/plan/build_key.py
-"""Plain-Python planning of the mono kernels: the execution model (one CTA a CU,
-all resident), mailbox layouts, arithmetic that runs on ints and traced values
-alike, TP shards, and build keys (every build parameter, and this package's
-sources, in FlyDSL's JIT cache key)."""
+"""Plain-Python planning of the mono kernels: execution model, layouts, TP shards and build keys."""
 
 import enum
 import functools
@@ -25,9 +22,7 @@ WAVES = THREADS // 64
 
 
 def first_task(bid, base):
-    """CTA ``bid``'s first task of a stage placed from CTA ``base`` (any count of
-    CTAs past 0: placements that add task counts run past the grid), then every
-    BLOCKS-th."""
+    """Return CTA ``bid``'s first task of a stage placed from CTA ``base``."""
     return (bid - base % BLOCKS + BLOCKS) % BLOCKS
 
 
@@ -36,8 +31,7 @@ PAIR_BYTES = 8  # a (value, tag) pair
 
 
 def pair_layout(items, align: int = PAIR_BYTES, start: int = 0) -> dict:
-    """``items`` (name, pairs) laid out in order: name -> (byte offset, bytes),
-    each region from an ``align``-byte boundary at or past ``start``."""
+    """Lay out ``items`` (name, pairs) in order: name -> (byte offset, bytes), ``align``-aligned."""
     out, off = {}, start
     for name, pairs in items:
         off = (off + align - 1) // align * align
@@ -48,8 +42,7 @@ def pair_layout(items, align: int = PAIR_BYTES, start: int = 0) -> dict:
 
 # ---------------------------------------------------------------- arithmetic
 def sel(pred, a, b):
-    """A if pred else b: a conditional on Python values, ``select`` on traced
-    ones (rewrapped in the traced operand's type)."""
+    """Return a if pred else b, as ``select`` on traced values."""
     if isinstance(pred, bool):
         return a if pred else b
     out = pred.select(a, b)
@@ -104,9 +97,7 @@ _ROOT = Path(__file__).resolve().parents[1]  # the mono package
 
 @functools.cache
 def source_digest(*paths: str) -> str:
-    """sha256 of every ``.py`` file under ``paths`` (files or directories,
-    relative to the mono package), each file's path and contents: one model's
-    kernel sources, so an edit to another model's rebuilds none of these."""
+    """Return the sha256 of every ``.py`` file under ``paths`` (path and contents)."""
     h = hashlib.sha256()
     for rel in paths:
         root = _ROOT / rel
@@ -120,8 +111,7 @@ def source_digest(*paths: str) -> str:
 
 
 def key_tuple(key, sources: str) -> tuple:
-    """``key``'s (field name, value) pairs, every value a scalar, then
-    ("sources", ``sources``): the model's ``source_digest``."""
+    """Return ``key``'s (field, value) pairs, then ("sources", ``sources``)."""
     out = []
     for f in fields(key):
         value = getattr(key, f.name)

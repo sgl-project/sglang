@@ -1,9 +1,4 @@
-"""CPU test of the FFN launch's model guard (``unsupported_model``): the checkpoint's config passes, and
-each routing, activation and shape setting the kernels build in fails when it differs or is missing.
-The normal MoE path's warmup runs every width up to MAX_ROWS once.
-
-Run in the image: python3 test_dsv41_mono_guards.py [model path]
-"""
+"""CPU test of the FFN launch's model guard and the normal MoE path warmup (python3, in the image)."""
 
 import sys
 import types
@@ -56,6 +51,35 @@ def warm_widths():
     return seen == list(range(1, m.MAX_ROWS + 1))
 
 
+def spec_cases(cfg):
+    """The deployment guard rejects every speculative algorithm and lets None / 'none' through."""
+    from sglang.srt.models.deepseek_common.amd import dsv41_mono_decode as m
+
+    msg = "does not support speculative decoding"
+    fails = []
+    get_spec, gfx95 = m.get_spec, m.is_gfx95_supported
+    # without a GPU the next check stops at "needs gfx950"
+    m.is_gfx95_supported = lambda: False
+    try:
+        for algo, rejected in (
+            (None, False),
+            ("none", False),
+            ("NONE", False),
+            ("NEXTN", True),
+            ("EAGLE", True),
+            ("DSPARK", True),
+        ):
+            m.get_spec = lambda: types.SimpleNamespace(speculative_algorithm=algo)
+            why = m._unsupported(cfg)
+            ok = why == (msg if rejected else "needs gfx950")
+            print(f"  {'PASS' if ok else 'FAIL'} speculative_algorithm={algo!r}: {why}")
+            if not ok:
+                fails.append(f"speculative {algo}")
+    finally:
+        m.get_spec, m.is_gfx95_supported = get_spec, gfx95
+    return fails
+
+
 def main():
     path = sys.argv[1] if len(sys.argv) > 1 else "deepseek-ai/DeepSeek-V4.1-Flash"
     cfg = load_config(path)
@@ -82,8 +106,9 @@ def main():
     )
     if not ok:
         fails.append("warmup")
+    fails += spec_cases(cfg)
     print(
-        f"{len(cases)} negative cases + warmup; "
+        f"{len(cases)} negative cases + warmup + 6 speculative cases; "
         + ("ALL PASS" if not fails else f"FAILED: {fails}")
     )
     sys.exit(1 if fails else 0)

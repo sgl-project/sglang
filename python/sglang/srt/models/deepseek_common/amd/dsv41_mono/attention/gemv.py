@@ -1,33 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""MXFP8 GEMV of the mega kernel: 16 rows of a row-major e4m3 weight [N, K]
-(vLLM's loaded layout, E8M0 scales in 32x32 blocks [N / 32, K / 32]) against
-every token of a tile, its MXFP8 rows in LDS, on the gfx950 scaled MFMA.
-
-A task may cover a window of K (``kbeg`` .. ``kbeg + nsteps`` 128-steps): a
-split-K part, its activations in LDS holding just that window. The weight
-operands are loaded first (all in flight, before the task waits on its
-activations); wave w takes the window's steps w, w + 8, ... (or, ``split``, a
-contiguous range of waves 0 .. split - 1), its 16 x 16 partial in ``red``,
-summed in wave order by ``row_sum``. Adapted from ATOM's
-``attn_pre.gemv_fp8_*``, which reads aiter's (16, 16)-preshuffled layout.
-"""
+"""K1's MXFP8 GEMV of a row-major e4m3 weight on the gfx950 scaled MFMA."""
 
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import T
 
-from .device import THREADS, WAVES, mfma_scaled, rsrc, tile_map, traced
+from sglang.srt.models.deepseek_common.amd.dsv41_mono.common.ops import rsrc, traced
+from sglang.srt.models.deepseek_common.amd.dsv41_mono.stages.gemv import lds_row
 
-# a token's LDS row of MXFP8 words / E8M0 codes, padded by 16 B so 16 rows read
-# by one MFMA operand do not share a bank group
-LDS_PAD = 4
+from .device import THREADS, WAVES, mfma_scaled, tile_map
+
 RED = WAVES * 64 * 4  # one task's accumulators in ``red`` (f32)
-
-
-def lds_row(words):
-    return words + LDS_PAD
 
 
 def _steps(c, nsteps, split, tiled):
@@ -47,10 +32,7 @@ def _steps(c, nsteps, split, tiled):
 
 
 def _step_load(c, r_w, r_ws, k, row0, st, pred=None):
-    """Global step ``st``'s weight operand of rows row0 .. +16: two 16 B chunks a
-    lane (K bytes 16 j .. and 64 + 16 j .. of the step, row row0 + lane % 16)
-    and the E8M0 byte of its K block. ``pred`` false: masked (out of range: no
-    memory traffic, zeros)."""
+    """Load step ``st``'s weight operand of rows row0 .. +16 and its E8M0 byte (masked when not ``pred``)."""
     lane = c["lane"]
     j = lane // 16
     row = row0 + lane % 16
@@ -66,9 +48,7 @@ def _step_load(c, r_w, r_ws, k, row0, st, pred=None):
 def gemv_loads(
     c, w, ws, k, row0, split=None, tiled=False, kbeg=0, nsteps=None, pred=None
 ):
-    """The weight operands of rows row0 .. +16 (``tiled``: row0 + 16 (wave //
-    split)) over steps kbeg .. kbeg + nsteps for this wave, all in flight
-    (``pred`` false: masked off, no memory traffic)."""
+    """Issue this wave's weight loads for steps kbeg .. kbeg + nsteps."""
     nsteps = k // 128 if nsteps is None else nsteps
     if const_expr(pred is None):
         r_w, r_ws = rsrc(w), rsrc(ws)
@@ -140,9 +120,7 @@ def _step_mfma(c, nsteps, xl, xsl, st, ops, acc, live, rows, halves=False):
 
 
 def gemv_mfmas(c, k, xl, xsl, red, ops, split=None, tiled=False, rows=16, nsteps=None):
-    """``gemv_loads``' operands against ``rows`` tokens' MXFP8 rows of the
-    window in LDS (``xl`` words, ``xsl`` codes, rows ``lds_row`` of the window)
-    -> ``red[wave][lane]`` (a 16 x 16 C: row 4 (lane // 16) + i, token lane % 16)."""
+    """Multiply ``gemv_loads``' operands with ``rows`` tokens' MXFP8 rows in LDS into ``red``."""
     lane, wave = c["lane"], c["wave"]
     nsteps = k // 128 if nsteps is None else nsteps
     acc = fx.Vector.filled(4, 0.0, fx.Float32)
@@ -156,19 +134,7 @@ def gemv_mfmas(c, k, xl, xsl, red, ops, split=None, tiled=False, rows=16, nsteps
     fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
 
 
-def row_sum(red, r, t, waves=None):
-    """Row r, token t of the waves' accumulators, summed in wave order."""
-    tot = fx.Float32(0.0)
-    for w in waves if waves is not None else range(WAVES):
-        tot = tot + fx.ptr_load(red + ((w * 64 + 16 * (r // 4) + t) * 4 + r % 4))
-    return tot
-
-
-# SGLang's mxfp8_gemv (deepseek_v4/mxfp8_gemv_gfx95.cuh) with W waves: wave w chains
-# the 128-steps [w L, w L + L), L = cdiv(nsteps, W), from a zero accumulator; the W
-# partials are summed in wave order, then rounded to bf16 once. A chain here plays
-# one of its waves, so the sum is bit for bit SGLang's. Its split-K Triton GEMM is
-# the same with ``halves`` steps and the partials in torch's sum order.
+# SGLang's mxfp8_gemv chains per wave and sums in wave order; a chain here plays one wave
 
 
 def chain_slots(c, nsteps, waves):
@@ -182,8 +148,7 @@ def chain_slots(c, nsteps, waves):
 
 
 def chain_loads(c, w, ws, k, row0, slots, pred):
-    """The weight operands of every step of ``slots`` (rows row0 .. +16); a dead
-    step or a CTA with ``pred`` false reads through a zero-size buffer."""
+    """Issue the weight loads of every step of ``slots`` (a dead step reads a zero-size buffer)."""
     out = []
     for _, steps in slots:
         ops = []
@@ -199,9 +164,7 @@ def chain_loads(c, w, ws, k, row0, slots, pred):
 
 
 def chain_mfmas(c, xl, xsl, ops, rows, nsteps, slots, halves=False):
-    """The chains against ``rows`` tokens' MXFP8 rows of all ``nsteps`` steps
-    in LDS, each from a zero accumulator in step order; a step past the end
-    leaves its chain as is."""
+    """Run the chains against ``rows`` tokens' MXFP8 rows, each from zero in step order."""
     out = []
     for (_, steps), sops in zip(slots, ops):
         acc = fx.Vector.filled(4, 0.0, fx.Float32)
@@ -252,12 +215,7 @@ def rows_loads(
     n,
     pred=None,
 ):
-    """Tokens t0 .. t0 + n's published MXFP8 row slices -- ``words`` i32 from
-    ``off_w`` and ``groups`` codes (an i32 each) from ``off_g``, rows
-    ``stride_w`` / ``stride_g`` i32 apart -- loaded (issued, not waited on),
-    16 B a lane-item: a thread one column, rows a round apart. Plain loads:
-    their flags are seen, and nothing in the launch read these lines before.
-    ``pred`` false: masked off (zeros, no memory traffic)."""
+    """Issue loads of the published MXFP8 rows of tokens t0 .. t0 + n (masked when not ``pred``)."""
     tid = c["tid"]
     nb = None if pred is None else pred.select(fx.Int64(0xFFFFFFFF), fx.Int64(0))
     out = []
@@ -299,8 +257,7 @@ def _store_span(c, regs, width, dst, n, lrow=None):
 
 
 def rows_store(c, regs, words, groups, xl, xsl, n, row_w=None, row_g=None):
-    """``rows_loads``' registers into LDS rows 0 .. n (``lds_row`` strides, or
-    rows ``row_w`` / ``row_g`` i32 apart: a slice of wider rows)."""
+    """Store ``rows_loads``' registers into LDS rows 0 .. n."""
     _store_span(c, regs[0], words, xl, n, row_w)
     _store_span(c, regs[1], groups, xsl, n, row_g)
     gpu.barrier()

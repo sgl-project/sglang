@@ -30,6 +30,8 @@ from sglang.srt.utils import is_gfx95_supported
 live_rows = gfx95_dense.live_rows
 wo_a_fp8_grid_matmul = gfx95_dense.wo_a_fp8_grid_matmul
 wo_b_emits_mxfp8 = gfx95_dense.wo_b_emits_mxfp8
+stash_k1_weights = dsv41_mono_decode.stash_k1_weights
+stash_shared_expert = dsv41_mono_decode.stash_shared_expert
 
 _is_gfx95_supported = is_gfx95_supported()
 

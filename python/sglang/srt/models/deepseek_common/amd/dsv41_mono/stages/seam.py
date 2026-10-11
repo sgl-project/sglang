@@ -4,24 +4,7 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc.:
 # atom/models/deepseek_v41/mono/kernels/attn_pre.py (slice, gate, norm) and
 # atom/models/deepseek_v41/mono/kernels/attn_post.py (the attention's TP reduce).
-"""The mono layer's mHC seam stages, each a task table of a persistent launch
-handing off through the tagged mailbox:
-
-    slice   (160, 32 hidden columns x 4 streams each): the owed post folded into
-            the residual (R_new, bf16 out), the collapsed layer input (mailbox
-            LIN) and the partial mix projection / sum of squares (mailbox PMIX)
-    gate    (S): the 160 partials -> post / comb (Sinkhorn) and the next pre
-    norm    (S): the RMSNorm -> the bf16 row, handed to the caller's store
-    reduce  (160): the FFN seam's attention output, the TP ranks' partials
-            (pushed to every rank's ATTN region) summed in the all-reduce's
-            order -> ``pend_lds``, where its slice reads it
-    push    (160): a rank's partial given in memory (an attention vLLM ran)
-            to every rank's ATTN region, ahead of the slice's reduce
-
-Every elementwise step follows aiter's ``mhc_fused_post_pre_delayed_rmsnorm``
-rounding; the mix projection and the sums of squares, split-K reductions,
-differ only in their split and order.
-"""
+"""The mHC seam stages (slice, gate, norm, reduce, push), handing off through the tagged mailbox."""
 
 import math
 
@@ -108,9 +91,7 @@ def lane_f32(v, src):
 
 
 def pend_value(c, t, col, cc):
-    """The owed post's sublayer output at (token t, column col): read from
-    ``pend``, or where a caller staged it (``pend_lds``, ``[token][32]`` of this
-    task's columns: a reduction it did first)."""
+    """Return the owed post's sublayer output at (token t, column col)."""
     if const_expr(c.get("pend_lds") is None):
         return ld_bf(c["args"]["pend"], t * HIDDEN + col)
     return fx.ptr_load(c["pend_lds"] + (t * COLS + cc))
@@ -119,8 +100,7 @@ def pend_value(c, t, col, cc):
 # ---------------------------------------------------------------- slice
 @traced
 def slice_input(c, task, idx):
-    """Thread ``idx``'s pair of the layer input (token idx / 16, columns
-    32 task + 2 (idx % 16) ..)."""
+    """Return thread ``idx``'s pair of the layer input."""
     s, rl = c["S"], c["rl"]
     a = c["args"]
     c0 = task * COLS
@@ -156,13 +136,11 @@ def slice_row(c, c0, e, got):
     a = c["args"]
     t, o, col = slice_at(c0, e)
     r, cm, post = got
-    # aiter's mhc_fused_post_pre_delayed_rmsnorm: ((post x + c0 r0)
-    # + c1 r1) + c2 r2, each product rounded, then fma(c3, r3, ..)
+    # aiter's mhc_fused_post_pre_delayed_rmsnorm order: ((post x + c0 r0) + c1 r1) + c2 r2, then fma(c3, r3, ..)
     v = post * pend_value(c, t, col, e % COLS) + (r[0] * cm[0])
     for h in range_constexpr(1, HC - 1):
         v = v + cm[h] * r[h]
-    # bf16 R_new is what the collapse, the sums of squares and the
-    # mix projection all read; SGLang's Triton boundary has no fma
+    # bf16 R_new feeds the collapse, the sums of squares and the mix projection (no fma, as Triton)
     if const_expr(c.get("sgl", False)):
         v = bf16_round(v + cm[HC - 1] * r[HC - 1])
     else:
@@ -173,8 +151,7 @@ def slice_row(c, c0, e, got):
 
 @traced
 def stage_slice(c, task):
-    """R_new, the layer input and the partial projections of hidden columns
-    32 task .. +32, all four streams, every token."""
+    """Compute R_new, the layer input and the partial projections of columns 32 task .. +32."""
     s, tid, lane, wave = c["S"], c["tid"], c["lane"], c["wave"]
     rl, fl = c["rl"], c["fl"]
     a = c["args"]
@@ -194,9 +171,7 @@ def stage_slice(c, task):
             f = ld_f32(a["hc_fn"], j * K_MIX + o * HIDDEN + c0 + e % COLS)
             fx.ptr_store(f, fl + e)
     gpu.barrier()
-    # the layer input: bf16 R_new of the four streams by the incoming pre-mix,
-    # products rounded, summed in order (the Triton collapse, no contraction);
-    # two columns a thread, one bf16 pair a mailbox store
+    # layer input: bf16 R_new times pre, products rounded, summed in order (as the Triton collapse)
     for pas in range_constexpr(0, s * COLS // 2, THREADS):
         slice_input(c, task, plus(pas, tid))
     # sum of squares: token t on wave t % WAVES, two columns a lane
@@ -207,8 +182,7 @@ def stage_slice(c, task):
             sq = butterfly(x0 * x0 + x1 * x1, (32, 16, 8, 4, 2, 1))
             if lane == 0:
                 c["put"](c["pmix"], (task * s + t) * PART + MIX, sq)
-    # mixes: fp32 MFMA 16x16x4, A = fn rows (two 16-row tiles), B = R_new^T,
-    # a token tile at a time
+    # mixes: fp32 MFMA 16x16x4, A = fn rows, B = R_new^T, a token tile at a time
     for t0, n in token_tiles(s):
         slice_mix(c, task, t0, n)
 
@@ -248,8 +222,7 @@ def slice_mix(c, task, t0, n):
 
 # ---------------------------------------------------------------- gate
 def _row(v, lane, q):
-    """Comb lanes 8..23 hold ``comb[r][c]`` at lane 8 + 4 r + c: element q of
-    the row."""
+    """Return element q of a comb row (lanes 8..23 hold comb[r][c] at lane 8 + 4 r + c)."""
     return lane_f32(v, (lane - 8) // 4 * 4 + 8 + q)
 
 
@@ -287,8 +260,7 @@ def stage_gate(c, t):
             sq = sq + fx.ptr_load(red + (g * PART + MIX))
         sc = [ld_f32(a["hc_scale"], i) for i in range(3)]
         base = ld_f32(a["hc_base"], j)
-        # aiter's mhc_fused_post_pre_delayed_rmsnorm reduce: one rstd =
-        # rsq(fma(sum, 1/K, eps)), then each gate fma(mix rstd, scale, base)
+        # aiter's reduce: rstd = rsq(fma(sum, 1/K, eps)), then each gate fma(mix rstd, scale, base)
         v = mix * hw_rsq(fma(sq, fx.Float32(1.0 / K_MIX), fx.Float32(EPS)))
         if lane < HC:
             pre = sigmoid(fma(v, sc[0], base))
@@ -325,10 +297,7 @@ def stage_gate(c, t):
 # ---------------------------------------------------------------- norm
 @traced
 def stage_norm(c, t, store):
-    """Token t's RMSNorm (rstd = rsq(fma(sum, 1/H, eps)), bf16((x rstd) w));
-    256 threads, 3 chunks of 8 at 8 t + 2048 c, each chunk's bf16 values handed
-    to ``store(t, col, ys, live)`` by every thread (``live``: a thread's chunk
-    in the row; threads 256.. mirror thread 255)."""
+    """Token t's RMSNorm: rstd = rsq(fma(sum, 1/H, eps)), bf16((x rstd) w), handed to ``store``."""
     tid, lane, wave, red = c["tid"], c["lane"], c["wave"], c["red"]
     a = c["args"]
     tt = fx.min(tid, 255)
@@ -344,9 +313,7 @@ def stage_norm(c, t, store):
         xs.append([(cols[ch] < HIDDEN).select(x, fx.Float32(0.0)) for x in v])
     sgl = c.get("sgl", False)
     if const_expr(sgl):
-        # SGLang's rmsnorm_fake_quant_row tree: per column (c0^2 + c1^2) + c2^2,
-        # the 8 columns as ((0+2)+(4+6)) + ((1+3)+(5+7)), the wave's
-        # DPP rows 8, 4, 2, 1 then 16, 32, the waves as (w0+w2) + (w1+w3)
+        # SGLang's rmsnorm_fake_quant_row reduction tree, step for step
         e = [
             fma(xs[2][j], xs[2][j], fma(xs[0][j], xs[0][j], xs[1][j] * xs[1][j]))
             for j in range(8)
@@ -382,9 +349,7 @@ def stage_norm(c, t, store):
 # ---------------------------------------------------------------- reduce
 @traced
 def stage_reduce(c, task):
-    """The attention output at this slice's 32 columns: the TP ranks' partials
-    in the all-reduce's order (``sum_partials``), in fp32 -> bf16 ->
-    ``pend_lds``."""
+    """Sum the TP ranks' attention partials at this slice's 32 columns in rank order into ``pend_lds``."""
     s, tid = c["S"], c["tid"]
     for pas in range_constexpr(0, s * COLS // 2, THREADS):
         reduce_attn_pair(c, task, plus(pas, tid))
@@ -413,9 +378,7 @@ def reduce_attn_pair(c, task, idx):
 
 @traced
 def stage_push(c, task, part):
-    """This rank's attention partial (``part``: bf16 [S, HIDDEN], wo_b's
-    unreduced output) at this slice's 32 columns, every token, to every rank's
-    ATTN region: the pairs ``stage_reduce`` polls, as the bits vLLM wrote."""
+    """Push this rank's attention partial at this slice's 32 columns to every rank's ATTN region."""
     s, tid, tp = c["S"], c["tid"], c["d"].tp
     for pas in range_constexpr(0, s * COLS // 2, THREADS):
         idx = plus(pas, tid)

@@ -4,9 +4,7 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc.:
 # atom/mono/runtime/consensus.py
 # atom/mono/runtime/peer_memory.py
-"""Symmetric peer memory for the in-kernel TP all-reduces, and the agreement every
-rank must reach before anything collective (a rank that turned the mono layer
-off alone would leave the others spinning on the GPU)."""
+"""Symmetric peer memory for the in-kernel TP all-reduces."""
 
 import torch
 import torch.distributed as dist
@@ -19,9 +17,7 @@ class MonoUnsupported(Exception):
 
 
 def tp_agree(ok: bool, group) -> bool:
-    """True when every rank of ``group`` passed ``ok`` true. Every rank must call
-    it at the same point; ``group`` is a CPU (gloo) process group, or None for a
-    single rank."""
+    """Return True when every rank of ``group`` passed ``ok`` true (collective)."""
     if group is None:
         return ok
     flag = torch.tensor([int(ok)], dtype=torch.int32)
@@ -31,8 +27,7 @@ def tp_agree(ok: bool, group) -> bool:
 
 # ---------------------------------------------------------------- peer buffers
 class _DeviceBytes:
-    """``__cuda_array_interface__`` of ``nbytes`` bytes at a raw device address, for a
-    non-owning torch view."""
+    """Return a ``__cuda_array_interface__`` of ``nbytes`` at a raw device address."""
 
     def __init__(self, ptr: int, nbytes: int):
         self.__cuda_array_interface__ = {
@@ -44,15 +39,7 @@ class _DeviceBytes:
 
 
 class PeerBuffer:
-    """One uncached buffer per rank, every rank holding every peer's address
-    (``addresses``, int64, indexed by TP rank). What lives where, and why no rank
-    overwrites a peer's unread data, is the model's layout's to say.
-
-    The constructor is collective over ``group`` (the handle exchange, then an
-    agreement that every rank mapped every peer): every rank must reach it, so a
-    runner reaches it only after ``tp_agree``. A failed mapping on any rank raises
-    ``MonoUnsupported`` on all of them.
-    """
+    """One uncached buffer per rank with every peer's address; the constructor is collective."""
 
     def __init__(
         self,
@@ -93,8 +80,7 @@ class PeerBuffer:
         self.addresses = torch.tensor(addresses, dtype=torch.int64, device=device)
 
     def close(self) -> None:
-        """Close the peer mappings and free the local buffer; idempotent. Only once no
-        kernel of any rank can still touch it (the runner is being dropped)."""
+        """Close the peer mappings and free the local buffer (idempotent)."""
         opened, self._opened = self._opened, []
         for base in opened:
             UncachedIpcHeap.close_mem_handle(base)

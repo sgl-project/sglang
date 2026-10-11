@@ -5,50 +5,27 @@
 # atom/mono/device/ops.py
 # atom/mono/device/ranks.py
 # atom/mono/device/stamps.py
-"""Device-side primitives of the mono kernels: wave reductions and shuffles, the
-approximate hardware math, bf16 / fp8 packing, buffer resources, the
-execution-model constants and the kernel symbol naming.
-
-Ported from the FlyDSL GLM-5 layer kernel (ROCm/FlyDSL branch
-``glm5-mla-moe-layer-monokernel`` @ 1e28fd8a,
-``kernels/mla_moe_layer/shared_reuse_moe_kernel.py``). Only published flydsl APIs
-and aiter's vendored ``buffer_ops`` / ``dpp_utils`` are used.
-
-Every function but ``kernel_symbol`` is traced inside a ``@flyc.kernel`` body.
-
-Raw boundaries kept, for want of an equivalent on the pinned FlyDSL:
-``buffer_ops`` loads / stores (the kernels take raw Int64 addresses, no tensors
-for ``make_buffer_tensor``); raw MFMA intrinsics (hand-laid operands: permlane
-transposes, fp8 packing, MXFP4 scales); the LLVM intrinsics here (``expect``,
-``s_memrealtime``, the approximate rsq / rcp / exp2) and the struct unpacking of
-``permlane*_swap``.
-
-Also the TP group seen from inside a kernel (every rank's peer buffer, an
-all-reduce's rank-ordered sum) and a timeline build's phase stamps."""
+"""Device primitives of the mono kernels: wave ops, hardware math, packing and buffer access."""
 
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from aiter.ops.flydsl.kernels.dpp_utils import update_dpp_i32
 from flydsl._mlir.dialects import llvm
 from flydsl.compiler.ast_rewriter import ASTRewriter
-from flydsl.expr import const_expr
 from flydsl.expr import math as fmath
 from flydsl.expr import range_constexpr, rocdl
 from flydsl.expr.typing import T, as_ir_value
 
 from sglang.srt.models.deepseek_common.amd.dsv41_mono.common.plan import THREADS, WAVES
 
-# ---------------------------------------------------------------- primitives
-# gfx95x cache policy bits (LLVM CPol): SC0 = 1, SC1 = 16. SC1 alone is device
-# scope (past the per-XCD caches); SC0 | SC1 is system scope (peers over XGMI).
+# gfx95x cache policy bits: SC1 = device scope, SC0 | SC1 = system scope (peers over XGMI)
 CM_DEV = 16
 
 
 CM_SYS = 17
 
 
-# NT = 2: nontemporal. A weight a layer reads once streams past the caches it
-# would only evict the step's reused data from (the MoE at 48 rows: 143 -> 133 us)
+# NT = 2: nontemporal, for weights a layer reads once
 CM_NT = 2
 
 
@@ -57,9 +34,7 @@ def rsrc(addr, nbytes=None):
 
 
 def permlane_swap(off, x, y):
-    """v_permlane{32,16}_swap on registers (x, y): off 32 trades x's upper-half
-    lanes with y's lower-half lanes; off 16 trades x's odd 16-lane rows with y's
-    even rows (each within its half). -> (x', y')."""
+    """v_permlane{32,16}_swap on registers (x, y); returns (x', y')."""
     swap = rocdl.permlane32_swap if off == 32 else rocdl.permlane16_swap
     pr = swap(
         llvm.StructType.get_literal([T.i32, T.i32]),
@@ -78,16 +53,8 @@ def lane_gather(v, src_lane):
     )
 
 
-def memrealtime():
-    """s_memrealtime: the 100 MHz device clock (no FlyDSL wrapper)."""
-    return fx.Int64(llvm.call_intrinsic(T.i64, "llvm.amdgcn.s.memrealtime", [], [], []))
-
-
 def fresh(v):
-    """``v`` (a per-lane Int32) through an opaque move, here: the lane math built
-    on it is computed at its use, where LLVM would otherwise hoist it out of a task
-    loop or CSE it across stages into registers held for the whole kernel (spills,
-    and a kernel with scratch is refused: ``runtime.widths``)."""
+    """Pass ``v`` through an opaque move, so LLVM does not hoist lane math into long-lived registers."""
     return fx.Int32(
         llvm.inline_asm(
             T.i32,
@@ -123,17 +90,13 @@ def hw_exp2(x):
 
 
 def div_rn(x, d, r):
-    """``x / d`` rounded to nearest, bit-identical to the IEEE division, given
-    ``r = 1.0 / d`` from one true division per divisor (Markstein: a quotient
-    within 1 ulp plus its exact fma residual times RN(1/d) rounds correctly)."""
+    """Return ``x / d`` rounded to nearest, bit-identical to IEEE division, given ``r = 1.0 / d``."""
     q = x * r
     return fx.Float32(fmath.fma(fx.Float32(fmath.fma(-q, d, x)), r, q))
 
 
 def xshfl(v, off):
-    """Value of lane ``lane ^ off``: offsets 32 / 16 via v_permlane*_swap, in-row
-    offsets via DPP (VALU latency, not LDS). Powers of two only: any other
-    offset would take the lane ^ 1 path."""
+    """Return the value of lane ``lane ^ off`` (power-of-two offsets only)."""
     assert off in (1, 2, 4, 8, 16, 32), off
     if off >= 16:
         return v.shuffle_xor(off, 64)
@@ -169,18 +132,14 @@ def _add(a, b):
 
 
 def butterfly(v, offsets, op=_add):
-    """Butterfly reduction over the given xor offsets, in the given order.
-
-    The order is the numerical contract: the aiter per-head norm reduces 32
-    lanes with offsets 16, 8, 4, 2, 1, and matching it keeps rstd bit-exact."""
+    """Butterfly reduction over the xor offsets in the given order (the order sets the result bits)."""
     for off in offsets:
         v = xred(v, off, op)
     return v
 
 
 def traced(fn):
-    """Apply flydsl's AST rewriting to a helper, so its ``while`` / ``if`` over
-    traced values lower to scf ops. Kernels rewrite only their own body."""
+    """Apply FlyDSL's AST rewrite to a helper, so its control flow on traced values lowers to scf."""
     return ASTRewriter.transform(fn)
 
 
@@ -189,11 +148,7 @@ LOAD_BATCH = 4  # rounds of a strided loop whose loads go out together
 
 @traced
 def batched_rounds(tid, n, load, use, batch=LOAD_BATCH):
-    """A CTA's strided loop over elements v = tid + THREADS i < n (n a Python
-    int): ``load(v)`` of ``batch`` rounds issued before any ``use(v, loaded)``.
-    A round whose ``use`` stores to global memory keeps the next round's loads
-    behind it (they may alias), so the rounds' loads would go out in series. A
-    round past n loads element n - 1 (in range) and uses nothing."""
+    """Strided CTA loop over v < n: ``batch`` rounds of ``load(v)`` issued before each ``use``."""
     rounds = -(-n // THREADS)
     for b0 in range_constexpr(0, rounds, batch):
         idx = range(b0, min(b0 + batch, rounds))
@@ -209,9 +164,7 @@ def mfma_bf16(a, b, c):
 
 
 def row_sum(red, r, t, waves=None):
-    """Row r, token t of the waves' 16x16 MFMA accumulators (wave w's at ``red``
-    + (w * 64 + lane) * 4), summed in wave order from 0 (``waves``: which, in
-    order; all of them by default)."""
+    """Return row r, token t of the waves' MFMA accumulators, summed in wave order."""
     tot = fx.Float32(0.0)
     for w in waves if waves is not None else range(WAVES):
         tot = tot + fx.ptr_load(red + ((w * 64 + 16 * (r // 4) + t) * 4 + r % 4))
@@ -233,8 +186,7 @@ def lanes_below(bal, lane):
 
 
 def load_ptr64(table, i):
-    """Entry ``i`` of an i64 table in memory, wave-uniform (each half through
-    ``uniform``): a peer's buffer base, a kernel argument block's pointer."""
+    """Load entry ``i`` of an i64 table, wave-uniform."""
     pw = fx.Vector(bo.buffer_load(rsrc(table), i * 2, vec_width=2, dtype=T.i32))
     return (fx.Int64(uniform(pw[1])) << 32) | fx.Int64(fx.Uint32(uniform(pw[0])))
 
@@ -275,15 +227,12 @@ def fp8_pack4(a, b, c, d):
 
 # ---------------------------------------------------------------- TP ranks
 def peer_bases(peers, tp):
-    """Every rank's peer buffer base from the ``peers`` table (an i64 a rank),
-    loaded once: a put's address must not wait on a load of its own."""
+    """Load every rank's peer buffer base from the ``peers`` table once."""
     return [load_ptr64(peers, p) for p in range(tp)]
 
 
 def sum_partials(poll, own, pair_of, tp):
-    """The ``tp`` ranks' bf16 pair partials at ``pair_of(src)`` of the mailbox
-    region ``own``, summed in fp32 in rank order 0 .. tp - 1: one poll batch ->
-    (lo sum, hi sum). Every rank sums in the same order, so they agree."""
+    """Poll the ``tp`` ranks' bf16 pair partials and sum them in fp32 in rank order."""
     ws = poll([(own, pair_of(src), 1) for src in range(tp)])
     acc0, acc1 = bf2_f32(ws[0][0])
     for src in range_constexpr(1, tp):
@@ -291,11 +240,3 @@ def sum_partials(poll, own, pair_of, tp):
         acc0 = acc0 + lo
         acc1 = acc1 + hi
     return acc0, acc1
-
-
-# ---------------------------------------------------------------- timeline stamps
-def stamp(on, tls, tid, k):
-    # compile-time gate outside, traced condition inside: they cannot be one `and`
-    if const_expr(on):  # noqa: SIM102
-        if tid == 0:
-            fx.ptr_store(memrealtime(), tls + k)

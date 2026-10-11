@@ -1,17 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""DeepSeek-V4.1-Flash mono decode layer: host side.
-
-One ``DSV41MonoLayer`` a TP rank runs every mono layer of a decode step (M <= 48
-rows): the FFN launch (``ffn``) from the layer's unreduced attention output to
-the MoE's reduced output, the residual after the FFN seam and that seam's mixes,
-with both TP all-reduces inside the kernel (symmetric peer memory). K1, launched
-by the model glue, writes its outputs into this runner's buffers (``q``,
-``res_mid``, ``post_a``, ``comb_a``, ``pre_a``). Every argument is a device
-pointer: the launches can be captured in a HIP graph. The kernels move their
-mailbox epoch on themselves; every rank runs the same launches, so the ranks'
-epochs agree.
-"""
+"""Host runner and buffers of the mono decode launches."""
 
 from __future__ import annotations
 
@@ -21,7 +10,7 @@ from pathlib import Path
 
 import torch
 
-from .attention.plan import HEAD_DIM, KEYS, Dims
+from .attention.plan import HEAD_DIM, Dims
 from .common.plan import BLOCKS
 from .layer import (
     EPOCH_WORDS,
@@ -41,8 +30,7 @@ HC = 4
 
 
 def _ensure_writable_flydsl_cache() -> None:
-    """Aiter points FlyDSL at its bundled, read-only cache; new kernels need a
-    writable one."""
+    """Point FlyDSL at a writable cache (aiter sets a read-only one)."""
     cur = os.environ.get("FLYDSL_RUNTIME_CACHE_DIR")
     if cur and os.access(cur, os.W_OK):
         return
@@ -52,19 +40,45 @@ def _ensure_writable_flydsl_cache() -> None:
 
 
 def _check_tensors(owner, tag: str, want: dict) -> None:
-    """Each named tensor of ``owner`` has the (shape, dtype) the kernels read,
-    contiguous: their buffer loads are unbounded, so a mismatch would read
-    garbage rather than fault."""
+    """Raise unless each named tensor has the expected shape and dtype and is contiguous."""
     for name, (shape, dtype) in want.items():
         t = getattr(owner, name)
-        assert tuple(t.shape) == shape and t.dtype == dtype and t.is_contiguous(), (
-            f"{tag} {name}: {tuple(t.shape)} {t.dtype}, want {shape} {dtype}"
+        if not (
+            tuple(t.shape) == shape
+            and t.dtype == dtype
+            and t.is_contiguous()
+            and t.is_cuda
+        ):
+            raise RuntimeError(
+                f"{tag} {name}: {tuple(t.shape)} {t.dtype}, want {shape} {dtype}"
+            )
+
+
+def check_rows(tag: str, rows: int, device, want: dict) -> None:
+    """Raise unless each tensor is contiguous on ``device`` with ``rows`` rows of (row size, dtype)."""
+    for name, (t, size, dtype) in want.items():
+        if not (
+            t.dtype == dtype
+            and t.numel() == rows * size
+            and t.is_contiguous()
+            and t.device == device
+        ):
+            raise RuntimeError(
+                f"{tag} {name}: {tuple(t.shape)} {t.dtype} {t.device}, want {rows} x {size} {dtype}"
+            )
+
+
+def no_capture(what: str) -> None:
+    """Raise inside a CUDA graph capture: builds and allocations run eagerly."""
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            f"DSv4.1 mono decode: {what} first reached inside a CUDA graph capture"
         )
 
 
 @dataclass
 class MonoLayerWeights:
-    """One layer's FFN-launch tensors on this rank, in vLLM's loaded layout."""
+    """One layer's FFN-launch tensors on this rank, in SGLang's loaded layout."""
 
     hc_ffn_fn: torch.Tensor  # [24, 4 * 5120] f32
     hc_ffn_scale: torch.Tensor  # [3] f32
@@ -82,9 +96,7 @@ class MonoLayerWeights:
     sw2_s: torch.Tensor
 
     def check(self, tp: int) -> None:
-        """The MoE's tensors: 384 experts, TP-sharded intermediates (the routed
-        one padded as the loader pads it), AITER's A8W4 layout, 32 x 32 E8M0
-        blocks for the shared expert."""
+        """One rank's MoE tensors in SGLang's loaded layout."""
         d, fp4, e4m3, u8 = (
             MoeDims(tp),
             torch.float4_e2m1fn_x2,
@@ -107,8 +119,7 @@ class MonoLayerWeights:
 
 
 class DSV41MonoLayer:
-    """The mono decode runner of one TP rank (``group``: its TP group, for the
-    peer-memory handle exchange; a gloo / CPU group)."""
+    """The mono decode runner of one TP rank (``group``: a gloo group for the peer handle exchange)."""
 
     def __init__(self, tp: int, rank: int, group, device: torch.device | str = "cuda"):
         _ensure_writable_flydsl_cache()
@@ -116,16 +127,16 @@ class DSV41MonoLayer:
 
         self.tp, self.rank = tp, rank
         self.d = Dims(tp)
-        dev = self.device = torch.device(device)
+        dev = torch.device(device)
+        if dev.index is None:
+            dev = torch.device(dev.type, torch.cuda.current_device())
+        self.device = dev
         self._scratch: dict[int, torch.Tensor] = {}
         # [epoch, -, -, -, a mark per CTA, the MoE's counters]
         self.epoch = torch.zeros(EPOCH_WORDS, dtype=torch.int32, device=dev)
         self.q = torch.zeros(
             MAX_TOKENS, self.d.heads, HEAD_DIM, dtype=torch.bfloat16, device=dev
         )
-        self.kt = torch.zeros(MAX_TOKENS * KEYS, dtype=torch.int32, device=dev)
-        self.klen = torch.zeros(2 * MAX_TOKENS, dtype=torch.int32, device=dev)
-        self._dummy = torch.zeros(4, dtype=torch.int32, device=dev)
         # K1's outputs: the attention seam's residual and mixes
         self.res_mid = torch.zeros(
             MAX_TOKENS, HC, HIDDEN, dtype=torch.bfloat16, device=dev
@@ -138,16 +149,10 @@ class DSV41MonoLayer:
         self._kernels: dict = {}
 
     def scratch(self, tokens: int) -> torch.Tensor:
-        """Step width ``tokens``'s scratch: a width's layout has memory of its own
-        (``layer.scratch_layout``). Allocated at the width's first step, which is
-        eager: vLLM runs every graph's batch eagerly before capturing it."""
+        """Return this width's scratch, allocated before graph capture."""
         buf = self._scratch.get(tokens)
         if buf is None:
-            if torch.cuda.is_current_stream_capturing():
-                raise RuntimeError(
-                    f"DSv4.1 mono decode: step width {tokens} first reached inside "
-                    "a CUDA graph capture"
-                )
+            no_capture(f"step width {tokens}")
             buf = torch.zeros(
                 scratch_bytes(tokens, self.tp), dtype=torch.uint8, device=self.device
             )
@@ -161,7 +166,8 @@ class DSV41MonoLayer:
     def ffn_kernel(self, tokens: int):
         key = (tokens, "ffn")
         if key not in self._kernels:
-            self._kernels[key] = build_mono_ffn(MonoBuild(tokens, self.tp, 0))
+            no_capture(f"FFN launch width {tokens}")
+            self._kernels[key] = build_mono_ffn(MonoBuild(tokens, self.tp))
         return self._kernels[key]
 
     @staticmethod
@@ -185,17 +191,38 @@ class DSV41MonoLayer:
         pre_mix: torch.Tensor,  # [M, 4] f32
         outs: tuple | None = None,
     ):
-        """-> (out, residual, post_mix, res_mix, pre_mix) of a layer whose
-        attention vLLM ran: the attention's TP reduce, the FFN seam, the MoE and
-        its all-reduce in one launch."""
+        """Run the FFN launch: attention TP reduce, FFN seam, MoE and all-reduce."""
         M = part.shape[0]
-        assert self.supports(M), M
-        for t_ in (part, residual, post_mix, res_mix, pre_mix):
-            assert t_.is_contiguous()
-        assert part.dtype == residual.dtype == torch.bfloat16
+        if not self.supports(M):
+            raise RuntimeError(f"DSv4.1 mono decode: {M} rows")
+        bf, f32 = torch.bfloat16, torch.float32
+        check_rows(
+            "FFN",
+            M,
+            self.device,
+            {
+                "part": (part, HIDDEN, bf),
+                "residual": (residual, HC * HIDDEN, bf),
+                "post": (post_mix, HC, f32),
+                "comb": (res_mix, HC * HC, f32),
+                "pre": (pre_mix, HC, f32),
+            },
+        )
         if outs is None:
             outs = self._outs(M, residual)
         out, res_out, post_out, comb_out, pre_out = outs
+        check_rows(
+            "FFN",
+            M,
+            self.device,
+            {
+                "out": (out, HIDDEN, bf),
+                "res_out": (res_out, HC * HIDDEN, bf),
+                "post_out": (post_out, HC, f32),
+                "comb_out": (comb_out, HC * HC, f32),
+                "pre_out": (pre_out, HC, f32),
+            },
+        )
         self.ffn_kernel(M)(
             part.data_ptr(),
             residual.data_ptr(),

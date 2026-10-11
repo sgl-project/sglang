@@ -1,16 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""The mono decode layer's two launches: K1 = the attention seam (``stages.seam``:
-slice, gate, the norm into the attention's MXFP8) + the attention front
-(``attention.front``); the FFN launch = a push of the attention's unreduced wo_b
-output to every rank (``seam.stage_push``) + the FFN seam (the TP sum folded in)
-+ the MoE (``stages.moe``, its all-reduce in-kernel too).
-
-Tags: K1's hand-offs carry 2 e + 1, the FFN launch's 2 e + 2 (e: the epoch,
-moved on by the FFN launch's CTA 0 at its end), so the FFN seam may reuse K1's
-seam regions. Peer regions alternate by e's parity; every rank runs the same
-launches, so the epochs agree across ranks.
-"""
+"""Build K1 (attention seam and front) and the FFN launch (seam, MoE and TP all-reduce)."""
 
 from dataclasses import dataclass
 
@@ -21,7 +11,7 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int32, Int64, T
 
 from .attention import front as mb_front
-from .attention.plan import Dims, back_scratch, front_scratch
+from .attention.plan import Dims, front_scratch
 from .common.epoch import EPOCH_MARKS, epoch_begin, epoch_end, gstore, kernel_symbol
 from .common.mx import clamp_fp8
 from .common.ops import CM_DEV, butterfly, fp8_pack4, peer_bases, rsrc, traced
@@ -38,14 +28,11 @@ HIDDEN = seam.HIDDEN
 X_WORDS = HIDDEN // 4
 X_GROUPS = HIDDEN // 32
 SLICES = seam.SLICES  # 160
-# K1's MXFP8 x and the MoE's: plain words in both, the same size, so the two
-# launches share the MoE's (placed later); any other name is one region, so a
-# word is never a tag to one launch and data to another
+# K1 and the MoE share the MXFP8 x region (plain words in both); other names get one region each
 SHARED_REGIONS = ("x8", "x8s")
 COUNTER_WORDS = 2 * 256  # the MoE's ug queue and down counts, a word a slot
 COUNTERS = ("ugq", "dq")
-# the epoch buffer, in words: the epoch, a mark a CTA (epoch.EPOCH_MARKS), then on
-# lines of their own the MoE's counters
+# epoch buffer words: the epoch, one mark per CTA, then the MoE counters on their own lines
 EPOCH_COUNTERS = -(-(EPOCH_MARKS + BLOCKS) // 64) * 64
 EPOCH_WORDS = EPOCH_COUNTERS + COUNTER_WORDS
 
@@ -54,8 +41,6 @@ EPOCH_WORDS = EPOCH_COUNTERS + COUNTER_WORDS
 class MonoBuild:
     tokens: int
     tp: int
-    ratio: int  # the layer's compress ratio (its attention's key sources)
-    timeline: bool = False
 
 
 def _moe_key(key: MonoBuild) -> MoeBuild:
@@ -63,16 +48,11 @@ def _moe_key(key: MonoBuild) -> MoeBuild:
 
 
 def _front_key(key: MonoBuild):
-    return mb_front.FrontBuild(key.tokens, key.tp, key.ratio, key.timeline)
+    return mb_front.FrontBuild(key.tokens, key.tp)
 
 
 def scratch_layout(s: int, tp: int) -> dict:
-    """Every region of step width s's launches -> (byte offset, bytes), disjoint:
-    K1's front and seam, the attention back's (``plan.back_scratch``), the MoE's
-    regions, the normed rows and their flags. Each width has a scratch of its own (``DSV41MonoLayer.scratch``):
-    under another width's layout a mailbox pair's tag word could be plain data,
-    which a poll may take for a current tag. The MoE's counters, whose slots
-    outlive a step width, are in the epoch buffer."""
+    """Return each scratch region of width s -> (byte offset, bytes), without overlap."""
     d = Dims(tp)
     out: dict = {}
     off = 0
@@ -88,8 +68,7 @@ def scratch_layout(s: int, tp: int) -> dict:
 
     place(front_scratch(s, d))
     place(seam.scratch_layout(s))
-    place(back_scratch(s, d, start=0))
-    regions = moe.scratch_layout(_moe_key(MonoBuild(s, tp, 1))).items()
+    regions = moe.scratch_layout(_moe_key(MonoBuild(s, tp))).items()
     mr = {n: v for n, v in regions if n not in COUNTERS}
     lo = min(o for o, _ in mr.values())
     place({n: (o - lo, n_) for n, (o, n_) in mr.items()})
@@ -115,9 +94,7 @@ def _epoch(epoch):
 
 @traced
 def store_x8(c, t, col, ys, live):
-    """The attention seam's norm output (``seam.stage_norm``'s 8 columns at
-    ``col``) -> vLLM's MXFP8 of each 32 (the attention's input quant) -> the
-    front's X8 / X8S, plain at device scope."""
+    """Store the seam's norm output at ``col`` as MXFP8 X8 / X8S for the front."""
     amax = abs(ys[0])
     for y in ys[1:]:
         amax = fx.max(amax, abs(y))
@@ -169,7 +146,7 @@ def build_mono_k1(key: MonoBuild):
         seam: SeamLds
         front: FrontLds  # type: ignore[valid-type]
 
-    name = kernel_symbol("dsv41_mono_k1", s=s, tp=tp, r=key.ratio, tl=key.timeline)
+    name = kernel_symbol("dsv41_mono_k1", s=s, tp=tp)
     keyed = key_tuple(key, SOURCES)
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
@@ -200,18 +177,8 @@ def build_mono_k1(key: MonoBuild):
         swa_stride: Int64,
         swa_block: Int32,
         q: Int64,
-        swa_idx: Int64,
-        swa_lens: Int64,
-        comp_block: Int32,
-        comp_bt: Int64,
-        bt_stride: Int32,
-        topk: Int64,
-        t2r: Int64,
-        kt: Int64,
-        klen: Int64,
         scratch: Int64,
         epoch: Int64,
-        tl: Int64,
     ):
         _ = keyed
         bid = fx.block_idx.x
@@ -235,15 +202,6 @@ def build_mono_k1(key: MonoBuild):
             "swa_stride": swa_stride,
             "swa_block": swa_block,
             "q": q,
-            "swa_idx": swa_idx,
-            "swa_lens": swa_lens,
-            "comp_block": comp_block,
-            "comp_bt": comp_bt,
-            "bt_stride": bt_stride,
-            "topk": topk,
-            "t2r": t2r,
-            "kt": kt,
-            "klen": klen,
         }
         flayout = {n: layout[n] for n in front_scratch(s, Dims(tp))}
         c = mb_front.front_context(fkey, lds.front.peek(), fargs, scratch, tag, flayout)
@@ -283,8 +241,6 @@ def build_mono_k1(key: MonoBuild):
         }
         for region in ("lin", "pmix"):
             ca[region] = sreg(scratch, layout[region][0], region)
-        if const_expr(key.timeline):
-            c["tl"], c["tl_points"] = tl, mb_front.FRONT_POINTS
 
         def seam_slice():
             for task in range(first_task(bid, 0), SLICES, BLOCKS):
@@ -331,18 +287,8 @@ def build_mono_k1(key: MonoBuild):
         swa_stride: Int64,
         swa_block: Int32,
         q: Int64,
-        swa_idx: Int64,
-        swa_lens: Int64,
-        comp_block: Int32,
-        comp_bt: Int64,
-        bt_stride: Int32,
-        topk: Int64,
-        t2r: Int64,
-        kt: Int64,
-        klen: Int64,
         scratch: Int64,
         epoch: Int64,
-        tl: Int64,
         stream: fx.Stream = _STREAM,
     ):
         _ = keyed
@@ -373,18 +319,8 @@ def build_mono_k1(key: MonoBuild):
             swa_stride,
             swa_block,
             q,
-            swa_idx,
-            swa_lens,
-            comp_block,
-            comp_bt,
-            bt_stride,
-            topk,
-            t2r,
-            kt,
-            klen,
             scratch,
             epoch,
-            tl,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)
 
     return launch
@@ -395,8 +331,7 @@ def build_mono_k1(key: MonoBuild):
 
 @traced
 def store_normed(normed, t, col, ys, live):
-    """The FFN seam's norm output -> the MoE input row (bf16, device scope:
-    this launch reads it)."""
+    """Store the FFN seam's norm output as the MoE input row (bf16, device scope)."""
     if live:
         for j in range_constexpr(8):
             bo.buffer_store(
@@ -420,10 +355,7 @@ def _seam_lds(s):
 
 @traced
 def run_ffn(key: MonoBuild, lds, a: dict, amb, bases, own, rank, ep, part=None):
-    """The FFN launch on this CTA: the FFN seam (the attention's TP partials --
-    ``part`` pushed to every rank's ATTN region first -- summed and folded into
-    the residual), the MoE and its all-reduce into ``a["out"]``, then the
-    launch pair's epoch moved on."""
+    """Run the FFN seam, the MoE, its all-reduce into ``a["out"]``, and the epoch update."""
     s, tp = key.tokens, key.tp
     layout = scratch_layout(s, tp)
     mkey = _moe_key(key)
@@ -489,7 +421,6 @@ def run_ffn(key: MonoBuild, lds, a: dict, amb, bases, own, rank, ep, part=None):
     cb = moe.moe_context(
         s, rs, lds.moe.peek(), amb, bases, mlayout, scratch, margs, rank, own
     )
-    cb["x_cm"], cb["x_ready"] = CM_DEV, True
     cb["tag"] = ep & 255
     for i, region in enumerate(COUNTERS):
         cb[region] = sreg(a["epoch"], 4 * (EPOCH_COUNTERS + i * moe.TAGS), region)
@@ -506,11 +437,10 @@ def run_ffn(key: MonoBuild, lds, a: dict, amb, bases, own, rank, ep, part=None):
     gpu.barrier()
 
     # ---- the MoE, its all-reduce into ``out``
-    moe.run_moe(cb, mkey, bid, 0, 0)
+    moe.run_moe(cb, mkey, bid)
 
     def reset():
-        # the MoE counter slot 128 launch pairs ahead: its last use long
-        # done, its next use far off
+        # the MoE counter slot 128 launch pairs ahead: its last use is long done
         slot = (ep + 128) & 255
         for region in COUNTERS:
             gstore(cb[region].value + fx.Int64(slot * 4), fx.Int32(0), words=1)
@@ -519,14 +449,12 @@ def run_ffn(key: MonoBuild, lds, a: dict, amb, bases, own, rank, ep, part=None):
 
 
 def build_mono_ffn(key: MonoBuild):
-    """The FFN launch of a layer whose attention vLLM ran (``part``: this rank's
-    unreduced wo_b output, bf16 [S, HIDDEN]): ``run_ffn``, the partial pushed
-    to every rank first. It moves the epoch on at its end."""
+    """Build the FFN launch: push this rank's wo_b partial, then ``run_ffn``."""
     s, tp = key.tokens, key.tp
     assert 1 <= s <= MAX_TOKENS
     rs = route_shape(_moe_key(key))
     assert rs.experts // 64 in SORT_NETS
-    MoeLds = moe.moe_smem(s, rs, False)
+    MoeLds = moe.moe_smem(s, rs)
     half = peer_half_bytes(tp)
     assert SLICES + 2 * s <= BLOCKS
     SeamLds = _seam_lds(s)

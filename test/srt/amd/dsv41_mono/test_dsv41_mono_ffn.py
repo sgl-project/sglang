@@ -1,18 +1,8 @@
-"""Numerics of the DeepSeek-V4.1 mono FFN launch on gfx950 at TP4 (or TP2), one layer with random weights
-in SGLang's loaded layout (aiter's MoE shuffles, the 576 -> 640 padding):
-
-- the attention all-reduce and the FFN seam against SGLang's own ops: an fp32 all-reduce, then
-  ``hc_boundary_fused_deferred`` and ``rmsnorm_with_sinkhorn`` (the gfx950 fused boundary's kernels);
-- the MoE and its all-reduce against a golden model on the launch's own MoE input (routing cannot differ),
-  with the launch's MXFP8 rules at each quantization point;
-- a short replay check: every width's launch in one CUDA graph, replayed, outputs sampled every 50 replays
-  against eager (the race stress is ``stress_dsv41_mono_ffn.py``).
-
-Run on 4 GPUs: torchrun --nproc-per-node 4 test_dsv41_mono_ffn.py [--replays N]
-"""
+"""Check the mono FFN launch's numerics and graph replay against SGLang's ops on gfx950 (torchrun, TP2 or TP4)."""
 
 import argparse
 import os
+import sys
 
 import torch
 import torch.distributed as dist
@@ -94,8 +84,7 @@ def code_ceil(v):
 
 
 def mxfp8_qdq(x, rule):
-    """Per-32 MXFP8 quantize-dequantize of f32 ``x``: "aiter" = ceil code of max(amax, 1e-10) / 448
-    (routed); "vllm" = ceil code of RN(max(amax, FLT_MIN) / 448) (shared expert)."""
+    """Per-32 MXFP8 quantize-dequantize: "aiter" (routed experts) or "vllm" (shared expert) scale rule."""
     g = x.float().reshape(*x.shape[:-1], -1, 32)
     amax = g.abs().amax(-1, keepdim=True)
     if rule == "aiter":
@@ -131,8 +120,7 @@ def bf(x):
 
 # ---------------------------------------------------------------- weights
 def make_weights(tp, rank, dev, seed=0):
-    """One layer's tensors on this rank in SGLang's loaded layout, plus the logical copies the golden
-    model reads. Replicated tensors are seeded alike on every rank; TP shards per rank."""
+    """One layer's tensors on this rank in SGLang's loaded layout, plus the copies the golden model reads."""
     from aiter.ops.shuffle import shuffle_scale, shuffle_weight
 
     g = torch.Generator(device=dev).manual_seed(1000 + 7919 * seed)
@@ -255,8 +243,7 @@ def seam_inputs(M, tp, rank, dev):
 
 
 def reduced(part):
-    """The attention all-reduce as an fp32 sum in rank order, as the kernel sums (RCCL's order differs,
-    which flips bf16 roundings)."""
+    """Return the attention all-reduce as an fp32 sum in rank order, as the kernel sums."""
     parts = [torch.empty_like(part) for _ in range(dist.get_world_size())]
     dist.all_gather(parts, part)
     a = parts[0].float()
@@ -266,8 +253,7 @@ def reduced(part):
 
 
 def sglang_ffn_seam(part, res, post, comb, pre, w):
-    """SGLang's decode chain for the same step: the attention all-reduce, the gfx950 boundary kernel
-    (attention post, collapse with the attention pre, the FFN mixes) and its norm launch."""
+    """Return SGLang's decode chain for the same step: all-reduce, gfx950 boundary kernel and norm."""
     from sglang.kernels.ops.layernorm.mhc_boundary_hip import (
         hc_boundary_fused_deferred,
         rmsnorm_with_sinkhorn,
@@ -322,8 +308,7 @@ def main():
         err, err_sgl = term_ulps(res_o, ref64, big), term_ulps(res2, ref64, big)
         checks = {
             "residual exact": torch.equal(res_o, res2),
-            # the same fp32 math in another operation order: rare flipped bf16 roundings. The error against
-            # an fp64 hc_post, in ulps of each element's largest term, stays within SGLang's own
+            # the same fp32 math in another order: error in ulps of each element's largest term vs an fp64 hc_post
             "residual err <= SGLang's + 0.5 ulp, <= 0.01% differ": err <= err_sgl + 0.5
             and res_share <= 1e-4,
             "post": torch.allclose(post_o.view(M, HC), post2, rtol=1e-4, atol=1e-5),
@@ -380,10 +365,20 @@ def main():
               flush=True)  # fmt: skip
     if bad_replays:
         fails.append("replay")
-    if rank == 0:
-        print("ALL PASS" if not fails else f"FAILED: {fails}", flush=True)
-    dist.barrier()
+    finish(fails, dev)
+
+
+def finish(fails, dev):
+    """Print this rank's failures, then exit nonzero on every rank if any rank failed."""
+    if fails:
+        print(f"rank {dist.get_rank()} FAILED: {fails}", flush=True)
+    bad = torch.tensor([int(bool(fails))], device=dev)
+    dist.all_reduce(bad, op=dist.ReduceOp.MAX)
+    if dist.get_rank() == 0:
+        print("ALL PASS" if not bad.item() else "FAILED", flush=True)
     dist.destroy_process_group()
+    if bad.item():
+        sys.exit(1)
 
 
 if __name__ == "__main__":

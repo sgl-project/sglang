@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Geometry of the DeepSeek-V4.1 attention mega kernel: model widths, a TP
-rank's share of them, task counts and the scratch (mailbox) layout."""
+"""K1 geometry and scratch layout."""
 
 from dataclasses import dataclass
 
@@ -14,19 +13,11 @@ NOPE = 448
 ROPE = 64
 HALF = ROPE // 2
 N_HEADS = 64
-O_GROUPS = 8
-O_RANK = 1024
-WINDOW = 128
-TOPK = 512
 EPS = 1e-20
 
 ROWS = 16  # GEMV rows a task
-TILE = 16  # tokens a GEMV pass (an MFMA's N)
-HEAD_TILE = 16  # heads an attention MFMA takes
-WOA_ROWS = 32  # a wo_a task's rows: one MX group of its output
 
-# KV record (V4 fp8_ds_mla): 576 B data rows (448 e4m3 | 64 bf16), then 8 B of
-# scales a token (7 UE8M0 + pad) after the block's rows
+# KV record (V4 fp8_ds_mla): 576 B rows (448 e4m3, 64 bf16), then 8 B of scales a token
 DATA = 576
 
 PAIR = 8  # a mailbox (value, tag) pair
@@ -52,18 +43,6 @@ class Dims:
         return N_HEADS // self.tp
 
     @property
-    def head_tiles(self) -> int:
-        return self.heads // HEAD_TILE
-
-    @property
-    def groups(self) -> int:
-        return O_GROUPS // self.tp
-
-    @property
-    def o_rows(self) -> int:
-        return self.groups * O_RANK
-
-    @property
     def q_rows(self) -> int:
         return self.heads * HEAD_DIM
 
@@ -71,37 +50,18 @@ class Dims:
     def wqb_tasks(self) -> int:
         return self.q_rows // ROWS
 
-    @property
-    def woa_tasks(self) -> int:
-        return self.o_rows // WOA_ROWS
-
 
 WQKV_TASKS = QKV_ROWS // ROWS  # 112
 WQKV_KPARTS = 2  # X8's K halves (a flag each); an LDS window of the wqkv GEMV
 
 
 def wqkv_order(s):
-    """SGLang's wqkv_a K order at width s (N 1792, K 5120, mxfp8_gemv_gfx95_configs.json),
-    which K1 follows: (chains, halves, sum order). Up to 32 rows its GEMV: 16 waves up
-    to 4 rows, then 8, summed in wave order. Above, its Triton GEMM (bucket 64, split_k
-    5): 5 chains of 32x32x64 MFMAs (a 128-step's halves in turn), summed in the order
-    torch's out.sum(0) adds them."""
+    """Return SGLang's wqkv_a K order at width s as (chains, halves, sum order)."""
     if s <= 32:
         w = 16 if s <= 4 else 8
         return w, False, tuple(range(w))
     assert s <= 64
     return 5, True, (0, 4, 1, 2, 3)
-
-
-KEYS = TOPK + WINDOW  # a token's attention keys at most
-
-
-def token_tiles(s):
-    return [(t0, min(TILE, s - t0)) for t0 in range(0, s, TILE)]
-
-
-def tile_rows(s):
-    return min(s, TILE)
 
 
 def byte_layout(items, start=0, align=256):
@@ -114,8 +74,7 @@ def byte_layout(items, start=0, align=256):
 
 
 def front_scratch(s: int, d: Dims) -> dict:
-    """K1's scratch regions -> (byte offset, bytes): published data (plain
-    words behind a flag) and mailbox pairs."""
+    """Return K1's scratch regions -> (byte offset, bytes)."""
     return byte_layout(
         [
             ("x8", s * HIDDEN),  # e4m3 words (S > 16: quantized once, shared)
@@ -126,28 +85,4 @@ def front_scratch(s: int, d: Dims) -> dict:
             ("qx8s", s * Q_RANK // 32 * 4),  # an i32 code a group
             ("qrdy", s * PAIR),
         ]
-    )
-
-
-def back_scratch(s: int, d: Dims, start: int = 0) -> dict:
-    """The attention back's scratch regions (vLLM's K2), laid out past
-    ``start``: no SGLang launch uses them; kept so the FFN launch's regions
-    keep the offsets its tests and race stress ran with."""
-    ck = (
-        64 if d.head_tiles == 2 and s * cdiv(KEYS, 64) <= 256 else 128
-    )  # K2's keys a chunk
-    nchunk = cdiv(KEYS, ck)
-    return byte_layout(
-        [
-            ("part", s * nchunk * d.heads * HEAD_DIM * 2),  # bf16 partials
-            ("pstat", s * nchunk * d.heads * 8),  # (max, sum) f32
-            ("srdy", s * nchunk * PAIR),
-            ("xo", s * d.q_rows),  # e4m3 words
-            ("xos", s * d.q_rows // 32 * 4),  # an i32 code a group
-            ("crdy", s * d.heads // 8 * PAIR),
-            ("x8b", s * d.o_rows),
-            ("x8bs", s * d.o_rows // 32 * 4),
-            ("ardy", d.woa_tasks * PAIR),
-        ],
-        start=start,
     )

@@ -1,9 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""The launch's epoch: every CTA marks the epoch it read; CTA 0 moves it on once
-every CTA marked it. Also the device helpers the layer's launch uses with it:
-its kernel symbol and a store at a 64-bit global address. Adapted from ATOM's
-mono decode framework (``atom/mono/device``) and V4.1 ``attn_post``."""
+"""The launch epoch: every CTA marks it, and CTA 0 moves it on once all have."""
 
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
@@ -50,8 +47,7 @@ EPOCH_MARKS = 4  # word offset of the per-CTA marks in the epoch buffer
 
 @traced
 def epoch_begin(c, epoch, ep):
-    """This CTA has read the launch pair's epoch: its own mark word (no
-    contended atomic) := ep + 1, which ``epoch_end`` checks."""
+    """Mark that this CTA read epoch ``ep``."""
     if c["tid"] == 0:
         bo.buffer_store(
             ep + 1, rsrc(epoch), EPOCH_MARKS + c["bid"], cache_modifier=CM_DEV
@@ -60,10 +56,7 @@ def epoch_begin(c, epoch, ep):
 
 @traced
 def epoch_end(c, epoch, ep, reset=None):
-    """CTA 0, once every CTA marked this epoch (thread u checks CTA u's mark):
-    ``reset()`` (state later pairs must find cleared), then the epoch moved on.
-    The next pair's hand-offs carry a tag no earlier pair wrote; later launches'
-    kernels start after this one ends."""
+    """CTA 0: once every CTA marked the epoch, run ``reset()`` and move the epoch on."""
     if c["bid"] == 0:
         tid = c["tid"]
         if tid < BLOCKS:

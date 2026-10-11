@@ -3,8 +3,7 @@
 # Adapted from ROCm/ATOM (https://github.com/ROCm/ATOM) at 97359d6, MIT License,
 # Copyright (C) 2026, Advanced Micro Devices, Inc.:
 # atom/mono/device/sync.py
-"""The tagged mailbox: hand-offs between the CTAs of one GPU (device scope) and
-between GPUs (system scope), every address a named region (``Addr``)."""
+"""The tagged mailbox between CTAs (device scope) and GPUs (system scope)."""
 
 from dataclasses import dataclass
 from enum import Enum
@@ -27,8 +26,7 @@ POLL_MAX = 12  # mailbox specs polled per batch (bounds live registers)
 
 @traced
 def _spin(load_all, pending):
-    """Re-issue ``load_all`` until ``pending`` clears; a side-effecting op in the
-    loop keeps the loads from being hoisted."""
+    """Re-issue ``load_all`` until ``pending`` clears."""
     v = load_all()
     while pending(v):
         rocdl.s_sleep(1)
@@ -43,9 +41,7 @@ class Space(Enum):
 
 @dataclass(frozen=True)
 class Addr:
-    """A mailbox region's address: the region's name and space, and the traced
-    address. The space sets the hand-off's scope: device for SCRATCH, system for
-    PEER."""
+    """A mailbox region's name, space and traced address; the space sets the scope."""
 
     region: str
     space: Space
@@ -58,8 +54,7 @@ def sreg(base, offset, region):
 
 
 def preg(base, offset, region):
-    """Peer-symmetric region ``region`` at byte ``offset`` of a rank's buffer
-    ``base``."""
+    """Return the address of peer-symmetric region ``region`` at byte ``offset`` of buffer ``base``."""
     return Addr(region, Space.PEER, base + fx.Int64(offset))
 
 
@@ -68,15 +63,7 @@ _SCOPE_CM = {Space.SCRATCH: CM_DEV, Space.PEER: CM_SYS}
 
 
 class Mailbox:
-    """Tagged-pair hand-off between CTAs (device scope) and GPUs (system scope).
-
-    Every 32-bit value is stored next to this launch's tag; a consumer
-    polls the payload until all tags match, so a hand-off costs one round trip
-    (no store drain, no separate flag). The mono layer's launches tag their
-    hand-offs with their epoch (``layer.py``), so a pair from an earlier step
-    never carries a live tag. Every address is an ``Addr``: its space picks the
-    scope.
-    """
+    """Tagged-pair hand-off between CTAs or GPUs: each value is stored next to the launch tag."""
 
     def __init__(self, tag):
         self.tag = tag
@@ -91,8 +78,7 @@ class Mailbox:
         )
 
     def put_bf(self, a, i, vs):
-        """Elements i .. i+len(vs) (2 or 4, i aligned) as packed bf16 pairs, one
-        store."""
+        """Store elements i .. i + len(vs) as packed bf16 pairs in one store."""
         words = []
         for j in range_constexpr(len(vs) // 2):
             words += [bf16_pair(vs[2 * j], vs[2 * j + 1]).bitcast(fx.Int32), self.tag]
@@ -104,9 +90,7 @@ class Mailbox:
         )
 
     def put_words(self, a, i, words):
-        """Raw 32-bit words (1 or 2) at pairs i.. as (word, tag). Integer payloads
-        (fp8 words) must come this way: through an f32 value a NaN bit pattern is
-        not kept."""
+        """Store raw 32-bit words at pairs i..; integer payloads must use this path."""
         vals = []
         for w in words:
             vals += [fx.Int32(w), self.tag]
@@ -118,11 +102,7 @@ class Mailbox:
         )
 
     def poll(self, specs, batch=POLL_MAX):
-        """Batched poll of pairs ``specs`` = [(Addr, pair index, npairs in {1, 2})],
-        all of one space.
-
-        All pairs are re-loaded together while any tag is stale, so a batch costs
-        one round trip after its last producer lands. Returns the value words."""
+        """Poll the pairs in ``specs`` (one space) until every tag is current; return the value words."""
         if const_expr(len(specs) == 0):
             return []
         if const_expr(len(specs) > batch):
@@ -166,11 +146,7 @@ class Mailbox:
 
 @traced
 def publish(put, a, i, v, who):
-    """This CTA's plain stores made readable by every CTA, then (thread ``who``)
-    the mailbox pair (``a``, i) := v. The stores are drained first: a flag may
-    not overtake the data it announces, and a workgroup-scope release fence does
-    not wait for them (LLVM's AMDGPU memory model omits vmcnt outside tgsplit
-    mode: the workgroup's waves share one CU, the readers here do not)."""
+    """Drain this CTA's plain stores, then store mailbox pair (``a``, i) := v from thread ``who``."""
     rocdl.s_waitcnt(vmcnt=0)
     gpu.barrier()
     if who:

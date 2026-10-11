@@ -11,7 +11,6 @@ from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.utils import should_skip_post_experts_all_reduce
-from sglang.srt.models.deepseek_common.amd import dsv41_mono_decode
 from sglang.srt.models.deepseek_v2 import MoEOutput
 from sglang.srt.models.deepseek_v4_mhc import AttnOutput
 from sglang.srt.runtime_context import (
@@ -36,6 +35,7 @@ if _is_hip:
     from sglang.kernels.ops.layernorm.mhc_boundary_hip import (
         hc_boundary_fused_deferred,
     )
+    from sglang.srt.models.deepseek_common.amd import dsv41_mono_decode
 if _is_gfx95_supported:
     from sglang.srt.models.deepseek_common.amd.deepseek_v4_gfx95_dense import (
         post_attention_norm,
@@ -602,7 +602,8 @@ def forward_hc_pre_from_prev_fused_boundary(
                 defer_all_reduce=True,
                 mono_q=q,
             )
-        assert isinstance(x, AttnOutput)
+        if not isinstance(x, AttnOutput):
+            raise RuntimeError("mono K1: the attention reduced wo_b itself")
         x, residual, post, comb, pre = mono(x.partial, residual, post, comb, pre)
         if defer_post:
             return None, pre, (x, residual, post, comb)
@@ -636,8 +637,8 @@ def forward_hc_pre_from_prev_fused_boundary(
             defer_all_reduce=mhc is not None or mono is not None,
         )
     if mono is not None:
-        # the FFN launch reduces wo_b's partials itself; an attention that reduced them fails loud
-        assert isinstance(x, AttnOutput)
+        if not isinstance(x, AttnOutput):
+            raise RuntimeError("mono FFN launch: the attention reduced wo_b itself")
         pre, post, comb = attn_coefficients.tensors()
         x, residual, post, comb, pre = mono(x.partial, residual, post, comb, pre)
         if defer_post:

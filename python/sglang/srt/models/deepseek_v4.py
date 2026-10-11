@@ -159,7 +159,6 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models import deepseek_v4_mhc as mhc
 from sglang.srt.models.dbrx import ReplicatedLinear
-from sglang.srt.models.deepseek_common.amd import dsv41_mono_decode
 from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
     apply_mhc_post_pre_boundary,
     is_cross_layer_mhc_fusion_enabled,
@@ -2173,8 +2172,6 @@ class MQALayer(MqaAttentionBase):
         defer_all_reduce: bool = False,
         mono_q: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, mhc.AttnOutput]:
-        """``mono_q``: the roped q of the mono K1 launch, which also stored the step's KV rows; then ``x``
-        only gives the row count."""
         if not get_attn_tp_context().input_scattered and x.shape[0] == 0:
             return x
 
@@ -2332,9 +2329,8 @@ class MQALayer(MqaAttentionBase):
         attn_sink = self._local_attn_sink(kernel_num_heads)
 
         if mono_q is not None:
-            assert not unified and q_out is None and q_padded is None, (
-                "mono K1 needs the unpadded bf16 q of the paged SWA path"
-            )
+            if unified or q_out is not None or q_padded is not None:
+                raise RuntimeError("mono K1 needs the paged SWA path's unpadded q")
             q, kv = mono_q, None
         elif enable_multi_stream:
             # Multi-stream path always fuses cache write into the K kernel,
@@ -5103,14 +5099,8 @@ class DeepseekV4ForCausalLM(nn.Module):
                         )
                     ):
                         continue
-                    if (
-                        envs.SGLANG_ROCM_MONO_DECODE.get()
-                        and not is_nextn
-                        and "mlp.shared_experts" in name
-                    ):
-                        dsv41_mono_decode.stash_shared_expert(
-                            self.model.layers, name, loaded_weight
-                        )
+                    if _is_hip and not is_nextn:
+                        _hip.stash_shared_expert(self.model.layers, name, loaded_weight)
                     if (
                         self.num_fused_shared_experts > 0
                         and "mlp.shared_experts" in name
@@ -5381,7 +5371,8 @@ class DeepseekV4ForCausalLM(nn.Module):
         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
 
         if not is_nextn:
-            dsv41_mono_decode.stash_k1_weights(self.model.layers)
+            if _is_hip:
+                _hip.stash_k1_weights(self.model.layers)
             for i, layer in enumerate(self.model.layers):
                 if getattr(layer, "engram", None) is not None:
                     layer.engram.embed.finish_load(label=f"layer {i}")

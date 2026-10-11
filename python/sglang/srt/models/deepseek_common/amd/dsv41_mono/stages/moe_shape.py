@@ -3,12 +3,9 @@
 # Adapted from ROCm/ATOM (https://github.com/ROCm/ATOM) at 97359d6, MIT License,
 # Copyright (C) 2026, Advanced Micro Devices, Inc.:
 # atom/models/deepseek_v41/mono/kernels/moe_shape.py
-"""The MoE stages' build key and route shape: what they are built for (``MoeBuild``),
-and the task counts, placements and LDS route table that follow from its
-routing (``RouteShape``), with the table's readers. Plain Python but for the
-readers; the kernel's stages are in ``moe``."""
+"""The MoE build key (``MoeBuild``) and route shape (``RouteShape``)."""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import flydsl.expr as fx
 
@@ -24,11 +21,10 @@ from sglang.srt.models.deepseek_common.amd.dsv41_mono.stages.router import (
     PARTS as ROUTER_PARTS,
 )
 
-EXPERTS, TOPK = 384, 6  # the target's routing (a build's: ``MoeBuild``)
+EXPERTS, TOPK = 384, 6  # DeepSeek-V4.1-Flash routing
 ROUTER0 = 8  # the router's first task: past the xq tasks (a token each)
 MASK_WORDS = 2  # an expert's token bitmap in the route table: tokens <= 64
-# a route lane's experts (EXPERTS / 64) sorted descending, ties kept in index
-# order: the network by their count
+# a route lane's experts sorted descending, ties in index order
 SORT_NETS = {
     6: [
         (0, 1),
@@ -44,40 +40,25 @@ SORT_NETS = {
         (3, 4),
         (2, 3),
     ],
-    2: [(0, 1)],
 }
 
 
 @dataclass(frozen=True)
 class MoeBuild:
     tokens: int
-    # routed experts and a token's top-k: the target's, or the DSpark draft's
-    experts: int = EXPERTS
-    topk: int = TOPK
     # the TP size: every width a rank holds (``Dims``)
     tp: int = 4
-    timeline: bool = field(default=False, metadata={"sym": "tl"})
-    # FP4 groups an ug task (``RouteShape.ug_groups``)
-    ug_groups: int = 2
 
 
 @dataclass(frozen=True)
 class RouteShape:
-    """A build's routing: ``experts`` routed experts, ``topk`` a token of
-    ``tokens``, the task counts and placements that follow, and the route table
-    ``load_route`` lays out in LDS: every token's (ids, weights), |U|, the
-    experts of U, each (t, k)'s slot in U, each expert's slot, the picks in slot
-    order and each slot's first position in it (past one token tile also each
-    slot's first pick tile and each pick tile's slot)."""
+    """A build's routing: task counts, placements and the LDS route table layout."""
 
     experts: int
     topk: int
     tokens: int
     tp: int
-    # FP4 groups (32 intermediate columns) an ug task, its waves splitting K in
-    # halves (2) or quarters (1). 1 is twice the tasks, so the CTAs' ug ends
-    # closer together: faster at the draft's widths (40 rows -4 us), slower at
-    # the target's (48 rows +3 us; the runners pick)
+    # FP4 groups (32 intermediate columns) an ug task, its waves splitting K in halves
     ug_groups: int = 2
 
     @property
@@ -91,8 +72,7 @@ class RouteShape:
 
     @property
     def ug_k_slices(self) -> int:
-        """The K slices of an ug task's waves: a wave a (group, 16-column half,
-        slice)."""
+        """Return the K slices of an ug task's waves."""
         return WAVES // (2 * self.ug_groups)
 
     @property
@@ -105,9 +85,7 @@ class RouteShape:
 
     @property
     def router_groups(self) -> tuple[int, int]:
-        """``stage_router``'s token groups and their tokens: a group a token
-        tile, as many as one round of CTAs holds (a CTA running two serialized
-        them: the route waited on the 32 that did at 48 rows)."""
+        """Return ``stage_router``'s token groups and their tokens."""
         per_group = self.experts // ROWS * ROUTER_PARTS
         groups = max(1, min(len(token_tiles(self.tokens)), BLOCKS // per_group))
         tokens = -(-self.tokens // groups)
@@ -152,8 +130,7 @@ class RouteShape:
 
     @property
     def multi(self) -> bool:
-        """More than one token tile: an ug task is a (tile of a slot's picks,
-        part) (``stage_ug``)."""
+        """True past one token tile: an ug task is then a (pick tile, part)."""
         return self.tokens > TILE
 
     @property
@@ -163,8 +140,7 @@ class RouteShape:
 
     @property
     def max_tiles(self) -> int:
-        """The pick tiles of U at most: a slot's partial tile each, then the
-        whole tiles, and never more than a tile a pick."""
+        """Return the maximum number of pick tiles of U."""
         return min(self.picks, self.max_u + self.picks // TILE)
 
     @property
@@ -232,4 +208,4 @@ class RouteShape:
 
 
 def route_shape(key: MoeBuild) -> RouteShape:
-    return RouteShape(key.experts, key.topk, key.tokens, key.tp, key.ug_groups)
+    return RouteShape(EXPERTS, TOPK, key.tokens, key.tp)

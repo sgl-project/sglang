@@ -3,17 +3,7 @@
 # Adapted from ROCm/ATOM (https://github.com/ROCm/ATOM) at 97359d6, MIT License,
 # Copyright (C) 2026, Advanced Micro Devices, Inc.:
 # atom/model_ops/deepseek_v41/router.py
-"""V4.1's router GEMV tile for decode: bf16 x [T, 5120] times the gate weight
-[384, 5120] -> f32 logits, in one fixed summation order.
-
-Rows 16 a tile, K in ``PARTS`` contiguous parts, 16x16x32 bf16 MFMA: in part
-p wave w takes the part's K steps w, w + 8, ... (32 columns each) in that
-order, and the eight wave partials are summed in wave order
-(``common.ops.row_sum``); the MoE's route stage sums the parts in part
-order. The MoE stages spread a tile's parts over PARTS CTAs, and past 16 tokens
-a token tile a CTA too, which the order allows: a CTA alone cannot read a
-tile, or every token's x, fast enough.
-"""
+"""V4.1's decode router GEMV tile in one fixed summation order."""
 
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
@@ -39,9 +29,7 @@ def _k0s(part, lane, wave):
 
 
 def router_weight_loads(w, task, part, lane, wave, w_cm=0):
-    """``router_tile``'s weight operands (rows 16 task .., K part ``part``).
-    ``w_cm``: their load cache policy (nontemporal where nothing else of the
-    step reuses them)."""
+    """Issue ``router_tile``'s weight loads (``w_cm``: their cache policy)."""
     row = task * ROWS + lane % 16
     return [
         fx.Vector(
@@ -58,9 +46,7 @@ def router_weight_loads(w, task, part, lane, wave, w_cm=0):
 
 
 def router_x_loads(x, part, s, lane, wave, x_cm=0, t0=0):
-    """``router_tile``'s x operands: the s tokens from ``t0`` (column
-    lane % 16; ``t0`` traced or an int). ``x_cm``: their load cache policy
-    (device scope when another CTA of the same launch wrote x)."""
+    """Load ``router_tile``'s x operands for s tokens from ``t0`` (``x_cm``: their cache policy)."""
     tok = fx.min(lane % 16, s - 1)
     if const_expr(not isinstance(t0, int) or t0 != 0):
         tok = tok + t0

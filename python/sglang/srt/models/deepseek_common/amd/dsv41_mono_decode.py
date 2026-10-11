@@ -1,12 +1,4 @@
-"""DeepSeek-V4.1 mono decode on gfx950 (``SGLANG_ROCM_MONO_DECODE=1``): the FFN launch.
-
-On a decode step of at most ``MAX_ROWS`` rows, each layer's attention TP all-reduce, FFN mHC seam, MoE
-(router, top-6, shared expert, MXFP4 experts) and MoE TP all-reduce run as one persistent FlyDSL launch
-(``dsv41_mono``, from vllm-project/vllm#60397) on the attention's unreduced wo_b output. The launch
-returns what the fused mHC boundary returns: the MoE output with its post still pending, the residual
-and the FFN seam's mixes. Every TP rank takes the same path at every layer, since the kernels wait on
-each other's pushes: the conditions read only what every rank holds alike.
-"""
+"""SGLang glue for the DeepSeek-V4.1 gfx950 mono decode launches (FFN launch and K1)."""
 
 import logging
 import time
@@ -16,7 +8,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.utils import get_layer_id
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.utils import get_bool_env_var, is_gfx95_supported
 
 logger = logging.getLogger(__name__)
@@ -47,26 +39,26 @@ _runner = None
 
 
 def _get_runner(device: torch.device):
-    """The process's runner (one per TP rank, shared by every layer). Its peer-memory handshake is
-    collective over the TP group: every rank builds it at the same layer of the same step."""
+    """Return this TP rank's runner; its peer-memory setup is collective, so every rank builds it at the same layer."""
     global _runner
+    p = get_parallel()
     if _runner is None:
-        if torch.cuda.is_current_stream_capturing():
-            # its peer memory is allocated and exchanged eagerly; SGLang warms every graph up eagerly
-            raise RuntimeError(
-                "SGLANG_ROCM_MONO_DECODE was first reached inside a CUDA graph capture"
-            )
         from sglang.srt.models.deepseek_common.amd.dsv41_mono.runner import (
             MAX_TOKENS,
             DSV41MonoLayer,
+            no_capture,
         )
 
+        no_capture("SGLANG_ROCM_MONO_DECODE")
         assert MAX_TOKENS >= MAX_ROWS, MAX_TOKENS
-        p = get_parallel()
         _runner = DSV41MonoLayer(p.tp_size, p.tp_rank, p.tp_group.cpu_group, device)
         logger.info(
             "DeepSeek-V4.1 mono decode: the FFN launch runs decode steps of <= %d rows",
             MAX_ROWS,
+        )
+    if (_runner.device, _runner.tp, _runner.rank) != (device, p.tp_size, p.tp_rank):
+        raise RuntimeError(
+            f"DSv4.1 mono decode: one runner a process, built for {_runner.device} TP{_runner.tp} rank {_runner.rank}"
         )
     return _runner
 
@@ -75,10 +67,7 @@ _normal_path_warm = False
 
 
 def _warm_normal_path(moe, device: torch.device) -> None:
-    """Run the normal MoE path once at every width up to ``MAX_ROWS`` tokens, before serving. Its
-    small-token Triton kernels (the MoE sort's, keyed by the token count's power-of-2 bucket) are
-    otherwise compiled by decode graph capture, which the launch now takes: a short extend (a chunk
-    tail) after serving starts would stall every rank on the compile."""
+    """Warm the normal MoE kernels for widths 1 to MAX_ROWS, so no later extend step compiles them."""
     global _normal_path_warm
     if _normal_path_warm:
         return
@@ -88,7 +77,8 @@ def _warm_normal_path(moe, device: torch.device) -> None:
         MAX_ROWS, _MODEL["hidden_size"], dtype=torch.bfloat16, device=device
     )
     for m in range(1, MAX_ROWS + 1):
-        moe.forward_normal(x[:m], return_moe_output=True)  # per-rank, no collective
+        # per-rank, no collective
+        moe.forward_normal(x[:m], return_moe_output=True)
     torch.cuda.synchronize(device)
     logger.info(
         "DeepSeek-V4.1 mono decode: normal MoE path warmed for 1-%d tokens in %.1f s",
@@ -107,6 +97,9 @@ def unsupported_model(config) -> Optional[str]:
 
 def _unsupported(config) -> Optional[str]:
     """Why the kernels cannot serve this deployment, or None."""
+    # speculative target steps are verify steps, which the launches do not take
+    if (get_spec().speculative_algorithm or "none").lower() != "none":
+        return "does not support speculative decoding"
     if not is_gfx95_supported():
         return "needs gfx950"
     p = get_parallel()
@@ -156,9 +149,7 @@ def _unsupported_k1(attn) -> Optional[str]:
 
 
 def init_layer(layer) -> None:
-    """``layer.mono_ffn``: the decoder layer's FFN launch, or None (mono decode off, a hash-routed MoE);
-    ``layer.mono_k1``: its K1 launch, or None (K1 off, a layer with a compressor or indexer).
-    An opt-in the deployment cannot serve raises."""
+    """Attach the layer's FFN launch and K1 launch (or None); an opt-in the deployment cannot serve raises."""
     layer.mono_ffn = layer.mono_k1 = None
     if not envs.SGLANG_ROCM_MONO_DECODE.get():
         if envs.SGLANG_ROCM_MONO_K1.get():
@@ -182,19 +173,20 @@ def init_layer(layer) -> None:
 
 
 def stash_shared_expert(layers, name: str, loaded_weight: torch.Tensor) -> None:
-    """Keep this rank's shard of a checkpoint shared-expert tensor (FP8 e4m3, 32 x 32 E8M0 block
-    scales) for the layer's FFN launch: shared-expert fusion requantizes SGLang's own copy to MXFP4."""
+    """Keep this rank's shard of a checkpoint FP8 shared-expert tensor for the FFN launch."""
+    if not envs.SGLANG_ROCM_MONO_DECODE.get() or "mlp.shared_experts" not in name:
+        return
     i = get_layer_id(name)
-    if i is None or i >= len(
-        layers
-    ):  # not a decoder layer's (the checkpoint's mtp.* draft layers)
+    # skip tensors outside the decoder layers (the checkpoint's mtp.* layers)
+    if i is None or i >= len(layers):
         return
     mono = getattr(layers[i], "mono_ffn", None)
     if mono is None:
         return
     proj = next(p for p in _SHARED if f".{p}." in name)
     kind = "weight" if name.endswith(".weight") else "scale"
-    dim = 1 if proj == "down_proj" else 0  # the TP-sharded intermediate
+    # the TP-sharded intermediate dimension
+    dim = 1 if proj == "down_proj" else 0
     p = get_parallel()
     t = loaded_weight.view(torch.uint8)
     n = t.shape[dim] // p.tp_size
@@ -208,7 +200,8 @@ class MonoFfn:
 
     def __init__(self, layer):
         self.layer = layer
-        self.shared: dict = {}  # (projection, "weight" / "scale") -> this rank's checkpoint shard
+        # (projection, "weight" / "scale") -> this rank's checkpoint shard
+        self.shared: dict = {}
         self._weights = None
 
     def weights(self):
@@ -219,14 +212,16 @@ class MonoFfn:
         )
 
         layer, moe = self.layer, self.layer.mlp
-        e, n = (
-            moe.experts,
-            moe.gate.weight.shape[0],
-        )  # the routed experts, before a fused shared one
-        assert getattr(e.w13_weight, "is_shuffled", False), (
-            "MoE weights not in aiter's shuffle"
-        )
-        assert len(self.shared) == 2 * len(_SHARED), sorted(self.shared)
+        # n: the routed experts, before a fused shared one
+        e, n = moe.experts, moe.gate.weight.shape[0]
+        if not getattr(e.w13_weight, "is_shuffled", False):
+            raise RuntimeError(
+                "SGLANG_ROCM_MONO_DECODE: MoE weights not in aiter's shuffle"
+            )
+        if len(self.shared) != 2 * len(_SHARED):
+            raise RuntimeError(
+                f"SGLANG_ROCM_MONO_DECODE: shared-expert shards {sorted(self.shared)}"
+            )
         sh = self.shared
 
         def u8(t):
@@ -258,8 +253,7 @@ class MonoFfn:
         return self._weights
 
     def __call__(self, part, residual, post, comb, pre):
-        """The layer's (MoE output, residual, FFN post, comb, pre) from wo_b's unreduced output ``part``
-        and the attention seam's residual and mixes."""
+        """Return (MoE output, residual, post, comb, pre) from wo_b's unreduced output and the seam state."""
         out, residual, post, comb, pre = _get_runner(part.device).ffn(
             self.weights(), part, residual, post, comb, pre
         )
@@ -276,26 +270,26 @@ def ffn_launch(layer, forward_batch, rows: int) -> Optional[MonoFfn]:
 
 _k1_kernels: dict = {}
 _k1_tables: list = []
-_k1_dummy = None
 
 
 def _k1_kernel(rows: int, tp: int):
-    """K1 for ``rows`` rows. Built for ratio 0: its key list is for K2, and SGLang's attention keeps its own."""
-    k = _k1_kernels.get(rows)
+    """K1 for ``rows`` rows at TP ``tp``."""
+    k = _k1_kernels.get((rows, tp))
     if k is None:
         from sglang.srt.models.deepseek_common.amd.dsv41_mono.layer import (
             MonoBuild,
             build_mono_k1,
         )
+        from sglang.srt.models.deepseek_common.amd.dsv41_mono.runner import no_capture
 
-        k = _k1_kernels[rows] = build_mono_k1(MonoBuild(rows, tp, 0))
+        no_capture(f"K1 width {rows}")
+        k = _k1_kernels[rows, tp] = build_mono_k1(MonoBuild(rows, tp))
         logger.info("DeepSeek-V4.1 mono decode: K1 runs decode steps of %d rows", rows)
     return k
 
 
 def _cos_sin(freqs_cis: torch.Tensor) -> torch.Tensor:
-    """The rope table K1 reads, [positions, 64] f32: 32 cosines, then 32 sines. Every layer has its own
-    freqs_cis buffer; layers with equal tables share one copy."""
+    """Return K1's rope table [positions, 64] f32 (32 cos, then 32 sin); equal tables share one copy."""
     for f, t in _k1_tables:
         if (
             f.shape == freqs_cis.shape
@@ -319,14 +313,13 @@ def _e8m0(scale: torch.Tensor) -> torch.Tensor:
 
 
 class MonoK1:
-    """One standard layer's K1 launch: the attention mHC seam and the attention front, from the previous
-    layer's FFN launch outputs to the roped q and the step's SWA KV rows. Its weights are taken at the first
-    call, after loading; its rope table at init, before SGLang sizes the KV cache."""
+    """One standard layer's K1 launch: the attention mHC seam and the attention front."""
 
     def __init__(self, layer):
         self.layer = layer
         self._weights = None
-        self.plain = None  # (wqkv_a, wq_b) as loaded, from stash_k1_weights
+        # (wqkv_a, wq_b) as loaded, from stash_k1_weights
+        self.plain = None
         self.cos_sin = _cos_sin(layer.self_attn.freqs_cis)
 
     def weights(self):
@@ -338,8 +331,7 @@ class MonoK1:
             raise RuntimeError("stash_k1_weights did not run after loading")
 
         def fp8(lin, plain, shape):
-            # the FP8 linear method may rewrite the weight in place (aiter preshuffle, or the MXFP8 native
-            # route's lane order); K1 reads the row-major bytes
+            # the FP8 linear method may rewrite the weight in place; K1 reads the row-major copy
             shuffled = getattr(lin, "aiter_bpreshuffled", False) or getattr(
                 lin, "mxfp8_native_ready", False
             )
@@ -358,7 +350,8 @@ class MonoK1:
 
         wqkv, wqkv_s = fp8(a.wqkv_a, self.plain[0], (1792, 5120))
         wqb, wqb_s = fp8(a.wq_b, self.plain[1], (heads * 512, 1280))
-        self.plain = None  # the copies K1 does not read are freed
+        # free the copies K1 does not read
+        self.plain = None
         self._weights = dict(
             hc_fn=layer.hc_attn_fn,
             hc_scale=layer.hc_attn_scale,
@@ -380,18 +373,24 @@ class MonoK1:
             or not (w["q_norm"].dtype == w["kv_norm"].dtype == torch.bfloat16)
         ):
             raise RuntimeError(f"K1: unexpected weights {bad or 'dtypes'}")
+        cs = w["cos_sin"]
+        if not (cs.dtype == torch.float32 and cs.dim() == 2 and cs.shape[1] == 64):
+            raise RuntimeError(
+                f"K1: rope table {tuple(cs.shape)} {cs.dtype}, want [positions, 64] f32"
+            )
         return w
 
     def __call__(self, positions, forward_batch, x, residual, post, comb, pre):
-        """(q [M, heads, 512] bf16 roped, the residual after the attention seam, its post, comb, pre),
-        with the step's KV rows stored in the layer's SWA cache. ``x``, ``residual``, ``post``, ``comb``:
-        the previous layer's FFN launch outputs (its post still pending); ``pre``: its FFN seam's pre."""
-        global _k1_dummy
+        """Run K1, store the step's KV rows, and return (q, residual, post, comb, pre)."""
         from sglang.srt.model_executor.forward_context import (
             get_attn_backend,
             get_token_to_kv_pool,
         )
-        from sglang.srt.models.deepseek_common.amd.dsv41_mono.runner import MAX_TOKENS
+        from sglang.srt.models.deepseek_common.amd.dsv41_mono.runner import (
+            HC,
+            HIDDEN,
+            check_rows,
+        )
 
         M = x.shape[0]
         r = _get_runner(x.device)
@@ -400,33 +399,36 @@ class MonoK1:
             raise RuntimeError(
                 f"K1: q buffer {tuple(r.q.shape)}, {self.layer.self_attn.n_local_heads} heads"
             )
-        if _k1_dummy is None:
-            if torch.cuda.is_current_stream_capturing():
-                raise RuntimeError(
-                    "SGLANG_ROCM_MONO_K1 was first reached inside a CUDA graph capture"
-                )
-            # K1's key list for K2 (unused here) reads these: no window rows, so no keys
-            _k1_dummy = torch.zeros(
-                MAX_TOKENS * 128, dtype=torch.int32, device=x.device
-            )
         slot = get_attn_backend().get_swa_out_cache_loc(forward_batch)
         # K1 writes through raw pointers: a layout it does not expect would corrupt memory, not fault
         if not (1 <= M <= MAX_ROWS and slot.shape[0] >= M and positions.shape[0] >= M):
             raise RuntimeError(
                 f"K1: {M} rows, {tuple(slot.shape)} SWA slots, {tuple(positions.shape)} positions"
             )
-        src = (positions.data_ptr(), slot.data_ptr(), M)
+        bf, f32 = torch.bfloat16, torch.float32
+        check_rows(
+            "K1",
+            M,
+            r.device,
+            {
+                "x": (x, HIDDEN, bf),
+                "residual": (residual, HC * HIDDEN, bf),
+                "post": (post, HC, f32),
+                "comb": (comb, HC * HC, f32),
+                "pre": (pre, HC, f32),
+            },
+        )
+        lid = self.layer.self_attn.layer_id
         meta = getattr(forward_batch, "_mono_k1_meta", None)
-        if meta is None or meta[0] != src:
-            # once a step: every layer's K1 reads the same positions and SWA slots, as int64
+        if meta is None or lid <= meta[0]:
+            # the first K1 layer of every forward pass copies them, so graph capture records the copy
             meta = forward_batch._mono_k1_meta = (
-                src,
+                lid,
                 positions[:M].to(torch.int64).contiguous(),
                 slot[:M].to(torch.int64).contiguous(),
             )
         _, pos, slot = meta
         pool = get_token_to_kv_pool()
-        lid = self.layer.self_attn.layer_id
         if pool.request_window is not None or pool.uniform_fp8:
             raise RuntimeError("K1 needs the paged V4 SWA pool")
         swa = pool.get_swa_raw_buffer(lid)
@@ -440,9 +442,6 @@ class MonoK1:
             raise RuntimeError(
                 f"K1: SWA cache {swa.dtype} {tuple(swa.shape)} {swa.stride()}, page {block} x 584 B"
             )
-        if not all(t.is_contiguous() for t in (x, residual, post, comb, pre)):
-            raise RuntimeError("K1: non-contiguous seam inputs")
-        dummy = r._dummy
         _k1_kernel(M, r.tp)(
             residual.data_ptr(),
             x.data_ptr(),
@@ -470,26 +469,15 @@ class MonoK1:
             swa.stride(0),
             block,
             r.q.data_ptr(),
-            _k1_dummy.data_ptr(),  # window slots
-            _k1_dummy.data_ptr(),  # window lengths: 0
-            1,
-            dummy.data_ptr(),
-            0,
-            dummy.data_ptr(),
-            _k1_dummy.data_ptr(),  # token -> request
-            r.kt.data_ptr(),
-            r.klen.data_ptr(),
             r.scratch(M).data_ptr(),
             r.epoch.data_ptr(),
-            0,
             stream=torch.cuda.current_stream(),
         )
         return r.q[:M], r.res_mid[:M], r.post_a[:M], r.comb_a[:M], r.pre_a[:M]
 
 
 def stash_k1_weights(layers) -> None:
-    """Copies of the K1 layers' wqkv_a and wq_b weights at the end of load_weights, before the FP8 linear
-    method processes them (about 20 MB a layer at TP4). Made before SGLang sizes the KV cache."""
+    """Copy the K1 layers' row-major wqkv_a and wq_b weights before the FP8 linear method rewrites them."""
     for layer in layers:
         k1 = getattr(layer, "mono_k1", None)
         if k1 is not None:
@@ -501,8 +489,7 @@ def stash_k1_weights(layers) -> None:
 
 
 def k1_launch(layer, forward_batch, pending_post, prev_pre) -> Optional[MonoK1]:
-    """The layer's K1 launch when this step takes it: a step the FFN launch takes, after a layer whose FFN
-    launch left its post pending (``pending_post``: its (x, residual, post, comb), ``prev_pre``: its pre)."""
+    """Return the layer's K1 launch when this step takes it, else None."""
     k1 = getattr(layer, "mono_k1", None)
     if k1 is None or pending_post is None or prev_pre is None:
         return None
