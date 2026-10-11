@@ -17,7 +17,9 @@ import logging
 import os
 from typing import Dict, Optional
 
-from huggingface_hub import snapshot_download
+from huggingface_hub import hf_hub_download
+
+from sglang.srt.utils.common import download_hf_file_if_exists
 
 logger = logging.getLogger(__name__)
 
@@ -76,27 +78,25 @@ class LoRAConfig:
         if dummy:
             raise NotImplementedError()
         else:
-            if not os.path.isdir(self.path):
-                weights_dir = snapshot_download(self.path, allow_patterns=["*.json"])
-            else:
-                weights_dir = self.path
             config_name = "adapter_config.json"
-            with open(os.path.join(weights_dir, config_name), "r") as f:
+            if not os.path.isdir(self.path):
+                config_path = hf_hub_download(repo_id=self.path, filename=config_name)
+            else:
+                config_path = os.path.join(self.path, config_name)
+            with open(config_path, "r") as f:
                 return json.load(f)
 
     def get_added_tokens_config(self):
         """Load added tokens from the LoRA adapter if the file exists."""
-        # Determine the weights directory
         if not os.path.isdir(self.path):
-            weights_dir = snapshot_download(self.path, allow_patterns=["*.json"])
+            added_tokens_path = download_hf_file_if_exists(
+                repo_id=self.path, filename="added_tokens.json"
+            )
         else:
-            weights_dir = self.path
-
-        # Construct the path to added_tokens.json
-        added_tokens_path = os.path.join(weights_dir, "added_tokens.json")
+            added_tokens_path = os.path.join(self.path, "added_tokens.json")
 
         # Return None if the file doesn't exist (optional for standard LoRA adapters)
-        if not os.path.exists(added_tokens_path):
+        if added_tokens_path is None or not os.path.exists(added_tokens_path):
             return None
 
         # Load and return the added tokens

@@ -214,7 +214,7 @@ def get_processor(
     *args,
     tokenizer_mode: str = "auto",
     trust_remote_code: bool = False,
-    tokenizer_revision: Optional[str] = None,
+    revision: Optional[str] = None,
     use_fast: Optional[bool] = None,
     image_processor_backend: Optional[str] = None,
     tokenizer_backend: str = "huggingface",
@@ -226,7 +226,6 @@ def get_processor(
 
         _ensure_fastokens_patched()
 
-    revision = kwargs.pop("revision", tokenizer_revision)
     image_processor_backend = _normalize_image_processor_backend(
         image_processor_backend, use_fast
     )
@@ -369,7 +368,7 @@ def get_processor(
             tokenizer_name,
             tokenizer_mode=tokenizer_mode,
             trust_remote_code=trust_remote_code,
-            tokenizer_revision=revision,
+            revision=revision,
             tokenizer_backend=tokenizer_backend,
         )
         if isinstance(processor, PreTrainedTokenizerBase):

@@ -396,6 +396,36 @@ def start_subprocess_fail_fast_watcher(
     return stop
 
 
+def _get_launch_arg(other_args: list[str], flag: str) -> Optional[str]:
+    for i, arg in enumerate(other_args):
+        if arg == flag and i + 1 < len(other_args):
+            return str(other_args[i + 1])
+        if isinstance(arg, str) and arg.startswith(f"{flag}="):
+            return arg.split("=", 1)[1]
+    return None
+
+
+def _draft_model_cache_complete(draft: Optional[str], revision: Optional[str]) -> bool:
+    from sglang.srt.model_loader.weight_utils import _check_index_files_exist
+    from sglang.srt.utils import find_local_repo_dir
+
+    if draft is None or os.path.isdir(draft):
+        return True
+    snapshot_dir = find_local_repo_dir(draft, revision=revision)
+    if snapshot_dir is None:
+        return False
+    # Draft repos often ship no tokenizer; only the config and weights must be cached.
+    snapshot = Path(snapshot_dir)
+    has_weights = any(
+        any(snapshot.glob(pattern)) for pattern in ("*.safetensors", "*.bin", "*.pt")
+    )
+    return (
+        (snapshot / "config.json").exists()
+        and has_weights
+        and _check_index_files_exist(snapshot_dir)[0]
+    )
+
+
 def _try_enable_offline_mode_if_cache_complete(
     model_name_or_path: str, env: dict, other_args: Optional[list[str]] = None
 ) -> Optional[str]:
@@ -426,8 +456,19 @@ def _try_enable_offline_mode_if_cache_complete(
                 requires_hf_quant_config = True
                 break
 
+    if not _draft_model_cache_complete(
+        draft=_get_launch_arg(other_args, flag="--speculative-draft-model-path"),
+        revision=_get_launch_arg(other_args, flag="--speculative-draft-model-revision"),
+    ):
+        print(
+            f"CI_OFFLINE: Draft model cache incomplete, will use online mode - {model_name_or_path}"
+        )
+        return None
+
     marker_path = _validate_cache_for_offline(
-        model_name_or_path, requires_hf_quant_config
+        model_name_or_path,
+        requires_hf_quant_config=requires_hf_quant_config,
+        revision=_get_launch_arg(other_args, flag="--revision"),
     )
     if marker_path is not None:
         env["HF_HUB_OFFLINE"] = "1"
@@ -435,7 +476,9 @@ def _try_enable_offline_mode_if_cache_complete(
 
 
 def _validate_cache_for_offline(
-    model_name_or_path: str, requires_hf_quant_config: bool
+    model_name_or_path: str,
+    requires_hf_quant_config: bool,
+    revision: Optional[str] = None,
 ) -> Optional[str]:
     """Return the per-run marker path if the model's local cache is complete
     enough to load offline, else None.
@@ -457,7 +500,7 @@ def _validate_cache_for_offline(
 
     # Try to find local snapshot
     try:
-        snapshot_dir = find_local_repo_dir(model_name_or_path, revision=None)
+        snapshot_dir = find_local_repo_dir(model_name_or_path, revision=revision)
         if not snapshot_dir or not os.path.isdir(snapshot_dir):
             return None
     except Exception:
@@ -531,12 +574,16 @@ def _hf_offline_if_cache_complete(engine_kwargs: dict):
         model_path = server_args.model_path
         tokenizer_path = server_args.tokenizer_path
         draft_path = server_args.speculative_draft_model_path
+        revision = server_args.revision
+        draft_revision = server_args.speculative_draft_model_revision
         quantization = server_args.quantization
         uses_lora = server_args.enable_lora or bool(server_args.lora_paths)
     else:
         model_path = engine_kwargs.get("model_path")
         tokenizer_path = engine_kwargs.get("tokenizer_path")
         draft_path = engine_kwargs.get("speculative_draft_model_path")
+        revision = engine_kwargs.get("revision")
+        draft_revision = engine_kwargs.get("speculative_draft_model_revision")
         quantization = engine_kwargs.get("quantization")
         uses_lora = bool(
             engine_kwargs.get("enable_lora") or engine_kwargs.get("lora_paths")
@@ -554,14 +601,21 @@ def _hf_offline_if_cache_complete(engine_kwargs: dict):
     ]
     repo_ids = {
         path
-        for path in (model_path, tokenizer_path, draft_path)
+        for path in (model_path, tokenizer_path)
         if path is not None and not os.path.isdir(path)
     }
-    if not repo_ids or not all(
-        _validate_cache_for_offline(
-            repo_id, requires_hf_quant_config and repo_id == model_path
+    if (
+        not repo_ids
+        or not all(
+            _validate_cache_for_offline(
+                repo_id,
+                requires_hf_quant_config=requires_hf_quant_config
+                and repo_id == model_path,
+                revision=revision,
+            )
+            for repo_id in repo_ids
         )
-        for repo_id in repo_ids
+        or not _draft_model_cache_complete(draft=draft_path, revision=draft_revision)
     ):
         yield
         return

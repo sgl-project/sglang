@@ -7,7 +7,6 @@ from typing import Any
 
 import huggingface_hub
 import torch
-from huggingface_hub import snapshot_download
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.layers.quantization.base_config import (
@@ -19,6 +18,7 @@ from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4LinearMethod,
 )
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils.common import download_hf_file_if_exists
 from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 
 logger = logging.getLogger(__name__)
@@ -45,22 +45,21 @@ def _get_raw_quant_config(
 
     model_name_or_path = model_config.model_path
 
-    # A local path holds hf_quant_config.json directly; anything else resolves its
-    # JSON configs first. An object-storage URL is neither a directory nor a valid
-    # repo id, so it needs its own branch before snapshot_download.
+    # An object-storage URL is neither a directory nor a valid repo id.
     if os.path.isdir(model_name_or_path):
-        hf_folder = model_name_or_path
+        quant_config_file = os.path.join(model_name_or_path, "hf_quant_config.json")
     elif is_runai_obj_uri(model_name_or_path):
         hf_folder = ObjectStorageModel.download_and_get_path(model_name_or_path)
+        quant_config_file = os.path.join(hf_folder, "hf_quant_config.json")
     else:
-        hf_folder = snapshot_download(
-            model_name_or_path,
-            allow_patterns="*.json",
+        quant_config_file = download_hf_file_if_exists(
+            repo_id=model_name_or_path,
+            filename="hf_quant_config.json",
+            revision=model_config.revision,
             local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
         )
 
-    quant_config_file = os.path.join(hf_folder, "hf_quant_config.json")
-    if not os.path.exists(quant_config_file):
+    if quant_config_file is None or not os.path.exists(quant_config_file):
         return None
     with open(quant_config_file) as f:
         config = json.load(f)

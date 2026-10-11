@@ -14,6 +14,8 @@ from urllib.parse import unquote, urlparse
 from huggingface_hub import HfApi, hf_hub_download
 from huggingface_hub.utils import validate_repo_id
 
+from sglang.srt.utils.common import retry_on_hub_rate_limit
+
 WeightSourceKind = Literal["local", "huggingface"]
 
 _WEIGHT_SUFFIXES = (".safetensors", ".gguf", ".bin", ".pt", ".pth", ".ckpt")
@@ -274,9 +276,8 @@ def resolve_weight_inventory(source: WeightSource) -> WeightInventory:
         )
 
     assert source.repo_id is not None
-    model_info = HfApi().model_info(
-        source.repo_id,
-        revision=source.revision,
+    model_info = retry_on_hub_rate_limit(
+        lambda: HfApi().model_info(source.repo_id, revision=source.revision)
     )
     files = tuple(sibling.rfilename for sibling in model_info.siblings)
     return WeightInventory(

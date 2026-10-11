@@ -36,7 +36,6 @@ import numpy as np
 import safetensors.torch
 import torch
 from huggingface_hub import HfFileSystem, hf_hub_download, snapshot_download
-from huggingface_hub.errors import HfHubHTTPError
 from pydantic import BaseModel, ConfigDict, ValidationInfo, model_validator
 from tqdm.auto import tqdm
 
@@ -72,6 +71,7 @@ from sglang.srt.utils import (
     is_hip,
     log_info_on_rank0,
     print_warning_once,
+    retry_on_hub_rate_limit,
 )
 from sglang.srt.utils.common import is_cuda_alike
 from sglang.utils import is_in_ci
@@ -328,13 +328,15 @@ def get_quant_config(
     if not is_local:
         # Download the config files.
         with get_lock(model_name_or_path, load_config.download_dir):
-            hf_folder = snapshot_download(
-                model_name_or_path,
-                revision=model_config.revision,
-                allow_patterns="*.json",
-                cache_dir=load_config.download_dir,
-                local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
-                tqdm_class=DisabledTqdm,
+            hf_folder = retry_on_hub_rate_limit(
+                lambda: snapshot_download(
+                    model_name_or_path,
+                    revision=model_config.revision,
+                    allow_patterns="*.json",
+                    cache_dir=load_config.download_dir,
+                    local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
+                    tqdm_class=DisabledTqdm,
+                )
             )
     else:
         hf_folder = model_name_or_path
@@ -520,21 +522,9 @@ def _find_local_hf_snapshot_dir_unlocked(
     # Check custom cache_dir (if provided)
     if cache_dir:
         try:
-            repo_folder = os.path.join(
-                cache_dir,
-                huggingface_hub.constants.REPO_ID_SEPARATOR.join(
-                    ["models", *model_name_or_path.split("/")]
-                ),
+            found_local_snapshot_dir = find_local_repo_dir(
+                model_name_or_path, revision=revision, cache_dir=cache_dir
             )
-            rev_to_use = revision
-            ref_path = os.path.join(repo_folder, "refs", revision or "main")
-            if os.path.isfile(ref_path):
-                with open(ref_path) as f:
-                    rev_to_use = f.read().strip()
-            if rev_to_use:
-                rev_dir = os.path.join(repo_folder, "snapshots", rev_to_use)
-                if os.path.isdir(rev_dir):
-                    found_local_snapshot_dir = rev_dir
         except Exception as e:
             logger.warning(
                 "Failed to find local snapshot in custom cache_dir %s: %s",
@@ -669,18 +659,9 @@ def download_weights_from_hf(
         if not huggingface_hub.constants.HF_HUB_OFFLINE:
             # Before we download we look at what is available:
             fs = HfFileSystem()
-            try:
-                file_list = fs.ls(model_name_or_path, detail=False, revision=revision)
-            except HfHubHTTPError as e:
-                # Fail open (e.g. a 429 rate limit): pick the format from the local
-                # snapshot; snapshot_download below re-raises errors it cannot recover.
-                logger.warning(
-                    "Listing %s on the Hub failed, using the local snapshot: %s",
-                    model_name_or_path,
-                    e,
-                )
-                local_dir = find_local_repo_dir(model_name_or_path, revision)
-                file_list = os.listdir(local_dir) if local_dir else []
+            file_list = retry_on_hub_rate_limit(
+                lambda: fs.ls(model_name_or_path, detail=False, revision=revision)
+            )
 
             # depending on what is available we download different things
             for pattern in allow_patterns:
