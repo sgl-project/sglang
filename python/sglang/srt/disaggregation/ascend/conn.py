@@ -1,6 +1,7 @@
 import concurrent.futures
 import enum
 import logging
+import traceback
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -123,6 +124,35 @@ class AscendKVManager(MooncakeKVManager):
             npu_id=self.kv_args.gpu_id,
             disaggregation_mode=self.disaggregation_mode,
         )
+
+    def _transfer_data(self, mooncake_session_id, transfer_blocks):
+        ret = super()._transfer_data(mooncake_session_id, transfer_blocks)
+        if ret == 0 or not transfer_blocks:
+            return ret
+
+        regions = self._registerable_regions()
+        invalid = [
+            (index, hex(src), hex(dst), length)
+            for index, (src, dst, length) in enumerate(transfer_blocks)
+            if length <= 0
+            or not any(
+                start <= src and src + length <= start + size for start, size in regions
+            )
+        ]
+        logger.error(
+            "Ascend PD transfer diagnostic: ret=%s blocks=%s invalid=%s "
+            "invalid_examples=%s first_blocks=%s callers=%s",
+            ret,
+            len(transfer_blocks),
+            len(invalid),
+            invalid[:8],
+            [
+                (index, hex(src), hex(dst), length)
+                for index, (src, dst, length) in enumerate(transfer_blocks[:4])
+            ],
+            [frame.name for frame in traceback.extract_stack(limit=8)[:-1]],
+        )
+        return ret
 
     def _registerable_regions(self) -> List[Tuple[int, int]]:
         # Skip-topk layers retain zero-length DSA-tail entries so that PD peers

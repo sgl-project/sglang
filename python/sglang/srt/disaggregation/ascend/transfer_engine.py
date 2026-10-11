@@ -89,8 +89,15 @@ class AscendTransferEngine(MooncakeTransferEngine):
         except Exception:
             # Mark register as failed
             ret_value = -1
+            logger.exception("Ascend PD memory registration raised")
         if ret_value != 0:
-            logger.debug(f"Ascend memory registration for ptr {ptrs} failed.")
+            logger.error(
+                "Ascend PD memory registration failed: ret=%s regions=%s "
+                "total_bytes=%s",
+                ret_value,
+                len(ptrs),
+                sum(lengths),
+            )
 
     @staticmethod
     def _get_transfer_protocol() -> str:
