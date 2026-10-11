@@ -23,7 +23,7 @@ import sys
 import time
 from array import array
 from collections import deque
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from functools import partial
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Set, Tuple, Union
@@ -210,6 +210,7 @@ from sglang.srt.managers.prefill_delayer import (
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     MultimodalInputs,
+    MultimodalProcessorOutput,
     NextBatchPlan,
     Req,
     ScheduleBatch,
@@ -2235,6 +2236,12 @@ class Scheduler(
                 )
                 error_msg = f"Multimodal feature reconstruction failed ({details})"
                 logger.error(error_msg)
+                if isinstance(
+                    tokenized_req.mm_inputs,
+                    (MultimodalInputs, MultimodalProcessorOutput),
+                ):
+                    for item in tokenized_req.mm_inputs.mm_items:
+                        item.release_transport_proxies()
                 tokenized_req.mm_inputs = None
                 request_errors.append(error_msg)
             else:
@@ -2779,6 +2786,8 @@ class Scheduler(
                 continue
             # For session requests, keep mm_inputs for the next request
             if req.session:
+                if isinstance(req.finished_reason, FINISH_ABORT):
+                    req.release_mm_inputs_on_abort()
                 continue
             # For non-session requests, clear features and mm_inputs
             mm_inputs.release_features()
@@ -2787,6 +2796,23 @@ class Scheduler(
     def handle_generate_request(
         self,
         recv_req: TokenizedGenerateReqInput,
+        *,
+        mm_input_error: Optional[str] = None,
+    ):
+        with ExitStack() as mm_cleanup:
+            if isinstance(
+                recv_req.mm_inputs, (MultimodalInputs, MultimodalProcessorOutput)
+            ):
+                for item in recv_req.mm_inputs.mm_items:
+                    mm_cleanup.callback(item.release_transport_proxies)
+            self._handle_generate_request(
+                recv_req, mm_cleanup, mm_input_error=mm_input_error
+            )
+
+    def _handle_generate_request(
+        self,
+        recv_req: TokenizedGenerateReqInput,
+        mm_cleanup: ExitStack,
         *,
         mm_input_error: Optional[str] = None,
     ):
@@ -3047,6 +3073,8 @@ class Scheduler(
                     req.origin_input_ids, image_inputs, self.pad_input_ids_func
                 )
             req.extend_image_inputs(image_inputs)
+            # the request now owns cleanup, including rejection after padding
+            mm_cleanup.pop_all()
             self._maybe_compute_mrope_positions(req)
 
             if len(req.origin_input_ids) >= self.max_req_input_len:
@@ -3279,6 +3307,7 @@ class Scheduler(
         # detach lives in `StreamingSession.find_active_slot`, which only runs
         # while scheduling; a session left in-flight rejects every later request.
         if req.session is not None and req.session.streaming:
+            req.release_mm_inputs_on_abort()
             req.session.abort_req()
             req.session = None
         # `beam_coordinator.validate_and_init` counts the group in ahead of the
@@ -3364,7 +3393,10 @@ class Scheduler(
 
     def _release_aborted_request(self, req: Req) -> None:
         """Drop the cache-side state an aborted request left behind."""
+        req.release_mm_inputs_on_abort()
         self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
+        if req.session is not None and req.session.streaming:
+            req.session.abort_req()
 
     def _abort_on_queued_limit(self, recv_req: Req) -> bool:
         """Abort an incoming or existing request if the waiting queue is full. Returns True if the incoming request is aborted."""
@@ -3473,6 +3505,23 @@ class Scheduler(
         *,
         mm_input_error: Optional[str] = None,
     ):
+        with ExitStack() as mm_cleanup:
+            if isinstance(
+                recv_req.mm_inputs, (MultimodalInputs, MultimodalProcessorOutput)
+            ):
+                for item in recv_req.mm_inputs.mm_items:
+                    mm_cleanup.callback(item.release_transport_proxies)
+            self._handle_embedding_request(
+                recv_req, mm_cleanup, mm_input_error=mm_input_error
+            )
+
+    def _handle_embedding_request(
+        self,
+        recv_req: TokenizedEmbeddingReqInput,
+        mm_cleanup: ExitStack,
+        *,
+        mm_input_error: Optional[str] = None,
+    ):
         req = Req(
             recv_req.rid,
             recv_req.input_text,
@@ -3528,6 +3577,7 @@ class Scheduler(
                 )
 
             req.extend_image_inputs(image_inputs)
+            mm_cleanup.pop_all()
             self._maybe_compute_mrope_positions(req)
 
             if len(req.origin_input_ids) >= self.max_req_input_len:
@@ -3740,8 +3790,10 @@ class Scheduler(
             if last_batch.batch_size() < last_bs:
                 running_batch.batch_is_full = False
 
-            # Merge the new batch into the running batch.
-            if not last_batch.is_empty():
+            # Merge the new batch into the running batch. A running batch that
+            # DP attention converted to extend is last_batch itself: filtered
+            # in place above, nothing to merge.
+            if not last_batch.is_empty() and last_batch is not running_batch:
                 if running_batch.is_empty():
                     running_batch = last_batch
                 else:
@@ -3801,14 +3853,9 @@ class Scheduler(
             ret, need_sync=need_mlp_sync
         )
         # Decode->extend conversion keeps a heterogeneous dp step replayable.
-        converted = self.dp_attn_adapter.maybe_convert_decode_to_extend(ret)
-        if converted is running_batch and converted.forward_mode.is_extend():
-            # The converted batch re-enters via the last_batch extend-merge
-            # next iteration; empty running_batch or it merges with itself.
-            running_batch = ScheduleBatch(
-                reqs=[], batch_is_full=running_batch.batch_is_full
-            )
-        ret = converted
+        # A converted running batch stays the running batch; next step it comes
+        # back as last_batch and is filtered in place, not merged with itself.
+        ret = self.dp_attn_adapter.maybe_convert_decode_to_extend(ret)
         self._arm_prefill_decode_interval(ret)
 
         # Handle ngram embedding
@@ -4103,6 +4150,10 @@ class Scheduler(
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
         if len(can_run_list) == 0:
+            # Preemption already released these requests; requeue them even
+            # though the request they made room for was not admitted.
+            for req in adder.preempt_list:
+                self._add_request_to_queue(req)
             return None, running_batch
 
         can_run_set = set(can_run_list)
@@ -4180,7 +4231,10 @@ class Scheduler(
             running_batch.filter_batch(reqs_to_exclude=finishing_reqs)
             if finishing_reqs:
                 running_batch.batch_is_full = False
-            if not running_batch.is_empty():
+            # The prefill admitted above may leave no KV room for the decode
+            # rows. They then sit out this step and decode on the next decode
+            # step, which fits them; a mixed step does not retract them.
+            if not running_batch.is_empty() and running_batch.check_decode_mem():
                 running_batch.prepare_for_decode()
                 new_batch.mix_with_running(running_batch)
                 new_batch.decoding_reqs = running_batch.reqs
@@ -5534,6 +5588,9 @@ class Scheduler(
         if (
             self.last_batch is not None
             and self.last_batch.forward_mode.is_extend()
+            # A running batch that DP attention converted to extend is
+            # last_batch itself; its requests are already listed above.
+            and self.last_batch is not self.running_batch
             # Skip merge for disagg prefill: completed prefill requests are
             # already in disagg_prefill_inflight_queue. Merging them into
             # running_batch leaks them, since the prefill event loop never
