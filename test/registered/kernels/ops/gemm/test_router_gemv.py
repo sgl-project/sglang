@@ -1,4 +1,4 @@
-"""Tests for the BF16x3 router GEMM with FP32 gates."""
+"""Tests for the router-logits GEMV and the BF16x3 router GEMM with FP32 gates."""
 
 import sys
 
@@ -8,6 +8,8 @@ import torch.nn.functional as F
 
 from sglang.kernels.ops.gemm.router_gemv import (
     router_gemm_bf16x3,
+    router_gemv,
+    router_gemv_supported,
     split_fp32_to_bf16x3,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -45,6 +47,24 @@ def test_bf16x3_split_reconstructs_fp32_exactly():
     assert torch.equal(hi + mid + lo, w)
     # The CUDA kernel must round like the torch reference path.
     assert torch.equal(w3.cpu(), split_fp32_to_bf16x3(w.cpu()))
+
+
+@requires_cuda
+@pytest.mark.parametrize("m", [1, 2, 4, 8])
+def test_fp32_gate_gemv_matches_fp64(m):
+    x, w = _inputs(m)
+    assert router_gemv_supported(x, w)
+    out = router_gemv(x, w)
+    assert out.dtype == torch.float32
+    # Measured about 5e-7 on H200 and B300; a BF16 or TF32 weight read is ~1e-3.
+    assert _max_error(out, x, w) < 2e-6
+
+
+@requires_cuda
+def test_fp32_gate_gemv_stops_at_its_row_path():
+    x, w = _inputs(9)
+    assert not router_gemv_supported(x, w)
+    assert not router_gemv_supported(x[:1], w.bfloat16())
 
 
 @requires_cuda

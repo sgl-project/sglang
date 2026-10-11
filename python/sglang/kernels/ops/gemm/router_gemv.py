@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Skinny router-logits GEMV: [M, K] bf16 x [N, K] bf16 -> [M, N] fp32.
+"""Skinny router-logits GEMV: [M, K] bf16 x [N, K] bf16 or fp32 -> [M, N] fp32.
 
 MoE router gates are tiny (N ~ 128 experts, K ~ hidden) but hipblaslt's
 solutions for M<=8, N=128 run at ~0.1 TB/s on gfx950 (~12us for 1.6MB). This
@@ -31,13 +31,21 @@ _CONFIGS = (
     (32, (16, 32, 512, 8, 4)),
     (_MAX_M, (32, 32, 512, 8, 4)),
 )
+# FP32 weights on CUDA (FP32 router gates) use the FP32 row path only; above
+# 8 rows router_gemm_bf16x3 is faster. Swept for N=256, K=5120 on H200 and B300.
+_CUDA_FP32_CONFIGS = ((8, (1, 16, 128, 8, 8)),)
 
 
-def _config(m: int):
-    for max_m, cfg in _CONFIGS:
+def _configs(w_dtype: torch.dtype):
+    return _CUDA_FP32_CONFIGS if w_dtype == torch.float32 else _CONFIGS
+
+
+def _config(m: int, w_dtype: torch.dtype = torch.bfloat16):
+    configs = _configs(w_dtype)
+    for max_m, cfg in configs:
         if m <= max_m:
             return cfg
-    return _CONFIGS[-1][1]
+    return configs[-1][1]
 
 
 @triton.jit
@@ -120,7 +128,7 @@ _scratch: Dict[Tuple[torch.device, int], Tuple[torch.Tensor, torch.Tensor]] = {}
 def _get_scratch(device: torch.device, n: int) -> Tuple[torch.Tensor, torch.Tensor]:
     key = (device, n)
     if key not in _scratch:
-        max_split_k = max(cfg[3] for _, cfg in _CONFIGS)
+        max_split_k = max(cfg[3] for _, cfg in _CONFIGS + _CUDA_FP32_CONFIGS)
         _scratch[key] = (
             torch.empty(max_split_k * _MAX_M * n, dtype=torch.float32, device=device),
             torch.zeros(n * _MAX_M // 16, dtype=torch.int32, device=device),
@@ -131,18 +139,21 @@ def _get_scratch(device: torch.device, n: int) -> Tuple[torch.Tensor, torch.Tens
 def router_gemv_supported(x: torch.Tensor, w: torch.Tensor) -> bool:
     m, k = x.shape
     n = w.shape[0]
-    _, block_n, block_k, _, _ = _config(m)
+    _, block_n, block_k, _, _ = _config(m, w.dtype)
+    # BF16 gates are tuned for gfx950 only; FP32 gates for CUDA only.
+    platform_ok = (
+        _is_gfx95_supported if w.dtype == torch.bfloat16 else not _is_hip
+    ) and w.dtype in (torch.bfloat16, torch.float32)
     return (
-        _is_gfx95_supported
+        platform_ok
         and x.device.type == "cuda"
         and w.device == x.device
         and x.dtype == torch.bfloat16
-        and w.dtype == torch.bfloat16
         and x.stride(1) == 1
         and w.stride(1) == 1
         and n % block_n == 0
         and k % block_k == 0
-        and m <= _MAX_M
+        and m <= _configs(w.dtype)[-1][0]
     )
 
 
@@ -150,7 +161,7 @@ def router_gemv(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     """Router logits in fp32; caller guards with router_gemv_supported()."""
     m, k = x.shape
     n = w.shape[0]
-    block_m, block_n, block_k, split_k, num_warps = _config(m)
+    block_m, block_n, block_k, split_k, num_warps = _config(m, w.dtype)
     partials, counter = _get_scratch(x.device, n)
     out = torch.empty(m, n, device=x.device, dtype=torch.float32)
     grid = (n // block_n, triton.cdiv(m, block_m), split_k)
