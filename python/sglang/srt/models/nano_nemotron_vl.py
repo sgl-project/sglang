@@ -280,16 +280,17 @@ class NemotronH_Nano_VL_V2(EVS):
         Returns:
             video_features (`torch.Tensor`): Video feature tensor of shape `(num_videos, video_length, embed_dim)`).
         """
-        pixel_values = torch.cat([item.feature for item in items])
         if getattr(self.config, "video_temporal_patch_size", 1) > 1:
-            # Tubelets must not span videos, so encode each video separately.
-            frames_per_video = [n for item in items for n in item.frames_per_video]
             return torch.cat(
                 [
-                    self.extract_video_feature_temporal(video, video.shape[0])
-                    for video in pixel_values.split(frames_per_video)
+                    self.extract_video_feature_temporal(video, video.shape[0]).flatten(
+                        0, 1
+                    )
+                    for item in items
+                    for video in item.feature.split(item.frames_per_video)
                 ]
             )
+        pixel_values = torch.cat([item.feature for item in items])
         video_features = self.extract_feature(pixel_values)
         return video_features
 

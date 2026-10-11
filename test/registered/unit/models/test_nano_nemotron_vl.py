@@ -45,10 +45,10 @@ def _temporal_video_model(video_pruning_rate: float):
     return model
 
 
-def _video_item(frames_per_video: list[int], **model_specific_data):
+def _video_item(frames_per_video: list[int], frame_hw=(4, 4), **model_specific_data):
     return MultimodalDataItem(
         modality=Modality.VIDEO,
-        feature=torch.zeros(sum(frames_per_video), 3, 4, 4),
+        feature=torch.zeros(sum(frames_per_video), 3, *frame_hw),
         offsets=[],
         model_specific_data={"frames_per_video": frames_per_video}
         | model_specific_data,
@@ -63,7 +63,24 @@ class TestNemotronHOmniVideo(CustomTestCase):
         features = model.get_video_feature([_video_item([3, 1])])
 
         self.assertEqual(model.encoded_num_frames, [3, 1])
-        self.assertEqual(features.shape[0], 3)
+        self.assertEqual(features.shape, (3 * TOKENS_PER_TUBELET, HIDDEN_SIZE))
+
+    def test_batched_videos_with_different_frame_sizes(self):
+        """Single-tubelet videos from different requests are encoded in one call;
+        aspect-preserving resize gives them different frame sizes, which must not
+        crash the scheduler."""
+        for video_pruning_rate in (0.0, 0.7):
+            with self.subTest(video_pruning_rate=video_pruning_rate):
+                model = _temporal_video_model(video_pruning_rate)
+                rows = cols = int(math.sqrt(TOKENS_PER_TUBELET))
+                grids = {"thw_grids": [(1, rows, cols)]}
+                landscape = _video_item([1], frame_hw=(4, 6), **grids)
+                portrait = _video_item([1], frame_hw=(6, 4), **grids)
+
+                features = model.get_video_feature([landscape, portrait])
+
+                self.assertEqual(model.encoded_num_frames, [1, 1])
+                self.assertEqual(features.shape, (2 * TOKENS_PER_TUBELET, HIDDEN_SIZE))
 
     def test_evs_prunes_temporal_tubelets_per_video(self):
         """EVS on 2-frame tubelets keeps each video's first tubelet and prunes per video."""
