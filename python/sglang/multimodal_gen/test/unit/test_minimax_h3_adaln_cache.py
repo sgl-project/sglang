@@ -14,6 +14,9 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     maybe_init_distributed_environment_and_model_parallel,
     model_parallel_is_initialized,
 )
+from sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader import (
+    _resolve_minimax_h3_adaln_variant,
+)
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3_adaln_cache import (
     MiniMaxH3AdalnCache,
 )
@@ -564,3 +567,23 @@ def test_weights_updater_rejects_tensor_update_in_online_cache_mode(tmp_path):
     assert not ok
     assert "update_weights_from_disk" in message
     assert torch.equal(model.probe, torch.zeros(2))
+
+
+def test_adaln_variant_defaults_to_fl2va_when_unset():
+    """FastH3 rejects --model-variant, so an unset variant must still resolve.
+
+    FastH3PipelineConfig forbids passing --model-variant while the sidecar
+    branch used to require one explicitly, deadlocking the only supported
+    FastH3 + AdaLN cache path.
+    """
+    assert _resolve_minimax_h3_adaln_variant(None) == "fl2va"
+
+
+@pytest.mark.parametrize("variant", ["fl2va", "ref2va"])
+def test_adaln_variant_passes_through_supported_values(variant):
+    assert _resolve_minimax_h3_adaln_variant(variant) == variant
+
+
+def test_adaln_variant_rejects_unsupported_value():
+    with pytest.raises(ValueError, match="fl2va or ref2va"):
+        _resolve_minimax_h3_adaln_variant("t2va")
