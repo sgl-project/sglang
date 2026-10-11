@@ -4,6 +4,7 @@ SGLang SDARMoeModelLM (block diffusion / dLLM-style forward) with MoE MLP.
 """
 
 import logging
+from functools import partial
 from typing import Iterable, Optional, Tuple, Union
 
 import torch
@@ -351,12 +352,20 @@ class SDARMoeBlock(nn.Module):
             prefix=add_prefix("mlp", prefix),
         )
 
+        attn, ffn = self.stage_facts(config, layer_id)
         self.attn_boundary, self.ffn_boundary = append_stages(
-            (declare_attn(), self.input_layernorm),
-            (
-                declare_ffn(sparse=True, next_layer_sparse=True),
-                self.post_attention_layernorm,
-            ),
+            (attn, self.input_layernorm),
+            (ffn, self.post_attention_layernorm),
+        )
+
+    @staticmethod
+    def stage_facts(config: PretrainedConfig, layer_id: int):
+        """The stages the layer at ``layer_id`` declares, in order: the model's
+        shared declaration function, which the layer declares with too (see
+        make_layers)."""
+        return (
+            declare_attn(),
+            declare_ffn(sparse=True, next_layer_sparse=True),
         )
 
     def forward(
@@ -422,6 +431,7 @@ class SDARMoeModel(nn.Module):
                 alt_stream=alt_stream,
             ),
             prefix=add_prefix("layers", prefix),
+            stage_facts=partial(SDARMoeBlock.stage_facts, config),
         )
 
         if self.pp_group.is_last_rank:

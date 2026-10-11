@@ -6,10 +6,13 @@ use std::sync::Arc;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
-use super::pieces::byte_level_byte;
+use super::request::{
+    OneOrList, ResponseFormat, StreamOptions, custom_labels, default_model, float_logit_bias,
+    format_json_schema, lora_path, one, usage_flags, yes,
+};
 use super::wire::{
-    Reply, error_reply, http_status_name, malformed_output_reply, meta_u64, py_strip, python_json,
-    stream_error_event, usage, without_nulls,
+    Payload, Reply, StreamState, http_status_name, malformed_output_reply, meta_u64, now,
+    stream_error_event, unary_reply, without_nulls,
 };
 use super::{OpenAiHeaders, OpenAiSettings, OpenAiTokenizer, Unsupported};
 
@@ -101,14 +104,8 @@ struct CompletionRequest {
     disagg_prefill_dp_rank: Option<i64>,
 }
 
-fn default_model() -> String {
-    "default".into()
-}
 fn default_max_tokens() -> i64 {
     16
-}
-fn one() -> i64 {
-    1
 }
 fn one_f64() -> f64 {
     1.0
@@ -116,18 +113,8 @@ fn one_f64() -> f64 {
 fn minus_one() -> i64 {
     -1
 }
-fn yes() -> bool {
-    true
-}
 fn false_value() -> Value {
     Value::Bool(false)
-}
-
-#[derive(Deserialize, serde::Serialize)]
-#[serde(untagged)]
-enum OneOrList<T> {
-    One(T),
-    List(Vec<T>),
 }
 
 #[derive(Deserialize)]
@@ -137,39 +124,6 @@ enum Prompt {
     IdBatch(Vec<Vec<u32>>),
     Text(String),
     TextBatch(Vec<String>),
-}
-
-#[derive(Deserialize)]
-struct StreamOptions {
-    include_usage: Option<bool>,
-    continuous_usage_stats: Option<bool>,
-}
-
-/// Python validates `json_schema` whatever the `type`.
-#[derive(Deserialize)]
-struct ResponseFormat {
-    #[serde(rename = "type")]
-    kind: FormatKind,
-    json_schema: Option<JsonSchemaFormat>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum FormatKind {
-    Text,
-    JsonObject,
-    JsonSchema,
-}
-
-#[derive(Deserialize)]
-struct JsonSchemaFormat {
-    #[allow(dead_code)]
-    name: String,
-    #[allow(dead_code)]
-    description: Option<String>,
-    schema: Option<Map<String, Value>>,
-    #[allow(dead_code)]
-    strict: Option<bool>,
 }
 
 /// Lower a completions body into a `/generate` body, as
@@ -200,31 +154,12 @@ pub fn lower_completion(
     {
         return Err(Unsupported("sglext_output"));
     }
-    if !custom_labels_are_strings(&custom_labels(headers, settings)) {
-        return Err(Unsupported("invalid_request"));
-    }
+    custom_labels(headers, settings)?;
     if (request.echo || request.logprobs.is_some()) && tokenizer.is_none() {
         return Err(Unsupported("no_tokenizer"));
     }
-    // A `structural_tag` format fails to parse above, so it goes to the engine.
-    match &request.response_format {
-        Some(ResponseFormat {
-            kind: FormatKind::JsonSchema,
-            json_schema,
-        }) => {
-            let schema = json_schema
-                .as_ref()
-                .and_then(|format| format.schema.clone())
-                .ok_or(Unsupported("invalid_request"))?;
-            request.json_schema = Some(python_json(&Value::Object(schema)));
-        }
-        Some(ResponseFormat {
-            kind: FormatKind::JsonObject,
-            ..
-        }) => {
-            request.json_schema = Some(r#"{"type": "object"}"#.into());
-        }
-        Some(_) | None => {}
+    if let Some(schema) = format_json_schema(request.response_format.as_ref())? {
+        request.json_schema = Some(schema);
     }
     if request.routed_dp_rank.is_none() {
         request.routed_dp_rank = request.data_parallel_rank;
@@ -236,15 +171,8 @@ pub fn lower_completion(
         Vec::new()
     };
     let lowered = generate_body(&request, headers, settings);
-    // `should_include_usage`.
-    let default_usage = settings.stream_response_default_include_usage;
-    let (include_usage, continuous_usage_stats) = match &request.stream_options {
-        Some(options) => (
-            options.include_usage.unwrap_or(false) || default_usage,
-            options.continuous_usage_stats.unwrap_or(false),
-        ),
-        None => (default_usage, false),
-    };
+    let (include_usage, continuous_usage_stats) =
+        usage_flags(request.stream_options.as_ref(), settings);
     let responder = CompletionResponder {
         model: request.model,
         n: request.n as usize,
@@ -258,6 +186,7 @@ pub fn lower_completion(
         tokenizer,
         created: now(),
         stream: StreamState::default(),
+        token_id_counts: HashMap::new(),
     };
     Ok((lowered, responder))
 }
@@ -267,11 +196,7 @@ fn generate_body(
     headers: &OpenAiHeaders<'_>,
     settings: &OpenAiSettings,
 ) -> Value {
-    let logit_bias = request.logit_bias.as_ref().map(|bias| {
-        bias.iter()
-            .map(|(k, v)| (k.clone(), json!(v.as_f64())))
-            .collect::<Map<_, _>>()
-    });
+    let logit_bias = float_logit_bias(&request.logit_bias);
     let sampling = json!({
         "temperature": request.temperature,
         "max_new_tokens": request.max_tokens,
@@ -302,10 +227,7 @@ fn generate_body(
         Prompt::Ids(ids) => ("input_ids", json!(ids)),
         Prompt::IdBatch(ids) => ("input_ids", json!(ids)),
     };
-    let lora_path = match request.model.split_once(':') {
-        Some((_, adapter)) if !py_strip(adapter).is_empty() => json!(py_strip(adapter)),
-        _ => json!(request.lora_path),
-    };
+    let lora_path = lora_path(&request.model, &request.lora_path);
     let mut body = Map::new();
     body.insert(prompt_key.into(), prompt);
     let fields = json!({
@@ -331,42 +253,12 @@ fn generate_body(
         "cache_salt": request.cache_salt,
         "priority": request.priority,
         "routing_key": headers.routing_key,
-        "custom_labels": custom_labels(headers, settings),
+        "custom_labels": custom_labels(headers, settings).unwrap_or_default(),
         "custom_logit_processor": request.custom_logit_processor,
         "images_config": request.images_config,
     });
     body.extend(fields.as_object().expect("object literal").clone());
     Value::Object(body)
-}
-
-/// `OpenAIServingBase.extract_custom_labels`.
-fn custom_labels(headers: &OpenAiHeaders<'_>, settings: &OpenAiSettings) -> Value {
-    let allowed = settings
-        .tokenizer_metrics_allowed_custom_labels
-        .as_deref()
-        .unwrap_or_default();
-    if allowed.is_empty() || settings.tokenizer_metrics_custom_labels_header.is_none() {
-        return Value::Null;
-    }
-    match headers
-        .custom_labels
-        .and_then(|raw| serde_json::from_str(raw).ok())
-    {
-        Some(Value::Object(labels)) => Value::Object(
-            labels
-                .into_iter()
-                .filter(|(label, _)| allowed.contains(label))
-                .collect(),
-        ),
-        _ => Value::Null,
-    }
-}
-
-/// Custom labels `/generate` accepts as its `Dict[str, str]`.
-pub(super) fn custom_labels_are_strings(labels: &Value) -> bool {
-    labels
-        .as_object()
-        .is_none_or(|labels| labels.values().all(Value::is_string))
 }
 
 fn prompt_is_empty(prompt: &Prompt) -> bool {
@@ -392,12 +284,6 @@ fn echo_prompts(prompt: &Prompt, tokenizer: Option<&dyn OpenAiTokenizer>) -> Opt
     })
 }
 
-fn now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
-}
-
 /// Builds the OpenAI response from the engine's `/generate` output.
 pub struct CompletionResponder {
     model: String,
@@ -412,22 +298,7 @@ pub struct CompletionResponder {
     tokenizer: Option<Arc<dyn OpenAiTokenizer>>,
     created: u64,
     stream: StreamState,
-}
-
-#[derive(Default)]
-struct StreamState {
-    started: bool,
-    stopped: bool,
-    failed: bool,
-    done: bool,
-    last_id: Value,
-    text_offsets: HashMap<u64, usize>,
-    logprob_counts: HashMap<u64, usize>,
     token_id_counts: HashMap<u64, usize>,
-    prompt_tokens: HashMap<u64, u64>,
-    completion_tokens: HashMap<u64, u64>,
-    reasoning_tokens: HashMap<u64, u64>,
-    cached_tokens: HashMap<u64, u64>,
 }
 
 impl CompletionResponder {
@@ -456,62 +327,25 @@ impl CompletionResponder {
             });
             choices.push(self.choice(index as u64, text, logprobs, meta, item));
         }
-        let first = &ret.first()?["meta_info"];
-        let stride = |key: &str| -> u64 {
-            ret.iter()
-                .step_by(self.n)
-                .map(|r| meta_u64(&r["meta_info"], key))
-                .sum()
-        };
-        let all = |key: &str| -> u64 { ret.iter().map(|r| meta_u64(&r["meta_info"], key)).sum() };
-        let cached = self
-            .settings
-            .enable_cache_report
-            .then(|| stride("cached_tokens"));
-        let mut metadata = json!({"weight_version": first["weight_version"]});
-        if let Some(versions) = first.get("weight_versions") {
-            metadata["weight_versions"] = versions.clone();
-        }
-        let response = json!({
-            "id": first["id"],
-            "object": "text_completion",
-            "created": now(),
-            "model": self.model,
-            "choices": choices,
-            "usage": usage(stride("prompt_tokens"), all("completion_tokens"), all("reasoning_tokens"), cached),
-            "metadata": metadata,
-        });
-        Some(Reply {
-            status: 200,
-            body: response.to_string(),
-        })
+        unary_reply(
+            &ret,
+            self.n,
+            self.settings.enable_cache_report,
+            "text_completion",
+            &self.model,
+            choices,
+        )
     }
 
     /// One `/generate` SSE `data:` payload, as `_generate_completion_stream`
     /// handles it. `Err` replaces the whole stream, before anything was sent.
     pub fn stream_data(&mut self, data: &[u8]) -> Result<Vec<String>, Reply> {
-        if self.stream.done {
-            return Ok(Vec::new());
-        }
-        if data == b"[DONE]" {
-            return Ok(self.stream_end());
-        }
-        let Ok(content) = serde_json::from_slice::<Value>(data) else {
-            return Ok(Vec::new());
+        let mut events = match self.stream.payload(data)? {
+            Payload::Done => return Ok(self.stream_end()),
+            Payload::Frame(content) => self.stream_chunk(&content).into_iter().collect(),
+            Payload::Events(events) => events,
         };
-        let mut events = Vec::new();
-        if let Some(message) = content.pointer("/error/message").and_then(Value::as_str) {
-            if !self.stream.started {
-                return Err(error_reply(message, "BadRequestError", 400));
-            }
-            self.stream.failed = true;
-            events.push(stream_error_event(message, "BadRequestError", 400));
-        } else {
-            self.stream.started = true;
-            events.extend(self.stream_chunk(&content));
-        }
-        // Python ends the stream here, without waiting for the other choices.
-        if self.stream.stopped || self.stream.failed {
+        if self.stream.ending() {
             events.extend(self.stream_end());
         }
         Ok(events)
@@ -526,19 +360,7 @@ impl CompletionResponder {
         let state = &mut self.stream;
         let index = content.get("index").and_then(Value::as_u64).unwrap_or(0);
         let meta = &content["meta_info"];
-        state.last_id = meta["id"].clone();
-        state
-            .prompt_tokens
-            .insert(index, meta_u64(meta, "prompt_tokens"));
-        state
-            .completion_tokens
-            .insert(index, meta_u64(meta, "completion_tokens"));
-        state
-            .reasoning_tokens
-            .insert(index, meta_u64(meta, "reasoning_tokens"));
-        state
-            .cached_tokens
-            .insert(index, meta_u64(meta, "cached_tokens"));
+        state.record(index, meta);
         let finish_reason = &meta["finish_reason"];
         let raw_text = content["text"].as_str().unwrap_or_default();
 
@@ -595,11 +417,7 @@ impl CompletionResponder {
             token_ids = Some(match incremental {
                 true => ids,
                 false => {
-                    let prev = self
-                        .stream
-                        .token_id_counts
-                        .insert(index, ids.len())
-                        .unwrap_or(0);
+                    let prev = self.token_id_counts.insert(index, ids.len()).unwrap_or(0);
                     ids.into_iter().skip(prev).collect()
                 }
             });
@@ -640,12 +458,7 @@ impl CompletionResponder {
             choice["prompt_token_ids"] = Value::Array(ids);
         }
         let usage_value = match self.continuous_usage_stats {
-            true => usage(
-                self.stream.prompt_tokens[&index],
-                self.stream.completion_tokens[&index],
-                self.stream.reasoning_tokens[&index],
-                None,
-            ),
+            true => self.stream.choice_usage(index, false),
             false => Value::Null,
         };
         let chunk = json!({
@@ -664,28 +477,13 @@ impl CompletionResponder {
         let mut events = Vec::new();
         let state = &self.stream;
         if self.include_usage && !state.failed && state.started {
-            let first_choice = |map: &HashMap<u64, u64>| -> u64 {
-                map.iter()
-                    .filter(|(i, _)| *i % self.n as u64 == 0)
-                    .map(|(_, v)| v)
-                    .sum()
-            };
-            let cached = self
-                .settings
-                .enable_cache_report
-                .then(|| first_choice(&state.cached_tokens));
             let chunk = json!({
                 "id": state.last_id,
                 "object": "text_completion",
                 "created": self.created,
                 "model": self.model,
                 "choices": [],
-                "usage": usage(
-                    first_choice(&state.prompt_tokens),
-                    state.completion_tokens.values().sum(),
-                    state.reasoning_tokens.values().sum(),
-                    cached,
-                ),
+                "usage": state.total_usage(self.n, self.settings.enable_cache_report),
             });
             events.push(format!("data: {}\n\n", without_nulls(chunk)));
         }
@@ -776,14 +574,7 @@ impl CompletionResponder {
         let fallback = text.unwrap_or_default().to_owned();
         let bytes = triple[1]
             .as_u64()
-            .and_then(|id| self.tokenizer.as_ref()?.byte_level_piece(id as u32))
-            .and_then(|piece| {
-                piece
-                    .chars()
-                    .map(byte_level_byte)
-                    .collect::<Option<Vec<u8>>>()
-            })
-            .filter(|bytes| !bytes.is_empty());
+            .and_then(|id| self.tokenizer.as_ref()?.byte_level_bytes(id as u32));
         match bytes {
             Some(bytes) if std::str::from_utf8(&bytes).is_err() => {
                 bytes.into_iter().map(char::from).collect()
