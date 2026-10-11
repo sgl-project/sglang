@@ -18,6 +18,11 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 
+_NPU_CROSS_REQUEST_IMAGE_BATCH_MODELS = {
+    "Qwen3VLForConditionalGeneration",
+    "Qwen3VLMoeForConditionalGeneration",
+}
+
 embedding_cache: Optional[MultiModalStaticCache] = None
 host_offload_event: Optional[torch.cuda.Event] = None
 
@@ -219,6 +224,30 @@ def _can_skip_pre_embed_feature_move(data_embedding_func: DataEmbeddingFunc) -> 
         "KimiK25ForConditionalGeneration",
         "KimiK3ForConditionalGeneration",
     }
+
+
+def _can_batch_cross_request_image_misses(
+    data_embedding_func: DataEmbeddingFunc,
+) -> bool:
+    """Whether per-image cache misses may share one encoder invocation.
+
+    CUDA keeps the existing cross-request batching behavior. HIP and XPU retain
+    their per-request paths because those backends have not been validated for
+    this optimization. On NPU, limit the initial enablement to Qwen3-VL image
+    encoders, whose ``get_image_feature`` already accepts multiple items and
+    materializes them as one packed visual batch.
+    """
+    if _is_hip or _is_xpu:
+        return False
+    if not _is_npu:
+        return True
+
+    owner = getattr(data_embedding_func, "__self__", None)
+    return (
+        owner is not None
+        and getattr(data_embedding_func, "__name__", None) == "get_image_feature"
+        and owner.__class__.__name__ in _NPU_CROSS_REQUEST_IMAGE_BATCH_MODELS
+    )
 
 
 def _move_items_to_device(
@@ -570,8 +599,8 @@ def _get_chunked_prefill_embedding(
 ) -> tuple[torch.Tensor | None, torch.Tensor]:
     """
     Chunked prefill embedding: encode items across all requests and extract
-    per-request chunks. Images from all requests are batched into a single
-    ViT call for efficiency.
+    per-request chunks. On supported platform/model combinations, images from
+    all requests are batched into a single ViT call for efficiency.
     """
     device = input_ids.device
     # FIXME(Xinyuan): temporary workaround for eagle3
@@ -612,9 +641,9 @@ def _get_chunked_prefill_embedding(
             for item in embedding_items_per_req
         )
         if is_per_image:
-            if _is_hip or _is_npu or _is_xpu:
-                # ROCm CI regressed with one large cross-request ViT batch; keep
-                # the previous per-request path on HIP/NPU/XPU while CUDA uses batching.
+            if not _can_batch_cross_request_image_misses(data_embedding_func):
+                # ROCm CI regressed with one large cross-request ViT batch. Keep
+                # HIP/XPU and unvalidated NPU models on the per-request path.
                 chunk_slices = _get_chunked_embedding_by_item(
                     data_embedding_func,
                     embedding_items_per_req,
