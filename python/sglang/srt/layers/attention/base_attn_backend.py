@@ -152,6 +152,9 @@ class AttentionBackend(ABC):
     # those tensor addresses. Such backends opt in here, create the metadata
     # object during capture, and refresh its dynamic fields before each replay.
     use_captured_forward_metadata_for_breakable_cuda_graph: bool = False
+    # Most requests one replay of that captured metadata can carry (None: no
+    # bound). Fixed at init: the dp-attention replay vote checks it too.
+    prefill_cuda_graph_max_batch_size: Optional[int] = None
 
     # Backends may keep MIXED prefill eager under DP attention when replaying
     # the EXTEND graph is a known serving-performance regression.
