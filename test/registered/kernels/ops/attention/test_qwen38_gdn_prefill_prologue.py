@@ -13,6 +13,7 @@ from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     QWEN38_GDN_NUM_QK_HEADS,
     QWEN38_GDN_NUM_V_HEADS,
     QWEN38_GDN_QKV_DIM,
+    can_use_qwen38_gdn_prefill_prologue,
     causal_conv1d_fn,
     qwen38_gdn_prefill_prologue,
 )
@@ -34,8 +35,9 @@ def _make_inputs(
     *,
     has_initial_state: bool,
     projection_stride: bool = True,
+    has_bias: bool = True,
     seed: int = 20260921,
-) -> dict[str, torch.Tensor | list[int]]:
+) -> dict[str, torch.Tensor | list[int] | None]:
     torch.manual_seed(seed)
     tokens = sum(lengths)
     if projection_stride:
@@ -78,6 +80,8 @@ def _make_inputs(
             device="cuda",
         )
         * 0.125
+        if has_bias
+        else None
     )
     num_sequences = len(lengths)
     num_slots = num_sequences + 3
@@ -216,11 +220,13 @@ class TestQwen38GDNPrefillPrologue(unittest.TestCase):
         *,
         has_initial_state: bool,
         projection_stride: bool = True,
+        has_bias: bool = True,
     ) -> None:
         inputs = _make_inputs(
             lengths,
             has_initial_state=has_initial_state,
             projection_stride=projection_stride,
+            has_bias=has_bias,
         )
         ref_state = inputs["conv_state"].clone()
         fused_state = inputs["conv_state"].clone()
@@ -269,6 +275,52 @@ class TestQwen38GDNPrefillPrologue(unittest.TestCase):
                         lengths,
                         has_initial_state=has_initial_state,
                     )
+
+    def test_without_conv_bias_exact(self):
+        """Qwen3.8 checkpoints have no Conv1D bias; the producer must still
+        dispatch and match the legacy bias-free Conv1D bit for bit."""
+        for lengths in ([65], [13, 17, 19, 23]):
+            for has_initial_state in (False, True):
+                with self.subTest(
+                    lengths=lengths,
+                    has_initial_state=has_initial_state,
+                ):
+                    self._assert_prologue_exact(
+                        lengths,
+                        has_initial_state=has_initial_state,
+                        has_bias=False,
+                    )
+
+    def test_conv_bias_contract(self):
+        inputs = _make_inputs([8], has_initial_state=False)
+
+        def check(bias: torch.Tensor | None) -> tuple[bool, str]:
+            return can_use_qwen38_gdn_prefill_prologue(
+                inputs["x"],
+                inputs["weight"],
+                bias,
+                inputs["conv_state"],
+                inputs["query_start_loc"],
+                inputs["seq_lens_cpu"],
+                inputs["cache_indices"],
+                inputs["has_initial_state"],
+                inputs["A_log"],
+                inputs["a"],
+                inputs["b"],
+                inputs["dt_bias"],
+            )
+
+        bias = inputs["bias"]
+        self.assertEqual(check(bias), (True, "eligible"))
+        self.assertEqual(check(None), (True, "eligible"))
+        rejected = {
+            "shape": bias[:-1],
+            "dtype": bias.float(),
+            "stride": bias.repeat_interleave(2)[::2],
+        }
+        for name, bad_bias in rejected.items():
+            with self.subTest(rejected=name):
+                self.assertFalse(check(bad_bias)[0])
 
     def test_scheduler_chunk_tail_exact(self):
         self._assert_prologue_exact(

@@ -55,12 +55,22 @@ if is_cuda() or is_hip() or is_xpu():
 MAX_FUSED_QKV_SPLIT_DIM = 8192
 _fused_decode_proj_conv_logged = False
 _fused_decode_proj_conv_fallback_logged = False
+_qwen38_prefill_prologue_logged = False
 _fused_decode_proj_conv_layers_logged: set[int] = set()
 _fused_decode_real_tensor_verified_layers: set[int] = set()
 _fused_decode_log_layer_hits = envs.SGLANG_GDN_DECODE_FUSION_LOG_LAYER_HITS.get()
 _fused_decode_verify_real_tensors = (
     envs.SGLANG_GDN_DECODE_FUSION_VERIFY_REAL_TENSORS.get()
 )
+
+
+def _log_qwen38_prefill_prologue_once(*, eligible: bool, reason: str) -> None:
+    global _qwen38_prefill_prologue_logged
+    if _qwen38_prefill_prologue_logged:
+        return
+    status = "enabled" if eligible else f"disabled ({reason})"
+    rank0_log(f"Qwen3.8 fused GDN prefill prologue: {status}.")
+    _qwen38_prefill_prologue_logged = True
 
 
 class GDNMISMetadata(msgspec.Struct, frozen=True):
@@ -999,7 +1009,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
             layer.dt_bias,
             layer.activation,
         )
-        eligible, _ = can_use_qwen38_gdn_prefill_prologue(*prologue_args)
+        eligible, reason = can_use_qwen38_gdn_prefill_prologue(*prologue_args)
+        _log_qwen38_prefill_prologue_once(eligible=eligible, reason=reason)
         if not eligible:
             return None
         return qwen38_gdn_prefill_prologue(*prologue_args)
