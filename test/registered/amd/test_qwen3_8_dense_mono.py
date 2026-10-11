@@ -223,7 +223,7 @@ class DenseFfnTest(CustomTestCase):
                     self.assertEqual(bad, [])
 
 
-@unittest.skipUnless(_gfx950(), "needs aiter on gfx950")
+@unittest.skipUnless(_gfx950(), "needs FlyDSL and aiter on gfx950")
 class RowCapsTest(CustomTestCase):
     def test_tp_defaults_and_overrides(self):
         from sglang.srt.environ import envs
@@ -242,6 +242,7 @@ class RowCapsTest(CustomTestCase):
                 self.assertEqual(row_caps(2), want2)
 
 
+@unittest.skipUnless(_gfx950(), "needs aiter on gfx950")
 class StockAccumulationTest(CustomTestCase):
     # K2's GEMM K sizes: gate_up, down at TP1, down at TP2.
     KS = (5120, 17408, 8704)
