@@ -1,5 +1,7 @@
+import argparse
 import concurrent.futures
 import logging
+import os
 import random
 import time
 from typing import List
@@ -23,9 +25,7 @@ def print_stats(x: List[int]):
     )
 
 
-def test():
-    # /path/to/hf3fs
-    file_path = "/data/bench.bin"
+def test(file_path):
     file_size = 1 << 40
     bytes_per_page = 16 << 20
     entries = 32
@@ -57,14 +57,13 @@ def test():
             offsets[i : i + file_ops.entries], tensor_reads[i : i + file_ops.entries]
         )
         assert all([result == numel * dtype.itemsize for result in results])
-    assert all([torch.allclose(r, w) for r, w in zip(tensor_reads, tensor_writes)])
+    assert all([torch.equal(r, w) for r, w in zip(tensor_reads, tensor_writes)])
 
     file_ops.close()
     print("test done")
 
 
-def bench():
-    file_path = "/data/bench.bin"
+def bench(file_path):
     file_size = 1 << 40
     bytes_per_page = 16 << 20
     entries = 8
@@ -81,8 +80,14 @@ def bench():
     num_page = entries
 
     offsets = list(range(file_size // bytes_per_page))
-    tensors_write = [torch.randn(numel, dtype=dtype)] * num_page
-    tensors_read = [torch.empty(numel, dtype=dtype)] * num_page
+    tensors_write = [
+        [torch.randn(numel, dtype=dtype) for _ in range(num_page)]
+        for _ in range(numjobs)
+    ]
+    tensors_read = [
+        [torch.empty(numel, dtype=dtype) for _ in range(num_page)]
+        for _ in range(numjobs)
+    ]
     random.shuffle(offsets)
 
     warmup = 50
@@ -92,7 +97,7 @@ def bench():
 
     w_bw = []
     w_size = num_page * numjobs * bytes_per_page / (1 << 30)
-    for i in tqdm(range(warmup + iteration), desc="Benchmarking write (GB/s)"):
+    for i in tqdm(range(warmup + iteration), desc="Benchmarking write (GiB/s)"):
         _offsets = [
             [
                 offset * bytes_per_page
@@ -104,7 +109,7 @@ def bench():
         ]
         tik = time.perf_counter()
         futures = [
-            executor.submit(file_ops[j].batch_write, offset, tensors_write)
+            executor.submit(file_ops[j].batch_write, offset, tensors_write[j])
             for j, offset in enumerate(_offsets)
         ]
         results = [future.result() for future in futures]
@@ -120,7 +125,7 @@ def bench():
 
     r_bw = []
     r_size = w_size
-    for i in tqdm(range(warmup + iteration), desc="Benchmarking read (GB/s)"):
+    for i in tqdm(range(warmup + iteration), desc="Benchmarking read (GiB/s)"):
         _offsets = [
             [
                 offset * bytes_per_page
@@ -132,7 +137,7 @@ def bench():
         ]
         tik = time.perf_counter()
         futures = [
-            executor.submit(file_ops[j].batch_read, offset, tensors_read)
+            executor.submit(file_ops[j].batch_read, offset, tensors_read[j])
             for j, offset in enumerate(_offsets)
         ]
         results = [future.result() for future in futures]
@@ -153,9 +158,13 @@ def bench():
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--file-path", default="/data/bench.bin")
+    args = parser.parse_args()
     logging.basicConfig(level=logging.INFO)
-    test()
-    bench()
+    test(args.file_path)
+    bench(args.file_path)
+    os.remove(args.file_path)
 
 
 if __name__ == "__main__":
