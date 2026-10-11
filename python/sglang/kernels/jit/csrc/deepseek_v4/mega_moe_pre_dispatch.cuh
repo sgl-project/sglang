@@ -204,8 +204,10 @@ struct MegaMoEPreDispatchKernel {
         .with_dtype<int8_t, fp8_e4m3_t>()
         .with_device(device)
         .verify(buf_x);
-    // DeepGEMM exposes only the logical G scale bytes but may pad its physical
-    // row stride to 16 bytes for TMA (for example, H=2304 is 72B -> 80B).
+    // Use the buffer's actual row stride. Older DeepGEMM builds pad it to
+    // 16 bytes; upstream #462 also exposes unpadded rows (H=2304 is 72B).
+    // This kernel writes individual scale bytes and needs neither layout
+    // to have a 16-byte row stride.
     TensorMatcher({P, G4})  // buf_x_sf
         .with_strides({-1, 1})
         .with_dtype<int32_t>()
@@ -234,7 +236,6 @@ struct MegaMoEPreDispatchKernel {
         buf_x_sf.stride(0) >= static_cast<int64_t>(num_groups_div_4),
         "buf_x_sf row stride is smaller than its logical row width");
     const auto buf_x_sf_stride_bytes = static_cast<uint64_t>(buf_x_sf.stride(0)) * sizeof(int32_t);
-    RuntimeCheck(buf_x_sf_stride_bytes % 16u == 0, "buf_x_sf row stride must be 16B-aligned");
     RuntimeCheck(
         reinterpret_cast<uintptr_t>(buf_x_sf.data_ptr()) % 16u == 0, "buf_x_sf base address must be 16B-aligned");
     RuntimeCheck(hidden % 8u == 0, "hidden must be a multiple of 8 (16B bf16 loads)");

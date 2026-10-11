@@ -13,13 +13,13 @@ register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="4-gpu-b
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
     reason="Requires Blackwell GPU (sm_100+)",
 )
-def test_mxfp8_scale_output_uses_padded_row_stride() -> None:
-    """Write each MXFP8 scale row without overwriting its physical padding."""
+@pytest.mark.parametrize("scale_stride_int32", [18, 20])
+def test_mxfp8_scale_output_uses_actual_row_stride(scale_stride_int32: int) -> None:
+    """Support upstream unpadded rows and retain older builds' padding."""
     torch.manual_seed(42)
     num_tokens, padded_max, hidden, top_k = 5, 8, 2304, 8
     num_groups = hidden // 32
     logical_scale_int32 = num_groups // 4
-    scale_stride_int32 = 20
     marker = 0xA5
 
     x = torch.randn(num_tokens, hidden, device="cuda", dtype=torch.bfloat16)
@@ -57,7 +57,14 @@ def test_mxfp8_scale_output_uses_padded_row_stride() -> None:
     torch.cuda.synchronize()
 
     logical_scale_bytes = logical_scale_int32 * 4
-    assert torch.all(scale_bytes[:num_tokens, :logical_scale_bytes] != marker)
+    absmax = x.float().reshape(num_tokens, num_groups, 32).abs().amax(dim=-1)
+    scale_exp = torch.ceil(torch.log2(absmax.clamp_min(1e-10) / 448)) + 127
+    torch.testing.assert_close(
+        scale_bytes[:num_tokens, :logical_scale_bytes], scale_exp.to(torch.uint8)
+    )
+    scale = torch.exp2(scale_exp - 127).repeat_interleave(32, dim=-1)
+    expected_x = (x.float() / scale).to(torch.float8_e4m3fn)
+    torch.testing.assert_close(buf_x[:num_tokens].float(), expected_x.float())
     assert torch.all(scale_bytes[:num_tokens, logical_scale_bytes:] == marker)
     assert torch.all(scale_bytes[num_tokens:] == marker)
     torch.testing.assert_close(buf_topk_idx[:num_tokens], topk_idx.to(torch.int64))

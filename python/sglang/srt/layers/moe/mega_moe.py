@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import functools
+import logging
 from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING, Optional
 
@@ -41,6 +42,8 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
 
+
+logger = logging.getLogger(__name__)
 
 _MEGA_MOE_SYMM_BUFFER: dict = {}
 _is_hip = is_hip()
@@ -75,16 +78,23 @@ def _mega_moe_max_num_sms() -> Optional[int]:
 
 @contextmanager
 def _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
-    max_num_sms = _mega_moe_max_num_sms()
-    if max_num_sms is None:
-        yield
-        return
-
     current_num_sms = deep_gemm.get_num_sms()
-    # Stay under an outer context's budget instead of claiming SMs back from it.
-    target_num_sms = min(max_num_sms, current_num_sms)
-    # Round down: the clustered launch needs an even CTA count.
-    target_num_sms -= target_num_sms % 2
+    if getattr(deep_gemm, "locality_domain", None) is not None:
+        # PR #462's locality-aware scheduler requires the physical SM count,
+        # including for ordinary weights. Other DeepGEMM users (e.g. the DSA
+        # indexer) may temporarily lower this process-wide setting.
+        target_num_sms = torch.cuda.get_device_properties(
+            device="cuda"
+        ).multi_processor_count
+    else:
+        max_num_sms = _mega_moe_max_num_sms()
+        if max_num_sms is None:
+            yield
+            return
+        # Older sgl-deep-gemm kernels need a clustered-launch residency margin.
+        # Stay under an outer context's budget instead of claiming SMs back.
+        target_num_sms = min(max_num_sms, current_num_sms)
+        target_num_sms -= target_num_sms % 2
     if target_num_sms == current_num_sms:
         yield
         return
@@ -97,14 +107,14 @@ def _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
 
 
 def check_mega_moe_shapes(hidden: int, intermediate: int, mma_type: str) -> None:
-    # DeepGEMM keeps one scale row per token and needs 16-byte TMA alignment
-    # on it (layout/mega_moe.cuh), so both dims must be multiples of 16 * group.
-    scale_group = 16 if mma_type == "nvfp4xnvfp4" else 32
-    align = 16 * scale_group
-    if hidden % align != 0 or intermediate % align != 0:
+    # MegaMoE schedules two 128-column CTAs per cluster. L1 has 2 *
+    # intermediate columns (gate + up), while L2 has hidden columns.
+    # Scale rows are not TMA-aligned in the current DeepGEMM layout; applying
+    # the old 16-byte scale-row restriction rejects valid DSV4.1 shapes.
+    if hidden % 256 != 0 or intermediate % 128 != 0:
         raise ValueError(
             f"DeepGEMM MegaMoE ({mma_type}) needs hidden_size and "
-            f"moe_intermediate_size to be multiples of {align}; got "
+            "moe_intermediate_size to be multiples of 256 and 128 respectively; got "
             f"hidden_size={hidden}, moe_intermediate_size={intermediate}. "
             "Use another --moe-a2a-backend for this model."
         )
@@ -409,16 +419,19 @@ def run_mega_routed_experts(
     else:
         shared_block_m = 0
         if shared_l1_weights is not None:
-            shared_block_m = deep_gemm.get_block_m_for_mega_moe(
-                num_ranks=buf.group.size(),
-                num_experts=buf.num_experts,
-                # DeepGEMM rounds the requested capacity up for its buffer.
-                num_max_tokens_per_rank=buf.num_max_tokens_per_rank,
-                # Match the non-null output allocation passed to DeepGEMM.
-                num_tokens=max(num_tokens, 1),
-                num_topk=buf.num_topk,
-                mma_type=buf.mma_type,
-            )
+            with _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
+                # The upstream pybind11 API has no named arguments; positional
+                # arguments also work with sgl-deep-gemm's TVM-FFI binding.
+                shared_block_m = deep_gemm.get_block_m_for_mega_moe(
+                    buf.group.size(),
+                    buf.num_experts,
+                    # DeepGEMM rounds the requested capacity up for its buffer.
+                    buf.num_max_tokens_per_rank,
+                    # Match the non-null output allocation passed to DeepGEMM.
+                    max(num_tokens, 1),
+                    buf.num_topk,
+                    buf.mma_type,
+                )
         mega_moe_pre_dispatch(
             hidden_states,
             topk_ids_in,
@@ -596,3 +609,108 @@ def _transform_mega_moe_shared_sf(linear) -> torch.Tensor:
         recipe=(128, 32),
         disable_ue8m0_cast=False,
     )
+
+
+def prepare_mega_moe_locality(model) -> None:
+    """Localize V4 MegaMoE weights after shared weights are built, before graphs.
+
+    V4 has no routed-expert fallback. Repoint its parameters to the localized
+    tensors so it does not retain a second copy of the full expert weights.
+    Scaling factors keep DeepGEMM's existing UTCCP layout.
+    """
+    if (
+        not envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_LOCALIZE_WEIGHTS.get()
+        or not get_moe_a2a_backend().is_megamoe()
+        or _device_sm // 10 != 10
+    ):
+        return
+
+    from sglang.srt.runtime_context import get_exec
+
+    if get_exec().moe.enable_eplb:
+        logger.warning(
+            "MegaMoE weight localization is disabled with EPLB: expert migration "
+            "requires the ordinary weight layout."
+        )
+        return
+
+    candidates = []
+    seen = set()
+    for module in model.modules():
+        experts = getattr(module, "experts", None)
+        if (
+            experts is None
+            or id(experts) in seen
+            or not getattr(experts, "_mega_moe_weights_built", False)
+            or getattr(experts, "_mega_moe_weights_localized", False)
+        ):
+            continue
+        seen.add(id(experts))
+        if _mega_moe_mma_type(experts) != "fp8xfp4":
+            logger.warning(
+                "MegaMoE weight localization requires fp8xfp4; keeping the "
+                "ordinary weights for %s.",
+                _mega_moe_mma_type(experts),
+            )
+            continue
+        candidates.append(module)
+
+    if not candidates:
+        return
+
+    import deep_gemm
+
+    locality = getattr(deep_gemm, "locality_domain", None)
+    if (
+        locality is None
+        or not callable(getattr(locality, "is_localization_available", None))
+        or not callable(getattr(deep_gemm, "localize", None))
+        or not callable(getattr(deep_gemm, "destroy_localizer", None))
+    ):
+        logger.warning(
+            "DeepGEMM lacks the PR #462 locality APIs; using ordinary MegaMoE weights."
+        )
+        return
+    if not locality.is_localization_available():
+        logger.warning(
+            "DeepGEMM MLOPart is unavailable; using ordinary MegaMoE weights."
+        )
+        return
+
+    try:
+        for module in candidates:
+            experts = module.experts
+            l1, l2 = experts.mega_l1_weights, experts.mega_l2_weights
+            shared_l1 = getattr(module, "mega_shared_l1_weights", None)
+            shared_l2 = getattr(module, "mega_shared_l2_weights", None)
+            if (shared_l1 is None) != (shared_l2 is None):
+                raise ValueError(
+                    "MegaMoE shared L1 and L2 weights must be provided together."
+                )
+
+            # Stage a complete layer before committing: routed and shared weights
+            # must all have the same localization state in DeepGEMM's kernel.
+            new_l1 = (deep_gemm.localize(l1[0]), l1[1])
+            new_l2 = (deep_gemm.localize(l2[0]), l2[1])
+            if shared_l1 is not None:
+                new_shared_l1 = (deep_gemm.localize(shared_l1[0]), shared_l1[1])
+                new_shared_l2 = (deep_gemm.localize(shared_l2[0]), shared_l2[1])
+
+            experts.w13_weight.data = new_l1[0]
+            experts.w2_weight.data = new_l2[0]
+            experts.mega_l1_weights = new_l1
+            experts.mega_l2_weights = new_l2
+            if shared_l1 is not None:
+                module.mega_shared_l1_weights = new_shared_l1
+                module.mega_shared_l2_weights = new_shared_l2
+            experts._mega_moe_weights_localized = True
+            # Drop the last local references before allocating the next layer.
+            del l1, l2, new_l1, new_l2, shared_l1, shared_l2
+    finally:
+        # Complete copies before releasing MLOPart; the allocated tensors survive.
+        try:
+            torch.cuda.synchronize()
+        finally:
+            deep_gemm.destroy_localizer()
+
+    logger.info("Localized MegaMoE weights for %d layers.", len(candidates))
