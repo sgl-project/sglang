@@ -268,6 +268,23 @@ class SGLDUNETLoader:
         return (model,)
 
 
+# Dropdowns are built in INPUT_TYPES, before any client exists; they list the
+# adapters of the server the user most recently connected to.
+_last_client = None
+LORA_NONE = "none"
+LORA_SLOTS = 4
+
+
+def _loaded_lora_choices() -> list:
+    if _last_client is None:
+        return [LORA_NONE]
+    try:
+        listing = _last_client.list_loras(timeout=3)
+    except Exception:
+        return [LORA_NONE]
+    return [LORA_NONE] + [a["nickname"] for a in listing.get("loaded_adapters", [])]
+
+
 class SGLDiffusionServerModel:
     """Node to load and manage SGLang Diffusion server connection."""
 
@@ -299,7 +316,9 @@ class SGLDiffusionServerModel:
 
     def load_server(self, base_url: str, api_key: str):
         """Initialize OpenAI client for SGLang Diffusion server."""
+        global _last_client
         client = SGLDiffusionServerAPI(base_url=base_url, api_key=api_key)
+        _last_client = client
         try:
             model_info = client.get_model_info()
             # Format model_info as a readable string
@@ -1127,6 +1146,14 @@ class SGLDiffusionServerSetLora:
                         "tooltip": "Which transformer(s) to apply the LoRA to",
                     },
                 ),
+                "strength": (
+                    "FLOAT",
+                    {"default": 1.0, "min": 0, "max": 10, "step": 0.01},
+                ),
+                "merge_mode": (
+                    ["server default", "auto", "merge", "dynamic"],
+                    {"default": "server default"},
+                ),
             },
         }
 
@@ -1142,6 +1169,8 @@ class SGLDiffusionServerSetLora:
         lora_name: str = "",
         lora_nickname: str = "",
         target: str = "all",
+        strength: float = 1.0,
+        merge_mode: str = "server default",
     ):
         """Set LoRA adapter using SGLang Diffusion API."""
         if lora_nickname == "":
@@ -1152,6 +1181,8 @@ class SGLDiffusionServerSetLora:
             "lora_nickname": lora_nickname,
             "lora_path": lora_name,
             "target": target,
+            "strength": strength,
+            "merge_mode": None if merge_mode == "server default" else merge_mode,
         }
 
         # Call API
@@ -1160,6 +1191,119 @@ class SGLDiffusionServerSetLora:
             return (sgld_client,)
         except Exception as e:
             raise RuntimeError(f"Failed to set LoRA adapter: {str(e)}")
+
+
+class SGLDiffusionServerListLoras:
+    """Node to browse the LoRA adapters loaded on the SGLang Diffusion server."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"sgld_client": ("SGLD_CLIENT",)}}
+
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("nicknames", "status")
+    FUNCTION = "list_loras"
+    CATEGORY = "SGLDiffusion"
+
+    def list_loras(self, sgld_client: SGLDiffusionServerAPI):
+        listing = sgld_client.list_loras()
+        nicknames = [a["nickname"] for a in listing.get("loaded_adapters", [])]
+        return ("\n".join(nicknames), json.dumps(listing, indent=2))
+
+
+class SGLDiffusionServerLoraStack:
+    """Node to apply several LoRA adapters at once, each with its own strength.
+
+    A slot's dropdown lists adapters already loaded on the server (refresh after
+    connecting). To load a new one, leave the dropdown on "none" and give its
+    path or HF repo id in the slot's path field.
+    """
+
+    MERGE_MODES = ["merge", "auto", "dynamic", "server default"]
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        choices = _loaded_lora_choices()
+        optional = {}
+        for i in range(1, LORA_SLOTS + 1):
+            optional[f"lora_{i}"] = (choices, {"default": LORA_NONE})
+            optional[f"lora_path_{i}"] = (
+                "STRING",
+                {
+                    "default": "",
+                    "tooltip": "Path or HF repo id; only needed to load an "
+                    "adapter the server does not have yet",
+                },
+            )
+            optional[f"strength_{i}"] = (
+                "FLOAT",
+                {"default": 1.0, "min": 0, "max": 10, "step": 0.01},
+            )
+        optional["merge_mode"] = (
+            cls.MERGE_MODES,
+            {
+                "default": "merge",
+                "tooltip": "Stacking several LoRAs on one target needs merge",
+            },
+        )
+        optional["target"] = (
+            ["all", "transformer", "transformer_2", "critic"],
+            {"default": "all"},
+        )
+        return {"required": {"sgld_client": ("SGLD_CLIENT",)}, "optional": optional}
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, lora_1=None, lora_2=None, lora_3=None, lora_4=None):
+        # The dropdown can be stale or empty; the server is the authority.
+        return True
+
+    RETURN_TYPES = ("SGLD_CLIENT", "STRING")
+    RETURN_NAMES = ("sgld_client", "summary")
+    FUNCTION = "set_lora_stack"
+    CATEGORY = "SGLDiffusion"
+
+    def set_lora_stack(
+        self,
+        sgld_client: SGLDiffusionServerAPI,
+        merge_mode: str = "merge",
+        target: str = "all",
+        **slots,
+    ):
+        adapters = self._collect_adapters(slots)
+        nicknames = [nickname for nickname, _, _ in adapters]
+        if len(set(nicknames)) != len(nicknames):
+            raise ValueError(f"The same LoRA is selected twice: {nicknames}")
+        if len(adapters) > 1 and merge_mode == "dynamic":
+            raise ValueError("Stacking several LoRAs needs merge_mode merge or auto")
+
+        try:
+            sgld_client.set_lora(
+                lora_nickname=nicknames,
+                lora_path=[path for _, path, _ in adapters],
+                target=target,
+                strength=[strength for _, _, strength in adapters],
+                merge_mode=None if merge_mode == "server default" else merge_mode,
+            )
+        except Exception as e:
+            raise RuntimeError(f"Failed to set LoRA stack: {str(e)}")
+
+        summary = ", ".join(f"{name}@{strength:g}" for name, _, strength in adapters)
+        return (sgld_client, summary)
+
+    @staticmethod
+    def _collect_adapters(slots: dict) -> list:
+        adapters = []
+        for i in range(1, LORA_SLOTS + 1):
+            name = slots.get(f"lora_{i}", LORA_NONE)
+            path = slots.get(f"lora_path_{i}", "").strip()
+            if name == LORA_NONE and not path:
+                continue
+            if name == LORA_NONE:
+                name = os.path.splitext(os.path.basename(path.rstrip("/")))[0]
+            adapters.append((name, path or None, slots.get(f"strength_{i}", 1.0)))
+        if not adapters:
+            raise ValueError("Pick at least one LoRA")
+        return adapters
 
 
 class SGLDiffusionServerUnsetLora:
@@ -1215,6 +1359,8 @@ NODE_CLASS_MAPPINGS = {
     "SGLDiffusionGenerateAudioVideo": SGLDiffusionGenerateAudioVideo,
     "SGLDiffusionGenerateH3": SGLDiffusionGenerateH3,
     "SGLDiffusionServerSetLora": SGLDiffusionServerSetLora,
+    "SGLDiffusionServerListLoras": SGLDiffusionServerListLoras,
+    "SGLDiffusionServerLoraStack": SGLDiffusionServerLoraStack,
     "SGLDiffusionServerUnsetLora": SGLDiffusionServerUnsetLora,
     "SGLDUNETLoader": SGLDUNETLoader,
     "SGLDOptions": SGLDOptions,
@@ -1229,6 +1375,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SGLDiffusionGenerateAudioVideo": "SGLDiffusion Generate Audio-Video",
     "SGLDiffusionGenerateH3": "SGLDiffusion Generate MiniMax-H3",
     "SGLDiffusionServerSetLora": "SGLDiffusion Server Set LoRA",
+    "SGLDiffusionServerListLoras": "SGLDiffusion Server List LoRAs",
+    "SGLDiffusionServerLoraStack": "SGLDiffusion Server LoRA Stack",
     "SGLDiffusionServerUnsetLora": "SGLDiffusion Server Unset LoRA",
     "SGLDUNETLoader": "SGLDiffusion UNET Loader",
     "SGLDOptions": "SGLDiffusion Options",

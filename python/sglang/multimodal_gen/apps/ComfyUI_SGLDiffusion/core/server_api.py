@@ -5,7 +5,7 @@ Provides a low-level interface for interacting with SGLang Diffusion HTTP server
 
 import os
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Union
 
 import requests
 
@@ -481,24 +481,49 @@ class SGLDiffusionServerAPI:
         }
         return content_types.get(ext, "image/png")
 
+    def list_loras(self, timeout: float = 30) -> Dict[str, Any]:
+        """
+        List loaded LoRA adapters and what is currently applied per module.
+
+        Returns:
+            {"loaded_adapters": [{"nickname", "path"}, ...], "active": {...}}
+        """
+        try:
+            response = requests.get(
+                f"{self.base_url}/list_loras", headers=self.headers, timeout=timeout
+            )
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            raise RuntimeError(f"Failed to list LoRA adapters: {_error_detail(e)}")
+
     def set_lora(
         self,
-        lora_nickname: str,
-        lora_path: Optional[str] = None,
+        lora_nickname: Union[str, List[str]],
+        lora_path: Optional[Union[str, List[Optional[str]]]] = None,
         target: str = "all",
+        strength: Optional[Union[float, List[float]]] = None,
+        merge_mode: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
-        Set a LoRA adapter for the specified transformer(s).
+        Set one or several LoRA adapters for the specified transformer(s).
 
         Args:
-            lora_nickname: The nickname of the adapter (required).
-            lora_path: Path to the LoRA adapter (local path or HF repo id).
-                      Required for the first load; optional if re-activating a cached nickname.
+            lora_nickname: The nickname of the adapter, or a list of nicknames to
+                stack (required).
+            lora_path: Path to the LoRA adapter (local path or HF repo id); a list
+                matching lora_nickname when stacking. Required for the first load;
+                optional (None) if re-activating a cached nickname.
             target: Which transformer(s) to apply the LoRA to. One of:
                 - "all": Apply to all transformers (default)
                 - "transformer": Apply only to the primary transformer (high noise for Wan2.2)
                 - "transformer_2": Apply only to transformer_2 (low noise for Wan2.2)
                 - "critic": Apply only to the critic model
+            strength: LoRA strength, or one per adapter when stacking. The server
+                uses 1.0 when omitted.
+            merge_mode: "auto", "merge" or "dynamic". The server's own
+                --lora-merge-mode applies when omitted. Stacking several adapters
+                on one target needs "merge".
 
         Returns:
             Dictionary containing the API response with status and message
@@ -515,6 +540,10 @@ class SGLDiffusionServerAPI:
         # Add optional lora_path if provided
         if lora_path:
             payload["lora_path"] = lora_path
+        if strength is not None:
+            payload["strength"] = strength
+        if merge_mode:
+            payload["merge_mode"] = merge_mode
 
         try:
             response = requests.post(
@@ -526,7 +555,7 @@ class SGLDiffusionServerAPI:
             response.raise_for_status()
             return response.json()
         except requests.exceptions.RequestException as e:
-            raise RuntimeError(f"Failed to set LoRA adapter: {str(e)}")
+            raise RuntimeError(f"Failed to set LoRA adapter: {_error_detail(e)}")
 
     def unset_lora(
         self,
@@ -556,7 +585,7 @@ class SGLDiffusionServerAPI:
             response.raise_for_status()
             return response.json()
         except requests.exceptions.RequestException as e:
-            raise RuntimeError(f"Failed to unset LoRA adapter: {str(e)}")
+            raise RuntimeError(f"Failed to unset LoRA adapter: {_error_detail(e)}")
 
 
 if __name__ == "__main__":
