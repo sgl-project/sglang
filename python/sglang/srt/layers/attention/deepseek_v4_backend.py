@@ -2461,6 +2461,7 @@ class DeepseekV4AttnBackend(
             max_seq_len=max(seq_lens_cpu_list),
             total_swa=total_swa,
             request_window_layout=request_layout,
+            seq_lens_cpu=seq_lens_cpu_list,
         )
 
     def _build_forward_metadata(

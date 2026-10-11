@@ -2917,6 +2917,7 @@ class DeepseekV4HipRadixBackend(
             num_qo_tokens=num_tokens,
             max_seq_len=max(seq_lens_cpu),
             total_swa=total_swa,
+            seq_lens_cpu=seq_lens_cpu,
         )
 
     def _forward_prefill_opus(

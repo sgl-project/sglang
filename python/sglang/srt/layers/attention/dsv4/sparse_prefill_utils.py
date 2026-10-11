@@ -13,9 +13,9 @@ chunk's bf16 KV workspace:
     [ -1 padding up to a multiple of 128             ]
 
 The workspace is a single flat ``(total_workspace_tokens, 512)`` tensor
-formed by concatenating, per request, that request's compressed-region
-gather followed by all requests' SWA-region gathers. Two per-request
-offset tensors describe the layout:
+formed by concatenating every request's compressed-region gather, packed
+back to back at that request's own live extent, followed by all requests'
+SWA-region gathers. Two per-request offset tensors describe the layout:
 
   * ``compressed_base[r]`` — flat index where request r's compressed
     region begins. Topk indices ``topk_indices[token, j]`` are local to
@@ -34,7 +34,7 @@ compressed branch becomes a no-op) and any ``compress_ratio >= 1``.
 
 import os
 from dataclasses import dataclass, field
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Sequence
 
 import torch
 import triton
@@ -97,6 +97,9 @@ class SparsePrefillWorkspace:
         current_capacity = self._buffer.shape[0] if self._buffer is not None else 0
         current_dtype = self._buffer.dtype if self._buffer is not None else None
         if num_tokens > current_capacity or dtype != current_dtype:
+            # Release the old extent first: assigning straight over it keeps both
+            # alive during the allocation, so every growth step peaks at old + new.
+            self._buffer = None
             self._buffer = torch.empty(
                 (num_tokens, 1, WORKSPACE_DIM),
                 dtype=dtype,
@@ -287,7 +290,7 @@ def build_swa_token_ids(
 class CompressedGather:
     """Positional layout of one compressed cache inside the workspace."""
 
-    flat_token_ids: torch.Tensor  # (num_reqs * c_max,) int32
+    flat_token_ids: torch.Tensor  # (sum_r c_len[r],) int32
     compressed_base: torch.Tensor  # (num_reqs,) int32
     swa_base: torch.Tensor  # (num_reqs,) int32
     # Tail stays at the -1 sentinel because the valid prefix length is
@@ -338,6 +341,9 @@ class SparsePrefillChunkCache:
     compressed: Dict[int, CompressedGather] = field(default_factory=dict)
     swa_indices: Optional[torch.Tensor] = None
     swa_lengths: Optional[torch.Tensor] = None
+    # Host copy of seq_lens, used to size the packed compressed gather without
+    # a device sync. When absent it is read back from ``seq_lens``.
+    seq_lens_cpu: Optional[List[int]] = None
 
     @classmethod
     def build(
@@ -355,6 +361,7 @@ class SparsePrefillChunkCache:
         max_seq_len: int,
         total_swa: int,
         request_window_layout=None,
+        seq_lens_cpu: Optional[Sequence[int]] = None,
     ) -> "SparsePrefillChunkCache":
         """``query_lens`` / ``query_pos``: the rows this forward runs (the extend, or
         a CP rank's interleaved share of it); the SWA gather spans the whole extend."""
@@ -403,6 +410,9 @@ class SparsePrefillChunkCache:
             swa_offsets=swa_offsets,
             swa_indices=swa_indices,
             swa_lengths=swa_lengths,
+            seq_lens_cpu=(
+                None if seq_lens_cpu is None else [int(s) for s in seq_lens_cpu]
+            ),
         )
 
         # Pre-compute the c0 combine output: TOPK=0, compressed_base=0,
@@ -426,15 +436,39 @@ class SparsePrefillChunkCache:
         )
         return cache
 
-    def _workspace_bases(self, c_max: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """Flat workspace offsets of each request's compressed and SWA regions:
-        ``c_max`` compressed slots per request, then the SWA gather."""
+    def _packed_layout(
+        self, compress_ratio: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Pack each request's compressed region at its own live extent.
+
+        Request r owns ``c_len[r] = max(seq_lens[r] // compress_ratio, 1)`` slots
+        starting at ``compressed_base[r]``, and the SWA gather follows the last
+        request. A query at position ``pos`` reads compressed positions below
+        ``(pos + 1) // compress_ratio <= c_len[r]``, so no request needs the
+        batch's longest extent: padding every request to it made the workspace
+        ``num_reqs * max_seq_len // compress_ratio`` rows, and one long prompt
+        sharing a prefill batch with many short ones ran out of memory.
+
+        Returns ``(compressed_base, swa_base, slot_req, slot_pos)``, where slot
+        ``i`` of the packed region holds position ``slot_pos[i]`` of request
+        ``slot_req[i]``. Sizes come from host lengths, so nothing syncs.
+        """
         device = self.seq_lens.device
-        compressed_base = (
-            torch.arange(self.num_reqs, dtype=torch.int32, device=device) * c_max
-        ).to(torch.int32)
-        swa_base = (self.num_reqs * c_max + self.swa_offsets[:-1]).to(torch.int32)
-        return compressed_base, swa_base
+        seq_lens_cpu = self.seq_lens_cpu
+        if seq_lens_cpu is None:
+            seq_lens_cpu = self.seq_lens.tolist()
+        total = sum(max(int(s) // compress_ratio, 1) for s in seq_lens_cpu)
+
+        c_lens = torch.clamp_min(self.seq_lens // compress_ratio, 1).to(torch.int32)
+        compressed_base = torch.zeros(self.num_reqs, dtype=torch.int32, device=device)
+        compressed_base[1:] = torch.cumsum(c_lens, dim=0)[:-1].to(torch.int32)
+        swa_base = (total + self.swa_offsets[:-1]).to(torch.int32)
+
+        slot_req = torch.repeat_interleave(
+            torch.arange(self.num_reqs, device=device), c_lens, output_size=total
+        )
+        slot_pos = torch.arange(total, device=device) - compressed_base.long()[slot_req]
+        return compressed_base, swa_base, slot_req, slot_pos
 
     def layer_inputs(
         self,
@@ -491,10 +525,10 @@ class SparsePrefillChunkCache:
         per_req_c128 = c128_page_indices.narrow(1, 0, c128_max).index_select(
             0, last_q_per_req
         )
+        compressed_base, swa_base, slot_req, slot_pos = self._packed_layout(128)
         # Clamp -1 -> 0 so dequant doesn't OOB; combine masks the invalid
         # tail via topk_len.
-        flat_c128_ids = per_req_c128.reshape(-1).clamp_min(0).to(torch.int32)
-        compressed_base, swa_base = self._workspace_bases(c128_max)
+        flat_c128_ids = per_req_c128[slot_req, slot_pos].clamp_min(0).to(torch.int32)
         # Pre-compute the c128 combine output. topk_indices[q, j] = j is the
         # arange-broadcast pattern; we materialize it once here so the
         # combine kernel can read it like any other topk tensor.
@@ -542,7 +576,6 @@ class SparsePrefillChunkCache:
         gather = self.compressed.get(compress_ratio)
         if gather is not None:
             return gather
-        device = self.seq_lens.device
         c_max = max(self.max_seq_len // compress_ratio, 1)
         c_capacity = page_table.shape[-1] * c_page_size
         assert c_max <= c_capacity, (
@@ -557,14 +590,12 @@ class SparsePrefillChunkCache:
             0, first_q_per_req
         )
 
-        k_arange = torch.arange(c_max, dtype=torch.int32, device=device)
-        block_idx = (k_arange // c_page_size).long()
-        in_page = (k_arange % c_page_size).to(torch.int32)
-        token_ids_2d = (
-            per_req_page_table.index_select(1, block_idx) * c_page_size + in_page
-        ).to(torch.int32)
-        flat_ids = token_ids_2d.reshape(-1).clamp_min(0)
-        compressed_base, swa_base = self._workspace_bases(c_max)
+        compressed_base, swa_base, slot_req, slot_pos = self._packed_layout(
+            compress_ratio
+        )
+        pages = per_req_page_table[slot_req, slot_pos // c_page_size]
+        token_ids = pages * c_page_size + slot_pos % c_page_size
+        flat_ids = token_ids.to(torch.int32).clamp_min(0)
 
         gather = CompressedGather(
             flat_token_ids=flat_ids,
