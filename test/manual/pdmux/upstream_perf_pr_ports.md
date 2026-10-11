@@ -58,6 +58,43 @@ PYTHONPATH=python python -m pytest -q \
 GPU acceptance includes odd/even pair starts, unfinished pairs crossing chunk
 boundaries, padded rows, shared KV source layers and prefill-to-decode migration.
 
+## PR #40860: compact SM90 candidate indexers
+
+Source: [sgl-project/sglang#40860](https://github.com/sgl-project/sglang/pull/40860),
+head `f983aca2d2f04f87bb504235728156441888d6f1`.
+
+Source layers retain full scoring (including #42365 when enabled). Consumers
+score compact candidate blocks in prefill and decode/verify. The port adapts
+the current `Selection` interface and CPU request geometry, and keeps candidate
+metadata on the owning forward batch. Compact scan lengths remain distinct
+from causal K lengths; output mapping sorts logical positions and clears padding.
+
+```bash
+export SGLANG_OPT_USE_DSV41_SM90_CANDIDATES=1
+```
+
+Set before server startup; use `0` and restart to restore the dense candidate
+path and recapture graphs. Prefill requires H32/D128 BF16 and 8-position blocks;
+unsupported shapes and the Torch prefill oracle retain the existing scorer.
+The upstream SM90 graph-variant expansion is deliberately excluded: this port
+does not alter captured batch sizes, DSPARK block widths or lane graph selection.
+
+```bash
+PYTHONPATH=python python -m pytest -q \
+  test/registered/kernels/ops/attention/test_candidate_bf16_mqa.py \
+  test/registered/kernels/ops/attention/test_dsv41_triton_candidate_indexer.py \
+  test/registered/kernels/ops/attention/test_fp4_indexer.py::test_hopper_indexer_backends_replay \
+  test/registered/unit/layers/test_dsv41_candidate_blocks.py \
+  test/registered/unit/layers/test_dsv41_candidate_graph_variants.py
+```
+
+Tests include request/tail coordinate mapping, empty candidates, causal holes,
+changed-input CUDA graph replay, independent streams sharing a read-only cache,
+and the existing dense path. Full-model PDMux GPU validation is still required.
+
+To enable all three ports, set all three environment variables above to `1`
+before the unchanged serve command. All default to `0` on this branch.
+
 ## Combination acceptance
 
 Run each optimization alone and then together, with the same checkpoint,
@@ -71,3 +108,15 @@ c10 for at least 30 minutes before c24. The user's current YAML requests 62
 prefill SMs (the driver may round); its omitted layer cap and chunk size are
 not that historical configuration. CPU tests do not verify CUDA numerics,
 multi-rank liveness or throughput.
+
+## Local validation (2026-10-11)
+
+- PDMux, DP, DSPARK, HiCache, graph policy and port regression selection:
+  470 passed, 309 subtests passed, 91 skipped on the CPU-only macOS host.
+- Environment and kernel inventory checks: 77 passed. One subprocess import
+  check (`test_amx_backend_probe_is_lazy[srt/utils/common.py]`) fails because
+  Triton is not installed; importing the identical file from baseline
+  `a64f33f089` reproduces that failure. This check is not claimed as passed.
+- Ruff, isort, Python AST, registered-test lint and whitespace checks passed.
+- CUDA kernel tests, full-model accuracy, multi-rank liveness and throughput
+  remain unverified. In particular, these ports do not establish a hang fix.
