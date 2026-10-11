@@ -24,6 +24,7 @@ from transformers import AutoTokenizer
 # Fixtures must not depend on the generating machine's environment.
 os.environ["SGLANG_DEFAULT_THINKING"] = "false"
 os.environ["SGLANG_DSV4_REASONING_EFFORT"] = ""
+os.environ["SGLANG_DSV41_REASONING_EFFORT"] = ""
 
 from sglang.srt.entrypoints.openai import chat_encoding
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
@@ -66,6 +67,11 @@ def serving_chat(path, revision, config, tokenizer, tool_call_parser):
             model_path=path, revision=revision, override=config.get(DSV4_PROFILE)
         )
         if server.chat_encoding_spec == "dsv4"
+        else None
+    )
+    server._dsv41_default_reasoning_effort = (
+        chat_encoding.default_dsv41_reasoning_effort_from_env(None)
+        if server.chat_encoding_spec == "dsv41"
         else None
     )
     return server
