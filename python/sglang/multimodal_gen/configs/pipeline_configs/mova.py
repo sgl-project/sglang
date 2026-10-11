@@ -154,19 +154,6 @@ class MOVAPipelineConfig(PipelineConfig):
         latent_T = (num_samples + audio_vae.hop_length - 1) // audio_vae.hop_length
         return (batch_size, audio_vae.latent_dim, latent_T)
 
-    def normalize_video_latents(self, latents: torch.Tensor, video_vae) -> torch.Tensor:
-        latents_mean = getattr(video_vae.config, "latents_mean", None)
-        latents_std = getattr(video_vae.config, "latents_std", None)
-        if latents_mean is None or latents_std is None:
-            return latents
-        mean = torch.tensor(
-            latents_mean, device=latents.device, dtype=latents.dtype
-        ).view(1, video_vae.config.z_dim, 1, 1, 1)
-        inv_std = (
-            1.0 / torch.tensor(latents_std, device=latents.device, dtype=latents.dtype)
-        ).view(1, video_vae.config.z_dim, 1, 1, 1)
-        return (latents - mean) * inv_std
-
     def denormalize_video_latents(
         self, latents: torch.Tensor, video_vae
     ) -> torch.Tensor:
