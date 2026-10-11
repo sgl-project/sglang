@@ -4103,6 +4103,10 @@ class Scheduler(
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
         if len(can_run_list) == 0:
+            # Preemption already released these requests; requeue them even
+            # though the request they made room for was not admitted.
+            for req in adder.preempt_list:
+                self._add_request_to_queue(req)
             return None, running_batch
 
         can_run_set = set(can_run_list)
