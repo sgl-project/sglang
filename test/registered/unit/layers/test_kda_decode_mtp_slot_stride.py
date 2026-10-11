@@ -1,6 +1,6 @@
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=6, stage="base-b", runner_config="1-gpu-small")
 
 import importlib.util
 import unittest
@@ -48,7 +48,7 @@ class TestKdaDecodeMtpSlotStride(unittest.TestCase):
     small slot id and asserts bitwise parity against a contiguous pool."""
 
     def test_wrap_regime_matches_contiguous(self):
-        from sglang.kernels.ops.kimi_k3.kda_decode_mtp import (
+        from sglang.kernels.ops.attention.kda_decode_mtp import (
             fused_kda_decode_mtp_dspark,
         )
 

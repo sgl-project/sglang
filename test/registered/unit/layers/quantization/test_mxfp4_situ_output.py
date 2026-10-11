@@ -1,5 +1,5 @@
 import sys
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -16,9 +16,19 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires 
 
 
 def test_situ_routed_moe_returns_published_output_buffer():
-    from sglang.srt.layers.moe import route_quant_handoff
+    # Import mxfp4 before flashinfer_trtllm to avoid the pre-existing
+    # compressed_tensors circular import.
+    # isort: off
     from sglang.srt.layers.quantization import mxfp4 as mxfp4_module
-    from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
+    from sglang.srt.layers.moe.moe_runner import (
+        flashinfer_trtllm as flashinfer_trtllm_module,
+    )
+    from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+    from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+        FlashInferTrtllmGenMxfp4MoeQuantInfo,
+        _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen,
+    )
+    # isort: on
 
     tokens, hidden, top_k = 3, 128, 2
     x = torch.randn(tokens, hidden, dtype=torch.bfloat16, device="cuda")
@@ -38,27 +48,23 @@ def test_situ_routed_moe_returns_published_output_buffer():
         topk_output=topk_output,
     )
 
-    method = Mxfp4MoEMethod.__new__(Mxfp4MoEMethod)
-    method.use_deep_gemm = False
-    method.use_marlin = False
-    method.use_flashinfer = True
-    method._fi_kernel = None
-    method.flashinfer_mxfp4_moe_precision = "default"
-    method.hidden_size = hidden
-    method.intermediate_size_per_partition = 128
-    method.moe_runner_config = SimpleNamespace(activation="situ")
-
     dummy = torch.empty(1, dtype=torch.uint8, device="cuda")
-    layer = SimpleNamespace(
-        moe_ep_rank=0,
-        num_local_experts=1,
-        num_experts=1,
+    quant_info = FlashInferTrtllmGenMxfp4MoeQuantInfo(
         w13_weight=dummy,
-        w13_weight_scale=dummy,
-        gemm1_alpha=None,
-        gemm1_clamp_limit=None,
         w2_weight=dummy,
+        w13_weight_scale=dummy,
         w2_weight_scale=dummy,
+        w13_weight_bias=dummy,
+        w2_weight_bias=dummy,
+        gemm1_alpha=dummy,
+        gemm1_beta=dummy,
+        gemm1_clamp_limit=dummy,
+        global_num_experts=1,
+        local_expert_offset=0,
+        local_num_experts=1,
+        intermediate_size_per_partition=128,
+        hidden_size=hidden,
+        flashinfer_mxfp4_moe_precision="default",
     )
     expected = (
         torch.arange(tokens * hidden, dtype=torch.float32, device="cuda")
@@ -74,33 +80,40 @@ def test_situ_routed_moe_returns_published_output_buffer():
         returned_ptr = ffi_result.data_ptr()
         return ffi_result
 
+    flashinfer = ModuleType("flashinfer")
+    flashinfer.__path__ = []
+    flashinfer.trtllm_fp4_block_scale_moe = None
+    fused_moe = ModuleType("flashinfer.fused_moe")
+    fused_moe.trtllm_fp4_block_scale_routed_moe = fake_routed_moe
+    tllm_enums = ModuleType("flashinfer.tllm_enums")
+    tllm_enums.RoutingMethodType = SimpleNamespace(TopK=SimpleNamespace(value=0))
+    tllm_enums.ActivationType = SimpleNamespace(Situ=SimpleNamespace(value=0))
+
     latent = torch.empty_like(x)
     with (
         patch.object(
-            route_quant_handoff,
-            "take",
-            return_value=(packed_topk, x_quant, x_scale),
+            mxfp4_module,
+            "_prepare_flashinfer_mxfp8_activations",
+            return_value=(x, packed_topk, x_quant, x_scale),
         ),
-        patch(
-            "sglang.srt.layers.quantization.mxfp4.trtllm_fp4_block_scale_routed_moe",
-            side_effect=fake_routed_moe,
-            create=True,
+        patch.dict(
+            "sys.modules",
+            {
+                "flashinfer": flashinfer,
+                "flashinfer.fused_moe": fused_moe,
+                "flashinfer.tllm_enums": tllm_enums,
+            },
         ),
         patch.object(
-            mxfp4_module,
-            "RoutingMethodType",
-            SimpleNamespace(TopK=SimpleNamespace(value=0)),
-            create=True,
-        ),
-        patch.object(
-            mxfp4_module,
-            "ActivationType",
-            SimpleNamespace(Situ=SimpleNamespace(value=0)),
-            create=True,
+            flashinfer_trtllm_module, "trtllm_moe_enable_pdl", return_value=False
         ),
         zero_copy_context.set_moe_output(latent),
     ):
-        combine_input = method.apply(layer, dispatch_output)
+        combine_input = _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
+            dispatch_output,
+            quant_info,
+            MoeRunnerConfig(activation="situ"),
+        )
 
     assert returned_ptr is not None
     assert returned_ptr != latent.data_ptr()

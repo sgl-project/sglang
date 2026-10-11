@@ -1,6 +1,7 @@
 import sys
 import types
 import unittest
+from contextlib import nullcontext
 from types import ModuleType
 from unittest.mock import Mock, patch
 
@@ -8,6 +9,8 @@ import torch
 
 from sglang.multimodal_gen.runtime.layers.attention.selector import (
     _cached_get_attn_backend,
+    component_attn_backend_context_manager,
+    get_attn_backend,
 )
 from sglang.multimodal_gen.runtime.platforms.cuda import (
     CudaPlatformBase,
@@ -18,6 +21,7 @@ from sglang.multimodal_gen.runtime.platforms.interface import (
     AttentionBackendEnum,
     DeviceCapability,
 )
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 SDPA_BACKEND_CLS_STR = (
     "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
@@ -64,6 +68,7 @@ class TestCudaAttentionBackendSelection(unittest.TestCase):
         FakeCudaPlatform.supports_flash_attention = True
         FakeCudaPlatform.device_capability = DeviceCapability(8, 0)
         _cached_get_attn_backend.cache_clear()
+        self.addCleanup(_cached_get_attn_backend.cache_clear)
 
     def resolve(
         self,
@@ -106,6 +111,51 @@ class TestCudaAttentionBackendSelection(unittest.TestCase):
             self.resolve(AttentionBackendEnum.CUBE_SPARSE_ATTN)
 
         fake_flash_attn.set_fa_ver.assert_called_once_with(4)
+
+    def test_hybrid_window_h3_on_sm120_uses_fa4(self):
+        FakeCudaPlatform.is_sm120_device = True
+        FakeCudaPlatform.device_capability = DeviceCapability(12, 0)
+        fa_module = "sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn"
+        fake_flash_attn = ModuleType(fa_module)
+        fake_flash_attn.set_fa_ver = Mock()
+        hybrid_module = "sglang.multimodal_gen.runtime.layers.attention.backends.hybrid_window_attn_h3"
+        fake_hybrid = ModuleType(hybrid_module)
+        fake_hybrid.HybridWindowAttentionH3Backend = object
+
+        with patch.dict(
+            "sys.modules", {fa_module: fake_flash_attn, hybrid_module: fake_hybrid}
+        ):
+            self.assertEqual(
+                self.resolve(AttentionBackendEnum.HYBRID_WINDOW_ATTN_H3),
+                f"{hybrid_module}.HybridWindowAttentionH3Backend",
+            )
+
+        fake_flash_attn.set_fa_ver.assert_called_once_with(4)
+
+    def test_hybrid_window_h3_on_ampere_keeps_fa3(self):
+        FakeCudaPlatform.device_capability = DeviceCapability(8, 0)
+        fa_module = "sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn"
+        fake_flash_attn = ModuleType(fa_module)
+        fake_flash_attn.set_fa_ver = Mock()
+        hybrid_module = "sglang.multimodal_gen.runtime.layers.attention.backends.hybrid_window_attn_h3"
+        fake_hybrid = ModuleType(hybrid_module)
+        fake_hybrid.HybridWindowAttentionH3Backend = object
+
+        with patch.dict(
+            "sys.modules", {fa_module: fake_flash_attn, hybrid_module: fake_hybrid}
+        ):
+            self.assertEqual(
+                self.resolve(AttentionBackendEnum.HYBRID_WINDOW_ATTN_H3),
+                f"{hybrid_module}.HybridWindowAttentionH3Backend",
+            )
+
+        fake_flash_attn.set_fa_ver.assert_not_called()
+
+    def test_hybrid_window_h3_rejects_unsupported_capability(self):
+        FakeCudaPlatform.device_capability = DeviceCapability(7, 5)
+
+        with self.assertRaisesRegex(ValueError, "12.0"):
+            self.resolve(AttentionBackendEnum.HYBRID_WINDOW_ATTN_H3)
 
     def test_default_backend_uses_torch_sdpa_on_sm120(self):
         FakeCudaPlatform.is_sm120_device = True
@@ -153,6 +203,73 @@ class TestCudaAttentionBackendSelection(unittest.TestCase):
     def test_invalid_backend_raises(self):
         with self.assertRaisesRegex(ValueError, "Invalid attention backend"):
             self.resolve(AttentionBackendEnum.AITER_SAGE)
+
+    def test_sage_attention_head_sizes(self):
+        sage_cls_str = (
+            "sglang.multimodal_gen.runtime.layers.attention.backends."
+            "sage_attn.SageAttentionBackend"
+        )
+        sageattention = types.ModuleType("sageattention")
+        sageattention.sageattn = object()
+        with patch.dict(sys.modules, {"sageattention": sageattention}):
+            for head_size in (32, 64, 72, 96, 128):
+                with self.subTest(head_size=head_size):
+                    self.assertEqual(
+                        FakeCudaPlatform.get_attn_backend_cls_str(
+                            AttentionBackendEnum.SAGE_ATTN, head_size, torch.float16
+                        ),
+                        sage_cls_str,
+                    )
+            for head_size in (0, 160, 256):
+                with self.subTest(head_size=head_size):
+                    with self.assertRaisesRegex(ValueError, f"head size {head_size}"):
+                        FakeCudaPlatform.get_attn_backend_cls_str(
+                            AttentionBackendEnum.SAGE_ATTN, head_size, torch.float16
+                        )
+
+    def test_sage_head_size_fallback_respects_component_policy(self):
+        selector = "sglang.multimodal_gen.runtime.layers.attention.selector"
+        server_args = ServerArgs.__new__(ServerArgs)
+        server_args.attention_backend = "sage_attn"
+        server_args._explicit_arg_names = {"attention_backend"}
+        sageattention = types.ModuleType("sageattention")
+        sageattention.sageattn = object()
+        sage = AttentionBackendEnum.SAGE_ATTN
+        sdpa = AttentionBackendEnum.TORCH_SDPA
+        with (
+            patch.dict(sys.modules, {"sageattention": sageattention}),
+            patch(f"{selector}.get_global_server_args", return_value=server_args),
+            patch(f"{selector}.get_global_forced_attn_backend", return_value=None),
+            patch(
+                "sglang.multimodal_gen.runtime.platforms.current_platform",
+                FakeCudaPlatform,
+            ),
+            patch.object(
+                FakeCudaPlatform, "_resolve_default_attn_backend", return_value=sdpa
+            ),
+        ):
+            for component, override, head_size, expected in (
+                ("text_encoder", None, 256, sdpa),
+                ("text_encoder", sage, 256, None),
+                ("transformer", None, 256, None),
+                ("text_encoder", sdpa, 72, sdpa),
+                ("transformer", None, 72, sage),
+            ):
+                with self.subTest(
+                    component=component, override=override, size=head_size
+                ):
+                    with (
+                        self.assertRaisesRegex(ValueError, "head size 256")
+                        if expected is None
+                        else nullcontext(),
+                        component_attn_backend_context_manager(
+                            override,
+                            component_name=component,
+                            allow_global_backend_fallback=component == "text_encoder",
+                        ),
+                    ):
+                        backend = get_attn_backend(head_size, torch.float16)
+                        self.assertEqual(backend.get_enum(), expected)
 
     def test_hopper_sage_attention_without_sm90_fix_falls_back(self):
         FakeCudaPlatform.is_hopper_device = True
@@ -217,7 +334,7 @@ class TestCudaAttentionBackendSelection(unittest.TestCase):
                 FakeCudaPlatform,
             ),
             patch(
-                "sglang.multimodal_gen.runtime.layers.attention.selector.resolve_obj_by_qualname",
+                "sglang.multimodal_gen.runtime.layers.attention.selector.resolve_name",
                 return_value=FakeAITERBackend,
             ),
         ):

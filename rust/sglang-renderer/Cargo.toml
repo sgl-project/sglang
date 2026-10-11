@@ -1,0 +1,41 @@
+[package]
+name = "sglang-renderer"
+description = "Temporary standalone SGLang renderer service with an OpenAI frontend"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "sglang-renderer"
+path = "src/main.rs"
+
+[dependencies]
+sglang-processor = { path = "../sglang-processor" }
+async-stream = { workspace = true }
+flume = "0.12.0"
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }
+
+axum = { version = "0.8.9", features = ["json"] }
+clap = { version = "4", features = ["derive"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+tracing-subscriber = { workspace = true }
+dynamo-parsers = "=9.2.8"
+dynamo-protocols = "7.0.0"
+dynamo-renderer = "7.0.1"
+hf-hub = { version = "0.4", default-features = false, features = ["rustls-tls", "tokio"] }
+minijinja = { version = "2.24.0", features = ["unstable_machinery"] }
+regex-syntax = "=0.8.11"
+
+# Keep this paired with the server until Dynamo exposes a smaller tokenizer API.
+dynamo-tokenizers = "3.1.0"
+
+[dev-dependencies]
+rmp-serde = "1"
+rmpv = { version = "1", features = ["with-serde"] }
+tower = { version = "0.5", features = ["util"] }

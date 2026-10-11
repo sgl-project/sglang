@@ -16,8 +16,9 @@ from sglang.srt.distributed.parallel_state import (
 from sglang.srt.layers.attention import vision
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import publish_build_topology
 
-register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 EMBED_DIM = 32
 NUM_HEADS = 4
@@ -52,7 +53,8 @@ def gloo_world():
         distributed_init_method=f"tcp://127.0.0.1:{port}",
         backend="gloo",
     )
-    initialize_model_parallel(tensor_model_parallel_size=1, backend="gloo")
+    publish_build_topology(tp_size=1)
+    initialize_model_parallel(backend="gloo")
     yield
     destroy_model_parallel()
     destroy_distributed_environment()

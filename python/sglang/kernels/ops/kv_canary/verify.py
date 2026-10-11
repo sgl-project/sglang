@@ -8,6 +8,7 @@ import torch
 
 from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
 from sglang.kernels.ops.kv_canary import consts
+from sglang.kernels.ops.kv_canary._dispatch import use_torch_reference
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -55,22 +56,23 @@ class RealKvSource:
     num_bytes_per_token``. Trailing bytes of each row are ignored by the canary; this is exactly how the
     abstraction accommodates pools whose per-row layout interleaves canary-relevant bytes with other metadata
     (layer-split storage, K/V interleaving, ...). When ``page_size == 1`` the pattern
-    collapses to the simple ``tensor[slot_idx, :num_bytes_per_token]`` case.
+    collapses to the simple ``tensor[slot_idx, :num_bytes_per_token]`` case. Rows are stepped by
+    ``tensor.stride(0)``, so dim 0 may be a per-layer view into a larger buffer.
 
     A pool may expose multiple RealKvSource instances per (canary buffer × K/V half) — the launch wrappers
     iterate the source list and fold each into the running real_kv_hash via splitmix64 (one int64 fingerprint
     per slot, regardless of source count).
 
     Pool patchers construct sources by:
-    - viewing / reshaping the underlying KV layer into the canonical [num_rows, dim1_bytes] form (no stage-copy
-      needed when the underlying storage is already row-major contiguous on dim 0),
+    - viewing the underlying KV layer as [num_rows, dim1_bytes] (a view, never a stage-copy: a copy would
+      fingerprint a stale snapshot instead of the live pool),
     - choosing ``page_size`` and ``num_bytes_per_token`` so that the access pattern above lands on the bytes
       the canary should fingerprint,
     - leaving any per-row padding / non-canary bytes in the trailing portion of each row (they will simply be
       skipped).
 
     16-byte alignment precondition: the CUDA fold kernel issues 128-bit aligned loads, so ``read_bytes``,
-    ``num_bytes_per_token``, and the row stride (``tensor.shape[1]`` in bytes) must all be positive
+    ``num_bytes_per_token``, and the row stride (``tensor.stride(0)`` in bytes) must all be positive
     multiples of 16. There is no "skip this source" sentinel — callers omit the source from their
     ``real_kv_sources`` tuple entirely (factory helpers return an empty tuple in that case).
 
@@ -113,11 +115,23 @@ class RealKvSource:
             raise ValueError(
                 f"kv-canary: RealKvSource.tensor must be at least 2-D, got shape {tuple(self.tensor.shape)}"
             )
-        row_stride_bytes = int(self.tensor.shape[1]) * self.tensor.element_size()
+        row_stride_bytes = int(self.tensor.stride(0)) * self.tensor.element_size()
         if row_stride_bytes % 16 != 0:
             raise ValueError(
-                f"kv-canary: RealKvSource.tensor dim-1 byte width must be a multiple of 16, "
+                f"kv-canary: RealKvSource.tensor row stride must be a multiple of 16 bytes, "
                 f"got {row_stride_bytes} bytes (shape={tuple(self.tensor.shape)}, "
+                f"strides={tuple(self.tensor.stride())}, dtype={self.tensor.dtype})"
+            )
+        # A row is addressed as page_size slots of num_bytes_per_token, unchecked at fold time;
+        # a narrower row hashes fewer bytes than asked and still reports the chain clean. Check the
+        # row's width, not its stride.
+        row_bytes = int(self.tensor.shape[1]) * self.tensor.element_size()
+        min_row_bytes = self.page_size * self.num_bytes_per_token
+        if row_bytes < min_row_bytes:
+            raise ValueError(
+                f"kv-canary: RealKvSource.tensor row is {row_bytes} bytes wide but "
+                f"page_size={self.page_size} x num_bytes_per_token={self.num_bytes_per_token} "
+                f"needs {min_row_bytes} (shape={tuple(self.tensor.shape)}, "
                 f"dtype={self.tensor.dtype})"
             )
 
@@ -196,6 +210,10 @@ class VerifyPlan:
     verify_prev_slot_indices: torch.Tensor
     verify_num_valid: torch.Tensor
     enable: torch.Tensor
+
+    @staticmethod
+    def allocation_bytes(verify_capacity: int) -> int:
+        return 4 * verify_capacity * torch.int64.itemsize + 2 * torch.int32.itemsize
 
     @classmethod
     def allocate(cls, *, verify_capacity: int, device: torch.device) -> VerifyPlan:
@@ -297,7 +315,8 @@ def launch_canary_verify_kernel(
         - Pure side-effect; never raises. Host polls violation_write_index[0] > 0 for is_errored and
           violation_ring[0] for the first violation.
         - kernel_run_counter is bumped every call (canary-ran health signal).
-        - Safe in cuda-graph capture; caller refills plan in-place before replay.
+        - Safe in cuda-graph capture; caller refills plan in-place before replay. The reference
+          path is not (host work, D2H) and must not be launched under capture.
 
     Pinned by torch reference
     :func:`sglang.kernels.ops.kv_canary.verify_ref.launch_canary_verify_kernel_torch_reference`; CUDA must match
@@ -305,11 +324,27 @@ def launch_canary_verify_kernel(
     """
     canary_buf = context.canary_buf
     real_kv_sources = context.real_kv_sources
+    # Enforce the source-count cap before dispatching: the torch reference is
+    # pinned to match the CUDA ABI byte-for-byte, so the limit is a cross-backend
+    # contract, not a CUDA-only guard. Checking after the reference early-return
+    # (XPU / CPU path) would silently skip it.
     if len(real_kv_sources) > consts.MAX_REAL_KV_SOURCES:
         raise ValueError(
             f"kv-canary: at most {consts.MAX_REAL_KV_SOURCES} RealKvSource entries supported by the CUDA ABI, "
             f"got {len(real_kv_sources)}"
         )
+
+    if use_torch_reference(canary_buf.device):
+        from sglang.kernels.ops.kv_canary.verify_ref import (
+            launch_canary_verify_kernel_torch_reference,
+        )
+
+        launch_canary_verify_kernel_torch_reference(
+            context=context,
+            plan=plan,
+            check_verify_expected_token=check_verify_expected_token,
+        )
+        return
 
     _assert_contiguous(canary_buf, "canary_buf")
     _assert_contiguous(plan.verify_slot_indices, "plan.verify_slot_indices")
@@ -380,7 +415,12 @@ def _build_real_kv_source_abi(
     )
 
     for i, source in enumerate(real_kv_sources):
-        _assert_contiguous(source.tensor, f"real_kv_sources[{i}].tensor")
+        # The kernels step rows by stride(0), so only the bytes within a row must be packed.
+        if source.tensor.stride(-1) != 1:
+            raise ValueError(
+                f"kv-canary: real_kv_sources[{i}].tensor rows must be packed "
+                f"(stride(-1) == 1), got strides {tuple(source.tensor.stride())}"
+            )
         source_u8 = source.tensor.view(torch.uint8)
         if source_u8.dim() != 2:
             raise ValueError(

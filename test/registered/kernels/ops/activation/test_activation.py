@@ -9,7 +9,9 @@ from sglang.kernels.ops.activation.activation import (
     SUPPORTED_ACTIVATIONS,
     relu2,
     run_activation,
+    silu_and_mul_with_activation_rounding,
 )
+from sglang.srt.utils import is_sm90_supported
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -166,6 +168,36 @@ def test_activation_filter_expert_none_skipped(op_name: str) -> None:
     torch.testing.assert_close(out_filtered, out_unfiltered, atol=0.0, rtol=0.0)
 
 
+def test_activation_filter_expert_int64_under_torch_compile() -> None:
+    """torch.topk routing ids remain usable after AOTAutograd realizes int64."""
+    shape = (32, 512)
+    dtype = torch.bfloat16
+    x = torch.randn(shape, dtype=dtype, device="cuda")
+    expert_ids = torch.zeros((shape[0],), dtype=torch.int64, device="cuda")
+    expert_ids[::3] = -1
+    out = torch.full(
+        shape[:-1] + (shape[-1] // 2,),
+        float("nan"),
+        dtype=dtype,
+        device="cuda",
+    )
+
+    def compiled_activation(input, output, routing_ids):
+        return run_activation("silu", input, output, routing_ids, 1)
+
+    result = torch.compile(compiled_activation, fullgraph=True)(x, out, expert_ids)
+    assert result is out
+
+    skipped = expert_ids == -1
+    assert torch.isnan(out[skipped]).all()
+    torch.testing.assert_close(
+        out[~skipped],
+        _reference("silu", x)[~skipped],
+        atol=1e-2,
+        rtol=1e-2,
+    )
+
+
 UNARY_SHAPES = get_ci_test_range(
     full_range=[
         (7, 16),
@@ -207,6 +239,36 @@ def test_relu2_negative_inputs_zeroed() -> None:
     x = -torch.rand((64, 512), dtype=torch.bfloat16, device="cuda") - 1e-3
     out = relu2(x)
     assert torch.count_nonzero(out) == 0
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("limit", [0.0, 6.3, 10.0])
+@pytest.mark.skipif(not is_sm90_supported(), reason="Hopper rounding contract")
+def test_rounded_silu_clamp_graph(dtype, limit):
+    # Include all input bit patterns, especially eager rounding boundaries,
+    # infinities and NaNs; the activation must round before multiplying up.
+    values = (
+        torch.arange(65536, device="cuda", dtype=torch.int32)
+        .to(torch.int16)
+        .view(dtype)
+    )
+    x = torch.cat((values.view(-1, 32), values.roll(17953).view(-1, 32)), dim=1)
+
+    def reference():
+        gate, up = x.chunk(2, dim=-1)
+        if limit > 0:
+            gate = gate.clamp(max=limit)
+            up = up.clamp(-limit, limit)
+        return F.silu(gate) * up
+
+    actual = silu_and_mul_with_activation_rounding(x, clamp_limit=limit)
+    torch.testing.assert_close(actual, reference(), rtol=0, atol=0, equal_nan=True)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        silu_and_mul_with_activation_rounding(x, actual, clamp_limit=limit)
+    x.neg_()
+    graph.replay()
+    torch.testing.assert_close(actual, reference(), rtol=0, atol=0, equal_nan=True)
 
 
 if __name__ == "__main__":

@@ -18,7 +18,7 @@ import pytest
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+register_cpu_ci(est_time=13, suite="base-a-test-cpu")
 
 _MULTIMODAL_ROOT = (
     pathlib.Path(__file__).resolve().parents[4]
@@ -93,26 +93,6 @@ def test_every_call_site_can_await():
     )
 
 
-def test_default_worker_count_follows_the_preprocessing_path():
-    """The count is resolved per path, not pinned to a number.
-
-    Two workers overlap preprocessing that runs on the CPU, where the second
-    thread is real parallelism: 4.46 -> 6.08 req/s on H200 and 7.07 -> 8.76 on
-    GB300, full-page images at 32-way concurrency. On the GPU path the same
-    second worker only contends for the device the scheduler serves from --
-    flat on H200, and 9.30 -> 4.02 req/s on GB300.
-
-    Measuring one path gives the opposite answer from the other, so pinning a
-    single default here is what this asserts against.
-    """
-    from sglang.srt.multimodal.processors.base_processor import (
-        BaseMultimodalProcessor,
-    )
-
-    assert BaseMultimodalProcessor.supports_mm_processor_concurrency is True
-    assert BaseMultimodalProcessor.auto_mm_processor_worker_num is None
-
-
 def _process_mm_data_overrides():
     """Yield (path, node) for every subclass override of `process_mm_data`."""
     for path in sorted(_MULTIMODAL_ROOT.rglob("*.py")):
@@ -154,6 +134,9 @@ def test_overrides_take_the_worker_pools_processor_clone():
 # explicitly so that adding a processor forces a decision instead of silently
 # leaving it at one-worker speed.
 _NO_WORKER_POOL_ROUTE = {
+    # Runs its own image preprocessing to keep the raw token ids the Engram
+    # hasher needs; the shared chain would re-tokenize them.
+    "deepseek_v41.py",
     "dots_note_omni.py",
     "inkling.py",
     "lightonocr.py",

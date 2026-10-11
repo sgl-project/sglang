@@ -13,7 +13,12 @@ ARG SG_LANG_REPO=https://github.com/sgl-project/sglang.git
 ARG SG_LANG_BRANCH=main
 
 ARG SG_LANG_KERNEL_REPO=https://github.com/sgl-project/sgl-kernel-xpu.git
+# Branch, tag or commit SHA; only used when SG_LANG_KERNEL_SOURCE=source.
 ARG SG_LANG_KERNEL_BRANCH=main
+# wheel: prebuilt sglang-kernel-xpu pinned in pyproject_xpu.toml; source: build SG_LANG_KERNEL_BRANCH.
+ARG SG_LANG_KERNEL_SOURCE=wheel
+# AOT target for source builds (bmg | cri); set explicitly since no GPU is visible during docker build.
+ARG SG_LANG_KERNEL_TARGET=bmg
 
 USER root
 
@@ -58,6 +63,7 @@ RUN apt-get update && apt-get install -y software-properties-common curl && \
 RUN apt-get update && apt-get install -y \
     python3-dev \
     build-essential \
+    libssl-dev \
     protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
 
@@ -83,4 +89,33 @@ RUN echo "Cloning ${SG_LANG_BRANCH} from ${SG_LANG_REPO}" && \
     pip install --no-cache-dir ".[dev,diffusion]" --extra-index-url https://download.pytorch.org/whl/xpu && \
     pip install --no-cache-dir --no-deps xgrammar==0.1.33
 
-CMD ["bash", "-c", "source /opt/intel/oneapi/setvars.sh --force && exec bash"]
+# Optionally replace the prebuilt kernel wheel with a source build. --no-build-isolation
+# so CMake finds the installed torch; build/ is removed to keep the image small.
+RUN if [ "${SG_LANG_KERNEL_SOURCE}" = "source" ]; then \
+        echo "Building sgl-kernel-xpu ${SG_LANG_KERNEL_BRANCH} from ${SG_LANG_KERNEL_REPO} for ${SG_LANG_KERNEL_TARGET}" && \
+        git clone ${SG_LANG_KERNEL_REPO} sgl-kernel-xpu && \
+        git -C sgl-kernel-xpu checkout ${SG_LANG_KERNEL_BRANCH} && \
+        git -C sgl-kernel-xpu log -1 --format='sgl-kernel-xpu commit: %H %s' && \
+        pip install --no-cache-dir "scikit-build-core>=0.10" wheel cmake ninja && \
+        pip install -v --no-cache-dir --no-build-isolation --no-deps --force-reinstall \
+            --config-settings=cmake.define.DPCPP_SYCL_TARGET=${SG_LANG_KERNEL_TARGET} \
+            ./sgl-kernel-xpu && \
+        rm -rf sgl-kernel-xpu/build; \
+    elif [ "${SG_LANG_KERNEL_SOURCE}" != "wheel" ]; then \
+        echo "Invalid SG_LANG_KERNEL_SOURCE=${SG_LANG_KERNEL_SOURCE} (expected wheel or source)" && exit 1; \
+    fi
+
+# Install torch_memory_saver for release/resume_memory_occupation ("memory saver").
+# XPU ships no prebuilt wheel: it is built from source against the local oneAPI +
+# torch-XPU runtime (the .so links libsycl.so.<N>, which must match the installed
+# intel-sycl-rt). TMS_PLATFORM=xpu forces the XPU backend; --no-build-isolation
+# lets the build import the installed torch (above) so it can match the libsycl
+# major to it -- under build isolation torch is absent and the match is skipped.
+# Pinned (v0.0.10b2) so image builds are reproducible; bump via --build-arg.
+ARG TORCH_MEMORY_SAVER_REF=a5c99f11b18ebb8e9fda71a68812e476ae49e417
+# Base image already applies setvars.sh in its own layers (SETVARS_COMPLETED=1,
+# icpx on PATH, LIBRARY_PATH/CPATH populated), so re-sourcing here is redundant.
+RUN TMS_PLATFORM=xpu pip install --no-cache-dir --no-build-isolation \
+    git+https://github.com/fzyzcjy/torch_memory_saver.git@${TORCH_MEMORY_SAVER_REF}
+
+CMD ["bash"]

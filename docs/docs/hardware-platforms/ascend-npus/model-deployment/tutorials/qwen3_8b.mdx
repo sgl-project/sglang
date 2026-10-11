@@ -26,7 +26,7 @@ version.
 | Tensor Parallelism            | `--tp-size 2`                                                                                 |
 | Quantization                  | `--quantization modelslim`                                                                    |
 | Chunked Prefill               | auto based on device memory, or set explicit value;<br/>disable with `--chunked-prefill-size -1`; e.g., `--chunked-prefill-size 8192` |
-| NPU Graph                     | enabled by default; disable with `--disable-cuda-graph`;<br/>control range via `--cuda-graph-bs` or `--cuda-graph-max-bs-decode`; e.g., `--cuda-graph-bs 1 2 4 6 9 10 15 16` |
+| NPU Graph                     | enabled by default; disable with `--disable-cuda-graph`;<br/>control range via `--cuda-graph-bs-decode` or `--cuda-graph-max-bs-decode`; e.g., `--cuda-graph-bs-decode 1 2 4 6 9 10 15 16` |
 | Speculative Decoding          | `--speculative-algorithm EAGLE3 \`<br/>`--speculative-draft-model-path /path/to/draft-model-weights \`<br/>`--speculative-num-steps 3 \`<br/>`--speculative-eagle-topk 1 \`<br/>`--speculative-num-draft-tokens 4 \`<br/>`--speculative-draft-model-quantization unquant` |
 | Overlap Schedule              | `export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`                                                  |
 
@@ -65,13 +65,13 @@ For multi-node deployment, download the weights to a shared directory accessible
 
 <Info>
 We recommend deploying the W8A8 variant for reduced resource usage and higher throughput.
-It (11.27GB) fits within a single 64GB die, so `--tp-size 1` is sufficient on either A2 or A3.
+It (11.27GB) fits within a single 64GB die, so `--tp-size 1` is sufficient on either A2 Series or A3 Series.
 </Info>
 
 This is the minimum recommended configuration. For optimized configurations,
 see [Best practices](#best-practices), which may require additional cards or nodes.
 
-For the hardware specifications (memory per die, dies per card, and the difference between A2 and A3),
+For the hardware specifications (memory per die, dies per card, and the difference between A2 Series and A3 Series),
 see [Ascend NPU Reference — Hardware](/docs/hardware-platforms/ascend-npus/reference/glossary#hardware).
 
 ## Installation
@@ -87,7 +87,7 @@ Both **stable releases** and **daily builds** are available. The following comma
 For details, see [Docker image versions](/docs/hardware-platforms/ascend-npus/faq#8-docker-image-versions-stable-release-vs-daily-build).
 
 <Tabs>
-  <Tab title="Atlas 800I A3">
+  <Tab title="Ascend A3 Series">
 
 ```bash Command
 docker pull quay.io/ascend/sglang:cann9.0.0-a3-v0.5.16
@@ -122,7 +122,7 @@ quay.io/ascend/sglang:cann9.0.0-a3-v0.5.16
 ```
 
   </Tab>
-  <Tab title="Atlas 800I A2">
+  <Tab title="Ascend A2 Series">
 
 ```bash Command
 docker pull quay.io/ascend/sglang:cann9.0.0-910b-v0.5.16
@@ -164,7 +164,7 @@ quay.io/ascend/sglang:cann9.0.0-910b-v0.5.16
 Single-node deployment completes both prefill and decode within the same node (PD mixed mode), suitable for scenarios
 with limited hardware resources. This scenario is already covered in the best practice. For the complete, optimized
 deployment commands and benchmark data, see
-[Qwen3-8B Best Practice — PD Mixed On A3](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_8b#single-node-pd-mixed).
+[Qwen3-8B Best Practice — PD Mixed On A3 Series](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_8b#single-node-pd-mixed).
 
 ## Functional verification
 

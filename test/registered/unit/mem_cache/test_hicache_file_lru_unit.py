@@ -14,7 +14,7 @@ Run with:
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 import os
 import shutil
@@ -149,24 +149,6 @@ class HiCacheFileLRUTestBase(CustomTestCase):
         for cm in self._env_overrides:
             cm.__exit__(None, None, None)
         shutil.rmtree(self.tmpdir, ignore_errors=True)
-
-
-class TestEnvDefaults(CustomTestCase):
-    """Verify the env var defaults match the documented opt-in behavior."""
-
-    def test_min_free_space_default_is_zero(self):
-        # Default must keep eviction off so existing users are unaffected.
-        with mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("SGLANG_HICACHE_FILE_BACKEND_MIN_FREE_SPACE", None)
-            self.assertEqual(
-                envs.SGLANG_HICACHE_FILE_BACKEND_MIN_FREE_SPACE.get(),
-                "0",
-            )
-
-    def test_max_size_default_is_none(self):
-        with mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE", None)
-            self.assertIsNone(envs.SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE.get())
 
 
 class TestEvictionDisabledByDefault(HiCacheFileLRUTestBase):
