@@ -452,21 +452,22 @@ class QSAIndexer(MultiPlatformOp):
         )
 
     def _compress_decode_cuda_graph(self, metadata) -> None:
-        """Fixed-shape graph-replay compression; non-boundary rows write slot 0."""
+        """Fixed-shape compression with owner-masked writes to local slots."""
 
         if metadata.graph_write_locs is None or metadata.graph_ring_group_locs is None:
             raise RuntimeError("QSA CUDA graph compression metadata is incomplete")
         pool = metadata.token_to_kv_pool
         group_locs = metadata.graph_ring_group_locs
+        owner_mask = (
+            metadata.write_owner_mask
+            if metadata.write_owner_mask is not None
+            else metadata.graph_write_locs != 0
+        )
         if self._use_fused_compress(pool):
             self._fused_compress_store(
                 pool,
                 group_locs,
-                (
-                    metadata.write_owner_mask
-                    if metadata.write_owner_mask is not None
-                    else metadata.graph_write_locs != 0
-                ),
+                owner_mask,
                 metadata.graph_write_locs,
             )
             return
@@ -478,9 +479,20 @@ class QSAIndexer(MultiPlatformOp):
         compressed = self.normalize_compressed_keys(
             compressed, compressed_rope_positions
         )
-        pool.set_qsa_compressed_k_buffer(
-            self.layer_id, metadata.graph_write_locs, compressed.contiguous()
-        )
+        # Graph metadata already contains local slots. The global-address pool
+        # setter would localize twice and dynamically compact the owner rows.
+        buffer = pool.get_qsa_compressed_k_buffer(self.layer_id)
+        if compressed.is_cuda:
+            from sglang.kernels.ops.attention.qsa_indexer import (
+                qsa_store_compressed_keys,
+            )
+
+            qsa_store_compressed_keys(
+                compressed, buffer, metadata.graph_write_locs, owner_mask
+            )
+        else:
+            local_locs = metadata.graph_write_locs[owner_mask].long()
+            buffer[local_locs] = compressed[owner_mask].to(buffer.dtype)
 
     def _rope_from_matrix(self, positions: torch.Tensor) -> torch.Tensor:
         """[n, 3] slot coordinates -> the layout apply_rope expects."""
@@ -582,10 +594,9 @@ class QSAIndexer(MultiPlatformOp):
                 device=local_indices.device,
             )
         else:
-            absolute_indices = (
-                local_indices.clamp_min(0).long()
-                + row_starts.long().unsqueeze(1)
-            )
+            absolute_indices = local_indices.clamp_min(
+                0
+            ).long() + row_starts.long().unsqueeze(1)
             within_logits = absolute_indices < logits.shape[1]
             valid &= within_logits
             safe_absolute_indices = torch.where(

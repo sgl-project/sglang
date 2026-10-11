@@ -52,6 +52,7 @@ from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
 from sglang.srt.mem_cache.qsa_kv_pool import (
     QSACompressedBlockSharding,
     QSARawKVSharding,
+    QSATokenToKVPool,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import ServerArgs
@@ -103,6 +104,96 @@ def test_qsa_unsharded_multi_kv_decode_preserves_local_heads(monkeypatch, tp_siz
     )
     expected = qsa_sparse_attention(q, k, v, slots, layer.scaling).reshape(2, -1)
     torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("cache_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("capture", [False, True])
+def test_qsa_graph_compression_fallback_local_writes(
+    monkeypatch, rank, cache_dtype, capture
+):
+    from sglang.srt.layers.layernorm import GemmaRMSNorm
+    from sglang.srt.layers.rotary_embedding import get_rope
+
+    device = "cuda"
+    indexer = QSAIndexer.__new__(QSAIndexer)
+    torch.nn.Module.__init__(indexer)
+    indexer.layer_id = 0
+    indexer.index_head_dim = 128
+    indexer.index_kv_heads = 1
+    indexer.compress_ratio = COMPRESS_RATIO
+    indexer.rotary_emb = get_rope(
+        head_size=128,
+        rotary_dim=64,
+        max_position=64,
+        base=10000,
+        rope_scaling={
+            "rope_type": "default",
+            "mrope_section": [8, 12, 12],
+            "mrope_interleaved_glm": True,
+        },
+        dtype=torch.float32,
+    ).to(device)
+    indexer.k_layernorm = GemmaRMSNorm(128, eps=1e-6).to(
+        device=device, dtype=torch.bfloat16
+    )
+    # Graph runners publish capture mode before invoking the indexer.
+    monkeypatch.setattr(qsa_indexer_module, "get_is_capture_mode", lambda: True)
+    generator = torch.Generator(device=device).manual_seed(42)
+    keys = torch.randn(
+        16, 1, 128, dtype=torch.bfloat16, device=device, generator=generator
+    )
+    cache = torch.full((128, 1, 128), -3, dtype=cache_dtype, device=device)
+    pool = SimpleNamespace(
+        qsa_compressed_sharding=QSACompressedBlockSharding(256, 16, 2, rank),
+        qsa_rope_position_buffer=torch.zeros(16, 3, dtype=torch.int64, device=device),
+        get_qsa_key_state_buffer=lambda _: keys,
+        get_qsa_compressed_k_buffer=lambda _: cache,
+    )
+    pool.set_qsa_compressed_k_buffer = MethodType(
+        QSATokenToKVPool.set_qsa_compressed_k_buffer, pool
+    )
+    assert not indexer._use_fused_compress(pool)
+    local_locs = torch.tensor([0, 33, 0, 0], dtype=torch.int32, device=device)
+    owners = torch.tensor([True, True, False, False], device=device)
+    metadata = SimpleNamespace(
+        token_to_kv_pool=pool,
+        graph_ring_group_locs=torch.arange(16, device=device).reshape(4, 4),
+        graph_write_locs=local_locs,
+        write_owner_mask=owners,
+    )
+    pooled = keys.float().reshape(4, 4, 1, 128).mean(1).to(keys.dtype)
+    compressed = indexer.normalize_compressed_keys(
+        pooled, torch.zeros(3, 4, dtype=torch.int64, device=device)
+    ).to(cache_dtype)
+    graph = None
+    if capture:
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            indexer._compress_decode_cuda_graph(metadata)
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            indexer._compress_decode_cuda_graph(metadata)
+    for slots, mask in (
+        ([0, 33, 0, 0], [True, True, False, False]),
+        ([0, 0, 65, 0], [False, False, True, True]),
+        ([0, 0, 0, 0], [False, False, False, False]),
+    ):
+        local_locs.copy_(torch.tensor(slots, device=device))
+        owners.copy_(torch.tensor(mask, device=device))
+        cache.fill_(-3)
+        expected = cache.float()
+        for row, (slot, owned) in enumerate(zip(slots, mask)):
+            if owned:
+                expected[slot] = compressed[row].float()
+        if graph is None:
+            indexer._compress_decode_cuda_graph(metadata)
+        else:
+            graph.replay()
+        torch.testing.assert_close(cache.float(), expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
