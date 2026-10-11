@@ -191,7 +191,7 @@ guard, named here so the next sweep checks the same four things by hand first.
    `publish` says nothing about whether a given read runs before it. Spawned
    workers (`MMEncoder` for encoder DP/TP, the Ray scheduler actor) start with
    an empty context, so a bag read above the publish raises only there.
-   Guard: `test_publish_precedes_bag_reads.py`.
+   No automated guard; check by review.
 3. **The role namespace a process publishes under.** `ROLE_NAMESPACE_SETS`
    narrows what each role may read; the DP controller is audited for `exec`
    alone. A helper that reaches for another namespace passes every default-mode
@@ -201,7 +201,7 @@ guard, named here so the next sweep checks the same four things by hand first.
    means enumerating the others: HTTP, gRPC and in-process `Engine` each have
    their own server-info and model-info, and each passes its own tests while
    its users lose the field.
-   Guard: `test_effective_state_surfaces.py`.
+   No automated guard; check by review.
 
 A fifth, from the same rounds: the accessor **name itself**. Called as an
 object member (`manager.get_disagg()`), or shadowed by a same-named import
@@ -563,10 +563,9 @@ ONE thread — do not design for TBO threads that don't exist.
    resolved config with `get_context().override`; hand a per-runner value to its
    runner as a constructor argument. Projected bags are sealed the same way (leaf
    assignment raises).
-2. **Mutation ratchet** (`test_server_args_mutation_ratchet.py`, exact pin 0 over the whole
-   package minus the pipeline / multimodal_gen): textual scan for assignment forms. Never
-   raise the baseline.
-3. **No-copy contract** (`test_server_args_no_instance_mutation_entry.py`): neither
+2. **No textual mutation ratchet**: the strict guard above is the only mutation
+   check.
+3. **No-copy contract** (review only, no automated guard): neither
    `ServerArgs.override` nor `ServerArgs.derive` exists, and nothing in the package
    calls either form. Rerouting a writer to the bags means flipping **all its readers
    in the same commit** (no transitional dual-write).
@@ -591,9 +590,9 @@ ONE thread — do not design for TBO threads that don't exist.
    `TestNoRenamedAccessorImports` holds the ban. There is no configured-size registry
    here any longer — `get_parallel()` has one spelling per name, so a size read is not a
    choice between two answers and nothing needs registering.
-6. **Module-state ratchet** (`test_module_state_ratchet.py`): `global` statements in the
-   flag-owning layers are pinned by name. A new module-level runtime global belongs on a
-   flags group / resources slot instead; migrating a pinned survivor must shrink the pin.
+6. **Module-state rule** (review only, no automated guard): a new module-level
+   runtime global in the flag-owning layers belongs on a flags group / resources slot
+   instead.
 7. **Namespace coverage** (`test_server_args_namespaces.py`,
    `test_runtime_context_config_bags.py`): every `ServerArgs` field resolves to a
    namespace — from the `arg_groups/fields/` class that declares it — and the
@@ -649,8 +648,7 @@ Key source files: `python/sglang/srt/runtime_context.py` (the container, every t
 `python/sglang/srt/arg_groups/overrides.py` (override registry, passes,
 `declare_resolution` and the spellings around it), `python/sglang/srt/server_args.py` (`NS` metadata,
 `Arg(..., resolvable=True)`, `__setattr__` strict guard), and the guardrail tests under
-`test/registered/unit/` (`test_server_args_mutation_ratchet.py`,
-`test_global_config_read_ratchet.py`,
-`test_module_state_ratchet.py`, `test_server_args_namespaces.py`,
+`test/registered/unit/` (`test_global_config_read_ratchet.py`,
+`test_server_args_namespaces.py`,
 `test_runtime_context.py` — the last one doubles
 as executable documentation of every tier's semantics).
