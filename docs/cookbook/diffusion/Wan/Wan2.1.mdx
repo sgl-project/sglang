@@ -1,25 +1,32 @@
 ---
 title: Wan2.1
+description: "Deploy Wan2.1 video generation models with SGLang - community contribution guide for Wan Video's diffusion models."
 metatags:
     description: "Deploy Wan2.1 video generation models with SGLang - community contribution guide for Wan Video's diffusion models."
 ---
 
 import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
-import { Wan21Deployment } from '/src/snippets/diffusion/wan21-deployment.jsx';
 
 <DiffusionModelTags tags={["video", "text-to-video", "image-to-video", "1.3B / 14B", "bilingual text"]} />
 
-## 1. Model Introduction
+import { Deployment } from '/src/snippets/_deployment.jsx';
+import { config } from '/src/snippets/configs/Wan/wan21.jsx';
+
+## 1. Quick start
+
+Follow the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installation) for your GPU platform.
+
+<a id="2-sglang-diffusion-installation" />
+
+<Deployment config={config} />
+
+<a id="1-model-introduction" />
+
+## 2. Model capabilities
 
 [Wan2.1](https://github.com/Wan-Video/Wan2.1) is a broad open video family covering text-to-video and image-to-video across 1.3B and 14B checkpoints. Its practical strengths are motion-rich generation, temporal consistency, and readable Chinese/English text, with 480p and 720p variants for different quality and memory targets.
 
 Choose the 1.3B T2V model for consumer-GPU experiments and the 14B models when quality matters more than footprint. Wan2.1 is a dense DiT family; for timestep-specialized MoE capacity or the unified 5B TI2V path, use Wan2.2 instead.
-
-## 2. SGLang-diffusion Installation
-
-SGLang-diffusion offers multiple installation methods. You can choose the most suitable installation method based on your hardware platform and requirements.
-
-Please refer to the [official SGLang-diffusion installation guide](../../../docs/sglang-diffusion/installation) for installation instructions.
 
 ## 3. Model Deployment
 
@@ -29,9 +36,7 @@ This section provides deployment configurations optimized for different hardware
 
 The Wan2.1 series offers models in multiple sizes and resolutions. SGLang supports Wan2.1 deployment on NVIDIA B200, B300, H200, H100, and AMD MI300X, MI325X, MI355X GPUs and Ascend A2/A3 Series NPUs. The recommended launch configurations vary by hardware, model size, and memory headroom.
 
-**Interactive Command Generator**: Use the configuration selector below to automatically generate an appropriate deployment command for your model variant and options.
-
-<Wan21Deployment />
+Use the [command builder](#1-quick-start) above.
 
 ### 3.2 Configuration Tips
 

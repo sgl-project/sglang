@@ -19,6 +19,7 @@ from typing import Callable, Optional
 import torch
 
 from sglang.kernels.ops.layernorm.mhc import hc_contract, hc_expand
+from sglang.srt.layers.layer_boundary.facts import ReadFacts, UpdateFacts
 from sglang.srt.layers.layer_boundary.residual import LayerResidualOps
 from sglang.srt.runtime_context import get_parallel
 
@@ -155,13 +156,31 @@ class MHCState:
             ),
         )
 
+    @staticmethod
+    def facts() -> LayerResidualOps:
+        """What residual_ops() declares (see facts_of): the class constants
+        of its reads and updates, the same for every layer whatever
+        parameters it holds, so the stages of a layer that is not built
+        declare them too."""
+        return LayerResidualOps(
+            attn_readout=ReadFacts.of(_AttnReadout),
+            attn_update=UpdateFacts.of(_AttnUpdate),
+            ffn_readout=ReadFacts.of(_FfnReadout),
+            # Only PP declares neighbours, and PP never defers FFN write-backs.
+            ffn_update=UpdateFacts.of(_FfnUpdate),
+        )
+
 
 class _AttnReadout:
     """hc_pre and the input norm; a previous layer's deferred FFN update, if any,
-    runs first, fused with this hc_pre when hc_attn_post_pre takes the batch."""
+    runs first, fused with this hc_pre when hc_attn_post_pre takes the batch.
+    A ``post_residual_addition`` is not applied."""
 
     is_plain_norm = False
+    completing_fusions = ()
+    gathering_reads = ()
     reads_before_dp_gather = False
+    reads_after_attn_tp_gather = False
 
     def __init__(self, state: MHCState):
         self.state = state
@@ -204,6 +223,8 @@ class _AttnUpdate:
     is_plain_add = False
     applied_at_exit = False
     outlives_layer = False
+    writes_stream = False
+    quantized_sum = False
 
     def __init__(self, state: MHCState):
         self.state = state
@@ -223,7 +244,10 @@ class _FfnReadout:
     in hc_ffn_post_pre when it takes the batch."""
 
     is_plain_norm = False
+    completing_fusions = ()
+    gathering_reads = ()
     reads_before_dp_gather = False
+    reads_after_attn_tp_gather = False
 
     def __init__(self, state: MHCState):
         self.state = state
@@ -250,6 +274,8 @@ class _FfnUpdate:
     is_plain_add = False
     applied_at_exit = True
     outlives_layer = False
+    writes_stream = False
+    quantized_sum = False
 
     def __init__(self, state: MHCState):
         self.state = state
