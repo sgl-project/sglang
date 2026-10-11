@@ -1417,6 +1417,8 @@ class TritonAttnBackend(AttentionBackend):
         k_nope: torch.Tensor,
         k_pe: torch.Tensor,
         v: torch.Tensor,
+        *,
+        layer: Optional[RadixAttention] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Pack a materialized dense prefix directly into unit-scale FP8 K/V."""
         return mla_kv_pack_quantize_fp8(
