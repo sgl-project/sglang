@@ -439,6 +439,25 @@ class TestStreamOrderedMmFeaturePool(CustomTestCase):
         with get_parallel().override(tp_rank=6, attn_tp_rank=2):
             self.assertEqual(resolve_consumer_rank(8), 6)
 
+    def test_attention_dp_uses_only_the_routed_scheduler_group(self):
+        from sglang.srt.multimodal.transport.memory_pool import (
+            get_mm_feature_consumer_count,
+            resolve_consumer_rank,
+        )
+        from sglang.srt.runtime_context import get_parallel
+
+        with get_parallel().override(
+            tp_size=8,
+            attn_dp_enabled=True,
+            num_dp_ranks=2,
+            tp_rank=6,
+            attn_tp_rank=0,
+            attn_dcp_size=2,
+        ):
+            count = get_mm_feature_consumer_count()
+            self.assertEqual(count, 4)
+            self.assertEqual(resolve_consumer_rank(count), 2)
+
     def test_complete_group_acknowledges_each_consumer_slot(self):
         from sglang.srt.multimodal.transport import memory_pool
 

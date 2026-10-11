@@ -23,7 +23,7 @@ import sys
 import time
 from array import array
 from collections import deque
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from functools import partial
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Set, Tuple, Union
@@ -210,6 +210,7 @@ from sglang.srt.managers.prefill_delayer import (
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     MultimodalInputs,
+    MultimodalProcessorOutput,
     NextBatchPlan,
     Req,
     ScheduleBatch,
@@ -2235,6 +2236,12 @@ class Scheduler(
                 )
                 error_msg = f"Multimodal feature reconstruction failed ({details})"
                 logger.error(error_msg)
+                if isinstance(
+                    tokenized_req.mm_inputs,
+                    (MultimodalInputs, MultimodalProcessorOutput),
+                ):
+                    for item in tokenized_req.mm_inputs.mm_items:
+                        item.release_transport_proxies()
                 tokenized_req.mm_inputs = None
                 request_errors.append(error_msg)
             else:
@@ -2779,6 +2786,8 @@ class Scheduler(
                 continue
             # For session requests, keep mm_inputs for the next request
             if req.session:
+                if isinstance(req.finished_reason, FINISH_ABORT):
+                    req.release_mm_inputs_on_abort()
                 continue
             # For non-session requests, clear features and mm_inputs
             mm_inputs.release_features()
@@ -2787,6 +2796,23 @@ class Scheduler(
     def handle_generate_request(
         self,
         recv_req: TokenizedGenerateReqInput,
+        *,
+        mm_input_error: Optional[str] = None,
+    ):
+        with ExitStack() as mm_cleanup:
+            if isinstance(
+                recv_req.mm_inputs, (MultimodalInputs, MultimodalProcessorOutput)
+            ):
+                for item in recv_req.mm_inputs.mm_items:
+                    mm_cleanup.callback(item.release_transport_proxies)
+            self._handle_generate_request(
+                recv_req, mm_cleanup, mm_input_error=mm_input_error
+            )
+
+    def _handle_generate_request(
+        self,
+        recv_req: TokenizedGenerateReqInput,
+        mm_cleanup: ExitStack,
         *,
         mm_input_error: Optional[str] = None,
     ):
@@ -3047,6 +3073,8 @@ class Scheduler(
                     req.origin_input_ids, image_inputs, self.pad_input_ids_func
                 )
             req.extend_image_inputs(image_inputs)
+            # the request now owns cleanup, including rejection after padding
+            mm_cleanup.pop_all()
             self._maybe_compute_mrope_positions(req)
 
             if len(req.origin_input_ids) >= self.max_req_input_len:
@@ -3279,6 +3307,7 @@ class Scheduler(
         # detach lives in `StreamingSession.find_active_slot`, which only runs
         # while scheduling; a session left in-flight rejects every later request.
         if req.session is not None and req.session.streaming:
+            req.release_mm_inputs_on_abort()
             req.session.abort_req()
             req.session = None
         # `beam_coordinator.validate_and_init` counts the group in ahead of the
@@ -3364,7 +3393,10 @@ class Scheduler(
 
     def _release_aborted_request(self, req: Req) -> None:
         """Drop the cache-side state an aborted request left behind."""
+        req.release_mm_inputs_on_abort()
         self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
+        if req.session is not None and req.session.streaming:
+            req.session.abort_req()
 
     def _abort_on_queued_limit(self, recv_req: Req) -> bool:
         """Abort an incoming or existing request if the waiting queue is full. Returns True if the incoming request is aborted."""
@@ -3473,6 +3505,23 @@ class Scheduler(
         *,
         mm_input_error: Optional[str] = None,
     ):
+        with ExitStack() as mm_cleanup:
+            if isinstance(
+                recv_req.mm_inputs, (MultimodalInputs, MultimodalProcessorOutput)
+            ):
+                for item in recv_req.mm_inputs.mm_items:
+                    mm_cleanup.callback(item.release_transport_proxies)
+            self._handle_embedding_request(
+                recv_req, mm_cleanup, mm_input_error=mm_input_error
+            )
+
+    def _handle_embedding_request(
+        self,
+        recv_req: TokenizedEmbeddingReqInput,
+        mm_cleanup: ExitStack,
+        *,
+        mm_input_error: Optional[str] = None,
+    ):
         req = Req(
             recv_req.rid,
             recv_req.input_text,
@@ -3528,6 +3577,7 @@ class Scheduler(
                 )
 
             req.extend_image_inputs(image_inputs)
+            mm_cleanup.pop_all()
             self._maybe_compute_mrope_positions(req)
 
             if len(req.origin_input_ids) >= self.max_req_input_len:
