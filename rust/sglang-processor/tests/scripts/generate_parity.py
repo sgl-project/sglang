@@ -2,10 +2,10 @@
 
 Each fixture names a checkpoint (`model`, `revision`, optionally the server's
 `tool_call_parser`) and request `cases`, each optionally with the server's
-`default_chat_template_kwargs`. This renders every case with `OpenAIServingChat`
-on that checkpoint and records the prompt and its token ids, or the error SGLang
-raises, plus the `config.json` fields the processor reads and the Jinja template
-a checkpoint renders with.
+`default_chat_template_kwargs`. This validates and renders every case with
+`OpenAIServingChat` on that checkpoint and records the prompt and its token ids,
+or the error SGLang raises, plus the `config.json` fields the processor reads
+and the Jinja template a checkpoint renders with.
 
 Run from rust/sglang-processor in a SGLang Python environment with the
 checkpoints cached:
@@ -33,6 +33,8 @@ from sglang.srt.entrypoints.openai import chat_encoding
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.parser.template_manager import TemplateManager
+from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.server_args import ServerArgs
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures/parity"
 DSV4_PROFILE = chat_encoding.DSV4_REASONING_EFFORT_PROFILE_OVERRIDE
@@ -57,7 +59,11 @@ def serving_chat(model, path, revision, config, tokenizer, tool_call_parser):
     """The state `OpenAIServingChat.__init__` resolves for this checkpoint, without
     a reasoning parser."""
     server = object.__new__(OpenAIServingChat)
-    server.tokenizer_manager = SimpleNamespace(tokenizer=tokenizer, processor=None)
+    server.tokenizer_manager = SimpleNamespace(
+        tokenizer=tokenizer,
+        processor=None,
+        model_config=SimpleNamespace(is_multimodal=False),
+    )
     server.template_manager = TemplateManager()
     server.template_manager.load_chat_template(server.tokenizer_manager, None, model)
     server.tool_call_parser = tool_call_parser
@@ -99,6 +105,9 @@ def generate(fixture_path):
         allow_patterns=["*.json", "*.jinja", "*.py", "*.model", "*.tiktoken"],
     )
     config = json.loads(Path(path, "config.json").read_text())
+    # The server args `_validate_request` reads.
+    reset_context()
+    publish(ServerArgs(model_path=path), role="tokenizer")
     tok = RecordingTokenizer(AutoTokenizer.from_pretrained(path, local_files_only=True))
     server = serving_chat(
         fixture["model"],
@@ -126,6 +135,10 @@ def generate(fixture_path):
         server.default_chat_template_kwargs = case.get("default_chat_template_kwargs")
         try:
             request = ChatCompletionRequest(**copy.deepcopy(case["request"]))
+            # Validation also rewrites tool schemas the prompt shows.
+            invalid = server._validate_request(request)
+            if invalid:
+                raise ValueError(invalid)
             # _convert_to_internal_request: kwargs effort replaces the request effort.
             if request.chat_template_kwargs:
                 effort = request.chat_template_kwargs.pop("reasoning_effort", None)

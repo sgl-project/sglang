@@ -63,9 +63,9 @@ pub(crate) fn render(
     if messages
         .iter()
         .chain(tools.iter().flatten())
-        .any(prints_unlike_python)
+        .any(has_negative_zero)
     {
-        return Err("numbers serde_json prints unlike Python render on the engine".into());
+        return Err("-0 renders on the engine".into());
     }
     let PromptFormatter::OAI(formatter) = formatter;
     let prompt = formatter
@@ -89,12 +89,6 @@ fn template_args(
         Value::Object(kwargs) => kwargs.clone().into_iter().collect(),
         _ => return Err("chat_template_kwargs must be an object".into()),
     };
-    if let Some(key) = RESERVED_KWARGS
-        .iter()
-        .find(|key| kwargs.contains_key(**key))
-    {
-        return Err(format!("chat_template_kwargs.{key} renders on the engine"));
-    }
     // `normalize_reasoning_inputs`.
     if let Some(thinking) = requested_thinking(request) {
         kwargs.entry("thinking".into()).or_insert(thinking.into());
@@ -111,6 +105,12 @@ fn template_args(
     // stands in for a missing one.
     for (key, value) in defaults {
         kwargs.entry(key.clone()).or_insert_with(|| value.clone());
+    }
+    if let Some(key) = RESERVED_KWARGS
+        .iter()
+        .find(|key| kwargs.contains_key(**key))
+    {
+        return Err(format!("chat_template_kwargs.{key} renders on the engine"));
     }
     let effort = effort.or_else(|| {
         kwargs
@@ -219,17 +219,15 @@ fn join_text_parts(message: &mut Value) {
     }
 }
 
-/// Whether `value` holds a number Dynamo's serde_json prints unlike Python's
-/// `json.dumps`: floats in exponent notation (`1e-06`, `1e+16`), integers
-/// beyond 64 bits, and negative zero, which serde_json also reads from `-0`.
-fn prints_unlike_python(value: &Value) -> bool {
+/// Whether `value` holds a negative zero: serde_json reads JSON `-0` as `-0.0`,
+/// where the engine's orjson reads the integer `0`.
+fn has_negative_zero(value: &Value) -> bool {
     match value {
-        Value::Number(number) => number.as_f64().is_some_and(|f| {
-            let positive_zero = f == 0.0 && f.is_sign_positive();
-            number.is_f64() && !positive_zero && !(1e-4..1e16).contains(&f.abs())
-        }),
-        Value::Array(items) => items.iter().any(prints_unlike_python),
-        Value::Object(fields) => fields.values().any(prints_unlike_python),
+        Value::Number(number) => number
+            .as_f64()
+            .is_some_and(|f| f == 0.0 && f.is_sign_negative()),
+        Value::Array(items) => items.iter().any(has_negative_zero),
+        Value::Object(fields) => fields.values().any(has_negative_zero),
         _ => false,
     }
 }
