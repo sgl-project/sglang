@@ -144,6 +144,8 @@ class MHATokenToKVPoolHost(HostKVCache):
     ):
         self.mtp_draft_device_pools = tuple(mtp_draft_device_pools)
         self.target_layer_num = device_pool.layer_num
+        # Transfer buffers are captured below. The pool remains available for
+        # NPU transfer APIs and device layer ownership.
         self.device_pool = device_pool
         self._transfer_device = torch.device(device_pool.device)
         self.dtype = device_pool.store_dtype

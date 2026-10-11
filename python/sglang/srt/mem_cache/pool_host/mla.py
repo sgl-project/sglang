@@ -89,6 +89,8 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         self.mtp_draft_device_pools = tuple(mtp_draft_device_pools)
         self._is_dummy = is_dummy
 
+        # Transfer buffers are captured below. The pool remains available for
+        # NPU transfer APIs and device layer ownership.
         self.device_pool = device_pool
         if not is_dummy:
             self._transfer_device = torch.device(device_pool.device)
@@ -752,7 +754,6 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
 
     def _backup_from_device_per_layer(
         self,
-        device_pool,
         host_indices,
         device_indices,
         layer_id,
@@ -763,6 +764,10 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         assert not getattr(self, "_is_dummy", False), (
             "backup on a dummy (non-src MLA) host pool"
         )
+        if io_backend not in ("kernel", "direct"):
+            raise ValueError(
+                f"Layer-sharded HiCache backup does not support IO backend: {io_backend}"
+            )
         # Indices arrive already translated by backup_from_device_all_layer.
         # MTP draft layers do not participate in CP layer sharding.
         host_layer_id = layer_id if is_draft else self._host_layer_index(layer_id)
@@ -821,10 +826,6 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     "Layer-sharded direct HiCache backup only supports "
                     f"layer_first layout, got {self.layout}"
                 )
-        else:
-            raise ValueError(
-                f"Layer-sharded HiCache backup does not support IO backend: {io_backend}"
-            )
 
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
@@ -841,13 +842,10 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         if self._is_device_layer_sharded(device_pool):
             for layer_id in self._owned_device_layer_ids(device_pool):
                 self._backup_from_device_per_layer(
-                    device_pool, host_indices, device_indices, layer_id, io_backend
+                    host_indices, device_indices, layer_id, io_backend
                 )
-            for draft_layer_id, draft_device_pool in enumerate(
-                self.mtp_draft_device_pools
-            ):
+            for draft_layer_id in range(len(self.mtp_draft_device_pools)):
                 self._backup_from_device_per_layer(
-                    draft_device_pool,
                     host_indices,
                     device_indices,
                     self.device_pool.layer_num + draft_layer_id,

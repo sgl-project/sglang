@@ -197,6 +197,27 @@ class TestTransferEntryPointsTranslate(CustomTestCase):
 
 
 class TestLayerShardedHostTransfers(CustomTestCase):
+    def test_layer_sharded_ascend_reports_unsupported_backend(self):
+        """Unsupported Ascend backup must report the backend, not a buffer error."""
+        pool = _fake_mla_device_pool(size=128)
+        pool.layer_shard_enabled = True
+        pool.layer_shard_size = 2
+        pool._owned_local_layer_range = lambda: (0, 1)
+        host = MLATokenToKVPoolHost(
+            pool, 2, 0, PHYSICAL_PAGE, "layer_first", pin_memory=False
+        )
+        self.addCleanup(host.destroy)
+        # Ascend has no CUDA-style per-layer KV buffers.
+        host.device_kv_buffers = ()
+        indices = torch.arange(PHYSICAL_PAGE)
+        with self.assertRaisesRegex(
+            ValueError,
+            "Layer-sharded HiCache backup does not support IO backend: kernel_ascend",
+        ):
+            host.backup_from_device_all_layer(
+                pool, indices, indices, io_backend="kernel_ascend"
+            )
+
     def test_owned_device_layers_keep_their_original_positions(self):
         # Rank 1 owns device layers 2/3, which occupy host layers 0/1.
         pool = _fake_mla_device_pool(size=128)
