@@ -8,7 +8,6 @@ import torch
 
 from sglang.srt.layers.attention.cutedsl_mla_backend import CuteDslMLABackend
 from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttnBackend
-from sglang.srt.layers.attention.tokenspeed_mla_backend import TokenspeedMLABackend
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLABackend,
     _get_cute_dsl_workspace_buffer,
@@ -26,7 +25,7 @@ register_cuda_ci(est_time=1, stage="base-b-kernel-unit", runner_config="1-gpu-la
 
 
 class TestVarlenAbsorbedMLAGate(CustomTestCase):
-    DECODE_KERNEL_OVERRIDERS = (TokenspeedMLABackend, CuteDslMLABackend)
+    DECODE_KERNEL_OVERRIDERS = (CuteDslMLABackend,)
 
     def test_decode_overrides_do_not_own_a_varlen_extend_kernel(self):
         for cls in self.DECODE_KERNEL_OVERRIDERS:
@@ -58,51 +57,6 @@ class TestVarlenAbsorbedCapabilityContract(CustomTestCase):
 
     _BACKEND = "sglang.srt.layers.attention.trtllm_mla_backend"
 
-    def _server_args(self, *, kv_cache_dtype="fp8_e4m3", model_dtype=torch.bfloat16):
-        from sglang.srt.server_args import ServerArgs
-
-        args = ServerArgs(model_path="dummy", kv_cache_dtype=kv_cache_dtype)
-        args._model_config = SimpleNamespace(dtype=model_dtype)
-        return args
-
-    def test_server_args_delegates_to_the_backend_predicate(self):
-        from sglang.srt.arg_groups.cuda_graph_hook import trtllm_mla_has_varlen_absorbed
-
-        args = self._server_args()
-        for supported in (True, False):
-            with self.subTest(supported=supported):
-                with (
-                    patch(
-                        "sglang.srt.arg_groups.overrides.attention_backends_of",
-                        return_value=("trtllm_mla", "trtllm_mla"),
-                    ),
-                    patch(
-                        f"{self._BACKEND}.configured_varlen_absorbed_mla_supported",
-                        return_value=supported,
-                    ) as helper,
-                ):
-                    has = trtllm_mla_has_varlen_absorbed(args)
-                self.assertEqual(has, supported)
-                helper.assert_called_once_with(args.kv_cache_dtype, torch.bfloat16)
-
-    def test_auto_kv_uses_resolved_model_dtype(self):
-        from sglang.srt.arg_groups.cuda_graph_hook import trtllm_mla_has_varlen_absorbed
-
-        for model_dtype, expected in (
-            (torch.bfloat16, True),
-            (torch.float16, False),
-        ):
-            with self.subTest(model_dtype=model_dtype):
-                args = self._server_args(kv_cache_dtype="auto", model_dtype=model_dtype)
-                with (
-                    patch(
-                        "sglang.srt.arg_groups.overrides.attention_backends_of",
-                        return_value=("trtllm_mla", "trtllm_mla"),
-                    ),
-                    patch(f"{self._BACKEND}.is_sm100_supported", return_value=True),
-                ):
-                    self.assertEqual(trtllm_mla_has_varlen_absorbed(args), expected)
-
     def test_configured_auto_and_explicit_forms_match_runtime_gate(self):
         with patch(f"{self._BACKEND}.is_sm100_supported", return_value=True):
             self.assertTrue(
@@ -114,16 +68,6 @@ class TestVarlenAbsorbedCapabilityContract(CustomTestCase):
             self.assertTrue(
                 configured_varlen_absorbed_mla_supported("fp8_e4m3", torch.float16)
             )
-
-    def test_other_backends_are_never_excluded(self):
-        from sglang.srt.arg_groups.cuda_graph_hook import trtllm_mla_has_varlen_absorbed
-
-        args = self._server_args()
-        with patch(
-            "sglang.srt.arg_groups.overrides.attention_backends_of",
-            return_value=("fa3", "fa3"),
-        ):
-            self.assertTrue(trtllm_mla_has_varlen_absorbed(args))
 
     def test_only_supported_string_and_dtype_forms_are_allowed(self):
         with patch(f"{self._BACKEND}.is_sm100_supported", return_value=True):
@@ -175,16 +119,14 @@ class TestVarlenAbsorbedWorkspaceAllocation(CustomTestCase):
         with patch(self._SKIP_SOFTMAX, return_value=skip_softmax):
             return varlen_absorbed_extend_may_run(graph, dcp_enabled)
 
-    def test_captured_prefill_graphs_allocate(self):
-        for backend in (Backend.TC_PIECEWISE, Backend.BREAKABLE):
-            with self.subTest(backend=backend):
-                self.assertTrue(self._may_run(self._graph(backend)))
+    def test_breakable_prefill_graph_allocates(self):
+        self.assertTrue(self._may_run(self._graph(Backend.BREAKABLE)))
 
     def test_unreachable_configs_skip_the_workspace(self):
         cases = {
             "no graph config": (None, {}),
             "prefill graph disabled": (self._graph(Backend.DISABLED), {}),
-            "dcp": (self._graph(Backend.TC_PIECEWISE), {"dcp_enabled": True}),
+            "dcp": (self._graph(Backend.BREAKABLE), {"dcp_enabled": True}),
             "skip-softmax": (self._graph(Backend.BREAKABLE), {"skip_softmax": 1.0}),
         }
         for name, (graph, kwargs) in cases.items():
@@ -211,8 +153,7 @@ class TestVarlenAbsorbedMLARouting(CustomTestCase):
         )
 
         with (
-            patch(f"{self._BACKEND}.is_in_tc_piecewise_cuda_graph", return_value=True),
-            patch(f"{self._BACKEND}.is_in_breakable_cuda_graph", return_value=False),
+            patch(f"{self._BACKEND}.is_in_breakable_cuda_graph", return_value=True),
             patch.object(
                 FlashInferMLAAttnBackend, "init_forward_metadata"
             ) as paged_fallback,
@@ -222,6 +163,51 @@ class TestVarlenAbsorbedMLARouting(CustomTestCase):
         paged_fallback.assert_called_once_with(forward_batch)
         self.assertTrue(backend.forward_prefill_metadata.fallback_to_flashinfer_impl)
         self.assertIsNone(backend.forward_prefill_metadata.block_kv_indices)
+
+    def test_varlen_block_table_is_built_from_the_batch_iteration_ids(self):
+        # autospec keeps the real signature, so a call that drops the plan (the
+        # first required argument) raises here instead of on a GPU server.
+        backend = object.__new__(TRTLLMMLABackend)
+        backend.disable_chunked_prefix_cache = False
+        backend._varlen_absorbed_workspace_buffer = sentinel.workspace
+        backend._kv_shard_pool = None
+        backend.max_context_len = 4096
+        block_table = torch.zeros(1, 4, dtype=torch.int32)
+
+        forward_batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            batch_size=1,
+            extend_prefix_lens_cpu=[0],
+            extend_prefix_lens=torch.tensor([0], dtype=torch.int32),
+            extend_seq_lens_cpu=[3],
+            seq_lens=torch.tensor([3], dtype=torch.int32),
+            seq_lens_cpu=torch.tensor([3], dtype=torch.int32),
+            req_pool_indices=torch.tensor([0], dtype=torch.int64),
+            spec_info=None,
+            iteration_ids=sentinel.iteration_ids,
+        )
+
+        with (
+            patch(f"{self._BACKEND}.is_in_breakable_cuda_graph", return_value=True),
+            patch.object(TRTLLMMLABackend, "_calc_padded_blocks", return_value=4),
+            patch.object(
+                TRTLLMMLABackend,
+                "_create_block_kv_indices",
+                autospec=True,
+                return_value=block_table,
+            ) as create_table,
+            patch.object(
+                FlashInferMLAAttnBackend, "init_forward_metadata"
+            ) as paged_fallback,
+        ):
+            backend.init_forward_metadata(forward_batch)
+
+        paged_fallback.assert_not_called()
+        self.assertIs(create_table.call_args.args[1], sentinel.iteration_ids)
+        metadata = backend.forward_prefill_metadata
+        self.assertFalse(metadata.fallback_to_flashinfer_impl)
+        self.assertIs(metadata.block_kv_indices, block_table)
+        self.assertEqual(metadata.max_seq_len_k, 3)
 
 
 class TestVarlenAbsorbedMLADispatchContract(CustomTestCase):

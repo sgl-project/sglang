@@ -38,13 +38,13 @@ Columns are runner modes; rows are attention backends. Cells use:
 - Nonzero MLA rope dimension support is present in the fixture, but RoPE math
   is intentionally orthogonal to the runner/backend matrix.
 
-## `trtllm_mla` PCG/BCG Extend (Varlen Absorbed MLA)
+## `trtllm_mla` BCG Extend (Varlen Absorbed MLA)
 
-Under a captured `tc_piecewise` **or** `breakable` prefill graph, the
+Under a captured `breakable` prefill graph, the
 DeepSeek/Kimi dispatcher returns `AttnForwardMethod.MLA` even for a genuine
 extend, so `trtllm_mla` serves it with absorbed MLA over a ragged `q`
 (`_run_varlen_absorbed_kernel`) instead of the FlashInfer paged-MLA parent.
-The piecewise and breakable tests share ten numerical cases, including ragged
+The breakable test covers ten numerical cases, including ragged
 batches, page boundaries, real capture/replay, and the 65–127-head range where
 FlashInfer `backend="auto"` selects monolithic CuTeDSL. The dedicated
 `cutedsl_mla` SGLang backend remains decode-only; its prefill side is
