@@ -55,6 +55,43 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
 
 
+def class_counts(start_class: int, num_pages: int, shard_size: int) -> List[int]:
+    """Pages drawn from each class by a cyclic run of ``num_pages`` pages
+    starting at ``start_class``; closed-form, host-only."""
+    return [
+        num_pages // shard_size
+        + (1 if (c - start_class) % shard_size < num_pages % shard_size else 0)
+        for c in range(shard_size)
+    ]
+
+
+def pop_cyclic_pages(
+    class_free_pages: List[torch.Tensor], start_class: int, num_pages: int
+) -> torch.Tensor:
+    """Pop a position-ordered run of ``num_pages`` pages whose owner classes
+    cycle from ``start_class``; mutates ``class_free_pages``. The caller has
+    checked that every class can supply its share.
+
+    Position-page j draws class (start_class + j) % N, so class c fills
+    positions (c - start_class) % N, +N, +2N, ...
+    """
+    shard_size = len(class_free_pages)
+    device = class_free_pages[0].device
+    pages = torch.empty((num_pages,), dtype=torch.int64, device=device)
+    counts = class_counts(
+        start_class=start_class, num_pages=num_pages, shard_size=shard_size
+    )
+    for c, count in enumerate(counts):
+        if count == 0:
+            continue
+        positions = torch.arange(
+            (c - start_class) % shard_size, num_pages, shard_size, device=device
+        )
+        pages[positions] = class_free_pages[c][:count]
+        class_free_pages[c] = class_free_pages[c][count:]
+    return pages
+
+
 class PageInterleavePoolAllocator(PagedTokenToKVPoolAllocator):
     """Classed paged allocator over the shard-widened logical index space.
 
@@ -172,16 +209,6 @@ class PageInterleavePoolAllocator(PagedTokenToKVPoolAllocator):
             "rotation base)"
         )
 
-    @staticmethod
-    def _class_counts(start_class: int, new_pages: int, shard_size: int) -> List[int]:
-        """Pages drawn from each class by a cyclic run of ``new_pages`` pages
-        starting at ``start_class`` — closed-form, host-only."""
-        return [
-            new_pages // shard_size
-            + (1 if (c - start_class) % shard_size < new_pages % shard_size else 0)
-            for c in range(shard_size)
-        ]
-
     def alloc_extend(
         self,
         prefix_lens: torch.Tensor,
@@ -241,9 +268,10 @@ class PageInterleavePoolAllocator(PagedTokenToKVPoolAllocator):
             start_class = (rotation_bases[i] + prefix_len // ps) % shard_size
             start_classes.append(start_class)
             new_pages_list.append(new_pages)
-            for c, need in enumerate(
-                self._class_counts(start_class, new_pages, shard_size)
-            ):
+            counts = class_counts(
+                start_class=start_class, num_pages=new_pages, shard_size=shard_size
+            )
+            for c, need in enumerate(counts):
                 sim_counts[c] -= need
             if self.debug_mode and prefix_len > 0:
                 # Owner congruence of the prefix end: the host-tracked phase
@@ -278,25 +306,11 @@ class PageInterleavePoolAllocator(PagedTokenToKVPoolAllocator):
         # request, concatenated in batch order (= out_cache_loc order).
         out_parts = []
         for i in range(bs):
-            new_pages = new_pages_list[i]
-            start_class = start_classes[i]
-            counts = self._class_counts(start_class, new_pages, shard_size)
-            # Interleave the class pops into one position-ordered page
-            # vector: position-page j draws class (start_class + j) % N, so
-            # class c fills plan slots (c - start_class) % N, +N, +2N, ...
-            pages = torch.empty((new_pages,), dtype=torch.int64, device=self.device)
-            for c in range(shard_size):
-                if counts[c] == 0:
-                    continue
-                pages[
-                    torch.arange(
-                        (c - start_class) % shard_size,
-                        new_pages,
-                        shard_size,
-                        device=self.device,
-                    )
-                ] = self.class_free_pages[c][: counts[c]]
-                self.class_free_pages[c] = self.class_free_pages[c][counts[c] :]
+            pages = pop_cyclic_pages(
+                class_free_pages=self.class_free_pages,
+                start_class=start_classes[i],
+                num_pages=new_pages_list[i],
+            )
             extend_len = int(seq_lens_cpu[i]) - int(prefix_lens_cpu[i])
             offsets = torch.arange(extend_len, dtype=torch.int64, device=self.device)
             out_parts.append(pages[offsets // ps] * ps + offsets % ps)
@@ -305,6 +319,33 @@ class PageInterleavePoolAllocator(PagedTokenToKVPoolAllocator):
         if self.debug_mode:
             assert len(torch.unique(out_indices)) == len(out_indices)
         return out_indices
+
+    def alloc_cyclic(self, start_class: int, need_size: int) -> Optional[torch.Tensor]:
+        """Whole pages whose owner classes cycle from ``start_class``, or None.
+
+        HiCache load-back keeps the owners the host copies were backed up under.
+        """
+        ps = self.page_size
+        assert need_size % ps == 0, (
+            f"load-back allocates whole pages, got {need_size} tokens (page_size={ps})"
+        )
+        num_pages = need_size // ps
+        counts = class_counts(
+            start_class=start_class, num_pages=num_pages, shard_size=self.shard_size
+        )
+        if any(n > f for n, f in zip(counts, self.class_free_page_counts())):
+            return None
+        if self.need_sort and any(
+            n > len(free) for n, free in zip(counts, self.class_free_pages)
+        ):
+            self.merge_and_sort_free()
+        pages = pop_cyclic_pages(
+            class_free_pages=self.class_free_pages,
+            start_class=start_class,
+            num_pages=num_pages,
+        )
+        offsets = torch.arange(ps, dtype=torch.int64, device=self.device)
+        return (pages[:, None] * ps + offsets).reshape(-1)
 
     def alloc_decode(
         self,
