@@ -98,7 +98,7 @@ export const config = {
             "--speculative-algorithm DFLASH",
             "--speculative-draft-model-path {{DRAFT_MODEL_ID}}",
             "--speculative-draft-attention-backend fa4",
-            "--speculative-num-draft-tokens 6",
+            "--speculative-num-draft-tokens 8",
           ],
           disabled: (s) => s.hw === "mi355x",
           disableReason: "Dflash V2 with fa4 draft attention is not validated on MI355X.",
