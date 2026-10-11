@@ -248,6 +248,11 @@ def _ppu_msa_sparse_prefill(
     idx_q_scale=None,
     idx_k_scale=None,
     idx_v_scale=None,
+    cached_topk_idx=None,
+    return_topk_idx=False,
+    loc_mapping=None,
+    page_size=1,
+    seq_lens_cpu=None,
 ):
     """SAIL MSA prefill: chunked indexer + whole-batch attend, else Triton.
 
@@ -298,6 +303,11 @@ def _ppu_msa_sparse_prefill(
             idx_q_scale=idx_q_scale,
             idx_k_scale=idx_k_scale,
             idx_v_scale=idx_v_scale,
+            cached_topk_idx=cached_topk_idx,
+            return_topk_idx=return_topk_idx,
+            loc_mapping=loc_mapping,
+            page_size=page_size,
+            seq_lens_cpu=seq_lens_cpu,
         )
 
     backend = _find_backend(req_to_token)
@@ -317,6 +327,12 @@ def _ppu_msa_sparse_prefill(
                 "capture; routing this batch to the Triton path."
             )
             _ppu_prefill_capture_warned = True
+        return _triton_prefill()
+
+    # The SAIL planner neither produces nor consumes the cross-layer top-k
+    # index cache, and does not implement the hisparse loc remapping; a batch
+    # needing either stays on the community Triton path.
+    if return_topk_idx or cached_topk_idx is not None or loc_mapping is not None:
         return _triton_prefill()
 
     # msa_ppu_forward_extend needs the live ForwardBatch (req_pool_indices
