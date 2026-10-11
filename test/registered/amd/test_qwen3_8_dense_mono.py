@@ -7,6 +7,8 @@ post_attention_layernorm + gate_up, SiLU-mul and down, against dynamic_mxfp4_qua
 (from the stock norm's output) each rank's down partial before the all-reduce,
 from its half of gate_up's rows and down's K columns.
 
+``RowCapsTest``: K1's and K2's row caps by TP and their env overrides.
+
 ``StockAccumulationTest``: the property K2's K partition relies on (see
 ``dense_ffn``): the stock MXFP4 GEMM's output is bf16(fp32(exact sum)) at K2's
 K sizes, so any K partition with exact fp32 partials gives the stock bits.
@@ -222,6 +224,24 @@ class DenseFfnTest(CustomTestCase):
 
 
 @unittest.skipUnless(_gfx950(), "needs aiter on gfx950")
+class RowCapsTest(CustomTestCase):
+    def test_tp_defaults_and_overrides(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.layers.qwen3_8_dense_mono import row_caps
+
+        k1 = envs.SGLANG_QWEN3_8_DENSE_MONO_K1_MAX_ROWS
+        k2 = envs.SGLANG_QWEN3_8_DENSE_MONO_K2_MAX_ROWS
+        for v1, v2, want1, want2 in (
+            (None, None, (8, 4), (8, 8)),
+            (6, 2, (6, 2), (6, 2)),
+            (None, 16, (8, 8), (8, 16)),
+            (0, 99, (1, 8), (1, 16)),
+        ):
+            with self.subTest(k1=v1, k2=v2), k1.override(v1), k2.override(v2):
+                self.assertEqual(row_caps(1), want1)
+                self.assertEqual(row_caps(2), want2)
+
+
 class StockAccumulationTest(CustomTestCase):
     # K2's GEMM K sizes: gate_up, down at TP1, down at TP2.
     KS = (5120, 17408, 8704)

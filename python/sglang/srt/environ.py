@@ -881,8 +881,8 @@ class Envs:
     # AMD, ROCm, and AITER
     # ===================================================================
     SGLANG_USE_AITER = EnvBool(False)
-    # ROCm FlyDSL Qwen3.8-27B dense mono decode for steps of <= 8 rows (gfx950,
-    # TP1). See srt/layers/qwen3_8_dense_mono.py.
+    # ROCm FlyDSL Qwen3.8-27B dense mono decode for narrow decode steps (gfx950,
+    # TP1 or TP2). See srt/layers/qwen3_8_dense_mono.py.
     SGLANG_QWEN3_8_DENSE_MONO = EnvBool(False)
     # With it: fold out_proj / o_proj into the FFN launch (TP1), or each GDN
     # layer's out_proj into K1 (TP2).
@@ -891,9 +891,10 @@ class Envs:
     SGLANG_QWEN3_8_DENSE_MONO_K1 = EnvBool(True)
     # TP2: each layer's FFN (gate_up .. down, before the all-reduce) as one launch.
     SGLANG_QWEN3_8_DENSE_MONO_K2 = EnvBool(True)
-    # TP2: the widest decode step K1 / K2 take (1..16; TP1 stays at 8).
-    SGLANG_QWEN3_8_DENSE_MONO_K1_MAX_ROWS = EnvInt(8)
-    SGLANG_QWEN3_8_DENSE_MONO_K2_MAX_ROWS = EnvInt(8)
+    # The widest decode step K1 / K2 take (1..8 at TP1, 1..16 at TP2); unset, the
+    # TP's default (K1 8; K2 4 at TP1, 8 at TP2).
+    SGLANG_QWEN3_8_DENSE_MONO_K1_MAX_ROWS = EnvInt(None)
+    SGLANG_QWEN3_8_DENSE_MONO_K2_MAX_ROWS = EnvInt(None)
     # Fuse MiniMax-M3 main/index QK norm + RoPE with main KV and index-K cache
     # insertion. Requires an AITER build with the fp8_e4m3_unit cache contract.
     # Enabled by default for supported configurations; set to 0 to disable.

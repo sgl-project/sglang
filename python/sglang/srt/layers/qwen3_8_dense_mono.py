@@ -1,9 +1,8 @@
 """ROCm FlyDSL dense mono decode for Qwen3.8-27B (``SGLANG_QWEN3_8_DENSE_MONO=1``,
 gfx950, TP1 or TP2).
 
-A pure decode step of at most 8 rows (16 at TP2, see below) runs each decoder
-layer as at most two persistent launches
-(``sglang.kernels.ops.moe.qwen3_5_mono_flydsl``):
+A pure decode step of a few rows runs each decoder layer as at most two
+persistent launches (``sglang.kernels.ops.moe.qwen3_5_mono_flydsl``):
 
 - K1 (``dense_gdn``, GDN layers, ``SGLANG_QWEN3_8_DENSE_MONO_K1``): the residual
   add + input_layernorm -> in_proj_qkvz / in_proj_ba -> conv1d -> the gated
@@ -28,9 +27,12 @@ the heads, from the stock input_layernorm's output) up to out_proj's partial
 each layer's ``mlp`` takes K2 (``SGLANG_QWEN3_8_DENSE_MONO_K2``, its half of the
 intermediate, from the stock post_attention_layernorm's output) up to down's
 partial. The all-reduces, the norms, attention and its o_proj stay stock.
-K1 and K2 each take steps of up to 8 rows by default, up to 16 with
-``SGLANG_QWEN3_8_DENSE_MONO_K1_MAX_ROWS`` / ``_K2_MAX_ROWS``; a step wider than
-one kernel's cap runs that part stock.
+
+Each kernel takes steps up to its row cap, by TP: K1 8 rows; K2 4 at TP1 and 8
+at TP2. ``SGLANG_QWEN3_8_DENSE_MONO_K1_MAX_ROWS`` / ``_K2_MAX_ROWS`` override
+them (up to 8 at TP1, 16 at TP2). A step wider than one kernel's cap runs that
+part stock: at TP1 a step wider than K2's runs K1, then the stock out_proj,
+post_attention_layernorm and MLP.
 
 The decode CUDA graph captures the step per batch size; any other step takes
 the stock layers. Mailbox tags carry a device epoch bumped once a step
@@ -50,6 +52,10 @@ logger = logging.getLogger(__name__)
 
 # The K1 self-check's pool: slot 0 unused, a pad row at width > 1.
 _CHECK_SLOTS = 4
+
+# K1's and K2's default row caps by TP. Chosen on MI355X with the AITER ASM FP4
+# GEMM as the stock path; re-measure when that path changes.
+_DEFAULT_ROWS = {1: (8, 4), 2: (8, 8)}
 
 
 def enabled() -> bool:
@@ -216,6 +222,38 @@ def _k1_state_unsupported(model, pool, tp: int) -> str | None:
     return None
 
 
+def row_caps(tp: int) -> tuple[int, int]:
+    """K1's and K2's widest step at TP ``tp``: ``_DEFAULT_ROWS`` unless
+    ``SGLANG_QWEN3_8_DENSE_MONO_K1_MAX_ROWS`` / ``_K2_MAX_ROWS`` is set, clamped
+    to the kernels' builds (8 rows at TP1, 16 at TP2)."""
+    from sglang.kernels.ops.moe.qwen3_5_mono_flydsl import dense_ffn as D
+
+    top = D.max_tokens(tp)
+    caps = []
+    for env, default in zip(
+        (
+            envs.SGLANG_QWEN3_8_DENSE_MONO_K1_MAX_ROWS,
+            envs.SGLANG_QWEN3_8_DENSE_MONO_K2_MAX_ROWS,
+        ),
+        _DEFAULT_ROWS[tp],
+    ):
+        cap = env.get()
+        if cap is None:
+            cap = default
+        elif not 1 <= cap <= top:
+            logger.warning(
+                "%s=%d: not in 1..%d at TP%d, using %d",
+                env.name,
+                cap,
+                top,
+                tp,
+                min(max(cap, 1), top),
+            )
+            cap = min(max(cap, 1), top)
+        caps.append(cap)
+    return caps[0], caps[1]
+
+
 def stock_gdn_decode(layer, h, residual, conv_state, ssm_state, idx):
     """The stock decode path of a GDN layer from its input to out_proj's input
     (as ``Qwen3_5GatedDeltaNet.forward`` + the Triton GDN backend run it on
@@ -289,7 +327,7 @@ class DenseMono:
         # TP2: K2 in each layer's mlp
         self.k2 = not self.whole_step and envs.SGLANG_QWEN3_8_DENSE_MONO_K2.get()
         # the widest step K1 / K2 take
-        self.k1_rows, self.k2_rows = self._row_caps()
+        self.k1_rows, self.k2_rows = row_caps(self.tp)
         # out_proj / o_proj return their input while a mono step traces the layers
         self._skip_o = False
         # TP2: whether the step being run (or captured) takes K1 in linear_attn
@@ -303,6 +341,12 @@ class DenseMono:
         if not self.ok:
             logger.info("Qwen3.8 dense mono off: %s", why)
             return
+        logger.info(
+            "Qwen3.8 dense mono row caps at TP%d: K1 %d, K2 %d",
+            self.tp,
+            self.k1_rows,
+            self.k2_rows,
+        )
         dev = model.embed_tokens.weight.device
         self.scratch = None
         if self.whole_step or self.k2:
@@ -328,27 +372,6 @@ class DenseMono:
                 dtype=torch.uint8,
                 device=dev,
             )
-
-    def _row_caps(self) -> tuple[int, int]:
-        """K1's and K2's widest step: 8 at TP1, the env caps (1..16) at TP2."""
-        from sglang.kernels.ops.moe.qwen3_5_mono_flydsl import dense_ffn as D
-
-        if self.whole_step:
-            return D.MAX_TOKENS, D.MAX_TOKENS
-        top = D.max_tokens(self.tp)
-        caps = []
-        for env in (
-            envs.SGLANG_QWEN3_8_DENSE_MONO_K1_MAX_ROWS,
-            envs.SGLANG_QWEN3_8_DENSE_MONO_K2_MAX_ROWS,
-        ):
-            cap = env.get()
-            if not 1 <= cap <= top:
-                cap = min(max(cap, 1), top)
-                logger.warning(
-                    "%s=%d: not in 1..%d, using %d", env.name, env.get(), top, cap
-                )
-            caps.append(cap)
-        return caps[0], caps[1]
 
     def _k1_key(self, dense_gdn, s: int, *, first: bool, eps=1e-6, norm_eps=1e-6):
         """K1's build at width ``s``: at TP2 from the stock norm's output."""
@@ -688,23 +711,25 @@ class DenseMono:
             self._logged.add(s)
             logger.info("Qwen3.8 dense mono step at width %d", s)
         self.epoch.add_(1)
-        self._skip_o = self.oproj
+        k2 = s <= self.k2_rows
+        self._skip_o = self.oproj and k2
         try:
-            h, residual = self._layers(h, positions, forward_batch)
+            h, residual = self._layers(h, positions, forward_batch, k2)
         finally:
             self._skip_o = False
         h, _ = model.norm(h, residual)
         return h
 
-    def _layers(self, h, positions, forward_batch):
+    def _layers(self, h, positions, forward_batch, k2):
         residual = None
-        if self.k1:
+        k1 = self.k1 and h.size(0) <= self.k1_rows
+        if k1:
             from sglang.srt.model_executor.forward_context import get_attn_backend
 
             lab = get_attn_backend().linear_attn_backend
             idx = lab.forward_metadata.mamba_cache_indices
         for i, layer in enumerate(self.model.layers):
-            if self.k1 and _is_gdn(layer):
+            if k1 and _is_gdn(layer):
                 a = layer.linear_attn
                 st = lab.req_to_token_pool.mamba2_layer_cache(a.layer_id)
                 core, res, _ = self._k1(
@@ -714,7 +739,9 @@ class DenseMono:
                 lab._track_mamba_state_decode(
                     forward_batch, st.conv[0], st.temporal, idx, a.layer_id
                 )
-                h, residual = self._ffn(i, layer, core, res)
+                if not k2:
+                    core, _ = a.out_proj(core)
+                h, residual = self._tail(i, layer, core, res, k2)
                 continue
             if residual is None:
                 res = h
@@ -727,8 +754,16 @@ class DenseMono:
                 a = layer.self_attention(
                     positions=positions, hidden_states=x, forward_batch=forward_batch
                 )
-            h, residual = self._ffn(i, layer, a.contiguous(), res.contiguous())
+            h, residual = self._tail(i, layer, a.contiguous(), res.contiguous(), k2)
         return h, residual
+
+    def _tail(self, i, layer, h, residual, k2):
+        """The layer after its mixer: K2 (with o_proj folded in, ``h`` the
+        mixer's core), or the stock post_attention_layernorm and MLP."""
+        if k2:
+            return self._ffn(i, layer, h, residual)
+        x, residual = layer.post_attention_layernorm(h, residual)
+        return layer.mlp(x), residual
 
     def _k1(self, i, layer, conv_state, ssm_state, idx, h, residual):
         """-> core, residual out, out_proj's output; at TP2 ``h`` is
