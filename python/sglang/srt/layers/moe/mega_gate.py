@@ -21,9 +21,7 @@ def should_use_mega_gate(moe, hidden_states, device_sm, dispatch_info) -> bool:
         not envs.SGLANG_OPT_DEEPGEMM_MEGA_GATE.get()
         or device_sm // 10 != 10
         or getattr(moe.config, "model_type", None) != "deepseek_v41"
-        # vLLM's Flash measurements favor the unfused router at <=16 rows.
-        # Keep the conservative threshold for target and draft expert counts.
-        or not 16 < hidden_states.shape[0] <= (1 << 20)
+        or not 0 < hidden_states.shape[0] <= (1 << 20)
         or hidden_states.dtype != torch.bfloat16
         or not hidden_states.is_contiguous()
         or getattr(moe.topk, "enable_waterfill", False)
@@ -38,6 +36,7 @@ def should_use_mega_gate(moe, hidden_states, device_sm, dispatch_info) -> bool:
         weight.dtype != torch.bfloat16
         or not weight.is_contiguous()
         or hidden != hidden_states.shape[1]
+        or hidden == 0
         or hidden % 256 != 0
         or not 0 < num_experts <= 512
         or num_experts % 4 != 0
@@ -46,7 +45,7 @@ def should_use_mega_gate(moe, hidden_states, device_sm, dispatch_info) -> bool:
         return False
     for bias in (
         moe.gate.e_score_correction_bias,
-        moe.gate.e_score_correction_bias_vl,
+        moe.gate.e_score_correction_bias_vl if not moe.is_hash else None,
     ):
         if bias is not None and (
             bias.dtype != torch.float32 or not bias.is_contiguous()
@@ -56,7 +55,6 @@ def should_use_mega_gate(moe, hidden_states, device_sm, dispatch_info) -> bool:
         "lp",
         "fake",
     ):
-        # Preserve the LP solver's collectives and fake routing's logit override.
         return False
     if moe.is_hash:
         if moe.topk.score_func != "sqrtsoftplus":
@@ -66,7 +64,8 @@ def should_use_mega_gate(moe, hidden_states, device_sm, dispatch_info) -> bool:
         if (
             config.scoring_func != "sqrtsoftplus"
             or not config.renormalize
-            or config.top_k <= 1
+            # vision_topk leaves top-k=1 weights unnormalized.
+            or (config.top_k == 1 and moe.gate.e_score_correction_bias_vl is not None)
             or config.use_grouped_topk
             or config.custom_routing_function is not None
             or config.torch_native
@@ -98,10 +97,9 @@ def run_mega_gate(moe, hidden_states, input_ids, num_token_non_padded, dispatch_
     image_mask = None
     image_bias = None
     if moe.is_hash:
-        # Match HashTopK: image IDs still select their checkpoint hash routes.
-        # Padding IDs may be outside the vocabulary, so sanitize before lookup.
         if input_ids is None:
             raise ValueError("DeepSeek-V4.1 hash routing requires input_ids.")
+        # Padded IDs may be outside the vocabulary.
         safe_ids = (
             torch.where(valid_mask, input_ids, 0)
             if valid_mask is not None
@@ -143,8 +141,7 @@ def run_mega_gate(moe, hidden_states, input_ids, num_token_non_padded, dispatch_
             [weights, weights.new_full((num_tokens, num_shared), shared_weight)], dim=-1
         )
 
-    # MegaGate emits logical routed IDs. Reuse SGLang's EPLB, capture and
-    # home-rank shared-slot mapping; only the expert count is needed from logits.
+    # Postprocessing needs the expert count, not the logits.
     logits_shape = hidden_states.new_empty((0, moe.gate.weight.shape[0]))
     ids, weights, recorder_ids = _post_process_topk_ids(
         ids,
@@ -158,8 +155,7 @@ def run_mega_gate(moe, hidden_states, input_ids, num_token_non_padded, dispatch_
     )
     if num_shared and config.apply_routed_scaling_factor_on_output:
         weights[:, -num_shared:] = 1.0
-    # Shared-slot remapping may overwrite weights in padded rows. Mask last,
-    # before recording, including when every row on this DP rank is padding.
+    # Shared-slot remapping can overwrite padded weights.
     if num_token_non_padded is not None:
         _mask_topk_ids_padded_region(ids, num_token_non_padded)
         _zero_topk_weights_padded_region(weights, num_token_non_padded)

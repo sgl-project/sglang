@@ -28,16 +28,11 @@ def bf16_mega_gate(
     valid_token_mask: Optional[torch.Tensor] = None,
     hash_topk_ids: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return normalized sqrtsoftplus weights and logical routed expert IDs.
-
-    Shared-slot insertion, EPLB mapping and recording belong to the runtime.
-    Outputs are PyTorch-owned, including during CUDA graph capture. The pinned
-    DeepGEMM build checks every GEMM score for finiteness before applying its
-    token mask, so clear padded input rows without changing the caller's tensor.
-    """
+    """Return normalized sqrtsoftplus weights and logical routed expert IDs."""
     import deep_gemm
 
     if valid_token_mask is not None:
+        # DeepGEMM checks score finiteness before masking padded rows.
         hidden_states = torch.where(valid_token_mask[:, None], hidden_states, 0)
 
     ids = torch.empty(

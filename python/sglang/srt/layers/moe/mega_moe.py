@@ -270,8 +270,6 @@ def _run_mega_routed(
         if should_use_mega_gate(moe, hidden_states, _device_sm, dispatch_info):
             import deep_gemm
 
-            # Keep MegaGate under the same SM budget as MegaMoE when the
-            # alternate stream overlaps with shared-expert work.
             with _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
                 topk_weights, topk_ids = run_mega_gate(
                     moe,

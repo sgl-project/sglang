@@ -9,7 +9,7 @@ from sglang.kernels.ops.moe.mega_gate import bf16_mega_gate, is_mega_gate_availa
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=45, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 
 class TestMegaGate(CustomTestCase):
@@ -58,7 +58,7 @@ class TestMegaGate(CustomTestCase):
         torch.manual_seed(42)
         # Target Flash and reduced expert-count draft gates, at exact H=5120.
         for num_experts, top_k in ((384, 6), (128, 6)):
-            for tokens in (17, 32, 128, 512):
+            for tokens in (1, 2, 16, 17, 32, 128, 512):
                 for routing in ("text", "image", "hash"):
                     with self.subTest(
                         num_experts=num_experts, tokens=tokens, routing=routing

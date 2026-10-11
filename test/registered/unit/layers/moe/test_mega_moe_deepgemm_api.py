@@ -443,7 +443,6 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
 
     @staticmethod
     def _mega_gate_reference(x, weight, top_k, **kwargs):
-        """Numerical substitute at the external DeepGEMM boundary only."""
         if not torch.isfinite(x).all():
             raise ValueError("The pinned MegaGate rejects nonfinite GEMM inputs")
         scores = torch.log1p(torch.exp(x.float() @ weight.float().T)).sqrt()
@@ -492,30 +491,36 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
         return moe
 
     def test_mega_gate_preserves_vision_hash_shared_scaling_and_padding(self):
-        """A fused gate must preserve expert contributions across EP layouts.
-
-        Nonfinite padding and out-of-vocabulary padded IDs must reach the
-        expert boundary with zero weight; routed scaling must apply once and
-        the home-rank shared expert must contribute exactly one identity.
-        """
+        """Padding contributes zero; routed and shared scales apply once."""
         deep_gemm = self.deep_gemm
         deep_gemm.bf16_mega_gate = self._mega_gate_reference
         for is_hash in (False, True):
             for fused_shared in (0, 1):
                 for scale_in_topk in (False, True):
-                    for valid_rows in (0, 2, 32):
+                    for num_tokens, valid_rows in (
+                        (1, 0),
+                        (1, 1),
+                        (2, 1),
+                        (2, 2),
+                        (32, 0),
+                        (32, 2),
+                        (32, 32),
+                    ):
                         with self.subTest(
                             is_hash=is_hash,
                             fused_shared=fused_shared,
                             scale_in_topk=scale_in_topk,
+                            num_tokens=num_tokens,
                             valid_rows=valid_rows,
                         ):
                             moe = self._mega_gate_moe(
                                 fused_shared, scale_in_topk, is_hash
                             )
-                            hidden = torch.ones((32, 256), dtype=torch.bfloat16)
+                            hidden = torch.ones((num_tokens, 256), dtype=torch.bfloat16)
                             hidden[valid_rows:] = float("nan")
-                            input_ids = torch.tensor([7, 99] * 16)
+                            input_ids = torch.tensor([7, 99] * ((num_tokens + 1) // 2))[
+                                :num_tokens
+                            ]
                             input_ids[valid_rows:] = 1000
                             batch = SimpleNamespace(
                                 moe_num_token_non_padded=lambda: torch.tensor(
@@ -562,21 +567,19 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
                                 ),
                             ):
                                 out = mega_moe._run_mega_routed(
-                                    moe, hidden, batch, input_ids, num_tokens=32
+                                    moe, hidden, batch, input_ids, num_tokens=num_tokens
                                 )
                             image_value = 15.0 + 3 * fused_shared
                             text_value = image_value if is_hash else 3.0 + fused_shared
-                            expected = torch.tensor([text_value, image_value] * 16)
+                            expected = torch.tensor(
+                                [text_value, image_value] * ((num_tokens + 1) // 2)
+                            )[:num_tokens]
                             expected[valid_rows:] = 0.0
                             torch.testing.assert_close(out[:, 0], expected)
                             self.assertTrue(torch.isnan(hidden[valid_rows:]).all())
 
     def test_mega_gate_preserves_target_only_routed_experts_capture(self):
-        """Draft and hash routing must leave the target's capture buffer intact.
-
-        Reusing normal TopK postprocessing for HashTopK otherwise opts hash
-        layers into capture even though HashTopK never writes this buffer.
-        """
+        """Draft and hash routing leave the target's capture buffer intact."""
         deep_gemm = ModuleType("deep_gemm")
         deep_gemm.bf16_mega_gate = self._mega_gate_reference
         hidden = torch.ones((32, 256), dtype=torch.bfloat16)
@@ -622,14 +625,43 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
             self.assertTrue(
                 mega_gate_runtime.should_use_mega_gate(moe, hidden, 100, None)
             )
-            for tokens in (0, 1, 16):
-                self.assertFalse(
+            self.assertFalse(
+                mega_gate_runtime.should_use_mega_gate(moe, hidden[:0], 100, None)
+            )
+            for tokens in (1, 2, 16, 17):
+                self.assertTrue(
                     mega_gate_runtime.should_use_mega_gate(
-                        moe, hidden[:tokens], 100, None
+                        moe, hidden[:tokens], 103, None
                     )
                 )
+            with (
+                patch.object(moe.config, "num_experts_per_tok", 1),
+                patch.object(moe.topk.topk_config, "top_k", 1),
+            ):
+                self.assertFalse(
+                    mega_gate_runtime.should_use_mega_gate(moe, hidden, 100, None)
+                )
+                with patch.object(moe.gate, "e_score_correction_bias_vl", None):
+                    self.assertTrue(
+                        mega_gate_runtime.should_use_mega_gate(moe, hidden, 100, None)
+                    )
+                    with (
+                        get_parallel().override(moe_ep_rank=0),
+                        patch.object(topk_module, "_is_cuda", True),
+                    ):
+                        weights, ids = mega_gate_runtime.run_mega_gate(
+                            moe, hidden, None, None, None
+                        )
+                    torch.testing.assert_close(weights, torch.ones((32, 1)))
+                    torch.testing.assert_close(
+                        ids, torch.zeros((32, 1), dtype=torch.int64)
+                    )
+            hash_moe = self._mega_gate_moe(0, False, hash_routing=True)
+            hash_moe.gate.e_score_correction_bias_vl = torch.zeros(
+                8, dtype=torch.bfloat16
+            )
             self.assertTrue(
-                mega_gate_runtime.should_use_mega_gate(moe, hidden[:17], 103, None)
+                mega_gate_runtime.should_use_mega_gate(hash_moe, hidden, 100, None)
             )
             for sm in (90, 120):
                 self.assertFalse(
