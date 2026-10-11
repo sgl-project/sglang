@@ -8,6 +8,7 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionImpl,
     AttentionMetadata,
     AttentionMetadataBuilder,
+    trailing_padding_used_len,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
@@ -45,7 +46,9 @@ class AITERSageImpl(AttentionImpl):
         dropout_p: float = 0.0,
         **extra_impl_args,
     ) -> None:
-
+        self.packed_trailing_padding = extra_impl_args.get(
+            "packed_trailing_padding", False
+        )
         try:
             from aiter.ops.triton.attention.fav3_sage import fav3_sage_wrapper_func
 
@@ -76,4 +79,45 @@ class AITERSageImpl(AttentionImpl):
         """
 
         output = self.aiter_sage_attn_fn(query, key, value)
+        return output
+
+    def forward_varlen(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+        cu_seqlens_host: tuple[int, ...] | None = None,
+    ) -> torch.Tensor:
+        """Packed varlen attention: [total_tokens, head_num, head_dim] in and out,
+        one kernel call per segment of ``cu_seqlens``."""
+        bounds = tuple(
+            cu_seqlens_host
+            if cu_seqlens_host is not None
+            else (int(x) for x in cu_seqlens.tolist())
+        )
+        # MiniMax-H3 packs one live document as bounds=(0, used, total):
+        # [0, used) are real tokens; [used, total) is 64-aligned tail padding.
+        if self.packed_trailing_padding:
+            used = trailing_padding_used_len(
+                total_tokens=query.shape[0], max_seqlen=max_seqlen, bounds=bounds
+            )
+            if used is not None:
+                bounds = (0, used)
+        if bounds == (0, query.shape[0]):
+            return self.forward(
+                query.unsqueeze(0), key.unsqueeze(0), value.unsqueeze(0)
+            )[0]
+        # Keep padded tail rows at zero so downstream masked rows stay inactive.
+        output = torch.zeros_like(query)
+        for start, stop in zip(bounds[:-1], bounds[1:]):
+            if start == stop:
+                continue
+            output[start:stop] = self.forward(
+                query[start:stop].unsqueeze(0),
+                key[start:stop].unsqueeze(0),
+                value[start:stop].unsqueeze(0),
+            )[0]
         return output
