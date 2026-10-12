@@ -503,7 +503,7 @@ class ElasticEPStateManager:
             operation = get_recovery_operation_for_slot(
                 topology.runtime_instance_id,
                 topology.topology_generation,
-                get_parallel().ep_join_rank_offset,
+                global_rank,
                 allocation_id,
             )
             if operation is None:
