@@ -105,9 +105,9 @@ class TestGLM53FlashB200HighThroughput(
     gsm8k_num_shots = 20
     server_args = [
         *COMMON_SERVER_ARGS,
-        "--enable-dp-attention",
-        "--dp-size",
+        "--attn-dp-size",
         "4",
+        "--mm-enable-dp-encoder",
     ]
 
 

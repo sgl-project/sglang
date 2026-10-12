@@ -4,6 +4,8 @@ import os
 import subprocess
 from functools import lru_cache
 
+from huggingface_hub.errors import GatedRepoError
+
 from sglang.srt.environ import envs
 from sglang.utils import (
     has_diffusion_overlay_registry_match,
@@ -43,15 +45,13 @@ def _is_diffusion_model_from_registry(model_path: str) -> bool:
 
 
 def _is_diffusers_model_dir(model_dir: str) -> bool:
-    """Check if a local directory contains a valid diffusers model_index.json."""
-    config_path = os.path.join(model_dir, "model_index.json")
-    if not os.path.exists(config_path):
-        return False
-
-    with open(config_path) as f:
-        config = json.load(f)
-
-    return "_diffusers_version" in config
+    """Check for a standard or modular Diffusers pipeline index."""
+    for filename in ("model_index.json", "modular_model_index.json"):
+        config_path = os.path.join(model_dir, filename)
+        if os.path.isfile(config_path):
+            with open(config_path) as f:
+                return "_diffusers_version" in json.load(f)
+    return False
 
 
 def _is_gated_diffusion_repo(repo_id: str) -> bool:
@@ -71,7 +71,7 @@ def get_is_diffusion_model(model_path: str) -> bool:
     For registered models, consults the diffusion registry first.
     For other local directories, checks the filesystem directly.
     For other HF/ModelScope model IDs, attempts to fetch only model_index.json.
-    For gated repos where file download fails, falls back to HF model card
+    For gated HF repos where file download fails, falls back to HF model card
     metadata (library_name == "diffusers").
     Returns False on any failure (network error, 404, offline mode, etc.)
     so that the caller falls through to the standard LLM server path.
@@ -88,8 +88,10 @@ def get_is_diffusion_model(model_path: str) -> bool:
     if os.path.isdir(model_path):
         return _is_diffusers_model_dir(model_path)
 
+    use_modelscope = envs.SGLANG_USE_MODELSCOPE.get()
+
     try:
-        if envs.SGLANG_USE_MODELSCOPE.get():
+        if use_modelscope:
             from modelscope import model_file_download
 
             file_path = model_file_download(
@@ -103,6 +105,8 @@ def get_is_diffusion_model(model_path: str) -> bool:
         return _is_diffusers_model_dir(os.path.dirname(file_path))
     except Exception as e:
         logger.debug("Failed to auto-detect diffusion model for %s: %s", model_path, e)
+        if not use_modelscope and isinstance(e, GatedRepoError):
+            return _is_gated_diffusion_repo(model_path)
         return False
 
 

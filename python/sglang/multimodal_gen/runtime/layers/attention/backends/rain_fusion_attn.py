@@ -57,12 +57,6 @@ class RainFusionAttentionMetadata(AttentionMetadata):
 
 
 class RainFusionAttentionMetadataBuilder(AttentionMetadataBuilder):
-    def __init__(self) -> None:
-        pass
-
-    def prepare(self) -> None:
-        pass
-
     def build(
         self,
         current_timestep: int,

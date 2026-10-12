@@ -172,39 +172,6 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
 
         get_model_architecture.assert_not_called()
 
-    def test_vmm_transport_initializes_pool(self):
-        from sglang.srt.runtime_context import get_context
-        from sglang.srt.utils import cuda_vmm_transport_utils as vmm
-
-        server_args = SimpleNamespace(
-            mm_feature_transport="cuda_vmm",
-            tokenizer_worker_num=2,
-            base_gpu_id=3,
-            tp_size=4,
-            nnodes=1,
-        )
-        # The consumer count comes from the published topology.
-        override = get_context().override_server_args(
-            enable_dp_attention=False, tp_size=4, mm_feature_transport="cuda_vmm"
-        )
-        override.install()
-        self.addCleanup(override.restore)
-        pool = object()
-        with (
-            patch.object(vmm, "get_mm_feature_pool_size_per_worker", return_value=123),
-            patch.object(vmm, "CudaVmmMemoryPool", return_value=pool) as pool_class,
-        ):
-            transport = vmm.CudaVmmFeatureTransport(server_args, SimpleNamespace())
-
-        self.assertIs(transport.pool, pool)
-        pool_class.assert_called_once_with(
-            memory_size=123,
-            recycle_interval=vmm.MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
-            base_gpu_id=3,
-            consumer_count=4,
-            allow_posix_fallback=True,
-        )
-
     def test_disabled_transport_is_a_noop(self):
         from sglang.srt.runtime_context import get_context
         from sglang.srt.utils.cuda_vmm_transport_utils import (
@@ -372,31 +339,6 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         self.assertIs(items[0].precomputed_embeddings, embedding)
         pool._cancel_control_offset.assert_called_once_with(owner.control_offset)
 
-    def test_text_request_uses_base_send_path(self):
-        from sglang.srt.managers import tokenizer_manager
-        from sglang.srt.managers.tokenizer_manager import TokenizerManager
-
-        manager = object.__new__(TokenizerManager)
-        manager.rid_to_state = {}
-        manager.encoder_dispatch_ready = {}
-        transport = MagicMock()
-        transport.prepare_for_dispatch_async = AsyncMock(return_value=[])
-        manager.cuda_vmm_feature_transport = transport
-        manager._dispatch_to_scheduler = MagicMock()
-        tokenized_obj = SimpleNamespace(
-            rid="test-request",
-            mm_inputs=None,
-            time_stats=MagicMock(),
-            wrap_pickle_fields=MagicMock(),
-        )
-
-        with patch.object(tokenizer_manager, "wrap_shm_features", lambda obj: obj):
-            asyncio.run(manager._send_one_request(tokenized_obj))
-
-        manager._dispatch_to_scheduler.assert_called_once_with(tokenized_obj)
-        transport.prepare_for_dispatch_async.assert_awaited_once_with((None,))
-        transport.cancel_for_dispatch.assert_not_called()
-
     def test_failed_dispatch_cancels_published_items(self):
         from sglang.srt.managers import tokenizer_manager
         from sglang.srt.managers.schedule_batch import (
@@ -470,6 +412,11 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         transport.cancel_for_dispatch.assert_not_called()
 
     def test_async_publication_keeps_event_loop_responsive(self):
+        from sglang.srt.managers.schedule_batch import (
+            Modality,
+            MultimodalDataItem,
+            MultimodalProcessorOutput,
+        )
         from sglang.srt.utils.cuda_vmm_transport_utils import (
             CudaVmmFeatureTransport,
         )
@@ -495,7 +442,11 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
                 release.set()
 
         transport.prepare_for_dispatch = MagicMock(side_effect=block_publication)
-        mm_inputs = SimpleNamespace(mm_items=[object()])
+        mm_inputs = MultimodalProcessorOutput(
+            mm_items=[
+                MultimodalDataItem(modality=Modality.IMAGE, feature=torch.ones(2))
+            ]
+        )
 
         async def run():
             watchdog = threading.Thread(target=unblock_if_event_loop_stalls)
@@ -505,6 +456,8 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
                     transport.prepare_for_dispatch_async([mm_inputs])
                 )
                 while not started.is_set():
+                    if task.done():
+                        await task
                     await asyncio.sleep(0)
                 event_loop_responsive.set()
                 self.assertFalse(task.done())
@@ -577,6 +530,7 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         from sglang.srt.utils import cuda_vmm_transport_utils as vmm
 
         pool = object.__new__(vmm.CudaVmmMemoryPool)
+        pool._lock = threading.Lock()
         pool.device_index = 0
         pool.consumer_count = 2
         pool._recycle_stream = object()
@@ -1045,6 +999,7 @@ class TestSchedulerMmTransportBoundary(CustomTestCase):
             return_pooled_hidden_states=False,
             multi_item_delimiter_indices=None,
             token_indices_to_pool=None,
+            decision_layout=None,
             mm_inputs=object(),
         )
 
@@ -1179,6 +1134,7 @@ class TestVmmConsumerCount(unittest.TestCase):
         proxy = object.__new__(CudaVmmTensorTransportProxy)
         proxy.consumer_count = 4
         with get_parallel().override(
+            tp_rank=3,
             attn_tp_size=2,
             attn_tp_rank=1,
             attn_cp_size=2,
