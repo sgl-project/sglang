@@ -139,6 +139,8 @@ message GenerateRequest {
   repeated string image_data = 19;
   repeated string video_data = 20;
   repeated string audio_data = 21;
+  // Hex hashes, one per image_data entry; see GenerateReqInput.mm_hashes.
+  repeated string mm_hashes = 22;
 }
 
 // Versioned KV-hint envelope forwarded from a trusted orchestrator.
