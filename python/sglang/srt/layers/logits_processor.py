@@ -30,7 +30,6 @@ from sglang.kernels.ops.activation.softcap import (
     softcap_to_float32_logits,
 )
 from sglang.srt.beam_search.logits_capture import BeamLogitsCapture
-from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
 from sglang.srt.environ import envs
 from sglang.srt.layers import layernorm_sp
@@ -209,30 +208,6 @@ def autotune_dummy_run_mode(*, run_lm_head: bool):
         yield
     finally:
         _autotune_run_lm_head = None
-
-
-def gather_and_crop_vocab(
-    local_logits: torch.Tensor, lm_head: nn.Module
-) -> torch.Tensor:
-    full_logits = tensor_model_parallel_all_gather(local_logits, dim=-1)
-    return full_logits[..., : int(lm_head.org_vocab_size)]
-
-
-def project_through_lm_head(hidden: torch.Tensor, lm_head: nn.Module) -> torch.Tensor:
-    """Project draft hidden states through the target head; a quantized head
-    stores `weight` packed, so it needs its own kernel instead of a matmul."""
-    quant_method = lm_head.quant_method
-    if should_apply_lm_head_quant_method(lm_head, quant_method):
-        return quant_method.apply(lm_head, hidden, None)
-    weight = lm_head.weight
-    return torch.matmul(hidden.to(weight.dtype), weight.T)
-
-
-def lm_head_logits_dtype(lm_head: nn.Module, hidden_dtype: torch.dtype) -> torch.dtype:
-    """The dtype ``project_through_lm_head`` returns for hidden of ``hidden_dtype``."""
-    if should_apply_lm_head_quant_method(lm_head, lm_head.quant_method):
-        return hidden_dtype
-    return lm_head.weight.dtype
 
 
 @dataclasses.dataclass

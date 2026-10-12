@@ -157,7 +157,6 @@ class TestDraftMarkovBlockGraph(CustomTestCase):
             sample_from_anchor=sample_from_anchor,
             lm_head=SimpleNamespace(org_vocab_size=VOCAB, weight=weight),
             compute_base_logits=lambda hidden: (hidden @ weight.T, hidden),
-            base_logits_dtype=torch.bfloat16,
         )
         model.compute_confidence = MethodType(
             DSparkDraftMixin.compute_confidence, model

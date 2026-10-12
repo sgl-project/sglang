@@ -11,7 +11,6 @@ from sglang.srt.speculative.dspark_components.dspark_draft import (
     DraftProposalTensors,
     resolve_draft_params,
     run_draft_proposal,
-    step_logits_width,
 )
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync
 
@@ -71,17 +70,9 @@ class DraftProposalGraphTail:
                 (self.max_bs,), dtype=torch.float32, device=device
             ),
         )
-        # [max_bs, gamma, vocab] step logits for the sampling accept; a greedy
-        # draft keeps none.
-        self.step_logits = (
-            None
-            if greedy_draft
-            else torch.empty(
-                (self.max_bs, self.gamma, _step_logits_width(model)),
-                dtype=model.markov_head.step_logits_dtype(model.base_logits_dtype),
-                device=device,
-            )
-        )
+        # [max_bs, gamma, vocab] step logits for the sampling accept, sized on
+        # the first call; a greedy draft keeps none.
+        self.step_logits: Optional[torch.Tensor] = None
 
     def stage_sampling_params(self, *, bs: int, sampling_info) -> None:
         """Must run before the draft graph replay that reads these buffers."""
@@ -89,7 +80,11 @@ class DraftProposalGraphTail:
 
     def __call__(self, hidden_states, input_ids):
         bs = hidden_states.shape[0] // self.query_token_num
-        run_draft_proposal(
+        first_call = self.step_logits is None and not self.greedy_draft
+        if first_call:
+            # The runner's warmup calls the tail eagerly before capture.
+            assert not torch.cuda.is_current_stream_capturing()
+        proposal = run_draft_proposal(
             model=self.model,
             hidden_states=hidden_states,
             anchor_tokens=input_ids.view(bs, self.query_token_num)[:, 0],
@@ -103,11 +98,13 @@ class DraftProposalGraphTail:
                 self.out, self.step_logits, self.confidence_out, self.confidence_raw_out
             ),
         )
-
-
-def _step_logits_width(model) -> int:
-    # Unsharded base logits span the cropped vocab.
-    return step_logits_width(model.markov_head, int(model.lm_head.org_vocab_size))
+        if first_call:
+            # Take the shape and dtype of the step logits the proposal allocated.
+            step_logits = proposal.step_logits
+            self.step_logits = step_logits.new_empty(
+                (self.max_bs, *step_logits.shape[1:])
+            )
+            self.step_logits[:bs].copy_(step_logits)
 
 
 def maybe_build_proposal_graph_tail(

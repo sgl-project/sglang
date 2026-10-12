@@ -9,13 +9,10 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
 from sglang.srt.environ import envs
 from sglang.srt.layers.linear import ReplicatedLinear
-from sglang.srt.layers.logits_processor import (
-    gather_and_crop_vocab,
-    lm_head_logits_dtype,
-    project_through_lm_head,
-)
+from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dflash import DFlashDraftModel
@@ -39,6 +36,23 @@ logger = logging.getLogger(__name__)
 _CONFIDENCE = Invariant(
     "dspark.model.confidence", Bucket.GUARD, InClosedRange(0.0, 1.0)
 )
+
+
+def gather_and_crop_vocab(
+    local_logits: torch.Tensor, lm_head: nn.Module
+) -> torch.Tensor:
+    full_logits = tensor_model_parallel_all_gather(local_logits, dim=-1)
+    return full_logits[..., : int(lm_head.org_vocab_size)]
+
+
+def project_through_lm_head(hidden: torch.Tensor, lm_head: nn.Module) -> torch.Tensor:
+    """Project draft hidden states through the target head; a quantized head
+    stores `weight` packed, so it needs its own kernel instead of a matmul."""
+    quant_method = lm_head.quant_method
+    if should_apply_lm_head_quant_method(lm_head, quant_method):
+        return quant_method.apply(lm_head, hidden, None)
+    weight = lm_head.weight
+    return torch.matmul(hidden.to(weight.dtype), weight.T)
 
 
 class VocabShard(msgspec.Struct, frozen=True):
@@ -433,13 +447,6 @@ class DSparkDraftMixin:
         local_logits = project_through_lm_head(hidden, self.lm_head)
         base_logits = gather_and_crop_vocab(local_logits, self.lm_head)
         return base_logits, confidence_features
-
-    @property
-    def base_logits_dtype(self) -> torch.dtype:
-        """The dtype of the logits ``compute_base_logits`` returns."""
-        # A quantized head emits the draft's dtype.
-        draft_dtype = next(self.markov_head.parameters()).dtype
-        return lm_head_logits_dtype(self.lm_head, draft_dtype)
 
     def compute_confidence(
         self,

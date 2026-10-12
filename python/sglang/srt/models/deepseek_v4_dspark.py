@@ -19,12 +19,7 @@ from sglang.srt.distributed.device_communicators.vocab_gather import make_vocab_
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.logits_processor import (
-    LogitsProcessorOutput,
-    gather_and_crop_vocab,
-    lm_head_logits_dtype,
-    project_through_lm_head,
-)
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.utils import is_shared_experts_fusion_disabled
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -53,6 +48,8 @@ from sglang.srt.models.dspark import (
     BaseDSparkMarkovHead,
     DSparkConfidenceHead,
     VocabShard,
+    gather_and_crop_vocab,
+    project_through_lm_head,
 )
 from sglang.srt.runtime_context import (
     get_parallel,
@@ -984,25 +981,14 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             )
         last = self.stages[-1]
         x = last.norm(x_post_hc)
-        if self._fp32_lm_head():
-            local_logits = F.linear(x.float(), self.lm_head.weight.float())
+        weight = self.lm_head.weight
+        if self._use_fp32_lm_head and weight.is_floating_point():
+            local_logits = F.linear(x.float(), weight.float())
         else:
             local_logits = project_through_lm_head(x, self.lm_head)
         if self._opt_markov_w2_tp_shard:
             return local_logits
         return gather_and_crop_vocab(local_logits, self.lm_head)
-
-    def _fp32_lm_head(self) -> bool:
-        return self._use_fp32_lm_head and self.lm_head.weight.is_floating_point()
-
-    @property
-    def base_logits_dtype(self) -> torch.dtype:
-        """The dtype of the logits ``compute_base_logits`` returns."""
-        if self._fp32_lm_head():
-            return torch.float32
-        # A quantized head emits the draft's dtype.
-        draft_dtype = next(self.markov_head.parameters()).dtype
-        return lm_head_logits_dtype(self.lm_head, draft_dtype)
 
     def compute_confidence(
         self,
