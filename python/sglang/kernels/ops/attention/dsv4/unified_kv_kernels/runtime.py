@@ -282,6 +282,60 @@ def _decode_fp8_tail_splits(T: int, compress_ratio: Optional[int]) -> int:
     return max(1, min(_DECODE_SPLIT_TAIL_VALUE, _cu_count() // T))
 
 
+@lru_cache(maxsize=1)
+def _flydsl_v4_decode():
+    """aiter.ops.flydsl when it ships the FlyDSL v4 nm decode, else None."""
+    from sglang.srt.environ import envs
+
+    if not envs.SGLANG_DSV4_FLYDSL_DECODE.get():
+        return None
+    try:
+        from aiter.ops import flydsl as fly
+
+        fly.flydsl_mla_v4_decode_supported  # resolves the lazy import
+    except (ImportError, AttributeError):
+        return None
+    return fly
+
+
+def flydsl_decode_supported(
+    num_heads: int, max_seqlen_q: int = 1, grouped: bool = False
+) -> bool:
+    fly = _flydsl_v4_decode()
+    return fly is not None and fly.flydsl_mla_v4_decode_supported(
+        num_heads, max_seqlen_q, grouped
+    )
+
+
+def _stream_hint(compress_ratio: Optional[int]) -> Optional[str]:
+    # FlyDSL split plans are keyed by stream kind
+    if compress_ratio is None:
+        return None
+    return {0: "swa", 4: "csa", 128: "hca"}[compress_ratio]
+
+
+def flydsl_grouped_verify_pays(
+    num_heads: int, num_draft: int, num_reqs: int, compress_ratio: int, epi: str
+) -> bool:
+    """aiter's measured policy: whether target verify should read one shared
+    stream per request on this layer kind, for output mode ``epi``."""
+    return flydsl_decode_supported(
+        num_heads, num_draft, grouped=True
+    ) and _flydsl_v4_decode().flydsl_mla_v4_grouped_pays(
+        num_heads, num_draft, num_reqs, hint=_stream_hint(compress_ratio), epi=epi
+    )
+
+
+def build_grouped_verify_streams(
+    state_slot: torch.Tensor, positions: torch.Tensor, *args, **kwargs
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """(kv_indices, kv_indptr, qo_indptr, q_kv_bounds): one stream per request,
+    with per-draft key ranges equal to each draft's per-token stream."""
+    return _flydsl_v4_decode().flydsl_mla_v4_grouped_verify_meta(
+        state_slot.contiguous(), positions.contiguous(), *args, **kwargs
+    )
+
+
 def decode_fp8_2buff(
     *,
     q: torch.Tensor,  # [T, H, nope_row_bytes] fp8 packed nope + inline e8m0 scale
@@ -296,8 +350,10 @@ def decode_fp8_2buff(
     max_seqlen_q: int = 1,
     num_kv_splits: Optional[int] = None,
     compress_ratio: Optional[int] = None,
+    q_kv_bounds: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Decode over the two-pool fp8 unified_kv, through aiter's v4 nm asm kernel.
+    """Decode over the two-pool fp8 unified_kv, through aiter's FlyDSL v4 nm
+    decode (split merge in the same launch) where available, else the asm kernel.
 
     Q arrives in the same packed form as the pool rows (nope fp8 + duplicated
     e8m0 tile scales) with its rope half beside it in bf16, which is why this
@@ -314,6 +370,9 @@ def decode_fp8_2buff(
 
     ``max_seqlen_q`` above 1 puts several q rows in one tile, which the v4
     dispatcher serves for gqa=16 at 1, 2 and 4 off the same 64-row tile.
+
+    ``q_kv_bounds`` (FlyDSL only): the grouped verify streams of
+    ``build_grouped_verify_streams``.
     """
     from aiter.mla import mla_decode_fwd_v4_nm
 
@@ -350,15 +409,23 @@ def decode_fp8_2buff(
 
     rows = unified_kv.shape[0]
     out = q_rope.new_empty((n_seq * max_seqlen_q, H, v_head_dim))
-    # Left None, the wrapper's occupancy heuristic picks it, folds the cross-split
-    # merge back into `out`, and leaves the final bf16 there whether or not it
-    # split. Pinning it to 1 costs 6.9x at bs=1 kv=2048.
-    # Sequences, not tokens: the wave-fitting rule counts the workgroups the
-    # kernel launches, which is n_seq x splits. They are the same number on the
-    # per-token path and differ once q rows share a tile.
-    if num_kv_splits is None and n_seq > _DECODE_SPLIT_TAIL_MIN_TOKENS:
-        num_kv_splits = _decode_fp8_tail_splits(n_seq, compress_ratio)
-    mla_decode_fwd_v4_nm(
+    # FlyDSL is a drop-in for the asm kernel: its own capture-safe split plan,
+    # split merge in the same launch
+    if flydsl_decode_supported(H, max_seqlen_q, q_kv_bounds is not None):
+        decode_fwd = _flydsl_v4_decode().flydsl_mla_decode_fwd_v4_nm
+        kwargs = dict(hint=_stream_hint(compress_ratio), q_kv_bounds=q_kv_bounds)
+    else:
+        assert q_kv_bounds is None, "grouped verify streams need FlyDSL"
+        # Left None, the wrapper's occupancy heuristic picks it, folds the
+        # cross-split merge back into `out`, and leaves the final bf16 there
+        # whether or not it split. Pinning it to 1 costs 6.9x at bs=1 kv=2048.
+        # Sequences, not tokens: the wave-fitting rule counts the workgroups the
+        # kernel launches, which is n_seq x splits. They are the same number on
+        # the per-token path and differ once q rows share a tile.
+        if num_kv_splits is None and n_seq > _DECODE_SPLIT_TAIL_MIN_TOKENS:
+            num_kv_splits = _decode_fp8_tail_splits(n_seq, compress_ratio)
+        decode_fwd, kwargs = mla_decode_fwd_v4_nm, dict(num_kv_splits=num_kv_splits)
+    decode_fwd(
         q,
         q_rope,
         unified_kv.view(rows, 1, 1, row_bytes),
@@ -369,13 +436,48 @@ def decode_fp8_2buff(
         kv_indices,
         max_seqlen_q,
         sink=attn_sink,
-        num_kv_splits=num_kv_splits,
+        **kwargs,
     )
     # No empty-segment mask: a CG-padded row gets seq_len 1 on the ring slot
     # ReqToTokenPool reserves, so the builders can't emit a zero-length one, and
     # the compare + masked_fill_ was costing a launch per layer for it. One would
     # come back NaN now (all-sink denominator); the guard UT pins that.
     return out[:T]
+
+
+def decode_fp8_2buff_wo_a_mxfp8(
+    *,
+    q: torch.Tensor,  # [T, H, nope_row_bytes] fp8 packed nope + inline e8m0 scale
+    q_rope: torch.Tensor,  # [T, H, rope_dim] bf16
+    unified_kv: torch.Tensor,  # [rows, nope_row_bytes] fp8
+    unified_kv_rope: torch.Tensor,  # [rows, rope_dim] bf16
+    kv_indices: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    attn_sink: torch.Tensor,  # [H] fp32
+    positions: torch.Tensor,  # [T] int64
+    rope_freqs: torch.Tensor,  # [max_pos, rope_dim] fp32, view_as_real(freqs_cis)
+    compress_ratio: int,
+    qo_indptr: Optional[torch.Tensor] = None,
+    max_seqlen_q: int = 1,
+    q_kv_bounds: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """``decode_fp8_2buff`` + inverse RoPE + wo_a mxfp8 quant in one FlyDSL
+    launch. Returns the wo_a operands (fp8 [T, H*512], e8m0 [T, H*4])."""
+    return _flydsl_v4_decode().flydsl_mla_v4_decode_fused(
+        q,
+        q_rope,
+        unified_kv,
+        unified_kv_rope,
+        kv_indptr,
+        kv_indices,
+        attn_sink,
+        positions,
+        rope_freqs,
+        compress_ratio,
+        qo_indptr=qo_indptr,
+        max_seqlen_q=max_seqlen_q,
+        q_kv_bounds=q_kv_bounds,
+    )
 
 
 @triton.jit

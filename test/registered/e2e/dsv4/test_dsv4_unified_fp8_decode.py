@@ -1,4 +1,5 @@
-"""Decode read path over the two-pool fp8 unified_kv (aiter's v4 nm asm kernel).
+"""Decode read path over the two-pool fp8 unified_kv (aiter's v4 nm decode,
+FlyDSL or asm).
 
 What these pin is the reader-side plumbing, not the kernel's arithmetic: the
 packed 512 B nope row and the bf16 rope pool addressed by one shared row index,
@@ -13,18 +14,23 @@ The quantization helpers mirror aiter's own reference
 file is a test, not part of the aiter package.
 """
 
+import contextlib
+import itertools
 import unittest
+from unittest import mock
 
 import torch
 
+from sglang.kernels.ops.attention.dsv4 import fused_rope_inplace
 from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import runtime
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DSV4_FP8_NOPE_ROW_BYTES
+from sglang.srt.models.deepseek_common.amd import deepseek_v4_wo_a_fp8 as wo_a_fp8
 from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
 # the asm shader is only shipped for gfx950
-register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=180, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 DEVICE = torch.device("cuda")
 
@@ -142,23 +148,28 @@ class TestUnifiedFp8Decode(CustomTestCase):
         torch.manual_seed(7)
         self.rows = 256
 
-    def _run(self, lengths, num_heads):
+    def _run(self, lengths, num_heads, asm=False):
         T = len(lengths)
         pool_nope, pool_rope, kv_silver = _make_latent(self.rows)
         q_packed, q_rope, q_silver = _make_latent(T, num_heads)
         indices, indptr = _ragged(lengths, self.rows)
         sink = torch.randn(num_heads, device=DEVICE, dtype=torch.float32)
 
-        got = runtime.decode_fp8_2buff(
-            q=q_packed,
-            q_rope=q_rope,
-            unified_kv=pool_nope,
-            unified_kv_rope=pool_rope,
-            kv_indices=indices,
-            kv_indptr=indptr,
-            attn_sink=sink,
-            v_head_dim=V_HEAD_DIM,
-        )
+        with (
+            mock.patch.object(runtime, "_flydsl_v4_decode", lambda: None)
+            if asm
+            else contextlib.nullcontext()
+        ):
+            got = runtime.decode_fp8_2buff(
+                q=q_packed,
+                q_rope=q_rope,
+                unified_kv=pool_nope,
+                unified_kv_rope=pool_rope,
+                kv_indices=indices,
+                kv_indptr=indptr,
+                attn_sink=sink,
+                v_head_dim=V_HEAD_DIM,
+            )
         want = _reference(q_silver, kv_silver, indices, indptr, sink)
         return got.float(), want
 
@@ -186,9 +197,105 @@ class TestUnifiedFp8Decode(CustomTestCase):
                 self._assert_close(got, want)
 
     @_needs_gfx950
-    def test_head_count_64(self):
-        got, want = self._run([48, 96], num_heads=64)
-        self._assert_close(got, want)
+    def test_head_counts_both_backends(self):
+        for num_heads in (16, 32, 64, 128):
+            for asm in (False, True):
+                with self.subTest(num_heads=num_heads, asm=asm):
+                    got, want = self._run([48, 96, 1, 250], num_heads, asm=asm)
+                    self._assert_close(got, want)
+
+    @_needs_gfx950
+    @unittest.skipUnless(
+        runtime.flydsl_decode_supported(16, 7, grouped=True),
+        "aiter has no FlyDSL v4 decode",
+    )
+    def test_grouped_verify_streams_match_per_token(self):
+        """Each draft of a shared per-request stream matches its per-token
+        stream, incl. drafts straddling a c128 commit and short requests."""
+        win, ring = 128, 256
+        num_draft, reqs, rows = 7, 9, 8192
+        pool_nope, pool_rope, _ = _make_latent(rows)
+        swa_pages = reqs * ring
+        last = torch.tensor([6, 70, 127, 128, 133, 900, 3000, 4000, 262], device=DEVICE)
+        positions = (
+            last.repeat_interleave(num_draft)
+            - num_draft
+            + 1
+            + torch.arange(num_draft, device=DEVICE).repeat(reqs)
+        ).clamp_min(0)
+        state_slot = torch.arange(reqs, device=DEVICE).repeat_interleave(num_draft)
+        N = positions.numel()
+        width = 40
+        hca_len = torch.div(positions + 1, 128, rounding_mode="floor").to(torch.int32)
+        tail_rows = torch.randperm(rows - swa_pages, device=DEVICE)[: reqs * width]
+        tails = tail_rows.view(reqs, width).to(torch.int32)
+        hca_pages = tails.repeat_interleave(num_draft, dim=0).contiguous()
+        swa_len = torch.clamp(positions + 1, max=win).to(torch.int32)
+        zero = torch.zeros(N, dtype=torch.int32, device=DEVICE)
+        swa_i, swa_p, hca_i, hca_p, _, _ = runtime.build_decode_streams(
+            state_slot=state_slot.to(torch.int32),
+            positions=positions.to(torch.int32),
+            swa_len=swa_len,
+            hca_len=hca_len,
+            csa_len=zero,
+            hca_page_indices=hca_pages,
+            csa_width=0,
+            win=win,
+            ring_stride=ring,
+            swa_pages=swa_pages,
+        )
+        q_packed, q_rope, _ = _make_latent(N, 16)
+        sink = torch.randn(16, device=DEVICE, dtype=torch.float32)
+        angle = torch.rand(4096, ROPE_DIM // 2, device=DEVICE) * 6.28
+        freqs = torch.view_as_real(torch.polar(torch.ones_like(angle), angle)).flatten(
+            1
+        )
+        kw = dict(
+            q=q_packed,
+            q_rope=q_rope,
+            unified_kv=pool_nope,
+            unified_kv_rope=pool_rope,
+            attn_sink=sink,
+        )
+        for cr, tail, tok in (
+            (128, (hca_len, hca_pages), (hca_i, hca_p)),
+            (0, (None, None), (swa_i, swa_p)),
+        ):
+            g_idx, g_kvp, g_qop, bnd = runtime.build_grouped_verify_streams(
+                state_slot,
+                positions,
+                *tail,
+                num_draft=num_draft,
+                win=win,
+                ring_stride=ring,
+                swa_pages=swa_pages,
+            )
+            grp = dict(
+                kv_indices=g_idx,
+                kv_indptr=g_kvp,
+                qo_indptr=g_qop,
+                max_seqlen_q=num_draft,
+                q_kv_bounds=bnd,
+                compress_ratio=cr,
+            )
+            with self.subTest(compress_ratio=cr, mode="bf16"):
+                want = runtime.decode_fp8_2buff(
+                    **kw, kv_indices=tok[0], kv_indptr=tok[1], v_head_dim=V_HEAD_DIM
+                )
+                got = runtime.decode_fp8_2buff(**kw, **grp, v_head_dim=V_HEAD_DIM)
+                self._assert_close(got.float(), want.float(), atol=1e-2, rtol=1e-2)
+            with self.subTest(compress_ratio=cr, mode="fused"):
+                fused = dict(positions=positions.to(torch.int64), rope_freqs=freqs)
+                want = runtime.decode_fp8_2buff_wo_a_mxfp8(
+                    **kw,
+                    **fused,
+                    kv_indices=tok[0],
+                    kv_indptr=tok[1],
+                    compress_ratio=cr,
+                )
+                got = runtime.decode_fp8_2buff_wo_a_mxfp8(**kw, **fused, **grp)
+                w, g = _dequant_wo_a(*want), _dequant_wo_a(*got)
+                self.assertLess(((g - w).norm() / w.norm()).item(), 2e-2)
 
     @_needs_gfx950
     def test_cuda_graph_pad_reads_only_the_reserved_ring_row(self):
@@ -262,7 +369,7 @@ class TestUnifiedFp8Decode(CustomTestCase):
         """
         lengths = [200, 64] * 24  # 48 tokens, both layer flavours' segment lengths
         self.assertGreater(len(lengths), 40)
-        got, want = self._run(lengths, num_heads=16)
+        got, want = self._run(lengths, num_heads=16, asm=True)
         self._assert_close(got, want)
 
     @_needs_gfx950
@@ -304,6 +411,80 @@ class TestUnifiedFp8Decode(CustomTestCase):
                 attn_sink=sink,
                 v_head_dim=V_HEAD_DIM,
             )
+
+    @_needs_gfx950
+    @unittest.skipUnless(
+        runtime.flydsl_decode_supported(16),
+        "aiter has no flydsl_mla_v4_decode_fused",
+    )
+    def test_fused_wo_a_operands_match_unfused_chain(self):
+        """decode + inverse RoPE + wo_a quant in one launch == the unfused chain,
+        eagerly and from a replayed cuda graph (TP8 H16 and DP attention H128)."""
+        max_pos = 4096
+        angle = torch.rand(max_pos, ROPE_DIM // 2, device=DEVICE) * 6.28
+        freqs_cis = torch.polar(torch.ones_like(angle), angle)
+        pool_nope, pool_rope, _ = _make_latent(self.rows)
+        for H, (lengths, compress_ratio) in itertools.product(
+            (16, 128), (([64, 17, 128, 1] * 3, 4), ([200] * 40, 128))
+        ):
+            T = len(lengths)
+            q_packed, q_rope, _ = _make_latent(T, H)
+            indices, indptr = _ragged(lengths, self.rows)
+            kw = dict(
+                q=q_packed,
+                q_rope=q_rope,
+                unified_kv=pool_nope,
+                unified_kv_rope=pool_rope,
+                kv_indices=indices,
+                kv_indptr=indptr,
+                attn_sink=torch.randn(H, device=DEVICE, dtype=torch.float32),
+            )
+            positions = torch.randint(0, max_pos, (T,), device=DEVICE)
+
+            out = runtime.decode_fp8_2buff(**kw, v_head_dim=V_HEAD_DIM)
+            fused_rope_inplace(
+                out[..., -ROPE_DIM:], None, freqs_cis, positions=positions, inverse=True
+            )
+            want = _dequant_wo_a(
+                *wo_a_fp8.quant_wo_a_act_mxfp8(out.view(T, H // 8, -1))
+            )
+
+            def fused():
+                return runtime.decode_fp8_2buff_wo_a_mxfp8(
+                    **kw,
+                    positions=positions,
+                    rope_freqs=torch.view_as_real(freqs_cis).flatten(1),
+                    compress_ratio=compress_ratio,
+                )
+
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):  # warm up on the capture stream
+                eager = fused()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                captured = fused()
+            graph.replay()
+            torch.cuda.synchronize()
+
+            with self.subTest(H=H, T=T, compress_ratio=compress_ratio):
+                got = _dequant_wo_a(*eager)
+                err = (got - want).norm() / want.norm()
+                self.assertLess(err.item(), 2e-2)
+                self.assertTrue(
+                    torch.equal(
+                        captured[0].view(torch.uint8), eager[0].view(torch.uint8)
+                    )
+                )
+                self.assertTrue(torch.equal(captured[1], eager[1]))
+
+
+def _dequant_wo_a(codes: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+    """wo_a mxfp8 operands (any [T, ...] row-major view) -> fp32 [T, H*512]"""
+    T = codes.shape[0]
+    blocks = codes.reshape(T, -1, 128).float()
+    scale = torch.exp2(scales.reshape(T, -1, 1).float() - 127)
+    return (blocks * scale).reshape(T, -1)
 
 
 if __name__ == "__main__":
