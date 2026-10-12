@@ -38,6 +38,7 @@ from sglang.srt.managers.mm_schedule import (
 from sglang.srt.managers.schedule_batch import (
     CudaIpcTensorTransportProxy,
     Modality,
+    MultimodalDataItem,
     MultimodalInputs,
     MultimodalProcessorOutput,
 )
@@ -914,6 +915,40 @@ def hash_feature(f):
             return f.precomputed_hash
         return tensor_hash([f.tensor])
     return data_hash(f)
+
+
+def apply_caller_mm_hashes(
+    mm_inputs: MultimodalProcessorOutput, mm_hashes: Optional[List[str]]
+) -> None:
+    """Seed item hashes from caller-supplied hex hashes, one per item.
+
+    External KV routers hash each image before dispatch. A preset hash skips
+    hash_feature() in set_pad_value(), so the pad value, and with it the
+    prefix-cache key, follows the router's hash. On a length mismatch or a
+    non-hex entry the item keeps hash_feature().
+    """
+    mm_items = mm_inputs.mm_items
+    if not mm_hashes or not mm_items:
+        return
+    if len(mm_hashes) != len(mm_items):
+        logger.warning(
+            "mm_hashes length (%d) != mm_items length (%d); "
+            "ignoring caller hashes for this request.",
+            len(mm_hashes),
+            len(mm_items),
+        )
+        return
+    for item, hex_hash in zip(mm_items, mm_hashes):
+        if not isinstance(item, MultimodalDataItem):
+            continue
+        try:
+            item.set_hash(int(hex_hash, 16))
+        except (TypeError, ValueError):
+            logger.warning(
+                "Ignoring malformed mm_hashes entry %r; "
+                "this item will fall back to hash_feature().",
+                hex_hash,
+            )
 
 
 def extend_mrope_positions_for_retracted_request(

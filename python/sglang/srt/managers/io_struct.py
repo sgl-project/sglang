@@ -173,6 +173,13 @@ MultimodalDataInputFormat = Union[
 ]
 
 
+def _check_mm_hashes_are_strings(hashes: Any, name: str) -> None:
+    # TokenizedGenerateReqInput.mm_hashes is a typed IPC field; any other shape
+    # fails decode in the scheduler instead of in this request.
+    if not isinstance(hashes, list) or not all(isinstance(h, str) for h in hashes):
+        raise ValueError(f"{name} must be a list of strings, one per image")
+
+
 @dataclass
 class GenerateReqInput:
     # Request ID(s). If omitted, generated during normalization. For batch
@@ -575,6 +582,8 @@ class GenerateReqInput:
         self.kv_hints = (
             decode_kv_hints_envelope(self.kv_hints) if self.kv_hints else None
         )
+        if self.mm_hashes is not None:
+            _check_mm_hashes_are_strings(self.mm_hashes, "mm_hashes")
 
     def _normalize_batch_inputs(self):
         """Normalize inputs for a batch of examples, including parallel sampling expansion."""
@@ -704,6 +713,10 @@ class GenerateReqInput:
                     raise ValueError(
                         f"{field_name}[{request_index}] has {len(per_request)} "
                         f"entries for {image_count} images"
+                    )
+                if field_name == "mm_hashes":
+                    _check_mm_hashes_are_strings(
+                        per_request, f"mm_hashes[{request_index}]"
                     )
                 normalized.append(per_request)
             setattr(self, field_name, normalized * self.parallel_sample_num)
@@ -1151,6 +1164,9 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # Shape of output_token_sampling_logprobs for each output token. This is a
     # defaulted tail field so older IPC senders decode as selected mode.
     sampling_logprobs_mode: SamplingLogprobsMode = "selected"
+    # See GenerateReqInput.mm_hashes. With encoder disaggregation the scheduler
+    # builds mm_inputs, so the scheduler applies these hashes.
+    mm_hashes: Optional[List[str]] = None
 
     def wrap_pickle_fields(self):
         self.time_stats = wrap_as_pickle(self.time_stats)
