@@ -36,7 +36,6 @@ from sglang.srt.mem_cache.utils import (
     compute_node_event_hash_values,
     compute_node_hash_values,
     hash_str_to_int64,
-    kv_event_lora_seed,
 )
 
 if TYPE_CHECKING:
@@ -234,7 +233,14 @@ class KVCacheEventRecorder:
 
     def _namespace_seed(self, node: Any) -> Optional[bytes]:
         if not self.dynamo_format:
-            return kv_event_lora_seed(self.lora_names.get(node.key.extra_key))
+            return kv_event_namespace_seed(
+                extra_key=(
+                    node.key.extra_key
+                    if self.lora_names.get(node.key.extra_key) is not None
+                    else None
+                ),
+                cache_salt=None,
+            )
         return kv_event_namespace_seed(
             extra_key=node.key.extra_key, cache_salt=node.key.cache_salt
         )

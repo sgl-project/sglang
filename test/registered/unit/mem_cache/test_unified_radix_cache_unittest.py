@@ -110,7 +110,6 @@ from sglang.srt.mem_cache.unified_radix_cache import (
     _OngoingPrefetch,
     _OngoingWriteThrough,
 )
-from sglang.srt.mem_cache.utils import kv_event_lora_seed, namespace_event_block_hash
 from sglang.srt.runtime_context import (
     get_serving,
     mamba_cache_chunk_size,
@@ -1546,8 +1545,8 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
             stored_hashes(extra_key="adapter-b", cache_salt="tenant-a"),
         )
 
-    def test_lora_name_namespaces_event_hashes(self):
-        """LoRA blocks publish name-keyed hashes, the same on every worker."""
+    def test_lora_external_ids_separate_adapter_loads(self):
+        """External IDs distinguish loads; routers match tokens and public names."""
         lora_names, _reqs = _lora_names(
             **{
                 "uuid-a": "adapter-a",
@@ -1572,13 +1571,13 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         lora_a = store_then_evict("uuid-a")
         self.assertIsNone(base[0].lora_name)
         self.assertEqual(lora_a[0].lora_name, "adapter-a")
-        seed = kv_event_lora_seed("adapter-a")
+        seed = kv_event_namespace_seed(extra_key="uuid-a", cache_salt=None)
         self.assertEqual(
             self._event_hashes(lora_a),
-            [namespace_event_block_hash(h, seed) for h in self._event_hashes(base)],
+            [namespaced_block_hash(h, namespace_seed=seed) for h in self._event_hashes(base)],
         )
-        # Another load or user extra_key of the same adapter hashes the same.
-        self.assertEqual(
+        # Another load of the same public name has distinct external IDs.
+        self.assertNotEqual(
             self._event_hashes(store_then_evict("user|uuid-a2")),
             self._event_hashes(lora_a),
         )

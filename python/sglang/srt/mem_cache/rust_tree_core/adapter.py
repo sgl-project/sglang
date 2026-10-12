@@ -14,6 +14,8 @@ from sglang.srt.disaggregation.kv_events import (
     BlockRemoved,
     BlockStored,
     StorageMedium,
+    kv_event_namespace_seed,
+    namespaced_block_hash,
 )
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
@@ -62,8 +64,6 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
 )
 from sglang.srt.mem_cache.utils import (
     get_eviction_strategy,
-    kv_event_lora_seed,
-    namespace_event_block_hash,
 )
 from sglang.srt.runtime_context import get_exec, mamba_cache_chunk_size
 from sglang.srt.utils import assert_int64_array
@@ -114,13 +114,17 @@ def _kv_event_from_tagged(
         lora_name = (
             lora_names.resolve(event[8]) if dynamo_format else lora_names.get(event[8])
         )
-        seed = None if dynamo_format else kv_event_lora_seed(lora_name)
+        seed = (
+            kv_event_namespace_seed(extra_key=event[8], cache_salt=None)
+            if not dynamo_format and lora_name is not None
+            else None
+        )
         lora_names.count_published(event[8], len(event[1]))
         parent = event[2]
         return BlockStored(
-            block_hashes=[namespace_event_block_hash(h, seed) for h in event[1]],
+            block_hashes=[namespaced_block_hash(h, namespace_seed=seed) for h in event[1]],
             parent_block_hash=(
-                None if parent is None else namespace_event_block_hash(parent, seed)
+                None if parent is None else namespaced_block_hash(parent, namespace_seed=seed)
             ),
             token_ids=event[3],
             block_size=event[4],
@@ -131,10 +135,14 @@ def _kv_event_from_tagged(
             lora_name=lora_name,
         )
     if tag == "block_removed":
-        seed = None if dynamo_format else kv_event_lora_seed(lora_names.get(event[3]))
+        seed = (
+            kv_event_namespace_seed(extra_key=event[3], cache_salt=None)
+            if not dynamo_format and lora_names.get(event[3]) is not None
+            else None
+        )
         lora_names.count_published(event[3], -len(event[1]))
         return BlockRemoved(
-            block_hashes=[namespace_event_block_hash(h, seed) for h in event[1]],
+            block_hashes=[namespaced_block_hash(h, namespace_seed=seed) for h in event[1]],
             medium=StorageMedium(event[2]),
         )
     if tag == "all_blocks_cleared":
