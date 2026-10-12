@@ -3008,6 +3008,9 @@ class SchedulerDisaggregationDecodeMixin:
             if self._engine_paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
+            # Finished rows leave before preallocation and the prebuilt join
+            # size their budgets from the running batch.
+            self.leave_finished_rows(self.running_batch)
             self.process_decode_queue()
 
             # Get the next batch to run
@@ -3057,6 +3060,9 @@ class SchedulerDisaggregationDecodeMixin:
             if self._engine_paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
+            # Finished rows leave before preallocation and the prebuilt join
+            # size their budgets from the running batch.
+            self.leave_finished_rows(self.running_batch)
             self.process_decode_queue()
 
             # Get the next batch to run

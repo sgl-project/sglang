@@ -423,6 +423,8 @@ class SchedulerPPMixin:
                 tmbs[mb_id] = transferred_rids
                 self._pp_commit_comm_work(send_transfer_work)
 
+                # Finished rows leave before the prebuilt join sizes its budget.
+                self.leave_finished_rows(self.running_batch)
                 # get batch to run and proxy tensors if needed
                 plan = self.get_next_disagg_decode_batch_to_run(
                     running_batch=self.running_batch

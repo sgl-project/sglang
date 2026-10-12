@@ -1,14 +1,16 @@
-"""Finished running rows leave at the top of the next plan, before admission."""
+"""Finished running rows leave at the top of the next plan: before admission,
+and in PD decode before preallocation."""
 
 import unittest
-from types import SimpleNamespace
-from unittest.mock import Mock
+from types import MethodType, SimpleNamespace
+from unittest.mock import MagicMock, Mock
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.disaggregation.decode import SchedulerDisaggregationDecodeMixin
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.schedule_batch import NextBatchPlan
 from sglang.srt.managers.scheduler import Scheduler
@@ -131,6 +133,38 @@ class TestLeaveBeforeAdmission(unittest.TestCase):
         plan = s.get_next_batch_to_run(running_batch=plan.running_batch, last_batch=new)
         self.assertIs(plan.running_batch, new)
         self.assertEqual(_rids(plan.running_batch), ["new"])
+
+
+class TestLeaveBeforeDecodePrealloc(unittest.TestCase):
+    def _run_one_step(self, event_loop):
+        """Run one PD-decode loop step; return the rows preallocation saw."""
+        s = MagicMock()
+        s.gracefully_exit = False
+        s._engine_paused = False
+        s.leave_finished_rows = MethodType(Scheduler.leave_finished_rows, s)
+        s.running_batch = _Batch([_Req("a"), _Req("b", True), _Req("c")])
+        s.is_disable_overlap_for_batch.return_value = False
+        s.ngram_embedding_manager.prepare_for_forward.side_effect = lambda b, **_: b
+        seen = []
+
+        def process_decode_queue():
+            seen.append(_rids(s.running_batch))
+            s.gracefully_exit = True
+
+        s.process_decode_queue.side_effect = process_decode_queue
+        s.get_next_disagg_decode_batch_to_run.side_effect = lambda running_batch: (
+            NextBatchPlan(batch_to_run=None, running_batch=running_batch)
+        )
+        event_loop(s)
+        return seen
+
+    def test_prealloc_sees_only_live_rows(self):
+        for event_loop in (
+            SchedulerDisaggregationDecodeMixin.event_loop_normal_disagg_decode,
+            SchedulerDisaggregationDecodeMixin.event_loop_overlap_disagg_decode,
+        ):
+            with self.subTest(event_loop=event_loop.__name__):
+                self.assertEqual(self._run_one_step(event_loop), [["a", "c"]])
 
 
 if __name__ == "__main__":
