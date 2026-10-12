@@ -2574,6 +2574,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         )
         w2_input_scale._sglang_require_global_experts = True
         layer.register_parameter("w2_input_scale", w2_input_scale)
+        # calibrated activation scales, as the KV cache scales: no weight update carries them
+        w13_input_scale._skip_weight_check = True
+        w2_input_scale._skip_weight_check = True
 
     def _build_mega_moe_weights(self, layer: torch.nn.Module) -> None:
         # Activations are quantized per token at dispatch, so w13_input_scale
