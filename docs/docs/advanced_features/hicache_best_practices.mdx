@@ -30,6 +30,18 @@ Notes:
 
 - Besides configuring `--hicache-storage-backend` at startup, SGLang also supports **runtime attach/detach** of the HiCache storage backend (no restart required) via HTTP admin endpoints. See [Runtime Attach/Detach HiCache Storage Backend](./hicache_storage_runtime_attach_detach).
 
+### Host Memory Allocation on WSL2
+
+HiCache normally registers its host buffers with `cudaHostRegister`. On WSL2, some CUDA configurations require buffers allocated with PyTorch's pinned-memory allocator instead. SGLang automatically selects that allocator when it detects a WSL kernel. To override the selection, set `SGLANG_HICACHE_HOST_ALLOC` before starting the server:
+
+```bash
+export SGLANG_HICACHE_HOST_ALLOC=pin       # Use PyTorch pinned host allocations
+# export SGLANG_HICACHE_HOST_ALLOC=register # Force cudaHostRegister
+# export SGLANG_HICACHE_HOST_ALLOC=auto     # Detect WSL (default)
+```
+
+The `pin` allocator requires pinned HiCache memory and the default host allocator; it is not compatible with shared-memory (`shm`) or external storage allocators. The setting is read when the HiCache host allocator is first selected, so configure it before server startup.
+
 ## Key Configurations with Storage Backends Enabled
 
 ### Memory Layout Optimization

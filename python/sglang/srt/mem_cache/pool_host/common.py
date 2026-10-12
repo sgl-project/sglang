@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import platform
 from collections import defaultdict
 from functools import lru_cache
 
@@ -322,8 +323,55 @@ def make_kernel_ptr_table(
     )
 
 
+def _alloc_with_pinned_host_memory(
+    dims: tuple,
+    dtype: torch.dtype,
+    device: str,
+    pin_memory: bool,
+    allocator: HostTensorAllocator,
+    registration_granularity_bytes: int | None = None,
+) -> torch.Tensor:
+    """Use cudaHostAlloc-backed pinned memory where cudaHostRegister is unsafe."""
+    if type(allocator) is not HostTensorAllocator:
+        raise RuntimeError(
+            "SGLANG_HICACHE_HOST_ALLOC=pin requires the default HiCache host "
+            "allocator; mmap/shm and external storage allocators are incompatible."
+        )
+    if not pin_memory:
+        raise RuntimeError(
+            "SGLANG_HICACHE_HOST_ALLOC=pin requires pinned HiCache host memory."
+        )
+    return alloc_with_pin_memory(
+        dims,
+        dtype=dtype,
+        device=device,
+        pin_memory=pin_memory,
+        allocator=None,
+    )
+
+
+def _default_alloc_memory_func():
+    host_alloc = os.getenv("SGLANG_HICACHE_HOST_ALLOC", "auto").strip().lower()
+    if host_alloc not in ("auto", "pin", "register"):
+        raise ValueError(
+            "SGLANG_HICACHE_HOST_ALLOC must be one of: auto, pin, register; "
+            f"got {host_alloc!r}"
+        )
+    use_pin_memory = host_alloc == "pin" or (
+        host_alloc == "auto" and "microsoft" in platform.uname().release.lower()
+    )
+    if use_pin_memory:
+        logger.warning(
+            "HiCache host allocator: using torch pin_memory (cudaHostAlloc) "
+            "instead of cudaHostRegister; this is required for GPU-direct access "
+            "to pinned host memory on WSL2."
+        )
+        return _alloc_with_pinned_host_memory
+    return alloc_with_host_register
+
+
 ALLOC_MEMORY_FUNCS = defaultdict(
-    lambda: alloc_with_host_register,
+    _default_alloc_memory_func,
     {
         "npu": alloc_with_pin_memory,
         "musa": alloc_with_pin_memory,

@@ -1,3 +1,5 @@
+import os
+import platform
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -10,6 +12,7 @@ from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4PagedHostPool,
     DeepSeekV4StateHostPool,
 )
+from sglang.srt.mem_cache.pool_host import common as pool_host_common
 from sglang.srt.mem_cache.pool_host import mha as mha_pool_host
 from sglang.srt.mem_cache.pool_host import mla as mla_pool_host
 from sglang.srt.mem_cache.pool_host.common import (
@@ -66,6 +69,111 @@ class _FakeCudart:
 
 
 class TestHiCacheHostRegister(unittest.TestCase):
+    def test_auto_allocator_uses_pinned_memory_on_wsl2(self):
+        with (
+            mock.patch.dict(os.environ, {"SGLANG_HICACHE_HOST_ALLOC": "auto"}),
+            mock.patch.object(
+                platform,
+                "uname",
+                return_value=SimpleNamespace(
+                    release="5.15.167-microsoft-standard-WSL2"
+                ),
+            ),
+        ):
+            allocator = pool_host_common._default_alloc_memory_func()
+
+        self.assertIs(allocator, pool_host_common._alloc_with_pinned_host_memory)
+
+    def test_auto_allocator_keeps_host_registration_outside_wsl2(self):
+        with (
+            mock.patch.dict(os.environ, {"SGLANG_HICACHE_HOST_ALLOC": "auto"}),
+            mock.patch.object(
+                platform,
+                "uname",
+                return_value=SimpleNamespace(release="6.8.0-generic"),
+            ),
+        ):
+            allocator = pool_host_common._default_alloc_memory_func()
+
+        self.assertIs(allocator, pool_host_common.alloc_with_host_register)
+
+    def test_explicit_host_registration_overrides_wsl2_auto_detection(self):
+        with (
+            mock.patch.dict(os.environ, {"SGLANG_HICACHE_HOST_ALLOC": "register"}),
+            mock.patch.object(
+                platform,
+                "uname",
+                return_value=SimpleNamespace(
+                    release="5.15.167-microsoft-standard-WSL2"
+                ),
+            ),
+        ):
+            allocator = pool_host_common._default_alloc_memory_func()
+
+        self.assertIs(allocator, pool_host_common.alloc_with_host_register)
+
+    def test_explicit_pinned_allocator_overrides_non_wsl2_auto_detection(self):
+        with (
+            mock.patch.dict(os.environ, {"SGLANG_HICACHE_HOST_ALLOC": "pin"}),
+            mock.patch.object(
+                platform,
+                "uname",
+                return_value=SimpleNamespace(release="6.8.0-generic"),
+            ),
+        ):
+            allocator = pool_host_common._default_alloc_memory_func()
+
+        self.assertIs(allocator, pool_host_common._alloc_with_pinned_host_memory)
+
+    def test_invalid_host_allocator_setting_is_rejected(self):
+        with (
+            mock.patch.dict(os.environ, {"SGLANG_HICACHE_HOST_ALLOC": "unknown"}),
+            self.assertRaisesRegex(ValueError, "auto, pin, register"),
+        ):
+            pool_host_common._default_alloc_memory_func()
+
+    def test_pinned_allocator_uses_torch_pinned_allocation(self):
+        tensor = object()
+        with mock.patch.object(
+            pool_host_common, "alloc_with_pin_memory", return_value=tensor
+        ) as alloc:
+            result = pool_host_common._alloc_with_pinned_host_memory(
+                (4, 8),
+                dtype=torch.float16,
+                device="cpu",
+                pin_memory=True,
+                allocator=pool_host_common.HostTensorAllocator(),
+            )
+
+        self.assertIs(result, tensor)
+        alloc.assert_called_once_with(
+            (4, 8),
+            dtype=torch.float16,
+            device="cpu",
+            pin_memory=True,
+            allocator=None,
+        )
+
+    def test_pinned_allocator_rejects_non_default_storage_allocator(self):
+        with self.assertRaisesRegex(RuntimeError, "mmap/shm and external"):
+            pool_host_common._alloc_with_pinned_host_memory(
+                (4, 8),
+                dtype=torch.float16,
+                device="cpu",
+                pin_memory=True,
+                allocator=object(),
+            )
+
+    def test_pinned_allocator_requires_pin_memory(self):
+        with self.assertRaisesRegex(RuntimeError, "requires pinned HiCache"):
+            pool_host_common._alloc_with_pinned_host_memory(
+                (4, 8),
+                dtype=torch.float16,
+                device="cpu",
+                pin_memory=False,
+                allocator=pool_host_common.HostTensorAllocator(),
+            )
+
     def test_dsa_page_layouts_with_draft_use_page_registration_granularity(self):
         target_buffers = [torch.empty(1, dtype=torch.uint8) for _ in range(3)]
         draft_buffer = torch.empty(1, dtype=torch.uint8)
