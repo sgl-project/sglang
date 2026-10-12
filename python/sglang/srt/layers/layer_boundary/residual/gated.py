@@ -170,6 +170,7 @@ class _AttnUpdate:
     only once the sum it writes in is complete."""
 
     bind = None
+    replay_update = None
 
     is_plain_add = False
     applied_at_exit = False
@@ -227,6 +228,7 @@ class _FfnUpdate:
     streams stay widened: the layer stack's terminal read mixes them down."""
 
     bind = None
+    replay_update = None
 
     is_plain_add = False
     applied_at_exit = True

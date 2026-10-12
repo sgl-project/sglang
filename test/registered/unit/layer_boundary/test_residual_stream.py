@@ -81,6 +81,7 @@ class TestResidualStream(CustomTestCase):
     def test_consumer_executes_the_carried_update_not_the_bound_producers(self):
         class Update:
             bind = None
+            replay_update = None
             is_plain_add = False
             applied_at_exit = False
 

@@ -29,6 +29,7 @@ class UpdateFacts(msgspec.Struct, frozen=True):
     """The capabilities a ResidualUpdate declares (see ResidualUpdate)."""
 
     bind = None
+    replay_update = None
 
     is_plain_add: bool
     applied_at_exit: bool
@@ -110,6 +111,9 @@ def facts_of(declaration):
         read=ReadFacts.of(declaration.read),
         update=UpdateFacts.of(declaration.update),
         output_transform=TransformFacts.of(declaration.output_transform),
+        sum_impl=declaration.sum_impl.facts()
+        if declaration.sum_impl is not None
+        else None,
         previous=None,
         prepared_from=None,
     )

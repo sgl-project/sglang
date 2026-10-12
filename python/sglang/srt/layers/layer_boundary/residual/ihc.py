@@ -132,6 +132,7 @@ class _AttnUpdate:
     complete."""
 
     bind = None
+    replay_update = None
 
     is_plain_add = False
     applied_at_exit = False
@@ -188,6 +189,7 @@ class _FfnUpdate:
     so it belongs to the final norm."""
 
     bind = None
+    replay_update = None
 
     is_plain_add = False
     applied_at_exit = True

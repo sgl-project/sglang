@@ -13,7 +13,7 @@
 # ==============================================================================
 """One forward's residual and its producer's outstanding contribution."""
 
-from typing import Optional, Union
+from typing import Callable, Optional, Union
 
 import msgspec
 import torch
@@ -24,11 +24,16 @@ from sglang.srt.layers.layer_boundary.residual import ResidualUpdate
 
 
 class DeclaredSum(msgspec.Struct, frozen=True):
-    """A sum every output of this producer owes to its declared input edge."""
+    """A sum every output owes to its declared input edge. complete_sum is
+    the producer's custom implementation bound to this invocation, or None
+    for the ordinary group all-reduce."""
 
     group: SumGroup
+    complete_sum: Optional[Callable] = None
 
     def complete(self, value):
+        if self.complete_sum is not None:
+            return self.complete_sum(value)
         return _sum_group(self.group).all_reduce(value)
 
 

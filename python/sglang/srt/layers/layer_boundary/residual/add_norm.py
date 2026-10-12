@@ -274,6 +274,7 @@ class PlainAdd:
     """A plain residual: the output is added into it."""
 
     bind = None
+    replay_update = None
 
     is_plain_add = True
     applied_at_exit = False
@@ -299,6 +300,7 @@ class ReplaceAtExit:
     boundary complete each part's sum first (StageBoundary.sum_part)."""
 
     bind = None
+    replay_update = None
 
     is_plain_add = False
     applied_at_exit = True

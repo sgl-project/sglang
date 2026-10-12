@@ -185,6 +185,7 @@ class _WrittenIn:
     residual only once its sum is complete."""
 
     bind = None
+    replay_update = None
 
     is_plain_add = False
     applied_at_exit = False
