@@ -3,9 +3,11 @@
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
+import pytest
 import trimesh
 
 from sglang.multimodal_gen.test.server import test_server_utils as mesh_utils
@@ -59,6 +61,110 @@ class TestMeshCorrectness(CustomTestCase):
             mesh.export(self.generated)
             with self.assertRaises(AssertionError):
                 self.validate()
+
+    def test_corrupt_glb_is_rejected(self):
+        self.save_pair()
+        self.generated = self.root / "generated.glb"
+        self.generated.write_bytes(b"glTF\x02\x00\x00\x00broken")
+        with self.assertRaisesRegex(AssertionError, "Invalid generated mesh"):
+            self.validate()
+
+    def test_missing_performance_baseline_does_not_hide_mesh_result(self):
+        """A missing perf reference used to abort before validating real geometry."""
+        from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
+        from sglang.multimodal_gen.test.runner.pytest_runner import (
+            _is_retryable_failure,
+        )
+        from sglang.multimodal_gen.test.server import test_server_common as common
+        from sglang.multimodal_gen.test.server.testcase_configs import (
+            DiffusionSamplingParams,
+            DiffusionServerArgs,
+            DiffusionTestCase,
+        )
+
+        case = DiffusionTestCase(
+            "mesh_missing_baseline",
+            DiffusionServerArgs(
+                model_path="test", modality="3d", custom_validator="mesh"
+            ),
+            DiffusionSamplingParams(prompt="test"),
+            run_consistency_check=False,
+            run_models_api_check=False,
+            run_t2v_input_reference_check=False,
+            perf_repeat_requests=1,
+        )
+        record = RequestPerfRecord(
+            request_id="mesh",
+            commit_hash="test",
+            tag="mesh",
+            stages=[],
+            steps=[100],
+            total_duration_ms=1000,
+        )
+        runner = common.DiffusionServerBase()
+        runner._perf_results = []
+        baseline_path = self.root / "candidate.json"
+        with (
+            patch.dict(
+                "os.environ", {"SGLANG_GEN_GT": "0", "SGLANG_GEN_BASELINE": "0"}
+            ),
+            patch.object(common, "get_generate_fn", return_value=None),
+            patch.object(runner, "run_and_collect", return_value=(record, b"mesh")),
+            patch.object(common.BASELINE_CONFIG, "scenarios", {}),
+            patch.object(
+                common, "get_perf_baseline_update_path", return_value=baseline_path
+            ),
+            patch.dict(mesh_utils.MESH_OUTPUT_PATHS, {}, clear=True),
+        ):
+            for bad_geometry in (False, True):
+                with self.subTest(bad_geometry=bad_geometry):
+                    self.save_pair(offset=10 if bad_geometry else 0)
+                    mesh_utils.MESH_OUTPUT_PATHS[case.id] = str(self.generated)
+                    with self.assertRaises(
+                        common.PerformanceValidationError
+                    ) as failure:
+                        runner._test_diffusion_request(
+                            case, SimpleNamespace(load_time_ms=100), 1
+                        )
+                    message = str(failure.exception)
+                    self.assertIn("[performance]", message)
+                    self.assertNotIn(case.id, mesh_utils.MESH_OUTPUT_PATHS)
+                    self.assertEqual("[mesh correctness]" in message, bad_geometry)
+                    self.assertEqual(_is_retryable_failure(message), not bad_geometry)
+
+    def test_missing_mesh_artifact_fails_correctness(self):
+        """An absent generated mesh must not silently pass the mesh branch."""
+        from sglang.multimodal_gen.test.server import test_server_common as common
+        from sglang.multimodal_gen.test.server.testcase_configs import (
+            DiffusionSamplingParams,
+            DiffusionServerArgs,
+            DiffusionTestCase,
+        )
+
+        case = DiffusionTestCase(
+            "missing_mesh",
+            DiffusionServerArgs(
+                model_path="test", modality="3d", custom_validator="mesh"
+            ),
+            DiffusionSamplingParams(prompt="test"),
+            run_consistency_check=False,
+            run_models_api_check=False,
+            run_t2v_input_reference_check=False,
+        )
+        runner = common.DiffusionServerBase()
+        with (
+            patch.dict("os.environ", {"SGLANG_GEN_GT": "0"}),
+            patch.object(common, "get_generate_fn", return_value=None),
+            patch.object(runner, "run_and_collect", return_value=(None, b"")),
+            patch.object(runner, "_validate_and_record"),
+            patch.dict(mesh_utils.MESH_OUTPUT_PATHS, {}, clear=True),
+        ):
+            with self.assertRaisesRegex(
+                pytest.fail.Exception, "Missing generated mesh"
+            ):
+                runner._test_diffusion_request(
+                    case, SimpleNamespace(load_time_ms=100), 1
+                )
 
     def test_rng_isolation_and_repeatability(self):
         original_state = np.random.get_state()
