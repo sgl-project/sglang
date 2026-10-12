@@ -78,8 +78,9 @@ sgl-eval run gsm8k \\
     ["gsm8k_pct", "GSM8K", "%"],
   ],
 
+  // Patch image built from the #41993 head; nightly `dev` lacks 4.7 support until it merges.
   dockerImages: {
-    gb300: "lmsysorg/sglang:dev",
+    gb300: "lmsysorg/sglang:dev-minicpm-v-4.7",
   },
 
   github: {
@@ -93,11 +94,12 @@ sgl-eval run gsm8k \\
       ],
     },
 
-    // Opt-in: the cells run without a parser, so the thinking trace stays in
-    // `content`; `qwen3` matches the chat template's <think> format.
+    // Opt-out: every cell already carries both `auto` parsers, which resolve
+    // from the chat template to qwen3 (reasoning) and qwen3_coder (tool calls).
     parsers: {
       items: [
-        { id: "reasoning", label: "Reasoning Parser", flag: "--reasoning-parser qwen3" },
+        { id: "reasoning", label: "Reasoning Parser", flag: "--reasoning-parser auto" },
+        { id: "toolCall",  label: "Tool Call Parser", flag: "--tool-call-parser auto" },
       ],
     },
   },
@@ -111,6 +113,8 @@ sgl-eval run gsm8k \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--mamba-radix-cache-strategy extra_buffer",
+        "--reasoning-parser auto",
+        "--tool-call-parser auto",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -124,6 +128,8 @@ sgl-eval run gsm8k \\
         "--model-path {{MODEL_NAME}}",
         "--tp 2",
         "--mamba-radix-cache-strategy extra_buffer",
+        "--reasoning-parser auto",
+        "--tool-call-parser auto",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -137,6 +143,8 @@ sgl-eval run gsm8k \\
         "--model-path {{MODEL_NAME}}",
         "--tp 2",
         "--mamba-radix-cache-strategy extra_buffer",
+        "--reasoning-parser auto",
+        "--tool-call-parser auto",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -150,6 +158,8 @@ sgl-eval run gsm8k \\
         "--model-path {{MODEL_NAME}}",
         "--tp 1",
         "--mamba-radix-cache-strategy extra_buffer",
+        "--reasoning-parser auto",
+        "--tool-call-parser auto",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],

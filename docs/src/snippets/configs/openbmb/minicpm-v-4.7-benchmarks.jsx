@@ -1,7 +1,10 @@
 // GSM8K: sgl-eval, full 1,319 questions, temperature 1.0 / top-p 0.95, on
-// 4x GB300 with the PR #41993 head. Stop rate is 100% on every row except
-// 1B + DSPARK (99.92%), and every recipe passed the image probes (16x / 4x / 16x-again / multi-image /
-// max_slice_nums=1: 355 / 1291 / 355 / 556 / 93 prompt tokens, finish_reason=stop).
+// 4x GB300 with the PR #41993 head on top of nightly main, so sglang_version
+// names the PR rather than a release. The accuracy runs predate the `auto`
+// parser flags in the cells. Stop rate is 100% on every row except
+// 1B + DSPARK (99.92%), and every recipe passed the image probes
+// (16x / 4x / 16x-again / multi-image / max_slice_nums=1: 355 / 1291 / 355 /
+// 556 / 93 prompt tokens, finish_reason=stop).
 
 export const benchmarks = [
   {
