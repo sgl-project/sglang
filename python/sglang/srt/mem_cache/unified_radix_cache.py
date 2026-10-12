@@ -1201,9 +1201,17 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
             )
 
-        # With PD decode radix caching, SWA matching can stop short of the inserted path.
-        # Repoint from that path to protect all tree-owned KV.
-        new_last_node = result.last_device_node
+        if is_finished:
+            # The tree owns the inserted FULL prefix even if it is no longer
+            # reusable: e.g. C128 rounds the endpoint behind the live SWA
+            # window. A shorter match would make release_kv_cache free those
+            # tree-owned pages a second time.
+            new_last_node = result.last_device_node
+        else:
+            # A running request also needs the matched component state.
+            # Bypass session matching: this is the tree's own inserted prefix.
+            match_result = self._match_tree(MatchPrefixParams(key=radix_key, req=req))
+            new_last_node = match_result.last_device_node
         new_indices = self.path_device_indices(new_last_node)
         new_prefix_len = result.prefix_len
         assert req.kv.cache_protected_len <= len(new_indices) + self.page_size - 1, (

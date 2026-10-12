@@ -1,6 +1,7 @@
 """Focused CPU contracts for DeepSeek V4 NPU HiCache L2."""
 
 import unittest
+from array import array
 from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -12,20 +13,132 @@ from sglang.srt.hardware_backend.npu.dsv4.c128_sidecar_component import (
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_allocator import (
     DSV4NPUTokenToKVPoolAllocator,
 )
+from sglang.srt.managers.schedule_batch import ReqKvInfo
+from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.base_prefix_cache import EvictParams, MatchPrefixParams
+from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler as assembler
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4PagedHostPool,
     DeepSeekV4StateHostPool,
 )
+from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components import (
     CacheTransferPhase,
     ComponentType,
 )
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+
+
+class TestDSV4FinishedCheckpoint(CustomTestCase):
+    def test_finished_request_keeps_full_pages_without_a_reusable_swa_window(self):
+        """A C128-aligned prefix can outlive its SWA window. Finishing must
+        leave its FULL pages owned by the tree until eviction, even on a miss.
+        """
+        page_size, capacity = 128, 8192
+        for length, expected_hit in ((2048, 2048), (2176, 2048), (2304, 0), (4352, 0)):
+            with self.subTest(length=length, expected_hit=expected_hit):
+                # Only KV buffers and the independent C128 page ownership are
+                # doubles; FULL/SWA allocation and the radix tree run on CPU.
+                kv_pool = MagicMock(spec=BaseSWAKVPool)
+                kv_pool.full_kv_pool = kv_pool.swa_kv_pool = None
+                kv_pool.swa_req_ring_size = None
+                allocator = SWATokenToKVPoolAllocator(
+                    capacity,
+                    capacity,
+                    page_size,
+                    torch.bfloat16,
+                    "cpu",
+                    kv_pool,
+                    need_sort=False,
+                )
+                kv_pool.full_to_swa_index_mapping = allocator.full_to_swa_index_mapping
+                kv_pool.translate_loc_from_full_to_swa.side_effect = lambda indices: (
+                    allocator.full_to_swa_index_mapping[indices.long()]
+                )
+                allocator.c128_attn_allocator = SimpleNamespace(
+                    page_size=16, free_pages=torch.arange(1, 5)
+                )
+                allocator.retain_c128_pages = MagicMock()
+                allocator.release_c128_pages = MagicMock()
+                pool = ReqToTokenPool(1, capacity, "cpu", enable_memory_saver=False)
+                pool.req_to_c128_sidecar = torch.arange(
+                    1, capacity // 2048 + 1, dtype=torch.int64
+                ).repeat(pool._alloc_size, 1)
+                pool.set_c128_prefix_pages = MagicMock()
+                cache = UnifiedRadixCache(
+                    CacheInitParams(
+                        disable=False,
+                        req_to_token_pool=pool,
+                        token_to_kv_pool_allocator=allocator,
+                        page_size=page_size,
+                        sliding_window_size=128,
+                        tree_components=(
+                            ComponentType.FULL,
+                            ComponentType.SWA,
+                            ComponentType.C128,
+                        ),
+                        component_registry_override={
+                            ComponentType.C128: C128SidecarComponent
+                        },
+                        tree_core_backend="python",
+                    )
+                )
+                req = SimpleNamespace(
+                    rid="c128-rounded-finish",
+                    kv=ReqKvInfo(),
+                    origin_input_ids=array("q", range(length)),
+                    full_untruncated_fill_ids=array("q", range(length)),
+                    finished=lambda: True,
+                    priority=0,
+                    session_id=None,
+                    kv_rotation_base=None,
+                    extra_key=None,
+                    cache_salt=None,
+                    swa_branching_seqlen=None,
+                )
+                pool.alloc([req])
+                full = allocator.full_attn_allocator.alloc(length)
+                swa = allocator.swa_attn_allocator.alloc(length)
+                allocator.set_full_to_swa_mapping(full, swa)
+                pool.write((req.kv.req_pool_idx, slice(0, length)), full)
+                req.kv.kv_committed_len = req.kv.kv_allocated_len = length
+                req.last_node = cache.root_node_handle()
+                req.lock = cache.lock(req.last_node)
+                cached_len = length // 2048 * 2048
+                evicted_len = length - 256
+                allocator.free_swa_segment(full[:evicted_len], start_pos=0)
+                req.kv.set_evicted_seqlen(ComponentType.SWA, evicted_len)
+
+                # The checkpoint/free/unlock sequence used by release_kv_cache.
+                cache.checkpoint_into_tree(req, up_to=length)
+                cache.free_kv_row(req.kv, [(req.kv.cache_protected_len, length)])
+                cache.unlock(req.lock)
+
+                match = cache.match_prefix(
+                    MatchPrefixParams(key=RadixKey(array("q", range(length))))
+                )
+                self.assertEqual(match.device_prefix_len, expected_hit)
+                self.assertEqual(cache.full_evictable_size(), cached_len)
+                self.assertEqual(allocator.full_available_size(), capacity - cached_len)
+                self.assertEqual(
+                    allocator.swa_available_size() + cache.swa_evictable_size(),
+                    capacity,
+                )
+
+                cache.evict(EvictParams(num_tokens=cached_len))
+                self.assertEqual(cache.full_evictable_size(), 0)
+                self.assertEqual(allocator.full_available_size(), capacity)
+                self.assertEqual(allocator.swa_available_size(), capacity)
+                pages = allocator.full_attn_allocator.get_all_free_pages()
+                self.assertEqual(pages.unique().numel(), pages.numel())
 
 
 class TestDSV4DecodeCapacity(CustomTestCase):
