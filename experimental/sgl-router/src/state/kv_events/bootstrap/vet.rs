@@ -271,6 +271,12 @@ impl VettedSnapshot {
         ranks.iter().any(|r| self.cursor_for(r).is_some())
     }
 
+    /// Every rank [`Self::covers_any`] would accept, for checking many ranks
+    /// against one snapshot.
+    pub fn covered_ranks(&self) -> HashSet<&KvWorkerId> {
+        self.cursors.iter().map(|(w, _)| w).collect()
+    }
+
     /// Last-applied sequence the producer had for `worker`, or `None` when it
     /// did not track that worker.
     pub fn cursor_for(&self, worker: &KvWorkerId) -> Option<i64> {

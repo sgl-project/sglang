@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from array import array
 from typing import TYPE_CHECKING, Any, Callable, NamedTuple, Optional, cast
 
 import numpy as np
@@ -10,10 +11,18 @@ from sglang.kernels.ops.memory.common import (
     _get_last_loc_safe_kernel as _get_last_loc_safe_kernel,
 )
 from sglang.kernels.ops.memory.common import get_last_loc_kernel as get_last_loc_kernel
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
-from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
+from sglang.srt.mem_cache.base_prefix_cache import (
+    BasePrefixCache,
+    EvictParams,
+    MatchPrefixParams,
+    MatchResult,
+    zero_match_result,
+)
 from sglang.srt.mem_cache.hicache_storage import PoolTransfer
-from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.runtime_context import get_serving, get_spec
 from sglang.srt.utils.common import ceil_align
@@ -22,12 +31,6 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-
-# Needs 2 + 1 slots for mamba request with prefix cache. 2 for ping pong cache, 1 for running mamba state.
-MAMBA_STATE_PER_REQ_PREFIX_CACHE = 3
-# Lazy mode: 1 + 1 slots (1 ping-pong + 1 running), second ping-pong allocated on demand at boundary.
-MAMBA_STATE_PER_REQ_PREFIX_CACHE_LAZY = 2
-MAMBA_STATE_PER_REQ_NO_CACHE = 1
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +63,7 @@ def free_swa_out_of_window_slots(
     page_size: int,
     req_to_token_pool: ReqToTokenPool,
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
-    is_chunk_cache: bool = False,
+    supports_prefix_sharing: bool = True,
     retain_floor: int | None = None,
     component_type: ComponentType = ComponentType.SWA,
     free_segment: Callable[..., None] | None = None,
@@ -85,20 +88,20 @@ def free_swa_out_of_window_slots(
     evicted_seqlen = max(evicted_seqlen, dead_lo)
     req.kv.set_evicted_seqlen(component_type, evicted_seqlen)
 
-    if is_chunk_cache:
-        # Chunk cache builds no radix tree, so no tombstone-leaf concern; evict
+    if not supports_prefix_sharing:
+        # Nothing is inserted into a tree, so no tombstone-leaf concern; evict
         # up to the window boundary (the trailing floor keeps it page-aligned).
         evict_threshold = pre_len - sliding_window_size
     else:
-        # Radix cache: keep max(window, page). The trailing floor page-aligns the
+        # Prefix-sharing cache: keep max(window, page). The trailing floor page-aligns the
         # frontier, and subtracting at least one page keeps it below the insert
         # boundary (page_floor(seq_len)) so the last leaf is never all-tombstone.
         # No extra page margin is needed.
         evict_threshold = pre_len - max(sliding_window_size, page_size)
-    if retain_floor is not None and not is_chunk_cache:
+    if retain_floor is not None and supports_prefix_sharing:
         # The caller owns where the floor is (see BasePrefixCache.swa_retain_floor);
-        # this only promises not to free past it. Chunk cache has no tree, so a
-        # retained checkpoint could never be matched and holding it is pure cost.
+        # this only promises not to free past it. Without prefix sharing a retained
+        # checkpoint could never be matched, so holding it is pure cost.
         evict_threshold = min(evict_threshold, retain_floor)
 
     new_evicted_seqlen = max(evicted_seqlen, evict_threshold)
@@ -169,17 +172,100 @@ def free_kv_row_segments(
         allocator.free_segments(swa_alive)
 
 
-def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
-    if req.skip_radix_cache_insert:
-        return
+def _req_radix_key(
+    tree_cache: BasePrefixCache,
+    req: Req,
+    token_ids: array[int],
+    max_prefix_len: Optional[int] = None,
+) -> RadixKey:
+    # unified_kv SWA lives in a per-request ring the tree never stores, so a reused
+    # prefix carries stale SWA; cap the match so the window is re-prefilled.
+    reprefill_tail = tree_cache.swa_reprefill_tail_tokens()
+    key_limit = max(0, len(token_ids) - reprefill_tail) if reprefill_tail else None
+    if max_prefix_len is not None:
+        key_limit = (
+            max_prefix_len if key_limit is None else min(key_limit, max_prefix_len)
+        )
+    return RadixKey(
+        token_ids=token_ids,
+        extra_key=req.extra_key,
+        limit=key_limit,
+        cache_salt=req.cache_salt,
+    )
 
-    tree_cache.cache_unfinished_req(req, **kwargs)
+
+def touch_waiting_prefix(req: Req, tree_cache: BasePrefixCache) -> None:
+    tree_cache.touch_prefix(
+        _req_radix_key(tree_cache, req, req.origin_input_ids + req.output_ids)
+    )
+
+
+def match_kv_cache(
+    req: Req,
+    tree_cache: BasePrefixCache,
+    token_ids: Optional[array] = None,
+    *,
+    cow_mamba: bool = False,
+    max_prefix_len: Optional[int] = None,
+) -> MatchResult:
+    """Match token_ids against tree_cache and adopt the hit as req's prefix."""
+    if token_ids is None:
+        token_ids = req.origin_input_ids + req.output_ids
+
+    match_result = tree_cache.match_prefix(
+        MatchPrefixParams(
+            key=_req_radix_key(tree_cache, req, token_ids, max_prefix_len),
+            cow_mamba=cow_mamba,
+            req=req,
+        )
+    )
+    if envs.SGLANG_RADIX_FORCE_MISS.get():
+        match_result = zero_match_result(
+            tree_cache, match_result, extra_key=req.extra_key
+        )
+    req.prefix_len = match_result.device_prefix_len
+    (
+        req.last_node,
+        req.last_host_node,
+        req.best_match_node,
+        req.host_hit_length,
+        req.swa_host_hit_length,
+        req.mamba_host_hit_length,
+    ) = (
+        match_result.last_device_node,
+        match_result.last_host_node,
+        match_result.best_match_node,
+        match_result.host_hit_length,
+        match_result.swa_host_hit_length,
+        match_result.mamba_host_hit_length,
+    )
+    max_len = req._compute_max_prefix_len(len(token_ids))
+    req.num_matched_prefix_tokens = min(req.prefix_len + req.host_hit_length, max_len)
+    req.swa_branching_seqlen = match_result.swa_branching_seqlen
+    # A probe match keeps what it did not report; a new round resets both.
+    if match_result.mamba_branching_seqlen is not None:
+        req.mamba_branching_seqlen = match_result.mamba_branching_seqlen
+    if match_result.cache_protected_len is not None:
+        req.kv.cache_protected_len = match_result.cache_protected_len
+    return match_result
+
+
+def checkpoint_kv_cache(req: Req, tree_cache: BasePrefixCache) -> None:
+    """Publish what the running request has computed so far, unless it is
+    barred from the tree."""
+    # The tree reads req.finished() to tell a checkpoint from the final
+    # insert; a finished request belongs in release_kv_cache.
+    assert not req.finished(), f"checkpointing finished request {req.rid}"
+    if not req.skip_radix_cache_insert:
+        tree_cache.checkpoint(req, up_to=req.extend_end)
+    # The next extend resumes after this one, published or not.
+    req.prefix_len = req.extend_end
 
 
 def evict_from_tree_cache(
     tree_cache: BasePrefixCache | None, num_tokens: int
 ) -> bool | None:
-    if tree_cache is not None and not tree_cache.is_chunk_cache():
+    if tree_cache is not None and tree_cache.supports_prefix_sharing():
         return tree_cache.token_to_kv_pool_allocator.evict_to_free_tokens(
             tree_cache, num_tokens
         )
@@ -289,8 +375,8 @@ def discard_kv_cache_backup(
     req.kv.retraction_backup = None
 
 
-def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
-    """Give the request's kv row back; with ``is_insert`` the tree first keeps
+def release_kv_cache(req: Req, tree_cache: BasePrefixCache, *, checkpoint: bool):
+    """Give the request's kv row back; with ``checkpoint`` the tree first keeps
     what it can key."""
     assert (not req.kv.holds_kv) == req.kv.is_kv_released
     # A mamba-capable cache may alloc mamba state before alloc KV cache
@@ -311,25 +397,25 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
         return
 
     owned_kv_len = req.owned_kv_len()
-    is_insert = is_insert and not req.skip_radix_cache_insert
-    if is_insert:
-        tree_cache.insert_req(req, up_to=owned_kv_len)
+    checkpoint = checkpoint and not req.skip_radix_cache_insert
+    if checkpoint:
+        # A tree that takes over component state (mamba) must see the request
+        # finished, or the insert forks the state and the slot leaks.
+        assert req.finished() or not tree_cache.supports_mamba(), (
+            f"releasing unfinished request {req.rid} into a mamba tree"
+        )
+        # The fill-id array lags output_ids until the next prepare_for_decode.
+        req.refresh_fill_ids()
+        tree_cache.checkpoint(req, up_to=owned_kv_len)
     # The protected prefix is not this req's to free.
     tree_cache.free_kv_row(req.kv, [(req.kv.cache_protected_len, owned_kv_len)])
-    tree_cache.unpin(req)
+    tree_cache.unlock(req.lock)
+    req.lock = None
     _release_overallocated_kv_indices(
         req, owned_kv_len, req.kv.kv_allocated_len, tree_cache
     )
-    tree_cache.on_release(req, inserted=is_insert)
+    tree_cache.on_release(req, checkpointed=checkpoint)
 
-    # If the prefix cache doesn't manage mamba states, we must free them here.
-    if isinstance(tree_cache.req_to_token_pool, HybridReqToTokenPool) and (
-        not tree_cache.supports_mamba()
-    ):
-        assert req.kv.holds_mamba, (
-            "mamba state is freed while the tree cache does not manage mamba states"
-        )
-        tree_cache.req_to_token_pool.free_mamba_cache(req)
     # The DSV4-NPU ReqToTokenPool subclass's free() additionally releases the
     # c4/c128 state pages; other ReqToTokenPool subclasses are a no-op here.
     tree_cache.req_to_token_pool.free(req)
@@ -346,7 +432,12 @@ def _release_overallocated_kv_indices(
     # strip_thinking_cache intentionally reports output tokens as overallocated
     # so they fall into the free path below (#22373).
     if spec_algo is None and not get_serving().strip_thinking_cache:
-        assert start_p == end_p, (
+        # A stop landing before the last committed token does the same, via
+        # effective_kv_committed_len().
+        assert start_p == end_p or (
+            req.finished_len is not None
+            and len(req.origin_input_ids) + req.finished_len < req.kv.kv_committed_len
+        ), (
             f"Unexpected overallocated KV cache, {req.kv.kv_committed_len=}, {req.kv.kv_allocated_len=}"
         )
 
