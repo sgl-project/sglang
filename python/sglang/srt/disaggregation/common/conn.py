@@ -1162,7 +1162,7 @@ class CommonKVManager(BaseKVManager):
             url = (
                 f"http://{bootstrap_addr}/route?"
                 f"prefill_dp_rank={-1}&prefill_cp_rank={-1}&"
-                f"target_tp_rank={-1}&target_pp_rank={-1}"
+                f"target_tp_rank={-1}&target_pp_rank={-1}&include_capabilities=1"
             )
             response = requests.get(url, timeout=5)
             if response.status_code == 200:
@@ -2692,6 +2692,8 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 supports_host_destination=bool(self.supports_host_destination),
             )
             payload = dataclasses.asdict(info)
+            if request.query.get("include_capabilities") != "1":
+                payload.pop("supports_host_destination")
             if info.dsv41_spec_layout is None:
                 payload.pop("dsv41_spec_layout")
             return web.json_response(payload, status=200)

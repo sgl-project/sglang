@@ -1,3 +1,5 @@
+import asyncio
+import json
 import struct
 import threading
 import unittest
@@ -15,7 +17,12 @@ from sglang.srt.disaggregation.base.conn import (
     KVTransferDestination,
     StateType,
 )
-from sglang.srt.disaggregation.common.conn import AckTarget, CommonKVManager
+from sglang.srt.disaggregation.common.conn import (
+    AckTarget,
+    CommonKVBootstrapServer,
+    CommonKVManager,
+    PrefillServerInfo,
+)
 from sglang.srt.disaggregation.common.staging_buffer import (
     StagingAllocator,
 )
@@ -134,6 +141,61 @@ class TestMixedSWAKVBlockScales(CustomTestCase):
 
 
 class TestDisaggregationWire(unittest.TestCase):
+    def test_decode_opts_in_to_bootstrap_capabilities(self):
+        with patch(
+            "sglang.srt.disaggregation.common.conn.requests.get",
+            return_value=SimpleNamespace(status_code=503, text="not ready"),
+        ) as get:
+            self.assertFalse(
+                CommonKVManager.try_ensure_parallel_info(
+                    SimpleNamespace(prefill_info_table={}), "127.0.0.1:8998"
+                )
+            )
+        self.assertIn("include_capabilities=1", get.call_args.args[0])
+
+    def test_bootstrap_host_capability_requires_opt_in(self):
+        server = SimpleNamespace(
+            _is_ready=lambda: True,
+            attn_tp_size=2,
+            attn_cp_size=1,
+            dp_size=1,
+            pp_size=1,
+            page_size=64,
+            kv_cache_dtype="bfloat16",
+            dsv41_spec_layout=None,
+            follow_bootstrap_room=True,
+            enable_dsa_cache_layer_split=False,
+            prefill_http_port=9001,
+            decode_allocation_policy="early",
+            supports_host_destination=True,
+        )
+        for opt_in in (None, "0", "1"):
+            with self.subTest(opt_in=opt_in):
+                query = dict.fromkeys(
+                    (
+                        "prefill_dp_rank",
+                        "prefill_cp_rank",
+                        "target_tp_rank",
+                        "target_pp_rank",
+                    ),
+                    "-1",
+                )
+                if opt_in is not None:
+                    query["include_capabilities"] = opt_in
+                response = asyncio.run(
+                    CommonKVBootstrapServer._handle_route_get(
+                        server, SimpleNamespace(query=query)
+                    )
+                )
+                self.assertEqual(response.status, 200)
+                payload = json.loads(response.text)
+                # Older decoders reject unknown fields in PrefillServerInfo.
+                self.assertEqual("supports_host_destination" in payload, opt_in == "1")
+                self.assertEqual(
+                    PrefillServerInfo(**payload).supports_host_destination,
+                    opt_in == "1",
+                )
+
     def test_mooncake_stride_mismatch_only_fails_affected_request(self):
         for layer_ids in ([], [7]):
             for outcome in ("mismatch", "cleared", "transport_failure"):
@@ -165,6 +227,8 @@ class TestDisaggregationWire(unittest.TestCase):
                     manager.state_strides_validated = set()
                     manager.failure_records = {}
                     manager._staging_outstanding = defaultdict(int)
+                    manager._deferred_ack_targets = {}
+                    manager._deferred_ack_poisoned_rooms = set()
                     manager.request_status = {
                         42: KVPoll.Transferring,
                         43: KVPoll.Transferring,
@@ -187,7 +251,15 @@ class TestDisaggregationWire(unittest.TestCase):
                         )
                         manager.transfer_infos[room] = {req.mooncake_session_id: req}
                         manager.decode_kv_args_table[req.mooncake_session_id] = (
-                            SimpleNamespace(
+                            KVArgsRegisterInfo(
+                                room=str(room),
+                                endpoint=req.endpoint,
+                                dst_port=req.dst_port,
+                                mooncake_session_id=req.mooncake_session_id,
+                                dst_kv_ptrs=[],
+                                dst_tp_rank=0,
+                                dst_kv_item_len=0,
+                                dst_kv_layer_ids=[],
                                 requires_dcp_relayout=False,
                                 dst_state_data_ptrs=[[0x2000], [0x4000]],
                                 dst_state_item_lens=[
