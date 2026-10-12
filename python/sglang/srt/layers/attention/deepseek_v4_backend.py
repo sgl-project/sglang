@@ -2483,6 +2483,7 @@ class DeepseekV4AttnBackend(
             swa_page_size=self.token_to_kv_pool.get_swa_key_page_size(),
             num_qo_tokens=num_qo_tokens,
             max_seq_len=max(seq_lens_cpu_list),
+            seq_lens_cpu=seq_lens_cpu_list,
             total_swa=total_swa,
             request_window_layout=request_layout,
         )
