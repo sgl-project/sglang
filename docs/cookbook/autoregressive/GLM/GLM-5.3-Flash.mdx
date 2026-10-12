@@ -22,7 +22,7 @@ For MI355X, follow the [AMD GPU installation guide](/docs/hardware-platforms/amd
 
 </Accordion>
 
-Choose your hardware, then choose the operating point that matches your workload:
+The cookbook opens on **B300**. Choose your hardware, then choose the operating point that matches your workload:
 
 - **Low Latency** starts with MTP 5/1/6 speculative decoding and tensor parallelism to shorten interactive responses.
 - **High Throughput** starts with speculative decoding off, which avoids draft-and-verify overhead under sustained batches.
@@ -45,7 +45,7 @@ Generated commands leave `--mamba-full-memory-ratio` at its `0.9` default, which
 
 ## Playground
 
-Use the Playground for lower-level tuning such as attention parallelism, MoE communication, speculative decoding, and reasoning or tool parsers. It inherits every selection from the deployment panel and shows only the command-line diff.
+Use the Playground for lower-level tuning such as attention parallelism, MoE communication, PD disaggregation, speculative decoding, and reasoning or tool parsers. It inherits every selection from the deployment panel and shows only the command-line diff. The MoE backend defaults to `flashinfer_trtllm` on B300, B200, GB300 and GB200, to DeepGemm on Hopper, and to AITER on MI355X.
 
 import { Playground } from "/src/snippets/_playground.jsx";
 
@@ -130,7 +130,7 @@ For agentic MXFP4 serving on MI355X, select **Low Latency** with **L1 + L2**. Th
 
 ### Multimodal memory
 
-All strategies enable multimodal serving. Image and video input need a Transformers build that ships `Glm5NextProcessor` (the current `transformers==5.17.0` dependency includes it and requires `tokenizers>=0.23.1`). With older `transformers==5.12.1`, the server loads only the tokenizer and silently answers image requests from the text alone. On MI355X, text, image, and an image-bearing follow-up were qualified with Transformers commit `e4052f55`; video was not evaluated. The processor samples video at 2 FPS and caps video input at 240,000 visual tokens. Install `torchcodec` in the serving environment before sending video requests. For very long videos on 4x GB300, use encoder disaggregation to isolate the vision encoder's memory spikes from language decoding.
+All strategies enable multimodal serving. Image and video input use `Glm5NextProcessor`, which the pinned Transformers release ships (the MI355X checks predate that release and used commit `e4052f55`). On MI355X, text, image, and an image-bearing follow-up were qualified with that build; video was not evaluated. The processor samples video at 2 FPS and caps video input at 240,000 visual tokens. Install `torchcodec` in the serving environment before sending video requests. For very long videos on 4x GB300, use encoder disaggregation to isolate the vision encoder's memory spikes from language decoding.
 
 The default multimodal feature transport is automatic, and on a single CUDA node auto resolves to CPU transport. The MI355X selection explicitly emits CPU transport, matching its image-serving check. CUDA IPC is opt-in: pass `--mm-feature-transport cuda_ipc` when lower transfer latency matters more than the GPU memory the IPC pool reserves. CUDA VMM transport applies only to multi-node GB200/GB300 systems on the MNNVL fabric, where auto selects it.
 
@@ -206,6 +206,8 @@ Install `torchcodec` for video and see the [encoder disaggregation guide](/docs/
 
 Use prefill context parallelism (CP) to distribute DSA prefill computation for long prompts, including multimodal inputs. This hybrid model uses **interleave CP for DSA layers** and **head-wise tensor parallelism for KDA layers**, sharing the same communication group. Layer boundaries all-gather the context shards before KDA and reduce-scatter its output back onto those shards. The mHC residual streams and their coefficients stay local, with each output's reduction completed before the residual update.
 
+In the Playground's **Attention** card, select **TP=8** and **CP=8** on B300 or B200 to add `--attn-cp-size 8 --enable-prefill-cp --cp-strategy interleave`. For CP4, set TP=4 and CP=4. With CP enabled, the **MoE** card restricts EP to **1** or the CP size; an incompatible EP selection falls back to 1. Choosing EP=CP also adds `--moe-dense-tp-size` with the CP size. Prefill CP and PD disaggregation cannot be enabled together for this model.
+
 <Accordion title="Example of launching with Prefill CP on Blackwell GPU">
 
 ```bash Command
@@ -236,6 +238,8 @@ sglang serve \
 ### 3.6 PD disaggregation (preview)
 
 PD splits prefill and decode into separate server groups behind a router. For this hybrid model, the transfer moves both the paged DSA KV and the KDA recurrent state.
+
+The Playground's **PD Disagg** card defaults to **Off**, with **Mooncake** as its only transfer backend. Select **Prefill** or **Decode** to add `--disaggregation-mode prefill` or `--disaggregation-mode decode`, respectively, together with `--disaggregation-transfer-backend mooncake`. Selecting either role disables prefill CP. The generated prefill and decode commands use ports 30000 and 30100, respectively.
 
 <Warning>
 PD serving is mechanically validated with dummy weights only — startup, bootstrap, state transfer, and request flow all work on 4x GB300. It has not been load- or accuracy-tested. Treat it as a preview until the real-weight gate completes.
