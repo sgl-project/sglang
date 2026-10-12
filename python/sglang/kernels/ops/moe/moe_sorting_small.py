@@ -295,8 +295,7 @@ def _moe_sorting_small_kernel_distributed(
 
 
 def _mx_quant_chunk(n_cols: int):
-    """Columns per sort-time quant step: the widest power of two up to 2048 dividing n_cols
-    (DeepSeek-V4's hidden 5120 takes 1024), None when no 32-multiple does."""
+    """Widest power-of-two quant step (32..2048) dividing `n_cols`; None skips the fused quant."""
     for chunk in (2048, 1024, 512, 256, 128, 64, 32):
         if n_cols % chunk == 0:
             return chunk
