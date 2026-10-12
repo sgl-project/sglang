@@ -1,4 +1,6 @@
+import random
 import unittest
+from collections import deque
 
 from sglang.srt.managers.scheduler_components.inflight_queue import InflightQueue
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -55,6 +57,60 @@ class TestInflightQueue(CustomTestCase):
         self.assertEqual(len(q), 0)
         self.assertIsNone(q.newest())
         self.assertIsNone(q.last_launched)
+
+    def test_step_rule_matches_last_batch_gate(self):
+        # Differential against the gate the loops used before the queue: commit
+        # the oldest launched batch iff last_batch (what the previous completed
+        # step launched) is set. Depth 0 commits in the launching step instead;
+        # the overlap loop may commit early before a launch; a retract pause
+        # commits what is pending; the PD prefill polling loop may wait a pass
+        # for the result without ending the step.
+        rng = random.Random(0)
+        for _ in range(3000):
+            mode = rng.choice(("normal", "overlap", "polling"))
+            q = InflightQueue(
+                depth=0 if mode == "normal" else 1, blocking=mode != "polling"
+            )
+            pending = deque()  # launched and not yet committed, oldest first
+            last_batch = batch = None
+            waiting = False
+            for i in range(rng.randint(1, 40)):
+                if mode != "normal" and not waiting and rng.random() < 0.1:
+                    self.assertEqual(len(q), int(last_batch is not None))
+                    drained = [record.batch for record in q.drain()]
+                    self.assertEqual(drained, list(pending))
+                    pending.clear()
+                    last_batch = None
+                    continue
+
+                launched = False
+                # The polling loop keeps its previous batch when it cannot plan.
+                if mode != "polling" or q.can_launch():
+                    launched = rng.random() < 0.6
+                    batch = f"b{i}" if launched else None
+                disable = (
+                    mode == "overlap" and launched and pending and rng.random() < 0.3
+                )
+                if disable:
+                    self.assertEqual(q.pop_due().batch, pending.popleft())
+                if launched:
+                    q.push(batch, None)
+                    pending.append(batch)
+
+                if mode == "normal":
+                    gate = launched
+                else:
+                    gate = last_batch is not None and not disable
+                self.assertEqual(q.has_due(), gate)
+                if gate:
+                    if mode == "polling" and rng.random() < 0.5:
+                        waiting = True
+                        continue
+                    self.assertEqual(q.pop_due().batch, pending.popleft())
+                last_batch = batch
+                q.end_step(batch)
+                waiting = False
+                self.assertLessEqual(len(q), q.depth)
 
 
 if __name__ == "__main__":
