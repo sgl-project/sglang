@@ -2065,7 +2065,13 @@ class C4IndexerAscendBackendMixin:
           i.e. ``cmp_sparse_indices`` handed to
           ``npu_kv_quant_sparse_attn_sharedkv``. Same md5 hit vs miss => the
           selection is identical (the root is KV/state content); different =>
-          the indexer itself diverges.
+          the indexer itself diverges. The SAME line also carries the
+          per-ABSOLUTE-POSITION top-k INDEX lists as
+          ``kidx=[pos:i,i,..|pos2:i,..]`` (sorted unique, pads <0 dropped), for
+          the rows in [``DSV4_DUMP_MIN_POS``, ``DSV4_DUMP_MAX_POS``] capped to the
+          last ``DSV4_DUMP_CMPIDX_ROWS`` (default 8; 0 = all). A whole-tensor md5
+          is shape-confounded (MISS ntok=17523 vs HIT ntok=1139), so the analyzer
+          compares the top-k SET per absolute position from these lists.
         - ``DSV4_DUMP_IDXK`` = c4 layer id: content of the dedicated indexer-K
           buffer the top-k reads (small fp8 buffer, hashed whole).
         - ``DSV4_DUMP_C4KV`` = c4 layer id: content of the compressed c4 KV pages
@@ -2136,16 +2142,45 @@ class C4IndexerAscendBackendMixin:
                 # and same index-K still yield a different topk at block 134-135,
                 # the divergence is inside L2's c4-indexer select (not the SWA).
                 blkx = []
+                # S249: per-ABSOLUTE-POSITION top-k INDEX lists. A whole-tensor md5
+                # is not comparable across different ntok (full-prefill MISS
+                # s1=17523 vs suffix-prefill HIT s1=1139) and a tie at the k-th
+                # value is broken by the s1-dependent core-split workspace order,
+                # so the SET at the SAME absolute position may differ. Emit
+                # ``kidx=[pos:i,i,..|pos2:i,..]`` (sorted unique, pads <0 dropped)
+                # for the rows whose position is in [DSV4_DUMP_MIN_POS,
+                # DSV4_DUMP_MAX_POS], capped to the LAST DSV4_DUMP_CMPIDX_ROWS rows
+                # (default 8; 0 = all). Same DSV4_DUMP_CMPIDX gate; additive and
+                # read-only (a no-op unless the env is set).
+                kidx = ""
                 if t.numel():
                     _pos = forward_batch.positions.reshape(-1).to(torch.int64).cpu()
                     _blk = _pos // 128
                     for _b in torch.unique(_blk).tolist():
                         _m = _blk == _b
                         blkx.append(f"{int(_b)}:{_md5(t[_m])}")
+                    _nrows = int(os.environ.get("DSV4_DUMP_CMPIDX_ROWS", "8"))
+                    _npos = min(int(t.shape[0]), int(_pos.numel()))
+                    _sel = [
+                        _r for _r in range(_npos) if lo <= int(_pos[_r]) <= hi
+                    ]
+                    if not _sel:
+                        _sel = list(range(_npos))
+                    if _nrows > 0:
+                        _sel = _sel[-_nrows:]
+                    _parts = []
+                    for _r in _sel:
+                        _idxs = sorted(
+                            {int(v) for v in t[_r].tolist() if int(v) >= 0}
+                        )
+                        _parts.append(
+                            f"{int(_pos[_r])}:" + ",".join(str(v) for v in _idxs)
+                        )
+                    kidx = " kidx=[" + "|".join(_parts) + "]"
                 print(
                     f"[CMPIDX] layer={layer_id} mode={forward_batch.forward_mode} "
                     f"ntok={int(t.shape[0])} lastpos={lastpos} md5={_md5(t)} "
-                    f"tail={row} blkx={blkx[-8:]}",
+                    f"tail={row} blkx={blkx[-8:]}{kidx}",
                     flush=True,
                 )
             except Exception as exc:

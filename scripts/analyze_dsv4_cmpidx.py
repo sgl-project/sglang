@@ -64,6 +64,7 @@ CHAT_BOUNDARY = re.compile(r"/v1/chat/completions")
 MAX_REQ_SHOWN = 20
 MAX_DIFF_SHOWN = 8
 MAX_OFFENDER_SHOWN = 10
+MAX_ALIGNED_SHOWN = 20
 OSHAPE_KEYS = ("ratio", "ori_page", "ori_bt", "s2Size", "cmp_page", "cmp_bt")
 
 
@@ -497,6 +498,231 @@ def report_cmpidx_div(rows, cmp_reqs, miss_i):
     first_txt = str(div[0]) if div else "none"
     print(f"[CMPIDX-DIV] miss={miss_ntok} hit={hit_ntok} "
           f"divergent_blocks={blocks_txt} first={first_txt}")
+
+
+CMPIDX_ALIGNED_RUNBOOK = (
+    "[CMPIDX-ALIGNED-RUNBOOK] per-absolute-position indexer top-k SET "
+    "(window around P*):\n"
+    "  DSV4_DUMP_CMPIDX=<layer> DSV4_DUMP_C4POS=1 "
+    "DSV4_DUMP_MIN_POS=<win_lo> DSV4_DUMP_MAX_POS=<win_hi> "
+    "DSV4_DUMP_CMPIDX_ROWS=8 <serve> ; <curl miss> ; <curl hit> ; "
+    "python scripts/analyze_dsv4_cmpidx.py /tmp/dsv4_cmpidx.log\n"
+    "  kidx=[pos:i,i,..|pos2:i,..] is emitted by the backend under the same "
+    "DSV4_DUMP_CMPIDX gate"
+)
+
+
+def _cmpidx_kidx(rec):
+    """Parse ``kidx=[pos:i,i,..|pos2:i,..]`` into ``{pos: sorted unique idxs}``.
+
+    ``kidx`` is the per-ABSOLUTE-POSITION indexer top-k key list the backend
+    emits (already sorted unique; pads ``<0`` dropped).  Empty when the field is
+    absent (older probe), so the caller can say what is missing.
+    """
+    v = rec.get("kidx")
+    if not v:
+        return {}
+    s = str(v).strip()
+    if s.startswith("["):
+        s = s[1:]
+    if s.endswith("]"):
+        s = s[:-1]
+    out = {}
+    for entry in s.split("|"):
+        entry = entry.strip()
+        if ":" not in entry:
+            continue
+        p, _, lst = entry.partition(":")
+        try:
+            pos = int(p.strip())
+        except ValueError:
+            continue
+        idxs = []
+        for tok in lst.split(","):
+            tok = tok.strip()
+            if not tok:
+                continue
+            try:
+                idxs.append(int(tok))
+            except ValueError:
+                continue
+        out[pos] = sorted(set(idxs))
+    return out
+
+
+def _cmpidx_by_layer(group):
+    """``{layer: {pos: (sorted_idxs, mode)}}`` of one request's [CMPIDX] rows.
+
+    A row's ``mode`` (``2`` == ``ForwardMode.DECODE``) labels its positions
+    ``decode`` vs ``prefill``; the FIRST row carrying a position wins.
+    """
+    out = defaultdict(dict)
+    for r in group:
+        mode = "decode" if r.get("mode") == "2" else "prefill"
+        ly = _int(r, "layer")
+        for pos, idxs in _cmpidx_kidx(r).items():
+            out[ly].setdefault(pos, (idxs, mode))
+    return out
+
+
+def _cmpidx_ntok0(group):
+    """Largest ``ntok`` of one request's [CMPIDX] rows (prefill length, or -1)."""
+    return max((_int(r, "ntok") for r in group), default=-1)
+
+
+def _cmp_aligned_roles(cmp_reqs, c4pos_rows, idxin_rows):
+    """``(source, miss_idx, hit_idx, note)`` for the ALIGNED [CMPIDX] compare.
+
+    PREFERS the [C4POS] ``first`` label (``first==0`` -> MISS full prefill,
+    ``first>0`` -> HIT suffix prefill) mapped onto the [CMPIDX] request indices
+    via the SAME request split.  Falls back to the [IDXIN] ``sps`` rule (aligned
+    by the ``/v1/chat/completions`` boundary), then to largest-prefill-``ntok``.
+    MISS and HIT indices are DISJOINT by construction (a MISS request is never
+    paired with another MISS); equal-label pairs are handled only by the
+    two-MISS control inside ``report_cmpidx_aligned``.
+    """
+    c4_reqs = _c4pos_requests(c4pos_rows) if c4pos_rows else []
+    if c4_reqs and len(c4_reqs) == len(cmp_reqs):
+        miss, hit = [], []
+        for i, g in enumerate(c4_reqs):
+            m = _c4pos_prefill_maps(g)
+            if not m:
+                continue
+            first = min(f for f, _r, _p in m.values())
+            (miss if first == 0 else hit).append(i)
+        if miss and hit:
+            return ("c4pos", miss, hit,
+                    f"c4pos first==0 -> MISS {miss}, first>0 -> HIT {hit}")
+    if idxin_rows and _idxin_split_source(idxin_rows) == "chat/completions":
+        ireqs = _idxin_requests(idxin_rows)
+        if len(ireqs) == len(cmp_reqs):
+            _m, miss_set, hit_idx, source, note = _idxin_roles(ireqs)
+            if miss_set and hit_idx:
+                return (f"idxin:{source}", list(miss_set), list(hit_idx), note)
+    if len(cmp_reqs) >= 2:
+        ntoks = [_cmpidx_ntok0(g) for g in cmp_reqs]
+        mi = ntoks.index(max(ntoks))
+        hit = [j for j in range(len(cmp_reqs)) if j != mi and cmp_reqs[j]]
+        if hit:
+            return ("largest-ntok", [mi], hit,
+                    "no [C4POS]/[IDXIN]; MISS=largest prefill ntok")
+    return "none", [], [], "no usable MISS/HIT split"
+
+
+def _cmpidx_set_hash(idxs):
+    """Short md5 of a sorted top-k index list (``empty`` for an empty list)."""
+    if not idxs:
+        return "empty"
+    return hashlib.md5(
+        ",".join(str(v) for v in idxs).encode("ascii")).hexdigest()[:12]
+
+
+def report_cmpidx_aligned(cmp_rows, c4pos_rows, idxin_rows):
+    """``[CMPIDX-ALIGNED]`` MISS-vs-HIT indexer top-k SET per absolute position.
+
+    The whole-tensor [CMPIDX] md5 is only comparable at equal ``ntok`` and the
+    per-block ``blkx`` hashes the sampled row, so neither answers "did the top-k
+    SET change at the SAME absolute position / stage".  This report uses the
+    backend per-position ``kidx=[pos:i,i,..|..]`` field:
+
+      * requests are split by the [C4POS] ``first`` label (``first==0`` MISS,
+        ``first>0`` HIT), falling back to the [IDXIN] ``sps`` rule / largest
+        ``ntok`` -- the SOURCE used is printed;
+      * at every (layer, absolute position) reached by BOTH a MISS and a HIT,
+        the MISS top-k SET is compared with the HIT top-k SET;
+      * ``TOPK_DIFF`` reports the symmetric-difference offenders (the few keys
+        that swapped) -- the predicted ``==kth`` tie-break signature;
+      * a two-MISS control verifies two MISS requests agree at a shared position
+        (MISS vs MISS MUST be identical) and WARNS when they do not.
+    """
+    print("\n== [CMPIDX-ALIGNED] indexer top-k SET per absolute position ==")
+    if not cmp_rows:
+        print("  [CMPIDX-ALIGNED] no [CMPIDX] rows")
+        return
+    if not any("kidx" in r for r in cmp_rows):
+        print("  [CMPIDX-ALIGNED] [CMPIDX] has no per-position `kidx=` field -> "
+              "cannot compare top-k SETs. Re-run with the backend field "
+              "(DSV4_DUMP_CMPIDX=<layer>): it emits "
+              "`kidx=[pos:i,i,..|..]` per absolute position.")
+        print(CMPIDX_ALIGNED_RUNBOOK)
+        return
+    cmp_reqs = _c4pos_requests(cmp_rows)
+    source, miss_idx, hit_idx, note = _cmp_aligned_roles(
+        cmp_reqs, c4pos_rows, idxin_rows)
+    print(f"  [CMPIDX-ALIGNED] split_source={source} miss_req={miss_idx} "
+          f"hit_req={hit_idx}")
+    print(f"  [CMPIDX-ALIGNED] rules: {note}")
+    if not miss_idx or not hit_idx:
+        print("  [CMPIDX-ALIGNED] need >=1 MISS (first==0) and >=1 HIT "
+              "(first>0) with DIFFERENT labels; none")
+        print(CMPIDX_ALIGNED_RUNBOOK)
+        return
+
+    miss_maps = [_cmpidx_by_layer(cmp_reqs[i]) for i in miss_idx]
+    hit_maps = [_cmpidx_by_layer(cmp_reqs[i]) for i in hit_idx]
+
+    def _hit_pos(ly, pos):
+        for hm in hit_maps:
+            if ly in hm and pos in hm[ly]:
+                return hm[ly][pos]
+        return None
+
+    results = []  # (layer, pos, mode, miss_set, hit_set, delta, same)
+    for ly in sorted(miss_maps[0]):
+        for pos in sorted(miss_maps[0][ly]):
+            mset, mmode = miss_maps[0][ly][pos]
+            h = _hit_pos(ly, pos)
+            if h is None:
+                continue
+            ms, hs = sorted(set(mset)), sorted(set(h[0]))
+            delta = sorted(set(ms) ^ set(hs))
+            results.append((ly, pos, mmode, ms, hs, delta, ms == hs))
+    diffs = [r for r in results if not r[6]]
+    print(f"  [CMPIDX-ALIGNED] positions_compared={len(results)} "
+          f"same={len(results) - len(diffs)} diff={len(diffs)}")
+    ordered = diffs + [r for r in results if r[6]]
+    for ly, pos, mmode, ms, hs, delta, same in ordered[:MAX_ALIGNED_SHOWN]:
+        verdict = "TOPK_SAME" if same else "TOPK_DIFF"
+        print(f"  [CMPIDX-ALIGNED] layer={ly} pos={pos} mode={mmode} "
+              f"SET_miss={_cmpidx_set_hash(ms)}({len(ms)}) "
+              f"SET_hit={_cmpidx_set_hash(hs)}({len(hs)}) "
+              f"delta={len(delta)} => {verdict}")
+        if not same:
+            print(f"     offenders(symdiff)={delta[:MAX_OFFENDER_SHOWN]}"
+                  + (" ..." if len(delta) > MAX_OFFENDER_SHOWN else ""))
+    if len(ordered) > MAX_ALIGNED_SHOWN:
+        print(f"  ... {len(ordered) - MAX_ALIGNED_SHOWN} more positions")
+    print(f"  [CMPIDX-ALIGNED] VERDICT "
+          f"{'TOPK_SAME' if not diffs else 'TOPK_DIFF'}")
+
+    # Two-MISS control: two MISS requests must agree at every shared position.
+    if len(miss_maps) >= 2:
+        base = miss_maps[0]
+        ctl_pos = ctl_same = ctl_diff = 0
+        first_bad = None
+        for ly in sorted(base):
+            for pos in sorted(base[ly]):
+                if not all(ly in m and pos in m[ly] for m in miss_maps[1:]):
+                    continue
+                ctl_pos += 1
+                sets = {tuple(sorted(m[ly][pos][0])) for m in miss_maps}
+                if len(sets) == 1:
+                    ctl_same += 1
+                else:
+                    ctl_diff += 1
+                    if first_bad is None:
+                        first_bad = (ly, pos)
+        if ctl_pos == 0:
+            print("  [CMPIDX-ALIGNED] two-MISS control: no position shared by "
+                  "both MISS requests (cannot sanity-check)")
+        elif ctl_diff == 0:
+            print(f"  [CMPIDX-ALIGNED] two-MISS control: IDENTICAL at all "
+                  f"{ctl_pos} shared position(s) (sanity OK)")
+        else:
+            print(f"  [CMPIDX-ALIGNED] WARN two-MISS control: {ctl_diff}/"
+                  f"{ctl_pos} shared position(s) DIFFER between two MISS "
+                  f"requests (first layer={first_bad[0]} pos={first_bad[1]})")
+    print(CMPIDX_ALIGNED_RUNBOOK)
 
 
 def report_uniq(rows, label, fields, key="mode"):
@@ -2313,6 +2539,8 @@ def main(path):
             print("\n== [CMPIDX] c4-indexer top-k (per-c128-block, prefill) ==")
             report_blkx(rows, "CMPIDX", keep=_is_prefill)
             report_cmpidx_div(rows, cmp_reqs, miss_i)
+            report_cmpidx_aligned(
+                rows, recs.get("C4POS", []), recs.get("IDXIN", []))
             # fall through to the whole-tensor segment compare below as well
         if tag == "IDXK":
             print("\n== [IDXK] c4 index-K (per-logical-page, prefill) ==")
@@ -2752,8 +2980,7 @@ def _selftest():
             _c4dec(2, 16384, _KB_A, _RC_A, "same4382", "same4383"),
         ]
         c4idxkdiv_out = _run_main(c4dec_idxk_div)
-        c4nodiv_out = _run_main(c4dec_no_div)
-        # H4: the EXACT reported repro -- FIVE ``/v1/chat/completions`` requests
+        c4nodiv_out = _run_main(c4dec_no_div)        # H4: the EXACT reported repro -- FIVE ``/v1/chat/completions`` requests
         #     (boundary line AFTER each request's rows -> 0-based indices); req0..3
         #     are cache-MISS (sps=0) and req4 the cache-HIT (sps=16384).  The
         #     widened [C4DEC] gate emits the MISS calls from a window-OVERLAPPING
@@ -2785,6 +3012,34 @@ def _selftest():
         g2_rows, g2_out = _run_c4pos(g2_pos)
         b1_reqs = _idxin_requests(b1_rows)
         b2_reqs = _idxin_requests(b2_rows)
+
+        # --- [CMPIDX-ALIGNED] per-absolute-position top-k SET (I1/I2) ---
+        # I1: two MISS (first==0) + one HIT (first==16384); IDENTICAL top-k SETs
+        #     at the shared positions -> TOPK_SAME (+ two-MISS control OK).
+        # I2: the HIT swaps key 9 -> 999 at pos 17522 -> TOPK_DIFF with the
+        #     symmetric-difference offenders.
+        def _cmpidx_line(ly, mode, ntok, kidx):
+            return (f"[CMPIDX] layer={ly} mode={mode} ntok={ntok} "
+                    f"lastpos=17522 md5=zz tail=[] blkx=[] kidx={kidx}")
+
+        def _c4pos_first(first, ly=2):
+            return (f"[C4POS] layer={ly} idx=1 n=8 ratio=4 nz=8 first={first} "
+                    f"last=0 md5=aa sum=1 pos=[0,4,8,12,16,20,24,28]")
+
+        _kidx_ok = "[17520:1,2,3|17521:4,5,6|17522:7,8,9]"
+        _kidx_bad = "[17520:1,2,3|17521:4,5,6|17522:7,8,999]"
+        cmpidx_same = [
+            CHAT, _c4pos_first(0), _cmpidx_line(2, 1, 17523, _kidx_ok),
+            CHAT, _c4pos_first(0), _cmpidx_line(2, 1, 17523, _kidx_ok),
+            CHAT, _c4pos_first(16384), _cmpidx_line(2, 1, 1139, _kidx_ok),
+        ]
+        cmpidx_diff = [
+            CHAT, _c4pos_first(0), _cmpidx_line(2, 1, 17523, _kidx_ok),
+            CHAT, _c4pos_first(0), _cmpidx_line(2, 1, 17523, _kidx_ok),
+            CHAT, _c4pos_first(16384), _cmpidx_line(2, 1, 1139, _kidx_bad),
+        ]
+        ci_same_out = _run_main(cmpidx_same)
+        ci_diff_out = _run_main(cmpidx_diff)
 
         checks = [
             ("kpg full value parsed",
@@ -2944,6 +3199,20 @@ def _selftest():
              and "=> SAME" in c4nodiv_out
              and "stored_diff=False" in c4nodiv_out
              and "=> OUTPUT-SLOT" not in c4nodiv_out),
+            ("[CMPIDX-ALIGNED] kidx parsed per absolute position",
+             _cmpidx_kidx({"kidx": _kidx_bad})[17522] == [7, 8, 999]),
+            ("[CMPIDX-ALIGNED] TOPK_SAME + two-MISS control OK",
+             "split_source=c4pos" in ci_same_out
+             and "=> TOPK_SAME" in ci_same_out
+             and "two-MISS control: IDENTICAL" in ci_same_out
+             and "=> TOPK_DIFF" not in ci_same_out),
+            ("[CMPIDX-ALIGNED] TOPK_DIFF + offenders",
+             "=> TOPK_DIFF" in ci_diff_out
+             and "offenders(symdiff)=[9, 999]" in ci_diff_out
+             and "split_source=c4pos" in ci_diff_out),
+            ("[CMPIDX-ALIGNED] miss/hit roles are disjoint (no MISS-vs-MISS pair)",
+             "[CMPIDX-ALIGNED] split_source=c4pos miss_req=[1, 2] "
+             "hit_req=[3]" in ci_same_out),
         ]
         failed = [name for name, ok in checks if not ok]
         for name, ok in checks:
