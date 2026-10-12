@@ -1299,6 +1299,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 raise ValueError(
                     "encoder SWA replay cannot return cached prompt logprobs"
                 )
+        requests_embed_overrides = obj.positional_embed_overrides is not None or (
+            isinstance(obj, EmbeddingReqInput)
+            and obj.embed_overrides is not None
+            and obj.embed_override_token_id is not None
+        )
+        if requests_embed_overrides and obj.contains_mm_input():
+            raise ValueError(
+                "embedding overrides cannot be combined with image, video, or audio "
+                "inputs"
+            )
         # A decision layout indexes the whole prompt, so it is checked before any
         # truncation below could cut the prompt.
         self._validate_joint_schema_request(obj, input_ids)
