@@ -615,10 +615,7 @@ class DSV4AttnMetadata:
         )
         assert self.c4_topk_lengths_clamp1 is not None
         assert self.c4_topk_lengths_raw is not None
-        # the clamped lengths and the -1 filled top-k buffers of every ratio in one
-        # launch; the low-ratio raw indices are -1 filled like the page indices:
-        # identity rows write only their reachable columns, and the OPUS prefill
-        # reads the raw indices without the top-k lengths
+        # the clamped lengths and the -1 filled top-k buffers of every ratio in one launch
         for name, value in sparse_buffers(
             c4_topk_lengths_clamp1=self.c4_topk_lengths_clamp1,
             c4_topk_lengths_raw=self.c4_topk_lengths_raw,
@@ -630,6 +627,7 @@ class DSV4AttnMetadata:
             ),
             index_topk=self.index_topk,
             page_index_align=PAGE_INDEX_ALIGNED_SIZE,
+            # identity rows leave columns unwritten; OPUS prefill reads past the top-k lengths
             low_ratio_raw_indices=True,
         ).items():
             setattr(self, name, value)
@@ -1373,8 +1371,6 @@ class DeepseekV4HipRadixBackend(
         assert out_cache_loc.shape[0] >= num_tokens, (
             f"{out_cache_loc.shape=} holds fewer than {num_tokens=} block slots"
         )
-        # expand_extend_with_same_length(seq_lens + block_size) and the row
-        # positions in one launch
         _, _, seq_lens_casual, positions_casual, req_pool_indices_repeated = (
             expand_same_length_rows(
                 seq_lens,
@@ -1420,8 +1416,6 @@ class DeepseekV4HipRadixBackend(
             extend_seq_lens = extend_seq_lens.to(
                 device=seq_lens.device, dtype=seq_lens.dtype
             )
-        # seq_lens + num_draft_tokens, the extend lengths clamped to [1, seq_lens],
-        # expand_extend_with_same_length and the row positions in one launch
         (
             seq_lens,
             extend_seq_lens,
@@ -1650,7 +1644,6 @@ class DeepseekV4HipRadixBackend(
                 and out_cache_loc.dim() == 1
                 and out_cache_loc.stride(0) == 1
             ):
-                # the translate and the int32 cast in one launch
                 swa_out_cache_loc = gather_i32(full_to_swa, out_cache_loc)
             else:
                 swa_out_cache_loc = (
@@ -1848,8 +1841,7 @@ class DeepseekV4HipRadixBackend(
                 and not in_capture
                 and key in self.cuda_graph_metadata_of_bucket_and_bs[bucket]
             ):
-                # Replay copies it into the captured buffer; a zero-width pad would
-                # only clone it first.
+                # replay copies it into the captured buffer; a zero-width pad is a clone
                 return out_cache_loc
             return F.pad(
                 out_cache_loc,

@@ -29,8 +29,7 @@ def _engram_gather_kernel(
     E8M0_ZERO: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
-    # ids is [n // ids_cols, ids_cols] with unit column stride; a contiguous ids has
-    # ids_row_stride == ids_cols
+    # ids is [n // ids_cols, ids_cols] with a unit column stride
     ids_row = row // ids_cols
     idx = tl.load(ids_ptr + ids_row * ids_row_stride + (row - ids_row * ids_cols)).to(
         tl.int64
@@ -69,7 +68,6 @@ def engram_gather(
     ``weight_ptr`` addresses [rows, dim] fp8 e4m3 bytes and ``scale_ptr``
     [rows, dim // block_size] e8m0 bytes for global rows [row_lo, row_hi); both
     may live in device or host memory. Ids outside the range produce zero rows.
-    A [T, C] ids may be a column slice of a wider table (no contiguous copy).
     """
     assert dim > 0 and dim & (dim - 1) == 0 and block_size > 0, (dim, block_size)
     assert dim % block_size == 0, (dim, block_size)

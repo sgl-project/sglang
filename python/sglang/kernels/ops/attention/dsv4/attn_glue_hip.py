@@ -261,8 +261,7 @@ def _sparse_buffers_kernel(
                 c2_clamp1 = tl.load(c2_clamp1_ptr + r, mask=m, other=0)
                 tl.store(c2_sparse_ptr + r, tl.minimum(c2_clamp1, topk), mask=m)
     else:
-        # the rest fill the -1 [rows, width] buffers, one buffer per range of
-        # programs; the host packs the live buffers into fill0.. in order
+        # the rest -1-fill the live buffers packed into fill0.., one per program range
         fill = pid - 1
         n = rows * width
         per_buffer = tl.cdiv(n, FILL_BLOCK)
@@ -294,8 +293,7 @@ def sparse_buffers(
     """init_flashmla_related's tensors in one launch, keyed by attribute name: the top-k
     lengths clamped to index_topk and the -1-filled int32 page-index buffers padded to
     page_index_align, for ratio 4 and the ratios whose clamp-1 lengths are given.
-    low_ratio_raw_indices adds those ratios' c{r}_sparse_raw_indices, -1-filled like
-    their page indices (torch.full_like(c{r}_sparse_page_indices, -1))."""
+    low_ratio_raw_indices adds those ratios' -1-filled c{r}_sparse_raw_indices."""
     for t in (
         c4_topk_lengths_clamp1,
         c4_topk_lengths_raw,
@@ -485,9 +483,7 @@ def expand_same_length_rows(
       torch.minimum(extend_seq_lens.to(s.dtype) or full_like(s, qo_len), s).clamp_min_(1),
       (s[:, None] + arange(-qo_len + 1, 1, int32)).flatten().to(int32)  (seq_lens_casual),
       that minus 1                                                      (positions),
-      req_pool_indices[arange(bs, int32).repeat_interleave(qo_len)]     (rows' slots),
-    i.e. the torch chain of expand_extend_with_same_length and the head of
-    make_core_attn_metadata."""
+      req_pool_indices[arange(bs, int32).repeat_interleave(qo_len)]     (rows' slots)."""
     assert seq_lens.dim() == 1 and seq_lens.stride(0) == 1, seq_lens.stride()
     assert req_pool_indices.dim() == 1 and req_pool_indices.stride(0) == 1
     assert qo_len >= 1, qo_len
@@ -529,8 +525,7 @@ def _gather_i32_kernel(table_ptr, idx_ptr, out_ptr, n, table_len, BLOCK: tl.cons
     i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     m = i < n
     idx = tl.load(idx_ptr + i, mask=m, other=0).to(tl.int64)
-    # torch indexing wraps a negative index once (the -1 of an unset slot reads the
-    # mapping's trailing sentinel)
+    # a negative index wraps like torch indexing (-1 reads the trailing sentinel)
     idx = tl.where(idx < 0, idx + table_len, idx)
     tl.store(
         out_ptr + i, tl.load(table_ptr + idx, mask=m, other=0).to(tl.int32), mask=m
@@ -538,8 +533,7 @@ def _gather_i32_kernel(table_ptr, idx_ptr, out_ptr, n, table_len, BLOCK: tl.cons
 
 
 def gather_i32(table: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
-    """table[index].to(torch.int32) for a 1-D table and a 1-D index in one launch (the
-    full->SWA slot translation of the per-step write locations)."""
+    """`table[index].to(torch.int32)` for a 1-D table and a 1-D index in one launch."""
     assert table.dim() == 1 and table.stride(0) == 1
     assert index.dim() == 1 and index.stride(0) == 1
     n = index.shape[0]

@@ -904,7 +904,7 @@ def build_out_tokens_triton(
     T = verify_num_draft_tokens
     device = draft_tokens.device
     draft_tokens = draft_tokens.to(torch.int64).contiguous()
-    # the kernel narrows the lengths to int32 itself; no int64 copy needed
+    # the kernel narrows the lengths to int32 itself
     correct_len_i = correct_len.contiguous()
     bonus_i = bonus.to(torch.int64).contiguous()
     if out is None:

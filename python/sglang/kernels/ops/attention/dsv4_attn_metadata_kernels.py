@@ -538,8 +538,7 @@ def _causal_swa_page_indices_kernel(
         full_loc = tl.load(base + tl.where(valid, off, 0), mask=valid, other=-1).to(
             tl.int64
         )
-        # torch indexing wraps a negative slot once (-1 reads the mapping's trailing
-        # -1 sentinel)
+        # a negative slot wraps like torch indexing; HIP callers pass unset -1 slots
         full_loc = tl.where(full_loc < 0, full_loc + map_len, full_loc)
         swa = tl.load(full_to_swa_ptr + full_loc, mask=valid, other=-1).to(tl.int32)
         tl.store(out_base + k, tl.where(valid, swa, -1), mask=kmask)

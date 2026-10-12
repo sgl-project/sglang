@@ -274,10 +274,7 @@ def apply_rotary_emb_flat_copy_kernel(
     RDH: tl.constexpr,
     BLOCK_ROWS: tl.constexpr,
 ):
-    # apply_rotary_emb_flat_kernel (forward, with positions) on the last RD dims of
-    # unit-stride [NOPE + RD] head rows, written to out together with the copied
-    # leading NOPE dims: out = cat(x[..., :NOPE], rope(x[..., NOPE:])). The rope
-    # arithmetic is the flat kernel's, line for line.
+    # out = cat(x[..., :NOPE], rope(x[..., NOPE:])), rope math as in the flat kernel
     pid = tl.program_id(0)
     row = pid * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
     rmask = row < n_rows
@@ -330,10 +327,11 @@ def apply_rotary_emb_copy_into(
     positions: torch.Tensor,
     rope_dim: int,
 ) -> Optional[torch.Tensor]:
-    """out.copy_(x) after apply_rotary_emb_triton(x[..., -rope_dim:], freqs_cis,
-    positions) in one launch, leaving x untouched; out may be a head slice of a wider
-    buffer. Returns None (nothing done) where apply_rotary_emb_triton would not take
-    the flat kernel, so the caller keeps its two-step path."""
+    """`out` = `x` with its last `rope_dim` dims roped, in one launch; `x` is untouched.
+
+    `out` may be a head slice of a wider buffer. Returns None, doing nothing, where
+    `apply_rotary_emb_triton` would not take the flat kernel.
+    """
     if not _USE_BATCHED_ROPE or x.ndim != 3 or not x.is_cuda:
         return None
     batch_size, n_heads, head_dim = x.shape
