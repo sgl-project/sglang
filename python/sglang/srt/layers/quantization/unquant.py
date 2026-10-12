@@ -33,7 +33,6 @@ from sglang.srt.layers.quantization.base_config import (
 )
 from sglang.srt.layers.utils import copy_or_rebind_param
 from sglang.srt.runtime_context import (
-    get_context,
     get_exec,
     get_lora,
     get_platform,
@@ -88,9 +87,6 @@ def _use_aiter_unquant() -> bool:
     # deterministic inference keeps these layers on the batch-invariant path on gfx95.
     if not (_use_aiter and _is_gfx95):
         return _use_aiter
-    # Bare constructions (unit tests) publish no config and are not deterministic.
-    if not get_context().is_config_namespace_published("exec"):
-        return True
     return not get_exec().deterministic.enable_deterministic_inference
 
 
