@@ -175,7 +175,7 @@ impl PreparedRequest {
         let input_tokens = input_token_count(tokens.as_ref(), &body);
         let output_tokens = fields.requested_max_output_tokens();
         Ok(Self {
-            path: CHAT_PATH,
+            path,
             model,
             streaming: fields.stream.unwrap_or(false),
             output_tokens,
@@ -522,7 +522,9 @@ impl PreparedRequest {
         bootstrap: Option<&BootstrapFields>,
         engine_rid: Option<&str>,
     ) -> Result<Bytes, ApiError> {
-        if self.body.is_empty() { return Ok(self.body.clone()); }
+        if self.body.is_empty() {
+            return Ok(self.body.clone());
+        }
         let input_ids = self
             .tokens
             .as_ref()
