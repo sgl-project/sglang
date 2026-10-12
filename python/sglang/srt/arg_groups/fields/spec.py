@@ -124,7 +124,7 @@ class Spec(msgspec.Struct):
     ] = False
     speculative_sampling_renorm_fallback: A[
         bool,
-        "If flashinfer's speculative verify sampling ops fail to JIT-compile, "
+        "If FlashInfer's speculative verify sampling ops fail to JIT-compile, "
         "degrade the verify renorm to the in-tree triton kernels instead of "
         "failing startup (or aborting the affected requests at request time).",
     ] = False

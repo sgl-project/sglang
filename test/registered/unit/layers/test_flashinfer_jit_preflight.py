@@ -1,6 +1,8 @@
 import os
 import tempfile
+import types
 import unittest
+from unittest import mock
 
 from sglang.srt.layers import flashinfer_jit_preflight as fjp
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -109,6 +111,30 @@ class TestPoisonedCacheClearing(CustomTestCase):
         self.assertTrue(cleared)
         self.assertFalse(os.path.exists(sampling_dir))
         self.assertTrue(os.path.isfile(os.path.join(norm_dir, "norm.so")))
+
+    def test_lock_held_means_not_poisoned_and_no_clear(self):
+        # A concurrent build (e.g. another TP rank mid-preflight) holds the
+        # same on-disk state; the lock probe must keep us from declaring
+        # poison, and the clear must leave the directory untouched.
+        build_dir = _make_build_dir("poisoned")
+
+        class _HeldLock:
+            def __init__(self, path):
+                pass
+
+            def acquire(self, timeout=None):
+                raise TimeoutError("lock held")
+
+            def release(self):
+                pass
+
+        filelock = types.ModuleType("filelock")
+        filelock.FileLock = _HeldLock
+        with mock.patch.dict("sys.modules", {"filelock": filelock}):
+            self.assertFalse(fjp.is_flashinfer_sampling_poisoned(build_dir))
+            cleared, _ = fjp.clear_poisoned_flashinfer_sampling_cache(build_dir)
+        self.assertFalse(cleared)
+        self.assertTrue(os.path.isdir(build_dir))
 
 
 if __name__ == "__main__":

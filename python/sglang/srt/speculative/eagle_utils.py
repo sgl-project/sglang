@@ -107,16 +107,10 @@ def resolve_verify_renorm_impls():
         )
         if degrade:
             return _triton_renorm_impls()
-        if _verify_sampling_ops_failed:
-            # Fail fast instead of re-running the failing JIT build on every
-            # request; the scheduler turns this into per-request aborts.
-            raise SpecSamplingOpError(
-                "The flashinfer verify sampling ops previously failed in "
-                "this process; aborting without retrying the compile. Set "
-                "--sampling-backend pytorch or "
-                "--speculative-sampling-renorm-fallback to serve non-greedy "
-                "speculative traffic without flashinfer."
-            )
+        # After a failure without the fallback flag, still resolve the
+        # flashinfer kernels here: the fail-fast lives in
+        # _renorm_verify_probs, which only raises for batches that actually
+        # need renorm (temperature-only batches stay servable).
         from flashinfer.sampling import top_k_renorm_probs, top_p_renorm_probs
 
         return top_k_renorm_probs, top_p_renorm_probs
@@ -143,7 +137,25 @@ def _renorm_verify_probs(
     on the in-tree triton kernels, otherwise SpecSamplingOpError is raised
     for the scheduler to convert into per-request aborts.
     """
+    global _verify_sampling_ops_failed
+
     renorm_input = target_probs
+    need_renorm = sampling_info.need_top_k_sampling or sampling_info.need_top_p_sampling
+    if (
+        need_renorm
+        and _verify_sampling_ops_failed
+        and not get_spec().speculative_sampling_renorm_fallback
+    ):
+        # Fail fast instead of re-running the failing JIT build on every
+        # request (flashinfer does not cache failed builds). Only batches
+        # that actually renorm fail; temperature-only batches stay servable.
+        raise SpecSamplingOpError(
+            "The flashinfer verify sampling ops previously failed in "
+            "this process; aborting without retrying the compile. Set "
+            "--sampling-backend pytorch or "
+            "--speculative-sampling-renorm-fallback to serve non-greedy "
+            "speculative traffic without flashinfer."
+        )
     try:
         if sampling_info.need_top_k_sampling:
             target_probs = top_k_renorm_prob(
@@ -162,8 +174,12 @@ def _renorm_verify_probs(
             )
             maybe_detect_nan(target_probs, "v2 verify: target_probs after top_p_renorm")
         return target_probs
+    except torch.cuda.OutOfMemoryError:
+        # Memory pressure is not a backend/JIT failure: do not poison the
+        # failed-backend flag (a retry after the OOM passes would succeed),
+        # and keep the pre-existing crash semantics for OOM.
+        raise
     except (RuntimeError, FileNotFoundError) as e:
-        global _verify_sampling_ops_failed
         _verify_sampling_ops_failed = True
         if get_spec().speculative_sampling_renorm_fallback:
             logger.warning(
@@ -172,28 +188,36 @@ def _renorm_verify_probs(
                 e,
             )
             top_k_renorm_prob, top_p_renorm_prob = _triton_renorm_impls()
-            target_probs = renorm_input
-            if sampling_info.need_top_k_sampling:
-                target_probs = top_k_renorm_prob(
-                    target_probs,
-                    torch.repeat_interleave(
-                        sampling_info.top_ks, verify_input.draft_token_num, dim=0
-                    ),
-                )
-                maybe_detect_nan(
-                    target_probs, "v2 verify: target_probs after top_k_renorm"
-                )
-            if sampling_info.need_top_p_sampling:
-                target_probs = top_p_renorm_prob(
-                    target_probs,
-                    torch.repeat_interleave(
-                        sampling_info.top_ps, verify_input.draft_token_num, dim=0
-                    ),
-                )
-                maybe_detect_nan(
-                    target_probs, "v2 verify: target_probs after top_p_renorm"
-                )
-            return target_probs
+            try:
+                target_probs = renorm_input
+                if sampling_info.need_top_k_sampling:
+                    target_probs = top_k_renorm_prob(
+                        target_probs,
+                        torch.repeat_interleave(
+                            sampling_info.top_ks, verify_input.draft_token_num, dim=0
+                        ),
+                    )
+                    maybe_detect_nan(
+                        target_probs, "v2 verify: target_probs after top_k_renorm"
+                    )
+                if sampling_info.need_top_p_sampling:
+                    target_probs = top_p_renorm_prob(
+                        target_probs,
+                        torch.repeat_interleave(
+                            sampling_info.top_ps, verify_input.draft_token_num, dim=0
+                        ),
+                    )
+                    maybe_detect_nan(
+                        target_probs, "v2 verify: target_probs after top_p_renorm"
+                    )
+                return target_probs
+            except (RuntimeError, FileNotFoundError) as fallback_error:
+                raise SpecSamplingOpError(
+                    "The speculative verify sampling op failed on both the "
+                    "flashinfer and the triton fallback kernels. Greedy and "
+                    "non-speculative requests are unaffected. Original "
+                    f"fallback error: {fallback_error}",
+                ) from fallback_error
         raise SpecSamplingOpError(
             "The speculative verify sampling op failed to build or launch "
             "(flashinfer JIT). Greedy and non-speculative requests are "
@@ -217,7 +241,8 @@ def warm_verify_renorm_ops(device: str = "cuda") -> None:
     top_ps = torch.full((1, 1), 0.9, dtype=torch.float32, device=device)
     top_k_renorm_prob(probs, top_ks)
     top_p_renorm_prob(probs, top_ps)
-    torch.cuda.synchronize()
+    if device.startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.synchronize()
 
 
 def preflight_verify_sampling_ops() -> None:

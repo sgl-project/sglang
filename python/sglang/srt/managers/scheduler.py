@@ -5463,12 +5463,14 @@ class Scheduler(
         reqs_to_abort = []
         for idx in range(len(batch.reqs)):
             req = batch.reqs[idx]
-            if req.finished():
-                continue
-            req.to_finish = FINISH_ABORT(
-                message,
-                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
-            )
+            if req.to_finish is None:
+                req.to_finish = FINISH_ABORT(
+                    message,
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+            # Every request is released and reported — a req that already
+            # carries a to_finish (e.g. an in-flight client abort) keeps its
+            # own reason instead of being silently dropped by the filter.
             batch.release_req(idx, len(batch.reqs) - idx, offload_kv=False)
             reqs_to_abort.append(req)
         batch.filter_batch(keep_indices=[])

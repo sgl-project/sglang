@@ -22,8 +22,9 @@ This module provides the containment primitives:
   dummy tensors at startup so any compile failure surfaces before serving,
   instead of on the first non-greedy request.
 
-Notes on flashinfer's layout (verified against flashinfer 0.6.18,
-``flashinfer/jit/env.py`` and ``flashinfer/jit/core.py``):
+Notes on flashinfer's layout (verified against flashinfer 0.7.1 — the
+version sglang pins — and unchanged from 0.6.18; see ``flashinfer/jit/env.py``
+and ``flashinfer/jit/core.py``):
 
 - All sampling ops share ONE JitSpec named ``"sampling"``, so one warm-up call
   covers renorm + sampling + softmax for the whole process.
@@ -80,6 +81,14 @@ def flashinfer_sampling_build_dir() -> str | None:
     return os.path.join(str(jit_dir), _SAMPLING_SPEC_NAME)
 
 
+def _sampling_lock_path(build_dir: str) -> str:
+    return os.path.join(
+        os.path.dirname(os.path.normpath(build_dir)),
+        "tmp",
+        f"{_SAMPLING_SPEC_NAME}.lock",
+    )
+
+
 def _sampling_lock_available(build_dir: str) -> bool:
     """Best-effort check that no other process is building right now.
 
@@ -88,15 +97,10 @@ def _sampling_lock_available(build_dir: str) -> bool:
     leaves the same on-disk state as a poisoned cache (artifacts, no .so), so
     we only declare poison when the lock can be taken immediately.
     """
-    lock_path = os.path.join(
-        os.path.dirname(os.path.normpath(build_dir)),
-        "tmp",
-        f"{_SAMPLING_SPEC_NAME}.lock",
-    )
     try:
         from filelock import FileLock
 
-        lock = FileLock(lock_path)
+        lock = FileLock(_sampling_lock_path(build_dir))
         lock.acquire(timeout=0)
         lock.release()
         return True
@@ -104,6 +108,17 @@ def _sampling_lock_available(build_dir: str) -> bool:
         # filelock missing, lock held by a concurrent build, or the lock dir
         # does not exist yet — treat as "do not touch the dir".
         return False
+
+
+def _partial_build_state(build_dir: str) -> bool:
+    """On-disk partial-build signature: artifacts present, no linked .so."""
+    if not os.path.isdir(build_dir):
+        return False
+    if os.path.isfile(os.path.join(build_dir, _SAMPLING_LIBRARY_NAME)):
+        return False
+    has_ninja_file = os.path.isfile(os.path.join(build_dir, "build.ninja"))
+    has_objects = any(name.endswith(".o") for name in os.listdir(build_dir))
+    return has_ninja_file or has_objects
 
 
 def is_flashinfer_sampling_poisoned(build_dir: str | None = None) -> bool:
@@ -116,18 +131,10 @@ def is_flashinfer_sampling_poisoned(build_dir: str | None = None) -> bool:
     """
     if build_dir is None:
         build_dir = flashinfer_sampling_build_dir()
-    if build_dir is None or not os.path.isdir(build_dir):
+    if build_dir is None:
         return False
-
-    has_library = os.path.isfile(os.path.join(build_dir, _SAMPLING_LIBRARY_NAME))
-    if has_library:
+    if not _partial_build_state(build_dir):
         return False
-
-    has_ninja_file = os.path.isfile(os.path.join(build_dir, "build.ninja"))
-    has_objects = any(name.endswith(".o") for name in os.listdir(build_dir))
-    if not (has_ninja_file or has_objects):
-        return False
-
     return _sampling_lock_available(build_dir)
 
 
@@ -140,6 +147,11 @@ def clear_poisoned_flashinfer_sampling_cache(
     own ``clear_cache_dir()`` wipes every cached op for the current
     version+arch, which would throw away unrelated working kernels.
 
+    The check and the delete run under the same filelock flashinfer
+    serializes builds with: at TP startup every rank runs the preflight
+    concurrently, and a check-then-act race here could delete a build
+    another rank has just started.
+
     Returns (cleared, path): cleared is True when a poisoned dir was removed.
     Never touches a dir that looks clean, already has ``sampling.so``, or is
     being built by another process right now.
@@ -148,18 +160,30 @@ def clear_poisoned_flashinfer_sampling_cache(
         build_dir = flashinfer_sampling_build_dir()
     if build_dir is None:
         return False, None
-    if not is_flashinfer_sampling_poisoned(build_dir):
-        return False, build_dir
 
-    logger.warning(
-        "flashinfer sampling JIT cache is in a partial-build state (failed "
-        "compile left artifacts without %s); clearing %s so warm-up can "
-        "retry from scratch",
-        _SAMPLING_LIBRARY_NAME,
-        build_dir,
-    )
-    shutil.rmtree(build_dir, ignore_errors=True)
-    return True, build_dir
+    try:
+        from filelock import FileLock
+
+        lock = FileLock(_sampling_lock_path(build_dir))
+        lock.acquire(timeout=0)
+    except Exception:
+        # Lock unavailable: another process is mid-build (or filelock is
+        # missing) — leave the directory alone.
+        return False, build_dir
+    try:
+        if not _partial_build_state(build_dir):
+            return False, build_dir
+        logger.warning(
+            "flashinfer sampling JIT cache is in a partial-build state (failed "
+            "compile left artifacts without %s); clearing %s so warm-up can "
+            "retry from scratch",
+            _SAMPLING_LIBRARY_NAME,
+            build_dir,
+        )
+        shutil.rmtree(build_dir, ignore_errors=True)
+        return True, build_dir
+    finally:
+        lock.release()
 
 
 def preflight_flashinfer_sampling_ops(device: str = "cuda") -> tuple[bool, str]:

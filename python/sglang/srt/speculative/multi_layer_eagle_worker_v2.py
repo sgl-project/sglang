@@ -1029,6 +1029,10 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
 
 
 class MultiLayerEagleWorkerV2(BaseSpecWorker):
+    # eagle_sample's renorm ops run in this worker's verify path; the
+    # scheduler prewarms them at startup (sglang#43412).
+    verify_uses_eagle_sample = True
+
     def weight_update_runners(self) -> List[Tuple[str, ModelRunner]]:
         return [
             (f"draft_step_{i}", r)

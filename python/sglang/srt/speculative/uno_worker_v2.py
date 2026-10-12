@@ -57,6 +57,10 @@ logger = logging.getLogger(__name__)
 class UnoWorkerV2(BaseSpecWorker):
     """Single-model UNO worker with linear and native-EAGLE tree decode."""
 
+    # eagle_sample's renorm ops run in this worker's verify path; the
+    # scheduler prewarms them at startup (sglang#43412).
+    verify_uses_eagle_sample = True
+
     def __init__(
         self,
         server_args: ServerArgs,
