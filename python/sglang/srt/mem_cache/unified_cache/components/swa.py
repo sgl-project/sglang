@@ -27,6 +27,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeComponentHostSlot,
     FreeDeviceKVFullOnly,
     RebuildFullToSWAMapping,
+    RecoverEvictedSWA,
     RecoverSWAWithLockedFull,
     SWARebuild,
 )
@@ -304,6 +305,21 @@ class SWAComponent(TreeComponent):
         swa.bind(kept_pages, physical)
         swa.virtual_to_physical.index_fill_(0, incoming_pages, -1)
         swa.clear_inverse_history()
+
+    def _set_swa(
+        self, kept_full: torch.Tensor, incoming_full: torch.Tensor
+    ) -> torch.Tensor:
+        """Move incoming SWA mappings to kept Full IDs and return SWA indices."""
+        unified = self._unified_allocator()
+        if unified is not None:
+            self._transfer_swa_pages(unified, kept_full, incoming_full)
+            return self._translate_full_to_swa(kept_full)
+
+        allocator = self.cache.token_to_kv_pool_allocator
+        swa_value = self._translate_full_to_swa(incoming_full)
+        allocator.clear_full_to_swa_mapping(incoming_full)
+        allocator.set_full_to_swa_mapping(kept_full, swa_value)
+        return swa_value
 
     def refresh_lru(
         self,
@@ -1538,29 +1554,19 @@ class SWAComponent(TreeComponent):
             for full, swa in zip(action.full_indices, action.swa_indices):
                 alloc.set_full_to_swa_mapping(full, swa)
             return
+        if isinstance(action, RecoverEvictedSWA):
+            self._set_swa(action.kept_full, action.incoming_full)
+            return
         if isinstance(action, RecoverSWAWithLockedFull):
             # Keep the locked full; hand the node the INCOMING ids' swa pages,
             # freeing only the incoming full, then store the swa on the node.
+            swa_value = self._set_swa(action.kept_full, action.incoming_full)
             unified = self._unified_allocator()
             if unified is not None:
-                # No `full_to_swa_index_mapping` here: the swa sub-pool's v2p IS
-                # the mapping. Rebind page ownership, then free through the
-                # composite -- its `swa_v2p_pages > 0` filter skips the
-                # just-tombstoned swa side, releasing only the full one.
-                self._transfer_swa_pages(
-                    unified, action.kept_full, action.incoming_full
-                )
+                # The composite skips the detached SWA side and releases Full.
                 unified.free(action.incoming_full)
-                self.tree_core.set_component_device_value(
-                    action.node_id,
-                    self.component_type,
-                    self._translate_full_to_swa(action.kept_full),
-                )
-                return
-            swa_value = self._translate_full_to_swa(action.incoming_full)
-            alloc.set_full_to_swa_mapping(action.kept_full, swa_value)
-            alloc.clear_full_to_swa_mapping(action.incoming_full)
-            alloc.free_full_segment(action.incoming_full, start_pos=0)
+            else:
+                alloc.free_full_segment(action.incoming_full, start_pos=0)
             self.tree_core.set_component_device_value(
                 action.node_id, self.component_type, swa_value
             )
