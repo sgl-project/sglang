@@ -149,6 +149,7 @@ class SchedulerPPMixin:
                         running_batch=self.running_batch, last_batch=self.last_batch
                     )
                     self.running_batch = plan.running_batch
+                    self._pp_debug_check_slot(mb_id)
                     self.inflight_steps.push(plan.batch_to_run, None)
                 self.running_mbs[mb_id] = self.running_batch
                 cur_batch: Optional[ScheduleBatch] = plan.batch_to_run
@@ -293,6 +294,7 @@ class SchedulerPPMixin:
                 batch = prefill_plan.batch_to_run
                 self.running_batch = prefill_plan.running_batch
                 batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
+                self._pp_debug_check_slot(mb_id)
                 self.inflight_steps.push(batch, None)
                 self.running_mbs[mb_id] = self.running_batch
 
@@ -431,6 +433,7 @@ class SchedulerPPMixin:
                 )
                 self.running_batch = plan.running_batch
                 batch = plan.batch_to_run
+                self._pp_debug_check_slot(mb_id)
                 self.inflight_steps.push(batch, None)
                 self.running_mbs[mb_id] = self.running_batch
 
@@ -753,6 +756,11 @@ class SchedulerPPMixin:
             self.pp_outputs,
         )
         return next_pp_outputs, next_batch_result, d2h_event
+
+    def _pp_debug_check_slot(self: Scheduler, mb_id: int) -> None:
+        # Slot alignment needs exactly one push and one end_step per mb_id.
+        if envs.SGLANG_DEBUG_INFLIGHT_STEPS.get():
+            assert self.inflight_steps.step % self.pp_loop_size == mb_id
 
     def _pp_pop_due_batch(self: Scheduler) -> Optional[ScheduleBatch]:
         """Pop the record of slot next_mb_id, launched L - 1 steps ago, and
