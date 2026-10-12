@@ -25,10 +25,7 @@ from fastapi import FastAPI
 from fastapi.responses import ORJSONResponse, Response
 from transformers import PretrainedConfig
 
-from sglang.srt.distributed.parallel_state import (
-    GroupCoordinator,
-    get_mooncake_transfer_engine,
-)
+from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     EncoderDispatchErrorReq,
@@ -1873,9 +1870,6 @@ class MMReceiverBase(ABC):
         server_args: ServerArgs,
         dtype: Optional[torch.dtype] = None,
         hf_config: Optional[PretrainedConfig] = None,
-        pp_rank: Optional[int] = None,
-        tp_rank: Optional[int] = None,
-        tp_group: Optional[GroupCoordinator] = None,
         scheduler: Optional["Scheduler"] = None,
         encode_urls: Optional[List[str]] = None,
     ):
@@ -1895,10 +1889,13 @@ class MMReceiverBase(ABC):
         )
         self.recv_timeout = envs.SGLANG_ENCODER_RECV_TIMEOUT.get()
         self.host = get_local_ip_auto(get_serving().host)
-        self.pp_rank = pp_rank
-        self.tp_rank = tp_rank
-        self.tp_size = get_parallel().tp_size
-        self.tp_group = tp_group
+        # A scheduler-side receiver works across its TP group; the tokenizer
+        # side has no placement.
+        parallel = get_parallel()
+        self.pp_rank = parallel.pp_rank if scheduler is not None else None
+        self.tp_rank = parallel.tp_rank if scheduler is not None else None
+        self.tp_size = parallel.tp_size
+        self.tp_group = parallel.tp_group if scheduler is not None else None
         self.nnodes = get_parallel().nnodes
         self.hostname = get_local_ip_auto()
         self.waiting_list: List[WaitingMMRequestBase] = []
@@ -1911,7 +1908,7 @@ class MMReceiverBase(ABC):
             and scheduler is not None
         ):
             self.registration_runner = _ReceiveRegistrationRunner(
-                f"encoder-receive-registration-{tp_rank}"
+                f"encoder-receive-registration-{self.tp_rank}"
             )
             (
                 self.scheduler_embedding_port,
@@ -2677,9 +2674,6 @@ class MMReceiverHTTP(MMReceiverBase):
         server_args: ServerArgs,
         dtype: Optional[torch.dtype] = None,
         hf_config: Optional[PretrainedConfig] = None,
-        pp_rank: Optional[int] = None,
-        tp_rank: Optional[int] = None,
-        tp_group: Optional[GroupCoordinator] = None,
         scheduler: Optional["Scheduler"] = None,
         encode_urls: Optional[List[str]] = None,
     ):
@@ -2687,9 +2681,6 @@ class MMReceiverHTTP(MMReceiverBase):
             server_args,
             dtype=dtype,
             hf_config=hf_config,
-            pp_rank=pp_rank,
-            tp_rank=tp_rank,
-            tp_group=tp_group,
             scheduler=scheduler,
             encode_urls=encode_urls,
         )
@@ -2816,9 +2807,6 @@ class MMReceiverGrpc(MMReceiverBase):
         server_args: ServerArgs,
         dtype: Optional[torch.dtype] = None,
         hf_config: Optional[PretrainedConfig] = None,
-        pp_rank: Optional[int] = None,
-        tp_rank: Optional[int] = None,
-        tp_group: Optional[GroupCoordinator] = None,
         scheduler: Optional["Scheduler"] = None,
         encode_urls: Optional[List[str]] = None,
     ):
@@ -2833,9 +2821,6 @@ class MMReceiverGrpc(MMReceiverBase):
             server_args,
             dtype=dtype,
             hf_config=hf_config,
-            pp_rank=pp_rank,
-            tp_rank=tp_rank,
-            tp_group=tp_group,
             scheduler=scheduler,
             encode_urls=encode_urls,
         )
@@ -2949,9 +2934,6 @@ def create_mm_receiver(
     server_args: ServerArgs,
     dtype: Optional[torch.dtype] = None,
     hf_config: Optional[PretrainedConfig] = None,
-    pp_rank: Optional[int] = None,
-    tp_rank: Optional[int] = None,
-    tp_group: Optional[GroupCoordinator] = None,
     scheduler: Optional["Scheduler"] = None,
     transport_mode: Optional[str] = None,
     encode_urls: Optional[List[str]] = None,
@@ -2970,9 +2952,6 @@ def create_mm_receiver(
         server_args,
         dtype=dtype,
         hf_config=hf_config,
-        pp_rank=pp_rank,
-        tp_rank=tp_rank,
-        tp_group=tp_group,
         scheduler=scheduler,
         encode_urls=encode_urls,
     )
