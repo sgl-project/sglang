@@ -1,4 +1,4 @@
-"""CPU guards for DeepGEMM UE8M0 weight-scale requantization decisions."""
+"""CPU guards for UE8M0 weight quantization and DeepGEMM requantization."""
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -26,6 +26,45 @@ def _make_params(n: int = 64, k: int = 128):
     weight_scale = torch.nn.Parameter(torch.ones((1, 1)), requires_grad=False)
     weight_scale.format_ue8m0 = False
     return weight, weight_scale
+
+
+class TestUE8M0WeightQuantization(CustomTestCase):
+    def test_fp32_exports_match_bf16_quantization(self):
+        """Upcasting BF16 weights for export must preserve their FP8 encoding."""
+        generator = torch.Generator().manual_seed(0)
+        for shape in ((256, 512), (2, 128, 512)):
+            with self.subTest(shape=shape):
+                weight = torch.randn(shape, generator=generator, dtype=torch.bfloat16)
+                exported = weight.float()
+                expected_weight, expected_scale = fp8_utils.quant_weight_ue8m0(
+                    weight, BLOCK_SIZE
+                )
+                actual_weight, actual_scale = fp8_utils.quant_weight_ue8m0(
+                    exported, BLOCK_SIZE
+                )
+                self.assertTrue(
+                    torch.equal(
+                        actual_weight.view(torch.uint8),
+                        expected_weight.view(torch.uint8),
+                    )
+                )
+                torch.testing.assert_close(actual_scale, expected_scale, rtol=0, atol=0)
+                self.assertEqual(exported.dtype, torch.float32)
+                torch.testing.assert_close(exported, weight.float(), rtol=0, atol=0)
+
+    def test_fp32_values_are_not_rounded_through_bf16(self):
+        """FP32 values above an FP8 midpoint must not become BF16 ties first."""
+        weight = torch.zeros((128, 128), dtype=torch.float32)
+        weight[0, 0] = 448.0
+        # With scale 1, the E4M3 midpoint is 1.0625, exactly representable in BF16.
+        weight[0, 1] = 1.063
+
+        quantized, scale = fp8_utils.quant_weight_ue8m0(weight, BLOCK_SIZE)
+        rounded, _ = fp8_utils.quant_weight_ue8m0(weight.bfloat16(), BLOCK_SIZE)
+
+        self.assertEqual(scale.item(), 1.0)
+        self.assertEqual(quantized[0, 1].float().item(), 1.125)
+        self.assertEqual(rounded[0, 1].float().item(), 1.0)
 
 
 class TestDeepGemmUE8M0Requant(CustomTestCase):

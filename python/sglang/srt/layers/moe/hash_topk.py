@@ -20,6 +20,7 @@ from sglang.srt.layers.moe.topk import (
     TopKConfig,
     _mask_topk_ids_padded_region,
     _zero_topk_weights_padded_region,
+    capture_routed_experts_if_allowed,
     remap_topk_for_per_rank_shared_slots,
 )
 from sglang.srt.layers.moe.utils import has_per_rank_fused_shared_slots
@@ -54,12 +55,26 @@ class HashTopK(nn.Module):
         self.waterfill_balancer = None
 
         if self.enable_waterfill:
+            # Routed-experts capture sizes its buffer by the model's fused
+            # shared-expert count, but under waterfill the ids captured here
+            # carry routed slots only, so the two widths disagree.
+            if get_exec().features.enable_return_routed_experts:
+                raise ValueError(
+                    "HashTopK cannot capture routed experts with waterfill enabled: "
+                    "disable --enable-waterfill or --enable-return-routed-experts."
+                )
             # Waterfill appends the shared expert after EPLB maps routed IDs.
             topk -= num_fused_shared_experts
             num_fused_shared_experts = 0
 
         self.num_experts = num_experts
         self.topk = topk
+        self.topk_config = TopKConfig(
+            top_k=topk,
+            num_fused_shared_experts=num_fused_shared_experts,
+            routed_scaling_factor=routed_scaling_factor,
+            scoring_func=scoring_func,
+        )
         self.routed_scaling_factor = routed_scaling_factor
         self.num_fused_shared_experts = num_fused_shared_experts
         self.score_func = scoring_func
@@ -250,6 +265,13 @@ class HashTopK(nn.Module):
         if self.apply_routed_scaling_factor_on_output:
             topk_weights = topk_weights * self.routed_scaling_factor
 
+        capture_routed_experts_if_allowed(
+            self.topk_config,
+            self.layer_id,
+            topk_ids,
+            num_token_non_padded,
+        )
+
         num_fused_shared_experts = self.num_fused_shared_experts
         log2phy_prob = None
         if (
@@ -284,11 +306,7 @@ class HashTopK(nn.Module):
                 topk_weights,
                 num_fused_shared_experts,
                 num_physical_routed_experts,
-                TopKConfig(
-                    top_k=self.topk,
-                    num_fused_shared_experts=num_fused_shared_experts,
-                    routed_scaling_factor=self.routed_scaling_factor,
-                ),
+                self.topk_config,
             )
         else:
             topk_ids = topk_ids_logical_to_physical(
