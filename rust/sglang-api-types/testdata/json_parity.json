@@ -128,7 +128,7 @@
         "priority": 3,
         "session_id": "ignored"
       },
-      "canonical": "{\"text\":\"see\",\"stream\":false,\"image_data\":[[\"a\",null],null,[]],\"mm_hashes\":[\"h1\",\"h2\"],\"video_data\":{\"url\":\"v\",\"fps\":2.0,\"use_audio\":true},\"audio_data\":\"data:audio/wav;base64,AA==\"}"
+      "canonical": "{\"text\":\"see\",\"stream\":false,\"image_data\":[[\"a\",null],null,[]],\"mm_hashes\":[\"h1\",\"h2\"],\"video_data\":{\"url\":\"v\",\"fps\":2.0,\"use_audio\":true},\"audio_data\":\"data:audio/wav;base64,AA==\",\"priority\":3}"
     },
     {
       "type": "SamplingParams",
@@ -354,7 +354,7 @@
           }
         ]
       },
-      "canonical": "{\"model_path\":\"/m\",\"served_model_name\":\"m\",\"tokenizer_path\":\"/t\",\"max_context_length\":4096,\"max_total_num_tokens\":8192,\"version\":\"0.5.0\",\"internal_states\":[{\"last_gen_throughput\":1.5,\"memory_usage\":{\"weight\":2.0}}]}"
+      "canonical": "{\"model_path\":\"/m\",\"served_model_name\":\"m\",\"tokenizer_path\":\"/t\",\"max_context_length\":4096,\"max_total_num_tokens\":8192,\"version\":\"0.5.0\",\"internal_states\":[{\"last_gen_throughput\":1.5,\"memory_usage\":{\"weight\":2.0}}],\"host\":\"\",\"port\":0,\"incremental_streaming_output\":false,\"disaggregation_mode\":\"\",\"node_rank\":0,\"nnodes\":0,\"dp_size\":0,\"base_gpu_id\":0,\"dcp_size\":0,\"max_prefill_tokens\":0,\"enable_dp_attention\":false,\"enable_hierarchical_cache\":false,\"hicache_size\":0}"
     },
     {
       "type": "SamplingParams",

@@ -11,8 +11,8 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.managers.utils import compute_num_reserved_tokens
 from sglang.srt.runtime_context import (
-    get_disagg,
     get_device,
+    get_disagg,
     get_memory,
     get_mm,
     get_model,
