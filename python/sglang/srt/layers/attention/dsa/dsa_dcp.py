@@ -14,8 +14,8 @@ TRTLLM_MAX_BATCH_ROWS = 65535
 
 
 class DcpPageTableCache(msgspec.Struct):
-    """NOTE(vincentzed): 57 of GLM's 78 layers reuse the previous layer's top-k
-    tensor; remapping once per fresh top-k cuts 78 launches/step to 21.
+    """NOTE(vincentzed): GLM-5.2/5.3 reuse the previous layer's top-k tensor in
+    57 of 78 layers; remapping once per fresh top-k cuts 78 launches/step to 21.
     """
 
     metadata: object = None
