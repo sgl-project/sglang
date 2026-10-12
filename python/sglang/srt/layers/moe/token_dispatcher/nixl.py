@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from enum import Enum, auto
+from functools import cache
 
 import torch
 import torch.distributed as dist
@@ -23,18 +24,34 @@ from sglang.srt.layers.moe.token_dispatcher.deepep import (
 )
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import DeepEPMode
-
-try:
-    from nixl_ep import Buffer
-
-    use_nixl = True
-except ImportError:
-    use_nixl = False
+from sglang.srt.runtime_context import (
+    get_parallel,
+    get_resources,
+)
 
 logger = logging.getLogger(__name__)
 
 NixlEPDispatchOutput = DeepEPLLDispatchOutput
 NixlEPCombineInput = DeepEPLLCombineInput
+
+
+@cache
+def _load_nixl_ep() -> tuple[type, torch.dtype]:
+    try:
+        from nixl_ep import Buffer
+    except ImportError as exc:
+        raise ImportError(
+            "NixlEP is not installed. Please install NixlEP package from "
+            "https://github.com/ai-dynamo/nixl."
+        ) from exc
+
+    try:
+        from nixl_ep import topk_idx_t
+    except ImportError:
+        topk_idx_t = torch.int64
+
+    assert isinstance(topk_idx_t, torch.dtype)
+    return Buffer, topk_idx_t
 
 
 class NixlEPBuffer:
@@ -44,8 +61,6 @@ class NixlEPBuffer:
     @classmethod
     def _state(cls):
         from types import SimpleNamespace
-
-        from sglang.srt.runtime_context import get_resources
 
         buffers = get_resources().buffers
         state = buffers.get("nixl_ep_state")
@@ -116,6 +131,7 @@ class NixlEPBuffer:
                 cls._update_connections(state, state.scale_to)
             return state.buffer
 
+        Buffer, _ = _load_nixl_ep()
         state.hidden_size = hidden_size
         state.num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank
         state.num_experts = num_experts
@@ -127,9 +143,7 @@ class NixlEPBuffer:
         offset = ElasticEPStateManager.get_ep_join_rank_offset()
         global_rank = rank + offset
 
-        from sglang.srt.runtime_context import get_server_args
-
-        max_ep_size = get_server_args().max_ep_size or world_size
+        max_ep_size = get_parallel().max_ep_size or world_size
         nixl_max_ranks = max_ep_size
 
         num_rdma_bytes = 0
@@ -200,11 +214,7 @@ class _NixlEPDispatcherImplBase:
         params_dtype: torch.dtype,
         deepep_mode: DeepEPMode,
     ):
-        if not use_nixl:
-            raise ImportError(
-                "NixlEP is not installed. Please install NixlEP package from "
-                "https://github.com/ai-dynamo/nixl."
-            )
+        _, self.topk_indices_dtype = _load_nixl_ep()
 
         self.group = group
         self.router_topk = router_topk
@@ -226,9 +236,8 @@ class _NixlEPDispatcherImplBase:
             elastic_state.active_ranks if elastic_state is not None else None
         )
         self._active_world_size = dist.get_world_size(group)
-        from sglang.srt.runtime_context import get_server_args
 
-        _max_ep = get_server_args().max_ep_size or self._active_world_size
+        _max_ep = get_parallel().max_ep_size or self._active_world_size
         self._mask_buffer = (
             torch.zeros(_max_ep, dtype=torch.int32, device="cuda")
             if self.active_ranks is not None
@@ -290,7 +299,7 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
     ):
         buffer = self._get_buffer()
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
-        topk_ids = topk_ids.to(torch.int64)
+        topk_ids = topk_ids.to(self.topk_indices_dtype)
         state = NixlEPBuffer._state()
         dispatch_ep_size = state.dispatch_ep_size
         num_local_experts = state.num_local_experts
@@ -413,7 +422,7 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
         if self._mask_buffer is not None:
             buffer.query_mask_buffer(self._mask_buffer)
 
-            n = ElasticEPStateManager.get_effective_ep_size()
+            n = ElasticEPStateManager.get_data_plane_ep_size()
             self.active_ranks[:n].copy_(1 - self._mask_buffer[:n])
 
         self.packed_recv_count = self.handle = None

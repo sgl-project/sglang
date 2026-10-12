@@ -4,11 +4,10 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_adapter import (
-    BaseRealtimeModelAdapter,
-)
-
 if TYPE_CHECKING:
+    from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_adapter import (
+        BaseRealtimeModelAdapter,
+    )
     from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 
@@ -66,4 +65,13 @@ def get_realtime_model_adapter(
     raise ValueError(
         "Realtime video is not supported for pipeline config "
         f"{type(pipeline_config).__name__}; no realtime adapter is registered."
+    )
+
+
+def has_realtime_model_adapter(server_args: ServerArgs) -> bool:
+    """Whether the resolved pipeline config has a registered adapter."""
+    _register_builtin_realtime_model_adapters()
+    return any(
+        config_cls in _REALTIME_ADAPTER_REGISTRY
+        for config_cls in type(server_args.pipeline_config).__mro__
     )

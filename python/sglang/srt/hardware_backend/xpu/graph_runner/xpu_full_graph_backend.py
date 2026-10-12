@@ -22,6 +22,7 @@ from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
 from sglang.srt.model_executor.runner_utils.pool import (
     get_or_create_global_graph_memory_pool,
 )
+from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -41,7 +42,7 @@ class FullXPUGraphBackend(BaseCudaGraphBackend):
         self._outputs: Dict[Any, Any] = {}
         self._pool = None
         self._device_module = cuda_graph_runner.device_module
-        self._tp_group = cuda_graph_runner.model_runner.tp_group
+        self._tp_group = get_parallel().tp_group
         self._capture_stream: Optional[torch.xpu.Stream] = None
 
     @contextmanager
@@ -58,7 +59,7 @@ class FullXPUGraphBackend(BaseCudaGraphBackend):
         self,
         shape_key: ShapeKey,
         forward_fn: Callable[[], Any],
-        dummies: Optional[Any] = None,
+        capture_inputs: Optional[Any] = None,
         post_warmup_hook: Optional[Callable[[], None]] = None,
     ) -> None:
         for _ in range(2):

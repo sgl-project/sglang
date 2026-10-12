@@ -28,7 +28,7 @@ git add -A
 git commit -m "chore: bump sglang-kernel version to ${KERNEL_VERSION} in SGLang
 
 This commit updates the sglang-kernel version across SGLang files to match
-the version defined in sgl-kernel/pyproject.toml.
+the version defined in python/sglang/kernels/aot/pyproject.toml.
 
 Files updated:
 ${COMMIT_FILES}
@@ -45,7 +45,7 @@ PR_URL=$(gh pr create \
   --title "chore: bump sglang-kernel version to ${KERNEL_VERSION}" \
   --body "## Summary
 
-This PR bumps the \`sglang-kernel\` version to \`${KERNEL_VERSION}\` across SGLang files to match the version defined in \`sgl-kernel/pyproject.toml\`.
+This PR bumps the \`sglang-kernel\` version to \`${KERNEL_VERSION}\` across SGLang files to match the version defined in \`python/sglang/kernels/aot/pyproject.toml\`.
 
 **Kernel Version:** \`${KERNEL_VERSION}\`
 
@@ -54,7 +54,7 @@ ${FILES_LIST}
 
 ## Context
 
-The kernel version in \`sgl-kernel/pyproject.toml\` has been updated. This PR ensures that all SGLang files referencing the \`sglang-kernel\` dependency are updated accordingly:
+The kernel version in \`python/sglang/kernels/aot/pyproject.toml\` has been updated. This PR ensures that all SGLang files referencing the \`sglang-kernel\` dependency are updated accordingly:
 - \`python/pyproject.toml\` - dependency specification
 - \`python/sglang/srt/entrypoints/engine.py\` - version check
 - \`docker/Dockerfile\` - Docker build argument

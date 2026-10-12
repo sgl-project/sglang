@@ -1,5 +1,5 @@
 """
-Publish diffusion CI ground-truth images to sgl-project/ci-data
+Publish diffusion CI ground-truth images and audio to sgl-project/ci-data-diffusion
 via the GitHub API (same pattern as publish_traces.py).
 """
 
@@ -10,6 +10,7 @@ import io
 import json
 import os
 import sys
+import wave
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.error import HTTPError
@@ -48,11 +49,12 @@ else:
     )
 
 REPO_OWNER = "sgl-project"
-REPO_NAME = "ci-data"
+REPO_NAME = "ci-data-diffusion"
 BRANCH = "main"
 DEFAULT_TARGET_DIR = "diffusion-ci/consistency_gt/sglang_generated"
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
+GT_EXTENSIONS = IMAGE_EXTENSIONS | {".wav"}
 QUALITY_MAX_SIDE = 256
 LOW_DETAIL_STD_THRESHOLD = 0.075
 LOW_DETAIL_ENTROPY_THRESHOLD = 0.55
@@ -81,12 +83,12 @@ class OldNewMetrics:
     mean_abs_diff: float
 
 
-def collect_images(source_dir, target_dir):
-    """Collect image files from source_dir and return list of (repo_path, content) tuples."""
+def collect_gt_files(source_dir, target_dir):
+    """Collect image and audio GT files from source_dir and return list of (repo_path, content) tuples."""
     files = []
     for entry in sorted(os.listdir(source_dir)):
         ext = os.path.splitext(entry)[1].lower()
-        if ext not in IMAGE_EXTENSIONS:
+        if ext not in GT_EXTENSIONS:
             continue
         full_path = os.path.join(source_dir, entry)
         if not os.path.isfile(full_path):
@@ -106,13 +108,13 @@ def git_blob_sha(content):
 def get_remote_blob_shas(repo_owner, repo_name, target_dir, token):
     return {
         path: item["sha"]
-        for path, item in get_remote_image_entries(
+        for path, item in get_remote_gt_entries(
             repo_owner, repo_name, target_dir, token
         ).items()
     }
 
 
-def get_remote_image_entries(repo_owner, repo_name, target_dir, token):
+def get_remote_gt_entries(repo_owner, repo_name, target_dir, token):
     url = (
         f"https://api.github.com/repos/{repo_owner}/{repo_name}/contents/"
         f"{target_dir}?ref={BRANCH}"
@@ -129,7 +131,7 @@ def get_remote_image_entries(repo_owner, repo_name, target_dir, token):
         for item in entries
         if item.get("type") == "file"
         and "sha" in item
-        and os.path.splitext(item["path"])[1].lower() in IMAGE_EXTENSIONS
+        and os.path.splitext(item["path"])[1].lower() in GT_EXTENSIONS
     }
 
 
@@ -301,6 +303,22 @@ def _format_old_new_metrics(metrics):
 def validate_gt_files(files_to_upload, changed_files, remote_image_entries, token):
     failures = []
     for path, content in files_to_upload:
+        if Path(path).suffix.lower() == ".wav":
+            try:
+                with wave.open(io.BytesIO(content), "rb") as wav:
+                    if (
+                        wav.getnchannels() != 1
+                        or wav.getsampwidth() != 2
+                        or wav.getframerate() != 16000
+                        or wav.getnframes() == 0
+                        or len(wav.readframes(wav.getnframes())) != wav.getnframes() * 2
+                    ):
+                        failures.append(
+                            f"{path}: expected nonempty mono 16 kHz PCM16 audio"
+                        )
+            except (wave.Error, EOFError) as exc:
+                failures.append(f"{path}: invalid WAV ({exc})")
+            continue
         quality_metrics = compute_image_quality_metrics(content)
         quality_reasons = get_quality_failure_reasons(quality_metrics)
         if quality_reasons:
@@ -310,6 +328,8 @@ def validate_gt_files(files_to_upload, changed_files, remote_image_entries, toke
             )
 
     for path, content in changed_files:
+        if Path(path).suffix.lower() == ".wav":
+            continue
         remote_entry = remote_image_entries.get(path)
         if not remote_entry:
             continue
@@ -339,8 +359,8 @@ def validate_gt_files(files_to_upload, changed_files, remote_image_entries, toke
 
     if not failures:
         print(
-            f"GT quality gate passed for {len(files_to_upload)} generated image(s) "
-            f"and {len(changed_files)} changed image(s)."
+            f"GT quality gate passed for {len(files_to_upload)} generated GT file(s) "
+            f"and {len(changed_files)} changed GT file(s)."
         )
         return
 
@@ -350,19 +370,18 @@ def validate_gt_files(files_to_upload, changed_files, remote_image_entries, toke
     sys.exit(1)
 
 
-def check_quality(source_dir, target_dir=None):
-    target_dir = target_dir or DEFAULT_TARGET_DIR
+def check_quality(source_dir, target_dir):
     token = os.getenv("GITHUB_TOKEN")
     if not token:
         print("Error: GITHUB_TOKEN environment variable not set")
         sys.exit(1)
 
-    files_to_upload = collect_images(source_dir, target_dir)
+    files_to_upload = collect_gt_files(source_dir, target_dir)
     if not files_to_upload:
-        print(f"No image files found in {source_dir}")
+        print(f"No GT files found in {source_dir}")
         return
 
-    remote_image_entries = get_remote_image_entries(
+    remote_image_entries = get_remote_gt_entries(
         REPO_OWNER, REPO_NAME, target_dir, token
     )
     remote_blob_shas = {
@@ -372,20 +391,19 @@ def check_quality(source_dir, target_dir=None):
     validate_gt_files(files_to_upload, changed_files, remote_image_entries, token)
 
 
-def publish(source_dir, target_dir=None):
-    target_dir = target_dir or DEFAULT_TARGET_DIR
+def publish(source_dir, target_dir):
     token = os.getenv("GITHUB_TOKEN")
     if not token:
         print("Error: GITHUB_TOKEN environment variable not set")
         sys.exit(1)
 
-    files_to_upload = collect_images(source_dir, target_dir)
+    files_to_upload = collect_gt_files(source_dir, target_dir)
     if not files_to_upload:
-        print(f"No image files found in {source_dir}")
+        print(f"No GT files found in {source_dir}")
         return
 
     print(
-        f"Found {len(files_to_upload)} image(s) to upload to {REPO_OWNER}/{REPO_NAME}/{target_dir}"
+        f"Found {len(files_to_upload)} GT file(s) to upload to {REPO_OWNER}/{REPO_NAME}/{target_dir}"
     )
 
     # Verify token
@@ -403,7 +421,7 @@ def publish(source_dir, target_dir=None):
         try:
             branch_sha = get_branch_sha(REPO_OWNER, REPO_NAME, BRANCH, token)
             tree_sha = get_tree_sha(REPO_OWNER, REPO_NAME, branch_sha, token)
-            remote_image_entries = get_remote_image_entries(
+            remote_image_entries = get_remote_gt_entries(
                 REPO_OWNER, REPO_NAME, target_dir, token
             )
             remote_blob_shas = {
@@ -414,7 +432,7 @@ def publish(source_dir, target_dir=None):
                 files_to_upload, changed_files, remote_image_entries, token
             )
             if not changed_files:
-                print("No image changes to publish.")
+                print("No GT changes to publish.")
                 return
 
             try:
@@ -438,13 +456,13 @@ def publish(source_dir, target_dir=None):
                 print("No tree changes to publish.")
                 return
 
-            commit_msg = f"diffusion-ci: update images in {target_dir} ({len(changed_files)} files) [automated]"
+            commit_msg = f"diffusion-ci: update GT in {target_dir} ({len(changed_files)} files) [automated]"
             commit_sha = create_commit(
                 REPO_OWNER, REPO_NAME, new_tree_sha, branch_sha, commit_msg, token
             )
             update_branch_ref(REPO_OWNER, REPO_NAME, BRANCH, commit_sha, token)
             print(
-                f"Successfully pushed {len(changed_files)} changed images (commit {commit_sha[:10]})"
+                f"Successfully pushed {len(changed_files)} changed GT files (commit {commit_sha[:10]})"
             )
             return
         except Exception as e:
@@ -478,6 +496,23 @@ def publish(source_dir, target_dir=None):
                 raise
 
 
+def _resolve_target_dir(target_dir: str | None, per_platform: bool) -> str:
+    """Resolve the effective remote target dir.
+
+    With ``per_platform`` set, append the consistency platform subdir
+    (``h100``/``b200``/``5090``) so the publish path matches how the consistency
+    tests resolve GT: ``<target>/<platform>/<file>`` first, bare ``<target>/<file>``
+    only as fallback. Reuses the SAME resolver the tests use so read and write can
+    never drift. Lazy import keeps this script light when the flag is off.
+    """
+    target_dir = target_dir or DEFAULT_TARGET_DIR
+    if per_platform:
+        from sglang.multimodal_gen.test.test_utils import get_consistency_platform
+
+        target_dir = f"{target_dir}/{get_consistency_platform()}"
+    return target_dir
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Publish diffusion GT images to GitHub"
@@ -497,10 +532,13 @@ def main():
         help="Validate generated GT images without publishing them",
     )
     args = parser.parse_args()
+
+    per_platform = os.environ.get("SGLANG_DIFFUSION_GT_PER_PLATFORM") == "1"
+    target_dir = _resolve_target_dir(args.target_dir, per_platform)
     if args.check_only:
-        check_quality(args.source_dir, args.target_dir)
+        check_quality(args.source_dir, target_dir)
     else:
-        publish(args.source_dir, args.target_dir)
+        publish(args.source_dir, target_dir)
 
 
 if __name__ == "__main__":

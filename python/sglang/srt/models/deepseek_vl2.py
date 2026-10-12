@@ -1,3 +1,4 @@
+from array import array
 from typing import Iterable, List, Optional, Tuple
 
 import torch
@@ -156,6 +157,15 @@ class DeepseekVL2MlpProjector(nn.Module):
 
 
 class DeepseekVL2ForCausalLM(nn.Module):
+    @staticmethod
+    def shared_experts_fusion_disable_reason(hf_config, quant_config):
+        language_config = hf_config.language_config
+        if not language_config.use_mla:
+            return None
+        # The language model is built without a quantization config.
+        return DeepseekV2ForCausalLM.shared_experts_fusion_disable_reason(
+            language_config, None
+        )
 
     def __init__(
         self,
@@ -253,7 +263,7 @@ class DeepseekVL2ForCausalLM(nn.Module):
                 weights_loader = getattr(param, "weight_loader", default_weight_loader)
                 weights_loader(param, loaded_weight)
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 

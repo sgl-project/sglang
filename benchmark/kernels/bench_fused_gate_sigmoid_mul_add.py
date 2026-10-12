@@ -7,7 +7,7 @@ over the Qwen3.5 MoE target hidden size.
 import torch
 import triton
 
-from sglang.kernels.ops.layernorm.elementwise import fused_gate_sigmoid_mul_add
+from sglang.kernels.ops.elementwise.elementwise import fused_gate_sigmoid_mul_add
 
 HIDDEN_DIMS = [4096]
 

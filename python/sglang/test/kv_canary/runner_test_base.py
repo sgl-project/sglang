@@ -5,8 +5,8 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.jit_kernel.kv_canary.consts import RealKvHashMode
-from sglang.jit_kernel.kv_canary.verify import CanaryLaunchTag
+from sglang.kernels.ops.kv_canary.consts import RealKvHashMode
+from sglang.kernels.ops.kv_canary.verify import CanaryLaunchTag
 from sglang.srt.kv_canary import endpoint as endpoint_module
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup
 from sglang.srt.kv_canary.capacities import CanaryLaunchCapacities
@@ -74,6 +74,7 @@ def make_manager(
     req_pool: SimpleNamespace | None = None,
     per_forward_verify_capacity: int = 16,
     speculative_num_steps: int = 1,
+    is_eagle_draft_decode: bool = False,
 ) -> CanaryManager:
     if config is None:
         config = make_config()
@@ -95,6 +96,7 @@ def make_manager(
             per_forward_write_entry_capacity=8,
         ),
         speculative_num_steps=speculative_num_steps,
+        is_eagle_draft_decode=is_eagle_draft_decode,
     )
 
 

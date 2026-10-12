@@ -22,6 +22,7 @@
 """Inference-only MiniCPM-V model compatible with HuggingFace weights."""
 
 import types
+from array import array
 from functools import partial
 from itertools import chain
 from typing import (
@@ -269,7 +270,6 @@ class BaseResampler(nn.Module):
 
 
 class Resampler2_5(BaseResampler):
-
     def __init__(
         self,
         num_queries: int,
@@ -346,9 +346,7 @@ class Resampler2_5(BaseResampler):
             key_padding_mask[i, patch_len[i] :] = True
         pos_embed = torch.nn.utils.rnn.pad_sequence(
             pos_embed, batch_first=True, padding_value=0.0
-        ).permute(
-            1, 0, 2
-        )  # BLD => L * B * D
+        ).permute(1, 0, 2)  # BLD => L * B * D
         x, _ = self.kv_proj(x)  # B * L * D
         x = self.ln_kv(x).permute(1, 0, 2)  # L * B * D
 
@@ -369,7 +367,6 @@ class Resampler2_5(BaseResampler):
 
 
 class Resampler4_5(BaseResampler):
-
     def __init__(
         self,
         num_queries: int,
@@ -522,9 +519,7 @@ class Resampler4_5(BaseResampler):
 
         pos_embed_2d = torch.nn.utils.rnn.pad_sequence(
             pos_embed_2d, batch_first=True, padding_value=0.0
-        ).permute(
-            1, 0, 2
-        )  # BLD => L * B * D
+        ).permute(1, 0, 2)  # BLD => L * B * D
 
         k = x
         v = x + pos_embed_2d
@@ -554,14 +549,10 @@ class Resampler4_5(BaseResampler):
 
             k = torch.nn.utils.rnn.pad_sequence(
                 merge_k, batch_first=True, padding_value=0.0
-            ).permute(
-                1, 0, 2
-            )  # L*(end-start)
+            ).permute(1, 0, 2)  # L*(end-start)
             v = torch.nn.utils.rnn.pad_sequence(
                 merge_v, batch_first=True, padding_value=0.0
-            ).permute(
-                1, 0, 2
-            )  # L*(end-start)
+            ).permute(1, 0, 2)  # L*(end-start)
             key_padding_mask = torch.nn.utils.rnn.pad_sequence(
                 merge_key_padding_mask, batch_first=True, padding_value=True
             ).squeeze(-1)
@@ -725,8 +716,7 @@ class MiniCPMBaseModel(nn.Module):
             )
             if not isinstance(image_embeds, (torch.Tensor, list)):
                 raise ValueError(
-                    f"Incorrect type of image embeds. "
-                    f"Got type: {type(image_embeds)}"
+                    f"Incorrect type of image embeds. Got type: {type(image_embeds)}"
                 )
 
             if isinstance(image_embeds, list):
@@ -994,7 +984,7 @@ class MiniCPMV2_6(MiniCPMBaseModel):
         )
         return self.resampler(vision_embedding, tgt_sizes)
 
-    def pad_input_ids(self, input_ids: List[int], image_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, image_inputs: MultimodalInputs) -> array:
         # Get all special token IDs
         im_start_id: int = image_inputs.im_start_id
         im_end_id: int = image_inputs.im_end_id
@@ -1160,7 +1150,7 @@ class MiniCPMV4_0(MiniCPMBaseModel):
         )
         return self.resampler(vision_embedding, tgt_sizes)
 
-    def pad_input_ids(self, input_ids: List[int], image_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, image_inputs: MultimodalInputs) -> array:
         # Get all special token IDs
         im_start_id: int = image_inputs.im_start_id
         im_end_id: int = image_inputs.im_end_id
@@ -1330,7 +1320,7 @@ class MiniCPMV4_5(MiniCPMBaseModel):
         )
         return self.resampler(vision_embedding, tgt_sizes)
 
-    def pad_input_ids(self, input_ids: List[int], image_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, image_inputs: MultimodalInputs) -> array:
         # Get all special token IDs
         im_start_id: int = image_inputs.im_start_id
         im_end_id: int = image_inputs.im_end_id
@@ -1555,7 +1545,7 @@ class MiniCPMV4_6(MiniCPMBaseModel):
     # source. sglang's dispatcher routes by ``get_{modality}_feature``.
     get_video_feature = get_image_feature
 
-    def pad_input_ids(self, input_ids: List[int], image_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, image_inputs: MultimodalInputs) -> array:
         im_start_id: int = image_inputs.im_start_id
         im_end_id: int = image_inputs.im_end_id
         slice_start_id: int = image_inputs.slice_start_id
@@ -1639,6 +1629,14 @@ class MiniCPMV:
     embedding_padding_modules = []
 
     minicpmv: nn.Module
+
+    @staticmethod
+    def shared_experts_fusion_disable_reason(hf_config, quant_config):
+        # 4.6 nests a Qwen3.5 LLM under ``text_config``; every other version
+        # builds a dense LLM, for which the Qwen3.5 gate answers None.
+        return Qwen3_5ForCausalLM.shared_experts_fusion_disable_reason(
+            getattr(hf_config, "text_config", hf_config), quant_config
+        )
 
     def __init__(
         self,

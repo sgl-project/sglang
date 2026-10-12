@@ -1,11 +1,71 @@
-from typing import Optional, Tuple
+from typing import NamedTuple, Optional, Tuple
 
 import torch
 import triton
 import triton.language as tl
 
 
-@triton.jit(do_not_specialize=["bs", "c128_cur_max_seq_len"])
+@triton.jit
+def _fill_all_compressed_indices_kernel(
+    page_table,
+    seq_lens,
+    page_indices,
+    raw_indices,
+    PAGE_STRIDE: tl.constexpr,
+    TOPK: tl.constexpr,
+    RATIO: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    positions = tl.arange(0, BLOCK)
+    length = tl.load(seq_lens + row)
+    valid = (positions < length) & (positions < TOPK)
+    slots_per_page = PAGE_SIZE // RATIO
+    pages = tl.load(
+        page_table + row * PAGE_STRIDE + positions // slots_per_page,
+        mask=valid,
+        other=0,
+    )
+    slots = pages * slots_per_page + positions % slots_per_page
+    tl.store(
+        page_indices + row * TOPK + positions,
+        tl.where(valid, slots, -1),
+        positions < TOPK,
+    )
+    if raw_indices is not None:
+        tl.store(
+            raw_indices + row * TOPK + positions,
+            tl.where(valid, positions, -1),
+            positions < TOPK,
+        )
+
+
+def fill_all_compressed_indices(
+    page_table: torch.Tensor,
+    compressed_seq_lens: torch.Tensor,
+    page_indices: torch.Tensor,
+    *,
+    compress_ratio: int,
+    page_size: int,
+    raw_indices: Optional[torch.Tensor] = None,
+) -> None:
+    """Fill all reachable slots; the caller guarantees compressed length <= top-k."""
+    topk = page_indices.shape[1]
+    _fill_all_compressed_indices_kernel[(compressed_seq_lens.numel(),)](
+        page_table,
+        compressed_seq_lens,
+        page_indices,
+        raw_indices,
+        page_table.stride(0),
+        topk,
+        compress_ratio,
+        page_size,
+        triton.next_power_of_2(topk),
+    )
+
+
+@triton.jit(do_not_specialize=["bs", "num_write_tokens", "c128_cur_max_seq_len"])
 def _init_compressed_attn_metadata_kernel(
     seq_lens_ptr,
     positions_ptr,
@@ -21,6 +81,7 @@ def _init_compressed_attn_metadata_kernel(
     c128_seq_lens_clamp1_ptr,
     c128_page_indices_ptr,
     bs,
+    num_write_tokens,
     max_pages,
     c128_cur_max_seq_len,
     c128_page_size: tl.constexpr,
@@ -33,7 +94,8 @@ def _init_compressed_attn_metadata_kernel(
 
     seq_len = tl.load(seq_lens_ptr + batch_id)
     position = tl.load(positions_ptr + batch_id)
-    raw_out_loc = tl.load(raw_out_loc_ptr + batch_id)
+    is_write_token = batch_id < num_write_tokens
+    raw_out_loc = tl.load(raw_out_loc_ptr + batch_id, mask=is_write_token, other=0)
 
     c4_should_compress = (seq_len % 4) == 0
     c4_out_loc = tl.where(c4_should_compress, raw_out_loc // 4, 0)
@@ -41,7 +103,7 @@ def _init_compressed_attn_metadata_kernel(
     c4_seq_lens_raw = seq_len // 4
     c4_seq_lens_clamp1 = tl.maximum(c4_seq_lens_raw, 1)
 
-    tl.store(c4_out_loc_ptr + batch_id, c4_out_loc)
+    tl.store(c4_out_loc_ptr + batch_id, c4_out_loc, mask=is_write_token)
     tl.store(c4_positions_ptr + batch_id, c4_positions)
     tl.store(c4_seq_lens_raw_ptr + batch_id, c4_seq_lens_raw)
     tl.store(c4_seq_lens_clamp1_ptr + batch_id, c4_seq_lens_clamp1)
@@ -52,7 +114,7 @@ def _init_compressed_attn_metadata_kernel(
     c128_seq_lens_raw = seq_len // 128
     c128_seq_lens_clamp1 = tl.maximum(c128_seq_lens_raw, 1)
 
-    tl.store(c128_out_loc_ptr + batch_id, c128_out_loc)
+    tl.store(c128_out_loc_ptr + batch_id, c128_out_loc, mask=is_write_token)
     tl.store(c128_positions_ptr + batch_id, c128_positions)
     tl.store(c128_seq_lens_raw_ptr + batch_id, c128_seq_lens_raw)
     tl.store(c128_seq_lens_clamp1_ptr + batch_id, c128_seq_lens_clamp1)
@@ -104,25 +166,32 @@ def _init_compressed_attn_metadata_triton(
     Optional[torch.Tensor],
 ]:
     bs = seq_lens.shape[0]
+    # CP may add padding rows to the attention metadata, but those rows have
+    # no cache-write locations. Keep the write buffers unpadded and mask those
+    # rows in the kernel.
+    num_write_tokens = raw_out_loc.shape[0]
+    assert num_write_tokens <= bs, (
+        f"raw_out_loc has {num_write_tokens} rows, expected at most {bs} metadata rows"
+    )
     device = seq_lens.device
 
-    c4_out_loc = torch.empty(bs, dtype=torch.int64, device=device)
+    c4_out_loc = torch.empty(num_write_tokens, dtype=torch.int64, device=device)
     c4_positions = torch.empty(bs, dtype=torch.int32, device=device)
     c4_seq_lens_raw = torch.empty(bs, dtype=torch.int32, device=device)
     c4_seq_lens_clamp1 = torch.empty(bs, dtype=torch.int32, device=device)
 
-    c128_out_loc = torch.empty(bs, dtype=torch.int64, device=device)
+    c128_out_loc = torch.empty(num_write_tokens, dtype=torch.int64, device=device)
     c128_positions = torch.empty(bs, dtype=torch.int32, device=device)
     c128_seq_lens_raw = torch.empty(bs, dtype=torch.int32, device=device)
     c128_seq_lens_clamp1 = torch.empty(bs, dtype=torch.int32, device=device)
 
     if compute_page_indices:
-        assert (
-            page_table is not None
-        ), "page_table required when compute_page_indices=True"
-        assert (
-            page_size >= 128 and page_size % 128 == 0
-        ), "page_size must be a multiple of 128 when compute_page_indices=True"
+        assert page_table is not None, (
+            "page_table required when compute_page_indices=True"
+        )
+        assert page_size >= 128 and page_size % 128 == 0, (
+            "page_size must be a multiple of 128 when compute_page_indices=True"
+        )
         max_pages = page_table.shape[1]
         c128_page_size = page_size // 128
         c128_cur_max_seq_len = c128_page_size * max_pages
@@ -159,6 +228,7 @@ def _init_compressed_attn_metadata_triton(
             else torch.empty(0, dtype=torch.int32, device=device)
         ),
         bs,
+        num_write_tokens,
         max_pages,
         c128_cur_max_seq_len,
         c128_page_size,
@@ -205,3 +275,68 @@ def init_compression_metadata(
         page_size,
         compute_page_indices,
     )
+
+
+@triton.jit
+def _low_ratio_metadata(
+    LENS,
+    LOC,
+    OUT1,
+    LEN1,
+    SPARSE1,
+    PAGE1,
+    OUT2,
+    LEN2,
+    SPARSE2,
+    PAGE2,
+    TOPK: tl.constexpr,
+    PADDED: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    length = tl.load(LENS + row).to(tl.int32)
+    loc = tl.load(LOC + row).to(tl.int64)
+    len1, len2 = tl.maximum(length, 1), tl.maximum(length >> 1, 1)
+    tl.store(OUT1 + row, loc)
+    tl.store(OUT2 + row, tl.where((length & 1) == 0, loc >> 1, -1))
+    tl.store(LEN1 + row, len1)
+    tl.store(LEN2 + row, len2)
+    tl.store(SPARSE1 + row, tl.minimum(len1, TOPK))
+    tl.store(SPARSE2 + row, tl.minimum(len2, TOPK))
+    cols = tl.arange(0, BLOCK)
+    tl.store(PAGE1 + row * PADDED + cols, -1, cols < PADDED)
+    tl.store(PAGE2 + row * PADDED + cols, -1, cols < PADDED)
+
+
+class LowRatioMetadata(NamedTuple):
+    """Per-request slots and lengths of the ratio-1 and ratio-2 compressed caches."""
+
+    c1_out_loc: torch.Tensor
+    c1_seq_lens: torch.Tensor
+    c1_sparse_lens: torch.Tensor
+    c1_page_indices: torch.Tensor
+    c2_out_loc: torch.Tensor
+    c2_seq_lens: torch.Tensor
+    c2_sparse_lens: torch.Tensor
+    c2_page_indices: torch.Tensor
+
+
+def build_low_ratio_metadata(seq_lens, out_loc, topk) -> LowRatioMetadata:
+    assert seq_lens.numel() == out_loc.numel()
+    rows = seq_lens.numel()
+    kw = dict(device=seq_lens.device, dtype=torch.int32)
+    padded = triton.cdiv(topk, 64) * 64
+    outputs = []
+    for _ in range(2):
+        outputs.extend(
+            [
+                torch.empty(rows, device=out_loc.device, dtype=torch.int64),
+                torch.empty(rows, **kw),
+                torch.empty(rows, **kw),
+                torch.empty((rows, padded), **kw),
+            ]
+        )
+    _low_ratio_metadata[(rows,)](
+        seq_lens, out_loc, *outputs, topk, padded, triton.next_power_of_2(padded)
+    )
+    return LowRatioMetadata(*outputs)

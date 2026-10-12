@@ -5,10 +5,14 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
-from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
-from sglang.srt.utils import get_bool_env_var, is_hip
+from sglang.srt.layers.attention.dsa.utils import (
+    INDEXER_K_CACHE_PRESHUFFLE_TILE,
+    aiter_can_use_preshuffle_paged_mqa,
+)
+from sglang.srt.utils import get_bool_env_var, is_hip, is_xpu
 
 _is_hip = is_hip()
+_is_xpu = is_xpu()
 _is_fp8_fnuz = is_fp8_fnuz()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 # aiter cp_gather kernel with preshuffle=True is only valid when the indexer
@@ -37,8 +41,9 @@ class GetK:
     def slow(
         cls, pool: "DSATokenToKVPool", buf, seq_len: int, page_indices: torch.Tensor
     ):
-        num_pages = (seq_len + pool.page_size - 1) // pool.page_size
-        seq_len_ = num_pages * pool.page_size
+        page_size = pool.index_page_size
+        num_pages = (seq_len + page_size - 1) // page_size
+        seq_len_ = num_pages * page_size
         index_k_fp8 = torch.empty(
             (seq_len_, pool.index_head_dim),
             dtype=torch.uint8,
@@ -46,9 +51,9 @@ class GetK:
         )
         for i in range(num_pages):
             page_index = page_indices[i]
-            index_k_fp8[i * pool.page_size : (i + 1) * pool.page_size] = buf[
-                page_index
-            ][: pool.page_size * pool.index_head_dim].view(-1, pool.index_head_dim)
+            index_k_fp8[i * page_size : (i + 1) * page_size] = buf[page_index][
+                : page_size * pool.index_head_dim
+            ].view(-1, pool.index_head_dim)
 
         return index_k_fp8[:seq_len]
 
@@ -66,7 +71,7 @@ class GetK:
         # page_indices: (num_pages,), element := a page index
         buf_numel_per_page = buf.shape[1]
 
-        num_k_bytes_per_page = pool.page_size * pool.index_head_dim
+        num_k_bytes_per_page = pool.index_page_size * pool.index_head_dim
         num_k_bytes_per_token = pool.index_head_dim
 
         # buf: (num_pages, page_size 64 * head_dim 128 + page_size 64 * fp32_nbytes 4), uint8
@@ -95,7 +100,7 @@ class GetK:
             buf=buf,
             page_indices=page_indices,
             seq_len=seq_len,
-            page_size=pool.page_size,
+            page_size=pool.index_page_size,
             index_head_dim=pool.index_head_dim,
         )
 
@@ -109,8 +114,9 @@ class GetS:
     def slow(
         cls, pool: "DSATokenToKVPool", buf, seq_len: int, page_indices: torch.Tensor
     ):
-        num_pages = (seq_len + pool.page_size - 1) // pool.page_size
-        seq_len_ = num_pages * pool.page_size
+        page_size = pool.index_page_size
+        num_pages = (seq_len + page_size - 1) // page_size
+        seq_len_ = num_pages * page_size
         assert pool.index_head_dim // pool.quant_block_size == 1
         index_k_scale_fp8 = torch.empty(
             (seq_len_, 4),
@@ -119,9 +125,9 @@ class GetS:
         )
         for i in range(num_pages):
             page_index = page_indices[i]
-            index_k_scale_fp8[i * pool.page_size : (i + 1) * pool.page_size] = buf[
-                page_index
-            ][pool.page_size * pool.index_head_dim :].view(-1, 4)
+            index_k_scale_fp8[i * page_size : (i + 1) * page_size] = buf[page_index][
+                page_size * pool.index_head_dim :
+            ].view(-1, 4)
         return index_k_scale_fp8[:seq_len]
 
     @classmethod
@@ -134,9 +140,9 @@ class GetS:
         """
         buf_numel_per_page = buf.shape[1]
 
-        num_s_bytes_per_page = buf.shape[1] - pool.page_size * pool.index_head_dim
+        s_offset_in_page = pool.index_page_size * pool.index_head_dim
+        num_s_bytes_per_page = buf.shape[1] - s_offset_in_page
         num_s_bytes_per_token = pool.index_head_dim // pool.quant_block_size * 4
-        s_offset_in_page = pool.page_size * pool.index_head_dim
 
         flat_buf = buf.flatten()
         flat_indices = (
@@ -164,7 +170,7 @@ class GetS:
             buf=buf,
             page_indices=page_indices,
             seq_len=seq_len,
-            page_size=pool.page_size,
+            page_size=pool.index_page_size,
             index_head_dim=pool.index_head_dim,
         )
 
@@ -192,7 +198,7 @@ class GetKAndS:
     ):
         from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
 
-        page_size = pool.page_size
+        page_size = pool.index_page_size
         index_head_dim = pool.index_head_dim
         quant_block_size = pool.quant_block_size
         scale_elems = index_head_dim // quant_block_size
@@ -248,7 +254,7 @@ class GetKAndS:
             seq_lens=seq_len_tensor,
             seq_len_sum=seq_len_sum,
             max_seq_len=max_seq_len,
-            page_size=pool.page_size,
+            page_size=pool.index_page_size,
             index_head_dim=pool.index_head_dim,
         )
 
@@ -267,7 +273,7 @@ class SetKAndS:
             loc=loc,
             index_k=index_k,
             index_k_scale=index_k_scale,
-            page_size=pool.page_size,
+            page_size=pool.index_page_size,
         )
 
 
@@ -305,9 +311,14 @@ def _set_k_and_s_triton(
     assert scale_dim == 1
     if _is_hip:
         if _use_aiter_preshuffle:
-            assert (
-                page_size % 16 == 0
-            ), f"HIP preshuffle requires page_size to be a multiple of 16, got {page_size}"
+            assert page_size % 16 == 0, (
+                f"HIP preshuffle requires page_size to be a multiple of 16, got {page_size}"
+            )
+    elif _is_xpu:
+        assert page_size in (
+            64,
+            128,
+        ), f"XPU DSA requires page_size 64 or 128, got {page_size}"
     else:
         assert page_size == 64
 
@@ -341,6 +352,7 @@ def _set_k_and_s_triton(
         BUF_NUMEL_PER_PAGE=buf_numel_per_page,
         NUM_K_ELEMS_PER_TOKEN=index_head_dim,
         S_OFFSET_NBYTES_IN_PAGE=page_size * index_head_dim,
+        PRESHUFFLE_TILE=INDEXER_K_CACHE_PRESHUFFLE_TILE if _use_aiter_preshuffle else 0,
     )
 
 
@@ -356,6 +368,7 @@ def _set_k_and_s_triton_kernel(
     BUF_NUMEL_PER_PAGE: tl.constexpr,
     NUM_K_ELEMS_PER_TOKEN: tl.constexpr,
     S_OFFSET_NBYTES_IN_PAGE: tl.constexpr,
+    PRESHUFFLE_TILE: tl.constexpr,
 ):
     token_id = tl.program_id(0)
 
@@ -370,11 +383,26 @@ def _set_k_and_s_triton_kernel(
     loc_page_index = loc // PAGE_SIZE
     loc_token_offset_in_page = loc % PAGE_SIZE
 
-    out_k_offsets = (
-        loc_page_index * BUF_NUMEL_PER_PAGE
-        + loc_token_offset_in_page * NUM_K_ELEMS_PER_TOKEN
-        + tl.arange(0, NUM_K_ELEMS_PER_TOKEN)
-    )
+    k_range = tl.arange(0, NUM_K_ELEMS_PER_TOKEN)
+    if PRESHUFFLE_TILE:
+        tile = PRESHUFFLE_TILE
+        token_tile_id = loc_token_offset_in_page // tile
+        token_in_tile = loc_token_offset_in_page % tile
+        col_tile_id = k_range // tile
+        col_in_tile = k_range % tile
+        out_k_offsets = (
+            loc_page_index * BUF_NUMEL_PER_PAGE
+            + token_tile_id * (tile * NUM_K_ELEMS_PER_TOKEN)
+            + col_tile_id * (tile * tile)
+            + token_in_tile * tile
+            + col_in_tile
+        )
+    else:
+        out_k_offsets = (
+            loc_page_index * BUF_NUMEL_PER_PAGE
+            + loc_token_offset_in_page * NUM_K_ELEMS_PER_TOKEN
+            + k_range
+        )
 
     # "//4" b/c it is fp32 instead of uint8
     out_s_offset = (
@@ -639,6 +667,9 @@ def _get_k_and_s_triton_kernel(
     k_offsets = thread_idx * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
 
     seq_len = tl.load(seq_len_ptr + batch_id)
+    # Grid axis 1 spans the batch-max seq len; fully-masked blocks store nothing.
+    if block_token_start >= seq_len:
+        return
     token_valid_mask = token_ids < seq_len
 
     pre_batch_idx = tl.arange(0, seq_len_num_pow)

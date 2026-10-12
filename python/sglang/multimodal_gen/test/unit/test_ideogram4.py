@@ -68,8 +68,11 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
 from sglang.multimodal_gen.runtime.models.dits.ideogram import (
     Ideogram4ColumnParallelLinear,
     Ideogram4MergedColumnParallelLinear,
+    Ideogram4RMSNorm,
     Ideogram4RowParallelLinear,
     Ideogram4Transformer2DModel,
+    _gate_residual,
+    _norm_scale,
 )
 from sglang.multimodal_gen.runtime.models.encoders.ideogram import (
     IdeogramQwen3VLTextEncoder,
@@ -98,6 +101,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
     TextEncodingStage,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.platforms.interface import DeviceCapability
 from sglang.multimodal_gen.runtime.server_args import set_global_server_args
 
 
@@ -182,6 +186,9 @@ def _fake_server_args(cfg=None):
         disable_autocast=False,
         enable_cfg_parallel=False,
         attention_backend_config=None,
+        component_precisions={},
+        kv_gather_degree=1,
+        sp_split_auto=False,
     )
 
 
@@ -190,6 +197,24 @@ def _fake_ideogram_pipeline(transformer, unconditional_transformer):
 
 
 class TestIdeogram4(unittest.TestCase):
+    def test_lossless_norm_postprocess_preserves_cpu_reference(self):
+        norm = Ideogram4RMSNorm(16, eps=1e-5)
+        x = torch.randn(1, 7, 16)
+        update = torch.randn_like(x)
+        scale = torch.randn(1, 1, 16)
+        gate = torch.randn_like(scale)
+
+        self.assertTrue(
+            torch.equal(_norm_scale(x, scale, norm, False), norm(x) * (1 + scale))
+        )
+        self.assertTrue(
+            torch.equal(
+                _gate_residual(update, gate, x, norm, False),
+                x + torch.tanh(gate) * norm(update),
+            )
+        )
+        self.assertEqual(set(norm.state_dict()), {"weight"})
+
     def test_ideogram_dit_supports_layerwise_offload(self):
         self.assertTrue(
             issubclass(Ideogram4Transformer2DModel, LayerwiseOffloadableModuleMixin)
@@ -357,7 +382,12 @@ class TestIdeogram4(unittest.TestCase):
         prev_args = server_args_module._global_server_args
         try:
             set_global_server_args(
-                SimpleNamespace(attention_backend="torch_sdpa", comfyui_mode=False)
+                SimpleNamespace(
+                    attention_backend="torch_sdpa",
+                    comfyui_mode=False,
+                    kv_gather_degree=1,
+                    sp_split_auto=False,
+                )
             )
             torch.manual_seed(0)
             batch_size, seq_len, num_heads, head_dim = 2, 5, 2, 8
@@ -442,6 +472,18 @@ class TestIdeogram4(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Unknown Ideogram 4 preset"):
             Ideogram4SamplingParams(preset="V4_FAST")
 
+    def test_turbotime_and_distilled_presets_coexist(self):
+        for steps in (2, 4, 8):
+            preset = f"V4_TURBOTIME_LORA_{steps}"
+            with self.subTest(preset=preset):
+                params = Ideogram4SamplingParams(preset=preset)
+                self.assertEqual(params.num_inference_steps, steps)
+                self.assertEqual(params.guidance_scale, 1.0)
+                self.assertTrue(IDEOGRAM4_PRESETS[preset]["skip_unconditional"])
+                self.assertTrue(IDEOGRAM4_PRESETS[preset]["requires_lora"])
+        self.assertEqual(Ideogram4FastSamplingParams().preset, "V4_FAST_20")
+        self.assertEqual(Ideogram4InstantSamplingParams().preset, "V4_INSTANT_8")
+
     def test_ideogram_distilled_sampling_defaults(self):
         fast = Ideogram4FastSamplingParams()
         instant = Ideogram4InstantSamplingParams()
@@ -480,7 +522,9 @@ class TestIdeogram4(unittest.TestCase):
         server_args = SimpleNamespace(
             transformer_weights_path="/unused/override.safetensors",
             nunchaku_config={"enabled": True},
-            component_transformer_weights_paths={},
+            component_weights_paths={},
+            component_quantizations={},
+            component_quantization_ignored_layers={},
         )
         component_args = _server_args_for_transformer_component(
             server_args, "unconditional_transformer"
@@ -495,11 +539,15 @@ class TestIdeogram4(unittest.TestCase):
                 "/ckpt/diffusion_models/ideogram4_nvfp4_mixed.safetensors"
             ),
             nunchaku_config={"enabled": True},
-            component_transformer_weights_paths={
+            component_weights_paths={
                 "unconditional_transformer": (
                     "/ckpt/diffusion_models/"
                     "ideogram4_unconditional_nvfp4_mixed.safetensors"
                 )
+            },
+            component_quantizations={"unconditional_transformer": "fp8"},
+            component_quantization_ignored_layers={
+                "unconditional_transformer": ["lm_head"]
             },
         )
 
@@ -514,6 +562,8 @@ class TestIdeogram4(unittest.TestCase):
             "/ckpt/diffusion_models/ideogram4_unconditional_nvfp4_mixed.safetensors",
         )
         self.assertIsNone(component_args.nunchaku_config)
+        self.assertEqual(component_args.quantization, "fp8")
+        self.assertEqual(component_args.quantization_ignored_layers, ["lm_head"])
 
     def test_ideogram_nvfp4_unconditional_transformer_path_uses_sibling_file(self):
         self.assertEqual(
@@ -666,6 +716,9 @@ class TestIdeogram4(unittest.TestCase):
         }
         stage.copy_deduplicated_outputs(base, same)
 
+        self.assertIs(same.prompt_embeds[0], base.prompt_embeds[0])
+        self.assertIs(same.prompt_embeds_mask[0], base.prompt_embeds_mask[0])
+        self.assertIsNot(same.prompt_embeds, base.prompt_embeds)
         self.assertIn("ideogram4", same.extra)
         self.assertTrue(
             torch.equal(
@@ -734,12 +787,12 @@ class TestIdeogram4(unittest.TestCase):
             ["transformer", "unconditional_transformer"],
         )
 
-    def test_ideogram_attention_backend_is_passed_from_config(self):
+    def test_ideogram_attention_backend_is_declared_by_runtime_model(self):
         import sglang.multimodal_gen.runtime.server_args as server_args_module
 
         config = Ideogram4DiTConfig()
         self.assertEqual(
-            config.arch_config._supported_attention_backends,
+            Ideogram4Transformer2DModel._supported_attention_backends,
             {AttentionBackendEnum.FA, AttentionBackendEnum.TORCH_SDPA},
         )
         prev_args = server_args_module._global_server_args
@@ -756,7 +809,7 @@ class TestIdeogram4(unittest.TestCase):
 
         self.assertEqual(
             model.supported_attention_backends,
-            config.arch_config._supported_attention_backends,
+            Ideogram4Transformer2DModel._supported_attention_backends,
         )
         self.assertEqual(
             model.layers[0].attention.attn.backend,
@@ -769,7 +822,12 @@ class TestIdeogram4(unittest.TestCase):
         prev_args = server_args_module._global_server_args
         try:
             set_global_server_args(
-                SimpleNamespace(attention_backend="torch_sdpa", comfyui_mode=False)
+                SimpleNamespace(
+                    attention_backend="torch_sdpa",
+                    comfyui_mode=False,
+                    kv_gather_degree=1,
+                    sp_split_auto=False,
+                )
             )
             with patch(
                 "sglang.multimodal_gen.runtime.layers.attention.layer.get_ring_parallel_world_size",
@@ -794,7 +852,12 @@ class TestIdeogram4(unittest.TestCase):
         prev_args = server_args_module._global_server_args
         try:
             set_global_server_args(
-                SimpleNamespace(attention_backend="torch_sdpa", comfyui_mode=False)
+                SimpleNamespace(
+                    attention_backend="torch_sdpa",
+                    comfyui_mode=False,
+                    kv_gather_degree=1,
+                    sp_split_auto=False,
+                )
             )
             with patch(
                 "sglang.multimodal_gen.runtime.layers.attention.layer.get_ring_parallel_world_size",
@@ -842,7 +905,12 @@ class TestIdeogram4(unittest.TestCase):
         prev_args = server_args_module._global_server_args
         try:
             set_global_server_args(
-                SimpleNamespace(attention_backend="torch_sdpa", comfyui_mode=False)
+                SimpleNamespace(
+                    attention_backend="torch_sdpa",
+                    comfyui_mode=False,
+                    kv_gather_degree=1,
+                    sp_split_auto=False,
+                )
             )
             with (
                 patch(
@@ -888,7 +956,12 @@ class TestIdeogram4(unittest.TestCase):
         prev_args = server_args_module._global_server_args
         try:
             set_global_server_args(
-                SimpleNamespace(attention_backend="torch_sdpa", comfyui_mode=False)
+                SimpleNamespace(
+                    attention_backend="torch_sdpa",
+                    comfyui_mode=False,
+                    kv_gather_degree=1,
+                    sp_split_auto=False,
+                )
             )
             with (
                 patch(
@@ -941,11 +1014,22 @@ class TestIdeogram4(unittest.TestCase):
         prev_args = server_args_module._global_server_args
         try:
             set_global_server_args(
-                SimpleNamespace(attention_backend="torch_sdpa", comfyui_mode=False)
+                SimpleNamespace(
+                    attention_backend="torch_sdpa",
+                    comfyui_mode=False,
+                    kv_gather_degree=1,
+                    sp_split_auto=False,
+                )
             )
-            with patch(
-                "sglang.multimodal_gen.runtime.layers.attention.layer.get_ring_parallel_world_size",
-                return_value=1,
+            with (
+                patch(
+                    "sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant.current_platform.get_device_capability",
+                    return_value=DeviceCapability(10, 0),
+                ),
+                patch(
+                    "sglang.multimodal_gen.runtime.layers.attention.layer.get_ring_parallel_world_size",
+                    return_value=1,
+                ),
             ):
                 with torch.device("meta"):
                     model = Ideogram4Transformer2DModel(
@@ -997,9 +1081,18 @@ class TestIdeogram4(unittest.TestCase):
         prev_args = server_args_module._global_server_args
         try:
             set_global_server_args(
-                SimpleNamespace(attention_backend="torch_sdpa", comfyui_mode=False)
+                SimpleNamespace(
+                    attention_backend="torch_sdpa",
+                    comfyui_mode=False,
+                    kv_gather_degree=1,
+                    sp_split_auto=False,
+                )
             )
             with (
+                patch(
+                    "sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant.current_platform.get_device_capability",
+                    return_value=DeviceCapability(10, 0),
+                ),
                 patch(
                     "sglang.multimodal_gen.runtime.models.dits.ideogram.model_parallel_is_initialized",
                     return_value=True,
@@ -1210,7 +1303,12 @@ class TestIdeogram4(unittest.TestCase):
         prev_args = server_args_module._global_server_args
         try:
             set_global_server_args(
-                SimpleNamespace(attention_backend="torch_sdpa", comfyui_mode=False)
+                SimpleNamespace(
+                    attention_backend="torch_sdpa",
+                    comfyui_mode=False,
+                    kv_gather_degree=1,
+                    sp_split_auto=False,
+                )
             )
             with (
                 patch.dict(os.environ, {W8A8_FP8_GEMM_ENV: "1"}),
@@ -1250,7 +1348,12 @@ class TestIdeogram4(unittest.TestCase):
         prev_args = server_args_module._global_server_args
         try:
             set_global_server_args(
-                SimpleNamespace(attention_backend="torch_sdpa", comfyui_mode=False)
+                SimpleNamespace(
+                    attention_backend="torch_sdpa",
+                    comfyui_mode=False,
+                    kv_gather_degree=1,
+                    sp_split_auto=False,
+                )
             )
             with (
                 patch(
@@ -1489,6 +1592,20 @@ class TestIdeogram4(unittest.TestCase):
 
             with patch.object(stage, "_run_ideogram_transformer", side_effect=fake_run):
                 stage._run_denoising_step(ctx, step, batch, args)
+            for skip_unconditional, unconditional in (
+                (True, unconditional_transformer),
+                (False, None),
+            ):
+                with self.subTest(skip_unconditional=skip_unconditional):
+                    ctx.latents.zero_()
+                    ctx.extra["ideogram4_skip_unconditional"] = skip_unconditional
+                    stage.unconditional_transformer = unconditional
+                    with patch.object(
+                        stage, "_run_ideogram_transformer", side_effect=fake_run
+                    ) as run:
+                        stage._run_denoising_step(ctx, step, batch, args)
+                    self.assertEqual(run.call_count, 1)
+                    self.assertIs(run.call_args.args[0], transformer)
         finally:
             set_global_server_args(prev_args)
 

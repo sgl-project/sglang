@@ -23,11 +23,31 @@ from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config impo
 from sglang.multimodal_gen.configs.post_training.pipeline_configs import (
     ZImageRolloutPipelineMixin,
 )
+from sglang.multimodal_gen.runtime.distributed.cfg_policy import (
+    CFGPolicy,
+    _apply_cfg_postprocess,
+)
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_sp_group,
     get_sp_parallel_rank,
     get_sp_world_size,
 )
+
+
+@dataclass
+class ZImageCFGPolicy(CFGPolicy):
+    parallel_uses_serial_arithmetic: bool = True
+
+    def combine(
+        self, predictions, batch, cfg_scale, pipeline_config, *, cfg_parallel=False
+    ):
+        if len(predictions) == 1:
+            return predictions[0]
+        # the DiT already negates its output; match diffusers' fp32 CFG arithmetic
+        pos = predictions[0].float()
+        neg = predictions[1].float()
+        noise_pred = pos + cfg_scale * (pos - neg)
+        return _apply_cfg_postprocess(noise_pred, pos, batch, pipeline_config)
 
 
 def zimage_preprocess_text(prompt: str):
@@ -57,12 +77,9 @@ def zimage_postprocess_text(
     return pad_text_embeddings_with_mask(split_hidden_states)
 
 
-class TransformersModelConfig(EncoderConfig):
-    tokenizer_kwargs: dict = field(default_factory=lambda: {})
-
-
 @dataclass
 class ZImagePipelineConfig(ZImageRolloutPipelineMixin, ImagePipelineConfig):
+    cfg_policy: CFGPolicy = field(default_factory=ZImageCFGPolicy)
     should_use_guidance: bool = False
     task_type: ModelTaskType = ModelTaskType.T2I
     dit_config: DiTConfig = field(default_factory=ZImageDitConfig)
@@ -86,7 +103,10 @@ class ZImagePipelineConfig(ZImageRolloutPipelineMixin, ImagePipelineConfig):
     F_PATCH_SIZE: int = 1
 
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
-        return ModelDeploymentConfig(fsdp_auto_min_available_memory_gb=40)
+        return ModelDeploymentConfig(
+            keep_resident_min_available_gb=30,
+            fsdp_auto_min_available_memory_gb=40,
+        )
 
     def prepare_sigmas(self, sigmas, num_inference_steps):
         return self._prepare_sigmas(sigmas, num_inference_steps)
@@ -516,3 +536,30 @@ class ZImagePipelineConfig(ZImageRolloutPipelineMixin, ImagePipelineConfig):
                 dtype=torch.long,
             ),
         }
+
+
+def register():
+    from sglang.multimodal_gen.configs.sample.zimage import (
+        ZImageSamplingParams,
+        ZImageTurboSamplingParams,
+    )
+    from sglang.multimodal_gen.registry import register_configs
+
+    register_configs(
+        sampling_param_cls=ZImageTurboSamplingParams,
+        pipeline_config_cls=ZImagePipelineConfig,
+        hf_model_paths=[
+            "Tongyi-MAI/Z-Image-Turbo",
+        ],
+        model_detectors=[lambda hf_id: "z-image-turbo" in hf_id.lower()],
+    )
+    register_configs(
+        sampling_param_cls=ZImageSamplingParams,
+        pipeline_config_cls=ZImagePipelineConfig,
+        hf_model_paths=[
+            "Tongyi-MAI/Z-Image",
+        ],
+        model_detectors=[
+            lambda hf_id: "z-image" in hf_id.lower() and "turbo" not in hf_id.lower()
+        ],
+    )

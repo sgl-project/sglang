@@ -6,7 +6,7 @@ from typing import Optional
 
 import torch
 
-from sglang.jit_kernel.kv_canary.verify import CanaryLaunchTag
+from sglang.kernels.ops.kv_canary.verify import CanaryLaunchTag
 from sglang.srt.kv_canary.config import CanaryConfig
 from sglang.srt.kv_canary.runner.future_tensor import DelayedDeviceHostHandler
 from sglang.srt.kv_canary.runner.kernel_launcher import passes_v_half_gate
@@ -31,12 +31,14 @@ class KernelRunCounterHealthChecker:
         self,
         *,
         config: CanaryConfig,
+        is_draft_runner: bool,
         device_state: CanaryDeviceState,
         active_tags: tuple[CanaryLaunchTag, ...],
         outer_step_counter_getter: Callable[[], int],
-        d2h_stream: torch.cuda.Stream,
+        d2h_stream: torch.Stream,
     ) -> None:
         self._config = config
+        self._is_draft_runner = is_draft_runner
         self._device_state = device_state
         self._active_tags = active_tags
         self._outer_step_counter_getter = outer_step_counter_getter
@@ -76,6 +78,8 @@ class KernelRunCounterHealthChecker:
 
     def _expected_active_tags_for_health_check(self) -> tuple[CanaryLaunchTag, ...]:
         tags = self._active_tags
-        if self._config.sweep_interval <= 0:
+        # The scheduler attaches the radix cache only to the target runner, so
+        # only its sweep launches; a missing attach there must still fail here.
+        if self._config.sweep_interval <= 0 or self._is_draft_runner:
             tags = tuple(tag for tag in tags if tag not in _SWEEP_TAGS)
         return tuple(tag for tag in tags if passes_v_half_gate(tag))

@@ -4,6 +4,7 @@ from typing import Optional
 
 from sglang.multimodal_gen.configs.models import DiTConfig, VAEConfig
 from sglang.multimodal_gen.configs.models.dits.hunyuan3d import Hunyuan3DDiTConfig
+from sglang.multimodal_gen.configs.models.encoders.clip import CLIPTextConfig
 from sglang.multimodal_gen.configs.models.vaes.hunyuan3d import Hunyuan3DVAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ModelTaskType,
@@ -29,6 +30,12 @@ class Hunyuan3D2PipelineConfig(PipelineConfig):
     # VAE configuration
     vae_config: VAEConfig = field(default_factory=Hunyuan3DVAEConfig)
     vae_precision: str = "fp32"
+
+    text_encoder_configs: tuple[CLIPTextConfig, ...] = field(
+        default_factory=lambda: (CLIPTextConfig(),)
+    )
+    text_encoder_precisions: tuple[str, ...] = ("fp16",)
+    native_only_components: tuple[str, ...] = ("delight_text_encoder",)
 
     # Shape model configuration
     shape_model_path: Optional[str] = None
@@ -71,3 +78,19 @@ class Hunyuan3D2PipelineConfig(PipelineConfig):
         latent_shape = self.vae_config.arch_config.latent_shape
         shape = (batch_size, *latent_shape)
         return shape
+
+
+def register():
+    from sglang.multimodal_gen.configs.sample.hunyuan3d import (
+        Hunyuan3DSamplingParams,
+    )
+    from sglang.multimodal_gen.registry import register_configs
+
+    register_configs(
+        sampling_param_cls=Hunyuan3DSamplingParams,
+        pipeline_config_cls=Hunyuan3D2PipelineConfig,
+        hf_model_paths=[
+            "tencent/Hunyuan3D-2",
+        ],
+        model_detectors=[lambda hf_id: "hunyuan3d" in hf_id.lower()],
+    )

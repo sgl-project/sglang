@@ -7,6 +7,9 @@ import torch
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     is_layerwise_offloaded_module,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.weight_snapshot import (
+    restore_weight_snapshot,
+)
 from sglang.multimodal_gen.runtime.pipelines_core import ComposedPipelineBase
 from sglang.multimodal_gen.runtime.post_training.weights_updater import (
     get_updatable_modules,
@@ -14,6 +17,24 @@ from sglang.multimodal_gen.runtime.post_training.weights_updater import (
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+
+
+def _module_to_pinned_cpu(module: torch.nn.Module) -> None:
+    # Async D2H into pinned host memory; caller synchronizes once after the batch.
+    for t in list(module.parameters()) + list(module.buffers()):
+        if t.device.type == "cuda":
+            # Mirror stride/layout like srt/utils/offloader.py: torch.empty() would force
+            # contiguous and silently drop channels_last_3d VAE weights.
+            pin = torch.empty_strided(
+                size=t.size(),
+                stride=t.stride(),
+                dtype=t.dtype,
+                layout=t.layout,
+                device="cpu",
+                pin_memory=True,
+            )
+            pin.copy_(t.data, non_blocking=True)
+            t.data = pin
 
 
 def _get_module_device(module: torch.nn.Module) -> str:
@@ -113,9 +134,14 @@ class MemoryOccupationController:
             for name in names:
                 module = modules[name]
                 src_device_map[name] = _get_module_device(module)
-                module.to(device)
+                if device.startswith("cpu"):
+                    if not restore_weight_snapshot(module):
+                        _module_to_pinned_cpu(module)
+                else:
+                    module.to(device, non_blocking=True)
                 moved.append(name)
                 _move_unregistered_tensors(module, device)
+            torch.cuda.synchronize()
         except Exception as e:
             logger.warning(
                 f"[_move_modules] move failed, rollback started: target={device} moved={moved} error={e}",
