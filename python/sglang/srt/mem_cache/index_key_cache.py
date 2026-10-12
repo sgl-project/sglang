@@ -15,7 +15,7 @@ if TYPE_CHECKING:
 class IndexKeyCache:
     def __init__(self, pool: DSATokenToKVPool, index_buf_size: int):
         self.pool = pool
-        num_pages = (index_buf_size + pool.page_size + 1) // pool.page_size
+        num_pages = (index_buf_size + pool.index_alloc_page_size + 1) // pool.page_size
         with pool.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
                 torch.cuda.use_mem_pool(pool.custom_mem_pool)
