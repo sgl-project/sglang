@@ -129,6 +129,7 @@ class AddLayer(torch.nn.Module):
         attention_all_reduce_comm=None,
         flashinfer_all_reduce=None,
         mlp_flashinfer_all_reduce=None,
+        mlp_all_reduce_comm=None,
     ):
         hidden = self.forward(positions, residual, batch, ssmax_scale)
         return hidden * next_weight, hidden

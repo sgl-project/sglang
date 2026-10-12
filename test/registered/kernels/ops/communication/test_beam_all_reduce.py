@@ -260,10 +260,10 @@ class TestBeamAllReduce(CustomTestCase):
             self.assertIsNone(model._flashinfer_ar_for(tokens(128)))
         # The MLP takes it only when it owes one TP-wide sum that nothing else runs.
         model._mlp_has_single_tp_sum = _mlp_owes_single_tp_sum()
-        self.assertTrue(model._flashinfer_ar_covers_mlp())
+        self.assertTrue(model._can_replace_mlp_all_reduce())
         with get_forward().scoped(mlp_reduce_scatter=True):
             self.assertFalse(
-                model._flashinfer_ar_covers_mlp(), "reduce-scatter owns the sum"
+                model._can_replace_mlp_all_reduce(), "reduce-scatter owns the sum"
             )
         world, rank = dist.get_world_size(), dist.get_rank()
         if world >= 4:  # EP2 x MoE-TP(world/2): two partial sums, not one
@@ -318,6 +318,34 @@ class TestBeamAllReduce(CustomTestCase):
             peers = [torch.empty_like(local) for _ in range(dist.get_world_size())]
             dist.all_gather(peers, local, group=self.group)
             # FP32 rank summation is the fused collective's explicit contract.
+            reduced = sum((peer.float() for peer in peers)).bfloat16()
+            torch.testing.assert_close(expected, reduced, atol=0.016, rtol=0.016)
+            self.assertFalse(torch.equal(local, reduced))
+            post = torch.ones(5120, device="cuda", dtype=torch.bfloat16)
+            _, actual = beam_all_reduce_norm(
+                self.comm.obj, local, hidden, post, None, 1e-6, (0.13, 0.97)
+            )
+            combined = self.norm(reduced, post) * 0.13 + hidden * 0.97
+            torch.testing.assert_close(actual, combined, atol=0.016, rtol=0.016)
+
+    def test_dense_mlp_reduction_ownership(self):
+        """A skipped down_proj reduction fuses into the MLP boundary exactly once."""
+        from sglang.srt.configs.beam import BeamConfig
+        from sglang.srt.models.beam import BeamMLP
+
+        config = BeamConfig(hidden_size=5120, intermediate_size=1024)
+        with torch.device("cuda"):
+            mlp = BeamMLP(config).bfloat16()
+        torch.manual_seed(307 + dist.get_rank())
+        for parameter in mlp.parameters():
+            parameter.data.normal_(std=0.02)
+        for rows in (1, 16, 32):
+            torch.manual_seed(401 + rows)
+            hidden = torch.randn(rows, 5120, device="cuda", dtype=torch.bfloat16)
+            expected = mlp(hidden)
+            local = mlp(hidden, skip_all_reduce=True)
+            peers = [torch.empty_like(local) for _ in range(dist.get_world_size())]
+            dist.all_gather(peers, local, group=self.group)
             reduced = sum((peer.float() for peer in peers)).bfloat16()
             torch.testing.assert_close(expected, reduced, atol=0.016, rtol=0.016)
             self.assertFalse(torch.equal(local, reduced))

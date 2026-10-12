@@ -733,6 +733,7 @@ class BeamDecoderLayer(nn.Module):
         attention_all_reduce_comm=None,
         flashinfer_all_reduce=None,
         mlp_flashinfer_all_reduce=None,
+        mlp_all_reduce_comm=None,
     ) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
         """Same arithmetic as `forward` with the two norm/residual transitions fused.
 
@@ -742,6 +743,8 @@ class BeamDecoderLayer(nn.Module):
         that does not own the final norm) and the new residual stream.
         `flashinfer_all_reduce` / `mlp_flashinfer_all_reduce`, when given, replace
         the TP all-reduce of the attention / MLP output ahead of the unfused norm.
+        `mlp_all_reduce_comm` fuses the MLP's summed output like attention's when
+        the deferred expert sum (`moe_all_reduce_comm`) does not apply.
         """
         if attention_all_reduce_comm is not None:
             from sglang.kernels.ops.communication.beam_all_reduce import (
@@ -801,6 +804,20 @@ class BeamDecoderLayer(nn.Module):
                 self.rms_norm_eps,
                 self.mlp_residual_scales,
                 routed_scale=self.mlp.config.routed_scaling_factor,
+            )
+        if mlp_all_reduce_comm is not None:
+            from sglang.kernels.ops.communication.beam_all_reduce import (
+                beam_all_reduce_norm,
+            )
+
+            return beam_all_reduce_norm(
+                mlp_all_reduce_comm,
+                self.mlp(normed, skip_all_reduce=True),
+                residual,
+                self.post_feedforward_layernorm.weight,
+                next_norm_weight,
+                self.rms_norm_eps,
+                self.mlp_residual_scales,
             )
         mlp = self._forward_mlp(normed, forward_batch, mlp_flashinfer_all_reduce)
         return self.sandwich_residual_norm(
@@ -951,7 +968,8 @@ class BeamModel(nn.Module):
             return None
         return self._flashinfer_ar
 
-    def _flashinfer_ar_covers_mlp(self) -> bool:
+    def _can_replace_mlp_all_reduce(self) -> bool:
+        """Whether a fused or FlashInfer all-reduce may replace the MLP's own."""
         return self._mlp_has_single_tp_sum and not should_skip_mlp_all_reduce()
 
     def _all_reduce_limits(self, hidden_states) -> Optional[Tuple[int, int]]:
@@ -1097,7 +1115,7 @@ class BeamModel(nn.Module):
     ):
         # Each fused transition also produces the next layer's normalized input,
         # so the first norm of this stage is the only standalone one.
-        moe_all_reduce_comm = attention_all_reduce_comm = None
+        moe_all_reduce_comm = attention_all_reduce_comm = mlp_all_reduce_comm = None
         limits = self._all_reduce_limits(hidden_states)
         if limits is not None:
             attention_max_tokens, moe_max_tokens = limits
@@ -1106,12 +1124,16 @@ class BeamModel(nn.Module):
                 moe_all_reduce_comm = comm
             if hidden_states.shape[0] <= attention_max_tokens:
                 attention_all_reduce_comm = comm
+                # A summed MLP output is the same [tokens, hidden] partial sum as
+                # attention's, so it fuses under the same limit.
+                if self._can_replace_mlp_all_reduce():
+                    mlp_all_reduce_comm = comm
         # FlashInfer's MNNVL all-reduce replaces CustomAR inside the measured token
         # band (_FLASHINFER_AR_TOKEN_BAND); None outside it.
         flashinfer_all_reduce = self._flashinfer_ar_for(hidden_states)
         mlp_flashinfer_all_reduce = (
             flashinfer_all_reduce
-            if flashinfer_all_reduce is not None and self._flashinfer_ar_covers_mlp()
+            if flashinfer_all_reduce is not None and self._can_replace_mlp_all_reduce()
             else None
         )
         residual = hidden_states
@@ -1134,6 +1156,7 @@ class BeamModel(nn.Module):
                 attention_all_reduce_comm,
                 flashinfer_all_reduce=flashinfer_all_reduce,
                 mlp_flashinfer_all_reduce=mlp_flashinfer_all_reduce,
+                mlp_all_reduce_comm=mlp_all_reduce_comm,
             )
             if layer_id in self.layers_to_capture:
                 aux_hidden_states.append(residual)
