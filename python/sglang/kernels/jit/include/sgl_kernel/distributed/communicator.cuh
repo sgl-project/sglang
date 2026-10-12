@@ -158,9 +158,12 @@ struct LamportTrait {
 template <uint32_t kWorldSize>
 struct Barrier {
  public:
-  SGL_DEVICE Barrier(Semaphore* const* semaphores, uint32_t rank, uint32_t num_arrives)
-      : m_counter(0), m_rank(rank), m_semaphores(semaphores) {
-    const auto counter = semaphores[rank][blockIdx.x].counter_ptr();
+  /// `slot` indexes the semaphore plane, whose capacity is the owning communicator's
+  /// `num_blocks`. It defaults to the block index, which is only right when every block
+  /// of the grid barriers; a kernel where one role barriers passes that role's index.
+  SGL_DEVICE Barrier(Semaphore* const* semaphores, uint32_t rank, uint32_t num_arrives, uint32_t slot = blockIdx.x)
+      : m_counter(0), m_rank(rank), m_semaphores(semaphores), m_slot(slot) {
+    const auto counter = semaphores[rank][slot].counter_ptr();
     const auto signal = num_arrives * kWorldSize;
     m_counter = threadIdx.x == rank ? counter->inc(signal) : 0;
   }
@@ -168,8 +171,7 @@ struct Barrier {
   template <bool kNeedFence>
   SGL_DEVICE void arrive(uint32_t n) const {
     if (const auto tx = threadIdx.x; tx < kWorldSize) {
-      const auto bx = blockIdx.x;
-      const auto semaphore = &m_semaphores[tx][bx];
+      const auto semaphore = &m_semaphores[tx][m_slot];
       const auto current = m_counter + n * kWorldSize;
       if constexpr (kNeedFence) {
         semaphore->put_release();
@@ -199,6 +201,7 @@ struct Barrier {
   uint32_t m_counter;
   uint32_t m_rank;
   Semaphore* const* m_semaphores;
+  uint32_t m_slot;
 };
 
 /// Picks which half of a push plane's `2 * kWorldSize` slots this round owns.
@@ -256,16 +259,20 @@ struct PushEpoch {
 /// the signal must stay after it, since it asserts the producer grid flushed.
 struct McBarrier {
  public:
-  SGL_DEVICE McBarrier(Semaphore* local, Semaphore* mc, uint32_t world_size, uint32_t num_arrives)
-      : m_counter(0), m_world_size(world_size), m_local(local), m_mc(mc) {
+  /// `slot` indexes the semaphore plane, whose capacity is the owning communicator's
+  /// `num_blocks`. It defaults to the block index, which is only right when every block
+  /// of the grid barriers; a kernel where one role barriers passes that role's index.
+  SGL_DEVICE
+  McBarrier(Semaphore* local, Semaphore* mc, uint32_t world_size, uint32_t num_arrives, uint32_t slot = blockIdx.x)
+      : m_counter(0), m_world_size(world_size), m_local(local), m_mc(mc), m_slot(slot) {
     if (threadIdx.x == 0) {
-      m_counter = local[blockIdx.x].counter_ptr()->inc(num_arrives * world_size);
+      m_counter = local[slot].counter_ptr()->inc(num_arrives * world_size);
     }
   }
 
   template <bool kNeedFence>
   SGL_DEVICE void arrive(uint32_t n) const {
-    return arrive_at<kNeedFence>(m_local, m_mc, m_world_size, m_counter + n * m_world_size);
+    return arrive_at<kNeedFence>(m_local, m_mc, m_world_size, m_counter + n * m_world_size, m_slot);
   }
 
   SGL_DEVICE void arrive_relaxed(uint32_t n) const {
@@ -286,11 +293,11 @@ struct McBarrier {
   /// `arrive` against a window reserved earlier, without holding the object.
   /// `window` already includes the `n * world_size` offset.
   template <bool kNeedFence>
-  SGL_DEVICE static void arrive_at(Semaphore* local, Semaphore* mc, uint32_t world_size, uint32_t window) {
+  SGL_DEVICE static void
+  arrive_at(Semaphore* local, Semaphore* mc, uint32_t world_size, uint32_t window, uint32_t slot = blockIdx.x) {
     if (threadIdx.x != 0) return;
-    const auto bx = blockIdx.x;
-    const auto semaphore = &local[bx];
-    const auto mc_semaphore = &mc[bx];
+    const auto semaphore = &local[slot];
+    const auto mc_semaphore = &mc[slot];
     if constexpr (kNeedFence) {
       mc_semaphore->put_release_multicast();
       while (semaphore->get_acquire() - window < world_size)
@@ -307,6 +314,7 @@ struct McBarrier {
   uint32_t m_world_size;
   Semaphore* m_local;
   Semaphore* m_mc;
+  uint32_t m_slot;
 };
 
 }  // namespace device::distributed

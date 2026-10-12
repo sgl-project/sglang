@@ -4,6 +4,8 @@
 #pragma once
 #include <sgl_kernel/utils.cuh>
 
+#include <type_traits>
+
 namespace sglang {
 
 namespace device::atomic {
@@ -40,6 +42,23 @@ SGL_DEVICE void red_release_add_u32(uint32_t* ptr, uint32_t n) {
   asm volatile("red.release.gpu.global.add.u32 [%0], %1;" ::"l"(ptr), "r"(n) : "memory");
 }
 
+/**
+ * \brief `red_release_add_u32` on the uniform datapath (PTX ISA 8.7, sm_100+);
+ * falls back to the plain form where the target does not have it.
+ *
+ * Typically, one elected lane of a converged warp must issue this, via
+ * `device::warp::elect_one_lane` (or read from `%lane_id`).
+ * \note If the ptxas cannot prove the instruction issue is from single thread,
+ * the generated SASS may have very poor performance.
+ */
+SGL_DEVICE void red_async_release_add_u32(uint32_t* ptr, uint32_t n) {
+#if defined(SGL_CUDA_ARCH) && SGL_CUDA_ARCH >= 1000
+  asm volatile("red.async.release.gpu.global.add.u32 [%0], %1;" ::"l"(ptr), "r"(n) : "memory");
+#else
+  red_release_add_u32(ptr, n);
+#endif
+}
+
 SGL_DEVICE void red_relaxed_add_u32(uint32_t* ptr, uint32_t n) {
   asm volatile("red.relaxed.gpu.global.add.u32 [%0], %1;" ::"l"(ptr), "r"(n) : "memory");
 }
@@ -70,8 +89,8 @@ SGL_DEVICE uint32_t atom_acquire_add_u32(uint32_t* addr, uint32_t n) {
 /**
  * \brief Cross-CTA arrive/wait counter packed into one 32-bit word.
  *
- * Producers call `arrive()`; consumers call `wait()` (exactly one consumer) or
- * `wait_multi()` (several) until every producer has. The word is split: the low
+ * Producers call `arrive()`; consumers call `wait_unique()` (exactly one consumer)
+ * or `wait()` (several) until every producer has. The word is split: the low
  * `32 - kConsumerBits` bits count producer arrivals, the high bits count
  * consumers that have already been released. The last consumer to be released
  * subtracts the whole thing, so one Event is reusable across launches without a
@@ -87,8 +106,6 @@ SGL_DEVICE uint32_t atom_acquire_add_u32(uint32_t* addr, uint32_t n) {
  *       has to be released before any producer arrives for generation N + 1.
  *       The word carries no phase bit, so overlapping two generations on one
  *       Event is undefined behavior.
- * \note `wait()` and `wait_multi()` lay the word out incompatibly. Mixing them
- *       on one Event is undefined behavior.
  */
 struct Event {
  public:
@@ -96,6 +113,10 @@ struct Event {
 
   Event(const Event&) = delete;
   Event& operator=(const Event&) = delete;
+
+  struct DefaultSpin {
+    SGL_DEVICE void operator()() const {}
+  };
 
   /// \brief DON'T touch unless you know what you're doing.
   SGL_DEVICE handle_type& unsafe_get_handle() {
@@ -113,15 +134,30 @@ struct Event {
   }
 
   /**
+   * \brief `arrive()` on the uniform datapath: two instructions instead of four.
+   * \param n The number of producers to arrive. Defaults to 1.
+   */
+  SGL_DEVICE void arrive_async(uint32_t n = 1) {
+    ptx::red_async_release_add_u32(&m_handle, n);
+  }
+
+  /**
    * \brief Block until `num_producers` producers have arrived.
    * \param num_producers The number of producers to wait for.
+   * \param spin A callable invoked each time the wait spins, or the nanoseconds
+   *             to sleep per poll.
    *
-   * Single-consumer: simpler and faster than `wait_multi()`, but exactly one
-   * thread in the whole grid may call it per generation.
+   * Single-consumer: simpler and faster than `wait()`, but exactly one thread in
+   * the whole grid may call it per generation.
+   *
+   * \note Every poll is an atomic RMW, which serializes on the L2 slice holding
+   *       the handle. That is cheap at a low poll rate; pass a `spin` that backs
+   *       off where the producers are the bottleneck.
    */
-  SGL_DEVICE void wait(uint32_t num_producers) {
+  template <typename Spin = DefaultSpin>
+  SGL_DEVICE void wait_unique(uint32_t num_producers, Spin spin = {}) {
     while (ptx::atom_acquire_cas_b32(&m_handle, num_producers, 0) != num_producers)
-      ;
+      s_poll(spin);
   }
 
   /**
@@ -134,9 +170,11 @@ struct Event {
    *                       Event is never reset.
    * \param n              How many of `num_consumers` this call stands for.
    *                       Defaults to 1, i.e. one calling thread per consumer.
+   * \param spin           A callable invoked each time the wait spins, or the
+   *                       nanoseconds to sleep per poll.
    */
-  template <uint32_t kConsumerBits = 16u>
-  SGL_DEVICE void wait_multi(uint32_t num_producers, uint32_t num_consumers, uint32_t n = 1) {
+  template <uint32_t kConsumerBits = 16u, typename Spin = DefaultSpin>
+  SGL_DEVICE void wait(uint32_t num_producers, uint32_t num_consumers, uint32_t n = 1, Spin spin = {}) {
     static_assert(kConsumerBits > 0 && kConsumerBits < 32);
     constexpr uint32_t kProducerBits = 32 - kConsumerBits;
     constexpr uint32_t kProducerMask = (1u << kProducerBits) - 1;
@@ -150,6 +188,7 @@ struct Event {
       /// NOTE: when v = 0, a reset has already happened.
       while (const auto v = ptx::load_acquire_u32(&m_handle)) {
         if ((v & kProducerMask) == num_producers) break;
+        s_poll(spin);
       }
     }
 
@@ -161,6 +200,16 @@ struct Event {
   }
 
  private:
+  template <typename Spin>
+  SGL_DEVICE static void s_poll(Spin spin) {
+    if constexpr (std::is_integral_v<Spin>) {
+      static_assert(std::is_unsigned_v<Spin> && sizeof(Spin) <= 4);
+      __nanosleep(spin);
+    } else {
+      spin();
+    }
+  }
+
   handle_type m_handle;
 };
 

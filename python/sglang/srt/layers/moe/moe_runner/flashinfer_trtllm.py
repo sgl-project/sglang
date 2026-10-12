@@ -82,6 +82,7 @@ def is_deferred_finalize_enabled() -> bool:
 def finalize_flashinfer_trtllm_deferred_output(
     deferred_output: FlashInferTrtllmDeferredFinalizeOutput,
     shared_output: Optional[torch.Tensor],
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     from sglang.kernels.ops.moe.moe_finalize_fuse_shared import moe_finalize_fuse_shared
 
@@ -92,6 +93,7 @@ def finalize_flashinfer_trtllm_deferred_output(
         shared_output,
         deferred_output.top_k,
         enable_pdl=trtllm_moe_enable_pdl(deferred_output.expert_weights.shape[0]),
+        out=out,
     )
 
 
