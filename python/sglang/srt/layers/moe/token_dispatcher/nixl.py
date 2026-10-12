@@ -185,6 +185,8 @@ class NixlEPBuffer:
             if replacement
             else [operation.rank_offset]
         )
+        if replacement:
+            state.dispatch_ep_size = 0
         cls._connect_ranks(state, ranks, tag="recovery", store=store)
 
         global_rank = get_parallel().tp_rank + get_parallel().ep_join_rank_offset
@@ -200,6 +202,21 @@ class NixlEPBuffer:
         state.dispatch_ep_size = effective_ep_size
         state.recovery_operation_id = operation.operation_id
         state.recovery_connections_ready = True
+
+    @classmethod
+    def finish_recovery(cls, operation_id: str) -> None:
+        state = cls._state()
+        if state.recovery_operation_id != operation_id:
+            raise RuntimeError(
+                "NIXL recovery completion does not match the pending operation."
+            )
+        if not state.recovery_connections_ready:
+            raise RuntimeError(
+                "NIXL recovery cannot finish before connections are ready."
+            )
+        state.recovery_operation_id = None
+        state.recovery_disconnected_rank = None
+        state.recovery_connections_ready = False
 
     @classmethod
     def _update_connections(cls, state, scale_to: int) -> None:
