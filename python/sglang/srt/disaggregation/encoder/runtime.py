@@ -74,6 +74,14 @@ class PendingRequest:
         self.future: asyncio.Future = loop.create_future()
         self.submit_time = time.time()
 
+    def reject(self, exc: BaseException) -> None:
+        if not self.future.done():
+            self.future.set_exception(exc)
+
+    def resolve(self, result) -> None:
+        if not self.future.done():
+            self.future.set_result(result)
+
 
 # VIDEO excluded: per-video preprocess kwargs (do_sample_frames, video_metadata)
 # vary per request and can't merge into one HF processor call.
@@ -159,15 +167,82 @@ class EncoderScheduler:
         self.request_timeout = max(1.0, float(request_timeout))
         self.pending_queue: asyncio.Queue[PendingRequest] = asyncio.Queue()
         self._worker_task: Optional[asyncio.Task] = None
+        # batch_id -> (group, modality, start) for batches whose images are being
+        # decoded out-of-process; process_batch_separate looks them back up when
+        # the decoded payload arrives.
+        self.batch_info_map: Dict = {}
+        self.image_loader = None
+        self._loader_in_queue = None
+        self._loader_out_queue = None
+        self._loader_consumer_task: Optional[asyncio.Task] = None
+        # Handing batches to the loader no longer blocks the batch worker on the
+        # GPU, so nothing else bounds how many batches are decoding at once.
+        # Cap them: their decoded images are the largest objects in the encoder,
+        # and they would otherwise pile up in the loader's output queue under
+        # sustained overload. Enough in flight to keep every worker busy.
+        self._loader_slots: Optional[asyncio.Semaphore] = None
+        self.use_image_loader = self._resolve_image_loader_enabled()
+
+    def _resolve_image_loader_enabled(self) -> bool:
+        """Whether IMAGE batches may take the out-of-process loader path.
+
+        TP followers make this unsafe. Their batches arrive over ZMQ from
+        _dispatch_group, but rank 0's own forward runs later from a different
+        stage, so another dispatcher (the inline audio/video path) can slip a
+        broadcast plus forward in between. Rank 0 would then enter collectives
+        in a different order than the followers received batches, which
+        deadlocks the whole encoder. Degrade instead of raising: the feature
+        defaults on, and refusing to boot would be worse than running the
+        inline path.
+        """
+        if not envs.SGLANG_ENCODER_ENABLE_IMAGE_LOADER.get():
+            return False
+        if self.send_sockets:
+            logger.warning(
+                "Encoder image loader disabled: it is only safe with a single-rank "
+                f"encoder, but this one drives {len(self.send_sockets)} TP "
+                "follower(s). IMAGE batches will decode on the inline path."
+            )
+            return False
+        return True
 
     def start(self) -> None:
         if self._worker_task is None:
+            if self.use_image_loader:
+                self._start_image_loader()
             self._worker_task = asyncio.create_task(self._batch_worker())
             logger.info(
                 "EncoderScheduler started with "
                 f"max_batch_size={self.max_batch_size}, "
-                f"coalesce_same_turn={self.coalesce_same_turn}"
+                f"coalesce_same_turn={self.coalesce_same_turn}, "
+                f"image_loader={self.use_image_loader}"
             )
+
+    def _start_image_loader(self) -> None:
+        """Spawn the loader processes and the task that consumes their output."""
+        from sglang.srt.disaggregation.encoder.image_loader import (
+            _MultiImageProcessingLoader,
+            create_loader_queues,
+            image_loader_worker,
+        )
+
+        num_workers = envs.SGLANG_ENCODER_IMAGE_LOADER_WORKERS.get()
+        self._loader_slots = asyncio.Semaphore(max(2, num_workers))
+        self._loader_in_queue, self._loader_out_queue = create_loader_queues()
+        self.image_loader = _MultiImageProcessingLoader(
+            num_workers,
+            image_loader_worker,
+            self._loader_in_queue,
+            self._loader_out_queue,
+        )
+        # Deliberately a task on this loop, not a second event loop in a thread:
+        # the encode path shares asyncio primitives with this loop
+        # (encode_dispatch_lock, ReqState.embedding_ready, lifecycle_condition),
+        # and those are loop-bound.
+        self._loader_consumer_task = asyncio.create_task(
+            self.process_batch_separate(self._loader_out_queue)
+        )
+        logger.info(f"Encoder image loader started with {num_workers} worker processes")
 
     async def stop(self) -> None:
         if self._worker_task is not None:
@@ -175,14 +250,30 @@ class EncoderScheduler:
             with contextlib.suppress(asyncio.CancelledError):
                 await self._worker_task
             self._worker_task = None
+        if self._loader_consumer_task is not None:
+            self._loader_consumer_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._loader_consumer_task
+            self._loader_consumer_task = None
+        if self.image_loader is not None:
+            # Sentinel per worker; they are daemons, so a slow exit can't wedge
+            # shutdown either way.
+            for _ in range(self.image_loader._num_workers):
+                with contextlib.suppress(Exception):
+                    self._loader_in_queue.put(None)
+            self.image_loader = None
+        # Requests whose images are still in flight have no future owner left.
+        for group, _modality, _start in self.batch_info_map.values():
+            for p in group:
+                p.reject(RuntimeError("EncoderScheduler stopped"))
+        self.batch_info_map.clear()
         # Reject any requests still queued so their HTTP handlers don't hang.
         while True:
             try:
                 pending = self.pending_queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
-            if not pending.future.done():
-                pending.future.set_exception(RuntimeError("EncoderScheduler stopped"))
+            pending.reject(RuntimeError("EncoderScheduler stopped"))
 
     async def submit(self, request: dict) -> Tuple:
         pending = PendingRequest(request, asyncio.get_running_loop())
@@ -232,19 +323,108 @@ class EncoderScheduler:
                         Modality.from_str(p.request.get("modality", "image"))
                     ].append(p)
                 for modality, group in groups.items():
-                    await self._dispatch_group(group, modality)
+                    if modality == Modality.IMAGE and self.use_image_loader:
+                        # Hand image decoding to the loader processes; the GPU
+                        # encode runs later, from process_batch_separate.
+                        await self._enqueue_for_loading(group, modality)
+                    else:
+                        # AUDIO loading is cheap and VIDEO can't fuse, so both
+                        # stay on the inline path.
+                        await self._dispatch_group(group, modality)
             except asyncio.CancelledError:
                 for p in batch:
-                    if not p.future.done():
-                        p.future.set_exception(RuntimeError("EncoderScheduler stopped"))
+                    p.reject(RuntimeError("EncoderScheduler stopped"))
                 raise
             except Exception as e:
                 logger.error(
                     f"Error in EncoderScheduler batch worker: {e}", exc_info=True
                 )
                 for p in batch:
-                    if not p.future.done():
-                        p.future.set_exception(e)
+                    p.reject(e)
+
+    async def _enqueue_for_loading(
+        self, group: List[PendingRequest], modality: Modality
+    ) -> None:
+        """Hand a collected group to the loader processes.
+
+        The flattened image references go onto the loader queue keyed by a fresh
+        batch_id, while the group itself is stashed in batch_info_map so
+        process_batch_separate can pair the decoded images back with their
+        futures.
+
+        Blocks the batch worker once _loader_slots is exhausted, which is the
+        only backpressure between request arrival and the GPU on this path.
+        """
+        # Drop structurally-bad requests up front so the flattened refs stay
+        # aligned with the group that process_batch_separate later dispatches.
+        # (Mirrors the validation in _dispatch_group.)
+        valid: List[PendingRequest] = []
+        for p in group:
+            err = validate_encode_request(p.request)
+            if err is None:
+                valid.append(p)
+                continue
+            logger.error(f"Dropping req_id={p.request.get('req_id')} from batch: {err}")
+            p.reject(server_module.BadRequestError(err))
+        if not valid:
+            return
+        group = valid
+
+        flat_refs = self.encoder.preprocessor.flatten_batch_refs(
+            [p.request for p in group]
+        )
+
+        await self._loader_slots.acquire()
+        batch_id = uuid.uuid4()
+        self.batch_info_map[batch_id] = (group, modality, time.time())
+        try:
+            self._loader_in_queue.put(
+                (flat_refs, self.encoder.preprocessor.load_item_kwargs(), batch_id)
+            )
+        except Exception:
+            # Never leave a slot (or a group) stranded on a queue that refused it.
+            self.batch_info_map.pop(batch_id, None)
+            self._loader_slots.release()
+            raise
+
+    async def process_batch_separate(self, output_queue) -> None:
+        """Consume decoded image batches and run each one's GPU encode.
+
+        Image decoding already overlaps the GPU here by construction: it happens
+        in the loader processes, and this task only blocks a thread-pool thread
+        waiting on their output queue.
+        """
+        loop = asyncio.get_running_loop()
+        while True:
+            try:
+                payload = await loop.run_in_executor(None, output_queue.get)
+                loaded_images, batch_id = payload
+                info = self.batch_info_map.pop(batch_id, None)
+                if info is None:
+                    logger.error(f"Unknown batch_id from loader: {batch_id}")
+                    continue
+                # The batch is off the loader; let the next one in. Released
+                # here rather than after the encode so decoding keeps running
+                # ahead of the GPU, which is the point of the loader.
+                self._loader_slots.release()
+                group, modality, _start = info
+                # A loader worker reports a decode failure by sending the
+                # exception in place of the images; fail that batch's futures
+                # instead of dispatching it to the GPU.
+                if isinstance(loaded_images, Exception):
+                    for p in group:
+                        p.reject(loaded_images)
+                    continue
+
+                await self._dispatch_group(
+                    group, modality, preloaded_images=loaded_images
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(
+                    f"Error in EncoderScheduler loader consumer: {e}", exc_info=True
+                )
 
     async def _dispatch_group(
         self,
@@ -252,10 +432,14 @@ class EncoderScheduler:
         modality: Modality,
         *,
         observe_queue_wait: bool = True,
+        preloaded_images: Optional[List] = None,
     ) -> None:
         # A request may time out while queued. Never start work that no caller
         # can observe, or its eventual staged embedding would have no owner.
-        group = [pending for pending in group if not pending.future.done()]
+        # Preloaded batches are exempt: dropping one here would leave the images
+        # the loader already decoded misaligned with the surviving group.
+        if preloaded_images is None:
+            group = [pending for pending in group if not pending.future.done()]
         if not group:
             return
 
@@ -266,19 +450,21 @@ class EncoderScheduler:
 
         # Drop structurally-bad requests before broadcasting; otherwise TP
         # workers would join batch_encode collectives that rank-0 has already
-        # abandoned.
-        valid: List[PendingRequest] = []
-        for p in group:
-            err = validate_encode_request(p.request)
-            if err is None:
-                valid.append(p)
-                continue
-            logger.error(f"Dropping req_id={p.request.get('req_id')} from batch: {err}")
-            if not p.future.done():
-                p.future.set_exception(server_module.BadRequestError(err))
-        if not valid:
-            return
-        group = valid
+        # abandoned. Already done pre-load for a preloaded batch.
+        if preloaded_images is None:
+            valid: List[PendingRequest] = []
+            for p in group:
+                err = validate_encode_request(p.request)
+                if err is None:
+                    valid.append(p)
+                    continue
+                logger.error(
+                    f"Dropping req_id={p.request.get('req_id')} from batch: {err}"
+                )
+                p.reject(server_module.BadRequestError(err))
+            if not valid:
+                return
+            group = valid
 
         requests = [p.request for p in group]
         start = time.time()
@@ -310,7 +496,9 @@ class EncoderScheduler:
                 logger.info(
                     f"Dispatching batch of {len(group)} {modality.name} requests"
                 )
-                results = await self.encoder.batch_encode(requests, modality)
+                results = await self.encoder.batch_encode(
+                    requests, modality, preloaded_images=preloaded_images
+                )
             if len(group) > 1:
                 logger.info(
                     f"Batch of {len(group)} {modality.name} requests completed in "
@@ -323,8 +511,7 @@ class EncoderScheduler:
             # and let the client retry. Re-broadcasting would risk a deadlock.
             logger.error(f"batch_encode raised: {e}", exc_info=True)
             for p in group:
-                if not p.future.done():
-                    p.future.set_exception(e)
+                p.reject(e)
             return
 
         if len(results) != len(group):
@@ -333,8 +520,7 @@ class EncoderScheduler:
             )
             logger.error(str(err))
             for p in group:
-                if not p.future.done():
-                    p.future.set_exception(err)
+                p.reject(err)
             return
 
         if len(group) > 1 and all(
@@ -354,8 +540,7 @@ class EncoderScheduler:
             return
 
         for p, result in zip(group, results):
-            if not p.future.done():
-                p.future.set_result(result)
+            p.resolve(result)
 
     async def _dispatch_per_request(
         self,
@@ -385,14 +570,12 @@ class EncoderScheduler:
                     part_idx=req["part_idx"],
                     hashes=req.get("hashes"),
                 )
-                if not p.future.done():
-                    p.future.set_result(result)
+                p.resolve(result)
             except Exception as e:
                 logger.error(
                     f"Per-request encode failed for req_id={req.get('req_id')}: {e}"
                 )
-                if not p.future.done():
-                    p.future.set_exception(e)
+                p.reject(e)
 
 
 @dataclass

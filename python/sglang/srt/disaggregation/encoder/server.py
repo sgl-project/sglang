@@ -1132,6 +1132,7 @@ class MMEncoder:
         *,
         use_global_cache: bool,
         is_health_check: bool = False,
+        preloaded_images: Optional[List] = None,
     ) -> EncodeContext:
         """Flatten a batch of requests into one EncodeContext (single = N of 1)."""
         modality_str = modality.name.lower()
@@ -1140,7 +1141,9 @@ class MMEncoder:
             (
                 preprocess_result,
                 items_per_req,
-            ) = await self.preprocessor.process_batch_mm_items(requests, modality)
+            ) = await self.preprocessor.process_batch_mm_items(
+                requests, modality, preloaded_images=preloaded_images
+            )
         except MMError:
             raise
         except NotImplementedError as e:
@@ -1239,6 +1242,7 @@ class MMEncoder:
         *,
         use_global_cache: bool,
         is_health_check: bool = False,
+        preloaded_images: Optional[List] = None,
     ) -> EncodeContext:
         """Prepare one context consistently before TP ranks enter model forward."""
         ctx = None
@@ -1250,6 +1254,7 @@ class MMEncoder:
                 modality,
                 use_global_cache=use_global_cache,
                 is_health_check=is_health_check,
+                preloaded_images=preloaded_images,
             )
         except Exception as e:
             local_error = e
@@ -2235,12 +2240,18 @@ class MMEncoder:
         return [(0, 0, 0, msg, code)] * len(requests)
 
     async def batch_encode(
-        self, requests: List[dict], modality: Modality
+        self,
+        requests: List[dict],
+        modality: Modality,
+        preloaded_images: Optional[List] = None,
     ) -> List[Tuple[int, int, int, Optional[str], Optional[int]]]:
         """Encode requests through one fused pipeline; encode() is the N=1 case.
 
         Fuse-or-not is EncoderScheduler policy, not an API fork. Health probes
         bypass caches and stage on CPU so completion confirms a model forward.
+
+        ``preloaded_images`` (rank-0 IMAGE path) are images already decoded by
+        the out-of-process loader; TP followers always load inline.
         """
         states = [self._acquire_encode_ref(req["req_id"]) for req in requests]
         is_health_check = all(
@@ -2257,6 +2268,7 @@ class MMEncoder:
                 modality,
                 use_global_cache=use_global_cache,
                 is_health_check=is_health_check,
+                preloaded_images=preloaded_images,
             )
             mm_embedding = await self._compute_embedding(ctx, keep_on_gpu=keep_on_gpu)
 

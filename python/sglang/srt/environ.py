@@ -1865,6 +1865,13 @@ class Envs:
     # deferring that CPU work to the preprocessing/forward stage.
     SGLANG_ENCODER_EAGER_IMAGE_DECODE = EnvBool(True)
     
+    # Overlapped image loading: decode each batch's images in a pool of loader
+    # processes off the GPU path so the next batch loads while the current one
+    # encodes. When disabled, IMAGE batches decode inline on the dispatch path.
+    SGLANG_ENCODER_ENABLE_IMAGE_LOADER = EnvBool(True)
+    # Worker processes that load/decode batch images off the GPU path, so the
+    # next batch can be loaded while the current one is encoding on the GPU.
+    SGLANG_ENCODER_IMAGE_LOADER_WORKERS = EnvInt(10)
     # EPD: avoid redundant concat/device-normalization in precomputed embedding
     # extraction on the prefill side.
     SGLANG_EPD_PRECOMPUTED_EMBEDDING_FAST_PATH = EnvBool(False)
