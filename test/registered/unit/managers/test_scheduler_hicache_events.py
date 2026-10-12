@@ -16,6 +16,7 @@ maybe_stub_sgl_kernel()
 from sglang.srt.managers.schedule_batch import NextBatchPlan
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.decoding_batch import DecodingBatch
+from sglang.srt.managers.scheduler_components.inflight_queue import InflightQueue
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -125,7 +126,7 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
         enter_scope(self, published_topology(pp_size=2))
         s.pp_group = SimpleNamespace(is_last_rank=True)
         s.decoding_batches = [self.decoding_batch]
-        s.last_mbs = [None]
+        s.inflight_steps = InflightQueue(depth=0, ring=True)
         s.ingest_requests = Mock(return_value=[])
         s.waiting_queue = []
         s.disagg_prefill_bootstrap_queue = SimpleNamespace(pop_bootstrapped=lambda: [])

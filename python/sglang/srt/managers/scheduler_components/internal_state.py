@@ -263,7 +263,6 @@ class SchedulerInternalStateController:
         if scheduler.inflight_steps.ring:
             batches.extend(scheduler.running_mbs)
             batches.extend(scheduler.inflight_steps.slot_batches())
-            batches.extend(scheduler.last_mbs)
         queued = [
             *(req for batch in batches if batch is not None for req in batch.reqs),
             *scheduler.waiting_queue,
