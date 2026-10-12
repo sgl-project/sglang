@@ -1038,6 +1038,8 @@ def enable_batch_invariant_mode(enable_bmm: bool = True):
             npu_mm_batch_invariant,
         )
 
+        torch.use_deterministic_algorithms(True, warn_only=True)
+
         _batch_invariant_LIB.impl("aten::mm", npu_mm_batch_invariant, dispatch_key)
         _batch_invariant_LIB.impl(
             "aten::matmul", npu_matmul_batch_invariant, dispatch_key
