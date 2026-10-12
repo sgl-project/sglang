@@ -33,9 +33,8 @@ TEST_MODEL_MATRIX = {
 # The nightly pipeline is also triggered by pull requests via path filters, so the
 # pipeline is identified by GITHUB_WORKFLOW_REF (inherited from the caller's github
 # context) instead of the triggering event.
-_is_pr_pipeline = (
-    "/.github/workflows/nightly-test-npu.yml"
-    not in os.environ.get("GITHUB_WORKFLOW_REF", "")
+_is_pr_pipeline = "/.github/workflows/nightly-test-npu.yml" not in os.environ.get(
+    "GITHUB_WORKFLOW_REF", ""
 )
 
 

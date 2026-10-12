@@ -23,9 +23,8 @@ register_npu_ci(
 
 # The nightly pipeline can also be triggered by pull requests, so use GITHUB_WORKFLOW_REF
 # (which inherits the caller's github context) to identify the invoking workflow.
-_is_pr_pipeline = (
-    "/.github/workflows/nightly-test-npu.yml"
-    not in os.environ.get("GITHUB_WORKFLOW_REF", "")
+_is_pr_pipeline = "/.github/workflows/nightly-test-npu.yml" not in os.environ.get(
+    "GITHUB_WORKFLOW_REF", ""
 )
 
 DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_ENVS = {
