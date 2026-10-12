@@ -6,8 +6,12 @@ import math
 import pytest
 import torch
 
-from sglang.kernels.ops.lora.dense.chunked_sgmv_expand import chunked_sgmv_lora_expand_forward
-from sglang.kernels.ops.lora.dense.chunked_sgmv_shrink import chunked_sgmv_lora_shrink_forward
+from sglang.kernels.ops.lora.dense.chunked_sgmv_expand import (
+    chunked_sgmv_lora_expand_forward,
+)
+from sglang.kernels.ops.lora.dense.chunked_sgmv_shrink import (
+    chunked_sgmv_lora_shrink_forward,
+)
 from sglang.srt.lora.utils import LoRABatchInfo
 from sglang.test.ci.ci_register import register_cuda_ci
 

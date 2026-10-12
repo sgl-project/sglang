@@ -2,6 +2,7 @@
 
 PYTHONPATH=python python benchmark/kernels/lora_csgmv/bench_csgmv_split_k.py
 Timings cover shrink + expand under CUDA graphs; routing is excluded.
+The split-K case uses production dispatch, including tuned-config fallbacks.
 """
 
 import argparse
@@ -12,8 +13,12 @@ import math
 import torch
 import triton
 
-from sglang.kernels.ops.lora.dense.chunked_sgmv_expand import chunked_sgmv_lora_expand_forward
-from sglang.kernels.ops.lora.dense.chunked_sgmv_shrink import chunked_sgmv_lora_shrink_forward
+from sglang.kernels.ops.lora.dense.chunked_sgmv_expand import (
+    chunked_sgmv_lora_expand_forward,
+)
+from sglang.kernels.ops.lora.dense.chunked_sgmv_shrink import (
+    chunked_sgmv_lora_shrink_forward,
+)
 from sglang.srt.environ import envs
 from sglang.srt.lora.utils import LoRABatchInfo
 
@@ -24,7 +29,6 @@ def main():
     parser.add_argument("--adapters", type=int, default=8)
     args = parser.parse_args()
     torch.manual_seed(0)
-    envs.SGLANG_CSGMV_SPLIT_K.set(False)
     envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.set(False)
     print(
         json.dumps(
@@ -70,20 +74,16 @@ def main():
             cpu_offsets = torch.tensor(offsets, dtype=torch.int32)
             gpu_offsets = cpu_offsets.cuda()
             maxwidth = max(hi - lo for lo, hi in zip(offsets, offsets[1:]))
-            splits = (16 if k == 12288 else 8) if total <= 128 else 1
-            result = dict(
-                tokens=total, adapters=args.adapters, projection=name, split_k=splits
-            )
-            for label, split, compact in [
-                ("early_return", 1, False),
-                ("compact", 1, True),
-                ("compact_split_k", splits, True),
+            result = dict(tokens=total, adapters=args.adapters, projection=name)
+            for label, enable_split_k, compact in [
+                ("early_return", False, False),
+                ("compact", False, True),
+                ("compact_split_k", True, True),
             ]:
+                envs.SGLANG_CSGMV_SPLIT_K.set(enable_split_k)
 
                 def run():
-                    h = chunked_sgmv_lora_shrink_forward(
-                        x, a, info, slices, split_k=split
-                    )
+                    h = chunked_sgmv_lora_shrink_forward(x, a, info, slices)
                     chunked_sgmv_lora_expand_forward(
                         h,
                         b,
