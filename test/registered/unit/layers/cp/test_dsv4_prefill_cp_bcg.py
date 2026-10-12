@@ -57,6 +57,50 @@ class TestDSV4PrefillCPBCG(unittest.TestCase):
                         selected, not cp_active and (forced or num_tokens > 11673)
                     )
 
+    def test_low_ratio_indexer_writes_page_indices_for_paged_cp(self):
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            DeepseekV4AttnBackend,
+        )
+
+        backend = SimpleNamespace(
+            trtllm_attn=False,
+            tail_forward_metadata=None,
+            forward_metadata=SimpleNamespace(late_layer_tail=None),
+            token_to_kv_pool=SimpleNamespace(request_window=None),
+        )
+        backend._use_sparse_prefill = lambda fb, *, num_qo_tokens: (
+            DeepseekV4AttnBackend._use_sparse_prefill(
+                None, fb, num_qo_tokens=num_qo_tokens
+            )
+        )
+        batch = SimpleNamespace(forward_mode=ForwardMode.EXTEND)
+        for cp_active in (False, True):
+            for forced in (False, True):
+                with (
+                    patch(
+                        "sglang.srt.layers.attention.deepseek_v4_backend.is_cp_active",
+                        return_value=cp_active,
+                    ),
+                    patch(
+                        "sglang.srt.layers.attention.deepseek_v4_backend.get_platform",
+                        return_value=SimpleNamespace(is_sm120=False),
+                    ),
+                    patch(
+                        "sglang.srt.layers.attention.deepseek_v4_backend.envs"
+                    ) as envs,
+                ):
+                    envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get.return_value = forced
+                    reads = DeepseekV4AttnBackend._low_ratio_prefill_reads_page_indices(
+                        backend, batch
+                    )
+                    for num_tokens in (256, 11674):
+                        # Any batch that runs paged attention must get page indices.
+                        if not backend._use_sparse_prefill(
+                            batch, num_qo_tokens=num_tokens
+                        ):
+                            self.assertTrue(reads)
+                self.assertEqual(reads, cp_active or not forced)
+
     def test_sparse_metadata_rejects_short_query_buffer_before_launch(self):
         from sglang.srt.layers.attention.deepseek_v4_backend import (
             DeepseekV4AttnBackend,
