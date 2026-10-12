@@ -38,6 +38,9 @@ KPG_LOOSE = re.compile(r"kpg=([^\s]+)")
 # call-origin RoPE phase index.  Neither contains spaces, so the generic KV
 # regex captures the whole value; ``ROPE_SHIFT`` pulls the ``shift`` sub-field.
 ROPE_SHIFT = re.compile(r"shift=\[([^\]]*)\]")
+# ``sps=[..]`` = the call's start position(s); 0 => a full prefill from position
+# 0 (cache-MISS), >0 => a suffix prefill / continuation (cache-HIT).
+ROPE_SPS = re.compile(r"sps=\[([^\]]*)\]")
 # [KSTATELOC] is emitted positionally (no key=value for the numbers):
 #   op=W <batch> <seq> <col> <sl> <blk> <row> out=<curSeqIdx>
 #   op=R <batch> <seq> <col> <sl> <blk> <row>
@@ -429,33 +432,29 @@ def _idxin_split_source(rows):
 
 
 def _idxin_split_info(rows):
-    """``(source, n_req, hit_idx)`` banner fields for the ``[IDXIN-SPLIT]`` line.
+    """``(source, split, n_req, miss_req, hit_req)`` for the ``[IDXIN-SPLIT]`` line.
 
-    ``source`` names the segmenter in use; ``n_req`` is the detected request
-    count (the HTTP request count when chat-split); ``hit_idx`` is the same-slq
-    HIT that [IDXIN-ROPE] compares against the MISS (its boundary ordinal when
-    chat-split), or ``None`` when there is no MISS/HIT pair.
+    ``source`` is the MISS/HIT rule (``sps`` or ``largest-slq``); ``split`` the
+    segmenter (``chat/completions``/``lastpos``/``stream``); ``n_req`` the request
+    count; ``miss_req``/``hit_req`` the classified request indices.
     """
-    source = _idxin_split_source(rows)
+    split = _idxin_split_source(rows)
     reqs = _idxin_requests(rows)
-    if source == "chat/completions":
-        n_req = max((_int(r, "_req", 0) for r in rows), default=0)
-    else:
-        n_req = len(reqs)
+    n_req = (max((_int(r, "_req", 0) for r in rows), default=0)
+             if split == "chat/completions" else len(reqs))
     if len(reqs) < 2:
-        return source, n_req, None
-    miss_i = _idxin_miss_index(reqs)
-    same_hits, _slq, _slk = _idxin_same_len_hits(reqs, miss_i)
-    return source, n_req, (same_hits[0] if same_hits else None)
+        return "none", split, n_req, [], []
+    _miss_i, miss_set, hit_idx, source, _note = _idxin_roles(reqs)
+    return source, split, n_req, miss_set, hit_idx
 
 
 def report_idxin_split(rows):
-    """One ``[IDXIN-SPLIT]`` banner naming the request-split source + HIT idx."""
+    """One ``[IDXIN-SPLIT]`` banner: MISS/HIT rule, split, and req indices."""
     if not rows:
         return
-    source, n_req, hit_i = _idxin_split_info(rows)
-    hit_txt = "none" if hit_i is None else str(hit_i)
-    print(f"  [IDXIN-SPLIT] source={source} requests={n_req} hit_idx={hit_txt}")
+    source, split, n_req, miss_set, hit_idx = _idxin_split_info(rows)
+    print(f"  [IDXIN-SPLIT] source={source} split={split} requests={n_req} "
+          f"miss_req={miss_set} hit_req={hit_idx}")
 
 
 def _idxin_requests(rows):
@@ -527,6 +526,56 @@ def _idxin_same_len_hits(reqs, miss_i):
     return hits, miss_slq, miss_slk
 
 
+def _idxin_req_sps(group):
+    """Start position (min ``sps``) of one request's rows, or None.
+
+    The full prefill of the MISS starts at position 0, so its ``sps`` is 0 even
+    when the request later decodes to higher positions; a suffix HIT never sees
+    position 0.
+    """
+    vals = [s for s in (_rope_sps(r.get("ropephase")) for r in group)
+            if s is not None]
+    return min(vals) if vals else None
+
+
+def _idxin_sps_roles(reqs):
+    """``(miss_reqs, hit_reqs)`` by start position: ``sps==0`` MISS, ``sps>0`` HIT.
+
+    Requests without a parseable ``sps`` are left unclassified (neither list).
+    """
+    miss, hit = [], []
+    for i, g in enumerate(reqs):
+        s = _idxin_req_sps(g)
+        if s is None:
+            continue
+        (miss if s == 0 else hit).append(i)
+    return miss, hit
+
+
+def _idxin_roles(reqs):
+    """``(miss_i, miss_set, hit_idx, source, note)`` -- MISS/HIT classification.
+
+    PREFERS the ``sps`` rule (``sps==0`` -> MISS, ``sps>0`` -> HIT) -- the true
+    prefill start position -- over the largest-prefill ``slq`` heuristic and over
+    the /v1/chat/completions hit_idx.  When no request carries an ``sps`` (older
+    probe) it falls back to the largest-``slq`` MISS plus its same-slq HIT(s).
+    ``miss_i`` is the canonical (first) MISS.
+    """
+    miss, hit = _idxin_sps_roles(reqs)
+    if miss:
+        note = f"sps: sps==0 -> MISS {miss}, sps>0 -> HIT {hit}"
+        return miss[0], miss, hit, "sps", note
+    miss_i = _idxin_miss_index(reqs)
+    same_hits, _slq, _slk = _idxin_same_len_hits(reqs, miss_i)
+    if same_hits:
+        note = f"same-slq/slk HIT(s)={same_hits}"
+        hits = same_hits
+    else:
+        note = "no same-slq HIT -> fallback to all HITs (lengths differ)"
+        hits = [j for j in range(len(reqs)) if j != miss_i and reqs[j]]
+    return miss_i, [miss_i], hits, "largest-slq", note
+
+
 def _distinct_km(group):
     """Distinct ``(klog, kpg)`` tuples of one request, sorted."""
     return sorted({(r.get("klog", "?"), r.get("kpg", "?")) for r in group}, key=str)
@@ -548,13 +597,13 @@ def report_idxin_requests(rows):
     if n_req < 2:
         print("  [IDXIN-KM] <2 requests -> per-request MISS/HIT split skipped")
         return
-    miss_i = _idxin_miss_index(reqs)
-    print(f"  [IDXIN-KM] MISS=req{miss_i} (largest prefill slq); "
-          f"{n_req - 1} HIT request(s)")
+    miss_i, miss_set, _hit_idx, role_src, _note = _idxin_roles(reqs)
+    print(f"  [IDXIN-KM] MISS=req{miss_i} (source={role_src}); "
+          f"{n_req - len(miss_set)} HIT request(s)")
     for i, g in enumerate(reqs[:MAX_REQ_SHOWN]):
         if not g:
             continue
-        role = "MISS" if i == miss_i else "HIT "
+        role = "MISS" if i in miss_set else "HIT "
         km = _distinct_km(g)
         print(f"     req{i} {role} probes={len(g)} distinct(klog,kpg)={len(km)}")
         for klog, kpg in km[:MAX_DIFF_SHOWN]:
@@ -694,6 +743,20 @@ def _rope_shift(v):
         return None
 
 
+def _rope_sps(v):
+    """First ``sps=[..]`` (start position) entry of a ``ropephase=`` value."""
+    if not v:
+        return None
+    m = ROPE_SPS.search(str(v))
+    if not m:
+        return None
+    first = m.group(1).split(",")[0].strip()
+    try:
+        return int(first)
+    except ValueError:
+        return None
+
+
 def _idxin_knorm_by_block(group):
     """``{abs_shift: knorm_mean}`` for one request's [IDXIN] rows.
 
@@ -740,6 +803,15 @@ def _knorm_block_verdict(miss_map, hit_map, tol):
             rel, shared, miss_only, hit_only, offenders)
 
 
+def _knorm_maps_agree(base, other, tol):
+    """True when two ``{abs_shift: knorm}`` maps agree on every SHARED block."""
+    for s in set(base) & set(other):
+        a, b = base[s], other[s]
+        if abs(a - b) / max(abs(a), abs(b), 1e-12) > tol:
+            return False
+    return True
+
+
 def report_idxin_rope(rows, knorm_tol=0.05):
     """``[IDXIN-ROPE]`` MISS-vs-HIT RoPE-phase verdict (one line + per request).
 
@@ -753,18 +825,19 @@ def report_idxin_rope(rows, knorm_tol=0.05):
       * ``knorm`` equal & ``klog`` differs       -> ``ROPE-PHASE`` (the sole
         remaining difference is the RoPE phase the kernel applies)
 
-    Pairing rule: the MISS (largest prefill) is compared against the HIT
-    request(s) whose ``slq``/``slk`` MATCHES the MISS -- i.e. the cache-hit of
-    the SAME sequence.  Pairing the MISS with the FIRST HITs (different, short
-    prompts) forces a false ``CONTENT/WINDOW``.  When no HIT shares the length we
-    fall back to all HITs and SAY SO.
+    MISS/HIT classification: a request whose (prefill) start position ``sps`` is
+    0 is the cache-MISS (a full prefill from position 0); an ``sps>0`` request is
+    a cache-HIT (a suffix prefill).  This ``sps`` rule is preferred over the
+    largest-prefill ``slq`` heuristic and over the /v1/chat/completions hit_idx.
+    Several identical MISS curls are allowed: the first MISS is the reference and
+    the others are checked for self-consistency.
 
     Comparison is PER-BLOCK: each request's ``knorm`` values are paired with
     their ABSOLUTE block index (the ``ropephase`` ``shift``) and ONLY the blocks
-    present in BOTH the MISS and the matching HIT are compared.  RoPE is
-    orthonormal, so a shared block's magnitude must match within ``knorm_tol``;
-    the MISS's extra (or the HIT's extra) blocks are reported but NOT judged.
-    With no shared block the verdict is ``NO-SHARED-BLOCKS``.
+    present in BOTH the MISS and the HIT are compared.  RoPE is orthonormal, so a
+    shared block's magnitude must match within ``knorm_tol``; the MISS's extra
+    (or the HIT's extra) blocks are reported but NOT judged.  With no shared
+    block the verdict is ``NO-SHARED-BLOCKS``.
 
     Requests are split by the ``/v1/chat/completions`` boundary when present
     (see ``_idxin_requests``), so ``req{i}`` matches the curl order and the
@@ -781,7 +854,10 @@ def report_idxin_rope(rows, knorm_tol=0.05):
     if n_req < 2:
         print("  [IDXIN-ROPE] <2 requests -> MISS/HIT RoPE split skipped")
         return
-    miss_i = _idxin_miss_index(reqs)
+    miss_i, miss_set, hit_idx, role_src, role_note = _idxin_roles(reqs)
+    miss_slq, miss_slk = _idxin_req_len(reqs[miss_i])
+    hit_len_txt = ",".join(str(s) for s in sorted({_idxin_req_len(reqs[j])[0]
+                                                   for j in hit_idx})) or "-"
     knorms, shifts, phases = [], [], []
     for g in reqs:
         knorms.append(sorted({r.get("knorm") for r in g if r.get("knorm")}))
@@ -789,27 +865,16 @@ def report_idxin_rope(rows, knorm_tol=0.05):
                               if _rope_shift(r.get("ropephase")) is not None}))
         phases.append(sorted({r.get("ropephase") for r in g if r.get("ropephase")}))
 
-    # Pair the MISS with the HIT(s) of the SAME prompt length (cache-hit of the
-    # SAME sequence), NOT the first HITs.  Only that comparison is meaningful:
-    # short unrelated HITs have a different window and would fake CONTENT/WINDOW.
-    same_hits, miss_slq, miss_slk = _idxin_same_len_hits(reqs, miss_i)
-    if same_hits:
-        hit_idx = same_hits
-        pairing_txt = f"same-slq/slk HIT(s)={same_hits}"
-    else:
-        hit_idx = [j for j in range(len(reqs)) if j != miss_i and reqs[j]]
-        pairing_txt = "no same-slq HIT -> fallback to all HITs (lengths differ)"
-    hit_len_txt = ",".join(str(s) for s in sorted({_idxin_req_len(reqs[j])[0]
-                                                   for j in hit_idx}))
-
-    print(f"  [IDXIN-ROPE] MISS=req{miss_i} (largest prefill slq={miss_slq}); "
-          f"{n_req - 1} HIT request(s)  knorm_tol={knorm_tol}")
-    print(f"  [IDXIN-ROPE] pairing: {pairing_txt}  miss_slk={miss_slk} "
-          f"hit_slq={hit_len_txt}")
+    print(f"  [IDXIN-ROPE] MISS=req{miss_i} (source={role_src}); "
+          f"{len(miss_set)} MISS / {len(hit_idx)} HIT request(s)  "
+          f"knorm_tol={knorm_tol}")
+    print(f"  [IDXIN-ROPE] pairing: {role_note}")
+    print(f"  [IDXIN-ROPE] miss_req={miss_set} hit_req={hit_idx} "
+          f"miss_slq={miss_slq} hit_slq={hit_len_txt}")
     for i, _g in enumerate(reqs[:MAX_REQ_SHOWN]):
         if not _g:
             continue
-        role = "MISS" if i == miss_i else "HIT "
+        role = "MISS" if i in miss_set else "HIT "
         kmeans = [_knorm_mean(v) for v in knorms[i]]
         kmean_txt = ",".join(
             "?" if m is None else f"{m:.4g}" for m in kmeans[:MAX_DIFF_SHOWN])
@@ -817,11 +882,15 @@ def report_idxin_rope(rows, knorm_tol=0.05):
         print(f"     req{i} {role} knorm[{len(knorms[i])}]={kmean_txt or '-'} "
               f"shift={shifts[i] or '-'} ropephase[{len(phases[i])}]={ph_txt}")
 
-    # Per-BLOCK comparison: {abs_shift: knorm} for the MISS and the matching
-    # HIT(s), compared ONLY on the blocks present in BOTH.  The MISS's (or the
-    # HIT's) EXTRA blocks must not be judged -- a whole-request value-SET compare
-    # lets them fake a CONTENT/WINDOW.
-    miss_map = _idxin_knorm_by_block(reqs[miss_i])
+    # Per-BLOCK comparison: {abs_shift: knorm} for the MISS and the HIT(s),
+    # compared ONLY on the blocks present in BOTH.  The MISS's (or the HIT's)
+    # EXTRA blocks must not be judged -- a whole-request value-SET compare lets
+    # them fake a CONTENT/WINDOW.  Identical MISS curls are also checked for
+    # self-consistency against the first MISS.
+    miss_maps = [_idxin_knorm_by_block(reqs[j]) for j in miss_set]
+    miss_consistent = all(_knorm_maps_agree(miss_maps[0], m, knorm_tol)
+                          for m in miss_maps[1:])
+    miss_map = miss_maps[0]
     hit_map = {}
     for j in hit_idx:
         hit_map.update(_idxin_knorm_by_block(reqs[j]))
@@ -839,10 +908,11 @@ def report_idxin_rope(rows, knorm_tol=0.05):
     else:
         verdict = "SAME"
     rel_txt = "na" if rel is None else f"{rel:.3e}"
-    print(f"[IDXIN-ROPE] miss_slq={miss_slq} hit_slq={hit_len_txt} "
-          f"n_shared={len(shared)} n_miss_only={len(miss_only)} "
-          f"n_hit_only={len(hit_only)} maxrel={rel_txt} "
-          f"knorm_same={knorm_cmp == 'SAME'} klog_diff={klog_diff} => {verdict}")
+    print(f"[IDXIN-ROPE] miss_req={miss_set} hit_req={hit_idx} "
+          f"miss_consistent={miss_consistent} n_shared={len(shared)} "
+          f"n_miss_only={len(miss_only)} n_hit_only={len(hit_only)} "
+          f"maxrel={rel_txt} knorm_same={knorm_cmp == 'SAME'} "
+          f"klog_diff={klog_diff} => {verdict}")
     if offenders:
         off_txt = "  ".join(
             f"shift={s}:miss={a:.4g}->hit={b:.4g}" for s, a, b in offenders)
@@ -1624,11 +1694,13 @@ def _selftest():
     with THAT HIT (ROPE-PHASE, not a false CONTENT/WINDOW from the first short
     HITs); C2 has NO same-slq HIT and asserts the fallback is stated.  FINALLY,
     D1 builds a synthetic log with FIVE ``/v1/chat/completions`` boundary lines
-    and asserts the boundary split picks request 5 as the HIT (``[IDXIN-SPLIT]
-    source=chat/completions requests=5 hit_idx=5``) and yields ROPE-PHASE.  E1/E2
-    build per-BLOCK ``knorm`` (each row a distinct ``shift``) and assert the
-    comparison judges ONLY shared blocks: E1 (shared equal, one extra MISS block)
-    -> ROPE-PHASE; E2 (a shared block differs) -> CONTENT/WINDOW.
+    and asserts the boundary split + the ``sps`` rule label requests 1..4 MISS
+    and 5 HIT.  E1/E2 build per-BLOCK ``knorm`` and assert the comparison judges
+    ONLY shared blocks: E1 (shared equal, one extra MISS block) -> ROPE-PHASE; E2
+    (a shared block differs) -> CONTENT/WINDOW.  F1 is the real shape: five
+    requests where 0..3 are MISS (``sps=0``) and 4 is HIT (``sps=16384``); it
+    asserts ``[IDXIN-SPLIT] source=sps ... miss_req=[0, 1, 2, 3] hit_req=[4]``,
+    a self-consistent MISS set, and a ROPE-PHASE shared-block verdict.
     """
     import contextlib
     import io
@@ -1639,11 +1711,12 @@ def _selftest():
     kpg_b = "n=8,first=[1, 2, 3, 4],last=[5, 6, 7, 8]"
 
     def _idxin(ly, slq, klog, kpg, knorm="1.0:100:64", shift=0, npb=100,
-               slk=17523):
+               slk=17523, with_sps=True):
+        sps = f"sps=[{shift * 4}]," if with_sps else ""
         return (
             f"[IDXIN] layer={ly} mode=1 qblk=[0:aa] wblk=[0:bb] "
             f"slq=({slq},{slq},1) slk=({slk},{slk},1) klog={klog} kpg={kpg} "
-            f"knorm={knorm} ropephase=r=4,sps=[{shift * 4}],shift=[{shift}],"
+            f"knorm={knorm} ropephase=r=4,{sps}shift=[{shift}],"
             f"npb=[{npb}],loc=[0..{npb - 1}],abs=[{shift}..{shift + npb - 1}] "
             f"kraw=kk meta=mm bt=tt qshape=(1,2,3) wshape=(1,2,3) "
             f"kshape=(4,5,6)"
@@ -1695,76 +1768,100 @@ def _selftest():
         out = buf.getvalue()
 
         # --- no-[CMPIDX] fallback: split [IDXIN] purely from its own stream ---
-        # B1: same knorm on the SHARED block (shift 0) + differing klog
-        #     -> ROPE-PHASE.
+        # B1: NO sps -> largest-slq fallback; same knorm on the SHARED block
+        #     (shift 0) + differing klog -> ROPE-PHASE.
         nocmp_rope = [
-            _idxin(5, 17523, "aaaa", kpg_a, knorm="1.0:100:64", shift=0),
-            _idxin(7, 17523, "bbbb", kpg_a, knorm="1.0:100:64", shift=0),
-            _idxin(5, 1139, "cccc", kpg_a, knorm="1.0:100:64", shift=0),
-            _idxin(7, 1139, "dddd", kpg_a, knorm="1.0:100:64", shift=0),
+            _idxin(5, 17523, "aaaa", kpg_a, knorm="1.0:100:64", shift=0,
+                   with_sps=False),
+            _idxin(5, 1139, "cccc", kpg_a, knorm="1.0:100:64", shift=0,
+                   with_sps=False),
         ]
         # B2: shared block (shift 0) knorm differs (rel=0.5 > tol=0.05)
         #     -> CONTENT/WINDOW.
         nocmp_content = [
-            _idxin(5, 17523, "aaaa", kpg_a, knorm="1.0:100:64", shift=0),
-            _idxin(5, 1139, "aaaa", kpg_a, knorm="2.0:100:64", shift=0),
+            _idxin(5, 17523, "aaaa", kpg_a, knorm="1.0:100:64", shift=0,
+                   with_sps=False),
+            _idxin(5, 1139, "aaaa", kpg_a, knorm="2.0:100:64", shift=0,
+                   with_sps=False),
         ]
-        # C1: a same-slq HIT EXISTS (knorm ~equal, 198.935 vs 199.0 on the SAME
-        #     shared block) -> must pair the MISS with THAT HIT and print
-        #     ROPE-PHASE -- NOT with the first, short-slq HITs (knorm 6.7/12.7)
-        #     which would fake CONTENT/WINDOW.
+        # C1: NO sps -> same-slq fallback.  A same-slq HIT EXISTS (knorm ~equal,
+        #     198.935 vs 199.0 on the SAME shared block) -> must pair the MISS
+        #     with THAT HIT and print ROPE-PHASE -- NOT with the first, short-slq
+        #     HITs (knorm 6.7/12.7) which would fake CONTENT/WINDOW.
         same_slq = [
-            _idxin(5, 17523, "aaaa", kpg_a, knorm="198.935:100:64", shift=0),
-            _idxin(5, 10, "xx", kpg_a, knorm="6.71568:100:64", shift=1, slk=10),
-            _idxin(5, 12, "yy", kpg_a, knorm="12.7265:100:64", shift=1, slk=12),
+            _idxin(5, 17523, "aaaa", kpg_a, knorm="198.935:100:64", shift=0,
+                   with_sps=False),
+            _idxin(5, 10, "xx", kpg_a, knorm="6.71568:100:64", shift=1, slk=10,
+                   with_sps=False),
+            _idxin(5, 12, "yy", kpg_a, knorm="12.7265:100:64", shift=1, slk=12,
+                   with_sps=False),
             _idxin(5, 17523, "bbbb", kpg_a, knorm="199.0:100:64",
-                   shift=0, slk=17523),
+                   shift=0, slk=17523, with_sps=False),
         ]
         # C2: NO same-slq HIT -> fall back to all HITs AND SAY SO; shared block
         #     knorm equal -> still ROPE-PHASE (the fallback is stated).
         no_same_slq = [
-            _idxin(5, 17523, "aaaa", kpg_a, knorm="198.935:100:64", shift=0),
-            _idxin(5, 10, "xx", kpg_a, knorm="198.935:100:64", shift=0, slk=10),
+            _idxin(5, 17523, "aaaa", kpg_a, knorm="198.935:100:64", shift=0,
+                   with_sps=False),
+            _idxin(5, 10, "xx", kpg_a, knorm="198.935:100:64", shift=0, slk=10,
+                   with_sps=False),
         ]
-        # E1: per-BLOCK knorm.  Shared shifts {0,1,2} are EQUAL; the MISS also
-        #     carries an extra block (shift 3, 150.0) that the HIT lacks -> the
-        #     extra block must NOT be judged => ROPE-PHASE (a whole-request
-        #     value-SET compare would count 150.0 and fake CONTENT/WINDOW).
+        # E1: per-BLOCK knorm with the sps rule.  Shared shifts {4096,4097} are
+        #     EQUAL; the MISS (sps=0) also carries an extra block (shift 0,
+        #     12.73) the HIT lacks -> the extra block must NOT be judged
+        #     => ROPE-PHASE (a whole-request value-SET compare would fake
+        #     CONTENT/WINDOW).
         per_shift_rope = [
             _idxin(2, 17523, "aaaa", kpg_a, knorm="12.73:1:64", shift=0),
-            _idxin(3, 17523, "aaaa", kpg_a, knorm="197.7:1:64", shift=1),
-            _idxin(4, 17523, "aaaa", kpg_a, knorm="199.0:1:64", shift=2),
-            _idxin(5, 17523, "aaaa", kpg_a, knorm="150.0:1:64", shift=3),
-            _idxin(2, 17523, "bbbb", kpg_a, knorm="12.73:1:64", shift=0),
-            _idxin(3, 17523, "bbbb", kpg_a, knorm="197.7:1:64", shift=1),
-            _idxin(4, 17523, "bbbb", kpg_a, knorm="199.0:1:64", shift=2),
+            _idxin(3, 17523, "aaaa", kpg_a, knorm="197.7:1:64", shift=4096),
+            _idxin(4, 17523, "aaaa", kpg_a, knorm="199.0:1:64", shift=4097),
+            _idxin(2, 17523, "bbbb", kpg_a, knorm="197.7:1:64", shift=4096),
+            _idxin(3, 17523, "bbbb", kpg_a, knorm="199.0:1:64", shift=4097),
         ]
-        # E2: per-BLOCK knorm.  A SHARED shift (1) DIFFERS (197.7 vs 250.0)
-        #     -> CONTENT/WINDOW.
+        # E2: per-BLOCK knorm.  Shared blocks (4096/4097) DIFFER -> CONTENT/WINDOW.
         per_shift_content = [
             _idxin(2, 17523, "aaaa", kpg_a, knorm="12.73:1:64", shift=0),
-            _idxin(3, 17523, "aaaa", kpg_a, knorm="197.7:1:64", shift=1),
-            _idxin(2, 17523, "bbbb", kpg_a, knorm="12.73:1:64", shift=0),
-            _idxin(3, 17523, "bbbb", kpg_a, knorm="250.0:1:64", shift=1),
+            _idxin(3, 17523, "aaaa", kpg_a, knorm="197.7:1:64", shift=4096),
+            _idxin(4, 17523, "aaaa", kpg_a, knorm="199.0:1:64", shift=4097),
+            _idxin(2, 17523, "bbbb", kpg_a, knorm="12.73:1:64", shift=4096),
+            _idxin(3, 17523, "bbbb", kpg_a, knorm="250.0:1:64", shift=4097),
         ]
-        # D1: /v1/chat/completions HTTP boundaries -- the STRONGEST split signal.
-        #     The 5th request is the HIT (same slq=17523 as the 4th=MISS); the
-        #     boundary split must pick request 5 (not the earlier short ones) and
-        #     print ROPE-PHASE.
+        # F1: the REAL shape -- the harness fires 5 identical requests; req0..3
+        #     MISS (sps=0), req4 HIT (sps=16384).  The sps rule must label 0-3
+        #     MISS / 4 HIT and the shared block (shift 4096) must give ROPE-PHASE.
+        per_sps = [
+            _idxin(0, 17523, "aaaa", kpg_a, knorm="198.935:100:64", shift=0),
+            _idxin(1, 17523, "aaaa", kpg_a, knorm="198.935:100:64", shift=4096),
+            _idxin(0, 17523, "aaaa", kpg_a, knorm="198.935:100:64", shift=0),
+            _idxin(1, 17523, "aaaa", kpg_a, knorm="198.935:100:64", shift=4096),
+            _idxin(0, 17523, "aaaa", kpg_a, knorm="198.935:100:64", shift=0),
+            _idxin(1, 17523, "aaaa", kpg_a, knorm="198.935:100:64", shift=4096),
+            _idxin(0, 17523, "aaaa", kpg_a, knorm="198.935:100:64", shift=0),
+            _idxin(1, 17523, "aaaa", kpg_a, knorm="198.935:100:64", shift=4096),
+            _idxin(0, 17523, "bbbb", kpg_a, knorm="199.0:100:64", shift=4096),
+            _idxin(1, 17523, "bbbb", kpg_a, knorm="199.0:100:64", shift=4096),
+        ]
+        # D1: /v1/chat/completions HTTP boundaries + the sps rule.  req1..4 are
+        #     identical MISSes (sps=0) and req5 the HIT (sps=16384) sharing
+        #     block 4096 -> ROPE-PHASE.
         CHAT = ('INFO:     127.0.0.1:0 - "POST /v1/chat/completions '
                 'HTTP/1.1" 200 OK')
         chat_split = [
-            CHAT,  # request 1: short
-            _idxin(5, 10, "s1", kpg_a, knorm="6.71568:100:64", shift=1, slk=10),
-            CHAT,  # request 2: short
-            _idxin(5, 12, "s2", kpg_a, knorm="12.7265:100:64", shift=1, slk=12),
-            CHAT,  # request 3: short
-            _idxin(5, 14, "s3", kpg_a, knorm="12.7265:100:64", shift=1, slk=14),
-            CHAT,  # request 4: MISS prefill
-            _idxin(5, 17523, "aaaa", kpg_a, knorm="198.935:100:64", shift=0),
-            CHAT,  # request 5: HIT (same slq) -> the one to compare against
-            _idxin(5, 17523, "bbbb", kpg_a, knorm="199.0:100:64",
-                   shift=0, slk=17523),
+            CHAT,  # request 1: MISS
+            _idxin(2, 17523, "aaaa", kpg_a, knorm="198.935:100:64", shift=0),
+            _idxin(3, 17523, "aaaa", kpg_a, knorm="198.935:100:64", shift=4096),
+            CHAT,  # request 2: MISS
+            _idxin(2, 17523, "aaaa", kpg_a, knorm="198.935:100:64", shift=0),
+            _idxin(3, 17523, "aaaa", kpg_a, knorm="198.935:100:64", shift=4096),
+            CHAT,  # request 3: MISS
+            _idxin(2, 17523, "aaaa", kpg_a, knorm="198.935:100:64", shift=0),
+            _idxin(3, 17523, "aaaa", kpg_a, knorm="198.935:100:64", shift=4096),
+            CHAT,  # request 4: MISS
+            _idxin(2, 17523, "aaaa", kpg_a, knorm="198.935:100:64", shift=0),
+            _idxin(3, 17523, "aaaa", kpg_a, knorm="198.935:100:64", shift=4096),
+            CHAT,  # request 5: HIT (sps=16384), shares block 4096
+            _idxin(2, 17523, "bbbb", kpg_a, knorm="199.0:100:64",
+                   shift=4096, slk=17523),
         ]
 
         def _run_nocmp(src_lines):
@@ -1793,9 +1890,9 @@ def _selftest():
         d1_rows, d1_out = _run_nocmp(chat_split)
         e1_rows, e1_out = _run_nocmp(per_shift_rope)
         e2_rows, e2_out = _run_nocmp(per_shift_content)
+        f1_rows, f1_out = _run_nocmp(per_sps)
         b1_reqs = _idxin_requests(b1_rows)
         b2_reqs = _idxin_requests(b2_rows)
-        d1_reqs = _idxin_requests(d1_rows)
 
         checks = [
             ("kpg full value parsed",
@@ -1849,29 +1946,40 @@ def _selftest():
              "no same-slq HIT" in c2_out),
             ("[IDXIN-ROPE] no-same-slq fallback still ROPE-PHASE",
              "=> ROPE-PHASE" in c2_out),
-            ("[IDXIN-SPLIT] chat/completions banner (5 requests, HIT=5)",
-             "[IDXIN-SPLIT] source=chat/completions requests=5 hit_idx=5"
-             in d1_out),
-            ("chat boundary split picks request 5 as HIT",
-             _idxin_split_info(d1_rows) == ("chat/completions", 5, 5)),
-            ("chat boundary split MISS=req4 (prefill before the HIT)",
-             _idxin_miss_index(d1_reqs) == 4),
-            ("[IDXIN-ROPE] chat-split HIT -> ROPE-PHASE",
-             "miss_slq=17523" in d1_out and "hit_slq=17523" in d1_out
+            ("[IDXIN-SPLIT] sps rule labels chat reqs (miss 1-4, hit 5)",
+             "source=sps" in d1_out
+             and "miss_req=[1, 2, 3, 4]" in d1_out
+             and "hit_req=[5]" in d1_out),
+            ("[IDXIN-SPLIT] info: sps + chat/completions + 5 reqs",
+             _idxin_split_info(d1_rows)
+             == ("sps", "chat/completions", 5, [1, 2, 3, 4], [5])),
+            ("[IDXIN-ROPE] chat-split MISS vs HIT -> ROPE-PHASE",
+             "miss_req=[1, 2, 3, 4]" in d1_out and "hit_req=[5]" in d1_out
              and "=> ROPE-PHASE" in d1_out
              and "=> CONTENT/WINDOW" not in d1_out),
             ("[IDXIN-SPLIT] non-chat logs keep lastpos/stream source",
              _idxin_split_source(idxin) == "lastpos"
              and _idxin_split_source(b1_rows) == "stream"),
             ("[IDXIN-ROPE] per-block: extra MISS block NOT judged -> ROPE-PHASE",
-             "n_shared=3" in e1_out and "n_miss_only=1" in e1_out
+             "n_shared=2" in e1_out and "n_miss_only=1" in e1_out
              and "n_hit_only=0" in e1_out
              and "=> ROPE-PHASE" in e1_out
              and "=> CONTENT/WINDOW" not in e1_out),
             ("[IDXIN-ROPE] per-block: shared block differs -> CONTENT/WINDOW",
              "n_shared=2" in e2_out and "=> CONTENT/WINDOW" in e2_out),
             ("[IDXIN-ROPE] per-block offending block printed",
-             "differing shared blocks" in e2_out and "shift=1:" in e2_out),
+             "differing shared blocks" in e2_out and "shift=4096:" in e2_out),
+            ("[IDXIN-SPLIT] sps rule: 4 MISS (sps=0) + 1 HIT (sps=16384)",
+             "source=sps" in f1_out and "miss_req=[0, 1, 2, 3]" in f1_out
+             and "hit_req=[4]" in f1_out),
+            ("[IDXIN-SPLIT] info: sps + stream + miss 0-3 / hit 4",
+             _idxin_split_info(f1_rows)
+             == ("sps", "stream", 5, [0, 1, 2, 3], [4])),
+            ("[IDXIN-ROPE] sps MISS set self-consistent",
+             "miss_consistent=True" in f1_out),
+            ("[IDXIN-ROPE] sps shared block -> ROPE-PHASE",
+             "n_shared=1" in f1_out and "=> ROPE-PHASE" in f1_out
+             and "=> CONTENT/WINDOW" not in f1_out),
             ("[IDXIN-ROPE] per-request knorm+ropephase printed",
              "knorm[" in b1_out and "ropephase[" in b1_out),
         ]
