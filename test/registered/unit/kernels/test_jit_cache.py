@@ -83,14 +83,14 @@ def test_musa_ninja_uses_the_musa_device_compiler(monkeypatch):
         )
     )
 
-    assert "compiler = /opt/musa/bin/mcc" in build_file
-    assert "command = $compiler " in build_file
+    assert "nvcc = /opt/musa/bin/mcc" in build_file
+    assert "command = $nvcc " in build_file
     assert "--offload-arch=mp_31" in build_file
     assert "-x musa" in build_file
-    assert "nvcc =" not in build_file
 
 
 def test_musa_toolchain_flags(monkeypatch):
+    monkeypatch.setattr(toolchain, "is_hip_runtime", lambda: False)
     monkeypatch.setattr(toolchain, "is_musa_runtime", lambda: True)
     monkeypatch.setattr(toolchain, "musa_home", lambda: "/opt/musa")
     monkeypatch.setattr(toolchain, "gpu_arch_name", lambda: "mp_31")
@@ -115,6 +115,26 @@ def test_musa_toolchain_flags(monkeypatch):
         "-lmusa",
         "-lmusart",
     ]
+
+
+@pytest.mark.parametrize(
+    "configured, capability, expected",
+    [(None, (3, 1), "mp_31"), (None, (0, 0), "unknown"), ("mp_32", None, "mp_32")],
+)
+def test_musa_arch_uses_shared_query(monkeypatch, configured, capability, expected):
+    monkeypatch.setattr(toolchain, "is_hip_runtime", lambda: False)
+    monkeypatch.setattr(toolchain, "is_musa_runtime", lambda: True)
+    if configured is None:
+        monkeypatch.delenv("MTGPU_TARGET", raising=False)
+    else:
+        monkeypatch.setenv("MTGPU_TARGET", configured)
+
+    def query():
+        assert capability is not None, "explicit target must not query a device"
+        return arch.make_jit_cuda_arch(*capability)
+
+    monkeypatch.setattr(toolchain, "get_jit_cuda_arch", query)
+    assert toolchain.gpu_arch_name.__wrapped__() == expected
 
 
 def test_musa_home_prefers_explicit_environment(monkeypatch):

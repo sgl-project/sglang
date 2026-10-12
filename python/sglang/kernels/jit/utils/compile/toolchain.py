@@ -127,15 +127,10 @@ def gpu_arch_name() -> str:
         configured = os.environ.get("MTGPU_TARGET")
         if configured:
             return configured
-        try:
-            device = torch.musa.current_device()
-            properties = torch.musa.get_device_properties(device)
-            return f"mp_{int(properties.major)}{int(properties.minor)}"
-        except Exception:
-            logger.warning(
-                "Cannot detect MUSA architecture; the JIT cache target degrades."
-            )
+        arch = get_jit_cuda_arch()
+        if (arch.major, arch.minor) == (0, 0):
             return "unknown"
+        return f"mp_{arch.major}{arch.minor}"
     else:
         return get_jit_cuda_arch().target_name
 
