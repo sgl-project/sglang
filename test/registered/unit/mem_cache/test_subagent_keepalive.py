@@ -101,19 +101,15 @@ class SubagentKeepaliveTestBase(CustomTestCase):
         req.swa_uuid_for_lock = None
         req.extra_key = None
         req.full_untruncated_fill_ids = array("q", tokens)
-        req.set_extend_range(
-            len(req.prefix_indices), len(req.full_untruncated_fill_ids)
-        )
+        req.extend_end = len(req.full_untruncated_fill_ids)
 
         finish_req(self.cache, req, up_to=req.owned_kv_len())
         return req
 
     def match_len(self, tokens) -> int:
-        return len(
-            self.cache.match_prefix(
-                MatchPrefixParams(key=RadixKey(array("q", tokens)))
-            ).device_indices
-        )
+        return self.cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", tokens)))
+        ).device_prefix_len
 
 
 class TestSubagentKeepaliveEnabled(SubagentKeepaliveTestBase):
