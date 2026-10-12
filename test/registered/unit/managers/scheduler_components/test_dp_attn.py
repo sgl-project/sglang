@@ -1,4 +1,5 @@
 import unittest
+from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Optional
 from unittest.mock import Mock, patch
@@ -398,60 +399,149 @@ class TestDPBalanceStats(CustomTestCase):
 
 
 class TestDecodeToExtendConversionVote(CustomTestCase):
-    """A decode batch votes for the prefill graph only when its 1-token extend
-    view can represent every row. Beam requests cannot: the converted batch
-    takes the prefill result path, which commits them per-req instead of
-    through the batch decode fold, and member rows carry no req."""
+    """A decode batch votes for the prefill graph, and is converted to its
+    1-token extend view after the gather, only when that view can represent
+    every row. The vote and the conversion read one predicate, so each
+    ineligibility blocks both. Beam requests, for one, cannot be represented:
+    the converted batch takes the prefill result path, which commits them
+    per-req instead of through the batch decode fold, and member rows carry no
+    req."""
 
-    def _vote(self, *, beam):
-        runner = Mock(spec=dp_attn.PrefillCudaGraphRunner)
-        runner.enable_lora = False
-        runner.max_context_size = None
-        runner.can_replay_locally.return_value = True
+    # Each case makes the decode batch ineligible for the extend view.
+    INELIGIBLE = {
+        "spec": dict(spec_algorithm=SpeculativeAlgorithm.EAGLE),
+        "logprob": dict(return_logprob=True),
+        "grammar": dict(has_grammar=True),
+        "beam": dict(beam=True),
+        "a2a": dict(a2a=True),
+        "ssm": dict(ssm=True),
+        "hisparse": dict(hisparse=True),
+        "tbo": dict(tbo=True),
+        "cp": dict(cp=True),
+        "non_breakable": dict(breakable=False),
+        "eager_runner": dict(eager_runner=True),
+        "coordination": dict(coordination=True),
+    }
+
+    @contextmanager
+    def _env(
+        self,
+        *,
+        spec_algorithm=SpeculativeAlgorithm.NONE,
+        return_logprob=False,
+        has_grammar=False,
+        beam=False,
+        a2a=False,
+        ssm=False,
+        hisparse=False,
+        tbo=False,
+        cp=False,
+        breakable=True,
+        eager_runner=False,
+        coordination=False,
+    ):
+        if eager_runner:
+            runner = Mock()
+        else:
+            runner = Mock(spec=dp_attn.PrefillCudaGraphRunner)
+            runner.enable_lora = False
+            runner.max_context_size = None
+            runner.can_replay_locally.return_value = True
         batch = SimpleNamespace(
             forward_mode=ForwardMode.DECODE,
             batch_size=lambda: 2,
-            return_logprob=False,
-            has_grammar=False,
+            return_logprob=return_logprob,
+            has_grammar=has_grammar,
             multimodal_inputs=None,
             reqs=[
                 SimpleNamespace(beam_group=Mock() if beam else None),
                 SimpleNamespace(beam_group=None),
             ],
+            # Global triggers from the gather, all set: only this rank's
+            # eligibility decides the conversion.
+            is_extend_in_batch=True,
+            can_run_dp_prefill_cuda_graph=True,
+            global_num_tokens=[2, 3],
+            convert_decode_to_extend=Mock(),
         )
         with (
             patch.object(
-                dp_attn, "get_moe_a2a_backend", return_value=Mock(is_none=lambda: True)
+                dp_attn,
+                "get_moe_a2a_backend",
+                return_value=Mock(is_none=lambda: not a2a),
             ),
-            patch.object(dp_attn, "uses_ssm_state", return_value=False),
+            patch.object(dp_attn, "uses_ssm_state", return_value=ssm),
             patch.object(
                 dp_attn,
                 "get_memory",
-                return_value=SimpleNamespace(enable_hisparse=False),
+                return_value=SimpleNamespace(enable_hisparse=hisparse),
             ),
             patch.object(
                 dp_attn,
                 "get_exec",
                 return_value=SimpleNamespace(
-                    overlap=SimpleNamespace(enable_two_batch_overlap=False)
+                    overlap=SimpleNamespace(enable_two_batch_overlap=tbo)
                 ),
             ),
-            patch.object(dp_attn, "get_cp_strategy", return_value=None),
+            patch.object(
+                dp_attn, "get_cp_strategy", return_value=Mock() if cp else None
+            ),
+            patch.object(
+                dp_attn,
+                "check_cuda_graph_backend",
+                side_effect=lambda phase, backend: (
+                    breakable if backend == Backend.BREAKABLE else False
+                ),
+            ),
+            envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.override(coordination),
         ):
+            yield SimpleNamespace(
+                batch=batch,
+                runner=runner,
+                breakable=breakable,
+                spec_algorithm=spec_algorithm,
+            )
+
+    def _vote(self, **case) -> bool:
+        with self._env(**case) as env:
             return dp_attn._local_prefill_cuda_graph_vote(
-                local_batch=batch,
-                prefill_graph_runner=runner,
+                local_batch=env.batch,
+                prefill_graph_runner=env.runner,
                 coordinated_prefill=True,
-                breakable_prefill=True,
-                spec_algorithm=SpeculativeAlgorithm.NONE,
+                breakable_prefill=env.breakable,
+                spec_algorithm=env.spec_algorithm,
                 model_config=object(),
             )
 
-    def test_plain_decode_batch_votes_for_conversion(self):
-        self.assertTrue(self._vote(beam=False))
+    def _converts(self, **case) -> bool:
+        with self._env(**case) as env:
+            adapter = dp_attn.SchedulerDPAttnAdapter(
+                model_runner=SimpleNamespace(
+                    prefill_cuda_graph_runner=env.runner,
+                    spec_algorithm=env.spec_algorithm,
+                    model_config=object(),
+                ),
+                req_to_token_pool=object(),
+                token_to_kv_pool_allocator=object(),
+                tree_cache=object(),
+                offload_tags=set(),
+                model_config=object(),
+                enable_overlap=False,
+                spec_algorithm=env.spec_algorithm,
+                get_require_mlp_sync=lambda: True,
+            )
+            self.assertIs(adapter.maybe_convert_decode_to_extend(env.batch), env.batch)
+            return env.batch.convert_decode_to_extend.called
 
-    def test_beam_request_blocks_conversion(self):
-        self.assertFalse(self._vote(beam=True))
+    def test_plain_decode_batch_votes_for_conversion(self):
+        self.assertTrue(self._vote())
+        self.assertTrue(self._converts())
+
+    def test_each_ineligibility_blocks_vote_and_conversion(self):
+        for name, case in self.INELIGIBLE.items():
+            with self.subTest(name):
+                self.assertFalse(self._vote(**case))
+                self.assertFalse(self._converts(**case))
 
 
 class TestPrefillCudaGraphVote(CustomTestCase):

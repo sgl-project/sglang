@@ -343,6 +343,46 @@ def _local_decode_cuda_graph_vote(
     return local_batch is None or local_batch.forward_mode.is_decode_or_idle()
 
 
+def decode_extend_view_eligible(
+    batch: ScheduleBatch,
+    *,
+    prefill_graph_runner,
+    breakable_prefill: bool,
+    spec_algorithm: SpeculativeAlgorithm,
+    model_config,
+) -> bool:
+    """Whether this rank's batch may run as the 1-token-extend view of its
+    decode. The prefill-graph vote and the post-gather conversion both ask it."""
+    return (
+        batch.forward_mode.is_decode()
+        # Keep verification rows in their native mode on heterogeneous steps.
+        and not envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get()
+        # Conversion replays the breakable graphs only; full's fixed
+        # request-slot geometry does not cover converted decode tails.
+        and breakable_prefill
+        # decode->extend conversion eligibility; needs the captured-graph
+        # prefill runner, not the eager fallback.
+        and isinstance(prefill_graph_runner, PrefillCudaGraphRunner)
+        and spec_algorithm.is_none()
+        and not batch.return_logprob
+        # Grammar FSMs advance through the decode result path only.
+        and not batch.has_grammar
+        # A converted batch takes the prefill result path, which commits beam
+        # requests per-req rather than through the batch decode fold; member
+        # rows also have no req of their own for the reqs-aligned extend lists.
+        and all(r.beam_group is None for r in batch.reqs)
+        # Small-bucket BCG replays amplify the a2a EP logits drift (#30898)
+        # into an accuracy loss.
+        and get_moe_a2a_backend().is_none()
+        # The converted view lacks prepare_for_extend's mamba-track fills.
+        and not uses_ssm_state(model_config)
+        # HiSparse decode has its own batch lifecycle and host-offloaded KV.
+        and not get_memory().enable_hisparse
+        and not get_exec().overlap.enable_two_batch_overlap
+        and get_cp_strategy() is None
+    )
+
+
 def _local_prefill_cuda_graph_vote(
     *,
     local_batch: Optional[ScheduleBatch],
@@ -368,31 +408,12 @@ def _local_prefill_cuda_graph_vote(
         replace_embeds = local_batch.replace_embeds
         prefix_lens = local_batch.prefix_lens
         return_logprob = local_batch.return_logprob
-    elif (
-        mode.is_decode()
-        # Conversion replays the breakable graphs only; full's fixed
-        # request-slot geometry does not cover converted decode tails.
-        and breakable_prefill
-        # decode->extend conversion eligibility; needs the captured-graph
-        # prefill runner, not the eager fallback.
-        and isinstance(prefill_graph_runner, PrefillCudaGraphRunner)
-        and spec_algorithm.is_none()
-        and not local_batch.return_logprob
-        # Grammar FSMs advance through the decode result path only.
-        and not local_batch.has_grammar
-        # A converted batch takes the prefill result path, which commits beam
-        # requests per-req rather than through the batch decode fold; member
-        # rows also have no req of their own for the reqs-aligned extend lists.
-        and all(r.beam_group is None for r in local_batch.reqs)
-        # Small-bucket BCG replays amplify the a2a EP logits drift (#30898)
-        # into an accuracy loss.
-        and get_moe_a2a_backend().is_none()
-        # The converted view lacks prepare_for_extend's mamba-track fills.
-        and not uses_ssm_state(model_config)
-        # HiSparse decode has its own batch lifecycle and host-offloaded KV.
-        and not get_memory().enable_hisparse
-        and not get_exec().overlap.enable_two_batch_overlap
-        and get_cp_strategy() is None
+    elif decode_extend_view_eligible(
+        local_batch,
+        prefill_graph_runner=prefill_graph_runner,
+        breakable_prefill=breakable_prefill,
+        spec_algorithm=spec_algorithm,
+        model_config=model_config,
     ):
         num_tokens = local_batch.batch_size()
         input_embeds = None
@@ -710,14 +731,9 @@ class SchedulerDPAttnAdapter:
         extend view when a peer rank runs extend this step, so the step stays
         mode-homogeneous and every rank replays the extend graphs instead of
         all falling to eager."""
-        if envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get():
-            # Keep verification rows in their native mode on heterogeneous steps.
+        if batch is None:
             return batch
-        if batch is None or not batch.forward_mode.is_decode():
-            return batch
-        # Global triggers from the gather. This rank's own eligibility (spec/
-        # TBO/CP/logprob/replayability) is folded into the min-reduced vote:
-        # if it failed, can_run_dp_prefill_cuda_graph is already False.
+        # Global triggers from the gather.
         if not batch.is_extend_in_batch:
             return batch
         if not batch.can_run_dp_prefill_cuda_graph:
@@ -732,6 +748,17 @@ class SchedulerDPAttnAdapter:
             # An idle rank makes the prefill runner reject replay for every
             # rank (_has_inactive_dp_rank); converting would only trade eager
             # decode for eager mixed.
+            return batch
+        # This rank's own eligibility: the predicate its prefill-graph vote read.
+        if not decode_extend_view_eligible(
+            batch,
+            prefill_graph_runner=self.model_runner.prefill_cuda_graph_runner,
+            breakable_prefill=check_cuda_graph_backend(
+                Phase.PREFILL, Backend.BREAKABLE
+            ),
+            spec_algorithm=self.model_runner.spec_algorithm,
+            model_config=self.model_runner.model_config,
+        ):
             return batch
         batch.convert_decode_to_extend()
         return batch
