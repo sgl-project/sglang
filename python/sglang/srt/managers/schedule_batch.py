@@ -3564,6 +3564,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Decode embeds the last output token via embed_tokens; clear the stale
         # prefill-time tensor so it doesn't leak into ForwardBatch.
         self.input_embeds = None
+        # A running batch adopted from a prefill batch still carries that
+        # prefill's per-step fields; decode reads none of them. Left set, the
+        # embed overrides keep decode off the CUDA graph, the load slot makes
+        # each layer wait on a finished load, and the token count is added to
+        # the processed-token counter on every decode step.
+        self.hicache_consumer_index = -1
+        self.replace_embeds = None
+        self.replace_positions = None
+        self.extend_input_logprob_token_ids = None
+        self.extend_num_tokens = None
 
         self.mamba_cow_src_indices = None
         self.mamba_cow_dst_indices = None

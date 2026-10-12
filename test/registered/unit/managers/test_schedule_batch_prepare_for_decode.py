@@ -58,6 +58,50 @@ class TestPrepareForDecodeMambaInit(CustomTestCase):
         self.assertIsNone(batch.mamba_clear_indices)
 
 
+class TestPrepareForDecodeDropsPrefillFields(CustomTestCase):
+    """A running batch adopted from a prefill batch decodes without that
+    prefill's per-step fields, with and without speculative decoding."""
+
+    def _set_prefill_fields(self, batch):
+        batch.hicache_consumer_index = 2
+        batch.replace_embeds = torch.zeros(1, 4)
+        batch.replace_positions = torch.tensor([0])
+        batch.extend_input_logprob_token_ids = torch.tensor([5, 6])
+        batch.extend_num_tokens = 7
+
+    def _assert_dropped(self, batch):
+        self.assertEqual(batch.hicache_consumer_index, -1)
+        self.assertIsNone(batch.replace_embeds)
+        self.assertIsNone(batch.replace_positions)
+        self.assertIsNone(batch.extend_input_logprob_token_ids)
+        self.assertIsNone(batch.extend_num_tokens)
+
+    def test_decode(self):
+        batch = _make_decode_batch()
+        self._set_prefill_fields(batch)
+        override = get_context().override_server_args(
+            mamba_radix_cache_strategy="no_buffer"
+        )
+        override.install()
+        self.addCleanup(override.restore)
+        with patch(
+            "sglang.srt.managers.schedule_batch.alloc_for_decode",
+            return_value=torch.tensor([6, 7], dtype=torch.int64),
+        ):
+            batch.prepare_for_decode()
+
+        self._assert_dropped(batch)
+
+    def test_spec_decode(self):
+        batch = ScheduleBatch(reqs=[])
+        batch.spec_algorithm = types.SimpleNamespace(is_none=lambda: False)
+        self._set_prefill_fields(batch)
+        with patch("sglang.srt.speculative.spec_utils.spec_prepare_for_decode"):
+            batch.prepare_for_decode()
+
+        self._assert_dropped(batch)
+
+
 class TestPrepareForDecodeSeqLensOwnership(unittest.TestCase):
     def test_decode_seq_lens_bump_is_out_of_place(self):
         """Each prepare_for_decode call rebinds seq-lens tensors to new +1 objects without mutating the old ones."""
