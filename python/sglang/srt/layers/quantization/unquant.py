@@ -906,6 +906,16 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             "Interleaved w13 gate/up: the SwiGLU is applied by the MoE up-GEMM epilogue."
         )
 
+    def restore_weights_before_loading(self, layer: torch.nn.Module) -> None:
+        """Return the expert weights to the canonical layout loads expect, which the TRT-LLM BF16 postprocess
+        left in block layout. A no-op on other MoE backends."""
+        for weight_name in ("w13_weight", "w2_weight"):
+            self.maybe_restore_flashinfer_trtllm_bf16_weight_shape_for_load(
+                layer=layer,
+                param=getattr(layer, weight_name),
+                weight_name=f".experts.{weight_name}",
+            )
+
     def maybe_restore_flashinfer_trtllm_bf16_weight_shape_for_load(
         self,
         layer: torch.nn.Module,

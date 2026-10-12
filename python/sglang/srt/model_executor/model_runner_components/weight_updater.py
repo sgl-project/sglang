@@ -301,12 +301,41 @@ class WeightUpdater:
         DefaultModelLoader.restore_weights_before_loading(
             self.get_model(), torch.device(self.device)
         )
+        self._assert_published_storage_unmoved()
 
     def end_weight_update(self: WeightUpdater, *, run_post_load: bool) -> None:
         if run_post_load:
             post_load_weights(self.get_model())
         DefaultModelLoader.postprocess_weights(
             self.get_model(), torch.device(self.device)
+        )
+        self._assert_published_storage_unmoved()
+
+    def _assert_published_storage_unmoved(self: WeightUpdater) -> None:
+        """Peers write weight updates straight into the addresses this rank published at startup (p2p), so a
+        weight-update session must leave every published parameter's storage where it was."""
+        published_weight_info = (
+            self.get_model_runner().remote_instance_weight_transporter.weight_info
+        )
+        # nothing published: nobody writes by address
+        if published_weight_info is None:
+            return
+        params = dict(self.get_model().named_parameters())
+        moved = []
+        for name, (address, numel, element_size) in published_weight_info.items():
+            param = params.get(name)
+            now = (
+                None
+                if param is None
+                else (param.data_ptr(), param.numel() * param.element_size())
+            )
+            if now != (address, numel * element_size):
+                moved.append(
+                    f"{name} published at {(address, numel * element_size)}, now {now}"
+                )
+        assert not moved, (
+            "a weight-update session moved published parameters, so peer writes would land in freed memory: "
+            f"{', '.join(moved[:5])} ({len(moved)} in all)"
         )
 
     def load_weights_from_distributed(

@@ -66,7 +66,9 @@ class RemoteInstanceWeightTransporter:
                 self.tp_rank
             )
 
-    def maybe_register_and_publish_weight_info(self) -> None:
+    def maybe_register_and_publish_weight_info(self, role: str) -> None:
+        """Registers this runner's weights with its transfer engine and publishes them, with its parallelism
+        config, under `role`: ``target``, or the draft role `weight_update_runners()` names."""
         if (
             remote_instance_transfer_engine_enabled()
             # ModelExpress owns TransferEngine memory registration and metadata
@@ -79,7 +81,7 @@ class RemoteInstanceWeightTransporter:
         ):
             # Register memory and upstream the transfer engine info to the bootstrap server
             self.weight_info = register_memory_region(self.model, self.engine)
-            self._register_to_engine_info_bootstrap()
+            self._register_to_engine_info_bootstrap(role)
 
         # The P2P weight-update client needs each rank's parallelism layout to
         # map training-side parameters onto this rank's shards.
@@ -87,7 +89,7 @@ class RemoteInstanceWeightTransporter:
             self.server_args.registers_parallelism_config()
             and self.parallelism_config is not None
         ):
-            self._register_parallelism_config_to_bootstrap()
+            self._register_parallelism_config_to_bootstrap(role)
 
     def _bootstrap_url(self) -> str:
         if get_parallel().dist_init_addr:
@@ -99,13 +101,14 @@ class RemoteInstanceWeightTransporter:
         bootstrap_port = get_model().engine_info_bootstrap_port
         return NetworkAddress(bootstrap_host, bootstrap_port).to_url()
 
-    def _register_parallelism_config_to_bootstrap(self) -> None:
+    def _register_parallelism_config_to_bootstrap(self, role: str) -> None:
         """Register this rank's parallelism config with the EngineInfoBootstrapServer."""
         import requests as http_requests
 
         bootstrap_url = self._bootstrap_url()
         url = f"{bootstrap_url}/register_parallelism_config"
         payload = {
+            "role": role,
             "tp_rank": self.tp_rank,
             "parallelism_config": self.parallelism_config.to_dict(),
         }
@@ -126,7 +129,9 @@ class RemoteInstanceWeightTransporter:
                 f"Failed to register parallelism config for tp_rank={self.tp_rank}: {e}"
             )
 
-    def _register_to_engine_info_bootstrap(self: RemoteInstanceWeightTransporter):
+    def _register_to_engine_info_bootstrap(
+        self: RemoteInstanceWeightTransporter, role: str
+    ):
         """Register transfer engine info with the EngineInfoBootstrapServer via HTTP PUT.
 
         The bootstrap server runs on node_rank==0. For multi-node setups, the
@@ -148,6 +153,7 @@ class RemoteInstanceWeightTransporter:
         url = f"{bootstrap_na.to_url()}/register_transfer_engine_info"
 
         payload = {
+            "role": role,
             "tp_rank": self.tp_rank,
             "transfer_engine_info": {
                 "session_id": self.session_id,
