@@ -193,6 +193,12 @@ def _auto_tokenizer_from_pretrained(tokenizer_name, *args, **common_kwargs):
             return retry_without_mistral_common_kwargs(
                 tokenizer_name, *args, **common_kwargs
             )
+        if "Couldn't instantiate the backend tokenizer" in str(e):
+            declared = _load_tokenizer_by_declared_class(
+                tokenizer_name, *args, **common_kwargs
+            )
+            if declared is not None:
+                return declared
         # If the error pertains to the tokenizer class not existing or not
         # currently being imported, suggest using the --trust-remote-code flag.
         if not common_kwargs.get("trust_remote_code") and (
