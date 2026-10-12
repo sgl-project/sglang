@@ -98,7 +98,28 @@ fixed-seed output measured 0.984 SSIM and 39.7 dB PSNR against eager output; use
 eager execution when you require bit-exact output. Regional `torch.compile` was
 also tested on this profile and did not improve steady-state latency.
 
-### 3.3 Configuration Tips
+### 3.3 Two 32 GB GPUs (RTX 5090)
+
+With `--tp-size 2`, the adaLN modulation projections and the text-stream FFN
+are sharded, so each rank holds about 19 GiB of DiT weights and the DiT stays
+resident on 32 GB cards:
+
+```bash Command
+sglang serve \
+  --model-path Qwen/Qwen-Image \
+  --num-gpus 2 \
+  --tp-size 2 \
+  --ulysses-degree 1 \
+  --performance-mode manual \
+  --text-encoder-cpu-offload true \
+  --attention-backend torch_cudnn_sdpa
+```
+
+On 2x RTX 5090 (PCIe, no P2P) this measured 19.7 s at 1024x1024 with 50 steps
+and no CFG. Add `--dit-cpu-offload true` to cut peak memory to about 22 GB per
+GPU at 21.2 s.
+
+### 3.4 Configuration Tips
 
 See [Performance Optimization](/docs/sglang-diffusion/performance-optimization) for acceleration features and their runtime requirements.
 
