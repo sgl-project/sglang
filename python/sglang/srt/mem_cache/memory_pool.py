@@ -64,7 +64,10 @@ from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     UnquantizedKVCacheMethod,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.mem_cache.allocation_sizing import get_mamba_tracking_slots
+from sglang.srt.mem_cache.allocation_sizing import (
+    get_alloc_page_size,
+    get_mamba_tracking_slots,
+)
 from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
 from sglang.srt.mem_cache.index_key_cache import IndexKeyCache
 from sglang.srt.mem_cache.kv_vmm_backing import KvVmmBufferOwner
@@ -4794,9 +4797,7 @@ class MLATokenToKVPool(KVCache):
 
     @property
     def alloc_page_size(self) -> int:
-        if self.dcp_replicated:
-            return self.page_size * get_parallel().attn_dcp_size
-        return self.page_size
+        return get_alloc_page_size() if self.dcp_replicated else self.page_size
 
     @property
     def _write_loc_dcp_span(self) -> int:
@@ -5215,10 +5216,11 @@ class DSATokenToKVPool(MLATokenToKVPool):
         )
         self.index_page_size = self.page_size // index_kpool
         # Index keys are replicated under DCP and addressed by the widened slot.
-        dcp_size = get_parallel().attn_dcp_size
-        self.index_alloc_page_size = self.page_size * dcp_size
+        self.index_alloc_page_size = get_alloc_page_size()
         if index_buf_size is None:
-            index_buf_size = size if dcp_replicated else size * dcp_size
+            index_buf_size = (
+                size if dcp_replicated else size * get_parallel().attn_dcp_size
+            )
         self.index_buf_size = index_buf_size
         # num head == 1 and head dim == 128 for index_k in DSA
         assert index_head_dim == 128
