@@ -61,16 +61,30 @@ pub(super) async fn forward_request(
     request_started_at: Instant,
     duration: &Arc<RequestDurationGuard>,
 ) -> Result<HttpDispatched, ApiError> {
-    let dispatched = dispatch(Http, ctx, request, workers, headers, request_started_at, duration).await?;
+    let dispatched = dispatch(
+        Http,
+        ctx,
+        request,
+        workers,
+        headers,
+        request_started_at,
+        duration,
+    )
+    .await?;
     let mut response = match dispatched.result {
         Ok(mut response) => {
-            if let Some(hint) = dispatched.decode_url_header { response.headers_mut().insert(X_SGL_DECODE_URL, hint); }
+            if let Some(hint) = dispatched.decode_url_header {
+                response.headers_mut().insert(X_SGL_DECODE_URL, hint);
+            }
             response
         }
         Err(error) => error.into_response(),
     };
     response.extensions_mut().insert(dispatched.log_context);
-    Ok(HttpDispatched { response, retry_excluding: dispatched.retry_excluding })
+    Ok(HttpDispatched {
+        response,
+        retry_excluding: dispatched.retry_excluding,
+    })
 }
 
 /// [`forward_request`] for a gRPC client: the engines are called over gRPC too.
@@ -83,7 +97,17 @@ pub(super) async fn forward_request_grpc(
     request_started_at: Instant,
 ) -> (Result<GrpcResponse, ApiError>, Option<RequestLogContext>) {
     let duration = RequestDurationGuard::new(ctx, &request.model, request_started_at);
-    match dispatch(Grpc, ctx, request, workers, headers, request_started_at, &duration).await {
+    match dispatch(
+        Grpc,
+        ctx,
+        request,
+        workers,
+        headers,
+        request_started_at,
+        &duration,
+    )
+    .await
+    {
         Ok(dispatched) => (dispatched.result, Some(dispatched.log_context)),
         Err(error) => (Err(error), None),
     }
@@ -123,7 +147,7 @@ async fn dispatch<T: Transport>(
     // for each item on a different prefill rank; one pinned rank would break that.
     let unpin_prefill = dp_aware && decode.is_some() && request.fans_out;
     let prefill_rank = (dp_aware && !unpin_prefill)
-        .then(|| prompt_dp_rank(ctx, &request, &headers, &prefill))
+        .then(|| prompt_dp_rank(ctx, request, &headers, &prefill))
         .flatten();
     let decode_rank = decode
         .as_deref()
@@ -146,7 +170,7 @@ async fn dispatch<T: Transport>(
     // Attribute the outcome to the worker supplying the client-visible response.
     let metrics = DispatchMetrics::new(
         ctx,
-        &request,
+        request,
         decode.as_deref().unwrap_or(&prefill),
         request_started_at,
         duration,
@@ -197,8 +221,13 @@ async fn dispatch<T: Transport>(
             );
             let decode_load_guards = (
                 decode.load_guard(),
-                ctx.router_inflight_load
-                    .register_aged(decode.id.clone(), decode.url.clone(), 0, 1, request_started_at.elapsed()),
+                ctx.router_inflight_load.register_aged(
+                    decode.id.clone(),
+                    decode.url.clone(),
+                    0,
+                    1,
+                    request_started_at.elapsed(),
+                ),
                 decode_rank.map(|rank| decode.dp_rank_guard(rank)),
             );
             let (decode_headers, decode_body) = with_dp_rank(dp_aware, headers, &body, decode_rank);
@@ -280,8 +309,11 @@ trait Transport: Copy + Send + 'static {
     type Response: Send + 'static;
 
     fn status(response: &Self::Response) -> u16;
-    fn respond(request: &mut PreparedRequest, response: Self::Response, streaming: bool) -> impl Future<Output = Self::Response> + Send;
-
+    fn respond(
+        request: &mut PreparedRequest,
+        response: Self::Response,
+        streaming: bool,
+    ) -> impl Future<Output = Self::Response> + Send;
 
     /// Send to the worker whose response the client receives.
     #[allow(clippy::too_many_arguments)]
@@ -315,8 +347,16 @@ struct Http;
 
 impl Transport for Http {
     type Response = Response<Body>;
-    async fn respond(request: &mut PreparedRequest, response: Self::Response, streaming: bool) -> Self::Response {
-        super::openai::respond(&mut request.responder, response, streaming).await
+    async fn respond(
+        request: &mut PreparedRequest,
+        response: Self::Response,
+        streaming: bool,
+    ) -> Self::Response {
+        if request.responder.is_some() {
+            super::openai::respond(&mut request.responder, response, streaming).await
+        } else {
+            response
+        }
     }
 
     fn status(response: &Response<Body>) -> u16 {
@@ -380,8 +420,13 @@ struct Grpc;
 
 impl Transport for Grpc {
     type Response = GrpcResponse;
-    async fn respond(_request: &mut PreparedRequest, response: Self::Response, _streaming: bool) -> Self::Response { response }
-
+    async fn respond(
+        _request: &mut PreparedRequest,
+        response: Self::Response,
+        _streaming: bool,
+    ) -> Self::Response {
+        response
+    }
 
     fn status(response: &GrpcResponse) -> u16 {
         response.status.as_u16()
@@ -740,7 +785,9 @@ impl DispatchMetrics {
         Box::new(move || metrics.observe_ttft(&model, request_started_at.elapsed().as_secs_f64()))
     }
 
-    fn stream_duration_guard(&self) -> Arc<RequestDurationGuard> { Arc::clone(&self.duration) }
+    fn stream_duration_guard(&self) -> Arc<RequestDurationGuard> {
+        Arc::clone(&self.duration)
+    }
 
     fn stream_end_callback(
         &self,
