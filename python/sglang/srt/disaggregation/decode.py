@@ -3127,7 +3127,9 @@ class SchedulerDisaggregationDecodeMixin:
                 # Rows adopted from a prebuilt batch take the HiSparse coordinator.
                 if self.enable_hisparse and decoding_batch.rows.is_empty():
                     new_prebuilt_batch.hisparse_coordinator = self.hisparse_coordinator
-                decoding_batch.join(new_prebuilt_batch)
+                # A copy joins: the prebuilt batch never becomes the running
+                # rows.
+                decoding_batch.join(new_prebuilt_batch.shallow_copy())
 
         # Schedule decode batch
         if decoding_batch.rows.is_empty():
