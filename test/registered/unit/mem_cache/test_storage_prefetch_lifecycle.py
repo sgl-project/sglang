@@ -63,6 +63,7 @@ def _staged_fixture(full_match=2):
     cache.ongoing_prefetch = {}
     cache._prefetch_outcome_stats = defaultdict(int)
     cache.tree_components = []
+    cache.components = {}
     cache.prefetch_threshold = 2
     cache._build_sidecar_transfers = Mock(return_value=[])
     cache.supports_swa = lambda: True
@@ -86,7 +87,6 @@ def _staged_fixture(full_match=2):
         entry_map={
             PoolName.SWA: SimpleNamespace(
                 host_pool=SimpleNamespace(free=Mock()),
-                device_indices_from_anchor_fn=None,
             )
         },
     )
