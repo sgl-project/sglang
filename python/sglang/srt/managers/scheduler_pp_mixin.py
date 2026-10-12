@@ -569,6 +569,9 @@ class SchedulerPPMixin:
                     self.on_idle()
 
     def init_pp_loop_state(self: Scheduler):
+        # In-flight readers gated on overlap expect non-ring records; server
+        # args force overlap off under PP.
+        assert not self.enable_overlap
         self.pp_loop_size: int = (
             get_parallel().pp_size + get_parallel().pp_async_batch_depth
         )

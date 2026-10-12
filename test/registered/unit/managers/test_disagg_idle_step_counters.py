@@ -543,6 +543,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
 
     def prepare_pp_scheduler(self, scheduler):
         enter_scope(self, get_parallel().override(pp_size=2, pp_rank=0))
+        scheduler.enable_overlap = False
         scheduler.pp_group = SimpleNamespace(is_last_rank=True)
         scheduler.forward_stream_ctx = nullcontext()
         scheduler.forward_stream = Mock()
