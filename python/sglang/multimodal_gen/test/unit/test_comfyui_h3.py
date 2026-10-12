@@ -323,8 +323,6 @@ def test_vsa_h3_tiles_cover_comfyui_packed_rows(keyframes):
     """Integrated steps hand ComfyUI's own layout to the VSA-H3 tile builder,
     which assumes text, cond and audio prefixes followed by the raster video
     rows; a reordered layout would mis-tile attention silently."""
-    from types import SimpleNamespace
-
     from sglang.multimodal_gen.configs.models.dits.minimax_h3 import MiniMaxH3DiTConfig
     from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.denoising import (
         _maybe_prepare_vsa_h3_step_metadata,
@@ -509,8 +507,11 @@ from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.base import (
     SGLDiffusionExecutor,
 )
 from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.minimax_h3 import (
+    FastH3Executor,
     MiniMaxH3Adapter,
+    distilled_h3_sigmas,
     drop_h3_pinned_sampling_fields,
+    validate_distilled_h3_step,
     worker_transformer_options,
 )
 from sglang.multimodal_gen.configs.sample.minimax_h3 import MiniMaxH3SamplingParams
@@ -1276,8 +1277,6 @@ def test_integrated_h3_int8_loader_preserves_quantized_weights(
         pin_cpu_memory=False,
         should_start_component_on_cpu=lambda _: True,
         should_use_fsdp_for_component=lambda _: False,
-        minimax_h3_adaln_online=False,
-        minimax_h3_adaln_cache_path=None,
     )
     pipeline = SimpleNamespace(
         pipeline_name="MiniMaxH3Pipeline",
@@ -1319,34 +1318,17 @@ def test_h3_pack_rejects_batched_latents() -> None:
 
 
 def test_comfyui_sparse_stream_layout_preserves_target_and_condition_roles():
-    layout = ComfyUIPackedLayout(
-        3,
-        2,
-        8,
-        12,
-        4,
-        keyframes=[{"resolved_frame_index": 0, "latent": torch.zeros(1, 24, 1, 8, 12)}],
-    )
-    packed = comfyui_layout_to_packed(serialize_comfyui_layout(layout))
-    assert packed["stream_layout"]["target_shape"] == (2, 4, 6)
-    assert packed["stream_layout"]["cond_image_shapes"] == ((1, 4, 6),)
-    assert packed["stream_layout"]["cond_image_roles"] == ("joint_cube",)
-    assert packed["stream_layout"]["cond_event_orders"] == (("imgvid", 0),)
-    assert packed["video_pos"].numel() == 2 * 4 * 6
-    assert not torch.isin(
-        packed["video_pos"], packed["img_pos"][~packed["update_mask"]]
-    ).any()
+    keyframe = {"resolved_frame_index": 0, "latent": torch.zeros(1, 24, 1, 8, 12)}
+    layout = ComfyUIPackedLayout(3, 2, 8, 12, 4, keyframes=[keyframe])
+    stream = comfyui_layout_to_packed(serialize_comfyui_layout(layout))["stream_layout"]
+    assert stream["target_shape"] == (2, 4, 6)
+    assert stream["cond_image_shapes"] == ((1, 4, 6),)
+    assert stream["cond_image_roles"] == ("joint_cube",)
+    assert stream["cond_event_orders"] == (("imgvid", 0),)
 
 
 @pytest.mark.parametrize("model_type", ["fast_h3", "vdn_h3"])
 def test_distilled_h3_rejects_wrong_grid_and_reference_task(model_type):
-    from types import SimpleNamespace
-
-    from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.minimax_h3 import (
-        distilled_h3_sigmas,
-        validate_distilled_h3_step,
-    )
-
     expected = distilled_h3_sigmas(model_type)
     sigmas = torch.tensor(expected)
     packed = SimpleNamespace(extra_req={"h3_sample_sigmas": sigmas})
@@ -1364,9 +1346,6 @@ def test_distilled_h3_rejects_wrong_grid_and_reference_task(model_type):
 def test_fasth3_comfy_grid_matches_native_8_step_v2_contract():
     """The plugin pinned fast_h3 to the 4-NFE preview grid (shift 12) after the
     runtime moved to FastH3 8-Step V2, so V2 could not run in ComfyUI."""
-    from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.minimax_h3 import (
-        distilled_h3_sigmas,
-    )
     from sglang.multimodal_gen.configs.sample.minimax_h3 import FastH3SamplingParams
     from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.time_request import (
         minimax_h3_time_shift_sigmas,
@@ -1381,17 +1360,20 @@ def test_fasth3_comfy_grid_matches_native_8_step_v2_contract():
     assert len(native) == FastH3SamplingParams().num_inference_steps + 1
 
 
-def _fasth3_executor(tmp_path, minimax_h3):
+def test_fasth3_executor_uses_trained_shifts_and_rejects_conflicts(tmp_path):
+    """Without a MiniMaxH3SigmaShift node the audio sigma was derived with the
+    base 12/3 shifts instead of FastH3's trained 10/3."""
     import json
-    from types import SimpleNamespace
 
-    from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.minimax_h3 import (
-        FastH3Executor,
-    )
-
-    (tmp_path / "model_index.json").write_text(
-        json.dumps({"_class_name": "FastH3Pipeline", "_minimax_h3": minimax_h3})
-    )
+    release = {
+        "schema_version": 1,
+        "partition": "fl2va",
+        "tasks": ["t2va"],
+        "task_aliases": {},
+        "sigma_shift_scales": {"video": 10.0, "audio": 3.0},
+        "dmd_denoising_steps": [999, 874, 749, 624, 500, 375, 250, 125],
+    }
+    (tmp_path / "model_index.json").write_text(json.dumps({"_minimax_h3": release}))
     sent = []
 
     class Recording(FastH3Executor):
@@ -1400,58 +1382,41 @@ def _fasth3_executor(tmp_path, minimax_h3):
             return x
 
     config = SimpleNamespace(unet_config={"dtype": torch.bfloat16})
-    return Recording(None, str(tmp_path), None, config), sent
-
-
-_FASTH3_V2_RELEASE = {
-    "schema_version": 1,
-    "partition": "fl2va",
-    "tasks": ["t2va"],
-    "task_aliases": {},
-    "sigma_shift_scales": {"video": 10.0, "audio": 3.0},
-    "dmd_denoising_steps": [999, 874, 749, 624, 500, 375, 250, 125],
-}
-
-
-def test_fasth3_executor_uses_trained_shifts_and_rejects_conflicts(tmp_path):
-    """Without a MiniMaxH3SigmaShift node the audio sigma was derived with the
-    base 12/3 shifts instead of FastH3's trained 10/3."""
-    ex, sent = _fasth3_executor(tmp_path, _FASTH3_V2_RELEASE)
+    ex = Recording(None, str(tmp_path), None, config)
     x = [torch.ones(1, 24, 2, 4, 4), torch.ones(1, 32, 2, 3)]
-    kwargs = dict(minimax_payload={"audio_scale": 1.0})
-    sigmas = torch.tensor(ex.expected_sigmas)
-    ex(
+    step = lambda **opts: ex(
         x,
         torch.tensor([500.0]),
         torch.ones(1, 8, 16),
-        transformer_options={"sample_sigmas": sigmas},
-        **kwargs,
+        transformer_options={"sample_sigmas": torch.tensor(ex.expected_sigmas), **opts},
+        minimax_payload={"audio_scale": 1.0},
     )
+    step()
     opts = sent[0].extra_req["h3_transformer_options"]
     assert opts["minimax_h3_sigma_shift_video"] == 10.0
     assert opts["minimax_h3_sigma_shift_audio"] == 3.0
     with pytest.raises(ValueError, match="distilled with sigma shift video/audio 10/3"):
-        ex(
-            x,
-            torch.tensor([500.0]),
-            torch.ones(1, 8, 16),
-            transformer_options={
-                "sample_sigmas": sigmas,
-                "minimax_h3_sigma_shift_video": 12.0,
+        step(minimax_h3_sigma_shift_video=12.0)
+
+
+@pytest.mark.parametrize(
+    "masks, video_out, audio_out",
+    [
+        # ComfyUI forward: (1 - scale) * input + scale * (-raw velocity). At
+        # sigma_v=sigma_a=1 this is -3 - 4=-7; a second derivative gave -28.
+        ({}, -1, -7),
+        # Masks apply to the raw velocities, before the carried-audio transform.
+        (
+            {
+                "denoise_mask": torch.full((1, 1, 2, 4, 4), 0.25),
+                "audio_denoise_mask": torch.zeros(1, 1, 2, 3),
             },
-            **kwargs,
-        )
-
-
-def test_fasth3_executor_rejects_runtime_without_trained_rungs(tmp_path):
-    release = {
-        k: v for k, v in _FASTH3_V2_RELEASE.items() if k != "dmd_denoising_steps"
-    }
-    with pytest.raises(ValueError, match="no trained DMD rungs"):
-        _fasth3_executor(tmp_path, release)
-
-
-def test_h3_carried_audio_matches_comfyui_without_double_sigma_derivative():
+            -0.25,
+            -3,
+        ),
+    ],
+)
+def test_h3_velocities_match_comfyui_forward(masks, video_out, audio_out):
     adapter = MiniMaxH3Adapter()
     video = torch.ones(1, 24, 2, 4, 4)
     audio = torch.ones(1, 32, 2, 3)
@@ -1460,46 +1425,22 @@ def test_h3_carried_audio_matches_comfyui_without_double_sigma_derivative():
         torch.tensor([1000.0]),
         torch.ones(1, 4, 8),
         minimax_payload={"audio_scale": 4.0},
+        **masks,
     )
     out = adapter.unpack(
         [torch.ones_like(video), torch.ones_like(audio)], packed, [video, audio]
     )
-    # ComfyUI forward: (1 - scale) * input + scale * (-raw velocity).
-    # At sigma_v=sigma_a=1 this is -3 - 4=-7; another derivative gives -28.
-    assert torch.equal(out[1], torch.full_like(audio, -7))
-
-
-def test_h3_masked_velocities_match_comfyui_before_audio_carry_transform():
-    adapter = MiniMaxH3Adapter()
-    video = torch.ones(1, 24, 2, 4, 4)
-    audio = torch.ones(1, 32, 2, 3)
-    packed = adapter.pack(
-        [video, audio],
-        torch.tensor([1000.0]),
-        torch.ones(1, 4, 8),
-        minimax_payload={"audio_scale": 4.0},
-        denoise_mask=torch.full((1, 1, 2, 4, 4), 0.25),
-        audio_denoise_mask=torch.zeros(1, 1, 2, 3),
-    )
-    out = adapter.unpack(
-        [torch.ones_like(video), torch.ones_like(audio)], packed, [video, audio]
-    )
-    assert torch.equal(out[0], torch.full_like(video, -0.25))
-    assert torch.equal(out[1], torch.full_like(audio, -3))
+    assert torch.equal(out[0], torch.full_like(video, video_out))
+    assert torch.equal(out[1], torch.full_like(audio, audio_out))
 
 
 def test_comfyui_h3_rejects_bcg_with_offload_before_cuda_capture():
-    from types import SimpleNamespace
-
-    import pytest
-
     from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.comfyui_step import (
         MiniMaxH3ComfyUIStepStage,
     )
 
-    batch = SimpleNamespace(sampling_params=SimpleNamespace(quality="lossless"))
     args = SimpleNamespace(
         enable_breakable_cuda_graph=True, is_dit_layerwise_offload_selected=True
     )
     with pytest.raises(ValueError, match="copy-stream events"):
-        MiniMaxH3ComfyUIStepStage.forward(None, batch, args)
+        MiniMaxH3ComfyUIStepStage.verify_input(None, SimpleNamespace(), args)

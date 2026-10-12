@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 import torch
 
@@ -223,9 +223,8 @@ def comfyui_layout_to_packed(layout: dict[str, Any]) -> dict[str, Any]:
         token_tags[start:stop] = _SEG_TOKEN_TAG.get(kind, -1)
         if kind == "text":
             text_pos = torch.arange(start, stop, dtype=torch.long)
-    # Export sparse stream descriptors from ComfyUI's actual row/position layout.
-    # Condition rows remain independent from the target update mask.
-    cond_shapes, cond_roles, events, audio_lens, video_parts = [], [], [], [], []
+    # Cube-sparse-attention segment shapes, as packed_sequence exports them.
+    cond_shapes, cond_roles, events, audio_lens = [], [], [], []
     for start, stop, kind in layout["segments"]:
         if kind in ("cond", "ref_img"):
             coords = position_ids[start:stop]
@@ -237,8 +236,6 @@ def comfyui_layout_to_packed(layout: dict[str, Any]) -> dict[str, Any]:
         elif kind in ("cond_audio", "ref_audio"):
             audio_lens.append(stop - start)
             events.append(("audio", len(audio_lens) - 1))
-        elif kind == "video":
-            video_parts.append(torch.arange(start, stop, dtype=torch.long))
     _, latent_t, latent_h, latent_w, *_ = layout["signature"]
     stream_layout = {
         "target_shape": (latent_t, (latent_h + 1) // 2, (latent_w + 1) // 2),
@@ -249,9 +246,6 @@ def comfyui_layout_to_packed(layout: dict[str, Any]) -> dict[str, Any]:
     }
     return {
         "stream_layout": stream_layout,
-        "video_pos": (
-            torch.cat(video_parts) if video_parts else torch.empty(0, dtype=torch.long)
-        ),
         "seq_len": seq_len,
         "img_pos": layout["img_pos"].view(-1).to(torch.long),
         "audio_pos": layout["audio_pos"].view(-1).to(torch.long),
@@ -637,6 +631,53 @@ def _sample_sigmas_len(sample_sigmas: Any) -> int | None:
     return None
 
 
+def _step_attn_metadata(
+    model: Any,
+    inputs: dict[str, Any],
+    sample_sigmas: Any,
+    server_args: ServerArgs,
+    device: torch.device,
+) -> Callable[[int], Any] | None:
+    """Sparse-attention metadata per step, built as the native H3 loop builds it."""
+    from sglang.multimodal_gen.runtime.models.dits.minimax_h3_vdn_attention import (
+        prepare_hybrid_attention_metadata,
+    )
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.denoising import (
+        _build_cube_attn_metadata,
+        _maybe_prepare_vsa_h3_step_metadata,
+    )
+
+    packed = inputs["packed"]
+    latent_shape = tuple(inputs["padded_video_shape"][-3:])
+    cube = _build_cube_attn_metadata(
+        server_args,
+        packed=packed,
+        num_steps=max((_sample_sigmas_len(sample_sigmas) or 2) - 1, 1),
+        device=device,
+    )
+    if cube is not None:
+        return lambda _step: cube
+    # VSA-H3 tiles assume the native row order (text, cond, audio, raster video);
+    # test_vsa_h3_tiles_cover_comfyui_packed_rows pins ComfyUI layouts to it.
+    build = _maybe_prepare_vsa_h3_step_metadata(
+        model=model,
+        packed=packed,
+        is_ref2va=inputs["is_ref2va"],
+        latent_shape=latent_shape,
+        server_args=server_args,
+        device=device,
+    )
+    if build is not None:
+        return build
+    return prepare_hybrid_attention_metadata(
+        model=model,
+        packed=packed,
+        latent_shape=latent_shape,
+        server_args=server_args,
+        device=device,
+    )
+
+
 @dataclass
 class MiniMaxH3ComfyUIRunState:
     branch: MiniMaxH3DenoiseBranch
@@ -644,8 +685,7 @@ class MiniMaxH3ComfyUIRunState:
     orig_video_shape: tuple[int, ...]
     padded_video_shape: tuple[int, ...]
     sample_sigmas: Any = None
-    attn_metadata: Any = None
-    build_step_metadata: Any = None
+    step_attn_metadata: Callable[[int], Any] | None = None
     cache_mounted: bool = False
     refined: bool = False
     steps_done: int = 0
@@ -659,20 +699,13 @@ class MiniMaxH3ComfyUIStepStage(PipelineStage):
         self._cache_stage = None
 
     def verify_input(self, batch: Req, server_args: ServerArgs):
-        if getattr(batch.sampling_params, "quality", "lossless") != "lossless":
-            raise ValueError(
-                'ComfyUI H3 integrated mode supports quality="lossless"; '
-                'quality="high" requires native audited request-plan admission. '
-                "Use explicit cache/Spectrum parameters for ComfyUI experiments."
-            )
         if (
             server_args.enable_breakable_cuda_graph
             and server_args.is_dit_layerwise_offload_selected
         ):
             raise ValueError(
-                "ComfyUI H3 breakable CUDA graph is incompatible with layerwise offload: "
-                "the offload copy-stream events invalidate graph capture. "
-                "Disable enable_breakable_cuda_graph when using CPU layerwise offload."
+                "ComfyUI H3 breakable CUDA graph is incompatible with layerwise "
+                "offload: the offload copy-stream events invalidate graph capture"
             )
         bind_comfyui_session(batch)
         return super().verify_input(batch, server_args)
@@ -737,8 +770,6 @@ class MiniMaxH3ComfyUIStepStage(PipelineStage):
         server_args: ServerArgs,
     ) -> MiniMaxH3ComfyUIRunState:
         from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.denoising import (
-            _build_cube_attn_metadata,
-            _maybe_prepare_vsa_h3_step_metadata,
             _precompute_refined_prompt_embeds,
         )
 
@@ -767,42 +798,14 @@ class MiniMaxH3ComfyUIStepStage(PipelineStage):
                 token_tags=inputs["token_tags"],
                 device=device,
                 video_query_indices=inputs["packed"]["img_pos"][
-                    inputs["packed"]["update_mask"].bool()
+                    inputs["packed"]["update_mask"]
                 ],
             )
-            from sglang.multimodal_gen.runtime.models.dits.minimax_h3_vdn_attention import (
-                prepare_hybrid_attention_metadata,
-            )
-
-            n_sigmas = _sample_sigmas_len(sample_sigmas)
-            metadata = _build_cube_attn_metadata(
-                server_args,
-                packed=inputs["packed"],
-                num_steps=max((n_sigmas or 2) - 1, 1),
-                device=device,
-            )
-            # VSA-H3 tiles assume the native row order (text, cond, audio, raster
-            # video); ComfyUI layouts match it, see test_comfyui_h3 layout tests.
-            build_step_metadata = _maybe_prepare_vsa_h3_step_metadata(
-                model=self.transformer,
-                packed=inputs["packed"],
-                is_ref2va=inputs["is_ref2va"],
-                latent_shape=tuple(inputs["padded_video_shape"][-3:]),
-                server_args=server_args,
-                device=device,
-            )
-            if build_step_metadata is None:
-                build_step_metadata = prepare_hybrid_attention_metadata(
-                    model=self.transformer,
-                    packed=inputs["packed"],
-                    latent_shape=tuple(inputs["padded_video_shape"][-3:]),
-                    server_args=server_args,
-                    device=device,
-                )
             return MiniMaxH3ComfyUIRunState(
                 branch=branch,
-                attn_metadata=metadata,
-                build_step_metadata=build_step_metadata,
+                step_attn_metadata=_step_attn_metadata(
+                    self.transformer, inputs, sample_sigmas, server_args, device
+                ),
                 used=inputs["used"],
                 orig_video_shape=inputs["orig_video_shape"],
                 padded_video_shape=inputs["padded_video_shape"],
@@ -822,22 +825,35 @@ class MiniMaxH3ComfyUIStepStage(PipelineStage):
             state.refined = True
         return state
 
+    def _run_dit(
+        self, batch: Req, fk: dict[str, Any], state: MiniMaxH3ComfyUIRunState
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        from sglang.multimodal_gen.runtime.managers.forward_context import (
+            set_forward_context,
+        )
+
+        stage = self._cache_dit_stage()
+        step = state.steps_done
+        attn_metadata = (
+            state.step_attn_metadata(step)
+            if state.step_attn_metadata is not None
+            else None
+        )
+        runner = stage._maybe_get_bcg_runner(self.transformer)
+        if runner is not None:
+            # Integrated mode never warms up, so capture here; it is a no-op
+            # once this signature has a graph.
+            with set_forward_context(
+                current_timestep=step, attn_metadata=attn_metadata, forward_batch=batch
+            ):
+                runner.capture(
+                    **stage._bcg_pad_prompt_kwargs(fk, current_model=self.transformer)
+                )
+        return stage._forward_dit(
+            self.transformer, fk, step, batch=batch, attn_metadata=attn_metadata
+        )
+
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
-        if getattr(batch.sampling_params, "quality", "lossless") != "lossless":
-            raise ValueError(
-                'ComfyUI H3 integrated mode supports quality="lossless"; '
-                'quality="high" requires native audited request-plan admission. '
-                "Use explicit cache/Spectrum parameters for ComfyUI experiments."
-            )
-        if (
-            server_args.enable_breakable_cuda_graph
-            and server_args.is_dit_layerwise_offload_selected
-        ):
-            raise ValueError(
-                "ComfyUI H3 breakable CUDA graph is incompatible with layerwise offload: "
-                "the offload copy-stream events invalidate graph capture. "
-                "Disable enable_breakable_cuda_graph when using CPU layerwise offload."
-            )
         bind_comfyui_session(batch)
         extra = getattr(batch, "extra", None) or {}
         video_x, audio_x, context = self._read_step_tensors(batch)
@@ -864,48 +880,14 @@ class MiniMaxH3ComfyUIStepStage(PipelineStage):
             denoise_mask=extra.get("h3_denoise_mask"),
             audio_denoise_mask=extra.get("h3_audio_denoise_mask"),
         )
-        n_sigmas = _sample_sigmas_len(sample_sigmas)
-        if n_sigmas is not None:
-            object.__setattr__(batch, "num_inference_steps", max(n_sigmas - 1, 1))
         state = self._bind_run_state(
             batch, inputs, sample_sigmas, video_x.device, server_args
         )
         self._maybe_mount_cache_dit(batch, state)
-        if state.steps_done == 0:
-            _logger.info(
-                "ComfyUI H3 effective backend=%s; cube_metadata=%s; step_metadata=%s; sparse_query_mask=%s",
-                self.transformer._resolved_attention_backend,
-                state.attn_metadata is not None,
-                state.build_step_metadata is not None,
-                state.branch.static_kwargs.get("subblock_sparse_query_block_mask")
-                is not None,
-            )
         fk, _branch = build_step_forward_kwargs(
             inputs, branch=state.branch, device=video_x.device
         )
-        stage = self._cache_dit_stage()
-        runner = stage._maybe_get_bcg_runner(self.transformer)
-        if runner is not None:
-            from sglang.multimodal_gen.runtime.managers.forward_context import (
-                set_forward_context,
-            )
-
-            with set_forward_context(
-                current_timestep=state.steps_done,
-                attn_metadata=state.attn_metadata,
-                forward_batch=batch,
-            ):
-                runner.capture(
-                    **stage._bcg_pad_prompt_kwargs(fk, current_model=self.transformer)
-                )
-        v_video, v_audio = stage._forward_dit(
-            self.transformer,
-            fk,
-            state.steps_done,
-            batch=batch,
-            attn_metadata=state.attn_metadata,
-            build_vsa_h3_step_metadata=state.build_step_metadata,
-        )
+        v_video, v_audio = self._run_dit(batch, fk, state)
         batch.noise_pred = pack_comfy_output(v_video, v_audio, state)
         state.steps_done += 1
         n_sigmas = _sample_sigmas_len(sample_sigmas)

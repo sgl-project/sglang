@@ -1104,7 +1104,7 @@ def _maybe_prepare_vsa_h3_step_metadata(
     def build(step_index: int):
         return builder.build(
             current_timestep=step_index,
-            raw_latent_shape=tuple(int(dim) for dim in latent_shape),
+            raw_latent_shape=latent_shape,
             patch_size=patch_size,
             VSA_sparsity=sparsity,
             prefix_segments=(text_len, cond_rows, audio_rows),
