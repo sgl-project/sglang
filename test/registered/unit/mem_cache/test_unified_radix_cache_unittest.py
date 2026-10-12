@@ -357,11 +357,7 @@ class TestUnifiedRadixComponentLedgerUnits(CustomTestCase):
 
         # The figure changes in place, without a lock transition.
         component.rows_handed_back[leaf] = 1
-        cache.tree_core.adjust_component_ledger(
-            node=cache.tree_core.node_by_id(leaf),
-            component_type=ComponentType.FULL,
-            delta=-1,
-        )
+        cache.tree_core.adjust_component_size(leaf, ComponentType.FULL, -1)
         self.assertEqual(ledgers(), (0, 3))
 
         cache.dec_lock_ref(leaf, lock_params)
