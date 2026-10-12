@@ -4258,15 +4258,13 @@ class Scheduler(
             and all(r.beam_group is None for r in running_batch.reqs)
         ):
             # TODO (lianmin): support return_logprob + mixed chunked prefill
-            finishing_reqs = self._reqs_finishing_inflight(running_batch)
-            running_batch.filter_batch(reqs_to_exclude=finishing_reqs)
-            if finishing_reqs:
-                running_batch.batch_is_full = False
             # The prefill admitted above may leave no KV room for the decode
             # rows. They then sit out this step and decode on the next decode
             # step, which fits them; a mixed step does not retract them.
-            if not running_batch.is_empty() and running_batch.check_decode_mem():
-                running_batch.prepare_for_decode()
+            if (
+                self.select_decode_rows(running_batch, retract=False)
+                and not running_batch.is_empty()
+            ):
                 new_batch.mix_with_running(running_batch)
                 new_batch.decoding_reqs = running_batch.reqs
                 if not self.enable_overlap and not self.spec_algorithm.is_none():
@@ -4333,20 +4331,41 @@ class Scheduler(
 
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
         """Update the running decoding batch in place; None skips decode this step."""
+        if not self.select_decode_rows(batch, retract=True):
+            return None
+        return batch
+
+    def select_decode_rows(self, batch: ScheduleBatch, *, retract: bool) -> bool:
+        """Keep in batch the rows that decode this step and prepare them for
+        decode; False skips decode this step.
+
+        Drops rows whose last output is already in flight. When the rest do not
+        fit the KV pool, retract mode retracts rows; hold mode (a mixed step)
+        holds them all back to decode on a later step.
+        """
         initial_bs = batch.batch_size()
 
         finishing_reqs = self._reqs_finishing_inflight(batch)
         batch.filter_batch(reqs_to_exclude=finishing_reqs)
         if batch.is_empty():
             batch.batch_is_full = False
-            return batch
+            return True
 
         kv_full_retract_flag = not batch.check_decode_mem()
         if kv_full_retract_flag and finishing_reqs:
             # The queued result frees the finishing requests' KV at the end of
             # this step; decode the rest next step instead of retracting them.
             batch.batch_is_full = False
-            return None
+            return False
+
+        if not retract:
+            # Hold mode never retracts; rows that do not fit decode on a later step.
+            if kv_full_retract_flag:
+                return False
+            if finishing_reqs:
+                batch.batch_is_full = False
+            batch.prepare_for_decode()
+            return True
 
         # Check if decode out of memory
         if kv_full_retract_flag or (
@@ -4420,11 +4439,11 @@ class Scheduler(
             batch.batch_is_full = False
 
         if batch.is_empty():
-            return batch
+            return True
 
         # Update batch tensors
         batch.prepare_for_decode()
-        return batch
+        return True
 
     def record_batch_in_overlap(self, batch: ScheduleBatch):
         # FIXME(lsyin): hacky way to keep a reference to avoid GPU tensors being freed by torch GC
