@@ -3866,6 +3866,15 @@ def _mask_dp_pad_rows(local_hidden_states, forward_batch) -> None:
     )
 
 
+def _gather_late_layer_ids(
+    input_ids: torch.Tensor, counts: List[int], forward_batch: ForwardBatch
+) -> torch.Tensor:
+    # Re-gather the compact tail IDs in the late-layer MoE layout.
+    gathered = input_ids.new_empty((sum(counts), 1))
+    dp_gather_replicate(gathered, input_ids[:, None].clone(), forward_batch)
+    return gathered.squeeze(-1)
+
+
 def _scatter_tail_rows(
     tail: LateLayerTail, rows: torch.Tensor, num_tokens: int
 ) -> torch.Tensor:
@@ -4009,6 +4018,15 @@ class DeepseekV4Model(nn.Module):
                 0,
                 1,
             }, f"late layers must not compress on their own, got ratios {late_ratios}"
+            assert getattr(config, "num_hash_layers", 0) <= self.late_layer_start, (
+                "decoder SWA bounded replay needs hash routing before the late layers"
+            )
+        # Only vision routing reads token IDs in the late layers.
+        self.late_layer_vl_routing = (
+            config.model_type == "deepseek_v41"
+            and config.vision_n_layers > 0
+            and not getattr(config, "language_model_only", False)
+        )
 
     def get_input_embeddings(self) -> nn.Module:
         return self.embed_tokens
@@ -4154,12 +4172,11 @@ class DeepseekV4Model(nn.Module):
                 saved_dp = enter_late_layer_dp(forward_batch, late_dp_counts)
                 if get_moe_a2a_backend().is_none():
                     # Full-prefill IDs are not indexed by this rank's tail rows.
-                    # Re-gather the compact IDs in the late-layer MoE layout.
-                    gathered_ids = input_ids.new_empty((sum(late_dp_counts), 1))
-                    dp_gather_replicate(
-                        gathered_ids, input_ids[:, None].clone(), forward_batch
+                    input_ids_global = (
+                        _gather_late_layer_ids(input_ids, late_dp_counts, forward_batch)
+                        if self.late_layer_vl_routing
+                        else None
                     )
-                    input_ids_global = gathered_ids.squeeze(-1)
             engram = self.layers[i].engram
             if engram is not None:
                 before_engram = state.residual

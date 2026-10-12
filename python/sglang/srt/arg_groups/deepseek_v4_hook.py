@@ -18,7 +18,7 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
-from sglang.srt.utils.common import is_gfx95_supported, is_hip, is_npu
+from sglang.srt.utils.common import is_gfx95_supported, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -352,7 +352,7 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                     cfg.attn_dp_size == cfg.tp_size
                     and cfg.attn_cp_size == 1
                     and (
-                        (is_hip() and cfg.moe_a2a_backend == "none")
+                        (get_platform().is_hip and cfg.moe_a2a_backend == "none")
                         or (
                             get_platform().is_cuda
                             and cfg.moe_a2a_backend in ("none", "megamoe")

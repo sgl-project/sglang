@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
+from sglang.srt.distributed.utils import all_gather_single
 from sglang.srt.layers.dp_attention import DpPaddingMode, set_dp_buffer_len_from_batch
 from sglang.srt.runtime_context import get_parallel
 
@@ -23,11 +24,18 @@ def late_layer_dp_counts(
         early = forward_batch.global_num_tokens_cpu
     if early is None or torch.cuda.is_current_stream_capturing():
         return None
-    device = forward_batch.global_num_tokens_gpu.device
-    local = torch.tensor([local_late_rows], dtype=torch.int64, device=device)
-    counts = torch.empty(len(early), dtype=torch.int64, device=device)
-    get_parallel().tp_group.all_gather_into_tensor(counts, local)
-    counts = counts.tolist()
+    if len(early) == 1:
+        # Local-only counts (MegaMoE with a DP LM head): no peer geometry to share.
+        counts = [local_late_rows]
+    else:
+        # Tail row counts are host-known; the CPU group avoids a device sync.
+        counts = torch.empty(len(early), dtype=torch.int64)
+        all_gather_single(
+            counts,
+            torch.tensor([local_late_rows], dtype=torch.int64),
+            group=get_parallel().tp_group.cpu_group,
+        )
+        counts = counts.tolist()
     return None if counts == list(early) else counts
 
 
@@ -61,7 +69,7 @@ def enter_late_layer_dp(forward_batch: ForwardBatch, counts: List[int]) -> tuple
     fb.dp_local_start_pos = fb.dp_local_num_tokens = None
     # With attention TP=1 the invariant scalar also describes local MoE rows.
     # Preserve an idle peer's zero bound even when it carries fabricated rows.
-    local_rows = counts[get_parallel().attn_dp_rank]
+    local_rows = counts[get_parallel().attn_dp_rank if len(counts) > 1 else 0]
     real_rows = min(local_rows, fb.global_num_token_non_padded_cpu)
     fb.global_num_token_non_padded_cpu = real_rows
     if fb.global_num_token_non_padded is not None:

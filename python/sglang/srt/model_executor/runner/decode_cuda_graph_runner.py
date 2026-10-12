@@ -713,16 +713,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return max(request_counts)
 
     def can_run_graph(self, forward_batch: ForwardBatch):
-        # A prefill peer changes the late-layer DP geometry eagerly. Every target
-        # rank must execute that boundary; a decode replay would skip it.
-        if (
-            get_exec().features.enable_decoder_swa_bounded_replay
-            and self.require_mlp_sync
-            and not self.model_runner.is_draft_worker
-            and forward_batch.is_extend_in_batch
-        ):
-            return False
-
         # Disable for token embedding overrides (dynamic per-request)
         if forward_batch.replace_embeds is not None:
             return False
