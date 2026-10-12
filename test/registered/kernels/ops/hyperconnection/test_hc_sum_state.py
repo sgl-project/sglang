@@ -93,6 +93,27 @@ def _reference_mix(state, checkpoint, eps):
     return mixed, alpha
 
 
+def _reference_unfused_mix(residual, checkpoint, eps):
+    """HC math with RMS scale on activations, independent of folded weights."""
+    t, width = residual.shape
+    grouped = residual.float().view(t, 4, width // 4)
+    weights = {
+        name: value.to(device=residual.device, dtype=torch.float32)
+        for name, value in checkpoint.items()
+    }
+    norm = grouped * torch.rsqrt(grouped.square().mean(-1, keepdim=True) + eps)
+    norm = (norm.flatten(1) * (1 + weights["hc_norm.weight"])).to(residual.dtype)
+    down = F.silu(F.linear(norm.float(), weights["input_mix_weight_down.weight"]) / 4)
+    logits = F.linear(
+        down.to(residual.dtype).float(), weights["input_mix_weight_up.weight"]
+    ).view_as(grouped)
+    mixed = (torch.sigmoid(logits) * norm.float().view_as(grouped)).mean(1)
+    alpha = 2 * torch.sigmoid(
+        F.linear(norm.float(), weights["block_inject_weight.weight"]) / 4
+    )
+    return mixed.to(residual.dtype), alpha
+
+
 @unittest.skipUnless(
     torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10,
     "HC sum-state projections require SM100-family GPUs",
@@ -239,7 +260,33 @@ class TestHCSumState(CustomTestCase):
                     with self.subTest(dtype=dtype, h=h, lowrank=lowrank, t=t):
                         residual = self.tensor((t, 4 * h), dtype)
                         saved = residual.clone()
-                        _, context = self.step(layer, residual, checkpoint)
+                        output, context = self.step(layer, residual, checkpoint)
+                        # Reuse the existing cases, including both dispatch sides.
+                        # This oracle normalizes stored activations before GEMM;
+                        # it does not reproduce the optimized weight folding.
+                        expected = _reference_unfused_mix(
+                            residual, checkpoint, layer.config.rms_norm_eps
+                        )
+                        for actual, reference in zip(
+                            (context.buffers.mixed, context.buffers.alpha), expected
+                        ):
+                            torch.testing.assert_close(
+                                actual,
+                                reference,
+                                rtol=0.02 if dtype == torch.bfloat16 else 0.003,
+                                atol=0.004 if dtype == torch.bfloat16 else 0.0005,
+                            )
+                        bootstrap = layer.bootstrap_sum_state(output.residual)
+                        # For normal-range values rounded with unit roundoff u,
+                        # |sum(round(x)^2) - sum(x^2)| <= (2u + u^2) * sum(x^2).
+                        # Allow the two FP32 reductions' existing 3e-6 budgets.
+                        u = torch.finfo(dtype).eps / 2
+                        torch.testing.assert_close(
+                            bootstrap.sum_sq,
+                            output.sum_sq,
+                            rtol=2 * u + u * u + 6e-6,
+                            atol=2e-5,
+                        )
                         torch.testing.assert_close(
                             context.state.sum_sq,
                             residual.float().view(t, 4, h).square().sum(-1),
