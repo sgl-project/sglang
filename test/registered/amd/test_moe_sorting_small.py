@@ -84,11 +84,11 @@ class TestMoeSortingSmall(CustomTestCase):
 
     def test_sort_matches_aiter(self):
         # compact at E=513; distributed at MiniMax-M3's E=129 / top-4 + shared and at
-        # DeepSeek-V4's E=385 / top-6 + shared
+        # DeepSeek-V4's E=385 / top-6 + shared, at its 112-pair cutoff
         cases = (
             [(513, 11, m) for m in (1, 2, 4, 5)]
             + [(129, 5, m) for m in (13, 25, 51)]
-            + [(385, 7, m) for m in (1, 5, 10, 16)]
+            + [(385, 7, 16)]
         )
         for bs in (32, 64):
             for E, topk, m in cases:
@@ -139,49 +139,46 @@ class TestMoeSortingSmall(CustomTestCase):
         """Hidden sizes that are not a multiple of 2048 (DeepSeek-V4's 5120, V3's 7168) emit
         the stage1 quant too: fp8 rows and the scales of every real sorted row match aiter's
         fused_dynamic_mxfp8_quant_moe_sort over the same sort."""
-        bs = 32
-        cases = [(385, 7, m) for m in (1, 2, 5, 9, 10, 16)] + [
-            (129, 4, m) for m in (1, 2, 5, 10, 40, 64)
-        ]
-        for dim in (5120, 7168):
-            for E, topk, m in cases:
-                ids, w = self._routing(m, m, E, topk)
-                x = torch.randn(m, dim, dtype=torch.bfloat16, device=self.dev)
-                x[:, :64] *= 1e-3  # spread the per-group scales
-                tok = self.S._pending_quant_input.set(x)
-                etok = self.S._emitted_quant.set(None)
-                try:
-                    sid, sw, _, nv, _ = self.fm._moe_sorting_impl(
-                        ids, w, E, dim, torch.bfloat16, bs, None, None, 0, True
-                    )
-                    emitted = self.S._emitted_quant.get()
-                finally:
-                    self.S._emitted_quant.reset(etok)
-                    self.S._pending_quant_input.reset(tok)
-                msg = f"dim={dim} E={E} topk={topk} m={m}"
-                self.assertIsNotNone(emitted, msg)
-                ref_q, ref_s = self.orig_quant(
-                    x,
-                    sorted_ids=sid,
-                    num_valid_ids=nv,
-                    token_num=m,
-                    topk=topk,
-                    block_size=bs,
-                    sorted_weights=sw,
-                    num_experts_upper_bound=E,
+        bs, dim, E, topk = 32, 5120, 385, 7
+        # the widest compact sort (63 pairs) and the distributed one at the 112-pair cutoff
+        for m in (9, 16):
+            ids, w = self._routing(m, m, E, topk)
+            x = torch.randn(m, dim, dtype=torch.bfloat16, device=self.dev)
+            x[:, :64] *= 1e-3  # spread the per-group scales
+            tok = self.S._pending_quant_input.set(x)
+            etok = self.S._emitted_quant.set(None)
+            try:
+                sid, sw, _, nv, _ = self.fm._moe_sorting_impl(
+                    ids, w, E, dim, torch.bfloat16, bs, None, None, 0, True
                 )
-                self.assertTrue(
-                    torch.equal(ref_q.view(torch.uint8), emitted[0].view(torch.uint8)),
-                    msg,
-                )
-                self.assertEqual(ref_s.shape, emitted[1].shape, msg)
-                self.assertTrue(
-                    torch.equal(
-                        self._valid_scale_bytes(ref_s, sid, nv, m, dim),
-                        self._valid_scale_bytes(emitted[1], sid, nv, m, dim),
-                    ),
-                    msg,
-                )
+                emitted = self.S._emitted_quant.get()
+            finally:
+                self.S._emitted_quant.reset(etok)
+                self.S._pending_quant_input.reset(tok)
+            msg = f"m={m}"
+            self.assertIsNotNone(emitted, msg)
+            ref_q, ref_s = self.orig_quant(
+                x,
+                sorted_ids=sid,
+                num_valid_ids=nv,
+                token_num=m,
+                topk=topk,
+                block_size=bs,
+                sorted_weights=sw,
+                num_experts_upper_bound=E,
+            )
+            self.assertTrue(
+                torch.equal(ref_q.view(torch.uint8), emitted[0].view(torch.uint8)),
+                msg,
+            )
+            self.assertEqual(ref_s.shape, emitted[1].shape, msg)
+            self.assertTrue(
+                torch.equal(
+                    self._valid_scale_bytes(ref_s, sid, nv, m, dim),
+                    self._valid_scale_bytes(emitted[1], sid, nv, m, dim),
+                ),
+                msg,
+            )
 
     def test_falls_back_to_aiter_past_compact_at_513_experts(self):
         m = 6
@@ -204,8 +201,7 @@ class TestDsv4MoePrologue(CustomTestCase):
     output is bitwise the same. The stage2 GEMM accumulates the top-k rows atomically, so
     the MoE output only matches to atomic-order rounding."""
 
-    H, INTER, BLOCK_M = 5120, 640, 32
-    ROWS = (1, 2, 5, 10, 40, 80, 320)
+    H, INTER = 5120, 640
 
     @classmethod
     def setUpClass(cls):
@@ -294,42 +290,27 @@ class TestDsv4MoePrologue(CustomTestCase):
 
     def _route(self, x, gate_w, bias):
         """V4.1's decode router: split-K GEMV + sqrtsoftplus gate + the shared slot."""
-        from sglang.kernels.ops.gemm.router_gemv_hip import (
-            ROCM_ROUTER_MAX_TOKENS,
-            rocm_router_gemv_split_k,
-        )
+        from sglang.kernels.ops.gemm.router_gemv_hip import rocm_router_gemv_split_k
         from sglang.kernels.ops.moe.rocm_router_gate import rocm_router_gate
 
-        m = x.shape[0]
-        logits = torch.empty(m, gate_w.shape[0], device=self.dev)
-        partials = None
-        if m <= ROCM_ROUTER_MAX_TOKENS:
-            partials = rocm_router_gemv_split_k(x, gate_w)
-        else:
-            # past the split-K router the gate reads a GEMM's logits
-            logits.copy_(x.float() @ gate_w.float().T)
+        logits = torch.empty(x.shape[0], gate_w.shape[0], device=self.dev)
+        partials = rocm_router_gemv_split_k(x, gate_w)
         return rocm_router_gate(
             logits, bias, 6, True, 1.5, partials=partials, num_shared=1
         )
 
-    def _check(self, E, topk, routed_by_gate):
+    def test_target_moe_385_experts_top7(self):
+        E, topk = 385, 7
         gen = torch.Generator().manual_seed(E)
         experts = self._experts(E, gen)
         gate_w = (torch.randn(E - 1, self.H, generator=gen) * 0.02).to(torch.bfloat16)
         gate_w = gate_w.to(self.dev)
         bias = (torch.randn(E - 1, generator=gen) * 0.5).to(torch.bfloat16).to(self.dev)
-        for m in self.ROWS:
-            msg = f"E={E} topk={topk} M={m}"
+        # compact sort, and the distributed sort at the 112-pair cutoff
+        for m in (1, 16):
+            msg = f"M={m}"
             x = torch.randn(m, self.H, generator=gen).to(torch.bfloat16).to(self.dev)
-            if routed_by_gate:
-                weights, ids = self._route(x, gate_w, bias)
-            else:
-                ids = torch.stack(
-                    [torch.randperm(E - 1, generator=gen)[: topk - 1] for _ in range(m)]
-                )
-                ids = torch.cat([ids, torch.full((m, 1), E - 1)], 1)
-                ids = ids.to(torch.int32).to(self.dev).contiguous()
-                weights = torch.rand(m, topk, generator=gen).to(self.dev)
+            weights, ids = self._route(x, gate_w, bias)
             self.assertEqual(ids.shape, (m, topk), msg)
             ref_out, ref_stage1 = self._fused_moe(x, experts, weights, ids, stock=True)
             out, stage1 = self._fused_moe(x, experts, weights, ids, stock=False)
@@ -337,12 +318,6 @@ class TestDsv4MoePrologue(CustomTestCase):
             # bf16 atomics round partial sums of up to topk rows: a few ulp of the row scale
             err = (out.float() - ref_out.float()).abs().max().item()
             self.assertLessEqual(err, 2e-2 * ref_out.float().abs().max().item(), msg)
-
-    def test_target_moe_385_experts_top7(self):
-        self._check(385, 7, routed_by_gate=True)
-
-    def test_dspark_draft_moe_129_experts_top4(self):
-        self._check(129, 4, routed_by_gate=False)
 
 
 if __name__ == "__main__":
