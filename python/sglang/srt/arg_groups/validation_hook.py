@@ -239,6 +239,13 @@ def check_server_args(server_args: Any):
             "MindSpore model impl is only supported on Ascend npu."
         )
 
+    # ROCm also uses PyTorch's "cuda" device type.
+    if cfg.load_format == "instanttensor" and cfg.device != "cuda":
+        raise ValueError(
+            "InstantTensor requires a CUDA-compatible device (including CUDA and ROCm); "
+            f"got {cfg.device!r}."
+        )
+
     # Check metrics labels
     if (
         not cfg.tokenizer_metrics_custom_labels_header

@@ -98,7 +98,6 @@ class CausalWanSelfAttention(nn.Module):
         self.sink_size = sink_size
         self.qk_norm = qk_norm
         self.eps = eps
-        self.parallel_attention = parallel_attention
 
         # Scaled dot product attention
         self.attn = LocalAttention(
