@@ -355,8 +355,6 @@ def decode_extend_view_eligible(
     decode. The prefill-graph vote and the post-gather conversion both ask it."""
     return (
         batch.forward_mode.is_decode()
-        # Keep verification rows in their native mode on heterogeneous steps.
-        and not envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get()
         # Conversion replays the breakable graphs only; full's fixed
         # request-slot geometry does not cover converted decode tails.
         and breakable_prefill
@@ -749,7 +747,7 @@ class SchedulerDPAttnAdapter:
             # rank (_has_inactive_dp_rank); converting would only trade eager
             # decode for eager mixed.
             return batch
-        # This rank's own eligibility: the predicate its prefill-graph vote read.
+        # Implied by the min-reduced vote; re-checked against vote/conversion drift.
         if not decode_extend_view_eligible(
             batch,
             prefill_graph_runner=self.model_runner.prefill_cuda_graph_runner,

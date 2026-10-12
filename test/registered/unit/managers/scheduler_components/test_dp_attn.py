@@ -420,7 +420,6 @@ class TestDecodeToExtendConversionVote(CustomTestCase):
         "cp": dict(cp=True),
         "non_breakable": dict(breakable=False),
         "eager_runner": dict(eager_runner=True),
-        "coordination": dict(coordination=True),
     }
 
     @contextmanager
@@ -438,7 +437,6 @@ class TestDecodeToExtendConversionVote(CustomTestCase):
         cp=False,
         breakable=True,
         eager_runner=False,
-        coordination=False,
     ):
         if eager_runner:
             runner = Mock()
@@ -493,7 +491,6 @@ class TestDecodeToExtendConversionVote(CustomTestCase):
                     breakable if backend == Backend.BREAKABLE else False
                 ),
             ),
-            envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.override(coordination),
         ):
             yield SimpleNamespace(
                 batch=batch,
