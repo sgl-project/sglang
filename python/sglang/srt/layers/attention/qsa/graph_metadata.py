@@ -148,10 +148,7 @@ def _qsa_graph_row_metadata_kernel(
     # page-aligned req_to_token row; the scoring kernels turn them into
     # compressed slots as page_id * (FULL_PAGE // RATIO) + block_in_page.
     table_row = page_table_ptr + row.to(tl.int64) * max_pages
-    positions_row = (
-        block_positions_ptr
-        + row.to(tl.int64) * max_pages * COMPRESSED_PAGE
-    )
+    positions_row = block_positions_ptr + row.to(tl.int64) * max_pages * COMPRESSED_PAGE
     offs = tl.arange(0, PAGE_BLOCK)
     row_width_pages = req_to_token_row_stride // FULL_PAGE
     visible_pages = tl.cdiv(compressed, COMPRESSED_PAGE)
@@ -159,18 +156,14 @@ def _qsa_graph_row_metadata_kernel(
     local_block_count = 0
     for p0 in range(0, max_pages, PAGE_BLOCK):
         idx = p0 + offs
-        valid = idx < tl.minimum(
-            visible_pages, tl.minimum(max_pages, row_width_pages)
-        )
+        valid = idx < tl.minimum(visible_pages, tl.minimum(max_pages, row_width_pages))
         loc = tl.load(
             req_to_token_ptr + token_row + idx * FULL_PAGE, mask=valid, other=0
         )
         global_page = tl.maximum(loc // FULL_PAGE, 0)
         owner = valid & (global_page % WORLD_SIZE == RANK)
         owner_i = owner.to(tl.int32)
-        local_indices = (
-            local_page_count + tl.cumsum(owner_i, axis=0) - 1
-        )
+        local_indices = local_page_count + tl.cumsum(owner_i, axis=0) - 1
         tl.store(
             table_row + local_indices,
             global_page // WORLD_SIZE,
@@ -273,15 +266,9 @@ def launch_graph_metadata(
         FULL_PAGE=pool.qsa_compressed_page_size * indexer.compress_ratio,
         COMPRESSED_PAGE=pool.qsa_compressed_page_size,
         WORLD_SIZE=(
-            compressed_sharding.world_size
-            if compressed_sharding is not None
-            else 1
+            compressed_sharding.world_size if compressed_sharding is not None else 1
         ),
-        RANK=(
-            compressed_sharding.rank
-            if compressed_sharding is not None
-            else 0
-        ),
+        RANK=(compressed_sharding.rank if compressed_sharding is not None else 0),
         PAGE_BLOCK=128,
         seq_lens_ptr=seq_lens,
         req_pool_ptr=req_pool_indices,
@@ -371,16 +358,8 @@ def prepare_draft_graph_metadata(metadata, req_to_token, pool):
         pool.qsa_compress_ratio,
         pool.qsa_compressed_page_size * pool.qsa_compress_ratio,
         pool.qsa_compressed_page_size,
-        (
-            compressed_sharding.world_size
-            if compressed_sharding is not None
-            else 1
-        ),
-        (
-            compressed_sharding.rank
-            if compressed_sharding is not None
-            else 0
-        ),
+        (compressed_sharding.world_size if compressed_sharding is not None else 1),
+        (compressed_sharding.rank if compressed_sharding is not None else 0),
     )
 
 

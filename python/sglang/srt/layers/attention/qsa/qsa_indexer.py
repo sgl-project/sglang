@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 
 import torch
+
 from sglang.srt.layers.attention.qsa.cache_sharding import (
     QSACacheShardingRuntime,
     assert_qsa_cache_sharding_runtime_match,
@@ -35,8 +36,8 @@ from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
-from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.mem_cache.qsa_kv_pool import assert_qsa_indices_in_bounds
+from sglang.srt.model_executor.runner import get_is_capture_mode
 
 # Cap on the fp32 [query_rows, compressed_keys] prefill logits workspace;
 # top-k is per row, so tiling rows does not change the selection.
@@ -986,15 +987,21 @@ class QSAIndexer(MultiPlatformOp):
             prefill_kwargs["logical_block_sequence_ids"] = query_sequence_ids
         group = getattr(self, "distributed_topk_group", None)
         if group is not None:
-            prefill_kwargs["collective_keys"] = int(
-                torch.div(
-                    indexer_metadata.sequence_lengths,
-                    self.compress_ratio,
-                    rounding_mode="floor",
+            host_lengths = indexer_metadata.prefill_sequence_lengths_cpu
+            if host_lengths is None:
+                # Hand-built metadata may not carry scheduler lengths. A
+                # shape-derived upper bound keeps every rank's collective
+                # schedule identical without synchronizing a CUDA scalar.
+                collective_keys = (
+                    indexer_metadata.sequence_lengths.numel()
+                    * indexer_metadata.token_slot_table.shape[1]
+                    // self.compress_ratio
                 )
-                .sum()
-                .item()
-            )
+            else:
+                collective_keys = sum(
+                    length // self.compress_ratio for length in host_lengths
+                )
+            prefill_kwargs["collective_keys"] = collective_keys
             prefill_kwargs["collective_world_size"] = int(group.world_size)
         row_sequence_lengths = sequence_lengths.index_select(
             0, query_sequence_ids.long()

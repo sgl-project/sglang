@@ -836,6 +836,15 @@ class QwenSparseAttnBackend(AttentionBackend):
         prefill_page_table = None
         prefill_lengths = None
         prefill_block_positions = None
+        prefill_cache_indices = None
+        prefill_sequence_lengths_cpu = None
+        if not decode_like and forward_batch.seq_lens_cpu is not None:
+            host_sequence_lengths = forward_batch.seq_lens_cpu[
+                : sequence_lengths.numel()
+            ]
+            prefill_sequence_lengths_cpu = tuple(
+                int(length) for length in host_sequence_lengths.tolist()
+            )
         if not self.should_reuse_mtp_sparse_indices(forward_batch):
             global_page_table, global_lengths = compressed_decode_view(
                 compressed_page_size=pool.qsa_compressed_page_size,
@@ -847,6 +856,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 (
                     local_page_table,
                     local_lengths,
+                    local_lengths_cpu,
                     local_block_positions,
                 ) = localize_compressed_page_table(
                     global_page_table=global_page_table,
@@ -864,7 +874,30 @@ class QwenSparseAttnBackend(AttentionBackend):
                         prefill_page_table,
                         prefill_lengths,
                         prefill_block_positions,
-                    ) = (local_page_table, local_lengths, local_block_positions)
+                    ) = (
+                        local_page_table,
+                        local_lengths,
+                        local_block_positions,
+                    )
+                    page_size = pool.qsa_compressed_page_size
+                    local_block_table = (
+                        local_page_table.long().clamp_min(0).unsqueeze(-1) * page_size
+                        + torch.arange(
+                            page_size,
+                            device=local_page_table.device,
+                            dtype=torch.long,
+                        ).view(1, 1, -1)
+                    ).flatten(1)
+                    local_block_parts = [
+                        local_block_table[row, :local_length]
+                        for row, local_length in enumerate(local_lengths_cpu)
+                        if local_length
+                    ]
+                    prefill_cache_indices = (
+                        torch.cat(local_block_parts)
+                        if local_block_parts
+                        else local_block_table.new_empty(0)
+                    )
             elif decode_like:
                 decode_page_table = global_page_table
                 decode_lengths = global_lengths
@@ -911,6 +944,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             prefill_page_table=prefill_page_table,
             prefill_lengths=prefill_lengths,
             prefill_block_positions=prefill_block_positions,
+            prefill_cache_indices=prefill_cache_indices,
             decode_page_table=decode_page_table,
             decode_lengths=decode_lengths,
             decode_block_positions=decode_block_positions,
@@ -922,6 +956,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 self._can_defer_block_expansion(forward_batch.forward_mode)
                 and decode_logical_positions is not None
             ),
+            prefill_sequence_lengths_cpu=prefill_sequence_lengths_cpu,
         )
         return QwenSparseAttnMetadata(
             sequence_lengths=sequence_lengths,

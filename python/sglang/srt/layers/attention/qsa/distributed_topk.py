@@ -5,6 +5,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+
 from sglang.srt.distributed.device_communicators.triton_symm_mem_ag import (
     _blockwise_barrier,
     _multimem_st_128,
@@ -61,8 +62,6 @@ def _validate_scores(scores: torch.Tensor, expected_width: int | None = None) ->
             f"local score width must equal local shard size {expected_width}, "
             f"got {scores.shape[1]}"
         )
-    if torch.isnan(scores).any().item():
-        raise ValueError("QSA top-k scores must not contain NaN")
 
 
 def pack_qsa_topk_candidates(

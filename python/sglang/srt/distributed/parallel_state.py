@@ -42,6 +42,8 @@ from unittest.mock import patch
 
 import torch
 import torch.distributed
+from torch.distributed import Backend, ProcessGroup
+
 from sglang.srt import platforms
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.distributed.utils import (
@@ -77,7 +79,6 @@ from sglang.srt.utils import (
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.network import get_local_ip_auto
 from sglang.srt.utils.stale_shm_cleanup import make_shm_name
-from torch.distributed import Backend, ProcessGroup
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()

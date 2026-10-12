@@ -618,13 +618,9 @@ def _dcp_lse_combine_kernel(
 
     if RETURN_LSE:
         if IS_BASE_E:
-            global_lse = tl.where(
-                has_any, tl.log(weight_sum) + lse_max, -float("inf")
-            )
+            global_lse = tl.where(has_any, tl.log(weight_sum) + lse_max, -float("inf"))
         else:
-            global_lse = tl.where(
-                has_any, tl.log2(weight_sum) + lse_max, -float("inf")
-            )
+            global_lse = tl.where(has_any, tl.log2(weight_sum) + lse_max, -float("inf"))
         out_lse_offset = batch_idx * out_lse_stride_B + head_idx * out_lse_stride_H
         tl.store(out_lse_ptr + out_lse_offset, global_lse)
 

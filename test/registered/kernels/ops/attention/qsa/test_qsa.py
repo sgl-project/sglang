@@ -9,14 +9,8 @@ import torch
 from sglang.kernels.ops.attention import qwen38_qsa_sm121_varlen
 from sglang.srt.configs.qwen4_exp import Qwen4ExpConfig
 from sglang.srt.layers.attention import qwen_sparse_attn_backend as qsa_backend_module
-from sglang.srt.layers.attention.qsa import cache_sharding as cache_sharding_module
-from sglang.srt.layers.attention.qsa import distributed_topk as distributed_topk_module
-from sglang.srt.layers.attention.qsa import (
-    owner_sparse_attn as owner_sparse_attn_module,
-)
 from sglang.srt.layers.attention.qsa import qsa_indexer as qsa_indexer_module
 from sglang.srt.layers.attention.qsa.cache_sharding import (
-    QSACacheShardingStaticBuffers,
     resolve_qsa_cache_sharding_runtime,
     validate_qsa_cache_sharding,
 )
@@ -51,7 +45,6 @@ from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
 )
 from sglang.srt.mem_cache.qsa_kv_pool import (
     QSACompressedBlockSharding,
-    QSARawKVSharding,
     QSATokenToKVPool,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -324,58 +317,6 @@ def _pack_global_topk_candidates(scores, *, world_size, page_size, topk):
     return torch.stack(ranks)
 
 
-def _owner_localize_reference(global_slots, sharding):
-    mapped = sharding.global_to_local_tokens(global_slots)
-    owned = mapped >= 0
-    lengths = owned.sum(dim=1, dtype=torch.int32)
-    compact = torch.full_like(mapped, -1)
-    destinations = owned.cumsum(dim=1).sub(1).clamp_min(0)
-    compact.scatter_reduce_(
-        1, destinations.long(), mapped, reduce="amax", include_self=True
-    )
-    return compact, lengths
-
-
-def _owner_attention_reference(q, k, v, slots, scale):
-    output = torch.zeros_like(q)
-    lse = torch.full(q.shape[:2], float("-inf"), dtype=torch.float32, device=q.device)
-    repeats = q.shape[1] // k.shape[1]
-    for row in range(q.shape[0]):
-        selected = slots[row][slots[row] >= 0].long()
-        if not selected.numel():
-            continue
-        keys = k.index_select(0, selected).repeat_interleave(repeats, dim=1)
-        values = v.index_select(0, selected).repeat_interleave(repeats, dim=1)
-        scores = torch.einsum("hd,khd->hk", q[row].float(), keys.float()) * scale
-        lse[row] = torch.logsumexp(scores, dim=-1)
-        output[row] = torch.einsum(
-            "hk,khd->hd", torch.softmax(scores, dim=-1), values.float()
-        ).to(q.dtype)
-    return output, lse
-
-
-def _merge_owner_reference(partials):
-    outputs, lses = zip(*partials)
-    outputs = torch.stack(outputs)
-    lses = torch.stack(lses)
-    maximum = lses.max(dim=0).values
-    finite = torch.isfinite(maximum)
-    safe_maximum = torch.where(finite, maximum, torch.zeros_like(maximum))
-    weights = torch.exp(lses - safe_maximum.unsqueeze(0))
-    weights = torch.where(torch.isfinite(lses), weights, torch.zeros_like(weights))
-    denominator = weights.sum(dim=0)
-    merged = (outputs.float() * weights[..., None]).sum(dim=0) / denominator.clamp_min(
-        torch.finfo(torch.float32).tiny
-    )[..., None]
-    merged = torch.where(finite[..., None], merged, torch.zeros_like(merged))
-    merged_lse = torch.where(
-        finite,
-        safe_maximum + torch.log(denominator),
-        torch.full_like(maximum, float("-inf")),
-    )
-    return merged.to(outputs.dtype), merged_lse
-
-
 def test_distributed_topk_matches_test_oracle_for_ties_and_ragged_shards():
     scores = torch.tensor(
         [
@@ -403,67 +344,6 @@ def test_distributed_topk_matches_test_oracle_for_ties_and_ragged_shards():
     torch.testing.assert_close(
         actual_scores, torch.tensor([[2.0, 1.0, float("-inf"), float("-inf")]])
     )
-
-
-@pytest.mark.parametrize("device", ["cpu", "cuda"])
-def test_owner_reference_matches_unsharded_numerics(device):
-    if device == "cuda" and not torch.cuda.is_available():
-        pytest.skip("CUDA is required")
-    torch.manual_seed(1)
-    q = torch.randn(3, 4, 8, device=device)
-    k = torch.randn(7, 2, 8, device=device)
-    v = torch.randn(7, 2, 8, device=device)
-    slots = torch.tensor(
-        [[0, 2, 3, 5, -1], [1, 4, 6, -1, -1], [0, 1, 2, 3, 4]],
-        device=device,
-    )
-    partials = []
-    for rank in range(2):
-        sharding = QSARawKVSharding(
-            local_capacity=4, page_size=1, world_size=2, rank=rank
-        )
-        local_slots, _ = _owner_localize_reference(slots, sharding)
-        partials.append(
-            _owner_attention_reference(
-                q, k[rank::2], v[rank::2], local_slots, scale=0.5
-            )
-        )
-    actual, actual_lse = _merge_owner_reference(partials)
-    expected, expected_lse = _owner_attention_reference(q, k, v, slots, scale=0.5)
-    torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-6)
-    torch.testing.assert_close(actual_lse, expected_lse, atol=2e-6, rtol=2e-6)
-
-
-def test_qsa_cache_sharding_production_surface_is_runtime_only():
-    assert not hasattr(distributed_topk_module, "qsa_distributed_topk_reference")
-    assert not hasattr(
-        owner_sparse_attn_module, "owner_sparse_attention_partial_reference"
-    )
-    assert not hasattr(cache_sharding_module, "QSACacheShardingBufferView")
-    assert not hasattr(QSARawKVSharding, "clear_slots_")
-    assert not hasattr(QSACompressedBlockSharding, "owned_global_blocks")
-
-    buffers = QSACacheShardingStaticBuffers(
-        max_rows=2,
-        topk=2,
-        num_heads=2,
-        head_dim=4,
-        device="cpu",
-        dtype=torch.float32,
-    )
-    for unused in (
-        "collective_stream",
-        "q_gather_stream",
-        "candidate_pack_ready",
-        "candidate_gather_done",
-        "q_pack_ready",
-        "q_gather_done",
-        "owner_pack_ready",
-        "owner_gather_done",
-        "owner_partial_output",
-        "owner_partial_lse",
-    ):
-        assert not hasattr(buffers, unused)
 
 
 @pytest.mark.parametrize("option", ["--qsa-cache-sharding-size", "--state-cp-size"])

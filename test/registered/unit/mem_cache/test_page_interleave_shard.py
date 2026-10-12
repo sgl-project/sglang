@@ -1591,7 +1591,12 @@ def test_qsa_page_localization_preserves_reuse_and_ragged_tail(
         world_size=2,
         rank=1 if page_table[0][0] == 5 else 0,
     )
-    actual_pages, actual_length, actual_positions = localize_compressed_page_table(
+    (
+        actual_pages,
+        actual_length,
+        actual_length_cpu,
+        actual_positions,
+    ) = localize_compressed_page_table(
         global_page_table=torch.tensor(page_table, dtype=torch.int32),
         compressed_lengths=torch.tensor([length], dtype=torch.int32),
         sharding=shard,
@@ -1600,6 +1605,7 @@ def test_qsa_page_localization_preserves_reuse_and_ragged_tail(
     torch.testing.assert_close(
         actual_length, torch.tensor([local_length], dtype=torch.int32)
     )
+    assert actual_length_cpu == (local_length,)
     torch.testing.assert_close(
         actual_positions, torch.tensor(positions, dtype=torch.int64)
     )
@@ -1636,6 +1642,8 @@ def test_qsa_sharding_rejects_out_of_bounds_writes(kind):
         )
         with pytest.raises(IndexError, match="raw KV write locations"):
             shard.local_write_targets(torch.tensor([16]))
+
+
 # =============================================================================
 # Multi-GPU: the real NCCL layer-ahead gather (2 GPUs).
 #

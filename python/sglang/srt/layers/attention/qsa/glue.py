@@ -20,17 +20,19 @@ def build_qsa_indexer(
         raise ValueError(
             "build_qsa_indexer requires a config with a QSA indexer schema"
         )
-    from sglang.srt.layers.attention.qsa.qsa_indexer import QSAIndexer
-
     from sglang.srt.layers.attention.qsa.cache_sharding import (
         get_qsa_cache_sharding_runtime,
     )
+    from sglang.srt.layers.attention.qsa.qsa_indexer import QSAIndexer
 
     cache_sharding_runtime = get_qsa_cache_sharding_runtime()
     expected_group = (
         cache_sharding_runtime.group if cache_sharding_runtime.enabled else None
     )
-    if distributed_topk_group is not None and distributed_topk_group is not expected_group:
+    if (
+        distributed_topk_group is not None
+        and distributed_topk_group is not expected_group
+    ):
         raise ValueError(
             "QSA indexer collective group does not match cache-sharding runtime"
         )

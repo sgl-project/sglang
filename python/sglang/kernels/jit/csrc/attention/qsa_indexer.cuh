@@ -381,8 +381,7 @@ __launch_bounds__(128) void qsa_index_k_compress_kernel(const QsaIndexKCompressP
     pos[a] = params.rope_position_buffer[static_cast<int64_t>(loc0) * 3 + a];
   }
 
-  TOut* out_row =
-      static_cast<TOut*>(params.compressed_k_buffer) + static_cast<int64_t>(write_loc) * kHeadDim;
+  TOut* out_row = static_cast<TOut*>(params.compressed_k_buffer) + static_cast<int64_t>(write_loc) * kHeadDim;
   qsa_mrope_apply<T, TOut, kHeadDim, kIsNeox>(
       smem_rows[warp], out_row, params.cos_sin_cache, params.axis_map, pos, params.rotary_dim);
 

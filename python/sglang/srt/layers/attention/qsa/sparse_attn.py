@@ -107,9 +107,7 @@ def _sparse_gqa_prefill(
         next_max = tl.where(
             block_has_tokens, tl.maximum(max_value, tl.max(scores, 1)), max_value
         )
-        alpha = tl.where(
-            block_has_tokens, tl.math.exp2(max_value - next_max), 1.0
-        )
+        alpha = tl.where(block_has_tokens, tl.math.exp2(max_value - next_max), 1.0)
         probabilities = tl.where(
             valid[None, :], tl.math.exp2(scores - next_max[:, None]), 0.0
         )
@@ -288,9 +286,7 @@ def _sparse_gqa_chunk_prefill(
             -float("inf"),
         )
         tl.store(
-            lse
-            + query * sl_m
-            + (group * GROUP_SIZE + offs_h) * sl_h,
+            lse + query * sl_m + (group * GROUP_SIZE + offs_h) * sl_h,
             row_lse,
             mask=offs_h < GROUP_SIZE,
         )

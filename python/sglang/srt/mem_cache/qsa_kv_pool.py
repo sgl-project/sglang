@@ -13,6 +13,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 
 import torch
+
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.layers.attention.qsa.cache_sharding import (
     QSACacheShardingRuntime,
@@ -86,9 +87,7 @@ def assert_qsa_indices_in_bounds(
         raise ValueError(f"{label} valid mask must match index shape")
     else:
         valid_mask = valid_mask.to(device=indices.device, dtype=torch.bool)
-    condition = torch.all(
-        (~valid_mask) | ((indices >= 0) & (indices < upper_bound))
-    )
+    condition = torch.all((~valid_mask) | ((indices >= 0) & (indices < upper_bound)))
     message = f"{label} must be in [0, {upper_bound})"
     if indices.is_cuda:
         torch._assert_async(condition, message)
@@ -191,6 +190,7 @@ class QSARawKVSharding:
         if bool(torch.any(src_owned != dst_owned).item()):
             raise ValueError("cross-owner raw K/V copy requires communication")
         return src[src_owned], dst[dst_owned]
+
 
 @dataclass(frozen=True)
 class QSACompressedBlockSharding:
@@ -619,9 +619,7 @@ class QSATokenToKVPool(HybridLinearKVPool):
         buffer = self.get_qsa_compressed_k_buffer(layer_id)
         if self.qsa_compressed_sharding is not None:
             local_blocks = self.qsa_compressed_sharding.global_to_local_blocks(loc)
-            source_rows = torch.nonzero(
-                local_blocks >= 0, as_tuple=False
-            ).flatten()
+            source_rows = torch.nonzero(local_blocks >= 0, as_tuple=False).flatten()
             loc = local_blocks.index_select(0, source_rows)
             compressed_k = compressed_k.index_select(0, source_rows)
         buffer[loc.long()] = compressed_k.to(buffer.dtype)

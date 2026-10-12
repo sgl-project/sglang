@@ -319,9 +319,9 @@ class PageInterleavePoolAllocator(PagedTokenToKVPoolAllocator):
             "sharded alloc_decode needs the rotation base of every request"
         )
         if self.debug_mode:
-            assert torch.all(
-                (last_loc + 2) % ps == seq_lens % ps
-            ), "decode length and last location disagree"
+            assert torch.all((last_loc + 2) % ps == seq_lens % ps), (
+                "decode length and last location disagree"
+            )
 
         # A decode token needs a fresh page exactly at the first position of a
         # position-page. Its owner is host-computable from the chain rotation,
@@ -350,9 +350,7 @@ class PageInterleavePoolAllocator(PagedTokenToKVPoolAllocator):
                 continue
             pages = self.class_free_pages[owner][:count]
             self.class_free_pages[owner] = self.class_free_pages[owner][count:]
-            request_indices = torch.tensor(
-                reqs, dtype=torch.int64, device=self.device
-            )
+            request_indices = torch.tensor(reqs, dtype=torch.int64, device=self.device)
             out_indices[request_indices] = pages.to(dtype=out_indices.dtype) * ps
 
         if self.debug_mode:
