@@ -11,6 +11,7 @@ import torch
 from sglang.srt.mem_cache.device_pool_info import MambaStateBufferInfo
 from sglang.srt.mem_cache.pool_host.base import (
     HostKVCache,
+    host_memory_allocation_bytes,
     host_memory_budget_bytes,
     sync_fixed_hicache_size,
     synchronized,
@@ -172,18 +173,24 @@ class MambaPoolHost(HostKVCache):
                 device_capacity,
             )
 
-        requested_bytes = self.size * self.size_per_token
-        available_bytes = host_memory_budget_bytes(requested_bytes)
-        if requested_bytes > available_bytes:
+        allocation_bytes = host_memory_allocation_bytes(
+            self.get_mapping_lengths(),
+            self.allocator,
+            self._buffer_device,
+        )
+        available_bytes = host_memory_budget_bytes(
+            allocation_bytes, self.allocator, self._buffer_device
+        )
+        if allocation_bytes > available_bytes:
             raise ValueError(
                 f"Not enough host memory available. Requesting "
-                f"{requested_bytes / 1e9:.2f} GB but only have "
+                f"{allocation_bytes / 1e9:.2f} GB but only have "
                 f"{available_bytes / 1e9:.2f} GB free. Please reduce the "
                 f"size of the hierarchical cache."
             )
         logger.info(
             "Allocating %.2f GB host memory for hierarchical Mamba cache (layout=%s).",
-            requested_bytes / 1e9,
+            allocation_bytes / 1e9,
             self.layout,
         )
 
@@ -411,6 +418,18 @@ class MambaPoolHost(HostKVCache):
 
     def get_ksize_per_token(self):
         return self.get_size_per_token()
+
+    def get_mapping_lengths(self) -> list[int]:
+        token_layer_bytes = self.size * self.num_mamba_layers
+        return [
+            token_layer_bytes
+            * self.temporal_state_elem_size
+            * self.temporal_dtype.itemsize,
+            *(
+                token_layer_bytes * elem_size * self.conv_dtype.itemsize
+                for elem_size in self.conv_state_elem_sizes
+            ),
+        ]
 
     @staticmethod
     def _item_size_per_index(tensor: torch.Tensor) -> int:
