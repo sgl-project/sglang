@@ -1,7 +1,6 @@
 import asyncio
 import re
 from abc import ABC, abstractmethod
-from contextlib import contextmanager
 from typing import (
     Any,
     Dict,
@@ -527,24 +526,6 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
             return "npu"
         return None
 
-    @contextmanager
-    def _temporary_fast_processor_cuda_pool(self, device: Optional[str]):
-        """Release fast-processor CUDA temporaries after CPU feature transport."""
-        can_release = (
-            device is not None
-            and torch.device(device).type == "cuda"
-            and not self.keep_mm_features_on_device
-            and not self.precompute_hash_before_cpu_transfer
-        )
-        if not can_release:
-            yield
-            return
-
-        with torch.cuda.device(device):
-            pool = torch.cuda.MemPool()
-        with torch.cuda.use_mem_pool(pool, device=device):
-            yield
-
     def process_mm_data(
         self,
         input_text,
@@ -623,20 +604,6 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
             self._move_processor_output_to_cpu(result)
 
         return result
-
-    def _move_processor_output_to_cpu(self, result):
-        # Deferred: the hash is computed on the GPU tensor first, and
-        # _precompute_hashes_before_cpu_transfer moves it down afterwards.
-        if (
-            not self.keep_mm_features_on_device
-            and not self.precompute_hash_before_cpu_transfer
-        ):
-            # move feature tensors to cpu
-            for feature_name in self.FEATURE_NAMES:
-                if feature_name in result and isinstance(
-                    result[feature_name], torch.Tensor
-                ):
-                    result[feature_name] = result[feature_name].to("cpu")
 
     @abstractmethod
     async def process_mm_data_async(
