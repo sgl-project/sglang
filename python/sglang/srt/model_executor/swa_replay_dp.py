@@ -11,7 +11,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
-def _late_layer_dp_counts(
+def late_layer_dp_counts(
     forward_batch: ForwardBatch, local_late_rows: int
 ) -> Optional[List[int]]:
     # Bounded replay shrinks an extending rank's late layers to its tail, but the
@@ -31,17 +31,21 @@ def _late_layer_dp_counts(
     return None if counts == list(early) else counts
 
 
-def _enter_late_layer_dp(forward_batch: ForwardBatch, counts: List[int]) -> tuple:
+def enter_late_layer_dp(forward_batch: ForwardBatch, counts: List[int]) -> tuple:
     fb = forward_batch
     saved = (
         fb.global_num_tokens_cpu,
         fb.global_num_tokens_gpu,
         fb.global_num_tokens_padded_cpu,
         fb.global_num_tokens_for_logprob_cpu,
+        fb.global_num_tokens_for_logprob_gpu,
         fb.global_dp_buffer_len,
         fb.dp_padding_mode,
         fb.dp_local_start_pos,
         fb.dp_local_num_tokens,
+        fb.global_num_token_non_padded,
+        fb.global_num_token_non_padded_cpu,
+        fb.num_token_non_padded,
     )
     fb.global_num_tokens_cpu = counts
     fb.global_num_tokens_gpu = torch.tensor(
@@ -50,24 +54,39 @@ def _enter_late_layer_dp(forward_batch: ForwardBatch, counts: List[int]) -> tupl
     fb.global_num_tokens_padded_cpu = counts
     # The MoE gatherv reads its sizes from the logprob counts when present.
     fb.global_num_tokens_for_logprob_cpu = counts
+    fb.global_num_tokens_for_logprob_gpu = fb.global_num_tokens_gpu
     fb.global_dp_buffer_len = sum(counts)
     # Tail rows are real rows only, so the late layers gather variable lengths.
     fb.dp_padding_mode = DpPaddingMode.SUM_LEN
     fb.dp_local_start_pos = fb.dp_local_num_tokens = None
+    # With attention TP=1 the invariant scalar also describes local MoE rows.
+    # Preserve an idle peer's zero bound even when it carries fabricated rows.
+    local_rows = counts[get_parallel().attn_dp_rank]
+    real_rows = min(local_rows, fb.global_num_token_non_padded_cpu)
+    fb.global_num_token_non_padded_cpu = real_rows
+    if fb.global_num_token_non_padded is not None:
+        fb.global_num_token_non_padded = fb.global_num_token_non_padded.new_tensor(
+            real_rows
+        )
+        fb.num_token_non_padded = fb.global_num_token_non_padded
     set_dp_buffer_len_from_batch(fb)
     return saved
 
 
-def _exit_late_layer_dp(forward_batch: ForwardBatch, saved: tuple) -> None:
+def exit_late_layer_dp(forward_batch: ForwardBatch, saved: tuple) -> None:
     fb = forward_batch
     (
         fb.global_num_tokens_cpu,
         fb.global_num_tokens_gpu,
         fb.global_num_tokens_padded_cpu,
         fb.global_num_tokens_for_logprob_cpu,
+        fb.global_num_tokens_for_logprob_gpu,
         fb.global_dp_buffer_len,
         fb.dp_padding_mode,
         fb.dp_local_start_pos,
         fb.dp_local_num_tokens,
+        fb.global_num_token_non_padded,
+        fb.global_num_token_non_padded_cpu,
+        fb.num_token_non_padded,
     ) = saved
     set_dp_buffer_len_from_batch(fb)

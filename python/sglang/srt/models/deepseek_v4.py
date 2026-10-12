@@ -154,9 +154,9 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     get_tc_piecewise_forward_context,
 )
 from sglang.srt.model_executor.swa_replay_dp import (
-    _enter_late_layer_dp,
-    _exit_late_layer_dp,
-    _late_layer_dp_counts,
+    enter_late_layer_dp,
+    exit_late_layer_dp,
+    late_layer_dp_counts,
 )
 from sglang.srt.model_loader.utils import maybe_executor_submit, should_async_load
 from sglang.srt.model_loader.weight_utils import (
@@ -4119,12 +4119,11 @@ class DeepseekV4Model(nn.Module):
         late_dp_counts = None
         saved_dp = None
         if (
-            _is_hip
-            and self.late_layer_start is not None
+            self.late_layer_start is not None
             and get_parallel().attn_dp_size > 1
-            and get_moe_a2a_backend().is_none()
+            and (forward_batch.is_extend_in_batch or _is_hip)
         ):
-            late_dp_counts = _late_layer_dp_counts(
+            late_dp_counts = late_layer_dp_counts(
                 forward_batch,
                 (
                     tail.token_indices.shape[0]
@@ -4143,18 +4142,24 @@ class DeepseekV4Model(nn.Module):
                 # Decode reaches back at most SWA_WINDOW positions.
                 saved_full = attn_backend.enter_late_layer_tail(forward_batch)
                 state = state.take_rows(tail.rows)
-                input_ids, input_ids_global = (
-                    tail.rows(input_ids),
-                    tail.rows(input_ids_global),
-                )
+                input_ids = tail.rows(input_ids)
+                if not (
+                    get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none()
+                ):
+                    input_ids_global = tail.rows(input_ids_global)
                 positions = tail.positions
                 if hash_ids is not None:
                     hash_ids = tail.rows(hash_ids)
-            # late_dp_counts is only not None on hip
             if late_dp_counts is not None and i == self.late_layer_start:
-                saved_dp = _enter_late_layer_dp(forward_batch, late_dp_counts)
-                # Gathered over the full extend; no late layer is hash-routed.
-                input_ids_global = None
+                saved_dp = enter_late_layer_dp(forward_batch, late_dp_counts)
+                if get_moe_a2a_backend().is_none():
+                    # Full-prefill IDs are not indexed by this rank's tail rows.
+                    # Re-gather the compact IDs in the late-layer MoE layout.
+                    gathered_ids = input_ids.new_empty((sum(late_dp_counts), 1))
+                    dp_gather_replicate(
+                        gathered_ids, input_ids[:, None].clone(), forward_batch
+                    )
+                    input_ids_global = gathered_ids.squeeze(-1)
             engram = self.layers[i].engram
             if engram is not None:
                 before_engram = state.residual
@@ -4211,9 +4216,8 @@ class DeepseekV4Model(nn.Module):
                     mega_mhc_seam_open=i + 1 != self.late_layer_start,
                 )
         state = state.materialized(self.layers[self.end_layer - 1].hc_cfg)
-        # saved_dp is only not None on hip
         if saved_dp is not None:
-            _exit_late_layer_dp(forward_batch, saved_dp)
+            exit_late_layer_dp(forward_batch, saved_dp)
         if saved_full is not None:
             attn_backend.exit_late_layer_tail(saved_full, forward_batch)
             return state.residual, state.pre, tail

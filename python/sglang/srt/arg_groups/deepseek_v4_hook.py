@@ -343,15 +343,21 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 "the prefill CUDA graph",
                 cfg.cuda_graph_config.prefill.backend != Backend.DISABLED,
             ),
-            # DP attention + TP MoE re-sizes the MoE gather to every rank's tail
-            # (deepseek_v4 _late_layer_dp_counts, ROCm only); other DP layouts do not.
+            # Late-layer communication uses one row count per attention-DP rank.
+            # Attention TP/CP shards need a separate tail padding layout.
             (
-                "DP attention other than TP MoE with attention TP 1 on ROCm",
+                "DP attention other than attention TP 1 with supported MoE backends",
                 attn_dp_enabled_of(cfg)
                 and not (
-                    is_hip()
-                    and cfg.moe_a2a_backend == "none"
-                    and cfg.attn_dp_size == cfg.tp_size
+                    cfg.attn_dp_size == cfg.tp_size
+                    and cfg.attn_cp_size == 1
+                    and (
+                        (is_hip() and cfg.moe_a2a_backend == "none")
+                        or (
+                            get_platform().is_cuda
+                            and cfg.moe_a2a_backend in ("none", "megamoe")
+                        )
+                    )
                 ),
             ),
         )
