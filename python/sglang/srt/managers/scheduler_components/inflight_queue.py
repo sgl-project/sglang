@@ -32,6 +32,9 @@ class StepRecord:
     result: Optional[GenerationBatchResult | EmbeddingBatchResult]
     # The queue's completed step count when the batch was launched.
     step: int
+    # PD prefill: whether a plan has processed the chunked request this step
+    # ran, so a replan while its result is pending skips it.
+    prefill_chunk_done: bool = False
 
 
 class InflightQueue:

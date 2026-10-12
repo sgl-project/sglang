@@ -2357,9 +2357,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     chunked_req_next_prompt_token: Optional[int] = None
     contains_last_prefill_chunk: bool = True
 
-    # Tracks process_prefill_chunk() on the original scheduler batch only.
-    prefill_chunk_processed: bool = False
-
     # Decode rows run as a 1-token extend. They are always the last rows of an
     # extend step: mix_with_running appends them, and a converted step is all
     # decode rows. prepare_for_decode, filter_batch and merge_batch clear it;

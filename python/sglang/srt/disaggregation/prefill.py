@@ -641,11 +641,13 @@ class SchedulerDisaggregationPrefillMixin:
 
         self.resolve_waiting_queue_bootstrap()
 
-        # Skip repeated chunk processing while polling a pending batch.
-        if last_batch is None or not last_batch.prefill_chunk_processed:
+        # Skip repeated chunk processing while polling a pending batch: a
+        # replan in the same step sees the same step in flight.
+        inflight = self.inflight_steps.newest()
+        if inflight is None or not inflight.prefill_chunk_done:
             self.process_prefill_chunk(last_batch=last_batch)
-            if last_batch is not None:
-                last_batch.prefill_chunk_processed = True
+            if inflight is not None:
+                inflight.prefill_chunk_done = True
 
         prefill_plan = self.get_new_batch_prefill(decoding_batch)
         batch = prefill_plan.batch_to_run

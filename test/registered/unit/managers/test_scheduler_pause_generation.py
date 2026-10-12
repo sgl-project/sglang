@@ -629,7 +629,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         self.assertIs(scheduler.chunked_req, chunked_req)
 
     def test_retract_drains_overlap_queue(self):
-        """Single-result retract must preserve the existing chunk-preparation state."""
+        """Retract under overlap commits the one step in flight."""
         for mode in (
             DisaggregationMode.NULL,
             DisaggregationMode.PREFILL,
@@ -649,7 +649,6 @@ class TestSchedulerPauseGeneration(CustomTestCase):
 
                 scheduler.process_batch_result.assert_called_once_with(batch, result)
                 self.assertFalse(scheduler.inflight_steps)
-                self.assertFalse(batch.prefill_chunk_processed)
 
     def test_pd_decode_retract_requeues_for_rebootstrap(self):
         """PD decode retract should rebootstrap instead of resuming stale CPU KV."""
