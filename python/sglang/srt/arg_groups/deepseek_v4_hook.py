@@ -289,9 +289,6 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             read_ragged_verify_mode,
         )
 
-        # The DSpark aux (first token, draft state, hidden states) travels on the
-        # prefill-side aux WRITE path that disaggregation/common implements for
-        # every transfer backend, so NIXL carries it the same way Mooncake does.
         # CP size may still be implicit here; validate_deepseek_v4_cp resolves it.
         supported_prefill_cp = (
             cfg.disaggregation_mode == "prefill"
