@@ -12,6 +12,7 @@ from sglang.srt.model_loader.loader import (
     DefaultModelLoader,
     get_model_loader,
     post_load_weights,
+    refresh_gemma_weights,
 )
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import (
@@ -316,6 +317,8 @@ class WeightUpdater:
     def end_weight_update(self: WeightUpdater, *, run_post_load: bool) -> None:
         if run_post_load:
             post_load_weights(self.get_model())
+        else:
+            refresh_gemma_weights(self.get_model())
         DefaultModelLoader.postprocess_weights(
             self.get_model(), torch.device(self.device)
         )

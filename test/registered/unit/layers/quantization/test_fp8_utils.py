@@ -82,13 +82,18 @@ class TestMxfp8MoeScaleLayout(CustomTestCase):
 
 class TestInverseTransformScaleUe8m0(CustomTestCase):
     def test_round_trip(self):
+        for shape in (
+            # DeepSeek V3 kv_b_proj
+            (32768, 512),
+            # GLM-5 fused q_a + kv_a: 2048 + 576 rows, the last block partial
+            (2624, 6144),
+        ):
+            with self.subTest(shape=shape):
+                self._check_round_trip(shape)
+
+    def _check_round_trip(self, shape):
         for _ in range(100):
-            weight_bf16 = torch.randn(
-                # DeepSeek V3 kv_b_proj
-                (32768, 512),
-                dtype=torch.bfloat16,
-                device="cuda",
-            )
+            weight_bf16 = torch.randn(shape, dtype=torch.bfloat16, device="cuda")
 
             weight_block_size = [128, 128]
 
