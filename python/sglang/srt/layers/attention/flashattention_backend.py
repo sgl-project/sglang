@@ -606,6 +606,7 @@ class FlashAttentionBackend(AttentionBackend):
                 ),
             )
             self._apply_cuda_graph_metadata(
+                plan=forward_batch.kv_loc_plan,
                 bs=forward_batch.batch_size,
                 req_pool_indices=forward_batch.req_pool_indices,
                 seq_lens=forward_batch.seq_lens,
