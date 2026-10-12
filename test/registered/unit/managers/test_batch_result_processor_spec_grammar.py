@@ -30,8 +30,6 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class _FakeGrammar:
-    """Grammar stub that terminates after `terminate_after` accepted tokens."""
-
     def __init__(self, terminate_after: int):
         self.accepted = []
         self.finished = False
@@ -161,7 +159,6 @@ class TestSpecV2GrammarTruncation(CustomTestCase):
     def test_resolve_truncates_after_grammar_completion(self):
         req = _make_req(terminate_after=2)
         proc = _make_processor()
-        # stride=4, accept_len=3 -> proposed [101, 102, 103]; grammar finishes at 102.
         result = _make_result(4, [3], [101, 102, 103, 0])
 
         predict_tokens = proc._resolve_spec_v2_tokens(result, _FakeBatch([req]))
@@ -261,7 +258,6 @@ class TestFinishedMambaSpecCheckpoint(CustomTestCase):
             _make_processor(), tree_cache=SimpleNamespace(supports_mamba=lambda: True)
         )
         cases = (
-            # Grammar retained, finish length, non-draft count, track slots, cache.
             ("grammar", [4], 1, 1, 0, False),
             ("zero_commit", [], 0, 1, 0, False),
             ("eos_or_stop", None, 1, 1, 0, False),

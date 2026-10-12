@@ -1,9 +1,3 @@
-"""KL regression tests for Mamba prefix-cache correctness.
-
-Keep each scenario in its own class so server configurations and cache-pressure
-requirements remain explicit.
-"""
-
 import unittest
 
 import numpy as np
@@ -54,19 +48,9 @@ class MambaCacheKLMixin:
 
 
 class TestMambaLazyInplaceKL(MambaCacheKLMixin, DefaultServerBase):
-    """Guard lazy Mamba checkpoint reuse when the optional track slot is exhausted.
-
-    Keep overlap scheduling and decode CUDA graphs enabled. A four-slot pool holds
-    two cached prefixes, the request's live state, and its keep checkpoint. The
-    first decode must track in place; delayed prefill processing must not publish
-    that buffer under the old checkpoint length.
-
-    Compare full-vocabulary next-token distributions at the SAME 255-token prompt,
-    before and after a 32-token decode seeds the cache. Comparing later free-running
-    tokens would confound cache corruption with different generated histories.
-
-    GB300 / Qwen3.5-0.8B: reverting the checkpoint invalidation gives KL=0.649448
-    and a stale 192-token cache hit; with the fix KL=0 and the safe hit is 128 tokens.
+    """The four-slot pool forces in-place tracking on the first decode. Delayed
+    prefill processing must not publish that state under the old checkpoint key.
+    Compare the same prompt so generated histories cannot confound the KL.
     """
 
     ignore_eos = True
@@ -137,20 +121,13 @@ class TestMambaLazyInplaceKL(MambaCacheKLMixin, DefaultServerBase):
             flush=True,
         )
         self.assertGreaterEqual(kl, -1e-12)
-        # Leave room for numerical noise while staying far below the broken run.
         self.assertLess(kl, 1e-4, "Cache reuse changed the next-token distribution")
 
 
 class TestMambaSpecTruncationKL(MambaCacheKLMixin, DefaultServerBase):
-    """A no_buffer state advanced past the finish point cannot name a short key.
-
-    NEXTN can accept more tokens than max_new_tokens permits. Compare a fixed
-    continuation using the resulting cache with a cold recompute of that exact
-    continuation; both sides must condition on the same generated token IDs.
-
-    GB300: count/story KL is 0.877/4.107 without the finished-state guard, and
-    0.000235/0.000942 with it. The safe prompt-only hit and cold recompute use
-    different prefill splits, so allow numerical noise rather than requiring 0.
+    """NEXTN can advance the no_buffer state past max_new_tokens. Compare warm
+    and cold distributions for identical token IDs to detect a misaligned key.
+    Different prefill splits introduce numerical noise, so KL need not be zero.
     """
 
     model = "Qwen/Qwen3.5-0.8B"
