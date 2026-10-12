@@ -569,22 +569,6 @@ class QSATokenToKVPool(HybridLinearKVPool):
             src_loc, tgt_loc = sharding.local_copy_targets(src_loc, tgt_loc)
         self.full_kv_pool.move_kv_cache(tgt_loc, src_loc)
 
-    def clear_raw_kv_slots(self, global_slots: torch.Tensor) -> None:
-        sharding = self.qsa_raw_kv_sharding
-        if sharding is None:
-            local_slots = global_slots
-        else:
-            local_slots = sharding.global_to_local_tokens(global_slots)
-            local_slots = local_slots[local_slots >= 0]
-        if local_slots.numel() == 0:
-            return
-        layer_ids = self.full_attention_layer_id_mapping.values()
-        for layer_id in layer_ids:
-            key = self.full_kv_pool.get_key_buffer(layer_id)
-            value = self.full_kv_pool.get_value_buffer(layer_id)
-            key[local_slots] = 0
-            value[local_slots] = 0
-
     def set_qsa_key_state_buffer(
         self, layer_id: int, loc: torch.Tensor, token_k: torch.Tensor
     ) -> None:

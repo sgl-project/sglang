@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import os
-
 import torch
 import triton
 import triton.language as tl
@@ -12,10 +10,6 @@ from sglang.srt.distributed.utils import all_gather_single
 from sglang.srt.mem_cache.qsa_kv_pool import (
     QSARawKVSharding,
     assert_qsa_indices_in_bounds,
-)
-
-OWNER_PARTIAL_TRANSPORT = os.environ.get(
-    "SGLANG_QSA_OWNER_PARTIAL_TRANSPORT", "packed_a2a"
 )
 
 
@@ -279,7 +273,6 @@ def merge_owner_sparse_attention(
     *,
     group,
     static_buffers=None,
-    transport: str = "packed_a2a",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Exchange FP32 output/LSE once and stably merge this rank's head shard."""
 
@@ -289,56 +282,33 @@ def merge_owner_sparse_attention(
         raise TypeError("partial LSE must be float32")
     world_size = int(group.world_size)
     rows, num_heads, head_dim = partial_output.shape
-    if transport not in ("packed_a2a", "all_gather"):
-        raise ValueError(f"unsupported owner partial transport: {transport}")
-    if transport == "packed_a2a":
-        if num_heads % world_size:
-            raise ValueError("owner partial heads must be divisible by group size")
-        local_heads = num_heads // world_size
-        if static_buffers is None:
-            packed = torch.empty(
-                (world_size, rows, local_heads, head_dim + 1),
-                dtype=torch.float32,
-                device=partial_output.device,
-            )
-            recv = torch.empty_like(packed)
-        else:
-            static_buffers = static_buffers.for_graph(rows)
-            static_buffers.for_batch(rows)
-            packed = static_buffers.owner_a2a_send
-            recv = static_buffers.owner_a2a_recv
-            packed[..., :-1].zero_()
-            packed[..., -1].fill_(float("-inf"))
-        packed[:, :rows, ..., :-1].copy_(
-            partial_output.float()
-            .view(rows, world_size, local_heads, head_dim)
-            .permute(1, 0, 2, 3)
+    if num_heads % world_size:
+        raise ValueError("owner partial heads must be divisible by group size")
+    local_heads = num_heads // world_size
+    if static_buffers is None:
+        packed = torch.empty(
+            (world_size, rows, local_heads, head_dim + 1),
+            dtype=torch.float32,
+            device=partial_output.device,
         )
-        packed[:, :rows, ..., -1].copy_(
-            partial_lse.view(rows, world_size, local_heads).permute(1, 0, 2)
-        )
-        group.all_to_all_single(recv.view(-1), packed.view(-1))
-        gathered = recv[:, :rows]
-    elif static_buffers is None:
-        packed = torch.cat(
-            (partial_output.float(), partial_lse[..., None]), dim=-1
-        ).unsqueeze(0)
-        gathered = group.all_gather(packed, dim=0)
+        recv = torch.empty_like(packed)
     else:
         static_buffers = static_buffers.for_graph(rows)
         static_buffers.for_batch(rows)
-        packed = static_buffers.owner_transport
+        packed = static_buffers.owner_a2a_send
+        recv = static_buffers.owner_a2a_recv
         packed[..., :-1].zero_()
         packed[..., -1].fill_(float("-inf"))
-        packed[:rows, ..., :-1].copy_(partial_output.float())
-        packed[:rows, ..., -1].copy_(partial_lse)
-        recv = static_buffers.owner_recv.view(
-            world_size * static_buffers.max_rows,
-            static_buffers.num_heads,
-            static_buffers.head_dim + 1,
-        )
-        group.all_gather_into_tensor(recv, packed)
-        gathered = static_buffers.owner_recv[:, :rows]
+    packed[:, :rows, ..., :-1].copy_(
+        partial_output.float()
+        .view(rows, world_size, local_heads, head_dim)
+        .permute(1, 0, 2, 3)
+    )
+    packed[:, :rows, ..., -1].copy_(
+        partial_lse.view(rows, world_size, local_heads).permute(1, 0, 2)
+    )
+    group.all_to_all_single(recv.view(-1), packed.view(-1))
+    gathered = recv[:, :rows]
     if gathered.shape[0] != world_size:
         raise ValueError("owner collective returned an unexpected owner dimension")
     if not gathered.is_cuda:
@@ -462,19 +432,11 @@ def owner_sparse_attention(
             lse,
             group=group,
             static_buffers=static_buffers,
-            transport=OWNER_PARTIAL_TRANSPORT,
         )
-    if OWNER_PARTIAL_TRANSPORT == "all_gather":
-        rank = int(group.rank_in_group)
-        head_start = rank * local_query_heads
-        head_stop = head_start + local_query_heads
-        output = output[:, head_start:head_stop]
-        lse = lse[:, head_start:head_stop]
     return output, lse
 
 
 __all__ = [
-    "OWNER_PARTIAL_TRANSPORT",
     "merge_owner_sparse_attention",
     "owner_sparse_attention",
     "owner_sparse_attention_partial",

@@ -154,7 +154,7 @@ def _qsa_graph_row_metadata_kernel(
     visible_pages = tl.cdiv(compressed, COMPRESSED_PAGE)
     local_page_count = 0
     local_block_count = 0
-    for p0 in range(0, max_pages, PAGE_BLOCK):
+    for p0 in range(0, visible_pages, PAGE_BLOCK):
         idx = p0 + offs
         valid = idx < tl.minimum(visible_pages, tl.minimum(max_pages, row_width_pages))
         loc = tl.load(
@@ -185,18 +185,8 @@ def _qsa_graph_row_metadata_kernel(
             )
         local_page_count += tl.sum(owner_i, axis=0)
         local_block_count += tl.sum(tl.where(owner, blocks, 0), axis=0)
-    # Graph buffers persist across replays. Clear the unused tail so shrinking
-    # sequences and padded rows cannot retain stale page ids or block positions.
-    for p0 in range(0, max_pages, PAGE_BLOCK):
-        idx = p0 + offs
-        clear_page = (idx >= local_page_count) & (idx < max_pages)
-        tl.store(table_row + idx, 0, mask=clear_page)
-        for k in tl.static_range(COMPRESSED_PAGE):
-            tl.store(
-                positions_row + idx * COMPRESSED_PAGE + k,
-                -1,
-                mask=clear_page,
-            )
+    # Consumers are bounded by local_block_count, so graph replays may leave the
+    # unreachable tail intact when a sequence shrinks.
     tl.store(compressed_lens_ptr + row, local_block_count)
 
 

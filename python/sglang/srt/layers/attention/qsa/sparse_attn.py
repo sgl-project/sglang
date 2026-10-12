@@ -103,14 +103,9 @@ def _sparse_gqa_prefill(
             other=0.0,
         )
         scores = tl.where(valid[None, :], tl.dot(q_values, keys), -float("inf"))
-        block_has_tokens = tl.sum(valid.to(tl.int32), axis=0) > 0
-        next_max = tl.where(
-            block_has_tokens, tl.maximum(max_value, tl.max(scores, 1)), max_value
-        )
-        alpha = tl.where(block_has_tokens, tl.math.exp2(max_value - next_max), 1.0)
-        probabilities = tl.where(
-            valid[None, :], tl.math.exp2(scores - next_max[:, None]), 0.0
-        )
+        next_max = tl.maximum(max_value, tl.max(scores, 1))
+        alpha = tl.math.exp2(max_value - next_max)
+        probabilities = tl.math.exp2(scores - next_max[:, None])
         accumulator = tl.dot(
             probabilities.to(values.dtype), values, accumulator * alpha[:, None]
         )

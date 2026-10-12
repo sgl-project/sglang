@@ -12,7 +12,6 @@ def build_qsa_indexer(
     quant_config=None,
     prefix: str = "",
     rotary_emb=None,
-    distributed_topk_group=None,
 ):
 
     profile = parse_qsa_profile(config)
@@ -26,27 +25,14 @@ def build_qsa_indexer(
     from sglang.srt.layers.attention.qsa.qsa_indexer import QSAIndexer
 
     cache_sharding_runtime = get_qsa_cache_sharding_runtime()
-    expected_group = (
-        cache_sharding_runtime.group if cache_sharding_runtime.enabled else None
+    return QSAIndexer(
+        config=config,
+        layer_id=layer_id,
+        quant_config=quant_config,
+        prefix=prefix,
+        rotary_emb=rotary_emb,
+        cache_sharding_runtime=cache_sharding_runtime,
     )
-    if (
-        distributed_topk_group is not None
-        and distributed_topk_group is not expected_group
-    ):
-        raise ValueError(
-            "QSA indexer collective group does not match cache-sharding runtime"
-        )
-    kwargs = {
-        "config": config,
-        "layer_id": layer_id,
-        "quant_config": quant_config,
-        "prefix": prefix,
-        "rotary_emb": rotary_emb,
-        "cache_sharding_runtime": cache_sharding_runtime,
-    }
-    if expected_group is not None:
-        kwargs["distributed_topk_group"] = expected_group
-    return QSAIndexer(**kwargs)
 
 
 def resolve_qsa_sparse_backend(attn_backend):

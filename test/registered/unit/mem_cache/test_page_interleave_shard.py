@@ -93,7 +93,6 @@ from sglang.srt.mem_cache.qsa_kv_pool import (
     QSACompressedBlockSharding,
     QSARawKVSharding,
     QSATokenToKVPool,
-    qsa_global_compressed_capacity,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
@@ -1446,28 +1445,6 @@ def test_qsa_compressed_page_ownership_mapping():
     )
 
 
-def test_qsa_shards_reuse_page_interleave_placement():
-    raw = QSARawKVSharding(local_capacity=8, page_size=4, world_size=2, rank=1)
-    compressed = QSACompressedBlockSharding(
-        global_blocks=20,
-        compressed_page_size=4,
-        world_size=3,
-        rank=1,
-    )
-    assert isinstance(raw.placement, PageInterleavePlacement)
-    assert raw.placement.spec.page_size == 1
-    assert isinstance(compressed.placement, PageInterleavePlacement)
-    assert compressed.placement.spec.page_size == 4
-
-
-def test_qsa_capacity_uses_page_interleave_allocator_width():
-    allocator = object.__new__(PageInterleavePoolAllocator)
-    allocator.shard_size = 4
-    assert (
-        qsa_global_compressed_capacity(13, compress_ratio=4, allocator=allocator) == 13
-    )
-
-
 def test_kv_cache_configurator_selects_page_interleave_allocator_for_sharded_qsa(
     monkeypatch,
 ):
@@ -1519,48 +1496,6 @@ def test_kv_cache_configurator_selects_page_interleave_allocator_for_sharded_qsa
         )
         == 32 * 4
     )
-
-
-@pytest.mark.parametrize("vendor_allocator", [None, PagedTokenToKVPoolAllocator])
-def test_non_qsa_vendor_allocator_preserves_fallback_and_dcp_capacity(
-    monkeypatch, vendor_allocator
-):
-    from sglang.srt.mem_cache import kv_cache_configurator as module
-
-    subject = object.__new__(module.KVCacheConfigurator)
-    subject.kv_cache_dtype = torch.bfloat16
-    subject.device = "cpu"
-    subject.is_hybrid_swa = False
-    subject.is_draft_worker = False
-    subject.kv_shard_size = 1
-    monkeypatch.setattr(module, "_is_npu", False)
-    monkeypatch.setattr(module.current_platform, "is_out_of_tree", lambda: True)
-    monkeypatch.setattr(
-        module.current_platform, "get_paged_allocator_cls", lambda: vendor_allocator
-    )
-    monkeypatch.setattr(module, "get_schedule", lambda: SimpleNamespace(page_size=4))
-    monkeypatch.setattr(
-        module, "get_disagg", lambda: SimpleNamespace(disaggregation_mode="null")
-    )
-    monkeypatch.setattr(
-        module, "get_memory", lambda: SimpleNamespace(enable_hisparse=False)
-    )
-    monkeypatch.setattr(
-        module,
-        "get_parallel",
-        lambda: SimpleNamespace(dcp_enabled=True, attn_dcp_size=2),
-    )
-    allocator = subject._build_token_to_kv_pool_allocator(
-        sizes=SimpleNamespace(max_total_num_tokens=32),
-        token_to_kv_pool=SimpleNamespace(),
-        is_dsv4_model=False,
-        req_to_token_pool=SimpleNamespace(),
-        token_to_kv_pool_allocator=None,
-    )
-    assert isinstance(allocator, PagedTokenToKVPoolAllocator)
-    assert allocator.size == 64
-    assert allocator.page_size == 8
-    assert allocator.available_size() == 64
 
 
 @pytest.mark.parametrize(

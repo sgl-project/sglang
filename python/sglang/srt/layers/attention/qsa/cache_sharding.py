@@ -148,7 +148,6 @@ class QSACacheShardingStaticBuffers:
         device: torch.device | str,
         dtype: torch.dtype,
         layer_ids: tuple[int, ...] | list[int] | None = None,
-        owner_partial_transport: str | None = None,
         candidate_group=None,
     ) -> None:
         owner_topk = topk if owner_topk is None else owner_topk
@@ -164,36 +163,14 @@ class QSACacheShardingStaticBuffers:
         self.head_dim = head_dim
         self._device = torch.device(device)
         self._dtype = dtype
-        self.owner_partial_transport = owner_partial_transport or os.environ.get(
-            "SGLANG_QSA_OWNER_PARTIAL_TRANSPORT", "packed_a2a"
-        )
-        if self.owner_partial_transport not in ("packed_a2a", "all_gather"):
-            raise ValueError(
-                f"unsupported owner partial transport: {self.owner_partial_transport}"
-            )
-        self._layer_buffers = None
+        self._layer_ids = None
         if layer_ids is not None:
             unique_layer_ids = tuple(
                 dict.fromkeys(int(layer_id) for layer_id in layer_ids)
             )
             if not unique_layer_ids or len(unique_layer_ids) != len(layer_ids):
                 raise ValueError("QSA layer ids must be non-empty and unique")
-            self._layer_buffers = {
-                layer_id: QSACacheShardingStaticBuffers(
-                    max_rows=max_rows,
-                    topk=topk,
-                    owner_topk=owner_topk,
-                    num_heads=num_heads,
-                    head_dim=head_dim,
-                    world_size=world_size,
-                    device=device,
-                    dtype=dtype,
-                    owner_partial_transport=self.owner_partial_transport,
-                    candidate_group=candidate_group,
-                )
-                for layer_id in unique_layer_ids
-            }
-            return
+            self._layer_ids = unique_layer_ids
         local_heads = num_heads // world_size
         self.candidate_transport = torch.empty(
             (max_rows, topk, 2), dtype=torch.float32, device=device
@@ -232,28 +209,12 @@ class QSACacheShardingStaticBuffers:
             dtype=torch.int64,
             device=device,
         )
-        self.owner_transport = None
-        self.owner_recv = None
-        self.owner_a2a_send = None
-        self.owner_a2a_recv = None
-        if self.owner_partial_transport == "all_gather":
-            self.owner_transport = torch.empty(
-                (max_rows, num_heads, head_dim + 1),
-                dtype=torch.float32,
-                device=device,
-            )
-            self.owner_recv = torch.empty(
-                (world_size, max_rows, num_heads, head_dim + 1),
-                dtype=torch.float32,
-                device=device,
-            )
-        else:
-            self.owner_a2a_send = torch.empty(
-                (world_size, max_rows, local_heads, head_dim + 1),
-                dtype=torch.float32,
-                device=device,
-            )
-            self.owner_a2a_recv = torch.empty_like(self.owner_a2a_send)
+        self.owner_a2a_send = torch.empty(
+            (world_size, max_rows, local_heads, head_dim + 1),
+            dtype=torch.float32,
+            device=device,
+        )
+        self.owner_a2a_recv = torch.empty_like(self.owner_a2a_send)
 
     def _create_candidate_symm_state(self, candidate_group):
         """Rendezvous one graph-only candidate buffer before graph capture."""
@@ -308,19 +269,11 @@ class QSACacheShardingStaticBuffers:
         return state if bool(multicast.item()) else None
 
     def for_layer(self, layer_id: int) -> QSACacheShardingStaticBuffers:
-        if self._layer_buffers is None:
+        if self._layer_ids is None:
             return self
-        try:
-            return self._layer_buffers[int(layer_id)]
-        except KeyError:
-            raise KeyError(
-                f"no static transport slice for QSA layer {layer_id}"
-            ) from None
-
-    def layer_items(self):
-        if self._layer_buffers is None:
-            return ()
-        return tuple(self._layer_buffers.items())
+        if int(layer_id) not in self._layer_ids:
+            raise KeyError(f"no static transport slice for QSA layer {layer_id}")
+        return self
 
     def for_graph(self, rows: int) -> QSACacheShardingStaticBuffers:
         self.for_batch(rows)
