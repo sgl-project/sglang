@@ -233,11 +233,17 @@ class ExecKernel(msgspec.Struct):
         str,
         Arg(
             help=(
-                "DeepSeek-V4 sparse prefill backend. 'auto' and "
-                "'flashmla_sparse' use the existing BF16 sparse prefill path; "
+                "DeepSeek-V4 prefill backend. 'auto' selects by query size, "
+                "'flashmla_kvcache' forces the paged FP8 FlashMLA path, "
+                "'flashmla_sparse' forces the BF16 sparse prefill path, and "
                 "'flashmla_sparse_q8' enables the Q8KV8 sparse prefill path."
             ),
-            choices=["auto", "flashmla_sparse", "flashmla_sparse_q8"],
+            choices=[
+                "auto",
+                "flashmla_kvcache",
+                "flashmla_sparse",
+                "flashmla_sparse_q8",
+            ],
         ),
     ] = "auto"
     dsa_triton_union: A[

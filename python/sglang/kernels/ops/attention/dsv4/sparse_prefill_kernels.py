@@ -45,8 +45,7 @@ def _combine_topk_swa_indices_kernel(
     topk_indices_stride,
     query_start_loc_ptr,
     query_pos_ptr,
-    seq_lens_ptr,
-    gather_lens_ptr,
+    swa_first_pos_ptr,
     compressed_base_ptr,
     swa_base_ptr,
     swa_indices_ptr,
@@ -84,14 +83,10 @@ def _combine_topk_swa_indices_kernel(
     owned = valid & (token < tl.load(query_start_loc_ptr + num_reqs) - base)
 
     pos = tl.load(query_pos_ptr + token, mask=owned, other=0)
-    seq_len = tl.load(seq_lens_ptr + batch_idx, mask=owned, other=0)
-    gather_len = tl.load(gather_lens_ptr + batch_idx, mask=owned, other=0)
     compressed_base = tl.load(compressed_base_ptr + batch_idx, mask=owned, other=0)
     swa_base = tl.load(swa_base_ptr + batch_idx, mask=owned, other=0)
-    # SWA portion of the gathered buffer starts from position
-    # (seq_len - gather_len), not 0. The +pos-gather_start formula maps a
-    # query's window back into the workspace's SWA region.
-    gather_start = seq_len - gather_len
+    # CP queries are strided; their gathered SWA range may end before seq_len.
+    gather_start = tl.load(swa_first_pos_ptr + batch_idx, mask=owned, other=0)
 
     # -1 entries inside the top-k span stay -1 (attention skips them).
     # top_k=0 disables the compressed portion for SWA-only layers.
