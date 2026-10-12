@@ -56,6 +56,7 @@ SEQ_TUP = re.compile(r"\((\d+),(\d+),(\d+)\)")
 CHAT_BOUNDARY = re.compile(r"/v1/chat/completions")
 MAX_REQ_SHOWN = 20
 MAX_DIFF_SHOWN = 8
+MAX_OFFENDER_SHOWN = 10
 OSHAPE_KEYS = ("ratio", "ori_page", "ori_bt", "s2Size", "cmp_page", "cmp_bt")
 
 
@@ -693,21 +694,50 @@ def _rope_shift(v):
         return None
 
 
-def _knorm_verdict(miss_vals, hit_vals, tol):
-    """(verdict, max_rel) comparing the MISS vs HIT ``knorm`` means.
+def _idxin_knorm_by_block(group):
+    """``{abs_shift: knorm_mean}`` for one request's [IDXIN] rows.
 
-    RoPE is orthonormal, so the per-pair magnitude is invariant: the means must
-    match within ``tol`` (fp8 rounding) when the ONLY difference is the phase.
-    A larger relative gap means the CONTENT/WINDOW differs.
+    Each row carries ``knorm=<mean>:<npairs>:<ropeDim>`` (the RoPE-invariant
+    magnitude of the logical index-K slab) AND a ``ropephase`` whose ``shift``
+    is the ABSOLUTE compressed block index -- so the row pairs its block index
+    with that block's magnitude.  That pair IS the per-block signature; the
+    whole-request value-SET is NOT comparable (the MISS's extra blocks would
+    fake a CONTENT/WINDOW).  Rows without a parseable shift/knorm are skipped.
     """
-    if not miss_vals or not hit_vals:
-        return "UNKNOWN", None
-    rel = 0.0
-    for a in miss_vals:
-        for b in hit_vals:
-            denom = max(abs(a), abs(b), 1e-12)
-            rel = max(rel, abs(a - b) / denom)
-    return ("CONTENT/WINDOW" if rel > tol else "SAME", rel)
+    out = {}
+    for r in group:
+        sh = _rope_shift(r.get("ropephase"))
+        kn = _knorm_mean(r.get("knorm"))
+        if sh is not None and kn is not None:
+            out[sh] = kn
+    return out
+
+
+def _knorm_block_verdict(miss_map, hit_map, tol):
+    """``(verdict, rel, shared, miss_only, hit_only, offenders)`` per shared block.
+
+    RoPE is orthonormal, so the per-pair magnitude of a given ABSOLUTE block is
+    INVARIANT under the phase: the MISS and the matching HIT must print the same
+    ``knorm`` for every block present in BOTH.  Only SHARED blocks are compared
+    (a block present in just one request cannot be judged).  ``rel`` is the max
+    relative gap over the shared blocks; ``offenders`` lists the worst
+    ``(shift, miss, hit)`` triples over ``tol`` (largest gap first, capped).
+    """
+    miss_k, hit_k = set(miss_map), set(hit_map)
+    shared = sorted(miss_k & hit_k)
+    miss_only, hit_only = sorted(miss_k - hit_k), sorted(hit_k - miss_k)
+    if not shared:
+        return "NO-SHARED", None, shared, miss_only, hit_only, []
+    rels = []
+    for s in shared:
+        a, b = miss_map[s], hit_map[s]
+        denom = max(abs(a), abs(b), 1e-12)
+        rels.append((abs(a - b) / denom, s, a, b))
+    rel = max(r for r, _s, _a, _b in rels)
+    offenders = [(s, a, b) for r, s, a, b in sorted(rels, key=lambda t: -t[0])
+                 if r > tol][:MAX_OFFENDER_SHOWN]
+    return ("CONTENT/WINDOW" if rel > tol else "SAME",
+            rel, shared, miss_only, hit_only, offenders)
 
 
 def report_idxin_rope(rows, knorm_tol=0.05):
@@ -723,13 +753,18 @@ def report_idxin_rope(rows, knorm_tol=0.05):
       * ``knorm`` equal & ``klog`` differs       -> ``ROPE-PHASE`` (the sole
         remaining difference is the RoPE phase the kernel applies)
 
-    Pairing rule (the fix): the MISS (largest prefill) is compared against the
-    HIT request(s) whose ``slq``/``slk`` MATCHES the MISS -- i.e. the cache-hit
-    of the SAME sequence.  Pairing the MISS with the FIRST HITs (different, short
+    Pairing rule: the MISS (largest prefill) is compared against the HIT
+    request(s) whose ``slq``/``slk`` MATCHES the MISS -- i.e. the cache-hit of
+    the SAME sequence.  Pairing the MISS with the FIRST HITs (different, short
     prompts) forces a false ``CONTENT/WINDOW``.  When no HIT shares the length we
-    fall back to all HITs and SAY SO.  A per-absolute-block knorm comparison is
-    NOT derivable (``knorm`` is a whole-request mean); the whole-request same-slq
-    comparison is used and that fact is printed.
+    fall back to all HITs and SAY SO.
+
+    Comparison is PER-BLOCK: each request's ``knorm`` values are paired with
+    their ABSOLUTE block index (the ``ropephase`` ``shift``) and ONLY the blocks
+    present in BOTH the MISS and the matching HIT are compared.  RoPE is
+    orthonormal, so a shared block's magnitude must match within ``knorm_tol``;
+    the MISS's extra (or the HIT's extra) blocks are reported but NOT judged.
+    With no shared block the verdict is ``NO-SHARED-BLOCKS``.
 
     Requests are split by the ``/v1/chat/completions`` boundary when present
     (see ``_idxin_requests``), so ``req{i}`` matches the curl order and the
@@ -771,8 +806,6 @@ def report_idxin_rope(rows, knorm_tol=0.05):
           f"{n_req - 1} HIT request(s)  knorm_tol={knorm_tol}")
     print(f"  [IDXIN-ROPE] pairing: {pairing_txt}  miss_slk={miss_slk} "
           f"hit_slq={hit_len_txt}")
-    print("  [IDXIN-ROPE] note: per-block knorm not derivable (knorm is a "
-          "whole-request mean); using whole-request same-slq comparison")
     for i, _g in enumerate(reqs[:MAX_REQ_SHOWN]):
         if not _g:
             continue
@@ -784,16 +817,21 @@ def report_idxin_rope(rows, knorm_tol=0.05):
         print(f"     req{i} {role} knorm[{len(knorms[i])}]={kmean_txt or '-'} "
               f"shift={shifts[i] or '-'} ropephase[{len(phases[i])}]={ph_txt}")
 
-    miss_kn = [m for m in (_knorm_mean(v) for v in knorms[miss_i])
-               if m is not None]
-    hit_kn = []
+    # Per-BLOCK comparison: {abs_shift: knorm} for the MISS and the matching
+    # HIT(s), compared ONLY on the blocks present in BOTH.  The MISS's (or the
+    # HIT's) EXTRA blocks must not be judged -- a whole-request value-SET compare
+    # lets them fake a CONTENT/WINDOW.
+    miss_map = _idxin_knorm_by_block(reqs[miss_i])
+    hit_map = {}
     for j in hit_idx:
-        hit_kn += [m for m in (_knorm_mean(v) for v in knorms[j])
-                   if m is not None]
-    knorm_cmp, rel = _knorm_verdict(miss_kn, hit_kn, knorm_tol)
+        hit_map.update(_idxin_knorm_by_block(reqs[j]))
+    knorm_cmp, rel, shared, miss_only, hit_only, offenders = (
+        _knorm_block_verdict(miss_map, hit_map, knorm_tol))
     klog_diff = _idxin_comp_differs(rows)
     if knorm_cmp == "CONTENT/WINDOW":
         verdict = "CONTENT/WINDOW"
+    elif knorm_cmp == "NO-SHARED":
+        verdict = "NO-SHARED-BLOCKS"
     elif klog_diff:
         verdict = "ROPE-PHASE"
     elif klog_diff is None:
@@ -801,10 +839,14 @@ def report_idxin_rope(rows, knorm_tol=0.05):
     else:
         verdict = "SAME"
     rel_txt = "na" if rel is None else f"{rel:.3e}"
-    print(f"[IDXIN-ROPE] miss_slq={miss_slq} miss_knorm={miss_kn[:4]} "
-          f"hit_slq={hit_len_txt} hit_knorm={hit_kn[:4]} "
-          f"maxrel={rel_txt} knorm_same={knorm_cmp != 'CONTENT/WINDOW'} "
-          f"klog_diff={klog_diff} => {verdict}")
+    print(f"[IDXIN-ROPE] miss_slq={miss_slq} hit_slq={hit_len_txt} "
+          f"n_shared={len(shared)} n_miss_only={len(miss_only)} "
+          f"n_hit_only={len(hit_only)} maxrel={rel_txt} "
+          f"knorm_same={knorm_cmp == 'SAME'} klog_diff={klog_diff} => {verdict}")
+    if offenders:
+        off_txt = "  ".join(
+            f"shift={s}:miss={a:.4g}->hit={b:.4g}" for s, a, b in offenders)
+        print(f"[IDXIN-ROPE] differing shared blocks (>{knorm_tol}): {off_txt}")
 
 
 def _parse_kstateloc(recs):
@@ -1583,7 +1625,10 @@ def _selftest():
     HITs); C2 has NO same-slq HIT and asserts the fallback is stated.  FINALLY,
     D1 builds a synthetic log with FIVE ``/v1/chat/completions`` boundary lines
     and asserts the boundary split picks request 5 as the HIT (``[IDXIN-SPLIT]
-    source=chat/completions requests=5 hit_idx=5``) and yields ROPE-PHASE.
+    source=chat/completions requests=5 hit_idx=5``) and yields ROPE-PHASE.  E1/E2
+    build per-BLOCK ``knorm`` (each row a distinct ``shift``) and assert the
+    comparison judges ONLY shared blocks: E1 (shared equal, one extra MISS block)
+    -> ROPE-PHASE; E2 (a shared block differs) -> CONTENT/WINDOW.
     """
     import contextlib
     import io
@@ -1613,9 +1658,9 @@ def _selftest():
         "[CMPIDX] layer=9 lastpos=100 ntok=17523 md5=ffff",
         _idxin(9, 17523, "mmmm", kpg_a),
         "[CMPIDX] layer=5 lastpos=101 ntok=17523 md5=ffff",
-        _idxin(5, 17523, "aaaa", kpg_a),
+        _idxin(5, 17523, "aaaa", kpg_a, shift=4096),
         "[CMPIDX] layer=7 lastpos=101 ntok=17523 md5=ffff",
-        _idxin(7, 17523, "zzzz", kpg_a),
+        _idxin(7, 17523, "zzzz", kpg_a, shift=4096),
         # HIT request (suffix prefill slq=1139): lastpos drops to 100 -> new req.
         #   layer 5: same (klog,kpg) as MISS               -> SAME
         #   layer 7: same klog, DIFFERENT kpg              -> READ-PAGE misaligned
@@ -1650,33 +1695,57 @@ def _selftest():
         out = buf.getvalue()
 
         # --- no-[CMPIDX] fallback: split [IDXIN] purely from its own stream ---
-        # B1: same knorm (RoPE-invariant) + differing klog -> ROPE-PHASE.
+        # B1: same knorm on the SHARED block (shift 0) + differing klog
+        #     -> ROPE-PHASE.
         nocmp_rope = [
             _idxin(5, 17523, "aaaa", kpg_a, knorm="1.0:100:64", shift=0),
             _idxin(7, 17523, "bbbb", kpg_a, knorm="1.0:100:64", shift=0),
-            _idxin(5, 1139, "cccc", kpg_a, knorm="1.0:100:64", shift=4096),
-            _idxin(7, 1139, "dddd", kpg_a, knorm="1.0:100:64", shift=4096),
+            _idxin(5, 1139, "cccc", kpg_a, knorm="1.0:100:64", shift=0),
+            _idxin(7, 1139, "dddd", kpg_a, knorm="1.0:100:64", shift=0),
         ]
-        # B2: differing knorm (rel=0.5 > tol=0.05) -> CONTENT/WINDOW.
+        # B2: shared block (shift 0) knorm differs (rel=0.5 > tol=0.05)
+        #     -> CONTENT/WINDOW.
         nocmp_content = [
             _idxin(5, 17523, "aaaa", kpg_a, knorm="1.0:100:64", shift=0),
-            _idxin(5, 1139, "aaaa", kpg_a, knorm="2.0:100:64", shift=4096),
+            _idxin(5, 1139, "aaaa", kpg_a, knorm="2.0:100:64", shift=0),
         ]
-        # C1: a same-slq HIT EXISTS (knorm ~equal, 198.935 vs 199.0) -> must pair
-        #     the MISS with THAT HIT and print ROPE-PHASE -- NOT with the first,
-        #     short-slq HITs (knorm 6.7/12.7) which would fake CONTENT/WINDOW.
+        # C1: a same-slq HIT EXISTS (knorm ~equal, 198.935 vs 199.0 on the SAME
+        #     shared block) -> must pair the MISS with THAT HIT and print
+        #     ROPE-PHASE -- NOT with the first, short-slq HITs (knorm 6.7/12.7)
+        #     which would fake CONTENT/WINDOW.
         same_slq = [
             _idxin(5, 17523, "aaaa", kpg_a, knorm="198.935:100:64", shift=0),
             _idxin(5, 10, "xx", kpg_a, knorm="6.71568:100:64", shift=1, slk=10),
             _idxin(5, 12, "yy", kpg_a, knorm="12.7265:100:64", shift=1, slk=12),
             _idxin(5, 17523, "bbbb", kpg_a, knorm="199.0:100:64",
-                   shift=4380, slk=17523),
+                   shift=0, slk=17523),
         ]
-        # C2: NO same-slq HIT -> fall back to all HITs AND SAY SO; knorm equal
-        #     -> still ROPE-PHASE (the fallback is stated, not silent).
+        # C2: NO same-slq HIT -> fall back to all HITs AND SAY SO; shared block
+        #     knorm equal -> still ROPE-PHASE (the fallback is stated).
         no_same_slq = [
             _idxin(5, 17523, "aaaa", kpg_a, knorm="198.935:100:64", shift=0),
-            _idxin(5, 10, "xx", kpg_a, knorm="198.935:100:64", shift=1, slk=10),
+            _idxin(5, 10, "xx", kpg_a, knorm="198.935:100:64", shift=0, slk=10),
+        ]
+        # E1: per-BLOCK knorm.  Shared shifts {0,1,2} are EQUAL; the MISS also
+        #     carries an extra block (shift 3, 150.0) that the HIT lacks -> the
+        #     extra block must NOT be judged => ROPE-PHASE (a whole-request
+        #     value-SET compare would count 150.0 and fake CONTENT/WINDOW).
+        per_shift_rope = [
+            _idxin(2, 17523, "aaaa", kpg_a, knorm="12.73:1:64", shift=0),
+            _idxin(3, 17523, "aaaa", kpg_a, knorm="197.7:1:64", shift=1),
+            _idxin(4, 17523, "aaaa", kpg_a, knorm="199.0:1:64", shift=2),
+            _idxin(5, 17523, "aaaa", kpg_a, knorm="150.0:1:64", shift=3),
+            _idxin(2, 17523, "bbbb", kpg_a, knorm="12.73:1:64", shift=0),
+            _idxin(3, 17523, "bbbb", kpg_a, knorm="197.7:1:64", shift=1),
+            _idxin(4, 17523, "bbbb", kpg_a, knorm="199.0:1:64", shift=2),
+        ]
+        # E2: per-BLOCK knorm.  A SHARED shift (1) DIFFERS (197.7 vs 250.0)
+        #     -> CONTENT/WINDOW.
+        per_shift_content = [
+            _idxin(2, 17523, "aaaa", kpg_a, knorm="12.73:1:64", shift=0),
+            _idxin(3, 17523, "aaaa", kpg_a, knorm="197.7:1:64", shift=1),
+            _idxin(2, 17523, "bbbb", kpg_a, knorm="12.73:1:64", shift=0),
+            _idxin(3, 17523, "bbbb", kpg_a, knorm="250.0:1:64", shift=1),
         ]
         # D1: /v1/chat/completions HTTP boundaries -- the STRONGEST split signal.
         #     The 5th request is the HIT (same slq=17523 as the 4th=MISS); the
@@ -1695,7 +1764,7 @@ def _selftest():
             _idxin(5, 17523, "aaaa", kpg_a, knorm="198.935:100:64", shift=0),
             CHAT,  # request 5: HIT (same slq) -> the one to compare against
             _idxin(5, 17523, "bbbb", kpg_a, knorm="199.0:100:64",
-                   shift=4380, slk=17523),
+                   shift=0, slk=17523),
         ]
 
         def _run_nocmp(src_lines):
@@ -1722,6 +1791,8 @@ def _selftest():
         c1_rows, c1_out = _run_nocmp(same_slq)
         c2_rows, c2_out = _run_nocmp(no_same_slq)
         d1_rows, d1_out = _run_nocmp(chat_split)
+        e1_rows, e1_out = _run_nocmp(per_shift_rope)
+        e2_rows, e2_out = _run_nocmp(per_shift_content)
         b1_reqs = _idxin_requests(b1_rows)
         b2_reqs = _idxin_requests(b2_rows)
         d1_reqs = _idxin_requests(d1_rows)
@@ -1772,8 +1843,7 @@ def _selftest():
              and "hit_slq=17523" in c1_out
              and "miss_slq=17523" in c1_out),
             ("[IDXIN-ROPE] same-slq HIT -> ROPE-PHASE (fix)",
-             "miss_knorm=[198.935]" in c1_out and "hit_knorm=[199" in c1_out
-             and "=> ROPE-PHASE" in c1_out
+             "n_shared=1" in c1_out and "=> ROPE-PHASE" in c1_out
              and "=> CONTENT/WINDOW" not in c1_out),
             ("[IDXIN-ROPE] no-same-slq fallback is STATED",
              "no same-slq HIT" in c2_out),
@@ -1793,6 +1863,15 @@ def _selftest():
             ("[IDXIN-SPLIT] non-chat logs keep lastpos/stream source",
              _idxin_split_source(idxin) == "lastpos"
              and _idxin_split_source(b1_rows) == "stream"),
+            ("[IDXIN-ROPE] per-block: extra MISS block NOT judged -> ROPE-PHASE",
+             "n_shared=3" in e1_out and "n_miss_only=1" in e1_out
+             and "n_hit_only=0" in e1_out
+             and "=> ROPE-PHASE" in e1_out
+             and "=> CONTENT/WINDOW" not in e1_out),
+            ("[IDXIN-ROPE] per-block: shared block differs -> CONTENT/WINDOW",
+             "n_shared=2" in e2_out and "=> CONTENT/WINDOW" in e2_out),
+            ("[IDXIN-ROPE] per-block offending block printed",
+             "differing shared blocks" in e2_out and "shift=1:" in e2_out),
             ("[IDXIN-ROPE] per-request knorm+ropephase printed",
              "knorm[" in b1_out and "ropephase[" in b1_out),
         ]
