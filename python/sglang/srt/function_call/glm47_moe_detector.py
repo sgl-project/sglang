@@ -523,15 +523,18 @@ class Glm47MoeDetector(BaseFormatDetector):
                             # verbatim; anything else ("1, 2", "True") is held and
                             # parsed at value close, as non-streaming does.
                             if content:
-                                self._current_value += content
                                 self._xml_tag_buffer = ""
                                 if self._value_started:
+                                    # Emitted content is not read at value close.
                                     json_output += content
-                                elif self._current_value.lstrip()[
-                                    :1
-                                ] == _JSON_OPENERS.get(value_type):
-                                    self._value_started = True
-                                    json_output += self._current_value
+                                else:
+                                    self._current_value += content
+                                    if self._current_value.lstrip()[
+                                        :1
+                                    ] == _JSON_OPENERS.get(value_type):
+                                        self._value_started = True
+                                        json_output += self._current_value
+                                        self._current_value = ""
 
         return json_output
 
