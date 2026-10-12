@@ -1,7 +1,7 @@
 ---
 title: "Bench Serving Guide"
 metatags:
-    description: "SGLang bench_serving: benchmark throughput, TTFT, ITL with random/sharegpt/image datasets. Multi-backend support."
+    description: "SGLang bench_serving: benchmark throughput, TTFT, ITL with random/sharegpt/image/audio datasets. Multi-backend support."
 ---
 This guide explains how to benchmark online serving throughput and latency using `python -m sglang.bench_serving`. It supports multiple inference backends via OpenAI-compatible and native endpoints, and produces both console metrics and optional JSONL outputs.
 
@@ -96,6 +96,7 @@ Select with `--dataset-name`:
 - `random`: random text lengths; sampled from ShareGPT token space
 - `random-ids`: random token ids (can lead to gibberish)
 - `image`: generates images and wraps them in chat messages; supports custom resolutions, multiple formats, and different content types
+- `audio`: generates synthetic audio clips and sends them with a text prompt through `sglang-oai-chat`
 - `generated-shared-prefix`: synthetic dataset with shared long system prompts and short questions
 - `mmmu`: samples from MMMU (Math split) and includes images
 - `speed-bench`: [SPEED-Bench](https://huggingface.co/datasets/nvidia/SPEED-Bench) (**SPEculative Evaluation Dataset**) — a unified benchmark for evaluating [Speculative Decoding (SD)](https://arxiv.org/abs/2604.09557) algorithms. Uses the Throughput split, which provides fixed-length input sequences (1K–32K tokens) grouped into three output-entropy categories (`low_entropy`, `mixed`, `high_entropy`). Requires a pre-downloaded JSONL file passed via `--dataset-path`.
@@ -139,6 +140,36 @@ SPEED-Bench flags (for `speed-bench`):
 - `--dataset-path PATH`: path to the pre-downloaded SPEED-Bench Throughput JSONL (e.g., `throughput_1k.jsonl`). Use the [SPEED-Bench measurement framework](https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/specdec_bench) to generate it.
 - `--speed-bench-category`: filter to one entropy category: `low_entropy`, `mixed`, or `high_entropy` (default: all)
 - `--speed-bench-output-len`: fixed number of output tokens per request (default: 512)
+
+### Audio input benchmark
+
+Use `--dataset-name audio` to measure serving latency and throughput with synthetic audio. The client generates seeded mono, 16-bit PCM WAV clips at 16 kHz and sends them as `input_audio` content alongside text. It does not download an audio dataset or measure transcription accuracy.
+
+Run the client on CPU against an already-running SGLang server whose model accepts audio through `/v1/chat/completions`. The example uses the Hugging Face model ID `Qwen/Qwen2-Audio-7B-Instruct`; set `--model` to your server's model ID and adjust the URL as needed. The command does not change the server's GPU platform or parallelism. Authentication uses `OPENAI_API_KEY` if your endpoint requires it.
+
+```bash Command
+python3 -m sglang.benchmark.serving \
+    --backend sglang-oai-chat \
+    --base-url http://127.0.0.1:30000 \
+    --model Qwen/Qwen2-Audio-7B-Instruct \
+    --dataset-name audio \
+    --num-prompts 20 \
+    --max-concurrency 4 \
+    --audio-duration 1 \
+    --audio-count 1 \
+    --random-output-len 32 \
+    --seed 1
+```
+
+- `--audio-duration`: positive, finite duration in seconds per clip (default: `1`), with at least one sample at 16 kHz.
+- `--audio-count`: nonnegative number of clips per request (default: `1`). Use `0` for a text-only control.
+- `--random-audio-count`: sample the clip count independently for each request from `1` through `--audio-count`, inclusive. A count of `0` remains `0`.
+- `--random-output-len`: requested output-token budget per request.
+- `--seed`: reproduce the generated audio and sampled clip counts.
+
+Audio input requires `--backend sglang-oai-chat` and cannot be combined with `--tokenize-prompt`. Streaming requests include usage statistics; overriding `stream_options.include_usage` to `false` is rejected. Input-token counts come from the server's `usage.prompt_tokens`, since a text tokenizer cannot determine audio-token counts. The report omits the text/vision token split for this dataset.
+
+The report also includes total submitted audio seconds and submitted audio seconds per second of benchmark time, counting only successful measured requests and excluding warmup and failures. JSON output records these as `total_submitted_audio_seconds` and `submitted_audio_seconds_per_second`. They describe the submitted clips, not the duration actually processed by the model: an audio processor can pad or truncate clips. Use real speech and a separate accuracy evaluation when measuring ASR quality.
 
 ### Examples
 
@@ -232,10 +263,10 @@ The script will add `Authorization: Bearer $OPENAI_API_KEY` automatically for Op
 Printed after each run:
 
 - Request throughput (req/s)
-- Input token throughput (tok/s) - includes both text and vision tokens
+- Input token throughput (tok/s) - includes text and modality tokens; audio uses the server's reported prompt-token count
 - Output token throughput (tok/s)
-- Total token throughput (tok/s) - includes both text and vision tokens
-- Total input text tokens and Total input vision tokens - per-modality breakdown
+- Total token throughput (tok/s) - includes text and modality tokens
+- Total input text tokens and Total input vision tokens - per-modality breakdown, omitted for the audio dataset
 - Concurrency: aggregate time of all requests divided by wall time
 - End-to-End Latency (ms): mean/median/std/p99 per-request total latency
 - Time to First Token (TTFT, ms): mean/median/std/p99 for streaming mode

@@ -41,6 +41,7 @@ from tqdm.asyncio import tqdm
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from sglang.benchmark.datasets import DatasetRow, get_dataset
+from sglang.benchmark.datasets.audio import AudioDataset
 from sglang.benchmark.datasets.mooncake import get_mooncake_request_over_time
 from sglang.benchmark.utils import (
     get_tokenizer,
@@ -53,7 +54,7 @@ from sglang.srt.utils.network import resolve_base_url, resolve_host_port
 
 _ROUTING_KEY_HEADER = "X-SMG-Routing-Key"
 
-_EMBEDDING_UNSUPPORTED_DATASETS = {"image", "mmmu", "mooncake"}
+_EMBEDDING_UNSUPPORTED_DATASETS = {"image", "mmmu", "mooncake", "audio"}
 
 TERM_PLOTLIB_AVAILABLE = (importlib.util.find_spec("termplotlib") is not None) and (
     shutil.which("gnuplot") is not None
@@ -93,6 +94,7 @@ class RequestFuncInput:
     extra_request_body: Dict[str, Any]
     timestamp: Optional[float] = None
     routing_key: Optional[str] = None
+    prompt_len_from_usage: bool = False
 
 
 @dataclass
@@ -399,6 +401,15 @@ async def async_request_openai_completions(
     return output
 
 
+def _require_prompt_tokens(usage):
+    tokens = usage.get("prompt_tokens") if isinstance(usage, dict) else None
+    if type(tokens) is not int or tokens < 0:
+        raise ValueError(
+            "Audio benchmark requires a nonnegative integer usage.prompt_tokens"
+        )
+    return tokens
+
+
 async def async_request_openai_chat_completions(
     request_func_input: RequestFuncInput,
     pbar: Optional[tqdm] = None,
@@ -406,7 +417,7 @@ async def async_request_openai_chat_completions(
     """Makes a request to the OpenAI Chat Completions API.
 
     Handles both streaming and non-streaming responses, including support
-    for image data in messages. Calculates and returns various performance
+    for multimodal data in messages. Calculates and returns various performance
     metrics.
 
     Args:
@@ -492,7 +503,16 @@ async def async_request_openai_chat_completions(
         st = time.perf_counter()
         output.start_time = st
         most_recent_timestamp = st
+        prompt_usage_received = False
         try:
+            if request_func_input.prompt_len_from_usage and payload["stream"]:
+                stream_options = dict(payload.get("stream_options") or {})
+                if stream_options.get("include_usage", True) is not True:
+                    raise ValueError(
+                        "The audio benchmark requires stream_options.include_usage=true"
+                    )
+                stream_options["include_usage"] = True
+                payload["stream_options"] = stream_options
             async with session.post(
                 url=api_url, json=payload, headers=headers
             ) as response:
@@ -500,6 +520,10 @@ async def async_request_openai_chat_completions(
                     if args.disable_stream:
                         # Non-streaming response
                         response_json = await response.json()
+                        if request_func_input.prompt_len_from_usage:
+                            output.prompt_len = _require_prompt_tokens(
+                                response_json.get("usage")
+                            )
                         message = response_json["choices"][0]["message"]
                         output.generated_text = _combine_openai_chat_content(message)
                         output.success = True
@@ -539,6 +563,14 @@ async def async_request_openai_chat_completions(
                                 pass
                             else:
                                 data = json.loads(chunk)
+                                if (
+                                    request_func_input.prompt_len_from_usage
+                                    and data.get("usage") is not None
+                                ):
+                                    output.prompt_len = _require_prompt_tokens(
+                                        data["usage"]
+                                    )
+                                    prompt_usage_received = True
                                 # Check for usage info in final chunks. OpenAI-compatible
                                 # servers may emit usage-only chunks with choices=[].
                                 output_len = (data.get("usage") or {}).get(
@@ -575,6 +607,13 @@ async def async_request_openai_chat_completions(
                                     most_recent_timestamp = timestamp
                                     generated_text += content
 
+                        if (
+                            request_func_input.prompt_len_from_usage
+                            and not prompt_usage_received
+                        ):
+                            raise ValueError(
+                                "Audio benchmark response is missing usage.prompt_tokens"
+                            )
                         output.generated_text = generated_text
                         output.success = True
                         output.latency = latency
@@ -1159,9 +1198,13 @@ def calculate_metrics(
             )
             retokenized_output_lens.append(retokenized_output_len)
             if input_requests is not None:
-                total_input += input_requests[i].prompt_len
-                total_input_text += input_requests[i].text_prompt_len
-                total_input_vision += input_requests[i].vision_prompt_len
+                request = input_requests[i]
+                if request.prompt_len_from_usage:
+                    total_input += outputs[i].prompt_len
+                else:
+                    total_input += request.prompt_len
+                    total_input_text += request.text_prompt_len
+                    total_input_vision += request.vision_prompt_len
             if output_len > 1:
                 tpots.append((outputs[i].latency - outputs[i].ttft) / (output_len - 1))
             if use_retokenized_itl:
@@ -1476,6 +1519,7 @@ async def benchmark(
         lora_name=lora_name,
         image_data=test_request.image_data,
         extra_request_body=extra_request_body,
+        prompt_len_from_usage=test_request.prompt_len_from_usage,
     )
 
     # Run warmup requests
@@ -1603,6 +1647,7 @@ async def benchmark(
             extra_request_body=merged_extra_body,
             timestamp=request.timestamp,
             routing_key=request.routing_key,
+            prompt_len_from_usage=request.prompt_len_from_usage,
         )
 
         tasks.append(
@@ -1683,7 +1728,29 @@ async def benchmark(
     print("{:<40} {:<10}".format("Successful requests:", metrics.completed))
     print("{:<40} {:<10.2f}".format("Benchmark duration (s):", benchmark_duration))
     print("{:<40} {:<10}".format("Total input tokens:", metrics.total_input))
-    print("{:<40} {:<10}".format("Total input text tokens:", metrics.total_input_text))
+    if args.dataset_name == "audio":
+        # Duration submitted for successful measured requests. It is not the
+        # model's processed duration (processors may pad or truncate audio).
+        submitted_audio_seconds = sum(
+            request.audio_duration
+            for request, output in zip(input_requests, outputs)
+            if output.success
+        )
+        audio_seconds_per_second = submitted_audio_seconds / benchmark_duration
+        print(
+            "{:<40} {:<10.2f}".format(
+                "Submitted audio (successful reqs, s):", submitted_audio_seconds
+            )
+        )
+        print(
+            "{:<40} {:<10.2f}".format(
+                "Submitted audio throughput (s/s):", audio_seconds_per_second
+            )
+        )
+    else:
+        print(
+            "{:<40} {:<10}".format("Total input text tokens:", metrics.total_input_text)
+        )
     if args.dataset_name in ["image", "mmmu"]:
         print(
             "{:<40} {:<10}".format(
@@ -1893,6 +1960,19 @@ async def benchmark(
             "max_output_tokens_per_s": metrics.max_output_tokens_per_s,
             "max_concurrent_requests": metrics.max_concurrent_requests,
         }
+
+        if args.dataset_name == "audio":
+            result.update(
+                audio_duration=args.audio_duration,
+                audio_count=args.audio_count,
+                random_audio_count=args.random_audio_count,
+                seed=args.seed,
+                input_token_source="server_usage",
+                total_submitted_audio_seconds=submitted_audio_seconds,
+                submitted_audio_seconds_per_second=audio_seconds_per_second,
+                total_input_text_tokens=None,
+                total_input_vision_tokens=None,
+            )
 
         if args.cache_report:
             result["cache_report"] = {
@@ -2294,6 +2374,7 @@ def cli_main():
             "generated-shared-prefix",
             "mmmu",
             "image",
+            "audio",
             "mooncake",
             "longbench_v2",
             "speed-bench",
@@ -2374,7 +2455,7 @@ def cli_main():
         "--random-output-len",
         default=1024,
         type=int,
-        help="Number of output tokens per request, used only for random and image dataset.",
+        help="Number of output tokens per request, used only for random, image and audio datasets.",
     )
     parser.add_argument(
         "--random-range-ratio",
@@ -2382,6 +2463,24 @@ def cli_main():
         default=0.0,
         help="Range of sampled ratio of input/output length, "
         "used only for random and image dataset.",
+    )
+    # audio dataset args
+    parser.add_argument(
+        "--audio-duration",
+        type=_finite_positive_float,
+        default=1.0,
+        help="Seconds per synthetic 16 kHz WAV clip (audio dataset only).",
+    )
+    parser.add_argument(
+        "--audio-count",
+        type=int,
+        default=1,
+        help="Audio clips per request; 0 produces text-only controls (audio dataset only).",
+    )
+    parser.add_argument(
+        "--random-audio-count",
+        action="store_true",
+        help="Sample 1 to --audio-count clips per request; 0 stays text-only.",
     )
     # image dataset args
     parser.add_argument(
@@ -2799,6 +2898,11 @@ def cli_main():
         help="Custom HTTP headers in Key=Value format. Example: --header MyHeader=MY_VALUE MyAnotherHeader=myanothervalue",
     )
     args = parser.parse_args()
+    if args.dataset_name == "audio":
+        try:
+            AudioDataset.from_args(args)
+        except ValueError as error:
+            parser.error(str(error))
     _validate_parsed_gsp_args(parser, args)
     run_benchmark(args)
 
