@@ -203,7 +203,7 @@ class DisaggCluster:
         log = _LOG_DIR / f"disagg_{self.name}_server.log"
         self._logs["server"] = log
         # Role processes register their transfer work_endpoint with the
-        # derived value ``tcp://0.0.0.0:<port>`` (see disagg_args.py). The
+        # derived value ``tcp://0.0.0.0:<port>`` (see server_args/disagg.py). The
         # server head must advertise the same literal so ``_handle_register``'s
         # endpoint_to_idx exact-string match succeeds.
         cmd = [

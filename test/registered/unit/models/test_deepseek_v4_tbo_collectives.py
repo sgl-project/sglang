@@ -6,7 +6,7 @@ from unittest.mock import Mock, patch
 import torch
 
 from sglang.srt.batch_overlap.operations import _StateDict
-from sglang.srt.batch_overlap.two_batch_overlap import _model_forward_tbo_merge_outputs
+from sglang.srt.batch_overlap.two_batch_overlap import _model_forward_tbo_merge_key
 from sglang.srt.layers.dp_attention import DpPaddingMode
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.models import deepseek_v4
@@ -152,12 +152,13 @@ class TestDeepseekV4TboMerge(unittest.TestCase):
             outputs.append(
                 deepseek_v4.DeepseekV4DecoderLayer.op_mhc_postprocess(layer, state)
             )
-        hidden, stream = _model_forward_tbo_merge_outputs(*outputs, original_len=3)
+        hidden = _model_forward_tbo_merge_key(
+            *outputs, name="hidden_states", original_len=3
+        )
         torch.testing.assert_close(hidden, torch.cat((chunks[0][:2], chunks[1][:1])))
-        self.assertIsNone(stream.pending)
-        exported, residual = stream.export(hidden)
-        self.assertIs(exported, hidden)
-        self.assertIsNone(residual)
+        self.assertIsNone(
+            _model_forward_tbo_merge_key(*outputs, name="residual", original_len=3)
+        )
 
 
 if __name__ == "__main__":

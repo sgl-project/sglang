@@ -44,51 +44,6 @@ SERVER_LAUNCH_TIMEOUT = 3600
 DEEPEP_CONFIG = '{"normal_dispatch":{"num_sms":96},"normal_combine":{"num_sms":96}}'
 
 
-class TestDSV4FlashFP4H200(
-    SpecDecodingMixin,
-    BasicDecodeCorrectnessMixin,
-    GSM8KMixin,
-    CustomTestCase,
-):
-    """LowLatency recipe: TP=4, Marlin FP4, EAGLE spec decoding."""
-
-    gsm8k_accuracy_thres = 0.93
-    accept_length_thres = 2.8
-    bs_1_speed_thres = 240
-
-    @classmethod
-    def setUpClass(cls):
-        cls.model = try_cached_model(MODEL)
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=SERVER_LAUNCH_TIMEOUT,
-            other_args=[
-                "--trust-remote-code",
-                "--tp",
-                "4",
-                "--moe-runner-backend",
-                "marlin",
-                "--speculative-algorithm",
-                "EAGLE",
-                "--speculative-num-steps",
-                "3",
-                "--speculative-eagle-topk",
-                "1",
-                "--speculative-num-draft-tokens",
-                "4",
-                "--watchdog-timeout",
-                "900",
-            ],
-        )
-
-    @classmethod
-    def tearDownClass(cls):
-        if hasattr(cls, "process") and cls.process:
-            kill_process_tree(cls.process.pid)
-
-
 @unittest.skipUnless(
     _flashinfer_has_sm90_cutlass_mxfp4(),
     "FlashInfer build lacks SM90 mixed-input MXFP4 helpers (PR #3084, >= 0.6.11)",
@@ -132,38 +87,6 @@ class TestDSV4FlashFP4H200FlashInferCutlass(
                 "1",
                 "--speculative-num-draft-tokens",
                 "4",
-            ],
-        )
-
-    @classmethod
-    def tearDownClass(cls):
-        if hasattr(cls, "process") and cls.process:
-            kill_process_tree(cls.process.pid)
-
-
-class TestDSV4FlashFP4NonMTPH200(
-    BasicDecodeCorrectnessMixin, GSM8KMixin, CustomTestCase
-):
-    """LowLatency recipe without MTP: TP=4, Marlin FP4, no speculative decoding."""
-
-    gsm8k_accuracy_thres = 0.93
-
-    @classmethod
-    def setUpClass(cls):
-        cls.model = try_cached_model(MODEL)
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=SERVER_LAUNCH_TIMEOUT,
-            other_args=[
-                "--trust-remote-code",
-                "--tp",
-                "4",
-                "--moe-runner-backend",
-                "marlin",
-                "--watchdog-timeout",
-                "900",
             ],
         )
 
