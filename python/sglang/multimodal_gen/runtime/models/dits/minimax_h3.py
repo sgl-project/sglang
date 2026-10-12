@@ -1369,7 +1369,11 @@ class MiniMaxH3Attention(nn.Module):
             gate_flat, _ = self.to_gate_compress(x)
             gate_compress = gate_flat.view(total, self.num_heads, self.head_dim)
 
-        out = self.attend(
+        # The fused qk-norm/RoPE, pipelined Ulysses exchange and attention kernels
+        # are untraceable, and the traceable fallback is slower than eager, so a
+        # compiled DiT runs this section eager and compiles around it.
+        attend = self._attend_eager if torch.compiler.is_compiling() else self._attend
+        out = attend(
             qkv,
             rope_cache=rope_cache,
             cu_seqlens=cu_seqlens,
@@ -1394,7 +1398,7 @@ class MiniMaxH3Attention(nn.Module):
             v.view(total, self.num_heads, self.head_dim),
         )
 
-    def attend(
+    def _attend(
         self,
         qkv: torch.Tensor,
         *,
@@ -1424,7 +1428,7 @@ class MiniMaxH3Attention(nn.Module):
             )
         else:
             cos_sin_cache, positions = rope_cache
-            if self._use_fused_qknorm_rope and not torch.compiler.is_compiling():
+            if self._use_fused_qknorm_rope:
                 if ulysses_active and not ring_active:
                     out = _minimax_h3_qknorm_rope_pipelined_attention(
                         self,
@@ -1437,10 +1441,7 @@ class MiniMaxH3Attention(nn.Module):
                         max_seqlen=max_seqlen,
                     )
                     if out is not None:
-                        out, _ = self.out_proj(
-                            out.reshape(total, self.num_heads * self.head_dim)
-                        )
-                        return out
+                        return out.reshape(total, self.num_heads * self.head_dim)
                 fused_inplace_qknorm_rope(
                     q,
                     k,
@@ -1483,6 +1484,8 @@ class MiniMaxH3Attention(nn.Module):
             gate_compress=gate_compress,
         )
         return out.reshape(total, self.num_heads * self.head_dim)
+
+    _attend_eager = torch.compiler.disable(_attend)
 
 
 class MiniMaxH3MLP(nn.Module):
@@ -1906,7 +1909,7 @@ class MiniMaxH3DiTBlock(nn.Module):
         qkv = x.new_empty((whole * chunks, qkv_proj.output_size_per_partition))
         for span, pending in zip(rows, gathered):
             prequantized_linear(qkv_proj, pending.result(), out=qkv[span])
-        attended = self.attn.attend(
+        attended = self.attn._attend(
             qkv,
             rope_cache=rope_cache,
             cu_seqlens=cu_seqlens,

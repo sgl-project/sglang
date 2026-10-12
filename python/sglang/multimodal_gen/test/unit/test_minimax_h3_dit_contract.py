@@ -850,3 +850,74 @@ def test_cuda_ulysses_qkv_pack_is_bit_exact():
 
     actual = pack_qkv_destination_major(q.contiguous(), k.contiguous(), v, world_size)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("compiling", [False, True])
+def test_compiled_attention_runs_its_fused_section_eager(compiling):
+    _ensure_single_process_parallel_runtime()
+    arch = MiniMaxH3DiTArchConfig()
+    with torch.device("meta"):
+        attention = MiniMaxH3Attention(arch, None, prefix="blocks.0.attn")
+    tokens = 4
+    out = torch.empty(tokens, attention.local_inner_dim, device="meta")
+
+    with (
+        patch.object(torch.compiler, "is_compiling", return_value=compiling),
+        patch.object(MiniMaxH3Attention, "_attend", return_value=out) as attend,
+        patch.object(
+            MiniMaxH3Attention, "_attend_eager", return_value=out
+        ) as attend_eager,
+    ):
+        result = attention(
+            torch.empty(tokens, arch.hidden_size, device="meta"),
+            rope_cache=None,
+            cu_seqlens=torch.empty(2, dtype=torch.int32, device="meta"),
+            max_seqlen=tokens,
+        )
+
+    assert result.shape == (tokens, arch.hidden_size)
+    assert (attend_eager if compiling else attend).call_count == 1
+    assert (attend if compiling else attend_eager).call_count == 0
+
+
+def test_eager_attention_section_is_hidden_from_dynamo():
+    assert MiniMaxH3Attention._attend_eager._torchdynamo_disable
+
+
+def test_pipelined_ulysses_attention_projects_its_output_once():
+    _ensure_single_process_parallel_runtime()
+    arch = MiniMaxH3DiTArchConfig()
+    with torch.device("meta"):
+        attention = MiniMaxH3Attention(arch, None, prefix="blocks.0.attn")
+    attention._use_fused_qknorm_rope = True
+    tokens = 4
+    attended = torch.empty(
+        tokens, attention.num_heads, attention.head_dim, device="meta"
+    )
+    projected = torch.empty(tokens, arch.hidden_size, device="meta")
+
+    with (
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.minimax_h3."
+            "_minimax_h3_qknorm_rope_pipelined_attention",
+            return_value=attended,
+        ) as pipeline,
+        patch.object(
+            attention.out_proj, "forward", return_value=(projected, None)
+        ) as project,
+    ):
+        result = attention(
+            torch.empty(tokens, arch.hidden_size, device="meta"),
+            rope_cache=(
+                torch.empty(tokens, attention.head_dim, device="meta"),
+                torch.arange(tokens),
+            ),
+            cu_seqlens=torch.empty(2, dtype=torch.int32, device="meta"),
+            max_seqlen=tokens,
+            ulysses_active=True,
+        )
+
+    pipeline.assert_called_once()
+    project.assert_called_once()
+    assert project.call_args.args[0].shape == (tokens, attention.local_inner_dim)
+    assert result is projected

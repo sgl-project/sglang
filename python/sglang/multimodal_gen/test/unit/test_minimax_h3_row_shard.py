@@ -202,7 +202,7 @@ def _two_gpu_worker(
                 arch, quant_config, prefix="blocks.0", use_adaln_cache=True
             )
         _fill_block_fp8(block, rank=rank)
-        block.attn.attend = _row_mixing_attention(block.attn.local_inner_dim)
+        block.attn._attend = _row_mixing_attention(block.attn.local_inner_dim)
         if fused_norm_modulate:
             from sglang.kernels.ops.diffusion import mount_minimax_h3_norm_modulate
 
