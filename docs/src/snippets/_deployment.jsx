@@ -41,7 +41,9 @@
 //                      command rendering. Shape:
 //                      {defaultSelection, resource: {limits, verifiedRecipes,
 //                      autoTopology(sel), validateTopology(sel)},
-//                      resolveDeployment(sel)}. The resolver returns a cell plus
+//                      resolveDeployment(sel)}. Recipes may use verifiedWhen(sel)
+//                      to qualify the recommendation badge by checkpoint or mode.
+//                      The resolver returns a cell plus
 //                      `builder` metadata (topologySummary, errors, warnings,
 //                      verification, resolvedSettings). UI-only scope/expand and
 //                      local head-address/rank state never enter the URL hash.
@@ -98,6 +100,9 @@
 //                      defaults to both, in that order
 //   showPlaygroundLink optional — false hides the "Open the Playground" footer
 //                      for cookbooks that only expose the deployment matrix
+// Component props besides `config` / `benchmarks`:
+//   agenticLink        optional — heading id of the page's agentic long-context
+//                      section; adds a footer link to it under the Playground link
 //   github             optional — "Submit verified cell" issue-template overrides
 //   playgroundFeatures optional — consumed by _playground.jsx (see its header)
 //
@@ -108,7 +113,7 @@
 //     HTML tags only; factor into helper functions, not sub-components.
 //   - Import plain-data config from the MDX file, pass through as a prop.
 
-export const Deployment = ({ config, benchmarks }) => {
+export const Deployment = ({ config, benchmarks, agenticLink }) => {
   if (!config) {
     return <div style={{padding: 12, color: "#b91c1c"}}>Deployment: missing <code>config</code> prop</div>;
   }
@@ -1878,6 +1883,8 @@ export const Deployment = ({ config, benchmarks }) => {
       || sel[dim.id]
       || "—";
     const recommendedRecipe = recommendedBuilderRecipe(sel.hw);
+    const recommendedIsVerified = !!recommendedRecipe && !recommendedRecipe.unverified
+      && (typeof recommendedRecipe.verifiedWhen !== "function" || recommendedRecipe.verifiedWhen(sel));
     const recommendedInUse = !!recommendedRecipe
       && Number(sel.nodes) === recommendedRecipe.nodes
       && Number(sel.gpus_per_node) === recommendedRecipe.gpus_per_node
@@ -2001,7 +2008,7 @@ export const Deployment = ({ config, benchmarks }) => {
               {/* This is the verified operating point, not sizing advice — a
                   hardware whose validation ran on 8 GPUs is not "recommending"
                   8 over a smaller deployment. */}
-              <span>{recommendedRecipe.unverified ? "Derived recipe" : "Verified recipe"} · {sel.hw.toUpperCase()}</span>
+              <span>{recommendedIsVerified ? "Verified recipe" : "Derived recipe"} · {sel.hw.toUpperCase()}</span>
               <strong>
                 {[
                   `${recommendedRecipe.nodes * recommendedRecipe.gpus_per_node} GPUs`,
@@ -2013,10 +2020,10 @@ export const Deployment = ({ config, benchmarks }) => {
               </strong>
             </div>
             <div>
-              {renderStatus(recommendedRecipe.unverified ? "unverified" : "verified")}
+              {renderStatus(recommendedIsVerified ? "verified" : "unverified")}
               {recommendedInUse
                 ? <small>In use</small>
-                : <button type="button" className="sgd-builder-text-action" onClick={restoreRecommendedRecipe}>{recommendedRecipe.unverified ? "Use derived recipe" : "Use verified recipe"}</button>}
+                : <button type="button" className="sgd-builder-text-action" onClick={restoreRecommendedRecipe}>{recommendedIsVerified ? "Use verified recipe" : "Use derived recipe"}</button>}
             </div>
           </section>
         )}
@@ -2364,6 +2371,13 @@ export const Deployment = ({ config, benchmarks }) => {
           </div>
         </div>
 
+        {builderScope === "serve" && (
+          <p className="sgd-builder-docs-tip">
+            <strong>Tip:</strong> For more server options, see the{" "}
+            <a href="/docs/sglang-diffusion/api/cli">CLI reference</a>.
+          </p>
+        )}
+
         {modal === "env" && (
           <div style={s.modalBackdrop} onClick={() => setModal(null)}>
             <div style={s.modalBox} onClick={(event) => event.stopPropagation()}>
@@ -2533,6 +2547,44 @@ export const Deployment = ({ config, benchmarks }) => {
             }}
           >
             Open the Playground →
+          </button>
+        </div>
+      )}
+
+      {/* Agentic long-context link (opt-in per page) — same scroll-only pattern. */}
+      {agenticLink && (
+        <div
+          style={{
+            padding: "0 12px 6px",
+            fontSize: "12px",
+            color: isDark ? "#9ca3af" : "#6b7280",
+            display: "flex",
+            flexWrap: "wrap",
+            alignItems: "center",
+            gap: "2px 6px",
+          }}
+        >
+          <span>Need to serve Agentic Long-Context workloads?</span>
+          <button
+            type="button"
+            onClick={() => {
+              const el = document.getElementById(agenticLink);
+              if (el) el.scrollIntoView({ behavior: "smooth", block: "start" });
+            }}
+            style={{
+              background: "transparent",
+              border: "none",
+              padding: 0,
+              color: isDark ? "#FDBA74" : "#C2410C",
+              cursor: "pointer",
+              fontSize: "12px",
+              fontWeight: 600,
+              textDecoration: "underline",
+              textUnderlineOffset: "2px",
+              whiteSpace: "nowrap",
+            }}
+          >
+            Refer to the Agentic Long-Context section →
           </button>
         </div>
       )}
