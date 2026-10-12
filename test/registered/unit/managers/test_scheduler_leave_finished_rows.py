@@ -1,6 +1,7 @@
 """Finished running rows leave at the top of the next plan: before admission,
 and in PD decode before preallocation."""
 
+import copy
 import unittest
 from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock, Mock
@@ -34,6 +35,7 @@ class _Batch:
     def __init__(self, reqs, extend=False):
         self.reqs = list(reqs)
         self.forward_mode = SimpleNamespace(is_extend=lambda: extend)
+        self.has_prefill_rows = lambda: extend
         self.chunked_req = None
         self.is_prefill_only = False
         self.sampling_info = SimpleNamespace(penalizer_orchestrator=SimpleNamespace())
@@ -48,6 +50,11 @@ class _Batch:
 
     def merge_batch(self, other):
         self.reqs = self.reqs + other.reqs
+
+    def shallow_copy(self):
+        batch = copy.copy(self)
+        batch.reqs = self.reqs[:]
+        return batch
 
 
 class _StopLoop(Exception):
@@ -119,7 +126,7 @@ class TestLeaveBeforeAdmission(unittest.TestCase):
         )
 
         self.assertEqual(s.seen, [["b", "c", "d"]])
-        self.assertIs(plan.batch_to_run, running)
+        self.assertEqual(_rids(plan.batch_to_run), ["b", "c", "d"])
 
         # The join sees the old rows before they leave: a batch whose rows all
         # finished takes the new rows in, it is not replaced at this plan.

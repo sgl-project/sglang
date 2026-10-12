@@ -272,8 +272,8 @@ class SchedulerInvariantChecker:
         return active_leak or int8_leak, active_msg + "\n" + int8_msg
 
     def _requests_owning_rows(self) -> List[Req]:
-        # After decode running_batch IS last_batch; the loop below skips the
-        # repeats.
+        # A decode step lists the running requests again; the loop below skips
+        # the repeats.
         reqs = [
             req
             for batch in self.get_running_and_inflight_batches()

@@ -365,18 +365,20 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         self.assertIsNone(scheduler.last_batch)
 
     def test_retract_after_dp_conversion_releases_each_req_once(self):
-        """retract after DP attention converted the running batch to extend
-        (running_batch is last_batch) releases each request once."""
+        """retract after DP attention converted the decode step of the running
+        rows to extend releases each request once."""
         scheduler = self._new_scheduler()
         run_req_a = self._make_req("run-a")
         run_req_b = self._make_req("run-b")
-        converted = self._make_batch(
+        scheduler.running_batch = self._make_batch(
             scheduler,
             reqs=[run_req_a, run_req_b],
-            forward_mode=ForwardMode.EXTEND,
+            forward_mode=ForwardMode.DECODE,
             with_tensors=True,
         )
-        scheduler.running_batch = converted
+        converted = scheduler.decoding_batch.decode_step()
+        converted.forward_mode = ForwardMode.EXTEND
+        converted.num_decode_rows = 2
         scheduler.last_batch = converted
         requeue_log = self._spy_requeue(scheduler)
 

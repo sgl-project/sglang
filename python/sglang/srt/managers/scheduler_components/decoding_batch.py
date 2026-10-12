@@ -6,6 +6,10 @@ one exception: PrefillAdder's priority preemption releases and filters the rows
 object it was given in place. ``join`` and ``park_for_mix`` may replace the
 rows object; the other methods change it in place, so a reference to ``rows``
 stays valid across them.
+
+The rows are never a step. A decode step is a copy of the rows
+(``decode_step``), and the rows take back the fields its run and commit
+rebound (``absorb``) before the next plan reads them.
 """
 
 from __future__ import annotations
