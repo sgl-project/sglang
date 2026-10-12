@@ -354,7 +354,7 @@ class TreeComponent(ABC):
         the allocator's units: the value length by default, less for a
         component whose values are not backed one-to-one by pool rows. A
         component whose per-node figure changes in place reports the delta
-        through ``UnifiedTreeCore.adjust_component_ledger``."""
+        through ``UnifiedTreeCore.adjust_component_size``."""
         return self.value_len(node)
 
     def has_host_value_only(self, node: UnifiedTreeNode) -> bool:

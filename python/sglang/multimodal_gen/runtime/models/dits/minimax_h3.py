@@ -1296,6 +1296,43 @@ class MiniMaxH3Attention(nn.Module):
                 ulysses_active=ulysses_active,
                 ring_active=ring_active,
             )
+        # The fused qk-norm/RoPE, pipelined Ulysses exchange and attention kernels
+        # are untraceable, and the traceable fallback is slower than eager, so a
+        # compiled DiT runs this section eager and compiles around it.
+        attend = self._attend_eager if torch.compiler.is_compiling() else self._attend
+        out = attend(
+            x,
+            q,
+            k,
+            v,
+            rope_cache=rope_cache,
+            cu_seqlens=cu_seqlens,
+            cu_seqlens_host=cu_seqlens_host,
+            max_seqlen=max_seqlen,
+            subblock_sparse_query_block_mask=subblock_sparse_query_block_mask,
+            ulysses_active=ulysses_active,
+            ring_active=ring_active,
+        )
+        out, _ = self.out_proj(out)
+        return out
+
+    def _attend(
+        self,
+        x: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        rope_cache: tuple[torch.Tensor, torch.Tensor] | None,
+        cu_seqlens: torch.Tensor,
+        cu_seqlens_host: tuple[int, ...] | None,
+        max_seqlen: int,
+        subblock_sparse_query_block_mask: torch.Tensor | None,
+        ulysses_active: bool,
+        ring_active: bool,
+    ) -> torch.Tensor:
+        """q/k/v [T, heads, head_dim] -> attention output [T, heads * head_dim]."""
+        total = x.shape[0]
         if rope_cache is None:
             q, k = _apply_qk_norm(
                 q,
@@ -1306,7 +1343,7 @@ class MiniMaxH3Attention(nn.Module):
             )
         else:
             cos_sin_cache, positions = rope_cache
-            if self._use_fused_qknorm_rope and not torch.compiler.is_compiling():
+            if self._use_fused_qknorm_rope:
                 if ulysses_active and not ring_active:
                     out = _minimax_h3_qknorm_rope_pipelined_attention(
                         self,
@@ -1319,10 +1356,7 @@ class MiniMaxH3Attention(nn.Module):
                         max_seqlen=max_seqlen,
                     )
                     if out is not None:
-                        out, _ = self.out_proj(
-                            out.reshape(total, self.num_heads * self.head_dim)
-                        )
-                        return out
+                        return out.reshape(total, self.num_heads * self.head_dim)
                 fused_inplace_qknorm_rope(
                     q,
                     k,
@@ -1372,9 +1406,9 @@ class MiniMaxH3Attention(nn.Module):
             ring_active=ring_active,
             gate_compress=gate_compress,
         )
-        out = out.reshape(total, self.num_heads * self.head_dim)
-        out, _ = self.out_proj(out)
-        return out
+        return out.reshape(total, self.num_heads * self.head_dim)
+
+    _attend_eager = torch.compiler.disable(_attend)
 
 
 class MiniMaxH3MLP(nn.Module):

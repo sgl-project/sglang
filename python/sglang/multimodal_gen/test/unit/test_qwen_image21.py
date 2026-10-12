@@ -4,7 +4,7 @@ import json
 import sys
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import numpy as np
 import pytest
@@ -709,3 +709,10 @@ def test_packed_qkv_weight_skips_offloaded_placeholders():
     )
     attention = SimpleNamespace(to_q=projection, to_k=projection, to_v=projection)
     assert QwenImage21Attention.packed_qkv_weight(attention) is None
+
+
+def test_packed_qkv_projection_is_skipped_under_compile():
+    # Its storage-identity checks cannot be traced; compiled graphs keep the
+    # plain projections instead of breaking in every attention.
+    with patch.object(torch.compiler, "is_compiling", return_value=True):
+        assert QwenImage21Attention._project_qkv_packed(object(), None, [], []) is None
