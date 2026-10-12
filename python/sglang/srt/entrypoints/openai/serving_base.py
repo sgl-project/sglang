@@ -4,6 +4,7 @@ import json
 import logging
 import uuid
 from abc import ABC, abstractmethod
+from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
 
 import orjson
@@ -12,7 +13,11 @@ from fastapi.responses import ORJSONResponse, StreamingResponse
 
 from sglang.srt.entrypoints.openai.encoding_dsv32 import DS32EncodingError
 from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingRequest
-from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
+from sglang.srt.managers.io_struct import (
+    HTTP_ERROR_ABORT_STATUSES,
+    EmbeddingReqInput,
+    GenerateReqInput,
+)
 from sglang.srt.observability.req_time_stats import monotonic_time
 from sglang.srt.runtime_context import get_observability
 from sglang.srt.server_args import ServerArgs
@@ -21,6 +26,45 @@ if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
 logger = logging.getLogger(__name__)
+
+
+def error_abort_status(finish_reason: Optional[dict]) -> Optional[HTTPStatus]:
+    """Return the HTTP status of an abort that carries an error ``status_code``.
+
+    Returns None for any other finish, including a graceful abort without a
+    status code (e.g. ``/abort_request``), which streams as a normal finish.
+    ``status_code`` is an ``HTTPStatus`` under pickle IPC and a plain ``int``
+    under msgpack IPC, so both are accepted.
+    """
+    if not finish_reason or finish_reason.get("type") != "abort":
+        return None
+    code = finish_reason.get("status_code")
+    if code is None:
+        return None
+    try:
+        return HTTPStatus(int(code))
+    except (TypeError, ValueError):
+        return None
+
+
+def raise_pre_stream_abort(status: HTTPStatus, message: str) -> None:
+    """Raise an error abort that arrived before a stream yielded its first chunk.
+
+    Streaming handlers wait for the generator's first chunk before sending the
+    response status line. Raising here instead of yielding an in-band error
+    chunk lets an admission-time rejection (e.g. "The request queue is full.")
+    reach the client as a real HTTP error rather than an error event under
+    HTTP 200. It raises exactly when, and what,
+    ``TokenizerManager._handle_abort_finish_reason`` raises for a non-stream
+    abort, so ``handle_request`` answers both modes with the same status and
+    body. For any other status it returns, and the caller streams the error
+    in-band.
+    """
+    if status not in HTTP_ERROR_ABORT_STATUSES:
+        return
+    if status == HTTPStatus.BAD_REQUEST:
+        raise ValueError(message)
+    raise HTTPException(status_code=status.value, detail=message)
 
 
 # Base class for specific endpoint handlers

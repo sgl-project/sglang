@@ -73,6 +73,7 @@ from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchT
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.io_struct import (
+    HTTP_ERROR_ABORT_STATUSES,
     AbortReq,
     ActiveRanksOutput,
     BaseBatchReq,
@@ -1848,10 +1849,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         finish_reason = out["meta_info"]["finish_reason"]
 
         status_code = finish_reason.get("status_code")
-        if finish_reason.get("type") != "abort" or status_code not in (
-            HTTPStatus.BAD_REQUEST,
-            HTTPStatus.SERVICE_UNAVAILABLE,
-            HTTPStatus.INTERNAL_SERVER_ERROR,
+        if (
+            finish_reason.get("type") != "abort"
+            or status_code not in HTTP_ERROR_ABORT_STATUSES
         ):
             return None
 

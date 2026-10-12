@@ -803,12 +803,41 @@ class RuntimeHandle:
                     or getattr(result, "code", None)
                     or 200
                 )
-                self._safe_callback(
-                    chunk_callback,
-                    resp_bytes,
-                    finished=True,
-                    status_code=status_code,
-                )
+                if (
+                    streaming
+                    and getattr(request_obj, "stream", False)
+                    and status_code >= 400
+                ):
+                    # A stream rejected before its first chunk (bad request,
+                    # queue full) comes back as a plain error response. The
+                    # streaming RPC drops status_code, so deliver it as the
+                    # in-band {"error": ...} chunk stream clients look for.
+                    try:
+                        error = json.loads(resp_bytes)
+                    except ValueError:
+                        error = None
+                    if isinstance(error, dict) and isinstance(error.get("error"), dict):
+                        error = error["error"]
+                    if not isinstance(error, dict):
+                        error = {
+                            "message": resp_bytes.decode("utf-8", errors="replace"),
+                            "type": str(status_code),
+                            "code": status_code,
+                        }
+                    status = self._safe_callback(
+                        chunk_callback,
+                        json.dumps({"error": error}).encode("utf-8"),
+                        finished=False,
+                    )
+                    if status is not None and not self._is_closed_status(status):
+                        self._safe_callback(chunk_callback, b"", finished=True)
+                else:
+                    self._safe_callback(
+                        chunk_callback,
+                        resp_bytes,
+                        finished=True,
+                        status_code=status_code,
+                    )
 
         except Exception as e:
             logger.error("gRPC OpenAI %s error: %s", serving_key, e)
