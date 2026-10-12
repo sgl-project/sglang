@@ -454,11 +454,25 @@ def test_deterministic_mode_keeps_original_shrink_path():
         ):
             chunked_sgmv_lora_shrink_forward(inputs, weights, batch_info, 3)
             assert launches.call_count == 1
+            assert launches.call_args.kwargs["SPLIT_K"] == 8
+            chunked_sgmv_lora_shrink_forward(inputs, weights, batch_info, 3, split_k=4)
+            assert launches.call_count == 2
+            assert launches.call_args.kwargs["SPLIT_K"] == 4
+            chunked_sgmv_lora_shrink_forward(inputs, weights, batch_info, 3, split_k=1)
+            assert launches.call_count == 2
+            for deterministic in (False, True):
+                with (
+                    envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.override(deterministic),
+                    pytest.raises(ValueError, match="split_k must be positive"),
+                ):
+                    chunked_sgmv_lora_shrink_forward(
+                        inputs, weights, batch_info, 3, split_k=0
+                    )
             with envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.override(True):
                 actual = chunked_sgmv_lora_shrink_forward(
                     inputs, weights, batch_info, 3, split_k=8
                 )
-            assert launches.call_count == 1
+            assert launches.call_count == 2
     for adapter, rank in enumerate((8, 16, 32), start=1):
         rows = batch_info.permutation[2 * (adapter - 1) : 2 * adapter].long()
         assert torch.equal(actual[rows, : 3 * rank], expected[rows, : 3 * rank])

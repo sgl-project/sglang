@@ -270,8 +270,11 @@ def chunked_sgmv_lora_shrink_forward(
     weights: torch.Tensor,
     batch_info: LoRABatchInfo,
     num_slices: int,
-    split_k: int = 1,
+    split_k: int | None = None,
 ) -> torch.Tensor:
+    if split_k is not None and split_k < 1:
+        raise ValueError("split_k must be positive")
+
     # x: (s, input_dim)
     # weights: (num_lora, num_slices * r, input_dim)
     # output: (s, num_slices * r)
@@ -320,17 +323,16 @@ def chunked_sgmv_lora_shrink_forward(
     # Opt-in policy measured on H200 with BF16 rank-32 adapters. Keep other
     # shapes and deterministic inference on the original accumulation order.
     if (
-        envs.SGLANG_ENABLE_LORA_CSGMV_SPLIT_K.get()
+        split_k is None
+        and envs.SGLANG_ENABLE_LORA_CSGMV_SPLIT_K.get()
         and MAX_RANK == 32
         and K in (4096, 12288)
         and x.dtype == torch.bfloat16
         and (BLOCK_M, BLOCK_N, BLOCK_K) == (16, 16, 256)
     ):
         split_k = 16 if K == 12288 else 8
-    if envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get():
+    if split_k is None or envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get():
         split_k = 1
-    if split_k < 1:
-        raise ValueError("split_k must be positive")
 
     output = torch.empty((S, N), device=x.device, dtype=x.dtype)
     if split_k > 1:
