@@ -20,6 +20,32 @@ _is_hip = is_hip()
 _CUDA_HOST_REGISTERED_RANGES_ATTR = "_sglang_cuda_host_registered_ranges"
 
 
+def consume_pending_cuda_error() -> None:
+    """Consume a CUDA error left pending by a failed cudart call.
+
+    Such an error is raised by the next unrelated CUDA call, not by the failing
+    one; ``synchronize()`` does not clear it and a kernel launch does.
+    """
+    if not torch.cuda.is_available():
+        return
+    try:
+        cudart = torch.cuda.cudart()
+    except Exception:
+        return
+    get_last_error = getattr(cudart, "cudaGetLastError", None)
+    if get_last_error is not None:
+        try:
+            get_last_error()
+            return
+        except Exception:
+            # Fall through to the kernel launch below.
+            pass
+    try:
+        torch.zeros(1, device="cuda")
+    except Exception:
+        pass
+
+
 class HostTensorAllocator:
     def __init__(self):
         """Initialize the HostTensorAllocator."""
@@ -188,6 +214,9 @@ def _cuda_host_register(
         # original base once after several independent registrations.
         setattr(buffer, _CUDA_HOST_REGISTERED_RANGES_ATTR, registered_ranges)
     except Exception:
+        # Left pending, the error surfaces at the next unrelated CUDA call.
+        # Consume it here so the failure is reported where it happened.
+        consume_pending_cuda_error()
         remaining_ranges = _cuda_host_unregister_ranges(
             cudart, registered_ranges, operation="registration rollback"
         )
