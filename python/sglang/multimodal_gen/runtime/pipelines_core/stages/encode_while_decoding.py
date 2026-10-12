@@ -25,14 +25,15 @@ logger = init_logger(__name__)
 _STREAMED_VIDEO_QUEUE_BYTES = 256 * 1024 * 1024
 
 
-def streamed_video_output_path(
+def can_encode_while_decoding(
     batch: Req, server_args: ServerArgs, batch_size: int
-) -> str | None:
-    """Where the output rank can write the MP4 during the decode, if anywhere."""
-    if not (
+) -> bool:
+    """Rank-independent eligibility, including ranks that only decode audio/video."""
+    return (
         batch.save_output
         and batch.return_file_paths_only
         and not batch.return_raw_frames
+        and not (batch.extra or {}).get("retain_decoded_frames", False)
         and batch.data_type == DataType.VIDEO
         and not batch.enable_frame_interpolation
         and not batch.enable_upscaling
@@ -42,7 +43,14 @@ def streamed_video_output_path(
         and type(server_args.pipeline_config).post_decoding
         is PipelineConfig.post_decoding
         and current_platform.is_cuda()
-    ):
+    )
+
+
+def streamed_video_output_path(
+    batch: Req, server_args: ServerArgs, batch_size: int
+) -> str | None:
+    """Where the output rank can write the MP4 during the decode, if anywhere."""
+    if not can_encode_while_decoding(batch, server_args, batch_size):
         return None
     if model_parallel_is_initialized() and get_replica_group().rank_in_group != 0:
         return None
@@ -73,15 +81,23 @@ class EncodeWhileDecoding:
         if self._failed:
             return
         try:
-            if self._finish_frames is not None:
-                frames = self._finish_frames(frames)
-            frames = frames[0]
-            if self._encoder is None:
-                self._encoder = self._open(frames)
+            # Untiled decoders can hand over an entire clip. Bound FP32
+            # postprocessing too, not just the queued uint8 frame copies.
+            height, width = frames.shape[-2:]
+            float_frame_bytes = 3 * height * width * 4
+            chunk_frames = max(
+                1, (_STREAMED_VIDEO_QUEUE_BYTES // 4) // float_frame_bytes
+            )
+            for chunk in frames.split(chunk_frames, dim=2):
+                if self._finish_frames is not None:
+                    chunk = self._finish_frames(chunk)
+                chunk = chunk[0]
                 if self._encoder is None:
-                    self._failed = True
-                    return
-            self._encoder.write(frames)
+                    self._encoder = self._open(chunk)
+                    if self._encoder is None:
+                        self._failed = True
+                        return
+                self._encoder.write(chunk)
         except Exception:
             self._fail()
 

@@ -460,7 +460,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         )
 
         self.kv_events = KVCacheEventRecorder(
-            enabled=params.enable_kv_cache_events, page_size=self.page_size
+            enabled=params.enable_kv_cache_events,
+            page_size=self.page_size,
+            dynamo_format=params.dynamo_kv_event_format,
+            lora_names=params.kv_event_lora_names,
         )
 
         self.reset()
@@ -696,8 +699,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     @staticmethod
     def _assert_receipt_anchor(node: UnifiedTreeNode, params: DecLockRefParams) -> None:
         """A receipt releases only the node its acquire returned; a mispaired
-        node would silently release (or steal) another holder's segment."""
-        assert params.node_id is None or params.node_id == node.id, (
+        or unanchored one would silently release (or steal) another holder's segment."""
+        assert params.node_id == node.id, (
             f"lock receipt anchored on node {params.node_id} released on node {node.id}"
         )
 
