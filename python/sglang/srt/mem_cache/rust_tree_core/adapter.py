@@ -107,7 +107,7 @@ def _kv_event_from_tagged(
     """Build the Python KV cache event for one of the binding's tagged tuples.
 
     Rust hashes are LoRA-agnostic; the trailing extra_key selects the LoRA
-    namespace, applied and counted here as in KVCacheEventRecorder.
+    namespace, applied here as in KVCacheEventRecorder.
     """
     tag = event[0]
     if tag == "block_stored":
@@ -119,7 +119,6 @@ def _kv_event_from_tagged(
             if not dynamo_format and lora_name is not None
             else None
         )
-        lora_names.count_published(event[8], len(event[1]))
         parent = event[2]
         return BlockStored(
             block_hashes=[
@@ -144,7 +143,6 @@ def _kv_event_from_tagged(
             if not dynamo_format and lora_names.get(event[3]) is not None
             else None
         )
-        lora_names.count_published(event[3], -len(event[1]))
         return BlockRemoved(
             block_hashes=[
                 namespaced_block_hash(h, namespace_seed=seed) for h in event[1]
@@ -152,7 +150,6 @@ def _kv_event_from_tagged(
             medium=StorageMedium(event[2]),
         )
     if tag == "all_blocks_cleared":
-        lora_names.clear_published()
         return AllBlocksCleared()
     raise ValueError(f"unknown kv event tag: {tag}")
 
@@ -362,7 +359,6 @@ class _RustKVCacheEventRecorder:
             _kv_event_from_tagged(event, self._lora_names, self._dynamo_format)
             for event in self._binding.take_events()
         ]
-        self._lora_names.prune()
         return events
 
 

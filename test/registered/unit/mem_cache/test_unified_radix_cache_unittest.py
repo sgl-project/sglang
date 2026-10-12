@@ -1645,9 +1645,8 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
             self._event_hashes(stored),
         )
 
-    def test_lora_name_is_kept_until_published_blocks_are_removed(self):
-        """Removals hash like their stores after the request is gone; then the
-        name is forgotten, so the table does not grow without bound."""
+    def test_lora_name_survives_a_gap_before_a_delayed_store(self):
+        """Write-back can publish a store after the request and GPU blocks are gone."""
         lora_names, reqs = _lora_names(**{"uuid-a": "adapter-a"})
         cache, allocator, _ = build_fixture(
             self.cfg, enable_kv_cache_events=True, kv_event_lora_names=lora_names
@@ -1661,7 +1660,12 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         cache.evict(EvictParams(num_tokens=4))
         removed = self._removed_events(cache, StorageMedium.GPU)
         self.assertEqual(self._event_hashes(removed), self._event_hashes(stored))
-        self.assertIsNone(lora_names.get("uuid-a"))
+        self.assertEqual(lora_names.get("uuid-a"), "adapter-a")
+        # A late background store needs no new request/name registration.
+        self._insert(cache, allocator, [1, 2, 3, 4], extra_key="uuid-a")
+        delayed = self._stored_events(cache, StorageMedium.GPU)
+        self.assertEqual(delayed[0].lora_name, "adapter-a")
+        self.assertEqual(self._event_hashes(delayed), self._event_hashes(stored))
 
     def test_lora_name_survives_until_queued_stores_are_taken(self):
         """A finished request's blocks still publish under its adapter when

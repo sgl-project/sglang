@@ -20,8 +20,6 @@ it; the recorder owns the queue and needs nothing back from its owner.
 
 from __future__ import annotations
 
-import weakref
-from collections import Counter
 from typing import TYPE_CHECKING, Any, Iterable, Optional
 
 from sglang.srt.disaggregation.kv_events import (
@@ -75,33 +73,18 @@ class LoRANameTable:
             return None
         return self._names.get(extra_key[-_LORA_ID_LEN:])
 
-    def count_published(self, extra_key: Optional[str], num_blocks: int) -> None:
-        pass
-
-    def clear_published(self) -> None:
-        pass
-
-    def prune(self) -> None:
-        pass
-
 
 class KvEventLoraNames(LoRANameTable):
-    """LoRA adapter name per cache namespace (``extra_key``), for KV events.
+    """Public names of selected LoRA namespaces, kept for the publisher lifetime.
 
-    A name is kept while a request of its namespace is alive or a block
-    published under it is not yet removed, so removals hash like their stores.
-    Pruning runs only when events are taken: the Rust tree counts a block when
-    its queued event is taken, not when it is stored.
+    Write-back can publish a host store after the last GPU removal and after
+    its request dies, so request or published-block counts cannot bound this.
     """
 
     def __init__(self):
         # Adapter-id registrations keep the existing Dynamo load-time lookup.
         self._adapter_names: dict[str, str] = {}
         self._names: dict[str, str] = {}
-        self._requests: dict[str, weakref.WeakSet] = {}
-        self._published_blocks: Counter = Counter()
-        # Namespaces that may have lost their last request or block.
-        self._prune_candidates: set[str] = set()
 
     def register(
         self,
@@ -121,8 +104,6 @@ class KvEventLoraNames(LoRANameTable):
         if not lora_name:
             return
         self._names[req.extra_key] = lora_name
-        self._requests.setdefault(req.extra_key, weakref.WeakSet()).add(req)
-        self._prune_candidates.add(req.extra_key)
 
     def get(self, extra_key: Optional[str]) -> Optional[str]:
         return self._names.get(extra_key)
@@ -133,26 +114,6 @@ class KvEventLoraNames(LoRANameTable):
         return self._names.get(extra_key) or self._adapter_names.get(
             extra_key[-_LORA_ID_LEN:]
         )
-
-    def count_published(self, extra_key: Optional[str], num_blocks: int) -> None:
-        if extra_key in self._names:
-            self._published_blocks[extra_key] += num_blocks
-            if self._published_blocks[extra_key] <= 0:
-                self._prune_candidates.add(extra_key)
-
-    def clear_published(self) -> None:
-        self._published_blocks.clear()
-        self._prune_candidates.update(self._names)
-
-    def prune(self) -> None:
-        """Forget namespaces with no live request and no published block."""
-        for key in list(self._prune_candidates):
-            if self._requests[key]:
-                continue
-            self._prune_candidates.discard(key)
-            if self._published_blocks[key] <= 0:
-                del self._names[key], self._requests[key]
-                self._published_blocks.pop(key, None)
 
 
 class KVCacheEventRecorder:
@@ -308,7 +269,6 @@ class KVCacheEventRecorder:
 
             parent_block_hash = block_hash
             page_index += 1
-        self.lora_names.count_published(node.key.extra_key, page_index)
 
     def record_remove(self, node: Any, medium=None) -> None:
         # One BlockRemoved per radix node.
@@ -341,13 +301,11 @@ class KVCacheEventRecorder:
 
         if block_hashes:
             self.enqueue(BlockRemoved(block_hashes=block_hashes, medium=medium))
-            self.lora_names.count_published(node.key.extra_key, -len(block_hashes))
 
     def record_all_cleared(self) -> None:
         if not self.enabled:
             return
         self.enqueue(AllBlocksCleared())
-        self.lora_names.clear_published()
 
     def take(self) -> list:
         """Atomically takes all events and clears the queue.
@@ -355,7 +313,6 @@ class KVCacheEventRecorder:
         Returns:
             A list of KV cache events.
         """
-        self.lora_names.prune()
         if not self.enabled:
             return []
         events = self._queue
