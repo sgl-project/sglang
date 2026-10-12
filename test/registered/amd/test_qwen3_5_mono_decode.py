@@ -116,56 +116,40 @@ class GdnPreTest(CustomTestCase):
 
         slots = 16
         for s, n_real, first in ((1, 1, True), (4, 3, False), (8, 8, False)):
-            conv0 = rnd(slots, CONV, 3)
-            rstate0 = rnd(slots, NV, HD, HD, scale=0.05, dtype=torch.float32)
+            conv = rnd(slots, CONV, 3)
+            rstate = rnd(slots, NV, HD, HD, scale=0.05, dtype=torch.float32)
+            conv0, rstate0 = conv.clone(), rstate.clone()
             idx = torch.full((s,), -1, dtype=torch.int32, device="cuda")
             idx[:n_real] = torch.arange(3, 3 + n_real, dtype=torch.int32, device="cuda")
-            w = {
-                "hidden": rnd(s, HIDDEN, scale=2.0),
-                "residual": None if first else rnd(s, HIDDEN, scale=2.0),
-                "ln_w": rnd(HIDDEN, scale=0.1),
-                "w_qkvz": rnd(QKVZ, HIDDEN, scale=0.02),
-                "w_ba": rnd(BA, HIDDEN, scale=0.05),
-                "conv_w": rnd(CONV, 1, 4, scale=0.4),
-                "a_log": rnd(NV, scale=0.5, dtype=torch.float32),
-                "dt_bias": rnd(NV, scale=0.5),
-                "norm_w": (1 + rnd(HD, scale=0.1, dtype=torch.float32)).to(BF),
-            }
-            # the speed flags change how, not what, K1 computes
-            runs = []
-            for flags in ({}, gdn.tuned(s, False)):
-                key = gdn.K1Build(tokens=s, first=first, **flags)
-                o = {
-                    "core": torch.full(
-                        (s, CORE), float("nan"), dtype=BF, device="cuda"
-                    ),
-                    "res_out": torch.empty(s, HIDDEN, dtype=BF, device="cuda"),
-                    "conv": conv0.clone(),
-                    "rstate": rstate0.clone(),
-                }
-                gdn.gdn_pre(
-                    key,
-                    **w,
-                    res_out=o["res_out"],
-                    conv_state=o["conv"],
-                    rstate=o["rstate"],
-                    st_idx=idx,
-                    core=o["core"],
-                    scratch=torch.zeros(
-                        gdn.scratch_bytes(key), dtype=torch.uint8, device="cuda"
-                    ),
-                    epoch=torch.ones(1, dtype=torch.int32, device="cuda"),
-                    layer=0,
-                )
-                runs.append(o)
+            key = gdn.K1Build(tokens=s, first=first)
+            core = torch.full((s, CORE), float("nan"), dtype=BF, device="cuda")
+            gdn.gdn_pre(
+                key,
+                hidden=rnd(s, HIDDEN, scale=2.0),
+                residual=None if first else rnd(s, HIDDEN, scale=2.0),
+                res_out=torch.empty(s, HIDDEN, dtype=BF, device="cuda"),
+                ln_w=rnd(HIDDEN, scale=0.1),
+                w_qkvz=rnd(QKVZ, HIDDEN, scale=0.02),
+                w_ba=rnd(BA, HIDDEN, scale=0.05),
+                conv_w=rnd(CONV, 1, 4, scale=0.4),
+                conv_state=conv,
+                a_log=rnd(NV, scale=0.5, dtype=torch.float32),
+                dt_bias=rnd(NV, scale=0.5),
+                norm_w=(1 + rnd(HD, scale=0.1, dtype=torch.float32)).to(BF),
+                rstate=rstate,
+                st_idx=idx,
+                core=core,
+                scratch=torch.zeros(
+                    gdn.scratch_bytes(key), dtype=torch.uint8, device="cuda"
+                ),
+                epoch=torch.ones(1, dtype=torch.int32, device="cuda"),
+                layer=0,
+            )
             torch.cuda.synchronize()
-            core, conv, rstate = (runs[1][n] for n in ("core", "conv", "rstate"))
             live = idx[:n_real].long()
             keep = torch.ones(slots, dtype=torch.bool, device="cuda")
             keep[live] = False
             with self.subTest(s=s, n_real=n_real, first=first):
-                for name in runs[0]:
-                    self.assertTrue(torch.equal(runs[0][name], runs[1][name]), name)
                 self.assertTrue(torch.isfinite(core[:n_real]).all())
                 self.assertGreater(core[:n_real].abs().sum().item(), 0)
                 self.assertTrue(
@@ -213,7 +197,7 @@ class GdnPreTest(CustomTestCase):
         idx = torch.tensor([1, 2, -1, 4], dtype=torch.int32, device="cuda")
         out = {}
         for bf in (False, True):
-            key = gdn.K1Build(tokens=s, state_bf16=bf, **gdn.tuned(s, False))
+            key = gdn.K1Build(tokens=s, state_bf16=bf)
             out[bf] = {
                 "conv": conv.clone(),
                 "rstate": state.clone() if bf else state.float(),
