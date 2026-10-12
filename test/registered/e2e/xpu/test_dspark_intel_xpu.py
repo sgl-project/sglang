@@ -29,7 +29,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_xpu_ci(est_time=3000, suite="nightly-xpu-2-gpu", nightly=True)
+register_xpu_ci(est_time=3000, suite="nightly-xpu-kernel-main-2-gpu", nightly=True)
 
 
 @unittest.skipUnless(is_xpu(), "Intel XPU required")

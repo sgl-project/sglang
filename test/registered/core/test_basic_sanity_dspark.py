@@ -44,7 +44,6 @@ class _DSparkSanityMixin(
     SpecGrammarKit,
     SpecLogprobKit,
     SpecSamplingMaskKit,
-    CustomTestCase,
 ):
     """DSpark sanity coverage shared by every backend pairing. Concrete
     subclasses add CustomTestCase, set the (attention_backend,
