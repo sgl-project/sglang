@@ -322,6 +322,19 @@ def execute_prefill_cp_bcg(
             static_forward_batch,
             torch.cuda.current_stream(),
         )
+        # Match eager CP: DFlash consumes features for every prompt token, not
+        # the rank-local rows returned by the captured model body.
+        if aux_hidden_states is not None:
+            stream = torch.cuda.current_stream()
+            if torch.is_tensor(aux_hidden_states):
+                aux_hidden_states = cp_gather_after_forward(
+                    aux_hidden_states, static_forward_batch, stream
+                )
+            else:
+                aux_hidden_states = [
+                    cp_gather_after_forward(aux, static_forward_batch, stream)
+                    for aux in aux_hidden_states
+                ]
         return model.logits_processor(
             forward_batch.input_ids,
             hidden_states,

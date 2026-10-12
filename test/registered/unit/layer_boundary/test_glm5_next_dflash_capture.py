@@ -8,7 +8,9 @@ contract is a silent shape/quality bug the crash-guard alone would miss.
 """
 
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 from torch import nn
@@ -22,6 +24,47 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestGlm5NextDflashCapture(CustomTestCase):
+    def test_cp_bcg_gathers_each_aux_feature_before_draft_materialization(self):
+        from sglang.srt.layers.cp.bcg import execute_prefill_cp_bcg
+
+        # This rank owns tokens 0,4; one additional row is capture padding.
+        local = torch.tensor([[0.0], [4.0], [-1.0]])
+        auxiliary = [local + 10, local + 20]
+        global_tokens = torch.arange(8, dtype=torch.float32).view(-1, 1)
+
+        def gather(value, _batch, _stream):
+            self.assertEqual(value.shape[0], 2)
+            return global_tokens + value[0, 0]
+
+        def logits(_ids, hidden, _head, _batch, aux):
+            torch.testing.assert_close(hidden, global_tokens)
+            for actual, offset in zip(aux, (10, 20)):
+                torch.testing.assert_close(actual, global_tokens + offset)
+            return torch.cat(aux, dim=-1)
+
+        runner = SimpleNamespace(
+            prefill_cp_bcg_input=SimpleNamespace(live_local_tokens=2),
+            model_runner=SimpleNamespace(
+                model=SimpleNamespace(
+                    capture_aux_hidden_states=True,
+                    pp_group=SimpleNamespace(is_last_rank=True),
+                    logits_processor=logits,
+                    lm_head=None,
+                )
+            ),
+            backend=SimpleNamespace(replay=lambda *_a, **_kw: (local, auxiliary)),
+            _prefill_forward_context=lambda *_a, **_kw: nullcontext(),
+        )
+        batch = SimpleNamespace(input_ids=torch.arange(8))
+        with (
+            patch(
+                "sglang.srt.layers.cp.bcg.cp_gather_after_forward", side_effect=gather
+            ),
+            patch("torch.cuda.current_stream", return_value=None),
+        ):
+            actual = execute_prefill_cp_bcg(runner, batch, batch, 8, 8)
+        self.assertEqual(actual.shape, (8, 2))
+
     def test_dflash_contracts_mhc_hidden_state_without_residual(self):
         model = Glm5NextModel.__new__(Glm5NextModel)
         nn.Module.__init__(model)
