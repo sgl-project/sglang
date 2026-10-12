@@ -62,7 +62,8 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
         if cfg.kv_cache_dtype not in ("auto", "fp8_e4m3"):
             raise ValueError(
                 "--dsv4-attn-backend flashmla_mega requires "
-                "--kv-cache-dtype fp8_e4m3 for its packed KV storage"
+                "--kv-cache-dtype auto or fp8_e4m3 for byte-packed KV storage; "
+                "NVFP4 compressed KV is selected separately by its layout"
             )
         unsupported = (
             (
