@@ -123,7 +123,7 @@ def _chunked_lora_shrink_kernel(
     tl.store(output_ptr, partial_sum, mask=output_mask)
 
 
-@triton.jit(do_not_specialize=["num_segs"])
+@triton.jit(do_not_specialize=["num_segs", "TOTAL_ROWS"])
 def _chunked_lora_shrink_split_k_kernel(
     # Pointers to matrices
     x,
@@ -143,7 +143,7 @@ def _chunked_lora_shrink_split_k_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
     SPLIT_K: tl.constexpr,
-    TOTAL_ROWS: tl.constexpr,
+    TOTAL_ROWS,
 ):
     """Write FP32 partials with shape [SPLIT_K, TOTAL_ROWS, N]."""
     x_stride_1: tl.constexpr = 1
@@ -228,7 +228,7 @@ def _chunked_lora_shrink_split_k_kernel(
     tl.store(output_ptr, partial_sum, mask=output_mask)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["TOTAL_ROWS"])
 def _reduce_shrink_split_k(
     partials,
     output,
@@ -237,7 +237,7 @@ def _reduce_shrink_split_k(
     lora_ranks,
     permutation,
     N: tl.constexpr,
-    TOTAL_ROWS: tl.constexpr,
+    TOTAL_ROWS,
     NUM_SLICES: tl.constexpr,
     SPLIT_K: tl.constexpr,
     BLOCK_M: tl.constexpr,
