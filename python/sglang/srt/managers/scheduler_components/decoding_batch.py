@@ -67,9 +67,8 @@ class DecodingBatch:
         its tail, so its rows, new before old, replace them.
 
         The copy shares the step's sampling_info and spec_info, and its filter
-        changes them in place. In the loops that join right after the launch
-        that is before the step's commit, so a commit must not read either of
-        them by row."""
+        changes them in place. In the normal and overlap loops the join runs
+        before the step's commit, so a commit must not read either by row."""
         if not step.has_prefill_rows():
             return
         still_chunking = [] if step.chunked_req is None else [step.chunked_req]
