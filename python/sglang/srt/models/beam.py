@@ -729,11 +729,11 @@ class BeamDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         next_norm_weight: Optional[torch.Tensor],
         ssmax_scale: torch.Tensor | None,
-        moe_all_reduce_comm=None,
-        attention_all_reduce_comm=None,
-        flashinfer_all_reduce=None,
-        mlp_flashinfer_all_reduce=None,
-        mlp_all_reduce_comm=None,
+        attention_beam_ar_comm=None,
+        attention_flashinfer_ar=None,
+        mlp_beam_ar_topk_comm=None,
+        mlp_beam_ar_comm=None,
+        mlp_flashinfer_ar=None,
     ) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
         """Same arithmetic as `forward` with the two norm/residual transitions fused.
 
@@ -741,12 +741,13 @@ class BeamDecoderLayer(nn.Module):
         previous transition. Returns the next layer's normalized input (or None
         when `next_norm_weight` is None, on the last layer of a pipeline stage
         that does not own the final norm) and the new residual stream.
-        `flashinfer_all_reduce` / `mlp_flashinfer_all_reduce`, when given, replace
-        the TP all-reduce of the attention / MLP output ahead of the unfused norm.
-        `mlp_all_reduce_comm` fuses the MLP's summed output like attention's when
-        the deferred expert sum (`moe_all_reduce_comm`) does not apply.
+        Each boundary takes at most one replacement for its TP all-reduce:
+        `*_beam_ar_comm` fuses the all-reduce and norm in `beam_all_reduce_norm`
+        (`mlp_beam_ar_topk_comm` also sums the top-k expert outputs, and wins
+        when it applies); `*_flashinfer_ar` runs FlashInfer's all-reduce ahead
+        of the unfused norm.
         """
-        if attention_all_reduce_comm is not None:
+        if attention_beam_ar_comm is not None:
             from sglang.kernels.ops.communication.beam_all_reduce import (
                 beam_all_reduce_norm,
             )
@@ -755,7 +756,7 @@ class BeamDecoderLayer(nn.Module):
                 positions, normed, forward_batch, ssmax_scale, skip_all_reduce=True
             )
             normed, residual = beam_all_reduce_norm(
-                attention_all_reduce_comm,
+                attention_beam_ar_comm,
                 attn,
                 residual,
                 self.post_attention_layernorm.weight,
@@ -764,8 +765,8 @@ class BeamDecoderLayer(nn.Module):
                 self.attn_residual_scales,
             )
         else:
-            if flashinfer_all_reduce is not None:
-                attn = flashinfer_all_reduce(
+            if attention_flashinfer_ar is not None:
+                attn = attention_flashinfer_ar(
                     self.self_attn(
                         positions,
                         normed,
@@ -785,7 +786,7 @@ class BeamDecoderLayer(nn.Module):
                 self.attn_residual_scales,
             )
         if (
-            moe_all_reduce_comm is not None
+            mlp_beam_ar_topk_comm is not None
             and isinstance(self.mlp, BeamMoE)
             and self.mlp.experts.quant_method.runner.runner_backend.is_triton()
             and not self.mlp.experts._dwdp_bound
@@ -796,7 +797,7 @@ class BeamDecoderLayer(nn.Module):
 
             expert_outputs = self.mlp(normed, defer_sum=True)
             return beam_all_reduce_norm(
-                moe_all_reduce_comm,
+                mlp_beam_ar_topk_comm,
                 expert_outputs,
                 residual,
                 self.post_feedforward_layernorm.weight,
@@ -805,13 +806,13 @@ class BeamDecoderLayer(nn.Module):
                 self.mlp_residual_scales,
                 routed_scale=self.mlp.config.routed_scaling_factor,
             )
-        if mlp_all_reduce_comm is not None:
+        if mlp_beam_ar_comm is not None:
             from sglang.kernels.ops.communication.beam_all_reduce import (
                 beam_all_reduce_norm,
             )
 
             return beam_all_reduce_norm(
-                mlp_all_reduce_comm,
+                mlp_beam_ar_comm,
                 self.mlp(normed, skip_all_reduce=True),
                 residual,
                 self.post_feedforward_layernorm.weight,
@@ -819,7 +820,7 @@ class BeamDecoderLayer(nn.Module):
                 self.rms_norm_eps,
                 self.mlp_residual_scales,
             )
-        mlp = self._forward_mlp(normed, forward_batch, mlp_flashinfer_all_reduce)
+        mlp = self._forward_mlp(normed, forward_batch, mlp_flashinfer_ar)
         return self.sandwich_residual_norm(
             mlp,
             residual,
@@ -973,7 +974,7 @@ class BeamModel(nn.Module):
         return self._mlp_has_single_tp_sum and not should_skip_mlp_all_reduce()
 
     def _all_reduce_limits(self, hidden_states) -> Optional[Tuple[int, int]]:
-        """Return attention/MoE token limits for eligible inputs, without allocation."""
+        """Return attention/top-k MLP token limits for eligible inputs; no allocation."""
         if not hidden_states.is_cuda or torch.version.hip is not None:
             return None
         execution = get_exec()
@@ -1005,7 +1006,7 @@ class BeamModel(nn.Module):
             return None
         # Keep the existing collective above the measured one-shot crossover.
         # Attention and MoE have different savings: only MoE removes a local sum.
-        attention_max_tokens, moe_max_tokens = (
+        attention_max_tokens, topk_max_tokens = (
             {2: (32, 32), 4: (32, 64), 8: (1, 16)}[parallel.tp_size]
             if architecture == 9
             else (64, 64)
@@ -1014,7 +1015,7 @@ class BeamModel(nn.Module):
         # Keep its original reduction/norm until the fused norm tree is aligned.
         if capability == (10, 3) and parallel.tp_size == 4:
             attention_max_tokens = min(attention_max_tokens, 32)
-            moe_max_tokens = min(moe_max_tokens, 32)
+            topk_max_tokens = min(topk_max_tokens, 32)
         # Deferred expert outputs currently require unsharded expert IDs and
         # one TP reduction. EP keeps its normal expert mapping and reduction.
         if (
@@ -1023,11 +1024,11 @@ class BeamModel(nn.Module):
             or parallel.moe_tp_size != parallel.tp_size
             or should_skip_post_experts_all_reduce(is_tp_path=True)
         ):
-            moe_max_tokens = 0
-        max_tokens = max(attention_max_tokens, moe_max_tokens)
+            topk_max_tokens = 0
+        max_tokens = max(attention_max_tokens, topk_max_tokens)
         if hidden_states.shape[0] > max_tokens:
             return None
-        return attention_max_tokens, moe_max_tokens
+        return attention_max_tokens, topk_max_tokens
 
     def _prepare_all_reduce_comm(self, hidden_states, max_tokens: int):
         """Reuse or initialize the shared push workspace during eager warmup.
@@ -1115,27 +1116,25 @@ class BeamModel(nn.Module):
     ):
         # Each fused transition also produces the next layer's normalized input,
         # so the first norm of this stage is the only standalone one.
-        moe_all_reduce_comm = attention_all_reduce_comm = mlp_all_reduce_comm = None
+        attention_beam_ar_comm = mlp_beam_ar_topk_comm = mlp_beam_ar_comm = None
         limits = self._all_reduce_limits(hidden_states)
         if limits is not None:
-            attention_max_tokens, moe_max_tokens = limits
+            attention_max_tokens, topk_max_tokens = limits
             comm = self._prepare_all_reduce_comm(hidden_states, max(limits))
-            if hidden_states.shape[0] <= moe_max_tokens:
-                moe_all_reduce_comm = comm
+            if hidden_states.shape[0] <= topk_max_tokens:
+                mlp_beam_ar_topk_comm = comm
             if hidden_states.shape[0] <= attention_max_tokens:
-                attention_all_reduce_comm = comm
+                attention_beam_ar_comm = comm
                 # A summed MLP output is the same [tokens, hidden] partial sum as
                 # attention's, so it fuses under the same limit.
                 if self._can_replace_mlp_all_reduce():
-                    mlp_all_reduce_comm = comm
+                    mlp_beam_ar_comm = comm
         # FlashInfer's MNNVL all-reduce replaces CustomAR inside the measured token
         # band (_FLASHINFER_AR_TOKEN_BAND); None outside it.
-        flashinfer_all_reduce = self._flashinfer_ar_for(hidden_states)
-        mlp_flashinfer_all_reduce = (
-            flashinfer_all_reduce
-            if flashinfer_all_reduce is not None and self._can_replace_mlp_all_reduce()
-            else None
-        )
+        attention_flashinfer_ar = self._flashinfer_ar_for(hidden_states)
+        mlp_flashinfer_ar = None
+        if attention_flashinfer_ar is not None and self._can_replace_mlp_all_reduce():
+            mlp_flashinfer_ar = attention_flashinfer_ar
         residual = hidden_states
         normed = self.layers[self.start_layer].input_layernorm(residual)
         for layer_id in range(self.start_layer, self.end_layer):
@@ -1152,11 +1151,11 @@ class BeamModel(nn.Module):
                 forward_batch,
                 next_norm_weight,
                 ssmax_scale,
-                moe_all_reduce_comm,
-                attention_all_reduce_comm,
-                flashinfer_all_reduce=flashinfer_all_reduce,
-                mlp_flashinfer_all_reduce=mlp_flashinfer_all_reduce,
-                mlp_all_reduce_comm=mlp_all_reduce_comm,
+                attention_beam_ar_comm=attention_beam_ar_comm,
+                attention_flashinfer_ar=attention_flashinfer_ar,
+                mlp_beam_ar_topk_comm=mlp_beam_ar_topk_comm,
+                mlp_beam_ar_comm=mlp_beam_ar_comm,
+                mlp_flashinfer_ar=mlp_flashinfer_ar,
             )
             if layer_id in self.layers_to_capture:
                 aux_hidden_states.append(residual)
