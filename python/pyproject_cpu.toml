@@ -51,9 +51,10 @@ dependencies = [
   "python-multipart",
   "pytest",
   "pyzmq>=25.1.2",
+  "regex",
   "requests",
   "scipy",
-  "sentencepiece",
+  "sentencepiece==0.2.1",  # 0.2.2 rejects null pieces in InternVL tokenizers.
   "setproctitle",
   "smg-grpc-servicer>=0.9.0",
   "soundfile==0.13.1",
@@ -65,7 +66,7 @@ dependencies = [
   "torchcodec==0.12.0 ; sys_platform != 'linux' or (sys_platform == 'linux' and platform_machine != 'aarch64' and platform_machine != 'arm64' and platform_machine != 'armv7l')",
   "torchvision==0.29.0",
   "tqdm",
-  "transformers==5.12.1",
+  "transformers==5.19.0",
   "triton==3.8.0",
   "uvicorn",
   "uvloop",
@@ -127,6 +128,10 @@ sglang = "sglang.cli.main:main"
   "srt/**/*",
   "kernels/**/*"
 ]
+
+[tool.setuptools.exclude-package-data]
+# .claude/skills is a directory symlink; setuptools build_py cannot copy it.
+"sglang.multimodal_gen" = [".claude/*"]
 
 [tool.setuptools.packages.find]
 exclude = [

@@ -42,7 +42,7 @@ def _require_accelerator_device():
     return get_device(0)
 
 
-from sglang.kernels.ops.moe.virtual_experts import (
+from sglang.kernels.ops.lora.moe.virtual_experts import (
     _align_block_size_jit,
     _align_block_size_torch,
     _fused_virtual_topk_ids,

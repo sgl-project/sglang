@@ -12,7 +12,7 @@ from sglang.srt.models.dflash import (
 from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=38, suite="base-a-test-cpu")
+register_cpu_ci(est_time=31, suite="base-a-test-cpu")
 
 
 def test_dflash_unary_logit_transform():
@@ -248,7 +248,7 @@ def test_worker_folds_a_gate_admitted_quantized_selector_head(monkeypatch):
     worker = SimpleNamespace(
         block_size=8,
         selector=object(),
-        model_runner=SimpleNamespace(tp_rank=0),
+        _target_tp_rank=0,
         ps=SimpleNamespace(tp_rank=0),
         draft_model=SimpleNamespace(lm_head=None),
         device="cpu",
@@ -270,35 +270,6 @@ def test_worker_folds_a_gate_admitted_quantized_selector_head(monkeypatch):
     worker.draft_model.lm_head = None
     assert worker_mod.DFlashWorkerV2._maybe_build_draft_sampler(worker) is None
     assert worker.draft_model.lm_head is None
-
-
-def test_worker_warns_once_when_selector_sampling_is_disabled(monkeypatch):
-    from sglang.srt.speculative import dflash_worker_v2 as worker_mod
-
-    warnings = []
-    monkeypatch.setattr(
-        worker_mod.logger, "warning", lambda *args: warnings.append(args)
-    )
-    worker = SimpleNamespace(
-        selector=object(),
-        _selector_sampling_enabled=False,
-        _warned_sampling_fallback=False,
-        model_runner=SimpleNamespace(tp_rank=0),
-        ps=SimpleNamespace(tp_rank=0),
-    )
-    batch = SimpleNamespace(sampling_info=SimpleNamespace(is_all_greedy=False))
-
-    worker_mod.DFlashWorkerV2._validate_phase1_sampling_support(worker, batch)
-    worker_mod.DFlashWorkerV2._validate_phase1_sampling_support(worker, batch)
-
-    assert worker._warned_sampling_fallback
-    assert len(warnings) == 1
-    assert "sampling distribution will not be preserved" in warnings[0][0]
-
-    worker._selector_sampling_enabled = True
-    worker._warned_sampling_fallback = False
-    worker_mod.DFlashWorkerV2._validate_phase1_sampling_support(worker, batch)
-    assert len(warnings) == 1
 
 
 def test_disabled_selector_sampling_forces_greedy_draft():

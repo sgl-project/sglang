@@ -133,8 +133,12 @@ SGL_DEVICE IndexPacked index_rope_quant_pack(fp32x2_t head, fp32x2_t tail, fp32x
     // `inv_scale_ue8m0` instead of the reference's division: the scale is a
     // power of two, so both are exact except at the unreachable exponent 254.
     const auto inv_scale = deepseek_v4::fp8::inv_scale_ue8m0(static_cast<int32_t>(out.exponent[half]));
+#ifndef USE_ROCM
     const auto code = __nv_cvt_float2_to_fp4x2(
         fp32x2_t{data[half * 2] * inv_scale, data[half * 2 + 1] * inv_scale}, __NV_E2M1, cudaRoundNearest);
+#else
+    const auto code = fp4::e2m1x2_code(fp32x2_t{data[half * 2] * inv_scale, data[half * 2 + 1] * inv_scale});
+#endif
     out.payload[half] = clear_negative_zero(static_cast<uint32_t>(code));
   }
   return out;
@@ -147,8 +151,15 @@ SGL_DEVICE IndexPacked index_rope_quant_pack(fp32x2_t head, fp32x2_t tail, fp32x
 /// the warp. Every lane must reach it: the shuffles are warp-wide.
 SGL_DEVICE uint32_t index_scale_word(const uint32_t (&exponent)[2]) {
   using namespace device;
+#ifndef USE_ROCM
   const auto exp_1 = __shfl_sync(warp::kFullMask, exponent[0], kWarpThreads / 2);
   const auto exp_3 = __shfl_sync(warp::kFullMask, exponent[1], kWarpThreads / 2);
+#else
+  // A wave holds two of these 32-lane rows, so the shuffle width has to be the
+  // row, not the wave, for lane 16 to be this row's lane 16.
+  const auto exp_1 = __shfl(exponent[0], kWarpThreads / 2, kWarpThreads);
+  const auto exp_3 = __shfl(exponent[1], kWarpThreads / 2, kWarpThreads);
+#endif
   return exponent[0] | (exp_1 << 8) | (exponent[1] << 16) | (exp_3 << 24);
 }
 
@@ -310,7 +321,7 @@ struct IndexKKernel {
 
     auto N = SymbolicSize{"num_tokens"};
     auto device_ = SymbolicDevice{};
-    device_.set_options<kDLCUDA>();
+    device_.set_options<kDLGPU>();
 
     TensorMatcher({N, kHeadDim}).with_dtype<bf16_t>().with_device(device_).verify(input);
     TensorMatcher({kHeadDim}).with_dtype<bf16_t>().with_device(device_).verify(norm_weight);
@@ -390,7 +401,7 @@ struct IndexQKernel {
     auto H = SymbolicSize{"heads"};
     auto R = SymbolicSize{"num_rows"};
     auto device_ = SymbolicDevice{};
-    device_.set_options<kDLCUDA>();
+    device_.set_options<kDLGPU>();
 
     TensorMatcher({N, H, kHeadDim}).with_dtype<bf16_t>().with_device(device_).verify(input);
     // Real/imag interleaved, so the trailing dim is kRopeDim, not kRopeDim / 2.
