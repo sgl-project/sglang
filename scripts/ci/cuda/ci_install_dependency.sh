@@ -369,24 +369,39 @@ setup_cargo_cache() {
         mkdir -p "${CARGO_TARGET_DIR}"
     fi
 
-    # Keep third-party dependencies warm, but rebuild checkout-local packages.
-    # A shared target can contain artifacts from another checkout whose source
-    # mtimes predate the cached fingerprints. Cargo can then report stale API
-    # types as Fresh and compile this checkout against the wrong protobuf fields.
-    # Clean under the target lock, before any Rust extension is built.
-    local local_packages package
-    local_packages="$(cargo metadata --locked --no-deps --format-version 1 \
-        --manifest-path "${REPO_ROOT}/rust/Cargo.toml" | python3 -c '
-import json, sys
-for package in json.load(sys.stdin)["packages"]:
-    if package["source"] is None:
-        print(package["name"])
-')"
-    local clean_args=()
-    while IFS= read -r package; do
-        clean_args+=(--package "${package}")
-    done <<< "${local_packages}"
-    cargo clean --manifest-path "${REPO_ROOT}/rust/Cargo.toml" "${clean_args[@]}"
+    # Rebuild checkout-local crates but keep third-party ones warm: cargo judges
+    # local crates by mtime, so another checkout's artifacts can pass as Fresh.
+    python3 - "${REPO_ROOT}/rust" <<'EOF'
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+
+def cargo_metadata(manifest):
+    out = subprocess.run(
+        ["cargo", "metadata", "--locked", "--no-deps", "--format-version", "1",
+         "--manifest-path", manifest],
+        check=True, stdout=subprocess.PIPE, text=True,
+    ).stdout
+    return json.loads(out)
+
+
+rust_dir = Path(sys.argv[1])
+root = cargo_metadata(rust_dir / "Cargo.toml")
+# The same manifest set setup.py builds extensions from.
+extension_manifests = (
+    (root.get("metadata") or {}).get("sglang", {}).get("extension-manifests", [])
+)
+for manifest in [rust_dir / "Cargo.toml", *(rust_dir / m for m in extension_manifests)]:
+    names = [p["name"] for p in cargo_metadata(manifest)["packages"] if p["source"] is None]
+    package_args = [arg for name in names for arg in ("--package", name)]
+    # setuptools-rust builds with --release; `cargo clean -p` cleans only the given profile.
+    subprocess.run(
+        ["cargo", "clean", "--locked", "--release", "--manifest-path", manifest, *package_args],
+        check=True,
+    )
+EOF
 
     mark_step_done "${FUNCNAME[0]}"
 }
