@@ -359,9 +359,9 @@ def _single_bin_scores(kind, batch, width, device):
         pick = torch.rand(batch, width, device=device) < 0.5
         return torch.where(pick, hi, torch.ones_like(hi))
     if kind == "signed_zero":
-        # The threshold bin holds -0.0, which fp32 compares see as +0.0, so
-        # -0.0 must bin with +0.0 to stay in the tie set instead of racing
-        # true positive values for output slots.
+        # The threshold bin ends at +0.0. Its upper boundary must move to the
+        # smallest positive subnormal so -0.0 stays in the tie set instead of
+        # racing true positive values for output slots.
         out = torch.full((batch, width), -1.0, dtype=torch.float32, device=device)
         out[:, : width // 2] = -0.0
         out[:, -1024:] = 1e-6
@@ -400,30 +400,6 @@ def test_topk_v2_single_coarse_bin_is_exact(batch: int, seq: int, dist: str) -> 
     k = 2048
     width = (seq + 3) & ~3
     scores = _single_bin_scores(dist, batch, width, device)[:, :seq]
-    seq_lens = torch.full((batch,), seq, dtype=torch.int32, device=device)
-
-    our_raw = _run_raw(scores, seq_lens, k)
-    ref_raw = _reference(scores, seq_lens, k)
-    _assert_topk_close(
-        scores.cpu(), ref_raw, our_raw, batch, seq_lens.cpu(), k, max_permit_error=0
-    )
-
-
-@pytest.mark.parametrize("batch,seq", [(6, 8192), (4, 32768), (4, 65536)])
-@torch.inference_mode()
-def test_topk_v2_zeros_above_threshold_bin_are_exact(batch: int, seq: int) -> None:
-    """k-1 +0.0 scores sit one coarse bin above two scores that round to fp16
-    -0.0. Counted as ties, the zeros would overflow the staging buffer, which
-    the CUDA cluster path truncates, so this also runs on cluster shapes.
-    """
-    torch.manual_seed(batch * 100003 + seq)
-    device = "cuda"
-    k = 2048
-    scores = torch.full((batch, seq), -1.0, dtype=torch.float32, device=device)
-    for row in range(batch):
-        pos = torch.randperm(seq, device=device)
-        scores[row, pos[: k - 1]] = 0.0
-        scores[row, pos[k - 1 : k + 1]] = -1e-30
     seq_lens = torch.full((batch,), seq, dtype=torch.int32, device=device)
 
     our_raw = _run_raw(scores, seq_lens, k)

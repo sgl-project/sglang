@@ -83,22 +83,17 @@ constexpr float infinity_value() {
   return std::numeric_limits<float>::infinity();
 }
 
-#ifdef __FAST_MATH__
-#error "extract_coarse_bin relies on x + 0.0f mapping -0.0 to +0.0"
-#endif
-
-/// fp32 -0.0 bins with +0.0 (x + 0.0f): the fp32 bounds below cannot tell them apart.
 template <uint32_t kBits>
 SGL_DEVICE uint32_t extract_coarse_bin(float x) {
   static_assert(0 < kBits && kBits < 15);
-  x += 0.0f;
   uint32_t b = (uint32_t)__half_as_ushort(__float2half_rn(x)) << 16;
   uint32_t s = (uint32_t)((int32_t)b >> 31);
   return (b ^ (s | 0x80000000u)) >> (32 - kBits);
 }
 
 /// fp32 bounds {lo, hi} of coarse bin `bin`: "above" iff v >= hi, "tie" iff lo <= v < hi,
-/// agreeing with extract_coarse_bin<kBits> on every non-NaN score.
+/// agreeing with extract_coarse_bin<kBits> on every non-NaN score. A zero hi moves to
+/// the smallest subnormal, since fp32 compares cannot put -0.0 below +0.0.
 template <uint32_t kBits>
 SGL_DEVICE float2 coarse_bin_bounds(uint32_t bin) {
   constexpr uint32_t kShift = 16 - kBits;
@@ -120,9 +115,9 @@ SGL_DEVICE float2 coarse_bin_bounds(uint32_t bin) {
   const int32_t lo = __float_as_int(midpoint(v_lo, u_lo));
   const int32_t hi = __float_as_int(midpoint(v_hi, u_hi));
   // Ties round to even and edge keys are even, so negative edges sit one ulp above
-  // the midpoint. A zero edge is +0.0, which also admits fp32 -0.0, as binned above.
+  // the midpoint. A zero hi steps past +0.
   const float lo_edge = __int_as_float(lo + (lo >> 31));
-  const float hi_edge = __int_as_float(hi + (hi >> 31));
+  const float hi_edge = __int_as_float(hi + (hi >> 31) + (hi == 0));
   // Edges inside the NaN key space: every score is >= lo, none is >= hi.
   return {bin <= kNegInfBin ? -infinity_value() : lo_edge, bin >= kInfBin ? infinity_value() : hi_edge};
 }
