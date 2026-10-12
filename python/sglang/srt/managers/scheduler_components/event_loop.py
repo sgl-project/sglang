@@ -7,14 +7,16 @@ Every non-pipeline CUDA loop runs one step order:
 A ``LoopSpec`` names how each mode fills those stages; ``run_flat_loop`` walks
 them. The in-flight queue the mode installs sets the commit timing: depth 0
 commits a step in the iteration that launched it, depth 1 in the next one.
+
+PD prefill overlap keeps its own loop (``event_loop_overlap_disagg_prefill``):
+with continuous input polling it repeats intake while the due step's result
+is unfinished, which no other mode does.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, List, Optional
-
-import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler_components.inflight_queue import InflightQueue
@@ -28,17 +30,12 @@ if TYPE_CHECKING:
 class LoopSpec:
     # Writes the mode's flags and installs its in-flight queue.
     enter: Callable[[Scheduler], None]
-    # Plans the next step: (scheduler, waiting_for_batch_result) -> batch.
-    plan: Callable[[Scheduler, bool], Optional[ScheduleBatch]]
+    # Plans the next step.
+    plan: Callable[[Scheduler], Optional[ScheduleBatch]]
     # Hands the PD queues' new work over after intake; returns what arrived.
     take_arrivals: Optional[Callable[[Scheduler], Optional[List]]] = None
     # PD decode: query the prefill DP ranks before intake.
     prefetch_prefill_dp_ranks: bool = False
-    # PD prefill overlap: stop intake at a pause while waiting on a result,
-    # yield the GIL while paused, plan only when the queue has room, no
-    # input is deferred and the last plan did not fail since the last
-    # arrival, and mark the scheduler idle at the step end.
-    intake_while_waiting: bool = False
     # Commits the due step before a launch that must not overlap it; returns
     # whether it disabled the overlap.
     commit_before_launch: Optional[Callable[[Scheduler, ScheduleBatch], bool]] = None
@@ -55,15 +52,6 @@ class LoopSpec:
 def run_flat_loop(self: Scheduler, spec: LoopSpec) -> None:
     spec.enter(self)
     overlapped = self.inflight_steps.depth > 0
-    if spec.intake_while_waiting:
-        batch_result_completion_status = torch.empty(1, dtype=torch.int32, device="cpu")
-    # True when intake repeats while the oldest batch result is unfinished.
-    waiting_for_batch_result = False
-    # Avoid retrying failed batch preparation after every copy poll.
-    skip_batch_creation = False
-    # Keep the newer forward's sampling context across unfinished-result passes.
-    batch = None
-    batch_result = None
 
     while True:
         if self.gracefully_exit:
@@ -74,43 +62,20 @@ def run_flat_loop(self: Scheduler, spec: LoopSpec) -> None:
             # Pending rooms from the prior cycle can overlap request intake and
             # the tail of the in-flight decode graph.
             self.disagg_decode_prealloc_queue.prefetch_prefill_dp_rank_queries()
-        if spec.intake_while_waiting:
-            # Stop dispatching at pause requests while waiting for a batch result.
-            received_inputs = self.ingest_requests(
-                stop_at_pause=waiting_for_batch_result
-            )
-        else:
-            received_inputs = self.ingest_requests()
+        self.ingest_requests()
         if self._engine_paused:
             self._record_scheduler_state_for_paused_engine()
-            if spec.intake_while_waiting:
-                self._yield_gil_if_needed()
             continue
-        arrivals = spec.take_arrivals(self) if spec.take_arrivals else None
+        if spec.take_arrivals:
+            spec.take_arrivals(self)
 
         # Plan and launch
-        may_plan = True
-        if spec.intake_while_waiting:
-            # Resume batch creation on completion, new/ready requests, or an idle step.
-            if not waiting_for_batch_result or received_inputs or arrivals:
-                skip_batch_creation = False
-            # Keep at most two batches in flight.
-            may_plan = (
-                self.inflight_steps.can_launch()
-                and not self.gracefully_exit
-                and not self._deferred_input_requests
-                and not skip_batch_creation
-            )
+        batch = spec.plan(self)
+        self.cur_batch_for_debug = batch
         disable_overlap_for_batch = False
-        if may_plan:
-            batch = spec.plan(self, waiting_for_batch_result)
-            self.cur_batch_for_debug = batch
-            if spec.intake_while_waiting:
-                # Skip batch creation next round to avoid repeated preparation failures.
-                skip_batch_creation = batch is None
-            if spec.commit_before_launch:
-                disable_overlap_for_batch = spec.commit_before_launch(self, batch)
-            batch_result = _launch(self, spec, batch, overlapped)
+        if spec.commit_before_launch:
+            disable_overlap_for_batch = spec.commit_before_launch(self, batch)
+        batch_result = _launch(self, spec, batch, overlapped)
 
         # Commit the due step
         if overlapped:
@@ -118,18 +83,6 @@ def run_flat_loop(self: Scheduler, spec: LoopSpec) -> None:
                 self.last_batch is not None and not disable_overlap_for_batch
             )
         if self.inflight_steps.has_due():
-            if not self.inflight_steps.blocking:
-                # Resume intake until the oldest result is ready on all TP ranks.
-                oldest_batch_result = self.inflight_steps.head().result
-                if (
-                    not self.gracefully_exit
-                    and not self.is_disagg_prefill_batch_result_ready(
-                        oldest_batch_result, batch_result_completion_status
-                    )
-                ):
-                    waiting_for_batch_result = True
-                    self._yield_gil_if_needed()
-                    continue
             # Process the oldest batch result.
             self._commit_due_step()
         elif batch is None:
@@ -151,13 +104,10 @@ def run_flat_loop(self: Scheduler, spec: LoopSpec) -> None:
         if overlapped and (not spec.sample_only_for_generation or self.is_generation):
             self.launch_batch_sample_if_needed(batch_result, batch)
 
-        # Update last_batch and scheduler status
-        if spec.intake_while_waiting:
-            self._sched_idled = batch is None
+        # Update last_batch
         self.last_batch = batch
         self.inflight_steps.end_step(batch)
         self._debug_check_last_launched()
-        waiting_for_batch_result = False
 
         if (
             spec.strict_mem_check
@@ -188,8 +138,7 @@ def _launch(
             self.inflight_steps.push(batch, batch_result)
     else:
         batch_result = None
-        if not spec.intake_while_waiting:
-            self._sched_idled = True
+        self._sched_idled = True
     return batch_result
 
 
@@ -209,13 +158,6 @@ def _enter_overlap(self: Scheduler) -> None:
 
 def _enter_pd(self: Scheduler) -> None:
     self.inflight_steps = InflightQueue(depth=0)
-
-
-def _enter_pd_prefill_overlap(self: Scheduler) -> None:
-    self.enable_continuous_input_polling = self._is_continuous_input_polling_enabled()
-    self.inflight_steps = InflightQueue(
-        depth=1, blocking=not self.enable_continuous_input_polling
-    )
 
 
 def _enter_pd_decode_overlap(self: Scheduler) -> None:
@@ -239,16 +181,14 @@ def _process_decode_queue(self: Scheduler) -> None:
 # Plans: each mode's schedule entry point.
 
 
-def _plan(self: Scheduler, waiting_for_batch_result: bool) -> Optional[ScheduleBatch]:
+def _plan(self: Scheduler) -> Optional[ScheduleBatch]:
     plan = self.get_next_batch_to_run(
         decoding_batch=self.decoding_batch, last_batch=self.last_batch
     )
     return plan.batch_to_run
 
 
-def _plan_pd_prefill(
-    self: Scheduler, waiting_for_batch_result: bool
-) -> Optional[ScheduleBatch]:
+def _plan_pd_prefill(self: Scheduler) -> Optional[ScheduleBatch]:
     plan = self.get_next_disagg_prefill_batch_to_run(
         decoding_batch=self.decoding_batch, last_batch=self.last_batch
     )
@@ -258,24 +198,7 @@ def _plan_pd_prefill(
     )
 
 
-def _plan_pd_prefill_overlap(
-    self: Scheduler, waiting_for_batch_result: bool
-) -> Optional[ScheduleBatch]:
-    plan = self.get_next_disagg_prefill_batch_to_run(
-        decoding_batch=self.decoding_batch,
-        last_batch=self.last_batch,
-        # Storage retry deadlines count scheduling steps, not copy polls.
-        should_retry_storage_prefetch=not waiting_for_batch_result,
-    )
-    batch = plan.batch_to_run
-    return self.ngram_embedding_manager.prepare_for_forward(
-        batch, chunked_req=self.chunked_req
-    )
-
-
-def _plan_pd_decode(
-    self: Scheduler, waiting_for_batch_result: bool
-) -> Optional[ScheduleBatch]:
+def _plan_pd_decode(self: Scheduler) -> Optional[ScheduleBatch]:
     plan = self.get_next_disagg_decode_batch_to_run(decoding_batch=self.decoding_batch)
     batch = plan.batch_to_run
     return self.ngram_embedding_manager.prepare_for_forward(
@@ -356,15 +279,6 @@ PD_PREFILL_LOOP = LoopSpec(
     enter=_enter_pd,
     plan=_plan_pd_prefill,
     take_arrivals=_take_bootstrapped,
-    prefetch_staging=True,
-    after_commit=_process_prefill_inflight_queue,
-)
-
-PD_PREFILL_OVERLAP_LOOP = LoopSpec(
-    enter=_enter_pd_prefill_overlap,
-    plan=_plan_pd_prefill_overlap,
-    take_arrivals=_take_bootstrapped,
-    intake_while_waiting=True,
     prefetch_staging=True,
     after_commit=_process_prefill_inflight_queue,
 )

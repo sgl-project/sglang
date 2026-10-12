@@ -73,9 +73,9 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.managers.scheduler_components.event_loop import (
     PD_PREFILL_LOOP,
-    PD_PREFILL_OVERLAP_LOOP,
     run_flat_loop,
 )
+from sglang.srt.managers.scheduler_components.inflight_queue import InflightQueue
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.srt.mem_cache.common import (
     checkpoint_kv_cache,
@@ -699,7 +699,103 @@ class SchedulerDisaggregationPrefillMixin:
         After a failed preparation, only new input or bootstrap arrivals retry
         during the wait; other readiness is checked after a result finishes.
         """
-        run_flat_loop(self, PD_PREFILL_OVERLAP_LOOP)
+        self.enable_continuous_input_polling = (
+            self._is_continuous_input_polling_enabled()
+        )
+        self.inflight_steps = InflightQueue(
+            depth=1, blocking=not self.enable_continuous_input_polling
+        )
+        batch_result_completion_status = torch.empty(1, dtype=torch.int32, device="cpu")
+        # True when intake repeats while the oldest batch result is unfinished.
+        waiting_for_batch_result = False
+        # Avoid retrying failed batch preparation after every copy poll.
+        skip_batch_creation = False
+        # Keep the newer forward's sampling context across unfinished-result passes.
+        batch = None
+        batch_result = None
+
+        while True:
+            if self.gracefully_exit:
+                break
+
+            # Stop dispatching at pause requests while waiting for a batch result.
+            received_inputs = self.ingest_requests(
+                stop_at_pause=waiting_for_batch_result
+            )
+            if self._engine_paused:
+                self._record_scheduler_state_for_paused_engine()
+                self._yield_gil_if_needed()
+                continue
+            bootstrapped_reqs = self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
+            self.waiting_queue.extend(bootstrapped_reqs)
+            # Resume batch creation on completion, new/ready requests, or an idle step.
+            if not waiting_for_batch_result or received_inputs or bootstrapped_reqs:
+                skip_batch_creation = False
+
+            # Keep at most two batches in flight.
+            if (
+                self.inflight_steps.can_launch()
+                and not self.gracefully_exit
+                and not self._deferred_input_requests
+                and not skip_batch_creation
+            ):
+                # Get the next batch to run
+                plan = self.get_next_disagg_prefill_batch_to_run(
+                    decoding_batch=self.decoding_batch,
+                    last_batch=self.last_batch,
+                    # Storage retry deadlines count scheduling steps, not copy polls.
+                    should_retry_storage_prefetch=not waiting_for_batch_result,
+                )
+                batch = plan.batch_to_run
+                batch = self.ngram_embedding_manager.prepare_for_forward(
+                    batch, chunked_req=self.chunked_req
+                )
+                self.cur_batch_for_debug = batch
+                # Skip batch creation next round to avoid repeated preparation failures.
+                skip_batch_creation = batch is None
+
+                # Launch the current batch
+                if batch:
+                    if self.enable_staging:
+                        self.maybe_prefetch_staging_for_batch(batch)
+                    batch_result = self.run_batch(batch)
+                    self._apply_war_barrier()
+                    self.inflight_steps.push(batch.copy(), batch_result)
+                else:
+                    batch_result = None
+
+            self._debug_check_commit_gate(self.last_batch is not None)
+            if self.inflight_steps.has_due():
+                if not self.inflight_steps.blocking:
+                    # Resume intake until the oldest result is ready on all TP ranks.
+                    oldest_batch_result = self.inflight_steps.head().result
+                    if (
+                        not self.gracefully_exit
+                        and not self.is_disagg_prefill_batch_result_ready(
+                            oldest_batch_result, batch_result_completion_status
+                        )
+                    ):
+                        waiting_for_batch_result = True
+                        self._yield_gil_if_needed()
+                        continue
+                # Process the oldest batch result.
+                self._commit_due_step()
+            elif batch is None:
+                # When the server is idle, do self-check and re-init some states
+                self.on_idle()
+
+            self.process_disagg_prefill_inflight_queue()
+
+            # Run sample of the current batch
+            # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
+            self.launch_batch_sample_if_needed(batch_result, batch)
+
+            # Update last_batch and scheduler status
+            self._sched_idled = batch is None
+            self.last_batch = batch
+            self.inflight_steps.end_step(batch)
+            self._debug_check_last_launched()
+            waiting_for_batch_result = False
 
     def is_disagg_prefill_batch_result_ready(
         self: Scheduler,
