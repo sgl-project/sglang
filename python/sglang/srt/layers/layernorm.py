@@ -39,6 +39,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_flashinfer_available,
+    is_gfx1250_supported,
     is_hip,
     is_musa,
     is_npu,
@@ -110,8 +111,17 @@ _has_rocm_triton_gemma_rms_norm = False
 if _use_aiter:
     import aiter as _aiter
     from aiter import layernorm2d_fwd as layer_norm
-    from aiter import rmsnorm2d_fwd as rms_norm
-    from aiter import rmsnorm2d_fwd_with_add as fused_add_rms_norm
+
+    if is_gfx1250_supported():
+        from aiter.ops.triton.normalization.rmsnorm import (
+            rms_norm,
+        )
+        from aiter.ops.triton.normalization.rmsnorm import (
+            rmsnorm2d_fwd_with_add as fused_add_rms_norm,
+        )
+    else:
+        from aiter import rmsnorm2d_fwd as rms_norm
+        from aiter import rmsnorm2d_fwd_with_add as fused_add_rms_norm
 
     _has_aiter_layer_norm = True  # aiter provides the layer_norm functions
     _has_vllm_rms_norm = True  # aiter provides the rms_norm functions
@@ -199,12 +209,14 @@ def _forward_with_allreduce_fusion(
     """Shared allreduce-fused RMSNorm logic usable by any norm."""
     if residual is not None:
         from sglang.srt.distributed import (
+            attention_tensor_model_parallel_all_reduce,
             tensor_model_parallel_all_reduce,
             tensor_model_parallel_fused_allreduce_rmsnorm,
         )
         from sglang.srt.layers.flashinfer_comm_fusion import (
             flashinfer_allreduce_residual_rmsnorm,
         )
+        from sglang.srt.layers.moe.utils import deferred_post_experts_all_reduce
 
         if use_attn_tp_group:
             world_size = get_parallel().attn_tp_size
@@ -236,6 +248,16 @@ def _forward_with_allreduce_fusion(
                 )
                 if fused_result[0] is not None:
                     return fused_result
+                # The kernel declined: all-reduce over the group its workspace
+                # is built on, then add and norm into a new residual tensor, as
+                # the kernel does.
+                if use_attn_tp_group:
+                    x = attention_tensor_model_parallel_all_reduce(x)
+                else:
+                    x = deferred_post_experts_all_reduce(x)
+                if post_residual_addition is None:
+                    residual = residual.clone()
+                return norm_module.forward(x, residual, None)
 
             # For AITER route, preserve correctness when fused path is unavailable.
             if _use_aiter and get_exec().comm.enable_aiter_allreduce_fusion:
@@ -427,6 +449,9 @@ def _is_static_per_tensor_fp8_linear(quant_method, linear) -> bool:
 
 
 class RMSNorm(BaseFusedOp):
+    # The projection that consumes this norm's output; see fuse_input_quant().
+    _quant_linear: Optional[nn.Module] = None
+
     def __init__(
         self,
         hidden_size: int,
@@ -477,6 +502,12 @@ class RMSNorm(BaseFusedOp):
         if force_native:
             self._forward_method = self.forward_native
 
+    def fuse_input_quant(self, linear: nn.Module) -> None:
+        """Fuse the static per-tensor FP8 input quantization of ``linear``, the
+        projection that consumes this norm's output, whenever forward_cuda can.
+        The projection stays out of this module's children."""
+        self.__dict__["_quant_linear"] = linear
+
     def forward_cuda(
         self,
         x: torch.Tensor,
@@ -484,6 +515,8 @@ class RMSNorm(BaseFusedOp):
         post_residual_addition: Optional[torch.Tensor] = None,
         quant_linear: Optional[nn.Module] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if quant_linear is None:
+            quant_linear = self._quant_linear
         if x.numel() == 0:
             if residual is not None:
                 if post_residual_addition is not None:
@@ -627,6 +660,11 @@ class RMSNorm(BaseFusedOp):
             if residual is not None:
                 return x, residual
             return x
+        if not x.is_cuda:
+            # AITER kernels dereference activations as GPU pointers; a CPU
+            # input (e.g. unit tests building modules on CPU) aborts the
+            # process with HSA_STATUS_ERROR_MEMORY_FAULT instead of raising.
+            return self.forward_native(x, residual, post_residual_addition)
         if self.weight.data.dtype != x.dtype:
             # AITER's ROCm rmsnorm2d_fwd requires weight/activation dtypes to match;
             # FP32 weight + BF16 activation yields finite-but-corrupted output on gfx950.
@@ -1306,6 +1344,19 @@ class Gemma3RMSNorm(BaseFusedOp):
         if x.dim() == 2:
             return gemma_rmsnorm(x, self.weight.data, self.eps)
         return self.forward_native(x)
+
+    def forward_xpu(self, x, residual: Optional[torch.Tensor] = None):
+        if residual is not None and x.dim() == 2:
+            # The decoder residual is token-major and contiguous. The fused
+            # kernel updates both tensors in place: x becomes the normalized
+            # output and residual becomes x + residual for the next layer.
+            gemma_fused_add_rmsnorm(x, residual, self.weight.data, self.eps)
+            return x, residual
+        # The XPU kernel flattens leading dims internally, so 2D/3D/4D inputs
+        # can all go through it directly without a Python-side reshape.
+        elif residual is None and x.dim() in (2, 3, 4):
+            return gemma_rmsnorm(x, self.weight.data, self.eps)
+        return self.forward_native(x, residual)
 
     def forward_musa(self, x, residual: Optional[torch.Tensor] = None):
         # sgl_kernel's gemma norm ops are built for MUSA; follow the CUDA path.

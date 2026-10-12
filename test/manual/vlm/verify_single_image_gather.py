@@ -76,9 +76,9 @@ def main():
     if rank == 0:
         print(
             f"world={world} owner={owner} shape=[{n_tok},{hidden}] "
-            f"(~{n_tok*hidden*2/1e6:.0f}MB) | all_ranks_bitwise_ok={bool(flags.item())} "
+            f"(~{n_tok * hidden * 2 / 1e6:.0f}MB) | all_ranks_bitwise_ok={bool(flags.item())} "
             f"(A==truth={eq_truth} A==B={eq_ab}) | all_gather {ta:.3f}ms "
-            f"broadcast {tb:.3f}ms speedup {ta/tb:.2f}x",
+            f"broadcast {tb:.3f}ms speedup {ta / tb:.2f}x",
             flush=True,
         )
     dist.destroy_process_group()

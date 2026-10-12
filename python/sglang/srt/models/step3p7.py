@@ -1,3 +1,4 @@
+from array import array
 from typing import Iterable, List, Optional, Tuple
 
 import torch
@@ -25,7 +26,6 @@ from sglang.srt.utils import add_prefix
 
 
 class Step3p7ForConditionalGeneration(nn.Module):
-
     # NVFP4 checkpoints (e.g. huangyu-nv/step3p7-nvfp4-moe-only-kvfp8) use
     # "model.language_model." prefix, while sglang parameters are named
     # "language_model.model.". This mapper remaps the quantization ignore
@@ -129,7 +129,7 @@ class Step3p7ForConditionalGeneration(nn.Module):
             )
         return self._flatten_embeddings(merged_image_features)
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 

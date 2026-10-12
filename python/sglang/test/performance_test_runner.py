@@ -55,7 +55,7 @@ def run_performance_test(
     if batch_sizes is None:
         batch_sizes = [1, 8, 16, 64]
 
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"Running PERFORMANCE test for {model.model_path}")
     print(f"  Variant: {model.variant}")
     print(f"  Batch sizes: {batch_sizes}")
@@ -63,7 +63,7 @@ def run_performance_test(
     print(f"  Output lens: {output_lens}")
     if spec_accept_length_threshold is not None:
         print(f"  Spec accept length threshold: {spec_accept_length_threshold}")
-    print(f"{'='*60}\n")
+    print(f"{'=' * 60}\n")
 
     # Build extra args for benchmarks
     extra_bench_args = ["--trust-remote-code"]

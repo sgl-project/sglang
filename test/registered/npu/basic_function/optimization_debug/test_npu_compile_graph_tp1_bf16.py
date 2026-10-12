@@ -29,7 +29,6 @@ os.environ["ASCEND_USE_FIA"] = "true"
 
 
 class TestAscendTp1Bf16(CustomTestCase):
-
     @classmethod
     def setUpClass(cls):
         cls.models = TEST_MODEL_MATRIX.keys()
@@ -71,7 +70,7 @@ class TestAscendTp1Bf16(CustomTestCase):
                             num_questions=1319,
                             max_new_tokens=512,
                             parallel=32,
-                            host=f"http://{self.url.hostname}",
+                            host=self.url.hostname,
                             port=int(self.url.port),
                         )
 

@@ -10,10 +10,23 @@ from typing import Any
 import torch
 
 from sglang.multimodal_gen.configs.models.base import ArchConfig, ModelConfig
-from sglang.multimodal_gen.utils import StoreBoolean
+from sglang.multimodal_gen.runtime.utils.argparse import StoreBoolean
 
 AUTO_PARALLEL_DECODE_MODE = "auto"
 SPATIAL_SHARD_PARALLEL_DECODE_MODES = ("spatial_shard", "spatial")
+
+
+def get_channelwise_decode_scale_and_shift(arch_config, device, dtype):
+    """Return reciprocal std and mean broadcast over BCTHW latents."""
+    scaling_factor = 1.0 / torch.tensor(arch_config.latents_std, device=device).view(
+        1, arch_config.z_dim, 1, 1, 1
+    ).to(device, dtype)
+    shift_factor = (
+        torch.tensor(arch_config.latents_mean)
+        .view(1, arch_config.z_dim, 1, 1, 1)
+        .to(device, dtype)
+    )
+    return scaling_factor, shift_factor
 
 
 @lru_cache(maxsize=8)

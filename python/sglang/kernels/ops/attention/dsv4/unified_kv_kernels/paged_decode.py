@@ -52,16 +52,25 @@ the captured launch sequence.
 from __future__ import annotations
 
 import functools
+import os
 
 import torch
 import triton
 import triton.language as tl
-from aiter.ops.triton.utils.device_info import get_num_sms
 
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.srt.utils import is_hip
+from sglang.srt.utils.common import is_gfx1250_supported
+
+_is_gfx1250_supported = is_gfx1250_supported()
 
 LOG2E = 1.4426950408889634  # log2(e); folded into qk_scale so softmax can use exp2.
-_MAX_KV_SPLITS = 64  # Hard cap on kv_splits (see _kv_splits_heuristic).
+
+# Split-K heuristic constants. The (1.5, 16) pair is tuned for MI355X (see
+# _kv_splits_heuristic); CUDA is unmeasured here and keeps the prior (2.0, 64).
+_is_hip = is_hip()
+_MAX_KV_SPLITS = 16 if _is_hip else 64  # Hard cap on kv_splits.
+_TARGET_WG_PER_CU = 1.5 if _is_hip else 2.0
 
 # FP8 KV cache (1xGROUP_SIZE block-scale quantization).
 #
@@ -81,6 +90,48 @@ _FP8_GROUP_SIZE = 64
 _FP8_DTYPE = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
 
 
+# --- layer-aware split-K (SGLANG_MLA_HCA_KV_SPLITS, 0 = keep the heuristic) --
+# `_kv_splits_heuristic` is an OCCUPANCY rule: it splits only when the base grid
+# underfills the device. That is the wrong question for this kernel. At bs=14
+# the grid nearly saturates (196 CTAs against a 384 target) so it picks
+# splits=1, while the actual cost is set by ONE straggler CTA walking ~5,000 KV
+# entries next to CTAs walking 200. Splitting breaks up that CTA; occupancy
+# never sees it.
+#
+# The discriminator is static and known at capture time: `compress_ratio`.
+#   CSA (ratio 4)   is clamped to index_topk+128 = 1152, dispersion ~0.19,
+#                   and split-K LOSES on it (+5.1 % measured at bs=14).
+#   HCA (ratio 128) is unclamped, kv_len ~ context/128 reaching ~5,000,
+#                   dispersion 0.70-0.78, and split-K wins at every kv_len the
+#                   run traverses.
+#
+# Measured on the HCA shape at bs=14 vs the heuristic's splits=1, swept over the
+# kv_len range the run actually traverses:
+#   median   200: splits 4 -41.8 %, 8 -35.8 %
+#   median  1300: splits 4 -50.1 %, 8 -54.0 %   <- steady state
+#   median  3000: splits 4 -23.8 %, 8 -27.0 %
+# 4 wins outright at the low end, gives ~93 % of 8 at steady state, and halves
+# the partial buffers: acc_partial is T x splits x h_padded x D x 4 B = 103 MB
+# at splits=4 against 205 MB at 8 for bs=14, charged inside the cuda-graph pool.
+#
+# End to end on DSv4 / MI355X / c128, n-weighted at matched batch size against
+# the same config with the plain heuristic: decode step 121.76 -> 114.12 ms
+# (-7.50 ms, -6.2 %). At c256 the gain is smaller (-5.37 ms of 156.19).
+_HCA_KV_SPLITS = int(os.environ.get("SGLANG_MLA_HCA_KV_SPLITS", "4"))
+
+
+def _kv_splits_for_stream(compress_ratio: int) -> int | None:
+    """-> kv_splits override for a decode stream, or None to keep the heuristic.
+
+    Only the unclamped stream is overridden. SWA (ratio 0) is a 128-entry
+    window and CSA (ratio 4) is clamped, so both are near-uniform and the
+    occupancy heuristic is already right for them.
+    """
+    if _HCA_KV_SPLITS > 0 and compress_ratio == 128:
+        return _HCA_KV_SPLITS
+    return None
+
+
 @functools.lru_cache(maxsize=1)
 def _cu_count() -> int:
     """Compute-unit count of the active GPU, queried once via aiter.
@@ -88,7 +139,12 @@ def _cu_count() -> int:
     Wrapped in ``lru_cache`` so the first decode call pays the device-property
     lookup and all subsequent calls hit the cache — important inside a hot
     decode loop and CUDAGraph capture (no data-dependent host work).
+
+    ``aiter`` is imported lazily: it is a ROCm-only package, and the pure-Python
+    heuristics below must stay importable on a machine without it.
     """
+    from aiter.ops.triton.utils.device_info import get_num_sms
+
     return get_num_sms()
 
 
@@ -141,7 +197,7 @@ def _kv_splits_heuristic(
     H: int,
     block_h: int,
     num_cu: int | None = None,
-    target_wg_per_cu: float = 2.0,
+    target_wg_per_cu: float = _TARGET_WG_PER_CU,
     max_kv_splits: int = _MAX_KV_SPLITS,
 ) -> int:
     """Pick KV_SPLITS to fill the GPU. CUDAGraph-safe: depends ONLY on
@@ -154,15 +210,30 @@ def _kv_splits_heuristic(
     ``T * ceil(H/block_h)`` underfills the device.
 
       base_ctas  = T * ceil(H / block_h)
-      target_wg  = target_wg_per_cu * num_cu     (≈ 1.7x to hide load-imbalance)
+      target_wg  = target_wg_per_cu * num_cu
       if base_ctas >= target_wg:  splits = 1     (grid already saturates GPU)
       else:                       splits = prev_pow2(min(target_wg/base_ctas,
                                                           max_kv_splits))
 
-    ``max_kv_splits`` (default 64) caps the number of split-kernel CTAs per
-    token. Higher values would buy more parallelism for bs=1 long-ctx, but
-    when per-token K is short most splits fall-through and the launch
-    overhead dominates. 64 is the sweet spot for MI300/MI355.
+    On HIP the tuned ``target_wg_per_cu`` is 1.5 (CUDA keeps 2.0, unmeasured
+    here). At 2.0 the rule over-split by exactly one power of two across the
+    whole decode range on MI355X: at H=128/block_h=64 it chose 8/4/2 splits for
+    T=32/64/128 where 4/2/1 measure faster. Split-K only pays while the base
+    grid underfills the device, and each extra split adds a partial-buffer write
+    plus reduce-kernel work that the shrinking per-split K no longer amortizes.
+
+    ``max_kv_splits`` caps the number of split-kernel CTAs per token (16 on HIP,
+    64 on CUDA). Higher values buy more parallelism for bs=1 long-ctx in
+    principle, but measured optima on MI355X never exceed 16 even at T=1: when
+    per-token K is short most splits fall through and the launch plus reduce
+    overhead dominates.
+
+    Measured over T in {1..256} x kv_len in {128,512,1024} at H=128 on MI355X,
+    scoring each candidate by distance from the per-shape optimum: (2.0, 64)
+    leaves 33.5% geomean regret (119% worst case), (1.5, 16) leaves 3.7% (36%
+    worst). The per-shape optimum does depend on per-token K, which is not
+    knowable at capture time, so the residual is the price of CUDAGraph safety
+    rather than a tuning gap.
 
     Rounded DOWN to a power of two — rounding up over-splits when
     splits_to_fill isn't already pow2 (e.g. T=2 → 258 → 512 doubles the wg
@@ -872,18 +943,39 @@ def sparse_attn_v4_paged_decode(
     attn_sink: torch.Tensor,
     softmax_scale: float,
     kv_scales: torch.Tensor | None = None,
+    kv_splits: int | None = None,
 ) -> torch.Tensor:
     """V4 decode sparse attention over a unified KV pool with paged indices.
 
     When ``kv_scales`` is provided, ``unified_kv`` must be fp8 (e4m3fnuz) and
     will be dequantized in-kernel using 1xGROUP_SIZE (default 64) block scales.
+
+    ``kv_splits`` overrides `_kv_splits_heuristic`. The caller knows the layer's
+    ``compress_ratio`` and the heuristic does not; see `_kv_splits_for_stream`.
     """
-    return _sparse_attn_v4_paged_decode_triton(
-        q,
-        unified_kv,
-        kv_indices,
-        kv_indptr,
-        attn_sink,
-        softmax_scale,
-        kv_scales=kv_scales,
-    )
+    if _is_gfx1250_supported:
+        # aiter ships only on ROCm, and this module is imported by a CPU-registered
+        # test, so the import has to sit behind the same gate as the call.
+        from aiter.ops.triton.attention.pa_decode_sparse import pa_decode_sparse
+
+        return pa_decode_sparse(
+            q,
+            unified_kv,
+            kv_indices,
+            kv_indptr,
+            attn_sink,
+            softmax_scale,
+            has_invalid=False,
+            kv_scales=kv_scales,
+        )
+    else:
+        return _sparse_attn_v4_paged_decode_triton(
+            q,
+            unified_kv,
+            kv_indices,
+            kv_indptr,
+            attn_sink,
+            softmax_scale,
+            kv_scales=kv_scales,
+            kv_splits=kv_splits,
+        )

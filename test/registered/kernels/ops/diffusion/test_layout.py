@@ -21,6 +21,7 @@ from sglang.kernels.jit.utils import get_ci_test_range
 from sglang.kernels.ops.attention.flash_attention import flash_attn_varlen_func
 from sglang.kernels.ops.diffusion import (
     build_inv_indices,
+    can_use_nearest_upsample_nhwc,
     can_use_usp_merge_heads,
     cat_pad_channels_last_3d,
     dup_up3d_add,
@@ -31,7 +32,9 @@ from sglang.kernels.ops.diffusion import (
 from sglang.kernels.ops.diffusion import (
     fused_causal_conv3d_cat_pad_cuda,
     fused_pack_qkv,
+    fused_pack_segmented_qkv,
     fused_scatter_to_padded,
+    nearest_upsample_nhwc,
     pack_qkv_destination_major,
     usp_merge_heads,
 )
@@ -58,6 +61,18 @@ def _cl3d(shape, dtype):
     return torch.randn(shape, device=DEVICE, dtype=dtype).contiguous(
         memory_format=torch.channels_last_3d
     )
+
+
+def _channels_first_3d(shape, dtype):
+    # Frames-major storage viewed as (B, C, T, H, W), like the WanResample output.
+    b, c, t, h, w = shape
+    return torch.randn((b, t, c, h, w), device=DEVICE, dtype=dtype).permute(
+        0, 2, 1, 3, 4
+    )
+
+
+def _video(layout, shape, dtype):
+    return _cl3d(shape, dtype) if layout == "cl" else _channels_first_3d(shape, dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -101,15 +116,13 @@ def test_usp_merge_heads_bitwise(dtype, world, seq, batch, h_local, head_dim):
 
 def test_usp_merge_heads_unsupported_inputs_use_exact_fallback():
     # The wrapper degrades to the aten permute for anything the fast path
-    # rejects -- a wrong rank, a transposed view, an empty leading dim, or a
-    # ROCm build -- so callers never need their own guard.
+    # rejects: a transposed view, an empty leading dim, or a ROCm build.
     x = torch.randn(2, 4, 1, 4, 64, dtype=torch.bfloat16, device=DEVICE)
-    for value in (x.transpose(0, 1), x[:0], x[0]):
+    for value in (x.transpose(0, 1), x[:0]):
         assert not can_use_usp_merge_heads(value)
-        if value.dim() == 5:
-            assert torch.equal(
-                usp_merge_heads(value), value.permute(2, 1, 0, 3, 4).contiguous()
-            )
+        assert torch.equal(
+            usp_merge_heads(value), value.permute(2, 1, 0, 3, 4).contiguous()
+        )
 
     with patch.object(torch.version, "hip", "6.3"):
         assert not can_use_usp_merge_heads(x)
@@ -151,6 +164,30 @@ def test_pack_qkv_destination_major_validates_inputs():
         pack_qkv_destination_major(q, q, q, 3)
     with pytest.raises(ValueError, match="expected shape"):
         pack_qkv_destination_major(q, q, q, 2, out=torch.empty_like(q))
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.mem_get_info()[0] < 24 * 2**30,
+    reason="needs a CUDA GPU with 24 GiB free",
+)
+def test_pack_qkv_destination_major_rows_past_int32():
+    """Past 2^31 elements, the last rows must pack exactly as the same rows
+    packed alone, whether the packed output, the q/k/v views, or both pass it."""
+    rows, heads, head_size = 119_024, 56, 128
+    qkv = torch.randn(rows, 3 * heads * head_size, device="cuda", dtype=torch.bfloat16)
+    views = [
+        t.view(rows, heads, head_size) for t in qkv.split(heads * head_size, dim=-1)
+    ]
+    tail = slice(100_000, None)
+    cases = (
+        ([t.contiguous() for t in views], 4),  # only the output passes 2^31
+        (views, 4),  # both pass 2^31
+        ([t[:, :1] for t in views], 1),  # only the q/k/v views pass 2^31
+    )
+    for (q, k, v), world in cases:
+        out = pack_qkv_destination_major(q, k, v, world)[:, tail]
+        ref = pack_qkv_destination_major(q[tail], k[tail], v[tail], world)
+        assert torch.equal(out, ref)
 
 
 # ---------------------------------------------------------------------------
@@ -209,6 +246,28 @@ def test_varlen_pack_matches_index_select(dtype, shape):
     for got, src in zip(fused, (q, k, v), strict=True):
         want = src.reshape(bs * s, num_heads, head_dim).index_select(0, indices)
         assert torch.equal(got, want)
+
+
+@pytest.mark.parametrize("dtype", VARLEN_DTYPES)
+@pytest.mark.parametrize("shape", VARLEN_SHAPES, ids=lambda s: s[0])
+def test_varlen_segmented_pack_matches_materialized_joint(dtype, shape):
+    _, bs, s_txt, s_img, num_heads, head_dim, valid_txt_lens = shape
+    torch.manual_seed(42)
+    indices, _ = _build_meta(_build_mask(bs, s_txt, s_img, valid_txt_lens))
+    txt_qkv = tuple(
+        torch.randn(bs, s_txt, num_heads, head_dim, dtype=dtype, device=DEVICE)
+        for _ in range(3)
+    )
+    img_qkv = tuple(
+        torch.randn(bs, s_img, num_heads, head_dim, dtype=dtype, device=DEVICE)
+        for _ in range(3)
+    )
+
+    got = fused_pack_segmented_qkv(*txt_qkv, *img_qkv, indices)
+    for actual, txt, img in zip(got, txt_qkv, img_qkv, strict=True):
+        joint = torch.cat([txt, img], dim=1)
+        expected = joint.flatten(0, 1).index_select(0, indices)
+        assert torch.equal(actual, expected)
 
 
 @pytest.mark.parametrize("dtype", VARLEN_DTYPES)
@@ -345,6 +404,45 @@ def _varlen_path(q, k, v, key_mask, softmax_scale):
 
 
 @pytest.mark.parametrize("dtype", VARLEN_DTYPES)
+def test_fa_dense_scheduler_matches_single_sequence_varlen(dtype):
+    torch.manual_seed(7)
+    batch_size, seq, num_heads, head_dim = 1, 256, 4, 128
+    q, k, v = (
+        torch.randn(
+            batch_size,
+            seq,
+            num_heads,
+            head_dim,
+            dtype=dtype,
+            device=DEVICE,
+        )
+        for _ in range(3)
+    )
+    cu_seqlens = torch.tensor([0, seq], dtype=torch.int32, device=DEVICE)
+    kwargs = dict(
+        max_seqlen_q=seq,
+        max_seqlen_k=seq,
+        softmax_scale=head_dim**-0.5,
+        causal=False,
+        ver=_fa_backend.fa_ver,
+    )
+    try:
+        varlen = flash_attn_varlen_func(
+            q.flatten(0, 1),
+            k.flatten(0, 1),
+            v.flatten(0, 1),
+            cu_seqlens,
+            cu_seqlens,
+            **kwargs,
+        ).view_as(q)
+        dense = flash_attn_varlen_func(q, k, v, None, None, **kwargs)
+    except ImportError as exc:  # pragma: no cover - image-dependent
+        pytest.skip(f"FlashAttention unavailable: {exc}")
+
+    torch.testing.assert_close(dense, varlen, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.parametrize("dtype", VARLEN_DTYPES)
 @pytest.mark.parametrize("shape", VARLEN_SHAPES, ids=lambda s: s[0])
 def test_varlen_path_matches_sdpa_on_valid_rows(dtype, shape):
     """Valid rows: varlen output ≈ SDPA output within FA tolerance."""
@@ -468,6 +566,7 @@ def _ref_cat_pad(x, cache, padding):
 
 
 @torch.no_grad()
+@pytest.mark.parametrize("x_layout", ["cl", "cf"])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize(
     "c,t,h,w,cache_t,pads",
@@ -479,9 +578,9 @@ def _ref_cat_pad(x, cache, padding):
         (48, 4, 10, 14, 2, (1, 1, 1, 1, 2, 0)),  # encoder-style T=4 chunk
     ],
 )
-def test_cat_pad_channels_last_3d_bitwise(dtype, c, t, h, w, cache_t, pads):
+def test_cat_pad_channels_last_3d_bitwise(dtype, c, t, h, w, cache_t, pads, x_layout):
     torch.cuda.manual_seed(0)
-    x = _cl3d((1, c, t, h, w), dtype)
+    x = _video(x_layout, (1, c, t, h, w), dtype)
     cache = None
     if cache_t:
         # Strided interior view: caches may arrive as non-contiguous slices.
@@ -512,22 +611,26 @@ def test_cat_pad_channels_last_3d_bitwise(dtype, c, t, h, w, cache_t, pads):
 @torch.no_grad()
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize(
+    "main_layout,src_layout", [("cf", "cl"), ("cf", "cf"), ("cl", "cf"), ("cl", "cl")]
+)
+@pytest.mark.parametrize(
     "c_in,c_out,t,h,w,ft,fs,drop",
     [
         (128, 64, 1, 10, 14, 2, 2, False),
         (128, 64, 1, 10, 14, 2, 2, True),  # first_chunk slicing
         (64, 32, 2, 10, 14, 1, 2, False),
+        (128, 64, 1, 10, 7, 2, 2, False),  # rows of 14: runs of 2 outputs
+        (32, 32, 2, 10, 7, 1, 1, False),  # rows of 7: no vector runs
     ],
 )
-def test_dup_up3d_add_bitwise(dtype, c_in, c_out, t, h, w, ft, fs, drop):
+def test_dup_up3d_add_bitwise(
+    dtype, c_in, c_out, t, h, w, ft, fs, drop, main_layout, src_layout
+):
     torch.cuda.manual_seed(0)
     repeats = c_out * ft * fs * fs // c_in
-    src = _cl3d((1, c_in, t, h, w), dtype)
+    src = _video(src_layout, (1, c_in, t, h, w), dtype)
     t_out = t * ft - (ft - 1 if drop else 0)
-    # Main arm as a permuted view, like the WanResample 2D output.
-    main = torch.randn(
-        (1, t_out, c_out, h * fs, w * fs), device=DEVICE, dtype=dtype
-    ).permute(0, 2, 1, 3, 4)
+    main = _video(main_layout, (1, c_out, t_out, h * fs, w * fs), dtype)
 
     dup = src.repeat_interleave(repeats, dim=1)
     dup = dup.view(1, c_out, ft, fs, fs, t, h, w)
@@ -595,3 +698,70 @@ def test_wan_cached_conv_chunk_loop_bitwise(pads_temporal_only):
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+# -------------------------------------------------------------------------
+# Wan-family VAE channels_last nearest upsample (pure gather, bit-exact)
+# -------------------------------------------------------------------------
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize(
+    "shape,scale", [((1, 192, 30, 52), 2), ((4, 96, 15, 26), 2), ((2, 3, 5, 7), (3, 2))]
+)
+@pytest.mark.parametrize("mode", ["nearest", "nearest-exact"])
+def test_nearest_upsample_nhwc_is_bit_exact(dtype, shape, scale, mode):
+    x = torch.randn(shape, device="cuda", dtype=dtype).contiguous(
+        memory_format=torch.channels_last
+    )
+    sf = (
+        (float(scale), float(scale))
+        if isinstance(scale, int)
+        else tuple(float(v) for v in scale)
+    )
+    assert can_use_nearest_upsample_nhwc(x, sf, mode)
+    ref = F.interpolate(x, scale_factor=sf, mode=mode)
+    out = nearest_upsample_nhwc(x, sf)
+    assert out.shape == ref.shape
+    assert out.stride() == ref.stride()  # layout-identical, not just values
+    assert torch.equal(out, ref)
+
+
+@torch.no_grad()
+def test_nearest_upsample_nhwc_rejects_unsupported_inputs():
+    x = torch.randn(2, 8, 6, 6, device="cuda", dtype=torch.bfloat16)
+    assert not can_use_nearest_upsample_nhwc(x, 2.0, "nearest-exact")  # NCHW
+    x_cl = x.contiguous(memory_format=torch.channels_last)
+    assert can_use_nearest_upsample_nhwc(x_cl, 2.0, "nearest-exact")
+    assert not can_use_nearest_upsample_nhwc(x_cl, 1.5, "nearest-exact")
+    assert not can_use_nearest_upsample_nhwc(x_cl, 2.0, "bilinear")
+    assert not can_use_nearest_upsample_nhwc(x_cl[:, :, :0], 2.0, "nearest")
+    # Malformed scale factors must yield False, never raise.
+    for bad in (
+        (None, 2),
+        float("nan"),
+        float("inf"),
+        (2, float("-inf")),
+        "2",
+        True,
+        (2,),
+    ):
+        assert not can_use_nearest_upsample_nhwc(x_cl, bad, "nearest")
+    # C == 1 is also NCHW-contiguous: aten picks its NCHW kernel and returns a
+    # differently laid-out tensor, so the predicate must reject it.
+    x1 = torch.randn(1, 1, 1, 1, device="cuda", dtype=torch.bfloat16)
+    assert x1.is_contiguous(memory_format=torch.channels_last)
+    assert not can_use_nearest_upsample_nhwc(x1, 2.0, "nearest-exact")
+    with pytest.raises(ValueError):
+        nearest_upsample_nhwc(x1, 2.0)
+    # Direct calls validate too: no silent autograd drop, no layout surprise.
+    with pytest.raises(ValueError):
+        nearest_upsample_nhwc(x_cl, 1.5)
+    with pytest.raises(ValueError):
+        nearest_upsample_nhwc(x, 2.0)  # NCHW
+    with torch.enable_grad():
+        xg = x_cl.clone().requires_grad_(True)
+        assert not can_use_nearest_upsample_nhwc(xg, 2.0, "nearest")
+        with pytest.raises(ValueError):
+            nearest_upsample_nhwc(xg, 2.0)

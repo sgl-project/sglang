@@ -1,27 +1,33 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 import asyncio
+import dataclasses
 import inspect
 import json
 import os
+import re
 import shutil
 import tempfile
 import time
 from contextlib import contextmanager
-from typing import Any, Generator, List, Optional, Union
+from functools import cache
+from typing import Any, Generator, List, Literal, Optional, Union
 
 import httpx
 from fastapi import HTTPException, UploadFile
+from pydantic import BaseModel
 
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     DataType,
     SamplingParams,
 )
-from sglang.multimodal_gen.runtime.entrypoints.utils import (
+from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
     ListLorasReq,
     MergeLoraWeightsReq,
     SetLoraReq,
     ShutdownReq,
     UnmergeLoraWeightsReq,
+)
+from sglang.multimodal_gen.runtime.entrypoints.utils import (
     format_lora_message,
     save_outputs,
 )
@@ -29,7 +35,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBa
 from sglang.multimodal_gen.runtime.scheduler_client import AsyncSchedulerClient
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.common import parse_size
-from sglang.multimodal_gen.runtime.utils.image_io import save_base64_image_to_path
+from sglang.multimodal_gen.runtime.utils.image_io import (
+    ensure_path_within_root,
+    save_base64_image_to_path,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     init_logger,
     log_batch_completion,
@@ -95,6 +104,103 @@ def flatten_extra_params(payload: Any) -> dict[str, Any]:
     return payload
 
 
+_REQUEST_EXTRA_CONTAINERS = (
+    "extra_body",
+    "extra_json",
+    "extra_args",
+    "extra_params",
+)
+
+
+def _parse_request_extra_container(value: Any) -> dict[str, Any]:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return {}
+    if not isinstance(value, dict):
+        return {}
+    return flatten_extra_params(dict(value))
+
+
+def request_extra_value(request: Any, field_name: str) -> Any:
+    """Read an extension field while preserving top-level precedence.
+
+    This function only handles transport compatibility. Callers must first use
+    the active SamplingParams subclass to decide which model-owned fields are
+    valid; transport helpers must not introduce per-model allowlists.
+    """
+
+    extra = dict(getattr(request, "model_extra", None) or {})
+    direct = {
+        key: value
+        for key, value in extra.items()
+        if key not in _REQUEST_EXTRA_CONTAINERS
+    }
+    direct = flatten_extra_params(direct)
+    if field_name in direct and direct[field_name] is not None:
+        return direct[field_name]
+
+    for container_name in _REQUEST_EXTRA_CONTAINERS:
+        nested = _parse_request_extra_container(extra.get(container_name))
+        if field_name in nested and nested[field_name] is not None:
+            return nested[field_name]
+    return None
+
+
+def request_field_value(request: BaseModel, field_name: str) -> Any:
+    """Prefer a non-None protocol field over transport extras."""
+    value = vars(request).get(field_name)
+    if value is not None:
+        return value
+    return request_extra_value(request, field_name)
+
+
+@cache
+def get_declared_request_extra_fields(
+    sampling_params_cls: type[SamplingParams],
+    api: Literal["image", "video"],
+) -> frozenset[str]:
+    """Return the active model's accepted fields, including transport aliases."""
+
+    if api == "image":
+        return sampling_params_cls.image_request_extra_fields()
+    return sampling_params_cls.video_request_extra_fields()
+
+
+@cache
+def get_sampling_request_extra_fields(
+    sampling_params_cls: type[SamplingParams],
+    api: Literal["image", "video"],
+) -> frozenset[str]:
+    """Return declared extension fields that can initialize SamplingParams.
+
+    A video declaration may also contain transport-only aliases. Those remain
+    on the request for the model's lowering hook instead of being passed to the
+    dataclass constructor.
+    """
+
+    declared = get_declared_request_extra_fields(sampling_params_cls, api)
+    init_fields = {
+        field.name for field in dataclasses.fields(sampling_params_cls) if field.init
+    }
+    return declared & init_fields
+
+
+def request_model_kwargs(
+    request: BaseModel,
+    sampling_params_cls: type[SamplingParams],
+    api: Literal["image", "video"],
+) -> dict[str, Any]:
+    """Extract only constructor fields declared by the active model contract."""
+    kwargs = {}
+    for field_name in get_sampling_request_extra_fields(sampling_params_cls, api):
+        value = request_extra_value(request, field_name)
+        if value is not None:
+            kwargs[field_name] = value
+    return kwargs
+
+
 @contextmanager
 def temp_dir_if_disabled(
     configured_path: str | None,
@@ -135,6 +241,17 @@ def build_sampling_params(request_id: str, **kwargs) -> SamplingParams:
 
     # pop HTTP-layer params that aren't SamplingParams fields
     output_quality = kwargs.pop("output_quality", None)
+    request_data_type = kwargs.pop("request_data_type", None)
+    if request_data_type is not None:
+        try:
+            kwargs["task_type"] = server_args.pipeline_config.resolve_task_type(
+                kwargs.get("task_type"),
+                data_type=request_data_type,
+                has_image=bool(kwargs.get("image_path")),
+                has_video=bool(kwargs.get("video_path")),
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     has_explicit_compression = kwargs.get("output_compression") is not None
 
@@ -161,22 +278,65 @@ def build_sampling_params(request_id: str, **kwargs) -> SamplingParams:
     kwargs = {k: v for k, v in kwargs.items() if v is not None}
     kwargs.setdefault("save_output", True)
 
-    sampling_params = SamplingParams.from_user_sampling_params_args(
-        model_path=server_args.model_path,
-        server_args=server_args,
-        request_id=request_id,
-        **kwargs,
-    )
+    try:
+        sampling_params = SamplingParams.from_user_sampling_params_args(
+            model_path=server_args.model_path,
+            server_args=server_args,
+            request_id=request_id,
+            **kwargs,
+        )
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     # resolve output_quality → output_compression with the correct data_type.
     # SamplingParams.__post_init__ may have resolved with the wrong data_type
     # (default VIDEO) before _adjust() set the correct one.
     if not has_explicit_compression and output_quality is not None:
-        resolved = adjust_output_quality(output_quality, sampling_params.data_type)
-        if resolved is not None:
-            sampling_params.output_compression = resolved
+        sampling_params.output_compression = adjust_output_quality(
+            output_quality, sampling_params.data_type
+        )
 
     return sampling_params
+
+
+def resolve_sampling_params_cls(server_args: Any) -> type[SamplingParams]:
+    """Resolve the model-owned sampling contract selected for this server.
+
+    Shared API code must dispatch through this type instead of branching on a
+    model ID or importing individual model configurations.
+    """
+
+    sampling_params_cls = SamplingParams
+    if server_args.pipeline_class_name:
+        from sglang.multimodal_gen.registry import get_pipeline_config_classes
+
+        config_classes = get_pipeline_config_classes(server_args.pipeline_class_name)
+        if config_classes is not None:
+            _, sampling_params_cls = config_classes
+    if sampling_params_cls is SamplingParams:
+        from sglang.multimodal_gen.registry import get_model_info
+
+        model_info = get_model_info(
+            server_args.model_path,
+            backend=server_args.backend,
+            model_id=server_args.model_id,
+        )
+        if model_info is not None:
+            sampling_params_cls = model_info.sampling_param_cls
+    return sampling_params_cls
+
+
+def sanitize_upload_filename(filename: str, fallback: str) -> str:
+    name = os.path.basename((filename or "").replace("\\", "/"))
+    if not name or name in {".", ".."}:
+        name = fallback
+
+    stem, ext = os.path.splitext(name)
+    safe_stem = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("._")
+    safe_ext = re.sub(r"[^A-Za-z0-9.]+", "", ext)
+    if not safe_stem:
+        safe_stem = re.sub(r"[^A-Za-z0-9._-]+", "_", fallback).strip("._") or "upload"
+    return f"{safe_stem}{safe_ext}"
 
 
 async def save_image_to_path(
@@ -184,9 +344,15 @@ async def save_image_to_path(
     target_path: str,
     *,
     prefer_remote_source: bool = False,
+    uploads_root: str | None = None,
 ) -> str:
+    if uploads_root is not None:
+        target_path = ensure_path_within_root(target_path, uploads_root)
     input_path = await _maybe_url_image(
-        image, target_path, prefer_remote_source=prefer_remote_source
+        image,
+        target_path,
+        prefer_remote_source=prefer_remote_source,
+        uploads_root=uploads_root,
     )
     if input_path is None:
         input_path = await _save_upload_to_path(image, target_path)
@@ -225,6 +391,7 @@ async def _maybe_url_image(
     target_path: str,
     *,
     prefer_remote_source: bool = False,
+    uploads_root: str | None = None,
 ) -> str | None:
     if not isinstance(img_url, str):
         return None
@@ -235,19 +402,25 @@ async def _maybe_url_image(
         if prefer_remote_source:
             return img_url
         # download image from URL and persist on disk
-        input_path = await _save_url_image_to_path(img_url, target_path)
+        input_path = await _save_url_image_to_path(
+            img_url, target_path, uploads_root=uploads_root
+        )
         return input_path
     elif img_url.startswith("data:image"):
         if prefer_remote_source:
             return img_url
         # encode image base64 url and persist on disk
-        input_path = save_base64_image_to_path(img_url, target_path)
+        input_path = save_base64_image_to_path(
+            img_url, target_path, uploads_root=uploads_root
+        )
         return input_path
     else:
         raise ValueError("Unsupported image url format")
 
 
-async def _save_url_image_to_path(image_url: str, target_path: str) -> str:
+async def _save_url_image_to_path(
+    image_url: str, target_path: str, *, uploads_root: str | None = None
+) -> str:
     """Download image from URL and save to target path."""
 
     def _is_retryable_download_error(error: Exception) -> bool:
@@ -313,6 +486,8 @@ async def _save_url_image_to_path(image_url: str, target_path: str) -> str:
                             )
                         target_path = f"{target_path}{ext}"
 
+                    if uploads_root is not None:
+                        target_path = ensure_path_within_root(target_path, uploads_root)
                     with open(target_path, "wb") as f:
                         f.write(response.content)
 
@@ -374,6 +549,7 @@ async def process_generation_batch(
                 audio=result.audio,
                 audio_sample_rate=result.audio_sample_rate,
                 output_compression=batch.output_compression,
+                x264_preset=batch.x264_preset,
                 enable_frame_interpolation=batch.enable_frame_interpolation,
                 frame_interpolation_exp=batch.frame_interpolation_exp,
                 frame_interpolation_scale=batch.frame_interpolation_scale,
@@ -465,7 +641,14 @@ def add_common_data_to_response(
     return response
 
 
-def adjust_output_quality(output_quality: str, data_type: DataType = None) -> int:
+def adjust_output_quality(
+    output_quality: str, data_type: DataType | None = None
+) -> int:
     if output_quality == "default":
         return 50 if data_type == DataType.VIDEO else 75
-    return OUTPUT_QUALITY_MAPPER.get(output_quality, None)
+    if output_quality not in OUTPUT_QUALITY_MAPPER:
+        valid = list(OUTPUT_QUALITY_MAPPER.keys()) + ["default"]
+        raise ValueError(
+            f"Invalid output_quality {output_quality!r}. Expected one of: {valid}"
+        )
+    return OUTPUT_QUALITY_MAPPER[output_quality]

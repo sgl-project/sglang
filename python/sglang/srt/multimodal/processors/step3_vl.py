@@ -27,7 +27,6 @@ ImageWithPatches = tuple[Step3Image, list[Step3Image], list[int] | None]
 
 
 class GPUToTensor(torch.nn.Module):
-
     def forward(
         self, raw_image: Union[np.ndarray, Image.Image, torch.Tensor]
     ) -> torch.Tensor:
