@@ -20,8 +20,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_COMPONENT_PACKAGE = "sglang_afd_deepep_v2"
-_COMPONENT_DISTRIBUTION = "sglang-afd-deepep-v2"
+_COMPONENT_PACKAGE = "deep_ep.afd"
+_COMPONENT_DISTRIBUTION = "sgl-deep-ep"
 EXPERT_ALIGNMENT = 128
 
 
@@ -29,11 +29,11 @@ def _import_component() -> Any:
     try:
         module = importlib.import_module(_COMPONENT_PACKAGE)
     except ModuleNotFoundError as exc:
-        if exc.name != _COMPONENT_PACKAGE:
+        if exc.name not in ("deep_ep", _COMPONENT_PACKAGE):
             raise
         raise RuntimeError(
-            "--afd-backend direct_deepep requires the optional package "
-            f"{_COMPONENT_DISTRIBUTION!r}"
+            "--afd-backend direct_deepep requires a "
+            f"{_COMPONENT_DISTRIBUTION!r} build with AFD extensions"
         ) from exc
     return module
 
@@ -195,8 +195,9 @@ class AFDDirectDeepEPAdapter:
             rank,
             comm.config.world_size,
             nccl_comm_ptr,
+            [],
             num_bytes,
-            False,
+            0,
             allow_hybrid_mode,
             allow_multiple_reduction,
             True,
@@ -206,11 +207,13 @@ class AFDDirectDeepEPAdapter:
             120,
             True,
             self._role is AFDRole.ATTN,
+            True,
         )
 
         torch.cuda.synchronize()
         comm.startup_barrier()
-        self._runtime.barrier(True, False)
+        # Preserve the original parallel scaleout/scaleup barrier.
+        self._runtime.barrier(True, False, False)
         torch.cuda.synchronize()
 
         logger.info(
@@ -304,20 +307,25 @@ class AFDDirectDeepEPAdapter:
             _recv_topk_ids,
             recv_topk_weights,
             copied_topk_ids,
+            _num_recv_tokens,
+            _num_expanded_tokens,
             _num_recv_tokens_per_expert,
             psum_num_recv_tokens_per_scaleup_rank,
             psum_num_recv_tokens_per_expert,
-            masked_m,
+            num_unaligned_recv_tokens_per_expert,
             recv_src_metadata,
             _dst_buffer_slot_idx,
             token_metadata_at_forward,
             channel_linked_list,
             completion_event,
-        ) = self._runtime.dispatch(
+        ) = self._runtime.dispatch_afd(
             wire_hidden_states,
             wire_scale,
             topk_ids.to(dtype=self._topk_dtype).contiguous(),
             topk_weights.float().contiguous(),
+            None,
+            None,
+            None,
             None,
             None,
             None,
@@ -338,6 +346,7 @@ class AFDDirectDeepEPAdapter:
             True,
             do_cpu_sync,
             True,
+            False,
             True,
             self._use_nvfp4,
             input_scale,
@@ -352,7 +361,9 @@ class AFDDirectDeepEPAdapter:
             topk_ids=copied_topk_ids,
             topk_weights=recv_topk_weights,
             expert_psum=psum_num_recv_tokens_per_expert,
-            masked_m=masked_m,
+            masked_m=(
+                num_unaligned_recv_tokens_per_expert if self._use_nvfp4 else None
+            ),
             expert_capacity=expert_capacity,
             handle=_AFDElasticHandle(
                 num_max_tokens_per_rank=bucket,
@@ -382,7 +393,7 @@ class AFDDirectDeepEPAdapter:
         if self._role is AFDRole.ATTN:
             expert_weights = None
             combine_input = self._attn_combine_input
-        combined, _combined_topk_weights, completion_event = self._runtime.combine(
+        combined, _combined_topk_weights, completion_event = self._runtime.combine_afd(
             combine_input.contiguous(),
             expert_weights,
             None,
@@ -439,7 +450,6 @@ def build_afd_direct_deepep_adapters(
         raise RuntimeError(f"AFD Direct DeepEP requires BF16 activations, got {dtype}")
 
     component = _import_component()
-    component.validate_runtime()
     if comm_sm_budget is None:
         raise RuntimeError("AFD Direct DeepEP requires an FFN communication SM budget")
 

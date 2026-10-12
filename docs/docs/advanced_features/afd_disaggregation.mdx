@@ -59,7 +59,7 @@ applies to specific model, checkpoint, backend, and hardware configurations.
 | --- | --- | --- |
 | `nccl` | Staged transfers between A and F | None |
 | `nvshmem` | Transfers through a shared symmetric arena | `afd-nvshmem` |
-| `direct_deepep` | Direct token dispatch from A ranks to F expert owners | `sglang-afd-deepep-v2` |
+| `direct_deepep` | Direct token dispatch from A ranks to F expert owners | An `sgl-deep-ep` build exposing `deep_ep.afd` |
 | `direct_megamoe` | Fused M2N dispatch, expert compute, and combine | An `sgl-deep-gemm` build exposing `deep_gemm.mega.m2n` |
 
 All backends use staged NCCL transfers for prefill. For staged backends,
@@ -80,6 +80,11 @@ for your Python version, CPU architecture, Torch, and CUDA environment. These
 AFD component builds are separate from the standard SGLang installation; a stock
 DeepGEMM wheel does not provide the M2N API.
 
+The standard `sgl-deep-ep` package provides legacy `deep_ep.Buffer` and v2
+`deep_ep.ElasticBuffer` for the `deepep` and `deepep_v2` MoE backends.
+AFD's `direct_deepep` uses additional native bindings from `deep_ep.afd` in
+the same package. Current official wheels do not include these AFD extensions.
+
 {/* TODO: Add public source and release links once component publishing is finalized. */}
 
 Replace the local paths below with the corresponding wheel paths:
@@ -89,15 +94,16 @@ Replace the local paths below with the corresponding wheel paths:
 python -m pip install --no-deps /path/to/afd_nvshmem-*.whl
 
 # For --afd-backend direct_deepep:
-python -m pip install --no-deps /path/to/sglang_afd_deepep_v2-*.whl
+python -m pip install --no-deps /path/to/sgl_deep_ep-*.whl
 
 # For --afd-backend direct_megamoe:
 python -m pip install --no-deps /path/to/sgl_deep_gemm-*.whl
 ```
 
-Use an AFD-tagged DeepGEMM version to distinguish this build from the stock
-release. The isolated `sglang_afd_deepep_v2` module and the private NVSHMEM runtime
-allow their AFD paths to coexist with F's standard DeepEP prefill path.
+Use AFD-tagged versions for the modified DeepEP and DeepGEMM builds to distinguish
+them from stock releases. The AFD DeepEP wheel replaces the standard
+`sgl-deep-ep` wheel and also supplies F's DeepEP prefill path. The private NVSHMEM
+runtime allows its AFD path to coexist with standard DeepEP.
 
 ## Reference deployment
 
