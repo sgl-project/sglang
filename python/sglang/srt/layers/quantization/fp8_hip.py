@@ -148,7 +148,6 @@ def _flydsl_gemm():
 def _prepare_flydsl(layer: torch.nn.Module) -> None:
     """Weight scales in mxfp8_gemm_gfx950's layout when SGLANG_OPT_HIP_FLYDSL_MXFP8 is
     set and the kernel takes this weight; weight_scale_flydsl stays None otherwise."""
-    layer.weight_scale_flydsl = None
     n, k = layer.weight.shape
     if (
         not envs.SGLANG_OPT_HIP_FLYDSL_MXFP8.get()
@@ -157,10 +156,13 @@ def _prepare_flydsl(layer: torch.nn.Module) -> None:
         or not layer.weight.is_contiguous()
         or _flydsl_gemm() is None
     ):
+        layer.weight_scale_flydsl = None
         return
     # one row of block scales per output row
     rows = layer.weight_scale_mx_e8m0.repeat_interleave(32, dim=0)[:n]
-    layer.weight_scale_flydsl = _flydsl_gemm().mxfp8_scale_layout(rows)
+    copy_or_rebind_param(
+        layer, "weight_scale_flydsl", _flydsl_gemm().mxfp8_scale_layout(rows)
+    )
 
 
 def _apply_flydsl(
