@@ -1228,6 +1228,24 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         return ffn_exit.finish(hidden_states)
 
 
+def _refreshes_rope_cos_sin(
+    config: Qwen3_5TextConfig, layer_id: int, is_nextn: bool
+) -> bool:
+    """rotary_emb is shared by all layers, so its per-forward cos/sin is refreshed
+    once, at the first full-attention layer this PP stage owns."""
+    # Drafts keep the unsplit numbering.
+    stage_start = 0
+    if not is_nextn:
+        stage_start, _ = get_pp_indices(
+            config.num_hidden_layers,
+            get_parallel().pp_rank,
+            get_parallel().pp_size,
+        )
+    # Full-attention layers are interval apart, so only the first one in the
+    # stage lies within interval of its start.
+    return stage_start <= layer_id < stage_start + config.full_attention_interval
+
+
 class Qwen3_5AttentionDecoderLayer(nn.Module):
     """Qwen3.5 Decoder Layer with Full Attention."""
 
@@ -1248,20 +1266,8 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         self.attn_tp_rank = get_parallel().attn_tp_rank
         self.attn_tp_size = get_parallel().attn_tp_size
-        # rotary_emb is shared by all layers, so its per-forward cos/sin is refreshed
-        # once, at the first full-attention layer this PP stage owns. Drafts keep the
-        # unsplit numbering.
-        stage_start = 0
-        if not is_nextn:
-            stage_start, _ = get_pp_indices(
-                config.num_hidden_layers,
-                get_parallel().pp_rank,
-                get_parallel().pp_size,
-            )
-        # Full-attention layers are interval apart, so only the first one in the
-        # stage lies within interval of its start.
-        self.refreshes_rope_cos_sin = (
-            stage_start <= layer_id < stage_start + config.full_attention_interval
+        self.refreshes_rope_cos_sin = _refreshes_rope_cos_sin(
+            config, layer_id, is_nextn
         )
         # A Qwen3.5 draft is rewritten to the MTP arch (model_config._config_draft_model),
         # so is_nextn marks it. Drafts are TP-sharded and do not replicate KV under DCP.
