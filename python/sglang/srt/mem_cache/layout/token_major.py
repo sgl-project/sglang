@@ -43,6 +43,11 @@ def align_entry_bytes(num_bytes: int) -> int:
     return -(-num_bytes // ENTRY_ALIGN_BYTES) * ENTRY_ALIGN_BYTES
 
 
+def align_part_offset(num_bytes: int) -> int:
+    """Round a part's byte offset inside the entry up to the row alignment."""
+    return -(-num_bytes // ROW_ALIGN_BYTES) * ROW_ALIGN_BYTES
+
+
 class DensePart(msgspec.Struct, frozen=True, kw_only=True):
     """One row family inside the entry: ``layer_num`` rows of ``row_shape``,
     layer ``l`` at ``offset_bytes + l * layer_stride_bytes``."""
