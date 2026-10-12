@@ -1265,12 +1265,18 @@ class CompressorAscendBackendMixin:
                             ).hexdigest()[:8]
                             _rc.append(f"{_p}={_sl}:{_h}")
                     _rdcarry_col = "[" + ",".join(_rc) + "]"
-                    # (3) idxK: produced index-K for global blocks 4382/4383.
-                    #     The op output MAY be padded, and the caller trims it
-                    #     with  cmp_kv = cmp_kv[: loc.numel()]  a few lines
-                    #     below. Read the SAME trimmed view here, else [-1]
-                    #     could be a padding row and (gamma) is void. n_raw /
-                    #     n_keep are emitted so a wrong trim is visible.
+                    # (3) idxK: produced index-K of the WHOLE last c4 page,
+                    #     keyed by ABSOLUTE ratio-compressed block ids. The op
+                    #     output MAY be padded, and the caller trims it with
+                    #     cmp_kv = cmp_kv[: loc.numel()] a few lines below, so
+                    #     read the SAME trimmed view here (else a tail row
+                    #     could be padding and (gamma) is void); n_raw/n_keep
+                    #     are emitted so a wrong trim is visible. The stored
+                    #     side ([IDXK] blkx) is a whole 128-token page = 128/r
+                    #     blocks (32 for r=4), so emit the last full page of
+                    #     produced rows -- NOT a hardcoded last-two-block pair,
+                    #     which masked a divergence in any other block of the
+                    #     page and mislabelled whenever the last block != 4383.
                     try:
                         torch.npu.synchronize()
                     except Exception:
@@ -1282,26 +1288,41 @@ class CompressorAscendBackendMixin:
                         if _loc is not None and int(_loc.numel()) < _n_raw
                         else _n_raw
                     )
-                    _ik = [f"n_raw={_n_raw},n_keep={_n_keep}"]
                     _ck = (
                         cmp_kv[: _n_keep].detach().to(torch.float32).cpu()
                     )
-                    if _ck.shape[0] >= 2:
-                        for _bid, _ri in ((4382, -2), (4383, -1)):
-                            _row = _ck[_ri].reshape(-1)
+                    # A ratio-r block spans r tokens and a c4 page spans 128
+                    # tokens, so a page holds 128 // r blocks (32 for r=4).
+                    # Emit the WHOLE last page of produced rows under their
+                    # ABSOLUTE block ids, so the [C4DEC-VERDICT] join sees the
+                    # same blocks the stored [IDXK] page carries.  Guard the
+                    # ratio==0 / empty cases; a short call (_n < _P) emits
+                    # whatever rows exist.
+                    _P = 128 // ratio if ratio else 0
+                    _n = int(_ck.shape[0])
+                    _ik = [f"n_raw={_n_raw},n_keep={_n_keep}"]
+                    if _P > 0 and _n > 0 and _sp_l:
+                        _last_blk = max(
+                            (int(_sp_l[_b]) + int(_su_l[_b])) // ratio - 1
+                            for _b in range(len(_sp_l))
+                        )
+                        _ik[0] = (
+                            f"n_raw={_n_raw},n_keep={_n_keep},"
+                            f"first_block={_last_blk - (_n - 1)},"
+                            f"last_block={_last_blk}"
+                        )
+                        for _i in range(max(0, _n - _P), _n):
+                            _bid = _last_blk - (_n - 1 - _i)
+                            _row = _ck[_i].reshape(-1)
+                            if not _row.numel():
+                                continue
                             _h = _hld.md5(
                                 _row.numpy().tobytes()
                             ).hexdigest()[:8]
-                            _v0 = float(_row[0]) if _row.numel() else 0.0
-                            _sum = float(_row.sum())
-                            _am = (
-                                float(_row.abs().max())
-                                if _row.numel()
-                                else 0.0
-                            )
                             _ik.append(
-                                f"{_bid}:{_h}:v0={_v0:.4e}:sum={_sum:.4e}:"
-                                f"am={_am:.4e}"
+                                f"{_bid}:{_h}:v0={float(_row[0]):.4e}:"
+                                f"sum={float(_row.sum()):.4e}:"
+                                f"am={float(_row.abs().max()):.4e}"
                             )
                     _idxk_col = "[" + ",".join(_ik) + "]"
                     print(
