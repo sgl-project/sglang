@@ -362,6 +362,23 @@ class GlmImageAR(PipelineStage):
                 e,
             )
             raise
+        except requests.HTTPError as e:
+            # HTTPError alone omits the server's request-validation details.
+            response = e.response
+            if response is not None:
+                logger.error(
+                    "SGLang encoder at %s returned HTTP %s: %s",
+                    server_args.srt_encoder_url,
+                    response.status_code,
+                    response.text[:2000],
+                )
+            else:
+                logger.error(
+                    "SGLang encoder at %s failed with no response: %s",
+                    server_args.srt_encoder_url,
+                    e,
+                )
+            raise
         except requests.RequestException as e:
             logger.error(
                 "SGLang encoder request to %s failed: %s",

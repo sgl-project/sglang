@@ -278,6 +278,11 @@ jobs:
           # copy gsm8k dataset from cache
           cp ~/.cache/modelscope/hub/datasets/tmp/test.jsonl /tmp
 
+      - name: Prefetch image-edit input
+        env:
+          GITHUB_PROXY_URL: "https://gh-proxy.test.osinfra.cn/"
+        run: python3 scripts/ci/utils/diffusion/prefetch_input_image.py
+
       - name: Run test
         timeout-minutes: 60
         env:
