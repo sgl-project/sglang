@@ -4,7 +4,6 @@ from typing import Optional, Tuple
 
 import torch
 import triton
-from aiter.ops.triton._gluon_kernels.gfx950.attention.pa_decode_sparse import _qkpv_fp8
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
@@ -105,32 +104,25 @@ def _compact_qkpv(
     BLOCK: gl.constexpr,
     SCALE: gl.constexpr,
 ):
-    # aiter's private helper, by keyword: a renamed or reordered parameter fails to compile
-    return _qkpv_fp8(
-        k_nope=kv,
-        k_rope=kv,
-        valid=valid,
-        q_dot=qdot,
-        m_i=m,
-        l_i=den,
-        acc=acc,
-        head_mask=head_mask,
-        qk_scale=SCALE * RCP_LN2,
-        kv_smem=smem,
-        qk_layout=MF,
-        pv_layout=MF,
-        k_layout=gl.DotOperandLayout(1, MF, 8),
-        v_layout=gl.DotOperandLayout(1, MF, 8),
-        p_layout=gl.DotOperandLayout(0, MF, 8),
-        NOPE_DIM=512,
-        ROPE_DIM=0,
-        HEAD_SIZE=512,
-        BLOCK_M=16,
-        BLOCK_K=BLOCK,
-        HEAD_ALIGNED=H % 16 == 0,
-        UNIFORM=True,
-        HAS_INVALID=True,
-    )
+    # m stays unscaled: the epilogue scales it by SCALE * RCP_LN2
+    qk_scale: gl.constexpr = SCALE * RCP_LN2
+    smem.store(kv)
+    k = smem.permute([1, 0]).load(gl.DotOperandLayout(1, MF, 8))
+    s = gl.amd.cdna4.mfma(qdot, k, gl.zeros([16, BLOCK], gl.float32, layout=MF))
+    mask = gl.convert_layout(valid, gl.SliceLayout(0, MF))[None, :]
+    if H % 16 != 0:
+        mask = gl.convert_layout(head_mask, gl.SliceLayout(1, MF))[:, None] & mask
+    s = gl.where(mask, s, -float("inf"))
+    m_new = gl.maximum(m, gl.max(s, axis=1))
+    m_new = gl.where(m_new > -float("inf"), m_new, 0.0)
+    m_new_s = m_new * qk_scale
+    p = gl.exp2(s * qk_scale - m_new_s[:, None])
+    alpha = gl.exp2(m * qk_scale - m_new_s)
+    den = den * alpha + gl.sum(p, axis=1)
+    v = smem.load(gl.DotOperandLayout(1, MF, 8))
+    p = gl.convert_layout(p.to(gl.bfloat16), gl.DotOperandLayout(0, MF, 8))
+    acc = acc * gl.convert_layout(alpha, gl.SliceLayout(1, MF))[:, None]
+    return m_new, den, gl.amd.cdna4.mfma(p, v, acc)
 
 
 @gluon.jit
