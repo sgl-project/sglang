@@ -1339,26 +1339,6 @@ def _pick_tactic(m: int, n: int, k: int) -> int:
 # (L2-defeating weight rotation + CUDA-graph timing; serving A/B confirmed
 # e2e with GSM8K parity). kv_a (n=576) loses (0.84x) and stays out. Gated to
 # small decode batches; larger m stays on the measured heuristic below.
-# Muse Spark Open TP4 projections using TGV on B300 at M <= 8.
-_MUSE_SPARK_TGV_WIN_SHAPES = frozenset(
-    {
-        (4608, 8192),  # qkvg
-        (4096, 8192),  # pooler
-        (8192, 4096),  # unpooler
-        (8192, 2048),  # o_proj
-        (2048, 4096),  # unpooler TP4 slice
-        (1024, 8192),  # pooler TP4 slice
-    }
-)
-
-# Muse Spark Open TP8 projections using TGV on GB300.
-_MUSE_SPARK_TP8_TGV_M_RANGES = {
-    (2304, 8192): (40, 512),
-    (8192, 1024): (1, 64),
-    (512, 8192): (256, 512),
-    (1024, 4096): (1, 512),
-}
-
 _K3_TGV_WIN_SHAPES = frozenset(
     {
         (6144, 7168),  # KDA fused qkvg
@@ -1373,6 +1353,21 @@ _K3_TGV_WIN_SHAPES = frozenset(
 )
 
 
+# Muse Spark Open TP4/TP8 projections using TGV on GB300; other M use cuBLAS.
+_MUSE_SPARK_TGV_M_RANGES = {
+    (4096, 8192): (1, 16),  # replicated pooler
+    (8192, 4096): (1, 128),  # replicated unpooler
+    (4608, 8192): (1, 256),  # TP4 qkvg
+    (8192, 2048): (1, 128),  # TP4 o_proj
+    (1024, 8192): (1, 256),  # TP4 pooler slice
+    (2048, 4096): (1, 256),  # TP4 unpooler slice
+    (2304, 8192): (40, 512),  # TP8 qkvg
+    (8192, 1024): (1, 64),  # TP8 o_proj
+    (512, 8192): (256, 512),  # TP8 pooler slice
+    (1024, 4096): (1, 512),  # TP8 unpooler slice
+}
+
+
 def use_cutedsl_bf16_gemm(m: int, n: int, k: int) -> bool:
     """TGV-vs-cuBLAS (``F.linear``) decision, CUPTI-measured on B300 under CUDA
     graph capture (cold L2). Conservative: ties and unmeasured regions fall
@@ -1384,12 +1379,10 @@ def use_cutedsl_bf16_gemm(m: int, n: int, k: int) -> bool:
         return False
     if k % 8 != 0:  # TMA requires 16B-aligned rows
         return False
-    m_range = _MUSE_SPARK_TP8_TGV_M_RANGES.get((n, k))
+    m_range = _MUSE_SPARK_TGV_M_RANGES.get((n, k))
     if m_range is not None:
         return m_range[0] <= m <= m_range[1]
-    if m <= 8 and (
-        (n, k) in _K3_TGV_WIN_SHAPES or (n, k) in _MUSE_SPARK_TGV_WIN_SHAPES
-    ):
+    if m <= 8 and (n, k) in _K3_TGV_WIN_SHAPES:
         return True
     if n < 1024 or k < 2048 or k > 6144:
         return False
