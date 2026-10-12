@@ -7,8 +7,9 @@ from triton.experimental.gluon import language as gl
 
 from .decode_attention_sm100 import swapab_attention as _swapab_attention
 
-# the V4 page load is plain gluon (no Blackwell ops), so the SM100 kernel's serves gfx950 too
-from .decode_attention_sm100_gluon import _load_v4
+# the V4 and V4.1 page loads are plain gluon (no Blackwell ops), so the SM100
+# kernel's serve gfx950 too
+from .decode_attention_sm100_gluon import _load_v4, _load_v41
 
 
 @gluon.jit
@@ -45,8 +46,19 @@ def partial_gluon(
     DATA_BYTES: gl.constexpr,
     SCALE_BYTES: gl.constexpr,
     TILE: gl.constexpr,
+    E_DATA_BYTES: gl.constexpr,
+    E_SCALE_BYTES: gl.constexpr,
+    E_TILE: gl.constexpr,
+    IS_V41: gl.constexpr,
+    IS_FP4: gl.constexpr,
+    E_IS_V41: gl.constexpr,
+    E_IS_FP4: gl.constexpr,
 ):
     gl.static_assert(SWAP_AB and H == 16 and (BT == 64 or BT == 128))
+    # V4.1 pairs its fp4 compressed cache only with an fp8 main cache, so the
+    # fp4 flag never applies to a V4 row.
+    gl.static_assert(not IS_FP4 or IS_V41)
+    gl.static_assert(not E_IS_FP4 or E_IS_V41)
     b, t = gl.program_id(0), gl.program_id(1)
     kv_layout: gl.constexpr = gl.BlockedLayout([1, 8], [8, 8], [1, 4], [1, 0])
     n = gl.arange(0, BT, gl.SliceLayout(1, kv_layout))
@@ -55,33 +67,63 @@ def partial_gluon(
         length = gl.load(L + b)
         ids = gl.load(IDX + b * IS + at, at < NK, -1)
         valid = (at < NK) & (at < length) & (ids >= 0) & (ids < KTOKENS)
-        kv = _load_v4(
-            K,
-            gl.maximum(ids, 0),
-            valid,
-            KP,
-            KS,
-            kv_layout,
-            DATA_BYTES,
-            SCALE_BYTES,
-            TILE,
-        )
+        if IS_V41:
+            kv = _load_v41(
+                K,
+                gl.maximum(ids, 0),
+                valid,
+                KP,
+                KS,
+                kv_layout,
+                DATA_BYTES,
+                SCALE_BYTES,
+                TILE,
+                IS_FP4,
+                BT,
+            )
+        else:
+            kv = _load_v4(
+                K,
+                gl.maximum(ids, 0),
+                valid,
+                KP,
+                KS,
+                kv_layout,
+                DATA_BYTES,
+                SCALE_BYTES,
+                TILE,
+            )
     else:
         at = (t - KT) * BT + n
         length = gl.load(EL + b)
         ids = gl.load(EI + b * EIS + at, at < NE, -1)
         valid = (at < NE) & (at < length) & (ids >= 0) & (ids < ETOKENS)
-        kv = _load_v4(
-            E,
-            gl.maximum(ids, 0),
-            valid,
-            EP,
-            ES,
-            kv_layout,
-            DATA_BYTES,
-            SCALE_BYTES,
-            TILE,
-        )
+        if E_IS_V41:
+            kv = _load_v41(
+                E,
+                gl.maximum(ids, 0),
+                valid,
+                EP,
+                ES,
+                kv_layout,
+                E_DATA_BYTES,
+                E_SCALE_BYTES,
+                E_TILE,
+                E_IS_FP4,
+                BT,
+            )
+        else:
+            kv = _load_v4(
+                E,
+                gl.maximum(ids, 0),
+                valid,
+                EP,
+                ES,
+                kv_layout,
+                E_DATA_BYTES,
+                E_SCALE_BYTES,
+                E_TILE,
+            )
     qh = gl.arange(0, H, gl.SliceLayout(1, kv_layout))
     qd = gl.arange(0, 512, gl.SliceLayout(0, kv_layout))
     q = gl.load(Q + b * QS + qh[:, None] * QH + qd[None, :])
