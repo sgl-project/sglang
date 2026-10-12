@@ -89,8 +89,6 @@ Reference workflow files are provided in the `workflows/` directory:
 - **`minimax_h3_t2v_sgld.json`**: MiniMax-H3 T2V / I2VA / FL2VA (`fl2va` DiT).
 - **`minimax_h3_r2v_sgld.json`**: MiniMax-H3 reference-to-video (`ref2va` DiT).
 - **`minimax_h3_t2v_sgld_upscaler.json`**: H3 two-pass latent upscale (low-res then 3D ×2 refine).
-- **`ltx2_5_t2v_sgld.json`**: the official LTX-2.5 two-stage text-to-video template with `SGLDUNETLoader`.
-- **`ltx2_3_dev_lora_t2v_sgld.json`**: the official LTX-2.3 template (dev FP8 checkpoint + distilled LoRA 0.5). `SGLDLoraLoader` replaces `LoraLoaderModelOnly`; the worker merges the LoRA into the FP8 weights once, so sampling runs at base-model speed. On a 32 GB GPU the options stream 20% of the DiT layers (`dit_layerwise_offload` + `extra_server_args`).
 
 For other workflows supporting the models, you can easily use SGLang by replacing the official `UNET Loader` node with the `SGLDUNETLoader` node. Similarly, for LoRA support, replace the official LoRA loader with the `SGLDiffusion LoRA Loader`.
 
