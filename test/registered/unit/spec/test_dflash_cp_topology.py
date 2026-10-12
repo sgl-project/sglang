@@ -3,6 +3,7 @@
 import unittest
 
 from sglang.srt.distributed.parallel_state import GroupCoordinator
+from sglang.srt.layers.cp.base import init_cp_strategy, is_cp_enabled
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.spec_utils import draft_tp_context
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -33,6 +34,15 @@ class TestDflashCpTopology(CustomTestCase):
                         enable_prefill_cp=True,
                         enable_cp_tp_group_sharing=True,
                     ):
+                        init_cp_strategy(
+                            enable_prefill_cp=True, cp_size=4, cp_strategy="interleave"
+                        )
+                        self.addCleanup(
+                            init_cp_strategy,
+                            enable_prefill_cp=False,
+                            cp_size=1,
+                            cp_strategy="interleave",
+                        )
                         try:
                             with draft_tp_context(True):
                                 p = get_parallel()
@@ -43,6 +53,7 @@ class TestDflashCpTopology(CustomTestCase):
                                 self.assertEqual(p.attn_cp_size, 1)
                                 self.assertFalse(p.enable_prefill_cp)
                                 self.assertFalse(p.enable_cp_tp_group_sharing)
+                                self.assertFalse(is_cp_enabled())
                                 if fail:
                                     raise RuntimeError("draft failed")
                         except RuntimeError as exc:
@@ -53,6 +64,7 @@ class TestDflashCpTopology(CustomTestCase):
                         self.assertIs(p.attn_tp_group, attn_tp)
                         self.assertTrue(p.enable_prefill_cp)
                         self.assertTrue(p.enable_cp_tp_group_sharing)
+                        self.assertTrue(is_cp_enabled())
 
 
 if __name__ == "__main__":

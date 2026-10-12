@@ -43,6 +43,7 @@ from sglang.srt.distributed.parallel_state import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
+from sglang.srt.layers.cp.base import disable_cp_strategy
 from sglang.srt.managers.schedule_batch import set_mamba_track_indices_from_reqs
 from sglang.srt.managers.utils import _async_d2h
 from sglang.srt.mem_cache.allocation import (
@@ -774,6 +775,7 @@ def draft_tp_context(owns_attention: bool):
     with (
         patch_tensor_parallel_group(group, owns_attention=True),
         parallel.override(enable_prefill_cp=False, enable_cp_tp_group_sharing=False),
+        disable_cp_strategy(),
     ):
         yield
 
