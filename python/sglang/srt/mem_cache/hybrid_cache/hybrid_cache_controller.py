@@ -41,7 +41,6 @@ from sglang.srt.mem_cache.pool_host.base import uses_shared_host_layout
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.runtime_context import get_memory
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -898,10 +897,12 @@ class HybridCacheController(BaseHiCacheController):
                 if draft_host_layer is None:
                     continue
 
+                # Finish every draft before the final target-layer event,
+                # including chains deeper than the target model.
                 def draft_layer_mapper(
                     layer_id: int,
                     *,
-                    expected_layer_id: int = depth,
+                    expected_layer_id: int = min(depth, self.transfer_layer_id_max - 1),
                     host_layer_id: int = draft_host_layer,
                 ) -> Optional[int]:
                     if layer_id == expected_layer_id:
@@ -1513,8 +1514,6 @@ class HybridCacheController(BaseHiCacheController):
                     )
                 pool_hits = count_pool_hits(results)
             except Exception:
-                if not get_memory().enable_unified_memory:
-                    raise
                 logger.exception(
                     "HiCache sidecar prefetch failed for request %s",
                     operation.request_id,
@@ -1630,7 +1629,7 @@ class HybridCacheController(BaseHiCacheController):
                 operation = self.backup_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue
-                self._page_backup(operation)
+                self._page_backup_or_log(operation)
                 self.ack_backup_queue.put(operation)
             except Empty:
                 continue

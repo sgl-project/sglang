@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from functools import lru_cache
 from typing import Optional, Tuple, Union
 
@@ -1618,6 +1619,7 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
     """
 
     _supports_gradient_checkpointing = False
+    supports_decode_on_frames = True
 
     def __init__(self, config: LTXVideoVAEConfig):
         super().__init__(config=config)
@@ -1896,6 +1898,7 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
         temb: Optional[torch.Tensor] = None,
         causal: Optional[bool] = None,
         return_dict: bool = True,
+        on_frames: Callable[[torch.Tensor], None] | None = None,
     ) -> Union[DecoderOutput, torch.Tensor]:
         batch_size, num_channels, num_frames, height, width = z.shape
         tile_latent_min_height = (
@@ -1910,7 +1913,7 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
 
         if self.use_framewise_decoding and num_frames > tile_latent_min_num_frames:
             return self._temporal_tiled_decode(
-                z, temb, causal=causal, return_dict=return_dict
+                z, temb, causal=causal, return_dict=return_dict, on_frames=on_frames
             )
 
         if self.use_tiling and (
@@ -1948,6 +1951,7 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
         temb: Optional[torch.Tensor] = None,
         causal: Optional[bool] = None,
         return_dict: bool = True,
+        on_frames: Callable[[torch.Tensor], None] | None = None,
     ) -> Union[DecoderOutput, torch.Tensor]:
         """
         Decode a batch of images.
@@ -1975,7 +1979,17 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
                 ]
             decoded = torch.cat(decoded_slices)
         else:
-            decoded = self._decode(z, temb, causal=causal).sample
+            decoded = self._decode(z, temb, causal=causal, on_frames=on_frames).sample
+
+        tile_latent_frames = (
+            self.tile_sample_min_num_frames // self.temporal_compression_ratio
+        )
+        if on_frames is not None and not (
+            self.use_framewise_decoding
+            and z.shape[2] > tile_latent_frames
+            and z.shape[0] == 1
+        ):
+            on_frames(decoded)
 
         if not return_dict:
             return (decoded,)
@@ -2163,6 +2177,7 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
         temb: Optional[torch.Tensor],
         causal: Optional[bool] = None,
         return_dict: bool = True,
+        on_frames: Callable[[torch.Tensor], None] | None = None,
     ) -> Union[DecoderOutput, torch.Tensor]:
         batch_size, num_channels, num_frames, height, width = z.shape
         num_sample_frames = (num_frames - 1) * self.temporal_compression_ratio + 1
@@ -2183,7 +2198,9 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
             self.tile_sample_min_num_frames - self.tile_sample_stride_num_frames
         )
 
-        row = []
+        result_row = []
+        previous = None
+        emitted = 0
         for i in range(0, num_frames, tile_latent_stride_num_frames):
             tile = z[:, :, i : i + tile_latent_min_num_frames + 1, :, :]
             if self.use_tiling and (
@@ -2197,18 +2214,16 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
                 decoded = self.decoder(tile, temb, causal=causal)
             if i > 0:
                 decoded = decoded[:, :, :-1, :, :]
-            row.append(decoded)
-
-        result_row = []
-        for i, tile in enumerate(row):
-            if i > 0:
-                tile = self.blend_t(row[i - 1], tile, blend_num_frames)
-                tile = tile[:, :, : self.tile_sample_stride_num_frames, :, :]
-                result_row.append(tile)
-            else:
-                result_row.append(
-                    tile[:, :, : self.tile_sample_stride_num_frames + 1, :, :]
-                )
+                decoded = self.blend_t(previous, decoded, blend_num_frames)
+            previous = decoded
+            kept = decoded[:, :, : self.tile_sample_stride_num_frames + (i == 0)]
+            result_row.append(kept)
+            # only the kept prefix is final; the tail is still needed to blend the next tile
+            if on_frames is not None and batch_size == 1:
+                frames = kept[:, :, : max(0, num_sample_frames - emitted)]
+                if frames.shape[2]:
+                    on_frames(frames)
+                    emitted += frames.shape[2]
 
         dec = torch.cat(result_row, dim=2)[:, :, :num_sample_frames]
 
