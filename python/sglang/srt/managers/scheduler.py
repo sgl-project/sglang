@@ -5156,6 +5156,10 @@ class Scheduler(
         # Waiting queues: waiting + bootstrapping + preallocation + kv transfer (decode)
         if not ignore_waiting:
             idle &= len(self.waiting_queue) == 0
+        else:
+            # A PD-decode request waiting with its transferred KV still owns
+            # its request row; a flush would free it.
+            idle &= not any(r.kv.holds_kv for r in self.waiting_queue)
 
         if (
             for_health_check
@@ -5617,6 +5621,16 @@ class Scheduler(
             and self.disaggregation_mode != DisaggregationMode.PREFILL
         ):
             retract_reqs.append(self.chunked_req)
+
+        if self.disaggregation_mode == DisaggregationMode.DECODE:
+            # Transferred requests wait for a slot holding their row and KV;
+            # retract them too, so their KV is rebuilt under the new weights.
+            staged = [r for r in self.waiting_queue if r.kv.holds_kv]
+            if staged:
+                self.waiting_queue = [
+                    r for r in self.waiting_queue if not r.kv.holds_kv
+                ]
+                retract_reqs += staged
 
         self.last_batch = None
         self.cur_batch_for_debug = None
