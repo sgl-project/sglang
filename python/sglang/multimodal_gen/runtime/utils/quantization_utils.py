@@ -438,14 +438,6 @@ def normalize_flat_modelopt_quant_config(
     return normalized
 
 
-def _infer_nvfp4_group_size_from_tensors(weight, scale) -> Optional[int]:
-    """Infer NVFP4 group_size from serialized weight/scale tensor shapes."""
-    return _infer_nvfp4_group_size_from_shapes(
-        getattr(weight, "shape", ()),
-        getattr(scale, "shape", ()),
-    )
-
-
 def _infer_nvfp4_group_size_from_shapes(weight_shape, scale_shape) -> Optional[int]:
     weight_shape = tuple(weight_shape or ())
     scale_shape = tuple(scale_shape or ())
@@ -741,7 +733,7 @@ def _canonicalize_modulation_exclude(module_name: str) -> str:
     return module_name
 
 
-def _build_nvfp4_config_from_safetensors_files(
+def build_nvfp4_config_from_safetensors_list(
     file_paths: list[str],
     param_names_mapping_dict: Optional[dict] = None,
     reverse_param_names_mapping_dict: Optional[dict] = None,
@@ -953,32 +945,3 @@ def _build_nvfp4_config_from_safetensors_files(
             e,
         )
         return None
-
-
-def build_nvfp4_config_from_safetensors(
-    file_path: str,
-    param_names_mapping_dict: Optional[dict] = None,
-    reverse_param_names_mapping_dict: Optional[dict] = None,
-    fallback_group_size: Optional[int] = None,
-) -> Optional[QuantizationConfig]:
-    """Backward-compatible wrapper for a single safetensors file."""
-    return _build_nvfp4_config_from_safetensors_files(
-        [file_path],
-        param_names_mapping_dict,
-        reverse_param_names_mapping_dict,
-        fallback_group_size,
-    )
-
-
-def build_nvfp4_config_from_safetensors_list(
-    file_paths: list[str],
-    param_names_mapping_dict: Optional[dict] = None,
-    reverse_param_names_mapping_dict: Optional[dict] = None,
-    fallback_group_size: Optional[int] = None,
-) -> Optional[QuantizationConfig]:
-    return _build_nvfp4_config_from_safetensors_files(
-        file_paths,
-        param_names_mapping_dict,
-        reverse_param_names_mapping_dict,
-        fallback_group_size,
-    )

@@ -911,21 +911,19 @@ class TestUnifiedRadixAllocationEvictionRealComponents(CustomTestCase):
         for session in _session_radix_cache_test_values():
             for pinned in (False, True):
                 with self.subTest(session=session, pinned=pinned):
-                    # This exercises the Rust backup barrier, independently of
-                    # the shared suite's default backend.
+                    # Rust independently of the shared suite's default backend;
+                    # session caches fall back to the Python TreeCore.
                     with mock.patch(f"{__name__}._TREE_CORE_TEST_BACKEND", "rust"):
                         cache, first, second, leaf = self._build_internal_chain(
                             ct, session
                         )
                     cache.tree_core.is_write_back = True
                     cache.tree_core.has_swa_host_pool = True
-                    cache.tree_core.enable_swa_write_back_eviction_barrier()
-                    if session:
-                        # Session caches use main's Python fallback, whose
-                        # component backup is gated by the HiCache attachment.
-                        cache.tree_core.enable_hicache = True
-                        cache.host_pool_group = mock.Mock()
-                        cache.host_pool_group.get_pool.return_value = None
+                    # Both cores gate the internal SWA component backup on the
+                    # HiCache attachment.
+                    cache.tree_core.set_hicache_enabled()
+                    cache.host_pool_group = mock.Mock()
+                    cache.host_pool_group.get_pool.return_value = None
                     if pinned:
                         receipt = cache.inc_host_lock_ref(first).to_dec_params()
                     tracker = {ComponentType.FULL: 0, ct: 0}
@@ -2492,7 +2490,7 @@ class UnifiedRadixCacheSuite:
         )
         cache.sanity_check()
 
-        cache.dec_lock_ref(node_a, DecLockRefParams(), skip_swa=True)
+        cache.dec_lock_ref(node_a, lock_result.to_dec_params(), skip_swa=True)
         cache.sanity_check()
 
     def test_mamba_opt_out_holder_cannot_release_another_holders_mamba_lock(self):
@@ -2800,7 +2798,7 @@ class UnifiedRadixCacheSuite:
             "SWA stays in LRU for drive_eviction to pick later",
         )
 
-        cache.dec_lock_ref(node_a, DecLockRefParams(), skip_swa=True)
+        cache.dec_lock_ref(node_a, lock_result.to_dec_params(), skip_swa=True)
         self.assertTrue(cache.tree_core.is_device_leaf(node_a))
         cache.sanity_check()
 
@@ -4348,6 +4346,120 @@ class UnifiedRadixCacheSuite:
                 )
             )
             self.assertEqual(self._host_avail_sizes(cache), avail0)
+        cache.sanity_check()
+
+    def _drain_buffer_writes(self, cache):
+        pipeline = cache.buffer_pipeline
+        self._pump_hicache_until(
+            cache,
+            lambda: (
+                not pipeline.inflight_backup_node_ids and not pipeline.ongoing_backup
+            ),
+            "buffer backup pipeline did not drain",
+        )
+        self.assertFalse(pipeline.pending_write_queue)
+        self.assertFalse(pipeline._queued_span_refs)
+        self.assertEqual(pipeline.write_backlog_tokens_, 0)
+        self.assertEqual(pipeline.write_staged_tokens_, 0)
+
+    def test_buffer_only_split_intent_writes_every_piece(self):
+        """Repeated splits preserve every pool's write once, parents first."""
+        self._skip_unsupported_hicache_test()
+        storage_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self._init_buffer_hicache(cache, storage_dir)
+        pipeline = cache.buffer_pipeline
+        ps = self.cfg.page_size
+
+        seq = self._buffer_swa_seq(min_pages=4)
+        self._insert(cache, allocator, req_to_token_pool, seq)
+        leaf = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", seq)))
+        ).last_device_node
+        chain = self._path_chain(cache, leaf)
+        span_hashes = [h for n in chain for h in cache.tree_core.get_hash_values(n)]
+        aux_keys = _aux_storage_key_transfers(cache, leaf)
+        _write_backup(cache, leaf)
+        expected_keys = [
+            (i.pool, key) for i in pipeline.pending_write_queue for key in i.keys
+        ]
+        # SWA may already have split the leaf at its window boundary.
+        end = len(seq)
+        for node in reversed(chain):
+            node_len = _node_key_length(cache, node)
+            if node_len >= 3 * ps:
+                break
+            end -= node_len
+        else:
+            self.fail("no node of three pages to split")
+        for offset in (1, 2):
+            split_at = end - node_len + offset * ps
+            self._insert(
+                cache,
+                allocator,
+                req_to_token_pool,
+                seq[:split_at] + self._make_seq(9000, 2),
+            )
+            self.assertEqual(_node_key_length(cache, node), end - split_at)
+            _write_backup(cache, _node_parent(cache, node))
+
+        pipeline._refresh_pending_backup_intents()
+        kv_order = [
+            intent.snapshot.node_id
+            for intent in pipeline.pending_write_queue
+            if intent.pool == PoolName.KV
+        ]
+        self.assertEqual(kv_order, self._path_chain(cache, leaf))
+        self.assertCountEqual(
+            [(i.pool, key) for i in pipeline.pending_write_queue for key in i.keys],
+            expected_keys,
+        )
+        self.assertEqual(pipeline.write_backlog_tokens_, len(seq))
+        self._drain_buffer_writes(cache)
+        self.assertEqual(
+            self._storage_exists_count(cache, span_hashes, aux_keys), len(span_hashes)
+        )
+        cache.sanity_check()
+
+    def test_buffer_only_finish_writes_prompt_and_output(self):
+        """The finish-path split preserves both prompt and output writes."""
+        if self.cfg.components != (ComponentType.FULL,):
+            self.skipTest("only FULL-only caches split the leaf at the prompt")
+        storage_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self._init_buffer_hicache(cache, storage_dir)
+        cache.tree_core.write_through_threshold = 1  # the write_through trigger
+
+        req = self._make_req(req_to_token_pool)
+        prompt = self._make_seq(1, 6)
+        output = self._make_seq(3000, 4)
+        req.origin_input_ids = array("q", prompt)
+        req.output_ids = array("q", output)
+        req.full_untruncated_fill_ids = array("q", prompt + output)
+        req.extend_end = len(prompt) + len(output)
+        kv_len = req.extend_end
+        kv_indices = self._alloc(allocator, kv_len)
+        req_to_token_pool.write((req.kv.req_pool_idx, slice(0, kv_len)), kv_indices)
+        req.kv.kv_committed_len = kv_len
+        req.kv.kv_allocated_len = kv_len
+        req.last_node = cache.root_node_handle()
+        req.kv.cache_protected_len = 0
+        req.lock = None
+        req.extra_key = None
+        finish_req(cache, req, kv_len)
+
+        leaf = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", prompt + output)))
+        ).last_device_node
+        chain = self._path_chain(cache, leaf)
+        self.assertEqual(
+            [_node_key_length(cache, n) for n in chain], [len(prompt), len(output)]
+        )
+        self._drain_buffer_writes(cache)
+        hashes = [h for n in chain for h in cache.tree_core.get_hash_values(n)]
+        self.assertEqual(self._storage_exists_count(cache, hashes), len(hashes))
         cache.sanity_check()
 
     @staticmethod
@@ -10346,7 +10458,7 @@ class TestResumableInsertWalkSWA(_InsertWalkSuite):
         self.assertEqual(_device_lock_ref(cache, node, ComponentType.SWA), 0)
         self.assertGreaterEqual(_device_lock_ref(cache, node, ComponentType.FULL), 1)
 
-        cache.dec_lock_ref(node, DecLockRefParams(), skip_swa=True)
+        cache.dec_lock_ref(node, lock_result.to_dec_params(), skip_swa=True)
         cache.sanity_check()
 
 
@@ -11302,6 +11414,8 @@ class TestSegmentLockProtocol(_InsertWalkSuite):
     cfg = CacheConfig(
         components=(ComponentType.FULL, ComponentType.SWA), sliding_window_size=8
     )
+    _backup_node = UnifiedRadixCacheSuite._backup_node
+    _path_chain = UnifiedRadixCacheSuite._path_chain
 
     @staticmethod
     def _swa_ref(cache, node_id):
@@ -11419,11 +11533,24 @@ class TestSegmentLockProtocol(_InsertWalkSuite):
         cache, _, _ = build_fixture(self.cfg)
         core = cache.tree_core
         root = cache.root_node_handle()
-        core.dec_lock_ref(root, DecLockRefParams())
-        core.dec_host_lock_ref(root, DecLockRefParams())
-        released = core.dec_swa_lock_only(root, DecLockRefParams())
+        receipt = DecLockRefParams(node_id=root)
+        core.dec_lock_ref(root, receipt)
+        core.dec_host_lock_ref(root, receipt)
+        released = core.dec_swa_lock_only(root, receipt)
         self.assertFalse(released.device_frees)
         self.assertFalse(released.host_frees)
+        released = core.dec_window_lock_only(root, ComponentType.SWA, receipt)
+        self.assertFalse(released.device_frees)
+        self.assertFalse(released.host_frees)
+        cache.sanity_check()
+
+    def test_root_acquire_receipt_releases_on_root(self):
+        """A cold request locks the root, so its receipt is anchored on root."""
+        cache, _, _ = build_fixture(self.cfg)
+        root = cache.root_node_handle()
+        lock = cache.inc_lock_ref(root).to_dec_params()
+        self.assertEqual(lock.node_id, root)
+        cache.dec_lock_ref(root, lock)
         cache.sanity_check()
 
     def test_release_with_incorrect_root_boundary_fails_loud(self):
@@ -11438,7 +11565,10 @@ class TestSegmentLockProtocol(_InsertWalkSuite):
 
         self._assert_protocol_violation(
             lambda: cache.dec_lock_ref(
-                leaf, DecLockRefParams(component_lock_uuids={ComponentType.SWA: None})
+                leaf,
+                DecLockRefParams(
+                    node_id=leaf, component_lock_uuids={ComponentType.SWA: None}
+                ),
             ),
             "lock_ref=0",
         )
@@ -11459,6 +11589,105 @@ class TestSegmentLockProtocol(_InsertWalkSuite):
 
         self._assert_protocol_violation(
             lambda: cache.dec_lock_ref(parent, lock.to_dec_params()),
+            "lock receipt anchored on node",
+        )
+
+    def _locked_path_state(self, cache, allocator, leaf):
+        """Every lock count on the leaf's path plus every free-slot count."""
+        refs = [
+            (_device_lock_ref(cache, n, ct), _host_lock_ref(cache, n, ct))
+            for n in self._full_path(cache, leaf)
+            for ct in self.cfg.components
+        ]
+        free_slots = [
+            allocator.full_attn_allocator.available_size(),
+            allocator.swa_attn_allocator.available_size(),
+        ]
+        if cache.cache_controller is not None:
+            free_slots.append(cache.cache_controller.mem_pool_host.available_size())
+        return refs, free_slots
+
+    def _leaf_with_lock_path(self, *, hicache=False):
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        if hicache:
+            self._init_hicache(cache, write_policy="write_back")
+        seq = self._make_seq(1, 2 * self.cfg.sliding_window_size)
+        self._insert(cache, allocator, req_to_token_pool, seq)
+        leaf = self._match_leaf(cache, seq)
+        self.assertFalse(cache.tree_core.is_root(leaf))
+        return cache, allocator, leaf
+
+    def _assert_unanchored_release_rejected(
+        self, cache, allocator, leaf, release, unlock
+    ):
+        """The anchor check runs before any lock count or free list changes."""
+        before = self._locked_path_state(cache, allocator, leaf)
+        self._assert_protocol_violation(release, "lock receipt anchored on node")
+        if cache._tree_core_backend == "rust":
+            # A Rust panic poisons the core; the crate's own test checks state.
+            return
+        self.assertEqual(self._locked_path_state(cache, allocator, leaf), before)
+        unlock()
+        cache.sanity_check()
+
+    def test_unanchored_device_release_fails_loud(self):
+        """#41261 replay: a receipt that lost its anchor must not walk the
+        node's segment and drop locks other holders own."""
+        cache, allocator, leaf = self._leaf_with_lock_path()
+        lock = cache.inc_lock_ref(leaf).to_dec_params()
+        self._assert_unanchored_release_rejected(
+            cache,
+            allocator,
+            leaf,
+            lambda: cache.dec_lock_ref(leaf, replace(lock, node_id=None)),
+            lambda: cache.dec_lock_ref(leaf, lock),
+        )
+
+    def test_unanchored_host_release_fails_loud(self):
+        cache, allocator, leaf = self._leaf_with_lock_path(hicache=True)
+        self._backup_node(cache, leaf)
+        lock = cache.inc_host_lock_ref(leaf).to_dec_params()
+        self._assert_unanchored_release_rejected(
+            cache,
+            allocator,
+            leaf,
+            lambda: cache.dec_host_lock_ref(leaf, replace(lock, node_id=None)),
+            lambda: cache.dec_host_lock_ref(leaf, lock),
+        )
+
+    def test_unanchored_swa_only_release_fails_loud(self):
+        cache, allocator, leaf = self._leaf_with_lock_path()
+        lock = cache.inc_lock_ref(leaf).to_dec_params()
+        self._assert_unanchored_release_rejected(
+            cache,
+            allocator,
+            leaf,
+            lambda: cache.tree_core.dec_swa_lock_only(
+                leaf, replace(lock, node_id=None)
+            ),
+            lambda: cache.dec_lock_ref(leaf, lock),
+        )
+
+    def test_unanchored_window_only_release_fails_loud(self):
+        cache, allocator, leaf = self._leaf_with_lock_path()
+        lock = cache.inc_lock_ref(leaf).to_dec_params()
+        self._assert_unanchored_release_rejected(
+            cache,
+            allocator,
+            leaf,
+            lambda: cache.tree_core.dec_window_lock_only(
+                leaf, ComponentType.SWA, replace(lock, node_id=None)
+            ),
+            lambda: cache.dec_lock_ref(leaf, lock),
+        )
+
+    def test_unanchored_root_release_fails_loud(self):
+        """Every acquire anchors its receipt, root included; an unanchored
+        receipt lost its anchor upstream even where releasing is a no-op."""
+        cache, _, _ = build_fixture(self.cfg)
+        root = cache.root_node_handle()
+        self._assert_protocol_violation(
+            lambda: cache.tree_core.dec_lock_ref(root, DecLockRefParams()),
             "lock receipt anchored on node",
         )
 

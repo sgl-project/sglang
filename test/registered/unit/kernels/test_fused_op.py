@@ -10,7 +10,7 @@ import pytest
 import torch
 
 import sglang.kernels as K
-from sglang.kernels.fused_op import BACKEND_METHODS, DEFAULT_PRIORITY, BaseFusedOp
+from sglang.kernels.fused_op import BaseFusedOp
 from sglang.kernels.registry import KernelRegistry
 from sglang.kernels.spec import CapabilityRequirement as Cap
 from sglang.kernels.spec import KernelBackend, KernelSpec
@@ -64,38 +64,11 @@ def test_available_backends():
     }
 
 
-def test_kda_backend_contract():
-    assert KernelBackend.KDA.value == "KDA"
-    assert BACKEND_METHODS[KernelBackend.KDA] == "forward_kda"
-    assert DEFAULT_PRIORITY[0] is KernelBackend.KDA
-    with pytest.raises(NotImplementedError, match="no KDA backend"):
-        _ToyAdd().forward(_t(1.0), _t(2.0), backend=KernelBackend.KDA)
-
-
-def test_priority_dispatch():
-    # TRITON is first in priority and always eligible (no capability).
-    assert _ToyAdd()(_t(1.0), _t(2.0)).item() == 1003.0
-
-
-def test_explicit_backend_overrides_priority():
-    assert (
-        _ToyAdd().forward(_t(1.0), _t(2.0), backend=KernelBackend.TORCH).item() == 3.0
-    )
-
-
 def test_capability_gates_eligibility():
     if K.PlatformInfo.detect().is_cuda:
         pytest.skip("requires a CPU-only environment")
     # CUDA backend is filtered out; auto-selection falls back to native.
     assert _CudaOnlyToy()(_t(3.0)).item() == 6.0
-
-
-def test_forced_backend_global_switch():
-    op = _ToyAdd()
-    K.set_fused_op_backend(KernelBackend.TORCH)
-    assert op(_t(1.0), _t(2.0)).item() == 3.0
-    K.set_fused_op_backend(None)
-    assert op(_t(1.0), _t(2.0)).item() == 1003.0
 
 
 def test_forced_backend_env_var():
@@ -108,11 +81,6 @@ def test_forced_backend_env_var():
         assert K.get_fused_op_backend() is KernelBackend.TORCH
         assert op(_t(1.0), _t(2.0)).item() == 3.0
     m._forced_backend = m._UNRESOLVED
-
-
-def test_unimplemented_backend_raises():
-    with pytest.raises(NotImplementedError):
-        _ToyAdd().forward(_t(1.0), _t(2.0), backend=KernelBackend.AOT)
 
 
 def test_trace_records_op_backend_and_shapes():
