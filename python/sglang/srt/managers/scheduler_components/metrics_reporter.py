@@ -402,7 +402,9 @@ class SchedulerMetricsReporter:
                 self.forward_pass_device_timer = DeviceTimer(
                     reporter=_fpm_device_timer_reporter,
                 )
-            self.scheduler._fpm_uses_device_timer = True
+            self.scheduler._fpm_uses_device_timer = (
+                self.forward_pass_device_timer.timing_supported
+            )
             self.scheduler.enable_fpm = True
             logger.info(
                 "FPM: ZMQ PUB bound on %s (dp_rank=%d, device_timer=%s)",

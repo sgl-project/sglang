@@ -42,7 +42,7 @@ except ImportError:
 
 register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_amd_ci(est_time=10, suite="nightly-amd-kernel-1-gpu", nightly=True)
-register_xpu_ci(est_time=40, suite="nightly-xpu-1-gpu", nightly=True)
+register_xpu_ci(est_time=40, suite="nightly-xpu-kernel-main-1-gpu", nightly=True)
 
 DEVICE = get_device()
 
