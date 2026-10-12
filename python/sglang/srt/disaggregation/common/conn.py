@@ -910,6 +910,10 @@ class CommonKVManager(BaseKVManager):
         (outstanding == 0). pop() makes it fire at most once."""
         if self._staging_outstanding.get(room, 0) > 0:
             return
+        if room in self._deferred_ack_poisoned_rooms:
+            # A target registered concurrently with the poison must not fire.
+            self._deferred_ack_targets.pop(room, None)
+            return
         self._send_abort_acks(room, self._deferred_ack_targets.pop(room, None))
 
     def _send_abort_acks(
