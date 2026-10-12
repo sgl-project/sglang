@@ -141,12 +141,9 @@ class TestHFTransformersLoading(unittest.TestCase):
         }
         return config
 
-    def test_rope_scaling_override_keeps_the_rope_base(self):
-        """Under transformers v5 the RoPE base lives inside rope_parameters and
-        rope_scaling is an alias whose setter replaces that dict wholesale, so
-        `--json-model-override-args '{"rope_scaling": {...}}'` used to drop
-        rope_theta and get_rope_config fell back to 10000 (issue #41227). The
-        override must only change the keys it names."""
+    def test_rope_scaling_override_merges_with_checkpoint(self):
+        # Regression for #41227: v5's rope_scaling setter replaces
+        # rope_parameters wholesale, dropping an unmentioned rope_theta.
         self.write_config(self.llama3_rope_config())
         restated = {
             "rope_type": "llama3",
@@ -169,9 +166,6 @@ class TestHFTransformersLoading(unittest.TestCase):
                 self.assertEqual(theta, 500000.0)
                 self.assertEqual(rope["factor"], 32.0)
                 self.assertEqual(rope["rope_type"], "llama3")
-
-    def test_rope_scaling_override_can_still_change_the_base(self):
-        self.write_config(self.llama3_rope_config())
 
         config = get_config(
             self.model_path,
