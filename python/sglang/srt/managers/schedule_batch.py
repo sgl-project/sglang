@@ -3216,8 +3216,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         The prefill rows drop the plan prepare_for_extend built for them, and
         the decode rows the one prepare_for_decode built. A decode row gets a
-        plan again at its next decode-only step.
+        plan again at its next decode-only step. merge_batch already dropped
+        both plans; this is where a mixed step would set one.
         """
+        self._clear_mamba_track_plan()
+
+    def _clear_mamba_track_plan(self):
+        """Drop the per-row mamba track plan; prepare_for_decode or
+        prepare_for_extend builds the next one."""
         self.mamba_track_indices = None
         self.mamba_track_buffer_indices = None
         self.mamba_track_mask = None
@@ -3739,16 +3745,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.seq_lens_cpu is not None:
             self.seq_lens_cpu = self.seq_lens_cpu[keep_indices]
 
-        self.mamba_track_indices = None
-        self.mamba_track_buffer_indices = None
-        self.mamba_track_mask = None
-        self.mamba_track_seqlens = None
-        self.mamba_track_seqlens_cpu = None
-        self.mamba_prefill_track_mask_cpu = None
-        self.mamba_track_mask_cpu = None
-        self.mamba_track_mask_next_cpu = None
-        self.mamba_decode_batch_idx_cpu = None
-        self.mamba_lazy_spec_track_positions_cpu = None
+        self._clear_mamba_track_plan()
         self.mamba_cow_src_indices = None
         self.mamba_cow_dst_indices = None
         self.mamba_clear_indices = None
@@ -3808,16 +3805,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.seq_lens_cpu = None
         else:
             self.seq_lens_cpu = torch.cat([self.seq_lens_cpu, other.seq_lens_cpu])
-        self.mamba_track_indices = None
-        self.mamba_track_buffer_indices = None
-        self.mamba_track_mask = None
-        self.mamba_track_seqlens = None
-        self.mamba_track_seqlens_cpu = None
-        self.mamba_prefill_track_mask_cpu = None
-        self.mamba_track_mask_cpu = None
-        self.mamba_track_mask_next_cpu = None
-        self.mamba_decode_batch_idx_cpu = None
-        self.mamba_lazy_spec_track_positions_cpu = None
+        self._clear_mamba_track_plan()
         if self.return_logprob and other.return_logprob:
             self.top_logprobs_nums = self.top_logprobs_nums + other.top_logprobs_nums
             self.token_ids_logprobs = self.token_ids_logprobs + other.token_ids_logprobs

@@ -2,7 +2,7 @@ import dataclasses
 import types
 import unittest
 from array import array
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -21,6 +21,19 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm  # noqa: E402
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 AUTO_FILL_EXCLUDED_FIELDS = ["reqs"]
+
+_MAMBA_TRACK_PLAN_FIELDS = (
+    "mamba_track_indices",
+    "mamba_track_buffer_indices",
+    "mamba_track_mask",
+    "mamba_track_seqlens",
+    "mamba_track_seqlens_cpu",
+    "mamba_prefill_track_mask_cpu",
+    "mamba_track_mask_cpu",
+    "mamba_track_mask_next_cpu",
+    "mamba_decode_batch_idx_cpu",
+    "mamba_lazy_spec_track_positions_cpu",
+)
 
 
 class TestCachedPrefixTierAttribution(unittest.TestCase):
@@ -212,7 +225,15 @@ class TestMixWithRunningOutOfPlace(unittest.TestCase):
         extend_snapshot = _snapshot_mutable_fields(extend_batch)
         running_snapshot = _snapshot_mutable_fields(running_batch)
 
-        extend_batch.mix_with_running(running_batch)
+        with patch.object(
+            ScheduleBatch,
+            "_set_mixed_mamba_track_plan",
+            autospec=True,
+            side_effect=ScheduleBatch._set_mixed_mamba_track_plan,
+        ) as mixed_rule:
+            extend_batch.mix_with_running(running_batch)
+        # The mixed step's plan comes from the mixed rule, after the merge.
+        mixed_rule.assert_called_once_with(extend_batch)
 
         self.assertEqual(extend_batch.forward_mode, ForwardMode.MIXED)
         self.assertIs(extend_batch.mix_running_indices, running_batch.req_pool_indices)
@@ -227,23 +248,26 @@ class TestMixWithRunningOutOfPlace(unittest.TestCase):
         self.assertEqual(extend_batch.extend_logprob_start_lens, [0, 0, 0])
         self.assertFalse(extend_batch.is_prefill_only)
         # Both sides came with a mamba track plan; a mixed step keeps none.
-        for name in (
-            "mamba_track_indices",
-            "mamba_track_buffer_indices",
-            "mamba_track_mask",
-            "mamba_track_seqlens",
-            "mamba_track_seqlens_cpu",
-            "mamba_prefill_track_mask_cpu",
-            "mamba_track_mask_cpu",
-            "mamba_track_mask_next_cpu",
-            "mamba_decode_batch_idx_cpu",
-            "mamba_lazy_spec_track_positions_cpu",
-        ):
+        for name in _MAMBA_TRACK_PLAN_FIELDS:
             self.assertIsNone(getattr(extend_batch, name), name)
         self.assertIsNot(extend_batch.prefix_lens, extend_prefix_before)
         self.assertIsNot(extend_batch.extend_lens, extend_lens_before)
         _assert_snapshot_not_mutated(self, extend_snapshot)
         _assert_snapshot_not_mutated(self, running_snapshot)
+
+    def test_mixed_rule_drops_every_row_plan(self):
+        batch = make_schedule_batch(
+            2,
+            reqs=[types.SimpleNamespace(rid="e1"), types.SimpleNamespace(rid="r1")],
+            model_config=types.SimpleNamespace(is_encoder_decoder=False),
+        )
+        for name in _MAMBA_TRACK_PLAN_FIELDS:
+            self.assertIsNotNone(getattr(batch, name), name)
+
+        batch._set_mixed_mamba_track_plan()
+
+        for name in _MAMBA_TRACK_PLAN_FIELDS:
+            self.assertIsNone(getattr(batch, name), name)
 
 
 class TestPrepareEncoderInfoExtendOutOfPlace(unittest.TestCase):
