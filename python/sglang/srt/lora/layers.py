@@ -804,6 +804,44 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         return B[shard * shard_size : (shard + 1) * shard_size, :]
 
 
+# At decode sizes the one-shot custom all-reduce sums each element over the ranks
+# in a fixed order whatever the buffer length, so one all-reduce over [base | lora_a]
+# gives the same bits as the two a reducing row-parallel LoRA layer issues.
+_ROW_PARALLEL_FUSED_ALL_REDUCE = (
+    envs.SGLANG_OPT_LORA_ROW_PARALLEL_FUSED_ALL_REDUCE.get()
+)
+_ROW_PARALLEL_FUSED_ALL_REDUCE_MAX_TOKENS = (
+    envs.SGLANG_OPT_LORA_ROW_PARALLEL_FUSED_ALL_REDUCE_MAX_TOKENS.get()
+)
+
+
+def _fuse_row_lora_all_reduce(
+    output_parallel: torch.Tensor, lora_a_output: torch.Tensor
+) -> bool:
+    return (
+        _ROW_PARALLEL_FUSED_ALL_REDUCE
+        and output_parallel.dim() == 2
+        and lora_a_output.dim() == 2
+        and output_parallel.dtype == lora_a_output.dtype
+        and output_parallel.shape[0] == lora_a_output.shape[0]
+        and 0 < output_parallel.shape[0] <= _ROW_PARALLEL_FUSED_ALL_REDUCE_MAX_TOKENS
+    )
+
+
+def _fused_row_lora_all_reduce(
+    all_reduce, output_parallel: torch.Tensor, lora_a_output: torch.Tensor
+):
+    m, n = output_parallel.shape
+    r = lora_a_output.shape[1]
+    flat = torch.empty(
+        m * (n + r), dtype=output_parallel.dtype, device=output_parallel.device
+    )
+    flat[: m * n].view(m, n).copy_(output_parallel)
+    flat[m * n :].view(m, r).copy_(lora_a_output)
+    reduced = all_reduce(flat)
+    return reduced[: m * n].view(m, n), reduced[m * n :].view(m, r)
+
+
 class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
     def __init__(
         self,
@@ -894,8 +932,13 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
             lora_a_output = self.lora_backend.run_lora_a_sgemm(
                 input_parallel, self.A_buffer
             )
-            output_ = all_reduce(output_parallel)
-            lora_a_output = all_reduce(lora_a_output)
+            if _fuse_row_lora_all_reduce(output_parallel, lora_a_output):
+                output_, lora_a_output = _fused_row_lora_all_reduce(
+                    all_reduce, output_parallel, lora_a_output
+                )
+            else:
+                output_ = all_reduce(output_parallel)
+                lora_a_output = all_reduce(lora_a_output)
             output_ = self.lora_backend.run_lora_b_sgemm(
                 x=lora_a_output,
                 weights=self.B_buffer,

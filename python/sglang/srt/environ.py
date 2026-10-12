@@ -1781,6 +1781,11 @@ class Envs:
     # and for SGLANG_OPT_LORA_SHARED_OUTER_MOE_DECODE a fused down shrink+expand
     # and the token shrink on a side stream next to the MoE gate|up GEMM.
     SGLANG_OPT_LORA_DECODE_FUSED_LAUNCHES = EnvBool(False)
+    # Row-parallel LoRA layers that reduce their output: one all-reduce over
+    # [base | lora_a] instead of two for at most MAX_TOKENS tokens (decode), where
+    # the one-shot custom all-reduce gives the same bits.
+    SGLANG_OPT_LORA_ROW_PARALLEL_FUSED_ALL_REDUCE = EnvBool(False)
+    SGLANG_OPT_LORA_ROW_PARALLEL_FUSED_ALL_REDUCE_MAX_TOKENS = EnvInt(16)
 
     # ===================================================================
     # Kimi K3
