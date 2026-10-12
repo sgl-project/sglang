@@ -196,7 +196,9 @@ def base_include_paths() -> List[str]:
     if is_hip_runtime():
         return [*includes, f"{rocm_home()}/include"]
     elif is_musa_runtime():
-        return [*includes, f"{musa_home()}/include"]
+        from torchada.utils.cpp_extension import stable_compat_include_dir
+
+        return [stable_compat_include_dir(), *includes, f"{musa_home()}/include"]
     else:
         return list(includes)
 

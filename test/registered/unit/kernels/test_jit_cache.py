@@ -90,6 +90,11 @@ def test_musa_ninja_uses_the_musa_device_compiler(monkeypatch):
 
 
 def test_musa_toolchain_flags(monkeypatch):
+    monkeypatch.setitem(
+        sys.modules,
+        "torchada.utils.cpp_extension",
+        SimpleNamespace(stable_compat_include_dir=lambda: "/opt/torchada/compat"),
+    )
     monkeypatch.setattr(toolchain, "is_hip_runtime", lambda: False)
     monkeypatch.setattr(toolchain, "is_musa_runtime", lambda: True)
     monkeypatch.setattr(toolchain, "musa_home", lambda: "/opt/musa")
@@ -104,6 +109,7 @@ def test_musa_toolchain_flags(monkeypatch):
     assert toolchain.target_flags() == ["--offload-arch=mp_31"]
     assert toolchain.base_cuda_flags() == ["-fPIC", "-x", "musa"]
     assert toolchain.base_include_paths() == [
+        "/opt/torchada/compat",
         "/opt/tvm/include",
         "/opt/musa/include",
     ]
@@ -115,6 +121,21 @@ def test_musa_toolchain_flags(monkeypatch):
         "-lmusa",
         "-lmusart",
     ]
+
+
+@pytest.mark.parametrize("hip", [False, True])
+def test_native_include_paths_do_not_import_torchada(monkeypatch, hip):
+    monkeypatch.setattr(toolchain, "is_hip_runtime", lambda: hip)
+    monkeypatch.setattr(toolchain, "is_musa_runtime", lambda: False)
+    monkeypatch.setattr(toolchain, "rocm_home", lambda: "/opt/rocm")
+    monkeypatch.setattr(
+        toolchain, "tvm_ffi_paths", lambda: (("/opt/tvm/include",), "", "")
+    )
+    monkeypatch.setitem(sys.modules, "torchada.utils.cpp_extension", None)
+    expected = ["/opt/tvm/include"]
+    if hip:
+        expected.append("/opt/rocm/include")
+    assert toolchain.base_include_paths() == expected
 
 
 @pytest.mark.parametrize(

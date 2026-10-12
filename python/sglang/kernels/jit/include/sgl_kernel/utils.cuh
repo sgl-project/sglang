@@ -62,40 +62,10 @@ inline constexpr auto cudaSuccess = hipSuccess;
 #define cudaFuncSetAttribute hipFuncSetAttribute
 #define cudaFuncAttributeMaxDynamicSharedMemorySize hipFuncAttributeMaxDynamicSharedMemorySize
 #elif defined(USE_MUSA)
-#include <musa_bf16.h>
-#include <musa_fp16.h>
-#include <musa_fp8.h>
-#include <musa_runtime.h>
-#ifndef __grid_constant__
-#define __grid_constant__
-#endif
-using cudaError_t = musaError_t;
-using cudaStream_t = musaStream_t;
-using cudaLaunchConfig_t = musaLaunchConfig_t;
-using cudaLaunchAttribute = musaLaunchAttribute;
-inline constexpr auto cudaSuccess = musaSuccess;
-#define cudaStreamPerThread musaStreamPerThread
-#define cudaGetErrorString musaGetErrorString
-#define cudaGetLastError musaGetLastError
-#define cudaLaunchKernel musaLaunchKernel
-#define cudaLaunchKernelEx musaLaunchKernelEx
-#define cudaMemcpy musaMemcpy
-#define cudaMemcpyAsync musaMemcpyAsync
-#define cudaMemcpyHostToDevice musaMemcpyHostToDevice
-#define cudaMemcpyDeviceToHost musaMemcpyDeviceToHost
-#define cudaDeviceGetAttribute musaDeviceGetAttribute
-#define cudaGetDevice musaGetDevice
-#define cudaRuntimeGetVersion musaRuntimeGetVersion
-#define cudaDevAttrMultiProcessorCount musaDevAttrMultiProcessorCount
-#define cudaDevAttrComputeCapabilityMajor musaDevAttrComputeCapabilityMajor
-#define cudaDevAttrComputeCapabilityMinor musaDevAttrComputeCapabilityMinor
-#define cudaDevAttrMaxSharedMemoryPerBlock musaDevAttrMaxSharedMemoryPerBlock
-#define cudaDevAttrMaxSharedMemoryPerBlockOptin musaDevAttrMaxSharedMemoryPerBlockOptin
-#define cudaHostGetDevicePointer musaHostGetDevicePointer
-#define cudaOccupancyMaxActiveBlocksPerMultiprocessor musaOccupancyMaxActiveBlocksPerMultiprocessor
-#define cudaOccupancyAvailableDynamicSMemPerBlock musaOccupancyAvailableDynamicSMemPerBlock
-#define cudaFuncSetAttribute musaFuncSetAttribute
-#define cudaFuncAttributeMaxDynamicSharedMemorySize musaFuncAttributeMaxDynamicSharedMemorySize
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <cuda_fp8.h>
+#include <cuda_runtime.h>
 #else
 #include <tvm/ffi/extra/cuda/device_guard.h>
 
@@ -120,22 +90,6 @@ using fp8x2_e4m3_t = uint16_t;
 using fp8x2_e5m2_t = uint16_t;
 using fp8x4_e4m3_t = uint32_t;
 using fp8x4_e5m2_t = uint32_t;
-using fp32x4_t = float4;
-#elif defined(USE_MUSA)
-using fp32_t = float;
-using fp16_t = __half;
-using bf16_t = __mt_bfloat16;
-using fp8_e4m3_t = __mt_fp8_e4m3;
-using fp8_e5m2_t = __mt_fp8_e5m2;
-
-using fp32x2_t = float2;
-using fp16x2_t = __half2;
-using bf16x2_t = __mt_bfloat162;
-using fp8x2_e4m3_t = __mt_fp8x2_e4m3;
-using fp8x2_e5m2_t = __mt_fp8x2_e5m2;
-using fp8x4_e4m3_t = __mt_fp8x4_e4m3;
-using fp8x4_e5m2_t = __mt_fp8x4_e5m2;
-
 using fp32x4_t = float4;
 #else
 using fp32_t = float;
