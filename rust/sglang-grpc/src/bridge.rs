@@ -77,6 +77,20 @@ pub enum ChunkSendStatus {
     Closed,
 }
 
+#[pyclass]
+struct EngineStateChangedCallback {
+    sender: Sender<()>,
+}
+
+#[pymethods]
+impl EngineStateChangedCallback {
+    fn __call__(&self) {
+        // A full snapshot is built after the notification is received, so one
+        // pending signal is enough to represent any number of quick changes.
+        let _ = self.sender.try_send(());
+    }
+}
+
 fn lock_or_recover<'a, T>(mutex: &'a Mutex<T>, name: &'static str) -> MutexGuard<'a, T> {
     mutex.lock().unwrap_or_else(|poisoned| {
         tracing::warn!(mutex = name, "Recovering from poisoned gRPC bridge mutex");
@@ -285,6 +299,25 @@ impl PyBridge {
         Python::attach(|py| {
             let result = self.runtime_handle.call_method0(py, "health_check")?;
             result.extract::<bool>(py)
+        })
+    }
+
+    pub fn is_pause(&self) -> PyResult<bool> {
+        Python::attach(|py| {
+            let result = self.runtime_handle.call_method0(py, "is_pause")?;
+            result.extract::<bool>(py)
+        })
+    }
+
+    pub fn set_engine_state_changed_callback(&self, sender: Sender<()>) -> PyResult<()> {
+        Python::attach(|py| {
+            let callback = Py::new(py, EngineStateChangedCallback { sender })?;
+            self.runtime_handle.call_method1(
+                py,
+                "set_engine_state_changed_callback",
+                (callback,),
+            )?;
+            Ok(())
         })
     }
 

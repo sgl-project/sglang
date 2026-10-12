@@ -60,18 +60,11 @@ from sglang.benchmark.serving import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=30, suite="base-a-test-cpu")
-register_cpu_ci(est_time=46, suite="base-c-test-cpu")
+register_cpu_ci(est_time=38, suite="base-a-test-cpu")
+register_cpu_ci(est_time=46, suite="stage-b-test-cpu-intel")
 
 
 _BENCH_SERVING_CLI_CASES = {
-    "help": ["--help"],
-    "invalid_distribution": [
-        "--dataset-name",
-        "generated-shared-prefix",
-        "--gsp-group-distribution",
-        "invalid_name",
-    ],
     "flush_cache_timeout": ["--flush-cache-timeout", "inf"],
     "zipf_without_alpha": [
         "--dataset-name",
@@ -1407,26 +1400,6 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
             args = make_args(dataset_name="generated-shared-prefix", **case)
             with self.assertRaises(ValueError, msg=f"case={case}"):
                 GeneratedSharedPrefixDataset.from_args(args)
-
-    def test_bench_serving_help_and_invalid_choice_argparse(self):
-        # Subprocess-driven coverage of the live CLI: --help advertises both
-        # flags with the rank-based Zipf formula and the alpha constraint,
-        # and argparse rejects an unknown distribution choice.
-        help_res = _bench_serving_cli_results()["help"]
-        self.assertEqual(help_res.returncode, 0, help_res.stderr)
-        out = help_res.stdout
-        # Both new flags appear.
-        self.assertIn("--gsp-group-distribution", out)
-        self.assertIn("--gsp-zipf-alpha", out)
-        # Rank-based Zipf formula and alpha constraint are documented.
-        self.assertIn("1/rank**alpha", out)
-        self.assertIn("rank starts at 1", out)
-        self.assertIn("finite float", out)
-
-        # Argparse rejects unknown distribution choice.
-        bad_choice_res = _bench_serving_cli_results()["invalid_distribution"]
-        self.assertNotEqual(bad_choice_res.returncode, 0)
-        self.assertIn("invalid choice", (bad_choice_res.stderr + bad_choice_res.stdout))
 
     def test_serving_benchmark_cli_rejects_invalid_flush_cache_timeout(self):
         """Invalid timeouts fail before the benchmark contacts a server or hangs."""

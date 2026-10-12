@@ -144,7 +144,11 @@ class ModelSlimConfig(QuantizationConfig):
                 ModelSlimMXFP4Scheme,
             )
 
-            return ModelSlimMXFP4Scheme()
+            return ModelSlimMXFP4Scheme(
+                quant_config=self.quant_description,
+                prefix=prefix,
+                quant_type=quant_type,
+            )
         raise NotImplementedError(
             f"No modelslim compatible scheme was found for layer '{layer_name}'. "
             f"quant_description['{layer_name}.weight'] = '{quant_type}'"
@@ -196,12 +200,8 @@ class ModelSlimConfig(QuantizationConfig):
         assert is_skipped is not None
         return is_skipped
 
-    def get_scaled_act_names(self) -> List[str]:
-        return []
-
 
 class ModelSlimLinearMethod(LinearMethodBase):
-
     def __init__(self, quantization_config: ModelSlimConfig):
         self.quantization_config = quantization_config
 

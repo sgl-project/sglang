@@ -11,7 +11,10 @@ from sglang.multimodal_gen.configs.models.encoders import (
 )
 from sglang.multimodal_gen.configs.models.encoders.gemma_3 import Gemma3Config
 from sglang.multimodal_gen.configs.models.vaes.ltx_audio import LTXAudioVAEConfig
-from sglang.multimodal_gen.configs.models.vaes.ltx_video import LTXVideoVAEConfig
+from sglang.multimodal_gen.configs.models.vaes.ltx_video import (
+    LTXVideoVAEConfig,
+    get_ltx_video_decode_scale_and_shift,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ModelTaskType,
     PipelineConfig,
@@ -394,6 +397,7 @@ class LTX2PipelineConfig(PipelineConfig):
 
         # Pad whole frames so `latent_frames` is divisible by `sp_world_size`.
         pad_frames = (sp_world_size - (latent_frames % sp_world_size)) % sp_world_size
+        batch.sp_video_has_padding = pad_frames > 0
         if pad_frames:
             pad_tokens = int(pad_frames) * int(tokens_per_frame)
             pad = torch.zeros(
@@ -443,6 +447,7 @@ class LTX2PipelineConfig(PipelineConfig):
         batch.sp_audio_orig_num_frames = int(seq_len)
 
         pad_frames = (sp_world_size - (seq_len % sp_world_size)) % sp_world_size
+        batch.sp_audio_has_padding = pad_frames > 0
         if pad_frames:
             pad = torch.zeros(
                 (audio_latents.shape[0], pad_frames, audio_latents.shape[2]),
@@ -562,36 +567,9 @@ class LTX2PipelineConfig(PipelineConfig):
         )
 
     def get_decode_scale_and_shift(self, device, dtype, vae):
-        latents_mean = getattr(vae, "latents_mean", None)
-        latents_std = getattr(vae, "latents_std", None)
-
-        scaling_factor = (
-            getattr(getattr(vae, "config", None), "scaling_factor", None)
-            or getattr(vae, "scaling_factor", None)
-            or getattr(self.vae_config.arch_config, "scaling_factor", None)
-            or 1.0
+        return get_ltx_video_decode_scale_and_shift(
+            device, dtype, vae, self.vae_config.arch_config
         )
-        if isinstance(scaling_factor, (int, float)) and float(scaling_factor) == 0.0:
-            scaling_factor = 1.0
-
-        if isinstance(latents_mean, torch.Tensor) and isinstance(
-            latents_std, torch.Tensor
-        ):
-            latents_mean = latents_mean.to(device=device, dtype=dtype).view(
-                1, -1, 1, 1, 1
-            )
-            latents_std = latents_std.to(device=device, dtype=dtype).view(
-                1, -1, 1, 1, 1
-            )
-            sf = torch.tensor(float(scaling_factor), device=device, dtype=dtype).view(
-                1, 1, 1, 1, 1
-            )
-            return sf / latents_std, latents_mean
-
-        sf = torch.tensor(float(scaling_factor), device=device, dtype=dtype).view(
-            1, 1, 1, 1, 1
-        )
-        return sf, None
 
     @staticmethod
     def _unpack_latents(
@@ -623,29 +601,6 @@ class LTX2PipelineConfig(PipelineConfig):
             .flatten(2, 3)
         )
         return latents
-
-    @staticmethod
-    def _denormalize_latents(
-        latents: torch.Tensor,
-        latents_mean: torch.Tensor,
-        latents_std: torch.Tensor,
-        scaling_factor: float = 1.0,
-    ) -> torch.Tensor:
-        # Denormalize latents across the channel dimension [B, C, F, H, W]
-        latents_mean = latents_mean.view(1, -1, 1, 1, 1).to(
-            latents.device, latents.dtype
-        )
-        latents_std = latents_std.view(1, -1, 1, 1, 1).to(latents.device, latents.dtype)
-        latents = latents * latents_std / scaling_factor + latents_mean
-        return latents
-
-    @staticmethod
-    def _denormalize_audio_latents(
-        latents: torch.Tensor, latents_mean: torch.Tensor, latents_std: torch.Tensor
-    ):
-        latents_mean = latents_mean.to(latents.device, latents.dtype)
-        latents_std = latents_std.to(latents.device, latents.dtype)
-        return (latents * latents_std) + latents_mean
 
     @staticmethod
     def _unpack_audio_latents(
@@ -723,3 +678,40 @@ class LTX2PipelineConfig(PipelineConfig):
 @dataclasses.dataclass
 class LTX23PipelineConfig(LTX2PipelineConfig):
     """Configuration overrides for LTX-2.3."""
+
+    # original-mode lora swaps invalidate post-warmup timing calibration
+    supports_auto_residency: bool = False
+
+
+def register():
+    from sglang.multimodal_gen.configs.sample.ltx_2 import (
+        LTX2SamplingParams,
+        LTX23HQSamplingParams,
+        LTX23SamplingParams,
+    )
+    from sglang.multimodal_gen.registry import register_configs
+
+    register_configs(
+        sampling_param_cls=LTX2SamplingParams,
+        pipeline_config_cls=LTX2PipelineConfig,
+        hf_model_paths=["Lightricks/LTX-2"],
+        model_detectors=[
+            lambda path: "ltx" in path.lower() and "video" in path.lower(),
+            lambda path: (
+                "ltx-2" in path.lower()
+                and "ltx-2.3" not in path.lower()
+                and "ltx-2.5" not in path.lower()
+            ),
+        ],
+    )
+    register_configs(
+        sampling_param_cls=LTX23SamplingParams,
+        pipeline_config_cls=LTX23PipelineConfig,
+        hf_model_paths=["Lightricks/LTX-2.3"],
+        model_detectors=[
+            lambda path: "ltx-2.3" in path.lower(),
+        ],
+        pipeline_config_registry_entries={
+            "LTX2TwoStageHQPipeline": (LTX2PipelineConfig, LTX23HQSamplingParams),
+        },
+    )

@@ -24,10 +24,19 @@ from sglang.srt.multimodal.internvl_utils import IMAGENET_MEAN, IMAGENET_STD
 
 def float_triplet(seq: Any):
     a, b, c = tuple(seq)
-    assert (
-        isinstance(a, float) and isinstance(b, float) and isinstance(c, float)
-    ), "expected three floats"
+    assert isinstance(a, float) and isinstance(b, float) and isinstance(c, float), (
+        "expected three floats"
+    )
     return a, b, c
+
+
+def _nemotron_h_compatible_config(config: dict) -> dict:
+    config = dict(config)
+    aliases = {"linear_attention": "mamba", "full_attention": "attention"}
+    for field in ("layers_block_type", "mtp_layers_block_type"):
+        if config.get(field) is not None:
+            config[field] = [aliases.get(value, value) for value in config[field]]
+    return config
 
 
 class NemotronH_Nano_VL_V2_Config(PretrainedConfig):
@@ -165,4 +174,16 @@ class NemotronH_Nano_Omni_Reasoning_V3_Config(NemotronH_Nano_VL_V2_Config):
     def __init__(self, *args, **kwargs):
         # Explicit __init__ prevents PretrainedConfig.__init_subclass__ from
         # replacing the parent's custom __init__ with a dataclass-generated one.
+        super().__init__(*args, **kwargs)
+
+
+class NemotronH_Omni_Reasoning_V3_Config(NemotronH_Nano_Omni_Reasoning_V3_Config):
+    model_type = "nemotron_h_omni"
+
+    def __init__(self, *args, **kwargs):
+        args = list(args)
+        if len(args) > 1 and args[1] is not None:
+            args[1] = _nemotron_h_compatible_config(args[1])
+        elif kwargs.get("llm_config") is not None:
+            kwargs["llm_config"] = _nemotron_h_compatible_config(kwargs["llm_config"])
         super().__init__(*args, **kwargs)

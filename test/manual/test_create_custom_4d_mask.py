@@ -386,8 +386,8 @@ class TestPerformance(unittest.TestCase):
         speedup = t_ref / t_new
         dev_tag = "CUDA" if "cuda" in str(self.device) else "CPU"
         print(
-            f"  [{dev_tag}] B={batch_size:3d} S={seq_len:5d} img%={int(image_fraction*100):3d}%"
-            f"  ref={t_ref*1e3:.2f}ms  new={t_new*1e3:.2f}ms  speedup={speedup:.2f}x"
+            f"  [{dev_tag}] B={batch_size:3d} S={seq_len:5d} img%={int(image_fraction * 100):3d}%"
+            f"  ref={t_ref * 1e3:.2f}ms  new={t_new * 1e3:.2f}ms  speedup={speedup:.2f}x"
         )
         self.assertGreaterEqual(
             speedup,

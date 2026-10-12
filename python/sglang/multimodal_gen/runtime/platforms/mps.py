@@ -10,7 +10,6 @@ from sglang.multimodal_gen.runtime.platforms import (
     Platform,
     PlatformEnum,
 )
-from sglang.multimodal_gen.runtime.platforms.interface import DeviceCapability
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 # SPDX-License-Identifier: Apache-2.0
@@ -43,10 +42,6 @@ class MpsPlatform(Platform):
     @classmethod
     def set_device(cls, device: torch.device) -> None:
         pass
-
-    @classmethod
-    def get_device_capability(cls, device_id: int = 0) -> DeviceCapability | None:
-        return None
 
     @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
@@ -117,9 +112,11 @@ class MpsPlatform(Platform):
         )
 
     @classmethod
-    def get_device_communicator_cls(cls) -> str:
-        # Use base communicator for MPS
-        return "sglang.multimodal_gen.runtime.distributed.device_communicators.base_device_communicator.DeviceCommunicatorBase"
+    def get_all_to_all_communicator_cls(cls) -> str:
+        return (
+            "sglang.multimodal_gen.runtime.distributed.device_communicators."
+            "cpu_communicator.CpuCommunicator"
+        )
 
     @classmethod
     def seed_everything(cls, seed: int | None = None) -> None:

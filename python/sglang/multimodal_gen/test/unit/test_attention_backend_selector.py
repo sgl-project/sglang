@@ -4,11 +4,15 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.multimodal_gen.configs.attention_roles import AttentionRole
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionRequirements,
 )
 from sglang.multimodal_gen.runtime.layers.attention.selector import (
+    ComponentAttentionBackendNotAppliedError,
     _cached_get_attn_backend,
+    _record_component_attn_backend,
+    claim_deferred_component_attn_backend,
     component_attn_backend_context_manager,
     get_attn_backend,
     get_component_attn_backend_context,
@@ -16,6 +20,7 @@ from sglang.multimodal_gen.runtime.layers.attention.selector import (
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentLoader,
     GenericComponentLoader,
+    NativeComponentLoaderRequired,
     PipelineComponentLoader,
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders.text_encoder_loader import (
@@ -25,6 +30,9 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader i
     TransformerLoader,
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders.vae_loader import VAELoader
+from sglang.multimodal_gen.runtime.pipelines.diffusers_pipeline import (
+    DiffusersPipeline,
+)
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
@@ -120,6 +128,8 @@ class TestAttentionBackendFallback(unittest.TestCase):
         component_backend: AttentionBackendEnum | None = None,
         allow_global_backend_fallback: bool = False,
         server_args: object | None = None,
+        backend_by_role: dict[AttentionRole, AttentionBackendEnum] | None = None,
+        also_resolve_is_cross: tuple[bool, ...] = (),
     ):
         if server_args is None:
             server_args = _ServerArgs(backend.name.lower(), explicit=explicit)
@@ -135,16 +145,18 @@ class TestAttentionBackendFallback(unittest.TestCase):
                 _FakePlatform,
             ),
             patch(
-                f"{_SELECTOR}.resolve_obj_by_qualname",
+                f"{_SELECTOR}.resolve_name",
                 side_effect=_FAKE_BACKENDS.__getitem__,
             ),
             component_attn_backend_context_manager(
                 component_backend,
                 component_name="text_encoder",
+                backend_by_role=backend_by_role,
                 allow_global_backend_fallback=allow_global_backend_fallback,
+                require_backend_selection=component_backend is not None,
             ),
         ):
-            return get_attn_backend(
+            resolved = get_attn_backend(
                 128,
                 torch.bfloat16,
                 supported_attention_backends=supported,
@@ -152,6 +164,18 @@ class TestAttentionBackendFallback(unittest.TestCase):
                 default_attention_backend=default_attention_backend,
                 is_cross_attention=is_cross_attention,
             )
+            # Component-scoped validation runs on context exit, so a test that
+            # configures a role must build a layer of that role somewhere.
+            for extra_is_cross in also_resolve_is_cross:
+                get_attn_backend(
+                    128,
+                    torch.bfloat16,
+                    supported_attention_backends=supported,
+                    attention_requirements=attention_requirements,
+                    default_attention_backend=default_attention_backend,
+                    is_cross_attention=extra_is_cross,
+                )
+            return resolved
 
     def test_implicit_platform_preference_falls_back(self):
         backend = self._resolve(
@@ -163,6 +187,36 @@ class TestAttentionBackendFallback(unittest.TestCase):
 
         self.assertIs(backend, _FakeFABackend)
         self.assertIsNone(_FakePlatform.selected_backend)
+
+    def test_component_override_requires_an_sglang_attention_layer(self):
+        with self.assertRaisesRegex(
+            ValueError, "did not construct any SGLang-selectable attention layers"
+        ):
+            with component_attn_backend_context_manager(
+                AttentionBackendEnum.FA, component_name="vae"
+            ):
+                pass
+
+        self.assertIsNone(get_component_attn_backend_context())
+
+    def test_component_override_preserves_load_error_and_resets_context(self):
+        with self.assertRaisesRegex(RuntimeError, "component failed"):
+            with component_attn_backend_context_manager(
+                AttentionBackendEnum.FA, component_name="vae"
+            ):
+                raise RuntimeError("component failed")
+
+        self.assertIsNone(get_component_attn_backend_context())
+
+    def test_automatic_component_backend_may_skip_sglang_attention_layer(self):
+        with component_attn_backend_context_manager(
+            AttentionBackendEnum.TORCH_SDPA,
+            component_name="text_encoder",
+            require_component_backend_selection=False,
+        ):
+            pass
+
+        self.assertIsNone(get_component_attn_backend_context())
 
     def test_implicit_preference_falls_back_for_missing_capability(self):
         backend = self._resolve(
@@ -189,15 +243,25 @@ class TestAttentionBackendFallback(unittest.TestCase):
 
         self.assertIs(backend, _FakeFABackend)
 
-    def test_explicit_dense_mismatch_fails_closed(self):
-        with self.assertRaisesRegex(
-            ValueError, "not supported by this attention layer"
-        ):
+    def test_explicit_backend_is_not_rejected_by_automatic_selection_set(self):
+        backend = self._resolve(
+            AttentionBackendEnum.AITER,
+            explicit=True,
+            is_cross_attention=False,
+            supported={AttentionBackendEnum.FA, AttentionBackendEnum.TORCH_SDPA},
+        )
+
+        self.assertIs(backend, _FakeAITERBackend)
+        self.assertEqual(_FakePlatform.selected_backend, AttentionBackendEnum.AITER)
+
+    def test_explicit_backend_still_fails_missing_capability(self):
+        with self.assertRaisesRegex(ValueError, "packed varlen attention"):
             self._resolve(
                 AttentionBackendEnum.AITER,
                 explicit=True,
                 is_cross_attention=False,
                 supported={AttentionBackendEnum.FA, AttentionBackendEnum.TORCH_SDPA},
+                attention_requirements=AttentionRequirements(packed_varlen=True),
             )
 
     def test_explicit_global_backend_uses_component_default(self):
@@ -206,6 +270,7 @@ class TestAttentionBackendFallback(unittest.TestCase):
             explicit=True,
             is_cross_attention=False,
             supported={AttentionBackendEnum.FA, AttentionBackendEnum.TORCH_SDPA},
+            attention_requirements=AttentionRequirements(packed_varlen=True),
             default_attention_backend=AttentionBackendEnum.TORCH_SDPA,
         )
 
@@ -220,24 +285,35 @@ class TestAttentionBackendFallback(unittest.TestCase):
             explicit=True,
             is_cross_attention=False,
             supported={AttentionBackendEnum.FA, AttentionBackendEnum.TORCH_SDPA},
+            attention_requirements=AttentionRequirements(packed_varlen=True),
             allow_global_backend_fallback=True,
         )
 
         self.assertIs(backend, _FakeFABackend)
         self.assertIsNone(_FakePlatform.selected_backend)
 
-    def test_explicit_component_backend_remains_strict(self):
-        with self.assertRaisesRegex(
-            ValueError, "not supported by this attention layer"
-        ):
-            self._resolve(
-                AttentionBackendEnum.FA,
-                explicit=True,
-                is_cross_attention=False,
-                supported={AttentionBackendEnum.FA, AttentionBackendEnum.TORCH_SDPA},
-                component_backend=AttentionBackendEnum.AITER,
-                allow_global_backend_fallback=True,
-            )
+    def test_explicit_component_backend_ignores_automatic_selection_set(self):
+        backend = self._resolve(
+            AttentionBackendEnum.FA,
+            explicit=True,
+            is_cross_attention=False,
+            supported={AttentionBackendEnum.FA, AttentionBackendEnum.TORCH_SDPA},
+            component_backend=AttentionBackendEnum.AITER,
+            allow_global_backend_fallback=True,
+        )
+
+        self.assertIs(backend, _FakeAITERBackend)
+
+    def test_explicit_component_backend_is_consumed(self):
+        backend = self._resolve(
+            AttentionBackendEnum.TORCH_SDPA,
+            explicit=True,
+            is_cross_attention=False,
+            supported={AttentionBackendEnum.FA, AttentionBackendEnum.TORCH_SDPA},
+            component_backend=AttentionBackendEnum.FA,
+        )
+
+        self.assertIs(backend, _FakeFABackend)
 
     def test_sparse_backend_falls_back_for_cross_attention(self):
         backend = self._resolve(
@@ -261,37 +337,190 @@ class TestAttentionBackendFallback(unittest.TestCase):
         self.assertIs(backend, _FakeFABackend)
         self.assertIsNone(_FakePlatform.selected_backend)
 
-    def test_sparse_backend_mismatch_fails_for_self_attention(self):
+    def test_explicit_sparse_backend_is_admitted_for_self_attention(self):
+        backend = self._resolve(
+            AttentionBackendEnum.LASER_ATTN,
+            explicit=True,
+            is_cross_attention=False,
+            supported={AttentionBackendEnum.FA, AttentionBackendEnum.TORCH_SDPA},
+        )
+
+        self.assertIs(backend, _FakeSparseBackend)
+
+    def test_role_backend_selects_for_cross(self):
+        # Component-wide default is SDPA (implicit), but the cross role forces FA.
+        backend = self._resolve(
+            AttentionBackendEnum.TORCH_SDPA,
+            explicit=False,
+            is_cross_attention=True,
+            supported={AttentionBackendEnum.FA, AttentionBackendEnum.TORCH_SDPA},
+            backend_by_role={AttentionRole.CROSS: AttentionBackendEnum.FA},
+        )
+
+        self.assertIs(backend, _FakeFABackend)
+        self.assertEqual(_FakePlatform.selected_backend, AttentionBackendEnum.FA)
+
+    def test_role_backend_not_applied_to_self(self):
+        # The cross role override must not leak into self-attention, which keeps
+        # the explicit SDPA selection.
+        backend = self._resolve(
+            AttentionBackendEnum.TORCH_SDPA,
+            explicit=True,
+            is_cross_attention=False,
+            supported={AttentionBackendEnum.FA, AttentionBackendEnum.TORCH_SDPA},
+            backend_by_role={AttentionRole.CROSS: AttentionBackendEnum.FA},
+            also_resolve_is_cross=(True,),
+        )
+
+        self.assertIs(backend, _FakeSDPABackend)
+
+    def test_role_backend_requires_a_matching_layer(self):
+        # A role override on a component that builds no layers of that role is
+        # a silent no-op, which is the failure the component-wide check reports.
         with self.assertRaisesRegex(
-            ValueError, "not supported by this attention layer"
+            ComponentAttentionBackendNotAppliedError,
+            "constructed no cross-attention layers",
         ):
             self._resolve(
-                AttentionBackendEnum.LASER_ATTN,
+                AttentionBackendEnum.TORCH_SDPA,
                 explicit=True,
                 is_cross_attention=False,
                 supported={AttentionBackendEnum.FA, AttentionBackendEnum.TORCH_SDPA},
+                backend_by_role={AttentionRole.CROSS: AttentionBackendEnum.FA},
             )
+
+    def test_role_override_does_not_mask_component_wide_failure(self):
+        # A layer that pins its own backend still fails the component-wide
+        # requirement even when a role override happens to name that backend.
+        with (
+            patch(f"{_SELECTOR}.get_global_forced_attn_backend", return_value=None),
+            patch(
+                f"{_SELECTOR}.get_component_forced_attn_backend",
+                return_value=AttentionBackendEnum.AITER,
+            ),
+            patch(
+                f"{_SELECTOR}.get_global_server_args",
+                return_value=_ServerArgs("aiter", explicit=False),
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.platforms.current_platform",
+                _FakePlatform,
+            ),
+            patch(
+                f"{_SELECTOR}.resolve_name",
+                side_effect=_FAKE_BACKENDS.__getitem__,
+            ),
+            self.assertRaisesRegex(
+                ComponentAttentionBackendNotAppliedError, "selected fa instead"
+            ),
+            component_attn_backend_context_manager(
+                AttentionBackendEnum.AITER,
+                component_name="text_encoder",
+                backend_by_role={AttentionRole.CROSS: AttentionBackendEnum.FA},
+                require_backend_selection=True,
+            ),
+        ):
+            # Cross-attention honors the role override.
+            get_attn_backend(
+                128,
+                torch.bfloat16,
+                supported_attention_backends={AttentionBackendEnum.FA},
+                is_cross_attention=True,
+            )
+            # Self-attention pins FA for correctness, ignoring aiter entirely.
+            get_attn_backend(
+                128,
+                torch.bfloat16,
+                supported_attention_backends={AttentionBackendEnum.FA},
+                selected_attention_backend=AttentionBackendEnum.FA,
+                is_cross_attention=False,
+            )
+
+    def test_role_backend_overrides_component_wide(self):
+        # Role-qualified selection takes precedence over the component-wide backend.
+        backend = self._resolve(
+            AttentionBackendEnum.TORCH_SDPA,
+            explicit=False,
+            is_cross_attention=True,
+            supported={AttentionBackendEnum.FA, AttentionBackendEnum.TORCH_SDPA},
+            backend_by_role={AttentionRole.CROSS: AttentionBackendEnum.FA},
+            component_backend=AttentionBackendEnum.TORCH_SDPA,
+        )
+
+        self.assertIs(backend, _FakeFABackend)
+
+    def test_role_sparse_backend_downgrades_for_cross(self):
+        # A sparse backend chosen via the cross role still downgrades to dense.
+        backend = self._resolve(
+            AttentionBackendEnum.LASER_ATTN,
+            explicit=False,
+            is_cross_attention=True,
+            supported={AttentionBackendEnum.FA, AttentionBackendEnum.TORCH_SDPA},
+            backend_by_role={AttentionRole.CROSS: AttentionBackendEnum.LASER_ATTN},
+        )
+
+        self.assertIs(backend, _FakeFABackend)
 
 
 class TestComponentAttentionBackendScope(unittest.TestCase):
     def _load_with_policy(self, allow_global_backend_fallback: bool):
         captured_context = None
 
-        class _Loader:
-            def load(self, *_args):
+        class _Loader(ComponentLoader):
+            def load_customized(self, *_args):
                 nonlocal captured_context
                 captured_context = get_component_attn_backend_context()
-                return object(), 0.0
+                return object()
 
-        _Loader.allow_global_attention_backend_fallback = allow_global_backend_fallback
-        with patch.object(
-            ComponentLoader, "for_component_type", return_value=_Loader()
+            def component_attention_backend_context(
+                self,
+                attn_backend,
+                component_attn_name: str | None,
+                require_backend_selection: bool,
+                backend_by_role=None,
+            ):
+                return component_attn_backend_context_manager(
+                    attn_backend,
+                    component_name=component_attn_name,
+                    backend_by_role=backend_by_role,
+                    allow_global_backend_fallback=allow_global_backend_fallback,
+                    require_backend_selection=require_backend_selection,
+                )
+
+        class _Args:
+            component_precisions = {}
+            component_quantizations = {}
+            component_weights_paths = {}
+            pipeline_config = SimpleNamespace(native_only_components=())
+
+            @staticmethod
+            def resolve_component_backend_by_role(*_component_names):
+                return {}
+
+            @staticmethod
+            def requested_component_attention_backend(_component_name):
+                return None
+
+            @staticmethod
+            def should_direct_gpu_weight_load_component(_component_name):
+                return False
+
+            @staticmethod
+            def should_use_fsdp_for_component(_component_name):
+                return False
+
+        with (
+            patch.object(ComponentLoader, "for_component_type", return_value=_Loader()),
+            patch(
+                "sglang.multimodal_gen.runtime.loader.component_loaders.component_loader.current_platform.get_available_gpu_memory",
+                return_value=1.0,
+            ),
         ):
             PipelineComponentLoader.load_component(
                 component_name="text_encoder",
                 component_model_path="unused",
                 transformers_or_diffusers="transformers",
-                server_args=object(),
+                server_args=_Args(),
                 component_attn_name="text_encoder",
             )
         return captured_context
@@ -309,10 +538,231 @@ class TestComponentAttentionBackendScope(unittest.TestCase):
         self.assertFalse(context.allow_global_backend_fallback)
 
     def test_builtin_loader_scopes(self):
-        self.assertFalse(TransformerLoader.allow_global_attention_backend_fallback)
-        self.assertFalse(GenericComponentLoader.allow_global_attention_backend_fallback)
-        self.assertTrue(TextEncoderLoader.allow_global_attention_backend_fallback)
-        self.assertTrue(VAELoader.allow_global_attention_backend_fallback)
+        cases = (
+            (TransformerLoader(), "transformer", False),
+            (GenericComponentLoader(), "custom", False),
+            (TextEncoderLoader(), "text_encoder", True),
+            (VAELoader(), "vae", True),
+        )
+        for loader, component_name, expected_fallback in cases:
+            with (
+                self.subTest(loader=loader.__class__.__name__),
+                loader.component_attention_backend_context(None, component_name, False),
+            ):
+                context = get_component_attn_backend_context()
+                self.assertIsNotNone(context)
+                self.assertEqual(
+                    context.allow_global_backend_fallback, expected_fallback
+                )
+
+    def test_explicit_backend_must_be_consumed(self):
+        with self.assertRaisesRegex(
+            ComponentAttentionBackendNotAppliedError,
+            "did not construct any SGLang-selectable attention layers",
+        ):
+            with component_attn_backend_context_manager(
+                AttentionBackendEnum.FA,
+                component_name="image_encoder",
+                require_backend_selection=True,
+            ):
+                pass
+
+    def test_deferred_selection_satisfies_construction_contract(self):
+        with component_attn_backend_context_manager(
+            AttentionBackendEnum.FA,
+            component_name="transformer",
+            require_backend_selection=True,
+        ):
+            self.assertIs(
+                claim_deferred_component_attn_backend(),
+                AttentionBackendEnum.FA,
+            )
+
+    def test_fixed_component_load_rejects_explicit_backend(self):
+        class _Loader(ComponentLoader):
+            def load_customized(self, *_args):
+                return object()
+
+        class _Args:
+            component_precisions = {}
+            component_quantizations = {}
+            component_weights_paths = {}
+            pipeline_config = SimpleNamespace(native_only_components=())
+
+            @staticmethod
+            def resolve_component_backend_by_role(*_component_names):
+                return {}
+
+            @staticmethod
+            def requested_component_attention_backend(_component_name):
+                return "fa"
+
+            @staticmethod
+            def should_direct_gpu_weight_load_component(_component_name):
+                return False
+
+            @staticmethod
+            def should_use_fsdp_for_component(_component_name):
+                return False
+
+        with (
+            patch.object(ComponentLoader, "for_component_type", return_value=_Loader()),
+            patch(
+                "sglang.multimodal_gen.runtime.loader.component_loaders.component_loader.current_platform.get_available_gpu_memory",
+                return_value=1.0,
+            ),
+            self.assertRaisesRegex(
+                ComponentAttentionBackendNotAppliedError,
+                "did not construct any SGLang-selectable attention layers",
+            ),
+        ):
+            PipelineComponentLoader.load_component(
+                component_name="image_encoder",
+                component_model_path="unused",
+                transformers_or_diffusers="transformers",
+                server_args=_Args(),
+                component_attn_backend=AttentionBackendEnum.FA,
+                component_attn_name="image_encoder",
+            )
+
+    def test_unexplained_mixed_backend_is_rejected(self):
+        with self.assertRaisesRegex(
+            ComponentAttentionBackendNotAppliedError,
+            "also selected torch_sdpa without an allowed fallback",
+        ):
+            with component_attn_backend_context_manager(
+                AttentionBackendEnum.FA,
+                component_name="transformer",
+                require_backend_selection=True,
+            ):
+                _record_component_attn_backend("fa", None)
+                _record_component_attn_backend("torch_sdpa", None)
+                _record_component_attn_backend(
+                    "torch_sdpa", "dense cross-attention fallback"
+                )
+
+    def test_explicit_backend_preserves_customized_load_failure(self):
+        native_load_called = False
+
+        class _Loader(ComponentLoader):
+            def load_customized(self, *_args):
+                claim_deferred_component_attn_backend()
+                raise RuntimeError("customized load failed")
+
+            def load_native(self, *_args):
+                nonlocal native_load_called
+                native_load_called = True
+                return object()
+
+        class _Args:
+            component_precisions = {}
+            component_quantizations = {}
+            component_weights_paths = {}
+            pipeline_config = SimpleNamespace(native_only_components=())
+
+            @staticmethod
+            def resolve_component_backend_by_role(*_component_names):
+                return {}
+
+            @staticmethod
+            def requested_component_attention_backend(_component_name):
+                return "fa"
+
+            @staticmethod
+            def should_direct_gpu_weight_load_component(_component_name):
+                return False
+
+            @staticmethod
+            def should_use_fsdp_for_component(_component_name):
+                return False
+
+        with (
+            patch.object(ComponentLoader, "for_component_type", return_value=_Loader()),
+            patch(
+                "sglang.multimodal_gen.runtime.loader.component_loaders.component_loader.current_platform.get_available_gpu_memory",
+                return_value=1.0,
+            ),
+            self.assertRaisesRegex(RuntimeError, "customized load failed"),
+        ):
+            PipelineComponentLoader.load_component(
+                component_name="text_encoder",
+                component_model_path="unused",
+                transformers_or_diffusers="transformers",
+                server_args=_Args(),
+                component_attn_backend=AttentionBackendEnum.FA,
+                component_attn_name="text_encoder",
+            )
+        self.assertFalse(native_load_called)
+
+    def test_legacy_fallback_uses_a_fresh_selection_context(self):
+        customized_context = None
+        native_context = None
+
+        class _Loader(ComponentLoader):
+            def load_customized(self, *_args):
+                nonlocal customized_context
+                customized_context = get_component_attn_backend_context()
+                _record_component_attn_backend("fa", None)
+                raise NativeComponentLoaderRequired("use native loader")
+
+            def load_native(self, *_args):
+                nonlocal native_context
+                native_context = get_component_attn_backend_context()
+                return object()
+
+        class _Args:
+            component_precisions = {}
+            component_quantizations = {}
+            component_weights_paths = {}
+            pipeline_config = SimpleNamespace(native_only_components=())
+
+            @staticmethod
+            def resolve_component_backend_by_role(*_component_names):
+                return {}
+
+            @staticmethod
+            def requested_component_attention_backend(_component_name):
+                return None
+
+            @staticmethod
+            def should_direct_gpu_weight_load_component(_component_name):
+                return False
+
+            @staticmethod
+            def should_use_fsdp_for_component(_component_name):
+                return False
+
+        with (
+            patch.object(ComponentLoader, "for_component_type", return_value=_Loader()),
+            patch(
+                "sglang.multimodal_gen.runtime.loader.component_loaders.component_loader.current_platform.get_available_gpu_memory",
+                return_value=1.0,
+            ),
+        ):
+            PipelineComponentLoader.load_component(
+                component_name="text_encoder",
+                component_model_path="unused",
+                transformers_or_diffusers="transformers",
+                server_args=_Args(),
+                component_attn_name="text_encoder",
+            )
+
+        self.assertIsNotNone(customized_context)
+        self.assertIsNotNone(native_context)
+        self.assertIsNot(customized_context, native_context)
+        self.assertEqual(customized_context.selected_backends, {"fa": None})
+        self.assertEqual(native_context.selected_backends, {})
+
+    def test_diffusers_backend_rejects_component_override(self):
+        with self.assertRaisesRegex(
+            ValueError, "supported only by native SGLang diffusion pipelines"
+        ):
+            DiffusersPipeline(
+                "/unused",
+                SimpleNamespace(
+                    has_requested_component_attention_backends=lambda: True
+                ),
+            )
 
 
 if __name__ == "__main__":

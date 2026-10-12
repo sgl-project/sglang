@@ -53,9 +53,11 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsWNA16MoE,
     CompressedTensorsWNA16TritonMoE,
     NPUCompressedTensorsW4A8Int8DynamicMoE,
+    NPUCompressedTensorsW4A8mxfp4MoE,
     NPUCompressedTensorsW4A16Int4DynamicMoE,
     NPUCompressedTensorsW8A8Int8,
     NPUCompressedTensorsW8A8Int8DynamicMoE,
+    XPUCompressedTensorsWNA16,
 )
 from sglang.srt.layers.quantization.compressed_tensors.utils import (
     check_equal_or_regex_match,
@@ -69,7 +71,8 @@ from sglang.srt.layers.quantization.unquant import (
     UnquantizedFusedMoEMethod,
     UnquantizedLinearMethod,
 )
-from sglang.srt.utils import is_cuda, is_hip, is_npu, is_sm100_supported, is_xpu
+from sglang.srt.runtime_context import get_platform
+from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
 
 _is_cuda = is_cuda()
 _is_npu = is_npu()
@@ -224,7 +227,10 @@ class CompressedTensorsConfig(QuantizationConfig):
             # Detect MXFP4 before the scheme-based path: MXFP4 uses a
             # dedicated FusedMoEMethodBase (Mxfp4MoEMethod) that already
             # handles all MoE backends, bypassing the scheme abstraction.
-            if self._is_mxfp4_moe(layer_name=prefix):
+            # On NPU the dedicated Mxfp4MoEMethod does not apply, so fall
+            # through to the scheme-based path and let get_moe_scheme select
+            # NPUCompressedTensorsW4A8mxfp4MoE.
+            if self._is_mxfp4_moe(layer_name=prefix) and not _is_npu:
                 from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
 
                 logger.info_once(
@@ -694,7 +700,10 @@ class CompressedTensorsConfig(QuantizationConfig):
                 quant_format == CompressionFormat.pack_quantized.value
                 and weight_quant.num_bits in WNA16_SUPPORTED_BITS
             ):
-                return CompressedTensorsWNA16(
+                scheme_cls = (
+                    XPUCompressedTensorsWNA16 if _is_xpu else CompressedTensorsWNA16
+                )
+                return scheme_cls(
                     num_bits=weight_quant.num_bits,
                     strategy=weight_quant.strategy,
                     group_size=weight_quant.group_size,
@@ -818,15 +827,20 @@ class CompressedTensorsConfig(QuantizationConfig):
         weight_quant = scheme_dict.get("weights")
         input_quant = scheme_dict.get("input_activations")
 
+        # MXFP4 MoE on NPU is served by NPUCompressedTensorsW4A8mxfp4MoE. Detect
+        # it before the WNA16 branch: MXFP4 weights are FP4 (float) group-32 so
+        # `_is_wNa16_group_channel` / `_is_dynamic_token_w4a8` would otherwise
+        # misroute them to the INT4 WNA16 or W4A8-int8 schemes.
+        if _is_npu and self._is_mxfp4_moe(layer_name=layer_name):
+            logger.info_once("Using NPUCompressedTensorsW4A8mxfp4MoE")
+            return NPUCompressedTensorsW4A8mxfp4MoE()
+
         if self._is_wNa16_group_channel(weight_quant, input_quant):
             if not _is_npu:
                 if (
                     self._is_mxint4a16(weight_quant, input_quant)
                     and get_moe_runner_backend().is_flashinfer_trtllm()
                 ):
-                    logger.info_once(
-                        "Using CompressedTensorsMxInt4MoE with flashinfer_trtllm backend"
-                    )
                     return CompressedTensorsMxInt4MoE(self, weight_quant=weight_quant)
                 elif _is_hip:
                     logger.info_once("Using CompressedTensorsWNA16TritonMoE (ROCm)")
@@ -838,7 +852,7 @@ class CompressedTensorsConfig(QuantizationConfig):
                     triton_supported = self._is_wna16_triton_moe_supported(weight_quant)
                     use_blackwell_triton = (
                         moe_backend.is_auto()
-                        and is_sm100_supported()
+                        and get_platform().is_sm100
                         and triton_supported
                     )
                     if moe_backend.is_triton() and not triton_supported:
@@ -978,7 +992,9 @@ class CompressedTensorsConfig(QuantizationConfig):
         # (e.g. fp8 needs ada lovelace)
         # Note: NPU devices do not support min_capability function
         if _is_xpu:
-            if not isinstance(scheme, CompressedTensorsW8A8Fp8):
+            if not isinstance(
+                scheme, (CompressedTensorsW8A8Fp8, XPUCompressedTensorsWNA16)
+            ):
                 raise RuntimeError(
                     f"{scheme.__class__.__name__} is not supported on XPU "
                     "(no XPU kernel implementation)."
@@ -1241,6 +1257,9 @@ class CompressedTensorsFusedMoEMethod(FusedMoEMethodBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         layer.scheme.process_weights_after_loading(layer)
+
+    def restore_weights_before_loading(self, layer: torch.nn.Module) -> None:
+        layer.scheme.restore_weights_before_loading(layer)
 
     def create_weights(
         self,

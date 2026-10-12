@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-import math
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, ClassVar
 
 import msgspec
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.utils import optional_positive_finite_float
 
 _MINIMAX_H3_MAX_SIGNED_SEED = (1 << 63) - 1
 
@@ -23,19 +23,10 @@ def _optional_unit_float(value: Any, field_name: str) -> float | None:
     return out
 
 
-def _optional_positive_finite_float(value: Any, field_name: str) -> float | None:
-    if value is None:
-        return None
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError(f"{field_name} must be a number")
-    out = float(value)
-    if not math.isfinite(out) or out <= 0.0:
-        raise ValueError(f"{field_name} must be a positive finite number")
-    return out
-
-
 @dataclass
 class MiniMaxH3SamplingParams(SamplingParams):
+    min_num_inference_steps: ClassVar[int] = 1
+
     height: int = 512
     width: int = 896
     num_inference_steps: int = 50
@@ -146,14 +137,40 @@ class MiniMaxH3SamplingParams(SamplingParams):
 
         self.task = task
         self.conditions = conditions
-        self.target = {
-            "short_edge": 768,
-            "aspect_ratio": "16:9",
-            "duration_seconds": 5.0,
-        }
+        self.target = self._synthetic_warmup_target(req, server_args)
         selected_seed = req.seed if isinstance(req.seed, int) else int(req.seed[0])
         req.extra.update(self.build_request_extra(_seed_override=int(selected_seed)))
         self._video_hooks().prepare_for_queue_sync(req)
+
+    @staticmethod
+    def _synthetic_warmup_target(req: Any, server_args: Any) -> dict[str, Any]:
+        """Warmup canvas from ``--warmup-num-frames`` / ``--warmup-resolutions``."""
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.constants import (
+            MINIMAX_H3_RECOMMENDED_SHORT_EDGE,
+            MINIMAX_H3_SUPPORTED_FPS,
+        )
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.task_profiles import (
+            MINIMAX_H3_FINITE_ASPECT_RATIOS,
+        )
+
+        target: dict[str, Any] = {
+            "short_edge": MINIMAX_H3_RECOMMENDED_SHORT_EDGE,
+            "aspect_ratio": "16:9",
+            "duration_seconds": 5.0,
+        }
+        if server_args.warmup_num_frames is not None:
+            target["duration_seconds"] = (
+                server_args.warmup_num_frames / MINIMAX_H3_SUPPORTED_FPS
+            )
+        if server_args.warmup_resolutions is not None:
+            ratio = req.width / req.height
+
+            def distance(name: str) -> float:
+                w, h = map(int, name.split(":"))
+                return abs(w / h - ratio)
+
+            target["aspect_ratio"] = min(MINIMAX_H3_FINITE_ASPECT_RATIOS, key=distance)
+        return target
 
     def project_video_queued_job_fields(self, req: Any) -> dict[str, str]:
         return self._video_hooks().project_queued_job_fields(req)
@@ -197,8 +214,8 @@ class MiniMaxH3SamplingParams(SamplingParams):
                 if field_name in self.target
             }
         super()._validate()
-        _optional_positive_finite_float(self.flow_shift, "flow_shift")
-        _optional_positive_finite_float(self.audio_flow_shift, "audio_flow_shift")
+        optional_positive_finite_float(self.flow_shift, "flow_shift")
+        optional_positive_finite_float(self.audio_flow_shift, "audio_flow_shift")
         if self.enable_frame_interpolation:
             raise ValueError(
                 "MiniMax H3 does not support enable_frame_interpolation: the "
@@ -214,15 +231,37 @@ class MiniMaxH3SamplingParams(SamplingParams):
                 "MiniMax H3 does not support enable_teacache: its packed "
                 "video/audio denoise loop has no lossless TeaCache contract"
             )
-        if self.rollout:
-            raise ValueError(
-                "MiniMax H3 does not support rollout: its coupled video/audio "
-                "scheduler has no SchedulerRLMixin contract"
+        if self.enable_spectrum:
+            if self.quality == "high":
+                raise ValueError(
+                    "MiniMax H3 enable_spectrum cannot be combined with "
+                    'quality="high" (Cache-DiT). Use one skip-step accelerator.'
+                )
+            if self.enable_cache_dit:
+                raise ValueError(
+                    "MiniMax H3 enable_spectrum cannot be combined with "
+                    "enable_cache_dit. Use one skip-step accelerator."
+                )
+            from sglang.multimodal_gen.configs.sample.spectrum import SpectrumParams
+            from sglang.multimodal_gen.runtime.cache.spectrum import (
+                apply_h3_spectrum_param_defaults,
             )
+
+            if isinstance(self.spectrum_params, dict):
+                self.spectrum_params = SpectrumParams(**self.spectrum_params)
+            elif self.spectrum_params is None:
+                self.spectrum_params = SpectrumParams()
+            apply_h3_spectrum_param_defaults(self.spectrum_params)
+        if self.rollout:
+            task = str(self.task or "t2va").lower()
+            if task not in ("t2va",):
+                raise ValueError(
+                    f"MiniMax H3 rollout currently supports task=t2va only, got {task!r}"
+                )
         if self.return_trajectory_latents or self.return_trajectory_decoded:
             raise ValueError(
-                "MiniMax H3 does not support trajectory output for its coupled "
-                "video/audio denoise state"
+                "MiniMax H3 does not support return_trajectory_latents/decoded; "
+                "use rollout=True with rollout_return_dit_trajectory instead"
             )
         seeds = self.seed if isinstance(self.seed, list) else [self.seed]
         for seed in seeds:
@@ -267,7 +306,9 @@ class MiniMaxH3SamplingParams(SamplingParams):
                     seed=(
                         _seed_override
                         if _seed_override is not None
-                        else self.seed if isinstance(self.seed, int) else None
+                        else self.seed
+                        if isinstance(self.seed, int)
+                        else None
                     ),
                 )
             )
@@ -302,4 +343,28 @@ class MiniMaxH3SamplingParams(SamplingParams):
             req.extra.update(self.build_request_extra())
 
 
-__all__ = ["MiniMaxH3SamplingParams"]
+@dataclass
+class FastH3SamplingParams(MiniMaxH3SamplingParams):
+    """FastH3 8-Step V2: nine sigma points, i.e. eight DiT forwards on the trained rungs."""
+
+    num_inference_steps: int = 8
+    quality: str = "lossless"
+
+    def _validate(self) -> None:
+        super()._validate()
+        if self.num_inference_steps != 8:
+            raise ValueError(
+                "FastH3 is distilled for exactly eight inference steps (nine sigma "
+                "grid points, eight DiT "
+                f"forwards); got num_inference_steps={self.num_inference_steps}. "
+                "Use MiniMaxAI/MiniMax-H3 for other schedules."
+            )
+        if self.task is not None and self.task.strip().lower() != "t2va":
+            raise ValueError(
+                "FastH3 is distilled for t2va only; fl2va and ref2va were not "
+                f"distilled (got task={self.task!r}). Use MiniMaxAI/MiniMax-H3 "
+                "for those tasks."
+            )
+
+
+__all__ = ["FastH3SamplingParams", "MiniMaxH3SamplingParams"]

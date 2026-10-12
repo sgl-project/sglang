@@ -94,7 +94,7 @@ import { KimiK26Deployment } from '/src/snippets/autoregressive/kimi-k26-deploym
 - **NVFP4**: Use `nvidia/Kimi-K2.6-NVFP4` with `--quantization modelopt_fp4` on NVIDIA Blackwell. Use `tp=8` on B300 and `tp=4` on GB300.
 - **AMD GPU TP Constraint**: On AMD GPUs, TP must be ≤ 4 (not 8). Kimi-K2.6 has 64 attention heads; the AITER MLA kernel requires `heads_per_gpu % 16 == 0`. With TP=4, each GPU gets 16 heads (valid). With TP=8, each GPU gets 8 heads (invalid).
 - **AMD Docker Image**: Use `lmsysorg/sglang:v0.5.9-rocm700-mi35x` for MI350X/MI355X and `lmsysorg/sglang:v0.5.9-rocm700-mi30x` for MI300X/MI325X.
-- **DP Attention**: Enable with `--dp <N> --enable-dp-attention` for production throughput. A common choice is to set `--dp` equal to `--tp`, but this is not required.
+- **DP Attention**: Enable with `--attn-dp-size <N>` for production throughput. A common choice is to set `--attn-dp-size` equal to `--tp`, but this is not required.
 - **Reasoning Parser**: Add `--reasoning-parser kimi_k2` to separate thinking and content in model outputs.
 - **Tool Call Parser**: Add `--tool-call-parser kimi_k2` for structured tool calls.
 - **AMD FP8 KV Cache**: On AMD platforms the generator adds `--kv-cache-dtype fp8_e4m3` by default and sets `--mem-fraction-static 0.8` to fit the INT4 weights plus KV cache. FP8 KV cache trades a small amount of accuracy for memory; omit the flag if you observe accuracy regressions on your workload.
@@ -621,32 +621,25 @@ python tool_calls_eval.py tool-calls/samples.jsonl \
 #### 5.1.2 AIME 2025
 
 - Dataset: [AIME 2025](https://huggingface.co/datasets/nvidia/aime25) (30 problems)
-- Evaluation Tool: [NVIDIA NeMo-Skills](https://github.com/NVIDIA/NeMo-Skills)
+- Evaluation Tool: [sgl-eval](https://github.com/sgl-project/sgl-eval)
 - Prompt: `eval/matharena/aime` (MathArena format with `\boxed{}` answers)
-- Settings: temperature=1.0, top_p=0.95, max_tokens=131,072, 32 seeds
+- Settings: temperature=1.0, top_p=0.95, max_tokens=131,072, 32 repeats
 
 **Evaluation Command:**
 
 ```shell Command
-# Prepare dataset
-python3 nemo_skills/dataset/aime25/prepare.py
+pip install sgl-eval
 
-# Run 32 seeds in parallel
-for RS in $(seq 0 31); do
-  python3 nemo_skills/inference/generate.py \
-    input_file=nemo_skills/dataset/aime25/test.jsonl \
-    output_file=results/kimi-k26/aime25/output-rs${RS}.jsonl \
-    prompt_config=eval/matharena/aime \
-    prompt_format=openai \
-    +server.server_type=openai \
-    +server.model=moonshotai/Kimi-K2.6 \
-    +server.base_url=http://localhost:30000/v1 \
-    ++inference.temperature=1.0 \
-    ++inference.top_p=0.95 \
-    ++inference.tokens_to_generate=131072 \
-    ++inference.random_seed=${RS} \
-    max_concurrent_requests=512 &
-done
+# The dataset ships with sgl-eval; --n-repeats runs all 32 samples per problem.
+sgl-eval run aime25 \
+  --base-url http://localhost:30000/v1 \
+  --model moonshotai/Kimi-K2.6 \
+  --n-repeats 32 \
+  --temperature 1.0 \
+  --top-p 0.95 \
+  --max-tokens 131072 \
+  --prompt matharena-aime \
+  --num-threads 512
 ```
 
 **Results:**

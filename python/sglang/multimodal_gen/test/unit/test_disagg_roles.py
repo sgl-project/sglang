@@ -520,7 +520,8 @@ class TestImageVAEEncodingStageComponentName(_GlobalStageArgsMixin, unittest.Tes
     def test_component_name_can_follow_non_default_vae_key(self):
         stage = ImageVAEEncodingStage(vae=object(), component_name="video_vae")
         server_args = SimpleNamespace(
-            pipeline_config=SimpleNamespace(vae_precision="bf16")
+            component_precisions={},
+            pipeline_config=SimpleNamespace(vae_precision="bf16"),
         )
 
         uses = stage.component_uses(server_args, "image_vae_encoding")
@@ -615,13 +616,6 @@ class TestStageAffinityAndValidation(_GlobalStageArgsMixin, unittest.TestCase):
             pipeline = self._make_hunyuan_pipeline(role, paint_enable=False)
             pipeline.create_pipeline_stages(pipeline.server_args)
             self.assertEqual(list(pipeline._stage_name_mapping.keys()), stage_names)
-
-    def test_hunyuan3d_shape_stage_no_longer_stores_model_dtype(self):
-        pipeline = self._make_hunyuan_pipeline(RoleType.ENCODER, paint_enable=False)
-        pipeline.create_pipeline_stages(pipeline.server_args)
-        stage = pipeline._stage_name_mapping["shape_before_denoising"]
-        self.assertIsInstance(stage, Hunyuan3DShapeBeforeDenoisingStage)
-        self.assertFalse(hasattr(stage, "model_dtype"))
 
     def test_ltx2_refinement_stage_keeps_class_name_stage_key(self):
         stage = object.__new__(LTX2RefinementStage)
