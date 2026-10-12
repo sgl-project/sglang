@@ -58,7 +58,7 @@ import re
 import sys
 from array import array
 from concurrent.futures import Future
-from enum import Enum, IntEnum, auto
+from enum import Enum, auto
 from functools import lru_cache
 from http import HTTPStatus
 from typing import (
@@ -2327,19 +2327,6 @@ def _compute_chunked_req_next_prompt_token(
     return None
 
 
-class RowRole(IntEnum):
-    """What one row of a step does, read by result processing."""
-
-    # A middle chunk of the chunked request; it emits no token.
-    PREFILL = auto()
-    # A prefill whose last chunk runs this step; it emits its first token.
-    PREFILL_LAST = auto()
-    # A decode row of a decode step.
-    DECODE = auto()
-    # A decode row run as a 1-token extend, in a mixed or DP-converted step.
-    DECODE_AS_EXTEND = auto()
-
-
 @dataclasses.dataclass
 class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     """Store all information of a batch on the scheduler."""
@@ -2608,15 +2595,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     @property
     def first_decode_row(self) -> int:
         return len(self.reqs) - self.num_decode_rows
-
-    def row_role(self, i: int) -> RowRole:
-        if self.forward_mode.is_decode():
-            return RowRole.DECODE
-        if i >= self.first_decode_row:
-            return RowRole.DECODE_AS_EXTEND
-        if self.reqs[i] is self.chunked_req:
-            return RowRole.PREFILL
-        return RowRole.PREFILL_LAST
 
     def is_dllm(self):
         return self.dllm_config is not None
@@ -3860,7 +3838,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return_hidden_states=self.return_hidden_states,
             return_hidden_states_mode=self.return_hidden_states_mode,
             num_decode_rows=self.num_decode_rows,
-            chunked_req=self.chunked_req,
             spec_algorithm=self.spec_algorithm,
             spec_info=self.spec_info,
             dp_spec_prefill_coordination_metadata=self.dp_spec_prefill_coordination_metadata,
