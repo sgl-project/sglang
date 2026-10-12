@@ -90,7 +90,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 from sglang.srt.mem_cache.common import (
     RetractionBackup,
     discard_kv_cache_backup,
-    dsv41_dspark_needs_rebootstrap,
+    dsv4_needs_rebootstrap,
     kv_to_page_indices,
     match_kv_cache,
     page_align_floor,
@@ -800,9 +800,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if not is_retracted and not is_rebootstrap and is_unadmitted_reject(req):
             self.scheduler.retire_unadmitted_request(req)
             return
-        if is_retracted and dsv41_dspark_needs_rebootstrap(
-            self.token_to_kv_pool_allocator
-        ):
+        if is_retracted and dsv4_needs_rebootstrap(self.token_to_kv_pool_allocator):
             if req.output_ids:
                 req.pd_rebootstrap_forced_output_id = req.output_ids.pop()
             req.pd_rebootstrap_in_progress = True

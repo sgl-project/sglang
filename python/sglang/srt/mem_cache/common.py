@@ -296,17 +296,15 @@ def _evict_until_allocatable(
             return
 
 
-def dsv41_dspark_needs_rebootstrap(
+def dsv4_needs_rebootstrap(
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
 ) -> bool:
-    """V4.1's request-scoped pair ring and draft KV cannot use CPU tensor backup."""
-    if str(get_spec().speculative_algorithm).upper() != "DSPARK":
-        return False
-
+    """DeepSeek-V4 pools cannot back up a retracted request's KV on the host, so
+    the prefill recomputes it instead."""
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 
     pool = token_to_kv_pool_allocator.get_kvcache()
-    return isinstance(pool, DeepSeekV4TokenToKVPool) and 2 in pool.compression_ratios
+    return isinstance(pool, DeepSeekV4TokenToKVPool)
 
 
 def backup_kv_cache(
@@ -316,15 +314,19 @@ def backup_kv_cache(
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
     backend: str,
 ) -> bool:
-    """Returns False when no backup can be taken ('none' backend, or the host
-    pool cannot hold it); the caller aborts the request."""
-    if dsv41_dspark_needs_rebootstrap(token_to_kv_pool_allocator):
-        # Drain the in-flight verify before its slots can receive recomputed KV.
+    """Returns False when no backup can be taken ('none' backend, a request the
+    prefill cannot recompute, or the host pool cannot hold it); the caller aborts
+    the request."""
+    if backend == "none":
+        return False
+    if dsv4_needs_rebootstrap(token_to_kv_pool_allocator):
+        if req.multimodal_inputs is not None:
+            # The recompute payload carries token ids only; images would be lost.
+            return False
+        # Drain the in-flight forward before its slots can receive recomputed KV.
         device = token_to_kv_pool_allocator.get_kvcache().device
         torch.get_device_module(device).synchronize(device)
         return True
-    if backend == "none":
-        return False
     if backend == "cpu_tensor":
         req.offload_kv_cache(req_to_token_pool, token_to_kv_pool_allocator)
         return True
