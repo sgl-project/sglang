@@ -29,6 +29,7 @@ from sglang.multimodal_gen.runtime.models.vaes.common import (
     can_install_spatial_shard_parallel_decode,
     should_run_spatial_shard_parallel_decode,
 )
+from sglang.multimodal_gen.runtime.models.vaes.resample import AvgDown3D, DupUp3D
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -39,88 +40,6 @@ def get_activation(name):
     if name != "silu":
         raise ValueError(f"unsupported VAE activation: {name}")
     return nn.SiLU()
-
-
-class QwenImage21AvgDown3D(nn.Module):
-    def __init__(self, in_channels, out_channels, factor_t, factor_s=1):
-        super().__init__()
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.factor_t = factor_t
-        self.factor_s = factor_s
-        self.factor = self.factor_t * self.factor_s * self.factor_s
-        assert in_channels * self.factor % out_channels == 0
-        self.group_size = in_channels * self.factor // out_channels
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        pad_t = (self.factor_t - x.shape[2] % self.factor_t) % self.factor_t
-        pad = (0, 0, 0, 0, pad_t, 0)
-        x = F.pad(x, pad)
-        B, C, T, H, W = x.shape
-        x = x.view(
-            B,
-            C,
-            T // self.factor_t,
-            self.factor_t,
-            H // self.factor_s,
-            self.factor_s,
-            W // self.factor_s,
-            self.factor_s,
-        )
-        x = x.permute(0, 1, 3, 5, 7, 2, 4, 6).contiguous()
-        x = x.view(
-            B,
-            C * self.factor,
-            T // self.factor_t,
-            H // self.factor_s,
-            W // self.factor_s,
-        )
-        x = x.view(
-            B,
-            self.out_channels,
-            self.group_size,
-            T // self.factor_t,
-            H // self.factor_s,
-            W // self.factor_s,
-        )
-        x = x.mean(dim=2)
-        return x
-
-
-class QwenImage21DupUp3D(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, factor_t, factor_s=1):
-        super().__init__()
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.factor_t = factor_t
-        self.factor_s = factor_s
-        self.factor = self.factor_t * self.factor_s * self.factor_s
-        assert out_channels * self.factor % in_channels == 0
-        self.repeats = out_channels * self.factor // in_channels
-
-    def forward(self, x: torch.Tensor, first_chunk=False) -> torch.Tensor:
-        x = x.repeat_interleave(self.repeats, dim=1)
-        x = x.view(
-            x.size(0),
-            self.out_channels,
-            self.factor_t,
-            self.factor_s,
-            self.factor_s,
-            x.size(2),
-            x.size(3),
-            x.size(4),
-        )
-        x = x.permute(0, 1, 5, 2, 6, 3, 7, 4).contiguous()
-        x = x.view(
-            x.size(0),
-            self.out_channels,
-            x.size(2) * self.factor_t,
-            x.size(4) * self.factor_s,
-            x.size(6) * self.factor_s,
-        )
-        if first_chunk:
-            x = x[:, :, self.factor_t - 1 :, :, :]
-        return x
 
 
 class QwenImage21CausalConv3d(nn.Conv2d):
@@ -353,7 +272,7 @@ class QwenImage21ResidualDownBlock(nn.Module):
         down_flag=False,
     ):
         super().__init__()
-        self.avg_shortcut = QwenImage21AvgDown3D(
+        self.avg_shortcut = AvgDown3D(
             in_dim,
             out_dim,
             factor_t=2 if temperal_downsample else 1,
@@ -464,7 +383,7 @@ class QwenImage21ResidualUpBlock(nn.Module):
         self.in_dim = in_dim
         self.out_dim = out_dim
         if up_flag:
-            self.avg_shortcut = QwenImage21DupUp3D(
+            self.avg_shortcut = DupUp3D(
                 in_dim, out_dim, factor_t=2 if temperal_upsample else 1, factor_s=2
             )
         else:
@@ -495,7 +414,7 @@ class QwenImage21ResidualUpBlock(nn.Module):
         if self.avg_shortcut is not None:
             shortcut = self.avg_shortcut
             if (
-                type(shortcut) is QwenImage21DupUp3D
+                type(shortcut) is DupUp3D
                 and x.is_cuda
                 and x.dtype in (torch.float16, torch.bfloat16, torch.float32)
                 and not torch.compiler.is_compiling()
