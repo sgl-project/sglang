@@ -44,6 +44,11 @@ class SpecAuxHiddenStateConfig(msgspec.Struct, kw_only=True):
     dflash_target_layer_ids: Any = None
     # DFLASH draft KV bytes/token; None when unresolved.
     dflash_draft_cell_size_per_token: int | None = None
+    # The draft checkpoint read in draft mode, and its KV layer count, for
+    # every drafting algorithm: the fused-draft placement's input. A private
+    # EAGLE draft pool is sized by `eagle_draft_num_layers` instead.
+    draft_model_config: Optional[ModelConfig] = None
+    draft_kv_num_layers: Optional[int] = None
 
 
 def resolve_spec_aux_hidden_state_config(
@@ -85,24 +90,37 @@ def _resolve_eagle_aux_hidden_state(
     ):
         return
 
-    draft_model_config = model_config
-    if get_spec().speculative_draft_model_path:
-        draft_model_config = ModelConfig.from_server_args(
-            server_args,
-            model_path=get_spec().speculative_draft_model_path,
-            model_revision=get_spec().speculative_draft_model_revision,
-            is_draft_model=True,
+    draft_path = get_spec().speculative_draft_model_path
+    # The draft read in draft mode. A path-less NEXTN/MTP head is the TARGET
+    # checkpoint rewritten to its MTP form, which is where its
+    # `num_nextn_predict_layers` gets filled in.
+    draft_mode_config = ModelConfig.from_server_args(
+        server_args,
+        model_path=draft_path,
+        model_revision=get_spec().speculative_draft_model_revision,
+        is_draft_model=True,
+    )
+    if draft_mode_config.num_nextn_predict_layers is not None:
+        config.draft_kv_num_layers = int(draft_mode_config.num_nextn_predict_layers)
+    elif draft_path:
+        config.draft_kv_num_layers = int(
+            max(
+                draft_mode_config.num_hidden_layers,
+                draft_mode_config.num_attention_layers,
+            )
         )
+    if config.draft_kv_num_layers is not None:
+        config.draft_model_config = draft_mode_config
+
+    # A private draft pool is sized off the TARGET config when path-less, so
+    # a path-less MTP deployment's token budget does not depend on the
+    # draft-mode rewrite.
+    draft_model_config = draft_mode_config if draft_path else model_config
     num_nextn_predict_layers = draft_model_config.num_nextn_predict_layers
     if num_nextn_predict_layers is not None:
         config.eagle_draft_num_layers = int(num_nextn_predict_layers)
-    elif get_spec().speculative_draft_model_path:
-        config.eagle_draft_num_layers = int(
-            max(
-                draft_model_config.num_hidden_layers,
-                draft_model_config.num_attention_layers,
-            )
-        )
+    elif draft_path:
+        config.eagle_draft_num_layers = config.draft_kv_num_layers
     else:
         return
 
@@ -204,6 +222,8 @@ def _resolve_dflash_aux_hidden_state(
 
         config.dflash_use_aux_hidden_state = True
         config.dflash_draft_num_layers = int(draft_num_layers)
+        config.draft_model_config = draft_model_config
+        config.draft_kv_num_layers = int(draft_num_layers)
         config.dflash_target_layer_ids = target_layer_ids
         config.dflash_draft_cell_size_per_token = _resolve_dflash_draft_cell_size(
             draft_model_config=draft_model_config,
