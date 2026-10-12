@@ -295,8 +295,8 @@ def _moe_sorting_small_kernel_distributed(
 
 
 def _mx_quant_chunk(n_cols: int):
-    """Widest power-of-two quant step (32..2048) dividing `n_cols`; None skips the fused quant."""
-    for chunk in (2048, 1024, 512, 256, 128, 64, 32):
+    """Widest verified quant step (2048 or 1024) dividing `n_cols`; None skips the fused quant."""
+    for chunk in (2048, 1024):
         if n_cols % chunk == 0:
             return chunk
     return None
@@ -358,7 +358,7 @@ def _run_small_sort(
     else:
         n_cols, scalen_pad = 32, 8
         qout = qscale = moe_buf  # unused placeholder pointers
-    qchunk = _mx_quant_chunk(n_cols)
+    qchunk = _mx_quant_chunk(n_cols) if emit_mx else 32  # unused without the quant
     num_buf = triton.cdiv(max(moe_buf.numel(), 1), buf_block)
     if p <= 64 and p <= 2 * block_size:
         # compact variant: one sort CTA does the P x P rank compare

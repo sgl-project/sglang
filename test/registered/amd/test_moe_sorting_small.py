@@ -323,6 +323,24 @@ class TestDsv4MoePrologue(CustomTestCase):
             err = (out.float() - ref_out.float()).abs().max().item()
             self.assertLessEqual(err, 2e-2 * ref_out.float().abs().max().item(), msg)
 
+    def test_draft_moe_129_experts_top4(self):
+        """The draft MoE's sort-time quant must hand stage1 what stock aiter builds."""
+        E, topk, m = 129, 4, 1
+        gen = torch.Generator().manual_seed(E)
+        experts = self._experts(E, gen)
+        x = torch.randn(m, self.H, generator=gen).to(torch.bfloat16).to(self.dev)
+        ids = torch.cat(
+            [torch.randperm(E - 1, generator=gen)[: topk - 1], torch.tensor([E - 1])]
+        )
+        ids = ids.view(m, topk).to(torch.int32).to(self.dev).contiguous()
+        weights = torch.rand(m, topk, generator=gen).to(self.dev)
+        ref_out, ref_stage1, _ = self._fused_moe(x, experts, weights, ids, stock=True)
+        out, stage1, fused = self._fused_moe(x, experts, weights, ids, stock=False)
+        self.assertTrue(fused)
+        self.assertTrue(torch.equal(stage1, ref_stage1))
+        err = (out.float() - ref_out.float()).abs().max().item()
+        self.assertLessEqual(err, 2e-2 * ref_out.float().abs().max().item())
+
 
 if __name__ == "__main__":
     unittest.main()
