@@ -85,16 +85,41 @@ def mxfp8_ready(layer) -> bool:
     return mxfp8_route(layer) is not None
 
 
+def _weight_identity(layer):
+    """The source this layer's cached copy was built from.
+
+    ``id`` catches a replaced tensor and ``_version`` an in-place write, which
+    is what the update paths do. Keying on a hook having re-run would not work:
+    ``end_weight_update`` calls ``post_load_weights`` only when asked, and
+    ``precompile_kernels_after_loading`` not at all.
+    """
+    w, s = layer.weight, layer.weight_scale_mx_e8m0
+    return (id(w), w._version, id(s), s._version)
+
+
+def release_mori_weight(layer) -> None:
+    """Drop this layer's re-laid-out copy, if it has one."""
+    layer._mori_b = None
+
+
 def mori_weight(layer):
     """The layer's B operand and B scale in mori's layouts, cached on the layer.
 
     sglang and mori differ only in how a lane's two 64-wide K sub-blocks sit:
     sglang interleaves them inside its 32 bytes, mori keeps them as two 16-byte
     blocks. Cached because the permutation copies the whole weight.
+
+    Keyed on the source weight rather than on the cache's own existence:
+    returning it unconditionally meant that after ``update_weights_from_*`` the
+    fused path kept multiplying by the weight the server started with, while
+    decode and every declined call used the new one -- no error, just wrong
+    output, and certain in an RL flow that loads dummy weights then syncs real
+    ones.
     """
+    src = _weight_identity(layer)
     cached = getattr(layer, "_mori_b", None)
-    if cached is not None:
-        return cached
+    if cached is not None and cached[0] == src:
+        return cached[1]
     n, k = mxfp8_shape(layer)
     w = layer.weight.data.contiguous().view(torch.uint8)
     if mxfp8_route(layer) == "aiter":
@@ -121,8 +146,8 @@ def mori_weight(layer):
         .to(torch.int32)
         .reshape(-1)
     )
-    layer._mori_b = (b, b_scale)
-    return layer._mori_b
+    layer._mori_b = (src, (b, b_scale))
+    return layer._mori_b[1]
 
 
 @triton.jit
@@ -220,6 +245,7 @@ _state: _FusedWoB | None = None
 _disabled = False
 _warned_layout = False
 _warned_window = False
+_warned_late = False
 _mori_ok: bool | None = None
 _switch_on: bool | None = None
 
@@ -268,26 +294,69 @@ def _shuffled_once():
     return False
 
 
-def prepare_wo_b_weight(layer) -> None:
-    """Build this layer's fused B operand now, at weight-processing time.
+def _can_ever_fuse(layer) -> bool:
+    """Whether any batch this deployment can schedule would take the fused path.
 
-    ``mori_weight`` re-lays the weight out, which is a full second copy of it
-    -- the original stays, because decode and every declined call still read
-    it. Doing that lazily on the first fused call allocated it *while serving*,
-    after the memory profiler had already sized the KV cache around its
-    absence: 61 layers of it, about 1.3 GiB at TP2. Preparing here puts it in
-    front of the profiler instead, and turns a mid-serving OOM into one at
-    startup.
+    Everything here is fixed for the life of the process, so a False means the
+    allocations below would never be read. The prefill ceiling is the strongest
+    M available at load time: `_eligible`'s floor is monotonic in M, so failing
+    it at the ceiling means failing it at every M.
 
-    Best effort on purpose. A failure here leaves ``_mori_b`` unset, the per
-    call path falls back to building it, and that path is identical on every
-    rank -- so this is not a place where ranks can disagree.
+    It does not catch every case -- a decode-only instance can still declare a
+    large ceiling -- so an instance that never prefills may still pay for the
+    window. Narrowing that needs a signal this layer does not have.
     """
     if not fused_wo_b_available() or not _reduces_over_tp_group(layer):
+        return False
+    if not mxfp8_ready(layer):
+        return False
+    from sglang.srt.distributed import get_tp_group
+
+    world_size = get_tp_group().world_size
+    n, k = mxfp8_shape(layer)
+    ceiling = _prefill_ceiling()
+    if not ceiling:
+        return True
+    return _eligible(ceiling, _padded_m(ceiling, world_size), n, k, world_size)
+
+
+def prepare_fused_wo_b(layers) -> None:
+    """Build everything the fused path allocates, before the profiler runs.
+
+    Two allocations used to appear while serving, after the memory profiler had
+    sized the KV cache around their absence: the per-layer re-laid-out weight
+    (``mori_weight`` copies the whole thing, and the original stays because
+    decode and every declined call still read it -- about 840 MiB at TP2 over
+    40 layers) and the symmetric window (another 560-700 MiB per rank). Both
+    are now sized from configuration alone, so both belong here.
+
+    ``layers`` is the ``wo_b`` of each attention module that actually calls
+    ``fused_wo_b``. Walking every module with a ``wo_b`` instead would also
+    prepare the DSPARK draft's, which calls its linear directly.
+
+    Not best effort: a failure here is a startup failure. The alternative --
+    swallowing it and letting the per-call path retry -- puts the allocation
+    back where it was, which is what this exists to stop.
+    """
+    candidates = [layer for layer in layers if _can_ever_fuse(layer)]
+    if not candidates:
         return
-    if not mxfp8_ready(layer) or not hasattr(layer, "weight_scale_mx_e8m0"):
-        return
-    mori_weight(layer)
+    for layer in candidates:
+        mori_weight(layer)
+
+    # Collective, and it must run on every rank or none. `_can_ever_fuse` reads
+    # only configuration and the weight layout, which are the same everywhere,
+    # so the ranks agree on whether to be here at all.
+    layer = candidates[0]
+    n, k = mxfp8_shape(layer)
+    from sglang.srt.distributed import get_tp_group
+
+    world_size = get_tp_group().world_size
+    m_max = _window_m_max(_padded_m(_prefill_ceiling() or 1, world_size), world_size)
+    if not _construct_collectively(m_max, n, k):
+        # Disabled for the process; the copies above have no reader left.
+        for layer in candidates:
+            release_mori_weight(layer)
 
 
 def _fused_weight(layer):
@@ -324,8 +393,19 @@ class _FusedWoB:
         self.world_size = tp.world_size
         self.n, self.k, self.m_max = n, k, m_max
 
-        payload = [bytes(Communicator.get_unique_id()) if self.rank == 0 else None]
+        # Rank 0's id is produced inside the try so that a failure there still
+        # broadcasts -- raising before the broadcast would leave the peers
+        # blocked in it while this rank went on to the agreement below, which
+        # is two different collectives on the same gloo group.
+        try:
+            payload = [bytes(Communicator.get_unique_id()) if self.rank == 0 else None]
+        except Exception:
+            payload = [None]
+            dist.broadcast_object_list(payload, src=tp.ranks[0], group=tp.cpu_group)
+            raise
         dist.broadcast_object_list(payload, src=tp.ranks[0], group=tp.cpu_group)
+        if payload[0] is None:
+            raise RuntimeError("mori fused wo_b: rank 0 could not make a unique id")
         uid = UniqueId.from_bytes(payload[0])
 
         # The window is VMM memory outside torch's allocator, so the run has to
@@ -362,12 +442,6 @@ class _FusedWoB:
                 gather_dtype=gather_dtype,
                 gather_transport=envs.SGLANG_OPT_FUSED_WO_B_AR_GATHER_TRANSPORT.get(),
             )
-            # Prove the collective moves bytes before serving a token. A mori
-            # built with BUILD_CCO_SDMA=OFF compiles the puts out: the kernels
-            # still launch, the all-reduce returns mostly the local slice, and
-            # the model answers fluently while being wrong -- and measures
-            # *faster*, having moved nothing.
-            self.op.self_test()
         except Exception:
             # The communicator holds a VMM reservation the whole process pays
             # for. Half-constructing this object and leaving it open makes the
@@ -384,6 +458,33 @@ class _FusedWoB:
             k,
             gather_dtype,
         )
+
+    def warmup(self) -> None:
+        """Compile the kernels, without running the collective.
+
+        ``self_test`` compiles and *then* launches the device phases. Splitting
+        the compile out gives the ranks somewhere to agree in between, so a
+        FlyDSL failure on one rank is caught while its peers are still on the
+        host rather than already inside a cross-rank barrier.
+
+        ``_compiled`` is mori-private; the public surface has no compile-only
+        entry point, and the alternative to reaching for it is a hang.
+        """
+        self.op._compiled(self.m_max)
+
+    def self_test(self) -> None:
+        """Prove the collective moves bytes before serving a token.
+
+        A mori built with ``BUILD_CCO_SDMA=OFF`` compiles the puts out: the
+        kernels still launch, the all-reduce returns mostly the local slice,
+        and the model answers fluently while being wrong -- and measures
+        *faster*, having moved nothing.
+
+        Outside ``__init__`` because it is a *device-side* collective, and so
+        may only run once every rank is known to hold an op. See
+        ``_construct_collectively``.
+        """
+        self.op.self_test()
 
     def pad_rows(self, x: torch.Tensor, m_pad: int) -> torch.Tensor:
         return self.op.pad_rows(x, m_pad)
@@ -411,9 +512,22 @@ def _construct_collectively(m_max: int, n: int, k: int) -> bool:
     error, a hung server. That is what a rank-local ``_disabled`` produced.
 
     Rank-local failures are realistic -- an OOM in ``Communicator.init``'s VMM
-    reservation, or in ``self_test``'s buffers -- so this agrees on the outcome
-    over the CPU group before any rank is allowed to call the op, and the ranks
-    that *succeeded* tear their communicator down again when a peer did not.
+    reservation, ``create_dev_comm`` losing an SDMA queue, or the FlyDSL
+    compile inside the op raising on one rank.
+
+    **Agreed after each stage that can fail locally**, because the stage after
+    it is collective. Agreeing only once, after ``_FusedWoB`` was fully built,
+    left the hole this closes: ``self_test`` runs the scatter/reduce/gather
+    phases, which end in cross-rank barriers on the GPU, so a rank that failed
+    before launching its phases left the peers that did launch spinning in
+    ``synchronize()``, never reaching the CPU agreement at all.
+
+    What this cannot cover is a failure *inside* the device phases, once the
+    peers are already in the barrier -- no host-side agreement around a
+    collective can. Both failures the review named happen before that point
+    (``create_dev_comm`` losing an SDMA queue, the FlyDSL compile raising), and
+    the stages are cut so that each lands in a window that agrees. Beyond them
+    a watchdog is the only recourse.
 
     Construction is attempted once per process. A failure disables the path for
     good rather than being retried: every retry is another broadcast, another
@@ -421,40 +535,78 @@ def _construct_collectively(m_max: int, n: int, k: int) -> bool:
     """
     global _state, _disabled
 
-    import torch.distributed as dist
-
     from sglang.srt.distributed import get_tp_group
 
     tp = get_tp_group()
+
     state = None
     err = None
     try:
         state = _FusedWoB(m_max=m_max, n=n, k=k)
     except Exception as exc:  # noqa: BLE001 - reported below, then disabled
         err = exc
+    if not _agreed(tp, err is None):
+        _disable(tp, state, err, "constructed")
+        return False
 
-    ok = torch.tensor([0 if err is not None else 1], dtype=torch.int32)
-    dist.all_reduce(ok, op=dist.ReduceOp.MIN, group=tp.cpu_group)
-    if int(ok.item()) == 1:
-        _state = state
-        return True
+    # Compiling is local. Agreeing here means a FlyDSL failure on one rank is
+    # caught while its peers are still on the host.
+    try:
+        state.warmup()
+    except Exception as exc:  # noqa: BLE001 - reported below, then disabled
+        err = exc
+    if not _agreed(tp, err is None):
+        _disable(tp, state, err, "compiled")
+        return False
+
+    # Every rank holds a compiled op, so the device phases are safe to launch.
+    try:
+        state.self_test()
+    except Exception as exc:  # noqa: BLE001 - reported below, then disabled
+        err = exc
+    if not _agreed(tp, err is None):
+        _disable(tp, state, err, "self-tested")
+        return False
+
+    _state = state
+    return True
+
+
+def _agreed(tp, ok: bool) -> bool:
+    """Whether *every* rank reports ok, over the CPU group."""
+    import torch.distributed as dist
+
+    flag = torch.tensor([1 if ok else 0], dtype=torch.int32)
+    dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=tp.cpu_group)
+    return bool(flag.item())
+
+
+def _disable(tp, state, err, stage: str) -> None:
+    """Turn the path off here because some rank could not get this far.
+
+    Releases this rank's op even when it built one: holding the window's
+    reservation for a path nothing may call costs the process its memory for
+    nothing.
+    """
+    global _disabled
 
     _disabled = True
     if state is not None:
         state.close()
     if err is not None:
         logger.warning(
-            "mori fused wo_b could not be constructed on rank %d; the fused "
-            "path is off for this process on every rank: %s",
+            "mori fused wo_b could not be %s on rank %d; the fused path is off "
+            "for this process on every rank: %s",
+            stage,
             tp.rank_in_group,
             err,
         )
     else:
         logger.warning(
-            "mori fused wo_b could not be constructed on a peer rank; the "
-            "fused path is off for this process on every rank"
+            "mori fused wo_b could not be %s on a peer rank; the fused path is "
+            "off for this process on every rank",
+            stage,
         )
-    return False
 
 
 def _window_m_max(m_pad: int, world_size: int) -> int:
@@ -472,14 +624,32 @@ def _window_m_max(m_pad: int, world_size: int) -> int:
     the chunk size. Its own zero case falls through to ``max_prefill_tokens``,
     the same way ``disaggregation/common/conn.py`` does it.
     """
-    from sglang.srt.runtime_context import get_schedule, max_prefill_buffer_tokens
-
-    limit = max_prefill_buffer_tokens() or get_schedule().max_prefill_tokens
+    limit = _prefill_ceiling()
     if limit:
-        return max(m_pad, _padded_m(int(limit), world_size))
+        return max(m_pad, _padded_m(limit, world_size))
     # Nothing declares a ceiling. Sizing from this call is then the only option
     # left, and `_warn_once_over_window` reports it if a later M outgrows it.
     return m_pad
+
+
+def _prefill_ceiling() -> int:
+    """The most tokens one forward can carry, or 0 if nothing declares it."""
+    from sglang.srt.runtime_context import get_schedule, max_prefill_buffer_tokens
+
+    return int(max_prefill_buffer_tokens() or get_schedule().max_prefill_tokens or 0)
+
+
+def _warn_once_late_window() -> None:
+    """Report a window built during a forward rather than at load time."""
+    global _warned_late
+    if _warned_late:
+        return
+    _warned_late = True
+    logger.warning(
+        "mori fused wo_b: building the window on the first fused call. It is "
+        "outside the memory profiler's budget there; prepare_fused_wo_b() was "
+        "not called for this model."
+    )
 
 
 def _warn_once_over_window(m_pad: int, m_max: int) -> None:
@@ -661,10 +831,14 @@ def fused_wo_b(layer, x: torch.Tensor) -> torch.Tensor | None:
     if not eligible:
         return None
 
-    if _state is None and not _construct_collectively(
-        _window_m_max(m_pad, world_size), n, k
-    ):
-        return None
+    # Normally `prepare_fused_wo_b` already did this at load time. The fallback
+    # is for a caller that never ran it; it allocates the window mid-forward,
+    # which is what moving the preparation to load time exists to avoid, so it
+    # says so rather than doing it silently.
+    if _state is None:
+        _warn_once_late_window()
+        if not _construct_collectively(_window_m_max(m_pad, world_size), n, k):
+            return None
 
     # Every reason to decline a call is a check here rather than an exception
     # caught below, and every one of them reads the same on all ranks -- the

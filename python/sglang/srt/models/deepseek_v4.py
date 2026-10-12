@@ -108,7 +108,7 @@ from sglang.srt.layers.moe.utils import (
     should_skip_post_experts_all_reduce,
     uses_per_rank_fused_shared_slots,
 )
-from sglang.srt.layers.mori_gemm_ar import fused_wo_b, prepare_wo_b_weight
+from sglang.srt.layers.mori_gemm_ar import fused_wo_b, prepare_fused_wo_b
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
 from sglang.srt.layers.quantization.fp8_utils import (
     Mxfp8DenseGemmBackend,
@@ -4826,19 +4826,20 @@ class DeepseekV4ForCausalLM(nn.Module):
                     build_mega_moe_shared_weights(module.shared_experts)
                 )
 
-        # The fused wo_b keeps a second, re-laid-out copy of each wo_b weight,
-        # and building it on the first fused call would allocate it after the
-        # memory profiler had already sized the KV cache around its absence.
-        # Here rather than in `post_load_weights`, which runs *before*
-        # `process_weights_after_loading` and so before the mxfp8 layout this
-        # reads even exists.
+        # The fused wo_b's weight copies and symmetric window are sized from
+        # configuration alone, so they are built here rather than on the first
+        # fused call, which allocated them after the memory profiler had sized
+        # the KV cache around their absence. Here rather than in
+        # `post_load_weights`, which runs *before* `process_weights_after_loading`
+        # and so before the mxfp8 layout this reads even exists.
         #
-        # Walked as modules, not as `self.model.layers`: the DSPARK draft
-        # wrapper borrows this method and has no `.model`.
-        for module in self.modules():
-            wo_b = getattr(module, "wo_b", None)
-            if wo_b is not None:
-                prepare_wo_b_weight(wo_b)
+        # Only MQALayer routes wo_b through `fused_wo_b`. DSPARK's attention
+        # also has a `wo_b` and calls it directly, and the draft wrapper borrows
+        # this method, so a walk over every module with the attribute would
+        # prepare copies nothing reads.
+        prepare_fused_wo_b(
+            [m.wo_b for m in self.modules() if isinstance(m, MQALayer)]
+        )
 
     @staticmethod
     def remap_weight_name_to_dpsk_hf_format(
