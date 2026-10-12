@@ -153,8 +153,10 @@ def mxfp8_e4m3_quantize(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
 def mxfp8_operand(
     x: torch.Tensor, scale: Optional[torch.Tensor]
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """A dense layer's input as 2D MXFP8: fp8 e4m3 [M, K] and ue8m0 [M, K // 32]. A bf16
-    x is quantized here; an fp8 x arrives with its scale."""
+    """
+    A dense layer's input as 2D MXFP8: fp8 e4m3 [M, K] and ue8m0 [M, K // 32]. A bf16
+    x is quantized here; an fp8 x arrives with its scale.
+    """
     x2d = x.reshape(-1, x.shape[-1])
     if scale is None:
         return mxfp8_e4m3_quantize(x2d.to(torch.bfloat16))

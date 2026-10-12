@@ -1,8 +1,10 @@
 """gfx950 dense routes of Fp8LinearMethod for 32x32-block fp8 checkpoints served as
 MXFP8 (block_fp8_as_mxfp8): the Triton dot_scaled kernel, the native scaled-MFMA
-kernels on a lane-ordered weight, or aiter's MXFP8 GEMM on the plain one. The fused gfx950
-producers hand these routes their operand as an Fp8GridActivation (bf16 already on the fp8
-grid) or an Mxfp8Activation."""
+kernels on a lane-ordered weight, or aiter's MXFP8 GEMM on the plain one. With
+SGLANG_OPT_HIP_FLYDSL_MXFP8 the aiter route hands its large-M (prefill) calls to the FlyDSL
+kernel of mxfp8_flydsl_gfx95 on the same weight. The fused gfx950 producers hand these
+routes their operand as an Fp8GridActivation (bf16 already on the fp8 grid) or an
+Mxfp8Activation."""
 
 from __future__ import annotations
 
@@ -30,9 +32,9 @@ from sglang.srt.layers.utils import copy_or_rebind_param
 
 logger = logging.getLogger(__name__)
 
-# Fewer rows (decode, short prefill chunks) stay on aiter: there the FlyDSL kernel's 128-
-# and 256-row tiles leave CUs idle and it loses on the narrow GEMMs (N = 1792, 4096).
-_FLYDSL_MIN_M = 2048
+# Fewer rows (decode, short prefill chunks) stay on aiter: otherwise run in-tree FlyDSL
+# kernel.
+_FLYDSL_MXFP8_MIN_M = 2048
 
 
 def process_dense_weights(method, layer: torch.nn.Module, scale_u8) -> None:
@@ -50,7 +52,7 @@ def process_dense_weights(method, layer: torch.nn.Module, scale_u8) -> None:
             "weight_scale_mx_e8m0",
             ue8m0_weight_scale(layer.weight_scale_inv.data),
         )
-        _prepare_flydsl(layer)
+        _prepare_flydsl_mxfp8(layer)
         return
     assert backend.is_gfx95_mxfp8_native()
     n, k = layer.weight.shape
@@ -104,10 +106,10 @@ def apply_dense(
         return _apply_native(method, layer, x, bias, input_scale, on_fp8_grid)
     if aiter_route:
         if (
-            layer.weight_scale_flydsl is not None
-            and x.numel() // x.shape[-1] >= _FLYDSL_MIN_M
+            layer.weight_scale_mx_flydsl is not None
+            and x.numel() // x.shape[-1] >= _FLYDSL_MXFP8_MIN_M
         ):
-            return _apply_flydsl(layer, x, bias, input_scale)
+            return _apply_flydsl_mxfp8(layer, x, bias, input_scale)
         return method.w8a8_mxfp8_linear(
             input=x,
             weight=layer.weight,
@@ -135,8 +137,8 @@ def apply_dense(
 
 
 @functools.cache
-def _flydsl_gemm():
-    """The mxfp8_flydsl_gfx95 module, or None (warned once) when FlyDSL is missing."""
+def _flydsl_mxfp8_module():
+    """The mxfp8_flydsl_gfx95 module, or None when FlyDSL is missing."""
     try:
         from sglang.kernels.ops.quantization import mxfp8_flydsl_gfx95
     except ImportError as e:
@@ -145,27 +147,29 @@ def _flydsl_gemm():
     return mxfp8_flydsl_gfx95
 
 
-def _prepare_flydsl(layer: torch.nn.Module) -> None:
-    """Weight scales in mxfp8_flydsl_gfx95's layout when SGLANG_OPT_HIP_FLYDSL_MXFP8 is
-    set and the kernel takes this weight; weight_scale_flydsl stays None otherwise."""
+def _prepare_flydsl_mxfp8(layer: torch.nn.Module) -> None:
+    """
+    Weight scales in mxfp8_flydsl_gfx95's layout when SGLANG_OPT_HIP_FLYDSL_MXFP8 is set
+    and the kernel takes this weight; weight_scale_mx_flydsl stays None otherwise.
+    """
     n, k = layer.weight.shape
     if (
         not envs.SGLANG_OPT_HIP_FLYDSL_MXFP8.get()
         or k % 128
         or n % 8
         or not layer.weight.is_contiguous()
-        or _flydsl_gemm() is None
+        or _flydsl_mxfp8_module() is None
     ):
-        layer.weight_scale_flydsl = None
+        layer.weight_scale_mx_flydsl = None
         return
     # one row of block scales per output row
     rows = layer.weight_scale_mx_e8m0.repeat_interleave(32, dim=0)[:n]
     copy_or_rebind_param(
-        layer, "weight_scale_flydsl", _flydsl_gemm().mxfp8_scale_layout(rows)
+        layer, "weight_scale_mx_flydsl", _flydsl_mxfp8_module().mxfp8_scale_layout(rows)
     )
 
 
-def _apply_flydsl(
+def _apply_flydsl_mxfp8(
     layer: torch.nn.Module,
     x: torch.Tensor,
     bias: Optional[torch.Tensor],
@@ -173,9 +177,9 @@ def _apply_flydsl(
 ) -> torch.Tensor:
     """The aiter route's GEMM on mxfp8_flydsl_gfx95."""
     xq, xs = mxfp8_operand(x, input_scale)
-    gemm = _flydsl_gemm()
-    out = gemm.mxfp8_gemm(
-        xq, gemm.mxfp8_scale_layout(xs), layer.weight, layer.weight_scale_flydsl
+    flydsl = _flydsl_mxfp8_module()
+    out = flydsl.mxfp8_gemm(
+        xq, flydsl.mxfp8_scale_layout(xs), layer.weight, layer.weight_scale_mx_flydsl
     )
     if bias is not None:
         out = out + bias
