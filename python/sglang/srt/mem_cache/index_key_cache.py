@@ -15,8 +15,7 @@ if TYPE_CHECKING:
 class IndexKeyCache:
     def __init__(self, pool: DSATokenToKVPool, index_buf_size: int):
         self.pool = pool
-        self.tokens_per_page = pool.index_page_size * pool.index_kpool
-        num_pages = (index_buf_size + pool.page_size + 1) // self.tokens_per_page
+        num_pages = (index_buf_size + pool.page_size + 1) // pool.page_size
         with pool.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
                 torch.cuda.use_mem_pool(pool.custom_mem_pool)
@@ -34,11 +33,14 @@ class IndexKeyCache:
 
     def _buffer_shape(self, num_pages: int) -> tuple[int, int]:
         pool = self.pool
-        return (
-            num_pages,
-            pool.index_page_size
-            * (pool.index_head_dim + pool.index_head_dim // pool.quant_block_size * 4),
-        )
+        return (num_pages, pool.page_size // pool.index_kpool * self._entry_nbytes())
+
+    def _entry_nbytes(self) -> int:
+        pool = self.pool
+        return pool.index_head_dim + pool.index_head_dim // pool.quant_block_size * 4
+
+    def _kernel_view(self, buffer: torch.Tensor) -> torch.Tensor:
+        return buffer.view(-1, self.pool.index_page_size * self._entry_nbytes())
 
     def _layer_num_pages(self, layer_idx: int, num_pages: int) -> int:
         # Layers that reuse the previous layer's top-k never write index-K, so
@@ -63,7 +65,7 @@ class IndexKeyCache:
             self.pool.layer_transfer_counter.wait_until(
                 layer_id - self.pool.start_layer
             )
-        return self.buffer[layer_id - self.pool.start_layer]
+        return self._kernel_view(self.buffer[layer_id - self.pool.start_layer])
 
     def get_buffer(self, layer_id: int) -> torch.Tensor:
         return self.get_local_buffer(layer_id)
@@ -93,7 +95,7 @@ class IndexKeyCache:
         index_k: torch.Tensor,
         index_k_scale: torch.Tensor,
     ) -> None:
-        buf = self.buffer[layer_id - self.pool.start_layer]
+        buf = self._kernel_view(self.buffer[layer_id - self.pool.start_layer])
         index_buf_accessor.SetKAndS.execute(
             pool=self.pool,
             buf=buf,
@@ -104,12 +106,11 @@ class IndexKeyCache:
 
     def cpu_copy(self, indices):
         # Retracted pages may be reused before resume, so offload index-K with KV.
-        page_size = self.tokens_per_page
-        page_indices = indices[::page_size] // page_size
+        page_indices = indices[:: self.pool.page_size] // self.pool.page_size
         torch.cuda.synchronize()
         index_k_cpu = []
         chunk_size = self.pool.cpu_offloading_chunk_size
-        page_chunk_size = max(1, chunk_size // page_size)
+        page_chunk_size = max(1, chunk_size // self.pool.page_size)
         for layer_id in range(self.pool.layer_num):
             index_k_cpu.append([])
             if self.buffer[layer_id].shape[0] == 0:
@@ -124,11 +125,10 @@ class IndexKeyCache:
         return index_k_cpu
 
     def load_cpu_copy(self, index_k_cpu, indices) -> None:
-        page_size = self.tokens_per_page
-        page_indices = indices[::page_size] // page_size
+        page_indices = indices[:: self.pool.page_size] // self.pool.page_size
         torch.cuda.synchronize()
         chunk_size = self.pool.cpu_offloading_chunk_size
-        page_chunk_size = max(1, chunk_size // page_size)
+        page_chunk_size = max(1, chunk_size // self.pool.page_size)
         for layer_id in range(self.pool.layer_num):
             if self.buffer[layer_id].shape[0] == 0:
                 continue
