@@ -1470,13 +1470,19 @@ class OpenAIServingChat(OpenAIServingBase):
         # When input_ids are provided, skip template tokenization entirely;
         # only stop tokens and tool_call_constraint are needed.
         if request.input_ids is not None:
+            # A pre-tokenized request (e.g. the miles TITO session server) keeps the
+            # media in its messages; the client's ids carry one placeholder per item,
+            # which the multimodal processor expands in place (SGLANG_MM_AVOID_RETOKENIZE).
+            image_data, video_data, audio_data, modalities = (
+                self._collect_media_for_pretokenized(request) if is_multimodal else ([], [], [], [])
+            )
             result = MessageProcessingResult(
                 prompt="",
                 prompt_ids=request.input_ids,
-                image_data=None,
-                audio_data=None,
-                video_data=None,
-                modalities=[],
+                image_data=image_data if image_data else None,
+                audio_data=audio_data if audio_data else None,
+                video_data=video_data if video_data else None,
+                modalities=modalities,
                 stop=request.stop or [],
             )
         elif self.template_manager.chat_template_name is None:
@@ -1523,6 +1529,23 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
             result.reasoning_end_token_ids = list(token_ids)
         return result
+
+    def _collect_media_for_pretokenized(self, request: ChatCompletionRequest):
+        """The images, videos and audio of a request whose prompt arrives as
+        ``input_ids``: the same extraction the template path runs, without
+        rendering. The client's ids carry one placeholder per item."""
+        image_data: List[Any] = []
+        video_data: List[Any] = []
+        audio_data: List[Any] = []
+        modalities: List[str] = []
+        for message in request.messages:
+            msg_dict = message.model_dump()
+            if msg_dict.get("content") is None:
+                msg_dict["content"] = ""
+            process_content_for_template_format(
+                msg_dict, "openai", image_data, video_data, audio_data, modalities
+            )
+        return image_data, video_data, audio_data, modalities
 
     def _apply_jinja_template(
         self,
