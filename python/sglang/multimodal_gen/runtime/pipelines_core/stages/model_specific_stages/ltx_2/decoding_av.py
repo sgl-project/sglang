@@ -3,7 +3,11 @@ from collections.abc import Callable
 import torch
 from diffusers.video_processor import VideoProcessor
 
-from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.distributed import (
+    get_local_torch_device,
+    get_replica_group,
+    model_parallel_is_initialized,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
@@ -152,7 +156,11 @@ class LTX2AVDecodingStage(DecodingStage):
             raise
         if output_paths is not None:
             output_batch.output_file_paths = output_paths
-        else:
+        elif (
+            batch.extra.get("retain_decoded_frames", False)
+            or not model_parallel_is_initialized()
+            or get_replica_group().rank_in_group == 0
+        ):
             output_batch.output = self.video_processor.postprocess_video(
                 video, output_type="np"
             )
