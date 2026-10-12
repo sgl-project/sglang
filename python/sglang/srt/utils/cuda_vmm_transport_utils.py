@@ -22,6 +22,12 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_serving,
 )
+from sglang.srt.utils.common import (
+    FD_SEND_TIMEOUT_S,
+    align_up,
+    recv_fd,
+    send_fd,
+)
 from sglang.srt.utils.cuda_ipc_transport_utils import (
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
     MM_FEATURE_CACHE_SIZE,
@@ -40,12 +46,6 @@ from sglang.srt.utils.cuda_vmm_utils import (
     make_device_allocation_prop,
     release_mappings,
     tensor_from_pointer,
-)
-from sglang.srt.utils.vmm_common import (
-    FD_SEND_TIMEOUT_S,
-    align_up,
-    recv_fd,
-    send_fd,
 )
 
 logger = logging.getLogger(__name__)

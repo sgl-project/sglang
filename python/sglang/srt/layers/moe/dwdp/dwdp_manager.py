@@ -81,7 +81,7 @@ class DwdpManager:
         for li, experts in moe_layers:
             local_params[(li, "w13_weight")] = experts.w13_weight.data
             local_params[(li, "w2_weight")] = experts.w2_weight.data
-        self._validate_local_shard_rows(local_params, moe_layers)
+        self._validate_local_shard_rows(local_params)
         layer_weight_specs = build_layer_weight_specs(
             local_params, self.layout.num_routed_experts
         )
@@ -154,25 +154,16 @@ class DwdpManager:
     def _validate_local_shard_rows(
         self,
         local_params: Dict[Tuple[int, str], torch.Tensor],
-        moe_layers: List[Tuple[int, FusedMoE]],
     ) -> None:
         # Composite VA offsets come from the routed count, so a shard with extra
-        # rows overruns its window; fused shared experts append exactly such a row.
+        # rows would overrun its window; handle_dwdp turns shared-experts fusion off.
         expected_rows = self.layout.num_experts_per_worker
         for (li, name), param in local_params.items():
-            if param.shape[0] != expected_rows:
-                shared = next(
-                    layer.num_fused_shared_experts
-                    for idx, layer in moe_layers
-                    if idx == li
-                )
-                raise RuntimeError(
-                    f"DWDP layer {li} {name} has dim0={param.shape[0]}, expected "
-                    f"{expected_rows} ({self.layout.num_routed_experts} routed "
-                    f"experts / dwdp_size {self.dwdp_size}). "
-                    f"num_fused_shared_experts={shared}; if non-zero, "
-                    f"rerun with --disable-shared-experts-fusion."
-                )
+            assert param.shape[0] == expected_rows, (
+                f"DWDP layer {li} {name} has dim0={param.shape[0]}, expected "
+                f"{expected_rows} ({self.layout.num_routed_experts} routed "
+                f"experts / dwdp_size {self.dwdp_size})"
+            )
 
     @staticmethod
     def _collect_moe_layers(model: nn.Module) -> List[Tuple[int, FusedMoE]]:

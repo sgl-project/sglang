@@ -40,7 +40,12 @@ from sglang.test.kernels.utils import (
 )
 
 register_xpu_ci(est_time=60, suite="nightly-xpu-4-gpu", nightly=True)
-register_cuda_ci(est_time=90, stage="extra-b", runner_config="4-gpu-h100")
+register_cuda_ci(
+    est_time=90,
+    stage="extra-b",
+    runner_config="4-gpu-h100",
+    disabled="not yet run on a CUDA machine",
+)
 
 # the two backends get_vmm_backend() knows; DWDP has no CPU path to fall back to
 pytestmark = pytest.mark.skipif(

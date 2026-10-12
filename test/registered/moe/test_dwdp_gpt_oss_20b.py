@@ -28,7 +28,12 @@ from sglang.test.dwdp_test_utils import (
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, CustomTestCase
 
 register_xpu_ci(est_time=1800, suite="nightly-xpu-2-gpu", nightly=True)
-register_cuda_ci(est_time=900, stage="extra-b", runner_config="4-gpu-h100")
+register_cuda_ci(
+    est_time=900,
+    stage="extra-b",
+    runner_config="4-gpu-h100",
+    disabled="not yet run on a CUDA machine",
+)
 
 MODEL = "openai/gpt-oss-20b"
 DWDP_SIZE = 2

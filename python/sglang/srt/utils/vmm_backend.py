@@ -16,8 +16,7 @@ from typing import List, Optional, Tuple
 import torch
 from torch.distributed import ProcessGroup
 
-from sglang.srt.utils.common import is_xpu
-from sglang.srt.utils.vmm_common import Reservation
+from sglang.srt.utils.common import Reservation, is_xpu
 
 
 class VmmBackend(ABC):

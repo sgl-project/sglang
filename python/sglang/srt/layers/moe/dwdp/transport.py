@@ -16,8 +16,8 @@ from sglang.srt.layers.moe.dwdp.layout import (
     LayerWeightSpecs,
     MnnvlHandleSet,
 )
+from sglang.srt.utils.common import align_down, align_up, exchange_posix_fds
 from sglang.srt.utils.vmm_backend import VmmBackend, get_vmm_backend
-from sglang.srt.utils.vmm_common import align_down, align_up, exchange_posix_fds
 
 logger = logging.getLogger(__name__)
 
@@ -68,9 +68,6 @@ def _copy_local_weights_to_handles(
 
         param.untyped_storage().resize_(0)
 
-        # Release freed memory per shard to avoid doubling peak memory.
-        backend.empty_cache()
-
         handles[(layer_idx, name)] = handle
         sizes[(layer_idx, name)] = phys_size
 
@@ -78,6 +75,8 @@ def _copy_local_weights_to_handles(
             f"Phase 1: layer={layer_idx}, name={name}, "
             f"phys_size={phys_size}, data_offset={data_offset}"
         )
+
+    backend.empty_cache()
 
     return handles, sizes
 

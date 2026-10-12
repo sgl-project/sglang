@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, List, Optional, Sequence
 
 import torch
 
+from sglang.srt.utils.common import align_up
 from sglang.srt.utils.cuda_vmm_utils import (
     BumpArenaStub,
     VmmReservation,
@@ -13,7 +14,6 @@ from sglang.srt.utils.cuda_vmm_utils import (
     get_device_granularity,
     make_device_allocation_prop,
 )
-from sglang.srt.utils.vmm_common import align_up
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KvBufferDesc

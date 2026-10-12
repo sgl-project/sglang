@@ -8,7 +8,12 @@ from sglang.test.dwdp_test_utils import assert_prefill_perf_vs_tp
 from sglang.test.test_utils import CustomTestCase
 
 register_xpu_ci(est_time=2400, suite="nightly-xpu-4-gpu", nightly=True)
-register_cuda_ci(est_time=900, stage="nightly", runner_config="4-gpu-h100")
+register_cuda_ci(
+    est_time=900,
+    stage="nightly",
+    runner_config="4-gpu-h100",
+    disabled="not yet run on a CUDA machine",
+)
 
 NUM_GPUS = 4
 

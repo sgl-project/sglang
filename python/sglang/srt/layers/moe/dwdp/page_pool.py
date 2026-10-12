@@ -9,8 +9,8 @@ from typing import Dict, List
 import msgspec
 
 from sglang.srt.layers.moe.dwdp.layout import PageAlignedLayout
+from sglang.srt.utils.common import Reservation, align_up
 from sglang.srt.utils.vmm_backend import get_vmm_backend
-from sglang.srt.utils.vmm_common import Reservation, align_up
 
 logger = logging.getLogger(__name__)
 

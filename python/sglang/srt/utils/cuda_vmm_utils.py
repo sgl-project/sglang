@@ -12,7 +12,7 @@ import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 from sglang.srt.utils import log_info_on_rank0
-from sglang.srt.utils.vmm_common import (
+from sglang.srt.utils.common import (
     all_ranks_ok,
     exchange_posix_fds,
 )

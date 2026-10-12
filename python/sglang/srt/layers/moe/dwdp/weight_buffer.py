@@ -22,8 +22,8 @@ from sglang.srt.layers.moe.dwdp.page_pool import (
     PoolBinding,
     compute_slot_sizes,
 )
+from sglang.srt.utils.common import Reservation
 from sglang.srt.utils.vmm_backend import get_vmm_backend
-from sglang.srt.utils.vmm_common import Reservation
 
 logger = logging.getLogger(__name__)
 

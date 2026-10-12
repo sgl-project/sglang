@@ -29,7 +29,7 @@ import torch
 from torch.distributed import ProcessGroup
 
 from sglang.srt.environ import envs
-from sglang.srt.utils.vmm_common import (
+from sglang.srt.utils.common import (
     all_ranks_ok,
 )
 
@@ -95,6 +95,16 @@ _SYSMAN_PROCESS_SLACK = 8
 # zeVirtualMemQueryPageSize grows with the request: measured 64 KiB below 2 MiB,
 # 2 MiB from there to 64 GiB on Arc B60. Expert shards always sit past that step.
 _PAGE_SIZE_QUERY_BYTES = 2 << 20
+
+# Set once this process creates or imports Level Zero physical memory, which torch's
+# allocator cannot see; memory accounting queries sysman only after that.
+_physical_memory_created = False
+
+
+def has_physical_memory() -> bool:
+    """Whether this process holds Level Zero physical memory outside torch's allocator."""
+    return _physical_memory_created
+
 
 # Arbitrary; ldconfig -p only reads a cache, and it must not be what hangs a launch.
 _LDCONFIG_TIMEOUT_S = 10.0
@@ -450,6 +460,8 @@ def create_physical_mem(size: int, prop: XpuAllocationProp) -> int:
         ),
         "zePhysicalMemCreate",
     )
+    global _physical_memory_created
+    _physical_memory_created = True
     return int(handle.value)
 
 
@@ -705,6 +717,8 @@ def import_peer_handle(
         )
     finally:
         os.close(dup_fd)
+    global _physical_memory_created
+    _physical_memory_created = True
     return int(handle.value)
 
 

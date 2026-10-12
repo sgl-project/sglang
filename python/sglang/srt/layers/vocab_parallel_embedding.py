@@ -136,6 +136,8 @@ class VocabParallelEmbeddingShardIndices:
         assert self.num_added_elements <= self.num_added_elements_padded
 
 
+# XPU: the Inductor-compiled kernel segfaults at launch on Arc Pro B60 (torch 2.13),
+# taking down every TP >= 2 server; eager mode is used there
 @torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu or _is_xpu)
 def get_masked_input_and_mask(
     input_: torch.Tensor,
