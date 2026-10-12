@@ -81,6 +81,7 @@ def _scheduler(waiting_queue, running_reqs=(), last_batch_reqs=()):
     s.last_batch = _batch(list(last_batch_reqs)) if last_batch_reqs else None
     s.rows_join_before_plan = False
     s.disaggregation_mode = DisaggregationMode.NULL
+    s.chunked_req = None
     return s
 
 
@@ -205,7 +206,10 @@ class TestRunningTimeout(CustomTestCase):
                 # Polling re-enters intake before last_batch advances to newer.
                 last_req = older if pp_size == 1 else newer
                 s = _scheduler([], last_batch_reqs=[last_req])
-                s.enable_continuous_input_polling = pp_size == 1
+                if pp_size == 1:
+                    # Only the PD prefill overlap loop polls.
+                    s.enable_continuous_input_polling = True
+                    s.disaggregation_mode = DisaggregationMode.PREFILL
                 s.running_mbs = [s.running_batch]
                 if pp_size == 1:
                     s.inflight_steps.push(_batch([older]), None)

@@ -15,12 +15,12 @@ if TYPE_CHECKING:
 def running_and_inflight_batches(
     scheduler: Scheduler,
 ) -> List[Optional[ScheduleBatch]]:
-    """The running batch, then the launched batches whose requests it does not
-    hold yet: the batch launched last, or when the rows hold the steps
-    launched, the steps in flight. Any may be None, and the running and last
+    """The running batch, then the launched batches whose requests no other
+    holder lists yet: the batch launched last, or when another holder lists
+    the steps launched, the steps in flight. Any may be None, and the running and last
     batch may be the same. Under PP they are the current slot's rows and the
     step that slot launched last."""
-    if rows_hold_launched(scheduler):
+    if launched_reqs_held(scheduler):
         return [
             scheduler.running_batch,
             *(record.batch for record in scheduler.inflight_steps),
@@ -36,12 +36,15 @@ def running_and_inflight_batches(
     return [scheduler.running_batch, scheduler.last_batch]
 
 
-def rows_hold_launched(scheduler: Scheduler) -> bool:
-    """Whether the rows hold every unfinished request of the steps launched,
-    except the steps in flight and the request still chunking: the normal and
-    overlap loops, which join before the plan, and the PD decode loops, whose
-    step is a copy of the rows. Not the pipeline loops."""
+def launched_reqs_held(scheduler: Scheduler) -> bool:
+    """Whether another holder lists every unfinished request of the steps
+    launched, except the steps in flight and the request still chunking: the
+    rows in the normal and overlap loops, which join before the plan, and in
+    the PD decode loops, whose step is a copy of the rows; the KV transfer
+    and waiting queues in the PD prefill loops, which take the step's
+    requests at its commit. Not the pipeline loops."""
     return (
         scheduler.rows_join_before_plan
-        or scheduler.disaggregation_mode == DisaggregationMode.DECODE
+        or scheduler.disaggregation_mode
+        in (DisaggregationMode.DECODE, DisaggregationMode.PREFILL)
     ) and not scheduler.inflight_steps.ring
