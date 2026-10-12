@@ -672,11 +672,22 @@ pub(crate) fn normalize_bootstrap_columns(
     let bootstrap_hosts = flatten_column(fan_out(hosts, prompt_count, "bootstrap_host")?);
     let bootstrap_ports = flatten_column(fan_out(ports, prompt_count, "bootstrap_port")?);
     let bootstrap_rooms = match rooms {
-        // Wrapping preserves distinct pairing keys at the i64 boundary;
-        // saturating would make multiple requests share a room.
-        Some(OneOrMany::One(Some(room))) => (0..prompt_count)
-            .map(|i| Some(room.wrapping_add(i as i64)))
-            .collect(),
+        // The fan-out advances the room once per prompt. Python's
+        // arbitrary-precision normalizer (io_struct.py) never wraps, so a
+        // room whose fan-out would wrap i64 derives different rooms on the
+        // two frontends and breaks the PD rendezvous contract — reject it
+        // instead of silently wrapping (issue #43882).
+        Some(OneOrMany::One(Some(room))) => {
+            if room > i64::MAX - (prompt_count - 1) as i64 {
+                return Err(Error::Validation(format!(
+                    "bootstrap_room ({room}) fanned out over {prompt_count} prompts \
+                     would overflow i64; send a smaller bootstrap_room or a smaller batch"
+                )));
+            }
+            (0..prompt_count)
+                .map(|i| Some(room.wrapping_add(i as i64)))
+                .collect()
+        }
         other => flatten_column(fan_out(other, prompt_count, "bootstrap_room")?),
     };
     Ok(BootstrapColumns {
@@ -1187,6 +1198,29 @@ mod tests {
 
         let err = requests(r#"{"text": ["a", "b"], "bootstrap_room": [1, 2, 3]}"#).unwrap_err();
         assert!(err.to_string().contains("bootstrap_room"), "{err}");
+    }
+
+    /// A scalar `bootstrap_room` whose fan-out would wrap i64 must be
+    /// rejected, not silently wrapped: Python's arbitrary-precision
+    /// normalizer derives different rooms for the same body (issue #43882),
+    /// so a mixed Rust/Python PD pair would rendezvous on different rooms.
+    #[test]
+    fn bootstrap_room_fan_out_overflow_rejected() {
+        let err = requests(
+            r#"{"text": ["a", "b"], "bootstrap_host": "h", "bootstrap_port": 8998,
+                "bootstrap_room": 9223372036854775807}"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("bootstrap_room"), "{err}");
+
+        // The boundary itself is fine: MAX - (n - 1) + (n - 1) == MAX.
+        let (ps, _) = requests(
+            r#"{"text": ["a", "b"], "bootstrap_host": "h", "bootstrap_port": 8998,
+                "bootstrap_room": 9223372036854775806}"#,
+        )
+        .unwrap();
+        assert_eq!(ps[0].bootstrap_room, Some(9223372036854775806));
+        assert_eq!(ps[1].bootstrap_room, Some(9223372036854775807));
     }
 
     /// The PD router (mini_lb) and PD-warmup payload shapes must parse. The
