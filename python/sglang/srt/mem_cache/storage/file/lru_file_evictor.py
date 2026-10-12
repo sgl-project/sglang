@@ -70,20 +70,22 @@ class LRUFileEvictor:
         *,
         tp_rank: int,
         is_mla_model: bool,
+        sharded_suffix: Optional[str] = None,
         extra_config: Optional[dict] = None,
         on_evict: Optional[Callable[[str], None]] = None,
-        owns_key: Optional[Callable[[str], bool]] = None,
     ) -> None:
         self.file_path = file_path
         self.config_suffix = config_suffix
         self._tp_rank = tp_rank
         self._on_evict = on_evict
 
-        # Hybrid MLA models also own TP-local state, selected by owns_key.
-        self._is_storage_owner = (
-            owns_key is not None or not is_mla_model or tp_rank == 0
+        # MLA ranks share replicated files, so rank 0 owns their LRU bookkeeping;
+        # keys ending in ``sharded_suffix`` hold this rank's own TP shard.
+        owns_replicated = (not is_mla_model) or (tp_rank == 0)
+        self._owned_suffixes = tuple(
+            s for s in (config_suffix if owns_replicated else None, sharded_suffix) if s
         )
-        self._owns_key = owns_key or (lambda key: self._is_storage_owner)
+        self._is_storage_owner = bool(self._owned_suffixes)
 
         # suffixed_key -> file size in bytes; oldest at front.
         self._lru: OrderedDict[str, int] = OrderedDict()
@@ -178,7 +180,7 @@ class LRUFileEvictor:
         """
         if not self._eviction_configured:
             return True  # unbounded storage: nothing to enforce
-        if not self._owns_key(suffixed_key):
+        if not suffixed_key.endswith(self._owned_suffixes):
             logger.warning(
                 f"HiCacheFile rank {self._tp_rank} does not own this key; "
                 f"not caching new key {key} because file eviction is enabled."
@@ -243,7 +245,9 @@ class LRUFileEvictor:
 
     def touch(self, suffixed_key: str, tensor_path: str) -> None:
         """Mark key as MRU, adopting an untracked on-disk file if needed."""
-        if not self._eviction_enabled or not self._owns_key(suffixed_key):
+        if not self._eviction_enabled or not suffixed_key.endswith(
+            self._owned_suffixes
+        ):
             return
         with self._lock:
             if suffixed_key in self._lru:
@@ -310,7 +314,7 @@ class LRUFileEvictor:
                 continue
             stem = fn[:-4]
             # Only files belonging to this rank/model.
-            if not stem.endswith(self.config_suffix) or not self._owns_key(stem):
+            if not stem.endswith(self._owned_suffixes):
                 continue
             fp = os.path.join(self.file_path, fn)
             try:

@@ -88,13 +88,6 @@ class PoolName(str, Enum):
         return self.value
 
 
-def mla_tp_shard_tag(is_mla_model: bool, tp_rank: int, tp_size: int, pool_name) -> str:
-    """Key tag for MLA Mamba state, which every TP rank backs up (see should_backup)."""
-    if is_mla_model and pool_name == PoolName.MAMBA:
-        return f"tp{tp_rank}_{tp_size}"
-    return ""
-
-
 class PoolHitPolicy(str, Enum):
     """Hit policy for batch_exists_v2 per-pool prefix matching.
 
@@ -404,19 +397,18 @@ class HiCacheFile(HiCacheStorage):
         attn_cp_size = storage_config.attn_cp_size
         model_name = "-".join(model_name.split("/")) if model_name else ""
         enable_pp = pp_size > 1
-        self._is_mla_model = is_mla_model
-        self._tp_rank = tp_rank
-        mamba_tag = mla_tp_shard_tag(True, tp_rank, tp_size, PoolName.MAMBA)
-        self._mamba_tp_suffix = f".mamba.{mamba_tag}"
-        self.config_suffix = f"_{model_name}"
-        if not is_mla_model:
-            self.config_suffix += f"_{tp_rank}_{tp_size}"
-        if enable_pp:
-            self.config_suffix += f"_{pp_size}_{pp_rank}"
+        rank_suffix = f"_{tp_rank}_{tp_size}"
+        stage_suffix = f"_{pp_size}_{pp_rank}" if enable_pp else ""
         # Under NSA context parallel each CP rank holds a disjoint slice of every
         # page, so give each rank its own file key to avoid a cross-rank write race.
         if attn_cp_size > 1:
-            self.config_suffix += f"_cp{attn_cp_rank}_{attn_cp_size}"
+            stage_suffix += f"_cp{attn_cp_rank}_{attn_cp_size}"
+        self.config_suffix = (
+            f"_{model_name}{'' if is_mla_model else rank_suffix}{stage_suffix}"
+        )
+        # MLA KV is replicated across TP ranks, but every rank backs up its own
+        # Mamba shard (see should_backup), so Mamba keys always carry the TP rank.
+        self.mamba_config_suffix = f"_{model_name}{rank_suffix}{stage_suffix}"
 
         if not os.path.exists(self.file_path) and tp_rank == 0 and attn_cp_rank == 0:
             os.makedirs(self.file_path)
@@ -457,7 +449,7 @@ class HiCacheFile(HiCacheStorage):
             self.config_suffix,
             tp_rank=tp_rank,
             is_mla_model=is_mla_model,
-            owns_key=self._owns_file_key if is_mla_model else None,
+            sharded_suffix=self.mamba_config_suffix,
             extra_config=storage_config.extra_config,
             on_evict=(
                 self.metadata_cache.remove if self.metadata_cache is not None else None
@@ -465,18 +457,9 @@ class HiCacheFile(HiCacheStorage):
         )
 
     def _get_suffixed_key(self, key: str) -> str:
-        # MLA KV/indexer pages are replicated; Mamba state is TP-sharded.
-        if self._is_mla_model and key.endswith(".mamba"):
-            key = key[: -len(".mamba")] + self._mamba_tp_suffix
+        if key.endswith(f".{PoolName.MAMBA.value}"):
+            return key + self.mamba_config_suffix
         return key + self.config_suffix
-
-    def _owns_file_key(self, suffixed_key: str) -> bool:
-        key = suffixed_key[: -len(self.config_suffix)]
-        if ".mamba.tp" in key:
-            return key.endswith(self._mamba_tp_suffix)
-        if key.endswith(".mamba"):
-            return False  # Legacy state has no rank identity.
-        return self._tp_rank == 0  # Rank 0 owns replicated pages.
 
     def _get_component_key(self, key: str, component_name: Optional[str] = None) -> str:
         if component_name is None or component_name in ("__default__", PoolName.KV):
@@ -493,7 +476,7 @@ class HiCacheFile(HiCacheStorage):
                 continue
             stem = fn[:-4]
             # Only files belonging to this rank/model.
-            if stem.endswith(self.config_suffix):
+            if stem.endswith((self.config_suffix, self.mamba_config_suffix)):
                 self.metadata_cache.add(stem)
 
     def get(
