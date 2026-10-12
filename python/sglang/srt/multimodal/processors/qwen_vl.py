@@ -264,11 +264,8 @@ async def preprocess_video(
     idx = np.linspace(0, total_frames - 1, num=nframes, dtype=np.int64)
     idx = np.unique(idx)
 
-    video = vr.get_frames_as_tensor(idx.tolist())
-
-    video = video.permute(0, 3, 1, 2)  # NHWC -> TCHW
-
-    nframes, _, height, width = video.shape
+    nframes = len(idx)
+    height, width = vr.frame_shape
     min_pixels = video_config.get("min_pixels", VIDEO_MIN_PIXELS)
     total_pixels = video_config.get("total_pixels", VIDEO_TOTAL_PIXELS)
     max_pixels = max(
@@ -278,8 +275,6 @@ async def preprocess_video(
         ),
         int(min_pixels * 1.05),
     )
-
-    get_batch_time = time.perf_counter()
 
     max_pixels_supposed = video_config.get("max_pixels", max_pixels)
 
@@ -303,11 +298,35 @@ async def preprocess_video(
             max_pixels=max_pixels,
         )
     smart_resize_time = time.perf_counter()
-    video = torchvision.transforms.functional.resize(
-        video,
-        [resized_height, resized_width],
-        interpolation=InterpolationMode.BILINEAR,
+    # Bound raw decode batches by the output pixel budget, allowing one source frame.
+    batch_size = min(
+        nframes,
+        max(
+            1,
+            int(
+                nframes
+                * max(max_pixels, resized_height * resized_width)
+                // (height * width)
+            ),
+        ),
     )
+    video = None
+    for start in range(0, nframes, batch_size):
+        frames = vr.get_frames_as_tensor(idx[start : start + batch_size].tolist())
+        frames = torchvision.transforms.functional.resize(
+            frames.permute(0, 3, 1, 2),  # NHWC -> TCHW
+            [resized_height, resized_width],
+            interpolation=InterpolationMode.BILINEAR,
+        )
+        if batch_size == nframes:
+            video = frames
+        else:
+            if video is None:
+                video = frames.new_empty(
+                    (nframes, resized_height, resized_width, frames.shape[1])
+                ).permute(0, 3, 1, 2)
+            video[start : start + len(frames)] = frames
+        del frames
     if not is_cpu():
         video = video.pin_memory()
     video_metadata = {
@@ -320,9 +339,8 @@ async def preprocess_video(
     torchvision_resize_time = time.perf_counter()
     logger.debug(
         f"[preprocess_video Perf], "
-        f"get_batch_time: {(get_batch_time - entry_time) * 1000:.2f} ms, "
-        f"smart_resize_time: {(smart_resize_time - get_batch_time) * 1000:.2f} ms, "
-        f"torchvision_resize_time: {(torchvision_resize_time - smart_resize_time) * 1000:.2f} ms, "
+        f"smart_resize_time: {(smart_resize_time - entry_time) * 1000:.2f} ms, "
+        f"decode_resize_time: {(torchvision_resize_time - smart_resize_time) * 1000:.2f} ms, "
         f"total_time: {(torchvision_resize_time - entry_time) * 1000:.2f} ms"
     )
     return video, video_metadata
