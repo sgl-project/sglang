@@ -17,13 +17,15 @@ from dataclasses import dataclass
 from functools import cached_property
 from typing import Callable, Optional
 
-from sglang.srt.environ import envs
+import msgspec
+
 from sglang.srt.layers.layer_boundary.adapters.attention import get_attn_tp_context
 from sglang.srt.layers.layer_boundary.boundary import (
     ExitMove,
     _cp_moves,
     bind_entry,
     bind_exit,
+    input_rows,
 )
 from sglang.srt.layers.layer_boundary.contracts import (
     BatchVariant,
@@ -34,7 +36,7 @@ from sglang.srt.layers.layer_boundary.contracts import (
     StageKind,
     StagePath,
 )
-from sglang.srt.layers.layer_boundary.exit import ExitPolicy
+from sglang.srt.layers.layer_boundary.exit import ExitPolicy, exit_facts
 from sglang.srt.layers.layer_boundary.fusions.allreduce import (
     attn_input_fusions,
     ffn_input_fusions,
@@ -43,17 +45,12 @@ from sglang.srt.layers.layer_boundary.layout import (
     TokenAxis,
     _batch_shards_over_cp,
     _cp_gathers_over_attn_cp,
-    _prefill_cp_shards_tokens,
-    is_dense_ffn_fully_dp,
 )
 from sglang.srt.layers.layer_boundary.prepare import (
     _attn_input_default,
     _attn_input_scattered,
 )
 from sglang.srt.layers.layer_boundary.stage import StageBoundary
-from sglang.srt.layers.moe import (
-    get_moe_a2a_backend,
-)
 from sglang.srt.runtime_context import (
     get_forward,
     get_lora,
@@ -62,49 +59,10 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
-_use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
 
-
-def _reject_unsupported_cp_moe(moe_on_local_rows: bool, cp_shards: bool) -> None:
-    """A MoE layer under attention CP whose tokens the steps cannot bring
-    to it: under a prefill CP, one dispatched per DP shard under attention DP
-    and GQA CP, and one on the TP group whose data-parallel groups are the CP
-    ranks under DSA or MLA CP; and under attention DP, one on the TP group
-    whose data-parallel groups are the CP ranks."""
-    parallel = get_parallel()
-    gqa = not _cp_gathers_over_attn_cp()
-    if moe_on_local_rows:
-        if cp_shards and gqa and parallel.attn_dp_size > 1:
-            raise NotImplementedError(
-                "a MoE dispatched per DP shard under attention DP and GQA prefill CP"
-            )
-    elif parallel.moe_dp_size == parallel.attn_cp_size:
-        if cp_shards and not gqa:
-            raise NotImplementedError(
-                "a MoE on the TP group with moe_dp_size == attn_cp_size under "
-                "DSA or MLA prefill CP"
-            )
-        if parallel.attn_dp_size > 1:
-            raise NotImplementedError(
-                "a MoE on the TP group with moe_dp_size == attn_cp_size under "
-                "attention DP and attention CP"
-            )
-
-
-def _input_scattered_possible() -> bool:
-    """Whether a batch may run this layer with input-scattered attention:
-    configured, on TP without attention DP, a prefill CP, an a2a backend or
-    a dense MLP on every rank. The rest of what ``AttnTpContext.init_context`` requires is only
-    known once the model is built."""
-    parallel = get_parallel()
-    return (
-        parallel.enable_attn_tp_input_scattered
-        and parallel.tp_size > 1
-        and parallel.attn_dp_size == 1
-        and not _prefill_cp_shards_tokens()
-        and get_moe_a2a_backend().is_none()
-        and not is_dense_ffn_fully_dp()
-    )
+def _rows_indivisible_over_attn_tp(forward_batch, attn_tp_size: int) -> bool:
+    """Whether this batch arrived with rows that do not divide over attention TP."""
+    return forward_batch.input_ids.shape[0] % attn_tp_size != 0
 
 
 @dataclass(frozen=True)
@@ -142,6 +100,8 @@ class StagePlan:
         is_branch: Branch reusing an already-read input; requires branch_input
             instead of a normal prepare to avoid repeating the read/update.
         terminal: Whether the stage ends the model's layer stack.
+        writes_at_handoff: Whether the stage, an FFN handing off to another
+            pipeline rank, writes its output into the residual at its exit.
         finishes_directly: Attention can publish its output with finish instead of
             an exit scope and output transport.
         qkv_latent_func: Optional hook for prepared attention input.
@@ -164,12 +124,22 @@ class StagePlan:
         enters_stack=False,
         is_branch=False,
         terminal=False,
+        writes_at_handoff=False,
         finishes_directly=False,
         qkv_latent_func=None,
         fusions=None,
+        attn_tp_gather=None,
+        exit_gather=None,
+        next_input_rows=None,
+        capture_preserves_residual=None,
     ):
         self.norm = norm
         self.edges = dict(variants)
+        # The attention TP size an unpadded batch's rows are checked against,
+        # when such a batch may arrive (see BatchVariant.UNPADDED).
+        self._unpadded_attn_tp_size = (
+            get_parallel().attn_tp_size if BatchVariant.UNPADDED in self.edges else None
+        )
         self.enters_stack = enters_stack
         self.terminal = terminal
         self.finishes_directly = finishes_directly
@@ -181,7 +151,7 @@ class StagePlan:
         self._publish_lora_layout = get_parallel().attn_dp_enabled and bool(
             get_lora().enable_lora
         )
-        self._next_input_rows = None
+        self._next_input_rows = next_input_rows
         carried = (
             attn_input_fusions(self, next(iter(self.edges.values())).incoming.need.read)
             if kind is StageKind.ATTENTION
@@ -205,18 +175,33 @@ class StagePlan:
                     cp_moves=edges.cp_moves,
                     enters_stack=enters_stack,
                     attn_input_adapter=edges.attn_input_adapter,
+                    attn_tp_gather=attn_tp_gather,
                 )
+                keeps = (capture_preserves_residual or {}).get(variant)
+                if keeps is not None:
+                    entry = msgspec.structs.replace(
+                        entry, capture_preserves_residual=keeps
+                    )
             out = (
                 ExitMove()
                 if finishes_directly
-                else bind_exit(edges.outgoing, cp_moves=edges.cp_moves)
+                else bind_exit(
+                    edges.outgoing,
+                    cp_moves=edges.cp_moves,
+                    attn_tp_gather=exit_gather,
+                )
             )
-            self.paths[variant] = StagePath(
+            path = StagePath(
                 entry=entry,
                 output=edges.outgoing.produced,
                 output_move=out.output_move,
                 output_move_completes_sum=out.output_move_completes_sum,
+                output_gathers_attn_tp=out.gathers_attn_tp,
                 returns_over_dp=out.returns_over_dp,
+                writes_at_handoff=writes_at_handoff,
+            )
+            self.paths[variant] = msgspec.structs.replace(
+                path, exit=exit_facts(kind, self, variant, path)
             )
 
     @property
@@ -236,25 +221,19 @@ class StagePlan:
             return BatchVariant.INPUT_SCATTERED
         if _batch_shards_over_cp(forward_batch):
             return BatchVariant.CONTEXT_PARALLEL
+        if self._unpadded_attn_tp_size is not None and _rows_indivisible_over_attn_tp(
+            forward_batch, self._unpadded_attn_tp_size
+        ):
+            return BatchVariant.UNPADDED
         return BatchVariant.ORDINARY
 
     def path_for(self, forward_batch):
-        variant = self.variant_for(forward_batch)
-        try:
-            return self.paths[variant]
-        except KeyError:
-            raise NotImplementedError(
-                f"no stage boundary path for the active {variant.name} batch"
-            ) from None
+        return _bound_for(self.paths, self.variant_for(forward_batch))
 
     def fused_input_rows(self, forward_batch):
         if self._next_input_rows is not None:
-            return self._next_input_rows[self.variant_for(forward_batch)]
-        entry = self.path_for(forward_batch)
-        return entry.entry.input_rows
-
-    def produced(self, forward_batch):
-        return self.path_for(forward_batch).output
+            return _bound_for(self._next_input_rows, self.variant_for(forward_batch))
+        return self.path_for(forward_batch).entry.input_rows
 
     @cached_property
     def output(self):
@@ -271,25 +250,58 @@ class StagePlan:
         )
 
 
-def _bind_stage(declaration, norm, incoming, outgoing, **options):
+def _bound_for(bound, variant):
+    """What a stage bound for a batch's variant: the variant a batch selects
+    must be one the stage bound, whichever table is looked up."""
+    try:
+        return bound[variant]
+    except KeyError:
+        raise NotImplementedError(
+            f"no stage boundary path for the active {variant.name} batch"
+        ) from None
+
+
+def _bind_stage(
+    declaration,
+    norm,
+    incoming,
+    outgoing,
+    *,
+    final_read=None,
+    capture_preserves_residual=None,
+    **options,
+):
     if incoming.consumer != declaration or outgoing.producer != declaration:
         raise ValueError("connections do not match the stage declaration")
     if incoming.entries.keys() != outgoing.exits.keys():
         raise ValueError("incoming and outgoing batch variants disagree")
+    update = declaration.update
+    if declaration.terminal and not (update.is_plain_add or update.applied_at_exit):
+        # The final read adds the last output into the residual itself, as a
+        # plain add, before its norm.
+        raise NotImplementedError(
+            f"the layer stack ends on a stage whose {type(update).__name__} "
+            "update the final read would apply as a plain add"
+        )
     variants = {}
     for variant, edge in incoming.entries.items():
         if (
             declaration.update.applied_at_exit
             and TokenAxis.ATTN_CP
             in edge.produced.layout.sharded - edge.need.layout.sharded
+            and not _cp_gathers_over_attn_cp()
         ):
-            raise NotImplementedError("MHC with a gather over attention CP")
+            raise NotImplementedError(
+                "an update applied at the stage's exit with a gather over attention CP"
+            )
         attn_input_adapter = None
         if declaration.kind is StageKind.ATTENTION:
+            # On an input-scattered batch the step gathers the rows itself for
+            # an attention whose QKV hook does not gather them after the
+            # projection.
             attn_input_adapter = (
                 _attn_input_scattered
                 if variant is BatchVariant.INPUT_SCATTERED
-                and not declaration.update.is_plain_add
                 else _attn_input_default
             )
         moves = _cp_moves() if variant is BatchVariant.CONTEXT_PARALLEL else None
@@ -303,17 +315,25 @@ def _bind_stage(declaration, norm, incoming, outgoing, **options):
         enters_stack=incoming.producer is None,
         is_branch=declaration.prepared_from is not None,
         terminal=declaration.terminal,
+        writes_at_handoff=declaration.writes_at_handoff,
+        attn_tp_gather=declaration.attn_tp_gather,
+        # The exit runs its consumer's gather: the next stage's, or the
+        # final read's.
+        exit_gather=getattr(
+            outgoing.consumer if outgoing.consumer is not None else final_read,
+            "attn_tp_gather",
+            None,
+        ),
         finishes_directly=declaration.kind is StageKind.ATTENTION
         and declaration.reduction is ProducerReduction.ALWAYS_PARTIAL,
-        **options,
-    )
-    if declaration.kind is StageKind.ATTENTION and outgoing.consumer is not None:
         # Layout eligibility comes from the connected consumer, not a mutable
         # link to its execution plan. Kernel binding remains consumer-owned.
-        from sglang.srt.layers.layer_boundary.boundary import input_rows
-
-        plan._next_input_rows = {
-            v: input_rows(edge) for v, edge in outgoing.entries.items()
-        }
-
+        next_input_rows=(
+            {v: input_rows(edge) for v, edge in outgoing.entries.items()}
+            if declaration.kind is StageKind.ATTENTION and outgoing.consumer is not None
+            else None
+        ),
+        capture_preserves_residual=capture_preserves_residual,
+        **options,
+    )
     return StageBoundary(plan, declaration=declaration)
