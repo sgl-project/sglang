@@ -36,7 +36,11 @@ from sglang.srt.layers.dp_attention import (
     get_global_dp_buffer_len,
     is_dp_gatherv_active,
 )
-from sglang.srt.layers.engram_table import EngramTableLayout, create_engram_table
+from sglang.srt.layers.engram_table import (
+    EngramTableLayout,
+    column_shard,
+    create_engram_table,
+)
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE
@@ -513,10 +517,12 @@ class EngramHasher(nn.Module):
 class EngramEmbedding(nn.Module):
     """One layer's fp8 hash table with e8m0 block scales, dequantized on lookup.
 
-    Storage and layout come from engram_table: device or host
-    (SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE), and per SGLANG_DSV41_ENGRAM_TABLE_LAYOUT
-    either one full_shared copy or row_sharded column shards. Loading is sharded
-    in every layout: a rank writes only its own row range.
+    Storage and visibility come from engram_table: device or host
+    (SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE), full_shared or row_sharded
+    (SGLANG_DSV41_ENGRAM_TABLE_LAYOUT). A table whose rows every rank reads in
+    place is looked up without a collective; otherwise each rank fills its own
+    rows and the lookup all-reduces. Loading is sharded in every layout: a rank
+    writes only its own column shard.
     """
 
     def __init__(
@@ -526,51 +532,38 @@ class EngramEmbedding(nn.Module):
         assert dim % FP8_BLOCK_SIZE == 0
         super().__init__()
         self.dim = dim
-        self.tp_size = get_parallel().tp_size
-        tp_rank = get_parallel().tp_rank
+        parallel = get_parallel()
+        self.tp_size = parallel.tp_size
         self.use_host = envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.get()
-        layout = EngramTableLayout.parse(
-            self.use_host, envs.SGLANG_DSV41_ENGRAM_TABLE_LAYOUT.get()
-        )
-        self.row_start, self.row_end = layout.shard(bounds, self.tp_size, tp_rank)
-        self.num_rows = self.row_end - self.row_start
-        # Loading is sharded in every layout: a full_shared table is one buffer
-        # the ranks fill together, each writing its row_sharded slice.
-        self._load_slice = slice(
-            *EngramTableLayout.ROW_SHARDED.shard(bounds, self.tp_size, tp_rank)
-        )
         self.table = create_engram_table(
             use_host=self.use_host,
-            layout=layout,
-            nbytes=self.num_rows * (dim + (dim // FP8_BLOCK_SIZE)),
+            layout=EngramTableLayout.parse(
+                self.use_host, envs.SGLANG_DSV41_ENGRAM_TABLE_LAYOUT.get()
+            ),
+            bounds=bounds,
+            dim=dim,
             name=f"sglang_engram_{layer_id}",
-            group=get_parallel().tp_group,
+            group=parallel.tp_group,
         )
-        raw = self.table.bytes
-        n, d = self.num_rows, dim
-        weight = raw[: n * d].view(torch.float8_e4m3fn).view(n, d)
-        scale = raw[n * d :].view(torch.float8_e8m0fnu).view(n, d // FP8_BLOCK_SIZE)
-        device_ptr = self.table.device_ptr
-        self.weight = nn.Parameter(weight, requires_grad=False)
-        self.scale = nn.Parameter(scale, requires_grad=False)
+        self.row_start = self.table.row_start
+        self.num_rows = self.table.weight.shape[0]
+        self.row_end = self.row_start + self.num_rows
+        load_start, load_end = column_shard(bounds, self.tp_size, parallel.tp_rank)
+        self._load_rows_global = slice(load_start, load_end)
+        self._load_rows_local = slice(
+            load_start - self.row_start, load_end - self.row_start
+        )
+        self.weight = nn.Parameter(self.table.weight, requires_grad=False)
+        self.scale = nn.Parameter(self.table.scale, requires_grad=False)
         self.weight.weight_loader = self._load_rows
         self.scale.weight_loader = self._load_rows
-        self._table_ptrs = (device_ptr, device_ptr + n * d)
-
-    @property
-    def _shared(self) -> bool:
-        return self.table.layout == EngramTableLayout.FULL_SHARED
 
     def _load_rows(self, param: nn.Parameter, loaded_weight: torch.Tensor):
-        rows = self._load_slice
-        if self._shared:
-            param.data[rows].copy_(loaded_weight[rows])
-        else:
-            param.data.copy_(loaded_weight[rows])
+        param.data[self._load_rows_local].copy_(loaded_weight[self._load_rows_global])
         self.table.mark_loaded()
 
     def finish_load(self, label: str):
-        """Collective in the shared layout: every rank calls it after loading."""
+        """Collective: every rank calls it after loading."""
         self.table.finish_load(label)
 
     def forward(
@@ -580,18 +573,9 @@ class EngramEmbedding(nn.Module):
         *,
         cp_all_tokens: bool = False,
     ) -> torch.Tensor:
-        if self._shared:
-            if indices.shape[0] == 0:
-                return self._empty(indices)
-            out = self._empty(indices)
-            engram_gather(
-                *self._table_ptrs,
-                indices.reshape(-1),
-                out.view(-1, self.dim),
-                self.dim,
-                FP8_BLOCK_SIZE,
-            )
-            return out
+        view = self.table.gather_view()
+        if view is not None:
+            return self._gather(indices, view)
         if cp_all_tokens and self.tp_size > 1:
             # Prefill CP: gather the hash ids over the CP group first so every
             # TP rank looks up the same indices, then keep this rank's slice.
@@ -606,6 +590,38 @@ class EngramEmbedding(nn.Module):
         if self.tp_size > 1 and get_parallel().attn_dp_size > 1:
             return self._dp_sharded_lookup(indices, forward_batch)
         return self._lookup(indices)
+
+    def _gather(self, indices: torch.Tensor, view) -> torch.Tensor:
+        """Every row read in place: no collective, so each rank may pass its own
+        indices (DP attention, CP) and look up only those."""
+        if len(view.w_ptrs) == 1 and not _cuda_kernels(indices):
+            # One shard owning every row: the reference lookup, nothing to reduce.
+            return self._owned_rows(indices)
+        out = self._empty(indices)
+        if indices.shape[0] == 0:
+            return out
+        if len(view.w_ptrs) == 1:
+            engram_gather(
+                view.w_ptrs[0],
+                view.s_ptrs[0],
+                indices.reshape(-1),
+                out.view(-1, self.dim),
+                self.dim,
+                FP8_BLOCK_SIZE,
+            )
+            return out
+        from sglang.kernels.ops.embeddings.engram_peer_gather import (
+            engram_gather_bf16,
+        )
+
+        engram_gather_bf16(
+            indices.to(torch.int32),
+            out.view(indices.shape[0], -1),
+            view.w_ptrs,
+            view.s_ptrs,
+            view.starts,
+        )
+        return out
 
     def _lookup(self, indices: torch.Tensor) -> torch.Tensor:
         """Lookup when every TP rank holds the same indices: the device and
@@ -644,7 +660,7 @@ class EngramEmbedding(nn.Module):
             return values.to(torch.bfloat16).masked_fill(~owned.unsqueeze(-1), 0)
         out = self._empty(indices)
         engram_gather(
-            *self._table_ptrs,
+            *self.table.ptrs,
             indices.reshape(-1),
             out.view(-1, self.dim),
             self.dim,

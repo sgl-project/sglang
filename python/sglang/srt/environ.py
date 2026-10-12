@@ -1609,6 +1609,9 @@ class Envs:
     SGLANG_OPT_DSV41_MEGA_MHC_PREFILL = EnvBool(False)
     # "row_sharded" | "full_shared"
     SGLANG_DSV41_ENGRAM_TABLE_LAYOUT = EnvStr("")
+    # Back a CUDA host table with VMM (pinned, 2MB-granular, fd-shareable)
+    # instead of memfd / anonymous mmap.
+    SGLANG_OPT_DSV41_ENGRAM_HOST_TABLE_VMM = EnvBool(False)
 
     # Kernels and indexer
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)

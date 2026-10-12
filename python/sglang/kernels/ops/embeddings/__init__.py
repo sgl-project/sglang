@@ -24,6 +24,15 @@ register_kernel(
 
 register_kernel(
     KernelSpec(
+        op="embeddings.engram_gather_bf16",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.embeddings.engram_peer_gather:engram_gather_bf16",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+    )
+)
+
+register_kernel(
+    KernelSpec(
         op="embeddings.engram_hash_ids",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.embeddings.engram_hash:engram_hash_ids",
