@@ -1739,8 +1739,14 @@ def main(path):
         miss_i = 0
         print("\nno [CMPIDX] lines; per-tag request split used (req0 = MISS).")
 
-    for tag in ("CMPIDX", "IDXK", "C4KV", "C128KV", "C128X", "OSHAPE", "XIN", "LHID", "IDXIN", "LIMETA", "C4ST", "KSTATELOC"):
+    for tag in ("CMPIDX", "IDXK", "C4KV", "C128KV", "C128X", "OSHAPE", "XIN", "LHID", "IDXIN", "LIMETA", "C4ST", "KSTATELOC", "C4POS"):
         rows = recs.get(tag, [])
+        if tag == "C4POS":
+            # Emit this section ALWAYS (real verdict, or the no-data fallback
+            # when the dump gate produced no rows), so the [C4POS] block is
+            # visible on the executed main() path even with zero rows.
+            report_c4pos(rows)
+            continue
         if not rows:
             continue
         if tag == "KSTATELOC":
@@ -1763,9 +1769,6 @@ def main(path):
                 "C4ST.idx1.any",
                 keep=lambda r: r.get("idx") == "1" and not r.get("tag"),
             )
-            continue
-        if tag == "C4POS":
-            report_c4pos(rows)
             continue
         if tag == "IDXIN":
             print("\n== [IDXIN] c4-indexer raw inputs (per-block q/w + seq lens) ==")
@@ -2084,6 +2087,44 @@ def _selftest():
                 except OSError:
                     pass
 
+        def _run_main(src_lines):
+            """Write a synthetic log and run the REAL ``main()``; return stdout.
+
+            Unlike ``_run_c4pos`` (which calls ``report_c4pos`` directly), this
+            exercises the executed ``main()`` control flow, so it catches the
+            case where the [C4POS] section is defined but never reached.
+            """
+            fd4, p4 = tempfile.mkstemp(suffix=".log", prefix="cmpidx_selftest_")
+            try:
+                with os.fdopen(fd4, "w", encoding="utf-8") as fh4:
+                    fh4.write("\n".join(src_lines) + "\n")
+                buf4 = io.StringIO()
+                with contextlib.redirect_stdout(buf4):
+                    main(p4)
+                return buf4.getvalue()
+            finally:
+                try:
+                    os.remove(p4)
+                except OSError:
+                    pass
+
+        # G3: the EXACT reported repro - two [C4POS] rows (one MISS anchor 0,
+        #     one HIT anchor 16384) through the REAL main() path.  Before the
+        #     fix main() printed only the "parsed C4POS: 2 lines" counter.
+        repro_pos = [
+            "[C4POS] layer=2 idx=1 n=5 ratio=4 nz=3 first=0 last=8 "
+            "md5=abc sum=12 pos=[0,4,8]",
+            "[C4POS] layer=2 idx=1 n=2 ratio=4 nz=2 first=16384 last=16388 "
+            "md5=def sum=9 pos=[16384,16388]",
+        ]
+        repro_out = _run_main(repro_pos)
+        # G4: a log with NO [C4POS] rows must still print the section + the
+        #     "no [C4POS] rows (dump gate off?)" fallback on the main() path.
+        no_c4pos_out = _run_main(["[CMPIDX] layer=1 lastpos=1 ntok=10 md5=xx"])
+        # G5: the phase_same fixture through main() -> a REAL verdict (not the
+        #     no-data line) reaches stdout.
+        g5_out = _run_main(g1_pos)
+
         b1_rows, b1_out = _run_nocmp(nocmp_rope)
         b2_rows, b2_out = _run_nocmp(nocmp_content)
         c1_rows, c1_out = _run_nocmp(same_slq)
@@ -2196,6 +2237,13 @@ def _selftest():
              "=> phase_diff" in g2_out and "block7:" in g2_out),
             ("[C4POS-RUNBOOK] printed",
              "[C4POS-RUNBOOK]" in g1_out and "DSV4_DUMP_C4POS=1" in g1_out),
+            ("[C4POS] real main() emits header+verdict on the 2-row repro",
+             "== [C4POS]" in repro_out and "[C4POS-VERDICT]" in repro_out),
+            ("[C4POS] real main() prints a phase_same verdict",
+             "=> phase_same" in g5_out),
+            ("[C4POS] real main() prints no-data fallback when no rows",
+             "== [C4POS]" in no_c4pos_out
+             and "no [C4POS] rows (dump gate off?)" in no_c4pos_out),
         ]
         failed = [name for name, ok in checks if not ok]
         for name, ok in checks:
