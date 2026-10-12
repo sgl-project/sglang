@@ -6,23 +6,31 @@ Only the transfer worker can send that ACK after its write has drained.
 
 import unittest
 from collections import defaultdict
+from threading import Lock, RLock
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
+import zmq
 from test_deferred_decode_kv_release import (
     DeferredAbortNotificationScenarios,
     TaggedAbortNotificationScenarios,
     WorkerFailureAbortScenarios,
 )
 
-from sglang.srt.disaggregation.base.conn import KVPoll
+from sglang.srt.disaggregation.base.conn import KVPoll, KVTransferDestination
 from sglang.srt.disaggregation.common.conn import (
     ABORT_ACK_TAG,
     ABORT_TAG,
     AbortNotification,
+    KVTransferError,
 )
 from sglang.srt.disaggregation.common.utils import TransferKVChunk
-from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
+from sglang.srt.disaggregation.mooncake.conn import (
+    MooncakeKVManager,
+    MooncakeKVReceiver,
+    TransferInfo,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -140,6 +148,111 @@ class TestMooncakeAbortNotification(
         self.assertEqual(manager.request_status[ROOM], KVPoll.Failed)
         payload = manager._send_multipart_locked.call_args.args[1]
         self.assertEqual(payload, [ABORT_ACK_TAG, str(ROOM).encode("ascii")])
+
+
+class TestMooncakeHostReceiver(CustomTestCase):
+    def _receiver(self):
+        manager = _manager()
+        manager.__dict__.update(
+            attn_tp_size=2,
+            dcp_size=1,
+            enable_staging=False,
+            local_ip=DECODE_IP,
+            rank_port=DECODE_PORT,
+            _deferred_abort_generation=0,
+            _deferred_abort_ack_tracker={},
+            failure_lock=Lock(),
+            failure_records={},
+            defer_decode_allocation=False,
+            required_prefill_response_num_table={},
+            prefill_response_tracker={},
+            addr_to_rooms_tracker=defaultdict(set),
+        )
+        receiver = MooncakeKVReceiver.__new__(MooncakeKVReceiver)
+        receiver.__dict__.update(
+            kv_mgr=manager,
+            session_id="session",
+            bootstrap_room=ROOM,
+            bootstrap_addr="prefill",
+            init_time=None,
+            conclude_state=None,
+            _host_destination_published=False,
+            _abort_generation=None,
+            _owns_bootstrap_room=True,
+            _lifecycle_lock=RLock(),
+            abort_notified=False,
+            require_staging=False,
+            required_dst_info_num=2,
+            bootstrap_infos=[{"is_dummy": False}, {"is_dummy": True}],
+            prefill_info=SimpleNamespace(
+                supports_host_destination=True, attn_tp_size=2, attn_cp_size=1
+            ),
+        )
+        receiver.socket = MagicMock()
+        receiver._connect_to_bootstrap_server = lambda info: (receiver.socket, Lock())
+        receiver.invalidate_cached_bootstrap_infos = MagicMock()
+        return receiver
+
+    def test_host_metadata_roundtrip_and_capability_fallback(self):
+        receiver = self._receiver()
+        for owner, field, value in (
+            (receiver.prefill_info, "supports_host_destination", False),
+            (receiver.prefill_info, "attn_tp_size", 1),
+            (receiver.prefill_info, "attn_cp_size", 2),
+            (receiver.kv_mgr, "dcp_size", 2),
+            (receiver.kv_mgr, "enable_deferred_decode_kv_release", False),
+            (receiver.kv_mgr, "supports_host_destination", False),
+            (receiver, "require_staging", True),
+        ):
+            with self.subTest(field=field), patch.object(owner, field, value):
+                self.assertFalse(receiver.supports_host_destination)
+        self.assertTrue(receiver.supports_host_destination)
+        receiver.send_metadata(
+            np.array([3, 5], dtype=np.int32),
+            7,
+            [[9]],
+            destination=KVTransferDestination.HOST,
+        )
+        for call, dummy in zip(
+            receiver.socket.send_multipart.call_args_list, (False, True)
+        ):
+            info = TransferInfo.from_zmq(call.args[0])
+            self.assertEqual(info.destination, KVTransferDestination.HOST)
+            self.assertEqual(info.is_dummy, dummy)
+            self.assertEqual(info.dst_state_indices, [] if dummy else [[9]])
+
+    def test_partial_publication_keeps_early_and_late_drain_acks(self):
+        for early_ack in (False, True):
+            with self.subTest(early_ack=early_ack):
+                receiver = self._receiver()
+                manager = receiver.kv_mgr
+                receiver.socket.send_multipart.side_effect = [None, zmq.ZMQError()]
+                receiver.send_metadata(
+                    np.array([3], dtype=np.int32),
+                    7,
+                    destination=KVTransferDestination.HOST,
+                )
+                self.assertIsNone(receiver.init_time)
+                self.assertFalse(receiver.is_abort_release_safe())
+                receiver.socket.send_multipart.side_effect = None
+                receiver.ensure_abort_notified()
+                generation = receiver._abort_generation
+                self.assertIsNotNone(generation)
+                manager.note_abort_ack(ROOM, 0, generation - 1)
+                self.assertFalse(receiver.is_abort_release_safe())
+                if early_ack:
+                    manager.note_abort_ack(ROOM, 0, generation)
+                with self.assertRaises(KVTransferError):
+                    receiver.failure_exception()
+                self.assertIn(ROOM, manager._deferred_abort_ack_tracker)
+                self.assertIn(ROOM, manager.request_status)
+                manager.note_abort_ack(ROOM, 1, generation)
+                self.assertEqual(receiver.is_abort_release_safe(), early_ack)
+                manager.note_abort_ack(ROOM, 0, generation)
+                self.assertTrue(receiver.is_abort_release_safe())
+                receiver.clear()
+                self.assertNotIn(ROOM, manager._deferred_abort_ack_tracker)
+                self.assertNotIn(ROOM, manager.request_status)
 
 
 if __name__ == "__main__":

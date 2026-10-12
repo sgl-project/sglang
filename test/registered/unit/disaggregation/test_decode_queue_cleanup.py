@@ -465,6 +465,29 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue.req_to_metadata_buffer_idx_allocator.free.assert_called_once_with(3)
         mock_release_kv_cache.assert_not_called()
 
+    def test_host_transfer_abort_notifies_receiver_without_releasing_pages(self):
+        receiver = MagicMock()
+        req = SimpleNamespace(rid="cancel-host")
+        transfer = SimpleNamespace(req=req, kv_receiver=receiver, host_staged=True)
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.chunked_req = None
+        scheduler.mm_receiver = None
+        scheduler.waiting_queue = []
+        scheduler.dllm_config = None
+        scheduler.grammar_manager = MagicMock()
+        scheduler.disaggregation_mode = DisaggregationMode.DECODE
+        scheduler.disagg_decode_prealloc_queue = SimpleNamespace(
+            queue=[], retracted_queue=[]
+        )
+        scheduler.disagg_decode_transfer_queue = SimpleNamespace(queue=[transfer])
+        scheduler.collect_inflight_reqs = MagicMock(return_value=[])
+        with patch("sglang.srt.managers.scheduler.prepare_abort") as mark_aborted:
+            scheduler.abort_request(SimpleNamespace(abort_all=False, rid=req.rid))
+        receiver.abort.assert_called_once_with()
+        receiver.clear.assert_not_called()
+        mark_aborted.assert_called_once_with(req, "Aborted by AbortReq.")
+        self.assertEqual(scheduler.disagg_decode_transfer_queue.queue, [transfer])
+
     def test_fake_receiver_initializes_deferred_release_state(self):
         manager = MagicMock()
         receiver = FakeKVReceiver(manager, "")
