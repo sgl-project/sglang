@@ -38,6 +38,8 @@ class ForwardContext:
     attn_metadata: "AttentionMetadata"  # set dynamically for each forward pass
     forward_batch: Optional["Req"] = None
     attention_backend_cls: Optional[Type] = None
+    # A persistent CFG residual must be anchored to real DiT features.
+    force_spectrum_real: bool = False
 
     def set_attn_backend_cls(self, attention_backend_cls: Type):
         if self.attention_backend_cls:
@@ -68,7 +70,11 @@ def get_forward_context_or_none() -> "ForwardContext | None":
 # TODO(will): finalize the interface
 @contextmanager
 def set_forward_context(
-    current_timestep, attn_metadata, forward_batch: Optional["Req"] = None
+    current_timestep,
+    attn_metadata,
+    forward_batch: Optional["Req"] = None,
+    *,
+    force_spectrum_real: bool = False,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -84,6 +90,7 @@ def set_forward_context(
         current_timestep=current_timestep,
         attn_metadata=attn_metadata,
         forward_batch=forward_batch,
+        force_spectrum_real=force_spectrum_real,
     )
 
     try:

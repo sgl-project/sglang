@@ -319,6 +319,7 @@ class SpectrumContext:
     spectrum_params: SpectrumParams
     debug: bool
     is_cfg_parallel: bool = False
+    force_real: bool = False
 
 
 class SpectrumMixin:
@@ -477,6 +478,7 @@ class SpectrumMixin:
         )
 
         return SpectrumContext(
+            force_real=forward_context.force_spectrum_real,
             current_step=forward_context.current_timestep,
             num_inference_steps=num_inference_steps,
             total_forward_steps=total_forward_steps,
@@ -588,6 +590,11 @@ class SpectrumMixin:
                 # Widen the gap for the next stretch (paper alpha / flex_window).
                 curr_ws += params.flex_window
                 curr_ws = round(curr_ws, 3)
+
+        # Keep the normal request/branch lifecycle and record the real features
+        # even when CFG needs to refresh a residual on a scheduled skip.
+        if ctx.force_real:
+            actual_forward = True
 
         # One denoising forward completed on this branch.
         cnt += 1
