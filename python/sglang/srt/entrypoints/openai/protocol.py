@@ -1472,6 +1472,21 @@ DecisionText = Union[str, Dict[str, Any], List[Any]]
 RequiredDecisionText = Annotated[DecisionText, AfterValidator(_nonblank_decision_text)]
 
 
+def _to_image_url(
+    image: Union[ChatCompletionMessageContentImageURL, str],
+) -> ChatCompletionMessageContentImageURL:
+    if isinstance(image, str):
+        return ChatCompletionMessageContentImageURL(url=image)
+    return image
+
+
+# An image arrives as the chat image URL object or as its url alone, such as a
+# data URI or base64 bytes. A url alone is converted to the object as it validates.
+DecisionImage = Annotated[
+    Union[ChatCompletionMessageContentImageURL, str], AfterValidator(_to_image_url)
+]
+
+
 class DecisionOption(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -1527,6 +1542,7 @@ class DecisionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     input: RequiredDecisionText
+    images: List[DecisionImage] = Field(default_factory=list)
     questions: List[DecisionQuestion] = Field(min_length=1)
     # Scales option probabilities only, not label_mass.
     temperature: float = Field(default=1.0, gt=0, allow_inf_nan=False)
@@ -1974,23 +1990,32 @@ class ResponsesRequest(PDRoutingFields):
 
     def to_sampling_params(
         self,
-        default_max_tokens: int,
+        default_max_tokens: Optional[int] = None,
         default_params: Optional[Dict] = None,
         stop: Optional[Union[str, List[str]]] = None,
         tool_call_constraint: Optional[ToolCallConstraint] = None,
     ) -> Dict[str, Any]:
-        """Convert to sampling parameters for generation."""
+        """Convert to sampling parameters for generation.
+
+        ``default_max_tokens`` may be ``None``: when neither it nor
+        ``max_output_tokens`` is set, ``max_new_tokens`` is left ``None`` so the
+        scheduler clamps the budget against the real (post-expansion) input
+        length, matching the Chat Completions path. See issue #29287.
+        """
         if default_params is None:
             default_params = {}
 
         # Use max_output_tokens if available, otherwise use max_tokens for backwards compatibility
         if self.max_output_tokens is not None:
-            max_tokens = min(self.max_output_tokens, default_max_tokens)
+            max_tokens = self.max_output_tokens
+            if default_max_tokens is not None:
+                max_tokens = min(max_tokens, default_max_tokens)
         else:
             max_tokens = default_max_tokens
 
         # Headroom for BOS/EOS the engine appends on top of prompt+budget.
-        max_tokens -= 2
+        if max_tokens is not None:
+            max_tokens -= 2
 
         temperature = self.temperature
         if temperature is None:

@@ -17,7 +17,7 @@
 //!
 //! The handler tries buckets in order, advancing on missing candidates or admission
 //! rejection. Both P/D picks must succeed in the same bucket before dispatch.
-//! [`WorkerRegistry`] owns live workers; groups reference their IDs. Policies own
+//! [`WorkerRegistry`] owns live workers; groups select by ID or Service. Policies own
 //! their load/KV/affinity dependencies and pass selected observations to admission.
 
 use std::collections::HashSet;
@@ -41,8 +41,10 @@ impl TokenLimits {
 
 #[derive(Debug)]
 pub struct EngineGroup {
-    /// `None` includes all registered engines matching the request's model and role.
+    /// Exact identities. Omit both membership fields to include all engines of the role.
     pub worker_ids: Option<HashSet<WorkerId>>,
+    /// Match any named Kubernetes Service (namespace/name), across pod replacements.
+    pub worker_services: Option<HashSet<String>>,
     pub policy: Arc<dyn Policy>,
 }
 
@@ -50,6 +52,7 @@ impl EngineGroup {
     pub fn new(policy: Arc<dyn Policy>) -> Self {
         Self {
             worker_ids: None,
+            worker_services: None,
             policy,
         }
     }
@@ -74,7 +77,24 @@ impl EngineGroup {
                     .as_ref()
                     .is_none_or(|ids| ids.contains(&engine.id))
             })
+            .filter(|engine| {
+                self.worker_services
+                    .as_ref()
+                    .is_none_or(|services| engine.matches_services(services))
+            })
             .collect()
+    }
+
+    /// Live members minus the engines this request already failed on.
+    fn candidates(
+        &self,
+        workers: &WorkerRegistry,
+        request: &BucketRequest<'_>,
+        stage: Stage,
+    ) -> Vec<Arc<Worker>> {
+        let mut engines = self.members(workers, request.model, stage);
+        engines.retain(|engine| !request.excluded.contains(&engine.id));
+        engines
     }
 
     async fn pick_from(
@@ -114,11 +134,14 @@ pub enum BucketGroups {
 pub struct BucketRequest<'a> {
     pub model: &'a ModelId,
     pub input_tokens: u64,
+    pub total_input_tokens: u64,
     pub expected_peak_tokens: Option<u64>,
     pub prefix: Option<&'a crate::policies_reorg::cache_aware::PrefixMemo>,
     pub token_ids: Option<&'a [u32]>,
     pub session_key: Option<&'a str>,
     pub routing_key: Option<&'a str>,
+    /// Engines this request already failed on; no group offers them again.
+    pub excluded: &'a [WorkerId],
 }
 
 /// A complete selection from one bucket. For plain serving, `prefill` is the
@@ -212,13 +235,13 @@ impl Bucket {
     ) -> Result<BucketPick, (Stage, PickError)> {
         let (prefill, decode) = match &self.groups {
             BucketGroups::Plain(group) => {
-                let engines = group.members(workers, request.model, Stage::Plain);
+                let engines = group.candidates(workers, request, Stage::Plain);
                 let plain = self.pick_from_group(group, Stage::Plain, engines, request);
                 (plain.await?, None)
             }
             BucketGroups::Pd { prefill, decode } => {
-                let prefills = prefill.members(workers, request.model, Stage::Prefill);
-                let decoders = decode.members(workers, request.model, Stage::Decode);
+                let prefills = prefill.candidates(workers, request, Stage::Prefill);
+                let decoders = decode.candidates(workers, request, Stage::Decode);
                 let stage = if prefills.is_empty() {
                     Stage::Prefill
                 } else {
@@ -274,6 +297,7 @@ impl Bucket {
             stage,
             bucket: &self.id,
             input_tokens: request.input_tokens,
+            total_input_tokens: request.total_input_tokens,
             expected_peak_tokens: request.expected_peak_tokens,
             prefix: request.prefix,
             token_ids: request.token_ids,
@@ -302,7 +326,8 @@ impl Bucket {
 }
 
 /// Soft preference; nonpreferred buckets remain available for fallback.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SloPreference {
     #[default]
     Disabled,

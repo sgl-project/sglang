@@ -16,8 +16,8 @@ try:
     from triton.experimental.gluon.language.nvidia.blackwell import get_tmem_reg_layout
 except ImportError:
     # Triton 3.8 moved this onto the descriptor type (triton-lang/triton#9594)
-    # TODO(tmorris): After we update to triton 3.8 (torch 2.15), use new API directly
-    # instead of this compatibility wrapper.
+    # TODO: once ROCm leaves triton 3.7 (swapab_gluon_hip imports _load_v4
+    # from here), drop the try import above and call get_reg_layout directly.
     from triton.experimental.gluon.language.nvidia.blackwell import (
         tensor_memory_descriptor_type,
     )

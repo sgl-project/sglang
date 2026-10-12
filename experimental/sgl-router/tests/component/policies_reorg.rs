@@ -114,6 +114,7 @@ fn registry() -> Arc<WorkerRegistry> {
 
 fn group(members: &[&str], policy: Arc<dyn Policy>) -> EngineGroup {
     EngineGroup {
+        worker_services: None,
         worker_ids: Some(members.iter().map(|id| WorkerId((*id).into())).collect()),
         policy,
     }
@@ -259,16 +260,70 @@ async fn selected_pd_bucket_owns_both_memberships_and_policies() {
         prefix: None,
         model: &model,
         input_tokens: 10,
+        total_input_tokens: 10,
         expected_peak_tokens: Some(20),
         token_ids: None,
         session_key: None,
         routing_key: None,
+        excluded: &[],
     };
     let picks = bucket.pick_engines(&workers, &request).await.unwrap();
     assert_eq!(picks.prefill.engine.id.0, "p2");
     assert_eq!(picks.decode.unwrap().engine.id.0, "d2");
     assert_eq!(*prefill_policy.calls.lock().unwrap(), ["shared"]);
     assert_eq!(*decode_policy.calls.lock().unwrap(), ["shared"]);
+}
+
+#[tokio::test]
+async fn excluded_engines_are_never_offered() {
+    let workers = registry();
+    workers.add(spec("d2", Stage::Decode, "pd")).unwrap();
+    let ids =
+        |ids: &[&str]| -> Vec<WorkerId> { ids.iter().map(|id| WorkerId((*id).into())).collect() };
+    let policy = || -> Arc<dyn Policy> { Arc::new(TestPolicy::default()) };
+    let request = |model, excluded| BucketRequest {
+        prefix: None,
+        model,
+        input_tokens: 10,
+        total_input_tokens: 10,
+        expected_peak_tokens: None,
+        token_ids: None,
+        session_key: None,
+        routing_key: None,
+        excluded,
+    };
+
+    let model = ModelId("m".into());
+    let plain = Bucket::new("plain", BucketGroups::Plain(group(&["a", "b"], policy())));
+    let excluded = ids(&["a"]);
+    let picks = plain
+        .pick_engines(&workers, &request(&model, &excluded))
+        .await
+        .unwrap();
+    assert_eq!(picks.prefill.engine.id.0, "b");
+    let excluded = ids(&["a", "b"]);
+    assert!(matches!(
+        plain
+            .pick_engines(&workers, &request(&model, &excluded))
+            .await,
+        Err((Stage::Plain, PickError::NoCandidates))
+    ));
+
+    let model = ModelId("pd".into());
+    let pd = Bucket::new(
+        "pd",
+        BucketGroups::Pd {
+            prefill: group(&["p"], policy()),
+            decode: group(&["d", "d2"], policy()),
+        },
+    );
+    let excluded = ids(&["d"]);
+    let picks = pd
+        .pick_engines(&workers, &request(&model, &excluded))
+        .await
+        .unwrap();
+    assert_eq!(picks.prefill.engine.id.0, "p");
+    assert_eq!(picks.decode.unwrap().engine.id.0, "d2");
 }
 
 #[tokio::test]
@@ -427,10 +482,12 @@ async fn bucket_scopes_plain_pick_and_preserves_request_facts() {
         prefix: None,
         model: &model,
         input_tokens: 2,
+        total_input_tokens: 2,
         expected_peak_tokens: Some(12),
         token_ids: Some(&[7, 9]),
         session_key: Some("session"),
         routing_key: Some("routing"),
+        excluded: &[],
     };
     let picks = bucket.pick_engines(&workers, &request).await.unwrap();
     assert_eq!(picks.prefill.engine.id.0, "b");
