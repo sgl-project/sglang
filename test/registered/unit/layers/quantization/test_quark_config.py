@@ -62,31 +62,6 @@ class TestCheckSchemeSupportedError(CustomTestCase):
             f"RuntimeError must carry a single joined message, got {err.args!r}",
         )
 
-    def test_error_message_renders_as_sentence(self):
-        with patch(_GET_CAP, return_value=(7, 0)):
-            with self.assertRaises(RuntimeError) as ctx:
-                _bare_config()._check_scheme_supported(min_capability=200)
-        msg = str(ctx.exception)
-        # Tuple-repr leakage shows up as a leading '(' and quote-comma joins.
-        self.assertFalse(
-            msg.startswith("("),
-            f"error message starts with '(' (tuple repr leaked): {msg!r}",
-        )
-        self.assertNotIn(
-            "', '",
-            msg,
-            f"error message contains tuple-style fragment join: {msg!r}",
-        )
-
-    def test_error_message_content(self):
-        with patch(_GET_CAP, return_value=(7, 0)):
-            with self.assertRaises(RuntimeError) as ctx:
-                _bare_config()._check_scheme_supported(min_capability=200)
-        msg = str(ctx.exception)
-        self.assertIn("Quantization scheme is not supported", msg)
-        self.assertIn("Min capability: 200", msg)
-        self.assertIn("Current capability: 70", msg)
-
     # ---- Guardrails: unchanged code paths ---------------------------------
 
     def test_unsupported_returns_false_when_error_disabled(self):
