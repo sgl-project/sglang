@@ -179,10 +179,6 @@ class SGLDiffusionExecutor(torch.nn.Module):
             "with SGLDLoraLoader"
         )
 
-    @classmethod
-    def validate_sgld_options(cls, sgld_options: dict | None) -> None:
-        """Reject SGLDOptions this model cannot honour, before the worker starts."""
-
     @staticmethod
     def should_suppress_logs(timestep):
         """Determine if logs should be suppressed based on timestep value."""
