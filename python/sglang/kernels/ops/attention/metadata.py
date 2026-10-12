@@ -20,7 +20,9 @@ def get_num_kv_splits_triton(
     device_core_count,
     MAX_NUM_SEQ: tl.constexpr,
 ):
-    # TODO: this method is tunable, we need more online serving data to tune it
+    # Dynamic Hardware-Aware Split-K Calculation for Long-Context Decoding
+    # Optimizes issue #2271: Resolves single-SM serialization and wave quantization
+    # by dynamically scaling splits with sequence length and hardware compute units.
     offs_seq = tl.arange(0, MAX_NUM_SEQ)
     mask_seq = offs_seq < num_seq
 
@@ -33,26 +35,35 @@ def get_num_kv_splits_triton(
     max_kv_splits_1 = tl.minimum(tl.cdiv(max_seq_len, min_seq_len), max_kv_splits)
     kv_chunk_size_1 = tl.cdiv(max_seq_len, max_kv_splits_1)
 
-    # NOTE: this is a hack to let num_kv_split grows up with seqlen gradually
-    ext_seq_len = tl.cast(max_seq_len, tl.float32) / 64.0
-    ext_device_core_count = tl.cast(
-        device_core_count * tl.maximum(tl.log2(ext_seq_len), 1.0), tl.int32
-    )
+    # Scale total workgroup wave size to saturate GPU SMs
+    # Target chunk size of 128~256 tokens per split to balance compute density
+    # and reduction cost
     block_h, num_kv_group = 16, num_head // num_kv_head
     if num_kv_group == 1:
         token_grid = num_seq * num_group * num_head
     else:
-        # from triton_ops/decode_attention.py:_decode_grouped_att_m_fwd
         block_h = tl.minimum(block_h, num_kv_group)
         token_grid = num_seq * num_group * tl.cdiv(num_head, block_h)
-    max_kv_splits_2 = tl.minimum(
-        tl.cdiv(ext_device_core_count, token_grid), max_kv_splits
-    )
-    kv_chunk_size_2 = tl.cdiv(max_seq_len, max_kv_splits_2)
+
+    # Mathematical Unified Dynamic Split-K Scaling (Chunk-driven & Hardware-bounded)
+    # Optimizes issue #2271: Resolves single-SM serialization and wave quantization
+    # by dynamically scaling splits with sequence length and hardware compute units.
+    CHUNK_SIZE = 256
+    seq_driven_splits = tl.cdiv(max_seq_len, CHUNK_SIZE)
+    sm_wave_budget = tl.cdiv(device_core_count * 2, tl.maximum(token_grid, 1))
+
+    # Continuous scaling bounded by hardware SM capacity and max_kv_splits
+    dynamic_splits_target = tl.minimum(seq_driven_splits, sm_wave_budget)
+    dynamic_splits_target = tl.minimum(dynamic_splits_target, max_kv_splits)
+    dynamic_splits_target = tl.maximum(dynamic_splits_target, 1)
+
+    kv_chunk_size_2 = tl.cdiv(max_seq_len, dynamic_splits_target)
 
     num_kv_splits = tl.maximum(
         tl.cdiv(seq_lens, kv_chunk_size_1), tl.cdiv(seq_lens, kv_chunk_size_2)
     )
+    num_kv_splits = tl.minimum(num_kv_splits, max_kv_splits)
+    num_kv_splits = tl.maximum(num_kv_splits, 1)
 
     offs_token = offs_seq * num_group
     mask_token = offs_token < num_seq * num_group
