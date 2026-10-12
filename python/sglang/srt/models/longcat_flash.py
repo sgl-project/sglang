@@ -607,7 +607,7 @@ class LongcatFlashModel(nn.Module):
         for i in range(total_num_layers):
             if i in self.layers_to_capture:
                 aux_hidden_states.append(
-                    self.layers[i].attn_boundary.snapshot(hidden_states, forward_batch)
+                    residual_batch.snapshot(hidden_states, forward_batch)
                 )
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 layer = self.layers[i]

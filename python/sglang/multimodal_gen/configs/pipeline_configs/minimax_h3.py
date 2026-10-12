@@ -28,6 +28,9 @@ from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
 
 
 @dataclass
@@ -70,15 +73,8 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
     output_audio_channels: int | None = 2
     output_av_drift_tolerance_s: float | None = 0.25
 
-    def accepts_audio_input(self) -> bool:
-        return True
-
     def supports_disaggregation(self) -> bool:
         return False
-
-    @property
-    def requires_audio_output(self) -> bool:
-        return True
 
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
         return ModelDeploymentConfig(
@@ -162,6 +158,7 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
             "is_dit_layerwise_offload_selected": (
                 server_args.is_dit_layerwise_offload_selected
             ),
+            "lora_path": server_args.lora_path,
             "model_variant": model_variant,
             "num_gpus": server_args.num_gpus,
             "performance_mode": server_args.performance_mode,
@@ -172,6 +169,7 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
             "ring_degree": server_args.ring_degree,
             "sp_degree": server_args.sp_degree,
             "tp_size": server_args.tp_size,
+            "transformer_weights_path": server_args.transformer_weights_path,
             "ulysses_degree": server_args.ulysses_degree,
             "use_fsdp_inference": server_args.use_fsdp_inference,
         }
@@ -185,6 +183,7 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
             "enable_breakable_cuda_graph": False,
             "enable_torch_compile": False,
             "is_dit_layerwise_offload_selected": False,
+            "lora_path": None,
             "model_variant": "fl2va",
             "num_gpus": 4,
             "performance_mode": "speed",
@@ -195,6 +194,7 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
             "ring_degree": 1,
             "sp_degree": 4,
             "tp_size": 1,
+            "transformer_weights_path": None,
             "ulysses_degree": 4,
             "use_fsdp_inference": False,
         }
@@ -358,7 +358,42 @@ class FastH3PipelineConfig(MiniMaxH3PipelineConfig):
                 "--model-variant does not apply. FL2VA and Ref2VA tasks were "
                 "not distilled; use MiniMaxAI/MiniMax-H3 for those."
             )
+        self._default_to_trained_sparse_attention(server_args)
         super().validate_server_args(server_args)
+
+    def _default_to_trained_sparse_attention(self, server_args) -> None:
+        # The checkpoint was distilled with VSA-H3; dense attention skips its
+        # trained compression gate and runs slower.
+        if self.resolve_transformer_attention_backend(server_args) is not None:
+            return
+        if not current_platform.is_cuda():
+            return
+        from sglang.multimodal_gen.runtime.platforms.cuda import VSA_H3_CAPABILITIES
+
+        capability = current_platform.get_device_capability()
+        if (
+            capability is None
+            or (capability.major, capability.minor) not in VSA_H3_CAPABILITIES
+        ):
+            return
+        if (
+            server_args.enable_torch_compile
+            or server_args.enable_breakable_cuda_graph
+            or int(server_args.ring_degree or 1) > 1
+        ):
+            logger.info(
+                "FastH3 runs dense attention: VSA-H3 does not serve torch.compile, "
+                "the breakable CUDA graph or ring attention"
+            )
+            return
+        server_args.set_automatic_component_attention_backend(
+            "transformer", AttentionBackendEnum.VIDEO_SPARSE_ATTN_H3.name.lower()
+        )
+        logger.info(
+            "Automatically set video_sparse_attn_h3 for the FastH3 transformer, the "
+            "attention it was distilled with; --component-attention-backends "
+            "transformer=fa selects dense attention"
+        )
 
 
 __all__ = ["FastH3PipelineConfig", "MiniMaxH3PipelineConfig"]

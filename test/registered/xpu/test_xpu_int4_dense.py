@@ -5,7 +5,6 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_xpu
 from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -197,8 +196,8 @@ class TestXPUInt4DenseKernel(CustomTestCase):
         layer.g_idx = torch.nn.Parameter(g_idx, requires_grad=False)
 
         kernel = GPTQXPULinearKernel(_gptq_config(gs, desc_act, fmt))
-        with get_parallel().override(tp_size=tp_size):
-            kernel.process_weights_after_loading(layer)
+        layer.tp_group = SimpleNamespace(world_size=tp_size)
+        kernel.process_weights_after_loading(layer)
         out = kernel.apply(layer, x)
 
         self.assertEqual(tuple(out.shape), (m, n))
