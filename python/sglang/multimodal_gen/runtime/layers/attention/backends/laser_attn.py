@@ -1,4 +1,3 @@
-
 import sgl_kernel_npu  # noqa: F401
 import torch
 

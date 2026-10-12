@@ -24,7 +24,6 @@ _DIT_LAYER_PREFIX = re.compile(r"^blocks\.(\d+)\.")
 
 
 class RainFusionAttentionBackend(AttentionBackend):
-
     accept_output_buffer: bool = True
 
     @staticmethod
