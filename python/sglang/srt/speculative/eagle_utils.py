@@ -21,7 +21,7 @@ from sglang.srt.mem_cache.allocation_sizing import (
     get_alloc_reserve_per_decode,
     page_aligned_decode_alloc_lens,
 )
-from sglang.srt.runtime_context import get_spec
+from sglang.srt.runtime_context import get_exec, get_spec
 from sglang.srt.utils import (
     is_cpu,
     is_cuda,
@@ -30,7 +30,7 @@ from sglang.srt.utils import (
     is_npu,
     is_xpu,
 )
-from sglang.srt.utils.async_probe import maybe_detect_oob
+from sglang.srt.utils.async_probe import maybe_detect_nan, maybe_detect_oob
 
 if TYPE_CHECKING:
     from sglang.srt.constrained.base_grammar_backend import GrammarMask
@@ -50,6 +50,225 @@ _is_xpu = is_xpu()
 _is_cpu = is_cpu()
 
 logger = logging.getLogger(__name__)
+
+
+class SpecSamplingOpError(RuntimeError):
+    """A speculative verify sampling op failed (e.g. a flashinfer JIT build).
+
+    Raised in place of the raw error so the scheduler can abort only the
+    affected batch's requests instead of the whole server process
+    (sglang#43412).
+    """
+
+
+# Set once a flashinfer verify-renorm failure has been observed in this
+# process. flashinfer does not cache failed JIT builds, so without this flag
+# every subsequent non-greedy verify batch would re-run the failing compile
+# under the flashinfer filelock. Later batches either fail fast (default) or
+# degrade to the in-tree triton renorm (--speculative-sampling-renorm-fallback).
+_verify_sampling_ops_failed = False
+
+
+def mark_verify_sampling_ops_failed():
+    """Record that the flashinfer verify sampling ops failed in this process."""
+    global _verify_sampling_ops_failed
+    _verify_sampling_ops_failed = True
+
+
+def verify_sampling_ops_failed() -> bool:
+    return _verify_sampling_ops_failed
+
+
+def _triton_renorm_impls():
+    # Same names, same contract: dflash_utils.py aliases these too.
+    from sglang.kernels.ops.sampling.renorm_triton import (
+        top_k_renorm_probs_triton,
+        top_p_renorm_probs_triton,
+    )
+
+    return top_k_renorm_probs_triton, top_p_renorm_probs_triton
+
+
+def resolve_verify_renorm_impls():
+    """Pick the renorm kernels for the non-greedy verify path.
+
+    flashinfer is the default on CUDA, but a pytorch sampling backend or an
+    armed fallback (after a flashinfer JIT failure) routes to the in-tree
+    triton renorm kernels instead — the same kernels HIP already uses at this
+    exact call site, so the degraded path introduces no new numerics
+    (sglang#43412).
+    """
+    if _is_hip:
+        return _triton_renorm_impls()
+    if _is_cuda:
+        degrade = get_exec().kernel.sampling_backend == "pytorch" or (
+            _verify_sampling_ops_failed
+            and get_spec().speculative_sampling_renorm_fallback
+        )
+        if degrade:
+            return _triton_renorm_impls()
+        if _verify_sampling_ops_failed:
+            # Fail fast instead of re-running the failing JIT build on every
+            # request; the scheduler turns this into per-request aborts.
+            raise SpecSamplingOpError(
+                "The flashinfer verify sampling ops previously failed in "
+                "this process; aborting without retrying the compile. Set "
+                "--sampling-backend pytorch or "
+                "--speculative-sampling-renorm-fallback to serve non-greedy "
+                "speculative traffic without flashinfer."
+            )
+        from flashinfer.sampling import top_k_renorm_probs, top_p_renorm_probs
+
+        return top_k_renorm_probs, top_p_renorm_probs
+    # Other non-NPU devices keep the sgl_kernel kernels (NPU imports its own
+    # renorm in the caller).
+    from sgl_kernel import top_k_renorm_prob, top_p_renorm_prob
+
+    return top_k_renorm_prob, top_p_renorm_prob
+
+
+def _renorm_verify_probs(
+    target_probs,
+    sampling_info,
+    verify_input,
+    top_k_renorm_prob,
+    top_p_renorm_prob,
+):
+    """Apply top-k / top-p renorm to the verify target probs.
+
+    flashinfer JIT-compiles these ops on first use; a compile failure (e.g.
+    the bundled-cccl vs pip-toolkit header mismatch in sglang#43412) must
+    fail these requests, not the server. On failure the backend is marked
+    failed; with --speculative-sampling-renorm-fallback the renorm is retried
+    on the in-tree triton kernels, otherwise SpecSamplingOpError is raised
+    for the scheduler to convert into per-request aborts.
+    """
+    renorm_input = target_probs
+    try:
+        if sampling_info.need_top_k_sampling:
+            target_probs = top_k_renorm_prob(
+                target_probs,
+                torch.repeat_interleave(
+                    sampling_info.top_ks, verify_input.draft_token_num, dim=0
+                ),
+            )  # (bs * num_draft_tokens, vocab_size)
+            maybe_detect_nan(target_probs, "v2 verify: target_probs after top_k_renorm")
+        if sampling_info.need_top_p_sampling:
+            target_probs = top_p_renorm_prob(
+                target_probs,
+                torch.repeat_interleave(
+                    sampling_info.top_ps, verify_input.draft_token_num, dim=0
+                ),
+            )
+            maybe_detect_nan(target_probs, "v2 verify: target_probs after top_p_renorm")
+        return target_probs
+    except (RuntimeError, FileNotFoundError) as e:
+        global _verify_sampling_ops_failed
+        _verify_sampling_ops_failed = True
+        if get_spec().speculative_sampling_renorm_fallback:
+            logger.warning(
+                "flashinfer verify renorm failed; degrading to the in-tree "
+                "triton renorm for the rest of this process (%s)",
+                e,
+            )
+            top_k_renorm_prob, top_p_renorm_prob = _triton_renorm_impls()
+            target_probs = renorm_input
+            if sampling_info.need_top_k_sampling:
+                target_probs = top_k_renorm_prob(
+                    target_probs,
+                    torch.repeat_interleave(
+                        sampling_info.top_ks, verify_input.draft_token_num, dim=0
+                    ),
+                )
+                maybe_detect_nan(
+                    target_probs, "v2 verify: target_probs after top_k_renorm"
+                )
+            if sampling_info.need_top_p_sampling:
+                target_probs = top_p_renorm_prob(
+                    target_probs,
+                    torch.repeat_interleave(
+                        sampling_info.top_ps, verify_input.draft_token_num, dim=0
+                    ),
+                )
+                maybe_detect_nan(
+                    target_probs, "v2 verify: target_probs after top_p_renorm"
+                )
+            return target_probs
+        raise SpecSamplingOpError(
+            "The speculative verify sampling op failed to build or launch "
+            "(flashinfer JIT). Greedy and non-speculative requests are "
+            "unaffected. Set --sampling-backend pytorch or "
+            "--speculative-sampling-renorm-fallback to serve non-greedy "
+            f"speculative traffic without flashinfer. Original error: {e}",
+        ) from e
+
+
+def warm_verify_renorm_ops(device: str = "cuda") -> None:
+    """Warm the currently resolved verify renorm kernels with tiny dummies.
+
+    Both flashinfer (nvcc/ninja) and triton JIT-compile on first use; doing
+    it here at startup means the compile cost and any failure surface before
+    serving instead of on the first non-greedy request (sglang#43412).
+    Raises on failure so startup fails fast with the compiler log.
+    """
+    top_k_renorm_prob, top_p_renorm_prob = resolve_verify_renorm_impls()
+    probs = torch.full((1, 8), 1.0 / 8, dtype=torch.float32, device=device)
+    top_ks = torch.full((1, 1), 4, dtype=torch.int32, device=device)
+    top_ps = torch.full((1, 1), 0.9, dtype=torch.float32, device=device)
+    top_k_renorm_prob(probs, top_ks)
+    top_p_renorm_prob(probs, top_ps)
+    torch.cuda.synchronize()
+
+
+def preflight_verify_sampling_ops() -> None:
+    """Startup preflight for the speculative verify sampling path (#43412).
+
+    Clears a poisoned flashinfer JIT cache (a failed compile leaves
+    build.ninja + partial objects with no sampling.so, turning every restart
+    into the same crash), then warms the renorm kernels that will actually
+    serve. On a flashinfer failure: with --speculative-sampling-renorm-fallback
+    the process degrades to the triton renorm and keeps starting; otherwise
+    startup fails with the full compiler log.
+    """
+    if not _is_cuda:
+        # HIP already uses the triton renorm; NPU/other devices use sgl_kernel.
+        # Scoping the preflight to CUDA keeps this PR at the reported failure
+        # class (pip CUDA bundles with no prebuilt flashinfer coverage).
+        return
+
+    if get_exec().kernel.sampling_backend == "pytorch":
+        # The verify path degrades statically; warm the triton renorm only.
+        warm_verify_renorm_ops()
+        return
+
+    from sglang.srt.layers.flashinfer_jit_preflight import (
+        preflight_flashinfer_sampling_ops,
+    )
+
+    ok, detail = preflight_flashinfer_sampling_ops()
+    if ok:
+        return
+
+    if get_spec().speculative_sampling_renorm_fallback:
+        logger.warning(
+            "flashinfer sampling op preflight failed; degrading speculative "
+            "verify to the in-tree triton renorm (--speculative-sampling-"
+            "renorm-fallback). Detail: %s",
+            detail,
+        )
+        mark_verify_sampling_ops_failed()
+        warm_verify_renorm_ops()
+        return
+
+    raise RuntimeError(
+        "flashinfer sampling ops failed to build at startup. The server "
+        "refuses to start so the failure surfaces here with the compiler "
+        "log instead of killing the process on the first non-greedy "
+        "speculative request. Fix the toolchain (see #43591), or start with "
+        "--sampling-backend pytorch / --speculative-sampling-renorm-fallback "
+        f"to serve without flashinfer sampling. Detail: {detail}"
+    )
+
 
 if _is_cuda or _is_hip:
     from sglang.kernels.ops.speculative.tree import (
@@ -912,19 +1131,11 @@ def eagle_sample(
 
             sampling_fn = tree_speculative_sampling_target_only
 
-        if _is_hip:
-            # Same names, same contract: dflash_utils.py aliases these too.
-            from sglang.kernels.ops.sampling.renorm_triton import (
-                top_k_renorm_probs_triton as top_k_renorm_prob,
-            )
-            from sglang.kernels.ops.sampling.renorm_triton import (
-                top_p_renorm_probs_triton as top_p_renorm_prob,
-            )
-        elif _is_cuda:
-            from flashinfer.sampling import top_k_renorm_probs as top_k_renorm_prob
-            from flashinfer.sampling import top_p_renorm_probs as top_p_renorm_prob
-        elif not _is_npu:
-            from sgl_kernel import top_k_renorm_prob, top_p_renorm_prob
+        if not _is_npu:
+            # Resolved per call: on CUDA this consults the sampling backend
+            # and the fallback state instead of hardwiring flashinfer, so a
+            # JIT failure fails requests rather than the server (#43412).
+            top_k_renorm_prob, top_p_renorm_prob = resolve_verify_renorm_impls()
 
         expanded_temperature = torch.repeat_interleave(
             sampling_info.temperatures, verify_input.draft_token_num, dim=0
@@ -934,22 +1145,13 @@ def eagle_sample(
             next_token_logits, temperatures=expanded_temperature
         )  # (bs * num_draft_tokens, vocab_size)
         maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
-        if sampling_info.need_top_k_sampling:
-            target_probs = top_k_renorm_prob(
-                target_probs,
-                torch.repeat_interleave(
-                    sampling_info.top_ks, verify_input.draft_token_num, dim=0
-                ),
-            )  # (bs * num_draft_tokens, vocab_size)
-            maybe_detect_nan(target_probs, "v2 verify: target_probs after top_k_renorm")
-        if sampling_info.need_top_p_sampling:
-            target_probs = top_p_renorm_prob(
-                target_probs,
-                torch.repeat_interleave(
-                    sampling_info.top_ps, verify_input.draft_token_num, dim=0
-                ),
-            )
-            maybe_detect_nan(target_probs, "v2 verify: target_probs after top_p_renorm")
+        target_probs = _renorm_verify_probs(
+            target_probs,
+            sampling_info,
+            verify_input,
+            top_k_renorm_prob,
+            top_p_renorm_prob,
+        )
         target_probs = target_probs.reshape(bs, verify_input.draft_token_num, -1)
         draft_probs = (
             verify_input.draft_probs
