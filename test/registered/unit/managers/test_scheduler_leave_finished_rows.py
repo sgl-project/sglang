@@ -6,7 +6,7 @@ from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock, Mock
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from sglang.test.test_utils import maybe_stub_sgl_kernel, published_topology
 
 maybe_stub_sgl_kernel()
 
@@ -46,6 +46,10 @@ class _Batch:
 
     def merge_batch(self, other):
         self.reqs = self.reqs + other.reqs
+
+
+class _StopLoop(Exception):
+    pass
 
 
 def _rids(batch):
@@ -165,6 +169,27 @@ class TestLeaveBeforeDecodePrealloc(unittest.TestCase):
         ):
             with self.subTest(event_loop=event_loop.__name__):
                 self.assertEqual(self._run_one_step(event_loop), [["a", "c"]])
+
+    def test_pp_prebuilt_join_sees_only_live_rows(self):
+        # The PP loop runs up to the plan of its first slot; the mocked
+        # init_pp_loop_state leaves the slot state set here.
+        s = MagicMock()
+        s.leave_finished_rows = MethodType(Scheduler.leave_finished_rows, s)
+        s.pp_loop_size = 1
+        s.running_mbs = [_Batch([_Req("a"), _Req("b", True), _Req("c")])]
+        s.last_mbs = [None]
+        seen = []
+
+        def get_next_disagg_decode_batch_to_run(running_batch):
+            seen.append(_rids(running_batch))
+            raise _StopLoop
+
+        s.get_next_disagg_decode_batch_to_run.side_effect = (
+            get_next_disagg_decode_batch_to_run
+        )
+        with published_topology(role="scheduler"), self.assertRaises(_StopLoop):
+            Scheduler.event_loop_pp_disagg_decode(s)
+        self.assertEqual(seen, [["a", "c"]])
 
 
 if __name__ == "__main__":
