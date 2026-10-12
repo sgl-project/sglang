@@ -7,12 +7,14 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 
 import unittest
+from array import array
 from collections import defaultdict
 from unittest import mock
 
 import torch
 from test_unified_radix_cache_unittest import CacheConfig, UnifiedRadixCacheSuite
 
+from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.cache_action import EvictExcessPathStates
 from sglang.srt.mem_cache.unified_cache.components.base import (
     ComponentType,
@@ -78,6 +80,7 @@ def _build_unified_chain(cap, length=3):
     for index in range(length):
         node = UnifiedTreeNode(core.tree_components)
         node.parent = parent
+        node.key = RadixKey(array("q", [index]))
         node.component_data[ComponentType.FULL].value = torch.tensor([100 + index])
         node.component_data[ComponentType.MAMBA].value = torch.tensor([index])
         parent.children[index] = node

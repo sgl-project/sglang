@@ -90,7 +90,6 @@ class SWAComponent(TreeComponent):
         ) // params.page_size
         # HiCache state: set to host SWA pool when HiCache enabled
         self._swa_kv_pool_host = None
-        # Shares the Mamba per-path cap: both are checkpoint-only state.
         self.swa_max_states_per_path = get_schedule().swa_max_states_per_path
 
     component_type = ComponentType.SWA
@@ -572,7 +571,11 @@ class SWAComponent(TreeComponent):
         host_frees: dict[ComponentType, list[torch.Tensor]],
     ) -> None:
         self._evict_path_states_beyond_cap(
-            tail, self.swa_max_states_per_path, device_frees, host_frees
+            tail,
+            self.swa_max_states_per_path,
+            device_frees,
+            host_frees,
+            protected_tail_tokens=self.sliding_window_size,
         )
 
     def _maybe_split_leaf_for_swa_lock(

@@ -209,6 +209,7 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
                 MAMBA,
                 tail_node_id,
                 cap,
+                0,
                 device_frees,
                 host_frees,
             );

@@ -460,6 +460,7 @@ def build_fixture(
     tree_page_size: Optional[int] = None,
     mamba_cache_chunk_size: Optional[int] = None,
     tree_core_backend: Optional[str] = None,
+    swa_max_states_per_path: int = -1,
 ):
     """Create (tree, allocator, req_to_token_pool) from a CacheConfig.
 
@@ -472,6 +473,7 @@ def build_fixture(
         model_path="dummy",
         page_size=cfg.page_size,
         enable_int8_mamba_checkpoint=cfg.enable_int8_mamba_checkpoint,
+        swa_max_states_per_path=swa_max_states_per_path,
     )
     # The mamba component reads mamba_cache_chunk_size, whose property otherwise
     # loads the HF config for self.model_path — impossible for the dummy model.

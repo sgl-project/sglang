@@ -2823,18 +2823,21 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     }
 
     /// Evict shallow device values of `component_type` beyond `cap` on the tail's
-    /// root path. Full KV, host backups, the tail, forks, locked nodes and device
+    /// root path. Full KV, host backups, the tail, nodes ending within
+    /// `protected_tail_tokens` of the tail's end, forks, locked nodes and device
     /// leaves are preserved, so the cap is a best-effort soft limit.
     pub(crate) fn evict_path_states_beyond_cap_(
         &mut self,
         component_type: ComponentType,
         tail_node_id: NodeIdx_,
         cap: usize,
+        protected_tail_tokens: usize,
         device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
     ) {
-        // Value holders on the root path, tail-first.
-        let mut holders: Vec<NodeIdx_> = Vec::new();
+        // Value holders on the root path with the tokens below them, tail-first.
+        let mut holders: Vec<(NodeIdx_, usize)> = Vec::new();
+        let mut tokens_below = 0;
         let mut cursor = Some(tail_node_id);
         while let Some(node_id) = cursor {
             let node = self.arena.node(node_id);
@@ -2842,8 +2845,9 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 break;
             }
             if node.has_device_value(component_type) {
-                holders.push(node_id);
+                holders.push((node_id, tokens_below));
             }
+            tokens_below += node.key.atom_len();
             cursor = node.parent;
         }
         let mut excess = holders.len().saturating_sub(cap);
@@ -2852,8 +2856,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         }
         // Cache-level apply: the counts are not reported, only the frees.
         let mut tracker: HashMap<ComponentType, usize> = HashMap::new();
-        for &node_id in holders.iter().rev() {
-            if excess == 0 || node_id == tail_node_id {
+        for &(node_id, tokens_below) in holders.iter().rev() {
+            if excess == 0 || node_id == tail_node_id || tokens_below < protected_tail_tokens {
                 break;
             }
             let node = self.arena.node(node_id);

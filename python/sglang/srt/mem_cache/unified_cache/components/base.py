@@ -322,10 +322,12 @@ class TreeComponent(ABC):
         cap: int,
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
+        protected_tail_tokens: int = 0,
     ) -> None:
         """Evict shallow eligible device values beyond ``cap`` on tail's root path.
 
-        Full KV and any existing host backup are retained. The tail, forks,
+        Full KV and any existing host backup are retained. The tail, nodes
+        ending within ``protected_tail_tokens`` of the tail's end, forks,
         locked nodes (including a pending backup chain's write-through locks),
         and device leaves are preserved, so the cap is a best-effort soft
         limit. Freed slots are collected into the caller's dicts.
@@ -335,10 +337,12 @@ class TreeComponent(ABC):
 
         ct = self.component_type
         holders = []
+        tokens_below = 0
         node = tail
         while node is not None and node is not self.tree_core.root_node:
             if node.component_data[ct].value is not None:
-                holders.append(node)
+                holders.append((node, tokens_below))
+            tokens_below += len(node.key)
             node = node.parent
 
         excess = len(holders) - cap
@@ -346,8 +350,8 @@ class TreeComponent(ABC):
             return
 
         tracker = {component: 0 for component in self.cache.tree_components}
-        for node in reversed(holders):
-            if excess <= 0 or node is tail:
+        for node, tokens_below in reversed(holders):
+            if excess <= 0 or node is tail or tokens_below < protected_tail_tokens:
                 break
             if node.component_data[ct].lock_ref > 0 or len(node.children) != 1:
                 continue

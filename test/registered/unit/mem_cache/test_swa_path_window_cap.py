@@ -2,17 +2,28 @@
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 import unittest
+from array import array
 from collections import defaultdict
 
 import torch
+from test_unified_radix_cache_unittest import (
+    CacheConfig,
+    UnifiedRadixCacheSuite,
+    build_fixture,
+)
 
+from sglang.srt.arg_groups.kv_cache_hook import handle_cache_compatibility
+from sglang.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixParams
+from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components.base import ComponentType
 from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedLRUList, UnifiedTreeNode
+from sglang.srt.server_args import ServerArgs
+from sglang.test.test_utils import CustomTestCase
 
 
 class _FakeTreeCore:
@@ -55,12 +66,14 @@ def _build_chain(cap, length=3):
     component.cache = _FakeUnifiedCache()
     component.tree_core = core
     component.swa_max_states_per_path = cap
+    component.sliding_window_size = 1
 
     nodes = []
     parent = core.root_node
     for index in range(length):
         node = UnifiedTreeNode(core.tree_components)
         node.parent = parent
+        node.key = RadixKey(array("q", [index]))
         node.component_data[ComponentType.FULL].value = torch.tensor([100 + index])
         node.component_data[ComponentType.SWA].value = torch.tensor([index])
         parent.children[index] = node
@@ -78,6 +91,17 @@ def _trim(component, tail):
 
 
 class TestSWAPathWindowCap(unittest.TestCase):
+    def test_server_arg_rejects_zero_and_values_below_negative_one(self):
+        for value in (0, -2):
+            args = ServerArgs(model_path="dummy", swa_max_states_per_path=value)
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(
+                    ValueError, "must be -1 \\(unlimited\\) or a positive integer"
+                ),
+            ):
+                handle_cache_compatibility(args)
+
     def test_removes_shallow_windows_but_keeps_full_kv(self):
         component, nodes, core = _build_chain(cap=1)
 
@@ -98,20 +122,67 @@ class TestSWAPathWindowCap(unittest.TestCase):
         )
         self.assertEqual(core.component_evictable_size_[ComponentType.SWA], 1)
 
-    def test_cap_is_soft_for_fork_and_locked_nodes(self):
-        component, nodes, core = _build_chain(cap=1, length=4)
-        nodes[0].children["fork"] = UnifiedTreeNode(core.tree_components)
-        nodes[1].component_data[ComponentType.SWA].lock_ref = 1
 
-        _trim(component, nodes[-1])
+class _SWAPathCapFixtureBase:
+    cfg = CacheConfig(
+        components=(ComponentType.FULL, ComponentType.SWA), sliding_window_size=4
+    )
+    tree_core_backend: str
+    _rid = 0
+    _alloc = UnifiedRadixCacheSuite._alloc
 
-        self.assertEqual(core.evicted, [nodes[2]])
+    def _build(self, cap):
+        return build_fixture(
+            self.cfg,
+            tree_core_backend=self.tree_core_backend,
+            swa_max_states_per_path=cap,
+        )
 
-    def test_negative_one_disables_cap(self):
-        component, nodes, core = _build_chain(cap=-1)
+    def _insert(self, cache, allocator, tokens, swa_evicted_seqlen):
+        value = self._alloc(allocator, len(tokens))
+        cache.insert(
+            InsertParams(
+                key=RadixKey(array("q", tokens)),
+                value=value[: len(tokens)],
+                component_evicted_seqlens={ComponentType.SWA: swa_evicted_seqlen},
+            )
+        )
 
-        self.assertEqual(dict(_trim(component, nodes[-1])), {})
-        self.assertEqual(core.evicted, [])
+    def _match_len(self, cache, tokens):
+        match = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
+        return len(match.device_indices), match.full_kv_hit_length
+
+    def test_trims_shallow_window_but_keeps_full_kv_and_tail_match(self):
+        cache, allocator, _ = self._build(cap=1)
+        tokens = list(range(16))
+
+        self._insert(cache, allocator, tokens[:8], swa_evicted_seqlen=4)
+        self._insert(cache, allocator, tokens, swa_evicted_seqlen=12)
+
+        # The first chunk's window is a tombstone; its full KV stays.
+        self.assertEqual(self._match_len(cache, tokens[:8]), (0, 8))
+        self.assertEqual(self._match_len(cache, tokens), (16, 16))
+        cache.sanity_check()
+
+    def test_keeps_parent_window_completing_a_short_tail(self):
+        """A tail shorter than the window keeps the parent window it needs,
+        even when no request locks that parent."""
+        cache, allocator, _ = self._build(cap=1)
+        tokens = list(range(14))
+
+        self._insert(cache, allocator, tokens[:12], swa_evicted_seqlen=8)
+        self._insert(cache, allocator, tokens, swa_evicted_seqlen=10)
+
+        self.assertEqual(self._match_len(cache, tokens), (14, 14))
+        cache.sanity_check()
+
+
+class TestSWAPathCapPythonTreeCore(_SWAPathCapFixtureBase, CustomTestCase):
+    tree_core_backend = "python"
+
+
+class TestSWAPathCapRustTreeCore(_SWAPathCapFixtureBase, CustomTestCase):
+    tree_core_backend = "rust"
 
 
 if __name__ == "__main__":

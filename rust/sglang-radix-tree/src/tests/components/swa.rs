@@ -6391,12 +6391,12 @@ fn insert_reports_whether_it_reached_the_branch_boundary() {
     }
 }
 
-fn swa_core_with_cap(cap: usize) -> UnifiedTreeCore<Vec<i64>> {
+fn swa_core_with_cap(cap: usize, window: usize) -> UnifiedTreeCore<Vec<i64>> {
     UnifiedTreeCore::new(
         CacheInitParams {
             page_size: 1,
             swa_max_states_per_path: Some(cap),
-            ..swa_params_with_window(1)
+            ..swa_params_with_window(window)
         },
         vec![FULL, SWA],
     )
@@ -6413,7 +6413,7 @@ fn set_full_and_swa_device(tc: &mut UnifiedTreeCore<Vec<i64>>, node: NodeIdx_, s
 
 #[test]
 fn evict_excess_path_states_removes_the_shallowest_windows_beyond_the_cap() {
-    let mut tc = swa_core_with_cap(1);
+    let mut tc = swa_core_with_cap(/* cap = */ 1, /* window = */ 1);
     let [a, b, c] = chain::<3>(&mut tc);
     for (node, slot) in [(a, 7), (b, 8), (c, 9)] {
         set_full_and_swa_device(&mut tc, node, slot);
@@ -6434,7 +6434,7 @@ fn evict_excess_path_states_removes_the_shallowest_windows_beyond_the_cap() {
 
 #[test]
 fn evict_excess_path_states_preserves_forks_locked_nodes_and_the_tail() {
-    let mut tc = swa_core_with_cap(1);
+    let mut tc = swa_core_with_cap(/* cap = */ 1, /* window = */ 1);
     let [a, b, c] = chain::<3>(&mut tc);
     for (node, slot) in [(a, 7), (b, 8), (c, 9)] {
         set_full_and_swa_device(&mut tc, node, slot);
@@ -6457,6 +6457,21 @@ fn evict_excess_path_states_preserves_forks_locked_nodes_and_the_tail() {
     for node in [a, b, c] {
         assert!(tc.arena.node(node).try_device_value(SWA).is_some());
     }
+}
+
+#[test]
+fn evict_excess_path_states_keeps_the_tails_window_across_ancestors() {
+    let mut tc = swa_core_with_cap(/* cap = */ 1, /* window = */ 2);
+    let [a, b, c] = chain::<3>(&mut tc);
+    for (node, slot) in [(a, 7), (b, 8), (c, 9)] {
+        set_full_and_swa_device(&mut tc, node, slot);
+    }
+    tc.evict_excess_path_states(tc.arena.node(c).id, SWA)
+        .expect("live test node");
+    assert!(tc.arena.node(a).try_device_value(SWA).is_none());
+    // The tail's one-token node needs its parent to complete a two-token window.
+    assert!(tc.arena.node(b).try_device_value(SWA).is_some());
+    assert!(tc.arena.node(c).try_device_value(SWA).is_some());
 }
 
 #[test]

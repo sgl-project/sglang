@@ -672,6 +672,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
                 SWA,
                 tail_node_id,
                 cap,
+                self.sliding_window_size,
                 device_frees,
                 host_frees,
             );
