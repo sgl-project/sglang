@@ -15,6 +15,10 @@ Usage:
   python analyze_kstateloc.py /tmp/run.log
   # miss vs hit: two logs, aligned block-by-block
   python analyze_kstateloc.py /tmp/miss.log --log2 /tmp/hit.log
+  # A/B from ONE log: is the miss!=hit root the COMPRESSOR (A) or the
+  # c4-indexer tie-break (B)?  Compares [IDXIN].klog vs [CMPIDX].md5 per layer.
+  python analyze_kstateloc.py /tmp/run.log --ab              # default layer 2
+  python analyze_kstateloc.py /tmp/run.log --ab --layers all  # every layer
   python analyze_kstateloc.py --selftest
 """
 import argparse
@@ -245,6 +249,99 @@ def _show_xdiff(xdiff, tag=""):
         print(f"   layer={layer}: {'IDENTICAL' if len(uniq) == 1 else 'DIFFERS(' + str(len(uniq)) + ')'} md5={uniq[0]}")
 
 
+# --- A/B: is the miss!=hit divergence the COMPRESSOR (A) or the c4-INDEXER (B)? ---
+# [IDXIN]  layer=<id> ... klog=<md5-of-index-K-op-input> ...   (the c4-indexer
+#          index-K op INPUT / "klog", i.e. the COMPRESSOR's output as the
+#          indexer consumes it).
+# [CMPIDX] layer=<id> ... md5=<top-k md5> tail=[...] blkx=[...]  (the c4-indexer
+#          top-k / discrete argmax handed to the sparse attention).
+# A single log carries both the MISS and HIT forwards, so per layer:
+#   klog>1 distinct  => the compressor output differs (A)
+#   klog==1, topk>1  => the compressor is identical, the indexer tie-break differs (B)
+TAG_AB = re.compile(r"\[(IDXIN|CMPIDX)\]")
+KV = re.compile(r"(\w+)=(\[[^\]]*\]|\([^)]*\)|\S+)")
+
+
+def parse_ab(path):
+    """Return {layer: {'klog': [vals...], 'topk': [md5...]}} from [IDXIN]/[CMPIDX].
+
+    klog = the [IDXIN] ``klog=`` field (index-K op input, the compressor output).
+    topk = the [CMPIDX] ``md5=`` field (c4-indexer top-k). Rows without a numeric
+    layer (e.g. ``[TAG] skipped: ...``) are ignored."""
+    data = collections.defaultdict(lambda: {"klog": [], "topk": []})
+    with open(path, "r", errors="ignore") as fh:
+        for ln in fh:
+            m = TAG_AB.search(ln)
+            if not m:
+                continue
+            d = dict(KV.findall(ln))
+            layer = d.get("layer")
+            if layer is None or not layer.lstrip("-").isdigit():
+                continue
+            layer = int(layer)
+            if m.group(1) == "IDXIN":
+                kl = d.get("klog")
+                if kl is not None:
+                    data[layer]["klog"].append(kl)
+            else:  # CMPIDX
+                tk = d.get("md5")
+                if tk is not None:
+                    data[layer]["topk"].append(tk)
+    return data
+
+
+def _uniq(vals):
+    """Ordered distinct values (dedup, first-seen order preserved)."""
+    return list(collections.OrderedDict.fromkeys(vals))
+
+
+def _select_layers(data, layers):
+    """``all`` => every layer present; else a comma-separated int list."""
+    if layers == "all":
+        return sorted(data)
+    sel = []
+    for part in str(layers).split(","):
+        part = part.strip()
+        if part.lstrip("-").isdigit():
+            sel.append(int(part))
+    return sel
+
+
+def _ab_verdict(nklog, ntopk):
+    if nklog == 0 and ntopk == 0:
+        return "no probe lines for this layer"
+    if nklog > 1 and ntopk > 1:
+        return "inconclusive (both differ)"
+    if nklog > 1:
+        return "(A) compressor"
+    if ntopk > 1:
+        return "(B) indexer"
+    return "same (no divergence captured in this window)"
+
+
+def ab(path, layers="2"):
+    """Judge (A) compressor vs (B) indexer tie-break from a single log."""
+    data = parse_ab(path)
+    sel = _select_layers(data, layers)
+    print(f"{path}: --ab mode  layers={layers}")
+    if not sel:
+        print("  (no layers selected)")
+    for layer in sel:
+        d = data.get(layer, {"klog": [], "topk": []})
+        kl = _uniq(d["klog"])
+        tk = _uniq(d["topk"])
+        print(f"\n-- layer {layer}")
+        print(
+            f"   klog: {len(kl)} distinct variant(s)"
+            + (f" md5={kl}" if kl else " (no data)")
+        )
+        print(
+            f"   topk: {len(tk)} distinct variant(s)"
+            + (f" md5={tk}" if tk else " (no data)")
+        )
+        print(f"   VERDICT: {_ab_verdict(len(kl), len(tk))}")
+
+
 def selftest():
     miss = "\n".join([
         "[KSTATELOC] op=R 0 17534 8 1110 138 6",
@@ -263,11 +360,70 @@ def selftest():
     f1.write(miss); f1.close()
     f2 = tempfile.NamedTemporaryFile("w", suffix=".log", delete=False)
     f2.write(hit); f2.close()
+    # Synthetic A/B log: one line per (layer, miss/hit) so each verdict fires.
+    ab_log = "\n".join([
+        # layer 2: klog identical, topk differs  -> (B) indexer
+        "[IDXIN] layer=2 mode=ForwardMode.PREFILL qblk=[] wblk=[] slq=(0,17523,17523) "
+        "slk=(0,17523,17523) klog=aaaaaaaaaaaaaaaa kraw=1 meta=2 bt=3 qshape=(1,1) "
+        "wshape=(1,1) kshape=(1,1)",
+        "[IDXIN] layer=2 mode=ForwardMode.PREFILL qblk=[] wblk=[] slq=(0,1139,1139) "
+        "slk=(0,1139,1139) klog=aaaaaaaaaaaaaaaa kraw=4 meta=5 bt=6 qshape=(1,1) "
+        "wshape=(1,1) kshape=(1,1)",
+        "[CMPIDX] layer=2 mode=ForwardMode.PREFILL ntok=17523 lastpos=17522 "
+        "md5=bbbbbbbbbbbbbbbb tail=[1, 2] blkx=[134:dead]",
+        "[CMPIDX] layer=2 mode=ForwardMode.PREFILL ntok=1139 lastpos=1138 "
+        "md5=cccccccccccccccc tail=[3, 4] blkx=[8:beef]",
+        # layer 3: klog differs, topk identical  -> (A) compressor
+        "[IDXIN] layer=3 mode=ForwardMode.PREFILL qblk=[] wblk=[] slq=(0,1,1) "
+        "slk=(0,1,1) klog=1111111111111111 kraw=1 meta=2 bt=3 qshape=(1,1) "
+        "wshape=(1,1) kshape=(1,1)",
+        "[IDXIN] layer=3 mode=ForwardMode.PREFILL qblk=[] wblk=[] slq=(0,1,1) "
+        "slk=(0,1,1) klog=2222222222222222 kraw=1 meta=2 bt=3 qshape=(1,1) "
+        "wshape=(1,1) kshape=(1,1)",
+        "[CMPIDX] layer=3 mode=ForwardMode.PREFILL ntok=1 lastpos=1 "
+        "md5=dddddddddddddddd tail=[1] blkx=[0:aa]",
+        "[CMPIDX] layer=3 mode=ForwardMode.PREFILL ntok=1 lastpos=1 "
+        "md5=dddddddddddddddd tail=[1] blkx=[0:aa]",
+        # layer 4: klog and topk both identical  -> same
+        "[IDXIN] layer=4 mode=ForwardMode.DECODE qblk=[] wblk=[] slq=(0,1,1) "
+        "slk=(0,1,1) klog=3333333333333333 kraw=1 meta=2 bt=3 qshape=(1,1) "
+        "wshape=(1,1) kshape=(1,1)",
+        "[CMPIDX] layer=4 mode=ForwardMode.DECODE ntok=1 lastpos=5 "
+        "md5=eeeeeeeeeeeeeeee tail=[1] blkx=[0:aa]",
+        # layer 5: klog and topk both differ  -> inconclusive
+        "[IDXIN] layer=5 mode=ForwardMode.PREFILL qblk=[] wblk=[] slq=(0,1,1) "
+        "slk=(0,1,1) klog=4444444444444444 kraw=1 meta=2 bt=3 qshape=(1,1) "
+        "wshape=(1,1) kshape=(1,1)",
+        "[IDXIN] layer=5 mode=ForwardMode.PREFILL qblk=[] wblk=[] slq=(0,1,1) "
+        "slk=(0,1,1) klog=5555555555555555 kraw=1 meta=2 bt=3 qshape=(1,1) "
+        "wshape=(1,1) kshape=(1,1)",
+        "[CMPIDX] layer=5 mode=ForwardMode.PREFILL ntok=1 lastpos=1 "
+        "md5=6666666666666666 tail=[1] blkx=[0:aa]",
+        "[CMPIDX] layer=5 mode=ForwardMode.PREFILL ntok=1 lastpos=1 "
+        "md5=7777777777777777 tail=[1] blkx=[0:bb]",
+    ])
+    f3 = tempfile.NamedTemporaryFile("w", suffix=".log", delete=False)
+    f3.write(ab_log); f3.close()
     print("--- single ---")
     single(f1.name, 17520, 17540)
     print("\n--- diff2 ---")
     diff2(f1.name, f2.name, 17520, 17540)
-    os.unlink(f1.name); os.unlink(f2.name)
+    print("\n--- ab (default layer 2) ---")
+    ab(f1.name, "2")
+    print("\n--- ab (all layers) ---")
+    ab(f3.name, "all")
+    data = parse_ab(f3.name)
+    expected = {
+        2: "(B) indexer",
+        3: "(A) compressor",
+        4: "same (no divergence captured in this window)",
+        5: "inconclusive (both differ)",
+    }
+    for ly, want in sorted(expected.items()):
+        got = _ab_verdict(len(_uniq(data[ly]["klog"])), len(_uniq(data[ly]["topk"])))
+        assert got == want, f"ab layer {ly}: got {got!r}, want {want!r}"
+    print("ab verdicts: OK")
+    os.unlink(f1.name); os.unlink(f2.name); os.unlink(f3.name)
     print("\nSELFTEST OK")
 
 
@@ -282,13 +438,19 @@ def main():
     ap.add_argument("--phases", action="store_true")
     ap.add_argument("--tagged", action="store_true")
     ap.add_argument("--bycol", action="store_true")
+    ap.add_argument("--ab", action="store_true",
+                    help="judge (A) compressor vs (B) indexer from one log")
+    ap.add_argument("--layers", default="2",
+                    help="--ab layer(s): N, N,M, or 'all' (default 2)")
     a = ap.parse_args()
     if a.selftest:
         selftest()
         return
     if not a.log:
         ap.error("log path required (or --selftest)")
-    if a.bycol:
+    if a.ab:
+        ab(a.log, a.layers)
+    elif a.bycol:
         bycol(a.log, a.lo, a.hi)
     elif a.tagged:
         tagged(a.log, a.lo, a.hi)
