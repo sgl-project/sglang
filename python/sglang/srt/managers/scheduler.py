@@ -3841,6 +3841,30 @@ class Scheduler(
             if running_batch.is_empty():
                 running_batch.batch_is_full = False
 
+        new_batch, running_batch = self._admit_prefill(running_batch)
+        new_batch, need_mlp_sync = self._gather_admitted(new_batch)
+
+        if new_batch is not None:
+            # Run prefill first if possible
+            ret = new_batch
+        else:
+            ret = self._select_decode(running_batch)
+
+        # Handle DP attention and log stats
+        ret = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(
+            ret, need_sync=need_mlp_sync
+        )
+        ret = self._finalize_step(ret)
+
+        plan = NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
+        if self.scripted_scheduler_hook is not None:
+            self.scripted_scheduler_hook.on_schedule(plan)
+        return plan
+
+    def _admit_prefill(
+        self, running_batch: ScheduleBatch
+    ) -> Tuple[Optional[ScheduleBatch], ScheduleBatch]:
+        """Admit this step's prefill batch; a mixed step also takes the decode rows."""
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm(running_batch)
         elif self._should_defer_prefill():
@@ -3849,7 +3873,19 @@ class Scheduler(
             prefill_plan = self.get_new_batch_prefill(running_batch)
             new_batch = prefill_plan.batch_to_run
             running_batch = prefill_plan.running_batch
+        return new_batch, running_batch
 
+    def _gather_admitted(
+        self, new_batch: Optional[ScheduleBatch]
+    ) -> Tuple[Optional[ScheduleBatch], bool]:
+        """Gather the admitted batch across DP ranks first when spec decoding
+        keeps prefill and decode steps apart.
+
+        Returns the batch and whether the step still needs its gather. When this
+        gather runs and any rank admitted a batch, every rank gets one (its own
+        or IDLE) and selects no decode this step; only when no rank admitted one
+        does the step go on to decode selection and its gather.
+        """
         need_mlp_sync = self.require_mlp_sync
         if (
             need_mlp_sync
@@ -3863,26 +3899,24 @@ class Scheduler(
             # 2. All new batches are some (prefill / idle) -> we do not need prepare mlp sync one more time.
             new_batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(new_batch)
             need_mlp_sync = new_batch is None
+        return new_batch, need_mlp_sync
 
-        if new_batch is not None:
-            # Run prefill first if possible
-            ret = new_batch
+    def _select_decode(self, running_batch: ScheduleBatch) -> Optional[ScheduleBatch]:
+        """Select the running batch's rows that decode this step; None skips decode."""
+        # Run decode (skip for prefill-only batches)
+        if not running_batch.is_empty() and not running_batch.is_prefill_only:
+            decode_batch = self.update_running_batch(running_batch)
+            ret = (
+                decode_batch
+                if decode_batch is not None and not decode_batch.is_empty()
+                else None
+            )
         else:
-            # Run decode (skip for prefill-only batches)
-            if not running_batch.is_empty() and not running_batch.is_prefill_only:
-                decode_batch = self.update_running_batch(running_batch)
-                ret = (
-                    decode_batch
-                    if decode_batch is not None and not decode_batch.is_empty()
-                    else None
-                )
-            else:
-                ret = None
+            ret = None
+        return ret
 
-        # Handle DP attention and log stats
-        ret = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(
-            ret, need_sync=need_mlp_sync
-        )
+    def _finalize_step(self, ret: Optional[ScheduleBatch]) -> Optional[ScheduleBatch]:
+        """Prepare the gathered batch to run: DP extend view, ngram inputs, timing."""
         # Decode->extend conversion keeps a heterogeneous dp step replayable.
         # A converted running batch stays the running batch; next step it comes
         # back as last_batch and is filtered in place, not merged with itself.
@@ -3898,11 +3932,7 @@ class Scheduler(
             set_schedule_time_batch(ret)
             if self.enable_fpm:
                 ret.fpm_start_time = self._fpm_batch_t0
-
-        plan = NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
-        if self.scripted_scheduler_hook is not None:
-            self.scripted_scheduler_hook.on_schedule(plan)
-        return plan
+        return ret
 
     def get_num_allocatable_reqs(
         self,
