@@ -86,7 +86,7 @@ Reference workflow files are provided in the `workflows/` directory:
 - **`z-image_sgld.json`**: High-speed image generation using Z-Image.
 - **`sgld_text2img.json`**: Server-mode text-to-image generation with LoRA support.
 - **`sgld_image2video.json`**: Server-mode image-to-video generation.
-- **`qwen_image21_t2i_sgld.json`** / **`qwen_image21_edit_sgld.json`**: Qwen-Image-2.1 text-to-image and reference edit (official templates without the prompt-enhancer branch).
+- **`qwen_image21_t2i_sgld.json`**: Qwen-Image-2.1 text-to-image. For reference edit, use the official template with `SGLDUNETLoader`.
 - **`minimax_h3_t2v_sgld.json`**: MiniMax-H3 T2V / I2VA / FL2VA (`fl2va` DiT).
 - **`minimax_h3_r2v_sgld.json`**: MiniMax-H3 reference-to-video (`ref2va` DiT).
 - **`minimax_h3_t2v_sgld_upscaler.json`**: H3 two-pass latent upscale (low-res then 3D ×2 refine).

@@ -460,12 +460,11 @@ class SGLDiffusionGenerator:
             model_type = set_model_type
 
         pipeline_class_name = self.pipeline_class_dict[model_type]
-        executor_class = self.executor_class_dict[model_type]
-        executor_class.validate_sgld_options(sgld_options)
         self.generator = self.init_generator(
             detect_path, pipeline_class_name, sgld_options
         )
 
+        executor_class = self.executor_class_dict[model_type]
         self.executor = executor_class(
             self.generator, detect_path, comfyui_model, model_config
         )

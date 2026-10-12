@@ -179,16 +179,11 @@ class SGLDiffusionExecutor(torch.nn.Module):
             "with SGLDLoraLoader"
         )
 
-    @classmethod
-    def validate_sgld_options(cls, sgld_options: dict | None) -> None:
-        """Reject SGLDOptions this model cannot honour, before the worker starts."""
-
     @staticmethod
     def should_suppress_logs(timestep):
         """Determine if logs should be suppressed based on timestep value."""
         if torch.is_tensor(timestep):
-            # ComfyUI batches cond/uncond rows, so the timestep can be [B].
-            return bool((timestep.reshape(-1)[0] < 1.0).item())
+            return bool((timestep < 1.0).item())
         return bool(timestep < 1.0)
 
     def set_lora(self, lora_nickname=None, lora_path=None, strength=None, target=None):
