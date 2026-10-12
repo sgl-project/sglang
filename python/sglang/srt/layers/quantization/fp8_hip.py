@@ -18,7 +18,7 @@ from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
     bf16_dequant_blockscaled_linear,
     dequant_block_fp8_weight_to_bf16,
     dequant_mxfp8_to_bf16,
-    mxfp8_e4m3_quantize,
+    mxfp8_operand,
 )
 from sglang.kernels.ops.quantization.mxfp8_native_amd_gfx95 import (
     native_route_supports,
@@ -104,7 +104,7 @@ def apply_dense(
         return _apply_native(method, layer, x, bias, input_scale, on_fp8_grid)
     if aiter_route:
         if (
-            getattr(layer, "weight_scale_flydsl", None) is not None
+            layer.weight_scale_flydsl is not None
             and x.numel() // x.shape[-1] >= _FLYDSL_MIN_M
         ):
             return _apply_flydsl(layer, x, bias, input_scale)
@@ -136,17 +136,17 @@ def apply_dense(
 
 @functools.cache
 def _flydsl_gemm():
-    """The mxfp8_gemm_gfx950 module, or None (warned once) when FlyDSL is missing."""
+    """The mxfp8_flydsl_gfx95 module, or None (warned once) when FlyDSL is missing."""
     try:
-        from sglang.kernels.ops.quantization import mxfp8_gemm_gfx950
+        from sglang.kernels.ops.quantization import mxfp8_flydsl_gfx95
     except ImportError as e:
         logger.warning("SGLANG_OPT_HIP_FLYDSL_MXFP8 ignored, FlyDSL unavailable: %s", e)
         return None
-    return mxfp8_gemm_gfx950
+    return mxfp8_flydsl_gfx95
 
 
 def _prepare_flydsl(layer: torch.nn.Module) -> None:
-    """Weight scales in mxfp8_gemm_gfx950's layout when SGLANG_OPT_HIP_FLYDSL_MXFP8 is
+    """Weight scales in mxfp8_flydsl_gfx95's layout when SGLANG_OPT_HIP_FLYDSL_MXFP8 is
     set and the kernel takes this weight; weight_scale_flydsl stays None otherwise."""
     n, k = layer.weight.shape
     if (
@@ -171,12 +171,8 @@ def _apply_flydsl(
     bias: Optional[torch.Tensor],
     input_scale: Optional[torch.Tensor],
 ) -> torch.Tensor:
-    """The aiter route's GEMM on mxfp8_gemm_gfx950."""
-    x2d = x.reshape(-1, x.shape[-1])
-    if input_scale is None:
-        xq, xs = mxfp8_e4m3_quantize(x2d.to(torch.bfloat16))
-    else:
-        xq, xs = x2d.contiguous(), input_scale.reshape(-1, input_scale.shape[-1])
+    """The aiter route's GEMM on mxfp8_flydsl_gfx95."""
+    xq, xs = mxfp8_operand(x, input_scale)
     gemm = _flydsl_gemm()
     out = gemm.mxfp8_gemm(
         xq, gemm.mxfp8_scale_layout(xs), layer.weight, layer.weight_scale_flydsl
