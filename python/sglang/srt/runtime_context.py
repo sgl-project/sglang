@@ -673,6 +673,10 @@ class ForwardFlags:
     _DEFAULTS = {
         "multi_stream": False,
         "moe_output_buffer": None,
+        # An optional forward-local fence, re-armed for each prefetch stage.
+        # The next MegaMoE kernel joins it on its actual launch stream, after
+        # routing and pre-dispatch have overlapped that stage's preparation.
+        "moe_prefetch_fence": None,
         # Attention-TP input-scattering (set per forward by
         # AttnTpContext.maybe_input_scattered / set_attn_inputs).
         "attn_input_scattered": False,
@@ -709,6 +713,8 @@ class ForwardFlags:
             "attn_inputs",
             "is_extend_in_batch",
             "mlp_reduce_scatter",
+            # Compiled MoE also reads the disabled/default None branch.
+            "moe_prefetch_fence",
             "flashinfer_trtllm_bypass",
             "defer_moe_finalize",
             "lora_batch_layout",

@@ -15,7 +15,7 @@ import mmap
 import os
 import re
 import time
-from typing import Optional
+from typing import Optional, Sequence
 
 import msgspec
 import numpy as np
@@ -1003,6 +1003,51 @@ class Engram(nn.Module):
         self.q_weight = nn.Parameter(torch.ones(hc_mult, dim), requires_grad=False)
         self.k_weight = nn.Parameter(torch.ones(hc_mult, dim), requires_grad=False)
 
+    def supports_prefetch(self) -> bool:
+        """Only move projections with no shared mutable GEMM workspace."""
+        from sglang.srt.layers.quantization.fp8_utils import Mxfp8DenseGemmBackend
+        from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+
+        method = self.wkv.quant_method
+        return isinstance(method, UnquantizedLinearMethod) or (
+            not getattr(method, "use_marlin", False)
+            and not getattr(method, "convert_mxfp8_to_block", False)
+            and getattr(method, "mxfp8_dense_backend", None)
+            == Mxfp8DenseGemmBackend.FLASHINFER_CUTEDSL
+            and (
+                getattr(method, "use_mxfp8", False)
+                or getattr(self.wkv, "block_fp8_mxfp8_ready", False)
+            )
+        )
+
+    def prepare(
+        self,
+        hash_ids: torch.Tensor,
+        forward_batch: Optional[ForwardBatch] = None,
+        *,
+        cp_all_tokens: bool = False,
+    ) -> Optional[torch.Tensor]:
+        """Lookup and projection depend on token hashes, not the hc residual."""
+        # The lookup runs first even for an idle DP-attention batch: under DP
+        # attention it is a collective every rank has to join.
+        emb = self.embed(hash_ids, forward_batch, cp_all_tokens=cp_all_tokens)
+        if hash_ids.shape[0] == 0:
+            # MXFP8 quantize rejects empty M; do not skip the lookup collective.
+            return None
+        kv, _ = self.wkv(emb.flatten(-2))
+        return kv
+
+    def apply_prepared(
+        self, x: torch.Tensor, kv: Optional[torch.Tensor]
+    ) -> torch.Tensor:
+        """The only residual-dependent part stays on the consumer stream."""
+        if x.shape[0] == 0:
+            return x
+        assert kv is not None and kv.shape[0] == x.shape[0]
+        return engram_gate(
+            x, kv, self.q_weight, self.k_weight, self.eps, self.clamp_value
+        )
+
     def forward(
         self,
         x: torch.Tensor,
@@ -1011,15 +1056,98 @@ class Engram(nn.Module):
         *,
         cp_all_tokens: bool = False,
     ) -> torch.Tensor:
-        """x [T, hc_mult, dim]; hash_ids [T, n_hash_cols] for this layer."""
-        # The lookup runs first even for an idle DP-attention batch: under DP
-        # attention it is a collective every rank has to join.
-        emb = self.embed(hash_ids, forward_batch, cp_all_tokens=cp_all_tokens)
-        if x.shape[0] == 0:
-            # Nothing to gate, and the MXFP8 quantize behind wkv rejects an
-            # empty M.
-            return x
-        kv, _ = self.wkv(emb.flatten(-2))
-        return engram_gate(
-            x, kv, self.q_weight, self.k_weight, self.eps, self.clamp_value
+        """Synchronous fallback, including prefill and CP."""
+        return self.apply_prepared(
+            x, self.prepare(hash_ids, forward_batch, cp_all_tokens=cp_all_tokens)
         )
+
+
+class EngramPrefetchFence:
+    """Join each armed stage on the stream that actually launches MegaMoE.
+
+    Each forward owns its fence. CUDA graph capture records the dependency;
+    replay does not depend on the Python object's already-consumed state.
+    """
+
+    def __init__(self, stream: Optional[torch.cuda.Stream] = None):
+        self.stream = stream
+
+    def arm(self, stream: torch.cuda.Stream) -> None:
+        self.stream = stream
+
+    def wait(self) -> None:
+        if self.stream is not None:
+            torch.cuda.current_stream().wait_stream(self.stream)
+            self.stream = None
+
+
+class EngramPrefetcher:
+    """One ordered producer stream, with an independent join at each gate.
+
+    Construct outside capture. Results live in a forward-local dictionary, not
+    on the model: graph-pool allocations keep captured addresses stable without
+    retaining another batch's projected values. The caller must exclude paths
+    that interleave other collectives on Engram's TP communicator and install
+    a forward-local MoE fence: NCCL preparation may overlap attention/routing,
+    but not MegaMoE's whole-grid software barrier. Prepare the next Engram at
+    its preceding layer, rather than draining all future layers at the first
+    MoE fence.
+    """
+
+    def __init__(self, stream: torch.cuda.Stream, layers: Sequence[tuple[int, Engram]]):
+        self.stream = stream
+        self.layers = tuple(layers)
+        self.ready = {layer_id: torch.cuda.Event() for layer_id, _ in self.layers}
+
+    def moe_fence(self) -> EngramPrefetchFence:
+        return EngramPrefetchFence()
+
+    def start(
+        self,
+        hash_ids: torch.Tensor,
+        forward_batch: ForwardBatch,
+        *,
+        layer_ids: Optional[Sequence[int]] = None,
+        fence: Optional[EngramPrefetchFence] = None,
+    ) -> dict[int, Optional[torch.Tensor]]:
+        # Selection depends only on the model, never on a rank's real rows.
+        # Preserve model order even when the caller supplies unordered IDs.
+        layers = (
+            self.layers
+            if layer_ids is None
+            else tuple(item for item in self.layers if item[0] in layer_ids)
+        )
+        if not layers:
+            return {}
+        current = torch.cuda.current_stream()
+        capturing = torch.cuda.is_current_stream_capturing()
+        self.stream.wait_stream(current)
+        if not capturing:
+            # Protect a main-stream allocation read by the producer in eager.
+            hash_ids.record_stream(self.stream)
+        prepared = {}
+        with torch.cuda.stream(self.stream):
+            for layer_id, engram in layers:
+                prepared[layer_id] = engram.prepare(
+                    hash_ids[:, engram.layer_hash_index], forward_batch
+                )
+                self.ready[layer_id].record(self.stream)
+        if fence is not None:
+            fence.arm(self.stream)
+        return prepared
+
+    def consume(
+        self,
+        layer_id: int,
+        engram: Engram,
+        x: torch.Tensor,
+        prepared: dict[int, Optional[torch.Tensor]],
+    ) -> torch.Tensor:
+        current = torch.cuda.current_stream()
+        # wait_stream would also join later layers and destroy look-ahead.
+        current.wait_event(self.ready[layer_id])
+        kv = prepared.pop(layer_id)
+        if kv is not None and not torch.cuda.is_current_stream_capturing():
+            # The producer allocator must not recycle kv before gate completes.
+            kv.record_stream(current)
+        return engram.apply_prepared(x, kv)

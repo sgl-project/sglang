@@ -1607,6 +1607,9 @@ class Envs:
     # anonymous mapping per rank holding only its rows, gathered with the
     # all-reduce, and the only layout that gets huge pages without shmem THP.
     SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT = EnvStr("shared")
+    # Decode/VERIFY: prepare Engram lookup and wkv on a dedicated stream.
+    # Requires pure DP-attention + MegaMoE (or TP1), and a stream-safe wkv.
+    SGLANG_OPT_DSV41_ENGRAM_PREFETCH = EnvBool(False)
 
     # Kernels and indexer
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)

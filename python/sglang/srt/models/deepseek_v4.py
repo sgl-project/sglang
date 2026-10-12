@@ -98,7 +98,12 @@ from sglang.srt.layers.dp_attention import (
     is_dp_gatherv_active,
     set_dp_buffer_len_from_batch,
 )
-from sglang.srt.layers.engram import Engram, EngramHasher, EngramLayout
+from sglang.srt.layers.engram import (
+    Engram,
+    EngramHasher,
+    EngramLayout,
+    EngramPrefetcher,
+)
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.layers.layer_boundary.ops import attn_cp_interleave_reduce_scatter
 from sglang.srt.layers.layernorm import RMSNorm
@@ -188,9 +193,11 @@ from sglang.srt.multimodal.deepseek_v41_image_processing import (
 from sglang.srt.runtime_context import (
     get_device,
     get_exec,
+    get_flags,
     get_forward,
     get_parallel,
     get_platform,
+    get_stream,
 )
 from sglang.srt.utils import (
     LazyValue,
@@ -4037,6 +4044,32 @@ class DeepseekV4Model(nn.Module):
                 ),
             )
 
+        self.engram_prefetcher = None
+        parallel = get_parallel()
+        if (
+            _is_cuda
+            and envs.SGLANG_OPT_DSV41_ENGRAM_PREFETCH.get()
+            and self.engram_layout is not None
+            and config.model_type == "deepseek_v41"
+            and self.hc_pre_from_prev_sublayer
+            and parallel.pp_size == 1
+            and parallel.attn_cp_size == 1
+            and parallel.attn_tp_size == 1
+            and parallel.tp_size == parallel.attn_dp_size
+            and parallel.dcp_size == 1
+            and not get_flags().capture.enable_torch_compile
+        ):
+            # Do not borrow attention/MoE alternate streams: their joins must not
+            # accidentally wait for a later Engram layer's preparation.
+            self.engram_prefetcher = EngramPrefetcher(
+                get_stream("dsv41_engram_prefetch"),
+                [
+                    (i, self.layers[i].engram)
+                    for i in range(self.start_layer, self.end_layer)
+                    if self.layers[i].engram is not None
+                ],
+            )
+
         self.use_fused_mhc_post_pre = (
             is_cross_layer_mhc_fusion_enabled() or _is_fused_mhc_post_pre_enabled_xpu()
         )
@@ -4120,6 +4153,49 @@ class DeepseekV4Model(nn.Module):
                 "set logprob_start_len to the prompt length"
             )
 
+    def _can_prefetch_engram(
+        self, forward_batch: ForwardBatch, hidden_states: torch.Tensor
+    ) -> bool:
+        if self.engram_prefetcher is None:
+            return False
+        parallel = get_parallel()
+        mode = forward_batch.global_forward_mode
+        # A local DECODE/IDLE decision is not a collective decision. In DP use
+        # the global mode, which the scheduler and graph capture both supply.
+        if mode is None:
+            if parallel.attn_dp_size > 1:
+                return False
+            mode = forward_batch.forward_mode
+        if not (mode.is_decode() or mode.is_target_verify()):
+            return False
+        if forward_batch.tbo_children is not None or get_forward().sp_active:
+            return False
+        if not all(e.supports_prefetch() for _, e in self.engram_prefetcher.layers):
+            return False
+        if parallel.tp_size == 1:
+            return True
+
+        from sglang.srt.layers.dp_attention import world_dp_gather_enabled
+        from sglang.srt.layers.moe.mega_moe import should_use_mega_moe
+
+        # Equal padding is a rank-uniform guard, including idle ranks. Keep
+        # SUM_LEN/gatherv, elastic WORLD gathers and mixed prefill synchronous.
+        if (
+            forward_batch.dp_padding_mode is None
+            or not forward_batch.dp_padding_mode.is_max_len()
+            or world_dp_gather_enabled()
+            or not get_moe_a2a_backend().is_megamoe()
+        ):
+            return False
+        # Here attention TP=CP=1, shared experts are replicated, and the Mega
+        # kernel owns EP transport. No layer inserts a collective on the TP
+        # communicator used by Engram. Check actual dispatch, not only config:
+        # an unready/oversized Mega path can fall back to another MoE transport.
+        return all(
+            should_use_mega_moe(self.layers[i].mlp, hidden_states)
+            for i in range(self.start_layer, self.end_layer)
+        )
+
     def _forward_layers_hc_pre_from_prev(
         self,
         positions: torch.Tensor,
@@ -4129,6 +4205,8 @@ class DeepseekV4Model(nn.Module):
         input_ids_global: torch.Tensor,
         capture_dspark: bool,
         dspark_aux_hidden_states: List[torch.Tensor],
+        *,
+        prefetch_engram: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[LateLayerTail]]:
         assert self.pp_group.world_size == 1, "pre-mix hand-off across PP is not wired"
         hash_ids = None
@@ -4157,6 +4235,7 @@ class DeepseekV4Model(nn.Module):
                 )
             else:
                 hash_ids = self.engram_hasher(input_ids, forward_batch)
+        prepared_engram = {} if prefetch_engram else None
         tail = None
         if (
             self.late_layer_start is not None
@@ -4207,12 +4286,27 @@ class DeepseekV4Model(nn.Module):
             engram = self.layers[i].engram
             if engram is not None:
                 before_engram = state.residual
-                hidden_states = engram(
-                    state.residual,
-                    hash_ids[:, engram.layer_hash_index],
-                    forward_batch,
-                    cp_all_tokens=cp_extend,
-                )
+                if prepared_engram is not None:
+                    # A first-layer Engram has no preceding attention window.
+                    if i == self.start_layer:
+                        prepared_engram.update(
+                            self.engram_prefetcher.start(
+                                hash_ids,
+                                forward_batch,
+                                layer_ids=(i,),
+                                fence=get_forward().moe_prefetch_fence,
+                            )
+                        )
+                    hidden_states = self.engram_prefetcher.consume(
+                        i, engram, state.residual, prepared_engram
+                    )
+                else:
+                    hidden_states = engram(
+                        state.residual,
+                        hash_ids[:, engram.layer_hash_index],
+                        forward_batch,
+                        cp_all_tokens=cp_extend,
+                    )
                 # Only multimodal placeholders become image_token_id, so a text-only
                 # batch skips this full-residual where.
                 if (
@@ -4232,6 +4326,22 @@ class DeepseekV4Model(nn.Module):
                 if tail is not None and i < self.late_layer_start:
                     aux = tail.rows(aux)
                 dspark_aux_hidden_states.append(aux.mean(dim=1))
+            if (
+                prepared_engram is not None
+                and i + 1 < self.end_layer
+                and self.layers[i + 1].engram is not None
+            ):
+                # The preceding layer's MoE has already joined its launch
+                # stream. Only this layer's attention/mHC/routing may overlap
+                # the next Engram; its MegaMoE kernel joins the re-armed fence.
+                prepared_engram.update(
+                    self.engram_prefetcher.start(
+                        hash_ids,
+                        forward_batch,
+                        layer_ids=(i + 1,),
+                        fence=get_forward().moe_prefetch_fence,
+                    )
+                )
             ctx = (
                 nullcontext()
                 if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
@@ -4461,15 +4571,24 @@ class DeepseekV4Model(nn.Module):
         tail = None
         if self.hc_pre_from_prev_sublayer:
             assert not run_tbo, "two-batch overlap is not wired for this hc scheme"
-            hidden_states, last_pre, tail = self._forward_layers_hc_pre_from_prev(
-                positions,
-                hidden_states,
-                forward_batch,
-                input_ids,
-                input_ids_global,
-                capture_dspark,
-                dspark_aux_hidden_states,
+            prefetch_engram = self._can_prefetch_engram(forward_batch, hidden_states)
+            fence = self.engram_prefetcher.moe_fence() if prefetch_engram else None
+            prefetch_ctx = (
+                get_forward().scoped(moe_prefetch_fence=fence)
+                if prefetch_engram
+                else nullcontext()
             )
+            with prefetch_ctx:
+                hidden_states, last_pre, tail = self._forward_layers_hc_pre_from_prev(
+                    positions,
+                    hidden_states,
+                    forward_batch,
+                    input_ids,
+                    input_ids_global,
+                    capture_dspark,
+                    dspark_aux_hidden_states,
+                    prefetch_engram=prefetch_engram,
+                )
         elif run_tbo:
             # Two-batch-overlap prefill (EP / mori). Cross-layer mHC fusion is
             # disabled here (each layer self-contained), so no trailing hc_post.
