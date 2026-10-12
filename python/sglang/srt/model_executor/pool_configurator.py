@@ -619,9 +619,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     ) -> MemoryPoolConfig:
         # DCP adds one physical MLA padding page plus one widened indexer padding page.
         available_bytes = max(
-            available_bytes
-            - self._fixed_overhead_bytes
-            - self._dcp_pool_padding_bytes,
+            available_bytes - self._fixed_overhead_bytes - self._dcp_pool_padding_bytes,
             0,
         )
         max_total_num_tokens = (
