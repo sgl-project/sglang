@@ -129,6 +129,52 @@ class TestShouldApplyLoRAGate(CustomTestCase):
 
         self.assertEqual(list(manager.lora_modules[0]), [LANGUAGE_QKV])
 
+    def test_model_scope_keeps_decoder_projections(self):
+        """Decoder FFN, expert, and hybrid projections stay inside LoRA scope."""
+        from sglang.srt.models.gemma4_mm import Gemma4ForConditionalGeneration
+        from sglang.srt.models.mllama4 import Llama4ForConditionalGeneration
+        from sglang.srt.models.qwen4_exp import Qwen4ExpForConditionalGeneration
+
+        for model_class, prefix, projections, encoders in (
+            (
+                Llama4ForConditionalGeneration,
+                "language_model.model.layers.0.",
+                (
+                    "feed_forward.down_proj",
+                    "feed_forward.experts",
+                    "feed_forward.shared_expert.gate_up_proj",
+                ),
+                ("vision_model", "multi_modal_projector"),
+            ),
+            (
+                Gemma4ForConditionalGeneration,
+                "language_model.layers.0.",
+                ("moe.experts",),
+                ("vision_tower", "audio_tower"),
+            ),
+            (
+                Qwen4ExpForConditionalGeneration,
+                "model.layers.0.",
+                (
+                    "qkv_proj",
+                    "o_proj",
+                    "linear_attn.in_proj_qkvz",
+                    "mlp.experts",
+                    "mlp.shared_expert.down_proj",
+                ),
+                ("visual",),
+            ),
+        ):
+            with self.subTest(model=model_class.__name__):
+                model = object.__new__(model_class)
+                torch.nn.Module.__init__(model)
+                for projection in projections:
+                    name = prefix + projection
+                    self.assertTrue(model.should_apply_lora(name), name)
+                for encoder in encoders:
+                    name = encoder + ".layers.0.qkv_proj"
+                    self.assertFalse(model.should_apply_lora(name), name)
+
     def test_embed_tokens_outside_the_gated_prefix_is_still_wrapped(self):
         """The gate stays below the embed_tokens / lm_head handling."""
         embed_tokens = VocabParallelEmbedding.__new__(VocabParallelEmbedding)
