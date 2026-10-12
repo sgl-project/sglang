@@ -348,6 +348,34 @@ def test_lora_guard_rejects_adaln_keys_in_cache_mode():
         MiniMaxH3DiTModel.prepare_lora_adapter(model, adapter)
 
 
+def test_sidecar_pairs_with_quantized_linears_but_online_rebuild_does_not():
+    """A sidecar replaces adaln_proj outright; the online rebuild streams it
+    from the checkpoint, so only the rebuild must refuse quantized weights."""
+    from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
+        MiniMaxH3DiTModel,
+    )
+
+    MiniMaxH3DiTModel._validate_adaln_precompute_config(quantized=True, online=False)
+    with pytest.raises(ValueError, match="adaln-online requires unquantized"):
+        MiniMaxH3DiTModel._validate_adaln_precompute_config(quantized=True, online=True)
+
+
+def test_comfy_marker_filter_survives_adaln_precompute():
+    """A Comfy-marker checkpoint loaded with an AdaLN sidecar or online rebuild
+    must still skip its .comfy_quant metadata tensors, not only adaln_proj."""
+    from sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader import (
+        _select_checkpoint_key_filter,
+    )
+
+    key_filter = _select_checkpoint_key_filter(
+        uses_comfy_layer_markers=True, drops_adaln_proj=True
+    )
+    assert not key_filter("blocks.0.attn.qkv_proj.comfy_quant")
+    assert not key_filter("blocks.0.adaln_proj.linear.weight")
+    assert key_filter("blocks.0.attn.qkv_proj.weight")
+    assert key_filter("blocks.0.attn.qkv_proj.weight_scale")
+
+
 def test_invalidate_drops_all_tiers_and_allows_rebuild(tmp_path):
     cache = _online_cache(
         tmp_path,
