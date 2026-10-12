@@ -81,6 +81,14 @@ def token_req_indices(forward_batch, *, num_tokens=None) -> torch.Tensor:
     assert forward_batch.forward_mode.is_extend(), (
         "the V4.1 torch attention path serves extend, target-verify and decode"
     )
+    lens_cpu = forward_batch.extend_seq_lens_cpu
+    real = sum(lens_cpu) if lens_cpu is not None else None
+    if num_tokens is not None and real is not None and num_tokens > real:
+        # MLP-sync padding rows use request 0, the padding row of the request pool.
+        rows = torch.repeat_interleave(
+            req, forward_batch.extend_seq_lens.to(torch.int64), output_size=real
+        )
+        return torch.nn.functional.pad(rows, (0, num_tokens - real), value=0)
     return torch.repeat_interleave(
         req, forward_batch.extend_seq_lens.to(torch.int64), output_size=num_tokens
     )
