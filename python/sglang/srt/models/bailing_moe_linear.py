@@ -386,17 +386,17 @@ class BailingGroupRMSNormGate(RMSNormGated):
             dtype=dtype,
             activation="sigmoid",
         )
+        self.tp_size = get_parallel().attn_tp_size
+        self.tp_rank = get_parallel().attn_tp_rank
         self.weight.weight_loader = self.weight_loader
 
-    @staticmethod
     def weight_loader(
+        self,
         param: torch.nn.Parameter,
         loaded_weight: torch.Tensor,
     ) -> None:
-        tp_size = get_parallel().attn_tp_size
-        tp_rank = get_parallel().attn_tp_rank
-        shard_size = loaded_weight.shape[0] // tp_size
-        shard = slice(tp_rank * shard_size, (tp_rank + 1) * shard_size)
+        shard_size = loaded_weight.shape[0] // self.tp_size
+        shard = slice(self.tp_rank * shard_size, (self.tp_rank + 1) * shard_size)
         param.data.copy_(loaded_weight[shard].contiguous())
         return
 
@@ -459,8 +459,7 @@ class BailingMoELinearAttention(nn.Module):
             bias=(config.use_bias or config.use_qkv_bias),
             quant_config=quant_config,
             prefix=f"{prefix}.qkv_proj",
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
+            parallel_group="attn_tp",
         )
 
         if self.use_qk_norm:
@@ -473,8 +472,7 @@ class BailingMoELinearAttention(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.output_gate",
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
+            parallel_group="attn_tp",
         )
         self.dense = RowParallelLinear(
             self.hidden_inner_size,
@@ -482,8 +480,7 @@ class BailingMoELinearAttention(nn.Module):
             bias=config.use_bias,
             quant_config=quant_config,
             prefix=f"{prefix}.out_proj",
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
+            parallel_group="attn_tp",
             reduce_results=False,
         )
         self.attn = RadixAttention(
@@ -782,8 +779,7 @@ class BailingMoELinearDecoderLayer(nn.Module):
 
         self.expert_num = config.num_experts
         self.hidden_size = config.hidden_size
-        is_moe_layer = self._is_layer_sparse(config, self.layer_id, is_nextn=is_nextn)
-        is_next_layer_moe_layer = self._is_layer_sparse(config, self.layer_id + 1)
+        attn, ffn = self.stage_facts(config, self.layer_id, is_nextn=is_nextn)
         if self.expert_num == 1:
             self.mlp = BailingMLP(
                 hidden_size=self.hidden_size,
@@ -821,22 +817,27 @@ class BailingMoELinearDecoderLayer(nn.Module):
             else None
         )
         self.attn_boundary, self.ffn_boundary = append_stages(
-            (
-                declare_attn(),
-                self.input_layernorm,
-                {"qkv_latent_func": qkv_latent_func},
-            ),
-            (
-                declare_ffn(
-                    sparse=is_moe_layer,
-                    next_layer_sparse=is_next_layer_moe_layer,
-                ),
-                self.post_attention_layernorm,
+            (attn, self.input_layernorm, {"qkv_latent_func": qkv_latent_func}),
+            (ffn, self.post_attention_layernorm),
+        )
+
+    @classmethod
+    def stage_facts(
+        cls, config: PretrainedConfig, layer_id: int, is_nextn: bool = False
+    ):
+        """The stages the layer at ``layer_id`` declares, from the config: the
+        model's shared declaration function (see make_layers)."""
+        return (
+            declare_attn(),
+            declare_ffn(
+                sparse=cls._is_layer_sparse(config, layer_id, is_nextn=is_nextn),
+                next_layer_sparse=cls._is_layer_sparse(config, layer_id + 1),
             ),
         )
 
+    @staticmethod
     def _is_layer_sparse(
-        self, config: PretrainedConfig, layer_id: int, is_nextn: bool = False
+        config: PretrainedConfig, layer_id: int, is_nextn: bool = False
     ) -> bool:
         return is_nextn or (
             config.num_experts is not None and layer_id >= config.first_k_dense_replace
@@ -948,6 +949,9 @@ class BailingMoELinearModel(nn.Module):
             self.num_layers,
             layer_fn,
             prefix=f"{prefix}.layers",
+            stage_facts=lambda idx: BailingMoELinearDecoderLayer.stage_facts(
+                config, idx
+            ),
         )
 
         norm_kwargs = {}

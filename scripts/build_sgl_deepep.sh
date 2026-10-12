@@ -2,7 +2,7 @@
 # Build sgl-deep-ep wheels in a CUDA-versioned manylinux container.
 #
 # Usage:
-#   build_sgl_deepep.sh <python-version> <cuda-version> <deepep-source> <packaging-overlay> [architecture]
+#   build_sgl_deepep.sh <python-version> <cuda-version> <deepep-source> [architecture]
 #
 # Writes CUDA-tagged wheels to <deepep-source>/dist, plus PyPI-ready wheels
 # without the local CUDA version in <deepep-source>/dist-pypi.
@@ -11,17 +11,18 @@ set -euo pipefail
 
 usage() {
     cat <<'EOF'
-Usage: build_sgl_deepep.sh <python-version> <cuda-version> <deepep-source> <packaging-overlay> [architecture]
+Usage: build_sgl_deepep.sh <python-version> <cuda-version> <deepep-source> [architecture]
 
   python-version:     3.10, 3.11, 3.12, or 3.13
   cuda-version:       13.0
-  deepep-source:      checkout of the selected DeepEP implementation branch
-  packaging-overlay: path to the shared DeepEP sgl_deep_ep directory
+  deepep-source:      DeepEP checkout containing the sgl_deep_ep package
   architecture:       x86_64 or aarch64 (defaults to the current machine)
+
+Set SGL_DEEP_EP_VERSION to override the checked-in package version.
 EOF
 }
 
-if [[ $# -lt 4 || $# -gt 5 ]]; then
+if [[ $# -lt 3 || $# -gt 4 ]]; then
     usage >&2
     exit 2
 fi
@@ -29,8 +30,7 @@ fi
 PYTHON_VERSION="$1"
 CUDA_VERSION="$2"
 DEEPEP_SOURCE="$(cd "$3" && pwd)"
-PACKAGING_OVERLAY="$(cd "$4" && pwd)"
-ARCHITECTURE="${5:-$(uname -m)}"
+ARCHITECTURE="${4:-$(uname -m)}"
 
 if [[ "${ARCHITECTURE}" == arm64 ]]; then
     ARCHITECTURE=aarch64
@@ -67,15 +67,9 @@ case "${ARCHITECTURE}" in
         ;;
 esac
 
-for required_file in setup.py deep_ep/__init__.py; do
+for required_file in setup.py deep_ep/__init__.py sgl_deep_ep/build_sgl_deep_ep.sh sgl_deep_ep/setup.py sgl_deep_ep/VERSION; do
     if [[ ! -f "${DEEPEP_SOURCE}/${required_file}" ]]; then
         echo "DeepEP source is missing ${required_file}: ${DEEPEP_SOURCE}" >&2
-        exit 1
-    fi
-done
-for required_file in build_sgl_deep_ep.sh setup.py VERSION; do
-    if [[ ! -f "${PACKAGING_OVERLAY}/${required_file}" ]]; then
-        echo "Packaging overlay is missing ${required_file}: ${PACKAGING_OVERLAY}" >&2
         exit 1
     fi
 done
@@ -100,7 +94,6 @@ echo "CUDA:              ${CUDA_VERSION} (${CUDA_TAG})"
 echo "Architecture:      ${ARCHITECTURE}"
 echo "Base image:        ${BASE_IMAGE}:cuda${CUDA_VERSION}"
 echo "DeepEP source:     ${DEEPEP_SOURCE}"
-echo "Packaging overlay: ${PACKAGING_OVERLAY}"
 echo "Builder image:     ${IMAGE_TAG}"
 echo "----------------------------------------"
 
@@ -122,8 +115,8 @@ docker run --rm \
     --env CUDA_TAG="${CUDA_TAG}" \
     --env CUDA_VERSION="${CUDA_VERSION}" \
     --env MAX_JOBS="${MAX_JOBS:-8}" \
+    --env SGL_DEEP_EP_VERSION="${SGL_DEEP_EP_VERSION:-}" \
     --volume "${DEEPEP_SOURCE}:/deepep:ro" \
-    --volume "${PACKAGING_OVERLAY}:/sgl-deep-ep-packaging:ro" \
     --volume "${DIST_DIR}:/output/dist" \
     --volume "${PYPI_DIST_DIR}:/output/dist-pypi" \
     "${IMAGE_TAG}" \
@@ -133,8 +126,8 @@ find /output/dist-pypi -maxdepth 1 -type f -name "sgl_deep_ep-*.whl" -delete
 raw_dir="$(mktemp -d -t sgl-deep-ep-raw.XXXXXX)"
 trap '\''rm -rf -- "${raw_dir}"'\'' EXIT
 
-bash /sgl-deep-ep-packaging/build_sgl_deep_ep.sh \
-    /deepep /sgl-deep-ep-packaging "${raw_dir}" "${CUDA_VERSION}" "${ARCHITECTURE}"
+bash /deepep/sgl_deep_ep/build_sgl_deep_ep.sh \
+    "${raw_dir}" "${CUDA_VERSION}" "${ARCHITECTURE}"
 
 shopt -s nullglob
 raw_wheels=("${raw_dir}"/*.whl)

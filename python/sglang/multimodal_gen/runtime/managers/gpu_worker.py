@@ -37,6 +37,9 @@ from sglang.multimodal_gen.runtime.distributed import (
 from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a import (
     IPC_A2A,
 )
+from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a_multi import (
+    IPC_A2A_MULTI,
+)
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_cfg_group,
     get_classifier_free_guidance_rank,
@@ -102,6 +105,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     configure_logger,
     init_logger,
 )
+from sglang.multimodal_gen.runtime.utils.numerics_policy import apply_numerics_policy
 from sglang.multimodal_gen.runtime.utils.perf_logger import (
     PerformanceLogger,
     capture_memory_snapshot,
@@ -171,6 +175,27 @@ def _worker_cpu_intra_op_threads(num_gpus: int) -> int | None:
     return max(1, min(16, cpu_count // max(1, num_gpus)))
 
 
+def _bind_worker_to_gpu_numa_node(
+    server_args: ServerArgs, local_rank: int
+) -> int | None:
+    """Bind this worker's CPUs and host memory to its GPU's NUMA node, as srt does.
+
+    Must run before CUDA init and model load so first-touch host memory lands
+    on that node; an unbound worker drifts across sockets and every
+    host-bound op pays remote-memory latency.
+    """
+    from sglang.srt.utils.numa_utils import (
+        get_numa_node_if_available,
+        numa_bind_to_node,
+    )
+
+    numa_node = get_numa_node_if_available(server_args, local_rank)
+    if numa_node is not None:
+        numa_bind_to_node(numa_node)
+        logger.info("GPU %d worker bound to NUMA node %d", local_rank, numa_node)
+    return numa_node
+
+
 OFFLOAD_DISABLE_RECOMMENDATION_ORDER = (
     "vae",
     "image_encoder",
@@ -213,20 +238,26 @@ def fit_auto_residency_probe(
     floor_units = min((record.workload_units() for record in records), default=0)
     fitted, steps = req, 0
     while True:
-        units = (
-            max(1, int(fitted.width or 1))
-            * max(1, int(fitted.height or 1))
-            * max(1, int(fitted.num_frames or 1))
-        )
+        units = _probe_workload_units(fitted)
         estimate = estimate_default_workload_peak_bytes(
             records=records, target_units=units
         )
         if estimate is None or estimate <= budget or units <= floor_units:
             return fitted, estimate, steps
         lighter = lighten_warmup_req(server_args, fitted)
-        if lighter is None:
+        # Sampling params that pin the frame count (Wan-Animate-2 mirrors clip_len
+        # in __post_init__) hand back an equal-size req; treat that as the floor.
+        if lighter is None or _probe_workload_units(lighter) >= units:
             return fitted, estimate, steps
         fitted, steps = lighter, steps + 1
+
+
+def _probe_workload_units(req: Req) -> int:
+    return (
+        max(1, int(req.width or 1))
+        * max(1, int(req.height or 1))
+        * max(1, int(req.num_frames or 1))
+    )
 
 
 class GPUWorker(GPUWorkerPostTrainingMixin):
@@ -384,6 +415,12 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         if not current_platform.is_mps():
             current_platform.set_device(current_platform.get_device(self.local_rank))
         self._cap_device_memory_for_tests()
+        apply_numerics_policy(
+            allow_cudnn_tf32=self.server_args.allow_cudnn_tf32,
+            allow_bf16_reduced_precision_reduction=(
+                self.server_args.allow_bf16_reduced_precision_reduction
+            ),
+        )
         # num_gpus is the total world size across every node; the co-located,
         # CPU-contending worker count on THIS host is num_gpus // nnodes.
         local_num_gpus = self.server_args.num_gpus // self.server_args.nnodes
@@ -546,6 +583,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         # request boundary: the IPC watchdog flag is a device read, illegal
         # inside a graph capture and too costly per exchange
         IPC_A2A.check_timeout()
+        IPC_A2A_MULTI.check_timeout()
         if len(batch) > 1:
             if return_req:
                 raise ValueError(
@@ -1197,6 +1235,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         from sglang.multimodal_gen.runtime.layers.usp import drop_a2a_staging_buffers
 
         IPC_A2A.drop_staging()
+        IPC_A2A_MULTI.drop_staging()
         drop_a2a_staging_buffers()
         torch.get_device_module().empty_cache()
 
@@ -1435,6 +1474,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             output=result.output,
             audio=getattr(result, "audio", None),
             audio_sample_rate=getattr(result, "audio_sample_rate", None),
+            fps=getattr(result, "fps", None),
             metrics=result.metrics,
             usage=getattr(result, "usage", None),
             trajectory_timesteps=getattr(result, "trajectory_timesteps", None),
@@ -1450,6 +1490,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
     ) -> OutputBatch:
         """Merge per-output batches produced by grouped execution."""
         merged = OutputBatch()
+        merged.fps = output_batches[0].fps
         parts = _ExpandedOutputParts()
 
         for output_batch in output_batches:
@@ -1736,6 +1777,7 @@ def run_scheduler_process(
     kill_itself_when_parent_died()
     configure_logger(server_args)
     globally_suppress_loggers()
+    _bind_worker_to_gpu_numa_node(server_args, local_rank)
 
     if current_platform.is_cuda():
         set_cuda_arch()
