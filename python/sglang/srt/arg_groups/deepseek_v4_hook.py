@@ -17,8 +17,8 @@ from sglang.srt.arg_groups.overrides import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
-from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform, num_dp_ranks_of
-from sglang.srt.utils.common import is_gfx95_supported, is_npu
+from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
+from sglang.srt.utils.common import is_gfx95_supported, is_hip, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -292,15 +292,14 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
         if (
             read_ragged_verify_mode() is not RaggedVerifyMode.STATIC
             or cfg.disaggregation_transfer_backend != "mooncake"
-            or num_dp_ranks_of(cfg) != 1
-            or attn_dp_enabled_of(cfg)
+            or cfg.enable_prefill_cp
             or cfg.attn_cp_size != 1
             or cfg.dcp_size != 1
         ):
             raise ValueError(
                 "DeepSeek-V4.1 DSpark PD requires static verify, Mooncake, "
-                "DP=1 and CP=1. Both servers must enable DSpark with the same "
-                "block size and TP size."
+                "and CP=1 on both servers. DP attention is supported when "
+                "both servers use the same block size and target/draft KV layout."
             )
 
     prefill_graph = cfg.cuda_graph_config.prefill
@@ -326,8 +325,17 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 "the prefill CUDA graph",
                 cfg.cuda_graph_config.prefill.backend != Backend.DISABLED,
             ),
-            # input_ids_global is a DP-wide gather, so the tail slice cannot apply.
-            ("DP attention", attn_dp_enabled_of(cfg)),
+            # DP attention + TP MoE re-sizes the MoE gather to every rank's tail
+            # (deepseek_v4 _late_layer_dp_counts, ROCm only); other DP layouts do not.
+            (
+                "DP attention other than TP MoE with attention TP 1 on ROCm",
+                attn_dp_enabled_of(cfg)
+                and not (
+                    is_hip()
+                    and cfg.moe_a2a_backend == "none"
+                    and cfg.attn_dp_size == cfg.tp_size
+                ),
+            ),
         )
         for feature, enabled in incompatible:
             if enabled:
