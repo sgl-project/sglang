@@ -6,12 +6,12 @@ from array import array
 from collections import defaultdict, deque
 from datetime import timedelta
 from queue import Queue
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import Mock
 
 import torch
 
-from sglang.srt.managers.schedule_batch import split_cached_prefix_by_tier
+from sglang.srt.managers.schedule_batch import Req, split_cached_prefix_by_tier
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     InitLoadBackParams,
@@ -119,9 +119,12 @@ def _staged_fixture(full_match=2):
         swa_host_hit_length=0,
         host_hit_is_storage=False,
         host_loaded_length=0,
+        storage_hit_start=2,
+        storage_hit_length=6,
         storage_prefetch_last_match_len=4,
         storage_prefetch_retry_attempts=0,
     )
+    req.fulfilled_storage_hit_len = MethodType(Req.fulfilled_storage_hit_len, req)
     return cache, pipeline, req
 
 
@@ -387,6 +390,7 @@ class TestStagedPrefetchLifecycle(unittest.TestCase):
         self.assertEqual(req.prefix_len, 12)
         self.assertEqual((req.last_node, req.kv.cache_protected_len), (9, 12))
         self.assertEqual((req.host_hit_length, req.swa_host_hit_length), (0, 0))
+        self.assertEqual((req.storage_hit_start, req.storage_hit_length), (2, 6))
         self.assertFalse(pipeline.has_staged(req.cache_request_handle))
         self.assertEqual(cache.cache_controller.prefetch_tokens_occupied, 0)
         cache.cache_controller.mem_pool_host.free.assert_called_once()
