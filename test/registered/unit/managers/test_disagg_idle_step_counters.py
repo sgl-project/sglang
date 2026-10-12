@@ -17,6 +17,7 @@ from sglang.srt.environ import envs
 from sglang.srt.managers import scheduler as scheduler_module
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.inflight_queue import InflightQueue
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_parallel
@@ -504,6 +505,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler.last_batch = None
         scheduler.rows_join_before_plan = False
         scheduler.disagg_decode_launches_copy = False
+        scheduler.inflight_steps = InflightQueue(depth=0)
         scheduler.recv_skipper = None
         scheduler.chunked_req = None
         scheduler.waiting_queue = []

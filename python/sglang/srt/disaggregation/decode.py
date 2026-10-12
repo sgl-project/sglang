@@ -3151,18 +3151,6 @@ class SchedulerDisaggregationDecodeMixin:
             else:
                 ret = None
 
-        if self.inflight_steps.ring and self.last_batch is not None:
-            # Under the pipeline loop, the step launched last stays last_batch
-            # until the loop launches the next one, and the idle checks and
-            # request queries read its requests. It is a copy of the rows, or
-            # an idle step without requests: it drops the requests that have
-            # left the rows since, by a finish or a retract. Filter only its
-            # request list; the rows share its sampling and spec objects. It
-            # is then only a listing of requests, which nothing may filter,
-            # merge or plan again.
-            row_ids = set(map(id, decoding_batch.rows.reqs))
-            self.last_batch.reqs = [r for r in self.last_batch.reqs if id(r) in row_ids]
-
         ret = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(ret)
         if ret:
             set_schedule_time_batch(ret)

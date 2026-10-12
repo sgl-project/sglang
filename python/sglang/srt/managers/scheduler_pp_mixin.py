@@ -130,9 +130,8 @@ class SchedulerPPMixin:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
                 self.decoding_batch = self.decoding_batches[mb_id]
-                self.last_batch = self._pp_slot_last_batch(mb_id)
                 if self.recv_skipper is not None:
-                    self.recv_skipper.on_launch(self.last_batch)
+                    self.recv_skipper.on_launch(self._pp_slot_last_batch(mb_id))
                 next_first_rank_mb_id = (
                     mb_id + get_parallel().pp_size
                 ) % self.pp_loop_size
@@ -148,7 +147,7 @@ class SchedulerPPMixin:
                         )
                 with torch.profiler.record_function("get_next_batch_to_run"):
                     plan = self.get_next_batch_to_run(
-                        decoding_batch=self.decoding_batch, last_batch=self.last_batch
+                        decoding_batch=self.decoding_batch
                     )
                     self._pp_debug_check_slot(mb_id)
                     self.inflight_steps.push(plan.batch_to_run, None)
@@ -262,9 +261,8 @@ class SchedulerPPMixin:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
                 self.decoding_batch = self.decoding_batches[mb_id]
-                self.last_batch = self._pp_slot_last_batch(mb_id)
                 if self.recv_skipper is not None:
-                    self.recv_skipper.on_launch(self.last_batch)
+                    self.recv_skipper.on_launch(self._pp_slot_last_batch(mb_id))
                 next_first_rank_mb_id = (
                     mb_id + get_parallel().pp_size
                 ) % self.pp_loop_size
@@ -286,7 +284,7 @@ class SchedulerPPMixin:
                 self._pp_commit_comm_work(send_transfer_work)
                 tmbs[mb_id] = transferred_rids
 
-                self.process_prefill_chunk(last_batch=self.last_batch)
+                self.process_prefill_chunk(last_batch=self._pp_slot_last_batch(mb_id))
                 self._process_hicache_events()
                 prefill_plan = self.get_new_batch_prefill(self.decoding_batch)
                 batch = prefill_plan.batch_to_run
@@ -387,9 +385,8 @@ class SchedulerPPMixin:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
                 self.decoding_batch = self.decoding_batches[mb_id]
-                self.last_batch = self._pp_slot_last_batch(mb_id)
                 if self.recv_skipper is not None:
-                    self.recv_skipper.on_launch(self.last_batch)
+                    self.recv_skipper.on_launch(self._pp_slot_last_batch(mb_id))
                 next_first_rank_mb_id = (
                     mb_id + get_parallel().pp_size
                 ) % self.pp_loop_size

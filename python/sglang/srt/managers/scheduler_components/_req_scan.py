@@ -16,11 +16,20 @@ def running_and_inflight_batches(
     """The running batch, then the launched batches whose requests it does not
     hold yet: the batch launched last, or when the rows hold the steps
     launched, the steps in flight. Any may be None, and the running and last
-    batch may be the same. Under PP they are the current micro-batch's."""
+    batch may be the same. Under PP they are the current slot's rows and the
+    step that slot launched last."""
     if rows_hold_launched(scheduler):
         return [
             scheduler.running_batch,
             *(record.batch for record in scheduler.inflight_steps),
+        ]
+    if scheduler.inflight_steps.ring:
+        # The step the current pipeline slot launched last, until the slot
+        # launches again.
+        slots = scheduler.inflight_steps.slot_batches()
+        return [
+            scheduler.running_batch,
+            slots[scheduler.inflight_steps.step % len(slots)],
         ]
     return [scheduler.running_batch, scheduler.last_batch]
 

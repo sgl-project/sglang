@@ -3857,10 +3857,10 @@ class Scheduler(
             # Filter batch
             last_batch.filter_batch(reqs_to_exclude=list(reqs_to_exclude))
 
-                # Merge a copy of the new batch into the running batch: the
-                # launched step never becomes the running rows.
-                if not last_batch.is_empty():
-                    decoding_batch.join(last_batch.shallow_copy())
+            # Merge a copy of the new batch into the running batch: the
+            # launched step never becomes the running rows.
+            if not last_batch.is_empty():
+                decoding_batch.join(last_batch.shallow_copy())
 
         # Rows whose finish a commit already observed leave before admission,
         # so admission, the decode rows and load reporting (/v1/loads) see only
