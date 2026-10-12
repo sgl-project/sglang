@@ -427,9 +427,7 @@ class SchedulerPPMixin:
                 self.cur_batch_for_debug = cur_batch
                 if cur_batch:
                     server_is_idle = False
-                    pp_proxy_tensors = None
-                    if not cur_batch.forward_mode.is_prebuilt():
-                        pp_proxy_tensors = self._pp_recv_proxy_tensors()
+                    pp_proxy_tensors = self._pp_recv_proxy_tensors()
 
                 # early send output if possible
                 if get_parallel().pp_async_batch_depth > 0:
@@ -510,12 +508,11 @@ class SchedulerPPMixin:
 
                 # post-process the coming microbatch
                 if self.mbs[next_mb_id] is not None:
-                    if not self.mbs[next_mb_id].forward_mode.is_prebuilt():
-                        d2h_event.synchronize()
-                        self._pp_process_batch_result(
-                            self.mbs[next_mb_id],
-                            next_batch_result,
-                        )
+                    d2h_event.synchronize()
+                    self._pp_process_batch_result(
+                        self.mbs[next_mb_id],
+                        next_batch_result,
+                    )
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
 
                 if not self.pp_group.is_last_rank:
@@ -531,7 +528,7 @@ class SchedulerPPMixin:
                     send_transfer_work = self._pp_send_pyobj_to_next_stage(
                         transferred_rids, async_send=True
                     )
-                    if cur_batch and not cur_batch.forward_mode.is_prebuilt():
+                    if cur_batch:
                         self._pp_send_proxy_to_next_stage(result)
 
                 self.pp_outputs = next_pp_outputs

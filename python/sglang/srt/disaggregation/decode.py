@@ -77,7 +77,6 @@ from sglang.srt.managers.schedule_batch import (
     NextBatchPlan,
     ScheduleBatch,
 )
-from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocation import ensure_mamba_capacity
 from sglang.srt.mem_cache.allocation_sizing import get_mamba_tracking_slots
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -2039,16 +2038,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             reserved_tokens, need_space_for_single_req
         )
 
-        # Note: if the last prebuilt extend just finishes, and we enter `pop_preallocated` immediately in the next iteration
-        #       the extend batch is not in any queue, so we need to explicitly add the tokens slots here
-        if (
-            self.scheduler.last_batch
-            and self.scheduler.last_batch.forward_mode.is_prebuilt()
-        ):
-            allocatable_tokens -= self.num_reserved_decode_tokens * len(
-                self.scheduler.last_batch.reqs
-            )
-
         if count_retracted:
             for req in self.retracted_queue:
                 full_required, _ = self._prealloc_required_tokens(req)
@@ -2111,19 +2100,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             + swa_evictable
             - max(swa_reserved_tokens, need_swa_space_for_single_req)
         )
-
-        # Note: if the last prebuilt extend just finishes, and we enter `pop_preallocated` immediately in the next iteration
-        #       the extend batch is not in any queue, so we need to explicitly add the tokens slots here
-        if (
-            self.scheduler.last_batch
-            and self.scheduler.last_batch.forward_mode.is_prebuilt()
-        ):
-            prebuilt_reserved_tokens = self.num_reserved_decode_tokens * len(
-                self.scheduler.last_batch.reqs
-            )
-            prebuilt_n = len(self.scheduler.last_batch.reqs)
-            prebuilt_swa_growth = max(0, prebuilt_n * window_size - swa_used)
-            swa_allocatable_tokens -= min(prebuilt_reserved_tokens, prebuilt_swa_growth)
 
         if count_retracted:
             for req in self.retracted_queue:
@@ -3112,17 +3088,6 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Update last_batch
             self.last_batch = batch
-
-    def _run_batch_prebuilt(
-        self: Scheduler, batch: ScheduleBatch
-    ) -> GenerationBatchResult:
-        if batch.inner_idle_batch is not None:
-            idle_batch = batch.inner_idle_batch
-            # Reset the inner idle batch to avoid reusing it.
-            batch.inner_idle_batch = None
-            return self.run_batch(idle_batch)
-
-        return GenerationBatchResult()
 
     @scheduler_stage_method(SCHEDULER_STAGE_GET_NEXT_BATCH)
     def get_next_disagg_decode_batch_to_run(

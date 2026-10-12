@@ -4499,10 +4499,6 @@ class Scheduler(
             logger.info(f"Scheduler.run_batch sleep {self.forward_sleep_time}s")
             time.sleep(self.forward_sleep_time)
 
-        # Place holder handling for pd-disagg decode event loop
-        if batch.forward_mode.is_prebuilt():
-            return self._run_batch_prebuilt(batch)
-
         # PD prefill: early-send cached prefix KV, overlapping the suffix forward.
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             for req in batch.reqs:

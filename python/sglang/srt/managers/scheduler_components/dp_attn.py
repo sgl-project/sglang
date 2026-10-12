@@ -618,25 +618,18 @@ def prepare_mlp_sync_batch_raw(
     else:
         need_idle_batch = max(mlp_sync_info.global_num_tokens) > 0
 
-    batch_to_gather = local_batch
-    if need_idle_batch:
-        if local_batch is None:
-            batch_to_gather = local_batch = get_idle_batch()
-        elif local_batch.forward_mode.is_prebuilt():
-            # NOTE: for prebuilt batch, we add an inner idle batch to run MLP sync
-            batch_to_gather = local_batch.inner_idle_batch = get_idle_batch()
+    if need_idle_batch and local_batch is None:
+        local_batch = get_idle_batch()
 
-    if batch_to_gather is not None:
+    if local_batch is not None:
         _update_gather_batch(
-            batch_to_gather,
+            local_batch,
             mlp_sync_info,
             require_mlp_tp_gather,
             draft_require_mlp_tp_gather,
             skip_global_metadata=not metadata_ready,
         )
 
-    # Set on `local_batch`, not `batch_to_gather`: for PREBUILT batches the
-    # scheduler's `last_batch` is the prebuilt batch, not its inner idle batch.
     if local_batch is not None and metadata_ready:
         local_batch.recv_skipper_forward_mode = (
             SchedulerRecvSkipper.derive_forward_mode(
