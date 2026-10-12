@@ -11,11 +11,13 @@ from sglang.kernels.ops.kvcache.kv_indices import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.dcp.layout import filter_dcp_local_chunk_kv_indices
+from sglang.srt.layers.dcp.metadata import DCPKVCacheGatherPlan
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
     get_req_to_token_pool,
     get_token_to_kv_pool,
 )
+from sglang.srt.runtime_context import get_parallel
 
 
 class ForwardBatchDeepSeekMHAMixin:
@@ -47,6 +49,7 @@ class ForwardBatchDeepSeekMHAMixin:
     prefix_chunk_num_tokens: Optional[List[int]] = None
     # KV Indices for each chunk
     prefix_chunk_kv_indices: Optional[List[torch.Tensor]] = None
+    prefix_chunk_gather_plans: Optional[List[DCPKVCacheGatherPlan]] = None
     # All chunk KV indices in chunk-major order. The packed dense-prefix path
     # gathers this once, then slices materialized K/V by chunk token count.
     prefix_all_kv_indices: Optional[torch.Tensor] = None
@@ -122,6 +125,16 @@ class ForwardBatchDeepSeekMHAMixin:
             )
             chunk_kv_indices = translator.translate_dcp_read_ids(chunk_kv_indices)
             self.prefix_chunk_kv_indices.append(chunk_kv_indices)
+
+        if get_parallel().dcp_enabled:
+            self.prefix_chunk_gather_plans = [
+                DCPKVCacheGatherPlan.build(indices, lengths, starts)
+                for indices, lengths, starts in zip(
+                    self.prefix_chunk_kv_indices,
+                    self.prefix_chunk_seq_lens_cpu,
+                    self.prefix_chunk_starts_cpu,
+                )
+            ]
 
         if not (pack_all_prefix_chunks or dense_metadata):
             return

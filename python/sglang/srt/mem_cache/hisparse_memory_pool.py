@@ -132,9 +132,11 @@ class HiSparseDSATokenToKVPool(DSATokenToKVPool):
         layer: RadixAttention,
         loc: torch.Tensor,
         dst_dtype: Optional[torch.dtype] = None,
+        *,
+        out: Optional[torch.Tensor] = None,
     ):
         loc = self.translate_loc_to_hisparse_device(loc)
-        return super().get_mla_kv_buffer(layer, loc, dst_dtype)
+        return super().get_mla_kv_buffer(layer, loc, dst_dtype, out=out)
 
     def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
         raise NotImplementedError("HiSparseDevicePool does not support get_cpu_copy")

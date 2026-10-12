@@ -1,6 +1,6 @@
 import concurrent.futures
 import unittest
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -16,6 +16,11 @@ from sglang.srt.layers.dcp.comm import (
     all_gather_kv_cache_for_mha_extend,
     all_gather_kv_cache_for_mla_extend,
 )
+from sglang.srt.layers.dcp.metadata import (
+    DCPKVCacheGatherPlan,
+    DecodeContextParallelMetadata,
+)
+from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -323,21 +328,41 @@ class TestDcpGather(CustomTestCase):
         parallel.dcp_group = SimpleNamespace(
             all_gather_into_tensor=all_gather_into_tensor
         )
-        with patch("sglang.srt.layers.dcp.comm.get_parallel", return_value=parallel):
+        with (
+            patch("sglang.srt.layers.dcp.comm.get_parallel", return_value=parallel),
+            patch("sglang.srt.runtime_context.get_parallel", return_value=parallel),
+        ):
             local = [
                 x[(parallel.dcp_rank - start) % parallel.dcp_size :: parallel.dcp_size]
                 for x, start in zip(rows, starts)
             ]
             local = torch.cat(local).to(device="cuda", dtype=dtype)
             expected = torch.cat(rows).cuda()
-            k, pe = local.split([512, 64], dim=-1)
-            lens, offsets = torch.tensor(lengths), torch.tensor(starts)
+            # Exercise the real pool reader with noncontiguous physical rows.
+            indices = torch.arange(len(local), device="cuda", dtype=torch.int32) * 2 + 1
+            storage = torch.zeros(max(1, len(local) * 2), 1, 576, device="cuda")
+            storage[indices.long()] = local.float()
+            storage = storage.to(dtype)
+            pool = SimpleNamespace(
+                kv_lora_rank=512,
+                qk_rope_head_dim=64,
+                dtype=dtype,
+                get_key_buffer=lambda layer_id: storage,
+            )
+            pool.get_mla_kv_buffer = MethodType(
+                MLATokenToKVPool.get_mla_kv_buffer, pool
+            )
+            layer = SimpleNamespace(layer_id=0)
+            metadata = DecodeContextParallelMetadata(
+                dcp_local_prefix_kv_indices=indices
+            )
+            plan = DCPKVCacheGatherPlan.build(indices, lengths, starts)
             combined_prefix = local.new_empty(sum(lengths), 1, 576)
             all_gather_kv_cache_for_dcp(
-                k, pe, lens, offsets, output=combined_prefix.split([512, 64], dim=-1)
+                pool, layer, plan, output=combined_prefix.split([512, 64], dim=-1)
             )
             actual = all_gather_kv_cache_for_mha_chunk_extend(
-                k.squeeze(1), pe, lens, offsets
+                pool, layer, plan, 512, 64, dtype
             )
             torch.testing.assert_close(
                 combined_prefix.float(), expected, rtol=0, atol=0
@@ -352,13 +377,6 @@ class TestDcpGather(CustomTestCase):
 
             if any(starts):
                 return
-            # The cache reader is a boundary here; exercise the real merge/layout
-            # consumers with exact local KV, including ranks owning no prefix rows.
-            pool = SimpleNamespace(
-                get_mla_kv_buffer=lambda *args, dst_dtype=None: tuple(
-                    x.to(dst_dtype or dtype) for x in (k, pe)
-                )
-            )
             extend_lens = [2, 1, 3][: len(lengths)]
             suffix = (
                 torch.randn(sum(extend_lens), 1, 576, generator=generator)
@@ -370,9 +388,9 @@ class TestDcpGather(CustomTestCase):
             )
             all_gather_kv_cache_for_mla_extend(
                 pool,
-                None,
+                layer,
                 lengths,
-                None,
+                metadata,
                 sum(lengths),
                 combined,
                 512,
@@ -387,8 +405,8 @@ class TestDcpGather(CustomTestCase):
             )
             outputs = all_gather_kv_cache_for_mha_extend(
                 pool,
-                None,
-                None,
+                layer,
+                metadata,
                 lengths,
                 extend_lens,
                 suffix[:, 0, :512],
