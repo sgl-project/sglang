@@ -892,7 +892,7 @@ class Envs:
     # TP2: each layer's FFN (gate_up .. down, before the all-reduce) as one launch.
     SGLANG_QWEN3_8_DENSE_MONO_K2 = EnvBool(True)
     # The widest decode step K1 / K2 take (1..8 at TP1, 1..16 at TP2); unset, the
-    # TP's default (K1 8; K2 4 at TP1, 8 at TP2).
+    # TP's default (K1 4 / K2 4 at TP1, K1 8 / K2 8 at TP2).
     SGLANG_QWEN3_8_DENSE_MONO_K1_MAX_ROWS = EnvInt(None)
     SGLANG_QWEN3_8_DENSE_MONO_K2_MAX_ROWS = EnvInt(None)
     # Fuse MiniMax-M3 main/index QK norm + RoPE with main KV and index-K cache
