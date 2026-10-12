@@ -460,26 +460,37 @@ def _modulate_scale_shift(
     ).to(dtype)
 
 
-def _modulate_quantize_block_fp8(
+def _norm_modulate_quantize_block_fp8(
     x: torch.Tensor,
+    norm: nn.Module,
     shift: torch.Tensor,
     scale: torch.Tensor,
     indices: torch.Tensor,
     *,
     linear: nn.Module,
+    fused: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """``_modulate_scale_shift`` then ``linear``'s own block-FP8 input quant.
+    """RMSNorm + AdaLN, then ``linear``'s own block-FP8 input quant.
 
     Returns the ``(fp8 rows, row-major packed UE8M0 scales)`` pair ``linear``
-    would build from the modulated rows for DeepGEMM, in one kernel where the
-    modulation would have taken its fused kernel.
+    would build from the modulated rows for DeepGEMM. Preserve the request's
+    fused RMSNorm + AdaLN rounding; on the reference path, fuse modulation
+    with quantization instead.
     """
     group_size = linear.quant_method.quant_config.weight_block_size[1]
-    if can_use_indexed_scale_shift_block_fp8(x, shift, scale, group_size=group_size):
-        return indexed_scale_shift_block_fp8(
-            x, shift, scale, indices, group_size=group_size
+    if fused:
+        modulated = _modulate_rmsnorm_scale_shift(
+            x, norm, shift, scale, indices, dtype=_BF16_DTYPE, fused=True
         )
-    modulated = _modulate_scale_shift(x, shift, scale, indices, dtype=_BF16_DTYPE)
+    else:
+        x = norm(x)
+        if can_use_indexed_scale_shift_block_fp8(
+            x, shift, scale, group_size=group_size
+        ):
+            return indexed_scale_shift_block_fp8(
+                x, shift, scale, indices, group_size=group_size
+            )
+        modulated = _modulate_scale_shift(x, shift, scale, indices, dtype=_BF16_DTYPE)
     # DeepGEMM's own quantizer, scales made row-major for the all-gather.
     q, q_scale = fp8_utils.sglang_per_token_group_quant_fp8(
         modulated,
@@ -1868,6 +1879,7 @@ class MiniMaxH3DiTBlock(nn.Module):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = adaln_params
         qkv_proj, out_proj = self.attn.qkv_proj, self.attn.out_proj
         fc1, fc2 = self.mlp.fc1, self.mlp.fc2
+        fused_norm_modulate = minimax_h3_norm_modulate_active(self)
         lane = comm_lane(x.device)
         mine = x.shape[0] // chunks
         spans = [slice(c * mine, (c + 1) * mine) for c in range(chunks)]
@@ -1878,12 +1890,14 @@ class MiniMaxH3DiTBlock(nn.Module):
         # previous chunk's projection runs, into one buffer attention reads.
         gathered = [
             lane.gather(
-                _modulate_quantize_block_fp8(
-                    self.norm1(x[span]),
+                _norm_modulate_quantize_block_fp8(
+                    x[span],
+                    self.norm1,
                     shift_msa,
                     scale_msa,
                     indices[span],
                     linear=qkv_proj,
+                    fused=fused_norm_modulate,
                 ),
                 group=qkv_proj.tp_group,
             )
@@ -1917,12 +1931,14 @@ class MiniMaxH3DiTBlock(nn.Module):
             _modulate_gate_rows_(x[span], gate_msa, pending.result(), indices[span])
             gathered.append(
                 lane.gather(
-                    _modulate_quantize_block_fp8(
-                        self.norm2(x[span]),
+                    _norm_modulate_quantize_block_fp8(
+                        x[span],
+                        self.norm2,
                         shift_mlp,
                         scale_mlp,
                         indices[span],
                         linear=fc1,
+                        fused=fused_norm_modulate,
                     ),
                     group=fc1.tp_group,
                 )

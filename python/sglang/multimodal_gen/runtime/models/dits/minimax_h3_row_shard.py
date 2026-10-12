@@ -84,19 +84,24 @@ def prequantized_scale_dtype(linear: nn.Module) -> torch.dtype | None:
     # input to compute its own delta, so it keeps the all-reduce path.
     if not isinstance(linear, ColumnParallelLinear) or linear.bias is not None:
         return None
+    return torch.int32 if _uses_deepgemm_block_fp8(linear) else None
+
+
+def _uses_deepgemm_block_fp8(linear: nn.Module) -> bool:
+    """Whether chunking this layer keeps the verified DeepGEMM arithmetic."""
     method = linear.quant_method
     if not (
         isinstance(method, Fp8LinearMethod)
         and method.block_quant
         and not method.use_marlin
     ):
-        return None
+        return False
     runner = method.w8a8_block_fp8_linear
     block = method.quant_config.weight_block_size
     # From the layer, not its weight: under layerwise offload a layer that is
     # not resident holds a placeholder in its place.
     n, k = linear.output_size_per_partition, linear.input_size_per_partition
-    if (
+    return (
         runner is fp8_utils.deepgemm_w8a8_block_fp8_linear_with_fallback
         and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
         # The shapes the runner hands to DeepGEMM rather than to Triton, which
@@ -104,9 +109,7 @@ def prequantized_scale_dtype(linear: nn.Module) -> torch.dtype | None:
         and list(block) == [128, 128]
         and n % 64 == 0
         and k % 128 == 0
-    ):
-        return torch.int32
-    return None
+    )
 
 
 # SMs the side stream's NCCL kernels hold while a GEMM runs: one block per
@@ -137,8 +140,12 @@ def _num_sms(device: torch.device) -> int:
 
 
 def _plain_row_parallel(linear: nn.Module) -> bool:
-    """Whether ``unreduced_linear`` gives this layer's partial sums."""
-    return type(linear) is RowParallelLinear and linear.bias is None
+    """Whether chunked ``unreduced_linear`` preserves this layer's partial sums."""
+    return (
+        type(linear) is RowParallelLinear
+        and linear.bias is None
+        and _uses_deepgemm_block_fp8(linear)
+    )
 
 
 def row_chunks(

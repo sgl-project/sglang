@@ -166,7 +166,9 @@ def _row_mixing_attention(local_inner: int):
     return attend
 
 
-def _two_gpu_worker(rank: int, port: int, scale_dtype: torch.dtype, failures) -> None:
+def _two_gpu_worker(
+    rank: int, port: int, scale_dtype: torch.dtype, fused_norm_modulate: bool, failures
+) -> None:
     os.environ.update(
         MASTER_ADDR="127.0.0.1",
         MASTER_PORT=str(port),
@@ -201,6 +203,10 @@ def _two_gpu_worker(rank: int, port: int, scale_dtype: torch.dtype, failures) ->
             )
         _fill_block_fp8(block, rank=rank)
         block.attn.attend = _row_mixing_attention(block.attn.local_inner_dim)
+        if fused_norm_modulate:
+            from sglang.kernels.ops.diffusion import mount_minimax_h3_norm_modulate
+
+            assert mount_minimax_h3_norm_modulate(block)
 
         g = torch.Generator("cuda").manual_seed(0)
         hidden = (torch.randn(_ROWS, 1024, device="cuda", generator=g) * 2).to(
@@ -266,6 +272,26 @@ def _two_gpu_worker(rank: int, port: int, scale_dtype: torch.dtype, failures) ->
                     f"chunks={chunks}: {int((diff > 0).sum())} elements differ, "
                     f"max {diff.max().item()}"
                 )
+        # ignored_layers can leave either row projection in BF16 even when
+        # the column projections use DeepGEMM. Chunking its GEMM can change
+        # cuBLAS's accumulation, so the whole stack must keep all-reduce.
+        for linear, prefix in (
+            (out_proj, "blocks.0.attn.out_proj"),
+            (block.mlp.fc2, "blocks.0.mlp.fc2"),
+        ):
+            method = linear.quant_method
+            ignored_config = Fp8Config(ignored_layers=[prefix])
+            linear.quant_method = ignored_config.get_quant_method(linear, prefix)
+            assert (
+                minimax_h3_row_shard.row_chunks(
+                    column_linears=(block.attn.qkv_proj, block.mlp.fc1),
+                    row_linears=(out_proj, block.mlp.fc2),
+                    tp_size=2,
+                    rows=_ROWS,
+                )
+                == 0
+            )
+            linear.quant_method = method
     except BaseException as exc:  # reported to the parent
         failures.put(f"rank {rank}: {exc!r}")
         raise
@@ -278,7 +304,10 @@ def _deep_gemm_has_sm120_kernels() -> bool:
 
 
 @pytest.mark.skipif(not _two_sm120_gpus(), reason="needs two SM120 GPUs")
-def test_block_fp8_row_sharded_block_is_bit_exact_at_tp2(monkeypatch):
+@pytest.mark.parametrize("fused_norm_modulate", [False, True])
+def test_block_fp8_row_sharded_block_is_bit_exact_at_tp2(
+    monkeypatch, fused_norm_modulate
+):
     if not _deep_gemm_has_sm120_kernels():
         pytest.skip("the installed DeepGEMM has no SM120 kernels")
     # DeepGEMM wins the auto dispatch where it is installed. Read at import, so
@@ -290,7 +319,7 @@ def test_block_fp8_row_sharded_block_is_bit_exact_at_tp2(monkeypatch):
     procs = [
         ctx.Process(
             target=_two_gpu_worker,
-            args=(rank, port, torch.int32, failures),
+            args=(rank, port, torch.int32, fused_norm_modulate, failures),
         )
         for rank in range(2)
     ]
