@@ -1083,6 +1083,12 @@ class ModelRunner:
     def post_capture_elastic_ep_recover(self):
         join_process_groups()
 
+        operation = ElasticEPStateManager.current_recovery_operation()
+        if get_exec().moe.moe_a2a_backend == "nixl":
+            from sglang.srt.layers.moe.token_dispatcher.nixl import NixlEPBuffer
+
+            NixlEPBuffer.connect_recovery(operation, replacement=True)
+
         global_ep_rank = get_parallel().tp_rank + get_parallel().ep_join_rank_offset
         broadcast_global_expert_location_metadata(
             model_config=self.model_config,
