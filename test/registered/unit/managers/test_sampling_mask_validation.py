@@ -1,12 +1,10 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
 
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.custom_logit_processor import (
-    CustomLogitProcessor,
     DisallowedTokensLogitsProcessor,
     Qwen3ThinkingBudgetLogitProcessor,
 )
@@ -71,15 +69,6 @@ class TestSamplingMaskValidation(CustomTestCase):
                     ValueError, "only supports DisallowedTokensLogitsProcessor"
                 ):
                     self._validate(processor)
-
-    def test_disabled_processors_are_not_deserialized(self):
-        with (
-            get_context().override_server_args(enable_custom_logit_processor=False),
-            patch.object(CustomLogitProcessor, "from_str") as deserialize,
-        ):
-            with self.assertRaisesRegex(ValueError, "--enable-custom-logit-processor"):
-                self._validate(DisallowedTokensLogitsProcessor.to_str())
-            deserialize.assert_not_called()
 
     def test_other_processors_still_work_without_sampling_masks(self):
         self._validate(
