@@ -103,6 +103,8 @@ To use these workflows:
 SGLang's optimized kernels and parallelism (TP / SP, compile, cache) run on the
 DiT only. Text encoding and VAE stay in ComfyUI.
 
+Start ComfyUI with `--disable-cuda-malloc` for integrated mode. ComfyUI's default `cudaMallocAsync` pool cannot export CUDA IPC handles, so per-step tensors (latents, ControlNet residuals) then go through a host copy; with the flag they are shared on the GPU. Flux + ControlNet at 1024x1024 on an H100 drops from 13.1s to 4.7s for 25 steps.
+
 ## Architecture
 
 ```mermaid
