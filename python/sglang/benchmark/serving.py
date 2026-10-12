@@ -1152,7 +1152,8 @@ def calculate_metrics(
     # is observable from the response stream for any streaming backend. Gating it on the
     # backend name instead means one run can measure two systems under two definitions.
     use_retokenized_itl = any(
-        o.success and o.text_chunks and o.output_len > len(o.text_chunks) for o in outputs
+        o.success and o.text_chunks and o.output_len > len(o.text_chunks)
+        for o in outputs
     )
 
     for i in range(len(outputs)):
