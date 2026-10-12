@@ -1,11 +1,15 @@
-"""Sparse attention reading V4.1 FP8/FP4 pages directly on HIP. The tile step
-(_compact_qkpv) is adapted from _qkpv_fp8 of aiter's former gfx950 gluon sparse decode
-kernel (MIT)."""
+"""Sparse attention reading V4.1 FP8/FP4 pages directly on HIP."""
 
 from typing import Optional, Tuple
 
 import torch
 import triton
+from aiter.ops.triton._gluon_kernels.gfx950.attention.sparse_mla import (
+    Cfg,
+    Fmt,
+    Seg,
+    _qkpv_lds,
+)
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
@@ -92,41 +96,28 @@ def _read_compact_gluon(
 
 
 @gluon.jit
-def _compact_qkpv(
-    kv,
-    valid,
-    qdot,
-    m,
-    den,
-    acc,
-    head_mask,
-    smem,
-    MF: gl.constexpr,
-    H: gl.constexpr,
-    BLOCK: gl.constexpr,
-    SCALE: gl.constexpr,
-):
-    """One bf16 tile through LDS: QK, online softmax, PV. m stays the raw-score row max,
-    which the epilogue and the split partials scale; a row with no valid slot yet keeps 0."""
-    qk_scale: gl.constexpr = SCALE * RCP_LN2
-    KV: gl.constexpr = gl.DotOperandLayout(1, MF, 8)
+def _compact_qkpv(cfg, seg, kv, valid, qdot, m, den, acc, head_mask, smem, qk_scale):
+    """The dequantized tile into LDS, then aiter's QK -> softmax -> PV over it. m is the
+    running row max in the base-2 exponent domain (scores * qk_scale)."""
     smem.store(kv)
-    k = smem.permute([1, 0]).load(KV)
-    s = gl.amd.cdna4.mfma(qdot, k, gl.zeros([16, BLOCK], gl.float32, layout=MF))
-    mask = gl.convert_layout(valid, gl.SliceLayout(0, MF))[None, :]
-    if H % 16 != 0:
-        mask = head_mask[:, None] & mask
-    s = gl.where(mask, s, -float("inf"))
-    m_new = gl.maximum(m, gl.max(s, axis=1))
-    m_new = gl.where(m_new > -float("inf"), m_new, 0.0)
-    m_scaled = m_new * qk_scale
-    p = gl.exp2(s * qk_scale - m_scaled[:, None])
-    alpha = gl.exp2(m * qk_scale - m_scaled)
-    den = den * alpha + gl.sum(p, axis=1)
-    v = smem.load(KV)
-    p = gl.convert_layout(p.to(gl.bfloat16), gl.DotOperandLayout(0, MF, 8))
-    acc = gl.amd.cdna4.mfma(p, v, acc * alpha[:, None])
-    return m_new, den, acc
+    # aiter's private helper, by keyword: a renamed or reordered parameter fails to compile.
+    # No rope buffer (ROPE_SEPARATE=False) and no fp8 V scale ("bf16"), so the rope and
+    # v_scale arguments are never read.
+    return _qkpv_lds(
+        cfg=cfg,
+        seg=seg,
+        valid=valid,
+        q_dot=qdot,
+        q_rope_dot=qdot,
+        m_i=m,
+        l_i=den,
+        acc=acc,
+        head_mask=head_mask,
+        qk_scale=qk_scale,
+        v_scale=1.0,
+        kv_smem=smem,
+        rope_smem=smem,
+    )
 
 
 @gluon.jit
@@ -195,25 +186,31 @@ def _compact_attention_kernel(
     BLOCK: gl.constexpr,
 ):
     t, split, hg = gl.program_id(0).to(gl.int64), gl.program_id(1), gl.program_id(2)
-    MF: gl.constexpr = gl.amd.AMDMFMALayout(
-        version=4, instr_shape=[16, 16, 16], transposed=True, warps_per_cta=[1, 4]
+    cfg = Cfg(
+        BLOCK_M=16,
+        BLOCK_K=BLOCK,
+        KV_DIM=512,
+        ROPE_DIM=0,
+        ROPE_SEPARATE=False,
+        NUM_WARPS=4,
+        UNI_TILE=False,
+        HAS_INVALID=True,
+        HEAD_ALIGNED=H % 16 == 0,
+        IDX_BUFFER_LOAD=False,
     )
+    MF: gl.constexpr = cfg.qk_layout
     G: gl.constexpr = gl.BlockedLayout([1, 16], [8, 8], [1, 4], [1, 0])
     QG: gl.constexpr = gl.BlockedLayout([1, 8], [8, 8], [1, 4], [1, 0])
     hq = hg * 16 + gl.arange(0, 16, layout=gl.SliceLayout(1, QG))
     dq = gl.arange(0, 512, layout=gl.SliceLayout(0, QG))
     q = gl.load(Q + t * QS + hq[:, None] * QH + dq[None, :], hq[:, None] < H, 0)
-    qdot = gl.convert_layout(q, gl.DotOperandLayout(0, MF, 8))
+    qdot = gl.convert_layout(q, cfg.q_layout)
     h = hg * 16 + gl.arange(0, 16, layout=gl.SliceLayout(1, MF))
     d = gl.arange(0, 512, layout=gl.SliceLayout(0, MF))
     m = gl.full((16,), -float("inf"), gl.float32, layout=gl.SliceLayout(1, MF))
     den = gl.zeros((16,), gl.float32, layout=gl.SliceLayout(1, MF))
     acc = gl.zeros((16, 512), gl.float32, layout=MF)
-    smem = gl.allocate_shared_memory(
-        gl.bfloat16,
-        [BLOCK, 512],
-        gl.PaddedSharedLayout.with_identity_for([[512, 8]], [BLOCK, 512], [1, 0]),
-    )
+    smem = gl.allocate_shared_memory(gl.bfloat16, [BLOCK, 512], cfg.kv_shared)
     for segment in gl.static_range(2):
         if segment == 0 or NE > 0:
             if segment == 0:
@@ -222,6 +219,27 @@ def _compact_attention_kernel(
             else:
                 indices, lengths, width, stride, capacity = EI, EL, NE, EIS, EN
                 cache, page, cache_stride, fp4, buffer = E, EP, ES, EFP4, EBUFFER
+            # _qkpv_lds reads only seg.fmt: what sits in LDS is the bf16 dequant
+            seg = Seg(
+                fmt=Fmt(
+                    cfg,
+                    KIND="bf16",
+                    BLOCK_SIZE=page,
+                    USE_BUFFER_LOAD=buffer,
+                    DEQ="none",
+                    NOPE_DIM=512,
+                    NOPE_CHUNK=512,
+                    CHUNK_AXIS=1,
+                ),
+                cache_ptr=cache,
+                alt_ptr=cache,
+                scl_ptr=cache,
+                indices_ptr=indices,
+                seg_start=t * stride,
+                cs0=gl.to_tensor(cache_stride),
+                num_rows=gl.to_tensor(capacity),
+                target=t * stride,
+            )
             length = gl.minimum(gl.load(lengths + t), width)
             if split * BLOCK < length:
                 kv, valid = _compact_tile(
@@ -256,18 +274,27 @@ def _compact_attention_kernel(
                         BLOCK,
                     )
                     m, den, acc = _compact_qkpv(
-                        kv, valid, qdot, m, den, acc, h < H, smem, MF, H, BLOCK, SCALE
+                        cfg,
+                        seg,
+                        kv,
+                        valid,
+                        qdot,
+                        m,
+                        den,
+                        acc,
+                        h < H,
+                        smem,
+                        SCALE * RCP_LN2,
                     )
                     kv, valid = next_kv, next_valid
                 m, den, acc = _compact_qkpv(
-                    kv, valid, qdot, m, den, acc, h < H, smem, MF, H, BLOCK, SCALE
+                    cfg, seg, kv, valid, qdot, m, den, acc, h < H, smem, SCALE * RCP_LN2
                 )
     if SPLITS == 1:
         if HAS_SINK:
             sink = gl.load(Sink + h, h < H, -float("inf"))
-            scaled_max = m * (SCALE * RCP_LN2)
-            final_max = gl.maximum(scaled_max, sink * RCP_LN2)
-            weight = gl.exp2(scaled_max - final_max)
+            final_max = gl.maximum(m, sink * RCP_LN2)
+            weight = gl.exp2(m - final_max)
             den = den * weight + gl.exp2(sink * RCP_LN2 - final_max)
             acc = acc * weight[:, None]
         out = (acc / den[:, None]).to(gl.bfloat16)
@@ -286,7 +313,7 @@ def _compact_attention_kernel(
         gl.store(Out + (t * H + hq[:, None]) * 512 + dq[None, :], out, hq[:, None] < H)
     else:
         off = (t * SPLITS + split) * H + h
-        gl.store(Max + off, m * (SCALE * RCP_LN2), h < H)
+        gl.store(Max + off, m, h < H)
         gl.store(Sum + off, den, h < H)
         gl.store(Acc + off[:, None] * 512 + d[None, :], acc, h[:, None] < H)
 
