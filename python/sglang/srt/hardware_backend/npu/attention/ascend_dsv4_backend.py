@@ -288,6 +288,82 @@ def _ropephase_in(fm, cmp_ratio: int = 4, limit: int = 8) -> str:
     )
 
 
+# READ-ONLY [C4WR] write-trace cache: page -> (lo, hi) slot id range. The page
+# stride is the c4 indexer buffer's kernel page size, i.e. the SAME granularity
+# the [IDXK] reader indexes with ``get_compress_buffer(layer, True)[page]``.
+_C4WR_PAGE_CACHE: dict = {}
+
+
+def _c4wr_page_range(backend, layer_id: int, page: int) -> tuple:
+    """(lo, hi) of c4 pool ``page`` slot ids; derived once and cached.
+
+    Read-only: the buffer is only inspected for its page stride (the writer's
+    ``loc`` slots index the flattened (num_pages, kernel_page_size) buffer, so
+    ``slot // stride`` is the physical page the reader addresses).
+    """
+    cached = _C4WR_PAGE_CACHE.get(page)
+    if cached is not None:
+        return cached
+    buf = backend.token_to_kv_pool.get_compress_buffer(layer_id, True)
+    kp = int(buf.shape[1]) if buf is not None and buf.dim() > 1 else 0
+    if kp <= 0:
+        return (0, 0)
+    rng = (page * kp, (page + 1) * kp)
+    _C4WR_PAGE_CACHE[page] = rng
+    return rng
+
+
+def _c4wr_probe(compressor, loc, forward_batch, backend) -> None:
+    """READ-ONLY write-trace of the compressor scatter site.
+
+    Emits ONE line per writing compressor call for the c4 INDEXER (idx=1),
+    naming the slot ids that land in c4 pool page 136 (ratio-4 blocks
+    4352..4383, tokens 17408..17536) so a MISS vs HIT run can be compared
+    writer-by-writer (does one side write MORE / FEWER page-136 slots, or a
+    different LAST writer?). Gated by ``DSV4_DUMP_C4WR`` (truthy); prints
+    nothing when off and never mutates the pool.
+    """
+    env = os.environ.get("DSV4_DUMP_C4WR")
+    if env is None or env in ("", "0"):
+        return
+    if not compressor.is_in_indexer:
+        return
+    layers = {
+        int(v)
+        for v in os.environ.get("DSV4_DUMP_LAYERS", "").split(",")
+        if v.strip()
+    }
+    if layers and compressor.layer_id not in layers:
+        return
+    if loc is None:
+        return
+    page = int(os.environ.get("DSV4_DUMP_C4WR_PAGE", "136"))
+    lo, hi = _c4wr_page_range(backend, compressor.layer_id, page)
+    if hi <= lo:
+        return
+    s = loc.detach().reshape(-1).to(torch.int64).cpu()
+    tail = s[-40:].tolist()
+    in_page = s[(s >= lo) & (s < hi)].tolist()
+    fm = backend.forward_metadata
+    try:
+        if forward_batch.forward_mode.is_prefill():
+            mode = "prefill"
+        elif forward_batch.forward_mode.is_decode():
+            mode = "decode"
+        else:
+            mode = str(forward_batch.forward_mode).split(".")[-1].lower()
+    except Exception:
+        mode = str(forward_batch.forward_mode)
+    sp = _cpu_int_1d(getattr(fm, "start_pos", None))
+    su = _cpu_int_1d(getattr(fm, "seqused", None))
+    print(
+        f"[C4WR] layer={compressor.layer_id} idx={int(compressor.is_in_indexer)} "
+        f"mode={mode} start={sp} seqused={su} nloc={int(s.numel())} "
+        f"loc_tail={tail} slots_in_page136={in_page} n_136={len(in_page)}",
+        flush=True,
+    )
+
+
 def _apply_hadamard(inp: torch.Tensor, hadamard_matrix: torch.Tensor) -> torch.Tensor:
     init_shape = inp.shape
     flat = inp.view(-1, hadamard_matrix.shape[0])
@@ -1444,6 +1520,14 @@ class CompressorAscendBackendMixin:
         # a legitimate step outcome. Static shape read, so graph capture is unaffected.
         if kv.shape[0] == 0:
             return
+
+        # READ-ONLY write-trace: which compressor call scatters rows into c4 pool
+        # page 136 (the MISS-vs-HIT last-writer divergence). DSV4_DUMP_C4WR gate,
+        # indexer-only; prints nothing and mutates nothing when off.
+        try:
+            _c4wr_probe(compressor, loc, forward_batch, self)
+        except Exception as _c4wr_exc:
+            print(f"[C4WR] skipped: {_c4wr_exc}", flush=True)
 
         if fused_fp8_indexer_write:
             if loc is None:
