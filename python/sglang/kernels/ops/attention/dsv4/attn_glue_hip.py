@@ -280,6 +280,10 @@ def _sparse_buffers_kernel(
             tl.store(fill4_ptr + i, -1, mask=m)
 
 
+# fill0..fill4 of _sparse_buffers_kernel: c4 page indices, then c1/c2 page + raw indices
+_SPARSE_FILL_BUFFERS = 5
+
+
 def sparse_buffers(
     *,
     c4_topk_lengths_clamp1: torch.Tensor,
@@ -330,7 +334,7 @@ def sparse_buffers(
     fill_block = 1024
     per_buffer = triton.cdiv(rows * width, fill_block)
     n_buffers = len(fills)
-    fills += [placeholder] * (5 - n_buffers)
+    fills += [placeholder] * (_SPARSE_FILL_BUFFERS - n_buffers)
     _sparse_buffers_kernel[(1 + per_buffer * n_buffers,)](
         c4_topk_lengths_clamp1,
         c4_topk_lengths_raw,

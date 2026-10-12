@@ -1841,7 +1841,7 @@ class DeepseekV4HipRadixBackend(
                 and not in_capture
                 and key in self.cuda_graph_metadata_of_bucket_and_bs[bucket]
             ):
-                # replay copies it into the captured buffer; a zero-width pad is a clone
+                # replay copies it into the captured buffer, so the alias is only read
                 return out_cache_loc
             return F.pad(
                 out_cache_loc,

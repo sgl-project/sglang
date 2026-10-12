@@ -783,7 +783,27 @@ class DsparkVerifyEpilogue:
         self._tp_sync.sync(SpecTpSyncSite.DSPARK_ACCEPT_GRAPH, correct_len)
         self._tp_sync.sync(SpecTpSyncSite.DSPARK_ACCEPT_GRAPH, bonus)
         self._tp_sync.sync(SpecTpSyncSite.DSPARK_ACCEPT_GRAPH, cap_trim_lens)
-        # finalize and the out-token build write the persistent outputs directly
+        if not _is_hip:
+            finalized = finalize_accept_lens_triton(
+                correct_len=correct_len,
+                cap_trim_lens=cap_trim_lens,
+                prefix_lens=seq_lens[:bs],
+            )
+            out_tokens = BuildOutTokens.execute(
+                draft_tokens=draft_tokens,
+                correct_len=correct_len,
+                bonus=bonus,
+                verify_num_draft_tokens=self.stride,
+                gamma=self.gamma,
+            )
+            self.correct_len_buf[:bs].copy_(correct_len)
+            self.bonus_buf[:bs].copy_(bonus)
+            self.cap_trim_lens_buf[:bs].copy_(cap_trim_lens.to(torch.int32))
+            self.commit_lens_buf[:bs].copy_(finalized.commit_lens)
+            self.new_seq_lens_buf[:bs].copy_(finalized.new_seq_lens)
+            self.out_tokens_buf[:bs].copy_(out_tokens.view(bs, self.stride))
+            return finalized.commit_lens
+        # ROCm: finalize and the out-token build write the persistent outputs directly
         finalized = finalize_accept_lens_triton(
             correct_len=correct_len,
             cap_trim_lens=cap_trim_lens,
@@ -794,24 +814,14 @@ class DsparkVerifyEpilogue:
                 cap_trim_lens=self.cap_trim_lens_buf[:bs],
             ),
         )
-        if candidates.is_cuda:
-            build_out_tokens_triton(
-                draft_tokens=draft_tokens,
-                correct_len=correct_len,
-                bonus=bonus,
-                verify_num_draft_tokens=self.stride,
-                gamma=self.gamma,
-                out=self.out_tokens_buf[:bs],
-            )
-        else:
-            out_tokens = BuildOutTokens.execute(
-                draft_tokens=draft_tokens,
-                correct_len=correct_len,
-                bonus=bonus,
-                verify_num_draft_tokens=self.stride,
-                gamma=self.gamma,
-            )
-            self.out_tokens_buf[:bs].copy_(out_tokens.view(bs, self.stride))
+        build_out_tokens_triton(
+            draft_tokens=draft_tokens,
+            correct_len=correct_len,
+            bonus=bonus,
+            verify_num_draft_tokens=self.stride,
+            gamma=self.gamma,
+            out=self.out_tokens_buf[:bs],
+        )
         self.correct_len_buf[:bs].copy_(correct_len)
         self.bonus_buf[:bs].copy_(bonus)
         return finalized.commit_lens
