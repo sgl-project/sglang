@@ -933,10 +933,12 @@ class VisionAscendAttention(nn.Module):
         )[0]
 
         if valid_indices is not None:
+            output.zero_()
             output.index_copy_(0, valid_indices, attn_output)
         elif output.shape[0] != total_tokens:
             # Single image: write the compact result into the front of the
-            # pre-allocated padded output, leaving the padding rows as-is.
+            # pre-allocated padded output, with finite zero padding.
+            output.zero_()
             output[:total_tokens].copy_(attn_output)
         else:
             output = attn_output
