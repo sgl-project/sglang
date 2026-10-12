@@ -176,7 +176,6 @@ class DevicePoolGroup:
         self.num_layers = num_layers
         self.page_size = page_size
         self.rank_replicated = rank_replicated
-        # Every attention CP rank holds the same pages, not a sequence shard.
         self.cp_replicated = cp_replicated
         self.kv_buffer = None
 
@@ -391,8 +390,6 @@ def _build_deepseek_v4_device_pool_group(
         mappings.transfer_layer_id_max,
         page_size,
         rank_replicated=True,
-        # Prefill CP materializes the whole chunk on every rank before caching it,
-        # see deepseek_v4.py and dsv4/compressor.py (cp_materialize_global_token_order).
         cp_replicated=True,
     )
 

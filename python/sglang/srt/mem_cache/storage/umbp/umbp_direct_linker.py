@@ -57,8 +57,6 @@ def _storage_suffix(
     parts = []
     if not rank_replicated:
         parts.append(f"tp{tp_rank}")
-    # A CP-replicated group would store attn_cp_size copies under per-rank cp terms;
-    # cp0 keeps its keys identical to a deployment without CP.
     cp_term = 0 if cp_replicated else attn_cp_rank
     parts.extend((f"cp{cp_term}", f"pp{pp_rank}"))
     return "_".join(parts)

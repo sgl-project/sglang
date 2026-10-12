@@ -47,9 +47,6 @@ class TestStorageSuffix(CustomTestCase):
         self.assertEqual(suffixes[3], "tp3_cp0_pp0")
 
     def test_cp_replicated_group_shares_the_non_cp_key(self):
-        """DeepSeek-V4 prefill CP leaves the whole chunk on every CP rank, so a
-        per-rank cp term stored attn_cp_size identical copies of every page and
-        cut the tier's usable capacity by that factor. PP still shards layers."""
         suffixes = {
             _storage_suffix(
                 rank_replicated=True,
@@ -64,7 +61,6 @@ class TestStorageSuffix(CustomTestCase):
         self.assertEqual(suffixes, {"cp0_pp1"})
 
     def test_group_not_cp_replicated_keeps_a_key_per_cp_rank(self):
-        # Such a group may hold a sequence shard per CP rank, so CP must not collapse.
         suffixes = {
             _storage_suffix(
                 rank_replicated=True,
