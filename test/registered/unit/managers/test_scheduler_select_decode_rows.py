@@ -68,6 +68,7 @@ class TestMixedStepHoldsDecodeRows(CustomTestCase):
     def test_kv_full_running_rows_sit_out_without_retracting(self):
         s = MagicMock()
         s.select_decode_rows = MethodType(Scheduler.select_decode_rows, s)
+        s.admission_skip_reason = MethodType(Scheduler.admission_skip_reason, s)
         s._reqs_finishing_inflight.return_value = []
         s.grammar_manager.has_waiting_grammars.return_value = False
         s.enable_priority_preemption = False

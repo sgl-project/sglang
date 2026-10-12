@@ -219,6 +219,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
+    AdmissionSkipReason,
     PrefillAdder,
     SchedulePolicy,
 )
@@ -3952,6 +3953,30 @@ class Scheduler(
 
         return res
 
+    def admission_skip_reason(
+        self, running_batch: ScheduleBatch
+    ) -> Optional[AdmissionSkipReason]:
+        """Why this step's admission cannot admit anything, or None to run it.
+
+        Reads only current state, and is checked before admission touches any
+        state, so a skipped step leaves the same state as an empty admission.
+        """
+        # A chunked request always continues: under PP it can start in one
+        # micro-batch and end in another, so its slot is not counted here.
+        if self.chunked_req is not None:
+            return None
+        if not self.waiting_queue:
+            return AdmissionSkipReason.NO_WAITING
+        if (
+            not self.enable_priority_preemption
+            and self.get_num_allocatable_reqs(
+                len(running_batch.reqs), running_batch=running_batch
+            )
+            <= 0
+        ):
+            return AdmissionSkipReason.NO_REQ_SLOT
+        return None
+
     def get_new_batch_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
@@ -3998,9 +4023,7 @@ class Scheduler(
             # other place that clears the flag, so admission would stay shut.
             running_batch.batch_is_full = False
 
-        if (
-            running_batch.batch_is_full or len(self.waiting_queue) == 0
-        ) and self.chunked_req is None:
+        if running_batch.batch_is_full and self.chunked_req is None:
             return None, running_batch
 
         running_bs = len(running_batch.reqs)
@@ -4017,17 +4040,9 @@ class Scheduler(
         ):
             return None, running_batch
 
-        # Ignore the check if self.chunked_req is not None.
-        # In the non-PP case, when self.chunked_req is not None, num_allocatable_reqs should always be greater than 0,
-        # as the space for the chunked requests has just been released.
-        # In PP case, chunked requests (or dllm requests) can start in one microbatch and end in another microbatch, so the max_running_requests per microbatch should not be strict.
-        # Instead, we should always allow chunked requests to be added, otherwise, there will be a memory leak.
-        if (
-            self.get_num_allocatable_reqs(running_bs, running_batch=running_batch) <= 0
-            and self.chunked_req is None
-            and not self.enable_priority_preemption
-        ):
-            running_batch.batch_is_full = True
+        if (skip_reason := self.admission_skip_reason(running_batch)) is not None:
+            if skip_reason == AdmissionSkipReason.NO_REQ_SLOT:
+                running_batch.batch_is_full = True
             return None, running_batch
 
         # Get priority queue
