@@ -691,6 +691,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         """
         output_batch = None
         forward_failed = False
+        release_cache = False
         # A closure left behind by an aborted dispatch must not pair with this
         # request's output.
         self._deferred_finalize = None
@@ -832,9 +833,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 output_batch = OutputBatch()
             output_batch.error = f"Error executing {error_context}: {e}"
             self._record_output_peak_memory(output_batch, is_warmup=req.is_warmup)
-            # clean cache if OOM
-            if not current_platform.is_cpu():
-                torch.get_device_module().empty_cache()
+            release_cache = True
         finally:
             # also runs on the propagate_forward_errors re-raise: a warmup
             # forward that never completed must still leave a failed record,
@@ -856,6 +855,11 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                     layerwise_layer_uses=layerwise_layer_uses,
                     layerwise_layer_uses_by_stage=layerwise_layer_uses_by_stage,
                 )
+        # clean cache if OOM; the failed forward's tensors are freed only once
+        # the except clause exits
+        if release_cache and not current_platform.is_cpu():
+            gc.collect()
+            torch.get_device_module().empty_cache()
         return output_batch
 
     def _finalize_output_batch(
