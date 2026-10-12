@@ -10,21 +10,14 @@ row-wise as ``img_mlp.gate_up = [gate; up]``.
 import re
 from typing import Any
 
-from sglang.multimodal_gen.configs.models.dits.qwenimage21 import QwenImage21DitConfig
 from sglang.multimodal_gen.runtime.loader.comfyui_checkpoints.spec import (
     ComfyUICheckpointSpec,
     WeightIterator,
     register_comfyui_checkpoint,
 )
-from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 # INT8 ConvRot files carry a per-row weight_scale next to each weight.
 _GATE_UP_RE = re.compile(r"^(.*\.img_mlp)\.gate_up\.(weight|weight_scale)$")
-
-
-def _build_dit_config(server_args: ServerArgs) -> QwenImage21DitConfig:
-    # The Comfy-Org files are the default Qwen-Image 2.1 architecture.
-    return server_args.pipeline_config.dit_config
 
 
 def _convert_weights(weights: WeightIterator, dit_config: Any) -> WeightIterator:
@@ -37,10 +30,6 @@ def _convert_weights(weights: WeightIterator, dit_config: Any) -> WeightIterator
         if match is None:
             yield name, tensor
             continue
-        if tensor.shape[0] != 2 * ffn_dim:
-            raise ValueError(
-                f"{name} must have {2 * ffn_dim} rows, got {tuple(tensor.shape)}"
-            )
         mlp, param = match.groups()
         # Exact for INT8 too: ConvRot rotates the input axis, the scale is per row.
         yield f"{mlp}.gate_layer.{param}", tensor[:ffn_dim]
@@ -67,7 +56,8 @@ register_comfyui_checkpoint(
     "QwenImage21Pipeline",
     ComfyUICheckpointSpec(
         dit_cls_name="QwenImage21Transformer2DModel",
-        build_dit_config=_build_dit_config,
+        # The Comfy-Org files are the default Qwen-Image 2.1 architecture.
+        build_dit_config=lambda server_args: server_args.pipeline_config.dit_config,
         convert_weights=_convert_weights,
         quant_markers=_quant_markers,
     ),

@@ -16,17 +16,6 @@ COND_EXTRA_KEY = "qwen21_cond"
 _LATENT_SCALE = 16
 
 
-def _dit_patches(transformer_options) -> bool:
-    opts = transformer_options or {}
-    patches = opts.get("patches") or {}
-    return bool(
-        (opts.get("patches_replace") or {}).get("dit")
-        or patches.get("post_input")
-        or patches.get("single_block")
-        or patches.get("attn1_patch")
-    )
-
-
 class QwenImage21Adapter(ComfyUIModelAdapter):
     model_types = ("qwen_image21",)
     pipeline_class_name = "QwenImage21Pipeline"
@@ -43,14 +32,15 @@ class QwenImage21Adapter(ComfyUIModelAdapter):
         transformer_options=None,
         **kwargs,
     ) -> PackedForward:
-        if _dit_patches(transformer_options):
-            raise NotImplementedError(
-                "Qwen-Image 2.1 SGLD integrated mode does not run ComfyUI DiT "
-                "patches (model patches, Fun-Control, attention hooks); use UNETLoader"
-            )
+        sigmas = (transformer_options or {}).get("sample_sigmas")
+        final_sigma = None
+        if sigmas is not None and (sigmas > 0).any():
+            final_sigma = float(sigmas[sigmas > 0].min())
         payload = {
             "image_slots": list(image_slots or []),
-            "ref_latents": [r for r in (ref_latents or []) if r is not None],
+            "ref_latents": list(ref_latents or []),
+            # The worker frees this cond's prefix K/V cache after this sigma.
+            "final_sigma": final_sigma,
         }
         return PackedForward(
             latents=x,
@@ -67,27 +57,12 @@ class QwenImage21Adapter(ComfyUIModelAdapter):
 
     def fill_req(self, req, packed: PackedForward) -> None:
         super().fill_req(req, packed)
-        payload = packed.extra_req.get(COND_EXTRA_KEY)
-        if payload is not None:
-            req.extra = {**(req.extra or {}), COND_EXTRA_KEY: payload}
+        if COND_EXTRA_KEY in packed.extra_req:
+            req.extra = {**req.extra, COND_EXTRA_KEY: packed.extra_req[COND_EXTRA_KEY]}
 
 
 class QwenImage21Executor(SGLDiffusionExecutor):
     adapter_cls = QwenImage21Adapter
-
-    def __init__(self, generator, model_path, model, config):
-        super().__init__(generator, model_path, model, config)
-        self.current_patcher = None
-
-    @classmethod
-    def validate_sgld_options(cls, sgld_options: dict | None) -> None:
-        options = sgld_options or {}
-        if options.get("enable_cfg_parallel"):
-            raise ValueError(
-                "enable_cfg_parallel does not apply to Qwen-Image 2.1 in ComfyUI "
-                "integrated mode: ComfyUI runs CFG itself, so every CFG rank would "
-                "recompute the same DiT call. Use sp_degree=2 or tp_size=2."
-            )
 
     def reset_prefix_cache(self, enabled):
         """Called by ComfyUI's QwenImage21 on pre_run / cleanup; the cache lives on the worker."""

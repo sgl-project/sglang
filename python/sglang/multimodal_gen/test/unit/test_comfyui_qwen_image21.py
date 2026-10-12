@@ -21,7 +21,6 @@ from sglang.multimodal_gen.configs.models.dits.qwenimage21 import (
 from sglang.multimodal_gen.runtime.loader.comfyui_checkpoints import (
     get_comfyui_checkpoint_spec,
 )
-from sglang.multimodal_gen.runtime.models.dits.qwen_image21 import build_layout
 from sglang.multimodal_gen.runtime.pipelines_core.comfyui_mode import (
     bind_comfyui_session,
     get_run_state,
@@ -31,52 +30,30 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages i
     qwen_image21 as stage_mod,
 )
 
-AXES = (16, 56, 56)
-
-
-def _small_dit_config():
-    return QwenImage21DitConfig(
-        arch_config=QwenImage21ArchConfig(
-            num_layers=2, num_attention_heads=1, attention_head_dim=4
-        )
+# hidden_size 4, ffn 12.
+_DIT_CONFIG = QwenImage21DitConfig(
+    arch_config=QwenImage21ArchConfig(
+        num_layers=2, num_attention_heads=1, attention_head_dim=4
     )
+)
 
 
 def test_checkpoint_spec_splits_fused_gate_up_and_int8_scales() -> None:
+    mlp, ffn = "transformer_blocks.0.img_mlp", 12
+    gate_up, scale = torch.randn(2 * ffn, 4), torch.randn(2 * ffn, 1)
+    weights = [
+        (f"{mlp}.gate_up.weight", gate_up),
+        (f"{mlp}.gate_up.weight_scale", scale),
+        (f"{mlp}.gate_up.comfy_quant", torch.zeros(3)),
+        ("img_in.weight", torch.ones(1)),
+    ]
     spec = get_comfyui_checkpoint_spec("QwenImage21Pipeline")
-    assert spec.dit_cls_name == "QwenImage21Transformer2DModel"
-    ffn = 4 * 3
-    gate_up = torch.arange(2 * ffn * 4, dtype=torch.float32).reshape(2 * ffn, 4)
-    scale = torch.arange(2 * ffn, dtype=torch.float32)[:, None]
-    out = dict(
-        spec.convert_weights(
-            iter(
-                [
-                    ("transformer_blocks.0.img_mlp.gate_up.weight", gate_up),
-                    ("transformer_blocks.0.img_mlp.gate_up.weight_scale", scale),
-                    (
-                        "transformer_blocks.0.img_mlp.gate_up.comfy_quant",
-                        torch.zeros(3),
-                    ),
-                    ("img_in.weight", torch.ones(1)),
-                ]
-            ),
-            _small_dit_config(),
-        )
-    )
+    out = dict(spec.convert_weights(iter(weights), _DIT_CONFIG))
+    assert len(out) == 5 and "img_in.weight" in out
     # ComfyUI's swiglu is silu(first half) * second half.
-    prefix = "transformer_blocks.0.img_mlp"
-    assert torch.equal(out[f"{prefix}.gate_layer.weight"], gate_up[:ffn])
-    assert torch.equal(out[f"{prefix}.proj.weight"], gate_up[ffn:])
-    assert torch.equal(out[f"{prefix}.gate_layer.weight_scale"], scale[:ffn])
-    assert torch.equal(out[f"{prefix}.proj.weight_scale"], scale[ffn:])
-    assert set(out) == {
-        f"{prefix}.gate_layer.weight",
-        f"{prefix}.proj.weight",
-        f"{prefix}.gate_layer.weight_scale",
-        f"{prefix}.proj.weight_scale",
-        "img_in.weight",
-    }
+    for param, fused in (("weight", gate_up), ("weight_scale", scale)):
+        assert torch.equal(out[f"{mlp}.gate_layer.{param}"], fused[:ffn])
+        assert torch.equal(out[f"{mlp}.proj.{param}"], fused[ffn:])
 
 
 def test_int8_marker_of_fused_gate_up_covers_both_halves(monkeypatch) -> None:
@@ -92,15 +69,24 @@ def test_int8_marker_of_fused_gate_up_covers_both_halves(monkeypatch) -> None:
         },
     )
     markers = get_comfyui_checkpoint_spec("QwenImage21Pipeline").quant_markers(["f"])
-    assert set(markers) == {
-        "transformer_blocks.0.img_mlp.gate_layer",
-        "transformer_blocks.0.img_mlp.proj",
-        "transformer_blocks.0.attn.to_q",
-    }
+    gate = markers.pop("transformer_blocks.0.img_mlp.gate_layer")
+    proj = markers.pop("transformer_blocks.0.img_mlp.proj")
+    assert gate == proj == marker and gate is not proj
+    assert set(markers) == {"transformer_blocks.0.attn.to_q"}
 
 
-def test_layout_follows_comfyui_token_order() -> None:
-    """Reference latents sit at ComfyUI's image_slots, the target comes last."""
+@pytest.mark.parametrize(
+    "target_hw,ref_hws,slots",
+    [
+        ((4, 6), [(4, 4), (2, 6)], [2, 6]),
+        # Odd parity: ComfyUI centres the reference by half a token.
+        ((5, 6), [(4, 4), (3, 6)], [2, 6]),
+        # A reference without a slot follows the text.
+        ((4, 6), [(4, 4), (2, 6)], [2]),
+    ],
+)
+def test_layout_follows_comfyui_token_order(target_hw, ref_hws, slots) -> None:
+    """The prefix hidden states, RoPE and segments match ComfyUI's own model."""
     model_mod = pytest.importorskip("comfy.ldm.qwen_image21.model")
     ops = pytest.importorskip("comfy.ops")
     torch.manual_seed(0)
@@ -117,14 +103,14 @@ def test_layout_follows_comfyui_token_order() -> None:
     )
     for p in model.parameters():
         torch.nn.init.normal_(p)
-    x = torch.randn(1, 4, 4, 6)
+    x = torch.randn(1, 4, *target_hw)
     context = torch.randn(1, 11, 8)
-    refs = [torch.randn(1, 4, 4, 4), torch.randn(1, 4, 2, 6)]
-    slots = [2, 6]
+    refs = [torch.randn(1, 4, *hw) for hw in ref_hws]
     with torch.no_grad():
         hidden, pe, segments = model.build_sequence(x, context, refs, slots)
         ctx, flags = stage_mod.insert_image_placeholders(context, slots, len(refs))
-        layout = build_layout(flags, [(1, 4, 4), (1, 2, 6), (1, 4, 6)], AXES, "cpu")
+        shapes = [(1, *hw) for hw in ref_hws] + [(1, *target_hw)]
+        layout = stage_mod.comfyui_layout(flags, shapes, (16, 56, 56), "cpu")
         prefix = model.txt_in(ctx).index_select(1, layout["text_indices"])
         cond = torch.cat([r.flatten(2).transpose(1, 2) for r in refs], dim=1)
         prefix[:, layout["image_indices"]] = model.img_in(cond)
@@ -136,171 +122,97 @@ def test_layout_follows_comfyui_token_order() -> None:
     assert list(layout["segments"]) == [(s, e, m is None) for s, e, m in segments[:-1]]
 
 
-def test_placeholders_for_missing_and_trailing_slots() -> None:
-    ctx = torch.arange(3.0).view(1, 3, 1)
-    out, flags = stage_mod.insert_image_placeholders(ctx, [9], 2)
-    assert flags == [False, False, False, True, True]
-    assert out.flatten().tolist() == [0, 1, 2, 0, 0]
-    with pytest.raises(ValueError, match="ascending"):
-        stage_mod.insert_image_placeholders(ctx, [2, 1], 2)
-
-
-def test_adapter_registration_and_payload() -> None:
-    assert get_adapter_class("qwen_image21") is QwenImage21Adapter
-    assert stage_mod.COMFYUI_COND_EXTRA_KEY == COND_EXTRA_KEY
-    adapter = QwenImage21Adapter()
-    x = torch.randn(2, 64, 5, 7)
-    ref = torch.randn(2, 64, 4, 4)
-    packed = adapter.pack(
-        x,
-        torch.tensor([0.5, 0.5]),
-        torch.randn(2, 9, 32),
-        ref_latents=[ref],
-        image_slots=[3],
-    )
-    assert packed.latents is x
-    assert torch.equal(packed.timesteps, torch.tensor([500.0, 500.0]))
-    assert (packed.height, packed.width) == (80, 112)
-    noise = x.flatten(2).transpose(1, 2).contiguous()
-    assert torch.equal(adapter.unpack(noise, packed, x), x)
-    req = SimpleNamespace(extra={"comfyui_session_id": "s:1"})
-    adapter.fill_req(req, packed)
-    assert req.extra[COND_EXTRA_KEY] == {"image_slots": [3], "ref_latents": [ref]}
-    assert req.extra["comfyui_session_id"] == "s:1"
-    adapter.drop_cached_fields(packed)
-    assert packed.prompt_embeds == [] and COND_EXTRA_KEY not in packed.extra_req
-    with pytest.raises(NotImplementedError):
-        adapter.pack(
-            x,
-            torch.tensor([1.0]),
-            torch.randn(1, 3, 8),
-            transformer_options={"patches_replace": {"dit": {("single_block", 0): 1}}},
-        )
-
-
-class _CacheRecordingExecutor(QwenImage21Executor):
-    """Real forward and cond-cache bookkeeping; records the payload sent."""
+class _RecordingExecutor(QwenImage21Executor):
+    """Real forward and cond-cache bookkeeping; the worker echoes the latents."""
 
     def __init__(self):
         torch.nn.Module.__init__(self)
         self.adapter = QwenImage21Adapter()
-        self._sent_conds = set()
-        self._cond_key_cache = {}
-        self.sent = []
+        self._sent_conds, self._cond_key_cache, self.sent = set(), {}, []
 
     def _execute_packed(self, packed, x, timestep):
         self._mark_and_maybe_drop(packed)
-        self.sent.append(packed.extra_req.get(COND_EXTRA_KEY))
-        return x
+        req = SimpleNamespace(extra={})
+        self.adapter.fill_req(req, packed)
+        self.sent.append((packed, req))
+        return self.adapter.unpack(x.flatten(2).transpose(1, 2), packed, x)
 
 
 def test_reference_latents_reach_the_worker_and_key_the_cond_cache() -> None:
     """Edit workflows pass ref_latents: the executor must forward them, and two
     conds that differ only in their reference must not share a cached cond."""
-    ex = _CacheRecordingExecutor()
-    x, timestep, context = (
-        torch.zeros(1, 64, 5, 7),
-        torch.tensor([0.5]),
-        torch.ones(1, 9, 32),
-    )
+    assert get_adapter_class("qwen_image21") is QwenImage21Adapter
+    assert stage_mod.COMFYUI_COND_EXTRA_KEY == COND_EXTRA_KEY
+    ex = _RecordingExecutor()
+    x, context = torch.randn(1, 64, 5, 7), torch.ones(1, 9, 32)
+    options = {"sample_sigmas": torch.tensor([1.0, 0.5, 0.0])}
     ref_a, ref_b = torch.zeros(1, 64, 4, 4), torch.ones(1, 64, 4, 4)
+    kwargs = dict(image_slots=[3], transformer_options=options)
     for ref in (ref_a, ref_b, ref_a):
-        ex(x, timestep, context, ref_latents=[ref], image_slots=[3])
-    assert torch.equal(ex.sent[0]["ref_latents"][0], ref_a)
-    assert torch.equal(ex.sent[1]["ref_latents"][0], ref_b)
-    assert ex.sent[2] is None  # an identical cond is restored by the worker
+        out = ex(x, torch.tensor([0.5]), context, ref_latents=[ref], **kwargs)
+        assert torch.equal(out, x)
+    (packed, req), (_, req_b), (_, req_a) = ex.sent
+    assert torch.equal(req.timesteps, torch.tensor([500.0]))
+    assert (packed.height, packed.width) == (80, 112)
+    payload = req.extra[COND_EXTRA_KEY]
+    assert payload["image_slots"] == [3] and payload["final_sigma"] == 0.5
+    assert payload["ref_latents"][0] is ref_a
+    assert req_b.extra[COND_EXTRA_KEY]["ref_latents"][0] is ref_b
+    # An identical cond is restored by the worker.
+    assert COND_EXTRA_KEY not in req_a.extra and req_a.prompt_embeds == []
 
 
-def test_cfg_parallel_is_rejected() -> None:
-    """ComfyUI owns CFG, so a CFG rank would only recompute the same DiT call."""
-    with pytest.raises(ValueError, match="does not apply"):
-        QwenImage21Executor.validate_sgld_options({"enable_cfg_parallel": True})
-    QwenImage21Executor.validate_sgld_options({"num_gpus": 2, "sp_degree": 2})
-
-
-# ----- worker condition stage ---------------------------------------------------
-
-
-def _run(monkeypatch, req, fits=True):
+def _run(monkeypatch, sid, key, sigma, prompt_embeds, payload, fits=True):
     """Condition stage after ComfyUILatentPreparationStage restored the session."""
     monkeypatch.setattr(stage_mod, "_cache_fits", lambda need, device: fits)
-    server_args = SimpleNamespace(
-        pipeline_config=SimpleNamespace(dit_config=_small_dit_config())
+    req = SimpleNamespace(
+        extra={
+            "comfyui_session_id": sid,
+            "comfyui_cond_key": key,
+            COND_EXTRA_KEY: payload,
+        },
+        latents=torch.ones(1, 64, 2, 3),
+        timesteps=torch.tensor([sigma * 1000.0]),
+        prompt_embeds=prompt_embeds,
     )
     bind_comfyui_session(req)
+    server_args = SimpleNamespace(
+        pipeline_config=SimpleNamespace(dit_config=_DIT_CONFIG)
+    )
     return stage_mod.QwenImage21ComfyUIConditionStage().forward(req, server_args)
 
 
-def _req(sid, key, latents, sigma, context=None, payload=None):
-    extra = {"comfyui_session_id": sid, "comfyui_cond_key": key}
-    if payload is not None:
-        extra[COND_EXTRA_KEY] = payload
-    return SimpleNamespace(
-        extra=extra,
-        latents=latents,
-        timesteps=torch.full((latents.shape[0],), sigma * 1000.0),
-        prompt_embeds=[] if context is None else [context],
-    )
-
-
-def test_condition_stage_is_built_once_per_cond_for_the_run(monkeypatch) -> None:
-    x = torch.randn(1, 64, 3, 4)
-    pos, neg = torch.randn(1, 5, 16), torch.randn(1, 7, 16)
-    payload = {"image_slots": [], "ref_latents": []}
+def test_cond_is_built_once_per_run_and_freed_after_the_final_sigma(
+    monkeypatch,
+) -> None:
+    """Each cond's prefix K/V cache is reused across steps, and the cache (GiBs)
+    must not outlive the sampler's last call."""
+    ref = torch.randn(1, 64, 2, 2)
+    # Per cond: context, image_slots, ref_latents, room for the cache.
+    conds = {
+        "pos": (torch.randn(1, 5, 16), [], [], True),
+        "neg": (torch.randn(1, 7, 16), [1], [ref], False),
+    }
     built = {}
     try:
-        for sigma in (1.0, 0.5):
-            first = sigma == 1.0
-            for key, ctx in (("pos", pos), ("neg", neg)):
-                req = _run(
-                    monkeypatch,
-                    _req(
-                        "exec:1",
-                        key,
-                        x,
-                        sigma,
-                        ctx if first else None,
-                        payload if first else None,
-                    ),
-                )
-                assert torch.equal(req.latents, x.flatten(2).transpose(1, 2))
+        for step, sigma in enumerate((1.0, 0.5, 0.25)):
+            for key, (ctx, slots, refs, fits) in conds.items():
+                payload = dict(image_slots=slots, ref_latents=refs, final_sigma=0.25)
+                sent = ([ctx], payload) if step == 0 else ([], None)
+                req = _run(monkeypatch, "r:1", key, sigma, *sent, fits=fits)
+                assert req.latents.shape == (1, 6, 64)
+                assert req.prompt_embeds[0].shape[1] == ctx.shape[1] + len(refs)
                 cond = req.extra["qwen21_positive"]
-                assert req.prompt_embeds[0].shape[1] == ctx.shape[1]
-                assert cond["condition_latents"] is None
                 assert built.setdefault(key, cond) is cond
-        state = get_run_state(SimpleNamespace(extra={"comfyui_session_id": "exec:1"}))
-        assert len(state) == 2
-        # The next sampler run of this executor evicts the old run's caches.
-        _run(monkeypatch, _req("exec:2", "pos", x, 1.0, pos, payload))
-        assert (
-            get_run_state(SimpleNamespace(extra={"comfyui_session_id": "exec:1"}))
-            is None
-        )
+                # No room: the prefix is recomputed every step.
+                assert (cond["prefix_caches"] is None) == (not fits)
+            assert len(get_run_state(req)) == (0 if sigma == 0.25 else 2)
     finally:
-        release_comfyui_session("exec:1")
-        release_comfyui_session("exec:2")
-
-
-def test_condition_stage_batch_rows_refs_and_no_room(monkeypatch) -> None:
-    x = torch.randn(2, 64, 2, 2)
-    ref = torch.randn(1, 64, 2, 2)
-    payload = {"image_slots": [1], "ref_latents": [ref]}
-    try:
-        req = _run(
-            monkeypatch,
-            _req("b:1", "k", x, 1.0, torch.randn(2, 3, 16), payload),
-            fits=False,
-        )
-        cond = req.extra["qwen21_positive"]
-        assert cond["prefix_caches"] is None  # no room: recompute every step
-        assert len(cond["layouts"]) == 2
-        assert cond["layouts"][0]["image_indices"].tolist() == [1, 2, 3, 4]
-        assert cond["condition_latents"].shape == (2, 4, 64)
-        assert req.prompt_embeds[0].shape == (2, 4, 16)  # + 1 placeholder
-        assert req.latents.shape == (2, 4, 64)
-        assert req.timesteps.tolist() == [1000.0]  # one loop step for both rows
-    finally:
-        release_comfyui_session("b:1")
+        release_comfyui_session("r:1")
+    assert built["pos"]["condition_latents"] is None
+    expected = ref.flatten(2).transpose(1, 2).bfloat16()
+    assert torch.equal(built["neg"]["condition_latents"], expected)
+    assert built["neg"]["layouts"][0]["image_indices"].tolist() == [1, 2, 3, 4]
 
 
 def test_cache_decision_is_agreed_across_tp_ranks(monkeypatch) -> None:
@@ -311,7 +223,6 @@ def test_cache_decision_is_agreed_across_tp_ranks(monkeypatch) -> None:
         seen.append(group)
         tensor.fill_(10)
 
-    monkeypatch.setattr(stage_mod, "model_parallel_is_initialized", lambda: True)
     monkeypatch.setattr(
         stage_mod, "get_tp_group", lambda: SimpleNamespace(world_size=2, cpu_group="tp")
     )
@@ -324,36 +235,24 @@ def test_cache_decision_is_agreed_across_tp_ranks(monkeypatch) -> None:
     assert seen == ["tp", "tp"]
 
 
-def test_pipeline_uses_generic_comfyui_stages(monkeypatch) -> None:
+def test_comfyui_stages_and_cfg_parallel_rejection(monkeypatch) -> None:
     from sglang.multimodal_gen.runtime.pipelines.qwen_image21 import QwenImage21Pipeline
     from sglang.multimodal_gen.runtime.pipelines_core.stages import (
         ComfyUILatentPreparationStage,
     )
-
-    created = {}
-
-    def _fake_init(self, transformer, scheduler):
-        created["modules"] = (transformer, scheduler)
-
-    monkeypatch.setattr(stage_mod.QwenImage21DenoisingStage, "__init__", _fake_init)
-    pipe = SimpleNamespace(
-        modules={"transformer": object(), "scheduler": object()}, stages=[]
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.qwen_image21 import (
+        QwenImage21DenoisingStage,
     )
-    pipe.get_module = pipe.modules.__getitem__
+
+    monkeypatch.setattr(QwenImage21DenoisingStage, "__init__", lambda *args: None)
+    pipe = SimpleNamespace(get_module=lambda name: object(), stages=[])
     pipe.add_stages = pipe.stages.extend
-    QwenImage21Pipeline.create_comfyui_stages(
-        pipe, SimpleNamespace(enable_cfg_parallel=False)
-    )
+    create = QwenImage21Pipeline.create_comfyui_stages
+    create(pipe, SimpleNamespace(enable_cfg_parallel=False))
     assert [type(s) for s in pipe.stages] == [
         ComfyUILatentPreparationStage,
         stage_mod.QwenImage21ComfyUIConditionStage,
-        stage_mod.QwenImage21DenoisingStage,
+        QwenImage21DenoisingStage,
     ]
-    assert created["modules"] == (
-        pipe.modules["transformer"],
-        pipe.modules["scheduler"],
-    )
     with pytest.raises(ValueError, match="enable_cfg_parallel"):
-        QwenImage21Pipeline.create_comfyui_stages(
-            pipe, SimpleNamespace(enable_cfg_parallel=True)
-        )
+        create(pipe, SimpleNamespace(enable_cfg_parallel=True))

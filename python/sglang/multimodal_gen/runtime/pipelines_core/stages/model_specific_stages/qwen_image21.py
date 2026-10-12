@@ -301,84 +301,106 @@ COMFYUI_COND_EXTRA_KEY = "qwen21_cond"
 def insert_image_placeholders(context, image_slots, num_refs):
     """Context with a zero token at each ComfyUI image slot, and the native flags."""
     text_len = context.shape[1]
-    slots = [min(int(s), text_len) for s in image_slots][:num_refs]
-    slots += [text_len] * (num_refs - len(slots))
-    if slots != sorted(slots):
-        raise ValueError(f"Qwen-Image 2.1 image_slots must be ascending, got {slots}")
-    placeholder = context.new_zeros(context.shape[0], 1, context.shape[2])
-    pieces, flags, start = [], [], 0
-    for slot in slots:
-        pieces += [context[:, start:slot], placeholder]
-        flags += [False] * (slot - start) + [True]
-        start = slot
-    pieces.append(context[:, start:])
-    flags += [False] * (text_len - start)
-    return torch.cat(pieces, dim=1), flags
+    # Same slot padding as ComfyUI's build_sequence.
+    slots = (list(image_slots) + [text_len] * num_refs)[:num_refs]
+    flags = torch.zeros(text_len + num_refs, dtype=torch.bool, device=context.device)
+    flags[[slot + i for i, slot in enumerate(slots)]] = True
+    out = context.new_zeros(context.shape[0], len(flags), context.shape[2])
+    out[:, ~flags] = context
+    return out, flags.tolist()
+
+
+def comfyui_layout(image_slots, image_shapes, axes_dims, device):
+    """Native ``build_layout`` plus ComfyUI's half-token centring of references.
+
+    ComfyUI shifts a reference by ``0.5 * (h % 2 - target_h % 2)`` per axis; native
+    sizes are multiples of 32 px so parity never differs there.
+    """
+    layout = build_layout(image_slots, image_shapes, axes_dims, device)
+    _, target_h, target_w = image_shapes[-1]
+    refs = [(s, e) for s, e, is_image in layout["segments"] if is_image]
+    for (start, stop), (_, h, w) in zip(refs, image_shapes[:-1]):
+        shifts = (0.0, 0.5 * (h % 2 - target_h % 2), 0.5 * (w % 2 - target_w % 2))
+        if not any(shifts):
+            continue
+        delta = torch.cat(
+            [
+                shift
+                * (10000.0 ** (-torch.arange(0, dim, 2, device=device).float() / dim))
+                for shift, dim in zip(shifts, axes_dims)
+            ]
+        )
+        layout["prefix_rope"][start:stop] *= torch.polar(torch.ones_like(delta), delta)
+    return layout
 
 
 def _cache_fits(need_bytes, device) -> bool:
-    free = torch.cuda.mem_get_info(device)[0] if device.type == "cuda" else 0
+    free = 0
+    if device.type == "cuda":
+        # Blocks freed by an earlier run stay in PyTorch's cache, not in mem_get_info.
+        free = torch.cuda.mem_get_info(device)[0]
+        free += torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)
     free = torch.tensor([free], dtype=torch.int64)
     # Ranks running one call must agree: under TP an uncached prefix runs
     # extra all-reduces, so a split decision would hang.
-    if model_parallel_is_initialized():
-        for group in (get_tp_group(), get_sp_group()):
-            if group.world_size > 1:
-                torch.distributed.all_reduce(
-                    free, op=torch.distributed.ReduceOp.MIN, group=group.cpu_group
-                )
+    for group in (get_tp_group(), get_sp_group()):
+        if group.world_size > 1:
+            torch.distributed.all_reduce(
+                free, op=torch.distributed.ReduceOp.MIN, group=group.cpu_group
+            )
     return int(free) > 2 * need_bytes
 
 
 class QwenImage21ComfyUIConditionStage(PipelineStage):
-    """Turn one ComfyUI ``apply_model`` call into native denoising inputs.
+    """Turn one single-row ComfyUI ``apply_model`` call into native denoising inputs.
 
     ComfyUI's text encoder drops the vision tokens and reports ``image_slots``:
     the text positions of the reference latents. A placeholder token at each
-    slot gives the native ``build_layout`` input; the DiT overwrites those rows
-    with ``img_in(condition_latents)``. Conditioning and its prefix K/V cache
-    are built once per cond for the sampler run.
+    slot gives the native layout input; the DiT overwrites those rows with
+    ``img_in(condition_latents)``. Conditioning and its prefix K/V cache are
+    built once per cond for the sampler run.
     """
 
     def forward(self, batch, server_args):
-        bsz, _, height, width = batch.latents.shape
+        _, _, height, width = batch.latents.shape
         batch.latents = batch.latents.flatten(2).transpose(1, 2).contiguous()
-        # ComfyUI repeats one sigma per batch row; the loop runs one step per entry.
-        batch.timesteps = batch.timesteps[:1]
+        payload = batch.extra[COMFYUI_COND_EXTRA_KEY]
         conds = get_or_create_run_state(batch, dict)
-        key = (batch.extra.get("comfyui_cond_key"), bsz, height, width)
+        key = (batch.extra["comfyui_cond_key"], height, width)
         if key not in conds:
-            conds[key] = self._new_cond(batch, server_args, bsz, height, width)
+            conds[key] = self._new_cond(batch, server_args, payload, height, width)
         batch.prompt_embeds, batch.extra["qwen21_positive"] = conds[key]
+        # Drop the cond at the sampler's last call so its K/V cache (GiBs) is freed
+        # with this request, not at the next run; timesteps carry sigma * 1000.
+        final_sigma = payload["final_sigma"]
+        if (
+            final_sigma is not None
+            and batch.timesteps.item() <= final_sigma * 1e3 + 1e-3
+        ):
+            del conds[key]
         return batch
 
-    def _new_cond(self, batch, server_args, bsz, height, width):
+    def _new_cond(self, batch, server_args, payload, height, width):
         arch = server_args.pipeline_config.dit_config.arch_config
-        payload = batch.extra.get(COMFYUI_COND_EXTRA_KEY) or {}
         device, dtype = batch.latents.device, torch.bfloat16
-        context = batch.prompt_embeds[0].to(device=device, dtype=dtype)
-        refs = [
-            r.to(device=device, dtype=dtype) for r in payload.get("ref_latents", [])
-        ]
+        refs = [r.to(device=device, dtype=dtype) for r in payload["ref_latents"]]
         context, flags = insert_image_placeholders(
-            context.expand(bsz, -1, -1), payload.get("image_slots", []), len(refs)
+            batch.prompt_embeds[0].to(device=device, dtype=dtype),
+            payload["image_slots"],
+            len(refs),
         )
         shapes = [(1, r.shape[-2], r.shape[-1]) for r in refs] + [(1, height, width)]
-        layout = build_layout(flags, shapes, arch.axes_dims_rope, device)
+        layout = comfyui_layout(flags, shapes, arch.axes_dims_rope, device)
         condition_latents = None
         if refs:
             condition_latents = torch.cat(
-                [r.expand(bsz, -1, -1, -1).flatten(2).transpose(1, 2) for r in refs],
-                dim=1,
+                [r.flatten(2).transpose(1, 2) for r in refs], dim=1
             )
-        # K and V of every layer for every batch row, bf16.
-        need = 2 * arch.num_layers * bsz * layout["prefix_rope"].shape[0]
-        need *= arch.hidden_size * 2
+        # K and V of every layer, bf16.
+        need = 4 * arch.num_layers * layout["prefix_rope"].shape[0] * arch.hidden_size
         caches = None
         if _cache_fits(need, device):
-            caches = [[{} for _ in range(arch.num_layers)] for _ in range(bsz)]
+            caches = [[{} for _ in range(arch.num_layers)]]
         return [context], dict(
-            layouts=[layout] * bsz,
-            condition_latents=condition_latents,
-            prefix_caches=caches,
+            layouts=[layout], condition_latents=condition_latents, prefix_caches=caches
         )
