@@ -1,17 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """ComfyUI per-step DiT stage for LTX-2.x audio-video (ComfyUI ``ltxav``).
 
-ComfyUI owns the sampler loop, CFG and the VAEs. Each request is either one
-``LTXAVModel.forward`` (``[video, audio]`` velocities on ``batch.noise_pred``)
-or, with ``extra["ltxav_op"] == "connectors"``, one pass of the text
-connectors that ComfyUI runs from ``preprocess_text_embeds``. The DiT runs
-with SGLang's native LTX semantics (RoPE coordinates, timestep embeddings).
+Each request is one ``LTXAVModel.forward`` (``[video, audio]`` velocities on
+``batch.noise_pred``) or, with ``extra["ltxav_connectors"]``, one pass of the
+text connectors that ComfyUI runs from ``preprocess_text_embeds``.
 """
 
 from __future__ import annotations
 
 import math
-from typing import Any
 
 import torch
 
@@ -34,26 +31,8 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
-LTXAV_OP_CONNECTORS = "connectors"
-# ComfyUI AudioPatchifier: [B, 8 channels, T, 16 mel bins] <-> [B, T, 128].
-AUDIO_CHANNELS = 8
 # ComfyUI Embeddings1DConnector pads the prompt with registers to this length.
 CONNECTOR_MIN_TOKENS = 1024
-
-
-def patchify_video(video: torch.Tensor) -> torch.Tensor:
-    """[B, C, T, H, W] -> [B, T*H*W, C] (patch size 1)."""
-    return video.flatten(2).transpose(1, 2)
-
-
-def patchify_audio(audio: torch.Tensor) -> torch.Tensor:
-    """[B, C, T, F] -> [B, T, C*F]."""
-    return audio.transpose(1, 2).flatten(2)
-
-
-def unpatchify_audio(tokens: torch.Tensor) -> torch.Tensor:
-    b, t, _ = tokens.shape
-    return tokens.reshape(b, t, AUDIO_CHANNELS, -1).transpose(1, 2)
 
 
 def per_token_timestep(timestep: torch.Tensor, batch_size: int) -> torch.Tensor:
@@ -67,11 +46,8 @@ def per_token_timestep(timestep: torch.Tensor, batch_size: int) -> torch.Tensor:
 def run_ltxav_connectors(
     video_connector, audio_connector, context: torch.Tensor, video_dim: int
 ) -> torch.Tensor:
-    """ComfyUI ``preprocess_text_embeds(unprocessed=True)`` with SGLang connectors.
-
-    The prompt tokens are left-padded to a register multiple; the connector
-    moves them to the front and fills the rest with its learnable registers.
-    """
+    """ComfyUI ``preprocess_text_embeds(unprocessed=True)``: the prompt is
+    left-padded to a register multiple; the connector moves it to the front."""
     batch, tokens, _ = context.shape
     registers = video_connector.num_learnable_registers
     total = max(CONNECTOR_MIN_TOKENS, math.ceil(tokens / registers) * registers)
@@ -98,12 +74,11 @@ def shard_video_frames_for_sp(
             f"{size} ranks, which needs a frame count divisible by {size}; change "
             "the video length, or run without sp_degree"
         )
-    local = frames // size
     per_rank = tokens.shape[1] // size
     rows = slice(rank * per_rank, (rank + 1) * per_rank)
     if timestep.ndim == 2 and timestep.shape[1] == tokens.shape[1]:
         timestep = timestep[:, rows]
-    return tokens[:, rows], timestep, local
+    return tokens[:, rows], timestep, frames // size
 
 
 class LTX2ComfyUIStepStage(PipelineStage):
@@ -112,63 +87,47 @@ class LTX2ComfyUIStepStage(PipelineStage):
     def __init__(self, transformer, model_path: str) -> None:
         super().__init__()
         self.transformer = transformer
+        self.dtype = transformer.patchify_proj.bias.dtype
         # Loaded with the DiT, while ComfyUI has freed the device for the worker.
         self.connectors = load_comfyui_ltx_connectors(
-            model_path, get_local_torch_device(), self._dtype
+            model_path, get_local_torch_device(), self.dtype
         )
-
-    def verify_input(self, batch: Req, server_args: ServerArgs):
-        bind_comfyui_session(batch)
-        return super().verify_input(batch, server_args)
-
-    @property
-    def _dtype(self) -> torch.dtype:
-        return self.transformer.patchify_proj.bias.dtype
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         bind_comfyui_session(batch)
-        extra = batch.extra or {}
-        context = batch.prompt_embeds
-        if isinstance(context, (list, tuple)):
-            context = context[0] if context else None
-        if context is None:
-            raise ValueError("LTX ComfyUI step requires prompt_embeds")
-        context = context.to(self._dtype)
-        with (
-            torch.no_grad(),
-            set_forward_context(
-                current_timestep=0, attn_metadata=None, forward_batch=batch
-            ),
+        context = batch.prompt_embeds[0].to(self.dtype)
+        video_dim = self.transformer.config.cross_attention_dim
+        with set_forward_context(
+            current_timestep=0, attn_metadata=None, forward_batch=batch
         ):
-            if extra.get("ltxav_op") == LTXAV_OP_CONNECTORS:
-                batch.noise_pred = self._connectors(context)
+            if batch.extra.get("ltxav_connectors"):
+                batch.noise_pred = run_ltxav_connectors(
+                    *self.connectors, context, video_dim
+                )
             else:
-                batch.noise_pred = self._step(batch, extra, context)
+                batch.noise_pred = self._step(batch, context, video_dim)
         return batch
 
-    def _connectors(self, context: torch.Tensor) -> torch.Tensor:
-        video_dim = self.transformer.config.cross_attention_dim
-        return run_ltxav_connectors(*self.connectors, context, video_dim)
-
     def _step(
-        self, batch: Req, extra: dict[str, Any], context: torch.Tensor
+        self, batch: Req, context: torch.Tensor, video_dim: int
     ) -> list[torch.Tensor]:
         transformer = self.transformer
-        video = batch.latents.to(self._dtype)
-        audio = batch.audio_latents.to(self._dtype)
+        video = batch.latents.to(self.dtype)
+        audio = batch.audio_latents.to(self.dtype)
         b, _, frames, height, width = video.shape
         v_ts = per_token_timestep(batch.timesteps, b)
-        a_ts = per_token_timestep(extra["ltxav_audio_timestep"], b)
+        a_ts = per_token_timestep(batch.extra["ltxav_audio_timestep"], b)
         scale = float(transformer.config.timestep_scale_multiplier)
-        video_dim = transformer.config.cross_attention_dim
-        hidden, sp_size = patchify_video(video), get_sp_world_size()
+        # Same token layouts as ComfyUI's patchifiers and the native packers:
+        # video [B, T*H*W, C], audio [B, T, C*F].
+        hidden, sp_size = video.flatten(2).transpose(1, 2), get_sp_world_size()
         if sp_size > 1:
             hidden, v_ts, frames = shard_video_frames_for_sp(
                 hidden, v_ts, frames, get_sp_parallel_rank(), sp_size
             )
         video_tokens, audio_tokens = transformer(
             hidden_states=hidden,
-            audio_hidden_states=patchify_audio(audio),
+            audio_hidden_states=audio.transpose(1, 2).flatten(2),
             encoder_hidden_states=context[..., :video_dim],
             audio_encoder_hidden_states=context[..., video_dim:],
             timestep=v_ts * scale,
@@ -176,7 +135,7 @@ class LTX2ComfyUIStepStage(PipelineStage):
             num_frames=frames,
             height=height,
             width=width,
-            fps=float(extra.get("ltxav_frame_rate", 25.0)),
+            fps=batch.extra["ltxav_frame_rate"],
             audio_num_frames=int(audio.shape[2]),
             return_latents=False,
             audio_replicated_for_sp=sp_size > 1,
@@ -185,17 +144,7 @@ class LTX2ComfyUIStepStage(PipelineStage):
             video_tokens = sequence_model_parallel_all_gather(
                 video_tokens.contiguous(), dim=1
             )
-        video_out = video_tokens.transpose(1, 2).reshape(video.shape)
-        return [video_out, unpatchify_audio(audio_tokens)]
-
-
-__all__ = [
-    "LTXAV_OP_CONNECTORS",
-    "LTX2ComfyUIStepStage",
-    "patchify_audio",
-    "patchify_video",
-    "per_token_timestep",
-    "run_ltxav_connectors",
-    "shard_video_frames_for_sp",
-    "unpatchify_audio",
-]
+        return [
+            video_tokens.transpose(1, 2).reshape(video.shape),
+            audio_tokens.unflatten(2, (audio.shape[1], -1)).transpose(1, 2),
+        ]

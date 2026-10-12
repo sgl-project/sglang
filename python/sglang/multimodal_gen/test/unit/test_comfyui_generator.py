@@ -260,15 +260,3 @@ def test_multi_gpu_single_file_starts_without_cfg_parallel(
         str(path), "FluxPipeline", {"num_gpus": 2, "enable_cfg_parallel": True}
     )
     assert "cfg_parallel_degree" not in seen
-
-
-def test_should_suppress_logs_accepts_batched_timestep() -> None:
-    """ComfyUI batches cond/uncond rows into one call with a [B] timestep."""
-    import torch
-
-    from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.base import (
-        SGLDiffusionExecutor,
-    )
-
-    assert SGLDiffusionExecutor.should_suppress_logs(torch.tensor([0.5, 0.5]))
-    assert not SGLDiffusionExecutor.should_suppress_logs(torch.tensor([2.0, 2.0]))

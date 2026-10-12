@@ -6,7 +6,6 @@ Provides executor classes for different model types.
 from .adapter import ComfyUIModelAdapter, PackedForward, get_adapter_class
 from .base import SGLDiffusionExecutor
 from .flux import FluxAdapter, FluxExecutor
-from .ltx_av import LTXAVAdapter, LTXAVExecutor
 from .minimax_h3 import MiniMaxH3Adapter, MiniMaxH3Executor
 from .zimage import ZImageAdapter, ZImageExecutor
 
@@ -19,8 +18,6 @@ __all__ = [
     "SGLDiffusionExecutor",
     "FluxAdapter",
     "FluxExecutor",
-    "LTXAVAdapter",
-    "LTXAVExecutor",
     "MiniMaxH3Adapter",
     "MiniMaxH3Executor",
     "ZImageAdapter",

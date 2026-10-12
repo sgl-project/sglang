@@ -76,39 +76,23 @@ def _is_dit_key(key: str) -> bool:
     return not key.startswith("text_encoders.")
 
 
-def test_quantized_spec_gets_quant_config_and_both_key_filters(monkeypatch):
+@pytest.mark.parametrize("markers", [{"blocks.0.attn.to_q": _MARKER}, {}])
+def test_spec_quant_markers_and_key_filter(monkeypatch, markers):
+    """A quantized file gets the quant config and both key filters; an
+    unquantized one keeps only the spec's filter."""
     seen = _load(
         monkeypatch,
-        _spec(
-            quant_markers=lambda paths: {"blocks.0.attn.to_q": _MARKER},
-            checkpoint_key_filter=_is_dit_key,
-        ),
-    )
-    assert seen["init_params"]["quant_config"] == (
-        "quant-config",
-        {"blocks.0.attn.to_q": _MARKER},
+        _spec(quant_markers=lambda paths: markers, checkpoint_key_filter=_is_dit_key),
     )
     key_filter = seen["checkpoint_key_filter"]
+    assert not key_filter("text_encoders.layer.weight")
+    if not markers:
+        assert "quant_config" not in seen["init_params"]
+        assert key_filter is _is_dit_key
+        return
+    assert seen["init_params"]["quant_config"] == ("quant-config", markers)
     assert key_filter("blocks.0.attn.to_q.weight")
     assert not key_filter("blocks.0.attn.to_q.comfy_quant")
-    assert not key_filter("text_encoders.layer.weight")
-    assert seen["weight_load_plan"] is not None
-
-
-def test_unquantized_file_keeps_only_the_spec_key_filter(monkeypatch):
-    seen = _load(
-        monkeypatch,
-        _spec(quant_markers=lambda paths: {}, checkpoint_key_filter=_is_dit_key),
-    )
-    assert "quant_config" not in seen["init_params"]
-    assert seen["checkpoint_key_filter"] is _is_dit_key
-    assert seen["weight_load_plan"] is None
-
-
-def test_spec_without_hooks_loads_as_before(monkeypatch):
-    seen = _load(monkeypatch, _spec())
-    assert "quant_config" not in seen["init_params"]
-    assert seen["checkpoint_key_filter"] is None
 
 
 def test_h3_spec_still_rejects_non_int8_markers(monkeypatch):

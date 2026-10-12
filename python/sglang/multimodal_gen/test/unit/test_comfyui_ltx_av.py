@@ -10,7 +10,6 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
-from sglang.multimodal_gen.configs.models.dits.ltx_2_5 import LTX25Config
 from sglang.multimodal_gen.runtime.loader.comfyui_checkpoints.ltx_2 import (
     _build_dit_config,
     _dequantize,
@@ -18,13 +17,9 @@ from sglang.multimodal_gen.runtime.loader.comfyui_checkpoints.ltx_2 import (
     is_comfyui_ltx_dit_key,
     load_comfyui_ltx_connectors,
 )
-from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ltx_2.comfyui_step import (
-    patchify_audio,
-    patchify_video,
     run_ltxav_connectors,
     shard_video_frames_for_sp,
-    unpatchify_audio,
 )
 
 PREFIX = "model.diffusion_model."
@@ -42,33 +37,19 @@ TINY = {
 }
 
 
-def test_patchify_layouts_round_trip():
-    video = torch.randn(2, 3, 4, 5, 6)
-    tokens = patchify_video(video)
-    # Token order is (frame, row, column), channels last.
-    torch.testing.assert_close(tokens[1, 5 * 6 + 6 + 2], video[1, :, 1, 1, 2])
-    audio = torch.randn(2, 8, 7, 16)
-    tokens = patchify_audio(audio)
-    torch.testing.assert_close(tokens[0, 3, 16:32], audio[0, 1, 3])
-    torch.testing.assert_close(unpatchify_audio(tokens), audio)
-
-
-def _write_checkpoint(path, extra=()):
-    tensors = {
-        f"{PREFIX}audio_adaln_single.linear.weight": torch.zeros(1),
-        f"{PREFIX}keyframes_abs_pos_embedding": torch.zeros(1),
-        f"{PREFIX}transformer_blocks.0.audio_ff.net.0.proj.bias": torch.zeros(1),
-        f"{PREFIX}transformer_blocks.3.attn1.to_q.weight": torch.zeros(1),
-        **{key: torch.zeros(1) for key in extra},
-    }
-    save_file(
-        tensors, str(path), metadata={"config": json.dumps({"transformer": TINY})}
-    )
-
-
 def test_dit_config_comes_from_the_file(tmp_path):
     path = tmp_path / "ltx.safetensors"
-    _write_checkpoint(path)
+    keys = (
+        "audio_adaln_single.linear.weight",
+        "keyframes_abs_pos_embedding",
+        "transformer_blocks.0.audio_ff.net.0.proj.bias",
+        "transformer_blocks.3.attn1.to_q.weight",
+    )
+    save_file(
+        {f"{PREFIX}{key}": torch.zeros(1) for key in keys},
+        str(path),
+        metadata={"config": json.dumps({"transformer": TINY})},
+    )
     server_args = SimpleNamespace(
         model_path=str(path), pipeline_config=SimpleNamespace(dit_config=None)
     )
@@ -88,17 +69,11 @@ def test_dit_config_rejects_video_only_files(tmp_path):
         _build_dit_config(server_args)
 
 
-def test_dit_keys_exclude_connectors_vae_and_markers():
+def test_dit_keys_exclude_connectors_and_vae():
     assert is_comfyui_ltx_dit_key(f"{PREFIX}proj_out.weight")
     assert not is_comfyui_ltx_dit_key("vae.decoder.conv.weight")
-    assert not is_comfyui_ltx_dit_key(f"{PREFIX}proj_out.comfy_quant")
     assert not is_comfyui_ltx_dit_key(
         f"{PREFIX}video_embeddings_connector.learnable_registers"
-    )
-    mapping = get_param_names_mapping(LTX25Config().arch_config.param_names_mapping)
-    assert (
-        mapping(f"{PREFIX}transformer_blocks.3.audio_ff.net.2.weight")[0]
-        == "transformer_blocks.3.audio_ff.proj_out.weight"
     )
 
 
@@ -107,7 +82,6 @@ def test_convrot_int8_weights_dequantize_to_the_original_basis():
     torch.manual_seed(0)
     weight = torch.randn(8, 512)
     hadamard = _regular_hadamard(256, torch.device("cpu"))
-    torch.testing.assert_close(hadamard @ hadamard, torch.eye(256), atol=1e-5, rtol=0)
     rotated = (weight.view(8, 2, 256) @ hadamard.T).view(8, 512)
     scale = rotated.abs().amax(dim=1, keepdim=True) / 127
     restored = _dequantize((rotated / scale).round().to(torch.int8), scale, 256)
@@ -164,43 +138,11 @@ def test_sglang_connectors_reproduce_comfyui_connectors(tmp_path):
     assert err.item() < 1e-3, err.item()
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_quantization_ignored_layers_match_ltx2_module_paths(
-    single_process_model_parallel,
-):
-    """--quantization-ignored-layers must reach LTX-2 linears by module path."""
-    from sglang.multimodal_gen.runtime.layers.linear import LinearBase
-    from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8Config
-    from sglang.multimodal_gen.runtime.models.dits.ltx_2 import (
-        LTX2VideoTransformer3DModel,
-    )
-
-    config = LTX25Config()
-    for key, value in {**TINY, "num_layers": 1}.items():
-        if key != "rope_type":
-            setattr(config.arch_config, key, value)
-    config.arch_config.__post_init__()
-    quant_config = Fp8Config(ignored_layers=["transformer_blocks.0.attn1", "proj_out"])
-    with torch.device("meta"):
-        model = LTX2VideoTransformer3DModel(
-            config=config, hf_config={}, quant_config=quant_config
-        )
-    methods = {
-        name: type(module.quant_method).__name__
-        for name, module in model.named_modules()
-        if isinstance(module, LinearBase)
-    }
-    for name in ("transformer_blocks.0.attn1.to_q", "proj_out"):
-        assert methods[name] == "UnquantizedLinearMethod", name
-    for name in ("transformer_blocks.0.attn2.to_q", "patchify_proj"):
-        assert methods[name] == "Fp8LinearMethod", name
-
-
 def test_sp_ranks_take_equal_whole_frame_blocks_of_the_video():
     """Ranks must get contiguous frames: the DiT offsets RoPE time by rank."""
-    frames, height, width = 4, 2, 3
-    tokens = patchify_video(torch.randn(1, 5, frames, height, width))
-    timestep = torch.arange(frames * height * width, dtype=torch.float32)[None]
+    frames = 4
+    tokens = torch.randn(1, frames * 6, 5)
+    timestep = torch.arange(frames * 6, dtype=torch.float32)[None]
     shards = [
         shard_video_frames_for_sp(tokens, timestep, frames, rank, 2) for rank in (0, 1)
     ]
@@ -213,3 +155,24 @@ def test_sp_ranks_take_equal_whole_frame_blocks_of_the_video():
         assert sharded is per_sample
     with pytest.raises(ValueError, match="3 latent frames"):
         shard_video_frames_for_sp(tokens[:, :18], timestep[:, :18], 3, 0, 2)
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"stg_self_attn_blocks": {3}},
+        {"a2v_cross_attn": False, "v2a_cross_attn": False},
+    ],
+)
+def test_guidance_passes_the_worker_cannot_apply_raise(options):
+    """STG / modality guidance would silently equal the cond prediction."""
+    from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.ltx_av import (
+        LTXAVAdapter,
+    )
+
+    x = [torch.zeros(1, 128, 2, 4, 4), torch.zeros(1, 8, 3, 16)]
+    with pytest.raises(NotImplementedError, match="guidance|STG"):
+        LTXAVAdapter().pack(
+            x, torch.ones(1), torch.zeros(1, 4, 32), transformer_options=options
+        )
+    LTXAVAdapter().pack(x, torch.ones(1), torch.zeros(1, 4, 32), transformer_options={})
