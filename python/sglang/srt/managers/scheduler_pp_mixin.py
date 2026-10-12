@@ -521,6 +521,9 @@ class SchedulerPPMixin:
                         next_batch,
                         next_batch_result,
                     )
+                    # The slot's rows take back what their decode step's run
+                    # and output relay rebound.
+                    self.decoding_batches[next_mb_id].absorb()
                     self.last_mbs[next_mb_id] = next_batch
 
                 if not self.pp_group.is_last_rank:

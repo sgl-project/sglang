@@ -1307,11 +1307,9 @@ class Scheduler(
         self.enable_skip_finishing_decode = False
         # Set by the normal and overlap loops, which join a launched step's
         # finished-prefill rows into the running rows at launch and drop
-        # finished rows at commit.
+        # finished rows at commit. The PD decode loops drop finished rows at
+        # commit too; their rows join from the prebuilt batch at the plan.
         self.rows_join_at_launch = False
-        # Set by the PD decode loops that launch a copy of the running rows as
-        # their decode step; the pipeline PD decode loop launches the rows.
-        self.disagg_decode_launches_copy = False
         self.forward_ct = 0
         self.return_health_check_ipcs: Deque[Optional[str]] = deque()
         self.flush_wrapper = SchedulerFlushWrapper(
@@ -3794,9 +3792,9 @@ class Scheduler(
     ) -> NextBatchPlan:
         """Plan the next step. A loop that does not join at launch passes the
         step it launched last, whose finished-prefill rows join here."""
-        # For a loop that does not take them back at launch: the last decode
-        # step from these rows has run and committed, so the rows take back
-        # what its run and commit rebound.
+        # For a loop that takes a decode step back at the next plan (the
+        # pipeline and MLX loops): the last decode step from these rows has run
+        # and committed, so the rows take back what its run and commit rebound.
         decoding_batch.absorb()
         self.process_pending_chunked_abort()
         self._process_hicache_events()
@@ -6079,7 +6077,6 @@ def _dispatch_event_loop_once(scheduler: Scheduler):
     scheduler.enable_continuous_input_polling = False
     scheduler.enable_skip_finishing_decode = False
     scheduler.rows_join_at_launch = False
-    scheduler.disagg_decode_launches_copy = False
     disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
     if disaggregation_mode == DisaggregationMode.NULL:
         if scheduler.enable_pdmux:
