@@ -549,6 +549,153 @@ def test_topk_v2_ragged_bucket_overflow(length: int, k: int) -> None:
         )
 
 
+# Keep the extra distributions small rather than multiplying the full dispatch
+# matrix above. Odd lengths also exercise padded vector tails and partial pages.
+@pytest.mark.parametrize("batch,seq", [(2, 8191), (1, 131073), (64, 131073)])
+@pytest.mark.parametrize(
+    "distribution,k",
+    [
+        ("negative", 512),
+        ("cutoff_ties", 512),
+        ("mixed_inf", 512),
+        ("negative_inf", 512),
+        ("cutoff_ties", 1),
+        ("cutoff_ties", 17),
+    ],
+)
+@pytest.mark.parametrize("mode", ["raw", "paged", "dual"])
+@torch.inference_mode()
+def test_topk_v2_overflow_value_boundaries(
+    batch: int, seq: int, distribution: str, k: int, mode: str
+) -> None:
+    if is_hip() and seq > 65536:
+        pytest.skip("ROCm split selection uses a separate implementation")
+    torch.manual_seed(batch + seq + k)
+    width = (seq + 3) & ~3
+    # Invalid columns must not displace valid negative scores or -inf ties.
+    scores = torch.full((batch, width), 3000.0, dtype=torch.float32, device="cuda")
+    lengths = torch.full((batch,), seq, dtype=torch.int32, device="cuda")
+    if batch == 64:
+        lengths[:48] = 32769
+    count = 4096
+    for row, length in enumerate(lengths.cpu().tolist()):
+        window = scores[row, :length]
+        window.fill_(-torch.inf if "inf" in distribution else -2000.0)
+        if distribution == "negative":
+            # All distinct FP32 values round to the same FP16 value (-1000).
+            window[:count] = -1000 - torch.arange(
+                count, device="cuda", dtype=torch.float32
+            ) / 16384
+            window[count : count + 8] = -500
+        elif distribution == "negative_inf":
+            window[:8] = torch.inf
+            window[8:40] = torch.arange(32, device="cuda", dtype=torch.float32)
+        else:
+            above = min(8, k // 4)
+            if distribution == "mixed_inf":
+                window[:count] = 1000 + torch.arange(
+                    count, device="cuda", dtype=torch.float32
+                ) / 16384
+                window[count : count + above] = torch.inf
+            else:
+                # The greater, cutoff-equal, and lower values all round to the
+                # same FP16 value. Only part of the 2049 exact ties is needed.
+                greater = min(31, k // 2)
+                window[:count] = 999.875
+                window[:greater] = 1000.125
+                window[greater : greater + 2049] = 1000
+                window[count : count + above] = 2000
+
+    if mode == "raw":
+        selected = _run_raw(scores, lengths, k)
+    else:
+        pages, inverse = _make_page_table(
+            batch, (width + PAGE_SIZE - 1) // PAGE_SIZE, "perm", "cuda", per_row=True
+        )
+        if mode == "paged":
+            selected = _run(scores, lengths, pages, inverse, k)
+        else:
+            selected, raw = _run_dual(scores, lengths, pages, inverse, k)
+            for mapped_row, raw_row in zip(selected, raw):
+                assert sorted(mapped_row) == sorted(raw_row)
+    for row, length in enumerate(lengths.cpu().tolist()):
+        _assert_topk_values(scores[row, :length], torch.tensor(selected[row]), k)
+
+
+@pytest.mark.skipif(
+    is_hip(), reason="ROCm split selection uses a separate implementation"
+)
+@torch.inference_mode()
+def test_topk_v2_overflow_graph_transitions() -> None:
+    torch.manual_seed(20261012)
+    batch, seq, k = 64, 131073, 512
+    width = (seq + 3) & ~3
+    scores = torch.randn(batch, width, dtype=torch.float32, device="cuda")
+    original_scores = scores.clone()
+    lengths = torch.full((batch,), seq, dtype=torch.int32, device="cuda")
+    lengths[:48] = 32769
+    pages, _ = _make_page_table(
+        batch, (width + PAGE_SIZE - 1) // PAGE_SIZE, "perm", "cuda", per_row=True
+    )
+    out = torch.empty((batch, k), dtype=torch.int32, device="cuda")
+    raw = torch.empty_like(out)
+    target = 53
+
+    def update(count, short_rows=False):
+        scores.copy_(original_scores)
+        scores[target, :seq] = -2000
+        scores[target, seq - count : seq] = 1000 + torch.arange(
+            count, device="cuda", dtype=torch.float32
+        ) / 16384
+        scores[target, :8] = 2000
+        lengths[:48] = 32769
+        lengths[48:] = seq
+        if short_rows:
+            lengths[0] = 0
+            lengths[1] = 17
+
+    def invoke():
+        out.fill_(-2)
+        raw.fill_(-2)
+        topk_transform_paged_v2(scores, lengths, pages, out, PAGE_SIZE, metadata, raw)
+
+    def check():
+        for row, length in enumerate(lengths.cpu().tolist()):
+            valid = min(k, length)
+            _assert_topk_values(scores[row, :length], raw[row, :valid], valid)
+            assert (raw[row, valid:] == -1).all()
+            assert (out[row, valid:] == -1).all()
+        mapped = (
+            pages.gather(1, raw.clamp_min(0).long() // PAGE_SIZE) * PAGE_SIZE
+            + raw.clamp_min(0) % PAGE_SIZE
+        )
+        assert torch.equal(out, torch.where(raw >= 0, mapped, -1))
+
+    update(4096)
+    metadata = _plan(lengths)
+    buffers = (scores, lengths, pages, metadata, out, raw)
+    addresses = tuple(t.data_ptr() for t in buffers)
+    invoke()
+    check()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        invoke()
+    stream.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        invoke()
+    # The same long row changes overflow state. Empty/short rows then recover
+    # their full length, exercising output padding and refreshed routing too.
+    for count, short_rows in [(4096, False), (2048, True), (4096, False)]:
+        update(count, short_rows)
+        updated_metadata = _plan(lengths)
+        metadata.copy_(updated_metadata)
+        assert addresses == tuple(t.data_ptr() for t in buffers)
+        graph.replay()
+        check()
+
+
 @pytest.mark.parametrize("num_ties", [48, 96])
 @torch.inference_mode()
 def test_topk_v2_negative_infinity_ties(num_ties: int) -> None:
