@@ -2584,6 +2584,7 @@ class DeepseekSparseAttnBackend(
             d_v=v_head_dim,
             attn_sink=sink_input,
             topk_length=topk_length,
+            return_log2_lse=False,
         )
 
         # Trim output back to original num_heads if we padded

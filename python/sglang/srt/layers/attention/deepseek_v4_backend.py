@@ -3590,6 +3590,7 @@ class DeepseekV4AttnBackend(
             d_v=self.head_dim_v,
             attn_sink=attn_sink,
             topk_length=combined_lens,
+            return_log2_lse=False,
         )
         return o
 

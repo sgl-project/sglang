@@ -1,4 +1,4 @@
-"""Sparse prefill's public statistics are base-2, including the fused H64 path."""
+"""Sparse prefill returns optional base-2 statistics without conversion launches."""
 
 import math
 
@@ -48,7 +48,7 @@ def make_inputs(heads, dim, topk, mode):
     return q, kv, indices, sink, lengths
 
 
-def call(inputs):
+def call(inputs, return_log2_lse=True):
     q, kv, indices, sink, lengths = inputs
     return flash_mla_sparse_fwd(
         q,
@@ -57,10 +57,11 @@ def call(inputs):
         q.shape[-1] ** -0.5,
         attn_sink=sink,
         topk_length=lengths,
+        return_log2_lse=return_log2_lse,
     )
 
 
-def check(inputs, result):
+def check(inputs, result, return_log2_lse=True):
     q, kv, indices, sink, lengths = inputs
     selected_indices = indices[:, 0].long()
     valid = (selected_indices >= 0) & (selected_indices < kv.shape[0])
@@ -79,8 +80,11 @@ def check(inputs, result):
 
     out, got_max, got_lse = result
     assert out.dtype == torch.bfloat16
-    assert got_max.dtype == got_lse.dtype == torch.float32
     torch.testing.assert_close(out.float(), expected_out, atol=0.012, rtol=0.025)
+    if not return_log2_lse:
+        assert got_max is None and got_lse is None
+        return
+    assert got_max.dtype == got_lse.dtype == torch.float32
     torch.testing.assert_close(
         got_max, maximum * math.log2(math.e), atol=2e-4, rtol=2e-4
     )
@@ -90,7 +94,8 @@ def check(inputs, result):
 
 
 @pytest.mark.parametrize("heads,dim", [(64, 512), (64, 576), (128, 512), (128, 576)])
-@pytest.mark.parametrize("topk", [128, 512])
+@pytest.mark.parametrize("topk", [128, 512, 2048])
+@pytest.mark.parametrize("return_log2_lse", [True, False])
 @pytest.mark.parametrize(
     "mode",
     [
@@ -103,20 +108,21 @@ def check(inputs, result):
         "no-options",
     ],
 )
-def test_prefill_stats_units(heads, dim, topk, mode):
+def test_prefill_stats_units(heads, dim, topk, mode, return_log2_lse):
     inputs = make_inputs(heads, dim, topk, mode)
-    check(inputs, call(inputs))
+    check(inputs, call(inputs, return_log2_lse), return_log2_lse)
 
 
 @pytest.mark.parametrize("heads,dim", [(64, 512), (64, 576), (128, 512), (128, 576)])
-def test_prefill_stats_graph_mutation(heads, dim):
+@pytest.mark.parametrize("return_log2_lse", [True, False])
+def test_prefill_stats_graph_mutation(heads, dim, return_log2_lse):
     inputs = make_inputs(heads, dim, 128, "masked")
     for _ in range(3):
-        call(inputs)
+        call(inputs, return_log2_lse)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        output = call(inputs)
+        output = call(inputs, return_log2_lse)
     for value in inputs:
         original = value.clone()
         if value.dtype == torch.int32:
@@ -125,21 +131,33 @@ def test_prefill_stats_graph_mutation(heads, dim):
             value.add_(0.125)
         graph.replay()
         torch.cuda.synchronize()
-        check(inputs, output)
+        check(inputs, output, return_log2_lse)
         value.copy_(original)
 
 
-def test_h64_stats_conversion_is_fused():
-    if torch.cuda.get_device_capability()[0] != 10:
-        pytest.skip("Only SM100-family H64 fuses the statistics conversion")
+def test_prefill_legacy_operator_arguments():
+    inputs = make_inputs(64, 512, 128, "no-options")
+    q, kv, indices, sink, lengths = inputs
+    result = torch.ops.sgl_kernel.sparse_prefill_fwd.default(
+        q, kv, indices, q.shape[-1] ** -0.5, 512, sink, lengths
+    )
+    check(inputs, result)
+
+
+@pytest.mark.parametrize("heads,dim", [(64, 512), (64, 576), (128, 512), (128, 576)])
+@pytest.mark.parametrize("topk", [128, 2048])
+@pytest.mark.parametrize("return_log2_lse", [True, False])
+def test_prefill_has_no_statistics_conversion_launches(
+    heads, dim, topk, return_log2_lse
+):
     if (
         torch.profiler.ProfilerActivity.CUDA
         not in torch.profiler.supported_activities()
     ):
         pytest.skip("CUDA profiling unavailable")
-    inputs = make_inputs(64, 512, 128, "no-options")
+    inputs = make_inputs(heads, dim, topk, "no-options")
     for _ in range(5):
-        call(inputs)
+        call(inputs, return_log2_lse)
     torch.cuda.synchronize()
     with torch.profiler.profile(
         activities=[
@@ -147,10 +165,10 @@ def test_h64_stats_conversion_is_fused():
             torch.profiler.ProfilerActivity.CUDA,
         ]
     ) as prof:
-        call(inputs)
+        result = call(inputs, return_log2_lse)
         torch.cuda.synchronize()
     kernels = [
         e for e in prof.events() if e.device_type == torch.autograd.DeviceType.CUDA
     ]
     assert len(kernels) == 1, [e.name for e in kernels]
-    assert "sparse_attn_fwd_kernel" in kernels[0].name
+    check(inputs, result, return_log2_lse)
