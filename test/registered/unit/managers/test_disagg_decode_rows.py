@@ -166,7 +166,6 @@ class _Loop:
             "get_next_disagg_decode_batch_to_run",
             "_commit_due_step",
             "_debug_check_commit_gate",
-            "_debug_check_last_launched",
             "leave_finished_rows",
         ):
             setattr(s, name, MethodType(getattr(Scheduler, name), s))
