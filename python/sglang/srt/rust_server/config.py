@@ -13,6 +13,7 @@ from sglang.srt.managers.utils import compute_num_reserved_tokens
 from sglang.srt.runtime_context import (
     get_device,
     get_disagg,
+    get_lora,
     get_memory,
     get_mm,
     get_model,
@@ -122,6 +123,14 @@ def _build_server_args(
             if get_serving().preferred_sampling_params is not None
             else None
         ),
+        lora_ids={
+            ref.lora_name: ref.lora_id
+            for ref in (get_lora().lora_paths or [])
+            if ref.lora_name is not None
+        },
+        enable_strict_thinking=get_serving().enable_strict_thinking,
+        enable_priority_scheduling=get_schedule().enable_priority_scheduling,
+        default_priority_value=get_schedule().default_priority_value,
         limit_mm_data_per_request=get_mm().limit_mm_data_per_request or {},
         allow_auto_truncate=get_serving().allow_auto_truncate,
         enable_return_hidden_states=sa.enable_return_hidden_states,

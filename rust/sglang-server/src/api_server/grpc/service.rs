@@ -12,7 +12,7 @@ use tonic::{Request, Response, Status};
 use super::{info, native_api};
 use crate::api_server::core::{CoreHandle, HealthStatus};
 use crate::message::config::{PreferredSamplingParams, ServerArgs};
-use crate::message::request::into_requests;
+use crate::message::request::{GenerationPolicy, into_requests};
 use crate::message::wire::fill_preferred_sampling;
 use crate::utils::environ;
 
@@ -33,6 +33,7 @@ struct AdapterConfig {
     /// `/health_generate`'s heartbeat window (`SGLANG_HEALTH_CHECK_TIMEOUT`).
     health_timeout: Duration,
     has_tokenizer: bool,
+    generation_policy: GenerationPolicy,
 }
 
 /// Tonic-facing implementation backed by the transport-neutral core.
@@ -53,6 +54,7 @@ impl GrpcService {
                     environ::env_i64("SGLANG_HEALTH_CHECK_TIMEOUT", 20).max(0) as u64,
                 ),
                 has_tokenizer: !server_args.skip_tokenizer_init,
+                generation_policy: server_args.into(),
             },
         }
     }
@@ -72,6 +74,7 @@ impl GrpcService {
                 response_timeout,
                 health_timeout: Duration::from_millis(20),
                 has_tokenizer: true,
+                generation_policy: GenerationPolicy::default(),
             },
         }
     }
@@ -98,8 +101,8 @@ impl SglangService for GrpcService {
         // schema default, as an absent JSON key does.
         request.apply_absent_defaults();
         let stream = request.stream.unwrap_or(false);
-        let (payloads, is_batch) =
-            into_requests(request).map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let (payloads, is_batch) = into_requests(request, &self.config.generation_policy)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
         // Python starts its request clock after normalization and before
         // tokenization / multimodal preprocessing; `e2e_latency` measures from
         // the same boundary here.

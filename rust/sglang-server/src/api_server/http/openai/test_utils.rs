@@ -105,9 +105,11 @@ pub(super) fn server_args() -> Arc<ServerArgs> {
 }
 
 pub(super) fn app_state(core: CoreHandle) -> Arc<super::AppState> {
+    let server_args = server_args();
     Arc::new(super::AppState {
         core,
-        server_args: server_args(),
+        generation_policy: crate::message::request::GenerationPolicy::from(server_args.as_ref()),
+        server_args,
         chat_formatter: None,
     })
 }

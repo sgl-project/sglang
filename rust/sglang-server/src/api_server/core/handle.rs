@@ -160,6 +160,16 @@ impl CoreHandle {
             .map(CoreCall::new)
     }
 
+    /// Submit core-owned work without exposing it through the public Abort
+    /// registry. Drop still owns cancellation through `RuntimeCall`.
+    async fn generate_internal(&self, mut request: GenerateRequest) -> Result<CoreCall, CoreError> {
+        self.prepare_generations(std::slice::from_mut(&mut request))
+            .await?;
+        self.submit(RequestKind::Generate(Box::new(request)))
+            .await
+            .map(CoreCall::new)
+    }
+
     /// Prepare the group before submitting any surviving request. Explicit
     /// cancellation produces only that item's terminal result, preserving batch
     /// order. Other preparation/admission failures still reject the group and
@@ -359,7 +369,7 @@ impl CoreHandle {
         // The probe is intentionally not drained. Its call stays alive while
         // the heartbeat is observed, then aborts on drop to clean up a probe
         // that a busy scheduler skipped without producing a terminal frame.
-        let _probe = self.generate(probe).await?;
+        let _probe = self.generate_internal(probe).await?;
 
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
@@ -382,7 +392,7 @@ impl CoreHandle {
             (Some("The capital city of France is".to_string()), None)
         };
         let mut call = self
-            .generate(GenerateRequest {
+            .generate_internal(GenerateRequest {
                 rid: Rid::new(),
                 text,
                 input_ids,
@@ -1236,11 +1246,17 @@ mod tests {
             false,
             BTreeMap::new(),
         );
-        let probe = tokio::spawn(async move { handle.probe_health(Duration::from_secs(1)).await });
+        let probe_handle = handle.clone();
+        let probe =
+            tokio::spawn(async move { probe_handle.probe_health(Duration::from_secs(1)).await });
 
         let request = accept_intake(intake_rx.recv_async().await.unwrap());
         let rid = request.rid.clone();
         assert!(rid.as_str().starts_with("HEALTH_CHECK_"));
+        assert!(
+            !handle.abort(None),
+            "internal probes must not enter the public abort-all registry"
+        );
         activity.fetch_add(1, Ordering::Relaxed);
 
         assert_eq!(probe.await.unwrap().unwrap(), HealthStatus::Healthy);
@@ -1300,6 +1316,10 @@ mod tests {
         assert_eq!(warmup.input_ids, None);
         assert_eq!(warmup.sampling_params.max_new_tokens, Some(8));
         assert_eq!(warmup.bootstrap_host, None);
+        assert!(
+            !harness.handle.abort(None),
+            "startup warmup must not enter the public abort-all registry"
+        );
         request
             .sink
             .try_send(ResponseItem::Done(ChunkEvent::default()))

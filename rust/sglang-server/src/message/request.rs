@@ -1,7 +1,7 @@
 //! The `/generate` request path: the HTTP body and its per-request fan-out
 //! ([`GenerateBody`] → [`GenerateRequest`]s).
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::LazyLock;
 
 use bytes::Bytes;
@@ -14,6 +14,7 @@ use super::response::ResponseSink;
 use super::sampling::SamplingParams;
 use super::types::{OneOrMany, OneOrManyItem, TokenIds};
 use super::wire;
+use crate::message::config::ServerArgs;
 use crate::message::ids::Rid;
 use crate::utils::fsm::RequestState;
 use crate::utils::{environ::env_i64, error::Error};
@@ -55,7 +56,29 @@ const JSON_TO_HEAP_FACTOR: usize = 8;
 /// The wire type is the generated `sglang_api_types` request (the schema is
 /// the contract); its carriers become the internal ones through `message::wire`
 /// on the way in.
-pub fn into_requests(req: api_v1::GenerateRequest) -> Result<(Vec<GenerateRequest>, bool), Error> {
+#[derive(Clone, Debug, Default)]
+pub struct GenerationPolicy {
+    lora_ids: BTreeMap<String, String>,
+    enable_strict_thinking: bool,
+    enable_priority_scheduling: bool,
+    default_priority_value: Option<i64>,
+}
+
+impl From<&ServerArgs> for GenerationPolicy {
+    fn from(args: &ServerArgs) -> Self {
+        Self {
+            lora_ids: args.lora_ids.clone(),
+            enable_strict_thinking: args.enable_strict_thinking,
+            enable_priority_scheduling: args.enable_priority_scheduling,
+            default_priority_value: args.default_priority_value,
+        }
+    }
+}
+
+pub fn into_requests(
+    req: api_v1::GenerateRequest,
+    policy: &GenerationPolicy,
+) -> Result<(Vec<GenerateRequest>, bool), Error> {
     let api_v1::GenerateRequest {
         rid,
         text,
@@ -109,6 +132,30 @@ pub fn into_requests(req: api_v1::GenerateRequest) -> Result<(Vec<GenerateReques
     let video_data = video_data.map(wire::media_input).transpose()?;
     let audio_data = audio_data.map(wire::media_input).transpose()?;
     let mm_hashes = mm_hashes.and_then(wire::string_list_or_list);
+
+    if max_thinking_tokens.is_some() && !policy.enable_strict_thinking {
+        return Err(Error::Validation(
+            "max_thinking_tokens requires the server to be launched with --enable-strict-thinking"
+                .into(),
+        ));
+    }
+    let lora_id = lora_path
+        .as_deref()
+        .map(|name| {
+            policy.lora_ids.get(name).cloned().ok_or_else(|| {
+                Error::Validation(format!(
+                    "LoRA adapter '{name}' is not loaded; loaded adapters: {:?}",
+                    policy.lora_ids.keys().collect::<Vec<_>>()
+                ))
+            })
+        })
+        .transpose()?;
+    let priority = priority.or_else(|| {
+        policy
+            .enable_priority_scheduling
+            .then_some(policy.default_priority_value)
+            .flatten()
+    });
 
     // Cap the batch BEFORE the columns below allocate anything. Reading the
     // declared length off the input costs nothing; the previous placement (after
@@ -303,6 +350,19 @@ pub fn into_requests(req: api_v1::GenerateRequest) -> Result<(Vec<GenerateReques
     // Every column above is exactly `n` long, so zip them by value: each
     // request takes ownership of its cell, with no indexing or bounds checks.
     let kv_hints = kv_hints.map(KvHintsEnvelope::try_from).transpose()?;
+    if let Some(value) = &routing_key {
+        check_broadcast_budget(value.len(), n, "routing_key")?;
+    }
+    if let Some(value) = &lora_id {
+        check_broadcast_budget(value.len(), n, "lora_path")?;
+    }
+    if let Some(value) = &kv_hints {
+        let per_clone = serde_json::to_vec(value)
+            .expect("KvHintsEnvelope contains only JSON-serializable values")
+            .len()
+            .saturating_mul(JSON_TO_HEAP_FACTOR);
+        check_broadcast_budget(per_clone, n, "kv_hints")?;
+    }
     let mut requests: Vec<GenerateRequest> = izip!(
         rids,
         texts,
@@ -378,7 +438,7 @@ pub fn into_requests(req: api_v1::GenerateRequest) -> Result<(Vec<GenerateReques
                 decode_tp_size,
                 routed_dp_rank,
                 disagg_prefill_dp_rank,
-                lora_id: lora_path.clone(),
+                lora_id: lora_id.clone(),
                 routing_key: routing_key.clone(),
                 priority,
                 require_reasoning: require_reasoning.unwrap_or(false),
@@ -778,7 +838,83 @@ mod tests {
     const TEST_VOCAB: u64 = 1000;
 
     fn requests(body: &str) -> Result<(Vec<GenerateRequest>, bool), Error> {
-        into_requests(serde_json::from_str::<api_v1::GenerateRequest>(body).unwrap())
+        requests_with_policy(body, &GenerationPolicy::default())
+    }
+
+    fn requests_with_policy(
+        body: &str,
+        policy: &GenerationPolicy,
+    ) -> Result<(Vec<GenerateRequest>, bool), Error> {
+        into_requests(
+            serde_json::from_str::<api_v1::GenerateRequest>(body).unwrap(),
+            policy,
+        )
+    }
+
+    #[test]
+    fn launch_policy_is_applied_before_scheduler_submission() {
+        let mut lora_ids = BTreeMap::new();
+        lora_ids.insert("adapter".into(), "stable-id".into());
+        let policy = GenerationPolicy {
+            lora_ids,
+            enable_strict_thinking: true,
+            enable_priority_scheduling: true,
+            default_priority_value: Some(17),
+        };
+        let (requests, _) = requests_with_policy(
+            r#"{"text":"hi","lora_path":"adapter","max_thinking_tokens":23}"#,
+            &policy,
+        )
+        .unwrap();
+        assert_eq!(requests[0].lora_id.as_deref(), Some("stable-id"));
+        assert_eq!(requests[0].priority, Some(17));
+        assert!(matches!(
+            requests[0]
+                .sampling_params
+                .custom_params
+                .as_ref()
+                .and_then(|params| params.get("thinking_budget")),
+            Some(super::super::sampling::CustomParamValue::Unsigned(23))
+        ));
+
+        let error =
+            requests_with_policy(r#"{"text":"hi","lora_path":"missing"}"#, &policy).unwrap_err();
+        assert!(error.to_string().contains("not loaded"), "{error}");
+    }
+
+    #[test]
+    fn max_thinking_tokens_requires_strict_thinking() {
+        let error = requests(r#"{"text":"hi","max_thinking_tokens":23}"#).unwrap_err();
+        assert!(
+            error.to_string().contains("--enable-strict-thinking"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn orchestrator_scalar_broadcasts_are_bounded() {
+        let prompts = vec!["x"; 4096];
+        let routing_key = "k".repeat(MAX_BROADCAST_CLONE_BYTES / prompts.len() + 1);
+        let body = serde_json::json!({"text": prompts, "routing_key": routing_key});
+        let error = requests(&body.to_string()).unwrap_err();
+        assert!(error.to_string().contains("routing_key"), "{error}");
+
+        let payload = "v".repeat(MAX_BROADCAST_CLONE_BYTES / 8 / 4096 + 1);
+        let body = serde_json::json!({
+            "text": vec!["x"; 4096],
+            "kv_hints": {
+                "protocol_version": "1",
+                "message_id": "m",
+                "actions": [{
+                    "action_id": "a",
+                    "action_type": "t",
+                    "action_version": "1",
+                    "payload": serde_json::json!({"value": payload}).to_string()
+                }]
+            }
+        });
+        let error = requests(&body.to_string()).unwrap_err();
+        assert!(error.to_string().contains("kv_hints"), "{error}");
     }
 
     /// Scalar `text` → one item, not a batch (response stays a single object).
