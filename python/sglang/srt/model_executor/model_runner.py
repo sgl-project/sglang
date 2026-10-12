@@ -2121,7 +2121,9 @@ class ModelRunner:
                 if forward_batch.forward_mode.is_decode()
                 else forward_batch.seq_lens - 1
             ),
-            logprob_logits=logprob_logits,
+            **(
+                {"logprob_logits": logprob_logits} if logprob_logits is not None else {}
+            ),
         )
         if observer_state is not None:
             logits_output.auxiliary_device_output = observer.after_sample(

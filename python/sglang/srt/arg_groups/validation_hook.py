@@ -8,6 +8,7 @@ import logging
 import os
 from typing import Any, Dict, List, Optional
 
+from sglang.srt.arg_groups.choices import BUILT_IN_SAMPLING_BACKENDS
 from sglang.srt.arg_groups.overrides import (
     _hisparse_validation,
     resolved_view,
@@ -73,9 +74,13 @@ def check_watermark_server_args(server_args: Any) -> None:
         raise ValueError(
             "--enable-watermark is incompatible with --enable-custom-logit-processor"
         )
-    if cfg.sampling_backend == "token_oracle":
+    if (
+        cfg.sampling_backend is not None
+        and cfg.sampling_backend not in BUILT_IN_SAMPLING_BACKENDS
+    ):
         raise ValueError(
-            "--enable-watermark is incompatible with --sampling-backend token_oracle"
+            "--enable-watermark does not support custom sampling backends; "
+            f"got --sampling-backend {cfg.sampling_backend!r}"
         )
     if cfg.dllm_algorithm is not None:
         raise ValueError("--enable-watermark is not supported with diffusion LLM")

@@ -44,8 +44,6 @@ class CustomizedInfoSampler(Sampler):
         top_logprobs_nums: List[int],
         token_ids_logprobs: List[List[int]],
         positions: torch.Tensor,
-        *,
-        logprob_logits: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch_next_token_ids = super().forward(
             logits_output,
@@ -54,7 +52,6 @@ class CustomizedInfoSampler(Sampler):
             top_logprobs_nums,
             token_ids_logprobs,
             positions,
-            logprob_logits=logprob_logits,
         )
 
         if logits_output.customized_info is None:
