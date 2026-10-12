@@ -238,6 +238,9 @@ def _normalize_tp_style(style: str) -> Style:
         "packed_rowwise": "rowwise",
         "local_rowwise": "rowwise",
         "local_packed_rowwise": "rowwise",
+        # transformers' tied-embedding `base_model_tp_plan`s give the embedding this
+        # style; `replace_vocab_embed_class` shards it instead.
+        "embedding_rowwise": "replicate",
         "isolated": "replicate",
         "local": "replicate",
         "replicated_with_grad_allreduce": "replicate",

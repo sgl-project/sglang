@@ -16,7 +16,7 @@ register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
 
 class TestUnifiedRadixLockRefScenarios(unittest.TestCase):
-    def test_no_insert_without_last_node_skips_lock_release(self):
+    def test_no_insert_without_lock_skips_lock_release(self):
         cache = object.__new__(UnifiedRadixCache)
         cache.cache_controller = None
         cache.session = MagicMock()
@@ -26,7 +26,7 @@ class TestUnifiedRadixLockRefScenarios(unittest.TestCase):
         cache.token_to_kv_pool_allocator = SimpleNamespace(page_size=1)
         cache.req_to_token_pool.req_to_token = torch.arange(8).reshape(1, 8)
         cache.free_kv_row = MagicMock()
-        cache._dec_req_lock = MagicMock()
+        cache.dec_lock_ref = MagicMock()
         cache._components_tuple = ()
         cache.enable_session_radix_cache = False
 
@@ -41,7 +41,7 @@ class TestUnifiedRadixLockRefScenarios(unittest.TestCase):
             output_ids=array("q"),
             kv=kv,
             last_node=None,
-            swa_prefix_lock_released=False,
+            lock=None,
             owned_kv_len=lambda: 3,
         )
 
@@ -55,10 +55,10 @@ class TestUnifiedRadixLockRefScenarios(unittest.TestCase):
                 return_value=SimpleNamespace(strip_thinking_cache=False),
             ),
         ):
-            release_kv_cache(req, cache, is_insert=False)
+            release_kv_cache(req, cache, checkpoint=False)
 
         cache.free_kv_row.assert_called_once_with(kv, [(0, 3)])
-        cache._dec_req_lock.assert_not_called()
+        cache.dec_lock_ref.assert_not_called()
         cache.req_to_token_pool.free.assert_called_once_with(req)
 
 

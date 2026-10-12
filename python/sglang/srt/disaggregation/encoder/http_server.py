@@ -209,7 +209,7 @@ def launch_server(server_args: ServerArgs):
 
     configure_logger(server_args, prefix=" encode_server")
     publish(server_args, role="encoder")
-    if get_parallel().dp_size > 1:
+    if get_parallel().num_dp_ranks > 1:
         dp_dispatcher = launch_dp_runtime(server_args)
         # runtime initializes multiprocess metrics before spawning;
         # HTTP only exposes their endpoint.
