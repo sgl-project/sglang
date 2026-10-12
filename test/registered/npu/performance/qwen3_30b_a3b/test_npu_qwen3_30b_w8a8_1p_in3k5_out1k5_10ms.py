@@ -65,7 +65,7 @@ OTHER_ARGS = [
     2,
     "--mem-fraction-static",
     0.87,
-    "--cuda-graph-bs",
+    "--cuda-graph-bs-decode",
     1,
     5,
     15,
