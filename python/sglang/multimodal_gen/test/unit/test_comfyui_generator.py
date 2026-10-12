@@ -263,3 +263,24 @@ def test_multi_gpu_single_file_starts_without_cfg_parallel(
         str(path), "FluxPipeline", {"num_gpus": 2, "enable_cfg_parallel": True}
     )
     assert "cfg_parallel_degree" not in seen
+
+
+def test_get_model_info_reads_the_card_from_v1_models(monkeypatch) -> None:
+    """The plugin reads the OpenAI /v1/models route, not the deprecated root
+    /models, so it must unwrap the card from the list envelope."""
+    from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.core import server_api
+
+    card = {"id": "wan", "object": "model", "task_type": "T2V"}
+    urls = []
+
+    def fake_get(url, headers=None, timeout=None):
+        urls.append(url)
+        return SimpleNamespace(
+            raise_for_status=lambda: None,
+            json=lambda: {"object": "list", "data": [card]},
+        )
+
+    monkeypatch.setattr(server_api.requests, "get", fake_get)
+    client = server_api.SGLDiffusionServerAPI(base_url="http://host:30010/v1")
+    assert client.get_model_info() == card
+    assert urls == ["http://host:30010/v1/models"]
