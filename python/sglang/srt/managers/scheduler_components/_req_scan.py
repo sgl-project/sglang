@@ -29,4 +29,4 @@ def rows_hold_launched(scheduler: Scheduler) -> bool:
     """Whether the rows hold every unfinished request of the steps launched,
     except the steps in flight and the request still chunking: the loops that
     join at launch, and the PD decode loops, whose step is a copy of the rows."""
-    return scheduler.rows_join_at_launch or scheduler.disagg_decode_launches_copy
+    return scheduler.rows_join_before_plan or scheduler.disagg_decode_launches_copy

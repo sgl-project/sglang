@@ -314,7 +314,7 @@ class _SchedulerStub:
         self.inflight_steps = InflightQueue(depth=1)
         self.running_batch = SimpleNamespace(reqs=running)
         self.last_batch = last_batch
-        self.rows_join_at_launch = False
+        self.rows_join_before_plan = False
         self.disagg_decode_launches_copy = False
         self.disaggregation_mode = DisaggregationMode.NULL
         self.waiting_queue = waiting

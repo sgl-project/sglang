@@ -1309,7 +1309,7 @@ class Scheduler(
         # finished-prefill rows into the running rows at launch and drop
         # finished rows at commit. The PD decode loops drop finished rows at
         # commit too; their rows join from the prebuilt batch at the plan.
-        self.rows_join_at_launch = False
+        self.rows_join_before_plan = False
         self.forward_ct = 0
         self.return_health_check_ipcs: Deque[Optional[str]] = deque()
         self.flush_wrapper = SchedulerFlushWrapper(
@@ -1961,7 +1961,7 @@ class Scheduler(
     def event_loop_normal(self):
         """A normal scheduler loop."""
         self.inflight_steps = InflightQueue(depth=0)
-        self.rows_join_at_launch = True
+        self.rows_join_before_plan = True
         while True:
             if self.gracefully_exit:
                 break
@@ -2002,7 +2002,7 @@ class Scheduler(
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
         self.enable_skip_finishing_decode = True
         self.inflight_steps = InflightQueue(depth=1)
-        self.rows_join_at_launch = True
+        self.rows_join_before_plan = True
 
         while True:
             if self.gracefully_exit:
@@ -4338,9 +4338,9 @@ class Scheduler(
                     self.future_map.stash_bonus_tokens(
                         running_batch.req_pool_indices, last_tokens
                     )
-                if not self.rows_join_at_launch:
+                if not self.rows_join_before_plan:
                     # The rows run inside the mixed step, which the next plan
-                    # joins back. A loop that joins at launch keeps them.
+                    # joins back. A loop that joins before the plan keeps them.
                     decoding_batch.park_for_mix()
 
         return NextBatchPlan(batch_to_run=new_batch, running_batch=decoding_batch.rows)
@@ -5250,7 +5250,7 @@ class Scheduler(
             # Under a loop that joins at launch, a just-prefilled HiSparse request
             # waits in staging, not in the rows, until the next plan.
             and not (
-                self.rows_join_at_launch
+                self.rows_join_before_plan
                 and self.hisparse_coordinator is not None
                 and len(self.hisparse_coordinator.ack_staging_queue) > 0
             )
@@ -6076,7 +6076,7 @@ def _dispatch_event_loop_once(scheduler: Scheduler):
     # A PD role switch can select a different loop on the same scheduler.
     scheduler.enable_continuous_input_polling = False
     scheduler.enable_skip_finishing_decode = False
-    scheduler.rows_join_at_launch = False
+    scheduler.rows_join_before_plan = False
     disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
     if disaggregation_mode == DisaggregationMode.NULL:
         if scheduler.enable_pdmux:
