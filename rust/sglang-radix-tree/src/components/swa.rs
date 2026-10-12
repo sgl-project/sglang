@@ -668,11 +668,13 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
         host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
     ) {
         if let Some(cap) = self.swa_max_states_per_path {
+            // A repeat of the tail matches up to one page short of its end.
+            let protected_tail_tokens = self.sliding_window_size + tree_core.page_size;
             tree_core.evict_path_states_beyond_cap_(
                 SWA,
                 tail_node_id,
                 cap,
-                self.sliding_window_size,
+                protected_tail_tokens,
                 device_frees,
                 host_frees,
             );

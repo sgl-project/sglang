@@ -45,7 +45,6 @@ from sglang.srt.mem_cache.unified_cache.components.base import (
     TreeComponent,
     next_component_uuid,
 )
-from sglang.srt.runtime_context import get_schedule
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -90,7 +89,7 @@ class SWAComponent(TreeComponent):
         ) // params.page_size
         # HiCache state: set to host SWA pool when HiCache enabled
         self._swa_kv_pool_host = None
-        self.swa_max_states_per_path = get_schedule().swa_max_states_per_path
+        self.swa_max_states_per_path = params.swa_max_states_per_path
 
     component_type = ComponentType.SWA
     _independent = False
@@ -575,7 +574,8 @@ class SWAComponent(TreeComponent):
             self.swa_max_states_per_path,
             device_frees,
             host_frees,
-            protected_tail_tokens=self.sliding_window_size,
+            # A repeat of the tail matches up to one page short of its end.
+            protected_tail_tokens=self.sliding_window_size + self.tree_core.page_size,
         )
 
     def _maybe_split_leaf_for_swa_lock(

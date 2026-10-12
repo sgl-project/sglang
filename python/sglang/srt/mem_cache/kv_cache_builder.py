@@ -377,6 +377,7 @@ def build_kv_cache(
         attn_cp_size=parallel.attn_cp_size,
         chunked_prefill_size=effective_chunked_prefill_size,
         sliding_window_size=sliding_window_size,
+        swa_max_states_per_path=get_schedule().swa_max_states_per_path,
         mtp_draft_device_pools=mtp_draft_device_pools,
     )
 

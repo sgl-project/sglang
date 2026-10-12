@@ -59,11 +59,7 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     UnifiedTreeCoreInterface,
 )
 from sglang.srt.mem_cache.utils import get_eviction_strategy
-from sglang.srt.runtime_context import (
-    get_exec,
-    get_schedule,
-    mamba_cache_chunk_size,
-)
+from sglang.srt.runtime_context import get_exec, mamba_cache_chunk_size
 from sglang.srt.utils import assert_int64_array
 
 if TYPE_CHECKING:
@@ -399,7 +395,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             get_exec().mamba.mamba_max_states_per_path if has_mamba else -1
         )
         swa_max_states_per_path = (
-            get_schedule().swa_max_states_per_path
+            params.swa_max_states_per_path
             if ComponentType.SWA in self.tree_components
             else -1
         )

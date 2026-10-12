@@ -1,8 +1,9 @@
-"""CPU-only unit tests for the per-path SWA window cap."""
+"""Unit tests for the per-path SWA window cap."""
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 
 import unittest
 from array import array
@@ -28,6 +29,7 @@ from sglang.test.test_utils import CustomTestCase
 
 class _FakeTreeCore:
     tree_components = (ComponentType.FULL, ComponentType.SWA)
+    page_size = 1
 
     def __init__(self):
         self.root_node = UnifiedTreeNode(self.tree_components)
@@ -60,7 +62,7 @@ class _FakeUnifiedCache:
     tree_components = _FakeTreeCore.tree_components
 
 
-def _build_chain(cap, length=3):
+def _build_chain(cap, length=4):
     core = _FakeTreeCore()
     component = object.__new__(SWAComponent)
     component.cache = _FakeUnifiedCache()
@@ -109,7 +111,7 @@ class TestSWAPathWindowCap(unittest.TestCase):
 
         self.assertEqual(core.evicted, [nodes[0], nodes[1]])
         swa = [node.component_data[ComponentType.SWA].value for node in nodes]
-        self.assertEqual([value is None for value in swa], [True, True, False])
+        self.assertEqual([value is None for value in swa], [True, True, False, False])
         # SWA slots are freed through their FULL indices, never the SWA ones.
         self.assertEqual(
             [value.item() for value in device_frees[ComponentType.SWA]], [100, 101]
@@ -120,7 +122,7 @@ class TestSWAPathWindowCap(unittest.TestCase):
                 for node in nodes
             )
         )
-        self.assertEqual(core.component_evictable_size_[ComponentType.SWA], 1)
+        self.assertEqual(core.component_evictable_size_[ComponentType.SWA], 2)
 
 
 class _SWAPathCapFixtureBase:
@@ -130,6 +132,7 @@ class _SWAPathCapFixtureBase:
     tree_core_backend: str
     _rid = 0
     _alloc = UnifiedRadixCacheSuite._alloc
+    _init_hicache = UnifiedRadixCacheSuite._init_hicache
 
     def _build(self, cap):
         return build_fixture(
@@ -176,11 +179,39 @@ class _SWAPathCapFixtureBase:
         self.assertEqual(self._match_len(cache, tokens), (14, 14))
         cache.sanity_check()
 
+    def test_keeps_window_for_a_repeat_of_the_cached_input(self):
+        """A repeated input matches up to one page short of the cached tail;
+        the window ending there must survive the cap."""
+        cache, allocator, _ = self._build(cap=1)
+        tokens = list(range(10))
 
+        self._insert(cache, allocator, tokens, swa_evicted_seqlen=4)
+
+        self.assertEqual(self._match_len(cache, tokens[:-1]), (9, 9))
+        cache.sanity_check()
+
+    def test_write_through_backup_chain_survives_path_cap(self):
+        """Windows trimmed by the cap must not break a pending write-through
+        backup of their ancestors."""
+        cache, allocator, _ = self._build(cap=1)
+        self._init_hicache(cache)
+        cache.write_through_threshold = 2
+        tokens = list(range(24))
+
+        for end in (8, 16, 24, 24):
+            self._insert(cache, allocator, tokens[:end], swa_evicted_seqlen=0)
+        cache.writing_check(write_back=True)
+
+        self.assertEqual(self._match_len(cache, tokens[:-1]), (23, 23))
+        cache.sanity_check()
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "SWA pool fixtures need CUDA")
 class TestSWAPathCapPythonTreeCore(_SWAPathCapFixtureBase, CustomTestCase):
     tree_core_backend = "python"
 
 
+@unittest.skipUnless(torch.cuda.is_available(), "SWA pool fixtures need CUDA")
 class TestSWAPathCapRustTreeCore(_SWAPathCapFixtureBase, CustomTestCase):
     tree_core_backend = "rust"
 
