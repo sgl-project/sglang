@@ -43,6 +43,7 @@ from sglang.srt.distributed.parallel_state import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
+from sglang.srt.layers.cp.base import disable_cp_strategy
 from sglang.srt.managers.schedule_batch import set_mamba_track_indices_from_reqs
 from sglang.srt.managers.utils import _async_d2h
 from sglang.srt.mem_cache.allocation import (
@@ -751,19 +752,32 @@ def draft_pp_context():
         yield
 
 
+@contextmanager
 def draft_tp_context(owns_attention: bool):
     """Enter the TP placement that draft work runs under.
 
     Work that owns attention (an attention-owning draft, or DSpark's DP-MoE
     sync) runs on the target's attention-TP group; other draft work keeps the
-    target's TP placement. Enter it from outside any draft scope, where
+    target's TP placement. CP/TP sharing uses the full TP group for an external
+    attention-owning draft, independent of the target's CP placement.
+    Enter it from outside any draft scope, where
     ``attn_tp_group`` is still the target's.
     """
     if not owns_attention:
-        return contextlib.nullcontext()
-    return patch_tensor_parallel_group(
-        get_parallel().attn_tp_group, owns_attention=True
+        yield
+        return
+    parallel = get_parallel()
+    group = (
+        parallel.tp_group
+        if parallel.enable_cp_tp_group_sharing
+        else parallel.attn_tp_group
     )
+    with (
+        patch_tensor_parallel_group(group, owns_attention=True),
+        parallel.override(enable_prefill_cp=False, enable_cp_tp_group_sharing=False),
+        disable_cp_strategy(),
+    ):
+        yield
 
 
 def spec_stage_span(name: str):
