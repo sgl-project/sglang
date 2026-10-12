@@ -249,19 +249,22 @@ class TestDsv4MoePrologue(CustomTestCase):
         )
 
     def _fused_moe(self, x, experts, weights, ids, stock):
-        """fused_moe output and the stage1 output the stage2 quant reads."""
+        """fused_moe output, the stage1 output the stage2 quant reads, and whether the
+        stage1 quant came from the sort."""
         from aiter import ActivationType, QuantType
         from aiter.ops.flydsl.moe_common import GateMode
 
         fm, S = self.fm, self.S
         w1, w2, w1_scale, w2_scale = experts
-        stage1_out = []
+        stage1_out, sort_time_quant = [], []
         patched_quant = fm.fused_dynamic_mxfp8_quant_moe_sort
         patched_supported = S._small_sort_supported
 
         def recording_quant(input, *args, **kwargs):
             if input.shape[-1] == self.INTER:
                 stage1_out.append(input.clone())
+            else:
+                sort_time_quant.append(S._emitted_quant.get() is not None)
             return patched_quant(input, *args, **kwargs)
 
         fm.fused_dynamic_mxfp8_quant_moe_sort = recording_quant
@@ -286,7 +289,8 @@ class TestDsv4MoePrologue(CustomTestCase):
             fm.fused_dynamic_mxfp8_quant_moe_sort = patched_quant
             S._small_sort_supported = patched_supported
         self.assertEqual(len(stage1_out), 1)
-        return out, stage1_out[0]
+        self.assertEqual(len(sort_time_quant), 1)
+        return out, stage1_out[0], sort_time_quant[0]
 
     def _route(self, x, gate_w, bias):
         """V4.1's decode router: split-K GEMV + sqrtsoftplus gate + the shared slot."""
@@ -312,8 +316,11 @@ class TestDsv4MoePrologue(CustomTestCase):
             x = torch.randn(m, self.H, generator=gen).to(torch.bfloat16).to(self.dev)
             weights, ids = self._route(x, gate_w, bias)
             self.assertEqual(ids.shape, (m, topk), msg)
-            ref_out, ref_stage1 = self._fused_moe(x, experts, weights, ids, stock=True)
-            out, stage1 = self._fused_moe(x, experts, weights, ids, stock=False)
+            ref_out, ref_stage1, _ = self._fused_moe(
+                x, experts, weights, ids, stock=True
+            )
+            out, stage1, fused = self._fused_moe(x, experts, weights, ids, stock=False)
+            self.assertTrue(fused, msg)
             self.assertTrue(torch.equal(stage1, ref_stage1), msg)
             # bf16 atomics round partial sums of up to topk rows: a few ulp of the row scale
             err = (out.float() - ref_out.float()).abs().max().item()
