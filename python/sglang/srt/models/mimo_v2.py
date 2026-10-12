@@ -77,7 +77,12 @@ from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
     Mxfp4FlashinferTrtllmMoEMethod,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.kernels.ops.attention.mimo_fused_rope_cache import (
+    mimo_fused_front_enabled,
+    try_mimo_fused_rope_cache,
+)
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.models.utils import create_fused_set_kv_buffer_arg
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -772,6 +777,38 @@ class MiMoV2Attention(nn.Module):
             state.pop("attn_intermediate_state")
         )
 
+    def _prepare_qkv(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ):
+        qkv, _ = self.qkv_proj(hidden_states)
+        q, k, v = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
+        fused_cache = False
+        if (
+            forward_batch.forward_mode.is_decode_or_idle()
+            and mimo_fused_front_enabled()
+        ):
+            fused_cache = try_mimo_fused_rope_cache(
+                q,
+                k,
+                v,
+                positions,
+                self.rotary_emb,
+                self.v_scale if self.v_scale is not None else 1.0,
+                create_fused_set_kv_buffer_arg(
+                    value=v,
+                    layer=self.attn,
+                    forward_batch=forward_batch,
+                ),
+            )
+        if not fused_cache:
+            q, k = self.rotary_emb(positions, q, k)
+            if self.v_scale is not None:
+                v = v * self.v_scale
+        return q, k, v, not fused_cache
+
     def forward_prepare(
         self,
         positions: torch.Tensor,
@@ -780,23 +817,24 @@ class MiMoV2Attention(nn.Module):
     ):
         if hidden_states.shape[0] == 0:
             return hidden_states, forward_batch, None
-        qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
-
-        q, k = self.rotary_emb(positions, q, k)
-        if self.v_scale is not None:
-            v = v * self.v_scale
-
-        inner_state = q, k, v, forward_batch
+        q, k, v, save_kv_cache = self._prepare_qkv(
+            positions, hidden_states, forward_batch
+        )
+        inner_state = q, k, v, forward_batch, save_kv_cache
         return None, forward_batch, inner_state
 
     def forward_core(self, intermediate_state):
         hidden_states, forward_batch, inner_state = intermediate_state
         if inner_state is None:
             return hidden_states
+        q, k, v, forward_batch, save_kv_cache = inner_state
         attn_output = self.attn(
-            *inner_state,
+            q,
+            k,
+            v,
+            forward_batch,
             sinks=self.attention_sink_bias,
+            save_kv_cache=save_kv_cache,
         )
         output, _ = self.o_proj(attn_output)
         return output
@@ -807,16 +845,17 @@ class MiMoV2Attention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
-
-        # [t, h, dr]
-        q, k = self.rotary_emb(positions, q, k)
-        # [t, h, d]
-
-        if self.v_scale is not None:
-            v = v * self.v_scale
-        attn_output = self.attn(q, k, v, forward_batch, sinks=self.attention_sink_bias)
+        q, k, v, save_kv_cache = self._prepare_qkv(
+            positions, hidden_states, forward_batch
+        )
+        attn_output = self.attn(
+            q,
+            k,
+            v,
+            forward_batch,
+            sinks=self.attention_sink_bias,
+            save_kv_cache=save_kv_cache,
+        )
         output, _ = self.o_proj(attn_output)
         return output
 
