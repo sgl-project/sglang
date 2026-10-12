@@ -8,15 +8,52 @@ import unittest
 
 import numpy as np
 import requests
-from transformers import AutoConfig
+from transformers import AutoConfig, AutoTokenizer
 
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 
-register_cuda_ci(est_time=120, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=240, stage="extra-a", runner_config="1-gpu-large")
 
 
-class TestMambaLazyInplaceKL(DefaultServerBase):
+class MambaCacheKLMixin:
+    ignore_eos = False
+
+    def _generate(self, input_ids, max_new_tokens, *, score=False):
+        payload = {
+            "input_ids": input_ids,
+            "sampling_params": {
+                "temperature": 0,
+                "max_new_tokens": max_new_tokens,
+                "ignore_eos": self.ignore_eos,
+            },
+            "return_logprob": True,
+            "logprob_start_len": -1,
+        }
+        if score:
+            payload["token_ids_logprob"] = self.vocab_ids
+        response = requests.post(self.base_url + "/generate", json=payload, timeout=120)
+        response.raise_for_status()
+        result = response.json()
+        self.assertEqual(result["meta_info"]["completion_tokens"], max_new_tokens)
+        return result
+
+    def _flush_cache(self):
+        response = requests.post(self.base_url + "/flush_cache", timeout=30)
+        response.raise_for_status()
+
+    def _distribution(self, result):
+        rows = result["meta_info"]["output_token_ids_logprobs"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual([row[1] for row in rows[0]], self.vocab_ids)
+        logprobs = np.asarray([row[0] for row in rows[0]], dtype=np.float64)
+        self.assertTrue(np.isfinite(logprobs).all())
+        self.assertAlmostEqual(float(np.exp(logprobs).sum()), 1.0, places=4)
+        # Remove log-softmax rounding error before computing the exact KL.
+        return logprobs - np.logaddexp.reduce(logprobs)
+
+
+class TestMambaLazyInplaceKL(MambaCacheKLMixin, DefaultServerBase):
     """Guard lazy Mamba checkpoint reuse when the optional track slot is exhausted.
 
     Keep overlap scheduling and decode CUDA graphs enabled. A four-slot pool holds
@@ -32,6 +69,7 @@ class TestMambaLazyInplaceKL(DefaultServerBase):
     and a stale 192-token cache hit; with the fix KL=0 and the safe hit is 128 tokens.
     """
 
+    ignore_eos = True
     model = "Qwen/Qwen3.5-0.8B"
     server_env = {
         "SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK": "0",
@@ -67,40 +105,10 @@ class TestMambaLazyInplaceKL(DefaultServerBase):
         "42",
     ]
 
-    def _generate(self, input_ids, max_new_tokens, *, score=False):
-        payload = {
-            "input_ids": input_ids,
-            "sampling_params": {
-                "temperature": 0,
-                "max_new_tokens": max_new_tokens,
-                "ignore_eos": True,
-            },
-            "return_logprob": True,
-            "logprob_start_len": -1,
-        }
-        if score:
-            payload["token_ids_logprob"] = self.vocab_ids
-        response = requests.post(self.base_url + "/generate", json=payload, timeout=120)
-        response.raise_for_status()
-        result = response.json()
-        self.assertEqual(result["meta_info"]["completion_tokens"], max_new_tokens)
-        return result
-
     def _warm_prefixes(self):
-        response = requests.post(self.base_url + "/flush_cache", timeout=30)
-        response.raise_for_status()
+        self._flush_cache()
         self._generate([44] * 128, 1)
         self._generate([42] * 128, 1)
-
-    def _distribution(self, result):
-        rows = result["meta_info"]["output_token_ids_logprobs"]
-        self.assertEqual(len(rows), 1)
-        self.assertEqual([row[1] for row in rows[0]], self.vocab_ids)
-        logprobs = np.asarray([row[0] for row in rows[0]], dtype=np.float64)
-        self.assertTrue(np.isfinite(logprobs).all())
-        self.assertAlmostEqual(float(np.exp(logprobs).sum()), 1.0, places=4)
-        # Remove log-softmax rounding error before computing the exact KL.
-        return logprobs - np.logaddexp.reduce(logprobs)
 
     def test_reuse_distribution_after_inplace_tracking(self):
         config = AutoConfig.from_pretrained(self.model)
@@ -131,6 +139,91 @@ class TestMambaLazyInplaceKL(DefaultServerBase):
         self.assertGreaterEqual(kl, -1e-12)
         # Leave room for numerical noise while staying far below the broken run.
         self.assertLess(kl, 1e-4, "Cache reuse changed the next-token distribution")
+
+
+class TestMambaReplaySSMFinishedKL(MambaCacheKLMixin, DefaultServerBase):
+    """An unflushed ReplaySSM slot cannot be cached at the last flush boundary.
+
+    Conv advances every decode step, while temporal advances only on a flush.
+    Compare the same continuation with a warm cache and a cold recompute, both
+    when finishing mid-ring and when finishing with a fully flushed state.
+    """
+
+    ignore_eos = True
+    model = "Qwen/Qwen3.5-0.8B"
+    revision = "2fc06364715b967f1860aea9cf38778875588b17"
+    other_args = [
+        "--revision",
+        revision,
+        "--mamba-radix-cache-strategy",
+        "no_buffer",
+        "--page-size",
+        "1",
+        "--disable-overlap-schedule",
+        "--disable-cuda-graph",
+        "--enable-linear-replayssm",
+        "--linear-replayssm-cache-len",
+        "16",
+        "--mem-fraction-static",
+        "0.25",
+        "--max-total-tokens",
+        "8192",
+        "--max-running-requests",
+        "8",
+        "--max-mamba-cache-size",
+        "128",
+        "--attention-backend",
+        "triton",
+        "--linear-attn-backend",
+        "triton",
+    ]
+
+    def test_reuse_distribution_after_finish(self):
+        tokenizer = AutoTokenizer.from_pretrained(self.model, revision=self.revision)
+        config = AutoConfig.from_pretrained(self.model, revision=self.revision)
+        self.vocab_ids = list(range(config.get_text_config().vocab_size))
+        newline = tokenizer.encode("\n", add_special_tokens=False)
+        cases = (
+            (
+                "count",
+                "Continue the sequence with numbers separated by spaces: 1 2 3 4 5 6 7 8 9 10",
+            ),
+            ("story", "Write a story about a cat who likes fish."),
+        )
+        for name, text in cases:
+            prompt = tokenizer.apply_chat_template(
+                [{"role": "user", "content": text}],
+                tokenize=True,
+                return_dict=False,
+                add_generation_prompt=True,
+                enable_thinking=False,
+            )
+            # Prefill emits the first token; the remaining tokens run decode.
+            # 23 decode steps leave a partial ring, while 32 flush twice.
+            for limit in (24, 33):
+                with self.subTest(case=name, max_new_tokens=limit):
+                    self._flush_cache()
+                    seed = self._generate(prompt, limit)
+                    probe = prompt + seed["output_ids"] + newline
+                    warm = self._generate(probe, 1, score=True)
+                    cached = warm["meta_info"]["cached_tokens"]
+                    self.assertGreater(cached, 0)
+                    self._flush_cache()
+                    cold = self._generate(probe, 1, score=True)
+                    self.assertEqual(cold["meta_info"]["cached_tokens"], 0)
+                    p, q = self._distribution(cold), self._distribution(warm)
+                    kl = float(np.sum(np.exp(p) * (p - q)))
+                    print(
+                        f"ReplaySSM {name} {limit=} KL(cold || warm)={kl:.9g}, "
+                        f"{cached=}",
+                        flush=True,
+                    )
+                    self.assertGreaterEqual(kl, -1e-12)
+                    self.assertLess(
+                        kl, 5e-3, "ReplaySSM checkpoint corrupted cache reuse"
+                    )
+                    expected = len(prompt) + (32 if limit == 33 else 0)
+                    self.assertEqual(cached, expected)
 
 
 if __name__ == "__main__":
