@@ -15,7 +15,12 @@ import numpy.typing as npt
 import zmq
 from prometheus_client import Counter
 
-from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
+from sglang.srt.disaggregation.base.conn import (
+    KVArgs,
+    KVPoll,
+    KVTransferDestination,
+    StateType,
+)
 from sglang.srt.disaggregation.common.conn import (
     ABORT_ACK_TAG,
     ABORT_TAG,
@@ -100,6 +105,7 @@ class TransferInfo:
     is_dummy: bool
     decode_prefix_len: Optional[int] = None
     dst_device_kv_indices: Optional[npt.NDArray[np.int32]] = None
+    destination: KVTransferDestination = KVTransferDestination.DEVICE
     # Note: always put the optional staging field at the final (it will be set through 'STAGING_RSP' pkg when needed)
     staging: Optional[StagingTransferInfo] = None
 
@@ -116,6 +122,11 @@ class TransferInfo:
             dst_state_indices = unpack_int_lists(msg[6], "i")
             is_dummy = False
         return cls(
+            destination=(
+                KVTransferDestination(msg[10].decode("ascii"))
+                if len(msg) > 10
+                else KVTransferDestination.DEVICE
+            ),
             room=int(msg[0].decode("ascii")),
             endpoint=msg[1].decode("ascii"),
             dst_port=int(msg[2].decode("ascii")),
@@ -159,6 +170,10 @@ class KVArgsRegisterInfo:
     requires_dcp_relayout: bool = False
     dcp_token_item_lens: Optional[List[int]] = None
     dst_kv_item_lens: List[int] = dataclasses.field(default_factory=list)
+    dst_host_kv_ptrs: List[int] = dataclasses.field(default_factory=list)
+    dst_host_state_data_ptrs: List[List[int]] = dataclasses.field(default_factory=list)
+    dst_host_state_item_lens: List[List[int]] = dataclasses.field(default_factory=list)
+    dst_host_kv_item_lens: List[int] = dataclasses.field(default_factory=list)
     staging_base_ptr: int = 0
     staging_total_size: int = 0
     staging: Optional[StagingRegisterInfo] = None
@@ -211,8 +226,54 @@ class KVArgsRegisterInfo:
                 if len(msg) > 19 and msg[19]
                 else []
             ),
+            dst_host_kv_ptrs=(
+                list(struct.unpack(f"{len(msg[20]) // 8}Q", msg[20]))
+                if len(msg) > 20
+                else []
+            ),
+            dst_host_state_data_ptrs=(
+                unpack_int_lists(msg[21], "Q") if len(msg) > 21 else []
+            ),
+            dst_host_state_item_lens=(
+                unpack_int_lists(msg[22], "I") if len(msg) > 22 else []
+            ),
+            dst_host_kv_item_lens=(
+                list(struct.unpack(f"{len(msg[23]) // 8}Q", msg[23]))
+                if len(msg) > 23
+                else []
+            ),
             # Note: always put the staging field at the final
             staging=StagingRegisterInfo.from_zmq_fields(msg, 14, slot_ids_index=18),
+        )
+
+    def for_destination(self, destination: KVTransferDestination):
+        if destination == KVTransferDestination.DEVICE:
+            return self
+        if (
+            not self.dst_host_kv_ptrs
+            or len(self.dst_host_kv_ptrs) != len(self.dst_kv_ptrs)
+            or len(self.dst_host_kv_item_lens) != len(self.dst_host_kv_ptrs)
+        ):
+            raise ValueError("Host KV destination descriptors are missing")
+        if self.requires_dcp_relayout:
+            raise ValueError("Host receive does not support DCP relayout")
+        host_state_counts = [len(v) for v in self.dst_host_state_data_ptrs]
+        if host_state_counts != [len(v) for v in self.dst_state_data_ptrs] or (
+            host_state_counts != [len(v) for v in self.dst_host_state_item_lens]
+        ):
+            raise ValueError("Host state destination descriptors are missing")
+        # Adjacent requests may choose different destinations. Keep the cached
+        # device registration intact and use a per-transfer descriptor view.
+        return dataclasses.replace(
+            self,
+            dst_kv_ptrs=self.dst_host_kv_ptrs,
+            dst_kv_item_len=self.dst_host_kv_item_lens[0],
+            dst_kv_item_lens=self.dst_host_kv_item_lens,
+            dst_state_data_ptrs=self.dst_host_state_data_ptrs,
+            dst_state_item_lens=self.dst_host_state_item_lens,
+            staging_base_ptr=0,
+            staging_total_size=0,
+            staging=None,
         )
 
 
@@ -238,6 +299,7 @@ def _uses_flat_entry_layout(
 
 
 class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
+    supports_host_destination = True
     AUX_DATA_HEADER = b"AUX_DATA"
     # Implements teardown() below, so runtime PD role switching is supported.
     supports_role_switch = True
@@ -369,9 +431,15 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     regions.append((ptr, length))
 
         add(self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens)
+        add(self.kv_args.host_kv_data_ptrs, self.kv_args.host_kv_data_lens)
         add(self.kv_args.aux_data_ptrs, self.kv_args.aux_data_lens)
         for ptrs, lens in zip(
             self.kv_args.state_data_ptrs, self.kv_args.state_data_lens
+        ):
+            add(ptrs, lens)
+        for ptrs, lens in zip(
+            self.kv_args.host_state_data_ptrs or [],
+            self.kv_args.host_state_data_lens or [],
         ):
             add(ptrs, lens)
         return regions
@@ -2405,7 +2473,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 break
 
                         target_rank_registration_info: KVArgsRegisterInfo = (
-                            self.decode_kv_args_table[req.mooncake_session_id]
+                            self.decode_kv_args_table[
+                                req.mooncake_session_id
+                            ].for_destination(req.destination)
                         )
                         is_dcp_transfer = (
                             target_rank_registration_info.requires_dcp_relayout
@@ -2983,9 +3053,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 class MooncakeFailureExceptionMixin:
     """Shared `failure_exception` for the Mooncake sender and receiver.
 
-    Both sides conclude a failed room identically: latch Failed, clear local
-    state, then raise with the recorded reason -- or, when no reason was
-    recorded locally, report it as propagated from another rank. Expects the
+    Latch Failed and raise with the recorded reason, or report it as propagated
+    from another rank when no reason was recorded locally. A published Host
+    receiver keeps its state until the transfer queue confirms drain. Expects the
     concrete class to provide ``conclude_state``, ``clear()``,
     ``bootstrap_room`` and ``kv_mgr``.
     """
@@ -2995,7 +3065,10 @@ class MooncakeFailureExceptionMixin:
         if self.conclude_state is None:
             self.conclude_state = KVPoll.Failed
 
-        self.clear()
+        # The transfer queue owns published Host pages until all senders drain.
+        # Reporting a failure must not discard the receiver's ACK generation.
+        if not getattr(self, "_host_destination_published", False):
+            self.clear()
 
         with self.kv_mgr.failure_lock:
             failure_reason = self.kv_mgr.failure_records.pop(self.bootstrap_room, None)
@@ -3123,9 +3196,44 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
         bootstrap_addr: str,
         bootstrap_room: Optional[int] = None,
     ):
+        self._host_destination_published = False
         self.session_id = mgr.get_session_id()
         self.init_time = None
         super().__init__(mgr, bootstrap_addr, bootstrap_room)
+
+    @property
+    def supports_host_destination(self) -> bool:
+        peer = getattr(self, "prefill_info", None)
+        return bool(
+            peer is not None
+            and peer.supports_host_destination
+            and self.kv_mgr.supports_host_destination
+            and self.kv_mgr.enable_deferred_decode_kv_release
+            and peer.attn_tp_size == self.kv_mgr.attn_tp_size
+            and peer.attn_cp_size == 1
+            and self.kv_mgr.dcp_size == 1
+            and not self.require_staging
+        )
+
+    def _send_abort_notification(self, *, force_arm: bool = False):
+        # A partial metadata send can publish Host addresses before init_time
+        # is set. Arm the existing generation-tagged ACK protocol in that case.
+        super()._send_abort_notification(
+            force_arm=force_arm or self._host_destination_published
+        )
+
+    def is_abort_release_safe(self) -> bool:
+        return not self._host_destination_published or (
+            self._abort_generation is not None
+            and self.kv_mgr.is_abort_release_safe(
+                self.bootstrap_room, len(self.bootstrap_infos)
+            )
+        )
+
+    def clear(self) -> None:
+        if self._host_destination_published:
+            self.kv_mgr.clear_deferred_abort_state(self.bootstrap_room)
+        super().clear()
 
     def _register_kv_args(self) -> bool:
         for bootstrap_info in self.bootstrap_infos:
@@ -3209,6 +3317,20 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
                                 f"{len(self.kv_mgr.kv_args.kv_item_lens)}Q",
                                 *self.kv_mgr.kv_args.kv_item_lens,
                             ),
+                            struct.pack(
+                                f"{len(self.kv_mgr.kv_args.host_kv_data_ptrs or [])}Q",
+                                *(self.kv_mgr.kv_args.host_kv_data_ptrs or []),
+                            ),
+                            pack_int_lists(
+                                self.kv_mgr.kv_args.host_state_data_ptrs or [], "Q"
+                            ),
+                            pack_int_lists(
+                                self.kv_mgr.kv_args.host_state_item_lens or [], "I"
+                            ),
+                            struct.pack(
+                                f"{len(self.kv_mgr.kv_args.host_kv_item_lens or [])}Q",
+                                *(self.kv_mgr.kv_args.host_kv_item_lens or []),
+                            ),
                         ]
                     )
             except zmq.ZMQError:
@@ -3228,6 +3350,7 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
         state_indices: Optional[List] = None,
         decode_prefix_len: Optional[int] = None,
         device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
+        destination: KVTransferDestination = KVTransferDestination.DEVICE,
     ):
         if self.bootstrap_infos is None:
             self.kv_mgr.record_failure(
@@ -3237,9 +3360,16 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
             return
 
+        if destination == KVTransferDestination.HOST:
+            if not self.supports_host_destination:
+                raise ValueError("The prefill peer or layout cannot receive into Host")
+            if device_kv_indices is not None:
+                raise ValueError("Host receive cannot mix HiSparse device indices")
+            self._host_destination_published = True
         self.chunk_staging_infos = []
         if (
-            self.kv_mgr.enable_staging
+            destination == KVTransferDestination.DEVICE
+            and self.kv_mgr.enable_staging
             and self.kv_mgr._staging_ctx.allocator is not None
         ):
             self.kv_mgr.register_staging_room_bootstrap(
@@ -3271,6 +3401,7 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
                                 if not is_dummy and device_kv_indices is not None
                                 else b""
                             ),
+                            destination.value.encode("ascii"),
                         ]
                     )
             except zmq.ZMQError:

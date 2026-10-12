@@ -433,11 +433,31 @@ class TestDecodeRetractionBackup(CustomTestCase):
         self.assertEqual(full_host.available_size(), capacities[0])
         receiver.send_metadata.assert_not_called()
         swa_host.free(blocker)
+        # Another rank can fail at either allocation after local capacity fits.
+        # Every rank must roll back, without publishing any Host destinations.
+        for decisions in ([True, False], [True, True, False]):
+            with patch.object(queue, "_host_receive_all_ready", side_effect=decisions):
+                self.assertFalse(queue._pre_alloc_host(decode_req))
+            self.assertEqual(
+                (full_host.available_size(), swa_host.available_size()), capacities
+            )
+            self.assertIsNone(req.kv.retraction_backup)
+            receiver.send_metadata.assert_not_called()
+        receiver.send_metadata.side_effect = lambda *a, **kw: self.assertTrue(
+            decode_req.host_staged
+        )
         self.assertTrue(queue._pre_alloc_host(decode_req))
         backup = req.kv.retraction_backup
         self.assertEqual(len(backup.host_indices), 24)
         self.assertEqual(len(backup.pool_transfers[0].host_indices), 12)
         self.assertEqual(len(receiver.send_metadata.call_args.args[2][0]), 3)
+
+        # A peer without a request slot or device capacity blocks all ranks.
+        for decisions in ([False], [True, False]):
+            with patch.object(queue, "_host_receive_all_ready", side_effect=decisions):
+                self.assertFalse(queue.allocate_host_staged(decode_req))
+            self.assertIsNone(req.kv.req_pool_idx)
+            self.assertTrue(decode_req.host_staged)
 
         # Independent SWA pressure must delay device admission even when full KV fits.
         swa_blocker = env.allocator.swa_attn_allocator.alloc(self.pool_size)

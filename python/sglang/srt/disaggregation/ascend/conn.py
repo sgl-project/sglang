@@ -93,6 +93,9 @@ def _build_page_interleaved_dcp_plan(
 
 
 class AscendKVManager(MooncakeKVManager):
+    # MemFabric registers device regions only.
+    supports_host_destination = False
+
     def __init__(
         self,
         args,

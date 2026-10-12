@@ -1426,11 +1426,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
             if (
                 get_disagg().disaggregation_decode_host_receive_threshold < 1
-                and not decode_req.is_rebootstrap
-                and not _is_fake_transfer(decode_req.req)
-                and decode_req.kv_receiver.supports_host_destination
-                and self.scheduler.pool_stats_observer.get_pool_stats().full_token_usage
-                >= get_disagg().disaggregation_decode_host_receive_threshold
+                and self._use_host_destination(decode_req)
             ):
                 if not self._pre_alloc_host(decode_req):
                     break
@@ -1808,6 +1804,25 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self._num_published_destinations += 1
         decode_req.req.time_stats.set_decode_transfer_queue_entry_time()
 
+    def _host_receive_all_ready(self, ready: bool) -> bool:
+        # Follow the queue order established by the handshake poll. Every
+        # attention TP rank must choose the same destination and admission step.
+        state = torch.tensor([int(ready)], dtype=torch.int32)
+        if torch.distributed.get_world_size(self.gloo_group) > 1:
+            torch.distributed.all_reduce(
+                state, op=torch.distributed.ReduceOp.MIN, group=self.gloo_group
+            )
+        return bool(state.item())
+
+    def _use_host_destination(self, decode_req: DecodeRequest) -> bool:
+        return self._host_receive_all_ready(
+            not decode_req.is_rebootstrap
+            and not _is_fake_transfer(decode_req.req)
+            and decode_req.kv_receiver.supports_host_destination
+            and self.scheduler.pool_stats_observer.get_pool_stats().full_token_usage
+            >= get_disagg().disaggregation_decode_host_receive_threshold
+        )
+
     def _pre_alloc_host(self, decode_req: DecodeRequest) -> bool:
         seq_len = len(decode_req.req.origin_input_ids)
         page_size = self.host_pool.page_size
@@ -1818,8 +1833,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             and not self.tree_cache.disable
         ):
             self.tree_cache.evict_host(required_tokens)
-        if self.host_pool.available_size() < required_tokens:
-            return False
+        host_ready = self.host_pool.available_size() >= required_tokens
         swa_num_tokens = 0
         if self.host_swa_pool is not None:
             window_start = page_align_floor(
@@ -1831,18 +1845,23 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 entry = self.tree_cache.host_pool_group.get_entry(PoolName.SWA)
                 if entry.host_evict_fn is not None:
                     entry.host_evict_fn(required_swa_tokens)
-            if self.host_swa_pool.available_size() < required_swa_tokens:
-                return False
+            host_ready &= self.host_swa_pool.available_size() >= required_swa_tokens
+        if not self._host_receive_all_ready(host_ready):
+            return False
         host_indices = self.host_pool.alloc(num_tokens)
-        if host_indices is None:
+        if not self._host_receive_all_ready(host_indices is not None):
+            if host_indices is not None:
+                self.host_pool.free(host_indices)
             return False
         indices_by_pool = {PoolName.KV: host_indices}
         transfers = []
         state_indices = None
         if self.host_swa_pool is not None:
             swa_host_indices = self.host_swa_pool.alloc(swa_num_tokens)
-            if swa_host_indices is None:
+            if not self._host_receive_all_ready(swa_host_indices is not None):
                 self.host_pool.free(host_indices)
+                if swa_host_indices is not None:
+                    self.host_swa_pool.free(swa_host_indices)
                 return False
             indices_by_pool[PoolName.SWA] = swa_host_indices
             transfers.append(
@@ -1867,6 +1886,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
         if get_disagg().disaggregation_decode_enable_radix_cache:
             _bind_root_prefix(decode_req.req, self.tree_cache)
+        # Own the pages before publishing addresses, including partial sends.
+        decode_req.host_staged = True
         self._send_kv_metadata(
             decode_req,
             host_indices,
@@ -1875,13 +1896,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             decode_prefix_len=0,
             destination=KVTransferDestination.HOST,
         )
-        decode_req.host_staged = True
         if self.scheduler.metrics_reporter.current_scheduler_metrics_enabled:
             self.scheduler.metrics_collector.increment_decode_host_receive_reqs()
         return True
 
     def allocate_host_staged(self, decode_req: DecodeRequest) -> bool:
-        if self.req_to_token_pool.available_size() <= 0:
+        if not self._host_receive_all_ready(
+            self.req_to_token_pool.available_size() > 0
+        ):
             return False
         req = decode_req.req
         retractable_tokens = sum(
@@ -1914,11 +1936,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             full_allocatable_tokens = self._allocatable_token_budgets(
                 retractable_tokens=retractable_tokens, count_retracted=True
             )
-        if not self._prealloc_reservation_fits(
-            required_tokens,
-            swa_required_tokens,
-            full_allocatable_tokens=full_allocatable_tokens,
-            swa_allocatable_tokens=swa_allocatable_tokens,
+        if not self._host_receive_all_ready(
+            self._prealloc_reservation_fits(
+                required_tokens,
+                swa_required_tokens,
+                full_allocatable_tokens=full_allocatable_tokens,
+                swa_allocatable_tokens=swa_allocatable_tokens,
+            )
         ):
             return False
         self._pre_alloc(req)
@@ -3301,6 +3325,9 @@ class SchedulerDisaggregationDecodeMixin:
                         self.token_to_kv_pool_allocator,
                         "host_pool",
                     )
+            # Restore is synchronous; all attention ranks finish H2D before
+            # any rank enters the first decode forward.
+            self.disagg_decode_prealloc_queue._host_receive_all_ready(True)
         return new_batch
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
@@ -3318,8 +3345,12 @@ class SchedulerDisaggregationDecodeMixin:
         # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
         resumed_reqs = self.disagg_decode_prealloc_queue.resume_retracted_reqs()
         self.waiting_queue.extend(resumed_reqs)
-        if len(self.disagg_decode_prealloc_queue.retracted_queue) > 0:
-            # if there are still retracted requests, we do not allocate new requests
+        can_admit = not self.disagg_decode_prealloc_queue.retracted_queue
+        if get_disagg().disaggregation_decode_host_receive_threshold < 1:
+            can_admit = self.disagg_decode_prealloc_queue._host_receive_all_ready(
+                can_admit
+            )
+        if not can_admit:
             return
 
         if not hasattr(self, "polling_count"):
