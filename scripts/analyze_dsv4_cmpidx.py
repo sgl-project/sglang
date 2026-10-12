@@ -23,7 +23,7 @@ from collections import defaultdict
 
 TAG = re.compile(
     r"\[(CMPIDX|IDXK|C4KV|C128KV|C128X|OSHAPE|XIN|LHID|IDXIN|LIMETA"
-    r"|C4ST|C4STP|KSTATELOC)\]"
+    r"|C4ST|C4STP|KSTATELOC|C4POS)\]"
 )
 KV = re.compile(r"(\w+)=(\[[^\]]*\]|\([^)]*\)|[^\s]+)")
 # [IDXIN] kpg= is emitted by ``_read_page_table_pages`` as
@@ -919,6 +919,166 @@ def report_idxin_rope(rows, knorm_tol=0.05):
         print(f"[IDXIN-ROPE] differing shared blocks (>{knorm_tol}): {off_txt}")
 
 
+C4POS_RUNBOOK = (
+    "[C4POS-RUNBOOK] DSV4_DUMP_C4POS=1 bash start_test.sh > /tmp/dsv4_c4pos.log 2>&1 & "
+    "bash curl.sh; bash curl.sh; bash curl.sh; bash curl.sh; bash curl.sh; "
+    "grep -n '\\[C4POS\\]' /tmp/dsv4_c4pos.log; "
+    "python scripts/analyze_dsv4_cmpidx.py /tmp/dsv4_c4pos.log"
+)
+
+
+def _c4pos_ints(rec):
+    """Parse the compact ``pos=[a,b,c]`` list of one [C4POS] row into ints."""
+    v = rec.get("pos")
+    if not v:
+        return []
+    s = str(v).strip()
+    if s.startswith("["):
+        s = s[1:]
+    if s.endswith("]"):
+        s = s[:-1]
+    out = []
+    for tok in s.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        try:
+            out.append(int(tok))
+        except ValueError:
+            continue
+    return out
+
+
+def _c4pos_requests(rows):
+    """Split [C4POS] rows into requests (chat/completions, else layer-reset).
+
+    The strongest boundary is the ``/v1/chat/completions`` line (``_req`` stamped
+    by ``parse``); with none present we fall back to the layer index RESET, which
+    happens exactly once per request (cmp layers emit in ascending order).
+    """
+    if any(_int(r, "_req", 0) > 0 for r in rows):
+        return _idxin_chat_split(rows)[0]
+    reqs = []
+    prev_ly = None
+    for r in rows:
+        ly = _int(r, "layer")
+        if not reqs or (prev_ly is not None and 0 <= ly < prev_ly):
+            reqs.append([])
+        reqs[-1].append(r)
+        prev_ly = ly
+    return reqs
+
+
+def _c4pos_prefill_maps(group):
+    """``{layer: (first, ratio, pos_list)}`` of the PREFILL row per layer.
+
+    A request emits one [C4POS] row per compressor call (one prefill + every
+    decode step); the prefill row is the one with the LONGEST compact ``pos``
+    list, so for each layer keep the max-length row.
+    """
+    out = {}
+    for r in group:
+        pos = _c4pos_ints(r)
+        if not pos:
+            continue
+        ly = _int(r, "layer")
+        if ly not in out or len(pos) > len(out[ly][2]):
+            out[ly] = (_int(r, "first"), _int(r, "ratio", 4), pos)
+    return out
+
+
+def _c4pos_value_maps(pos_list, ratio):
+    """``{abs_block: value}`` keyed by the ABSOLUTE compressed block.
+
+    The table value IS the absolute RoPE position, so ``block = value // ratio``.
+    A MISS and a HIT that anchor the SAME absolute block must carry the SAME
+    value; anything else is a host table bug.
+    """
+    if ratio <= 0:
+        return {}
+    return {v // ratio: v for v in pos_list}
+
+
+def report_c4pos(rows):
+    """``[C4POS-VERDICT]`` MISS-vs-HIT per ABSOLUTE compressed block.
+
+    The host builds ``positions_cmp_padding_c{ratio}`` as a COMPACT per-call
+    table already anchored at absolute positions (entry j = absolute token
+    ``(first_k+j)*ratio``) and the kernel indexes it with a call-local
+    ``padScIdx``; so the RoPE value for a given ABSOLUTE block must be identical
+    on a MISS and a HIT:
+
+      * equal on every shared block -> ``phase_same`` (compressor RoPE provably
+        identical; any remaining divergence is CONTENT / output-slot, not phase)
+      * any shared block differs    -> ``phase_diff`` (host metadata bug)
+    """
+    print("\n== [C4POS] positions_cmp_padding_c4 (absolute-block parity) ==")
+    if not rows:
+        print("  [C4POS-VERDICT] no [C4POS] rows (dump gate off?)")
+        print(C4POS_RUNBOOK)
+        return
+    reqs = _c4pos_requests(rows)
+    sides = [_c4pos_prefill_maps(g) for g in reqs]
+    miss_idx, hit_idx = [], []
+    for i, m in enumerate(sides):
+        if not m:
+            continue
+        # MISS = a full prefill whose compact table starts at absolute block 0.
+        if min(first for first, _r, _p in m.values()) == 0:
+            miss_idx.append(i)
+        else:
+            hit_idx.append(i)
+    if not miss_idx or not hit_idx:
+        print(f"  [C4POS-VERDICT] miss_req={miss_idx} hit_req={hit_idx} "
+              f"-> need >=1 MISS (first==0) and >=1 HIT (first>0); none")
+        print(C4POS_RUNBOOK)
+        return
+    miss_layers = sides[miss_idx[0]]
+    shared_total = miss_only_total = hit_only_total = 0
+    diff_layers, per_layer = [], []
+    for ly in sorted(miss_layers):
+        _miss_first, ratio, miss_pos = miss_layers[ly]
+        miss_map = _c4pos_value_maps(miss_pos, ratio)
+        shared = miss_only = hit_only = 0
+        offenders = []
+        for j in hit_idx:
+            hm = sides[j].get(ly)
+            if hm is None:
+                continue
+            hit_map = _c4pos_value_maps(hm[2], ratio)
+            sh = set(miss_map) & set(hit_map)
+            shared += len(sh)
+            miss_only += len(set(miss_map) - set(hit_map))
+            hit_only += len(set(hit_map) - set(miss_map))
+            for b in sorted(sh):
+                if miss_map[b] != hit_map[b]:
+                    offenders.append((b, miss_map[b], hit_map[b]))
+        if offenders:
+            diff_layers.append(ly)
+        per_layer.append((ly, offenders))
+        shared_total += shared
+        miss_only_total += miss_only
+        hit_only_total += hit_only
+    verdict = "phase_diff" if diff_layers else "phase_same"
+    print(f"  [C4POS-VERDICT] miss_req={miss_idx} hit_req={hit_idx} "
+          f"layers={len(miss_layers)} n_shared={shared_total} "
+          f"n_miss_only={miss_only_total} n_hit_only={hit_only_total} "
+          f"=> {verdict}")
+    if diff_layers:
+        print(f"  [C4POS-VERDICT] phase-diff layers={diff_layers}")
+        for ly, off in per_layer:
+            if off:
+                off_txt = "  ".join(
+                    f"block{b}:miss={a}->hit={c}"
+                    for b, a, c in off[:MAX_OFFENDER_SHOWN])
+                print(f"     layer={ly} {off_txt}")
+    else:
+        print("  -> every shared absolute block has the SAME value MISS vs HIT: "
+              "compressor RoPE is identical; look at CONTENT/output-slot, not "
+              "phase")
+    print(C4POS_RUNBOOK)
+
+
 def _parse_kstateloc(recs):
     """Split raw [KSTATELOC] rows into (write op=W, read op=R) numeric dicts."""
     writes, reads = [], []
@@ -1560,7 +1720,7 @@ def verdict_c4stp(recs):
 
 def main(path):
     recs = parse(path)
-    for tag in ("CMPIDX", "IDXK", "C4KV", "C128KV", "C128X", "OSHAPE", "XIN", "LHID", "IDXIN", "LIMETA", "C4ST", "C4STP", "KSTATELOC"):
+    for tag in ("CMPIDX", "IDXK", "C4KV", "C128KV", "C128X", "OSHAPE", "XIN", "LHID", "IDXIN", "LIMETA", "C4ST", "C4STP", "KSTATELOC", "C4POS"):
         print(f"parsed {tag}: {len(recs.get(tag, []))} lines")
     if recs.get("CMPIDX"):
         cmp_reqs = segment(recs["CMPIDX"])
@@ -1603,6 +1763,9 @@ def main(path):
                 "C4ST.idx1.any",
                 keep=lambda r: r.get("idx") == "1" and not r.get("tag"),
             )
+            continue
+        if tag == "C4POS":
+            report_c4pos(rows)
             continue
         if tag == "IDXIN":
             print("\n== [IDXIN] c4-indexer raw inputs (per-block q/w + seq lens) ==")
@@ -1863,6 +2026,27 @@ def _selftest():
             _idxin(2, 17523, "bbbb", kpg_a, knorm="199.0:100:64",
                    shift=4096, slk=17523),
         ]
+        # G1: [C4POS] absolute-block parity.  MISS anchor 0 (blocks 0..7), HIT
+        #     anchor 16 = block 4 (blocks 4..9); shared blocks 4..7 carry the
+        #     SAME value -> phase_same.
+        g1_pos = [
+            CHAT,
+            "[C4POS] layer=2 idx=1 n=12 ratio=4 nz=8 first=0 last=0 "
+            "md5=aaa sum=112 pos=[0,4,8,12,16,20,24,28]",
+            CHAT,
+            "[C4POS] layer=2 idx=1 n=10 ratio=4 nz=6 first=16 last=0 "
+            "md5=bbb sum=156 pos=[16,20,24,28,32,36]",
+        ]
+        # G2: same anchors, but the HIT's block-7 value is 31 (not 28) -> a
+        #     SHARED block differs -> phase_diff.
+        g2_pos = [
+            CHAT,
+            "[C4POS] layer=2 idx=1 n=12 ratio=4 nz=8 first=0 last=0 "
+            "md5=aaa sum=112 pos=[0,4,8,12,16,20,24,28]",
+            CHAT,
+            "[C4POS] layer=2 idx=1 n=10 ratio=4 nz=6 first=16 last=0 "
+            "md5=bbb sum=156 pos=[16,20,24,31]",
+        ]
 
         def _run_nocmp(src_lines):
             """Parse + report a synthetic no-[CMPIDX] log; return (rows, out)."""
@@ -1883,6 +2067,23 @@ def _selftest():
                 except OSError:
                     pass
 
+        def _run_c4pos(src_lines):
+            """Parse + report a synthetic [C4POS] log; return (rows, out)."""
+            fd3, p3 = tempfile.mkstemp(suffix=".log", prefix="cmpidx_selftest_")
+            try:
+                with os.fdopen(fd3, "w", encoding="utf-8") as fh3:
+                    fh3.write("\n".join(src_lines) + "\n")
+                crows = parse(p3).get("C4POS", [])
+                buf3 = io.StringIO()
+                with contextlib.redirect_stdout(buf3):
+                    report_c4pos(crows)
+                return crows, buf3.getvalue()
+            finally:
+                try:
+                    os.remove(p3)
+                except OSError:
+                    pass
+
         b1_rows, b1_out = _run_nocmp(nocmp_rope)
         b2_rows, b2_out = _run_nocmp(nocmp_content)
         c1_rows, c1_out = _run_nocmp(same_slq)
@@ -1891,6 +2092,8 @@ def _selftest():
         e1_rows, e1_out = _run_nocmp(per_shift_rope)
         e2_rows, e2_out = _run_nocmp(per_shift_content)
         f1_rows, f1_out = _run_nocmp(per_sps)
+        g1_rows, g1_out = _run_c4pos(g1_pos)
+        g2_rows, g2_out = _run_c4pos(g2_pos)
         b1_reqs = _idxin_requests(b1_rows)
         b2_reqs = _idxin_requests(b2_rows)
 
@@ -1982,6 +2185,17 @@ def _selftest():
              and "=> CONTENT/WINDOW" not in f1_out),
             ("[IDXIN-ROPE] per-request knorm+ropephase printed",
              "knorm[" in b1_out and "ropephase[" in b1_out),
+            ("[C4POS] pos= parsed per row",
+             bool(g1_rows) and _c4pos_ints(g1_rows[0])[:3] == [0, 4, 8]),
+            ("[C4POS] prefill row keeps the longest pos list",
+             _c4pos_ints(g1_rows[0]) == [0, 4, 8, 12, 16, 20, 24, 28]),
+            ("[C4POS-VERDICT] same absolute blocks -> phase_same",
+             "=> phase_same" in g1_out and "n_shared=" in g1_out
+             and "n_miss_only=" in g1_out),
+            ("[C4POS-VERDICT] differing absolute block -> phase_diff",
+             "=> phase_diff" in g2_out and "block7:" in g2_out),
+            ("[C4POS-RUNBOOK] printed",
+             "[C4POS-RUNBOOK]" in g1_out and "DSV4_DUMP_C4POS=1" in g1_out),
         ]
         failed = [name for name, ok in checks if not ok]
         for name, ok in checks:

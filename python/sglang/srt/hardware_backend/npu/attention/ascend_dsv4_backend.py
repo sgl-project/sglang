@@ -1077,6 +1077,11 @@ class CompressorAscendBackendMixin:
         # S232 Option D: dump positions_cmp_padding_c{ratio} (the RoPE position
         # input to the op) so a MISS run vs a HIT run can be diffed for
         # position/RoPE parity. Env DSV4_DUMP_C4POS=<any>, INDEXER only.
+        # The compact ``pos=[...]`` list is the per-ABSOLUTE-block GROUND TRUTH
+        # (entry j = absolute token ``(first_k+j)*ratio``): it lets the analyzer
+        # pair a MISS block with the SAME absolute HIT block.  ``first`` is the
+        # call's absolute anchor (0 => MISS / full prefill) and ``nz`` the compact
+        # block count before the trailing zero padding.
         _want_pos = os.environ.get("DSV4_DUMP_C4POS")
         if _want_pos and bool(compressor.is_in_indexer):
             try:
@@ -1085,12 +1090,19 @@ class CompressorAscendBackendMixin:
                 _p = getattr(fm, f"positions_cmp_padding_c{ratio}")
                 _pc = _p.detach().to(torch.int64).cpu()
                 _n = int(_pc.numel())
+                _plist = _pc.tolist()
+                _nz = len(_plist)
+                while _nz > 1 and _plist[_nz - 1] == 0:
+                    _nz -= 1
+                _pos = ",".join(str(v) for v in _plist[:_nz])
                 print(
                     f"[C4POS] layer={compressor.layer_id} idx=1 n={_n} "
+                    f"ratio={ratio} nz={_nz} "
                     f"first={int(_pc[0]) if _n else -1} "
                     f"last={int(_pc[-1]) if _n else -1} "
                     f"md5={_hlpos.md5(_pc.numpy().tobytes()).hexdigest()[:16] if _n else 'empty'} "
-                    f"sum={int(_pc.sum().item()) if _n else 0}",
+                    f"sum={int(_pc.sum().item()) if _n else 0} "
+                    f"pos=[{_pos}]",
                     flush=True,
                 )
             except Exception as _exc:
