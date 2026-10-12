@@ -39,6 +39,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
 from sglang.srt.layers.quantization.int8_utils import (
     block_dequant as int8_block_dequant,
 )
+from sglang.srt.layers.quantization.mxfp8_block_convert import dequant_mxfp8_2d_to_bf16
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.model_loader.utils import (
     maybe_executor_submit,
@@ -112,6 +113,19 @@ def _resolve_layer_weight_block_size(
     return getattr(selected_quant_config, "weight_block_size", None)
 
 
+def _dequant_fused_indexer_shard(
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    quant_config: Optional[QuantizationConfig],
+) -> torch.Tensor:
+    # mxfp8 scales are UE8M0 exponents stored as uint8, not fp32 multipliers
+    if scale.dtype == torch.uint8:
+        return dequant_mxfp8_2d_to_bf16(weight, scale)
+    return block_quant_dequant(
+        weight, scale, _get_indexer_weight_block_size(quant_config), torch.bfloat16
+    )
+
+
 def _load_fused_indexer_wk(
     name: str,
     loaded_weight: torch.Tensor,
@@ -145,9 +159,8 @@ def _load_fused_indexer_wk(
         )
         if "weight" in entry and "scale" in entry:
             pending.pop(fused_name + ".weights_proj")
-            block_size = _get_indexer_weight_block_size(quant_config)
-            weights_bf16 = block_quant_dequant(
-                entry["weight"], entry["scale"], block_size, torch.bfloat16
+            weights_bf16 = _dequant_fused_indexer_shard(
+                entry["weight"], entry["scale"], quant_config
             )
             fused_param.data[-weights_bf16.shape[0] :].copy_(weights_bf16)
         return True
@@ -165,9 +178,8 @@ def _load_fused_indexer_wk(
     )
     if "weight" in entry and "scale" in entry:
         pending.pop(fused_name)
-        block_size = _get_indexer_weight_block_size(quant_config)
-        wk_bf16 = block_quant_dequant(
-            entry["weight"], entry["scale"], block_size, torch.bfloat16
+        wk_bf16 = _dequant_fused_indexer_shard(
+            entry["weight"], entry["scale"], quant_config
         )
         fused_param.data[: wk_bf16.shape[0]].copy_(wk_bf16)
     return True

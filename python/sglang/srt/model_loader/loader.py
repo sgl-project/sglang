@@ -330,6 +330,14 @@ def post_load_weights(model: nn.Module) -> None:
     # `is_nextn=True`, so the loader doesn't need to know.
     if hasattr(model, "post_load_weights"):
         model.post_load_weights()
+    refresh_gemma_weights(model)
+
+
+def refresh_gemma_weights(model: nn.Module) -> None:
+    # its weight loader derives the buffer, so writes that bypass the loader leave it stale
+    for module in model.modules():
+        if isinstance(module, GemmaRMSNorm):
+            module.refresh_gemma_weight()
 
 
 def _modules_with_quant_method(model: nn.Module):
