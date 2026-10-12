@@ -9,7 +9,7 @@ use tracing::{debug, info, warn};
 
 use super::sweep::{deliver_bootstrap, still_pending, sweep_recording_settled, SweepResult};
 use super::{KvEventIndex, LateJoin, ObligationBatch};
-use crate::state::kv_events::bootstrap::BootstrapTracker;
+use crate::state::kv_events::bootstrap::{BootstrapTracker, SweepOutcome};
 use crate::state::kv_events::tree::KvWorkerId;
 
 /// Obligations taken off the queue for one sweep, with the freshness every one
@@ -137,6 +137,19 @@ pub(super) async fn bootstrap_coordinator(
         requeued.retain(|(rank, epoch)| deps.bootstrap.epoch_of(rank) == Some(*epoch));
         pending.retain_graftable(&deps.bootstrap);
         if pending.obligations.is_empty() {
+            // Every rank left `Pending` before its sweep could start — most
+            // often resolved from its stream's origin by a fresh engine's
+            // first batch. The seed gate reads "no sweep verdict yet" as a boot
+            // sweep still in flight, so with no rank left waiting on any sweep
+            // this records the verdict a sweep started a moment later would
+            // reach before its first fetch; otherwise `/readyz` would hold for
+            // a sweep that never runs. While any rank is still `Pending`, the
+            // sweep that owns it reports instead, and an early verdict here
+            // would open the gate ahead of it.
+            if !deps.bootstrap.any_pending() {
+                deps.bootstrap
+                    .record_sweep_result(SweepOutcome::RanksResolved, 0);
+            }
             continue;
         }
         let deadline = deps.deadline();
@@ -673,6 +686,99 @@ mod tests {
             tracker.sweep_result_counts(),
         );
         assert_eq!(queries.lock().expect("queries lock").len(), 1, "one fetch");
+        index.shutdown().await;
+    }
+
+    /// A router booting alongside fresh engines resolves every rank from its
+    /// stream's origin, often before the coordinator takes the batch, so no
+    /// sweep ever runs. Under `--kv-bootstrap-seed-required` the gate reads "no
+    /// sweep verdict yet" as a boot sweep still in flight, so the skipped sweep
+    /// must still leave its verdict, or `/readyz` holds until the gate's hard
+    /// bound for a sweep that never runs.
+    #[tokio::test]
+    async fn a_batch_every_rank_left_before_its_sweep_still_records_a_verdict() {
+        use std::sync::Arc;
+
+        use crate::state::kv_events::block_size_oracle::BlockSizeOracle;
+
+        let tracker = Arc::new(BootstrapTracker::new_with_opts(
+            Duration::from_secs(3600),
+            Duration::from_secs(60),
+            true,
+        ));
+        let index = KvEventIndex::new_with_bootstrap(
+            reqwest::Client::new(),
+            BlockSizeOracle::new(),
+            Arc::clone(&tracker),
+        );
+        let rank = worker_id("http://w1:30000", 0);
+        let obligations = tracker.register(std::slice::from_ref(&rank));
+        // What `resolve_from_origin` leaves, before the batch is taken.
+        tracker.set(&rank, BootstrapState::Recovered);
+        assert!(tracker.settled());
+        assert!(
+            !tracker.admit_ready(),
+            "premise: the gate waits on a verdict"
+        );
+
+        index.enqueue_bootstrap(ObligationBatch {
+            obligations,
+            holding_since: Instant::now(),
+            late_join: LateJoin::Permitted,
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !tracker.admit_ready() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("a sweep with nothing left to do must not hold readiness");
+        assert!(tracker
+            .sweep_result_counts()
+            .contains(&("ranks_resolved", 1)));
+        index.shutdown().await;
+    }
+
+    /// The other side of that verdict: while some rank is still `Pending`, the
+    /// sweep that owns it is the one that reports. A verdict recorded for an
+    /// emptied batch would clear the gate's "no verdict yet" arm ahead of it,
+    /// and a probe landing before that sweep's `TimedOut` could latch the
+    /// replica ready without the seed `--kv-bootstrap-seed-required` asks for.
+    #[tokio::test]
+    async fn an_emptied_batch_leaves_the_verdict_to_a_rank_still_pending() {
+        use std::sync::Arc;
+
+        use crate::state::kv_events::block_size_oracle::BlockSizeOracle;
+
+        let tracker = Arc::new(BootstrapTracker::new_with_opts(
+            Duration::from_secs(3600),
+            Duration::from_secs(60),
+            true,
+        ));
+        let index = KvEventIndex::new_with_bootstrap(
+            reqwest::Client::new(),
+            BlockSizeOracle::new(),
+            Arc::clone(&tracker),
+        );
+        let (resolved, waiting) = (
+            worker_id("http://w1:30000", 0),
+            worker_id("http://w2:30000", 0),
+        );
+        let obligations = tracker.register(&[resolved.clone(), waiting]);
+        tracker.set(&resolved, BootstrapState::Recovered);
+
+        index.enqueue_bootstrap(ObligationBatch {
+            obligations: vec![obligations[0].clone()],
+            holding_since: Instant::now(),
+            late_join: LateJoin::Permitted,
+        });
+        // Long enough for the coordinator to take and drop the batch.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            tracker.sweep_result_counts().iter().all(|(_, n)| *n == 0),
+            "no verdict while a rank still waits on its own sweep: {:?}",
+            tracker.sweep_result_counts(),
+        );
         index.shutdown().await;
     }
 }

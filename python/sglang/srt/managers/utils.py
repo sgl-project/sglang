@@ -26,6 +26,7 @@ from sglang.srt.utils.common import async_d2h as _async_d2h
 if TYPE_CHECKING:
     from sglang.srt.managers.auxiliary_output import HostAuxiliaryOutput
     from sglang.srt.managers.scheduler import GenerationBatchResult
+    from sglang.srt.mem_cache.kv_loc_plan import KVLocPlan
     from sglang.srt.speculative.spec_info import SpecInput
 
 
@@ -118,10 +119,18 @@ class GenerationBatchResult:
     # until the accepted path comes back over the relay.
     spec_verify_out_cache_loc: Optional[torch.Tensor] = None
 
+    # The plan the forward wrote its KV through, when the caller asked for it
+    # (`return_kv_loc_plan`): a speculative worker's own writes into the same
+    # slots take their ids from it.
+    kv_loc_plan: Optional[KVLocPlan] = None
+
     # PP+spec: [bs, spec_steps + 1] global node indices of the accepted path.
     # Every stage holds the KV for its own layers, so every stage has to compact
     # that path into its committed prefix; only the last stage can compute it.
     accept_index: Optional[torch.Tensor] = None
+    prepared_draft_extend_inputs: Optional[
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    ] = None
 
     # Refs the worker wants scheduler to keep alive for the same 2-iter window
     # as batch_record_buf. Used for cross-stream tensor lifetime (e.g. a spec
