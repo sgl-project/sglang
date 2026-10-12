@@ -25,7 +25,7 @@ DIFF_CONTEXT_RECORDS: int = 3
 
 # Bumped whenever records gain, drop or change fields, so a trace written in
 # an older format shows up as a config mismatch instead of a diff.
-TRACE_FORMAT: int = 2
+TRACE_FORMAT: int = 3
 
 # Server args that decide scheduling, recorded in each trace's header.
 HEADER_SERVER_ARGS = (
@@ -117,6 +117,11 @@ class SchedulingTraceWriter:
             chunked=self._label(chunked.rid) if chunked is not None else None,
             running=self._labels(plan.running_batch.reqs),
             waiting=self._labels(scheduler.waiting_queue),
+            admission_skip_reason=(
+                plan.admission_skip_reason.name
+                if plan.admission_skip_reason is not None
+                else None
+            ),
             retracted=self._labels(
                 self._newly_retracted(
                     [

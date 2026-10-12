@@ -3835,8 +3835,9 @@ class Scheduler(
         if running_batch.is_prefill_only:
             running_batch.filter_batch()
 
-        new_batch, running_batch = self._admit_prefill(running_batch)
-        new_batch, need_mlp_sync = self._gather_admitted(new_batch)
+        admit_plan = self._admit_prefill(running_batch)
+        running_batch = admit_plan.running_batch
+        new_batch, need_mlp_sync = self._gather_admitted(admit_plan.batch_to_run)
 
         if new_batch is not None:
             # Run prefill first if possible
@@ -3850,24 +3851,24 @@ class Scheduler(
         )
         ret = self._finalize_step(ret)
 
-        plan = NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
+        plan = NextBatchPlan(
+            batch_to_run=ret,
+            running_batch=running_batch,
+            admission_skip_reason=admit_plan.admission_skip_reason,
+        )
         if self.scripted_scheduler_hook is not None:
             self.scripted_scheduler_hook.on_schedule(plan)
         return plan
 
-    def _admit_prefill(
-        self, running_batch: ScheduleBatch
-    ) -> Tuple[Optional[ScheduleBatch], ScheduleBatch]:
+    def _admit_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
         """Admit this step's prefill batch; a mixed step also takes the decode rows."""
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm(running_batch)
         elif self._should_defer_prefill():
             new_batch = None
         else:
-            prefill_plan = self.get_new_batch_prefill(running_batch)
-            new_batch = prefill_plan.batch_to_run
-            running_batch = prefill_plan.running_batch
-        return new_batch, running_batch
+            return self.get_new_batch_prefill(running_batch)
+        return NextBatchPlan(batch_to_run=new_batch, running_batch=running_batch)
 
     def _gather_admitted(
         self, new_batch: Optional[ScheduleBatch]
@@ -3981,12 +3982,13 @@ class Scheduler(
                 self.prefill_delayer, token_usage=max_pool_usage
             )
 
-        ret, running_batch = self._get_new_batch_prefill_raw(
+        plan = self._get_new_batch_prefill_raw(
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             running_batch=running_batch,
         )
 
         if self.prefill_delayer:
+            ret = plan.batch_to_run
             observed_prefill_bs = prefill_delayer_single_pass.finalize(
                 actual_prefill_bs=ret.batch_size() if ret is not None else 0
             )
@@ -3995,21 +3997,25 @@ class Scheduler(
                     observed_prefill_bs
                 )
 
-        return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
+        return plan
 
     def _get_new_batch_prefill_raw(
         self,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
         running_batch: ScheduleBatch,
-    ) -> Tuple[Optional[ScheduleBatch], ScheduleBatch]:
+    ) -> NextBatchPlan:
         # Check if the grammar is ready in the grammar queue
         if self.grammar_manager.has_waiting_grammars():
             ready_grammar_requests = self.grammar_manager.get_ready_grammar_requests()
             for req in ready_grammar_requests:
                 self._add_request_to_queue(req)
 
-        if self.admission_skip_reason(running_batch) is not None:
-            return None, running_batch
+        if (skip_reason := self.admission_skip_reason(running_batch)) is not None:
+            return NextBatchPlan(
+                batch_to_run=None,
+                running_batch=running_batch,
+                admission_skip_reason=skip_reason,
+            )
 
         running_bs = len(running_batch.reqs)
         # Skipped during a chunked prefill: that pass must proceed regardless.
@@ -4023,7 +4029,7 @@ class Scheduler(
                 ),
             )
         ):
-            return None, running_batch
+            return NextBatchPlan(batch_to_run=None, running_batch=running_batch)
 
         # Get priority queue
         self.policy.calc_priority(
@@ -4036,7 +4042,7 @@ class Scheduler(
             # If we are testing retraction and the running batch size exceeds
             # TEST_RETRACT_NO_PREFILL_BS, we skip the prefill to keep the requests
             # in the waiting queue.
-            return None, running_batch
+            return NextBatchPlan(batch_to_run=None, running_batch=running_batch)
 
         # Determine chunked_prefill_size for this batch
         chunked_prefill_size = self.chunked_prefill_size
@@ -4205,7 +4211,7 @@ class Scheduler(
             # though the request they made room for was not admitted.
             for req in adder.preempt_list:
                 self._add_request_to_queue(req)
-            return None, running_batch
+            return NextBatchPlan(batch_to_run=None, running_batch=running_batch)
 
         can_run_set = set(can_run_list)
         retries = self.tree_cache.storage_prefetch_retries
@@ -4299,7 +4305,7 @@ class Scheduler(
                     )
                 running_batch = ScheduleBatch(reqs=[])
 
-        return new_batch, running_batch
+        return NextBatchPlan(batch_to_run=new_batch, running_batch=running_batch)
 
     def can_schedule_lora_req(
         self, req: Req, running_loras: set[Optional[str]]

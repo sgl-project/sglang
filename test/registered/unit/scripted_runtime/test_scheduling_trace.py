@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
+from sglang.srt.managers.schedule_policy import AdmissionSkipReason
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.scripted_runtime.scheduling_trace import (
@@ -49,6 +50,7 @@ class TestSchedulingTraceWriter(CustomTestCase):
         plan = SimpleNamespace(
             batch_to_run=batch,
             running_batch=SimpleNamespace(reqs=[req]),
+            admission_skip_reason=AdmissionSkipReason.NO_WAITING,
         )
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp, "t.jsonl")
@@ -61,6 +63,7 @@ class TestSchedulingTraceWriter(CustomTestCase):
             records = load_trace(path)
 
         self.assertEqual([r["retracted"] for r in records[1:]], [[], ["r0"], []])
+        self.assertEqual(records[1]["admission_skip_reason"], "NO_WAITING")
 
     def test_paused_iterations_record_reader_values(self):
         inflight = [SimpleNamespace(rid="a"), SimpleNamespace(rid="b")]

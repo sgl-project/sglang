@@ -149,6 +149,7 @@ if TYPE_CHECKING:
 
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+    from sglang.srt.managers.schedule_policy import AdmissionSkipReason
     from sglang.srt.managers.scheduler_components.metrics_reporter import PrefillStats
     from sglang.srt.mem_cache.storage_prefetch import StagedPrefetchPlan
     from sglang.srt.session.session_controller import Session
@@ -3967,3 +3968,5 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 class NextBatchPlan(msgspec.Struct):
     batch_to_run: Optional[ScheduleBatch]
     running_batch: ScheduleBatch
+    # Set when this step skipped admission before touching any state.
+    admission_skip_reason: Optional[AdmissionSkipReason] = None

@@ -650,7 +650,11 @@ class SchedulerDisaggregationPrefillMixin:
         if batch:
             set_schedule_time_batch(batch)
 
-        return NextBatchPlan(batch_to_run=batch, running_batch=running_batch)
+        return NextBatchPlan(
+            batch_to_run=batch,
+            running_batch=running_batch,
+            admission_skip_reason=prefill_plan.admission_skip_reason,
+        )
 
     @torch.no_grad()
     def event_loop_normal_disagg_prefill(self: Scheduler) -> None:

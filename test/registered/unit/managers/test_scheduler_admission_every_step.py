@@ -44,9 +44,9 @@ class TestAdmissionSkipReason(CustomTestCase):
             reqs=[SimpleNamespace(rid=f"running-{i}") for i in range(running_reqs)]
         )
         try:
-            ret, _ = s._get_new_batch_prefill_raw(
+            ret = s._get_new_batch_prefill_raw(
                 prefill_delayer_single_pass=None, running_batch=running_batch
-            )
+            ).batch_to_run
         except _AdmissionAttempted:
             return True
         self.assertIsNone(ret)
@@ -161,10 +161,10 @@ class TestAdmissionEveryStep(CustomTestCase):
                 side_effect=lambda reqs, *args, **kwargs: MagicMock(reqs=reqs),
             ),
         ):
-            ret, _ = Scheduler._get_new_batch_prefill_raw(
+            plan = Scheduler._get_new_batch_prefill_raw(
                 s, prefill_delayer_single_pass=None, running_batch=running_batch
             )
-        return ret
+        return plan.batch_to_run
 
     def test_admits_on_the_step_after_no_token(self):
         # No running row leaves between the two passes; KV freed (or the

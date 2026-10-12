@@ -108,12 +108,12 @@ class TestMixedStepHoldsDecodeRows(CustomTestCase):
                 scheduler_module.ScheduleBatch, "init_new", return_value=new_batch
             ),
         ):
-            ret, ret_running = Scheduler._get_new_batch_prefill_raw(
+            plan = Scheduler._get_new_batch_prefill_raw(
                 s, prefill_delayer_single_pass=None, running_batch=running_batch
             )
 
-        self.assertIs(ret, new_batch)
-        self.assertIs(ret_running, running_batch)
+        self.assertIs(plan.batch_to_run, new_batch)
+        self.assertIs(plan.running_batch, running_batch)
         running_batch.retract_decode.assert_not_called()
         running_batch.prepare_for_decode.assert_not_called()
         new_batch.mix_with_running.assert_not_called()
