@@ -31,6 +31,7 @@ from sglang.srt.mem_cache.unified_cache.components.base import (
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.mem_cache.radix_cache import RadixKey
     from sglang.srt.mem_cache.unified_cache.cache_action import (
         CacheAction,
         ComponentAction,
@@ -370,7 +371,7 @@ class FullComponent(TreeComponent):
 
     def build_hicache_transfers(
         self,
-        node: UnifiedTreeNode,
+        node: Optional[UnifiedTreeNode],
         phase: CacheTransferPhase,
         *,
         mamba_pool_idx: Optional[torch.Tensor] = None,
@@ -379,6 +380,8 @@ class FullComponent(TreeComponent):
         prefetch_tokens: int = 0,
         staging_tokens: int = 0,
         last_hash: Optional[str] = None,
+        # Buffer-mode PREFETCH describes prefix_key without a resident node.
+        prefix_key: Optional[RadixKey] = None,
     ) -> Optional[list[PoolTransfer]]:
         ct = self.component_type
 
@@ -389,6 +392,7 @@ class FullComponent(TreeComponent):
             return None
 
         if phase == CacheTransferPhase.LOAD_BACK:
+            assert node is not None
             # `node` is best_match_node. FULL device evict only from leaves,
             # so once we hit a device-on node, everything above is also device-on
             backed_up: list[torch.Tensor] = []
