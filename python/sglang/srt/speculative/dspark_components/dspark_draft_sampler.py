@@ -70,17 +70,20 @@ class DsparkDraftSampler:
                 (self.max_bs,), dtype=torch.float32, device=device
             ),
         )
-        # [max_bs, gamma, vocab] step logits for the sampling accept; a greedy
-        # draft keeps none.
-        self.step_logits = (
-            None
-            if greedy_draft
-            else torch.empty(
-                (self.max_bs, self.gamma, _step_logits_width(model)),
-                dtype=self.markov_head.step_logits_dtype(model.base_logits_dtype),
-                device=device,
+        # [max_bs, gamma, vocab] step logits for the sampling accept, sized on
+        # the first call; a greedy draft keeps none.
+        self.step_logits: Optional[torch.Tensor] = None
+
+    def _step_logits(self, base_logits: torch.Tensor) -> torch.Tensor:
+        if self.step_logits is None:
+            # The runner's warmup calls the tail eagerly before capture.
+            assert not torch.cuda.is_current_stream_capturing()
+            self.step_logits = torch.empty(
+                (self.max_bs, self.gamma, _step_logits_width(self.model)),
+                dtype=self.markov_head.step_logits_dtype(base_logits.dtype),
+                device=base_logits.device,
             )
-        )
+        return self.step_logits
 
     def stage_sampling_params(self, *, bs: int, sampling_info) -> None:
         """Must run before the draft graph replay that reads these buffers."""
@@ -109,7 +112,9 @@ class DsparkDraftSampler:
             step_temperatures=self.params.step_temperatures[:bs],
             noise=self._noise,
             tp_sync=self._tp_sync,
-            logits_out=None if self.greedy_draft else self.step_logits[:bs],
+            logits_out=None
+            if self.greedy_draft
+            else self._step_logits(base_logits)[:bs],
             greedy_draft=self.greedy_draft,
         )
         self.out[: draft_tokens.numel()].copy_(draft_tokens.reshape(-1))
