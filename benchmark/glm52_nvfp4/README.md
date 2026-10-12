@@ -121,6 +121,23 @@ The historical `Initialized DSA NVFP4 global scales for 78/78 local layers`
 message does **not** prove calibrated checkpoint scales: initialization also
 counts fallback values of `1.0`. Check the checkpoint's attention scale
 weights and loaded per-layer scales before making a calibration claim.
+The available JET artifact at revision
+`aec724e8c7b8ee9db3b48c01c320f63f9cdaf8aa` has **no serialized calibrated
+attention K/V scales**: its safetensors index contains 232385 tensors across
+47 shards, with all 172800 scale tensors belonging to MLPs. Alternative
+KV/projection scale names and `amax` tensors are also absent. Its export
+quantization summary lists 156 K/V BMM quantizers, all `amax=dynamic`.
+The historical loader would use fallback K/V scales of `1.0` for this
+artifact, not calibrated per-layer K scales.
+
+That artifact's config matches the recovered historical config byte for
+byte (SHA256 `d3783a603e5aa9cb58eff7a5d8ac9c42d83156b229efe185c72e9e2dc8444923`).
+This does **not** establish the historical weight revision or observed
+runtime scale values. The old Slurm job is no longer queryable, and the
+physical `/model` mount remains unconfirmed; therefore the historical
+accuracy results must not be described as calibrated-K-scale validation.
+
 Historical raw logs and outputs are retained in
 `/dockerroot/containers/c/pr41913-gpu-validation/pr41913_validation_evidence.tar.gz`
-in the author's validation environment; they are not bundled with this repo.
+and checkpoint metadata evidence in `/tmp/pr41913-checkpoint-evidence/`
+in the author's validation environment; neither is bundled with this repo.
