@@ -1,5 +1,6 @@
 ---
 title: Krea-2
+description: "Deploy Krea-2 with SGLang - fast, high-quality text-to-image generation."
 metatags:
     description: "Deploy Krea-2 with SGLang - fast, high-quality text-to-image generation."
 ---
@@ -8,7 +9,20 @@ import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
 
 <DiffusionModelTags tags={["image", "text-to-image", "8-step Turbo", "high-fidelity Raw", "Qwen3-VL"]} />
 
-## 1. Model Introduction
+import { Deployment } from '/src/snippets/_deployment.jsx';
+import { config } from '/src/snippets/configs/Krea/krea2.jsx';
+
+## 1. Quick start
+
+Follow the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installation) for your GPU platform.
+
+<a id="2-sglang-diffusion-installation" />
+
+<Deployment config={config} />
+
+<a id="1-model-introduction" />
+
+## 2. Model capabilities
 
 [Krea-2](https://huggingface.co/krea/Krea-2-Turbo) is Krea's photorealistic text-to-image family, built as a single-stream MMDiT with a Qwen3-VL text encoder and Qwen-Image VAE. Both public variants use the same native SGLang pipeline and differ mainly in their sampling target.
 
@@ -18,12 +32,6 @@ Choose Turbo for interactive generation: it is distilled to 8 steps with `guidan
 | --- | --- | --- |
 | Turbo | `krea/Krea-2-Turbo` | 8 steps, no CFG; fastest path |
 | Raw | `krea/Krea-2-Raw` | About 52 steps with CFG; higher-fidelity path |
-
-## 2. SGLang-diffusion Installation
-
-SGLang-diffusion offers multiple installation methods. You can choose the most suitable installation method based on your hardware platform and requirements.
-
-Please refer to the [official SGLang-diffusion installation guide](https://docs.sglang.io/docs/sglang-diffusion/installation) for installation instructions.
 
 ## 3. Model Deployment
 

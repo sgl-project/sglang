@@ -53,6 +53,18 @@ fn next_coexist_reclaim_digest(current: i64, node_id: NodeId, component_idx: usi
 
 // ---- interface types ----
 
+/// A node's position and FULL value length on a root-to-node path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TreePathNodeInfo {
+    pub node_id: NodeId,
+    pub parent_id: NodeId,
+    /// Half-open offsets from the root, in tokens (or bigrams for bigram keys).
+    pub path_start: usize,
+    pub path_end: usize,
+    /// Logical FULL device indices; None when absent.
+    pub full_value_len: Option<usize>,
+}
+
 /// Receipt returned by `inc_lock_ref` and replayed by `dec_lock_ref`.
 #[derive(Default)]
 pub struct IncLockRefResult {
@@ -90,8 +102,8 @@ impl IncLockRefResult {
 /// Receipt required by `dec_lock_ref`.
 #[derive(Default)]
 pub struct DecLockRefParams {
-    /// The node the matching acquire locked; None only for receipts that did
-    /// not come from this core (a mispaired anchor is a protocol violation).
+    /// The node the matching acquire locked; a missing or mispaired anchor is
+    /// a protocol violation.
     pub node_id: Option<NodeId>,
     /// Components the matching acquire left untaken.
     pub skipped_lock_components: ComponentSet,
@@ -509,11 +521,6 @@ pub struct ComponentState {
     /// leaf may be freed: the leaf's parent for Full, the LRU predecessor for
     /// SWA and Mamba.
     pub(crate) evict_device_cursor: Option<NodeIdx_>,
-    /// Internal node whose component value must be backed up before the walk
-    /// can tombstone it. The Controller consumes this request between steps.
-    pub(crate) evict_device_backup_node: Option<NodeIdx_>,
-    /// A resumed victim is tombstoned after its best-effort backup attempt.
-    pub(crate) evict_device_last_backup: Option<NodeIdx_>,
     /// Internal component victim waiting for the controller's host backup attempt.
     /// A generation-checked handle survives host eviction during that I/O.
     pub(crate) evict_device_pending_node: Option<NodeId>,
@@ -551,6 +558,8 @@ pub struct CacheInitParams {
     pub has_swa_host_pool: bool,
     /// Whether tree mutations emit BlockStored/BlockRemoved events.
     pub enable_kv_cache_events: bool,
+    /// If true, events use the dynamo format: namespaced block hashes and extra_key.
+    pub dynamo_kv_event_format: bool,
     /// Chunk alignment for the mamba branching seqlen; None when Mamba is disabled.
     pub mamba_cache_chunk_size: Option<usize>,
     /// Per-root-path cap on cached Mamba states; None means unlimited.
@@ -573,6 +582,7 @@ impl Default for CacheInitParams {
             swa_req_ring: false,
             has_swa_host_pool: false,
             enable_kv_cache_events: false,
+            dynamo_kv_event_format: false,
             mamba_cache_chunk_size: None,
             mamba_max_states_per_path: None,
         }
@@ -587,7 +597,6 @@ pub struct EvictionStepResult {
     pub tracker: HashMap<ComponentType, usize>,
     pub device_frees: HashMap<ComponentType, Vec<Tensor>>,
     pub host_frees: HashMap<ComponentType, Vec<Tensor>>,
-    pub backup_kv: Option<BackupKV>,
     /// Full device tokens freed without a host copy during this device step.
     pub unbacked_tokens: usize,
     /// Back up this internal Mamba state before resuming its device tombstone.
@@ -641,10 +650,10 @@ pub struct UnifiedTreeCore<K: ChildKeyType> {
     pub(crate) enable_external_cache_linker: bool,
     /// Whether the cache wired a host SWA pool (HiCache).
     pub(crate) has_swa_host_pool: bool,
-    /// Whether dirty internal SWA nodes must be backed up before eviction.
-    pub(crate) swa_write_back_eviction_barrier_enabled: bool,
     /// Whether tree mutations emit BlockStored/BlockRemoved events.
     pub(crate) enable_kv_cache_events: bool,
+    /// If true, events use the dynamo format: namespaced block hashes and extra_key.
+    pub(crate) dynamo_kv_event_format: bool,
     /// Queued placement events, drained by take_events.
     pub(crate) kv_event_queue: Vec<KvCacheEvent<K::Atom>>,
     /// Namespaced event hashes, seeded only by cache_salt; events omit extra_key.
@@ -663,6 +672,91 @@ pub struct UnifiedTreeCore<K: ChildKeyType> {
 }
 
 impl<K: ChildKeyType> UnifiedTreeCore<K> {
+    /// Adjust the component's evictable or protected count of reclaimable tokens.
+    /// The caller updates backing and size together, and restores backing on error.
+    /// This changes counters only; roots and device tombstones are ignored.
+    pub fn adjust_component_size(
+        &mut self,
+        node_id: NodeId,
+        component_type: ComponentType,
+        delta: i64,
+    ) -> Result<(), TreeCoreRuntimeError> {
+        let node_idx = self.arena.resolve(node_id)?;
+        if self.components_by_type[component_type.idx()].is_none() {
+            return Err(TreeCoreRuntimeError::ComponentNotEnabled { component_type });
+        }
+        let node = self.arena.node(node_idx);
+        if node.is_root() || !node.has_device_value(component_type) {
+            return Ok(());
+        }
+        let protected = node.device_lock_ref(component_type) > 0;
+        let state = self.component_state_mut(component_type);
+        let size = if protected {
+            &mut state.protected_size
+        } else {
+            &mut state.evictable_size
+        };
+        let updated = usize::try_from(delta.unsigned_abs())
+            .ok()
+            .and_then(|magnitude| {
+                if delta >= 0 {
+                    size.checked_add(magnitude)
+                } else {
+                    size.checked_sub(magnitude)
+                }
+            })
+            .ok_or(TreeCoreRuntimeError::InvalidComponentSizeDelta {
+                node_id,
+                component_type,
+                current: *size,
+                delta,
+                protected,
+            })?;
+        *size = updated;
+        Ok(())
+    }
+
+    /// Copy root-to-node paths in input order, keeping duplicates and excluding roots.
+    /// An invalid node id fails the whole call.
+    pub fn collect_path_info(
+        &self,
+        node_ids: &[NodeId],
+    ) -> Result<Vec<Vec<TreePathNodeInfo>>, TreeCoreRuntimeError> {
+        node_ids
+            .iter()
+            .map(|&node_id| {
+                let mut current = self.arena.resolve(node_id)?;
+                let mut path = Vec::new();
+                loop {
+                    let node = self.arena.node(current);
+                    if node.is_root() {
+                        break;
+                    }
+                    let parent = node.parent();
+                    path.push(TreePathNodeInfo {
+                        node_id: node.id,
+                        parent_id: self.arena.node(parent).id,
+                        path_start: 0,
+                        path_end: node.key.atom_len(),
+                        full_value_len: node
+                            .has_device_value(FULL)
+                            .then(|| node.device_value_len(FULL)),
+                    });
+                    current = parent;
+                }
+                path.reverse();
+                let mut start = 0;
+                for info in &mut path {
+                    let length = info.path_end;
+                    info.path_start = start;
+                    start += length;
+                    info.path_end = start;
+                }
+                Ok(path)
+            })
+            .collect()
+    }
+
     /// Build a tree core for the given component types with a fresh arena.
     /// Fresh per-slot LRU lists.
     pub(crate) fn new_lru_lists() -> [UnifiedLRUList; NUM_VALUE_SLOTS] {
@@ -755,8 +849,6 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         state.is_evict_device_ongoing = true;
         state.evict_device_request_cnt = request_cnt;
         state.evict_device_cursor = None;
-        state.evict_device_backup_node = None;
-        state.evict_device_last_backup = None;
         state.evict_device_pending_node = None;
         state.evict_device_pending_num_tokens = 0;
     }
@@ -771,8 +863,6 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         );
         state.is_evict_device_ongoing = false;
         state.evict_device_cursor = None;
-        state.evict_device_backup_node = None;
-        state.evict_device_last_backup = None;
         state.evict_device_pending_node = None;
         state.evict_device_pending_num_tokens = 0;
     }
@@ -841,8 +931,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             enable_storage: false,
             enable_external_cache_linker: false,
             has_swa_host_pool: params.has_swa_host_pool,
-            swa_write_back_eviction_barrier_enabled: false,
             enable_kv_cache_events: params.enable_kv_cache_events,
+            dynamo_kv_event_format: params.dynamo_kv_event_format,
             kv_event_queue: Vec::new(),
             namespaced_event_hashes: HashMap::new(),
             write_through_threshold: params.write_through_threshold,
@@ -987,16 +1077,15 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         Ok(())
     }
 
-    /// A receipt releases only the node its acquire returned; a mispaired
-    /// node would silently release (or steal) another holder's segment.
+    /// A receipt releases only the node its acquire returned; a mispaired or
+    /// unanchored one would silently release (or steal) another holder's segment.
     fn assert_receipt_anchor_(&self, node_idx: NodeIdx_, params: &DecLockRefParams) {
-        if let Some(anchor) = params.node_id {
-            let node_handle = self.arena.node(node_idx).id;
-            assert!(
-                anchor == node_handle,
-                "lock receipt anchored on node {anchor} released on node {node_handle}"
-            );
-        }
+        let node_handle = self.arena.node(node_idx).id;
+        assert!(
+            params.node_id == Some(node_handle),
+            "lock receipt anchored on node {:?} released on node {node_handle}",
+            params.node_id
+        );
     }
 
     /// Release each component this receipt acquired. Auxiliaries go first so
@@ -2397,15 +2486,6 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 &mut result.device_frees,
                 &mut result.host_frees,
             );
-        let backup_node = self
-            .component_state_mut(component_type)
-            .evict_device_backup_node
-            .take();
-        if let Some(backup_node) = backup_node {
-            assert!(node_id.is_none());
-            result.backup_kv =
-                Some(self.build_backup_kv_action_(self.arena.node(backup_node), true));
-        }
         result.unbacked_tokens = self.tracked_unbacked_tokens.take().unwrap();
         let state = self.component_state(component_type);
         if component_type == MAMBA {
@@ -3161,11 +3241,6 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         self.enable_hicache = true;
     }
 
-    /// Preserve dirty internal SWA nodes before cache-mode write-back eviction.
-    pub fn enable_swa_write_back_eviction_barrier(&mut self) {
-        self.swa_write_back_eviction_barrier_enabled = true;
-    }
-
     /// Mark the host tier as buffer-only; wired after the host pools are built.
     pub fn set_host_memory_buffer_only(&mut self) {
         self.is_host_memory_buffer_only = true;
@@ -3225,6 +3300,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                     medium,
                     cache_salt,
                     session_id,
+                    ..
                 },
             ) if *tail_medium == medium
                 && *tail_block_size == block_size
@@ -3310,29 +3386,39 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             self.arena.node_mut(node_id).hash_value = Some(hash_values);
         }
         let cache_salt = self.arena.node(node_id).namespace.cache_salt_arc();
+        // Python reads the LoRA adapter name from extra_key in the dynamo format.
+        let extra_key = self
+            .dynamo_kv_event_format
+            .then(|| self.arena.node(node_id).namespace.extra_key_arc())
+            .flatten();
         let session_id: Option<Arc<str>> = session_id.map(Arc::from);
         let namespaced = self.arena.node(node_id).namespace != KeyNamespace::default();
         if namespaced {
             self.ensure_namespaced_event_hashes_(node_id);
         }
+        let namespace_seed = self.namespace_seed_(node_id);
         let events = {
             let node = self.arena.node(node_id);
-            let mut parent_block_hash = node.parent.and_then(|parent_id| {
-                let parent = self.arena.node(parent_id);
-                if namespaced {
-                    self.namespaced_event_hashes
-                        .get(&parent.id)
-                        .and_then(|hashes| hashes.last())
-                        .map(crate::node::hash_digest_to_int64)
-                } else {
-                    parent
-                        .get_last_hash_value()
-                        .map(crate::node::hash_str_to_int64)
-                }
-            });
+            let mut parent_block_hash = node
+                .parent
+                .and_then(|parent_id| {
+                    let parent = self.arena.node(parent_id);
+                    if namespaced {
+                        self.namespaced_event_hashes
+                            .get(&parent.id)
+                            .and_then(|hashes| hashes.last())
+                            .map(crate::node::hash_digest_to_int64)
+                    } else {
+                        parent
+                            .get_last_hash_value()
+                            .map(crate::node::hash_str_to_int64)
+                    }
+                })
+                .map(|parent| namespaced_block_hash(namespace_seed.as_ref(), parent));
             let num_pages = node.key.atom_len().div_ceil(self.page_size);
             let mut events = Vec::with_capacity(num_pages);
             let mut append_event = |page: &[K::Atom], block_hash| {
+                let block_hash = namespaced_block_hash(namespace_seed.as_ref(), block_hash);
                 events.push(KvCacheEvent::BlockStored {
                     block_hashes: vec![block_hash],
                     parent_block_hash,
@@ -3341,6 +3427,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                     medium,
                     cache_salt: cache_salt.clone(),
                     session_id: session_id.clone(),
+                    extra_key: extra_key.clone(),
                 });
                 parent_block_hash = Some(block_hash);
             };
@@ -3398,12 +3485,25 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 .map(|hash| crate::node::hash_str_to_int64(hash))
                 .collect()
         };
+        let namespace_seed = self.namespace_seed_(node_id);
+        let block_hashes: Vec<i64> = block_hashes
+            .into_iter()
+            .map(|hash| namespaced_block_hash(namespace_seed.as_ref(), hash))
+            .collect();
         if !block_hashes.is_empty() {
             self.enqueue_kv_event_(KvCacheEvent::BlockRemoved {
                 block_hashes,
                 medium,
             });
         }
+    }
+
+    /// The namespaced-hash seed of `node_id`; None in the default format.
+    fn namespace_seed_(&self, node_id: NodeIdx_) -> Option<HashDigest> {
+        if !self.dynamo_kv_event_format {
+            return None;
+        }
+        kv_event_namespace_seed(&self.arena.node(node_id).namespace)
     }
 
     /// Queue the all-cleared marker.
@@ -5778,6 +5878,44 @@ impl StorageMedium {
     }
 }
 
+// The dynamo format publishes namespaced hashes as block hashes. If you change
+// this tag, all of these hashes change. disaggregation/kv_events.py has a Python copy.
+const KV_EVENT_NAMESPACE_SEED_TAG: &[u8] = b"sglang-kv-event-namespace-v1";
+
+/// The seed for `namespaced_block_hash`, or None for no namespace.
+pub(crate) fn kv_event_namespace_seed(namespace: &KeyNamespace) -> Option<HashDigest> {
+    if *namespace == KeyNamespace::default() {
+        return None;
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(KV_EVENT_NAMESPACE_SEED_TAG);
+    // The presence byte and the length prefix make ("a", "bc") and ("ab", "c") differ.
+    for part in [namespace.extra_key(), namespace.cache_salt()] {
+        match part {
+            None => hasher.update([0u8]),
+            Some(part) => {
+                hasher.update([1u8]);
+                hasher.update((part.len() as u64).to_le_bytes());
+                hasher.update(part.as_bytes());
+            }
+        }
+    }
+    Some(hasher.finalize().into())
+}
+
+/// Return the namespaced hash of a published block hash. If there is no namespace,
+/// the result is `block_hash`. If not, it is the first 8 bytes of SHA-256(seed, block_hash).
+pub(crate) fn namespaced_block_hash(seed: Option<&HashDigest>, block_hash: i64) -> i64 {
+    let Some(seed) = seed else {
+        return block_hash;
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(seed);
+    hasher.update(block_hash.to_be_bytes());
+    let digest: HashDigest = hasher.finalize().into();
+    crate::node::hash_digest_to_int64(&digest)
+}
+
 /// A KV placement event; one stored event may carry multiple same-sized pages.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum KvCacheEvent<A> {
@@ -5789,6 +5927,9 @@ pub enum KvCacheEvent<A> {
         medium: StorageMedium,
         cache_salt: Option<Arc<str>>,
         session_id: Option<Arc<str>>,
+        /// Set only in the dynamo format, and not published. Python uses it to
+        /// find the LoRA adapter name.
+        extra_key: Option<Arc<str>>,
     },
     BlockRemoved {
         block_hashes: Vec<i64>,

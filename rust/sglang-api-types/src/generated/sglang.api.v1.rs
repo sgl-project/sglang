@@ -535,6 +535,15 @@ pub struct MediaRef {
     /// Video: also decode the audio track.
     #[prost(bool, optional, tag = "14")]
     pub use_audio: ::core::option::Option<bool>,
+    /// GLM-Image external AR uses grids with input_ids to compute MRoPE positions.
+    #[prost(message, optional, tag = "15")]
+    pub image_grid_thw: ::core::option::Option<ImageGridThw>,
+}
+/// One (t, h, w) row per image; the processor validates row arity.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ImageGridThw {
+    #[prost(message, repeated, tag = "1")]
+    pub rows: ::prost::alloc::vec::Vec<Int64List>,
 }
 /// One media item. JSON: a bare string is the source; an object is a MediaRef.
 #[derive(Clone, PartialEq, ::prost::Message)]
