@@ -786,8 +786,7 @@ class HiCacheHF3FS(HiCacheStorage):
         return results
 
     def _pool_component_key(self, key: str, pool_name: PoolName) -> str:
-        # MLA KV is replicated across TP ranks, but every rank backs up its own
-        # Mamba shard (see should_backup), so Mamba keys always carry the TP rank.
+        # Mamba state is TP-sharded even when the model's MLA KV is replicated.
         if self.is_mla_model and pool_name == PoolName.MAMBA:
             return f"{key}_{pool_name}_{self.tp_rank}_{self.tp_size}"
         return f"{key}_{pool_name}"
