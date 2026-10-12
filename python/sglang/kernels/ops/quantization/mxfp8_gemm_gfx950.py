@@ -46,10 +46,11 @@ one row of C; the tile is staged through the idle LDS and stored 1 KB per instru
 
 import functools
 
-import torch
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+import torch
+import triton
+import triton.language as tl
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import Vector as Vec
@@ -334,17 +335,31 @@ def _build(K, block_m, xcd_swizzle, b_shuffled):
     return launch
 
 
+@triton.jit
+def _scale_layout_kernel(src, dst, rows, blocks, stride_r, stride_b, n_groups):
+    # one program per (16-row tile, 512-K group): 16 rows x 16 scales -> 256 bytes
+    tile, group = tl.program_id(0), tl.program_id(1)
+    r = tl.arange(0, 16)[:, None]
+    b = tl.arange(0, 16)[None, :]
+    row, blk = tile * 16 + r, group * 16 + b
+    v = tl.load(src + row * stride_r + blk * stride_b, mask=(row < rows) & (blk < blocks), other=127)
+    # scale b = 4j + g of the group is byte j of word (tile, group, g, r)
+    tl.store(dst + (tile * n_groups + group) * 256 + (b % 4) * 64 + r * 4 + b // 4, v)
+
+
 def mxfp8_scale_layout(scale: torch.Tensor) -> torch.Tensor:
     """ue8m0 scales [rows, K/32] (uint8) -> int32 words [ceil(rows/16), ceil(K/512), 4, 16];
     word (row, q, g) holds in byte j the scale of MX block 16q + 4j + g. Padding is 127 (x1).
     The reference for producers: the activation's quantization should write this layout."""
+    scale = scale.view(torch.uint8)
     rows, blocks = scale.shape
-    rows_p, n_groups = _ceil_div(rows, 16) * 16, _ceil_div(blocks, 16)
-    padded = torch.full((rows_p, n_groups * 16), 127, dtype=torch.uint8, device=scale.device)
-    padded[:rows, :blocks] = scale.view(torch.uint8)
-    # bytes (row, q, j, g) -> words (row, q, g) with byte j -> [rows/16, q, g, row % 16]
-    words = padded.view(rows_p, n_groups, 4, 4).transpose(2, 3).contiguous().view(torch.int32)
-    return words.view(rows_p // 16, 16, n_groups, 4).permute(0, 2, 3, 1).contiguous()
+    tiles, n_groups = _ceil_div(rows, 16), _ceil_div(blocks, 16)
+    words = torch.empty((tiles, n_groups, 4, 16), dtype=torch.int32, device=scale.device)
+    if rows:
+        _scale_layout_kernel[(tiles, n_groups)](
+            scale, words.view(torch.uint8), rows, blocks, scale.stride(0), scale.stride(1), n_groups
+        )
+    return words
 
 
 _KERNELS = {}

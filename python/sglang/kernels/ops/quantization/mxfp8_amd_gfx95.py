@@ -150,44 +150,6 @@ def mxfp8_e4m3_quantize(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     return _mxfp8_e4m3_quantize_torch(x)
 
 
-@triton.jit
-def _mxfp8_scale_words_kernel(src, dst, rows, blocks, stride_r, stride_b, n_groups):
-    # one program per (16-row tile, 512-K group): 16 rows x 16 scales -> 256 bytes
-    tile = tl.program_id(0)
-    group = tl.program_id(1)
-    r = tl.arange(0, 16)[:, None]
-    b = tl.arange(0, 16)[None, :]
-    row = tile * 16 + r
-    blk = group * 16 + b
-    v = tl.load(
-        src + row * stride_r + blk * stride_b,
-        mask=(row < rows) & (blk < blocks),
-        other=127,
-    )
-    tl.store(dst + (tile * n_groups + group) * 256 + (b % 4) * 64 + r * 4 + b // 4, v)
-
-
-def mxfp8_scale_words(scale: torch.Tensor) -> torch.Tensor:
-    """UE8M0 scales [rows, K // 32] -> the int32 words [ceil(rows/16), ceil(K/512), 4, 16]
-    that mxfp8_gemm_gfx950 reads (its mxfp8_scale_layout), in one launch."""
-    rows, blocks = scale.shape
-    tiles, n_groups = triton.cdiv(rows, 16), triton.cdiv(blocks, 16)
-    words = torch.empty(
-        (tiles, n_groups, 4, 16), dtype=torch.int32, device=scale.device
-    )
-    if rows:
-        _mxfp8_scale_words_kernel[(tiles, n_groups)](
-            scale,
-            words.view(torch.uint8),
-            rows,
-            blocks,
-            scale.stride(0),
-            scale.stride(1),
-            n_groups,
-        )
-    return words
-
-
 def dequant_mxfp8_to_bf16(x: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
     """Dequantize an MXFP8 tensor (fp8 values + UE8M0 scales) to BF16."""
     x_float = x.to(torch.float32)

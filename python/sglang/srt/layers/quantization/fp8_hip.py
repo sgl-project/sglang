@@ -19,7 +19,6 @@ from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
     dequant_block_fp8_weight_to_bf16,
     dequant_mxfp8_to_bf16,
     mxfp8_e4m3_quantize,
-    mxfp8_scale_words,
 )
 from sglang.kernels.ops.quantization.mxfp8_native_amd_gfx95 import (
     native_route_supports,
@@ -176,8 +175,9 @@ def _apply_flydsl(
         xq, xs = mxfp8_e4m3_quantize(x2d.to(torch.bfloat16))
     else:
         xq, xs = x2d.contiguous(), input_scale.reshape(-1, input_scale.shape[-1])
-    out = _flydsl_gemm().mxfp8_gemm(
-        xq, mxfp8_scale_words(xs), layer.weight, layer.weight_scale_flydsl
+    gemm = _flydsl_gemm()
+    out = gemm.mxfp8_gemm(
+        xq, gemm.mxfp8_scale_layout(xs), layer.weight, layer.weight_scale_flydsl
     )
     if bias is not None:
         out = out + bias
