@@ -5,6 +5,7 @@ import logging
 import threading
 import time
 from dataclasses import replace
+from http import HTTPStatus
 from queue import Queue
 from typing import TYPE_CHECKING, Iterator, NamedTuple, Optional, Sequence, TypeVar
 
@@ -424,18 +425,11 @@ class UnifiedRadixCache(BasePrefixCache):
         """Initialize HiCache infrastructure."""
         self.host_memory_mode = get_memory().hicache_host_memory_mode
         if self.host_memory_mode == "buffer_only":
-            # TODO(Jialin): Extend buffer-only state handoff to Mamba in a
-            # follow-up to #34798 and #35769.
-            # FULL and FULL+SWA only: Mamba has no state-handoff channel on
-            # the admission-time load-back read path and is not layer-gated.
-            # Lifting the fence also needs the admission charge: a staged
-            # state slot is request-pinned at consumption and must ride
-            # req.mamba_host_hit_length the way the SWA window does.
-            supported = {ComponentType.FULL, ComponentType.SWA}
+            supported = {ComponentType.FULL, ComponentType.SWA, ComponentType.MAMBA}
             if not set(self.tree_components) <= supported:
                 raise ValueError(
                     "--hicache-host-memory-mode buffer_only supports only "
-                    "FULL/SWA unified trees; got components "
+                    "FULL/SWA/MAMBA unified trees; got components "
                     f"{sorted(ct.name for ct in self.tree_components)}."
                 )
         from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
@@ -3464,20 +3458,41 @@ class UnifiedRadixCache(BasePrefixCache):
 
         return 0, last_best_match_device_node_id
 
+    def load_back_is_cache_owned(self) -> bool:
+        # Linker-loaded slots stay request-owned until the load succeeds.
+        # Keep cache_protected_len unchanged so failed loads can be freed.
+        return self.linker is None
+
+    def finish_external_linker_loads(self, reqs: list[Req]) -> list[Req]:
+        """Wait for the external-linker loads of the batch that just ran and
+        return the requests whose KV did not land, marked so their output is
+        dropped and their KV never reaches the tree. Their slots are private
+        (see :meth:`UnifiedCacheLinkerWrapper.load_back`), so nothing else read
+        them."""
+        if self.linker is None:
+            return []
+        failed_rids = set(self.linker.finish_loads())
+        failed = [req for req in reqs if req.rid in failed_rids]
+        if failed:
+            from sglang.srt.managers.schedule_batch import FINISH_ABORT
+
+            for req in failed:
+                req.skip_radix_cache_insert = True
+                req.discard_output_reason = FINISH_ABORT(
+                    "External KV cache load failed", HTTPStatus.SERVICE_UNAVAILABLE
+                )
+        return failed
+
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""
         if self.linker is not None:
             finish_counts = torch.tensor(
-                [
-                    self.linker.num_completed_loads(),
-                    self.linker.num_completed_offloads(),
-                ],
+                [self.linker.num_completed_offloads()],
                 dtype=torch.int,
                 device="cpu",
             )
             self._all_reduce_attn_groups(finish_counts, torch.distributed.ReduceOp.MIN)
-            load_count, offload_count = map(int, finish_counts.tolist())
-            self.linker.drain_loads(load_count)
+            offload_count = int(finish_counts.item())
             local_successes = self.linker.take_completed_offloads(offload_count)
             if local_successes:
                 successes = torch.tensor(local_successes, dtype=torch.int, device="cpu")
@@ -3776,6 +3791,16 @@ class UnifiedRadixCache(BasePrefixCache):
             return self.tree_core.node_by_id(node_handle)
         # Internal callers (and the session sentinel / None) pass a non-int through.
         return node_handle
+
+    def prefix_device_indices(self, req: Req) -> torch.Tensor:
+        root = self.root_node_handle(req.extra_key)
+        path = self.tree_core.collect_full_device_indices(req.last_node, root)
+        if self.linker is not None:
+            tail = self.linker.private_load_indices.get(req.rid)
+            if tail is not None:
+                path = torch.cat([path, tail])
+        assert len(path) >= req.prefix_len, (req.rid, len(path), req.prefix_len)
+        return path[: req.prefix_len]
 
     def path_device_indices(self, node: NodeId) -> torch.Tensor:
         return self.tree_core.collect_full_device_indices(node, self.root_node_handle())
