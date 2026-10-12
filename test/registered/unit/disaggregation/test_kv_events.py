@@ -10,6 +10,7 @@ the router can subscribe per replica (the `dp_size` it reads from
 import unittest
 
 import msgspec
+import zmq
 
 from sglang.srt.disaggregation.kv_events import (
     AllBlocksCleared,
@@ -21,6 +22,9 @@ from sglang.srt.disaggregation.kv_events import (
     resolve_load_pub_range,
     select_kv_publisher_dp_rank,
 )
+from sglang.srt.runtime_context import describe_kv_events_publisher
+from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils.network import get_free_port
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -247,6 +251,43 @@ class TestBlockStoredWireFormat(CustomTestCase):
         self.assertEqual(decoded[2], 0)
         self.assertIsInstance(decoded[1][0], dict)
         self.assertEqual(len(decoded), 3)
+
+
+class TestReplay(CustomTestCase):
+    def test_descriptor_advertises_replay_port(self):
+        def descriptor(**cfg):
+            cfg = msgspec.json.encode({"publisher": "zmq", **cfg}).decode()
+            args = ServerArgs(model_path="dummy", page_size=16, kv_events_config=cfg)
+            return describe_kv_events_publisher(args)
+
+        self.assertNotIn("replay_endpoint_port_base", descriptor())
+        self.assertEqual(
+            descriptor(replay_endpoint="tcp://*:6000")["replay_endpoint_port_base"],
+            6000,
+        )
+
+    def test_router_serves_buffered_batches_then_end_seq(self):
+        # The router's DEALER client relies on this exact framing.
+        replay = f"tcp://127.0.0.1:{get_free_port()}"
+        publisher = ZmqEventPublisher(
+            attn_dp_rank=0, endpoint="inproc://kv-replay-test", replay_endpoint=replay
+        )
+        dealer = zmq.Context.instance().socket(zmq.DEALER)
+        dealer.setsockopt(zmq.RCVTIMEO, 5000)
+        dealer.connect(replay)
+        try:
+            for _ in range(3):
+                publisher.publish(KVEventBatch(ts=1.0, events=[AllBlocksCleared()]))
+            publisher._event_queue.join()
+            dealer.send_multipart([b"", (1).to_bytes(8, "big")])
+            frames = [dealer.recv_multipart() for _ in range(3)]
+        finally:
+            dealer.close(linger=0)
+            publisher.shutdown()
+        seqs = [int.from_bytes(f[1], "big", signed=True) for f in frames]
+        self.assertEqual(seqs, [1, 2, -1])
+        self.assertEqual([f[0] for f in frames], [b""] * 3)
+        self.assertEqual(frames[2][2], b"")
 
 
 if __name__ == "__main__":

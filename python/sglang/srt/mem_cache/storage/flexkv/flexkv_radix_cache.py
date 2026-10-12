@@ -382,16 +382,16 @@ class FlexKVRadixCache(RadixCache):
         return fetched_slots, new_node
 
     # ------------------------------------------------------------------
-    # insert_req (STORE)
+    # checkpoint (STORE)
     # ------------------------------------------------------------------
 
-    def on_release(self, req: Req, *, inserted: bool) -> None:
-        if not inserted:
+    def on_release(self, req: Req, *, checkpointed: bool) -> None:
+        if not checkpointed:
             self._load_markers.pop(req.cache_request_handle, None)
 
-    def insert_req(self, req: Req, *, up_to: int) -> None:  # type: ignore[override]
-        """Base insert_req; a finished request also fires an async FlexKV store."""
-        super().insert_req(req, up_to=up_to)
+    def checkpoint(self, req: Req, *, up_to: int) -> None:  # type: ignore[override]
+        """Base checkpoint; a finished request also fires an async FlexKV store."""
+        super().checkpoint(req, up_to=up_to)
         if not req.finished():
             return
 

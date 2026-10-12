@@ -317,7 +317,8 @@ class TestPdRoleSwitchStartupValidation(unittest.TestCase):
             speculative_algorithm=None,
         )
         base.update(kw)
-        return SimpleNamespace(**base)
+        # Keep the production defaults for fields read by the shared PD hook.
+        return ServerArgs(model_path="dummy", **base)
 
     def _run(self, sa):
         from sglang.srt.arg_groups.pd_disaggregation_hook import (

@@ -128,10 +128,22 @@ class IpcA2AState:
     def init(self, group):
         import ctypes
 
+        from sglang.multimodal_gen.runtime.platforms import current_platform
+        from sglang.multimodal_gen.runtime.platforms.cuda import (
+            device_id_to_physical_device_id,
+        )
+
         self.rank = dist.get_rank(group=group)
         self.group = group
         dev = torch.cuda.current_device()
         peer_dev = _peer_cuda_device(group, self.rank, dev)
+        # Peer access alone also admits PCIe pairs, where this NVLink transport
+        # can stall in its GPU-side flag wait. Query the same pair on both ranks.
+        physical_devices = sorted(
+            device_id_to_physical_device_id(d) for d in (dev, peer_dev)
+        )
+        if not current_platform.is_full_nvlink(physical_devices):
+            raise _Unsupported("requires an NVLink-connected GPU pair")
         try:
             has_peer_access = torch.cuda.can_device_access_peer(dev, peer_dev)
         except RuntimeError as e:

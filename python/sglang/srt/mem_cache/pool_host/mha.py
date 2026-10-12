@@ -823,6 +823,8 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
         self.pin_memory = pin_memory
         self.device = device
         self.allocator = get_allocator_from_storage(allocator_type)
+        # HostPoolGroup ANDs this over its pools; this pool skips HostKVCache.__init__
+        self.can_use_write_back_jit = False
         self.dtype = device_pool.store_dtype
         self.start_layer = device_pool.start_layer
         self.end_layer = device_pool.end_layer

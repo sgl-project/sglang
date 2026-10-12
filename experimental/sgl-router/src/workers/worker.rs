@@ -3,9 +3,9 @@
 
 use crate::discovery::{ModelId, WorkerId, WorkerMode};
 use crate::health::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 /// How long a prefill stays unroutable, after joining its model pool, while
@@ -221,6 +221,7 @@ pub struct Worker {
     /// PD pairing scope; carried from `WorkerSpec`. See
     /// [`crate::discovery::WorkerSpec`].
     version_group: Option<String>,
+    services: RwLock<BTreeSet<String>>,
     /// Router in-flight requests per DP rank; one slot per rank.
     dp_rank_inflight: Arc<[AtomicUsize]>,
 }
@@ -259,8 +260,25 @@ impl Worker {
             bootstrap_port: spec.bootstrap_port,
             pooled_at: tokio::time::Instant::now(),
             version_group: spec.version_group,
+            services: RwLock::new(spec.services),
             dp_rank_inflight: (0..dp_ranks.max(1)).map(|_| AtomicUsize::new(0)).collect(),
         }
+    }
+
+    pub fn services(&self) -> BTreeSet<String> {
+        self.services.read().unwrap().clone()
+    }
+
+    pub fn matches_services(&self, services: &HashSet<String>) -> bool {
+        self.services
+            .read()
+            .unwrap()
+            .iter()
+            .any(|s| services.contains(s))
+    }
+
+    pub(crate) fn set_services(&self, services: BTreeSet<String>) {
+        *self.services.write().unwrap() = services;
     }
 
     /// Hostname carried on PD-disagg request bodies as `bootstrap_host`.
@@ -377,7 +395,7 @@ pub fn paired_prefills(
     mut prefills: Vec<Arc<Worker>>,
     decoders: &[Arc<Worker>],
 ) -> Vec<Arc<Worker>> {
-    let groups: std::collections::HashSet<_> = decoders.iter().map(|d| d.version_group()).collect();
+    let groups: HashSet<_> = decoders.iter().map(|d| d.version_group()).collect();
     prefills.retain(|p| groups.contains(&p.version_group()));
     prefills
 }

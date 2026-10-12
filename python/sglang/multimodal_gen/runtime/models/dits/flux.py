@@ -122,8 +122,9 @@ def _flux_fused_ln_modulate(
     """
     if (
         _FLUX_LN_MOD.disabled
+        or not x.is_cuda
         or not is_plain_layer_norm(norm, x.shape[-1])
-        or not can_use_fused_layernorm_modulate(x, scale, shift)
+        or not can_use_fused_layernorm_modulate(x.dtype, x.shape[-1])
     ):
         return None
     sig = (

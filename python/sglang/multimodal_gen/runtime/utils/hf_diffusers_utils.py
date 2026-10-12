@@ -386,7 +386,8 @@ def _verify_diffusers_model_complete(path: str) -> bool:
     component_keys = [
         key
         for key, value in model_index.items()
-        if _is_diffusers_component_entry(value)
+        if not key.startswith("_")
+        and _is_diffusers_component_entry(value)
         and any(item is not None for item in value)
     ]
     if component_keys:
@@ -560,6 +561,35 @@ def get_diffusers_component_config(
     combined_config = reduce(
         lambda acc, path: acc | load_dict(path), config_file_paths, {}
     )
+
+    if "_class_name" not in combined_config:
+        # Some checkpoints (e.g. real Kandinsky6 exports, which declare
+        # "uses_patched_diffusers": true) omit "_class_name" from a
+        # component's own config.json, relying on the parent
+        # model_index.json's [library, class_name] entry for that component
+        # subfolder instead. Fall back to that so component loaders (which
+        # unconditionally pop "_class_name") still resolve the right class.
+        model_index_path = os.path.join(
+            os.path.dirname(os.path.normpath(component_path)), "model_index.json"
+        )
+        component_key = os.path.basename(os.path.normpath(component_path))
+        if os.path.exists(model_index_path):
+            try:
+                with open(model_index_path) as f:
+                    model_index = json.load(f)
+                entry = model_index.get(component_key)
+                class_name = (
+                    entry[-1] if isinstance(entry, (list, tuple)) and entry else entry
+                )
+                if class_name:
+                    combined_config["_class_name"] = str(class_name)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to backfill _class_name for %s from %s: %s",
+                    component_path,
+                    model_index_path,
+                    exc,
+                )
 
     quant_config = combined_config.get("quantization_config")
     if quant_config is not None:
@@ -736,7 +766,8 @@ def verify_model_config_and_directory(model_path: str) -> dict[str, Any]:
     component_keys = [
         key
         for key, value in config.items()
-        if isinstance(value, (list, tuple))
+        if not key.startswith("_")
+        and isinstance(value, (list, tuple))
         and len(value) == 2
         and all(isinstance(item, str) for item in value)
     ]

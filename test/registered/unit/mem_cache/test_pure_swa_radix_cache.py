@@ -70,6 +70,7 @@ class TestPureSWARadixCache(CustomTestCase):
             extra_key=None,
             cache_salt=None,
             last_node=cache.root_node,
+            lock=None,
             priority=0,
             kv=ReqKvInfo(
                 req_pool_idx=0,
@@ -78,9 +79,9 @@ class TestPureSWARadixCache(CustomTestCase):
             ),
         )
 
-        cache.insert_req(req, up_to=8)
+        cache.checkpoint(req, up_to=8)
         cache.free_kv_row(req.kv, [(req.kv.cache_protected_len, 8)])
-        cache.unpin(req)
+        cache.unlock(req.lock)
 
         # [0, 4) went into the tree; [4, 6) was window-evicted; [6, 8) is freed.
         match = cache.match_prefix(MatchPrefixParams(key=RadixKey(token_ids)))

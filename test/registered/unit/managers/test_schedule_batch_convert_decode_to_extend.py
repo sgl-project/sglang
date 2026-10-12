@@ -28,7 +28,7 @@ class _FakeReq:
     """Carries the fill-id state convert_decode_to_extend touches, with the
     real Req methods so the array bookkeeping is not re-implemented here."""
 
-    _refresh_fill_ids = Req._refresh_fill_ids
+    refresh_fill_ids = Req.refresh_fill_ids
     set_extend_range = Req.set_extend_range
 
     def __init__(self, *, num_prompt_tokens: int, num_output_tokens: int):

@@ -66,6 +66,7 @@ def _cache_and_request(cache_class, *, swa_enabled, swa_cursor=0):
         ),
         priority=0,
         last_node=None,
+        lock=None,
     )
     if swa_enabled:
         req.kv.set_evicted_seqlen(ComponentType.SWA, swa_cursor)
@@ -117,7 +118,7 @@ def test_mamba_publication_snapshots_component_cursors(cache_class, swa_enabled)
     req.kv.set_evicted_seqlen(ComponentType.AUXILIARY_SWA, 99)
     assert insert_params.get_evicted_seqlen(ComponentType.AUXILIARY_SWA) == 6
     assert req.kv.cache_protected_len == 8
-    assert req.lock_receipt.node_id == 42
+    assert req.lock.receipt.node_id == 42
     assert flow.prefix_published
     assert flow.mamba_value is None
     assert req.prefix_indices.tolist() == list(range(12))

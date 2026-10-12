@@ -60,6 +60,7 @@ mod tests {
             model_ids: vec![ModelId("m".into())],
             bootstrap_port: None,
             version_group: None,
+            services: Default::default(),
         };
         let profile = EngineProfile {
             protocol: WireProtocol::default(),

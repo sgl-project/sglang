@@ -338,8 +338,8 @@ class XIELU(BaseFusedOp):
         self.register_buffer("eps", torch.tensor(eps, dtype=dtype))
         self.with_vector_loads = with_vector_loads
         # Temporary until xIELU CUDA fully implemented
-        self._beta_scalar = float(self.beta.detach().cpu().float().item())
-        self._eps_scalar = float(self.eps.detach().cpu().float().item())
+        self._beta_scalar = torch.tensor(beta, dtype=dtype, device="cpu").item()
+        self._eps_scalar = torch.tensor(eps, dtype=dtype, device="cpu").item()
 
         self._xielu_cuda_obj = None
         try:

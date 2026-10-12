@@ -1414,8 +1414,6 @@ class TestForwardFlags(_IsolatedServerArgs):
                 x = x + 1
             if fwd.is_extend_in_batch:
                 x = x + 2
-            if fwd.fuse_mlp_allreduce:
-                x = x + 4
             if fwd.mlp_reduce_scatter:
                 x = x + 8
             if fwd.flashinfer_trtllm_bypass:
@@ -1429,11 +1427,10 @@ class TestForwardFlags(_IsolatedServerArgs):
         self.assertEqual(probe(torch.zeros(())).item(), 2)
         get_forward().set("is_extend_in_batch", False)
         with get_forward().scoped(
-            fuse_mlp_allreduce=True,
             mlp_reduce_scatter=True,
             flashinfer_trtllm_bypass=True,
         ):
-            self.assertEqual(probe(torch.zeros(())).item(), 28)
+            self.assertEqual(probe(torch.zeros(())).item(), 24)
         self.assertEqual(probe(torch.zeros(())).item(), 0)
 
     def test_parallel_config_leaves_trace_under_torch_compile(self):
@@ -1578,23 +1575,17 @@ class TestForwardFlags(_IsolatedServerArgs):
 
         reset_context()
         fwd = get_forward()
-        self.assertFalse(fwd.fuse_mlp_allreduce)
         self.assertFalse(fwd.mlp_reduce_scatter)
         self.assertFalse(fwd.flashinfer_trtllm_bypass)
-        self.assertFalse(should_skip_mlp_all_reduce())
-
-        with fwd.scoped(fuse_mlp_allreduce=True):
-            self.assertTrue(fwd.fuse_mlp_allreduce)
-            self.assertTrue(should_skip_mlp_all_reduce())
-            # Fusion alone is enough to skip post-experts AR.
-            self.assertTrue(should_skip_post_experts_all_reduce(is_tp_path=True))
-        self.assertFalse(fwd.fuse_mlp_allreduce)
         self.assertFalse(should_skip_mlp_all_reduce())
 
         with fwd.scoped(mlp_reduce_scatter=True):
             self.assertTrue(fwd.mlp_reduce_scatter)
             self.assertTrue(should_skip_mlp_all_reduce())
+            # The reduce-scatter alone is enough to skip post-experts AR.
+            self.assertTrue(should_skip_post_experts_all_reduce(is_tp_path=True))
         self.assertFalse(fwd.mlp_reduce_scatter)
+        self.assertFalse(should_skip_mlp_all_reduce())
 
         with fwd.scoped(flashinfer_trtllm_bypass=True):
             self.assertTrue(fwd.flashinfer_trtllm_bypass)

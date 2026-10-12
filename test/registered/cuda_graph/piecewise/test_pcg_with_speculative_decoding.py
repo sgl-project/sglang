@@ -2,8 +2,8 @@
 
 PCG handles prefill/extend path while speculative decoding (EAGLE3) uses
 decode CUDA graphs. This test verifies they don't interfere with each
-other. MTP / STANDALONE / NGRAM variants moved to the sibling file
-test_pcg_with_speculative_decoding_extra.py.
+other. The MTP variant runs under breakable CUDA graph in
+../breakable/test_bcg_with_speculative_decoding_extra.py.
 """
 
 import unittest

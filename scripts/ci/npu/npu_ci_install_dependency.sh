@@ -79,7 +79,7 @@ ${PIP_INSTALL} torch-npu==2.10.0.post6 --extra-index-url https://ascend.devcloud
 
 case "$(arch)" in
 aarch64)
-    ${PIP_INSTALL} https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/ta/triton_ascend-3.2.2-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl
+    ${PIP_INSTALL} "${GITHUB_PROXY_URL}https://github.com/triton-lang/triton-ascend/releases/download/v3.2.2/triton_ascend-3.2.2-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl"
     ;;
 x86_64)
     ${PIP_INSTALL} "${GITHUB_PROXY_URL}https://github.com/triton-lang/triton-ascend/releases/download/v3.2.2/triton_ascend-3.2.2-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl"

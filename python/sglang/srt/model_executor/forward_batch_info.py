@@ -1303,6 +1303,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         from sglang.srt.layers.layer_boundary import batch_gathers_over_moe_cp
         from sglang.srt.layers.moe.utils import is_moe_input_scattered_across_dp_ranks
 
+        if (
+            is_moe_input_scattered_across_dp_ranks()
+            and self.attn_cp_metadata is not None
+            and self.forward_mode.is_context_parallel_extend()
+        ):
+            from sglang.srt.layers.cp.base import get_cp_strategy
+
+            strategy = get_cp_strategy()
+            if strategy is not None:
+                return strategy.moe_num_token_non_padded(self)
+
         if self.num_token_non_padded is None:
             return None
 

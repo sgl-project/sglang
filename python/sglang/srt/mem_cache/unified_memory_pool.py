@@ -33,9 +33,11 @@ from typing import ClassVar, Dict, List, NamedTuple, Optional, Tuple
 import torch
 from torch.profiler import record_function
 
+from sglang.kernels.ops.kvcache.copy_pages import copy_pages
 from sglang.kernels.ops.kvcache.zero_pages import zero_pages
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.kv_vmm_backing import KvVmmBufferOwner
 from sglang.srt.mem_cache.layout.token_major import (
     ROW_ALIGN_BYTES,
     DenseEntryLayout,
@@ -47,6 +49,7 @@ from sglang.srt.mem_cache.layout.token_major import (
 from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
     HybridReqToTokenPool,
+    KvBufferDesc,
     KVWriteLoc,
     MambaPool,
     MHATokenToKVPool,
@@ -345,6 +348,8 @@ class UnifiedKVPool:
         device: str,
         enable_memory_saver: bool,
         page_size: int = 1,
+        post_capture_active: bool = False,
+        bs1_floor_terms: Optional[List[Tuple[str, int]]] = None,
     ):
         assert page_size >= 1, f"page_size must be >= 1; got {page_size}"
         assert len(sub_pool_specs) >= 2, (
@@ -378,22 +383,57 @@ class UnifiedKVPool:
         self._specs_by_name: Dict[str, SubPoolSpec] = {
             s.name: s for s in sub_pool_specs
         }
+        self.post_capture_active = post_capture_active
+        self._post_capture_owner: Optional[KvVmmBufferOwner] = None
+        self._bs1_floor_terms = bs1_floor_terms or []
 
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
         )
+        # Slot-0 dummy writes for both pools land in the reserved low-byte sink;
+        # each pool's first allocatable slot is chosen so real data starts past it.
+        # A page-aware sub-pool allocates whole pages, so the sink is all of page
+        # 0 (up to page_size * entry_bytes), not one slot entry -- reserve the
+        # max of both.
+        reserved_floor = _reserved_floor_bytes(self.sub_pool_specs, page_size)
+
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
-            self._raw = torch.empty(total_bytes, dtype=torch.uint8, device=device)
-        if envs.SGLANG_DEBUG_POISON_POOL.get():
-            # Debug: bf16-NaN-fill so NaN-unsafe reads of never-written bytes
-            # fail deterministically.
-            self._raw.view(torch.int16).fill_(0x7FC1)
-            logger.warning(
-                "[unified-memory-pool] POISONED: pool filled with bf16-NaN "
-                "patterns (SGLANG_DEBUG_POISON_POOL)"
-            )
-        else:
-            self._raw.zero_()  # unset slots must read as zeros (matches non-shared)
+            if post_capture_active:
+                dev = torch.device(device)
+                if dev.type != "cuda":
+                    raise ValueError(
+                        "UnifiedKVPool post-capture backing requires a CUDA device"
+                    )
+                device_id = (
+                    dev.index if dev.index is not None else torch.cuda.current_device()
+                )
+                self._post_capture_owner = KvVmmBufferOwner(
+                    device=device,
+                    device_id=device_id,
+                    store_dtype=torch.uint8,
+                    page_size=1,
+                    reserved_num_tokens=total_bytes,
+                    buffer_descs=[
+                        KvBufferDesc(
+                            "unified_raw",
+                            (total_bytes,),
+                            row_bytes=1,
+                            tokens_per_row=1,
+                        )
+                    ],
+                )
+                self._raw = self._post_capture_owner.tensors[0]
+                # Capture routes every dummy KV write to slot 0, whose page
+                # envelope is the whole reserved sink: back it before any graph
+                # is captured.
+                self._post_capture_owner.ensure_prefix(reserved_floor)
+                accessible_raw = self._raw[:reserved_floor]
+                self._accessible_bytes = reserved_floor
+            else:
+                self._raw = torch.empty(total_bytes, dtype=torch.uint8, device=device)
+                accessible_raw = self._raw
+                self._accessible_bytes = total_bytes
+        self._initialize_raw(accessible_raw)
 
         self._max_slots: Dict[str, int] = {}
         self._anchor_bytes: Dict[str, int] = {}
@@ -403,13 +443,6 @@ class UnifiedKVPool:
         self._mha_views: Dict[str, Tuple[List[torch.Tensor], List[torch.Tensor]]] = {}
         self._mla_views: Dict[str, List[torch.Tensor]] = {}
         self._mamba_views: Dict[str, Tuple[List[torch.Tensor], torch.Tensor]] = {}
-
-        # Slot-0 dummy writes for both pools land in the reserved low-byte sink;
-        # each pool's first allocatable slot is chosen so real data starts past it.
-        # A page-aware sub-pool allocates whole pages, so the sink is all of page
-        # 0 (up to page_size * entry_bytes), not one slot entry -- reserve the
-        # max of both.
-        reserved_floor = _reserved_floor_bytes(self.sub_pool_specs, page_size)
 
         for spec in self.sub_pool_specs:
             entry_bytes = spec.entry_bytes()
@@ -447,8 +480,9 @@ class UnifiedKVPool:
                 raise TypeError(f"unsupported SubPoolSpec type: {type(spec)}")
 
         logger.info(
-            "[unified-memory-pool] UnifiedKVPool allocated: total_bytes=%.2f GB (=%d B), "
+            "[unified-memory-pool] UnifiedKVPool %s: total_bytes=%.2f GB (=%d B), "
             "%d sub-pool(s)",
+            "reserved VA upper bound" if post_capture_active else "allocated",
             total_bytes / GB,
             total_bytes,
             len(self.sub_pool_specs),
@@ -466,6 +500,67 @@ class UnifiedKVPool:
                 self._min_slot_index[s.name],
                 self._min_slot_index[s.name],
             )
+
+    def _initialize_raw(self, raw: torch.Tensor) -> None:
+        if envs.SGLANG_DEBUG_POISON_POOL.get():
+            # Debug: bf16-NaN-fill so NaN-unsafe reads of never-written bytes
+            # fail deterministically.
+            raw.view(torch.int16).fill_(0x7FC1)
+            logger.warning(
+                "[unified-memory-pool] POISONED: backed pool bytes filled with "
+                "bf16-NaN patterns (SGLANG_DEBUG_POISON_POOL)"
+            )
+        else:
+            raw.zero_()  # unset slots must read as zeros (matches non-shared)
+
+    def _max_slots_for_total_bytes(self, total_bytes: int) -> Dict[str, int]:
+        max_slots_by_name = {}
+        for spec in self.sub_pool_specs:
+            max_slots = total_bytes // spec.entry_bytes()
+            min_page_index = (
+                self._min_slot_index[spec.name] + self._page_size - 1
+            ) // self._page_size
+            if max_slots // self._page_size <= min_page_index:
+                raise ValueError(
+                    f"unified pool size {total_bytes} leaves no allocatable page "
+                    f"for sub-pool {spec.name!r} after its reserved slot-0 sink"
+                )
+            max_slots_by_name[spec.name] = max_slots
+        return max_slots_by_name
+
+    @property
+    def post_capture_backed_bytes(self) -> int:
+        if self._post_capture_owner is None:
+            return 0
+        return self._post_capture_owner.backed_bytes
+
+    @property
+    def active_allocation_bytes(self) -> int:
+        """Bytes that are safe to access/register in the shared raw tensor."""
+        return self._accessible_bytes
+
+    def finalize_backing(self, config) -> None:
+        """Back the final shared byte budget without changing any tensor address."""
+        if self._post_capture_owner is None:
+            raise RuntimeError("UnifiedKVPool post-capture backing is not active")
+        final_total_bytes = config.unified_memory_pool_bytes
+        if final_total_bytes is None:
+            raise ValueError(
+                "UnifiedKVPool post-capture sizing requires "
+                "config.unified_memory_pool_bytes"
+            )
+        final_total_bytes = int(final_total_bytes)
+        _check_bs1_feasibility_floor(
+            total_bytes=final_total_bytes,
+            floor_terms=self._bs1_floor_terms,
+            factory="UnifiedKVPool.finalize_backing",
+        )
+        final_max_slots = self._max_slots_for_total_bytes(final_total_bytes)
+        self._post_capture_owner.ensure_prefix(final_total_bytes)
+        self._initialize_raw(self._raw[:final_total_bytes])
+        self.total_bytes = final_total_bytes
+        self._accessible_bytes = final_total_bytes
+        self._max_slots = final_max_slots
 
     # -- introspection --
 
@@ -642,10 +737,13 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
         tgt_pages = tgt_loc.view(-1, ps)[:, 0] // ps
         src_pages = src_loc.view(-1, ps)[:, 0] // ps
         with record_function("UnifiedMHA.move_kv_cache"):
-            env = self._unified_buffer._raw[: self._num_pages * self._page_bytes].view(
-                self._num_pages, self._page_bytes
+            copy_pages(
+                self._unified_buffer._raw,
+                tgt_pages,
+                src_pages,
+                self._num_pages,
+                self._page_bytes,
             )
-            env[tgt_pages] = env[src_pages]
 
     def get_contiguous_buf_infos(self):
         """Register the raw buffer as physical page envelopes for PD transfer.
@@ -656,7 +754,11 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
         """
         assert self._unified_buffer.anchor_bytes(self._sub_pool_name) == 0
         raw = self._unified_buffer._raw
-        return [raw.data_ptr()], [raw.numel()], [self._page_bytes]
+        return (
+            [raw.data_ptr()],
+            [self._unified_buffer.active_allocation_bytes],
+            [self._page_bytes],
+        )
 
     def get_page_envelope_buffer(self) -> torch.Tensor:
         """Return this sub-pool's page-strided view of the shared allocation."""
@@ -767,10 +869,13 @@ class UnifiedMLATokenToKVPool(MLATokenToKVPool):
         tgt_pages = tgt_loc.view(-1, ps)[:, 0] // ps
         src_pages = src_loc.view(-1, ps)[:, 0] // ps
         with record_function("UnifiedMLA.move_kv_cache"):
-            env = self._unified_buffer._raw[: self._num_pages * self._page_bytes].view(
-                self._num_pages, self._page_bytes
+            copy_pages(
+                self._unified_buffer._raw,
+                tgt_pages,
+                src_pages,
+                self._num_pages,
+                self._page_bytes,
             )
-            env[tgt_pages] = env[src_pages]
 
     def zero_physical_pages(self, phys_pages: torch.Tensor) -> None:
         """Zero whole page envelopes (PHYSICAL page ids) on allocator
@@ -1043,6 +1148,7 @@ class UnifiedHybridReqToTokenPool(HybridReqToTokenPool):
         cache_params,
         mamba_layer_ids: List[int],
         enable_mamba_extra_buffer: bool,
+        enable_mamba_extra_buffer_lazy: bool,
         speculative_num_draft_tokens: Optional[int] = None,
         enable_overlap_schedule: bool = True,
         start_layer: Optional[int] = None,
@@ -1066,6 +1172,7 @@ class UnifiedHybridReqToTokenPool(HybridReqToTokenPool):
             cache_params=cache_params,
             mamba_layer_ids=mamba_layer_ids,
             enable_mamba_extra_buffer=enable_mamba_extra_buffer,
+            enable_mamba_extra_buffer_lazy=enable_mamba_extra_buffer_lazy,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
             enable_overlap_schedule=enable_overlap_schedule,
             start_layer=start_layer,
@@ -1262,6 +1369,7 @@ def init_unified_mamba_pools(
     max_num_reqs: int,
     enable_memory_saver: bool,
     enable_mamba_extra_buffer: bool,
+    enable_mamba_extra_buffer_lazy: bool,
     speculative_num_draft_tokens: Optional[int],
     disable_overlap_schedule: bool,
     need_sort: bool,
@@ -1361,6 +1469,7 @@ def init_unified_mamba_pools(
         cache_params=mamba2_cache_params,
         mamba_layer_ids=mamba_layer_ids,
         enable_mamba_extra_buffer=enable_mamba_extra_buffer,
+        enable_mamba_extra_buffer_lazy=enable_mamba_extra_buffer_lazy,
         speculative_num_draft_tokens=speculative_num_draft_tokens,
         enable_overlap_schedule=not disable_overlap_schedule,
         start_layer=start_layer,
@@ -1610,6 +1719,17 @@ class UnifiedSWAKVPool(SWAKVPool):
     def get_kv_size_bytes(self):
         return 0, 0  # UnifiedKVPool logs the total; per-side would double-count
 
+    @property
+    def post_capture_active(self) -> bool:
+        return self.unified_buffer.post_capture_active
+
+    @property
+    def post_capture_backed_bytes(self) -> int:
+        return self.unified_buffer.post_capture_backed_bytes
+
+    def finalize_backing(self, config) -> None:
+        self.unified_buffer.finalize_backing(config)
+
     def get_contiguous_buf_infos(self):
         return self.full_kv_pool.get_contiguous_buf_infos()
 
@@ -1770,6 +1890,7 @@ def init_unified_swa_pools(
     swa_max_total_num_tokens: Optional[int] = None,
     total_bytes: Optional[int] = None,
     enable_memory_saver: bool,
+    post_capture_active: bool = False,
     need_sort: bool,
     forward_stream: Optional[torch.cuda.Stream] = None,
     lazy_compaction: bool = False,
@@ -1827,6 +1948,7 @@ def init_unified_swa_pools(
             "full_max_total_num_tokens": full_max_total_num_tokens,
             "swa_max_total_num_tokens": swa_max_total_num_tokens,
         }
+    bs1_floor_terms = []
     if model_context_len is not None:
         # bs=1 floor: ONE sliding window of swa KV (+ a page of slack for the
         # page-granular walk) + the slot-0 sink. The full side is not charged
@@ -1837,12 +1959,13 @@ def init_unified_swa_pools(
             if sliding_window_size is not None
             else model_context_len
         )
+        bs1_floor_terms = [
+            ("swa_window_kv", swa_bs1_tokens * swa_spec.entry_bytes()),
+            ("sink", _reserved_floor_bytes([full_spec, swa_spec], page_size)),
+        ]
         _check_bs1_feasibility_floor(
             total_bytes=total_bytes,
-            floor_terms=[
-                ("swa_window_kv", swa_bs1_tokens * swa_spec.entry_bytes()),
-                ("sink", _reserved_floor_bytes([full_spec, swa_spec], page_size)),
-            ],
+            floor_terms=bs1_floor_terms,
             factory="init_unified_swa_pools",
         )
     if total_bytes <= 0:
@@ -1853,6 +1976,8 @@ def init_unified_swa_pools(
         device=device,
         enable_memory_saver=enable_memory_saver,
         page_size=page_size,
+        post_capture_active=post_capture_active,
+        bs1_floor_terms=bs1_floor_terms,
     )
     token_to_kv_pool = UnifiedSWAKVPool(
         unified_buffer=shared_pool,
@@ -1941,6 +2066,7 @@ def init_unified_mamba_swa_pools(
     max_num_reqs: int,
     enable_memory_saver: bool,
     enable_mamba_extra_buffer: bool,
+    enable_mamba_extra_buffer_lazy: bool,
     disable_overlap_schedule: bool,
     need_sort: bool,
     speculative_num_draft_tokens: Optional[int] = None,
@@ -2073,6 +2199,7 @@ def init_unified_mamba_swa_pools(
         cache_params=mamba2_cache_params,
         mamba_layer_ids=mamba_layer_ids,
         enable_mamba_extra_buffer=enable_mamba_extra_buffer,
+        enable_mamba_extra_buffer_lazy=enable_mamba_extra_buffer_lazy,
         speculative_num_draft_tokens=speculative_num_draft_tokens,
         enable_overlap_schedule=not disable_overlap_schedule,
         start_layer=start_layer,

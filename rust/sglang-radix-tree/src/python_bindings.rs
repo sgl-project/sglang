@@ -847,6 +847,7 @@ fn tracker_to_py(tracker: HashMap<ComponentType, usize>) -> HashMap<u8, usize> {
 #[pyclass(get_all)]
 pub struct EvictDeviceNextNodeResultBinding {
     node_id: Option<NodeId>,
+    backup_kv: Option<Py<PyAny>>,
     mamba_backup_node_id: Option<NodeId>,
     swa_backup_node_id: Option<NodeId>,
     swa_backup_num_tokens: usize,
@@ -1430,11 +1431,16 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         let (node_id, result) =
             py.allow_threads(move || self.core().evict_device_next_node(ct, &baseline));
         let made_progress = node_id.is_some()
+            || result.backup_kv.is_some()
             || result.mamba_backup_node_id.is_some()
             || result.swa_backup_node_id.is_some()
             || !result.tracker.is_empty();
         Ok(EvictDeviceNextNodeResultBinding {
             node_id,
+            backup_kv: result
+                .backup_kv
+                .map(|backup| cache_action_to_py(py, CacheAction::BackupKV(backup)))
+                .transpose()?,
             mamba_backup_node_id: result.mamba_backup_node_id,
             swa_backup_node_id: result.swa_backup_node_id,
             swa_backup_num_tokens: result.swa_backup_num_tokens,
@@ -1473,6 +1479,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
     ) -> PyResult<EvictDeviceNextNodeResultBinding> {
         Ok(EvictDeviceNextNodeResultBinding {
             node_id: None,
+            backup_kv: None,
             mamba_backup_node_id: None,
             swa_backup_node_id: None,
             swa_backup_num_tokens: 0,
@@ -1640,6 +1647,11 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
     /// Whether the host tier (HiCache) is wired.
     fn enable_hicache(&self, py: Python<'_>) -> bool {
         py.allow_threads(|| self.core().enable_hicache)
+    }
+
+    /// Preserve dirty SWA data before cache-mode write-back eviction.
+    fn enable_swa_write_back_eviction_barrier(&self, py: Python<'_>) {
+        py.allow_threads(|| self.core().enable_swa_write_back_eviction_barrier());
     }
 
     /// Mark the SWA host pool as wired (HiCache).
@@ -2039,6 +2051,10 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         Ok(())
     }
 
+    fn is_write_through_compatible(&self, py: Python<'_>) -> bool {
+        py.allow_threads(|| self.core().is_write_through_compatible())
+    }
+
     /// Set the write-back (vs write-through) policy; decided at HiCache init.
     fn set_is_write_back(&self, py: Python<'_>, is_write_back: bool) {
         py.allow_threads(|| self.core().is_write_back = is_write_back);
@@ -2316,6 +2332,20 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         py.allow_threads(|| {
             self.core()
                 .inspect_get_component_device_lock_ref(node_id, component_type)
+        })
+        .map_err(node_access_error)
+    }
+
+    fn inspect_get_component_host_lock_ref(
+        &self,
+        py: Python<'_>,
+        node_id: NodeId,
+        component_type: u8,
+    ) -> PyResult<u32> {
+        let component_type = parse_component_type(component_type)?;
+        py.allow_threads(|| {
+            self.core()
+                .inspect_get_component_host_lock_ref(node_id, component_type)
         })
         .map_err(node_access_error)
     }
@@ -3037,6 +3067,11 @@ macro_rules! tree_core_binding {
                 catch_native_panic(|| Ok(self.inner.enable_hicache(py)))
             }
 
+            /// Preserve dirty SWA data before cache-mode write-back eviction.
+            fn enable_swa_write_back_eviction_barrier(&self, py: Python<'_>) {
+                self.inner.enable_swa_write_back_eviction_barrier(py)
+            }
+
             /// Mark the SWA host pool as wired (HiCache).
             fn set_has_swa_host_pool(&self, py: Python<'_>) -> PyResult<()> {
                 catch_native_panic(|| {
@@ -3315,6 +3350,10 @@ macro_rules! tree_core_binding {
                 catch_native_panic(|| self.inner.dec_host_lock_ref(py, node_id, params))
             }
 
+            fn is_write_through_compatible(&self, py: Python<'_>) -> bool {
+                self.inner.is_write_through_compatible(py)
+            }
+
             /// Set the write-back (vs write-through) policy; decided at HiCache init.
             fn set_is_write_back(&self, py: Python<'_>, is_write_back: bool) -> PyResult<()> {
                 catch_native_panic(|| {
@@ -3538,6 +3577,19 @@ macro_rules! tree_core_binding {
                 catch_native_panic(|| {
                     self.inner
                         .inspect_get_component_device_lock_ref(py, node_id, component_type)
+                })
+            }
+
+            #[cfg(feature = "inspection")]
+            fn inspect_get_component_host_lock_ref(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+                component_type: u8,
+            ) -> PyResult<u32> {
+                catch_native_panic(|| {
+                    self.inner
+                        .inspect_get_component_host_lock_ref(py, node_id, component_type)
                 })
             }
 

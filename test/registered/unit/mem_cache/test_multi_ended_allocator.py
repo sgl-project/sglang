@@ -513,6 +513,39 @@ class TestMultiEndedAllocator(unittest.TestCase):
         self.assertEqual(int(full_alloc.virtual_to_physical[0].item()), 0)
         self.assertTrue(torch.equal(full_alloc.translate_kv_loc(zeros), zeros))
 
+    def test_set_capacity_keeps_tables_and_shrinks_the_active_range(self):
+        """Post-capture sizing shrinks a captured allocator in place: the
+        v2p/p2v tables the graphs captured keep their storage, and every
+        capacity-derived range follows the new slot count on both ends."""
+        pool, full_alloc, mamba_alloc, full_kv, mamba_kv = self._build_pair()
+        for alloc, kv in ((full_alloc, full_kv), (mamba_alloc, mamba_kv)):
+            with self.subTest(sub_pool=alloc.sub_pool_name):
+                v2p, p2v = alloc.virtual_to_physical, alloc.physical_to_virtual
+                new_slots = pool.max_slots(alloc.sub_pool_name) // 2
+                alloc._set_capacity(new_slots)
+                self.assertIs(alloc.virtual_to_physical, v2p)
+                self.assertIs(alloc.physical_to_virtual, p2v)
+                self.assertEqual(alloc.max_slots, new_slots)
+                self.assertEqual(alloc.num_pages, new_slots)
+                self.assertEqual(alloc.num_virtual_ids, new_slots)
+                self.assertEqual(
+                    alloc.free_virtual_ids.tolist(),
+                    list(range(alloc.min_page_index, new_slots)),
+                )
+        # Each side still fills its whole range, and only inside the new bounds.
+        for alloc, kv in ((full_alloc, full_kv), (mamba_alloc, mamba_kv)):
+            with self.subTest(sub_pool=alloc.sub_pool_name):
+                n = alloc.available_size()
+                self.assertGreater(n, 0)
+                v = self._alloc(alloc, kv, n)
+                p = alloc.virtual_to_physical[v]
+                self.assertGreaterEqual(int(p.min()), alloc.min_slot_index)
+                self.assertLess(int(p.max()), alloc.max_slots)
+                self.assertIsNone(alloc.alloc(1))
+                self._check_invariants(alloc, kv)
+                self._free(alloc, kv, v)
+                self._check_invariants(alloc, kv)
+
 
 # ---------------------------------------------------------------------------
 # Shared SWA composite -- unit tests

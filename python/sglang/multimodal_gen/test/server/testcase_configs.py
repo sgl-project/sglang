@@ -49,6 +49,7 @@ class ToleranceConfig:
     load_peak_vram: float = 0.01
     runtime_peak_vram: float = 0.02
     host_anon: float = 0.02
+    load: float | None = None
 
     @classmethod
     def load_profile(cls, all_tolerances: dict, profile_name: str) -> ToleranceConfig:
@@ -102,6 +103,7 @@ class ToleranceConfig:
                 )
             ),
             host_anon=float(tol_data.get("host_anon", 0.02)),
+            load=float(tol_data["load"]) if "load" in tol_data else None,
         )
 
 

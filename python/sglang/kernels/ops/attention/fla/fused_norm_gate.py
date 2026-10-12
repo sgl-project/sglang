@@ -7,7 +7,7 @@ import torch.nn as nn
 import triton
 import triton.language as tl
 
-from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.kernels.jit.utils import get_jit_cuda_arch, is_arch_support_pdl
 from sglang.srt.utils import (
     cdiv,
     cpu_has_amx_support,
@@ -223,10 +223,16 @@ def layer_norm_gated_fwd(
     # heuristics for number of warps
 
     if D <= 512:
+        use_pdl = is_arch_support_pdl()
         BT = 32
-        pdl_kwargs = (
-            {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
-        )
+        use_bt8 = 8 <= T <= 256 if is_rms_norm and activation == "sigmoid" else T == 64
+        if use_pdl and use_bt8 and (D, x.dtype) == (128, torch.bfloat16):
+            arch = get_jit_cuda_arch()
+            if (arch.major, arch.minor) == (10, 3):
+                # Small sigmoid-gated RMSNorm batches use eight rows per CTA.
+                # Other norm modes retain their T=64 selection.
+                BT = 8
+        pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if use_pdl else {}
         layer_norm_gated_fwd_kernel[(cdiv(T, BT),)](
             x=x,
             g=g,

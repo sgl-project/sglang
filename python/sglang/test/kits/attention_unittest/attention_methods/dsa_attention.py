@@ -1205,6 +1205,13 @@ def dsa_impl_capability(impl: str) -> tuple[bool, str]:
             return False, f"aiter unavailable: {exc}"
         return True, ""
 
+    if impl == "triton_sparse_mla":
+        if is_hip():
+            return False, "triton_sparse_mla is a CUDA-only prefill backend"
+        if major < 9:
+            return False, f"{impl} requires SM>=9.0, got SM{major}.x"
+        return True, ""
+
     if impl == "flashmla_auto":
         # `flashmla_auto` resolves to flashmla_sparse / flashmla_kv at
         # forward time depending on `dsa_kv_cache_store_fp8`; both leaf
@@ -1223,6 +1230,7 @@ DSA_PREFILL_IMPL_VARIANTS: tuple[str, ...] = (
     "tilelang",
     "trtllm",
     "aiter",
+    "triton_sparse_mla",
 )
 DSA_DECODE_IMPL_VARIANTS: tuple[str, ...] = (
     "flashmla_sparse",
@@ -1239,7 +1247,7 @@ DSA_DECODE_IMPL_VARIANTS: tuple[str, ...] = (
 # take in FP8 deployments. AITER decode, the `flashmla_kv` decode kernel,
 # and both flashmla prefill kernels are the production-relevant FP8 paths.
 DSA_FP8_COMPATIBLE_PREFILL_IMPLS: frozenset[str] = frozenset(
-    {"flashmla_sparse", "flashmla_kv", "flashmla_auto"}
+    {"aiter", "flashmla_sparse", "flashmla_kv", "flashmla_auto", "triton_sparse_mla"}
 )
 DSA_FP8_COMPATIBLE_DECODE_IMPLS: frozenset[str] = frozenset(
     {"aiter", "flashmla_kv", "flashmla_auto"}
@@ -1386,8 +1394,8 @@ def run_dsa_sparse_fp8_prefill_case(
     if dsa_prefill_backend not in DSA_FP8_COMPATIBLE_PREFILL_IMPLS:
         testcase.skipTest(
             f"DSA prefill impl `{dsa_prefill_backend}` does not support FP8 KV "
-            f"cache (only `flashmla_sparse`, `flashmla_kv`, and `flashmla_auto` "
-            f"read FP8 K directly; others require BF16 K)."
+            f"cache (only `aiter`, `flashmla_sparse`, `flashmla_kv`, and "
+            f"`flashmla_auto` read FP8 K directly; others require BF16 K)."
         )
     if not case.forward_mode.is_extend_without_speculative():
         raise ValueError("run_dsa_sparse_fp8_prefill_case expects an EXTEND case.")

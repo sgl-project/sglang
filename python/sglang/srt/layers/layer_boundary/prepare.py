@@ -24,6 +24,9 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.layers.cp.interleave import (
+    attn_cp_interleave_gather,
+)
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather_into_tensor,
     dp_scatter,
@@ -37,13 +40,9 @@ from sglang.srt.layers.layer_boundary.adapters.attention import (
     get_attn_tp_context,
     tp_gather,
 )
-from sglang.srt.layers.layer_boundary.adapters.context_parallel import (
-    attn_cp_gather,
-)
 from sglang.srt.layers.layer_boundary.layout import (
     SumGroup,
     _cp_shard_token_rows,
-    moe_cp_gathered_rows,
 )
 from sglang.srt.layers.layer_boundary.output import (
     DeferredFinalize,
@@ -86,10 +85,13 @@ def _reduce_update_read(
     group: SumGroup = SumGroup.ATTN_TP,
     read: ResidualReadout = NORM_READOUT,
     update: ResidualUpdate = PLAIN_ADD,
+    quant_format: str = "",
+    post_residual_addition: Optional[torch.Tensor] = None,
 ):
     """Complete the sum the input owes over ``group`` on the rows it is on,
     unless one of ``fusions`` does it with the residual add and the norm, then
-    write it into the residual and read the input."""
+    write it into the residual and read the input (an attention's read takes
+    ``quant_format`` and ``post_residual_addition``)."""
     if gathers_residual:
         residual = update.gather_residual_attn_tp(residual)
     for fused in fusions:
@@ -105,7 +107,14 @@ def _reduce_update_read(
         hidden_states = tensor_model_parallel_all_reduce(hidden_states)
     if _is_npu and cache is not None:
         _ = prepare_weight_cache(hidden_states, cache)
-    return read.update_and_read(update, hidden_states, residual, norm)
+    return read.update_and_read(
+        update,
+        hidden_states,
+        residual,
+        norm,
+        quant_format=quant_format,
+        post_residual_addition=post_residual_addition,
+    )
 
 
 def _reduce_update_read_dp_gather(
@@ -415,7 +424,7 @@ def _then_attn_cp_gather(
     hidden_states, residual = gather(
         hidden_states, residual, forward_batch, norm, update=update, cache=cache
     )
-    return attn_cp_gather(hidden_states), residual
+    return attn_cp_interleave_gather(hidden_states), residual
 
 
 def _then_moe_cp_gather(
@@ -428,25 +437,20 @@ def _then_moe_cp_gather(
     gather: Callable,
     update: ResidualUpdate = PLAIN_ADD,
 ):
-    """Gather for the FFN, then over the MoE-CP group so each rank holds all
-    tokens of its MoE group (moe_dp_size < attn_cp_size). The residual stays on
-    this rank's attention rows."""
-    # Early return on empty tensor is safe for MOE_CP because:
-    # - During CP extend: zigzag split guarantees all CP ranks have non-zero tokens,
-    #   so no rank hits this path while others proceed to the allgather.
-    # - During decode: moe_cp allgather is skipped (guarded by is_context_parallel_extend).
-    # - CUDA graph warmup: not applicable when --cuda-graph-backend-prefill=disabled is used.
-    if hidden_states.shape[0] == 0:
-        return hidden_states, residual
+    """Read each shard, then gather the MoE group's tokens on its CP path.
 
+    StagePlan selects this path only for a CP extend with MoE-CP rows; zigzag
+    eligibility guarantees nonempty shards. Decode and non-CP batches use the
+    ordinary path. The residual stays on this rank's attention rows.
+    """
     hidden_states, residual = gather(
         hidden_states, residual, forward_batch, norm, update=update, cache=cache
     )
-
-    rows = moe_cp_gathered_rows(forward_batch)
-    if rows is not None and hidden_states.shape[0] > 0:
-        hidden_states = moe_cp_gather(hidden_states, rows, get_moe_cp_size())
-
+    hidden_states = moe_cp_gather(
+        hidden_states,
+        forward_batch.attn_cp_metadata.per_rank_actual_token,
+        get_moe_cp_size(),
+    )
     return hidden_states, residual
 
 

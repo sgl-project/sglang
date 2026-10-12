@@ -15,7 +15,7 @@ use crate::server::metrics::{escape_label, WorkerSnapshot};
 use crate::state::kv_events::bootstrap::{
     BootstrapTracker, PeerRegistry, RankOutcome, SnapshotOutcome, SweepOutcome,
 };
-use crate::state::kv_events::{KvIndexMetrics, Tiers, ACCOUNTING_REASONS};
+use crate::state::kv_events::{KvIndexMetrics, ReplayOutcome, Tiers, ACCOUNTING_REASONS};
 use axum::extract::State;
 use axum::http::header::CONTENT_TYPE;
 use axum::http::StatusCode;
@@ -295,6 +295,25 @@ fn render_kv_tiers(kv: &KvIndexMetrics, block_size: u32) -> String {
     out.push_str(&format!(
         "sgl_router_kv_event_batches_lost_total {}\n",
         kv.tally.batches_lost(),
+    ));
+    out.push_str(
+        "# HELP sgl_router_kv_event_replays_total Sequence gaps a subscriber asked the engine's replay socket to fill, by outcome. Batches an incomplete or failed replay could not recover still count in sgl_router_kv_event_batches_lost_total.\n",
+    );
+    out.push_str("# TYPE sgl_router_kv_event_replays_total counter\n");
+    for outcome in ReplayOutcome::ALL {
+        out.push_str(&format!(
+            "sgl_router_kv_event_replays_total{{outcome=\"{}\"}} {}\n",
+            outcome.label(),
+            kv.tally.replays(outcome),
+        ));
+    }
+    out.push_str(
+        "# HELP sgl_router_cache_pending_prefix_hits_total Prefix lookups where a prompt routed within --cache-pending-prefix-ttl-ms matched deeper than any KV-event-confirmed prefix.\n",
+    );
+    out.push_str("# TYPE sgl_router_cache_pending_prefix_hits_total counter\n");
+    out.push_str(&format!(
+        "sgl_router_cache_pending_prefix_hits_total {}\n",
+        kv.tree.pending().hits(),
     ));
 
     out.push_str(

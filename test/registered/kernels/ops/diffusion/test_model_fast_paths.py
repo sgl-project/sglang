@@ -41,9 +41,6 @@ import sglang.multimodal_gen.runtime.models.dits.qwen_image21 as qwen_image21
 import sglang.multimodal_gen.runtime.models.dits.sana as sana
 from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
-    can_use_fused_layernorm_modulate,
-    can_use_fused_qk_head_layernorm,
-    can_use_fused_rmsnorm_scale_shift,
     fused_ltx2_rms_norm_modulate,
     hunyuan_qkv_rope_pack,
     mark_fused_ln_modulate_site,
@@ -244,21 +241,6 @@ def test_packed_sdpa_preserves_training_dropout_and_missing_api_fallbacks():
     ):
         attention.forward_varlen(q, k, v, **kwargs)
     assert forward.call_count == 2
-
-
-def test_bitexact_norm_guards_follow_platform():
-    # Runs on both lanes, with shapes inside every guard's contract so only the
-    # platform decides: engaged on CUDA, rejected on ROCm.  A fatal LLVM error
-    # there kills the process, so the sites' own try/except cannot be what
-    # catches it -- the guards have to.
-    x = torch.randn(1, 256, 4096, device="cuda", dtype=torch.bfloat16)
-    row = torch.randn(1, 4096, device="cuda", dtype=torch.bfloat16)
-    vec = torch.randn(1, 1, 4096, device="cuda", dtype=torch.bfloat16)
-    weight = torch.randn(4096, device="cuda", dtype=torch.bfloat16)
-    q = torch.randn(1, 256, 32, 128, device="cuda", dtype=torch.bfloat16)
-    assert can_use_fused_layernorm_modulate(x, row, row) is is_cuda()
-    assert can_use_fused_qk_head_layernorm(q, q) is is_cuda()
-    assert can_use_fused_rmsnorm_scale_shift(x, weight, vec, vec) is is_cuda()
 
 
 # -------------------------------------------------------------------------
@@ -1657,6 +1639,47 @@ def test_qwen21_cuda_qk_rope_does_not_verify_during_capture(monkeypatch):
     x.normal_()
     graph.replay()
     assert torch.equal(out, qwen_image21.apply_rope(norm(x), rope))
+
+
+@pytest.mark.skipif(torch.version.hip is not None, reason="NVIDIA CUDA required")
+def test_anima_rope_dispatch_and_fallback():
+    import sglang.kernels.ops.diffusion as ops
+    import sglang.multimodal_gen.runtime.models.dits.anima as anima
+
+    generator = torch.Generator(device="cuda").manual_seed(42)
+    q, k = [
+        torch.randn(
+            2, 17, 3, 128, device="cuda", dtype=torch.bfloat16, generator=generator
+        )
+        for _ in range(2)
+    ]
+    angles = torch.randn(17, 128, device="cuda", generator=generator)
+    cos, sin = angles.cos(), angles.sin()
+    args = q, k, cos, sin
+    expected = anima._anima_rope_eager(*args)
+    expected_fp32 = anima._anima_rope_eager(q.float(), k.float(), cos, sin)
+    gate = BitExactFusionGate("Anima test", per_signature=True)
+    with (
+        patch.object(anima, "_ANIMA_ROPE", gate),
+        patch.object(
+            ops, "fused_rope_rotate_half_fp32", wraps=ops.fused_rope_rotate_half_fp32
+        ) as fused,
+        patch.object(
+            anima, "_anima_rope_eager", wraps=anima._anima_rope_eager
+        ) as eager,
+    ):
+        for _ in range(2):
+            outputs = anima._anima_rope(*args)
+            assert all(torch.equal(out, ref) for out, ref in zip(outputs, expected))
+        assert fused.call_count == 2
+        assert eager.call_count == 1  # Only the first call verifies against eager.
+        assert gate.is_verified((q.device, q.dtype, q.shape)) and not gate.disabled
+
+        fused.reset_mock()
+        outputs = anima._anima_rope(q.float(), k.float(), cos, sin)
+        fused.assert_not_called()
+        assert eager.call_count == 2
+        assert all(torch.equal(out, ref) for out, ref in zip(outputs, expected_fp32))
 
 
 if __name__ == "__main__":

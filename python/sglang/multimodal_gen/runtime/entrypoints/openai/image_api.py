@@ -45,6 +45,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     process_generation_batch,
     request_extra_value,
     resolve_sampling_params_cls,
+    sanitize_upload_filename,
     save_image_to_path,
     temp_dir_if_disabled,
 )
@@ -470,10 +471,12 @@ async def edits(
         try:
             for idx, img in enumerate(image_list):
                 filename = img.filename if hasattr(img, "filename") else f"image_{idx}"
+                safe_name = sanitize_upload_filename(filename, f"image_{idx}")
                 input_path = await save_image_to_path(
                     img,
-                    os.path.join(uploads_dir, f"{request_id}_{idx}_{filename}"),
+                    os.path.join(uploads_dir, f"{request_id}_{idx}_{safe_name}"),
                     prefer_remote_source=server_args.input_save_path is None,
+                    uploads_root=uploads_dir,
                 )
                 input_paths.append(input_path)
         except Exception as e:

@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
-from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import MHATokenToKOnlyPool, MHATokenToKVPool
 from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4PagedHostPool,
     LogicalHostPool,
@@ -20,7 +20,10 @@ from sglang.srt.mem_cache.pool_host.dsa import (
     make_dsa_indexer_pool_decl,
 )
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
-from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+from sglang.srt.mem_cache.pool_host.mha import (
+    MHATokenToKOnlyPoolHost,
+    MHATokenToKVPoolHost,
+)
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -53,6 +56,40 @@ class TestHostKVCache(CustomTestCase):
             device="cpu",
             allocator_type="default",
         )
+
+    def test_index_k_host_pool_joins_a_host_pool_group(self):
+        """Grouping a main KV pool with a K-only index pool raised AttributeError."""
+        index_pool = MHATokenToKOnlyPool(
+            size=self.page_size * 2,
+            page_size=self.page_size,
+            dtype=torch.float16,
+            head_num=1,
+            head_dim=4,
+            layer_num=2,
+            device="cpu",
+            enable_memory_saver=False,
+        )
+        index_host = MHATokenToKOnlyPoolHost(
+            index_pool, self.host_pool, "layer_first", pin_memory=False
+        )
+        group = HostPoolGroup(
+            [
+                PoolEntry(
+                    name=PoolName.KV,
+                    host_pool=self.host_pool,
+                    device_pool=self.device_pool,
+                    layer_mapper=lambda layer_id: layer_id,
+                    is_primary_index_anchor=True,
+                ),
+                PoolEntry(
+                    name=PoolName.INDEXER,
+                    host_pool=index_host,
+                    device_pool=index_pool,
+                    layer_mapper=lambda layer_id: layer_id,
+                ),
+            ]
+        )
+        self.assertFalse(group.can_use_write_back_jit)
 
     def test_multiple_attention_rows_per_token(self):
         for rows_per_token in (1, 3):
@@ -446,6 +483,8 @@ class TestDSAIndexerPoolDecl(CustomTestCase):
             qk_rope_head_dim=64,
             index_head_dim=128,
             quant_block_size=128,
+            page_size=64,
+            slots_per_page=64,
             skip_topk_layers=[False] * 5,
         )
 

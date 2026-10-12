@@ -71,7 +71,7 @@ def try_fused_scaled_residual_add_exact(
     return output
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["seq_len", "stride_i_b"])
 def _fused_layernorm_scale_shift_gate_select01_kernel(
     output_ptr,
     gate_out_ptr,
@@ -165,7 +165,7 @@ def _fused_layernorm_scale_shift_gate_select01_kernel(
     tl.store(gate_row_ptr + cols, gate, mask=mask)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["seq_len", "stride_i_b"])
 def _fused_residual_layernorm_scale_shift_gate_select01_kernel(
     output_ptr,
     residual_out_ptr,
@@ -273,7 +273,7 @@ def _fused_residual_layernorm_scale_shift_gate_select01_kernel(
     tl.store(gate_row_ptr + cols, gate, mask=mask)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["seq_len", "num_frames", "frame_seqlen"])
 def _fused_scale_shift_4d_kernel(
     output_ptr,
     normalized_ptr,
@@ -322,7 +322,7 @@ def _fused_scale_shift_4d_kernel(
     tl.store(out_ptrs, output, mask=mask)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["B", "L"])
 def fuse_scale_shift_kernel_blc_opt(
     x_ptr,
     shift_ptr,

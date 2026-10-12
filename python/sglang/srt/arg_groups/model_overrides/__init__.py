@@ -12,6 +12,7 @@ from sglang.srt.arg_groups.model_overrides import bailing_moe_v3  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import cohere2_moe  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import deepseek_v2  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import deepseek_v4  # noqa: F401
+from sglang.srt.arg_groups.model_overrides import ernie45_vl  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import exaone  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import falcon_h1  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import gemma2_gemma3  # noqa: F401

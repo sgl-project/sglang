@@ -45,6 +45,30 @@ Current supported optimization options are listed in the [SGLang diffusion suppo
 - `--ring-degree {RING_DEGREE}`: Degree of ring attention-style SP in USP.
 - `--text-encoder-cpu-offload`, `--dit-cpu-offload`, `--vae-cpu-offload`: Use CPU offload to reduce peak GPU memory when needed.
 
+### 3.3 24 GB NVIDIA GPUs
+
+The 14B DiTs do not fit on a 24 GB card in BF16 (the I2V-14B one is 30.5 GiB), so their weights have to stream from host memory layer by layer. On CUDA, `--performance-mode memory` streams the DiT, text encoder, image encoder and VAE:
+
+```bash
+# 1 GPU
+sglang serve --model-path Wan-AI/Wan2.1-I2V-14B-480P-Diffusers --performance-mode memory
+
+# 8 GPUs: CFG parallel x Ulysses 4
+sglang serve --model-path Wan-AI/Wan2.1-I2V-14B-480P-Diffusers --num-gpus 8 \
+  --enable-cfg-parallel --ulysses-degree 4 --performance-mode memory
+```
+
+Each GPU's worker keeps its own copy of the streamed weights in host memory, about 60 GiB, so 8 GPUs need close to 500 GiB of RAM.
+
+Measured with SGLang main `c7be3e9` (2026-09-29) on RTX 4090 24 GB (PCIe, no P2P between GPUs), for Wan2.1-I2V-14B-480P image-to-video at 480x832, 81 frames, 40 steps, BF16:
+
+| GPUs | Time per video | Time per step | Peak GPU memory | Host memory |
+|---|---:|---:|---:|---:|
+| 1 | 840 s | 20.7 s | 12.5 GiB | 59 GiB |
+| 8 | 198 s | 4.8 s | 11.9 GiB | 483 GiB |
+
+Component CPU offload (`--dit-cpu-offload`) does not help here: it moves the whole DiT onto the GPU around each use.
+
 ## 4. Model Invocation
 
 ### 4.1 Basic Usage
@@ -121,7 +145,7 @@ SGLANG_CACHE_DIT_ENABLED=true sglang serve --model-path Wan-AI/Wan2.1-T2V-14B-Di
 
 #### 4.2.2 GPU Optimization
 
-- `--dit-cpu-offload`: Use CPU offload for DiT inference. Enable if you run out of memory with FSDP.
+- `--dit-cpu-offload`: Keep DiT weights on the CPU and move them onto the GPU whole around each use. This takes the DiT out of FSDP, which shards only resident components.
 - `--text-encoder-cpu-offload`: Use CPU offload for text encoder inference.
 - `--image-encoder-cpu-offload`: Use CPU offload for image encoder inference.
 - `--vae-cpu-offload`: Use CPU offload for VAE.

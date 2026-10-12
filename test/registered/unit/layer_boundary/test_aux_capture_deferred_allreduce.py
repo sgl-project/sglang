@@ -98,8 +98,8 @@ class DeferringLayer(nn.Module):
         self.layer_communicator.paths[BatchVariant.INPUT_SCATTERED] = None
         self.layer_communicator.paths[BatchVariant.CONTEXT_PARALLEL] = None
         self.layer_communicator.output.ffn_reduction_group = lambda forward_batch: GROUP
-        self.layer_communicator.output._skips_sum_for_reduce_scatter = (
-            lambda batch, dp_step: False
+        self.layer_communicator.output._sum_in_reduce_scatter = lambda batch, dp_step: (
+            False
         )
         self.layer_communicator.output._complete_now = lambda hidden, residual, **_: (
             all_reduce(hidden),

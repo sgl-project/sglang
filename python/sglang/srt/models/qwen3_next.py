@@ -23,9 +23,9 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layer_boundary import (
+    append_stages,
     declare_attn,
     declare_ffn,
-    make_stages,
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import GemmaRMSNorm
@@ -479,15 +479,14 @@ def _apply_qwen3_next_mlp(
 ) -> torch.Tensor:
     hidden_states = layer.attn_boundary.finish(hidden_states, forward_batch)
     hidden_states = layer.ffn_boundary.prepare(hidden_states, forward_batch)
-    with layer.ffn_boundary.exit(forward_batch) as ffn_exit:
-        if isinstance(layer.mlp, Qwen2MoeSparseMoeBlock):
-            hidden_states = layer.mlp(
-                hidden_states,
-                forward_batch=forward_batch,
-            )
-        else:
-            hidden_states = layer.mlp(hidden_states)
-    hidden_states = ffn_exit.finish(hidden_states)
+    if isinstance(layer.mlp, Qwen2MoeSparseMoeBlock):
+        hidden_states = layer.mlp(
+            hidden_states,
+            forward_batch=forward_batch,
+        )
+    else:
+        hidden_states = layer.mlp(hidden_states)
+    hidden_states = layer.ffn_boundary.finish(hidden_states, forward_batch)
 
     return hidden_states
 
@@ -510,7 +509,6 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
 
         # Qwen3Next all layers are sparse and have no nextn now
         self.is_layer_sparse = True
-        is_previous_layer_sparse = True
         is_next_layer_sparse = True
         self.layer_id = layer_id
 
@@ -524,6 +522,7 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
                 is_nextn=is_nextn,
                 support_shared_expert_fusion=True,
                 enable_cuda_shared_expert_fusion=True,
+                reduce_results=False,
             )
         else:
             self.mlp = Qwen2MoeMLP(
@@ -532,12 +531,13 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix.replace(".linear_attn", "")),
+                reduce_results=False,
             )
         self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = GemmaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.attn_boundary, self.ffn_boundary = make_stages(
+        self.attn_boundary, self.ffn_boundary = append_stages(
             (declare_attn(), self.input_layernorm),
             (
                 declare_ffn(
@@ -546,12 +546,6 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
                 ),
                 self.post_attention_layernorm,
             ),
-            previous=declare_ffn(
-                sparse=is_previous_layer_sparse, next_layer_sparse=self.is_layer_sparse
-            )
-            if layer_id != 0
-            else None,
-            terminal=layer_id == config.num_hidden_layers - 1,
         )
 
     def forward(
@@ -675,7 +669,6 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
 
         # Qwen3Next all layers are sparse and have no nextn now
         self.is_layer_sparse = True
-        is_previous_layer_sparse = True
         is_next_layer_sparse = True
 
         if self.is_layer_sparse:
@@ -688,6 +681,7 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
                 is_nextn=is_nextn,
                 support_shared_expert_fusion=True,
                 enable_cuda_shared_expert_fusion=True,
+                reduce_results=False,
             )
         else:
             self.mlp = Qwen2MoeMLP(
@@ -696,6 +690,7 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix.replace(".self_attn", "")),
+                reduce_results=False,
             )
         self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = GemmaRMSNorm(
@@ -705,7 +700,7 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
-        self.attn_boundary, self.ffn_boundary = make_stages(
+        self.attn_boundary, self.ffn_boundary = append_stages(
             (declare_attn(), self.input_layernorm),
             (
                 declare_ffn(
@@ -714,12 +709,6 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
                 ),
                 self.post_attention_layernorm,
             ),
-            previous=declare_ffn(
-                sparse=is_previous_layer_sparse, next_layer_sparse=self.is_layer_sparse
-            )
-            if layer_id != 0
-            else None,
-            terminal=layer_id == config.num_hidden_layers - 1,
         )
 
         self.alt_stream = alt_stream

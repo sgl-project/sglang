@@ -523,7 +523,7 @@ class IndexerKPool(MultiPlatformOp):
                 )
 
             pool_start_id = first_pos // kpool
-            page_size = get_token_to_kv_pool().page_size
+            page_size = attn_metadata.page_size
             use_returned_compressed = return_compressed and (
                 not write_cache or pool_start_id == 0
             )
@@ -805,9 +805,14 @@ class IndexerKPool(MultiPlatformOp):
         if plan is not None and plan.pool_seqlens_per_q is not None:
             pool_seqlens = plan.pool_seqlens_per_q[: seqlens_32.shape[0]]
             pool_context_lens = pool_seqlens.contiguous().view(-1, 1)
-            pool_block_tables = build_pooled_page_table_64(
-                block_tables, self.index_kpool
-            ).contiguous()
+            pool_block_tables = attn_metadata.pooled_real_page_table
+            if (
+                pool_block_tables is None
+                or attn_metadata.pooled_index_kpool != self.index_kpool
+            ):
+                pool_block_tables = build_pooled_page_table_64(
+                    block_tables, self.index_kpool
+                ).contiguous()
             pool_schedule_metadata = plan.pool_schedule_metadata
             if pool_schedule_metadata is None and build_schedule_metadata:
                 pool_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
@@ -955,7 +960,7 @@ class IndexerKPool(MultiPlatformOp):
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
 
         pool = get_token_to_kv_pool()
-        page_size = pool.page_size
+        page_size = pool.slots_per_page
         # DeepGEMM paged-MQA requires 64-token pages.
         assert page_size == 64, "only support page size 64"
 
@@ -1241,7 +1246,8 @@ class IndexerKPool(MultiPlatformOp):
         )
 
         pool_size = self.index_kpool
-        page_size = get_token_to_kv_pool().page_size
+        page_size = metadata.attn_metadata.page_size
+        slots_per_page = get_token_to_kv_pool().slots_per_page
         token_nums = q_fp8.shape[0]
         tail_pool = pool_size - 1
         topk_result = torch.empty(
@@ -1355,7 +1361,9 @@ class IndexerKPool(MultiPlatformOp):
                             token_page_table = block_tables[
                                 i, :num_token_pages
                             ].contiguous()
-                            pool_pages = (curr_pool_start + page_size - 1) // page_size
+                            pool_pages = (
+                                curr_pool_start + slots_per_page - 1
+                            ) // slots_per_page
                             pooled_page_table = build_pooled_page_table_64(
                                 token_page_table, pool_size
                             )[:pool_pages].contiguous()
@@ -1395,7 +1403,9 @@ class IndexerKPool(MultiPlatformOp):
                         token_page_table = block_tables[
                             i, :num_token_pages
                         ].contiguous()
-                        pool_pages = (pool_seq_len + page_size - 1) // page_size
+                        pool_pages = (
+                            pool_seq_len + slots_per_page - 1
+                        ) // slots_per_page
                         pooled_page_table = build_pooled_page_table_64(
                             token_page_table, pool_size
                         )[:pool_pages].contiguous()
@@ -1494,7 +1504,7 @@ class IndexerKPool(MultiPlatformOp):
 
         assert forward_batch.forward_mode.is_extend_without_speculative()
 
-        page_size = get_token_to_kv_pool().page_size
+        page_size = get_token_to_kv_pool().slots_per_page
         assert page_size == 64, "only support page size 64"
         assert len(weights.shape) == 3
         weights = weights.squeeze(-1)

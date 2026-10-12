@@ -2,6 +2,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import torch
+
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
@@ -98,6 +100,7 @@ class TestDecodeToExtendConversionVote(CustomTestCase):
             batch_size=lambda: 2,
             return_logprob=False,
             has_grammar=False,
+            multimodal_inputs=None,
             reqs=[
                 SimpleNamespace(beam_group=Mock() if beam else None),
                 SimpleNamespace(beam_group=None),
@@ -139,14 +142,20 @@ class TestDecodeToExtendConversionVote(CustomTestCase):
 
 
 class TestPrefillCudaGraphVote(CustomTestCase):
-    def _vote(self, mode):
-        runner = Mock(spec=dp_attn.PrefillCudaGraphRunner)
+    def _vote(self, mode, *, mm=None):
+        runner_cls = dp_attn.PrefillCudaGraphRunner
+        runner = Mock(spec=runner_cls)
         runner.enable_lora = False
         runner.max_context_size = None
-        runner.can_replay_locally.return_value = True
+        runner._qwen_bcg_hc_sidechannel = True
+        runner.can_replay_locally.side_effect = lambda **kwargs: (
+            not kwargs["contains_mm_inputs"]
+            or runner_cls.can_replay_locally(self=runner, **kwargs)
+        )
         batch = SimpleNamespace(
             forward_mode=mode,
             extend_num_tokens=4,
+            multimodal_inputs=mm,
             input_embeds=None,
             replace_embeds=None,
             prefix_lens=[1, 1],
@@ -176,6 +185,32 @@ class TestPrefillCudaGraphVote(CustomTestCase):
         self.assertTrue(vote)
         runner.can_replay_locally.assert_called_once()
         self.assertTrue(runner.can_replay_locally.call_args.kwargs["is_mixed"])
+
+    @patch.object(dp_attn, "get_parallel")
+    @patch.object(dp_attn, "all_gather_single")
+    def test_multimodal_ranks_vote_eager(self, gather, parallel):
+        infos = [
+            dp_attn.MLPSyncBatchInfo(
+                num_dp_ranks=2,
+                tp_size=1,
+                cp_size=1,
+                num_tokens=4,
+                num_tokens_for_logprob=1,
+                can_run_decode_cuda_graph=False,
+                can_run_draft_cuda_graph=False,
+                can_run_prefill_cuda_graph=self._vote(ForwardMode.EXTEND, mm=mm)[0],
+                is_extend_in_batch=True,
+                local_can_run_tbo=False,
+                local_forward_mode=ForwardMode.EXTEND.value,
+            )
+            for mm in ([SimpleNamespace(contains_mm_input=lambda: True)], None)
+        ]
+        values = torch.cat([i._get_local_tensor(device="cpu") for i in infos])
+        gather.side_effect = lambda output, *a, **kw: output.copy_(values)
+        parallel.return_value.tp_group.active_ranks_cpu = torch.ones(2)
+        for info in infos:
+            info.all_gather(device="cpu", group=None)
+            self.assertFalse(info.can_run_prefill_cuda_graph)
 
 
 if __name__ == "__main__":

@@ -16,16 +16,18 @@
 
 import logging
 from itertools import islice
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, Optional, Union
 
 import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.distributed import (
-    tensor_model_parallel_all_reduce,
+from sglang.srt.layers.layer_boundary import (
+    append_stages,
+    declare_attn,
+    declare_ffn,
 )
-from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
@@ -108,6 +110,7 @@ class Ernie4_5_VLMoeAttention(nn.Module):
             hidden_size,
             bias=bias,
             quant_config=quant_config,
+            reduce_results=False,
             prefix=add_prefix("o_proj", prefix),
         )
 
@@ -349,10 +352,26 @@ class Ernie4_5_VLMoeMoE(nn.Module):
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
 
-        if self.tp_size > 1:
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
-
         return final_hidden_states.view(orig_shape)
+
+
+def _is_moe_layer(config: PretrainedConfig, layer_id: int) -> bool:
+    min_moe_layer_start_index = min(config.moe_layer_start_index)
+    moe_layer_end_index = getattr(
+        config,
+        "moe_layer_end_index",
+        [config.num_hidden_layers - 1, config.num_hidden_layers - 1],
+    )
+    max_moe_layer_end_index = max(moe_layer_end_index)
+    assert min_moe_layer_start_index <= max_moe_layer_end_index
+    moe_layer_interval = getattr(config, "moe_layer_interval", 1)
+    use_moe = getattr(config, "use_moe", max(config.moe_num_experts) > 0)
+    return (
+        use_moe
+        and ((layer_id + 1) % moe_layer_interval == 0)
+        and layer_id >= min_moe_layer_start_index
+        and layer_id <= max_moe_layer_end_index
+    )
 
 
 class Ernie4_5_VLMoeDecoderLayer(nn.Module):
@@ -392,26 +411,9 @@ class Ernie4_5_VLMoeDecoderLayer(nn.Module):
         )
 
         # MoE
-        moe_layer_start_index = config.moe_layer_start_index
-        min_moe_layer_start_index = min(moe_layer_start_index)
-        moe_layer_end_index = getattr(
-            config,
-            "moe_layer_end_index",
-            [config.num_hidden_layers - 1, config.num_hidden_layers - 1],
-        )
-        max_moe_layer_end_index = max(moe_layer_end_index)
-        assert min_moe_layer_start_index <= max_moe_layer_end_index
-        moe_num_experts = config.moe_num_experts
-        max_moe_num_experts = max(moe_num_experts)
-        moe_layer_interval = getattr(config, "moe_layer_interval", 1)
-        use_moe = getattr(config, "use_moe", max_moe_num_experts > 0)
         # MLP
-        if (
-            use_moe
-            and ((layer_id + 1) % moe_layer_interval == 0)
-            and layer_id >= min_moe_layer_start_index
-            and layer_id <= max_moe_layer_end_index
-        ):
+        sparse = _is_moe_layer(config, layer_id)
+        if sparse:
             self.mlp = Ernie4_5_VLMoeMoE(
                 config=config,
                 layer_id=layer_id,
@@ -424,6 +426,8 @@ class Ernie4_5_VLMoeDecoderLayer(nn.Module):
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
+                reduce_results=False,
+                allow_fused_down=False,
                 prefix=add_prefix("mlp", prefix),
             )
 
@@ -431,22 +435,27 @@ class Ernie4_5_VLMoeDecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        next_sparse = layer_id + 1 < config.num_hidden_layers and _is_moe_layer(
+            config, layer_id + 1
+        )
+        self.attn_boundary, self.ffn_boundary = append_stages(
+            (declare_attn(), self.input_layernorm),
+            (
+                declare_ffn(sparse=sparse, next_layer_sparse=next_sparse),
+                self.post_attention_layernorm,
+            ),
+        )
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        residual: Optional[torch.Tensor],
         visual_token_mask: torch.Tensor | None,
         **kwargs: object,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         # Self Attention
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
-        else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        hidden_states = self.attn_boundary.prepare(hidden_states, forward_batch)
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
@@ -454,13 +463,13 @@ class Ernie4_5_VLMoeDecoderLayer(nn.Module):
         )
 
         # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
         if isinstance(self.mlp, Ernie4_5_VLMoeMoE):
             hidden_states = self.mlp(hidden_states, visual_token_mask, **kwargs)
         else:
             hidden_states = self.mlp(hidden_states)
-
-        return hidden_states, residual
+        return self.ffn_boundary.finish(hidden_states, forward_batch)
 
 
 # only used as text backbone for ernie4.5 vl
@@ -479,7 +488,6 @@ class Ernie4_5_VLMoeModel(nn.Module):
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
-                enable_tp=not is_dp_attention_enabled(),
                 prefix=add_prefix("embed_tokens", prefix),
             )
         else:
@@ -519,33 +527,23 @@ class Ernie4_5_VLMoeModel(nn.Module):
                 hidden_states = self.embed_tokens(input_ids)
             else:
                 hidden_states = input_embeds
-            residual = None
+            residual_batch.start(forward_batch)
         else:
             assert pp_proxy_tensors is not None
-            hidden_states = pp_proxy_tensors["hidden_states"]
-            residual = pp_proxy_tensors["residual"]
+            hidden_states = self.layers[self.start_layer].attn_boundary.from_pp(
+                pp_proxy_tensors, forward_batch
+            )
 
         for layer in islice(self.layers, self.start_layer, self.end_layer):
-            hidden_states, residual = layer(
+            hidden_states = layer(
                 positions,
                 hidden_states,
                 forward_batch,
-                residual,
                 visual_token_mask,
             )
 
         if not self.pp_group.is_last_rank:
-            return PPProxyTensors(
-                {
-                    "hidden_states": hidden_states,
-                    "residual": residual,
-                }
-            )
-
-        if hidden_states.shape[0] != 0:
-            if residual is None:
-                hidden_states = self.norm(hidden_states)
-            else:
-                hidden_states, _ = self.norm(hidden_states, residual)
-
-        return hidden_states
+            return residual_batch.to_pp(hidden_states, forward_batch)
+        return residual_batch.final_norm(
+            hidden_states, forward_batch, self.norm, skip_empty=True
+        )

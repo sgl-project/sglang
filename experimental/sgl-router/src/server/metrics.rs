@@ -30,6 +30,7 @@
 //! | `sgl_router_worker_cb_state` | Gauge | `worker_url` |
 //! | `sgl_router_worker_inflight_requests` | Gauge | `worker_url` |
 //! | `sgl_router_stale_requests_total` | Counter | `outcome` |
+//! | `sgl_router_retries_total` | Counter | `model_id` |
 //! | `sgl_router_decode_affinity_total` | Counter | `outcome` |
 //! | `sgl_router_sticky_total` | Counter | `outcome` |
 //! | `sgl_router_policy_decisions_total` | Counter | `policy`, `reason` |
@@ -478,6 +479,7 @@ pub struct MetricsRegistry {
     cache_aware_decisions_total: Mutex<HashMap<CacheAwareDecisionKey, Arc<AtomicU64>>>,
     diverted_overlap_blocks: Mutex<HashMap<String, Histogram>>,
     ingress_tokenize_errors_total: Mutex<HashMap<String, Arc<AtomicU64>>>,
+    retries_total: Mutex<HashMap<String, Arc<AtomicU64>>>,
     input_ids_forwarding_total: Mutex<HashMap<InputIdsForwardingKey, Arc<AtomicU64>>>,
     sampling_contract_rejections_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
 }
@@ -876,6 +878,18 @@ impl MetricsRegistry {
     /// Pairs with the per-model WARN log in `encode_chat`.
     pub fn record_ingress_tokenize_error(&self, model_id: &str) {
         let mut guard = self.ingress_tokenize_errors_total.lock();
+        let counter = guard
+            .entry(model_id.to_owned())
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .clone();
+        drop(guard);
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Bump `sgl_router_retries_total{model_id}`: one per dispatch attempt
+    /// after a request's first.
+    pub fn record_retry(&self, model_id: &str) {
+        let mut guard = self.retries_total.lock();
         let counter = guard
             .entry(model_id.to_owned())
             .or_insert_with(|| Arc::new(AtomicU64::new(0)))
@@ -1355,6 +1369,26 @@ impl MetricsRegistry {
         for (model_id, value) in entries {
             out.push_str(&format!(
                 "sgl_router_ingress_tokenize_errors_total{{model_id=\"{}\"}} {}\n",
+                escape_label(model_id),
+                value,
+            ));
+        }
+        drop(guard);
+
+        // retries_total
+        out.push_str(
+            "# HELP sgl_router_retries_total Dispatch attempts retried on another worker after a failure that reached the client as a status only.\n",
+        );
+        out.push_str("# TYPE sgl_router_retries_total counter\n");
+        let guard = self.retries_total.lock();
+        let mut entries: Vec<(&String, u64)> = guard
+            .iter()
+            .map(|(k, v)| (k, v.load(Ordering::Relaxed)))
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        for (model_id, value) in entries {
+            out.push_str(&format!(
+                "sgl_router_retries_total{{model_id=\"{}\"}} {}\n",
                 escape_label(model_id),
                 value,
             ));

@@ -165,10 +165,34 @@ def post_attention_norm(layer, x: torch.Tensor, coefficients=None) -> torch.Tens
         if coefficients is not None:
             coefficients.materialize()
         return norm(x)
+    if _ffn_norm_emits_mxfp8(layer, x.shape[0]):
+        x_quant, out = rmsnorm_with_sinkhorn(
+            x, norm.weight.data, norm.variance_epsilon, coefficients, emit_fp8=True
+        )
+        # the shared expert's gate_up takes it in place of its own quant (_forward_shared_experts)
+        out._hip_mxfp8_operand = x_quant
+        return out
     _, out = rmsnorm_with_sinkhorn(
         x, norm.weight.data, norm.variance_epsilon, coefficients, fake_quant=False
     )
     return out
+
+
+_FFN_NORM_EMIT_MXFP8 = envs.SGLANG_HIP_FFN_NORM_MXFP8.get()
+
+
+def _ffn_norm_emits_mxfp8(layer, num_tokens: int) -> bool:
+    """SGLANG_HIP_FFN_NORM_MXFP8: whether the FFN norm launch also emits fp8 + ue8m0 for the
+    shared expert's gate_up (its route consumes them at this token count)."""
+    if not _FFN_NORM_EMIT_MXFP8:
+        return False
+    consumer = getattr(layer, "_ffn_shared_mxfp8_consumer", None)
+    if consumer is None:
+        shared = getattr(getattr(layer, "mlp", None), "shared_experts", None)
+        consumer = layer._ffn_shared_mxfp8_consumer = _mxfp8_consumer(
+            getattr(shared, "gate_up_proj", None)
+        )
+    return consumer
 
 
 def live_rows(activation, num_tokens: int):
@@ -196,15 +220,37 @@ def wo_b_takes_fp8_grid(attn) -> bool:
     return attn._wo_b_fp8_grid_operand
 
 
-def wo_a_fp8_grid_matmul(o: torch.Tensor, wo_a: torch.Tensor, fp8_grid: bool):
+_WO_A_EMIT_MXFP8 = envs.SGLANG_HIP_WO_A_MXFP8.get()
+
+
+def wo_b_emits_mxfp8(attn, num_tokens: int) -> bool:
+    """SGLANG_HIP_WO_A_MXFP8: whether the wo_a GEMM hands wo_b fp8 + ue8m0 from its epilogue
+    (wo_b's route consumes them at this token count) instead of bf16 plus a separate quant."""
+    if not _WO_A_EMIT_MXFP8 or _wo_a_fp8_grid_gemm is None:
+        return False
+    consumer = getattr(attn, "_wo_b_mxfp8_consumer", None)
+    if consumer is None:
+        consumer = attn._wo_b_mxfp8_consumer = _mxfp8_consumer(attn.wo_b)
+    return consumer
+
+
+def wo_a_fp8_grid_matmul(
+    o: torch.Tensor, wo_a: torch.Tensor, fp8_grid: bool, emit_fp8: bool = False
+):
     """o [T, G, D] @ wo_a [G, R, D]^T through the gfx950 fork of the aiter batched
     GEMM: bf16 [T, G, R], or with fp8_grid rounded onto wo_b's fp8 grid as
-    an Fp8GridActivation [T, G * R]; None when the fork did not import."""
+    an Fp8GridActivation [T, G * R], or with emit_fp8 an Mxfp8Activation [T, G * R];
+    None when the fork did not import."""
     if _wo_a_fp8_grid_gemm is None:
         return None
     # the split-K regime ends at 64 rows, so a request's verify and decode rows would
     # take different reduction orders; deterministic inference keeps the single chain
     split_k = False if get_exec().deterministic.enable_deterministic_inference else None
+    if emit_fp8:
+        q, scale = _wo_a_fp8_grid_gemm(
+            o, wo_a, fp8_grid=False, split_k=split_k, emit_fp8=True
+        )
+        return Mxfp8Activation(q, scale)
     y = _wo_a_fp8_grid_gemm(o, wo_a, fp8_grid=fp8_grid, split_k=split_k)
     if fp8_grid:
         return Fp8GridActivation(y)

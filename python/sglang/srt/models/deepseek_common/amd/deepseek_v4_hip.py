@@ -28,6 +28,7 @@ from sglang.srt.utils import is_gfx95_supported
 
 live_rows = gfx95_dense.live_rows
 wo_a_fp8_grid_matmul = gfx95_dense.wo_a_fp8_grid_matmul
+wo_b_emits_mxfp8 = gfx95_dense.wo_b_emits_mxfp8
 
 _is_gfx95_supported = is_gfx95_supported()
 
@@ -166,20 +167,15 @@ def init_decoder_layer(layer, quant_config) -> None:
     )
 
 
-def hc_post(layer, x, residual, post, comb) -> Optional[torch.Tensor]:
+def hc_post(cfg, x, residual, post, comb) -> Optional[torch.Tensor]:
     """V4.1's gfx950 hc_post at 768-4096 rows: the split-H kernel with 2048-wide blocks,
     whose ordinary stores preserve locality for the following mHC reader; None elsewhere."""
     if not (
         _is_gfx95_supported
-        and layer.config.model_type == "deepseek_v41"
+        and cfg.pre_from_prev
+        and cfg.mult == 4
         and 768 <= x.shape[0] <= 4096
         and x.shape[1] == 5120
-        and residual.shape == (x.shape[0], 4, 5120)
-        and post.shape == (x.shape[0], 4)
-        and comb.shape == (x.shape[0], 4, 4)
-        and x.dtype == residual.dtype == torch.bfloat16
-        and post.dtype == comb.dtype == torch.float32
-        and all(t.is_contiguous() for t in (x, residual, post, comb))
     ):
         return None
     return mhc_post_split_h(x, residual, post, comb, block_size=2048)
@@ -215,14 +211,12 @@ def input_norm(
 def forward_layer_fused_boundary(
     model,
     i: int,
+    state,
     *,
     positions: torch.Tensor,
-    hidden_states: Optional[torch.Tensor],
     input_ids: torch.Tensor,
     forward_batch,
     input_ids_global: torch.Tensor,
-    prev_pre: Optional[torch.Tensor],
-    pending_post: Optional[Tuple[torch.Tensor, ...]],
     capture_dspark: bool,
 ):
     """Layer i through the fused mHC boundary. Its FFN hc_post stays pending for the next
@@ -234,14 +228,23 @@ def forward_layer_fused_boundary(
         and model.layers[nxt].engram is None
         and not (capture_dspark and nxt in model.dspark_layers_to_capture)
     )
-    return forward_hc_pre_from_prev_fused_boundary(
+    # The boundary speaks its own (hidden_states, prev_pre, pending_post) triple;
+    # the loop speaks HcState. This is the only place the two meet.
+    from sglang.srt.models.deepseek_v4_mhc import HcPending, HcState
+
+    pending = isinstance(state.streams, HcPending)
+    hidden_states, prev_pre, pending_post = forward_hc_pre_from_prev_fused_boundary(
         model.layers[i],
         positions=positions,
-        hidden_states=hidden_states,
+        hidden_states=None if pending else state.streams,
         input_ids=input_ids,
         forward_batch=forward_batch,
         input_ids_global=input_ids_global,
-        prev_pre=prev_pre,
-        pending_post=pending_post,
+        prev_pre=state.pre,
+        pending_post=tuple(state.streams) if pending else None,
         defer_post=defer_post,
+    )
+    return HcState(
+        hidden_states if pending_post is None else HcPending(*pending_post),
+        prev_pre,
     )

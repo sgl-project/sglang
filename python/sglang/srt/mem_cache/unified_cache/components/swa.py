@@ -221,9 +221,14 @@ class SWAComponent(TreeComponent):
                     )
 
     def _translate_full_to_swa(self, full_indices: torch.Tensor) -> torch.Tensor:
-        return self.cache.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
-            full_indices
+        swa_indices = (
+            self.cache.token_to_kv_pool_allocator.translate_swa_indices_for_transfer(
+                full_indices
+            )
         )
+        # Tree component values use int64 indices; normalize transfer ids at the
+        # tree boundary.
+        return swa_indices.to(torch.int64)
 
     def _unified_allocator(self):
         """The unified SWA composite, or None when running on the static pool."""
@@ -843,7 +848,7 @@ class SWAComponent(TreeComponent):
             covered += len(cur.key)
             if covered >= sliding_window_size:
                 if comp.metadata.get(uuid_key) is None:
-                    comp.metadata[uuid_key] = next_component_uuid()
+                    comp.metadata[uuid_key] = next_component_uuid(ct)
                 swa_uuid = comp.metadata[uuid_key]
             cur = cur.parent
 
