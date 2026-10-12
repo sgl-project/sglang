@@ -1244,3 +1244,18 @@ def test_integrated_h3_int8_loader_preserves_quantized_weights(
     arguments.should_use_fsdp_for_component = lambda _: True
     with pytest.raises(ValueError, match="FSDP"):
         spec.load_comfyui_transformer(pipeline, arguments)
+
+
+def test_h3_pack_rejects_batched_latents() -> None:
+    """A B>1 H3 latent used to reach the worker as one packed sequence and fail
+    with an index_copy_ shape error; it must be rejected up front."""
+    adapter = MiniMaxH3Adapter()
+    x = [torch.ones(2, 24, 2, 4, 4), torch.ones(2, 32, 2, 3)]
+    with pytest.raises(ValueError, match="batch size 1, got 2"):
+        adapter.pack(
+            x,
+            torch.tensor([500.0, 500.0]),
+            torch.ones(2, 8, 16),
+            minimax_payload={"audio_scale": 1.0},
+            transformer_options={"sample_sigmas": torch.tensor([1.0, 0.0])},
+        )
