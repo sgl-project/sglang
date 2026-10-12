@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 import torch
 
 from sglang.srt.beam_search.logits_capture import capture_pre_sample_logits
+from sglang.srt.configs.load_config import _DEFAULT_LOAD_GROUP, LoadGroup
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
@@ -32,14 +33,11 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     SendWeightsToRemoteInstanceReqInput,
     UnloadLoRAAdapterReqInput,
-    UpdateWeightFromDiskReqInput,
-    UpdateWeightsFromDistributedReqInput,
-    UpdateWeightsFromIPCReqInput,
-    UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -146,14 +144,6 @@ class BaseTpWorker(ABC):
             self.model_runner.token_to_kv_pool_allocator,
         )
 
-    def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
-        success, message = self.model_runner.weight_updater.update_weights_from_disk(
-            recv_req.model_path,
-            recv_req.load_format,
-            recapture_cuda_graph=recv_req.recapture_cuda_graph,
-        )
-        return success, message
-
     def init_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):
         success, message = self.model_runner.weight_updater.init_weights_update_group(
             recv_req.master_address,
@@ -200,42 +190,14 @@ class BaseTpWorker(ABC):
         )
         return success, message
 
-    def update_weights_from_distributed(
-        self, recv_req: UpdateWeightsFromDistributedReqInput
-    ):
-        success, message = (
-            self.model_runner.weight_updater.update_weights_from_distributed(
-                recv_req.names,
-                recv_req.dtypes,
-                recv_req.shapes,
-                recv_req.group_name,
-                recv_req.load_format,
-            )
-        )
-        return success, message
-
-    def _deserialize_own_rank(self, serialized_named_tensors):
+    def deserialize_own_rank(self, serialized_named_tensors):
         """Each rank deserializes only its own payload (index tp_rank);
         deserializing another rank's copy would break producer-side CUDA-IPC
         refcounting."""
         monkey_patch_torch_reductions()
         return MultiprocessingSerializer.deserialize(
-            serialized_named_tensors[self.model_runner.tp_rank]
+            serialized_named_tensors[get_parallel().tp_rank]
         )
-
-    def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
-        success, message = self.model_runner.weight_updater.update_weights_from_tensor(
-            named_tensors=self._deserialize_own_rank(recv_req.serialized_named_tensors),
-            load_format=recv_req.load_format,
-        )
-        return success, message
-
-    def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
-        """Update weights from IPC for checkpoint-engine integration."""
-        success, message = self.model_runner.weight_updater.update_weights_from_ipc(
-            recv_req
-        )
-        return success, message
 
     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
         parameter = self.model_runner.weight_exporter.get_weights_by_name(
@@ -256,7 +218,7 @@ class BaseTpWorker(ABC):
     ):
         # The LoRA code handles TP sharding internally using slice_lora_a_weights
         # and slice_lora_b_weights methods (see lora/layers.py and mem_pool.py).
-        data = self._deserialize_own_rank(recv_req.serialized_named_tensors)
+        data = self.deserialize_own_rank(recv_req.serialized_named_tensors)
         if recv_req.load_format == "flattened_bucket":
             bucket = FlattenedTensorBucket(
                 flattened_tensor=data["flattened_tensor"],
@@ -289,12 +251,12 @@ class BaseTpWorker(ABC):
             extra = [n for n in tensors if n not in exp]
             if mismatch or missing or extra:
                 raise RuntimeError(
-                    f"[LORA-CHECK] rank{self.model_runner.tp_rank} adapter sync MISMATCH of {len(exp)} expected: "
+                    f"[LORA-CHECK] rank{get_parallel().tp_rank} adapter sync MISMATCH of {len(exp)} expected: "
                     f"{len(mismatch)} value-diff {mismatch[:5]}, {len(missing)} missing {missing[:5]}, "
                     f"{len(extra)} extra {extra[:5]}"
                 )
             logger.info(
-                f"[LORA-CHECK] rank{self.model_runner.tp_rank} adapter sync OK: {len(exp)}/{len(exp)} tensors match (sha256)"
+                f"[LORA-CHECK] rank{get_parallel().tp_rank} adapter sync OK: {len(exp)}/{len(exp)} tensors match (sha256)"
             )
         result = self.model_runner.load_lora_adapter_from_tensors(
             recv_req.to_ref(),
@@ -330,9 +292,11 @@ class TpModelWorker(BaseTpWorker):
         context_length: Optional[int] = None,
         draft_attention_backend: Optional[str] = None,
         random_seed: Optional[int] = None,
+        load_group: LoadGroup = _DEFAULT_LOAD_GROUP,
     ):
         # Parse args
         self.server_args = server_args
+        self.load_group = load_group
         self.gpu_id = gpu_id
         self.nccl_port = nccl_port
         self.is_draft_worker = is_draft_worker
@@ -405,18 +369,18 @@ class TpModelWorker(BaseTpWorker):
             # the set of ranks holding a draft worker. The draft worker is
             # constructed with pp_rank=0, so derive the caller's global rank
             # from the TP group rather than tp_size * pp_rank + tp_rank.
-            tp_group = self.model_runner.tp_group
+            tp_group = get_parallel().tp_group
             self.random_seed = broadcast_pyobj(
                 [get_device().random_seed],
-                tp_group.ranks[self.model_runner.tp_rank],
+                tp_group.ranks[tp_group.rank_in_group],
                 tp_group.cpu_group,
                 src=tp_group.ranks[0],
             )[0]
         else:
             self.random_seed = broadcast_pyobj(
                 [get_device().random_seed],
-                self.model_runner.tp_size * get_parallel().pp_rank
-                + self.model_runner.tp_rank,
+                get_parallel().tp_size * get_parallel().pp_rank
+                + get_parallel().tp_rank,
                 self.world_group.cpu_group,
                 src=self.world_group.ranks[0],
             )[0]
@@ -449,9 +413,7 @@ class TpModelWorker(BaseTpWorker):
         assert self.model_runner.max_running_requests > 0, "max_running_request is zero"
         max_req_len = min(
             self.model_config.context_len - 1,
-            self.model_runner.effective_max_total_num_tokens
-            * get_parallel().attn_dcp_size
-            - 1,
+            self.model_runner.effective_logical_max_total_num_tokens - 1,
         )
         assert max_req_len > 0, "Memory pool size is too small"
 
@@ -527,6 +489,7 @@ class TpModelWorker(BaseTpWorker):
             memory_pool_config=self.memory_pool_config,
             draft_attention_backend=self.draft_attention_backend,
             draft_model_idx=0 if self.is_multi_layer_eagle else None,
+            load_group=self.load_group,
         )
 
     def _init_multi_layer_eagle_model_runners(self):
@@ -547,6 +510,7 @@ class TpModelWorker(BaseTpWorker):
                     memory_pool_config=self.memory_pool_config,
                     draft_attention_backend=self.draft_attention_backend,
                     draft_model_idx=i,
+                    load_group=self.load_group,
                 )
             )
 
@@ -562,6 +526,10 @@ class TpModelWorker(BaseTpWorker):
     def model_runner(self) -> ModelRunner:
         return self._model_runner
 
+    def weight_update_runners(self) -> List[Tuple[str, ModelRunner]]:
+        """(role, runner) pairs weight ops apply to; the target worker owns one."""
+        return [("target", self._model_runner)]
+
     def register_hicache_layer_transfer_counter(self, counter: LayerDoneCounter):
         self.hicache_layer_transfer_counter = counter
 
@@ -573,19 +541,20 @@ class TpModelWorker(BaseTpWorker):
         self.model_runner.hisparse_coordinator = coordinator
 
     def get_worker_info(self):
+        # The runner already reports logical DCP capacity.
+        kv_capacity = (
+            self.model_runner.effective_logical_max_total_num_tokens
+            * page_interleave_shard_size(self.model_runner.token_to_kv_pool_allocator)
+        )
         max_req_len = min(
             self.model_config.context_len - 1,
-            self.model_runner.effective_max_total_num_tokens
-            * get_parallel().attn_dcp_size
-            - 1,
+            kv_capacity - 1,
         )
         max_req_input_len = max_req_len - 5
         if self.dllm_algorithm is not None:
             max_req_input_len -= self.dllm_algorithm.block_size
         return (
-            self.model_runner.req_to_token_pool.schedulable_token_capacity(
-                self.model_runner.max_total_num_tokens
-            ),
+            self.model_runner.logical_max_total_num_tokens,
             get_schedule().max_prefill_tokens,
             self.model_runner.max_running_requests,
             get_schedule().max_queued_requests,
@@ -640,6 +609,7 @@ class TpModelWorker(BaseTpWorker):
         skip_attn_backend_init: Optional[bool] = None,  # deprecated
         *,
         capture_hidden_mode: Optional[CaptureHiddenMode] = None,
+        return_kv_loc_plan: bool = False,
     ) -> GenerationBatchResult:
         # Get forward batch from schedule batch
         if batch is not None:
@@ -685,6 +655,7 @@ class TpModelWorker(BaseTpWorker):
                 expert_distribution_metrics=out.expert_distribution_metrics,
                 routed_experts_output=out.routed_experts_output,
                 indexer_topk_output=out.indexer_topk_output,
+                kv_loc_plan=forward_batch.kv_loc_plan if return_kv_loc_plan else None,
             )
 
             capture_pre_sample_logits(batch, forward_batch, logits_output)

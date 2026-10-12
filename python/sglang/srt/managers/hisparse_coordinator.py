@@ -47,6 +47,7 @@ from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool, ReqToTokenPool
 from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
 from sglang.srt.mem_cache.pool_host.mha import HiSparseMHATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.runtime_context import get_parallel
 
 device_module = get_device_module()
 
@@ -72,7 +73,6 @@ class HiSparseTokenStats(NamedTuple):
 def resolve_shared_index_layers(
     *,
     hf_text_config,
-    pp_size: int,
     is_speculative: bool,
 ) -> Optional[List[bool]]:
     """Per-layer "reuses the previous layer's top-k index" pattern, or None.
@@ -91,7 +91,7 @@ def resolve_shared_index_layers(
         pattern = [dsa_layer_skips_topk(hf_text_config, i) for i in range(num_layers)]
     if not any(pattern):
         return None
-    if pp_size != 1 or is_speculative:
+    if get_parallel().pp_size != 1 or is_speculative:
         logger.warning(
             "HiSparse shared-index prefetch is unsupported under pipeline "
             "parallelism / speculative decoding; falling back to synchronous "
@@ -407,7 +407,7 @@ class HiSparseCoordinator:
         req.hisparse_staging = True
 
         full_kv_indices = self.req_to_token_pool.req_to_token[
-            req.kv.req_pool_idx, : req.extend_range.end
+            req.kv.req_pool_idx, : req.extend_end
         ].to(dtype=torch.int64, copy=True)
         device_indices = (
             self.mem_pool_device.translate_loc_from_full_to_hisparse_device(
@@ -503,7 +503,7 @@ class HiSparseCoordinator:
 
     def alloc_device_buffer(self, req: Req) -> None:
         if self.is_dsv4_hisparse:
-            allocated_len = req.extend_range.end
+            allocated_len = req.extend_end
             alloc_size = self.padded_buffer_size
         else:
             allocated_len = req.kv.kv_allocated_len
@@ -755,9 +755,11 @@ class HiSparseCoordinator:
         if not backup_indices:
             return
 
+        # Use a pinned, non-blocking H2D copy to avoid synchronizing the host
+        # with pending work on the schedule stream.
         backup_indices_gpu = torch.tensor(
-            backup_indices, dtype=torch.int64, device=self.device
-        )
+            backup_indices, dtype=torch.int64, device="cpu", pin_memory=True
+        ).to(self.device, non_blocking=True)
         backup_req_indices = req_pool_indices[backup_indices_gpu]
 
         # The previous compressed token's position and its device buffer slot:
@@ -920,7 +922,7 @@ class HiSparseCoordinator:
         # Wait for any in-flight staging DMA to complete before freeing
         self.write_staging_stream.synchronize()
 
-        prefill_len = req.extend_range.end
+        prefill_len = req.extend_end
         allocated_locs = self.req_to_token_pool.req_to_token[
             req.kv.req_pool_idx, :prefill_len
         ]

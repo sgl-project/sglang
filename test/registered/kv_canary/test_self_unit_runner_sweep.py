@@ -7,8 +7,8 @@ from sglang.srt.kv_canary import endpoint as endpoint_module
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kv_canary.fixtures import (
     make_forward_batch,
-    make_radix_cache,
     make_req_to_token_pool,
+    make_unified_radix_chain,
 )
 from sglang.test.kv_canary.runner_test_base import (
     CanaryManagerTestCase,
@@ -62,7 +62,7 @@ class TestSelfUnitManagerSweep(CanaryManagerTestCase):
         with manager.with_active_single_forward_manager(0):
             manager.pre_ops_maybe_inside_graph(forward_batch)
 
-        cache = make_radix_cache([[], [10, 11, 12]], device=self.device)
+        cache = make_unified_radix_chain([[10, 11, 12]], device=self.device)
         cache.req_to_token_pool = make_req_to_token_pool(self.device)
         manager.attach_radix_cache(cache)
 
@@ -80,7 +80,7 @@ class TestSelfUnitManagerSweep(CanaryManagerTestCase):
     def test_sweep_allocates_verify_plan_from_walker_output(self) -> None:
         """Verify sweep planning sizes the verify plan from walker output."""
         manager = make_manager(device=self.device)
-        cache = make_radix_cache([[], [10, 11], [12, 13, 14]], device=self.device)
+        cache = make_unified_radix_chain([[10, 11], [12, 13, 14]], device=self.device)
         cache.req_to_token_pool = make_req_to_token_pool(self.device)
         manager.attach_radix_cache(cache)
 

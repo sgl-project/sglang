@@ -51,15 +51,7 @@ def _causal_block_count(batch: Req, server_args: ServerArgs) -> int:
 
 
 class LongLive2TextEncodingStage(TextEncodingStage):
-    def build_dedup_fingerprint(self, batch: Req, server_args: ServerArgs):
-        base = super().build_dedup_fingerprint(batch, server_args)
-        return (
-            base,
-            self.freeze_for_dedup(getattr(batch, "shot_prompts", None)),
-            self.freeze_for_dedup(getattr(batch, "shot_durations", None)),
-            int(getattr(batch, "chunks_per_shot", 0) or 0),
-            getattr(batch, "scene_cut_prefix", None),
-        )
+    deduplicated_output_fields = ()
 
     def _block_prompts(self, batch: Req, server_args: ServerArgs) -> list[str] | None:
         shot_prompts = getattr(batch, "shot_prompts", None)

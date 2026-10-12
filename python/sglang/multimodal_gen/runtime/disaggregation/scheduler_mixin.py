@@ -17,6 +17,7 @@ import pickle
 import queue
 import threading
 import time
+from enum import Enum
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -53,6 +54,10 @@ from sglang.multimodal_gen.runtime.disaggregation.transport.protocol import (
     decode_transfer_msg,
     encode_transfer_msg,
     is_transfer_message,
+)
+from sglang.multimodal_gen.runtime.distributed.ipc_cuda import (
+    attach_cuda_tensors,
+    detach_cuda_tensors,
 )
 from sglang.multimodal_gen.runtime.distributed.utils import broadcast_pyobj
 from sglang.multimodal_gen.runtime.entrypoints.utils import expand_request_outputs
@@ -173,20 +178,16 @@ def _is_tensor_like(value) -> bool:
 
 
 def _to_json_serializable(value):
+    if isinstance(value, Enum):
+        return value.name
     if isinstance(value, (torch.Tensor, np.ndarray)):
         return value.tolist()
     if isinstance(value, np.generic):
         return value.item()
+    if isinstance(value, dict):
+        return {key: _to_json_serializable(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
-        converted = []
-        for item in value:
-            if isinstance(item, (torch.Tensor, np.ndarray)):
-                converted.append(item.tolist())
-            elif isinstance(item, np.generic):
-                converted.append(item.item())
-            else:
-                converted.append(item)
-        return converted
+        return [_to_json_serializable(item) for item in value]
     return value
 
 
@@ -426,9 +427,7 @@ class SchedulerDisaggMixin:
         from sglang.multimodal_gen.runtime.disaggregation.metrics import DisaggMetrics
 
         self._disagg_role = server_args.disagg_role
-        self._disagg_timeout_s = float(getattr(server_args, "disagg_timeout", 600))
         self._disagg_metrics = None
-        self._disagg_mode = getattr(server_args, "disagg_mode", False)
         self._pool_work_pull = None
         self._pool_result_push = None
         self._transfer_manager = None
@@ -792,6 +791,31 @@ class SchedulerDisaggMixin:
             )
 
         return data
+
+    def _broadcast_recv_reqs(self: Scheduler, recv_reqs):
+        """ComfyUI multi-rank recv: pickle the Req skeleton, NCCL the CUDA tensors.
+
+        The general SP/CFG/TP path stays in ``Scheduler.recv_reqs`` as the
+        original whole-list ``broadcast_pyobj``. This helper is only the
+        ComfyUI overlay and does not use disagg extract.
+        """
+        is_rank0 = self.gpu_id == 0
+        if is_rank0:
+            assert recv_reqs is not None, "rank 0 must pass the ZMQ poll result"
+            skeleton, tensors = detach_cuda_tensors(recv_reqs)
+        else:
+            skeleton, tensors = None, None
+
+        skeleton = self._broadcast_to_all_ranks(skeleton)
+        tensors = self._broadcast_tensor_dict_to_all_ranks(tensors)
+        if is_rank0:
+            return recv_reqs
+        if not skeleton:
+            return []
+        local_device = torch.device(
+            f"{current_platform.device_type}:{self.worker.local_rank}"
+        )
+        return attach_cuda_tensors(skeleton, tensors or {}, device=local_device)
 
     def _is_multi_rank(self: Scheduler) -> bool:
         sa = self.server_args

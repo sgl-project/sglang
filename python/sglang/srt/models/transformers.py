@@ -238,6 +238,9 @@ def _normalize_tp_style(style: str) -> Style:
         "packed_rowwise": "rowwise",
         "local_rowwise": "rowwise",
         "local_packed_rowwise": "rowwise",
+        # transformers' tied-embedding `base_model_tp_plan`s give the embedding this
+        # style; `replace_vocab_embed_class` shards it instead.
+        "embedding_rowwise": "replicate",
         "isolated": "replicate",
         "local": "replicate",
         "replicated_with_grad_allreduce": "replicate",
@@ -646,10 +649,9 @@ class TransformersBase(nn.Module):
         # Pipeline parallel
         self.pipeline_parallel()
         # Module replacement (Linear → TP, RMSNorm → fused, MoE overridden by MoEMixin)
-        tp_size = get_parallel().tp_size
         self.recursive_replace()
         # Attention instances
-        self.attention_instances = self._create_attention_instances(tp_size)
+        self.attention_instances = self._create_attention_instances()
         # Vocab embeddings
         self.replace_vocab_embed_class(self.model)
 
@@ -902,7 +904,8 @@ class TransformersBase(nn.Module):
             self._register_missing_prefix(maybe_prefix("model", name))
 
     # -- Attention instances ------------------------------------------------
-    def _create_attention_instances(self, tp_size: int) -> dict[int, RadixAttention]:
+    def _create_attention_instances(self) -> dict[int, RadixAttention]:
+        tp_size = get_parallel().tp_size
         num_heads = self.text_config.num_attention_heads
         num_kv_heads = getattr(self.text_config, "num_key_value_heads", num_heads)
         hidden_size = self.text_config.hidden_size

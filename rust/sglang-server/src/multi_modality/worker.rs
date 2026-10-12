@@ -1,16 +1,21 @@
-//! The worker pool: drain MM requests, run the `sglang-mm` pipeline, park
-//! the result buffers.
+//! The worker pool: drain requests in `Encoding`, run the selected processor,
+//! and hand each request back with the expanded ids and the named feature
+//! buffers that ride the ring with it.
 
 use std::sync::Arc;
 
-use super::result_store::{
-    FeatureStore, MmEncodedEntry, MmResultStore, QwenMmEncodedEntry, park_features_in_shm,
-};
+use sglang_mm::driver::{self, Output};
+use sglang_mm::pipeline::{MmFamilyProcessor, PositionOutput, Tensor, TensorData};
+use sglang_mm::registry::build_pipeline;
+
+use super::encoded::{MRope, MmEncodedEntry, MmEncodedItem, MmMeta, MmMetaValue, MmModality};
+use crate::message::buffers::{Buffer, BufferData, BufferStore};
 use crate::message::config::MmSpec;
-use crate::message::ids::Rid;
-use crate::message::request::{MmRequest, MmWorkItem};
-use crate::tokenizer_manager::tokenizer::TextTokenizer;
+use crate::message::request::{MmData, Request, RequestKind};
+use crate::message::types::TokenIds;
 use crate::tokenizer_manager::wiring::TmEvent;
+use crate::utils::error::Error;
+use crate::utils::fsm::Event;
 use crate::utils::runtime::Runnable;
 
 /// Python parity: caller hashes override the computed ones so an external
@@ -49,147 +54,243 @@ fn parse_caller_hash(entry: &str) -> Option<u64> {
 
 /// Complete result of one multimodal processor invocation.
 pub struct MmProcessOutput {
-    pub input_ids: Vec<i32>,
+    /// The final placeholder-expanded prompt ids.
+    pub input_ids: TokenIds,
     pub result: MmEncodedEntry,
 }
 
 /// Multimodal processor shared by built-in and external implementations.
 /// Implementations run on the fixed Rust worker pool and must not retain
-/// request-scoped Python objects.
+/// request-scoped Python objects. `input_ids` arrive tokenized (the FSM runs
+/// `Tokenizing` before `Encoding` for a text prompt), so a processor never
+/// tokenizes: it expands placeholders in ids. `mm` is the request's media,
+/// owned.
 pub trait MmProcessor: Send + Sync {
-    fn process(
-        &self,
-        work: MmWorkItem,
-        tokenizer: Option<&dyn TextTokenizer>,
-    ) -> Result<MmProcessOutput, String>;
+    fn process(&self, input_ids: TokenIds, mm: MmData) -> Result<MmProcessOutput, String>;
 }
 
 struct QwenMmProcessor {
-    family: Box<dyn sglang_mm::pipeline::MmFamilyProcessor>,
-    feature_shm: bool,
+    family: Box<dyn MmFamilyProcessor>,
 }
 
 impl QwenMmProcessor {
     fn new(spec: MmSpec) -> Result<Self, String> {
         Ok(Self {
-            family: sglang_mm::registry::build_pipeline(spec.pipeline)?,
-            feature_shm: spec.feature_shm,
+            family: build_pipeline(spec.pipeline)?,
         })
     }
 }
 
 impl MmProcessor for QwenMmProcessor {
-    fn process(
-        &self,
-        work: MmWorkItem,
-        tokenizer: Option<&dyn TextTokenizer>,
-    ) -> Result<MmProcessOutput, String> {
-        let input = super::payload::to_mm_input(work)?;
-        let output = sglang_mm::driver::process(self.family.as_ref(), input, |text| {
-            let tokenizer = tokenizer.ok_or_else(|| {
-                "skip_tokenizer_init is set: multimodal text prompts require input_ids".to_string()
-            })?;
-            tokenizer.encode(text).map_err(|error| error.to_string())
-        })?;
-        let drain = sglang_mm::qwen_vl::pack_output(output)?;
-        let features = if self.feature_shm {
-            park_features_in_shm(&drain.features, &drain.grids)
-        } else {
-            FeatureStore::Inline(drain.features)
-        };
-        Ok(MmProcessOutput {
-            input_ids: drain.input_ids,
-            result: MmEncodedEntry::Qwen(QwenMmEncodedEntry {
-                features,
-                grids: drain.grids,
-                hashes: drain.hashes,
-                offsets: drain.offsets,
-                mrope: drain.mrope,
-                mrope_delta: drain.mrope_delta,
-            }),
+    fn process(&self, input_ids: TokenIds, mm: MmData) -> Result<MmProcessOutput, String> {
+        let input = super::payload::to_mm_input(input_ids, mm)?;
+        let output = driver::process(self.family.as_ref(), input)?;
+        encode_driver_output(output)
+    }
+}
+
+/// Map the driver's output straight onto the common encoded result: each
+/// feature tensor is moved with its own shape and dtype, the per-item span
+/// and hash ride along, and every auxiliary tensor is translated once into
+/// the sidecar's metadata form. Nothing is reconstructed from lengths.
+fn encode_driver_output(output: Output) -> Result<MmProcessOutput, String> {
+    let Output {
+        input_ids,
+        items,
+        offsets,
+        positions,
+    } = output;
+    if items.len() != offsets.len() {
+        return Err(format!(
+            "mm: {} items but {} spans",
+            items.len(),
+            offsets.len()
+        ));
+    }
+    let items = items
+        .into_iter()
+        .zip(offsets)
+        .map(|(item, span)| {
+            Ok(MmEncodedItem {
+                modality: MmModality::Image,
+                feature: item.feature,
+                hash: item.hash,
+                offsets: vec![span],
+                model_specific_data: item
+                    .aux
+                    .into_iter()
+                    .map(|(name, tensor)| Ok((name.clone(), aux_meta(&name, tensor)?)))
+                    .collect::<Result<_, String>>()?,
+            })
         })
+        .collect::<Result<Vec<_>, String>>()?;
+    let mrope = match positions {
+        PositionOutput::Rope1D => None,
+        PositionOutput::MRope { positions, delta } => Some(MRope { positions, delta }),
+    };
+    Ok(MmProcessOutput {
+        input_ids,
+        result: MmEncodedEntry {
+            items,
+            token_ids: None,
+            mrope,
+        },
+    })
+}
+
+/// An auxiliary tensor as sidecar metadata. Only integer tensors have a
+/// metadata form (a grid, a count); anything else is a processor bug, not
+/// something to approximate.
+fn aux_meta(name: &str, tensor: Tensor) -> Result<MmMetaValue, String> {
+    match tensor.data {
+        TensorData::I64(values) if values.len() == 1 && tensor.shape.is_empty() => {
+            Ok(MmMetaValue::Int(values[0]))
+        }
+        TensorData::I64(values) => Ok(MmMetaValue::Ints(values)),
+        _ => Err(format!("mm: aux tensor {name:?} has no metadata form")),
     }
 }
 
 /// Shared state of the multimodal path, built once at worker startup.
 pub struct MmContext {
     pub processor: Arc<dyn MmProcessor>,
-    /// `None` under `skip_tokenizer_init` (requests must carry `input_ids`).
-    pub tokenizer: Option<Arc<dyn TextTokenizer>>,
-    pub results: MmResultStore,
+    /// Place feature tensors in POSIX shm. Set by the Python launcher
+    /// (`RustMmProcessor._use_feature_shm`) exactly when the scheduler broadcasts
+    /// across TP ranks and will unwrap `ShmPointerMMData`.
+    pub feature_shm: bool,
 }
 
 impl MmContext {
-    pub fn new(
-        spec: MmSpec,
-        tokenizer: Option<Arc<dyn TextTokenizer>>,
-        results: MmResultStore,
-    ) -> Result<Self, String> {
+    pub fn new(spec: MmSpec) -> Result<Self, String> {
+        let feature_shm = spec.feature_shm;
         Ok(Self {
             processor: Arc::new(QwenMmProcessor::new(spec)?),
-            tokenizer,
-            results,
+            feature_shm,
         })
     }
 
-    pub fn with_processor(
-        processor: Arc<dyn MmProcessor>,
-        tokenizer: Option<Arc<dyn TextTokenizer>>,
-        results: MmResultStore,
-    ) -> Self {
+    pub fn with_processor(processor: Arc<dyn MmProcessor>, feature_shm: bool) -> Self {
         Self {
             processor,
-            tokenizer,
-            results,
+            feature_shm,
         }
     }
 }
 
-/// Run the pipeline for one request. `Ok` returns the final expanded ids, the
-/// buffers already parked; `Err` rejects the request back to the client.
-fn process(ctx: &MmContext, rid: &Rid, mut work: MmWorkItem) -> Result<Vec<i32>, String> {
-    let caller_hashes = std::mem::take(&mut work.mm_hashes);
-    let mut output = ctx.processor.process(work, ctx.tokenizer.as_deref())?;
-    match &mut output.result {
-        MmEncodedEntry::Qwen(entry) => apply_caller_hashes(entry.hashes.iter_mut(), &caller_hashes),
-        MmEncodedEntry::External(entry) => {
-            entry.validate(output.input_ids.len())?;
-            apply_caller_hashes(
-                entry.items.iter_mut().map(|item| &mut item.hash),
-                &caller_hashes,
-            );
+fn tensor_data(data: TensorData) -> BufferData {
+    match data {
+        TensorData::F32(v) => BufferData::F32(v),
+        TensorData::I64(v) => BufferData::I64(v),
+        TensorData::Bf16(v) => BufferData::U16(v),
+    }
+}
+
+/// Lay each item's feature tensor out as `mm.feature.{i}`: in its own shm
+/// segment when `shm` is set -- the unit Python's `ShmPointerMMData` maps --
+/// else inline. An empty tensor stays inline even under `shm`: a zero-length
+/// segment cannot be mapped on either side, and there is nothing to share.
+/// Any shm failure (`/dev/shm` full) falls the whole request back to inline,
+/// as Python's `_wrap_shm_or_inline` does: degrade to the slow path, never
+/// fail the request. `segment_name` names each item's segment.
+fn place_features(
+    features: Vec<Tensor>,
+    shm: bool,
+    mut segment_name: impl FnMut(usize) -> String,
+) -> Vec<Buffer> {
+    let name = |i: usize| format!("mm.feature.{i}");
+    let features: Vec<(Vec<usize>, BufferData)> = features
+        .into_iter()
+        .map(|t| (t.shape, tensor_data(t.data)))
+        .collect();
+    if shm {
+        let parked: Result<Vec<Buffer>, String> = features
+            .iter()
+            .enumerate()
+            .map(|(i, (shape, data))| match data.len() {
+                0 => Buffer::inline_shaped(name(i), shape.clone(), BufferData::empty(data.dtype())),
+                _ => Buffer::shm(name(i), segment_name(i), shape.clone(), data),
+            })
+            .collect();
+        match parked {
+            Ok(buffers) => return buffers,
+            Err(error) => {
+                tracing::warn!(%error, "mm: shm feature transport failed; falling back to inline");
+            }
         }
     }
-    ctx.results.park(rid.as_str().to_owned(), output.result);
-    Ok(output.input_ids)
+    features
+        .into_iter()
+        .enumerate()
+        .map(|(i, (shape, data))| Buffer {
+            name: name(i),
+            shape,
+            store: BufferStore::Inline(data),
+        })
+        .collect()
+}
+
+/// The ring's named buffers for one result: the per-item features (see
+/// [`place_features`]), the M-RoPE positions, and the `mm.meta` sidecar --
+/// always last, so a reader that finds it knows the rest is present.
+fn make_buffers(entry: MmEncodedEntry, feature_shm: bool) -> Result<Vec<Buffer>, String> {
+    let meta = MmMeta::of(&entry).encode()?;
+    let MmEncodedEntry { items, mrope, .. } = entry;
+    let features = items.into_iter().map(|item| item.feature).collect();
+    let mut buffers = place_features(features, feature_shm, |_| {
+        crate::utils::shm::unique_name("mm")
+    });
+    if let Some(mrope) = mrope {
+        let len = mrope.positions.len() / 3;
+        buffers.push(Buffer::inline_shaped(
+            "mm.mrope",
+            vec![3, len],
+            mrope.positions,
+        )?);
+    }
+    buffers.push(Buffer::inline("mm.meta", meta));
+    Ok(buffers)
+}
+
+/// Run the processor for one request. `Ok` returns the final expanded ids and
+/// the buffers to ride the ring; `Err` rejects the request back to the client.
+fn process(
+    ctx: &MmContext,
+    input_ids: TokenIds,
+    mut mm: MmData,
+) -> Result<(TokenIds, Vec<Buffer>), String> {
+    let caller_hashes = std::mem::take(&mut mm.mm_hashes);
+    let mut output = ctx.processor.process(input_ids, mm)?;
+    output.result.validate(output.input_ids.len())?;
+    apply_caller_hashes(
+        output.result.items.iter_mut().map(|item| &mut item.hash),
+        &caller_hashes,
+    );
+    let buffers = make_buffers(output.result, ctx.feature_shm)?;
+    Ok((output.input_ids, buffers))
 }
 
 /// Boot-time wiring of the MM path, held privately by the `Runtime` for the
 /// late pool spawn (`Runtime::start_mm_workers`, once Python has resolved
 /// the spec).
 pub struct MmWiring {
-    /// Requests parked in `Encoding`, drained by the worker pool. Stays empty
-    /// for non-multimodal models — nothing routes to it.
-    pub mm_rx: flume::Receiver<MmRequest>,
-    /// Back-channel for the workers' `MmEncoded` / `MmFailed` into the
-    /// to-scheduler loop.
+    /// Requests in `Encoding`, drained by the worker pool. Stays empty for
+    /// non-multimodal models -- nothing routes to it.
+    pub mm_rx: flume::Receiver<Request>,
+    /// Back-channel for the workers' `Encoded` into the to-scheduler loop.
     pub tm_tx: flume::Sender<TmEvent>,
-    /// The loaded tokenizer, shared with the tokenizer pool (`None` under
-    /// `skip_tokenizer_init`).
-    pub tokenizer: Option<Arc<dyn TextTokenizer>>,
 }
 
 /// One MM worker, spawned via `Runtime::start_mm_workers` (which owns the
 /// pinning policy for this pool — see its docs).
 pub struct MmWorker {
-    mm_rx: flume::Receiver<MmRequest>,
+    mm_rx: flume::Receiver<Request>,
     tm_tx: flume::Sender<TmEvent>,
     ctx: Arc<MmContext>,
 }
 
 impl MmWorker {
     pub fn new(
-        mm_rx: flume::Receiver<MmRequest>,
+        mm_rx: flume::Receiver<Request>,
         tm_tx: flume::Sender<TmEvent>,
         ctx: Arc<MmContext>,
     ) -> Self {
@@ -200,21 +301,43 @@ impl MmWorker {
 impl Runnable for MmWorker {
     /// Drain until the mm channel closes (to-scheduler drops its sender on
     /// shutdown). One request at a time, so the pool size bounds MM
-    /// concurrency; an error rejects the request back to the client.
+    /// concurrency. Mirrors `TokenizerWorker`: carve the work out of the
+    /// request, process, write the result back, advance the FSM
+    /// (`EncodeDone` -> PreSendValidating, or `Error` -> Failed, which intake
+    /// rejects to the client as Python turns a per-request exception into a
+    /// 400), and return the request as `Encoded`.
     fn run(self) {
-        while let Ok(req) = self.mm_rx.recv() {
-            let rid = req.rid;
-            let event = match process(&self.ctx, &rid, req.work) {
-                Ok(input_ids) => {
-                    tracing::debug!(%rid, tokens = input_ids.len(), "mm: processed");
-                    TmEvent::MmEncoded { rid, input_ids }
+        while let Ok(mut req) = self.mm_rx.recv() {
+            // A request is never dropped here: a kind this pool cannot serve
+            // goes back as `Failed`, so intake rejects it and releases its
+            // tracking entry instead of leaving the client hung.
+            let event = if let RequestKind::Generate(g) = &mut req.kind {
+                // Move the processor's inputs out: the unexpanded ids (always
+                // present by `Encoding`; the expanded ids replace them) and the
+                // media, so the processor owns the bytes without a copy. `text`
+                // stays for the scheduler header; nothing reads `mm` after this.
+                let input_ids = g.input_ids.take().unwrap_or_default();
+                let mm = g.mm.take().map(|m| *m).unwrap_or_default();
+                match process(&self.ctx, input_ids, mm) {
+                    Ok((input_ids, buffers)) => {
+                        tracing::debug!(rid = %req.rid, tokens = input_ids.len(), "mm: processed");
+                        g.input_ids = Some(input_ids);
+                        g.mm_buffers = buffers;
+                        Event::EncodeDone
+                    }
+                    Err(message) => {
+                        tracing::warn!(rid = %req.rid, %message, "mm processing rejected");
+                        Event::Error(Error::Encode(message))
+                    }
                 }
-                Err(message) => {
-                    tracing::warn!(%rid, %message, "mm processing rejected");
-                    TmEvent::MmFailed { rid, message }
-                }
+            } else {
+                tracing::error!(rid = %req.rid, "mm pool received a non-generate request");
+                Event::Error(Error::Internal(
+                    "non-generate request in the mm pool".into(),
+                ))
             };
-            if self.tm_tx.send(event).is_err() {
+            let _ = req.state.apply(event);
+            if self.tm_tx.send(TmEvent::Encoded(req)).is_err() {
                 return; // to-scheduler gone: shutdown
             }
         }
@@ -223,27 +346,26 @@ impl Runnable for MmWorker {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::{
-        ExternalMmEncodedEntry, ExternalMmItem, MmModality, MmTokenIds, Tensor, TensorData,
-    };
+    use sglang_mm::driver::OutputItem;
+    use std::collections::BTreeMap;
 
+    use super::*;
+    use crate::message::buffers::find;
+    use crate::utils::shm::{shm_path, unique_name};
+
+    /// An external-style processor: one image item with a caller-shaped
+    /// feature and spans, no M-RoPE.
     struct ExternalProcessor {
         shape: Vec<usize>,
         offsets: Vec<(u32, u32)>,
     }
 
     impl MmProcessor for ExternalProcessor {
-        fn process(
-            &self,
-            work: MmWorkItem,
-            tokenizer: Option<&dyn TextTokenizer>,
-        ) -> Result<MmProcessOutput, String> {
-            assert!(tokenizer.is_none());
+        fn process(&self, input_ids: TokenIds, _mm: MmData) -> Result<MmProcessOutput, String> {
             Ok(MmProcessOutput {
-                input_ids: work.input_ids.unwrap_or_default(),
-                result: MmEncodedEntry::External(ExternalMmEncodedEntry {
-                    items: vec![ExternalMmItem {
+                input_ids,
+                result: MmEncodedEntry {
+                    items: vec![MmEncodedItem {
                         modality: MmModality::Image,
                         feature: Tensor {
                             shape: self.shape.clone(),
@@ -251,56 +373,480 @@ mod tests {
                         },
                         hash: 7,
                         offsets: self.offsets.clone(),
-                        model_specific_data: Default::default(),
+                        model_specific_data: BTreeMap::from([(
+                            "clip_index".to_owned(),
+                            MmMetaValue::Int(3),
+                        )]),
                     }],
-                    token_ids: MmTokenIds::default(),
-                }),
+                    token_ids: None,
+                    mrope: None,
+                },
             })
         }
     }
 
+    /// The driver's output maps onto the encoded result without any
+    /// reconstruction: feature tensors keep their shape and dtype, spans and
+    /// hashes ride per item, integer aux tensors become metadata, and M-RoPE
+    /// carries over; 1-D positions leave `mrope` empty.
     #[test]
-    fn external_processor_result_reaches_store() {
-        let results = MmResultStore::default();
-        let processor = ExternalProcessor {
-            shape: vec![1],
-            offsets: vec![(1, 1)],
+    fn driver_output_maps_directly() {
+        let item = |shape: Vec<usize>, hash| OutputItem {
+            feature: Tensor {
+                shape,
+                data: TensorData::F32(vec![0.5; 12]),
+            },
+            aux: vec![
+                (
+                    "image_grid_thw".into(),
+                    Tensor {
+                        shape: vec![3],
+                        data: TensorData::I64(vec![1, 2, 3]),
+                    },
+                ),
+                (
+                    "clip_index".into(),
+                    Tensor {
+                        shape: vec![],
+                        data: TensorData::I64(vec![7]),
+                    },
+                ),
+            ],
+            hash,
         };
-        let ctx = MmContext::with_processor(Arc::new(processor), None, results.clone());
-        let rid = Rid::from_client("external");
-        let work = MmWorkItem {
-            input_ids: Some(vec![1, 2]),
+        let output = Output {
+            input_ids: vec![1, 2, 2, 3],
+            items: vec![item(vec![6, 2], 11), item(vec![2, 6], 22)],
+            offsets: vec![(1, 2), (3, 3)],
+            positions: PositionOutput::MRope {
+                positions: vec![0; 12],
+                delta: -2,
+            },
+        };
+        let encoded = encode_driver_output(output).unwrap();
+        assert_eq!(encoded.input_ids, [1, 2, 2, 3]);
+        let items = &encoded.result.items;
+        assert_eq!(items[0].feature.shape, [6, 2], "shape kept, not rebuilt");
+        assert_eq!(items[1].feature.shape, [2, 6]);
+        assert_eq!((items[0].hash, items[1].hash), (11, 22));
+        assert_eq!(items[0].offsets, [(1, 2)]);
+        assert_eq!(items[1].offsets, [(3, 3)]);
+        assert_eq!(
+            items[0].model_specific_data["image_grid_thw"],
+            MmMetaValue::Ints(vec![1, 2, 3])
+        );
+        assert_eq!(
+            items[0].model_specific_data["clip_index"],
+            MmMetaValue::Int(7)
+        );
+        let mrope = encoded.result.mrope.as_ref().unwrap();
+        assert_eq!((mrope.positions.len(), mrope.delta), (12, -2));
+
+        let plain = Output {
+            input_ids: vec![1],
+            items: vec![],
+            offsets: vec![],
+            positions: PositionOutput::Rope1D,
+        };
+        assert!(encode_driver_output(plain).unwrap().result.mrope.is_none());
+
+        let bad = Output {
+            input_ids: vec![1],
+            items: vec![OutputItem {
+                feature: Tensor {
+                    shape: vec![1],
+                    data: TensorData::F32(vec![1.0]),
+                },
+                aux: vec![(
+                    "scale".into(),
+                    Tensor {
+                        shape: vec![1],
+                        data: TensorData::F32(vec![1.0]),
+                    },
+                )],
+                hash: 1,
+            }],
+            offsets: vec![(0, 0)],
+            positions: PositionOutput::Rope1D,
+        };
+        let Err(err) = encode_driver_output(bad) else {
+            panic!("an f32 aux tensor must be rejected");
+        };
+        assert!(err.contains("no metadata form"), "{err}");
+    }
+
+    /// The built-in Qwen shape: two items with grids, spans and M-RoPE.
+    fn qwen_entry() -> MmEncodedEntry {
+        let item = |rows: usize, feature: Vec<f32>, grid: [i64; 3], hash, span| MmEncodedItem {
+            modality: MmModality::Image,
+            feature: Tensor {
+                shape: vec![rows, 2],
+                data: TensorData::F32(feature),
+            },
+            hash,
+            offsets: vec![span],
+            model_specific_data: BTreeMap::from([(
+                "image_grid_thw".to_owned(),
+                MmMetaValue::Ints(grid.to_vec()),
+            )]),
+        };
+        MmEncodedEntry {
+            items: vec![
+                item(2, vec![1.0, 2.0, 3.0, 4.0], [1, 2, 1], 11, (1, 2)),
+                item(1, vec![5.0, 6.0], [1, 1, 1], 22, (3, 3)),
+            ],
+            token_ids: None,
+            mrope: Some(MRope {
+                positions: vec![0, 1, 2, 0, 1, 2, 0, 1, 2],
+                delta: -1,
+            }),
+        }
+    }
+
+    fn decoded_meta(buffers: &[Buffer]) -> rmpv::Value {
+        let BufferStore::Inline(BufferData::U8(bytes)) = &find(buffers, "mm.meta").unwrap().store
+        else {
+            panic!("mm.meta must be an inline byte buffer")
+        };
+        rmpv::decode::read_value(&mut bytes.as_slice()).unwrap()
+    }
+
+    /// Inline: one shaped `mm.feature.{i}` per item owning its own tensor, the
+    /// M-RoPE positions as `[3, len]`, and the sidecar last, decoding to named
+    /// maps with the item metadata in order.
+    #[test]
+    fn buffers_are_shaped_features_mrope_and_meta_sidecar() {
+        let buffers = make_buffers(qwen_entry(), false).unwrap();
+        let names: Vec<&str> = buffers.iter().map(|b| b.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["mm.feature.0", "mm.feature.1", "mm.mrope", "mm.meta"]
+        );
+        let feature1 = find(&buffers, "mm.feature.1").unwrap();
+        assert_eq!(feature1.shape, [1, 2]);
+        assert!(
+            matches!(&feature1.store, BufferStore::Inline(BufferData::F32(v)) if v == &[5.0, 6.0])
+        );
+        assert_eq!(find(&buffers, "mm.mrope").unwrap().shape, [3, 3]);
+
+        let meta = decoded_meta(&buffers);
+        let get = |m: &rmpv::Value, key: &str| {
+            m.as_map()
+                .unwrap()
+                .iter()
+                .find(|(k, _)| k.as_str() == Some(key))
+                .map(|(_, v)| v.clone())
+                .unwrap()
+        };
+        let items = get(&meta, "items");
+        let items = items.as_array().unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(get(&items[1], "hash").as_u64(), Some(22));
+        assert_eq!(get(&items[1], "modality").as_str(), Some("image"));
+        assert_eq!(
+            get(&items[1], "offsets"),
+            rmpv::Value::Array(vec![rmpv::Value::Array(vec![3.into(), 3.into()])])
+        );
+        assert_eq!(
+            get(&get(&items[0], "model_specific_data"), "image_grid_thw"),
+            rmpv::Value::Array(vec![1.into(), 2.into(), 1.into()])
+        );
+        assert_eq!(get(&meta, "mrope_delta").as_i64(), Some(-1));
+        assert!(get(&meta, "token_ids").is_nil());
+    }
+
+    /// Shm: each item's tensor lands in its own segment holding exactly its
+    /// bytes, shaped as the tensor; the segment lives as long as the buffer.
+    #[test]
+    fn shm_places_each_item_in_its_own_segment() {
+        let names: Vec<String> = (0..2).map(|_| unique_name("test")).collect();
+        let namer = names.clone();
+        let features: Vec<Tensor> = qwen_entry().items.into_iter().map(|i| i.feature).collect();
+        let expected: Vec<Vec<f32>> = features
+            .iter()
+            .map(|t| match &t.data {
+                TensorData::F32(v) => v.clone(),
+                _ => unreachable!(),
+            })
+            .collect();
+        let buffers = place_features(features, true, move |i| namer[i].clone());
+        for (i, name) in names.iter().enumerate() {
+            assert!(matches!(buffers[i].store, BufferStore::Shm { .. }));
+            assert_eq!(buffers[i].shape, [[2, 2], [1, 2]][i]);
+            let bytes = std::fs::read(shm_path(name)).unwrap();
+            assert_eq!(bytes, bytemuck::cast_slice::<f32, u8>(&expected[i]));
+        }
+        drop(buffers);
+        assert!(names.iter().all(|n| !shm_path(n).exists()), "drop unlinks");
+    }
+
+    /// An empty tensor has no segment to make: it stays inline while its
+    /// siblings still go to shm, with no request-wide fallback.
+    #[test]
+    fn shm_keeps_empty_items_inline() {
+        let names: Vec<String> = (0..2).map(|_| unique_name("test")).collect();
+        let namer = names.clone();
+        let features = vec![
+            Tensor {
+                shape: vec![0, 2],
+                data: TensorData::F32(vec![]),
+            },
+            Tensor {
+                shape: vec![1, 2],
+                data: TensorData::F32(vec![5.0, 6.0]),
+            },
+        ];
+        let buffers = place_features(features, true, move |i| namer[i].clone());
+        assert!(
+            matches!(&buffers[0].store, BufferStore::Inline(BufferData::F32(v)) if v.is_empty())
+        );
+        assert_eq!(buffers[0].shape, [0, 2]);
+        assert!(
+            !shm_path(&names[0]).exists(),
+            "no segment for the empty item"
+        );
+        assert!(matches!(buffers[1].store, BufferStore::Shm { .. }));
+        assert!(
+            shm_path(&names[1]).exists(),
+            "the sibling still goes to shm"
+        );
+    }
+
+    /// A full `/dev/shm` (page reservation refused with `ENOSPC`) reaches the
+    /// same inline fallback as any other segment failure: the request keeps
+    /// every feature value, and the segments made before the failure are gone.
+    #[test]
+    fn shm_exhaustion_falls_back_to_inline_with_values_intact() {
+        use crate::utils::shm::{ShmSegment, shm_path};
+        use std::os::fd::BorrowedFd;
+
+        // Item 0's segment is created for real; item 1's reservation fails as
+        // an exhausted tmpfs would. `place_features` sees one Err and must
+        // fall the whole request back, dropping item 0's segment with it.
+        fn no_space(_: BorrowedFd<'_>, _: u64) -> rustix::io::Result<()> {
+            Err(rustix::io::Errno::NOSPC)
+        }
+        let names: Vec<String> = (0..2).map(|_| unique_name("test")).collect();
+        let first = names[0].clone();
+        let expected: Vec<Vec<f32>> = qwen_entry()
+            .items
+            .iter()
+            .map(|i| match &i.feature.data {
+                TensorData::F32(v) => v.clone(),
+                _ => unreachable!(),
+            })
+            .collect();
+        let bytes0 = bytemuck::cast_slice::<f32, u8>(&expected[0]).to_vec();
+        let parked: Result<Vec<Buffer>, String> = (0..2)
+            .map(|i| {
+                let segment = if i == 0 {
+                    ShmSegment::create(first.clone(), &bytes0)
+                } else {
+                    ShmSegment::create_with(names[1].clone(), &[1], no_space)
+                }?;
+                Ok(Buffer {
+                    name: format!("mm.feature.{i}"),
+                    shape: vec![1],
+                    store: BufferStore::Shm {
+                        segment,
+                        dtype: crate::message::buffers::DType::F32,
+                    },
+                })
+            })
+            .collect();
+        let err = parked.unwrap_err();
+        assert!(err.contains("fallocate("), "{err}");
+        assert!(err.contains("No space left"), "{err}");
+        assert!(!shm_path(&first).exists(), "item 0's segment released");
+
+        // And through `place_features` itself, with a namer whose second
+        // segment cannot be reserved: values survive, inline.
+        let features: Vec<Tensor> = qwen_entry().items.into_iter().map(|i| i.feature).collect();
+        let buffers = place_features(features, true, |_| "bad\0name".into());
+        for (i, buffer) in buffers.iter().enumerate() {
+            let BufferStore::Inline(BufferData::F32(v)) = &buffer.store else {
+                panic!("expected inline f32, got {:?}", buffer.store);
+            };
+            assert_eq!(v, &expected[i]);
+        }
+    }
+
+    /// A segment that cannot be created degrades the whole request to inline
+    /// rather than rejecting it (Python's `_wrap_shm_or_inline` parity).
+    #[test]
+    fn shm_failure_falls_back_to_inline() {
+        let features = qwen_entry().items.into_iter().map(|i| i.feature).collect();
+        let buffers = place_features(features, true, |_| "bad\0name".into());
+        assert_eq!(buffers.len(), 2);
+        assert!(
+            buffers
+                .iter()
+                .all(|b| matches!(b.store, BufferStore::Inline(_)))
+        );
+    }
+
+    /// An external processor's result rides the same buffers: its tensor's
+    /// dtype and shape are kept, the caller hash override applies, and the
+    /// sidecar carries its scalar metadata.
+    #[test]
+    fn external_processor_result_becomes_buffers() {
+        let ctx = MmContext::with_processor(
+            Arc::new(ExternalProcessor {
+                shape: vec![1],
+                offsets: vec![(1, 1)],
+            }),
+            false,
+        );
+        let mm = MmData {
             mm_hashes: vec!["2a".to_owned()],
             ..Default::default()
         };
-
-        assert_eq!(process(&ctx, &rid, work).unwrap(), [1, 2]);
-        let Some(MmEncodedEntry::External(entry)) = results.take(rid.as_str()) else {
-            panic!("external processor must park an external entry")
-        };
-        assert_eq!(entry.items.len(), 1);
-        assert_eq!(entry.items[0].hash, 0x2a);
+        let (input_ids, buffers) = process(&ctx, vec![1, 2], mm).unwrap();
+        assert_eq!(input_ids, [1, 2]);
+        assert_eq!(find(&buffers, "mm.feature.0").unwrap().shape, [1]);
+        assert!(find(&buffers, "mm.mrope").is_none());
+        let meta = decoded_meta(&buffers);
+        let text = format!("{meta}");
+        assert!(text.contains("42"), "caller hash 0x2a applied: {text}");
+        assert!(text.contains("clip_index"), "{text}");
     }
 
+    /// Malformed results are rejected before any buffer exists, so nothing
+    /// reaches the ring for them.
     #[test]
-    fn malformed_processor_results_are_rejected_before_parking() {
+    fn malformed_processor_results_are_rejected() {
         for (shape, offsets) in [
             (vec![2], vec![(1, 1)]),
             (vec![usize::MAX, 2], vec![(1, 1)]),
             (vec![1], vec![(2, 1)]),
             (vec![1], vec![(1, 2)]),
         ] {
-            let results = MmResultStore::default();
-            let processor = ExternalProcessor { shape, offsets };
-            let ctx = MmContext::with_processor(Arc::new(processor), None, results.clone());
-            let rid = Rid::from_client("invalid");
-            let work = MmWorkItem {
-                input_ids: Some(vec![1, 2]),
-                ..Default::default()
-            };
-            assert!(process(&ctx, &rid, work).is_err());
-            assert!(results.take(rid.as_str()).is_none());
+            let ctx =
+                MmContext::with_processor(Arc::new(ExternalProcessor { shape, offsets }), false);
+            assert!(process(&ctx, vec![1, 2], MmData::default()).is_err());
         }
+    }
+
+    /// A request in `Encoding` for the worker loop, with the given ids.
+    fn encoding_req(rid: &str, input_ids: Vec<i64>) -> Request {
+        use crate::message::request::GenerateRequest;
+        use crate::message::response::ResponseSink;
+        use crate::utils::fsm::RequestState;
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        Request {
+            rid: rid.to_string().into(),
+            state: RequestState::Encoding,
+            sink: ResponseSink::Local(tx),
+            kind: RequestKind::Generate(Box::new(GenerateRequest {
+                rid: rid.to_string().into(),
+                input_ids: Some(input_ids),
+                ..Default::default()
+            })),
+        }
+    }
+
+    /// The worker loop takes the whole request, like the tokenizer pool: on
+    /// success it writes the expanded ids and buffers back and advances to
+    /// `PreSendValidating`; on a processor error it marks the request
+    /// `Failed(Encode)`. Either way the request comes back as `Encoded`.
+    #[test]
+    fn worker_returns_request_with_fsm_advanced() {
+        use crate::utils::fsm::RequestState;
+        let (mm_tx, mm_rx) = flume::unbounded::<Request>();
+        let (tm_tx, tm_rx) = flume::unbounded::<TmEvent>();
+        let ok_ctx = Arc::new(MmContext::with_processor(
+            Arc::new(ExternalProcessor {
+                shape: vec![1],
+                offsets: vec![(1, 1)],
+            }),
+            false,
+        ));
+        let worker = std::thread::spawn({
+            let mm_rx = mm_rx.clone();
+            move || MmWorker::new(mm_rx, tm_tx, ok_ctx).run()
+        });
+        mm_tx.send(encoding_req("ok", vec![1, 2])).unwrap();
+        drop(mm_tx); // closes the pool edge -> the loop exits after draining
+        worker.join().unwrap();
+
+        let TmEvent::Encoded(req) = tm_rx.try_recv().expect("returned") else {
+            panic!("expected Encoded");
+        };
+        assert_eq!(req.rid.as_str(), "ok");
+        assert!(
+            matches!(req.state, RequestState::PreSendValidating),
+            "{:?}",
+            req.state
+        );
+        let RequestKind::Generate(g) = &req.kind else {
+            panic!("generate")
+        };
+        assert_eq!(g.input_ids.as_deref(), Some(&[1, 2][..]));
+        assert!(find(&g.mm_buffers, "mm.feature.0").is_some());
+        assert!(find(&g.mm_buffers, "mm.meta").is_some());
+
+        // A malformed result (span past the prompt) fails the request in place.
+        let (mm_tx, mm_rx) = flume::unbounded::<Request>();
+        let (tm_tx, tm_rx) = flume::unbounded::<TmEvent>();
+        let bad_ctx = Arc::new(MmContext::with_processor(
+            Arc::new(ExternalProcessor {
+                shape: vec![1],
+                offsets: vec![(1, 2)],
+            }),
+            false,
+        ));
+        let worker = std::thread::spawn(move || MmWorker::new(mm_rx, tm_tx, bad_ctx).run());
+        mm_tx.send(encoding_req("bad", vec![1, 2])).unwrap();
+        drop(mm_tx);
+        worker.join().unwrap();
+        let TmEvent::Encoded(req) = tm_rx.try_recv().expect("returned") else {
+            panic!("expected Encoded");
+        };
+        assert!(
+            matches!(req.state, RequestState::Failed(Error::Encode(_))),
+            "{:?}",
+            req.state
+        );
+    }
+
+    /// A kind the pool cannot serve is returned `Failed`, never dropped:
+    /// intake still holds its sink registration and pool-tracking entry.
+    #[test]
+    fn non_generate_request_is_returned_failed_not_dropped() {
+        use crate::message::response::ResponseSink;
+        use crate::utils::fsm::RequestState;
+        let (mm_tx, mm_rx) = flume::unbounded::<Request>();
+        let (tm_tx, tm_rx) = flume::unbounded::<TmEvent>();
+        let ctx = Arc::new(MmContext::with_processor(
+            Arc::new(ExternalProcessor {
+                shape: vec![1],
+                offsets: vec![(1, 1)],
+            }),
+            false,
+        ));
+        let (sink_tx, _sink_rx) = tokio::sync::mpsc::channel(4);
+        mm_tx
+            .send(Request {
+                rid: "detok".to_string().into(),
+                state: RequestState::Encoding,
+                sink: ResponseSink::Local(sink_tx),
+                kind: RequestKind::Detokenize {
+                    token_ids: vec![1, 2],
+                },
+            })
+            .unwrap();
+        drop(mm_tx);
+        MmWorker::new(mm_rx, tm_tx, ctx).run();
+
+        let TmEvent::Encoded(req) = tm_rx.try_recv().expect("returned, not dropped") else {
+            panic!("expected Encoded");
+        };
+        assert_eq!(req.rid.as_str(), "detok");
+        assert!(
+            matches!(req.state, RequestState::Failed(Error::Internal(_))),
+            "{:?}",
+            req.state
+        );
     }
 
     /// Caller hashes override computed ones; mismatched lengths and malformed

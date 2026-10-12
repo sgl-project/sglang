@@ -19,7 +19,7 @@ on:
         type: string
         required: true
       npu_device_type:
-        description: 'NPU device type, e.g. 910b, a3.'
+        description: 'NPU device type, e.g. a3, 950.'
         type: string
         default: 'a3'
       run_timeout_minutes:
@@ -177,7 +177,7 @@ jobs:
                 return false;
               }
               // multimodal-gen NPU tests should not cascade fast-fail to perf/accuracy stages.
-              if (baseName === 'multimodal-gen-test-1-npu-a3' || baseName === 'multimodal-gen-test-2-npu-a3') {
+              if (baseName === 'multimodal-gen-test-1-npu-a3' || baseName === 'multimodal-gen-test-4-npu-a3') {
                 core.info(`[health-check] Filtered out multimodal-gen NPU job: ${j.name}`);
                 return false;
               }
