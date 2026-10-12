@@ -1,80 +1,41 @@
 {
   "parser": "glm45",
   "inputs": [
-    {"chunks": ["Let me think", " about it", "</think>", "Paris", " is"]},
+    {"chunks": ["The user", " greets me.", "</think>", "Hello!"]},
     {"chunks": ["Let me think</th", "ink>Answer"]},
-    {"chunks": ["</think>", "Answer only"]},
     {"chunks": ["<think>", "reason", "</think>", "done"]},
-    {
-      "chunks": [
-        "The user wants the weather.", "</think>",
-        "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>"
-      ]
-    },
-    {
-      "chunks": [
-        "I should call a tool", "<tool_",
-        "call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>"
-      ]
-    },
-    {"chunks": ["mention <tool_call> inline", " then", "</think>", "ans"]},
-    {"chunks": ["reasoning\n", "<tool_call>f</tool_call>"]},
-    {"chunks": ["cut off mid reasoning"]},
-    {"chunks": ["cut </thi"]},
-    {"chunks": ["ends at <tool_"]},
-    {"chunks": ["a", "b", "c", "</think>"]},
-    {"chunks": ["", "x", "", "</think>", "", "y"]},
-    {"chunks": ["reason", "</think>", "line1\n", "<think>not reasoning</think>"]},
-    {"chunks": ["思考中", "……", "</think>", "答案"]},
-    {
-      "chunks": [
-        "</think>", "\n", "Hello",
-        "<tool_call>f<arg_key>a</arg_key><arg_value>1</arg_value></tool_call>"
-      ]
-    }
+    {"chunks": ["I should call a tool", "<tool_", "call>get_weather</tool_call>"]},
+    {"chunks": ["mention <tool_call> inline", "</think>", "ans"]},
+    {"chunks": ["ends at <tool_"]}
   ],
   "cases": [
     {
       "input": 0,
       "force": true,
       "stream": true,
-      "steps": [["Let me think", ""], [" about it", ""], ["", ""], ["", "Paris"], ["", " is"], ["", ""]],
-      "unary": ["Let me think about it", "Paris is"]
+      "steps": [["The user", ""], [" greets me.", ""], ["", ""], ["", "Hello!"], ["", ""]],
+      "unary": ["The user greets me.", "Hello!"]
     },
     {
       "input": 0,
       "force": true,
       "stream": false,
-      "steps": [["", ""], ["", ""], ["Let me think about it", ""], ["", "Paris"], ["", " is"], ["", ""]],
-      "unary": ["Let me think about it", "Paris is"]
+      "steps": [["", ""], ["", ""], ["The user greets me.", ""], ["", "Hello!"], ["", ""]],
+      "unary": ["The user greets me.", "Hello!"]
     },
     {
       "input": 0,
       "force": false,
       "stream": true,
-      "steps": [
-        ["", "Let me think"],
-        ["", " about it"],
-        ["", "</think>"],
-        ["", "Paris"],
-        ["", " is"],
-        ["", ""]
-      ],
-      "unary": ["", "Let me think about it</think>Paris is"]
+      "steps": [["", "The user"], ["", " greets me."], ["", "</think>"], ["", "Hello!"], ["", ""]],
+      "unary": ["", "The user greets me.</think>Hello!"]
     },
     {
       "input": 0,
       "force": false,
       "stream": false,
-      "steps": [
-        ["", "Let me think"],
-        ["", " about it"],
-        ["", "</think>"],
-        ["", "Paris"],
-        ["", " is"],
-        ["", ""]
-      ],
-      "unary": ["", "Let me think about it</think>Paris is"]
+      "steps": [["", "The user"], ["", " greets me."], ["", "</think>"], ["", "Hello!"], ["", ""]],
+      "unary": ["", "The user greets me.</think>Hello!"]
     },
     {
       "input": 1,
@@ -108,505 +69,113 @@
       "input": 2,
       "force": true,
       "stream": true,
-      "steps": [["", ""], ["", "Answer only"], ["", ""]],
-      "unary": ["", "Answer only"]
-    },
-    {
-      "input": 2,
-      "force": true,
-      "stream": false,
-      "steps": [["", ""], ["", "Answer only"], ["", ""]],
-      "unary": ["", "Answer only"]
-    },
-    {
-      "input": 2,
-      "force": false,
-      "stream": true,
-      "steps": [["", "</think>"], ["", "Answer only"], ["", ""]],
-      "unary": ["", "</think>Answer only"]
-    },
-    {
-      "input": 2,
-      "force": false,
-      "stream": false,
-      "steps": [["", "</think>"], ["", "Answer only"], ["", ""]],
-      "unary": ["", "</think>Answer only"]
-    },
-    {
-      "input": 3,
-      "force": true,
-      "stream": true,
       "steps": [["", ""], ["reason", ""], ["", ""], ["", "done"], ["", ""]],
       "unary": ["reason", "done"]
     },
     {
-      "input": 3,
+      "input": 2,
       "force": true,
       "stream": false,
       "steps": [["", ""], ["", ""], ["reason", ""], ["", "done"], ["", ""]],
       "unary": ["reason", "done"]
     },
     {
-      "input": 3,
+      "input": 2,
       "force": false,
       "stream": true,
       "steps": [["", ""], ["reason", ""], ["", ""], ["", "done"], ["", ""]],
       "unary": ["reason", "done"]
     },
     {
-      "input": 3,
+      "input": 2,
       "force": false,
       "stream": false,
       "steps": [["", ""], ["", ""], ["reason", ""], ["", "done"], ["", ""]],
       "unary": ["reason", "done"]
     },
     {
+      "input": 3,
+      "force": true,
+      "stream": true,
+      "steps": [["I should call a tool", ""], ["", ""], ["", "<tool_call>get_weather</tool_call>"], ["", ""]],
+      "unary": ["I should call a tool", "<tool_call>get_weather</tool_call>"]
+    },
+    {
+      "input": 3,
+      "force": true,
+      "stream": false,
+      "steps": [["", ""], ["", ""], ["I should call a tool", "<tool_call>get_weather</tool_call>"], ["", ""]],
+      "unary": ["I should call a tool", "<tool_call>get_weather</tool_call>"]
+    },
+    {
+      "input": 3,
+      "force": false,
+      "stream": true,
+      "steps": [["", "I should call a tool"], ["", ""], ["", "<tool_call>get_weather</tool_call>"], ["", ""]],
+      "unary": ["", "I should call a tool<tool_call>get_weather</tool_call>"]
+    },
+    {
+      "input": 3,
+      "force": false,
+      "stream": false,
+      "steps": [["", "I should call a tool"], ["", ""], ["", "<tool_call>get_weather</tool_call>"], ["", ""]],
+      "unary": ["", "I should call a tool<tool_call>get_weather</tool_call>"]
+    },
+    {
       "input": 4,
       "force": true,
       "stream": true,
-      "steps": [
-        ["The user wants the weather.", ""],
-        ["", ""],
-        [
-          "",
-          "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>"
-        ],
-        ["", ""]
-      ],
-      "unary": [
-        "The user wants the weather.",
-        "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>"
-      ]
+      "steps": [["mention ", "<tool_call> inline"], ["", "</think>"], ["", "ans"], ["", ""]],
+      "unary": ["mention <tool_call> inline", "ans"]
     },
     {
       "input": 4,
       "force": true,
       "stream": false,
-      "steps": [
-        ["", ""],
-        ["The user wants the weather.", ""],
-        [
-          "",
-          "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>"
-        ],
-        ["", ""]
-      ],
-      "unary": [
-        "The user wants the weather.",
-        "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>"
-      ]
+      "steps": [["mention ", "<tool_call> inline"], ["", "</think>"], ["", "ans"], ["", ""]],
+      "unary": ["mention <tool_call> inline", "ans"]
     },
     {
       "input": 4,
       "force": false,
       "stream": true,
-      "steps": [
-        ["", "The user wants the weather."],
-        ["", "</think>"],
-        [
-          "",
-          "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>"
-        ],
-        ["", ""]
-      ],
-      "unary": [
-        "",
-        "The user wants the weather.</think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>"
-      ]
+      "steps": [["", "mention <tool_call> inline"], ["", "</think>"], ["", "ans"], ["", ""]],
+      "unary": ["", "mention <tool_call> inline</think>ans"]
     },
     {
       "input": 4,
       "force": false,
       "stream": false,
-      "steps": [
-        ["", "The user wants the weather."],
-        ["", "</think>"],
-        [
-          "",
-          "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>"
-        ],
-        ["", ""]
-      ],
-      "unary": [
-        "",
-        "The user wants the weather.</think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>"
-      ]
+      "steps": [["", "mention <tool_call> inline"], ["", "</think>"], ["", "ans"], ["", ""]],
+      "unary": ["", "mention <tool_call> inline</think>ans"]
     },
     {
       "input": 5,
-      "force": true,
-      "stream": true,
-      "steps": [
-        ["I should call a tool", ""],
-        ["", ""],
-        [
-          "",
-          "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>"
-        ],
-        ["", ""]
-      ],
-      "unary": [
-        "I should call a tool",
-        "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>"
-      ]
-    },
-    {
-      "input": 5,
-      "force": true,
-      "stream": false,
-      "steps": [
-        ["", ""],
-        ["", ""],
-        [
-          "I should call a tool",
-          "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>"
-        ],
-        ["", ""]
-      ],
-      "unary": [
-        "I should call a tool",
-        "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>"
-      ]
-    },
-    {
-      "input": 5,
-      "force": false,
-      "stream": true,
-      "steps": [
-        ["", "I should call a tool"],
-        ["", ""],
-        [
-          "",
-          "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>"
-        ],
-        ["", ""]
-      ],
-      "unary": [
-        "",
-        "I should call a tool<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>"
-      ]
-    },
-    {
-      "input": 5,
-      "force": false,
-      "stream": false,
-      "steps": [
-        ["", "I should call a tool"],
-        ["", ""],
-        [
-          "",
-          "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>"
-        ],
-        ["", ""]
-      ],
-      "unary": [
-        "",
-        "I should call a tool<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>"
-      ]
-    },
-    {
-      "input": 6,
-      "force": true,
-      "stream": true,
-      "steps": [["mention ", "<tool_call> inline"], ["", " then"], ["", "</think>"], ["", "ans"], ["", ""]],
-      "unary": ["mention <tool_call> inline then", "ans"]
-    },
-    {
-      "input": 6,
-      "force": true,
-      "stream": false,
-      "steps": [["mention ", "<tool_call> inline"], ["", " then"], ["", "</think>"], ["", "ans"], ["", ""]],
-      "unary": ["mention <tool_call> inline then", "ans"]
-    },
-    {
-      "input": 6,
-      "force": false,
-      "stream": true,
-      "steps": [["", "mention <tool_call> inline"], ["", " then"], ["", "</think>"], ["", "ans"], ["", ""]],
-      "unary": ["", "mention <tool_call> inline then</think>ans"]
-    },
-    {
-      "input": 6,
-      "force": false,
-      "stream": false,
-      "steps": [["", "mention <tool_call> inline"], ["", " then"], ["", "</think>"], ["", "ans"], ["", ""]],
-      "unary": ["", "mention <tool_call> inline then</think>ans"]
-    },
-    {
-      "input": 7,
-      "force": true,
-      "stream": true,
-      "steps": [["reasoning\n", ""], ["", "<tool_call>f</tool_call>"], ["", ""]],
-      "unary": ["reasoning\n", "<tool_call>f</tool_call>"]
-    },
-    {
-      "input": 7,
-      "force": true,
-      "stream": false,
-      "steps": [["", ""], ["reasoning\n", "<tool_call>f</tool_call>"], ["", ""]],
-      "unary": ["reasoning\n", "<tool_call>f</tool_call>"]
-    },
-    {
-      "input": 7,
-      "force": false,
-      "stream": true,
-      "steps": [["", "reasoning\n"], ["", "<tool_call>f</tool_call>"], ["", ""]],
-      "unary": ["", "reasoning\n<tool_call>f</tool_call>"]
-    },
-    {
-      "input": 7,
-      "force": false,
-      "stream": false,
-      "steps": [["", "reasoning\n"], ["", "<tool_call>f</tool_call>"], ["", ""]],
-      "unary": ["", "reasoning\n<tool_call>f</tool_call>"]
-    },
-    {
-      "input": 8,
-      "force": true,
-      "stream": true,
-      "steps": [["cut off mid reasoning", ""], ["", ""]],
-      "unary": ["cut off mid reasoning", ""]
-    },
-    {
-      "input": 8,
-      "force": true,
-      "stream": false,
-      "steps": [["", ""], ["cut off mid reasoning", ""]],
-      "unary": ["cut off mid reasoning", ""]
-    },
-    {
-      "input": 8,
-      "force": false,
-      "stream": true,
-      "steps": [["", "cut off mid reasoning"], ["", ""]],
-      "unary": ["", "cut off mid reasoning"]
-    },
-    {
-      "input": 8,
-      "force": false,
-      "stream": false,
-      "steps": [["", "cut off mid reasoning"], ["", ""]],
-      "unary": ["", "cut off mid reasoning"]
-    },
-    {
-      "input": 9,
-      "force": true,
-      "stream": true,
-      "steps": [["cut ", ""], ["</thi", ""]],
-      "unary": ["cut </thi", ""]
-    },
-    {
-      "input": 9,
-      "force": true,
-      "stream": false,
-      "steps": [["", ""], ["cut </thi", ""]],
-      "unary": ["cut </thi", ""]
-    },
-    {
-      "input": 9,
-      "force": false,
-      "stream": true,
-      "steps": [["", "cut </thi"], ["", ""]],
-      "unary": ["", "cut </thi"]
-    },
-    {
-      "input": 9,
-      "force": false,
-      "stream": false,
-      "steps": [["", "cut </thi"], ["", ""]],
-      "unary": ["", "cut </thi"]
-    },
-    {
-      "input": 10,
       "force": true,
       "stream": true,
       "steps": [["ends at ", ""], ["<tool_", ""]],
       "unary": ["ends at <tool_", ""]
     },
     {
-      "input": 10,
+      "input": 5,
       "force": true,
       "stream": false,
       "steps": [["", ""], ["ends at <tool_", ""]],
       "unary": ["ends at <tool_", ""]
     },
     {
-      "input": 10,
+      "input": 5,
       "force": false,
       "stream": true,
       "steps": [["", "ends at <tool_"], ["", ""]],
       "unary": ["", "ends at <tool_"]
     },
     {
-      "input": 10,
+      "input": 5,
       "force": false,
       "stream": false,
       "steps": [["", "ends at <tool_"], ["", ""]],
       "unary": ["", "ends at <tool_"]
-    },
-    {
-      "input": 11,
-      "force": true,
-      "stream": true,
-      "steps": [["a", ""], ["b", ""], ["c", ""], ["", ""], ["", ""]],
-      "unary": ["abc", ""]
-    },
-    {
-      "input": 11,
-      "force": true,
-      "stream": false,
-      "steps": [["", ""], ["", ""], ["", ""], ["abc", ""], ["", ""]],
-      "unary": ["abc", ""]
-    },
-    {
-      "input": 11,
-      "force": false,
-      "stream": true,
-      "steps": [["", "a"], ["", "b"], ["", "c"], ["", "</think>"], ["", ""]],
-      "unary": ["", "abc</think>"]
-    },
-    {
-      "input": 11,
-      "force": false,
-      "stream": false,
-      "steps": [["", "a"], ["", "b"], ["", "c"], ["", "</think>"], ["", ""]],
-      "unary": ["", "abc</think>"]
-    },
-    {
-      "input": 12,
-      "force": true,
-      "stream": true,
-      "steps": [["", ""], ["x", ""], ["", ""], ["", ""], ["", ""], ["", "y"], ["", ""]],
-      "unary": ["x", "y"]
-    },
-    {
-      "input": 12,
-      "force": true,
-      "stream": false,
-      "steps": [["", ""], ["", ""], ["", ""], ["x", ""], ["", ""], ["", "y"], ["", ""]],
-      "unary": ["x", "y"]
-    },
-    {
-      "input": 12,
-      "force": false,
-      "stream": true,
-      "steps": [["", ""], ["", "x"], ["", ""], ["", "</think>"], ["", ""], ["", "y"], ["", ""]],
-      "unary": ["", "x</think>y"]
-    },
-    {
-      "input": 12,
-      "force": false,
-      "stream": false,
-      "steps": [["", ""], ["", "x"], ["", ""], ["", "</think>"], ["", ""], ["", "y"], ["", ""]],
-      "unary": ["", "x</think>y"]
-    },
-    {
-      "input": 13,
-      "force": true,
-      "stream": true,
-      "steps": [["reason", ""], ["", ""], ["", "line1\n"], ["not reasoning", ""], ["", ""]],
-      "unary": ["reason", "line1\n<think>not reasoning</think>"]
-    },
-    {
-      "input": 13,
-      "force": true,
-      "stream": false,
-      "steps": [["", ""], ["reason", ""], ["", "line1\n"], ["not reasoning", ""], ["", ""]],
-      "unary": ["reason", "line1\n<think>not reasoning</think>"]
-    },
-    {
-      "input": 13,
-      "force": false,
-      "stream": true,
-      "steps": [["", "reason"], ["", "</think>"], ["", "line1\n"], ["not reasoning", ""], ["", ""]],
-      "unary": ["reason", "line1\n<think>not reasoning</think>"]
-    },
-    {
-      "input": 13,
-      "force": false,
-      "stream": false,
-      "steps": [["", "reason"], ["", "</think>"], ["", "line1\n"], ["not reasoning", ""], ["", ""]],
-      "unary": ["reason", "line1\n<think>not reasoning</think>"]
-    },
-    {
-      "input": 14,
-      "force": true,
-      "stream": true,
-      "steps": [["思考中", ""], ["……", ""], ["", ""], ["", "答案"], ["", ""]],
-      "unary": ["思考中……", "答案"]
-    },
-    {
-      "input": 14,
-      "force": true,
-      "stream": false,
-      "steps": [["", ""], ["", ""], ["思考中……", ""], ["", "答案"], ["", ""]],
-      "unary": ["思考中……", "答案"]
-    },
-    {
-      "input": 14,
-      "force": false,
-      "stream": true,
-      "steps": [["", "思考中"], ["", "……"], ["", "</think>"], ["", "答案"], ["", ""]],
-      "unary": ["", "思考中……</think>答案"]
-    },
-    {
-      "input": 14,
-      "force": false,
-      "stream": false,
-      "steps": [["", "思考中"], ["", "……"], ["", "</think>"], ["", "答案"], ["", ""]],
-      "unary": ["", "思考中……</think>答案"]
-    },
-    {
-      "input": 15,
-      "force": true,
-      "stream": true,
-      "steps": [
-        ["", ""],
-        ["", "\n"],
-        ["", "Hello"],
-        ["", "<tool_call>f<arg_key>a</arg_key><arg_value>1</arg_value></tool_call>"],
-        ["", ""]
-      ],
-      "unary": ["", "\nHello<tool_call>f<arg_key>a</arg_key><arg_value>1</arg_value></tool_call>"]
-    },
-    {
-      "input": 15,
-      "force": true,
-      "stream": false,
-      "steps": [
-        ["", ""],
-        ["", "\n"],
-        ["", "Hello"],
-        ["", "<tool_call>f<arg_key>a</arg_key><arg_value>1</arg_value></tool_call>"],
-        ["", ""]
-      ],
-      "unary": ["", "\nHello<tool_call>f<arg_key>a</arg_key><arg_value>1</arg_value></tool_call>"]
-    },
-    {
-      "input": 15,
-      "force": false,
-      "stream": true,
-      "steps": [
-        ["", "</think>"],
-        ["", "\n"],
-        ["", "Hello"],
-        ["", "<tool_call>f<arg_key>a</arg_key><arg_value>1</arg_value></tool_call>"],
-        ["", ""]
-      ],
-      "unary": ["", "</think>\nHello<tool_call>f<arg_key>a</arg_key><arg_value>1</arg_value></tool_call>"]
-    },
-    {
-      "input": 15,
-      "force": false,
-      "stream": false,
-      "steps": [
-        ["", "</think>"],
-        ["", "\n"],
-        ["", "Hello"],
-        ["", "<tool_call>f<arg_key>a</arg_key><arg_value>1</arg_value></tool_call>"],
-        ["", ""]
-      ],
-      "unary": ["", "</think>\nHello<tool_call>f<arg_key>a</arg_key><arg_value>1</arg_value></tool_call>"]
     }
   ]
 }

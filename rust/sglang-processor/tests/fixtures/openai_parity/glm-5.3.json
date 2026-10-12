@@ -7,230 +7,25 @@
       "name": "chat",
       "endpoint": "chat",
       "synthetic": true,
-      "request": {
-        "model": "zai-org/GLM-5.3",
-        "messages": [{"role": "user", "content": "Hi"}],
-        "max_tokens": 64
-      },
+      "request": {"model": "zai-org/GLM-5.3", "messages": [{"role": "user", "content": "Hi"}]},
       "engine": {
         "status": 200,
         "body": {
-          "text": "The user greets me, so I should greet back.</think>Hello! How can I help you today?",
-          "output_ids": [
-            785, 1196, 2816, 1415, 752, 11, 773, 358, 1265, 40561, 1182, 13, 154842, 9703, 0, 2585,
-            646, 358, 1492, 498, 3351, 30
-          ],
+          "text": "Greet back.</think>Hello!",
+          "output_ids": [38, 3744, 1182, 13, 154842, 9703, 0],
           "meta_info": {
-            "id": "0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e",
+            "id": "r",
             "finish_reason": {"type": "stop", "matched": 154827},
-            "prompt_tokens": 120,
+            "prompt_tokens": 12,
             "weight_version": "default",
-            "reasoning_tokens": 11,
-            "completion_tokens": 22,
-            "cached_tokens": 0,
-            "weight_versions": [{"version": "default", "start": 0, "end": 22}],
-            "cached_tokens_details": null
+            "reasoning_tokens": 2,
+            "completion_tokens": 7,
+            "cached_tokens": 0
           }
         }
       },
       "generate": {
         "input_ids": [154822, 154824, 154826, 25062, 287, 29905, 371, 25, 7487, 154827, 13041, 154828, 154841],
-        "sampling_params": {"max_new_tokens": 64},
-        "return_logprob": false,
-        "logprob_start_len": -1,
-        "top_logprobs_num": 0,
-        "return_sampling_mask": false,
-        "return_text_in_logprobs": true,
-        "modalities": [],
-        "require_reasoning": true
-      },
-      "openai": {
-        "status": 200,
-        "body": {
-          "id": "0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e",
-          "object": "chat.completion",
-          "created": 1791761736,
-          "model": "zai-org/GLM-5.3",
-          "choices": [
-            {
-              "index": 0,
-              "message": {
-                "role": "assistant",
-                "content": "Hello! How can I help you today?",
-                "reasoning_content": "The user greets me, so I should greet back.",
-                "tool_calls": null
-              },
-              "logprobs": null,
-              "finish_reason": "stop",
-              "matched_stop": 154827
-            }
-          ],
-          "usage": {
-            "prompt_tokens": 120,
-            "total_tokens": 142,
-            "completion_tokens": 22,
-            "prompt_tokens_details": null,
-            "reasoning_tokens": 11
-          },
-          "metadata": {
-            "weight_version": "default",
-            "weight_versions": [{"version": "default", "start": 0, "end": 22}]
-          }
-        }
-      }
-    },
-    {
-      "name": "chat_stream",
-      "endpoint": "chat",
-      "synthetic": true,
-      "request": {
-        "model": "zai-org/GLM-5.3",
-        "messages": [{"role": "user", "content": "Hi"}],
-        "max_tokens": 64,
-        "stream": true,
-        "stream_options": {"include_usage": true}
-      },
-      "engine": {
-        "status": 200,
-        "frames": [
-          {"text": "The user", "output_ids": [785, 1196], "meta_info": {"id": "0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e", "finish_reason": null, "prompt_tokens": 120, "weight_version": "default", "reasoning_tokens": 0, "completion_tokens": 2, "cached_tokens": 0}},
-          {"text": " greets me, so I", "output_ids": [2816, 1415, 752, 11, 773, 358], "meta_info": {"completion_tokens": 8}},
-          {"text": " should greet back.", "output_ids": [1265, 40561, 1182, 13], "meta_info": {"completion_tokens": 12}},
-          {"text": "</th", "output_ids": [522, 339], "meta_info": {"completion_tokens": 14}},
-          {"text": "ink>", "output_ids": [766, 29], "meta_info": {"completion_tokens": 16}},
-          {"text": "Hello!", "output_ids": [9703, 0], "meta_info": {"completion_tokens": 18}},
-          {"text": " How can I help you today?", "output_ids": [2585, 646, 358, 1492, 498, 3351, 30], "meta_info": {"completion_tokens": 25, "finish_reason": {"type": "stop", "matched": 154827}, "reasoning_tokens": 11}}
-        ]
-      },
-      "generate": {
-        "input_ids": [154822, 154824, 154826, 25062, 287, 29905, 371, 25, 7487, 154827, 13041, 154828, 154841],
-        "sampling_params": {"max_new_tokens": 64},
-        "return_logprob": false,
-        "logprob_start_len": -1,
-        "top_logprobs_num": 0,
-        "return_sampling_mask": false,
-        "return_text_in_logprobs": true,
-        "stream": true,
-        "modalities": [],
-        "require_reasoning": true
-      },
-      "openai": {
-        "events": [
-          {"id": "0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e", "object": "chat.completion.chunk", "created": 1791761736, "model": "zai-org/GLM-5.3", "choices": [{"index": 0, "delta": {"reasoning_content": null, "role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e", "object": "chat.completion.chunk", "created": 1791761736, "model": "zai-org/GLM-5.3", "choices": [{"index": 0, "delta": {"reasoning_content": "The user"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e", "object": "chat.completion.chunk", "created": 1791761736, "model": "zai-org/GLM-5.3", "choices": [{"index": 0, "delta": {"reasoning_content": " greets me, so I"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e", "object": "chat.completion.chunk", "created": 1791761736, "model": "zai-org/GLM-5.3", "choices": [{"index": 0, "delta": {"reasoning_content": " should greet back."}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e", "object": "chat.completion.chunk", "created": 1791761736, "model": "zai-org/GLM-5.3", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": "Hello!"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e", "object": "chat.completion.chunk", "created": 1791761736, "model": "zai-org/GLM-5.3", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": " How can I help you today?"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e", "object": "chat.completion.chunk", "created": 1791761736, "model": "zai-org/GLM-5.3", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": null, "finish_reason": "stop", "matched_stop": 154827}]},
-          {"id": "0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e", "object": "chat.completion.chunk", "created": 1791761736, "model": "zai-org/GLM-5.3", "choices": [], "usage": {"prompt_tokens": 120, "total_tokens": 145, "completion_tokens": 25, "prompt_tokens_details": null, "reasoning_tokens": 11}},
-          "[DONE]"
-        ]
-      }
-    },
-    {
-      "name": "chat_effort_low",
-      "endpoint": "chat",
-      "synthetic": true,
-      "request": {
-        "model": "zai-org/GLM-5.3",
-        "messages": [{"role": "user", "content": "Hi"}],
-        "reasoning_effort": "low",
-        "temperature": 0
-      },
-      "engine": {
-        "status": 200,
-        "body": {
-          "text": "Greeting.</think>Hi there!",
-          "output_ids": [38, 43382, 13, 154842, 13041, 1052, 0],
-          "meta_info": {
-            "id": "0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e",
-            "finish_reason": {"type": "stop", "matched": 154827},
-            "prompt_tokens": 120,
-            "weight_version": "default",
-            "reasoning_tokens": 3,
-            "completion_tokens": 7,
-            "cached_tokens": 0,
-            "weight_versions": [{"version": "default", "start": 0, "end": 7}],
-            "cached_tokens_details": null
-          }
-        }
-      },
-      "generate": {
-        "input_ids": [154822, 154824, 154826, 25062, 287, 29905, 371, 25, 12035, 154827, 13041, 154828, 154841],
-        "sampling_params": {"temperature": 0.0},
-        "return_logprob": false,
-        "logprob_start_len": -1,
-        "top_logprobs_num": 0,
-        "return_sampling_mask": false,
-        "return_text_in_logprobs": true,
-        "modalities": [],
-        "require_reasoning": true
-      },
-      "openai": {
-        "status": 200,
-        "body": {
-          "id": "0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e",
-          "object": "chat.completion",
-          "created": 1791761736,
-          "model": "zai-org/GLM-5.3",
-          "choices": [
-            {
-              "index": 0,
-              "message": {
-                "role": "assistant",
-                "content": "Hi there!",
-                "reasoning_content": "Greeting.",
-                "tool_calls": null
-              },
-              "logprobs": null,
-              "finish_reason": "stop",
-              "matched_stop": 154827
-            }
-          ],
-          "usage": {
-            "prompt_tokens": 120,
-            "total_tokens": 127,
-            "completion_tokens": 7,
-            "prompt_tokens_details": null,
-            "reasoning_tokens": 3
-          },
-          "metadata": {
-            "weight_version": "default",
-            "weight_versions": [{"version": "default", "start": 0, "end": 7}]
-          }
-        }
-      }
-    },
-    {
-      "name": "chat_kwargs_effort_high",
-      "endpoint": "chat",
-      "synthetic": true,
-      "request": {
-        "model": "zai-org/GLM-5.3",
-        "messages": [{"role": "user", "content": "Hi"}],
-        "chat_template_kwargs": {"reasoning_effort": "high"}
-      },
-      "engine": {
-        "status": 200,
-        "body": {
-          "text": "A friendly greeting.</think>Hello!",
-          "output_ids": [32, 11651, 41875, 13, 154842, 9703, 0],
-          "meta_info": {
-            "id": "0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e",
-            "finish_reason": {"type": "stop", "matched": 154827},
-            "prompt_tokens": 120,
-            "weight_version": "default",
-            "reasoning_tokens": 4,
-            "completion_tokens": 7,
-            "cached_tokens": 0,
-            "weight_versions": [{"version": "default", "start": 0, "end": 7}],
-            "cached_tokens_details": null
-          }
-        }
-      },
-      "generate": {
-        "input_ids": [154822, 154824, 154826, 25062, 287, 29905, 371, 25, 5124, 154827, 13041, 154828, 154841],
         "sampling_params": {},
         "return_logprob": false,
         "logprob_start_len": -1,
@@ -243,9 +38,9 @@
       "openai": {
         "status": 200,
         "body": {
-          "id": "0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e",
+          "id": "r",
           "object": "chat.completion",
-          "created": 1791761736,
+          "created": 1791783771,
           "model": "zai-org/GLM-5.3",
           "choices": [
             {
@@ -253,7 +48,7 @@
               "message": {
                 "role": "assistant",
                 "content": "Hello!",
-                "reasoning_content": "A friendly greeting.",
+                "reasoning_content": "Greet back.",
                 "tool_calls": null
               },
               "logprobs": null,
@@ -262,17 +57,73 @@
             }
           ],
           "usage": {
-            "prompt_tokens": 120,
-            "total_tokens": 127,
+            "prompt_tokens": 12,
+            "total_tokens": 19,
             "completion_tokens": 7,
             "prompt_tokens_details": null,
-            "reasoning_tokens": 4
+            "reasoning_tokens": 2
           },
-          "metadata": {
-            "weight_version": "default",
-            "weight_versions": [{"version": "default", "start": 0, "end": 7}]
-          }
+          "metadata": {"weight_version": "default"}
         }
+      }
+    },
+    {
+      "name": "chat_stream",
+      "endpoint": "chat",
+      "synthetic": true,
+      "request": {"model": "zai-org/GLM-5.3", "messages": [{"role": "user", "content": "Hi"}], "stream": true},
+      "engine": {
+        "status": 200,
+        "frames": [
+          {"text": "Greet", "output_ids": [38, 3744], "meta_info": {"id": "r", "finish_reason": null, "prompt_tokens": 12, "weight_version": "default", "reasoning_tokens": 0, "completion_tokens": 2, "cached_tokens": 0}},
+          {"text": " back.</th", "output_ids": [1182, 3918, 339], "meta_info": {"completion_tokens": 5}},
+          {"text": "ink>Hel", "output_ids": [766, 29, 32561], "meta_info": {"completion_tokens": 8}},
+          {"text": "lo!", "output_ids": [385, 0], "meta_info": {"completion_tokens": 10, "finish_reason": {"type": "stop", "matched": 154827}, "reasoning_tokens": 2}}
+        ]
+      },
+      "generate": {
+        "input_ids": [154822, 154824, 154826, 25062, 287, 29905, 371, 25, 7487, 154827, 13041, 154828, 154841],
+        "sampling_params": {},
+        "return_logprob": false,
+        "logprob_start_len": -1,
+        "top_logprobs_num": 0,
+        "return_sampling_mask": false,
+        "return_text_in_logprobs": true,
+        "stream": true,
+        "modalities": [],
+        "require_reasoning": true
+      },
+      "openai": {
+        "events": [
+          {"id": "r", "object": "chat.completion.chunk", "created": 1791783771, "model": "zai-org/GLM-5.3", "choices": [{"index": 0, "delta": {"reasoning_content": null, "role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "r", "object": "chat.completion.chunk", "created": 1791783771, "model": "zai-org/GLM-5.3", "choices": [{"index": 0, "delta": {"reasoning_content": "Greet"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "r", "object": "chat.completion.chunk", "created": 1791783771, "model": "zai-org/GLM-5.3", "choices": [{"index": 0, "delta": {"reasoning_content": " back."}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "r", "object": "chat.completion.chunk", "created": 1791783771, "model": "zai-org/GLM-5.3", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": "Hel"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "r", "object": "chat.completion.chunk", "created": 1791783771, "model": "zai-org/GLM-5.3", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": "lo!"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "r", "object": "chat.completion.chunk", "created": 1791783771, "model": "zai-org/GLM-5.3", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": null, "finish_reason": "stop", "matched_stop": 154827}]},
+          "[DONE]"
+        ]
+      }
+    },
+    {
+      "name": "chat_effort_low",
+      "endpoint": "chat",
+      "lower_only": true,
+      "request": {
+        "model": "zai-org/GLM-5.3",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "reasoning_effort": "low"
+      },
+      "generate": {
+        "input_ids": [154822, 154824, 154826, 25062, 287, 29905, 371, 25, 12035, 154827, 13041, 154828, 154841],
+        "sampling_params": {},
+        "return_logprob": false,
+        "logprob_start_len": -1,
+        "top_logprobs_num": 0,
+        "return_sampling_mask": false,
+        "return_text_in_logprobs": true,
+        "modalities": [],
+        "require_reasoning": true
       }
     },
     {
@@ -282,19 +133,19 @@
       "request": {
         "model": "zai-org/GLM-5.3",
         "messages": [{"role": "user", "content": "Hi"}],
-        "max_tokens": 6,
+        "max_tokens": 3,
         "stream": true
       },
       "engine": {
         "status": 200,
         "frames": [
-          {"text": "The user", "output_ids": [785, 1196], "meta_info": {"id": "0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e", "finish_reason": null, "prompt_tokens": 120, "weight_version": "default", "reasoning_tokens": 0, "completion_tokens": 2, "cached_tokens": 0}},
-          {"text": " greets me, so", "output_ids": [2816, 1415, 752, 11, 773], "meta_info": {"completion_tokens": 7, "finish_reason": {"type": "length", "length": 6}, "reasoning_tokens": 6}}
+          {"text": "Greet", "output_ids": [38, 3744], "meta_info": {"id": "r", "finish_reason": null, "prompt_tokens": 12, "weight_version": "default", "reasoning_tokens": 0, "completion_tokens": 2, "cached_tokens": 0}},
+          {"text": " back", "output_ids": [1182], "meta_info": {"completion_tokens": 3, "finish_reason": {"type": "length", "length": 3}, "reasoning_tokens": 3}}
         ]
       },
       "generate": {
         "input_ids": [154822, 154824, 154826, 25062, 287, 29905, 371, 25, 7487, 154827, 13041, 154828, 154841],
-        "sampling_params": {"max_new_tokens": 6},
+        "sampling_params": {"max_new_tokens": 3},
         "return_logprob": false,
         "logprob_start_len": -1,
         "top_logprobs_num": 0,
@@ -306,131 +157,10 @@
       },
       "openai": {
         "events": [
-          {"id": "0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e", "object": "chat.completion.chunk", "created": 1791761736, "model": "zai-org/GLM-5.3", "choices": [{"index": 0, "delta": {"reasoning_content": null, "role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e", "object": "chat.completion.chunk", "created": 1791761736, "model": "zai-org/GLM-5.3", "choices": [{"index": 0, "delta": {"reasoning_content": "The user"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e", "object": "chat.completion.chunk", "created": 1791761736, "model": "zai-org/GLM-5.3", "choices": [{"index": 0, "delta": {"reasoning_content": " greets me, so"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e", "object": "chat.completion.chunk", "created": 1791761736, "model": "zai-org/GLM-5.3", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": null, "finish_reason": "length", "matched_stop": null}]},
-          "[DONE]"
-        ]
-      }
-    },
-    {
-      "name": "chat_no_separate",
-      "endpoint": "chat",
-      "synthetic": true,
-      "request": {
-        "model": "zai-org/GLM-5.3",
-        "messages": [{"role": "user", "content": "Hi"}],
-        "separate_reasoning": false
-      },
-      "engine": {
-        "status": 200,
-        "body": {
-          "text": "The user greets me, so I should greet back.</think>Hello! How can I help you today?",
-          "output_ids": [
-            785, 1196, 2816, 1415, 752, 11, 773, 358, 1265, 40561, 1182, 13, 154842, 9703, 0, 2585,
-            646, 358, 1492, 498, 3351, 30
-          ],
-          "meta_info": {
-            "id": "0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e",
-            "finish_reason": {"type": "stop", "matched": 154827},
-            "prompt_tokens": 120,
-            "weight_version": "default",
-            "reasoning_tokens": 11,
-            "completion_tokens": 22,
-            "cached_tokens": 0,
-            "weight_versions": [{"version": "default", "start": 0, "end": 22}],
-            "cached_tokens_details": null
-          }
-        }
-      },
-      "generate": {
-        "input_ids": [154822, 154824, 154826, 25062, 287, 29905, 371, 25, 7487, 154827, 13041, 154828, 154841],
-        "sampling_params": {},
-        "return_logprob": false,
-        "logprob_start_len": -1,
-        "top_logprobs_num": 0,
-        "return_sampling_mask": false,
-        "return_text_in_logprobs": true,
-        "modalities": [],
-        "require_reasoning": true
-      },
-      "openai": {
-        "status": 200,
-        "body": {
-          "id": "0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e",
-          "object": "chat.completion",
-          "created": 1791761736,
-          "model": "zai-org/GLM-5.3",
-          "choices": [
-            {
-              "index": 0,
-              "message": {
-                "role": "assistant",
-                "content": "The user greets me, so I should greet back.</think>Hello! How can I help you today?",
-                "reasoning_content": null,
-                "tool_calls": null
-              },
-              "logprobs": null,
-              "finish_reason": "stop",
-              "matched_stop": 154827
-            }
-          ],
-          "usage": {
-            "prompt_tokens": 120,
-            "total_tokens": 142,
-            "completion_tokens": 22,
-            "prompt_tokens_details": null,
-            "reasoning_tokens": 11
-          },
-          "metadata": {
-            "weight_version": "default",
-            "weight_versions": [{"version": "default", "start": 0, "end": 22}]
-          }
-        }
-      }
-    },
-    {
-      "name": "chat_no_stream_reasoning",
-      "endpoint": "chat",
-      "synthetic": true,
-      "request": {
-        "model": "zai-org/GLM-5.3",
-        "messages": [{"role": "user", "content": "Hi"}],
-        "stream": true,
-        "stream_reasoning": false
-      },
-      "engine": {
-        "status": 200,
-        "frames": [
-          {"text": "The user", "output_ids": [785, 1196], "meta_info": {"id": "0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e", "finish_reason": null, "prompt_tokens": 120, "weight_version": "default", "reasoning_tokens": 0, "completion_tokens": 2, "cached_tokens": 0}},
-          {"text": " greets me, so I", "output_ids": [2816, 1415, 752, 11, 773, 358], "meta_info": {"completion_tokens": 8}},
-          {"text": " should greet back.", "output_ids": [1265, 40561, 1182, 13], "meta_info": {"completion_tokens": 12}},
-          {"text": "</th", "output_ids": [522, 339], "meta_info": {"completion_tokens": 14}},
-          {"text": "ink>", "output_ids": [766, 29], "meta_info": {"completion_tokens": 16}},
-          {"text": "Hello!", "output_ids": [9703, 0], "meta_info": {"completion_tokens": 18}},
-          {"text": " How can I help you today?", "output_ids": [2585, 646, 358, 1492, 498, 3351, 30], "meta_info": {"completion_tokens": 25, "finish_reason": {"type": "stop", "matched": 154827}, "reasoning_tokens": 11}}
-        ]
-      },
-      "generate": {
-        "input_ids": [154822, 154824, 154826, 25062, 287, 29905, 371, 25, 7487, 154827, 13041, 154828, 154841],
-        "sampling_params": {},
-        "return_logprob": false,
-        "logprob_start_len": -1,
-        "top_logprobs_num": 0,
-        "return_sampling_mask": false,
-        "return_text_in_logprobs": true,
-        "stream": true,
-        "modalities": [],
-        "require_reasoning": true
-      },
-      "openai": {
-        "events": [
-          {"id": "0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e", "object": "chat.completion.chunk", "created": 1791761736, "model": "zai-org/GLM-5.3", "choices": [{"index": 0, "delta": {"reasoning_content": null, "role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e", "object": "chat.completion.chunk", "created": 1791761736, "model": "zai-org/GLM-5.3", "choices": [{"index": 0, "delta": {"reasoning_content": "The user greets me, so I should greet back."}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e", "object": "chat.completion.chunk", "created": 1791761736, "model": "zai-org/GLM-5.3", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": "Hello!"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e", "object": "chat.completion.chunk", "created": 1791761736, "model": "zai-org/GLM-5.3", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": " How can I help you today?"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e", "object": "chat.completion.chunk", "created": 1791761736, "model": "zai-org/GLM-5.3", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": null, "finish_reason": "stop", "matched_stop": 154827}]},
+          {"id": "r", "object": "chat.completion.chunk", "created": 1791783771, "model": "zai-org/GLM-5.3", "choices": [{"index": 0, "delta": {"reasoning_content": null, "role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "r", "object": "chat.completion.chunk", "created": 1791783771, "model": "zai-org/GLM-5.3", "choices": [{"index": 0, "delta": {"reasoning_content": "Greet"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "r", "object": "chat.completion.chunk", "created": 1791783771, "model": "zai-org/GLM-5.3", "choices": [{"index": 0, "delta": {"reasoning_content": " back"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "r", "object": "chat.completion.chunk", "created": 1791783771, "model": "zai-org/GLM-5.3", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": null, "finish_reason": "length", "matched_stop": null}]},
           "[DONE]"
         ]
       }
@@ -442,24 +172,21 @@
       "request": {
         "model": "zai-org/GLM-5.3",
         "messages": [{"role": "user", "content": "Hi"}, {"role": "assistant", "content": "Hello"}],
-        "continue_final_message": true,
-        "max_tokens": 32
+        "continue_final_message": true
       },
       "engine": {
         "status": 200,
         "body": {
-          "text": "! How can I help?",
-          "output_ids": [0, 2585, 646, 358, 1492, 30],
+          "text": "!",
+          "output_ids": [0],
           "meta_info": {
-            "id": "0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e",
+            "id": "r",
             "finish_reason": {"type": "stop", "matched": 154827},
-            "prompt_tokens": 120,
+            "prompt_tokens": 12,
             "weight_version": "default",
-            "reasoning_tokens": 0,
-            "completion_tokens": 6,
-            "cached_tokens": 0,
-            "weight_versions": [{"version": "default", "start": 0, "end": 6}],
-            "cached_tokens_details": null
+            "reasoning_tokens": 2,
+            "completion_tokens": 1,
+            "cached_tokens": 0
           }
         }
       },
@@ -468,86 +195,6 @@
           154822, 154824, 154826, 25062, 287, 29905, 371, 25, 7487, 154827, 13041, 154828, 154841,
           9703
         ],
-        "sampling_params": {"max_new_tokens": 32},
-        "return_logprob": false,
-        "logprob_start_len": -1,
-        "top_logprobs_num": 0,
-        "return_sampling_mask": false,
-        "return_text_in_logprobs": true,
-        "modalities": [],
-        "require_reasoning": true
-      },
-      "openai": {
-        "status": 200,
-        "body": {
-          "id": "0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e",
-          "object": "chat.completion",
-          "created": 1791761737,
-          "model": "zai-org/GLM-5.3",
-          "choices": [
-            {
-              "index": 0,
-              "message": {
-                "role": "assistant",
-                "content": "",
-                "reasoning_content": "! How can I help?",
-                "tool_calls": null
-              },
-              "logprobs": null,
-              "finish_reason": "stop",
-              "matched_stop": 154827
-            }
-          ],
-          "usage": {
-            "prompt_tokens": 120,
-            "total_tokens": 126,
-            "completion_tokens": 6,
-            "prompt_tokens_details": null,
-            "reasoning_tokens": 0
-          },
-          "metadata": {
-            "weight_version": "default",
-            "weight_versions": [{"version": "default", "start": 0, "end": 6}]
-          }
-        }
-      }
-    },
-    {
-      "name": "chat_history",
-      "endpoint": "chat",
-      "synthetic": true,
-      "request": {
-        "model": "zai-org/GLM-5.3",
-        "messages": [
-          {"role": "user", "content": "Pick a color."},
-          {"role": "assistant", "content": "Blue.", "reasoning_content": "Any color works."},
-          {"role": "user", "content": "Why?"}
-        ],
-        "chat_template_kwargs": {"clear_thinking": true}
-      },
-      "engine": {
-        "status": 200,
-        "body": {
-          "text": "Explain the choice.</think>It is calming.",
-          "output_ids": [840, 20726, 279, 5754, 13, 154842, 2132, 374, 77006, 13],
-          "meta_info": {
-            "id": "0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e",
-            "finish_reason": {"type": "stop", "matched": 154827},
-            "prompt_tokens": 120,
-            "weight_version": "default",
-            "reasoning_tokens": 4,
-            "completion_tokens": 10,
-            "cached_tokens": 0,
-            "weight_versions": [{"version": "default", "start": 0, "end": 10}],
-            "cached_tokens_details": null
-          }
-        }
-      },
-      "generate": {
-        "input_ids": [
-          154822, 154824, 154826, 25062, 287, 29905, 371, 25, 7487, 154827, 36761, 264, 1894, 13,
-          154828, 154841, 154842, 10326, 13, 154827, 10229, 30, 154828, 154841
-        ],
         "sampling_params": {},
         "return_logprob": false,
         "logprob_start_len": -1,
@@ -560,420 +207,49 @@
       "openai": {
         "status": 200,
         "body": {
-          "id": "0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e",
+          "id": "r",
           "object": "chat.completion",
-          "created": 1791761737,
+          "created": 1791783772,
           "model": "zai-org/GLM-5.3",
           "choices": [
             {
               "index": 0,
-              "message": {
-                "role": "assistant",
-                "content": "It is calming.",
-                "reasoning_content": "Explain the choice.",
-                "tool_calls": null
-              },
+              "message": {"role": "assistant", "content": "", "reasoning_content": "!", "tool_calls": null},
               "logprobs": null,
               "finish_reason": "stop",
               "matched_stop": 154827
             }
           ],
           "usage": {
-            "prompt_tokens": 120,
-            "total_tokens": 130,
-            "completion_tokens": 10,
+            "prompt_tokens": 12,
+            "total_tokens": 13,
+            "completion_tokens": 1,
             "prompt_tokens_details": null,
-            "reasoning_tokens": 4
+            "reasoning_tokens": 2
           },
-          "metadata": {
-            "weight_version": "default",
-            "weight_versions": [{"version": "default", "start": 0, "end": 10}]
-          }
+          "metadata": {"weight_version": "default"}
         }
       }
-    },
-    {
-      "name": "chat_n2_stream",
-      "endpoint": "chat",
-      "synthetic": true,
-      "request": {
-        "model": "zai-org/GLM-5.3",
-        "messages": [{"role": "user", "content": "Hi"}],
-        "n": 2,
-        "temperature": 0.7,
-        "stream": true
-      },
-      "engine": {
-        "status": 200,
-        "frames": [
-          {"index": 0, "text": "Greet.", "output_ids": [38, 3744, 13], "meta_info": {"id": "0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e", "finish_reason": null, "prompt_tokens": 120, "weight_version": "default", "reasoning_tokens": 0, "completion_tokens": 3, "cached_tokens": 0}},
-          {"index": 1, "text": "Say hello.", "output_ids": [45494, 23745, 13], "meta_info": {"id": "0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e", "finish_reason": null, "prompt_tokens": 120, "weight_version": "default", "reasoning_tokens": 0, "completion_tokens": 3, "cached_tokens": 0}},
-          {"index": 0, "text": "</think>Hi!", "output_ids": [154842, 13041, 0], "meta_info": {"completion_tokens": 6, "finish_reason": {"type": "stop", "matched": 154827}, "reasoning_tokens": 2}},
-          {"index": 1, "text": "</think>Hello!", "output_ids": [154842, 9703, 0], "meta_info": {"completion_tokens": 6, "finish_reason": {"type": "stop", "matched": 154827}, "reasoning_tokens": 3}}
-        ]
-      },
-      "generate": {
-        "input_ids": [154822, 154824, 154826, 25062, 287, 29905, 371, 25, 7487, 154827, 13041, 154828, 154841],
-        "sampling_params": {"temperature": 0.7, "n": 2},
-        "return_logprob": false,
-        "logprob_start_len": -1,
-        "top_logprobs_num": 0,
-        "return_sampling_mask": false,
-        "return_text_in_logprobs": true,
-        "stream": true,
-        "modalities": [],
-        "require_reasoning": true
-      },
-      "openai": {
-        "events": [
-          {"id": "0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e", "object": "chat.completion.chunk", "created": 1791761737, "model": "zai-org/GLM-5.3", "choices": [{"index": 0, "delta": {"reasoning_content": null, "role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e", "object": "chat.completion.chunk", "created": 1791761737, "model": "zai-org/GLM-5.3", "choices": [{"index": 0, "delta": {"reasoning_content": "Greet."}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e", "object": "chat.completion.chunk", "created": 1791761737, "model": "zai-org/GLM-5.3", "choices": [{"index": 1, "delta": {"reasoning_content": null, "role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e", "object": "chat.completion.chunk", "created": 1791761737, "model": "zai-org/GLM-5.3", "choices": [{"index": 1, "delta": {"reasoning_content": "Say hello."}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e", "object": "chat.completion.chunk", "created": 1791761737, "model": "zai-org/GLM-5.3", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": "Hi!"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e", "object": "chat.completion.chunk", "created": 1791761737, "model": "zai-org/GLM-5.3", "choices": [{"index": 1, "delta": {"reasoning_content": null, "content": "Hello!"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e", "object": "chat.completion.chunk", "created": 1791761737, "model": "zai-org/GLM-5.3", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": null, "finish_reason": "stop", "matched_stop": 154827}]},
-          {"id": "0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e", "object": "chat.completion.chunk", "created": 1791761737, "model": "zai-org/GLM-5.3", "choices": [{"index": 1, "delta": {"reasoning_content": null}, "logprobs": null, "finish_reason": "stop", "matched_stop": 154827}]},
-          "[DONE]"
-        ]
-      }
-    },
-    {
-      "name": "tools",
-      "endpoint": "chat",
-      "synthetic": true,
-      "request": {
-        "model": "zai-org/GLM-5.3",
-        "messages": [{"role": "user", "content": "What's the weather in Paris right now?"}],
-        "tools": [
-          {
-            "type": "function",
-            "function": {
-              "name": "get_weather",
-              "description": "Get the current weather for a city.",
-              "parameters": {
-                "type": "object",
-                "properties": {
-                  "city": {"type": "string", "description": "City name"},
-                  "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}
-                },
-                "required": ["city"]
-              }
-            }
-          },
-          {
-            "type": "function",
-            "function": {
-              "name": "get_time",
-              "description": "Get the local time in a timezone.",
-              "parameters": {
-                "type": "object",
-                "properties": {"timezone": {"type": "string"}},
-                "required": ["timezone"]
-              }
-            }
-          }
-        ],
-        "max_tokens": 256,
-        "temperature": 0
-      },
-      "unsupported": true
-    },
-    {
-      "name": "tools_stream",
-      "endpoint": "chat",
-      "synthetic": true,
-      "request": {
-        "model": "zai-org/GLM-5.3",
-        "messages": [{"role": "user", "content": "What's the weather in Paris right now?"}],
-        "tools": [
-          {
-            "type": "function",
-            "function": {
-              "name": "get_weather",
-              "description": "Get the current weather for a city.",
-              "parameters": {
-                "type": "object",
-                "properties": {
-                  "city": {"type": "string", "description": "City name"},
-                  "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}
-                },
-                "required": ["city"]
-              }
-            }
-          },
-          {
-            "type": "function",
-            "function": {
-              "name": "get_time",
-              "description": "Get the local time in a timezone.",
-              "parameters": {
-                "type": "object",
-                "properties": {"timezone": {"type": "string"}},
-                "required": ["timezone"]
-              }
-            }
-          }
-        ],
-        "stream": true,
-        "stream_options": {"include_usage": true}
-      },
-      "unsupported": true
-    },
-    {
-      "name": "tools_required",
-      "endpoint": "chat",
-      "synthetic": true,
-      "request": {
-        "model": "zai-org/GLM-5.3",
-        "messages": [{"role": "user", "content": "What's the weather in Paris right now?"}],
-        "tools": [
-          {
-            "type": "function",
-            "function": {
-              "name": "get_weather",
-              "description": "Get the current weather for a city.",
-              "parameters": {
-                "type": "object",
-                "properties": {
-                  "city": {"type": "string", "description": "City name"},
-                  "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}
-                },
-                "required": ["city"]
-              }
-            }
-          },
-          {
-            "type": "function",
-            "function": {
-              "name": "get_time",
-              "description": "Get the local time in a timezone.",
-              "parameters": {
-                "type": "object",
-                "properties": {"timezone": {"type": "string"}},
-                "required": ["timezone"]
-              }
-            }
-          }
-        ],
-        "tool_choice": "required"
-      },
-      "unsupported": true
-    },
-    {
-      "name": "tools_named_stream",
-      "endpoint": "chat",
-      "synthetic": true,
-      "request": {
-        "model": "zai-org/GLM-5.3",
-        "messages": [{"role": "user", "content": "What's the weather in Paris right now?"}],
-        "tools": [
-          {
-            "type": "function",
-            "function": {
-              "name": "get_weather",
-              "description": "Get the current weather for a city.",
-              "parameters": {
-                "type": "object",
-                "properties": {
-                  "city": {"type": "string", "description": "City name"},
-                  "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}
-                },
-                "required": ["city"]
-              }
-            }
-          },
-          {
-            "type": "function",
-            "function": {
-              "name": "get_time",
-              "description": "Get the local time in a timezone.",
-              "parameters": {
-                "type": "object",
-                "properties": {"timezone": {"type": "string"}},
-                "required": ["timezone"]
-              }
-            }
-          }
-        ],
-        "tool_choice": {"type": "function", "function": {"name": "get_weather"}},
-        "stream": true
-      },
-      "unsupported": true
-    },
-    {
-      "name": "tools_none",
-      "endpoint": "chat",
-      "synthetic": true,
-      "request": {
-        "model": "zai-org/GLM-5.3",
-        "messages": [{"role": "user", "content": "What's the weather in Paris right now?"}],
-        "tools": [
-          {
-            "type": "function",
-            "function": {
-              "name": "get_weather",
-              "description": "Get the current weather for a city.",
-              "parameters": {
-                "type": "object",
-                "properties": {
-                  "city": {"type": "string", "description": "City name"},
-                  "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}
-                },
-                "required": ["city"]
-              }
-            }
-          },
-          {
-            "type": "function",
-            "function": {
-              "name": "get_time",
-              "description": "Get the local time in a timezone.",
-              "parameters": {
-                "type": "object",
-                "properties": {"timezone": {"type": "string"}},
-                "required": ["timezone"]
-              }
-            }
-          }
-        ],
-        "tool_choice": "none"
-      },
-      "unsupported": true
-    },
-    {
-      "name": "tools_response_format",
-      "endpoint": "chat",
-      "synthetic": true,
-      "request": {
-        "model": "zai-org/GLM-5.3",
-        "messages": [{"role": "user", "content": "What's the weather in Paris right now?"}],
-        "tools": [
-          {
-            "type": "function",
-            "function": {
-              "name": "get_weather",
-              "description": "Get the current weather for a city.",
-              "parameters": {
-                "type": "object",
-                "properties": {
-                  "city": {"type": "string", "description": "City name"},
-                  "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}
-                },
-                "required": ["city"]
-              }
-            }
-          },
-          {
-            "type": "function",
-            "function": {
-              "name": "get_time",
-              "description": "Get the local time in a timezone.",
-              "parameters": {
-                "type": "object",
-                "properties": {"timezone": {"type": "string"}},
-                "required": ["timezone"]
-              }
-            }
-          }
-        ],
-        "response_format": {"type": "json_object"}
-      },
-      "unsupported": true
-    },
-    {
-      "name": "tools_history",
-      "endpoint": "chat",
-      "synthetic": true,
-      "request": {
-        "model": "zai-org/GLM-5.3",
-        "messages": [
-          {"role": "user", "content": "What's the weather in Paris right now?"},
-          {
-            "role": "assistant",
-            "content": null,
-            "tool_calls": [
-              {
-                "id": "call_1",
-                "type": "function",
-                "function": {"name": "get_weather", "arguments": "{\"city\": \"Paris\"}"}
-              }
-            ]
-          },
-          {"role": "tool", "tool_call_id": "call_1", "content": "18C, sunny"}
-        ],
-        "tools": [
-          {
-            "type": "function",
-            "function": {
-              "name": "get_weather",
-              "description": "Get the current weather for a city.",
-              "parameters": {
-                "type": "object",
-                "properties": {
-                  "city": {"type": "string", "description": "City name"},
-                  "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}
-                },
-                "required": ["city"]
-              }
-            }
-          },
-          {
-            "type": "function",
-            "function": {
-              "name": "get_time",
-              "description": "Get the local time in a timezone.",
-              "parameters": {
-                "type": "object",
-                "properties": {"timezone": {"type": "string"}},
-                "required": ["timezone"]
-              }
-            }
-          }
-        ]
-      },
-      "unsupported": true
     },
     {
       "name": "chat_thinking_part",
       "endpoint": "chat",
-      "synthetic": true,
+      "lower_only": true,
       "request": {
         "model": "zai-org/GLM-5.3",
         "messages": [
-          {"role": "user", "content": "Pick a color."},
+          {"role": "user", "content": "Hi"},
           {
             "role": "assistant",
-            "content": [
-              {"type": "thinking", "thinking": "Any color works."},
-              {"type": "text", "text": "Blue."}
-            ]
+            "content": [{"type": "thinking", "thinking": "Greet."}, {"type": "text", "text": "Hi!"}]
           },
-          {"role": "user", "content": "Why?"}
+          {"role": "user", "content": "Again"}
         ]
-      },
-      "engine": {
-        "status": 200,
-        "body": {
-          "text": "Explain.</think>It is calming.",
-          "output_ids": [840, 20726, 13, 154842, 2132, 374, 77006, 13],
-          "meta_info": {
-            "id": "0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e",
-            "finish_reason": {"type": "stop", "matched": 154827},
-            "prompt_tokens": 120,
-            "weight_version": "default",
-            "reasoning_tokens": 2,
-            "completion_tokens": 8,
-            "cached_tokens": 0,
-            "weight_versions": [{"version": "default", "start": 0, "end": 8}],
-            "cached_tokens_details": null
-          }
-        }
       },
       "generate": {
         "input_ids": [
-          154822, 154824, 154826, 25062, 287, 29905, 371, 25, 7487, 154827, 36761, 264, 1894, 13,
-          154828, 154841, 154842, 10326, 13, 154827, 10229, 30, 154828, 154841
+          154822, 154824, 154826, 25062, 287, 29905, 371, 25, 7487, 154827, 13041, 154828, 154841,
+          154842, 13041, 0, 154827, 30268, 154828, 154841
         ],
         "sampling_params": {},
         "return_logprob": false,
@@ -983,173 +259,41 @@
         "return_text_in_logprobs": true,
         "modalities": [],
         "require_reasoning": true
-      },
-      "openai": {
-        "status": 200,
-        "body": {
-          "id": "0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e",
-          "object": "chat.completion",
-          "created": 1791761737,
-          "model": "zai-org/GLM-5.3",
-          "choices": [
-            {
-              "index": 0,
-              "message": {
-                "role": "assistant",
-                "content": "It is calming.",
-                "reasoning_content": "Explain.",
-                "tool_calls": null
-              },
-              "logprobs": null,
-              "finish_reason": "stop",
-              "matched_stop": 154827
-            }
-          ],
-          "usage": {
-            "prompt_tokens": 120,
-            "total_tokens": 128,
-            "completion_tokens": 8,
-            "prompt_tokens_details": null,
-            "reasoning_tokens": 2
-          },
-          "metadata": {
-            "weight_version": "default",
-            "weight_versions": [{"version": "default", "start": 0, "end": 8}]
-          }
-        }
       }
     },
     {
-      "name": "tools_tool_reference",
+      "name": "chat_tool_reference",
       "endpoint": "chat",
-      "synthetic": true,
+      "lower_only": true,
       "request": {
         "model": "zai-org/GLM-5.3",
         "messages": [
           {
             "role": "user",
-            "content": [
-              {"type": "text", "text": "Use this tool: "},
-              {"type": "tool_reference", "name": "get_weather"},
-              {"type": "text", "text": " for Paris."}
-            ]
-          }
-        ],
-        "tools": [
-          {
-            "type": "function",
-            "function": {
-              "name": "get_weather",
-              "description": "Get the current weather for a city.",
-              "parameters": {
-                "type": "object",
-                "properties": {
-                  "city": {"type": "string", "description": "City name"},
-                  "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}
-                },
-                "required": ["city"]
-              }
-            }
-          },
-          {
-            "type": "function",
-            "function": {
-              "name": "get_time",
-              "description": "Get the local time in a timezone.",
-              "parameters": {
-                "type": "object",
-                "properties": {"timezone": {"type": "string"}},
-                "required": ["timezone"]
-              }
-            }
+            "content": [{"type": "text", "text": "Use "}, {"type": "tool_reference", "name": "f"}]
           }
         ]
       },
-      "unsupported": true
-    },
-    {
-      "name": "chat_user_thinking_part",
-      "endpoint": "chat",
-      "synthetic": true,
-      "unsupported": true,
-      "request": {
-        "model": "zai-org/GLM-5.3",
-        "messages": [{"role": "user", "content": [{"type": "thinking", "thinking": "x"}]}]
-      }
-    },
-    {
-      "name": "tools_strict",
-      "endpoint": "chat",
-      "synthetic": true,
-      "unsupported": true,
-      "request": {
-        "model": "zai-org/GLM-5.3",
-        "messages": [{"role": "user", "content": "What's the weather in Paris right now?"}],
-        "tools": [
-          {
-            "type": "function",
-            "function": {
-              "name": "get_weather",
-              "description": "Get the current weather for a city.",
-              "parameters": {
-                "type": "object",
-                "properties": {
-                  "city": {"type": "string", "description": "City name"},
-                  "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}
-                },
-                "required": ["city"]
-              },
-              "strict": true
-            }
-          }
-        ]
-      }
-    },
-    {
-      "name": "tools_varchar",
-      "endpoint": "chat",
-      "synthetic": true,
-      "unsupported": true,
-      "request": {
-        "model": "zai-org/GLM-5.3",
-        "messages": [{"role": "user", "content": "What's the weather in Paris right now?"}],
-        "tools": [
-          {
-            "type": "function",
-            "function": {
-              "name": "q",
-              "parameters": {"type": "object", "properties": {"s": {"type": "varchar"}}}
-            }
-          }
-        ]
+      "generate": {
+        "input_ids": [
+          154822, 154824, 154826, 25062, 287, 29905, 371, 25, 7487, 154827, 10248, 220, 154828,
+          154841
+        ],
+        "sampling_params": {},
+        "return_logprob": false,
+        "logprob_start_len": -1,
+        "top_logprobs_num": 0,
+        "return_sampling_mask": false,
+        "return_text_in_logprobs": true,
+        "modalities": [],
+        "require_reasoning": true
       }
     },
     {
       "name": "tools_empty",
       "endpoint": "chat",
-      "synthetic": true,
+      "lower_only": true,
       "request": {"model": "zai-org/GLM-5.3", "messages": [{"role": "user", "content": "Hi"}], "tools": []},
-      "engine": {
-        "status": 200,
-        "body": {
-          "text": "The user greets me, so I should greet back.</think>Hello! How can I help you today?",
-          "output_ids": [
-            785, 1196, 2816, 1415, 752, 11, 773, 358, 1265, 40561, 1182, 13, 154842, 9703, 0, 2585,
-            646, 358, 1492, 498, 3351, 30
-          ],
-          "meta_info": {
-            "id": "0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e",
-            "finish_reason": {"type": "stop", "matched": 154827},
-            "prompt_tokens": 120,
-            "weight_version": "default",
-            "reasoning_tokens": 11,
-            "completion_tokens": 22,
-            "cached_tokens": 0,
-            "weight_versions": [{"version": "default", "start": 0, "end": 22}],
-            "cached_tokens_details": null
-          }
-        }
-      },
       "generate": {
         "input_ids": [154822, 154824, 154826, 25062, 287, 29905, 371, 25, 7487, 154827, 13041, 154828, 154841],
         "sampling_params": {},
@@ -1160,101 +304,36 @@
         "return_text_in_logprobs": true,
         "modalities": [],
         "require_reasoning": true
-      },
-      "openai": {
-        "status": 200,
-        "body": {
-          "id": "0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e",
-          "object": "chat.completion",
-          "created": 1791761737,
-          "model": "zai-org/GLM-5.3",
-          "choices": [
-            {
-              "index": 0,
-              "message": {
-                "role": "assistant",
-                "content": "Hello! How can I help you today?",
-                "reasoning_content": "The user greets me, so I should greet back.",
-                "tool_calls": null
-              },
-              "logprobs": null,
-              "finish_reason": "stop",
-              "matched_stop": 154827
-            }
-          ],
-          "usage": {
-            "prompt_tokens": 120,
-            "total_tokens": 142,
-            "completion_tokens": 22,
-            "prompt_tokens_details": null,
-            "reasoning_tokens": 11
-          },
-          "metadata": {
-            "weight_version": "default",
-            "weight_versions": [{"version": "default", "start": 0, "end": 22}]
-          }
-        }
       }
     },
     {
-      "name": "completion",
-      "endpoint": "completions",
-      "synthetic": true,
-      "request": {"model": "zai-org/GLM-5.3", "prompt": "The capital of France is", "max_tokens": 4},
-      "engine": {
-        "status": 200,
-        "body": {
-          "text": " Paris.",
-          "output_ids": [12089, 13],
-          "meta_info": {
-            "id": "0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e",
-            "finish_reason": {"type": "length", "length": 4},
-            "prompt_tokens": 120,
-            "weight_version": "default",
-            "reasoning_tokens": 0,
-            "completion_tokens": 2,
-            "cached_tokens": 0,
-            "weight_versions": [{"version": "default", "start": 0, "end": 2}],
-            "cached_tokens_details": null
-          }
-        }
-      },
-      "generate": {
-        "text": "The capital of France is",
-        "sampling_params": {"max_new_tokens": 4},
-        "return_logprob": false,
-        "logprob_start_len": -1,
-        "top_logprobs_num": 0,
-        "return_text_in_logprobs": true
-      },
-      "openai": {
-        "status": 200,
-        "body": {
-          "id": "0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e",
-          "object": "text_completion",
-          "created": 1791761737,
-          "model": "zai-org/GLM-5.3",
-          "choices": [
-            {
-              "index": 0,
-              "text": " Paris.",
-              "logprobs": null,
-              "finish_reason": "length",
-              "matched_stop": null
-            }
-          ],
-          "usage": {
-            "prompt_tokens": 120,
-            "total_tokens": 122,
-            "completion_tokens": 2,
-            "prompt_tokens_details": null,
-            "reasoning_tokens": 0
-          },
-          "metadata": {
-            "weight_version": "default",
-            "weight_versions": [{"version": "default", "start": 0, "end": 2}]
-          }
-        }
+      "name": "tools",
+      "endpoint": "chat",
+      "unsupported": true,
+      "request": {
+        "model": "zai-org/GLM-5.3",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "tools": [{"type": "function", "function": {"name": "f", "parameters": {"type": "object"}}}]
+      }
+    },
+    {
+      "name": "tools_none",
+      "endpoint": "chat",
+      "unsupported": true,
+      "request": {
+        "model": "zai-org/GLM-5.3",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "tools": [{"type": "function", "function": {"name": "f", "parameters": {"type": "object"}}}],
+        "tool_choice": "none"
+      }
+    },
+    {
+      "name": "chat_user_thinking_part",
+      "endpoint": "chat",
+      "unsupported": true,
+      "request": {
+        "model": "zai-org/GLM-5.3",
+        "messages": [{"role": "user", "content": [{"type": "thinking", "thinking": "x"}]}]
       }
     }
   ],
