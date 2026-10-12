@@ -17,13 +17,61 @@ from sglang.srt.layers.cp.bcg import (
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-class TestDSV4PrefillCPBCG(unittest.TestCase):
+class TestDSV4PrefillCPBCG(CustomTestCase):
     def tearDown(self):
         init_cp_strategy(enable_prefill_cp=False, cp_size=1, cp_strategy="zigzag")
+
+    def test_low_ratio_cp_sources_exclude_capture_padding(self):
+        """A 91-token request replaying a 96-token bucket must map only live rows."""
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            DeepseekV4AttnBackend,
+        )
+
+        global_x = torch.arange(96, dtype=torch.float32)[:, None]
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            attn_cp_metadata=SimpleNamespace(total_seq_lens=96),
+            req_pool_indices=torch.tensor([2, 4]),
+            extend_seq_lens=torch.tensor([3, 88]),
+            extend_seq_lens_cpu=[3, 88],
+            positions=torch.arange(96),
+        )
+        backend = SimpleNamespace(
+            forward_metadata=SimpleNamespace(late_layer_tail=None),
+            _low_ratio_compress_torch=Mock(),
+            _low_ratio_index_topk=Mock(),
+        )
+        layer = SimpleNamespace(compressor=object(), indexer=object())
+        with (
+            get_parallel().override(attn_cp_size=4, attn_cp_rank=0),
+            patch(
+                "sglang.srt.layers.attention.deepseek_v4_backend.cp_materialize_global_token_order",
+                return_value=global_x,
+            ),
+            patch("torch.cuda.current_stream", return_value=None),
+        ):
+            DeepseekV4AttnBackend._forward_low_ratio_sources_cp(
+                backend,
+                layer=layer,
+                x=torch.zeros(24, 1),
+                q_lora=torch.zeros(24, 1),
+                positions=torch.arange(24),
+                forward_batch=batch,
+                run_compressor=True,
+                run_indexer=True,
+            )
+        _, x, req, pos = backend._low_ratio_compress_torch.call_args.args
+        torch.testing.assert_close(x, global_x[:91])
+        torch.testing.assert_close(req, torch.tensor([2] * 3 + [4] * 88))
+        torch.testing.assert_close(pos, torch.arange(91))
+        args, kwargs = backend._low_ratio_index_topk.call_args
+        self.assertEqual(args[1].shape[0], 23)
+        self.assertEqual(kwargs["rows_per_request"], [1, 22])
 
     def test_sparse_prefill_never_uses_cp_local_queries(self):
         from sglang.srt.layers.attention.deepseek_v4_backend import (

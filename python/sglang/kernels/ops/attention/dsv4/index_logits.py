@@ -54,6 +54,7 @@ def flat_index_logits_tiles(
     width = ceil_align(max(context_lengths, default=0), width_align)
     if rows == 0 or width == 0:
         return
+    weights = weights.to(torch.bfloat16)
     rows_per_chunk = flat_index_logits_rows_per_tile(
         rows, width, heads=q[0].shape[1], budget_bytes=budget_bytes
     )
@@ -68,9 +69,8 @@ def flat_index_logits_tiles(
                 weights[tile],
                 tile_starts,
                 tile_starts + lengths[tile],
-                False,
                 width,
-            ),
+            ).float(),
         )
 
 
@@ -89,16 +89,18 @@ def deep_gemm_fp4_paged_mqa_logits(
     sl = seq_lens.to(torch.int32)
     if sl.dim() == 1:
         sl = sl.unsqueeze(-1)
+    # SM100 uses BF16 head weights and explicit varlen request indices.
+    indices = torch.arange(sl.shape[0], dtype=torch.int32, device=sl.device)
     return fp8_fp4_paged_mqa_logits(
         q_fp4,
         k_cache,
-        weights,
+        weights.to(torch.bfloat16),
         sl,
         page_table,
         deep_gemm_metadata,
         max_seq_len,
-        False,
-    )
+        indices=indices,
+    ).float()
 
 
 def sparse_logits(
