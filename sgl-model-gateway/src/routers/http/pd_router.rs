@@ -11,14 +11,16 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use futures_util::StreamExt;
-use memchr::memmem;
 use reqwest::Client;
 use serde::Serialize;
 use serde_json::{json, Value};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, warn};
 
-use super::pd_types::api_path;
+use super::{
+    pd_stream::{DecodeReadAhead, SseFrames, StreamFailure, Terminal},
+    pd_types::api_path,
+};
 use crate::{
     config::types::RetryConfig,
     core::{
@@ -712,6 +714,8 @@ impl PDRouter {
         // Scope the futures so a failed side drops its pending peer before we
         // read an error body or construct a downstream response. Dropping only a
         // Pin<&mut Future> would leave the underlying request alive.
+        let mut read_ahead = DecodeReadAhead::default();
+        let mut stream_failure = None;
         let (prefill_result, decode_result) = {
             let prefill_fut = prefill_request.send();
             let decode_fut = decode_request.send();
@@ -735,6 +739,14 @@ impl PDRouter {
                         };
                         break (Some(pr), Some(dr));
                     }
+                    result = async {
+                        read_ahead.read(decode_early.as_mut().unwrap().as_mut().unwrap()).await
+                    }, if context.is_stream && decode_early.is_some() && !read_ahead.finished => {
+                        if let Err(error) = result {
+                            stream_failure = Some(error);
+                            break (None, None);
+                        }
+                    }
                     dr = &mut decode_fut, if decode_early.is_none() => {
                         let failed = match &dr {
                             Ok(res) => !res.status().is_success(),
@@ -755,6 +767,12 @@ impl PDRouter {
                 }
             }
         };
+
+        if let Some(failure) = stream_failure {
+            // Both upstream connections have left scope before returning the
+            // terminal error. In particular, do not wait for Prefill bootstrap.
+            return self.decode_stream_failure(failure, prefill, decode);
+        }
 
         let prefill_failed = match &prefill_result {
             Some(Ok(resp)) => !resp.status().is_success(),
@@ -802,7 +820,7 @@ impl PDRouter {
 
         // Process decode response
         match decode_result {
-            Ok(res) => {
+            Ok(mut res) => {
                 let status = StatusCode::from_u16(res.status().as_u16())
                     .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                 debug!("Decode response status: {}", status);
@@ -838,28 +856,36 @@ impl PDRouter {
 
                 // A successful decode result is returned only after prefill.
                 let prefill_result = prefill_result.expect("successful decode awaits prefill");
-                // Process prefill response
-                let prefill_body = if context.return_logprob {
-                    match self
-                        .process_prefill_response(
-                            prefill_result,
-                            prefill.url(),
-                            context.return_logprob,
-                        )
-                        .await
-                    {
-                        Ok((_, body)) => body,
-                        Err(error_response) => return error_response,
+                // Continue observing Decode until Prefill's body is consumed as
+                // well: headers alone do not complete logprob/body processing.
+                let prefill_body = {
+                    let process = self.process_prefill_response(
+                        prefill_result,
+                        prefill.url(),
+                        context.return_logprob,
+                    );
+                    tokio::pin!(process);
+                    loop {
+                        tokio::select! {
+                            biased;
+                            result = &mut process => break result,
+                            result = read_ahead.read(&mut res),
+                                if context.is_stream && !read_ahead.finished => {
+                                if let Err(error) = result {
+                                    stream_failure = Some(error);
+                                    break Ok((status, None));
+                                }
+                            }
+                        }
                     }
-                } else {
-                    // Even if we don't need logprobs, we should check prefill status
-                    match self
-                        .process_prefill_response(prefill_result, prefill.url(), false)
-                        .await
-                    {
-                        Ok((_, body)) => body,
-                        Err(error_response) => return error_response,
-                    }
+                };
+                if let Some(failure) = stream_failure {
+                    drop(res);
+                    return self.decode_stream_failure(failure, prefill, decode);
+                }
+                let prefill_body = match prefill_body {
+                    Ok((_, body)) => body,
+                    Err(response) => return response,
                 };
 
                 if context.is_stream {
@@ -878,7 +904,8 @@ impl PDRouter {
                     let response_headers = header_utils::preserve_response_headers(res.headers());
 
                     self.create_streaming_response(
-                        res.bytes_stream(),
+                        futures_util::stream::iter(read_ahead.chunks.into_iter().map(Ok))
+                            .chain(res.bytes_stream()),
                         status,
                         prefill_logprobs,
                         context.return_logprob,
@@ -1105,6 +1132,30 @@ impl PDRouter {
         Ok(available_workers[selected_idx].clone())
     }
 
+    fn decode_stream_failure(
+        &self,
+        failure: StreamFailure,
+        prefill: Arc<dyn Worker>,
+        decode: Arc<dyn Worker>,
+    ) -> Response {
+        warn!(decode_url = decode.url(), prefill_url = prefill.url(),
+            status = %failure.status, "Decode SSE failed, cancelling paired prefill");
+        // No downstream headers have been sent. Use the failure's actual
+        // status, allowing the existing bounded retry policy to decide.
+        let body = failure.body();
+        let mut response = self.create_streaming_response(
+            futures_util::stream::once(async move { Ok(body) }),
+            failure.status,
+            None,
+            false,
+            None,
+            prefill,
+            decode,
+        );
+        response.extensions_mut().insert(BreakerOutcomesRecorded);
+        response
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn create_streaming_response(
         &self,
@@ -1142,41 +1193,51 @@ impl PDRouter {
         }
         let decode_for_log = decode.clone();
         tokio::spawn(async move {
-            loop {
+            let mut frames = SseFrames::default();
+            'stream: loop {
                 tokio::select! {
                     biased;
                     chunk_result = tracked.next() => {
                         match chunk_result {
                             Some(Ok(chunk)) => {
-                                let is_done = memmem::find(&chunk, b"data: [DONE]").is_some();
-
-                                let result = if return_logprob && prefill_logprobs.is_some() {
-                                    Self::merge_streaming_logprobs(prefill_logprobs.clone(), &chunk)
-                                        .unwrap_or(chunk)
-                                } else {
-                                    chunk
+                                // HTTP error bodies are already shaped by the
+                                // caller. Preserve their established SSE format
+                                // and status-based breaker attribution.
+                                if !status.is_success() {
+                                    if tx.send(Ok(chunk)).is_err() { break; }
+                                    continue;
+                                }
+                                let events = match frames.push(&chunk) {
+                                    Ok(events) => events,
+                                    Err(error) => {
+                                        tracked.mark_errored();
+                                        let _ = tx.send(Ok(error.body()));
+                                        break;
+                                    }
                                 };
-
-                                // Mark the wrapper completed before the client
-                                // send: upstream finished cleanly regardless of
-                                // whether the client is still listening, and
-                                // the worker deserves the success tick either
-                                // way. `mark_completed` is a no-op once Errored
-                                // is set, so the synthetic-error path is unaffected.
-                                if is_done {
-                                    tracked.mark_completed();
-                                }
-
-                                if tx.send(Ok(result)).is_err() {
-                                    tracing::debug!(
-                                        "Receiver dropped (likely client disconnect), \
-                                        cancelling upstream PD stream"
-                                    );
-                                    break;
-                                }
-
-                                if is_done {
-                                    break;
+                                for (frame, terminal) in events {
+                                    let is_terminal = terminal.is_some();
+                                    if let Some(Terminal::Failed(error)) = &terminal {
+                                        if error.status.is_server_error() {
+                                            tracked.mark_errored();
+                                        } else {
+                                            tracked.mark_completed();
+                                        }
+                                    } else if is_terminal {
+                                        tracked.mark_completed();
+                                    }
+                                    let result = if return_logprob && prefill_logprobs.is_some() {
+                                        Self::merge_streaming_logprobs(prefill_logprobs.clone(), &frame)
+                                            .unwrap_or(frame)
+                                    } else { frame };
+                                    if tx.send(Ok(result)).is_err() {
+                                        break 'stream;
+                                    }
+                                    if matches!(terminal, Some(Terminal::Failed(_))) {
+                                        // Abort is terminal even if upstream never sends DONE.
+                                        let _ = tx.send(Ok(bytes::Bytes::from_static(b"data: [DONE]\n\n")));
+                                    }
+                                    if is_terminal { break 'stream; }
                                 }
                             }
                             Some(Err(e)) => {
@@ -1186,7 +1247,14 @@ impl PDRouter {
                                 let _ = tx.send(Err(format!("Stream error: {}", e)));
                                 break;
                             }
-                            None => break,
+                            None => {
+                                if frames.has_incomplete_event() {
+                                    tracked.mark_errored();
+                                    let error = StreamFailure::protocol("Decode stream ended inside an SSE event");
+                                    let _ = tx.send(Ok(error.body()));
+                                }
+                                break;
+                            },
                         }
                     }
                     _ = tx.closed() => {
@@ -1420,7 +1488,7 @@ impl PDRouter {
     ) -> Result<bytes::Bytes, ()> {
         // Skip non-data chunks
         let chunk_str = std::str::from_utf8(decode_chunk).map_err(|_| ())?;
-        if !chunk_str.starts_with("data: ") || chunk_str.contains("[DONE]") {
+        if !chunk_str.starts_with("data: ") {
             return Err(());
         }
 
