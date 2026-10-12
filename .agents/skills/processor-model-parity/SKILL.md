@@ -187,6 +187,10 @@ OpenAI layer:
 - `tests/fixtures/reasoning_parity/<parser>.json`, from
   `tests/scripts/generate_reasoning_parity.py`: SGLang's `ReasoningParser` on
   chunked outputs. A parser is served once `src/think/models/` ports it.
+- `tests/fixtures/tool_parity/<parser>.json`, from
+  `tests/scripts/generate_tool_parity.py`: SGLang's `FunctionCallParser` on
+  chunked outputs, replayed by the test in `src/tool_call/models/mod.rs`. A tool
+  parser is served once `src/tool_call/models/` ports it.
 - `tests/fixtures/openai_parity/<model-id>.json`, from
   `tests/scripts/generate_openai_parity.py --model <dir> --engine-url <engine>`:
   the `/generate` body `OpenAIServingChat` builds for each case, a live engine's
@@ -197,9 +201,10 @@ OpenAI layer:
 
 - Dynamo version bumps change rendering silently: rerun every fixture after bumping
   `dynamo-renderer` or `dynamo-tokenizers`.
-- Env vars (`SGLANG_DEFAULT_THINKING`, `SGLANG_DSV4_REASONING_EFFORT`) are read per
-  request, as in Python. The generator pins them and `tests/parity.rs` clears them,
-  so fixtures do not depend on the machine.
+- Env vars (`SGLANG_DEFAULT_THINKING`, `SGLANG_DSV4_REASONING_EFFORT`,
+  `SGLANG_DSV41_REASONING_EFFORT`) are read per request, as in Python. The
+  generator pins them and `tests/parity.rs` clears them, so fixtures do not
+  depend on the machine.
 - Typed hosts (the renderer's `OAIChatLikeRequest` path) cannot carry every field,
   such as `task` and message-level `tools`. Parity is defined on `render_request`;
   report host-adapter gaps separately rather than bending the model code.

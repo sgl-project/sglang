@@ -21,8 +21,8 @@ pub use wire::Reply;
 
 /// Builds the OpenAI response of a lowered request from the engine's `/generate` output.
 pub enum Responder {
-    Completion(CompletionResponder),
-    Chat(ChatResponder),
+    Completion(Box<CompletionResponder>),
+    Chat(Box<ChatResponder>),
 }
 
 impl Responder {
