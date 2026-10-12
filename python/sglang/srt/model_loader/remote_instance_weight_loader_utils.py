@@ -79,7 +79,9 @@ def trigger_transferring_weights_request(
         raise
 
 
-def get_remote_instance_transfer_engine_info_per_rank(seed_url: str, rank: int, role: str):
+def get_remote_instance_transfer_engine_info_per_rank(
+    seed_url: str, rank: int, role: str
+):
     try:
         response = requests.get(
             f"{seed_url}/get_remote_instance_transfer_engine_info",

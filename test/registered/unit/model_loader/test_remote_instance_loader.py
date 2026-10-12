@@ -92,12 +92,19 @@ class TestRemoteInstanceTransferEngineRole(CustomTestCase):
         for is_draft_model, role in ((False, "target"), (True, "draft")):
             with self.subTest(role=role):
                 queried = []
-                with patch.object(loader_mod, "_get_quantization_config"), patch.object(
-                    loader_mod, "_initialize_model", return_value=torch.nn.Linear(1, 1)
-                ), patch.object(loader_mod, "register_memory_region"), patch.object(
-                    loader_mod,
-                    "get_remote_instance_transfer_engine_info_per_rank",
-                    side_effect=lambda *args: queried.append(args) or (None, None),
+                with (
+                    patch.object(loader_mod, "_get_quantization_config"),
+                    patch.object(
+                        loader_mod,
+                        "_initialize_model",
+                        return_value=torch.nn.Linear(1, 1),
+                    ),
+                    patch.object(loader_mod, "register_memory_region"),
+                    patch.object(
+                        loader_mod,
+                        "get_remote_instance_transfer_engine_info_per_rank",
+                        side_effect=lambda *args: queried.append(args) or (None, None),
+                    ),
                 ):
                     with self.assertRaises(RuntimeError):
                         loader.load_model(
