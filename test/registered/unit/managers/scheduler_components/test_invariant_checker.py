@@ -171,8 +171,8 @@ class TestShardedFullPoolInvariant(CustomTestCase):
                     tree_components=(ComponentType.FULL,),
                 )
             )
-        self.last_batch = SimpleNamespace(reqs=[], is_empty=lambda: True)
-        self.running_batch = self.last_batch
+        self.cur_batch = SimpleNamespace(reqs=[], is_empty=lambda: True)
+        self.running_batch = self.cur_batch
         self.chunked_req = None
         observer = SchedulerPoolStatsObserver(
             tree_cache=self.cache,
@@ -199,11 +199,8 @@ class TestShardedFullPoolInvariant(CustomTestCase):
             token_to_kv_pool_allocator=self.allocator,
             req_to_token_pool=req_pool,
             pool_stats_observer=observer,
-            get_cur_batch=lambda: self.last_batch,
-            get_running_and_inflight_batches=lambda: [
-                self.running_batch,
-                self.last_batch,
-            ],
+            get_cur_batch=lambda: self.cur_batch,
+            get_running_and_inflight_batches=lambda: [self.running_batch],
             get_chunked_req=lambda: self.chunked_req,
             scheduler_stage_metrics=None,
         )
@@ -252,8 +249,8 @@ class TestShardedFullPoolInvariant(CustomTestCase):
             ),
             beam_group=None,
         )
-        self.last_batch = SimpleNamespace(reqs=[req], is_empty=lambda: False)
-        self.running_batch = self.last_batch
+        self.cur_batch = SimpleNamespace(reqs=[req], is_empty=lambda: False)
+        self.running_batch = self.cur_batch
         return req
 
     def test_balanced_and_skewed_cache_ownership_conserve_full_pool(self):
@@ -308,8 +305,8 @@ class TestShardedFullPoolInvariant(CustomTestCase):
             with self.subTest(parked=parked):
                 self.chunked_req = req
                 if parked:
-                    self.last_batch = SimpleNamespace(reqs=[], is_empty=lambda: True)
-                    self.running_batch = self.last_batch
+                    self.cur_batch = SimpleNamespace(reqs=[], is_empty=lambda: True)
+                    self.running_batch = self.cur_batch
                 uncached, swa_uncached = checker._get_total_uncached_sizes()
                 self.assertEqual((uncached, swa_uncached), (self.PAGE_SIZE, 0))
                 stats = checker.pool_stats_observer.get_pool_stats()
@@ -329,8 +326,8 @@ class TestShardedFullPoolInvariant(CustomTestCase):
             with self.subTest(parked=parked):
                 self.chunked_req = req
                 if parked:
-                    self.last_batch = SimpleNamespace(reqs=[], is_empty=lambda: True)
-                    self.running_batch = self.last_batch
+                    self.cur_batch = SimpleNamespace(reqs=[], is_empty=lambda: True)
+                    self.running_batch = self.cur_batch
                 self.assertEqual(checker._get_total_uncached_sizes(), (0, 0))
                 self.assertEqual(
                     checker.pool_stats_observer.session_held_tokens(), self.PAGE_SIZE

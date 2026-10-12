@@ -15,13 +15,12 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed import parallel_state
 from sglang.srt.environ import envs
 from sglang.srt.managers import scheduler as scheduler_module
-from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.inflight_queue import InflightQueue
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import (
@@ -266,6 +265,8 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
                 scheduler = self.make_scheduler(schedule)
                 scheduler.future_map = None
                 scheduler.result_queue = deque()
+                scheduler.enable_hisparse = False
+                scheduler.decoding_batch = Mock()
                 scheduler._prepare_mlx_launch = MethodType(
                     mixin._prepare_mlx_launch, scheduler
                 )
@@ -308,23 +309,6 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
                     scheduler.tp_worker.async_chained_decode_mlx.call_count,
                     2 if chained else 0,
                 )
-
-    def test_mlx_pending_job_preserves_inflight_request_inventory(self):
-        module = load_mlx_scheduler_module()
-        scheduler = self.make_scheduler([])
-        scheduler.disaggregation_mode = DisaggregationMode.NULL
-        req = Req("mlx-pending", "", [1], SamplingParams())
-        batch = ScheduleBatch(reqs=[req], forward_mode=ForwardMode.DECODE)
-        scheduler.last_batch = batch
-        pending = module.MlxPendingJob(
-            launch=None,
-            batch_copy=batch.copy(),
-            schedule_batch=batch,
-            reqs=batch.reqs[:],
-        )
-        scheduler.result_queue = deque([pending])
-
-        self.assertEqual(scheduler.collect_inflight_reqs(), {req})
 
     def test_split_prefill_is_charged_once_from_its_first_chunk(self):
         # A split prefill spans several run_batch calls but yields one result,
@@ -504,7 +488,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler.decode_moment_totals = [0.0] * 6
         scheduler.running_batch = ScheduleBatch(reqs=[])
         scheduler.last_batch = None
-        scheduler.rows_join_before_plan = False
+        scheduler.hisparse_coordinator = None
         scheduler.inflight_steps = InflightQueue(depth=0)
         scheduler.recv_skipper = None
         scheduler.chunked_req = None

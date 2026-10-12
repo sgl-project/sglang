@@ -111,8 +111,11 @@ class SchedulerMlxOverlapMixin:
         if result.next_token_ids is not None:
             pending.batch_copy.input_ids = result.next_token_ids
             pending.schedule_batch.input_ids = result.next_token_ids
-        self.last_batch = pending.schedule_batch
         self.process_batch_result(pending.batch_copy, result)
+        # The rows take the requests whose last prefill chunk this step ran;
+        # a mixed step's rows replace them.
+        if not self.enable_hisparse and self.dllm_config is None:
+            self.decoding_batch.join_launched(pending.schedule_batch)
 
     def _drain_mlx_pending_jobs(self: Scheduler):
         """Finalize and process every launched job, oldest first."""
@@ -259,7 +262,6 @@ class SchedulerMlxOverlapMixin:
                 and not new_prefill_waiting
             ):
                 self.cur_batch_for_debug = pending_next.schedule_batch
-                self.last_batch = pending_next.schedule_batch
                 if self.recv_skipper is not None:
                     self.recv_skipper.on_launch(pending_next.schedule_batch)
                 if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
@@ -271,9 +273,7 @@ class SchedulerMlxOverlapMixin:
             if pending_next is not None:
                 self._finalize_mlx_pending_job(pending_next)
                 self.result_queue.popleft()
-            plan = self.get_next_batch_to_run(
-                decoding_batch=self.decoding_batch, last_batch=self.last_batch
-            )
+            plan = self.get_next_batch_to_run(decoding_batch=self.decoding_batch)
             next_batch = plan.batch_to_run
             self.cur_batch_for_debug = next_batch
             if next_batch:
@@ -282,7 +282,6 @@ class SchedulerMlxOverlapMixin:
                 self._sched_idled = True
                 self.on_idle()
 
-            self.last_batch = next_batch
             if self.recv_skipper is not None:
                 self.recv_skipper.on_launch(next_batch)
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():

@@ -34,8 +34,8 @@ def _make_checker(page_size=_PAGE_SIZE, row_width=4096, num_reqs=8, free_pages=N
         req_to_token_pool = _rtp
         token_to_kv_pool_allocator = _alloc
         tree_cache = _tc
-        get_last_batch = lambda self: None
-        get_running_and_inflight_batches = lambda self: [self.get_last_batch()]
+        get_inflight_batch = lambda self: None
+        get_running_and_inflight_batches = lambda self: [self.get_inflight_batch()]
         get_chunked_req = lambda self: None
         count_memory_leak_warnings = 0
 
@@ -67,7 +67,7 @@ class TestKVPageInvariants(CustomTestCase):
         )
         rtt[0, :256] = torch.arange(_PAGE_SIZE)  # req 0 owns page 0
         rtt[1, :256] = torch.arange(_PAGE_SIZE, 2 * _PAGE_SIZE)  # req 1 owns page 1
-        chk.get_last_batch = lambda: SimpleNamespace(
+        chk.get_inflight_batch = lambda: SimpleNamespace(
             reqs=[_FakeOwner(0, 256, 256, rid="a"), _FakeOwner(1, 200, 256, rid="b")]
         )
         chk._check_kv_page_invariants()
@@ -75,7 +75,7 @@ class TestKVPageInvariants(CustomTestCase):
 
     def test_committed_gt_allocated_raises(self):
         chk, rtt, tc, alloc = _make_checker()
-        chk.get_last_batch = lambda: SimpleNamespace(
+        chk.get_inflight_batch = lambda: SimpleNamespace(
             reqs=[_FakeOwner(0, 145, 144, rid="a")]
         )
         with self.assertRaises(AssertionError):
@@ -83,7 +83,7 @@ class TestKVPageInvariants(CustomTestCase):
 
     def test_slot_committed_gt_allocated_raises(self):
         chk, rtt, tc, alloc = _make_checker()
-        chk.get_last_batch = lambda: None
+        chk.get_inflight_batch = lambda: None
         tc.session_records()["s1"] = _FakeOwner(0, 145, 144).kv
         with self.assertRaises(AssertionError):
             chk._check_kv_page_invariants()
@@ -94,13 +94,13 @@ class TestKVPageInvariants(CustomTestCase):
         rtt[0, :3] = torch.tensor(
             [5 * _PAGE_SIZE, 5 * _PAGE_SIZE + 1, 5 * _PAGE_SIZE + 2]
         )
-        chk.get_last_batch = lambda: SimpleNamespace(
+        chk.get_inflight_batch = lambda: SimpleNamespace(
             reqs=[_FakeOwner(0, 3, 3, rid="a")]
         )
         with self.assertRaises(ValueError):
             chk._check_kv_page_invariants()
 
-    def test_requests_outside_last_batch_are_checked(self):
+    def test_requests_outside_the_step_in_flight_are_checked(self):
         # A request still owns its row from running_batch or parked between chunks.
         for where in ("running", "chunked"):
             with self.subTest(where=where):
@@ -125,7 +125,7 @@ class TestKVPageInvariants(CustomTestCase):
             return_value=torch.tensor([5, 6], dtype=torch.int64)
         )
         rtt[0, :1] = torch.tensor([5 * alloc.page_size])
-        chk.get_last_batch = lambda: SimpleNamespace(
+        chk.get_inflight_batch = lambda: SimpleNamespace(
             reqs=[_FakeOwner(0, 1, 1, rid="classed")]
         )
 
@@ -141,7 +141,7 @@ class TestKVPageInvariants(CustomTestCase):
     def test_free_pool_duplicate_raises(self):
         chk, rtt, tc, alloc = _make_checker(free_pages=torch.tensor([3, 3, 4]))
         rtt[0, :1] = torch.tensor([10 * _PAGE_SIZE])  # owner page 10, not in free
-        chk.get_last_batch = lambda: SimpleNamespace(
+        chk.get_inflight_batch = lambda: SimpleNamespace(
             reqs=[_FakeOwner(0, 1, 1, rid="a")]
         )
         with self.assertRaises(ValueError):

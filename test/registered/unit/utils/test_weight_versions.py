@@ -306,15 +306,15 @@ class _SchedulerStub:
         running,
         waiting,
         chunked=None,
-        last_batch=None,
+        inflight_batch=None,
         hisparse=None,
     ):
         self.serving = _ServingStub(version)
         self.enable_continuous_input_polling = False
         self.inflight_steps = InflightQueue(depth=1)
+        if inflight_batch is not None:
+            self.inflight_steps.push(inflight_batch, None)
         self.running_batch = SimpleNamespace(reqs=running)
-        self.last_batch = last_batch
-        self.rows_join_before_plan = False
         self.disaggregation_mode = DisaggregationMode.NULL
         self.waiting_queue = waiting
         self.chunked_req = chunked
@@ -355,15 +355,15 @@ class TestSchedulerRecordWeightVersionChange(CustomTestCase):
             self.assertEqual(req.weight_version_events[0].old_version, "v1")
             self.assertEqual(req.weight_version_events[0].num_output_tokens, output_len)
 
-    def test_records_on_last_batch_requests_exactly_once(self):
-        """A request in both the running and last batch is recorded once, and last-batch-only requests are recorded too."""
+    def test_records_on_inflight_step_requests_exactly_once(self):
+        """A request in both the running rows and a step in flight is recorded once, and step-only requests are recorded too."""
         shared_req = _ReqStub(3)
         prefill_req = _ReqStub(1)
         scheduler = self._scheduler(
             "v1",
             [shared_req],
             [],
-            last_batch=SimpleNamespace(reqs=[shared_req, prefill_req]),
+            inflight_batch=SimpleNamespace(reqs=[shared_req, prefill_req]),
         )
 
         Scheduler.record_weight_version_change(scheduler, new_version="v2")

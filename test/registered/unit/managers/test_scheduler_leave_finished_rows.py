@@ -1,7 +1,6 @@
 """Finished running rows leave at the top of the next plan, before admission.
-The step launched last, which readers between steps see as last_batch, drops
-them at that plan too. The PD decode loops and the pipeline loops drop them at
-the commit instead (test_disagg_decode_rows.py, test_scheduler_pp_slot_rows.py)."""
+The PD decode loops and the pipeline loops drop them at the commit instead
+(test_disagg_decode_rows.py, test_scheduler_pp_slot_rows.py)."""
 
 import copy
 import unittest
@@ -81,7 +80,6 @@ class TestLeaveBeforeAdmission(unittest.TestCase):
         s.dllm_config = None
         s.chunked_req = None
         s.enable_hisparse = False
-        s.rows_join_before_plan = False
         s.require_mlp_sync = False
         s._should_defer_prefill = Mock(return_value=False)
         s.dp_attn_adapter = Mock()
@@ -110,36 +108,11 @@ class TestLeaveBeforeAdmission(unittest.TestCase):
             [_Req("a"), _Req("b", True), _Req("c"), _Req("d", True), _Req("e")]
         )
 
-        plan = s.get_next_batch_to_run(
-            decoding_batch=DecodingBatch(running), last_batch=None
-        )
+        plan = s.get_next_batch_to_run(decoding_batch=DecodingBatch(running))
 
         self.assertEqual(s.seen, [["a", "c", "e"]])
         self.assertEqual(_rids(plan.running_batch), ["a", "c", "e"])
         s.select_decode_rows.assert_not_called()
-
-    def test_leave_runs_after_the_join(self):
-        # Overlap commits the previous step after this plan's join; the leave
-        # then drops the old rows that finished, keeping [old survivors, new].
-        s = self._scheduler()
-        running = _Batch([_Req("a", True), _Req("b")])
-        last = _Batch([_Req("c"), _Req("d")], extend=True)
-
-        plan = s.get_next_batch_to_run(
-            decoding_batch=DecodingBatch(running), last_batch=last
-        )
-
-        self.assertEqual(s.seen, [["b", "c", "d"]])
-        self.assertEqual(_rids(plan.batch_to_run), ["b", "c", "d"])
-
-        # The join sees the old rows before they leave: a batch whose rows all
-        # finished takes the new rows in, it is not replaced at this plan.
-        running = _Batch([_Req("a", True)])
-        plan = s.get_next_batch_to_run(
-            decoding_batch=DecodingBatch(running), last_batch=last
-        )
-        self.assertIs(plan.running_batch, running)
-        self.assertEqual(_rids(running), ["c", "d"])
 
     def test_next_joiner_replaces_an_all_finished_batch(self):
         # Every running row finished: the batch empties at this plan, so the
@@ -148,16 +121,13 @@ class TestLeaveBeforeAdmission(unittest.TestCase):
         s = self._scheduler(admitted=new)
         decoding_batch = DecodingBatch(_Batch([_Req("a", True), _Req("b", True)]))
 
-        plan = s.get_next_batch_to_run(decoding_batch=decoding_batch, last_batch=None)
+        plan = s.get_next_batch_to_run(decoding_batch=decoding_batch)
         self.assertEqual(s.seen, [[]])
         self.assertIs(plan.batch_to_run, new)
 
-        s.get_new_batch_prefill = lambda db: NextBatchPlan(
-            batch_to_run=None, running_batch=db.rows
-        )
-        plan = s.get_next_batch_to_run(decoding_batch=decoding_batch, last_batch=new)
-        self.assertIsNot(plan.running_batch, new)
-        self.assertEqual(_rids(plan.running_batch), ["new"])
+        decoding_batch.join_launched(new)
+        self.assertIsNot(decoding_batch.rows, new)
+        self.assertEqual(_rids(decoding_batch.rows), ["new"])
 
 
 class TestIdleAfterTheLastRowFinishes(unittest.TestCase):

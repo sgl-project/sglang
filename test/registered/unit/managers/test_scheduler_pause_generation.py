@@ -75,7 +75,6 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.enable_skip_finishing_decode = False
         scheduler.enable_overlap_mlx = False
         scheduler.last_batch = None
-        scheduler.rows_join_before_plan = False
         scheduler.recv_skipper = None
         scheduler.cur_batch_for_debug = None
         scheduler.chunked_req = None
@@ -110,6 +109,18 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.metrics_reporter.current_scheduler_metrics_enabled = False
         scheduler.kv_events_publisher = MagicMock()
         return scheduler
+
+    def _launch_in_slot(self, scheduler: Scheduler, batch: ScheduleBatch) -> None:
+        """Make batch the step the current pipeline slot launched last and the
+        ring committed: the only loop where a launched step lists requests the
+        running rows do not hold."""
+        ring = InflightQueue(depth=1, ring=True)
+        ring.push(batch, None)
+        ring.end_step()
+        ring.push(None, None)
+        ring.end_step()
+        ring.pop_due()
+        scheduler.inflight_steps = ring
 
     def _make_req(self, rid: str, finished: bool = False) -> Req:
         req = Req(
@@ -342,11 +353,14 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.running_batch = self._make_batch(
             scheduler, reqs=[run_req_a, run_req_b], with_tensors=True
         )
-        scheduler.last_batch = self._make_batch(
+        self._launch_in_slot(
             scheduler,
-            reqs=[last_req],
-            forward_mode=ForwardMode.EXTEND,
-            with_tensors=True,
+            self._make_batch(
+                scheduler,
+                reqs=[last_req],
+                forward_mode=ForwardMode.EXTEND,
+                with_tensors=True,
+            ),
         )
         scheduler.chunked_req = MagicMock()
         requeue_log = self._spy_requeue(scheduler)
@@ -378,21 +392,13 @@ class TestSchedulerPauseGeneration(CustomTestCase):
                 if mixed:
                     # The mixed step ran old as its tail: the rows are its
                     # rows, new first.
-                    rows, launched = [new, old], [chunk, new, old]
+                    rows = [new, old]
                 else:
-                    rows, launched = [old, new], [chunk, new]
+                    rows = [old, new]
                 scheduler.running_batch = self._make_batch(
                     scheduler, reqs=rows, with_tensors=True
                 )
-                scheduler.last_batch = self._make_batch(
-                    scheduler,
-                    reqs=launched,
-                    forward_mode=ForwardMode.MIXED if mixed else ForwardMode.EXTEND,
-                    with_tensors=True,
-                )
-                scheduler.last_batch.num_decode_rows = 1 if mixed else 0
                 scheduler.chunked_req = chunk
-                scheduler.rows_join_before_plan = True
                 requeue_log = self._spy_requeue(scheduler)
 
                 scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
@@ -416,7 +422,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         converted = scheduler.decoding_batch.decode_step()
         converted.forward_mode = ForwardMode.EXTEND
         converted.num_decode_rows = 2
-        scheduler.last_batch = converted
+        self._launch_in_slot(scheduler, converted)
         requeue_log = self._spy_requeue(scheduler)
 
         scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
@@ -433,11 +439,14 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler = self._new_scheduler()
         last_req = self._make_req("last")
         scheduler.running_batch = ScheduleBatch(reqs=[])
-        scheduler.last_batch = self._make_batch(
+        self._launch_in_slot(
             scheduler,
-            reqs=[last_req],
-            forward_mode=ForwardMode.EXTEND,
-            with_tensors=True,
+            self._make_batch(
+                scheduler,
+                reqs=[last_req],
+                forward_mode=ForwardMode.EXTEND,
+                with_tensors=True,
+            ),
         )
         scheduler.chunked_req = MagicMock()
         requeue_log = self._spy_requeue(scheduler)
@@ -456,11 +465,14 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.hisparse_coordinator = MagicMock()
         last_req = self._make_req("last")
         scheduler.running_batch = ScheduleBatch(reqs=[])
-        scheduler.last_batch = self._make_batch(
+        self._launch_in_slot(
             scheduler,
-            reqs=[last_req],
-            forward_mode=ForwardMode.EXTEND,
-            with_tensors=True,
+            self._make_batch(
+                scheduler,
+                reqs=[last_req],
+                forward_mode=ForwardMode.EXTEND,
+                with_tensors=True,
+            ),
         )
         requeue_log = self._spy_requeue(scheduler)
 
@@ -478,11 +490,14 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.running_batch = self._make_batch(
             scheduler, reqs=[run_req], with_tensors=True
         )
-        scheduler.last_batch = self._make_batch(
+        self._launch_in_slot(
             scheduler,
-            reqs=[last_req],
-            forward_mode=ForwardMode.EXTEND,
-            with_tensors=True,
+            self._make_batch(
+                scheduler,
+                reqs=[last_req],
+                forward_mode=ForwardMode.EXTEND,
+                with_tensors=True,
+            ),
         )
         requeue_log = self._spy_requeue(scheduler)
 
@@ -504,7 +519,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
             with_tensors=True,
         )
         scheduler.running_batch = running
-        scheduler.last_batch = running
+        self._launch_in_slot(scheduler, running)
         requeue_log = self._spy_requeue(scheduler)
 
         scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
@@ -574,12 +589,8 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler = self._new_scheduler()
         scheduler.enable_overlap = True
         last_req = self._make_req("last")
-        scheduler.running_batch = ScheduleBatch(reqs=[])
-        scheduler.last_batch = self._make_batch(
-            scheduler,
-            reqs=[last_req],
-            forward_mode=ForwardMode.EXTEND,
-            with_tensors=True,
+        scheduler.running_batch = self._make_batch(
+            scheduler, reqs=[last_req], with_tensors=True
         )
         scheduler.inflight_steps.push(MagicMock(), MagicMock())
         event_log: List[str] = []

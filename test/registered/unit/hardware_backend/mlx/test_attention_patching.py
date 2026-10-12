@@ -6,6 +6,7 @@ import importlib.util
 import unittest
 from collections import deque
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.test.ci.ci_register import register_mlx_ci
@@ -1108,13 +1109,11 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
 
 @unittest.skipUnless(_HAS_MLX, _SKIP_REASON)
 class TestMlxOverlapScheduler(unittest.TestCase):
-    def test_finalize_pending_job_updates_scheduler_last_batch(self):
+    def test_finalize_pending_job_joins_the_rows(self):
         token_ids = torch.tensor([7], dtype=torch.long)
         scheduler = FakeOverlapScheduler(token_ids)
-        stale_batch = SimpleNamespace(input_ids=None)
         batch_copy = SimpleNamespace(input_ids=None)
         schedule_batch = SimpleNamespace(input_ids=None)
-        scheduler.last_batch = stale_batch
 
         pending = MlxPendingJob(
             launch=MlxLaunch(
@@ -1131,7 +1130,7 @@ class TestMlxOverlapScheduler(unittest.TestCase):
 
         scheduler._finalize_mlx_pending_job(pending)
 
-        self.assertIs(scheduler.last_batch, schedule_batch)
+        scheduler.decoding_batch.join_launched.assert_called_once_with(schedule_batch)
         self.assertTrue(torch.equal(batch_copy.input_ids, token_ids))
         self.assertTrue(torch.equal(schedule_batch.input_ids, token_ids))
         self.assertIs(scheduler.processed_batch, batch_copy)
@@ -1166,7 +1165,6 @@ class TestMlxOverlapScheduler(unittest.TestCase):
         scheduler.result_queue = deque()
         scheduler.future_map = SimpleNamespace()
         scheduler.cur_batch_for_debug = None
-        scheduler.last_batch = None
         scheduler.decoding_batch = None
         scheduler.tp_worker = SimpleNamespace(
             async_forward_batch_generation_mlx=fake_forward
@@ -1180,8 +1178,8 @@ class TestMlxOverlapScheduler(unittest.TestCase):
             spec_algorithm=SpeculativeAlgorithm.NONE,
             device="cpu",
         )
-        scheduler.get_next_batch_to_run = lambda decoding_batch, last_batch: (
-            SimpleNamespace(batch_to_run=batch, running_batch=None)
+        scheduler.get_next_batch_to_run = lambda decoding_batch: SimpleNamespace(
+            batch_to_run=batch, running_batch=None
         )
 
         with self.assertRaises(_StopLoop):
@@ -1533,7 +1531,9 @@ if _HAS_MLX:
     class FakeOverlapScheduler(SchedulerMlxOverlapMixin):
         def __init__(self, next_token_ids):
             self.tp_worker = FakeTpWorker(next_token_ids)
-            self.last_batch = None
+            self.enable_hisparse = False
+            self.dllm_config = None
+            self.decoding_batch = Mock()
             self.processed_batch = None
             self.processed_result = None
             # Launch bookkeeping mirrors run_batch before each MLX forward.

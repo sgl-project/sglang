@@ -132,14 +132,6 @@ class TestDecodingBatch(CustomTestCase):
             self.assertIs(decoding_batch.rows, rows)
             self.assertEqual(_rids(rows), ["a", "b"])
 
-    def test_park_for_mix_hands_the_rows_to_the_mixed_step(self):
-        rows = _Batch("a", "b")
-        decoding_batch = DecodingBatch(rows)
-        decoding_batch.park_for_mix()
-        self.assertIsNot(decoding_batch.rows, rows)
-        self.assertTrue(decoding_batch.rows.is_empty())
-        self.assertEqual(_rids(rows), ["a", "b"])
-
     def test_in_place_methods_keep_the_rows_object(self):
         # select_decode_rows and the pipeline slots hold the rows object
         # across these calls.

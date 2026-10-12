@@ -121,9 +121,7 @@ class TestStashGatePreservesPrefix(CustomTestCase):
         # so the gate must skip stash and leave the prefix intact.
         s, req = self._build(fill_len=self.INITIAL_PREFIX_LEN)
 
-        Scheduler.get_next_batch_to_run(
-            s, decoding_batch=s.decoding_batch, last_batch=s.last_batch
-        )
+        Scheduler.get_next_batch_to_run(s, decoding_batch=s.decoding_batch)
 
         self.assertEqual(req.prefix_len, self.INITIAL_PREFIX_LEN)
         s.tree_cache.checkpoint.assert_not_called()
@@ -133,9 +131,7 @@ class TestStashGatePreservesPrefix(CustomTestCase):
         # the cached prefix, stash must run and advance prefix_len.
         s, req = self._build(fill_len=self.POST_RESET_FILL_LEN)
 
-        Scheduler.get_next_batch_to_run(
-            s, decoding_batch=s.decoding_batch, last_batch=s.last_batch
-        )
+        Scheduler.get_next_batch_to_run(s, decoding_batch=s.decoding_batch)
 
         self.assertEqual(req.prefix_len, self.POST_RESET_FILL_LEN)
         s.tree_cache.checkpoint.assert_called_once_with(
@@ -148,9 +144,7 @@ class TestStashGatePreservesPrefix(CustomTestCase):
         cache = _make_tree_cache()
         s = _scheduler_for_get_next_batch(tree_cache=cache, chunked_req=None)
 
-        Scheduler.get_next_batch_to_run(
-            s, decoding_batch=s.decoding_batch, last_batch=s.last_batch
-        )
+        Scheduler.get_next_batch_to_run(s, decoding_batch=s.decoding_batch)
         self.assertIsNone(s.chunked_req)
         cache.checkpoint.assert_not_called()
 

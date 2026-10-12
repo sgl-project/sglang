@@ -155,13 +155,11 @@ def _launch(
 
 def _enter_normal(self: Scheduler) -> None:
     self.inflight_steps = InflightQueue(depth=0)
-    self.rows_join_before_plan = True
 
 
 def _enter_overlap(self: Scheduler) -> None:
     self.enable_skip_finishing_decode = True
     self.inflight_steps = InflightQueue(depth=1)
-    self.rows_join_before_plan = True
 
 
 def _enter_pd(self: Scheduler) -> None:

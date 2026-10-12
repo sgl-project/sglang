@@ -37,7 +37,7 @@ class TestSchedulerFlushCacheAfterRetract(unittest.TestCase):
         scheduler._engine_paused = True
         scheduler.enable_overlap = False
         scheduler.last_batch = None
-        scheduler.rows_join_before_plan = False
+        scheduler.hisparse_coordinator = None
         scheduler.recv_skipper = None
         scheduler.cur_batch = None
         scheduler.chunked_req = None

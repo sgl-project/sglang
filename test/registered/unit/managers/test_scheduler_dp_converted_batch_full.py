@@ -98,21 +98,16 @@ class TestDpConvertedBatchFull(unittest.TestCase):
         decoding_batch = DecodingBatch(running)
 
         # Step N: decode is converted to extend because a peer rank extends.
-        plan = s.get_next_batch_to_run(decoding_batch=decoding_batch, last_batch=None)
+        plan = s.get_next_batch_to_run(decoding_batch=decoding_batch)
         self.assertIsNot(plan.batch_to_run, running)
         self.assertIs(plan.batch_to_run.forward_mode, _EXTEND)
         self.assertIs(plan.running_batch, running)
         self.assertIs(running.forward_mode, _DECODE)
 
-        # Step N+1: one row finished; the converted step comes back as
-        # last_batch and is not joined: its rows are the running rows. It
-        # drops the finished row with them.
+        # Step N+1: one row finished; the converted step's rows are the
+        # running rows, which drop it.
         running.reqs[0].finished = lambda: True
-        converted = plan.batch_to_run
-        plan = s.get_next_batch_to_run(
-            decoding_batch=decoding_batch, last_batch=converted
-        )
-        self.assertEqual(converted.batch_size(), 2)
+        plan = s.get_next_batch_to_run(decoding_batch=decoding_batch)
 
         self.assertEqual(len(seen), 2)
         self.assertIs(seen[-1], running)

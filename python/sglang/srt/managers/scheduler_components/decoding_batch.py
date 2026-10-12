@@ -2,8 +2,8 @@
 
 The scheduler changes ``DecodingBatch.rows`` only through the methods below,
 except PrefillAdder's priority preemption, which filters the rows in place.
-``join``, ``join_launched`` and ``park_for_mix`` may replace the rows object;
-the other methods keep it, so a reference to ``rows`` stays valid across them.
+``join`` and ``join_launched`` may replace the rows object; the other methods
+keep it, so a reference to ``rows`` stays valid across them.
 
 A decode step is a copy of the rows (only pdmux still launches the rows), and
 ``absorb`` takes back the fields its run, and in some loops its commit,
@@ -15,7 +15,8 @@ The normal and overlap loops join a step's finished prefills at its launch and
 drop the rows a commit finished at that commit, so between steps the rows are
 exactly the requests still decoding. The pipeline loops do both at the ring
 commit of the slot's step, where its output arrives; PD decode joins the
-prebuilt batch at the plan; MLX joins and leaves at the next plan.
+prebuilt batch at the plan; MLX joins a step's rows when it commits the step,
+and leaves at the next plan.
 """
 
 from __future__ import annotations
@@ -135,11 +136,6 @@ class DecodingBatch:
             step.forward_mode == ForwardMode.EXTEND
             and step.num_decode_rows == len(step.reqs)
         ), f"decode step came back as {step.forward_mode}"
-
-    def park_for_mix(self) -> None:
-        """Hand the rows to a mixed step, for a loop that joins at the next
-        plan: they run inside that step's batch, which that plan joins back."""
-        self.rows = ScheduleBatch(reqs=[])
 
     def clear_for_pause(self) -> None:
         """Forget the rows, and the decode step launched from them, after a

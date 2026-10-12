@@ -112,7 +112,7 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
         s.ngram_embedding_manager = Mock()
         s.ngram_embedding_manager.prepare_for_forward.return_value = None
 
-        plan = s.get_next_batch_to_run(self.decoding_batch, None)
+        plan = s.get_next_batch_to_run(self.decoding_batch)
 
         self.assertIsNone(plan.batch_to_run)
         s.get_new_batch_prefill.assert_not_called()

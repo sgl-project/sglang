@@ -2,7 +2,7 @@
 # on the hand-written loops. Read that test's docstring before re-recording.
 
 [normal]
-inflight_steps=IQ(0,True,False); rows_join_before_plan=True
+inflight_steps=IQ(0,True,False)
 ingest_requests(); get_next_batch_to_run(decoding_batch=decoding_batch); cur_batch_for_debug=A; run_batch(A); _update_rows_at_launch(A); iq.push(A,rA); _commit_due_step(); iq.pop_due(); process_batch_result(A,rA); leave_finished_rows(decoding_batch); last_batch=A; recv_skipper.on_launch(A); iq.end_step(); invariant_checker.self_check_during_busy()
 ingest_requests(); get_next_batch_to_run(decoding_batch=decoding_batch); cur_batch_for_debug=B; run_batch(B); _update_rows_at_launch(B); iq.push(B,rB); _commit_due_step(); iq.pop_due(); process_batch_result(B,rB); leave_finished_rows(decoding_batch); last_batch=B; recv_skipper.on_launch(B); iq.end_step(); invariant_checker.self_check_during_busy()
 ingest_requests(); _record_scheduler_state_for_paused_engine()
@@ -14,7 +14,7 @@ ingest_requests(); get_next_batch_to_run(decoding_batch=decoding_batch); cur_bat
 ingest_requests()
 
 [overlap]
-enable_skip_finishing_decode=True; inflight_steps=IQ(1,True,False); rows_join_before_plan=True
+enable_skip_finishing_decode=True; inflight_steps=IQ(1,True,False)
 ingest_requests(); get_next_batch_to_run(decoding_batch=decoding_batch); cur_batch_for_debug=A; is_disable_overlap_for_batch(A,last_batch=None); run_batch(A); _apply_war_barrier(); iq.push(Ac,rA); _update_rows_at_launch(A); _debug_check_commit_gate(False); leave_finished_rows(decoding_batch); launch_batch_sample_if_needed(rA,A); last_batch=A; recv_skipper.on_launch(A); iq.end_step(); invariant_checker.self_check_during_busy()
 ingest_requests(); get_next_batch_to_run(decoding_batch=decoding_batch); cur_batch_for_debug=B; is_disable_overlap_for_batch(B,last_batch=Ac); _commit_due_step(); iq.pop_due(); process_batch_result(Ac,rA); token_to_kv_pool_allocator.flush_opportunistic(); run_batch(B); _apply_war_barrier(); iq.push(Bc,rB); _update_rows_at_launch(B); _debug_check_commit_gate(False); leave_finished_rows(decoding_batch); launch_batch_sample_if_needed(rB,B); last_batch=B; recv_skipper.on_launch(B); iq.end_step(); invariant_checker.self_check_during_busy()
 ingest_requests(); _record_scheduler_state_for_paused_engine()
@@ -26,7 +26,7 @@ ingest_requests(); get_next_batch_to_run(decoding_batch=decoding_batch); cur_bat
 ingest_requests()
 
 [overlap_exit]
-enable_skip_finishing_decode=True; inflight_steps=IQ(1,True,False); rows_join_before_plan=True
+enable_skip_finishing_decode=True; inflight_steps=IQ(1,True,False)
 ingest_requests(); get_next_batch_to_run(decoding_batch=decoding_batch); cur_batch_for_debug=A; is_disable_overlap_for_batch(A,last_batch=None); run_batch(A); _apply_war_barrier(); iq.push(Ac,rA); _update_rows_at_launch(A); _debug_check_commit_gate(False); leave_finished_rows(decoding_batch); last_batch=A; recv_skipper.on_launch(A); iq.end_step(); invariant_checker.self_check_during_busy()
 ingest_requests(); get_next_batch_to_run(decoding_batch=decoding_batch); cur_batch_for_debug=B; is_disable_overlap_for_batch(B,last_batch=Ac); _commit_due_step(); iq.pop_due(); process_batch_result(Ac,rA); run_batch(B); _apply_war_barrier(); iq.push(Bc,rB); _update_rows_at_launch(B); _debug_check_commit_gate(False); leave_finished_rows(decoding_batch); last_batch=B; recv_skipper.on_launch(B); iq.end_step(); invariant_checker.self_check_during_busy()
 ingest_requests(); _record_scheduler_state_for_paused_engine()
@@ -253,7 +253,7 @@ decoding_batch=db0; _pp_slot_last_batch(0); recv_skipper.on_launch(None)
 ingest_requests()
 
 [pp_l2]
-init_pp_loop_state(); inflight_steps=IQ(1,True,True); pp_outputs=None; send_req_work=[]; rows_join_before_plan=True
+init_pp_loop_state(); inflight_steps=IQ(1,True,True); pp_outputs=None; send_req_work=[]
 decoding_batch=db0; _pp_slot_last_batch(0); recv_skipper.on_launch(None)
 recv_requests{; ingest_requests(); }; _pp_commit_comm_work([]); send_reqs_to_next_stage{; _pp_send_pyobj_to_next_stage([],async_send=True); send_req_work=work:[]; }; get_next_batch_to_run{; get_next_batch_to_run(decoding_batch=db0); _pp_debug_check_slot(0); iq.push(A,None); }; cur_batch_for_debug=A; _pp_recv_proxy_tensors(); _pp_commit_proxy_send_work(); _pp_launch_batch(0,A,proxy,[None,None],lrcq); launch_event=evA; _pp_commit_send_output_work_and_preprocess_output_tensors(0,1); _pp_pop_due_batch(); _pp_send_proxy_to_next_stage(resA); pp_outputs=out1; iq.end_step()
 decoding_batch=db1; _pp_slot_last_batch(1); recv_skipper.on_launch(None)
@@ -270,7 +270,7 @@ decoding_batch=db0; _pp_slot_last_batch(0); recv_skipper.on_launch(None)
 recv_requests{; ingest_requests(); }
 
 [pp_l2_spec_relay]
-init_pp_loop_state(); inflight_steps=IQ(1,True,True); pp_outputs=None; send_req_work=[]; rows_join_before_plan=True
+init_pp_loop_state(); inflight_steps=IQ(1,True,True); pp_outputs=None; send_req_work=[]
 decoding_batch=db0; _pp_slot_last_batch(0); recv_skipper.on_launch(None)
 recv_requests{; ingest_requests(); }; _pp_commit_comm_work([]); send_reqs_to_next_stage{; _pp_send_pyobj_to_next_stage([],async_send=True); send_req_work=work:[]; }; get_next_batch_to_run{; get_next_batch_to_run(decoding_batch=db0); _pp_debug_check_slot(0); iq.push(A,None); }; cur_batch_for_debug=A; _pp_recv_proxy_tensors(); _pp_commit_proxy_send_work(); _pp_launch_batch(0,A,proxy,[None,md],lrcq); launch_event=evA; _pp_commit_send_output_work_and_preprocess_output_tensors(0,1); _pp_pop_due_batch(); _pp_send_proxy_to_next_stage(resA); pp_outputs=out1; iq.end_step()
 decoding_batch=db1; _pp_slot_last_batch(1); recv_skipper.on_launch(None)
@@ -287,7 +287,7 @@ decoding_batch=db0; _pp_slot_last_batch(0); recv_skipper.on_launch(None)
 recv_requests{; ingest_requests(); }
 
 [pp_l3_last]
-init_pp_loop_state(); inflight_steps=IQ(2,True,True); pp_outputs=None; send_req_work=[]; rows_join_before_plan=True
+init_pp_loop_state(); inflight_steps=IQ(2,True,True); pp_outputs=None; send_req_work=[]
 decoding_batch=db0; _pp_slot_last_batch(0); recv_skipper.on_launch(None)
 recv_requests{; ingest_requests(); }; get_next_batch_to_run{; get_next_batch_to_run(decoding_batch=db0); _pp_debug_check_slot(0); iq.push(A,None); }; cur_batch_for_debug=A; _pp_recv_proxy_tensors(); _pp_commit_send_output_work_and_preprocess_output_tensors(2,1); _pp_commit_proxy_send_work(); _pp_launch_batch(0,A,proxy,[None,None,None],lrcq); launch_event=evA; _pp_pop_due_batch(); pp_outputs=out1; iq.end_step()
 decoding_batch=db1; _pp_slot_last_batch(1); recv_skipper.on_launch(None)

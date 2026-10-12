@@ -1310,9 +1310,6 @@ class Scheduler(
         self.inflight_steps = InflightQueue(depth=0)
         self.enable_continuous_input_polling = False
         self.enable_skip_finishing_decode = False
-        # Set by the loops that join a launched step's finished prefills into
-        # the running rows before the next plan (see decoding_batch).
-        self.rows_join_before_plan = False
         self.forward_ct = 0
         self.return_health_check_ipcs: Deque[Optional[str]] = deque()
         self.flush_wrapper = SchedulerFlushWrapper(
@@ -3682,11 +3679,9 @@ class Scheduler(
     def get_next_batch_to_run(
         self,
         decoding_batch: DecodingBatch,
-        last_batch: Optional[ScheduleBatch] = None,
     ) -> NextBatchPlan:
-        """Plan the next step. last_batch is the step launched last; under a
-        loop that does not join before the plan (MLX), its finished-prefill
-        rows join here."""
+        """Plan the next step. The rows already hold the finished-prefill rows
+        of every step launched before."""
         # For a loop that takes a decode step back at the next plan (MLX): the
         # last decode step from these rows has run and committed, so the rows
         # take back what its run and commit rebound.
@@ -3699,25 +3694,17 @@ class Scheduler(
         if self.dllm_config is not None:
             self.dllm_manager.filter_finished_reqs()
 
-        # Merge the prefill batch into the running batch
-        reqs_to_exclude = set()
-
         if self.dllm_config is not None and self.dllm_manager.any_staging_reqs():
-            reqs_to_exclude.update(self.dllm_manager.staging_queue)
             for req in self.dllm_manager.staging_queue:
                 self.finish_dllm_forward(req)
 
         if self.chunked_req is not None:
-            # Move the chunked request out of the batch so that we can merge
-            # only finished requests to running_batch.
-            reqs_to_exclude.add(self.chunked_req)
-
             # A parked chunk (add_chunked_req hybrid-SWA early-return) leaves
             # extend_end at prefix_len: it computed no new KV, so nothing to stash.
             if self.chunked_req.extend_end > self.chunked_req.prefix_len:
                 self.stash_chunked_request(self.chunked_req)
 
-        # HiSparse has its own prefill-to-decode transition; skip last_batch merge.
+        # HiSparse has its own prefill-to-decode transition.
         if self.enable_hisparse:
             ready_reqs = self.hisparse_coordinator.collect_ready_reqs()
             if len(ready_reqs) > 0:
@@ -3725,40 +3712,11 @@ class Scheduler(
                 decoding_batch.join(new_batch)
                 decoding_batch.rows.hisparse_coordinator = self.hisparse_coordinator
 
-        # The step launched last stays last_batch until the loop launches the
-        # next one, and the idle checks and request queries read its requests,
-        # so it drops here the requests that leave the rows. After a drop it is
-        # only a listing of requests: its tensors, num_decode_rows and beam
-        # tails still describe the launched rows, so nothing may filter, merge
-        # or plan it again.
-        if last_batch is not None and not last_batch.has_prefill_rows():
-            # A decode step, or its DP extend view: a copy of the running rows,
-            # which have dropped their finished rows by the leave below. Filter
-            # only its request list; the rows share its sampling and spec
-            # objects.
-            last_batch.reqs = [r for r in last_batch.reqs if not r.finished()]
-        elif not self.enable_hisparse and last_batch:
-            if last_batch.chunked_req is not None:
-                # In the context pipeline parallelism, after the last chunk, the current microbatch still track outdated chunked_req.
-                # We need to discard it.
-                reqs_to_exclude.add(last_batch.chunked_req)
-
-            if self.dllm_config is not None and last_batch.reqs:
-                reqs_to_exclude.update(last_batch.reqs)
-
-            # Filter batch
-            last_batch.filter_batch(reqs_to_exclude=list(reqs_to_exclude))
-
-            # Merge a copy of the new batch into the running batch: the
-            # launched step never becomes the running rows.
-            if not last_batch.is_empty():
-                decoding_batch.join(last_batch.shallow_copy())
-
         # Rows whose finish a commit already observed leave before admission,
         # so admission, the decode rows and load reporting (/v1/loads) see only
-        # live rows. Runs after the last_batch join and outside it, so finished
-        # rows leave even when no new batch arrives (e.g. traffic stops). The
-        # loops that join before the plan dropped them at commit already.
+        # live rows. Finished rows leave even when no new batch arrives (e.g.
+        # traffic stops). The normal, overlap, PD decode and pipeline loops
+        # dropped them at commit already.
         self.leave_finished_rows(decoding_batch)
         if self.scripted_scheduler_hook is not None:
             self.scripted_scheduler_hook.on_plan_start(decoding_batch.rows)
@@ -4233,10 +4191,6 @@ class Scheduler(
                     self.future_map.stash_bonus_tokens(
                         running_batch.req_pool_indices, last_tokens
                     )
-                if not self.rows_join_before_plan:
-                    # The rows run inside the mixed step, which the next plan
-                    # joins back. A loop that joins before the plan keeps them.
-                    decoding_batch.park_for_mix()
 
         return NextBatchPlan(batch_to_run=new_batch, running_batch=decoding_batch.rows)
 
@@ -5142,13 +5096,14 @@ class Scheduler(
             and not self.dllm_manager.any_staging_reqs()
             and (not self.enable_overlap or len(self.inflight_steps) == 0)
             and self._pp_microbatches_drained()
-            # Under the normal and overlap loops, a just-prefilled HiSparse request
-            # waits in staging, not in the rows, until the next plan.
+            # Outside the pipeline loops, a just-prefilled HiSparse request waits
+            # in staging, not in the rows, until the next plan. pdmux never plans
+            # through that join.
             and not (
-                self.rows_join_before_plan
-                and not self.inflight_steps.ring
+                not self.inflight_steps.ring
                 and self.hisparse_coordinator is not None
                 and len(self.hisparse_coordinator.ack_staging_queue) > 0
+                and not self.enable_pdmux
             )
         )
 
@@ -5969,7 +5924,6 @@ def _dispatch_event_loop_once(scheduler: Scheduler):
     # A PD role switch can select a different loop on the same scheduler.
     scheduler.enable_continuous_input_polling = False
     scheduler.enable_skip_finishing_decode = False
-    scheduler.rows_join_before_plan = False
     disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
     if disaggregation_mode == DisaggregationMode.NULL:
         if scheduler.enable_pdmux:

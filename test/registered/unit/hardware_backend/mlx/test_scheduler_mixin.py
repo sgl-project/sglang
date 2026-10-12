@@ -361,7 +361,6 @@ class TestRetractPauseDrainsInflightJob(unittest.TestCase):
         scheduler.disaggregation_mode = DisaggregationMode.NULL
         scheduler.chunked_req = None
         scheduler.decode_offload_manager = None
-        scheduler.last_batch = None
         scheduler.waiting_queue = []
         scheduler.result_queue = deque()
         scheduler.metrics_reporter.current_scheduler_metrics_enabled = False
@@ -389,7 +388,7 @@ class TestRetractPauseDrainsInflightJob(unittest.TestCase):
         scheduler.running_batch = batch
         scheduler.decoding_batch = DecodingBatch(batch)
 
-        def get_next_batch_to_run(decoding_batch, last_batch):
+        def get_next_batch_to_run(decoding_batch):
             running_batch = decoding_batch.rows
             plan = MagicMock()
             plan.running_batch = running_batch

@@ -39,7 +39,6 @@ _WATCHED = frozenset(
     {
         "inflight_steps",
         "enable_skip_finishing_decode",
-        "rows_join_before_plan",
         "enable_continuous_input_polling",
         "cur_batch_for_debug",
         "_sched_idled",

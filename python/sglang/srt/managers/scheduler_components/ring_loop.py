@@ -128,7 +128,6 @@ def _bind_slot(self: Scheduler, mb_id: int) -> _RingSlot:
 
 def _enter_pp(self: Scheduler) -> None:
     self.init_pp_loop_state()
-    self.rows_join_before_plan = True
 
 
 def _enter_pp_disagg(self: Scheduler) -> None:

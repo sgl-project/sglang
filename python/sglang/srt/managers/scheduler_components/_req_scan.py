@@ -5,8 +5,6 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, List, Optional
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
-
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.managers.scheduler import Scheduler
@@ -25,26 +23,20 @@ def running_and_inflight_batches(
             scheduler.running_batch,
             *(record.batch for record in scheduler.inflight_steps),
         ]
-    if scheduler.inflight_steps.ring:
-        # The step the current pipeline slot launched last, until the slot
-        # launches again.
-        slots = scheduler.inflight_steps.slot_batches()
-        return [
-            scheduler.running_batch,
-            slots[scheduler.inflight_steps.step % len(slots)],
-        ]
-    return [scheduler.running_batch, scheduler.last_batch]
+    # The step the current pipeline slot launched last, until the slot
+    # launches again.
+    slots = scheduler.inflight_steps.slot_batches()
+    return [
+        scheduler.running_batch,
+        slots[scheduler.inflight_steps.step % len(slots)],
+    ]
 
 
 def launched_reqs_held(scheduler: Scheduler) -> bool:
     """Whether another holder lists every unfinished request of the steps
     launched, except the steps in flight and the request still chunking: the
-    rows in the normal and overlap loops, which join before the plan, and in
-    the PD decode loops, whose step is a copy of the rows; the KV transfer
-    and waiting queues in the PD prefill loops, which take the step's
-    requests at its commit. Not the pipeline loops."""
-    return (
-        scheduler.rows_join_before_plan
-        or scheduler.disaggregation_mode
-        in (DisaggregationMode.DECODE, DisaggregationMode.PREFILL)
-    ) and not scheduler.inflight_steps.ring
+    rows in the normal, overlap and MLX loops, which join them at launch or
+    commit, and in the PD decode loops, whose step is a copy of the rows; the
+    KV transfer and waiting queues in the PD prefill loops, which take the
+    step's requests at its commit. Not the pipeline loops."""
+    return not scheduler.inflight_steps.ring
