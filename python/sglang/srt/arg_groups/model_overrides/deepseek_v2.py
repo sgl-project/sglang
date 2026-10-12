@@ -18,8 +18,10 @@ logger = logging.getLogger(__name__)
 def _dsa_dcp_overrides(cfg: Any) -> dict:
     if cfg.dcp_size <= 1:
         return {}
-    if cfg.enable_hisparse:
-        raise ValueError("DSA DCP does not support HiSparse.")
+    if cfg.enable_hisparse or cfg.enable_hierarchical_cache:
+        raise ValueError("DSA DCP does not support HiSparse or HiCache.")
+    if cfg.disaggregation_mode != "null":
+        raise ValueError("DSA DCP does not support PD disaggregation.")
     if cfg.speculative_eagle_topk not in (None, 1):
         raise ValueError("DSA DCP requires --speculative-eagle-topk 1.")
     overrides = {

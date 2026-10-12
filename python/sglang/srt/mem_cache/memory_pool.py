@@ -5207,8 +5207,11 @@ class DSATokenToKVPool(MLATokenToKVPool):
         if dcp_replicated:
             self.index_page_size //= get_parallel().attn_dcp_size
         if index_buf_size is None:
+            dcp_size = get_parallel().attn_dcp_size
             index_buf_size = (
-                size if dcp_replicated else size * get_parallel().attn_dcp_size
+                size
+                if dcp_replicated
+                else (size + self.page_size) * dcp_size - self.page_size
             )
         self.index_buf_size = index_buf_size
         # num head == 1 and head dim == 128 for index_k in DSA

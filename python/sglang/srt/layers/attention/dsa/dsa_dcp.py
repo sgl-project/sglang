@@ -91,6 +91,7 @@ def dcp_trtllm_sparse_attention(
     rows_per_call = (TRTLLM_MAX_BATCH_ROWS // head_groups) * head_groups
     if folded_rows > rows_per_call:
         attention_kwargs["enable_pdl"] = False
+    top_k_lens = attention_kwargs.pop("sparse_mla_top_k_lens", None)
     outputs = []
     for start in range(0, folded_rows, rows_per_call):
         end = min(start + rows_per_call, folded_rows)
@@ -100,6 +101,9 @@ def dcp_trtllm_sparse_attention(
             seq_lens=seq_lens[start:end],
             return_lse=True,
             lse=folded_lse[start:end],
+            sparse_mla_top_k_lens=(
+                None if top_k_lens is None else top_k_lens[start:end]
+            ),
             **attention_kwargs,
         )
         output = output.view(end - start, folded_heads, -1)
