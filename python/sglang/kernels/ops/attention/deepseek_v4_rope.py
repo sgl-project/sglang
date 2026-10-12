@@ -254,6 +254,130 @@ def apply_rotary_emb_flat_kernel(
     tl.store(x_ptr + xo, out.to(x_ptr.dtype.element_ty), mask=rmask[:, None])
 
 
+@triton.jit
+def apply_rotary_emb_flat_copy_kernel(
+    x_ptr,
+    out_ptr,
+    fr_ptr,
+    pos_ptr,
+    n_rows,
+    n_heads,
+    sx_tok,
+    sx_head,
+    so_tok,
+    so_head,
+    sfr_pos,
+    sfr_d,
+    NOPE: tl.constexpr,
+    NOPE_BLOCK: tl.constexpr,
+    RD: tl.constexpr,
+    RDH: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+):
+    # apply_rotary_emb_flat_kernel (forward, with positions) on the last RD dims of
+    # unit-stride [NOPE + RD] head rows, written to out together with the copied
+    # leading NOPE dims: out = cat(x[..., :NOPE], rope(x[..., NOPE:])). The rope
+    # arithmetic is the flat kernel's, line for line.
+    pid = tl.program_id(0)
+    row = pid * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+    rmask = row < n_rows
+    tok = row // n_heads
+    head = row % n_heads
+    x_base = tok[:, None] * sx_tok + head[:, None] * sx_head
+    o_base = tok[:, None] * so_tok + head[:, None] * so_head
+
+    n = tl.arange(0, NOPE_BLOCK)
+    nmask = rmask[:, None] & (n < NOPE)[None, :]
+    nope = tl.load(x_ptr + x_base + n[None, :], mask=nmask, other=0.0)
+    tl.store(out_ptr + o_base + n[None, :], nope, mask=nmask)
+
+    d = tl.arange(0, RD)
+    x = tl.load(x_ptr + x_base + NOPE + d[None, :], mask=rmask[:, None], other=0.0).to(
+        tl.float32
+    )
+    pos = tl.load(pos_ptr + tok, mask=rmask, other=0)
+    cos_idx = (d // 2) * 2
+    cos = tl.load(
+        fr_ptr + pos[:, None] * sfr_pos + cos_idx[None, :] * sfr_d,
+        mask=rmask[:, None],
+        other=0.0,
+    )
+    sin = tl.load(
+        fr_ptr + pos[:, None] * sfr_pos + (cos_idx[None, :] + 1) * sfr_d,
+        mask=rmask[:, None],
+        other=0.0,
+    )
+
+    x_sin = x * sin
+    even = (d % 2 == 0)[None, :]
+    x_neg = tl.where(even, x_sin, -x_sin)
+    x_neg = tl.reshape(x_neg, (BLOCK_ROWS, RDH, 2))
+    x_neg = tl.flip(x_neg, 2)
+    x_rot = tl.reshape(x_neg, (BLOCK_ROWS, RD))
+
+    out = x * cos + x_rot
+    tl.store(
+        out_ptr + o_base + NOPE + d[None, :],
+        out.to(out_ptr.dtype.element_ty),
+        mask=rmask[:, None],
+    )
+
+
+def apply_rotary_emb_copy_into(
+    x: torch.Tensor,
+    out: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor,
+    rope_dim: int,
+) -> Optional[torch.Tensor]:
+    """out.copy_(x) after apply_rotary_emb_triton(x[..., -rope_dim:], freqs_cis,
+    positions) in one launch, leaving x untouched; out may be a head slice of a wider
+    buffer. Returns None (nothing done) where apply_rotary_emb_triton would not take
+    the flat kernel, so the caller keeps its two-step path."""
+    if not _USE_BATCHED_ROPE or x.ndim != 3 or not x.is_cuda:
+        return None
+    batch_size, n_heads, head_dim = x.shape
+    nope = head_dim - rope_dim
+    if (
+        out.shape != x.shape
+        or out.dtype != x.dtype
+        or x.stride(2) != 1
+        or out.stride(2) != 1
+        or rope_dim < 2
+        or rope_dim & (rope_dim - 1)
+        or nope < 0
+        or positions is None
+        or positions.shape != (batch_size,)
+    ):
+        return None
+    freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
+    n_rows = batch_size * n_heads
+    if n_rows == 0:
+        return out
+    FLAT_BLOCK_ROWS = 16
+    apply_rotary_emb_flat_copy_kernel[(triton.cdiv(n_rows, FLAT_BLOCK_ROWS),)](
+        x,
+        out,
+        freqs_real,
+        positions,
+        n_rows,
+        n_heads,
+        x.stride(0),
+        x.stride(1),
+        out.stride(0),
+        out.stride(1),
+        freqs_real.stride(0),
+        freqs_real.stride(1),
+        NOPE=nope,
+        NOPE_BLOCK=max(triton.next_power_of_2(nope), 1),
+        RD=rope_dim,
+        RDH=rope_dim // 2,
+        BLOCK_ROWS=FLAT_BLOCK_ROWS,
+        num_warps=4,
+    )
+    return out
+
+
 # Use the batched / contiguous-load rope kernels (faster, coalesced) instead of the
 # per-token kernel. Default OFF; DeepseekV4 enables it via set_batched_rope(True).
 # The env var SGLANG_ROPE_BATCHED=1 still works as an override.

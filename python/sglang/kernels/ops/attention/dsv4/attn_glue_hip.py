@@ -227,13 +227,15 @@ def _sparse_buffers_kernel(
     c4_raw_ptr,
     c4_sparse_ptr,
     c4_sparse_raw_ptr,
-    c4_page_ptr,
     c1_clamp1_ptr,
     c1_sparse_ptr,
-    c1_page_ptr,
     c2_clamp1_ptr,
     c2_sparse_ptr,
-    c2_page_ptr,
+    fill0_ptr,
+    fill1_ptr,
+    fill2_ptr,
+    fill3_ptr,
+    fill4_ptr,
     rows,
     topk,
     width,
@@ -259,7 +261,8 @@ def _sparse_buffers_kernel(
                 c2_clamp1 = tl.load(c2_clamp1_ptr + r, mask=m, other=0)
                 tl.store(c2_sparse_ptr + r, tl.minimum(c2_clamp1, topk), mask=m)
     else:
-        # the rest fill the -1 page-index buffers, one buffer per range of programs
+        # the rest fill the -1 [rows, width] buffers, one buffer per range of
+        # programs; the host packs the live buffers into fill0.. in order
         fill = pid - 1
         n = rows * width
         per_buffer = tl.cdiv(n, FILL_BLOCK)
@@ -267,15 +270,15 @@ def _sparse_buffers_kernel(
         i = (fill - which * per_buffer) * FILL_BLOCK + tl.arange(0, FILL_BLOCK)
         m = i < n
         if which == 0:
-            tl.store(c4_page_ptr + i, -1, mask=m)
+            tl.store(fill0_ptr + i, -1, mask=m)
         elif which == 1:
-            if HAS_C1:
-                tl.store(c1_page_ptr + i, -1, mask=m)
-            elif HAS_C2:
-                tl.store(c2_page_ptr + i, -1, mask=m)
+            tl.store(fill1_ptr + i, -1, mask=m)
+        elif which == 2:
+            tl.store(fill2_ptr + i, -1, mask=m)
+        elif which == 3:
+            tl.store(fill3_ptr + i, -1, mask=m)
         else:
-            if HAS_C1 and HAS_C2:
-                tl.store(c2_page_ptr + i, -1, mask=m)
+            tl.store(fill4_ptr + i, -1, mask=m)
 
 
 def sparse_buffers(
@@ -286,10 +289,13 @@ def sparse_buffers(
     c2_topk_lengths_clamp1: Optional[torch.Tensor],
     index_topk: int,
     page_index_align: int,
+    low_ratio_raw_indices: bool = False,
 ) -> Dict[str, torch.Tensor]:
     """init_flashmla_related's tensors in one launch, keyed by attribute name: the top-k
     lengths clamped to index_topk and the -1-filled int32 page-index buffers padded to
-    page_index_align, for ratio 4 and the ratios whose clamp-1 lengths are given."""
+    page_index_align, for ratio 4 and the ratios whose clamp-1 lengths are given.
+    low_ratio_raw_indices adds those ratios' c{r}_sparse_raw_indices, -1-filled like
+    their page indices (torch.full_like(c{r}_sparse_page_indices, -1))."""
     for t in (
         c4_topk_lengths_clamp1,
         c4_topk_lengths_raw,
@@ -309,30 +315,34 @@ def sparse_buffers(
         "c4_sparse_topk_lengths_raw": torch.empty(rows, **i32),
         "c4_sparse_page_indices": torch.empty((rows, width), **i32),
     }
+    fills = [out["c4_sparse_page_indices"]]
     has_c1 = c1_topk_lengths_clamp1 is not None
     has_c2 = c2_topk_lengths_clamp1 is not None
     for ratio, has in ((1, has_c1), (2, has_c2)):
         if has:
             out[f"c{ratio}_sparse_topk_lengths"] = torch.empty(rows, **i32)
             out[f"c{ratio}_sparse_page_indices"] = torch.empty((rows, width), **i32)
+            fills.append(out[f"c{ratio}_sparse_page_indices"])
+            if low_ratio_raw_indices:
+                out[f"c{ratio}_sparse_raw_indices"] = torch.empty((rows, width), **i32)
+                fills.append(out[f"c{ratio}_sparse_raw_indices"])
     if rows == 0:
         return out
     placeholder = out["c4_sparse_topk_lengths"]
     fill_block = 1024
     per_buffer = triton.cdiv(rows * width, fill_block)
-    n_buffers = 1 + int(has_c1) + int(has_c2)
+    n_buffers = len(fills)
+    fills += [placeholder] * (5 - n_buffers)
     _sparse_buffers_kernel[(1 + per_buffer * n_buffers,)](
         c4_topk_lengths_clamp1,
         c4_topk_lengths_raw,
         out["c4_sparse_topk_lengths"],
         out["c4_sparse_topk_lengths_raw"],
-        out["c4_sparse_page_indices"],
         c1_topk_lengths_clamp1 if has_c1 else placeholder,
         out.get("c1_sparse_topk_lengths", placeholder),
-        out.get("c1_sparse_page_indices", placeholder),
         c2_topk_lengths_clamp1 if has_c2 else placeholder,
         out.get("c2_sparse_topk_lengths", placeholder),
-        out.get("c2_sparse_page_indices", placeholder),
+        *fills,
         rows,
         index_topk,
         width,
@@ -424,3 +434,119 @@ def widen_pair_i64(
             a, b, oa, ob, n, BLOCK=block, num_warps=4
         )
     return oa, ob
+
+
+@triton.jit
+def _expand_same_length_rows_kernel(
+    seq_lens_ptr,
+    req_ptr,
+    ext_in_ptr,
+    seq_out_ptr,
+    ext_out_ptr,
+    casual_ptr,
+    pos_ptr,
+    req_rep_ptr,
+    n_rows,
+    seq_offset,
+    QO: tl.constexpr,
+    HAS_EXT_IN: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    r = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    m = r < n_rows
+    b = r // QO
+    j = r - b * QO
+    seq = tl.load(seq_lens_ptr + b, mask=m, other=0).to(tl.int64) + seq_offset
+    casual = seq + (j - (QO - 1))
+    casual32 = casual.to(tl.int32)
+    tl.store(casual_ptr + r, casual32, mask=m)
+    tl.store(pos_ptr + r, casual32 - 1, mask=m)
+    tl.store(req_rep_ptr + r, tl.load(req_ptr + b, mask=m, other=0), mask=m)
+    first = m & (j == 0)
+    tl.store(seq_out_ptr + b, seq.to(seq_out_ptr.dtype.element_ty), mask=first)
+    if HAS_EXT_IN:
+        ext = tl.load(ext_in_ptr + b, mask=first, other=0).to(tl.int64)
+    else:
+        ext = tl.full((BLOCK,), QO, tl.int64)
+    ext = tl.maximum(tl.minimum(ext, seq), 1)
+    tl.store(ext_out_ptr + b, ext.to(ext_out_ptr.dtype.element_ty), mask=first)
+
+
+def expand_same_length_rows(
+    seq_lens: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    qo_len: int,
+    seq_lens_offset: int = 0,
+    extend_seq_lens: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The per-row metadata of qo_len query rows per request, in one launch. With
+    s = seq_lens + seq_lens_offset it returns
+      s (seq_lens' dtype),
+      torch.minimum(extend_seq_lens.to(s.dtype) or full_like(s, qo_len), s).clamp_min_(1),
+      (s[:, None] + arange(-qo_len + 1, 1, int32)).flatten().to(int32)  (seq_lens_casual),
+      that minus 1                                                      (positions),
+      req_pool_indices[arange(bs, int32).repeat_interleave(qo_len)]     (rows' slots),
+    i.e. the torch chain of expand_extend_with_same_length and the head of
+    make_core_attn_metadata."""
+    assert seq_lens.dim() == 1 and seq_lens.stride(0) == 1, seq_lens.stride()
+    assert req_pool_indices.dim() == 1 and req_pool_indices.stride(0) == 1
+    assert qo_len >= 1, qo_len
+    bs = seq_lens.shape[0]
+    assert req_pool_indices.shape[0] == bs, (req_pool_indices.shape, bs)
+    has_ext = extend_seq_lens is not None
+    if has_ext:
+        assert extend_seq_lens.shape == (bs,) and extend_seq_lens.stride(0) == 1
+    device = seq_lens.device
+    n = bs * qo_len
+    seq_out = torch.empty_like(seq_lens)
+    ext_out = torch.empty_like(seq_lens)
+    casual = torch.empty(n, dtype=torch.int32, device=device)
+    positions = torch.empty(n, dtype=torch.int32, device=device)
+    req_rep = torch.empty(n, dtype=req_pool_indices.dtype, device=device)
+    if n:
+        block = min(1024, triton.next_power_of_2(n))
+        _expand_same_length_rows_kernel[(triton.cdiv(n, block),)](
+            seq_lens,
+            req_pool_indices,
+            extend_seq_lens if has_ext else seq_lens,
+            seq_out,
+            ext_out,
+            casual,
+            positions,
+            req_rep,
+            n,
+            seq_lens_offset,
+            QO=qo_len,
+            HAS_EXT_IN=has_ext,
+            BLOCK=block,
+            num_warps=4,
+        )
+    return seq_out, ext_out, casual, positions, req_rep
+
+
+@triton.jit
+def _gather_i32_kernel(table_ptr, idx_ptr, out_ptr, n, table_len, BLOCK: tl.constexpr):
+    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    m = i < n
+    idx = tl.load(idx_ptr + i, mask=m, other=0).to(tl.int64)
+    # torch indexing wraps a negative index once (the -1 of an unset slot reads the
+    # mapping's trailing sentinel)
+    idx = tl.where(idx < 0, idx + table_len, idx)
+    tl.store(
+        out_ptr + i, tl.load(table_ptr + idx, mask=m, other=0).to(tl.int32), mask=m
+    )
+
+
+def gather_i32(table: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
+    """table[index].to(torch.int32) for a 1-D table and a 1-D index in one launch (the
+    full->SWA slot translation of the per-step write locations)."""
+    assert table.dim() == 1 and table.stride(0) == 1
+    assert index.dim() == 1 and index.stride(0) == 1
+    n = index.shape[0]
+    out = torch.empty(n, dtype=torch.int32, device=index.device)
+    if n:
+        block = min(1024, triton.next_power_of_2(n))
+        _gather_i32_kernel[(triton.cdiv(n, block),)](
+            table, index, out, n, table.shape[0], BLOCK=block, num_warps=4
+        )
+    return out

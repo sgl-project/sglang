@@ -70,6 +70,14 @@ def _cuda_kernels(t: torch.Tensor) -> bool:
     return t.is_cuda and (is_cuda() or is_gfx95_supported())
 
 
+def _gather_ids(indices: torch.Tensor) -> torch.Tensor:
+    """engram_gather's ids for [T, C] indices: a column slice of the per-layer hash
+    table is read in place rather than copied flat by reshape(-1)."""
+    if indices.dim() == 2 and indices.stride(1) == 1:
+        return indices
+    return indices.reshape(-1)
+
+
 def _is_prime(n: int) -> bool:
     """Deterministic Miller-Rabin; exact for n < 3.3e24 with these witnesses."""
     if n < 2:
@@ -834,7 +842,7 @@ class EngramEmbedding(nn.Module):
             out = self._empty(indices)
             engram_gather(
                 *self._table_ptrs(),
-                indices.reshape(-1),
+                _gather_ids(indices),
                 out.view(-1, self.dim),
                 self.dim,
                 FP8_BLOCK_SIZE,
@@ -893,7 +901,7 @@ class EngramEmbedding(nn.Module):
         out = self._empty(indices)
         engram_gather(
             *self._table_ptrs(),
-            indices.reshape(-1),
+            _gather_ids(indices),
             out.view(-1, self.dim),
             self.dim,
             FP8_BLOCK_SIZE,

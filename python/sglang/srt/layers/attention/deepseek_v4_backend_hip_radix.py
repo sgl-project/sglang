@@ -22,6 +22,8 @@ import torch.nn.functional as F
 
 from sglang.kernels.ops.attention.dsv4.attn_glue_hip import (
     expand_index_page_table,
+    expand_same_length_rows,
+    gather_i32,
     low_ratio_compression_metadata,
     mask_indices_by_length,
     page_table_from_req_to_token,
@@ -577,10 +579,13 @@ class DSV4AttnMetadata:
             self.page_table,
             self.page_size,
             compute_page_indices=True,
+            # _pad_last_dim(c128_page_indices) inside the same launch
+            page_indices_align=PAGE_INDEX_ALIGNED_SIZE,
         )
 
-        self.c128_page_indices = _pad_last_dim(self.c128_page_indices)
-        self.swa_page_indices = _pad_last_dim(self.swa_page_indices)
+        if self.swa_page_indices.shape[-1] % PAGE_INDEX_ALIGNED_SIZE:
+            # the aligned case would only clone the per-step tensor
+            self.swa_page_indices = _pad_last_dim(self.swa_page_indices)
 
         if unified_swa_pages:
             if self.unified is None:
@@ -610,7 +615,10 @@ class DSV4AttnMetadata:
         )
         assert self.c4_topk_lengths_clamp1 is not None
         assert self.c4_topk_lengths_raw is not None
-        # the clamped lengths and the -1 filled top-k buffers of every ratio in one launch
+        # the clamped lengths and the -1 filled top-k buffers of every ratio in one
+        # launch; the low-ratio raw indices are -1 filled like the page indices:
+        # identity rows write only their reachable columns, and the OPUS prefill
+        # reads the raw indices without the top-k lengths
         for name, value in sparse_buffers(
             c4_topk_lengths_clamp1=self.c4_topk_lengths_clamp1,
             c4_topk_lengths_raw=self.c4_topk_lengths_raw,
@@ -622,6 +630,7 @@ class DSV4AttnMetadata:
             ),
             index_topk=self.index_topk,
             page_index_align=PAGE_INDEX_ALIGNED_SIZE,
+            low_ratio_raw_indices=True,
         ).items():
             setattr(self, name, value)
         if is_prefill:
@@ -629,17 +638,9 @@ class DSV4AttnMetadata:
         self.c0_flashmla_metadata = _create_flashmla_metadata()
         self.c4_flashmla_metadata = _create_flashmla_metadata()
         self.c128_flashmla_metadata = _create_flashmla_metadata()
-        # -1 filled like the page indices: identity rows write only their reachable columns,
-        # and the OPUS prefill reads the raw indices without the top-k lengths
         if 1 in self.low_ratios:
-            self.c1_sparse_raw_indices = torch.full_like(
-                self.c1_sparse_page_indices, -1
-            )
             self.c1_flashmla_metadata = _create_flashmla_metadata()
         if 2 in self.low_ratios:
-            self.c2_sparse_raw_indices = torch.full_like(
-                self.c2_sparse_page_indices, -1
-            )
             self.c2_flashmla_metadata = _create_flashmla_metadata()
 
 
@@ -1372,18 +1373,21 @@ class DeepseekV4HipRadixBackend(
         assert out_cache_loc.shape[0] >= num_tokens, (
             f"{out_cache_loc.shape=} holds fewer than {num_tokens=} block slots"
         )
-        seq_lens_casual, req_pool_indices_repeated = (
-            self.expand_extend_with_same_length(
-                bs=batch_size,
+        # expand_extend_with_same_length(seq_lens + block_size) and the row
+        # positions in one launch
+        _, _, seq_lens_casual, positions_casual, req_pool_indices_repeated = (
+            expand_same_length_rows(
+                seq_lens,
+                req_pool_indices,
                 qo_len=block_size,
-                seq_lens=seq_lens + block_size,
-                req_pool_indices=req_pool_indices,
+                seq_lens_offset=block_size,
             )
         )
         core_attn_metadata = self.make_core_attn_metadata(
             req_to_token=self.req_to_token,
             req_pool_indices_repeated=req_pool_indices_repeated,
             seq_lens_casual=seq_lens_casual,
+            positions_casual=positions_casual,
             # The block may cross into the next page beyond the prefix.
             max_seq_len=max_seq_len + block_size,
             out_loc=out_cache_loc,
@@ -1409,26 +1413,34 @@ class DeepseekV4HipRadixBackend(
         out_cache_loc = raw_metadata.out_cache_loc
 
         bs, num_draft_tokens = len(seq_lens), self.target_verify_num_draft_tokens
-        seq_lens = seq_lens + num_draft_tokens
         extend_seq_lens = raw_metadata.extend_seq_lens
         if extend_seq_lens is None or extend_seq_lens.numel() != bs:
-            extend_seq_lens = torch.full_like(seq_lens, num_draft_tokens)
+            extend_seq_lens = None
         else:
             extend_seq_lens = extend_seq_lens.to(
                 device=seq_lens.device, dtype=seq_lens.dtype
             )
-        extend_seq_lens = torch.minimum(extend_seq_lens, seq_lens).clamp_min_(1)
-
-        seq_lens_casual, req_pool_indices_repeated = (
-            self.expand_extend_with_same_length(
-                bs, num_draft_tokens, seq_lens, req_pool_indices
-            )
+        # seq_lens + num_draft_tokens, the extend lengths clamped to [1, seq_lens],
+        # expand_extend_with_same_length and the row positions in one launch
+        (
+            seq_lens,
+            extend_seq_lens,
+            seq_lens_casual,
+            positions_casual,
+            req_pool_indices_repeated,
+        ) = expand_same_length_rows(
+            seq_lens,
+            req_pool_indices,
+            qo_len=num_draft_tokens,
+            seq_lens_offset=num_draft_tokens,
+            extend_seq_lens=extend_seq_lens,
         )
         need_compress = self.need_compress
         core_attn_metadata = self.make_core_attn_metadata(
             req_to_token=self.req_to_token,
             req_pool_indices_repeated=req_pool_indices_repeated,
             seq_lens_casual=seq_lens_casual,
+            positions_casual=positions_casual,
             max_seq_len=self.MAX_SEQ_LEN_FOR_CAPTURE,
             out_loc=out_cache_loc,
             need_compress=need_compress,
@@ -1632,11 +1644,21 @@ class DeepseekV4HipRadixBackend(
                     self.topk,
                     self.speculative_num_steps,
                 )[self.speculative_step_id]
-            metadata.core_attn_metadata.swa_out_cache_loc = (
-                self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc).to(
-                    torch.int32
+            full_to_swa = self._plain_full_to_swa_mapping()
+            if (
+                full_to_swa is not None
+                and out_cache_loc.dim() == 1
+                and out_cache_loc.stride(0) == 1
+            ):
+                # the translate and the int32 cast in one launch
+                swa_out_cache_loc = gather_i32(full_to_swa, out_cache_loc)
+            else:
+                swa_out_cache_loc = (
+                    self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                        out_cache_loc
+                    ).to(torch.int32)
                 )
-            )
+            metadata.core_attn_metadata.swa_out_cache_loc = swa_out_cache_loc
 
         if self._fp4_workspaces_enabled(metadata):
             from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
@@ -1820,15 +1842,26 @@ class DeepseekV4HipRadixBackend(
 
         graph_key = bs
 
-        if bucket == _GraphBucket.DECODE_OR_IDLE:
-            assert out_cache_loc is not None
-            assert len(out_cache_loc.shape) == 1, f"{out_cache_loc.shape=}"
-            out_cache_loc_padded = torch.nn.functional.pad(
+        def pad_out_cache_loc(num_tokens: int, key: int) -> torch.Tensor:
+            if (
+                len(out_cache_loc) == num_tokens
+                and not in_capture
+                and key in self.cuda_graph_metadata_of_bucket_and_bs[bucket]
+            ):
+                # Replay copies it into the captured buffer; a zero-width pad would
+                # only clone it first.
+                return out_cache_loc
+            return F.pad(
                 out_cache_loc,
-                pad=(0, bs - len(out_cache_loc)),
+                pad=(0, num_tokens - len(out_cache_loc)),
                 mode="constant",
                 value=0,
             )
+
+        if bucket == _GraphBucket.DECODE_OR_IDLE:
+            assert out_cache_loc is not None
+            assert len(out_cache_loc.shape) == 1, f"{out_cache_loc.shape=}"
+            out_cache_loc_padded = pad_out_cache_loc(bs, graph_key)
             temp_metadata = self.init_forward_metadata_decode(
                 max_seq_len=chosen_max_seq_len,
                 req_pool_indices=req_pool_indices,
@@ -1839,12 +1872,7 @@ class DeepseekV4HipRadixBackend(
             assert out_cache_loc is not None
             block_size = self.target_verify_num_draft_tokens
             num_tokens_v = block_size * bs
-            out_cache_loc_padded = F.pad(
-                out_cache_loc,
-                pad=(0, num_tokens_v - len(out_cache_loc)),
-                mode="constant",
-                value=0,
-            )
+            out_cache_loc_padded = pad_out_cache_loc(num_tokens_v, graph_key)
             if _DSPARK_DRAFT_RAW_METADATA:
                 temp_metadata = DSV4RawDSparkDraftMetadata(
                     req_pool_indices=req_pool_indices,
@@ -1869,12 +1897,7 @@ class DeepseekV4HipRadixBackend(
                 graph_key = num_tokens_v
             else:
                 num_tokens_v = self.target_verify_num_draft_tokens * bs
-            out_cache_loc_padded = torch.nn.functional.pad(
-                out_cache_loc,
-                pad=(0, num_tokens_v - len(out_cache_loc)),
-                mode="constant",
-                value=0,
-            )
+            out_cache_loc_padded = pad_out_cache_loc(num_tokens_v, graph_key)
             temp_metadata = self.init_forward_metadata_target_verify(
                 max_seq_len=chosen_max_seq_len,
                 req_pool_indices=req_pool_indices,
@@ -3265,23 +3288,6 @@ class DeepseekV4HipRadixBackend(
                 f"low-ratio indexer for {forward_batch.forward_mode} on HIP"
             )
 
-    def expand_extend_with_same_length(
-        self,
-        bs: int,
-        qo_len: int,
-        seq_lens: torch.Tensor,
-        req_pool_indices: torch.Tensor,
-    ):
-        seq_lens_casual = seq_lens[:, None] + torch.arange(
-            -qo_len + 1, 1, **self.cuda_int32_kwargs
-        )
-        seq_lens_casual = seq_lens_casual.flatten()
-        idx_to_req_repeated = torch.arange(
-            bs, **self.cuda_int32_kwargs
-        ).repeat_interleave(qo_len)
-        req_pool_indices_repeated = req_pool_indices[idx_to_req_repeated]
-        return seq_lens_casual, req_pool_indices_repeated
-
     def make_core_attn_metadata(
         self,
         req_to_token: torch.Tensor,
@@ -3295,10 +3301,14 @@ class DeepseekV4HipRadixBackend(
         dspark_block_size: Optional[int] = None,
         swa_replay_start: Optional[torch.Tensor] = None,
         num_groups: Optional[int] = None,
+        positions_casual: Optional[torch.Tensor] = None,
     ) -> DSV4AttnMetadata:
-        """swa_replay_start floors every row's window at that absolute position."""
+        """swa_replay_start floors every row's window at that absolute position.
+        positions_casual, when given, is the int32 seq_lens_casual - 1 already."""
         seq_lens_casual = seq_lens_casual.to(torch.int32)
-        raw_positions = seq_lens_casual - 1
+        raw_positions = (
+            seq_lens_casual - 1 if positions_casual is None else positions_casual
+        )
 
         request_layout = None
         window = self.token_to_kv_pool.request_window
@@ -3339,13 +3349,25 @@ class DeepseekV4HipRadixBackend(
                 block_size=dspark_block_size,
             )
         elif swa_replay_start is None:
-            swa_page_indices = self.get_swa_page_indices(
-                seq_lens_casual=seq_lens_casual,
-                req_pool_indices_repeated=req_pool_indices_repeated,
-            )
-            swa_page_indices = _pad_last_dim(
-                swa_page_indices, multiples_of=PAGE_INDEX_ALIGNED_SIZE
-            )
+            full_to_swa = self._plain_full_to_swa_mapping()
+            if full_to_swa is not None and seq_lens_casual.is_cuda:
+                # get_swa_page_indices + _pad_last_dim in one launch
+                swa_page_indices = BuildCausalSwaPageIndices.triton(
+                    req_to_token=self.req_to_token,
+                    full_to_swa_mapping=full_to_swa,
+                    req_pool_indices_repeated=req_pool_indices_repeated,
+                    seq_lens_casual=seq_lens_casual,
+                    swa_window=SWA_WINDOW,
+                    page_index_aligned_size=PAGE_INDEX_ALIGNED_SIZE,
+                )
+            else:
+                swa_page_indices = self.get_swa_page_indices(
+                    seq_lens_casual=seq_lens_casual,
+                    req_pool_indices_repeated=req_pool_indices_repeated,
+                )
+                swa_page_indices = _pad_last_dim(
+                    swa_page_indices, multiples_of=PAGE_INDEX_ALIGNED_SIZE
+                )
             swa_topk_lengths = torch.clamp(seq_lens_casual, max=SWA_WINDOW)
         else:
             swa_page_indices = BuildCausalSwaPageIndices.execute(
@@ -3399,6 +3421,20 @@ class DeepseekV4HipRadixBackend(
             core_attn_metadata.c4_flashmla_metadata = None
             core_attn_metadata.c128_flashmla_metadata = None
         return core_attn_metadata
+
+    def _plain_full_to_swa_mapping(self) -> Optional[torch.Tensor]:
+        """The full->SWA mapping when the pool's translate_loc_from_full_to_swa is the
+        plain mapping[loc] lookup (the fused kernels index it themselves), else None."""
+        pool = self.token_to_kv_pool
+        if (
+            type(pool).translate_loc_from_full_to_swa
+            is not DeepSeekV4TokenToKVPool.translate_loc_from_full_to_swa
+        ):
+            return None
+        mapping = getattr(pool, "full_to_swa_index_mapping", None)
+        if mapping is None or mapping.dim() != 1 or mapping.stride(0) != 1:
+            return None
+        return mapping
 
     def get_swa_page_indices(
         self,

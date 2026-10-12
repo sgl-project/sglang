@@ -22,12 +22,19 @@ def _engram_gather_kernel(
     out_ptr,
     row_lo,
     row_hi,
+    ids_cols,
+    ids_row_stride,
     DIM: tl.constexpr,
     BLK: tl.constexpr,
     E8M0_ZERO: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
-    idx = tl.load(ids_ptr + row).to(tl.int64)
+    # ids is [n // ids_cols, ids_cols] with unit column stride; a contiguous ids has
+    # ids_row_stride == ids_cols
+    ids_row = row // ids_cols
+    idx = tl.load(ids_ptr + ids_row * ids_row_stride + (row - ids_row * ids_cols)).to(
+        tl.int64
+    )
     # The table holds rows [row_lo, row_hi); an id outside it is not read and
     # comes out as zeros, which is what the sharded all-reduce sums.
     owned = (idx >= row_lo) & (idx < row_hi)
@@ -56,17 +63,22 @@ def engram_gather(
     row_lo: int = 0,
     row_hi: int = 2**62,
 ) -> torch.Tensor:
-    """Gather rows ``ids`` ([N] int) into ``out`` ([N, dim] bf16, contiguous).
+    """Gather rows ``ids`` ([N] int, or [T, C] int with a unit column stride, read in
+    row-major order) into ``out`` ([N, dim] bf16, contiguous).
 
     ``weight_ptr`` addresses [rows, dim] fp8 e4m3 bytes and ``scale_ptr``
     [rows, dim // block_size] e8m0 bytes for global rows [row_lo, row_hi); both
     may live in device or host memory. Ids outside the range produce zero rows.
+    A [T, C] ids may be a column slice of a wider table (no contiguous copy).
     """
     assert dim > 0 and dim & (dim - 1) == 0 and block_size > 0, (dim, block_size)
     assert dim % block_size == 0, (dim, block_size)
-    assert (
-        ids.is_cuda and ids.is_contiguous() and ids.dtype in (torch.int32, torch.int64)
-    )
+    assert ids.is_cuda and ids.dtype in (torch.int32, torch.int64)
+    if ids.dim() == 2 and ids.stride(1) == 1 and ids.shape[1] > 0:
+        ids_cols, ids_row_stride = ids.shape[1], ids.stride(0)
+    else:
+        assert ids.is_contiguous(), ids.stride()
+        ids_cols = ids_row_stride = max(ids.numel(), 1)
     assert out.is_contiguous() and out.dtype == torch.bfloat16
     assert out.device == ids.device and out.shape == (ids.numel(), dim), out.shape
     n = ids.numel()
@@ -78,6 +90,8 @@ def engram_gather(
             out,
             row_lo,
             row_hi,
+            ids_cols,
+            ids_row_stride,
             DIM=dim,
             BLK=block_size,
             E8M0_ZERO=_E8M0_ZERO,
