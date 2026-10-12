@@ -4350,7 +4350,10 @@ class Scheduler(
         ]
 
     def leave_finished_rows(self, running_batch: ScheduleBatch) -> None:
-        """Drop the running rows whose finish a commit already observed."""
+        """Drop the running rows whose finish a commit already observed.
+
+        An empty batch has no rows to drop and is left untouched.
+        """
         if not running_batch.is_empty():
             running_batch.filter_batch()
 
