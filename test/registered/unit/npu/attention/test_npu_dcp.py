@@ -359,8 +359,17 @@ class TestNpuDcpSparseAttentionContract(unittest.TestCase):
 
 class TestNpuDcpBufferAndLseHelpers(unittest.TestCase):
     def test_retraction_indices_map_target_kv_to_rank_local_slots(self):
-        pool = SimpleNamespace(dcp_size=4, dcp_rank=2, page_size=2)
+        pool = SimpleNamespace(dcp_size=4, dcp_rank=2, page_size=2, index_head_dim=128)
         indices = torch.tensor([0, 1, 4, 5, 6, 7, 12, 13], dtype=torch.int64)
+        got = NPUMLATokenToKVPool._copy_indices_for_buffer(
+            pool, indices, uses_global_slots=False
+        )
+        self.assertEqual(got.tolist(), [0, 1, 2, 3])
+
+    def test_retraction_indices_map_token_interleaved_kv_to_local_slots(self):
+        pool = SimpleNamespace(dcp_size=4, dcp_rank=2, page_size=2, index_head_dim=None)
+        # Token ownership must not depend on the physical page size.
+        indices = torch.tensor([0, 1, 2, 6, 10, 14], dtype=torch.int64)
         got = NPUMLATokenToKVPool._copy_indices_for_buffer(
             pool, indices, uses_global_slots=False
         )

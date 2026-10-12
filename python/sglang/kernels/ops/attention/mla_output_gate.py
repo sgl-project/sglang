@@ -12,11 +12,13 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
+from sglang.srt.utils import is_npu
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
 _THREADS: int = 256
+_is_npu = is_npu()
 
 
 @cache_once
@@ -32,8 +34,10 @@ def _jit_mla_output_gate_module() -> Module:
 
 
 def covered(x: torch.Tensor, gate: torch.Tensor) -> bool:
+    # transfer_to_npu aliases Tensor.is_cuda to Tensor.is_npu; this JIT is CUDA-only.
     return (
-        x.is_cuda
+        not _is_npu
+        and x.is_cuda
         and gate.is_cuda
         and x.dtype == torch.bfloat16
         and gate.dtype == torch.bfloat16

@@ -46,6 +46,7 @@ def prepare_decode_context_parallel_metadata(
     parallel = get_parallel()
     if not parallel.dcp_enabled:
         return None
+    backend = get_attn_backend()
     # dcp_kv_buffer tokens' layout
     # [ rank0_r1.prefix_tokens, rank1_r1.prefix_tokens, ..., rank7_r1.prefix_tokens,
     #   ...,
@@ -79,6 +80,12 @@ def prepare_decode_context_parallel_metadata(
         dcp_prefix_kv_indices,
         req_to_token.shape[1],
     )
+    if not backend.dcp_use_packed_kv:
+        return DecodeContextParallelMetadata(
+            dcp_local_prefix_kv_indices=backend.kv_index_translator.translate_dcp_read_ids(
+                dcp_prefix_kv_indices[parallel.dcp_rank :: parallel.dcp_size]
+            ),
+        )
     dcp_kv_indptr = torch.zeros(
         len(seq_lens) + 1,
         dtype=torch.int32,

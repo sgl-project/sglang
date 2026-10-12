@@ -701,6 +701,44 @@ class TestKVLocPlan(unittest.TestCase):
             self.assertTrue(torch.equal(draft_batch.out_cache_loc, global_ids))
             self.assertIs(plan.write_virtual, global_ids)
 
+    def test_npu_dcp_writer_keeps_global_slots_until_the_store(self):
+        # Dense MLA's writer localizes token-interleaved slots itself. Applying
+        # the plan's page-interleaved mapping first would convert them twice.
+        parallel = SimpleNamespace(
+            dcp_enabled=True, dcp_size=2, dcp_rank=1, attn_dcp_size=1
+        )
+        pool = _FakeKVCache(64)
+        pool.dcp_localizes_write_indices = True
+        with (
+            patch.object(kv_index_translator, "_is_npu", True),
+            patch.object(kv_index_translator, "get_parallel", return_value=parallel),
+        ):
+            target, draft = (
+                KVIndexTranslator(
+                    req_to_token=self.req_to_token,
+                    token_to_kv_pool_allocator=self.allocator,
+                    token_to_kv_pool=pool,
+                    page_size=4,
+                    device=_DEV,
+                    is_draft_worker=is_draft_worker,
+                )
+                for is_draft_worker in (False, True)
+            )
+        global_ids = torch.arange(8, 16)
+        for source in (target, draft):
+            plan = source.plan(
+                req_pool_indices=self.rpi,
+                seq_lens=self.seq_lens,
+                seq_lens_cpu=self.seq_lens.clone(),
+                write_virtual=global_ids,
+            )
+            for reader in (target, draft):
+                batch = SimpleNamespace()
+                plan.bind(batch, reader)
+                self.assertIs(batch.out_cache_loc, global_ids)
+                self.assertIsNone(batch.out_cache_loc_virtual)
+            self.assertIs(plan.write_virtual, global_ids)
+
     def test_runner_slots_are_used_as_they_are(self):
         for translator, writes_swa in (
             (self.target, True),

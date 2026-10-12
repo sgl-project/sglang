@@ -51,6 +51,7 @@ class TestNPUCudaGraphBackend(unittest.TestCase):
         self.assertEqual(set(update_input[0]), {"seq_lens"})
         self.assertEqual(update_input[0]["seq_lens"].dtype, torch.int32)
         self.assertTrue(torch.equal(update_input[0]["seq_lens"], torch.tensor([7, 9])))
+        runner.device_module.Event.return_value.record.assert_called_once_with()
         self.assertEqual(output, "output")
 
 
