@@ -18,7 +18,8 @@ pub fn chat_to_message(chat: &Value, echo: &EchoContext) -> Value {
     };
     let mut content = Vec::new();
     if let Some(r) = str_field("reasoning_content") {
-        content.push(json!({"type": "thinking", "thinking": r, "signature": ""}));
+        // An empty signature fails Anthropic signature verifiers; absent means unsigned.
+        content.push(json!({"type": "thinking", "thinking": r}));
     }
     if let Some(t) = str_field("content") {
         content.push(json!({"type": "text", "text": t}));
@@ -51,7 +52,7 @@ pub fn chat_to_message(chat: &Value, echo: &EchoContext) -> Value {
         "id": new_id("msg"),
         "type": "message",
         "role": "assistant",
-        "model": echo.model,
+        "model": chat.get("model").and_then(Value::as_str).unwrap_or(echo.model.as_str()),
         "content": content,
         "stop_reason": reason,
         "stop_sequence": sequence,
@@ -73,18 +74,18 @@ mod tests {
     #[test]
     fn thinking_text_and_usage() {
         let m = chat_to_message(
-            &json!({"choices": [{"finish_reason": "stop", "message": {"role": "assistant",
-                    "content": "OK", "reasoning_content": "hm"}}],
+            &json!({"model": "served", "choices": [{"finish_reason": "stop",
+                    "message": {"role": "assistant", "content": "OK", "reasoning_content": "hm"}}],
                     "usage": {"prompt_tokens": 5, "completion_tokens": 2}}),
             &echo(),
         );
         assert!(m["id"].as_str().unwrap().starts_with("msg_"));
         assert_eq!(m["type"], "message");
         assert_eq!(m["role"], "assistant");
-        assert_eq!(m["model"], "m");
+        assert_eq!(m["model"], "served");
         assert_eq!(
             m["content"],
-            json!([{"type": "thinking", "thinking": "hm", "signature": ""},
+            json!([{"type": "thinking", "thinking": "hm"},
                    {"type": "text", "text": "OK"}])
         );
         assert_eq!(m["stop_reason"], "end_turn");

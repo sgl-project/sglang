@@ -99,19 +99,22 @@ impl LineBuffer {
     }
 }
 
-/// JSON payload of a `data:` line (`None` for anything else and `[DONE]`).
-pub(crate) fn data_payload(line: &[u8]) -> Option<serde_json::Value> {
-    let payload = line.strip_prefix(b"data:")?.trim_ascii_start();
-    if payload.is_empty() || payload == b"[DONE]" {
+pub(crate) enum Data {
+    Json(serde_json::Value),
+    Done,
+    Invalid,
+}
+
+/// Payload of a `data:` line; `None` for anything else.
+pub(crate) fn data_payload(line: &[u8]) -> Option<Data> {
+    let payload = line.strip_prefix(b"data:")?.trim_ascii();
+    if payload.is_empty() {
         return None;
     }
-    match serde_json::from_slice(payload) {
-        Ok(v) => Some(v),
-        Err(_) => {
-            tracing::debug!("protocol stream: skipping non-JSON upstream data line");
-            None
-        }
+    if payload == b"[DONE]" {
+        return Some(Data::Done);
     }
+    Some(serde_json::from_slice(payload).map_or(Data::Invalid, Data::Json))
 }
 
 pub(crate) fn write_event(out: &mut Vec<u8>, event: &str, data: &serde_json::Value) {
