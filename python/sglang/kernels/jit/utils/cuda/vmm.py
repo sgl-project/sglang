@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 import tvm_ffi
 
 from sglang.kernels.jit.utils.common import cache_once, lazy_register_class
-from sglang.kernels.jit.utils.compile import load_jit
+from sglang.kernels.jit.utils.compile import cuda_stubs_dir, load_jit
 
 __all__ = ["VMMHostMemory"]
 
@@ -14,7 +14,7 @@ __all__ = ["VMMHostMemory"]
 def _jit_vmm_module() -> tvm_ffi.Module:
     return load_jit(
         "vmm_host_memory",
-        extra_ldflags=["-lcuda"],
+        extra_ldflags=[f"-L{cuda_stubs_dir()}", "-lcuda"],
         cuda_files=["arch/vmm.cuh"],
         cuda_wrappers=[
             ("register_once", "register_vmm_host_memory"),
@@ -27,8 +27,14 @@ def _init_vmm_host_memory() -> None:
     _jit_vmm_module().register_once()
 
 
+@cache_once
 def is_vmm_available() -> bool:
-    return _jit_vmm_module().is_available()
+    # A toolkit or driver too old for host-NUMA VMM fails the build itself;
+    # that is a no, so callers fall back instead of crashing.
+    try:
+        return bool(_jit_vmm_module().is_available())
+    except Exception:
+        return False
 
 
 @lazy_register_class("sgl.VMMHostMemory", _init_vmm_host_memory)
