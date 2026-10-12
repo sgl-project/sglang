@@ -297,6 +297,11 @@ The `SGLANG_MOONCAKE_CUSTOM_MEM_POOL` environment variable enables the custom me
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Interval (seconds) between cleanups of bootstrap entries</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>120</code></td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong><code>SGLANG_DISAGG_PREFILL_EARLY_SEND_KV</code></strong></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Send each prefill batch's KV chunks from a worker thread as soon as the batch's result copy completes, instead of after the next batch's forward. Lowers TTFT under the overlap scheduler. Requests that need logprobs, grammar, or a sampling mask, or that are still bootstrapping, keep the default path. Requires the overlap scheduler and the Mooncake backend; ignored with a warning together with the staging buffer, KV checksum, speculative decoding, unified memory, models that transfer extra state (e.g. Mamba, SWA, DSA), or the <code>prefill_complete</code> decode allocation policy</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
 </tbody>
 </table>
 

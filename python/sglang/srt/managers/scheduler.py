@@ -61,6 +61,8 @@ from torch.distributed import barrier
 if TYPE_CHECKING:
     from torch.cuda import Stream as CudaStream
 
+    from sglang.srt.disaggregation.prefill_early_send import EarlyKVChunkSender
+
 try:
     from sglang.kernels.ops.mamba.triton_ops import (
         initialize_mamba_selective_state_update_backend,
@@ -1588,6 +1590,8 @@ class Scheduler(
             self.disagg_prefill_inflight_queue: List[Req] = []
             # Requests with a sent chunk that are not yet on the inflight queue.
             self.disagg_prefill_pending_chunk_rids: Set[str] = set()
+            # Created by the overlap event loop when supported.
+            self.early_kv_chunk_sender: Optional[EarlyKVChunkSender] = None
 
             self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
 
@@ -3666,15 +3670,17 @@ class Scheduler(
         prepare_abort(req, "Aborted")
         req.time_stats.trace_ctx.abort(abort_info={"reason": "Aborted"})
         req.to_finish = None
-        if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            self.clear_pending_chunk_send(req)
-            req.disagg_kv_sender.abort()
-            maybe_release_metadata_buffer(
-                req, self.req_to_metadata_buffer_idx_allocator
-            )
-            req.pending_bootstrap = False
-        self._release_aborted_request(req)
-        release_kv_cache(req, self.tree_cache, checkpoint=False)
+        # An early KV sender may be reading this request's KV indices.
+        with self.early_kv_send_lock(req):
+            if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                self.clear_pending_chunk_send(req)
+                req.disagg_kv_sender.abort()
+                maybe_release_metadata_buffer(
+                    req, self.req_to_metadata_buffer_idx_allocator
+                )
+                req.pending_bootstrap = False
+            self._release_aborted_request(req)
+            release_kv_cache(req, self.tree_cache, checkpoint=False)
 
         self.chunked_req = None
         self._pending_chunked_abort_req = None

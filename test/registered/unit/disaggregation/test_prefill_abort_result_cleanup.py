@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
+from sglang.srt.disaggregation.utils import KVSendOwner
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput, SamplingMaskStatus
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ReqKvInfo
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
@@ -43,6 +44,7 @@ class _Req:
         self.output_ids = []
         self.origin_input_ids = list(range(100))
         self.extend_end = None
+        self.kv_send_owner = KVSendOwner.NONE
         self.time_stats = SimpleNamespace(
             set_prefill_finished_time=Mock(),
             set_last_chunked_prefill_finish_time=Mock(),
