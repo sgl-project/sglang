@@ -1353,52 +1353,80 @@ class TestDSAIndexer(CustomTestCase):
         self.assertIs(kwargs["kv_global_scale"], global_scale)
 
     def test_nvfp4_dsa_pool_moves_main_and_index_cache_together(self):
-        pool = DSATokenToKVPool(
-            size=128,
-            page_size=64,
-            kv_lora_rank=512,
-            dtype=torch.float4_e2m1fn_x2,
-            qk_rope_head_dim=64,
-            layer_num=2,
-            device=self.device,
-            index_head_dim=128,
-            enable_memory_saver=False,
-            kv_cache_dim=416,
-        )
-        source = torch.tensor([69], dtype=torch.int64, device=self.device)
-        target = torch.tensor([128], dtype=torch.int64, device=self.device)
-        page_size = pool.index_page_size
-        key_bytes = pool.index_head_dim
-        scale_bytes = key_bytes // pool.quant_block_size * 4
-        for layer in range(pool.layer_num):
-            pool.kv_buffer[layer][source] = layer + 17
-            index_buffer = pool.index_k_with_scale_buffer[layer]
-            key_rows = index_buffer[:, : page_size * key_bytes].view(-1, key_bytes)
-            scale_rows = index_buffer[:, page_size * key_bytes :].view(-1, scale_bytes)
-            key_rows[source] = layer + 29
-            scale_rows[source] = layer + 47
-        expected_main = [buffer[source].clone() for buffer in pool.kv_buffer]
-        expected_keys = []
-        expected_scales = []
-        for buffer in pool.index_k_with_scale_buffer:
-            expected_keys.append(
-                buffer[:, : page_size * key_bytes].view(-1, key_bytes)[source].clone()
-            )
-            expected_scales.append(
-                buffer[:, page_size * key_bytes :].view(-1, scale_bytes)[source].clone()
-            )
+        for index_kpool in (1, 2):
+            with self.subTest(index_kpool=index_kpool):
+                pool = DSATokenToKVPool(
+                    size=128,
+                    page_size=64 * index_kpool,
+                    kv_lora_rank=512,
+                    dtype=torch.float4_e2m1fn_x2,
+                    qk_rope_head_dim=64,
+                    layer_num=2,
+                    device=self.device,
+                    index_head_dim=128,
+                    enable_memory_saver=False,
+                    kv_cache_dim=416,
+                    index_kpool=index_kpool,
+                )
+                source = torch.tensor([69], dtype=torch.int64, device=self.device)
+                target = torch.tensor([128], dtype=torch.int64, device=self.device)
+                page_size = pool.index_page_size
+                key_bytes = pool.index_head_dim
+                scale_bytes = key_bytes // pool.quant_block_size * 4
 
-        pool.move_kv_cache(target, source)
+                index_source = (
+                    69 // pool.page_size * page_size
+                    + 69 % pool.page_size // index_kpool
+                )
+                index_target = (
+                    128 // pool.page_size * page_size
+                    + 128 % pool.page_size // index_kpool
+                )
+                for layer in range(pool.layer_num):
+                    pool.kv_buffer[layer][source] = layer + 17
+                    index_buffer = pool.index_k_with_scale_buffer[layer]
+                    key_rows = index_buffer[:, : page_size * key_bytes].view(
+                        -1, key_bytes
+                    )
+                    scale_rows = index_buffer[:, page_size * key_bytes :].view(
+                        -1, scale_bytes
+                    )
+                    key_rows[index_source] = layer + 29
+                    scale_rows[index_source] = layer + 47
+                expected_main = [buffer[source].clone() for buffer in pool.kv_buffer]
+                expected_keys = []
+                expected_scales = []
+                for buffer in pool.index_k_with_scale_buffer:
+                    expected_keys.append(
+                        buffer[:, : page_size * key_bytes]
+                        .view(-1, key_bytes)[index_source]
+                        .clone()
+                    )
+                    expected_scales.append(
+                        buffer[:, page_size * key_bytes :]
+                        .view(-1, scale_bytes)[index_source]
+                        .clone()
+                    )
 
-        for layer in range(pool.layer_num):
-            self.assertTrue(
-                torch.equal(pool.kv_buffer[layer][target], expected_main[layer])
-            )
-            index_buffer = pool.index_k_with_scale_buffer[layer]
-            key_rows = index_buffer[:, : page_size * key_bytes].view(-1, key_bytes)
-            scale_rows = index_buffer[:, page_size * key_bytes :].view(-1, scale_bytes)
-            self.assertTrue(torch.equal(key_rows[target], expected_keys[layer]))
-            self.assertTrue(torch.equal(scale_rows[target], expected_scales[layer]))
+                pool.move_kv_cache(target, source)
+
+                for layer in range(pool.layer_num):
+                    self.assertTrue(
+                        torch.equal(pool.kv_buffer[layer][target], expected_main[layer])
+                    )
+                    index_buffer = pool.index_k_with_scale_buffer[layer]
+                    key_rows = index_buffer[:, : page_size * key_bytes].view(
+                        -1, key_bytes
+                    )
+                    scale_rows = index_buffer[:, page_size * key_bytes :].view(
+                        -1, scale_bytes
+                    )
+                    self.assertTrue(
+                        torch.equal(key_rows[index_target], expected_keys[layer])
+                    )
+                    self.assertTrue(
+                        torch.equal(scale_rows[index_target], expected_scales[layer])
+                    )
 
     # TODO: enable this test after indexer accuracy aligned
     # @patch("sglang.srt.layers.attention.dsa.dsa_indexer.deep_gemm")

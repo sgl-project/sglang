@@ -50,8 +50,8 @@ class IndexKeyCache:
     def move(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor) -> None:
         if tgt_loc.numel() == 0:
             return
-        tgt_loc_flat = tgt_loc.view(-1).long()
-        src_loc_flat = src_loc.view(-1).long()
+        tgt_loc_flat = self._to_index_locs(tgt_loc.view(-1).long())
+        src_loc_flat = self._to_index_locs(src_loc.view(-1).long())
         for index_k in self.buffer:
             if index_k.shape[0] == 0:
                 continue
@@ -74,6 +74,12 @@ class IndexKeyCache:
             )
             key_pages[tgt_page, tgt_offset] = key_pages[src_page, src_offset]
             scale_pages[tgt_page, tgt_offset] = scale_pages[src_page, src_offset]
+
+    def _to_index_locs(self, loc: torch.Tensor) -> torch.Tensor:
+        pool = self.pool
+        page = loc // pool.page_size
+        offset = loc % pool.page_size
+        return page * pool.index_page_size + offset // pool.index_kpool
 
     def get_local_buffer(self, layer_id: int) -> torch.Tensor:
         if self.pool.layer_transfer_counter is not None:

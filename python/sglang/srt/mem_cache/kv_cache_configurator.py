@@ -2075,12 +2075,17 @@ class KVCacheConfigurator:
             self._load_dsa_nvfp4_global_scales(token_to_kv_pool)
         return token_to_kv_pool
 
-    def _load_dsa_nvfp4_global_scales(self, pool: DSATokenToKVPool) -> None:
+    def _load_dsa_nvfp4_global_scales(self, pool: KVCache) -> None:
         """Copy calibrated per-layer K scales into the graph-stable NVFP4 pool."""
+        if isinstance(pool, HybridLinearKVPool):
+            local_layer_ids = pool.full_attention_layer_id_mapping.keys()
+        else:
+            local_layer_ids = range(pool.start_layer, pool.start_layer + pool.layer_num)
+
         initialized = 0
         for attention in get_kv_scale_attention_layers(self.model):
             layer_id = attention.layer_id
-            if not pool.start_layer <= layer_id < pool.start_layer + pool.layer_num:
+            if layer_id not in local_layer_ids:
                 continue
             scale = attention.k_scale_float
             pool.set_mla_kv_global_scale(layer_id, 1.0 if scale is None else scale)
@@ -2394,6 +2399,8 @@ class KVCacheConfigurator:
             post_capture_active=self.post_capture_kv_active and quant_method is None,
             **extra_args,
         )
+        if token_to_kv_pool.dsa_kv_cache_store_nvfp4:
+            self._load_dsa_nvfp4_global_scales(token_to_kv_pool)
         return token_to_kv_pool
 
     def _hybrid_full_attention_pool_class(

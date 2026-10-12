@@ -2035,6 +2035,8 @@ class KvBufferDesc:
 class KVCache(abc.ABC):
     layer_shard_enabled: bool = False
     post_capture_active: bool = False
+    dsa_kv_cache_store_fp8: bool = False
+    dsa_kv_cache_store_nvfp4: bool = False
     # Whether get_cpu_copy/load_cpu_copy carry the recurrent state. False when the
     # state lives on the request pool instead, and the caller has to move it.
     cpu_copy_carries_mamba: bool = False
@@ -4564,6 +4566,17 @@ class HybridLinearKVPool(KVCache):
         # pool never translates.
         with self._transfer_id_context(layer):
             return self.full_kv_pool.get_mla_kv_buffer(layer, loc, dst_dtype)
+
+    def get_mla_kv_global_scale(self, layer_id: int) -> torch.Tensor:
+        self._wait_for_layer(layer_id)
+        local_layer_id = self._transfer_full_attention_id(layer_id)
+        return self.full_kv_pool.get_mla_kv_global_scale(local_layer_id)
+
+    def set_mla_kv_global_scale(
+        self, layer_id: int, value: torch.Tensor | float
+    ) -> None:
+        local_layer_id = self._transfer_full_attention_id(layer_id)
+        self.full_kv_pool.set_mla_kv_global_scale(local_layer_id, value)
 
     def set_index_k_scale_buffer(
         self,
