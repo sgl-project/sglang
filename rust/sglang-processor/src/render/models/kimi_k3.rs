@@ -180,7 +180,16 @@ pub(crate) fn render(
 /// `normalize_assistant_tool_call_arguments(strict=False)`.
 fn prepare_message(mut message: Value) -> Result<Value, String> {
     if let Some(parts) = message["content"].as_array_mut() {
-        parts.retain(|part| matches!(part["type"].as_str(), Some("text" | "image_url")));
+        // Media expands into image tokens only on the engine.
+        if parts.iter().any(|part| {
+            matches!(
+                part["type"].as_str(),
+                Some("image_url" | "video_url" | "audio_url" | "input_audio")
+            )
+        }) {
+            return Err("Kimi K3 media renders on the engine".into());
+        }
+        parts.retain(|part| part["type"] == "text");
     }
     neutralize(&mut message["content"]);
     if let Some(reasoning) = message.get_mut("reasoning_content") {
