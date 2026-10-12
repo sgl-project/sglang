@@ -21,7 +21,7 @@ def _dsa_dcp_overrides(cfg: Any, hf_config: Any) -> dict:
     if cfg.dcp_size <= 1:
         return {}
     if get_dsa_index_kpool(hf_config) > 1:
-        raise ValueError("DSA DCP does not support a pooled index (index_kpool > 1).")
+        raise ValueError("DSA DCP does not support index_kpool > 1.")
     if cfg.enable_prefill_cp or cfg.enable_hisparse:
         raise ValueError("DSA DCP does not support prefill CP or HiSparse.")
     if cfg.speculative_eagle_topk not in (None, 1):

@@ -181,7 +181,7 @@ DeepSeek Sparse Attention attends over a top-k slice of the context, so DCP keep
 3. The TRT-LLM sparse kernel returns the per-head LSE and the usual DCP merge combines the partial outputs.
 4. The MTP draft (nextn) layer keeps a replicated KV cache over the widened slots and attends without the DCP group, so MTP index share feeds the draft directly.
 
-Requirements: CUDA SM100/SM103 with the `trtllm` DSA backends (selected automatically), an `fp8_e4m3` or `bf16` KV cache, `attn_tp_size % dcp_size == 0`, and, with speculative decoding, the checkpoint's own MTP draft as a single EAGLE chain (`--speculative-eagle-topk 1`, draft tokens equal to steps + 1). HiSparse, prefill CP, HiCache, PD disaggregation, unified memory and GLM-5.3-Flash's pooled index are not supported in this combination.
+Requirements: CUDA SM100/SM103 with the `trtllm` DSA backends (selected automatically), an `fp8_e4m3` or `bf16` KV cache, `attn_tp_size % dcp_size == 0`, and, with speculative decoding, the checkpoint's own MTP draft as a single EAGLE chain (`--speculative-eagle-topk 1`, draft tokens equal to steps + 1). HiSparse, prefill CP, HiCache, PD disaggregation, unified memory and `index_kpool > 1` are not supported in this combination.
 
 ```bash Command
 sglang serve \
