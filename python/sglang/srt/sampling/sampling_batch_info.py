@@ -98,6 +98,8 @@ class SamplingBatchInfo:
     return_sampling_support_logprobs: Optional[List[bool]] = None
     sampling_mask_batch_indices: Optional[torch.Tensor] = None
     sampling_support_logprobs_capture_indices: Optional[torch.Tensor] = None
+    # Per-row top_k of mask requests (1 elsewhere); bounds the capture width.
+    sampling_mask_top_ks: Optional[List[int]] = None
 
     # Device
     device: str = "cuda"
@@ -108,6 +110,11 @@ class SamplingBatchInfo:
     # Host-side eligibility for torch_npu.npu_top_k_top_p. Keeping this off the
     # device avoids a scalar synchronization in the per-token sampling path.
     npu_top_k_top_p_eligible: bool = False
+
+    # Host-side upper bound on every row's top_k, or None when some row samples
+    # from the whole vocabulary. Any value >= the true max stays exact, so
+    # filter_batch keeps it unchanged.
+    max_top_k: Optional[int] = None
 
     @classmethod
     def from_schedule_batch(cls, batch: ScheduleBatch, vocab_size: int):
@@ -201,6 +208,9 @@ class SamplingBatchInfo:
                 device,
             )
         )
+        sampling_mask_top_ks = [
+            r.sampling_params.top_k if r.return_sampling_mask else 1 for r in reqs
+        ]
 
         if has_custom_logit_processor:
             # Merge the same type of custom logit processors together
@@ -258,6 +268,11 @@ class SamplingBatchInfo:
             npu_top_k_top_p_eligible=all(
                 1 <= r.sampling_params.top_k <= 1024 for r in reqs
             ),
+            max_top_k=(
+                max(r.sampling_params.top_k for r in reqs)
+                if reqs and all(1 <= r.sampling_params.top_k < TOP_K_ALL for r in reqs)
+                else None
+            ),
             vocab_size=vocab_size,
             penalizer_orchestrator=penalizer_orchestrator,
             has_custom_logit_processor=has_custom_logit_processor,
@@ -271,6 +286,7 @@ class SamplingBatchInfo:
             sampling_support_logprobs_capture_indices=(
                 sampling_support_logprobs_capture_indices
             ),
+            sampling_mask_top_ks=sampling_mask_top_ks,
         )
         ret.adjusted_from_schedule_batch(batch, vocab_size)
         return ret
@@ -435,6 +451,10 @@ class SamplingBatchInfo:
             self.return_sampling_masks = [
                 self.return_sampling_masks[i] for i in keep_indices
             ]
+            if self.sampling_mask_top_ks is not None:
+                self.sampling_mask_top_ks = [
+                    self.sampling_mask_top_ks[i] for i in keep_indices
+                ]
             if self.return_sampling_support_logprobs is not None:
                 self.return_sampling_support_logprobs = [
                     self.return_sampling_support_logprobs[i] for i in keep_indices
@@ -537,6 +557,9 @@ class SamplingBatchInfo:
                     self.device,
                 )
             )
+            self.sampling_mask_top_ks = (
+                self.sampling_mask_top_ks or [1] * self_len
+            ) + (other.sampling_mask_top_ks or [1] * other_len)
 
         # Note: because the __len()__ operator is defined on the temperatures tensor,
         # please make sure any merge operation with len(self) or len(other) is done before
@@ -559,6 +582,11 @@ class SamplingBatchInfo:
         self.need_top_k_sampling |= other.need_top_k_sampling
         self.need_min_p_sampling |= other.need_min_p_sampling
         self.npu_top_k_top_p_eligible &= other.npu_top_k_top_p_eligible
+        self.max_top_k = (
+            None
+            if self.max_top_k is None or other.max_top_k is None
+            else max(self.max_top_k, other.max_top_k)
+        )
 
         self.adjusted_merge_batch(other)
 

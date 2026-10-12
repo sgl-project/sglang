@@ -46,14 +46,17 @@ import torch.nn.functional as F
 
 from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
+    can_use_fp8_rowwise,
     can_use_fused_inplace_qknorm_rope,
     can_use_fused_layernorm_modulate,
+    fp8_rowwise,
     fused_inplace_qknorm_rope,
     fused_layernorm_modulate_raw,
     fused_packed_silu_mul_bitexact,
     is_plain_layer_norm,
     residual_gate_add,
 )
+from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.multimodal_gen.configs.models.dits.flux3 import (
     Flux3ArchConfig,
     Flux3DiTConfig,
@@ -132,13 +135,13 @@ _LN_MODULATE = BitExactFusionGate("FLUX 3 fused LN+modulate", per_signature=True
 _SWIGLU = BitExactFusionGate("FLUX 3 fused SwiGLU", per_signature=True)
 
 
-def _eager_fast_path_allowed(x: torch.Tensor) -> bool:
-    return (
-        x.is_cuda
-        and x.dtype is torch.bfloat16
-        and not torch.compiler.is_compiling()
-        and not torch.cuda.is_current_stream_capturing()
-    )
+def _fast_path_allowed(x: torch.Tensor) -> bool:
+    return x.is_cuda and x.dtype is torch.bfloat16 and not torch.compiler.is_compiling()
+
+
+def _can_verify() -> bool:
+    # First-sight verification runs the eager chain and a host sync.
+    return not torch.cuda.is_current_stream_capturing()
 
 
 def _norm_modulate(
@@ -148,12 +151,14 @@ def _norm_modulate(
     scale_row, shift_row = scale[:, 0], shift[:, 0]
     if (
         _LN_MODULATE.disabled
-        or not _eager_fast_path_allowed(x)
+        or not _fast_path_allowed(x)
         or not is_plain_layer_norm(norm, x.shape[-1])
-        or not can_use_fused_layernorm_modulate(x, scale_row, shift_row)
+        or not can_use_fused_layernorm_modulate(x.dtype, x.shape[-1])
     ):
         return (1 + scale) * norm(x) + shift
     sig = (x.device, x.shape[0], x.shape[-1], norm.eps)
+    if not _LN_MODULATE.is_verified(sig) and not _can_verify():
+        return (1 + scale) * norm(x) + shift
     try:
         out = fused_layernorm_modulate_raw(x, scale_row, shift_row, norm.eps)
     except Exception as exc:
@@ -173,9 +178,11 @@ def _norm_modulate(
 def _swiglu(packed: torch.Tensor) -> torch.Tensor:
     """``silu(gate) * value`` of a packed ``[gate | value]`` projection."""
     gate, value = packed.chunk(2, dim=-1)
-    if _SWIGLU.disabled or not _eager_fast_path_allowed(packed):
+    if _SWIGLU.disabled or not _fast_path_allowed(packed):
         return F.silu(gate) * value
     sig = (packed.device, packed.shape[-1], packed.stride(-2))
+    if not _SWIGLU.is_verified(sig) and not _can_verify():
+        return F.silu(gate) * value
     try:
         out = fused_packed_silu_mul_bitexact(packed)
     except Exception as exc:
@@ -194,7 +201,7 @@ def _swiglu(packed: torch.Tensor) -> torch.Tensor:
 
 def _fused_qknorm_rope_enabled(q: torch.Tensor, head_dim: int) -> bool:
     return (
-        _eager_fast_path_allowed(q)
+        _fast_path_allowed(q)
         and os.getenv("SGLANG_ENABLE_FUSED_QKNORM_ROPE", "1").lower()
         not in ("0", "false", "off", "no")
         and can_use_fused_inplace_qknorm_rope(
@@ -304,6 +311,16 @@ class Flux3Fp8RowwiseLinear(nn.Module):
             raise ValueError(
                 "expected an E4M3 weight with one fp32 scale per output row"
             )
+        if is_fp8_fnuz():
+            from sglang.srt.layers.quantization.fp8_utils import (
+                normalize_e4m3fn_to_e4m3fnuz,
+            )
+
+            # MI300 scaled_mm requires FNUZ. Preserve the dequantized checkpoint
+            # values and do not mutate checkpoint tensors shared by the loader.
+            weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
+                weight.clone(), weight_scale
+            )
         self.out_features, self.in_features = weight.shape
         self.tuple_output = tuple_output
         # Parameters (not buffers) so that layerwise offload streams them.
@@ -317,9 +334,22 @@ class Flux3Fp8RowwiseLinear(nn.Module):
         flat = x.reshape(-1, self.in_features).contiguous()
         rows = flat.shape[0]
         pad = -rows % self.ROW_ALIGNMENT
-        if pad:
-            flat = F.pad(flat, (0, 0, 0, pad))
-        activation, activation_scale = quantize_fp8_rowwise(flat)
+        if can_use_fp8_rowwise(flat):
+            activation, activation_scale = fp8_rowwise(flat, self.ROW_ALIGNMENT)
+        else:
+            if pad:
+                flat = F.pad(flat, (0, 0, 0, pad))
+            activation, activation_scale = quantize_fp8_rowwise(flat)
+            # ROCm-only: can_use_fp8_rowwise() requires torch.version.hip is None,
+            # so the fnuz weights only ever reach this branch.
+            if self.weight.dtype == torch.float8_e4m3fnuz:
+                from sglang.srt.layers.quantization.fp8_utils import (
+                    normalize_e4m3fn_to_e4m3fnuz,
+                )
+
+                activation, activation_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
+                    activation, activation_scale
+                )
         out = torch._scaled_mm(
             activation,
             self.weight.T,

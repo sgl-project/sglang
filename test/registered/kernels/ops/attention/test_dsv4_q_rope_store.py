@@ -3,14 +3,16 @@ import unittest
 import torch
 
 from sglang.kernels.ops.attention import deepseek_v4_rope
-from sglang.kernels.ops.attention.dsv4.elementwise import fused_rope_inplace
-from sglang.kernels.ops.attention.dsv4.q_rope_store import q_rope_store
+from sglang.kernels.ops.attention.dsv4.elementwise import (
+    fused_q_norm_rope,
+    fused_rope_inplace,
+)
 from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=40, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-# gfx950: q_rope_store's HIP operation order matches the batched RoPE DeepseekV4 turns on
+# gfx950: fused_q_norm_rope's HIP operation order matches the batched RoPE DeepseekV4 turns on
 register_amd_ci(est_time=40, stage="stage-b", runner_config="1-gpu-small-amd-mi35x")
 
 
@@ -26,7 +28,7 @@ class TestQRopeStore(CustomTestCase):
         freqs = torch.polar(
             torch.ones(8192, 32, device="cuda"), torch.randn(8192, 32, device="cuda")
         )
-        for rows in (1, 2, 5, 6, 8):
+        for rows in (1, 2, 5, 6, 8, 9, 100, 4095):
             for heads in (8, 16, 32):
                 for dtype in (torch.int32, torch.int64):
                     q = torch.randn(
@@ -42,7 +44,7 @@ class TestQRopeStore(CustomTestCase):
                     original = q.clone()
                     expected = q.clone()
                     fused_rope_inplace(expected[..., 448:], None, freqs, positions)
-                    q_rope_store(q, output, freqs, positions)
+                    fused_q_norm_rope(q, output, None, freqs, positions)
                     torch.testing.assert_close(output, expected, rtol=0, atol=0)
                     torch.testing.assert_close(q, original, rtol=0, atol=0)
                     self.assertTrue((padding[:, heads:] == 7).all().item())
@@ -67,7 +69,7 @@ class TestQRopeStore(CustomTestCase):
                         0, 8192, (rows,), device="cuda", dtype=dtype
                     )
                     fused_rope_inplace(expected[..., 448:], None, freqs, positions)
-                    q_rope_store(q, padding[:, :16], freqs, positions)
+                    fused_q_norm_rope(q, padding[:, :16], None, freqs, positions)
                     torch.testing.assert_close(
                         padding[:, :16], expected, rtol=0, atol=0
                     )
@@ -81,10 +83,10 @@ class TestQRopeStore(CustomTestCase):
             torch.ones(8192, 32, device="cuda"), torch.randn(8192, 32, device="cuda")
         )
         positions = torch.arange(rows, device="cuda") % 8192
-        q_rope_store(q, output, freqs, positions)
+        fused_q_norm_rope(q, output, None, freqs, positions)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            q_rope_store(q, output, freqs, positions)
+            fused_q_norm_rope(q, output, None, freqs, positions)
         for _ in range(3):
             q.normal_()
             positions.random_(0, 8192)

@@ -61,7 +61,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="acf8fdf9307431ece8ee275971c41cb3d1a7020b"
+ENV AITER_COMMIT_DEFAULT="e7d2453f25e5aaeea72a3a40b284ba453e026624"
 
 # ===============================
 # Base image 942 with rocm720 and args
@@ -71,7 +71,7 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="acf8fdf9307431ece8ee275971c41cb3d1a7020b"
+ENV AITER_COMMIT_DEFAULT="e7d2453f25e5aaeea72a3a40b284ba453e026624"
 ENV TRITON_COMMIT_DEFAULT="42270451990532c67e69d753fbd026f28fcc4840"
 
 # ===============================
@@ -82,7 +82,7 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="acf8fdf9307431ece8ee275971c41cb3d1a7020b"
+ENV AITER_COMMIT_DEFAULT="e7d2453f25e5aaeea72a3a40b284ba453e026624"
 # Pin the ROCm torch stack for every pip invocation in this flavor. The file is
 # filled in after the torch 2.11 upgrade below; it must already exist (empty is
 # valid) because pip reads PIP_CONSTRAINT from the first pip call onwards.
@@ -106,7 +106,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="acf8fdf9307431ece8ee275971c41cb3d1a7020b"
+ENV AITER_COMMIT_DEFAULT="e7d2453f25e5aaeea72a3a40b284ba453e026624"
 
 # ===============================
 # Base image 950 with rocm720 and args
@@ -116,7 +116,7 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="acf8fdf9307431ece8ee275971c41cb3d1a7020b"
+ENV AITER_COMMIT_DEFAULT="e7d2453f25e5aaeea72a3a40b284ba453e026624"
 ENV TRITON_COMMIT_DEFAULT="42270451990532c67e69d753fbd026f28fcc4840"
 
 # ===============================
@@ -127,7 +127,7 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="acf8fdf9307431ece8ee275971c41cb3d1a7020b"
+ENV AITER_COMMIT_DEFAULT="e7d2453f25e5aaeea72a3a40b284ba453e026624"
 # Pin the ROCm torch stack for every pip invocation in this flavor. The file is
 # filled in after the torch 2.11 upgrade below; it must already exist (empty is
 # valid) because pip reads PIP_CONSTRAINT from the first pip call onwards.
@@ -286,7 +286,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="acf8fdf9307431ece8ee275971c41cb3d1a7020b"
+ENV AITER_COMMIT_DEFAULT="e7d2453f25e5aaeea72a3a40b284ba453e026624"
 # Same reasoning as the rocm724 stages: keep pip from resolving the image's
 # ROCm torch away to a PyPI CUDA build. Populated after the stack is in place.
 ENV PIP_CONSTRAINT="/etc/sglang/constraints/torch-rocm.txt"
@@ -300,7 +300,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="acf8fdf9307431ece8ee275971c41cb3d1a7020b"
+ENV AITER_COMMIT_DEFAULT="e7d2453f25e5aaeea72a3a40b284ba453e026624"
 ENV PIP_CONSTRAINT="/etc/sglang/constraints/torch-rocm.txt"
 RUN mkdir -p /etc/sglang/constraints && : > /etc/sglang/constraints/torch-rocm.txt
 
@@ -568,13 +568,28 @@ RUN pip uninstall -y aiter
 # block AITER_COMMIT overrides that predate that rule. The working tree was just
 # produced by a fresh `git clone` above, so there are no real user changes to
 # preserve.
-# cherry pick ROCm/aiter#5283 and #5279 gfx950 dsv4 a8w8 blockscale bpreshuffle configs
+# cherry pick ROCm/aiter#6042 to unpeel the 64-bit sparse MLA loop below Triton 3.8, may be removed in next aiter upgrade
+# apply the DSV4.1 TP2 fp8/fp4 FMoE tuning CSVs from ROCm/aiter#5967, may be removed in next aiter upgrade
 # apply fix for v4 fp4 indexer, may be removed in next aiter upgrade
+# backport ROCm/aiter#6007 (masked E8M0 scales default to 0) to the group32 GEMM: with other=127 the
+# packed small-M kernel reads stale LDS as the masked K-tail scale, and a 0xFF byte turns the tile into NaN;
+# may be removed in next aiter upgrade
+# The #6042, #5967 and #6007 patches are written against the gfx942/gfx950 AITER pin and
+# do not apply to the older gfx1250 one (a conflict in pa_decode_sparse.py, and
+# the dsv41 CSVs and the group32 GEMM do not exist there yet), so gfx1250 skips them.
 RUN git clone ${AITER_REPO} \
  && cd aiter \
  && git checkout -f ${AITER_COMMIT} \
- && git cherry-pick --no-commit 7b481fbcaf834ce98b66004ea329c2ca2bba87d7 \
- && git cherry-pick --no-commit 24a62b1c122f23645a19b9d8b0abd4750c59359b \
+ && if [ "${GPU_ARCH_LIST}" != "gfx1250" ]; then \
+    git fetch origin pull/6042/head \
+    && git cherry-pick --no-commit 042a289183e5b47e193df6c10160915a6e8b69f5 \
+    && git fetch origin pull/5967/head \
+    && git diff -U0 89a47b84ac4b576339a50047e290c383c2377389 2bd147293d887c91fd10da10b1dbbf4690844270 -- \
+         aiter/configs/model_configs/dsv41_fp4_tuned_fmoe.csv \
+         aiter/configs/model_configs/dsv41_fp4_untuned_fmoe.csv \
+       | git apply --unidiff-zero \
+    && sed -i 's/other=127/other=0/' aiter/ops/triton/_triton_kernels/gemm/basic/gemm_a8w8_blockscale_group32.py; \
+ fi \
  && sed -i 's/from functools import lru_cache/from functools import cache/' aiter/ops/flydsl/kernels/mqa_logits/pa_mqa_logits_fp4_prefill.py \
  && sed -i 's/@lru_cache(maxsize=32)/@cache/' aiter/ops/flydsl/kernels/mqa_logits/pa_mqa_logits_fp4_prefill.py \
  && git submodule update --init --recursive \
@@ -591,25 +606,6 @@ RUN git clone ${AITER_REPO} \
 COPY --from=local_src \
      /src/python/sglang/kernels/ops/attention/dsv4/asm/gfx950/mla_v4/mla_a8w8_qh64_qseqlen1_gqaratio64_nm.co \
      /sgl-workspace/aiter/hsa/gfx950/mla_v4/
-
-# The pinned AITER revision uses std::optional in topk_per_row_kernels.cu without
-# including <optional>: ROCm/aiter#4702 removed the torch headers that previously
-# supplied it transitively. ROCm 7.0 therefore fails module_top_k_per_row, while
-# ROCm 7.2 toolchains still obtain <optional> from another header.
-# GPU_ARCH keeps the full selected stage name; only unsuffixed gfx942/gfx950
-# denote ROCm 7.0, while newer flavors carry a -rocm... suffix. Remove this
-# backport once AITER_COMMIT contains the upstream fix from ROCm/aiter#4853.
-RUN python3 <<'PY'
-import os
-from pathlib import Path
-
-p = Path("/sgl-workspace/aiter/csrc/kernels/topk_per_row_kernels.cu")
-anchor = "#include <type_traits>\n"
-if os.environ["GPU_ARCH"] in {"gfx942", "gfx950"} and p.exists():
-    s = p.read_text()
-    if "std::optional" in s and "#include <optional>" not in s and anchor in s:
-        p.write_text(s.replace(anchor, "#include <optional>\n" + anchor, 1))
-PY
 
 RUN cd aiter \
      && echo "[AITER] GPU_ARCH=${GPU_ARCH}" \
@@ -743,9 +739,9 @@ RUN cd sglang \
             all_extras="all_hip" ; \
             CONS="-c /tmp/constraints.txt" ; \
             echo 'diffusers==0.37.0' >> /tmp/constraints.txt ; \
-            echo 'transformers==5.12.1' >> /tmp/constraints.txt ; \
-            echo 'tokenizers==0.22.2' >> /tmp/constraints.txt ; \
-            echo 'huggingface_hub==1.27.0' >> /tmp/constraints.txt ; \
+            echo 'transformers==5.19.0' >> /tmp/constraints.txt ; \
+            echo 'tokenizers==0.23.2' >> /tmp/constraints.txt ; \
+            echo 'huggingface_hub==1.33.0' >> /tmp/constraints.txt ; \
             ;; \
        esac \
     && if [ "$BUILD_TYPE" = "srt" ]; then \
@@ -1101,10 +1097,6 @@ RUN cd /tmp/whl \
         echo "Not rocm720 (GPU_ARCH=${GPU_ARCH}), skip patch"; \
         ;; \
     esac
-
-# transformers 5.12.1: don't follow HF-cache symlinks when hashing custom modules
-# (transformers#46618, not yet released).
-RUN python3 -c "from pathlib import Path; import transformers.dynamic_module_utils as m; p=Path(m.__file__); t=p.read_text(); p.write_text(t.replace('Path(resolved_module_file).resolve()','Path(resolved_module_file)').replace('Path(source_file).resolve()','Path(source_file)'))"
 
 # -----------------------
 # Install AMD's ROCm Triton, replacing the base image's. The local version is
