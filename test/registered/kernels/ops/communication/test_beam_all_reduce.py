@@ -278,37 +278,79 @@ class TestBeamAllReduce(CustomTestCase):
         model._flashinfer_ar_tokens = None
         self.assertIsNone(model._flashinfer_ar_for(tokens(128)))
 
-    def test_flashinfer_ar_setup_is_lazy_and_outside_capture(self):
-        """Construction (even on meta) never sets up the workspace; the first
-        eager forward does, and a capturing forward never does."""
-        import sglang.srt.layers.flashinfer_comm_fusion as fi_fusion
-        from sglang.srt.models import beam
+    def test_flashinfer_all_reduce_graph_replay(self):
+        """FlashInfer's all-reduce returns the FP32 rank-order sum, and replays of
+        consecutive attention/MLP boundaries sharing its workspace stay exact."""
+        from functools import partial
 
-        key = (torch.cuda.get_device_capability(), dist.get_world_size())
-        band = patch.dict(beam._FLASHINFER_AR_TOKEN_BAND, {key: (96, 640)})
-        available = patch.object(
-            fi_fusion, "is_flashinfer_allreduce_unavailable", return_value=False
+        from sglang.kernels.jit.utils import is_arch_support_pdl
+        from sglang.kernels.ops.layernorm.beam_fused import (
+            fused_sandwich_residual_rmsnorm,
         )
-        no_setup = patch.object(
-            fi_fusion,
-            "FlashInferWorkspaceManager",
-            side_effect=AssertionError("workspace setup reached"),
+        from sglang.srt.layers.flashinfer_comm_fusion import (
+            FlashInferWorkspaceManager,
         )
-        with band, no_setup, torch.device("meta"):
-            tokens = beam.BeamModel._flashinfer_ar_band()
-        if tokens is None:
-            self.skipTest("FlashInfer is not available")
-        model = beam.BeamModel.__new__(beam.BeamModel)
-        torch.nn.Module.__init__(model)
-        model._flashinfer_ar_tokens, model._flashinfer_ar = tokens, None
-        hidden = torch.empty(128, 5120, device="cuda", dtype=torch.bfloat16)
-        capturing = patch.object(
-            torch.cuda, "is_current_stream_capturing", return_value=True
-        )
-        with available, no_setup, capturing:
-            self.assertIsNone(model._flashinfer_ar_for(hidden))
-        with available, no_setup, self.assertRaises(AssertionError):
-            model._flashinfer_ar_for(hidden)
+        from sglang.srt.models.beam import _flashinfer_all_reduce
+        from sglang.srt.utils import is_flashinfer_available
+
+        coord = get_parallel().tp_group
+        manager = FlashInferWorkspaceManager()
+        if is_flashinfer_available():
+            manager.initialize(
+                world_size=dist.get_world_size(),
+                rank=dist.get_rank(),
+                max_token_num=256,
+                hidden_dim=5120,
+                backend="mnnvl",
+                dtype=torch.bfloat16,
+                device_group=coord.device_group,
+                cpu_group=coord.cpu_group,
+            )
+        ready = torch.tensor([int(manager.workspace is not None)], dtype=torch.int32)
+        dist.all_reduce(ready, op=dist.ReduceOp.MIN, group=coord.cpu_group)
+        self.addCleanup(manager.cleanup)
+        if not ready.item():
+            self.skipTest("FlashInfer MNNVL workspace unavailable")
+        all_reduce = partial(_flashinfer_all_reduce, workspace=manager.workspace)
+        pdl = is_arch_support_pdl()
+        for rows in (96, 256):  # FlashInfer's one-shot and two-shot sizes
+            torch.manual_seed(7 + rows)
+            attn = torch.randn(rows, 5120, device="cuda", dtype=torch.bfloat16)
+            attn *= dist.get_rank() + 1
+            mlp = torch.randn_like(attn)
+            residual = torch.randn_like(attn)
+            post = torch.randn(5120, device="cuda", dtype=torch.bfloat16)
+            nxt = torch.randn_like(post)
+
+            def boundaries():
+                reduced_attn = all_reduce(attn)
+                normed, combined = fused_sandwich_residual_rmsnorm(
+                    reduced_attn, residual, post, nxt, 1e-6, 0.13, 0.97, enable_pdl=pdl
+                )
+                reduced_mlp = all_reduce(mlp)
+                _, combined2 = fused_sandwich_residual_rmsnorm(
+                    reduced_mlp, combined, post, nxt, 1e-6, 0.13, 0.97, enable_pdl=pdl
+                )
+                return reduced_attn, combined, reduced_mlp, combined2
+
+            boundaries()  # Compile before capture.
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                replayed = boundaries()
+            for change in (1.0, -0.5, 2.0):
+                attn.mul_(change)
+                mlp.mul_(-change)
+                for _ in range(3):
+                    graph.replay()
+                eager = boundaries()
+                names = ("attn sum", "attn combine", "mlp sum", "mlp combine")
+                for name, r, e in zip(names, replayed, eager):
+                    torch.testing.assert_close(
+                        r, e, atol=0, rtol=0, msg=f"replay {name} {rows=} {change=}"
+                    )
+                for actual, branch in ((replayed[0], attn), (replayed[2], mlp)):
+                    *_, expected = self.reference(branch, residual, post, nxt)
+                    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
     def test_attention_projection_reduction_ownership(self):
         """Deferring o_proj must perform exactly one collective before its norm."""

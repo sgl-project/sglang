@@ -1246,5 +1246,220 @@ class TestBeamPipelineStage(CustomTestCase):
                     torch.testing.assert_close(hidden, stream * 10)
 
 
+class TestBeamBoundaryOwnership(CustomTestCase):
+    """Who reduces each TP boundary, and how FlashInfer's workspace is set up."""
+
+    @staticmethod
+    def stub_layer(moe: bool, log: list):
+        """A decoder layer whose attention, MLP and collectives only record calls."""
+
+        def attention(positions, normed, batch, ssmax_scale, skip_all_reduce=False):
+            log.append("attention" if skip_all_reduce else "attention+own reduce")
+            return normed + 1
+
+        def mlp(hidden, defer_sum=False, skip_all_reduce=False):
+            if defer_sum:
+                log.append("experts deferred")
+                return hidden.unsqueeze(1).expand(-1, 8, -1)
+            log.append("mlp" if skip_all_reduce else "mlp+own reduce")
+            return hidden + 2
+
+        layer = BeamDecoderLayer.__new__(BeamDecoderLayer)
+        torch.nn.Module.__init__(layer)
+        layer.self_attn = attention
+        if moe:
+            layer.mlp = BeamMoE.__new__(BeamMoE)
+            torch.nn.Module.__init__(layer.mlp)
+            layer.mlp.forward = mlp
+            layer.mlp.config = SimpleNamespace(routed_scaling_factor=2.5)
+            backend = SimpleNamespace(is_triton=lambda: True)
+            layer.mlp.experts = SimpleNamespace(
+                quant_method=SimpleNamespace(
+                    runner=SimpleNamespace(runner_backend=backend)
+                ),
+                _dwdp_bound=False,
+            )
+        else:
+            layer.mlp = mlp
+        layer.gather_mlp_tokens = False
+        weight = SimpleNamespace(weight=torch.ones(4))
+        layer.post_attention_layernorm = layer.pre_feedforward_layernorm = weight
+        layer.post_feedforward_layernorm = weight
+        layer.rms_norm_eps = 1e-6
+        layer.attn_residual_scales = layer.mlp_residual_scales = (0.5, 0.5)
+
+        def norm(branch, residual, *args):
+            log.append("norm")
+            return branch, residual
+
+        layer.sandwich_residual_norm = norm
+        return layer
+
+    def test_each_boundary_is_reduced_exactly_once(self):
+        def fused(comm, branch, residual, *args, routed_scale=1.0):
+            log.append(f"{comm} {tuple(branch.shape[1:-1])} x{routed_scale}")
+            return branch[:, 0] if branch.ndim == 3 else branch, residual
+
+        def flashinfer(branch):
+            log.append("flashinfer")
+            return branch
+
+        # (MoE layer, replacements) -> calls in order; "x2.5" marks routed scaling.
+        cases = [
+            (False, {}, ["attention+own reduce", "norm", "mlp+own reduce", "norm"]),
+            (
+                False,
+                {"attention_beam_ar_comm": "fused", "mlp_beam_ar_comm": "fused"},
+                ["attention", "fused () x1.0", "mlp", "fused () x1.0"],
+            ),
+            (
+                True,
+                {
+                    "attention_beam_ar_comm": "fused",
+                    "mlp_beam_ar_topk_comm": "topk",
+                    "mlp_beam_ar_comm": "fused",
+                },
+                ["attention", "fused () x1.0", "experts deferred", "topk (8,) x2.5"],
+            ),
+            # The top-k variant needs per-expert outputs; a dense MLP falls back.
+            (
+                False,
+                {"mlp_beam_ar_topk_comm": "topk"},
+                ["attention+own reduce", "norm", "mlp+own reduce", "norm"],
+            ),
+            (
+                False,
+                {"mlp_beam_ar_topk_comm": "topk", "mlp_beam_ar_comm": "fused"},
+                ["attention+own reduce", "norm", "mlp", "fused () x1.0"],
+            ),
+            (
+                True,
+                {"mlp_beam_ar_comm": "fused"},
+                ["attention+own reduce", "norm", "mlp", "fused () x1.0"],
+            ),
+            (
+                True,
+                {
+                    "attention_flashinfer_ar": flashinfer,
+                    "mlp_flashinfer_ar": flashinfer,
+                },
+                ["attention", "flashinfer", "norm", "mlp", "flashinfer", "norm"],
+            ),
+            # A reduce-scatter or two-group MLP keeps its own reduction.
+            (
+                True,
+                {"attention_flashinfer_ar": flashinfer},
+                ["attention", "flashinfer", "norm", "mlp+own reduce", "norm"],
+            ),
+        ]
+        hidden = torch.zeros(3, 4)
+        for moe, replacements, expected in cases:
+            with self.subTest(moe=moe, replacements=sorted(replacements)):
+                log = []
+                layer = self.stub_layer(moe, log)
+                with patch(
+                    "sglang.kernels.ops.communication.beam_all_reduce."
+                    "beam_all_reduce_norm",
+                    side_effect=fused,
+                ):
+                    layer.forward_fused(
+                        None, hidden, hidden, None, None, None, **replacements
+                    )
+                self.assertEqual(log, expected)
+
+    def test_meta_construction_defers_flashinfer_setup(self):
+        pp_group = SimpleNamespace(
+            is_first_rank=True, is_last_rank=True, rank_in_group=0, world_size=1
+        )
+        with (
+            get_context().override_server_args(),
+            get_parallel().override(
+                tp_size=1,
+                tp_rank=0,
+                attn_tp_size=1,
+                attn_tp_rank=0,
+                attn_dp_size=1,
+                pp_group=pp_group,
+            ),
+            patch(
+                "sglang.srt.models.beam.BeamRotaryEmbedding",
+                side_effect=lambda config: torch.nn.Identity(),
+            ),
+            patch("sglang.srt.models.beam.BeamMoE", return_value=torch.nn.Identity()),
+            patch.object(BeamModel, "_flashinfer_ar_band", return_value=(96, 640)),
+            patch(
+                "sglang.srt.layers.flashinfer_comm_fusion.FlashInferWorkspaceManager",
+                side_effect=AssertionError("workspace setup during construction"),
+            ),
+            torch.device("meta"),
+        ):
+            model = BeamModel(tiny_config())
+        self.assertEqual(model._flashinfer_ar_tokens, (96, 640))
+        self.assertIsNone(model._flashinfer_ar)
+
+    def run_setup(self, *, local_ok=True, peer_ok=True, calls=()):
+        """Drive `_flashinfer_ar_for` through `calls` of (tokens, capturing)."""
+        manager = Mock(workspace=object() if local_ok else None)
+        model = BeamModel.__new__(BeamModel)
+        torch.nn.Module.__init__(model)
+        model._flashinfer_ar_tokens, model._flashinfer_ar = (96, 640), None
+        group = SimpleNamespace(
+            world_size=4, rank_in_group=0, device_group=None, cpu_group=None
+        )
+
+        def vote(ready, op, group):
+            ready.mul_(int(peer_ok))
+
+        results = []
+        with (
+            get_parallel().override(tp_group=group),
+            patch(
+                "sglang.srt.layers.flashinfer_comm_fusion.FlashInferWorkspaceManager",
+                return_value=manager,
+            ) as manager_class,
+            patch(
+                "sglang.srt.layers.flashinfer_comm_fusion."
+                "is_flashinfer_allreduce_unavailable",
+                return_value=False,
+            ),
+            patch("torch.distributed.all_reduce", side_effect=vote),
+            patch("sglang.srt.models.beam.atexit.register"),
+        ):
+            for tokens, capturing in calls:
+                hidden = torch.zeros(tokens, 8, dtype=torch.bfloat16)
+                with patch(
+                    "torch.cuda.is_current_stream_capturing", return_value=capturing
+                ):
+                    results.append(model._flashinfer_ar_for(hidden))
+        return model, manager, manager_class, results
+
+    def test_flashinfer_setup_runs_once_eagerly_and_is_reused(self):
+        model, manager, manager_class, results = self.run_setup(
+            calls=[(128, True), (8, False), (128, False), (128, True), (641, True)]
+        )
+        # Never during capture; once on the first eager forward, whatever its size.
+        self.assertIsNone(results[0])
+        manager_class.assert_called_once()
+        self.assertEqual(manager.initialize.call_args.kwargs["max_token_num"], 640)
+        self.assertIsNone(results[1])
+        self.assertIs(results[2], model._flashinfer_ar)
+        self.assertIs(results[3], model._flashinfer_ar)
+        self.assertIsNone(results[4])
+        manager.cleanup.assert_not_called()
+
+    def test_flashinfer_setup_failure_falls_back_for_good(self):
+        for local_ok, peer_ok in ((False, True), (True, False)):
+            with self.subTest(local_ok=local_ok, peer_ok=peer_ok):
+                model, manager, manager_class, results = self.run_setup(
+                    local_ok=local_ok,
+                    peer_ok=peer_ok,
+                    calls=[(128, False), (128, False), (256, True)],
+                )
+                self.assertEqual(results, [None, None, None])
+                manager_class.assert_called_once()
+                manager.cleanup.assert_called_once()
+                self.assertIsNone(model._flashinfer_ar_tokens)
+
+
 if __name__ == "__main__":
     unittest.main()
