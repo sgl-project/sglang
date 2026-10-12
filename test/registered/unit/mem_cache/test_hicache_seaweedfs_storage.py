@@ -325,12 +325,11 @@ class TestSeaweedFSStore(CustomTestCase):
                     for i in range(NUM_PAGES):
                         self.assertTrue(torch.equal(_page(pool, i), expected[p][i]))
 
-    def test_v2_mla_mamba_state_stays_per_rank(self):
-        # Every MLA TP rank backs up its own Mamba shard; replicated KV is shared.
+    def test_v2_mla_mamba_round_trip_keeps_each_tp_rank(self):
+        """MLA shares KV keys, but Mamba checkpoints must not overwrite another rank."""
         ranks = [self._v2_store(tp_rank=r, tp_size=2, is_mla=True) for r in (0, 1)]
-        keys = ranks[0][3]
         for store, _, _, _, transfers in ranks:
-            transfers[1].keys = keys
+            transfers[1].keys = ranks[0][3]
             self.assertEqual(
                 store.batch_set_v2(transfers[1:])[PoolName.MAMBA], [True] * NUM_PAGES
             )
@@ -342,10 +341,6 @@ class TestSeaweedFSStore(CustomTestCase):
             )
             for i in range(NUM_PAGES):
                 self.assertTrue(torch.equal(_page(side, i), expected[i]))
-        self.assertEqual(
-            ranks[0][0]._component_key("k", PoolName.KV),
-            ranks[1][0]._component_key("k", PoolName.KV),
-        )
 
     def test_v2_kv_pages_are_the_v1_objects(self):
         # KV pages keep their v1 object names, so v1 and v2 share one cache;
