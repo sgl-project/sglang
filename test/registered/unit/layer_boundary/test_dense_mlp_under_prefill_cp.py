@@ -7,7 +7,7 @@ from sglang.srt.layers.layer_boundary import (
 )
 from sglang.srt.layers.layer_boundary import prepare as comm_ops
 from sglang.srt.layers.layer_boundary.contracts import BatchVariant
-from sglang.srt.layers.layer_boundary.ops import scatter_moe_cp_output
+from sglang.srt.layers.layer_boundary.ops import moe_cp_take_back_output
 from sglang.test.boundary_fixtures import make_test_stages
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -28,16 +28,16 @@ class TestDenseMlpUnderPrefillCP(CustomTestCase):
             stages = make_test_stages(
                 attention_norm=fixture.Norm(), ffn_norm=fixture.Norm()
             )
-        attention = stages.attn.plan._paths.get(BatchVariant.CONTEXT_PARALLEL).entry
-        steps = stages.ffn.plan._paths.get(BatchVariant.CONTEXT_PARALLEL)
+        attention = stages.attn.plan.paths.get(BatchVariant.CONTEXT_PARALLEL).entry
+        steps = stages.ffn.plan.paths.get(BatchVariant.CONTEXT_PARALLEL)
         self.assertIn(TokenAxis.ATTN_CP, attention.input_rows.sharded)
         self.assertNotIn(TokenAxis.ATTN_CP, steps.entry.input_rows.sharded)
         self.assertIs(
-            steps.entry.prepare.keywords["step"].func, comm_ops._mlp_input_gather_moe_cp
+            steps.entry.prepare.keywords["step"].func, comm_ops._then_moe_cp_gather
         )
         self.assertIs(
             steps.output_move,
-            scatter_moe_cp_output,
+            moe_cp_take_back_output,
         )
 
 

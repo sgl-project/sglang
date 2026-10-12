@@ -1,4 +1,4 @@
-//! Per-rank bootstrap state, the readiness deadline and the outcome tallies.
+//! Per-rank bootstrap state, the readiness deadline, the seed gate and the outcome tallies.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -10,6 +10,17 @@ use tracing::{debug, info, warn};
 use super::DEFAULT_SNAPSHOT_FETCH_TIMEOUT_CAP;
 use super::{BootstrapState, RankOutcome, SnapshotOutcome, SweepOutcome};
 use crate::state::kv_events::tree::KvWorkerId;
+
+/// Hard bound on the seed-required readiness gate: three times the bootstrap
+/// budget, so a merely slow sweep still finishes inside it, floored at 60s so
+/// a short budget leaves a usable window. Bounded at all because a
+/// simultaneous fleet-wide restart, where no sweep can succeed, must degrade
+/// to a delay rather than an outage with no exit.
+fn seed_gate_timeout(bootstrap_timeout: Duration) -> Duration {
+    bootstrap_timeout
+        .saturating_mul(3)
+        .max(Duration::from_secs(60))
+}
 
 /// Rate-limit key for the snapshot-attempt log: one entry per peer per
 /// verdict.
@@ -41,6 +52,9 @@ impl LabelTally {
     fn snapshot(&self) -> Vec<(&'static str, u64)> {
         self.0.lock().iter().map(|(k, v)| (*k, *v)).collect()
     }
+    fn is_empty(&self) -> bool {
+        self.0.lock().is_empty()
+    }
 }
 
 /// Per-rank bootstrap progress and whether initial bootstrap has settled.
@@ -57,9 +71,10 @@ pub struct BootstrapTracker {
     /// Whether peer bootstrap is configured. Not derivable from `settled()`:
     /// a disabled tracker and a finished one both report settled.
     enabled: bool,
-    /// Set once `settled()` first answers true AFTER the first registration.
-    /// An expiry observed before any rank is registered answers true without
-    /// latching, so the re-arm at first registration still gates readiness.
+    /// Set once `settled()` first answers true AFTER the first registration,
+    /// or by [`Self::admit_ready`]. An expiry observed before any rank is
+    /// registered answers true without latching, so the re-arm at first
+    /// registration still gates readiness.
     latched: AtomicBool,
     /// Whether the one-shot re-arm at first worker discovery has happened.
     ///
@@ -84,6 +99,22 @@ pub struct BootstrapTracker {
     peer_attempts: Mutex<HashMap<PeerOutcomeKey, AttemptLog>>,
     /// Keyed by [`SweepOutcome::as_label`].
     sweep_results: LabelTally,
+    /// `--kv-bootstrap-seed-required`: whether a failed seed holds `/readyz`.
+    seed_required: bool,
+    /// Set by a [`SweepOutcome::TimedOut`] over a NON-EMPTY candidate set,
+    /// cleared by a later `Found`.
+    ///
+    /// Only that verdict means "siblings were there and we failed to get their
+    /// state". `NoPeers` (first deploy) and `FleetCold` (every sibling proved
+    /// empty) must never gate: an unready replica leaves its own
+    /// EndpointSlice, so gating on them deadlocks the fleet.
+    seed_failed: AtomicBool,
+    /// Hard bound on how long [`Self::seed_gate_open`] may hold readiness
+    /// down; re-armed at first registration, like `deadline`.
+    seed_gate_deadline: Mutex<Instant>,
+    /// Latched by [`Self::admit_ready`] or by the hard bound expiring; the
+    /// seed gate is then open for good.
+    seed_gate_passed: AtomicBool,
 }
 
 /// `now + timeout`, clamped instead of panicking: `Instant + Duration` panics
@@ -102,6 +133,13 @@ impl BootstrapTracker {
     }
 
     pub fn new_with_fetch_cap(timeout: Duration, fetch_cap: Duration) -> Self {
+        Self::new_with_opts(timeout, fetch_cap, false)
+    }
+
+    /// `seed_required`: hold `/readyz` at 503 when a sweep proves siblings were
+    /// present and their state could not be pulled. See
+    /// [`Self::seed_gate_open`].
+    pub fn new_with_opts(timeout: Duration, fetch_cap: Duration, seed_required: bool) -> Self {
         Self {
             fetch_cap,
             states: Mutex::new(HashMap::new()),
@@ -120,6 +158,10 @@ impl BootstrapTracker {
             rank_outcomes: LabelTally::default(),
             peer_attempts: Mutex::new(HashMap::new()),
             sweep_results: LabelTally::default(),
+            seed_required,
+            seed_failed: AtomicBool::new(false),
+            seed_gate_deadline: Mutex::new(deadline_after(seed_gate_timeout(timeout))),
+            seed_gate_passed: AtomicBool::new(false),
         }
     }
 
@@ -181,11 +223,69 @@ impl BootstrapTracker {
         self.rank_outcomes.snapshot()
     }
 
-    /// Tally one sweep's terminal verdict. `peers_tried` is accepted for
-    /// callers that gate on it and is not stored.
+    /// Tally one sweep's terminal verdict. `peers_tried` is the size of the
+    /// candidate set it was proven over: a `TimedOut` over a non-empty set is
+    /// a failed seed, over an empty one only a discovery race. See
+    /// [`Self::seed_gate_open`].
     pub fn record_sweep_result(&self, result: SweepOutcome, peers_tried: usize) {
-        let _ = peers_tried;
         self.sweep_results.bump(result.as_label());
+        match result {
+            SweepOutcome::TimedOut if peers_tried > 0 => {
+                self.seed_failed.store(true, Ordering::Relaxed);
+            }
+            // A later sweep that lands un-fails the replica.
+            SweepOutcome::Found => self.seed_failed.store(false, Ordering::Relaxed),
+            _ => {}
+        }
+    }
+
+    /// Whether readiness may proceed despite the seed outcome.
+    ///
+    /// Closed only while ALL hold: seed-required is on, [`Self::admit_ready`]
+    /// has never answered true, the hard bound has not expired, and either a sweep failed
+    /// the seed or ranks are registered with no sweep verdict yet. The last
+    /// arm exists because every rank can go terminal (overflow, publisher
+    /// reset, the tracker deadline) before the boot sweep reports, and a 200
+    /// in that window would latch the gate open unchecked.
+    ///
+    /// A NotReady pod is out of the Service, so a closed gate holds this
+    /// replica back while the previous generation keeps serving; once the
+    /// bound expires it serves cache-blind.
+    pub fn seed_gate_open(&self) -> bool {
+        if !self.seed_required || self.seed_gate_passed.load(Ordering::Relaxed) {
+            return true;
+        }
+        let verdict_pending = self.rearmed.load(Ordering::Relaxed) && self.sweep_results.is_empty();
+        if !verdict_pending && !self.seed_failed.load(Ordering::Relaxed) {
+            return true;
+        }
+        if Instant::now() >= *self.seed_gate_deadline.lock() {
+            // Latch, so the warning fires once rather than per probe.
+            self.seed_gate_passed.store(true, Ordering::Relaxed);
+            warn!(
+                "kv-bootstrap: seed-required gate expired with no usable peer snapshot; \
+                 serving cache-blind rather than holding this replica out forever",
+            );
+            return true;
+        }
+        false
+    }
+
+    /// Readiness conditions 3 and 4 together: `settled()` and
+    /// `seed_gate_open()`. A `true` latches both, so neither a later sweep nor
+    /// the first registration's re-arm can un-ready a replica that has served.
+    pub fn admit_ready(&self) -> bool {
+        if !(self.settled() && self.seed_gate_open()) {
+            return false;
+        }
+        self.latched.store(true, Ordering::Relaxed);
+        self.seed_gate_passed.store(true, Ordering::Relaxed);
+        true
+    }
+
+    /// Whether a sweep has recorded a failed seed.
+    pub fn seed_failed(&self) -> bool {
+        self.seed_failed.load(Ordering::Relaxed)
     }
 
     /// Per-sweep-verdict tallies for the metrics surface.
@@ -218,14 +318,21 @@ impl BootstrapTracker {
         self.fetch_cap
     }
 
-    /// Register ranks as `Pending` and return the obligation set: each rank
-    /// paired with the incarnation number a later control message must still
-    /// match to be allowed to act on it.
+    /// Register ranks as `Pending` and return obligations for the ones newly
+    /// inserted: each paired with a freshly minted incarnation number a later
+    /// control message must still match to be allowed to act on it.
+    ///
+    /// A rank already registered keeps its state and incarnation and yields no
+    /// obligation: whoever holds its existing obligation owns it. Decided under
+    /// the `states` lock, so concurrent callers registering the same rank get
+    /// exactly one obligation between them. A rank [`Self::forget`] removed is
+    /// new again and gets a new incarnation.
     ///
     /// Ranks added after the tracker has latched are recorded (so metrics stay
     /// accurate) but cannot un-settle readiness. The first registration is not
-    /// such a case: nothing latches before it (see [`Self::settled`]), so the
-    /// re-arm below is what the readiness gate measures from.
+    /// such a case: nothing latches before it (see [`Self::settled`]) unless
+    /// [`Self::admit_ready`] already has, so the re-arm below is what the
+    /// readiness gate measures from.
     pub fn register(&self, ids: &[KvWorkerId]) -> Vec<(KvWorkerId, u64)> {
         if ids.is_empty() {
             return Vec::new();
@@ -237,27 +344,17 @@ impl BootstrapTracker {
         // decides whether to latch, so the two cannot interleave.
         if !self.rearmed.swap(true, Ordering::Relaxed) {
             *self.deadline.lock() = Some(deadline_after(self.timeout));
+            *self.seed_gate_deadline.lock() = deadline_after(seed_gate_timeout(self.timeout));
         }
         let mut epochs = self.epochs.lock();
         let mut obligations = Vec::with_capacity(ids.len());
         for id in ids {
-            let fresh = !states.contains_key(id);
-            states.entry(id.clone()).or_insert(BootstrapState::Pending);
-            // A rank still present keeps its incarnation; one that was
-            // forgotten gets a new one, so a result started for the previous
-            // incarnation is recognisably stale.
-            let epoch = if fresh {
-                let e = self.epoch_seq.fetch_add(1, Ordering::Relaxed) + 1;
-                epochs.insert(id.clone(), e);
-                e
-            } else {
-                // A registered rank always has an epoch (`register` and `forget`
-                // write both maps together). Mint rather than default to 0 so a
-                // future asymmetry cannot make two incarnations share a number.
-                *epochs
-                    .entry(id.clone())
-                    .or_insert_with(|| self.epoch_seq.fetch_add(1, Ordering::Relaxed) + 1)
-            };
+            if states.contains_key(id) {
+                continue;
+            }
+            states.insert(id.clone(), BootstrapState::Pending);
+            let epoch = self.epoch_seq.fetch_add(1, Ordering::Relaxed) + 1;
+            epochs.insert(id.clone(), epoch);
             obligations.push((id.clone(), epoch));
         }
         obligations
@@ -342,6 +439,13 @@ impl BootstrapTracker {
     /// The deadline is always armed (see [`BootstrapTracker::new`]), so this
     /// cannot stay `false` forever regardless of what does or does not get
     /// registered.
+    /// Whether any registered rank is still [`BootstrapState::Pending`]. Every
+    /// such rank has an obligation some sweep owns, so its verdict is still to
+    /// come.
+    pub fn any_pending(&self) -> bool {
+        self.states.lock().values().any(|s| !s.is_terminal())
+    }
+
     pub fn settled(&self) -> bool {
         if self.latched.load(Ordering::Relaxed) {
             return true;
@@ -385,6 +489,11 @@ impl BootstrapTracker {
     fn expire_deadline_for_test(&self) {
         *self.deadline.lock() = Some(Instant::now());
     }
+
+    #[cfg(test)]
+    fn expire_seed_gate_for_test(&self) {
+        *self.seed_gate_deadline.lock() = Instant::now();
+    }
 }
 
 #[cfg(test)]
@@ -400,9 +509,17 @@ mod tests {
         let first = t.register(std::slice::from_ref(&a));
         let e1 = first[0].1;
 
-        // Re-registering a still-present rank keeps its incarnation.
-        let again = t.register(std::slice::from_ref(&a));
-        assert_eq!(again[0].1, e1, "a live rank keeps its incarnation");
+        // Re-registering a still-present rank yields no obligation and keeps
+        // its incarnation.
+        assert!(
+            t.register(std::slice::from_ref(&a)).is_empty(),
+            "a registered rank's obligation is already held",
+        );
+        assert_eq!(
+            t.epoch_of(&a),
+            Some(e1),
+            "a live rank keeps its incarnation"
+        );
 
         t.forget(std::slice::from_ref(&a));
         assert_eq!(t.epoch_of(&a), None);
@@ -613,8 +730,9 @@ mod tests {
         );
     }
 
-    /// The remaining window saturates at zero once the deadline passes, while
-    /// the configured timeout stays positive.
+    /// The premise behind `BootstrapDeps::deadline`'s settled branch: the
+    /// remaining window saturates at zero, so a late rank needs the configured
+    /// timeout instead.
     #[test]
     fn time_remaining_saturates_to_zero_once_expired() {
         let tracker = BootstrapTracker::new(Duration::from_millis(1));
@@ -628,5 +746,201 @@ mod tests {
             tracker.timeout() > Duration::ZERO,
             "the configured timeout must stay positive",
         );
+    }
+
+    // ===== seed-required readiness gate =====
+    //
+    // Which sweep verdicts may hold readiness down. Both failure directions are
+    // silent: gate too little and a cache-blind rollout ships, gate too much
+    // and the fleet deadlocks.
+
+    fn seed_tracker(seed_required: bool) -> BootstrapTracker {
+        BootstrapTracker::new_with_opts(
+            Duration::from_secs(300),
+            DEFAULT_SNAPSHOT_FETCH_TIMEOUT_CAP,
+            seed_required,
+        )
+    }
+
+    /// `NoPeers` (first deploy) and `FleetCold` (every sibling proved empty)
+    /// have nothing to inherit; gating on either deadlocks the fleet, since an
+    /// unready replica leaves its own EndpointSlice.
+    #[test]
+    fn seed_gate_never_closes_on_a_nothing_to_inherit_verdict() {
+        for verdict in [SweepOutcome::NoPeers, SweepOutcome::FleetCold] {
+            let t = seed_tracker(true);
+            t.record_sweep_result(verdict, 9);
+            assert!(
+                t.seed_gate_open(),
+                "{:?} means there was no state to inherit, not a failed seed; \
+                 gating on it deadlocks a cold fleet",
+                verdict.as_label(),
+            );
+            assert!(!t.seed_failed());
+        }
+    }
+
+    /// `TimedOut` gates only when the candidate set was non-empty. Over zero
+    /// peers it means discovery had not caught up, which is not evidence that
+    /// anyone had state to give.
+    #[test]
+    fn seed_gate_closes_only_on_timed_out_over_a_non_empty_candidate_set() {
+        let empty = seed_tracker(true);
+        empty.record_sweep_result(SweepOutcome::TimedOut, 0);
+        assert!(
+            empty.seed_gate_open(),
+            "a timeout over zero candidates is a discovery race, not a failed seed",
+        );
+
+        let peers = seed_tracker(true);
+        peers.record_sweep_result(SweepOutcome::TimedOut, 9);
+        assert!(
+            !peers.seed_gate_open(),
+            "siblings were present and their tree could not be pulled; this is \
+             the one verdict that must hold readiness down",
+        );
+    }
+
+    /// A later sweep that lands must un-fail the replica, or one unlucky sweep
+    /// gates a pod that went on to seed perfectly.
+    #[test]
+    fn seed_gate_reopens_when_a_later_sweep_finds_a_snapshot() {
+        let t = seed_tracker(true);
+        t.record_sweep_result(SweepOutcome::TimedOut, 9);
+        assert!(!t.seed_gate_open());
+        t.record_sweep_result(SweepOutcome::Found, 1);
+        assert!(t.seed_gate_open(), "a successful sweep clears the failure");
+        assert!(!t.seed_failed());
+    }
+
+    /// Off by default: the same failing sweep must not gate a tracker that did
+    /// not opt in.
+    #[test]
+    fn seed_gate_is_inert_unless_required() {
+        let t = seed_tracker(false);
+        t.record_sweep_result(SweepOutcome::TimedOut, 9);
+        assert!(t.seed_failed(), "the failure is still recorded");
+        assert!(
+            t.seed_gate_open(),
+            "but it must not hold readiness unless --kv-bootstrap-seed-required",
+        );
+    }
+
+    /// Once the replica has served a ready 200, a sweep started by a
+    /// late-discovered worker must not drag it back out of the Service.
+    #[test]
+    fn seed_gate_latches_open_once_readiness_has_passed() {
+        let t = seed_tracker(true);
+        let rank = KvWorkerId::new("http://w1".into(), 0);
+        t.register(std::slice::from_ref(&rank));
+        t.set(&rank, BootstrapState::Recovered);
+        t.record_sweep_result(SweepOutcome::Found, 1);
+        assert!(t.admit_ready());
+
+        t.record_sweep_result(SweepOutcome::TimedOut, 9);
+        assert!(
+            t.seed_gate_open(),
+            "an already-serving replica may not be un-readied by a later sweep",
+        );
+    }
+
+    /// In a simultaneous fleet-wide restart every sweep ends `TimedOut` over a
+    /// non-empty set; without the bound that is a permanent outage.
+    #[test]
+    fn seed_gate_opens_when_the_hard_bound_expires() {
+        let t = seed_tracker(true);
+        t.record_sweep_result(SweepOutcome::TimedOut, 9);
+        assert!(!t.seed_gate_open(), "closed while the bound holds");
+        t.expire_seed_gate_for_test();
+        assert!(
+            t.seed_gate_open(),
+            "the bound must expire the gate; a gate with no exit is worse than \
+             the degradation it prevents",
+        );
+    }
+
+    /// A tracker that never bootstraps cannot have failed to.
+    #[test]
+    fn disabled_tracker_never_gates() {
+        let t = BootstrapTracker::disabled();
+        t.record_sweep_result(SweepOutcome::TimedOut, 9);
+        assert!(t.seed_gate_open());
+    }
+
+    #[test]
+    fn seed_gate_timeout_scales_and_floors() {
+        assert_eq!(
+            seed_gate_timeout(Duration::from_secs(300)),
+            Duration::from_secs(900),
+        );
+        assert_eq!(
+            seed_gate_timeout(Duration::from_secs(1)),
+            Duration::from_secs(60),
+            "floored, or a short budget makes the gate unobservably brief",
+        );
+        assert_eq!(
+            seed_gate_timeout(Duration::from_millis(
+                crate::config::DEFAULT_KV_BOOTSTRAP_TIMEOUT_MS
+            )),
+            Duration::from_secs(1800),
+            "at the default budget the hold is three times it",
+        );
+    }
+
+    /// The hard bound runs from first registration, so slow discovery cannot
+    /// spend it before the first sweep has finished.
+    #[test]
+    fn the_seed_gate_bound_is_re_armed_at_first_registration() {
+        let t = seed_tracker(true);
+        t.expire_seed_gate_for_test();
+        t.register(&[KvWorkerId::new("http://w1".into(), 0)]);
+
+        t.record_sweep_result(SweepOutcome::TimedOut, 9);
+        assert!(
+            !t.seed_gate_open(),
+            "the bound must be re-armed with the budget, not left expired",
+        );
+    }
+
+    /// Every rank can go terminal before the boot sweep reports; a 200 in that
+    /// window would latch the gate open before the verdict arrives.
+    #[test]
+    fn seed_gate_holds_until_the_boot_sweep_reports() {
+        let t = seed_tracker(true);
+        let rank = KvWorkerId::new("http://w1".into(), 0);
+        t.register(std::slice::from_ref(&rank));
+        t.set(&rank, BootstrapState::Failed);
+        assert!(
+            t.settled(),
+            "condition 3 alone would let this replica serve"
+        );
+        assert!(
+            !t.seed_gate_open(),
+            "no sweep has reported yet, so the seed outcome is still unknown",
+        );
+
+        t.record_sweep_result(SweepOutcome::FleetCold, 9);
+        assert!(t.seed_gate_open(), "a nothing-to-inherit verdict opens it");
+    }
+
+    /// A replica that registers no rank never runs a sweep, so there is no
+    /// verdict to wait for.
+    #[test]
+    fn seed_gate_does_not_wait_for_a_sweep_that_cannot_run() {
+        assert!(seed_tracker(true).seed_gate_open());
+    }
+
+    /// A pool can go ready on a worker that publishes no KV events before the
+    /// first KV rank registers; that registration must not un-ready the
+    /// serving replica.
+    #[test]
+    fn first_registration_after_a_served_200_keeps_the_replica_ready() {
+        let t = seed_tracker(true);
+        t.expire_deadline_for_test();
+        assert!(t.admit_ready(), "the construction deadline has expired");
+
+        t.register(&[KvWorkerId::new("http://w1".into(), 0)]);
+        assert!(t.settled(), "condition 3 must stay latched");
+        assert!(t.seed_gate_open(), "condition 4 must stay latched");
     }
 }

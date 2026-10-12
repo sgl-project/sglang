@@ -33,6 +33,8 @@ class MiniMaxH3VideoVAEConfig(VAEConfig):
     load_decoder: bool = True
     use_tiling: bool = True
     use_parallel_tiling: bool = True
+    # Decode each rank's spatial tiles in one batched call instead of one by one.
+    stack_tiling: bool = False
     # The released checkpoint's quality contract uses overlapping latent
     # tiles. Parallel tiling distributes whole tiles without changing that
     # recipe. Spatial-shard decode is rejected because validation found output
