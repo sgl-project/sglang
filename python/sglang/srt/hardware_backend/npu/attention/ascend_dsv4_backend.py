@@ -143,6 +143,33 @@ def _read_page_table_md5(
     return hashlib.md5(raw).hexdigest()[:16]
 
 
+def _read_page_table_pages(buf, tbl, pages, max_pages: int = 256):
+    """Physical page ids the (logical) page table maps to, in column order.
+
+    Companion to ``_read_page_table_md5``: the md5 alone hides WHICH physical
+    page was read, so a MISS-vs-HIT run cannot tell whether the READ page
+    advanced. Mirrors the same whole-logical-page id walk (unsorted, deduped)
+    and returns a compact ``n=<count>,first=[..],last=[..]`` string. CPU only.
+    """
+    if tbl is None or not torch.is_tensor(tbl) or not tbl.numel():
+        return "none"
+    t = tbl.reshape(1, -1) if tbl.dim() == 1 else tbl
+    t = t.to(torch.int64)
+    ids_list = []
+    seen = set()
+    for row in t.tolist():
+        for v in row:
+            if v < 0 or v >= pages or v in seen:
+                continue
+            seen.add(v)
+            ids_list.append(v)
+    if not ids_list:
+        return "empty"
+    if len(ids_list) > max_pages:
+        ids_list = ids_list[-max_pages:]
+    return f"n={len(ids_list)},first={ids_list[:8]},last={ids_list[-8:]}"
+
+
 def _apply_hadamard(inp: torch.Tensor, hadamard_matrix: torch.Tensor) -> torch.Tensor:
     init_shape = inp.shape
     flat = inp.view(-1, hadamard_matrix.shape[0])
@@ -1622,6 +1649,14 @@ class C4IndexerAscendBackendMixin:
                     if _k is not None
                     else "None"
                 )
+                # S232: also surface the PHYSICAL index-K page(s) the klog md5
+                # was computed from, so a MISS-vs-HIT pair shows whether the READ
+                # page advanced (the md5 alone hides it). Additive; same gate.
+                _kpg = (
+                    _read_page_table_pages(_k, _ptab, int(_k.shape[0]))
+                    if _k is not None
+                    else "None"
+                )
                 _meta = kwargs.get("metadata")
                 _bt = kwargs.get("block_table")
                 print(
@@ -1631,6 +1666,7 @@ class C4IndexerAscendBackendMixin:
                     f"slq={_seq(fm.actual_seq_lengths_q)} "
                     f"slk={_seq(fm.actual_seq_lengths_kv)} "
                     f"klog={_klog} "
+                    f"kpg={_kpg} "
                     f"kraw={_md5_in(_k) if _k is not None else 'None'} "
                     f"meta={_md5_in(_meta) if _meta is not None else 'None'} "
                     f"bt={_md5_in(_bt) if _bt is not None else 'None'} "
