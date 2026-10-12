@@ -12,7 +12,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
     unwrap_write_loc,
 )
-from sglang.srt.mem_cache.utils import maybe_init_custom_mem_pool
+from sglang.srt.disaggregation.custom_mem_pool import maybe_init_custom_mem_pool
 
 logger = logging.getLogger(__name__)
 GB = 1024 * 1024 * 1024

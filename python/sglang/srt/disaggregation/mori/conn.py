@@ -330,6 +330,12 @@ class MoriKVManager(CommonKVManager):
         is_mla_backend: Optional[bool] = False,
     ):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
+        self._mori_backend = envs.SGLANG_MORI_BACKEND.get().strip().lower()
+        if self._mori_backend not in ("rdma", "fabric"):
+            raise ValueError(
+                f"Unsupported SGLANG_MORI_BACKEND={self._mori_backend!r}; "
+                "expected 'rdma' or 'fabric'"
+            )
         self.engine = self._init_engine()
         self.engine_desc = self.engine.get_engine_desc()
         self.kv_mem_descs: List[MemoryDesc] = []
@@ -343,6 +349,12 @@ class MoriKVManager(CommonKVManager):
         self._stopped = False
         self._worker_threads: List[threading.Thread] = []
         self._send_aux_rdma = envs.SGLANG_MORI_SEND_AUX_RDMA.get()
+        if self._mori_backend == "fabric" and self._send_aux_rdma:
+            logger.warning(
+                "Mori fabric backend cannot transport CPU aux data; "
+                "forcing aux transfer over TCP"
+            )
+            self._send_aux_rdma = False
         self._register_local_buffers()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self._num_shards = max(1, envs.SGLANG_MORI_TRANSFER_SHARDS.get())
@@ -388,49 +400,70 @@ class MoriKVManager(CommonKVManager):
             self._start_heartbeat_checker_thread()
 
     def _init_engine(self) -> IOEngine:
-        if self.kv_args.ib_device:
+        if self._mori_backend == "rdma" and self.kv_args.ib_device:
             os.environ["MORI_RDMA_DEVICES"] = self.kv_args.ib_device
 
         self.local_ip = get_local_ip_auto()
         config = IOEngineConfig(host=self.local_ip, port=0)
-
         engine_key = (
             f"io-{self.disaggregation_mode.value}-"
             f"dp{self.system_dp_rank}-tp{self.attn_tp_rank}-"
             f"pid{os.getpid()}-{self.local_ip}-"
             f"{uuid.uuid4().hex[:8]}"
         )
-
         engine = run_with_deadline(
             lambda: IOEngine(engine_key, config),
             timeout_s=envs.SGLANG_DISAGGREGATION_ENGINE_INIT_TIMEOUT.get(),
             what=f"Mori IOEngine({engine_key!r}, host={self.local_ip!r})",
         )
-        poll_mode = PollCqMode.POLLING
 
-        qp_per_transfer = envs.SGLANG_MORI_QP_PER_TRANSFER.get()
-        post_batch_size = envs.SGLANG_MORI_POST_BATCH_SIZE.get()
-        num_worker_threads = envs.SGLANG_MORI_NUM_WORKERS.get()
+        if self._mori_backend == "fabric":
+            try:
+                from mori.io import FabricBackendConfig
 
-        rdma_cfg = RdmaBackendConfig(
-            qp_per_transfer,
-            post_batch_size,
-            num_worker_threads,
-            poll_mode,
-            False,
-        )
-        engine.create_backend(BackendType.RDMA, rdma_cfg)
-        actual_port = engine.get_engine_desc().port
-        assert actual_port > 0, f"Failed to bind port for engine {engine_key}"
-        logger.debug(
-            "Initialized Mori IOEngine %s at %s:%s (qp_per_transfer=%s, workers=%s, poll_mode=%s)",
-            engine_key,
-            self.local_ip,
-            actual_port,
-            qp_per_transfer,
-            num_worker_threads,
-            poll_mode.name,
-        )
+                backend_type = BackendType.FABRIC
+            except (AttributeError, ImportError) as exc:
+                raise RuntimeError(
+                    "SGLANG_MORI_BACKEND=fabric requires a Mori build with "
+                    "fabric backend support"
+                ) from exc
+            num_streams = envs.SGLANG_MORI_FABRIC_STREAMS.get()
+            num_events = envs.SGLANG_MORI_FABRIC_EVENTS.get()
+            engine.create_backend(
+                backend_type, FabricBackendConfig(num_streams, num_events)
+            )
+            logger.debug(
+                "Initialized Mori IOEngine %s with fabric backend "
+                "(streams=%s, events=%s)",
+                engine_key,
+                num_streams,
+                num_events,
+            )
+        else:
+            poll_mode = PollCqMode.POLLING
+            qp_per_transfer = envs.SGLANG_MORI_QP_PER_TRANSFER.get()
+            post_batch_size = envs.SGLANG_MORI_POST_BATCH_SIZE.get()
+            num_worker_threads = envs.SGLANG_MORI_NUM_WORKERS.get()
+            rdma_cfg = RdmaBackendConfig(
+                qp_per_transfer,
+                post_batch_size,
+                num_worker_threads,
+                poll_mode,
+                False,
+            )
+            engine.create_backend(BackendType.RDMA, rdma_cfg)
+            actual_port = engine.get_engine_desc().port
+            assert actual_port > 0, f"Failed to bind port for engine {engine_key}"
+            logger.debug(
+                "Initialized Mori IOEngine %s at %s:%s "
+                "(qp_per_transfer=%s, workers=%s, poll_mode=%s)",
+                engine_key,
+                self.local_ip,
+                actual_port,
+                qp_per_transfer,
+                num_worker_threads,
+                poll_mode.name,
+            )
         return engine
 
     def _register_local_buffers(self) -> None:
@@ -684,6 +717,11 @@ class MoriKVManager(CommonKVManager):
     ) -> Optional[str]:
         if not statuses:
             return None
+        if self._mori_backend == "fabric":
+            rc = self.engine.wait_all(statuses)
+            if rc == StatusCode.SUCCESS:
+                return None
+            return self._collect_transfer_failure_reason(statuses)
 
         start = time.perf_counter()
         sla_ms = self._transfer_timeout_ms
