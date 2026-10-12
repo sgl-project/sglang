@@ -85,21 +85,41 @@ def mxfp8_ready(layer) -> bool:
     return mxfp8_route(layer) is not None
 
 
-def _weight_identity(layer):
-    """The source this layer's cached copy was built from.
-
-    ``id`` catches a replaced tensor and ``_version`` an in-place write, which
-    is what the update paths do. Keying on a hook having re-run would not work:
-    ``end_weight_update`` calls ``post_load_weights`` only when asked, and
-    ``precompile_kernels_after_loading`` not at all.
-    """
-    w, s = layer.weight, layer.weight_scale_mx_e8m0
-    return (id(w), w._version, id(s), s._version)
+#: Why an online weight update cannot run while a layer holds a fused copy.
+#:
+#: The loaders write through ``param.data.copy_()``, and nothing observable on
+#: the tensor moves when they do -- not ``_version`` (``.data`` carries its own
+#: counter), not ``data_ptr``, not the storage. So a cache keyed on the source
+#: cannot tell a fresh weight from a stale one, and the update has to be
+#: refused rather than silently served from the old copy. This is the same
+#: constraint ``_unsupported_derived_weight_cache_error`` already collects for
+#: the compensated mHC splits, and it is startup-determined and rank-uniform
+#: for the same reason they are: `_can_ever_fuse` reads only configuration and
+#: the weight layout.
+_UPDATE_UNSUPPORTED = (
+    "Online weight updates are not supported while the fused wo_b all-reduce "
+    "is active: it keeps a re-laid-out copy of each wo_b weight that in-place "
+    "loader writes do not refresh. Restart with "
+    "SGLANG_OPT_FUSED_WO_B_AR=0 to use online weight updates."
+)
 
 
 def release_mori_weight(layer) -> None:
-    """Drop this layer's re-laid-out copy, if it has one."""
+    """Drop this layer's re-laid-out copy, and the constraint that came with it."""
     layer._mori_b = None
+    layer._derived_weight_cache_error = None
+
+
+def release_all_prepared() -> None:
+    """Drop every copy this process built, across models.
+
+    A worker can prepare more than one model -- the target and, with MTP, the
+    NextN draft. Disabling the path has to release both, since a disable from
+    either model's construction leaves the other's copies with no reader.
+    """
+    for layer in _prepared:
+        release_mori_weight(layer)
+    _prepared.clear()
 
 
 def mori_weight(layer):
@@ -109,17 +129,15 @@ def mori_weight(layer):
     sglang interleaves them inside its 32 bytes, mori keeps them as two 16-byte
     blocks. Cached because the permutation copies the whole weight.
 
-    Keyed on the source weight rather than on the cache's own existence:
-    returning it unconditionally meant that after ``update_weights_from_*`` the
-    fused path kept multiplying by the weight the server started with, while
-    decode and every declined call used the new one -- no error, just wrong
-    output, and certain in an RL flow that loads dummy weights then syncs real
-    ones.
+    Building it publishes ``_derived_weight_cache_error`` on the layer, which
+    is how a model-owned cache tells the weight updater it cannot survive an
+    in-place reload. Without it the fused path kept multiplying by the weight
+    the server started with while decode and every declined call used the new
+    one -- no error, just wrong output.
     """
-    src = _weight_identity(layer)
     cached = getattr(layer, "_mori_b", None)
-    if cached is not None and cached[0] == src:
-        return cached[1]
+    if cached is not None:
+        return cached
     n, k = mxfp8_shape(layer)
     w = layer.weight.data.contiguous().view(torch.uint8)
     if mxfp8_route(layer) == "aiter":
@@ -146,8 +164,9 @@ def mori_weight(layer):
         .to(torch.int32)
         .reshape(-1)
     )
-    layer._mori_b = (src, (b, b_scale))
-    return layer._mori_b[1]
+    layer._mori_b = (b, b_scale)
+    layer._derived_weight_cache_error = _UPDATE_UNSUPPORTED
+    return layer._mori_b
 
 
 @triton.jit
@@ -248,6 +267,9 @@ _warned_window = False
 _warned_late = False
 _mori_ok: bool | None = None
 _switch_on: bool | None = None
+#: Every layer this process built a copy for, across models. A worker loads
+#: the target and, with MTP, the NextN draft.
+_prepared: list = []
 
 _shape_hist: dict = {}
 _shape_calls = 0
@@ -341,22 +363,43 @@ def prepare_fused_wo_b(layers) -> None:
     candidates = [layer for layer in layers if _can_ever_fuse(layer)]
     if not candidates:
         return
+
+    from sglang.srt.distributed import get_tp_group
+
+    world_size = get_tp_group().world_size
+    n, k = mxfp8_shape(candidates[0])
+    m_max = _window_m_max(_padded_m(_prefill_ceiling() or 1, world_size), world_size)
+
+    # Called once per model, and a worker can load more than one: with MTP the
+    # NextN draft is a DeepseekV4ForCausalLM subclass that does not override
+    # `precompile_kernels_after_loading`, and its decoder builds an MQALayer,
+    # so this runs again in the same process. Building a second op would
+    # overwrite `_state` and leak the first window -- 560-700 MiB per rank for
+    # the life of the server.
+    if _state is not None:
+        if (n, k) != (_state.n, _state.k) or m_max > _state.m_max:
+            # `fused_wo_b` declines any layer whose shape does not match
+            # `_state`, so preparing these would allocate copies nothing reads.
+            logger.info(
+                "mori fused wo_b: not preparing a second shape (N=%d K=%d "
+                "M<=%d) against the existing window (N=%d K=%d M<=%d)",
+                n, k, m_max, _state.n, _state.k, _state.m_max,
+            )
+            return
+        for layer in candidates:
+            mori_weight(layer)
+        _prepared.extend(candidates)
+        return
+
     for layer in candidates:
         mori_weight(layer)
+    _prepared.extend(candidates)
 
     # Collective, and it must run on every rank or none. `_can_ever_fuse` reads
     # only configuration and the weight layout, which are the same everywhere,
     # so the ranks agree on whether to be here at all.
-    layer = candidates[0]
-    n, k = mxfp8_shape(layer)
-    from sglang.srt.distributed import get_tp_group
-
-    world_size = get_tp_group().world_size
-    m_max = _window_m_max(_padded_m(_prefill_ceiling() or 1, world_size), world_size)
-    if not _construct_collectively(m_max, n, k):
-        # Disabled for the process; the copies above have no reader left.
-        for layer in candidates:
-            release_mori_weight(layer)
+    # `_disable` releases every prepared layer on the way out, across models.
+    _construct_collectively(m_max, n, k)
 
 
 def _fused_weight(layer):
@@ -584,15 +627,16 @@ def _agreed(tp, ok: bool) -> bool:
 def _disable(tp, state, err, stage: str) -> None:
     """Turn the path off here because some rank could not get this far.
 
-    Releases this rank's op even when it built one: holding the window's
-    reservation for a path nothing may call costs the process its memory for
-    nothing.
+    Releases this rank's op even when it built one, and every weight copy any
+    model prepared: holding the window's reservation and ~840 MiB of copies for
+    a path nothing may call costs the process that memory for nothing.
     """
     global _disabled
 
     _disabled = True
     if state is not None:
         state.close()
+    release_all_prepared()
     if err is not None:
         logger.warning(
             "mori fused wo_b could not be %s on rank %d; the fused path is off "
