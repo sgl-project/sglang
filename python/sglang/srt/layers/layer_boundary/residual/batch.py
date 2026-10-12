@@ -13,6 +13,7 @@
 # ==============================================================================
 """Residual access for one layer-stack invocation or TBO microbatch."""
 
+from sglang.srt.layers.layer_boundary.output import complete_owed
 from sglang.srt.layers.layer_boundary.residual import access
 from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
@@ -32,6 +33,12 @@ def stream_of(forward_batch):
     if stream is None:
         raise RuntimeError("start the layer stack before entering a stage")
     return stream
+
+
+def written_residual(forward_batch):
+    """The residual the last prepare wrote, for a stage whose compute reads it
+    too (e.g. to write the next stream at its exit). Borrowed: do not modify."""
+    return stream_of(forward_batch).residual
 
 
 def complete_output(hidden_states, forward_batch):
@@ -99,30 +106,30 @@ def final_norm(
         )
         return hidden_states
     if skip_empty and hidden_states.shape[0] == 0:
+        if capture is not None:
+            capture(hidden_states)
         return hidden_states
     return access.final_norm_pair(
         hidden_states, residual, layernorm, capture, **read_kwargs
     )
 
 
-def to_pp(hidden_states, forward_batch, *, preserve_declared=True):
+def to_pp(hidden_states, forward_batch):
     """Export hidden_states and residual as PPProxyTensors.
 
     Args:
         hidden_states: Current stream output or opaque owed handle.
         forward_batch: Batch owning the stream.
-        preserve_declared: True (the default) sends a statically declared
-            partial sum unreduced for the receiver's from_pp to complete; pass
-            False only when the receiver does not declare that sum.
 
-    Runtime-selected completion work is finished before transport. A stream
-    the producer already wrote (MHC writes its streams at the FFN exit) has no
-    separate residual and is sent as hidden_states alone; the receiver's
-    from_pp reconstructs it as written.
+    Every sum the output owes is completed before transport, a declared one
+    too: the pipeline sends each tensor as one slice per attention-TP rank and
+    gathers the slices back on the next rank, which reassembles only a tensor
+    that every attention-TP rank holds alike. A stream the producer already
+    wrote (MHC writes its streams at the FFN exit) has no separate residual
+    and is sent as hidden_states alone; the receiver's from_pp reconstructs it
+    as written.
     """
-    hidden_states, residual = stream_of(forward_batch).export(
-        hidden_states, preserve_declared=preserve_declared
-    )
+    hidden_states, residual = stream_of(forward_batch).export(hidden_states)
     forward_batch.residual_stream = None
     tensors = {"hidden_states": hidden_states}
     if residual is not None:
@@ -135,13 +142,24 @@ def snapshot(hidden_states, forward_batch):
 
 
 def add_to_output(hidden_states, forward_batch, extra):
-    output, _ = access.add_to_output(hidden_states, stream_of(forward_batch), extra)
-    return output
+    """Complete the output before adding an extra contribution exactly once.
+    Leave its residual update for the next prepare call."""
+    hidden_states = stream_of(forward_batch).complete(hidden_states)
+    hidden_states.add_(extra)
+    return hidden_states
 
 
 def fold(hidden_states, forward_batch):
-    output, _ = access.fold(hidden_states, stream_of(forward_batch))
-    return output
+    """Finish a plain layer output and fold its residual into a complete value.
+    The following stage receives it with no outstanding residual addition."""
+    stream = stream_of(forward_batch)
+    if stream.pending is not None and not stream.pending.update.is_plain_add:
+        raise NotImplementedError("fold requires a plain residual update")
+    hidden_states, residual = stream.export(hidden_states)
+    hidden_states = complete_owed(hidden_states)
+    if residual is not None:
+        hidden_states = hidden_states + residual
+    return stream.write(hidden_states)
 
 
 def set_written(hidden_states, forward_batch):

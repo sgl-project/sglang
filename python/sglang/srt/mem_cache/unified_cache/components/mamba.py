@@ -67,7 +67,9 @@ class MambaComponent(TreeComponent):
         assert isinstance(params.req_to_token_pool, HybridReqToTokenPool), (
             f"MambaComponent requires HybridReqToTokenPool, got {type(params.req_to_token_pool)}"
         )
-        if not params.enable_mamba_extra_buffer:
+        # Without the extra buffer only the sequence-end state exists, so a cached
+        # state needs page 1; a disabled tree caches none.
+        if not params.enable_mamba_extra_buffer and not params.disable:
             assert params.page_size == 1, (
                 f"MambaComponent requires page_size=1 when mamba_extra_buffer is disabled, got {params.page_size}"
             )
@@ -163,7 +165,7 @@ class MambaComponent(TreeComponent):
     ) -> MatchResult:
         last_node = result.best_match_node
 
-        mamba_boundary_len = len(result.device_indices) + result.host_hit_length
+        mamba_boundary_len = result.device_prefix_len + result.host_hit_length
 
         # Full KV may extend beyond the latest reusable Mamba state. The branching
         # point is the last Mamba-cache-chunk-aligned position within the Full-KV hit

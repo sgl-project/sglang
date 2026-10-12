@@ -104,6 +104,18 @@ class BufferBackupState(msgspec.Struct, frozen=True):
     parent_last_hash: Optional[str]
 
 
+class TreePathNodeInfo(msgspec.Struct, frozen=True):
+    """A node's key span on its root-to-node path."""
+
+    node_id: NodeId
+    parent_id: NodeId
+    # Half-open offsets from the root, in tokens (bigrams for bigram trees).
+    path_start: int
+    path_end: int
+    # Logical FULL device indices; None when the value is absent.
+    full_value_len: Optional[int]
+
+
 class InsertStepResult(msgspec.Struct, frozen=True):
     """One step of a resumable insert: the Controller executes ``actions``, then
     resumes while ``result`` is None; ``result`` is set on the final step."""
@@ -126,7 +138,11 @@ if TYPE_CHECKING:
         MatchResult,
     )
     from sglang.srt.mem_cache.events import KVCacheEventRecorder
-    from sglang.srt.mem_cache.hicache_storage import PoolTransfer, PoolTransferResult
+    from sglang.srt.mem_cache.hicache_storage import (
+        PoolName,
+        PoolTransfer,
+        PoolTransferResult,
+    )
     from sglang.srt.mem_cache.radix_cache import RadixKey
     from sglang.srt.mem_cache.unified_cache.cache_action import (
         BackupKV,
@@ -180,6 +196,14 @@ class UnifiedTreeCoreInterface(ABC):
         its tree node.
 
         TODO(Jialin): Remove after the Unified Radix Cache split.
+        """
+        ...
+
+    @abstractmethod
+    def is_write_through_compatible(self) -> bool:
+        """Whether current host ownership satisfies write-through invariants.
+
+        Read-only; the caller must have drained in-flight cache operations.
         """
         ...
 
@@ -256,6 +280,17 @@ class UnifiedTreeCoreInterface(ABC):
     @abstractmethod
     def dfs_weight_order(self, node_ids: Sequence[NodeId]) -> list[int]:
         """Return input indices in depth-first, subtree-weight order."""
+        ...
+
+    @abstractmethod
+    def collect_path_info(
+        self, end_node_ids: Sequence[NodeId]
+    ) -> tuple[tuple[TreePathNodeInfo, ...], ...]:
+        """Copy root-to-node paths, excluding roots, in input order.
+
+        Roots produce empty paths; missing handles raise KeyError. Callers must
+        serialize with tree mutations; native backends hold one lock per batch.
+        """
         ...
 
     @abstractmethod
@@ -387,6 +422,17 @@ class UnifiedTreeCoreInterface(ABC):
         raise NotImplementedError("This tree core does not expose per-component sizes")
 
     @abstractmethod
+    def adjust_component_size(
+        self, node_id: NodeId, component_type: ComponentType, delta: int
+    ) -> None:
+        """Adjust protected/evictable tokens after the component backing changes.
+
+        Roots and nodes without device values are no-ops. Missing handles raise
+        KeyError; disabled components raise ValueError.
+        """
+        ...
+
+    @abstractmethod
     def full_evictable_size(self) -> int: ...
 
     @abstractmethod
@@ -425,7 +471,7 @@ class UnifiedTreeCoreInterface(ABC):
 
     @abstractmethod
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
-        """Match a key against the tree; returns device indices + boundary NodeIds."""
+        """Match a key; returns the device prefix length + boundary NodeIds."""
         ...
 
     @abstractmethod
@@ -450,7 +496,7 @@ class UnifiedTreeCoreInterface(ABC):
     @property
     @abstractmethod
     def empty_match_result(self) -> MatchResult:
-        """A shared empty MatchResult (empty device indices + boundary NodeIds)."""
+        """A shared empty MatchResult (zero device prefix + boundary NodeIds)."""
         ...
 
     @abstractmethod
@@ -532,6 +578,20 @@ class UnifiedTreeCoreInterface(ABC):
     ) -> tuple[torch.Tensor, dict[ComponentType, list[PoolTransfer]]]:
         """Read a node's device->host backup spec (device value + transfers) now."""
         ...
+
+    def buffer_backup_pool_keys(
+        self, node_id: NodeId, hash_values: list[str]
+    ) -> dict[ComponentType, dict[PoolName, list[str]]]:
+        """Per component, the storage keys per pool a buffer-mode backup of
+        the node writes (``TreeComponent.buffer_backup_keys``); Rust cores name none."""
+        return {}
+
+    def build_backup_kv_action(self, node_id: NodeId) -> BackupKV:
+        """The write-through backup action for a node and its unstored
+        ancestors; only component-requested buffer backups need it."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not expose build_backup_kv_action"
+        )
 
     @abstractmethod
     def build_storage_backup_spec(
