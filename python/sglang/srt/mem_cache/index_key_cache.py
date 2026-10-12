@@ -33,14 +33,19 @@ class IndexKeyCache:
 
     def _buffer_shape(self, num_pages: int) -> tuple[int, int]:
         pool = self.pool
-        return (num_pages, pool.page_size // pool.index_kpool * self._entry_nbytes())
-
-    def _entry_nbytes(self) -> int:
-        pool = self.pool
-        return pool.index_head_dim + pool.index_head_dim // pool.quant_block_size * 4
+        return (
+            num_pages,
+            pool.page_size
+            // pool.index_kpool
+            * (pool.index_head_dim + pool.index_head_dim // pool.quant_block_size * 4),
+        )
 
     def _kernel_view(self, buffer: torch.Tensor) -> torch.Tensor:
-        return buffer.view(-1, self.pool.index_page_size * self._entry_nbytes())
+        pool = self.pool
+        kernel_pages_per_row = (
+            pool.page_size // pool.index_kpool // pool.index_page_size
+        )
+        return buffer.view(-1, buffer.shape[1] // kernel_pages_per_row)
 
     def _layer_num_pages(self, layer_idx: int, num_pages: int) -> int:
         # Layers that reuse the previous layer's top-k never write index-K, so
