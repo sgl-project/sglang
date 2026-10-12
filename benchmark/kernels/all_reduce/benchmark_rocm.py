@@ -301,7 +301,40 @@ def construct_impl(
             print(f"Failed to construct {name}: {exc}", file=sys.stderr)
             if args.verbose:
                 traceback.print_exc()
+        raise
     return None
+
+
+def synchronize_availability(name: str, comm, pg: dist.ProcessGroup):
+    locally_available = comm is not None and not getattr(comm, "disabled", False)
+    available_ranks = torch.tensor([locally_available], dtype=torch.int32)
+    dist.all_reduce(available_ranks, op=dist.ReduceOp.SUM, group=pg)
+    count = int(available_ranks.item())
+    world_size = dist.get_world_size(group=pg)
+    if count not in (0, world_size):
+        raise RuntimeError(f"{name} is available on only {count}/{world_size} ranks")
+    if count == world_size:
+        return comm
+    if comm is not None and hasattr(comm, "close"):
+        comm.close()
+    return None
+
+
+def synchronize_input_eligibility(
+    name: str, comm, inp: torch.Tensor, pg: dist.ProcessGroup
+) -> bool:
+    locally_eligible = not getattr(comm, "disabled", False)
+    if locally_eligible and hasattr(comm, "should_quick_allreduce"):
+        locally_eligible = comm.should_quick_allreduce(inp)
+    eligible_ranks = torch.tensor([locally_eligible], dtype=torch.int32)
+    dist.all_reduce(eligible_ranks, op=dist.ReduceOp.SUM, group=pg)
+    count = int(eligible_ranks.item())
+    world_size = dist.get_world_size(group=pg)
+    if count not in (0, world_size):
+        raise RuntimeError(
+            f"{name} accepts the input on only {count}/{world_size} ranks"
+        )
+    return count == world_size
 
 
 @torch.inference_mode()
@@ -441,6 +474,9 @@ def bench_eager(
     for size_bytes in sizes:
         elems = size_bytes // torch.empty((), dtype=dtype).element_size()
         base = torch.empty(elems, dtype=dtype, device=device).uniform_(0, 1)
+        if not synchronize_input_eligibility(name, comm, base, pg):
+            results.append((size_bytes, None))
+            continue
         if not args.skip_correctness and not check_correctness(
             name, comm, base, pg, reference_pg
         ):
@@ -514,25 +550,38 @@ def bench_graph(
         elems = size_bytes // torch.empty((), dtype=dtype).element_size()
         graph_inp = torch.empty(elems, dtype=dtype, device=device).uniform_(0, 1)
         reference = graph_inp.clone()
+        if not synchronize_input_eligibility(name, comm, graph_inp, pg):
+            results.append((size_bytes, None))
+            continue
+        graph = None
+        graph_out = None
+        capture_error = None
+        dist.barrier(group=pg)
         try:
-            dist.barrier(group=pg)
             capture = comm.capture() if hasattr(comm, "capture") else nullcontext()
             with capture:
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph):
                     graph_out = run_once(comm, graph_inp)
-            if graph_out is not None:
-                graph.replay()
-                torch.cuda.synchronize()
-            dist.barrier(group=pg)
         except Exception as exc:
+            capture_error = exc
+        capture_ok = torch.tensor(
+            [capture_error is None and graph_out is not None], dtype=torch.int32
+        )
+        dist.all_reduce(capture_ok, op=dist.ReduceOp.MIN, group=pg)
+        if not bool(capture_ok.item()):
             if dist.get_rank() == 0:
-                print(f"[{name}] {human_size(size_bytes)} capture failed: {exc}")
+                detail = (
+                    str(capture_error)
+                    if capture_error is not None
+                    else "capture failed or returned no output on another rank"
+                )
+                print(f"[{name}] {human_size(size_bytes)} capture failed: {detail}")
             results.append((size_bytes, None))
             continue
-        if graph_out is None:
-            results.append((size_bytes, None))
-            continue
+        graph.replay()
+        torch.cuda.synchronize()
+        dist.barrier(group=pg)
         if not args.skip_correctness and reference_pg is not None:
             dist.all_reduce(reference, group=reference_pg)
             torch.cuda.synchronize()
@@ -1149,6 +1198,7 @@ def run_benchmark(args: argparse.Namespace) -> None:
             isolated = []
             for size in sizes:
                 comm = construct_impl(name, pg, reference_pg, device, max_size, args)
+                comm = synchronize_availability(name, comm, pg)
                 if comm is None:
                     isolated.append((size, None))
                     continue
@@ -1161,6 +1211,7 @@ def run_benchmark(args: argparse.Namespace) -> None:
             results[name] = isolated
             continue
         comm = construct_impl(name, pg, reference_pg, device, max_size, args)
+        comm = synchronize_availability(name, comm, pg)
         if comm is None:
             results[name] = [(size, None) for size in sizes]
             continue

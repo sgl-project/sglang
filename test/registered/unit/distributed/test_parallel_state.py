@@ -234,14 +234,16 @@ def test_auto_outplace_resolution_prefers_quick_allreduce():
     assert method == "qr"
 
 
-def test_destroy_closes_quick_allreduce_before_process_groups():
+@pytest.mark.parametrize("has_quick_allreduce", [False, True])
+def test_destroy_handles_quick_allreduce_before_process_groups(has_quick_allreduce):
     coordinator = parallel_state.GroupCoordinator.__new__(
         parallel_state.GroupCoordinator
     )
     events = []
     coordinator.pcie_ipc_comm = None
-    coordinator.qr_comm = Mock()
-    coordinator.qr_comm.close.side_effect = lambda: events.append("qr")
+    if has_quick_allreduce:
+        coordinator.qr_comm = Mock()
+        coordinator.qr_comm.close.side_effect = lambda: events.append("qr")
     coordinator.device_group = "device"
     coordinator.cpu_group = "cpu"
     coordinator.pynccl_comm = None
@@ -256,8 +258,9 @@ def test_destroy_closes_quick_allreduce_before_process_groups():
     ):
         coordinator.destroy()
 
-    assert events == ["qr", "device", "cpu"]
-    assert coordinator.qr_comm is None
+    expected = ["qr"] if has_quick_allreduce else []
+    assert events == [*expected, "device", "cpu"]
+    assert getattr(coordinator, "qr_comm", None) is None
 
 
 @pytest.mark.parametrize("custom_allreduce_enabled", [False, True])

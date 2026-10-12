@@ -516,15 +516,14 @@ class GroupCoordinator:
                 )
 
             if is_hip():
-                try:
-                    # Prefer AITER QuickReduce when globally enabled and
-                    # available; otherwise retain the bundled implementation.
-                    # Based on quickreduce (https://github.com/mk1-project/quickreduce).
-                    self.qr_comm = create_quick_allreduce(
-                        group=self.cpu_group, device=self.device
-                    )
-                except Exception as e:
-                    logger.warning(f"Failed to initialize QuickAllReduce: {e}")
+                # Prefer AITER QuickReduce when globally enabled and
+                # available; otherwise retain the bundled implementation.
+                # Constructor failures must propagate to prevent ranks from
+                # selecting different collective implementations.
+                # Based on quickreduce (https://github.com/mk1-project/quickreduce).
+                self.qr_comm = create_quick_allreduce(
+                    group=self.cpu_group, device=self.device
+                )
         elif self.world_size > 1 and is_hip():
             logger.info("[AR] All-reduce call path: NCCL (custom AR disabled)")
 
@@ -2103,8 +2102,9 @@ class GroupCoordinator:
         if self.pcie_ipc_comm is not None:
             self.pcie_ipc_comm.destroy()
             self.pcie_ipc_comm = None
-        if self.qr_comm is not None:
-            self.qr_comm.close()
+        qr_comm = getattr(self, "qr_comm", None)
+        if qr_comm is not None:
+            qr_comm.close()
             self.qr_comm = None
         if self.device_group is not None:
             torch.distributed.destroy_process_group(self.device_group)
