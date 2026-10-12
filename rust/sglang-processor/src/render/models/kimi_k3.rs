@@ -7,12 +7,14 @@ use dynamo_renderer::{OAIChatLikeRequest, OAIPromptFormatter, RenderedPrompt};
 use serde_json::{Map, Value, json};
 
 use super::deepseek_v4::{engine_message, pydantic_bool, tool_arguments};
+use super::schema_types::normalize_json_schema_types;
 use crate::render::reasoning::{requested_effort, requested_thinking};
 
 const IMAGE_PLACEHOLDER: &str = "<|kimi_image_placeholder|>";
 const THINKING_EFFORTS: [&str; 3] = ["low", "high", "max"];
-const TOKENIZER_ARGS: [&str; 7] = [
+const TOKENIZER_ARGS: [&str; 8] = [
     "conversation",
+    "messages",
     "tools",
     "add_generation_prompt",
     "padding",
@@ -61,8 +63,8 @@ pub(crate) fn render(
     for (key, value) in defaults {
         kwargs.entry(key).or_insert_with(|| value.clone());
     }
-    // Kimi's `apply_chat_template` takes these as its own arguments: SGLang
-    // truncates or pads the ids, or fails on a duplicate argument.
+    // Kimi's `apply_chat_template` and `build_chat_segments` take these as their
+    // own arguments: SGLang truncates or pads the ids, or fails on a duplicate argument.
     if TOKENIZER_ARGS.iter().any(|arg| kwargs.contains_key(*arg)) {
         return Err(
             "Kimi K3 tokenizer arguments in chat_template_kwargs render on the engine".into(),
@@ -111,18 +113,33 @@ pub(crate) fn render(
         _ => None,
     };
     // `_effective_tools`: the request's and system turns' declarations.
-    if (tools.is_some() || messages.iter().any(|m| m.get("tools").is_some()))
-        && matches!(request["tool_choice"].as_str(), Some("required" | "none"))
+    let has_tools = tools.is_some() || messages.iter().any(|m| m.get("tools").is_some());
+    // `_validate_request` rejects a required choice without tools.
+    if !has_tools
+        && request["tool_choice"]
+            .as_str()
+            .is_some_and(|choice| choice.eq_ignore_ascii_case("required"))
     {
+        return Err("tool_choice required needs tools".into());
+    }
+    if has_tools && matches!(request["tool_choice"].as_str(), Some("required" | "none")) {
         kwargs
             .entry("tool_choice")
             .or_insert_with(|| request["tool_choice"].clone());
+    }
+    let request_format = response_format_dump(&request["response_format"]);
+    // `_validate_request` rejects a `json_schema` format without a schema.
+    if request_format
+        .as_ref()
+        .is_some_and(|f| f["type"] == "json_schema" && f["json_schema"]["schema"].is_null())
+    {
+        return Err("json_schema response format requires a schema".into());
     }
     // The encoder also takes a bare type name.
     let mut response_format = match kwargs.get("response_format") {
         Some(Value::String(kind)) => Some(json!({ "type": kind })),
         Some(format) => Some(format.clone()),
-        None => response_format_dump(&request["response_format"]),
+        None => request_format,
     };
     if let (Some(format), Some(schema)) = (
         response_format.as_mut().and_then(Value::as_object_mut),
@@ -225,8 +242,8 @@ fn prints_unlike_python(value: &Value) -> bool {
     }
 }
 
-/// `Tool.model_dump(exclude_unset=True)`: the fields the client set, coerced.
-/// The encoder sorts the keys.
+/// `Tool.model_dump(exclude_unset=True)`: the fields the client set, coerced,
+/// after `_validate_request` normalizes the schema types. The encoder sorts the keys.
 fn tool_dump(tool: &Value) -> Result<Value, String> {
     let f = &tool["function"];
     f["name"].as_str().ok_or("tool function requires name")?;
@@ -234,6 +251,9 @@ fn tool_dump(tool: &Value) -> Result<Value, String> {
         .into_iter()
         .filter_map(|key| Some((key.into(), f.get(key)?.clone())))
         .collect();
+    if let Some(parameters) = function.get_mut("parameters") {
+        normalize_json_schema_types(parameters);
+    }
     if let Some(strict) = f.get("strict") {
         function.insert("strict".into(), pydantic_bool(strict)?.into());
     }
