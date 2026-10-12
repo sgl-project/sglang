@@ -3811,7 +3811,7 @@ class Scheduler(
                 decoding_batch.join(new_batch)
                 decoding_batch.rows.hisparse_coordinator = self.hisparse_coordinator
 
-        # A step without prefill rows is the DP extend view of a decode step:
+        # A step without prefill rows is a decode step, or its DP extend view:
         # its rows are the running rows, and the leave below drops the finished.
         if not self.enable_hisparse and last_batch and last_batch.has_prefill_rows():
             if last_batch.chunked_req is not None:
