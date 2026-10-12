@@ -1,7 +1,9 @@
 """Small fixtures around production boundaries; no parallel layout recipes."""
 
 from types import SimpleNamespace
+from unittest import mock
 
+from sglang.srt.layers.layer_boundary import factories
 from sglang.srt.layers.layer_boundary.construction import StagePlan
 from sglang.srt.layers.layer_boundary.factories import (
     append_stages,
@@ -21,15 +23,19 @@ def build_stages(*stages, previous=None, terminal=False):
         *stages: Items of (declaration, norm) or (declaration, norm, options),
             as for append_stages.
         previous: Declaration of the stage before the first one, standing for
-            a layer the test does not build; None starts the stack.
+            a layer on the same rank that the test does not build; None starts
+            the stack.
         terminal: Whether the last stage ends the model's layer stack;
-            otherwise the next layer's attention follows it.
+            otherwise the next layer's attention follows it on the same rank.
     """
-    with layer_stack(
-        previous_layers=(
-            [lambda: append_stages((previous, None))] if previous is not None else []
+    # The stack's neighbours are layers another pipeline rank holds; here
+    # they stand for this rank's, so nothing is handed off to them.
+    with (
+        mock.patch.object(factories, "_handed_off", lambda declaration: declaration),
+        layer_stack(
+            previous_layers=[lambda: (previous,)] if previous is not None else [],
+            next_layers=[] if terminal else [lambda: (declare_attn(),)],
         ),
-        next_layers=[] if terminal else [lambda: append_stages((declare_attn(), None))],
     ):
         return append_stages(*stages)
 
@@ -83,8 +89,10 @@ def stub_plan():
     plan.fusions = None
     plan._publish_lora_layout = False
     plan._next_input_rows = None
+    plan._unpadded_attn_tp_size = None
     plan.paths = {}
     plan.enters_stack = False
+    plan.finishes_directly = False
     return plan
 
 
