@@ -165,6 +165,24 @@ class ExtendHashTest(unittest.TestCase):
             a["commit_history"][:-1], b["commit_history"][:-1], rtol=0, atol=0
         )
 
+    def test_batch_shapes_reuse_compiled_kernels(self):
+        # Batch size and token count must stay runtime arguments: a constexpr would
+        # compile and device-load a new specialization for every new prefill shape
+        # while serving, where the load can hit CUDA OOM. Shapes avoid Triton's
+        # == 1 and % 16 == 0 integer specializations so the keys must all match.
+        def num_compiled(fn):
+            return sum(len(cache[0]) for cache in fn.device_caches.values())
+
+        kernels = (
+            kernel._engram_hash_kernel,
+            kernel._engram_commit_extend_history_kernel,
+        )
+        kernel.engram_hash_extend_and_commit(**fixture([3, 4]))
+        before = [num_compiled(fn) for fn in kernels]
+        for lengths in ([2, 5, 6], [3, 9, 2, 5, 4], [7, 2, 11, 3, 5, 9, 6]):
+            kernel.engram_hash_extend_and_commit(**fixture(lengths))
+        self.assertEqual([num_compiled(fn) for fn in kernels], before)
+
 
 if __name__ == "__main__":
     unittest.main()

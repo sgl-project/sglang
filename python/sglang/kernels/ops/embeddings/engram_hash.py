@@ -98,6 +98,8 @@ def _engram_hash_kernel(
     out_ptr,
     num_tokens,
     num_real,
+    extend_bs,
+    search_steps,
     pad_id,
     image_token_id,
     mm_pad_shift,
@@ -111,8 +113,7 @@ def _engram_hash_kernel(
     L: tl.constexpr,
     H: tl.constexpr,
     BLOCK_T: tl.constexpr,
-    EXTEND_BS: tl.constexpr = 0,
-    SEARCH_STEPS: tl.constexpr = 0,
+    ROWS_FROM_STARTS: tl.constexpr = False,
 ):
     COLS: tl.constexpr = (N - 1) * H
     t = tl.program_id(0) * BLOCK_T + tl.arange(0, BLOCK_T)
@@ -126,19 +127,20 @@ def _engram_hash_kernel(
         r = (t // BLOCK).to(tl.int64)
         off = t - (t // BLOCK) * BLOCK
     else:
-        if EXTEND_BS == 1:
-            r = tl.full((BLOCK_T,), 0, tl.int64)
-        elif EXTEND_BS > 1:
+        if ROWS_FROM_STARTS:
             # Upper bound handles adjacent starts from zero-length requests.
             # Resolve rows in registers instead of materializing repeat_interleave.
-            lo = tl.full((BLOCK_T,), 0, tl.int32)
-            hi = tl.full((BLOCK_T,), EXTEND_BS, tl.int32)
-            for _ in tl.static_range(SEARCH_STEPS):
+            # The batch size and step count are runtime values: as constexprs every
+            # new batch size would compile and device-load a fresh specialization
+            # mid-serving.
+            lo = tl.zeros((BLOCK_T,), tl.int32)
+            hi = tl.zeros((BLOCK_T,), tl.int32) + extend_bs
+            for _ in range(search_steps):
                 mid = (lo + hi) // 2
                 start = tl.load(
-                    starts_ptr + mid, mask=real & (mid < EXTEND_BS), other=0
+                    starts_ptr + mid, mask=real & (mid < extend_bs), other=0
                 )
-                right = (mid < EXTEND_BS) & (start <= t)
+                right = (mid < extend_bs) & (start <= t)
                 lo = tl.where(right, mid + 1, lo)
                 hi = tl.where(right, hi, mid)
             r = tl.maximum(lo - 1, 0).to(tl.int64)
@@ -267,6 +269,8 @@ def _launch_hash_kernel(
         out,
         num_tokens,
         num_real,
+        extend_bs,
+        extend_bs.bit_length(),
         pad_id,
         image_token_id if image_token_id is not None else -1,
         mm_pad_shift,
@@ -280,8 +284,7 @@ def _launch_hash_kernel(
         L=L,
         H=H,
         BLOCK_T=block_t,
-        EXTEND_BS=extend_bs,
-        SEARCH_STEPS=extend_bs.bit_length(),
+        ROWS_FROM_STARTS=extend_bs > 0,
         num_warps=4,
     )
     return out, tokens
@@ -295,14 +298,14 @@ def _engram_commit_extend_history_kernel(
     starts_ptr,
     lens_ptr,
     out_loc_ptr,
-    NUM_TOKENS: tl.constexpr,
+    num_tokens,
     N: tl.constexpr,
     HAS_OUT_LOC: tl.constexpr,
 ):
     r = tl.program_id(0)
     length = tl.load(lens_ptr + r)
     start = tl.load(starts_ptr + r)
-    last = tl.minimum(tl.maximum(start + length - 1, 0), NUM_TOKENS - 1)
+    last = tl.minimum(tl.maximum(start + length - 1, 0), num_tokens - 1)
     live = length > 0
     if HAS_OUT_LOC:
         live = live & (tl.load(out_loc_ptr + last) != 0)
@@ -378,7 +381,7 @@ def engram_hash_extend_and_commit(
             starts,
             lengths,
             out_cache_loc if out_cache_loc is not None else req_slots,
-            NUM_TOKENS=input_ids.numel(),
+            input_ids.numel(),
             N=multipliers.shape[1],
             HAS_OUT_LOC=out_cache_loc is not None,
             num_warps=4,
