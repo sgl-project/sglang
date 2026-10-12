@@ -67,34 +67,38 @@ class TestSDPAShardedHeads(CustomTestCase):
         probe = torch.empty(1, 3, 1025, 128, device="cuda", dtype=torch.bfloat16)
         if _impl(heads=3, global_num_heads=24)._unsplit_query_len(probe, 1025) == 1025:
             self.skipTest("too few SMs for these shapes to split")
-        for head_dim in (64, 128):
-            for seq_len in (1025, 1536, 4608):
-                query, key, value = _qkv(seq_len, head_dim)
-                expected = F.scaled_dot_product_attention(
-                    *(x.transpose(1, 2) for x in (query, key, value)),
-                    scale=head_dim**-0.5,
-                ).transpose(1, 2)
-                for local_heads in (24, 12, 6, 3):
-                    with self.subTest(
-                        head_dim=head_dim, seq_len=seq_len, local_heads=local_heads
-                    ):
-                        impl = _impl(
-                            heads=local_heads,
+        for dtype in (torch.float16, torch.bfloat16):
+            for head_dim in (64, 128, 256):
+                for seq_len in (1025, 1536, 4608):
+                    query, key, value = _qkv(seq_len, head_dim, dtype=dtype)
+                    expected = F.scaled_dot_product_attention(
+                        *(x.transpose(1, 2) for x in (query, key, value)),
+                        scale=head_dim**-0.5,
+                    ).transpose(1, 2)
+                    for local_heads in (24, 12, 6, 3):
+                        with self.subTest(
+                            dtype=dtype,
                             head_dim=head_dim,
-                            global_num_heads=_GLOBAL_HEADS,
-                        )
-                        actual = torch.cat(
-                            [
-                                impl.forward(q, k, v, None)
-                                for q, k, v in zip(
-                                    query.split(local_heads, dim=2),
-                                    key.split(local_heads, dim=2),
-                                    value.split(local_heads, dim=2),
-                                )
-                            ],
-                            dim=2,
-                        )
-                        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+                            seq_len=seq_len,
+                            local_heads=local_heads,
+                        ):
+                            impl = _impl(
+                                heads=local_heads,
+                                head_dim=head_dim,
+                                global_num_heads=_GLOBAL_HEADS,
+                            )
+                            actual = torch.cat(
+                                [
+                                    impl.forward(q, k, v, None)
+                                    for q, k, v in zip(
+                                        query.split(local_heads, dim=2),
+                                        key.split(local_heads, dim=2),
+                                        value.split(local_heads, dim=2),
+                                    )
+                                ],
+                                dim=2,
+                            )
+                            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
     def test_padding_only_when_the_shard_alone_would_split(self):
         query = torch.empty(1, 6, 1025, 128, device="cuda", dtype=torch.bfloat16)
