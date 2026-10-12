@@ -28,7 +28,7 @@ jobs:
           npu-smi info
 
       - name: Run test
-        timeout-minutes: 120
+        timeout-minutes: 600
         env:
           SGLANG_USE_MODELSCOPE: true
           HF_ENDPOINT: https://hf-mirror.com
@@ -41,7 +41,12 @@ jobs:
 
           # Test cases - 使用时替换为实际的测试用例路径
           test_cases=(
-            "test/registered/npu/basic_function/runtime_options/test_npu_disaggregation_pp.py"
+            #test_npu_deepep_low_latency_qwen3_480b.py
+            "test/registered/npu/accuracy/qwen3_5_397b/test_npu_qwen3_5_397b_8p_gpqa.py"
+            "test/registered/npu/accuracy/deepseek_v3_2/test_npu_deepseek_v3_2_8p_aime25.py"
+            "test/registered/npu/accuracy/minimax_m2_5/test_npu_minimax_m2_5_w8a8_8p_in3k5_out1k5_50ms_gpqa.py"
+
+            #"test/registered/npu/basic_function/runtime_options/test_npu_disaggregation_pp.py"
             #"test/registered/npu/accuracy/deepseek_v4_flash/test_npu_deepseek_v4_flash_w8a8_8p_gpqa.py"
             #"test/registered/npu/performance/qwen3_30b_a3b/test_npu_qwen3_30b_w8a8_1p_in3k5_out1k5_10ms.py"
             #"test/registered/npu/basic_function/test_npu_lora_hf_sgl_logprob_diff.py"
