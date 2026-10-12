@@ -2,7 +2,8 @@
 
 Drives every flat and pipeline loop a few iterations on a fake scheduler that
 logs each call it receives (with its arguments, rendered when the call is made),
-each write to a loop-owned attribute, and each change to the in-flight queue.
+each write to a loop-owned attribute, each change to the in-flight queue, and
+where each profiler label opens (``label{``) and closes (``}``).
 The expected logs were recorded on the hand-written loops; a change to a loop's
 call order fails here.
 """
@@ -54,6 +55,9 @@ _QUEUE_CHANGES = ("push", "pop_due", "drain", "end_step")
 
 
 _PREFETCH = "disagg_decode_prealloc_queue.prefetch_prefill_dp_rank_queries("
+# Entries that open an intake line; the ingest_requests call right after one
+# stays on its line.
+_INTAKE_OPENERS = (_PREFETCH, "recv_requests{")
 
 
 class _Stop(Exception):
@@ -166,16 +170,15 @@ def _values(values, default):
 
 def _lines(log):
     """One line per loop iteration or pipeline slot: split at each intake, or
-    at the prefetch before it, and at each slot's row binding."""
+    at the prefetch or profiler label before it, and at each slot's row
+    binding."""
     lines = []
     for entry in log:
-        prefetched = bool(lines) and lines[-1][-1].startswith(_PREFETCH)
-        starts = entry.startswith(_PREFETCH) or entry.startswith("decoding_batch=")
-        if (
-            not lines
-            or starts
-            or (entry.startswith("ingest_requests(") and not prefetched)
-        ):
+        opened = bool(lines) and lines[-1][-1].startswith(_INTAKE_OPENERS)
+        starts = entry.startswith(_INTAKE_OPENERS) or entry.startswith(
+            "decoding_batch="
+        )
+        if not lines or starts or (entry.startswith("ingest_requests(") and not opened):
             lines.append([])
         lines[-1].append(entry)
     return ["; ".join(line) for line in lines]
@@ -203,6 +206,20 @@ class _QueueLog:
             p.__exit__(*exc)
 
 
+class _ProfilerLabel:
+    """Stands in for torch.profiler.record_function and logs the label span."""
+
+    def __init__(self, log, label):
+        self.log = log
+        self.label = label
+
+    def __enter__(self):
+        self.log.append(self.label + "{")
+
+    def __exit__(self, *exc):
+        self.log.append("}")
+
+
 class _LoopOrderCase(CustomTestCase):
     maxDiff = None
 
@@ -212,6 +229,13 @@ class _LoopOrderCase(CustomTestCase):
         enter_scope(self, envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(1))
         self.log = []
         enter_scope(self, _QueueLog(self.log))
+        enter_scope(
+            self,
+            patch(
+                "torch.profiler.record_function",
+                lambda label: _ProfilerLabel(self.log, label),
+            ),
+        )
 
     def run_loop(self, loop, s):
         try:
@@ -272,6 +296,23 @@ class TestFlatLoopOrder(_LoopOrderCase):
             with self.subTest(name):
                 s = self.flat_scheduler([A, B], paused=(), n=3)
                 s.is_generation = False
+                s._is_continuous_input_polling_enabled.return_value = False
+                self.check(name, self.run_loop(loop, s))
+
+    def test_pd_prefill_without_staging(self):
+        for name, loop in (
+            (
+                "pd_prefill_normal_no_staging",
+                Scheduler.event_loop_normal_disagg_prefill,
+            ),
+            (
+                "pd_prefill_overlap_no_staging",
+                Scheduler.event_loop_overlap_disagg_prefill,
+            ),
+        ):
+            with self.subTest(name):
+                s = self.flat_scheduler([A, B], paused=(), n=3)
+                s.enable_staging = False
                 s._is_continuous_input_polling_enabled.return_value = False
                 self.check(name, self.run_loop(loop, s))
 
@@ -455,6 +496,25 @@ class TestRingLoopOrder(_LoopOrderCase):
                     name, Scheduler.event_loop_pp_disagg_decode, s, 2, depth, offload
                 )
 
+    def test_pp_disagg_decode_idle_with_queued_requests(self):
+        # A queued or offloading request keeps the idle rounds from on_idle.
+        for name, offload in (("pdd_queued", False), ("pdd_offloading", True)):
+            with self.subTest(name):
+                s = self.ring_scheduler([_B("A", ForwardMode.DECODE)], 2, False)
+                for method in (
+                    "_pp_pd_get_retract_ids",
+                    "_pp_pd_get_prealloc_ids",
+                    "_pp_pd_get_decode_transferred_ids",
+                ):
+                    getattr(s, method).return_value = None
+                if offload:
+                    s.decode_offload_manager.ongoing_offload = [object()]
+                else:
+                    s.disagg_decode_transfer_queue.queue = [object()]
+                self.run_ring(
+                    name, Scheduler.event_loop_pp_disagg_decode, s, 2, 0, offload
+                )
+
 
 # Recorded on the hand-written loops; never edit to make a change pass.
 GOLDEN = {
@@ -531,6 +591,13 @@ ingest_requests(); disagg_prefill_bootstrap_queue.pop_bootstrapped(); waiting_qu
 ingest_requests(); disagg_prefill_bootstrap_queue.pop_bootstrapped(); waiting_queue.extend([]); get_next_disagg_prefill_batch_to_run(decoding_batch=decoding_batch,last_batch=None); ngram_embedding_manager.prepare_for_forward(None,chunked_req=None); cur_batch_for_debug=None; _sched_idled=True; on_idle(); process_disagg_prefill_inflight_queue(); last_batch=None; iq.end_step(None); _debug_check_last_launched()
 ingest_requests()
 """,
+    "pd_prefill_normal_no_staging": """
+inflight_steps=IQ(0,True,False)
+ingest_requests(); disagg_prefill_bootstrap_queue.pop_bootstrapped(); waiting_queue.extend([]); get_next_disagg_prefill_batch_to_run(decoding_batch=decoding_batch,last_batch=None); ngram_embedding_manager.prepare_for_forward(A,chunked_req=None); cur_batch_for_debug=A; run_batch(A); iq.push(A,rA); _commit_due_step(); iq.pop_due(); process_batch_result(A,rA); process_disagg_prefill_inflight_queue(); last_batch=A; iq.end_step(A); _debug_check_last_launched()
+ingest_requests(); disagg_prefill_bootstrap_queue.pop_bootstrapped(); waiting_queue.extend([]); get_next_disagg_prefill_batch_to_run(decoding_batch=decoding_batch,last_batch=A); ngram_embedding_manager.prepare_for_forward(B,chunked_req=None); cur_batch_for_debug=B; run_batch(B); iq.push(B,rB); _commit_due_step(); iq.pop_due(); process_batch_result(B,rB); process_disagg_prefill_inflight_queue(); last_batch=B; iq.end_step(B); _debug_check_last_launched()
+ingest_requests(); disagg_prefill_bootstrap_queue.pop_bootstrapped(); waiting_queue.extend([]); get_next_disagg_prefill_batch_to_run(decoding_batch=decoding_batch,last_batch=B); ngram_embedding_manager.prepare_for_forward(None,chunked_req=None); cur_batch_for_debug=None; _sched_idled=True; on_idle(); process_disagg_prefill_inflight_queue(); last_batch=None; iq.end_step(None); _debug_check_last_launched()
+ingest_requests()
+""",
     "pd_prefill_overlap": """
 _is_continuous_input_polling_enabled(); enable_continuous_input_polling=False; inflight_steps=IQ(1,True,False)
 ingest_requests(stop_at_pause=False); disagg_prefill_bootstrap_queue.pop_bootstrapped(); waiting_queue.extend([]); get_next_disagg_prefill_batch_to_run(decoding_batch=decoding_batch,last_batch=None,should_retry_storage_prefetch=True); ngram_embedding_manager.prepare_for_forward(A,chunked_req=None); cur_batch_for_debug=A; maybe_prefetch_staging_for_batch(A); run_batch(A); _apply_war_barrier(); iq.push(Ac,rA); _debug_check_commit_gate(False); process_disagg_prefill_inflight_queue(); launch_batch_sample_if_needed(rA,A); _sched_idled=False; last_batch=A; iq.end_step(A); _debug_check_last_launched()
@@ -547,6 +614,13 @@ ingest_requests(stop_at_pause=False)
 _is_continuous_input_polling_enabled(); enable_continuous_input_polling=False; inflight_steps=IQ(1,True,False)
 ingest_requests(stop_at_pause=False); disagg_prefill_bootstrap_queue.pop_bootstrapped(); waiting_queue.extend([]); get_next_disagg_prefill_batch_to_run(decoding_batch=decoding_batch,last_batch=None,should_retry_storage_prefetch=True); ngram_embedding_manager.prepare_for_forward(A,chunked_req=None); cur_batch_for_debug=A; maybe_prefetch_staging_for_batch(A); run_batch(A); _apply_war_barrier(); iq.push(Ac,rA); _debug_check_commit_gate(False); process_disagg_prefill_inflight_queue(); launch_batch_sample_if_needed(rA,A); _sched_idled=False; last_batch=A; iq.end_step(A); _debug_check_last_launched()
 ingest_requests(stop_at_pause=False); disagg_prefill_bootstrap_queue.pop_bootstrapped(); waiting_queue.extend([]); get_next_disagg_prefill_batch_to_run(decoding_batch=decoding_batch,last_batch=A,should_retry_storage_prefetch=True); ngram_embedding_manager.prepare_for_forward(B,chunked_req=None); cur_batch_for_debug=B; maybe_prefetch_staging_for_batch(B); run_batch(B); _apply_war_barrier(); iq.push(Bc,rB); _debug_check_commit_gate(True); _commit_due_step(); iq.pop_due(); process_batch_result(Ac,rA); process_disagg_prefill_inflight_queue(); launch_batch_sample_if_needed(rB,B); _sched_idled=False; last_batch=B; iq.end_step(B); _debug_check_last_launched()
+ingest_requests(stop_at_pause=False); disagg_prefill_bootstrap_queue.pop_bootstrapped(); waiting_queue.extend([]); get_next_disagg_prefill_batch_to_run(decoding_batch=decoding_batch,last_batch=B,should_retry_storage_prefetch=True); ngram_embedding_manager.prepare_for_forward(None,chunked_req=None); cur_batch_for_debug=None; _debug_check_commit_gate(True); _commit_due_step(); iq.pop_due(); process_batch_result(Bc,rB); process_disagg_prefill_inflight_queue(); launch_batch_sample_if_needed(None,None); _sched_idled=True; last_batch=None; iq.end_step(None); _debug_check_last_launched()
+ingest_requests(stop_at_pause=False)
+""",
+    "pd_prefill_overlap_no_staging": """
+_is_continuous_input_polling_enabled(); enable_continuous_input_polling=False; inflight_steps=IQ(1,True,False)
+ingest_requests(stop_at_pause=False); disagg_prefill_bootstrap_queue.pop_bootstrapped(); waiting_queue.extend([]); get_next_disagg_prefill_batch_to_run(decoding_batch=decoding_batch,last_batch=None,should_retry_storage_prefetch=True); ngram_embedding_manager.prepare_for_forward(A,chunked_req=None); cur_batch_for_debug=A; run_batch(A); _apply_war_barrier(); iq.push(Ac,rA); _debug_check_commit_gate(False); process_disagg_prefill_inflight_queue(); launch_batch_sample_if_needed(rA,A); _sched_idled=False; last_batch=A; iq.end_step(A); _debug_check_last_launched()
+ingest_requests(stop_at_pause=False); disagg_prefill_bootstrap_queue.pop_bootstrapped(); waiting_queue.extend([]); get_next_disagg_prefill_batch_to_run(decoding_batch=decoding_batch,last_batch=A,should_retry_storage_prefetch=True); ngram_embedding_manager.prepare_for_forward(B,chunked_req=None); cur_batch_for_debug=B; run_batch(B); _apply_war_barrier(); iq.push(Bc,rB); _debug_check_commit_gate(True); _commit_due_step(); iq.pop_due(); process_batch_result(Ac,rA); process_disagg_prefill_inflight_queue(); launch_batch_sample_if_needed(rB,B); _sched_idled=False; last_batch=B; iq.end_step(B); _debug_check_last_launched()
 ingest_requests(stop_at_pause=False); disagg_prefill_bootstrap_queue.pop_bootstrapped(); waiting_queue.extend([]); get_next_disagg_prefill_batch_to_run(decoding_batch=decoding_batch,last_batch=B,should_retry_storage_prefetch=True); ngram_embedding_manager.prepare_for_forward(None,chunked_req=None); cur_batch_for_debug=None; _debug_check_commit_gate(True); _commit_due_step(); iq.pop_due(); process_batch_result(Bc,rB); process_disagg_prefill_inflight_queue(); launch_batch_sample_if_needed(None,None); _sched_idled=True; last_batch=None; iq.end_step(None); _debug_check_last_launched()
 ingest_requests(stop_at_pause=False)
 """,
@@ -621,6 +695,40 @@ ingest_requests(); _pp_pd_get_retract_ids(2); _pp_commit_comm_work([]); _pp_pd_g
 decoding_batch=db0; _pp_slot_last_batch(0); last_batch=None
 ingest_requests()
 """,
+    "pdd_offloading": """
+init_pp_loop_state(); inflight_steps=IQ(1,True,True); pp_outputs=None; send_req_work=[]
+decoding_batch=db0; _pp_slot_last_batch(0); last_batch=None
+ingest_requests(); _pp_commit_comm_work([]); _pp_pd_get_retract_ids(0); _pp_commit_comm_work([]); _pp_pd_get_prealloc_ids(); _pp_commit_comm_work([]); _pp_pd_get_decode_transferred_ids(); _pp_commit_comm_work([]); get_next_disagg_decode_batch_to_run(decoding_batch=db0); _pp_debug_check_slot(0); iq.push(A,None); cur_batch_for_debug=A; _pp_recv_proxy_tensors(); _pp_commit_proxy_send_work(); _pp_launch_batch(0,A,proxy,[None,None],lrcq); launch_event=evA; _pp_commit_send_output_work_and_preprocess_output_tensors(0,1); _pp_pd_send_consensus_bootstrapped_ids([None,None],0,None,None); _pp_pd_send_consensus_bootstrapped_ids([None,None],0,None,None); _pp_pd_send_consensus_release_ids([None,None],0,None,None); decode_offload_manager.check_offload_progress(); _pp_commit_comm_work(conswork); _pp_commit_comm_work(conswork); _pp_commit_comm_work(relwork); _pp_pop_due_batch(); _pp_send_pyobj_to_next_stage([],async_send=True); send_req_work=work:[]; _pp_send_pyobj_to_next_stage(None,async_send=True); _pp_send_pyobj_to_next_stage(None,async_send=True); _pp_send_pyobj_to_next_stage(None,async_send=True); _pp_send_proxy_to_next_stage(resA); pp_outputs=out1; iq.end_step(A)
+decoding_batch=db1; _pp_slot_last_batch(1); last_batch=None
+ingest_requests(); _pp_commit_comm_work(work:[]); _pp_pd_get_retract_ids(1); _pp_commit_comm_work(work:None); _pp_pd_get_prealloc_ids(); _pp_commit_comm_work(work:None); _pp_pd_get_decode_transferred_ids(); _pp_commit_comm_work(work:None); get_next_disagg_decode_batch_to_run(decoding_batch=db1); _pp_debug_check_slot(1); iq.push(None,None); cur_batch_for_debug=None; _pp_commit_proxy_send_work(); _pp_commit_send_output_work_and_preprocess_output_tensors(1,0); _pp_pd_send_consensus_bootstrapped_ids([None,None],1,None,None); _pp_pd_send_consensus_bootstrapped_ids([None,None],1,None,None); _pp_pd_send_consensus_release_ids([None,None],1,None,None); decode_offload_manager.check_offload_progress(); _pp_commit_comm_work(conswork); _pp_commit_comm_work(conswork); _pp_commit_comm_work(relwork); _pp_pop_due_batch(); iq.pop_due(); d2h_event.synchronize(); _pp_process_batch_result(A,nres0); _pp_update_rows_at_commit(0,A); _pp_send_pyobj_to_next_stage([],async_send=True); send_req_work=work:[]; _pp_send_pyobj_to_next_stage(None,async_send=True); _pp_send_pyobj_to_next_stage(None,async_send=True); _pp_send_pyobj_to_next_stage(None,async_send=True); pp_outputs=out0; iq.end_step(None)
+decoding_batch=db0; _pp_slot_last_batch(0); last_batch=A
+ingest_requests(); _pp_commit_comm_work(work:[]); _pp_pd_get_retract_ids(0); _pp_commit_comm_work(work:None); _pp_pd_get_prealloc_ids(); _pp_commit_comm_work(work:None); _pp_pd_get_decode_transferred_ids(); _pp_commit_comm_work(work:None); get_next_disagg_decode_batch_to_run(decoding_batch=db0); _pp_debug_check_slot(0); iq.push(None,None); cur_batch_for_debug=None; _pp_commit_proxy_send_work(); _pp_commit_send_output_work_and_preprocess_output_tensors(0,1); _pp_pd_send_consensus_bootstrapped_ids([None,None],0,None,None); _pp_pd_send_consensus_bootstrapped_ids([None,None],0,None,None); _pp_pd_send_consensus_release_ids([None,None],0,None,None); decode_offload_manager.check_offload_progress(); _pp_commit_comm_work(conswork); _pp_commit_comm_work(conswork); _pp_commit_comm_work(relwork); _pp_pop_due_batch(); iq.pop_due(); _pp_send_pyobj_to_next_stage([],async_send=True); send_req_work=work:[]; _pp_send_pyobj_to_next_stage(None,async_send=True); _pp_send_pyobj_to_next_stage(None,async_send=True); _pp_send_pyobj_to_next_stage(None,async_send=True); pp_outputs=out1; iq.end_step(None)
+decoding_batch=db1; _pp_slot_last_batch(1); last_batch=None
+ingest_requests(); _pp_commit_comm_work(work:[]); _pp_pd_get_retract_ids(1); _pp_commit_comm_work(work:None); _pp_pd_get_prealloc_ids(); _pp_commit_comm_work(work:None); _pp_pd_get_decode_transferred_ids(); _pp_commit_comm_work(work:None); get_next_disagg_decode_batch_to_run(decoding_batch=db1); _pp_debug_check_slot(1); iq.push(None,None); cur_batch_for_debug=None; _pp_commit_proxy_send_work(); _pp_commit_send_output_work_and_preprocess_output_tensors(1,0); _pp_pd_send_consensus_bootstrapped_ids([None,None],1,None,None); _pp_pd_send_consensus_bootstrapped_ids([None,None],1,None,None); _pp_pd_send_consensus_release_ids([None,None],1,None,None); decode_offload_manager.check_offload_progress(); _pp_commit_comm_work(conswork); _pp_commit_comm_work(conswork); _pp_commit_comm_work(relwork); _pp_pop_due_batch(); iq.pop_due(); _pp_send_pyobj_to_next_stage([],async_send=True); send_req_work=work:[]; _pp_send_pyobj_to_next_stage(None,async_send=True); _pp_send_pyobj_to_next_stage(None,async_send=True); _pp_send_pyobj_to_next_stage(None,async_send=True); pp_outputs=out0; iq.end_step(None); _sched_idled=True
+decoding_batch=db0; _pp_slot_last_batch(0); last_batch=None
+ingest_requests(); _pp_commit_comm_work(work:[]); _pp_pd_get_retract_ids(0); _pp_commit_comm_work(work:None); _pp_pd_get_prealloc_ids(); _pp_commit_comm_work(work:None); _pp_pd_get_decode_transferred_ids(); _pp_commit_comm_work(work:None); get_next_disagg_decode_batch_to_run(decoding_batch=db0); _pp_debug_check_slot(0); iq.push(None,None); cur_batch_for_debug=None; _pp_commit_proxy_send_work(); _pp_commit_send_output_work_and_preprocess_output_tensors(0,1); _pp_pd_send_consensus_bootstrapped_ids([None,None],0,None,None); _pp_pd_send_consensus_bootstrapped_ids([None,None],0,None,None); _pp_pd_send_consensus_release_ids([None,None],0,None,None); decode_offload_manager.check_offload_progress(); _pp_commit_comm_work(conswork); _pp_commit_comm_work(conswork); _pp_commit_comm_work(relwork); _pp_pop_due_batch(); iq.pop_due(); _pp_send_pyobj_to_next_stage([],async_send=True); send_req_work=work:[]; _pp_send_pyobj_to_next_stage(None,async_send=True); _pp_send_pyobj_to_next_stage(None,async_send=True); _pp_send_pyobj_to_next_stage(None,async_send=True); pp_outputs=out1; iq.end_step(None)
+decoding_batch=db1; _pp_slot_last_batch(1); last_batch=None
+ingest_requests(); _pp_commit_comm_work(work:[]); _pp_pd_get_retract_ids(1); _pp_commit_comm_work(work:None); _pp_pd_get_prealloc_ids(); _pp_commit_comm_work(work:None); _pp_pd_get_decode_transferred_ids(); _pp_commit_comm_work(work:None); get_next_disagg_decode_batch_to_run(decoding_batch=db1); _pp_debug_check_slot(1); iq.push(None,None); cur_batch_for_debug=None; _pp_commit_proxy_send_work(); _pp_commit_send_output_work_and_preprocess_output_tensors(1,0); _pp_pd_send_consensus_bootstrapped_ids([None,None],1,None,None); _pp_pd_send_consensus_bootstrapped_ids([None,None],1,None,None); _pp_pd_send_consensus_release_ids([None,None],1,None,None); decode_offload_manager.check_offload_progress(); _pp_commit_comm_work(conswork); _pp_commit_comm_work(conswork); _pp_commit_comm_work(relwork); _pp_pop_due_batch(); iq.pop_due(); _pp_send_pyobj_to_next_stage([],async_send=True); send_req_work=work:[]; _pp_send_pyobj_to_next_stage(None,async_send=True); _pp_send_pyobj_to_next_stage(None,async_send=True); _pp_send_pyobj_to_next_stage(None,async_send=True); pp_outputs=out0; iq.end_step(None); _sched_idled=True
+decoding_batch=db0; _pp_slot_last_batch(0); last_batch=None
+ingest_requests()
+""",
+    "pdd_queued": """
+init_pp_loop_state(); inflight_steps=IQ(1,True,True); pp_outputs=None; send_req_work=[]
+decoding_batch=db0; _pp_slot_last_batch(0); last_batch=None
+ingest_requests(); _pp_commit_comm_work([]); _pp_pd_get_retract_ids(0); _pp_commit_comm_work([]); _pp_pd_get_prealloc_ids(); _pp_commit_comm_work([]); _pp_pd_get_decode_transferred_ids(); _pp_commit_comm_work([]); get_next_disagg_decode_batch_to_run(decoding_batch=db0); _pp_debug_check_slot(0); iq.push(A,None); cur_batch_for_debug=A; _pp_recv_proxy_tensors(); _pp_commit_proxy_send_work(); _pp_launch_batch(0,A,proxy,[None,None],lrcq); launch_event=evA; _pp_commit_send_output_work_and_preprocess_output_tensors(0,1); _pp_pd_send_consensus_bootstrapped_ids([None,None],0,None,None); _pp_pd_send_consensus_bootstrapped_ids([None,None],0,None,None); _pp_pd_send_consensus_release_ids([None,None],0,None,None); _pp_commit_comm_work(conswork); _pp_commit_comm_work(conswork); _pp_commit_comm_work(relwork); _pp_pop_due_batch(); _pp_send_pyobj_to_next_stage([],async_send=True); send_req_work=work:[]; _pp_send_pyobj_to_next_stage(None,async_send=True); _pp_send_pyobj_to_next_stage(None,async_send=True); _pp_send_pyobj_to_next_stage(None,async_send=True); _pp_send_proxy_to_next_stage(resA); pp_outputs=out1; iq.end_step(A)
+decoding_batch=db1; _pp_slot_last_batch(1); last_batch=None
+ingest_requests(); _pp_commit_comm_work(work:[]); _pp_pd_get_retract_ids(1); _pp_commit_comm_work(work:None); _pp_pd_get_prealloc_ids(); _pp_commit_comm_work(work:None); _pp_pd_get_decode_transferred_ids(); _pp_commit_comm_work(work:None); get_next_disagg_decode_batch_to_run(decoding_batch=db1); _pp_debug_check_slot(1); iq.push(None,None); cur_batch_for_debug=None; _pp_commit_proxy_send_work(); _pp_commit_send_output_work_and_preprocess_output_tensors(1,0); _pp_pd_send_consensus_bootstrapped_ids([None,None],1,None,None); _pp_pd_send_consensus_bootstrapped_ids([None,None],1,None,None); _pp_pd_send_consensus_release_ids([None,None],1,None,None); _pp_commit_comm_work(conswork); _pp_commit_comm_work(conswork); _pp_commit_comm_work(relwork); _pp_pop_due_batch(); iq.pop_due(); d2h_event.synchronize(); _pp_process_batch_result(A,nres0); _pp_update_rows_at_commit(0,A); _pp_send_pyobj_to_next_stage([],async_send=True); send_req_work=work:[]; _pp_send_pyobj_to_next_stage(None,async_send=True); _pp_send_pyobj_to_next_stage(None,async_send=True); _pp_send_pyobj_to_next_stage(None,async_send=True); pp_outputs=out0; iq.end_step(None)
+decoding_batch=db0; _pp_slot_last_batch(0); last_batch=A
+ingest_requests(); _pp_commit_comm_work(work:[]); _pp_pd_get_retract_ids(0); _pp_commit_comm_work(work:None); _pp_pd_get_prealloc_ids(); _pp_commit_comm_work(work:None); _pp_pd_get_decode_transferred_ids(); _pp_commit_comm_work(work:None); get_next_disagg_decode_batch_to_run(decoding_batch=db0); _pp_debug_check_slot(0); iq.push(None,None); cur_batch_for_debug=None; _pp_commit_proxy_send_work(); _pp_commit_send_output_work_and_preprocess_output_tensors(0,1); _pp_pd_send_consensus_bootstrapped_ids([None,None],0,None,None); _pp_pd_send_consensus_bootstrapped_ids([None,None],0,None,None); _pp_pd_send_consensus_release_ids([None,None],0,None,None); _pp_commit_comm_work(conswork); _pp_commit_comm_work(conswork); _pp_commit_comm_work(relwork); _pp_pop_due_batch(); iq.pop_due(); _pp_send_pyobj_to_next_stage([],async_send=True); send_req_work=work:[]; _pp_send_pyobj_to_next_stage(None,async_send=True); _pp_send_pyobj_to_next_stage(None,async_send=True); _pp_send_pyobj_to_next_stage(None,async_send=True); pp_outputs=out1; iq.end_step(None)
+decoding_batch=db1; _pp_slot_last_batch(1); last_batch=None
+ingest_requests(); _pp_commit_comm_work(work:[]); _pp_pd_get_retract_ids(1); _pp_commit_comm_work(work:None); _pp_pd_get_prealloc_ids(); _pp_commit_comm_work(work:None); _pp_pd_get_decode_transferred_ids(); _pp_commit_comm_work(work:None); get_next_disagg_decode_batch_to_run(decoding_batch=db1); _pp_debug_check_slot(1); iq.push(None,None); cur_batch_for_debug=None; _pp_commit_proxy_send_work(); _pp_commit_send_output_work_and_preprocess_output_tensors(1,0); _pp_pd_send_consensus_bootstrapped_ids([None,None],1,None,None); _pp_pd_send_consensus_bootstrapped_ids([None,None],1,None,None); _pp_pd_send_consensus_release_ids([None,None],1,None,None); _pp_commit_comm_work(conswork); _pp_commit_comm_work(conswork); _pp_commit_comm_work(relwork); _pp_pop_due_batch(); iq.pop_due(); _pp_send_pyobj_to_next_stage([],async_send=True); send_req_work=work:[]; _pp_send_pyobj_to_next_stage(None,async_send=True); _pp_send_pyobj_to_next_stage(None,async_send=True); _pp_send_pyobj_to_next_stage(None,async_send=True); pp_outputs=out0; iq.end_step(None); _sched_idled=True
+decoding_batch=db0; _pp_slot_last_batch(0); last_batch=None
+ingest_requests(); _pp_commit_comm_work(work:[]); _pp_pd_get_retract_ids(0); _pp_commit_comm_work(work:None); _pp_pd_get_prealloc_ids(); _pp_commit_comm_work(work:None); _pp_pd_get_decode_transferred_ids(); _pp_commit_comm_work(work:None); get_next_disagg_decode_batch_to_run(decoding_batch=db0); _pp_debug_check_slot(0); iq.push(None,None); cur_batch_for_debug=None; _pp_commit_proxy_send_work(); _pp_commit_send_output_work_and_preprocess_output_tensors(0,1); _pp_pd_send_consensus_bootstrapped_ids([None,None],0,None,None); _pp_pd_send_consensus_bootstrapped_ids([None,None],0,None,None); _pp_pd_send_consensus_release_ids([None,None],0,None,None); _pp_commit_comm_work(conswork); _pp_commit_comm_work(conswork); _pp_commit_comm_work(relwork); _pp_pop_due_batch(); iq.pop_due(); _pp_send_pyobj_to_next_stage([],async_send=True); send_req_work=work:[]; _pp_send_pyobj_to_next_stage(None,async_send=True); _pp_send_pyobj_to_next_stage(None,async_send=True); _pp_send_pyobj_to_next_stage(None,async_send=True); pp_outputs=out1; iq.end_step(None)
+decoding_batch=db1; _pp_slot_last_batch(1); last_batch=None
+ingest_requests(); _pp_commit_comm_work(work:[]); _pp_pd_get_retract_ids(1); _pp_commit_comm_work(work:None); _pp_pd_get_prealloc_ids(); _pp_commit_comm_work(work:None); _pp_pd_get_decode_transferred_ids(); _pp_commit_comm_work(work:None); get_next_disagg_decode_batch_to_run(decoding_batch=db1); _pp_debug_check_slot(1); iq.push(None,None); cur_batch_for_debug=None; _pp_commit_proxy_send_work(); _pp_commit_send_output_work_and_preprocess_output_tensors(1,0); _pp_pd_send_consensus_bootstrapped_ids([None,None],1,None,None); _pp_pd_send_consensus_bootstrapped_ids([None,None],1,None,None); _pp_pd_send_consensus_release_ids([None,None],1,None,None); _pp_commit_comm_work(conswork); _pp_commit_comm_work(conswork); _pp_commit_comm_work(relwork); _pp_pop_due_batch(); iq.pop_due(); _pp_send_pyobj_to_next_stage([],async_send=True); send_req_work=work:[]; _pp_send_pyobj_to_next_stage(None,async_send=True); _pp_send_pyobj_to_next_stage(None,async_send=True); _pp_send_pyobj_to_next_stage(None,async_send=True); pp_outputs=out0; iq.end_step(None); _sched_idled=True
+decoding_batch=db0; _pp_slot_last_batch(0); last_batch=None
+ingest_requests()
+""",
     "pdp_l2": """
 init_pp_loop_state(); inflight_steps=IQ(1,True,True); pp_outputs=None; send_req_work=[]
 decoding_batch=db0; _pp_slot_last_batch(0); last_batch=None
@@ -664,59 +772,59 @@ ingest_requests()
     "pp_l2": """
 init_pp_loop_state(); inflight_steps=IQ(1,True,True); pp_outputs=None; send_req_work=[]; rows_join_before_plan=True
 decoding_batch=db0; _pp_slot_last_batch(0); last_batch=None
-ingest_requests(); _pp_commit_comm_work([]); _pp_send_pyobj_to_next_stage([],async_send=True); send_req_work=work:[]; get_next_batch_to_run(decoding_batch=db0,last_batch=None); _pp_debug_check_slot(0); iq.push(A,None); cur_batch_for_debug=A; _pp_recv_proxy_tensors(); _pp_commit_proxy_send_work(); _pp_launch_batch(0,A,proxy,[None,None],lrcq); launch_event=evA; _pp_commit_send_output_work_and_preprocess_output_tensors(0,1); _pp_pop_due_batch(); _pp_send_proxy_to_next_stage(resA); pp_outputs=out1; iq.end_step(A)
+recv_requests{; ingest_requests(); }; _pp_commit_comm_work([]); send_reqs_to_next_stage{; _pp_send_pyobj_to_next_stage([],async_send=True); send_req_work=work:[]; }; get_next_batch_to_run{; get_next_batch_to_run(decoding_batch=db0,last_batch=None); _pp_debug_check_slot(0); iq.push(A,None); }; cur_batch_for_debug=A; _pp_recv_proxy_tensors(); _pp_commit_proxy_send_work(); _pp_launch_batch(0,A,proxy,[None,None],lrcq); launch_event=evA; _pp_commit_send_output_work_and_preprocess_output_tensors(0,1); _pp_pop_due_batch(); _pp_send_proxy_to_next_stage(resA); pp_outputs=out1; iq.end_step(A)
 decoding_batch=db1; _pp_slot_last_batch(1); last_batch=None
-ingest_requests(); _pp_commit_comm_work(work:[]); _pp_send_pyobj_to_next_stage([],async_send=True); send_req_work=work:[]; get_next_batch_to_run(decoding_batch=db1,last_batch=None); _pp_debug_check_slot(1); iq.push(D,None); cur_batch_for_debug=D; _pp_recv_proxy_tensors(); _pp_commit_proxy_send_work(); _pp_launch_batch(1,D,proxy,[None,None],lrcq); launch_event=evD; _pp_commit_send_output_work_and_preprocess_output_tensors(1,0); _pp_pop_due_batch(); iq.pop_due(); d2h_event.synchronize(); _pp_process_batch_result(A,nres0); _pp_update_rows_at_commit(0,A); _pp_send_proxy_to_next_stage(resD); pp_outputs=out0; iq.end_step(D)
+recv_requests{; ingest_requests(); }; _pp_commit_comm_work(work:[]); send_reqs_to_next_stage{; _pp_send_pyobj_to_next_stage([],async_send=True); send_req_work=work:[]; }; get_next_batch_to_run{; get_next_batch_to_run(decoding_batch=db1,last_batch=None); _pp_debug_check_slot(1); iq.push(D,None); }; cur_batch_for_debug=D; _pp_recv_proxy_tensors(); _pp_commit_proxy_send_work(); _pp_launch_batch(1,D,proxy,[None,None],lrcq); launch_event=evD; _pp_commit_send_output_work_and_preprocess_output_tensors(1,0); _pp_pop_due_batch(); iq.pop_due(); d2h_event.synchronize(); process_batch_result{; _pp_process_batch_result(A,nres0); }; _pp_update_rows_at_commit(0,A); _pp_send_proxy_to_next_stage(resD); pp_outputs=out0; iq.end_step(D)
 decoding_batch=db0; _pp_slot_last_batch(0); last_batch=A
-ingest_requests(); _pp_commit_comm_work(work:[]); _pp_send_pyobj_to_next_stage([],async_send=True); send_req_work=work:[]; get_next_batch_to_run(decoding_batch=db0,last_batch=A); _pp_debug_check_slot(0); iq.push(None,None); cur_batch_for_debug=None; _pp_commit_proxy_send_work(); _pp_commit_send_output_work_and_preprocess_output_tensors(0,1); _pp_pop_due_batch(); iq.pop_due(); d2h_event.synchronize(); _pp_process_batch_result(D,nres1); _pp_update_rows_at_commit(1,D); pp_outputs=out1; iq.end_step(None)
+recv_requests{; ingest_requests(); }; _pp_commit_comm_work(work:[]); send_reqs_to_next_stage{; _pp_send_pyobj_to_next_stage([],async_send=True); send_req_work=work:[]; }; get_next_batch_to_run{; get_next_batch_to_run(decoding_batch=db0,last_batch=A); _pp_debug_check_slot(0); iq.push(None,None); }; cur_batch_for_debug=None; _pp_commit_proxy_send_work(); _pp_commit_send_output_work_and_preprocess_output_tensors(0,1); _pp_pop_due_batch(); iq.pop_due(); d2h_event.synchronize(); process_batch_result{; _pp_process_batch_result(D,nres1); }; _pp_update_rows_at_commit(1,D); pp_outputs=out1; iq.end_step(None)
 decoding_batch=db1; _pp_slot_last_batch(1); last_batch=D
-ingest_requests(); _pp_commit_comm_work(work:[]); _pp_send_pyobj_to_next_stage([],async_send=True); send_req_work=work:[]; get_next_batch_to_run(decoding_batch=db1,last_batch=D); _pp_debug_check_slot(1); iq.push(E,None); cur_batch_for_debug=E; _pp_recv_proxy_tensors(); _pp_commit_proxy_send_work(); _pp_launch_batch(1,E,proxy,[None,None],lrcq); launch_event=evE; _pp_commit_send_output_work_and_preprocess_output_tensors(1,0); _pp_pop_due_batch(); iq.pop_due(); _pp_send_proxy_to_next_stage(resE); pp_outputs=out0; iq.end_step(E)
+recv_requests{; ingest_requests(); }; _pp_commit_comm_work(work:[]); send_reqs_to_next_stage{; _pp_send_pyobj_to_next_stage([],async_send=True); send_req_work=work:[]; }; get_next_batch_to_run{; get_next_batch_to_run(decoding_batch=db1,last_batch=D); _pp_debug_check_slot(1); iq.push(E,None); }; cur_batch_for_debug=E; _pp_recv_proxy_tensors(); _pp_commit_proxy_send_work(); _pp_launch_batch(1,E,proxy,[None,None],lrcq); launch_event=evE; _pp_commit_send_output_work_and_preprocess_output_tensors(1,0); _pp_pop_due_batch(); iq.pop_due(); _pp_send_proxy_to_next_stage(resE); pp_outputs=out0; iq.end_step(E)
 decoding_batch=db0; _pp_slot_last_batch(0); last_batch=None
-ingest_requests(); _pp_commit_comm_work(work:[]); _pp_send_pyobj_to_next_stage([],async_send=True); send_req_work=work:[]; get_next_batch_to_run(decoding_batch=db0,last_batch=None); _pp_debug_check_slot(0); iq.push(None,None); cur_batch_for_debug=None; _pp_commit_proxy_send_work(); _pp_commit_send_output_work_and_preprocess_output_tensors(0,1); _pp_pop_due_batch(); iq.pop_due(); d2h_event.synchronize(); _pp_process_batch_result(E,nres1); _pp_update_rows_at_commit(1,E); pp_outputs=out1; iq.end_step(None)
+recv_requests{; ingest_requests(); }; _pp_commit_comm_work(work:[]); send_reqs_to_next_stage{; _pp_send_pyobj_to_next_stage([],async_send=True); send_req_work=work:[]; }; get_next_batch_to_run{; get_next_batch_to_run(decoding_batch=db0,last_batch=None); _pp_debug_check_slot(0); iq.push(None,None); }; cur_batch_for_debug=None; _pp_commit_proxy_send_work(); _pp_commit_send_output_work_and_preprocess_output_tensors(0,1); _pp_pop_due_batch(); iq.pop_due(); d2h_event.synchronize(); process_batch_result{; _pp_process_batch_result(E,nres1); }; _pp_update_rows_at_commit(1,E); pp_outputs=out1; iq.end_step(None)
 decoding_batch=db1; _pp_slot_last_batch(1); last_batch=E
-ingest_requests(); _pp_commit_comm_work(work:[]); _pp_send_pyobj_to_next_stage([],async_send=True); send_req_work=work:[]; get_next_batch_to_run(decoding_batch=db1,last_batch=E); _pp_debug_check_slot(1); iq.push(None,None); cur_batch_for_debug=None; _pp_commit_proxy_send_work(); _pp_commit_send_output_work_and_preprocess_output_tensors(1,0); _pp_pop_due_batch(); iq.pop_due(); pp_outputs=out0; iq.end_step(None); _sched_idled=True; on_idle()
+recv_requests{; ingest_requests(); }; _pp_commit_comm_work(work:[]); send_reqs_to_next_stage{; _pp_send_pyobj_to_next_stage([],async_send=True); send_req_work=work:[]; }; get_next_batch_to_run{; get_next_batch_to_run(decoding_batch=db1,last_batch=E); _pp_debug_check_slot(1); iq.push(None,None); }; cur_batch_for_debug=None; _pp_commit_proxy_send_work(); _pp_commit_send_output_work_and_preprocess_output_tensors(1,0); _pp_pop_due_batch(); iq.pop_due(); pp_outputs=out0; iq.end_step(None); _sched_idled=True; on_idle()
 decoding_batch=db0; _pp_slot_last_batch(0); last_batch=None
-ingest_requests()
+recv_requests{; ingest_requests(); }
 """,
     "pp_l2_spec_relay": """
 init_pp_loop_state(); inflight_steps=IQ(1,True,True); pp_outputs=None; send_req_work=[]; rows_join_before_plan=True
 decoding_batch=db0; _pp_slot_last_batch(0); last_batch=None
-ingest_requests(); _pp_commit_comm_work([]); _pp_send_pyobj_to_next_stage([],async_send=True); send_req_work=work:[]; get_next_batch_to_run(decoding_batch=db0,last_batch=None); _pp_debug_check_slot(0); iq.push(A,None); cur_batch_for_debug=A; _pp_recv_proxy_tensors(); _pp_commit_proxy_send_work(); _pp_launch_batch(0,A,proxy,[None,md],lrcq); launch_event=evA; _pp_commit_send_output_work_and_preprocess_output_tensors(0,1); _pp_pop_due_batch(); _pp_send_proxy_to_next_stage(resA); pp_outputs=out1; iq.end_step(A)
+recv_requests{; ingest_requests(); }; _pp_commit_comm_work([]); send_reqs_to_next_stage{; _pp_send_pyobj_to_next_stage([],async_send=True); send_req_work=work:[]; }; get_next_batch_to_run{; get_next_batch_to_run(decoding_batch=db0,last_batch=None); _pp_debug_check_slot(0); iq.push(A,None); }; cur_batch_for_debug=A; _pp_recv_proxy_tensors(); _pp_commit_proxy_send_work(); _pp_launch_batch(0,A,proxy,[None,md],lrcq); launch_event=evA; _pp_commit_send_output_work_and_preprocess_output_tensors(0,1); _pp_pop_due_batch(); _pp_send_proxy_to_next_stage(resA); pp_outputs=out1; iq.end_step(A)
 decoding_batch=db1; _pp_slot_last_batch(1); last_batch=None
-ingest_requests(); _pp_commit_comm_work(work:[]); _pp_send_pyobj_to_next_stage([],async_send=True); send_req_work=work:[]; get_next_batch_to_run(decoding_batch=db1,last_batch=None); _pp_debug_check_slot(1); iq.push(D,None); cur_batch_for_debug=D; _pp_recv_proxy_tensors(); _pp_commit_send_output_work_and_preprocess_output_tensors(1,0); _pp_commit_proxy_send_work(); _pp_launch_batch(1,D,proxy,[None,md],lrcq); launch_event=evD; _pp_pop_due_batch(); iq.pop_due(); d2h_event.synchronize(); _pp_process_batch_result(A,nres0); _pp_update_rows_at_commit(0,A); _pp_send_proxy_to_next_stage(resD); pp_outputs=out0; iq.end_step(D)
+recv_requests{; ingest_requests(); }; _pp_commit_comm_work(work:[]); send_reqs_to_next_stage{; _pp_send_pyobj_to_next_stage([],async_send=True); send_req_work=work:[]; }; get_next_batch_to_run{; get_next_batch_to_run(decoding_batch=db1,last_batch=None); _pp_debug_check_slot(1); iq.push(D,None); }; cur_batch_for_debug=D; _pp_recv_proxy_tensors(); _pp_commit_send_output_work_and_preprocess_output_tensors(1,0); _pp_commit_proxy_send_work(); _pp_launch_batch(1,D,proxy,[None,md],lrcq); launch_event=evD; _pp_pop_due_batch(); iq.pop_due(); d2h_event.synchronize(); process_batch_result{; _pp_process_batch_result(A,nres0); }; _pp_update_rows_at_commit(0,A); _pp_send_proxy_to_next_stage(resD); pp_outputs=out0; iq.end_step(D)
 decoding_batch=db0; _pp_slot_last_batch(0); last_batch=A
-ingest_requests(); _pp_commit_comm_work(work:[]); _pp_send_pyobj_to_next_stage([],async_send=True); send_req_work=work:[]; get_next_batch_to_run(decoding_batch=db0,last_batch=A); _pp_debug_check_slot(0); iq.push(None,None); cur_batch_for_debug=None; _pp_commit_proxy_send_work(); _pp_commit_send_output_work_and_preprocess_output_tensors(0,1); _pp_pop_due_batch(); iq.pop_due(); d2h_event.synchronize(); _pp_process_batch_result(F1,nres1); _pp_update_rows_at_commit(1,D); pp_outputs=out1; iq.end_step(None)
+recv_requests{; ingest_requests(); }; _pp_commit_comm_work(work:[]); send_reqs_to_next_stage{; _pp_send_pyobj_to_next_stage([],async_send=True); send_req_work=work:[]; }; get_next_batch_to_run{; get_next_batch_to_run(decoding_batch=db0,last_batch=A); _pp_debug_check_slot(0); iq.push(None,None); }; cur_batch_for_debug=None; _pp_commit_proxy_send_work(); _pp_commit_send_output_work_and_preprocess_output_tensors(0,1); _pp_pop_due_batch(); iq.pop_due(); d2h_event.synchronize(); process_batch_result{; _pp_process_batch_result(F1,nres1); }; _pp_update_rows_at_commit(1,D); pp_outputs=out1; iq.end_step(None)
 decoding_batch=db1; _pp_slot_last_batch(1); last_batch=D
-ingest_requests(); _pp_commit_comm_work(work:[]); _pp_send_pyobj_to_next_stage([],async_send=True); send_req_work=work:[]; get_next_batch_to_run(decoding_batch=db1,last_batch=D); _pp_debug_check_slot(1); iq.push(E,None); cur_batch_for_debug=E; _pp_recv_proxy_tensors(); _pp_commit_send_output_work_and_preprocess_output_tensors(1,0); _pp_commit_proxy_send_work(); _pp_launch_batch(1,E,proxy,[None,md],lrcq); launch_event=evE; _pp_pop_due_batch(); iq.pop_due(); _pp_send_proxy_to_next_stage(resE); pp_outputs=out0; iq.end_step(E)
+recv_requests{; ingest_requests(); }; _pp_commit_comm_work(work:[]); send_reqs_to_next_stage{; _pp_send_pyobj_to_next_stage([],async_send=True); send_req_work=work:[]; }; get_next_batch_to_run{; get_next_batch_to_run(decoding_batch=db1,last_batch=D); _pp_debug_check_slot(1); iq.push(E,None); }; cur_batch_for_debug=E; _pp_recv_proxy_tensors(); _pp_commit_send_output_work_and_preprocess_output_tensors(1,0); _pp_commit_proxy_send_work(); _pp_launch_batch(1,E,proxy,[None,md],lrcq); launch_event=evE; _pp_pop_due_batch(); iq.pop_due(); _pp_send_proxy_to_next_stage(resE); pp_outputs=out0; iq.end_step(E)
 decoding_batch=db0; _pp_slot_last_batch(0); last_batch=None
-ingest_requests(); _pp_commit_comm_work(work:[]); _pp_send_pyobj_to_next_stage([],async_send=True); send_req_work=work:[]; get_next_batch_to_run(decoding_batch=db0,last_batch=None); _pp_debug_check_slot(0); iq.push(None,None); cur_batch_for_debug=None; _pp_commit_proxy_send_work(); _pp_commit_send_output_work_and_preprocess_output_tensors(0,1); _pp_pop_due_batch(); iq.pop_due(); d2h_event.synchronize(); _pp_process_batch_result(F1,nres1); _pp_update_rows_at_commit(1,E); pp_outputs=out1; iq.end_step(None)
+recv_requests{; ingest_requests(); }; _pp_commit_comm_work(work:[]); send_reqs_to_next_stage{; _pp_send_pyobj_to_next_stage([],async_send=True); send_req_work=work:[]; }; get_next_batch_to_run{; get_next_batch_to_run(decoding_batch=db0,last_batch=None); _pp_debug_check_slot(0); iq.push(None,None); }; cur_batch_for_debug=None; _pp_commit_proxy_send_work(); _pp_commit_send_output_work_and_preprocess_output_tensors(0,1); _pp_pop_due_batch(); iq.pop_due(); d2h_event.synchronize(); process_batch_result{; _pp_process_batch_result(F1,nres1); }; _pp_update_rows_at_commit(1,E); pp_outputs=out1; iq.end_step(None)
 decoding_batch=db1; _pp_slot_last_batch(1); last_batch=E
-ingest_requests(); _pp_commit_comm_work(work:[]); _pp_send_pyobj_to_next_stage([],async_send=True); send_req_work=work:[]; get_next_batch_to_run(decoding_batch=db1,last_batch=E); _pp_debug_check_slot(1); iq.push(None,None); cur_batch_for_debug=None; _pp_commit_proxy_send_work(); _pp_commit_send_output_work_and_preprocess_output_tensors(1,0); _pp_pop_due_batch(); iq.pop_due(); pp_outputs=out0; iq.end_step(None); _sched_idled=True; on_idle()
+recv_requests{; ingest_requests(); }; _pp_commit_comm_work(work:[]); send_reqs_to_next_stage{; _pp_send_pyobj_to_next_stage([],async_send=True); send_req_work=work:[]; }; get_next_batch_to_run{; get_next_batch_to_run(decoding_batch=db1,last_batch=E); _pp_debug_check_slot(1); iq.push(None,None); }; cur_batch_for_debug=None; _pp_commit_proxy_send_work(); _pp_commit_send_output_work_and_preprocess_output_tensors(1,0); _pp_pop_due_batch(); iq.pop_due(); pp_outputs=out0; iq.end_step(None); _sched_idled=True; on_idle()
 decoding_batch=db0; _pp_slot_last_batch(0); last_batch=None
-ingest_requests()
+recv_requests{; ingest_requests(); }
 """,
     "pp_l3_last": """
 init_pp_loop_state(); inflight_steps=IQ(2,True,True); pp_outputs=None; send_req_work=[]; rows_join_before_plan=True
 decoding_batch=db0; _pp_slot_last_batch(0); last_batch=None
-ingest_requests(); get_next_batch_to_run(decoding_batch=db0,last_batch=None); _pp_debug_check_slot(0); iq.push(A,None); cur_batch_for_debug=A; _pp_recv_proxy_tensors(); _pp_commit_send_output_work_and_preprocess_output_tensors(2,1); _pp_commit_proxy_send_work(); _pp_launch_batch(0,A,proxy,[None,None,None],lrcq); launch_event=evA; _pp_pop_due_batch(); pp_outputs=out1; iq.end_step(A)
+recv_requests{; ingest_requests(); }; get_next_batch_to_run{; get_next_batch_to_run(decoding_batch=db0,last_batch=None); _pp_debug_check_slot(0); iq.push(A,None); }; cur_batch_for_debug=A; _pp_recv_proxy_tensors(); _pp_commit_send_output_work_and_preprocess_output_tensors(2,1); _pp_commit_proxy_send_work(); _pp_launch_batch(0,A,proxy,[None,None,None],lrcq); launch_event=evA; _pp_pop_due_batch(); pp_outputs=out1; iq.end_step(A)
 decoding_batch=db1; _pp_slot_last_batch(1); last_batch=None
-ingest_requests(); get_next_batch_to_run(decoding_batch=db1,last_batch=None); _pp_debug_check_slot(1); iq.push(D,None); cur_batch_for_debug=D; _pp_recv_proxy_tensors(); _pp_commit_send_output_work_and_preprocess_output_tensors(0,2); _pp_commit_proxy_send_work(); _pp_launch_batch(1,D,proxy,[None,None,None],lrcq); launch_event=evD; _pp_pop_due_batch(); pp_outputs=out2; iq.end_step(D)
+recv_requests{; ingest_requests(); }; get_next_batch_to_run{; get_next_batch_to_run(decoding_batch=db1,last_batch=None); _pp_debug_check_slot(1); iq.push(D,None); }; cur_batch_for_debug=D; _pp_recv_proxy_tensors(); _pp_commit_send_output_work_and_preprocess_output_tensors(0,2); _pp_commit_proxy_send_work(); _pp_launch_batch(1,D,proxy,[None,None,None],lrcq); launch_event=evD; _pp_pop_due_batch(); pp_outputs=out2; iq.end_step(D)
 decoding_batch=db2; _pp_slot_last_batch(2); last_batch=None
-ingest_requests(); get_next_batch_to_run(decoding_batch=db2,last_batch=None); _pp_debug_check_slot(2); iq.push(None,None); cur_batch_for_debug=None; _pp_commit_send_output_work_and_preprocess_output_tensors(1,0); _pp_commit_proxy_send_work(); _pp_pop_due_batch(); iq.pop_due(); d2h_event.synchronize(); _pp_process_batch_result(A,nres0); _pp_update_rows_at_commit(0,A); pp_outputs=out0; iq.end_step(None)
+recv_requests{; ingest_requests(); }; get_next_batch_to_run{; get_next_batch_to_run(decoding_batch=db2,last_batch=None); _pp_debug_check_slot(2); iq.push(None,None); }; cur_batch_for_debug=None; _pp_commit_send_output_work_and_preprocess_output_tensors(1,0); _pp_commit_proxy_send_work(); _pp_pop_due_batch(); iq.pop_due(); d2h_event.synchronize(); process_batch_result{; _pp_process_batch_result(A,nres0); }; _pp_update_rows_at_commit(0,A); pp_outputs=out0; iq.end_step(None)
 decoding_batch=db0; _pp_slot_last_batch(0); last_batch=A
-ingest_requests(); get_next_batch_to_run(decoding_batch=db0,last_batch=A); _pp_debug_check_slot(0); iq.push(E,None); cur_batch_for_debug=E; _pp_recv_proxy_tensors(); _pp_commit_send_output_work_and_preprocess_output_tensors(2,1); _pp_commit_proxy_send_work(); _pp_launch_batch(0,E,proxy,[None,None,None],lrcq); launch_event=evE; _pp_pop_due_batch(); iq.pop_due(); d2h_event.synchronize(); _pp_process_batch_result(D,nres1); _pp_update_rows_at_commit(1,D); pp_outputs=out1; iq.end_step(E)
+recv_requests{; ingest_requests(); }; get_next_batch_to_run{; get_next_batch_to_run(decoding_batch=db0,last_batch=A); _pp_debug_check_slot(0); iq.push(E,None); }; cur_batch_for_debug=E; _pp_recv_proxy_tensors(); _pp_commit_send_output_work_and_preprocess_output_tensors(2,1); _pp_commit_proxy_send_work(); _pp_launch_batch(0,E,proxy,[None,None,None],lrcq); launch_event=evE; _pp_pop_due_batch(); iq.pop_due(); d2h_event.synchronize(); process_batch_result{; _pp_process_batch_result(D,nres1); }; _pp_update_rows_at_commit(1,D); pp_outputs=out1; iq.end_step(E)
 decoding_batch=db1; _pp_slot_last_batch(1); last_batch=D
-ingest_requests(); get_next_batch_to_run(decoding_batch=db1,last_batch=D); _pp_debug_check_slot(1); iq.push(None,None); cur_batch_for_debug=None; _pp_commit_send_output_work_and_preprocess_output_tensors(0,2); _pp_commit_proxy_send_work(); _pp_pop_due_batch(); iq.pop_due(); pp_outputs=out2; iq.end_step(None)
+recv_requests{; ingest_requests(); }; get_next_batch_to_run{; get_next_batch_to_run(decoding_batch=db1,last_batch=D); _pp_debug_check_slot(1); iq.push(None,None); }; cur_batch_for_debug=None; _pp_commit_send_output_work_and_preprocess_output_tensors(0,2); _pp_commit_proxy_send_work(); _pp_pop_due_batch(); iq.pop_due(); pp_outputs=out2; iq.end_step(None)
 decoding_batch=db2; _pp_slot_last_batch(2); last_batch=None
-ingest_requests(); get_next_batch_to_run(decoding_batch=db2,last_batch=None); _pp_debug_check_slot(2); iq.push(None,None); cur_batch_for_debug=None; _pp_commit_send_output_work_and_preprocess_output_tensors(1,0); _pp_commit_proxy_send_work(); _pp_pop_due_batch(); iq.pop_due(); d2h_event.synchronize(); _pp_process_batch_result(E,nres0); _pp_update_rows_at_commit(0,E); pp_outputs=out0; iq.end_step(None)
+recv_requests{; ingest_requests(); }; get_next_batch_to_run{; get_next_batch_to_run(decoding_batch=db2,last_batch=None); _pp_debug_check_slot(2); iq.push(None,None); }; cur_batch_for_debug=None; _pp_commit_send_output_work_and_preprocess_output_tensors(1,0); _pp_commit_proxy_send_work(); _pp_pop_due_batch(); iq.pop_due(); d2h_event.synchronize(); process_batch_result{; _pp_process_batch_result(E,nres0); }; _pp_update_rows_at_commit(0,E); pp_outputs=out0; iq.end_step(None)
 decoding_batch=db0; _pp_slot_last_batch(0); last_batch=E
-ingest_requests(); get_next_batch_to_run(decoding_batch=db0,last_batch=E); _pp_debug_check_slot(0); iq.push(None,None); cur_batch_for_debug=None; _pp_commit_send_output_work_and_preprocess_output_tensors(2,1); _pp_commit_proxy_send_work(); _pp_pop_due_batch(); iq.pop_due(); pp_outputs=out1; iq.end_step(None)
+recv_requests{; ingest_requests(); }; get_next_batch_to_run{; get_next_batch_to_run(decoding_batch=db0,last_batch=E); _pp_debug_check_slot(0); iq.push(None,None); }; cur_batch_for_debug=None; _pp_commit_send_output_work_and_preprocess_output_tensors(2,1); _pp_commit_proxy_send_work(); _pp_pop_due_batch(); iq.pop_due(); pp_outputs=out1; iq.end_step(None)
 decoding_batch=db1; _pp_slot_last_batch(1); last_batch=None
-ingest_requests(); get_next_batch_to_run(decoding_batch=db1,last_batch=None); _pp_debug_check_slot(1); iq.push(None,None); cur_batch_for_debug=None; _pp_commit_send_output_work_and_preprocess_output_tensors(0,2); _pp_commit_proxy_send_work(); _pp_pop_due_batch(); iq.pop_due(); pp_outputs=out2; iq.end_step(None)
+recv_requests{; ingest_requests(); }; get_next_batch_to_run{; get_next_batch_to_run(decoding_batch=db1,last_batch=None); _pp_debug_check_slot(1); iq.push(None,None); }; cur_batch_for_debug=None; _pp_commit_send_output_work_and_preprocess_output_tensors(0,2); _pp_commit_proxy_send_work(); _pp_pop_due_batch(); iq.pop_due(); pp_outputs=out2; iq.end_step(None)
 decoding_batch=db2; _pp_slot_last_batch(2); last_batch=None
-ingest_requests(); get_next_batch_to_run(decoding_batch=db2,last_batch=None); _pp_debug_check_slot(2); iq.push(None,None); cur_batch_for_debug=None; _pp_commit_send_output_work_and_preprocess_output_tensors(1,0); _pp_commit_proxy_send_work(); _pp_pop_due_batch(); iq.pop_due(); pp_outputs=out0; iq.end_step(None); _sched_idled=True; on_idle()
+recv_requests{; ingest_requests(); }; get_next_batch_to_run{; get_next_batch_to_run(decoding_batch=db2,last_batch=None); _pp_debug_check_slot(2); iq.push(None,None); }; cur_batch_for_debug=None; _pp_commit_send_output_work_and_preprocess_output_tensors(1,0); _pp_commit_proxy_send_work(); _pp_pop_due_batch(); iq.pop_due(); pp_outputs=out0; iq.end_step(None); _sched_idled=True; on_idle()
 decoding_batch=db0; _pp_slot_last_batch(0); last_batch=None
-ingest_requests()
+recv_requests{; ingest_requests(); }
 """,
 }
 
