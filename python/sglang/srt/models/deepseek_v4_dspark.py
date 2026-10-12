@@ -49,6 +49,7 @@ from sglang.srt.models.dspark import (
     DSparkConfidenceHead,
     VocabShard,
     gather_and_crop_vocab,
+    lm_head_logits_dtype,
     project_through_lm_head,
 )
 from sglang.srt.runtime_context import (
@@ -64,16 +65,11 @@ from sglang.srt.speculative.ragged_verify import (
     read_ragged_verify_mode,
 )
 from sglang.srt.utils import add_prefix, is_npu
-from sglang.srt.utils.invariants import Bucket, InClosedRange, Invariant, expect
 
 logger = logging.getLogger(__name__)
 
 _PAD_NUM_HEADS = 64
 
-# DSpark confidence is a per-token score that must stay in [0, 1].
-_CONFIDENCE = Invariant(
-    "dspark.model.confidence", Bucket.GUARD, InClosedRange(0.0, 1.0)
-)
 _is_npu = is_npu()
 
 
@@ -986,38 +982,39 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             )
         last = self.stages[-1]
         x = last.norm(x_post_hc)
-        weight = self.lm_head.weight
-        if self._use_fp32_lm_head and weight.is_floating_point():
-            local_logits = F.linear(x.float(), weight.float())
+        if self._fp32_lm_head():
+            local_logits = F.linear(x.float(), self.lm_head.weight.float())
         else:
             local_logits = project_through_lm_head(x, self.lm_head)
         if self._opt_markov_w2_tp_shard:
             return local_logits
         return gather_and_crop_vocab(local_logits, self.lm_head)
 
+    def _fp32_lm_head(self) -> bool:
+        return self._use_fp32_lm_head and self.lm_head.weight.is_floating_point()
+
+    @property
+    def base_logits_dtype(self) -> torch.dtype:
+        """The dtype of the logits ``compute_base_logits`` returns."""
+        if self._fp32_lm_head():
+            return torch.float32
+        # A quantized head emits the draft's dtype.
+        draft_dtype = next(self.markov_head.parameters()).dtype
+        return lm_head_logits_dtype(self.lm_head, draft_dtype)
+
     def compute_confidence(
         self,
         *,
         anchor_tokens: torch.Tensor,
-        sampled_tokens: torch.Tensor,
-        x_post_hc: torch.Tensor,
-    ) -> Optional[torch.Tensor]:
-        confidence_head = self.confidence_head
-        if confidence_head is None:
-            return None
-        bs = int(anchor_tokens.shape[0])
-        x_post_hc = x_post_hc.view(bs, self.gamma, -1)
-        if confidence_head.with_markov:
-            prev_seq = torch.cat(
-                [anchor_tokens.view(-1, 1), sampled_tokens[:, : self.gamma - 1]], dim=1
-            )
-            markov_embed_stack = self.markov_head.get_prev_embeddings(prev_seq)
-        else:
-            markov_embed_stack = None
-        confidence_raw = confidence_head(x_post_hc, markov_embed_stack)
-        confidence = confidence_head.apply_sts(confidence_raw)
-        expect(_CONFIDENCE, confidence)
-        return confidence
+        draft_tokens: torch.Tensor,
+        confidence_features: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self.confidence_head.predict(
+            confidence_features,
+            anchor_tokens=anchor_tokens,
+            draft_tokens=draft_tokens,
+            markov_head=self.markov_head,
+        )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:
         params_dict = dict(self.named_parameters())
