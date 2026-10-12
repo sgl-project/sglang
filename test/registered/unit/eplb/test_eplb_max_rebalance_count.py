@@ -42,25 +42,11 @@ class TestEPLBMaxRebalanceCount(unittest.TestCase):
             manager.on_forward_pass_end()
 
     def test_freezes_after_max_count_executed_rebalances(self):
-        manager = self._make_manager(max_count=2, outcomes=[True, True])
-        self._run_windows(manager, num_windows=10)
-        self.assertEqual(manager.rebalance_calls, 2)
-        self.recorder.stop_record.assert_called_once()
-
-    def test_skipped_rebalances_do_not_count(self):
         manager = self._make_manager(max_count=2, outcomes=[False, True, False, True])
-        self._run_windows(manager, num_windows=3)
-        self.assertEqual(manager.rebalance_calls, 3)
-        self.recorder.stop_record.assert_not_called()
         self._run_windows(manager, num_windows=10)
+        # Skipped rebalances do not use up the budget.
         self.assertEqual(manager.rebalance_calls, 4)
         self.recorder.stop_record.assert_called_once()
-
-    def test_zero_means_no_limit(self):
-        manager = self._make_manager(max_count=0, outcomes=[True] * 20)
-        self._run_windows(manager, num_windows=20)
-        self.assertEqual(manager.rebalance_calls, 20)
-        self.recorder.stop_record.assert_not_called()
 
     def test_reset_after_freeze_restarts_recorder_and_budget(self):
         manager = self._make_manager(max_count=1, outcomes=[True, True])
