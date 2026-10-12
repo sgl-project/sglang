@@ -529,6 +529,10 @@ class HiCacheController:
             )
             raise RuntimeError("Failed to stop HiCache storage threads cleanly.")
 
+    # A subclass whose attach continues registering host pools after super()
+    # returns fires on_host_pools_registered() itself, once.
+    _registers_host_pools_after_super_attach = False
+
     def attach_storage_backend(
         self,
         storage_backend: str,
@@ -577,6 +581,8 @@ class HiCacheController:
                 storage_backend, self.storage_config, self.storage_host_pool
             )
             self.storage_backend.register_mem_pool_host(self.storage_host_pool)
+            if not self._registers_host_pools_after_super_attach:
+                self.storage_backend.on_host_pools_registered()
 
             self.enable_storage = True
             # todo: threshold policy for prefetching
