@@ -17,6 +17,7 @@
 
 import logging
 from contextlib import nullcontext
+from functools import partial
 from typing import Iterable, List, Optional, Set, Tuple, Union
 
 import torch
@@ -1520,12 +1521,9 @@ class MiniMaxM3DecoderLayer(nn.Module):
             disable_index_value=disable_index_value,
         )
 
-        moe_layer_freq = getattr(config, "moe_layer_freq", None)
         # Means "MLP is a sparse MoE", not attention sparsity. Kept as ``is_layer_sparse``
         # because model construction and downstream integrations read this attr.
-        self.is_layer_sparse = (
-            moe_layer_freq[layer_id] != 0 if moe_layer_freq is not None else True
-        )
+        self.is_layer_sparse = self._is_layer_sparse(config, layer_id)
 
         if self.is_layer_sparse:
             self.mlp = MiniMaxM3MoE(
@@ -1560,25 +1558,39 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 config.hidden_size, eps=config.rms_norm_eps
             )
 
-        def _is_layer_sparse(lid):
-            if moe_layer_freq is None:
-                return True
-            if lid < 0 or lid >= config.num_hidden_layers:
-                return True
-            return moe_layer_freq[lid] != 0
-
-        is_next_layer_sparse = _is_layer_sparse(layer_id + 1)
-
+        attn, ffn = self.stage_facts(config, layer_id)
         self.attn_boundary, self.ffn_boundary = append_stages(
-            (declare_attn(), self.input_layernorm),
-            (
-                declare_ffn(
-                    sparse=self.is_layer_sparse,
-                    next_layer_sparse=is_next_layer_sparse,
-                ),
-                self.post_attention_layernorm,
+            (attn, self.input_layernorm),
+            (ffn, self.post_attention_layernorm),
+        )
+
+    @classmethod
+    def stage_facts(cls, config: PretrainedConfig, layer_id: int):
+        """The stages the layer at ``layer_id`` declares, in order: the model's
+        shared declaration function, which the layer declares with too (see
+        make_layers)."""
+        return (
+            declare_attn(),
+            declare_ffn(
+                sparse=cls._is_layer_sparse(config, layer_id),
+                next_layer_sparse=cls._is_next_layer_sparse(config, layer_id),
             ),
         )
+
+    @staticmethod
+    def _is_layer_sparse(config: PretrainedConfig, layer_id: int) -> bool:
+        moe_layer_freq = getattr(config, "moe_layer_freq", None)
+        return moe_layer_freq[layer_id] != 0 if moe_layer_freq is not None else True
+
+    @staticmethod
+    def _is_next_layer_sparse(config: PretrainedConfig, layer_id: int) -> bool:
+        moe_layer_freq = getattr(config, "moe_layer_freq", None)
+        lid = layer_id + 1
+        if moe_layer_freq is None:
+            return True
+        if lid < 0 or lid >= config.num_hidden_layers:
+            return True
+        return moe_layer_freq[lid] != 0
 
     def forward(
         self,
@@ -1653,6 +1665,7 @@ class MiniMaxM3Model(nn.Module):
             config.num_hidden_layers,
             layer_fn,
             prefix=add_prefix("layers", prefix),
+            stage_facts=partial(MiniMaxM3DecoderLayer.stage_facts, config),
         )
         if self.pp_group.is_last_rank:
             if self.use_gemma_norm:

@@ -28,6 +28,9 @@ from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
 
 
 @dataclass
@@ -355,7 +358,42 @@ class FastH3PipelineConfig(MiniMaxH3PipelineConfig):
                 "--model-variant does not apply. FL2VA and Ref2VA tasks were "
                 "not distilled; use MiniMaxAI/MiniMax-H3 for those."
             )
+        self._default_to_trained_sparse_attention(server_args)
         super().validate_server_args(server_args)
+
+    def _default_to_trained_sparse_attention(self, server_args) -> None:
+        # The checkpoint was distilled with VSA-H3; dense attention skips its
+        # trained compression gate and runs slower.
+        if self.resolve_transformer_attention_backend(server_args) is not None:
+            return
+        if not current_platform.is_cuda():
+            return
+        from sglang.multimodal_gen.runtime.platforms.cuda import VSA_H3_CAPABILITIES
+
+        capability = current_platform.get_device_capability()
+        if (
+            capability is None
+            or (capability.major, capability.minor) not in VSA_H3_CAPABILITIES
+        ):
+            return
+        if (
+            server_args.enable_torch_compile
+            or server_args.enable_breakable_cuda_graph
+            or int(server_args.ring_degree or 1) > 1
+        ):
+            logger.info(
+                "FastH3 runs dense attention: VSA-H3 does not serve torch.compile, "
+                "the breakable CUDA graph or ring attention"
+            )
+            return
+        server_args.set_automatic_component_attention_backend(
+            "transformer", AttentionBackendEnum.VIDEO_SPARSE_ATTN_H3.name.lower()
+        )
+        logger.info(
+            "Automatically set video_sparse_attn_h3 for the FastH3 transformer, the "
+            "attention it was distilled with; --component-attention-backends "
+            "transformer=fa selects dense attention"
+        )
 
 
 __all__ = ["FastH3PipelineConfig", "MiniMaxH3PipelineConfig"]

@@ -2,6 +2,10 @@
 """Process-wide SGLD worker ownership for ComfyUI loaders."""
 
 from types import SimpleNamespace
+from unittest.mock import Mock
+
+import pytest
+import torch
 
 from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.core.generator import (
     SGLDiffusionGenerator,
@@ -135,3 +139,124 @@ def test_generator_reports_real_runtime_import_error(caplog) -> None:
     with pytest.raises(RuntimeError, match="failed to import") as err:
         module.SGLDiffusionGenerator().init_generator("flux", "FluxPipeline", {})
     assert isinstance(err.value.__cause__, ImportError)
+
+
+def _runtime_that_must_reject() -> SGLDiffusionGenerator:
+    """A loader whose model build fails loudly, so a check that should reject
+    first is caught if it lets the options through."""
+    runtime = SGLDiffusionGenerator()
+    runtime.get_comfyui_model = Mock(
+        side_effect=AssertionError("must reject before building the model")
+    )
+    return runtime
+
+
+def test_non_default_weight_dtype_is_rejected_before_worker_load() -> None:
+    """weight_dtype only reached the ComfyUI architecture companion, so fp8
+    produced output bit-identical to the default load."""
+    with pytest.raises(ValueError, match="weight_dtype must be 'default'"):
+        _runtime_that_must_reject().load_model(
+            model_path="h3.safetensors",
+            model_options={"dtype": torch.float8_e4m3fn},
+            sgld_options={},
+        )
+
+
+@pytest.mark.parametrize(
+    "options,error",
+    [
+        ({"attention_backend": "sage_attn_3"}, "would run torch_sdpa instead"),
+        ({"component_attention_backends": "transformer=sol_attn"}, "not installed"),
+        ({"attention_backend": "not_a_backend"}, "not an SGLang attention backend"),
+        ({"attention_backend": "sage_attn"}, None),
+    ],
+)
+def test_attention_backends_are_checked_before_worker_load(
+    monkeypatch, options, error
+) -> None:
+    """SGLang serves a missing sage_attn / sage_attn_3 kernel as FA / SDPA, so an
+    explicit choice ran another backend; a missing sparse kernel only failed
+    after the full model load."""
+    from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.core import preflight
+    from sglang.multimodal_gen.runtime.platforms.interface import (
+        AttentionBackendEnum as Backend,
+    )
+
+    def resolved(backend):
+        if backend is Backend.SOL_ATTN:
+            raise ImportError("Sol-Attn backend is not installed")
+        return {Backend.SAGE_ATTN_3: Backend.TORCH_SDPA}.get(backend, backend)
+
+    monkeypatch.setattr(preflight, "_resolved_backend", resolved)
+    with pytest.raises(
+        ValueError if error else AssertionError, match=error or "must reject before"
+    ):
+        _runtime_that_must_reject().load_model(
+            model_path="h3.safetensors", sgld_options=options
+        )
+
+
+@pytest.mark.parametrize(
+    "options,error",
+    [
+        ({"num_gpus": 2, "tp_size": 1, "sp_degree": 1}, "must equal"),
+        ({"num_gpus": 2, "tp_size": 2, "sp_degree": 2}, "must equal"),
+        ({"num_gpus": 2, "dp_size": 2}, "dp_size > 1"),
+        ({"num_gpus": 2, "tp_size": 2, "sp_degree": 1}, None),
+        ({"num_gpus": 2, "tp_size": 1, "sp_degree": None}, None),
+    ],
+)
+def test_parallel_layout_is_checked_before_worker_load(options, error) -> None:
+    """num_gpus=2 with tp=sp=1 left rank 1 without a process group, hanging
+    worker startup forever; dp_size=2 sent sampler steps to a replica without
+    the run's cached conditioning."""
+    with pytest.raises(
+        ValueError if error else AssertionError, match=error or "must reject before"
+    ):
+        _runtime_that_must_reject().load_model(
+            model_path="h3.safetensors", sgld_options=options
+        )
+
+
+def test_worker_exit_during_load_names_where_the_reason_is(monkeypatch) -> None:
+    """A worker that raised while loading surfaced as an empty EOFError."""
+    from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.core import generator
+
+    def exit_during_load(**kwargs):
+        raise EOFError
+
+    monkeypatch.setattr(generator.DiffGenerator, "from_pretrained", exit_during_load)
+    with pytest.raises(RuntimeError, match="traceback is in the ComfyUI console"):
+        SGLDiffusionGenerator().init_generator("h3.safetensors", "MiniMaxH3Pipeline")
+
+
+def test_multi_gpu_single_file_starts_without_cfg_parallel(
+    tmp_path, monkeypatch
+) -> None:
+    """Auto CFG parallel read a model_index.json, so a Flux single file on two GPUs
+    failed ServerArgs validation; ComfyUI already splits cond/uncond requests."""
+    import torch
+    from safetensors.torch import save_file
+
+    from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.core import generator
+    from sglang.multimodal_gen.runtime.server_args import ServerArgs
+
+    path = tmp_path / "flux.safetensors"
+    save_file({"double_blocks.0.img_attn.qkv.weight": torch.zeros(1)}, path)
+    seen = {}
+    monkeypatch.setattr(
+        generator.DiffGenerator,
+        "from_pretrained",
+        lambda **kwargs: seen.update(kwargs) or object(),
+    )
+    SGLDiffusionGenerator().init_generator(str(path), "FluxPipeline", {"num_gpus": 2})
+    assert seen["cfg_parallel_degree"] == 1
+    if torch.cuda.device_count() >= 2:
+        server_args = ServerArgs.from_kwargs(**seen)
+        assert server_args.enable_cfg_parallel is False
+        assert server_args.sp_degree == 2
+    seen.clear()
+    SGLDiffusionGenerator().init_generator(
+        str(path), "FluxPipeline", {"num_gpus": 2, "enable_cfg_parallel": True}
+    )
+    assert "cfg_parallel_degree" not in seen

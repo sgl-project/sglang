@@ -77,8 +77,8 @@ _MLA_BUCKETS = (
 )
 
 # For the paths that must not depend on the batch; the mid bucket sits between the
-# other two geometries. Retuning it moves what deterministic inference produces, which
-# test_batch_free_geometry_is_pinned guards. max_splits goes unused there.
+# other two geometries. Retuning it moves what deterministic inference produces;
+# max_splits goes unused there.
 _MLA_BUCKET_BATCH_FREE = _MLA_BUCKETS[1]
 
 _KEEP_SCHEDULER_SPLITS = None

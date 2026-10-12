@@ -2303,9 +2303,9 @@ _HC_MIX_BLOCK_K = 64
 _HC_MIX_NUM_WARPS = 4
 # Triton on AMD has no tf32x3 (gfx942 adds only tf32); "ieee" is the fp32 MFMA
 _HC_MIX_DOT_PRECISION = "ieee" if _is_hip else "tf32x3"
-# num_stages only reorders memory issue, not arithmetic; 2 is enough to cover the
-# short k_per_slice loop (K=20480 gives 80 slices, i.e. 4 BLOCK_K tiles per CTA).
-_HC_MIX_NUM_STAGES = 2
+# num_stages only reorders memory issue, not arithmetic; AMD keeps 2, not measured.
+# Measured on B300 and H200: 1 stage beats 2-4 by 2-5x at every M in 1..4096.
+_HC_MIX_NUM_STAGES = 2 if _is_hip else 1
 
 # BLOCK_M 8/16/32 preserve each row's K reduction order; thresholds were measured on GB300.
 # Keep BLOCK_M below 64, where Triton lowers tf32x3 to plain TF32 and changes rounding.
@@ -2324,13 +2324,6 @@ def _block_m_for(m: int) -> int:
     if m <= _HC_MIX_MID_MAX_M:
         return _HC_MIX_BLOCK_M_MID
     return _HC_MIX_BLOCK_M
-
-
-def _num_stages_for(m: int, k: int) -> int:
-    # GB300 verify batches benefit from a smaller shared-memory footprint.
-    if get_platform().is_blackwell and k == 20480 and 64 <= m <= 384:
-        return 1
-    return _HC_MIX_NUM_STAGES
 
 
 def _num_slices_for(k: int) -> int:
@@ -2383,7 +2376,7 @@ def hc_mix_stats(x_flat: torch.Tensor, hc_fn: torch.Tensor, eps: float) -> torch
         BLOCK_K=_HC_MIX_BLOCK_K,
         DOT_PRECISION=_HC_MIX_DOT_PRECISION,
         num_warps=_HC_MIX_NUM_WARPS,
-        num_stages=_num_stages_for(m, k),
+        num_stages=_HC_MIX_NUM_STAGES,
     )
     _hc_mix_stats_reduce_kernel[(grid_m,)](
         part_mix,
@@ -2515,7 +2508,7 @@ def hc_mix_stats_sinkhorn(
         BLOCK_K=_HC_MIX_BLOCK_K,
         DOT_PRECISION=_HC_MIX_DOT_PRECISION,
         num_warps=_HC_MIX_NUM_WARPS,
-        num_stages=_num_stages_for(m, k),
+        num_stages=_HC_MIX_NUM_STAGES,
     )
     if _is_hip:
         hc_mix_reduce_sinkhorn_vec(

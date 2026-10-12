@@ -135,9 +135,8 @@ def _reduce_update_read(
         if result is not None:
             return result
     if group is SumGroup.ATTN_TP:
-        # MHC sums its streams in full precision.
         hidden_states = attn_tp_all_reduce(
-            hidden_states, forward_batch, may_quantize=update.is_plain_add
+            hidden_states, forward_batch, may_quantize=update.quantized_sum
         )
     elif group is SumGroup.TP:
         hidden_states = tensor_model_parallel_all_reduce(hidden_states)
@@ -261,21 +260,6 @@ def _attn_input_scattered(
             )
         )
     return hidden_states
-
-
-def _dispatch_by_update(
-    hidden_states, residual, forward_batch, norm, *, paths, update=PLAIN_ADD, **call
-):
-    if residual is None:
-        # A missing residual cannot join a partial sum. The non-plain path
-        # performs init_residual/read without that optimization.
-        prepare = paths[False]
-    else:
-        try:
-            prepare = paths[update.is_plain_add]
-        except KeyError:
-            raise RuntimeError("producer update has no bound input path") from None
-    return prepare(hidden_states, residual, forward_batch, norm, update=update, **call)
 
 
 def _run_entry(
