@@ -31,12 +31,13 @@ class StepRecord:
 class InflightQueue:
     def __init__(self, depth: int, blocking: bool = True):
         self.depth = depth
-        # A non-blocking loop may defer committing a due record until its
-        # result is ready; the loop tests readiness itself.
+        # Read by the PD prefill loop: when False, it defers committing a due
+        # record until its result is ready, testing readiness itself.
         self.blocking = blocking
         # Completed loop steps; only end_step advances it.
         self.step = 0
-        # The live batch the last completed step launched, or None.
+        # The live batch the last completed step launched, or None. Read only
+        # by the scheduler's debug check against last_batch.
         self.last_launched: Optional[ScheduleBatch] = None
         self._records: Deque[StepRecord] = deque()
 
