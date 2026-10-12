@@ -31,6 +31,7 @@ from sglang.srt.layers.moe.token_dispatcher.deepep import (
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import DeepEPMode
 from sglang.srt.runtime_context import (
+    get_exec,
     get_parallel,
     get_resources,
 )
@@ -98,6 +99,8 @@ class NixlEPBuffer:
                 connected_ep_size=None,
                 scale_to=None,
                 dispatch_ep_size=None,
+                # --elastic-ep-reuse-cuda-graph, read once when the buffer is built.
+                reuse_graphs=False,
                 # Peer-fault state, held once per process rather than once per
                 # dispatcher: there is one transport mask, and 26 MoE layers each
                 # polling it on their own counter is 26 different opinions about
@@ -297,7 +300,9 @@ class NixlEPBuffer:
         """Schedule connections for newly admitted ranks."""
         state = cls._state()
         state.scale_to = to_ep_size
-        state.dispatch_ep_size = to_ep_size
+        # Under graph reuse the width stays at capacity; see _mask_unwired.
+        if not state.reuse_graphs:
+            state.dispatch_ep_size = to_ep_size
         logger.debug(
             "[Elastic EP][nixl] scheduling rank connections: old_ep_size=%d "
             "new_ep_size=%d",
@@ -319,7 +324,42 @@ class NixlEPBuffer:
             cls._disconnect_ranks(state, stale)
         state.connected_ep_size = min(connected, tail)
         state.scale_to = tail
-        state.dispatch_ep_size = tail
+        if state.reuse_graphs:
+            cls._mask_unwired(state, retiree_ranks)
+        else:
+            state.dispatch_ep_size = tail
+
+    @classmethod
+    def _mask_unwired(cls, state, ranks: list) -> None:
+        """Have the transport skip slots the capacity-wide dispatch cannot reach.
+
+        Under --elastic-ep-reuse-cuda-graph every rank dispatches at the buffer
+        capacity, so a kept decode graph and a joiner agree on one layout. Slots
+        with no live peer must then be masked, or the dispatch waits on them.
+        """
+        if not ranks:
+            return
+        for rank in ranks:
+            try:
+                state.buffer.update_mask_buffer(rank, True)
+            except Exception:
+                # A disconnect may already have masked it; the readback decides.
+                logger.debug(
+                    "[Elastic EP][nixl] could not mask rank %d", rank, exc_info=True
+                )
+        # The readback syncs, which a capture cannot take.
+        if is_device_stream_capturing(torch.device("cuda")):
+            return
+        width = state.buffer.group_size
+        mask = torch.zeros(width, dtype=torch.int32, device="cuda")
+        state.buffer.query_mask_buffer(mask)
+        unmasked = [r for r in ranks if r < width and not int(mask[r])]
+        if unmasked:
+            logger.warning(
+                "[Elastic EP][nixl] ranks %s are still unmasked; a capacity-wide "
+                "dispatch will wait on them",
+                unmasked,
+            )
 
     @classmethod
     def _connect_ranks(cls, state, ranks: list, *, tag: str) -> None:
@@ -434,7 +474,12 @@ class NixlEPBuffer:
         cls._connect_ranks(state, list(range(scale_to)), tag="initial")
         state.connected_ep_size = scale_to
         state.scale_to = scale_to
-        state.dispatch_ep_size = scale_to
+        state.reuse_graphs = get_exec().moe.elastic_ep_reuse_cuda_graph
+        if state.reuse_graphs:
+            state.dispatch_ep_size = nixl_max_ranks
+            cls._mask_unwired(state, list(range(scale_to, nixl_max_ranks)))
+        else:
+            state.dispatch_ep_size = scale_to
         nixl_wired_barrier_via_store(scale_to)
         return state.buffer
 

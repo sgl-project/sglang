@@ -564,5 +564,6 @@ POSITIONAL_FIELD_ORDER = (
     "disable_normalize_embedding",
     "log_schedule_decisions",
     "elastic_ep_retiree_lifecycle",
+    "elastic_ep_reuse_cuda_graph",
 )
 # fmt: on
