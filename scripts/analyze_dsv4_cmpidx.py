@@ -23,7 +23,7 @@ from collections import defaultdict
 
 TAG = re.compile(
     r"\[(CMPIDX|IDXK|C4KV|C128KV|C128X|OSHAPE|XIN|LHID|IDXIN|LIMETA"
-    r"|C4ST|C4STP|KSTATELOC|C4POS|C4DEC)\]"
+    r"|C4ST|C4STP|KSTATELOC|C4POS|C4DEC|WSTAGE)\]"
 )
 # [C4DEC] kbase= contains SPACES (``mBaseNum=.. kBaseNum=.. raw_tok=..``), so
 # the generic ``KV`` regex would truncate it at the first space.  Capture the
@@ -2253,6 +2253,213 @@ def report_c4pos(rows):
     print(C4POS_RUNBOOK)
 
 
+WSTAGES = ("S0", "S1", "S2", "S3", "S4", "S5")
+MAX_WSTAGE_SHOWN = 20
+# First-differing write-stage -> root-cause verdict (from the S253/T6 probe).
+WSTAGE_VERDICT = {
+    "S0": "UPSTREAM-INPUT (layer input differs)",
+    "S1": "A-GEMM (npu_quant_matmul KV projection M-dependent split-K)",
+    "S2": "kv_norm",
+    "S3": "C-ROPE (inplace_partial_rotary_mul)",
+    "S4": "writer-assembly",
+    "S5": "E-fp8-epilog (kv_compress_epilog)",
+}
+WSTAGE_ALL_SAME = (
+    "ALL-SAME (write clean -> downstream attention/read or input side)")
+
+WSTAGE_RUNBOOK = (
+    "[WSTAGE-RUNBOOK] write-side stage sweep (MISS vs HIT per absolute position):\n"
+    "  DSV4_DUMP_WSTAGE=1 DSV4_DUMP_C4POS=1 "
+    "DSV4_DUMP_MIN_POS=<win_lo> DSV4_DUMP_MAX_POS=<win_hi> "
+    "<serve> ; <curl miss> ; <curl hit> ; "
+    "python scripts/analyze_dsv4_cmpidx.py /tmp/dsv4_wstage.log\n"
+    "  [WSTAGE] layer=<L> pos=<p> stage=S<i> md5=<h> (i in 0..5: S0 pre-GEMM, "
+    "S1 post-GEMM kv, S2 post-norm, S3 post-rope, S4 pre-epilog bf16, S5 stored "
+    "fp8); the parser is keyed by ABSOLUTE position (never a whole-log compare)"
+)
+
+
+def _wstage_maps(group):
+    """``{layer: {abs_pos: {stage: md5}}}`` of one request's [WSTAGE] rows.
+
+    Keyed by ABSOLUTE position (``pos=``), NEVER a whole-log compare: the MISS
+    (full prefill) and the HIT (suffix prefill) have different ``ntok``, so only
+    the absolute position aligns the two write-side stage sweeps.  The FIRST row
+    carrying a ``(pos, stage)`` wins; rows missing ``layer``/``pos``/``stage``/
+    ``md5`` or carrying an unknown stage are skipped.
+    """
+    out = defaultdict(dict)
+    for r in group:
+        ly = _int(r, "layer")
+        pos = _int(r, "pos", None)
+        stage = r.get("stage", "")
+        md5 = r.get("md5")
+        if pos is None or not md5 or stage not in WSTAGES:
+            continue
+        out.setdefault(ly, {}).setdefault(pos, {}).setdefault(stage, md5)
+    return out
+
+
+def _wstage_stage_str(maps, ly, pos):
+    """``S0:a,S1:b,...`` per-stage distinct md5s for one (layer,pos) side."""
+    parts = []
+    for st in WSTAGES:
+        vals = sorted({m.get(ly, {}).get(pos, {}).get(st) for m in maps
+                       if m.get(ly, {}).get(pos, {}).get(st) is not None})
+        if vals:
+            parts.append(f"{st}:{'/'.join(vals)}")
+    return ",".join(parts)
+
+
+def report_wstage(rows, c4pos_rows=(), idxin_rows=()):
+    """``[WSTAGE-VERDICT]`` MISS-vs-HIT write-side stage sweep per abs position.
+
+    The S253/T6 probe emits, one line per position per stage::
+
+        [WSTAGE] layer=<L> pos=<p> stage=S<i> md5=<h>   (i in 0..5)
+
+    with S0 pre-GEMM, S1 post-GEMM kv, S2 post-norm, S3 post-rope, S4 pre-epilog
+    bf16, S5 stored fp8.  This report ALIGNS the MISS and the HIT at the SAME
+    ABSOLUTE position (never a whole-log compare: the two requests have different
+    ``ntok``) and, per shared ``(layer, abs_pos)``, finds the FIRST stage
+    ``S0..S5`` whose md5 differs (MISS vs HIT):
+
+      * offending positions print ``layer=<L> pos=<p> first_diff_stage=S<i>``
+        with each side's per-stage md5 run (capped);
+      * the summary prints the MODE of ``first_diff_stage`` over the offending
+        positions, mapped to the T6 verdict::
+
+            S1 -> A-GEMM     S2 -> kv_norm      S3 -> C-ROPE
+            S4 -> writer-assembly               S5 -> E-fp8-epilog
+            none -> ALL-SAME (write clean)      S0 -> UPSTREAM-INPUT
+
+    Requests are split by the SAME rule the rest of the analyzer uses: the
+    [C4POS] ``first==0`` / ``first>0`` label, else the [IDXIN] ``sps==0`` /
+    ``sps>0`` rule, else largest-``ntok`` (the SOURCE is printed).  A two-MISS
+    self-control verifies two MISS requests are IDENTICAL at every shared
+    ``(layer, pos, stage)``; on MISMATCH it WARNS and marks the verdict
+    UNRELIABLE.  When ``[WSTAGE]`` rows are absent the report prints exactly what
+    is needed (env + window) and NEVER a false PASS/FAIL.
+    """
+    print("\n== [WSTAGE-VERDICT] write-side stage sweep (MISS vs HIT) ==")
+    if not rows:
+        print("  [WSTAGE-VERDICT] no [WSTAGE] rows -> need "
+              "DSV4_DUMP_WSTAGE=1 and a WINDOW "
+              "(DSV4_DUMP_MIN_POS + DSV4_DUMP_MAX_POS) around the position")
+        print(WSTAGE_RUNBOOK)
+        return
+    if not any("stage" in r for r in rows):
+        print("  [WSTAGE-VERDICT] [WSTAGE] rows carry no `stage=S<i>` field -> "
+              "cannot sweep the write stages; re-run the S253/T6 probe")
+        print(WSTAGE_RUNBOOK)
+        return
+    reqs = _c4pos_requests(rows)
+    source, miss_idx, hit_idx, note = _cmp_aligned_roles(
+        reqs, c4pos_rows, idxin_rows)
+    print(f"  [WSTAGE-VERDICT] split_source={source} miss_req={miss_idx} "
+          f"hit_req={hit_idx}")
+    print(f"  [WSTAGE-VERDICT] rules: {note}")
+    if not miss_idx or not hit_idx:
+        print("  [WSTAGE-VERDICT] need >=1 MISS (first==0) and >=1 HIT "
+              "(first>0); none")
+        print(WSTAGE_RUNBOOK)
+        return
+    miss_maps = [_wstage_maps(reqs[i]) for i in miss_idx]
+    hit_maps = [_wstage_maps(reqs[i]) for i in hit_idx]
+
+    # --- two-MISS self-control: two MISS requests must be IDENTICAL ---
+    unreliable = False
+    if len(miss_maps) < 2:
+        print("  [WSTAGE-VERDICT] two-MISS SKIP (need >=2 MISS requests; got "
+              f"{len(miss_maps)})")
+    else:
+        base = miss_maps[0]
+        ctl_shared = ctl_diff = 0
+        first_bad2 = None
+        for ly in sorted(base):
+            for pos in sorted(base[ly]):
+                if not all(ly in m and pos in m[ly] for m in miss_maps[1:]):
+                    continue
+                ctl_shared += 1
+                for st in WSTAGES:
+                    vals = {m[ly][pos].get(st) for m in miss_maps}
+                    if len(vals) > 1:
+                        ctl_diff += 1
+                        if first_bad2 is None:
+                            first_bad2 = (ly, pos, st)
+                        break
+        if ctl_shared == 0:
+            print("  [WSTAGE-VERDICT] two-MISS SKIP (no (layer,pos) shared by "
+                  "both MISS requests)")
+        elif ctl_diff == 0:
+            print(f"  [WSTAGE-VERDICT] two-MISS IDENTICAL "
+                  f"(at all {ctl_shared} shared position(s))")
+        else:
+            unreliable = True
+            print(f"  [WSTAGE-VERDICT] WARNING two-MISS MISMATCH "
+                  f"({ctl_diff}/{ctl_shared} shared position(s) differ between "
+                  f"two MISS requests; first layer={first_bad2[0]} "
+                  f"pos={first_bad2[1]} stage={first_bad2[2]}) -> verdict "
+                  f"UNRELIABLE")
+
+    # union of (layer, abs_pos) over the MISS side and the HIT side.
+    miss_keys = {(ly, pos) for m in miss_maps for ly in m for pos in m[ly]}
+    hit_keys = {(ly, pos) for h in hit_maps for ly in h for pos in h[ly]}
+    shared = sorted(miss_keys & hit_keys)
+    if not shared:
+        print("  [WSTAGE-VERDICT] no (layer,pos) reached by BOTH a MISS and a "
+              "HIT -> cannot judge (need the SAME absolute window in both)")
+        print(WSTAGE_RUNBOOK)
+        return
+
+    offenders = []
+    modes = defaultdict(int)
+    n_same = 0
+    for ly, pos in shared:
+        first = None
+        for st in WSTAGES:
+            hashes = set()
+            for m in miss_maps:
+                v = m.get(ly, {}).get(pos, {}).get(st)
+                if v is not None:
+                    hashes.add(v)
+            for h in hit_maps:
+                v = h.get(ly, {}).get(pos, {}).get(st)
+                if v is not None:
+                    hashes.add(v)
+            if len(hashes) > 1:
+                first = st
+                break
+        if first is None:
+            n_same += 1
+        else:
+            modes[first] += 1
+            offenders.append((ly, pos, first))
+
+    for ly, pos, first in offenders[:MAX_WSTAGE_SHOWN]:
+        print(f"  [WSTAGE-VERDICT] layer={ly} pos={pos} "
+              f"first_diff_stage={first} "
+              f"miss={_wstage_stage_str(miss_maps, ly, pos)} "
+              f"hit={_wstage_stage_str(hit_maps, ly, pos)}")
+    if len(offenders) > MAX_WSTAGE_SHOWN:
+        print(f"  ... {len(offenders) - MAX_WSTAGE_SHOWN} more positions")
+
+    if modes:
+        mode_stage = sorted(modes,
+                            key=lambda s: (-modes[s], WSTAGES.index(s)))[0]
+        verdict = WSTAGE_VERDICT.get(mode_stage, "UNKNOWN")
+        mode_txt = mode_stage
+    else:
+        verdict = WSTAGE_ALL_SAME
+        mode_txt = "none"
+    suffix = " [UNRELIABLE]" if unreliable else ""
+    print(f"  [WSTAGE-VERDICT] S0..S5: first_diff_stage MODE = {mode_txt} "
+          f"(=> {verdict}){suffix}")
+    print(f"  [WSTAGE-VERDICT] positions_compared={len(shared)} "
+          f"same={n_same} diff={len(offenders)}")
+    print(WSTAGE_RUNBOOK)
+
+
 C4DEC_RUNBOOK = (
     "[C4DEC-RUNBOOK] windowed probe (compressor produced idxK vs stored pool):\n"
     "  DSV4_DUMP_C4DEC=2 DSV4_DUMP_IDXK=2 DSV4_DUMP_IDXIN=2 "
@@ -3246,7 +3453,7 @@ def verdict_c4stp(recs):
 
 def main(path):
     recs = parse(path)
-    for tag in ("CMPIDX", "IDXK", "C4KV", "C128KV", "C128X", "OSHAPE", "XIN", "LHID", "IDXIN", "LIMETA", "C4ST", "C4STP", "KSTATELOC", "C4POS", "C4DEC"):
+    for tag in ("CMPIDX", "IDXK", "C4KV", "C128KV", "C128X", "OSHAPE", "XIN", "LHID", "IDXIN", "LIMETA", "C4ST", "C4STP", "KSTATELOC", "C4POS", "C4DEC", "WSTAGE"):
         print(f"parsed {tag}: {len(recs.get(tag, []))} lines")
     if recs.get("CMPIDX"):
         cmp_reqs = segment(recs["CMPIDX"])
@@ -3265,8 +3472,14 @@ def main(path):
         miss_i = 0
         print("\nno [CMPIDX] lines; per-tag request split used (req0 = MISS).")
 
-    for tag in ("CMPIDX", "IDXK", "C4KV", "C128KV", "C128X", "OSHAPE", "XIN", "LHID", "IDXIN", "LIMETA", "C4ST", "KSTATELOC", "C4POS", "C4DEC"):
+    for tag in ("CMPIDX", "IDXK", "C4KV", "C128KV", "C128X", "OSHAPE", "XIN", "LHID", "IDXIN", "LIMETA", "C4ST", "KSTATELOC", "C4POS", "C4DEC", "WSTAGE"):
         rows = recs.get(tag, [])
+        if tag == "WSTAGE":
+            # Always-emit: real verdict, or the no-data runbook when the dump
+            # gate produced no rows. Needs the [C4POS]/[IDXIN] rows for the
+            # MISS/HIT split (same rule as the rest of the analyzer).
+            report_wstage(rows, recs.get("C4POS", []), recs.get("IDXIN", []))
+            continue
         if tag == "C4POS":
             # Emit this section ALWAYS (real verdict, or the no-data fallback
             # when the dump gate produced no rows), so the [C4POS] block is
@@ -3975,6 +4188,54 @@ def _selftest():
             "[LHID] layer=1 lastpos=17597 ntok=1 md5=full blkx=[]",
         ])
 
+        # --- [WSTAGE-VERDICT] write-side stage sweep (6 fixtures a-f) ---
+        # One line per position per stage:
+        #   [WSTAGE] layer=<L> pos=<p> stage=S<i> md5=<h>   (i in 0..5)
+        def _wstage(ly, pos, stage, md5):
+            return f"[WSTAGE] layer={ly} pos={pos} stage={stage} md5={md5}"
+
+        def _wstage_sweep(ly, pos, hashes):
+            """S0..S5 lines for one (layer,pos); ``hashes`` = 6 md5 values."""
+            return [_wstage(ly, pos, st, h)
+                    for st, h in zip(WSTAGES, hashes)]
+
+        W_LAYER, W_POS = 2, 17522
+        _base = ["a", "b", "c", "d", "e", "f"]
+
+        def _wstage_log(miss_hashes, hit_hashes, miss2=None):
+            """CHAT/C4POS-framed WSTAGE log: MISS (+ optional 2nd MISS) + HIT."""
+            lines = [CHAT, _c4pos_first(0)]
+            lines += _wstage_sweep(W_LAYER, W_POS, miss_hashes)
+            if miss2 is not None:
+                lines += [CHAT, _c4pos_first(0)]
+                lines += _wstage_sweep(W_LAYER, W_POS, miss2)
+            lines += [CHAT, _c4pos_first(16384)]
+            lines += _wstage_sweep(W_LAYER, W_POS, hit_hashes)
+            return lines
+
+        # (a) S1 diff, S0 same -> A-GEMM.
+        wa_log = _wstage_log(_base, ["a", "X", "c", "d", "e", "f"])
+        # (b) S3 diff with S0-S2 same -> C-ROPE.
+        wb_log = _wstage_log(_base, ["a", "b", "c", "X", "e", "f"])
+        # (c) S5 diff with S0-S4 same -> E-fp8-epilog.
+        wc_log = _wstage_log(_base, ["a", "b", "c", "d", "e", "X"])
+        # (d) all stages same (2 MISS + HIT) -> ALL-SAME + two-MISS IDENTICAL.
+        wd_log = _wstage_log(_base, _base, miss2=_base)
+        # (e) S0 diff -> UPSTREAM-INPUT.
+        we_log = _wstage_log(_base, ["X", "b", "c", "d", "e", "f"])
+        # (f) two-MISS mismatch at S1 (MISS2 S1=Z) with HIT == MISS1 -> UNRELIABLE.
+        wf_log = _wstage_log(_base, _base,
+                             miss2=["a", "Z", "c", "d", "e", "f"])
+        wa_out = _run_main(wa_log)
+        wb_out = _run_main(wb_log)
+        wc_out = _run_main(wc_log)
+        wd_out = _run_main(wd_log)
+        we_out = _run_main(we_log)
+        wf_out = _run_main(wf_log)
+        # absent [WSTAGE] rows -> runbook, never a false verdict.
+        w_none_out = _run_main([CHAT, _c4pos_first(0)])
+        w_parse = _parse_src(wa_log).get("WSTAGE", [])
+
         checks = [
             ("kpg full value parsed",
              bool(idxin) and idxin[0].get("kpg") == kpg_a),
@@ -4217,6 +4478,36 @@ def _selftest():
             ("[LHID-ACCEPT] no hpos -> CANNOT-VERIFY (no false PASS)",
              "S1 divergent=? => CANNOT-VERIFY" in la_nohpos_out
              and "S1 divergent=0 => PASS" not in la_nohpos_out),
+            ("[WSTAGE] parser: 12 rows, keyed by (layer,abs_pos,stage)",
+             len(w_parse) == 12
+             and _wstage_maps(w_parse)[2][17522]["S0"] == "a"
+             and _wstage_maps(w_parse)[2][17522]["S5"] == "f"),
+            ("[WSTAGE-VERDICT] (a) S1 diff -> A-GEMM",
+             "split_source=c4pos" in wa_out
+             and "first_diff_stage=S1" in wa_out
+             and "MODE = S1" in wa_out and "A-GEMM" in wa_out
+             and "UPSTREAM-INPUT" not in wa_out),
+            ("[WSTAGE-VERDICT] (b) S3 diff (S0-S2 same) -> C-ROPE",
+             "first_diff_stage=S3" in wb_out
+             and "MODE = S3" in wb_out and "C-ROPE" in wb_out),
+            ("[WSTAGE-VERDICT] (c) S5 diff (S0-S4 same) -> E-fp8-epilog",
+             "first_diff_stage=S5" in wc_out
+             and "MODE = S5" in wc_out and "E-fp8-epilog" in wc_out),
+            ("[WSTAGE-VERDICT] (d) all same -> ALL-SAME",
+             "MODE = none" in wd_out and "ALL-SAME" in wd_out
+             and "first_diff_stage=S" not in wd_out),
+            ("[WSTAGE-VERDICT] (d) two-MISS IDENTICAL (control non-vacuous)",
+             "two-MISS IDENTICAL" in wd_out),
+            ("[WSTAGE-VERDICT] (e) S0 diff -> UPSTREAM-INPUT",
+             "first_diff_stage=S0" in we_out
+             and "MODE = S0" in we_out and "UPSTREAM-INPUT" in we_out),
+            ("[WSTAGE-VERDICT] (f) two-MISS MISMATCH -> UNRELIABLE",
+             "two-MISS MISMATCH" in wf_out
+             and "UNRELIABLE" in wf_out),
+            ("[WSTAGE-VERDICT] no [WSTAGE] rows -> runbook, no false verdict",
+             "no [WSTAGE] rows" in w_none_out
+             and "DSV4_DUMP_WSTAGE=1" in w_none_out
+             and "ALL-SAME" not in w_none_out),
         ]
         failed = [name for name, ok in checks if not ok]
         for name, ok in checks:
