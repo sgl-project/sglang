@@ -56,6 +56,9 @@ def single_gpu(monkeypatch, default_global_server_args, single_process_model_par
             param_dtype=torch.bfloat16, reduce_dtype=torch.float32
         ),
     )
+    # MIOpen may pick non-reproducible conv kernels unless determinism is requested
+    monkeypatch.setattr(torch.backends.cudnn, "benchmark", False)
+    monkeypatch.setattr(torch.backends.cudnn, "deterministic", True)
     args = get_global_server_args()
     args.attention_backend = "fa"
     args.pipeline_config = Kandinsky6TI2VAPipelineConfig()
