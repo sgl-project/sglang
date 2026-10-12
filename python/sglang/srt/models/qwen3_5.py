@@ -1241,9 +1241,11 @@ def _refreshes_rope_cos_sin(
             get_parallel().pp_rank,
             get_parallel().pp_size,
         )
-    # Full-attention layers are interval apart, so only the first one in the
-    # stage lies within interval of its start.
-    return stage_start <= layer_id < stage_start + config.full_attention_interval
+    owned_by_stage = layer_id >= stage_start
+    # Full-attention layers are interval apart, so only the stage's first one
+    # lies within interval of its start.
+    first_in_stage = layer_id < stage_start + config.full_attention_interval
+    return owned_by_stage and first_in_stage
 
 
 class Qwen3_5AttentionDecoderLayer(nn.Module):
