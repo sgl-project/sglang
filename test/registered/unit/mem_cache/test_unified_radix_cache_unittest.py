@@ -1574,7 +1574,10 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         seed = kv_event_namespace_seed(extra_key="uuid-a", cache_salt=None)
         self.assertEqual(
             self._event_hashes(lora_a),
-            [namespaced_block_hash(h, namespace_seed=seed) for h in self._event_hashes(base)],
+            [
+                namespaced_block_hash(h, namespace_seed=seed)
+                for h in self._event_hashes(base)
+            ],
         )
         # Another load of the same public name has distinct external IDs.
         self.assertNotEqual(

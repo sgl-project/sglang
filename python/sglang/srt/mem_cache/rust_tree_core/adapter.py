@@ -122,9 +122,13 @@ def _kv_event_from_tagged(
         lora_names.count_published(event[8], len(event[1]))
         parent = event[2]
         return BlockStored(
-            block_hashes=[namespaced_block_hash(h, namespace_seed=seed) for h in event[1]],
+            block_hashes=[
+                namespaced_block_hash(h, namespace_seed=seed) for h in event[1]
+            ],
             parent_block_hash=(
-                None if parent is None else namespaced_block_hash(parent, namespace_seed=seed)
+                None
+                if parent is None
+                else namespaced_block_hash(parent, namespace_seed=seed)
             ),
             token_ids=event[3],
             block_size=event[4],
@@ -142,7 +146,9 @@ def _kv_event_from_tagged(
         )
         lora_names.count_published(event[3], -len(event[1]))
         return BlockRemoved(
-            block_hashes=[namespaced_block_hash(h, namespace_seed=seed) for h in event[1]],
+            block_hashes=[
+                namespaced_block_hash(h, namespace_seed=seed) for h in event[1]
+            ],
             medium=StorageMedium(event[2]),
         )
     if tag == "all_blocks_cleared":
@@ -649,9 +655,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         self, node_id: NodeId, is_write_back: bool
     ) -> EvictDeviceLeafResult:
         # The binding reads is_write_back from the core's current config.
-        assert is_write_back == self.is_write_back, (
-            "is_write_back must match the core's current config"
-        )
+        assert (
+            is_write_back == self.is_write_back
+        ), "is_write_back must match the core's current config"
         binding_result = self._binding.evict_device_leaf(node_id)
         backup = binding_result.backup_kv
         result = EvictDeviceLeafResult(
