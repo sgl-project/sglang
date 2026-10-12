@@ -120,7 +120,7 @@ class AscendRunnerCore(MoeRunnerCore):
 
         kernel = config.layer.w2_kernel
 
-        if _uses_fused_gmm1(kernel, config):
+        if _uses_fused_gmm1(kernel, config) and config.activation != "situ":
             # Fused methods (MXFP8; MXFP4 W4A8 via use_fused_gmm1) fold
             # gate/up + swiglu + requant into gmm1, so there is no separate
             # activation step — run() skips it. Left None on purpose so that
@@ -219,7 +219,10 @@ class AscendRunnerCore(MoeRunnerCore):
 
         w13_kernel = self.config.layer.w13_kernel
 
-        if _uses_fused_gmm1(w13_kernel, self.config):
+        if (
+            _uses_fused_gmm1(w13_kernel, self.config)
+            and self.config.activation != "situ"
+        ):
             # --- w13 projection + activation, fused into one kernel ---
             # The fused gmm1 returns activations already requantised for gmm2,
             # so there is no separate activation step to run.
