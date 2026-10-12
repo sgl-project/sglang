@@ -2,13 +2,15 @@
 
 The scheduler changes ``DecodingBatch.rows`` only through the methods below,
 except PrefillAdder's priority preemption, which filters the rows in place.
-``join`` and ``park_for_mix`` may replace the rows object; the other methods
-keep it, so a reference to ``rows`` stays valid across them.
+``join``, ``join_launched`` and ``park_for_mix`` may replace the rows object;
+the other methods keep it, so a reference to ``rows`` stays valid across them.
 
-Under get_next_batch_to_run a decode step is a copy of the rows, and ``absorb``
-takes back what its run and commit rebound before the next plan. The PD decode
-normal and overlap loops launch such a copy too, and take it back at launch.
-The pipeline PD decode loop and pdmux still launch the rows themselves.
+The rows are never a step, except in the pipeline PD decode loop and pdmux,
+which still launch the rows themselves. A decode step is a copy of the rows,
+and ``absorb`` takes back the fields it rebound before the next plan reads
+them. The normal and overlap loops, PD decode's included, take it back right
+after its launch, before its commit, so a commit must not rebind a field of the
+step that the rows need.
 
 The normal and overlap loops join and leave at launch and commit
 (``rows_join_at_launch``), so between their steps the rows are exactly the
@@ -50,7 +52,11 @@ class DecodingBatch:
     def join_launched(self, step: ScheduleBatch) -> None:
         """Join a copy of the rows whose last prefill chunk step ran: all of
         its rows but the request still chunking. A mixed step ran the rows as
-        its tail, so its rows, new before old, replace them."""
+        its tail, so its rows, new before old, replace them.
+
+        The copy shares the step's sampling_info and spec_info, and its filter
+        changes them in place right after the launch, before the step's
+        commit: a commit must not read either of them by row."""
         if not step.has_prefill_rows():
             return
         still_chunking = [] if step.chunked_req is None else [step.chunked_req]
@@ -91,9 +97,10 @@ class DecodingBatch:
         return self._step
 
     def absorb(self) -> None:
-        """Take back the fields the last decode step's run and commit rebound,
-        except the DP extend view's: they describe that one step, and the rows
-        keep decoding."""
+        """Take back the fields the last decode step rebound since it was
+        copied: its run's, and its commit's when this runs after the commit.
+        The DP extend view's fields stay out: they describe that one step, and
+        the rows keep decoding."""
         step, self._step = self._step, None
         if step is None:
             return
