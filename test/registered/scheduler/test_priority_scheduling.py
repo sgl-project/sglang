@@ -57,19 +57,14 @@ class TestPriorityScheduling(CustomTestCase):
     def test_priority_scheduling_request_ordering_validation(self):
         """Verify pending requests are ordered by priority and received timestamp."""
 
-        responses = asyncio.run(
-            send_concurrent_generate_requests_with_custom_params(
-                self.base_url,
-                [
-                    {
-                        "priority": 0,
-                        "sampling_params": {"max_new_tokens": 10000},
-                    },  # starts being processed first
-                    {"priority": 1},  # third
-                    {"priority": 1},  # fourth
-                    {"priority": 2},  # second
-                ],
-            )
+        responses, finish_times = _send_in_waves(
+            self.base_url,
+            [
+                [_HOLDER | {"priority": 0}],  # starts being processed first
+                [{"priority": 1}],  # third
+                [{"priority": 1}],  # fourth
+                [{"priority": 2}],  # second
+            ],
         )
 
         expected_status_and_error_messages = [
@@ -79,31 +74,22 @@ class TestPriorityScheduling(CustomTestCase):
             (200, None),
         ]
 
-        e2e_latencies = []
-        _verify_genereate_responses(
-            responses, expected_status_and_error_messages, e2e_latencies
-        )
-        assert e2e_latencies[0] < e2e_latencies[3] < e2e_latencies[1] < e2e_latencies[2]
+        _verify_genereate_responses(responses, expected_status_and_error_messages, [])
+        assert finish_times[0] < finish_times[3] < finish_times[1] < finish_times[2]
 
     def test_priority_scheduling_existing_requests_abortion_validation(self):
         """Verify lower priority requests are aborted when incoming requests have higher priority"""
 
-        responses = asyncio.run(
-            send_concurrent_generate_requests_with_custom_params(
-                self.base_url,
-                [
-                    {
-                        "priority": 1,
-                        "sampling_params": {"max_new_tokens": 10000},
-                    },  # starts being processed first and holds the running queue capacity
-                    {"priority": 2},  # aborted by request 5
-                    {"priority": 3},  # aborted by request 6
-                    {"priority": 4},  # aborted by request 7
-                    {"priority": 5},  # fourth
-                    {"priority": 6},  # third
-                    {"priority": 7},  # second
-                ],
-            )
+        responses, finish_times = _send_in_waves(
+            self.base_url,
+            [
+                # starts being processed first and holds the running queue capacity
+                [_HOLDER | {"priority": 1}],
+                # fill the waiting queue; each is aborted by a later request
+                [{"priority": 2}, {"priority": 3}, {"priority": 4}],
+                # finish fourth, third, second
+                [{"priority": 5}, {"priority": 6}, {"priority": 7}],
+            ],
         )
 
         expected_status_and_error_messages = [
@@ -116,31 +102,22 @@ class TestPriorityScheduling(CustomTestCase):
             (200, None),
         ]
 
-        e2e_latencies = []
-        _verify_genereate_responses(
-            responses, expected_status_and_error_messages, e2e_latencies
-        )
-        assert e2e_latencies[0] < e2e_latencies[6] < e2e_latencies[5] < e2e_latencies[4]
+        _verify_genereate_responses(responses, expected_status_and_error_messages, [])
+        assert finish_times[0] < finish_times[6] < finish_times[5] < finish_times[4]
 
     def test_priority_scheduling_incoming_request_rejection_validation(self):
         """Verify incoming requests are rejected when existing requests have higher priority"""
 
-        responses = asyncio.run(
-            send_concurrent_generate_requests_with_custom_params(
-                self.base_url,
-                [
-                    {
-                        "priority": 7,
-                        "sampling_params": {"max_new_tokens": 10000},
-                    },  # starts being processed first and holds the running queue capacity
-                    {"priority": 6},  # second
-                    {"priority": 5},  # third
-                    {"priority": 4},  # fourth
-                    {"priority": 3},  # rejected
-                    {"priority": 2},  # rejected
-                    {"priority": 1},  # rejected
-                ],
-            )
+        responses, finish_times = _send_in_waves(
+            self.base_url,
+            [
+                # starts being processed first and holds the running queue capacity
+                [_HOLDER | {"priority": 7}],
+                # fill the waiting queue; finish second, third, fourth
+                [{"priority": 6}, {"priority": 5}, {"priority": 4}],
+                # rejected: the queue is full of higher-priority requests
+                [{"priority": 3}, {"priority": 2}, {"priority": 1}],
+            ],
         )
 
         expected_status_and_error_messages = [
@@ -153,11 +130,8 @@ class TestPriorityScheduling(CustomTestCase):
             (503, "The request queue is full."),
         ]
 
-        e2e_latencies = []
-        _verify_genereate_responses(
-            responses, expected_status_and_error_messages, e2e_latencies
-        )
-        assert e2e_latencies[0] < e2e_latencies[1] < e2e_latencies[2] < e2e_latencies[3]
+        _verify_genereate_responses(responses, expected_status_and_error_messages, [])
+        assert finish_times[0] < finish_times[1] < finish_times[2] < finish_times[3]
 
     def test_priority_scheduling_preemption_meeting_threshold_validation(self):
         """Verify running requests are preempted by requests with priorities meeting the preemption threshold"""
@@ -376,6 +350,46 @@ class TestPrioritySchedulingMultipleRunningRequests(CustomTestCase):
 
         # FIXME(harrison lim)
         # assert e2e_latencies[2] < e2e_latencies[3] < e2e_latencies[1] < e2e_latencies[0]
+
+
+# Holds the only running slot while later waves arrive: ignore_eos keeps it
+# running for its full length.
+_HOLDER = {"sampling_params": {"max_new_tokens": 1000, "ignore_eos": True}}
+
+
+def _send_in_waves(
+    base_url: str, waves: List[List[dict]], gap_s: float = 0.3
+) -> Tuple[List[Tuple[int, Any]], List[Optional[float]]]:
+    """Send each wave concurrently, gap_s after the previous one.
+
+    asyncio.gather gives no arrival-order guarantee, so requests whose
+    relative arrival matters go in separate waves. Returns the responses in
+    order and each request's finish time (send offset + server e2e latency),
+    or None for a failed request.
+    """
+
+    async def _run():
+        tasks, offsets = [], []
+        for i, wave in enumerate(waves):
+            if i:
+                await asyncio.sleep(gap_s)
+            tasks.append(
+                asyncio.create_task(
+                    send_concurrent_generate_requests_with_custom_params(base_url, wave)
+                )
+            )
+            offsets += [i * gap_s] * len(wave)
+        responses = []
+        for task in tasks:
+            responses += await task
+        return responses, offsets
+
+    responses, offsets = asyncio.run(_run())
+    finish_times = [
+        offset + body["meta_info"]["e2e_latency"] if status == 200 else None
+        for (status, body), offset in zip(responses, offsets)
+    ]
+    return responses, finish_times
 
 
 def _verify_genereate_responses(
