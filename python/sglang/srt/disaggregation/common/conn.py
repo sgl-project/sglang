@@ -112,6 +112,7 @@ class PrefillServerInfo:
     kv_cache_dtype: Optional[str]
     follow_bootstrap_room: bool
     enable_dsa_cache_layer_split: bool = False
+    enable_cp_tp_group_sharing: bool = False
     dsv41_spec_layout: Optional[dict] = None
     decode_allocation_policy: str = "early"
 
@@ -140,6 +141,7 @@ class PrefillServerInfo:
         )
         self.follow_bootstrap_room = bool(self.follow_bootstrap_room)
         self.enable_dsa_cache_layer_split = bool(self.enable_dsa_cache_layer_split)
+        self.enable_cp_tp_group_sharing = bool(self.enable_cp_tp_group_sharing)
         self.prefill_http_port = (
             int(self.prefill_http_port) if self.prefill_http_port is not None else None
         )
@@ -320,6 +322,7 @@ class CommonKVManager(BaseKVManager):
         self.attn_tp_rank = parallel.attn_tp_rank
         self.attn_cp_size = parallel.attn_cp_size
         self.attn_cp_rank = parallel.attn_cp_rank
+        self.enable_cp_tp_group_sharing = parallel.enable_cp_tp_group_sharing
         self.dcp_size = parallel.attn_dcp_size
         self.dcp_rank = parallel.attn_dcp_rank
         self.attn_dp_size = parallel.attn_dp_size
@@ -341,6 +344,7 @@ class CommonKVManager(BaseKVManager):
         )
         self.enable_all_cp_ranks_for_transfer = (
             envs.SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER.get()
+            or self.enable_cp_tp_group_sharing
             or cp_sharded_prefill
             or hybrid_decode_pulls_all_ranks
         )
@@ -465,12 +469,15 @@ class CommonKVManager(BaseKVManager):
         Prefill CP materializes global token order before writing state pools, so
         every CP rank holds the same state. When all CP ranks transfer their KV
         shards, only rank 0 needs to send that state. Cache layer split is the
-        exception because each CP rank owns different state layers.
+        exception because each CP rank owns different state layers. With CP/TP
+        sharing, each rank sends to a different decode TP rank, including its
+        TP-owned recurrent state and a complete copy of replicated state.
         """
         return (
             self.attn_cp_size > 1
             and self.attn_cp_rank != 0
             and not get_parallel().enable_dsa_cache_layer_split
+            and not getattr(self, "enable_cp_tp_group_sharing", False)
         )
 
     def requires_dcp_relayout(self, dst_dcp_size: int, dst_dcp_rank: int) -> bool:
@@ -1242,6 +1249,31 @@ class CommonKVManager(BaseKVManager):
     def _resolve_rank_mapping(self, info: PrefillServerInfo) -> None:
         """Compute TP/CP/PP rank mapping and store on the PrefillServerInfo object.
         Deterministic for a given (bootstrap_addr, decode engine) pair."""
+        if info.enable_cp_tp_group_sharing:
+            # DSA KV/KPool is replicated, while KDA and the external draft use
+            # full-TP head shards. One physical sender per receiver preserves
+            # both layouts without racing replicated writes or re-slicing KDA
+            # according to the target's (size-one) attention TP group.
+            if not (
+                info.attn_tp_size == 1
+                and info.attn_cp_size == self.attn_tp_size
+                and self.attn_cp_size == 1
+                and info.dp_size == self.attn_dp_size == 1
+                and info.pp_size == self.pp_size == 1
+                and not info.enable_dsa_cache_layer_split
+            ):
+                raise ValueError(
+                    "CP/TP-sharing PD requires matching prefill CP and decode TP "
+                    "sizes, DP=PP=1, and no cache layer split."
+                )
+            info.target_tp_rank = 0
+            info.target_tp_ranks = [0]
+            info.target_cp_ranks = [self.kv_args.engine_rank % self.attn_tp_size]
+            info.target_pp_ranks = [0]
+            info.required_dst_info_num = 1
+            info.required_prefill_response_num = 1
+            return
+
         # TP rank mapping
         if self.attn_tp_size == info.attn_tp_size:
             target_tp_rank = self.kv_args.engine_rank % self.attn_tp_size
@@ -1387,6 +1419,7 @@ class CommonKVManager(BaseKVManager):
             "dsv41_spec_layout": self.dsv41_spec_layout,
             "load_balance_method": get_parallel().load_balance_method,
             "enable_dsa_cache_layer_split": get_parallel().enable_dsa_cache_layer_split,
+            "enable_cp_tp_group_sharing": get_parallel().enable_cp_tp_group_sharing,
             # Self-register the HTTP API port so the decode can derive the PD
             # retract rebootstrap /generate URL from bootstrap info instead of a
             # router-injected pd_rebootstrap_prefill_url.
@@ -1932,6 +1965,7 @@ class CommonKVSender(BaseKVSender):
         if (
             self.kv_mgr.enable_all_cp_ranks_for_transfer
             and not get_parallel().enable_dsa_cache_layer_split
+            and not getattr(self.kv_mgr, "enable_cp_tp_group_sharing", False)
         ):
             kv_indices, index_slice = filter_kv_indices_for_cp_rank(
                 self.kv_mgr,
@@ -2494,6 +2528,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.dsv41_spec_layout: Optional[dict] = None
         self.follow_bootstrap_room: Optional[bool] = None
         self.enable_dsa_cache_layer_split: Optional[bool] = None
+        self.enable_cp_tp_group_sharing: Optional[bool] = None
         self.prefill_http_port: Optional[int] = None
         self.decode_allocation_policy = "early"
         self.prefill_port_table: Dict[
@@ -2564,6 +2599,10 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         kv_cache_dtype = data["kv_cache_dtype"]
         prefill_http_port = data.get("prefill_http_port")
         dsv41_spec_layout = data.get("dsv41_spec_layout")
+        cp_tp_sharing = bool(data.get("enable_cp_tp_group_sharing", False))
+        if self._registered_count and self.enable_cp_tp_group_sharing != cp_tp_sharing:
+            return web.Response(text="Inconsistent prefill CP/TP sharing", status=400)
+        self.enable_cp_tp_group_sharing = cp_tp_sharing
 
         if self._registered_count and self.dsv41_spec_layout != dsv41_spec_layout:
             return web.Response(
@@ -2675,6 +2714,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                     else True
                 ),
                 enable_dsa_cache_layer_split=bool(self.enable_dsa_cache_layer_split),
+                enable_cp_tp_group_sharing=bool(self.enable_cp_tp_group_sharing),
                 prefill_http_port=self.prefill_http_port,
                 decode_allocation_policy=self.decode_allocation_policy,
             )

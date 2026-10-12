@@ -1904,6 +1904,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     )
                 if (
                     target_rank_registration_info is not None
+                    and not getattr(self, "enable_cp_tp_group_sharing", False)
                     and self.attn_tp_size
                     != target_rank_registration_info.dst_attn_tp_size
                 ):
