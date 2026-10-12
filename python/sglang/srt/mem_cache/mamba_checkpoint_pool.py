@@ -249,7 +249,12 @@ class MambaCheckpointPool:
         cache = active_mamba_pool.mamba_cache
         self.temporal.store_from_pool(cache.temporal, active_slots, ckpt_slots)
         for i, c in enumerate(self.conv):
-            c[:, ckpt_slots] = cache.conv[i][:, active_slots]
+            src = cache.conv[i][:, active_slots]
+            # The active pool may store conv windows transposed (e.g. NPU
+            # backend allocates (k, d) while cache_params.shape.conv is (d, k)).
+            if src.shape[-2:] != c.shape[-2:]:
+                src = src.transpose(-1, -2)
+            c[:, ckpt_slots] = src
 
     def load_to_active(self, active_mamba_pool, ckpt_slots, active_slots) -> None:
         """Dequantize temporal + copy conv from checkpoint slots into the active pool
@@ -257,7 +262,11 @@ class MambaCheckpointPool:
         cache = active_mamba_pool.mamba_cache
         self.temporal.copy_to_pool(cache.temporal, ckpt_slots, active_slots)
         for i, c in enumerate(self.conv):
-            cache.conv[i][:, active_slots] = c[:, ckpt_slots].to(cache.conv[i].dtype)
+            dst = cache.conv[i][:, active_slots]
+            val = c[:, ckpt_slots].to(dst.dtype)
+            if dst.shape[-2:] != val.shape[-2:]:
+                val = val.transpose(-1, -2)
+            dst[:] = val
 
     @staticmethod
     def estimate_mem_usage_bytes(
