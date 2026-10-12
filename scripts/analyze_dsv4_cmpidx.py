@@ -355,21 +355,57 @@ def _seq_max(v):
     return int(m.group(2)) if m else -1
 
 
-def _idxin_requests(rows):
-    """Split [IDXIN] rows into requests (new request when lastpos decreases).
+def _idxin_stream_sig(r):
+    """Boundary signature of one [IDXIN] row: ``(mode, slq, slk)``."""
+    return (r.get("mode", "?"), r.get("slq", "?"), r.get("slk", "?"))
 
-    [IDXIN] carries no ``lastpos``; ``parse`` fills it from the preceding
-    [CMPIDX], so the same order-based split used for the other tags applies.
+
+def _idxin_requests_by_stream(rows):
+    """No-[CMPIDX] fallback split of the [IDXIN] stream into requests.
+
+    Each request emits its own [IDXIN] lines with a CONSTANT ``(mode, slq,
+    slk)`` signature, so a new request starts whenever that signature changes
+    (the ``(mode,slq,slk)`` stream resets/repeats).  The layer index also
+    RESETS (drops) on a new request, which additionally separates two adjacent
+    requests that happen to share the signature (e.g. repeated identical HIT
+    curls).  MISS is later picked as the request with the LARGEST prefill
+    ``slq`` (see ``_idxin_miss_index``) -- no [CMPIDX] needed.
     """
     reqs = []
-    last_lp = None
+    prev_sig = None
+    prev_ly = None
     for r in rows:
-        lp = _int(r, "lastpos")
-        if not reqs or (last_lp is not None and lp < last_lp):
+        sig = _idxin_stream_sig(r)
+        ly = _int(r, "layer")
+        if (not reqs or sig != prev_sig
+                or (prev_ly is not None and 0 <= ly < prev_ly)):
             reqs.append([])
         reqs[-1].append(r)
-        last_lp = lp
+        prev_sig = sig
+        prev_ly = ly
     return reqs
+
+
+def _idxin_requests(rows):
+    """Split [IDXIN] rows into requests.
+
+    Prefers the order-based split keyed on ``lastpos`` -- which ``parse`` fills
+    from the preceding [CMPIDX] -- so logs WITH [CMPIDX] keep the existing
+    behaviour.  When the log has NO [CMPIDX] at all there is no ``lastpos`` to
+    key on, so fall back to the self-contained ``(mode,slq,slk)`` run split
+    (``_idxin_requests_by_stream``), which needs nothing but [IDXIN] itself.
+    """
+    if any(_int(r, "lastpos") >= 0 for r in rows):
+        reqs = []
+        last_lp = None
+        for r in rows:
+            lp = _int(r, "lastpos")
+            if not reqs or (last_lp is not None and lp < last_lp):
+                reqs.append([])
+            reqs[-1].append(r)
+            last_lp = lp
+        return reqs
+    return _idxin_requests_by_stream(rows)
 
 
 def _idxin_miss_index(reqs):
@@ -513,6 +549,12 @@ def report_idxin_verdict(rows):
               f"=> {verdict}{extra}")
 
 
+def _short(v, n=64):
+    """``str(v)`` truncated to ``n`` chars (with an ellipsis when cut)."""
+    s = str(v)
+    return s if len(s) <= n else s[:n - 3] + "..."
+
+
 def _knorm_mean(v):
     """Leading float of ``knorm=<mean>:<n>:<rd>`` (or None when unparseable)."""
     if not v:
@@ -577,11 +619,12 @@ def report_idxin_rope(rows, knorm_tol=0.05):
         print("  [IDXIN-ROPE] <2 requests -> MISS/HIT RoPE split skipped")
         return
     miss_i = _idxin_miss_index(reqs)
-    knorms, shifts = [], []
+    knorms, shifts, phases = [], [], []
     for g in reqs:
         knorms.append(sorted({r.get("knorm") for r in g if r.get("knorm")}))
         shifts.append(sorted({_rope_shift(r.get("ropephase")) for r in g
                               if _rope_shift(r.get("ropephase")) is not None}))
+        phases.append(sorted({r.get("ropephase") for r in g if r.get("ropephase")}))
     print(f"  [IDXIN-ROPE] MISS=req{miss_i} (largest prefill slq); "
           f"{len(reqs) - 1} HIT request(s)  knorm_tol={knorm_tol}")
     for i, _g in enumerate(reqs[:MAX_REQ_SHOWN]):
@@ -589,8 +632,9 @@ def report_idxin_rope(rows, knorm_tol=0.05):
         kmeans = [_knorm_mean(v) for v in knorms[i]]
         kmean_txt = ",".join(
             "?" if m is None else f"{m:.4g}" for m in kmeans[:MAX_DIFF_SHOWN])
+        ph_txt = ";".join(_short(v) for v in phases[i][:2]) or "-"
         print(f"     req{i} {role} knorm[{len(knorms[i])}]={kmean_txt or '-'} "
-              f"shift={shifts[i] or '-'}")
+              f"shift={shifts[i] or '-'} ropephase[{len(phases[i])}]={ph_txt}")
 
     miss_kn = [m for m in (_knorm_mean(v) for v in knorms[miss_i])
                if m is not None]
@@ -1382,7 +1426,10 @@ def _selftest():
 
     Builds a synthetic log with one SAME probe (layer 5) and one READ-PAGE
     divergent probe (layer 7, same klog / different kpg) plus [KSTATELOC] rows,
-    then asserts both the raw parse and the printed verdict strings.
+    then asserts both the raw parse and the printed verdict strings.  ALSO builds
+    two synthetic logs WITHOUT any [CMPIDX] (the ">2 requests" fallback path) and
+    asserts the ``(mode,slq,slk)`` stream split reaches both the ROPE-PHASE and
+    the CONTENT/WINDOW [IDXIN-ROPE] branches.
     """
     import contextlib
     import io
@@ -1447,6 +1494,44 @@ def _selftest():
             report_kstateloc(ks)
         out = buf.getvalue()
 
+        # --- no-[CMPIDX] fallback: split [IDXIN] purely from its own stream ---
+        # B1: same knorm (RoPE-invariant) + differing klog -> ROPE-PHASE.
+        nocmp_rope = [
+            _idxin(5, 17523, "aaaa", kpg_a, knorm="1.0:100:64", shift=0),
+            _idxin(7, 17523, "bbbb", kpg_a, knorm="1.0:100:64", shift=0),
+            _idxin(5, 1139, "cccc", kpg_a, knorm="1.0:100:64", shift=4096),
+            _idxin(7, 1139, "dddd", kpg_a, knorm="1.0:100:64", shift=4096),
+        ]
+        # B2: differing knorm (rel=0.5 > tol=0.05) -> CONTENT/WINDOW.
+        nocmp_content = [
+            _idxin(5, 17523, "aaaa", kpg_a, knorm="1.0:100:64", shift=0),
+            _idxin(5, 1139, "aaaa", kpg_a, knorm="2.0:100:64", shift=4096),
+        ]
+
+        def _run_nocmp(src_lines):
+            """Parse + report a synthetic no-[CMPIDX] log; return (rows, out)."""
+            fd2, p2 = tempfile.mkstemp(suffix=".log", prefix="cmpidx_selftest_")
+            try:
+                with os.fdopen(fd2, "w", encoding="utf-8") as fh2:
+                    fh2.write("\n".join(src_lines) + "\n")
+                irows = parse(p2).get("IDXIN", [])
+                buf2 = io.StringIO()
+                with contextlib.redirect_stdout(buf2):
+                    report_idxin_requests(irows)
+                    report_idxin_verdict(irows)
+                    report_idxin_rope(irows)
+                return irows, buf2.getvalue()
+            finally:
+                try:
+                    os.remove(p2)
+                except OSError:
+                    pass
+
+        b1_rows, b1_out = _run_nocmp(nocmp_rope)
+        b2_rows, b2_out = _run_nocmp(nocmp_content)
+        b1_reqs = _idxin_requests(b1_rows)
+        b2_reqs = _idxin_requests(b2_rows)
+
         checks = [
             ("kpg full value parsed",
              bool(idxin) and idxin[0].get("kpg") == kpg_a),
@@ -1477,6 +1562,19 @@ def _selftest():
              "[IDXIN-ROPE] " in out and "=> ROPE-PHASE" in out),
             ("[KSTATELOC-W] out sequence printed",
              "out=17520" in out and "out=17524" in out),
+            ("no-CMPIDX fallback split >=2 requests",
+             len(b1_reqs) >= 2 and len(b2_reqs) >= 2),
+            ("no-CMPIDX fallback MISS = largest slq (req0)",
+             _idxin_miss_index(b1_reqs) == 0),
+            ("[IDXIN-KM] runs on fallback (not <2 skipped)",
+             "[IDXIN-KM] MISS=req0" in b1_out
+             and "<2 requests" not in b1_out),
+            ("[IDXIN-ROPE] fallback ROPE-PHASE branch",
+             "=> ROPE-PHASE" in b1_out),
+            ("[IDXIN-ROPE] fallback CONTENT/WINDOW branch",
+             "=> CONTENT/WINDOW" in b2_out),
+            ("[IDXIN-ROPE] per-request knorm+ropephase printed",
+             "knorm[" in b1_out and "ropephase[" in b1_out),
         ]
         failed = [name for name, ok in checks if not ok]
         for name, ok in checks:
