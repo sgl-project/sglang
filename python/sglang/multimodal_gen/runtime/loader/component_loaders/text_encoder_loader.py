@@ -5,7 +5,7 @@ from collections.abc import Generator
 import torch
 import transformers
 from torch import nn
-from transformers import PretrainedConfig
+from transformers import AutoConfig, PretrainedConfig
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
 from sglang.multimodal_gen.configs.models import EncoderConfig
@@ -79,11 +79,13 @@ from sglang.multimodal_gen.runtime.models.encoders.base import (
     finalize_encoder_folding,
     get_folding_tp_group,
 )
+from sglang.multimodal_gen.runtime.models.encoders.gemma_4_unified import (
+    NATIVE_LAYERWISE_ADAPTERS,
+)
 from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
-    get_config,
     get_diffusers_component_config,
     load_dict,
 )
@@ -474,6 +476,24 @@ class TextEncoderLoader(OnlineQuantizationComponentLoader):
                     return transformers_model_class
         return transformers.AutoModel
 
+    def load_native(
+        self,
+        component_model_path: str,
+        server_args: ServerArgs,
+        transformers_or_diffusers: str,
+        component_name: str | None = None,
+    ):
+        model = super().load_native(
+            component_model_path,
+            server_args,
+            transformers_or_diffusers,
+            component_name,
+        )
+        # A native encoder with no SGLang port can still stream its decoder
+        # stack when its layout is known; see NATIVE_LAYERWISE_ADAPTERS.
+        adapter = NATIVE_LAYERWISE_ADAPTERS.get(type(model).__name__)
+        return model if adapter is None else adapter(model)
+
     def _get_all_weights(
         self,
         model: EncoderTensorParallelMixin,
@@ -568,7 +588,7 @@ class TextEncoderLoader(OnlineQuantizationComponentLoader):
         server_args: ServerArgs,
         component_name: str,
     ) -> EncoderConfig:
-        diffusers_pretrained_config = get_config(
+        diffusers_pretrained_config = AutoConfig.from_pretrained(
             component_model_path, trust_remote_code=True
         )
         encoder_index = self._extract_encoder_index(
