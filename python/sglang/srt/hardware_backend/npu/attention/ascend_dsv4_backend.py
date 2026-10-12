@@ -4193,6 +4193,7 @@ class DeepseekV4AscendAttnBackend(
             layer_id=layer_id,
             loc=swa_loc,
             cache=swa_k,
+            positions=getattr(forward_batch, "positions", None),
         )
 
     def _build_npu_compress_metadata_verify(self, forward_batch: ForwardBatch) -> None:

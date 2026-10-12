@@ -1949,11 +1949,41 @@ class MQALayer(MqaAttentionBase):
             q = q.view(-1, self.n_local_heads, self.head_dim)
             q = torch_npu.npu_rms_norm(q, self.q_rms_norm_ones, self.eps)[0]
 
+            # READ-ONLY write-side staged probe (env: DSV4_DUMP_WSTAGE). Hashes
+            # the KV row at each stage of the L0 KV write, keyed by absolute
+            # position, so a MISS-vs-HIT diff isolates GEMM (S1) vs norm (S2) vs
+            # rope (S3) vs epilog (S4/S5). Disabled => empty row list, no import;
+            # never touches compute. Guarded end to end.
+            _wstage = None
+            _wstage_rows = []
+            try:
+                import os as _wstage_os
+
+                if _wstage_os.environ.get("DSV4_DUMP_WSTAGE"):
+                    from sglang.srt.hardware_backend.npu.dsv4 import (
+                        dsv4_wstage_probe as _wstage,
+                    )
+
+                    _wstage_rows = _wstage.select_rows(positions)
+            except Exception:
+                _wstage = None
+                _wstage_rows = []
+
+            if _wstage is not None:
+                # S0 pre-GEMM layer input feeding the projection (optional).
+                _wstage.emit_bf16("S0", self.layer_id, x_linear, _wstage_rows)
+
             if qkv_a is not None:
                 kv = qkv_a[..., self.q_lora_rank :]
             else:
                 kv, _ = self.wkv(x)
+            if _wstage is not None:
+                # S1 post-GEMM bf16 kv, before kv_norm.
+                _wstage.emit_bf16("S1", self.layer_id, kv, _wstage_rows)
             kv = self.kv_norm(kv)
+            if _wstage is not None:
+                # S2 post-norm bf16 kv, before the RoPE call.
+                _wstage.emit_bf16("S2", self.layer_id, kv, _wstage_rows)
 
             cos4, sin4 = self._get_npu_rope_position_cache(
                 forward_batch, positions, q.dtype, inverse=False
@@ -1965,6 +1995,9 @@ class MQALayer(MqaAttentionBase):
                 sin4,
                 qk_nope_dim=self.qk_nope_head_dim,
             )
+            if _wstage is not None:
+                # S3 post-rope bf16 kv (rotated in place above).
+                _wstage.emit_bf16("S3", self.layer_id, kv, _wstage_rows)
             kv_for_cache = kv
             if use_cp:
                 kv_for_cache = cp_gather_full_sequence_states(
