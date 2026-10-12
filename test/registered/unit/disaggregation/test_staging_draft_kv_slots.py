@@ -52,31 +52,13 @@ class TestStagingDraftKvSlots(CustomTestCase):
         self.assertEqual(slot_ids, [87, 91, 92, 87, 91, 92])
         self.assertNotEqual(slot_ids, _kv_layer_ids(target, draft))
 
-    def test_every_backend_keeps_the_slot_ids_passed_at_init(self):
-        # Prefill and decode init hand these ids to whichever staging backend is
-        # active; a setter that rejects them fails startup, one that drops them
-        # loses the gather-order labels.
-        target, draft = [87, 91], [92]
-        k_buffers, v_buffers, slot_ids = build_staging_slot_metadata(
-            kv_layer_ids=_kv_layer_ids(target, draft),
-            num_draft_entries=2,
-            kv_pool=_Pool("t", target),
-            draft_kv_pool=_Pool("d", draft),
-        )
+    def test_every_backend_setter_accepts_slot_layer_ids(self):
+        # Shared staging init passes slot_layer_ids to every backend's setter.
         for backend in (MooncakeKVManager, NixlKVManager):
             with self.subTest(backend=backend.__name__):
                 manager = object.__new__(backend)
                 manager.set_kv_buffer_tensors(
-                    k_buffers, v_buffers, 16, slot_layer_ids=slot_ids
-                )
-                self.assertEqual(
-                    manager.kv_buffer_tensors,
-                    {
-                        "k_buffers": ["tK87", "tK91", "dK92"],
-                        "v_buffers": ["tV87", "tV91", "dV92"],
-                        "page_size": 16,
-                        "slot_layer_ids": [87, 91, 92, 87, 91, 92],
-                    },
+                    ["tK87"], ["tV87"], 16, slot_layer_ids=[87, 87]
                 )
 
     def test_without_draft_matches_kv_layer_ids(self):

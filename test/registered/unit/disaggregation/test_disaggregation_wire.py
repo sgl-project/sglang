@@ -1085,9 +1085,6 @@ class _MemcpyNixlAgent:
 
 
 class TestHeteroTpSwaStateTransfer(CustomTestCase):
-    """Bug regression: PD rejected non-MLA SWA state across attention TP sizes;
-    each decode rank must receive exactly its KV heads of the window pages."""
-
     PAGE_SIZE = 2
     HEAD_BYTES = 4
     NUM_ENTRIES = 4  # K then V of two SWA layers
@@ -1161,12 +1158,12 @@ class TestHeteroTpSwaStateTransfer(CustomTestCase):
         self.assertEqual(len(handles), 1)
 
     def _prefill_manager(
-        self, *, backend, src_rank, prefill_tp, pp_size, total_heads, src_ptrs, item_len
+        self, *, backend, src_rank, prefill_tp, total_heads, src_ptrs, item_len
     ):
         prefill = object.__new__(backend)
         prefill.attn_tp_size = prefill_tp
         prefill.is_mla_backend = False
-        prefill.pp_size = pp_size
+        prefill.pp_size = 1
         prefill.kv_args = SimpleNamespace(
             engine_rank=src_rank,
             gpu_id=0,
@@ -1243,7 +1240,6 @@ class TestHeteroTpSwaStateTransfer(CustomTestCase):
                     backend=backend,
                     src_rank=src_rank,
                     prefill_tp=prefill_tp,
-                    pp_size=1,
                     total_heads=total_heads,
                     src_ptrs=src_ptrs,
                     item_len=src_item_len,
@@ -1279,65 +1275,23 @@ class TestHeteroTpSwaStateTransfer(CustomTestCase):
                         total_heads=total_heads,
                     )
 
-    def test_pipeline_parallel_prefill_is_rejected(self):
-        """Bug regression: a later prefill PP stage's SWA state landed on the
-        decode peer's first SWA layers instead of being rejected."""
-        # Prefill stage 1 of 2 owns SWA layers [4, 6]; the PP1 decode peer owns
-        # [0, 2, 4, 6]. SWA state has no layer ids and a zero layer offset.
-        src_item_len = self.PAGE_SIZE * 2 * self.HEAD_BYTES
-        dst_item_len = self.PAGE_SIZE * self.HEAD_BYTES
-        src_bytes = 4 * self.NUM_PAGES * src_item_len
-        memory = np.concatenate(
-            [
-                np.full(src_bytes, 0xA5, dtype=np.uint8),
-                np.zeros(8 * self.NUM_PAGES * dst_item_len, dtype=np.uint8),
-            ]
-        )
-        src_ptrs = [e * self.NUM_PAGES * src_item_len for e in range(4)]
-        dst_ptrs = [src_bytes + e * self.NUM_PAGES * dst_item_len for e in range(8)]
-        for backend, send in (
-            (MooncakeKVManager, self._send_mooncake),
-            (NixlKVManager, self._send_nixl),
-        ):
-            with self.subTest(backend=backend.__name__):
-                prefill = self._prefill_manager(
-                    backend=backend,
-                    src_rank=0,
-                    prefill_tp=1,
-                    pp_size=2,
-                    total_heads=2,
-                    src_ptrs=src_ptrs,
-                    item_len=src_item_len,
-                )
-                with self.assertRaisesRegex(
-                    RuntimeError, "different TP sizes for non-MLA SWA"
-                ):
-                    send(
-                        memory=memory,
-                        prefill=prefill,
-                        dst_rank=0,
-                        decode_tp=2,
-                        dst_ptrs=dst_ptrs,
-                        item_len=dst_item_len,
-                    )
-                self.assertFalse(memory[src_bytes:].any())
-
     def test_unsliceable_layouts_are_rejected(self):
-        """A unified-memory envelope, SWA heads sharded unlike total_kv_head_num
-        and non-NHD pages must fail instead of shipping nothing or wrong bytes."""
         prefill = object.__new__(CommonKVManager)
         prefill.attn_tp_size = 2
-        prefill.pp_size = 1
         prefill.kv_args = SimpleNamespace(
             engine_rank=0, page_size=2, total_kv_head_num=8, prefill_start_layer=0
         )
-        for layout, src_item_lens, dst_item_lens, message in (
-            ("nhd", [64], [32], "per-layer K/V"),
+        for pp_size, layout, src_item_lens, dst_item_lens, message in (
+            # SWA state has no layer ids, so a later PP stage would land on the
+            # decode peer's first SWA layers.
+            (2, "nhd", [16, 16], [8, 8], "pipeline parallelism"),
+            (1, "nhd", [64], [32], "per-layer K/V"),
             # One SWA head per rank on both sides, against 8 total KV heads.
-            ("nhd", [8, 8], [8, 8], "do not split"),
+            (1, "nhd", [8, 8], [8, 8], "do not split"),
             # Item lengths that are valid NHD, so only the layout can reject.
-            ("vectorized_5d", [16, 16], [8, 8], "NHD KV cache layout"),
+            (1, "vectorized_5d", [16, 16], [8, 8], "NHD KV cache layout"),
         ):
+            prefill.pp_size = pp_size
             prefill.kv_args.swa_kv_cache_layout = layout
             with self.subTest(message=message):
                 with self.assertRaisesRegex(RuntimeError, message):

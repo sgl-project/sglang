@@ -1,5 +1,4 @@
-"""Unequal attention TP must reshard sliding-window KV: two prefill ranks write
-their KV heads into each decode window page, and a wrong slice fails silently."""
+"""Prefill TP2 -> decode TP1: two prefill ranks write disjoint KV heads per SWA page."""
 
 import unittest
 
