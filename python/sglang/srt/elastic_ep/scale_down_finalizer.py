@@ -88,7 +88,7 @@ class ScaleDownFinalizer:
         apply_dp_size: Callable[[int, int], None],
         scale_ready_barrier: Callable[..., None],
         init_lplb_solvers: Callable[[], None],
-        reinit_recorder: Callable[[int], None],
+        reinit_recorder: Callable[..., None],
         rearm_eplb: Callable[[], None],
     ) -> None:
         self._model_config = model_config
@@ -174,7 +174,9 @@ class ScaleDownFinalizer:
         # Before the graph rebuild: a capture replays whatever the solvers hold.
         self._init_lplb_solvers()
 
-        self._reinit_recorder(self._moe_ep_rank)
+        reuse_graphs = get_exec().moe.elastic_ep_reuse_cuda_graph
+        # A kept decode graph still writes the gatherers it was captured against.
+        self._reinit_recorder(self._moe_ep_rank, keep_gatherers=reuse_graphs)
         self._rearm_eplb()
 
         scale_update = None
@@ -193,8 +195,17 @@ class ScaleDownFinalizer:
         # and capturing there frees the graph memory pool while the output we are
         # about to return still points into it. The scheduler then decodes from
         # corrupted logits and dies indexing req_to_token out of bounds.
+        # --elastic-ep-reuse-cuda-graph replays the old graphs instead: NIXL then
+        # dispatches at capacity with the retired slots masked, and the DP buffers
+        # were captured at capacity, so the retired slots replay as zero.
+        if reuse_graphs:
+            logger.info(
+                "[Elastic EP] keeping decode CUDA graphs across %d -> %d",
+                effective_size,
+                target_size,
+            )
         return ScaleDownFinalizeResult(
             reset_forward_pass_id=True,
-            request_graph_recapture=True,
+            request_graph_recapture=not reuse_graphs,
             scale_update=scale_update,
         )
