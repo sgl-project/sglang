@@ -38,8 +38,8 @@ const RERANK_PATH: &str = "/v1/rerank";
 /// reads there: `model: "base:adapter"` (OpenAI routes) wins over `lora_path`,
 /// and only generation honors `cache_salt`.
 pub(super) fn cache_namespace(path: &str, body: &Value) -> CacheNamespace {
-    let openai = matches!(path, CHAT_PATH | EMBEDDINGS_PATH);
-    let generates = matches!(path, CHAT_PATH | GENERATE_PATH);
+    let openai = matches!(path, CHAT_PATH | COMPLETIONS_PATH | EMBEDDINGS_PATH);
+    let generates = matches!(path, CHAT_PATH | COMPLETIONS_PATH | GENERATE_PATH);
     let model_adapter = body["model"]
         .as_str()
         .filter(|_| openai)
@@ -187,7 +187,7 @@ impl PreparedRequest {
             tokens,
             cache_namespace: parsed_body
                 .as_ref()
-                .map(|body| cache_namespace(CHAT_PATH, body))
+                .map(|body| cache_namespace(path, body))
                 .unwrap_or_default(),
             caller_set_rid: fields.caller_set_rid,
             fans_out: requests_multiple_samples(&fields, &sampling_defaults)
@@ -2394,6 +2394,10 @@ mod tests {
         let body = json!({"model": "m: b ", "lora_path": "a", "cache_salt": "t"});
         // `model: base:adapter` wins on OpenAI routes; only generation is salted.
         assert_eq!(ns(CHAT_PATH, body.clone()), (some("t"), some("b"), false));
+        assert_eq!(
+            ns(COMPLETIONS_PATH, body.clone()),
+            (some("t"), some("b"), false)
+        );
         assert_eq!(
             ns(GENERATE_PATH, body.clone()),
             (some("t"), some("a"), false)
