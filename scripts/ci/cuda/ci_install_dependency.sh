@@ -369,6 +369,25 @@ setup_cargo_cache() {
         mkdir -p "${CARGO_TARGET_DIR}"
     fi
 
+    # Keep third-party dependencies warm, but rebuild checkout-local packages.
+    # A shared target can contain artifacts from another checkout whose source
+    # mtimes predate the cached fingerprints. Cargo can then report stale API
+    # types as Fresh and compile this checkout against the wrong protobuf fields.
+    # Clean under the target lock, before any Rust extension is built.
+    local local_packages package
+    local_packages="$(cargo metadata --locked --no-deps --format-version 1 \
+        --manifest-path "${REPO_ROOT}/rust/Cargo.toml" | python3 -c '
+import json, sys
+for package in json.load(sys.stdin)["packages"]:
+    if package["source"] is None:
+        print(package["name"])
+')"
+    local clean_args=()
+    while IFS= read -r package; do
+        clean_args+=(--package "${package}")
+    done <<< "${local_packages}"
+    cargo clean --manifest-path "${REPO_ROOT}/rust/Cargo.toml" "${clean_args[@]}"
+
     mark_step_done "${FUNCNAME[0]}"
 }
 
