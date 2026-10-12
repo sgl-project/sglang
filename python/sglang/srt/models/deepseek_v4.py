@@ -188,8 +188,8 @@ from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.multimodal.deepseek_v41_image_processing import (
     GPU_PLAN_KEY,
     image_token_types,
-    load_image,
     materialize_image_gpu,
+    patchify_image,
 )
 from sglang.srt.runtime_context import (
     get_device,
@@ -4775,7 +4775,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         grids: List[List[int]] = []
         item_sizes: List[int] = []
         for image in mm_data:
-            patches, n_vit_h, n_vit_w, n_llm_h, n_llm_w = load_image(
+            patches, n_vit_h, n_vit_w, n_llm_h, n_llm_w = patchify_image(
                 image, self.config
             )
             # 3-wide grid ([t, h, w]) so the generic encoder/receiver grid

@@ -1239,6 +1239,8 @@ class MMEncoder:
             mm_feature = None
         else:
             mm_feature = _convert(_get_mm_feature(mm_inputs, modality))
+        if mm_feature is not None and not mm_feature.is_cuda:
+            mm_feature = mm_feature.to(self.gpu_id)
         num_items = len(grid_thw)
         if num_items != sum(items_per_req):
             raise InternalError(
