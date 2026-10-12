@@ -35,6 +35,7 @@ logger = logging.getLogger(__name__)
 _SCALE_COHORT_KEY_PREFIX = "elastic_ep/scale_cohort"
 _SCALE_OPERATION_KEY_PREFIX = "elastic_ep/scale_operation"
 _RECOVERY_OPERATION_KEY_PREFIX = "elastic_ep/recovery_operation"
+_RECOVERY_SLOT_KEY_PREFIX = "elastic_ep/recovery_slot"
 
 
 @dataclass(frozen=True)
@@ -124,11 +125,39 @@ def _recovery_operation_key(runtime_instance_id: str, operation_id: str) -> str:
     )
 
 
+def _recovery_slot_key(operation: RecoveryOperation) -> str:
+    return (
+        f"{_RECOVERY_SLOT_KEY_PREFIX}/"
+        f"{quote(operation.runtime_instance_id, safe='')}/"
+        f"{operation.topology_generation}/{operation.rank_offset}/"
+        f"{quote(operation.allocation_id, safe='')}"
+    )
+
+
 def get_recovery_operation(
     runtime_instance_id: str, operation_id: str
 ) -> Optional[RecoveryOperation]:
     value = _load_store_json(_recovery_operation_key(runtime_instance_id, operation_id))
     return RecoveryOperation(**value) if value is not None else None
+
+
+def get_recovery_operation_for_slot(
+    runtime_instance_id: str,
+    topology_generation: int,
+    rank_offset: int,
+    allocation_id: str,
+) -> Optional[RecoveryOperation]:
+    probe = RecoveryOperation(
+        runtime_instance_id=runtime_instance_id,
+        topology_generation=topology_generation,
+        operation_id="probe",
+        allocation_id=allocation_id,
+        rank_offset=rank_offset,
+    )
+    value = _load_store_json(_recovery_slot_key(probe))
+    if value is None:
+        return None
+    return get_recovery_operation(runtime_instance_id, value["operation_id"])
 
 
 def register_recovery_operation(operation: RecoveryOperation) -> RecoveryOperation:
@@ -150,13 +179,15 @@ def register_recovery_operation(operation: RecoveryOperation) -> RecoveryOperati
         existing = _load_store_json(key)
         if existing is None:
             _store_json(key, operation.__dict__)
-            return operation
-        registered = RecoveryOperation(**existing)
+            registered = operation
+        else:
+            registered = RecoveryOperation(**existing)
     if registered != operation:
         raise RuntimeError(
             f"Recovery operation {operation.operation_id} conflicts with "
             "the existing operation."
         )
+    _store_json(_recovery_slot_key(operation), {"operation_id": operation.operation_id})
     return registered
 
 
@@ -462,6 +493,53 @@ class ElasticEPStateManager:
             world_size = torch.distributed.get_world_size()
             inst.effective_ep_size = world_size
             inst.original_ep_size = world_size
+            topology = get_runtime_topology()
+            allocation_id = get_parallel().elastic_ep_allocation_id
+            if topology is None or allocation_id is None:
+                raise RuntimeError(
+                    "Elastic EP recovery joiners require runtime topology and "
+                    "an allocation identity."
+                )
+            operation = get_recovery_operation_for_slot(
+                topology.runtime_instance_id,
+                topology.topology_generation,
+                get_parallel().ep_join_rank_offset,
+                allocation_id,
+            )
+            if operation is None:
+                raise RuntimeError(
+                    "Elastic EP recovery joiner is not authorized for this "
+                    "runtime, generation, rank, and allocation."
+                )
+            operation.validate(topology)
+            inst.effective_ep_size = topology.effective_ep_size
+            inst.original_ep_size = topology.initial_ep_size
+            inst.runtime_instance_id = operation.runtime_instance_id
+            inst.recovery_operation_id = operation.operation_id
+            inst.recovery_topology_generation = operation.topology_generation
+            inst.recovery_allocation_id = operation.allocation_id
+            inst.recovery_rank_offset = operation.rank_offset
+            inst.recovery_phase = "restoring"
+
+    @classmethod
+    def current_recovery_operation(cls) -> RecoveryOperation:
+        inst = cls._instance
+        if (
+            inst is None
+            or inst.runtime_instance_id is None
+            or inst.recovery_topology_generation is None
+            or inst.recovery_operation_id is None
+            or inst.recovery_allocation_id is None
+            or inst.recovery_rank_offset is None
+        ):
+            raise RuntimeError("Elastic EP recovery has no fully bound operation.")
+        return RecoveryOperation(
+            runtime_instance_id=inst.runtime_instance_id,
+            topology_generation=inst.recovery_topology_generation,
+            operation_id=inst.recovery_operation_id,
+            allocation_id=inst.recovery_allocation_id,
+            rank_offset=inst.recovery_rank_offset,
+        )
 
     @staticmethod
     def _select_device() -> torch.device:
@@ -980,6 +1058,7 @@ def maybe_recover_ep_ranks(
         i for i in range(len(tp_active_ranks)) if not tp_active_ranks[i]
     ]
     state = ElasticEPStateManager.instance()
+    operation = None
     if state is not None and state.recovery_phase == "restoring":
         expected_rank = state.recovery_rank_offset
         if ranks_to_recover != [expected_rank]:
@@ -987,12 +1066,19 @@ def maybe_recover_ep_ranks(
                 "Recovery operation no longer matches the inactive slot set."
             )
             return False
+        operation = ElasticEPStateManager.current_recovery_operation()
+        if get_exec().moe.moe_a2a_backend == "nixl":
+            from sglang.srt.layers.moe.token_dispatcher.nixl import NixlEPBuffer
+
+            NixlEPBuffer.prepare_recovery(operation)
 
     # try_recover_ranks polls peer state via Mooncake EP backend.
     # Mooncake's internal semantics guarantee that all ranks observe
     # consistent peer readiness state, so collective operations below
     # are safe even though polling appears local.
     if ranks_to_recover and try_recover_ranks(ranks_to_recover):
+        if operation is not None and get_exec().moe.moe_a2a_backend == "nixl":
+            NixlEPBuffer.connect_recovery(operation, replacement=False)
         eplb_manager.reset_generator()
         broadcast_global_expert_location_metadata(
             model_config=model_config,
