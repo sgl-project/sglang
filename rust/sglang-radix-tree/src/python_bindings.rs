@@ -2281,7 +2281,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
     ) -> PyResult<Vec<Py<PyAny>>> {
         let kv_xfer = transfer_from_args(kv_xfer)?;
         let transfers = py
-            .allow_threads(move || self.core().split_full_load_back_spec(&kv_xfer))
+            .detach(move || self.core().split_full_load_back_spec(&kv_xfer))
             .map_err(node_access_error)?;
         transfers
             .into_iter()
@@ -2291,7 +2291,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
 
     /// Re-age a cached path as if just matched; false for a stale handle.
     fn refresh_lru_to_root(&self, py: Python<'_>, node_id: NodeId) -> PyResult<bool> {
-        Ok(py.allow_threads(|| self.core().refresh_lru_to_root(node_id)))
+        Ok(py.detach(|| self.core().refresh_lru_to_root(node_id)))
     }
 
     /// Build transfers for a node with no stored or pending external copy.
@@ -2450,7 +2450,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
     }
 
     fn inspect_is_full_host_duplicate(&self, py: Python<'_>, node_id: NodeId) -> PyResult<bool> {
-        py.allow_threads(|| self.core().inspect_is_full_host_duplicate(node_id))
+        py.detach(|| self.core().inspect_is_full_host_duplicate(node_id))
             .map_err(node_access_error)
     }
 
@@ -2459,7 +2459,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         py: Python<'_>,
         node_id: NodeId,
     ) -> PyResult<bool> {
-        py.allow_threads(|| self.core().inspect_can_reclaim_full_host_duplicate(node_id))
+        py.detach(|| self.core().inspect_can_reclaim_full_host_duplicate(node_id))
             .map_err(node_access_error)
     }
 
