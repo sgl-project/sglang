@@ -1013,13 +1013,13 @@ export const config = {
         ],
       },
       {
-        // A decode server runs a chunk cache by default (1 state slot/req);
+        // A decode server disables the radix cache by default (1 state slot/req);
         // radix restores prefix reuse at the unified per-request slot cost.
         id: "pdDecodeRadix", title: "PD Decode Radix Cache",
         showWhen: (b) => b.pdMode === "decode",
         stripPrefixes: ["--disaggregation-decode-enable-radix-cache"],
         options: [
-          { id: "off", label: "Off (chunk cache)" },
+          { id: "off", label: "Off" },
           { id: "on",  label: "On", flags: ["--disaggregation-decode-enable-radix-cache"] },
         ],
       },
@@ -1917,7 +1917,7 @@ export const config = {
     // shared PP2 x TP8 prefill. Comparisons hold; absolutes would be higher
     // behind the PP16 x TP1 prefill cell above.
     //
-    // Decode runs the KV cache as a chunk cache, so the unified 5-slots-per-
+    // Decode runs with the radix cache disabled, so the unified 5-slots-per-
     // request reservation (1 state + ping-pong copies for radix reuse) drops to
     // a single slot, and --mamba-radix-cache-strategy stops having any effect.
     // In-transfer requests holding a slot before decode starts are the only
@@ -2483,7 +2483,6 @@ export const config = {
         "SGLANG_NPU_USE_TRITON_PREFIX_KV_CACHE_STORE=1",
         "SGLANG_RAGGED_VERIFY_MODE=static",
         "SGLANG_DSPARK_FOLDED_PROPOSAL=0",
-        "SGLANG_DSPARK_FOLDED_SAMPLING=0",
         "SGLANG_DSPARK_STACKED_CTX_KV=0",
         "SGLANG_DSPARK_EMBED_IN_GRAPH=0",
       ],
@@ -2696,7 +2695,6 @@ export const config = {
         "SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1",
         "SGLANG_RAGGED_VERIFY_MODE=static",
         "SGLANG_DSPARK_FOLDED_PROPOSAL=0",
-        "SGLANG_DSPARK_FOLDED_SAMPLING=0",
         "SGLANG_DSPARK_STACKED_CTX_KV=0",
         "SGLANG_DSPARK_EMBED_IN_GRAPH=0",
         "STREAMS_PER_DEVICE=32",
@@ -2761,7 +2759,6 @@ export const config = {
         "SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1",
         "SGLANG_RAGGED_VERIFY_MODE=static",
         "SGLANG_DSPARK_FOLDED_PROPOSAL=0",
-        "SGLANG_DSPARK_FOLDED_SAMPLING=0",
         "SGLANG_DSPARK_STACKED_CTX_KV=0",
         "SGLANG_DSPARK_EMBED_IN_GRAPH=0",
         "STREAMS_PER_DEVICE=32",
@@ -2832,7 +2829,6 @@ export const config = {
         "SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1",
         "SGLANG_RAGGED_VERIFY_MODE=static",
         "SGLANG_DSPARK_FOLDED_PROPOSAL=0",
-        "SGLANG_DSPARK_FOLDED_SAMPLING=0",
         "SGLANG_DSPARK_STACKED_CTX_KV=0",
         "SGLANG_DSPARK_EMBED_IN_GRAPH=0",
         "STREAMS_PER_DEVICE=32",
