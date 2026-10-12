@@ -228,6 +228,7 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
 
         self.assertEqual(group.num_layers, 3)
         self.assertTrue(group.rank_replicated)
+        self.assertTrue(group.cp_replicated)
         self.assertEqual(
             set(group.entry_map),
             {
@@ -448,6 +449,8 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
 
         self.assertEqual(group.num_layers, 2)
         self.assertTrue(group.rank_replicated)
+        # DSA's prefill CP has not been shown to leave the whole chunk on every rank.
+        self.assertFalse(group.cp_replicated)
         self.assertEqual(set(group.entry_map), {PoolName.KV, PoolName.INDEXER})
         self.assertEqual(
             group.sources,
