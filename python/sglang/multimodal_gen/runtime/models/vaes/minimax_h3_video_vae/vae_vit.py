@@ -9,8 +9,8 @@ from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 from diffusers.utils import logging
 
-from .base_module import RotaryEmbeddingND, TransformerBlock
-from .vit_utils import create_token_ids, prepare_rotary_pos_emb
+from .base_module import RotaryEmbeddingND, TransformerBlock, _scaled_residual_add
+from .vit_utils import _env_flag, create_token_ids, prepare_rotary_pos_emb
 
 logger = logging.get_logger(__name__)
 
@@ -26,6 +26,96 @@ def _linear_with_module_dtype(linear, tensor, out_dtype=None):
 
 def _cuda_autocast_disabled(tensor: torch.Tensor):
     return torch.autocast("cuda", enabled=False) if tensor.is_cuda else nullcontext()
+
+
+def _fused_blocks_available(blocks, hidden_states) -> bool:
+    if not _env_flag("MINIMAX_H3_VAE_DECODER_FUSED_NORM", "1"):
+        return False
+    if (
+        not hidden_states.is_cuda
+        or hidden_states.dim() != 3
+        or hidden_states.dtype not in (torch.float16, torch.bfloat16, torch.float32)
+        or torch.is_grad_enabled()
+        or torch.compiler.is_compiling()
+        or len(blocks) == 0
+        or hidden_states.shape[-1] > 4096
+    ):
+        return False
+    dim = hidden_states.shape[-1]
+    for block in blocks:
+        # Layerwise offload hooks live on the block. This loop calls attn and
+        # ff directly, so those hooks would not see the weights move.
+        if block._forward_pre_hooks or block._forward_hooks:
+            return False
+        if not getattr(block, "use_scale", False):
+            return False
+        norm1, norm2 = block.norm1, block.norm2
+        if not isinstance(norm1, nn.RMSNorm) or not isinstance(norm2, nn.RMSNorm):
+            return False
+        if (
+            norm1.weight is None
+            or norm2.weight is None
+            or norm1.weight.shape != (dim,)
+            or norm2.weight.shape != (dim,)
+            or block.scale1.shape != (dim,)
+            or block.scale2.shape != (dim,)
+        ):
+            return False
+    return True
+
+
+_FUSED_BLOCKS_LOGGED = False
+
+
+def _run_fused_transformer_blocks(blocks, hidden_states, rotary_pos_emb):
+    global _FUSED_BLOCKS_LOGGED
+    from sglang.kernels.ops.diffusion import h3_vae_rmsnorm, h3_vae_scale_add_rmsnorm
+
+    if not _FUSED_BLOCKS_LOGGED:
+        _FUSED_BLOCKS_LOGGED = True
+        logger.info(
+            "MiniMax H3 video VAE decoder fuses each scaled residual add into the next RMSNorm"
+        )
+    pending = None
+    pending_scale = None
+    for block in blocks:
+        if pending is None:
+            normed = h3_vae_rmsnorm(hidden_states, block.norm1.weight, block.norm1.eps)
+        else:
+            hidden_states, normed = h3_vae_scale_add_rmsnorm(
+                hidden_states,
+                pending,
+                pending_scale,
+                block.norm1.weight,
+                block.norm1.eps,
+            )
+        attn_output = block.attn(normed, rotary_pos_emb)
+        hidden_states, normed = h3_vae_scale_add_rmsnorm(
+            hidden_states,
+            attn_output,
+            block.scale1,
+            block.norm2.weight,
+            block.norm2.eps,
+        )
+        pending = block.ff(normed)
+        pending_scale = block.scale2
+    return _scaled_residual_add(hidden_states, pending, pending_scale)
+
+
+def _expand_rotary_batch(rotary_pos_emb, batch: int):
+    """Broadcast a batch-1 rotary cache across stacked spatial tiles."""
+    cos, sin, *extra = rotary_pos_emb
+    if cos.shape[0] == batch:
+        return rotary_pos_emb
+    if cos.shape[0] != 1:
+        raise ValueError(
+            f"MiniMax H3 VAE rotary cache batch must be 1 or {batch}, got {cos.shape[0]}"
+        )
+    return (
+        cos.expand(batch, -1, -1, -1),
+        sin.expand(batch, -1, -1, -1),
+        *extra,
+    )
 
 
 def _pack_tensors_3d(tensors, patch_size, patch_size_t):
@@ -134,6 +224,10 @@ class ViTBase(ModelMixin, ConfigMixin):
         return hidden_states, img_ids
 
     def forward_transformer_blocks(self, hidden_states, rotary_pos_emb):
+        if _fused_blocks_available(self.transformer_blocks, hidden_states):
+            return _run_fused_transformer_blocks(
+                self.transformer_blocks, hidden_states, rotary_pos_emb
+            )
         for block in self.transformer_blocks:
             hidden_states = block(hidden_states, rotary_pos_emb)
         return hidden_states
@@ -326,10 +420,16 @@ class ViT3DDecoder(ViTBase):
         if cache_hit:
             rotary_pos_emb = cache_record[2]
         else:
+            # Every stacked tile has the same coordinates, so one rotary
+            # table is broadcast across the batch. That keeps the fused
+            # NeoX kernel, which indexes a single sequence, on the batched path.
             rotary_pos_emb = prepare_rotary_pos_emb(
-                self.pos_embed(img_ids),
+                self.pos_embed(img_ids[:1]),
                 dtype=rotary_dtype,
+                batch=B,
             )
+            if B > 1:
+                rotary_pos_emb = _expand_rotary_batch(rotary_pos_emb, B)
             if cache_enabled:
                 self._rotary_pos_emb_cache = (
                     cache_key,
@@ -337,8 +437,7 @@ class ViT3DDecoder(ViTBase):
                     rotary_pos_emb,
                 )
 
-        for block in self.transformer_blocks:
-            hidden_states = block(hidden_states, rotary_pos_emb)
+        hidden_states = self.forward_transformer_blocks(hidden_states, rotary_pos_emb)
 
         hidden_states = self.norm_out(hidden_states)
 

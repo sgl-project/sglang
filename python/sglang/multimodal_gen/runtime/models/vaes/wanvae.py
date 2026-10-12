@@ -18,6 +18,7 @@
 
 import contextvars
 from contextlib import contextmanager, nullcontext
+from functools import partial
 
 import torch
 import torch.distributed as dist
@@ -29,9 +30,12 @@ from sglang.multimodal_gen.configs.models.vaes import WanVAEConfig
 from sglang.multimodal_gen.configs.models.vaes.base import (
     should_use_spatial_shard_parallel_decode,
 )
+from sglang.multimodal_gen.runtime.cache.conditioning import cached_vae_encode
+from sglang.multimodal_gen.runtime.distributed.group_coordinator import GroupCoordinator
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_decode_parallel_rank,
     get_decode_parallel_world_size,
+    get_sp_group,
     get_sp_parallel_rank,
     get_sp_world_size,
 )
@@ -52,9 +56,11 @@ from sglang.multimodal_gen.runtime.models.vaes.common import (
     ParallelTiledVAE,
     should_run_spatial_shard_parallel_decode,
 )
+from sglang.multimodal_gen.runtime.models.vaes.resample import AvgDown3D
+from sglang.multimodal_gen.runtime.models.vaes.resample import DupUp3D as DupUp3DBase
 from sglang.multimodal_gen.runtime.platforms import current_platform
 
-if current_platform.is_cuda():
+if current_platform.is_cuda() or current_platform.is_xpu():
     try:
         from sglang.kernels.ops.diffusion import cat_pad_channels_last_3d, dup_up3d_add
     except ImportError:  # pragma: no cover
@@ -73,8 +79,10 @@ first_chunk = contextvars.ContextVar("first_chunk", default=None)
 
 
 def _channels_last_3d_supported_by_platform() -> bool:
-    return hasattr(torch, "channels_last_3d") and (
-        current_platform.is_cuda() or current_platform.is_rocm()
+    return (
+        current_platform.is_cuda()
+        or current_platform.is_rocm()
+        or current_platform.is_xpu()
     )
 
 
@@ -103,7 +111,7 @@ def _fused_conv_cache_supported(conv: nn.Module, x: torch.Tensor) -> bool:
         cat_pad_channels_last_3d is not None
         and type(conv) is WanCausalConv3d
         and x.dim() == 5
-        and x.is_cuda
+        and x.device.type in ("cuda", "xpu")
         and current_platform.is_amp_supported()
         and _conv3d_weight_is_channels_last_3d(conv.weight)
         and not torch.compiler.is_compiling()
@@ -158,103 +166,10 @@ def _run_cached_causal_conv(
     return out
 
 
-class AvgDown3D(nn.Module):
-    def __init__(
-        self,
-        in_channels,
-        out_channels,
-        factor_t,
-        factor_s=1,
-    ):
-        super().__init__()
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.factor_t = factor_t
-        self.factor_s = factor_s
-        self.factor = self.factor_t * self.factor_s * self.factor_s
-
-        assert in_channels * self.factor % out_channels == 0
-        self.group_size = in_channels * self.factor // out_channels
-
+class DupUp3D(DupUp3DBase):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        pad_t = (self.factor_t - x.shape[2] % self.factor_t) % self.factor_t
-        pad = (0, 0, 0, 0, pad_t, 0)
-        x = F.pad(x, pad)
-        B, C, T, H, W = x.shape
-        x = x.view(
-            B,
-            C,
-            T // self.factor_t,
-            self.factor_t,
-            H // self.factor_s,
-            self.factor_s,
-            W // self.factor_s,
-            self.factor_s,
-        )
-        x = x.permute(0, 1, 3, 5, 7, 2, 4, 6).contiguous()
-        x = x.view(
-            B,
-            C * self.factor,
-            T // self.factor_t,
-            H // self.factor_s,
-            W // self.factor_s,
-        )
-        x = x.view(
-            B,
-            self.out_channels,
-            self.group_size,
-            T // self.factor_t,
-            H // self.factor_s,
-            W // self.factor_s,
-        )
-        x = x.mean(dim=2)
-        return x
-
-
-class DupUp3D(nn.Module):
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        factor_t,
-        factor_s=1,
-    ):
-        super().__init__()
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-
-        self.factor_t = factor_t
-        self.factor_s = factor_s
-        self.factor = self.factor_t * self.factor_s * self.factor_s
-
-        assert out_channels * self.factor % in_channels == 0
-        self.repeats = out_channels * self.factor // in_channels
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x.repeat_interleave(self.repeats, dim=1)
-        x = x.view(
-            x.size(0),
-            self.out_channels,
-            self.factor_t,
-            self.factor_s,
-            self.factor_s,
-            x.size(2),
-            x.size(3),
-            x.size(4),
-        )
-        x = x.permute(0, 1, 5, 2, 6, 3, 7, 4).contiguous()
-        x = x.view(
-            x.size(0),
-            self.out_channels,
-            x.size(2) * self.factor_t,
-            x.size(4) * self.factor_s,
-            x.size(6) * self.factor_s,
-        )
-
         _first_chunk = first_chunk.get() if first_chunk is not None else None
-        if _first_chunk:
-            x = x[:, :, self.factor_t - 1 :, :, :]
-        return x
+        return super().forward(x, first_chunk=_first_chunk)
 
 
 class WanCausalConv3d(nn.Conv3d):
@@ -560,8 +475,8 @@ def residual_up_block_forward(self, x):
         if (
             dup_up3d_add is not None
             and type(shortcut) is DupUp3D
-            and x.is_cuda
-            and x_copy.is_cuda
+            and x.device.type in ("cuda", "xpu")
+            and x_copy.device.type in ("cuda", "xpu")
             and x.dtype == x_copy.dtype
             and not torch.compiler.is_compiling()
         ):
@@ -761,10 +676,22 @@ class WanAttentionBlock(nn.Module):
         dim (int): The number of channels in the input tensor.
     """
 
-    def __init__(self, dim, *, spatial_parallel: bool = False) -> None:
+    def __init__(
+        self,
+        dim,
+        *,
+        spatial_parallel: bool = False,
+        parallel_group: GroupCoordinator | None = None,
+    ) -> None:
         super().__init__()
         self.dim = dim
-        self.world_size = get_decode_parallel_world_size() if spatial_parallel else 1
+        self.parallel_group = parallel_group
+        if parallel_group is not None:
+            self.world_size = parallel_group.world_size
+        else:
+            self.world_size = (
+                get_decode_parallel_world_size() if spatial_parallel else 1
+            )
 
         # layers
         self.norm = WanRMS_norm(dim)
@@ -773,10 +700,12 @@ class WanAttentionBlock(nn.Module):
 
     def forward(self, x):
         if self.world_size > 1:
-            x = gather_height_for_global_op(x).contiguous()
+            x = gather_height_for_global_op(
+                x, parallel_group=self.parallel_group
+            ).contiguous()
         x = attention_block_forward(self, x)
         if self.world_size > 1:
-            x = chunk_height_for_parallel_decode(x)
+            x = chunk_height_for_parallel_decode(x, parallel_group=self.parallel_group)
         return x
 
 
@@ -860,13 +789,21 @@ class WanResidualDownBlock(nn.Module):
 
 
 class WanDistResample(WanResample):
-    def __init__(self, dim: int, mode: str, upsample_out_dim: int = None) -> None:
+    def __init__(
+        self,
+        dim: int,
+        mode: str,
+        upsample_out_dim: int = None,
+        parallel_group: GroupCoordinator | None = None,
+    ) -> None:
         super().__init__(
             dim,
             mode,
             upsample_out_dim=upsample_out_dim,
-            conv2d_cls=SpatialParallelConv2d,
-            zero_pad2d_cls=SpatialParallelZeroPad2d,
+            conv2d_cls=partial(SpatialParallelConv2d, parallel_group=parallel_group),
+            zero_pad2d_cls=partial(
+                SpatialParallelZeroPad2d, parallel_group=parallel_group
+            ),
             spatial_parallel=True,
         )
 
@@ -878,19 +815,22 @@ class WanDistResidualBlock(WanResidualBlock):
         out_dim: int,
         dropout: float = 0.0,
         non_linearity: str = "silu",
+        parallel_group: GroupCoordinator | None = None,
     ) -> None:
         super().__init__(
             in_dim,
             out_dim,
             dropout,
             non_linearity,
-            causal_conv3d_cls=SpatialParallelCausalConv3d,
+            causal_conv3d_cls=partial(
+                SpatialParallelCausalConv3d, parallel_group=parallel_group
+            ),
         )
 
 
 class WanDistAttentionBlock(WanAttentionBlock):
-    def __init__(self, dim) -> None:
-        super().__init__(dim, spatial_parallel=True)
+    def __init__(self, dim, parallel_group: GroupCoordinator | None = None) -> None:
+        super().__init__(dim, spatial_parallel=True, parallel_group=parallel_group)
 
 
 class WanDistMidBlock(WanMidBlock):
@@ -900,14 +840,19 @@ class WanDistMidBlock(WanMidBlock):
         dropout: float = 0.0,
         non_linearity: str = "silu",
         num_layers: int = 1,
+        parallel_group: GroupCoordinator | None = None,
     ):
         super().__init__(
             dim,
             dropout,
             non_linearity,
             num_layers=num_layers,
-            residual_block_cls=WanDistResidualBlock,
-            attention_block_cls=WanDistAttentionBlock,
+            residual_block_cls=partial(
+                WanDistResidualBlock, parallel_group=parallel_group
+            ),
+            attention_block_cls=partial(
+                WanDistAttentionBlock, parallel_group=parallel_group
+            ),
         )
 
 
@@ -920,6 +865,7 @@ class WanDistResidualDownBlock(WanResidualDownBlock):
         num_res_blocks,
         temperal_downsample=False,
         down_flag=False,
+        parallel_group: GroupCoordinator | None = None,
     ):
         super().__init__(
             in_dim,
@@ -928,8 +874,10 @@ class WanDistResidualDownBlock(WanResidualDownBlock):
             num_res_blocks,
             temperal_downsample=temperal_downsample,
             down_flag=down_flag,
-            residual_block_cls=WanDistResidualBlock,
-            resample_cls=WanDistResample,
+            residual_block_cls=partial(
+                WanDistResidualBlock, parallel_group=parallel_group
+            ),
+            resample_cls=partial(WanDistResample, parallel_group=parallel_group),
         )
 
 
@@ -983,12 +931,21 @@ class WanEncoder3d(nn.Module):
             world_size = get_sp_world_size()
 
         if use_parallel_encode and world_size > 1:
-            CausalConv3d = SpatialParallelCausalConv3d
-            ResidualDownBlock = WanDistResidualDownBlock
-            ResidualBlock = WanDistResidualBlock
-            AttentionBlock = WanDistAttentionBlock
-            Resample = WanDistResample
-            MidBlock = WanDistMidBlock
+            self.parallel_group = get_sp_group()
+            CausalConv3d = partial(
+                SpatialParallelCausalConv3d, parallel_group=self.parallel_group
+            )
+            ResidualDownBlock = partial(
+                WanDistResidualDownBlock, parallel_group=self.parallel_group
+            )
+            ResidualBlock = partial(
+                WanDistResidualBlock, parallel_group=self.parallel_group
+            )
+            AttentionBlock = partial(
+                WanDistAttentionBlock, parallel_group=self.parallel_group
+            )
+            Resample = partial(WanDistResample, parallel_group=self.parallel_group)
+            MidBlock = partial(WanDistMidBlock, parallel_group=self.parallel_group)
         else:
             CausalConv3d = WanCausalConv3d
             ResidualDownBlock = WanResidualDownBlock
@@ -1088,7 +1045,9 @@ class WanEncoder3d(nn.Module):
             x = self.conv_out(x)
 
         if self.use_parallel_encode and self.world_size > 1:
-            x = gather_and_trim_height(x, expected_height)
+            x = gather_and_trim_height(
+                x, expected_height, parallel_group=self.parallel_group
+            )
         return x
 
 
@@ -1464,6 +1423,7 @@ class AutoencoderKLWan(ParallelTiledVAE):
     """
 
     _supports_gradient_checkpointing = False
+    supports_decode_on_frames = True
 
     def __init__(
         self,
@@ -1583,6 +1543,7 @@ class AutoencoderKLWan(ParallelTiledVAE):
         self._causal_decode_initialized = True
         return out
 
+    @cached_vae_encode
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         if self.use_feature_cache:
             self.clear_cache()
@@ -1641,7 +1602,8 @@ class AutoencoderKLWan(ParallelTiledVAE):
         enc = torch.cat([first_frame, enc], dim=2)
         return enc
 
-    def decode(self, z: torch.Tensor) -> torch.Tensor:
+    def decode(self, z: torch.Tensor, on_frames=None) -> torch.Tensor:
+        """``on_frames`` receives every returned frame once, in order, as soon as it is final."""
         if self.use_feature_cache:
             self.clear_cache()
             iter_ = z.shape[2]
@@ -1660,6 +1622,10 @@ class AutoencoderKLWan(ParallelTiledVAE):
                         feat_idx.set(0)
                         first_chunk.set(i == 0)
                         out_chunks.append(self.decoder(x[:, :, i : i + 1, :, :]))
+                        # with the causal cache these frames are final, and full
+                        # height even under spatial-parallel decode
+                        if on_frames is not None:
+                            on_frames(self._output_frames(out_chunks[-1]))
                     out = (
                         torch.cat(out_chunks, 2)
                         if len(out_chunks) > 1
@@ -1674,8 +1640,17 @@ class AutoencoderKLWan(ParallelTiledVAE):
             self.clear_cache()
         else:
             out = ParallelTiledVAE.decode(self, z)
+            # tiled and whole-clip decodes only finish frames at the end
+            if on_frames is not None:
+                on_frames(out)
 
         return out
+
+    def _output_frames(self, out: torch.Tensor) -> torch.Tensor:
+        """What ``decode`` returns for decoder output ``out``, leaving ``out`` intact."""
+        if self.config.patch_size is not None:
+            out = unpatchify(out, patch_size=self.config.patch_size)
+        return out.float().clamp(min=-1.0, max=1.0)
 
     def _decode(self, z: torch.Tensor, first_frame=False) -> torch.Tensor:
         x = self.post_quant_conv(z)

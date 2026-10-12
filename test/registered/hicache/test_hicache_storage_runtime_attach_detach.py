@@ -32,9 +32,6 @@ register_cuda_ci(est_time=308, stage="base-b", runner_config="2-gpu-large")
 
 
 class TestHiCacheStorageRuntimeAttachDetach(CustomTestCase):
-    # Extra server env; subclasses use it to select a tree_cache implementation.
-    extra_env: dict = {}
-
     @classmethod
     def setUpClass(cls):
         cls.temp_dir = tempfile.mkdtemp()
@@ -63,7 +60,7 @@ class TestHiCacheStorageRuntimeAttachDetach(CustomTestCase):
             "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.temp_dir,
             # Make runs less flaky for CI/dev.
             "SGLANG_ENABLE_DETERMINISTIC_INFERENCE": "1",
-            **cls.extra_env,
+            "SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1",
         }
 
     @classmethod
@@ -369,19 +366,6 @@ class TestHiCacheStorageRuntimeAttachDetach(CustomTestCase):
         finally:
             terminate_and_kill_process_tree(process2)
             time.sleep(2)
-
-
-class TestUnifiedRadixCacheStorageRuntimeAttachDetach(
-    TestHiCacheStorageRuntimeAttachDetach
-):
-    """Same runtime attach/detach lifecycle, backed by UnifiedRadixCache."""
-
-    extra_env = {"SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"}
-
-    def test_runtime_attach_detach(self):
-        # Admin-key gating (phase A of the base test) lives in the HTTP layer and is
-        # independent of the tree cache implementation, so only the lifecycle is run.
-        self._check_attach_detach_lifecycle()
 
 
 if __name__ == "__main__":

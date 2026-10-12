@@ -1,6 +1,6 @@
 #!/bin/bash
 # Install flashinfer-jit-cache with caching and retry logic (flashinfer.ai can have transient DNS issues).
-# The jit-cache wheel is 1.2+ GB, so we skip the download entirely if already installed.
+# The jit-cache is 1.2+ GB across its wheels, so we skip the download entirely if already installed.
 #
 # Required environment (caller must export or set):
 #   UNINSTALL_JIT_CACHE          — literal true/false (skip download when false)
@@ -25,17 +25,19 @@ if [ "$FLASHINFER_JIT_CACHE_INSTALLED" = false ]; then
     FLASHINFER_CACHE_DIR="${HOME}/.cache/flashinfer-wheels"
     mkdir -p "${FLASHINFER_CACHE_DIR}"
 
-    FLASHINFER_WHEEL_PATTERN="flashinfer_jit_cache-${FLASHINFER_PYTHON_REQUIRED}+${CU_VERSION}*.whl"
-    CACHED_WHEEL=$(find "${FLASHINFER_CACHE_DIR}" -name "${FLASHINFER_WHEEL_PATTERN}" -type f 2>/dev/null | head -n 1)
+    # The per-arch wheel names are unclaimed on PyPI, so resolve the whole set
+    # from disk. The glob also matches the single pre-0.7.0 wheel.
+    FLASHINFER_WHEEL_GLOB="${FLASHINFER_CACHE_DIR}/flashinfer_jit_cache*-${FLASHINFER_PYTHON_REQUIRED}+${CU_VERSION}-*.whl"
 
-    if [ -n "$CACHED_WHEEL" ] && [ -f "$CACHED_WHEEL" ]; then
-        echo "Found cached flashinfer wheel: $CACHED_WHEEL"
-        if $PIP_CMD install "$CACHED_WHEEL" $PIP_INSTALL_SUFFIX; then
+    set -- $FLASHINFER_WHEEL_GLOB
+    if [ -f "$1" ]; then
+        echo "Found $# cached flashinfer wheel(s)"
+        if $PIP_CMD install --no-index "$@" $PIP_INSTALL_SUFFIX; then
             FLASHINFER_JIT_CACHE_INSTALLED=true
             echo "Successfully installed flashinfer-jit-cache from cache"
         else
             echo "Failed to install from cache, will try downloading..."
-            rm -f "$CACHED_WHEEL"
+            rm -f "$@"
         fi
     fi
 
@@ -46,9 +48,9 @@ if [ "$FLASHINFER_JIT_CACHE_INSTALLED" = false ]; then
                 --index-url "https://flashinfer.ai/whl/${CU_VERSION}" \
                 -d "${FLASHINFER_CACHE_DIR}"; then
 
-                CACHED_WHEEL=$(find "${FLASHINFER_CACHE_DIR}" -name "${FLASHINFER_WHEEL_PATTERN}" -type f 2>/dev/null | head -n 1)
-                if [ -n "$CACHED_WHEEL" ] && [ -f "$CACHED_WHEEL" ]; then
-                    if $PIP_CMD install "$CACHED_WHEEL" $PIP_INSTALL_SUFFIX; then
+                set -- $FLASHINFER_WHEEL_GLOB
+                if [ -f "$1" ]; then
+                    if $PIP_CMD install --no-index "$@" $PIP_INSTALL_SUFFIX; then
                         FLASHINFER_JIT_CACHE_INSTALLED=true
                         echo "Successfully downloaded and installed flashinfer-jit-cache"
                         break
@@ -65,5 +67,12 @@ fi
 
 if [ "$FLASHINFER_JIT_CACHE_INSTALLED" = false ]; then
     echo "ERROR: Failed to install flashinfer-jit-cache after 5 attempts"
+    exit 1
+fi
+
+# A resolve can succeed and still register no provider, which degrades silently.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if ! bash "${SCRIPT_DIR}/ci_check_flashinfer_jit_cache.sh"; then
+    echo "ERROR: flashinfer-jit-cache installed but serves no cubins"
     exit 1
 fi
