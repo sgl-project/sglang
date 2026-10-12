@@ -3937,6 +3937,31 @@ def _scatter_tail_rows(
     return full
 
 
+class _PackedAuxMeans(list):
+    """DSpark aux captures whose hc-means land in their slices of one packed
+    [tokens, K * hidden] buffer, so the logits processor skips the torch.cat."""
+
+    def __init__(self, num_captures: int) -> None:
+        super().__init__()
+        self._num_captures = int(num_captures)
+        self._buffer: Optional[torch.Tensor] = None
+
+    def capture_mean(self, aux: torch.Tensor) -> None:
+        hidden = aux.shape[-1]
+        if self._buffer is None:
+            self._buffer = aux.new_empty((aux.shape[0], hidden * self._num_captures))
+        k = len(self)
+        out = self._buffer[:, k * hidden : (k + 1) * hidden]
+        torch.mean(aux, dim=1, out=out)
+        self.append(out)
+
+    def packed(self) -> Union[torch.Tensor, List[torch.Tensor]]:
+        # the buffer holds unwritten slices until every layer is captured
+        if self._buffer is None or len(self) < self._num_captures:
+            return list(self)
+        return self._buffer
+
+
 class DeepseekV4Model(nn.Module):
     fall_back_to_pt_during_load = False
 
@@ -4241,7 +4266,10 @@ class DeepseekV4Model(nn.Module):
                 aux = state.residual
                 if tail is not None and i < self.late_layer_start:
                     aux = tail.rows(aux)
-                dspark_aux_hidden_states.append(aux.mean(dim=1))
+                if isinstance(dspark_aux_hidden_states, _PackedAuxMeans):
+                    dspark_aux_hidden_states.capture_mean(aux)
+                else:
+                    dspark_aux_hidden_states.append(aux.mean(dim=1))
             ctx = (
                 nullcontext()
                 if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
@@ -4438,6 +4466,19 @@ class DeepseekV4Model(nn.Module):
 
         capture_dspark = self.dspark_layers_to_capture is not None
         dspark_aux_hidden_states: List[torch.Tensor] = []
+        if (
+            _is_hip
+            and capture_dspark
+            and self.hc_pre_from_prev_sublayer
+            and (
+                forward_batch.forward_mode.is_decode_or_idle()
+                or forward_batch.forward_mode.is_target_verify()
+            )
+        ):
+            # extend can narrow the early captures to the late-layer tail rows
+            dspark_aux_hidden_states = _PackedAuxMeans(
+                len(self.dspark_layers_to_capture)
+            )
 
         attn_backend = get_attn_backend()
         if _is_npu and forward_batch.attn_cp_metadata is not None:
@@ -4535,8 +4576,14 @@ class DeepseekV4Model(nn.Module):
         if self.hc_pre_from_prev_sublayer:
             from sglang.kernels.ops.layernorm.mhc import hc_combine
 
+            # hc_combine widens unit-stride rows to fp32 on load; no fp32 copy needed
+            x_flat = (
+                pre_hc_head
+                if _is_hip and pre_hc_head.stride(-1) == 1
+                else pre_hc_head.float()
+            )
             hidden_states = hc_combine(
-                pre_hc_head.float(), last_pre, self.hc_mult, hidden_states.dtype
+                x_flat, last_pre, self.hc_mult, hidden_states.dtype
             )
         else:
             hidden_states = self.hc_head(
@@ -4555,6 +4602,8 @@ class DeepseekV4Model(nn.Module):
             )
 
         if capture_dspark:
+            if isinstance(dspark_aux_hidden_states, _PackedAuxMeans):
+                dspark_aux_hidden_states = dspark_aux_hidden_states.packed()
             return (hidden_states, pre_hc_head), dspark_aux_hidden_states
 
         return hidden_states, pre_hc_head

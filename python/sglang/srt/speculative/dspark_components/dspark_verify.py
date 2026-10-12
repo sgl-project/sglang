@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from functools import partial
 from typing import Optional
 
 import msgspec
@@ -14,8 +15,10 @@ from sglang.kernels.ops.speculative.dspark.dspark_accept import (
     FinalizeAcceptLens,
     SelectMixedAccept,
     SoftmaxTemp,
+    StaticVerifyEpilogueOuts,
     accept_greedy_triton,
     finalize_accept_lens_triton,
+    static_verify_epilogue_triton,
 )
 from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
     BuildCommitInjectLayout,
@@ -645,19 +648,29 @@ class DsparkVerifyEpilogue:
         bs = forward_batch.batch_size
         verify_lens = self.verify_lens_buf[:bs]
         candidates = forward_batch.input_ids.view(bs, self.stride)
-        commit_lens = self._accept(
-            candidates=candidates,
-            logits=out.next_token_logits,
-            draft_tokens=candidates[:, 1:].contiguous(),
-            seq_lens=forward_batch.seq_lens,
-        )
-        if not self.folds_commit:
-            return
-        # Same staged locations as target verify; padded and fallback rows skip KV.
-        gated_commit_lens = (
-            torch.minimum(commit_lens, verify_lens.to(torch.int32))
-            * self.inject_gate_buf
-        )
+        if _is_hip:
+            gated_commit_lens = self._static_accept_fused(
+                candidates=candidates,
+                logits=out.next_token_logits,
+                seq_lens=forward_batch.seq_lens,
+                verify_lens=verify_lens if self.folds_commit else None,
+            )
+            if gated_commit_lens is None:
+                return
+        else:
+            commit_lens = self._accept(
+                candidates=candidates,
+                logits=out.next_token_logits,
+                draft_tokens=candidates[:, 1:].contiguous(),
+                seq_lens=forward_batch.seq_lens,
+            )
+            if not self.folds_commit:
+                return
+            # Same staged locations as target verify; padded and fallback rows skip KV.
+            gated_commit_lens = (
+                torch.minimum(commit_lens, verify_lens.to(torch.int32))
+                * self.inject_gate_buf
+            )
         cache_loc = forward_batch.out_cache_loc
         state_slot = None
         if is_unified_kv_triton():
@@ -800,6 +813,43 @@ class DsparkVerifyEpilogue:
         self.new_seq_lens_buf[:bs].copy_(finalized.new_seq_lens)
         self.out_tokens_buf[:bs].copy_(out_tokens.view(bs, self.stride))
         return finalized.commit_lens
+
+    def _static_accept_fused(
+        self, *, candidates, logits, seq_lens, verify_lens
+    ) -> Optional[torch.Tensor]:
+        """``_accept`` of full-length rows plus the commit gate, bitwise, in one launch
+        after the argmax; returns the gated commit lengths, None without verify_lens."""
+        bs = candidates.shape[0]
+        gated_commit_lens = (
+            None
+            if verify_lens is None
+            else torch.empty(bs, dtype=torch.int32, device=candidates.device)
+        )
+        site = SpecTpSyncSite.DSPARK_ACCEPT_GRAPH
+        static_verify_epilogue_triton(
+            candidates=candidates,
+            target_logits=logits,
+            prefix_lens=seq_lens[:bs],
+            out=StaticVerifyEpilogueOuts(
+                correct_len=self.correct_len_buf[:bs],
+                bonus=self.bonus_buf[:bs],
+                cap_trim_lens=self.cap_trim_lens_buf[:bs],
+                commit_lens=self.commit_lens_buf[:bs],
+                new_seq_lens=self.new_seq_lens_buf[:bs],
+                out_tokens=self.out_tokens_buf[:bs],
+                gated_commit_lens=gated_commit_lens,
+            ),
+            verify_lens=verify_lens,
+            gate=self.inject_gate_buf,
+            simulated_correct_len=self.simulated_correct_len,
+            sync=(
+                partial(self._tp_sync.sync, site)
+                if self._tp_sync.enabled(site)
+                else None
+            ),
+            fused_argmax=self._fused_argmax,
+        )
+        return gated_commit_lens
 
     def _commit_inject(
         self, commit_lens, verify_lens, seq_lens, req_pool_indices, bs: int

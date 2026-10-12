@@ -959,7 +959,11 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         if self.hc_pre_from_prev_sublayer:
             from sglang.kernels.ops.layernorm.mhc import hc_combine
 
-            x = hc_combine(x.flatten(1).float(), pre, self.hc_mult, x.dtype)
+            x_flat = x.flatten(1)
+            # hc_combine widens unit-stride rows to fp32 on load; no fp32 copy needed
+            if not (get_platform().is_hip and x_flat.stride(-1) == 1):
+                x_flat = x_flat.float()
+            x = hc_combine(x_flat, pre, self.hc_mult, x.dtype)
 
         return LogitsProcessorOutput(next_token_logits=None, hidden_states=x)
 

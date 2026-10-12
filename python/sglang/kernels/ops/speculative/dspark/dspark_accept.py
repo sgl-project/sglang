@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from functools import partial
-from typing import Optional
+from typing import Callable, Optional
 
 import msgspec
 import torch
@@ -916,3 +916,156 @@ def cap_correct_len_triton(
         correct_len, verify_lens, capped, trim, n, BLOCK=BLOCK
     )
     return capped, trim
+
+
+class StaticVerifyEpilogueOuts(msgspec.Struct):
+    """Contiguous [bs] (out_tokens [bs, T]) destinations of the static verify
+    epilogue; gated_commit_lens is None when no KV is injected."""
+
+    correct_len: torch.Tensor
+    bonus: torch.Tensor
+    cap_trim_lens: torch.Tensor
+    commit_lens: torch.Tensor
+    new_seq_lens: torch.Tensor
+    out_tokens: torch.Tensor
+    gated_commit_lens: Optional[torch.Tensor] = None
+
+
+@triton.jit
+def _static_verify_epilogue_kernel(
+    cand_ptr,
+    cand_stride,
+    pred_ptr,
+    decision_ptr,
+    prefix_ptr,
+    verify_lens_ptr,
+    gate_ptr,
+    simulated_ptr,
+    correct_len_ptr,
+    bonus_ptr,
+    cap_trim_ptr,
+    commit_ptr,
+    new_seq_ptr,
+    out_tokens_ptr,
+    gated_ptr,
+    bs,
+    T: tl.constexpr,
+    BLOCK: tl.constexpr,
+    ACCEPT: tl.constexpr,
+    FINISH: tl.constexpr,
+    GATED: tl.constexpr,
+    SIMULATED: tl.constexpr,
+):
+    b = tl.program_id(0).to(tl.int64)
+    offs = tl.arange(0, BLOCK)
+    is_draft = offs < T - 1
+    drafts = tl.load(cand_ptr + b * cand_stride + 1 + offs, mask=is_draft, other=-1)
+    if ACCEPT:
+        targets = tl.load(pred_ptr + b * T + offs, mask=is_draft, other=-2)
+        eq = (drafts == targets) & is_draft
+        # the first mismatch, or T - 1 when every draft matches
+        correct = tl.min(tl.where(eq, BLOCK, offs), 0).to(tl.int32)
+        bonus = tl.load(pred_ptr + b * T + correct).to(tl.int64)
+        if SIMULATED:
+            # SGLANG_SIMULATE_ACC_LEN replaces only the length; the bonus stays the served one
+            correct = tl.load(simulated_ptr).to(tl.int32)
+        if not FINISH:
+            tl.store(decision_ptr + b, correct.to(tl.int64))
+            tl.store(decision_ptr + bs + b, bonus)
+    else:
+        correct = tl.load(decision_ptr + b).to(tl.int32)
+        bonus = tl.load(decision_ptr + bs + b)
+    if FINISH:
+        commit = correct + 1
+        tl.store(correct_len_ptr + b, correct)
+        tl.store(bonus_ptr + b, bonus)
+        tl.store(cap_trim_ptr + b, tl.zeros_like(correct))
+        tl.store(commit_ptr + b, commit)
+        tl.store(new_seq_ptr + b, tl.load(prefix_ptr + b) + commit)
+        tokens = tl.where(offs == correct, bonus, tl.where(is_draft, drafts, 0))
+        tl.store(out_tokens_ptr + b * T + offs, tokens.to(tl.int64), mask=offs < T)
+        if GATED:
+            verify_len = tl.load(verify_lens_ptr + b).to(tl.int32)
+            tl.store(gated_ptr + b, tl.minimum(commit, verify_len) * tl.load(gate_ptr))
+
+
+def static_verify_epilogue_triton(
+    *,
+    candidates: torch.Tensor,
+    target_logits: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    out: StaticVerifyEpilogueOuts,
+    verify_lens: Optional[torch.Tensor] = None,
+    gate: Optional[torch.Tensor] = None,
+    simulated_correct_len: Optional[torch.Tensor] = None,
+    sync: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+    fused_argmax: bool = False,
+) -> None:
+    """``accept_greedy_triton`` (no cutoff), ``finalize_accept_lens_triton`` and
+    ``build_out_tokens_triton`` over ``candidates[:, 1:]``, bitwise, in one launch
+    after the argmax; with ``out.gated_commit_lens`` also the injected-commit gate
+    ``min(commit_lens, verify_lens) * gate``. ``simulated_correct_len`` ([1]) replaces
+    every row's correct length, as ``_accept`` applies SGLANG_SIMULATE_ACC_LEN.
+
+    ``sync`` broadcasts rank 0's decision in place: two launches around one broadcast
+    of the packed (correct_len, bonus), as the cap trims are zero on every rank."""
+    bs, T = candidates.shape
+    assert candidates.stride(1) == 1
+    gated = out.gated_commit_lens is not None
+    simulated = simulated_correct_len is not None
+    if simulated:
+        assert simulated_correct_len.shape == (1,)
+    per_row = [
+        out.correct_len,
+        out.bonus,
+        out.cap_trim_lens,
+        out.commit_lens,
+        out.new_seq_lens,
+        prefix_lens,
+    ]
+    if gated:
+        assert verify_lens is not None and gate is not None and gate.numel() == 1
+        assert out.gated_commit_lens.dtype == torch.int32
+        per_row += [out.gated_commit_lens, verify_lens]
+    for t in per_row:
+        assert t.shape == (bs,) and t.is_contiguous(), t.shape
+    assert out.out_tokens.shape == (bs, T) and out.out_tokens.is_contiguous()
+    assert out.out_tokens.dtype == out.bonus.dtype == torch.int64
+    assert out.commit_lens.dtype == out.cap_trim_lens.dtype == torch.int32
+    target_predict = _row_argmax(target_logits, fused=fused_argmax).view(bs, T)
+    # binds the pointer arguments a launch variant never reads
+    unused = out.commit_lens
+    decision = (
+        unused
+        if sync is None
+        else torch.empty(2 * bs, dtype=torch.int64, device=candidates.device)
+    )
+    launch = partial(
+        _static_verify_epilogue_kernel[(bs,)],
+        candidates,
+        candidates.stride(0),
+        target_predict,
+        decision,
+        prefix_lens,
+        verify_lens if gated else unused,
+        gate if gated else unused,
+        simulated_correct_len if simulated else unused,
+        out.correct_len,
+        out.bonus,
+        out.cap_trim_lens,
+        out.commit_lens,
+        out.new_seq_lens,
+        out.out_tokens,
+        out.gated_commit_lens if gated else unused,
+        bs,
+        T=T,
+        BLOCK=triton.next_power_of_2(T),
+        GATED=gated,
+        SIMULATED=simulated,
+    )
+    if sync is None:
+        launch(ACCEPT=True, FINISH=True)
+        return
+    launch(ACCEPT=True, FINISH=False)
+    sync(decision)
+    launch(ACCEPT=False, FINISH=True)

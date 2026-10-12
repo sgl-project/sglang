@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import random
 import sys
+from unittest import mock
 
 import pytest
 import torch
@@ -30,7 +31,7 @@ from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=15, stage="stage-b", runner_config="1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=20, stage="stage-b", runner_config="1-gpu-small-amd-mi35x")
 
 pytestmark = pytest.mark.skipif(
     not (is_hip() and is_gfx95_supported()),
@@ -352,6 +353,173 @@ def test_page_table_from_req_to_token_matches_torch():
         req_to_token, torch.empty(0, device=DEVICE, dtype=torch.int32), 1000, 64
     )
     assert empty.shape == (0, 16)
+
+
+class _Rank0Decision:
+    """A TP sync whose broadcast hands this rank rank 0's (different) accept decision."""
+
+    def __init__(self, correct_len, bonus, enabled):
+        self._correct_len, self._bonus = correct_len, bonus
+        self._enabled = enabled
+        self._calls = 0
+
+    def enabled(self, site):
+        return self._enabled
+
+    def sync(self, site, values):
+        if not self._enabled:
+            return values
+        bs = self._bonus.shape[0]
+        if values.shape == (2 * bs,):
+            # the fused epilogue's packed (correct_len, bonus)
+            values[:bs].copy_(self._correct_len)
+            values[bs:].copy_(self._bonus)
+        elif self._calls % 3 < 2:
+            # _accept broadcasts correct_len, bonus, then the cap trims (zero everywhere)
+            values.copy_((self._correct_len, self._bonus)[self._calls % 3])
+        self._calls += 1
+        return values
+
+
+@pytest.mark.parametrize("simulated", [False, True], ids=["served", "simulated"])
+@pytest.mark.parametrize("synced", [False, True], ids=["local", "rank0"])
+@pytest.mark.parametrize("stride", [2, 5, 8])
+def test_static_verify_epilogue_matches_accept_chain(simulated, synced, stride):
+    """The one-launch static epilogue must write every persistent accept buffer and the
+    gated commit lengths bitwise as _accept + the gate did, rank 0's decision and a
+    SGLANG_SIMULATE_ACC_LEN length included."""
+    from sglang.srt.speculative.dspark_components.dspark_verify import (
+        DsparkVerifyEpilogue,
+    )
+
+    _seed(39)
+    max_bs, vocab = 16, 1000
+    # gate None: the epilogue folds no KV commit, so nothing is gated
+    for bs, gate in ((1, None), (7, 0), (16, 1)):
+        logits = torch.randn(bs * stride, vocab, device=DEVICE)
+        predict = logits.argmax(-1).view(bs, stride)
+        candidates = torch.randint(0, vocab, (bs, stride), device=DEVICE)
+        # row b matches its first b % stride drafts, so every correct length occurs
+        for b in range(bs):
+            candidates[b, 1 : 1 + b % stride] = predict[b, : b % stride]
+        seq_lens = torch.randint(1, 9000, (max_bs,), device=DEVICE)
+        verify_lens = torch.randint(1, stride + 2, (bs,), device=DEVICE)
+        rank0_correct_len = torch.randint(0, stride, (bs,), device=DEVICE).int()
+        rank0_bonus = torch.randint(0, vocab, (bs,), device=DEVICE)
+        # one length for every row, where the served lengths vary across rows
+        simulated_correct_len = (
+            torch.tensor([stride - 1], dtype=torch.int64, device=DEVICE)
+            if simulated
+            else None
+        )
+        outs = []
+        for fused in (False, True):
+            epilogue = DsparkVerifyEpilogue(
+                max_bs=max_bs,
+                verify_num_draft_tokens=stride,
+                device=DEVICE,
+                tp_sync=_Rank0Decision(rank0_correct_len, rank0_bonus, synced),
+                simulated_correct_len=simulated_correct_len,
+            )
+            persistent = epilogue.read_accept(max_bs)
+            for name in persistent.__struct_fields__:
+                getattr(persistent, name).fill_(-7)
+            epilogue.inject_gate_buf.fill_(gate or 0)
+            if fused:
+                gated = epilogue._static_accept_fused(
+                    candidates=candidates,
+                    logits=logits,
+                    seq_lens=seq_lens,
+                    verify_lens=None if gate is None else verify_lens,
+                )
+            else:
+                commit_lens = epilogue._accept(
+                    candidates=candidates,
+                    logits=logits,
+                    draft_tokens=candidates[:, 1:].contiguous(),
+                    seq_lens=seq_lens,
+                )
+                gated = (
+                    None
+                    if gate is None
+                    else torch.minimum(commit_lens, verify_lens.to(torch.int32))
+                    * epilogue.inject_gate_buf
+                )
+            outs.append((epilogue.read_accept(bs), gated))
+        (ref, ref_gated), (got, got_gated) = outs
+        for name in ref.__struct_fields__:
+            r, g = getattr(ref, name), getattr(got, name)
+            assert r.dtype == g.dtype and torch.equal(r, g), (name, bs, r, g)
+        if gate is None:
+            assert got_gated is None
+        else:
+            assert ref_gated.dtype == got_gated.dtype
+            assert torch.equal(ref_gated, got_gated), (bs, ref_gated, got_gated)
+
+
+def test_candidate_blocks_write_the_zero_page_table():
+    """The compact page table is an empty allocation the lengths launch zero-fills; a
+    row it misses hands the consumer a stale page."""
+    _seed(40)
+    empty = torch.empty
+
+    def poisoned_empty(*args, **kwargs):
+        return empty(*args, **kwargs).fill_(5)
+
+    width = 40000
+    logits = torch.randn(3, width, device=DEVICE)
+    seq_lens = torch.tensor([1, 16385, width], dtype=torch.int32, device=DEVICE)
+    with mock.patch.object(torch, "empty", poisoned_empty):
+        cands = select_candidate_blocks_hip(
+            logits, seq_lens, topk_blocks=TOPK_BLOCKS, block_size=BLOCK_SIZE
+        )
+    assert cands.compact_page_table.shape == (3, 1)
+    assert not cands.compact_page_table.any()
+
+
+@pytest.mark.parametrize("rows", [1, 3, 16])
+def test_hc_combine_widens_bf16_rows_exactly(rows):
+    """The V4 heads hand hc_combine the bf16 rows on HIP; its result must stay bitwise
+    the fp32 copy's, so the kernel must widen on load rather than compute in bf16."""
+    from sglang.kernels.ops.layernorm.mhc import hc_combine
+
+    _seed(41)
+    hc, hidden = 4, 4096
+    x = (torch.randn(rows, hc * hidden, device=DEVICE) * 30).bfloat16()
+    pre = torch.rand(rows, hc, device=DEVICE)
+    ref = hc_combine(x.float(), pre, hc, torch.bfloat16)
+    got = hc_combine(x, pre, hc, torch.bfloat16)
+    assert torch.equal(ref.view(torch.int16), got.view(torch.int16))
+
+
+def test_packed_aux_means_match_mean_then_cat():
+    """Each hc-mean written into its slice of the packed buffer must be bitwise the
+    separate mean the logits processor used to concatenate, in capture order."""
+    from sglang.srt.models.deepseek_v4 import _PackedAuxMeans
+
+    _seed(42)
+    hc, hidden, captures = 4, 4096, 3
+    for tokens in (1, 5, 40):
+        # wide magnitudes, so a different reduction order would round differently
+        auxes = [
+            (
+                torch.randn(tokens, hc, hidden, device=DEVICE)
+                * torch.exp(torch.randn(tokens, hc, hidden, device=DEVICE) * 4)
+            ).bfloat16()
+            for _ in range(captures)
+        ]
+        means = [a.mean(dim=1) for a in auxes]
+        packed = _PackedAuxMeans(captures)
+        for a in auxes[:-1]:
+            packed.capture_mean(a)
+        # a partial capture keeps the list form instead of unwritten slices
+        incomplete = packed.packed()
+        assert isinstance(incomplete, list) and len(incomplete) == captures - 1
+        packed.capture_mean(auxes[-1])
+        got = packed.packed()
+        ref = torch.cat(means, dim=-1)
+        assert isinstance(got, torch.Tensor) and got.shape == ref.shape
+        assert torch.equal(ref.view(torch.int16), got.view(torch.int16))
 
 
 if __name__ == "__main__":
