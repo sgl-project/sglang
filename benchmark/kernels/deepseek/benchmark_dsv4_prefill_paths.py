@@ -892,8 +892,6 @@ def main() -> None:
     # backend must see the same CP-v2/interleave topology and local coordinates
     # as production. No process group is touched by either measured function.
     with get_parallel().override(
-        world_size=args.cp_size,
-        world_rank=args.cp_rank,
         tp_size=args.cp_size,
         tp_rank=args.cp_rank,
         attn_tp_size=1,
