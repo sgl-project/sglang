@@ -351,6 +351,122 @@ def report_blkx(rows, label, field="blkx", keep=None):
         print(f"     ... {len(div) - MAX_DIFF_SHOWN} more divergent groups")
 
 
+def _idxk_evolving_pages(rows):
+    """``{(layer, page)}`` whose stored hash is NOT unique WITHIN one request.
+
+    A c4 page is written row-by-row; the PREFILL stops a few rows short of the
+    LAST page it touches (the prefill-absent tail) and those rows commit one per
+    decode step.  The [IDXK] probe hashes the WHOLE page, so a request that
+    samples the page while it is still being assembled sees a DIFFERENT md5 than
+    a request that samples it AFTER it is complete (``npu_scatter_nd_update_``
+    never clears untouched rows -> last-writer-wins).  A page whose hash changes
+    across the SAME request's own steps is therefore an EVOLVING (partially
+    written) page, and any MISS-vs-HIT difference confined to it is a
+    sampling-TIMING artifact, not a compressor-output difference.
+    """
+    per_req = defaultdict(lambda: defaultdict(set))
+    for r in rows:
+        req = _int(r, "_req", -1)
+        ly = _int(r, "layer")
+        for b, h in _parse_blkx(r, "blkx").items():
+            per_req[(ly, b)][req].add(h)
+    return {key for key, by_req in per_req.items()
+            if any(len(hs) > 1 for hs in by_req.values())}
+
+
+def _idxk_evolve_table(rows):
+    """``{(layer, page): [(req, lastpos, hash), ...]}`` in emission order."""
+    tb = defaultdict(list)
+    for r in rows:
+        req = _int(r, "_req", -1)
+        lp = _int(r, "lastpos", -1)
+        ly = _int(r, "layer")
+        for b, h in _parse_blkx(r, "blkx").items():
+            tb[(ly, b)].append((req, lp, h))
+    return tb
+
+
+def _idxk_aligned_groups(rows, evolving):
+    """Prefill ``(layer, page) -> {hashes}`` EXCLUDING the evolving tail pages."""
+    groups = defaultdict(set)
+    for r in rows:
+        if not _is_prefill(r):
+            continue
+        ly = _int(r, "layer")
+        for b, h in _parse_blkx(r, "blkx").items():
+            if (ly, b) in evolving:
+                continue
+            groups[(ly, b)].add(h)
+    return groups
+
+
+def report_idxk_aligned(rows):
+    """ALIGNED [IDXK] verdict: drop the evolving-tail sampling artifact.
+
+    The raw ``[IDXK]`` per-page hash is only comparable when the page has the
+    SAME assembly stage on both sides.  The prefill of a cache-MISS samples the
+    LAST page it touches while that page is still PARTIALLY written (the
+    prefill-absent tail rows commit later, one per decode step), whereas a cache
+    HIT -- sampled after an earlier request's decode completed the page -- sees
+    the FULL page.  Comparing whole-page md5s across those two stages is a
+    sampling artifact.
+
+    This report:
+      1. lists the EVOLVING pages (hash changes within a single request);
+      2. for each, prints every request's first (prefill-sampled) and last
+         (fully-assembled) hash + whether ALL requests converge to one final
+         hash (the direct MISS-vs-HIT same-stage comparison);
+      3. recomputes the prefill per-page divergence EXCLUDING the evolving pages
+         -> the aligned verdict: index-K CLEAN (artifact) or a REAL difference.
+    """
+    if not rows:
+        return
+    evolving = _idxk_evolving_pages(rows)
+    raw_div = _blkx_divergent(rows, "blkx", keep=_is_prefill)
+    print("\n== [IDXK-ALIGNED] prefill-written pages only (drop evolving tail) ==")
+    if not evolving:
+        print("  [IDXK-ALIGNED] no evolving page (every page stable within a "
+              "request) -> aligned verdict == raw verdict")
+        return
+    print(f"  [IDXK-ALIGNED] evolving (partially-written) pages: "
+          f"{sorted(evolving)}")
+    tb = _idxk_evolve_table(rows)
+    for key in sorted(evolving):
+        by_req = {}
+        for req, lp, h in tb[key]:
+            slot = by_req.setdefault(
+                req, {"first_lp": lp, "first": h, "last_lp": lp, "last": h})
+            if lp >= slot["last_lp"]:
+                slot["last_lp"], slot["last"] = lp, h
+            if lp <= slot["first_lp"]:
+                slot["first_lp"], slot["first"] = lp, h
+        finals = sorted({s["last"] for s in by_req.values()})
+        print(f"  [IDXK-ALIGNED] layer={key[0]} page={key[1]}: "
+              f"prefill-sampled vs fully-assembled per request")
+        for req in sorted(by_req):
+            s = by_req[req]
+            role = "HIT " if s["first"] == s["last"] else "MISS"
+            print(f"     req{req} {role} first(lp={s['first_lp']})="
+                  f"{s['first']} last(lp={s['last_lp']})={s['last']}")
+        conv = "CONVERGED" if len(finals) == 1 else "STILL-DIFF"
+        print(f"     fully-assembled hashes={finals} => {conv}")
+    aligned_groups = _idxk_aligned_groups(rows, evolving)
+    aligned_div = sorted((ly, b) for (ly, b), s in aligned_groups.items()
+                         if len(s) > 1)
+    artifact = sorted(k for k in raw_div if k in evolving)
+    real = sorted(k for k in raw_div if k not in evolving)
+    if not real:
+        print(f"  [IDXK-ALIGNED] VERDICT: every raw divergent page "
+              f"{sorted(raw_div)} is an EVOLVING tail page {artifact} "
+              f"-> MISS==HIT on all prefill-WRITTEN pages => index-K CLEAN "
+              f"(raw divergence is a sampling-time artifact)")
+    else:
+        print(f"  [IDXK-ALIGNED] VERDICT: artifact page(s)={artifact}; REAL "
+              f"divergence remains on {real} => index-K NOT clean")
+    if aligned_div:
+        print(f"  [IDXK-ALIGNED] non-evolving divergent groups: {aligned_div}")
+
+
 def report_cmpidx_div(rows, cmp_reqs, miss_i):
     """One best-effort ``[CMPIDX-DIV]`` line after the [CMPIDX] report.
 
@@ -2201,6 +2317,7 @@ def main(path):
         if tag == "IDXK":
             print("\n== [IDXK] c4 index-K (per-logical-page, prefill) ==")
             report_blkx(rows, "IDXK", keep=_is_prefill)
+            report_idxk_aligned(rows)
             report_uniq(rows, "IDXK.ptab", ("ptab",))
             # fall through to the whole-logical segment compare below as well
         if tag == "C4KV":
