@@ -117,6 +117,8 @@ class SchedulingTraceWriter:
             chunked=self._label(chunked.rid) if chunked is not None else None,
             running=self._labels(plan.running_batch.reqs),
             waiting=self._labels(scheduler.waiting_queue),
+            # None also when no skip check ran (dLLM, deferred prefill, PD
+            # decode) or a later check held admission (min free slots).
             admission_skip_reason=(
                 plan.admission_skip_reason.name
                 if plan.admission_skip_reason is not None
