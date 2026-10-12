@@ -561,5 +561,6 @@ POSITIONAL_FIELD_ORDER = (
     "uocr_max_page_tokens",
     "enable_fp4_indexer",
     "elastic_ep_retiree_lifecycle",
+    "elastic_ep_reuse_cuda_graph",
 )
 # fmt: on
