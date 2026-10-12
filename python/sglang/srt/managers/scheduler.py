@@ -3827,13 +3827,11 @@ class Scheduler(
                     # Merge running_batch with prefill batch
                     running_batch.merge_batch(last_batch)
 
-        # For prefill-only batch, filter out finished requests since they
-        # won't go through the decode step. This keeps running_batch accurate
-        # for load reporting (num_running_reqs via /v1/loads).
-        # Runs outside the last_batch block so stale requests are cleaned
-        # even when no new batches arrive (e.g. traffic stops).
-        if running_batch.is_prefill_only:
-            running_batch.filter_batch()
+        # Rows whose finish a commit already observed leave before admission,
+        # so admission, the decode rows and load reporting (/v1/loads) see only
+        # live rows. Runs after the last_batch join and outside it, so finished
+        # rows leave even when no new batch arrives (e.g. traffic stops).
+        self.leave_finished_rows(running_batch)
 
         admit_plan = self._admit_prefill(running_batch)
         running_batch = admit_plan.running_batch
@@ -4350,6 +4348,11 @@ class Scheduler(
             and req.beam_group is None
             and req.next_output_finishes_by_length()
         ]
+
+    def leave_finished_rows(self, running_batch: ScheduleBatch) -> None:
+        """Drop the running rows whose finish a commit already observed."""
+        if not running_batch.is_empty():
+            running_batch.filter_batch()
 
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
         """Update the running decoding batch in place; None skips decode this step."""
