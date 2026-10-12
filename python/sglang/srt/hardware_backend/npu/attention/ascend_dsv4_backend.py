@@ -293,6 +293,10 @@ def _ropephase_in(fm, cmp_ratio: int = 4, limit: int = 8) -> str:
 # the [IDXK] reader indexes with ``get_compress_buffer(layer, True)[page]``.
 _C4WR_PAGE_CACHE: dict = {}
 
+# [C4WR] one-shot guard so the raw reader page-table line prints once per
+# (layer_id, column) instead of on every writing compressor call.
+_C4WR_PTAB_SEEN: set = set()
+
 
 def _c4wr_page_range(backend, layer_id: int, page: int) -> tuple:
     """(lo, hi) of c4 pool ``page`` slot ids; derived once and cached.
@@ -313,15 +317,58 @@ def _c4wr_page_range(backend, layer_id: int, page: int) -> tuple:
     return rng
 
 
+def _c4wr_ptab_row(backend):
+    """Flattened int64 view of ``forward_metadata.c4_page_table`` (or None).
+
+    This is the SAME tensor the ``[IDXK]`` reader indexes as
+    ``get_compress_buffer(layer, True)[c4_page_table[j]]``, so the probe derives
+    the page->slot mapping from the reader helper's own output rather than a
+    re-implemented formula.
+    """
+    tbl = getattr(backend.forward_metadata, "c4_page_table", None)
+    if not (torch.is_tensor(tbl) and tbl.numel()):
+        return None
+    return tbl.reshape(-1).to(torch.int64).cpu()
+
+
+def _c4wr_resolve_page(backend) -> tuple:
+    """(col, phys, tbl_val, src) for the READER's page.
+
+    ``DSV4_DUMP_C4WR_PTAB_COL`` (default 136) selects c4 page-table column ``j``;
+    the reader addresses physical page ``c4_page_table[j]`` for it, so the probe
+    traces slots ``[phys*kp, (phys+1)*kp)``. ``DSV4_DUMP_C4WR_PAGE`` is the
+    legacy literal flat page (back-compat): used verbatim, and also as a fallback
+    when the page table is not derivable at the probe site.
+    """
+    col_env = os.environ.get("DSV4_DUMP_C4WR_PTAB_COL")
+    page_env = os.environ.get("DSV4_DUMP_C4WR_PAGE")
+    if col_env is not None and col_env != "":
+        col, src = int(col_env), "ptab"
+    elif page_env is not None and page_env != "":
+        col, src = int(page_env), "page"
+    else:
+        col, src = 136, "ptab"
+    row = _c4wr_ptab_row(backend)
+    tbl_val = None
+    if row is not None and 0 <= col < int(row.numel()):
+        tbl_val = int(row[col])
+    phys = col if (src == "page" or tbl_val is None) else tbl_val
+    return col, phys, tbl_val, src
+
+
 def _c4wr_probe(compressor, loc, forward_batch, backend) -> None:
     """READ-ONLY write-trace of the compressor scatter site.
 
     Emits ONE line per writing compressor call for the c4 INDEXER (idx=1),
-    naming the slot ids that land in c4 pool page 136 (ratio-4 blocks
-    4352..4383, tokens 17408..17536) so a MISS vs HIT run can be compared
-    writer-by-writer (does one side write MORE / FEWER page-136 slots, or a
-    different LAST writer?). Gated by ``DSV4_DUMP_C4WR`` (truthy); prints
-    nothing when off and never mutates the pool.
+    naming the slot ids that land in the READER's page for one c4 page-table
+    column (``DSV4_DUMP_C4WR_PTAB_COL``, default 136 -> physical page
+    ``c4_page_table[136]``), so a MISS vs HIT run can be compared writer-by-writer
+    (does one side write MORE / FEWER reader-page slots, or a different LAST
+    writer?). The same line reports the offset-consistency check for that column:
+    do this writer's ``loc`` slots equal the reader's ``phys*kp + arange(kp)``
+    (writer==reader, ``ok``) or the flat ``col*kp + arange(kp)`` (one-page skew,
+    ``skew_ok``)? Gated by ``DSV4_DUMP_C4WR`` (truthy); prints nothing when off
+    and never mutates the pool.
     """
     env = os.environ.get("DSV4_DUMP_C4WR")
     if env is None or env in ("", "0"):
@@ -337,13 +384,18 @@ def _c4wr_probe(compressor, loc, forward_batch, backend) -> None:
         return
     if loc is None:
         return
-    page = int(os.environ.get("DSV4_DUMP_C4WR_PAGE", "136"))
-    lo, hi = _c4wr_page_range(backend, compressor.layer_id, page)
+    col, phys, tbl_val, src = _c4wr_resolve_page(backend)
+    lo, hi = _c4wr_page_range(backend, compressor.layer_id, phys)
     if hi <= lo:
         return
+    ske_lo, ske_hi = _c4wr_page_range(backend, compressor.layer_id, col)
     s = loc.detach().reshape(-1).to(torch.int64).cpu()
     tail = s[-40:].tolist()
     in_page = s[(s >= lo) & (s < hi)].tolist()
+    expect = list(range(lo, hi))
+    ok = set(in_page) == set(expect)
+    in_skew = s[(s >= ske_lo) & (s < ske_hi)].tolist()
+    skew_ok = ske_hi > ske_lo and set(in_skew) == set(range(ske_lo, ske_hi))
     fm = backend.forward_metadata
     try:
         if forward_batch.forward_mode.is_prefill():
@@ -356,10 +408,24 @@ def _c4wr_probe(compressor, loc, forward_batch, backend) -> None:
         mode = str(forward_batch.forward_mode)
     sp = _cpu_int_1d(getattr(fm, "start_pos", None))
     su = _cpu_int_1d(getattr(fm, "seqused", None))
+    key = (compressor.layer_id, col)
+    if key not in _C4WR_PTAB_SEEN:
+        _C4WR_PTAB_SEEN.add(key)
+        row = _c4wr_ptab_row(backend)
+        col136 = int(row[136]) if row is not None and int(row.numel()) > 136 else None
+        tbl_len = int(row.numel()) if row is not None else 0
+        print(
+            f"[C4WR] ptab layer={compressor.layer_id} col136={col136} "
+            f"col={col} phys={phys} tbl_val={tbl_val} tbl_len={tbl_len} src={src}",
+            flush=True,
+        )
     print(
         f"[C4WR] layer={compressor.layer_id} idx={int(compressor.is_in_indexer)} "
         f"mode={mode} start={sp} seqused={su} nloc={int(s.numel())} "
-        f"loc_tail={tail} slots_in_page136={in_page} n_136={len(in_page)}",
+        f"loc_tail={tail} col={col} phys={phys} flat135={col} "
+        f"slots=[{lo}..{hi - 1}] c4loc_for_col={in_page} expect={expect} ok={ok} "
+        f"c4loc_skew={in_skew} skew_ok={skew_ok} "
+        f"slots_in_page={in_page} n_136={len(in_page)}",
         flush=True,
     )
 
