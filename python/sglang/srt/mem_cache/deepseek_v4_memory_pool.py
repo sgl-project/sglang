@@ -168,6 +168,12 @@ def select_dsv4_kv_layout() -> Tuple[KVLayout, Optional[str]]:
     AITER attention."""
     mode = envs.SGLANG_DSV4_KV_LAYOUT.get().lower()
     option = envs.SGLANG_DSV4_COMPRESSED_KV_LAYOUT.get().lower()
+    if get_exec().kernel.dsv4_attn_backend == "flashmla_mega":
+        if mode not in ("auto", "v4", "v41") or option not in ("auto", "fp8", "fp4"):
+            raise ValueError("invalid KV layout for flashmla_mega")
+        # The backend selects its required SWA layout even when the legacy
+        # SGLANG_DSV4_KV_LAYOUT default is v4. Ratio-1/2 caches use FP4 by default.
+        mode = "v41"
     if get_exec().kernel.dsv4_attn_backend == "trtllm":
         assert mode in ("auto", "v4") and option in ("auto", "fp8"), (
             "trtllm uses uniform FP8 pools, not the packed V4.1 KV layouts"

@@ -1114,6 +1114,7 @@ class MqaAttentionBase(nn.Module):
 
 class MQALayer(MqaAttentionBase):
     is_dsv41: bool = False
+    use_mega_attention: bool = False
 
     def __init__(
         self,
@@ -1250,6 +1251,35 @@ class MQALayer(MqaAttentionBase):
             prefix=add_prefix("attn_mqa", prefix),
         )
 
+        self.use_mega_attention = (
+            self.is_dsv41
+            and _is_cuda
+            and get_exec().kernel.dsv4_attn_backend == "flashmla_mega"
+        )
+        if self.use_mega_attention:
+            if (
+                self.q_head_norm
+                or self.head_dim != 512
+                or self.qk_rope_head_dim != 64
+                or self.n_local_heads > 128
+                or self.n_local_groups <= 0
+                or self.n_local_heads != 8 * self.n_local_groups
+                or self.wo_a_fp8
+            ):
+                raise ValueError(
+                    "MegaAttention requires DeepSeek-V4.1 with eight 512-dim "
+                    "heads per WO-A group and BF16 source WO-A weights"
+                )
+            self.register_buffer(
+                "mega_cos_sin_cache",
+                torch.cat(
+                    (self.freqs_cis.real, self.freqs_cis.imag), dim=-1
+                ).contiguous(),
+                persistent=False,
+            )
+            self.register_buffer("mega_wo_weight", None, persistent=False)
+            self.register_buffer("mega_wo_scale", None, persistent=False)
+
         self.use_fused_qk_norm_rope = _is_hip and _hip.use_fused_qk_norm_rope(self)
         # Static eligibility; token count and wo_b's output format are checked
         # in forward, after weights have loaded.
@@ -1276,6 +1306,24 @@ class MQALayer(MqaAttentionBase):
             self.indexer.compressor.fp4_cos = self.cos_cache[:, 0, 0, :]
             self.indexer.compressor.fp4_sin = self.sin_cache[:, 0, 0, :]
         return result
+
+    def setup_mega_attention(self) -> None:
+        if not self.use_mega_attention:
+            return
+        from sglang.kernels.ops.attention.dsv4.mega_attention import (
+            require_mega_attention,
+        )
+        from sglang.srt.layers.attention.dsv4.mega_attention import prepare_mega_wo_a
+
+        require_mega_attention()
+        weight = getattr(self.wo_a, "weight", None)
+        if weight is None or weight.dtype != torch.bfloat16:
+            raise ValueError("MegaAttention requires BF16 source WO-A weights")
+        # Rebuild after each load, before CUDA graph capture. Keeping the source
+        # parameter in checkpoint order avoids corrupting hot weight reloads.
+        self.mega_wo_weight, self.mega_wo_scale = prepare_mega_wo_a(
+            weight.view(self.n_local_groups, self.o_lora_rank, -1)
+        )
 
     def _get_npu_rope_position_cache(
         self,
@@ -1387,6 +1435,10 @@ class MQALayer(MqaAttentionBase):
     ) -> torch.Tensor:
         q, _ = self.wq_b(q)
         q = q.view(-1, self.n_local_heads, self.head_dim)
+        if self.use_mega_attention:
+            # The fused kernel owns Q RoPE. Query packing happens once after
+            # the prepare streams join, including zeroing padded heads.
+            return q
         if not self.q_head_norm:
             if q_out is not None and q_out.dtype == torch.float8_e4m3fn:
                 fused_q_norm_rope(q, q_out, None, self.freqs_cis, positions)
@@ -2291,7 +2343,9 @@ class MQALayer(MqaAttentionBase):
 
         tp_slice, q_padded, q_out, q_rope = slice(None), None, None, None
         k_nope, k_rope = None, None
-        if (
+        if self.use_mega_attention:
+            kernel_num_heads = 64 if self.n_local_heads <= 64 else 128
+        elif (
             self.is_dsv41
             and not self.q_head_norm
             and get_token_to_kv_pool().uniform_fp8
@@ -2415,6 +2469,38 @@ class MQALayer(MqaAttentionBase):
             kv, k_rope = _materialize_cp_unified_fp8_kv(
                 kv, k_rope, forward_batch, torch.cuda.current_stream()
             )
+
+        if self.use_mega_attention:
+            from sglang.kernels.ops.attention.dsv4.mega_attention import pack_mega_query
+            from sglang.srt.layers.attention.dsv4.mega_attention import (
+                project_mega_attention,
+            )
+
+            if self.mega_wo_weight is None:
+                raise RuntimeError(
+                    "MegaAttention WO-A was not prepared after weight loading"
+                )
+            if forward_batch.forward_mode.is_idle():
+                # An idle DP rank may have padded rows, but no attention work.
+                o = x.new_zeros(x.shape[0], self.n_local_groups, self.o_lora_rank)
+            else:
+                q = pack_mega_query(q, kernel_num_heads)
+                out = attn_backend.forward(
+                    q=q,
+                    k=q,
+                    v=q,
+                    layer=self.attn_mqa,
+                    forward_batch=forward_batch,
+                    compress_ratio=self.compress_ratio,
+                    attn_sink=attn_sink,
+                    save_kv_cache=False,
+                    mega_positions=positions,
+                    mega_cos_sin_cache=self.mega_cos_sin_cache,
+                )
+                o = project_mega_attention(
+                    out.data, out.scale, self.mega_wo_weight, self.mega_wo_scale
+                )
+            return self._project_wo_b(o, defer_all_reduce)
 
         # save_kv_cache = kv is not None selects who writes the ring. When kv is
         # None the store was already fused into _forward_prepare* (decode) or
@@ -4976,6 +5062,10 @@ class DeepseekV4ForCausalLM(nn.Module):
     def post_load_weights(self, is_nextn=False, weight_names=None):
         if self.wo_a_fp8:
             self._setup_fp8_wo_a_scales(is_nextn)
+
+        for module in self.modules():
+            if isinstance(module, MQALayer):
+                module.setup_mega_attention()
 
         if is_nextn:
             return

@@ -48,6 +48,42 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
 
     run_post_process_pass(server_args, _deepseek_v4_kv_cache_dtype)
 
+    if cfg.dsv4_attn_backend == "flashmla_mega":
+        from sglang.srt.utils.common import is_sm100_supported
+
+        if model_config_of(server_args).hf_config.model_type != "deepseek_v41":
+            raise ValueError("--dsv4-attn-backend flashmla_mega requires DeepSeek-V4.1")
+        if cfg.device != "cuda" or not is_sm100_supported():
+            raise ValueError("--dsv4-attn-backend flashmla_mega requires SM100/SM103")
+        if cfg.dtype not in ("auto", "bfloat16"):
+            raise ValueError(
+                "--dsv4-attn-backend flashmla_mega requires BF16 activations"
+            )
+        if cfg.kv_cache_dtype not in ("auto", "fp8_e4m3"):
+            raise ValueError(
+                "--dsv4-attn-backend flashmla_mega requires "
+                "--kv-cache-dtype fp8_e4m3 for its packed KV storage"
+            )
+        unsupported = (
+            (
+                "context parallelism",
+                cfg.attn_cp_size > 1 or cfg.dcp_size > 1 or cfg.enable_prefill_cp,
+            ),
+            ("PD disaggregation", cfg.disaggregation_mode != "null"),
+            (
+                "prefill CUDA graphs",
+                cfg.cuda_graph_config.prefill.backend != Backend.DISABLED,
+            ),
+        )
+        for feature, enabled in unsupported:
+            if enabled:
+                raise ValueError(
+                    f"--dsv4-attn-backend flashmla_mega does not support {feature} yet"
+                )
+        logger.info(
+            "DeepSeek-V4.1 MegaAttention enabled (packed KV, fused RoPE and MXFP8 WO-A)"
+        )
+
     if cfg.dsv4_attn_backend == "trtllm":
         from sglang.srt.utils.common import is_sm100_supported
 
