@@ -3443,6 +3443,7 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                 load_config.remote_instance_weight_loader_transfer_engine,
                 f"http://{load_config.remote_instance_weight_loader_seed_instance_ip}:{load_config.remote_instance_weight_loader_seed_instance_service_port}",
                 load_config.tp_rank,
+                role="draft" if model_config.is_draft_model else "target",
             )
             if not success:
                 raise RuntimeError(
@@ -3521,11 +3522,11 @@ class RemoteInstanceModelLoader(BaseModelLoader):
         current_platform.empty_cache()
 
     def load_model_from_remote_instance_by_transfer_engine(
-        self, model, transfer_engine, seed_url, tp_rank
+        self, model, transfer_engine, seed_url, tp_rank, role
     ) -> bool:
         # get remote weights metadata from source instance
         seed_transfer_engine_session_id, seed_transfer_engine_weight_info = (
-            get_remote_instance_transfer_engine_info_per_rank(seed_url, tp_rank)
+            get_remote_instance_transfer_engine_info_per_rank(seed_url, tp_rank, role)
         )
         if (
             seed_transfer_engine_session_id is None
