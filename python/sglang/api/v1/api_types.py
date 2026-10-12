@@ -356,6 +356,113 @@ class MediaRef(msgspec.Struct, kw_only=True, frozen=True):
         return encode_MediaRef(self)
 
 
+class ListModelsRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.ListModelsRequest: JSON object (unknown keys ignored)."""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "ListModelsRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_ListModelsRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_ListModelsRequest(self)
+
+
+class ListModelsResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.ListModelsResponse: JSON object (unknown keys ignored)."""
+
+    models: List[ModelCard] = []
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "ListModelsResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_ListModelsResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_ListModelsResponse(self)
+
+
+class ModelCard(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.ModelCard: JSON object (unknown keys ignored)."""
+
+    id: str = ""
+    root: str = ""
+    parent: Optional[str] = None
+    max_model_len: int = 0
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "ModelCard":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_ModelCard(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_ModelCard(self)
+
+
+class DetokenizeRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.DetokenizeRequest: JSON object (unknown keys ignored)."""
+
+    tokens: List[int] = []
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "DetokenizeRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_DetokenizeRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_DetokenizeRequest(self)
+
+
+class DetokenizeResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.DetokenizeResponse: JSON object (unknown keys ignored)."""
+
+    text: str = ""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "DetokenizeResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_DetokenizeResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_DetokenizeResponse(self)
+
+
+class AbortRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.AbortRequest: JSON object (unknown keys ignored)."""
+
+    rid: str = ""
+    abort_all: bool = False
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "AbortRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_AbortRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_AbortRequest(self)
+
+
+class AbortResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.AbortResponse: JSON object (unknown keys ignored)."""
+
+    success: bool = False
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "AbortResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_AbortResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_AbortResponse(self)
+
+
 class HealthCheckRequest(msgspec.Struct, kw_only=True, frozen=True):
     """sglang.api.v1.HealthCheckRequest: JSON object (unknown keys ignored)."""
 
@@ -1423,6 +1530,121 @@ def encode_MediaInput(v: MediaInput) -> Any:
     if isinstance(v, list) and (v and isinstance(v[0], list)):
         return encode_MediaItemsList(v)
     return v
+
+
+def decode_ListModelsRequest(value: Any) -> ListModelsRequest:
+    m = _expect_map(value, expected="struct ListModelsRequest")
+    return ListModelsRequest()
+
+
+def encode_ListModelsRequest(v: ListModelsRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    return d
+
+
+def decode_ListModelsResponse(value: Any) -> ListModelsResponse:
+    m = _expect_map(value, expected="struct ListModelsResponse")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "models":
+            kw["models"] = [] if x is None else [decode_ModelCard(e) for e in _expect_seq(x, expected="a sequence")]
+    return ListModelsResponse(**kw)
+
+
+def encode_ListModelsResponse(v: ListModelsResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.models:
+        d["models"] = [encode_ModelCard(e) for e in v.models]
+    return d
+
+
+def decode_ModelCard(value: Any) -> ModelCard:
+    m = _expect_map(value, expected="struct ModelCard")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "id":
+            kw["id"] = _expect_str(x, expected="a string")
+        elif key == "root":
+            kw["root"] = _expect_str(x, expected="a string")
+        elif key == "parent":
+            kw["parent"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "max_model_len":
+            kw["max_model_len"] = _expect_uint(x, expected="u64")
+    return ModelCard(**kw)
+
+
+def encode_ModelCard(v: ModelCard) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["id"] = v.id
+    d["root"] = v.root
+    if v.parent is not None:
+        d["parent"] = v.parent
+    d["max_model_len"] = v.max_model_len
+    return d
+
+
+def decode_DetokenizeRequest(value: Any) -> DetokenizeRequest:
+    m = _expect_map(value, expected="struct DetokenizeRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "tokens":
+            kw["tokens"] = [] if x is None else [_expect_int(e, expected="i64") for e in _expect_seq(x, expected="a sequence")]
+    return DetokenizeRequest(**kw)
+
+
+def encode_DetokenizeRequest(v: DetokenizeRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.tokens:
+        d["tokens"] = list(v.tokens)
+    return d
+
+
+def decode_DetokenizeResponse(value: Any) -> DetokenizeResponse:
+    m = _expect_map(value, expected="struct DetokenizeResponse")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "text":
+            kw["text"] = _expect_str(x, expected="a string")
+    return DetokenizeResponse(**kw)
+
+
+def encode_DetokenizeResponse(v: DetokenizeResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["text"] = v.text
+    return d
+
+
+def decode_AbortRequest(value: Any) -> AbortRequest:
+    m = _expect_map(value, expected="struct AbortRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "rid":
+            kw["rid"] = _expect_str(x, expected="a string")
+        elif key == "abort_all":
+            kw["abort_all"] = _expect_bool(x, expected="a boolean")
+    return AbortRequest(**kw)
+
+
+def encode_AbortRequest(v: AbortRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["rid"] = v.rid
+    d["abort_all"] = v.abort_all
+    return d
+
+
+def decode_AbortResponse(value: Any) -> AbortResponse:
+    m = _expect_map(value, expected="struct AbortResponse")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "success":
+            kw["success"] = _expect_bool(x, expected="a boolean")
+    return AbortResponse(**kw)
+
+
+def encode_AbortResponse(v: AbortResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["success"] = v.success
+    return d
 
 
 def decode_HealthCheckRequest(value: Any) -> HealthCheckRequest:

@@ -609,6 +609,54 @@ pub mod media_input {
     }
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ListModelsRequest {}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListModelsResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub models: ::prost::alloc::vec::Vec<ModelCard>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ModelCard {
+    #[prost(string, tag = "1")]
+    pub id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub root: ::prost::alloc::string::String,
+    #[prost(string, optional, tag = "3")]
+    pub parent: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(uint64, tag = "4")]
+    pub max_model_len: u64,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DetokenizeRequest {
+    #[prost(int64, repeated, tag = "1")]
+    pub tokens: ::prost::alloc::vec::Vec<i64>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DetokenizeResponse {
+    #[prost(string, tag = "1")]
+    pub text: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AbortRequest {
+    /// Native generation rid (HTTP `/generate` or gRPC Generate), not an HTTP
+    /// chat/completion response ID.
+    /// Required and nonempty unless abort_all is true.
+    #[prost(string, tag = "1")]
+    pub rid: ::prost::alloc::string::String,
+    /// When true, rid must be empty. Targets all frontend generations active at
+    /// this call, including HTTP chat/completions.
+    #[prost(bool, tag = "2")]
+    pub abort_all: bool,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AbortResponse {
+    /// True if at least one active generation matched and cancellation was
+    /// requested. Not an acknowledgement that the scheduler has stopped yet.
+    /// False for an unknown/already-finished ID; repeated aborts are harmless.
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct HealthCheckRequest {}
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct HealthCheckResponse {

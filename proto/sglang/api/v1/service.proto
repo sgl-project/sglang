@@ -27,6 +27,57 @@ service SglangService {
   // `/server_info`: one control round-trip, shaped through the runtime-metric
   // allowlist (never the raw server-args dump, which embeds keys).
   rpc GetServerInfo(GetServerInfoRequest) returns (GetServerInfoResponse);
+
+  // The same static model cards as HTTP `/v1/models`.
+  rpc ListModels(ListModelsRequest) returns (ListModelsResponse);
+
+  // Decode token IDs locally, without running model inference.
+  rpc Detokenize(DetokenizeRequest) returns (DetokenizeResponse);
+
+  // Cancel by the native rid used by HTTP `/generate` or gRPC Generate, or
+  // cancel all active frontend generations with abort_all. HTTP chat/completion
+  // response IDs are not supported as rid selectors.
+  // Duplicate native IDs cancel all matching generations. A later reuse of the
+  // ID is unaffected. Internal control/detokenization requests are not targeted.
+  rpc Abort(AbortRequest) returns (AbortResponse);
+}
+
+message ListModelsRequest {}
+
+message ListModelsResponse {
+  repeated ModelCard models = 1;
+}
+
+message ModelCard {
+  string id = 1;
+  string root = 2;
+  optional string parent = 3;
+  uint64 max_model_len = 4;
+}
+
+message DetokenizeRequest {
+  repeated int64 tokens = 1;
+}
+
+message DetokenizeResponse {
+  string text = 1;
+}
+
+message AbortRequest {
+  // Native generation rid (HTTP `/generate` or gRPC Generate), not an HTTP
+  // chat/completion response ID.
+  // Required and nonempty unless abort_all is true.
+  string rid = 1;
+  // When true, rid must be empty. Targets all frontend generations active at
+  // this call, including HTTP chat/completions.
+  bool abort_all = 2;
+}
+
+message AbortResponse {
+  // True if at least one active generation matched and cancellation was
+  // requested. Not an acknowledgement that the scheduler has stopped yet.
+  // False for an unknown/already-finished ID; repeated aborts are harmless.
+  bool success = 1;
 }
 
 message HealthCheckRequest {}

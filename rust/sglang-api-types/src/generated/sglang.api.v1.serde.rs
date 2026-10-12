@@ -2694,6 +2694,348 @@ impl<'de> ::serde::Deserialize<'de> for MediaInput {
     }
 }
 
+impl ::serde::Serialize for ListModelsRequest {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for ListModelsRequest {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = ListModelsRequest;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct ListModelsRequest")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(ListModelsRequest {})
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for ListModelsResponse {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        if !self.models.is_empty() {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "models", &self.models)?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for ListModelsResponse {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = ListModelsResponse;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct ListModelsResponse")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_models = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "models" => {
+                            if f_models.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("models"));
+                            }
+                            f_models = Some(
+                                map.next_value::<Option<Vec<ModelCard>>>()?
+                                    .unwrap_or_default(),
+                            );
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(ListModelsResponse {
+                    models: f_models.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for ModelCard {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "id", &self.id)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "root", &self.root)?;
+        if let Some(v) = &self.parent {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "parent", v)?;
+        }
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "max_model_len",
+            &self.max_model_len,
+        )?;
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for ModelCard {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = ModelCard;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct ModelCard")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_id = None;
+                let mut f_root = None;
+                let mut f_parent = None;
+                let mut f_max_model_len = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "id" => {
+                            if f_id.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("id"));
+                            }
+                            f_id = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "root" => {
+                            if f_root.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("root"));
+                            }
+                            f_root = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "parent" => {
+                            if f_parent.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("parent"));
+                            }
+                            f_parent =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "max_model_len" => {
+                            if f_max_model_len.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("max_model_len"));
+                            }
+                            f_max_model_len = Some(map.next_value::<u64>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(ModelCard {
+                    id: f_id.unwrap_or_default(),
+                    root: f_root.unwrap_or_default(),
+                    parent: f_parent.flatten(),
+                    max_model_len: f_max_model_len.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for DetokenizeRequest {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        if !self.tokens.is_empty() {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "tokens", &self.tokens)?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for DetokenizeRequest {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = DetokenizeRequest;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct DetokenizeRequest")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_tokens = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "tokens" => {
+                            if f_tokens.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("tokens"));
+                            }
+                            f_tokens =
+                                Some(map.next_value::<Option<Vec<i64>>>()?.unwrap_or_default());
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(DetokenizeRequest {
+                    tokens: f_tokens.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for DetokenizeResponse {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "text", &self.text)?;
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for DetokenizeResponse {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = DetokenizeResponse;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct DetokenizeResponse")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_text = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "text" => {
+                            if f_text.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("text"));
+                            }
+                            f_text = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(DetokenizeResponse {
+                    text: f_text.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for AbortRequest {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "rid", &self.rid)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "abort_all", &self.abort_all)?;
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for AbortRequest {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = AbortRequest;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct AbortRequest")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_rid = None;
+                let mut f_abort_all = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "rid" => {
+                            if f_rid.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("rid"));
+                            }
+                            f_rid = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "abort_all" => {
+                            if f_abort_all.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("abort_all"));
+                            }
+                            f_abort_all = Some(map.next_value::<bool>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(AbortRequest {
+                    rid: f_rid.unwrap_or_default(),
+                    abort_all: f_abort_all.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for AbortResponse {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "success", &self.success)?;
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for AbortResponse {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = AbortResponse;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct AbortResponse")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_success = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "success" => {
+                            if f_success.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("success"));
+                            }
+                            f_success = Some(map.next_value::<bool>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(AbortResponse {
+                    success: f_success.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
 impl ::serde::Serialize for HealthCheckRequest {
     fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let map = serializer.serialize_map(None)?;

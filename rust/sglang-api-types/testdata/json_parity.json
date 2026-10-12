@@ -2,6 +2,42 @@
   "_": "Cross-language JSON parity fixtures for sglang.api.v1. Each case: decoding `input` and re-encoding yields `canonical` byte for byte, and `canonical` re-encodes to itself. Checked by rust/sglang-api-types/tests/json_parity.rs and test/registered/unit/api/v1/test_parity.py.",
   "cases": [
     {
+      "type": "ListModelsResponse",
+      "name": "model cards preserve a uint64 context limit and omit absent parent",
+      "input": {"models": [{"id": "model", "root": "model", "max_model_len": 4294967296}]},
+      "canonical": "{\"models\":[{\"id\":\"model\",\"root\":\"model\",\"max_model_len\":4294967296}]}"
+    },
+    {
+      "type": "DetokenizeRequest",
+      "name": "token IDs share the native generate int64 representation",
+      "input": {"tokens": [1, 2147483648]},
+      "canonical": "{\"tokens\":[1,2147483648]}"
+    },
+    {
+      "type": "DetokenizeResponse",
+      "name": "decoded text",
+      "input": {"text": "hello"},
+      "canonical": "{\"text\":\"hello\"}"
+    },
+    {
+      "type": "AbortRequest",
+      "name": "single public request ID",
+      "input": {"rid": "request", "abort_all": false},
+      "canonical": "{\"rid\":\"request\",\"abort_all\":false}"
+    },
+    {
+      "type": "AbortRequest",
+      "name": "all generations",
+      "input": {"rid": "", "abort_all": true},
+      "canonical": "{\"rid\":\"\",\"abort_all\":true}"
+    },
+    {
+      "type": "AbortResponse",
+      "name": "unknown ID is an explicit unsuccessful match",
+      "input": {"success": false},
+      "canonical": "{\"success\":false}"
+    },
+    {
       "type": "GenerateRequest",
       "name": "single text prompt with a sampling object; stream absent",
       "input": {
