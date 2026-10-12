@@ -4550,7 +4550,7 @@ class TestEntrypointDpAttentionMissingAlias:
             "moe_tp_size": 2,
             "moe_dp_rank": 0,
             "moe_dp_size": 1,
-            "enable_dp_attention": True,
+            "attn_dp_enabled": True,
             "attn_tp_rank": 0,
             "attn_tp_size": 1,
             "attn_dp_rank": tp_rank,

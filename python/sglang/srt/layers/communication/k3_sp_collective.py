@@ -3,14 +3,12 @@
 The reduce-scatter folds the pending attention residual into its reduction
 epilogue.  The matching all-gather reassembles the token shards after MoE.
 Both reuse CustomAllReduceV2's push workspace and fall back as a pair outside
-the checked-in GB300 tuning envelope.
+the checked-in GB200/GB300 tuning envelope.
 """
 
 from __future__ import annotations
 
 import logging
-from contextlib import contextmanager
-from contextvars import ContextVar
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -28,7 +26,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _HIDDEN_SIZE = 7168
-_SUPPORTED_WORLD_SIZES = (4, 8)
+_SUPPORTED_WORLD_SIZES = (4, 8, 16)
 
 # Named persistent symmetric buffers, one per NVLS-aliased tensor. Every rank
 # must resolve the same (buffer, offset) for these, which a per-forward
@@ -47,9 +45,6 @@ class _State:
 _STATE: Optional[_State] = None
 _INITIALIZED = False
 _O_PROJ_RESULT_BUFFERS: dict[int, torch.Tensor] = {}
-_O_PROJ_OUTPUT_ROWS: ContextVar[Optional[int]] = ContextVar(
-    "k3_sp_o_proj_output_rows", default=None
-)
 
 
 def _init_state() -> Optional[_State]:
@@ -70,17 +65,35 @@ def _init_state() -> Optional[_State]:
     a2a = get_exec().moe.moe_a2a_backend
     group = get_parallel().attn_tp_group
     comm = group.ca_comm
+    device_sm = get_device_sm()
+    is_custom_allreduce = isinstance(comm, CustomAllReduceV2)
+    if is_custom_allreduce:
+        comm_disabled = comm.disabled
+        has_multicast = comm.has_multicast
+    else:
+        comm_disabled = None
+        has_multicast = None
     if (
-        get_device_sm() != 103
+        device_sm not in (100, 103)
         or group.world_size not in _SUPPORTED_WORLD_SIZES
         or a2a not in ("megamoe", "deepep")
-        or not isinstance(comm, CustomAllReduceV2)
-        or comm.disabled
-        or not comm.has_multicast
+        or not is_custom_allreduce
+        or comm_disabled
+        or not has_multicast
     ):
         message = (
-            "K3 SP collective requires SM103, TP4/TP8, MegaMoE/DeepEP, and "
-            "CustomAllReduceV2 with multicast; using NCCL."
+            "K3 SP collective requires SM100/SM103, TP4/TP8/TP16, "
+            "MegaMoE/DeepEP, and CustomAllReduceV2 with multicast; using NCCL "
+            "(sm=%s, world_size=%s, a2a=%s, comm=%s, disabled=%s, "
+            "has_multicast=%s)."
+            % (
+                device_sm,
+                group.world_size,
+                a2a,
+                type(comm).__name__ if comm is not None else None,
+                comm_disabled,
+                has_multicast,
+            )
         )
         (logger.warning if explicit else logger.info)(message)
         return None
@@ -133,7 +146,9 @@ def _symm_buffer(
     )
 
 
-def requires_symmetric_rs(num_tokens: int, device: torch.device) -> bool:
+def requires_symmetric_rs(
+    num_tokens: int, device: torch.device, element_size: int
+) -> bool:
     """Whether standalone or fused RS reads o_proj through its NVLS alias."""
     state = _init_state()
     if state is None:
@@ -146,6 +161,8 @@ def requires_symmetric_rs(num_tokens: int, device: torch.device) -> bool:
         _HIDDEN_SIZE,
         num_tokens,
         device,
+        element_size=element_size,
+        max_push_size=state.comm.max_push_size,
     )
     if dispatch is not None and dispatch.strategy == "pull":
         return True
@@ -170,21 +187,6 @@ def get_o_proj_output_buffer(
     return _symm_buffer(state, _O_PROJ, num_tokens, hidden_size, dtype)
 
 
-@contextmanager
-def o_proj_output_rows(num_rows: int):
-    """Tell o_proj to target a padded full-batch symmetric output."""
-    token = _O_PROJ_OUTPUT_ROWS.set(num_rows)
-    try:
-        yield
-    finally:
-        _O_PROJ_OUTPUT_ROWS.reset(token)
-
-
-def get_o_proj_output_rows(default: int) -> int:
-    num_rows = _O_PROJ_OUTPUT_ROWS.get()
-    return default if num_rows is None else num_rows
-
-
 def register_o_proj_output(result: torch.Tensor, output: torch.Tensor) -> None:
     """Associate a model-visible o_proj result/view with its symmetric backing."""
     if (
@@ -197,18 +199,6 @@ def register_o_proj_output(result: torch.Tensor, output: torch.Tensor) -> None:
             "K3 o_proj result does not match its persistent symmetric output"
         )
     _O_PROJ_RESULT_BUFFERS[result.data_ptr()] = output
-
-
-def finish_padded_o_proj_output(
-    result: torch.Tensor, num_padded: int
-) -> Optional[torch.Tensor]:
-    """Zero the padding tail and return the full persistent symmetric buffer."""
-    output = _O_PROJ_RESULT_BUFFERS.get(result.data_ptr())
-    if output is None or output.shape[0] != num_padded:
-        return None
-    output[result.shape[0] :].zero_()
-    _O_PROJ_RESULT_BUFFERS[output.data_ptr()] = output
-    return output
 
 
 def _resolve_symmetric_o_proj_input(tensor: torch.Tensor) -> tuple[torch.Tensor, int]:
@@ -247,8 +237,9 @@ def _eligible(
             or not residual.is_contiguous()
         ):
             return False
-    local_bytes = tensor.numel() * tensor.element_size() // state.group.world_size
-    return local_bytes <= state.comm.max_push_size
+    # Note(ajit283): Push capacity participates in dispatch selection so an
+    # oversized push can advance to a tuned pull/direct configuration.
+    return True
 
 
 def reduce_scatter_res(
@@ -266,6 +257,8 @@ def reduce_scatter_res(
         tensor.shape[1],
         tensor.shape[0],
         tensor.device,
+        element_size=tensor.element_size(),
+        max_push_size=state.comm.max_push_size,
     )
     if dispatch is None:
         return None
@@ -374,7 +367,6 @@ def all_gather(tensor: torch.Tensor) -> Optional[torch.Tensor]:
         or tensor.ndim != 2
         or tensor.shape[1] != _HIDDEN_SIZE
         or tensor.shape[0] <= 0
-        or tensor.numel() * tensor.element_size() > state.comm.max_push_size
     ):
         return None
     from sglang.kernels.ops.communication import sp_collective
@@ -385,6 +377,8 @@ def all_gather(tensor: torch.Tensor) -> Optional[torch.Tensor]:
         tensor.shape[1],
         global_tokens,
         tensor.device,
+        element_size=tensor.element_size(),
+        max_push_size=state.comm.max_push_size,
     )
     if dispatch is None:
         return None

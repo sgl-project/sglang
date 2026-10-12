@@ -85,7 +85,6 @@ def create_mla_kv_page_table_for_dcp(
     v2p_ptr,  # in: [num_pages + 1] int64 -- virtual->physical page table
     req_to_token_stride: tl.constexpr,
     block_table_stride: tl.constexpr,
-    mult,  # runtime: kernel_page_multiplier of the target sub-pool
     PHYSICAL_PAGE_SIZE: tl.constexpr,
     DCP_SIZE: tl.constexpr,
     DCP_RANK: tl.constexpr,
@@ -97,7 +96,7 @@ def create_mla_kv_page_table_for_dcp(
     ``HAS_V2P`` picks the id space the emitted page number is in: the
     DCP-collapsed page IS physical on a static pool, and still VIRTUAL under
     the unified memory pool, where it takes one more gather through ``v2p_ptr``
-    and a ``mult`` scale to reach the per-layer views.
+    to the physical page the per-layer views are indexed by.
     """
     req = tl.program_id(0)
     page_block = tl.program_id(1)
@@ -118,12 +117,51 @@ def create_mla_kv_page_table_for_dcp(
         # 0, the reserved padding page.
         pages = tl.where(virtual_locs < 0, 0, pages)
         physical = tl.load(v2p_ptr + pages, mask=mask, other=0)
-        pages = tl.maximum(physical * mult, 0)
+        pages = tl.maximum(physical, 0)
     tl.store(
         block_kv_indices_ptr + req * block_table_stride + page_offsets,
         pages.to(tl.int32),
         mask=mask,
     )
+
+
+@triton.jit
+def compact_dcp_verify_token_table_to_ragged(
+    token_table_ptr,  # in: [bs * q_len, table_stride] from create_mla_kv_page_table_for_dcp
+    local_kv_lens_ptr,  # in: [bs] this rank's shard length per request, contiguous
+    kv_indptr_ptr,  # in: [bs + 1] cumsum of the lengths, each clamped to >= 1
+    kv_indices_ptr,  # out: ragged ids, one run per request
+    table_stride: tl.constexpr,
+    Q_LEN: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Rectangular token table -> ragged (kv_indices, kv_indptr).
+
+    Every row of a request repeats that request's shard, so this reads row 0.
+    """
+    # The grid is (bs,) and the token loop is inside the kernel, so a cuda
+    # graph can capture this launch.
+    req = tl.program_id(0)
+    out_offset = tl.load(kv_indptr_ptr + req)
+    local_len = tl.load(local_kv_lens_ptr + req).to(tl.int32)
+    # The table must be wide enough for the whole shard. A narrow table makes
+    # this kernel read the next query row and return the wrong ids.
+    tl.device_assert(local_len <= table_stride)
+
+    if local_len == 0:
+        # Give an empty shard one slot, because the attention kernel fails
+        # on a shard of length zero. The caller removes that row later.
+        tl.store(kv_indices_ptr + out_offset, 0)
+    else:
+        row = token_table_ptr + req * Q_LEN * table_stride
+        for i in range(tl.cdiv(local_len, BLOCK_SIZE)):
+            offset = tl.arange(0, BLOCK_SIZE).to(tl.int64) + i * BLOCK_SIZE
+            mask = offset < local_len
+            tl.store(
+                kv_indices_ptr + out_offset + offset,
+                tl.load(row + offset, mask=mask),
+                mask=mask,
+            )
 
 
 @triton.jit
