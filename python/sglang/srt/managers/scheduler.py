@@ -5667,13 +5667,13 @@ class Scheduler(
         elif self.enable_overlap_mlx:
             self._drain_mlx_pending_jobs()
 
-        retract_reqs = [r for r in self.running_batch.reqs if not r.finished()]
+        launched_reqs = []
         for batch in running_and_inflight_batches(self):
             if (
                 batch is not None
                 and batch is not self.running_batch
-                # A step without prefill rows is the DP extend view of a decode
-                # step; its requests are the running ones, already listed above.
+                # A step without prefill rows is a decode step, or its DP extend
+                # view; its requests are the running ones.
                 and batch.has_prefill_rows()
                 # Skip merge for disagg prefill: completed prefill requests are
                 # already in disagg_prefill_inflight_queue. Merging them into
@@ -5681,7 +5681,17 @@ class Scheduler(
                 # calls update_running_batch to clean them up.
                 and self.disaggregation_mode != DisaggregationMode.PREFILL
             ):
-                retract_reqs += [r for r in batch.reqs if not r.finished()]
+                launched_reqs += batch.reqs
+        # The rows the last step did not launch, then that step's rows in its
+        # order, where a mid-chunk request sits where admission put it. Running
+        # rows that already joined from that step are listed once, at its order.
+        launched_ids = {id(r) for r in launched_reqs}
+        retract_reqs = [
+            r
+            for r in self.running_batch.reqs
+            if not r.finished() and id(r) not in launched_ids
+        ]
+        retract_reqs += [r for r in launched_reqs if not r.finished()]
 
         if (
             self.chunked_req is not None
