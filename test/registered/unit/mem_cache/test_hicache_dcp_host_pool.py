@@ -29,7 +29,12 @@ WIDENED_PAGE = PHYSICAL_PAGE * DCP_SIZE
 
 
 def _fake_mla_device_pool(size: int = 1024) -> SimpleNamespace:
+    buffers = [
+        torch.empty(size + PHYSICAL_PAGE, 1, 12, dtype=torch.float16) for _ in range(2)
+    ]
     return SimpleNamespace(
+        kv_buffer=buffers,
+        data_ptrs=torch.tensor([b.data_ptr() for b in buffers], dtype=torch.uint64),
         size=size,
         # Match KVCache's default: this static pool's size already counts tokens.
         host_capacity_tokens=None,
@@ -160,10 +165,7 @@ class TestHostPoolSizingUnderDcp(CustomTestCase):
 
 class TestTransferEntryPointsTranslate(CustomTestCase):
     def _run_backup(self, pool, host_indices, device_indices):
-        device_pool = SimpleNamespace(
-            data_ptrs=torch.zeros(2, dtype=torch.uint64),
-            kv_buffer=[torch.zeros(1)] * 2,
-        )
+        device_pool = pool.device_pool
         # create=True: mla.py imports the kernel only under `if _is_cuda or
         # _is_hip`, so the name is absent on the CPU runner this test targets.
         with mock.patch(
@@ -192,6 +194,83 @@ class TestTransferEntryPointsTranslate(CustomTestCase):
         pool = _make_host_pool(dcp_rank=0)
         with self.assertRaises(AssertionError):
             pool.get_data_page(0)
+
+
+class TestLayerShardedHostTransfers(CustomTestCase):
+    def test_layer_sharded_ascend_reports_unsupported_backend(self):
+        """Unsupported Ascend backup must report the backend, not a buffer error."""
+        pool = _fake_mla_device_pool(size=128)
+        pool.layer_shard_enabled = True
+        pool.layer_shard_size = 2
+        pool._owned_local_layer_range = lambda: (0, 1)
+        host = MLATokenToKVPoolHost(
+            pool, 2, 0, PHYSICAL_PAGE, "layer_first", pin_memory=False
+        )
+        self.addCleanup(host.destroy)
+        # Ascend has no CUDA-style per-layer KV buffers.
+        host.device_kv_buffers = ()
+        indices = torch.arange(PHYSICAL_PAGE)
+        with self.assertRaisesRegex(
+            ValueError,
+            "Layer-sharded HiCache backup does not support IO backend: kernel_ascend",
+        ):
+            host.backup_from_device_all_layer(
+                pool, indices, indices, io_backend="kernel_ascend"
+            )
+
+    def test_owned_device_layers_keep_their_original_positions(self):
+        # Rank 1 owns device layers 2/3, which occupy host layers 0/1.
+        pool = _fake_mla_device_pool(size=128)
+        pool.layer_num = 4
+        pool.end_layer = 3
+        pool.layer_shard_enabled = True
+        pool.layer_shard_size = 2
+        pool._owned_local_layer_range = lambda: (2, 4)
+        owned = [
+            torch.full((192, 1, 12), value, dtype=torch.float16) for value in (2, 3)
+        ]
+        pool.kv_buffer = [
+            torch.empty(0, 1, 12, dtype=torch.float16) for _ in range(2)
+        ] + owned
+        pool.data_ptrs = torch.tensor(
+            [b.data_ptr() for b in pool.kv_buffer], dtype=torch.uint64
+        )
+        host = MLATokenToKVPoolHost(
+            pool,
+            2,
+            0,
+            PHYSICAL_PAGE,
+            "layer_first",
+            pin_memory=False,
+        )
+        self.addCleanup(host.destroy)
+        self.assertEqual(host.layer_num, 2)
+        source = torch.arange(64, 128)
+        destination = torch.arange(64)
+        host_indices = torch.arange(128, 192)
+
+        def copy_pages(*, src_layers, dst_layers, src_indices, dst_indices, page_size):
+            for src, dst in zip(src_layers, dst_layers, strict=True):
+                dst[dst_indices] = src[src_indices]
+
+        with mock.patch(
+            "sglang.srt.mem_cache.pool_host.mla.transfer_kv_direct",
+            side_effect=copy_pages,
+            create=True,
+        ) as transfer:
+            host.backup_from_device_all_layer(pool, host_indices, source, "direct")
+            for buffer in owned:
+                buffer.zero_()
+            for layer in range(4):
+                host.load_to_device_per_layer(
+                    pool, host_indices, destination, layer, "direct"
+                )
+        self.assertEqual(transfer.call_count, 4)
+        for buffer, value in zip(owned, (2, 3), strict=True):
+            torch.testing.assert_close(
+                buffer[destination], torch.full((64, 1, 12), value, dtype=torch.float16)
+            )
+            self.assertEqual(torch.count_nonzero(buffer[64:]).item(), 0)
 
 
 if __name__ == "__main__":
