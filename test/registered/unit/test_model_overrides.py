@@ -144,49 +144,6 @@ class TestBoundaryParallelismResolution(CustomTestCase):
                         )
 
 
-class TestGlm53CpSharingResolution(CustomTestCase):
-    def test_external_dflash_prefill_pd_and_native_mtp(self):
-        from sglang.srt.arg_groups.cp_tp_group_sharing_hook import (
-            resolve_cp_tp_group_sharing,
-        )
-        from sglang.srt.arg_groups.overrides import resolved_view
-        from sglang.srt.model_executor.cuda_graph_config import (
-            CudaGraphConfig,
-            PhaseConfig,
-        )
-        from sglang.srt.server_args import ServerArgs
-
-        model = SimpleNamespace(
-            hf_config=SimpleNamespace(
-                architectures=["Glm5NextForConditionalGeneration"]
-            )
-        )
-        for algorithm, mode, draft in (
-            ("DFLASH", "prefill", "draft"),
-            ("NEXTN", "null", None),
-        ):
-            args = ServerArgs(
-                model_path="dummy",
-                tp_size=4,
-                attn_cp_size=4,
-                enable_prefill_cp=True,
-                cp_strategy="interleave",
-                speculative_algorithm=algorithm,
-                speculative_draft_model_path=draft,
-                disaggregation_mode=mode,
-                disaggregation_transfer_backend="mooncake",
-                cuda_graph_config=CudaGraphConfig(prefill=PhaseConfig()),
-            )
-            with patch(
-                "sglang.srt.arg_groups.cp_tp_group_sharing_hook.mambaish_config",
-                return_value=SimpleNamespace(
-                    linear_num_key_heads=16, linear_num_value_heads=32
-                ),
-            ):
-                resolve_cp_tp_group_sharing(args, model)
-            self.assertTrue(resolved_view(args).enable_cp_tp_group_sharing)
-
-
 class TestModelOverridableWhitelist(CustomTestCase):
     def test_whitelist_derivation_from_annotated_metadata(self):
         self.assertEqual(

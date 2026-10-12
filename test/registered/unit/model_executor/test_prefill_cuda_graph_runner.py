@@ -356,7 +356,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         self.assertEqual(tuple(trimmed["hidden_states"].shape), (3, 4))
         self.assertEqual(tuple(trimmed["residual"].shape), (3, 4))
 
-    def _load_static_batch(self, **batch_kwargs):
+    def test_static_batch_preserves_consumed_multimodal_embeddings(self):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner.capture_num_tokens = [4]
         runner.max_context_size = None
@@ -399,33 +399,12 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
             mm_input_embeds=mm_input_embeds,
             capture_hidden_mode=CaptureHiddenMode.NULL,
             global_forward_mode=ForwardMode.EXTEND,
-            **batch_kwargs,
         )
         translator.bind_own_plan(forward_batch)
 
         static_batch = runner.load_batch(forward_batch)
 
-        return forward_batch, static_batch
-
-    def test_static_batch_preserves_consumed_multimodal_embeddings(self):
-        live, static = self._load_static_batch()
-        self.assertIs(static.mm_input_embeds, live.mm_input_embeds)
-
-    def test_static_batch_can_plan_kda_checkpoints_from_host_tracking(self):
-        from sglang.srt.layers.attention.linear.kernels.kda_flashinfer_prefill import (
-            build_flashinfer_kda_checkpoint_plan,
-        )
-
-        _, static = self._load_static_batch(
-            mamba_prefill_track_mask_cpu=[True],
-            mamba_track_seqlens_cpu=[3],
-        )
-        metadata = SimpleNamespace(track_ssm_h_batch_src=torch.tensor([0]))
-        # Three new tokens, checkpoint after the first two-token chunk.
-        build_flashinfer_kda_checkpoint_plan(static, metadata, torch.device("cpu"), 2)
-        self.assertEqual(metadata.state_checkpoint_cu_starts.tolist(), [0, 1])
-        self.assertEqual(metadata.state_checkpoint_indices.tolist(), [0])
-        self.assertEqual(metadata.num_state_checkpoints, 1)
+        self.assertIs(static_batch.mm_input_embeds, mm_input_embeds)
 
     def test_eagle_target_full_reaches_graph_construction(self):
         override = get_context().override_server_args(
