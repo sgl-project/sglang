@@ -115,14 +115,15 @@ class K1Test(CustomTestCase):
         state0 = rnd(slots, NV, HD, HD, scale=0.05, dtype=torch.float32)
         probe_h, probe_r = rnd(1, HIDDEN, scale=2.0), rnd(1, HIDDEN, scale=2.0)
         epoch = torch.zeros(1, dtype=torch.int32, device="cuda")
-        scratch = torch.zeros(
-            max(
-                gdn.scratch_bytes(gdn.K1Build(tokens=s))
-                for s in range(1, MAX_TOKENS + 1)
-            ),
-            dtype=torch.uint8,
-            device="cuda",
-        )
+        # One scratch a width, as the glue has: a shared one is the vllm#60397 race.
+        scratch = {
+            s: torch.zeros(
+                gdn.scratch_bytes(gdn.K1Build(tokens=s)),
+                dtype=torch.uint8,
+                device="cuda",
+            )
+            for s in range(1, MAX_TOKENS + 1)
+        }
         outs = {}
         for s, pos, kind in _cases(MAX_TOKENS):
             g.manual_seed(1 + KINDS.index(kind))
@@ -157,7 +158,7 @@ class K1Test(CustomTestCase):
                 rstate=state,
                 st_idx=idx,
                 core=core,
-                scratch=scratch,
+                scratch=scratch[s],
                 epoch=epoch,
                 layer=0,
             )
@@ -230,14 +231,12 @@ def _worker_k2(rank, port, results):
         )
         peers.bytes.zero_()
         epoch = torch.zeros(1, dtype=torch.int32, device=dev)
-        scratch = torch.zeros(
-            max(
-                k2.scratch_bytes(k2.K2Build(tokens=s))
-                for s in range(1, MAX_TOKENS + 1)
-            ),
-            dtype=torch.uint8,
-            device=dev,
-        )
+        scratch = {
+            s: torch.zeros(
+                k2.scratch_bytes(k2.K2Build(tokens=s)), dtype=torch.uint8, device=dev
+            )
+            for s in range(1, MAX_TOKENS + 1)
+        }
         # A rank that cannot build would leave the others spinning in the kernel.
         built = True
         try:
@@ -266,7 +265,7 @@ def _worker_k2(rank, port, results):
                 **w,
                 out=out,
                 res_out=res_out,
-                scratch=scratch,
+                scratch=scratch[s],
                 peers=peers.addresses,
                 rank=rank,
                 epoch=epoch,
