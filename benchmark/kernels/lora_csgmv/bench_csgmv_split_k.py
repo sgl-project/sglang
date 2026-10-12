@@ -80,7 +80,7 @@ def main():
                 ("compact", False, True),
                 ("compact_split_k", True, True),
             ]:
-                envs.SGLANG_CSGMV_SPLIT_K.set(enable_split_k)
+                envs.SGLANG_ENABLE_LORA_CSGMV_SPLIT_K.set(enable_split_k)
 
                 def run():
                     h = chunked_sgmv_lora_shrink_forward(x, a, info, slices)

@@ -331,7 +331,7 @@ def test_split_k_preserves_fp32_partials_and_reduction_tail():
     weights[:, 0, small_terms] = 0.125
     split_kernel = shrink_module._chunked_lora_shrink_split_k_kernel
     with (
-        envs.SGLANG_CSGMV_SPLIT_K.override(False),
+        envs.SGLANG_ENABLE_LORA_CSGMV_SPLIT_K.override(False),
         envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.override(False),
         patch.object(
             shrink_module,
@@ -416,7 +416,7 @@ def test_split_k_compact_replay_uses_current_metadata():
 
     split_kernel = shrink_module._chunked_lora_shrink_split_k_kernel
     with (
-        envs.SGLANG_CSGMV_SPLIT_K.override(False),
+        envs.SGLANG_ENABLE_LORA_CSGMV_SPLIT_K.override(False),
         envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.override(False),
         patch.object(split_kernel, "run", wraps=split_kernel.run) as launches,
     ):
@@ -446,10 +446,10 @@ def test_deterministic_mode_keeps_original_shrink_path():
         ),
         envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.override(False),
     ):
-        with envs.SGLANG_CSGMV_SPLIT_K.override(False):
+        with envs.SGLANG_ENABLE_LORA_CSGMV_SPLIT_K.override(False):
             expected = chunked_sgmv_lora_shrink_forward(inputs, weights, batch_info, 3)
         with (
-            envs.SGLANG_CSGMV_SPLIT_K.override(True),
+            envs.SGLANG_ENABLE_LORA_CSGMV_SPLIT_K.override(True),
             patch.object(split_kernel, "run", wraps=split_kernel.run) as launches,
         ):
             chunked_sgmv_lora_shrink_forward(inputs, weights, batch_info, 3)
