@@ -1,5 +1,6 @@
 import asyncio
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -13,10 +14,12 @@ from sglang.srt.elastic_ep.elastic_ep import (
     RecoveryLifecycle,
     RecoveryOperation,
     get_recovery_operation,
+    get_recovery_operation_for_slot,
     get_scale_cohort,
     register_scale_cohort,
     register_scale_operation,
 )
+from sglang.srt.layers.moe.token_dispatcher.nixl import NixlEPBuffer
 from sglang.srt.managers.communicator import FanOutCommunicator
 from sglang.srt.managers.io_struct import (
     ActiveRanksOutput,
@@ -631,6 +634,10 @@ class TestElasticEPRecoveryLifecycle(CustomTestCase):
         self.assertTrue(ElasticEPStateManager.request_recovery(operation))
         self.assertEqual(self.state.recovery_phase, "restoring")
         self.assertEqual(get_recovery_operation("runtime-1", "recover-1"), operation)
+        self.assertEqual(
+            get_recovery_operation_for_slot("runtime-1", 3, 2, "pod-uid-5"),
+            operation,
+        )
 
         conflicting = RecoveryOperation(
             runtime_instance_id="runtime-1",
@@ -1177,6 +1184,130 @@ class TestElasticEPSchedulerIdempotency(CustomTestCase):
         self.assertEqual(state.runtime_error, "rank recovery requires a restart")
         self.assertTrue(state.operation_succeeded)
         self.assertIsNone(state.last_error)
+
+
+class _RecoveryPrefixStore:
+    def __init__(self, prefix, store):
+        self.prefix = prefix
+        self.store = store
+        self.waited = None
+        self.on_wait = None
+
+    def set(self, key, value):
+        self.store.set(f"{self.prefix}{key}", value)
+
+    def wait(self, keys, timeout):
+        self.waited = (keys, timeout)
+        if self.on_wait is not None:
+            self.on_wait()
+
+
+class TestNixlEPRecoveryConnections(CustomTestCase):
+    def setUp(self):
+        self.buffer = MagicMock(group_size=4)
+        self.state = SimpleNamespace(
+            buffer=self.buffer,
+            connected_ep_size=0,
+            scale_to=0,
+            dispatch_ep_size=0,
+            recovery_operation_id=None,
+            recovery_disconnected_rank=None,
+            recovery_connections_ready=False,
+        )
+        self.operation = RecoveryOperation(
+            runtime_instance_id="runtime/1",
+            topology_generation=3,
+            operation_id="recover/1",
+            allocation_id="pod/5",
+            rank_offset=2,
+        )
+        self.store = _Store()
+        self.prefix_stores = []
+        self.prefix_store_on_wait = None
+
+        def make_prefix_store(prefix, store):
+            scoped = _RecoveryPrefixStore(prefix, store)
+            scoped.on_wait = self.prefix_store_on_wait
+            self.prefix_stores.append(scoped)
+            return scoped
+
+        self.patches = [
+            patch.object(NixlEPBuffer, "_state", return_value=self.state),
+            patch(
+                "sglang.srt.layers.moe.token_dispatcher.nixl.get_global_tcp_store",
+                return_value=self.store,
+            ),
+            patch(
+                "sglang.srt.layers.moe.token_dispatcher.nixl.dist.PrefixStore",
+                side_effect=make_prefix_store,
+            ),
+            patch.object(
+                ElasticEPStateManager, "get_effective_ep_size", return_value=4
+            ),
+            patch(
+                "sglang.srt.layers.moe.token_dispatcher.nixl.get_parallel",
+                return_value=SimpleNamespace(tp_rank=0, ep_join_rank_offset=0),
+            ),
+        ]
+        for active_patch in self.patches:
+            active_patch.start()
+            self.addCleanup(active_patch.stop)
+
+    def test_survivor_disconnects_then_reconnects_under_operation_scope(self):
+        NixlEPBuffer.prepare_recovery(self.operation)
+        NixlEPBuffer.connect_recovery(self.operation, replacement=False)
+
+        self.buffer.disconnect_ranks.assert_called_once_with([2])
+        self.buffer.connect_ranks.assert_called_once_with([2])
+        scoped = self.prefix_stores[0]
+        self.assertEqual(
+            scoped.prefix,
+            "elastic_ep/nixl_recovery/runtime%2F1/3/recover%2F1/pod%2F5/",
+        )
+        self.assertEqual(
+            scoped.waited[0],
+            [
+                "connected/0",
+                "connected/1",
+                "connected/2",
+                "connected/3",
+            ],
+        )
+        self.assertTrue(self.state.recovery_connections_ready)
+
+    def test_replacement_initializes_only_its_fenced_self_connection(self):
+        NixlEPBuffer.initialize_recovery_joiner(self.operation, global_rank=2)
+
+        self.buffer.connect_ranks.assert_called_once_with([2])
+        self.assertEqual(self.state.connected_ep_size, 0)
+        self.assertEqual(self.state.dispatch_ep_size, 4)
+        self.assertEqual(self.state.recovery_operation_id, "recover/1")
+        self.assertFalse(self.state.recovery_connections_ready)
+
+    def test_replacement_connects_all_ranks_without_reusing_stale_scope(self):
+        stale = RecoveryOperation(
+            runtime_instance_id="runtime/1",
+            topology_generation=2,
+            operation_id="recover/old",
+            allocation_id="pod/old",
+            rank_offset=2,
+        )
+        stale_store = NixlEPBuffer._recovery_store(stale)
+        observed_dispatch_ep_sizes = []
+
+        def observe_dispatch_gate():
+            observed_dispatch_ep_sizes.append(self.state.dispatch_ep_size)
+
+        self.prefix_store_on_wait = observe_dispatch_gate
+
+        NixlEPBuffer.connect_recovery(self.operation, replacement=True)
+
+        self.buffer.disconnect_ranks.assert_not_called()
+        self.buffer.connect_ranks.assert_called_once_with([0, 1, 2, 3])
+        self.assertNotEqual(stale_store.prefix, self.prefix_stores[-1].prefix)
+        self.assertEqual(observed_dispatch_ep_sizes, [0])
+        self.assertEqual(self.state.connected_ep_size, 4)
+        self.assertEqual(self.state.dispatch_ep_size, 4)
 
 
 if __name__ == "__main__":
