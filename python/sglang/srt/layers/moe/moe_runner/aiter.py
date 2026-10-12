@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Optional, Union
 
 import torch
 
+from sglang.srt.layers import zero_copy_context
 _SMALLM_MOE_ON = os.environ.get("SGLANG_ROCM_SMALLM_MOE", "1") != "0"
 
 from sglang.srt.environ import envs
@@ -154,6 +155,15 @@ def _aiter_fused_moe_supports_no_combine() -> bool:
     from aiter.fused_moe import fused_moe
 
     return "no_combine" in inspect.signature(fused_moe).parameters
+
+
+@functools.cache
+def _aiter_fused_moe_supports_output() -> bool:
+    """Whether the installed aiter.fused_moe takes an `output` kwarg; without
+    it, zero_copy_context's buffer cannot be the destination and we copy."""
+    from aiter.fused_moe import fused_moe
+
+    return "output" in inspect.signature(fused_moe).parameters
 
 
 _RECV_BOUND_LOGGED: set[int] = set()
@@ -332,6 +342,24 @@ class AiterRunnerCore(MoeRunnerCore):
             extra["no_combine"] = True
         extra["moe_sorting_dispatch_policy"] = _MOE_SORTING_DISPATCH_POLICY
 
+        # Let aiter write the top-k sum into the published buffer. It returns
+        # that tensor when it takes it and a fresh one when it declines, so the
+        # publisher still compares before copying. no_combine's output has an
+        # extra top-k dim and cannot stand in for the [M, dim] buffer.
+        if not self.config.no_combine and _aiter_fused_moe_supports_output():
+            zero_copy_out = zero_copy_context.get_moe_output_spec(
+                torch.Size(
+                    (runner_input.hidden_states.shape[0], quant_info.w2_weight.shape[1])
+                ),
+                (
+                    runner_input.output_dtype
+                    if runner_input.output_dtype is not None
+                    else runner_input.hidden_states.dtype
+                ),
+                runner_input.hidden_states.device,
+            )
+            if zero_copy_out is not None:
+                extra["output"] = zero_copy_out
         # gfx950 small-M MXFP4 kernel (on by default, SGLANG_ROCM_SMALLM_MOE=0 disables): same layouts as aiter, bf16 activations.
         if _SMALLM_MOE_ON and quant_info.w13_weight.element_size() == 1:
             from sglang.kernels.ops.moe import smallm_moe_gfx950 as _smallm
