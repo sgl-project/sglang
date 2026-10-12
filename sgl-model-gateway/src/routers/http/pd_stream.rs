@@ -15,8 +15,8 @@ pub(super) struct RetryRequestIdentity {
 }
 
 impl RetryRequestIdentity {
-    pub fn replace(request: &mut Value) -> Option<Self> {
-        let rid = request.get_mut("rid")?;
+    fn replacement_inputs(request: &Value) -> Option<(Vec<String>, char)> {
+        let rid = request.get("rid")?;
         let clients = if let Some(client) = rid.as_str() {
             vec![client.to_owned()]
         } else {
@@ -25,12 +25,39 @@ impl RetryRequestIdentity {
                 .map(|v| v.as_str().map(str::to_owned))
                 .collect::<Option<Vec<_>>>()?
         };
-        let prefix = uuid::Uuid::new_v4();
+        // A fast Decode rejection can win before Prefill validates the batch.
+        // Retrying must never turn invalid caller duplicates into valid IDs.
+        if clients.is_empty()
+            || clients.iter().any(String::is_empty)
+            || clients
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                != clients.len()
+        {
+            return None;
+        }
+        // Scheduler aborts use starts_with(rid). Avoid the original caller
+        // IDs as prefixes, and use equal-length UUIDs so cancelling one batch
+        // member cannot accidentally cancel another (e.g. index 1 vs 10).
+        let marker = b"spq_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyz-~"
+            .iter()
+            .copied()
+            .find(|byte| clients.iter().all(|c| c.as_bytes()[0] != *byte))?;
+        Some((clients, char::from(marker)))
+    }
+
+    pub fn can_replace(request: &Value) -> bool {
+        Self::replacement_inputs(request).is_some()
+    }
+
+    pub fn replace(request: &mut Value) -> Option<Self> {
+        let (clients, marker) = Self::replacement_inputs(request)?;
         let mappings: Vec<_> = clients
             .into_iter()
-            .enumerate()
-            .map(|(i, client)| (client, format!("smg-retry-{prefix}-{i}")))
+            .map(|client| (client, format!("{marker}mg-retry-{}", uuid::Uuid::new_v4())))
             .collect();
+        let rid = request.get_mut("rid").unwrap();
         *rid = if rid.is_array() {
             Value::Array(
                 mappings
@@ -55,12 +82,15 @@ impl RetryRequestIdentity {
         // worker rid in these fields. Tool IDs and generated text are untouched.
         for path in ["/meta_info/id", "/id"] {
             if let Some(id) = value.pointer_mut(path) {
-                if let Some((client, _)) = self
-                    .mappings
-                    .iter()
-                    .find(|(_, worker)| id.as_str() == Some(worker.as_str()))
-                {
-                    *id = Value::String(client.clone());
+                if let Some((client, worker)) = self.mappings.iter().find(|(_, worker)| {
+                    id.as_str().is_some_and(|value| {
+                        value == worker
+                            || value.strip_prefix(worker).is_some_and(valid_batch_suffix)
+                    })
+                }) {
+                    // SRT expands a scalar batch rid into rid_0, rid_1, ... .
+                    let suffix = &id.as_str().unwrap()[worker.len()..];
+                    *id = Value::String(format!("{client}{suffix}"));
                     changed = true;
                 }
             }
@@ -104,6 +134,14 @@ impl RetryRequestIdentity {
         }
         Bytes::from(output)
     }
+}
+
+fn valid_batch_suffix(suffix: &str) -> bool {
+    suffix.strip_prefix('_').is_some_and(|index| {
+        !index.is_empty()
+            && (index == "0" || !index.starts_with('0'))
+            && index.bytes().all(|b| b.is_ascii_digit())
+    })
 }
 
 #[derive(Debug)]

@@ -403,6 +403,14 @@ impl PDRouter {
             Ok(request) => Arc::new(request),
             Err(e) => return Self::handle_serialization_error(e),
         };
+        if shared_request.get("rid").is_some_and(|rid| {
+            rid.as_str() == Some("")
+                || rid
+                    .as_array()
+                    .is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some("")))
+        }) {
+            return error::bad_request("invalid_request_id", "rid must not be empty");
+        }
         // Session history and Responses storage/cancel use the worker ID as a
         // durable key. Without an alias registry, neither renaming that ID nor
         // resubmitting it before cancellation completes is safe. Return the
@@ -417,6 +425,8 @@ impl PDRouter {
                 && shared_request
                     .get("request_id")
                     .is_some_and(|v| !v.is_null()));
+        let retry_ids_supported = shared_request.get("rid").is_none_or(Value::is_null)
+            || RetryRequestIdentity::can_replace(&shared_request);
         let response = RetryExecutor::execute_response_with_retry(
             &self.retry_config,
             {
@@ -540,7 +550,9 @@ impl PDRouter {
                     }
                 }
             },
-            |res, _attempt| !persistent_identity && is_retryable_status(res.status()),
+            |res, _attempt| {
+                !persistent_identity && retry_ids_supported && is_retryable_status(res.status())
+            },
             |delay, attempt| {
                 // Layer 3 worker metrics (PD mode uses both prefill and decode workers)
                 Metrics::record_worker_retry(metrics_labels::WORKER_PREFILL, endpoint);
@@ -615,7 +627,12 @@ impl PDRouter {
                 }
             };
 
-            let sse_data = format!("data: {}\n\n", json!({ "error": error_payload }));
+            let done = if context.route == "/v1/responses" {
+                ""
+            } else {
+                "data: [DONE]\n\n"
+            };
+            let sse_data = format!("data: {}\n\n{done}", json!({ "error": error_payload }));
             let mut response = Response::new(Body::from(sse_data));
             *response.status_mut() = status;
             response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
@@ -921,7 +938,7 @@ impl PDRouter {
                     )
                 } else {
                     // Non-streaming response
-                    if context.return_logprob || retry_identity.is_some() {
+                    let mut response = if context.return_logprob || retry_identity.is_some() {
                         self.process_non_streaming_response(
                             res,
                             status,
@@ -950,7 +967,19 @@ impl PDRouter {
                                 )
                             }
                         }
+                    };
+                    // Prefill has fully succeeded. A Decode body/JSON failure
+                    // must not penalize that healthy peer in the outer retry
+                    // dispatcher, or remove it from subsequent selection.
+                    if response.status().is_server_error() {
+                        prefill.record_outcome(true);
+                        decode.record_outcome(false);
+                        response.extensions_mut().insert(BreakerOutcomesRecorded {
+                            prefill_error: false,
+                            decode_error: true,
+                        });
                     }
+                    response
                 }
             }
             Err(e) => {
@@ -1339,7 +1368,14 @@ impl PDRouter {
         };
 
         let mut body = decode_body;
-        if let Ok(mut decode_json) = serde_json::from_slice::<Value>(&body) {
+        let json = serde_json::from_slice::<Value>(&body);
+        if json.is_err() && retry_identity.is_some() {
+            return error::bad_gateway(
+                "invalid_decode_response",
+                "Decode returned invalid JSON; cannot restore the client request ID",
+            );
+        }
+        if let Ok(mut decode_json) = json {
             let mut changed = retry_identity
                 .as_ref()
                 .is_some_and(|identity| identity.restore_json(&mut decode_json));
