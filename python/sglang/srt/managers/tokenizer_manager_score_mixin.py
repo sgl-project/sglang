@@ -1,6 +1,7 @@
 import logging
 import math
 from dataclasses import dataclass
+from functools import cached_property
 from typing import Any, Dict, List, Optional, Tuple, TypeAlias, Union
 
 import torch
@@ -10,6 +11,7 @@ from sglang.srt.configs.model_config import (
     is_score_and_pool_model,
 )
 from sglang.srt.constants import MIS_DELIMITER_TOKEN_ID
+from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.runtime_context import get_exec, get_memory, get_schedule, get_serving
@@ -42,6 +44,32 @@ class ScoreResult:
 
 
 class TokenizerManagerScoreMixin:
+    @cached_property
+    def dllm_scoring_config(self) -> Optional[DllmConfig]:
+        algorithm = get_exec().dllm.dllm_algorithm
+        if algorithm is None:
+            return None
+        if algorithm != "Gemma4Renoise":
+            raise ValueError(
+                "Candidate scoring for diffusion language models requires "
+                "--dllm-algorithm Gemma4Renoise"
+            )
+        return DllmConfig.from_server_args(self.server_args)
+
+    def score_output_token_budget(self) -> int:
+        """Space needed after the prompt, including the entire diffusion canvas."""
+        config = self.dllm_scoring_config
+        return config.block_size if config is not None else 1
+
+    @cached_property
+    def dllm_scoring_prefix_ids(self) -> List[int]:
+        # DiffusionGemma emits an empty thought channel even when its chat
+        # template disables thinking. This scaffold belongs to the decoder's
+        # canvas; adding it to the encoder prompt does not prefill the decoder.
+        return self.tokenizer.encode(
+            "<|channel>thought\n<channel|>", add_special_tokens=False
+        )
+
     async def score_prompts(
         self,
         prompts: Union[str, List[str], List[List[int]]],
@@ -354,6 +382,7 @@ class TokenizerManagerScoreMixin:
         per_item_matrix: bool = False,
         temperature: float = 1.0,
         return_token_logprobs: bool = False,
+        expected_output_prefix: Optional[List[int]] = None,
     ) -> ScoreResult:
         """
         Process results from single-item scoring request.
@@ -404,7 +433,25 @@ class TokenizerManagerScoreMixin:
                         f"{meta.get('id', '<unknown>')}."
                     )
 
-                logprobs = self._extract_logprobs_for_tokens(output_logprobs[0], labels)
+                answer_position = 0
+                if expected_output_prefix is not None:
+                    answer_position = len(expected_output_prefix)
+                    if (
+                        result.get("output_ids", [])[:answer_position]
+                        != expected_output_prefix
+                    ):
+                        raise ValueError(
+                            "DiffusionGemma candidate scoring requires an empty "
+                            "thought channel before the answer; the denoised "
+                            "canvas has a different prefix"
+                        )
+                    if len(output_logprobs) <= answer_position:
+                        raise RuntimeError(
+                            "DiffusionGemma answer-position logprobs are missing"
+                        )
+                logprobs = self._extract_logprobs_for_tokens(
+                    output_logprobs[answer_position], labels
+                )
                 score_list = self._convert_logprobs_to_scores(
                     logprobs, labels, apply_softmax, temperature
                 )
@@ -927,6 +974,23 @@ class TokenizerManagerScoreMixin:
         # Check if multi-item scoring is enabled
         use_multi_item_scoring = get_exec().features.enable_mis
 
+        dllm_config = self.dllm_scoring_config if is_generation else None
+        if dllm_config is not None and dllm_config.block_size <= len(
+            self.dllm_scoring_prefix_ids
+        ):
+            raise ValueError(
+                "DiffusionGemma scoring needs a canvas large enough for the "
+                "empty thought prefix and one answer token"
+            )
+        if dllm_config is not None and (
+            use_multi_item_scoring or score_extraction_token_id is not None
+        ):
+            raise ValueError(
+                "DiffusionGemma candidate scoring supports only the answer "
+                "canvas position; --enable-mis and score_extraction_token_id "
+                "are not supported"
+            )
+
         # Setwise readout: pool the head at every score_extraction_token_id.
         use_score_extraction = score_extraction_token_id is not None
         if use_score_extraction:
@@ -1067,6 +1131,26 @@ class TokenizerManagerScoreMixin:
         # Create the appropriate request type
         mis_delimiter_indices = [delimiter_indices] if use_multi_item_scoring else None
         if is_generation:
+            if dllm_config is not None:
+                # The encoder does not produce next-token logits. Denoise one
+                # full canvas and read the answer after its empty thought prefix.
+                # Only the prefix and one answer token are emitted internally;
+                # score responses contain no generated text. Reserve the full
+                # canvas even though the internal request emits fewer tokens,
+                # and refuse truncation because it would move the answer position.
+                if text_prompts is not None:
+                    input_ids = [self.tokenizer.encode(text) for text in text_prompts]
+                    text_prompts = None
+                for ids in input_ids:
+                    if (
+                        len(ids) + self.num_reserved_tokens + dllm_config.block_size
+                        > self.context_len
+                    ):
+                        raise ValueError(
+                            "The scoring prompt plus the DiffusionGemma canvas "
+                            f"of {dllm_config.block_size} tokens exceeds the "
+                            f"context length of {self.context_len} tokens"
+                        )
             # packed MIS requests gather the union, then select per item
             request_labels = (
                 list(
@@ -1089,7 +1173,14 @@ class TokenizerManagerScoreMixin:
                     0 if (use_multi_item_scoring or use_score_extraction) else -1
                 ),
                 stream=False,
-                sampling_params={"max_new_tokens": 0},
+                sampling_params=(
+                    {
+                        "max_new_tokens": len(self.dllm_scoring_prefix_ids) + 1,
+                        "ignore_eos": True,
+                    }
+                    if dllm_config is not None
+                    else {"max_new_tokens": 0}
+                ),
                 positional_embed_overrides=positional_embed_overrides,
                 multi_item_delimiter_indices=mis_delimiter_indices,
                 token_indices_to_pool=token_indices_to_pool,
@@ -1143,6 +1234,9 @@ class TokenizerManagerScoreMixin:
                 per_item_matrix=use_score_extraction,
                 temperature=temperature,
                 return_token_logprobs=return_token_logprobs,
+                expected_output_prefix=(
+                    self.dllm_scoring_prefix_ids if dllm_config is not None else None
+                ),
             )
 
     def _convert_logprobs_to_scores(
