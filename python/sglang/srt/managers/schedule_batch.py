@@ -2592,6 +2592,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def first_decode_row(self) -> int:
         return len(self.reqs) - self.num_decode_rows
 
+    def has_prefill_rows(self) -> bool:
+        return self.forward_mode.is_extend() and self.num_decode_rows < len(self.reqs)
+
     def is_dllm(self):
         return self.dllm_config is not None
 
