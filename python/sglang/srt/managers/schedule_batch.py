@@ -2367,7 +2367,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Decode rows run as a 1-token extend. They are always the last rows of an
     # extend step: mix_with_running appends them, and a converted step is all
     # decode rows. prepare_for_decode, filter_batch and merge_batch clear it;
-    # they run on the running set, never on a step between build and commit.
+    # mix_with_running sets it after its merge.
     num_decode_rows: int = 0
 
     # For split prefill
