@@ -136,9 +136,8 @@ class TestMoeSortingSmall(CustomTestCase):
         return scale.view(torch.uint8).flatten()[addr]
 
     def test_fused_mxfp8_quant_matches_aiter_dsv4_hidden(self):
-        """Hidden sizes that are not a multiple of 2048 (DeepSeek-V4's 5120, V3's 7168) emit
-        the stage1 quant too: fp8 rows and the scales of every real sorted row match aiter's
-        fused_dynamic_mxfp8_quant_moe_sort over the same sort."""
+        """A hidden size off a 2048 multiple must still quantize each row and real-row scale
+        bitwise like aiter's `fused_dynamic_mxfp8_quant_moe_sort`."""
         bs, dim, E, topk = 32, 5120, 385, 7
         # the widest compact sort (63 pairs) and the distributed one at the 112-pair cutoff
         for m in (9, 16):
@@ -186,6 +185,7 @@ class TestMoeSortingSmall(CustomTestCase):
         self.assertFalse(self.S._small_sort_supported(ids, 32, None, None, self.E))
 
     def test_falls_back_to_aiter_past_112_pairs_at_385_experts(self):
+        """Past 112 pairs at E=385 the distributed sort is slower than aiter's."""
         for m, small in ((16, True), (17, False)):
             ids, _ = self._routing(m, m, 385, 7)
             self.assertEqual(
@@ -195,11 +195,8 @@ class TestMoeSortingSmall(CustomTestCase):
 
 @unittest.skipUnless(_gfx950(), "gfx950 (MI35x) only")
 class TestDsv4MoePrologue(CustomTestCase):
-    """DeepSeek-V4.1's decode MoE at TP4 (afp8_wfp4, hidden 5120, inter 640 per rank) with the
-    sort patch (one launch for the sort and the stage1 mxfp8 quant where it applies) against
-    stock aiter's sort and quant launches: the stage1 GEMM sees the same operands, so its
-    output is bitwise the same. The stage2 GEMM accumulates the top-k rows atomically, so
-    the MoE output only matches to atomic-order rounding."""
+    """The sort-time quant must hand DeepSeek-V4.1's decode stage1 GEMM (TP4 afp8_wfp4)
+    operands bitwise equal to stock aiter's."""
 
     H, INTER = 5120, 640
 
@@ -213,7 +210,7 @@ class TestDsv4MoePrologue(CustomTestCase):
         cls.S, cls.fm = S, fm
         cls.dev = torch.device("cuda", 0)
         cls._bound = os.environ.get("AITER_BF16_FP8_MOE_BOUND")
-        # V4.1 serves with fp8 activations at every row count (see its launch recipe)
+        # V4.1 serves with fp8 activations at every row count
         os.environ["AITER_BF16_FP8_MOE_BOUND"] = "0"
 
     @classmethod
