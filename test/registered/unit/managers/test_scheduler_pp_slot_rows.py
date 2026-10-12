@@ -7,7 +7,7 @@ ran its last chunk."""
 import copy
 import unittest
 from types import MethodType, SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, Mock
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import maybe_stub_sgl_kernel
@@ -17,6 +17,9 @@ maybe_stub_sgl_kernel()
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.decoding_batch import DecodingBatch
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.runtime_context import get_parallel
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -115,6 +118,63 @@ class TestPPSlotRowsAtCommit(unittest.TestCase):
 
         self.assertEqual(_rids(s.decoding_batches[0].rows), ["x"])
         self.assertEqual(_rids(s.decoding_batches[1].rows), ["c"])
+
+
+class _EndLoop(Exception):
+    pass
+
+
+class TestPPLoopRowsAtCommit(unittest.TestCase):
+    def test_a_prefilled_request_joins_its_slot_when_the_ring_commits_it(self):
+        # pp_size 2, no async depth: two slots, and slot 0's step commits in
+        # ring step 1, just before slot 0 replans in ring step 2.
+        a = _Req("a")
+        step = _Batch([a], extend=True, spec_info="launched")
+        schedule = iter([step, None])
+        rows_at_replan = []
+
+        s = Scheduler.__new__(Scheduler)
+        s.enable_overlap = False
+        s.spec_algorithm = SpeculativeAlgorithm.NONE
+        s.device = "cpu"
+        s.enable_hisparse = False
+        s.dllm_config = None
+        s.pp_group = SimpleNamespace(is_last_rank=True)
+        s._sched_idled = False
+        s.on_idle = Mock()
+        s._pp_recv_proxy_tensors = Mock()
+        s._pp_commit_proxy_send_work = Mock()
+        s._pp_launch_batch = Mock(return_value=(GenerationBatchResult(), Mock()))
+        s._pp_commit_send_output_work_and_preprocess_output_tensors = Mock(
+            return_value=(None, GenerationBatchResult(), Mock())
+        )
+
+        def relay_and_commit(batch, result):
+            # The output relay rebinds a field of the step at its commit.
+            batch.spec_info = "relayed"
+
+        s._pp_process_batch_result = Mock(side_effect=relay_and_commit)
+
+        def ingest():
+            if s.inflight_steps.step == 2:
+                rows_at_replan.append(s.decoding_batches[0].rows)
+                raise _EndLoop
+            return []
+
+        s.ingest_requests = ingest
+        s.get_next_batch_to_run = Mock(
+            side_effect=lambda **kwargs: SimpleNamespace(batch_to_run=next(schedule))
+        )
+
+        with get_parallel().override(pp_size=2, pp_async_batch_depth=0):
+            with self.assertRaises(_EndLoop):
+                s.event_loop_pp()
+
+        s._pp_process_batch_result.assert_called_once()
+        (rows,) = rows_at_replan
+        self.assertEqual(_rids(rows), ["a"])
+        self.assertEqual(rows.spec_info, "relayed")
+        self.assertEqual(_rids(s.decoding_batches[1].rows), [])
 
 
 if __name__ == "__main__":
