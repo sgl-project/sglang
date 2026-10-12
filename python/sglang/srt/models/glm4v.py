@@ -76,18 +76,16 @@ class Glm4vRMSNorm(RMSNorm):
         return x
 
 
-# TODO: fold into parallel_group selection ("attn_tp" under DP attention).
 def glm4v_vision_reduces_over_attn_tp(use_data_parallel: bool) -> bool:
     return is_dp_attention_enabled() and not use_data_parallel
 
 
-def _glm4v_vision_tp(use_data_parallel: bool) -> Tuple[int, int]:
+def _glm4v_vision_parallel_group(use_data_parallel: bool) -> str:
     if use_data_parallel:
-        return 1, 0
-    parallel = get_parallel()
+        return "replicated"
     if glm4v_vision_reduces_over_attn_tp(use_data_parallel):
-        return parallel.attn_tp_size, parallel.attn_tp_rank
-    return parallel.tp_size, parallel.tp_rank
+        return "attn_tp"
+    return "tp"
 
 
 class Glm4vVisionMLP(nn.Module):
@@ -101,15 +99,14 @@ class Glm4vVisionMLP(nn.Module):
         use_data_parallel: bool = False,
     ):
         super().__init__()
-        self.tp_size, self.tp_rank = _glm4v_vision_tp(use_data_parallel)
+        parallel_group = _glm4v_vision_parallel_group(use_data_parallel)
         self.gate_up_proj = MergedColumnParallelLinear(
             input_size=in_features,
             output_sizes=[hidden_features] * 2,  # [gate_proj, up_proj]
             bias=bias,
             quant_config=quant_config,
             prefix=add_prefix("gate_up_proj", prefix),
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
+            parallel_group=parallel_group,
         )
         self.down_proj = RowParallelLinear(
             hidden_features,
@@ -117,8 +114,7 @@ class Glm4vVisionMLP(nn.Module):
             bias=bias,
             quant_config=quant_config,
             prefix=add_prefix("down_proj", prefix),
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
+            parallel_group=parallel_group,
             use_dp_attention_reduce=glm4v_vision_reduces_over_attn_tp(
                 use_data_parallel
             ),
@@ -257,7 +253,7 @@ class Glm4vPatchMerger(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = d_model
-        tp_size, tp_rank = _glm4v_vision_tp(use_data_parallel)
+        parallel_group = _glm4v_vision_parallel_group(use_data_parallel)
         self.proj = ReplicatedLinear(
             self.hidden_size,
             self.hidden_size,
@@ -272,8 +268,7 @@ class Glm4vPatchMerger(nn.Module):
             bias=bias,
             quant_config=quant_config,
             prefix=add_prefix("gate_up_proj", prefix),
-            tp_size=tp_size,
-            tp_rank=tp_rank,
+            parallel_group=parallel_group,
         )
         self.down_proj = RowParallelLinear(
             context_dim,
@@ -281,8 +276,7 @@ class Glm4vPatchMerger(nn.Module):
             bias=bias,
             quant_config=quant_config,
             prefix=add_prefix("down_proj", prefix),
-            tp_size=tp_size,
-            tp_rank=tp_rank,
+            parallel_group=parallel_group,
             use_dp_attention_reduce=glm4v_vision_reduces_over_attn_tp(
                 use_data_parallel
             ),

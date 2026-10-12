@@ -594,6 +594,7 @@ class TestDisaggregationWire(unittest.TestCase):
                 manager.transfer_infos = {}
                 manager._staging_outstanding = {42: outstanding}
                 manager._deferred_ack_targets = {42: {(target.ip, target.port): target}}
+                manager._deferred_ack_poisoned_rooms = set()
                 with patch.object(manager, "_send_abort_ack") as ack:
                     sender.clear()
                     if outstanding:
@@ -665,8 +666,8 @@ class TestDisaggregationWire(unittest.TestCase):
     def test_prebuilt_skips_unused_prompt_tensor(self):
         req = SimpleNamespace(
             kv=ReqKvInfo(req_pool_idx=0),
-            prefix_indices=[0, 1],
-            extend_range=SimpleNamespace(length=3),
+            prefix_len=2,
+            extend_len=3,
             origin_input_ids=[0, 1, 2, 3, 4],
             output_ids=[],
             retracted_stain=True,
