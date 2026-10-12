@@ -155,9 +155,67 @@ def _glm_effective_presize_budget(video_config, effective_max_image_tokens):
     return config
 
 
+def _glm_video_budget_ceiling(defaults, key):
+    if key in defaults and defaults[key] is not None:
+        return defaults[key]
+    if key == "fps":
+        return GLM_VIDEO_DEFAULT_FPS
+    if key == "max_frames":
+        return GLM_VIDEO_DEFAULT_MAX_FRAMES
+    if key == "max_tokens_per_frame":
+        return defaults.get("max_image_tokens")
+    return None
+
+
+def _clamp_glm_video_request_config(defaults, request):
+    """Keep request knobs from raising the deployment ceiling.
+
+    Only keys present on the request are touched. Omitted keys stay on today's
+    path so the HF sampler is not bypassed by an injected max_frames.
+    """
+    merged = {**defaults, **request}
+    for key in GLM_MEDIA_CONFIG_KEYS:
+        if key not in request:
+            continue
+        value = request[key]
+        if key == "fps":
+            value = float(value)
+        else:
+            value = int(value)
+        if value <= 0:
+            raise ValueError(f"GLM video {key} must be positive, got {request[key]!r}")
+
+        ceiling = _glm_video_budget_ceiling(defaults, key)
+        if ceiling is None:
+            continue
+
+        if key == "fps":
+            ceiling = float(ceiling)
+        else:
+            ceiling = int(ceiling)
+
+        if value <= ceiling:
+            merged[key] = value
+            continue
+
+        if key == "max_tokens_per_frame":
+            # A still-large per-frame cap skips _presize_budget. Drop back to
+            # the deployment default (or omit) so the multi-frame path runs.
+            if key in defaults and defaults[key] is not None:
+                merged[key] = defaults[key]
+            else:
+                merged.pop(key, None)
+        else:
+            merged[key] = ceiling
+    return merged
+
+
 def _merge_glm_video_configs(default_config, item_configs):
     defaults = dict(default_config or {})
-    return [{**defaults, **dict(config or {})} for config in item_configs]
+    return [
+        _clamp_glm_video_request_config(defaults, dict(config or {}))
+        for config in item_configs
+    ]
 
 
 def _hf_sample_frame_indices(

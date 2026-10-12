@@ -29,6 +29,7 @@ from sglang.srt.multimodal.encoder_preprocessing import (
 )
 from sglang.srt.multimodal.processors.glm4v import (
     _glm_effective_presize_budget,
+    _merge_glm_video_configs,
     glm_budget_kwargs,
     glm_decode_frames_at,
     glm_max_image_tokens_from_configs,
@@ -523,9 +524,7 @@ class EncoderPreprocessor:
             mm_items, video_configs = split_glm_video_items(mm_items)
             defaults = glm_processor_video_config(self.video_processor)
             defaults.update(self.vision_config.get("video", {}))
-            video_configs = [
-                {**defaults, **dict(config or {})} for config in video_configs
-            ]
+            video_configs = _merge_glm_video_configs(defaults, video_configs)
 
         futures, _ = self._submit_data_loading_tasks(
             mm_items, [Modality.VIDEO] * len(mm_items)
