@@ -36,6 +36,7 @@ class _Batch:
         self.forward_mode = SimpleNamespace(is_extend=lambda: extend)
         self.chunked_req = None
         self.is_prefill_only = False
+        self.sampling_info = SimpleNamespace(penalizer_orchestrator=SimpleNamespace())
 
     def is_empty(self):
         return not self.reqs

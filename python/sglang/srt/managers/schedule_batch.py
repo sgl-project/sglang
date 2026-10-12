@@ -3879,6 +3879,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             extend_num_tokens=self.extend_num_tokens,
         )
 
+    def shallow_copy(self) -> ScheduleBatch:
+        """A batch with every field of this one and its own reqs list.
+
+        Tensors, sampling_info and spec_info are shared, so an in-place write
+        through either batch reaches both; a field rebound on one is not seen
+        by the other.
+        """
+        batch = copy.copy(self)
+        batch.reqs = self.reqs[:]
+        return batch
+
     def _swa_eviction_trigger(self, sliding_window_size: int, eviction_interval: int):
         """Pick this forward's per-request SWA eviction trigger.
 

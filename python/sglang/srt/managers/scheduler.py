@@ -1317,8 +1317,9 @@ class Scheduler(
         self._engine_paused = False
         self._deferred_input_requests: List = []
 
-    # A read alias of the running rows. The event loops change the rows only
-    # through decoding_batch; assigning here gives the rows a new owner.
+    # A read alias of the running rows. The event loops change the rows through
+    # decoding_batch, except PrefillAdder's preemption, which filters them in
+    # place. Only tests assign here; that gives the rows a new owner.
     @property
     def running_batch(self) -> ScheduleBatch:
         return self.decoding_batch.rows
