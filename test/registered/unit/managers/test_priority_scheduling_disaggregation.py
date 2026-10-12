@@ -539,10 +539,16 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
         queue.pp_size = 2
         queue.transfer_queue.queue = [transferring]
         scheduler = queue.scheduler
-        scheduler.running_batch.reqs = [finished.req]
+        scheduler.running_batch.reqs = []
         scheduler.running_mbs = [
             scheduler.running_batch,
             SimpleNamespace(reqs=[running.req]),
+        ]
+        # The finished request has left the running batch; the launched batch
+        # that still reads its adapter is in flight.
+        scheduler.inflight_steps = [
+            SimpleNamespace(batch=SimpleNamespace(reqs=[finished.req])),
+            SimpleNamespace(batch=None),
         ]
         scheduler.waiting_queue = [waiting.req]
         scheduler.enable_decode_hicache = False

@@ -1401,6 +1401,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             running_loras = {
                 req.lora_id for batch in running_batches for req in batch.reqs
             }
+            # A launched batch may still read the adapters of rows that have
+            # left the running batch since its launch.
+            running_loras.update(
+                req.lora_id
+                for record in self.scheduler.inflight_steps
+                if record.batch is not None
+                for req in record.batch.reqs
+            )
             running_loras.update(r.req.lora_id for r in self.transfer_queue.queue)
             running_loras.update(req.lora_id for req in self.scheduler.waiting_queue)
 
