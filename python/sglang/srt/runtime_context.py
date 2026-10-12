@@ -474,6 +474,18 @@ def _install_parallel_properties() -> None:
 _install_parallel_properties()
 
 
+def linear_attn_parallel_group() -> str:
+    """The group linear attention partitions its heads over: the attention-TP
+    group, or the TP group under CP-TP group sharing, where the attention-TP
+    group is one rank wide."""
+    return "tp" if get_parallel().enable_cp_tp_group_sharing else "attn_tp"
+
+
+def linear_attn_tp_size() -> int:
+    """The width of ``linear_attn_parallel_group()``."""
+    return getattr(get_parallel(), f"{linear_attn_parallel_group()}_size")
+
+
 class _FlagGroupBase(msgspec.Struct):
     """Shared flag-group behavior: typo-safe writes + transactional ``override()``.
 
@@ -681,6 +693,10 @@ class ForwardFlags:
         "lora_batch_layout": LoRABatchLayout.DP_LOCAL,
         # LayerNorm sequence parallelism region; see layers/layernorm_sp.py.
         "sp_active": False,
+        # This forward's MoE runs on attention-TP-local token slices (the
+        # ForwardBatch.attn_tp_sequence_sharded decision, stamped by the model
+        # that slices); read by the benchmark routing override.
+        "attn_tp_sequence_sharded": False,
     }
 
     # Read/written inside compiled graphs (vocab embedding, layer boundaries,
@@ -697,6 +713,7 @@ class ForwardFlags:
             "defer_moe_finalize",
             "lora_batch_layout",
             "sp_active",
+            "attn_tp_sequence_sharded",
         }
     )
 
@@ -1488,6 +1505,37 @@ def publish(
     (bags re-projected, provenance reset, role overwritten), which is what
     lets one process rebuild an engine after shutting the previous one down.
     """
+    return _configure_context(_CONTEXT, server_args, role=role, ranks=ranks)
+
+
+def create_context(
+    server_args, *, role: str, ranks: SpawnRanks | None = None
+) -> RuntimeContext:
+    """Build a model-owned context without replacing the active process config."""
+    context = RuntimeContext(parallel=ParallelContext())
+    return _configure_context(context, server_args, role=role, ranks=ranks)
+
+
+@contextmanager
+def use_context(context: RuntimeContext):
+    """Activate a model context for serialized embedded SRT work.
+
+    Like process group scopes, this changes process globals and requires the
+    caller to serialize model execution. It does not isolate concurrent threads.
+    The previous context is restored by identity without re-projecting its bags.
+    """
+    global _CONTEXT, _PARALLEL
+    previous_context, previous_parallel = _CONTEXT, _PARALLEL
+    _CONTEXT, _PARALLEL = context, context.parallel
+    try:
+        yield context
+    finally:
+        _CONTEXT, _PARALLEL = previous_context, previous_parallel
+
+
+def _configure_context(
+    context, server_args, *, role: str, ranks: SpawnRanks | None = None
+) -> RuntimeContext:
     if _ROLE_NS_MODE == "enforce" and role not in ROLE_NAMESPACE_SETS:
         # Fail closed at publish time, not at the first stray read.
         raise ValueError(
@@ -1495,8 +1543,8 @@ def publish(
             "its namespace set (None for the full tree)."
         )
     server_args.resolve_once()
-    discarded = _CONTEXT.overrides_log()
-    _CONTEXT.set_server_args(server_args)
+    discarded = context.overrides_log()
+    context.set_server_args(server_args)
     if discarded:
         logger.warning(
             "publish(role=%s) re-projected the config bags and dropped %d "
@@ -1507,16 +1555,16 @@ def publish(
                 f"{source}({', '.join(sorted(fields))})" for source, fields in discarded
             ),
         )
-    _CONTEXT._publish_role = role
+    context._publish_role = role
     # Disabled DCP has rank zero even in processes without a rank bundle.
-    if not _CONTEXT.parallel.dcp_enabled:
-        _CONTEXT.parallel.override_permanently(attn_dcp_rank=0)
+    if not context.parallel.dcp_enabled:
+        context.parallel.override_permanently(attn_dcp_rank=0)
     # The device is assigned by the launcher; it is not a config field.
-    _CONTEXT.config_bag("device")._set(
+    context.config_bag("device")._set(
         "gpu_id", ranks.gpu_id if ranks is not None else None
     )
     if ranks is not None:
-        parallel = _CONTEXT.parallel
+        parallel = context.parallel
         placement = derive_spawn_ranks(
             world_rank=ranks.world_rank,
             tp_size=parallel.tp_size,
@@ -1550,7 +1598,7 @@ def publish(
             file=sys.stderr,
             flush=True,
         )
-    return _CONTEXT
+    return context
 
 
 def _attention_ranks(parallel, tp_rank: int) -> dict:
@@ -1776,6 +1824,7 @@ _PLATFORM_PROBES: Dict[str, str] = {
     "is_sm90": "is_sm90_supported",
     "is_sm100": "is_sm100_supported",
     "is_sm100_or_sm110": "is_sm100_or_sm110_supported",
+    "is_sm110": "is_sm110_supported",
     "is_sm120": "is_sm120_supported",
     "is_blackwell": "is_blackwell_supported",
     "is_hopper_with_cuda_12_3": "is_hopper_with_cuda_12_3",

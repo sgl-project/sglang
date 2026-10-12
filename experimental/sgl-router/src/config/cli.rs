@@ -13,14 +13,16 @@ use crate::config::types::is_selector_empty;
 use crate::config::{
     default_cb_cool_down, default_host, default_port, default_proxy_request_timeout_secs,
     default_shutdown_drain_secs, default_stale_request_timeout_secs, resolve_mode, AffinityConfig,
-    AffinityMode, CacheAwareConfig, CachePrefixProvider, ChatRoutingKind, CircuitBreakerConfig,
-    Config, DecodePolicyKind, DiscoveryBackend, EligibilityConfig, FilterKind, FusedTerm,
-    InflightLoadConfig, K8sDiscoveryConfig, K8sDiscoveryMode, KvIndexerEndpointConfig, LogFormat,
-    ModelConfig, ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig, SessionAffinityMode,
-    StaticUrlsDiscoveryConfig, StickyConfig, StickyFallbackKind, TokenizerBackend, TokenizerConfig,
-    DEFAULT_FUSE, DEFAULT_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS, DEFAULT_KV_BOOTSTRAP_TIMEOUT_MS,
+    AffinityMode, BalancedBy, CacheAwareConfig, CachePrefixProvider, ChatRoutingKind,
+    CircuitBreakerConfig, Config, DecodePolicyKind, DiscoveryBackend, EligibilityConfig,
+    FilterKind, FusedTerm, InflightLoadConfig, K8sDiscoveryConfig, K8sDiscoveryMode,
+    KvIndexerEndpointConfig, LogFormat, ModelConfig, ObservabilityConfig, PolicyKind, ProxyConfig,
+    ServerConfig, SessionAffinityMode, StaticUrlsDiscoveryConfig, StickyConfig, StickyFallbackKind,
+    TokenizerBackend, TokenizerConfig, DEFAULT_FUSE, DEFAULT_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS,
+    DEFAULT_KV_BOOTSTRAP_TIMEOUT_MS,
 };
 use crate::policies_reorg::admission::AdmissionLimits;
+use crate::policies_reorg::factory::AffinitySpec;
 
 const DEFAULT_KV_INDEXER_QUERY_TIMEOUT_MS: u64 = 100;
 const DEFAULT_KV_INDEXER_QUERY_MAX_INFLIGHT: usize = sgl_kv_indexer::DEFAULT_QUERY_MAX_INFLIGHT;
@@ -140,12 +142,28 @@ pub struct ServerArgs {
     #[arg(long)]
     pub worker_api_key: Option<String>,
 
-    /// Per-request upstream timeout in seconds.
+    /// Upstream timeout in seconds: the whole response of a non-streaming request,
+    /// the response headers of a streaming one. SGLang's chat endpoint sends those
+    /// headers with the first token, so for streaming chat this bounds time to
+    /// first token, queueing included. Must be greater than zero.
     #[arg(long, default_value_t = default_proxy_request_timeout_secs())]
     pub request_timeout_secs: u64,
     /// Maximum silence between upstream stream chunks, in seconds.
     #[arg(long, default_value_t = ProxyConfig::default().stream_idle_timeout_secs)]
     pub stream_idle_timeout_secs: u64,
+
+    /// Dispatch attempts per request, including the first. A request that fails
+    /// before any response reaches the client (transport error, 5xx, 429) is
+    /// retried on a worker it has not tried yet. 1 disables retries; 3 is typical.
+    #[arg(long, default_value_t = ProxyConfig::default().max_attempts)]
+    pub retry_max_attempts: NonZeroU32,
+    /// Backoff before the first retry, in milliseconds; doubles per retry, with
+    /// jitter. 0 retries immediately.
+    #[arg(long, default_value_t = ProxyConfig::default().initial_backoff_ms)]
+    pub retry_initial_backoff_ms: u64,
+    /// Upper bound on the backoff between retries, in milliseconds.
+    #[arg(long, default_value_t = ProxyConfig::default().max_backoff_ms)]
+    pub retry_max_backoff_ms: u64,
 
     /// Maximum in-flight request lifetime in seconds, including streaming responses.
     /// Expiry returns 504 `stale_request_expired` before response headers are sent;
@@ -242,7 +260,7 @@ pub struct RoutingArgs {
     #[arg(long, value_delimiter = ',')]
     pub filter: Vec<FilterKind>,
 
-    /// Router-local in-flight limit for `--filter overloaded`.
+    /// Router-local in-flight limit: for `--filter overloaded`, or reorg admission.
     #[arg(long)]
     pub max_in_flight: Option<usize>,
 
@@ -250,6 +268,19 @@ pub struct RoutingArgs {
     /// of its reported capacity, in (0, 1].
     #[arg(long)]
     pub max_kv_usage: Option<f64>,
+
+    /// Reorg admission: reject an engine whose running requests have reached this
+    /// share of its reported capacity, in (0, 1].
+    #[arg(long)]
+    pub max_running_usage: Option<f64>,
+
+    /// Reorg admission: reject an engine reporting this many waiting requests.
+    #[arg(long)]
+    pub max_waiting_requests: Option<u64>,
+
+    /// Reorg admission: reject an engine reporting this many waiting uncached tokens.
+    #[arg(long)]
+    pub max_pending_prefill_tokens: Option<u64>,
 
     /// Minimum cached prompt share for `--filter prefix_cache`.
     #[arg(long)]
@@ -377,11 +408,16 @@ pub struct AffinityArgs {
     #[arg(long, value_enum)]
     pub affinity_mode: Option<AffinityMode>,
 
+    /// Reorg balanced affinity: load compared against the alternative
+    /// (default prefill-tokens).
+    #[arg(long, value_enum)]
+    pub affinity_balanced_by: Option<BalancedBy>,
+
     /// Reorg balanced affinity: switch only above this load ratio (>= 1, default 2).
     #[arg(long)]
     pub affinity_load_factor: Option<f64>,
 
-    /// Reorg balanced affinity: minimum waiting uncached token difference (default 1024).
+    /// Reorg balanced affinity: minimum load difference (default 1024 tokens or 4 requests).
     #[arg(long)]
     pub affinity_load_gap: Option<u64>,
 
@@ -458,13 +494,18 @@ impl Cli {
                 self.affinity
                     .affinity_mode
                     .is_none_or(|mode| matches!(mode, AffinityMode::Strict | AffinityMode::Soft))
+                    && self.affinity.affinity_balanced_by.is_none()
                     && self.affinity.affinity_load_factor.is_none()
                     && self.affinity.affinity_load_gap.is_none(),
-                "prefer, balanced and --affinity-load-* require --chat-routing reorg"
+                "prefer, balanced, --affinity-balanced-by and --affinity-load-* require --chat-routing reorg"
             );
             ensure!(
-                self.routing.max_kv_usage.is_none(),
-                "--max-kv-usage requires --chat-routing reorg"
+                self.routing.max_kv_usage.is_none()
+                    && self.routing.max_running_usage.is_none()
+                    && self.routing.max_waiting_requests.is_none()
+                    && self.routing.max_pending_prefill_tokens.is_none(),
+                "--max-kv-usage, --max-running-usage, --max-waiting-requests and \
+                 --max-pending-prefill-tokens require --chat-routing reorg"
             );
             ensure!(
                 self.affinity.affinity_mode.is_none()
@@ -472,12 +513,13 @@ impl Cli {
                 "legacy --affinity-mode requires --policy session_aware"
             );
         }
-        ensure!(
-            (self.affinity.affinity_load_factor.is_none()
-                && self.affinity.affinity_load_gap.is_none())
-                || self.affinity.affinity_mode == Some(AffinityMode::Balanced),
-            "--affinity-load-* require --affinity-mode balanced"
-        );
+        let balanced = AffinitySpec {
+            mode: None,
+            balanced_by: self.affinity.affinity_balanced_by,
+            load_factor: self.affinity.affinity_load_factor,
+            load_gap: self.affinity.affinity_load_gap,
+        };
+        balanced.validate(self.affinity.affinity_mode.unwrap_or_default())?;
         let affinity = self
             .affinity
             .build_config(&self.cache, self.routing.policy)?;
@@ -517,7 +559,7 @@ impl Cli {
             }
         }
         let fused = self.routing.build_fused()?;
-        let eligibility = self.routing.build_eligibility()?;
+        let eligibility = self.routing.build_eligibility(reorg)?;
         let reorg_admission = self.routing.build_reorg_admission()?;
         let sticky = self.affinity.into_sticky_config(self.routing.policy)?;
         let sampling_overrides = self
@@ -590,6 +632,9 @@ impl Cli {
             proxy: ProxyConfig {
                 request_timeout_secs: self.server.request_timeout_secs,
                 stream_idle_timeout_secs: self.server.stream_idle_timeout_secs,
+                max_attempts: self.server.retry_max_attempts,
+                initial_backoff_ms: self.server.retry_initial_backoff_ms,
+                max_backoff_ms: self.server.retry_max_backoff_ms,
             },
             router_inflight_load: InflightLoadConfig {
                 stale_request_timeout_secs: self.server.stale_request_timeout_secs,
@@ -723,7 +768,7 @@ impl RoutingArgs {
         Ok(Some(terms))
     }
 
-    fn build_eligibility(&self) -> Result<Option<EligibilityConfig>> {
+    fn build_eligibility(&self, reorg: bool) -> Result<Option<EligibilityConfig>> {
         for (i, kind) in self.filter.iter().enumerate() {
             ensure!(
                 !self.filter[..i].contains(kind),
@@ -732,8 +777,13 @@ impl RoutingArgs {
         }
         let has = |k: FilterKind| self.filter.contains(&k);
         ensure!(
-            (self.max_in_flight.is_some() == has(FilterKind::Overloaded)),
-            "--max-in-flight and `--filter overloaded` require each other"
+            !has(FilterKind::Overloaded) || self.max_in_flight.is_some(),
+            "`--filter overloaded` requires --max-in-flight"
+        );
+        // Reorg applies --max-in-flight as admission; legacy only through the filter.
+        ensure!(
+            reorg || self.max_in_flight.is_none() || has(FilterKind::Overloaded),
+            "--max-in-flight requires `--filter overloaded` or --chat-routing reorg"
         );
         ensure!(
             self.max_in_flight != Some(0),
@@ -764,13 +814,15 @@ impl RoutingArgs {
     /// Reorg admission for groups without their own limits.
     fn build_reorg_admission(&self) -> Result<AdmissionLimits> {
         let limits = AdmissionLimits {
-            max_inflight_requests: self.max_in_flight.map(|n| n as u64),
+            max_running_usage: self.max_running_usage,
             max_kv_usage: self.max_kv_usage,
-            ..Default::default()
+            max_waiting_requests: self.max_waiting_requests,
+            max_pending_prefill_tokens: self.max_pending_prefill_tokens,
+            max_inflight_requests: self.max_in_flight.map(|n| n as u64),
         };
         limits
             .validate()
-            .map_err(|error| anyhow!("--max-in-flight / --max-kv-usage: {error}"))?;
+            .map_err(|error| anyhow!("reorg admission flags: {error}"))?;
         Ok(limits)
     }
 }
@@ -932,10 +984,6 @@ impl AffinityArgs {
         }
         let defaults = AffinityConfig::default();
         let load_factor = self.affinity_load_factor.unwrap_or(defaults.load_factor);
-        ensure!(
-            load_factor.is_finite() && load_factor >= 1.0,
-            "--affinity-load-factor must be finite and at least 1"
-        );
         let session_id_header = self
             .session_id_header
             .clone()
@@ -1003,8 +1051,9 @@ impl AffinityArgs {
             session_eviction_interval_secs,
             stable_pair: self.stable_pair,
             mode: self.affinity_mode.unwrap_or(defaults.mode),
+            balanced_by: self.affinity_balanced_by.unwrap_or(defaults.balanced_by),
             load_factor,
-            load_gap: self.affinity_load_gap.unwrap_or(defaults.load_gap),
+            load_gap: self.affinity_load_gap,
             session_affinity_mode: self
                 .session_affinity_mode
                 .unwrap_or(defaults.session_affinity_mode),
@@ -1162,10 +1211,47 @@ mod tests {
         let kv = parse(&["--max-kv-usage", "0.9"]).unwrap().model;
         assert_eq!(kv.reorg_admission.max_kv_usage, Some(0.9));
         assert!(kv.eligibility.is_none());
-        let legacy_kv = Cli::try_parse_from(base.iter().chain(&["--max-kv-usage", "0.9"]));
-        assert!(legacy_kv.unwrap().into_config().is_err());
+        let admission = parse(&[
+            "--max-in-flight",
+            "96",
+            "--max-running-usage",
+            "0.9",
+            "--max-waiting-requests",
+            "48",
+            "--max-pending-prefill-tokens",
+            "32768",
+        ])
+        .unwrap()
+        .model;
+        assert!(admission.eligibility.is_none());
+        assert_eq!(
+            admission.reorg_admission,
+            AdmissionLimits {
+                max_running_usage: Some(0.9),
+                max_kv_usage: None,
+                max_waiting_requests: Some(48),
+                max_pending_prefill_tokens: Some(32768),
+                max_inflight_requests: Some(96),
+            }
+        );
+        for args in [
+            ["--max-kv-usage", "0.9"],
+            ["--max-running-usage", "0.9"],
+            ["--max-waiting-requests", "48"],
+            ["--max-pending-prefill-tokens", "32768"],
+            ["--max-in-flight", "96"],
+        ] {
+            let legacy = Cli::try_parse_from(base.iter().chain(&args));
+            assert!(
+                legacy.unwrap().into_config().is_err(),
+                "legacy accepted {args:?}"
+            );
+        }
         for args in [
             vec!["--max-kv-usage", "1.5"],
+            vec!["--max-running-usage", "0"],
+            vec!["--max-waiting-requests", "0"],
+            vec!["--filter", "overloaded"],
             vec!["--policy", "round_robin"],
             vec!["--decode-policy", "legacy_host_affinity"],
             vec!["--policy", "session_aware", "--stable-pair"],
@@ -1198,10 +1284,30 @@ mod tests {
                 if let Ok(config) = result {
                     let affinity = config.model.affinity.unwrap();
                     assert_eq!(affinity.load_factor, factor.parse::<f64>().unwrap());
-                    assert_eq!(affinity.load_gap, 10);
+                    assert_eq!(affinity.load_gap(), 10);
                 }
             }
+            for (metric, balanced_by, gap) in [
+                ("", BalancedBy::PrefillTokens, 1_024),
+                (
+                    "--affinity-balanced-by running-requests",
+                    BalancedBy::RunningRequests,
+                    4,
+                ),
+            ] {
+                let config = cfg_of(&format!("{base} --affinity-mode balanced {metric}")).unwrap();
+                let affinity = config.model.affinity.unwrap();
+                assert_eq!(
+                    (affinity.balanced_by, affinity.load_gap()),
+                    (balanced_by, gap)
+                );
+            }
             assert!(cfg_of(&format!("{base} --affinity-load-gap 10")).is_err());
+            assert!(cfg_of(&format!("{base} --affinity-balanced-by running-requests")).is_err());
+            assert!(cfg_of(&format!(
+                "--policy {policy} --affinity-balanced-by running-requests"
+            ))
+            .is_err());
             assert!(cfg_of(&format!("--policy {policy} --affinity-mode balanced")).is_err());
         }
     }
@@ -2244,8 +2350,8 @@ mod tests {
     #[test]
     fn filter_misconfigurations_fail_at_startup() {
         let cases: [(&[&str], &str); 8] = [
-            (&["--filter", "overloaded"], "require each other"),
-            (&["--max-in-flight", "64"], "require each other"),
+            (&["--filter", "overloaded"], "requires --max-in-flight"),
+            (&["--max-in-flight", "64"], "or --chat-routing reorg"),
             (&["--filter", "prefix_cache"], "require each other"),
             (&["--prefix-cache-min-share", "0.6"], "require each other"),
             (
@@ -2933,7 +3039,8 @@ mod tests {
             "ttft_slo": "slo_first",
             "buckets": [
                 {"id": "short", "max_input_tokens": 4096, "plain": {
-                    "worker_ids": ["a"], "admission": {"max_kv_usage": 0.9}
+                    "worker_ids": ["a"], "admission": {"max_kv_usage": 0.9},
+                    "affinity": {"mode": "balanced", "balanced_by": "running_requests"}
                 }},
                 {"id": "long", "rank": 1, "prefill": {}, "decode": {"policy": "power_of_two", "worker_services": ["ns/decode"]}}
             ]
@@ -2978,6 +3085,11 @@ mod tests {
             json!({"buckets": [{"id": "x", "plain": {"worker_services": ["ns/short/extra"]}}]}),
             json!({"buckets": [{"id": "x", "plain": {"worker_services": ["ns/ short"]}}]}),
             json!({"buckets": [{"id": "x", "plain": {"worker_ids": ["a"], "worker_services": ["ns/short"]}}]}),
+            json!({"buckets": [{"id": "x", "plain": {"affinity": {"mode": "strict"}}}]}),
+            json!({"buckets": [{"id": "x", "plain": {"affinity": {"balanced_by": "running_requests"}}}]}),
+            json!({"buckets": [{"id": "x", "plain": {"affinity": {"mode": "balanced", "load_factor": 0.5}}}]}),
+            json!({"buckets": [{"id": "x", "plain": {"affinity": {"load_gap": 1, "mode": "balanced", "extra": 1}}}]}),
+            json!({"buckets": [{"id": "x", "plain": {"policy": "power_of_two", "affinity": {"mode": "balanced"}}}]}),
         ] {
             assert!(build(&bad).is_err(), "accepted {bad}");
         }
