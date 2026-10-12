@@ -125,7 +125,9 @@ class TestMmHashesContract(CustomTestCase):
             input_ids=[1, 2, 9, 4], image_data=["image"], mm_hashes=["bbbb"]
         )
 
-        asyncio.run(tm._tokenize_one_request(obj))
+        # The mock processor has no hash executor to await.
+        with envs.SGLANG_MM_PRECOMPUTE_HASH.override(False):
+            asyncio.run(tm._tokenize_one_request(obj))
 
         mm_inputs = tm._create_tokenized_object.call_args.args[4]
         pad = _compute_pad_value(0xBBBB)
