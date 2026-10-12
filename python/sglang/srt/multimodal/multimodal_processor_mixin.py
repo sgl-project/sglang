@@ -41,6 +41,9 @@ class MultimodalProcessorMixin:
     # `process_and_combine_mm_data` -- resolves that clone instead of
     # `self._processor`, so isolation does not depend on the subclass.
     supports_mm_processor_concurrency = True
+    video_preprocessing_device = None
+    precompute_hash_before_cpu_transfer = False
+    keep_mm_features_on_device = False
 
     def _initialize_processor(
         self, hf_config, _processor, *, processor_config, **kwargs
@@ -62,6 +65,15 @@ class MultimodalProcessorMixin:
         self.image_config = mm_process_config.get("image", {})
         self.video_config = mm_process_config.get("video", {})
         self.audio_config = mm_process_config.get("audio", {})
+
+        # name of the feature filed
+        # TODO: pass from processors
+        self.FEATURE_NAMES = [
+            "pixel_values",
+            "pixel_values_videos",
+            "audio_features",
+            "input_features",
+        ]
 
         self._tokenizer = _tokenizer_of(self._processor)
 
