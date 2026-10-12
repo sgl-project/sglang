@@ -130,6 +130,46 @@ class TestGlm53CpTpTransfer(CustomTestCase):
                 np.testing.assert_array_equal(destination[2], source[1])
                 self.assertTrue(np.all(destination[:2] == 255))
 
+    def test_replicated_kv_kpool_and_tp_draft_pages_arrive_once(self):
+        for rank in range(4):
+            # Two replicated components and one rank-specific external draft.
+            src = [np.arange(6 * n, dtype=np.uint8).reshape(6, n) for n in (4, 8, 12)]
+            src[2] += rank * 30
+            dst = [np.full_like(a, 255) for a in src]
+            manager = MooncakeKVManager.__new__(MooncakeKVManager)
+            manager.is_mla_backend = True
+            manager.is_hybrid_mla_backend = True
+            manager.enable_custom_mem_pool = False
+            manager.max_transfer_batch_indices = 0
+            manager.pp_size = 1
+            writes = []
+
+            def transfer(_session, blocks):
+                for source, destination, size in blocks:
+                    writes.extend(range(destination, destination + size))
+                    ctypes.memmove(destination, source, size)
+                return 0
+
+            manager._transfer_data = transfer
+            self.assertEqual(
+                manager._send_kvcache_generic(
+                    mooncake_session_id="test",
+                    src_data_ptrs=[a.ctypes.data for a in src],
+                    dst_data_ptrs=[a.ctypes.data for a in dst],
+                    item_lens=[4, 8, 12],
+                    prefill_data_indices=np.array([1, 2, 4], dtype=np.int32),
+                    dst_data_indices=np.array([0, 3, 4], dtype=np.int32),
+                    executor=None,
+                    src_layer_ids=[0, 1, 100],
+                    dst_layer_ids=[0, 1, 100],
+                ),
+                0,
+            )
+            self.assertEqual(len(writes), len(set(writes)))
+            for source, destination in zip(src, dst):
+                np.testing.assert_array_equal(destination[[0, 3, 4]], source[[1, 2, 4]])
+                self.assertTrue(np.all(destination[[1, 2, 5]] == 255))
+
 
 if __name__ == "__main__":
     unittest.main()

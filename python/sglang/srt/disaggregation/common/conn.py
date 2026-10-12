@@ -2719,6 +2719,10 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 decode_allocation_policy=self.decode_allocation_policy,
             )
             payload = dataclasses.asdict(info)
+            if not info.enable_cp_tp_group_sharing:
+                # Ordinary deployments keep the old wire shape so older
+                # decoders can still construct their PrefillServerInfo.
+                payload.pop("enable_cp_tp_group_sharing")
             if info.dsv41_spec_layout is None:
                 payload.pop("dsv41_spec_layout")
             return web.json_response(payload, status=200)
