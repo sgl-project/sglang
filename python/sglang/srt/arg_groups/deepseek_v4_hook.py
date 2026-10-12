@@ -18,7 +18,7 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
-from sglang.srt.utils.common import is_gfx95_supported, is_npu
+from sglang.srt.utils.common import is_gfx95_supported, is_hip, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -289,28 +289,43 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             read_ragged_verify_mode,
         )
 
+        # CP size may still be implicit here; validate_deepseek_v4_cp resolves it.
+        supported_prefill_cp = (
+            cfg.disaggregation_mode == "prefill"
+            and cfg.enable_prefill_cp
+            and cfg.cp_strategy == "interleave"
+        )
         if (
             read_ragged_verify_mode() is not RaggedVerifyMode.STATIC
             or cfg.disaggregation_transfer_backend != "mooncake"
-            or cfg.enable_prefill_cp
-            or cfg.attn_cp_size != 1
+            or (
+                (cfg.enable_prefill_cp or cfg.attn_cp_size != 1)
+                and not supported_prefill_cp
+            )
             or cfg.dcp_size != 1
         ):
             raise ValueError(
                 "DeepSeek-V4.1 DSpark PD requires static verify, Mooncake, "
-                "and CP=1 on both servers. DP attention is supported when "
+                "DCP=1, and CP=1 on decode. Prefill CP requires "
+                "--enable-prefill-cp with the interleave strategy. "
+                "DP attention is supported when "
                 "both servers use the same block size and target/draft KV layout."
             )
 
     prefill_graph = cfg.cuda_graph_config.prefill
+    cp_breakable_prefill = (
+        cfg.enable_prefill_cp
+        and cfg.cp_strategy == "interleave"
+        and cfg.tp_size > 1
+        and prefill_graph.backend == Backend.BREAKABLE
+    )
     if (
         prefill_graph.backend != Backend.DISABLED
         and prefill_graph.max_seq_len is None
+        and not cp_breakable_prefill
         # Decoder bounded replay runs the indexer at a graph break, not captured.
         and not cfg.enable_decoder_swa_bounded_replay
     ):
-        # The captured low-ratio indexer scores a static context width; 16k
-        # keeps it inside the candidate window at under 1 ms per layer.
         declare_resolution(
             server_args,
             "validate_deepseek_v41_features",
@@ -340,8 +355,17 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 "the prefill CUDA graph under context parallelism",
                 prefill_graph_backend != Backend.DISABLED and cfg.attn_cp_size > 1,
             ),
-            # input_ids_global is a DP-wide gather, so the tail slice cannot apply.
-            ("DP attention", attn_dp_enabled_of(cfg)),
+            # DP attention + TP MoE re-sizes the MoE gather to every rank's tail
+            # (deepseek_v4 _late_layer_dp_counts, ROCm only); other DP layouts do not.
+            (
+                "DP attention other than TP MoE with attention TP 1 on ROCm",
+                attn_dp_enabled_of(cfg)
+                and not (
+                    is_hip()
+                    and cfg.moe_a2a_backend == "none"
+                    and cfg.attn_dp_size == cfg.tp_size
+                ),
+            ),
         )
         for feature, enabled in incompatible:
             if enabled:
