@@ -783,12 +783,12 @@ install_extra_deps() {
     NIXL_BIN_NAME="nixl-cu13"
     EXTRA_NVIDIA_SPECS="nvidia-cuda-nvrtc"
 
-    # >>> TEMP -- DO NOT MERGE: validate Mooncake PR #3272 wheels -----------
+    # >>> TEMP -- DO NOT MERGE: validate Mooncake PR #3673 wheels -----------
     MOONCAKE_WHEEL_ZIP_URL=""
     if [ "$(uname -m)" = "x86_64" ]; then
         case "${SYS_PYTHON_VER}" in
-            3.10) MOONCAKE_WHEEL_ZIP_URL="https://nightly.link/kvcache-ai/Mooncake/actions/artifacts/9684879545.zip" ;;
-            3.12) MOONCAKE_WHEEL_ZIP_URL="https://nightly.link/kvcache-ai/Mooncake/actions/artifacts/9684916333.zip" ;;
+            3.10) MOONCAKE_WHEEL_ZIP_URL="https://nightly.link/kvcache-ai/Mooncake/actions/artifacts/11669460003.zip" ;;
+            3.12) MOONCAKE_WHEEL_ZIP_URL="https://nightly.link/kvcache-ai/Mooncake/actions/artifacts/11669301198.zip" ;;
         esac
     fi
     if [ -n "$MOONCAKE_WHEEL_ZIP_URL" ]; then
@@ -798,7 +798,7 @@ install_extra_deps() {
         python3 -c "import zipfile,sys; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" \
             "${MOONCAKE_WHEEL_DIR}/wheel.zip" "${MOONCAKE_WHEEL_DIR}"
         MOONCAKE_PKG="$(ls "${MOONCAKE_WHEEL_DIR}"/*.whl)"
-        echo "TEMP: overriding Mooncake with PR #3272 wheel for x86_64/py${SYS_PYTHON_VER}: ${MOONCAKE_PKG}"
+        echo "TEMP: overriding Mooncake with PR #3673 wheel for x86_64/py${SYS_PYTHON_VER}: ${MOONCAKE_PKG}"
     fi
     # <<< TEMP ---------------------------------------------------------------
 
