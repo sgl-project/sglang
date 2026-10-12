@@ -11,6 +11,7 @@ import builtins
 import os
 import pathlib
 import sys
+from types import SimpleNamespace
 
 import msgspec
 import pytest
@@ -145,6 +146,40 @@ def test_musa_activation_flags_skip_cuda_fast_math(monkeypatch):
     monkeypatch.setattr(arch, "is_musa_runtime", lambda: True)
 
     assert arch.get_activation_cuda_cflags() == []
+
+
+@pytest.mark.parametrize(
+    "backend, capability", [("cuda", (9, 0)), ("hip", (9, 4)), ("musa", (3, 1))]
+)
+def test_arch_query_uses_cuda_api_after_musa_initialization(
+    monkeypatch, backend, capability
+):
+    calls = []
+
+    def current_device():
+        calls.append("query")
+        return 0
+
+    cuda = SimpleNamespace(
+        current_device=current_device, get_device_capability=lambda device: capability
+    )
+    monkeypatch.setattr(arch, "torch", SimpleNamespace(cuda=cuda))
+    monkeypatch.setattr(arch, "is_hip_runtime", lambda: backend == "hip")
+    monkeypatch.setattr(arch, "is_musa_runtime", lambda: backend == "musa")
+    monkeypatch.setattr(arch, "_CUDA_ARCH", None, raising=False)
+    real_import = builtins.__import__
+
+    def import_with_torchada(name, *args, **kwargs):
+        if name == "torchada":
+            calls.append("torchada")
+            return SimpleNamespace()
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", import_with_torchada)
+    arch._init_jit_cuda_arch_once.__wrapped__()
+
+    assert (arch._CUDA_ARCH.major, arch._CUDA_ARCH.minor) == capability
+    assert calls == (["torchada", "query"] if backend == "musa" else ["query"])
 
 
 def test_musa_target_flags_use_cxx17_without_changing_cuda(monkeypatch):

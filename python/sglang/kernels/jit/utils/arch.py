@@ -94,17 +94,12 @@ def _cuda_arch_suffix(major: int, minor: int) -> str:
 @cache_once
 def _init_jit_cuda_arch_once():
     global _CUDA_ARCH
+    if is_musa_runtime():
+        import torchada  # noqa: F401
+
     try:
-        if is_hip_runtime():
-            device = torch.cuda.current_device()
-            major, minor = torch.cuda.get_device_capability(device)
-        elif is_musa_runtime():
-            device = torch.musa.current_device()
-            properties = torch.musa.get_device_properties(device)
-            major, minor = int(properties.major), int(properties.minor)
-        else:
-            device = torch.cuda.current_device()
-            major, minor = torch.cuda.get_device_capability(device)
+        device = torch.cuda.current_device()
+        major, minor = torch.cuda.get_device_capability(device)
     except Exception:
         logger.warning("Cannot detect CUDA architecture.")
         major, minor = 0, 0  # invalid value to trigger compile error if used

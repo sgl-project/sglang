@@ -170,9 +170,6 @@ using fp32x4_t = float4;
 #ifdef USE_ROCM
 inline constexpr auto kDLGPU = kDLROCM;
 inline constexpr auto kDLGPUHost = kDLROCMHost;
-#elif defined(USE_MUSA)
-inline constexpr auto kDLGPU = kDLCUDA;
-inline constexpr auto kDLGPUHost = kDLCUDAHost;
 #else
 inline constexpr auto kDLGPU = kDLCUDA;
 inline constexpr auto kDLGPUHost = kDLCUDAHost;
@@ -246,8 +243,10 @@ template <uint32_t kNumThreads = kWarpThreads>
 SGL_DEVICE uint32_t get_lane_id() {
 #ifdef USE_ROCM
   static_assert(kNumThreads <= 64 && host::is_pow2(kNumThreads));
-  // AMD has no lane-id register: `__lane_id()` is computed from the exec mask
-  // and the group mask is still needed on top.
+  // AMD has no lane-id register: `__lane_id()` is computed from the exec mask as
+  // a `v_mbcnt_lo`/`v_mbcnt_hi` pair, and the group mask is still needed on top.
+  // Masking `threadIdx.x` -- already live in v0 -- is 2 instructions cheaper and
+  // yields the same value (measured on gfx950, hipcc 7.0).
   return threadIdx.x % kNumThreads;
 #elif defined(USE_MUSA)
   static_assert(kNumThreads <= 32 && host::is_pow2(kNumThreads));
@@ -610,8 +609,6 @@ struct LaunchKernel {
         m_config.stream,
         std::forward<Args>(args)...);
     RuntimeDeviceCheck(m_location);
-#elif defined(USE_MUSA)
-    RuntimeDeviceCheck(::cudaLaunchKernelEx(&m_config, kernel, std::forward<Args>(args)...), m_location);
 #else
     RuntimeDeviceCheck(::cudaLaunchKernelEx(&m_config, kernel, std::forward<Args>(args)...), m_location);
 #endif
