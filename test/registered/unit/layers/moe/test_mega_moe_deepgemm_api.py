@@ -374,7 +374,8 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
                     batch = SimpleNamespace(
                         moe_num_token_non_padded=lambda: torch.tensor(
                             2, dtype=torch.int32
-                        )
+                        ),
+                        moe_valid_token_mask=lambda n: torch.arange(n) < 2,
                     )
 
                     def run_experts(_experts, x, topk_ids, weights, **kwargs):
@@ -520,7 +521,8 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
                 input_ids = torch.tensor([7, 99] * ((num_tokens + 1) // 2))[:num_tokens]
                 input_ids[valid_rows:] = 1000
                 batch = SimpleNamespace(
-                    moe_num_token_non_padded=lambda: torch.tensor(valid_rows)
+                    moe_num_token_non_padded=lambda: torch.tensor(valid_rows),
+                    moe_valid_token_mask=lambda n: torch.arange(n) < valid_rows,
                 )
 
                 def run_experts(_experts, x, ids, weights, **kwargs):
@@ -594,7 +596,7 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
                     if routing == "draft":
                         moe.topk.topk_config.allow_routed_experts_capture = False
                     mega_gate_runtime.run_mega_gate(
-                        moe, hidden, torch.full((32,), 7), None, None
+                        moe, hidden, torch.full((32,), 7), None, None, None
                     )
                     expected = (
                         torch.tensor([[0, 1]]).expand(32, -1)
@@ -631,7 +633,7 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
                         patch.object(topk_module, "_is_cuda", True),
                     ):
                         weights, ids = mega_gate_runtime.run_mega_gate(
-                            moe, hidden, None, None, None
+                            moe, hidden, None, None, None, None
                         )
                     torch.testing.assert_close(weights, torch.ones((32, 1)))
                     torch.testing.assert_close(
@@ -724,6 +726,7 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
                 hidden,
                 torch.tensor([7, 99] + [1000] * 30),
                 torch.tensor(2),
+                torch.arange(32) < 2,
                 dispatch_info,
             )
         # Rank 1's redundant-routed layout has shared ID 11. Logical 0/1

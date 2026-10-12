@@ -76,7 +76,9 @@ def should_use_mega_gate(moe, hidden_states, dispatch_info) -> bool:
     )
 
 
-def run_mega_gate(moe, hidden_states, input_ids, num_token_non_padded, dispatch_info):
+def run_mega_gate(
+    moe, hidden_states, input_ids, num_token_non_padded, valid_mask, dispatch_info
+):
     if moe.is_hash:
         config = TopKConfig(
             top_k=moe.topk.topk,
@@ -88,11 +90,6 @@ def run_mega_gate(moe, hidden_states, input_ids, num_token_non_padded, dispatch_
     else:
         config = moe.topk.topk_config
     num_tokens = hidden_states.shape[0]
-    valid_mask = None
-    if num_token_non_padded is not None:
-        valid_mask = (
-            torch.arange(num_tokens, device=hidden_states.device) < num_token_non_padded
-        )
 
     hash_ids = None
     image_mask = None
@@ -108,7 +105,7 @@ def run_mega_gate(moe, hidden_states, input_ids, num_token_non_padded, dispatch_
         hash_ids = moe.topk.tid2eid[safe_ids].to(torch.int64)
     elif moe.gate.e_score_correction_bias_vl is not None and input_ids is not None:
         image_bias = moe.gate.e_score_correction_bias_vl
-        image_mask = (input_ids == moe.config.image_token_id).contiguous()
+        image_mask = input_ids == moe.config.image_token_id
 
     weights, ids = bf16_mega_gate(
         hidden_states,

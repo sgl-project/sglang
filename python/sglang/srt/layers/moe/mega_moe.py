@@ -261,11 +261,11 @@ def _run_mega_routed(
     hidden_size = moe.config.hidden_size
 
     if num_tokens > 0:
-        num_token_non_padded = (
-            forward_batch.moe_num_token_non_padded()
-            if forward_batch is not None
-            else None
-        )
+        num_token_non_padded = None
+        valid_token_mask = None
+        if forward_batch is not None:
+            num_token_non_padded = forward_batch.moe_num_token_non_padded()
+            valid_token_mask = forward_batch.moe_valid_token_mask(num_tokens)
         dispatch_info = ExpertLocationDispatchInfo.init_new(layer_id=moe.layer_id)
         if should_use_mega_gate(moe, hidden_states, dispatch_info):
             import deep_gemm
@@ -276,6 +276,7 @@ def _run_mega_routed(
                     hidden_states,
                     input_ids_global,
                     num_token_non_padded,
+                    valid_token_mask,
                     dispatch_info,
                 )
         else:
