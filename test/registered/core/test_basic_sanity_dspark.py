@@ -8,7 +8,11 @@ from sglang.test.kits.basic_scheduler_stress_kit import BasicSchedulerStressMixi
 from sglang.test.kits.eval_accuracy_kit import MMLUSanityMixin
 from sglang.test.kits.fwd_occupancy_kit import FwdOccupancyMixin
 from sglang.test.kits.json_constrained_kit import JSONConstrainedMixin
-from sglang.test.kits.spec_server_kits import SpecGrammarKit, SpecLogprobKit
+from sglang.test.kits.spec_server_kits import (
+    SpecGrammarKit,
+    SpecLogprobKit,
+    SpecSamplingMaskKit,
+)
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -39,6 +43,7 @@ class TestBasicSanityDSpark(
     JSONConstrainedMixin,
     SpecGrammarKit,
     SpecLogprobKit,
+    SpecSamplingMaskKit,
     CustomTestCase,
 ):
     served_model_name = TARGET_MODEL
