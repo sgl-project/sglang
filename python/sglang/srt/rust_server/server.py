@@ -333,7 +333,8 @@ class RustServer:
         bulk numeric columns never go through msgpack:
 
           - ``header``: msgpack ``BatchHeader`` positional array — the per-request
-            scalar columns (``rids, finish_reasons, prompt_tokens, tok_lens``) plus
+          scalar columns (``rids, finish_reasons, prompt_tokens, tok_lens,
+          cached_tokens``) plus
             the shape metadata for the optional families (``*_lens`` element counts
             for the flat logprob columns, ``*_reqlens``/``*_poslens`` for the ragged
             and hidden ones).
@@ -381,7 +382,13 @@ class RustServer:
         # Column order here MUST match BatchHeader (header_cols) and
         # for_each_chunk's read order (data_cols); the extras contribution
         # is ordered by the `extras` tuple below.
-        header_cols = [rids, finish_reasons, prompt_tokens, tok_lens]
+        header_cols = [
+            rids,
+            finish_reasons,
+            prompt_tokens,
+            tok_lens,
+            payload.cached_tokens,
+        ]
         data_cols = [flat_ids]
 
         if has_extra:

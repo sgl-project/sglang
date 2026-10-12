@@ -57,6 +57,10 @@ pub(crate) struct CoreMetadata {
     max_context_length: u64,
     max_total_num_tokens: u64,
     version: String,
+    host: String,
+    port: u16,
+    incremental_streaming_output: bool,
+    deployment_info: crate::message::config::DeploymentInfo,
 }
 
 impl From<&ServerArgs> for CoreMetadata {
@@ -74,6 +78,10 @@ impl From<&ServerArgs> for CoreMetadata {
             max_context_length: args.model_config.context_len,
             max_total_num_tokens: args.max_total_num_tokens,
             version: args.version.clone(),
+            host: args.host.clone(),
+            port: args.port,
+            incremental_streaming_output: args.incremental_streaming_output,
+            deployment_info: args.deployment_info.clone(),
         }
     }
 }
@@ -268,6 +276,11 @@ impl CoreHandle {
             version: metadata.version.clone(),
             frontend: "rust",
             internal_states: vec![internal_state],
+            host: metadata.host.clone(),
+            port: metadata.port,
+            incremental_streaming_output: metadata.incremental_streaming_output,
+            disaggregation_mode: metadata.disaggregation_mode,
+            deployment_info: metadata.deployment_info.clone(),
         })
     }
 

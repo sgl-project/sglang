@@ -19,7 +19,7 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Boot knobs specific to the embedded rust server — none of these exist in
 /// the Python-built [`ServerArgs`]; they arrive as explicit
@@ -157,6 +157,8 @@ pub struct ServerArgs {
     /// and the scheduler-derived KV token capacity, reported by `/server_info`.
     pub version: String,
     pub max_total_num_tokens: u64,
+    /// Resolved deployment metadata used by out-of-process orchestrators.
+    pub deployment_info: DeploymentInfo,
 }
 
 #[pyo3::pymethods]
@@ -192,6 +194,7 @@ impl ServerArgs {
         num_reserved_tokens,
         version,
         max_total_num_tokens,
+        deployment_info,
     ))]
     // The parameter list IS the schema; one keyword per field, all required.
     #[allow(clippy::too_many_arguments)]
@@ -225,6 +228,7 @@ impl ServerArgs {
         num_reserved_tokens: u64,
         version: String,
         max_total_num_tokens: u64,
+        deployment_info: DeploymentInfo,
     ) -> Self {
         Self {
             model_path,
@@ -256,6 +260,7 @@ impl ServerArgs {
             num_reserved_tokens,
             version,
             max_total_num_tokens,
+            deployment_info,
         }
     }
 }
@@ -295,7 +300,53 @@ impl Default for ServerArgs {
             num_reserved_tokens: 0,
             version: String::new(),
             max_total_num_tokens: 0,
+            deployment_info: DeploymentInfo::default(),
         }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct DeploymentInfo {
+    pub disaggregation_bootstrap_port: Option<u16>,
+    pub node_rank: u32,
+    pub nnodes: u32,
+    pub dp_size: u32,
+    pub dp_rank: Option<u32>,
+    pub dist_init_addr: Option<String>,
+    pub base_gpu_id: u32,
+    pub page_size: Option<u32>,
+    pub dcp_size: u32,
+    pub max_running_requests: Option<u64>,
+    pub max_prefill_tokens: u64,
+    pub enable_dp_attention: bool,
+    pub speculative_algorithm: Option<String>,
+    pub enable_hierarchical_cache: bool,
+    pub hicache_ratio: Option<f64>,
+    pub hicache_size: u64,
+    pub hicache_write_policy: Option<String>,
+    pub hicache_host_total_tokens: Option<u64>,
+    pub kv_event_sources: Vec<KvEventSource>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct KvEventSource {
+    pub dp_rank: u32,
+    pub endpoint: String,
+    pub topic: String,
+    pub block_size: u32,
+}
+
+impl<'py> pyo3::FromPyObject<'_, 'py> for DeploymentInfo {
+    type Error = pyo3::PyErr;
+
+    fn extract(obj: pyo3::Borrowed<'_, 'py, pyo3::PyAny>) -> pyo3::PyResult<Self> {
+        let text = obj.extract::<String>()?;
+        serde_json::from_str(&text).map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "deployment_info is not valid JSON: {e}"
+            ))
+        })
     }
 }
 

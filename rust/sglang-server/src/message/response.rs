@@ -134,8 +134,8 @@ pub fn frame_decode_batch_cols(header: &[u8], data_cols: &[&[u8]]) -> Bytes {
 }
 
 /// Columnar scalar header for a whole decode batch. The first four fields are
-/// required; every field after `tok_lens` defaults empty, so the hot path emits
-/// a four-element header. Field order is the wire ABI and must match
+/// required; every field after `cached_tokens` defaults empty, so the hot path
+/// emits a five-element header. Field order is the wire ABI and must match
 /// `RustTokenizerManager.push_generation`'s `header_cols` in
 /// `python/sglang/srt/rust_server/server.py`.
 ///
@@ -155,6 +155,7 @@ pub struct BatchHeader {
     pub finish_reasons: Vec<Option<FinishReason>>,
     pub prompt_tokens: Vec<u32>,
     pub tok_lens: Vec<u32>,
+    pub cached_tokens: Vec<u64>,
     #[serde(default)]
     pub out_lp_lens: Vec<u32>,
     #[serde(default)]
@@ -277,7 +278,11 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
     // `finish_reasons` dropped the terminal marker so the request never completed
     // and its unary drain pended forever. The producer already asserts this for the
     // extras columns; the four core ones were unchecked.
-    if h.finish_reasons.len() != n || h.prompt_tokens.len() != n || h.tok_lens.len() != n {
+    if h.finish_reasons.len() != n
+        || h.prompt_tokens.len() != n
+        || h.tok_lens.len() != n
+        || h.cached_tokens.len() != n
+    {
         reject!()
     }
     // The per-request extras columns are either absent (no request asked) or one
@@ -465,6 +470,7 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
             token_ids,
             finish_reason: h.finish_reasons.get(i).cloned().flatten(),
             prompt_tokens: h.prompt_tokens.get(i).copied().unwrap_or(0),
+            cached_tokens: h.cached_tokens.get(i).copied().unwrap_or(0),
             extras,
             // Listed explicitly, NOT `..Default::default()`: a new column added to
             // `ChunkEvent` and wired into the response must fail to compile here
@@ -568,6 +574,8 @@ pub struct ChunkEvent {
     pub finish_reason: Option<FinishReason>,
     /// Prompt token count for this request (constant across its chunks).
     pub prompt_tokens: u32,
+    /// Prompt tokens served from SGLang's prefix cache.
+    pub cached_tokens: u64,
     /// Decoded text **delta** for this chunk (empty in skip mode / on partial UTF-8),
     /// filled by the detok shard. `token_ids` doubles as `output_ids`;
     /// `completion_tokens` is this chunk's count.
@@ -683,6 +691,11 @@ mod tests {
                 Value::from(0u32),
                 Value::from(1u32),
             ]),
+            Value::Array(vec![
+                Value::from(1u64),
+                Value::from(2u64),
+                Value::from(3u64),
+            ]),
         ]);
         let mut header = Vec::new();
         rmpv::encode::write_value(&mut header, &header_arr).unwrap();
@@ -738,6 +751,7 @@ mod tests {
             Value::Array(vec![Value::Nil]),         // finish_reasons
             Value::Array(vec![Value::from(0u32)]),  // prompt_tokens
             Value::Array(vec![Value::from(10u32)]), // tok_lens (claims 80 bytes)
+            Value::Array(vec![Value::from(0u64)]),  // cached_tokens
             Value::Array(vec![Value::from(1u32)]),  // out_lp_lens (base now past data)
         ]);
         let mut header = Vec::new();
@@ -776,6 +790,7 @@ mod tests {
             finish.clone(),
             arr_u(&[0, 0]), // prompt
             arr_u(&[1, 1]), // tok_lens
+            arr_u(&[0, 0]), // cached_tokens
             arr_u(&[0, 0]), // out_lp_lens
             arr_u(&[0, 0]), // in_lp_lens
             arr_u(&[2, 1]), // out_top_reqlens — 3 positions claimed
@@ -800,6 +815,7 @@ mod tests {
             finish,
             arr_u(&[0, 0]), // prompt
             arr_u(&[1, 1]), // tok_lens
+            arr_u(&[0, 0]), // cached_tokens
             arr_u(&[0, 0]), // out_lp_lens
             arr_u(&[0, 0]), // in_lp_lens
             arr_u(&[0, 0]), // out_top_reqlens
@@ -837,6 +853,7 @@ mod tests {
             Value::Array(vec![Value::Nil, Value::Nil]),
             Value::Array(vec![Value::from(0u32), Value::from(0u32)]),
             Value::Array(vec![Value::from(9u32), Value::from(9u32)]), // tok_lens past data
+            Value::Array(vec![Value::from(0u64), Value::from(0u64)]), // cached_tokens
         ]);
         let mut header = Vec::new();
         rmpv::encode::write_value(&mut header, &header_arr).unwrap();
@@ -863,6 +880,7 @@ mod tests {
             Value::Array(vec![Value::Nil]),
             Value::Array(vec![Value::from(0u32)]),
             Value::Array(vec![Value::from(1u32)]), // tok_lens: 1 id = 8 bytes
+            Value::Array(vec![Value::from(0u64)]), // cached_tokens
         ]);
         let mut header = Vec::new();
         rmpv::encode::write_value(&mut header, &header_arr).unwrap();
@@ -885,6 +903,7 @@ mod tests {
             Value::Array(vec![Value::Nil]),                   // finish_reasons
             Value::Array(vec![Value::from(1u32)]),            // prompt_tokens
             Value::Array(vec![Value::from(1u32)]),            // tok_lens
+            Value::Array(vec![Value::from(0u64)]),            // cached_tokens
         ]);
         let mut header = Vec::new();
         rmpv::encode::write_value(&mut header, &header_arr).unwrap();
@@ -938,6 +957,7 @@ mod tests {
             Value::Array(vec![Value::Nil, Value::Nil]),             // finish
             arr_u(&[3, 4]),                                         // prompt
             arr_u(&[1, 1]),                                         // tok_lens
+            arr_u(&[0, 0]),                                         // cached_tokens
             arr_u(&[2, 0]),                                         // out_lp_lens
             arr_u(&[0, 0]),                                         // in_lp_lens
             arr_u(&[1, 0]),                                         // out_top_reqlens (req0: 1 pos)
@@ -1011,6 +1031,7 @@ mod tests {
                 Value::Array(vec![Value::Nil, Value::Nil]),             // finish
                 arr_u(&[3, 4]),                                         // prompt
                 arr_u(&[1, 1]),                                         // tok_lens
+                arr_u(&[0, 0]),                                         // cached_tokens
                 arr_u(&[2, 0]),                                         // out_lp_lens (ACTIVE)
                 reqlens.clone(),                                        // in_lp_lens
                 reqlens.clone(),                                        // out_top_reqlens
@@ -1092,6 +1113,7 @@ mod tests {
             Value::Array(vec![Value::Nil]),       // finish
             arr_u(&[9]),                          // prompt
             arr_u(&[1]),                          // tok_lens
+            arr_u(&[0]),                          // cached_tokens
             arr_u(&[2]),                          // out_lp_lens      (2 flat)
             arr_u(&[1]),                          // in_lp_lens       (1 flat)
             arr_u(&[1]),                          // out_top_reqlens  (1 position…
@@ -1165,6 +1187,7 @@ mod tests {
             Value::Array(vec![Value::Nil, Value::Nil]),
             Value::Array(vec![Value::from(0u32), Value::from(0u32)]),
             Value::Array(vec![Value::from(1u32), Value::from(1u32)]),
+            Value::Array(vec![Value::from(0u64), Value::from(0u64)]),
         ]);
         let mut header = Vec::new();
         rmpv::encode::write_value(&mut header, &header_arr).unwrap();

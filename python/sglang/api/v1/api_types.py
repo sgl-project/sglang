@@ -203,6 +203,7 @@ class SamplingParams(msgspec.Struct, kw_only=True, frozen=True):
     sampling_seed: Optional[int] = None
     custom_params: Optional[Any] = None
     beam_width: Optional[int] = None
+    choice: List[str] = []
 
     @classmethod
     def from_json_value(cls, value: Any) -> "SamplingParams":
@@ -239,6 +240,12 @@ class GenerateRequest(msgspec.Struct, kw_only=True, frozen=True):
     mm_hashes: Optional[StringListOrList] = None
     video_data: Optional[MediaInput] = None
     audio_data: Optional[MediaInput] = None
+    lora_path: Optional[str] = None
+    routing_key: Optional[str] = None
+    priority: Optional[int] = None
+    require_reasoning: Optional[bool] = None
+    max_thinking_tokens: Optional[int] = None
+    kv_hints: Optional[KvHintsEnvelope] = None
 
     @classmethod
     def from_json_value(cls, value: Any) -> "GenerateRequest":
@@ -248,6 +255,41 @@ class GenerateRequest(msgspec.Struct, kw_only=True, frozen=True):
     def to_json_value(self) -> Dict[str, Any]:
         """Encode to a JSON-ready value (json.dumps-compatible)."""
         return encode_GenerateRequest(self)
+
+
+class KvHintsEnvelope(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.KvHintsEnvelope: JSON object (unknown keys ignored)."""
+
+    protocol_version: str = ""
+    message_id: str = ""
+    actions: List[KvHintAction] = []
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "KvHintsEnvelope":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_KvHintsEnvelope(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_KvHintsEnvelope(self)
+
+
+class KvHintAction(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.KvHintAction: JSON object (unknown keys ignored)."""
+
+    action_id: str = ""
+    action_type: str = ""
+    action_version: str = ""
+    payload: Optional[Any] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "KvHintAction":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_KvHintAction(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_KvHintAction(self)
 
 
 class LogprobEntry(msgspec.Struct, kw_only=True, frozen=True):
@@ -282,6 +324,7 @@ class GenerateMetaInfo(msgspec.Struct, kw_only=True, frozen=True):
     input_token_ids_logprobs: List[NullableTopLogprobs] = []
     hidden_states: List[HiddenStateRow] = []
     e2e_latency: Optional[float] = None
+    cached_tokens: Optional[int] = None
 
     @classmethod
     def from_json_value(cls, value: Any) -> "GenerateMetaInfo":
@@ -550,6 +593,29 @@ class GetServerInfoResponse(msgspec.Struct, kw_only=True, frozen=True):
     max_total_num_tokens: Optional[int] = None
     version: str = ""
     internal_states: List[Any] = []
+    host: str = ""
+    port: int = 0
+    incremental_streaming_output: bool = False
+    disaggregation_mode: str = ""
+    disaggregation_bootstrap_port: Optional[int] = None
+    node_rank: int = 0
+    nnodes: int = 0
+    dp_size: int = 0
+    dp_rank: Optional[int] = None
+    dist_init_addr: Optional[str] = None
+    base_gpu_id: int = 0
+    page_size: Optional[int] = None
+    dcp_size: int = 0
+    max_running_requests: Optional[int] = None
+    max_prefill_tokens: int = 0
+    enable_dp_attention: bool = False
+    speculative_algorithm: Optional[str] = None
+    enable_hierarchical_cache: bool = False
+    hicache_ratio: Optional[float] = None
+    hicache_size: int = 0
+    hicache_write_policy: Optional[str] = None
+    hicache_host_total_tokens: Optional[int] = None
+    kv_event_sources: List[KvEventSource] = []
 
     @classmethod
     def from_json_value(cls, value: Any) -> "GetServerInfoResponse":
@@ -559,6 +625,24 @@ class GetServerInfoResponse(msgspec.Struct, kw_only=True, frozen=True):
     def to_json_value(self) -> Dict[str, Any]:
         """Encode to a JSON-ready value (json.dumps-compatible)."""
         return encode_GetServerInfoResponse(self)
+
+
+class KvEventSource(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.KvEventSource: JSON object (unknown keys ignored)."""
+
+    dp_rank: int = 0
+    endpoint: str = ""
+    topic: str = ""
+    block_size: int = 0
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "KvEventSource":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_KvEventSource(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_KvEventSource(self)
 
 
 # ---- type aliases: JSON shapes without an object of their own ----
@@ -984,7 +1068,7 @@ def encode_FinishReason(v: FinishReason) -> Any:
     raise TypeError(f"FinishReason: unsupported value {type(v).__name__}")
 
 
-_FIELDS_SamplingParams = ("max_new_tokens", "stop", "stop_token_ids", "stop_regex", "temperature", "top_p", "top_k", "min_p", "frequency_penalty", "presence_penalty", "repetition_penalty", "min_new_tokens", "n", "json_schema", "regex", "ebnf", "structural_tag", "ignore_eos", "skip_special_tokens", "spaces_between_special_tokens", "no_stop_trim", "stream_interval", "logit_bias", "sampling_seed", "custom_params", "beam_width",)
+_FIELDS_SamplingParams = ("max_new_tokens", "stop", "stop_token_ids", "stop_regex", "temperature", "top_p", "top_k", "min_p", "frequency_penalty", "presence_penalty", "repetition_penalty", "min_new_tokens", "n", "json_schema", "regex", "ebnf", "structural_tag", "ignore_eos", "skip_special_tokens", "spaces_between_special_tokens", "no_stop_trim", "stream_interval", "logit_bias", "sampling_seed", "custom_params", "beam_width", "choice",)
 
 
 def decode_SamplingParams(value: Any) -> SamplingParams:
@@ -1043,6 +1127,8 @@ def decode_SamplingParams(value: Any) -> SamplingParams:
             kw["custom_params"] = x
         elif key == "beam_width":
             kw["beam_width"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "choice":
+            kw["choice"] = [] if x is None else [_expect_str(e, expected="a string") for e in _expect_seq(x, expected="a sequence")]
         else:
             raise _unknown_field(key, fields=_FIELDS_SamplingParams)
     return SamplingParams(**kw)
@@ -1101,6 +1187,8 @@ def encode_SamplingParams(v: SamplingParams) -> Dict[str, Any]:
         d["custom_params"] = v.custom_params
     if v.beam_width is not None:
         d["beam_width"] = v.beam_width
+    if v.choice:
+        d["choice"] = list(v.choice)
     return d
 
 
@@ -1152,6 +1240,18 @@ def decode_GenerateRequest(value: Any) -> GenerateRequest:
             kw["video_data"] = None if x is None else decode_MediaInput(x)
         elif key == "audio_data":
             kw["audio_data"] = None if x is None else decode_MediaInput(x)
+        elif key == "lora_path":
+            kw["lora_path"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "routing_key":
+            kw["routing_key"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "priority":
+            kw["priority"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "require_reasoning":
+            kw["require_reasoning"] = None if x is None else _expect_bool(x, expected="a boolean")
+        elif key == "max_thinking_tokens":
+            kw["max_thinking_tokens"] = None if x is None else _expect_uint(x, expected="u64")
+        elif key == "kv_hints":
+            kw["kv_hints"] = None if x is None else decode_KvHintsEnvelope(x)
     return GenerateRequest(**kw)
 
 
@@ -1201,6 +1301,65 @@ def encode_GenerateRequest(v: GenerateRequest) -> Dict[str, Any]:
         d["video_data"] = encode_MediaInput(v.video_data)
     if v.audio_data is not None:
         d["audio_data"] = encode_MediaInput(v.audio_data)
+    if v.lora_path is not None:
+        d["lora_path"] = v.lora_path
+    if v.routing_key is not None:
+        d["routing_key"] = v.routing_key
+    if v.priority is not None:
+        d["priority"] = v.priority
+    if v.require_reasoning is not None:
+        d["require_reasoning"] = v.require_reasoning
+    if v.max_thinking_tokens is not None:
+        d["max_thinking_tokens"] = v.max_thinking_tokens
+    if v.kv_hints is not None:
+        d["kv_hints"] = encode_KvHintsEnvelope(v.kv_hints)
+    return d
+
+
+def decode_KvHintsEnvelope(value: Any) -> KvHintsEnvelope:
+    m = _expect_map(value, expected="struct KvHintsEnvelope")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "protocol_version":
+            kw["protocol_version"] = _expect_str(x, expected="a string")
+        elif key == "message_id":
+            kw["message_id"] = _expect_str(x, expected="a string")
+        elif key == "actions":
+            kw["actions"] = [] if x is None else [decode_KvHintAction(e) for e in _expect_seq(x, expected="a sequence")]
+    return KvHintsEnvelope(**kw)
+
+
+def encode_KvHintsEnvelope(v: KvHintsEnvelope) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["protocol_version"] = v.protocol_version
+    d["message_id"] = v.message_id
+    if v.actions:
+        d["actions"] = [encode_KvHintAction(e) for e in v.actions]
+    return d
+
+
+def decode_KvHintAction(value: Any) -> KvHintAction:
+    m = _expect_map(value, expected="struct KvHintAction")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "action_id":
+            kw["action_id"] = _expect_str(x, expected="a string")
+        elif key == "action_type":
+            kw["action_type"] = _expect_str(x, expected="a string")
+        elif key == "action_version":
+            kw["action_version"] = _expect_str(x, expected="a string")
+        elif key == "payload":
+            kw["payload"] = x
+    return KvHintAction(**kw)
+
+
+def encode_KvHintAction(v: KvHintAction) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["action_id"] = v.action_id
+    d["action_type"] = v.action_type
+    d["action_version"] = v.action_version
+    if v.payload is not None:
+        d["payload"] = v.payload
     return d
 
 
@@ -1303,6 +1462,8 @@ def decode_GenerateMetaInfo(value: Any) -> GenerateMetaInfo:
             kw["hidden_states"] = [] if x is None else [decode_HiddenStateRow(e) for e in _expect_seq(x, expected="a sequence")]
         elif key == "e2e_latency":
             kw["e2e_latency"] = None if x is None else _expect_float(x, expected="f64")
+        elif key == "cached_tokens":
+            kw["cached_tokens"] = None if x is None else _expect_uint(x, expected="u64")
     return GenerateMetaInfo(**kw)
 
 
@@ -1328,6 +1489,8 @@ def encode_GenerateMetaInfo(v: GenerateMetaInfo) -> Dict[str, Any]:
         d["hidden_states"] = [encode_HiddenStateRow(e) for e in v.hidden_states]
     if v.e2e_latency is not None:
         d["e2e_latency"] = float(v.e2e_latency)
+    if v.cached_tokens is not None:
+        d["cached_tokens"] = v.cached_tokens
     return d
 
 
@@ -1749,6 +1912,52 @@ def decode_GetServerInfoResponse(value: Any) -> GetServerInfoResponse:
             kw["version"] = _expect_str(x, expected="a string")
         elif key == "internal_states":
             kw["internal_states"] = [] if x is None else list(_expect_seq(x, expected="a sequence"))
+        elif key == "host":
+            kw["host"] = _expect_str(x, expected="a string")
+        elif key == "port":
+            kw["port"] = _expect_uint(x, expected="u32")
+        elif key == "incremental_streaming_output":
+            kw["incremental_streaming_output"] = _expect_bool(x, expected="a boolean")
+        elif key == "disaggregation_mode":
+            kw["disaggregation_mode"] = _expect_str(x, expected="a string")
+        elif key == "disaggregation_bootstrap_port":
+            kw["disaggregation_bootstrap_port"] = None if x is None else _expect_uint(x, expected="u32")
+        elif key == "node_rank":
+            kw["node_rank"] = _expect_uint(x, expected="u32")
+        elif key == "nnodes":
+            kw["nnodes"] = _expect_uint(x, expected="u32")
+        elif key == "dp_size":
+            kw["dp_size"] = _expect_uint(x, expected="u32")
+        elif key == "dp_rank":
+            kw["dp_rank"] = None if x is None else _expect_uint(x, expected="u32")
+        elif key == "dist_init_addr":
+            kw["dist_init_addr"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "base_gpu_id":
+            kw["base_gpu_id"] = _expect_uint(x, expected="u32")
+        elif key == "page_size":
+            kw["page_size"] = None if x is None else _expect_uint(x, expected="u32")
+        elif key == "dcp_size":
+            kw["dcp_size"] = _expect_uint(x, expected="u32")
+        elif key == "max_running_requests":
+            kw["max_running_requests"] = None if x is None else _expect_uint(x, expected="u64")
+        elif key == "max_prefill_tokens":
+            kw["max_prefill_tokens"] = _expect_uint(x, expected="u64")
+        elif key == "enable_dp_attention":
+            kw["enable_dp_attention"] = _expect_bool(x, expected="a boolean")
+        elif key == "speculative_algorithm":
+            kw["speculative_algorithm"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "enable_hierarchical_cache":
+            kw["enable_hierarchical_cache"] = _expect_bool(x, expected="a boolean")
+        elif key == "hicache_ratio":
+            kw["hicache_ratio"] = None if x is None else _expect_float(x, expected="f64")
+        elif key == "hicache_size":
+            kw["hicache_size"] = _expect_uint(x, expected="u64")
+        elif key == "hicache_write_policy":
+            kw["hicache_write_policy"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "hicache_host_total_tokens":
+            kw["hicache_host_total_tokens"] = None if x is None else _expect_uint(x, expected="u64")
+        elif key == "kv_event_sources":
+            kw["kv_event_sources"] = [] if x is None else [decode_KvEventSource(e) for e in _expect_seq(x, expected="a sequence")]
     return GetServerInfoResponse(**kw)
 
 
@@ -1763,4 +1972,61 @@ def encode_GetServerInfoResponse(v: GetServerInfoResponse) -> Dict[str, Any]:
     d["version"] = v.version
     if v.internal_states:
         d["internal_states"] = list(v.internal_states)
+    d["host"] = v.host
+    d["port"] = v.port
+    d["incremental_streaming_output"] = v.incremental_streaming_output
+    d["disaggregation_mode"] = v.disaggregation_mode
+    if v.disaggregation_bootstrap_port is not None:
+        d["disaggregation_bootstrap_port"] = v.disaggregation_bootstrap_port
+    d["node_rank"] = v.node_rank
+    d["nnodes"] = v.nnodes
+    d["dp_size"] = v.dp_size
+    if v.dp_rank is not None:
+        d["dp_rank"] = v.dp_rank
+    if v.dist_init_addr is not None:
+        d["dist_init_addr"] = v.dist_init_addr
+    d["base_gpu_id"] = v.base_gpu_id
+    if v.page_size is not None:
+        d["page_size"] = v.page_size
+    d["dcp_size"] = v.dcp_size
+    if v.max_running_requests is not None:
+        d["max_running_requests"] = v.max_running_requests
+    d["max_prefill_tokens"] = v.max_prefill_tokens
+    d["enable_dp_attention"] = v.enable_dp_attention
+    if v.speculative_algorithm is not None:
+        d["speculative_algorithm"] = v.speculative_algorithm
+    d["enable_hierarchical_cache"] = v.enable_hierarchical_cache
+    if v.hicache_ratio is not None:
+        d["hicache_ratio"] = float(v.hicache_ratio)
+    d["hicache_size"] = v.hicache_size
+    if v.hicache_write_policy is not None:
+        d["hicache_write_policy"] = v.hicache_write_policy
+    if v.hicache_host_total_tokens is not None:
+        d["hicache_host_total_tokens"] = v.hicache_host_total_tokens
+    if v.kv_event_sources:
+        d["kv_event_sources"] = [encode_KvEventSource(e) for e in v.kv_event_sources]
+    return d
+
+
+def decode_KvEventSource(value: Any) -> KvEventSource:
+    m = _expect_map(value, expected="struct KvEventSource")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "dp_rank":
+            kw["dp_rank"] = _expect_uint(x, expected="u32")
+        elif key == "endpoint":
+            kw["endpoint"] = _expect_str(x, expected="a string")
+        elif key == "topic":
+            kw["topic"] = _expect_str(x, expected="a string")
+        elif key == "block_size":
+            kw["block_size"] = _expect_uint(x, expected="u32")
+    return KvEventSource(**kw)
+
+
+def encode_KvEventSource(v: KvEventSource) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["dp_rank"] = v.dp_rank
+    d["endpoint"] = v.endpoint
+    d["topic"] = v.topic
+    d["block_size"] = v.block_size
     return d

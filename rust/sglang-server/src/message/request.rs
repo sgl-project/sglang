@@ -79,6 +79,12 @@ pub fn into_requests(req: api_v1::GenerateRequest) -> Result<(Vec<GenerateReques
         mm_hashes,
         video_data,
         audio_data,
+        lora_path,
+        routing_key,
+        priority,
+        require_reasoning,
+        max_thinking_tokens,
+        kv_hints,
     } = req;
     let rid = rid.and_then(wire::string_or_list);
     let text = text.and_then(wire::string_or_list);
@@ -296,6 +302,7 @@ pub fn into_requests(req: api_v1::GenerateRequest) -> Result<(Vec<GenerateReques
 
     // Every column above is exactly `n` long, so zip them by value: each
     // request takes ownership of its cell, with no indexing or bounds checks.
+    let kv_hints = kv_hints.map(KvHintsEnvelope::try_from).transpose()?;
     let mut requests: Vec<GenerateRequest> = izip!(
         rids,
         texts,
@@ -334,34 +341,51 @@ pub fn into_requests(req: api_v1::GenerateRequest) -> Result<(Vec<GenerateReques
             image_data,
             video_data,
             audio_data,
-        )| GenerateRequest {
-            rid,
-            text,
-            input_ids,
-            // Plain text prompts keep the post-processor specials; the
-            // chat flow sets this explicitly.
-            skip_special_tokens: false,
-            sampling_params,
-            stream,
-            // Python `GenerateReqInput` defaults.
-            return_logprob: return_logprob.unwrap_or(false),
-            logprob_start_len: logprob_start_len.unwrap_or(-1),
-            top_logprobs_num: top_logprobs_num.unwrap_or(0),
-            // `Some` here means "these ids were requested", so an empty list
-            // collapses to None.
-            token_ids_logprob: token_ids_logprob.filter(|ids| !ids.is_empty()),
-            return_sampling_mask: false, // TODO: port Python's `return_sampling_mask`
-            return_hidden_states: return_hidden_states.unwrap_or(false),
-            return_text_in_logprobs,
-            bootstrap_host,
-            bootstrap_port,
-            bootstrap_room,
-            bootstrap_pair_key,
-            decode_tp_size,
-            routed_dp_rank,
-            disagg_prefill_dp_rank,
-            mm: pack_mm(image_data, video_data, audio_data),
-            mm_buffers: Vec::new(),
+        )| {
+            let mut sampling_params = sampling_params;
+            if let Some(max_thinking_tokens) = max_thinking_tokens {
+                sampling_params
+                    .custom_params
+                    .get_or_insert_default()
+                    .insert(
+                        "thinking_budget".into(),
+                        super::sampling::CustomParamValue::Unsigned(max_thinking_tokens),
+                    );
+            }
+            GenerateRequest {
+                rid,
+                text,
+                input_ids,
+                // Plain text prompts keep the post-processor specials; the
+                // chat flow sets this explicitly.
+                skip_special_tokens: false,
+                sampling_params,
+                stream,
+                // Python `GenerateReqInput` defaults.
+                return_logprob: return_logprob.unwrap_or(false),
+                logprob_start_len: logprob_start_len.unwrap_or(-1),
+                top_logprobs_num: top_logprobs_num.unwrap_or(0),
+                // `Some` here means "these ids were requested", so an empty list
+                // collapses to None.
+                token_ids_logprob: token_ids_logprob.filter(|ids| !ids.is_empty()),
+                return_sampling_mask: false, // TODO: port Python's `return_sampling_mask`
+                return_hidden_states: return_hidden_states.unwrap_or(false),
+                return_text_in_logprobs,
+                bootstrap_host,
+                bootstrap_port,
+                bootstrap_room,
+                bootstrap_pair_key,
+                decode_tp_size,
+                routed_dp_rank,
+                disagg_prefill_dp_rank,
+                lora_id: lora_path.clone(),
+                routing_key: routing_key.clone(),
+                priority,
+                require_reasoning: require_reasoning.unwrap_or(false),
+                kv_hints: kv_hints.clone(),
+                mm: pack_mm(image_data, video_data, audio_data),
+                mm_buffers: Vec::new(),
+            }
         },
     )
     .collect();
@@ -502,6 +526,14 @@ pub struct GenerateRequest {
     /// so these are pure passthrough for the scheduler/LB protocol.
     pub routed_dp_rank: Option<i64>,
     pub disagg_prefill_dp_rank: Option<i64>,
+    /// Scheduler/orchestrator controls forwarded by the native API. `lora_id`
+    /// accepts the preloaded adapter identifier; dynamic LoRA loading remains
+    /// owned by the Python registry and is intentionally not implied here.
+    pub lora_id: Option<String>,
+    pub routing_key: Option<String>,
+    pub priority: Option<i64>,
+    pub require_reasoning: bool,
+    pub kv_hints: Option<KvHintsEnvelope>,
     /// Multimodal inputs. Consumed by the Encoding stage, which ships them to
     /// the MM worker pool; never read by the tokenizer or serialized onto the
     /// scheduler header. Boxed so the common text-only request doesn't grow
@@ -511,6 +543,56 @@ pub struct GenerateRequest {
     /// per-item metadata, already placed inline or in shm. Pushed to the scheduler channel
     /// with the request by [`take_buffers`](Self::take_buffers).
     pub mm_buffers: Vec<Buffer>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct KvHintsEnvelope {
+    protocol_version: String,
+    message_id: String,
+    actions: Vec<KvHintAction>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct KvHintAction {
+    action_id: String,
+    action_type: String,
+    action_version: String,
+    payload: serde_json::Value,
+}
+
+impl TryFrom<api_v1::KvHintsEnvelope> for KvHintsEnvelope {
+    type Error = Error;
+
+    fn try_from(value: api_v1::KvHintsEnvelope) -> Result<Self, Self::Error> {
+        let actions = value
+            .actions
+            .into_iter()
+            .map(|action| {
+                let payload: serde_json::Value = serde_json::from_str(
+                    action.payload.as_deref().unwrap_or("{}"),
+                )
+                .map_err(|error| {
+                    Error::Validation(format!("kv_hints action payload is not JSON: {error}"))
+                })?;
+                if !payload.is_object() {
+                    return Err(Error::Validation(
+                        "kv_hints action payload must be a JSON object".into(),
+                    ));
+                }
+                Ok(KvHintAction {
+                    action_id: action.action_id,
+                    action_type: action.action_type,
+                    action_version: action.action_version,
+                    payload,
+                })
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+        Ok(Self {
+            protocol_version: value.protocol_version,
+            message_id: value.message_id,
+            actions,
+        })
+    }
 }
 
 /// The multimodal fields of one request (see [`GenerateRequest::mm`]), each
@@ -794,28 +876,25 @@ mod tests {
         assert!(ps[0].sampling_params.normalize(false, TEST_VOCAB).is_err());
     }
 
-    /// Unported `GenerateReqInput` fields are IGNORED, not rejected.
+    /// Remaining unported `GenerateReqInput` fields are IGNORED, not rejected.
     ///
     /// These are all real fields on Python's `GenerateReqInput` that this server
     /// has not ported. `deny_unknown_fields` turned every one of them into a 400,
     /// so a client that worked against the Python server broke here — and the
-    /// wire-compat fields (`lora_path`, `image_data`, `return_routed_experts`) had
-    /// to be declared and dropped by hand just to let `bench_serving` through.
+    /// wire-compat fields (`image_data`, `return_routed_experts`) had to be
+    /// declared and dropped by hand just to let `bench_serving` through.
     /// FastAPI's pydantic dataclass drops extras, so ignoring them is the parity
     /// behavior; a typo being silently ignored is the same trade Python makes.
     #[test]
     fn unported_generate_req_input_fields_are_ignored() {
         for field in [
-            r#""priority": 3"#,
             r#""extra_key": "k""#,
             r#""session_id": "s""#,
             r#""session_params": {"a": 1}"#,
             r#""return_sampling_mask": true"#,
             r#""custom_logit_processor": "cls""#,
-            r#""lora_path": "adapter""#,
             r#""image_data": "base64""#,
             r#""return_routed_experts": true"#,
-            r#""bootstrap_host": "h""#,
             // Python has no top-level `n` either, and ignores it just the same.
             r#""n": 1"#,
             r#""totally_made_up": 1"#,
@@ -865,9 +944,9 @@ mod tests {
     }
 
     /// The native `bench_serving` payload (a `GenerateReqInput` superset) parses:
-    /// its `lora_path`/`return_routed_experts` are accepted-but-ignored and a
-    /// `null` `image_data` means "no multimodal input", so `split` succeeds
-    /// while the real fields survive.
+    /// its optional `lora_path` is null, `return_routed_experts` is
+    /// accepted-but-ignored, and a null `image_data` means "no multimodal
+    /// input", so `split` succeeds while the real fields survive.
     #[test]
     fn accepts_bench_serving_payload() {
         let (ps, is_batch) = requests(

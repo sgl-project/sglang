@@ -12,10 +12,15 @@ from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.managers.utils import compute_num_reserved_tokens
 from sglang.srt.runtime_context import (
     get_disagg,
+    get_device,
+    get_memory,
     get_mm,
     get_model,
     get_observability,
+    get_parallel,
+    get_schedule,
     get_serving,
+    get_spec,
 )
 from sglang.version import __version__
 
@@ -52,6 +57,28 @@ def _build_server_args(
         if get_serving().smg_grpc_mode or get_serving().grpc_mode
         else get_serving().grpc_port
     )
+    init_info = scheduler.get_init_info()
+    deployment_info = {
+        "disaggregation_bootstrap_port": get_disagg().disaggregation_bootstrap_port,
+        "node_rank": get_parallel().node_rank,
+        "nnodes": get_parallel().nnodes,
+        "dp_size": get_parallel().num_dp_ranks,
+        "dp_rank": getattr(scheduler, "dp_rank", None),
+        "dist_init_addr": get_parallel().dist_init_addr,
+        "base_gpu_id": get_device().base_gpu_id,
+        "page_size": get_schedule().page_size,
+        "dcp_size": get_parallel().dcp_size,
+        "max_running_requests": get_schedule().max_running_requests,
+        "max_prefill_tokens": get_schedule().max_prefill_tokens,
+        "enable_dp_attention": get_parallel().attn_dp_size > 1,
+        "speculative_algorithm": get_spec().speculative_algorithm,
+        "enable_hierarchical_cache": get_memory().enable_hierarchical_cache,
+        "hicache_ratio": get_memory().hicache_ratio,
+        "hicache_size": get_memory().hicache_size,
+        "hicache_write_policy": get_memory().hicache_write_policy,
+        "hicache_host_total_tokens": init_info.get("hicache_host_total_tokens"),
+        "kv_event_sources": init_info.get("kv_event_sources", []),
+    }
     return ext.ServerArgs(
         model_path=get_model().model_path,
         served_model_name=get_serving().served_model_name,
@@ -106,6 +133,7 @@ def _build_server_args(
         # can serve them statically (no scheduler round-trip).
         version=__version__,
         max_total_num_tokens=scheduler.max_total_num_tokens,
+        deployment_info=json.dumps(deployment_info),
     )
 
 

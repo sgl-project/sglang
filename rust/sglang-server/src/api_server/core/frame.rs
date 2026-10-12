@@ -24,6 +24,7 @@ pub(crate) struct CoreOutput {
     pub(crate) token_ids: TokenIds,
     pub(crate) finish_reason: Option<FinishReason>,
     pub(crate) prompt_tokens: u32,
+    pub(crate) cached_tokens: u64,
     pub(crate) text: String,
     pub(crate) completion_tokens: u64,
     pub(crate) extras: Option<Box<ChunkExtras>>,
@@ -36,6 +37,7 @@ impl From<ChunkEvent> for CoreOutput {
             token_ids,
             finish_reason,
             prompt_tokens,
+            cached_tokens,
             text,
             completion_tokens,
             extras,
@@ -44,6 +46,7 @@ impl From<ChunkEvent> for CoreOutput {
             token_ids,
             finish_reason,
             prompt_tokens,
+            cached_tokens,
             text,
             completion_tokens,
             extras,
@@ -63,6 +66,7 @@ impl CoreOutput {
         self.token_ids.extend_from_slice(&delta.token_ids);
         self.completion_tokens += delta.completion_tokens;
         self.prompt_tokens = delta.prompt_tokens;
+        self.cached_tokens = delta.cached_tokens;
         if delta.finish_reason.is_some() {
             self.finish_reason = delta.finish_reason.clone();
         }
@@ -196,6 +200,7 @@ impl CoreOutput {
             completion_tokens: self.completion_tokens,
             finish_reason: self.finish_reason.as_ref().map(finish_reason),
             e2e_latency,
+            cached_tokens: Some(self.cached_tokens),
             ..Default::default()
         };
         let Some(extras) = self.extras.as_deref() else {

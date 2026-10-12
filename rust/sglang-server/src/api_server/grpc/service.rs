@@ -307,6 +307,7 @@ mod tests {
             token_ids: vec![token_id],
             finish_reason: finished.then(stop_reason),
             prompt_tokens: 3,
+            cached_tokens: 0,
             text: text.into(),
             completion_tokens: 1,
             extras: None,

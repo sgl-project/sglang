@@ -304,6 +304,10 @@ pub struct SamplingParams {
     /// the number of returned sequences (n \<= beam_width).
     #[prost(int64, optional, tag = "26")]
     pub beam_width: ::core::option::Option<i64>,
+    /// Literal alternatives. The server lowers these to an escaped regex before
+    /// grammar compilation, matching the legacy native gRPC contract.
+    #[prost(string, repeated, tag = "27")]
+    pub choice: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 /// (message_json).unknown_fields defaults to IGNORE — stated here as schema
 /// intent, load-bearing for client compat.
@@ -363,6 +367,43 @@ pub struct GenerateRequest {
     pub video_data: ::core::option::Option<MediaInput>,
     #[prost(message, optional, tag = "22")]
     pub audio_data: ::core::option::Option<MediaInput>,
+    /// Orchestrator controls used by native gRPC clients such as Dynamo. These
+    /// are scalar per RPC item today; batch callers that need distinct values
+    /// should issue one Generate RPC per item.
+    #[prost(string, optional, tag = "23")]
+    pub lora_path: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "24")]
+    pub routing_key: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(int64, optional, tag = "26")]
+    pub priority: ::core::option::Option<i64>,
+    #[prost(bool, optional, tag = "27")]
+    pub require_reasoning: ::core::option::Option<bool>,
+    #[prost(uint64, optional, tag = "28")]
+    pub max_thinking_tokens: ::core::option::Option<u64>,
+    #[prost(message, optional, tag = "29")]
+    pub kv_hints: ::core::option::Option<KvHintsEnvelope>,
+}
+/// Versioned KV-hint envelope forwarded from a trusted orchestrator. Action
+/// payloads are JSON because each action type owns its own schema.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct KvHintsEnvelope {
+    #[prost(string, tag = "1")]
+    pub protocol_version: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub message_id: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "3")]
+    pub actions: ::prost::alloc::vec::Vec<KvHintAction>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct KvHintAction {
+    #[prost(string, tag = "1")]
+    pub action_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub action_type: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub action_version: ::prost::alloc::string::String,
+    #[prost(string, optional, tag = "4")]
+    pub payload: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SamplingParamsOrList {
@@ -453,6 +494,11 @@ pub struct GenerateMetaInfo {
     /// on the terminal frame.
     #[prost(double, optional, tag = "12")]
     pub e2e_latency: ::core::option::Option<f64>,
+    /// Prompt tokens served from the prefix cache. Present on scheduler frames,
+    /// including zero, so callers can distinguish "no cache hit" from an older
+    /// server that does not report the metric.
+    #[prost(uint64, optional, tag = "13")]
+    pub cached_tokens: ::core::option::Option<u64>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct GenerateResponse {
@@ -691,7 +737,7 @@ pub struct GetModelInfoResponse {
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct GetServerInfoRequest {}
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct GetServerInfoResponse {
     #[prost(string, tag = "1")]
     pub model_path: ::prost::alloc::string::String,
@@ -711,4 +757,62 @@ pub struct GetServerInfoResponse {
     /// passes them through verbatim.
     #[prost(string, repeated, tag = "7")]
     pub internal_states: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Deployment/discovery metadata required by out-of-process orchestrators.
+    #[prost(string, tag = "8")]
+    pub host: ::prost::alloc::string::String,
+    #[prost(uint32, tag = "9")]
+    pub port: u32,
+    #[prost(bool, tag = "10")]
+    pub incremental_streaming_output: bool,
+    #[prost(string, tag = "11")]
+    pub disaggregation_mode: ::prost::alloc::string::String,
+    #[prost(uint32, optional, tag = "12")]
+    pub disaggregation_bootstrap_port: ::core::option::Option<u32>,
+    #[prost(uint32, tag = "13")]
+    pub node_rank: u32,
+    #[prost(uint32, tag = "14")]
+    pub nnodes: u32,
+    #[prost(uint32, tag = "15")]
+    pub dp_size: u32,
+    #[prost(uint32, optional, tag = "16")]
+    pub dp_rank: ::core::option::Option<u32>,
+    #[prost(string, optional, tag = "17")]
+    pub dist_init_addr: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(uint32, tag = "18")]
+    pub base_gpu_id: u32,
+    #[prost(uint32, optional, tag = "19")]
+    pub page_size: ::core::option::Option<u32>,
+    #[prost(uint32, tag = "20")]
+    pub dcp_size: u32,
+    #[prost(uint64, optional, tag = "21")]
+    pub max_running_requests: ::core::option::Option<u64>,
+    #[prost(uint64, tag = "22")]
+    pub max_prefill_tokens: u64,
+    #[prost(bool, tag = "23")]
+    pub enable_dp_attention: bool,
+    #[prost(string, optional, tag = "24")]
+    pub speculative_algorithm: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(bool, tag = "25")]
+    pub enable_hierarchical_cache: bool,
+    #[prost(double, optional, tag = "26")]
+    pub hicache_ratio: ::core::option::Option<f64>,
+    #[prost(uint64, tag = "27")]
+    pub hicache_size: u64,
+    #[prost(string, optional, tag = "28")]
+    pub hicache_write_policy: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(uint64, optional, tag = "29")]
+    pub hicache_host_total_tokens: ::core::option::Option<u64>,
+    #[prost(message, repeated, tag = "30")]
+    pub kv_event_sources: ::prost::alloc::vec::Vec<KvEventSource>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct KvEventSource {
+    #[prost(uint32, tag = "1")]
+    pub dp_rank: u32,
+    #[prost(string, tag = "2")]
+    pub endpoint: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub topic: ::prost::alloc::string::String,
+    #[prost(uint32, tag = "4")]
+    pub block_size: u32,
 }

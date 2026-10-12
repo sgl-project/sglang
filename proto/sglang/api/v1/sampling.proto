@@ -97,4 +97,7 @@ message SamplingParams {
   // beam_width > 1 turns the request into a beam search request; `n` is then
   // the number of returned sequences (n <= beam_width).
   optional int64 beam_width = 26;
+  // Literal alternatives. The server lowers these to an escaped regex before
+  // grammar compilation, matching the legacy native gRPC contract.
+  repeated string choice = 27;
 }

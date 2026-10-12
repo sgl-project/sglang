@@ -53,6 +53,32 @@ message GenerateRequest {
   optional StringListOrList mm_hashes = 20;
   optional MediaInput video_data = 21;
   optional MediaInput audio_data = 22;
+
+  // Orchestrator controls used by native gRPC clients such as Dynamo. These
+  // are scalar per RPC item today; batch callers that need distinct values
+  // should issue one Generate RPC per item.
+  optional string lora_path = 23;
+  optional string routing_key = 24;
+  reserved 25; // Trace-parent extraction is not implemented by the Rust frontend yet.
+  optional int64 priority = 26;
+  optional bool require_reasoning = 27;
+  optional uint64 max_thinking_tokens = 28;
+  optional KvHintsEnvelope kv_hints = 29;
+}
+
+// Versioned KV-hint envelope forwarded from a trusted orchestrator. Action
+// payloads are JSON because each action type owns its own schema.
+message KvHintsEnvelope {
+  string protocol_version = 1;
+  string message_id = 2;
+  repeated KvHintAction actions = 3;
+}
+
+message KvHintAction {
+  string action_id = 1;
+  string action_type = 2;
+  string action_version = 3;
+  optional string payload = 4 [(sglang.json.v1.field_json).raw_json = true];
 }
 
 message SamplingParamsOrList {
@@ -122,6 +148,10 @@ message GenerateMetaInfo {
   // Seconds from normalized-request acceptance to the terminal output; only
   // on the terminal frame.
   optional double e2e_latency = 12;
+  // Prompt tokens served from the prefix cache. Present on scheduler frames,
+  // including zero, so callers can distinguish "no cache hit" from an older
+  // server that does not report the metric.
+  optional uint64 cached_tokens = 13;
 }
 
 message GenerateResponse {

@@ -40,12 +40,10 @@ wire_struct! {
         return_indexer_topk: bool,
         session_id: (),
         session_params: (),
-        lora_id: (),
+        lora_id: Option<&'a str>,
         custom_logit_processor: (),
         positional_embed_overrides: (),
-        /// PD-disaggregation block — the last fields emitted; everything after
-        /// `disagg_prefill_dp_rank` in Python has a msgspec default and is
-        /// omitted (short arrays decode with defaulted tails).
+        /// PD-disaggregation block.
         bootstrap_host: Option<&'a str>,
         bootstrap_port: Option<i64>,
         bootstrap_room: Option<i64>,
@@ -53,6 +51,21 @@ wire_struct! {
         decode_tp_size: Option<i64>,
         routed_dp_rank: Option<i64>,
         disagg_prefill_dp_rank: Option<i64>,
+        routing_key: Option<&'a str>,
+        require_reasoning: bool,
+        priority: Option<i64>,
+        extra_key: (),
+        no_logs: bool,
+        return_bytes: bool,
+        return_entropy: bool,
+        need_wait_for_mm_inputs: (),
+        num_items_assigned: (),
+        encoder_urls: (),
+        multi_item_delimiter_indices: (),
+        token_indices_to_pool: (),
+        time_stats: (),
+        cache_salt: (),
+        kv_hints: Option<&'a super::request::KvHintsEnvelope>,
     }
 }
 
@@ -104,7 +117,7 @@ impl<'a> From<&'a GenerateRequest> for TokenizedGenerateReqInput<'a> {
             return_indexer_topk: false,
             session_id: (),
             session_params: (),
-            lora_id: (),
+            lora_id: req.lora_id.as_deref(),
             custom_logit_processor: (),
             positional_embed_overrides: (),
             bootstrap_host: req.bootstrap_host.as_deref(),
@@ -114,6 +127,21 @@ impl<'a> From<&'a GenerateRequest> for TokenizedGenerateReqInput<'a> {
             decode_tp_size: req.decode_tp_size,
             routed_dp_rank: req.routed_dp_rank,
             disagg_prefill_dp_rank: req.disagg_prefill_dp_rank,
+            routing_key: req.routing_key.as_deref(),
+            require_reasoning: req.require_reasoning,
+            priority: req.priority,
+            extra_key: (),
+            no_logs: false,
+            return_bytes: false,
+            return_entropy: false,
+            need_wait_for_mm_inputs: (),
+            num_items_assigned: (),
+            encoder_urls: (),
+            multi_item_delimiter_indices: (),
+            token_indices_to_pool: (),
+            time_stats: (),
+            cache_salt: (),
+            kv_hints: req.kv_hints.as_ref(),
         }
     }
 }
@@ -180,9 +208,8 @@ mod tests {
         let bytes = TokenizedGenerateReqInput::from(&req).encode().unwrap();
         let val = rmpv::decode::read_value(&mut &bytes[..]).unwrap();
         let arr = val.as_array().expect("array");
-        // msgspec requires >= 14 (through `stream`); we emit 32 (through
-        // `disagg_prefill_dp_rank`). Trailing defaulted fields are omitted.
-        assert_eq!(arr.len(), 32, "header ends at disagg_prefill_dp_rank");
+        // The orchestrator controls extend the array through `kv_hints`.
+        assert_eq!(arr.len(), 47, "header ends at kv_hints");
         assert_eq!(arr[0].as_str(), Some("TokenizedGenerateReqInput"));
         assert_eq!(arr[1].as_str(), Some("r1"));
         assert!(arr[5].is_nil(), "idx 5 must be input_embeds (nil)");
