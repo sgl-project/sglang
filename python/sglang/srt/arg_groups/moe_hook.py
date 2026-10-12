@@ -360,6 +360,11 @@ def handle_a2a_moe(server_args: Any):
                 "Remove --enforce-shared-experts-fusion when using "
                 "--moe-a2a-backend deepep_v2."
             )
+        if cfg.deepep_v2_mode == "direct" and cfg.nnodes > 1:
+            raise ValueError(
+                "--deepep-v2-mode direct is NVLink-only and cannot run across "
+                f"nodes (nnodes={cfg.nnodes}); pass --deepep-v2-mode hybrid."
+            )
         # Prefill reads host counts and is not graph-capturable.
         declare_resolution(
             server_args,
@@ -542,13 +547,17 @@ def validate_deepep_v2_speculative_draft(server_args: Any) -> None:
 
 
 def required_deepep_v2_prefill_tokens_per_rank(server_args: Any) -> int:
-    """Largest prefill dispatch on one rank, after model-specific sharding."""
+    """Largest prefill dispatch on one rank, after topology and model sharding."""
     view = resolved_view(server_args)
-    tokens = max_prefill_buffer_tokens(server_args) or (view.max_prefill_tokens or 0)
+    ceiling = max_prefill_buffer_tokens(server_args) or (view.max_prefill_tokens or 0)
+    # A per-DP chunk is scattered across tp_size // attn_dp_size ranks before
+    # dispatch, so that is the per-EP-rank divisor (pure TP scatters across all).
+    scatter_ranks = max(1, view.tp_size // view.attn_dp_size)
     return model_deepep_v2_prefill_dispatch_tokens(
         hf_config=model_config_of(server_args).hf_config,
         cfg=view,
-        default_tokens=tokens,
+        ceiling=ceiling,
+        default_tokens=-(-ceiling // scatter_ranks),
     )
 
 
