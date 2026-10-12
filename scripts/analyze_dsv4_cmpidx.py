@@ -416,6 +416,41 @@ def _idxin_miss_index(reqs):
     return scores.index(max(scores))
 
 
+def _idxin_req_len(rows):
+    """``(max prefill slq, max slk)`` of one request's [IDXIN] rows (or -1)."""
+    slq = max((_seq_max(r.get("slq")) for r in rows), default=-1)
+    slk = max((_seq_max(r.get("slk")) for r in rows), default=-1)
+    return slq, slk
+
+
+def _idxin_same_len_hits(reqs, miss_i):
+    """HIT request indices whose prompt length matches the MISS (slq/slk).
+
+    The MISS is the largest-prefill request, so a HIT that reports the SAME
+    ``slq`` (prompt length) -- or the same ``slk`` (context length, the suffix
+    continuation) -- is the cache-hit of the SAME sequence, i.e. the only fair
+    knorm comparison.  Picking the FIRST HITs instead pairs the MISS with
+    unrelated short prompts and yields a false ``CONTENT/WINDOW``.
+
+    Returns ``(hit_indices, miss_slq, miss_slk)``; ``hit_indices`` is empty when
+    no HIT shares the MISS length (caller then falls back to all HITs).
+    """
+    miss_slq, miss_slk = _idxin_req_len(reqs[miss_i])
+    if miss_slq <= 0 and miss_slk <= 0:
+        return [], miss_slq, miss_slk
+    hits = []
+    for j, g in enumerate(reqs):
+        if j == miss_i:
+            continue
+        h_slq, h_slk = _idxin_req_len(g)
+        if h_slq <= 0 and h_slk <= 0:
+            continue
+        if (h_slq == miss_slq or h_slk == miss_slq
+                or h_slq == miss_slk or h_slk == miss_slk):
+            hits.append(j)
+    return hits, miss_slq, miss_slk
+
+
 def _distinct_km(group):
     """Distinct ``(klog, kpg)`` tuples of one request, sorted."""
     return sorted({(r.get("klog", "?"), r.get("kpg", "?")) for r in group}, key=str)
@@ -609,6 +644,14 @@ def report_idxin_rope(rows, knorm_tol=0.05):
       * ``knorm`` equal & ``klog`` differs       -> ``ROPE-PHASE`` (the sole
         remaining difference is the RoPE phase the kernel applies)
 
+    Pairing rule (the fix): the MISS (largest prefill) is compared against the
+    HIT request(s) whose ``slq``/``slk`` MATCHES the MISS -- i.e. the cache-hit
+    of the SAME sequence.  Pairing the MISS with the FIRST HITs (different, short
+    prompts) forces a false ``CONTENT/WINDOW``.  When no HIT shares the length we
+    fall back to all HITs and SAY SO.  A per-absolute-block knorm comparison is
+    NOT derivable (``knorm`` is a whole-request mean); the whole-request same-slq
+    comparison is used and that fact is printed.
+
     Also prints the ``shift`` = ``abs - loc`` (the phase error: 0 for the MISS,
     ``start_pos // cmp_ratio`` for a suffix HIT).  Additive / read-only.
     """
@@ -625,8 +668,26 @@ def report_idxin_rope(rows, knorm_tol=0.05):
         shifts.append(sorted({_rope_shift(r.get("ropephase")) for r in g
                               if _rope_shift(r.get("ropephase")) is not None}))
         phases.append(sorted({r.get("ropephase") for r in g if r.get("ropephase")}))
-    print(f"  [IDXIN-ROPE] MISS=req{miss_i} (largest prefill slq); "
+
+    # Pair the MISS with the HIT(s) of the SAME prompt length (cache-hit of the
+    # SAME sequence), NOT the first HITs.  Only that comparison is meaningful:
+    # short unrelated HITs have a different window and would fake CONTENT/WINDOW.
+    same_hits, miss_slq, miss_slk = _idxin_same_len_hits(reqs, miss_i)
+    if same_hits:
+        hit_idx = same_hits
+        pairing_txt = f"same-slq/slk HIT(s)={same_hits}"
+    else:
+        hit_idx = [j for j in range(len(reqs)) if j != miss_i]
+        pairing_txt = "no same-slq HIT -> fallback to all HITs (lengths differ)"
+    hit_len_txt = ",".join(str(s) for s in sorted({_idxin_req_len(reqs[j])[0]
+                                                   for j in hit_idx}))
+
+    print(f"  [IDXIN-ROPE] MISS=req{miss_i} (largest prefill slq={miss_slq}); "
           f"{len(reqs) - 1} HIT request(s)  knorm_tol={knorm_tol}")
+    print(f"  [IDXIN-ROPE] pairing: {pairing_txt}  miss_slk={miss_slk} "
+          f"hit_slq={hit_len_txt}")
+    print("  [IDXIN-ROPE] note: per-block knorm not derivable (knorm is a "
+          "whole-request mean); using whole-request same-slq comparison")
     for i, _g in enumerate(reqs[:MAX_REQ_SHOWN]):
         role = "MISS" if i == miss_i else "HIT "
         kmeans = [_knorm_mean(v) for v in knorms[i]]
@@ -639,10 +700,9 @@ def report_idxin_rope(rows, knorm_tol=0.05):
     miss_kn = [m for m in (_knorm_mean(v) for v in knorms[miss_i])
                if m is not None]
     hit_kn = []
-    for j, kn in enumerate(knorms):
-        if j == miss_i:
-            continue
-        hit_kn += [m for m in (_knorm_mean(v) for v in kn) if m is not None]
+    for j in hit_idx:
+        hit_kn += [m for m in (_knorm_mean(v) for v in knorms[j])
+                   if m is not None]
     knorm_cmp, rel = _knorm_verdict(miss_kn, hit_kn, knorm_tol)
     klog_diff = _idxin_comp_differs(rows)
     if knorm_cmp == "CONTENT/WINDOW":
@@ -654,7 +714,8 @@ def report_idxin_rope(rows, knorm_tol=0.05):
     else:
         verdict = "SAME"
     rel_txt = "na" if rel is None else f"{rel:.3e}"
-    print(f"[IDXIN-ROPE] miss_knorm={miss_kn[:4]} hit_knorm={hit_kn[:4]} "
+    print(f"[IDXIN-ROPE] miss_slq={miss_slq} miss_knorm={miss_kn[:4]} "
+          f"hit_slq={hit_len_txt} hit_knorm={hit_kn[:4]} "
           f"maxrel={rel_txt} knorm_same={knorm_cmp != 'CONTENT/WINDOW'} "
           f"klog_diff={klog_diff} => {verdict}")
 
@@ -1429,7 +1490,10 @@ def _selftest():
     then asserts both the raw parse and the printed verdict strings.  ALSO builds
     two synthetic logs WITHOUT any [CMPIDX] (the ">2 requests" fallback path) and
     asserts the ``(mode,slq,slk)`` stream split reaches both the ROPE-PHASE and
-    the CONTENT/WINDOW [IDXIN-ROPE] branches.
+    the CONTENT/WINDOW [IDXIN-ROPE] branches.  Finally, TWO same-slq-pairing
+    cases: C1 has a same-slq HIT (knorm ~equal) and asserts the MISS is paired
+    with THAT HIT (ROPE-PHASE, not a false CONTENT/WINDOW from the first short
+    HITs); C2 has NO same-slq HIT and asserts the fallback is stated.
     """
     import contextlib
     import io
@@ -1439,10 +1503,11 @@ def _selftest():
     kpg_a = "n=8,first=[3, 5, 7, 9],last=[11, 13, 15, 17]"
     kpg_b = "n=8,first=[1, 2, 3, 4],last=[5, 6, 7, 8]"
 
-    def _idxin(ly, slq, klog, kpg, knorm="1.0:100:64", shift=0, npb=100):
+    def _idxin(ly, slq, klog, kpg, knorm="1.0:100:64", shift=0, npb=100,
+               slk=17523):
         return (
             f"[IDXIN] layer={ly} mode=1 qblk=[0:aa] wblk=[0:bb] "
-            f"slq=({slq},{slq},1) slk=(17523,17523,1) klog={klog} kpg={kpg} "
+            f"slq=({slq},{slq},1) slk=({slk},{slk},1) klog={klog} kpg={kpg} "
             f"knorm={knorm} ropephase=r=4,sps=[{shift * 4}],shift=[{shift}],"
             f"npb=[{npb}],loc=[0..{npb - 1}],abs=[{shift}..{shift + npb - 1}] "
             f"kraw=kk meta=mm bt=tt qshape=(1,2,3) wshape=(1,2,3) "
@@ -1507,6 +1572,22 @@ def _selftest():
             _idxin(5, 17523, "aaaa", kpg_a, knorm="1.0:100:64", shift=0),
             _idxin(5, 1139, "aaaa", kpg_a, knorm="2.0:100:64", shift=4096),
         ]
+        # C1: a same-slq HIT EXISTS (knorm ~equal, 198.935 vs 199.0) -> must pair
+        #     the MISS with THAT HIT and print ROPE-PHASE -- NOT with the first,
+        #     short-slq HITs (knorm 6.7/12.7) which would fake CONTENT/WINDOW.
+        same_slq = [
+            _idxin(5, 17523, "aaaa", kpg_a, knorm="198.935:100:64", shift=0),
+            _idxin(5, 10, "xx", kpg_a, knorm="6.71568:100:64", shift=1, slk=10),
+            _idxin(5, 12, "yy", kpg_a, knorm="12.7265:100:64", shift=1, slk=12),
+            _idxin(5, 17523, "bbbb", kpg_a, knorm="199.0:100:64",
+                   shift=4380, slk=17523),
+        ]
+        # C2: NO same-slq HIT -> fall back to all HITs AND SAY SO; knorm equal
+        #     -> still ROPE-PHASE (the fallback is stated, not silent).
+        no_same_slq = [
+            _idxin(5, 17523, "aaaa", kpg_a, knorm="198.935:100:64", shift=0),
+            _idxin(5, 10, "xx", kpg_a, knorm="198.935:100:64", shift=1, slk=10),
+        ]
 
         def _run_nocmp(src_lines):
             """Parse + report a synthetic no-[CMPIDX] log; return (rows, out)."""
@@ -1529,6 +1610,8 @@ def _selftest():
 
         b1_rows, b1_out = _run_nocmp(nocmp_rope)
         b2_rows, b2_out = _run_nocmp(nocmp_content)
+        c1_rows, c1_out = _run_nocmp(same_slq)
+        c2_rows, c2_out = _run_nocmp(no_same_slq)
         b1_reqs = _idxin_requests(b1_rows)
         b2_reqs = _idxin_requests(b2_rows)
 
@@ -1573,6 +1656,18 @@ def _selftest():
              "=> ROPE-PHASE" in b1_out),
             ("[IDXIN-ROPE] fallback CONTENT/WINDOW branch",
              "=> CONTENT/WINDOW" in b2_out),
+            ("[IDXIN-ROPE] same-slq HIT paired (not the first HITs)",
+             "same-slq/slk HIT(s)=[3]" in c1_out
+             and "hit_slq=17523" in c1_out
+             and "miss_slq=17523" in c1_out),
+            ("[IDXIN-ROPE] same-slq HIT -> ROPE-PHASE (fix)",
+             "miss_knorm=[198.935]" in c1_out and "hit_knorm=[199" in c1_out
+             and "=> ROPE-PHASE" in c1_out
+             and "=> CONTENT/WINDOW" not in c1_out),
+            ("[IDXIN-ROPE] no-same-slq fallback is STATED",
+             "no same-slq HIT" in c2_out),
+            ("[IDXIN-ROPE] no-same-slq fallback still ROPE-PHASE",
+             "=> ROPE-PHASE" in c2_out),
             ("[IDXIN-ROPE] per-request knorm+ropephase printed",
              "knorm[" in b1_out and "ropephase[" in b1_out),
         ]
