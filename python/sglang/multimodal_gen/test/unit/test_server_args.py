@@ -43,6 +43,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     LTX23PipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
+    FastH3PipelineConfig,
     MiniMaxH3PipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
@@ -93,6 +94,7 @@ from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
+from sglang.multimodal_gen.runtime.platforms.interface import DeviceCapability
 from sglang.multimodal_gen.runtime.server_args import (
     MAX_SCHEDULER_RPC_TIMEOUT_S,
     ServerArgs,
@@ -399,6 +401,46 @@ class TestServerArgsPathExpansion(_CudaPlatformTestCase):
         )
 
         self.assertFalse(args.is_component_attention_backend_automatic("text_encoder"))
+
+    def _fasth3_args(self, capability=(9, 0), **kwargs):
+        with patch(
+            "sglang.multimodal_gen.runtime.platforms.current_platform.get_device_capability",
+            return_value=DeviceCapability(*capability),
+        ):
+            return _from_dict_without_model_resolution(
+                {"model_path": "FastVideo/FastVideo-FastH3-8-Step-V2", **kwargs},
+                pipeline_config=FastH3PipelineConfig(),
+            )
+
+    def test_fasth3_selects_vsa_h3_for_the_transformer(self):
+        for capability in ((9, 0), (10, 0), (10, 3)):
+            with self.subTest(capability=capability):
+                args = self._fasth3_args(capability)
+                self.assertEqual(
+                    args.component_attention_backends,
+                    {"transformer": "video_sparse_attn_h3"},
+                )
+                self.assertTrue(
+                    args.is_component_attention_backend_automatic("transformer")
+                )
+
+    def test_fasth3_keeps_a_requested_or_incompatible_transformer_backend(self):
+        cases = (
+            ({"component_attention_backends": {"transformer": "fa"}}, (9, 0)),
+            ({"attention_backend": "fa"}, (9, 0)),
+            ({"enable_torch_compile": True}, (9, 0)),
+            ({}, (8, 0)),
+        )
+        for kwargs, capability in cases:
+            with self.subTest(kwargs=kwargs, capability=capability):
+                args = self._fasth3_args(capability, **kwargs)
+                self.assertEqual(
+                    args.component_attention_backends,
+                    kwargs.get("component_attention_backends", {}),
+                )
+                self.assertFalse(
+                    args.is_component_attention_backend_automatic("transformer")
+                )
 
     def test_invalid_component_attention_backend_raises(self):
         with self.assertRaises(ValueError):
