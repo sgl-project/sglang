@@ -68,6 +68,19 @@ class TestAdmissionSkipReason(CustomTestCase):
         )
         self.assertFalse(self._admit(s))
 
+    def test_no_req_slot_counts_the_given_running_batch(self):
+        # Under PP each micro-batch passes its own running batch, which is
+        # not self.running_batch.
+        s = self._scheduler(waiting=1, free_slots=0)
+        s.running_batch = ScheduleBatch(reqs=[])
+        mb_running_batch = ScheduleBatch(
+            reqs=[SimpleNamespace(rid=f"running-{i}") for i in range(3)]
+        )
+        s.admission_skip_reason(mb_running_batch)
+        call = s.get_num_allocatable_reqs.call_args
+        self.assertEqual(call.args, (3,))
+        self.assertIs(call.kwargs.get("running_batch"), mb_running_batch)
+
     def test_priority_preemption_attempts_without_free_slots(self):
         s = self._scheduler(waiting=1, free_slots=0)
         s.enable_priority_preemption = True
