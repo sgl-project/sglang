@@ -462,7 +462,8 @@ class HiSparseSpecSwapManager:
             host_locs.flatten(), destination_locs.flatten()
         )
 
-        mapping[verify_cache_locs] = 0
+        # Scalar indexed assignment performs a blocking CPU-to-CUDA copy.
+        mapping.index_fill_(0, verify_cache_locs, 0)
         mapping[canonical_locs] = torch.where(cache_mask, cache_locs, 0)
         coordinator.req_device_buffer_tokens[:, req_pool_indices, cache_positions] = (
             torch.where(

@@ -239,6 +239,12 @@ class TestHiSparseSpecCoordinator(CustomTestCase):
                         idx is not None and idx.dtype == torch.bool for idx in args[1]
                     ):
                         raise AssertionError("Dynamically sized boolean indexing")
+                if func == torch.ops.aten.index_put_.default:
+                    value = args[2]
+                    if value.device.type == "cpu" and value.ndim == 0:
+                        raise AssertionError(
+                            "Blocking CPU scalar copy in CUDA index_put"
+                        )
                 return func(*args, **(kwargs or {}))
 
         with (
