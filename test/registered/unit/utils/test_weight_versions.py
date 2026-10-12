@@ -1,11 +1,11 @@
 import random
 import unittest
-from collections import deque
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.scheduler import Scheduler, _make_abort_req
+from sglang.srt.managers.scheduler_components.inflight_queue import InflightQueue
 from sglang.srt.utils.weight_versions import (
     WeightVersionEvent,
     WeightVersionSpan,
@@ -310,7 +310,7 @@ class _SchedulerStub:
     ):
         self.serving = _ServingStub(version)
         self.enable_continuous_input_polling = False
-        self.result_queue = deque()
+        self.inflight_steps = InflightQueue(depth=1)
         self.running_batch = SimpleNamespace(reqs=running)
         self.last_batch = last_batch
         self.waiting_queue = waiting

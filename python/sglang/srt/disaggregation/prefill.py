@@ -23,7 +23,6 @@ import hashlib
 import logging
 import time
 from array import array
-from collections import deque
 from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional
 
@@ -742,7 +741,9 @@ class SchedulerDisaggregationPrefillMixin:
         self.enable_continuous_input_polling = (
             self._is_continuous_input_polling_enabled()
         )
-        self.result_queue = deque()
+        self.inflight_steps = InflightQueue(
+            depth=1, blocking=not self.enable_continuous_input_polling
+        )
         batch_result_completion_status = torch.empty(1, dtype=torch.int32, device="cpu")
         # True when intake repeats while the oldest batch result is unfinished.
         waiting_for_batch_result = False
@@ -772,7 +773,7 @@ class SchedulerDisaggregationPrefillMixin:
 
             # Keep at most two batches in flight.
             if (
-                len(self.result_queue) < 2
+                self.inflight_steps.can_launch()
                 and not self.gracefully_exit
                 and not self._deferred_input_requests
                 and not skip_batch_creation
@@ -799,14 +800,15 @@ class SchedulerDisaggregationPrefillMixin:
                         self.maybe_prefetch_staging_for_batch(batch)
                     batch_result = self.run_batch(batch)
                     self._apply_war_barrier()
-                    self.result_queue.append((batch.copy(), batch_result))
+                    self.inflight_steps.push(batch.copy(), batch_result)
                 else:
                     batch_result = None
 
-            if self.last_batch:
-                if self.enable_continuous_input_polling:
+            self._debug_check_commit_gate(self.last_batch is not None)
+            if self.inflight_steps.has_due():
+                if not self.inflight_steps.blocking:
                     # Resume intake until the oldest result is ready on all TP ranks.
-                    oldest_batch_result = self.result_queue[0][1]
+                    oldest_batch_result = self.inflight_steps.head().result
                     if (
                         not self.gracefully_exit
                         and not self.is_disagg_prefill_batch_result_ready(
@@ -817,8 +819,7 @@ class SchedulerDisaggregationPrefillMixin:
                         self._yield_gil_if_needed()
                         continue
                 # Process the oldest batch result.
-                oldest_batch, oldest_batch_result = self.result_queue.popleft()
-                self.process_batch_result(oldest_batch, oldest_batch_result)
+                self._commit_due_step()
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.on_idle()
@@ -832,6 +833,8 @@ class SchedulerDisaggregationPrefillMixin:
             # Update last_batch and scheduler status
             self._sched_idled = batch is None
             self.last_batch = batch
+            self.inflight_steps.end_step(batch)
+            self._debug_check_last_launched()
             waiting_for_batch_result = False
 
     def is_disagg_prefill_batch_result_ready(

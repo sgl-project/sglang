@@ -23,7 +23,6 @@ from __future__ import annotations
 import hashlib
 import logging
 import time
-from collections import deque
 from concurrent.futures import Future
 from dataclasses import dataclass
 from http import HTTPStatus
@@ -3031,12 +3030,8 @@ class SchedulerDisaggregationDecodeMixin:
 
     @torch.no_grad()
     def event_loop_overlap_disagg_decode(self: Scheduler):
-        self.result_queue = deque()
+        self.inflight_steps = InflightQueue(depth=1)
         self.last_batch: Optional[ScheduleBatch] = None
-
-        def pop_and_process():
-            tmp_batch, tmp_result = self.result_queue.popleft()
-            self.process_batch_result(tmp_batch, tmp_result)
 
         while True:
             if self.gracefully_exit:
@@ -3068,22 +3063,24 @@ class SchedulerDisaggregationDecodeMixin:
                 batch, last_batch=self.last_batch
             )
 
-            if disable_overlap_for_batch and self.last_batch:
-                pop_and_process()
+            if disable_overlap_for_batch and self.inflight_steps.has_due():
+                self._commit_due_step()
 
             # Launch the current batch
             if batch:
                 batch_result = self.run_batch(batch)
                 self._apply_war_barrier()
-                self.result_queue.append((batch.copy(), batch_result))
+                self.inflight_steps.push(batch.copy(), batch_result)
             else:
                 batch_result = None
                 self._sched_idled = True
 
             # Process the last batch
-            if self.last_batch:
-                if not disable_overlap_for_batch:
-                    pop_and_process()
+            self._debug_check_commit_gate(
+                self.last_batch is not None and not disable_overlap_for_batch
+            )
+            if self.inflight_steps.has_due():
+                self._commit_due_step()
             elif batch is None:
                 self.on_idle()
 
@@ -3093,6 +3090,8 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Update last_batch
             self.last_batch = batch
+            self.inflight_steps.end_step(batch)
+            self._debug_check_last_launched()
 
     @scheduler_stage_method(SCHEDULER_STAGE_GET_NEXT_BATCH)
     def get_next_disagg_decode_batch_to_run(

@@ -33,6 +33,7 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.schedule_batch import NextBatchPlan, Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import SchedulePolicy
 from sglang.srt.managers.scheduler import Scheduler, _dispatch_event_loop_once
+from sglang.srt.managers.scheduler_components.inflight_queue import InflightQueue
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
@@ -119,6 +120,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
 
     launch_batch_sample_if_needed = Scheduler.launch_batch_sample_if_needed
     _commit_due_step = Scheduler._commit_due_step
+    _debug_check_commit_gate = Scheduler._debug_check_commit_gate
     _debug_check_last_launched = Scheduler._debug_check_last_launched
     pause_generation = Scheduler.pause_generation
     continue_generation = Scheduler.continue_generation
@@ -162,7 +164,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self.attn_cp_cpu_group = None
         self.attn_tp_cpu_group = None
         self.last_batch = None
-        self.result_queue = deque()
+        self.inflight_steps = InflightQueue(depth=0)
         self.chunked_req = None
         self.decode_offload_manager = None
         self.running_batch = ScheduleBatch(reqs=[])
@@ -224,7 +226,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self.iteration += 1
         if self.iteration == len(self.arrivals):
             raise _StopLoop
-        self.depths.append(len(self.result_queue))
+        self.depths.append(len(self.inflight_steps))
         for name, iteration in self.ready_at.items():
             event = self.copy_events[name]
             event.ready = event.ready or self.iteration >= iteration
@@ -263,7 +265,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
             if isinstance(req, TokenizedGenerateReqInput):
                 self.ready_batches.append(self.batches[int(req.rid)])
             elif isinstance(req, PauseGenerationReqInput):
-                assert len(self.result_queue) <= 1, "Pause bypassed a result wait"
+                assert len(self.inflight_steps) <= 1, "Pause bypassed a result wait"
                 self.pause_generation(req)
             elif isinstance(req, ContinueGenerationReqInput):
                 self.continue_generation(req)
@@ -274,7 +276,8 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
 
     def _record_scheduler_state_for_paused_engine(self):
         self.actions.append((self.iteration, "pause", None))
-        self.paused_states.append((self.last_batch, tuple(self.result_queue)))
+        pending = tuple((record.batch, record.result) for record in self.inflight_steps)
+        self.paused_states.append((self.last_batch, pending))
 
     def process_prefill_chunk(self, last_batch, running_batch):
         if last_batch is not None:
@@ -294,7 +297,9 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         return NextBatchPlan(batch_to_run=batch, running_batch=running_batch)
 
     def run_batch(self, batch):
-        assert len(self.result_queue) < 2, "Overwrote a live forward's keep-alive slot"
+        assert len(self.inflight_steps) < 2, (
+            "Overwrote a live forward's keep-alive slot"
+        )
         self.actions.append((self.iteration, "launch", batch.forward_iter))
         result = self.results[batch.forward_iter]
         if result.delay_sample_func is not None:
@@ -310,7 +315,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         pass
 
     def process_batch_result(self, batch, result):
-        assert all(pending is not result for _, pending in self.result_queue)
+        assert all(record.result is not result for record in self.inflight_steps)
         self.result_processes[batch.forward_iter] += 1
         self.actions.append((self.iteration, "process_result", batch.forward_iter))
         Scheduler.process_batch_result(self, batch, result)
@@ -431,7 +436,8 @@ def _rank_consensus_worker(rank, rendezvous):
                     else:
                         result.delay_sample_func = lambda: None
                         result.copy_done.recorded = False
-                scheduler.result_queue = deque([(_batch(99), result)])
+                scheduler.inflight_steps = InflightQueue(depth=1, blocking=False)
+                scheduler.inflight_steps.push(_batch(99), result)
                 try:
                     scheduler.is_disagg_prefill_batch_result_ready(
                         result, batch_result_completion_status
@@ -862,7 +868,7 @@ class TestPrefillResultPolling(CustomTestCase):
                 (8, "process_result", 3),
             ],
         )
-        self.assertFalse(scheduler.result_queue)
+        self.assertFalse(scheduler.inflight_steps)
         self.assertIsNone(scheduler.last_batch)
         self.assertEqual(
             [req.rid for req in scheduler.disagg_prefill_inflight_queue],
@@ -921,7 +927,7 @@ class TestPrefillResultPolling(CustomTestCase):
                         (first_done + 3, "result", 2),
                     ],
                 )
-                self.assertFalse(scheduler.result_queue)
+                self.assertFalse(scheduler.inflight_steps)
 
     def test_delayed_sample_is_submitted_after_predecessor_before_query(self):
         for enabled in (False, True):
@@ -1046,7 +1052,7 @@ class TestPrefillResultPolling(CustomTestCase):
                     if name != 3:
                         self.assertEqual(event.records, 1)
                         self.assertIsNone(results[name].delay_sample_func)
-                self.assertFalse(scheduler.result_queue)
+                self.assertFalse(scheduler.inflight_steps)
                 self.assertIsNone(scheduler.last_batch)
 
     def test_shutdown_during_intake_stops_new_batches_in_both_modes(self):
@@ -1084,7 +1090,7 @@ class TestPrefillResultPolling(CustomTestCase):
                         scheduler.result_processes,
                         {name: 1 for name in range(1, shutdown_at + 1)},
                     )
-                    self.assertFalse(scheduler.result_queue)
+                    self.assertFalse(scheduler.inflight_steps)
 
     def test_shutdown_during_copy_wait_finishes_oldest_result_before_exiting(self):
         class StoppingScheduler(_Scheduler):
@@ -1125,7 +1131,7 @@ class TestPrefillResultPolling(CustomTestCase):
                 self.assertEqual(scheduler.copy_events[1].blocking_synchronizations, 1)
                 self.assertIn((2, "dispatch", "ShutdownReq"), scheduler.actions)
                 self.assertEqual(
-                    [batch.forward_iter for batch, _ in scheduler.result_queue],
+                    [record.batch.forward_iter for record in scheduler.inflight_steps],
                     [2] if pending_count == 2 else [],
                 )
                 self.assertEqual(
@@ -1175,7 +1181,10 @@ class TestPrefillResultPolling(CustomTestCase):
                         {1: 1, 2: 1} if depth == 2 and mode == "retract" else {1: 1},
                     )
                     self.assertEqual(
-                        [batch.forward_iter for batch, _ in scheduler.result_queue],
+                        [
+                            record.batch.forward_iter
+                            for record in scheduler.inflight_steps
+                        ],
                         [2] if depth == 2 and mode == "in_place" else [],
                     )
                     self.assertFalse(scheduler._deferred_input_requests)

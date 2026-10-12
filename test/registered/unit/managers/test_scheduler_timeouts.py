@@ -7,7 +7,6 @@ reaching the client is covered by scheduler/test_scheduler_control.py.
 
 import time
 import unittest
-from collections import deque
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -26,6 +25,7 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.inflight_queue import InflightQueue
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     CacheRequestOutcome,
@@ -70,7 +70,7 @@ def _batch(reqs):
 def _scheduler(waiting_queue, running_reqs=(), last_batch_reqs=()):
     s = Scheduler.__new__(Scheduler)
     s.enable_continuous_input_polling = False
-    s.result_queue = deque()
+    s.inflight_steps = InflightQueue(depth=1)
     s.waiting_queue = waiting_queue
     s.enable_hierarchical_cache = False
     s.enable_hicache_storage = False
@@ -171,7 +171,8 @@ class TestRunningTimeout(CustomTestCase):
         fresh = _req("fresh", forward_entry=time.perf_counter())
         s = _scheduler([], last_batch_reqs=[fresh])
         s.enable_continuous_input_polling = True
-        s.result_queue = deque([(_batch([stale]), None), (s.last_batch, None)])
+        s.inflight_steps.push(_batch([stale]), None)
+        s.inflight_steps.push(s.last_batch, None)
         s.disaggregation_mode = DisaggregationMode.PREFILL
         s.chunked_req = None
         s.mm_receiver = None
@@ -206,9 +207,8 @@ class TestRunningTimeout(CustomTestCase):
                 s.running_mbs = [s.running_batch]
                 s.mbs = [s.last_batch, _batch([older])]
                 if pp_size == 1:
-                    s.result_queue = deque(
-                        [(_batch([older]), None), (_batch([newer]), None)]
-                    )
+                    s.inflight_steps.push(_batch([older]), None)
+                    s.inflight_steps.push(_batch([newer]), None)
 
                 with envs.SGLANG_REQ_RUNNING_TIMEOUT.override(1.0):
                     aborts = s._poll_timeout_aborts()
@@ -219,7 +219,7 @@ class TestRunningTimeout(CustomTestCase):
                     [a.rid for a in aborts],
                     ["older", "newer"] if pp_size == 1 else ["newer", "older"],
                 )
-                self.assertEqual(len(s.result_queue), 2 if pp_size == 1 else 0)
+                self.assertEqual(len(s.inflight_steps), 2 if pp_size == 1 else 0)
 
     def test_unset_forward_entry_time_is_never_emitted(self):
         s = _scheduler([], running_reqs=[_req("unstamped", forward_entry=0.0)])

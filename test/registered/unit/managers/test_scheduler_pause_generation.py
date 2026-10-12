@@ -1,6 +1,5 @@
 import unittest
 from array import array
-from collections import deque
 from types import SimpleNamespace
 from typing import List, Optional, Tuple
 from unittest.mock import MagicMock, patch
@@ -24,6 +23,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.inflight_queue import InflightQueue
 from sglang.srt.managers.scheduler_components.pool_stats_observer import PoolStats
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import publish, reset_context
@@ -84,7 +84,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.tree_cache.protected_size.return_value = 0
         scheduler.req_to_token_pool = MagicMock()
         scheduler.hisparse_coordinator = MagicMock()
-        scheduler.result_queue = deque()
+        scheduler.inflight_steps = InflightQueue(depth=1)
         scheduler.disaggregation_mode = DisaggregationMode.NULL
         # Support _kv_snap diagnostic logging in patched schedulers
         scheduler.token_to_kv_pool_allocator = MagicMock()
@@ -281,16 +281,16 @@ class TestSchedulerPauseGeneration(CustomTestCase):
                     scheduler.metrics_reporter.record_scheduler_idle.assert_not_called()
 
     def test_inplace_does_not_drain_overlap_queue(self):
-        """in_place should not process the overlap result_queue."""
+        """in_place should not process the overlap in-flight steps."""
         scheduler = self._new_scheduler()
         scheduler.enable_overlap = True
         scheduler.last_batch = MagicMock()
-        scheduler.result_queue = deque([(MagicMock(), MagicMock())])
+        scheduler.inflight_steps.push(MagicMock(), MagicMock())
 
         scheduler.pause_generation(PauseGenerationReqInput(mode="in_place"))
 
         self.assertTrue(scheduler._engine_paused)
-        self.assertEqual(len(scheduler.result_queue), 1)
+        self.assertEqual(len(scheduler.inflight_steps), 1)
 
     def test_inplace_does_not_merge_batch(self):
         """in_place should not filter or merge last_batch into running_batch."""
@@ -536,7 +536,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         self.assertIsNone(scheduler.chunked_req)
 
     def test_retract_drain_happens_once_before_release(self):
-        """retract with overlap drains the result_queue once before releasing reqs."""
+        """retract with overlap drains the in-flight steps once before releasing reqs."""
         scheduler = self._new_scheduler()
         scheduler.enable_overlap = True
         last_req = self._make_req("last")
@@ -547,11 +547,11 @@ class TestSchedulerPauseGeneration(CustomTestCase):
             forward_mode=ForwardMode.EXTEND,
             with_tensors=True,
         )
-        scheduler.result_queue = deque([(MagicMock(), MagicMock())])
+        scheduler.inflight_steps.push(MagicMock(), MagicMock())
         event_log: List[str] = []
 
         def process_result(batch, result):
-            self.assertFalse(scheduler.result_queue)
+            self.assertFalse(scheduler.inflight_steps)
             event_log.append("drain")
 
         scheduler.process_batch_result = MagicMock(side_effect=process_result)
@@ -564,7 +564,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
 
         self.assertEqual(event_log, ["drain", "requeue-released"])
-        self.assertEqual(len(scheduler.result_queue), 0)
+        self.assertEqual(len(scheduler.inflight_steps), 0)
 
     def test_retract_empty_running_batch_requeues_nothing(self):
         """retract with empty running_batch must not release or requeue any request."""
@@ -608,13 +608,13 @@ class TestSchedulerPauseGeneration(CustomTestCase):
                 batch = ScheduleBatch(reqs=[], forward_mode=ForwardMode.EXTEND)
                 result = SimpleNamespace(delay_sample_func=None)
                 scheduler.last_batch = batch
-                scheduler.result_queue = deque([(batch, result)])
+                scheduler.inflight_steps.push(batch, result)
                 scheduler.process_batch_result = MagicMock()
 
                 scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
 
                 scheduler.process_batch_result.assert_called_once_with(batch, result)
-                self.assertFalse(scheduler.result_queue)
+                self.assertFalse(scheduler.inflight_steps)
                 self.assertFalse(batch.prefill_chunk_processed)
 
     def test_pd_decode_retract_requeues_for_rebootstrap(self):
