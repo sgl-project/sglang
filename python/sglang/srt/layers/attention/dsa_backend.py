@@ -461,10 +461,11 @@ class DeepseekSparseAttnBackend(
         self.num_q_heads = (
             model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
         )
-        self.dcp_size = (
-            1 if model_runner.is_draft_worker else get_parallel().attn_dcp_size
-        )
-        self.dcp_rank = get_parallel().attn_dcp_rank if self.dcp_size > 1 else 0
+        if model_runner.is_draft_worker:
+            self.dcp_size, self.dcp_rank = 1, 0
+        else:
+            self.dcp_size = get_parallel().attn_dcp_size
+            self.dcp_rank = get_parallel().attn_dcp_rank
         self.num_dcp_q_heads = self.num_q_heads * self.dcp_size
         self._dcp_page_table_cache = DcpPageTableCache()
         self.kv_cache_dim = model_runner.token_to_kv_pool.kv_cache_dim
