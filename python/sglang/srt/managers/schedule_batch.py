@@ -3235,6 +3235,22 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mamba_decode_batch_idx_cpu = None
         self.mamba_lazy_spec_track_positions_cpu = None
 
+    # The fields convert_decode_to_extend sets; nothing else on the batch
+    # changes. A class attribute without an annotation, so not a dataclass field.
+    EXTEND_VIEW_FIELDS = frozenset(
+        {
+            "forward_mode",
+            "chunked_req",
+            "prefill_stats",
+            "prefix_lens",
+            "extend_lens",
+            "extend_num_tokens",
+            "extend_logprob_start_lens",
+            "num_decode_rows",
+            "is_prefill_only",
+        }
+    )
+
     def convert_decode_to_extend(self):
         """View every decode request as a 1-token extend with its context as
         prefix, making this a plain extend (prefill) batch. Called after the

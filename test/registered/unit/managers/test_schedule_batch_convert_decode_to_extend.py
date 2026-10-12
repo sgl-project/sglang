@@ -104,6 +104,24 @@ class TestConvertDecodeToExtendGeometry(CustomTestCase):
         self.assertEqual(len(batch.prefix_lens), len(batch.reqs))
         self._assert_geometry(batch, seq_lens)
 
+    def test_sets_only_the_extend_view_fields(self):
+        """The running rows take back a converted step's run writes except
+        these fields (DecodingBatch.absorb), so the list must be complete."""
+        reqs = [_FakeReq(num_prompt_tokens=6, num_output_tokens=1) for _ in range(2)]
+        batch = ScheduleBatch(reqs=reqs)
+        batch.forward_mode = ForwardMode.DECODE
+        batch.enable_overlap = True
+        batch.seq_lens_cpu = torch.tensor([8, 8], dtype=torch.int64)
+        batch.chunked_req = object()
+        batch.prefill_stats = object()
+        batch.is_prefill_only = True
+        before = dict(vars(batch))
+
+        batch.convert_decode_to_extend()
+
+        changed = {k for k, v in vars(batch).items() if before.get(k, k) is not v}
+        self.assertEqual(changed, ScheduleBatch.EXTEND_VIEW_FIELDS)
+
     def test_short_seq_lens_fails_loudly(self):
         """A row/req divergence the slice cannot explain must raise, not
         silently truncate the way a plain zip would."""

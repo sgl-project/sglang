@@ -22,22 +22,6 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
 
-# The fields convert_decode_to_extend sets on a decode step for the DP extend
-# view. They describe that one step; the rows keep decoding.
-_EXTEND_VIEW_FIELDS = frozenset(
-    {
-        "forward_mode",
-        "chunked_req",
-        "prefill_stats",
-        "prefix_lens",
-        "extend_lens",
-        "extend_num_tokens",
-        "extend_logprob_start_lens",
-        "num_decode_rows",
-        "is_prefill_only",
-    }
-)
-
 
 class DecodingBatch:
     def __init__(self, rows: ScheduleBatch):
@@ -80,13 +64,18 @@ class DecodingBatch:
 
     def absorb(self) -> None:
         """Take back the fields the last decode step's run and commit rebound,
-        except the DP extend view's."""
+        except the DP extend view's: they describe that one step, and the rows
+        keep decoding."""
         step, self._step = self._step, None
         if step is None:
             return
         fields = vars(step)
         if step.forward_mode.is_extend():
-            fields = {k: v for k, v in fields.items() if k not in _EXTEND_VIEW_FIELDS}
+            fields = {
+                k: v
+                for k, v in fields.items()
+                if k not in ScheduleBatch.EXTEND_VIEW_FIELDS
+            }
         vars(self.rows).update(fields)
         self.rows.reqs = step.reqs[:]
 
