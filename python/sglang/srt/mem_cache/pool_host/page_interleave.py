@@ -3,11 +3,11 @@
 The host pool is striped exactly like its device pool. Host slots live in the
 same widened logical index space and follow the same placement: logical host
 page ``h`` is owned by rank ``h % N`` and is that rank's local host page
-``h // N``. The free lists are owner-classed like
-``PageInterleavePoolAllocator``'s, and every backup / load-back pairs device and
-host pages of the same class, so a rank's share of any transfer is exactly its
-own pages. Each shard rank therefore moves only its stripe between its own HBM
-and host memory, all ranks in parallel, with no cross-rank traffic.
+``h // N``. Host slots come from the device's own owner-classed allocator, and
+every backup / load-back pairs device and host pages of the same owner, so a
+rank's share of any transfer is exactly its own pages. Each shard rank
+therefore moves only its stripe between its own HBM and host memory, all ranks
+in parallel, with no cross-rank traffic.
 
 ``size`` stays the per-rank row count (the ratio applied to the per-rank
 device pool), so per-rank host memory matches the unsharded case while the
@@ -21,10 +21,7 @@ from typing import Optional, Tuple
 
 import torch
 
-from sglang.srt.mem_cache.allocator.page_interleave import (
-    class_counts,
-    pop_cyclic_pages,
-)
+from sglang.srt.mem_cache.allocator.page_interleave import PageInterleavePoolAllocator
 from sglang.srt.mem_cache.pool_host.base import synchronized
 
 
@@ -47,55 +44,34 @@ class PageInterleaveHostPoolMixin:
 
     @synchronized
     def clear(self):
-        # Class r holds the logical host pages owned by rank r: local host
-        # page p is logical page p * N + r. No reserved page on the host.
-        local_pages = torch.arange(self.size // self.page_size, dtype=torch.int64)
-        self.class_free_pages = [
-            local_pages * self.shard_size + r for r in range(self.shard_size)
-        ]
+        # The device's classed allocator over this rank's host rows; like the
+        # device, it leaves local page 0 unused.
+        self._slots = PageInterleavePoolAllocator(
+            size=self.size - self.page_size,
+            physical_page_size=self.page_size,
+            shard_size=self.shard_size,
+            dtype=torch.int64,
+            device="cpu",
+            kvcache=None,
+            need_sort=False,
+        )
 
     def available_size(self) -> int:
-        # Min-class floor, as on the device: any cyclic run of this many
-        # tokens fits whatever its start class.
-        return (
-            self.shard_size
-            * self.page_size
-            * min(len(free) for free in self.class_free_pages)
-        )
+        return self._slots.available_size()
 
     @synchronized
     def alloc(
         self, need_size: int, start_class: Optional[int] = None
     ) -> Optional[torch.Tensor]:
-        """Host slots for a backup whose device pages' owners cycle from
-        ``start_class`` (taken mod N)."""
         assert start_class is not None, (
             "sharded host slots must follow the owners of the device pages "
             "they back up; pass the first page's owner class"
         )
-        assert need_size % self.page_size == 0
-        num_pages = need_size // self.page_size
-        counts = class_counts(
-            start_class=start_class, num_pages=num_pages, shard_size=self.shard_size
-        )
-        if any(n > len(free) for n, free in zip(counts, self.class_free_pages)):
-            return None
-        pages = pop_cyclic_pages(
-            class_free_pages=self.class_free_pages,
-            start_class=start_class,
-            num_pages=num_pages,
-        )
-        offsets = torch.arange(self.page_size, dtype=torch.int64)
-        return (pages[:, None] * self.page_size + offsets).reshape(-1)
+        return self._slots.alloc_cyclic(start_class=start_class, need_size=need_size)
 
     @synchronized
     def free(self, indices: torch.Tensor) -> int:
-        pages = torch.unique(indices.cpu() // self.page_size)
-        owners = pages % self.shard_size
-        for r in range(self.shard_size):
-            self.class_free_pages[r] = torch.cat(
-                (self.class_free_pages[r], pages[owners == r])
-            )
+        self._slots.free(indices.cpu())
         return len(indices)
 
     def owned_rows(

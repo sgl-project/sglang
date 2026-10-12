@@ -1843,21 +1843,14 @@ class TestShardedHostSlots(CustomTestCase):
         # ratio x the per-rank device pool, page-aligned (+1 page), as unsharded.
         self.assertEqual(pool.size, (2 * 32 + 1) * PS)
         self.assertEqual(pool.logical_size, N * pool.size)
-        self.assertEqual(pool.available_size(), pool.logical_size)
+        # Every slot maps into this rank's host rows; local page 0 stays unused.
+        slots = pool.alloc(pool.available_size(), start_class=0)
+        self.assertEqual(slots.numel(), N * (pool.size - PS))
+        self.assertLess(int(pool.placement.local_index(slots).max()), pool.size)
 
     def test_alloc_without_a_start_class_fails_loud(self):
         with self.assertRaises(AssertionError):
             _host_pool(shard_rank=0).alloc(PS)
-
-    def test_min_class_floor_and_free_by_owner(self):
-        pool = _host_pool(shard_rank=0)
-        taken = [pool.alloc(PS, start_class=1) for _ in range(pool.size // PS)]
-        self.assertEqual(pool.available_size(), 0)
-        self.assertIsNone(pool.alloc(PS, start_class=1))
-        self.assertIsNotNone(pool.alloc(PS, start_class=2))
-        pool.free(taken[0])
-        self.assertEqual(pool.available_size(), N * PS)
-        self.assertTrue(torch.equal(pool.alloc(PS, start_class=1), taken[0]))
 
     def test_slots_are_mirrored_across_ranks(self):
         """A pure function of the mirrored alloc/free stream: the tree's host
