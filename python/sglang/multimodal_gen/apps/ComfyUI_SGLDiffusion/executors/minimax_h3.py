@@ -83,9 +83,24 @@ def _cache_fingerprint(video, sample_sigmas, serialized_layout) -> dict[str, Any
 class MiniMaxH3Adapter(ComfyUIModelAdapter):
     model_types = ("minimax_h3",)
     pipeline_class_name = "MiniMaxH3Pipeline"
+    # comfyui_cache_fp / comfyui_cond_key stay; later steps still send them.
+    cached_extra_keys = ComfyUIModelAdapter.cached_extra_keys + (
+        "h3_payload",
+        "h3_transformer_options",
+        "h3_sample_sigmas",
+        "h3_context",
+        "h3_layout",
+        "h3_denoise_mask",
+        "h3_audio_denoise_mask",
+        "sigmas",
+    )
 
     def pack(self, x, timestep, context, **kwargs) -> PackedForward:
         video, audio_src = _split_av(x)
+        if video.shape[0] != 1:
+            # Same limit as ComfyUI's MiniMax H3 model: the checkpoint is
+            # CFG-distilled and the packed sequence carries a single sample.
+            raise ValueError(f"MiniMax H3 supports batch size 1, got {video.shape[0]}")
         # PackedLayout is a ComfyUI class; the SGLD worker cannot unpickle it.
         payload = dict(kwargs.get("minimax_payload") or {})
         layout = payload.pop("layout", None)
@@ -194,18 +209,6 @@ class MiniMaxH3Adapter(ComfyUIModelAdapter):
             if value is not None:
                 extra[key] = value
         req.extra = extra
-
-    def drop_cached_fields(self, packed: PackedForward) -> None:
-        super().drop_cached_fields(packed)
-        packed.extra_req.pop("h3_payload", None)
-        packed.extra_req.pop("h3_transformer_options", None)
-        packed.extra_req.pop("h3_sample_sigmas", None)
-        packed.extra_req.pop("h3_context", None)
-        packed.extra_req.pop("h3_layout", None)
-        packed.extra_req.pop("h3_denoise_mask", None)
-        packed.extra_req.pop("h3_audio_denoise_mask", None)
-        packed.extra_req.pop("sigmas", None)
-        # Keep comfyui_cache_fp / comfyui_cond_key; later steps still send them.
 
 
 class MiniMaxH3Executor(SGLDiffusionExecutor):

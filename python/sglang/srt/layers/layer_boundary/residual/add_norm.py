@@ -33,7 +33,9 @@ from sglang.srt.layers.layer_boundary.adapters.attention import (
 from sglang.srt.layers.layer_boundary.residual import LayerResidualOps
 from sglang.srt.layers.quantization.fp8_utils import (
     _use_aiter_bpreshuffle_gfx95,
+    emit_transposed_bpreshuffle_scale,
     materialize_bpreshuffle_fp8_scale_tuple,
+    view_aiter_fused_rms_transposed_fp8_scale_tuple,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_exec, get_parallel, get_platform
@@ -213,6 +215,10 @@ def _update_and_read_residual_aiter_fp8_group(
     unquantized bf16 output rides along as a third element, so the DSA indexer
     can skip dequantizing. post_residual_addition is not applied on this path."""
     needs_bf16 = get_attn_tp_context().is_dsa
+    emit_transposed_scale = emit_transposed_bpreshuffle_scale(
+        hidden_states.shape[0],
+        on_bpreshuffle_gfx95=_use_aiter_bpreshuffle_gfx95,
+    )
     output, unquantized, _, residual_out = fused_rms_fp8_group_quant(
         hidden_states,
         norm.weight,
@@ -224,9 +230,11 @@ def _update_and_read_residual_aiter_fp8_group(
         dtype_quant=torch.float8_e4m3fn,
         res1=residual,
         output_unquantized_inp1=needs_bf16,
-        transpose_scale=False,
+        transpose_scale=emit_transposed_scale,
     )
-    if _use_aiter_bpreshuffle_gfx95:
+    if emit_transposed_scale:
+        output = view_aiter_fused_rms_transposed_fp8_scale_tuple(output)
+    elif _use_aiter_bpreshuffle_gfx95:
         output = materialize_bpreshuffle_fp8_scale_tuple(output)
     if needs_bf16:
         output = (output[0], output[1], unquantized)
@@ -268,6 +276,8 @@ class PlainAdd:
     is_plain_add = True
     applied_at_exit = False
     outlives_layer = True
+    writes_stream = False
+    quantized_sum = True
 
     def update(self, hidden_states, residual):
         hidden_states += residual
@@ -289,6 +299,8 @@ class ReplaceAtExit:
     is_plain_add = False
     applied_at_exit = True
     outlives_layer = True
+    writes_stream = True
+    quantized_sum = False
 
     def update(self, hidden_states, residual):
         return hidden_states
@@ -312,10 +324,17 @@ class NormQuantReadout:
     """The input is the residual's norm, fused with the quantization the
     consumer asks for (``quant_format``) and a post-residual addition; a plain
     add of the previous output runs in the same kernel. An empty batch skips
-    the norm."""
+    the norm.
+
+    ``post_residual_addition`` is added after a plain add and before the norm.
+    It is not applied by the aiter mxfp4 and fp8-group kernels, after an
+    update other than a plain add, or by ``read``, which has no add."""
 
     is_plain_norm = True
+    completing_fusions = ()
+    gathering_reads = ()
     reads_before_dp_gather: bool = False
+    reads_after_attn_tp_gather = False
     fp8_input: Optional[Fp8Input] = None
 
     def init_residual(self, hidden_states):
@@ -347,10 +366,15 @@ class NormQuantReadout:
 @dataclass(frozen=True)
 class NormReadout:
     """The input is the residual's norm; a plain add of the previous output
-    runs in the same kernel. An empty batch skips the norm."""
+    runs in the same kernel. An empty batch skips the norm. It rejects a
+    ``quant_format`` and a ``post_residual_addition``, except that the latter
+    is not applied after an update other than a plain add."""
 
     is_plain_norm = True
+    completing_fusions = ()
+    gathering_reads = ()
     reads_before_dp_gather: bool = False
+    reads_after_attn_tp_gather = False
 
     def init_residual(self, hidden_states):
         return hidden_states
@@ -394,6 +418,8 @@ class UnfusedNormReadout(NormReadout):
     in models that add their residual themselves. No fused kernel takes it."""
 
     is_plain_norm = False
+    completing_fusions = ()
+    gathering_reads = ()
 
     def update_and_read(
         self,
