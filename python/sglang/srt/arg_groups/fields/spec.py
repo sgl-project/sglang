@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 from typing import (
     Literal,
     Optional,
@@ -118,8 +119,8 @@ class Spec(msgspec.Struct):
     ] = False
     speculative_use_block_verification: A[
         bool,
-        "Use block verification for EAGLE/EAGLE3/NEXTN on CUDA or ROCm "
-        "(requires topk=1).",
+        "Use block verification for EAGLE/EAGLE3/NEXTN (requires topk=1) or for "
+        "sampled DFLASH/DSPARK drafts, on CUDA or ROCm.",
     ] = False
     speculative_token_map: A[
         Optional[str],
@@ -194,6 +195,21 @@ class Spec(msgspec.Struct):
                 "ascend_tp",
             ],
             resolvable=True,
+        ),
+    ] = None
+    speculative_enable_w4a4_mxfp4_megamoe: A[
+        Optional[bool],
+        Arg(
+            help="Whether the draft model's MXFP4 MegaMoE layers use the W4A4 "
+            "mxf4xmxf4 MMA type (see --enable-w4a4-mxfp4-megamoe). Pass "
+            "--no-speculative-enable-w4a4-mxfp4-megamoe to keep the draft on "
+            "fp8xfp4 (W4A8) while the target runs W4A4. Same as "
+            "--enable-w4a4-mxfp4-megamoe if unset. A draft that runs MXFP4 "
+            "MegaMoE with a different MMA type from the target may allocate an "
+            "additional MegaMoE symmetric buffer after the KV pool is sized; "
+            "lower --mem-fraction-static if CUDA-graph capture runs out of "
+            "memory.",
+            action=argparse.BooleanOptionalAction,
         ),
     ] = None
     speculative_draft_model_quantization: A[

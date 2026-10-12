@@ -220,7 +220,7 @@ class MockModelRunner:
                 "enable_deterministic_inference": False,
                 "dsa_prefill_backend": "intel_xpu",
                 "dsa_decode_backend": "intel_xpu",
-                "dsa_topk_backend": "torch",  # XPU uses torch.topk fallback
+                "dsa_topk_backend": "sgl-kernel",
                 "dsa_paged_mqa_logits_backend": "auto",
                 "disaggregation_mode": "null",
                 "enable_two_batch_overlap": False,
@@ -238,7 +238,6 @@ class TestDSAIndexerXPU(CustomTestCase):
         server_args = ServerArgs(model_path="dummy")
         server_args.dsa_prefill_backend = "intel_xpu"
         server_args.dsa_decode_backend = "intel_xpu"
-        server_args.dsa_topk_backend = "torch"
         # Disable CUDA-only JIT topk-v2 (TileLang requires CUDA_HOME)
         envs.SGLANG_OPT_USE_TOPK_V2.set(False)
         set_global_server_args_for_scheduler(server_args)

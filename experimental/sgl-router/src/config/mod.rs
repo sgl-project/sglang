@@ -54,6 +54,10 @@ impl Config {
         }
         self.model.sampling_overrides.validate()?;
         ensure!(
+            self.proxy.request_timeout_secs > 0,
+            "request_timeout_secs must be greater than zero"
+        );
+        ensure!(
             self.proxy.stream_idle_timeout_secs > 0,
             "stream_idle_timeout_secs must be greater than zero"
         );
@@ -607,6 +611,14 @@ mod tests {
             shutdown_drain_advisory(MAX_SHUTDOWN_DRAIN_SECS, Some(3600)).is_none(),
             "a long drain under a grace period declared to cover it must not warn",
         );
+    }
+
+    #[test]
+    fn validate_rejects_a_zero_request_timeout() {
+        let mut config = cfg("qwen3-0.6b", &["http://10.0.0.1:30000"]);
+        config.proxy.request_timeout_secs = 0;
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("request_timeout_secs"), "{error}");
     }
 
     #[test]
