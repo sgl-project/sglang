@@ -173,6 +173,7 @@ class TestIdleAfterTheLastRowFinishes(unittest.TestCase):
         s._engine_paused = False
         s.enable_overlap = False
         s.last_batch = None
+        s.recv_skipper = None
         s.waiting_queue = []
         s.grammar_manager = SimpleNamespace(grammar_queue=[])
         s.dllm_manager = SimpleNamespace(any_staging_reqs=lambda: False)
