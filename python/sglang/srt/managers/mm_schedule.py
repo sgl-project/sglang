@@ -9,7 +9,7 @@ from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.multimodal.evs import EVSEmbeddingResult
 from sglang.srt.multimodal.transport.cuda_ipc import BORROW_CUDA_IPC_FEATURE_KEY
-from sglang.srt.runtime_context import get_parallel, get_schedule
+from sglang.srt.runtime_context import get_schedule
 from sglang.srt.utils import is_hip, is_npu, is_xpu
 from sglang.srt.utils.async_probe import maybe_assert_sum
 from sglang.utils import logger
@@ -243,26 +243,6 @@ def _move_items_to_device(
             item.feature = item.feature.to(device, non_blocking=True)
 
 
-def _acknowledge_deferred_cuda_ipc_cache_hits(
-    items: List[MultimodalDataItem],
-) -> None:
-    """Release lazy Kimi IPC slices when a cached embedding skips ViT.
-
-    On an encoder-DP miss, exactly one rank copies an image and acknowledges
-    the full TP group.  On a cache hit no rank copies it, so rank zero performs
-    the equivalent single acknowledgement.  This preserves the fixed-pool
-    lifecycle without reintroducing an unnecessary GPU-to-GPU copy.
-    """
-    parallel = get_parallel()
-    if parallel.attn_tp_rank != 0:
-        return
-    # The pool's recycler counts the whole TP group, so the acknowledgement must
-    # match that count even when an attention subgroup is smaller.
-    consumer_count = max(parallel.tp_size, 1)
-    for item in items:
-        item.acknowledge_deferred_cuda_ipc_feature(consumer_count)
-
-
 def _item_overlap(
     item: MultimodalDataItem, chunk_start: int, chunk_end: int
 ) -> Optional[int]:
@@ -330,8 +310,8 @@ def _get_chunked_embedding_full(
             else embedding
         )
         embedding_cache.set(embedding_items_hash, embedding_per_req)
-    else:
-        _acknowledge_deferred_cuda_ipc_cache_hits(embedding_items_per_req)
+
+    # cache hits keep raw-input leases until request cleanup for eviction/re-prefill
 
     if isinstance(embedding_per_req, EVSEmbeddingResult):
         item = embedding_items_per_req[0]
@@ -492,7 +472,6 @@ def _get_chunked_embedding_by_item(
             cached_token_count = _embedding_token_count(cached_embedding)
             if cached_token_count == expected_token_count:
                 cached_embeddings[idx] = cached_embedding
-                _acknowledge_deferred_cuda_ipc_cache_hits([item])
             else:
                 _discard_mismatched_cached_embedding(
                     item.hash, expected_token_count, cached_token_count
