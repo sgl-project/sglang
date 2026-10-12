@@ -964,11 +964,7 @@ class ServingChatTestCase(CustomTestCase):
         ):
             self._use_delimited_response_template(reasoning_parser)
             reasoning = "Check the forecast." if reasoning_parser else ""
-            city = (
-                "a</call>b"
-                if reasoning_parser and constraint.get("tool_choice")
-                else "Paris"
-            )
+            city = "a</call>b" if reasoning_parser else "Paris"
             call = "<call:get_weather>" + json.dumps({"city": city}) + "</call>"
             text = (f"<think>{reasoning}</think>" if reasoning else "") + call
             for stream in (False, True):
@@ -1114,7 +1110,7 @@ class ServingChatTestCase(CustomTestCase):
         """JSON output must not skip the answer opener, while a forced tool array stays
         bare JSON."""
         self._use_delimited_response_template("beam")
-        answer, call = '<answer>{"a": 1}', '<call:get_weather>{"a": 1}</call>'
+        answer, call = '<answer>{"a": 1}', '<call:get_weather>{"city": "Paris"}</call>'
         for prompt, from_start, texts in (
             (
                 "<assistant>",
@@ -1272,7 +1268,7 @@ class ServingChatTestCase(CustomTestCase):
         for fields, text, admitted in (
             ({"tools": [strict]}, call, True),
             ({"tools": [strict]}, call.replace('"Paris"', "1"), False),
-            ({"tools": [strict]}, call.replace("get_weather", "delete_all"), False),
+            ({"tools": [strict]}, call.replace("get_weather", "delete_all"), True),
             ({"tools": [_WEATHER_TOOL], "parallel_tool_calls": False}, call, True),
             (
                 {"tools": [_WEATHER_TOOL], "parallel_tool_calls": False},

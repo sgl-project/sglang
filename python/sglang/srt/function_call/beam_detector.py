@@ -15,6 +15,8 @@ class BeamDetector(ResponseTemplateToolDetector):
     response_template = BEAM_RESPONSE_TEMPLATE
     constrains_every_turn = True
     forwards_unknown_tools = True
+    # Unheld, Beam's arguments drift from their schemas.
+    strict_arguments = True
 
     def supports_structural_tag(self) -> bool:
         # Forced calls then keep the native format, which this detector parses
@@ -55,6 +57,9 @@ class BeamDetector(ResponseTemplateToolDetector):
             message_start=self._message_start if message_start else None,
             grammar_requires_reasoning=True,
             undeclared_names=tool_choice == "auto" and self.admits_undeclared_tools(),
+            # Beam also writes arguments sorted by name.
+            sorted_arguments=True,
+            strict_arguments=self.strict_arguments,
         )
         if tag is None:
             return None

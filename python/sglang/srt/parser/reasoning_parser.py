@@ -52,7 +52,10 @@ from sglang.srt.parser.inkling_tokenizer import (
     INKLING_SPECIAL_TOKEN_IDS,
     MESSAGE_MODEL,
 )
-from sglang.srt.parser.response_template import ResponseTemplateReasoningDetector
+from sglang.srt.parser.response_template import (
+    ResponseTemplateReasoningDetector,
+    grammar_holds_calls,
+)
 
 
 class StreamingParseResult:
@@ -2392,7 +2395,10 @@ class ReasoningParser:
             if isinstance(request, (ChatCompletionRequest, ResponsesRequest)):
                 kwargs["grammar_start"] = request._response_parser_grammar_start
                 kwargs["tools"] = request.tools
-                kwargs["constrained"] = request._response_parser_tool_grammar
+                kwargs["constrained"] = grammar_holds_calls(
+                    request._response_parser_tool_grammar,
+                    request._response_parser_grammar_start,
+                )
 
         self.detector = detector_class(**kwargs)
 
