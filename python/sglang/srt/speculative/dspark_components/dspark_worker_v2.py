@@ -64,9 +64,6 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
     dp_global_verify_tier_num_tokens,
     idle_ragged_layout,
 )
-from sglang.srt.speculative.dspark_components.dspark_proposal_graph_tail import (
-    maybe_build_proposal_graph_tail,
-)
 from sglang.srt.speculative.dspark_components.dspark_verify import (
     CommitInjectCtx,
     DsparkVerifyEpilogue,
@@ -519,32 +516,25 @@ class DSparkWorkerV2(BaseSpecWorker):
                 # from being the intended precision fallback, skipping the
                 # unused hook avoids paying for two proposal computations.
                 if envs.SGLANG_DSPARK_FOLDED_PROPOSAL.get():
-                    self._proposal_graph_tail = self._maybe_build_proposal_graph_tail()
-                    if self._proposal_graph_tail is not None:
-                        self.draft_model_runner.capture_tail_hooks.append(
-                            make_draft_sampler_capture_hook(self._proposal_graph_tail)
+                    self._proposal_graph_tail = self._proposer.build_graph_tail(
+                        max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
+                        out=(
+                            self._verify_epilogue.draft_tokens_buf
+                            if self._verify_epilogue is not None
+                            else None
+                        ),
+                    )
+                    self.draft_model_runner.capture_tail_hooks.append(
+                        make_draft_sampler_capture_hook(self._proposal_graph_tail)
+                    )
+                    if self._target_tp_rank == 0:
+                        logger.info(
+                            "DSpark draft proposal (%s) folded into the draft cuda graph.",
+                            "greedy draft" if self._greedy_draft else "sampling",
                         )
-                self._proposer.attach_graph_tail(self._proposal_graph_tail)
             self._draft_worker.init_cuda_graphs(
                 capture_decode_cuda_graph=capture_decode_cuda_graph
             )
-
-    def _maybe_build_proposal_graph_tail(self):
-        return maybe_build_proposal_graph_tail(
-            draft_model=self.draft_model,
-            gamma=self.gamma,
-            max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
-            device=self.device,
-            tp_rank=self._target_tp_rank,
-            noise=self._proposer.noise,
-            greedy_draft=self._greedy_draft,
-            tp_sync=self._tp_sync,
-            out=(
-                self._verify_epilogue.draft_tokens_buf
-                if self._verify_epilogue is not None
-                else None
-            ),
-        )
 
     def clear_cache_pool(self):
         pass

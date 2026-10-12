@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-import logging
-from typing import Optional
-
 import torch
 
 from sglang.srt.speculative.dspark_components.dspark_draft import (
@@ -13,8 +10,6 @@ from sglang.srt.speculative.dspark_components.dspark_draft import (
     run_draft_proposal,
 )
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync
-
-logger = logging.getLogger(__name__)
 
 
 class DraftProposalGraphTail:
@@ -121,44 +116,3 @@ class DraftProposalGraphTail:
                 step_logits=step_logits.new_empty((self.max_bs, *step_logits.shape[1:]))
             )
             self.buffers.step_logits[:bs].copy_(step_logits)
-
-
-def maybe_build_proposal_graph_tail(
-    *,
-    draft_model,
-    gamma: int,
-    max_bs: int,
-    device,
-    tp_rank: int,
-    noise: DraftNoise,
-    greedy_draft: bool,
-    tp_sync: SpecTpSync,
-    out=None,
-) -> Optional[DraftProposalGraphTail]:
-    """Build the proposal's graph tail, or None (reason logged) when the
-    proposal must stay eager."""
-
-    def _eager(reason):
-        if tp_rank == 0:
-            logger.info("DSpark draft proposal kept eager (reason=%s).", reason)
-        return None
-
-    if gamma <= 0:
-        return _eager("gamma<=0")
-    if draft_model.markov_head is None:
-        return _eager("no markov head")
-    if tp_rank == 0:
-        logger.info(
-            "DSpark draft proposal (%s) folded into the draft cuda graph.",
-            "greedy draft" if greedy_draft else "sampling",
-        )
-    return DraftProposalGraphTail(
-        model=draft_model,
-        gamma=gamma,
-        max_bs=max_bs,
-        device=device,
-        noise=noise,
-        tp_sync=tp_sync,
-        greedy_draft=greedy_draft,
-        out=out,
-    )

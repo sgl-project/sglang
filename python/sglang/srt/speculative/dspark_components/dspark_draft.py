@@ -382,12 +382,24 @@ class DraftBlockProposer:
             else None
         )
 
-    @property
-    def noise(self) -> DraftNoise:
-        return self._noise
+    def build_graph_tail(self, *, max_bs: int, out: Optional[torch.Tensor] = None):
+        """The proposal as the draft cuda graph's tail, sharing this proposer's
+        noise; ``propose`` reads it after a replay."""
+        from sglang.srt.speculative.dspark_components.dspark_proposal_graph_tail import (
+            DraftProposalGraphTail,
+        )
 
-    def attach_graph_tail(self, graph_tail) -> None:
-        self._graph_tail = graph_tail
+        self._graph_tail = DraftProposalGraphTail(
+            model=self.draft_model,
+            gamma=self.gamma,
+            max_bs=max_bs,
+            device=self.draft_model_runner.device,
+            noise=self._noise,
+            tp_sync=self._tp_sync,
+            greedy_draft=self._greedy_draft,
+            out=out,
+        )
+        return self._graph_tail
 
     def propose(
         self,
