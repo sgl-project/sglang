@@ -55,6 +55,24 @@ class TestInflightQueue(CustomTestCase):
         self.assertEqual(len(q), 0)
         self.assertIsNone(q.newest())
 
+    def test_ring_slot_shows_its_newest_record_until_pushed_again(self):
+        # Three slots: a record is due two steps after its push.
+        q = InflightQueue(depth=2, ring=True)
+        launches = ["b0", None, "b2", "b3"]
+        committed = []
+        for step, batch in enumerate(launches):
+            q.push(batch, None)
+            if q.has_due():
+                committed.append(q.pop_due().batch)
+            # The committed record stays in its slot until the next push to it.
+            expected = [None] * 3
+            for s in range(max(0, step - 2), step + 1):
+                expected[s % 3] = launches[s]
+            self.assertEqual(q.slot_batches(), expected)
+            q.end_step(batch)
+        self.assertEqual(committed, ["b0", None])
+        self.assertEqual(len(q), 2)
+
     def test_step_rule_matches_last_batch_gate(self):
         # Differential against the gate the loops used before the queue: commit
         # the oldest launched batch iff last_batch (what the previous completed
