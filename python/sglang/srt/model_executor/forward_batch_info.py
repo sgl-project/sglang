@@ -635,6 +635,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # CUDA-graph runners may capture only the transformer body and execute the
     # logits processor eagerly after replay.
     defer_logits_to_eager: bool = False
+    # Full prefill graph capture uses a fixed request axis whose inactive slots
+    # must not participate in data-dependent row selection.
+    full_prefill_cuda_graph_capture: bool = False
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False
 
