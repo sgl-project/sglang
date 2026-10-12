@@ -1232,7 +1232,12 @@ def _refreshes_rope_cos_sin(
     config: Qwen3_5TextConfig, layer_id: int, is_nextn: bool
 ) -> bool:
     """rotary_emb is shared by all layers, so its per-forward cos/sin is refreshed
-    once, at the first full-attention layer this PP stage owns."""
+    once, at the first full-attention layer this PP stage owns.
+
+    layer_id must be a full-attention layer; linear-attention layers near the
+    stage start would also pass the check below. Only Qwen3_5AttentionDecoderLayer
+    calls this, and it is built only for "attention" entries of layers_block_type.
+    """
     # Drafts keep the unsplit numbering.
     stage_start = 0
     if not is_nextn:
