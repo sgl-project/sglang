@@ -396,6 +396,7 @@ class TestBuildCustomBlockAdapter(unittest.TestCase):
             ("ErnieImageTransformer2DModel", "layers"),
             ("MingImageTransformer2DModel", "layers"),
             ("AnimaTransformer3DModel", "transformer_blocks"),
+            ("WanS2VTransformer3DModel", "block_runners"),
         ):
             with self.subTest(class_name=class_name):
                 transformer = type(class_name, (), {blocks_attr: blocks})()
