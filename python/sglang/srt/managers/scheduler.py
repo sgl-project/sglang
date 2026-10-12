@@ -2438,7 +2438,9 @@ class Scheduler(
 
     def init_kv_event_lora_names(self) -> None:
         """Init the table that maps lora_id to adapter name for KV events."""
-        self.kv_event_lora_names = KvEventLoraNames.from_lora_refs(get_lora().lora_paths)
+        self.kv_event_lora_names = KvEventLoraNames.from_lora_refs(
+            get_lora().lora_paths
+        )
 
     def init_kv_events_publisher(self) -> None:
         self.kv_events_publisher = SchedulerKvEventsPublisher(

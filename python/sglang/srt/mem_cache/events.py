@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import weakref
 from collections import Counter
-
 from typing import TYPE_CHECKING, Any, Iterable, Optional
 
 from sglang.srt.disaggregation.kv_events import (
@@ -38,7 +37,6 @@ from sglang.srt.mem_cache.utils import (
     compute_node_hash_values,
     hash_str_to_int64,
     kv_event_lora_seed,
-    namespace_event_block_hash,
 )
 
 if TYPE_CHECKING:
@@ -106,7 +104,13 @@ class KvEventLoraNames(LoRANameTable):
         # Namespaces that may have lost their last request or block.
         self._prune_candidates: set[str] = set()
 
-    def register(self, req: Any = None, lora_name: Optional[str] = None, *, lora_id: Optional[str] = None) -> None:
+    def register(
+        self,
+        req: Any = None,
+        lora_name: Optional[str] = None,
+        *,
+        lora_id: Optional[str] = None,
+    ) -> None:
         """Name ``req``'s namespace; ``req`` needs ``extra_key`` and ``lora_id``."""
         if lora_id is not None:
             self._adapter_names[lora_id] = lora_name
@@ -118,12 +122,14 @@ class KvEventLoraNames(LoRANameTable):
         self._prune_candidates.add(req.extra_key)
 
     def get(self, extra_key: Optional[str]) -> Optional[str]:
-        return self.resolve(extra_key)
+        return self._names.get(extra_key)
 
     def resolve(self, extra_key: Optional[str]) -> Optional[str]:
         if not extra_key:
             return None
-        return self._names.get(extra_key) or self._adapter_names.get(extra_key[-_LORA_ID_LEN:])
+        return self._names.get(extra_key) or self._adapter_names.get(
+            extra_key[-_LORA_ID_LEN:]
+        )
 
     def count_published(self, extra_key: Optional[str], num_blocks: int) -> None:
         if extra_key in self._names:
@@ -251,7 +257,11 @@ class KVCacheEventRecorder:
             parent_block_hash = namespaced_block_hash(
                 parent_block_hash, namespace_seed=namespace_seed
             )
-        lora_name = self.lora_names.get(node.key.extra_key)
+        lora_name = (
+            self.lora_names.resolve(node.key.extra_key)
+            if self.dynamo_format
+            else self.lora_names.get(node.key.extra_key)
+        )
 
         page_index = 0
         logical_len = len(node.key)

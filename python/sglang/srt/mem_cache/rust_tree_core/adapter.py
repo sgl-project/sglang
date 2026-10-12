@@ -101,7 +101,9 @@ def _radix_key_buffer(key: RadixKey) -> array:
     return token_ids
 
 
-def _kv_event_from_tagged(event: tuple, lora_names: KvEventLoraNames, dynamo_format: bool = False):
+def _kv_event_from_tagged(
+    event: tuple, lora_names: KvEventLoraNames, dynamo_format: bool = False
+):
     """Build the Python KV cache event for one of the binding's tagged tuples.
 
     Rust hashes are LoRA-agnostic; the trailing extra_key selects the LoRA
@@ -109,7 +111,9 @@ def _kv_event_from_tagged(event: tuple, lora_names: KvEventLoraNames, dynamo_for
     """
     tag = event[0]
     if tag == "block_stored":
-        lora_name = lora_names.get(event[8])
+        lora_name = (
+            lora_names.resolve(event[8]) if dynamo_format else lora_names.get(event[8])
+        )
         seed = None if dynamo_format else kv_event_lora_seed(lora_name)
         lora_names.count_published(event[8], len(event[1]))
         parent = event[2]
@@ -324,7 +328,13 @@ def _fill_evict_result(binding_result, result):
 class _RustKVCacheEventRecorder:
     """Expose the Rust event queue through the Python recorder interface."""
 
-    def __init__(self, binding, enabled: bool, lora_names: KvEventLoraNames, dynamo_format: bool = False):
+    def __init__(
+        self,
+        binding,
+        enabled: bool,
+        lora_names: KvEventLoraNames,
+        dynamo_format: bool = False,
+    ):
         self._binding = binding
         self.enabled = enabled
         self._lora_names = lora_names

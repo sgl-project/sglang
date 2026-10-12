@@ -25,6 +25,8 @@ from sglang.srt.disaggregation.kv_events import (
     BlockRemoved,
     BlockStored,
     StorageMedium,
+    kv_event_namespace_seed,
+    namespaced_block_hash,
 )
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import (
@@ -603,6 +605,7 @@ def _aux_storage_key_transfers(cache, node_id):
 def build_fixture(
     cfg: CacheConfig,
     enable_kv_cache_events: bool = False,
+    dynamo_kv_event_format: bool = False,
     enable_session_radix_cache: bool = False,
     tree_page_size: Optional[int] = None,
     mamba_cache_chunk_size: Optional[int] = None,
@@ -741,6 +744,7 @@ def build_fixture(
         tree_components=cfg.components,
         enable_mamba_extra_buffer=cfg.enable_mamba_extra_buffer,
         enable_kv_cache_events=enable_kv_cache_events,
+        dynamo_kv_event_format=dynamo_kv_event_format,
         kv_event_lora_names=kv_event_lora_names or KvEventLoraNames(),
         enable_session_radix_cache=enable_session_radix_cache,
         eviction_policy=cfg.eviction_policy,
@@ -1582,6 +1586,44 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
             self._event_hashes(store_then_evict("uuid-b")),
             self._event_hashes(lora_a),
         )
+
+    def test_dynamo_lora_hashes_keep_the_dynamo_namespace(self):
+        """The default LoRA mix must not be applied a second time to Dynamo hashes."""
+        extra_key = "0123456789abcdef0123456789abcdef"
+        names, reqs = _lora_names(**{extra_key: "adapter-a"})
+
+        def publish(*, dynamo_format, namespace):
+            cache, allocator, _ = build_fixture(
+                self.cfg,
+                enable_kv_cache_events=True,
+                dynamo_kv_event_format=dynamo_format,
+                kv_event_lora_names=names,
+            )
+            cache.take_events()
+            self._insert(
+                cache,
+                allocator,
+                [1, 2, 3, 4],
+                extra_key=namespace,
+                cache_salt="tenant-a",
+            )
+            stored = self._stored_events(cache, StorageMedium.GPU)
+            cache.evict(EvictParams(num_tokens=4))
+            removed = self._removed_events(cache, StorageMedium.GPU)
+            self.assertEqual(self._event_hashes(removed), self._event_hashes(stored))
+            return stored
+
+        base = publish(dynamo_format=False, namespace=None)
+        lora = publish(dynamo_format=True, namespace=extra_key)
+        seed = kv_event_namespace_seed(extra_key=extra_key, cache_salt="tenant-a")
+        self.assertEqual(
+            self._event_hashes(lora),
+            [
+                namespaced_block_hash(h, namespace_seed=seed)
+                for h in self._event_hashes(base)
+            ],
+        )
+        self.assertEqual(lora[0].lora_name, "adapter-a")
 
     def test_lora_name_is_kept_until_published_blocks_are_removed(self):
         """Removals hash like their stores after the request is gone; then the
