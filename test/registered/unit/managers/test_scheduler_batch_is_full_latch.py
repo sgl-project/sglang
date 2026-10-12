@@ -146,6 +146,20 @@ class TestEmptyBatchFullLatch(CustomTestCase):
         self.assertEqual(s.policy.calc_priority.call_count, 2)
         self.assertFalse(running_batch.batch_is_full)
 
+    def test_prefill_retried_after_no_free_slot_on_empty_batch(self):
+        # Request slots held outside the running batch (for example by
+        # streaming sessions) leave no allocatable slot; once a slot frees up,
+        # the next round must try admission again.
+        s, req, running_batch = self._build(available_size=0)
+        s.get_num_allocatable_reqs.return_value = 0
+        Scheduler._get_new_batch_prefill_raw(s, None, running_batch)
+        self.assertEqual(s.policy.calc_priority.call_count, 0)
+
+        s.get_num_allocatable_reqs.return_value = 8
+        Scheduler._get_new_batch_prefill_raw(s, None, running_batch)
+
+        self.assertEqual(s.policy.calc_priority.call_count, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

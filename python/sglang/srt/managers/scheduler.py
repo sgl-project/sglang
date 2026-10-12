@@ -3842,6 +3842,10 @@ class Scheduler(
         if self.enable_priority_preemption or self.is_hybrid_swa:
             # Reset batch_is_full to try preemption with a prefill adder.
             running_batch.batch_is_full = False
+        if running_batch.is_empty():
+            # An empty batch never reaches update_running_batch, the only
+            # other place that clears the flag, so admission would stay shut.
+            running_batch.batch_is_full = False
 
         if (
             running_batch.batch_is_full or len(self.waiting_queue) == 0
