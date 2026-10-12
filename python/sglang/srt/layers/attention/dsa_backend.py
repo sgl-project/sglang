@@ -2710,17 +2710,12 @@ class DeepseekSparseAttnBackend(
     ) -> torch.Tensor:
         from sgl_kernel.flash_mla import flash_mla_sparse_fwd
 
-        # With attention DP, every GLM-5.2 decode rank owns all 64 Q heads.
-        # Select the matching H64 sparse-prefill specialization rather than
-        # padding to the generic Blackwell H128 path.
+        # FlashMLA sparse kernel requires num_heads to be a multiple of 64 (Hopper) or 128 (Blackwell)
+        # When using TP, num_heads might be smaller (e.g., 256//8=32)
         num_tokens, num_heads, head_dim = q_all.shape
 
         # Determine required padding based on GPU architecture (use cached value)
-        required_padding = (
-            64
-            if self.dsa_kv_cache_store_nvfp4
-            else (128 if self.device_sm_major >= 10 else 64)
-        )
+        required_padding = 128 if self.device_sm_major >= 10 else 64
 
         need_padding = num_heads % required_padding != 0
 

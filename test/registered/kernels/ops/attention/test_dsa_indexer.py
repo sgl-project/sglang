@@ -1298,6 +1298,36 @@ class TestDSAIndexer(CustomTestCase):
             TopkTransformMethod.RAGGED,
         )
 
+    def test_flashmla_sparse_prefill_padding_is_independent_of_cache_format(self):
+        q = torch.randn(2, 64, 576, dtype=torch.bfloat16, device=self.device)
+        kv = torch.randn(4, 1, 576, dtype=torch.bfloat16, device=self.device)
+        indices = torch.zeros(2, 2048, dtype=torch.int32, device=self.device)
+        for nvfp4 in (False, True):
+            with self.subTest(nvfp4=nvfp4):
+                backend = object.__new__(DeepseekSparseAttnBackend)
+                backend.device_sm_major = 10
+                backend.dsa_kv_cache_store_nvfp4 = nvfp4
+                backend.dsa_kv_cache_store_fp8 = not nvfp4
+                output = torch.randn(
+                    2, 128, 512, dtype=torch.bfloat16, device=self.device
+                )
+                with patch(
+                    "sgl_kernel.flash_mla.flash_mla_sparse_fwd",
+                    return_value=(output, None, None),
+                ) as fused:
+                    actual = backend._forward_flashmla_sparse(
+                        q_all=q,
+                        kv_cache=kv,
+                        v_head_dim=512,
+                        page_table_1=indices,
+                        sm_scale=1.0,
+                    )
+                padded_q = fused.call_args.kwargs["q"]
+                self.assertEqual(padded_q.shape, (2, 128, 576))
+                torch.testing.assert_close(padded_q[:, :64], q)
+                self.assertEqual(torch.count_nonzero(padded_q[:, 64:]).item(), 0)
+                torch.testing.assert_close(actual, output[:, :64])
+
     def test_nvfp4_flashmla_dispatch_keeps_packed_cache(self):
         backend = object.__new__(DeepseekSparseAttnBackend)
         backend.dsa_kv_cache_store_nvfp4 = True
