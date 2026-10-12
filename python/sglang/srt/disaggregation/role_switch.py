@@ -238,6 +238,10 @@ def teardown_disaggregation(scheduler: Scheduler) -> None:
                 km.teardown()
             scheduler.disagg_prefill_bootstrap_queue = None
         scheduler.disagg_prefill_inflight_queue = []
+        sender = getattr(scheduler, "early_kv_chunk_sender", None)
+        if sender is not None:
+            sender.stop()
+            scheduler.early_kv_chunk_sender = None
     elif mode == DisaggregationMode.DECODE:
         q = getattr(scheduler, "disagg_decode_prealloc_queue", None)
         if q is not None:

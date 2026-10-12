@@ -19,6 +19,7 @@ Life cycle of a request in the prefill server
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import logging
 import time
@@ -43,10 +44,12 @@ from sglang.srt.disaggregation.common.staging_buffer import (
     compute_grid_segments,
     staging_grid_tokens,
 )
+from sglang.srt.disaggregation.prefill_early_send import EarlyKVChunkSender
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
     DisaggregationMode,
     KVClassType,
+    KVSendOwner,
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
@@ -738,6 +741,7 @@ class SchedulerDisaggregationPrefillMixin:
             self._is_continuous_input_polling_enabled()
         )
         self.result_queue = deque()
+        self.early_kv_chunk_sender = EarlyKVChunkSender.maybe_create(self)
         batch_result_completion_status = torch.empty(1, dtype=torch.int32, device="cpu")
         # True when intake repeats while the oldest batch result is unfinished.
         waiting_for_batch_result = False
@@ -795,6 +799,11 @@ class SchedulerDisaggregationPrefillMixin:
                     batch_result = self.run_batch(batch)
                     self._apply_war_barrier()
                     self.result_queue.append((batch.copy(), batch_result))
+                    if (
+                        self.early_kv_chunk_sender is not None
+                        and batch_result.delay_sample_func is None
+                    ):
+                        self.early_kv_chunk_sender.submit(batch, batch_result)
                 else:
                     batch_result = None
 
@@ -822,7 +831,12 @@ class SchedulerDisaggregationPrefillMixin:
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
+            sample_delayed = (
+                batch_result is not None and batch_result.delay_sample_func is not None
+            )
             self.launch_batch_sample_if_needed(batch_result, batch)
+            if sample_delayed and self.early_kv_chunk_sender is not None:
+                self.early_kv_chunk_sender.submit(batch, batch_result)
 
             # Update last_batch and scheduler status
             self._sched_idled = batch is None
@@ -931,7 +945,13 @@ class SchedulerDisaggregationPrefillMixin:
             if req.inflight_middle_chunks <= 0:
                 req.time_stats.set_prefill_finished_time()
 
-                if is_aborted(req):
+                sends_last_chunk = req.kv_send_owner != KVSendOwner.EARLY
+                if is_aborted(req) and not sends_last_chunk:
+                    # The early sender may already be transferring; conclude
+                    # through the inflight queue like a request aborted after
+                    # its send.
+                    req.disagg_kv_sender.abort()
+                elif is_aborted(req):
                     if self._retire_aborted_prefill_result(req):
                         req.time_stats.set_completion_time()
                         aborted_reqs.append(req)
@@ -965,7 +985,8 @@ class SchedulerDisaggregationPrefillMixin:
                     advance_logprob_pt(i, req)
                     continue
 
-                req.output_ids.append(next_token_id)
+                if sends_last_chunk:
+                    req.output_ids.append(next_token_id)
                 if req.grammar is not None:
                     try:
                         req.grammar.accept_token(next_token_id)
@@ -1023,9 +1044,10 @@ class SchedulerDisaggregationPrefillMixin:
                     == "prefill_complete"
                 ):
                     req.disagg_kv_sender.mark_prefill_complete()
-                if not req.pending_bootstrap:
-                    self.send_kv_chunk(req, last_chunk=True)
-                req.time_stats.set_prefill_transfer_queue_entry_time()
+                if sends_last_chunk:
+                    if not req.pending_bootstrap:
+                        self.send_kv_chunk(req, last_chunk=True)
+                    req.time_stats.set_prefill_transfer_queue_entry_time()
 
             else:
                 # being chunked reqs' prefill is not finished
@@ -1072,7 +1094,11 @@ class SchedulerDisaggregationPrefillMixin:
 
                 # In non-overlap-mode, KV is sent in process_prefill_chunk
                 # Only send when req's sender is initialized
-                if self.enable_overlap and not req.pending_bootstrap:
+                if (
+                    self.enable_overlap
+                    and not req.pending_bootstrap
+                    and req.kv_send_owner != KVSendOwner.EARLY
+                ):
                     assert req.metadata_buffer_index >= 0, (
                         f"Req {req.rid} does not have metadata buffer allocated"
                     )
@@ -1252,10 +1278,17 @@ class SchedulerDisaggregationPrefillMixin:
             logger.warning(error_message)
         req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
         if req.finished_reason is None:
-            req.finished_reason = FINISH_LENGTH(length=0)
-        # unlock the tree
-        release_kv_cache(req, self.tree_cache, checkpoint=True)
-        self._release_aborted_request(req)
+            # Keep a client abort that failed the transfer, e.g. after an
+            # early send already handed the KV to the transfer engine.
+            req.finished_reason = (
+                req.to_finish
+                if isinstance(req.to_finish, FINISH_ABORT)
+                else FINISH_LENGTH(length=0)
+            )
+        with self.early_kv_send_lock(req):
+            # unlock the tree
+            release_kv_cache(req, self.tree_cache, checkpoint=True)
+            self._release_aborted_request(req)
         if not isinstance(req.finished_reason, FINISH_ABORT):
             prepare_abort(
                 req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
@@ -1275,6 +1308,10 @@ class SchedulerDisaggregationPrefillMixin:
 
     def _retire_aborted_prefill_result(self: Scheduler, req: Req) -> bool:
         """Release an aborted request when its last prefill result is safe."""
+        with self.early_kv_send_lock(req):
+            return self._retire_aborted_prefill_result_locked(req)
+
+    def _retire_aborted_prefill_result_locked(self: Scheduler, req: Req) -> bool:
         self.clear_pending_chunk_send(req)
         owns_resources = (
             req.kv.holds_kv or req.kv.holds_mamba or req.metadata_buffer_index >= 0
@@ -1412,6 +1449,9 @@ class SchedulerDisaggregationPrefillMixin:
     def maybe_send_cached_prefix_chunk(self: Scheduler, req: Req) -> None:
         if not envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX.get():
             return
+        # The early sender sends every chunk of the requests it owns.
+        if req.kv_send_owner == KVSendOwner.EARLY:
+            return
 
         # Staging sends into positional grid slots, so the early-send boundary
         # must stay stable across the request's batches: snapshot the at-rest
@@ -1445,6 +1485,13 @@ class SchedulerDisaggregationPrefillMixin:
             ev.record(self.forward_stream)
             req.disagg_kv_sender._early_send_wait_event = ev
         self.send_kv_chunk(req, last_chunk=False, end_idx=cached_end)
+
+    def early_kv_send_lock(self: Scheduler, req: Req):
+        """Hold while releasing `req`'s KV so no early send is reading it."""
+        sender = getattr(self, "early_kv_chunk_sender", None)
+        if sender is None or req.kv_send_owner != KVSendOwner.EARLY:
+            return contextlib.nullcontext()
+        return sender.lock
 
     def send_kv_chunk(
         self,
@@ -1691,6 +1738,7 @@ class SchedulerDisaggregationPrefillMixin:
         req.start_send_idx = 0
         self.clear_pending_chunk_send(req)  # re-sends from scratch
         req.tmp_end_idx = -1
+        req.kv_send_owner = KVSendOwner.NONE
         req.disagg_decode_prefix_len = 0
         req.early_send_prefix_end = None
         req.hidden_states_tensor = None

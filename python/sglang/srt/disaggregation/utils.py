@@ -145,6 +145,14 @@ def get_qsa_pending_state_indices(req: Req) -> np.ndarray:
     return np.array([int(req_pool_idx)], dtype=np.int32)
 
 
+class KVSendOwner(Enum):
+    """Who sends a prefill request's KV chunks (and appends its first token)."""
+
+    NONE = "none"  # not decided yet
+    EARLY = "early"  # EarlyKVChunkSender worker thread
+    SCHEDULER = "scheduler"  # process_batch_result_disagg_prefill
+
+
 class DisaggregationMode(Enum):
     NULL = "null"
     PREFILL = "prefill"

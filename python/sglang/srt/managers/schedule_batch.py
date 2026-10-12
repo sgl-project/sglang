@@ -92,7 +92,11 @@ from sglang.srt.disaggregation.base import BaseKVSender
 from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
     ScheduleBatchDisaggregationDecodeMixin,
 )
-from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
+from sglang.srt.disaggregation.utils import (
+    FAKE_BOOTSTRAP_HOST,
+    DisaggregationMode,
+    KVSendOwner,
+)
 from sglang.srt.dllm.mixin.req import ReqDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.managers.embed_types import PositionalEmbeds
@@ -1387,6 +1391,7 @@ class Req(ReqDllmMixin):
         # This is because kv is not ready in `process_prefill_chunk`.
         # We use `tmp_end_idx` to store the end index of the kv cache to send.
         self.tmp_end_idx: int = -1
+        self.kv_send_owner: KVSendOwner = KVSendOwner.NONE
         # Decode-side cached-prefix length; base of the staging chunk grid
         # (start_send_idx starts here but advances with every send).
         self.disagg_decode_prefix_len: int = 0

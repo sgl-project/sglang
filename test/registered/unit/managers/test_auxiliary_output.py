@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
+from sglang.srt.disaggregation.utils import KVSendOwner
 from sglang.srt.layers.logits_processor import (
     LogitsProcessorOutput,
     SamplingMaskOutput,
@@ -578,6 +579,7 @@ def test_disaggregated_prefill_consumes_auxiliary_output_after_commit():
         finished_reason=None,
         inflight_middle_chunks=0,
         pending_bootstrap=False,
+        kv_send_owner=KVSendOwner.NONE,
         return_logprob=False,
         return_sampling_mask=False,
         grammar=None,
