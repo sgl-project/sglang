@@ -33,7 +33,7 @@ from sglang.srt.managers.data_parallel_controller import (
 from sglang.srt.managers.load_snapshot import LoadSnapshot
 from sglang.srt.runtime_context import get_context
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
 
 _BASE_LOAD = msgspec.structs.replace(

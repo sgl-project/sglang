@@ -17,7 +17,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=120, stage="base-c", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=110, stage="base-c", runner_config="4-gpu-h100")
 
 
 class TestDPSpecPrefillCoordination(CustomTestCase):

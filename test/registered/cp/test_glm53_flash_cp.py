@@ -18,7 +18,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=600, stage="extra-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=363, stage="extra-b", runner_config="4-gpu-b200")
 
 
 class TestGLM53FlashB200ContextParallel(

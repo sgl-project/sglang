@@ -6,7 +6,7 @@ from sglang.srt.models.qwen3_5_mtp import Qwen3_5ForCausalLMMTP, _mtp_quant_conf
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 # The real `mtp.*` exclude entries of the two AMD Quark MXFP4 checkpoints.
 # Quark names layers in the checkpoint namespace, where the draft is prefixed

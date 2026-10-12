@@ -17,7 +17,7 @@ from sglang.srt.layers.deep_gemm_wrapper.compile_utils import (
     _BaseWarmupExecutor,
 )
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def _allocate_on_meta(factory):
