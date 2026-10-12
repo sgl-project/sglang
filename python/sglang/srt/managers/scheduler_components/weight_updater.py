@@ -123,6 +123,23 @@ class SchedulerWeightUpdaterManager:
                 empty_cache=recv_req.torch_empty_cache
             )
             assert flush_cache_success, "Cache flush failed after updating weights"
+            self._clear_storage_after_weight_update()
+
+    def _clear_storage_after_weight_update(self) -> None:
+        """Drop L3 too: flush_cache only resets the tree and the host tier, and
+        a storage key carries no weight version, so a later prefetch would serve
+        KV computed with the previous weights."""
+        scheduler = self.scheduler
+        if scheduler is None or not (
+            scheduler.enable_hierarchical_cache or scheduler.enable_lmcache
+        ):
+            return
+        if scheduler.tree_cache.clear_storage_backend():
+            return
+        logger.warning(
+            "Could not clear the HiCache storage backend after a weight update; "
+            "it may still serve KV computed with the previous weights."
+        )
 
     def record_weight_version_after_update(self, weight_version: Optional[str]) -> None:
         self.scheduler.record_weight_version_change(new_version=weight_version)

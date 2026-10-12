@@ -159,7 +159,11 @@ class _WeightUpdaterManagerTestBase(CustomTestCase):
             scheduler=SimpleNamespace(
                 record_weight_version_change=lambda new_version: self.recorded.append(
                     new_version
-                )
+                ),
+                # A flush after the update also drops L3, which these cases
+                # leave off.
+                enable_hierarchical_cache=False,
+                enable_lmcache=False,
             ),
         )
 
