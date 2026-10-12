@@ -598,6 +598,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 "mis-mapped to requests"
             )
         speculative_paged = self._is_speculative_paged_mode(forward_batch.forward_mode)
+        prefill_sequence_lengths_cpu = None
         if speculative_paged:
             logical_positions = forward_batch.positions
             if logical_positions.ndim == 2:
@@ -666,6 +667,10 @@ class QwenSparseAttnBackend(AttentionBackend):
                         "QSA extend request mapping exceeds token rows: "
                         f"mapping={token_to_batch_idx.numel()}, "
                         f"positions={num_position_tokens}"
+                    )
+                if forward_batch.seq_lens_cpu is not None:
+                    prefill_sequence_lengths_cpu = tuple(
+                        forward_batch.seq_lens_cpu[:batch_size].tolist()
                     )
         decode_page_table = None
         decode_lengths = None
@@ -753,6 +758,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 self._can_defer_block_expansion(forward_batch.forward_mode)
                 and decode_logical_positions is not None
             ),
+            prefill_sequence_lengths_cpu=prefill_sequence_lengths_cpu,
         )
         return QwenSparseAttnMetadata(
             sequence_lengths=sequence_lengths,
@@ -1592,7 +1598,12 @@ class QwenSparseAttnBackend(AttentionBackend):
             k_buffer = pool.get_key_buffer(layer.layer_id)
             v_buffer = pool.get_value_buffer(layer.layer_id)
             req_to_token = self.req_to_token_pool.req_to_token
-            req_indices = forward_batch.req_pool_indices[: meta.bs].tolist()
+            # The scheduler's host copy avoids a device sync in every layer.
+            req_indices = (
+                forward_batch.req_pool_indices_cpu
+                if forward_batch.req_pool_indices_cpu is not None
+                else forward_batch.req_pool_indices
+            )[: meta.bs].tolist()
             k_parts, v_parts = [], []
             extend_start = 0
             for req_idx, prefix_len, extend_len in zip(
@@ -1611,12 +1622,12 @@ class QwenSparseAttnBackend(AttentionBackend):
             # Use gathered new K/V even when save_kv_cache=False; those rows
             # need not have been written to the cache by the caller.
             k_full, v_full = torch.cat(k_parts), torch.cat(v_parts)
-        base = [0]
-        for length in seq_lens[:-1]:
-            base.append(base[-1] + length)
         # one entry per (request, prev block) then per (request, next block);
         # the kernel reads cu_k[e] as the request's K base row only.
-        cu_k = torch.tensor(base + base, dtype=torch.int32, device=q.device)
+        # Built on device: a host list -> device copy would sync every layer.
+        device_seq_lens = forward_batch.seq_lens[: meta.bs].to(torch.int32)
+        k_base = torch.cumsum(device_seq_lens, 0, dtype=torch.int32) - device_seq_lens
+        cu_k = torch.cat([k_base, k_base])
         output = sparse_gqa_fwd_interface_triton_ck(
             q,
             k_full,
@@ -1626,6 +1637,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             cu_k,
             meta.kv_len_combined_tensor,
             layer.scaling,
+            max_q=meta.max_seqlen_q_combined,
         )
         return self._pad_extend_output(output, num_output_rows)
 

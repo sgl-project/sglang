@@ -126,7 +126,7 @@ def test_cp_indexer_matches_compressed_dtype_without_storing_local_keys(
         index_head_dim=4,
         index_qk_proj=lambda value: (torch.cat([value, value], dim=-1), None),
         q_layernorm=lambda value: value,
-        apply_rope=lambda positions, value: value,
+        apply_rope=Mock(side_effect=lambda positions, value, **kwargs: value),
         _use_fused_prep=Mock(
             side_effect=AssertionError("local keys must not be stored")
         ),
@@ -147,6 +147,8 @@ def test_cp_indexer_matches_compressed_dtype_without_storing_local_keys(
     )
     torch.testing.assert_close(actual, expected)
     indexer._use_fused_prep.assert_not_called()
+    # Sizing the RoPE cache reads positions.max() on the host: a device sync per layer.
+    assert indexer.apply_rope.call_args.kwargs["ensure_cos_sin_cache"] is False
     update = indexer.update_key_state_and_compress.call_args
     torch.testing.assert_close(update.args[0], hidden.unsqueeze(1))
     assert update.kwargs["state_stored"] is False
@@ -256,10 +258,12 @@ def test_qsa_cp_cached_prefix_matches_full_context_attention(
     )
     batch = SimpleNamespace(
         attn_cp_metadata=meta,
+        seq_lens=torch.tensor(seq_lens),
         seq_lens_cpu=seq_lens,
         extend_seq_lens_cpu=extend_lens,
         extend_prefix_lens_cpu=list(prefix_lens),
         req_pool_indices=torch.tensor(req_indices),
+        req_pool_indices_cpu=torch.tensor(req_indices),
         out_cache_loc=out_cache_loc,
     )
     local_q = strategy.shard_hidden_states(queries, batch)
@@ -285,11 +289,13 @@ def test_qsa_cp_cached_prefix_matches_full_context_attention(
         qwen_sparse_attn_backend, "cp_materialize_global_token_order", gather_new_kv
     )
 
-    def sparse_chunk_attention(q, k, v, indices, cu_q, cu_k, kv_lens, scale):
+    def sparse_chunk_attention(q, k, v, indices, cu_q, cu_k, kv_lens, scale, max_q):
         # The last local query in each block identifies its absolute causal end.
         expected_ends = local_positions[cu_q[1:].long() - 1] + 1
         torch.testing.assert_close(kv_lens.long(), expected_ends)
         assert k.dtype == v.dtype == q.dtype
+        # The host max_q sizes the kernel grid; a short one would skip query rows.
+        assert max_q == int((cu_q[1:] - cu_q[:-1]).max())
         return _cpu_sparse_chunk_attention(q, k, v, indices, cu_q, cu_k, kv_lens, scale)
 
     monkeypatch.setattr(
