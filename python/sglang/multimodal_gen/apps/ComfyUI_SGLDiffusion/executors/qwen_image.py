@@ -74,6 +74,7 @@ class QwenImageAdapter(ComfyUIModelAdapter):
 class QwenImageEditAdapter(QwenImageAdapter):
     model_types = ("qwen_image_edit",)
     pipeline_class_name = "QwenImageEditPlusPipeline"
+    applied_conditioning = ("ref_latents",)
 
     def pack(
         self,

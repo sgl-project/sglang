@@ -50,9 +50,7 @@ def _staged_fixture(full_match=2):
         root_node_handle=lambda extra_key=None: 0,
         inc_full_pin=Mock(),
         dec_full_pin=Mock(),
-        empty_match_result=SimpleNamespace(
-            last_device_node=0, device_indices=torch.arange(0)
-        ),
+        empty_match_result=SimpleNamespace(last_device_node=0),
     )
     cache.host_memory_mode = "buffer_only"
     cache.linker = None
@@ -65,6 +63,7 @@ def _staged_fixture(full_match=2):
     cache.ongoing_prefetch = {}
     cache._prefetch_outcome_stats = defaultdict(int)
     cache.tree_components = []
+    cache.components = {}
     cache.prefetch_threshold = 2
     cache._build_sidecar_transfers = Mock(return_value=[])
     cache.supports_swa = lambda: True
@@ -88,7 +87,6 @@ def _staged_fixture(full_match=2):
         entry_map={
             PoolName.SWA: SimpleNamespace(
                 host_pool=SimpleNamespace(free=Mock()),
-                device_indices_from_anchor_fn=None,
             )
         },
     )

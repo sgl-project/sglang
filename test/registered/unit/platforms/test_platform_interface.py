@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang import _platform_stubs
-from sglang.srt.platforms import _load_platform_class, _resolve_platform
+from sglang.srt.platforms import _load_platform_class, _resolve_platform, interface
 from sglang.srt.platforms.cpu import CpuSRTPlatform
 from sglang.srt.platforms.cuda import CudaSRTPlatform
 from sglang.srt.platforms.device_mixin import (
@@ -384,6 +384,56 @@ class TestCpuDeviceMixin(CustomTestCase):
         name = base.get_device_name()
         self.assertIn("x86_64", name)
 
+    def test_cpu_srt_platform_capabilities(self):
+        base = CpuSRTPlatform()
+        self.assertTrue(base.capabilities.graph_capture)
+        self.assertFalse(base.capabilities.piecewise_graph)
+        self.assertFalse(base.capabilities.supports_triton)
+        # CPU has no GPU to pin host memory to.
+        self.assertFalse(base.is_pin_memory_available())
+        self.assertFalse(base.is_pin_memory_available(device="cpu"))
+
+
+class TestLegacyKvPoolHookDeprecation(CustomTestCase):
+    """get_kv_pool_cls() still serves platforms on the removed class hooks.
+
+    get_{mha,mla,dsa}_kv_pool_cls were the out-of-tree contract before
+    get_kv_pool_cls replaced them. An OOT platform pinned to an older sglang
+    overrides them and nothing else, so dropping the hooks outright would
+    silently build the CUDA-assuming in-tree pool on its device.
+    """
+
+    def test_legacy_hook_is_used_and_warns_once_per_kind(self):
+        sentinel = type("VendorMHAPool", (), {})
+
+        class LegacyPlatform(SRTPlatform):
+            def get_mha_kv_pool_cls(self):
+                return sentinel
+
+        platform = LegacyPlatform()
+        with self.assertLogs("sglang.srt.platforms.interface", "WARNING") as logs:
+            self.assertIs(platform.get_kv_pool_cls(kind="mha"), sentinel)
+        self.assertIn("get_mha_kv_pool_cls", logs.output[0])
+
+        # The warning is per (class, hook); a hot path must not re-log it.
+        with patch.object(interface.logger, "warning") as mock_warning:
+            self.assertIs(platform.get_kv_pool_cls(kind="mha"), sentinel)
+        mock_warning.assert_not_called()
+
+    def test_kinds_without_a_legacy_hook_stay_none(self):
+        class LegacyPlatform(SRTPlatform):
+            def get_mha_kv_pool_cls(self):
+                return type("VendorMHAPool", (), {})
+
+        platform = LegacyPlatform()
+        self.assertIsNone(platform.get_kv_pool_cls(kind="mla"))
+        self.assertIsNone(platform.get_kv_pool_cls(kind="dsa"))
+
+    def test_platform_on_neither_api_gets_the_in_tree_pool(self):
+        base = SRTPlatform()
+        for kind in ("mha", "mla", "dsa"):
+            self.assertIsNone(base.get_kv_pool_cls(kind=kind))
+
 
 class TestMpsDeviceMixin(CustomTestCase):
     """Tests for the built-in Apple MPS platform contract."""
@@ -491,6 +541,42 @@ class TestMpsDeviceMixin(CustomTestCase):
             finally:
                 common.get_device_count.cache_clear()
                 common.get_device.cache_clear()
+
+
+class TestMusaAvailableMemory(CustomTestCase):
+    def test_integrated_and_discrete_memory_sources(self):
+        from sglang.srt.utils import common
+
+        gpu_id = 3
+        for integrated in (True, False):
+            for empty_cache in (True, False):
+                with self.subTest(integrated=integrated, empty_cache=empty_cache):
+                    musa = MagicMock()
+                    musa.device_count.return_value = 4
+                    musa.current_device.return_value = gpu_id
+                    musa.get_device_properties.return_value.is_integrated = integrated
+                    musa.mem_get_info.return_value = (2 << 30, 16 << 30)
+                    with (
+                        patch.object(torch, "musa", musa, create=True),
+                        patch.object(common.psutil, "virtual_memory") as host_memory,
+                        patch.object(common, "empty_device_cache") as clear_cache,
+                    ):
+                        host_memory.return_value.available = 6 << 30
+                        self.assertEqual(
+                            common.get_available_gpu_memory(
+                                "musa", gpu_id, empty_cache=empty_cache
+                            ),
+                            6.0 if integrated else 2.0,
+                        )
+                        if integrated:
+                            musa.mem_get_info.assert_not_called()
+                        else:
+                            musa.mem_get_info.assert_called_once_with(gpu_id)
+                            host_memory.assert_not_called()
+                        if empty_cache:
+                            clear_cache.assert_called_once_with(musa)
+                        else:
+                            clear_cache.assert_not_called()
 
 
 class TestPinMemoryAvailability(CustomTestCase):
