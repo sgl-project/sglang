@@ -1786,6 +1786,10 @@ class Envs:
     # the one-shot custom all-reduce gives the same bits.
     SGLANG_OPT_LORA_ROW_PARALLEL_FUSED_ALL_REDUCE = EnvBool(False)
     SGLANG_OPT_LORA_ROW_PARALLEL_FUSED_ALL_REDUCE_MAX_TOKENS = EnvInt(16)
+    # Marlin MoE LoRA runner: run the decode GEMMs (moe_block_size 8) of MXFP4
+    # weights through a dedicated decode kernel instead of the Marlin launcher,
+    # and skip Marlin's zero padding of the intermediate dimension once checked.
+    SGLANG_OPT_MXFP4_MOE_DECODE_GEMM = EnvBool(False)
 
     # ===================================================================
     # Kimi K3
