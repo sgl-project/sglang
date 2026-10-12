@@ -49,6 +49,11 @@ KSTATELOC_R = re.compile(
     r"\[KSTATELOC\]\s+op=R\s+(\d+)\s+(\d+)\s+(-?\d+)\s+(\d+)\s+(\d+)\s+(\d+)"
 )
 SEQ_TUP = re.compile(r"\((\d+),(\d+),(\d+)\)")
+# Each HTTP request to the serving endpoint logs one ``/v1/chat/completions``
+# line, so those lines are the STRONGEST request boundary (one curl == one
+# request).  ``parse`` stamps every probe row with ``_req`` = the number of
+# boundary lines seen so far, and ``_idxin_chat_split`` groups on it.
+CHAT_BOUNDARY = re.compile(r"/v1/chat/completions")
 MAX_REQ_SHOWN = 20
 MAX_DIFF_SHOWN = 8
 OSHAPE_KEYS = ("ratio", "ori_page", "ori_bt", "s2Size", "cmp_page", "cmp_bt")
@@ -77,17 +82,26 @@ def parse(path):
 
     Rows produced before c85e85c lack ``lastpos`` on [IDXK]/[C4KV]; infer it
     from the most recent [CMPIDX] line (same forward step), so old logs align.
+
+    Every probe row is also stamped with ``_req`` = the number of
+    ``/v1/chat/completions`` boundary lines seen so far, so the strongest
+    request split (one HTTP request) can attribute each row to its request.
     """
     recs = defaultdict(list)
     cur_lp = None
+    chat_n = 0
     with open(path, "r", encoding="utf-8-sig", errors="replace") as fh:
         for ln in fh:
             ln = ln.lstrip("\ufeff")
+            if CHAT_BOUNDARY.search(ln):
+                chat_n += 1
+                recs["#CHAT"].append({"n": chat_n})
             mt = TAG.search(ln)
             if not mt:
                 continue
             tag = mt.group(1)
             d = dict(KV.findall(ln))
+            d["_req"] = chat_n
             if tag == "IDXIN" and "kpg=" in ln:
                 # Overwrite the KV-truncated kpg= with the full structured value.
                 d["kpg"] = _parse_kpg(ln)
@@ -386,15 +400,76 @@ def _idxin_requests_by_stream(rows):
     return reqs
 
 
+def _idxin_chat_split(rows):
+    """Group [IDXIN] rows by the ``/v1/chat/completions`` boundary before them.
+
+    ``parse`` stamps every row with ``_req`` = the number of chat/completions
+    boundary lines seen so far, so the request opened by the k-th boundary owns
+    the rows with ``_req == k`` (the user's "5th request" == index 5).  EMPTY
+    buckets are kept, so the returned list index EQUALS the boundary ordinal and
+    ``req{i}`` output matches the curl order.  Returns ``(groups, n_boundaries)``.
+    """
+    by = defaultdict(list)
+    top = 0
+    for r in rows:
+        k = _int(r, "_req", 0)
+        by[k].append(r)
+        top = max(top, k)
+    return [by.get(i, []) for i in range(top + 1)], top
+
+
+def _idxin_split_source(rows):
+    """Name the segmenter ``_idxin_requests`` uses: chat/completions|lastpos|stream."""
+    if any(_int(r, "_req", 0) > 0 for r in rows):
+        return "chat/completions"
+    if any(_int(r, "lastpos") >= 0 for r in rows):
+        return "lastpos"
+    return "stream"
+
+
+def _idxin_split_info(rows):
+    """``(source, n_req, hit_idx)`` banner fields for the ``[IDXIN-SPLIT]`` line.
+
+    ``source`` names the segmenter in use; ``n_req`` is the detected request
+    count (the HTTP request count when chat-split); ``hit_idx`` is the same-slq
+    HIT that [IDXIN-ROPE] compares against the MISS (its boundary ordinal when
+    chat-split), or ``None`` when there is no MISS/HIT pair.
+    """
+    source = _idxin_split_source(rows)
+    reqs = _idxin_requests(rows)
+    if source == "chat/completions":
+        n_req = max((_int(r, "_req", 0) for r in rows), default=0)
+    else:
+        n_req = len(reqs)
+    if len(reqs) < 2:
+        return source, n_req, None
+    miss_i = _idxin_miss_index(reqs)
+    same_hits, _slq, _slk = _idxin_same_len_hits(reqs, miss_i)
+    return source, n_req, (same_hits[0] if same_hits else None)
+
+
+def report_idxin_split(rows):
+    """One ``[IDXIN-SPLIT]`` banner naming the request-split source + HIT idx."""
+    if not rows:
+        return
+    source, n_req, hit_i = _idxin_split_info(rows)
+    hit_txt = "none" if hit_i is None else str(hit_i)
+    print(f"  [IDXIN-SPLIT] source={source} requests={n_req} hit_idx={hit_txt}")
+
+
 def _idxin_requests(rows):
     """Split [IDXIN] rows into requests.
 
-    Prefers the order-based split keyed on ``lastpos`` -- which ``parse`` fills
-    from the preceding [CMPIDX] -- so logs WITH [CMPIDX] keep the existing
-    behaviour.  When the log has NO [CMPIDX] at all there is no ``lastpos`` to
-    key on, so fall back to the self-contained ``(mode,slq,slk)`` run split
-    (``_idxin_requests_by_stream``), which needs nothing but [IDXIN] itself.
+    Prefers, in order:
+
+      1. ``/v1/chat/completions`` HTTP boundaries (``_req``, stamped by
+         ``parse``) -- the strongest signal: the user's real request boundaries;
+      2. the order-based ``lastpos`` split (logs WITH [CMPIDX]);
+      3. the self-contained ``(mode,slq,slk)`` stream split.
     """
+    if any(_int(r, "_req", 0) > 0 for r in rows):
+        groups, _n = _idxin_chat_split(rows)
+        return groups
     if any(_int(r, "lastpos") >= 0 for r in rows):
         reqs = []
         last_lp = None
@@ -466,14 +541,18 @@ def report_idxin_requests(rows):
     """
     if not rows:
         return
+    report_idxin_split(rows)
     reqs = _idxin_requests(rows)
-    if len(reqs) < 2:
+    n_req = sum(1 for g in reqs if g)
+    if n_req < 2:
         print("  [IDXIN-KM] <2 requests -> per-request MISS/HIT split skipped")
         return
     miss_i = _idxin_miss_index(reqs)
     print(f"  [IDXIN-KM] MISS=req{miss_i} (largest prefill slq); "
-          f"{len(reqs) - 1} HIT request(s)")
+          f"{n_req - 1} HIT request(s)")
     for i, g in enumerate(reqs[:MAX_REQ_SHOWN]):
+        if not g:
+            continue
         role = "MISS" if i == miss_i else "HIT "
         km = _distinct_km(g)
         print(f"     req{i} {role} probes={len(g)} distinct(klog,kpg)={len(km)}")
@@ -652,13 +731,19 @@ def report_idxin_rope(rows, knorm_tol=0.05):
     NOT derivable (``knorm`` is a whole-request mean); the whole-request same-slq
     comparison is used and that fact is printed.
 
+    Requests are split by the ``/v1/chat/completions`` boundary when present
+    (see ``_idxin_requests``), so ``req{i}`` matches the curl order and the
+    ``[IDXIN-SPLIT]`` banner lets the user confirm which request is the HIT.
+
     Also prints the ``shift`` = ``abs - loc`` (the phase error: 0 for the MISS,
     ``start_pos // cmp_ratio`` for a suffix HIT).  Additive / read-only.
     """
     if not rows:
         return
+    report_idxin_split(rows)
     reqs = _idxin_requests(rows)
-    if len(reqs) < 2:
+    n_req = sum(1 for g in reqs if g)
+    if n_req < 2:
         print("  [IDXIN-ROPE] <2 requests -> MISS/HIT RoPE split skipped")
         return
     miss_i = _idxin_miss_index(reqs)
@@ -677,18 +762,20 @@ def report_idxin_rope(rows, knorm_tol=0.05):
         hit_idx = same_hits
         pairing_txt = f"same-slq/slk HIT(s)={same_hits}"
     else:
-        hit_idx = [j for j in range(len(reqs)) if j != miss_i]
+        hit_idx = [j for j in range(len(reqs)) if j != miss_i and reqs[j]]
         pairing_txt = "no same-slq HIT -> fallback to all HITs (lengths differ)"
     hit_len_txt = ",".join(str(s) for s in sorted({_idxin_req_len(reqs[j])[0]
                                                    for j in hit_idx}))
 
     print(f"  [IDXIN-ROPE] MISS=req{miss_i} (largest prefill slq={miss_slq}); "
-          f"{len(reqs) - 1} HIT request(s)  knorm_tol={knorm_tol}")
+          f"{n_req - 1} HIT request(s)  knorm_tol={knorm_tol}")
     print(f"  [IDXIN-ROPE] pairing: {pairing_txt}  miss_slk={miss_slk} "
           f"hit_slq={hit_len_txt}")
     print("  [IDXIN-ROPE] note: per-block knorm not derivable (knorm is a "
           "whole-request mean); using whole-request same-slq comparison")
     for i, _g in enumerate(reqs[:MAX_REQ_SHOWN]):
+        if not _g:
+            continue
         role = "MISS" if i == miss_i else "HIT "
         kmeans = [_knorm_mean(v) for v in knorms[i]]
         kmean_txt = ",".join(
@@ -1493,7 +1580,10 @@ def _selftest():
     the CONTENT/WINDOW [IDXIN-ROPE] branches.  Finally, TWO same-slq-pairing
     cases: C1 has a same-slq HIT (knorm ~equal) and asserts the MISS is paired
     with THAT HIT (ROPE-PHASE, not a false CONTENT/WINDOW from the first short
-    HITs); C2 has NO same-slq HIT and asserts the fallback is stated.
+    HITs); C2 has NO same-slq HIT and asserts the fallback is stated.  FINALLY,
+    D1 builds a synthetic log with FIVE ``/v1/chat/completions`` boundary lines
+    and asserts the boundary split picks request 5 as the HIT (``[IDXIN-SPLIT]
+    source=chat/completions requests=5 hit_idx=5``) and yields ROPE-PHASE.
     """
     import contextlib
     import io
@@ -1588,6 +1678,25 @@ def _selftest():
             _idxin(5, 17523, "aaaa", kpg_a, knorm="198.935:100:64", shift=0),
             _idxin(5, 10, "xx", kpg_a, knorm="198.935:100:64", shift=1, slk=10),
         ]
+        # D1: /v1/chat/completions HTTP boundaries -- the STRONGEST split signal.
+        #     The 5th request is the HIT (same slq=17523 as the 4th=MISS); the
+        #     boundary split must pick request 5 (not the earlier short ones) and
+        #     print ROPE-PHASE.
+        CHAT = ('INFO:     127.0.0.1:0 - "POST /v1/chat/completions '
+                'HTTP/1.1" 200 OK')
+        chat_split = [
+            CHAT,  # request 1: short
+            _idxin(5, 10, "s1", kpg_a, knorm="6.71568:100:64", shift=1, slk=10),
+            CHAT,  # request 2: short
+            _idxin(5, 12, "s2", kpg_a, knorm="12.7265:100:64", shift=1, slk=12),
+            CHAT,  # request 3: short
+            _idxin(5, 14, "s3", kpg_a, knorm="12.7265:100:64", shift=1, slk=14),
+            CHAT,  # request 4: MISS prefill
+            _idxin(5, 17523, "aaaa", kpg_a, knorm="198.935:100:64", shift=0),
+            CHAT,  # request 5: HIT (same slq) -> the one to compare against
+            _idxin(5, 17523, "bbbb", kpg_a, knorm="199.0:100:64",
+                   shift=4380, slk=17523),
+        ]
 
         def _run_nocmp(src_lines):
             """Parse + report a synthetic no-[CMPIDX] log; return (rows, out)."""
@@ -1612,8 +1721,10 @@ def _selftest():
         b2_rows, b2_out = _run_nocmp(nocmp_content)
         c1_rows, c1_out = _run_nocmp(same_slq)
         c2_rows, c2_out = _run_nocmp(no_same_slq)
+        d1_rows, d1_out = _run_nocmp(chat_split)
         b1_reqs = _idxin_requests(b1_rows)
         b2_reqs = _idxin_requests(b2_rows)
+        d1_reqs = _idxin_requests(d1_rows)
 
         checks = [
             ("kpg full value parsed",
@@ -1668,6 +1779,20 @@ def _selftest():
              "no same-slq HIT" in c2_out),
             ("[IDXIN-ROPE] no-same-slq fallback still ROPE-PHASE",
              "=> ROPE-PHASE" in c2_out),
+            ("[IDXIN-SPLIT] chat/completions banner (5 requests, HIT=5)",
+             "[IDXIN-SPLIT] source=chat/completions requests=5 hit_idx=5"
+             in d1_out),
+            ("chat boundary split picks request 5 as HIT",
+             _idxin_split_info(d1_rows) == ("chat/completions", 5, 5)),
+            ("chat boundary split MISS=req4 (prefill before the HIT)",
+             _idxin_miss_index(d1_reqs) == 4),
+            ("[IDXIN-ROPE] chat-split HIT -> ROPE-PHASE",
+             "miss_slq=17523" in d1_out and "hit_slq=17523" in d1_out
+             and "=> ROPE-PHASE" in d1_out
+             and "=> CONTENT/WINDOW" not in d1_out),
+            ("[IDXIN-SPLIT] non-chat logs keep lastpos/stream source",
+             _idxin_split_source(idxin) == "lastpos"
+             and _idxin_split_source(b1_rows) == "stream"),
             ("[IDXIN-ROPE] per-request knorm+ropephase printed",
              "knorm[" in b1_out and "ropephase[" in b1_out),
         ]
