@@ -527,7 +527,14 @@ def test_engram_gather_reads_column_slice_ids():
         got = torch.empty_like(ref)
         for out, i in ((ref, ids.reshape(-1)), (got, ids)):
             engram_gather(
-                weight.data_ptr(), scale.data_ptr(), i, out, dim, blk, row_lo=500, row_hi=2500
+                weight.data_ptr(),
+                scale.data_ptr(),
+                i,
+                out,
+                dim,
+                blk,
+                row_lo=500,
+                row_hi=2500,
             )
         assert torch.equal(ref, got)
 
