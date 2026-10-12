@@ -53,7 +53,7 @@ def _get_runner(device: torch.device):
         assert MAX_TOKENS >= MAX_ROWS, MAX_TOKENS
         _runner = DSV41MonoLayer(p.tp_size, p.tp_rank, p.tp_group.cpu_group, device)
         logger.info(
-            "DeepSeek-V4.1 mono decode: the FFN launch runs decode steps of <= %d rows",
+            "DeepSeek-V4.1 mono decode: the FFN launch runs decode and verify steps of <= %d rows",
             MAX_ROWS,
         )
     if (_runner.device, _runner.tp, _runner.rank) != (device, p.tp_size, p.tp_rank):
@@ -97,9 +97,12 @@ def unsupported_model(config) -> Optional[str]:
 
 def _unsupported(config) -> Optional[str]:
     """Why the kernels cannot serve this deployment, or None."""
-    # speculative target steps are verify steps, which the launches do not take
-    if (get_spec().speculative_algorithm or "none").lower() != "none":
-        return "does not support speculative decoding"
+    # speculative target steps take the launches as DSpark's uniform verify steps only
+    algo = (get_spec().speculative_algorithm or "none").upper()
+    if algo not in ("NONE", "DSPARK"):
+        return "supports speculative decoding with DSpark only"
+    if algo == "DSPARK" and envs.SGLANG_RAGGED_VERIFY_MODE.get() != "static":
+        return "needs SGLANG_RAGGED_VERIFY_MODE=static with DSpark"
     if not is_gfx95_supported():
         return "needs gfx950"
     p = get_parallel()
@@ -154,6 +157,9 @@ def init_layer(layer) -> None:
     if not envs.SGLANG_ROCM_MONO_DECODE.get():
         if envs.SGLANG_ROCM_MONO_K1.get():
             raise ValueError("SGLANG_ROCM_MONO_K1 needs SGLANG_ROCM_MONO_DECODE=1.")
+        return
+    # draft layers (DSpark stages, next-n layers) keep the normal path
+    if layer.mlp.is_nextn:
         return
     why = _unsupported(layer.config)
     if why is None and envs.SGLANG_ROCM_MONO_K1.get():
@@ -261,9 +267,10 @@ class MonoFfn:
 
 
 def ffn_launch(layer, forward_batch, rows: int) -> Optional[MonoFfn]:
-    """The layer's FFN launch when this step takes it: decode only, at most ``MAX_ROWS`` rows."""
+    """The layer's FFN launch when this step takes it: decode or target verify, at most ``MAX_ROWS`` rows."""
     mono = getattr(layer, "mono_ffn", None)
-    if mono is None or not forward_batch.forward_mode.is_decode():
+    mode = forward_batch.forward_mode
+    if mono is None or not (mode.is_decode() or mode.is_target_verify()):
         return None
     return mono if 1 <= rows <= MAX_ROWS else None
 
@@ -284,7 +291,7 @@ def _k1_kernel(rows: int, tp: int):
 
         no_capture(f"K1 width {rows}")
         k = _k1_kernels[rows, tp] = build_mono_k1(MonoBuild(rows, tp))
-        logger.info("DeepSeek-V4.1 mono decode: K1 runs decode steps of %d rows", rows)
+        logger.info("DeepSeek-V4.1 mono decode: K1 runs steps of %d rows", rows)
     return k
 
 

@@ -1,5 +1,6 @@
-"""CPU test of the FFN launch's model guard and the normal MoE path warmup (python3, in the image)."""
+"""CPU test of the launches' guards (model, speculative, step mode, draft layers) and the normal MoE path warmup (python3, in the image)."""
 
+import os
 import sys
 import types
 
@@ -52,31 +53,124 @@ def warm_widths():
 
 
 def spec_cases(cfg):
-    """The deployment guard rejects every speculative algorithm and lets None / 'none' through."""
+    """The deployment guard lets None / 'none' / DSpark (static verify) through and rejects the rest."""
     from sglang.srt.models.deepseek_common.amd import dsv41_mono_decode as m
 
-    msg = "does not support speculative decoding"
+    only, static, gpu = (
+        "supports speculative decoding with DSpark only",
+        "needs SGLANG_RAGGED_VERIFY_MODE=static with DSpark",
+        "needs gfx950",
+    )
     fails = []
     get_spec, gfx95 = m.get_spec, m.is_gfx95_supported
+    ragged = os.environ.pop("SGLANG_RAGGED_VERIFY_MODE", None)
     # without a GPU the next check stops at "needs gfx950"
     m.is_gfx95_supported = lambda: False
     try:
-        for algo, rejected in (
-            (None, False),
-            ("none", False),
-            ("NONE", False),
-            ("NEXTN", True),
-            ("EAGLE", True),
-            ("DSPARK", True),
-        ):
+        cases = [
+            (None, None, gpu),
+            ("none", None, gpu),
+            ("NONE", None, gpu),
+            ("DSPARK", None, gpu),
+            ("dspark", "static", gpu),
+            ("DSPARK", "compact", static),
+            ("NEXTN", None, only),
+            ("EAGLE", None, only),
+            ("EAGLE3", None, only),
+        ]
+        for algo, mode, want in cases:
+            if mode is None:
+                os.environ.pop("SGLANG_RAGGED_VERIFY_MODE", None)
+            else:
+                os.environ["SGLANG_RAGGED_VERIFY_MODE"] = mode
             m.get_spec = lambda: types.SimpleNamespace(speculative_algorithm=algo)
             why = m._unsupported(cfg)
-            ok = why == (msg if rejected else "needs gfx950")
-            print(f"  {'PASS' if ok else 'FAIL'} speculative_algorithm={algo!r}: {why}")
+            ok = why == want
+            print(
+                f"  {'PASS' if ok else 'FAIL'} speculative_algorithm={algo!r} ragged={mode!r}: {why}"
+            )
             if not ok:
-                fails.append(f"speculative {algo}")
+                fails.append(f"speculative {algo} {mode}")
     finally:
         m.get_spec, m.is_gfx95_supported = get_spec, gfx95
+        os.environ.pop("SGLANG_RAGGED_VERIFY_MODE", None)
+        if ragged is not None:
+            os.environ["SGLANG_RAGGED_VERIFY_MODE"] = ragged
+    return fails, len(cases)
+
+
+def step_cases():
+    """The FFN launch (and K1 through it) takes decode and target-verify steps of 1..MAX_ROWS rows, nothing else."""
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sglang.srt.models.deepseek_common.amd import dsv41_mono_decode as m
+
+    ffn, k1 = object(), object()
+    layer = types.SimpleNamespace(mono_ffn=ffn, mono_k1=k1)
+    fails, n = [], 0
+    for mode in ForwardMode:
+        takes = mode in (ForwardMode.DECODE, ForwardMode.TARGET_VERIFY)
+        for rows in (0, 1, 4, 6, 12, 48, 49):
+            fb = types.SimpleNamespace(forward_mode=mode)
+            want = takes and 1 <= rows <= m.MAX_ROWS
+            pending = (
+                object(),
+                types.SimpleNamespace(shape=(rows,)),
+                object(),
+                object(),
+            )
+            got = (
+                m.ffn_launch(layer, fb, rows) is ffn,
+                m.k1_launch(layer, fb, pending, object()) is k1,
+            )
+            n += 1
+            if got != (want, want):
+                fails.append(f"{mode.name} rows={rows}: {got}")
+    print(
+        f"  {'PASS' if not fails else 'FAIL'} launches by forward mode x rows ({n} cases): {fails or 'decode / target verify, 1..48 rows'}"
+    )
+    return fails, n
+
+
+def draft_layer_cases(cfg):
+    """init_layer leaves draft layers (mlp.is_nextn) on the normal path and still checks target layers."""
+    from sglang.srt.models.deepseek_common.amd import dsv41_mono_decode as m
+
+    fails = []
+    old, gfx95, get_spec = (
+        os.environ.get("SGLANG_ROCM_MONO_DECODE"),
+        m.is_gfx95_supported,
+        m.get_spec,
+    )
+    os.environ["SGLANG_ROCM_MONO_DECODE"] = "1"
+    m.is_gfx95_supported = lambda: False
+    m.get_spec = lambda: types.SimpleNamespace(speculative_algorithm="DSPARK")
+    try:
+        draft = types.SimpleNamespace(
+            mlp=types.SimpleNamespace(is_nextn=True), config=None
+        )
+        m.init_layer(draft)
+        ok = draft.mono_ffn is None and draft.mono_k1 is None
+        print(f"  {'PASS' if ok else 'FAIL'} draft layer: no launches, no check")
+        if not ok:
+            fails.append("draft layer")
+        target = types.SimpleNamespace(
+            mlp=types.SimpleNamespace(is_nextn=False), config=cfg
+        )
+        try:
+            m.init_layer(target)
+            why = None
+        except ValueError as e:
+            why = str(e)
+        ok = why == "SGLANG_ROCM_MONO_DECODE needs gfx950."
+        print(f"  {'PASS' if ok else 'FAIL'} target layer still checked: {why}")
+        if not ok:
+            fails.append("target layer")
+    finally:
+        m.is_gfx95_supported, m.get_spec = gfx95, get_spec
+        if old is None:
+            os.environ.pop("SGLANG_ROCM_MONO_DECODE", None)
+        else:
+            os.environ["SGLANG_ROCM_MONO_DECODE"] = old
     return fails
 
 
@@ -106,9 +200,13 @@ def main():
     )
     if not ok:
         fails.append("warmup")
-    fails += spec_cases(cfg)
+    f, ns = spec_cases(cfg)
+    fails += f
+    f, nm = step_cases()
+    fails += f
+    fails += draft_layer_cases(cfg)
     print(
-        f"{len(cases)} negative cases + warmup + 6 speculative cases; "
+        f"{len(cases)} negative cases + warmup + {ns} speculative + {nm} step + 2 layer cases; "
         + ("ALL PASS" if not fails else f"FAILED: {fails}")
     )
     sys.exit(1 if fails else 0)
