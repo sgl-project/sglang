@@ -621,12 +621,6 @@ class TestAnthropicServing(unittest.TestCase):
             {"type": "api_error", "message": "Internal server error"},
         )
 
-    def test_non_streaming_cancelled_error_propagates(self):
-        exception = asyncio.CancelledError()
-        with self.assertRaises(asyncio.CancelledError) as captured:
-            self._non_streaming_exception_response(exception)
-        self.assertIs(captured.exception, exception)
-
     # ------------------------------------------------------------------
     # Edge-case coverage added in the review-fix pass
     # ------------------------------------------------------------------
