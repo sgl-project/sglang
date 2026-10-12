@@ -268,7 +268,13 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 "prefill CUDA graphs",
                 cfg.cuda_graph_config.prefill.backend != Backend.DISABLED,
             ),
-            ("DP attention", attn_dp_enabled_of(cfg)),
+            (
+                # Only the folding CUDA backend syncs its replay rows per DP rank;
+                # wider attention TP is untested.
+                "DP attention other than CUDA attention TP 1",
+                attn_dp_enabled_of(cfg)
+                and not (get_platform().is_cuda and cfg.attn_dp_size == cfg.tp_size),
+            ),
             ("context parallelism", cfg.attn_cp_size > 1),
             ("external cache linker", cfg.enable_unified_cache_external_linker),
             ("unified memory", cfg.enable_unified_memory),
@@ -282,14 +288,18 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 raise ValueError(
                     f"--enable-encoder-swa-bounded-replay does not support {feature} yet"
                 )
+        # This validation precedes the DP division of chunked_prefill_size.
+        min_prefill_tokens = 128 * cfg.attn_dp_size
         if (
             cfg.max_running_requests is None
             or cfg.max_running_requests <= 0
             or not cfg.chunked_prefill_size
-            or cfg.chunked_prefill_size < 128
+            or cfg.chunked_prefill_size < min_prefill_tokens
         ):
             raise ValueError(
-                "encoder SWA replay requires explicit --max-running-requests and --chunked-prefill-size >= 128"
+                "encoder SWA replay requires --max-running-requests > 0 and "
+                f"--chunked-prefill-size >= {min_prefill_tokens} "
+                "(128 tokens per attention DP rank)"
             )
 
     unsupported = (

@@ -4,6 +4,8 @@ from typing import Any, Optional
 import msgspec
 import torch
 
+from sglang.srt.layers.dp_attention import dp_slot_in
+
 
 class FoldedExtend(msgspec.Struct, frozen=True):
     """An extend batch whose prefix hits start at their replay start."""
@@ -27,6 +29,17 @@ def fold_encoder_swa_replay(worker, batch) -> Optional[FoldedExtend]:
     if not rows:
         return None
     return _fold_batch(batch=batch, runner=runner, rows=rows)
+
+
+def folded_replay_rows(batch) -> int:
+    """Rows the fold adds to an extend: each new window's <=128-token prefix tail."""
+    if not batch.forward_mode.is_extend_without_speculative():
+        return 0
+    return sum(
+        min(end, 128)
+        for reset, end in zip(batch.encoder_swa_reset, batch.prefix_lens)
+        if reset
+    )
 
 
 def apply_folded_extend(folded: FoldedExtend, forward_batch) -> None:
@@ -216,7 +229,7 @@ def _fold_batch(*, batch, runner, rows) -> FoldedExtend:
         folded.engram_history = _engram_history(
             reqs=batch.reqs, starts=pre, runner=runner
         )
-    _set_execution_counts(batch=folded, scheduled=batch)
+    _check_folded_counts(batch=folded, scheduled=batch)
     floor = torch.tensor(
         [p if r else 0 for p, r in zip(pre, replay)], dtype=torch.int64
     )
@@ -239,11 +252,23 @@ def _fold_batch(*, batch, runner, rows) -> FoldedExtend:
     )
 
 
+def _check_folded_counts(*, batch, scheduled) -> None:
+    """The scheduler's MLP-sync gather already counts the replay rows (folded_replay_rows)."""
+    if scheduled.global_num_tokens is None:
+        return
+    synced = scheduled.global_num_tokens[dp_slot_in(scheduled.global_num_tokens)]
+    if synced != batch.extend_num_tokens:
+        raise ValueError(
+            f"encoder SWA fold has {batch.extend_num_tokens} rows but the scheduler "
+            f"synced {synced}"
+        )
+
+
 def _set_execution_counts(*, batch, scheduled) -> None:
     """MLP-sync counts of a batch copied from `scheduled` with different rows."""
     if scheduled.global_num_tokens is None:
         return
-    # The flag rejects attention DP, so the gather holds only this rank's count.
+    # Attention DP is admitted only with the fold, so the gather holds one count.
     if (
         len(scheduled.global_num_tokens) != 1
         or scheduled.global_num_tokens[0] != scheduled.extend_num_tokens
