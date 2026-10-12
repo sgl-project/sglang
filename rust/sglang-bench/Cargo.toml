@@ -9,35 +9,26 @@ license.workspace = true
 # of the main sglang wheel at the given import path. debug = false keeps
 # editable installs on release builds, since a debug client cannot keep up with
 # the server it is measuring.
-# features: the wheel build needs the PyO3 bindings, which are NOT default (see
-# [features] below).
 [package.metadata.sglang]
 python-module = "sglang.srt.rust_extensions._bench"
 debug = false
-features = ["python"]
 
 [lib]
 # Unique per-crate artifact name: the shared workspace target/ dir cannot hold
 # two cdylibs of the same name. The importable Python module is `_bench`, named
 # by the `#[pymodule]` entry point, and setuptools-rust renames the artifact.
-name = "sglang_bench_core"
+name = "sglang_bench"
 # cdylib: the PyO3 module (`sglang.srt.rust_extensions._bench`).
-# rlib:   the pyo3-free core, so tests and any future standalone bin link it.
+# rlib:   so integration tests and any future standalone bin can link the core.
 crate-type = ["cdylib", "rlib"]
-
-[features]
-# Not default: `extension-module` tells PyO3 not to link libpython, which is
-# right for a module Python loads and wrong for anything that must run on its
-# own. A plain `cargo test` therefore builds the core without PyO3.
-python = ["dep:pyo3"]
 
 [dependencies]
 bytes = { workspace = true }
 futures = { workspace = true }
+pyo3 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
-pyo3 = { workspace = true, optional = true }
 
 # Declared here rather than in [workspace.dependencies]: no other member uses
 # them, and a benchmark client's dependency choices should not constrain the

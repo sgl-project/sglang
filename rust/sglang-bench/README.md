@@ -78,13 +78,11 @@ workspace fingerprinting per run after that; a wheel's bundled module skips
 both. To stage it by hand:
 
 ```bash
-cd rust && cargo build --release -p sglang-bench --features python
-cp target/release/libsglang_bench_core.so \
+cd rust && cargo build --release -p sglang-bench
+cp target/release/libsglang_bench.so \
   ../python/sglang/srt/rust_extensions/_bench.cpython-312-aarch64-linux-gnu.so
 ```
 
-The PyO3 bindings sit behind the non-default `python` feature, so `cargo test`
-and `cargo clippy` build the client core without Python.
 
 ## Covered
 
