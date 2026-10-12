@@ -1,0 +1,202 @@
+---
+title: MiniCPM-V 4.7
+description: "Deploy OpenBMB MiniCPM-V 4.7 with SGLang — 1B dense and 35B-A3B Mixture-of-Experts vision-language models on a hybrid Gated DeltaNet backbone, in BF16, FP8, or INT4, with DSpark speculative decoding on GB300."
+tag: NEW
+---
+
+<Note>
+  OpenBMB publishes the MiniCPM-V 4.7 checkpoints on Hugging Face at release. The repository ids on this page are the release ids.
+</Note>
+
+## Deployment
+
+<a id="install" />
+
+<Accordion title="Install SGLang">
+
+MiniCPM-V 4.7 support comes from [sgl-project/sglang#41993](https://github.com/sgl-project/sglang/pull/41993). For all methods and hardware platforms, see the [official SGLang installation guide](../../../docs/get-started/install). The two paths below match the **Python / Docker** toggle in the command panel.
+
+<Tabs>
+
+<Tab title="Python (from source)">
+
+```bash Command
+git clone https://github.com/sgl-project/sglang.git
+cd sglang
+pip install --upgrade pip
+pip install -e "python"
+```
+
+Then run the **Python** output of the command panel below in that environment.
+
+</Tab>
+
+<Tab title="Docker">
+
+```bash Command
+docker pull lmsysorg/sglang:dev
+```
+
+For how to launch the image, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker). Substitute the inner `sglang serve ...` with what the command generator below produces.
+
+</Tab>
+
+</Tabs>
+
+</Accordion>
+
+Pick the variant and quantization to generate the launch command. Each checkpoint has one validated recipe on GB300, plus an optional **DSPARK** speculative-decoding row that loads the matching DSpark draft checkpoint.
+
+import { Deployment } from "/src/snippets/_deployment.jsx";
+import { config }     from "/src/snippets/configs/openbmb/minicpm-v-4.7.jsx";
+import { benchmarks } from "/src/snippets/configs/openbmb/minicpm-v-4.7-benchmarks.jsx";
+
+<Deployment config={config} benchmarks={benchmarks} />
+
+## Playground
+
+The Playground is where you experiment with **SGLang features beyond the recipes above**. The Deploy panel emits this model's validated launch recipes; the Playground lets you turn on additional knobs on top of whichever cell the Deploy panel is currently showing.
+
+import { Playground } from "/src/snippets/_playground.jsx";
+
+<Playground config={config} />
+
+## 1. Model Introduction
+
+MiniCPM-V 4.7 is OpenBMB's next MiniCPM-V vision-language model. It pairs a Qwen3.5-style hybrid language backbone — Gated DeltaNet linear-attention layers interleaved with full-attention layers — with a vision encoder that slices high-resolution images into tiles and places image tokens with a canvas M-RoPE layout. It comes in a 1B dense size and a 35B-A3B Mixture-of-Experts size, and thinks by default.
+
+{/* TODO: add the license once the Hugging Face model cards are public. */}
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "42%"}} />
+    <col style={{width: "22%"}} />
+    <col style={{width: "36%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Checkpoint</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Precision</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Role on this page</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>openbmb/MiniCPM-V-4.7-1B</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>BF16</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>1B dense base, TP=1.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.05)"}}><code>openbmb/MiniCPM-V-4.7-35B-A3B</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>BF16</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>35B-A3B MoE base, TP=2.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>openbmb/MiniCPM-V-4.7-35B-A3B-FP8</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>FP8 (compressed-tensors)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>35B-A3B FP8, TP=2.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.05)"}}><code>openbmb/MiniCPM-V-4.7-35B-A3B-INT4</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>INT4 W4A16 (llm-compressor)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>35B-A3B INT4, TP=1.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>openbmb/MiniCPM-V-4.7-1B-DSpark</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>BF16 draft</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Draft model for the 1B <strong>DSPARK</strong> row; not served on its own.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.05)"}}><code>openbmb/MiniCPM-V-4.7-35B-A3B-DSpark</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>BF16 draft</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Draft model for the 35B-A3B <strong>DSPARK</strong> row; not served on its own.</td>
+    </tr>
+  </tbody>
+</table>
+
+**Resources:** [OpenBMB on Hugging Face](https://huggingface.co/openbmb) · [SGLang model support (#41993)](https://github.com/sgl-project/sglang/pull/41993).
+
+## 2. Configuration Tips
+
+- Every variant needs `--trust-remote-code` and `--mamba-radix-cache-strategy extra_buffer`; both are in every generated command.
+- The 1B model runs on one GPU. The 35B-A3B BF16 and FP8 checkpoints use `--tp 2`.
+- Serve INT4 at `--tp 1`. The vision tower stays unquantized BF16, and the W4A16 group-128 layout does not divide evenly across the vision layers at TP=2.
+- SGLang detects FP8 and INT4 from the checkpoint's `quantization_config`; no `--quantization` flag is needed.
+- The **DSPARK** row adds `--speculative-algorithm DSPARK` and `--speculative-draft-model-path` pointing at the variant's DSpark checkpoint. Measured accept length is about 1.1–1.3. DSPARK was validated on the BF16 bases; on FP8 and INT4 the panel marks it unverified.
+- Thinking is on by default. Without a reasoning parser, the thinking trace stays in `message.content`. To return it in `message.reasoning_content`, add `--reasoning-parser qwen3` (toggle **Reasoning Parser** in the **Parsers** card of the [Playground](#playground)).
+- Image and video requests need no extra server flags.
+
+<Warning>
+  The FP8 and INT4 checkpoints' remote code fails to import on transformers 5.17. `video_processing_minicpmv4_7.py` imports `BASE_VIDEO_PROCESSOR_DOCSTRING` from `transformers.video_processing_utils`, and transformers 5.17 removed that constant. In your local copy of the checkpoint, drop the name from that import and define it in the file instead:
+
+  ```python Example
+  from transformers.video_processing_utils import BaseVideoProcessor
+  BASE_VIDEO_PROCESSOR_DOCSTRING = ""
+  ```
+
+  The BF16 checkpoints are not affected.
+</Warning>
+
+## 3. Advanced Usage
+
+### 3.1 Per-request image processing
+
+OpenAI-compatible `/v1/chat/completions` and `/v1/completions` requests accept `mm_processor_kwargs`, which overrides the image processor for that request only:
+
+- `downsample_mode`: `"16x"` (default) or `"4x"`. `"4x"` keeps more visual tokens per tile.
+- `max_slice_nums`: the maximum number of high-resolution slices. `1` sends the image without slicing.
+
+<Accordion title="Image token budget (Python)">
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
+
+IMAGE_URL = "https://www.ilankelman.org/stopsigns/australia.jpg"
+
+for overrides in ({}, {"downsample_mode": "4x"}, {"max_slice_nums": 1}):
+    resp = client.chat.completions.create(
+        model="openbmb/MiniCPM-V-4.7-35B-A3B",
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": IMAGE_URL}},
+                {"type": "text", "text": "Describe this image in one sentence."},
+            ],
+        }],
+        extra_body={"mm_processor_kwargs": overrides} if overrides else None,
+    )
+    print(overrides or "default", "prompt_tokens =", resp.usage.prompt_tokens)
+```
+
+</Accordion>
+
+Prompt token counts measured on a 1568×448 image with the same text prompt:
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left",  padding: "10px 12px", fontWeight: 700}}><code>mm_processor_kwargs</code></th>
+      <th style={{textAlign: "right", padding: "10px 12px", fontWeight: 700}}>Prompt tokens</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>none (<code>"16x"</code>)</td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>355</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>{`{"downsample_mode": "4x"}`}</code></td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.05)"}}>1291</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>{`{"max_slice_nums": 1}`}</code></td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>93</td>
+    </tr>
+  </tbody>
+</table>
+
+Overrides do not leak between requests: alternating `"16x"` and `"4x"` on the same image returns the matching token count and a correct answer each time.
+
+For more API examples, see the [SGLang Basic Usage Guide](/docs/basic_usage/send_request).
