@@ -1397,12 +1397,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 if is_pp_mode
                 else (self.scheduler.running_batch,)
             )
-            # Include finished requests; GPU work may still use their adapters.
+            # GPU work may still read the adapters of every slot's running rows,
+            # finished rows that have not left yet included, and of the rows of
+            # every in-flight launched batch.
             running_loras = {
                 req.lora_id for batch in running_batches for req in batch.reqs
             }
-            # A launched batch may still read the adapters of rows that have
-            # left the running batch since its launch.
             running_loras.update(
                 req.lora_id
                 for record in self.scheduler.inflight_steps
