@@ -17,6 +17,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
     PoolTransferResult,
+    rank_shard_key_scope,
 )
 from sglang.srt.mem_cache.pool_host import HostKVCache
 from sglang.srt.mem_cache.storage.mmap import alloc_mmap
@@ -190,7 +191,8 @@ class HiCacheNixl(HiCacheStorage):
     ) -> str:
         if component_name in (None, PoolName.KV):
             return self._get_suffixed_key(key)
-        return f"{self._get_suffixed_key(key)}_{component_name}"
+        scope = rank_shard_key_scope(self.storage_config, component_name)
+        return f"{self._get_suffixed_key(key)}_{component_name}{scope}"
 
     def _get_component_keys(
         self, keys: List[str], pool_name: Optional[PoolName] = None
