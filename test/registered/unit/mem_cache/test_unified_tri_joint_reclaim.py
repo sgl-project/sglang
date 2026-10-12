@@ -131,9 +131,9 @@ class TestTriJointReclaim(CustomTestCase):
                         [] if count == 24 else ([1, 2] if count == 8 else [0, 1, 2])
                     )
                     for i, (key, prior) in enumerate(records):
-                        match = c.match_prefix(
-                            MatchPrefixParams(key=key)
-                        ).device_indices
+                        match = c.path_device_indices(
+                            c.match_prefix(MatchPrefixParams(key=key)).last_device_node
+                        )
                         if i in expected:
                             torch.testing.assert_close(match, prior)
                             self.check_payload(b, a, match, states[i : i + 1], states)
@@ -169,9 +169,11 @@ class TestTriJointReclaim(CustomTestCase):
                         self.assertEqual(walks.call_count, 0)
                         for key, prior in records:
                             torch.testing.assert_close(
-                                c.match_prefix(
-                                    MatchPrefixParams(key=key)
-                                ).device_indices,
+                                c.path_device_indices(
+                                    c.match_prefix(
+                                        MatchPrefixParams(key=key)
+                                    ).last_device_node
+                                ),
                                 prior,
                             )
                         self.check_payload(b, a, slots, states, states)
@@ -313,7 +315,11 @@ class TestTriJointReclaim(CustomTestCase):
                     self.assertEqual(walks.call_count, 0)
                     for key, prior in records:
                         torch.testing.assert_close(
-                            c.match_prefix(MatchPrefixParams(key=key)).device_indices,
+                            c.path_device_indices(
+                                c.match_prefix(
+                                    MatchPrefixParams(key=key)
+                                ).last_device_node
+                            ),
                             prior,
                         )
                     self.check_payload(b, a, slots, states, states)
@@ -333,7 +339,10 @@ class TestTriJointReclaim(CustomTestCase):
         self.assertEqual(c.full_evictable_size(), 95)
         for key, prior in records[1:]:
             torch.testing.assert_close(
-                c.match_prefix(MatchPrefixParams(key=key)).device_indices, prior
+                c.path_device_indices(
+                    c.match_prefix(MatchPrefixParams(key=key)).last_device_node
+                ),
+                prior,
             )
         self.check_payload(b, a, slots[1:], states[1:], states)
         self.assertFalse(a.verify_byte_accounting())
@@ -371,7 +380,9 @@ class TestTriJointReclaim(CustomTestCase):
                 self.assertEqual(len(got), page_size)
                 for key, prior in records:
                     torch.testing.assert_close(
-                        c.match_prefix(MatchPrefixParams(key=key)).device_indices,
+                        c.path_device_indices(
+                            c.match_prefix(MatchPrefixParams(key=key)).last_device_node
+                        ),
                         prior,
                     )
                 self.check_payload(b, a, slots, states, states)
@@ -542,7 +553,9 @@ class TestTriJointReclaim(CustomTestCase):
                     self.assertTrue(allocator.available_size() >= 6)
                     self.assertEqual(cache.full_evictable_size(), 4)
                     matched = cache.match_prefix(MatchPrefixParams(key=key))
-                    torch.testing.assert_close(matched.device_indices, slots)
+                    torch.testing.assert_close(
+                        cache.path_device_indices(matched.last_device_node), slots
+                    )
                     self.assertIsNotNone(allocator.alloc(6))
                     for layer in range(6):
                         member = full if layer < 4 else swa
@@ -583,7 +596,9 @@ class TestTriJointReclaim(CustomTestCase):
                     self.assertIsNotNone(a.alloc(demand))
                 self.assertLessEqual(prep.call_count, 3)
                 for i, key in enumerate(keys):
-                    actual = c.match_prefix(MatchPrefixParams(key=key)).device_indices
+                    actual = c.path_device_indices(
+                        c.match_prefix(MatchPrefixParams(key=key)).last_device_node
+                    )
                     if i < first:
                         self.assertEqual(len(actual), 0)
                     else:
@@ -774,7 +789,10 @@ assert not any('<function'in event for event in traces[0]),traces
                 self.assertEqual(c.full_evictable_size(), 95)
                 for key, prior in records[1:]:
                     torch.testing.assert_close(
-                        c.match_prefix(MatchPrefixParams(key=key)).device_indices, prior
+                        c.path_device_indices(
+                            c.match_prefix(MatchPrefixParams(key=key)).last_device_node
+                        ),
+                        prior,
                     )
                 self.check_payload(b, a, slots[1:], states[1:], states)
                 self.assertFalse(a.verify_byte_accounting())
