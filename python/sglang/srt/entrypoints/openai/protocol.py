@@ -189,7 +189,7 @@ class CachedTokensDetails(BaseModel):
 class PromptTokensDetails(BaseModel):
     """Details about prompt tokens."""
 
-    cached_tokens: int = 0
+    cached_tokens: int | None = None
     # Multimodal prompt token counts (only populated when present in the prompt)
     image_tokens: Optional[int] = None
     audio_tokens: Optional[int] = None
@@ -198,9 +198,9 @@ class PromptTokensDetails(BaseModel):
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
-        # Drop multimodal fields when absent so text-only/cache-only responses
-        # keep the original {"cached_tokens": N} shape.
-        for key in ("image_tokens", "audio_tokens", "video_tokens"):
+        # Keep a measured zero, but never invent one for an unknown cache count.
+        # Text-only/cache-only responses retain the {"cached_tokens": N} shape.
+        for key in ("cached_tokens", "image_tokens", "audio_tokens", "video_tokens"):
             if data.get(key) is None:
                 data.pop(key, None)
         return data

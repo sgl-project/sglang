@@ -264,7 +264,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 reasoning_tokens[index] = content["meta_info"].get(
                     "reasoning_tokens", 0
                 )
-                cached_tokens[index] = content["meta_info"].get("cached_tokens", 0)
+                cached_tokens[index] = content["meta_info"].get("cached_tokens")
                 hidden_states[index] = content["meta_info"].get("hidden_states", None)
                 routed_experts[index] = content["meta_info"].get("routed_experts", None)
                 cached_tokens_details[index] = content["meta_info"].get(
