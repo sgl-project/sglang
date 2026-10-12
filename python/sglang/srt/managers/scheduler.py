@@ -1296,8 +1296,9 @@ class Scheduler(
         self.cur_batch_for_debug: Optional[ScheduleBatch] = None
         # The last forward batch
         self.last_batch: Optional[ScheduleBatch] = None
-        # Launched batches whose results are not committed yet. Each event loop
-        # installs its own on entry.
+        # Launched batches whose results are not committed yet. The normal,
+        # overlap and PD event loops install their own on entry; the pipeline
+        # and MLX loops keep their own holders.
         self.inflight_steps = InflightQueue(depth=0)
         self.enable_continuous_input_polling = False
         self.enable_skip_finishing_decode = False
