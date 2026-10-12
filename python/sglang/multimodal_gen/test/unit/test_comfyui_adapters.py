@@ -22,6 +22,7 @@ from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.cache_options imp
     CACHE_OPTIONS_KEY,
     build_cache_options,
     read_cache_options,
+    request_cache_dit_for_run,
     with_cache_options,
 )
 from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.flux import (
@@ -427,23 +428,20 @@ def test_cache_options_reject_bad_requests() -> None:
         build_cache_options(None, {"max_warmup_steps": 2})
 
 
-def test_cache_dit_on_unsupported_model_fails_clearly() -> None:
-    flux = _bare_executor(FluxExecutor)
-    on = build_cache_options(True, None)
-    with pytest.raises(ValueError, match="FluxExecutor does not support Cache-DiT"):
-        with_cache_options(_FakePatcher({}, flux), on)
-    # A workflow that bypasses the node still fails before any request is sent.
-    with pytest.raises(ValueError, match="does not support Cache-DiT"):
-        flux.forward(
-            torch.ones(1, 16, 8, 8),
-            torch.tensor([0.5]),
-            torch.ones(1, 8, 4096),
-            y=torch.ones(1, 768),
-            transformer_options={CACHE_OPTIONS_KEY: on},
+def test_cache_dit_run_sends_sampler_steps_and_rejects_uncond() -> None:
+    """The worker counts DiT calls as Cache-DiT steps, so it needs the run's
+    step count and exactly one call per step."""
+    packed = SimpleNamespace(extra_req={})
+    request_cache_dit_for_run(
+        packed, {"sample_sigmas": torch.linspace(1, 0, 26), "cond_or_uncond": [0]}
+    )
+    assert packed.extra_req["comfyui_num_steps"] == 25
+    with pytest.raises(ValueError, match="one DiT call per step"):
+        request_cache_dit_for_run(
+            packed, {"sample_sigmas": [1.0, 0.0], "cond_or_uncond": [1]}
         )
-    # Off and default are valid everywhere.
-    with_cache_options(_FakePatcher({}, flux), build_cache_options(False, None))
-    with_cache_options(_FakePatcher({}, flux), build_cache_options(None, None))
+    with pytest.raises(ValueError, match="sample_sigmas"):
+        request_cache_dit_for_run(packed, {"cond_or_uncond": [0]})
 
 
 def _h3_kwargs(executor, cache_options):
@@ -453,13 +451,14 @@ def _h3_kwargs(executor, cache_options):
     return executor._sampling_params_kwargs(packed, torch.tensor([0.5]))
 
 
-def test_h3_per_run_cache_dit_overrides_loader_flag() -> None:
-    loader_on = _bare_executor(MiniMaxH3Executor, enable_cache_dit=True)
+@pytest.mark.parametrize("cls", [MiniMaxH3Executor, FluxExecutor])
+def test_per_run_cache_dit_overrides_loader_flag(cls) -> None:
+    loader_on = _bare_executor(cls, enable_cache_dit=True)
     run_off = build_cache_options(False, None)
     assert _h3_kwargs(loader_on, run_off)["enable_cache_dit"] is False
     # Unset per-run value falls back to the loader option (backward compatible).
     assert _h3_kwargs(loader_on, build_cache_options(None, None))["enable_cache_dit"]
-    assert "enable_cache_dit" not in _h3_kwargs(_bare_executor(MiniMaxH3Executor), {})
+    assert "enable_cache_dit" not in _h3_kwargs(_bare_executor(cls), {})
     params = {"max_warmup_steps": 3}
     kwargs = _h3_kwargs(loader_on, build_cache_options(True, params))
     assert kwargs["cache_dit_params"] == params

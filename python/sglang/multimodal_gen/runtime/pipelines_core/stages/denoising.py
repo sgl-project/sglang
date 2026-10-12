@@ -129,6 +129,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     LayerwiseOffloadableModuleMixin,
     is_layerwise_offloaded_module,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.comfyui_mode import (
+    comfyui_cache_dit_run,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.component_loading import (
     load_transformer_if_needed,
     register_loaded_transformer,
@@ -1064,6 +1067,11 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         (e.g. Wan2.2) get per-transformer configs.
         """
         requested = self._cache_dit_requested_for_batch(batch)
+        comfyui_run = (
+            comfyui_cache_dit_run(batch) if self.server_args.comfyui_mode else None
+        )
+        if comfyui_run is not None:
+            num_inference_steps = comfyui_run[0]
         if self.server_args.enable_breakable_cuda_graph:
             # Cache-DiT wraps transformer.forward with step-skipping control
             # flow that must not be baked into a captured CUDA graph.
@@ -1092,6 +1100,8 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         # opt-out or knob change: unmount, then remount below (or return)
         if self._cache_dit_enabled and desired_key != self._cache_dit_active_key:
             self._unmount_cache_dit()
+        if self._cache_dit_enabled and comfyui_run is not None and not comfyui_run[1]:
+            return
         # NOTE: When a new request arrives, we need to refresh the cache-dit context.
         if self._cache_dit_enabled:
             primary_num_steps, secondary_num_steps = self._cache_dit_step_counts(

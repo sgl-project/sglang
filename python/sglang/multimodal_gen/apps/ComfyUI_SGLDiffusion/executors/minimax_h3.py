@@ -213,7 +213,7 @@ class MiniMaxH3Adapter(ComfyUIModelAdapter):
 
 class MiniMaxH3Executor(SGLDiffusionExecutor):
     adapter_cls = MiniMaxH3Adapter
-    supports_cache_dit = True
+    cache_dit_needs_run_steps = False
     # ComfyUI MiniMaxH3.extra_conds reads this when a denoise_mask is present.
     patch_size = (1, 2, 2)
 

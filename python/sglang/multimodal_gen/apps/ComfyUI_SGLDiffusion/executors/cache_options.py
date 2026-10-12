@@ -29,20 +29,26 @@ def build_cache_options(
     return {"enable_cache_dit": enable_cache_dit, "cache_dit_params": params or None}
 
 
-def check_cache_options_supported(executor, options: dict[str, Any]) -> None:
-    """Raise if the options ask for a cache the executor's model cannot use."""
-    if options.get("enable_cache_dit") is True and not executor.supports_cache_dit:
+def request_cache_dit_for_run(packed, transformer_options) -> None:
+    """Ask the worker to keep one Cache-DiT context for the whole sampler run.
+
+    ComfyUI sends one request per DiT call, and the worker's cache context counts
+    calls as steps, so a step with a separate uncond call would desync it.
+    """
+    options = transformer_options or {}
+    if 1 in (options.get("cond_or_uncond") or ()):
         raise ValueError(
-            f"{type(executor).__name__} does not support Cache-DiT through "
-            "ComfyUI: this model runs one independent step per request, so "
-            "there is no step history to reuse. Supported: MiniMax-H3."
+            "Cache-DiT through ComfyUI needs one DiT call per step; set cfg to 1 "
+            "or turn Cache-DiT off for this run."
         )
+    sigmas = options.get("sample_sigmas")
+    if sigmas is None or len(sigmas) < 2:
+        raise ValueError("Cache-DiT through ComfyUI needs the sampler's sample_sigmas")
+    packed.extra_req["comfyui_num_steps"] = len(sigmas) - 1
 
 
 def with_cache_options(model, options: dict[str, Any]):
     """Return a clone of ``model`` carrying ``options``; ``model`` is untouched."""
-    executor = model.model.diffusion_model
-    check_cache_options_supported(executor, options)
     cloned = model.clone()
     transformer_options = dict(cloned.model_options.get("transformer_options") or {})
     transformer_options[CACHE_OPTIONS_KEY] = options

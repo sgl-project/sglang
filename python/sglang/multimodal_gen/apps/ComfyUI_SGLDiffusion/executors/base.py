@@ -8,8 +8,8 @@ import uuid
 import torch
 
 from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.cache_options import (
-    check_cache_options_supported,
     read_cache_options,
+    request_cache_dit_for_run,
 )
 
 try:
@@ -155,8 +155,8 @@ class SGLDiffusionExecutor(torch.nn.Module):
     """Shared ComfyUI DiT-forward executor. Per-model logic lives on the adapter."""
 
     adapter_cls = None
-    # Cache-DiT needs a multi-step run on the worker; only H3 has one.
-    supports_cache_dit = False
+    # False when the model's worker stage owns the per-run Cache-DiT state (H3).
+    cache_dit_needs_run_steps = True
     # Loader-option default (SGLDOptions); a per-run SGLDCacheOptions value wins.
     enable_cache_dit: bool | None = None
 
@@ -304,17 +304,19 @@ class SGLDiffusionExecutor(torch.nn.Module):
             "save_output": False,
             "suppress_logs": self.should_suppress_logs(timestep),
         }
-        if self.supports_cache_dit:
-            enable = packed.cache_options.get("enable_cache_dit")
-            if enable is None:
-                enable = self.enable_cache_dit
-            if enable is not None:
-                kwargs["enable_cache_dit"] = bool(enable)
-            if enable and packed.cache_options.get("cache_dit_params"):
-                kwargs["cache_dit_params"] = dict(
-                    packed.cache_options["cache_dit_params"]
-                )
+        enable = self._cache_dit_enabled_for(packed)
+        if enable is not None:
+            kwargs["enable_cache_dit"] = enable
+        if enable and packed.cache_options.get("cache_dit_params"):
+            kwargs["cache_dit_params"] = dict(packed.cache_options["cache_dit_params"])
         return kwargs
+
+    def _cache_dit_enabled_for(self, packed) -> bool | None:
+        """Per-run SGLDCacheOptions value, else the loader option; None = server default."""
+        enable = packed.cache_options.get("enable_cache_dit")
+        if enable is None:
+            enable = self.enable_cache_dit
+        return None if enable is None else bool(enable)
 
     def _execute_packed(self, packed, x, timestep):
         if _RUNTIME_IMPORT_ERROR is not None:
@@ -337,7 +339,7 @@ class SGLDiffusionExecutor(torch.nn.Module):
         self.adapter.fill_req(req, packed)
         extra = dict(req.extra or {})
         extra["comfyui_session_id"] = self.comfyui_session_id()
-        for key in ("comfyui_cond_key", "comfyui_cache_fp"):
+        for key in ("comfyui_cond_key", "comfyui_cache_fp", "comfyui_num_steps"):
             value = packed.extra_req.get(key)
             if value is not None:
                 extra[key] = value
@@ -391,5 +393,6 @@ class SGLDiffusionExecutor(torch.nn.Module):
             None if cond_uuid is None else (cond_uuid, _cond_row)
         )
         packed.cache_options = read_cache_options(kwargs.get("transformer_options"))
-        check_cache_options_supported(self, packed.cache_options)
+        if self.cache_dit_needs_run_steps and self._cache_dit_enabled_for(packed):
+            request_cache_dit_for_run(packed, kwargs.get("transformer_options"))
         return self._execute_packed(packed, x, timestep)

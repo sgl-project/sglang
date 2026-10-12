@@ -146,6 +146,7 @@ Adding a model means a checkpoint spec plus a `ComfyUIModelAdapter`. There is no
 
 `SGLDiffusion Cache Options` takes a MODEL and returns a clone carrying a per-run Cache-DiT toggle (plus optional DBCache knobs; `-1` keeps the server default). It is sent as a per-request sampling field, so changing it between runs does not restart the worker.
 
-- Supported today: MiniMax-H3 only. Other models run one independent step per request, so Cache-DiT raises a `ValueError` for them. Setting it to `off` or `default` is always accepted.
-- TeaCache is not exposed: no ComfyUI model can use it (H3 rejects `enable_teacache`; the single-step flow resets TeaCache state every request).
+- Works for every integrated-mode model. ComfyUI sends one request per DiT call, so the worker keeps one Cache-DiT context for the whole sampler run (sized from the run's `sample_sigmas`) instead of one per request.
+- The run must make one DiT call per step (`cfg` 1, as in the Flux, Z-Image and Qwen-Image workflows); a run that also sends an uncond pass raises a `ValueError`. MiniMax-H3 keeps its own run state and is not limited this way.
+- TeaCache is not exposed: H3 rejects `enable_teacache`, and the other models reset TeaCache state every request.
 - The `enable_cache_dit` loader option in `SGLDiffusion Options` still works as the default. A per-run `on`/`off` wins over it; `default` falls back to it.

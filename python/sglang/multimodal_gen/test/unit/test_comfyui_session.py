@@ -20,6 +20,7 @@ from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.zimage import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core.comfyui_mode import (
     bind_comfyui_session,
+    comfyui_cache_dit_run,
     get_run_state,
     initialize_comfyui_pipeline,
     release_comfyui_session,
@@ -118,6 +119,26 @@ def test_release_run_state_keeps_conditioning():
     assert torch.equal(second.prompt_embeds[0], first.prompt_embeds[0])
     assert second.extra["model_payload"]["audio_scale"] == 0.5
     release_comfyui_session(sid)
+
+
+def test_cache_dit_context_refreshes_once_per_sampler_run() -> None:
+    """Only a run's first request may refresh the Cache-DiT context; later steps
+    of that run continue it, and the next run (new id) starts fresh."""
+    family = uuid.uuid4().hex
+
+    def call(run):
+        req = _Req()
+        req.extra = {"comfyui_session_id": f"{family}:{run}", "comfyui_num_steps": 25}
+        bind_comfyui_session(req)
+        return comfyui_cache_dit_run(req)
+
+    assert call(1) == (25, True)
+    assert call(1) == (25, False)
+    assert call(2) == (25, True)
+    plain = _Req()
+    plain.extra = {"comfyui_session_id": f"{family}:2"}
+    assert comfyui_cache_dit_run(plain) is None
+    release_comfyui_session(f"{family}:2")
 
 
 def test_session_restores_extra_keys_on_later_steps() -> None:
