@@ -1420,10 +1420,7 @@ class SchedulerPPMixin:
             target = mbs[next_first_rank_mb_id]
             if target is not None:
                 q_event, pp_outputs_to_send = last_rank_comm_queue.popleft()
-                if (
-                    not target.forward_mode.is_prebuilt()
-                    and not _pp_can_skip_output_comm(target)
-                ):
+                if not _pp_can_skip_output_comm(target):
                     with torch.profiler.record_function("send_res_dict_to_next_stage"):
                         send_output_work = self._pp_send_dict_to_next_stage(
                             pp_outputs_to_send.tensors,
@@ -1506,7 +1503,7 @@ class SchedulerPPMixin:
         def _do_recv():
             nonlocal next_pp_outputs, batch_result, d2h_event
             target = mbs[next_mb_id]
-            if target is None or target.forward_mode.is_prebuilt():
+            if target is None:
                 return
             if _pp_can_skip_output_comm(target):
                 next_pp_outputs, batch_result, d2h_event = (
@@ -1587,13 +1584,12 @@ class SchedulerPPMixin:
             target_send = mbs[next_first_rank_mb_id]
             if target_send is not None:
                 q_event, pp_outputs_to_send = last_rank_comm_queue.popleft()
-                if not target_send.forward_mode.is_prebuilt():
-                    if _pp_can_skip_output_comm(target_send):
-                        send_dict = {"__msg_type__": "output", "__skip__": True}
-                    else:
-                        self.device_module.current_stream().wait_event(q_event)
-                        send_dict = dict(pp_outputs_to_send.tensors)
-                        send_dict["__msg_type__"] = "output"
+                if _pp_can_skip_output_comm(target_send):
+                    send_dict = {"__msg_type__": "output", "__skip__": True}
+                else:
+                    self.device_module.current_stream().wait_event(q_event)
+                    send_dict = dict(pp_outputs_to_send.tensors)
+                    send_dict["__msg_type__"] = "output"
         elif pp_outputs:
             if pp_outputs.tensors.get("__skip__"):
                 send_dict = {"__msg_type__": "output", "__skip__": True}
@@ -1607,9 +1603,7 @@ class SchedulerPPMixin:
         # marker.  The receiver always participates in the
         # batch_isend_irecv and inspects the marker after recv.
         target_recv = mbs[next_mb_id]
-        should_recv = (
-            target_recv is not None and not target_recv.forward_mode.is_prebuilt()
-        )
+        should_recv = target_recv is not None
 
         def _handle_recv_dict(recv_dict):
             nonlocal next_pp_outputs, batch_result, d2h_event
@@ -1643,7 +1637,7 @@ class SchedulerPPMixin:
                 )
             _handle_recv_dict(recv_dict)
         elif send_dict is not None:
-            # Send only (recv not needed — target is None or prebuilt)
+            # Send only (recv not needed: target is None)
             send_output_work = self._pp_send_dict_to_next_stage(
                 send_dict, async_send=True, msg_type="output"
             )
