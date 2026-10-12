@@ -53,6 +53,9 @@ pub fn select_chat_formatter(
     let model_type_lower = identity.model_type.as_deref().map(str::to_ascii_lowercase);
     let display_name_lower = model_source.to_ascii_lowercase();
     if config.chat_template.is_none() {
+        if identity.is_deepseek_v41() {
+            return (Some(ChatFormatter::DeepSeekV41), None);
+        }
         if identity.is_deepseek_v4() {
             let profile = match resolve_dsv4_profile(
                 identity.dsv4_reasoning_effort_profile.as_deref(),
@@ -151,6 +154,15 @@ pub fn select_chat_formatter(
 }
 
 impl ModelIdentity {
+    /// `chat_encoding.is_deepseek_v41_arch`; V4.1 may keep the V4 architecture name.
+    fn is_deepseek_v41(&self) -> bool {
+        self.model_type.as_deref() == Some("deepseek_v41")
+            || self
+                .architectures
+                .first()
+                .is_some_and(|architecture| architecture.contains("DeepseekV41"))
+    }
+
     fn is_deepseek_v4(&self) -> bool {
         self.model_type.as_deref() == Some("deepseek_v4")
             || self
