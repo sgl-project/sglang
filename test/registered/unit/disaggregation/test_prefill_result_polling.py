@@ -118,6 +118,8 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
     """Run real scheduling and result handling with controlled intake and GPU events."""
 
     launch_batch_sample_if_needed = Scheduler.launch_batch_sample_if_needed
+    _commit_due_step = Scheduler._commit_due_step
+    _debug_check_last_launched = Scheduler._debug_check_last_launched
     pause_generation = Scheduler.pause_generation
     continue_generation = Scheduler.continue_generation
 

@@ -77,6 +77,7 @@ from sglang.srt.managers.schedule_batch import (
     NextBatchPlan,
     ScheduleBatch,
 )
+from sglang.srt.managers.scheduler_components.inflight_queue import InflightQueue
 from sglang.srt.mem_cache.allocation import ensure_mamba_capacity
 from sglang.srt.mem_cache.allocation_sizing import get_mamba_tracking_slots
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -2985,6 +2986,7 @@ class SchedulerDisaggregationDecodeMixin:
     @torch.no_grad()
     def event_loop_normal_disagg_decode(self: Scheduler):
         """A normal scheduler loop for decode worker in disaggregation mode."""
+        self.inflight_steps = InflightQueue(depth=0)
 
         while True:
             if self.gracefully_exit:
@@ -3015,7 +3017,8 @@ class SchedulerDisaggregationDecodeMixin:
             # Launch the current batch
             if batch:
                 result = self.run_batch(batch)
-                self.process_batch_result(batch, result)
+                self.inflight_steps.push(batch, result)
+                self._commit_due_step()
             else:
                 # When the server is idle, do self-check and re-init some states
                 self._sched_idled = True
@@ -3023,6 +3026,8 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Update last_batch
             self.last_batch = batch
+            self.inflight_steps.end_step(batch)
+            self._debug_check_last_launched()
 
     @torch.no_grad()
     def event_loop_overlap_disagg_decode(self: Scheduler):
