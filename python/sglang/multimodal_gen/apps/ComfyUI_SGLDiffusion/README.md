@@ -82,6 +82,7 @@ Reference workflow files are provided in the `workflows/` directory:
 
 - **`flux_sgld_sp.json`**: Multi-GPU (Sequence Parallelism) workflow for FLUX models. High-performance inference across multiple cards.
 - **`qwen_image_sgld.json`**: Qwen-Image generation with LoRA support. Optimized for multi-modal image tasks.
+- **`flux_controlnet_sgld.json`**: Flux.1-dev with an InstantX canny ControlNet in integrated mode (`instantx_flux_canny.safetensors` in `models/controlnet`, any image as `example.png` in `input/`).
 - **`z-image_sgld.json`**: High-speed image generation using Z-Image.
 - **`sgld_text2img.json`**: Server-mode text-to-image generation with LoRA support.
 - **`sgld_image2video.json`**: Server-mode image-to-video generation.
