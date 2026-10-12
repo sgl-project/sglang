@@ -10,7 +10,7 @@ from sgl_kernel_npu.attention.sinks_attention import (
     attention_sinks_triton,
 )
 
-from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.configs.model_config import AttentionArch, is_deepseek_dsa
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.hardware_backend.npu.attention.ascend_torch_native_backend import (
     AscendTorchNativeAttnBackend,
@@ -336,6 +336,9 @@ class AscendAttnBackend(AttentionBackend):
         self.model_dtype = model_runner.model_config.dtype
         self.kv_cache_dtype = model_runner.kv_cache_dtype
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
+        # Only DSA models (GLM-5.2, DeepSeek-V3-DSA, ...) consume the per-token DSA
+        # CP metadata built by prepare_dsa_cp_metadata; V4 keeps its own variant.
+        self.use_dsa = is_deepseek_dsa(model_runner.model_config.hf_config)
         if self.use_mla:
             self.kv_lora_rank = model_runner.model_config.kv_lora_rank
             self.qk_rope_head_dim = model_runner.model_config.qk_rope_head_dim
@@ -1192,6 +1195,8 @@ class AscendAttnBackend(AttentionBackend):
 
     def prepare_dsa_cp_metadata(self, forward_batch: ForwardBatch) -> None:
         if getattr(forward_batch, "dsa_cp_metadata_prepared", False):
+            return
+        if not self.use_dsa:
             return
         if getattr(forward_batch, "attn_cp_metadata", None) is None:
             return
