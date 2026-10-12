@@ -87,11 +87,11 @@ class KVCRStore(HiCacheStorage):
         self._closed = False
         self._pinning = _NoFrameworkPinning()
         self._extra = dict(storage_config.extra_config or {})
-        if "startup_timeout_ms" in self._extra and (
-            type(self._extra["startup_timeout_ms"]) is not int
-            or self._extra["startup_timeout_ms"] <= 0
+        if "startup_timeout_seconds" in self._extra and (
+            type(self._extra["startup_timeout_seconds"]) is not int
+            or self._extra["startup_timeout_seconds"] <= 0
         ):
-            raise ValueError("startup_timeout_ms must be a positive integer")
+            raise ValueError("startup_timeout_seconds must be a positive integer")
         self.prefetch_batch_pages = self._extra.get(
             "prefetch_batch_pages", STORAGE_BATCH_SIZE
         )
@@ -260,8 +260,8 @@ class KVCRStore(HiCacheStorage):
                 # Do not pass the new option when unset: ordinary deployments
                 # remain compatible with KVCR versions predating this field.
                 startup_options = (
-                    {"startup_timeout_ms": self._extra["startup_timeout_ms"]}
-                    if "startup_timeout_ms" in self._extra
+                    {"startup_timeout_seconds": self._extra["startup_timeout_seconds"]}
+                    if "startup_timeout_seconds" in self._extra
                     else {}
                 )
                 self._runner = KVCR(

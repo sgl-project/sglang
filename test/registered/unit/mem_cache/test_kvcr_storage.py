@@ -238,8 +238,8 @@ class TestKVCRStorage(CustomTestCase):
         """An invalid optional deadline must not reach native registration."""
         for budget in (0, -1, True, 1.5, "30000", None):
             with self.subTest(budget=budget):
-                self.config.extra_config = {"startup_timeout_ms": budget}
-                with self.assertRaisesRegex(ValueError, "startup_timeout_ms"):
+                self.config.extra_config = {"startup_timeout_seconds": budget}
+                with self.assertRaisesRegex(ValueError, "startup_timeout_seconds"):
                     KVCRStore(self.config, self.pool)
 
     def test_constructor_failure_is_fatal_and_retains_unsafe_mappings(self):
@@ -255,11 +255,11 @@ class TestKVCRStorage(CustomTestCase):
 
         original_mmap = mmap.mmap
         for error_type in (RuntimeError, StartupError):
-            for budget in (None, 180000):
+            for budget in (None, 180):
                 with self.subTest(error_type=error_type, budget=budget):
                     self.config.extra_config = {"local_dram_bytes": 128}
                     if budget is not None:
-                        self.config.extra_config["startup_timeout_ms"] = budget
+                        self.config.extra_config["startup_timeout_seconds"] = budget
                     backend = KVCRStore(self.config, self.pool)
                     captured, mappings = [], []
 
@@ -318,9 +318,11 @@ class TestKVCRStorage(CustomTestCase):
                             [error_type is RuntimeError] * len(mappings),
                         )
                         if budget is None:
-                            self.assertNotIn("startup_timeout_ms", captured[0])
+                            self.assertNotIn("startup_timeout_seconds", captured[0])
                         else:
-                            self.assertEqual(captured[0]["startup_timeout_ms"], budget)
+                            self.assertEqual(
+                                captured[0]["startup_timeout_seconds"], budget
+                            )
                     finally:
                         for allocation in mappings:
                             allocation.close()

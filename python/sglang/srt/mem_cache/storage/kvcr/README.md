@@ -50,9 +50,9 @@ Prefix-recency alignment additionally requires
 `--hicache-storage-pass-prefix-keys`. It adjusts eviction preference; it does
 not reserve source blocks or guarantee residency.
 
-An optional positive `startup_timeout_ms` requires the companion KVCR startup
-budget change. Omitting it preserves KVCR's normal startup budget. Transfer
-and abandonment deadlines are separate from this initialization setting.
+An optional positive integer `startup_timeout_seconds` requires the companion
+KVCR startup budget change. Omitting it preserves KVCR's normal startup budget.
+Transfer and abandonment deadlines are separate from this initialization setting.
 
 ## Remote hints and replicated MLA
 
