@@ -243,11 +243,44 @@ def maybe_set_npu_deterministic_level():
     try:
         import torch_npu
 
-        torch_npu.npu.set_deterministic_level(int(level))
-        logger.info(
-            "NPU deterministic level set to %s (SGLANG_DSV4_DETERMINISTIC_LEVEL).",
-            level,
-        )
+        requested = int(level)
+        torch_npu.npu.set_deterministic_level(requested)
+
+        # Read back the effective level so the log proves the value actually
+        # stuck. The getter name varies across torch_npu builds, so probe the
+        # known candidates and use the first one that exists.
+        getter = None
+        for path in (
+            ("_C", "_npu_get_deterministic_level"),
+            ("npu", "_get_deterministic_level"),
+            ("npu", "get_deterministic_level"),
+        ):
+            obj = getattr(torch_npu, path[0], None)
+            fn = getattr(obj, path[1], None)
+            if callable(fn):
+                getter = fn
+                break
+
+        if getter is None:
+            logger.info(
+                "NPU deterministic level: requested=%s effective=<unavailable> "
+                "(this torch_npu build exposes no readback getter).",
+                level,
+            )
+        else:
+            effective = getter()
+            logger.info(
+                "NPU deterministic level: requested=%s effective=%s.",
+                requested,
+                effective,
+            )
+            if int(effective) != requested:
+                logger.warning(
+                    "NPU deterministic level did not stick: requested=%s "
+                    "effective=%s (likely CANN < 9.2.0 or wrong device scope).",
+                    requested,
+                    effective,
+                )
     except Exception as e:
         logger.warning(
             "Failed to set NPU deterministic level %s "
