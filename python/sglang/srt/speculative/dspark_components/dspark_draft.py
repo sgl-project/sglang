@@ -302,11 +302,10 @@ def run_draft_proposal(
     tp_sync: SpecTpSync,
     greedy_draft: bool,
     base_logits_context=None,
-    out: Optional[DraftProposalTensors] = None,
+    step_logits_out: Optional[torch.Tensor] = None,
 ) -> DraftProposalTensors:
-    """Draft a block from the draft forward's hidden rows. With ``out`` (static
-    graph buffers: ``draft_tokens`` flat [max_bs * gamma], others [max_bs, ...])
-    results go to its leading rows and are returned as views."""
+    """Draft a block from the draft forward's hidden rows. The step logits go to
+    ``step_logits_out`` ([bs, gamma, vocab]) when given."""
     if model.sample_from_anchor:
         if hidden_states.shape[0] != bs * gamma:
             raise RuntimeError(
@@ -330,14 +329,9 @@ def run_draft_proposal(
         step_temperatures=step_temperatures,
         noise=noise,
         tp_sync=tp_sync,
-        logits_out=(
-            None if out is None or out.step_logits is None else out.step_logits[:bs]
-        ),
+        logits_out=step_logits_out,
         greedy_draft=greedy_draft,
     )
-    num_tokens = bs * gamma
-    if out is not None:
-        out.draft_tokens[:num_tokens].copy_(draft_tokens.reshape(-1))
     confidence = confidence_raw = None
     if model.confidence_head is not None:
         confidence, confidence_raw = model.compute_confidence(
@@ -345,20 +339,7 @@ def run_draft_proposal(
             draft_tokens=draft_tokens,
             confidence_features=confidence_features,
         )
-    if out is None:
-        return DraftProposalTensors(
-            draft_tokens, step_logits, confidence, confidence_raw
-        )
-    if confidence is not None:
-        out.confidence[:bs].copy_(confidence)
-        out.confidence_raw[:bs].copy_(confidence_raw)
-        confidence, confidence_raw = out.confidence[:bs], out.confidence_raw[:bs]
-    return DraftProposalTensors(
-        out.draft_tokens[:num_tokens].view(bs, gamma),
-        step_logits,
-        confidence,
-        confidence_raw,
-    )
+    return DraftProposalTensors(draft_tokens, step_logits, confidence, confidence_raw)
 
 
 class DraftBlockProposer:
@@ -439,24 +420,12 @@ class DraftBlockProposer:
 
         folded = graph_tail is not None and fwd.can_run_graph
         if folded:
-            draft_block = DraftBlockResult(
-                draft_tokens=graph_tail.out[: bs * self.gamma].view(bs, self.gamma),
-                corrected_logits=(
-                    None if self._greedy_draft else graph_tail.step_logits[:bs]
-                ),
-                greedy_mask=graph_tail.params.greedy_mask[:bs],
-                temperatures=graph_tail.params.temperatures[:bs],
-                greedy_draft=self._greedy_draft,
-            )
-            confidence = confidence_raw = None
-            if graph_tail.confidence_out is not None:
-                confidence = graph_tail.confidence_out[:bs]
-                confidence_raw = graph_tail.confidence_raw_out[:bs]
+            proposal, params = graph_tail.views(bs)
         else:
             params = resolve_draft_params(
                 sampling_info=sampling_info, bs=bs, device=device
             )
-            draft_tokens, step_logits, confidence, confidence_raw = run_draft_proposal(
+            proposal = run_draft_proposal(
                 model=self.draft_model,
                 hidden_states=fwd.hidden_states,
                 anchor_tokens=draft_block_ids[:, 0],
@@ -468,17 +437,16 @@ class DraftBlockProposer:
                 greedy_draft=self._greedy_draft,
                 base_logits_context=draft_tp_context(self._dp_moe_sync),
             )
-            draft_block = DraftBlockResult(
-                draft_tokens=draft_tokens,
-                corrected_logits=(
-                    None
-                    if self._greedy_draft
-                    else expect(_DRAFT_STEP_LOGITS, step_logits)
-                ),
-                greedy_mask=params.greedy_mask,
-                temperatures=params.temperatures,
-                greedy_draft=self._greedy_draft,
+            proposal = proposal._replace(
+                step_logits=expect(_DRAFT_STEP_LOGITS, proposal.step_logits)
             )
+        draft_block = DraftBlockResult(
+            draft_tokens=proposal.draft_tokens,
+            corrected_logits=proposal.step_logits,
+            greedy_mask=params.greedy_mask,
+            temperatures=params.temperatures,
+            greedy_draft=self._greedy_draft,
+        )
         proposal_block_ids = (
             draft_block_ids
             if self.sample_from_anchor
@@ -487,8 +455,8 @@ class DraftBlockProposer:
         return DraftProposal(
             draft_block_ids=proposal_block_ids,
             draft_block=draft_block,
-            confidence=confidence,
-            confidence_raw=confidence_raw,
+            confidence=proposal.confidence,
+            confidence_raw=proposal.confidence_raw,
             folded=folded,
         )
 

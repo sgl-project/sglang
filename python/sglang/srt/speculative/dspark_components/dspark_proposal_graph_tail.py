@@ -42,23 +42,26 @@ class DraftProposalGraphTail:
         if out is not None:
             assert out.shape == (self.max_bs * self.gamma,)
             assert out.dtype == torch.int64
-            self.out = out
         else:
-            self.out = torch.empty(
+            out = torch.empty(
                 (self.max_bs * self.gamma,), dtype=torch.int64, device=device
             )
         confidence_head = model.confidence_head
-        if confidence_head is None:
-            self.confidence_out = self.confidence_raw_out = None
-        else:
-            self.confidence_out = torch.empty(
+        confidence = confidence_raw = None
+        if confidence_head is not None:
+            confidence = torch.empty(
                 (self.max_bs, self.gamma), dtype=torch.float32, device=device
             )
-            self.confidence_raw_out = torch.empty(
+            confidence_raw = torch.empty(
                 (self.max_bs, self.gamma),
                 dtype=confidence_head.proj.weight.dtype,
                 device=device,
             )
+        # [max_bs, gamma, vocab] step logits for the sampling accept, sized on
+        # the first call; a greedy draft keeps none.
+        self.buffers = DraftProposalTensors(
+            out.view(self.max_bs, self.gamma), None, confidence, confidence_raw
+        )
         self.greedy_draft = greedy_draft
         self._noise = noise
         self._tp_sync = tp_sync
@@ -70,17 +73,26 @@ class DraftProposalGraphTail:
                 (self.max_bs,), dtype=torch.float32, device=device
             ),
         )
-        # [max_bs, gamma, vocab] step logits for the sampling accept, sized on
-        # the first call; a greedy draft keeps none.
-        self.step_logits: Optional[torch.Tensor] = None
 
     def stage_sampling_params(self, *, bs: int, sampling_info) -> None:
         """Must run before the draft graph replay that reads these buffers."""
         resolve_draft_params(sampling_info=sampling_info, bs=bs, out=self.params)
 
+    def views(self, bs: int) -> tuple[DraftProposalTensors, DraftParams]:
+        """The last replay's proposal and the params staged for it."""
+
+        def head(t):
+            return None if t is None else t[:bs]
+
+        return (
+            DraftProposalTensors(*map(head, self.buffers)),
+            DraftParams(*map(head, self.params)),
+        )
+
     def __call__(self, hidden_states, input_ids):
         bs = hidden_states.shape[0] // self.query_token_num
-        first_call = self.step_logits is None and not self.greedy_draft
+        buffers = self.buffers
+        first_call = buffers.step_logits is None and not self.greedy_draft
         if first_call:
             # The runner's warmup calls the tail eagerly before capture.
             assert not torch.cuda.is_current_stream_capturing()
@@ -94,17 +106,21 @@ class DraftProposalGraphTail:
             noise=self._noise,
             tp_sync=self._tp_sync,
             greedy_draft=self.greedy_draft,
-            out=DraftProposalTensors(
-                self.out, self.step_logits, self.confidence_out, self.confidence_raw_out
+            step_logits_out=(
+                None if buffers.step_logits is None else buffers.step_logits[:bs]
             ),
         )
+        buffers.draft_tokens[:bs].copy_(proposal.draft_tokens)
+        if buffers.confidence is not None:
+            buffers.confidence[:bs].copy_(proposal.confidence)
+            buffers.confidence_raw[:bs].copy_(proposal.confidence_raw)
         if first_call:
             # Take the shape and dtype of the step logits the proposal allocated.
             step_logits = proposal.step_logits
-            self.step_logits = step_logits.new_empty(
-                (self.max_bs, *step_logits.shape[1:])
+            self.buffers = buffers._replace(
+                step_logits=step_logits.new_empty((self.max_bs, *step_logits.shape[1:]))
             )
-            self.step_logits[:bs].copy_(step_logits)
+            self.buffers.step_logits[:bs].copy_(step_logits)
 
 
 def maybe_build_proposal_graph_tail(

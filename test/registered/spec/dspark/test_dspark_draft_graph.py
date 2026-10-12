@@ -206,21 +206,18 @@ class TestDraftMarkovBlockGraph(CustomTestCase):
             tp_sync=tp_sync,
             greedy_draft=greedy_draft,
         )
-        self.assertTrue(
-            torch.equal(tail.out[: BS * GAMMA].view(BS, GAMMA), eager.draft_tokens)
-        )
-        if greedy_draft:
-            self.assertIsNone(eager.step_logits)
-        else:
-            self.assertTrue(torch.equal(tail.step_logits[:BS], eager.step_logits))
+        folded, _ = tail.views(BS)
         self.assertEqual(noise.offset.item(), eager_noise.offset.item())
+        if greedy_draft:
+            self.assertIsNone(folded.step_logits)
+            self.assertIsNone(eager.step_logits)
         if not with_confidence:
-            self.assertIsNone(tail.confidence_out)
+            self.assertIsNone(folded.confidence)
             self.assertIsNone(eager.confidence)
-            return
-        # Folded steps carry the confidence the eager proposal computes.
-        self.assertTrue(torch.equal(tail.confidence_out[:BS], eager.confidence))
-        self.assertTrue(torch.equal(tail.confidence_raw_out[:BS], eager.confidence_raw))
+        # Folded steps carry what the eager proposal computes.
+        for name, value in eager._asdict().items():
+            if value is not None:
+                self.assertTrue(torch.equal(getattr(folded, name), value), name)
 
 
 if __name__ == "__main__":
