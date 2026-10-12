@@ -868,6 +868,10 @@ class ChatCompletionRequest(PDRoutingFields):
     _response_parser_prefix: str = PrivateAttr(default="")
     _response_parser_grammar_start: Optional[str] = PrivateAttr(default=None)
     _response_parser_tool_grammar: bool = PrivateAttr(default=False)
+    # Set only by /v1/tokenize when the caller supplies add_generation_prompt:
+    # render the messages as given with these options. None keeps chat rendering.
+    _format_add_generation_prompt: Optional[bool] = PrivateAttr(default=None)
+    _format_add_special_tokens: bool = PrivateAttr(default=False)
 
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/chat/create
@@ -1675,6 +1679,14 @@ class TokenizeRequest(BaseModel):
         default=True,
         description="whether to add model-specific special tokens (e.g. BOS/EOS) during encoding.",
     )
+    add_generation_prompt: Optional[bool] = Field(
+        default=None,
+        description=(
+            "With messages: render them as given, passing this to the chat template, "
+            "and encode with add_special_tokens (default false). Omitted, messages are "
+            "rendered as for a chat completion."
+        ),
+    )
 
     @model_validator(mode="after")
     def validate_tokenize_input(self) -> TokenizeRequest:
@@ -1684,13 +1696,20 @@ class TokenizeRequest(BaseModel):
 
     def to_chat_completion_request(self) -> ChatCompletionRequest:
         data = self.model_dump(
-            exclude={"prompt", "add_special_tokens"},
+            exclude={"prompt", "add_special_tokens", "add_generation_prompt"},
             exclude_none=True,
         )
         extra = getattr(self, "__pydantic_extra__", None)
         if extra:
             data.update(extra)
-        return ChatCompletionRequest.model_validate(data)
+        request = ChatCompletionRequest.model_validate(data)
+        if self.add_generation_prompt is not None:
+            request._format_add_generation_prompt = self.add_generation_prompt
+            request._format_add_special_tokens = (
+                "add_special_tokens" in self.model_fields_set
+                and self.add_special_tokens
+            )
+        return request
 
 
 class TokenizeResponse(BaseModel):
