@@ -604,6 +604,22 @@ def handle_elastic_ep(server_args: Any):
             "--max-ep-size requires --elastic-ep-backend to be set."
         )
         assert cfg.max_ep_size > 0, "--max-ep-size must be a positive integer."
+    if cfg.elastic_ep_reuse_cuda_graph:
+        assert cfg.elastic_ep_backend is not None, (
+            "--elastic-ep-reuse-cuda-graph requires --elastic-ep-backend to be set."
+        )
+        # Only NIXL takes a dispatch width wider than the live cohort.
+        assert cfg.moe_a2a_backend == "nixl", (
+            "--elastic-ep-reuse-cuda-graph requires --moe-a2a-backend nixl "
+            f"(got {cfg.moe_a2a_backend})."
+        )
+        # A shrink rebuilds the LPLB solvers, and a kept graph replays the old ones.
+        assert cfg.ep_dispatch_algorithm != "lp", (
+            "--elastic-ep-reuse-cuda-graph does not support --ep-dispatch-algorithm lp."
+        )
+        assert cfg.speculative_algorithm is None, (
+            "--elastic-ep-reuse-cuda-graph does not support speculative decoding."
+        )
 
     scaling_active = (
         cfg.elastic_ep_backend is not None
