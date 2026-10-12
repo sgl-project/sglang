@@ -2095,7 +2095,9 @@ class Scheduler(
             and len(self.inflight_steps) > 0
         )
         # Every DP attention rank must take the same decision, but this term is
-        # rank-local. The algorithms that need it do not support DP attention.
+        # rank-local. The built-in algorithms that need it (NGRAM) reject DP
+        # attention at startup; a plugin algorithm without grammar overlap
+        # support fails here on its first grammar request.
         assert not (self.attn_dp_enabled and need_grammar_sync)
 
         # Algorithms that support grammar overlap advance the FSM inside verify()
