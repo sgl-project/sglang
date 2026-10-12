@@ -37,7 +37,7 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
         s.dp_attn_adapter = Mock()
         s.dp_attn_adapter.maybe_prepare_mlp_sync_batch.return_value = None
         self.running_batch = SimpleNamespace(
-            batch_is_full=False, is_prefill_only=False, is_empty=lambda: True
+            is_prefill_only=False, is_empty=lambda: True
         )
 
     def test_feature_gates(self):

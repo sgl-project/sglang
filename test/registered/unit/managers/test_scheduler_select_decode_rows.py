@@ -30,7 +30,6 @@ class TestSelectDecodeRowsHoldMode(CustomTestCase):
         batch.batch_size.return_value = 2
         batch.is_empty.return_value = False
         batch.check_decode_mem.return_value = fits
-        batch.batch_is_full = True
         return batch
 
     def test_kv_full_holds_rows_without_retracting(self):
@@ -42,7 +41,6 @@ class TestSelectDecodeRowsHoldMode(CustomTestCase):
         batch.retract_decode.assert_not_called()
         batch.prepare_for_decode.assert_not_called()
         s.new_token_ratio_tracker.decay_step.assert_not_called()
-        self.assertTrue(batch.batch_is_full)
 
     def test_rows_that_fit_are_prepared_without_ratio_decay(self):
         s = self._scheduler()
@@ -93,7 +91,6 @@ class TestMixedStepHoldsDecodeRows(CustomTestCase):
 
         running_batch = MagicMock(
             reqs=[SimpleNamespace(beam_group=None)],
-            batch_is_full=False,
             return_logprob=False,
         )
         running_batch.is_empty.return_value = False

@@ -107,6 +107,9 @@ class ScriptedContext:
     def exhaust_kv(self, *, leave_pages: int) -> None:
         return self._kv_exhauster.exhaust(leave_pages=leave_pages)
 
+    def release_kv(self) -> None:
+        return self._kv_exhauster.release()
+
     def exhaust_lock_refs(self, *, leave_refs: int) -> None:
         return self._lock_ref_exhauster.exhaust(leave_refs=leave_refs)
 

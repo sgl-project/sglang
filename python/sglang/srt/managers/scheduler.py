@@ -1292,7 +1292,7 @@ class Scheduler(
         self.gracefully_exit = False
         self.waiting_queue: List[Req] = []
         # The running decoding batch for continuous batching
-        self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
+        self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[])
         # The current forward batch
         self.cur_batch_for_debug: Optional[ScheduleBatch] = None
         # The last forward batch
@@ -3800,8 +3800,6 @@ class Scheduler(
                 else:
                     running_batch.merge_batch(new_batch)
                 running_batch.hisparse_coordinator = self.hisparse_coordinator
-            # Reset batch_is_full so the scheduler can schedule more prefills.
-            running_batch.batch_is_full = False
 
         if (
             not self.enable_hisparse
@@ -3817,10 +3815,7 @@ class Scheduler(
                 reqs_to_exclude.update(last_batch.reqs)
 
             # Filter batch
-            last_bs = last_batch.batch_size()
             last_batch.filter_batch(reqs_to_exclude=list(reqs_to_exclude))
-            if last_batch.batch_size() < last_bs:
-                running_batch.batch_is_full = False
 
             # Merge the new batch into the running batch. A running batch that
             # DP attention converted to extend is last_batch itself: filtered
@@ -3839,8 +3834,6 @@ class Scheduler(
         # even when no new batches arrive (e.g. traffic stops).
         if running_batch.is_prefill_only:
             running_batch.filter_batch()
-            if running_batch.is_empty():
-                running_batch.batch_is_full = False
 
         new_batch, running_batch = self._admit_prefill(running_batch)
         new_batch, need_mlp_sync = self._gather_admitted(new_batch)
@@ -4015,15 +4008,7 @@ class Scheduler(
             for req in ready_grammar_requests:
                 self._add_request_to_queue(req)
 
-        if self.enable_priority_preemption or self.is_hybrid_swa:
-            # Reset batch_is_full to try preemption with a prefill adder.
-            running_batch.batch_is_full = False
-        if running_batch.is_empty():
-            # An empty batch never reaches select_decode_rows, the only
-            # other place that clears the flag, so admission would stay shut.
-            running_batch.batch_is_full = False
-
-        if running_batch.batch_is_full and self.chunked_req is None:
+        if self.admission_skip_reason(running_batch) is not None:
             return None, running_batch
 
         running_bs = len(running_batch.reqs)
@@ -4038,11 +4023,6 @@ class Scheduler(
                 ),
             )
         ):
-            return None, running_batch
-
-        if (skip_reason := self.admission_skip_reason(running_batch)) is not None:
-            if skip_reason == AdmissionSkipReason.NO_REQ_SLOT:
-                running_batch.batch_is_full = True
             return None, running_batch
 
         # Get priority queue
@@ -4120,6 +4100,8 @@ class Scheduler(
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         buffer_pipeline = self.tree_cache.buffer_pipeline
+        # Once set, every later candidate of this pass needs a preemption.
+        rows_full = False
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             if self.enable_lora and not self.can_schedule_lora_req(req, running_loras):
@@ -4143,14 +4125,14 @@ class Scheduler(
                 candidate_beam_width,
                 running_batch=running_batch,
             ):
-                running_batch.batch_is_full = True
+                rows_full = True
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 # In prefill mode, prealloc queue and transfer queue can also take memory,
                 # so we need to check if the available size for the actual available size.
                 if len(adder.can_run_list) >= self.req_to_token_pool.available_size():
-                    running_batch.batch_is_full = True
+                    rows_full = True
 
-            if running_batch.batch_is_full:
+            if rows_full:
                 if not self.enable_priority_preemption or not adder.preempt_to_schedule(
                     req
                 ):
@@ -4196,11 +4178,6 @@ class Scheduler(
                 running_loras.add(req.lora_id)
 
             if res != AddReqResult.CONTINUE:
-                if res == AddReqResult.NO_TOKEN:
-                    # Set batch_is_full after making sure there are requests that can be served
-                    running_batch.batch_is_full = len(adder.can_run_list) > 0 or (
-                        not running_batch.is_empty()
-                    )
                 # revert matched mamba idx to avoid memory leak, if req is not added.
                 # Only free if the slot was freshly allocated in this batch (not
                 # pre-existing from a session). Session-held slots have their own
@@ -4320,9 +4297,7 @@ class Scheduler(
                     self.future_map.stash_bonus_tokens(
                         running_batch.req_pool_indices, last_tokens
                     )
-                running_batch = ScheduleBatch(
-                    reqs=[], batch_is_full=running_batch.batch_is_full
-                )
+                running_batch = ScheduleBatch(reqs=[])
 
         return new_batch, running_batch
 
@@ -4383,26 +4358,20 @@ class Scheduler(
         fit the KV pool, retract mode retracts rows; hold mode (a mixed step)
         holds them all back to decode on a later step.
         """
-        initial_bs = batch.batch_size()
-
         finishing_reqs = self._reqs_finishing_inflight(batch)
         batch.filter_batch(reqs_to_exclude=finishing_reqs)
         if batch.is_empty():
-            batch.batch_is_full = False
             return True
 
         kv_full_retract_flag = not batch.check_decode_mem()
         if kv_full_retract_flag and finishing_reqs:
             # The queued result frees the finishing requests' KV at the end of
             # this step; decode the rest next step instead of retracting them.
-            batch.batch_is_full = False
             return False
 
         if not retract:
             if kv_full_retract_flag:
                 return False
-            if finishing_reqs:
-                batch.batch_is_full = False
             batch.prepare_for_decode()
             return True
 
@@ -4473,9 +4442,6 @@ class Scheduler(
                 self._add_request_to_queue(req, is_retracted=True)
         else:
             self.new_token_ratio_tracker.decay_step()
-
-        if batch.batch_size() < initial_bs:
-            batch.batch_is_full = False
 
         if batch.is_empty():
             return True
@@ -5748,7 +5714,6 @@ class Scheduler(
                 self.disagg_decode_prealloc_queue.hold_rebootstrap(req)
             else:
                 self._add_request_to_queue(req)
-        self.running_batch.batch_is_full = False
         # In disagg-PREFILL, keep a live mid-chunk chunked_req rather than retract it:
         # freeing its KV under a live disagg KV-sender crashes pop_bootstrapped or
         # sends freed/reused KV to decode. Kept, it resumes prefill after the pause.

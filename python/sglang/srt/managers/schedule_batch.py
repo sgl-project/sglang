@@ -2351,11 +2351,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     hisparse_coordinator: Optional[HiSparseCoordinator] = None
 
     # === Batch-variant scheduler state (per-batch; not read by ForwardBatch) ===
-    # Tell whether the current running batch is full so that we can skip
-    # the check of whether to prefill new requests.
-    # This is an optimization to reduce the overhead of the prefill check.
-    batch_is_full: bool = False
-
     # For chunked prefill in PP
     chunked_req: Optional[Req] = None
     chunked_req_next_prompt_token: Optional[int] = None

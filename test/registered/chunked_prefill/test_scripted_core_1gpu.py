@@ -7,6 +7,7 @@ from sglang.test.scripted_runtime_chunked_helpers import (
     LIFECYCLE_STAGES,
     advance_to_lifecycle_stage,
     base_engine_kwargs,
+    run_until,
     run_until_finished,
 )
 
@@ -56,6 +57,33 @@ class TestScriptedCore(ScriptedTestCase):
         r = t.start_req(prompt_len=prompt_len, max_new_tokens=3)
         yield from run_until_finished(r)
         assert r.finished, f"req with prompt_len={prompt_len} did not finish"
+
+    def test_kv_freed_without_a_batch_shrink_admits_next_step(self):
+        self.server.execute_script(self._script_kv_freed_admits_next_step)
+
+    @staticmethod
+    def _script_kv_freed_admits_next_step(t: ScriptedContext):
+        page = t.engine_stats()["page_size"]
+        running = t.start_req(prompt_len=16, max_new_tokens=64, ignore_eos=True)
+        yield from run_until(running, lambda h: h.status == "running")
+        # Room for the running request's decode, but not for the head's
+        # prefill on top of the running request's decode reservation.
+        t.exhaust_kv(leave_pages=-(-80 // page))
+        head = t.start_req(prompt_len=_CHUNK_SIZE, max_new_tokens=8, prompt_token=2)
+        for _ in range(4):
+            yield
+        assert head.status == "waiting", f"head must not fit yet; {head.status}"
+
+        # No running row leaves: the freed KV alone must admit the head.
+        t.release_kv()
+        yield from run_until(
+            head,
+            lambda h: h.req is not None and len(h.req.output_ids) > 0,
+            max_steps=8,
+        )
+        assert not running.finished, "head must not wait for a batch shrink"
+        yield from run_until_finished(head)
+        yield from run_until_finished(running)
 
     def test_pause_retract_at_lifecycle_points_then_resume(self):
         for stage in LIFECYCLE_STAGES:

@@ -117,7 +117,6 @@ class SchedulingTraceWriter:
             chunked=self._label(chunked.rid) if chunked is not None else None,
             running=self._labels(plan.running_batch.reqs),
             waiting=self._labels(scheduler.waiting_queue),
-            batch_is_full=plan.running_batch.batch_is_full,
             retracted=self._labels(
                 self._newly_retracted(
                     [
