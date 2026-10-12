@@ -29,6 +29,8 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+import torch
+
 from sglang.srt.model_executor.runner import decode_cuda_graph_runner as mod
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
@@ -67,6 +69,91 @@ def _make_runner(cls, *, is_draft_worker):
     runner = cls.__new__(cls)
     runner.model_runner = SimpleNamespace(is_draft_worker=is_draft_worker)
     return runner
+
+
+class TestCaptureTailHooks(CustomTestCase):
+    def test_tail_hooks_do_not_retain_autograd_history(self):
+        weight = torch.nn.Parameter(torch.tensor([2.0, 3.0]))
+        output_buffers = [torch.zeros(4), torch.zeros(4)]
+        observations = []
+
+        def make_hook(buffer, offset):
+            def hook(runner, out, forward_batch, num_tokens):
+                # Like a sampler, compute with trainable parameters and write
+                # into a persistent buffer view. Without no-grad this retains
+                # the computation graph through CopySlices across iterations.
+                buffer[:num_tokens].copy_(out * weight + offset)
+                observations.append(
+                    (torch.is_grad_enabled(), buffer.requires_grad, buffer.grad_fn)
+                )
+
+            return hook
+
+        @torch.no_grad()
+        def forward(input_ids, positions, forward_batch):
+            return input_ids.float() * weight
+
+        forward_batch = SimpleNamespace(
+            input_ids=torch.tensor([1, 2]),
+            positions=torch.arange(2),
+            lora_ids=None,
+            global_dp_buffer_len=2,
+            dp_padding_mode=SimpleNamespace(is_max_len=lambda: True),
+            global_num_tokens_cpu=None,
+        )
+        runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
+        runner.captured_req_width = 1
+        runner.ragged_verify_mode = False
+        runner.pp_size = 1
+        runner.dllm_uses_input_embeds = False
+        runner.model_runner = SimpleNamespace(
+            spec_algorithm=SimpleNamespace(is_dflash_family=lambda: False),
+            capture_tail_hooks=[
+                make_hook(buffer, offset)
+                for offset, buffer in enumerate(output_buffers)
+            ],
+            canary_manager=None,
+        )
+        runner.capture_prepare = mock.Mock(
+            return_value=(forward_batch, mock.Mock(), None)
+        )
+        runner.tbo_plugin = mock.Mock()
+        runner.deepep_adapter = mock.Mock()
+        runner._record_in_graph_metadata_prep_done = mock.Mock()
+
+        def capture_one(shape_key, run_once, **kwargs):
+            # Simulate the backend's two warmups and one capture on CPU, using
+            # the real runner callback in all three phases.
+            for _ in range(3):
+                torch.testing.assert_close(run_once(), torch.tensor([2.0, 6.0]))
+                self.assertTrue(torch.is_grad_enabled())
+
+        runner.backend = SimpleNamespace(capture_one=capture_one)
+        with (
+            torch.enable_grad(),
+            mock.patch.object(
+                mod,
+                "get_exec",
+                return_value=SimpleNamespace(
+                    graph=SimpleNamespace(debug_cuda_graph=False)
+                ),
+            ),
+            mock.patch.object(mod, "set_dp_buffer_len"),
+            mock.patch.object(mod, "set_is_extend_in_batch"),
+            mock.patch.object(mod, "maybe_flashinfer_autotune_speculative_draft"),
+        ):
+            runner.capture_one_shape(2, forward)
+            self.assertTrue(torch.is_grad_enabled())
+
+        self.assertEqual(len(observations), 6)
+        for grad_enabled, requires_grad, grad_fn in observations:
+            self.assertFalse(requires_grad)
+            self.assertIsNone(grad_fn)
+            self.assertFalse(grad_enabled)
+        for offset, buffer in enumerate(output_buffers):
+            torch.testing.assert_close(
+                buffer, torch.tensor([4.0 + offset, 18.0 + offset, 0.0, 0.0])
+            )
 
 
 class TestInitProfileBatchMode(CustomTestCase):

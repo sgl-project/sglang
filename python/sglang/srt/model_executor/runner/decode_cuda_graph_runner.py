@@ -1321,8 +1321,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     forward_batch,
                     **kwargs,
                 )
-                for capture_hook in self.model_runner.capture_tail_hooks:
-                    capture_hook(self, out, forward_batch, num_tokens)
+                # Tail hooks run outside the model forward's no-grad scope.
+                # Avoid building autograd graphs here; hooks such as DsparkDraftSampler
+                # may otherwise unexpectedly retain autograd history.
+                with torch.no_grad():
+                    for capture_hook in self.model_runner.capture_tail_hooks:
+                        capture_hook(self, out, forward_batch, num_tokens)
                 return out
 
             self.deepep_adapter.capture(is_extend_in_batch=False)
