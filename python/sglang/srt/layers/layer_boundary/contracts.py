@@ -186,13 +186,14 @@ class FfnInputFusion(msgspec.Struct, frozen=True):
 
 class ReadoutFusion(msgspec.Struct, frozen=True):
     """A kernel a stage's read supplies (its ``completing_fusions``) that
-    completes the sum its input owes together with the residual add, for a
-    read that is not the residual's plain norm and so takes no FfnInputFusion.
+    completes the input's sum and producer update before the consumer read.
 
+    With no ``accepts_update`` predicate the update must be plain addition.
+    Otherwise ``run`` also receives the actual producer's ``update`` keyword.
     ``run(hidden_states, residual, forward_batch)`` returns the written stream,
-    the completed sum plus the residual, which the read then reads; or None
-    when it does not take the batch, before touching its inputs or starting a
-    collective."""
+    or, with ``reads=True``, takes ``norm`` and returns (input, residual).
+    A carried candidate may receive UnreducedOutput or DeferredFinalize.
+    Returning None must precede any collective or mutation of input/state."""
 
     # The group whose sum it completes.
     completes: SumGroup
@@ -204,6 +205,12 @@ class ReadoutFusion(msgspec.Struct, frozen=True):
     # Whether it also does the read: run(hidden_states, residual,
     # forward_batch, norm) then returns the read's (input, residual).
     reads: bool = False
+    # None restricts the existing kernel to a plain addition. An explicit
+    # predicate validates the actual update before run receives it as a keyword.
+    accepts_update: Optional[Callable] = None
+    # Also accepts dynamically carried output; run must decline unsupported
+    # completion handles without starting communication or changing state.
+    carried: bool = False
 
 
 class CpMoves(msgspec.Struct, frozen=True):

@@ -50,6 +50,7 @@ from sglang.srt.layers.layer_boundary.prepare import (
     _attn_input_default,
     _attn_input_scattered,
 )
+from sglang.srt.layers.layer_boundary.residual import takes_pending_update
 from sglang.srt.layers.layer_boundary.stage import StageBoundary
 from sglang.srt.runtime_context import (
     get_forward,
@@ -269,6 +270,7 @@ def _bind_stage(
     *,
     final_read=None,
     capture_preserves_residual=None,
+    pipeline_handoff=False,
     **options,
 ):
     if incoming.consumer != declaration or outgoing.producer != declaration:
@@ -276,7 +278,15 @@ def _bind_stage(
     if incoming.entries.keys() != outgoing.exits.keys():
         raise ValueError("incoming and outgoing batch variants disagree")
     update = declaration.update
-    if declaration.terminal and not (update.is_plain_add or update.applied_at_exit):
+    if pipeline_handoff and not (update.is_plain_add or update.applied_at_exit):
+        raise NotImplementedError(
+            "pipeline boundaries require a producer-written residual"
+        )
+    if declaration.terminal and not (
+        update.is_plain_add
+        or update.applied_at_exit
+        or takes_pending_update(final_read, update)
+    ):
         # The final read adds the last output into the residual itself, as a
         # plain add, before its norm.
         raise NotImplementedError(

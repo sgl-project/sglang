@@ -24,6 +24,8 @@ class PostNormAdd:
     """``residual + norm(output)``. It is not a plain add, so it runs only on a
     complete output. ``applied_at_exit`` makes the stage write it itself."""
 
+    bind = None
+
     is_plain_add = False
     outlives_layer = True
     writes_stream = False
@@ -45,6 +47,8 @@ class PostNormAdd:
 
 class PlainReadout:
     """The input is the residual itself; the stage's norm is not applied."""
+
+    bind = None
 
     is_plain_norm = False
     completing_fusions = ()

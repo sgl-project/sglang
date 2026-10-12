@@ -49,6 +49,7 @@ from sglang.srt.layers.layer_boundary.ops import (
 from sglang.srt.layers.layer_boundary.output import (
     UnreducedOutput,
 )
+from sglang.srt.layers.layer_boundary.residual import bind_update
 from sglang.srt.layers.layer_boundary.residual.add_norm import (
     aiter_ar_fusion_applies,
     flashinfer_ar_fusion_applies,
@@ -116,7 +117,7 @@ def exit_facts(kind, plan, variant, path) -> ExitFacts:
     )
     may_defer_sum = (
         tp
-        and not plan.terminal
+        and (not plan.terminal or output.may_defer_to_next)
         and _sum_deferral_allowed(plan, output, scattered=scattered)
         # Under attention DP the next layer must also run postprocess's
         # scatter back to this rank's tokens, and nothing more.
@@ -199,10 +200,12 @@ class ExitPolicy:
         forward_batch: ForwardBatch,
         *,
         already_reduced: bool = False,
+        update_context=None,
     ):
         """Complete the output of the operation-scheduled producer path, which
         never defers: the sum it owes, then its move and write-back."""
         steps = self.plan.path_for(forward_batch)
+        update = bind_update(steps.output.update, forward_batch, update_context)
         if already_reduced and steps.output_move_completes_sum:
             raise ValueError("already-reduced output cannot use a reduce-scatter move")
         hidden_states, residual = self._complete_now(
@@ -212,6 +215,7 @@ class ExitPolicy:
             dp_step=None,
             steps=steps,
             output_move=steps.output_move,
+            update=update,
             owes_sum=not already_reduced
             and steps.output.group is not None
             and not steps.output_move_completes_sum,
@@ -220,7 +224,7 @@ class ExitPolicy:
             hidden_states,
             residual,
             stream,
-            steps.output.update,
+            update,
         )
 
     @staticmethod
@@ -260,7 +264,9 @@ class ExitPolicy:
         group on a sparse layer, the TP group a dense MLP reduces over."""
         return _sum_group(steps.output.group)
 
-    def _decide(self, forward_batch: ForwardBatch, steps) -> ExitDecision:
+    def _decide(
+        self, forward_batch: ForwardBatch, steps, *, update=None
+    ) -> ExitDecision:
         """Decide once, before the FFN runs, what completes its output's sum:
         the next layer's input, or this layer's postprocess step."""
         dp_step = self._dp_reduce_scatter_step(forward_batch, steps)
@@ -271,6 +277,7 @@ class ExitPolicy:
             dp_step=dp_step,
             steps=steps,
             output_move=steps.output_move,
+            update=update,
             # A reduce-scatter completes the sum on its way back.
             owes_sum=steps.output.group is not None and not sum_in_reduce_scatter,
         )
@@ -340,6 +347,7 @@ class ExitPolicy:
         steps,
         output_move: Optional[Callable],
         owes_sum: bool,
+        update=None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """This layer's postprocess, run with the attention-DP step already
         chosen: the sum the output owes, the move back to where the next layer
@@ -364,27 +372,40 @@ class ExitPolicy:
                 residual=residual,
                 forward_batch=forward_batch,
             )
-        update = steps.output.update
+        if update is None:
+            update = bind_update(steps.output.update, forward_batch)
         if residual is not None and (update.applied_at_exit or steps.writes_at_handoff):
             hidden_states = update.update(hidden_states, residual)
             residual = None
         return hidden_states, residual
 
     def mixer_exit(
-        self, forward_batch: ForwardBatch, *, stream: ResidualStream
+        self,
+        forward_batch: ForwardBatch,
+        *,
+        stream: ResidualStream,
+        update_context=None,
     ) -> MixerExit:
         """Decide once whether this stage's mixer (an attention-like stage)
         output's sum is completed here or carried on. Call ``finish`` on the
         result with the mixer's output."""
-        return MixerExit(self, forward_batch, stream=stream)
+        return MixerExit(
+            self, forward_batch, stream=stream, update_context=update_context
+        )
 
     def ffn_exit(
-        self, forward_batch: ForwardBatch, *, stream: ResidualStream
+        self,
+        forward_batch: ForwardBatch,
+        *,
+        stream: ResidualStream,
+        update_context=None,
     ) -> FfnExit:
         """Decide once how this layer's FFN output reduction completes. Use the
         result as a context manager around the FFN call when the FFN may hand
         off its MoE finalize, then call ``finish``."""
-        return FfnExit(self, forward_batch, stream=stream)
+        return FfnExit(
+            self, forward_batch, stream=stream, update_context=update_context
+        )
 
     def _defers_sum(
         self,
@@ -485,12 +506,13 @@ class MixerExit:
         forward_batch: ForwardBatch,
         *,
         stream: ResidualStream,
+        update_context=None,
     ):
         steps = boundary.plan.path_for(forward_batch)
         produced = steps.output
         self._stream = stream
         self._forward_batch = forward_batch
-        self._update = produced.update
+        self._update = bind_update(produced.update, forward_batch, update_context)
         self._group = produced.group
         self._declared_sum = produced.group if produced.always_partial else None
         self._defers = steps.exit.defers_mixer_sum
@@ -552,16 +574,17 @@ class FfnExit:
         forward_batch: ForwardBatch,
         *,
         stream: ResidualStream,
+        update_context=None,
     ):
         self._stream = stream
         self.boundary = boundary
         # The same path the entry took: the flags that select it hold for the
         # whole call, and a stage keeps no state between its entry and exit.
         steps = boundary.plan.path_for(forward_batch)
-        completion = boundary._decide(forward_batch, steps)
+        self._update = bind_update(steps.output.update, forward_batch, update_context)
+        completion = boundary._decide(forward_batch, steps, update=self._update)
         self.defer_moe_finalize = completion.defer_moe_finalize
         self._complete = completion.complete
-        self._update = steps.output.update
         # A reduce-scatter that completes the sum on the way back is the
         # next input's only on an input-scattered batch.
         self._declared_sum = steps.exit.sum_left_to_next_input

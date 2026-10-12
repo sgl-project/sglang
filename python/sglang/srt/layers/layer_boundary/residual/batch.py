@@ -35,6 +35,16 @@ def stream_of(forward_batch):
     return stream
 
 
+def clear(forward_batch):
+    """Release invocation state on completion or an exception."""
+    stream = forward_batch.residual_stream
+    if stream is not None:
+        if stream.pending is not None:
+            stream.pending.release()
+        stream.pending = stream.residual = None
+    forward_batch.residual_stream = None
+
+
 def written_residual(forward_batch):
     """The residual the last prepare wrote, for a stage whose compute reads it
     too (e.g. to write the next stream at its exit). Borrowed: do not modify."""
@@ -54,6 +64,17 @@ def take_output(hidden_states, forward_batch):
         raise RuntimeError("write the residual update before taking the final output")
     forward_batch.residual_stream = None
     return hidden_states
+
+
+def _plain_output(hidden_states, forward_batch):
+    stream = stream_of(forward_batch)
+    stream.check(hidden_states)
+    if stream.pending is not None and not stream.pending.update.is_plain_add:
+        raise NotImplementedError(
+            "output/residual pair requires a plain residual update; "
+            "apply the producer update before export"
+        )
+    return stream
 
 
 def final_norm(
@@ -86,12 +107,12 @@ def final_norm(
         Normalized tensor. Add and norm remain together to preserve the kernel's
         accumulation/rounding order; a snapshot is not used as the norm input.
     """
-    hidden_states, residual = stream_of(forward_batch).export(
+    hidden_states, residual = _plain_output(hidden_states, forward_batch).export(
         hidden_states, takes_handoff=finalize_norm is not None
     )
     # The terminal consumer now owns the pair. Do not keep layer buffers alive
     # through logits processing or the next forward on this batch.
-    forward_batch.residual_stream = None
+    clear(forward_batch)
     from sglang.srt.layers.layer_boundary.output import DeferredFinalize
 
     if isinstance(hidden_states, DeferredFinalize):
@@ -114,6 +135,83 @@ def final_norm(
     )
 
 
+def read_output(hidden_states, forward_batch, read, norm, *, read_context=None):
+    """Consume the stack's output with an explicitly declared final read.
+
+    This entry accepts producer updates through ``accepts_pending_update``.
+    Completion candidates see the actual update before any collective; their
+    fallback completes the owed output once, then applies update_and_read.
+    A bindable read receives read_context once before consuming the output.
+    Ordinary model final norms continue to use final_norm().
+    """
+    from sglang.srt.layers.layer_boundary.layout import _sum_group
+    from sglang.srt.layers.layer_boundary.output import (
+        DeferredFinalize,
+        UnreducedOutput,
+    )
+    from sglang.srt.layers.layer_boundary.prepare import _run_read_fusions
+    from sglang.srt.layers.layer_boundary.residual import (
+        bind_read,
+        takes_pending_update,
+    )
+    from sglang.srt.layers.layer_boundary.residual.stream import DeclaredSum
+
+    stream = stream_of(forward_batch)
+    stream.check(hidden_states)
+    pending = stream.pending
+    try:
+        if pending is not None and not takes_pending_update(read, pending.update):
+            raise NotImplementedError(
+                "final read does not accept the pending producer update"
+            )
+        read = bind_read(read, forward_batch, read_context)
+        if pending is None:
+            value = stream.residual
+            if value is None:
+                value = read.init_residual(hidden_states)
+            return read.read(value, norm)
+        if not takes_pending_update(read, pending.update):
+            raise NotImplementedError(
+                "final read does not accept the pending producer update"
+            )
+        owed = pending.owed
+        candidates = tuple(
+            f
+            for f in read.completing_fusions
+            if not f.scatters
+            and (
+                (isinstance(owed, DeclaredSum) and f.completes is owed.group)
+                or (
+                    isinstance(owed, UnreducedOutput)
+                    and f.carried
+                    and owed.reduce_to_dp_local is None
+                    and _sum_group(f.completes) is owed.group
+                )
+                or (
+                    isinstance(owed, DeferredFinalize)
+                    and f.carried
+                    and f.completes is owed.completion_group
+                )
+            )
+        )
+        result = _run_read_fusions(
+            candidates,
+            pending.for_boundary(),
+            stream.residual,
+            forward_batch,
+            norm,
+            read=read,
+            update=pending.update,
+        )
+        if result is None:
+            value = pending.complete()
+            result = read.update_and_read(pending.update, value, stream.residual, norm)
+        return result
+    finally:
+        # The terminal consumer owns the result, including on an exception.
+        clear(forward_batch)
+
+
 def to_pp(hidden_states, forward_batch):
     """Export hidden_states and residual as PPProxyTensors.
 
@@ -129,8 +227,10 @@ def to_pp(hidden_states, forward_batch):
     and is sent as hidden_states alone; the receiver's from_pp reconstructs it
     as written.
     """
-    hidden_states, residual = stream_of(forward_batch).export(hidden_states)
-    forward_batch.residual_stream = None
+    hidden_states, residual = _plain_output(hidden_states, forward_batch).export(
+        hidden_states
+    )
+    clear(forward_batch)
     tensors = {"hidden_states": hidden_states}
     if residual is not None:
         tensors["residual"] = residual
