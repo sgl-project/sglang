@@ -1741,6 +1741,55 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         )
         self.assertEqual(_deterministic_sampling_backend(view), {})
 
+    def test_deterministic_rocm_rccl_above_two_ranks_raises(self):
+        """Deterministic ROCm TP above 2 must not fall back to RCCL, whose results
+        change with the batch above two ranks."""
+        from sglang.srt.arg_groups.overrides import (
+            ResolvedView,
+            _deterministic_rocm_rccl_check,
+        )
+
+        view = ResolvedView(
+            SimpleNamespace(
+                enable_deterministic_inference=True,
+                tp_size=4,
+                disable_custom_all_reduce=True,
+            )
+        )
+        with override_platform(is_cuda=False, is_hip=True):
+            with self.assertRaises(ValueError):
+                _deterministic_rocm_rccl_check(view)
+
+    def test_deterministic_rocm_rccl_check_leaves_other_setups_alone(self):
+        # CUDA disables the custom all-reduce itself in deterministic mode, and
+        # a two-rank sum has one order whatever the algorithm.
+        from sglang.srt.arg_groups.overrides import (
+            ResolvedView,
+            _deterministic_rocm_rccl_check,
+        )
+
+        cases = [
+            (False, True, 8, True),
+            (True, False, 8, True),
+            (True, True, 2, True),
+            (True, True, 8, False),
+        ]
+        for is_hip, deterministic, tp_size, disable_car in cases:
+            view = ResolvedView(
+                SimpleNamespace(
+                    enable_deterministic_inference=deterministic,
+                    tp_size=tp_size,
+                    disable_custom_all_reduce=disable_car,
+                )
+            )
+            with (
+                self.subTest(
+                    is_hip=is_hip, deterministic=deterministic, tp_size=tp_size
+                ),
+                override_platform(is_cuda=not is_hip, is_hip=is_hip),
+            ):
+                self.assertEqual(_deterministic_rocm_rccl_check(view), {})
+
     def test_dllm_forces_flashinfer_with_cuda_graph(self):
         # CUDA path: cuda graph enabled by default -> dllm forces flashinfer.
         # A real dllm arch: the page pass now runs regardless of the radix
