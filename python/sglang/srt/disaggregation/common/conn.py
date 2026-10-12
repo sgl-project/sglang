@@ -114,6 +114,7 @@ class PrefillServerInfo:
     enable_dsa_cache_layer_split: bool = False
     dsv41_spec_layout: Optional[dict] = None
     decode_allocation_policy: str = "early"
+    supports_host_destination: bool = False
 
     # PD true-retraction rebootstrap: the prefill's HTTP API port. The decode
     # already knows the prefill host (the bootstrap_addr host), so it can POST
@@ -1391,6 +1392,10 @@ class CommonKVManager(BaseKVManager):
             # retract rebootstrap /generate URL from bootstrap info instead of a
             # router-injected pd_rebootstrap_prefill_url.
             "prefill_http_port": get_serving().port,
+            "supports_host_destination": (
+                self.supports_host_destination
+                and self.enable_deferred_decode_kv_release
+            ),
         }
 
         payload["decode_allocation_policy"] = (
@@ -2496,6 +2501,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.enable_dsa_cache_layer_split: Optional[bool] = None
         self.prefill_http_port: Optional[int] = None
         self.decode_allocation_policy = "early"
+        self.supports_host_destination: Optional[bool] = None
         self.prefill_port_table: Dict[
             int, Dict[int, Dict[int, Dict[int, PrefillRankInfo]]]
         ] = {}
@@ -2577,6 +2583,12 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             )
         self.dsv41_spec_layout = dsv41_spec_layout
         self.decode_allocation_policy = policy
+        supports_host = bool(data.get("supports_host_destination", False))
+        self.supports_host_destination = (
+            supports_host
+            if self.supports_host_destination is None
+            else self.supports_host_destination and supports_host
+        )
 
         if self.attn_tp_size is None:
             self.attn_tp_size = attn_tp_size
@@ -2677,6 +2689,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 enable_dsa_cache_layer_split=bool(self.enable_dsa_cache_layer_split),
                 prefill_http_port=self.prefill_http_port,
                 decode_allocation_policy=self.decode_allocation_policy,
+                supports_host_destination=bool(self.supports_host_destination),
             )
             payload = dataclasses.asdict(info)
             if info.dsv41_spec_layout is None:

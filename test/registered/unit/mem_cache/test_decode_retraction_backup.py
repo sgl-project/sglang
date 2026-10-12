@@ -433,6 +433,9 @@ class TestDecodeRetractionBackup(CustomTestCase):
         self.assertEqual(full_host.available_size(), capacities[0])
         receiver.send_metadata.assert_not_called()
         swa_host.free(blocker)
+        receiver.send_metadata.side_effect = lambda *a, **kw: self.assertTrue(
+            decode_req.host_staged
+        )
         self.assertTrue(queue._pre_alloc_host(decode_req))
         backup = req.kv.retraction_backup
         self.assertEqual(len(backup.host_indices), 24)

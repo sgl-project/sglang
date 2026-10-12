@@ -9,7 +9,12 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
-from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
+from sglang.srt.disaggregation.base.conn import (
+    KVArgs,
+    KVPoll,
+    KVTransferDestination,
+    StateType,
+)
 from sglang.srt.disaggregation.common.conn import AckTarget, CommonKVManager
 from sglang.srt.disaggregation.common.staging_buffer import (
     StagingAllocator,
@@ -635,6 +640,54 @@ class TestDisaggregationWire(unittest.TestCase):
         self.assertEqual(info.dst_kv_item_lens, [])
         info = KVArgsRegisterInfo.from_zmq(msg + [b"", struct.pack("Q", 128)])
         self.assertEqual(info.dst_kv_item_lens, [128])
+        self.assertEqual(info.dst_host_kv_ptrs, [])
+        self.assertIs(info.for_destination(KVTransferDestination.DEVICE), info)
+        with self.assertRaisesRegex(ValueError, "Host KV"):
+            info.for_destination(KVTransferDestination.HOST)
+
+        msg[16] = b"1"  # Host receive requires DCP=1.
+        msg[6] = pack_int_lists([[0x1500, 0x1600]], "Q")
+        msg[10] = pack_int_lists([[128, 64]], "I")
+        info = KVArgsRegisterInfo.from_zmq(
+            msg
+            + [
+                b"",
+                struct.pack("Q", 128),
+                struct.pack("Q", 0x4000),
+                pack_int_lists([[0x4500, 0x4600]], "Q"),
+                pack_int_lists([[128, 64]], "I"),
+                struct.pack("Q", 128),
+            ]
+        )
+        host = info.for_destination(KVTransferDestination.HOST)
+        self.assertEqual(host.dst_kv_ptrs, [0x4000])
+        self.assertEqual(host.dst_kv_item_lens, [128])
+        self.assertEqual(host.dst_state_data_ptrs, [[0x4500, 0x4600]])
+        self.assertEqual(host.dst_state_item_lens, [[128, 64]])
+        self.assertEqual(info.dst_state_data_ptrs, [[0x1500, 0x1600]])
+        self.assertEqual(host.staging_base_ptr, 0)
+        self.assertEqual(info.dst_kv_ptrs, [0x1000])
+        self.assertEqual(info.staging_base_ptr, 0x3000)
+
+    def test_mooncake_registers_and_deregisters_host_regions(self):
+        manager = object.__new__(MooncakeKVManager)
+        manager.engine = Mock()
+        manager.kv_args = KVArgs()
+        manager.kv_args.kv_data_ptrs, manager.kv_args.kv_data_lens = [1], [100]
+        manager.kv_args.aux_data_ptrs, manager.kv_args.aux_data_lens = [2], [20]
+        manager.kv_args.state_data_ptrs, manager.kv_args.state_data_lens = [[3]], [[30]]
+        manager.kv_args.host_kv_data_ptrs, manager.kv_args.host_kv_data_lens = (
+            [4],
+            [400],
+        )
+        manager.kv_args.host_state_data_ptrs = [[5]]
+        manager.kv_args.host_state_data_lens = [[50]]
+        manager.register_buffer_to_engine()
+        manager.engine.batch_register.assert_called_once_with(
+            [1, 4, 2, 3, 5], [100, 400, 20, 30, 50]
+        )
+        manager.deregister_buffer_to_engine()
+        manager.engine.batch_deregister.assert_called_once_with([1, 4, 2, 3, 5])
 
     def test_int_lists_roundtrip(self):
         cases = [
@@ -1091,6 +1144,13 @@ class TestMooncakeTransferInfoIsDummy(unittest.TestCase):
         np.testing.assert_array_equal(info.dst_kv_indices, kv)
         self.assertEqual(info.dst_aux_index, 4)
         self.assertEqual(info.dst_state_indices, [[1]])
+        self.assertEqual(info.destination, KVTransferDestination.DEVICE)
+        host = TransferInfo.from_zmq(
+            self._frames(kv.tobytes(), b"4", pack_int_lists([[1]], "i"), b"0")
+            + [b"host"]
+        )
+        self.assertEqual(host.destination, KVTransferDestination.HOST)
+        np.testing.assert_array_equal(host.dst_kv_indices, kv)
 
     def test_full_prefix_hit_with_empty_kv_is_not_dummy(self):
         # Empty kv indices serialize to an empty frame, so only the non-empty

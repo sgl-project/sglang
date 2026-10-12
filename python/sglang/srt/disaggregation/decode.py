@@ -1867,6 +1867,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
         if get_disagg().disaggregation_decode_enable_radix_cache:
             _bind_root_prefix(decode_req.req, self.tree_cache)
+        # Own the pages before publishing addresses, including partial sends.
+        decode_req.host_staged = True
         self._send_kv_metadata(
             decode_req,
             host_indices,
@@ -1875,7 +1877,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             decode_prefix_len=0,
             destination=KVTransferDestination.HOST,
         )
-        decode_req.host_staged = True
         if self.scheduler.metrics_reporter.current_scheduler_metrics_enabled:
             self.scheduler.metrics_collector.increment_decode_host_receive_reqs()
         return True

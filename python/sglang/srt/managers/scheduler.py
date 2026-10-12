@@ -5524,7 +5524,9 @@ class Scheduler(
                 if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort transfer queue request. {decode_req.req.rid=}")
                     if decode_req.host_staged:
-                        # Keep the host destination alive until prefill stops writing.
+                        # Stop the transfer even if prefill will never publish success.
+                        # The transfer queue retains Host pages until writers drain.
+                        decode_req.kv_receiver.abort()
                         prepare_abort(decode_req.req, "Aborted by AbortReq.")
                         continue
                     # The receiver arms drain-ack accounting before sending the
