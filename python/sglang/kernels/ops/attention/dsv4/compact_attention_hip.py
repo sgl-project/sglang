@@ -1,10 +1,11 @@
-"""Sparse attention reading V4.1 FP8/FP4 pages directly on HIP."""
+"""Sparse attention reading V4.1 FP8/FP4 pages directly on HIP. The tile step
+(_compact_qkpv) is adapted from _qkpv_fp8 of aiter's former gfx950 gluon sparse decode
+kernel (MIT)."""
 
 from typing import Optional, Tuple
 
 import torch
 import triton
-from aiter.ops.triton._gluon_kernels.gfx950.attention.pa_decode_sparse import _qkpv_fp8
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
@@ -105,32 +106,27 @@ def _compact_qkpv(
     BLOCK: gl.constexpr,
     SCALE: gl.constexpr,
 ):
-    # aiter's private helper, by keyword: a renamed or reordered parameter fails to compile
-    return _qkpv_fp8(
-        k_nope=kv,
-        k_rope=kv,
-        valid=valid,
-        q_dot=qdot,
-        m_i=m,
-        l_i=den,
-        acc=acc,
-        head_mask=head_mask,
-        qk_scale=SCALE * RCP_LN2,
-        kv_smem=smem,
-        qk_layout=MF,
-        pv_layout=MF,
-        k_layout=gl.DotOperandLayout(1, MF, 8),
-        v_layout=gl.DotOperandLayout(1, MF, 8),
-        p_layout=gl.DotOperandLayout(0, MF, 8),
-        NOPE_DIM=512,
-        ROPE_DIM=0,
-        HEAD_SIZE=512,
-        BLOCK_M=16,
-        BLOCK_K=BLOCK,
-        HEAD_ALIGNED=H % 16 == 0,
-        UNIFORM=True,
-        HAS_INVALID=True,
-    )
+    """One bf16 tile through LDS: QK, online softmax, PV. m stays the raw-score row max,
+    which the epilogue and the split partials scale; a row with no valid slot yet keeps 0."""
+    qk_scale: gl.constexpr = SCALE * RCP_LN2
+    KV: gl.constexpr = gl.DotOperandLayout(1, MF, 8)
+    smem.store(kv)
+    k = smem.permute([1, 0]).load(KV)
+    s = gl.amd.cdna4.mfma(qdot, k, gl.zeros([16, BLOCK], gl.float32, layout=MF))
+    mask = gl.convert_layout(valid, gl.SliceLayout(0, MF))[None, :]
+    if H % 16 != 0:
+        mask = head_mask[:, None] & mask
+    s = gl.where(mask, s, -float("inf"))
+    m_new = gl.maximum(m, gl.max(s, axis=1))
+    m_new = gl.where(m_new > -float("inf"), m_new, 0.0)
+    m_scaled = m_new * qk_scale
+    p = gl.exp2(s * qk_scale - m_scaled[:, None])
+    alpha = gl.exp2(m * qk_scale - m_scaled)
+    den = den * alpha + gl.sum(p, axis=1)
+    v = smem.load(KV)
+    p = gl.convert_layout(p.to(gl.bfloat16), gl.DotOperandLayout(0, MF, 8))
+    acc = gl.amd.cdna4.mfma(p, v, acc * alpha[:, None])
+    return m_new, den, acc
 
 
 @gluon.jit
