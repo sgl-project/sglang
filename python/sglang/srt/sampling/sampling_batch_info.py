@@ -71,7 +71,6 @@ class SamplingBatchInfo:
 
     # Masking tensors for grammar-guided structured outputs
     vocab_size: int
-    max_top_k: int = TOP_K_ALL
     grammars: Optional[List[Optional[BaseGrammarObject]]] = None
     rids_int: Optional[torch.Tensor] = None
     bootstrap_room_ids_int: Optional[torch.Tensor] = None
@@ -305,7 +304,6 @@ class SamplingBatchInfo:
                 else None
             ),
             vocab_size=vocab_size,
-            max_top_k=max((r.sampling_params.top_k for r in reqs), default=1),
             penalizer_orchestrator=penalizer_orchestrator,
             has_custom_logit_processor=has_custom_logit_processor,
             custom_params=custom_params,
@@ -637,7 +635,6 @@ class SamplingBatchInfo:
         self.need_top_p_sampling |= other.need_top_p_sampling
         self.need_top_k_sampling |= other.need_top_k_sampling
         self.need_min_p_sampling |= other.need_min_p_sampling
-        self.max_top_k = max(self.max_top_k, other.max_top_k)
         self.npu_top_k_top_p_eligible &= other.npu_top_k_top_p_eligible
         self.max_top_k = (
             None
