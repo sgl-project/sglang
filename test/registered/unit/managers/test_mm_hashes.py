@@ -8,9 +8,9 @@ Verifies the contract that:
      mm_hashes — the property external KV routers depend on.
 
 The wiring step that copies GenerateReqInput.mm_hashes into per-item
-MultimodalDataItem.hash lives in tokenizer_manager.py and is exercised by
-the e2e serve tests; this file pins the unit-level invariants the wiring
-relies on.
+MultimodalDataItem.hash is mm_utils.apply_caller_mm_hashes, called by
+tokenizer_manager.py and the encoder-disaggregation receiver; this file pins
+the unit-level invariants the wiring relies on.
 """
 
 import asyncio
@@ -52,6 +52,17 @@ class TestMmHashesContract(CustomTestCase):
         self.assertEqual(req[0].mm_hashes, ["01"])
         self.assertEqual(req[1].mm_hashes, ["02", "03"])
         self.assertEqual(len(req[1].mm_content_hashes), 2)
+
+    def test_non_string_hashes_fail_normalization_not_scheduler_ipc(self):
+        """mm_hashes reach the scheduler as a typed list of strings, so another
+        shape must fail the request at normalization, not the scheduler decode."""
+        single = GenerateReqInput(text="one", image_data=["a"], mm_hashes=[["01"]])
+        batch = GenerateReqInput(
+            text=["one", "two"], image_data=[["a"], ["b"]], mm_hashes=["01", [2]]
+        )
+        for req in (single, batch):
+            with self.assertRaises(ValueError):
+                req.normalize_batch_and_arguments()
 
     def test_set_pad_value_honors_preset_hash(self):
         """set_pad_value() must use a pre-set hash without recomputing."""
