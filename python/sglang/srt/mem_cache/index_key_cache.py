@@ -15,8 +15,8 @@ if TYPE_CHECKING:
 class IndexKeyCache:
     def __init__(self, pool: DSATokenToKVPool, index_buf_size: int):
         self.pool = pool
-        tokens_per_page = pool.index_page_size * pool.index_kpool
-        num_pages = (index_buf_size + pool.page_size + 1) // tokens_per_page
+        self.tokens_per_page = pool.index_page_size * pool.index_kpool
+        num_pages = (index_buf_size + pool.page_size + 1) // self.tokens_per_page
         with pool.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
                 torch.cuda.use_mem_pool(pool.custom_mem_pool)
@@ -104,7 +104,7 @@ class IndexKeyCache:
 
     def cpu_copy(self, indices):
         # Retracted pages may be reused before resume, so offload index-K with KV.
-        page_size = self.pool.index_page_size * self.pool.index_kpool
+        page_size = self.tokens_per_page
         page_indices = indices[::page_size] // page_size
         torch.cuda.synchronize()
         index_k_cpu = []
@@ -124,7 +124,7 @@ class IndexKeyCache:
         return index_k_cpu
 
     def load_cpu_copy(self, index_k_cpu, indices) -> None:
-        page_size = self.pool.index_page_size * self.pool.index_kpool
+        page_size = self.tokens_per_page
         page_indices = indices[::page_size] // page_size
         torch.cuda.synchronize()
         chunk_size = self.pool.cpu_offloading_chunk_size
