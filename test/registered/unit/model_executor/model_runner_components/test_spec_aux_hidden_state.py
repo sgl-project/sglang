@@ -10,11 +10,14 @@ from sglang.srt.layers.aux_hidden_states import (
     pack_aux_hidden_states,
 )
 from sglang.srt.mem_cache.draft_kv_budget import resolve_dflash_draft_cell_size
+from sglang.srt.model_executor.model_runner_components import spec_aux_hidden_state
 from sglang.srt.model_executor.model_runner_components.misc_utils import (
     resolve_aux_hidden_states_width,
 )
 from sglang.srt.model_executor.model_runner_components.spec_aux_hidden_state import (
+    SpecAuxHiddenStateConfig,
     _map_muse_target_layer_ids,
+    _resolve_eagle_aux_hidden_state,
 )
 from sglang.srt.speculative.draft_parallel import legacy_draft_attn_tp_size
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -137,6 +140,44 @@ def test_only_dflash_target_models_share_aux_output(
         )
         == expected
     )
+
+
+def test_an_mtp_depth_named_mtp_num_hidden_layers_counts_as_the_eagle_draft(
+    monkeypatch,
+):
+    """Qwen3.5 names its MTP depth mtp_num_hidden_layers. Read as no draft, the target's
+    KV budget leaves the draft's pool, of the target's token count, outside
+    mem_fraction_static."""
+    monkeypatch.setattr(
+        spec_aux_hidden_state,
+        "get_spec",
+        lambda: SimpleNamespace(
+            speculative_draft_model_path=None,
+            speculative_draft_model_revision=None,
+        ),
+    )
+    # A path-less MTP head sizes its pool off the target config below.
+    monkeypatch.setattr(
+        spec_aux_hidden_state.ModelConfig,
+        "from_server_args",
+        lambda *args, **kwargs: SimpleNamespace(num_nextn_predict_layers=None),
+    )
+    config = SpecAuxHiddenStateConfig()
+
+    _resolve_eagle_aux_hidden_state(
+        config=config,
+        server_args=None,
+        model_config=SimpleNamespace(
+            num_nextn_predict_layers=None,
+            hf_text_config=SimpleNamespace(mtp_num_hidden_layers=1),
+            is_hybrid_swa=False,
+            is_deepseek_v4_arch=False,
+        ),
+        spec_algorithm=SpeculativeAlgorithm.EAGLE,
+        is_draft_worker=False,
+    )
+
+    assert config.eagle_draft_num_layers == 1
 
 
 if __name__ == "__main__":

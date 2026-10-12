@@ -1,4 +1,5 @@
-"""A weight-update session must leave every parameter that peers write by address where it was published."""
+"""A weight-update session must leave every parameter that peers write by address where it was published, and
+rebuild what the loaders derive from the weights it wrote."""
 
 import unittest
 from contextlib import contextmanager
@@ -8,6 +9,7 @@ from unittest.mock import patch
 import torch
 
 import sglang.srt.model_executor.model_runner_components.weight_updater as weight_updater_mod
+from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.model_executor.model_runner_components.weight_updater import (
     WeightUpdater,
 )
@@ -94,6 +96,23 @@ class TestPublishedStorage(CustomTestCase):
         with _postprocess(_rebind_weight):
             weight_updater.begin_weight_update()
             weight_updater.end_weight_update(run_post_load=False)
+
+
+class TestDerivedState(CustomTestCase):
+    def test_gemma_weight_follows_a_norm_weight_loaded_without_its_loader(self):
+        """`direct` and custom loads write params without GemmaRMSNorm's loader yet mark the session loaded, so
+        fused allreduce kernels would read the old `gemma_weight`."""
+        model = torch.nn.Module()
+        model.norm = GemmaRMSNorm(4)
+        weight_updater = _weight_updater(model, published_weight_info=None)
+        new_weight = torch.tensor([0.5, -0.25, 0.0, 2.0])
+
+        with _postprocess(lambda model, device: None):
+            weight_updater.begin_weight_update()
+            model.norm.weight.data.copy_(new_weight)
+            weight_updater.end_weight_update(run_post_load=False)
+
+        torch.testing.assert_close(model.norm.gemma_weight, new_weight + 1)
 
 
 if __name__ == "__main__":
