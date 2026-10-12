@@ -51,11 +51,11 @@ docker run --gpus all \
 AMD uses the daily-updated `lmsysorg/sglang-rocm` images. You can find the latest images on [Docker Hub](https://hub.docker.com/r/lmsysorg/sglang-rocm/tags). We recommend the ROCm 7.2 version.
 
 For example:
-- **MI355X** → `lmsysorg/sglang-rocm:v0.5.20-rocm720-mi35x-20260926`
-- **MI300X** → `lmsysorg/sglang-rocm:v0.5.20-rocm720-mi30x-20260926`
+- **MI355X** → `lmsysorg/sglang-rocm:v0.5.21-rocm720-mi35x-20261007`
+- **MI300X** → `lmsysorg/sglang-rocm:v0.5.21-rocm720-mi30x-20261007`
 
 ```bash Command
-docker pull lmsysorg/sglang-rocm:v0.5.20-rocm720-{mi35x,mi30x}-20260926
+docker pull lmsysorg/sglang-rocm:v0.5.21-rocm720-{mi35x,mi30x}-20261007
 
 docker run \
     --device=/dev/kfd --device=/dev/dri \
@@ -65,7 +65,7 @@ docker run \
     -p 30000:30000 \
     -v ~/.cache/huggingface:/root/.cache/huggingface \
     --env "HF_TOKEN=<your-hf-token>" \
-    lmsysorg/sglang-rocm:v0.5.20-rocm720-{mi35x,mi30x}-20260926 \
+    lmsysorg/sglang-rocm:v0.5.21-rocm720-{mi35x,mi30x}-20261007 \
     sglang serve <use args below>
 ```
 
@@ -768,9 +768,10 @@ Three commands follow, one per concurrency range. They share the model, parser, 
 
 DeepSeek-V4-Pro-0813 bundles the DSpark head, so `--speculative-draft-model-path` is not needed. `--speculative-dspark-block-size 6` is the AL-optimal draft length on the committed golden curve (verify window 7). Keep `SGLANG_DSV4_UNIFIED_KV_FP8=1` on every command. The first three use `--enforce-shared-experts-fusion`; the MegaMoE command uses `--disable-shared-experts-fusion` instead.
 
-Three adjustments are not in the commands below. Add them when they apply:
+Four adjustments are not in the commands below. Add them when they apply:
 
 - `--cuda-graph-backend-prefill breakable` at concurrency 1–4.
+- `--enable-prefill-cp --cp-strategy interleave --enable-cp-decode-attn-tp` on the TP-only commands at concurrency 16 and above. Prefill context parallelism splits each prompt across all eight ranks (CP size = TP size).
 - `SGLANG_DSV4_GROUPED_ASM=1` on the TP-only commands at concurrency 16 and above — the kernel needs at least 16 requests per draft token.
 - `--prefill-decode-interval 15` on the MegaMoE command at concurrency 384, replacing the `20` it ships with.
 
@@ -784,6 +785,7 @@ TORCH_BLAS_PREFER_HIPBLASLT=1 \
 SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton \
 AITER_BF16_FP8_MOE_BOUND=0 \
 SGLANG_OPT_USE_AITER_BATCHED_GEMM=1 \
+SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1 \
 python3 -m sglang.launch_server \
   --model-path deepseek-ai/DeepSeek-V4-Pro-0813 \
   --trust-remote-code \
@@ -824,6 +826,7 @@ TORCH_BLAS_PREFER_HIPBLASLT=1 \
 SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton \
 AITER_BF16_FP8_MOE_BOUND=0 \
 SGLANG_OPT_USE_AITER_BATCHED_GEMM=1 \
+SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1 \
 SGLANG_SHARED_EXPERT_TP1=1 \
 SGLANG_DP_SHARED_EXPERT_LOCAL=1 \
 SGLANG_DP_USE_GATHERV=1 \
@@ -873,6 +876,7 @@ TORCH_BLAS_PREFER_HIPBLASLT=1 \
 SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton \
 AITER_BF16_FP8_MOE_BOUND=0 \
 SGLANG_OPT_USE_AITER_BATCHED_GEMM=1 \
+SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1 \
 SGLANG_AMD_USE_FLYDSL_MEGA_MOE=1 \
 SGLANG_AMD_FLYDSL_MEGA_MOE_MTPR=8192 \
 SGLANG_AMD_FLYDSL_MEGA_QUANT=a8w4 \
