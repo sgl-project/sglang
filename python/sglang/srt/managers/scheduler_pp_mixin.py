@@ -125,6 +125,7 @@ class SchedulerPPMixin:
         ====================================================================
         """
         self.init_pp_loop_state()
+        self.rows_join_before_plan = True
         while True:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
@@ -202,6 +203,7 @@ class SchedulerPPMixin:
                             process_target,
                             next_batch_result,
                         )
+                    self._pp_update_rows_at_commit(next_mb_id, next_batch)
                     self.last_mbs[next_mb_id] = next_batch
                 if not self.pp_group.is_last_rank:
                     if cur_batch:
@@ -420,8 +422,6 @@ class SchedulerPPMixin:
                 tmbs[mb_id] = transferred_rids
                 self._pp_commit_comm_work(send_transfer_work)
 
-                # Finished rows leave before the prebuilt join sizes its budget.
-                self.leave_finished_rows(self.decoding_batch)
                 # get batch to run and proxy tensors if needed
                 plan = self.get_next_disagg_decode_batch_to_run(
                     decoding_batch=self.decoding_batch
@@ -521,9 +521,7 @@ class SchedulerPPMixin:
                         next_batch,
                         next_batch_result,
                     )
-                    # The slot's rows take back what their decode step's run
-                    # and output relay rebound.
-                    self.decoding_batches[next_mb_id].absorb()
+                    self._pp_update_rows_at_commit(next_mb_id, next_batch)
                     self.last_mbs[next_mb_id] = next_batch
 
                 if not self.pp_group.is_last_rank:
@@ -574,6 +572,24 @@ class SchedulerPPMixin:
     @running_mbs.setter
     def running_mbs(self: Scheduler, rows_per_slot: List[ScheduleBatch]) -> None:
         self.decoding_batches = [DecodingBatch(rows) for rows in rows_per_slot]
+
+    def _pp_update_rows_at_commit(
+        self: Scheduler, mb_id: int, batch: ScheduleBatch
+    ) -> None:
+        """The rows of slot mb_id once the ring commits the step it launched.
+
+        The step's output arrives over the relay at this commit and rebinds
+        the step's fields, so the rows take the step here and not at launch:
+        they take back what a decode step copied from them rebound, the rows
+        whose last prefill chunk the step ran join, and the rows the commit
+        finished leave. A request chunked across slots joins the slot that
+        launched its last chunk. HiSparse rows join at the plan, once staged;
+        dLLM rows never decode."""
+        decoding_batch = self.decoding_batches[mb_id]
+        decoding_batch.absorb()
+        if not self.enable_hisparse and self.dllm_config is None:
+            decoding_batch.join_launched(batch)
+        self.leave_finished_rows(decoding_batch)
 
     def init_pp_loop_state(self: Scheduler):
         # In-flight readers gated on overlap expect non-ring records; server

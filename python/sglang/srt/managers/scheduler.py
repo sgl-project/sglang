@@ -1305,10 +1305,12 @@ class Scheduler(
         self.inflight_steps = InflightQueue(depth=0)
         self.enable_continuous_input_polling = False
         self.enable_skip_finishing_decode = False
-        # Set by the normal and overlap loops, which join a launched step's
-        # finished-prefill rows into the running rows at launch and drop
-        # finished rows at commit. The PD decode loops drop finished rows at
-        # commit too; their rows join from the prebuilt batch at the plan.
+        # Set by the loops that join a launched step's finished-prefill rows
+        # into the running rows before the next plan and drop finished rows at
+        # commit: the normal and overlap loops at launch, the pipeline loop
+        # when the ring commits the step. The PD decode loops drop finished
+        # rows at commit too; their rows join from the prebuilt batch at the
+        # plan. The MLX loop joins and leaves at the next plan.
         self.rows_join_before_plan = False
         self.forward_ct = 0
         self.return_health_check_ipcs: Deque[Optional[str]] = deque()
@@ -3790,11 +3792,12 @@ class Scheduler(
         decoding_batch: DecodingBatch,
         last_batch: Optional[ScheduleBatch] = None,
     ) -> NextBatchPlan:
-        """Plan the next step. A loop that does not join at launch passes the
-        step it launched last, whose finished-prefill rows join here."""
-        # For a loop that takes a decode step back at the next plan (the
-        # pipeline and MLX loops): the last decode step from these rows has run
-        # and committed, so the rows take back what its run and commit rebound.
+        """Plan the next step. last_batch is the step launched last; under a
+        loop that does not join before the plan (MLX), its finished-prefill
+        rows join here."""
+        # For a loop that takes a decode step back at the next plan (MLX): the
+        # last decode step from these rows has run and committed, so the rows
+        # take back what its run and commit rebound.
         decoding_batch.absorb()
         self.process_pending_chunked_abort()
         self._process_hicache_events()
@@ -3863,7 +3866,7 @@ class Scheduler(
         # so admission, the decode rows and load reporting (/v1/loads) see only
         # live rows. Runs after the last_batch join and outside it, so finished
         # rows leave even when no new batch arrives (e.g. traffic stops). The
-        # loops that join at launch dropped them at commit already.
+        # loops that join before the plan dropped them at commit already.
         self.leave_finished_rows(decoding_batch)
         if self.scripted_scheduler_hook is not None:
             self.scripted_scheduler_hook.on_plan_start(decoding_batch.rows)

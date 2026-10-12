@@ -546,6 +546,9 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         enter_scope(self, get_parallel().override(pp_size=2, pp_rank=0))
         scheduler.enable_overlap = False
         scheduler.pp_group = SimpleNamespace(is_last_rank=True)
+        # The batches here carry no row tensors; these tests read idle step
+        # counters, not the running rows.
+        scheduler._pp_update_rows_at_commit = Mock()
         scheduler.forward_stream_ctx = nullcontext()
         scheduler.forward_stream = Mock()
         scheduler.schedule_stream = Mock()
