@@ -17,6 +17,7 @@ from unittest.mock import patch
 import torch
 import torch.multiprocessing as mp
 
+from sglang.multimodal_gen.test.precision_utils import strict_fp32_oracle
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -129,6 +130,46 @@ class TestTiledSpatialDecode(CustomTestCase):
                 args=(rendezvous, 4, ((14, 13), (2, 3), (12, 9))),
                 nprocs=4,
             )
+
+
+class TestStrictFP32Oracle(CustomTestCase):
+    def test_precision_policy_restored_after_normal_nested_and_failed_checks(self):
+        """A failed oracle must not leave later BF16 tests using its precision policy."""
+
+        def policy():
+            return (
+                torch.get_float32_matmul_precision(),
+                torch.backends.cuda.matmul.allow_tf32,
+                torch.backends.cudnn.allow_tf32,
+                torch.backends.cudnn.benchmark,
+            )
+
+        previous = policy()
+        try:
+            torch.set_float32_matmul_precision("high")
+            torch.backends.cudnn.allow_tf32 = True
+            torch.backends.cudnn.benchmark = True
+            outer = policy()
+            for fail in (False, True):
+                with self.subTest(fail=fail):
+                    try:
+                        with strict_fp32_oracle():
+                            self.assertEqual(policy(), ("highest", False, False, False))
+                            with strict_fp32_oracle():
+                                self.assertEqual(
+                                    policy(), ("highest", False, False, False)
+                                )
+                            self.assertEqual(policy(), ("highest", False, False, False))
+                            if fail:
+                                raise RuntimeError("oracle assertion failed")
+                    except RuntimeError as exc:
+                        self.assertTrue(fail)
+                        self.assertEqual(str(exc), "oracle assertion failed")
+                    self.assertEqual(policy(), outer)
+        finally:
+            torch.set_float32_matmul_precision(previous[0])
+            torch.backends.cudnn.allow_tf32 = previous[2]
+            torch.backends.cudnn.benchmark = previous[3]
 
 
 if __name__ == "__main__":
