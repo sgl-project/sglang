@@ -15,20 +15,13 @@ from sglang.srt.runtime_context import get_platform
 logger = logging.getLogger(__name__)
 
 
-def _dsa_dcp_overrides(cfg: Any, hf_config: Any) -> dict:
-    from sglang.srt.configs.model_config import get_dsa_index_kpool
-
+def _dsa_dcp_overrides(cfg: Any) -> dict:
     if cfg.dcp_size <= 1:
         return {}
-    if get_dsa_index_kpool(hf_config) > 1:
-        raise ValueError("DSA DCP does not support index_kpool > 1.")
-    if cfg.enable_prefill_cp or cfg.enable_hisparse:
-        raise ValueError("DSA DCP does not support prefill CP or HiSparse.")
+    if cfg.enable_hisparse:
+        raise ValueError("DSA DCP does not support HiSparse.")
     if cfg.speculative_eagle_topk not in (None, 1):
         raise ValueError("DSA DCP requires --speculative-eagle-topk 1.")
-    for backend in (cfg.dsa_prefill_backend, cfg.dsa_decode_backend):
-        if backend not in (None, "trtllm"):
-            raise ValueError("DSA DCP requires the trtllm DSA backends.")
     overrides = {
         name: "trtllm"
         for name in ("dsa_prefill_backend", "dsa_decode_backend")
@@ -102,7 +95,7 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                     )
 
     if is_deepseek_dsa(hf_config):  # DeepSeek 3.2/GLM 5
-        overrides.update(_dsa_dcp_overrides(cfg, hf_config))
+        overrides.update(_dsa_dcp_overrides(cfg))
         # Set attention backend for DeepSeek
         if is_attention_backend_not_set(cfg):
             overrides["attention_backend"] = "dsa"
