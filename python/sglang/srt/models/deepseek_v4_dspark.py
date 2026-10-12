@@ -933,9 +933,10 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                 "DeepseekV4ForCausalLMDSpark requires the target embed_tokens "
                 "(call attach_shared_modules first)."
             )
-        x = self.embed_tokens(input_ids)
-        x = x.unsqueeze(1).repeat(1, self.hc_mult, 1)
-        return x
+        return self._expand_hc(self.embed_tokens(input_ids))
+
+    def _expand_hc(self, embeds: torch.Tensor) -> torch.Tensor:
+        return embeds.unsqueeze(1).repeat(1, self.hc_mult, 1)
 
     def forward(
         self,
@@ -949,6 +950,9 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         del get_embedding, pp_proxy_tensors
         if input_embeds is None:
             input_embeds = self.forward_embed(input_ids)
+        elif input_embeds.dim() == 2:
+            # Embeds staged outside the model are [N, H].
+            input_embeds = self._expand_hc(input_embeds)
         x = input_embeds
         pre = None
         for stage in self.stages:
