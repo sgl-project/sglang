@@ -220,9 +220,9 @@ class TestNVFP4ToMXFP4MOETP1(TestOnlineQuantizationMemoryLoad):
     tp = 1
 
     def test_gsm8k(self):
-        # Requantized NVFP4 -> MXFP4 observed accuracy: ~0.88
+        # 47 scheduled MI35x CI runs: mean 0.856, stdev 0.020, min 0.802
         # (BF16 Qwen/Qwen3-30B-A3B reference: ~0.94).
-        self._test_gsm8k(accuracy_threshold=0.85)
+        self._test_gsm8k(accuracy_threshold=0.80)
 
 
 @unittest.skipIf(is_in_ci(), "local test only")
