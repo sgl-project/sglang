@@ -1228,7 +1228,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                                 "this item will fall back to hash_feature().",
                                 hex_hash,
                             )
-                    # The scheduler reuses padded_input_ids as-is.
+                    # set_hash changed the pad values, and the scheduler
+                    # reuses padded_input_ids as-is.
                     if mm_inputs.padded_input_ids is not None:
                         mm_inputs.padded_input_ids = (
                             MultimodalProcessorOutput.build_padded_input_ids(
