@@ -2380,13 +2380,17 @@ class ModelRunner:
         )
         self._rearm_eplb_after_elastic_scale()
 
-    def _reinit_expert_distribution_recorder(self, moe_ep_rank: int) -> None:
-        set_global_expert_distribution_recorder(
-            ExpertDistributionRecorder.init_new(
-                get_global_expert_location_metadata(),
-                rank=moe_ep_rank,
-            )
+    def _reinit_expert_distribution_recorder(
+        self, moe_ep_rank: int, *, keep_gatherers: bool = False
+    ) -> None:
+        previous = get_global_expert_distribution_recorder()
+        recorder = ExpertDistributionRecorder.init_new(
+            get_global_expert_location_metadata(),
+            rank=moe_ep_rank,
         )
+        if keep_gatherers:
+            recorder.adopt_single_pass_gatherers(previous)
+        set_global_expert_distribution_recorder(recorder)
 
     def _broadcast_expert_location(self, src_rank: int) -> None:
         broadcast_global_expert_location_metadata(
@@ -2579,6 +2583,7 @@ class ModelRunner:
         self._rebuild_elastic_cuda_graphs()
 
     def _rebuild_elastic_cuda_graphs(self, *, verify_config: bool = True) -> None:
+        tic = time.perf_counter()
         if verify_config:
             sync_elastic_cuda_graph_config(
                 config=resolve_elastic_cuda_graph_config(self),
@@ -2601,6 +2606,10 @@ class ModelRunner:
             self.graph_time_usage,
             capture.time_usage,
             phases=("decode", "target_verify", "draft_decode"),
+        )
+        logger.info(
+            "[Elastic EP] decode CUDA graphs rebuilt in %.2f s",
+            time.perf_counter() - tic,
         )
 
     def _fail_scale(self, error: str, effective_size: int) -> None:
