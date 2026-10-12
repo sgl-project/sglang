@@ -42,7 +42,7 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase, published_topology
+from sglang.test.test_utils import CustomTestCase, enter_scope, published_topology
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
@@ -451,6 +451,10 @@ def _rank_consensus_worker(rank, rendezvous):
 
 
 class TestPrefillResultPolling(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        enter_scope(self, envs.SGLANG_DEBUG_INFLIGHT_STEPS.override(True))
+
     def test_intake_retains_pause_suffix_while_continuing_to_receive(self):
         for stop_at_pause in (False, True):
             for prefix_size in (0, 1):

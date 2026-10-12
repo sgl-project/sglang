@@ -68,6 +68,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
     def setUp(self):
         super().setUp()
         enter_scope(self, published_topology(role="scheduler"))
+        enter_scope(self, envs.SGLANG_DEBUG_INFLIGHT_STEPS.override(True))
 
     @parameterized.expand(
         [
