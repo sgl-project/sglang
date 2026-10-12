@@ -134,6 +134,10 @@ _direct_default_tactic = None
 _prefer_direct = None
 _run_direct_dense = None
 _enable_bf16_splitk_gemm = False
+_mm_bf16 = None
+_flashinfer_autotuner = None
+_enable_bf16_low_m_autotune = False
+_BF16_LOW_M_AUTOTUNE_MAX_M = 16
 
 # GB300 TP16 tactics measured under CUDA graph replay with PDL and cold weights.
 # Unlisted shapes, including M=64, retain the existing TGV/cuBLAS path.
@@ -244,6 +248,7 @@ def initialize_bf16_gemm_config() -> None:
     global _prefer_direct
     global _run_direct_dense
     global _enable_bf16_splitk_gemm
+    global _mm_bf16, _flashinfer_autotuner, _enable_bf16_low_m_autotune
 
     backend_str = get_exec().kernel.bf16_gemm_backend
     if backend_str == "auto" and get_platform().is_sm100:
@@ -305,7 +310,24 @@ def initialize_bf16_gemm_config() -> None:
         _run_direct_dense = run_direct_dense
         _enable_bf16_splitk_gemm = True
 
+    _enable_bf16_low_m_autotune = False
+    if (
+        backend.is_cutedsl()
+        and envs.SGLANG_OPT_BF16_LOW_M_AUTOTUNE.get()
+        and not get_exec().kernel.disable_flashinfer_autotune
+    ):
+        from flashinfer.autotuner import AutoTuner
+        from flashinfer.gemm import mm_bf16
+
+        _mm_bf16 = mm_bf16
+        _flashinfer_autotuner = AutoTuner
+        _enable_bf16_low_m_autotune = True
+
     _BF16_GEMM_BACKEND = backend
+
+
+def bf16_low_m_autotune_enabled() -> bool:
+    return _enable_bf16_low_m_autotune
 
 
 def _bf16_gemm_dispatch_fake(
@@ -346,12 +368,66 @@ def _bf16_splitk_gemm(
     return out.view(*x.shape[:-1], weight.shape[0])
 
 
+def _bf16_low_m_in_file_cache(weight: torch.Tensor) -> bool:
+    # FlashInfer re-profiles file-loaded bf16_gemm entries while tuning
+    # (their cold-L2 policy is not persisted), so skip shapes the file covers;
+    # drop once FlashInfer persists the policy per entry.
+    shapes = f"({weight.shape[1]}, {weight.shape[0]})"
+    return any(
+        key.startswith("('bf16_gemm'") and shapes in key
+        for key in _flashinfer_autotuner.get()._file_configs
+    )
+
+
+def _bf16_low_m_autotune(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    out: Optional[torch.Tensor] = None,
+) -> Optional[torch.Tensor]:
+    """Run M <= 16 through FlashInfer's autotuned low-M kernels; None if not taken.
+
+    Inside FlashInfer autotune, a larger M profiles the M <= 16 buckets instead.
+    """
+    if not (
+        _enable_bf16_low_m_autotune
+        and bias is None
+        and x.is_cuda
+        and x.dtype == torch.bfloat16
+        and weight.dtype == torch.bfloat16
+        and x.is_contiguous()
+        and weight.is_contiguous()
+        and not weight.requires_grad
+    ):
+        return None
+    x_2d = x.view(-1, x.shape[-1])
+    m = x_2d.shape[0]
+    if m > _BF16_LOW_M_AUTOTUNE_MAX_M:
+        if _flashinfer_autotuner.get().is_tuning_mode and not _bf16_low_m_in_file_cache(
+            weight
+        ):
+            _mm_bf16(
+                x_2d[:_BF16_LOW_M_AUTOTUNE_MAX_M],
+                weight.T,
+                pdl=True,
+                backend="cute-dsl",
+            )
+        return None
+    if m == 0:
+        return None
+    output = _mm_bf16(x_2d, weight.T, pdl=True, out=out, backend="cute-dsl")
+    return output.view(*x.shape[:-1], weight.shape[0])
+
+
 def _bf16_gemm_dispatch_impl(
     x: torch.Tensor,
     weight: torch.Tensor,
     bias: Optional[torch.Tensor],
     addend: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    output = _bf16_low_m_autotune(x, weight, bias)
+    if output is not None:
+        return output if addend is None else output.add_(addend)
     m = x.numel() // x.shape[-1]
     if _enable_bf16_splitk_gemm and use_bf16_splitk_gemm(
         m, weight.shape[0], weight.shape[1]
@@ -562,6 +638,14 @@ class UnquantizedLinearMethod(LinearMethodBase):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Run an inference-only BF16 linear into caller-owned storage."""
+        if (
+            x.ndim == 2
+            and output.dtype == torch.bfloat16
+            and output.is_contiguous()
+            and output.shape == (x.shape[0], layer.weight.shape[0])
+            and _bf16_low_m_autotune(x, layer.weight, bias, out=output) is not None
+        ):
+            return output
         if (
             _enable_bf16_splitk_gemm
             and bias is None
