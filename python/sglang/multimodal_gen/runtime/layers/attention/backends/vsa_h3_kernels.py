@@ -33,8 +33,6 @@ import triton
 import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
-from sglang.kernels.ops.diffusion import vsa_block_sparse_sm100
-
 # BLOCK_M / BLOCK_N are structural, not tunable: the kernel indexes the top-k
 # list per BLOCK_M q-tile and addresses keys as kv_idx * BLOCK_N, so both must
 # match the granularity q2k_index and variable_block_sizes were built at.
@@ -241,6 +239,10 @@ def vsa_h3_block_sparse_attn_forward(
     if out is None:
         out = torch.empty_like(q)
     if use_sm100_kernel:
+        # Imported lazily: the sm100 tcgen05 kernel is an optional fast path, and
+        # the Triton kernel below must stay usable on stacks that do not ship it.
+        from sglang.kernels.ops.diffusion import vsa_block_sparse_sm100
+
         vsa_block_sparse_sm100(
             q,
             k,

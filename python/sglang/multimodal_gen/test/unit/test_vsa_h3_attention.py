@@ -344,6 +344,20 @@ def test_pointer_load_path_selection() -> None:
     assert not _use_pointer_loads((12, 0))
 
 
+def test_vsa_h3_module_imports_without_sm100_symbol() -> None:
+    """The module must import without sglang.kernels.ops.diffusion
+    vsa_block_sparse_sm100 (absent on stacks that do not ship the sm100 tcgen05
+    kernel): the dependency is imported lazily inside the sm100 branch only."""
+    import importlib
+
+    from sglang.multimodal_gen.runtime.layers.attention.backends import (
+        vsa_h3_kernels,
+    )
+
+    importlib.reload(vsa_h3_kernels)
+    assert hasattr(vsa_h3_kernels, "vsa_h3_block_sparse_attn_forward")
+
+
 def test_vsa_h3_backend_resolver_allows_sm80() -> None:
     """The resolver gate must admit A100, which the pointer kernel serves."""
     from sglang.multimodal_gen.runtime.platforms.cuda import (
