@@ -271,5 +271,118 @@ class TestAutotuneCachePhases(CustomTestCase):
                     self.assertNotIn("draft_decode", tuner._file_configs)
 
 
+@unittest.skipUnless(torch.cuda.is_available(), "FlashInfer requires CUDA")
+class TestAutotuneDefaultTactic(CustomTestCase):
+    """Omitting the default candidate can make startup tuning select a slower tactic."""
+
+    def test_default_candidate_persistence_and_warm_cache(self):
+        from flashinfer.autotuner import AutoTuner, TunableRunner, TuningConfig
+
+        class TestRunner(TunableRunner):
+            def get_valid_tactics(self, inputs, profile):
+                # The default must be added by the actual tuner.
+                return [0, 1]
+
+            def forward(self, inputs, tactic=-1):
+                return tactic
+
+        candidate = TestRunner()
+        inputs = [torch.zeros((2, 3), device="cuda")]
+        config = TuningConfig()
+        model_runner = SimpleNamespace(
+            device="cuda", forward_stream=torch.cuda.Stream()
+        )
+        op = "sglang_default_tactic_regression"
+
+        def serve():
+            runner, tactic = AutoTuner.get().choose_one(op, [candidate], config, inputs)
+            self.assertIs(runner, candidate)
+            return runner(inputs, tactic=tactic)
+
+        def assert_cached_winner(tuner, winner):
+            hit, runner_id, tactic, _ = tuner.search_cache(
+                op, [candidate], tuple(t.size() for t in inputs), config, inputs=inputs
+            )
+            # A -1 result alone could also be an uncached heuristic fallback.
+            self.assertTrue(hit)
+            self.assertEqual((runner_id, tactic), (0, winner))
+
+        # Also let an explicit tactic win, to distinguish cache reuse from a
+        # serving path that always falls back to -1.
+        for winner in (-1, 0):
+            with (
+                self.subTest(winner=winner),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                cache_path = Path(directory) / "rank.json"
+                times = {-1: 1.0, 0: 2.0, 1: 3.0}
+                times[winner] = 0.5
+
+                def profile(runner, tensors, tactic, tuning_config, **kwargs):
+                    self.assertEqual(runner(tensors, tactic=tactic), tactic)
+                    return times[tactic]
+
+                with (
+                    patch.object(
+                        autotune,
+                        "flashinfer_autotune_cache_path",
+                        return_value=cache_path,
+                    ),
+                    patch.object(
+                        autotune, "get_flashinfer_autotune_skip_ops", return_value=set()
+                    ),
+                    autotune.envs.SGLANG_FLASHINFER_AUTOTUNE_CACHE.override(True),
+                    get_parallel().override(tp_group=SimpleNamespace(world_size=1)),
+                ):
+                    tuner = AutoTuner()
+                    with (
+                        patch.object(AutoTuner, "_instance", tuner),
+                        patch.object(
+                            tuner, "_profile_single_kernel", side_effect=profile
+                        ) as profiler,
+                    ):
+                        with autotune.flashinfer_autotune_context(
+                            model_runner, run_lm_head=False
+                        ):
+                            self.assertEqual(serve(), winner)
+                        self.assertCountEqual(
+                            [call.args[2] for call in profiler.call_args_list],
+                            [-1, 0, 1],
+                        )
+                        self.assertFalse(tuner.is_tuning_mode)
+                        assert_cached_winner(tuner, winner)
+                        self.assertEqual(serve(), winner)
+                        self.assertEqual(profiler.call_count, 3)
+                        key = next(iter(tuner.profiling_cache)).file_key
+                        self.assertEqual(
+                            json.loads(cache_path.read_text())[key][1], winner
+                        )
+
+                    # A fresh tuner exercises the existing JSON load path,
+                    # then serves without either autotune context.
+                    reloaded = AutoTuner()
+                    with (
+                        patch.object(AutoTuner, "_instance", reloaded),
+                        patch.object(reloaded, "_profile_single_kernel") as profiler,
+                    ):
+                        self.assertTrue(reloaded.load_configs(str(cache_path)))
+                        assert_cached_winner(reloaded, winner)
+                        self.assertEqual(serve(), winner)
+                        profiler.assert_not_called()
+
+                    warm = AutoTuner()
+                    with (
+                        patch.object(AutoTuner, "_instance", warm),
+                        patch.object(warm, "_profile_single_kernel") as profiler,
+                    ):
+                        with autotune.flashinfer_autotune_context(
+                            model_runner, run_lm_head=False
+                        ):
+                            self.assertEqual(serve(), winner)
+                        assert_cached_winner(warm, winner)
+                        self.assertEqual(serve(), winner)
+                        profiler.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
