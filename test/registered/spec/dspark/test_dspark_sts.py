@@ -53,11 +53,7 @@ class TestConfidencePredict(CustomTestCase):
             markov_head=None,
         )
         self.assertEqual(confidence_raw.shape, (2, 3))
-        self.assertTrue(
-            torch.equal(
-                confidence, torch.sigmoid(confidence_raw / head.sts_temperatures)
-            )
-        )
+        self.assertTrue(torch.equal(confidence, head.apply_sts(confidence_raw)))
 
     def test_markov_features_are_the_previous_tokens(self):
         # Step i reads the embedding of the token before it: the anchor, then drafts.
