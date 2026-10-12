@@ -75,6 +75,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.enable_skip_finishing_decode = False
         scheduler.enable_overlap_mlx = False
         scheduler.last_batch = None
+        scheduler.rows_join_at_launch = False
         scheduler.recv_skipper = None
         scheduler.cur_batch_for_debug = None
         scheduler.chunked_req = None
@@ -366,9 +367,8 @@ class TestSchedulerPauseGeneration(CustomTestCase):
 
     def test_retract_order_is_kept_when_the_rows_joined_at_launch(self):
         """A loop that joins at launch already holds the last step's finished
-        prefills among the running rows; retract keeps the order of a join at
-        the next plan: the other rows, then the step's rows in its order, with
-        the mid-chunk request where admission put it."""
+        prefills among the running rows; retract takes the rows in their
+        order, then the mid-chunk request, which no rows hold."""
         for mixed in (False, True):
             with self.subTest(mixed=mixed):
                 scheduler = self._new_scheduler()
@@ -392,11 +392,12 @@ class TestSchedulerPauseGeneration(CustomTestCase):
                 )
                 scheduler.last_batch.num_decode_rows = 1 if mixed else 0
                 scheduler.chunked_req = chunk
+                scheduler.rows_join_at_launch = True
                 requeue_log = self._spy_requeue(scheduler)
 
                 scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
 
-                expected = [chunk, new, old] if mixed else [old, chunk, new]
+                expected = [new, old, chunk] if mixed else [old, new, chunk]
                 self.assertEqual([entry["req"] for entry in requeue_log], expected)
                 self.assertEqual([r.retraction_count for r in expected], [1, 1, 1])
 

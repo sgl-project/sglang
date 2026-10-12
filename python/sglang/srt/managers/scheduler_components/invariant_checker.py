@@ -63,7 +63,8 @@ class SchedulerInvariantChecker:
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
     req_to_token_pool: ReqToTokenPool
     pool_stats_observer: SchedulerPoolStatsObserver
-    get_last_batch: Callable
+    # The batch the current step launched, or None.
+    get_cur_batch: Callable
     get_running_and_inflight_batches: Callable
     scheduler_stage_metrics: SchedulerStageMetricsRecorder
     # The chunked-prefill request parked between chunks is in neither batch;
@@ -312,7 +313,7 @@ class SchedulerInvariantChecker:
 
     @scheduler_stage_method(SCHEDULER_STAGE_SANITY_CHECK_CACHE)
     def self_check_during_busy(self):
-        if self.get_last_batch() is None:
+        if self.get_cur_batch() is None:
             return
 
         ps = self.pool_stats_observer.get_pool_stats()

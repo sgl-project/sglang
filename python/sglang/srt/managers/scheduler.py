@@ -1971,9 +1971,7 @@ class Scheduler(
                 continue
 
             # Get the next batch to run
-            plan = self.get_next_batch_to_run(
-                decoding_batch=self.decoding_batch, last_batch=self.last_batch
-            )
+            plan = self.get_next_batch_to_run(decoding_batch=self.decoding_batch)
             batch = plan.batch_to_run
             self.cur_batch_for_debug = batch
 
@@ -2015,13 +2013,13 @@ class Scheduler(
                 continue
 
             # Get the next batch to run
-            plan = self.get_next_batch_to_run(
-                decoding_batch=self.decoding_batch, last_batch=self.last_batch
-            )
+            plan = self.get_next_batch_to_run(decoding_batch=self.decoding_batch)
             batch = plan.batch_to_run
             self.cur_batch_for_debug = batch
+            # The step in flight is the one launched last.
+            inflight = self.inflight_steps.newest()
             disable_overlap_for_batch = self.is_disable_overlap_for_batch(
-                batch, last_batch=self.last_batch
+                batch, last_batch=None if inflight is None else inflight.batch
             )
 
             # If we do not need to overlap the current batch with the last batch,
@@ -2473,7 +2471,7 @@ class Scheduler(
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             req_to_token_pool=self.req_to_token_pool,
             pool_stats_observer=self.pool_stats_observer,
-            get_last_batch=lambda: self.last_batch,
+            get_cur_batch=lambda: self.cur_batch_for_debug,
             get_running_and_inflight_batches=lambda: running_and_inflight_batches(self),
             get_chunked_req=lambda: self.chunked_req,
             scheduler_stage_metrics=self.scheduler_stage_metrics,
@@ -3534,32 +3532,24 @@ class Scheduler(
 
         if (timeout_s := envs.SGLANG_REQ_RUNNING_TIMEOUT.get()) > 0:
             deadline = time.perf_counter() - timeout_s
-            inflight_batches = self._collect_inflight_batches()
             seen_rids = set()
-            for batch in inflight_batches:
-                if batch is None:
+            for req in self._collect_inflight_req_list():
+                # Polling must not re-emit an abort awaiting result processing.
+                if req.rid in seen_rids or req.finished() or req.to_finish is not None:
                     continue
-                for req in batch.reqs:
-                    # Polling must not re-emit an abort awaiting result processing.
-                    if (
-                        req.rid in seen_rids
-                        or req.finished()
-                        or req.to_finish is not None
-                    ):
-                        continue
-                    seen_rids.add(req.rid)
-                    if 0 < req.time_stats.forward_entry_time < deadline:
-                        aborts.append(
-                            AbortReq(
-                                rid=req.rid,
-                                abort_message="Request running timeout reached.",
-                                finished_reason={
-                                    "type": "abort",
-                                    "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
-                                    "message": "Request running timeout reached.",
-                                },
-                            )
+                seen_rids.add(req.rid)
+                if 0 < req.time_stats.forward_entry_time < deadline:
+                    aborts.append(
+                        AbortReq(
+                            rid=req.rid,
+                            abort_message="Request running timeout reached.",
+                            finished_reason={
+                                "type": "abort",
+                                "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                                "message": "Request running timeout reached.",
+                            },
                         )
+                    )
 
         return aborts
 
@@ -3794,10 +3784,12 @@ class Scheduler(
 
     @scheduler_stage_method(SCHEDULER_STAGE_GET_NEXT_BATCH)
     def get_next_batch_to_run(
-        self, decoding_batch: DecodingBatch, last_batch: Optional[ScheduleBatch]
+        self,
+        decoding_batch: DecodingBatch,
+        last_batch: Optional[ScheduleBatch] = None,
     ) -> NextBatchPlan:
-        """Plan the next step. last_batch is the step launched last; under a
-        loop that does not join at launch, its finished-prefill rows join here."""
+        """Plan the next step. A loop that does not join at launch passes the
+        step it launched last, whose finished-prefill rows join here."""
         # For a loop that does not take them back at launch: the last decode
         # step from these rows has run and committed, so the rows take back
         # what its run and commit rebound.
@@ -3854,22 +3846,13 @@ class Scheduler(
             if self.dllm_config is not None and last_batch.reqs:
                 reqs_to_exclude.update(last_batch.reqs)
 
-            if self.rows_join_at_launch:
-                # Its rows joined at launch, through a copy that shares its
-                # sampling and spec objects: filter only its request list.
-                last_batch.reqs = [
-                    r
-                    for r in last_batch.reqs
-                    if not r.finished() and r not in reqs_to_exclude
-                ]
-            else:
-                # Filter batch
-                last_batch.filter_batch(reqs_to_exclude=list(reqs_to_exclude))
+            # Filter batch
+            last_batch.filter_batch(reqs_to_exclude=list(reqs_to_exclude))
 
-                # Merge a copy of the new batch into the running batch: the
-                # launched step never becomes the running rows.
-                if not last_batch.is_empty():
-                    decoding_batch.join(last_batch.shallow_copy())
+            # Merge a copy of the new batch into the running batch: the
+            # launched step never becomes the running rows.
+            if not last_batch.is_empty():
+                decoding_batch.join(last_batch.shallow_copy())
 
         # Rows whose finish a commit already observed leave before admission,
         # so admission, the decode rows and load reporting (/v1/loads) see only
@@ -5259,6 +5242,13 @@ class Scheduler(
             and not self.dllm_manager.any_staging_reqs()
             and (not self.enable_overlap or len(self.inflight_steps) == 0)
             and self._pp_microbatches_drained()
+            # Under a loop that joins at launch, a just-prefilled HiSparse request
+            # waits in staging, not in the rows, until the next plan.
+            and not (
+                self.rows_join_at_launch
+                and self.hisparse_coordinator is not None
+                and self.hisparse_coordinator.ack_staging_queue
+            )
         )
 
         # Waiting queues: waiting + bootstrapping + preallocation + kv transfer (decode)
@@ -5520,25 +5510,23 @@ class Scheduler(
         )
 
     def collect_inflight_reqs(self) -> Set[Req]:
-        return {
-            req
-            for batch in self._collect_inflight_batches()
-            if batch is not None
-            for req in batch.reqs
-        }
+        return set(self._collect_inflight_req_list())
 
-    def _collect_inflight_batches(self) -> list[ScheduleBatch | None]:
+    def _collect_inflight_req_list(self) -> List[Req]:
+        """The requests of the running rows and the launched steps, in that order;
+        a request may be listed more than once."""
         if get_parallel().pp_size == 1:
-            inflight_batches = running_and_inflight_batches(self)
+            batches = running_and_inflight_batches(self)
         else:
-            inflight_batches = [
-                *self.running_mbs,
-                *self.inflight_steps.slot_batches(),
-            ]
+            batches = [*self.running_mbs, *self.inflight_steps.slot_batches()]
         if self.enable_continuous_input_polling and self.inflight_steps:
             # Polling can run intake before the newest queued batch becomes last_batch.
-            inflight_batches.extend(record.batch for record in self.inflight_steps)
-        return inflight_batches
+            batches.extend(record.batch for record in self.inflight_steps)
+        reqs = [req for batch in batches if batch is not None for req in batch.reqs]
+        if self.rows_join_at_launch and self.chunked_req is not None:
+            # The request still chunking, which no rows hold.
+            reqs.append(self.chunked_req)
+        return reqs
 
     def abort_request(self, recv_req: AbortReq):
         if (chunked_req := self.chunked_req) is not None:

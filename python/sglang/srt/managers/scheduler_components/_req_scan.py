@@ -13,7 +13,13 @@ if TYPE_CHECKING:
 def running_and_inflight_batches(
     scheduler: Scheduler,
 ) -> List[Optional[ScheduleBatch]]:
-    """The running batch, then the batch launched last; either may be None,
-    and they may be the same batch. Under PP they are the current
-    micro-batch's."""
+    """The running batch, then the launched batches whose requests it does not
+    hold yet: the batch launched last, or under a loop that joins its rows at
+    launch, the steps in flight. Any may be None, and the running and last
+    batch may be the same. Under PP they are the current micro-batch's."""
+    if scheduler.rows_join_at_launch:
+        return [
+            scheduler.running_batch,
+            *(record.batch for record in scheduler.inflight_steps),
+        ]
     return [scheduler.running_batch, scheduler.last_batch]
