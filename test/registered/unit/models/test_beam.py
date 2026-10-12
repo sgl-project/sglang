@@ -147,6 +147,7 @@ def stub_beam_model(layers, norm, layers_to_capture):
     model.has_full_attention = False
     model._flashinfer_ar_tokens = None
     model._flashinfer_ar = None
+    model._mlp_has_single_tp_sum = True
     return model
 
 

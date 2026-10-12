@@ -278,27 +278,37 @@ class TestBeamAllReduce(CustomTestCase):
         model._flashinfer_ar_tokens = None
         self.assertIsNone(model._flashinfer_ar_for(tokens(128)))
 
-    def test_flashinfer_ar_setup_skips_meta_construction(self):
-        """Meta-device construction must not allocate a workspace or rendezvous."""
+    def test_flashinfer_ar_setup_is_lazy_and_outside_capture(self):
+        """Construction (even on meta) never sets up the workspace; the first
+        eager forward does, and a capturing forward never does."""
         import sglang.srt.layers.flashinfer_comm_fusion as fi_fusion
         from sglang.srt.models import beam
 
-        model = beam.BeamModel.__new__(beam.BeamModel)
-        torch.nn.Module.__init__(model)
-        model._flashinfer_ar_tokens = model._flashinfer_ar = None
         key = (torch.cuda.get_device_capability(), dist.get_world_size())
         band = patch.dict(beam._FLASHINFER_AR_TOKEN_BAND, {key: (96, 640)})
+        available = patch.object(
+            fi_fusion, "is_flashinfer_allreduce_unavailable", return_value=False
+        )
         no_setup = patch.object(
             fi_fusion,
             "FlashInferWorkspaceManager",
             side_effect=AssertionError("workspace setup reached"),
         )
-        # Off the meta device the same model reaches workspace setup.
-        with band, no_setup, self.assertRaises(AssertionError):
-            model._init_flashinfer_ar(5120)
         with band, no_setup, torch.device("meta"):
-            model._init_flashinfer_ar(5120)
-        self.assertIsNone(model._flashinfer_ar_tokens)
+            tokens = beam.BeamModel._flashinfer_ar_band()
+        if tokens is None:
+            self.skipTest("FlashInfer is not available")
+        model = beam.BeamModel.__new__(beam.BeamModel)
+        torch.nn.Module.__init__(model)
+        model._flashinfer_ar_tokens, model._flashinfer_ar = tokens, None
+        hidden = torch.empty(128, 5120, device="cuda", dtype=torch.bfloat16)
+        capturing = patch.object(
+            torch.cuda, "is_current_stream_capturing", return_value=True
+        )
+        with available, no_setup, capturing:
+            self.assertIsNone(model._flashinfer_ar_for(hidden))
+        with available, no_setup, self.assertRaises(AssertionError):
+            model._flashinfer_ar_for(hidden)
 
     def test_attention_projection_reduction_ownership(self):
         """Deferring o_proj must perform exactly one collective before its norm."""

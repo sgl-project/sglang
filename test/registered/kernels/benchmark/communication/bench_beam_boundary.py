@@ -195,18 +195,10 @@ def _init_fi_workspace():
 
 
 def _fi_all_reduce(x: torch.Tensor) -> torch.Tensor:
-    import flashinfer.comm as fi_comm
+    # The model's own call, so the benchmark measures what serving runs.
+    from sglang.srt.models.beam import _flashinfer_all_reduce
 
-    out = torch.empty_like(x)
-    fi_comm.allreduce_fusion(
-        input=x,
-        workspace=_init_fi_workspace(),
-        pattern=fi_comm.AllReduceFusionPattern.kAllReduce,
-        launch_with_pdl=True,
-        trigger_completion_at_end=False,
-        output=out,
-    )
-    return out
+    return _flashinfer_all_reduce(x, _init_fi_workspace())
 
 
 def _make_all_reduce(name: str) -> Callable[[torch.Tensor], torch.Tensor]:
@@ -340,22 +332,38 @@ def check_numerics() -> None:
     fused = _make_boundary("fused", 64, post, nxt)
     full = fused(branch, residual)
     half = fused(branch[:32].contiguous(), residual[:32].contiguous())
+    for h, f in zip(half, full):
+        assert torch.equal(h, f[:32]), "fused rows differ between 32 and 64 tokens"
+    # Swapping CustomAR for FlashInfer cannot change model outputs if the sums match.
+    if _available("fi-auto"):
+        for tokens in (96, 256, 640):
+            branch = _inputs(tokens, seed=2000 * rank + tokens)[0]
+            assert _init_ca_comm().should_custom_ar(branch), f"NCCL at {tokens=}"
+            custom = _make_all_reduce("ca-auto")(branch.clone())
+            flashinfer = _make_all_reduce("fi-auto")(branch.clone())
+            assert torch.equal(custom, flashinfer), f"FlashInfer != CustomAR {tokens=}"
+    # Serving replays the boundaries from CUDA graphs; replay must match eager.
+    graph_cases = (("fused", 32), ("ca-auto-pdl", 128), ("fi-auto-pdl", 256))
+    for provider, tokens in graph_cases:
+        if not _available(provider):
+            continue
+        branch, residual, post, nxt = _inputs(tokens, seed=3000 * rank + tokens)
+        boundary = _make_boundary(provider, tokens, post, nxt)
+        eager = boundary(branch.clone(), residual)
+        static = branch.clone()
+        boundary(static, residual)
+        graph = torch.cuda.CUDAGraph()
+        with _graph_context(provider), torch.cuda.graph(graph):
+            replayed = boundary(static, residual)
+        static.copy_(branch)
+        graph.replay()
+        for r, e in zip(replayed, eager):
+            assert torch.equal(r, e), f"{provider} graph replay != eager {tokens=}"
     torch.cuda.synchronize()
     if rank == 0:
         errors = ", ".join(f"{p} {e:.4f}" for p, e in max_errors.items())
         print(f"numerics ok; max abs error vs reference: {errors}")
-        same = all(torch.equal(h, f[:32]) for h, f in zip(half, full))
-        print(f"fused rows identical at 32 vs 64 tokens: {same}")
-    # Swapping CustomAR for FlashInfer cannot change model outputs if the sums match.
-    if _available("fi-auto"):
-        identical = {}
-        for tokens in (96, 256, 640):
-            branch = _inputs(tokens, seed=2000 * rank + tokens)[0]
-            custom = _make_all_reduce("ca-auto")(branch.clone())
-            flashinfer = _make_all_reduce("fi-auto")(branch.clone())
-            identical[tokens] = torch.equal(custom, flashinfer)
-        if rank == 0:
-            print(f"FlashInfer rank sum bit-identical to CustomAR: {identical}")
+        print("batch invariance, FlashInfer == CustomAR, graph replay == eager: ok")
 
 
 # ---------------------------------------------------------------------------
