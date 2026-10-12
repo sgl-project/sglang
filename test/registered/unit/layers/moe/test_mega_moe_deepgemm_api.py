@@ -668,7 +668,6 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
             with envs.SGLANG_OPT_DEEPGEMM_MEGA_GATE.override(False):
                 self.assertFalse(supported(moe, None))
 
-            # The static verdict is cached per layer; only the input is rechecked.
             self.assertTrue(mega_gate_runtime.should_use_mega_gate(moe, hidden, None))
             self.assertTrue(moe._mega_gate_supported)
             self.assertFalse(
@@ -692,7 +691,6 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
         hidden[2:] = float("nan")
         deep_gemm = ModuleType("deep_gemm")
         deep_gemm.bf16_mega_gate = self._mega_gate_reference
-        # Reverse routed placement. Physical expert count includes redundancy.
         dispatch_info = mega_moe.ExpertLocationDispatchInfo(
             ep_dispatch_algorithm="static",
             partial_logical_to_rank_dispatch_physical_map=torch.tensor(

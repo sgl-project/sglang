@@ -56,7 +56,6 @@ class TestMegaGate(CustomTestCase):
 
     def test_routing_and_cuda_graph_replay(self):
         torch.manual_seed(42)
-        # Target Flash and reduced expert-count draft gates, at exact H=5120.
         for num_experts, top_k in ((384, 6), (128, 6)):
             for tokens in (1, 2, 16, 17, 32, 128, 512):
                 for routing in ("text", "image", "hash"):
@@ -72,7 +71,6 @@ class TestMegaGate(CustomTestCase):
                             )
                             * 0.001
                         )
-                        # Separate selection boundaries from BF16 GEMM roundoff.
                         bias = torch.arange(num_experts, device="cuda").float() * 0.25
                         image_bias = bias.flip(0) if routing == "image" else None
                         image_mask = (

@@ -37,7 +37,6 @@ def mhc_mega_boundary(
     rows, hidden = x.shape
     hc = residual.shape[1]
     updated = torch.empty_like(residual)
-    # Idle HC views can retain a larger row stride that MegaMoE rejects.
     normalized = torch.empty_like(x, memory_format=torch.contiguous_format)
     next_pre = torch.empty((rows, hc, 1), device=x.device, dtype=torch.float32)
     next_post = torch.empty_like(next_pre)

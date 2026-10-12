@@ -20,7 +20,6 @@ class TestMegaMHC(CustomTestCase):
             raise unittest.SkipTest("Mega mHC requires SM10x")
 
     def test_idle_output_feeds_mega_moe_dispatch(self):
-        # RMSNorm preserves this zero-row slice's HC stride on an idle DP rank.
         hidden, hc, top_k = 5120, 4, 6
         residual = torch.empty((0, hc, hidden), dtype=torch.bfloat16, device="cuda")
         x = residual[:, 0, :]

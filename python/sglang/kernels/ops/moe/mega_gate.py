@@ -32,7 +32,6 @@ def bf16_mega_gate(
     import deep_gemm
 
     if valid_token_mask is not None:
-        # DeepGEMM checks score finiteness before masking padded rows.
         hidden_states = torch.where(valid_token_mask[:, None], hidden_states, 0)
 
     ids = torch.empty(

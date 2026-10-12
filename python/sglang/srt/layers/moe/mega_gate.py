@@ -59,7 +59,6 @@ def mega_gate_supported(moe, dispatch_info) -> bool:
     return (
         config.scoring_func == "sqrtsoftplus"
         and config.renormalize
-        # vision_topk leaves top-k=1 weights unnormalized.
         and not (config.top_k == 1 and moe.gate.e_score_correction_bias_vl is not None)
         and not config.use_grouped_topk
         and config.custom_routing_function is None
@@ -84,7 +83,6 @@ def run_mega_gate(moe, hidden_states, input_ids, num_token_non_padded, dispatch_
             num_fused_shared_experts=moe.topk.num_fused_shared_experts,
             routed_scaling_factor=moe.topk.routed_scaling_factor,
             apply_routed_scaling_factor_on_output=moe.topk.apply_routed_scaling_factor_on_output,
-            # HashTopK never captures into the target's routed-expert buffer.
             allow_routed_experts_capture=False,
         )
     else:
@@ -102,7 +100,6 @@ def run_mega_gate(moe, hidden_states, input_ids, num_token_non_padded, dispatch_
     if moe.is_hash:
         if input_ids is None:
             raise ValueError("DeepSeek-V4.1 hash routing requires input_ids.")
-        # Padded IDs may be outside the vocabulary.
         safe_ids = (
             torch.where(valid_mask, input_ids, 0)
             if valid_mask is not None
@@ -144,7 +141,6 @@ def run_mega_gate(moe, hidden_states, input_ids, num_token_non_padded, dispatch_
             [weights, weights.new_full((num_tokens, num_shared), shared_weight)], dim=-1
         )
 
-    # Postprocessing needs the expert count, not the logits.
     logits_shape = hidden_states.new_empty((0, moe.gate.weight.shape[0]))
     ids, weights, recorder_ids = _post_process_topk_ids(
         ids,
@@ -158,7 +154,6 @@ def run_mega_gate(moe, hidden_states, input_ids, num_token_non_padded, dispatch_
     )
     if num_shared and config.apply_routed_scaling_factor_on_output:
         weights[:, -num_shared:] = 1.0
-    # Shared-slot remapping can overwrite padded weights.
     if num_token_non_padded is not None:
         _mask_topk_ids_padded_region(ids, num_token_non_padded)
         _zero_topk_weights_padded_region(weights, num_token_non_padded)
