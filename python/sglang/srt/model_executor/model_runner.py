@@ -1099,6 +1099,7 @@ class ModelRunner:
         )
 
         ElasticEPStateManager.instance().reset()
+        ElasticEPStateManager.mark_recovery_slot_restored()
 
     def init_attention_backends(self):
         """Initialize attention backends only (no cuda graph capture)."""

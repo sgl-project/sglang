@@ -1,5 +1,6 @@
 import asyncio
 import unittest
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -620,6 +621,12 @@ class TestElasticEPRecoveryLifecycle(CustomTestCase):
         )
         self.instance_patch.start()
         self.addCleanup(self.instance_patch.stop)
+        self.exec_patch = patch(
+            "sglang.srt.managers.scheduler.get_exec",
+            return_value=SimpleNamespace(moe=SimpleNamespace(moe_a2a_backend="deepep")),
+        )
+        self.exec_patch.start()
+        self.addCleanup(self.exec_patch.stop)
 
     def test_recovery_record_is_idempotent_and_fenced(self):
         operation = RecoveryOperation(
@@ -868,6 +875,31 @@ class TestElasticEPRecoveryLifecycle(CustomTestCase):
         self.assertFalse(update.success)
         self.assertTrue(update.terminal)
         self.assertEqual(update.recovery_phase, "failed")
+
+    def test_terminal_warmup_releases_local_nixl_recovery_fence(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.ipc_channels = MagicMock()
+        self.state.recovery_operation_id = "recover-1"
+        self.state.recovery_phase = "warming_up"
+
+        with (
+            patch(
+                "sglang.srt.managers.scheduler.get_exec",
+                return_value=SimpleNamespace(
+                    moe=SimpleNamespace(moe_a2a_backend="nixl")
+                ),
+            ),
+            patch(
+                "sglang.srt.managers.scheduler.get_parallel",
+                return_value=SimpleNamespace(tp_rank=1),
+            ),
+            patch.object(NixlEPBuffer, "finish_recovery") as finish_recovery,
+        ):
+            scheduler._report_recovery_warmup_result("recover-1", success=True)
+
+        finish_recovery.assert_called_once_with("recover-1")
+        self.assertEqual(self.state.recovery_phase, "ready")
+        scheduler.ipc_channels.send_to_tokenizer.send_output.assert_not_called()
 
     def test_recovery_preserves_scale_result_and_releases_terminal_exclusion(self):
         self.state.operation_id = "grow-1"
@@ -1299,6 +1331,8 @@ class TestNixlEPRecoveryConnections(CustomTestCase):
             observed_dispatch_ep_sizes.append(self.state.dispatch_ep_size)
 
         self.prefix_store_on_wait = observe_dispatch_gate
+        self.state.dispatch_ep_size = 4
+        self.state.recovery_operation_id = self.operation.operation_id
 
         NixlEPBuffer.connect_recovery(self.operation, replacement=True)
 
@@ -1308,6 +1342,25 @@ class TestNixlEPRecoveryConnections(CustomTestCase):
         self.assertEqual(observed_dispatch_ep_sizes, [0])
         self.assertEqual(self.state.connected_ep_size, 4)
         self.assertEqual(self.state.dispatch_ep_size, 4)
+
+    def test_completed_recovery_releases_nixl_operation_fence(self):
+        self.state.recovery_operation_id = self.operation.operation_id
+        self.state.recovery_disconnected_rank = self.operation.rank_offset
+        self.state.recovery_connections_ready = True
+
+        NixlEPBuffer.finish_recovery(self.operation.operation_id)
+
+        self.assertIsNone(self.state.recovery_operation_id)
+        self.assertIsNone(self.state.recovery_disconnected_rank)
+        self.assertFalse(self.state.recovery_connections_ready)
+
+        next_operation = replace(
+            self.operation,
+            operation_id="recover/2",
+            allocation_id="pod/6",
+        )
+        NixlEPBuffer.prepare_recovery(next_operation)
+        self.buffer.disconnect_ranks.assert_called_once_with([2])
 
 
 if __name__ == "__main__":

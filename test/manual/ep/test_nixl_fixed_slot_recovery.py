@@ -181,13 +181,13 @@ class TestNixlFixedSlotRecovery(CustomTestCase):
         for log_file in getattr(cls, "logs", []):
             log_file.close()
 
-    def _generate(self) -> requests.Response:
+    def _generate(self, routed_dp_rank: int = 0) -> requests.Response:
         return requests.post(
             f"{self.base_url}/generate",
             json={
                 "text": "The capital of France is",
                 "sampling_params": {"max_new_tokens": 4, "temperature": 0.0},
-                "routed_dp_rank": 0,
+                "routed_dp_rank": routed_dp_rank,
             },
             timeout=120,
         )
@@ -253,7 +253,7 @@ class TestNixlFixedSlotRecovery(CustomTestCase):
             state = self._state()
             if state["recovery_phase"] == "ready":
                 self.assertTrue(state["recovery_succeeded"])
-                response = self._generate()
+                response = self._generate(routed_dp_rank=1)
                 self.assertEqual(response.status_code, 200, response.text)
                 return
             self.assertNotEqual(state["recovery_phase"], "failed", state)
