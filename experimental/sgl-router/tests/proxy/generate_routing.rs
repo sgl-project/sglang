@@ -69,7 +69,10 @@ async fn generate_streams_engine_events_through() {
     let app = radix_router(&[(&engine, WorkerMode::Plain)], HashTree::new());
 
     let res = send(&app, "POST", &json!({"text": "hi", "stream": true})).await;
-    assert_eq!(res.headers()["content-type"], "text/event-stream");
+    assert_eq!(
+        res.headers()["content-type"],
+        "text/event-stream; charset=utf-8"
+    );
     let events = parse_sse_data(&collect_body(res.into_body()).await);
     assert_eq!(events, ["{\"text\":\"ok\"}", "[DONE]"]);
 }

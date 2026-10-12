@@ -1073,6 +1073,8 @@ class TestTriFactorySizing(unittest.TestCase):
                             is_hybrid_swa=tri_pool,
                             is_hybrid_swa_compress=False,
                             forward_stream=None,
+                            # Spec off: no draft region to fuse.
+                            _fused_draft_for_mamba_factory=lambda: None,
                         )
                         # Run the production configurator AND factory. Reverting
                         # either top-level flag forwarding must break cleanup.
