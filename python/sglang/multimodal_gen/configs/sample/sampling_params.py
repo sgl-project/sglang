@@ -243,7 +243,12 @@ class SamplingParams:
     # All fields below are copied from ForwardBatch
 
     # Image inputs
-    image_path: str | list[str] | None = None
+    # Per-request conditioning input: excluded from the dynamic-batch
+    # signature so image-conditioned requests can still group (the grouping
+    # gate is supports_batching_image_conditioning()).
+    image_path: str | list[str] | None = field(
+        default=None, metadata={"batch_sig_exclude": True}
+    )
 
     # Video inputs (video-to-video conditioning)
     video_path: str | list[str] | None = None
@@ -538,6 +543,14 @@ class SamplingParams:
         """Number of final samples produced by one expanded scheduler request."""
         return 1
 
+    def should_use_classifier_free_guidance(self) -> bool:
+        cfg_scale = (
+            self.true_cfg_scale
+            if self.true_cfg_scale is not None
+            else self.guidance_scale
+        )
+        return cfg_scale > 1.0 and self.negative_prompt is not None
+
     @classmethod
     def default_image_output_format(cls) -> str | None:
         """Return a model-owned default format for the image API, if any."""
@@ -757,10 +770,6 @@ class SamplingParams:
             )
 
         RLRolloutArgs.validate_sampling_params(self)
-
-    def check_sampling_param(self):
-        # Keep backward-compatibility for old call sites.
-        self._validate()
 
     def _validate_with_pipeline_config(self, pipeline_config):
         """
@@ -1635,6 +1644,29 @@ class SamplingParams:
             "--upscaling-scale",
             type=int,
             help="Upscaling factor (default: 4).",
+        )
+        # HunyuanImage-3 and similar model-specific tokenizer/prompt arguments
+        add_argument(
+            "--bot-task",
+            dest="bot_task",
+            type=str,
+            help=(
+                "Tokenizer bot task (model-specific). For HunyuanImage-3: "
+                "auto, image, think, recaption, think_recaption, img_ratio, none. "
+                "Controls the bot response prefix in the tokenizer."
+            ),
+        )
+        add_argument(
+            "--system-prompt",
+            dest="system_prompt",
+            type=str,
+            help=(
+                "System prompt: preset name or raw custom text. "
+                "Presets: none, en_unified, en_vanilla, en_recaption, "
+                "en_think_recaption, dynamic, auto. "
+                "Any other string is used directly as the system prompt. "
+                "Default: en_unified."
+            ),
         )
         return parser
 
