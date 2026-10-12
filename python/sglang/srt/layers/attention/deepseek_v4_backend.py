@@ -3365,8 +3365,11 @@ class DeepseekV4AttnBackend(
             q_lens_cpu = tail.local_lens_cpu
             req_global, pos_global = tail.req_global, tail.pos_global
         else:
+            extend_lens_cpu = _as_int_list(forward_batch.extend_seq_lens_cpu)
+            # BCG gathers the capture bucket; compressed state belongs to live rows.
+            total = sum(extend_lens_cpu)
             q_lens_cpu = interleave_rows_per_request(
-                _as_int_list(forward_batch.extend_seq_lens_cpu),
+                extend_lens_cpu,
                 get_parallel().attn_cp_rank,
                 get_parallel().attn_cp_size,
             )
