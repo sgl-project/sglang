@@ -226,6 +226,7 @@ fallback_version = "0.0.0.dev0"
 target = "sglang.srt.grpc._core"
 path = "../rust/sglang-grpc/Cargo.toml"
 binding = "PyO3"
+optional = true
 
 [tool.kernels.dependencies]
 "kernels-community/sgl-flash-attn3" = 1

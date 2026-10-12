@@ -16,6 +16,10 @@ uv pip install "sglang[diffusion]" --prerelease=allow
 
 ### Method 2: From source
 
+SGLang's native gRPC extension is optional. Source installation can continue if
+its Rust build fails; diffusion does not use this extension. To use the native
+gRPC server, install Rust and protoc and ensure the extension builds successfully.
+
 ```bash
 # Use the latest release branch
 git clone https://github.com/sgl-project/sglang.git
