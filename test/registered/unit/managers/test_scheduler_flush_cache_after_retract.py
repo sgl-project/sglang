@@ -119,6 +119,24 @@ class TestSchedulerFlushCacheAfterRetract(unittest.TestCase):
         self.assertFalse(scheduler.flush_cache())
         scheduler.tree_cache.reset.assert_not_called()
 
+    def test_flush_cache_keeps_pipeline_ring_records(self):
+        """Each rank's relay reads a pipeline ring's records by slot after a
+        flush; any other in-flight queue is drained."""
+        for ring in (False, True):
+            with self.subTest(ring=ring):
+                scheduler = self._new_scheduler()
+                scheduler.inflight_steps = InflightQueue(depth=1, ring=ring)
+                batch = MagicMock()
+                scheduler.inflight_steps.push(batch, None)
+
+                self.assertTrue(scheduler.flush_cache())
+                if ring:
+                    self.assertEqual(
+                        scheduler.inflight_steps.slot_batches(), [batch, None]
+                    )
+                else:
+                    self.assertEqual(len(scheduler.inflight_steps), 0)
+
 
 if __name__ == "__main__":
     unittest.main()
