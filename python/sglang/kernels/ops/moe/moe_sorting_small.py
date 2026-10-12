@@ -656,6 +656,14 @@ _emitted_quant: ContextVar[tuple[torch.Tensor, torch.Tensor] | None] = ContextVa
 
 
 @functools.cache
+def _log_first_ep_sort(quant_fused: bool) -> None:
+    logger.info(
+        "small-batch MoE sort serving an EP-masked batch (stage-1 quant fused: %s)",
+        quant_fused,
+    )
+
+
+@functools.cache
 def apply_aiter_small_moe_sort_patch() -> None:
     """Patch a stock aiter so decode-sized MoE sorting (+ stage1 mxfp8 quant) is one launch."""
     if not is_gfx95_supported():
@@ -763,6 +771,8 @@ def apply_aiter_small_moe_sort_patch() -> None:
             )
             if quant_ret is not None:
                 _emitted_quant.set(quant_ret)
+            if expert_mask is not None:
+                _log_first_ep_sort(quant_ret is not None)
             return (
                 sorted_ids,
                 sorted_weights,
