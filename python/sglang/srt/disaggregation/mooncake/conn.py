@@ -2574,6 +2574,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                     executor,
                                     target_rank_registration_info,
                                 )
+                                # Before the Failed check: an ABORT during the
+                                # send also marks the room Failed.
+                                if state_rc != 0:
+                                    self._poison_unsettled_send(kv_chunk.room)
                                 if (
                                     self.request_status.get(
                                         kv_chunk.room, KVPoll.Failed
@@ -2589,7 +2593,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                         self.failed_sessions.add(
                                             req.mooncake_session_id
                                         )
-                                    self._poison_unsettled_send(kv_chunk.room)
                                     self.conclude_failure(
                                         bootstrap_room=kv_chunk.room,
                                         failure_reason=(
@@ -2606,16 +2609,16 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 kv_chunk.prefill_aux_index,
                                 target_rank_registration_info.dst_aux_ptrs,
                             )
+                            if ret != 0:
+                                # The aux write targets decode's metadata
+                                # slot, which the deferred release also frees.
+                                self._poison_unsettled_send(req.room)
                             polls.append(True if ret == 0 else False)
                             dst_ranks_infos.append((req.endpoint, req.dst_port))
 
                             # Only sync status when all the dst ranks have received the kvcache
                             if len(polls) == req.required_dst_info_num:
                                 status = KVPoll.Success if all(polls) else KVPoll.Failed
-                                if status == KVPoll.Failed:
-                                    # The aux write targets decode's metadata
-                                    # slot, which the deferred release also frees.
-                                    self._poison_unsettled_send(req.room)
                                 self.conclude_transfer(
                                     bootstrap_room=req.room,
                                     status=status,

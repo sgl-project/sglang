@@ -68,6 +68,18 @@ def _chunk() -> TransferKVChunk:
     )
 
 
+def _last_chunk() -> TransferKVChunk:
+    return TransferKVChunk(
+        room=ROOM,
+        prefill_kv_indices=np.array([1], dtype=np.int32),
+        index_slice=slice(0, 1),
+        is_last_chunk=True,
+        chunk_id=0,
+        prefill_aux_index=0,
+        state_indices=[[1]],
+    )
+
+
 class TestMooncakeAbortNotification(
     DeferredAbortNotificationScenarios,
     TaggedAbortNotificationScenarios,
@@ -135,9 +147,8 @@ class TestMooncakeAbortNotification(
                 self.assertEqual(manager._deferred_ack_targets, {})
                 self.assertEqual(manager._sent, [])
 
-    def _run_worker_with_failed_send(self, manager) -> None:
-        """Run one chunk through transfer_worker with send_kvcache returning -1."""
-        session = "decode-session"
+    def _prepare_worker(self, manager, num_dsts: int = 1) -> None:
+        """Wire transfer_worker to num_dsts decode ranks that all need the room."""
         manager.enable_trace = False
         manager.enable_staging = False
         manager.is_mla_backend = True
@@ -150,39 +161,64 @@ class TestMooncakeAbortNotification(
         manager.session_failures = defaultdict(int)
         manager.failed_sessions = set()
         manager.state_layout_rejections = {}
+        manager.req_to_decode_prefix_len = {}
         manager.kv_args = MagicMock(kv_data_ptrs=[0x1000])
-        manager.decode_kv_args_table = {session: MagicMock(requires_dcp_relayout=False)}
         manager._get_dsa_cache_transfer_skip_flags = lambda info: (False, False)
-        manager.transfer_infos = {
-            ROOM: {
-                (DECODE_IP, DECODE_PORT): TransferInfo(
-                    room=ROOM,
-                    endpoint=DECODE_IP,
-                    dst_port=DECODE_PORT,
-                    mooncake_session_id=session,
-                    dst_kv_indices=np.array([1], dtype=np.int32),
-                    dst_aux_index=0,
-                    dst_state_indices=[],
-                    required_dst_info_num=1,
-                    is_dummy=False,
-                )
-            }
-        }
-        manager.send_kvcache = MagicMock(return_value=-1)
+        manager.decode_kv_args_table = {}
+        manager.transfer_infos = {ROOM: {}}
+        for i in range(num_dsts):
+            session = f"decode-session-{i}"
+            manager.decode_kv_args_table[session] = MagicMock(
+                requires_dcp_relayout=False
+            )
+            manager.transfer_infos[ROOM][(DECODE_IP, DECODE_PORT + i)] = TransferInfo(
+                room=ROOM,
+                endpoint=DECODE_IP,
+                dst_port=DECODE_PORT + i,
+                mooncake_session_id=session,
+                dst_kv_indices=np.array([1], dtype=np.int32),
+                dst_aux_index=0,
+                dst_state_indices=[[1]],
+                required_dst_info_num=num_dsts,
+                is_dummy=False,
+            )
+        manager.send_kvcache = MagicMock(return_value=0)
+        manager.maybe_send_extra = MagicMock(return_value=0)
+        manager.send_aux = MagicMock(return_value=0)
         manager.conclude_failure = MagicMock(
             side_effect=lambda **kw: manager.update_status(
                 kw["bootstrap_room"], KVPoll.Failed
             )
         )
+        manager.conclude_transfer = MagicMock(
+            side_effect=lambda **kw: manager.update_status(
+                kw["bootstrap_room"], kw["status"]
+            )
+        )
+
+    def _run_worker(self, manager, chunk: TransferKVChunk) -> None:
         queue = MagicMock()
-        queue.get.side_effect = [_chunk(), None]
-
+        queue.get.side_effect = [chunk, None]
         manager.transfer_worker(queue, MagicMock())
+        self.assertEqual(manager.request_status[ROOM], KVPoll.Failed)
+        self.assertEqual(manager._staging_outstanding.get(ROOM, 0), 0)
 
+    def _abort_on_call(self, manager):
+        """A failed send whose ABORT lands while its writes may be in flight."""
+
+        def send(*args, **kwargs):
+            self._dispatch_abort(manager)
+            return -1
+
+        return send
+
+    def _run_worker_with_failed_send(self, manager) -> None:
+        """Run one chunk through transfer_worker with send_kvcache returning -1."""
+        self._prepare_worker(manager)
+        manager.send_kvcache.return_value = -1
+        self._run_worker(manager, _chunk())
         manager.send_kvcache.assert_called_once()
         manager.conclude_failure.assert_called_once()
-        self.assertEqual(manager.request_status[ROOM], KVPoll.Failed)
-        self.assertEqual(manager._staging_outstanding[ROOM], 0)
 
     def test_failed_send_never_acks_drained(self):
         # batch_transfer_sync can return -1 with the batch still writing, so a
@@ -210,6 +246,37 @@ class TestMooncakeAbortNotification(
                 CommonKVManager.update_status(manager, ROOM, KVPoll.Bootstrapping)
                 self._dispatch_abort(manager)
                 self.assertEqual(manager._sent, [(ROOM, target)])
+
+    def test_abort_during_failed_state_send_never_acks(self):
+        """A state send that fails after an ABORT marked the room Failed must
+        still withhold the drained ACK."""
+        manager = _manager()
+        self._prepare_worker(manager)
+        manager.maybe_send_extra.side_effect = self._abort_on_call(manager)
+
+        self._run_worker(manager, _last_chunk())
+
+        self.assertEqual(manager._sent, [])
+        self.assertIn(ROOM, manager._deferred_ack_poisoned_rooms)
+
+    def test_failed_aux_to_one_decode_rank_never_acks(self):
+        """An aux send that fails for the first decode rank must withhold the
+        ACK even when the second rank stops the room before its own aux send."""
+        for name, abort_during_aux in (("mid-send", True), ("dead-session", False)):
+            with self.subTest(name=name):
+                manager = _manager()
+                self._prepare_worker(manager, num_dsts=2)
+                if abort_during_aux:
+                    manager.send_aux.side_effect = self._abort_on_call(manager)
+                else:
+                    manager.send_aux.return_value = -1
+                    manager.failed_sessions.add("decode-session-1")
+
+                self._run_worker(manager, _last_chunk())
+                self._dispatch_abort(manager)
+
+                manager.send_aux.assert_called_once()
+                self.assertEqual(manager._sent, [])
 
     def test_feature_off_sends_legacy_ack(self):
         manager = _manager(enabled=False)
