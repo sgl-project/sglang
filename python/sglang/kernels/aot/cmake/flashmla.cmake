@@ -127,9 +127,6 @@ set(FlashMLA_SOURCES
 
 if(FLASHMLA_ENABLE_SM100)
     list(APPEND FlashMLA_SOURCES
-        # Fused Q RoPE + sparse attention + inverse RoPE + MXFP8 output.
-        # The implementation is already present in the compatible dependency
-        # pin; expose it without changing legacy KV layouts or SM90 support.
         "csrc/flashmla_mega_extension.cc"
         # sm100 dense prefill/bwd.
         ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm100/prefill/dense/fmha_cutlass_fwd_sm100.cu

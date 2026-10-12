@@ -1,5 +1,3 @@
-"""Cold-L2 latency of the fused prefill kernel (excludes query packing/WO-A)."""
-
 import torch
 from sgl_kernel.flash_mla_mega import flash_mla_mega_prefill
 
@@ -15,7 +13,6 @@ def benchmark(tokens: int, heads: int, provider: str):
     indices = torch.randint(4096, (tokens, 1, 640), device="cuda", dtype=torch.int32)
     positions = torch.zeros(tokens, device="cuda", dtype=torch.int32)
     table = torch.cat((torch.ones(1, 32), torch.zeros(1, 32)), dim=-1).cuda()
-    # marker rotates all tensor arguments across graph calls to defeat L2 reuse.
     return marker.do_bench(
         flash_mla_mega_prefill,
         input_args=(q, kv, indices, positions, table, 512**-0.5),

@@ -1,5 +1,3 @@
-"""Numerical and layout checks for the wheel's fused FlashMLA entry points."""
-
 import sys
 
 import pytest
@@ -100,12 +98,11 @@ def test_mega_prefill_matches_unfused_reference(heads):
     ).square().mean().sqrt() / expected.square().mean().sqrt()
     assert relative_rmse < 0.04
     assert scale.dtype == torch.int32 and scale.stride(0) == 1
-    assert scale.stride(-1) % 4 == 0  # three tokens require TMA padding
+    assert scale.stride(-1) % 4 == 0
 
 
 def test_mega_decode_matches_gathered_prefill():
     q, kv, indices, lens, positions, table, sink = _inputs(64)
-    # V4.1: all 512 dimensions in FP8, per-32 UE8M0 scales after the page's data.
     groups = kv.float().view(128, 16, 32)
     sf = torch.exp2(torch.ceil(torch.log2(groups.abs().amax(-1).clamp_min(1e-4) / 448)))
     codes = (groups / sf[..., None]).to(torch.float8_e4m3fn)
@@ -144,7 +141,6 @@ def test_mega_decode_matches_gathered_prefill():
 
 
 def test_mega_weight_permutations_preserve_scale_association():
-    # Distinct exponent bytes detect a weight/scale permutation disagreement.
     heads, rows, width = 64, 64, 128
     q_weight = (
         torch.randint(0, 112, (heads * 512 * width,), device="cuda")

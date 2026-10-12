@@ -1,9 +1,6 @@
 #include <torch/all.h>
 #include <torch/library.h>
 
-// Upstream's fused entry points are TU-local. Include their implementation to
-// register typed libtorch adapters without patching the pinned dependency.
-// FLASH_MLA_LIBTORCH_ONLY removes its pybind registration layer.
 #include "api/fused_norm_rope_attn_rope_cast_fwd.cpp"
 
 static std::vector<at::Tensor> sgl_flash_mla_mega_prefill(
