@@ -1,4 +1,4 @@
-"""Manual E2E tests for the Rust frontend's HTTP and runtime.v1 gRPC listeners.
+"""Manual E2E tests for the Rust frontend's HTTP and api.v1 gRPC listeners.
 
 Run from a SGLang source checkout with one GPU, the Rust server extension,
 and grpcio-tools installed in the same environment as the sglang command:
@@ -28,6 +28,7 @@ import openai
 import psutil
 import requests
 
+import sglang
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
@@ -60,41 +61,42 @@ def _payload(raw):
 
 
 def grpc_frames(call, api, stream):
-    """Read synchronous runtime.v1 response iterators, including stream=false."""
-    assert api in ("text", "tokens", "completion", "chat"), api
-    native = api in ("text", "tokens")
+    """Read synchronous api.v1 Generate streams, including stream=false."""
+    assert api in ("text", "tokens"), api
     finished = False
     count = 0
-    for chunk in call:
+    for item in call:
         assert not finished, "gRPC response after terminal marker"
         count += 1
-        finished = chunk.finished
-        if native:
-            if not stream:
-                assert finished and count == 1, (
-                    "nonstream native must have one response"
-                )
-            value = {
-                "meta_info": {
-                    key: json.loads(raw) for key, raw in chunk.meta_info.items()
-                }
+        kind = item.WhichOneof("item")
+        assert kind == "frame", f"gRPC generation error: {item!r}"
+        frame = item.frame
+        meta = frame.meta_info
+        assert meta.HasField("cached_tokens"), "api.v1 omitted cached_tokens"
+        finish_kind = (
+            meta.finish_reason.WhichOneof("kind")
+            if meta.HasField("finish_reason")
+            else None
+        )
+        finished = finish_kind is not None
+        if not stream:
+            assert finished and count == 1, "nonstream native must have one response"
+        value = {
+            "meta_info": {
+                "prompt_tokens": meta.prompt_tokens,
+                "completion_tokens": meta.completion_tokens,
+                "finish_reason": (
+                    {"type": finish_kind} if finish_kind is not None else None
+                ),
+                "cached_tokens": (
+                    meta.cached_tokens if meta.HasField("cached_tokens") else None
+                ),
             }
-            value["text" if api == "text" else "output_ids"] = (
-                chunk.text if api == "text" else list(chunk.output_ids)
-            )
-            assert bool(value["meta_info"].get("finish_reason")) == finished
-            yield value
-        elif stream:
-            if finished:
-                assert not chunk.json_chunk, "stream terminal must be empty"
-            else:
-                assert chunk.json_chunk, "empty nonterminal OpenAI chunk"
-                yield _payload(chunk.json_chunk)
-        else:
-            assert finished and count == 1, (
-                "nonstream OpenAI must have one terminal JSON chunk"
-            )
-            yield _payload(chunk.json_chunk)
+        }
+        value["text" if api == "text" else "output_ids"] = (
+            frame.text if api == "text" else list(frame.output_ids.ids)
+        )
+        yield value
     assert finished, "gRPC response truncated before terminal marker"
 
 
@@ -139,7 +141,7 @@ def summarize(api, frames, stream):
                 "total_tokens": meta["prompt_tokens"] + meta["completion_tokens"],
             }
         )
-        return {"output": output, "finish_reason": finish, "usage": usage}
+        return {"output": output, "finish_reason": finish["type"], "usage": usage}
 
     outputs, finishes = {}, {}
     usage = None
@@ -206,23 +208,35 @@ class TestRustFrontendE2E(CustomTestCase):
         # Generate the client from this checkout's canonical service definition.
         generated = cls.output / "client"
         generated.mkdir()
-        proto = cls.source / "proto/sglang/runtime/v1"
+        proto_root = cls.source / "proto"
+        proto = proto_root / "sglang/api/v1"
+        proto_files = sorted(proto.glob("*.proto")) + [
+            proto_root / "sglang/json/v1/options.proto"
+        ]
         subprocess.run(
             [
                 sys.executable,
                 "-m",
                 "grpc_tools.protoc",
-                f"-I{proto}",
+                f"-I{proto_root}",
                 f"--python_out={generated}",
                 f"--grpc_python_out={generated}",
-                str(proto / "sglang.proto"),
+                *(str(path) for path in proto_files),
             ],
             check=True,
         )
         sys.path.insert(0, str(generated))
         cls.addClassCleanup(sys.path.remove, str(generated))
-        cls.pb = importlib.import_module("sglang_pb2")
-        cls.stub_type = importlib.import_module("sglang_pb2_grpc").SglangServiceStub
+        generated_package = str(generated / "sglang")
+        sglang.__path__.append(generated_package)
+        cls.addClassCleanup(sglang.__path__.remove, generated_package)
+        cls.common_pb = importlib.import_module("sglang.api.v1.common_pb2")
+        cls.generate_pb = importlib.import_module("sglang.api.v1.generate_pb2")
+        cls.sampling_pb = importlib.import_module("sglang.api.v1.sampling_pb2")
+        cls.service_pb = importlib.import_module("sglang.api.v1.service_pb2")
+        cls.stub_type = importlib.import_module(
+            "sglang.api.v1.service_pb2_grpc"
+        ).SglangServiceStub
         cls.client = openai.OpenAI(
             api_key="EMPTY",
             base_url=f"{cls.base_url}/v1",
@@ -338,20 +352,27 @@ class TestRustFrontendE2E(CustomTestCase):
                 stream=body["stream"],
                 timeout=(5, 30),
             )
-        if api in ("text", "tokens"):
-            body = dict(
-                body, sampling_params=self.pb.SamplingParams(**body["sampling_params"])
-            )
-            request_type, method = (
-                (self.pb.TextGenerateRequest, self.stub.TextGenerate)
-                if api == "text"
-                else (self.pb.GenerateRequest, self.stub.Generate)
-            )
-            return method(request_type(**body), timeout=30)
-        method = self.stub.ChatComplete if api == "chat" else self.stub.Complete
-        return method(
-            self.pb.OpenAIRequest(json_body=json.dumps(body).encode()), timeout=30
+        assert api in ("text", "tokens"), (
+            f"api.v1 exposes native Generate, not OpenAI {api} over gRPC"
         )
+        sampling_params = self.sampling_pb.SamplingParams(**body["sampling_params"])
+        request = self.generate_pb.GenerateRequest(
+            stream=body["stream"],
+            sampling_params=self.generate_pb.SamplingParamsOrList(one=sampling_params),
+            priority=3,
+            routing_key="rust-frontend-e2e",
+        )
+        if "rid" in body:
+            request.rid.CopyFrom(self.common_pb.StringOrList(one=body["rid"]))
+        if api == "text":
+            request.text.CopyFrom(self.common_pb.StringOrList(one=body["text"]))
+        else:
+            request.input_ids.CopyFrom(
+                self.common_pb.TokenIdsOrList(
+                    one=self.common_pb.TokenIds(ids=body["input_ids"])
+                )
+            )
+        return self.stub.Generate(request, timeout=30)
 
     def frames(self, call, api, stream, transport):
         if transport == "grpc":
@@ -402,7 +423,8 @@ class TestRustFrontendE2E(CustomTestCase):
                     self.assertEqual(
                         summary, expected, "HTTP stream/nonstream mismatch"
                     )
-                    self.assertEqual(self.generate(api, stream, "grpc"), summary)
+                    if api in ("text", "tokens"):
+                        self.assertEqual(self.generate(api, stream, "grpc"), summary)
 
     def test_metadata_and_health(self):
         for path in ("/health", "/health_generate"):
@@ -416,29 +438,31 @@ class TestRustFrontendE2E(CustomTestCase):
                 self.assertEqual(response.status_code, 200, response.text)
                 self.assertEqual(response.json()["max_context_length"], 4096)
         self.assertTrue(
-            self.stub.HealthCheck(self.pb.HealthCheckRequest(), timeout=30).healthy
+            self.stub.HealthCheck(
+                self.service_pb.HealthCheckRequest(), timeout=30
+            ).healthy
         )
-        self.assertEqual(
-            json.loads(
-                self.stub.GetModelInfo(
-                    self.pb.GetModelInfoRequest(), timeout=30
-                ).json_info
-            ),
-            info,
+        grpc_info = self.stub.GetModelInfo(
+            self.service_pb.GetModelInfoRequest(), timeout=30
         )
-        models = self.stub.ListModels(self.pb.ListModelsRequest(), timeout=30).models
+        self.assertEqual(grpc_info.served_model_name, info["served_model_name"])
+        self.assertEqual(grpc_info.model_path, info["model_path"])
+        models = self.stub.ListModels(
+            self.service_pb.ListModelsRequest(), timeout=30
+        ).models
         self.assertEqual(
             [(m.id, m.max_model_len) for m in models], [("e2e-model", 4096)]
         )
         with self.subTest(operation="grpc/GetServerInfo"):
-            server = json.loads(
-                self.stub.GetServerInfo(
-                    self.pb.GetServerInfoRequest(), timeout=30
-                ).json_info
+            server = self.stub.GetServerInfo(
+                self.service_pb.GetServerInfoRequest(), timeout=30
             )
-            self.assertEqual(server["max_context_length"], 4096)
+            self.assertEqual(server.max_context_length, 4096)
+            self.assertEqual(server.served_model_name, "e2e-model")
+            self.assertEqual(server.disaggregation_mode, "null")
+            self.assertEqual(server.dp_size, 1)
         decoded = self.stub.Detokenize(
-            self.pb.DetokenizeRequest(tokens=self.tokens), timeout=30
+            self.service_pb.DetokenizeRequest(tokens=self.tokens), timeout=30
         ).text
         self.assertEqual(
             decoded, self.tokenizer.decode(self.tokens, skip_special_tokens=True)
@@ -452,42 +476,32 @@ class TestRustFrontendE2E(CustomTestCase):
         ) as response:
             self.assertEqual(response.status_code, 400)
         with self.assertRaises(grpc.RpcError) as caught:
-            self.stub.Tokenize(self.pb.TokenizeRequest(text=PROMPT), timeout=30)
-        self.assertEqual(caught.exception.code(), grpc.StatusCode.UNIMPLEMENTED)
-        for option, code in [
-            ({"suffix": "!"}, grpc.StatusCode.UNIMPLEMENTED),
-            ({"n": 0}, grpc.StatusCode.INVALID_ARGUMENT),
-        ]:
-            with self.assertRaises(grpc.RpcError) as caught:
-                list(
-                    self.open_call(
-                        "completion",
-                        self.body("completion", False) | option,
-                        "grpc",
-                    )
-                )
-            self.assertEqual(caught.exception.code(), code)
+            list(self.stub.Generate(self.generate_pb.GenerateRequest(), timeout=30))
+        self.assertEqual(caught.exception.code(), grpc.StatusCode.INVALID_ARGUMENT)
         self.generate("text", False)
 
     def test_concurrent_clients(self):
         # Different prompts make cross-delivery observable, not merely two successes.
         first = self.body("text", False)
-        second = self.body("completion", False) | {"prompt": "The capital of France is"}
+        second = self.body("text", False) | {"text": "The capital of France is"}
         # Distinct forced tokens make cross-delivery observable without depending
         # on identical floating-point results for single vs. batched decoding.
-        for params, word in ((first["sampling_params"], " apple"), (second, " banana")):
+        for params, word in (
+            (first["sampling_params"], " apple"),
+            (second["sampling_params"], " banana"),
+        ):
             token = self.tokenizer.encode(word, add_special_tokens=False)[-1]
             self.assertNotIn(token, self.tokenizer.all_special_ids)
             params["logit_bias"] = {str(token): 100}
         expected = [
             self.generate("text", False, body=first),
-            self.generate("completion", False, "grpc", second),
+            self.generate("text", False, "grpc", second),
         ]
-        self.assertNotEqual(expected[0]["output"], expected[1]["output"][0])
+        self.assertNotEqual(expected[0]["output"], expected[1]["output"])
         with ThreadPoolExecutor(max_workers=2) as pool:
             pending = [
                 pool.submit(self.generate, "text", False, "http", first),
-                pool.submit(self.generate, "completion", False, "grpc", second),
+                pool.submit(self.generate, "text", False, "grpc", second),
             ]
             self.assertEqual([f.result(timeout=40) for f in pending], expected)
 
@@ -543,19 +557,21 @@ class TestRustFrontendE2E(CustomTestCase):
             body["rid"] = f"cancel-{uuid.uuid4().hex}"
             body["sampling_params"].update(max_new_tokens=2048, ignore_eos=True)
             self.assert_cancelled("text", body, transport)
-            # Force a normal token so neither OpenAI choice finishes before cancellation.
-            token = self.tokenizer.encode(" apple", add_special_tokens=False)[-1]
-            self.assertNotIn(token, self.tokenizer.all_special_ids)
-            body = self.body("completion", True) | {
-                "n": 2,
-                "logit_bias": {str(token): 100},
-            }
-            self.assertEqual(
-                self.generate("completion", True, transport, body)["finish_reason"],
-                ["length", "length"],
-            )
-            body["max_tokens"] = 2048
-            self.assert_cancelled("completion", body, transport, choices=2)
+
+        # OpenAI requests remain HTTP-only in api.v1. Force a normal token so
+        # neither choice finishes before cancellation.
+        token = self.tokenizer.encode(" apple", add_special_tokens=False)[-1]
+        self.assertNotIn(token, self.tokenizer.all_special_ids)
+        body = self.body("completion", True) | {
+            "n": 2,
+            "logit_bias": {str(token): 100},
+        }
+        self.assertEqual(
+            self.generate("completion", True, "http", body)["finish_reason"],
+            ["length", "length"],
+        )
+        body["max_tokens"] = 2048
+        self.assert_cancelled("completion", body, "http", choices=2)
 
     def stop_and_assert(self):
         self.process.terminate()
