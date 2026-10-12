@@ -1079,6 +1079,11 @@ class Scheduler(
         if self.draft_worker is not None:
             self.draft_worker.init_attention_backends()
 
+    # Startup capture runs outside the event loops' grad guards. Without this,
+    # code around the forward (e.g. capture tail hooks) records autograd history
+    # into persistent buffers. Plain no_grad, not DynamicGradMode: tensors created
+    # under inference mode cannot be written by the no_grad disagg event loops.
+    @torch.no_grad()
     def init_all_cuda_graphs(self):
         """Capture cuda graphs for all workers."""
         self.tp_worker.init_cuda_graphs()
