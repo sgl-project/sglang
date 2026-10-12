@@ -115,3 +115,30 @@ class RolloutResponse(BaseModel):
 
     inference_time_s: Optional[float] = None
     peak_memory_mb: Optional[float] = None
+
+
+@dataclass
+class InitWeightsUpdateGroupReqInput:
+    master_address: str
+    master_port: int
+    rank_offset: int
+    world_size: int
+    group_name: str
+    backend: str = "nccl"
+
+
+@dataclass
+class UpdateWeightsFromDistributedReqInput:
+    names: list[str]
+    dtypes: list[str]
+    shapes: list[list[int]]
+    group_name: str
+    target_modules: list[str] | None = None
+    weight_update_mode: str | None = None
+    lora_alpha: int | None = None
+    lora_rank: int | None = None
+
+
+@dataclass
+class DestroyWeightsUpdateGroupReqInput:
+    group_name: str

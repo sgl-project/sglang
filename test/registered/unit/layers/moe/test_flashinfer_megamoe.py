@@ -6,6 +6,7 @@ from pathlib import Path
 import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -212,6 +213,114 @@ def test_capture_safe_ue8m0_pack_is_scoped(monkeypatch):
         assert packed.dtype == torch.int32
 
     assert dgm.pack_ue8m0_to_int is original
+
+
+class TestMegaMoeOutputViewCapability(CustomTestCase):
+    def test_unsupported_workspace_view_uses_owning_output(self):
+        """A shared forward signature does not imply backend view support."""
+        import pytest
+
+        with pytest.MonkeyPatch.context() as monkeypatch:
+            module = _load_megamoe_module(monkeypatch)
+            output = torch.arange(4, dtype=torch.bfloat16)
+
+            class Mega:
+                supports_output_view = False
+
+                def forward(self, tensors, *, return_workspace_view=False):
+                    if return_workspace_view:
+                        raise ValueError("workspace views are unsupported")
+                    return output
+
+            mega = Mega()
+            result = module._select_megamoe_forward(mega)(mega, object())
+            self.assertIs(result, output)
+
+
+class TestMegaMoeFp4Reload(CustomTestCase):
+    def test_reload_preserves_load_scales_and_cached_kernel_storage(self):
+        """Reloads must accept raw scales and refresh the live kernel's tensors."""
+        import pytest
+
+        from sglang.srt.layers.utils.common import copy_or_rebind_param
+
+        with pytest.MonkeyPatch.context() as monkeypatch:
+            module = _load_megamoe_module(monkeypatch)
+            fake_common = types.ModuleType("sglang.srt.layers.utils.common")
+            fake_common.copy_or_rebind_param = copy_or_rebind_param
+            monkeypatch.setitem(sys.modules, fake_common.__name__, fake_common)
+            monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+
+            class Mega(torch.nn.Module):
+                def __init__(self, *, bootstrap, fleet_params, weights, backend):
+                    super().__init__()
+                    self.transformed = backend.transformed_weights
+
+                def forward(self, tensors):
+                    return tensors
+
+            def preprocess(weights, **kwargs):
+                return (
+                    (weights.w13.flip(1), weights.w13_scale[..., ::4].to(torch.int32)),
+                    (weights.w2.flip(1), weights.w2_scale[..., ::4].to(torch.int32)),
+                )
+
+            fake_ep = types.ModuleType("flashinfer.moe_ep")
+            for name in (
+                "MoEWeightPack",
+                "BootstrapConfig",
+                "FleetParams",
+                "MegaConfig",
+                "DeepGemmMegaMoeConfig",
+            ):
+                setattr(fake_ep, name, types.SimpleNamespace)
+            fake_ep.MoEEpMegaLayer = Mega
+            fake_ep.preprocess_mega_weights = preprocess
+            monkeypatch.setitem(sys.modules, "flashinfer.moe_ep", fake_ep)
+
+            layer = torch.nn.Module()
+            layer.hidden_size = layer.intermediate_size_per_partition = 128
+            layer.moe_ep_size = layer.num_experts = 8
+            layer.moe_ep_rank = layer.layer_id = 0
+            layer.top_k = 1
+            layer.moe_runner_config = types.SimpleNamespace(swiglu_limit=10.0)
+            for name, shape, dtype in (
+                ("w13_weight", (1, 256, 64), torch.int8),
+                ("w2_weight", (1, 128, 64), torch.int8),
+                ("w13_weight_scale_inv", (1, 256, 4), torch.float32),
+                ("w2_weight_scale_inv", (1, 128, 4), torch.float32),
+            ):
+                layer.register_parameter(
+                    name,
+                    torch.nn.Parameter(
+                        torch.ones(shape, dtype=dtype), requires_grad=False
+                    ),
+                )
+            raw_scales = (layer.w13_weight_scale_inv, layer.w2_weight_scale_inv)
+            raw_ptrs = [scale.data_ptr() for scale in raw_scales]
+            cached = None
+            for value in (1, 2, 4):
+                for scale in raw_scales:
+                    scale.data.copy_(torch.full_like(scale, value, dtype=torch.float32))
+                module.prepare_fp4_moe_weights_for_flashinfer_megamoe(layer)
+                for scale, ptr in zip(raw_scales, raw_ptrs):
+                    self.assertEqual(scale.dtype, torch.float32)
+                    self.assertEqual(scale.shape[-1], 4)
+                    self.assertEqual(scale.data_ptr(), ptr)
+                mega = module.ensure_fp4_moe_layer_for_flashinfer_megamoe(layer)
+                tensors = [tensor for pair in mega.transformed for tensor in pair]
+                if cached is None:
+                    cached = mega
+                    kernel_ptrs = [tensor.data_ptr() for tensor in tensors]
+                self.assertIs(mega, cached)
+                self.assertEqual([tensor.data_ptr() for tensor in tensors], kernel_ptrs)
+                for _, scale in cached.transformed:
+                    torch.testing.assert_close(
+                        scale,
+                        torch.full_like(scale, value, dtype=torch.int32),
+                        rtol=0,
+                        atol=0,
+                    )
 
 
 if __name__ == "__main__":
