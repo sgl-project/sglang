@@ -77,7 +77,7 @@ class TestAscendMlaFiaHicacheBf16(CustomTestCase):
             30,
         ]
 
-    def test_a_gsm8k(self):
+    def test_a_gsm8k_fia(self):
         os.environ["ASCEND_USE_FIA"] = "true"
         for model in self.models:
             with self.subTest(model=model):
