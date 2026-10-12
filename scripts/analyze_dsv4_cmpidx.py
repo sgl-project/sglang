@@ -1098,6 +1098,19 @@ C4DEC_RUNBOOK = (
     "CONTENT:K-SPLIT (kbase differs) | "
     "CONTENT:READ-MISALIGN (kbase same, rdcarry differs) | SAME"
 )
+# The two probe sides live in DIFFERENT key spaces and must be translated before
+# the join:
+#   * ``[C4DEC] idxK`` keys are RATIO-compressed block ids (the probe emits the
+#     hardcoded tail blocks 4382/4383 = ratio-4 blocks);
+#   * ``[IDXK] blkx`` keys are c4-PAGE columns (absolute token block j, entry j
+#     <-> position j*128).
+# A ratio-``r`` block ``b`` covers tokens [b*r, (b+1)*r); a page ``p`` covers
+# [p*128, (p+1)*128); hence page = b*r // 128 (= b//32 for r=4).  Without this
+# translation the join looked up stored page 4383 (absent) and missed real
+# divergences such as page 136.
+C4_PAGE_TOKENS = 128   # a stored c4 page spans 128 absolute tokens
+C4_DEFAULT_RATIO = 4   # c4 compressor ratio when the probe omits ratio=
+
 
 
 def _c4dec_start_min(rec):
@@ -1213,8 +1226,32 @@ def _c4dec_roles(c4_reqs, idxin_rows):
     return miss, hit, "c4dec-start"
 
 
+def _c4dec_ratio(rec):
+    """Compressor ratio of one [C4DEC] row (``ratio=`` field, else 4).
+
+    The [C4DEC] emit does not print ``ratio=`` today, so the c4 default (4) is
+    used; a future probe that adds the field is honored automatically.
+    """
+    try:
+        r = int(rec.get("ratio"))
+    except (TypeError, ValueError):
+        return C4_DEFAULT_RATIO
+    return r if r > 0 else C4_DEFAULT_RATIO
+
+
+def _c4dec_block_page(block, ratio):
+    """ABSOLUTE stored-page id a produced ratio-``ratio`` block ``b`` lands in.
+
+    ``[C4DEC] idxK`` keys are ratio-compressed block ids; ``[IDXK] blkx`` keys are
+    c4-page columns.  A ratio-``r`` block covers tokens ``[b*r, (b+1)*r)`` and a
+    page covers ``[p*128, (p+1)*128)``, so ``page = block*ratio // 128``
+    (ratio=4 -> ``block // 32``: 4382/4383 -> page 136).
+    """
+    return (block * ratio) // C4_PAGE_TOKENS
+
+
 def _c4dec_produced_maps(group):
-    """``{layer: (idxK_by_block, kbase, rdcarry_by_pos)}`` for one request."""
+    """``{layer: (idxK_by_block, kbase, rdcarry_by_pos, ratio)}`` one request."""
     out = {}
     for r in group:
         if not _is_prefill(r):
@@ -1223,7 +1260,7 @@ def _c4dec_produced_maps(group):
         if not idxk:
             continue
         out[_int(r, "layer")] = (
-            idxk, r.get("kbase", ""), _c4dec_rdcarry(r))
+            idxk, r.get("kbase", ""), _c4dec_rdcarry(r), _c4dec_ratio(r))
     return out
 
 
@@ -1241,26 +1278,35 @@ def _c4dec_stored_maps(group):
 
 
 def report_c4dec(rows, idxk_rows=(), idxin_rows=()):
-    """``[C4DEC-VERDICT]`` produced idxK vs stored [IDXK] blkx, per absolute block.
+    """``[C4DEC-VERDICT]`` produced idxK vs stored [IDXK] blkx, per ABSOLUTE page.
 
     produced = the compressor's PRODUCED compressed KV ([C4DEC] ``idxK``);
-    stored   = the POOL content per absolute block ([IDXK] ``blkx[j]``).
+    stored   = the POOL content per absolute page ([IDXK] ``blkx[j]``).
+
+    The two sides use DIFFERENT key spaces: produced idxK keys are ratio-4
+    COMPRESSED-BLOCK ids (the probe emits the hardcoded tail blocks 4382/4383),
+    while stored blkx keys are c4-PAGE columns.  The produced keys are therefore
+    TRANSLATED to the stored-page space (``page = block*ratio // 128``, i.e.
+    ``block//32`` for ratio=4: 4382/4383 -> page 136) BEFORE the join; without
+    this the join looked up stored page 4383 (absent) and missed page 136.
+
     Requests are split by the ``/v1/chat/completions`` boundary and MISS/HIT is
     classified by the REQUEST-BOUNDARY rule the [IDXIN] section uses (``sps==0``
     -> MISS, ``sps>0`` -> HIT, via ``_c4dec_roles``); the [C4DEC] ``start==0``
-    test is only a secondary fallback.  Per shared (layer, absolute block j):
+    test is only a secondary fallback.  Per shared (layer, page):
 
       * produced MISS==HIT but stored MISS!=HIT  -> OUTPUT-SLOT
         (scatter / c4_loc misplacement: the right value lands in the wrong slot)
       * produced MISS!=HIT                       -> CONTENT, sub-split below
       * else (all identical)                     -> SAME
 
-    CONTENT sub-split via [C4DEC] ``kbase`` / ``rdcarry``:
+    ``n_shared`` is counted over the TRANSLATED (page) keys.  CONTENT sub-split
+    via [C4DEC] ``kbase`` / ``rdcarry``:
       kbase differs                          -> CONTENT:K-SPLIT
       kbase same + rdcarry differs           -> CONTENT:READ-MISALIGN (ReadState)
       both same                              -> producer-internal (CONTENT)
     """
-    print("\n== [C4DEC] produced idxK vs stored [IDXK] blkx (absolute block) ==")
+    print("\n== [C4DEC] produced idxK vs stored [IDXK] blkx (absolute page) ==")
     if not rows:
         print("  [C4DEC-VERDICT] no [C4DEC] rows (dump gate off?)")
         print(C4DEC_RUNBOOK)
@@ -1280,6 +1326,19 @@ def report_c4dec(rows, idxk_rows=(), idxin_rows=()):
         return (_c4dec_stored_maps(idxk_groups[i])
                 if 0 <= i < len(idxk_groups) else {})
 
+    def _produced_pages(idxk, ratio):
+        """Produced ``{page: {md5, ...}}`` keyed by the stored-page space.
+
+        Several produced blocks may land in the SAME page (4382 and 4383 both ->
+        page 136), so the per-page produced signature is the SET of their hashes.
+        ``ratio`` comes from the [C4DEC] row (default 4); a future probe with more
+        ``n_keep`` blocks is handled because every produced block is translated.
+        """
+        pages = defaultdict(set)
+        for b, h in idxk.items():
+            pages[_c4dec_block_page(b, ratio)].add(h)
+        return pages
+
     miss_prod = _c4dec_produced_maps(c4_reqs[miss_idx[0]])
     stored_miss = _stored(miss_idx[0])
     hit_prod = [_c4dec_produced_maps(c4_reqs[i]) for i in hit_idx]
@@ -1292,28 +1351,30 @@ def report_c4dec(rows, idxk_rows=(), idxin_rows=()):
     rdcarry_diff = False
     rows_out = []
     for ly in sorted(miss_prod):
-        pm_idxk, pm_kbase, pm_rd = miss_prod[ly]
+        pm_idxk, pm_kbase, pm_rd, pm_ratio = miss_prod[ly]
+        pm_pages = _produced_pages(pm_idxk, pm_ratio)
         sm_map = stored_miss.get(ly, {})
         for hj, hm in enumerate(hit_prod):
             if ly not in hm:
                 continue
-            ph_idxk, ph_kbase, ph_rd = hm[ly]
+            ph_idxk, ph_kbase, ph_rd, ph_ratio = hm[ly]
+            ph_pages = _produced_pages(ph_idxk, ph_ratio)
             if pm_kbase != ph_kbase:
                 kbase_diff = True
             if pm_rd != ph_rd:
                 rdcarry_diff = True
             sh_map = hit_stored[hj].get(ly, {})
-            for j in sorted(set(pm_idxk) & set(ph_idxk)):
+            for page in sorted(set(pm_pages) & set(ph_pages)):
                 n_shared += 1
-                p_same = pm_idxk[j] == ph_idxk[j]
+                p_same = pm_pages[page] == ph_pages[page]
                 if not p_same:
                     produced_same = False
-                s_m = sm_map.get(j)
-                s_h = sh_map.get(j)
+                s_m = sm_map.get(page)
+                s_h = sh_map.get(page)
                 if s_m is not None and s_h is not None and s_m != s_h:
                     stored_diff = True
-                rows_out.append((ly, j, pm_idxk[j], ph_idxk[j],
-                                 s_m, s_h, p_same))
+                rows_out.append((ly, page, sorted(pm_pages[page]),
+                                 sorted(ph_pages[page]), s_m, s_h, p_same))
 
     if not produced_same:
         if kbase_diff:
@@ -1334,7 +1395,7 @@ def report_c4dec(rows, idxk_rows=(), idxin_rows=()):
           f"rdcarry_diff={rdcarry_diff} => {verdict}")
 
     shown = 0
-    for (ly, j, pm, ph, s_m, s_h, p_same) in rows_out:
+    for (ly, page, pm, ph, s_m, s_h, p_same) in rows_out:
         if verdict == "OUTPUT-SLOT":
             keep = (p_same and s_m is not None and s_h is not None
                     and s_m != s_h)
@@ -1344,7 +1405,7 @@ def report_c4dec(rows, idxk_rows=(), idxin_rows=()):
             keep = False
         if not keep:
             continue
-        print(f"  [C4DEC-VERDICT] layer={ly} block={j} prod_miss={pm} "
+        print(f"  [C4DEC-VERDICT] layer={ly} page={page} prod_miss={pm} "
               f"prod_hit={ph} stored_miss={s_m} stored_hit={s_h}")
         shown += 1
         if shown >= MAX_OFFENDER_SHOWN:
@@ -2413,16 +2474,19 @@ def _selftest():
         _RC_B = "[17528=41:cccc,17529=42:dddd]"
 
         def _c4dec(ly, start, kbase, rd, blk_a, blk_b):
+            # Produced idxK keys are the probe's hardcoded ratio-4 tail blocks
+            # 4382/4383 (BOTH land in stored page 136 after the translation).
             idxk = (f"[n_raw=2,n_keep=2,"
-                    f"10:{blk_a}:v0=1.0e+00:sum=2.0e+00:am=1.0e+00,"
-                    f"11:{blk_b}:v0=1.0e+00:sum=2.0e+00:am=1.0e+00]")
+                    f"4382:{blk_a}:v0=1.0e+00:sum=2.0e+00:am=1.0e+00,"
+                    f"4383:{blk_b}:v0=1.0e+00:sum=2.0e+00:am=1.0e+00]")
             return (f"[C4DEC] layer={ly} idx=1 start=[{start}] "
                     f"kbase={kbase} rdcarry={rd} idxK={idxk}")
 
-        def _idxk_line(ly, h10, h11):
-            blkx = f"['10:{h10}', '11:{h11}']"
+        def _idxk_line(ly, h136, h137):
+            # Stored [IDXK] keys are c4-PAGE columns (136 = tokens 17408..17535).
+            blkx = f"['136:{h136}', '137:{h137}']"
             return (f"[IDXK] layer={ly} mode=EXTEND logical=ll "
-                    f"blkx={blkx} ptab=['10:7', '11:8']")
+                    f"blkx={blkx} ptab=['136:7', '137:8']")
 
         def _parse_src(src_lines):
             fd5, p5 = tempfile.mkstemp(suffix=".log", prefix="cmpidx_selftest_")
@@ -2437,7 +2501,7 @@ def _selftest():
                     pass
 
         _chat = "/v1/chat/completions"
-        # H1 OUTPUT-SLOT: produced MISS==HIT, stored MISS!=HIT at block 10.
+        # H1 OUTPUT-SLOT: produced MISS==HIT, stored MISS!=HIT at page 136.
         c4dec_slot = [
             _chat,
             _c4dec(2, 0, _KB_A, _RC_A, "aaaa", "bbbb"),
@@ -2464,9 +2528,34 @@ def _selftest():
             _c4dec(2, 17536, _KB_A, _RC_B, "cccc", "bbbb"),
             _idxk_line(2, "p111", "p222"),
         ]
+        # H5 (page-136 mapping): produced block 4383 -> page 136.  The two
+        #     requests produce the SAME 4382/4383 hashes but stored page 136
+        #     differs -> OUTPUT-SLOT.  BEFORE the block->page translation the join
+        #     looked up stored page 4383 (absent) so stored_diff stayed False and
+        #     the verdict was wrongly SAME.
+        c4dec_page136 = [
+            _chat,
+            _c4dec(2, 0, _KB_A, _RC_A, "same4382", "same4383"),
+            _idxk_line(2, "p111", "p222"),
+            _chat,
+            _c4dec(2, 17536, _KB_A, _RC_A, "same4382", "same4383"),
+            _idxk_line(2, "p333", "p222"),
+        ]
+        # H6 (produced differs on page 136): same 4383 key, DIFFERENT produced
+        #     hash, kbase+rdcarry identical -> CONTENT (producer-internal).
+        c4dec_prod_diff = [
+            _chat,
+            _c4dec(2, 0, _KB_A, _RC_A, "aaaa", "same4383"),
+            _idxk_line(2, "p111", "p222"),
+            _chat,
+            _c4dec(2, 17536, _KB_A, _RC_A, "cccc", "same4383"),
+            _idxk_line(2, "p111", "p222"),
+        ]
         c4slot_out = _run_main(c4dec_slot)
         c4ksplit_out = _run_main(c4dec_ksplit)
         c4rmis_out = _run_main(c4dec_rmis)
+        c4page136_out = _run_main(c4dec_page136)
+        c4proddiff_out = _run_main(c4dec_prod_diff)
         # H4: the EXACT reported repro -- FIVE ``/v1/chat/completions`` requests
         #     (boundary line AFTER each request's rows -> 0-based indices); req0..3
         #     are cache-MISS (sps=0) and req4 the cache-HIT (sps=16384).  The
@@ -2616,7 +2705,7 @@ def _selftest():
              and "=> OUTPUT-SLOT" in c4slot_out
              and "produced_same=True" in c4slot_out
              and "stored_diff=True" in c4slot_out
-             and "block=10" in c4slot_out),
+             and "page=136" in c4slot_out),
             ("[C4DEC] produced differs + kbase differs -> CONTENT:K-SPLIT",
              "=> CONTENT:K-SPLIT" in c4ksplit_out
              and "produced_same=False" in c4ksplit_out
@@ -2627,6 +2716,17 @@ def _selftest():
              and "produced_same=False" in c4rmis_out
              and "kbase_diff=False" in c4rmis_out
              and "rdcarry_diff=True" in c4rmis_out),
+            ("[C4DEC] block 4383 -> page 136: same produced + stored differs"
+             " -> OUTPUT-SLOT",
+             "=> OUTPUT-SLOT" in c4page136_out
+             and "n_shared=1" in c4page136_out
+             and "page=136" in c4page136_out
+             and "stored_diff=True" in c4page136_out),
+            ("[C4DEC] produced differs on page 136 -> CONTENT",
+             "=> CONTENT" in c4proddiff_out
+             and "=> CONTENT:K-SPLIT" not in c4proddiff_out
+             and "=> CONTENT:READ-MISALIGN" not in c4proddiff_out
+             and "produced_same=False" in c4proddiff_out),
             ("[C4DEC] start-free MISS classified by request boundary"
              " -> miss 0-3 / hit 4",
              "[C4DEC-VERDICT] miss_req=[0, 1, 2, 3] hit_req=[4]" in h4_out
