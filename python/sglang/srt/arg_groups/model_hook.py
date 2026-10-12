@@ -97,10 +97,7 @@ def _probe_wo_a_weight_dtype(model_config: Any, download_dir: str | None) -> str
         from transformers.utils.hub import cached_file
 
         model_path = model_config.model_path
-        revision = (
-            getattr(model_config.hf_config, "_commit_hash", None)
-            or model_config.revision
-        )
+        revision = model_config.revision
         index_path = cached_file(
             model_path,
             "model.safetensors.index.json",
@@ -643,6 +640,7 @@ def handle_model_specific_adjustments(server_args: Any):
         accepted_backends = (
             "trtllm_mha",
             "triton",
+            "fa4",
             "ascend",
             "intel_xpu",
             "intel_amx",
@@ -651,7 +649,7 @@ def handle_model_specific_adjustments(server_args: Any):
         assert (
             prefill_backend in accepted_backends and decode_backend in accepted_backends
         ), (
-            "Gemma4 only supports trtllm_mha, triton, ascend, intel_xpu, intel_amx, or "
+            "Gemma4 only supports trtllm_mha, triton, fa4, ascend, intel_xpu, intel_amx, or "
             f"aiter attention backend, got prefill={prefill_backend}, decode={decode_backend}"
         )
 
