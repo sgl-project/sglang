@@ -35,7 +35,11 @@ def dsa_dcp_head_groups(num_q_heads: int) -> int:
 
 
 class DcpPageTableCache(msgspec.Struct):
-    """Rank-local page table of the latest top-k, reused by shared-top-k layers."""
+    """Rank-local page table of the latest top-k, reused by shared-top-k layers.
+
+    NOTE(vincentzed): 57 of GLM's 78 layers reuse the previous layer's top-k
+    tensor; remapping once per fresh top-k cuts 78 launches/step to 21.
+    """
 
     metadata: object = None
     layer_id: int = -1
