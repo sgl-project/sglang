@@ -84,6 +84,11 @@ _is_npu = is_npu()
 _is_cpu = is_cpu()
 _is_xpu = is_xpu()
 _is_musa = is_musa()
+# Under CUDA-graph capture, stage aiter custom all-gather / reduce-scatter inputs
+# through the pre-registered IPC pool instead of registering graph-pool tensors:
+# the registered path makes peers read stale data over IPC on replay (garbage
+# rows / NaN under DP attention + TP MoE on MI355X). Set to 0 to restore it.
+_AITER_CAPTURE_COPY_IN = os.environ.get("SGLANG_AITER_CAPTURE_COPY_IN", "0") == "1"
 
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 
@@ -485,6 +490,28 @@ class GroupCoordinator:
 
         self.ca_comm: Optional[Any] = None
         self.qr_comm: Optional[QuickAllReduce] = None
+
+        self.pcie_ipc_comm: Optional[Any] = None
+        from sglang.srt.distributed.device_communicators.pcie_ipc_ar import (
+            PcieIpcCommunicator,
+            eligible_group,
+        )
+
+        if eligible_group(
+            group_name=group_name,
+            world_size=self.world_size,
+            deterministic=self._deterministic_collectives_enabled(),
+        ):
+            try:
+                # The IPC handshake needs the CUDA (NCCL) group, not the CPU one.
+                # Autotuning is the other way round: it rendezvouses on the host.
+                self.pcie_ipc_comm = PcieIpcCommunicator(
+                    group=self.device_group,
+                    device=self.device,
+                    cpu_group=self.cpu_group,
+                )
+            except Exception as e:
+                logger.warning(f"Setup FlashInfer PCIe-IPC allreduce failed with {e}.")
         if use_custom_allreduce and self.world_size > 1:
             # Initialize a custom fast all-reduce implementation.
             try:
@@ -944,6 +971,16 @@ class GroupCoordinator:
             and self.ca_comm.should_custom_ar(input_)
         ):
             return "ca"
+        # After ``ca``: the PCIe-IPC kernels are for hosts where no fabric-specific
+        # backend applies. They do not probe for NVLink, so on a host that has it
+        # this ordering is what keeps the faster backend in front of them.
+        if (
+            self.pcie_ipc_comm is not None
+            and not self.pcie_ipc_comm.disabled
+            and not should_use_pymscclpp_allreduce
+            and self.pcie_ipc_comm.should_pcie_ipc_ar(input_)
+        ):
+            return "pcie_ipc"
         if (
             self.qr_comm is not None
             and not self.qr_comm.disabled
@@ -1025,6 +1062,8 @@ class GroupCoordinator:
         elif outplace_all_reduce_method == "pymscclpp":
             assert not pymscclpp_comm.disabled
             out = pymscclpp_comm.all_reduce(input_)
+        elif outplace_all_reduce_method == "pcie_ipc":
+            return self.pcie_ipc_comm.pcie_ipc_all_reduce(input_)
         elif outplace_all_reduce_method == "pynccl":
             with pynccl_comm.change_state(enable=True):
                 out = pynccl_comm.outplace_all_reduce(input_)
@@ -1156,7 +1195,7 @@ class GroupCoordinator:
             return False
         if getattr(ca_comm, "_IS_CAPTURING", False):
             if torch.cuda.is_current_stream_capturing():
-                if envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get():
+                if envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get() or _AITER_CAPTURE_COPY_IN:
                     ca_comm.reduce_scatter(input, output, registered=False)
                 else:
                     ca_comm.reduce_scatter(input, output, registered=True)
@@ -1275,7 +1314,10 @@ class GroupCoordinator:
         ):
             if getattr(ca_comm, "_IS_CAPTURING", False):
                 if torch.cuda.is_current_stream_capturing():
-                    if envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get():
+                    if (
+                        envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
+                        or _AITER_CAPTURE_COPY_IN
+                    ):
                         ca_comm.all_gather_unreg(input, out=output, dim=0)
                     else:
                         ca_comm.all_gather_reg(input, out=output, dim=0)
@@ -2059,6 +2101,11 @@ class GroupCoordinator:
         return tensor
 
     def destroy(self):
+        # Must precede destroy_process_group(): FlashInfer's workspace
+        # teardown collectives on the group it was built with.
+        if self.pcie_ipc_comm is not None:
+            self.pcie_ipc_comm.destroy()
+            self.pcie_ipc_comm = None
         if self.device_group is not None:
             torch.distributed.destroy_process_group(self.device_group)
             self.device_group = None
@@ -2338,8 +2385,9 @@ def get_default_distributed_backend(device: str) -> str:
     # ``from ... import current_platform``) so each call resolves through the
     # platforms package's lazy ``__getattr__`` and picks up runtime overrides
     # of ``_current_platform`` (e.g. in tests).
-    if device == platforms.current_platform.device_type:
-        return platforms.current_platform.get_torch_distributed_backend_str()
+    platform = platforms.current_platform
+    if device in (platform.device_type, platform.device_name):
+        return platform.get_torch_distributed_backend_str()
     return _DEVICE_TO_DISTRIBUTED_BACKEND.get(device, "gloo")
 
 
@@ -2600,12 +2648,14 @@ def initialize_model_parallel(
         raise RuntimeError(
             f"decode_context_parallel_size ({decode_context_parallel_size}) must be >= 1"
         )
-    if decode_context_parallel_size > 1 and not (is_hip() or is_cuda()):
+    if decode_context_parallel_size > 1 and not (
+        is_hip() or is_cuda() or _is_npu or _is_xpu
+    ):
         raise RuntimeError(
             "Decode context parallel (decode_context_parallel_size > 1) is "
-            "currently only supported on the AMD HIP platform or CUDA platform, but got "
-            f"decode_context_parallel_size ({decode_context_parallel_size}) "
-            "on a non-HIP or non-CUDA platform."
+            "currently only supported on the AMD HIP, CUDA, NPU, or Intel XPU "
+            "platform, but got decode_context_parallel_size "
+            f"({decode_context_parallel_size}) on an unsupported platform."
         )
     if tensor_model_parallel_size % decode_context_parallel_size != 0:
         raise RuntimeError(
@@ -2760,7 +2810,10 @@ def initialize_model_parallel(
             get_world_group().local_rank,
             backend,
             use_pynccl=SYNC_TOKEN_IDS_ACROSS_TP or enable_symm_mem,
-            use_custom_allreduce=False,
+            # Attention TP can be a derived subgroup of the full TP group.
+            # Inherit the global policy and let per-group capability detection
+            # select a custom communicator or fall back.
+            use_custom_allreduce=None,
             use_torch_symm_mem_allreduce=False,
             use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
             group_name="attention_tp",

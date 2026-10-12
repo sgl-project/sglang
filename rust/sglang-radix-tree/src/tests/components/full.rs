@@ -8,6 +8,10 @@ fn core() -> UnifiedTreeCore<Vec<i64>> {
     UnifiedTreeCore::new(CacheInitParams::default(), vec![FULL])
 }
 
+fn dec_params(lock: IncLockRefResult) -> DecLockRefParams {
+    lock.to_dec_params()
+}
+
 // Raw seeding for states set_value rejects: mid-split (key trimmed before the value
 // splits) and present-but-empty semantics pins.
 fn set_value_no_check<K: ChildKeyType>(
@@ -66,6 +70,7 @@ fn match_params(key: &Vec<i64>) -> MatchPrefixParams<'_, Vec<i64>> {
 
 fn insert(tc: &mut UnifiedTreeCore<Vec<i64>>, key: &Vec<i64>, value: &[i64]) {
     tc.insert(&crate::unified_tree_core::InsertParams {
+        rotation_base: None,
         key,
         namespace: Default::default(),
         value: Tensor::from_slice(value),
@@ -73,7 +78,7 @@ fn insert(tc: &mut UnifiedTreeCore<Vec<i64>>, key: &Vec<i64>, value: &[i64]) {
         prev_prefix_len: 0,
         swa_evicted_seqlen: 0,
         swa_branching_seqlen: None,
-        chunked: false,
+        inserted_len: 0,
         priority: 0,
         session_id: None,
         track_adopted_ranges: false,
@@ -405,6 +410,10 @@ fn host_drive_reclaims_coexisting_host_values_while_sparing_the_device_leaf() {
     .expect("live test node");
     tc.commit_backup(leaf_handle, Tensor::from_slice(&[22i64]), HashMap::new())
         .expect("live test node");
+    for handle in [tc.arena.node(parent).id, leaf_handle] {
+        tc.mark_write_through_pending(vec![handle], handle).unwrap();
+        tc.finish_write_through(vec![handle], handle).unwrap();
+    }
     assert!(tc.evictable_host_leaves.is_empty());
 
     let (mut tr, mut df, mut hf) = (tracker(), frees(), frees());
@@ -423,6 +432,118 @@ fn host_drive_reclaims_coexisting_host_values_while_sparing_the_device_leaf() {
 }
 
 #[test]
+fn host_reclaim_keeps_insertion_order_across_calls_and_rebackup() {
+    let mut tc = write_back_core();
+    let mut handles = Vec::new();
+    for token in 1..=3i64 {
+        let key = vec![token];
+        insert(&mut tc, &key, &[token + 100]);
+        let handle = tc.match_prefix(&match_params(&key)).best_match_node_id;
+        tc.commit_backup(handle, Tensor::from_slice(&[token + 1000]), HashMap::new())
+            .expect("live test node");
+        tc.mark_write_through_pending(vec![handle], handle).unwrap();
+        tc.finish_write_through(vec![handle], handle).unwrap();
+        handles.push(handle);
+    }
+
+    for expected_host_slot in [1001, 1002, 1003, 2001] {
+        let step = tc.drive_host_eviction(FULL, 1);
+        assert_eq!(step.tracker[&FULL], 1);
+        assert!(step.device_frees.is_empty());
+        assert_eq!(step.host_frees[&FULL].len(), 1);
+        assert_eq!(
+            step.host_frees[&FULL][0].int64_value(&[0]),
+            expected_host_slot
+        );
+        if expected_host_slot == 1001 {
+            // A new host copy of the reclaimed slot joins behind the surviving
+            // duplicates. Refreshing another settled member must not move it.
+            tc.commit_backup(handles[0], Tensor::from_slice(&[2001i64]), HashMap::new())
+                .unwrap();
+            tc.mark_write_through_pending(vec![handles[0]], handles[0])
+                .unwrap();
+            tc.finish_write_through(vec![handles[0]], handles[0])
+                .unwrap();
+            tc.mark_write_through_pending(vec![handles[1]], handles[1])
+                .unwrap();
+            tc.finish_write_through(vec![handles[1]], handles[1])
+                .unwrap();
+        }
+        tc.sanity_check(&[], &[]);
+    }
+    assert!(tc.full_coexisting_host_nodes.iter().next().is_none());
+}
+
+#[test]
+fn host_reclaim_orders_pending_internal_split_fragments_by_ack() {
+    let mut tc = write_back_core();
+    insert(&mut tc, &vec![1, 2, 3, 4], &[10, 11, 12, 13]);
+    insert(&mut tc, &vec![1, 2, 3, 4, 5], &[10, 11, 12, 13, 14]);
+    insert(&mut tc, &vec![7, 8], &[17, 18]);
+    let a = tc
+        .match_prefix(&match_params(&vec![1, 2, 3, 4]))
+        .best_match_node_id;
+    let b = tc
+        .match_prefix(&match_params(&vec![7, 8]))
+        .best_match_node_id;
+    for (handle, slots) in [(a, vec![20i64, 21, 22, 23]), (b, vec![27, 28])] {
+        tc.commit_backup(handle, Tensor::from_slice(&slots), HashMap::new())
+            .unwrap();
+        tc.inc_lock_ref(handle, ComponentSet::EMPTY).unwrap();
+        tc.mark_write_through_pending(vec![handle], handle).unwrap();
+    }
+    // Incremental SWA backup can submit an unbacked Full ancestor
+    // asynchronously under write_back; matching can split it before the ack.
+    let (prefix_idx, action) = tc.split_node_(tc.arena.resolve(a).unwrap(), 2);
+    let published_a = match action {
+        Some(CacheAction::ReplaceWriteThroughOnNodeSplit {
+            ack_id,
+            old_node_id,
+            new_node_id,
+            new_child_node_id,
+        }) => {
+            assert_eq!((ack_id, old_node_id, new_child_node_id), (a, a, a));
+            assert_eq!(new_node_id, tc.arena.node(prefix_idx).id);
+            vec![new_node_id, new_child_node_id]
+        }
+        _ => panic!("expected pending-backup split publication"),
+    };
+    tc.sanity_check(&[(a as i64, a), (b as i64, b)], &[]);
+
+    // The controller publishes each FIFO ack's fragments ancestors first,
+    // then releases the original node's lock (which also covers its prefix).
+    for (ack, published) in [(a, published_a), (b, vec![b])] {
+        tc.finish_write_through(published, ack).unwrap();
+        tc.dec_lock_ref(
+            ack,
+            &DecLockRefParams {
+                node_id: Some(ack),
+                ..Default::default()
+            },
+            false,
+        )
+        .unwrap();
+    }
+    assert!(!tc.evictable_device_leaves.contains(prefix_idx));
+    assert!(
+        !tc.arena
+            .node(tc.arena.resolve(a).unwrap())
+            .children
+            .is_empty()
+    );
+    for expected in [[20i64, 21], [22, 23], [27, 28]] {
+        let step = tc.drive_host_eviction(FULL, 1);
+        assert_eq!(step.tracker[&FULL], 2);
+        assert!(step.device_frees.is_empty());
+        assert_eq!(step.host_frees[&FULL].len(), 1);
+        let slots = &step.host_frees[&FULL][0];
+        assert_eq!([slots.int64_value(&[0]), slots.int64_value(&[1])], expected);
+        tc.sanity_check(&[], &[]);
+    }
+    assert!(tc.full_coexisting_host_nodes.iter().next().is_none());
+}
+
+#[test]
 fn host_drive_spares_coexisting_host_values_under_an_in_flight_transfer() {
     let mut tc = write_back_core();
     insert(&mut tc, &vec![1, 2], &[10, 11]);
@@ -431,8 +552,12 @@ fn host_drive_spares_coexisting_host_values_under_an_in_flight_transfer() {
         .best_match_node_id;
     tc.commit_backup(handle, Tensor::from_slice(&[20i64, 21]), HashMap::new())
         .expect("live test node");
+    // commit_backup precedes the controller's pending marker; membership is
+    // born only when the transfer is acknowledged, not in this short gap.
+    assert!(tc.full_coexisting_host_nodes.iter().next().is_none());
     tc.mark_write_through_pending(vec![handle], /* ack_id = */ handle)
         .expect("live test node");
+    assert!(tc.full_coexisting_host_nodes.iter().next().is_none());
 
     let (mut tr, mut df, mut hf) = (tracker(), frees(), frees());
     accumulate_step(
@@ -450,6 +575,10 @@ fn host_drive_spares_coexisting_host_values_under_an_in_flight_transfer() {
 
     tc.finish_write_through(vec![handle], handle)
         .expect("live test node");
+    assert!(
+        tc.full_coexisting_host_nodes
+            .contains(tc.arena.resolve(handle).unwrap())
+    );
     accumulate_step(
         tc.drive_host_eviction(FULL, /* num_tokens = */ 2),
         &mut tr,
@@ -469,6 +598,7 @@ fn host_drive_spares_coexisting_host_values_under_an_in_flight_transfer() {
 fn host_drive_is_a_noop_without_host_leaves() {
     let mut tc = core();
     tc.insert(&crate::unified_tree_core::InsertParams {
+        rotation_base: None,
         key: &vec![1, 2],
         namespace: Default::default(),
         value: Tensor::from_slice(&[10i64, 11]),
@@ -476,7 +606,7 @@ fn host_drive_is_a_noop_without_host_leaves() {
         prev_prefix_len: 0,
         swa_evicted_seqlen: 0,
         swa_branching_seqlen: None,
-        chunked: false,
+        inserted_len: 0,
         priority: 0,
         session_id: None,
         track_adopted_ranges: false,
@@ -735,11 +865,7 @@ fn lock_round_trips_on_a_root_anchor_are_noops() {
     assert_eq!(tc.arena.device_lock_ref(root, FULL), 1);
     tc.dec_lock_ref(
         tc.arena.node(root).id,
-        /* params = */
-        &DecLockRefParams {
-            skipped_lock_components: ComponentSet::EMPTY,
-            ..Default::default()
-        },
+        /* params = */ &result.to_dec_params(),
         /* skip_swa = */ false,
     )
     .expect("live test node");
@@ -774,6 +900,7 @@ fn lock_walks_stop_at_the_root_of_a_salted_chain() {
         tc.arena.node(n1).id,
         /* params = */
         &DecLockRefParams {
+            node_id: Some(tc.arena.node(n1).id),
             skipped_lock_components: ComponentSet::EMPTY,
             ..Default::default()
         },
@@ -816,6 +943,7 @@ fn lock_walks_treat_a_present_but_empty_value_as_device_on() {
         tc.arena.node(n1).id,
         /* params = */
         &DecLockRefParams {
+            node_id: Some(tc.arena.node(n1).id),
             skipped_lock_components: ComponentSet::EMPTY,
             ..Default::default()
         },
@@ -838,6 +966,7 @@ fn dec_lock_ref_unlocks_and_restores_sizes() {
         tc.arena.node(n2).id,
         /* params = */
         &DecLockRefParams {
+            node_id: Some(tc.arena.node(n2).id),
             skipped_lock_components: ComponentSet::EMPTY,
             ..Default::default()
         },
@@ -892,6 +1021,7 @@ fn dec_lock_ref_replays_the_skip_set() {
         .inc_lock_ref(tc.arena.node(n3).id, ComponentSet::EMPTY)
         .expect("live test node");
     let params = DecLockRefParams {
+        node_id: Some(tc.arena.node(n3).id),
         skipped_lock_components: result.skipped_lock_components,
         ..Default::default()
     };
@@ -963,6 +1093,7 @@ fn temp_lock_counts_the_evicted_anchor_and_mirrors_on_release() {
     assert_eq!(tc.arena.device_lock_ref(a, FULL), 2);
     // Each release takes back exactly its own refs.
     let temp_params = DecLockRefParams {
+        node_id: Some(tc.arena.node(anchor).id),
         skipped_lock_components: temp_lock.skipped_lock_components,
         ..Default::default()
     };
@@ -976,6 +1107,7 @@ fn temp_lock_counts_the_evicted_anchor_and_mirrors_on_release() {
     assert_eq!(tc.arena.device_lock_ref(y, FULL), 1);
     assert_eq!(tc.arena.device_lock_ref(a, FULL), 1);
     let second_params = DecLockRefParams {
+        node_id: Some(tc.arena.node(anchor).id),
         skipped_lock_components: second_lock.skipped_lock_components,
         ..Default::default()
     };
@@ -1023,6 +1155,7 @@ fn dec_lock_ref_panics_on_double_release() {
         tc.arena.node(n2).id,
         /* params = */
         &DecLockRefParams {
+            node_id: Some(tc.arena.node(n2).id),
             skipped_lock_components: ComponentSet::EMPTY,
             ..Default::default()
         },
@@ -1033,6 +1166,7 @@ fn dec_lock_ref_panics_on_double_release() {
         tc.arena.node(n2).id,
         /* params = */
         &DecLockRefParams {
+            node_id: Some(tc.arena.node(n2).id),
             skipped_lock_components: ComponentSet::EMPTY,
             ..Default::default()
         },
@@ -1051,6 +1185,7 @@ fn dec_lock_ref_with_skip_swa_still_releases_full() {
         tc.arena.node(n2).id,
         /* params = */
         &DecLockRefParams {
+            node_id: Some(tc.arena.node(n2).id),
             skipped_lock_components: ComponentSet::EMPTY,
             ..Default::default()
         },
@@ -1073,6 +1208,7 @@ fn nested_locks_release_pairwise() {
         tc.arena.node(n2).id,
         /* params = */
         &DecLockRefParams {
+            node_id: Some(tc.arena.node(n2).id),
             skipped_lock_components: ComponentSet::EMPTY,
             ..Default::default()
         },
@@ -1087,6 +1223,7 @@ fn nested_locks_release_pairwise() {
         tc.arena.node(n2).id,
         /* params = */
         &DecLockRefParams {
+            node_id: Some(tc.arena.node(n2).id),
             skipped_lock_components: ComponentSet::EMPTY,
             ..Default::default()
         },
@@ -1108,6 +1245,7 @@ fn dec_lock_ref_panics_on_an_unlocked_node() {
         tc.arena.node(n2).id,
         /* params = */
         &DecLockRefParams {
+            node_id: Some(tc.arena.node(n2).id),
             skipped_lock_components: ComponentSet::EMPTY,
             ..Default::default()
         },
@@ -1180,6 +1318,7 @@ fn dec_lock_ref_panics_on_protected_underflow() {
         tc.arena.node(n2).id,
         /* params = */
         &DecLockRefParams {
+            node_id: Some(tc.arena.node(n2).id),
             skipped_lock_components: ComponentSet::EMPTY,
             ..Default::default()
         },
@@ -1225,6 +1364,11 @@ fn inc_host_lock_ref_pins_the_backuped_anchor() {
         .inc_host_lock_ref(tc.arena.node(node).id)
         .expect("live test node");
     assert_eq!(result.delta, None);
+    assert!(
+        result
+            .component_host_lock_uuids
+            .contains_key(&(FULL.idx() as u8))
+    );
     assert_eq!(tc.arena.host_lock_ref(node, FULL), 1);
     // The pinned anchor leaves the H-leaf set; the device tier is untouched.
     assert!(!tc.evictable_host_leaves.contains(node));
@@ -1297,9 +1441,23 @@ fn host_lock_round_trips_on_a_root_anchor_are_noops() {
         .expect("live test node");
     assert_eq!(result.delta, None);
     assert_eq!(tc.arena.host_lock_ref(root, FULL), 0);
-    tc.dec_host_lock_ref(tc.arena.node(root).id, &DecLockRefParams::default())
+    tc.dec_host_lock_ref(tc.arena.node(root).id, &dec_params(result))
         .expect("live test node");
     assert_eq!(tc.arena.host_lock_ref(root, FULL), 0);
+}
+
+#[test]
+fn write_back_root_host_lock_round_trips_without_a_parent_boundary() {
+    let mut tc = write_back_core();
+    let root = tc.arena.root();
+    let baseline = tc.arena.host_lock_ref(root, FULL);
+    let root_handle = tc.arena.node(root).id;
+    let lock = tc.inc_host_lock_ref(root_handle).expect("live root node");
+    let params = dec_params(lock);
+    assert_eq!(tc.arena.host_lock_ref(root, FULL), baseline + 1);
+    tc.dec_host_lock_ref(root_handle, &params)
+        .expect("live root node");
+    assert_eq!(tc.arena.host_lock_ref(root, FULL), baseline);
 }
 
 #[test]
@@ -1320,9 +1478,11 @@ fn dec_host_lock_ref_unpins_and_restores_the_h_leaf_set() {
     let mut tc = core();
     let node = host_lock_anchor(&mut tc);
     tc.component_state_mut(FULL).evictable_size = 7;
-    tc.inc_host_lock_ref(tc.arena.node(node).id)
-        .expect("live test node");
-    tc.dec_host_lock_ref(tc.arena.node(node).id, &DecLockRefParams::default())
+    let params = dec_params(
+        tc.inc_host_lock_ref(tc.arena.node(node).id)
+            .expect("live test node"),
+    );
+    tc.dec_host_lock_ref(tc.arena.node(node).id, &params)
         .expect("live test node");
     assert_eq!(tc.arena.host_lock_ref(node, FULL), 0);
     assert!(tc.evictable_host_leaves.contains(node));
@@ -1335,8 +1495,14 @@ fn dec_host_lock_ref_unpins_and_restores_the_h_leaf_set() {
 fn dec_host_lock_ref_on_an_unlocked_anchor_is_a_noop() {
     let mut tc = core();
     let node = host_lock_anchor(&mut tc);
-    tc.dec_host_lock_ref(tc.arena.node(node).id, &DecLockRefParams::default())
-        .expect("live test node");
+    tc.dec_host_lock_ref(
+        tc.arena.node(node).id,
+        &DecLockRefParams {
+            node_id: Some(tc.arena.node(node).id),
+            ..Default::default()
+        },
+    )
+    .expect("live test node");
     assert_eq!(tc.arena.host_lock_ref(node, FULL), 0);
 }
 
@@ -1345,10 +1511,12 @@ fn dec_host_lock_ref_keeps_the_counter_when_the_host_value_is_gone() {
     // A host-evicted anchor keeps its pin count under write-through.
     let mut tc = core();
     let node = host_lock_anchor(&mut tc);
-    tc.inc_host_lock_ref(tc.arena.node(node).id)
-        .expect("live test node");
+    let params = dec_params(
+        tc.inc_host_lock_ref(tc.arena.node(node).id)
+            .expect("live test node"),
+    );
     let _ = tc.arena.take_host_value(node, FULL);
-    tc.dec_host_lock_ref(tc.arena.node(node).id, &DecLockRefParams::default())
+    tc.dec_host_lock_ref(tc.arena.node(node).id, &params)
         .expect("live test node");
     assert_eq!(tc.arena.host_lock_ref(node, FULL), 1);
 }
@@ -1357,9 +1525,11 @@ fn dec_host_lock_ref_keeps_the_counter_when_the_host_value_is_gone() {
 fn host_lock_round_trip_under_write_back_is_a_pure_counter() {
     let mut tc = write_back_core();
     let (_n1, n2) = lock_chain(&mut tc);
-    tc.inc_host_lock_ref(tc.arena.node(n2).id)
-        .expect("live test node");
-    tc.dec_host_lock_ref(tc.arena.node(n2).id, &DecLockRefParams::default())
+    let params = dec_params(
+        tc.inc_host_lock_ref(tc.arena.node(n2).id)
+            .expect("live test node"),
+    );
+    tc.dec_host_lock_ref(tc.arena.node(n2).id, &params)
         .expect("live test node");
     assert_eq!(tc.arena.host_lock_ref(n2, FULL), 0);
     let state = tc.component_state(FULL);
@@ -1384,14 +1554,11 @@ fn acquire_host_arm_updates_the_h_leaf_set_without_the_dispatcher() {
 fn release_host_arm_updates_the_h_leaf_set_without_the_dispatcher() {
     let mut tc = core();
     let node = host_lock_anchor(&mut tc);
-    tc.inc_host_lock_ref(tc.arena.node(node).id)
-        .expect("live test node");
-    FullComponent.release_component_lock(
-        &mut tc,
-        node,
-        &DecLockRefParams::default(),
-        /* lock_host = */ true,
+    let params = dec_params(
+        tc.inc_host_lock_ref(tc.arena.node(node).id)
+            .expect("live test node"),
     );
+    FullComponent.release_component_lock(&mut tc, node, &params, /* lock_host = */ true);
     assert!(tc.evictable_host_leaves.contains(node));
 }
 
@@ -1399,15 +1566,19 @@ fn release_host_arm_updates_the_h_leaf_set_without_the_dispatcher() {
 fn nested_host_locks_release_pairwise() {
     let mut tc = core();
     let node = host_lock_anchor(&mut tc);
-    tc.inc_host_lock_ref(tc.arena.node(node).id)
-        .expect("live test node");
-    tc.inc_host_lock_ref(tc.arena.node(node).id)
-        .expect("live test node");
-    tc.dec_host_lock_ref(tc.arena.node(node).id, &DecLockRefParams::default())
+    let first_params = dec_params(
+        tc.inc_host_lock_ref(tc.arena.node(node).id)
+            .expect("live test node"),
+    );
+    let second_params = dec_params(
+        tc.inc_host_lock_ref(tc.arena.node(node).id)
+            .expect("live test node"),
+    );
+    tc.dec_host_lock_ref(tc.arena.node(node).id, &second_params)
         .expect("live test node");
     assert_eq!(tc.arena.host_lock_ref(node, FULL), 1);
     assert!(!tc.evictable_host_leaves.contains(node));
-    tc.dec_host_lock_ref(tc.arena.node(node).id, &DecLockRefParams::default())
+    tc.dec_host_lock_ref(tc.arena.node(node).id, &first_params)
         .expect("live test node");
     assert_eq!(tc.arena.host_lock_ref(node, FULL), 0);
     assert!(tc.evictable_host_leaves.contains(node));
@@ -2287,14 +2458,14 @@ fn redistribute_preserves_preexisting_parent_slot_value() {
 }
 
 #[test]
-fn redistribute_does_not_copy_host_lock_ref() {
+fn redistribute_copies_host_lock_ref() {
     let mut tc = core();
     let (parent, child) = nodes(&mut tc);
     tc.arena
         .node_mut(child)
         .set_lock_ref_(ValueSlotIdx::host(FULL), 5);
     FullComponent.redistribute_on_node_split(&mut tc, parent, child);
-    assert_eq!(tc.arena.host_lock_ref(parent, FULL), 0);
+    assert_eq!(tc.arena.host_lock_ref(parent, FULL), 5);
 }
 
 #[test]

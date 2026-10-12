@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 from typing import Any
 
 import torch
@@ -242,6 +243,7 @@ def _forward_diffusers_video_only(
     for block in transformer.transformer_blocks:
         hidden_states = _forward_diffusers_video_block(
             block=block,
+            self_attention=_streaming_diffusers_self_attention,
             hidden_states=hidden_states,
             encoder_hidden_states=encoder_hidden_states,
             temb=temb,
@@ -262,6 +264,7 @@ def _forward_diffusers_video_only(
 def _forward_diffusers_video_block(
     *,
     block: nn.Module,
+    self_attention: Callable[..., torch.Tensor],
     hidden_states: torch.Tensor,
     encoder_hidden_states: torch.Tensor,
     temb: torch.Tensor,
@@ -281,7 +284,7 @@ def _forward_diffusers_video_block(
     )
     norm_hidden_states = norm_hidden_states * (1 + scale_msa) + shift_msa
 
-    attn_hidden_states = _streaming_diffusers_self_attention(
+    attn_hidden_states = self_attention(
         attn=block.attn1,
         hidden_states=norm_hidden_states,
         query_rotary_emb=video_rotary_emb,

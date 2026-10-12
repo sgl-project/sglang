@@ -6,6 +6,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
+from sglang.kernels.ops.sampling import softmax as sampler_softmax
 from sglang.kernels.ops.sampling.murmur_hash import murmur_hash32
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
@@ -22,7 +23,7 @@ from sglang.srt.layers.logprob_processor import (
 from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
-from sglang.srt.utils.async_probe import sanitize_nan_logits
+from sglang.srt.utils.async_probe import maybe_detect_nan, sanitize_nan_logits
 from sglang.srt.utils.common import (
     get_bool_env_var,
     is_cuda,
@@ -30,6 +31,7 @@ from sglang.srt.utils.common import (
     is_hip,
     is_musa,
     is_npu,
+    is_xpu,
 )
 
 if is_cuda():
@@ -42,7 +44,7 @@ if is_cuda():
         top_p_renorm_prob,
     )
 
-if is_musa():
+if is_musa() or is_xpu():
     from sgl_kernel import (
         min_p_sampling_from_probs,
         top_k_renorm_prob,
@@ -72,7 +74,7 @@ logger = logging.getLogger(__name__)
 SYNC_TOKEN_IDS_ACROSS_TP = get_bool_env_var("SYNC_TOKEN_IDS_ACROSS_TP")
 SGLANG_RETURN_ORIGINAL_LOGPROB = get_bool_env_var("SGLANG_RETURN_ORIGINAL_LOGPROB")
 _CUSTOM_SAMPLER_FACTORIES: Dict[str, Callable[[], "Sampler"]] = {}
-_BUILT_IN_SAMPLING_BACKENDS = {"flashinfer", "pytorch", "ascend"}
+_BUILT_IN_SAMPLING_BACKENDS = {"flashinfer", "pytorch", "ascend", "intel_xpu"}
 
 
 def _trace_e2e_sampler(stage: str, **fields) -> None:
@@ -161,6 +163,7 @@ class Sampler(nn.Module):
                 to get the unique seed for each position.
         """
         logits = logits_output.next_token_logits
+        maybe_detect_nan(logits, "sampler: next_token_logits")
         _trace_e2e_sampler(
             "forward_enter",
             logits_shape=tuple(logits.shape),
@@ -262,7 +265,11 @@ class Sampler(nn.Module):
                     )
 
                 # In-place op to save memory
-                logits[:] = torch.softmax(logits, dim=-1)
+                logits[:] = (
+                    torch.softmax(logits, dim=-1)
+                    if self.enable_deterministic
+                    else sampler_softmax(logits)
+                )
                 probs = logits
 
                 batch_next_token_ids, sampling_mask_capture = self._sample_from_probs(
@@ -361,9 +368,9 @@ class Sampler(nn.Module):
                 )
         else:
             backend = get_exec().kernel.sampling_backend
-            if backend == "flashinfer":
+            if backend in ("flashinfer", "intel_xpu"):
                 assert sampling_info.sampling_seed is None, (
-                    "Sampling seed is not supported for flashinfer backend"
+                    f"Sampling seed is not supported for {backend} backend"
                 )
                 if sampling_info.need_min_p_sampling:
                     probs = top_k_renorm_prob(probs, sampling_info.top_ks)
@@ -443,6 +450,7 @@ class Sampler(nn.Module):
                     sampling_info.sampling_seed,
                     positions,
                     return_filtered_probs=return_sampling_mask,
+                    max_top_k=sampling_info.max_top_k,
                 )
                 if return_sampling_mask:
                     (
@@ -752,6 +760,7 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
     positions: torch.Tensor,
     *,
     return_filtered_probs: bool = False,
+    max_top_k: Optional[int] = None,
 ):
     """
     A top-k, top-p and min-p sampling implementation with native pytorch operations.
@@ -761,11 +770,26 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
     By default, returns only sampled token IDs. With return_filtered_probs=True,
     also returns the actual filtered weights, their token-ID permutation, and
     the selected weights.
+
+    max_top_k, when given, must be >= every value in top_ks.
     """
-    probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
+    # The top-k mask below zeroes every column at rank >= top_k, so the max_top_k
+    # leading columns carry all the mass that survives and sorting only those is
+    # exact. The seeded path keeps the full sort because the order of tied
+    # probabilities may depend on k, which is a batch-wide value, and
+    # deterministic inference must not depend on the batch composition.
+    if (
+        max_top_k is not None
+        and max_top_k < probs.shape[-1]
+        and sampling_seed is None
+        and not return_filtered_probs
+    ):
+        probs_sort, probs_idx = torch.topk(probs, k=max_top_k, dim=-1, sorted=True)
+    else:
+        probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
     probs_sum = torch.cumsum(probs_sort, dim=-1)
     probs_sort[
-        torch.arange(0, probs.shape[-1], device=probs.device).view(1, -1)
+        torch.arange(0, probs_sort.shape[-1], device=probs.device).view(1, -1)
         >= top_ks.view(-1, 1)
     ] = 0.0
     probs_sort[(probs_sum - probs_sort) > top_ps.view(-1, 1)] = 0.0

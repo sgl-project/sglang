@@ -9,6 +9,10 @@ from sglang.kernels.ops.attention.dsv4.kv_layout import (
     KVLayout,
     is_valid_kv_layout_pair,
 )
+from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
+from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
+    SparsePrefillChunkCache,
+)
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     DeepSeekV4SingleKVPool,
@@ -16,6 +20,8 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     _CompressedPoolConfig,
     _num_dsv4_physical_kv_pages,
 )
+from sglang.srt.mem_cache.dsv41_request_window import window_layout
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -24,6 +30,21 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestDSV4CompressedPools(CustomTestCase):
+    def test_swa_key_page_size_uses_physical_paged_size(self):
+        pool = DeepSeekV4TokenToKVPool.__new__(DeepSeekV4TokenToKVPool)
+        pool.request_window = None
+        pool.swa_page_size = 256
+        for physical_page_size in (256, 64):
+            with self.subTest(physical_page_size=physical_page_size):
+                pool.swa_kv_pool = SimpleNamespace(page_size=physical_page_size)
+                self.assertEqual(pool.get_swa_key_page_size(), physical_page_size)
+
+    def test_swa_key_page_size_without_paged_pool(self):
+        pool = DeepSeekV4TokenToKVPool.__new__(DeepSeekV4TokenToKVPool)
+        pool.swa_kv_pool = None
+        pool.request_window = SimpleNamespace(page_size=256)
+        self.assertEqual(pool.get_swa_key_page_size(), 256)
+
     def test_physical_kv_pages_cover_reserved_logical_page(self):
         size = 8192
         self.assertEqual(_num_dsv4_physical_kv_pages(size, 256, 256), 33)
@@ -59,12 +80,15 @@ class TestDSV4CompressedPools(CustomTestCase):
         self.assertEqual(pool.get_state_buf_infos(), ([], [], []))
 
     def test_pp_mapping_and_pd_buffer_order(self):
-        for unified, stage_ratios in product(
-            (False, True), ([4, 0, 128, 4], [128], [0])
+        for unified, fp8, stage_ratios in product(
+            (False, True), (False, True), ([4, 0, 128, 4], [128], [0])
         ):
-            with self.subTest(unified=unified, stage_ratios=stage_ratios):
+            if fp8 and not unified:
+                continue
+            with self.subTest(unified=unified, fp8=fp8, stage_ratios=stage_ratios):
                 pool = DeepSeekV4TokenToKVPool.__new__(DeepSeekV4TokenToKVPool)
                 pool._unified_kv = unified
+                pool._unified_kv_fp8 = fp8
                 pool.uniform_fp8 = False
                 pool.kv_layout = KVLayout.V4
                 pool.compressed_kv_layout_option = None
@@ -127,8 +151,13 @@ class TestDSV4CompressedPools(CustomTestCase):
                     buffers = [
                         torch.empty((9, 8), dtype=torch.uint8) for _ in stage_ratios
                     ]
+                    rope_buffers = [
+                        torch.empty((9, 16), dtype=torch.uint8) for _ in stage_ratios
+                    ]
                     pool.unified_kv_pool = SimpleNamespace(
-                        swa_pages=2, kv_buffer=buffers
+                        swa_pages=2,
+                        kv_buffer=buffers,
+                        kv_buffer_rope=rope_buffers,
                     )
 
                     def kv_entries(ratio):
@@ -137,6 +166,14 @@ class TestDSV4CompressedPools(CustomTestCase):
                             for buf, r in zip(buffers, stage_ratios)
                             if r == ratio
                         ]
+
+                    def rope_entries(ratio):
+                        return [
+                            (buf.data_ptr() + 32, 112, 256 // ratio * 16)
+                            for buf, r in zip(rope_buffers, stage_ratios)
+                            if r == ratio
+                        ]
+
                 else:
 
                     def kv_entries(ratio):
@@ -145,10 +182,22 @@ class TestDSV4CompressedPools(CustomTestCase):
                             for b in pool.kv_pools[ratio].kv_buffer
                         ]
 
+                    def rope_entries(ratio):
+                        return []
+
                 indexer_entries = [
                     (b.data_ptr(), b.nbytes, b[0].nbytes) for b in indexer_buffers
                 ]
-                expected = kv_entries(4) + indexer_entries + kv_entries(128)
+                if fp8:
+                    expected = (
+                        kv_entries(4)
+                        + rope_entries(4)
+                        + indexer_entries
+                        + kv_entries(128)
+                        + rope_entries(128)
+                    )
+                else:
+                    expected = kv_entries(4) + indexer_entries + kv_entries(128)
                 actual = list(zip(*pool.get_contiguous_buf_infos()))
                 self.assertEqual(actual, expected)
 
@@ -313,6 +362,25 @@ class TestV41KVPoolLayouts(CustomTestCase):
         # The 2-token c128 page is the only production page that pads.
         self.assertEqual(pool.kv_pools[128].bytes_per_page_padded, 1536)
 
+    def test_pd_entries_cover_the_c4_kv_page_count(self):
+        """The PD transfer walks every registered entry with the c4 KV pool's
+        page count, so the c4 indexer must reserve the same FULL logical page."""
+        pool = self.make_pool(
+            [0, 4, 128],
+            [],
+            KVLayout.V4,
+            c4_size=PAGE_SIZE,
+            c128_size=PAGE_SIZE // 32,
+            c4_state_pool_size=16,
+            c128_state_pool_size=16,
+        )
+        self.assertEqual(pool.c4_indexer_kv_pool.size, pool.c4_kv_pool.size)
+        _, data_lens, item_lens = pool.get_contiguous_buf_infos()
+        rows = [n // item for n, item in zip(data_lens, item_lens)]
+        c4_kv_rows = _num_dsv4_physical_kv_pages(PAGE_SIZE, PAGE_SIZE // 4, PAGE_SIZE)
+        self.assertEqual(rows[:2], [c4_kv_rows] * 2)  # c4 KV, then its indexer
+        self.assertEqual(min(rows), c4_kv_rows)
+
 
 class TestPagedDSparkWithEncoderReplay(CustomTestCase):
     def setUp(self):
@@ -369,6 +437,93 @@ class TestPagedDSparkWithEncoderReplay(CustomTestCase):
             ).tolist(),
             [768, 812, 1023],
         )
+
+
+class TestEncoderReplayWithoutSpeculation(CustomTestCase):
+    """Encoder replay without speculation has no paged SWA allocator, yet the
+    sparse-prefill path still reads the pool's full-to-SWA mapping."""
+
+    def setUp(self):
+        super().setUp()
+        override = get_context().override_server_args(
+            enable_encoder_swa_bounded_replay=True,
+            page_size=256,
+            max_running_requests=2,
+            chunked_prefill_size=256,
+        )
+        override.install()
+        self.addCleanup(override.restore)
+
+    def test_sparse_prefill_chunk_cache_builds_without_mapping(self):
+        pool = DeepSeekV4TokenToKVPool(
+            max_num_reqs=2,
+            num_req_slots=3,
+            swa_size=0,
+            c4_size=0,
+            c128_size=0,
+            c4_state_pool_size=0,
+            c128_state_pool_size=0,
+            page_size=256,
+            swa_page_size=256,
+            dtype=torch.float8_e4m3fn,
+            c4_state_dtype=torch.float32,
+            c128_state_dtype=torch.bfloat16,
+            qk_nope_head_dim=448,
+            qk_rope_head_dim=64,
+            indexer_head_dim=128,
+            layer_num=3,
+            device="cpu",
+            enable_memory_saver=False,
+            compression_ratios=[0, 0, 0],
+            full_size=2048,
+        )
+        self.assertIsNotNone(pool.request_window)
+        self.assertFalse(pool.needs_paged_swa_allocator)
+        self.assertIsNone(pool.full_to_swa_index_mapping)
+
+        # A 300-token cold prefill of request slot 1 on the sparse-prefill path.
+        rows = 300
+        layout = window_layout(
+            torch.ones(rows, dtype=torch.int64),
+            torch.arange(rows),
+            capacity=pool.request_window.capacity,
+            num_groups=1,
+        )
+        backend = object.__new__(DeepseekV4AttnBackend)
+        backend.token_to_kv_pool = pool
+        backend.req_to_token = torch.zeros((3, 2048), dtype=torch.int32)
+        backend.forward_metadata = SimpleNamespace(late_layer_tail=None)
+        forward_batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            seq_lens=torch.tensor([rows]),
+            seq_lens_cpu=torch.tensor([rows]),
+            extend_seq_lens=torch.tensor([rows], dtype=torch.int32),
+            extend_seq_lens_cpu=[rows],
+            req_pool_indices=torch.tensor([1]),
+        )
+        core = SimpleNamespace(
+            request_window_layout=layout, seq_lens_casual=torch.arange(1, rows + 1)
+        )
+        build = SparsePrefillChunkCache.build
+        empty = torch.empty(0, dtype=torch.int32)
+        with (
+            patch.object(SparsePrefillChunkCache, "build", wraps=build) as spy,
+            # The combine is a Triton kernel; the request-window inputs are the contract.
+            patch(
+                "sglang.srt.layers.attention.dsv4.sparse_prefill_utils."
+                "combine_topk_swa_indices",
+                return_value=(empty, empty),
+            ) as combine,
+        ):
+            cache = backend._build_sparse_prefill_chunk_cache(
+                forward_batch, core, num_qo_tokens=rows
+            )
+
+        self.assertIsNone(spy.call_args.kwargs["full_to_swa"])
+        self.assertIs(cache.swa_indices, layout.indices)
+        self.assertIs(cache.swa_lengths, layout.lengths)
+        self.assertIs(combine.call_args.kwargs["swa_indices"], layout.indices)
+        torch.testing.assert_close(cache.query_pos, layout.pos.to(torch.int32))
 
 
 if __name__ == "__main__":
