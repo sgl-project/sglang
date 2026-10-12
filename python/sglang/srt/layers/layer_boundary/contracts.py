@@ -314,6 +314,7 @@ class ExitFacts(msgspec.Struct, frozen=True):
             is not one all-reduce, may still be left to a fused consumer.
     """
 
+    writes_residual: bool = False
     may_defer_sum: bool = False
     defers_mixer_sum: bool = False
     sum_in_reduce_scatter: bool = False

@@ -371,6 +371,7 @@ class TestProducerCompletion(CustomTestCase):
     def test_neighbour_facts_do_not_retain_layer_state(self):
         import test_kimi_k3_stage_kernels as k3_fixture
 
+        from sglang.srt.layers.layer_boundary.row_transport import RowTransport
         from sglang.srt.models import kimi_k3
 
         seen = set()
@@ -416,6 +417,7 @@ class TestProducerCompletion(CustomTestCase):
             update=update,
             output_transform=OutputTransform(update.layer.forward),
             sum_impl=SumImplementation(update.layer.forward),
+            row_transport=RowTransport({}, bind=update.layer.forward),
         )
         facts = facts_of(declaration)
         self.assertIsInstance(facts.read, ReadFacts)
