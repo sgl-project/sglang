@@ -1,12 +1,14 @@
 import asyncio
 import json
 import unittest
+from http import HTTPStatus
 from types import SimpleNamespace
 
 from sglang.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()  # must precede imports that may pull in sgl_kernel
 
+from fastapi import HTTPException  # noqa: E402
 from fastapi.responses import JSONResponse  # noqa: E402
 from jinja2 import Environment  # noqa: E402
 
@@ -56,14 +58,15 @@ class _FakeOpenAIServingChat:
 
 
 class _FakeNonStreamingErrorOpenAI:
-    """Returns a configurable error response from the OpenAI handler."""
+    """Returns an error response or raises an exception from the OpenAI handler."""
 
     supports_inline_system = False
 
-    def __init__(self, status_code=400, body=None, content=None):
+    def __init__(self, status_code=400, body=None, content=None, exception=None):
         self._status_code = status_code
         self._body = body
         self._content = content
+        self._exception = exception
 
     def _validate_request(self, chat_request):
         return None
@@ -74,6 +77,8 @@ class _FakeNonStreamingErrorOpenAI:
     async def _handle_non_streaming_request(
         self, adapted_request, processed_request, raw_request
     ):
+        if self._exception is not None:
+            raise self._exception
         if self._body is not None:
             # Build a response object exposing raw bytes via `.body`.
             return SimpleNamespace(status_code=self._status_code, body=self._body)
@@ -91,6 +96,8 @@ class _FakeNonStreamingErrorOpenAI:
 
 class _FakeNonStreamingOpenAI:
     """Returns a configurable ChatCompletionResponse from the OpenAI handler."""
+
+    supports_inline_system = False
 
     def __init__(self, response):
         self._response = response
@@ -178,6 +185,12 @@ class TestAnthropicServing(unittest.TestCase):
         }
         data.update(overrides)
         return AnthropicMessagesRequest.model_validate(data)
+
+    def _non_streaming_exception_response(self, exception):
+        serving = AnthropicServing(_FakeNonStreamingErrorOpenAI(exception=exception))
+        return asyncio.run(
+            serving.handle_messages(self._anthropic_request(stream=False), object())
+        )
 
     def _tool_result_request(self, content, tools=None):
         overrides = {
@@ -550,6 +563,152 @@ class TestAnthropicServing(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertEqual(payload["error"]["type"], "invalid_request_error")
         self.assertEqual(payload["error"]["message"], "context length exceeded")
+
+    def test_non_streaming_queue_full_http_exception_preserves_503(self):
+        for status_code in (503, HTTPStatus.SERVICE_UNAVAILABLE):
+            with self.subTest(status_code=status_code, code_type=type(status_code)):
+                response = self._non_streaming_exception_response(
+                    HTTPException(
+                        status_code=status_code,
+                        detail="The request queue is full: sensitive internals /opt/secret",
+                    )
+                )
+                self.assertEqual(response.status_code, 503)
+                self.assertEqual(
+                    json.loads(response.body),
+                    {
+                        "type": "error",
+                        "error": {
+                            "type": "overloaded_error",
+                            "message": "Internal server error",
+                        },
+                    },
+                )
+
+    def test_non_streaming_http_exception_4xx_preserves_status_and_message(self):
+        for status_code, expected_type in [
+            (400, "invalid_request_error"),
+            (401, "authentication_error"),
+            (403, "permission_error"),
+            (404, "not_found_error"),
+            (408, "request_timeout_error"),
+            (429, "rate_limit_error"),
+            (418, "api_error"),
+        ]:
+            with self.subTest(status_code=status_code):
+                response = self._non_streaming_exception_response(
+                    HTTPException(status_code=status_code, detail="Request rejected")
+                )
+                self.assertEqual(response.status_code, status_code)
+                self.assertEqual(
+                    json.loads(response.body)["error"],
+                    {"type": expected_type, "message": "Request rejected"},
+                )
+
+    def test_non_streaming_http_exception_4xx_scrubs_message(self):
+        for detail, expected_message in [
+            (
+                'Bad request\nTraceback (most recent call last):\n  File "/opt/secret", line 1',
+                "Bad request",
+            ),
+            ("x" * 600, "x" * 500 + "…"),
+            ({"message": "Bad request"}, "{'message': 'Bad request'}"),
+        ]:
+            with self.subTest(detail=detail):
+                response = self._non_streaming_exception_response(
+                    HTTPException(status_code=400, detail=detail)
+                )
+                self.assertEqual(response.status_code, 400)
+                self.assertEqual(
+                    json.loads(response.body)["error"],
+                    {"type": "invalid_request_error", "message": expected_message},
+                )
+
+    def test_non_streaming_http_exception_5xx_scrubs_message(self):
+        for status_code in (500, 501, 502, 504, 599):
+            for detail in (
+                "sensitive internals: /opt/secret",
+                {"message": "sensitive internals: /opt/secret"},
+                ["sensitive internals: /opt/secret"],
+            ):
+                with self.subTest(status_code=status_code, detail=detail):
+                    response = self._non_streaming_exception_response(
+                        HTTPException(status_code=status_code, detail=detail)
+                    )
+                    self.assertEqual(response.status_code, status_code)
+                    self.assertEqual(
+                        json.loads(response.body)["error"],
+                        {"type": "api_error", "message": "Internal server error"},
+                    )
+
+    def test_non_streaming_http_exception_logs_original_detail(self):
+        detail = "worker rejected request: sensitive internals /opt/secret"
+        for status_code, expected_type in (
+            (500, "api_error"),
+            (503, "overloaded_error"),
+        ):
+            with self.subTest(status_code=status_code):
+                with self.assertLogs(
+                    "sglang.srt.entrypoints.anthropic.serving", level="WARNING"
+                ) as captured:
+                    response = self._non_streaming_exception_response(
+                        HTTPException(status_code=status_code, detail=detail)
+                    )
+                self.assertEqual(len(captured.records), 1)
+                message = captured.records[0].getMessage()
+                self.assertIn(detail, message)
+                self.assertIn(str(status_code), message)
+                self.assertEqual(response.status_code, status_code)
+                self.assertEqual(
+                    json.loads(response.body)["error"],
+                    {"type": expected_type, "message": "Internal server error"},
+                )
+
+    def test_non_streaming_unexpected_exception_returns_generic_500(self):
+        for exception_type in (RuntimeError, ValueError):
+            with self.subTest(exception_type=exception_type):
+                response = self._non_streaming_exception_response(
+                    exception_type("sensitive internals: /opt/secret")
+                )
+                self.assertEqual(response.status_code, 500)
+                self.assertEqual(
+                    json.loads(response.body)["error"],
+                    {"type": "api_error", "message": "Internal server error"},
+                )
+
+    def test_non_streaming_cancelled_error_propagates(self):
+        exception = asyncio.CancelledError()
+        with self.assertRaises(asyncio.CancelledError) as captured:
+            self._non_streaming_exception_response(exception)
+        self.assertIs(captured.exception, exception)
+
+    def test_non_streaming_success_response_is_converted(self):
+        response = ChatCompletionResponse.model_validate(
+            {
+                "id": "chatcmpl-test",
+                "model": "test-model",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "hello"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "total_tokens": 2,
+                },
+            }
+        )
+        serving = AnthropicServing(_FakeNonStreamingOpenAI(response))
+        result = asyncio.run(
+            serving.handle_messages(self._anthropic_request(stream=False), object())
+        )
+        self.assertEqual(result.status_code, 200)
+        payload = json.loads(result.body)
+        self.assertEqual(payload["content"], [{"type": "text", "text": "hello"}])
+        self.assertEqual(payload["stop_reason"], "end_turn")
 
     # ------------------------------------------------------------------
     # Edge-case coverage added in the review-fix pass
