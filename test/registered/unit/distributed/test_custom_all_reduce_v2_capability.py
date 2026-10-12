@@ -3,6 +3,7 @@ from unittest.mock import Mock
 import pytest
 
 from sglang.srt.distributed.device_communicators import custom_all_reduce_v2
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
@@ -86,6 +87,35 @@ def test_topology_capability(
         )
     else:
         intra_node_capability.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("has_fabric_clique", "allow_non_vmm", "expected"),
+    [
+        (True, False, False),
+        (True, True, True),
+        (False, True, False),
+    ],
+)
+def test_multi_node_non_vmm_allocator(
+    monkeypatch, has_fabric_clique, allow_non_vmm, expected
+):
+    """SGLANG_OPT_CUSTOM_ALL_REDUCE_V2_ALLOW_NON_VMM admits a non-VMM allocator on
+    a multi-node NVLink clique; it does not relax the clique requirement."""
+    group, device = _patch_group(monkeypatch, world_size=16, same_node=False)
+    monkeypatch.setattr(
+        custom_all_reduce_v2,
+        "is_one_nvlink_clique",
+        lambda group, device: has_fabric_clique,
+    )
+    monkeypatch.setattr(
+        custom_all_reduce_v2, "_is_vmm_backed_allocator", lambda device: False
+    )
+
+    with envs.SGLANG_OPT_CUSTOM_ALL_REDUCE_V2_ALLOW_NON_VMM.override(allow_non_vmm):
+        assert (
+            custom_all_reduce_v2.can_use_custom_all_reduce_v2(group, device) is expected
+        )
 
 
 if __name__ == "__main__":

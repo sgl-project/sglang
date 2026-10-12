@@ -1351,6 +1351,9 @@ class Envs:
     SGLANG_CUSTOM_ALL_REDUCE_V2_MAX_SIZE_KB = EnvInt(16 * 1024)
     SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PULL_SIZE_KB = EnvInt(None)
     SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PUSH_SIZE_KB = EnvInt(None)
+    # Let CustomAllReduceV2 span the nodes of one NVLink clique even when the
+    # caching allocator is not VMM-backed (e.g. under torch_memory_saver).
+    SGLANG_OPT_CUSTOM_ALL_REDUCE_V2_ALLOW_NON_VMM = EnvBool(False)
     # See docs/references/environment_variables.
     SGLANG_ENABLE_PCIE_IPC_ALLREDUCE = EnvBool(False)
     SGLANG_PCIE_IPC_MAX_NUMEL = EnvInt(0)
