@@ -294,12 +294,18 @@ def _moe_sorting_small_kernel_distributed(
             tl.store(qscale_ptr + sw, exp.to(tl.uint8))
 
 
-def _small_sort_supported(topk_ids, block_size, expert_mask, num_local_tokens):
+def _small_sort_supported(
+    topk_ids, block_size, expert_mask, num_local_tokens, num_experts
+):
     m, topk = topk_ids.shape
+    p = m * topk
     return (
         expert_mask is None
         and num_local_tokens is None
-        and m * topk <= 256
+        and p <= 256
+        # ponytail: the distributed variant scans every 64-expert chunk per pair, so it beats
+        # aiter at E=129 but loses at E=513; cutoff untuned in between
+        and ((p <= 64 and p <= 2 * block_size) or num_experts <= 256)
         and topk < 128
         and topk_ids.dtype == torch.int32
         and topk_ids.is_contiguous()
@@ -480,7 +486,11 @@ def apply_aiter_small_moe_sort_patch() -> None:
             and not return_local_topk_ids
             and orig_kwargs.get("output") is None
             and _small_sort_supported(
-                topk_ids, int(block_size), expert_mask, num_local_tokens
+                topk_ids,
+                int(block_size),
+                expert_mask,
+                num_local_tokens,
+                int(num_experts),
             )
         ):
             device = topk_ids.device

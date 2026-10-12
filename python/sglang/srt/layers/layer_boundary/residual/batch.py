@@ -106,30 +106,30 @@ def final_norm(
         )
         return hidden_states
     if skip_empty and hidden_states.shape[0] == 0:
+        if capture is not None:
+            capture(hidden_states)
         return hidden_states
     return access.final_norm_pair(
         hidden_states, residual, layernorm, capture, **read_kwargs
     )
 
 
-def to_pp(hidden_states, forward_batch, *, preserve_declared=True):
+def to_pp(hidden_states, forward_batch):
     """Export hidden_states and residual as PPProxyTensors.
 
     Args:
         hidden_states: Current stream output or opaque owed handle.
         forward_batch: Batch owning the stream.
-        preserve_declared: True (the default) sends a statically declared
-            partial sum unreduced for the receiver's from_pp to complete; pass
-            False only when the receiver does not declare that sum.
 
-    Runtime-selected completion work is finished before transport. A stream
-    the producer already wrote (MHC writes its streams at the FFN exit) has no
-    separate residual and is sent as hidden_states alone; the receiver's
-    from_pp reconstructs it as written.
+    Every sum the output owes is completed before transport, a declared one
+    too: the pipeline sends each tensor as one slice per attention-TP rank and
+    gathers the slices back on the next rank, which reassembles only a tensor
+    that every attention-TP rank holds alike. A stream the producer already
+    wrote (MHC writes its streams at the FFN exit) has no separate residual
+    and is sent as hidden_states alone; the receiver's from_pp reconstructs it
+    as written.
     """
-    hidden_states, residual = stream_of(forward_batch).export(
-        hidden_states, preserve_declared=preserve_declared
-    )
+    hidden_states, residual = stream_of(forward_batch).export(hidden_states)
     forward_batch.residual_stream = None
     tensors = {"hidden_states": hidden_states}
     if residual is not None:
