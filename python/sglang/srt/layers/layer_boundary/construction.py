@@ -282,6 +282,10 @@ def _bind_stage(
         raise NotImplementedError(
             "pipeline boundaries require a producer-written residual"
         )
+    if declaration.sum_impl is not None and declaration.sum_impl.run is None:
+        raise ValueError("a local stage requires its custom sum implementation")
+    if declaration.output_complete and declaration.sum_impl is not None:
+        raise ValueError("compute-completed output cannot also declare a custom sum")
     if declaration.terminal and not (
         update.is_plain_add
         or update.applied_at_exit

@@ -281,6 +281,14 @@ class ExitPolicy:
             # A reduce-scatter completes the sum on its way back.
             owes_sum=steps.output.group is not None and not sum_in_reduce_scatter,
         )
+        custom = steps.output.sum_impl
+        custom_can_defer = (
+            custom.can_defer(forward_batch)
+            if custom is not None and custom.can_defer is not None
+            else None
+        )
+        if custom_can_defer is False:
+            return ExitDecision(False, sum_in_reduce_scatter, complete_now)
         defer_moe_finalize = (
             self.plan.fusions is not None
             and self.plan.fusions.can_defer_finalize(self.plan, forward_batch)
@@ -302,6 +310,7 @@ class ExitPolicy:
             steps,
             sum_in_reduce_scatter=sum_in_reduce_scatter,
             dp_step=dp_step,
+            custom_can_defer=custom_can_defer,
         )
         if defers:
             group = self.ffn_reduction_group(steps)
@@ -315,7 +324,13 @@ class ExitPolicy:
                     ),
                 )
             else:
-                wrap = partial(UnreducedOutput, group=group)
+                wrap = partial(
+                    UnreducedOutput,
+                    group=group,
+                    complete_sum=partial(custom.run, forward_batch=forward_batch)
+                    if custom is not None
+                    else None,
+                )
             complete = partial(_defer, wrap)
         elif (
             dp_step is not None
@@ -353,7 +368,13 @@ class ExitPolicy:
         chosen: the sum the output owes, the move back to where the next layer
         reads it, then the write-back into the residual for a layer that does
         it itself."""
-        if owes_sum:
+        if owes_sum and steps.output.sum_impl is not None:
+            if steps.output_move_completes_sum or dp_step is not None:
+                raise NotImplementedError(
+                    "custom output sums require their declared token rows"
+                )
+            hidden_states = steps.output.sum_impl.run(hidden_states, forward_batch)
+        elif owes_sum:
             hidden_states = sum_output(
                 hidden_states,
                 steps.output.group,
@@ -414,6 +435,7 @@ class ExitPolicy:
         *,
         sum_in_reduce_scatter: bool,
         dp_step: Optional[Callable],
+        custom_can_defer: Optional[bool] = None,
     ) -> bool:
         """Whether the FFN leaves its output's all-reduce to the next layer's
         input when no fused kernel takes it: when the next layer would run the
@@ -422,7 +444,11 @@ class ExitPolicy:
         the scatter the next input runs."""
         return (
             steps.exit.may_defer_sum
-            and _batch_allows_deferred_sum(forward_batch, steps.exit, self.plan)
+            and (
+                custom_can_defer
+                if custom_can_defer is not None
+                else _batch_allows_deferred_sum(forward_batch, steps.exit, self.plan)
+            )
             and not sum_in_reduce_scatter
             and dp_step is None
         )

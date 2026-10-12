@@ -337,6 +337,27 @@ def _run_entry(
             if pending.owed is not None:
                 raise RuntimeError("a declared input sum carried another completion")
             step = completed_step
+    if pending is not None and isinstance(pending.owed, DeclaredSum):
+        owed = pending.owed
+        if owed.complete_sum is not None:
+            result = _run_read_fusions(
+                tuple(
+                    f
+                    for f in read.completing_fusions
+                    if f.completes is owed.group and not f.scatters
+                ),
+                hidden_states,
+                residual,
+                forward_batch,
+                norm,
+                read=read,
+                update=update,
+                **call,
+            )
+            if result is not None:
+                return result
+            hidden_states = pending.complete()
+            step = completed_step
     if written and written_step is not None:
         step = written_step
     if isinstance(hidden_states, (UnreducedOutput, DeferredFinalize)):

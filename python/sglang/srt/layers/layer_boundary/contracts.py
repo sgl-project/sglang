@@ -21,7 +21,7 @@ import torch
 
 from sglang.srt.distributed import GroupCoordinator
 from sglang.srt.layers.layer_boundary.layout import Layout, SumGroup, TokenAxis
-from sglang.srt.layers.layer_boundary.output import OutputTransform
+from sglang.srt.layers.layer_boundary.output import OutputTransform, SumImplementation
 from sglang.srt.layers.layer_boundary.residual import ResidualReadout, ResidualUpdate
 from sglang.srt.layers.layer_boundary.residual.add_norm import NORM_READOUT, PLAIN_ADD
 
@@ -105,6 +105,8 @@ class OutputContract(msgspec.Struct, frozen=True):
         transform: Optional operation on the contribution before residual update.
         in_token_order: The output covers the whole sequence in the batch's
             token order; the consumer takes this rank's CP shard of it back.
+        sum_impl: Custom implementation of this declared sum, or None for
+            the ordinary boundary collective. It does not change token rows.
 
     These are permissions, not a record of a particular output. The exit
     decision and ResidualStream record what that output actually owes.
@@ -125,6 +127,7 @@ class OutputContract(msgspec.Struct, frozen=True):
     update: Optional[ResidualUpdate] = PLAIN_ADD
     transform: Optional[OutputTransform] = None
     in_token_order: bool = False
+    sum_impl: Optional[SumImplementation] = None
 
 
 class StageContract(msgspec.Struct, frozen=True):

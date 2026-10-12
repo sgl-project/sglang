@@ -13,8 +13,10 @@
 # ==============================================================================
 """Residual access for one layer-stack invocation or TBO microbatch."""
 
+from typing import NamedTuple
+
 from sglang.srt.layers.layer_boundary.output import complete_owed
-from sglang.srt.layers.layer_boundary.residual import access
+from sglang.srt.layers.layer_boundary.residual import access, bind_update
 from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 
@@ -35,6 +37,13 @@ def stream_of(forward_batch):
     return stream
 
 
+class ReplayHandoff(NamedTuple):
+    value: object
+    residual: object
+    update: object
+    written: bool
+
+
 def clear(forward_batch):
     """Release invocation state on completion or an exception."""
     stream = forward_batch.residual_stream
@@ -43,6 +52,50 @@ def clear(forward_batch):
             stream.pending.release()
         stream.pending = stream.residual = None
     forward_batch.residual_stream = None
+
+
+def export_replay_handoff(hidden_states, forward_batch):
+    """Export a complete operand and reusable producer state across an eager break.
+
+    The handoff does not complete owed work or apply the residual update.
+    Replay rebinds dynamic producer metadata to the live batch.
+    """
+    from sglang.srt.layers.layer_boundary.residual.add_norm import PLAIN_ADD
+
+    stream = stream_of(forward_batch)
+    stream.check(hidden_states)
+    pending = stream.pending
+    if pending is not None and pending.owed is not None:
+        raise RuntimeError("complete the contribution before a graph replay handoff")
+    value, residual = stream.input(hidden_states)
+    update = pending.update if pending is not None else PLAIN_ADD
+    reusable = update.replay_update
+    result = ReplayHandoff(
+        value,
+        residual,
+        update if reusable is None else reusable,
+        pending is None and stream.residual is not None,
+    )
+    clear(forward_batch)
+    return result
+
+
+def import_replay_handoff(handoff, forward_batch, *, update_context=None):
+    """Reconstruct the residual state with replay's live producer metadata."""
+    if handoff.written:
+        if handoff.residual is not None:
+            raise ValueError("a written replay handoff has no separate residual")
+        set_written(handoff.value, forward_batch)
+        return handoff.value
+    if handoff.residual is None:
+        start(forward_batch)
+        return handoff.value
+    hidden, forward_batch.residual_stream = ResidualStream.from_handoff(
+        handoff.value,
+        handoff.residual,
+        bind_update(handoff.update, forward_batch, update_context),
+    )
+    return hidden
 
 
 def written_residual(forward_batch):

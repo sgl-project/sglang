@@ -81,6 +81,7 @@ class TestResidualStream(CustomTestCase):
     def test_consumer_executes_the_carried_update_not_the_bound_producers(self):
         class Update:
             bind = None
+            replay_update = None
             is_plain_add = False
             applied_at_exit = False
 
@@ -214,7 +215,9 @@ class TestResidualStream(CustomTestCase):
             )
 
     def test_snapshot_rejects_stateful_update_without_touching_main_state(self):
-        update = SimpleNamespace(is_plain_add=False, update=Mock(), bind=None)
+        update = SimpleNamespace(
+            is_plain_add=False, update=Mock(), bind=None, replay_update=None
+        )
         stream = ResidualStream(self.residual)
         hidden = stream.record(UnreducedOutput(self.partial, group=self.group), update)
         with self.assertRaisesRegex(NotImplementedError, "plain residual update"):

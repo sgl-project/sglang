@@ -13,6 +13,7 @@
 # ==============================================================================
 """A stage's model-facing input and output boundary."""
 
+from functools import partial
 from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
@@ -176,10 +177,21 @@ class StageBoundary:
         take a MoE finalize handoff) finishes through exit() instead."""
         if self.kind is StageKind.ATTENTION and self.plan.finishes_directly:
             produced = self.plan.path_for(forward_batch).output
+            completion = (
+                partial(produced.sum_impl.run, forward_batch=forward_batch)
+                if produced.sum_impl is not None
+                else None
+            )
+            if produced.always_partial:
+                owed = DeclaredSum(produced.group, completion)
+            else:
+                owed = None
+                if completion is not None:
+                    hidden_states = completion(hidden_states)
             return stream_of(forward_batch).record(
                 hidden_states,
                 bind_update(produced.update, forward_batch, update_context),
-                declared_sum=produced.group if produced.always_partial else None,
+                declared_sum=owed,
             )
         if self.kind is StageKind.FFN and self.plan.fusions is not None:
             raise RuntimeError(

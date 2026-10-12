@@ -19,6 +19,7 @@ from sglang.srt.layers.layer_boundary import (
     declare_ffn,
     layer_stack,
 )
+from sglang.srt.layers.layer_boundary.contracts import SumImplementation
 from sglang.srt.layers.layer_boundary.facts import (
     ReadFacts,
     TransformFacts,
@@ -412,7 +413,9 @@ class TestProducerCompletion(CustomTestCase):
         update = Nonplain()
         update.layer = torch.nn.Linear(4, 4)
         declaration = declare_ffn(
-            update=update, output_transform=OutputTransform(update.layer.forward)
+            update=update,
+            output_transform=OutputTransform(update.layer.forward),
+            sum_impl=SumImplementation(update.layer.forward),
         )
         facts = facts_of(declaration)
         self.assertIsInstance(facts.read, ReadFacts)
