@@ -21,7 +21,10 @@ from sglang.srt.hardware_backend.npu.moe.activation import (
     NPUSwigluStepAndMul,
 )
 from sglang.srt.hardware_backend.npu.moe.finalize_routing import NPUMoETokenUnpermute
-from sglang.srt.hardware_backend.npu.moe.init_routing import NPUMoEInitRouting_v2
+from sglang.srt.hardware_backend.npu.moe.init_routing import (
+    MXFP8_QUANT_MODE,
+    NPUMoEInitRouting_v2,
+)
 from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
     NPUMXFP8MoEMethod,
     NPUW4A8Int8MoEMethod,

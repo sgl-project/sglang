@@ -42,6 +42,7 @@ from unittest.mock import patch
 
 import torch
 import torch.distributed
+import torch.nn.functional as F
 from torch.distributed import Backend, ProcessGroup
 
 from sglang.srt import platforms
@@ -1516,15 +1517,10 @@ class GroupCoordinator:
         if all(s == max_tokens for s in sizes):
             gathered = input_.contiguous()
         else:
-            # Pad the local chunk with zeros so every rank sends max_tokens
-            # rows. zeros+copy instead of F.pad because the padding is not
-            # guaranteed to support low-bit dtypes (e.g. e8m0 block scales).
-            gathered = torch.zeros(
-                (max_tokens, *input_.shape[1:]),
-                dtype=input_.dtype,
-                device=input_.device,
-            )
-            gathered[: input_.shape[0]] = input_
+            # Pad the local chunk so every rank sends max_tokens rows.
+            pad_size = max_tokens - input_.shape[0]
+            padding = [0, 0] * (input_.ndim - 1) + [0, pad_size]
+            gathered = F.pad(input_, padding, mode="constant", value=0)
 
         output = torch.empty(
             (max_tokens * world_size, *input_.shape[1:]),

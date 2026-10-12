@@ -736,7 +736,8 @@ def should_use_npu_moe_allgather() -> bool:
     skips the all-gather entirely and combine uses an all-reduce to sum the
     per-rank partial expert outputs.
     """
-    if not (_is_npu and get_moe_a2a_backend().is_none() and get_moe_runner_backend().is_ascend()):
+    # return False
+    if not (_is_npu and get_moe_a2a_backend().is_none()):
         return False
     if is_dp_attention_enabled():
         return get_parallel().moe_ep_size == get_parallel().attn_dp_size
@@ -748,7 +749,7 @@ def is_moe_input_scattered_across_dp_ranks() -> bool:
     return (
         not get_moe_a2a_backend().is_none()
         or should_use_flashinfer_cutlass_moe_fp4_allgather()
-        or should_use_npu_moe_allgather()
+        or (should_use_npu_moe_allgather() and is_dp_attention_enabled())
         or get_parallel().dwdp_size > 1
     )
 

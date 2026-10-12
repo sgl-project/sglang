@@ -52,6 +52,7 @@ class AscendTPDispatcher(BaseDispatcher):
     def __init__(self, moe_runner_config: MoeRunnerConfig):
         super().__init__()
         self.num_experts = moe_runner_config.num_experts
+        self.num_local_experts = moe_runner_config.num_local_experts
         self.top_k = moe_runner_config.top_k
         self._dispatch_output: Optional[AscendTPDispatchOutput] = None
 
@@ -110,7 +111,7 @@ class AscendTPDispatcher(BaseDispatcher):
         ) = self.init._init_routing(
             hidden_states,
             topk_ids,
-            self.num_experts,
+            self.num_local_experts,
             top_k,
         )
 

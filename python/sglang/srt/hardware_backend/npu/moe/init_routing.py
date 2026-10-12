@@ -105,8 +105,9 @@ class NPUMoEInitRouting_v2(BaseInitRouting):
             # Pre-quantized input (e.g. MXFP8 activations quantized before an
             # all-gather): consume the fp8 payload as-is via x_dtype and route
             # the per-token block scale along with the tokens (PR 737 style:
-            # quant_mode=-1 + scale + x_dtype).
-            kwargs["scale"] = scale
+            # quant_mode=-1 + scale + x_dtype).  The op expects 3D pair-split
+            # scale [N, M//2, 2]; npu_dynamic_mx_quant returns 2D [N, M].
+            kwargs["scale"] = _normalize_mxfp_scale(scale)
             kwargs["x_dtype"] = x_dtype
         hidden_states, expanded_row_idx, expert_tokens, pertoken_scale = (
             torch.ops.npu.npu_moe_init_routing_v2(
@@ -121,7 +122,7 @@ class NPUMoEInitRouting_v2(BaseInitRouting):
                 **kwargs,
             )
         )
-        if self.quant_mode == -1:
+        if self.quant_mode == -1 and scale is None:
             pertoken_scale = None
         elif self.quant_mode == MXFP8_QUANT_MODE:
             pertoken_scale = _normalize_mxfp_scale(pertoken_scale)
