@@ -549,6 +549,8 @@ def test_warmup_preload_margin_reaches_request_state():
         (" text_encoder , transformer ", "4.5", "text_encoder,transformer"),
         ("text_encoder,,vae", "1", ValueError),
         ("auto", "-1", ValueError),
+        ("auto", "nan", ValueError),
+        ("auto", "inf", ValueError),
     ],
 )
 def test_warmup_preload_server_args(monkeypatch, components, margin, expected):

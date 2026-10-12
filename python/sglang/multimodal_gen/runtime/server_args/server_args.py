@@ -729,10 +729,11 @@ class ServerArgs(DisaggServerArgsMixin):
                 )
             policy = ",".join(names)
         self.warmup_preload_components = policy
-        if self.warmup_preload_margin_gib < 0:
+        margin = self.warmup_preload_margin_gib
+        if not math.isfinite(margin) or margin < 0:
             raise ValueError(
-                "--warmup-preload-margin-gib must be non-negative, got "
-                f"{self.warmup_preload_margin_gib}"
+                "--warmup-preload-margin-gib must be a finite non-negative number, got "
+                f"{margin}"
             )
 
     def _validate_minimax_h3_adaln(self) -> None:
