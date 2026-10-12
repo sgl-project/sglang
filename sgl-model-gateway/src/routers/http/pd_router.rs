@@ -18,7 +18,9 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, error, warn};
 
 use super::{
-    pd_stream::{read_error_body, DecodeReadAhead, SseFrames, StreamFailure, Terminal},
+    pd_stream::{
+        read_error_body, DecodeReadAhead, RetryRequestIdentity, SseFrames, StreamFailure, Terminal,
+    },
     pd_types::api_path,
 };
 use crate::{
@@ -397,9 +399,24 @@ impl PDRouter {
             endpoint,
             bool_to_static_str(context.is_stream),
         );
-        // Clone request once outside the retry loop, then use Arc to share across attempts
-        // This avoids O(retries) clones by sharing the same data
-        let shared_request = Arc::new(original_request.clone());
+        let shared_request = match serde_json::to_value(original_request) {
+            Ok(request) => Arc::new(request),
+            Err(e) => return Self::handle_serialization_error(e),
+        };
+        // Session history and Responses storage/cancel use the worker ID as a
+        // durable key. Without an alias registry, neither renaming that ID nor
+        // resubmitting it before cancellation completes is safe. Return the
+        // original attempt's verdict for these requests.
+        let persistent_identity = shared_request
+            .get("session_params")
+            .is_some_and(|v| !v.is_null())
+            || shared_request
+                .get("session_id")
+                .is_some_and(|v| !v.is_null())
+            || (route == "/v1/responses"
+                && shared_request
+                    .get("request_id")
+                    .is_some_and(|v| !v.is_null()));
         let response = RetryExecutor::execute_response_with_retry(
             &self.retry_config,
             {
@@ -429,13 +446,25 @@ impl PDRouter {
                             decode.url()
                         );
 
-                        let mut json_request = match serde_json::to_value(shared_request.as_ref()) {
-                            Ok(v) => v,
-                            Err(e) => return Self::handle_serialization_error(e),
-                        };
+                        let mut json_request = shared_request.as_ref().clone();
                         // ResponsesRequest serializes an absent stream as null, which SRT rejects.
                         if context.route == "/v1/responses" {
                             json_request["stream"] = Value::Bool(context.is_stream);
+                        }
+
+                        // Closing HTTP cancels an attempt, but tokenizer state
+                        // can remain registered until the scheduler replies.
+                        // Keep the first submission unchanged, including real
+                        // client duplicate-ID validation. Stateless retries
+                        // receive a fresh paired P/D identity; restore their
+                        // public response ID in the response path.
+                        let retry_identity = if attempt > 0 {
+                            RetryRequestIdentity::replace(&mut json_request)
+                        } else {
+                            None
+                        };
+                        if let Some(identity) = &retry_identity {
+                            debug!(attempt, mappings = ?identity.mappings, "PD retry identity");
                         }
 
                         json_request = match Self::inject_bootstrap_into_value(
@@ -456,6 +485,7 @@ impl PDRouter {
                                 Arc::clone(&prefill),
                                 Arc::clone(&decode),
                                 start_time,
+                                retry_identity,
                             )
                             .await;
 
@@ -510,7 +540,7 @@ impl PDRouter {
                     }
                 }
             },
-            |res, _attempt| is_retryable_status(res.status()),
+            |res, _attempt| !persistent_identity && is_retryable_status(res.status()),
             |delay, attempt| {
                 // Layer 3 worker metrics (PD mode uses both prefill and decode workers)
                 Metrics::record_worker_retry(metrics_labels::WORKER_PREFILL, endpoint);
@@ -664,6 +694,7 @@ impl PDRouter {
     }
 
     // Internal method that performs the actual dual dispatch (without retry logic)
+    #[allow(clippy::too_many_arguments)]
     async fn execute_dual_dispatch_internal(
         &self,
         headers: Option<&HeaderMap>,
@@ -672,6 +703,7 @@ impl PDRouter {
         prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
         _start_time: Instant,
+        retry_identity: Option<RetryRequestIdentity>,
     ) -> Response {
         // For non-streaming: use guard for automatic load management
         // For streaming: load will be managed in create_streaming_response
@@ -885,15 +917,17 @@ impl PDRouter {
                         Some(response_headers),
                         prefill,
                         decode,
+                        retry_identity,
                     )
                 } else {
                     // Non-streaming response
-                    if context.return_logprob {
+                    if context.return_logprob || retry_identity.is_some() {
                         self.process_non_streaming_response(
                             res,
                             status,
                             context.return_logprob,
                             prefill_body,
+                            retry_identity,
                         )
                         .await
                     } else {
@@ -1147,6 +1181,7 @@ impl PDRouter {
         headers: Option<HeaderMap>,
         prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
+        retry_identity: Option<RetryRequestIdentity>,
     ) -> Response {
         use crate::core::AttachedBody;
 
@@ -1199,10 +1234,12 @@ impl PDRouter {
                                 };
                                 let terminal = events.last().and_then(|(_, terminal)| terminal.as_ref());
                                 let prepare = |frame: bytes::Bytes| {
-                                    if return_logprob && prefill_logprobs.is_some() {
+                                    let frame = if return_logprob && prefill_logprobs.is_some() {
                                         Self::merge_streaming_logprobs(prefill_logprobs.clone(), &frame)
                                             .unwrap_or(frame)
-                                    } else { frame }
+                                    } else { frame };
+                                    retry_identity.as_ref().map_or_else(
+                                        || frame.clone(), |identity| identity.restore_frame(frame.clone()))
                                 };
                                 if let Some(terminal) = terminal {
                                     let failed = matches!(terminal, Terminal::Failed(_));
@@ -1289,7 +1326,9 @@ impl PDRouter {
         status: StatusCode,
         return_logprob: bool,
         prefill_body: Option<bytes::Bytes>,
+        retry_identity: Option<RetryRequestIdentity>,
     ) -> Response {
+        let mut headers = header_utils::preserve_response_headers(res.headers());
         let response = res.bytes().await;
         let decode_body = match response {
             Ok(decode_body) => decode_body,
@@ -1299,33 +1338,28 @@ impl PDRouter {
             }
         };
 
-        if !return_logprob {
-            return (status, decode_body).into_response();
-        }
-
-        let Some(prefill_body) = prefill_body else {
-            return (status, decode_body).into_response();
-        };
-
-        // Merge logprobs from prefill and decode
-        let (Ok(prefill_json), Ok(mut decode_json)) = (
-            serde_json::from_slice::<Value>(&prefill_body),
-            serde_json::from_slice::<Value>(&decode_body),
-        ) else {
-            warn!("Failed to parse responses for logprob merging");
-            return (status, decode_body).into_response();
-        };
-
-        Self::merge_logprobs_in_json(&prefill_json, &mut decode_json);
-
-        // Return merged response
-        match serde_json::to_vec(&decode_json) {
-            Ok(body) => (status, body).into_response(),
-            Err(e) => {
-                error!("Failed to serialize merged response: {}", e);
-                (status, decode_body).into_response()
+        let mut body = decode_body;
+        if let Ok(mut decode_json) = serde_json::from_slice::<Value>(&body) {
+            let mut changed = retry_identity
+                .as_ref()
+                .is_some_and(|identity| identity.restore_json(&mut decode_json));
+            if return_logprob {
+                if let Some(prefill_json) = prefill_body
+                    .as_ref()
+                    .and_then(|b| serde_json::from_slice::<Value>(b).ok())
+                {
+                    changed |= Self::merge_logprobs_in_json(&prefill_json, &mut decode_json);
+                }
+            }
+            if changed {
+                body = bytes::Bytes::from(serde_json::to_vec(&decode_json).expect("JSON value"));
+                headers.remove(CONTENT_LENGTH);
             }
         }
+        let mut response = Response::new(Body::from(body));
+        *response.status_mut() = status;
+        *response.headers_mut() = headers;
+        response
     }
 
     async fn handle_prefill_failure(&self, failure: PrefillFailure, prefill_url: &str) -> Response {
@@ -2048,6 +2082,7 @@ mod tests {
                 None,
                 prefill_ref.clone(),
                 decode_ref.clone(),
+                None,
             );
 
             // Guards are now attached to response body, so load should be 1

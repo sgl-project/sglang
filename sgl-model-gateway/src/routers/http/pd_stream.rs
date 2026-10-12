@@ -7,6 +7,105 @@ use serde_json::{json, Value};
 // prefill completes, only one incomplete SSE event needs to be retained.
 const MAX_PENDING_BYTES: usize = 1024 * 1024;
 
+/// The public rid survives a retry; its worker state must not collide
+/// with the cancelled attempt, which can still be awaiting a scheduler ACK.
+#[derive(Clone)]
+pub(super) struct RetryRequestIdentity {
+    pub mappings: Vec<(String, String)>,
+}
+
+impl RetryRequestIdentity {
+    pub fn replace(request: &mut Value) -> Option<Self> {
+        let rid = request.get_mut("rid")?;
+        let clients = if let Some(client) = rid.as_str() {
+            vec![client.to_owned()]
+        } else {
+            rid.as_array()?
+                .iter()
+                .map(|v| v.as_str().map(str::to_owned))
+                .collect::<Option<Vec<_>>>()?
+        };
+        let prefix = uuid::Uuid::new_v4();
+        let mappings: Vec<_> = clients
+            .into_iter()
+            .enumerate()
+            .map(|(i, client)| (client, format!("smg-retry-{prefix}-{i}")))
+            .collect();
+        *rid = if rid.is_array() {
+            Value::Array(
+                mappings
+                    .iter()
+                    .map(|(_, worker)| Value::String(worker.clone()))
+                    .collect(),
+            )
+        } else {
+            Value::String(mappings[0].1.clone())
+        };
+        Some(Self { mappings })
+    }
+
+    pub fn restore_json(&self, value: &mut Value) -> bool {
+        if let Some(items) = value.as_array_mut() {
+            return items
+                .iter_mut()
+                .fold(false, |changed, item| self.restore_json(item) || changed);
+        }
+        let mut changed = false;
+        // Native /generate and OpenAI chat/completion responses expose the
+        // worker rid in these fields. Tool IDs and generated text are untouched.
+        for path in ["/meta_info/id", "/id"] {
+            if let Some(id) = value.pointer_mut(path) {
+                if let Some((client, _)) = self
+                    .mappings
+                    .iter()
+                    .find(|(_, worker)| id.as_str() == Some(worker.as_str()))
+                {
+                    *id = Value::String(client.clone());
+                    changed = true;
+                }
+            }
+        }
+        changed
+    }
+
+    pub fn restore_frame(&self, frame: Bytes) -> Bytes {
+        // SseFrames has validated and assembled one complete UTF-8 event.
+        // Rewrite only public response identity fields, never generated text or
+        // error messages containing the same string.
+        let Ok(text) = std::str::from_utf8(&frame) else {
+            return frame;
+        };
+        let data = text
+            .lines()
+            .filter_map(|line| {
+                line.strip_prefix("data:")
+                    .map(|v| v.strip_prefix(' ').unwrap_or(v))
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let Ok(mut value) = serde_json::from_str::<Value>(&data) else {
+            return frame; // DONE or a heartbeat.
+        };
+        if !self.restore_json(&mut value) {
+            return frame;
+        }
+        let mut output = String::new();
+        let mut written = false;
+        for line in text.lines() {
+            if line.starts_with("data:") {
+                if !written {
+                    output.push_str(&format!("data: {value}\n"));
+                    written = true;
+                }
+            } else {
+                output.push_str(line);
+                output.push('\n');
+            }
+        }
+        Bytes::from(output)
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct StreamFailure {
     pub status: StatusCode,
