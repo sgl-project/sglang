@@ -12,7 +12,9 @@
 # limitations under the License.
 # ==============================================================================
 
+import atexit
 import math
+from functools import partial
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -54,6 +56,8 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     get_moe_runner_backend,
+    post_experts_output_is_complete,
+    should_skip_mlp_all_reduce,
     should_skip_post_experts_all_reduce,
     should_use_dp_reduce_scatterv,
 )
@@ -156,6 +160,41 @@ class BeamUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         return None
 
 
+# Token counts per forward where FlashInfer's MNNVL all-reduce beats the best
+# CustomAllReduceV2 algorithm with the same norm, measured on GB300 TP4 between
+# real-shape GEMMs. Other GPUs and TP sizes are unmeasured.
+_FLASHINFER_AR_TOKEN_BAND = {((10, 3), 4): (96, 640)}
+
+
+def _flashinfer_all_reduce(x: torch.Tensor, workspace) -> torch.Tensor:
+    import flashinfer.comm as fi_comm
+
+    x = x.contiguous()
+    out = torch.empty_like(x)
+    # With PDL the MNNVL kernel releases the next launch before its output store;
+    # the PDL norm's gdc_wait orders its read of `out`.
+    fi_comm.allreduce_fusion(
+        input=x,
+        workspace=workspace,
+        pattern=fi_comm.AllReduceFusionPattern.kAllReduce,
+        launch_with_pdl=True,
+        output=out,
+    )
+    return out
+
+
+def _mlp_owes_single_tp_sum() -> bool:
+    """Whether the MLP output owes one TP-wide sum that no combine already ran."""
+    parallel = get_parallel()
+    one_group = (
+        parallel.moe_ep_size == 1 and parallel.moe_tp_size == parallel.tp_size
+    ) or (parallel.moe_tp_size == 1 and parallel.moe_ep_size == parallel.tp_size)
+    return one_group and not (
+        post_experts_output_is_complete(is_tp_path=True)
+        or post_experts_output_is_complete(is_tp_path=False)
+    )
+
+
 class BeamMLP(nn.Module):
     def __init__(
         self,
@@ -180,10 +219,10 @@ class BeamMLP(nn.Module):
         )
         self.act_fn = BeamSiluAndMul()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, skip_all_reduce: bool = False) -> torch.Tensor:
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
+        x, _ = self.down_proj(x, skip_all_reduce=skip_all_reduce)
         return x
 
 
@@ -287,8 +326,12 @@ class BeamMoE(nn.Module):
         self,
         hidden_states: torch.Tensor,
         defer_sum: bool = False,
+        skip_all_reduce: bool = False,
     ) -> torch.Tensor:
         """Return combined outputs, or local expert outputs for Beam's fusion.
+
+        `skip_all_reduce=True` returns this rank's partial sum and leaves the
+        post-experts all-reduce to the caller.
 
         `defer_sum=True` is restricted by the caller to the unquantized Triton
         TP path. It returns contiguous BF16 [tokens, top_k, hidden_size] outputs
@@ -360,6 +403,8 @@ class BeamMoE(nn.Module):
                 fuse_swiglu_interleaved=self.experts.quant_method.w13_swiglu_interleaved,
             )
         output = self.experts(hidden_states, topk_output)
+        if skip_all_reduce:
+            return output
         if self.ep_size > 1 and not should_skip_post_experts_all_reduce(
             is_tp_path=False
         ):
@@ -679,6 +724,8 @@ class BeamDecoderLayer(nn.Module):
         ssmax_scale: torch.Tensor | None,
         moe_all_reduce_comm=None,
         attention_all_reduce_comm=None,
+        band_all_reduce=None,
+        mlp_band_all_reduce=None,
     ) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
         """Same arithmetic as `forward` with the two norm/residual transitions fused.
 
@@ -686,6 +733,8 @@ class BeamDecoderLayer(nn.Module):
         previous transition. Returns the next layer's normalized input (or None
         when `next_norm_weight` is None, on the last layer of a pipeline stage
         that does not own the final norm) and the new residual stream.
+        `band_all_reduce` / `mlp_band_all_reduce`, when given, replace the TP
+        all-reduce of the attention / MLP output ahead of the unfused norm.
         """
         if attention_all_reduce_comm is not None:
             from sglang.kernels.ops.communication.beam_all_reduce import (
@@ -705,7 +754,18 @@ class BeamDecoderLayer(nn.Module):
                 self.attn_residual_scales,
             )
         else:
-            attn = self.self_attn(positions, normed, forward_batch, ssmax_scale)
+            if band_all_reduce is not None:
+                attn = band_all_reduce(
+                    self.self_attn(
+                        positions,
+                        normed,
+                        forward_batch,
+                        ssmax_scale,
+                        skip_all_reduce=True,
+                    )
+                )
+            else:
+                attn = self.self_attn(positions, normed, forward_batch, ssmax_scale)
             normed, residual = self.sandwich_residual_norm(
                 attn,
                 residual,
@@ -735,7 +795,10 @@ class BeamDecoderLayer(nn.Module):
                 self.mlp_residual_scales,
                 routed_scale=self.mlp.config.routed_scaling_factor,
             )
-        mlp = self._forward_mlp(normed, forward_batch)
+        if mlp_band_all_reduce is not None:
+            mlp = mlp_band_all_reduce(self.mlp(normed, skip_all_reduce=True))
+        else:
+            mlp = self._forward_mlp(normed, forward_batch)
         return self.sandwich_residual_norm(
             mlp,
             residual,
@@ -792,7 +855,15 @@ class BeamModel(nn.Module):
         )
         # Decoder layers whose outputs feed a speculative drafter (DFlash).
         self.layers_to_capture = ()
-        self.fuse_all_reduce = quant_config is None and config.num_experts_per_tok == 8
+        # o_proj reduces BF16 partial sums in either format; FP8 is unvalidated.
+        self.fuse_attention_all_reduce = get_beam_quantization(quant_config) in (
+            "bf16",
+            "nvfp4",
+        )
+        # Deferred expert sums need the BF16 Triton runner's per-expert outputs.
+        self.fuse_moe_all_reduce = (
+            quant_config is None and config.num_experts_per_tok == 8
+        )
         self._beam_all_reduce_comm = None
         # Offload wrappers load weights through each layer's regular forward.
         # Fusing across layer boundaries would bypass those wrappers.
@@ -802,6 +873,87 @@ class BeamModel(nn.Module):
             and get_exec().offload.offload_group_size <= 0
             and self.start_layer < self.end_layer
         )
+        self._flashinfer_ar_band: Optional[Tuple[int, int]] = None
+        self._flashinfer_ar = None
+        if self.fuse_layers and self.fuse_attention_all_reduce:
+            self._init_flashinfer_ar_band(config.hidden_size)
+        self._band_mlp_single_reduction = _mlp_owes_single_tp_sum()
+
+    def _init_flashinfer_ar_band(self, hidden_size: int) -> None:
+        # Runs at construction so the rendezvous stays outside CUDA graph capture;
+        # all TP ranks see the same config, and one failed allocation disables it.
+        parallel = get_parallel()
+        execution = get_exec()
+        if (
+            parallel.tp_size < 2
+            or parallel.attn_tp_size != parallel.tp_size
+            or parallel.attn_cp_size != 1
+            or execution.graph.enable_torch_compile
+            or execution.deterministic.enable_deterministic_inference
+            or execution.comm.disable_custom_all_reduce
+            # The global FlashInfer all-reduce already serves every size.
+            or execution.comm.flashinfer_allreduce_fusion_backend is not None
+            or get_lora().enable_lora
+            or get_fused_op_backend() is not None
+            or not torch.cuda.is_available()
+            or torch.version.hip is not None
+        ):
+            return
+        band = _FLASHINFER_AR_TOKEN_BAND.get(
+            (torch.cuda.get_device_capability(), parallel.tp_size)
+        )
+        from sglang.srt.layers.flashinfer_comm_fusion import (
+            FlashInferWorkspaceManager,
+            is_flashinfer_allreduce_unavailable,
+        )
+        from sglang.srt.utils import is_flashinfer_available
+
+        if (
+            band is None
+            or not is_flashinfer_available()
+            or is_flashinfer_allreduce_unavailable()
+        ):
+            return
+        group = parallel.tp_group
+        manager = FlashInferWorkspaceManager()
+        manager.initialize(
+            world_size=group.world_size,
+            rank=group.rank_in_group,
+            max_token_num=band[1],
+            hidden_dim=hidden_size,
+            backend="mnnvl",
+            dtype=torch.bfloat16,
+            device_group=group.device_group,
+            cpu_group=group.cpu_group,
+        )
+        ready = torch.tensor([int(manager.workspace is not None)], dtype=torch.int32)
+        torch.distributed.all_reduce(
+            ready, op=torch.distributed.ReduceOp.MIN, group=group.cpu_group
+        )
+        if not ready.item():
+            manager.cleanup()
+            return
+        atexit.register(manager.cleanup)
+        self._flashinfer_ar_band = band
+        self._flashinfer_ar = partial(
+            _flashinfer_all_reduce, workspace=manager.workspace
+        )
+
+    def _band_all_reduce(self, hidden_states: torch.Tensor):
+        """The FlashInfer all-reduce if this forward's token count is in the band."""
+        band = self._flashinfer_ar_band
+        if (
+            band is None
+            or not band[0] <= hidden_states.shape[0] <= band[1]
+            or hidden_states.dtype != torch.bfloat16
+            or torch.compiler.is_compiling()
+            or get_forward().sp_active
+        ):
+            return None
+        return self._flashinfer_ar
+
+    def _band_covers_mlp(self) -> bool:
+        return self._band_mlp_single_reduction and not should_skip_mlp_all_reduce()
 
     def _all_reduce_limits(self, hidden_states) -> Optional[Tuple[int, int]]:
         """Return attention/MoE token limits for eligible inputs, without allocation."""
@@ -816,7 +968,7 @@ class BeamModel(nn.Module):
             or hidden_states.data_ptr() % 16 != 0
             or hidden_states.shape[1] != 5120
             or not 0 < hidden_states.shape[0] <= 64
-            or not self.fuse_all_reduce
+            or not self.fuse_attention_all_reduce
         ):
             return None
         # Attention owns a TP reduction independently of the expert layout.
@@ -850,7 +1002,8 @@ class BeamModel(nn.Module):
         # Deferred expert outputs currently require unsharded expert IDs and
         # one TP reduction. EP keeps its normal expert mapping and reduction.
         if (
-            parallel.moe_ep_size != 1
+            not self.fuse_moe_all_reduce
+            or parallel.moe_ep_size != 1
             or parallel.moe_tp_size != parallel.tp_size
             or should_skip_post_experts_all_reduce(is_tp_path=True)
         ):
@@ -955,6 +1108,12 @@ class BeamModel(nn.Module):
                 moe_all_reduce_comm = comm
             if hidden_states.shape[0] <= attention_max_tokens:
                 attention_all_reduce_comm = comm
+        band_all_reduce = self._band_all_reduce(hidden_states)
+        mlp_band_all_reduce = (
+            band_all_reduce
+            if band_all_reduce is not None and self._band_covers_mlp()
+            else None
+        )
         residual = hidden_states
         normed = self.layers[self.start_layer].input_layernorm(residual)
         for layer_id in range(self.start_layer, self.end_layer):
@@ -973,6 +1132,8 @@ class BeamModel(nn.Module):
                 ssmax_scale,
                 moe_all_reduce_comm,
                 attention_all_reduce_comm,
+                band_all_reduce=band_all_reduce,
+                mlp_band_all_reduce=mlp_band_all_reduce,
             )
             if layer_id in self.layers_to_capture:
                 aux_hidden_states.append(residual)

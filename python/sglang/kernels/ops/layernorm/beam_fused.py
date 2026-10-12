@@ -46,17 +46,26 @@ def _fused_sandwich_residual_rmsnorm_kernel(
     BLOCK_SIZE: tl.constexpr,
     HAS_SANDWICH: tl.constexpr,
     HAS_OUT_NORM: tl.constexpr,
+    USE_PDL: tl.constexpr,
 ):
     row = tl.program_id(axis=0).to(tl.int64)
     offsets = tl.arange(0, BLOCK_SIZE)
     mask = offsets < hidden_dim
     act_dtype = x_ptr.dtype.element_ty
 
+    # The preceding kernel does not write the weights; load them before the PDL wait.
+    if HAS_SANDWICH:
+        w = tl.load(sandwich_weight_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    if HAS_OUT_NORM:
+        w2 = tl.load(out_weight_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+
     x = tl.load(x_ptr + row * x_stride_row + offsets, mask=mask, other=0.0).to(
         tl.float32
     )
     if HAS_SANDWICH:
-        w = tl.load(sandwich_weight_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
         rstd = tl.rsqrt(tl.sum(x * x, axis=0) / hidden_dim + eps)
         # The standalone RMSNorm writes the activation dtype before the combine.
         x = (x * rstd * w).to(act_dtype).to(tl.float32)
@@ -74,7 +83,6 @@ def _fused_sandwich_residual_rmsnorm_kernel(
 
     if HAS_OUT_NORM:
         c = combined.to(tl.float32)
-        w2 = tl.load(out_weight_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
         rstd2 = tl.rsqrt(tl.sum(c * c, axis=0) / hidden_dim + eps)
         tl.store(out_ptr + out_offsets, (c * rstd2 * w2).to(act_dtype), mask=mask)
 
@@ -87,6 +95,8 @@ def fused_sandwich_residual_rmsnorm(
     eps: float,
     x_scale: float,
     residual_scale: float,
+    *,
+    enable_pdl: bool = False,
 ) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
     """Return `(next_norm(combined), combined)`; the first is None without `out_weight`.
 
@@ -94,7 +104,8 @@ def fused_sandwich_residual_rmsnorm(
     `sandwich_weight` is the post-norm weight applied to `branch` before the
     combine (None skips it); `out_weight` is the following norm's weight (None
     returns only the combined stream, for the last layer of a non-final
-    pipeline stage).
+    pipeline stage). `enable_pdl` launches with programmatic dependent launch;
+    the caller must check that the device supports it.
     """
     if branch.ndim != 2 or residual.shape != branch.shape:
         raise ValueError(
@@ -118,6 +129,7 @@ def fused_sandwich_residual_rmsnorm(
         residual_scale,
         out,
         combined,
+        enable_pdl,
     )
     return out, combined
 
@@ -133,6 +145,7 @@ def _fused_sandwich_residual_rmsnorm(
     residual_scale: float,
     out: Optional[torch.Tensor],
     combined: torch.Tensor,
+    enable_pdl: bool,
 ) -> None:
     hidden_dim = branch.shape[1]
     rows = branch.shape[0]
@@ -157,6 +170,8 @@ def _fused_sandwich_residual_rmsnorm(
         BLOCK_SIZE=triton.next_power_of_2(hidden_dim),
         HAS_SANDWICH=sandwich_weight is not None,
         HAS_OUT_NORM=out_weight is not None,
+        USE_PDL=enable_pdl,
         num_warps=8,
         enable_fp_fusion=False,
+        **({"launch_pdl": True} if enable_pdl else {}),
     )
