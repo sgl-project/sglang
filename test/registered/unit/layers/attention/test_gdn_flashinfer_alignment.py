@@ -9,6 +9,7 @@ from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
     _FlashInferGDNCache,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
@@ -40,7 +41,7 @@ def _make_kernel_without_flashinfer() -> FlashInferGDNKernel:
     return kernel
 
 
-class TestFlashInferGDNAlignment(unittest.TestCase):
+class TestFlashInferGDNAlignment(CustomTestCase):
     def test_extend_writes_directly_to_preallocated_output(self):
         kernel = _make_kernel_without_flashinfer()
         kernel.use_state_pool = True
@@ -412,7 +413,7 @@ class TestFlashInferGDNAlignment(unittest.TestCase):
         torch.testing.assert_close(second_pool, torch.full_like(second_pool, 2))
 
 
-class TestFlashInferGDNCache(unittest.TestCase):
+class TestFlashInferGDNCache(CustomTestCase):
     def test_flashinfer_bridge_reuses_aot_cache(self):
         kernel = type("Kernel", (), {"__module__": "flashinfer.gdn_kernels.test"})
         ffi_option = type("EnableTVMFFI", (), {})

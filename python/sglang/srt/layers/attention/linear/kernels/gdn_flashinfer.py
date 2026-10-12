@@ -15,6 +15,7 @@ import os
 from typing import TYPE_CHECKING, Optional
 
 import torch
+
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
@@ -156,6 +157,7 @@ def _enable_gdn_aot_cache():
     from pathlib import Path
 
     from flashinfer.gdn_kernels.delta_rule_dsl import custom_compile_cache
+
     from sglang.kernels.jit.cute_aot_cache import get_jit_cache
 
     previous = custom_compile_cache._in_mem_compile_cache
