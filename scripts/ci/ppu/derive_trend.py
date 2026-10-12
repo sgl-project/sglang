@@ -28,6 +28,23 @@ def _order(record):
     )
 
 
+def _legacy_perf_duplicate(left, right):
+    rows = (left["row"], right["row"])
+    if any(
+        row["schema_version"] != contract.PERF
+        or row["status"] != "failed"
+        or "github_run_attempt" in row["provenance"]
+        for row in rows
+    ):
+        return False
+    without_time = []
+    for row in rows:
+        value = dict(row)
+        value.pop("generated_at")
+        without_time.append(contract.canonical(value))
+    return without_time[0] == without_time[1]
+
+
 def _deduplicate(records):
     identities, copies, result = {}, set(), []
     # attempt小者先处理，相同原报告的旧perf重发不能伪装为一次新的测量。
@@ -35,10 +52,15 @@ def _deduplicate(records):
         key = contract.series_key(record["row"])
         identity = (*key, record["run"], record["attempt"])
         old = identities.get(identity)
-        contract.require(old is None or old == record["content"], "同测量身份内容冲突")
+        contract.require(
+            old is None
+            or old["content"] == record["content"]
+            or _legacy_perf_duplicate(old, record),
+            "同测量身份内容冲突",
+        )
         if old is not None:
             continue
-        identities[identity] = record["content"]
+        identities[identity] = record
         copy_key = (*key, record["run"], record["content"])
         legacy = record["row"]["schema_version"] == contract.PERF and not record["row"][
             "provenance"

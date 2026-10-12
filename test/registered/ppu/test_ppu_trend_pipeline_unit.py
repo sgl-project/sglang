@@ -396,6 +396,34 @@ class TestDerivation(unittest.TestCase):
         self.assertIn("质量失败", rendered)
         self.assertIn("insufficient_samples", rendered)
 
+    def test_legacy_perf_duplicate_failure_keeps_earliest_observation(self):
+        earliest = perf_row()
+        earliest.update(
+            status="failed",
+            reason_code="server_start_failed",
+            metrics=None,
+        )
+        save(
+            self.root / "data/perf-test",
+            earliest,
+            "2026-09-24-123-1.jsonl",
+        )
+        later = copy.deepcopy(earliest)
+        later["generated_at"] = "2026-09-25T00:00:00Z"
+        save(
+            self.root / "data/perf-test",
+            later,
+            "2026-09-25-123-1.jsonl",
+        )
+
+        (series,) = self.derive(day="25")["series"]
+
+        self.assertEqual(series["n_unmeasured"], 1)
+        self.assertEqual(
+            series["latest_observation"]["generated_at"],
+            "2026-09-24T00:00:00+00:00",
+        )
+
     def test_legacy_republication_and_future_attempt_do_not_bias_snapshot(self):
         value = row(run="5", day="23")
         value = {
@@ -469,6 +497,67 @@ class TestDerivation(unittest.TestCase):
         self.assertEqual(series["metrics"]["ratio"]["stats"]["n"], 2)
         self.assertIsNone(series["metrics"]["score"]["deviation"])
         self.assertEqual(series["latest_observation"]["run_id"], "4")
+
+    def test_legacy_perf_duplicate_with_other_change_is_rejected(self):
+        original = perf_row()
+        original.update(
+            status="failed",
+            reason_code="server_start_failed",
+            metrics=None,
+        )
+        save(
+            self.root / "data/perf-test",
+            original,
+            "2026-09-24-123-1.jsonl",
+        )
+        changed = copy.deepcopy(original)
+        changed["generated_at"] = "2026-09-25T00:00:00Z"
+        changed["tc_name"] = "different-prefill"
+        save(
+            self.root / "data/perf-test",
+            changed,
+            "2026-09-25-123-1.jsonl",
+        )
+
+        with self.assertRaisesRegex(ValueError, "同测量身份内容冲突"):
+            self.derive(day="25")
+
+    def test_legacy_perf_measured_duplicate_with_only_time_change_is_rejected(self):
+        original = perf_row()
+        save(
+            self.root / "data/perf-test",
+            original,
+            "2026-09-24-123-1.jsonl",
+        )
+        later = copy.deepcopy(original)
+        later["generated_at"] = "2026-09-25T00:00:00Z"
+        save(
+            self.root / "data/perf-test",
+            later,
+            "2026-09-25-123-1.jsonl",
+        )
+
+        with self.assertRaisesRegex(ValueError, "同测量身份内容冲突"):
+            self.derive(day="25")
+
+    def test_current_perf_duplicate_with_only_time_change_is_rejected(self):
+        original = perf_row()
+        original["provenance"]["github_run_attempt"] = "1"
+        save(
+            self.root / "data/perf-test",
+            original,
+            "2026-09-24-123-1.jsonl",
+        )
+        later = copy.deepcopy(original)
+        later["generated_at"] = "2026-09-25T00:00:00Z"
+        save(
+            self.root / "data/perf-test",
+            later,
+            "2026-09-25-123-1.jsonl",
+        )
+
+        with self.assertRaisesRegex(ValueError, "同测量身份内容冲突"):
+            self.derive(day="25")
 
     def test_conflicting_identity_and_filename_are_rejected(self):
         value = row()
