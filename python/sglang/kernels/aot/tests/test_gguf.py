@@ -640,6 +640,47 @@ def test_moe_mmq_repeated_expert_is_masked():
 
 
 @torch.inference_mode()
+def test_moe_a8_more_than_256_experts():
+    # ggml_moe_a8 (the dp4a MoE kernel) used to skip every slot whose expert id
+    # was above 255, so models with more experts lost those routes (zero rows).
+    from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import (
+        moe_align_block_size,
+    )
+
+    quant_type = GGMLQuantizationType.Q4_0
+    num_experts, top_k, num_tokens, rows, cols = 300, 4, 96, 256, 512
+    qweight, weight = moe_synthetic_weight(quant_type, rows, cols)
+    # the 128 cached experts tiled to 300: expert e is weight e % 128
+    reps = (num_experts + 127) // 128
+    qweight = qweight.repeat(reps, 1, 1)[:num_experts].contiguous()
+    weight = weight.repeat(reps, 1, 1)[:num_experts]
+    # every route goes to an expert >= 256
+    ids = (
+        random_topk_ids(num_tokens, num_experts - 256, top_k, (), seed=3, masked=False)
+        + 256
+    )
+    x = torch.randn(num_tokens, cols, device="cuda", dtype=torch.float16)
+    block_size = ggml_moe_get_block_size(quant_type)
+    sorted_ids, expert_ids, num_post_pad = moe_align_block_size(
+        ids, block_size, num_experts
+    )
+    out = ggml_moe_a8(
+        x,
+        qweight,
+        sorted_ids,
+        expert_ids,
+        num_post_pad,
+        quant_type,
+        rows,
+        top_k,
+        num_tokens,
+    ).view(num_tokens, top_k, rows)
+    ref = moe_reference(x, weight, ids, False)
+    assert (out.float().abs().sum(-1) > 0).all()
+    assert rel_l2(out.float(), ref) < MATMUL_REL_L2
+
+
+@torch.inference_mode()
 def test_moe_mmq_unsupported_type_raises():
     block_size, type_size = GGML_QUANT_SIZES[GGMLQuantizationType.Q8_1]
     qweight = torch.zeros(4, 128, 1024 // block_size * type_size, dtype=torch.uint8)
