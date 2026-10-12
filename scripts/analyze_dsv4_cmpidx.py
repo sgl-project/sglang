@@ -323,6 +323,157 @@ def report_lhid_pos(rows):
         print(f"     ... {len(div) - MAX_DIFF_SHOWN} more divergent groups")
 
 
+LHID_ACCEPT_RUNBOOK = (
+    "[LHID-ACCEPT-RUNBOOK] windowed hpos probe (MISS vs HIT per absolute "
+    "position):\n"
+    "  DSV4_DUMP_LHID=<layers> DSV4_DUMP_C4POS=1 "
+    "DSV4_DUMP_MIN_POS=<win_lo> DSV4_DUMP_MAX_POS=<win_hi> "
+    "<serve> ; <curl miss> ; <curl hit> ; "
+    "python scripts/analyze_dsv4_cmpidx.py /tmp/dsv4_lhid.log\n"
+    "  S1 gate: every dumped decoder layer's hpos must be IDENTICAL across "
+    "MISS/HIT at every shared absolute position (divergent=0). S2 sanity: two "
+    "MISS requests must be IDENTICAL at every shared position. S3 is MANUAL "
+    "(curl#1..5 output-text byte-equality)."
+)
+
+
+def _lhid_by_layer(group):
+    """``{layer: {pos: md5}}`` of one request's [LHID] ``hpos`` rows.
+
+    The FIRST row carrying an absolute position wins (one h hash per position),
+    mirroring ``_xin_by_layer`` for the ``[XIN]`` ``xpos`` field.
+    """
+    out = defaultdict(dict)
+    for r in group:
+        ly = _int(r, "layer")
+        for pos, h in _lhid_hpos(r).items():
+            out[ly].setdefault(pos, h)
+    return out
+
+
+def report_lhid_accept(lhid_rows, c4pos_rows, idxin_rows):
+    """``[LHID-ACCEPT]`` read-only acceptance gate for the MISS==HIT fix.
+
+    Encodes the fix CONTRACT as a verdict so the eventual fix is gated by a
+    check that is RED on today's logs (the ``[LHID-ACCEPT] S1 ... => FAIL`` line)
+    and GREEN once the shared-position hidden state matches:
+
+      * S1 (fix gate): across MISS vs HIT, at EVERY shared absolute position,
+        EVERY dumped decoder layer's ``hpos`` hash must be identical. The count
+        of shared (layer, position) groups carrying >1 distinct hash is
+        ``divergent``; ``divergent==0`` -> PASS, else FAIL.
+      * S2 (sanity, must always PASS): two-MISS self-control -- two MISS requests
+        must have IDENTICAL ``hpos`` at every shared position -> IDENTICAL,
+        otherwise MISMATCH.
+      * S3 (placeholder): the curl#1..5 OUTPUT-TEXT byte-equality is MANUAL, so
+        the line is printed with ``<manual>`` for the user to fill.
+
+    Alignment-correct: compares per ABOSLUTE position via ``hpos`` (never a
+    whole-tensor md5 across differing ``ntok``). MISS/HIT is split by the
+    [C4POS] ``first`` label with the [IDXIN] ``sps`` / largest-``ntok``
+    fallbacks (the SOURCE is printed). When ``hpos`` is absent the gate prints
+    exactly what is missing and NEVER a false PASS.
+    """
+    print("\n== [LHID-ACCEPT] MISS-vs-HIT hidden-state acceptance gate ==")
+    if not lhid_rows:
+        print("  [LHID-ACCEPT] no [LHID] rows (dump gate off?)")
+        print("  [LHID-ACCEPT] S1 divergent=? => CANNOT-VERIFY "
+              "(missing: [LHID] rows)")
+        print("  [LHID-ACCEPT] S2 two-MISS SKIP (no [LHID] rows)")
+        print("  [LHID-ACCEPT] S3 curl#1..5 byte-equal: <manual>")
+        print(LHID_ACCEPT_RUNBOOK)
+        return
+    if not any("hpos" in r for r in lhid_rows):
+        print("  [LHID-ACCEPT] S1 divergent=? => CANNOT-VERIFY "
+              "(missing: [LHID] `hpos=[pos:md5|..]` per-absolute-position field; "
+              "re-run WINDOWED with DSV4_DUMP_MIN_POS + DSV4_DUMP_MAX_POS)")
+        print("  [LHID-ACCEPT] S2 two-MISS SKIP (no `hpos` field)")
+        print("  [LHID-ACCEPT] S3 curl#1..5 byte-equal: <manual>")
+        print(LHID_ACCEPT_RUNBOOK)
+        return
+
+    reqs = _c4pos_requests(lhid_rows)
+    source, miss_idx, hit_idx, note = _cmp_aligned_roles(
+        reqs, c4pos_rows, idxin_rows)
+    print(f"  [LHID-ACCEPT] split_source={source} miss_req={miss_idx} "
+          f"hit_req={hit_idx}")
+    print(f"  [LHID-ACCEPT] rules: {note}")
+    miss_maps = [_lhid_by_layer(reqs[i]) for i in miss_idx]
+    hit_maps = [_lhid_by_layer(reqs[i]) for i in hit_idx]
+
+    # --- S1 (fix gate): MISS vs HIT identical at every shared absolute pos ---
+    if not miss_idx or not hit_idx:
+        print("  [LHID-ACCEPT] S1 divergent=? => CANNOT-VERIFY "
+              f"(need >=1 MISS (first==0) and >=1 HIT (first>0); got "
+              f"miss={len(miss_idx)} hit={len(hit_idx)})")
+    else:
+        divergent = 0
+        compared = 0
+        first_bad = None
+        layers = sorted({ly for m in miss_maps for ly in m})
+        for ly in layers:
+            miss_pos = set()
+            for m in miss_maps:
+                miss_pos |= set(m.get(ly, {}))
+            hit_pos = set()
+            for h in hit_maps:
+                hit_pos |= set(h.get(ly, {}))
+            for pos in sorted(miss_pos & hit_pos):
+                compared += 1
+                hashes = set()
+                for m in miss_maps:
+                    if pos in m.get(ly, {}):
+                        hashes.add(m[ly][pos])
+                for h in hit_maps:
+                    if pos in h.get(ly, {}):
+                        hashes.add(h[ly][pos])
+                if len(hashes) > 1:
+                    divergent += 1
+                    if first_bad is None:
+                        first_bad = (ly, pos, sorted(hashes))
+        verdict = "PASS" if divergent == 0 else "FAIL"
+        print(f"  [LHID-ACCEPT] S1 divergent={divergent} => {verdict} "
+              f"(shared layer/pos groups compared={compared})")
+        if first_bad is not None:
+            ly0, p0, h0 = first_bad
+            print(f"  [LHID-ACCEPT] S1 first divergence layer={ly0} pos={p0} "
+                  f"hashes={h0}")
+
+    # --- S2 (sanity): two MISS requests MUST be identical ---
+    if len(miss_maps) < 2:
+        print(f"  [LHID-ACCEPT] S2 two-MISS SKIP (need >=2 MISS requests; got "
+              f"{len(miss_maps)})")
+    else:
+        ctl_pos = ctl_diff = 0
+        first_bad2 = None
+        base = miss_maps[0]
+        for ly in sorted(base):
+            for pos in sorted(base[ly]):
+                if not all(ly in m and pos in m[ly] for m in miss_maps[1:]):
+                    continue
+                ctl_pos += 1
+                hashes = {m[ly][pos] for m in miss_maps}
+                if len(hashes) > 1:
+                    ctl_diff += 1
+                    if first_bad2 is None:
+                        first_bad2 = (ly, pos, sorted(hashes))
+        if ctl_pos == 0:
+            print("  [LHID-ACCEPT] S2 two-MISS NO-SHARED-POSITION "
+                  "(cannot sanity-check)")
+        elif ctl_diff == 0:
+            print(f"  [LHID-ACCEPT] S2 two-MISS IDENTICAL "
+                  f"(at all {ctl_pos} shared position(s))")
+        else:
+            print(f"  [LHID-ACCEPT] S2 two-MISS MISMATCH "
+                  f"({ctl_diff}/{ctl_pos} shared position(s) differ; first "
+                  f"layer={first_bad2[0]} pos={first_bad2[1]} "
+                  f"hashes={first_bad2[2]})")
+
+    # --- S3 (placeholder): curl#1..5 output-text byte-equality is MANUAL ---
+    print("  [LHID-ACCEPT] S3 curl#1..5 byte-equal: <manual>")
+    print(LHID_ACCEPT_RUNBOOK)
+
+
 XIN_POS_RUNBOOK = (
     "[XIN-POS-RUNBOOK] per-absolute-position indexer input x hash "
     "(window around P*):\n"
@@ -3176,6 +3327,8 @@ def main(path):
             report_lhid(rows)
             print("  ---- [LHID] per-absolute-position single row ----")
             report_lhid_pos(rows)
+            report_lhid_accept(rows, recs.get("C4POS", []),
+                               recs.get("IDXIN", []))
             print("  ---- [LHID] per-c128-block ----")
             report_blkx(rows, "LHID")
             continue
@@ -3791,6 +3944,37 @@ def _selftest():
         xin_out = _run_main(xin_same)
         xin_diff_out = _run_main(xin_diff)
 
+        # --- [LHID-ACCEPT] MISS-vs-HIT fix gate (S1) + two-MISS control (S2) ---
+        # K1: two MISS (first==0) agree at 17597, the HIT (first==16384)
+        #     DIFFERS -> S1 divergent=1 => FAIL (the RED gate on today's logs);
+        #     S2 two-MISS stays IDENTICAL.
+        # K2: the HIT matches the MISS hash -> S1 divergent=0 => PASS.
+        # K3: the two MISS requests DIFFER (aa vs bb) with a HIT present ->
+        #     S2 two-MISS MISMATCH (proves the S2 control is NON-VACUOUS).
+        # K4: no `hpos=` field -> S1 CANNOT-VERIFY, never a false PASS.
+        lhid_acc_fail = [
+            CHAT, _c4pos_first(0), _lhid_line(1, "[17597:aa]"),
+            CHAT, _c4pos_first(0), _lhid_line(1, "[17597:aa]"),
+            CHAT, _c4pos_first(16384), _lhid_line(1, "[17597:bb]"),
+        ]
+        lhid_acc_pass = [
+            CHAT, _c4pos_first(0), _lhid_line(1, "[17597:aa]"),
+            CHAT, _c4pos_first(0), _lhid_line(1, "[17597:aa]"),
+            CHAT, _c4pos_first(16384), _lhid_line(1, "[17597:aa]"),
+        ]
+        lhid_acc_2miss = [
+            CHAT, _c4pos_first(0), _lhid_line(1, "[17597:aa]"),
+            CHAT, _c4pos_first(0), _lhid_line(1, "[17597:bb]"),
+            CHAT, _c4pos_first(16384), _lhid_line(1, "[17597:aa]"),
+        ]
+        la_fail_out = _run_main(lhid_acc_fail)
+        la_pass_out = _run_main(lhid_acc_pass)
+        la_2miss_out = _run_main(lhid_acc_2miss)
+        la_nohpos_out = _run_main([
+            CHAT, _c4pos_first(0),
+            "[LHID] layer=1 lastpos=17597 ntok=1 md5=full blkx=[]",
+        ])
+
         checks = [
             ("kpg full value parsed",
              bool(idxin) and idxin[0].get("kpg") == kpg_a),
@@ -4017,6 +4201,22 @@ def _selftest():
              and "pos=17598" in xin_diff_out
              and "X_miss=ab" in xin_diff_out
              and "X_hit=ef" in xin_diff_out),
+            ("[LHID-ACCEPT] S1 divergent>0 -> FAIL (RED gate, non-vacuous)",
+             "[LHID-ACCEPT] S1 divergent=1 => FAIL" in la_fail_out
+             and "S1 first divergence layer=1 pos=17597" in la_fail_out),
+            ("[LHID-ACCEPT] S1 divergent=0 -> PASS (identical fixture)",
+             "[LHID-ACCEPT] S1 divergent=0 => PASS" in la_pass_out
+             and "S1 divergent=1 => FAIL" not in la_pass_out),
+            ("[LHID-ACCEPT] S2 two-MISS IDENTICAL on the PASS fixture",
+             "[LHID-ACCEPT] S2 two-MISS IDENTICAL" in la_pass_out),
+            ("[LHID-ACCEPT] S2 two-MISS MISMATCH (control non-vacuous)",
+             "[LHID-ACCEPT] S2 two-MISS MISMATCH" in la_2miss_out),
+            ("[LHID-ACCEPT] S3 manual placeholder printed",
+             "[LHID-ACCEPT] S3 curl#1..5 byte-equal: <manual>"
+             in la_pass_out),
+            ("[LHID-ACCEPT] no hpos -> CANNOT-VERIFY (no false PASS)",
+             "S1 divergent=? => CANNOT-VERIFY" in la_nohpos_out
+             and "S1 divergent=0 => PASS" not in la_nohpos_out),
         ]
         failed = [name for name, ok in checks if not ok]
         for name, ok in checks:
