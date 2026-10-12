@@ -127,6 +127,10 @@ set(FlashMLA_SOURCES
 
 if(FLASHMLA_ENABLE_SM100)
     list(APPEND FlashMLA_SOURCES
+        # Fused Q RoPE + sparse attention + inverse RoPE + MXFP8 output.
+        # The implementation is already present in the compatible dependency
+        # pin; expose it without changing legacy KV layouts or SM90 support.
+        "csrc/flashmla_mega_extension.cc"
         # sm100 dense prefill/bwd.
         ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm100/prefill/dense/fmha_cutlass_fwd_sm100.cu
         ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm100/prefill/dense/fmha_cutlass_bwd_sm100.cu
@@ -155,6 +159,21 @@ if(FLASHMLA_ENABLE_SM100)
         ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512_v41_splitkv.cu
         ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512_v41fp4.cu
         ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512_v41fp4_splitkv.cu
+    )
+    set(FLASHMLA_MEGA_ROOT ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd)
+    foreach(HEADS 64 128)
+        foreach(NORM norm nonorm)
+            list(APPEND FlashMLA_SOURCES
+                ${FLASHMLA_MEGA_ROOT}/core_attn/instantiations/v4_h${HEADS}_prefill_${NORM}.cu
+                ${FLASHMLA_MEGA_ROOT}/core_attn/instantiations/v4_h${HEADS}_decode_${NORM}.cu
+                ${FLASHMLA_MEGA_ROOT}/core_attn/instantiations/v41_h${HEADS}_decode_${NORM}.cu
+                ${FLASHMLA_MEGA_ROOT}/core_attn/instantiations/v41fp4_h${HEADS}_decode_${NORM}.cu
+            )
+        endforeach()
+    endforeach()
+    list(APPEND FlashMLA_SOURCES
+        ${FLASHMLA_MEGA_ROOT}/permute_q_b_proj/kernel.cu
+        ${FLASHMLA_MEGA_ROOT}/permute_wv_proj/kernel.cu
     )
 endif()
 
