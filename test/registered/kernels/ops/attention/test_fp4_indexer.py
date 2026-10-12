@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import sys
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -15,7 +17,9 @@ from sglang.kernels.ops.attention.dsv4 import (
     fused_q_indexer_rope_hadamard_fp4_quant,
 )
 from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+    finish_paged_indexer_topk,
     fp4_index_logits_decode,
+    fp4_index_logits_paged,
     quantize_fp4_indexer_tensor,
     store_fp4_index_k_cache,
 )
@@ -462,6 +466,387 @@ def test_fp4_logits_invisible_tiles_ignore_nonfinite_queries(value):
     slots.fill_(-1)
     actual = fp4_index_logits_decode(*args, PAGE_SIZE)
     assert torch.isneginf(actual).all().item()
+
+
+@pytest.mark.skipif(_is_xpu, reason="Paged decode uses CUDA persistent kernels")
+@pytest.mark.parametrize(
+    "batch,ratio,width,masked",
+    [
+        (6, 1, 193, False),
+        (6, 2, 193, True),
+        (6, 1, 16385, True),
+        (6, 2, 8193, False),
+        (6, 1, 32769, False),
+        (64, 1, 32769, True),
+    ],
+)
+def test_fp4_paged_logits_replay(batch, ratio, width, masked):
+    from sglang.kernels.ops.attention.dsv4.candidate_blocks import amax_topk_blocks
+    from sglang.kernels.ops.attention.dsv4.topk import (
+        plan_topk_v2,
+        topk_transform_paged_v2,
+    )
+
+    q, weights, slots, lens, table = _make_logits_case(batch, 32, width)
+    capacity = 1048580 // ratio
+    req = torch.arange(batch, device=q.device, dtype=torch.int32)
+    req_table = torch.full(
+        (batch, capacity * ratio), -1, device=q.device, dtype=torch.int32
+    )
+    req_table[:, : width * ratio : ratio] = (slots * ratio).to(torch.int32)
+    lengths = lens.to(torch.int32)
+    candidate_mask = (
+        torch.rand(batch, capacity, device=q.device) > 0.3 if masked else None
+    )
+    k = min(512, width)
+
+    def run():
+        plan = plan_topk_v2(lengths)
+        scores = fp4_index_logits_paged(
+            q,
+            weights,
+            req,
+            req_table,
+            lengths,
+            table,
+            PAGE_SIZE,
+            capacity,
+            ratio,
+            candidate_mask,
+        )
+        indices = torch.empty((batch, k), dtype=torch.int32, device=q.device)
+        topk_transform_paged_v2(scores, lengths, None, indices, 1, plan)
+        pages = torch.empty((batch + 1, 528), dtype=torch.int32, device=q.device)[
+            :, :512
+        ]
+        raw = torch.empty_like(pages) if ratio == 1 else None
+        finish_paged_indexer_topk(
+            indices, scores, lengths, req, req_table, pages, raw, ratio, masked
+        )
+        return scores, indices, pages, raw
+
+    for _ in range(3):
+        run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        scores, indices, pages, raw = run()
+    for step, visible in enumerate([width, 0, 1, 63, 64, 65, width]):
+        lens.copy_((visible - torch.arange(batch, device=q.device)).clamp_min(0))
+        lengths.copy_(lens)
+        req.copy_(req.roll(1))
+        slots.copy_(slots.roll(step, dims=1))
+        req_table[req.long(), : width * ratio : ratio] = (slots * ratio).to(torch.int32)
+        q.neg_()
+        # Poison the unused capacity: length-aware top-k must never select it.
+        scores.fill_(torch.inf)
+        graph.replay()
+        expected = _reference_logits(q, weights, slots, lens, table)
+        if masked:
+            expected.masked_fill_(~candidate_mask[:, :width], -torch.inf)
+        visible_mask = torch.arange(width, device=q.device)[None, :] < lens[:, None]
+        torch.testing.assert_close(
+            scores[:, :width][visible_mask], expected[visible_mask], atol=0, rtol=0
+        )
+        blocks = amax_topk_blocks(scores, lengths, (lengths + 7) // 8, 2048)
+        assert (pages[batch] == -1).all().item()
+        if raw is not None:
+            assert (raw[batch] == -1).all().item()
+        for row, length in enumerate(lens.tolist()):
+            selected = indices[row][indices[row] >= 0].long()
+            assert selected.numel() == selected.unique().numel() == min(k, length)
+            assert not selected.numel() or selected.max().item() < length
+            torch.testing.assert_close(
+                expected[row, selected].sort().values,
+                expected[row, :length].topk(min(k, length)).values.sort().values,
+                atol=0,
+                rtol=0,
+            )
+            kept = (
+                selected[expected[row, selected] > -torch.inf] if masked else selected
+            )
+            kept = kept.sort().values
+            expected_pages = torch.full_like(pages[row], -1)
+            expected_pages[: kept.numel()] = slots[row, kept].to(torch.int32)
+            torch.testing.assert_close(pages[row], expected_pages, rtol=0, atol=0)
+            if raw is not None:
+                expected_raw = torch.full_like(raw[row], -1)
+                expected_raw[: kept.numel()] = kept.to(torch.int32)
+                torch.testing.assert_close(raw[row], expected_raw, rtol=0, atol=0)
+            nblocks = (length + 7) // 8
+            chosen = blocks[row][blocks[row] >= 0].long()
+            assert chosen.numel() == chosen.unique().numel() == min(2048, nblocks)
+            if nblocks:
+                assert chosen.max().item() < nblocks
+                assert nblocks - 1 in chosen.tolist()
+                padded = torch.full((nblocks * 8,), -torch.inf, device=q.device)
+                padded[:length] = expected[row, :length]
+                maxima = padded.view(-1, 8).amax(1)
+                maxima[-1] = torch.inf
+                torch.testing.assert_close(
+                    maxima[chosen].sort().values,
+                    maxima.topk(min(2048, nblocks)).values.sort().values,
+                    atol=0,
+                    rtol=0,
+                )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9,
+    reason="Hopper paged indexer dispatch",
+)
+@pytest.mark.parametrize("ratio", [1, 2])
+def test_hopper_indexer_backends_replay(ratio):
+    from sglang.srt.layers.attention.dsv4.v41_indexer import scoring
+    from sglang.srt.layers.attention.dsv4.v41_indexer.dense_blocks import (
+        DenseBlocksBackend,
+    )
+    from sglang.srt.layers.attention.dsv4.v41_indexer.full_topk import FullTopKIndexer
+    from sglang.srt.layers.attention.dsv4.v41_indexer.types import (
+        DecodeInputs,
+    )
+
+    batch, width, capacity, topk = 12, 193, 32772, 64
+    q, weights, slots, lens, table = _make_logits_case(batch, 32, width)
+    consumer_q = -q
+    req = torch.arange(batch, device=q.device, dtype=torch.int32) // 6
+    req_table = torch.full(
+        (2, capacity * ratio), -1, device=q.device, dtype=torch.int32
+    )
+    req_table[:, : width * ratio : ratio] = (slots[::6] * ratio).int()
+    positions = (lens * ratio - 1).clamp_min(0)
+    pool = SimpleNamespace(get_index_k_with_scale_buffer=lambda layer: table)
+    indexer = SimpleNamespace(
+        queries=lambda q, freqs: q, head_weights=lambda x: x, index_topk=topk
+    )
+    common = dict(
+        indexer=indexer,
+        layer_id=0,
+        compress_ratio=ratio,
+        freqs_cis=torch.zeros(width * ratio + 1, device=q.device),
+        x=weights,
+        positions=positions,
+        req_rows=req,
+        paged_metadata=SimpleNamespace(max_compressed_seq_len=capacity),
+        is_verify=True,
+    )
+    kwargs = dict(
+        token_to_kv_pool=pool, req_to_token=req_table, use_deep_gemm_prefill=False
+    )
+    full = FullTopKIndexer(**kwargs, use_deep_gemm_decode=False)
+    candidates = DenseBlocksBackend(
+        **kwargs, candidate_topk_blocks=4, candidate_block_size=8
+    )
+    outputs = [
+        SimpleNamespace(
+            page_indices=torch.empty(
+                (batch + 1, topk + 8), device=q.device, dtype=torch.int32
+            ),
+            raw_indices=None,
+        )
+        for _ in range(3)
+    ]
+    decode_inputs = [
+        DecodeInputs(
+            q_lora=q if i < 2 else consumer_q,
+            out_page_indices=out.page_indices,
+            **common,
+        )
+        for i, out in enumerate(outputs)
+    ]
+    captured_scores = []
+    captured_masks = []
+
+    def record_scores(*args, **kwargs):
+        result = fp4_index_logits_paged(*args, **kwargs)
+        captured_scores.append(result)
+        captured_masks.append(args[-1])
+        return result
+
+    def run():
+        full.topk_decode(decode_inputs[0])
+        published = candidates.publish_decode(decode_inputs[1])
+        candidates.consume_decode(decode_inputs[2], published)
+        return published
+
+    for _ in range(3):
+        run()
+    graph = torch.cuda.CUDAGraph()
+    with patch.object(scoring, "fp4_index_logits_paged", side_effect=record_scores):
+        with torch.cuda.graph(graph):
+            published = run()
+    assert (
+        len(captured_scores) == 3
+    )  # all three runtime entrypoints took the paged path
+    mask = published.decode_mask
+    assert captured_masks[:2] == [None, None]
+    assert captured_masks[2] is mask
+    for step, visible in enumerate([193, 0, 1, 7, 8, 9, 65, 193]):
+        # -1 positions exercise zero-length padded rows, also for ratio 1.
+        lens.copy_((visible - torch.arange(batch, device=q.device) % 6).clamp_min(0))
+        positions.copy_(lens * ratio - 1)
+        req.copy_(req.roll(1))
+        req_table[:, : width * ratio : ratio] = (slots[::6].roll(step, 1) * ratio).int()
+        q.neg_()
+        for scores in captured_scores:
+            scores.fill_(torch.inf)
+        for out in outputs:
+            out.page_indices.fill_(12345)
+            if out.raw_indices is not None:
+                out.raw_indices.fill_(12345)
+        graph.replay()
+        current_slots = req_table[req.long(), : width * ratio : ratio].long() // ratio
+        source_scores = _reference_logits(q, weights, current_slots, lens, table)
+        consumer_scores = _reference_logits(
+            consumer_q, weights, current_slots, lens, table
+        )
+        for row, length in enumerate(lens.tolist()):
+            blocks = published.blocks[row]
+            blocks = blocks[blocks >= 0].long()
+            nblocks = (length + 7) // 8
+            assert blocks.numel() == blocks.unique().numel() == min(4, nblocks)
+            if nblocks:
+                assert nblocks - 1 in blocks.tolist()
+                maxima = torch.full((nblocks * 8,), -torch.inf, device=q.device)
+                maxima[:length] = source_scores[row, :length]
+                maxima = maxima.view(-1, 8).amax(-1)
+                maxima[-1] = torch.inf
+                torch.testing.assert_close(
+                    maxima[blocks].sort().values,
+                    maxima.topk(min(4, nblocks)).values.sort().values,
+                )
+            keep = torch.isin(torch.arange(width, device=q.device) // 8, blocks)
+            torch.testing.assert_close(mask[row, :width], keep)
+            consumer_scores[row].masked_fill_(~keep, -torch.inf)
+            for out, scores in zip(
+                outputs, (source_scores, source_scores, consumer_scores)
+            ):
+                pages = out.page_indices[row]
+                pages = pages[pages >= 0]
+                # The shuffled request mapping is bijective within a row.
+                selected = (current_slots[row, :, None] == pages[None, :]).nonzero()[
+                    :, 0
+                ]
+                count = min(topk, int(torch.isfinite(scores[row]).sum()))
+                assert pages.numel() == selected.unique().numel() == count
+                torch.testing.assert_close(
+                    scores[row, selected].sort().values,
+                    scores[row].topk(count).values.sort().values,
+                )
+                expected_pages = torch.full_like(out.page_indices[row], -1)
+                expected_pages[:count] = current_slots[
+                    row, selected.sort().values
+                ].int()
+                torch.testing.assert_close(out.page_indices[row], expected_pages)
+                if out.raw_indices is not None:
+                    expected_raw = torch.full_like(out.raw_indices[row], -1)
+                    expected_raw[:count] = selected.sort().values.int()
+                    torch.testing.assert_close(out.raw_indices[row], expected_raw)
+        for out in outputs:
+            assert (out.page_indices[batch] == -1).all().item()
+            if out.raw_indices is not None:
+                assert (out.raw_indices[batch] == -1).all().item()
+
+
+@pytest.mark.parametrize("rows", [0, 1, 32, 129])
+@pytest.mark.parametrize("topk", [0, 1, 65, 512])
+@pytest.mark.parametrize("write_raw", [False, True])
+def test_flat_indexer_finalization_replay(rows, topk, write_raw):
+    from sglang.kernels.ops.attention.dsv4.fp4_indexer import finish_flat_indexer_topk
+
+    torch.manual_seed(81 + rows + topk)
+    indices = torch.randint(
+        0, 2048, (rows, topk + 8), device="cuda", dtype=torch.int32
+    )[:, :topk]
+    slots = torch.randperm(2048, device="cuda").to(torch.int64)
+    starts = torch.randint(0, 128, (rows,), device="cuda", dtype=torch.int32)
+    pages = torch.full((rows + 1, topk + 8), 12345, device="cuda", dtype=torch.int32)
+    raw = torch.full_like(pages, 12345) if write_raw else None
+
+    def run():
+        finish_flat_indexer_topk(indices, slots, starts, pages, raw)
+
+    for _ in range(3):
+        run()
+    graph = None
+    if rows and topk:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run()
+    for step in range(3):
+        indices.copy_(
+            torch.randint(0, 2048, indices.shape, device="cuda", dtype=torch.int32)
+        )
+        indices[:, step::7] = -1 - step
+        indices[:, 2::11] = torch.iinfo(torch.int32).max
+        if step == 1:
+            indices.fill_(-1)
+        slots.copy_(slots.roll(17))
+        starts.add_(1)
+        pages.fill_(12345)
+        if raw is not None:
+            raw.fill_(12345)
+        if graph is not None:
+            graph.replay()
+        else:
+            run()
+        sentinel = torch.iinfo(torch.int32).max
+        selected = indices.masked_fill(indices < 0, sentinel).sort(-1).values
+        chosen = selected != sentinel
+        expected_pages = torch.full_like(pages, 12345)
+        expected_pages[:rows, :topk] = torch.where(
+            chosen, slots[selected.clamp_max(slots.numel() - 1)], -1
+        ).int()
+        torch.testing.assert_close(pages, expected_pages, rtol=0, atol=0)
+        if raw is not None:
+            expected_raw = torch.full_like(raw, 12345)
+            expected_raw[:rows, :topk] = torch.where(
+                chosen, selected - starts[:, None], -1
+            )
+            torch.testing.assert_close(raw, expected_raw, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("write_raw", [False, True])
+def test_flat_indexer_slot_count_does_not_recompile(write_raw):
+    from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+        _finish_flat_indexer_topk_kernel,
+    )
+
+    rows, topk = 32, 512
+    torch.manual_seed(95)
+    indices = torch.randint(0, 8192, (rows, topk), device="cuda", dtype=torch.int32)
+    indices[:, 0] = -3
+    indices[:, 1] = torch.iinfo(torch.int32).max
+    starts = torch.arange(rows, device="cuda", dtype=torch.int32)
+    pages = torch.empty_like(indices)
+    raw = torch.empty_like(indices) if write_raw else None
+    hashes = set()
+    for num_slots in (1, 17, 64, 65, 129, 2048, 8192):
+        slots = torch.arange(num_slots, device="cuda", dtype=torch.int64) * 3 + 7
+        compiled = _finish_flat_indexer_topk_kernel[(rows,)](
+            indices,
+            slots,
+            starts,
+            pages,
+            raw,
+            topk,
+            num_slots,
+            indices.stride(0),
+            pages.stride(0),
+            raw.stride(0) if raw is not None else 0,
+            write_raw,
+            topk,
+            num_warps=4,
+        )
+        hashes.add(compiled.hash)
+        sentinel = torch.iinfo(torch.int32).max
+        selected = indices.masked_fill(indices < 0, sentinel).sort(-1).values
+        chosen = selected != sentinel
+        expected = torch.where(chosen, slots[selected.clamp_max(num_slots - 1)], -1)
+        torch.testing.assert_close(pages, expected.int(), rtol=0, atol=0)
+        if raw is not None:
+            expected_raw = torch.where(chosen, selected - starts[:, None], -1)
+            torch.testing.assert_close(raw, expected_raw, rtol=0, atol=0)
+    assert len(hashes) == 1, "Changing the visible slot count must reuse the kernel"
 
 
 if __name__ == "__main__":

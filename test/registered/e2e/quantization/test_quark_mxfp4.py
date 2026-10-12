@@ -5,7 +5,7 @@ import unittest
 
 from sglang.test.ci.ci_register import register_amd_ci
 
-register_amd_ci(est_time=106, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=450, suite="stage-b-test-1-gpu-small-amd-mi35x")
 import os
 import time
 from types import SimpleNamespace

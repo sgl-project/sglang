@@ -119,9 +119,6 @@ class PoolTransfer:
     # Most pools are one-to-one. Coarse pools such as DSV4 C128 set this to
     # their physical-group coverage so exists() can return a logical prefix.
     logical_pages_per_object: int = 1
-    # Full IDs backing a dependent device allocation: resident tensors or
-    # slices of the full rows allocated by this load, in transfer order.
-    anchor_index_parts: Optional[List[torch.Tensor | slice]] = None
 
 
 @dataclass(frozen=True)
@@ -386,7 +383,11 @@ class HiCacheFile(HiCacheStorage):
     def __init__(
         self, storage_config: HiCacheStorageConfig, file_path: str = "/tmp/hicache"
     ):
-        self.file_path = envs.SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR.get() or file_path
+        self.file_path = (
+            envs.SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR.get()
+            or (storage_config.extra_config or {}).get("file_storage_path")
+            or file_path
+        )
 
         tp_rank, tp_size, pp_rank, pp_size, model_name, is_mla_model = (
             storage_config.tp_rank,

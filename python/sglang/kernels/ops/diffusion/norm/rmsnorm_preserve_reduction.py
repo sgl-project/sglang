@@ -2,7 +2,7 @@
 """Fuse RMSNorm pointwise work while retaining the native FP32 mean reduction.
 
 Matches ``weight * (x.float() * rsqrt(mean(x.float()**2) + eps)).to(x.dtype)``
-for contiguous FP16/BF16 inputs. The FP32 square buffer has the original shape,
+for FP16/BF16 inputs; packed projection views are materialized before the launch. The FP32 square buffer has the original shape,
 so aten selects the same reduction as the eager chain. Verified at head width
 128, including 131072 rows; callers verify their first dispatch before reuse.
 """
@@ -42,23 +42,8 @@ def _rmsnorm_finish_kernel(
     tl.store(out_ptr + index, normalized.to(tl.float32) * weight, mask)
 
 
-def can_use_rmsnorm_preserve_reduction(x: torch.Tensor, weight: torch.Tensor) -> bool:
-    return (
-        x.is_cuda
-        and torch.version.hip is None
-        and x.dtype in (torch.float16, torch.bfloat16)
-        and x.ndim >= 2
-        and x.numel() > 0
-        and x.is_contiguous()
-        and weight.device == x.device
-        and weight.dtype == x.dtype
-        and weight.shape == (x.shape[-1],)
-        and weight.is_contiguous()
-    )
-
-
 def _fake_rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
-    return torch.empty_like(x)
+    return torch.empty(x.shape, dtype=x.dtype, device=x.device)
 
 
 @register_custom_op(
@@ -70,7 +55,19 @@ def rmsnorm_preserve_reduction(
     x: torch.Tensor, weight: torch.Tensor, eps: float
 ) -> torch.Tensor:
     """Preserve aten's mean and cast-before-weight semantics without residuals."""
-    assert can_use_rmsnorm_preserve_reduction(x, weight)
+    if not (
+        x.is_cuda
+        and torch.version.hip is None
+        and x.dtype in (torch.float16, torch.bfloat16)
+        and x.ndim >= 2
+        and x.numel() > 0
+        and weight.device == x.device
+        and weight.dtype == x.dtype
+        and weight.shape == (x.shape[-1],)
+        and weight.is_contiguous()
+    ):
+        raise RuntimeError("invalid input for rmsnorm_preserve_reduction")
+    x = x.contiguous()
     squares = torch.empty_like(x, dtype=torch.float32)
     out = torch.empty_like(x)
     with torch.cuda.device(x.device):

@@ -11,6 +11,9 @@ from sglang.srt.hardware_backend.npu.dsv4.c128_sidecar_component import (
     C128SidecarComponent,
 )
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle, InsertResult
+from sglang.srt.mem_cache.buffer_mode.storage_existence_cache import (
+    StorageExistenceCache,
+)
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -651,30 +654,34 @@ def test_logical_anchor_prefetch_requires_all_physical_pools(failed_pool):
     operation.pool_transfers_done = True
     controller.append_host_mem_release = Mock()
     controller.prefetch_tokens_occupied = 2048
-    cache = SimpleNamespace(
-        page_size=128,
-        cache_controller=controller,
-        storage_existence_cache=SimpleNamespace(invalidate_beyond=Mock()),
-        _finish_storage_prefetch=Mock(),
-        buffer_pipeline=None,
-        ongoing_prefetch={request: operation},
-        _prefetch_occupied_span=lambda *_: 2048,
-        prefetch_loaded_tokens_by_reqid={},
-        prefetch_loaded_storage_start_by_reqid={},
-    )
-    accepted = UnifiedRadixCache._check_hybrid_prefetch_result(
-        cache,
+    cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+    cache.tree_core = SimpleNamespace(page_size=128)
+    cache.components = {}
+    cache.cache_controller = controller
+    cache.storage_existence_cache = StorageExistenceCache()
+    cache._finish_storage_prefetch = Mock()
+    cache.buffer_pipeline = None
+    cache.host_memory_mode = "cache"
+    cache.ongoing_prefetch = {
+        request: SimpleNamespace(
+            anchor_lock_params=None,
+            prefetch_key=RadixKey(list(range(2048))),
+            host_indices=operation.host_indices,
+            operation=operation,
+        )
+    }
+    cache.prefetch_loaded_tokens_by_reqid = {}
+    cache.prefetch_loaded_storage_start_by_reqid = {}
+    accepted = cache._check_hybrid_prefetch_result(
         request,
         operation,
-        operation.completed_tokens,
         operation.hash_value,
         operation.host_indices,
-        None,
-        None,
-        list(range(2048)),
     )
     assert accepted == (failed_pool is None)
     assert controller.append_host_mem_release.call_count == int(failed_pool is not None)
+    assert controller.prefetch_tokens_occupied == (2048 if accepted else 0)
+    assert (request in cache.ongoing_prefetch) == accepted
 
 
 @pytest.mark.parametrize("assume_stored", [False, True])
@@ -769,15 +776,16 @@ def test_memory_pressure_preserves_complete_c128_groups(coarse):
     host_pool = SimpleNamespace(
         alloc=Mock(side_effect=[None, None, torch.arange(1024)]),
         available_size=lambda: 1024,
+        anchor_entry=SimpleNamespace(host_pool=None),
     )
-    controller = SimpleNamespace(
-        mem_pool_host=host_pool,
-        prefetch_hit_queue=Queue(),
-        prefetch_buffer=Queue(),
-        ack_prefetch_queue=Queue(),
-        ack_backup_queue=Queue(),
-        host_mem_release_queue=Queue(),
-    )
+    controller = HybridCacheController.__new__(HybridCacheController)
+    controller.mem_pool_host = host_pool
+    controller.page_size = 128
+    controller.prefetch_hit_queue = Queue()
+    controller.prefetch_buffer = Queue()
+    controller.ack_prefetch_queue = Queue()
+    controller.ack_backup_queue = Queue()
+    controller.host_mem_release_queue = Queue()
     controller.prefetch_hit_queue.put(operation)
     cache = SimpleNamespace(
         cache_controller=controller,

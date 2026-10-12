@@ -12,7 +12,7 @@ from sglang.srt.platforms.device_mixin import (
     DeviceMixin,
     PlatformEnum,
 )
-from sglang.srt.platforms.interface import SRTPlatform
+from sglang.srt.platforms.interface import PlatformCapabilities, SRTPlatform
 
 logger = logging.getLogger(__name__)
 
@@ -32,8 +32,8 @@ class CudaDeviceMixin(DeviceMixin):
     ) -> float:
         return float(torch.cuda.max_memory_allocated(device))
 
-    def get_device(self, local_rank: int) -> "torch.device":
-        return torch.device("cuda", local_rank)
+    def get_device(self, device_id: int = 0) -> "torch.device":
+        return torch.device("cuda", device_id)
 
     def set_device(self, device: "torch.device") -> None:
         torch.cuda.set_device(device)
@@ -63,7 +63,7 @@ class CudaDeviceMixin(DeviceMixin):
         return True
 
     @contextmanager
-    def reindex_device_id(self, gpu_id: int):
+    def reindex_device_id(self, device_id: int):
         if os.environ.get("CUDA_DEVICE_ORDER") != "PCI_BUS_ID":
             logger.warning(
                 "`CUDA_DEVICE_ORDER` is not set to `PCI_BUS_ID`. Please set "
@@ -77,7 +77,7 @@ class CudaDeviceMixin(DeviceMixin):
             cuda_visible_devices = []
 
         str_gpu_id = (
-            cuda_visible_devices[gpu_id] if cuda_visible_devices else str(gpu_id)
+            cuda_visible_devices[device_id] if cuda_visible_devices else str(device_id)
         )
         os.environ["CUDA_VISIBLE_DEVICES"] = str_gpu_id
 
@@ -103,11 +103,9 @@ class CudaDeviceMixin(DeviceMixin):
 class CudaSRTPlatform(CudaDeviceMixin, SRTPlatform):
     """Default in-tree CUDA SRT platform."""
 
-    def supports_fp8(self) -> bool:
-        return True
-
-    def support_cuda_graph(self) -> bool:
-        return True
-
-    def support_piecewise_cuda_graph(self) -> bool:
-        return True
+    capabilities = PlatformCapabilities(
+        supports_triton=True,
+        graph_capture=True,
+        piecewise_graph=True,
+        hicache_device_kernels=True,
+    )
