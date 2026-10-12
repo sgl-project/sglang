@@ -130,6 +130,10 @@ def _mock_cuda_platform(
             return_value=True,
         ),
         patch(
+            "sglang.multimodal_gen.runtime.platforms.current_platform.is_rocm",
+            return_value=False,
+        ),
+        patch(
             "sglang.multimodal_gen.runtime.platforms.current_platform.get_device_total_memory",
             return_value=memory_gb * 1024**3,
         ),
