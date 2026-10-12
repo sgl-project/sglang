@@ -40,6 +40,7 @@ from sglang.srt.mem_cache.pool_host.base import (
 )
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
+    _cuda_host_unregister,
     get_allocator_from_storage,
     make_kernel_ptr_table,
 )
@@ -141,15 +142,26 @@ class MHATokenToKVPoolHost(HostKVCache):
     ):
         self.mtp_draft_device_pools = tuple(mtp_draft_device_pools)
         self.target_layer_num = device_pool.layer_num
+        self.device_pool = device_pool
+        self.dtype = device_pool.store_dtype
+        # Scale-bearing subclasses need page coverage when computing token bytes.
+        self.page_size = page_size
+        device_capacity = getattr(device_pool, "host_capacity_tokens", None)
         super().__init__(
-            device_pool,
-            host_to_device_ratio,
-            host_size,
-            page_size,
-            layout,
-            pin_memory,
-            device,
-            allocator_type,
+            dtype=self.dtype,
+            device_capacity_tokens=(
+                device_pool.size if device_capacity is None else device_capacity
+            ),
+            size_per_token=self.get_size_per_token(),
+            start_layer=device_pool.start_layer,
+            end_layer=device_pool.end_layer,
+            host_to_device_ratio=host_to_device_ratio,
+            host_size=host_size,
+            page_size=page_size,
+            layout=layout,
+            pin_memory=pin_memory,
+            device=device,
+            allocator_type=allocator_type,
             pool_label=pool_label,
         )
         self.element_dim = self.head_num * self.head_dim
@@ -822,6 +834,7 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
         device: str = "cpu",
         allocator_type: str = "default",
     ):
+        self._destroyed = False
         self.device_pool = device_pool
         self.page_size = anchor_host.page_size
         self.layout = layout
@@ -883,6 +896,15 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
             self.device_pool.device,
             host_memory_registered=self.pin_memory,
         )
+
+    def destroy(self):
+        if self._destroyed:
+            return
+        if self.pin_memory and (_is_cuda or _is_hip):
+            _cuda_host_unregister(self.k_buffer)
+        self.k_buffer = None
+        self.k_data_refs = []
+        super().destroy()
 
     def get_size_per_token(self):
         return self.head_dim * self.head_num * self.layer_num * self.dtype.itemsize
