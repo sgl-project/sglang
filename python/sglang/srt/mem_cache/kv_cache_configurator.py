@@ -2641,6 +2641,7 @@ class KVCacheConfigurator:
                     )
                     identity_mapping[-1] = -1
                     token_to_kv_pool.register_mapping(identity_mapping)
+                    token_to_kv_pool.swa_uses_full_indices = True
                 elif not uses_unified_virtual_ids:
                     token_to_kv_pool.register_mapping(
                         swa_allocator.full_to_swa_index_mapping
@@ -3097,6 +3098,14 @@ def calculate_mla_kv_cache_dim(
     if _is_hip and (
         get_exec().kernel.dsa_prefill_backend in ("tilelang", "triton", "aiter")
         or get_exec().kernel.dsa_decode_backend in ("tilelang", "triton", "aiter")
+    ):
+        return kv_cache_dim
+
+    # CUDA TileLang uses raw FP8 rows without per-block scales. Argument
+    # validation requires both consumers to use the same TileLang layout.
+    if (
+        get_exec().kernel.dsa_prefill_backend == "tilelang"
+        and get_exec().kernel.dsa_decode_backend == "tilelang"
     ):
         return kv_cache_dim
 
