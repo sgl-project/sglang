@@ -29,6 +29,9 @@ from sglang.srt.lora.utils import LoRABatchInfo, get_lm_head_lora_b_shard_size
 from sglang.srt.runtime_context import LoRABatchLayout, get_forward, get_parallel
 
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
+# Batched slicing of packed per-expert MoE LoRA factors, and pass-through of
+# factors the streamed-adapter stash already cut to this rank's TP shard.
+_LORA_FAST_STREAMED_LOAD = envs.SGLANG_OPT_LORA_FAST_STREAMED_LOAD.get()
 
 
 def unwrap_lora_layer(module: nn.Module) -> nn.Module:
@@ -1314,6 +1317,9 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         self, A: torch.Tensor, tp_rank: int, target_module: str
     ) -> torch.Tensor:
         shard_size = self.intermediate_size_per_partition
+        if _LORA_FAST_STREAMED_LOAD and A.shape[-1] == shard_size:
+            # already this rank's shard (cut when the streamed adapter was stashed)
+            return A.contiguous()
         start = tp_rank * shard_size
         end = start + shard_size
         return A[..., start:end].contiguous()
@@ -1348,6 +1354,8 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                 for eid, w in B.items()
             }
         if isinstance(B, torch.Tensor) and B.dim() == 3:
+            if _LORA_FAST_STREAMED_LOAD:
+                return self._slice_moe_b_3d(B, tp_rank)
             return torch.stack(
                 [
                     self._slice_moe_b_2d(B[i], tp_rank, target_module)
@@ -1355,6 +1363,28 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                 ]
             )
         return self._slice_moe_b_2d(B, tp_rank, target_module)
+
+    def _slice_moe_b_3d(self, B: torch.Tensor, tp_rank: int) -> torch.Tensor:
+        """``_slice_moe_b_2d`` of every expert of a gate_up_proj_moe B
+        ``[E, out, rank]`` as one batched copy instead of E per-expert copies."""
+        shard_size = self.intermediate_size_per_partition
+        start = tp_rank * shard_size
+        end = start + shard_size
+        if not self.base_layer.moe_runner_config.is_gated:
+            if self.tp_size <= 1 or B.shape[1] == shard_size:
+                return B.contiguous()
+            return B[:, start:end, :].contiguous()
+        full_inter = B.shape[1] // 2
+        if full_inter == shard_size:
+            # already this rank's [gate | up] shard
+            start, end = 0, shard_size
+        gate_b = B[:, start:end, :]
+        up_b = B[:, full_inter + start : full_inter + end, :]
+        if self._uses_interleaved_gate_up:
+            return torch.stack([gate_b, up_b], dim=2).reshape(
+                B.shape[0], -1, B.shape[-1]
+            )
+        return torch.cat([gate_b, up_b], dim=1).contiguous()
 
     def _slice_moe_b_2d(
         self, B: torch.Tensor, tp_rank: int, target_module: str
@@ -1364,7 +1394,10 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             # B has shape [intermediate_size, rank] — TP-shard directly.
             is_gated = self.base_layer.moe_runner_config.is_gated
             if not is_gated:
-                if self.tp_size > 1:
+                if self.tp_size > 1 and not (
+                    _LORA_FAST_STREAMED_LOAD
+                    and B.shape[0] == self.intermediate_size_per_partition
+                ):
                     shard_size = self.intermediate_size_per_partition
                     start = tp_rank * shard_size
                     end = start + shard_size
@@ -1375,6 +1408,9 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             start = tp_rank * shard_size
             end = start + shard_size
             full_inter = B.shape[0] // 2
+            if _LORA_FAST_STREAMED_LOAD and full_inter == shard_size:
+                # already this rank's [gate | up] shard
+                start, end = 0, shard_size
             gate_b = B[start:end, :]
             up_b = B[full_inter + start : full_inter + end, :]
             if self._uses_interleaved_gate_up:

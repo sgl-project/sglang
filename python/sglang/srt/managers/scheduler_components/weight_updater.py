@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 import time
 import traceback
 from contextlib import contextmanager
@@ -18,6 +19,7 @@ from sglang.srt.constants import (
     GPU_MEMORY_TYPE_WEIGHTS,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     BeginWeightUpdateReqInput,
     BeginWeightUpdateReqOutput,
@@ -55,6 +57,14 @@ from sglang.srt.utils.weight_checker import overall_checksum
 from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
 
 logger = logging.getLogger(__name__)
+
+# Stash only this rank's TP shard of packed per-expert MoE LoRA factors
+# (w1/w3 lora_B [E, inter, r] rows, w2 lora_A [E, r, inter] columns).
+_LORA_FAST_STREAMED_LOAD = envs.SGLANG_OPT_LORA_FAST_STREAMED_LOAD.get()
+_PACKED_EXPERT_FACTOR = re.compile(
+    r"\.experts\.(w1|w3|w2|gate_proj|up_proj|down_proj)\.lora_(A|B)\."
+)
+_LAYER_ID = re.compile(r"\.layers\.(\d+)\.")
 
 
 def _split_lora_named_tensors(named_tensors):
@@ -443,6 +453,54 @@ class SchedulerWeightUpdaterManager:
         is a new adapter identity and may stream a different tensor set."""
         self._lora_applied_names.pop(lora_name, None)
 
+    def _moe_lora_module(self, layer_id: int):
+        """The routed-expert MoE LoRA wrapper of a decoder layer, if any."""
+        lora_manager = getattr(self.tp_worker.model_runner, "lora_manager", None)
+        if lora_manager is None or layer_id >= len(lora_manager.lora_modules):
+            return None
+        for module in lora_manager.lora_modules[layer_id].values():
+            base = getattr(module, "base_layer", None)
+            if hasattr(module, "slice_moe_lora_b_weights") and not getattr(
+                base, "is_shared_fused_moe", False
+            ):
+                return module
+        return None
+
+    def _tp_shard_packed_expert_factor(
+        self, hf_key: str, tensor: torch.Tensor
+    ) -> torch.Tensor:
+        """This rank's TP shard of a packed per-expert factor that the MoE LoRA
+        slicer would cut anyway; every other tensor is returned unchanged."""
+        factor = _PACKED_EXPERT_FACTOR.search(hf_key)
+        layer = _LAYER_ID.search(hf_key)
+        if (
+            factor is None
+            or layer is None
+            or tensor.dim() != 3
+            or tensor.shape[0] <= 1
+            or "shared_expert" in hf_key
+        ):
+            return tensor
+        module = self._moe_lora_module(int(layer.group(1)))
+        if module is None or module.tp_size <= 1:
+            return tensor
+        proj, side = factor.groups()
+        shard = module.intermediate_size_per_partition
+        start = module.tp_rank * shard
+        if (
+            side == "B"
+            and proj in ("w1", "w3", "gate_proj", "up_proj")
+            and tensor.shape[1] == shard * module.tp_size
+        ):
+            return tensor[:, start : start + shard, :]
+        if (
+            side == "A"
+            and proj in ("w2", "down_proj")
+            and tensor.shape[2] == shard * module.tp_size
+        ):
+            return tensor[:, :, start : start + shard]
+        return tensor
+
     def _stash_lora_tensors(self, lora_tensors, *, copy_tensors: bool = False) -> None:
         copied_devices = set()
         for prefixed_name, tensor in lora_tensors:
@@ -452,6 +510,8 @@ class SchedulerWeightUpdaterManager:
             assert isinstance(tensor, torch.Tensor), (
                 f"streamed LoRA tensor {prefixed_name!r} must arrive as a plain tensor"
             )
+            if _LORA_FAST_STREAMED_LOAD:
+                tensor = self._tp_shard_packed_expert_factor(hf_key, tensor)
             if copy_tensors:
                 # the stash outlives this RPC, but an IPC sender may reuse the bucket once it replies
                 tensor = tensor.clone()
@@ -475,6 +535,12 @@ class SchedulerWeightUpdaterManager:
             )
         if not self._lora_stash:
             return True, "Success"
+        if expected_checksums is not None and _LORA_FAST_STREAMED_LOAD:
+            return False, (
+                "[LORA-CHECK] streamed-adapter checksums are computed on the full "
+                "factors, but SGLANG_OPT_LORA_FAST_STREAMED_LOAD stashes only this "
+                "rank's TP shard; disable one of the two"
+            )
         # The attribute only exists when LoRA is enabled at server start.
         lora_manager = getattr(self.tp_worker.model_runner, "lora_manager", None)
         if lora_manager is None:

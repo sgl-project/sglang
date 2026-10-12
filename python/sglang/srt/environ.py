@@ -1764,6 +1764,14 @@ class Envs:
     SGLANG_M3_ALLOW_CUSTOM_AR = EnvBool(False)
 
     # ===================================================================
+    # LoRA serving
+    # ===================================================================
+    # Streamed adapter updates: stash only this rank's TP shard of packed
+    # per-expert MoE LoRA factors and install them with one copy per module
+    # instead of one per expert. Not compatible with streamed-LoRA checksums.
+    SGLANG_OPT_LORA_FAST_STREAMED_LOAD = EnvBool(False)
+
+    # ===================================================================
     # Kimi K3
     # ===================================================================
     # MNNVL fused all-reduce (bf16, TP8): zero-copy 1shot multicast-push for
