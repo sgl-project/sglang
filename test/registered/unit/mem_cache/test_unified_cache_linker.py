@@ -185,7 +185,7 @@ def test_cache_linker_attachment_is_backend_independent():
     assert cache.linker.layer_done_counter is linker.layer_done_counter
 
 
-@pytest.mark.parametrize("component_type", [ComponentType.MAMBA, ComponentType.C128])
+@pytest.mark.parametrize("component_type", [ComponentType.C128])
 def test_cache_linker_rejects_unsupported_tree_components(component_type):
     cache = _cache_for_wrapper(tree_components=(ComponentType.FULL, component_type))
 
@@ -1141,6 +1141,7 @@ def full_linker_component():
 
     return SimpleNamespace(
         component_type=ComponentType.FULL,
+        linker_indices_are_paged=True,
         build_external_linker_transfer=MagicMock(side_effect=build_transfer),
         update_external_linker_load=lambda phase, req, full_transfer, transfer, prefix_len, **kwargs: (
             transfer

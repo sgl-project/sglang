@@ -54,6 +54,7 @@ _EXTERNAL_LINKER_SUPPORTED_COMPONENTS = frozenset(
     {
         ComponentType.FULL,
         ComponentType.SWA,
+        ComponentType.MAMBA,
     }
 )
 
@@ -440,19 +441,42 @@ class UnifiedCacheLinkerWrapper:
                     )
                     if max(start, coverage_start) < min(end, prefix_len)
                 ]
-                indices, keys = self._select_adopted_pages(
-                    transfer.device_indices,
-                    ranges,
-                    prefix_len,
-                    transfer.keys,
-                )
-                if not keys:
-                    continue
-                transfer.device_indices = indices
-                transfer.keys = keys
-                component_canonical, _ = self._select_adopted_pages(
-                    canonical_full, ranges, prefix_len
-                )
+                if not component.linker_indices_are_paged:
+                    # Slot-addressed state is adopted as a unit or not at all, so
+                    # ask the question load_back() actually answers: it hands the
+                    # slot to tree_core.insert() as InsertParams.mamba_value and
+                    # frees it there iff insert_result.mamba_exist. So mamba_exist
+                    # is exactly "the slot went back to the allocator", i.e. the
+                    # one case where continuing would DMA into a slot that may
+                    # already belong to another request.
+                    #
+                    # Do not test adopted_ranges here. Nothing ever calls
+                    # record_adopted_range() for a slot-addressed component --
+                    # only BASE/FULL (unified_tree_core) and SWA have producers --
+                    # so that test is always false and drops every mamba load,
+                    # including the ones whose slot the tree just took ownership
+                    # of and which therefore never get filled.
+                    #
+                    # Dropping still must not free: releasing through the
+                    # component's ABORT contract double-frees a slot the tree
+                    # owns, which the idle invariant reports as a mamba count one
+                    # larger than the pool with leaked_mamba_pages=None.
+                    if insert_result.mamba_exist:
+                        continue
+                else:
+                    indices, keys = self._select_adopted_pages(
+                        transfer.device_indices,
+                        ranges,
+                        prefix_len,
+                        transfer.keys,
+                    )
+                    if not keys:
+                        continue
+                    transfer.device_indices = indices
+                    transfer.keys = keys
+                    component_canonical, _ = self._select_adopted_pages(
+                        canonical_full, ranges, prefix_len
+                    )
             transfer = component.update_external_linker_load(
                 phase,
                 req,
