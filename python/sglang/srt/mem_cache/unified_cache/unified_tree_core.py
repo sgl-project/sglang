@@ -78,6 +78,7 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     InsertStepResult,
     NodeId,
     RadixCacheWalkResult,
+    TreePathNodeInfo,
     UnifiedTreeCoreInterface,
 )
 from sglang.srt.mem_cache.utils import (
@@ -460,7 +461,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         )
 
         self.kv_events = KVCacheEventRecorder(
-            enabled=params.enable_kv_cache_events, page_size=self.page_size
+            enabled=params.enable_kv_cache_events,
+            page_size=self.page_size,
+            dynamo_format=params.dynamo_kv_event_format,
+            lora_names=params.kv_event_lora_names,
         )
 
         self.reset()
@@ -663,6 +667,34 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
     def dfs_weight_order(self, node_ids: Sequence[NodeId]) -> list[int]:
         return _dfs_weight_order(self.root_node, node_ids, self.node_by_id)
+
+    def collect_path_info(
+        self, end_node_ids: Sequence[NodeId]
+    ) -> tuple[tuple[TreePathNodeInfo, ...], ...]:
+        paths = []
+        for node_id in end_node_ids:
+            node = self.node_by_id(node_id)
+            chain = []
+            while node is not self.root_node:
+                chain.append(node)
+                node = node.parent
+            path = []
+            start = 0
+            for node in reversed(chain):
+                end = start + len(node.key)
+                value = node.component_data[BASE_COMPONENT_TYPE].value
+                path.append(
+                    TreePathNodeInfo(
+                        node.id,
+                        node.parent.id,
+                        start,
+                        end,
+                        None if value is None else len(value),
+                    )
+                )
+                start = end
+            paths.append(tuple(path))
+        return tuple(paths)
 
     def _new_node(self, priority: int = 0) -> UnifiedTreeNode:
         """Create and register a tree node in the arena."""
@@ -2855,17 +2887,14 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         else:
             self.component_evictable_size_[component_type] += ledger
 
-    def adjust_component_ledger(
-        self, node: UnifiedTreeNode, component_type: ComponentType, delta: int
+    def adjust_component_size(
+        self, node_id: NodeId, component_type: ComponentType, delta: int
     ) -> None:
-        """A component changed how many pool tokens evicting ``node`` would
-        reclaim (``TreeComponent.reclaimable_tokens``) while the value stays
-        on device: move the ledger the node is on by ``delta``. A tombstoned
-        value is on neither ledger."""
-        if delta == 0:
-            return
+        node = self.node_by_id(node_id)
+        if component_type not in self.components_by_type:
+            raise ValueError(f"component is not enabled: {component_type}")
         cd = node.component_data[component_type]
-        if cd.value is None:
+        if node is self.root_node or cd.value is None:
             return
         if cd.lock_ref > 0:
             self.component_protected_size_[component_type] += delta
