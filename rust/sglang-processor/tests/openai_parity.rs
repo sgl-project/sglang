@@ -5,6 +5,7 @@
 
 #![cfg(all(feature = "openai", feature = "render", feature = "tokenizer"))]
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -161,7 +162,7 @@ fn check_case(
         Some(frames) => {
             let mut events = Vec::new();
             let mut reply = None;
-            for frame in frames
+            for frame in stream_frames(frames)
                 .iter()
                 .map(|f| f.to_string())
                 .chain(["[DONE]".into()])
@@ -181,7 +182,7 @@ fn check_case(
                 ),
                 None => (
                     json!({"events": events.iter().map(|e| event_json(e)).collect::<Vec<_>>()}),
-                    json!({"events": case["openai"]["events"].as_array().unwrap().iter().map(|e| event_json(e.as_str().unwrap())).collect::<Vec<_>>()}),
+                    case["openai"].clone(),
                 ),
             }
         }
@@ -206,6 +207,47 @@ fn check_case(
         ));
     }
     Ok(true)
+}
+
+/// What each `/generate` stream frame repeats in full; fixtures keep only what a frame adds.
+const GROWING: [&str; 4] = [
+    "text",
+    "output_ids",
+    "output_token_logprobs",
+    "output_top_logprobs",
+];
+
+/// The frames as the engine sent them, each choice's rebuilt from its stored deltas.
+fn stream_frames(deltas: &[Value]) -> Vec<Value> {
+    let mut last: HashMap<String, Value> = HashMap::new();
+    let mut frames = Vec::new();
+    for delta in deltas {
+        let index = delta["index"].to_string();
+        let frame = match last.get(&index) {
+            Some(prev) if delta.get("meta_info").is_some() => frame_merge(prev, delta),
+            _ => delta.clone(),
+        };
+        last.insert(index, frame.clone());
+        frames.push(frame);
+    }
+    frames
+}
+
+fn frame_merge(prev: &Value, delta: &Value) -> Value {
+    let mut frame = prev.clone();
+    for (key, value) in delta.as_object().unwrap() {
+        frame[key] = match (&prev[key], value) {
+            (Value::String(a), Value::String(b)) if GROWING.contains(&key.as_str()) => {
+                json!(format!("{a}{b}"))
+            }
+            (Value::Array(a), Value::Array(b)) if GROWING.contains(&key.as_str()) => {
+                json!([a.as_slice(), b.as_slice()].concat())
+            }
+            _ if key == "meta_info" => frame_merge(&prev[key], value),
+            _ => value.clone(),
+        };
+    }
+    frame
 }
 
 /// The fields Python set away from `GenerateReqInput`'s and a bare request's sampling defaults.

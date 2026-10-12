@@ -711,12 +711,11 @@ def capture_decode_graph(*, model_runner: ModelRunner) -> GraphCapture:
     else:
         capture_name = f"{role} decode"
         num_tokens_per_req = 1
-    capture_bs, _ = get_batch_sizes_to_capture(model_runner, num_tokens_per_req)
     decode_backend = get_exec().graph.cuda_graph_config.decode.backend
     logger.info(
         f"Capture {capture_name} {graph_backend[model_runner.device]} begin. "
         f"backend={decode_backend}, num_tokens_per_req={num_tokens_per_req}, "
-        f"bs={capture_bs}, avail mem={before_mem:.2f} GB"
+        f"avail mem={before_mem:.2f} GB"
     )
 
     GraphRunnerCls = current_platform.get_graph_runner_cls()
@@ -740,8 +739,11 @@ def capture_decode_graph(*, model_runner: ModelRunner) -> GraphCapture:
     after_mem = get_available_gpu_memory(model_runner.device, model_runner.gpu_id)
     memory_usage_gb = before_mem - after_mem
     capture_time = time.perf_counter() - tic
+    # The runner owns the bucket list: a dp-local draft aligns by its local
+    # batch, which a global re-derivation here would reject as empty.
     logger.info(
         f"Capture {capture_name} {graph_backend[model_runner.device]} end. "
+        f"bs={runner.capture_bs}, "
         f"elapsed={capture_time:.2f} s, "
         f"mem usage={memory_usage_gb:.2f} GB, avail mem={after_mem:.2f} GB."
     )

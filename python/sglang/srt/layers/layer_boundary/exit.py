@@ -28,7 +28,11 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
     is_enable_moe_cp_allgather,
 )
-from sglang.srt.layers.layer_boundary.adapters.attention import get_attn_tp_context
+from sglang.srt.layers.layer_boundary.contracts import (
+    BatchVariant,
+    ExitFacts,
+    StageKind,
+)
 from sglang.srt.layers.layer_boundary.layout import (
     SumGroup,
     _ffn_has_tokens,
@@ -72,13 +76,14 @@ def _select_dp_reduce_scatter(
     forward_batch: ForwardBatch,
     *,
     may_reduce_scatter: bool,
-    may_reduce_scatterv: bool,
+    reduce_scatterv: bool,
 ) -> Optional[Callable[[torch.Tensor, torch.Tensor, ForwardBatch], None]]:
     """The reduce-scatter that brings an FFN output gathered over attention
     DP back to this rank's tokens when the FFN leaves its sum to it (see
     OutputContract); None when the FFN reduces the output and only a scatter
-    remains."""
-    if should_use_dp_reduce_scatterv() and may_reduce_scatterv:
+    remains. Whether the reduce-scatter is usable follows the DP group, which
+    an elastic scale-up changes, so it is read for each batch."""
+    if reduce_scatterv:
         return dp_reduce_scatterv
     if (
         may_reduce_scatter
@@ -87,6 +92,98 @@ def _select_dp_reduce_scatter(
     ):
         return dp_reduce_scatter
     return None
+
+
+def exit_facts(kind, plan, variant, path) -> ExitFacts:
+    """What ``path``'s exit decides from fixed facts on ``variant``: the
+    parallel configuration, the declarations and the bound path. A stage
+    without an exit (an attention that always leaves its sum) decides
+    nothing. A condition is read only where the exit used to read it."""
+    if plan.finishes_directly:
+        return ExitFacts()
+    output = path.output
+    scattered = variant is BatchVariant.INPUT_SCATTERED
+    tp = get_parallel().tp_size > 1
+    if kind is StageKind.ATTENTION:
+        return ExitFacts(
+            defers_mixer_sum=output.may_defer_to_next
+            and tp
+            and not is_dp_attention_enabled()
+            and _sum_deferral_allowed(plan, output, scattered=scattered)
+        )
+    sum_in_reduce_scatter = output.may_reduce_scatter and (
+        path.output_move_completes_sum or (scattered and not plan.terminal)
+    )
+    may_defer_sum = (
+        tp
+        and not plan.terminal
+        and _sum_deferral_allowed(plan, output, scattered=scattered)
+        # Under attention DP the next layer must also run postprocess's
+        # scatter back to this rank's tokens, and nothing more.
+        and (
+            not is_dp_attention_enabled()
+            or (path.returns_over_dp and not output.update.applied_at_exit)
+        )
+    )
+    single_sum = may_defer_sum and post_experts_sum_is_one_all_reduce()
+    return ExitFacts(
+        may_defer_sum=may_defer_sum,
+        sum_in_reduce_scatter=sum_in_reduce_scatter,
+        # On an input-scattered batch the next input's TP reduce-scatter
+        # completes the sum; the other reduce-scatters are this exit's move.
+        sum_left_to_next_input=(
+            SumGroup.TP
+            if sum_in_reduce_scatter
+            and not path.returns_over_dp
+            and not path.output_move_completes_sum
+            else None
+        ),
+        reduce_scatterv=path.returns_over_dp
+        and should_use_dp_reduce_scatterv()
+        and output.may_reduce_scatterv,
+        single_sum=single_sum,
+        fused_consumer_sum=may_defer_sum and not single_sum and _fused_consumer_sum(),
+    )
+
+
+def _sum_deferral_allowed(plan, output, *, scattered: bool) -> bool:
+    # Under the MoE-CP all-gather the fusion path would skip complete_now
+    # and its MoE-CP scatter, leaving hidden_states longer than the residual.
+    if is_enable_moe_cp_allgather() or output.group is None:
+        return False
+
+    # The fused residual+LN reduces over a single group. Hybrid EP+TP spans
+    # two disjoint groups; post_experts_all_reduce() merges them into one
+    # _TP reduction when moe_dp_size == 1, which the fused kernel can absorb.
+    # When merging is blocked, no single group covers both, so fusion stays off.
+    parallel = get_parallel()
+    if (
+        parallel.moe_ep_size > 1
+        and parallel.moe_tp_size > 1
+        and not can_merge_post_experts_all_reduce()
+    ):
+        return False
+
+    if (
+        is_dp_attention_enabled()
+        and plan._speculative_algo is not None
+        and plan._speculative_algo.is_eagle()
+    ):
+        return False
+
+    return not scattered
+
+
+def _fused_consumer_sum() -> bool:
+    # LoRA-B is replicated and linear. TP1 shared experts add on rank zero
+    # when the sum is deferred. Preserve these fused paths, but keep their
+    # producer-side reduction order when no fused consumer is enabled.
+    return (
+        (get_lora().enable_lora or envs.SGLANG_SHARED_EXPERT_TP1.get())
+        and get_moe_a2a_backend().is_none()
+        and not get_exec().comm.enable_quant_communications
+        and post_experts_reduction_group() is get_parallel().tp_group
+    )
 
 
 class ExitPolicy:
@@ -133,18 +230,6 @@ class ExitPolicy:
             return stream.write(hidden_states)
         return stream.record(hidden_states, update, declared_sum=declared_sum)
 
-    @staticmethod
-    def _sum_left_to_next_input(steps, sum_in_reduce_scatter):
-        # On an input-scattered batch the next input's TP reduce-scatter
-        # completes the sum; the other reduce-scatters are this exit's move.
-        if (
-            sum_in_reduce_scatter
-            and not steps.returns_over_dp
-            and not steps.output_move_completes_sum
-        ):
-            return SumGroup.TP
-        return None
-
     def _next_input_can_scatter(self, steps) -> bool:
         """Whether the next layer's input can run this layer's move of its FFN
         output back to this rank's tokens: the base postprocess scatter, when
@@ -162,19 +247,13 @@ class ExitPolicy:
         return _select_dp_reduce_scatter(
             forward_batch,
             may_reduce_scatter=steps.output.may_reduce_scatter,
-            may_reduce_scatterv=steps.output.may_reduce_scatterv,
+            reduce_scatterv=steps.exit.reduce_scatterv,
         )
 
     def _sum_in_reduce_scatter(self, steps, dp_step: Optional[Callable]) -> bool:
         """Whether a reduce-scatter completes the FFN output's sum: the
         attention-DP one ``dp_step`` names, or the CP / input-scattered one."""
-        if dp_step is not None:
-            return True
-        if not steps.output.may_reduce_scatter:
-            return False
-        if steps.output_move_completes_sum:
-            return True
-        return get_attn_tp_context().input_scattered and not self.plan.terminal
+        return dp_step is not None or steps.exit.sum_in_reduce_scatter
 
     def ffn_reduction_group(self, steps) -> GroupCoordinator:
         """The group this layer's FFN output owes its sum over: the MoE output's
@@ -271,7 +350,7 @@ class ExitPolicy:
                 hidden_states,
                 steps.output.group,
                 forward_batch,
-                may_quantize=steps.output.update.is_plain_add,
+                may_quantize=steps.output.update.quantized_sum,
             )
         if steps.output.transform is not None:
             hidden_states = steps.output.transform.apply(hidden_states)
@@ -307,33 +386,6 @@ class ExitPolicy:
         off its MoE finalize, then call ``finish``."""
         return FfnExit(self, forward_batch, stream=stream)
 
-    def _sum_deferral_allowed(self, steps) -> bool:
-        # Under the MoE-CP all-gather the fusion path would skip complete_now
-        # and its MoE-CP scatter, leaving hidden_states longer than the residual.
-        if is_enable_moe_cp_allgather() or steps.output.group is None:
-            return False
-
-        # The fused residual+LN reduces over a single group. Hybrid EP+TP spans
-        # two disjoint groups; post_experts_all_reduce() merges them into one
-        # _TP reduction when moe_dp_size == 1, which the fused kernel can absorb.
-        # When merging is blocked, no single group covers both, so fusion stays off.
-        parallel = get_parallel()
-        if (
-            parallel.moe_ep_size > 1
-            and parallel.moe_tp_size > 1
-            and not can_merge_post_experts_all_reduce()
-        ):
-            return False
-
-        if (
-            is_dp_attention_enabled()
-            and self.plan._speculative_algo is not None
-            and self.plan._speculative_algo.is_eagle()
-        ):
-            return False
-
-        return not get_attn_tp_context().input_scattered
-
     def _defers_sum(
         self,
         forward_batch: ForwardBatch,
@@ -344,23 +396,20 @@ class ExitPolicy:
     ) -> bool:
         """Whether the FFN leaves its output's all-reduce to the next layer's
         input when no fused kernel takes it: when the next layer would run the
-        same all-reduce the FFN itself would have."""
+        same all-reduce the FFN itself would have. A reduce-scatter completing
+        the sum rules it out, and under attention DP so does any move back but
+        the scatter the next input runs."""
         return (
-            get_parallel().tp_size > 1
-            and not self.plan.terminal
-            and self._sum_deferral_allowed(steps)
-            and _batch_allows_deferred_sum(forward_batch, self.plan)
+            steps.exit.may_defer_sum
+            and _batch_allows_deferred_sum(forward_batch, steps.exit, self.plan)
             and not sum_in_reduce_scatter
-            # Under attention DP the next layer must also run postprocess's
-            # scatter back to this rank's tokens, and nothing more.
-            and (
-                not is_dp_attention_enabled()
-                or (self._next_input_can_scatter(steps) and dp_step is None)
-            )
+            and dp_step is None
         )
 
 
-def _batch_allows_deferred_sum(forward_batch: ForwardBatch, boundary=None) -> bool:
+def _batch_allows_deferred_sum(
+    forward_batch: ForwardBatch, facts: ExitFacts, boundary=None
+) -> bool:
     """Admit ordinary single-sum outputs, plus LoRA and TP1 shared-expert
     outputs when a fused consumer (the backend's can_defer_all_reduce,
     FlashInfer or aiter) can take them.
@@ -370,17 +419,9 @@ def _batch_allows_deferred_sum(forward_batch: ForwardBatch, boundary=None) -> bo
     """
     if not _ffn_has_tokens(forward_batch):
         return False
-    if post_experts_sum_is_one_all_reduce():
+    if facts.single_sum:
         return True
-    # LoRA-B is replicated and linear. TP1 shared experts add on rank zero
-    # when the sum is deferred. Preserve these fused paths, but keep their
-    # producer-side reduction order when no fused consumer is enabled.
-    if not (
-        (get_lora().enable_lora or envs.SGLANG_SHARED_EXPERT_TP1.get())
-        and get_moe_a2a_backend().is_none()
-        and not get_exec().comm.enable_quant_communications
-        and post_experts_reduction_group() is get_parallel().tp_group
-    ):
+    if not facts.fused_consumer_sum:
         return False
     if (
         boundary is not None
@@ -452,12 +493,7 @@ class MixerExit:
         self._update = produced.update
         self._group = produced.group
         self._declared_sum = produced.group if produced.always_partial else None
-        self._defers = (
-            produced.may_defer_to_next
-            and get_parallel().tp_size > 1
-            and not is_dp_attention_enabled()
-            and boundary._sum_deferral_allowed(steps)
-        )
+        self._defers = steps.exit.defers_mixer_sum
 
     def __enter__(self) -> MixerExit:
         return self
@@ -476,7 +512,7 @@ class MixerExit:
                 hidden_states,
                 self._group,
                 self._forward_batch,
-                may_quantize=self._update.is_plain_add,
+                may_quantize=self._update.quantized_sum,
             )
         return self._stream.record(
             hidden_states, self._update, declared_sum=self._declared_sum
@@ -519,14 +555,16 @@ class FfnExit:
     ):
         self._stream = stream
         self.boundary = boundary
+        # The same path the entry took: the flags that select it hold for the
+        # whole call, and a stage keeps no state between its entry and exit.
         steps = boundary.plan.path_for(forward_batch)
         completion = boundary._decide(forward_batch, steps)
         self.defer_moe_finalize = completion.defer_moe_finalize
         self._complete = completion.complete
         self._update = steps.output.update
-        self._declared_sum = boundary._sum_left_to_next_input(
-            steps, completion.sum_in_reduce_scatter
-        )
+        # A reduce-scatter that completes the sum on the way back is the
+        # next input's only on an input-scattered batch.
+        self._declared_sum = steps.exit.sum_left_to_next_input
         self._scope = get_forward().scoped(defer_moe_finalize=self.defer_moe_finalize)
 
     def __enter__(self) -> FfnExit:

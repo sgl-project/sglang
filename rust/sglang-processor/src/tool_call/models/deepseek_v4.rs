@@ -1,4 +1,5 @@
-//! DeepSeek-V4 (`DeepSeekV4Detector` in `function_call/deepseekv4_detector.py`):
+//! DeepSeek-V4 and V4.1 (`DeepSeekV4Detector` and `DeepSeekV41Detector` in
+//! `function_call/deepseekv4_detector.py` and `deepseekv41_detector.py`):
 //! SGLang's DSML detector (`deepseekv32_detector.py`), with
 //! `FunctionCallParser`'s wrapping.
 //!
@@ -18,12 +19,22 @@ pub(super) struct DsmlTags {
     block: &'static str,
     invoke: &'static str,
     parameter: &'static str,
+    strip_strings: bool,
 }
 
 pub(super) const DSML_TAGS: DsmlTags = DsmlTags {
     block: "tool_calls",
     invoke: "invoke",
     parameter: "parameter",
+    strip_strings: true,
+};
+
+/// V4.1's tag names start with a space, and it keeps string values unstripped.
+pub(super) const DSML_TAGS_V41: DsmlTags = DsmlTags {
+    block: " calls",
+    invoke: " invoke",
+    parameter: " parameter",
+    strip_strings: false,
 };
 
 const DSML: &str = "｜DSML｜";
@@ -39,6 +50,7 @@ pub(super) struct DsmlDetector {
     parameter_regex: Regex,
     calls_regex: Regex,
     invoke_regex: Regex,
+    strip_strings: bool,
     buffer: String,
     current_tool_id: i64,
 }
@@ -64,6 +76,7 @@ impl DsmlDetector {
             invoke_regex: regex(format!(
                 r#"(?s)<{invoke}{S}+name="(?P<name>[^"]+)"{S}*(?:(?P<self_close>/>)|>(?P<body>.*?)(?P<end>(?:</{invoke}>|$)))"#
             )),
+            strip_strings: tags.strip_strings,
             buffer: String::new(),
             current_tool_id: -1,
         }
@@ -217,7 +230,8 @@ impl DsmlDetector {
             matched = true;
             let (name, kind, value) = (&param[1], &param[2], &param[3]);
             let value = match kind {
-                "true" => Value::String(py_strip(value).to_owned()),
+                "true" if self.strip_strings => Value::String(py_strip(value).to_owned()),
+                "true" => Value::String(value.to_owned()),
                 _ => serde_json::from_str(py_strip(value))
                     .unwrap_or_else(|_| Value::String(py_strip(value).to_owned())),
             };
