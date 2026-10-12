@@ -8,7 +8,7 @@ and leave the caller's buffer intact.
 
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=25, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 
 import unittest
 from contextlib import ExitStack

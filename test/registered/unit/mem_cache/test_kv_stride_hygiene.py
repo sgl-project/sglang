@@ -39,7 +39,7 @@ from sglang.srt.kv_canary.pool_patcher.buffer_alloc import make_row_source
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
 
 def _strided_rows(num_rows: int, row_elems: int, slot_elems: int, dtype, *, offset=0):

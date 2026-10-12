@@ -30,7 +30,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (  # noqa: E402
     VocabParallelEmbedding,
 )
 
-register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
 VOCAB, HIDDEN = 16, 8
 AUTO = LoadConfig(load_format=LoadFormat.AUTO)

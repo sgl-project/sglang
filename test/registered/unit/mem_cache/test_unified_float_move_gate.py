@@ -18,7 +18,7 @@ from sglang.test.unified_allocator_fixtures import (
     tri_sub_pool_specs,
 )
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
 
 def build_geometry(ps, ratio, lazy, pattern, gate):
