@@ -90,7 +90,7 @@ def _scheduler_for_get_next_batch(*, tree_cache, chunked_req) -> Scheduler:
     s.ngram_embedding_manager.prepare_for_forward = MagicMock(
         side_effect=lambda batch, **_: batch
     )
-    s.update_running_batch = MagicMock(side_effect=lambda batch: batch)
+    s.select_decode_rows = MagicMock(return_value=True)
     tree_cache.check_hicache_events = MagicMock()
     s.tree_cache = tree_cache
     s.chunked_req = chunked_req

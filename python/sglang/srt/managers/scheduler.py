@@ -3904,16 +3904,14 @@ class Scheduler(
     def _select_decode(self, running_batch: ScheduleBatch) -> Optional[ScheduleBatch]:
         """Select the running batch's rows that decode this step; None skips decode."""
         # Run decode (skip for prefill-only batches)
-        if not running_batch.is_empty() and not running_batch.is_prefill_only:
-            decode_batch = self.update_running_batch(running_batch)
-            ret = (
-                decode_batch
-                if decode_batch is not None and not decode_batch.is_empty()
-                else None
-            )
-        else:
-            ret = None
-        return ret
+        if (
+            not running_batch.is_empty()
+            and not running_batch.is_prefill_only
+            and self.select_decode_rows(running_batch, retract=True)
+            and not running_batch.is_empty()
+        ):
+            return running_batch
+        return None
 
     def _finalize_step(self, ret: Optional[ScheduleBatch]) -> Optional[ScheduleBatch]:
         """Prepare the gathered batch to run: DP extend view, ngram inputs, timing."""
@@ -3996,7 +3994,7 @@ class Scheduler(
             # Reset batch_is_full to try preemption with a prefill adder.
             running_batch.batch_is_full = False
         if running_batch.is_empty():
-            # An empty batch never reaches update_running_batch, the only
+            # An empty batch never reaches select_decode_rows, the only
             # other place that clears the flag, so admission would stay shut.
             running_batch.batch_is_full = False
 
