@@ -6,8 +6,9 @@ import torch
 from sglang.srt.speculative.dspark_components.dspark_verify import (
     sample_simulated_bonus,
 )
-from sglang.test.ci.ci_register import register_amd_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
+register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
 
 
@@ -49,12 +50,11 @@ class TestSimulatedBonus(unittest.TestCase):
             bs=bs,
             verify_num_draft_tokens=rows,
         )
-        ref = (
-            logits.float()
-            .view(bs, rows, vocab)
-            .argmax(-1)[torch.arange(bs), correct_len]
-        )
-        self.assertTrue(torch.equal(out, ref))
+        sel = logits.float().view(bs, rows, vocab)[torch.arange(bs), correct_len]
+        # bf16 logits often tie at the row max, and a near-zero-temperature sample
+        # is uniform over the tied tokens: check the sampled logit, not argmax's index.
+        picked = sel.gather(1, out.unsqueeze(1)).squeeze(1)
+        self.assertTrue(torch.equal(picked, sel.max(-1).values))
 
     def test_matches_softmax_distribution(self):
         torch.manual_seed(1)
