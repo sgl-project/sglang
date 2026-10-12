@@ -224,6 +224,7 @@ from sglang.srt.managers.schedule_policy import (
     SchedulePolicy,
 )
 from sglang.srt.managers.scheduler_components._req_scan import (
+    rows_hold_launched,
     running_and_inflight_batches,
 )
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
@@ -5530,7 +5531,7 @@ class Scheduler(
             # Polling can run intake before the newest queued batch becomes last_batch.
             batches.extend(record.batch for record in self.inflight_steps)
         reqs = [req for batch in batches if batch is not None for req in batch.reqs]
-        if self.rows_join_at_launch and self.chunked_req is not None:
+        if rows_hold_launched(self) and self.chunked_req is not None:
             # The request still chunking, which no rows hold.
             reqs.append(self.chunked_req)
         return reqs

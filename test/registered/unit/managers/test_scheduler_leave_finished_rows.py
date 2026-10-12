@@ -83,6 +83,7 @@ class TestLeaveBeforeAdmission(unittest.TestCase):
         s.chunked_req = None
         s.enable_hisparse = False
         s.rows_join_at_launch = False
+        s.disagg_decode_launches_copy = False
         s.require_mlp_sync = False
         s._should_defer_prefill = Mock(return_value=False)
         s.dp_attn_adapter = Mock()

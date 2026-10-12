@@ -3077,8 +3077,10 @@ class SchedulerDisaggregationDecodeMixin:
             )
             self.cur_batch_for_debug = batch
             # overlap + spec + grammar is unsupported (would desync DP ranks).
+            # The step in flight is the one launched last.
+            inflight = self.inflight_steps.newest()
             disable_overlap_for_batch = self.is_disable_overlap_for_batch(
-                batch, last_batch=self.last_batch
+                batch, last_batch=None if inflight is None else inflight.batch
             )
 
             if disable_overlap_for_batch and self.inflight_steps.has_due():
@@ -3149,17 +3151,6 @@ class SchedulerDisaggregationDecodeMixin:
             ret = running_batch if not running_batch.is_empty() else None
             if ret is not None and self.disagg_decode_launches_copy:
                 ret = decoding_batch.decode_step()
-
-        if self.disagg_decode_launches_copy and self.last_batch is not None:
-            # The step launched last stays last_batch until the loop launches
-            # the next one, and the idle checks and request queries read its
-            # requests. It is a copy of the rows, or an idle step without
-            # requests: it drops the requests that have left the rows since,
-            # by a finish or a retract. Filter only its request list; the rows
-            # share its sampling and spec objects. It is then only a listing
-            # of requests, which nothing may filter, merge or plan again.
-            row_ids = set(map(id, decoding_batch.rows.reqs))
-            self.last_batch.reqs = [r for r in self.last_batch.reqs if id(r) in row_ids]
 
         ret = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(ret)
         if ret:

@@ -503,6 +503,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler.running_batch = ScheduleBatch(reqs=[])
         scheduler.last_batch = None
         scheduler.rows_join_at_launch = False
+        scheduler.disagg_decode_launches_copy = False
         scheduler.recv_skipper = None
         scheduler.chunked_req = None
         scheduler.waiting_queue = []
