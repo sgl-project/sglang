@@ -303,6 +303,10 @@ def _mx_quant_chunk(n_cols: int):
     return None
 
 
+# measured at DeepSeek-V4's E=385 top-7: past it the distributed sort + quant loses to aiter
+_DISTRIBUTED_MAX_PAIRS_UP_TO_385_EXPERTS = 112
+
+
 def _small_sort_supported(
     topk_ids, block_size, expert_mask, num_local_tokens, num_experts
 ):
@@ -313,13 +317,11 @@ def _small_sort_supported(
         and num_local_tokens is None
         and p <= 256
         # ponytail: the distributed variant scans every 64-expert chunk per pair, so it beats
-        # aiter at E=129 but loses at E=513; at DeepSeek-V4's E=385 (top-7, graph replay)
-        # it beats aiter's sort + stage1 quant launches by ~9 us up to 112 pairs, breaks
-        # even near 126 and loses from 140
+        # aiter at E=129 but loses at E=513; E=257..385 shares the cutoff measured at 385
         and (
             (p <= 64 and p <= 2 * block_size)
             or num_experts <= 256
-            or (num_experts <= 385 and p <= 112)
+            or (num_experts <= 385 and p <= _DISTRIBUTED_MAX_PAIRS_UP_TO_385_EXPERTS)
         )
         and topk < 128
         and topk_ids.dtype == torch.int32
