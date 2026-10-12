@@ -104,6 +104,43 @@ def flatten_extra_params(payload: Any) -> dict[str, Any]:
     return payload
 
 
+def parse_form_extra_value(value: Any) -> Any:
+    """Decode a JSON-encoded multipart form value, keeping plain strings as-is."""
+    if not isinstance(value, str):
+        return value
+    try:
+        return json.loads(value)
+    except Exception:
+        return value
+
+
+def parse_multipart_extra_containers(
+    extra_body: Any, extra_params: Any
+) -> dict[str, Any]:
+    """Parse the `extra_body` / `extra_params` JSON form fields of a multipart request.
+
+    `extra_params` entries override `extra_body`. Malformed JSON is a 400.
+    """
+    extras: dict[str, Any] = {}
+    if extra_body:
+        try:
+            extras = flatten_extra_params(json.loads(extra_body))
+        except (json.JSONDecodeError, ValueError, TypeError) as exc:
+            raise HTTPException(
+                status_code=400, detail="extra_body is not valid JSON"
+            ) from exc
+    if extra_params:
+        try:
+            extras.update(
+                flatten_extra_params({"extra_params": json.loads(extra_params)})
+            )
+        except (json.JSONDecodeError, ValueError, TypeError) as exc:
+            raise HTTPException(
+                status_code=400, detail="extra_params is not valid JSON"
+            ) from exc
+    return extras
+
+
 _REQUEST_EXTRA_CONTAINERS = (
     "extra_body",
     "extra_json",

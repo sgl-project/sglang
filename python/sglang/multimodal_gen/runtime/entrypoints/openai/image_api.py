@@ -3,7 +3,6 @@
 import asyncio
 import base64
 import contextlib
-import json
 import os
 import time
 from typing import Any, List, Optional
@@ -41,9 +40,10 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     add_common_data_to_response,
     build_sampling_params,
     choose_output_image_ext,
-    flatten_extra_params,
     get_sampling_request_extra_fields,
     merge_image_input_list,
+    parse_form_extra_value,
+    parse_multipart_extra_containers,
     process_generation_batch,
     request_extra_value,
     request_field_value,
@@ -75,15 +75,6 @@ def _resolve_image_output_format(
     return sampling_params_cls.default_image_output_format()
 
 
-def _parse_form_value(value: Any) -> Any:
-    if not isinstance(value, str):
-        return value
-    try:
-        return json.loads(value)
-    except ValueError:
-        return value
-
-
 def _multipart_image_model_kwargs(
     raw_form: Any,
     sampling_params_cls: type[SamplingParams],
@@ -96,23 +87,11 @@ def _multipart_image_model_kwargs(
     Mirrors what /generations reads from JSON extras, so edits accept the same
     model-specific fields as form fields, `extra_body`, or `extra_params`.
     """
-    extras: dict[str, Any] = {}
-    for name, payload in (("extra_body", extra_body), ("extra_params", extra_params)):
-        if not payload:
-            continue
-        try:
-            parsed = json.loads(payload)
-        except ValueError as exc:
-            raise HTTPException(
-                status_code=400, detail=f"{name} is not valid JSON"
-            ) from exc
-        if name == "extra_params":
-            parsed = {"extra_params": parsed}
-        extras.update(flatten_extra_params(parsed))
+    extras = parse_multipart_extra_containers(extra_body, extra_params)
     declared = get_sampling_request_extra_fields(sampling_params_cls, "image")
     for key in declared:
         if key in raw_form:
-            extras[key] = _parse_form_value(raw_form[key])
+            extras[key] = parse_form_extra_value(raw_form[key])
     return {
         key: value
         for key, value in extras.items()
