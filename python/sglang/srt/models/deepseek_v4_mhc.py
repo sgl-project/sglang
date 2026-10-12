@@ -42,6 +42,14 @@ from sglang.srt.utils import is_gfx95_supported
 
 _is_gfx95_supported = is_gfx95_supported()
 
+# The fused all-reduce epilogues have world-size-templated kernels for TP2 and TP4.
+_FUSED_MHC_TP_SIZES = (2, 4)
+
+
+def fused_mhc_tp_ok(tp_size: int) -> bool:
+    return tp_size in _FUSED_MHC_TP_SIZES
+
+
 # ---------------------------------------------------------------------------
 # What a layer hands this module
 # ---------------------------------------------------------------------------
