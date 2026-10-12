@@ -567,6 +567,10 @@ class Envs:
     # HND KV layout folds (page, head) into one paged index for per-kv-head sparse
     # page tables (DP attn); paged backends like trtllm_mha consume it directly.
     SGLANG_USE_HND_KVCACHE = EnvBool(False)
+    # --enable-kv-cache-sharding: run the layer-ahead prefix allgather on NCCL
+    # copy engines (zero SMs) when the shard group is on one node. Needs NCCL
+    # cuMem, which the engine then defaults on for single-node deployments.
+    SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER = EnvBool(True)
 
     # Attention (aiter, ROCm): route NEXTN spec draft_extend (EAGLE-v2 KV
     # catch-up) through aiter unified_attention (GQA-packed + split-KV) instead

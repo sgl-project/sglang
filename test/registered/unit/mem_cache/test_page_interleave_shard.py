@@ -33,13 +33,18 @@ allocation hangs on:
    SimpleNamespace binding pattern of ``test_dsa_layer_shard_utils.py``.
 
 The GPU tests exercise real pools and NCCL collectives: MLA and MHA gathers
-on 2 ranks (``TestPageInterleaveGatherMultiGpu``), and byte-exact DSA indexer
-keys, scales, and latent KV on 2 and 4 ranks (``TestPageInterleaveIndexer``),
-including dequantized MLA reads from packed FP8 scratch.
+on 2 ranks (``TestPageInterleaveGatherMultiGpu``), the copy-engine gather's
+symmetric window, its zero-kernel launch, its release, and the cross-node
+fallback (``TestPageInterleaveZeroSmGatherMultiGpu``),
+and byte-exact DSA indexer keys, scales, and latent KV on 2 and 4 ranks
+(``TestPageInterleaveIndexer``), including dequantized MLA reads from packed
+FP8 scratch.
 GPU tests skip when too few CUDA devices are visible, so the same file runs
 in both CPU and CUDA CI suites.
 """
 
+import gc
+import math
 import os
 import shutil
 import tempfile
@@ -84,6 +89,7 @@ from sglang.srt.mem_cache.page_interleave_pool import (
     PageInterleaveKVPoolMixin,
     PageInterleaveMHATokenToKVPool,
     PageInterleaveMLATokenToKVPool,
+    _symmetric_scratch_layout,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
@@ -91,6 +97,7 @@ from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import get_parallel, publish
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import ceil_div
+from sglang.srt.utils.common import temp_set_env
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.mem_cache_utils import finish_req
 from sglang.test.test_utils import CustomTestCase, publish_build_topology
@@ -236,12 +243,37 @@ class TestPageShardScratchSizing(CustomTestCase):
                     if use_mla
                     else PageInterleaveMHATokenToKVPool
                 )
-                tensors = pool_cls._scratch_tensor_specs(pool, spec.scratch_rows)
+                specs = pool_cls._scratch_tensor_specs(pool, spec.scratch_rows)
                 actual = 2 * sum(
-                    tensor.numel() * tensor.element_size()
-                    for tensor in tensors.values()
+                    math.prod(shape) * dtype.itemsize for shape, dtype in specs.values()
                 )
                 self.assertEqual(estimated, actual)
+                # The zero-SM buffer adds at most one window alignment per tensor.
+                _, symmetric_bytes = _symmetric_scratch_layout(specs, num_slots=2)
+                self.assertGreaterEqual(symmetric_bytes, estimated)
+                self.assertLess(symmetric_bytes, estimated + 2 * len(specs) * 4096)
+
+
+class TestZeroSmScratchLayout(CustomTestCase):
+    def test_slot_tensors_are_window_aligned_and_disjoint(self):
+        """Both slots share one symmetric window: every tensor must start on
+        NCCL's 4 KiB window alignment and no two tensors may overlap."""
+        rows = 13 * 16  # neither row width below fills a whole 4 KiB block
+        specs = {
+            "kv": ((rows, 1, 576), torch.bfloat16),
+            "index_k": ((rows // 16, 16 * 132), torch.uint8),
+        }
+        offsets, nbytes = _symmetric_scratch_layout(specs, num_slots=2)
+        spans = sorted(
+            (slot[name], slot[name] + math.prod(shape) * dtype.itemsize)
+            for slot in offsets
+            for name, (shape, dtype) in specs.items()
+        )
+        self.assertEqual(len(spans), 4)
+        self.assertTrue(all(start % 4096 == 0 for start, _ in spans))
+        for (_, end), (next_start, _) in zip(spans, spans[1:]):
+            self.assertLessEqual(end, next_start)
+        self.assertLessEqual(spans[-1][1], nbytes)
 
 
 def _make_spec(shard_rank=0, max_prefix_groups=64, chunk_pages=32):
@@ -1566,6 +1598,7 @@ def _run_mla(rank, world, port):
     torch.distributed.barrier()
     if rank == 0:
         print("PASS: MLA page-interleave shard (attn-TP axis)")
+    return pool, req_to_token, prefix_len, seq_len
 
 
 def _run_mha(rank, world, port):
@@ -1685,6 +1718,106 @@ class TestPageInterleaveGatherMultiGpu(CustomTestCase):
 
     def test_mha_shard_over_attention_cp(self):
         mp.spawn(_run_mha, args=(_GATHER_WORLD, 29812), nprocs=_GATHER_WORLD, join=True)
+
+
+def _gather_gpu_activity(pool, req_to_token, prefix_len, seq_len):
+    """Names of the GPU kernels and copies one sharded batch's gathers issue."""
+    torch.cuda.synchronize()
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CUDA]
+    ) as prof:
+        pool.begin_shard_extend(
+            req_to_token, torch.tensor([0]), [prefix_len], [seq_len]
+        )
+        for layer_id in range(_GATHER_LAYER_NUM):
+            pool.get_key_buffer(layer_id)
+        torch.cuda.synchronize()
+    return [
+        event.name
+        for event in prof.events()
+        if event.device_type == torch.autograd.DeviceType.CUDA
+    ]
+
+
+def _run_zero_sm_mla(rank, world, port):
+    pool, req_to_token, prefix_len, seq_len = _run_mla(rank, world, port)
+    assert pool._zero_sm_gather and pool._scratch_window_registered
+
+    # NCCL picks copy engines per collective, so a windowed gather can still
+    # land on ring or symmetric SM kernels; only the launched work tells.
+    activity = _gather_gpu_activity(pool, req_to_token, prefix_len, seq_len)
+    nccl_kernels = sorted({name for name in activity if "nccl" in name.lower()})
+    assert not nccl_kernels, f"gather ran on NCCL SM kernels: {nccl_kernels}"
+    assert any("PtoP" in name for name in activity), "no peer copy-engine copy"
+
+    scratch_bytes = sum(
+        tensor.numel() * tensor.element_size()
+        for slot in pool._slots
+        for tensor in slot.tensors.values()
+    )
+    view = pool._slots[1].tensors["kv"]
+    torch.cuda.synchronize()
+    torch.distributed.barrier()
+    free_with_pool = torch.cuda.mem_get_info()[0]
+    del pool
+    gc.collect()
+    torch.distributed.barrier()
+    free_with_view = torch.cuda.mem_get_info()[0]
+    # A peer's window maps this buffer until that peer deregisters too.
+    del view
+    gc.collect()
+    torch.distributed.barrier()
+    free_released = torch.cuda.mem_get_info()[0]
+    assert free_with_view - free_with_pool < scratch_bytes, "freed under a live view"
+    assert free_released - free_with_view >= scratch_bytes, "window buffer leaked"
+
+
+def _run_cross_node_mla(rank, world, port):
+    with unittest.mock.patch(
+        "sglang.srt.mem_cache.page_interleave_pool.in_the_same_node_as",
+        lambda pg, source_rank: [r == source_rank for r in range(world)],
+    ):
+        pool, req_to_token, prefix_len, seq_len = _run_mla(rank, world, port)
+    assert not pool._zero_sm_gather and not pool._scratch_window_registered
+    activity = _gather_gpu_activity(pool, req_to_token, prefix_len, seq_len)
+    assert any("nccl" in name.lower() for name in activity)
+
+
+@unittest.skipIf(
+    torch.cuda.device_count() < 2, "page-interleave gather needs 2 CUDA devices"
+)
+class TestPageInterleaveZeroSmGatherMultiGpu(CustomTestCase):
+    def test_copy_engine_window_gather_and_release(self):
+        """The zero-SM pool registers its scratch as a symmetric window, still
+        assembles the canonical prefix, and frees the window buffer only once
+        the pool and every scratch view are gone."""
+        if torch.cuda.nccl.version() < (2, 28, 0):
+            self.skipTest("copy-engine collectives need NCCL >= 2.28")
+        # Without cuMem NCCL returns a NULL window; the ranks inherit both.
+        with (
+            temp_set_env(NCCL_CUMEM_ENABLE="1"),
+            envs.SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER.override(True),
+        ):
+            mp.spawn(
+                _run_zero_sm_mla,
+                args=(_GATHER_WORLD, 29811),
+                nprocs=_GATHER_WORLD,
+                join=True,
+            )
+
+    def test_cross_node_group_keeps_sm_gather(self):
+        """A shard group spanning nodes keeps the torch scratch and the SM
+        allgather, even with cuMem on."""
+        with (
+            temp_set_env(NCCL_CUMEM_ENABLE="1"),
+            envs.SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER.override(True),
+        ):
+            mp.spawn(
+                _run_cross_node_mla,
+                args=(_GATHER_WORLD, 29811),
+                nprocs=_GATHER_WORLD,
+                join=True,
+            )
 
 
 # =============================================================================

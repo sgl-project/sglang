@@ -1861,8 +1861,20 @@ def _set_envs_and_config(server_args: ServerArgs):
     if cfg.nnodes > 1 and is_mnnvl_fabric_device():
         os.environ.setdefault("NCCL_CUMEM_ENABLE", "1")
         os.environ.setdefault("NCCL_MNNVL_ENABLE", "1")
+    # The zero-SM KV-shard gather registers its scratch as an NCCL symmetric
+    # window, which requires cuMem-backed NCCL memory. The pool keeps torch
+    # memory under the memory saver, a custom mem pool, or a cross-node group.
+    kv_shard_zero_sm_gather = (
+        cfg.enable_kv_cache_sharding
+        and cfg.nnodes == 1
+        and envs.SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER.get()
+        and not cfg.enable_memory_saver
+        and envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get() is None
+    )
     if "NCCL_CUMEM_ENABLE" not in os.environ or cfg.enable_symm_mem:
-        os.environ["NCCL_CUMEM_ENABLE"] = str(int(cfg.enable_symm_mem))
+        os.environ["NCCL_CUMEM_ENABLE"] = str(
+            int(cfg.enable_symm_mem or kv_shard_zero_sm_gather)
+        )
     if (
         "NCCL_NVLS_ENABLE" not in os.environ
         or cfg.enable_nccl_nvls
