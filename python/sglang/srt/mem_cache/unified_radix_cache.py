@@ -2102,7 +2102,6 @@ class UnifiedRadixCache(BasePrefixCache):
         # Preserve an aux-only load as a single step.
         steps = self.tree_core.split_full_load_back_spec(kv_xfer) or [kv_xfer]
 
-        loaded_full: dict[NodeId, torch.Tensor] = {}
         loaded_locks: list[tuple[NodeId, DecLockRefParams]] = []
         try:
             for i, step_xfer in enumerate(steps):
@@ -2118,9 +2117,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
                 step_comp_xfers = {}
                 if is_last:
-                    step_comp_xfers = _rebase_anchor_index_parts(
-                        comp_xfers, loaded_full=loaded_full, last_step=step_xfer
-                    )
+                    step_comp_xfers = comp_xfers
                     aux_xfers = [x for xs in step_comp_xfers.values() for x in xs]
                     step_pools = aux_xfers + aux_sidecars + step_pools
                 device_indices = self.cache_controller.load(
@@ -2137,8 +2134,6 @@ class UnifiedRadixCache(BasePrefixCache):
                         step_id, device_indices, step_xfer, step_comp_xfers
                     )
                 )
-                if not is_last:
-                    loaded_full[step_id] = device_indices
                 self.ongoing_load_back[step_id] = _OngoingLoadBack(
                     step_id,
                     self.inc_lock_ref(step_id).to_dec_params(),

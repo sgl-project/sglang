@@ -541,13 +541,13 @@ class HiCacheFixture:
         finish the prefix's partial page from ``last_loc + 1``, then take whole
         pages for the rest. Restating it is what buys the page_size > 1 shape --
         an unaligned prefix, which is the only case where
-        ``cache_protected_len`` differs from ``len(prefix_indices)``.
+        ``cache_protected_len`` differs from ``prefix_len``.
         """
         page_size = self.page_size
         if page_size == 1:
             return self.alloc_with_eviction(extend_len)
 
-        prefix_len = req.extend_range.start
+        prefix_len = req.prefix_len
         parts: list[torch.Tensor] = []
         remaining = extend_len
         partial = prefix_len % page_size
@@ -690,8 +690,9 @@ class MiniScheduler:
 
         can_run: list[Req] = []
         committed = 0
-        if self.chunked_req is not None:
-            committed += self._admit_chunk(self.chunked_req, can_run, result)
+        continuing = self.chunked_req
+        if continuing is not None:
+            committed += self._admit_chunk(continuing, can_run, result)
 
         # A truncated request spends the batch's whole chunk budget, so it is
         # the last one admitted -- scheduler.py asserts one chunked request at
@@ -709,7 +710,7 @@ class MiniScheduler:
         # The batched H->D for everything admitted above. Serialized load-back
         # has already drained its own transfers, so this finds an empty queue.
         consumer_index = cache.ready_to_load_host_cache()
-        self._allocate(can_run)
+        self._allocate(can_run, continuing=continuing)
         # Only the forward waits on the load. Admission and allocation above ran
         # with it in flight, which is the window the load-back pins must cover.
         fx.release_host_to_device()
@@ -722,18 +723,18 @@ class MiniScheduler:
     def _stash_previous_chunk(self) -> None:
         """scheduler.get_next_batch_to_run: cache the chunk that just ran."""
         req = self.chunked_req
-        if req is None or req.extend_range.end <= len(req.prefix_indices):
+        if req is None or req.extend_end <= req.prefix_len:
             return
         checkpoint_kv_cache(req, self.fx.cache)
 
     def _admit_chunk(self, req: Req, can_run: list[Req], result: StepResult) -> int:
         """PrefillAdder.add_chunked_req. No match, no load-back: the chunk
-        carries the prefix_indices checkpoint_kv_cache left on it."""
+        resumes from the prefix_len checkpoint_kv_cache left on it."""
         req.init_next_round_input()
-        prefix_len = len(req.prefix_indices)
+        prefix_len = req.prefix_len
         remaining = len(req.full_untruncated_fill_ids) - prefix_len
         take = min(remaining, self.max_prefill_tokens)
-        req.set_extend_range(prefix_len, prefix_len + take)
+        req.extend_end = prefix_len + take
         can_run.append(req)
         result.admitted.append(req.rid)
         result.prefix_lens[req.rid] = prefix_len
@@ -741,7 +742,7 @@ class MiniScheduler:
         result.chunked += 1
         if take == remaining:
             self.chunked_req = None
-        return req.extend_range.end
+        return req.extend_end
 
     def _admit(self, req: Req, can_run: list[Req], result: StepResult) -> int:
         """PrefillAdder.add_one_req, down to the calls that touch the cache."""
@@ -755,23 +756,23 @@ class MiniScheduler:
 
         guard = cache.lock(req.last_node)
         if req.needs_host_load_back():
-            new_indices, req.last_node = cache.init_load_back(
+            loaded, req.last_node = cache.init_load_back(
                 InitLoadBackParams(
                     best_match_node=req.best_match_node,
                     host_hit_length=req.host_hit_length,
                     req=req,
                 )
             )
-            req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
-            req.kv.cache_protected_len = len(req.prefix_indices)
+            req.prefix_len += loaded
+            req.kv.cache_protected_len = req.prefix_len
         # _commit_prefill_admission, then release the guard.
         req.lock = cache.lock(req.last_node)
         cache.unlock(guard)
 
-        prefix_len = len(req.prefix_indices)
+        prefix_len = req.prefix_len
         take = min(len(req.origin_input_ids) - prefix_len, self.max_prefill_tokens)
-        req.set_extend_range(prefix_len, prefix_len + take)
-        if req.extend_range.end < len(req.origin_input_ids):
+        req.extend_end = prefix_len + take
+        if req.extend_end < len(req.origin_input_ids):
             assert self.chunked_req is None, "one chunked request at a time"
             self.chunked_req = req
             result.chunked += 1
@@ -779,25 +780,29 @@ class MiniScheduler:
         can_run.append(req)
         result.admitted.append(req.rid)
         result.prefix_lens[req.rid] = prefix_len
-        return req.extend_range.end
+        return req.extend_end
 
-    def _allocate(self, can_run: list[Req]) -> None:
+    def _allocate(self, can_run: list[Req], *, continuing: Optional[Req]) -> None:
         """alloc_for_extend: evict the shortfall, then write req_to_token."""
         fx = self.fx
         for req in can_run:
-            extend = fx.alloc_extend(req, req.extend_range.length)
+            extend = fx.alloc_extend(req, req.extend_len)
             assert extend is not None, (
-                f"req {req.rid} could not allocate {req.extend_range.length} "
+                f"req {req.rid} could not allocate {req.extend_len} "
                 f"slots (available {fx.allocator.available_size()}, "
                 f"evictable {fx.cache.evictable_size()})"
             )
             req.out_cache_loc = extend
-            prefix_len = len(req.prefix_indices)
+            prefix_len = req.prefix_len
+            # allocation._prefix_kv_indices: a later chunk already has its prefix
+            # in its row; a new request reads its match off the tree.
+            if req is not continuing and prefix_len:
+                fx.req_pool.write(
+                    (req.kv.req_pool_idx, slice(0, prefix_len)),
+                    fx.cache.prefix_device_indices(req),
+                )
             fx.req_pool.write(
-                (req.kv.req_pool_idx, slice(0, prefix_len)), req.prefix_indices
-            )
-            fx.req_pool.write(
-                (req.kv.req_pool_idx, slice(prefix_len, req.extend_range.end)), extend
+                (req.kv.req_pool_idx, slice(prefix_len, req.extend_end)), extend
             )
 
     def _forward(
@@ -806,28 +811,24 @@ class MiniScheduler:
         """Read what the attention would read, then write this chunk's KV."""
         fx = self.fx
         for req in can_run:
-            seen = fx.req_pool.req_to_token[
-                req.kv.req_pool_idx, : req.extend_range.start
-            ]
-            expected = req.origin_input_ids[: req.extend_range.start]
+            seen = fx.req_pool.req_to_token[req.kv.req_pool_idx, : req.prefix_len]
+            expected = req.origin_input_ids[: req.prefix_len]
             problem = fx.check_stamps(seen, expected)
             if problem is not None:
                 result.corruption.append(
-                    f"req {req.rid} (prefix {req.extend_range.start}, host hit "
+                    f"req {req.rid} (prefix {req.prefix_len}, host hit "
                     f"{result.host_hits.get(req.rid, 0)}, chunk "
-                    f"[{req.extend_range.start}:{req.extend_range.end}), "
+                    f"[{req.prefix_len}:{req.extend_end}), "
                     f"consumer {consumer_index}): {problem}"
                 )
             if fx.sidecar is not None:
                 problem = fx.check_sidecar(seen, expected)
                 if problem is not None:
                     result.corruption.append(
-                        f"req {req.rid} (prefix {req.extend_range.start}, host "
+                        f"req {req.rid} (prefix {req.prefix_len}, host "
                         f"hit {result.host_hits.get(req.rid, 0)}): {problem}"
                     )
-            new_tokens = req.origin_input_ids[
-                req.extend_range.start : req.extend_range.end
-            ]
+            new_tokens = req.origin_input_ids[req.prefix_len : req.extend_end]
             fx.stamp(req.out_cache_loc, new_tokens)
             if fx.sidecar is not None:
                 fx.stamp_sidecar(req.out_cache_loc, new_tokens)
@@ -839,10 +840,10 @@ class MiniScheduler:
         request's last page is held by it even though no token uses it yet.
         """
         req = self.chunked_req
-        if req is None or req.extend_range is None:
+        if req is None or req.extend_end is None:
             return 0
         page_size = self.fx.page_size
-        held = -(-req.extend_range.end // page_size) * page_size
+        held = -(-req.extend_end // page_size) * page_size
         return max(0, held - req.kv.cache_protected_len)
 
     def _complete(self, can_run: list[Req]) -> None:
