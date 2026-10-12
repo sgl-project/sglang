@@ -13,6 +13,7 @@
 """Inference-only Ernie45-VL model compatible with HuggingFace weights."""
 
 import logging
+from array import array
 from functools import lru_cache, partial
 from typing import Iterable, List, Optional, Tuple, Type
 
@@ -588,7 +589,7 @@ class Ernie4_5_VLMoeForConditionalGeneration(nn.Module):
         else:
             self._visual_token_ids_tensor_cache = None
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 

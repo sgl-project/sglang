@@ -8,9 +8,12 @@ from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.flashattention_backend import (
     FlashAttentionMetadata,
-    make_local_attention_virtual_batches,
     merge_state_v2_wrapper,
     prepare_swa_spec_page_table_triton,
+)
+from sglang.srt.layers.attention.local_attention import (
+    LocalAttentionMetadata,
+    make_local_attention_virtual_batches,
 )
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
@@ -18,6 +21,7 @@ from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import (
     get_exec,
+    get_parallel,
     get_schedule,
     get_spec,
 )
@@ -67,7 +71,7 @@ class XPUAttentionBackend(AttentionBackend):
         self.num_attention_heads = (
             model_runner.model_config.hf_text_config.num_attention_heads
         )
-        self.tp_size = model_runner.ps.tp_size
+        self.tp_size = get_parallel().tp_size
         assert self.num_attention_heads % self.tp_size == 0
         self.num_local_heads = self.num_attention_heads // self.tp_size
         self.device = model_runner.device
@@ -1479,7 +1483,7 @@ class XPUAttentionBackend(AttentionBackend):
             self.page_size,
         )
 
-        local_metadata = FlashAttentionMetadata.LocalAttentionMetadata(
+        local_metadata = LocalAttentionMetadata(
             local_query_start_loc=torch.from_numpy(cu_seqlens_q_local_np).to(device),
             local_seqused_k=torch.from_numpy(seqlens_k_local_np).to(device),
             local_block_table=block_table_local.to(device),

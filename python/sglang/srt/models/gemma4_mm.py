@@ -15,6 +15,7 @@
 
 import logging
 import re
+from array import array
 from functools import lru_cache
 from typing import Iterable, List, Optional, Set, Tuple, TypedDict, Union
 
@@ -296,9 +297,9 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
 
     def pad_input_ids(
         self,
-        input_ids: List[int],
+        input_ids: array,
         mm_inputs: MultimodalInputs,
-    ) -> List[int]:
+    ) -> array:
         """Pad input IDs with image and audio tokens."""
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
@@ -334,11 +335,51 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         during prefill. Following the HF implementation, bidirectional attention
         is only enabled within each individual image group (same-item
         tokens), not across items.
-        Currently only the TritonAttnBackend supports this.
+        Triton and FA4 use causal attention for image spans split across chunks.
 
         TODO(kpham-sgl): Guard appropriately for gemma3_mm.py:prepare_attn_masks()
         """
-        if not isinstance(get_attn_backend(), TritonAttnBackend):
+        attn_backend = get_attn_backend()
+        prefill_backend = getattr(attn_backend, "prefill_backend", attn_backend)
+        if getattr(prefill_backend, "fa_impl_ver", None) == 4:
+            # O(query tokens) metadata instead of a dense Q x KV mask. Keep
+            # absolute ranges so cached text prefixes retain the right offset.
+            lengths = forward_batch.extend_seq_lens_cpu
+            prefixes = forward_batch.extend_prefix_lens_cpu
+            ranges = torch.full((sum(lengths), 2), -1, dtype=torch.int32)
+            offset = 0
+            split_images = []
+            for i, (length, prefix) in enumerate(zip(lengths, prefixes)):
+                mm_inputs = forward_batch.mm_inputs[i]
+                if mm_inputs is not None:
+                    for item in mm_inputs.mm_items:
+                        if not item.is_image():
+                            continue
+                        for begin, end in item.offsets:
+                            if end < prefix or begin >= prefix + length:
+                                continue
+                            if begin < prefix or end >= prefix + length:
+                                # Match Triton: leave split image rows at the
+                                # causal sentinel instead of granting partial
+                                # bidirectional attention within this chunk.
+                                split_images.append((i, begin, end))
+                                continue
+                            ranges[
+                                offset + begin - prefix : offset + end + 1 - prefix
+                            ] = torch.tensor([begin, end], dtype=torch.int32)
+                offset += length
+            if split_images:
+                logger.warning_once(
+                    f"{len(split_images)} images are split across chunk boundaries. "
+                    f"First 5 split images (batch, begin, end): {split_images[:5]}. "
+                    "Those images will receive causal attention. Disable chunked "
+                    "prefill (--chunked-prefill-size=-1) for full bidirectional attention."
+                )
+            prefill_backend.forward_metadata.image_token_ranges = ranges.to(
+                input_ids.device, non_blocking=True
+            )
+            return
+        if not isinstance(prefill_backend, TritonAttnBackend):
             logger.warning_once(
                 "Bidirectional attention for image tokens requires TritonAttnBackend. "
                 "Falling back to causal attention, which may degrade image quality."
@@ -412,10 +453,10 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             )
         if bidirectional_attn_masks_list:
             bidirectional_attn_masks = torch.cat(bidirectional_attn_masks_list, dim=0)
-            get_attn_backend().forward_metadata.mask_indptr = (
+            prefill_backend.forward_metadata.mask_indptr = (
                 bidirectional_attn_mask_indptr
             )
-            get_attn_backend().forward_metadata.custom_mask = bidirectional_attn_masks
+            prefill_backend.forward_metadata.custom_mask = bidirectional_attn_masks
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         vt = self.vision_tower

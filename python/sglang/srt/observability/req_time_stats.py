@@ -488,6 +488,18 @@ class APIServerReqTimeStats(ReqTimeStatsBase):
     def get_decode_latency(self):
         return self.finished_time - self.first_token_time
 
+    def get_time_per_output_token(self, completion_tokens: int) -> Optional[float]:
+        if self.first_token_time <= 0.0 or completion_tokens <= 1:
+            return None
+        decode_latency = self.get_decode_latency()
+        if decode_latency <= 0.0:
+            return None
+        return decode_latency / (completion_tokens - 1)
+
+    def get_decode_throughput(self, completion_tokens: int) -> Optional[float]:
+        tpot = self.get_time_per_output_token(completion_tokens)
+        return None if tpot is None else 1.0 / tpot
+
     def get_response_sent_to_client_realtime(self):
         return convert_time_to_realtime(self.response_sent_to_client_time)
 
@@ -514,9 +526,9 @@ class APIServerReqTimeStats(ReqTimeStatsBase):
                 self.finished_time
             )
 
-        decode_latency = self.get_decode_latency()
-        if decode_latency > 0.0 and completion_tokens > 1:
-            meta_info["decode_throughput"] = (completion_tokens - 1) / decode_latency
+        decode_throughput = self.get_decode_throughput(completion_tokens)
+        if decode_throughput is not None:
+            meta_info["decode_throughput"] = decode_throughput
         return meta_info
 
     def convert_to_gen_ai_span_attrs(self):
@@ -648,6 +660,10 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     transfer_speed_gb_s: float = 0.0
     transfer_total_mb: float = 0.0
 
+    # Seconds spent in the waiting queue over every entry (a retracted request
+    # re-enters it). Must not end in "time": __setstate__ clock-rebases those.
+    queue_duration_s: float = 0.0
+
     has_timing_data: bool = False
 
     def __getstate__(self) -> object:
@@ -660,6 +676,8 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
             "wait_queue_entry_time": self.wait_queue_entry_time,
             "forward_entry_time": self.forward_entry_time,
             "prefill_finished_time": self.prefill_finished_time,
+            # Read by meta_info["queue_time"] on the tokenizer; timestamps cannot rebuild it.
+            "queue_duration_s": self.queue_duration_s,
             "diff_realtime_monotonic": global_diff_realtime_monotonic,
         }
         return state
@@ -683,30 +701,6 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     def set_spec_verify_start_time(self, ts=None):
         ts = ts or time.perf_counter()
         self.spec_verify_start_time = ts
-
-    def set_spec_verify_end_time(
-        self,
-        ts=None,
-        num_correct_drafts: int = 0,
-        # FIXME: backward-compat alias, remove in next release.
-        accepted_tokens: Optional[int] = None,
-    ):
-        if accepted_tokens is not None:
-            num_correct_drafts = accepted_tokens
-        ts = ts or time.perf_counter()
-
-        if self.trace_ctx.tracing_enable:
-            stage = RequestStage.SPEC_VERIFY
-            self.trace_slice(
-                stage,
-                self.spec_verify_start_time,
-                ts,
-                {
-                    "num_correct_drafts": num_correct_drafts,
-                    # FIXME: backward-compat alias, remove in next release.
-                    "accepted_tokens": num_correct_drafts,
-                },
-            )
 
     def set_run_batch_cpu_start_time(self, ts=None, attrs=None):
         ts = ts or time.perf_counter()
@@ -742,6 +736,7 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         self.last_forward_entry_time = 0.0
         self.last_prefill_finished_time = 0.0
         self.last_chunked_prefill_finish_time = 0.0
+        self.queue_duration_s = 0.0
 
     def set_wait_queue_entry_time(self, ts=None):
         ts = ts or time.perf_counter()
@@ -769,9 +764,13 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         if self.forward_entry_time == 0.0:
             self.forward_entry_time = ts
             self.last_forward_entry_time = ts
+            self.queue_duration_s += ts - self.wait_queue_entry_time
 
             if self.enable_metrics:
-                self.metrics_collector.observe_queue_time(self.get_queueing_time())
+                # One sample per request: the wait before the first forward.
+                self.metrics_collector.observe_queue_time(
+                    ts - self.wait_queue_entry_time
+                )
 
             if self.enable_metrics or self.trace_ctx.tracing_enable:
                 if self.disagg_mode == DisaggregationMode.DECODE:
@@ -796,7 +795,9 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                         convert_time_to_realtime_ns(ts),
                     )
         elif self.last_forward_entry_time == 0.0:
+            # First forward after a retraction; later prefill chunks skip this branch.
             self.last_forward_entry_time = ts
+            self.queue_duration_s += ts - self.wait_queue_entry_time
 
     def set_last_chunked_prefill_finish_time(self, ts=None):
         ts = ts or time.perf_counter()
@@ -1053,13 +1054,11 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         self.trace_slice(stage, self.last_forward_entry_time, ts)
 
     def get_queueing_time(self) -> float:
-        return self.forward_entry_time - self.wait_queue_entry_time
+        return self.queue_duration_s
 
     def convert_to_duration(self) -> str:
         if self.disagg_mode == DisaggregationMode.NULL:
-            queue_duration = self.duration_between(
-                self.wait_queue_entry_time, self.forward_entry_time
-            )
+            queue_duration = self.get_queueing_time()
             forward_duration = self.duration_between(
                 self.forward_entry_time, self.completion_time
             )
@@ -1074,9 +1073,7 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
             bootstrap_queue_duration = self.duration_between(
                 self.prefill_bootstrap_queue_entry_time, self.wait_queue_entry_time
             )
-            queue_duration = self.duration_between(
-                self.wait_queue_entry_time, self.forward_entry_time
-            )
+            queue_duration = self.get_queueing_time()
             forward_duration = self.duration_between(
                 self.forward_entry_time, self.completion_time
             )
@@ -1127,10 +1124,7 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                 self.decode_transfer_queue_entry_time,
                 self.wait_queue_entry_time,
             )
-            queue_duration = self.duration_between(
-                self.wait_queue_entry_time,
-                self.forward_entry_time,
-            )
+            queue_duration = self.get_queueing_time()
             forward_duration = self.duration_between(
                 self.forward_entry_time,
                 self.completion_time,

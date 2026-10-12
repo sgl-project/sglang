@@ -18,6 +18,7 @@ from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
     FullCudaGraphBackend,
 )
 from sglang.srt.model_executor.runner_utils import pool
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative import dflash_utils, dflash_worker_v2, eagle_utils
 from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -222,12 +223,7 @@ class TestGraphPoolBorrow(CustomTestCase):
                 "sglang.srt.layers.dp_attention.is_dp_attention_enabled",
                 return_value=False,
             ),
-            # `parallel_state`, not the package re-export: a stub on the
-            # re-export is never consulted.
-            patch(
-                "sglang.srt.distributed.parallel_state.get_tp_group",
-                return_value=tp_group,
-            ),
+            get_parallel().override(tp_group=tp_group),
             patch(
                 "sglang.kernels.ops.speculative.sampling.tree_speculative_sampling_target_only",
                 side_effect=fake_sampling,
@@ -380,6 +376,9 @@ class TestGraphPoolBorrow(CustomTestCase):
                     logits = torch.randn(rows, 4096, device="cuda")
                     token_ids = torch.randint(0, 4096, (rows,), device="cuda")
                     split = rows // 2
+                    # Exercise tied top-k scores in both sequences explicitly.
+                    for row in (0, split):
+                        logits[row, :4] = logits[row].max() + 1
                     sample_indices = [split - 1, rows - 1]
                     metadata = SimpleNamespace(
                         sample_indices_cpu=sample_indices,
@@ -428,14 +427,22 @@ class TestGraphPoolBorrow(CustomTestCase):
                     )
                     self.assertTrue(torch.equal(sampled, logits[sample_indices]))
                     for i, (lo, hi) in enumerate(((0, split), (split, rows))):
-                        values, indices = expected[lo:hi].topk(
-                            metadata.top_logprobs_nums[i]
+                        values = (
+                            expected[lo:hi].topk(metadata.top_logprobs_nums[i]).values
                         )
                         self.assertEqual(
                             output.input_top_logprobs_val[i], values.tolist()
                         )
+                        # topk(max_k)[:k] and topk(k) may choose different tied
+                        # tokens. Check that the returned IDs select the right
+                        # scores and never repeat a token within one row.
+                        actual_indices = output.input_top_logprobs_idx[i]
+                        indices = torch.tensor(actual_indices, device=expected.device)
                         self.assertEqual(
-                            output.input_top_logprobs_idx[i], indices.tolist()
+                            expected[lo:hi].gather(1, indices).tolist(), values.tolist()
+                        )
+                        self.assertTrue(
+                            all(len(set(row)) == len(row) for row in actual_indices)
                         )
                         self.assertEqual(
                             output.input_token_ids_logprobs_val[i],

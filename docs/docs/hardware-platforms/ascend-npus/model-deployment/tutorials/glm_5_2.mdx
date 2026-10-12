@@ -384,7 +384,7 @@ do
         --disaggregation-transfer-backend ascend --max-running-requests 64 \
         --served-model-name glm-5 --chunked-prefill-size 524288 --max-prefill-tokens 180000 --moe-a2a-backend deepep --deepep-mode normal \
         --disable-shared-experts-fusion --disable-cuda-graph --dtype bfloat16 \
-        --dp-size 4 --enable-dp-attention \
+        --attn-dp-size 4 \
         --load-balance-method round_robin \
         --enable-dp-lm-head --moe-dense-tp 1 \
         --speculative-draft-model-quantization unquant \
@@ -418,9 +418,9 @@ do
         export SGLANG_NPU_USE_MULTI_STREAM=1
 
         python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} \
-        --port 8003 --trust-remote-code --nnodes 1 --node-rank $i --tp-size 16 --dp-size 16 --ep-size 16 \
+        --port 8003 --trust-remote-code --nnodes 1 --node-rank $i --tp-size 16 --attn-dp-size 16 --ep-size 16 \
         --mem-fraction-static 0.8 --max-running-requests 128 --attention-backend ascend --device npu --quantization modelslim \
-        --served-model-name glm-5 --moe-a2a-backend deepep --enable-dp-attention --deepep-mode low_latency \
+        --served-model-name glm-5 --moe-a2a-backend deepep --deepep-mode low_latency \
         --cuda-graph-max-bs-decode 4 --disaggregation-transfer-backend ascend --watchdog-timeout 9000 --context-length 180000 \
         --tokenizer-worker-num 4 --disable-shared-experts-fusion --dtype bfloat16  --load-balance-method round_robin \
         --speculative-draft-model-quantization unquant \

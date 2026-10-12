@@ -243,11 +243,8 @@ def _sparse_gqa_chunk_prefill(
             mask=valid[:, None],
             other=0.0,
         )
-        # The chunk-prefill K/V tensors are gathered from the KV pool and can
-        # therefore carry the FP8 storage dtype, which Triton's dot rejects
-        # (`Unsupported rhs dtype fp8e4nv`). Convert to Q's dtype; the QSA
-        # backend writes the pool without per-tensor k/v scales, so this is a
-        # plain cast (no-op for BF16 pools).
+        # Direct callers can pass FP8 K/V; production packing uses Q's dtype.
+        # QSA stores unscaled K/V, so a plain cast supports both callers.
         keys = keys.to(q_values.dtype)
         values = values.to(q_values.dtype)
         scores = tl.where(valid[None, :], tl.dot(q_values, keys), -float("inf"))
@@ -270,6 +267,105 @@ def _sparse_gqa_chunk_prefill(
     )
 
 
+@triton.jit(do_not_specialize=["TOTAL_K", "BS"])
+def _pack_qsa_prefill_kv(
+    k,
+    v,
+    packed_k,
+    packed_v,
+    req_to_token,
+    req_indices,
+    cu_k,
+    SK0: tl.constexpr,
+    SK1: tl.constexpr,
+    SK2: tl.constexpr,
+    SV0: tl.constexpr,
+    SV1: tl.constexpr,
+    SV2: tl.constexpr,
+    SR0: tl.constexpr,
+    SR1: tl.constexpr,
+    HEADS: tl.constexpr,
+    DIM: tl.constexpr,
+    BLOCK: tl.constexpr,
+    TOTAL_K,
+    BS,
+    COMPACT: tl.constexpr,
+):
+    offsets = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    token = offsets // (HEADS * DIM)
+    if COMPACT:
+        valid = token < TOTAL_K
+        lo = tl.full((BLOCK,), 0, tl.int32)
+        hi = lo + BS
+        steps = BS
+        while steps > 0:
+            mid = (lo + hi + 1) // 2
+            start = tl.load(cu_k + mid).to(tl.int64)
+            after = token >= start
+            lo = tl.where(after, mid, lo)
+            hi = tl.where(after, hi, mid - 1)
+            steps = steps // 2
+        start = tl.load(cu_k + lo, valid, 0).to(tl.int64)
+        req = tl.load(req_indices + lo, valid, 0).to(tl.int64)
+        token = token - start
+        dst = offsets
+    else:
+        batch = tl.program_id(1)
+        start = tl.load(cu_k + batch).to(tl.int64)
+        end = tl.load(cu_k + batch + 1).to(tl.int64)
+        valid = token < end - start
+        req = tl.load(req_indices + batch).to(tl.int64)
+        dst = start * HEADS * DIM + offsets
+    head = offsets // DIM % HEADS
+    dim = offsets % DIM
+    slot = tl.load(req_to_token + req * SR0 + token * SR1, valid, 0).to(tl.int64)
+    keys = tl.load(k + slot * SK0 + head * SK1 + dim * SK2, valid, 0.0)
+    values = tl.load(v + slot * SV0 + head * SV1 + dim * SV2, valid, 0.0)
+    tl.store(packed_k + dst, keys, valid)
+    tl.store(packed_v + dst, values, valid)
+
+
+def pack_qsa_prefill_kv(
+    *, k, v, req_to_token, req_indices, cu_k, total_k, max_k, output_dtype=None
+):
+    heads, dim = k.shape[1:]
+    packed_k = torch.empty(
+        (total_k, heads, dim), dtype=output_dtype or k.dtype, device=k.device
+    )
+    packed_v = torch.empty(
+        (total_k, heads, dim), dtype=output_dtype or v.dtype, device=v.device
+    )
+    batch_size = req_indices.numel()
+    blocks_per_request = triton.cdiv(max_k * heads * dim, 1024)
+    compact = (
+        max_k * batch_size > 2 * total_k and blocks_per_request * batch_size >= 4096
+    )
+    grid = (
+        (triton.cdiv(total_k * heads * dim, 1024),)
+        if compact
+        else (blocks_per_request, batch_size)
+    )
+    _pack_qsa_prefill_kv[grid](
+        k,
+        v,
+        packed_k,
+        packed_v,
+        req_to_token,
+        req_indices,
+        cu_k,
+        *k.stride(),
+        *v.stride(),
+        *req_to_token.stride(),
+        HEADS=heads,
+        DIM=dim,
+        BLOCK=1024,
+        TOTAL_K=total_k,
+        BS=batch_size,
+        COMPACT=compact,
+    )
+    return packed_k, packed_v
+
+
 def sparse_gqa_fwd_interface_triton_ck(q, k, v, indices, cu_q, cu_k, kv_lens, scale):
     k, v = k.contiguous(), v.contiguous()
     total_q, num_q_heads, head_dim = q.shape
@@ -280,6 +376,58 @@ def sparse_gqa_fwd_interface_triton_ck(q, k, v, indices, cu_q, cu_k, kv_lens, sc
     block_n, warps, stages = _get_best_config(total_q)
     out = torch.empty_like(q)
     _sparse_gqa_chunk_prefill[(max_q, (cu_q.shape[0] - 1) * num_kv_heads)](
+        q,
+        k,
+        v,
+        out,
+        indices,
+        cu_q,
+        cu_k,
+        kv_lens,
+        scale,
+        indices.shape[-1],
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        v.stride(0),
+        v.stride(1),
+        v.stride(2),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        indices.stride(0),
+        indices.stride(1) if indices.ndim == 3 else 0,
+        indices.stride(2) if indices.ndim == 3 else indices.stride(1),
+        NUM_KV_HEADS=num_kv_heads,
+        GROUP_SIZE=group_size,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        HEAD_DIM=head_dim,
+        num_warps=warps,
+        num_stages=stages,
+    )
+    return out
+
+
+def sparse_gqa_packed_decode_triton(q, k, v, indices, cu_q, cu_k, kv_lens, scale):
+    """Run one packed sparse-attention row per request without a host sync.
+
+    Reuses the chunk-prefill kernel at a fixed query length of one, so graph
+    capture never hits the ``.item()`` that the general interface needs to
+    derive ``max_q``.
+    """
+
+    k, v = k.contiguous(), v.contiguous()
+    total_q, num_q_heads, head_dim = q.shape
+    num_kv_heads = k.shape[1]
+    group_size = num_q_heads // num_kv_heads
+    block_m = max(16, triton.next_power_of_2(group_size))
+    block_n, warps, stages = _get_best_config(total_q)
+    out = torch.empty_like(q)
+    _sparse_gqa_chunk_prefill[(1, (cu_q.shape[0] - 1) * num_kv_heads)](
         q,
         k,
         v,
@@ -513,9 +661,11 @@ def qwen_sparse_kv_extraction_compact_triton(
 
 
 __all__ = [
+    "pack_qsa_prefill_kv",
     "qwen_sparse_fa2_cu_seqlens_triton",
     "qwen_sparse_valid_counts_triton",
     "qwen_sparse_kv_extraction_compact_triton",
     "sparse_gqa_fwd_interface_triton",
     "sparse_gqa_fwd_interface_triton_ck",
+    "sparse_gqa_packed_decode_triton",
 ]

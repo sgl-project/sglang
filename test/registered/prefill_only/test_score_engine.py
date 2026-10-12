@@ -249,6 +249,36 @@ class TestCausalLMScoring(CustomTestCase):
                 query="Q", items=None, label_token_ids=[1, 2], apply_softmax=True
             )
 
+    def test_decision_scoring(self):
+        tokenizer = AutoTokenizer.from_pretrained(_CAUSAL_LM_MODEL)
+        prompts = ["Answer A or B: Is Paris in France?", "Choose A, B or C: 2 + 2 ="]
+        inputs = [tokenizer.encode(prompt) for prompt in prompts]
+        labels = [[33, 32], [32, 34, 33]]
+        kwargs = dict(apply_softmax=True, temperature=1.7, return_token_logprobs=True)
+        batch = self.engine.score(
+            query=[], items=inputs, label_token_ids=labels, **kwargs
+        )
+        self.assertEqual(len(batch.scores), 2)
+        for i, (ids, candidates) in enumerate(zip(inputs, labels)):
+            single = self.engine.score(
+                query=[], items=[ids], label_token_ids=candidates, **kwargs
+            )
+            torch.testing.assert_close(
+                torch.tensor(batch.scores[i]),
+                torch.tensor(single.scores[0]),
+                atol=1e-3,
+                rtol=1e-2,
+            )
+            expected = torch.softmax(torch.tensor(batch.token_logprobs[i]) / 1.7, 0)
+            torch.testing.assert_close(torch.tensor(batch.scores[i]), expected)
+        repeated = self.engine.score(
+            query=[], items=inputs, label_token_ids=labels, **kwargs
+        )
+        for cold, warm in zip(batch.scores, repeated.scores):
+            torch.testing.assert_close(
+                torch.tensor(cold), torch.tensor(warm), atol=1e-3, rtol=1e-2
+            )
+
 
 # ---------------------------------------------------------------------------
 # SequenceClassification — single-item mode
