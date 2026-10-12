@@ -49,8 +49,10 @@ from sglang.multimodal_gen.runtime.platforms import (
     current_platform,
 )
 
+# torch.cuda.is_available() is also true on ROCm, where these JIT/Triton
+# kernels do not compile; gate on the platform instead.
 requires_cuda = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="fused qk-norm+RoPE kernel needs CUDA"
+    not current_platform.is_cuda(), reason="fused VAE kernels need CUDA"
 )
 
 
@@ -309,7 +311,7 @@ def _h3_shaped_decoder():
     return decoder
 
 
-@pytest.mark.skipif(not current_platform.is_cuda(), reason="requires NVIDIA CUDA")
+@requires_cuda
 def test_fused_decoder_matches_unfused_forward():
     from sglang.multimodal_gen.runtime.managers.forward_context import (
         set_forward_context,
