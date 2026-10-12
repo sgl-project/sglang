@@ -899,10 +899,14 @@ class BeamModel(nn.Module):
     def _init_flashinfer_ar(self, hidden_size: int) -> None:
         # Runs at construction so the rendezvous stays outside CUDA graph capture;
         # all TP ranks see the same config, and one failed allocation disables it.
+        # Meta-device construction (presharded cache keys, the IPC weight loader)
+        # builds structure only; it must not allocate or rendezvous, so the
+        # all-reduce stays on CustomAR there.
         parallel = get_parallel()
         execution = get_exec()
         if (
-            parallel.tp_size < 2
+            torch.get_default_device().type == "meta"
+            or parallel.tp_size < 2
             or parallel.attn_tp_size != parallel.tp_size
             or parallel.attn_cp_size != 1
             or execution.graph.enable_torch_compile
