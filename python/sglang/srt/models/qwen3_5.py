@@ -1258,9 +1258,10 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 get_parallel().pp_rank,
                 get_parallel().pp_size,
             )
-        interval = config.full_attention_interval
+        # Full-attention layers are interval apart, so only the first one in the
+        # stage lies within interval of its start.
         self.refreshes_rope_cos_sin = (
-            layer_id == stage_start + (interval - 1 - stage_start) % interval
+            stage_start <= layer_id < stage_start + config.full_attention_interval
         )
         # A Qwen3.5 draft is rewritten to the MTP arch (model_config._config_draft_model),
         # so is_nextn marks it. Drafts are TP-sharded and do not replicate KV under DCP.
