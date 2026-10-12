@@ -287,9 +287,9 @@ def _ensure_flashinfer_megamoe_layer(
 
     process_group = None
     if world_size > 1:
-        from sglang.srt.distributed import get_moe_ep_group
+        from sglang.srt.runtime_context import get_parallel
 
-        process_group = get_moe_ep_group().device_group
+        process_group = get_parallel().moe_ep_group.device_group
     bootstrap = BootstrapConfig(
         world_size=world_size,
         rank=rank,
