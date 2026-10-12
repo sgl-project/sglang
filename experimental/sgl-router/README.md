@@ -570,8 +570,9 @@ the encoder renders them differently.
 GLM-5.3 and GLM-5.3-Flash render with the checkpoint's `chat_template.jinja` through
 `rust/sglang-processor`, which picks them by their template as SGLang does and builds
 the template context SGLang's Jinja path builds. Every text chat forwards `input_ids`.
-Media, a `chat_template` key in `chat_template_kwargs` or the default kwargs, and `-0`
-in tools or tool arguments render on the worker. With the cookbook's parsers
+Media, a `chat_template` key in `chat_template_kwargs` or the default kwargs, `-0`
+in tools or tool arguments, and U+001C..U+001F in assistant history render on the
+worker. With the cookbook's parsers
 (`glm45` and `glm47`, which `auto` resolves to) chats without tools are served
 through `/generate`, with the router splitting reasoning as SGLang does. Chats with
 tools take the engine's own route, still with the router's `input_ids`, since

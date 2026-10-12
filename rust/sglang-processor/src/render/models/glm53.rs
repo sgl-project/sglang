@@ -67,6 +67,14 @@ pub(crate) fn render(
     {
         return Err("-0 renders on the engine".into());
     }
+    // The template strips assistant content; Python's `str.strip` also strips
+    // U+001C..U+001F, where minijinja's `strip` does not.
+    if messages
+        .iter()
+        .any(|m| m["role"] == "assistant" && has_python_only_space(&m["content"]))
+    {
+        return Err("U+001C..U+001F in assistant content renders on the engine".into());
+    }
     let PromptFormatter::OAI(formatter) = formatter;
     let prompt = formatter
         .render(&TemplateRequest {
@@ -111,6 +119,9 @@ fn template_args(
         .find(|key| kwargs.contains_key(**key))
     {
         return Err(format!("chat_template_kwargs.{key} renders on the engine"));
+    }
+    if !valid_documents(kwargs.get("documents").unwrap_or(&Value::Null)) {
+        return Err("chat_template_kwargs.documents must iterate as objects".into());
     }
     let effort = effort.or_else(|| {
         kwargs
@@ -216,6 +227,28 @@ fn join_text_parts(message: &mut Value) {
             .filter_map(|part| part["text"].as_str())
             .collect::<String>()
             .into();
+    }
+}
+
+/// `render_jinja_template`: Python iterates `documents` and requires each item
+/// to be a dict, so only an empty string or object passes besides a list of objects.
+fn valid_documents(documents: &Value) -> bool {
+    match documents {
+        Value::Null => true,
+        Value::Array(items) => items.iter().all(Value::is_object),
+        Value::String(text) => text.is_empty(),
+        Value::Object(fields) => fields.is_empty(),
+        Value::Bool(_) | Value::Number(_) => false,
+    }
+}
+
+/// Whether `value` holds a character Python counts as whitespace and Rust does not.
+fn has_python_only_space(value: &Value) -> bool {
+    match value {
+        Value::String(text) => text.chars().any(|c| ('\u{1c}'..='\u{1f}').contains(&c)),
+        Value::Array(items) => items.iter().any(has_python_only_space),
+        Value::Object(fields) => fields.values().any(has_python_only_space),
+        _ => false,
     }
 }
 
