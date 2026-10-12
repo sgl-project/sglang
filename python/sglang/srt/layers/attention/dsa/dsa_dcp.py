@@ -1,5 +1,3 @@
-"""RoPE DSA sparse attention under decode context parallelism (DCP)."""
-
 from __future__ import annotations
 
 import math
@@ -13,10 +11,7 @@ from sglang.kernels.ops.attention.dsa.transform_index import (
 )
 from sglang.kernels.ops.attention.fixup_zero_kv import fixup_zero_kv_rows
 
-# FlashInfer 0.7.0.post1 returns a wrong LSE above this; drop the head folding
-# once test_folded_head_groups_match_single_group_attention passes with one group.
 _TRTLLM_LSE_MAX_HEADS = 32
-# TRT-LLM puts the batch in a 16-bit grid dimension.
 TRTLLM_MAX_BATCH_ROWS = 65535
 
 
@@ -28,9 +23,7 @@ def dsa_dcp_head_groups(num_q_heads: int) -> int:
 
 
 class DcpPageTableCache(msgspec.Struct):
-    """Rank-local page table of the latest top-k, reused by shared-top-k layers.
-
-    NOTE(vincentzed): 57 of GLM's 78 layers reuse the previous layer's top-k
+    """NOTE(vincentzed): 57 of GLM's 78 layers reuse the previous layer's top-k
     tensor; remapping once per fresh top-k cuts 78 launches/step to 21.
     """
 
@@ -97,7 +90,6 @@ def dcp_trtllm_sparse_attention(
     folded_lse = lse.view(folded_rows, folded_heads)
     rows_per_call = (TRTLLM_MAX_BATCH_ROWS // head_groups) * head_groups
     if folded_rows > rows_per_call:
-        # The calls share one workspace, so they must not overlap.
         attention_kwargs["enable_pdl"] = False
     outputs = []
     for start in range(0, folded_rows, rows_per_call):

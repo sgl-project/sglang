@@ -55,7 +55,6 @@ def transform_index_page_table_dcp(
     dcp_rank: int,
     repeat_rows: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Owned widened slots -> local rows, compacted to the front in score order, -1 padded."""
     num_rows, topk = page_table.shape
     result = torch.empty(
         (num_rows * repeat_rows, topk),

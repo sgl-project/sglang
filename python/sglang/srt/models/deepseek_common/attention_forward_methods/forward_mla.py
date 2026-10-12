@@ -93,7 +93,6 @@ def _select_local_dcp_heads_for_autotune(
 
 
 def is_dcp_mla_decode_phase(module, forward_batch: ForwardBatch) -> bool:
-    """Gathered-Q attention with an LSE merge; DSA extend joins it instead of gathering KV."""
     if module.dcp_size == 1:
         return False
     mode = forward_batch.forward_mode
@@ -105,7 +104,6 @@ def is_dcp_mla_decode_phase(module, forward_batch: ForwardBatch) -> bool:
 
 
 def is_dcp_q_replicate_phase(module, forward_batch: ForwardBatch) -> bool:
-    """Replicated Q projection pays off on decode and verify only; extend all-gathers."""
     if not get_parallel().dcp_replicate_q_proj or module.dcp_size == 1:
         return False
     mode = forward_batch.forward_mode
@@ -173,7 +171,6 @@ class DeepseekMLAForwardMixin:
     ) -> bool:
         if getattr(self, "_kimi_split_gguf_kv_b", False):
             return False
-        # The fused plan returns no LSE for the DCP merge.
         if self.dcp_size > 1:
             return False
         # Shared activation surface with the DSA indexer graph dispatch

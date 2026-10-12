@@ -270,7 +270,6 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                         kvc=kvc,
                         num_layers=num_layers,
                     )
-                    # Index keys are replicated across the DCP group.
                     target_indexer_size *= dcp_size
                     target_kv_size = self._cell_size - target_indexer_size
                     from sglang.srt.layers.cp.utils import (
@@ -288,7 +287,6 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                         num_layers=draft_num_layers,
                         allocate_all_layers=True,
                     )
-                    # The draft pool is replicated over the widened allocator slots.
                     draft_kv_size *= dcp_size
                     draft_indexer_size *= dcp_size
                     self._cell_size += draft_kv_size + draft_indexer_size
@@ -386,7 +384,6 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     kvc=kvc,
                     num_layers=num_layers,
                 )
-                # Replicated index keys; a draft's token count is already widened.
                 if not kvc.is_draft_worker:
                     indexer_cell_size *= dcp_size
                 cell_size += indexer_cell_size

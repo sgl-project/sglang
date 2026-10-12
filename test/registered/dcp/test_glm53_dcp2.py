@@ -11,8 +11,6 @@ register_cuda_ci(est_time=600, stage="extra-b", runner_config="4-gpu-b200")
 
 
 class TestGLM53NVFP4DCP2MTP(DsaMtpServerBase, DsaMtpEvalConfigDefaults, GSM8KMixin):
-    """GLM-5.3 at TP4 + DCP2 with the checkpoint's MTP draft keeps GSM8K accuracy."""
-
     model = "RadixArk/GLM-5.3-NVFP4"
     tp_size = 4
     mem_fraction_static = 0.8

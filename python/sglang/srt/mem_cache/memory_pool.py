@@ -64,10 +64,7 @@ from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     UnquantizedKVCacheMethod,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.mem_cache.allocation_sizing import (
-    get_alloc_page_size,
-    get_mamba_tracking_slots,
-)
+from sglang.srt.mem_cache.allocation_sizing import get_mamba_tracking_slots
 from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
 from sglang.srt.mem_cache.index_key_cache import IndexKeyCache
 from sglang.srt.mem_cache.kv_vmm_backing import KvVmmBufferOwner
@@ -4738,7 +4735,7 @@ class MLATokenToKVPool(KVCache):
                 # The padded slot 0 is used for writing dummy outputs from padded tokens.
                 self.kv_buffer = [
                     torch.zeros(
-                        (self.size + self.alloc_page_size, 1, self.kv_cache_dim),
+                        (self.size + self.page_size, 1, self.kv_cache_dim),
                         dtype=self.store_dtype,
                         device=self.device,
                     )
@@ -4791,13 +4788,7 @@ class MLATokenToKVPool(KVCache):
     # False: this pool takes a WIDENED loc. The unified pool resolves it in
     # the plan's write translation (`translate_write_loc`) and flips this.
     write_loc_is_dcp_resolved = False
-    # True: one row per WIDENED slot (a draft replicated across the DCP ranks),
-    # so writes are identity and the reserve page is the allocator's widened page.
     dcp_replicated = False
-
-    @property
-    def alloc_page_size(self) -> int:
-        return get_alloc_page_size() if self.dcp_replicated else self.page_size
 
     @property
     def _write_loc_dcp_span(self) -> int:
@@ -4830,9 +4821,7 @@ class MLATokenToKVPool(KVCache):
     ):
         loc, _, _ = unwrap_write_loc(loc_info)
         self._check_physical_write_loc(loc_info, "set_kv_buffer (MLA)")
-        maybe_detect_oob(
-            loc, 0, self.size + self.alloc_page_size, "set_kv_buffer (MLA)"
-        )
+        maybe_detect_oob(loc, 0, self.size + self.page_size, "set_kv_buffer (MLA)")
         layer_id = (
             layer_id_override if layer_id_override is not None else layer.layer_id
         )
@@ -4920,7 +4909,7 @@ class MLATokenToKVPool(KVCache):
         maybe_detect_oob(
             loc,
             0,
-            (self.size + self.alloc_page_size) * self._write_loc_dcp_span,
+            (self.size + self.page_size) * self._write_loc_dcp_span,
             "set_mla_kv_buffer (MLA)",
         )
         layer_id = (
@@ -4961,7 +4950,7 @@ class MLATokenToKVPool(KVCache):
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         """Relocate accepted-token combined MLA KV (latent + rope) per layer."""
-        size_limit = self.size + self.alloc_page_size
+        size_limit = self.size + self.page_size
         maybe_detect_oob(tgt_loc, 0, size_limit, "move_kv_cache tgt_loc")
         maybe_detect_oob(src_loc, 0, size_limit, "move_kv_cache src_loc")
 
@@ -5185,6 +5174,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         max_running_requests: Optional[int] = None,
         skip_topk_layers: Optional[List[bool]] = None,
         dcp_replicated: bool = False,
+        index_kernel_page_size: Optional[int] = None,
     ):
         override_dim = (
             kv_cache_dim if kv_cache_dim != kv_lora_rank + qk_rope_head_dim else None
@@ -5211,12 +5201,13 @@ class DSATokenToKVPool(MLATokenToKVPool):
         self.index_kpool = index_kpool
         self.index_kpool_compress = index_kpool_compress
         self.tail_extra_slots = tail_extra_slots
-        assert self.page_size % index_kpool == 0, (
-            f"page_size {self.page_size} must be a multiple of index_kpool {index_kpool}"
+        self.index_kernel_page_size = (
+            page_size if index_kernel_page_size is None else index_kernel_page_size
         )
-        self.index_page_size = self.page_size // index_kpool
-        # Index keys are replicated under DCP and addressed by the widened slot.
-        self.index_alloc_page_size = get_alloc_page_size()
+        assert self.index_kernel_page_size % index_kpool == 0, (
+            f"page_size {self.index_kernel_page_size} must be a multiple of index_kpool {index_kpool}"
+        )
+        self.index_page_size = self.index_kernel_page_size // index_kpool
         if index_buf_size is None:
             index_buf_size = (
                 size if dcp_replicated else size * get_parallel().attn_dcp_size
@@ -5232,7 +5223,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         )
         assert len(self.skip_topk_layers) == layer_num
 
-        physical_page_size = self.page_size // index_kpool
+        physical_page_size = self.index_page_size
         if _is_hip:
             if aiter_can_use_preshuffle_paged_mqa():
                 assert physical_page_size % 16 == 0, (

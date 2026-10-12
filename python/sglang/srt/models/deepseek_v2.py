@@ -2018,7 +2018,6 @@ class DeepseekV2AttentionMLA(
         self.is_nextn = is_nextn
         attn_tp_size = get_parallel().attn_tp_size
         self.use_dsa = is_deepseek_dsa(config)
-        # A DSA draft replicates its KV over the DCP ranks and attends without the group.
         self.dcp_size = (
             1 if (is_nextn and self.use_dsa) else get_parallel().attn_dcp_size
         )
@@ -3445,7 +3444,6 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         kv_cache_device,
         create_chunked_prefix_cache_kv_indices_fn,
     ):
-        # DSA attends over its owned top-k slots and never gathers the prefix KV.
         if _is_npu or is_deepseek_dsa(self.config):
             return None
         return prepare_decode_context_parallel_metadata(

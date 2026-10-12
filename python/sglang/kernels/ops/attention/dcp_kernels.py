@@ -605,7 +605,6 @@ def _dcp_lse_combine_kernel(
         partial_out = tl.load(recv_output_ptr + o_offsets).to(tl.float32)
         acc += partial_out * w
 
-    # An all-empty padding row has zero weight and must stay zero, not NaN.
     acc = acc / tl.maximum(weight_sum, 1.0)
 
     out_offsets = (

@@ -462,7 +462,6 @@ class DeepseekSparseAttnBackend(
         self.num_q_heads = (
             model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
         )
-        # A draft replicates its KV over the DCP ranks and never joins the group.
         self.dcp_size = (
             1 if model_runner.is_draft_worker else get_parallel().attn_dcp_size
         )
@@ -486,7 +485,6 @@ class DeepseekSparseAttnBackend(
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
 
         self.use_mha: bool = False
-        # The dense one-shot path has no partial output to merge across DCP ranks.
         self.supports_mha_one_shot: bool = self.dcp_size == 1
         self.dsa_prefill_impl: _DSA_IMPL_T = get_exec().kernel.dsa_prefill_backend
         self.dsa_decode_impl: _DSA_IMPL_T = get_exec().kernel.dsa_decode_backend
@@ -699,7 +697,6 @@ class DeepseekSparseAttnBackend(
         ):
             self.workspace_buffer = get_buffer(
                 "dsa_trtllm_workspace",
-                # The split-KV scratch grows with the gathered head count.
                 lambda: torch.empty(
                     envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get() * self.dcp_size,
                     dtype=torch.uint8,
@@ -3670,7 +3667,6 @@ class DeepseekSparseAttnBackend(
         else:
             q_all = q.view(-1, layer.tp_q_head_num, layer.head_dim)
 
-        # Shared-top-k layers hand over this same tensor object.
         shared_topk_indices = topk_indices
 
         # Eager DP attention can pad q beyond metadata that was deliberately

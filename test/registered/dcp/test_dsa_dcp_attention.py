@@ -1,5 +1,3 @@
-"""RoPE DSA sparse attention under DCP, with KV shards emulated on one GPU."""
-
 import math
 import unittest
 
@@ -16,7 +14,6 @@ from sglang.srt.layers.attention.dsa.dsa_dcp import (
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-# The TRT-LLM sparse RoPE MLA kernels require SM100/SM103.
 register_cuda_ci(est_time=30, stage="base-b", runner_config="4-gpu-b200")
 
 TOPK = 2048
@@ -82,9 +79,6 @@ class TestDsaDcpAttention(CustomTestCase):
                             )
 
     def test_folded_head_groups_match_single_group_attention(self):
-        """FlashInfer 0.7.0.post1 returns a wrong LSE above 32 heads for short KV;
-        folding heads into rows must give the per-group result, and a row that
-        owns no KV must come back as zero output with -inf LSE."""
         generator = torch.Generator().manual_seed(0)
         heads, rows = 64, 4
         head_groups = dsa_dcp_head_groups(heads)
@@ -127,7 +121,6 @@ class TestDsaDcpAttention(CustomTestCase):
         generator = torch.Generator().manual_seed(0)
         capacity, heads = 8192, 32
         page_table = torch.full((3, TOPK), -1, dtype=torch.int32)
-        # Rows 0 and 1 select KV that only rank 0 owns.
         page_table[0, 0] = capacity - 4
         page_table[1, :127] = (
             torch.randperm(capacity // 4, generator=generator)[:127] * 4
@@ -162,8 +155,6 @@ class TestDsaDcpAttention(CustomTestCase):
                         is_lse_base_on_e=False,
                         return_lse=True,
                     )
-                    # Each shard quantizes FP8 softmax numerators against its
-                    # own maximum, so FP8 merges are slightly less exact.
                     atol = 0.008 if dtype == torch.float8_e4m3fn else 0.003
                     torch.testing.assert_close(
                         merged, expected.squeeze(1), atol=atol, rtol=0.02

@@ -2037,8 +2037,8 @@ class KVCacheConfigurator:
         else:
             PoolCls = dsa_pool_class
         if self.loc_space_scale > 1:
-            # The replicated draft spans the widened slots on 64-token kernel pages.
             pool_kwargs["dcp_replicated"] = True
+            pool_kwargs["index_kernel_page_size"] = get_schedule().page_size
         if _should_elide_dsa_index_k(is_draft_worker=self.is_draft_worker):
             pool_kwargs["skip_topk_layers"] = [
                 dsa_layer_skips_topk(self.model_config.hf_config, layer_id)
@@ -2048,7 +2048,7 @@ class KVCacheConfigurator:
             ]
         token_to_kv_pool = PoolCls(
             max_total_num_tokens,
-            page_size=get_schedule().page_size,
+            page_size=self.pool_page_size,
             dtype=self.kv_cache_dtype,
             kv_lora_rank=self.model_config.kv_lora_rank,
             qk_rope_head_dim=self.model_config.qk_rope_head_dim,

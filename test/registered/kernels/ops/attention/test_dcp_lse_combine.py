@@ -186,7 +186,6 @@ class TestLSECombineEdgeCases(CustomTestCase):
         cls.device = "cuda"
 
     def test_all_empty_rows_stay_zero(self):
-        """A row with -inf LSE on every shard owns no KV and must not become NaN."""
         from sglang.kernels.ops.attention.dcp_kernels import dcp_lse_combine_triton
 
         outputs = torch.ones(2, 2, 4, 64, device=self.device, dtype=torch.bfloat16)

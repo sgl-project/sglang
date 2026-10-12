@@ -16,7 +16,6 @@ logger = logging.getLogger(__name__)
 
 
 def _dsa_dcp_overrides(cfg: Any, hf_config: Any) -> dict:
-    """DCP for DSA needs the TRT-LLM sparse kernels (they return the LSE) and a chain draft."""
     from sglang.srt.configs.model_config import get_dsa_index_kpool
 
     if cfg.dcp_size <= 1:
