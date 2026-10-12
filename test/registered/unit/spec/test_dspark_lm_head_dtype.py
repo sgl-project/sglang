@@ -3,7 +3,10 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.models.dspark import lm_head_logits_dtype, project_through_lm_head
+from sglang.srt.layers.logits_processor import (
+    lm_head_logits_dtype,
+    project_through_lm_head,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 

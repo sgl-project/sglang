@@ -19,7 +19,12 @@ from sglang.srt.distributed.device_communicators.vocab_gather import make_vocab_
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.logits_processor import (
+    LogitsProcessorOutput,
+    gather_and_crop_vocab,
+    lm_head_logits_dtype,
+    project_through_lm_head,
+)
 from sglang.srt.layers.moe.utils import is_shared_experts_fusion_disabled
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -48,9 +53,6 @@ from sglang.srt.models.dspark import (
     BaseDSparkMarkovHead,
     DSparkConfidenceHead,
     VocabShard,
-    gather_and_crop_vocab,
-    lm_head_logits_dtype,
-    project_through_lm_head,
 )
 from sglang.srt.runtime_context import (
     get_parallel,
