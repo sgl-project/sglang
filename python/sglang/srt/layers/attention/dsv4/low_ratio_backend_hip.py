@@ -4,7 +4,16 @@ payload / scale index-K pools, then the top-k v2 transform -- the DeepGEMM path'
 from __future__ import annotations
 
 import itertools
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import (
+    TYPE_CHECKING,
+    Callable,
+    Dict,
+    FrozenSet,
+    List,
+    Optional,
+    Tuple,
+    Union,
+)
 
 import torch
 import triton
@@ -17,11 +26,15 @@ from sglang.kernels.ops.attention.dsv4.candidate_blocks_hip import (
     slice_candidate_blocks,
     topk_transform_paged_hip,
     topk_within_candidate_blocks_hip,
+    topk_within_candidate_blocks_page8,
+    with_candidate_page8_table,
 )
 from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
     LOW_RATIO_PAGE_TABLE_BUCKET,
     FP4DecodeWorkspace,
     FP4PrefillWorkspace,
+    FP4RowgroupDecodeWorkspace,
+    FP4RowgroupPrefillWorkspace,
     aiter_fp4_paged_mqa_logits,
     index_q_rope_pack_weights_flydsl,
     indexer_head_weights,
@@ -29,11 +42,17 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
     pack_fp4_query_flydsl,
     prepare_fp4_decode_workspace,
     prepare_fp4_prefill_workspace,
+    prepare_fp4_rowgroup_decode_workspace,
+    prepare_fp4_rowgroup_prefill_workspace,
+    rowgroup_paged_mqa_logits,
+    rowgroup_prefill_query_start_loc,
+    rowgroup_table_columns,
 )
 from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope_hip import (
     index_k_norm_rope_pack_store_split,
 )
 from sglang.kernels.ops.gemm.router_gemv_hip import rocm_router_gemv_split_k
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.deepseek_v4_backend import (
     _as_int_list,
 )
@@ -45,6 +64,44 @@ if TYPE_CHECKING:
 
 # fp32 logits scored per candidate-block chunk stay under this many bytes
 _CANDIDATE_SCORE_BUDGET_BYTES = 1 << 30
+
+
+def _score_requests_page8(
+    *,
+    q_fp4: torch.Tensor,
+    q_scale: torch.Tensor,
+    weights: torch.Tensor,
+    k_payload: torch.Tensor,
+    k_scale: torch.Tensor,
+    workspace: FP4RowgroupPrefillWorkspace,
+    rows: slice,
+    req_lo: int,
+    rows_per_request: List[int],
+    row_ends: torch.Tensor,
+) -> torch.Tensor:
+    """Full-context logits of a page8 pool for rows, consecutive requests from req_lo on with
+    rows_per_request rows each; a request's rows share every key load."""
+    assert sum(rows_per_request) == q_fp4.shape[0], (rows_per_request, q_fp4.shape)
+    return rowgroup_paged_mqa_logits(
+        q_fp4=q_fp4,
+        q_scale=q_scale,
+        k_payload=k_payload,
+        k_scale=k_scale,
+        weights=weights,
+        weight_scale=1.0,
+        block_tables=workspace.request_page_table[
+            req_lo : req_lo + len(rows_per_request)
+        ],
+        query_start_loc=rowgroup_prefill_query_start_loc(
+            workspace, rows, rows_per_request
+        ),
+        row_ends=row_ends,
+        max_query_len=max(rows_per_request),
+        max_seq_len=workspace.max_seq_len,
+        page8=True,
+        pages_per_block=8,
+        is_decode=False,
+    )
 
 
 def _gemv_head_weight_rows(indexer, x: torch.Tensor) -> bool:
@@ -100,33 +157,74 @@ def _indexer_inputs(layer, x, q_lora, pos):
 
 def build_low_ratio_decode_workspaces(
     metadata_by_ratio: Dict[int, PagedIndexerMetadata],
-) -> Dict[int, FP4DecodeWorkspace]:
-    """Capture-safe: everything the schedule kernel touches is pinned in the workspace."""
-    return {
-        ratio: prepare_fp4_decode_workspace(
-            meta.page_table,
-            meta.compressed_seq_lens,
-            page_table_bucket=LOW_RATIO_PAGE_TABLE_BUCKET,
+    *,
+    max_context_len: int,
+    num_requests: Optional[int] = None,
+    page8_ratios: FrozenSet[int] = frozenset(),
+) -> Dict[int, Union[FP4DecodeWorkspace, FP4RowgroupDecodeWorkspace]]:
+    """Capture-safe: everything the schedule kernel touches is pinned in the workspace.
+    With the row-group kernel there is no schedule; a request's rows (``num_requests``
+    requests of equal row counts, consecutive: decode 1, target-verify its draft rows)
+    score as one sequence, on a table as wide as ``max_context_len`` needs. A page8 pool
+    is read by the row-group kernel only."""
+    rowgroup = envs.SGLANG_HIP_FP4_INDEXER_ROWGROUP.get()
+    workspaces = {}
+    for ratio, meta in metadata_by_ratio.items():
+        if not (rowgroup or ratio in page8_ratios):
+            workspaces[ratio] = prepare_fp4_decode_workspace(
+                meta.page_table,
+                meta.compressed_seq_lens,
+                page_table_bucket=LOW_RATIO_PAGE_TABLE_BUCKET,
+            )
+            continue
+        rows = meta.page_table.shape[0]
+        rows_per_request = (
+            rows // num_requests if num_requests and rows % num_requests == 0 else 1
         )
-        for ratio, meta in metadata_by_ratio.items()
-    }
+        workspaces[ratio] = prepare_fp4_rowgroup_decode_workspace(
+            meta.page_table,
+            rows_per_request,
+            page_table_bucket=LOW_RATIO_PAGE_TABLE_BUCKET,
+            table_columns=rowgroup_table_columns(
+                max_context_len, ratio, LOW_RATIO_PAGE_TABLE_BUCKET
+            ),
+        )
+    return workspaces
 
 
 def refresh_low_ratio_prefill_workspaces(
     metadata_by_ratio: Dict[int, PagedIndexerMetadata],
     previous: Optional[Dict[int, FP4PrefillWorkspace]],
-) -> Dict[int, FP4PrefillWorkspace]:
-    """Must run outside CUDA-graph capture; see prepare_fp4_prefill_workspace."""
+    *,
+    extend_lens: Optional[List[int]],
+    max_context_len: int,
+    page8_ratios: FrozenSet[int] = frozenset(),
+) -> Dict[int, Union[FP4PrefillWorkspace, FP4RowgroupPrefillWorkspace]]:
+    """Must run outside CUDA-graph capture; see prepare_fp4_prefill_workspace. A page8 pool
+    scores on the row-group kernel, which takes no schedule, on a table as wide as
+    ``max_context_len`` needs (without extend_lens, the indexer builds its workspace
+    itself)."""
     previous = previous or {}
-    return {
-        ratio: prepare_fp4_prefill_workspace(
+    workspaces = {}
+    for ratio, meta in metadata_by_ratio.items():
+        if ratio in page8_ratios:
+            if extend_lens is not None:
+                workspaces[ratio] = prepare_fp4_rowgroup_prefill_workspace(
+                    meta.page_table,
+                    extend_lens,
+                    page_table_bucket=LOW_RATIO_PAGE_TABLE_BUCKET,
+                    table_columns=rowgroup_table_columns(
+                        max_context_len, ratio, LOW_RATIO_PAGE_TABLE_BUCKET
+                    ),
+                )
+            continue
+        workspaces[ratio] = prepare_fp4_prefill_workspace(
             meta.page_table,
             meta.compressed_seq_lens,
             workspace=previous.get(ratio),
             page_table_bucket=LOW_RATIO_PAGE_TABLE_BUCKET,
         )
-        for ratio, meta in metadata_by_ratio.items()
-    }
+    return workspaces
 
 
 def low_ratio_identity_skip_enabled(
@@ -263,11 +361,37 @@ def low_ratio_index_topk_hip_decode(
         two_level = False
 
     q_fp4, q_scale, weights = _indexer_inputs(layer, x, q_lora, pos)
+    k_payload = pool.get_index_k_fp4_payload_buffer(layer.layer_id)
+    k_scale = pool.get_index_k_fp4_scale_buffer(layer.layer_id)
+    page8 = pool.low_ratio_index_k_page8(layer.layer_id)
+    if two_level and indexer.uses_candidates:
+        candidates = backend.candidate_masks
+        assert (
+            isinstance(candidates, CandidateBlocks)
+            and candidates.ids.shape[0] == q_fp4.shape[0]
+            and candidates.block_size == indexer.candidate_block_size
+        ), "candidate blocks missing for decode"
+        if page8:
+            topk_within_candidate_blocks_page8(
+                q_fp4=q_fp4,
+                q_scale=q_scale,
+                weights=weights,
+                k_payload=k_payload,
+                k_scale=k_scale,
+                candidates=candidates,
+                seq_lens=indexer_metadata.compressed_seq_lens,
+                page_table=indexer_metadata.page_table,
+                page_size=indexer_metadata.compressed_page_size,
+                page_indices=core.sparse_page_indices(ratio),
+                raw_indices=core.sparse_raw_indices(ratio),
+                is_decode=True,
+            )
+            return
     logits = aiter_fp4_paged_mqa_logits(
         q_fp4=q_fp4,
         q_scale=q_scale,
-        k_payload=pool.get_index_k_fp4_payload_buffer(layer.layer_id),
-        k_scale=pool.get_index_k_fp4_scale_buffer(layer.layer_id),
+        k_payload=k_payload,
+        k_scale=k_scale,
         weights=weights,
         page_table=indexer_metadata.page_table,
         c4_seq_lens=indexer_metadata.compressed_seq_lens,
@@ -275,15 +399,13 @@ def low_ratio_index_topk_hip_decode(
         page_table_bucket=LOW_RATIO_PAGE_TABLE_BUCKET,
         is_decode=True,
         decode_workspace=metadata.fp4_low_ratio_decode_workspaces.get(ratio),
+        page8=page8,
+        rowgroup_table_columns=rowgroup_table_columns(
+            backend.max_context_len, ratio, LOW_RATIO_PAGE_TABLE_BUCKET
+        ),
     )
     # level one is bounded on device by the compressed lengths: a captured step cannot read them back
     if two_level and indexer.uses_candidates:
-        candidates = backend.candidate_masks
-        assert (
-            isinstance(candidates, CandidateBlocks)
-            and candidates.ids.shape[0] == logits.shape[0]
-            and candidates.block_size == indexer.candidate_block_size
-        ), "candidate blocks missing for decode"
         topk_within_candidate_blocks_hip(
             logits,
             indexer_metadata.compressed_seq_lens,
@@ -295,12 +417,20 @@ def low_ratio_index_topk_hip_decode(
         )
         return
     if two_level and indexer.is_candidate_source:
-        backend.candidate_masks = select_candidate_blocks_hip(
+        candidates = select_candidate_blocks_hip(
             logits,
             indexer_metadata.compressed_seq_lens,
             topk_blocks=indexer.candidate_topk_blocks,
             block_size=indexer.candidate_block_size,
         )
+        if page8:
+            candidates = with_candidate_page8_table(
+                candidates,
+                indexer_metadata.compressed_seq_lens,
+                indexer_metadata.page_table,
+                page_size=indexer_metadata.compressed_page_size,
+            )
+        backend.candidate_masks = candidates
     topk_transform_paged_hip(
         logits,
         indexer_metadata.compressed_seq_lens,
@@ -412,8 +542,36 @@ def low_ratio_index_topk_hip_extend(
     k_payload = pool.get_index_k_fp4_payload_buffer(layer.layer_id)
     k_scale = pool.get_index_k_fp4_scale_buffer(layer.layer_id)
     prefill_workspace = metadata.fp4_low_ratio_prefill_workspaces.get(ratio)
+    page8 = pool.low_ratio_index_k_page8(layer.layer_id)
+    if page8 and not (
+        isinstance(prefill_workspace, FP4RowgroupPrefillWorkspace)
+        and prefill_workspace.request_page_table.shape[0] == len(extend_lens_cpu)
+    ):
+        prefill_workspace = prepare_fp4_rowgroup_prefill_workspace(
+            indexer_metadata.page_table,
+            extend_lens_cpu,
+            page_table_bucket=LOW_RATIO_PAGE_TABLE_BUCKET,
+            table_columns=rowgroup_table_columns(
+                backend.max_context_len, ratio, LOW_RATIO_PAGE_TABLE_BUCKET
+            ),
+        )
 
-    def score_rows(rows: slice) -> torch.Tensor:
+    def score_rows(
+        rows: slice, req_lo: int, rows_per_request: List[int]
+    ) -> torch.Tensor:
+        if page8:
+            return _score_requests_page8(
+                q_fp4=q_fp4[rows],
+                q_scale=q_scale[rows],
+                weights=weights[rows],
+                k_payload=k_payload,
+                k_scale=k_scale,
+                workspace=prefill_workspace,
+                rows=rows,
+                req_lo=req_lo,
+                rows_per_request=rows_per_request,
+                row_ends=indexer_metadata.compressed_seq_lens[rows],
+            )
         return aiter_fp4_paged_mqa_logits(
             q_fp4=q_fp4[rows],
             q_scale=q_scale[rows],
@@ -428,16 +586,58 @@ def low_ratio_index_topk_hip_extend(
             prefill_workspace=prefill_workspace if rows.start == 0 else None,
         )
 
+    def select_rows_page8_consumer(rows: slice, req_lo, rows_per_request, consume_rows):
+        """A consumer on a page8 pool scores only a request's candidate blocks."""
+
+        def full_logits(r: slice, b: int) -> torch.Tensor:
+            g = slice(rows.start + r.start, rows.start + r.stop)
+            return score_rows(g, req_lo + b, [r.stop - r.start])
+
+        def within(r: slice, candidates, rows_page, rows_raw) -> None:
+            g = slice(rows.start + r.start, rows.start + r.stop)
+            topk_within_candidate_blocks_page8(
+                q_fp4=q_fp4[g],
+                q_scale=q_scale[g],
+                weights=weights[g],
+                k_payload=k_payload,
+                k_scale=k_scale,
+                candidates=candidates,
+                seq_lens=compress_lens[g],
+                page_table=indexer_metadata.page_table[g],
+                page_size=indexer_metadata.compressed_page_size,
+                page_indices=rows_page,
+                raw_indices=rows_raw,
+                is_decode=False,
+            )
+
+        _consume_candidates_per_request(
+            extend_lens_cpu=rows_per_request,
+            consume=consume_rows,
+            compress_lens=compress_lens[rows],
+            page_table=indexer_metadata.page_table[rows],
+            page_size=indexer_metadata.compressed_page_size,
+            page_indices=page_indices[rows],
+            raw_indices=raw_indices[rows] if raw_indices is not None else None,
+            full_logits=full_logits,
+            within=within,
+        )
+
     def select_rows(
         rows: slice, req_lo, req_hi, group_is_identity, consume_rows, publish
     ):
+        rows_per_request = (
+            [rows.stop - rows.start]
+            if req_hi == req_lo + 1
+            else extend_lens_cpu[req_lo:req_hi]
+        )
+        if page8 and consume_rows is not None:
+            select_rows_page8_consumer(rows, req_lo, rows_per_request, consume_rows)
+            return
         _select_topk_extend_hip(
             indexer=indexer,
-            logits=score_rows(rows),
+            logits=score_rows(rows, req_lo, rows_per_request),
             lc_per_req=lc_per_req[req_lo:req_hi],
-            extend_lens_cpu=[rows.stop - rows.start]
-            if req_hi == req_lo + 1
-            else extend_lens_cpu[req_lo:req_hi],
+            extend_lens_cpu=rows_per_request,
             is_identity=group_is_identity,
             compress_lens=compress_lens[rows],
             page_table=indexer_metadata.page_table[rows],
@@ -489,6 +689,19 @@ def low_ratio_index_topk_hip_extend(
         if publish is not None:
             publish.append(cat_candidate_blocks(pieces))
     if publish is not None:
+        if page8:
+            assert len(publish) == len(extend_lens_cpu), (len(publish), extend_lens_cpu)
+            tok = 0
+            for b, candidates in enumerate(publish):
+                r = slice(tok, tok + extend_lens_cpu[b])
+                tok = r.stop
+                if candidates is not None:
+                    publish[b] = with_candidate_page8_table(
+                        candidates,
+                        compress_lens[r],
+                        indexer_metadata.page_table[r],
+                        page_size=indexer_metadata.compressed_page_size,
+                    )
         backend.candidate_masks = publish
 
 
@@ -537,33 +750,27 @@ def _select_topk_extend_hip(
                 )
             publish.append(cat_candidate_blocks(pieces))
     if consume is not None:
-        tok_start = 0
-        for b, t_len in enumerate(extend_lens_cpu):
-            rows = slice(tok_start, tok_start + t_len)
-            tok_start += t_len
-            if t_len == 0:
-                continue
-            rows_page = page_indices[rows]
-            rows_raw = raw_indices[rows] if raw_indices is not None else None
-            if consume[b] is None:
-                topk_transform_paged_hip(
-                    logits[rows],
-                    compress_lens[rows].contiguous(),
-                    page_table[rows],
-                    rows_page,
-                    page_size,
-                    rows_raw,
-                )
-            else:
+        _consume_candidates_per_request(
+            extend_lens_cpu=extend_lens_cpu,
+            consume=consume,
+            compress_lens=compress_lens,
+            page_table=page_table,
+            page_size=page_size,
+            page_indices=page_indices,
+            raw_indices=raw_indices,
+            full_logits=lambda rows, b: logits[rows],
+            within=lambda rows, candidates, rows_page, rows_raw: (
                 topk_within_candidate_blocks_hip(
                     logits[rows],
                     compress_lens[rows],
-                    consume[b],
+                    candidates,
                     page_table=page_table[rows],
                     page_size=page_size,
                     page_indices=rows_page,
                     raw_indices=rows_raw,
                 )
+            ),
+        )
         return
     topk_transform_paged_hip(
         logits,
@@ -573,6 +780,43 @@ def _select_topk_extend_hip(
         page_size,
         raw_indices,
     )
+
+
+def _consume_candidates_per_request(
+    *,
+    extend_lens_cpu: List[int],
+    consume: List[Optional[CandidateBlocks]],
+    compress_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    page_size: int,
+    page_indices: torch.Tensor,
+    raw_indices: Optional[torch.Tensor],
+    full_logits: Callable[[slice, int], torch.Tensor],
+    within: Callable[
+        [slice, CandidateBlocks, torch.Tensor, Optional[torch.Tensor]], None
+    ],
+) -> None:
+    """A consumer layer's rows, request by request: within(rows, candidates, ...) selects inside
+    the published blocks; a request with none runs the paged top-k of full_logits(rows, b)."""
+    tok_start = 0
+    for b, t_len in enumerate(extend_lens_cpu):
+        rows = slice(tok_start, tok_start + t_len)
+        tok_start += t_len
+        if t_len == 0:
+            continue
+        rows_page = page_indices[rows]
+        rows_raw = raw_indices[rows] if raw_indices is not None else None
+        if consume[b] is None:
+            topk_transform_paged_hip(
+                full_logits(rows, b),
+                compress_lens[rows].contiguous(),
+                page_table[rows],
+                rows_page,
+                page_size,
+                rows_raw,
+            )
+        else:
+            within(rows, consume[b], rows_page, rows_raw)
 
 
 def _request_groups(
@@ -606,4 +850,5 @@ def store_index_k_split(
         pool.get_index_k_fp4_payload_buffer(layer_id),
         pool.get_index_k_fp4_scale_buffer(layer_id),
         ratio=layer.compress_ratio,
+        page8=pool.low_ratio_index_k_page8(layer_id),
     )
