@@ -226,6 +226,20 @@ class TestMixWithRunningOutOfPlace(unittest.TestCase):
         self.assertEqual(extend_batch.extend_num_tokens, 7)
         self.assertEqual(extend_batch.extend_logprob_start_lens, [0, 0, 0])
         self.assertFalse(extend_batch.is_prefill_only)
+        # Both sides came with a mamba track plan; a mixed step keeps none.
+        for name in (
+            "mamba_track_indices",
+            "mamba_track_buffer_indices",
+            "mamba_track_mask",
+            "mamba_track_seqlens",
+            "mamba_track_seqlens_cpu",
+            "mamba_prefill_track_mask_cpu",
+            "mamba_track_mask_cpu",
+            "mamba_track_mask_next_cpu",
+            "mamba_decode_batch_idx_cpu",
+            "mamba_lazy_spec_track_positions_cpu",
+        ):
+            self.assertIsNone(getattr(extend_batch, name), name)
         self.assertIsNot(extend_batch.prefix_lens, extend_prefix_before)
         self.assertIsNot(extend_batch.extend_lens, extend_lens_before)
         _assert_snapshot_not_mutated(self, extend_snapshot)

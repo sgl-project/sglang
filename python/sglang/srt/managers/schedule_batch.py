@@ -3189,6 +3189,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         out_cache_loc = torch.cat([self.out_cache_loc, running_out_cache_loc])
 
         self.merge_batch(running_batch)
+        self._set_mixed_mamba_track_plan()
         self.num_decode_rows = running_bs
         self.out_cache_loc = out_cache_loc
         if merged_seq_lens_cpu is not None:
@@ -3209,6 +3210,24 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.extend_logprob_start_lens + [0] * running_bs
         )
         self.is_prefill_only = False
+
+    def _set_mixed_mamba_track_plan(self):
+        """The mamba track plan of a mixed step, by row role: no row tracks.
+
+        The prefill rows drop the plan prepare_for_extend built for them, and
+        the decode rows the one prepare_for_decode built. A decode row gets a
+        plan again at its next decode-only step.
+        """
+        self.mamba_track_indices = None
+        self.mamba_track_buffer_indices = None
+        self.mamba_track_mask = None
+        self.mamba_track_seqlens = None
+        self.mamba_track_seqlens_cpu = None
+        self.mamba_prefill_track_mask_cpu = None
+        self.mamba_track_mask_cpu = None
+        self.mamba_track_mask_next_cpu = None
+        self.mamba_decode_batch_idx_cpu = None
+        self.mamba_lazy_spec_track_positions_cpu = None
 
     def convert_decode_to_extend(self):
         """View every decode request as a 1-token extend with its context as
