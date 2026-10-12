@@ -20,7 +20,6 @@ from sglang.srt.runtime_context import (
     get_schedule,
 )
 from sglang.srt.utils import get_compiler_backend
-from sglang.srt.utils.common import is_building_neighbour_layer
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe import MoeRunnerConfig
@@ -216,7 +215,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         # 2. Initialize KT wrapper for CPU experts
         # CPU experts: num_gpu_experts to num_experts-1
-        if self.tp_rank == 0 and not is_building_neighbour_layer():
+        if self.tp_rank == 0:
             self.wrapper = KTMoEWrapper(
                 layer_idx=self.kt_config.layer_idx,
                 num_experts=num_experts,
