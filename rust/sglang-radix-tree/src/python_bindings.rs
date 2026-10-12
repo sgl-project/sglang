@@ -1866,7 +1866,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
     /// Mark or clear the buffer-mode backup-pending flag the SWA window lock
     /// consults before splitting the node a lock walk would pin.
     fn set_buffer_backup_pending(&self, py: Python<'_>, node_id: NodeId, pending: bool) {
-        py.allow_threads(|| self.core().set_buffer_backup_pending(node_id, pending))
+        py.detach(|| self.core().set_buffer_backup_pending(node_id, pending))
     }
 
     /// Whether the node is a (default or named) root.
