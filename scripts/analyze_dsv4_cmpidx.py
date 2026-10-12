@@ -21,8 +21,28 @@ import re
 import sys
 from collections import defaultdict
 
-TAG = re.compile(r"\[(CMPIDX|IDXK|C4KV|C128KV|C128X|OSHAPE|XIN|LHID|IDXIN|LIMETA|C4STP|C4ST)\]")
+TAG = re.compile(
+    r"\[(CMPIDX|IDXK|C4KV|C128KV|C128X|OSHAPE|XIN|LHID|IDXIN|LIMETA"
+    r"|C4ST|C4STP|KSTATELOC)\]"
+)
 KV = re.compile(r"(\w+)=(\[[^\]]*\]|\([^)]*\)|[^\s]+)")
+# [IDXIN] kpg= is emitted by ``_read_page_table_pages`` as
+# ``n=<count>,first=[..],last=[..]`` (Python list repr, spaces after commas).
+# The generic KV regex would truncate it at the first inner space, so match the
+# known structured form first and fall back to the loose ``kpg=([^ ]+)`` form.
+KPG_STRUCT = re.compile(r"kpg=(n=\d+,first=\[[^\]]*\],last=\[[^\]]*\])")
+KPG_LOOSE = re.compile(r"kpg=([^\s]+)")
+# [KSTATELOC] is emitted positionally (no key=value for the numbers):
+#   op=W <batch> <seq> <col> <sl> <blk> <row> out=<curSeqIdx>
+#   op=R <batch> <seq> <col> <sl> <blk> <row>
+KSTATELOC_W = re.compile(
+    r"\[KSTATELOC\]\s+op=W\s+(\d+)\s+(\d+)\s+(-?\d+)\s+(\d+)\s+(\d+)\s+(\d+)"
+    r"\s+out=(\d+)"
+)
+KSTATELOC_R = re.compile(
+    r"\[KSTATELOC\]\s+op=R\s+(\d+)\s+(\d+)\s+(-?\d+)\s+(\d+)\s+(\d+)\s+(\d+)"
+)
+SEQ_TUP = re.compile(r"\((\d+),(\d+),(\d+)\)")
 MAX_REQ_SHOWN = 20
 MAX_DIFF_SHOWN = 8
 OSHAPE_KEYS = ("ratio", "ori_page", "ori_bt", "s2Size", "cmp_page", "cmp_bt")
@@ -62,12 +82,27 @@ def parse(path):
                 continue
             tag = mt.group(1)
             d = dict(KV.findall(ln))
+            if tag == "IDXIN" and "kpg=" in ln:
+                # Overwrite the KV-truncated kpg= with the full structured value.
+                d["kpg"] = _parse_kpg(ln)
+            if tag == "KSTATELOC":
+                # Positional line: keep the raw text for the dedicated parser.
+                d["_raw"] = ln
             if tag == "CMPIDX" and "lastpos" in d:
                 cur_lp = d["lastpos"]
             elif "lastpos" not in d and cur_lp is not None:
                 d["lastpos"] = cur_lp
             recs[tag].append(d)
     return recs
+
+
+def _parse_kpg(line):
+    """Full ``kpg=`` value from an [IDXIN] line (structured, else best-effort)."""
+    m = KPG_STRUCT.search(line)
+    if m:
+        return m.group(1)
+    m = KPG_LOOSE.search(line)
+    return m.group(1) if m else "?"
 
 
 def segment(rows):
@@ -306,6 +341,255 @@ def report_uniq(rows, label, fields, key="mode"):
         print(f"  [{label}] {key}={k}  distinct({','.join(fields)})={len(vals)}")
         for t in vals[:MAX_DIFF_SHOWN]:
             print("     " + "  ".join(f"{f}={v}" for f, v in zip(fields, t)))
+
+
+def _seq_max(v):
+    """Max element of a ``(min,max,numel)`` seq-length tuple, or -1."""
+    m = SEQ_TUP.search(str(v or ""))
+    return int(m.group(2)) if m else -1
+
+
+def _idxin_requests(rows):
+    """Split [IDXIN] rows into requests (new request when lastpos decreases).
+
+    [IDXIN] carries no ``lastpos``; ``parse`` fills it from the preceding
+    [CMPIDX], so the same order-based split used for the other tags applies.
+    """
+    reqs = []
+    last_lp = None
+    for r in rows:
+        lp = _int(r, "lastpos")
+        if not reqs or (last_lp is not None and lp < last_lp):
+            reqs.append([])
+        reqs[-1].append(r)
+        last_lp = lp
+    return reqs
+
+
+def _idxin_miss_index(reqs):
+    """Index of the cache-MISS request = largest prefill ``slq`` (best effort)."""
+    scores = [max((_seq_max(r.get("slq")) for r in g), default=-1) for g in reqs]
+    if not scores or max(scores) <= 0:
+        return 0
+    return scores.index(max(scores))
+
+
+def _distinct_km(group):
+    """Distinct ``(klog, kpg)`` tuples of one request, sorted."""
+    return sorted({(r.get("klog", "?"), r.get("kpg", "?")) for r in group}, key=str)
+
+
+def report_idxin_requests(rows):
+    """Per request (MISS vs each HIT), the DISTINCT ``(klog, kpg)`` values.
+
+    ``klog`` is the md5 of the LOGICAL index-K content the request reads;
+    ``kpg`` lists the PHYSICAL read-page ids that md5 was computed from.  A
+    MISS and a HIT that read the same logical content from the same physical
+    page print identical pairs.
+    """
+    if not rows:
+        return
+    reqs = _idxin_requests(rows)
+    if len(reqs) < 2:
+        print("  [IDXIN-KM] <2 requests -> per-request MISS/HIT split skipped")
+        return
+    miss_i = _idxin_miss_index(reqs)
+    print(f"  [IDXIN-KM] MISS=req{miss_i} (largest prefill slq); "
+          f"{len(reqs) - 1} HIT request(s)")
+    for i, g in enumerate(reqs[:MAX_REQ_SHOWN]):
+        role = "MISS" if i == miss_i else "HIT "
+        km = _distinct_km(g)
+        print(f"     req{i} {role} probes={len(g)} distinct(klog,kpg)={len(km)}")
+        for klog, kpg in km[:MAX_DIFF_SHOWN]:
+            print(f"        klog={klog} kpg={kpg}")
+        if len(km) > MAX_DIFF_SHOWN:
+            print(f"        ... {len(km) - MAX_DIFF_SHOWN} more")
+
+
+def _km_classify(miss_set, hit_set):
+    """Binary verdict for one probe: compare MISS vs HIT ``(klog,kpg)`` sets."""
+    if miss_set == hit_set:
+        return "SAME at these probes"
+    if {k for k, _ in miss_set} != {k for k, _ in hit_set}:
+        return "COMPRESSOR-OUTPUT differs"
+    return "READ-PAGE misaligned"
+
+
+def report_idxin_verdict(rows):
+    """One ``[IDXIN-VERDICT]`` line per layer: MISS-vs-HIT ``(klog,kpg)``.
+
+    Compares, at every ``(layer,lastpos)`` probe that BOTH the MISS request and
+    at least one HIT request reached, the distinct ``(klog,kpg)`` sets:
+
+      * equal                          -> ``SAME at these probes``
+      * ``klog`` differs               -> ``COMPRESSOR-OUTPUT differs`` (the
+                                          written index-K content differs)
+      * ``klog`` same, ``kpg`` differs -> ``READ-PAGE misaligned`` (same content
+                                          md5 read from a different page)
+    """
+    if not rows:
+        return
+    reqs = _idxin_requests(rows)
+    if len(reqs) < 2:
+        print("[IDXIN-VERDICT] need >=2 requests (MISS + HIT); none")
+        return
+    miss_i = _idxin_miss_index(reqs)
+    probes = defaultdict(lambda: defaultdict(set))
+    for i, g in enumerate(reqs):
+        for r in g:
+            key = (_int(r, "layer"), _int(r, "lastpos"))
+            probes[key][i].add((r.get("klog", "?"), r.get("kpg", "?")))
+    per_layer = defaultdict(
+        lambda: {"same": 0, "comp": 0, "page": 0,
+                 "first_comp": None, "first_page": None})
+    for (_ly, lp), byreq in probes.items():
+        if miss_i not in byreq:
+            continue
+        hit_sets = [s for j, s in byreq.items() if j != miss_i]
+        if not hit_sets:
+            continue
+        verds = [_km_classify(byreq[miss_i], s) for s in hit_sets]
+        agg = per_layer[_ly]
+        if any(v == "COMPRESSOR-OUTPUT differs" for v in verds):
+            agg["comp"] += 1
+            if agg["first_comp"] is None:
+                agg["first_comp"] = lp
+        elif all(v == "SAME at these probes" for v in verds):
+            agg["same"] += 1
+        else:
+            agg["page"] += 1
+            if agg["first_page"] is None:
+                agg["first_page"] = lp
+    if not per_layer:
+        print("[IDXIN-VERDICT] no overlapping (layer,lastpos) probes "
+              "between MISS and HIT")
+        return
+    for _ly in sorted(per_layer):
+        a = per_layer[_ly]
+        if a["comp"]:
+            verdict = "COMPRESSOR-OUTPUT differs"
+        elif a["page"]:
+            verdict = "READ-PAGE misaligned"
+        else:
+            verdict = "SAME at these probes"
+        if a["first_comp"] is not None:
+            extra = f" first_compressor_diff_lastpos={a['first_comp']}"
+        elif a["first_page"] is not None:
+            extra = f" first_readpage_diff_lastpos={a['first_page']}"
+        else:
+            extra = ""
+        print(f"[IDXIN-VERDICT] layer={_ly} same={a['same']} "
+              f"compressor_output_diff={a['comp']} readpage_diff={a['page']} "
+              f"=> {verdict}{extra}")
+
+
+def _parse_kstateloc(recs):
+    """Split raw [KSTATELOC] rows into (write op=W, read op=R) numeric dicts."""
+    writes, reads = [], []
+    for rec in recs:
+        raw = rec.get("_raw", "")
+        m = KSTATELOC_W.search(raw)
+        if m:
+            writes.append({
+                "b": int(m.group(1)), "seq": int(m.group(2)),
+                "col": int(m.group(3)), "sl": int(m.group(4)),
+                "blk": int(m.group(5)), "row": int(m.group(6)),
+                "out": int(m.group(7)),
+            })
+            continue
+        m = KSTATELOC_R.search(raw)
+        if m:
+            reads.append({
+                "b": int(m.group(1)), "seq": int(m.group(2)),
+                "col": int(m.group(3)), "sl": int(m.group(4)),
+                "blk": int(m.group(5)), "row": int(m.group(6)),
+            })
+    return writes, reads
+
+
+def _kstateloc_focus(writes):
+    """``(lo, hi)`` window to show: a known tail window, else the first block."""
+    seqs = sorted({x["seq"] for x in writes})
+    if not seqs:
+        return None
+    for lo, hi in C4STP_NUM_WINDOWS:
+        if any(lo <= s < hi for s in seqs):
+            return (lo, hi)
+    return (seqs[0], seqs[0] + 24)
+
+
+def report_kstateloc(rows):
+    """Print ``out=`` (op=W) / stateLoc (op=R) so write-loc can be judged.
+
+    The write output anchor ``out`` is the compressed position the compressor
+    committed.  It must ADVANCE (roughly once per ``cmp_ratio`` decode steps)
+    as the request grows; a FROZEN ``out`` across advancing write positions is
+    the write-loc bug.  ``op=R`` stateLoc is printed for the same positions so
+    the read side can be compared against the write.
+    """
+    if not rows:
+        return
+    writes, reads = _parse_kstateloc(rows)
+    if not writes and not reads:
+        print("\n== [KSTATELOC] no rows (dump gate off) ==")
+        return
+    print("\n== [KSTATELOC] compressor state write(op=W)/read(op=R) loc ==")
+    if writes:
+        seqs = sorted({x["seq"] for x in writes})
+        print(f"  [KSTATELOC-W] calls={len(writes)} distinct_seq={len(seqs)} "
+              f"seq_range=[{seqs[0]}..{seqs[-1]}] "
+              f"out_vals={sorted({x['out'] for x in writes})}")
+    if reads:
+        seqs = sorted({x["seq"] for x in reads})
+        print(f"  [KSTATELOC-R] calls={len(reads)} distinct_seq={len(seqs)} "
+              f"seq_range=[{seqs[0]}..{seqs[-1]}]")
+    win = _kstateloc_focus(writes) if writes else None
+    if win is not None:
+        lo, hi = win
+        print(f"  [KSTATELOC-W] focus window seq in [{lo},{hi}):")
+        shown = 0
+        for x in writes:
+            if lo <= x["seq"] < hi:
+                print(f"     seq={x['seq']} out={x['out']} sl={x['sl']} "
+                      f"blk={x['blk']} row={x['row']} col={x['col']}")
+                shown += 1
+                if shown >= 60:
+                    print("     ... (truncated)")
+                    break
+        rmatch = [x for x in reads if lo <= x["seq"] < hi]
+        if rmatch:
+            print(f"  [KSTATELOC-R] same positions seq in [{lo},{hi}):")
+            for x in rmatch[:60]:
+                print(f"     seq={x['seq']} sl={x['sl']} blk={x['blk']} "
+                      f"row={x['row']} col={x['col']}")
+        else:
+            print("  [KSTATELOC-R] none for focus window (op=R not emitted "
+                  "at these positions)")
+    if writes:
+        _kstateloc_advance(writes)
+
+
+def _kstateloc_advance(writes):
+    """Does ``out`` advance per write call, or stay frozen (write-loc bug)?"""
+    per_seq = defaultdict(set)
+    for x in writes:
+        per_seq[x["seq"]].add(x["out"])
+    multi = sorted(s for s, v in per_seq.items() if len(v) > 1)
+    ladder = sorted((s, next(iter(per_seq[s])))
+                    for s in per_seq if len(per_seq[s]) == 1)
+    advances = sum(1 for i in range(1, len(ladder))
+                   if ladder[i][1] != ladder[i - 1][1])
+    steps = max(len(ladder) - 1, 0)
+    distinct_out = len({x["out"] for x in writes})
+    if multi:
+        verdict = "WRITE-LOC inconsistent (same seq -> multiple out)"
+    elif steps and advances == 0:
+        verdict = "WRITE-LOC FROZEN (out never advances)"
+    else:
+        verdict = f"WRITE-LOC advances ({advances}/{steps} steps)"
+    multi_txt = ",".join(str(s) for s in multi[:20]) or "none"
+    print(f"  [KSTATELOC-W] VERDICT {verdict}  multi_out_seq=[{multi_txt}] "
+          f"distinct_out={distinct_out} distinct_seq={len(per_seq)}")
 
 
 C4ST_RUNBOOK = (
@@ -840,7 +1124,7 @@ def verdict_c4stp(recs):
 
 def main(path):
     recs = parse(path)
-    for tag in ("CMPIDX", "IDXK", "C4KV", "C128KV", "C128X", "OSHAPE", "XIN", "LHID", "IDXIN", "LIMETA", "C4ST", "C4STP"):
+    for tag in ("CMPIDX", "IDXK", "C4KV", "C128KV", "C128X", "OSHAPE", "XIN", "LHID", "IDXIN", "LIMETA", "C4ST", "C4STP", "KSTATELOC"):
         print(f"parsed {tag}: {len(recs.get(tag, []))} lines")
     if recs.get("CMPIDX"):
         cmp_reqs = segment(recs["CMPIDX"])
@@ -859,9 +1143,12 @@ def main(path):
         miss_i = 0
         print("\nno [CMPIDX] lines; per-tag request split used (req0 = MISS).")
 
-    for tag in ("CMPIDX", "IDXK", "C4KV", "C128KV", "C128X", "OSHAPE", "XIN", "LHID", "IDXIN", "LIMETA", "C4ST"):
+    for tag in ("CMPIDX", "IDXK", "C4KV", "C128KV", "C128X", "OSHAPE", "XIN", "LHID", "IDXIN", "LIMETA", "C4ST", "KSTATELOC"):
         rows = recs.get(tag, [])
         if not rows:
+            continue
+        if tag == "KSTATELOC":
+            report_kstateloc(rows)
             continue
         if tag == "C4ST":
             print("\n== [C4ST] c4 compress STATE rows (indexer idx=1, per-block) ==")
@@ -886,7 +1173,10 @@ def main(path):
             report_blkx(rows, "IDXIN.q_quant", field="qblk", keep=_is_prefill)
             report_blkx(rows, "IDXIN.weights", field="wblk", keep=_is_prefill)
             report_uniq(rows, "IDXIN.seq", ("slq", "slk", "qshape", "wshape"))
-            report_uniq(rows, "IDXIN.keymeta", ("klog", "kraw", "meta", "bt"))
+            report_uniq(rows, "IDXIN.keymeta",
+                        ("klog", "kpg", "kraw", "meta", "bt"))
+            report_idxin_requests(rows)
+            report_idxin_verdict(rows)
             continue
         if tag == "LIMETA":
             print("\n== [LIMETA] metadata core-partition ==")
@@ -953,8 +1243,112 @@ def main(path):
     verdict_c4stp(recs.get("C4STP", []))
 
 
+def _selftest():
+    """Exercise the new ``kpg=`` / ``out=`` parsing + verdict branches.
+
+    Builds a synthetic log with one SAME probe (layer 5) and one READ-PAGE
+    divergent probe (layer 7, same klog / different kpg) plus [KSTATELOC] rows,
+    then asserts both the raw parse and the printed verdict strings.
+    """
+    import contextlib
+    import io
+    import os
+    import tempfile
+
+    kpg_a = "n=8,first=[3, 5, 7, 9],last=[11, 13, 15, 17]"
+    kpg_b = "n=8,first=[1, 2, 3, 4],last=[5, 6, 7, 8]"
+
+    def _idxin(ly, slq, klog, kpg):
+        return (
+            f"[IDXIN] layer={ly} mode=1 qblk=[0:aa] wblk=[0:bb] "
+            f"slq=({slq},{slq},1) slk=(17523,17523,1) klog={klog} kpg={kpg} "
+            f"kraw=kk meta=mm bt=tt qshape=(1,2,3) wshape=(1,2,3) "
+            f"kshape=(4,5,6)"
+        )
+
+    lines = [
+        # MISS request (prefill slq=17523) spans layer 5 and layer 7, lastpos
+        # 100 then 101.
+        "[CMPIDX] layer=5 lastpos=100 ntok=17523 md5=ffff",
+        _idxin(5, 17523, "aaaa", kpg_a),
+        "[CMPIDX] layer=7 lastpos=100 ntok=17523 md5=ffff",
+        _idxin(7, 17523, "zzzz", kpg_a),
+        "[CMPIDX] layer=5 lastpos=101 ntok=17523 md5=ffff",
+        _idxin(5, 17523, "aaaa", kpg_a),
+        "[CMPIDX] layer=7 lastpos=101 ntok=17523 md5=ffff",
+        _idxin(7, 17523, "zzzz", kpg_a),
+        # HIT request (suffix prefill slq=1139): lastpos drops to 100 -> new req.
+        #   layer 5: same (klog,kpg) as MISS        -> SAME
+        #   layer 7: same klog, DIFFERENT kpg        -> READ-PAGE misaligned
+        "[CMPIDX] layer=5 lastpos=100 ntok=1139 md5=ffff",
+        _idxin(5, 1139, "aaaa", kpg_a),
+        "[CMPIDX] layer=7 lastpos=100 ntok=1139 md5=ffff",
+        _idxin(7, 1139, "zzzz", kpg_b),
+        # [KSTATELOC] write/read loc
+        "[KSTATELOC] op=W 0 17520 -12 40 0 40 out=17520",
+        "[KSTATELOC] op=W 0 17521 -11 41 0 41 out=17520",
+        "[KSTATELOC] op=W 0 17524 -8 44 0 44 out=17524",
+        "[KSTATELOC] op=R 0 17520 -12 40 0 40",
+    ]
+    fd, path = tempfile.mkstemp(suffix=".log", prefix="cmpidx_selftest_")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
+        recs = parse(path)
+        idxin = recs.get("IDXIN", [])
+        ks = recs.get("KSTATELOC", [])
+        writes, reads = _parse_kstateloc(ks)
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            report_idxin_requests(idxin)
+            report_idxin_verdict(idxin)
+            report_kstateloc(ks)
+        out = buf.getvalue()
+
+        checks = [
+            ("kpg full value parsed",
+             bool(idxin) and idxin[0].get("kpg") == kpg_a),
+            ("klog parsed", bool(idxin) and idxin[0].get("klog") == "aaaa"),
+            ("kraw/meta/bt kept",
+             bool(idxin) and idxin[0].get("kraw") == "kk"
+             and idxin[0].get("meta") == "mm" and idxin[0].get("bt") == "tt"),
+            ("KSTATELOC op=W count/out",
+             len(writes) == 3 and writes[0]["out"] == 17520
+             and writes[2]["out"] == 17524),
+            ("KSTATELOC op=W seq/sl",
+             writes[0]["seq"] == 17520 and writes[0]["sl"] == 40),
+            ("KSTATELOC op=R parsed",
+             len(reads) == 1 and reads[0]["seq"] == 17520
+             and reads[0]["sl"] == 40),
+            ("[IDXIN-VERDICT] SAME branch",
+             "[IDXIN-VERDICT] layer=5" in out
+             and "SAME at these probes" in out),
+            ("[IDXIN-VERDICT] READ-PAGE branch",
+             "[IDXIN-VERDICT] layer=7" in out
+             and "READ-PAGE misaligned" in out),
+            ("[KSTATELOC-W] out sequence printed",
+             "out=17520" in out and "out=17524" in out),
+        ]
+        failed = [name for name, ok in checks if not ok]
+        for name, ok in checks:
+            print(f"  [{'PASS' if ok else 'FAIL'}] {name}")
+        if failed:
+            print(f"SELFTEST FAIL ({len(failed)}): {', '.join(failed)}")
+            return 1
+        print("SELFTEST PASS")
+        return 0
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print(__doc__)
         sys.exit(1)
+    if sys.argv[1] == "--selftest":
+        sys.exit(_selftest())
     main(sys.argv[1])
