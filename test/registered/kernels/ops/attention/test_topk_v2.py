@@ -583,9 +583,9 @@ def test_topk_v2_overflow_value_boundaries(
         window.fill_(-torch.inf if "inf" in distribution else -2000.0)
         if distribution == "negative":
             # All distinct FP32 values round to the same FP16 value (-1000).
-            window[:count] = -1000 - torch.arange(
-                count, device="cuda", dtype=torch.float32
-            ) / 16384
+            window[:count] = (
+                -1000 - torch.arange(count, device="cuda", dtype=torch.float32) / 16384
+            )
             window[count : count + 8] = -500
         elif distribution == "negative_inf":
             window[:8] = torch.inf
@@ -593,9 +593,10 @@ def test_topk_v2_overflow_value_boundaries(
         else:
             above = min(8, k // 4)
             if distribution == "mixed_inf":
-                window[:count] = 1000 + torch.arange(
-                    count, device="cuda", dtype=torch.float32
-                ) / 16384
+                window[:count] = (
+                    1000
+                    + torch.arange(count, device="cuda", dtype=torch.float32) / 16384
+                )
                 window[count : count + above] = torch.inf
             else:
                 # The greater, cutoff-equal, and lower values all round to the
@@ -644,9 +645,9 @@ def test_topk_v2_overflow_graph_transitions() -> None:
     def update(count, short_rows=False):
         scores.copy_(original_scores)
         scores[target, :seq] = -2000
-        scores[target, seq - count : seq] = 1000 + torch.arange(
-            count, device="cuda", dtype=torch.float32
-        ) / 16384
+        scores[target, seq - count : seq] = (
+            1000 + torch.arange(count, device="cuda", dtype=torch.float32) / 16384
+        )
         scores[target, :8] = 2000
         lengths[:48] = 32769
         lengths[48:] = seq
