@@ -45,7 +45,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
-from sglang.srt.mem_cache.events import KVCacheEventRecorder
+from sglang.srt.mem_cache.events import KVCacheEventRecorder, LoRANameTable
 from sglang.srt.mem_cache.utils import (
     get_eviction_strategy,
     split_node_hash_value,
@@ -287,8 +287,13 @@ class RadixCache(BasePrefixCache):
         self.is_eagle = params.is_eagle
         self.eviction_policy = params.eviction_policy.lower()
 
+        # A disabled tree holds nothing, so it reports no KV events and never
+        # evicts; its eviction policy config is not built or validated.
         self.kv_events = KVCacheEventRecorder(
-            enabled=params.enable_kv_cache_events, page_size=self.page_size
+            enabled=params.enable_kv_cache_events and not self.disable,
+            page_size=self.page_size,
+            dynamo_format=params.dynamo_kv_event_format,
+            lora_names=params.kv_event_lora_names,
         )
 
         if params.enable_metrics:
@@ -304,7 +309,8 @@ class RadixCache(BasePrefixCache):
             self.device = torch.device("cpu")
 
         self.eviction_strategy = get_eviction_strategy(
-            self.eviction_policy, params.eviction_policy_config
+            "lru" if self.disable else self.eviction_policy,
+            None if self.disable else params.eviction_policy_config,
         )
 
         self.evictable_leaves = set()
@@ -317,6 +323,8 @@ class RadixCache(BasePrefixCache):
         mock_allocator: Optional[Any] = None,
         page_size: int = 1,
         enable_kv_cache_events: bool = False,
+        dynamo_kv_event_format: bool = False,
+        kv_event_lora_names: Optional[LoRANameTable] = None,
     ) -> RadixCache:
         """Init a radix cache without memory pools for simulation purpose."""
         params = CacheInitParams(
@@ -325,6 +333,8 @@ class RadixCache(BasePrefixCache):
             token_to_kv_pool_allocator=mock_allocator,
             page_size=page_size,
             enable_kv_cache_events=enable_kv_cache_events,
+            dynamo_kv_event_format=dynamo_kv_event_format,
+            kv_event_lora_names=kv_event_lora_names,
         )
         return RadixCache(params)
 
