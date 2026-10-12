@@ -93,7 +93,7 @@ class TestAdmissionSkipReason(CustomTestCase):
         self.assertIsNone(s.admission_skip_reason(ScheduleBatch(reqs=[])))
         self.assertTrue(self._admit(s))
 
-    def test_min_free_slots_delayer_skips(self):
+    def test_min_free_slots_delayer_defers_without_skip_reason(self):
         # A policy deferral, not a skip reason: the step has a free slot.
         s = self._scheduler(waiting=1, free_slots=1)
         s.min_free_slots_delayer = MinFreeSlotsDelayer(min_free_slots=2)
