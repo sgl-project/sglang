@@ -289,16 +289,19 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             read_ragged_verify_mode,
         )
 
+        # The DSpark aux (first token, draft state, hidden states) travels on the
+        # prefill-side aux WRITE path that disaggregation/common implements for
+        # every transfer backend, so NIXL carries it the same way Mooncake does.
         if (
             read_ragged_verify_mode() is not RaggedVerifyMode.STATIC
-            or cfg.disaggregation_transfer_backend != "mooncake"
+            or cfg.disaggregation_transfer_backend not in ("mooncake", "nixl")
             or cfg.enable_prefill_cp
             or cfg.attn_cp_size != 1
             or cfg.dcp_size != 1
         ):
             raise ValueError(
-                "DeepSeek-V4.1 DSpark PD requires static verify, Mooncake, "
-                "and CP=1 on both servers. DP attention is supported when "
+                "DeepSeek-V4.1 DSpark PD requires static verify, Mooncake or "
+                "NIXL, and CP=1 on both servers. DP attention is supported when "
                 "both servers use the same block size and target/draft KV layout."
             )
 
