@@ -779,8 +779,7 @@ class BailingMoELinearDecoderLayer(nn.Module):
 
         self.expert_num = config.num_experts
         self.hidden_size = config.hidden_size
-        is_moe_layer = self._is_layer_sparse(config, self.layer_id, is_nextn=is_nextn)
-        is_next_layer_moe_layer = self._is_layer_sparse(config, self.layer_id + 1)
+        attn, ffn = self.stage_facts(config, self.layer_id, is_nextn=is_nextn)
         if self.expert_num == 1:
             self.mlp = BailingMLP(
                 hidden_size=self.hidden_size,
@@ -818,22 +817,27 @@ class BailingMoELinearDecoderLayer(nn.Module):
             else None
         )
         self.attn_boundary, self.ffn_boundary = append_stages(
-            (
-                declare_attn(),
-                self.input_layernorm,
-                {"qkv_latent_func": qkv_latent_func},
-            ),
-            (
-                declare_ffn(
-                    sparse=is_moe_layer,
-                    next_layer_sparse=is_next_layer_moe_layer,
-                ),
-                self.post_attention_layernorm,
+            (attn, self.input_layernorm, {"qkv_latent_func": qkv_latent_func}),
+            (ffn, self.post_attention_layernorm),
+        )
+
+    @classmethod
+    def stage_facts(
+        cls, config: PretrainedConfig, layer_id: int, is_nextn: bool = False
+    ):
+        """The stages the layer at ``layer_id`` declares, from the config: the
+        model's shared declaration function (see make_layers)."""
+        return (
+            declare_attn(),
+            declare_ffn(
+                sparse=cls._is_layer_sparse(config, layer_id, is_nextn=is_nextn),
+                next_layer_sparse=cls._is_layer_sparse(config, layer_id + 1),
             ),
         )
 
+    @staticmethod
     def _is_layer_sparse(
-        self, config: PretrainedConfig, layer_id: int, is_nextn: bool = False
+        config: PretrainedConfig, layer_id: int, is_nextn: bool = False
     ) -> bool:
         return is_nextn or (
             config.num_experts is not None and layer_id >= config.first_k_dense_replace
@@ -945,6 +949,9 @@ class BailingMoELinearModel(nn.Module):
             self.num_layers,
             layer_fn,
             prefix=f"{prefix}.layers",
+            stage_facts=lambda idx: BailingMoELinearDecoderLayer.stage_facts(
+                config, idx
+            ),
         )
 
         norm_kwargs = {}

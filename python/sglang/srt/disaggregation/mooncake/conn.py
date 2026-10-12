@@ -2292,6 +2292,16 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
         return self._transfer_data(req.mooncake_session_id, transfer_blocks)
 
+    def _poison_unsettled_send(self, room: int) -> None:
+        """Keep the drain ack from firing after a submitted transfer failed.
+
+        batch_transfer_sync returns -1 on its wall-clock timeout with the batch
+        still running (freeBatchID refuses a busy batch and the handle is
+        dropped), so a failed send may still be writing decode's pages; decode
+        falls back to its release timeout instead."""
+        if self.enable_deferred_decode_kv_release:
+            self.poison_deferred_ack_room(room)
+
     def transfer_worker(
         self,
         queue: FastQueue,
@@ -2546,6 +2556,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                     logger.error(
                                         f"Session {req.mooncake_session_id} failed."
                                     )
+                            self._poison_unsettled_send(kv_chunk.room)
                             self.conclude_failure(
                                 bootstrap_room=kv_chunk.room,
                                 failure_reason=(
@@ -2563,6 +2574,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                     executor,
                                     target_rank_registration_info,
                                 )
+                                # Before the Failed check: an ABORT during the
+                                # send also marks the room Failed.
+                                if state_rc != 0:
+                                    self._poison_unsettled_send(kv_chunk.room)
                                 if (
                                     self.request_status.get(
                                         kv_chunk.room, KVPoll.Failed
@@ -2594,6 +2609,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 kv_chunk.prefill_aux_index,
                                 target_rank_registration_info.dst_aux_ptrs,
                             )
+                            if ret != 0:
+                                # The aux write targets decode's metadata
+                                # slot, which the deferred release also frees.
+                                self._poison_unsettled_send(req.room)
                             polls.append(True if ret == 0 else False)
                             dst_ranks_infos.append((req.endpoint, req.dst_port))
 
@@ -3064,30 +3083,36 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
         self._record_transfer_indices(kv_indices, state_indices)
 
     def poll(self) -> KVPoll:
-        if self.conclude_state is None:
-            status = self.kv_mgr.check_status(self.bootstrap_room)
-            # Hold Success until all staging chunks transferred. With deferred
-            # allocation also wait for worker cleanup (the zero entry is only
-            # removed after cleanup), before permitting the room to be reused.
-            if status == KVPoll.Success and (
-                self.kv_mgr._staging_outstanding.get(self.bootstrap_room, 0) > 0
-                or (
-                    self.kv_mgr.defer_decode_allocation
-                    and self.bootstrap_room in self.kv_mgr._staging_outstanding
-                )
-            ):
-                return KVPoll.Transferring
-            if status in (KVPoll.Success, KVPoll.Failed):
-                self.conclude_state = status
-                self.trace_ctx.trace_req_finish()
-            elif status == KVPoll.Bootstrapping:
-                timeout_result = self._check_bootstrap_timeout()
-                if timeout_result is not None:
-                    return timeout_result
+        return self._poll_with_status(self.kv_mgr.check_status)
 
-            return status
-        else:
+    def poll_pp_consensus(self) -> KVPoll:
+        return self._poll_with_status(self.kv_mgr.check_status_pp_consensus)
+
+    def _poll_with_status(self, check_status) -> KVPoll:
+        if self.conclude_state is not None:
             return self.conclude_state
+
+        status = check_status(self.bootstrap_room)
+        # Hold Success until all staging chunks transferred. With deferred
+        # allocation also wait for worker cleanup (the zero entry is only
+        # removed after cleanup), before permitting the room to be reused.
+        if status == KVPoll.Success and (
+            self.kv_mgr._staging_outstanding.get(self.bootstrap_room, 0) > 0
+            or (
+                self.kv_mgr.defer_decode_allocation
+                and self.bootstrap_room in self.kv_mgr._staging_outstanding
+            )
+        ):
+            return KVPoll.Transferring
+        if status in (KVPoll.Success, KVPoll.Failed):
+            self.conclude_state = status
+            self.trace_ctx.trace_req_finish()
+        elif status == KVPoll.Bootstrapping:
+            timeout_result = self._check_bootstrap_timeout()
+            if timeout_result is not None:
+                return timeout_result
+
+        return status
 
     def _init_trace_ctx(self):
         if self.kv_mgr.enable_trace:
