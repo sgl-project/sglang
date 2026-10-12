@@ -1,6 +1,10 @@
 """Unit tests for RemoteInstanceModelLoader construction - no server, no weights."""
 
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import torch
 
 import sglang.srt.model_loader.loader as loader_mod
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
@@ -71,6 +75,45 @@ class TestRemoteInstanceModelLoaderExtraConfig(CustomTestCase):
             with self.subTest(backend=backend):
                 loader = loader_mod.RemoteInstanceModelLoader(_load_config(backend))
                 self.assertFalse(loader.load_config.model_loader_extra_config)
+
+
+class TestRemoteInstanceTransferEngineRole(CustomTestCase):
+    def test_each_runner_loads_the_seed_weights_of_its_own_role(self):
+        loader = loader_mod.RemoteInstanceModelLoader(
+            LoadConfig(
+                load_format=LoadFormat.REMOTE_INSTANCE,
+                remote_instance_weight_loader_backend=RemoteInstanceWeightLoaderBackend.TRANSFER_ENGINE,
+                remote_instance_weight_loader_transfer_engine=object(),
+                remote_instance_weight_loader_seed_instance_ip="127.0.0.1",
+                remote_instance_weight_loader_seed_instance_service_port=30000,
+                tp_rank=1,
+            )
+        )
+        for is_draft_model, role in ((False, "target"), (True, "draft")):
+            with self.subTest(role=role):
+                queried = []
+                with (
+                    patch.object(loader_mod, "_get_quantization_config"),
+                    patch.object(
+                        loader_mod,
+                        "_initialize_model",
+                        return_value=torch.nn.Linear(1, 1),
+                    ),
+                    patch.object(loader_mod, "register_memory_region"),
+                    patch.object(
+                        loader_mod,
+                        "get_remote_instance_transfer_engine_info_per_rank",
+                        side_effect=lambda *args: queried.append(args) or (None, None),
+                    ),
+                ):
+                    with self.assertRaises(RuntimeError):
+                        loader.load_model(
+                            model_config=SimpleNamespace(
+                                is_draft_model=is_draft_model, dtype=torch.float32
+                            ),
+                            device_config=SimpleNamespace(device="cpu"),
+                        )
+                self.assertEqual(queried, [("http://127.0.0.1:30000", 1, role)])
 
 
 if __name__ == "__main__":
