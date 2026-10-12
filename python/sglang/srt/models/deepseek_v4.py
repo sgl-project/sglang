@@ -4634,7 +4634,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                     "(model_type=deepseek_v41 with vision_n_layers > 0)."
                 )
             self.model = None
-            self.pp_group = get_pp_group()
+            self.pp_group = get_parallel().pp_group
             self.lm_head = None
             self.logits_processor = None
             self.capture_aux_hidden_states = False
