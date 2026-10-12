@@ -1173,7 +1173,15 @@ class MMEncoder:
         mm_inputs = preprocess_result.mm_inputs
         grid_thw = preprocess_result.grid_thw
         token_counts = preprocess_result.token_counts
-        mm_feature = _convert(_get_mm_feature(mm_inputs, modality))
+        if get_encoder_preprocessed_items(mm_inputs) is not None:
+            # Model preprocessors (EncoderPreprocessOutput) carry per-item
+            # features on mm_items; there may be no aggregate feature tensor and
+            # none is needed: both _build_model_mm_items and
+            # _calculate_hashes_from_features branch on the preprocessed items
+            # and ignore mm_feature.
+            mm_feature = None
+        else:
+            mm_feature = _convert(_get_mm_feature(mm_inputs, modality))
         num_items = len(grid_thw)
         if num_items != sum(items_per_req):
             raise InternalError(

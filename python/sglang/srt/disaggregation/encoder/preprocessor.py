@@ -904,6 +904,16 @@ class EncoderPreprocessor:
             input_length = self.get_num_patches(grid, modality)
             return self._get_feat_extract_output_lengths(input_length)
         else:
+            if self.model_type == "deepseek_v41" and modality == Modality.IMAGE:
+                # DSV4.1 image tokens are a sentinel span, not a merged patch
+                # grid: [START] + ([IMAGE]*w + [NEWLINE])*h + [END], where the
+                # grid is [t, n_llm_h, n_llm_w] (see preprocess_mm_for_encoder).
+                from sglang.srt.multimodal.deepseek_v41_image_processing import (
+                    num_image_tokens,
+                )
+
+                g = grid.tolist() if isinstance(grid, torch.Tensor) else list(grid)
+                return num_image_tokens(int(g[-2]), int(g[-1]))
             if (
                 self.model_type in ["kimi_k25", "kimi_k3", "kimi_vl"]
                 and modality == Modality.IMAGE
