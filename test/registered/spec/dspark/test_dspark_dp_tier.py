@@ -69,6 +69,8 @@ class TestDraftDpSyncMetadata(CustomTestCase):
             global_num_tokens=[1, 3, 0, 2],
             global_num_tokens_for_logprob=[1, 3, 0, 2],
             can_run_decode_cuda_graph=True,
+            is_extend_in_batch=False,
+            dp_spec_prefill_coordination_applied=False,
         )
 
         with patch(

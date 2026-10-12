@@ -669,7 +669,6 @@ class HunyuanVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
         self.out_channels = (
             config.in_channels if config.out_channels is None else config.out_channels
         )
-        self.unpatchify_channels = self.out_channels
         self.guidance_embeds = config.guidance_embeds
         self.rope_dim_list = list(config.rope_axes_dim)
         self.rope_theta = config.rope_theta

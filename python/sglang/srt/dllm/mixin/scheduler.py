@@ -112,7 +112,7 @@ class SchedulerDllmMixin:
                         continue
 
                     req.full_untruncated_fill_ids[
-                        req.extend_range.end - new_tokens : req.extend_range.end
+                        req.extend_end - new_tokens : req.extend_end
                     ] = array("q", next_token_ids)
                     self.metrics_reporter.num_generated_tokens += new_tokens
 
@@ -137,16 +137,16 @@ class SchedulerDllmMixin:
 
                 # Mirror the resolved block into the committed fill ids so the
                 # prefix cache keys on the real tokens, not the mask block, next
-                # round. Index relative to extend_range.end (the truncated/
+                # round. Index relative to extend_end (the truncated/
                 # committed length), which can be shorter than
                 # full_untruncated_fill_ids when the staging adder truncates the
                 # block to the KV budget.
                 req.full_untruncated_fill_ids[
-                    req.extend_range.end - block_size : req.extend_range.end
+                    req.extend_end - block_size : req.extend_end
                 ] = array("q", next_token_ids)
 
                 len_input = len(req.origin_input_ids)
-                len_fill = req.extend_range.end
+                len_fill = req.extend_end
                 if len_fill <= len_input:
                     continue
 
@@ -179,14 +179,14 @@ class SchedulerDllmMixin:
             release_kv_cache(
                 req,
                 self.tree_cache,
-                is_insert=not self.dllm_config.requires_separate_context_encoding,
+                checkpoint=not self.dllm_config.requires_separate_context_encoding,
             )
             req.time_stats.set_completion_time()
 
     def _stash_dllm_context(self: Scheduler, req: Req) -> None:
         context_len = req.dllm_block_offset
         block_size = self.dllm_config.block_size
-        assert req.extend_range.end == context_len + block_size
+        assert req.extend_end == context_len + block_size
         assert req.kv is not None and req.kv.req_pool_idx is not None
 
         allocated_len = req.kv.kv_allocated_len
@@ -201,7 +201,7 @@ class SchedulerDllmMixin:
         req.kv.kv_committed_len = context_len
         req.kv.kv_allocated_len = context_len
         assert req.kv.max_evicted_seqlen <= context_len
-        req.set_extend_range(context_len, context_len)
+        req.extend_end = context_len
         self.stash_chunked_request(req)
 
     def finish_dllm_forward(self: Scheduler, req: Req) -> None:
@@ -215,9 +215,9 @@ class SchedulerDllmMixin:
         elif self.dllm_config.requires_separate_context_encoding:
             self._stash_dllm_context(req)
         else:
+            # The row stays with the request between blocks: a later abort
+            # releases its KV and tree lock through it.
             self.stash_chunked_request(req)
-            if fdfo_mode:
-                self.req_to_token_pool.free(req)
 
     def _fetch_waiting_reqs(self: Scheduler):
         # Calculate how many requests can be added to DLLM manager
