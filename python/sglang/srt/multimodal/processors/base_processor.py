@@ -56,9 +56,7 @@ _is_xpu = is_xpu()
 
 class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
     models = []
-    video_preprocessing_device = None
     prefer_tokenized_input = False
-    precompute_hash_before_cpu_transfer = False
     # Set by processors that already build input_ids from the request's own
     # tokens, so the retokenize-avoidance rebuild below has nothing to add.
     preserve_processor_input_ids = False
@@ -181,15 +179,6 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
             # Generic attributes that could apply to multiple modalities
             # "precomputed_embeddings" - handled specially as it can be any modality
         }
-
-        # name of the feature filed
-        # TODO: pass from processors
-        self.FEATURE_NAMES = [
-            "pixel_values",
-            "pixel_values_videos",
-            "audio_features",
-            "input_features",
-        ]
 
         if self.use_cuda_ipc and not kwargs.get("skip_mm_pool", False):
             # SGLANG_MM_FEATURE_CACHE_MB is the total pool budget across all
