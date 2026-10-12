@@ -403,12 +403,10 @@ class HiCacheFile(HiCacheStorage):
         # page, so give each rank its own file key to avoid a cross-rank write race.
         if attn_cp_size > 1:
             stage_suffix += f"_cp{attn_cp_rank}_{attn_cp_size}"
+        self.tp_config_suffix = f"_{model_name}{rank_suffix}{stage_suffix}"
         self.config_suffix = (
-            f"_{model_name}{'' if is_mla_model else rank_suffix}{stage_suffix}"
+            f"_{model_name}{stage_suffix}" if is_mla_model else self.tp_config_suffix
         )
-        # MLA KV is replicated across TP ranks, but every rank backs up its own
-        # Mamba shard (see should_backup), so Mamba keys always carry the TP rank.
-        self.mamba_config_suffix = f"_{model_name}{rank_suffix}{stage_suffix}"
 
         if not os.path.exists(self.file_path) and tp_rank == 0 and attn_cp_rank == 0:
             os.makedirs(self.file_path)
@@ -449,7 +447,7 @@ class HiCacheFile(HiCacheStorage):
             self.config_suffix,
             tp_rank=tp_rank,
             is_mla_model=is_mla_model,
-            sharded_suffix=self.mamba_config_suffix,
+            tp_config_suffix=self.tp_config_suffix,
             extra_config=storage_config.extra_config,
             on_evict=(
                 self.metadata_cache.remove if self.metadata_cache is not None else None
@@ -457,8 +455,9 @@ class HiCacheFile(HiCacheStorage):
         )
 
     def _get_suffixed_key(self, key: str) -> str:
+        # Mamba state is TP-sharded even when the model's MLA KV is replicated.
         if key.endswith(f".{PoolName.MAMBA.value}"):
-            return key + self.mamba_config_suffix
+            return key + self.tp_config_suffix
         return key + self.config_suffix
 
     def _get_component_key(self, key: str, component_name: Optional[str] = None) -> str:
@@ -476,7 +475,7 @@ class HiCacheFile(HiCacheStorage):
                 continue
             stem = fn[:-4]
             # Only files belonging to this rank/model.
-            if stem.endswith((self.config_suffix, self.mamba_config_suffix)):
+            if stem.endswith((self.config_suffix, self.tp_config_suffix)):
                 self.metadata_cache.add(stem)
 
     def get(

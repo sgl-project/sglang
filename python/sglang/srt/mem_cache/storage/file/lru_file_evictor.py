@@ -70,7 +70,7 @@ class LRUFileEvictor:
         *,
         tp_rank: int,
         is_mla_model: bool,
-        sharded_suffix: Optional[str] = None,
+        tp_config_suffix: Optional[str] = None,
         extra_config: Optional[dict] = None,
         on_evict: Optional[Callable[[str], None]] = None,
     ) -> None:
@@ -79,12 +79,12 @@ class LRUFileEvictor:
         self._tp_rank = tp_rank
         self._on_evict = on_evict
 
-        # MLA ranks share replicated files, so rank 0 owns their LRU bookkeeping;
-        # keys ending in ``sharded_suffix`` hold this rank's own TP shard.
-        owns_replicated = (not is_mla_model) or (tp_rank == 0)
-        self._owned_suffixes = tuple(
-            s for s in (config_suffix if owns_replicated else None, sharded_suffix) if s
-        )
+        # MLA ranks share the same physical files, so centralize LRU bookkeeping
+        # on rank 0; non-MLA ranks each own their own files via the suffix.
+        # Every rank owns its TP-sharded files (tp_config_suffix).
+        self._owned_suffixes = (tp_config_suffix,) if tp_config_suffix else ()
+        if not is_mla_model or tp_rank == 0:
+            self._owned_suffixes += (config_suffix,)
         self._is_storage_owner = bool(self._owned_suffixes)
 
         # suffixed_key -> file size in bytes; oldest at front.
@@ -162,6 +162,9 @@ class LRUFileEvictor:
         """True when a cap or free-space watermark is set (on any rank)."""
         return self._eviction_configured
 
+    def _owns(self, suffixed_key: str) -> bool:
+        return suffixed_key.endswith(self._owned_suffixes)
+
     @property
     def is_storage_owner(self) -> bool:
         """True when this rank owns (and may create/evict) the on-disk files."""
@@ -180,9 +183,9 @@ class LRUFileEvictor:
         """
         if not self._eviction_configured:
             return True  # unbounded storage: nothing to enforce
-        if not suffixed_key.endswith(self._owned_suffixes):
+        if not self._owns(suffixed_key):
             logger.warning(
-                f"HiCacheFile rank {self._tp_rank} does not own this key; "
+                f"HiCacheFile rank {self._tp_rank} is not the MLA storage owner; "
                 f"not caching new key {key} because file eviction is enabled."
             )
             return False
@@ -245,9 +248,7 @@ class LRUFileEvictor:
 
     def touch(self, suffixed_key: str, tensor_path: str) -> None:
         """Mark key as MRU, adopting an untracked on-disk file if needed."""
-        if not self._eviction_enabled or not suffixed_key.endswith(
-            self._owned_suffixes
-        ):
+        if not self._eviction_enabled or not self._owns(suffixed_key):
             return
         with self._lock:
             if suffixed_key in self._lru:
@@ -314,7 +315,7 @@ class LRUFileEvictor:
                 continue
             stem = fn[:-4]
             # Only files belonging to this rank/model.
-            if not stem.endswith(self._owned_suffixes):
+            if not self._owns(stem):
                 continue
             fp = os.path.join(self.file_path, fn)
             try:
