@@ -46,6 +46,21 @@ def check_mega_moe_compat(server_args: ServerArgs) -> None:
             "kernels over CUDA symmetric memory. On ROCm, set "
             "SGLANG_AMD_USE_FLYDSL_MEGA_MOE=1 to select aiter MegaMoEv2 instead."
         )
+    if (
+        platform.is_hip
+        and envs.SGLANG_AITER_MEGA_EPLB_PREFILL_ONLY.get()
+        and envs.SGLANG_AITER_MEGA_RANK_SYNC.get()
+        and cfg.expert_balancedness_report_mode != "off"
+    ):
+        # The prefill-only recorder (megamoe_prefill_only_recorder_enabled)
+        # skips a pass on ranks without prefill tokens, while balancedness
+        # reporting reduces over all ranks on every recorded pass.
+        raise ValueError(
+            "--expert-balancedness-report-mode is not supported with "
+            "SGLANG_AITER_MEGA_EPLB_PREFILL_ONLY=1 and SGLANG_AITER_MEGA_RANK_SYNC=1 "
+            "on --moe-a2a-backend megamoe: it hangs the first batch that "
+            "does not reach every DP rank. Set --expert-balancedness-report-mode off."
+        )
 
 
 # MoE blocks with no fused-MoE fallback under megamoe.

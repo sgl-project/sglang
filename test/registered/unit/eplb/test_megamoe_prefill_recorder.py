@@ -4,6 +4,7 @@ from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.srt.arg_groups.mega_moe_hook import check_mega_moe_compat
 from sglang.srt.eplb.eplb_manager import EPLBManager
 from sglang.srt.eplb.eplb_map_record_fused import eplb_map_and_record_fused
 from sglang.srt.eplb.expert_distribution import (
@@ -14,6 +15,7 @@ from sglang.srt.eplb.expert_distribution import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import override_platform
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import Withable
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -130,6 +132,25 @@ class TestMegaMoEPrefillRecorder(unittest.TestCase):
         with override_platform(is_hip=False):
             self.assertTrue(should_advance_eplb_counter(decode))
             self.assertTrue(should_record_forward_pass(decode))
+
+    def test_balancedness_reporting_is_rejected(self):
+        """Balancedness reporting reduces over all ranks on every recorded pass,
+        but this recorder skips the pass on ranks without prefill tokens, so the
+        first batch that misses a DP rank hangs prefill."""
+        for mode, rejected in [("server_log", True), ("off", False)]:
+            server_args = ServerArgs(
+                model_path="dummy",
+                moe_a2a_backend="megamoe",
+                expert_balancedness_report_mode=mode,
+            )
+            with self.subTest(mode=mode):
+                if rejected:
+                    with self.assertRaisesRegex(
+                        ValueError, "expert-balancedness-report-mode"
+                    ):
+                        check_mega_moe_compat(server_args)
+                else:
+                    check_mega_moe_compat(server_args)
 
     def test_select_experts_filters_all_out_of_range_ids(self):
         gatherer = _SelectExpertsSinglePassGatherer.__new__(
