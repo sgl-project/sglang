@@ -94,6 +94,9 @@ def _cuda_arch_suffix(major: int, minor: int) -> str:
 @cache_once
 def _init_jit_cuda_arch_once():
     global _CUDA_ARCH
+    if is_musa_runtime():
+        import torchada  # noqa: F401
+
     try:
         device = torch.cuda.current_device()
         major, minor = torch.cuda.get_device_capability(device)
@@ -126,6 +129,8 @@ def get_default_target_flags(arch: ArchInfo | None = None) -> List[str]:
         except Exception:
             flags.append("-DHIP_FP8_TYPE_E4M3=1")
         return flags
+    elif is_musa_runtime():
+        return ["-DUSE_MUSA", "-std=c++17", "-O3"]
     else:
         if arch is None:
             arch = get_jit_cuda_arch()
@@ -183,7 +188,7 @@ def is_arch_support_pdl() -> bool:
 
 def get_activation_cuda_cflags() -> list[str]:
     """Match the AOT activation fast-math policy without changing other kernels."""
-    # Blackwell needs precise expf; HIP clang rejects --use_fast_math.
-    if is_hip_runtime() or get_jit_cuda_arch().major >= 10:
+    # Blackwell needs precise expf; HIP clang and MUSA mcc reject --use_fast_math.
+    if is_hip_runtime() or is_musa_runtime() or get_jit_cuda_arch().major >= 10:
         return []
     return ["--use_fast_math"]

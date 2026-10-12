@@ -11,6 +11,7 @@
 
 #pragma once
 #include <sgl_kernel/bits.h>
+#include <sgl_kernel/cxx_compat.h>
 #include <sgl_kernel/utils.h>
 
 #include <dlpack/dlpack.h>
@@ -19,14 +20,22 @@
 
 #include <algorithm>
 #include <array>
+#if SGL_USE_BIT_CAST
 #include <bit>
+#endif
+#if SGL_USE_CONCEPTS
 #include <concepts>
+#endif
 #include <cstddef>
 #include <cstdint>
 #include <initializer_list>
 #include <optional>
+#if SGL_USE_RANGES
 #include <ranges>
+#endif
+#if SGL_USE_SPAN
 #include <span>
+#endif
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -36,6 +45,8 @@
 #ifdef __CUDACC__
 #include <sgl_kernel/utils.cuh>
 #elif defined(__HIPCC__)
+#include <sgl_kernel/utils.cuh>
+#elif defined(USE_MUSA)
 #include <sgl_kernel/utils.cuh>
 #endif
 
@@ -55,19 +66,32 @@ struct SizeRef;
 struct DTypeRef;
 struct DeviceRef;
 
+#if SGL_USE_CONCEPTS
 template <typename T>
 struct DLDataTypeTrait {};
 
 template <std::integral T>
 struct DLDataTypeTrait<T> {
+#else
+template <typename T, typename = void>
+struct DLDataTypeTrait {};
+
+template <typename T>
+struct DLDataTypeTrait<T, std::enable_if_t<std::is_integral_v<T> > > {
+#endif
   inline static constexpr DLDataType value = {
       .code = std::is_signed_v<T> ? DLDataTypeCode::kDLInt : DLDataTypeCode::kDLUInt,
       .bits = static_cast<std::uint8_t>(sizeof(T) * 8),
       .lanes = 1};
 };
 
+#if SGL_USE_CONCEPTS
 template <std::floating_point T>
 struct DLDataTypeTrait<T> {
+#else
+template <typename T>
+struct DLDataTypeTrait<T, std::enable_if_t<std::is_floating_point_v<T> > > {
+#endif
   inline static constexpr DLDataType value = {
       .code = DLDataTypeCode::kDLFloat, .bits = static_cast<std::uint8_t>(sizeof(T) * 8), .lanes = 1};
 };
@@ -94,6 +118,19 @@ template <>
 struct DLDataTypeTrait<bf16_t> {
   inline static constexpr DLDataType value = {.code = DLDataTypeCode::kDLBfloat, .bits = 16, .lanes = 1};
 };
+#elif defined(USE_MUSA)
+template <>
+struct DLDataTypeTrait<fp16_t> {
+  inline static constexpr DLDataType value = {.code = DLDataTypeCode::kDLFloat, .bits = 16, .lanes = 1};
+};
+template <>
+struct DLDataTypeTrait<bf16_t> {
+  inline static constexpr DLDataType value = {.code = DLDataTypeCode::kDLBfloat, .bits = 16, .lanes = 1};
+};
+template <>
+struct DLDataTypeTrait<fp8_e4m3_t> {
+  inline static constexpr DLDataType value = {.code = DLDataTypeCode::kDLFloat8_e4m3fn, .bits = 8, .lanes = 1};
+};
 #endif
 
 template <DLDeviceType Code>
@@ -109,8 +146,8 @@ inline constexpr auto kDeviceList = std::array<DLDevice, sizeof...(Codes)>{DLDev
 
 template <typename T>
 struct PrintAbleSpan {
-  explicit PrintAbleSpan(std::span<const T> data) : data(data) {}
-  std::span<const T> data;
+  explicit PrintAbleSpan(Span<const T> data) : data(data) {}
+  Span<const T> data;
 };
 
 // define DLDataType comparison and printing in root namespace
@@ -133,7 +170,18 @@ inline constexpr auto kDeviceStringMap = [] {
       std::pair{DLDeviceType::kDLMAIA, "maia"},
       std::pair{DLDeviceType::kDLTrn, "trn"},
   };
+#if SGL_USE_RANGES
   constexpr auto max_type = stdr::max(map | stdv::keys);
+#else
+  constexpr auto max_type = [](const auto& entries) {
+    std::size_t result = 0;
+    for (const auto& [code, name] : entries) {
+      (void)name;
+      result = std::max(result, static_cast<std::size_t>(code));
+    }
+    return result;
+  }(map);
+#endif
   auto result = std::array<std::string_view, max_type + 1>{};
   for (const auto& [code, name] : map) {
     result[static_cast<std::size_t>(code)] = name;
@@ -291,7 +339,7 @@ struct SymbolicDType {
     return m_value;
   }
 
-  auto set_options(std::span<const DLDataType> options) -> void {
+  auto set_options(Span<const DLDataType> options) -> void {
     m_options = options;
   }
 
@@ -318,7 +366,7 @@ struct SymbolicDType {
     return stdr::empty(m_options) || (stdr::find(m_options, value) != stdr::end(m_options));
   }
 
-  std::span<const DLDataType> m_options;
+  Span<const DLDataType> m_options;
   DLDataType m_value;
 };
 
@@ -358,7 +406,7 @@ struct SymbolicDevice {
     return m_value;
   }
 
-  auto set_options(std::span<const DLDevice> options) -> void {
+  auto set_options(Span<const DLDevice> options) -> void {
     m_options = options;
   }
 
@@ -390,7 +438,7 @@ struct SymbolicDevice {
            }));
   }
 
-  std::span<const DLDevice> m_options;
+  Span<const DLDevice> m_options;
   DLDevice m_value;
 };
 
@@ -439,7 +487,7 @@ struct DTypeRef : BaseRef<SymbolicDType> {
   DTypeRef(std::initializer_list<DLDataType> options) {
     (**this).set_options(options);
   }
-  DTypeRef(std::span<const DLDataType> options) {
+  DTypeRef(Span<const DLDataType> options) {
     (**this).set_options(options);
   }
 };
@@ -452,7 +500,7 @@ struct DeviceRef : BaseRef<SymbolicDevice> {
   DeviceRef(std::initializer_list<DLDevice> options) {
     (**this).set_options(options);
   }
-  DeviceRef(std::span<const DLDevice> options) {
+  DeviceRef(Span<const DLDevice> options) {
     (**this).set_options(options);
   }
 };
@@ -592,15 +640,21 @@ struct TensorMatcher {
     m_device->verify(view.device());
     if (m_alignment.has_value()) {
       const auto alignment = *m_alignment;
-      CHECK_HOST(std::bit_cast<uintptr_t>(view.data_ptr()) % alignment == 0)
+      CHECK_HOST(
+#if SGL_USE_BIT_CAST
+          std::bit_cast<uintptr_t>(view.data_ptr()) % alignment == 0
+#else
+          reinterpret_cast<uintptr_t>(view.data_ptr()) % alignment == 0
+#endif
+          )
           << "Tensor data pointer is not aligned to " << alignment << " bytes";
-      if (dim > 0) [[likely]] {
-        const auto bytes = static_cast<int64_t>(dtype_bytes(view.dtype()));
-        for (const auto i : irange(dim - 1)) {
-          CHECK_HOST(view.size(i) == 1 || (view.stride(i) * bytes) % alignment == 0)
-              << "Tensor stride for dimension " << i << " is not aligned to " << alignment << " bytes";
+      if (dim > 0) SGL_LIKELY {
+          const auto bytes = static_cast<int64_t>(dtype_bytes(view.dtype()));
+          for (const auto i : irange(dim - 1)) {
+            CHECK_HOST(view.size(i) == 1 || (view.stride(i) * bytes) % alignment == 0)
+                << "Tensor stride for dimension " << i << " is not aligned to " << alignment << " bytes";
+          }
         }
-      }
     }
   }
 
@@ -618,8 +672,8 @@ struct TensorMatcher {
     return !m_strides.empty();
   }
 
-  std::span<const SizeRef> m_shape;
-  std::span<const SizeRef> m_strides;
+  Span<const SizeRef> m_shape;
+  Span<const SizeRef> m_strides;
   DTypeRef m_dtype;
   DeviceRef m_device;
   bool m_has_dtype = false;

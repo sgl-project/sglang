@@ -137,5 +137,24 @@ def test_update_token_table_decode_matches_general(batch_size: int) -> None:
     torch.testing.assert_close(token_table_decode, token_table_general, atol=0, rtol=0)
 
 
+@pytest.mark.parametrize(
+    "cpu_argument", ["tokens", "ne_token_table", "row_indices", "column_starts"]
+)
+@pytest.mark.parametrize("pin_memory", [False, True])
+def test_update_token_table_decode_rejects_cpu_tensor(cpu_argument, pin_memory):
+    inputs = {
+        "tokens": torch.zeros(1, dtype=torch.int32, device="cuda"),
+        "ne_token_table": torch.zeros((1, 4), dtype=torch.int32, device="cuda"),
+        "row_indices": torch.zeros(1, dtype=torch.int64, device="cuda"),
+        "column_starts": torch.zeros(1, dtype=torch.int32, device="cuda"),
+    }
+    tensor = inputs[cpu_argument]
+    inputs[cpu_argument] = torch.zeros(
+        tensor.shape, dtype=tensor.dtype, device="cpu", pin_memory=pin_memory
+    )
+    with pytest.raises(RuntimeError, match="Device value .*not in the allowed options"):
+        update_token_table_decode(**inputs)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))
