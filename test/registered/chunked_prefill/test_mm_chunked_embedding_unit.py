@@ -50,9 +50,7 @@ HIDDEN = 16
 
 @pytest.fixture(autouse=True)
 def single_process_runtime_context():
-    # These mm_utils unit tests exercise cache-hit paths that acknowledge
-    # deferred CUDA IPC through runtime_context. They do not start an engine, so
-    # pin the runtime topology to a single-process CPU setup.
+    # Exercise the embedding path without starting an engine.
     server_args_override = get_context().override_server_args(tp_size=1)
     server_args_override.install()
     try:
@@ -72,14 +70,6 @@ TOTAL_LEN = 30
 CHUNKS = [(0, 8), (8, 8), (16, 8), (24, 6)]
 
 _CPU = torch.device("cpu")
-
-
-@pytest.fixture(autouse=True)
-def _skip_cuda_ipc_acknowledgement(monkeypatch):
-    """Keep CPU embedding tests independent of tensor-parallel runtime state."""
-    monkeypatch.setattr(
-        mm_schedule, "_acknowledge_deferred_cuda_ipc_cache_hits", lambda _items: None
-    )
 
 
 def _num_tokens(item: MultimodalDataItem) -> int:

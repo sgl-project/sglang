@@ -118,6 +118,7 @@ class TargetVerifyExecutor:
         tp_sync: SpecTpSync,
         verify_epilogue=None,
         simulate_acc_len: float = 0.0,
+        simulated_correct_len: Optional[torch.Tensor] = None,
         block_verification: bool = False,
     ) -> None:
         self.target_worker = target_worker
@@ -139,7 +140,7 @@ class TargetVerifyExecutor:
         self._verify_backend_self_adds_seq_lens_cache: Optional[bool] = None
         self._simulate_acc_len = float(simulate_acc_len)
         self._block_verification = block_verification
-        self._simulated_correct_drafts_buf: Optional[torch.Tensor] = None
+        self._simulated_correct_len = simulated_correct_len
 
     def accept_and_finalize(
         self,
@@ -160,13 +161,13 @@ class TargetVerifyExecutor:
 
         Folded path: the accept/finalize/out-token kernels already ran inside
         the target-verify cuda graph (DsparkVerifyEpilogue); read its buffers.
-        Eager path: run them here, including the SGLANG_SIMULATE_ACC_LEN
-        override.
+        Eager path: run them here. Both apply the SGLANG_SIMULATE_ACC_LEN
+        override drawn by begin_simulated_step.
         """
         if folded_accept:
             return self.verify_epilogue.read_accept(bs)
 
-        simulate = self._simulate_acc_len > 0
+        simulate = self._simulated_correct_len is not None
         # Simulated acceptance overwrites correct_len below, so a sampling accept
         # (draft/target softmax + rejection) would be computed only to be discarded.
         accept_sampling_info = None if simulate and _is_hip else sampling_info
@@ -183,9 +184,7 @@ class TargetVerifyExecutor:
             block_verification=self._block_verification,
         )
         if simulate:
-            correct_len = self._simulated_correct_len(
-                bs=bs, dtype=correct_len.dtype, device=correct_len.device
-            )
+            correct_len = self._simulated_correct_len.repeat(bs).to(correct_len.dtype)
             if simulate_bonus_sampling_info is not None:
                 bonus = sample_simulated_bonus(
                     target_logits=target_logits,
@@ -226,23 +225,15 @@ class TargetVerifyExecutor:
             out_tokens=out_tokens,
         )
 
-    def _simulated_correct_len(
-        self, *, bs: int, dtype: torch.dtype, device: torch.device
-    ) -> torch.Tensor:
-        buf = self._simulated_correct_drafts_buf
-        if (
-            buf is None
-            or buf.numel() < bs
-            or buf.dtype != dtype
-            or buf.device != device
-        ):
-            buf = torch.empty((max(bs, 512),), dtype=dtype, device=device)
-            self._simulated_correct_drafts_buf = buf
-
+    def begin_simulated_step(self) -> None:
+        """Draw this step's SGLANG_SIMULATE_ACC_LEN correct length, before the
+        target verify, so the folded accept in the graph applies it too."""
+        if self._simulated_correct_len is None:
+            return
         simulated_acc_len = sample_simulated_acc_len(
             self._simulate_acc_len, SIMULATE_ACC_METHOD, self.gamma + 1
         )
-        return buf[:bs].fill_(simulated_acc_len - 1)
+        self._simulated_correct_len.fill_(simulated_acc_len - 1)
 
     def run_idle_participation(
         self,
@@ -569,6 +560,7 @@ class DsparkVerifyEpilogue:
         tp_sync: SpecTpSync,
         commit_ctx: Optional[CommitInjectCtx] = None,
         fused_argmax: bool = False,
+        simulated_correct_len: Optional[torch.Tensor] = None,
     ) -> None:
         self.max_bs = int(max_bs)
         self.stride = int(verify_num_draft_tokens)
@@ -599,6 +591,8 @@ class DsparkVerifyEpilogue:
         self.out_tokens_buf = torch.zeros(
             (self.max_bs, self.stride), dtype=torch.int64, device=device
         )
+        # SGLANG_SIMULATE_ACC_LEN: the step's correct length, filled per step.
+        self.simulated_correct_len = simulated_correct_len
         self.strided_logits: Optional[torch.Tensor] = None
         self.strided_hidden: Optional[torch.Tensor] = None
         self._static_step_state: Optional[tuple[int, bool]] = None
@@ -781,6 +775,9 @@ class DsparkVerifyEpilogue:
             cutoff_verify_lens=cutoff_verify_lens,
             fused_argmax=self._fused_argmax,
         )
+        if self.simulated_correct_len is not None:
+            # The accept runs as served; only its length is replaced.
+            correct_len = self.simulated_correct_len.repeat(bs).to(correct_len.dtype)
         self._tp_sync.sync(SpecTpSyncSite.DSPARK_ACCEPT_GRAPH, correct_len)
         self._tp_sync.sync(SpecTpSyncSite.DSPARK_ACCEPT_GRAPH, bonus)
         self._tp_sync.sync(SpecTpSyncSite.DSPARK_ACCEPT_GRAPH, cap_trim_lens)
@@ -886,13 +883,23 @@ def accept_draft_tokens(
             cutoff_verify_lens=cutoff_verify_lens,
             fused_argmax=fused_argmax,
         )
-    bs, gamma_rows, vocab = draft_block.corrected_logits.shape
-    draft_probs = SoftmaxTemp.execute(
-        logits=draft_block.corrected_logits.reshape(bs * gamma_rows, vocab),
-        temperatures=draft_block.temperatures,
-        rows_per_request=gamma_rows,
-    ).view(bs, gamma_rows, vocab)
-    expect(_VERIFY_DRAFT_PROBS, draft_probs)
+    if draft_block.greedy_draft:
+        # An argmax draft is one-hot: rejection accepts at the target probability.
+        draft_tokens = draft_block.draft_tokens
+        draft_probs = torch.zeros(
+            (*draft_tokens.shape, target_logits.shape[-1]),
+            dtype=torch.float32,
+            device=target_logits.device,
+        )
+        draft_probs.scatter_(-1, draft_tokens.unsqueeze(-1), 1.0)
+    else:
+        bs, gamma_rows, vocab = draft_block.corrected_logits.shape
+        draft_probs = SoftmaxTemp.execute(
+            logits=draft_block.corrected_logits.reshape(bs * gamma_rows, vocab),
+            temperatures=draft_block.temperatures,
+            rows_per_request=gamma_rows,
+        ).view(bs, gamma_rows, vocab)
+        expect(_VERIFY_DRAFT_PROBS, draft_probs)
     if not sampling_info.is_any_greedy:
         return AcceptSampling.execute(
             candidates=candidates,
