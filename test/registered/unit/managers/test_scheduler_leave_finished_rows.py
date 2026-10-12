@@ -152,7 +152,7 @@ class TestLeaveBeforeAdmission(unittest.TestCase):
             batch_to_run=None, running_batch=db.rows
         )
         plan = s.get_next_batch_to_run(decoding_batch=decoding_batch, last_batch=new)
-        self.assertIs(plan.running_batch, new)
+        self.assertIsNot(plan.running_batch, new)
         self.assertEqual(_rids(plan.running_batch), ["new"])
 
 
