@@ -8,16 +8,61 @@ import tempfile
 import unittest
 import zipfile
 from contextlib import redirect_stdout
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import mlu_ci_reliability_report as report  # noqa: E402
 
 
 class TestMLUCIReport(unittest.TestCase):
+    def test_workflow_runs_walk_past_1000_with_boundary_overlap(self):
+        start = datetime(2026, 10, 1, tzinfo=timezone.utc)
+        end = start + timedelta(days=7)
+        runs = [
+            {
+                "id": index,
+                "created_at": report.isoformat(end - timedelta(seconds=index // 2)),
+            }
+            for index in range(1105)
+        ]
+        ranges = []
+
+        def batch(api, path, key):
+            lower, upper = parse_qs(urlsplit(path).query)["created"][0].split("..")
+            ranges.append((lower, upper))
+            return [run for run in runs if lower <= run["created_at"] <= upper][:1000]
+
+        with patch.object(report, "paginate", side_effect=batch):
+            result = report.list_workflow_runs(
+                None, "example/sglang", "pr-test-mlu.yml", start, end, "all"
+            )
+        self.assertEqual([run["id"] for run in result], list(range(2, 1105)))
+        self.assertEqual(
+            ranges,
+            [
+                (report.isoformat(start), report.isoformat(end)),
+                (report.isoformat(start), runs[999]["created_at"]),
+            ],
+        )
+
+    def test_workflow_runs_reject_stalled_cursor(self):
+        start = datetime(2026, 10, 1, tzinfo=timezone.utc)
+        end = start + timedelta(days=7)
+        runs = [
+            {"id": index, "created_at": report.isoformat(start)}
+            for index in range(1000)
+        ]
+        with (
+            patch.object(report, "paginate", return_value=runs),
+            self.assertRaisesRegex(RuntimeError, "1000-result limit"),
+        ):
+            report.list_workflow_runs(
+                None, "example/sglang", "pr-test-mlu.yml", start, end, "all"
+            )
+
     def test_successful_run_produces_json_and_markdown(self):
         prefix = "/repos/example/sglang/actions"
         responses = {
@@ -106,6 +151,55 @@ class TestMLUCIReport(unittest.TestCase):
         self.assertIn("<!-- mlu-ci-reliability-report -->", markdown)
         self.assertIn("| `success` | `success` | 1 |", markdown)
         self.assertIn("**100.0%**", markdown)
+
+    def test_failed_jobs_rerun_skips_carried_over_executions(self):
+        start = datetime(2026, 10, 6, tzinfo=timezone.utc)
+        single = {
+            "id": 101,
+            "name": "MLU / one",
+            "runner_group_name": "mlu-ci",
+            "runner_name": "mlu-runner",
+            "status": "completed",
+            "started_at": "2026-10-06T10:01:00Z",
+            "completed_at": "2026-10-06T10:03:00Z",
+        }
+        dual = {**single, "id": 102, "name": "MLU / two"}
+        rerun = {**dual, "id": 202, "completed_at": "2026-10-06T10:05:00Z"}
+        jobs = [[single, dual], [{**single, "id": 201}, rerun]]
+        runs = [{"id": 42, "run_attempt": 2}]
+        artifacts = [
+            {"id": index, "name": f"mlu-ci-result-pr-42-{attempt}-{suite}"}
+            for index, (attempt, suite) in enumerate(
+                ((1, "one"), (1, "two"), (2, "two"))
+            )
+        ]
+
+        def request(path, **kwargs):
+            status = "failed" if path.endswith("/artifacts/1/zip") else "success"
+            archive = io.BytesIO()
+            with zipfile.ZipFile(archive, "w") as bundle:
+                bundle.writestr("result-task.json", json.dumps({"status": status}))
+            return archive.getvalue()
+
+        api = report.GitHubApi("test-token")
+        with (
+            patch.object(report, "list_workflow_runs", return_value=runs),
+            patch.object(report, "list_attempt_jobs", side_effect=jobs),
+            patch.object(report, "paginate", return_value=artifacts),
+            patch.object(api, "request", side_effect=request),
+        ):
+            records, errors = report.collect_records(
+                api, "a/b", "mlu.yml", "MLU / ", start, start + timedelta(days=1)
+            )
+        self.assertEqual(
+            [(r["attempt"], r["job_id"]) for r in records],
+            [(1, 101), (1, 102), (2, 202)],
+        )
+        self.assertEqual(
+            [r["metadata"] for r in records],
+            [{"status": "success"}, {"status": "failed"}, {"status": "success"}],
+        )
+        self.assertEqual(errors, [])
 
     def test_mixed_results_keep_missing_metadata_out_of_reliability(self):
         outcomes = [

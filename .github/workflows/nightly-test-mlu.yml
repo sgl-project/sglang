@@ -15,7 +15,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: nightly-test-mlu-${{ inputs.ref || github.ref }}
+  group: nightly-test-mlu-${{ github.event_name == 'schedule' && github.run_id || inputs.ref || github.ref }}
   cancel-in-progress: true
 
 jobs:

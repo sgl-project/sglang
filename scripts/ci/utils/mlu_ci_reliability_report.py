@@ -126,12 +126,33 @@ def list_workflow_runs(
     event: str,
 ) -> list[dict[str, Any]]:
     encoded_workflow = urllib.parse.quote(workflow, safe="")
-    query_values = {"created": f">={isoformat(start)}"}
-    if event != "all":
-        query_values["event"] = event
-    query = urllib.parse.urlencode(query_values)
-    path = f"/repos/{repo}/actions/workflows/{encoded_workflow}/runs?{query}"
-    runs = paginate(api, path, "workflow_runs")
+    runs: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    upper = end
+    while True:
+        query_values = {"created": f"{isoformat(start)}..{isoformat(upper)}"}
+        if event != "all":
+            query_values["event"] = event
+        query = urllib.parse.urlencode(query_values)
+        path = f"/repos/{repo}/actions/workflows/{encoded_workflow}/runs?{query}"
+        batch = paginate(api, path, "workflow_runs")
+        fresh = [run for run in batch if int(run["id"]) not in seen]
+        seen.update(int(run["id"]) for run in fresh)
+        runs.extend(fresh)
+        if len(batch) < 1000:
+            break
+        if not fresh:
+            raise RuntimeError(
+                "Workflow run listing cannot advance past the 1000-result limit"
+            )
+        # GitHub caps filtered queries at 1000 runs; overlap the time boundary
+        # and deduplicate by ID so runs created in the same second are retained.
+        oldest = parse_timestamp(str(batch[-1]["created_at"]))
+        if oldest is None or oldest >= upper:
+            raise RuntimeError(
+                "Workflow run listing cannot advance past the 1000-result limit"
+            )
+        upper = oldest
     return [
         run
         for run in runs
@@ -211,6 +232,7 @@ def collect_records(
         run_id = int(run["id"])
         latest_attempt = max(1, int(run.get("run_attempt", 1)))
         artifacts: Optional[list[dict[str, Any]]] = None
+        seen_executions: set[tuple] = set()
         for attempt in range(1, latest_attempt + 1):
             try:
                 jobs = list_attempt_jobs(api, repo, run_id, attempt, latest_attempt)
@@ -230,6 +252,16 @@ def collect_records(
                 if is_mlu_job(job, runner_group) and job.get("conclusion") != "skipped"
             ]
             for job in target_jobs:
+                if job.get("status") == "completed":
+                    execution = (
+                        job.get("name"),
+                        job.get("runner_name"),
+                        job.get("started_at"),
+                        job.get("completed_at"),
+                    )
+                    if execution in seen_executions:
+                        continue  # carried over from an earlier attempt, not re-run
+                    seen_executions.add(execution)
                 if artifacts is None:
                     try:
                         artifacts = paginate(
