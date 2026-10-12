@@ -975,6 +975,10 @@ class SchedulerBatchResultProcessor:
         if batch.spec_algorithm.is_none() and logits_output is not None:
             newly_finished_beam_groups = self.beam_coordinator.commit_decode(batch)
 
+        is_spec = not batch.spec_algorithm.is_none()
+        # hidden_states is [bs * stride, hidden_dim], one row per emitted
+        # token; speculative workers record their padded row width.
+        stride = _get_speculative_output_stride(result) if is_spec else 1
         for i, req in enumerate(batch.reqs):
             req: Req
 
@@ -1001,10 +1005,6 @@ class SchedulerBatchResultProcessor:
             # next_token_id is a per-req list: 1 token for non-spec, the verified
             # run for spec (already grammar-truncated in _resolve_spec_v2_tokens).
             next_token_id = next_token_ids[i]
-            is_spec = not batch.spec_algorithm.is_none()
-            # hidden_states is [bs * stride, hidden_dim], one row per emitted
-            # token; speculative workers record their padded row width.
-            stride = _get_speculative_output_stride(result) if is_spec else 1
             self._commit_decode_row(
                 req=req,
                 i=i,
