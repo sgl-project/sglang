@@ -8,9 +8,9 @@ import torch
 from sglang.srt.speculative.dspark_components.dspark_draft import (
     DraftNoise,
     DraftParams,
-    draft_markov_block,
+    DraftProposalTensors,
     resolve_draft_params,
-    select_draft_hidden_without_anchor,
+    run_draft_proposal,
     step_logits_width,
 )
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync
@@ -18,8 +18,9 @@ from sglang.srt.speculative.spec_tp_sync import SpecTpSync
 logger = logging.getLogger(__name__)
 
 
-class DsparkDraftSampler:
-    """The eager path's markov block, run as the draft cuda graph's tail."""
+class DraftProposalGraphTail:
+    """``run_draft_proposal`` run as the draft cuda graph's tail, over static
+    buffers the eager proposal reads after a replay."""
 
     def __init__(
         self,
@@ -34,10 +35,10 @@ class DsparkDraftSampler:
         out=None,
     ):
         self.model = model
-        self.markov_head = model.markov_head
         self.gamma = int(gamma)
-        self.sample_from_anchor = bool(model.sample_from_anchor)
-        self.query_token_num = self.gamma if self.sample_from_anchor else self.gamma + 1
+        self.query_token_num = (
+            self.gamma if model.sample_from_anchor else self.gamma + 1
+        )
         self.max_bs = int(max_bs)
         if out is not None:
             assert out.shape == (self.max_bs * self.gamma,)
@@ -77,7 +78,7 @@ class DsparkDraftSampler:
             if greedy_draft
             else torch.empty(
                 (self.max_bs, self.gamma, _step_logits_width(model)),
-                dtype=self.markov_head.step_logits_dtype(model.base_logits_dtype),
+                dtype=model.markov_head.step_logits_dtype(model.base_logits_dtype),
                 device=device,
             )
         )
@@ -88,39 +89,20 @@ class DsparkDraftSampler:
 
     def __call__(self, hidden_states, input_ids):
         bs = hidden_states.shape[0] // self.query_token_num
-        if self.sample_from_anchor:
-            model_hidden = hidden_states
-            sample_hidden = hidden_states.view(bs, self.gamma, -1)
-        else:
-            model_hidden, sample_hidden = select_draft_hidden_without_anchor(
-                hidden_states,
-                bs=bs,
-                gamma=self.gamma,
-            )
-        base_logits, confidence_features = self.model.compute_base_logits(model_hidden)
-        base_logits = base_logits.view(bs, self.gamma, -1)
-        anchor = input_ids.view(bs, self.query_token_num)[:, 0]
-
-        draft_tokens, _ = draft_markov_block(
-            markov_head=self.markov_head,
-            base_logits=base_logits,
-            anchor_tokens=anchor,
-            draft_hidden=sample_hidden,
+        run_draft_proposal(
+            model=self.model,
+            hidden_states=hidden_states,
+            anchor_tokens=input_ids.view(bs, self.query_token_num)[:, 0],
+            bs=bs,
+            gamma=self.gamma,
             step_temperatures=self.params.step_temperatures[:bs],
             noise=self._noise,
             tp_sync=self._tp_sync,
-            logits_out=None if self.greedy_draft else self.step_logits[:bs],
             greedy_draft=self.greedy_draft,
+            out=DraftProposalTensors(
+                self.out, self.step_logits, self.confidence_out, self.confidence_raw_out
+            ),
         )
-        self.out[: draft_tokens.numel()].copy_(draft_tokens.reshape(-1))
-        if self.confidence_out is not None:
-            confidence, confidence_raw = self.model.compute_confidence(
-                anchor_tokens=anchor,
-                draft_tokens=draft_tokens,
-                confidence_features=confidence_features,
-            )
-            self.confidence_out[:bs].copy_(confidence)
-            self.confidence_raw_out[:bs].copy_(confidence_raw)
 
 
 def _step_logits_width(model) -> int:
@@ -128,7 +110,7 @@ def _step_logits_width(model) -> int:
     return step_logits_width(model.markov_head, int(model.lm_head.org_vocab_size))
 
 
-def maybe_build_draft_sampler(
+def maybe_build_proposal_graph_tail(
     *,
     draft_model,
     gamma: int,
@@ -139,8 +121,8 @@ def maybe_build_draft_sampler(
     greedy_draft: bool,
     tp_sync: SpecTpSync,
     out=None,
-) -> Optional[DsparkDraftSampler]:
-    """Build the graph-folded draft sampler, or None (reason logged) when the
+) -> Optional[DraftProposalGraphTail]:
+    """Build the proposal's graph tail, or None (reason logged) when the
     proposal must stay eager."""
 
     def _eager(reason):
@@ -157,7 +139,7 @@ def maybe_build_draft_sampler(
             "DSpark draft proposal (%s) folded into the draft cuda graph.",
             "greedy draft" if greedy_draft else "sampling",
         )
-    return DsparkDraftSampler(
+    return DraftProposalGraphTail(
         model=draft_model,
         gamma=gamma,
         max_bs=max_bs,
